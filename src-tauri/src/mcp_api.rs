@@ -1400,20 +1400,21 @@ async fn health(
         // The three arms plan 2026-09-18-runner-transport-rung-rows-never-
         // reach-coord-despite-a-serving-emitter §1 names, on which a
         // `coord-transport-rung` observation is DROPPED between the proxy
-        // door and coord — (a) lane miss, (b) drain 404/405 Ack-drop, (c)
-        // emitter outbox write error — counted since boot (Phase 1). Two
-        // drop arms are deliberately NOT counted here: any OTHER 4xx from
-        // `POST /sessions/:id/events` (falls to `write_failure_outcome` →
-        // PermanentFailure, logged at `error!` in `coord_sync`), and outbox
-        // cap eviction (`OutboxWriter::dropped_unacked`, kind-agnostic and
-        // not on /health). `emitted` is observations HANDED to the
-        // emitter; `laneMiss` partitions the calls that never got a
-        // `coord.sessions` lane by the FIRST gate they failed (one key per
-        // `EventLaneMiss` variant, present even at zero — an absent key is
-        // UNKNOWN, a zero is a number); `drainDropped` is what the outbox
-        // drain Ack-dropped on a 404 (coord does not know the lane) or a 405
-        // (no ingest route); `outboxWriteFailed` is the emitter's own append
-        // failing; `emitterInstalled: false` explains an all-zero block on a
+        // door and coord — (a) lane miss, (b) drain 4xx Ack-drop, (c)
+        // emitter outbox write error — counted since boot, plus the outbox
+        // cap eviction these rows share with every other kind. `emitted` is
+        // observations HANDED to the emitter; `laneMiss` partitions the
+        // calls that never got a `coord.sessions` lane by the FIRST gate
+        // they failed (one key per `EventLaneMiss` variant, present even at
+        // zero — an absent key is UNKNOWN, a zero is a number);
+        // `drainDropped` is what the outbox drain Ack-dropped on a 404
+        // (coord does not know the lane), a 405 (no ingest route) or any
+        // other 4xx (`other4xx` — the shared classifier's PermanentFailure,
+        // logged at `error!` in `coord_sync`); `outboxWriteFailed` is the
+        // emitter's own append failing; `outboxCapEvictedAllKinds` is the
+        // shared outbox's never-acked evictions — kind-agnostic, so an upper
+        // bound on rung rows lost there, and `null` with no emitter to read
+        // it through; `emitterInstalled: false` explains an all-zero block on a
         // host whose session subsystem never came up. A `coord_only` fleet
         // with a serving emitter used to be diagnosable only by log grep on
         // the emitting box.
@@ -3052,14 +3053,14 @@ fn record_event_lane_miss(miss: EventLaneMiss, door: &str, nonce: Option<&str>) 
 /// counters. The shape is [`transport_rung_snapshot_from`]'s; this only reads
 /// the process-wide sources.
 pub(crate) fn transport_rung_health_snapshot() -> serde_json::Value {
-    let (dropped_404, dropped_405) = crate::session::coord_sync::transport_rung_drain_dropped();
+    let emitter = crate::session::coord_transport_rung::global();
     transport_rung_snapshot_from(
         transport_rung_lane_miss_counters(),
         transport_rung_emitted_counter().load(Ordering::Relaxed),
-        dropped_404,
-        dropped_405,
+        crate::session::coord_sync::transport_rung_drain_dropped(),
         crate::session::coord_transport_rung::outbox_write_failed_total(),
-        crate::session::coord_transport_rung::global().is_some(),
+        emitter.as_ref().map(|e| e.outbox_cap_evicted()),
+        emitter.is_some(),
     )
 }
 
@@ -3069,9 +3070,9 @@ pub(crate) fn transport_rung_health_snapshot() -> serde_json::Value {
 fn transport_rung_snapshot_from(
     lane_miss: &[std::sync::atomic::AtomicU64; LANE_MISS_SLOTS],
     emitted: u64,
-    dropped_404: u64,
-    dropped_405: u64,
+    drain_dropped: crate::session::coord_sync::TransportRungDrainDropped,
     outbox_write_failed: u64,
+    outbox_cap_evicted: Option<u64>,
     emitter_installed: bool,
 ) -> serde_json::Value {
     let mut misses = serde_json::Map::new();
@@ -3086,8 +3087,13 @@ fn transport_rung_snapshot_from(
     serde_json::json!({
         "emitted": emitted,
         "laneMiss": misses,
-        "drainDropped": { "404": dropped_404, "405": dropped_405 },
+        "drainDropped": {
+            "404": drain_dropped.not_found,
+            "405": drain_dropped.method_not_allowed,
+            "other4xx": drain_dropped.other_client_error,
+        },
         "outboxWriteFailed": outbox_write_failed,
+        "outboxCapEvictedAllKinds": outbox_cap_evicted,
         "emitterInstalled": emitter_installed,
     })
 }
@@ -11540,7 +11546,18 @@ mod transport_rung_counter_tests {
     #[test]
     fn snapshot_renders_every_variant_at_zero_on_a_fresh_counter_set() {
         let fresh: [std::sync::atomic::AtomicU64; LANE_MISS_SLOTS] = Default::default();
-        let snap = transport_rung_snapshot_from(&fresh, 0, 0, 0, 0, false);
+        let snap = transport_rung_snapshot_from(
+            &fresh,
+            0,
+            crate::session::coord_sync::TransportRungDrainDropped {
+                not_found: 0,
+                method_not_allowed: 0,
+                other_client_error: 0,
+            },
+            0,
+            None,
+            false,
+        );
         let misses = snap["laneMiss"]
             .as_object()
             .expect("laneMiss must be an object");
@@ -11560,7 +11577,11 @@ mod transport_rung_counter_tests {
         assert_eq!(snap["emitted"], serde_json::json!(0));
         assert_eq!(snap["drainDropped"]["404"], serde_json::json!(0));
         assert_eq!(snap["drainDropped"]["405"], serde_json::json!(0));
+        assert_eq!(snap["drainDropped"]["other4xx"], serde_json::json!(0));
         assert_eq!(snap["outboxWriteFailed"], serde_json::json!(0));
+        // No emitter → no outbox to read through: UNKNOWN, rendered `null`,
+        // never a zero that would claim the eviction arm was ruled out.
+        assert_eq!(snap["outboxCapEvictedAllKinds"], serde_json::Value::Null);
         assert_eq!(snap["emitterInstalled"], serde_json::json!(false));
 
         // And the live renderer has the same shape (values are whatever the
@@ -11571,6 +11592,7 @@ mod transport_rung_counter_tests {
             "laneMiss",
             "drainDropped",
             "outboxWriteFailed",
+            "outboxCapEvictedAllKinds",
             "emitterInstalled",
         ] {
             assert!(
@@ -11581,6 +11603,7 @@ mod transport_rung_counter_tests {
         assert!(live["emitterInstalled"].is_boolean());
         assert!(live["drainDropped"]["404"].is_u64());
         assert!(live["drainDropped"]["405"].is_u64());
+        assert!(live["drainDropped"]["other4xx"].is_u64());
     }
 
     /// A successful hand-off to a real emitter increments `emitted` by one —

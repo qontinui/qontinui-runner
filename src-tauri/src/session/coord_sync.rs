@@ -622,12 +622,29 @@ pub(crate) static TRANSPORT_RUNG_DROPPED_404: AtomicU64 = AtomicU64::new(0);
 /// hoisting it out of the function changed nothing about the log cadence.
 pub(crate) static TRANSPORT_RUNG_DROPPED_405: AtomicU64 = AtomicU64::new(0);
 
-/// `(dropped_404, dropped_405)` for `GET /health` `transportRung.drainDropped`.
-pub(crate) fn transport_rung_drain_dropped() -> (u64, u64) {
-    (
-        TRANSPORT_RUNG_DROPPED_404.load(Ordering::Relaxed),
-        TRANSPORT_RUNG_DROPPED_405.load(Ordering::Relaxed),
-    )
+/// Rows Ack-dropped on any OTHER 4xx — a status the shared classifier
+/// ([`write_failure_outcome`]) maps to `PermanentFailure`, including a 429,
+/// which this kind does not special-case the way `output_chunk` does. The
+/// drain logs each one at `error!`; this is the total `GET /health`
+/// `transportRung.drainDropped.other4xx` reads, so the block no longer has an
+/// uncounted 4xx arm.
+pub(crate) static TRANSPORT_RUNG_DROPPED_OTHER_4XX: AtomicU64 = AtomicU64::new(0);
+
+/// The drain's Ack-drop totals for `coord-transport-rung` rows, one per arm,
+/// for `GET /health` `transportRung.drainDropped`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TransportRungDrainDropped {
+    pub not_found: u64,
+    pub method_not_allowed: u64,
+    pub other_client_error: u64,
+}
+
+pub(crate) fn transport_rung_drain_dropped() -> TransportRungDrainDropped {
+    TransportRungDrainDropped {
+        not_found: TRANSPORT_RUNG_DROPPED_404.load(Ordering::Relaxed),
+        method_not_allowed: TRANSPORT_RUNG_DROPPED_405.load(Ordering::Relaxed),
+        other_client_error: TRANSPORT_RUNG_DROPPED_OTHER_4XX.load(Ordering::Relaxed),
+    }
 }
 
 /// Kinds drained under the BEST-EFFORT posture: a transport failure skips the
@@ -1273,7 +1290,15 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             }
             let detail = resp.text().await.unwrap_or_default();
             // 4xx → Ack-drop; 5xx → transient. Shared classifier.
-            write_failure_outcome(status, format!("{status}: {detail}"))
+            let outcome = write_failure_outcome(status, format!("{status}: {detail}"));
+            if kind == "coord-transport-rung" && matches!(outcome, PushOutcome::PermanentFailure(_))
+            {
+                // The third drain-drop arm for this mirror (404 and 405 are
+                // counted above): without it `/health` `transportRung`
+                // could read all-zero drops while rows vanished at `error!`.
+                TRANSPORT_RUNG_DROPPED_OTHER_4XX.fetch_add(1, Ordering::Relaxed);
+            }
+            outcome
         }
         Err(e) => PushOutcome::Transport(format!("{e}")),
     }
@@ -2739,8 +2764,8 @@ mod tests {
         .await;
     }
 
-    /// The two drop counters are process-wide and each test below asserts
-    /// the OTHER one did not move, so the two serialise on one lock — the
+    /// The three drop counters are process-wide and each test below asserts
+    /// the OTHER two did not move, so they serialise on one lock — the
     /// same shared-static remedy as `series_lock` in `mcp_api`'s tests.
     fn drop_counter_lock() -> &'static TokMutex<()> {
         static LOCK: OnceLock<TokMutex<()>> = OnceLock::new();
@@ -2749,14 +2774,14 @@ mod tests {
 
     /// Drain one `coord-transport-rung` row into a fake coord answering
     /// `status` on the events route; returns how much the given drop counter
-    /// moved, plus the `/health` accessor's `(404, 405)` tuple read while the
-    /// guard is still held. The row must end ACKed (the arm drops, it does
-    /// not retry), and the SIBLING counter must not move.
+    /// moved, plus the `/health` accessor's totals read while the guard is
+    /// still held. The row must end ACKed (the arm drops, it does not retry),
+    /// and neither SIBLING counter may move.
     async fn drain_rung_row_dropped_with(
         status: u16,
         counter: &'static AtomicU64,
-        sibling: &'static AtomicU64,
-    ) -> (u64, (u64, u64)) {
+        siblings: [&'static AtomicU64; 2],
+    ) -> (u64, TransportRungDrainDropped) {
         let _guard = drop_counter_lock().lock().await;
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
@@ -2781,7 +2806,7 @@ mod tests {
             None,
         );
         let before = counter.load(Ordering::Relaxed);
-        let sibling_before = sibling.load(Ordering::Relaxed);
+        let siblings_before = siblings.map(|c| c.load(Ordering::Relaxed));
         outbox
             .record(
                 Uuid::new_v4(),
@@ -2812,9 +2837,9 @@ mod tests {
             "exactly one POST — the drop must not be retried"
         );
         assert_eq!(
-            sibling.load(Ordering::Relaxed),
-            sibling_before,
-            "the {status} drop must not move the sibling counter"
+            siblings.map(|c| c.load(Ordering::Relaxed)),
+            siblings_before,
+            "the {status} drop must not move a sibling counter"
         );
         (
             counter.load(Ordering::Relaxed) - before,
@@ -2828,10 +2853,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_counts_a_404_transport_rung_drop() {
         let before = TRANSPORT_RUNG_DROPPED_404.load(Ordering::Relaxed);
-        let (moved, (d404, _)) = drain_rung_row_dropped_with(
+        let (moved, totals) = drain_rung_row_dropped_with(
             404,
             &TRANSPORT_RUNG_DROPPED_404,
-            &TRANSPORT_RUNG_DROPPED_405,
+            [
+                &TRANSPORT_RUNG_DROPPED_405,
+                &TRANSPORT_RUNG_DROPPED_OTHER_4XX,
+            ],
         )
         .await;
         assert_eq!(
@@ -2839,7 +2867,7 @@ mod tests {
             "one 404-dropped row moves `drainDropped.404` by one"
         );
         assert!(
-            d404 >= before + 1,
+            totals.not_found >= before + 1,
             "the /health accessor reads the hoisted 404 counter"
         );
     }
@@ -2849,10 +2877,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_counts_a_405_transport_rung_drop() {
         let before = TRANSPORT_RUNG_DROPPED_405.load(Ordering::Relaxed);
-        let (moved, (_, d405)) = drain_rung_row_dropped_with(
+        let (moved, totals) = drain_rung_row_dropped_with(
             405,
             &TRANSPORT_RUNG_DROPPED_405,
-            &TRANSPORT_RUNG_DROPPED_404,
+            [
+                &TRANSPORT_RUNG_DROPPED_404,
+                &TRANSPORT_RUNG_DROPPED_OTHER_4XX,
+            ],
         )
         .await;
         assert_eq!(
@@ -2860,8 +2891,30 @@ mod tests {
             "one 405-dropped row moves `drainDropped.405` by one"
         );
         assert!(
-            d405 >= before + 1,
+            totals.method_not_allowed >= before + 1,
             "the /health accessor reads the hoisted 405 counter"
+        );
+    }
+
+    /// Any other 4xx (here a 422) is `PermanentFailure` through the shared
+    /// classifier and Ack-dropped at `error!` — the third drain-drop arm,
+    /// counted as `drainDropped.other4xx` so `/health` has no uncounted 4xx.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_counts_an_other_4xx_transport_rung_drop() {
+        let before = TRANSPORT_RUNG_DROPPED_OTHER_4XX.load(Ordering::Relaxed);
+        let (moved, totals) = drain_rung_row_dropped_with(
+            422,
+            &TRANSPORT_RUNG_DROPPED_OTHER_4XX,
+            [&TRANSPORT_RUNG_DROPPED_404, &TRANSPORT_RUNG_DROPPED_405],
+        )
+        .await;
+        assert_eq!(
+            moved, 1,
+            "one 422-dropped row moves `drainDropped.other4xx` by one"
+        );
+        assert!(
+            totals.other_client_error >= before + 1,
+            "the /health accessor reads the other-4xx counter"
         );
     }
 
