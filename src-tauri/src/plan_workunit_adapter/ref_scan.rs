@@ -33,7 +33,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::trigger::GitRefReader;
+use super::trigger::{GitRefReader, RefDirEntry};
 
 /// Where one scan cycle should take its bytes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +63,36 @@ pub enum ScanSource {
 /// than collapsing into one "could not scan": the work-tree question, the
 /// default-branch question and the fetch are three different answers.
 pub fn resolve_scan_source(git: &dyn GitRefReader, plans_dir: &Path) -> ScanSource {
+    let source = resolve_ref_listing_source(git, plans_dir);
+    // Fetch LAST, so a fetch failure is never reported for a repo whose ref
+    // could not have been named anyway.
+    if let ScanSource::Ref {
+        repo_root,
+        ref_name,
+        ..
+    } = &source
+    {
+        if let Err(e) = git.fetch_default(repo_root, ref_name) {
+            return ScanSource::Unavailable {
+                reason: format!("could not refresh {ref_name} before scanning: {e}"),
+            };
+        }
+    }
+    source
+}
+
+/// [`resolve_scan_source`] WITHOUT the fetch: name the ref this clone already
+/// holds and ask nothing of the network.
+///
+/// The split exists for the census-only read
+/// ([`super::trigger::ref_census_only`], which a withheld work-unit posture
+/// takes). A stem LISTING is not a scan: it reads no blob, parses nothing and
+/// publishes no corpus, so it neither needs nor deserves a fetch. Its claim is
+/// "these stems exist at this object id", which is true of the tracking ref
+/// whatever its age — and the scan-root report the census travels in carries
+/// that age (`behind`, `ahead`, `ref_age_secs`) right beside it, so a stale
+/// ref is qualified rather than mistaken for a fresh one.
+pub fn resolve_ref_listing_source(git: &dyn GitRefReader, plans_dir: &Path) -> ScanSource {
     let repo_root = match git.work_tree_root(plans_dir) {
         // Not in a repo at all — a real answer, and a supported layout.
         Ok(None) => return ScanSource::WorkTree,
@@ -93,13 +123,6 @@ pub fn resolve_scan_source(git: &dyn GitRefReader, plans_dir: &Path) -> ScanSour
             }
         }
     };
-    // Fetch LAST, so a fetch failure is never reported for a repo whose ref
-    // could not have been named anyway.
-    if let Err(e) = git.fetch_default(&repo_root, &ref_name) {
-        return ScanSource::Unavailable {
-            reason: format!("could not refresh {ref_name} before scanning: {e}"),
-        };
-    }
     ScanSource::Ref {
         repo_root,
         ref_name,
@@ -143,6 +166,26 @@ pub struct RefPlanFile {
     pub body: String,
 }
 
+/// What one ref listing produced: the files whose bytes were read, and the
+/// CENSUS of the listing itself.
+///
+/// The two are deliberately different sets. `files` is what the scan could
+/// USE; `names` is what the listing SAW — including an entry whose blob would
+/// not read, which is skipped below with a warning. The census is the
+/// denominator of a coverage question, so it has to be the second: a file the
+/// scan chokes on must not vanish from both sides of the set difference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefListing {
+    /// Files whose blobs read, sorted by name.
+    pub files: Vec<RefPlanFile>,
+    /// Every depth-1 `*.md` name at the ref, sorted — blob-readable or not.
+    pub names: Vec<String>,
+    /// What `ref_name` resolved to when this listing was taken. `None` when
+    /// the rev would not resolve: UNKNOWN, and the census still stands —
+    /// the stems WERE listed, only the sha they were listed at is missing.
+    pub ref_sha: Option<String>,
+}
+
 /// Read every depth-1 `*.md` of `rel_dir` at `ref_name`.
 ///
 /// Two `git` invocations for the whole directory — one listing, one batched
@@ -159,14 +202,24 @@ pub fn read_ref_dir(
     repo_root: &Path,
     ref_name: &str,
     rel_dir: &str,
-) -> Result<Vec<RefPlanFile>, String> {
-    let entries = git.list_ref_dir(repo_root, ref_name, rel_dir)?;
-    let wanted: Vec<_> = entries
-        .into_iter()
-        .filter(|e| is_plan_file(&e.name))
-        .collect();
+) -> Result<RefListing, String> {
+    // Resolved and listed by [`list_ref_entries`] — which is also what the
+    // census-only door takes, so neither can drift on the predicate or on the
+    // object id the stems were listed at.
+    let RefEntryListing {
+        entries: wanted,
+        ref_sha,
+    } = list_ref_entries(git, repo_root, ref_name, rel_dir)?;
+    // The census is taken from the LISTING, before a single blob is read, so
+    // it names what the ref side holds rather than what this cycle managed to
+    // read out of it.
+    let names: Vec<String> = wanted.iter().map(|e| e.name.clone()).collect();
     if wanted.is_empty() {
-        return Ok(Vec::new());
+        return Ok(RefListing {
+            files: Vec::new(),
+            names,
+            ref_sha,
+        });
     }
     let asked = wanted.len();
     let ids: Vec<String> = wanted.iter().map(|e| e.id.clone()).collect();
@@ -204,7 +257,96 @@ pub fn read_ref_dir(
     // `ls-tree` already emits in tree order, which is byte order on the name —
     // sorted anyway so a dry-run report is reproducible across git versions.
     out.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(out)
+    Ok(RefListing {
+        files: out,
+        names,
+        ref_sha,
+    })
+}
+
+/// The stem-bearing entries of `<ref>:<rel_dir>`, sorted by name, and the
+/// object id they were listed at.
+struct RefEntryListing {
+    entries: Vec<RefDirEntry>,
+    ref_sha: Option<String>,
+}
+
+/// The listing half of [`read_ref_dir`] — one `git ls-tree`, no blob read.
+///
+/// Shared with [`list_ref_plan_names`] so the two doors cannot drift into two
+/// different answers about which entries are plans, or about which object id
+/// they were listed at.
+fn list_ref_entries(
+    git: &dyn GitRefReader,
+    repo_root: &Path,
+    ref_name: &str,
+    rel_dir: &str,
+) -> Result<RefEntryListing, String> {
+    // Resolved FIRST, then LISTED AT THE RESOLVED OBJECT ID — so the census
+    // carries the sha its stems were actually listed at.
+    //
+    // Naming `ref_name` twice would be two reads of a MOVING target: these are
+    // separate `git` processes, and a concurrent `git fetch` in the same clone
+    // (the norm on a shared, hot checkout) advances `origin/main` between them.
+    // The census would then assert stems listed at A under a sha of B — a set
+    // difference computed against the wrong side, and invisible, because every
+    // field would look well-formed. Addressing the listing by object id makes
+    // the pair atomic by construction rather than by luck.
+    //
+    // A rev that will not resolve leaves the sha UNKNOWN and falls back to the
+    // ref name for the listing, rather than failing it: the stems are the
+    // reading, the sha only qualifies it.
+    let ref_sha = match git.rev_parse(repo_root, ref_name) {
+        Ok(sha) => Some(sha),
+        Err(e) => {
+            tracing::debug!(
+                ref_name = %ref_name,
+                error = %e,
+                "plan adapter: could not resolve the ref to an object id before listing it; the \
+                 slug census carries ref_sha UNKNOWN and the listing is taken at the ref name"
+            );
+            None
+        }
+    };
+    let listed_at = ref_sha.as_deref().unwrap_or(ref_name);
+    let mut entries: Vec<RefDirEntry> = git
+        .list_ref_dir(repo_root, listed_at, rel_dir)?
+        .into_iter()
+        .filter(|e| is_plan_file(&e.name))
+        .collect();
+    // `ls-tree` already emits in tree order, which is byte order on the name —
+    // sorted anyway so both doors are reproducible across git versions.
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(RefEntryListing { entries, ref_sha })
+}
+
+/// What a LISTING-ONLY read of the ref saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefNameListing {
+    /// Every depth-1 `*.md` name at the ref, sorted.
+    pub names: Vec<String>,
+    /// What the ref resolved to when this listing was taken; `None` is
+    /// UNKNOWN, and the stems still stand.
+    pub ref_sha: Option<String>,
+}
+
+/// LIST the ref's plan names without reading a single blob.
+///
+/// The census-only door, for a cycle that is not going to publish a corpus and
+/// so must not pay ~1,100 blob reads to discard them — the withheld work-unit
+/// posture. It is the same listing [`read_ref_dir`] takes its own census from,
+/// by construction: both go through [`list_ref_entries`].
+pub fn list_ref_plan_names(
+    git: &dyn GitRefReader,
+    repo_root: &Path,
+    ref_name: &str,
+    rel_dir: &str,
+) -> Result<RefNameListing, String> {
+    let listing = list_ref_entries(git, repo_root, ref_name, rel_dir)?;
+    Ok(RefNameListing {
+        names: listing.entries.into_iter().map(|e| e.name).collect(),
+        ref_sha: listing.ref_sha,
+    })
 }
 
 /// The ref arm's `*.md` predicate.
