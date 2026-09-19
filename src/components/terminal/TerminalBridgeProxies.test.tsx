@@ -658,7 +658,10 @@ describe("both text paths route through the same type guard (iter 24, item 2)", 
       // Every such destructure must read `text?: unknown` and be narrowed by
       // `requireTextPayload` — which is what the assertions above pin.
       expect(source).not.toMatch(/params \|\| \{\}\) as \{ text\?: string \}/);
-      expect(source).toMatch(/params \|\| \{\}\) as \{ text\?: unknown \}/);
+      // The value now arrives through the guard's bound `args`, still typed
+      // `unknown` so `requireTextPayload` is what narrows it.
+      expect(source).not.toMatch(/as \{ text\?: string \}/);
+      expect(source).toMatch(/args as \{ text\?: unknown \}/);
     }
   });
 });
@@ -801,8 +804,10 @@ describe("both scrollback paths route through the same bound guard (iter 25)", (
       // two paths slice by DIFFERENT expressions, `slice(NaN)` returned the
       // whole buffer here while `NaN < total` returned nothing there.
       const code = codeOf(file);
-      expect(code).not.toMatch(/params \|\| \{\}\) as \{ maxLines\?: number \}/);
-      expect(code).toMatch(/params \|\| \{\}\) as \{ maxLines\?: unknown \}/);
+      expect(code).not.toMatch(/as \{ maxLines\?: number \}/);
+      // Read off the guard's bound `args`, still `unknown` until
+      // `requireMaxLines` narrows it.
+      expect(code).toMatch(/args as \{ maxLines\?: unknown \}/);
     }
   });
 
@@ -863,5 +868,84 @@ describe("both key paths reject a malformed `modifiers` (iter 25 P0)", () => {
       expect(code).toMatch(/toPtySequence\(keys\)/);
       expect(code).not.toMatch(/modifiers\s*[.?[]/);
     }
+  });
+});
+
+// ── The bag itself, not only its values ────────────────────────────────────
+//
+// Both paths validated each VALUE with a typed validator, but neither refused
+// the BAG: `{text: "ls\r", zzz: 1}` was a successful write that dropped `zzz`
+// in silence, and a non-object bag reached the validators as `undefined`
+// fields. Every parameterised pane handler now binds through `guardedHandler`
+// against a schema shared by both paths (`terminalPaneActionSchemas.ts`),
+// with `valuesCheckedBy: "handler"` so the typed validators and their codes
+// are unchanged. Ported from qontinui-runner#1301 onto main's per-path
+// handlers.
+describe("pane custom actions refuse a malformed BAG before any write", () => {
+  const PARAMETERISED: Array<[string, Record<string, unknown>]> = [
+    ["sendKeys", { keys: "ls\r" }],
+    ["writeToTerminal", { text: "ls\r" }],
+    ["pasteText", { text: "ls\r" }],
+    ["getScrollback", { maxLines: 5 }],
+  ];
+  const BAD_BAGS: Array<[string, (valid: Record<string, unknown>) => unknown]> = [
+    ["a number", () => 5],
+    ["a string", () => "zz"],
+    ["a list", () => ["Enter"]],
+    ["an undeclared key beside a valid one", (valid) => ({ ...valid, zzz: 1 })],
+    [
+      "a __proto__ key",
+      (valid) => JSON.parse(`{"__proto__": 1, ${JSON.stringify(valid).slice(1)}`),
+    ],
+  ];
+
+  for (const [action, valid] of PARAMETERISED) {
+    for (const [label, make] of BAD_BAGS) {
+      it(`${action} refuses ${label} with ACTION_PARAMS_INVALID and no IPC`, async () => {
+        const handler = handlerFor(LIVE_TABS, "term-live", action);
+        invoke.mockClear();
+        let caught: (Error & { code?: string }) | null = null;
+        try {
+          await handler(make(valid));
+        } catch (err) {
+          caught = err as Error & { code?: string };
+        }
+        expect(caught?.code, `${action} / ${label}`).toBe("ACTION_PARAMS_INVALID");
+        // Nothing reached the runner at all — not a write, not a ring read.
+        expect(invoke).not.toHaveBeenCalled();
+      });
+    }
+  }
+
+  it("a well-formed bag still reaches the same typed validator with the same code", async () => {
+    const write = handlerFor(LIVE_TABS, "term-live", "writeToTerminal");
+    await expect(Promise.resolve().then(() => write({ text: 42 }))).rejects.toMatchObject({
+      code: "WRITE_TEXT_INVALID",
+    });
+    // …and a numeric-LOOKING string is text, not coerced into a refusal.
+    await write({ text: "5" });
+    expect(writtenText()).toBe("5");
+  });
+
+  it.each(PATHS.map((f) => [f]))(
+    "%s guards every parameterised pane handler against the SHARED schema",
+    (file) => {
+      const code = codeOf(file);
+      expect(code).toContain('from "./terminalPaneActionSchemas"');
+      for (const [action] of PARAMETERISED) {
+        expect(code).toMatch(new RegExp(`guardedHandler\\(\\s*"${action}",\\s*[A-Z_]+_SCHEMA,`));
+      }
+      // No pane handler reads the raw bag any more.
+      expect(code).not.toMatch(/\(params \|\| \{\}\)/);
+    },
+  );
+
+  it("the mounted imperative getScrollback shares the automation reader", () => {
+    // Two readers of one buffer used to disagree about "the last N lines":
+    // the imperative handle kept the pre-iter-26 row walk that spends the
+    // window on blank viewport padding. One implementation now.
+    const code = codeOf("TerminalInstance.tsx");
+    expect(code.match(/scrollbackTail\(/g) ?? []).toHaveLength(2);
+    expect(code).not.toMatch(/Math\.max\(0,\s*totalLines\s*-/);
   });
 });
