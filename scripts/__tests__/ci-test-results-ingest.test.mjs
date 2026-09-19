@@ -382,6 +382,35 @@ test("gatingQualification: a non-success gate whose OWN rows carry a failure is 
   assert.equal(q.message, null);
 });
 
+test("gatingQualification: an UNRECOGNISED outcome is announced EVEN on a red suite", () => {
+  // The regression a review caught: the `anyFailed` short-circuit was ordered
+  // ABOVE the recognition test, so an empty or unexpanded `${{ … }}` — i.e.
+  // "this script could not read the gate at all" — went unreported on every
+  // red suite. That is the silent-empty-is-unknown failure this flag exists to
+  // end, and it is the exact breakage the step-`id` pin in
+  // src-tauri/tests/ci_rust_test_steps_split.rs guards upstream.
+  for (const unreadable of ["", "${{ steps.run_rust_tests.outcome }}", "TIMED_OUT"]) {
+    const q = gatingQualification(unreadable, {
+      repo: "o/r",
+      headSha: "abc",
+      rows: 2,
+      anyFailed: true,
+    });
+    assert.equal(q.qualified, false, `an unreadable outcome ${JSON.stringify(unreadable)} must still announce`);
+    assert.match(q.message, /UNKNOWN, not success/);
+  }
+
+  // …while every RECOGNISED non-success outcome still stays quiet on a red suite.
+  for (const known of ["failure", "cancelled", "skipped"]) {
+    assert.equal(
+      gatingQualification(known, { repo: "o/r", headSha: "abc", rows: 2, anyFailed: true })
+        .qualified,
+      true,
+      `a recognised ${known} beside failing rows is the ordinary red PR`,
+    );
+  }
+});
+
 test("gatingQualification: an UNRECOGNISED outcome is UNKNOWN, never read as success", () => {
   const q = gatingQualification("${{ steps.run_rust_tests.outcome }}", {
     repo: "o/r",

@@ -20,7 +20,8 @@
  * earlier version of this header carried it. The `test result: ok. 1354
  * passed` line two minutes before the kill is ONE BINARY OF 29, not the suite:
  * the largest binary (9905 tests) started at 02:58:22, was still emitting `ok`
- * lines at 03:00:25, and never reported at all. The run was ~63% complete.
+ * lines at 03:00:25, and never reported at all. The run was ~62% complete
+ * (7112 rows against a suite of 11,486).
  * That is exactly the state this script must describe honestly rather than
  * summarising as a pass — see the all-`ok`-and-still-failed arm below.
  *
@@ -132,14 +133,15 @@ export function tallyTestResults(lines) {
  * fact from an empty or unrecognisable log and is never collapsed into one.
  *
  * @param {string|null} text
- * @returns {{readable: boolean, recognisedAsRun: boolean, crate: string|null,
- *            compileError: boolean, oom: boolean, binaries: number,
- *            anyFailed: boolean, lineCount: number}}
+ * @returns {{readable: boolean, empty: boolean, recognisedAsRun: boolean,
+ *            crate: string|null, compileError: boolean, oom: boolean,
+ *            binaries: number, anyFailed: boolean, lineCount: number}}
  */
 export function describeLog(text) {
   if (typeof text !== "string") {
     return {
       readable: false,
+      empty: false,
       recognisedAsRun: false,
       crate: null,
       compileError: false,
@@ -153,6 +155,10 @@ export function describeLog(text) {
   const { binaries, anyFailed } = tallyTestResults(lines);
   return {
     readable: true,
+    // `"".split("\n")` is `[""]`, so `lineCount` alone cannot tell an EMPTY log
+    // from a one-line one — the very distinction the abstain arm quotes it for.
+    // Carry the emptiness separately rather than pretending the count answers it.
+    empty: text.length === 0,
     recognisedAsRun: hasCargoTestOutput(lines),
     crate: lastRustcCrate(lines),
     compileError: lines.some((l) => COMPILE_ERROR_RE.test(l.trim())),
@@ -204,31 +210,41 @@ export function classifyExpiry({ buildLog, runLog, buildOutcome, runOutcome }) {
       lines.push(
         "The build log could not be read, so compile-error-vs-expiry is **UNKNOWN**.",
       );
-    } else if (buildLog.crate === null) {
-      // ABSTAIN. A readable log that never reached a single rustc invocation
-      // is at least as consistent with the step dying before cargo emitted
-      // anything — `cd src-tauri` failing, cargo missing, the disk full, an
-      // immediate runner kill — as with a mid-compile expiry. The
-      // no-`error:`-line arm below would call that a SLOW BUILD with full
-      // confidence, which is precisely the class this file promises to abstain
-      // on. `lineCount` is here and not merely computed because it is the
-      // difference between "empty" and "said things, none of them rustc".
-      lines.push(
-        `The build log is readable (${buildLog.lineCount} line(s)) but contains no rustc ` +
-          "invocation at all, so **UNKNOWN**: an expiry before the first compile and a " +
-          "step that died before cargo ran are indistinguishable from here. Read the job " +
-          "log's own step result rather than inferring one.",
-      );
     } else if (buildLog.oom) {
+      // OOM FIRST, and ahead of the abstain arm below. This is the single most
+      // actionable sentence this script emits, and it is derivable from the log
+      // alone — a `rustc-LLVM ERROR: out of memory` does not become less true
+      // because cargo never printed a `--crate-name` line. An earlier cut put
+      // the abstain arm above this one and told a log containing
+      // `rustc-LLVM ERROR` that it "contains no rustc invocation at all",
+      // which is both false and the opposite of useful.
       lines.push(
         "The log carries an rustc/LLVM out-of-memory signature. That is the condition " +
           "`CARGO_BUILD_JOBS` is throttled against — follow the revert ladder in the step's " +
           "own `env:` comment (revert the jobs value, keep the 32 GB pagefile).",
       );
     } else if (buildLog.compileError) {
+      // Likewise ahead of the abstain arm: `error: failed to select a version`
+      // and `error: could not compile workspace` are cargo-level failures that
+      // carry no rustc invocation at all, and they are a COMPILE ERROR whatever
+      // the abstain arm would otherwise say about them.
       lines.push(
         "The log carries a compiler `error:` line, so this is a COMPILE ERROR, not a bound expiry. " +
           "Fix the code; the timeout is not implicated.",
+      );
+    } else if (buildLog.crate === null) {
+      // ABSTAIN — and ONLY once OOM and compile-error have been ruled out. A
+      // readable log carrying no rustc invocation, no `error:` and no OOM is at
+      // least as consistent with the step dying before cargo emitted anything
+      // (`cd src-tauri` failing, cargo missing, the disk full, an immediate
+      // runner kill) as with a mid-compile expiry. The no-`error:`-line arm
+      // below would call that a SLOW BUILD with full confidence, which is the
+      // class this file promises to abstain on.
+      lines.push(
+        `The build log is readable (${buildLog.empty ? "empty" : `${buildLog.lineCount} line(s)`}) but ` +
+          "carries no rustc invocation, no compiler `error:` and no OOM signature, so **UNKNOWN**: " +
+          "an expiry before the first compile and a step that died before cargo ran are " +
+          "indistinguishable from here. Read the job log's own step result rather than inferring one.",
       );
     } else {
       lines.push(
@@ -237,14 +253,24 @@ export function classifyExpiry({ buildLog, runLog, buildOutcome, runOutcome }) {
           "into the job log, never into the tee'd file. Treat this as a SLOW BUILD, not a broken one.",
       );
     }
-    // Three states, not two. `recognisedAsRun: false` is true BOTH when the log
-    // was read and had no test output AND when it could not be read at all, and
-    // `describeLog`'s own contract says those must never be collapsed — which
-    // is exactly what this line used to do, asserting "no test ever executed"
-    // one bullet below "the build log could not be read".
-    if (!runLog.readable) {
+    // FOUR states, and the ORDER matters. `ro` is checked first because on the
+    // commonest build failure GitHub skips the run step, so `cargo-test-output.log`
+    // is never written and the log read comes back unreadable — and an earlier
+    // cut answered UNKNOWN there while being TOLD `skipped`, which is throwing
+    // away the fact that settles it. Only an unreadable log whose step did NOT
+    // report `skipped` is genuinely unknown.
+    //
+    // Below that, `recognisedAsRun: false` is still true BOTH when the log was
+    // read and had no test output AND when it could not be read at all, and
+    // `describeLog`'s own contract says those must never be collapsed.
+    if (ro === "skipped") {
       lines.push(
-        "The run log could not be read, so whether anything executed is **UNKNOWN**.",
+        "The run step was SKIPPED, so no test executed — the build never produced binaries to run.",
+      );
+    } else if (!runLog.readable) {
+      lines.push(
+        "The run log could not be read and the run step did not report `skipped`, so whether " +
+          "anything executed is **UNKNOWN**.",
       );
     } else if (runLog.recognisedAsRun) {
       lines.push(

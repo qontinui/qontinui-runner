@@ -62,7 +62,10 @@ const BUILD_OOM_LOG = [
   "rustc-LLVM ERROR: out of memory",
 ].join("\n");
 
-/// The suite reported and everything passed — #1545's own run log, in miniature.
+/// ONE binary reported and its own tests all passed. Deliberately NOT "the
+/// suite passed": on #1545 this exact shape sat two minutes before the kill
+/// while the 9905-test binary was still running, and reading it as a passing
+/// suite is the misreading this whole change exists to correct.
 const RUN_ALL_GREEN_LOG = [
   "     Running `target/debug/deps/qontinui_runner_lib-a9341426b1692ff6`",
   "running 1354 tests",
@@ -224,7 +227,9 @@ function hardCodedClassifier() {
   return { phase: "build", title: "Rust test phase: BUILD", lines: ["expired mid-compile"] };
 }
 
-/// The mutation: "collapse UNKNOWN into the compile-expiry arm".
+/// The mutation: "collapse UNKNOWN into the compile-expiry arm", as an OUTPUT
+/// rewrite. Proves the assertion is sensitive to the token, not that the
+/// decision logic is right — see `unknownBranchDeletedClassifier` for that.
 function unknownCollapsingClassifier(input) {
   const real = classifyExpiry(input);
   return {
@@ -235,14 +240,32 @@ function unknownCollapsingClassifier(input) {
   };
 }
 
-/// Run one assertion and report whether it threw. This is what lets a mutation
-/// proof assert "the suite CATCHES this", rather than asserting a stub.
+/// The mutation that matters: DELETE the `!runLog.recognisedAsRun` abstention
+/// branch, i.e. treat an unrecognisable run log as an all-green one. Modelled
+/// at the DECISION level by lying to the real classifier about the one input
+/// that branch reads — `recognisedAsRun` — which is what a deleted branch
+/// amounts to. The classifier is pure, so this is exact rather than an
+/// approximation.
+function unknownBranchDeletedClassifier(input) {
+  return classifyExpiry({
+    ...input,
+    runLog: { ...input.runLog, recognisedAsRun: true, binaries: 1, anyFailed: false },
+  });
+}
+
+/// Run one assertion and report whether it failed AS AN ASSERTION.
+///
+/// Narrowed to `AssertionError` deliberately: a bare `catch` would score an
+/// unrelated `TypeError` in a future mutant as "caught", so a mutation proof
+/// could pass because the mutant was broken rather than because the suite
+/// detected it. Anything that is not an assertion failure is re-thrown.
 function caught(fn) {
   try {
     fn();
     return false;
-  } catch {
-    return true;
+  } catch (err) {
+    if (err instanceof assert.AssertionError) return true;
+    throw err;
   }
 }
 
@@ -271,6 +294,22 @@ test("MUTATION UNKNOWN-collapse: the truncated-run assertion catches it", () => 
   assert.equal(caught(() => assertion(unknownCollapsingClassifier)), true);
 });
 
+test("MUTATION delete-the-abstention-branch: the truncated-run assertion catches it", () => {
+  // The decision-level mutant, which the output-rewrite one above does not
+  // cover: if the classifier stopped distinguishing an unrecognisable run log
+  // from a reported one, the truncated fixture would be summarised as an
+  // all-green run that failed anyway.
+  const assertion = (classifier) => {
+    const text = renderSummary(
+      classifier(describeAll(BUILD_EXPIRED_LOG, RUN_TRUNCATED_LOG, "success", "failure")),
+    );
+    assert.match(text, /\*\*UNKNOWN\*\*/);
+    assert.match(text, /not evidence that the tests passed/);
+  };
+  assert.equal(caught(() => assertion(classifyExpiry)), false);
+  assert.equal(caught(() => assertion(unknownBranchDeletedClassifier)), true);
+});
+
 // ---------------------------------------------------------------------------
 // The two abstention arms a review found the first cut got wrong.
 // ---------------------------------------------------------------------------
@@ -282,22 +321,66 @@ test("a READABLE build log with no rustc invocation at all ABSTAINS", () => {
   // one" with full confidence.
   const v = classify("", "", "failure", "skipped");
   const text = renderSummary(v);
-  assert.match(text, /no rustc invocation at all, so \*\*UNKNOWN\*\*/);
+  assert.match(text, /carries no rustc invocation, no compiler `error:` and no OOM signature, so \*\*UNKNOWN\*\*/);
   assert.doesNotMatch(text, /Treat this as a SLOW BUILD/);
 });
 
-test("an UNREADABLE run log is not reported as 'no test ever executed'", () => {
-  // `recognisedAsRun: false` covers BOTH "read, no test output" and "could not
-  // be read"; describeLog's own contract says never to collapse them.
+test("a SKIPPED run step is reported as skipped, NOT as UNKNOWN", () => {
+  // The commonest build-failure path in CI: GitHub skips the run step, so
+  // `cargo-test-output.log` is never written and the log read comes back
+  // unreadable — while `runOutcome` says `skipped` in so many words. One
+  // revision of this file answered UNKNOWN here, throwing away the fact it had
+  // been handed. `skipped` is checked before readability for that reason.
   const v = classify(BUILD_EXPIRED_LOG, null, "failure", "skipped");
   const text = renderSummary(v);
-  assert.match(text, /run log could not be read, so whether anything executed is \*\*UNKNOWN\*\*/);
+  assert.match(text, /The run step was SKIPPED, so no test executed/);
+  assert.doesNotMatch(text, /whether anything executed is \*\*UNKNOWN\*\*/);
+});
+
+test("an UNREADABLE run log whose step did NOT skip is genuinely UNKNOWN", () => {
+  const v = classify(BUILD_EXPIRED_LOG, null, "failure", "cancelled");
+  const text = renderSummary(v);
+  assert.match(text, /could not be read and the run step did not report `skipped`/);
+  assert.match(text, /\*\*UNKNOWN\*\*/);
   assert.doesNotMatch(text, /No test ever executed/);
 });
 
 test("a READ-but-silent run log still says no test executed", () => {
-  const v = classify(BUILD_EXPIRED_LOG, "", "failure", "skipped");
+  const v = classify(BUILD_EXPIRED_LOG, "", "failure", "cancelled");
   assert.match(renderSummary(v), /No test ever executed/);
+});
+
+test("OOM and a cargo-level compile error BEAT the no-rustc abstention", () => {
+  // The regression a review caught: ordering the abstain arm above these two
+  // told a log containing `rustc-LLVM ERROR` that it "contains no rustc
+  // invocation at all" — false, and it suppressed the single most actionable
+  // sentence this script emits.
+  const oomNoCrate = renderSummary(
+    classify("rustc-LLVM ERROR: out of memory", "", "failure", "skipped"),
+  );
+  assert.match(oomNoCrate, /out-of-memory/);
+  assert.match(oomNoCrate, /32 GB pagefile/);
+  assert.doesNotMatch(oomNoCrate, /carries no rustc invocation/);
+
+  const cargoError = renderSummary(
+    classify("error: could not compile workspace", "", "failure", "skipped"),
+  );
+  assert.match(cargoError, /COMPILE ERROR/);
+  assert.doesNotMatch(cargoError, /carries no rustc invocation/);
+});
+
+test("the abstention distinguishes an EMPTY build log from a one-line one", () => {
+  // `"".split("\n")` is `[""]`, so lineCount alone reads 1 for both — which is
+  // the exact distinction the abstain arm quotes it for. `describeLog.empty`
+  // carries it instead.
+  assert.match(
+    renderSummary(classify("", "", "failure", "skipped")),
+    /readable \(empty\)/,
+  );
+  assert.match(
+    renderSummary(classify("some unrelated line", "", "failure", "skipped")),
+    /readable \(1 line\(s\)\)/,
+  );
 });
 
 // ---------------------------------------------------------------------------

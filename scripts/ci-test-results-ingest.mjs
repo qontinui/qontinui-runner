@@ -50,13 +50,18 @@
  * WHAT IT DOES NOT CATCH, stated because the motivating incident is subtler
  * than it first reads. On run 35043646051 attempt 1 this script recorded 7112
  * rows for a job GitHub called `failure`. Those rows are not "a passing suite":
- * the full suite is 11,368 tests across 29 binaries, so 7112 is 62.6% of it,
- * and 5709 of them came from the one binary still executing when the clock
- * killed it. coord therefore received a **silently truncated** row set, in a
- * shape byte-indistinguishable from a complete one. This flag announces that
- * the gate did not succeed; it cannot detect truncation, because nothing here
- * knows how many tests the suite has. That is a separate, uncemented gap, and
- * it is recorded as a plan-library follow-up rather than implied to be covered.
+ * the full suite is **11,486** tests across 29 binaries (11,368 passed + 118
+ * ignored — count the rows this script EMITS, which include `skip`, not the
+ * `passed` sum), so 7112 is **61.9%** of it. Only **1409** of those rows came
+ * from binaries that had reported a `test result:`; the other **5703** came
+ * from the one binary still executing when the clock killed it, and 4374 tests
+ * never ran. coord therefore received a **silently truncated** row set, in a
+ * shape byte-indistinguishable from a complete one.
+ *
+ * This flag announces that the gate did not succeed; it cannot detect
+ * truncation, because nothing here knows how many tests the suite has. That is
+ * a separate, UNCLOSED gap, recorded as plan-library follow-up
+ * `eff25606-d3e0-4307-9e9c-3ddbceb2b0aa` rather than implied to be covered.
  *
  * WHY IT CANNOT DO MORE, verified at source on `qontinui-coord` `origin/main`
  * 2026-09-19 (`crates/coord/src/test_run_effects.rs`). There is nowhere for a
@@ -176,7 +181,7 @@ const KNOWN_GATING_OUTCOMES = new Set(["success", "failure", "cancelled", "skipp
  * ordinary one.
  *
  * @param {string|undefined} gatingOutcome
- * @param {{repo: string, headSha: string, rows: number}} ctx
+ * @param {{repo: string, headSha: string, rows: number, anyFailed: boolean}} ctx
  * @returns {{qualified: boolean, message: string|null}}
  */
 export function gatingQualification(gatingOutcome, { repo, headSha, rows, anyFailed }) {
@@ -185,15 +190,26 @@ export function gatingQualification(gatingOutcome, { repo, headSha, rows, anyFai
   }
   if (gatingOutcome === "success") return { qualified: true, message: null };
 
-  // NARROWED: a non-success gating step whose OWN rows carry a failure is the
-  // ordinary red PR, and there is no disagreement to announce — the rows coord
-  // holds are correct and complete, `FAILED` entries included. Alarming on
-  // every red PR is how an alarm stops being read, and this one exists for the
-  // case where coord's rows and GitHub's verdict DISAGREE. Only an all-green
-  // row set beside a non-success gate is that case.
-  if (anyFailed === true) return { qualified: true, message: null };
+  const recognised = KNOWN_GATING_OUTCOMES.has(gatingOutcome);
 
-  const named = KNOWN_GATING_OUTCOMES.has(gatingOutcome)
+  // NARROWED: a RECOGNISED non-success outcome whose OWN rows carry a failure
+  // is the ordinary red PR, and there is no disagreement to announce — the rows
+  // coord holds are correct and complete, `FAILED` entries included. Alarming
+  // on every red PR is how an alarm stops being read, and this flag exists for
+  // the case where coord's rows and GitHub's verdict DISAGREE.
+  //
+  // ⚠️ GATED ON `recognised`, and that conjunct is load-bearing. An
+  // UNRECOGNISED outcome — an empty string, an unexpanded `${{ … }}` — means
+  // this script could not read the gate AT ALL, which is not "the ordinary red
+  // PR" and must be announced whatever the rows say. An earlier cut put this
+  // short-circuit above the recognition test, so a broken `steps.<id>.outcome`
+  // reference went unreported on every red suite — the exact
+  // silent-empty-is-unknown failure the paragraph below says this flag ends,
+  // and the exact failure the step-`id` pin in
+  // src-tauri/tests/ci_rust_test_steps_split.rs exists to catch upstream.
+  if (recognised && anyFailed === true) return { qualified: true, message: null };
+
+  const named = recognised
     ? `\`${gatingOutcome}\``
     : `an unrecognised value \`${gatingOutcome}\` (UNKNOWN, not success)`;
   return {

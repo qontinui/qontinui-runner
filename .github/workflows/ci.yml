@@ -144,15 +144,21 @@ jobs:
     # variance while cutting the worst case from 6 h to 2.5 h. (Sampled, not
     # exhaustive: the full window holds ~348 successful legs.)
     #
-    # ⚠️ RE-READ THAT HEADROOM AFTER THE 2026-09-19 BUILD/RUN SPLIT. The figures
-    # above were measured against a single Rust step bounded at 90, so the
-    # worst bounded Rust time was 90. It is now 90 + 20 = 110. Attempt 1 of run
-    # 35043646051 ran 100m43s with the 90-min step, so the same shape under the
-    # split reaches ~120m; the historical max windows job (110.6m) reaches
-    # ~130m. Both still fit under 150, so this cap is NOT changed here — but the
-    # "+ ~60 min headroom" sentence above now overstates it by 20 minutes, and
-    # the next person sizing this should compute from 110, not 90. Re-sizing
-    # against a re-measured window is Phase 5 of plan
+    # ⚠️ RE-READ THIS AFTER THE 2026-09-19 BUILD/RUN SPLIT — and read WHICH
+    # quantity moved, because it is not the one the sentence above measures.
+    # "windows p90 + ~60 min headroom" is sized off OBSERVED job durations, and
+    # the split does not move an observed duration: a job that took 84 min
+    # still takes 84 min. What moved is the WORST BOUNDED Rust time, from 90 to
+    # 90 + 20 = 110. So the sentence above is not wrong; it simply answers a
+    # different question from the one the next person sizing this cap needs.
+    #
+    # Compute from 110, not 90. Attempt 1 of run 35043646051 ran 100m43s with
+    # the 90-min step, i.e. 10m43s outside it, so the same shape under the split
+    # reaches ~121m. The historical max windows job (110.6m) reaches ~130m ONLY
+    # IF its Rust step consumed the full 90 — an assumption, not a measurement,
+    # and this same block records max(success) 82 for that step, under which it
+    # is ~139m. Every one of those still fits under 150, which is why this cap
+    # is NOT changed here. Re-sizing against a re-measured window is Phase 5 of
     # 2026-09-17-the-windows-test-gate-is-a-90-minute-build-wearing-a-test-shaped-bound.
     timeout-minutes: 150
 
@@ -659,14 +665,24 @@ jobs:
       # minutes before the kill is ONE BINARY OF 29, not the suite. The largest
       # binary — 9905 tests — started at 02:58:22 and was still emitting `ok`
       # lines at 03:00:25 when the clock killed it, so it never produced a
-      # `test result:` line at all. The run was ~63% complete. Nothing about
-      # that run says the tests passed.
+      # `test result:` line at all. The run was ~62% complete (7112 ingested
+      # rows against a suite of 11,486). Nothing about that run says the tests
+      # passed.
       #
       # THE SPLIT WOULD HAVE SAVED IT, and that is the measurement that
       # justifies this change: on the same attempt the build phase finished at
       # 02:56:24 — 86m07s, UNDER a 90-minute build bound — and the run phase
       # needs 5m26s, far inside a 20-minute run bound. Two bounds, both met; one
       # composite bound, missed.
+      #
+      # ⚠️ SAY THE COUNTERFACTUAL'S OWN MARGIN, because the whole justification
+      # rests on the tighter half and it is the build half, not the run half:
+      # 86m07s under 90 is **3m53s of slack, 4.3%**. On that attempt the split
+      # would have held — but it would have held narrowly, and a build a few
+      # minutes slower expires the build bound instead. That is the correct
+      # outcome (a build expiry then NAMES itself as one, which is the point of
+      # Phases 1-2) and it is not the same as comfort. Phase 5 re-sizes both
+      # bounds against a re-measured window; this is the number it starts from.
       #
       # A bound sized against the wrong quantity cannot be tuned correctly and
       # cannot attribute its own expiry; split, each bound is named for what it
@@ -969,21 +985,29 @@ jobs:
       #
       # ⚠️ READ WHAT THOSE 7112 ROWS ACTUALLY ARE — this comment said "a fully
       # passing suite" until a review counted them, and the count refutes it.
-      # The full suite is 11,368 tests across 29 binaries (summed from attempt
-      # 2's `test result:` lines). 7112 is **62.6%** of it, and only 1403 of
-      # those rows came from binaries that had reported a `test result:`; the
-      # other 5709 came from the 9905-test binary that was still running when
-      # the clock killed it. So coord did not receive a green suite — it
-      # received a **silently truncated** one, missing 4256 tests, in a shape
+      # The full suite is 11,486 tests across 29 binaries — 11,368 passed plus
+      # 118 ignored, and the denominator has to be the count of rows this
+      # ingest EMITS, which includes `skip`. 7112 is **61.9%** of it. Only 1409
+      # of those rows came from binaries that had reported a `test result:`;
+      # the other 5703 came from the 9905-test binary that was still running
+      # when the clock killed it. So coord did not receive a green suite — it
+      # received a **silently truncated** one, missing 4374 tests, in a shape
       # byte-indistinguishable from a complete ingest.
+      #
+      # (Those two figures were 1403/5709 for one revision of this comment.
+      # 1403 is the PASSED sum of the reported binaries and drops the 6
+      # `ignored` tests, which do produce rows; the pair summed to 7112 only
+      # because the two errors cancelled. Recorded because a wrong measurement
+      # inside a correction is the thing this block exists to stop.)
       #
       # `--gating-outcome` is honest about what it does and does not fix. It
       # makes the DISAGREEMENT loud (`::error` + job summary) when the gating
       # step did not succeed. It does NOT detect truncation — nothing here
       # knows how many tests the suite has — and the durable stamp is a
       # three-repo change tracked as that plan's Phase 4b. TRUNCATION ITSELF IS
-      # A SEPARATE, UNCLOSED GAP, recorded as a plan-library follow-up; do not
-      # read this flag as covering it.
+      # A SEPARATE, UNCLOSED GAP, recorded as plan-library follow-up
+      # `eff25606-d3e0-4307-9e9c-3ddbceb2b0aa`; do not read this flag as
+      # covering it.
       #
       # The flag does NOT change the payload — verified at source, coord's
       # `ResultIngestRequest` has no field that could carry a gating outcome and
