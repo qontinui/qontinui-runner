@@ -9208,7 +9208,12 @@ mod tests {
             "claim_token": "agent:00000000-0000-0000-0000-000000000000"
         });
         let payload: LaunchPayload = serde_json::from_value(body).unwrap();
-        let result = payload_to_allocate_result(&payload);
+        let credential = AgentCredential {
+            token: "tok".to_string(),
+            exp: 0,
+            jti: uuid::Uuid::nil(),
+        };
+        let result = payload_to_allocate_result(&payload, &credential);
         let wt = &result.worktrees[0];
         assert_eq!(wt.parent_sha, "abc123");
         let p = &wt.parent_sha_provenance;
