@@ -1785,6 +1785,62 @@ bounded attempt, not an open loop:
   `/gate` (or `/blocked`) BEFORE moving on — turn the blocker into a watched gate, not a
   silent skip. Note the returned `gate_id`.
 
+### Registration mechanics — a returned `gate_id` is not the end of the transaction
+
+Every gate this skill registers (the emit-on-block gates above, the deferral gates in Step 3,
+the one named in the exit handoff) carries the same two mechanics. They are **inlined here, not
+cited**, because the copy of this skill a spawned session reads is the one bundled into the
+runner binary — a device with no claude-config checkout has no other copy to follow. Canonical
+spec: `_gate-registration` → "`gate_class`" and "Registration warnings".
+
+- **`initial_verdict_reason` — how you tell a REGISTERED-BUT-NOT-USABLE gate from a usable
+  one.** A returned `gate_id` proves only that the ROW was written. It is not evidence the gate
+  can ever CLEAR, and a gate that can never clear is a silent skip with an id on it — it rots
+  `open`, nothing escalates on it, and the ledger reports it as protection the session does not
+  have. **Branch on the VERDICT the registration response carries.** The gate is
+  REGISTERED-BUT-NOT-USABLE when `initial_verdict_reason` says the predicate could not be
+  evaluated (the *"cannot evaluate"* shape — coord saying in words that it has no way to answer
+  the question the gate asks), or when `initial_verdict` is a terminal state it can never clear
+  from (`misconfigured` / `failed`). In either case **withdraw it and re-register on a predicate
+  coord can evaluate**; do not report the id.
+  ⚠️ **A non-empty `warnings[]` is NOT that signal — read the warnings, do not count them.**
+  coord emits informational warnings freely and on this fleet the informational ones are the
+  majority; several say in so many words that the gate is registered and will clear on its own
+  condition. A steward that branches on `warnings[].is_empty()` withdraws healthy gates on
+  routine iterations, burns coord writes, and loops — the replacement carries the same
+  semantics and emits the same warning.
+  ⚠️ `initial_verdict` is an **advisory pre-insert** evaluation, not the row's verdict: the row
+  is born `open` always, and a sweep tick is what decides. So when you REPORT a gate's state in
+  the ledger, read the ROW back — `coord_gate_inspect(gate_id)`, or by anchor over
+  `GET /coord/agent-gates` (`/coord/gates` is the operator tier and 403s a session credential,
+  which is evidence about the route and never about the gate) — never quote the registration
+  response as the gate's current verdict. This is the same re-measure-every-iteration rule the
+  ledger format enforces, applied to gates.
+
+- **`gate_class` — what decides WHO MAY LATER CLEAR the gate.** Registration accepts an optional
+  `gate_class` (WHAT class of decision this is) alongside `clearance_audience` (WHO is expected
+  to clear it). coord resolves clearance authority from per-tenant `gate_clearance` policy rules
+  matched on the **exact class string**, so the class a steward files today is what a tenant rule
+  can attach authority to tomorrow. Classify from the deferred work, never by vibe:
+  `ops-confirm` for an operational confirmation — a deploy going healthy, a sweep running, a
+  migration or config applying, which is the shape of most of this steward's emit-on-block
+  gates; `routine-review` for a mechanical follow-up another session can judge on the diff;
+  `security-surface` when the deferred work would ITSELF fire a `security-and-autonomy` path
+  glob or content trigger (register has no free-text notes field, so put the glob or trigger
+  name in the `phase_name`, which is what makes the classification auditable afterwards).
+  **Omit when none applies — omitting is SAFE and is never a loophole**: an unclassified gate
+  gets the default bucket, which is never more permissive than today. A guessed class is worse
+  than no class.
+  ⚠️ **Omit it deliberately on a HUMAN-DECISION gate** — a PR the steward must not land, handed
+  to a person under `clearance_audience: "operator"`. None of the vocabulary fits a human PR
+  decision, and a class such as `routine-review` could let a future tenant rule admit an agent
+  clearer, which is exactly what the operator audience exists to prevent. Omitted, it resolves
+  to the default operator-only authority. **The steward never attests or clears a gate it
+  registered for a human decision** — under the agent audience,
+  `ClearanceAuthority::AgentAny` is *"any agent in the tenant, the registrant included"*, so
+  filing such a gate under the wrong audience lets the steward clear its own hand-off and
+  nullifies the remedy.
+
 ## Step 3 — Tier 2: autonomous handling of ANY deficiency found (the fully-autonomous pipeline)
 
 **Scope: not just wedges.** Tier 2 fires on *any deficiency the steward finds in the course
@@ -1812,8 +1868,11 @@ covers it, record a `POLICY_GAP` and proceed on your best judgement. Only a hit 
 closed escalation list (Step 4) goes to the operator.
 
 **Register a gate for anything you must defer**, with a returned `gate_id` — a deferred item
-without a gate is a silent drop (charter rule 7). Name every unchased anomaly in the ledger:
-what, why not chased, where to look.
+without a gate is a silent drop (charter rule 7). Classify it with `gate_class` (or omit
+deliberately) and check `initial_verdict_reason` before you count it as protection, per
+**"Registration mechanics"** in Step 2 — a gate coord cannot evaluate is the same silent drop
+with an id on it. Name every unchased anomaly in the ledger: what, why not chased, where to
+look.
 
 The pipeline, for each deficiency:
 
@@ -1994,7 +2053,10 @@ decision that is blocked:
 deploy going healthy, a CI run going green, a rate-limit window resetting, a coord leader-lease row
 being cleared — invoke `/blocked` to register the typed coord gate **BEFORE** stopping, and name the
 `gate_id` above. That turns the blocker into a watched gate instead of a report that dies with the
-session. If the blocker has no observable trigger, say so — that case is NOT a gate.
+session. If the blocker has no observable trigger, say so — that case is NOT a gate. Before you
+write the id into the handoff, apply **"Registration mechanics"** (Step 2): read the ROW back
+rather than the registration response, and do not report a gate whose `initial_verdict_reason`
+says the predicate cannot be evaluated — withdraw and re-register it instead.
 
 Close the session's final report with a **`POLICY_COMPLIANCE` footer** per the unified policy
 protocol, listing the clauses you applied and any `POLICY_GAP` you recorded.
