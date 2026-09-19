@@ -555,13 +555,39 @@ impl RungEmitter {
             // `transportRung.outboxWriteFailed` says how many observations
             // were handed to the emitter and never reached the outbox — the
             // `debug!` alone is silent at the default filter.
-            OUTBOX_WRITE_FAILED.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(
-                session = %lane_session_id,
-                transport = obs.transport,
-                "coord_transport_rung: outbox write failed ({e}) — observation dropped"
-            );
+            //
+            // Logged on the lane-miss arm's cadence (`warn!` on the first,
+            // then every 1000th, `debug!` in between): a failing outbox fails
+            // every call, so a per-call `warn!` would flood `.dev-logs`, and a
+            // `debug!` alone is invisible at the default filter.
+            let n = OUTBOX_WRITE_FAILED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 || n % 1000 == 0 {
+                tracing::warn!(
+                    dropped_total = n,
+                    session = %lane_session_id,
+                    transport = obs.transport,
+                    "coord_transport_rung: outbox write failed ({e}) — observation dropped \
+                     (GET /health transportRung.outboxWriteFailed carries the total)"
+                );
+            } else {
+                tracing::debug!(
+                    dropped_total = n,
+                    session = %lane_session_id,
+                    transport = obs.transport,
+                    "coord_transport_rung: outbox write failed ({e}) — observation dropped"
+                );
+            }
         }
+    }
+
+    /// Never-acked outbox rows evicted to stay under the byte cap
+    /// ([`OutboxWriter::dropped_unacked`]), for `GET /health`
+    /// `transportRung.outboxCapEvictedAllKinds`. The outbox is shared by every
+    /// session event kind and the writer does not record which kind it
+    /// evicted, so this is an UPPER BOUND on rung rows lost there — non-zero
+    /// means "rows may have died in the outbox", zero rules that arm out.
+    pub fn outbox_cap_evicted(&self) -> u64 {
+        self.outbox.dropped_unacked()
     }
 }
 
@@ -845,6 +871,39 @@ mod tests {
             outbox_write_failed_total(),
             before + 1,
             "an outbox write error must increment `outboxWriteFailed`"
+        );
+    }
+
+    /// `outboxCapEvictedAllKinds` reads the SHARED outbox's never-acked
+    /// evictions through the emitter — including rows of other kinds, which
+    /// is why the `/health` key says "all kinds".
+    #[test]
+    fn outbox_cap_evicted_reads_the_shared_outbox_eviction_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = Arc::new(
+            OutboxWriter::open_with_max_bytes(dir.path().join("session-outbox.jsonl"), 16 * 1024)
+                .expect("outbox opens"),
+        );
+        let emitter = RungEmitter::new(outbox.clone(), Uuid::new_v4());
+        assert_eq!(emitter.outbox_cap_evicted(), 0, "nothing evicted yet");
+
+        // Overflow the cap with a NON-rung kind, never acking.
+        let (m, s) = (Uuid::new_v4(), Uuid::new_v4());
+        for _ in 0..400 {
+            outbox
+                .record(
+                    m,
+                    s,
+                    SessionEventKind::Heartbeat,
+                    serde_json::json!({ "pad": "x".repeat(200) }),
+                )
+                .unwrap();
+        }
+        assert!(outbox.dropped_unacked() > 0, "the cap must have evicted");
+        assert_eq!(
+            emitter.outbox_cap_evicted(),
+            outbox.dropped_unacked(),
+            "the emitter reports the shared outbox's eviction total"
         );
     }
 }
