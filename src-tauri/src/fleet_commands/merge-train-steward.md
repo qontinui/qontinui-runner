@@ -1929,8 +1929,9 @@ state; keep watching the rest of the fleet.
   caught bad code here; a volume cap never caught any of it.
 - **Every change goes through the same worktree-isolated, vetted, CI-gated path a human
   session uses.** NEVER `--no-verify`. NEVER bypass a real (non-defect) gate —
-  `escalate-path-matched` and red CI are the system *working*; only a **diagnosed coord
-  defect** or **coord outage** justifies a recovery-merge, with evidence quoted on the PR
+  `escalate-path-matched` and red CI are the system *working* (act on the `pending_gate`
+  coord's `escalate` block names — `/babysit-prs` 4d; only its override arms go to the operator);
+  only a **diagnosed coord defect** or **coord outage** justifies a recovery-merge, with evidence quoted on the PR
   first (`/babysit-prs` Step 6 preconditions; the audit trail is mandatory per
   recovery-merge).
 - **Honest bookkeeping — PR state is DOUBLY unreliable; CONTENT on `origin/main` is the only
