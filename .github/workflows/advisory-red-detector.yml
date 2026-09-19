@@ -54,6 +54,8 @@ on:
       - "scripts/detect-schedule-red-streaks.sh"
       - "scripts/tests/test_schedule_red_streak_detector.sh"
       - "scripts/tests/fixtures/schedule-red-streaks/**"
+      - "scripts/lib/bound-hit-signature.jq"
+      - "scripts/tests/fixtures/bound-hit-signature/**"
       - ".github/workflows/advisory-red-detector.yml"
   pull_request:
     branches: [main]
@@ -61,6 +63,8 @@ on:
       - "scripts/detect-schedule-red-streaks.sh"
       - "scripts/tests/test_schedule_red_streak_detector.sh"
       - "scripts/tests/fixtures/schedule-red-streaks/**"
+      - "scripts/lib/bound-hit-signature.jq"
+      - "scripts/tests/fixtures/bound-hit-signature/**"
       - ".github/workflows/advisory-red-detector.yml"
   workflow_dispatch:
 
@@ -71,7 +75,7 @@ jobs:
   selftest:
     name: schedule-red-streak detector selftest
     runs-on: ubuntu-latest
-    # A checkout plus a handful of jq passes over ~100KB of recorded JSON.
+    # A checkout plus a few hundred jq passes over ~200KB of recorded JSON.
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5

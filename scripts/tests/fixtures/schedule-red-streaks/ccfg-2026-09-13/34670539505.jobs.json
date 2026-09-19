@@ -1,0 +1,35 @@
+{
+  "total_count": 3,
+  "jobs": [
+    {
+      "id": 103490944518,
+      "run_id": 34670539505,
+      "run_attempt": 1,
+      "name": "frontmatter",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-09-12T03:30:22Z",
+      "completed_at": "2026-09-12T04:02:02Z"
+    },
+    {
+      "id": 103490944638,
+      "run_id": 34670539505,
+      "run_attempt": 1,
+      "name": "guard-roster-windows",
+      "status": "completed",
+      "conclusion": "cancelled",
+      "started_at": "2026-09-12T03:30:22Z",
+      "completed_at": "2026-09-12T06:30:45Z"
+    },
+    {
+      "id": 103490944679,
+      "run_id": 34670539505,
+      "run_attempt": 1,
+      "name": "section-splice",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-09-12T03:30:22Z",
+      "completed_at": "2026-09-12T03:36:11Z"
+    }
+  ]
+}

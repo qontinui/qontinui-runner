@@ -1,0 +1,53 @@
+{
+  "total_count": 4,
+  "workflow_runs": [
+    {
+      "id": 900000101,
+      "name": "lint-frontmatter",
+      "event": "schedule",
+      "status": "completed",
+      "conclusion": "failure",
+      "head_branch": "main",
+      "head_sha": "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e",
+      "html_url": "https://example.invalid/SYNTHETIC-failed-night-not-a-real-run/900000101",
+      "created_at": "2026-09-14T03:31:00Z",
+      "run_attempt": 1
+    },
+    {
+      "id": 34735701419,
+      "name": "lint-frontmatter",
+      "event": "schedule",
+      "status": "completed",
+      "conclusion": "cancelled",
+      "head_branch": "main",
+      "head_sha": "1335de5853f3ac93a42c5b23cb42e46b88275176",
+      "html_url": "https://github.com/qontinui/qontinui-claude-config/actions/runs/34735701419",
+      "created_at": "2026-09-13T03:31:30Z",
+      "run_attempt": 2
+    },
+    {
+      "id": 34670539505,
+      "name": "lint-frontmatter",
+      "event": "schedule",
+      "status": "completed",
+      "conclusion": "cancelled",
+      "head_branch": "main",
+      "head_sha": "11c2caf22318c69ecc530969e5db30f2bffeaf57",
+      "html_url": "https://github.com/qontinui/qontinui-claude-config/actions/runs/34670539505",
+      "created_at": "2026-09-12T03:30:20Z",
+      "run_attempt": 1
+    },
+    {
+      "id": 34558750407,
+      "name": "lint-frontmatter",
+      "event": "schedule",
+      "status": "completed",
+      "conclusion": "success",
+      "head_branch": "main",
+      "head_sha": "4871b74b43d4072bc5e5af00cc3e92bfaecb4dde",
+      "html_url": "https://github.com/qontinui/qontinui-claude-config/actions/runs/34558750407",
+      "created_at": "2026-09-11T03:31:15Z",
+      "run_attempt": 1
+    }
+  ]
+}

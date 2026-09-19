@@ -1,0 +1,54 @@
+name: CI timeout marker selftest
+
+# Pins the in-band job-timeout marker contract (scripts/tests/test_ci_timeout_marker.py).
+#
+# WHY IT EXISTS. GitHub concludes a JOB-level `timeout-minutes` expiry as
+# `cancelled`, never `failure` -- the same conclusion a `cancel-in-progress`
+# supersede produces. The Frontend Coverage Producer timed out on 30 of 40 runs
+# at its old 45-minute bound and every one read as a supersede. Its fix is
+# in-band: a first-step start stamp, a budget-creep tripwire on green runs, and a
+# marker step that says in the log whether a cancelled run was a TIMEOUT, an
+# external cancel, or UNKNOWN. Those steps carry a literal `JOB_TIMEOUT_MINUTES`
+# that must track `timeout-minutes` by hand, and their bodies must never turn a
+# missing measurement into a verdict. This selftest executes the SHIPPED bodies
+# (extracted from the workflow YAML) against a fake clock and a stubbed `gh`,
+# and fails when the lockstep, the `if:` conditions, the stamp position or any
+# arm's routing drifts -- and when a carrier is added without its roster row.
+#
+# Hermetic: no network, no credentials (`gh` is stubbed), so it runs on `push`
+# to main as well and therefore has a baseline coord can read.
+#
+# NOT a merge gate. It tests a diagnostic, so it is deliberately absent from the
+# repo ruleset's required contexts. It IS inside ci-integrity.yml's scope
+# (`.github/workflows/**`) on a main-based PR, so the PR that adds or edits this
+# file needs `ci:gate-change=declared` (see advisory-red-detector.yml's header
+# for the full label grammar).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/**"
+      - "scripts/tests/test_ci_timeout_marker.py"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/**"
+      - "scripts/tests/test_ci_timeout_marker.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    name: CI timeout marker selftest
+    runs-on: ubuntu-latest
+    # A checkout plus a few dozen short bash invocations.
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Test the job-timeout marker and budget tripwire (no network)
+        shell: bash
+        run: python3 scripts/tests/test_ci_timeout_marker.py
