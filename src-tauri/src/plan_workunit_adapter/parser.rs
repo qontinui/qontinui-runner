@@ -342,6 +342,10 @@ static PHASE_TITLE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"^Phase\s+(\d+)([a-z]?)(?:\s*$|\s*[—–:(\-]|\.\s|\.$)").expect("valid regex")
 });
 
+/// `Phase` then a LETTERED number (`Phase 1e`, `Phase 2b`).
+static LETTERED_PHASE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^Phase\s+\d+[A-Za-z]").expect("valid regex"));
+
 /// A phase title whose name is struck after its prefix:
 /// `**Phase 1 — ~~make machine.json …~~ ALREADY EXECUTED**`.
 static STRUCK_PHASE_TITLE: Lazy<Regex> =
@@ -353,11 +357,11 @@ static STRUCK_PHASE_TITLE: Lazy<Regex> =
 /// `(optional, later)`); declaring one would leave coord a phase that can
 /// never be covered. Arm A — an explicit `Phase N` heading — is NOT filtered:
 /// that is the author naming a phase, and whether it was deferred is its
-/// delivery state, not whether it exists (filtering it dropped real phases in
-/// 73 corpus plans).
+/// delivery state, not whether it exists (filtering it too dropped
+/// currently-declared phases in 73 of 1792 corpus plans, measured 2026-09-19).
 static NOT_DELIVERED_MARKER: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r"(?i)not scheduled|not this plan|not built|not needed|\(defer|\bdeferred\b|\bdelegated\b|\bdropped\b|\bwithdrawn\b|\bsplit (?:out|to|into)\b|follow-?up plan|separate plan|\bits own plan\b|\bown plan, own vet\b|\bdischarged\b|\bmoot\b|\(optional\b|\bstretch\b|\bskip if\b",
+        r"(?i)not scheduled|not this plan|not built|not needed|\(defer|\bdeferred\b|\bdelegated\b|\bdropped\b|\bwithdrawn\b|\bsplit (?:out|to|into)\b|follow-?up plan|separate plan|\bits own plan\b|\bown plan, own vet\b|\bdischarged\b|\bmoot\b|\(optional\b|\bstretch\b|\bskip if\b|\bseparately\b|\(separate\)|\balready exists?\b",
     )
     .expect("valid regex")
 });
@@ -508,38 +512,66 @@ enum TableState {
     OtherTable,
 }
 
-/// How authoritative a declared phase's name is; a higher rank renames a lower.
+/// How authoritative a declared phase's NAME is; a higher rank renames a
+/// lower. Separate from whether arm A declared the index at all
+/// ([`Declared::by_heading`]), which is what protects an index from refusal.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum NameRank {
-    /// Arms B-D: a list item or table row.
-    Inferred,
-    /// Arm A, a heading or bold line that is a sentence about the phase.
+    /// Arm A, a heading or bold line that is a sentence about the phase
+    /// (`Phase 4 execution record`, `Phase 1 replay — measured`): a report
+    /// ABOUT the phase, the weakest name.
     HeadingSentence,
+    /// Arms B-D: a list item or table row outside a phase-list section.
+    Inferred,
+    /// Arms B-D inside a phase-list section.
+    InferredInSection,
     /// Arm A, a heading or bold line that is a phase TITLE.
     HeadingTitle,
 }
 
-/// One declared phase and the rank of the arm that named it.
+impl NameRank {
+    fn is_heading(self) -> bool {
+        matches!(self, NameRank::HeadingSentence | NameRank::HeadingTitle)
+    }
+}
+
+/// One declared phase, the rank of the name it carries, and whether any arm-A
+/// heading declared it.
 struct Declared {
     phase: ParsedPhase,
     rank: NameRank,
+    by_heading: bool,
 }
 
 /// Record `index`, keeping the FIRST occurrence's position; a later occurrence
 /// of a higher [`NameRank`] replaces the name, so a status table at the top of
-/// a plan cannot rename its `### Phase N — x`, and `Phase 4 — tests` wins over
-/// an earlier `Phase 4 gap, verified`.
+/// a plan cannot rename its `### Phase N — x`, `Phase 4 — tests` wins over an
+/// earlier `Phase 4 gap, verified`, and a phase list's own titles win over a
+/// later report heading about the same phase.
 fn declare(out: &mut Vec<Declared>, index: u32, name: String, rank: NameRank) {
     match out.iter_mut().find(|d| d.phase.index == index) {
-        Some(d) if rank > d.rank => {
-            d.phase.name = name;
-            d.rank = rank;
+        Some(d) => {
+            if rank > d.rank {
+                d.phase.name = name;
+                d.rank = rank;
+            }
+            d.by_heading |= rank.is_heading();
         }
-        Some(_) => {}
         None => out.push(Declared {
             phase: ParsedPhase { index, name },
             rank,
+            by_heading: rank.is_heading(),
         }),
+    }
+}
+
+/// The rank of an arm B-D name: higher inside a phase-list section, so the
+/// `## Phases` table outranks one under `## Divergent design for B`.
+fn inferred_rank(in_section: bool) -> NameRank {
+    if in_section {
+        NameRank::InferredInSection
+    } else {
+        NameRank::Inferred
     }
 }
 
@@ -563,8 +595,10 @@ fn heading_rank(name: &str) -> NameRank {
 /// `2026-09-19-runner-detect-phases-misses-plans-that-list-phases-in-a-table-or-prose`):
 ///
 /// - **A** — a `#`-heading (after an optional section enumerator, so
-///   `## 5. Phase 0 — x` counts) or a `**`-bold line: `Phase`, whitespace,
-///   digits. The pre-existing arm; its names outrank the other arms'.
+///   `## 5. Phase 0 — x` counts, unless the number is lettered — `### A.
+///   Phase 1e` is another plan's sub-phase) or a `**`-bold line: `Phase`,
+///   whitespace, digits. The pre-existing arm; its titles name a phase ahead of
+///   every other arm ([`NameRank`]).
 /// - **B** — inside a phase list (below), a column-0 list item whose bold text
 ///   is a phase TITLE ([`PHASE_TITLE`]): `- **Phase 1 — schema**`, never
 ///   `- **Phase 3's check could ossify**`. Outside a phase-list section a
@@ -603,6 +637,7 @@ fn detect_phases(body: &str) -> Vec<ParsedPhase> {
         }
     };
     let mut list = PhaseList::Off;
+    let mut in_section = false;
     let mut intro = String::new();
     let mut table = TableState::Outside;
 
@@ -622,21 +657,23 @@ fn detect_phases(body: &str) -> Vec<ParsedPhase> {
         if t.starts_with('#') {
             let rest = t.trim_start_matches('#');
             let level = t.len() - rest.len();
-            let text = if level <= 6 && rest.starts_with(char::is_whitespace) {
+            let (text, enumerated) = if level <= 6 && rest.starts_with(char::is_whitespace) {
                 let text = HEADING_ENUMERATOR.replace(rest.trim(), "").into_owned();
-                let opens = PHASE_LIST_HEADING.is_match(&text)
+                in_section = PHASE_LIST_HEADING.is_match(&text)
                     && !PHASE_LIST_HEADING_NAMES_PHASES.is_match(&text);
-                list = if opens {
+                list = if in_section {
                     PhaseList::Armed
                 } else {
                     PhaseList::Off
                 };
                 intro.clear();
-                text
+                let enumerated = text.len() != rest.trim().len();
+                (text, enumerated)
             } else {
-                rest.trim_start().to_string()
+                (rest.trim_start().to_string(), false)
             };
-            if let Some(index) = phase_index_at(&text) {
+            let lettered = LETTERED_PHASE.is_match(&text);
+            if let (Some(index), false) = (phase_index_at(&text), enumerated && lettered) {
                 let name = text.trim_end_matches(['#', '*']).trim().to_string();
                 let rank = heading_rank(&name);
                 declare(&mut out, index, name, rank);
@@ -689,7 +726,7 @@ fn detect_phases(body: &str) -> Vec<ParsedPhase> {
                 if title.is_some() || !procedure {
                     if let Some(index) = index {
                         let name = bold.unwrap_or_else(|| content.to_string());
-                        declare(&mut out, index, name, NameRank::Inferred);
+                        declare(&mut out, index, name, inferred_rank(in_section));
                     }
                 }
                 continue;
@@ -761,14 +798,14 @@ fn detect_phases(body: &str) -> Vec<ParsedPhase> {
                         .into_iter()
                         .find(|n| !n.is_empty())
                         .unwrap_or_default();
-                    declare(&mut out, index, name, NameRank::Inferred);
+                    declare(&mut out, index, name, inferred_rank(in_section));
                 }
                 _ => {}
             }
         }
     }
     out.into_iter()
-        .filter(|d| d.rank != NameRank::Inferred || !refused.contains(&d.phase.index))
+        .filter(|d| d.by_heading || !refused.contains(&d.phase.index))
         .map(|d| d.phase)
         .collect()
 }
@@ -1066,7 +1103,7 @@ mod tests {
     /// header declares nothing.
     #[test]
     fn phases_arm_d_table_keyed_on_a_phase_header() {
-        let body = "# T\n\n| Phase | Deliverable |\n|---|---|\n| 1 | re-export forms |\n| **2** | basis |\n| Phase 3 | label |\n| ~~4~~ | dropped |\n\n| # | Claim |\n|---|---|\n| 5 | not a phase |\n";
+        let body = "# T\n\n| Phase | Deliverable |\n|---|---|\n| 1 | re-export forms |\n| **2** | basis |\n| Phase 3 | label |\n| ~~4~~ | gone |\n\n| # | Claim |\n|---|---|\n| 5 | not a phase |\n";
         let p = parse(body);
         assert_eq!(indices(body), vec![1, 2, 3]);
         assert_eq!(p.phases[0].name, "re-export forms");
@@ -1259,6 +1296,43 @@ mod tests {
         assert_eq!(indices(body), vec![1]);
     }
 
+    /// A phase-list section whose introduction marks it not delivered by this
+    /// plan opens no list.
+    #[test]
+    fn phases_a_section_intro_marked_not_delivered_opens_no_list() {
+        let body = "# T\n\n## Phases\n\nDeferred to a follow-up plan.\n\n1. a\n2. b\n";
+        assert!(indices(body).is_empty());
+    }
+
+    /// Corpus wording for work done elsewhere or not at all: `shipping
+    /// separately`, `(separate)`, `already exist`.
+    #[test]
+    fn phases_separate_and_already_existing_work_is_not_declared() {
+        let body = "# T\n\n## Phases\n\n1. **(Layer 1 — shipping separately, prerequisite)**\n2. build\n3. **(separate)** scope TBD\n4. **Gates already exist.**\n";
+        assert_eq!(indices(body), vec![2]);
+    }
+
+    /// An enumerated heading naming a LETTERED phase (`### A. Phase 1e`) is
+    /// another plan's sub-phase, not this plan's phase 1.
+    #[test]
+    fn phases_an_enumerated_lettered_heading_does_not_declare() {
+        let body = "# T\n\n### A. Phase 1e: extend Phase 1d\n\n## 2. Phase 2 — real\n";
+        assert_eq!(indices(body), vec![2]);
+    }
+
+    /// A phase list's own title outranks a later report heading ABOUT the
+    /// phase, and a table in the phase section outranks one elsewhere — but a
+    /// refused index a heading declares is still kept.
+    #[test]
+    fn phases_name_ranks_list_titles_over_report_sentences() {
+        let body = "# T\n\n## Divergent design for B\n\n| Phase | Work |\n|---|---|\n| 1 | the design not taken |\n\n## Phases\n\n| Phase | Work |\n|---|---|\n| 1 | the real phase |\n\n- **Phase 2 — remove engineering**\n\n## Phase 2 execution record (2026-08-16)\n";
+        let p = parse(body);
+        let got: Vec<(u32, &str)> = p.phases.iter().map(|x| (x.index, x.name.as_str())).collect();
+        assert_eq!(got, vec![(1, "the real phase"), (2, "Phase 2 — remove engineering")]);
+        let body = "# T\n\n## Phase 4 execution record\n\n| Phase | Outcome |\n|---|---|\n| 4 | deferred |\n";
+        assert_eq!(indices(body), vec![4]);
+    }
+
     /// Regression for the measured unit (`cf9ae0b2`): the parser used to
     /// record only `{0}` from the bold `**Phase 0 is a gate, not a step.**`
     /// line. The plan's real declaration is the numbered list under
@@ -1291,8 +1365,10 @@ mod tests {
     #[test]
     #[ignore = "reads a plans directory named by QONTINUI_PHASE_CENSUS_DIR"]
     fn phase_census() {
-        let dir = std::env::var("QONTINUI_PHASE_CENSUS_DIR")
-            .expect("set QONTINUI_PHASE_CENSUS_DIR to a plans/ directory");
+        let Ok(dir) = std::env::var("QONTINUI_PHASE_CENSUS_DIR") else {
+            println!("phase_census: set QONTINUI_PHASE_CENSUS_DIR to a plans/ directory");
+            return;
+        };
         let mut skipped = 0;
         let mut names: Vec<String> = Vec::new();
         for entry in std::fs::read_dir(&dir).expect("readable plans dir") {
@@ -1323,8 +1399,11 @@ mod tests {
                 _ => many += 1,
             }
             let indices: Vec<String> = got.iter().map(|p| p.index.to_string()).collect();
-            let names: Vec<&str> = got.iter().map(|p| p.name.as_str()).collect();
-            println!("phase_census_row\t{name}\t{}\t{names:?}", indices.join(","));
+            let phase_names: Vec<&str> = got.iter().map(|p| p.name.as_str()).collect();
+            println!(
+                "phase_census_row\t{name}\t{}\t{phase_names:?}",
+                indices.join(",")
+            );
         }
         println!(
             "phase_census plans={plans} skipped={skipped} zero={zero} one={one} two_or_more={many}"
