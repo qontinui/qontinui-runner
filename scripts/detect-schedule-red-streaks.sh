@@ -122,6 +122,18 @@ SIGNATURE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/bound-hit-signature
 
 die() { echo "detect-schedule-red-streaks: $*" >&2; exit 2; }
 
+# Every jq below goes through this wrapper, for the fleet boxes the merge-train
+# steward runs this detector on: Git Bash on Windows, where `jq` is a native
+# jq.exe that writes CRLF. The trailing `\r` then rides into every value that is
+# `read` off a `@tsv` line or compared as a string -- `cancelled\r` is not
+# `cancelled`, a streak of `9\r` fails the numeric check -- so the detector dies
+# exit 2 on healthy input, or, in the cancellation tally, miscounts without a
+# word. Strip the CR here rather than pass `--binary`: jq.exe honours that
+# flag, but Linux jq 1.6 and 1.7 reject it as an unknown option. `pipefail`
+# (set above) keeps jq's own exit status, which `-e` and every `if !` rely on.
+jq() { command jq "$@" | tr -d '\r'; }
+command -v jq >/dev/null || die "jq not found on PATH -- every read below parses JSON with it"
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo)        REPO="${2:?--repo needs a value}"; shift 2 ;;
@@ -159,6 +171,7 @@ case "$WINDOW" in ''|*[!0-9]*) die "--window must be a positive integer" ;; esac
 case "$CLUSTER_MIN" in ''|*[!0-9]*) die "--cluster-min must be a positive integer" ;; esac
 [ "$CLUSTER_MIN" -ge 2 ] || die "--cluster-min must be at least 2"
 [ -f "$SIGNATURE" ] || die "bound-hit signature '$SIGNATURE' not found"
+[ -n "$FIXTURE_DIR" ] || command -v gh >/dev/null || die "gh not found on PATH -- live mode reads the API with it"
 
 # NO error suppression anywhere below. A read that fails is UNKNOWN, and a
 # detector that quietly reports "no findings" because its own API call 403'd

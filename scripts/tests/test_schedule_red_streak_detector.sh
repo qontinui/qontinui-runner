@@ -28,6 +28,11 @@
 
 set -euo pipefail
 
+# The harness's own jq reads must not carry a native Windows jq.exe's CRLF into
+# the string comparisons below either (see the wrapper in the detector).
+real_jq="$(type -P jq)" || { echo "::error::jq not found on PATH"; exit 1; }
+jq() { "$real_jq" "$@" | tr -d '\r'; }
+
 tests_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 scripts_dir="$(dirname "$tests_dir")"
 detector="$scripts_dir/detect-schedule-red-streaks.sh"
@@ -374,6 +379,28 @@ zeros='[{"run_id":1,"created_at":"2026-01-01T00:00:00Z","name":"m","conclusion":
         {"run_id":3,"created_at":"2026-01-03T00:00:00Z","name":"m","conclusion":"cancelled","started_at":"2026-01-03T00:00:00Z","completed_at":"2026-01-03T00:00:00Z"},
         {"run_id":4,"created_at":"2026-01-04T00:00:00Z","name":"m","conclusion":"cancelled","started_at":null,"completed_at":"2026-01-04T00:00:00Z"}]'
 assert "never-started cancels form no cluster"      "0 0 0" "$(printf '%s' "$zeros" | jq -f "$sig" | jq -r '"\(.bound_hits | length) \(.undecided | length) \([.jobs[].cancelled_n] | add // 0)"')"
+
+# The merge-train steward runs the detector from Git Bash on Windows, where jq
+# is a native jq.exe that writes CRLF. A stub with that behaviour, first on
+# PATH, must change nothing: without the detector's jq wrapper the streak reads
+# `9\r` and dies exit 2, and the tally reads `cancelled\r` and counts no
+# bound-hit. The stub keeps jq's exit status, which the detector relies on.
+echo ""
+echo "Under a CRLF-writing jq (a native Windows jq.exe):"
+mkdir -p "$work/crlf-bin"
+cat > "$work/crlf-bin/jq" <<EOF_STUB
+#!/usr/bin/env bash
+set -o pipefail
+"$real_jq" "\$@" | sed 's/\$/\r/'
+EOF_STUB
+chmod +x "$work/crlf-bin/jq"
+assert "the stub really writes CRLF"                yes "$(PATH="$work/crlf-bin:$PATH" command jq -n '1' | grep -q $'\r' && echo yes || echo no)"
+rc=0; PATH="$work/crlf-bin:$PATH" bash "$detector" --fixture-dir "$fixtures/real-2026-08-24" > "$work/out.txt" 2>&1 || rc=$?
+assert "real window: still exit 1, not 2"           1 "$rc"
+assert "real window: still a streak of 9"           yes "$(saw '317525761) -- 9 consecutive failing scheduled runs on main')"
+rc=0; PATH="$work/crlf-bin:$PATH" bash "$detector" --fixture-dir "$fixtures/ccfg-2026-09-13-plus-synthetic-night" > "$work/out.txt" 2>&1 || rc=$?
+assert "night 3: still exit 1"                      1 "$rc"
+assert "night 3: still tallies 3 bound-hits"        yes "$(saw '; cancelled runs: 3 bound-hit (counted as failing), 0 neutral, 0 unclassified')"
 
 echo ""
 if [ "$failures" -gt 0 ]; then
