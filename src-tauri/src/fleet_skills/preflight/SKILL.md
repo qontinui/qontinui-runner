@@ -403,11 +403,15 @@ before it. `/implement-plan` Step 0.45 carries the same command; this is it for
 every task that starts here instead (a post-merge follow-up, a no-plan
 dispatch), which otherwise reaches its rebase with no baseline at all.
 
-- **Record ONCE per session.** `record` overwrites the session's baseline file
-  unconditionally, so a second `record` (say `/preflight` here and then
-  `/implement-plan` Step 0.45 in the same session) moves the start FORWARD and
-  hides whatever landed in between. If this session already recorded one
-  (`test -f ~/.qontinui/landed-since/<session-id>.json`), skip this command.
+- **Record whenever a task reaches a repo the session has not recorded yet;
+  a second `record` MERGES.** A repo already in the baseline keeps its sha (a
+  baseline never moves forward past what a peer landed in between), a repo
+  named for the first time is added at the sha just fetched, and the globs are
+  unioned — `kept <repo> <sha>` names each baseline left alone. Until
+  2026-09-19 this bullet said *"record ONCE per session — a second record
+  overwrites"*, which left a session running a second plan in a second repo
+  with no baseline it was allowed to take (measured on a `/vet-imp` session:
+  round-1 runner globs, a round-3 coord plan, `check` INCOMPLETE).
 - `record` exits `0` when every glob's repo was fetched and pinned, `3`
   (INCOMPLETE) when, e.g., a glob reached no checkout, a fetch failed or the file
   could not be written — the baseline
