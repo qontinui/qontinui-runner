@@ -2438,7 +2438,11 @@ mod tests {
             std::fs::symlink_metadata(&link).is_err(),
             "the link itself must be gone"
         );
-        assert_eq!(std::fs::read(&file).unwrap(), b"keep", "the target must survive");
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            b"keep",
+            "the target must survive"
+        );
     }
 
     /// A dangling symlink (its target already gone) is still a link, and
