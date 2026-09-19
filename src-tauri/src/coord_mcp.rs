@@ -5223,9 +5223,13 @@ pub(crate) fn session_tenant_decision(nonce: Option<&str>) -> SessionTenantDecis
 /// the whole decision runs on the blocking pool, exactly where the per-site
 /// `device_bearer_for` call used to run.
 ///
-/// A join failure (panic or cancellation) degrades to `Ok((None, None))` —
-/// byte-for-byte the old `.ok().flatten()` behavior — rather than manufacturing
-/// a refusal out of an executor hiccup.
+/// A join failure (panic or cancellation) is a REFUSAL (`503`), not
+/// `Ok((None, None))`: the latter — the pre-B3 `.ok().flatten()` shape — dropped
+/// the tenant with the bearer, and the caller then re-minted for `None`, i.e.
+/// the machine's DEFAULT slot, so a session pinned to tenant B was one executor
+/// hiccup away from presenting tenant A's credential. An unresolved measurement
+/// renders as unresolved (the same rule `/health`'s `activeTenantPin` follows),
+/// never as the default (review W2, 2026-09-19).
 pub(crate) async fn session_bearer_and_tenant_or_refuse(
     nonce: Option<String>,
 ) -> Result<(Option<Uuid>, Option<String>), (u16, String)> {
@@ -5236,7 +5240,12 @@ pub(crate) async fn session_bearer_and_tenant_or_refuse(
     .await
     {
         Ok(res) => res,
-        Err(_) => Ok((None, None)),
+        Err(e) => Err((
+            503,
+            format!(
+                "tenant resolution did not complete (blocking task failed: {e}); refusing rather than falling back to the machine's default credential slot"
+            ),
+        )),
     }
 }
 
