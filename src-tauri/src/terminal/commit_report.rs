@@ -579,10 +579,9 @@ pub fn dispatch_stats() -> (u64, u64) {
 // a registry, and coord never sees it. This section is the runner's half of
 // the notify-after-action contract for exactly those commands:
 //
-// 1. **Classify** the Bash `tool_use` command ([`classify_commands`]), with
-//    the same first-word-of-a-segment rule [`command_is_git_push`] uses, so
-//    `echo "git push --force"` is text, not a push. Each segment carries its
-//    own working directory (`cd`, `git -C`), and `bash -c "…"`, `xargs`,
+// 1. **Classify** the Bash `tool_use` command ([`classify_call`]), with the
+//    same first-word-of-a-segment rule [`command_is_git_push`] uses, so
+//    `echo "git push --force"` is text, not a push. `bash -c "…"`, `xargs`,
 //    `sudo`, `timeout`, `env` … are looked through.
 // 2. **Hold** the classification in a bounded pending map keyed on the
 //    `tool_use_id` ([`SensitiveActionTracker`]). The transcript parser is
@@ -591,18 +590,17 @@ pub fn dispatch_stats() -> (u64, u64) {
 //    owned by the transcript watcher's per-session tail loop, capped at
 //    [`PENDING_ACTION_CAPACITY`] entries and expires entries after
 //    [`PENDING_ACTION_TTL`].
-// 3. **Emit only what happened**: positive evidence in the output (a
-//    `(forced update)` / `[deleted]` line inside a `To <url>` block — human
-//    or `--porcelain` — npm's `+ name@ver`, cargo's `Published`) always
-//    counts; anything inferred from the command alone counts only when the
-//    result is not `is_error`, was not interrupted and did not run in the
-//    background. The output is read ONCE per tool call, its `To` blocks are
-//    attributed to the push segments that printed them, and a `From <url>`
+// 3. **Emit what happened**: EVERY forced or deleted ref in EVERY `To <url>`
+//    block (human or `--porcelain`), npm's `+ name@ver`, cargo's `Published`
+//    — positive evidence, reported even when the call failed. When no `To`
+//    block exists, the pushes' declared actions are reported, but only for
+//    a call that succeeded, was not interrupted and did not run in the
+//    background. The output is read ONCE per tool call, and a `From <url>`
 //    (fetch) table never counts.
-// 4. **Filter noise (plan design decision D8)**: a force-push or delete of
-//    the agent's OWN non-default working branch is routine and is not
-//    notified; the default branch, tags, `release/*`/`hotfix/*` and any other
-//    branch are. See [`ref_action_is_notable`]. Unknown never suppresses.
+// 4. **Suppress one shape only (plan design decision D8)**: a force-push or
+//    delete of the agent's OWN working branch, verified on every clause of
+//    [`may_suppress`]. Everything else — anything unusual, anything git
+//    cannot answer — notifies.
 // 5. **POST** through the same session outbox → `CoordSync` drain → device-JWT
 //    path the commit report uses, to `POST /coord/agent-notifications` (the
 //    HTTP twin of `coord_notify_sensitive_action`). The drain arm lives in
@@ -713,9 +711,15 @@ pub struct GitPushIntent {
     /// `--tags` / `--mirror` — the push covers tags, which the D8 noise rule
     /// always notifies.
     pub tags: bool,
-    /// `--dry-run` / `-n` — pushes nothing. Kept (not dropped) so its output
-    /// block can be attributed to it rather than to a real push.
+    /// `--dry-run` / `-n` — pushes nothing, but still counts as a push
+    /// segment for D8 clause (a).
     pub dry_run: bool,
+    /// `--all` / `--branches` / `--mirror` — every branch, not one.
+    pub all_refs: bool,
+    /// A bare `:` or `+:` — the matching refspec, every common branch.
+    pub matching: bool,
+    /// How many refspecs followed the remote.
+    pub refspec_count: usize,
 }
 
 /// One classified command. A `GitPush` may be plain or a dry-run (see
@@ -965,11 +969,6 @@ fn redirection_takes_next(word: &str) -> bool {
     is_redirection(word) && (word.ends_with('>') || word.ends_with('<'))
 }
 
-/// The words of a segment from its PROGRAM on: leading env assignments,
-/// shell keywords (`if`, `then`, `do`, `else`, `{`, `!`, `time`, …) and
-/// transparent wrappers with their own arguments (`timeout <dur>`,
-/// `env VAR=… [-i] [-u NAME]`, `nohup`, `command`, `exec`) are skipped, so
-/// `if git push -f; then …` and `timeout 60 git push -f` are pushes.
 /// The words of a segment from its PROGRAM on. Skipped in front of it:
 /// leading env assignments, shell keywords (`if`, `then`, `do`, `else`, `{`,
 /// `!`, …) and transparent wrappers together with their own arguments —
@@ -1061,45 +1060,136 @@ fn args_without_redirections(args: &[String]) -> Vec<&str> {
     out
 }
 
+/// Whether a shell string opens a group — an unquoted `(` (a subshell or a
+/// `$(…)`) or a `{` word. A `cd` inside a group does not outlive it, which
+/// per-segment tracking cannot see.
+fn has_unquoted_group(command: &str) -> bool {
+    let mut quote: Option<char> = None;
+    let mut prev_boundary = true;
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                } else if c == '\\' && q == '"' {
+                    chars.next();
+                }
+            }
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '\\' => {
+                    chars.next();
+                }
+                '(' => return true,
+                '{' if prev_boundary && chars.peek().is_none_or(|n| n.is_whitespace()) => {
+                    return true
+                }
+                _ => {}
+            },
+        }
+        prev_boundary = c.is_whitespace() || matches!(c, ';' | '&' | '|' | '\n');
+    }
+    false
+}
+
 // ── Classification ───────────────────────────────────────────────────────────
 
 /// One classified command and the directory it runs in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassifiedCommand {
     pub cmd: SensitiveCommand,
-    /// The segment's own working directory: the transcript `cwd`, moved by
-    /// every `cd`/`pushd` segment before it (a relative one resolved against
-    /// the directory in effect, never against the runner's own cwd) and by
-    /// the segment's own `git -C`. Empty = unknown (`cd -`, `cd ~`, a
-    /// relative `cd` with no base) — which makes the D8 rule notify.
-    ///
-    /// Known limit: a subshell `( cd x && … )` does not restore the directory
-    /// afterwards, because segments are not scoped. The ownership check in
-    /// [`gather_ref_facts`] is the backstop — a push whose remote does not
-    /// match this directory's remote is treated as not-the-working-branch.
+    /// The transcript `cwd`, moved by every `cd`/`pushd` before this segment
+    /// (relative paths against the directory in effect, never the runner's
+    /// own cwd) and by the segment's own `git -C`. Empty = unknown.
     pub dir: String,
 }
 
-/// Classify every command in a shell string, with each one's directory.
-///
-/// EVERY `git push` is returned — plain and dry-run ones included — because
-/// the output's `To` blocks are attributed to push segments by position (see
-/// [`interpret_tool_use`]), and a block from a plain push must not be taken
-/// for a forced one. The other kinds are returned only when sensitive.
-/// `bash -c "…"` / `sh -c "…"` are classified by their inner script.
-pub fn classify_commands(command: &str, cwd: &str) -> Vec<ClassifiedCommand> {
-    classify_commands_depth(command, cwd, 0)
+/// One Bash call, classified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassifiedCall {
+    /// Every `git push` (plain and dry-run included) and every sensitive
+    /// other command, in order.
+    pub commands: Vec<ClassifiedCommand>,
+    /// How many `git push` segments the call contains, dry-runs included —
+    /// D8 clause (a).
+    pub push_segments: usize,
+    /// Whether every segment's working directory is known with CERTAINTY —
+    /// D8 clause (c). False on: `popd`; a `cd`/`pushd` to somewhere unknown
+    /// (`cd -`, `cd ~`, `$VAR`, a relative path with no base); any `cd` in a
+    /// call that opens a group (`( … )`, `{ … }`, `$( … )`) or inside a
+    /// nested `bash -c`; `env -C` / `--chdir`; `sudo -D`; `git --git-dir` /
+    /// `--work-tree`; any `GIT_DIR=` / `GIT_WORK_TREE=` assignment.
+    pub dir_certain: bool,
 }
 
-fn classify_commands_depth(command: &str, cwd: &str, depth: u8) -> Vec<ClassifiedCommand> {
+impl ClassifiedCall {
+    /// Whether any command in the call is one this notifier reports.
+    pub fn any_sensitive(&self) -> bool {
+        self.commands.iter().any(|c| is_sensitive(&c.cmd))
+    }
+}
+
+struct ClassifyState {
+    commands: Vec<ClassifiedCommand>,
+    push_segments: usize,
+    dir_certain: bool,
+}
+
+/// Classify a Bash call: its commands, each with its directory, and the two
+/// call-wide facts D8's suppression clauses (a) and (c) need.
+pub fn classify_call(command: &str, cwd: &str) -> ClassifiedCall {
+    let mut st = ClassifyState {
+        commands: Vec::new(),
+        push_segments: 0,
+        dir_certain: !cwd.trim().is_empty(),
+    };
+    classify_into(&mut st, command, cwd, 0);
+    ClassifiedCall {
+        commands: st.commands,
+        push_segments: st.push_segments,
+        dir_certain: st.dir_certain,
+    }
+}
+
+/// [`classify_call`]'s commands alone.
+pub fn classify_commands(command: &str, cwd: &str) -> Vec<ClassifiedCommand> {
+    classify_call(command, cwd).commands
+}
+
+fn classify_into(st: &mut ClassifyState, command: &str, cwd: &str, depth: u8) {
+    let grouped = has_unquoted_group(command);
     let mut dir = cwd.to_string();
-    let mut out = Vec::new();
     for seg in shell_segments(command) {
+        // Directory changes a segment can make that are not a `cd`.
+        for (k, w) in seg.iter().enumerate() {
+            if w.starts_with("GIT_DIR=")
+                || w.starts_with("GIT_WORK_TREE=")
+                || w == "--chdir"
+                || w.starts_with("--chdir=")
+            {
+                st.dir_certain = false;
+            }
+            let prog = seg[..k].iter().find(|p| !is_env_assignment(p));
+            if (w == "-C" && prog.is_some_and(|p| program_is(p, "env")))
+                || (w == "-D" && prog.is_some_and(|p| program_is(p, "sudo")))
+            {
+                st.dir_certain = false;
+            }
+        }
         let words = command_words(&seg);
         let Some(program) = words.first() else {
             continue;
         };
+        if program_is(program, "popd") {
+            st.dir_certain = false;
+            dir = String::new();
+            continue;
+        }
         if program_is(program, "cd") || program_is(program, "pushd") {
+            if grouped || depth > 0 {
+                st.dir_certain = false;
+            }
             let target = words[1..]
                 .iter()
                 .find(|w| !(w.starts_with('-') && w.len() > 1));
@@ -1107,6 +1197,9 @@ fn classify_commands_depth(command: &str, cwd: &str, depth: u8) -> Vec<Classifie
                 Some(t) if t != "-" => join_dir(&dir, t),
                 _ => String::new(), // `cd`, `cd -`: somewhere we cannot see
             };
+            if dir.is_empty() {
+                st.dir_certain = false;
+            }
             continue;
         }
         if ["bash", "sh", "zsh", "dash"]
@@ -1115,37 +1208,72 @@ fn classify_commands_depth(command: &str, cwd: &str, depth: u8) -> Vec<Classifie
         {
             if depth < 2 {
                 if let Some(script) = shell_c_script(&words[1..]) {
-                    out.extend(classify_commands_depth(script, &dir, depth + 1));
+                    classify_into(st, script, &dir, depth + 1);
                 }
             }
             continue;
         }
         if let Some(cmd) = classify_segment(words) {
             let seg_dir = if program_is(program, "git") {
+                if git_overrides_dir(&words[1..]) {
+                    st.dir_certain = false;
+                }
                 git_dash_c_dir(&words[1..], &dir)
             } else {
                 dir.clone()
             };
-            out.push(ClassifiedCommand { cmd, dir: seg_dir });
+            if matches!(cmd, SensitiveCommand::GitPush(_)) {
+                st.push_segments += 1;
+            }
+            st.commands.push(ClassifiedCommand { cmd, dir: seg_dir });
         }
     }
-    out
 }
 
-/// The script of `bash -c '<script>'` (also `-lc`, `-ec`, `-xc` clusters).
+/// The script of `bash -c '<script>'` — also `-lc`, `-ec`, and with
+/// value-taking options before it (`-o pipefail`, `+o`, `-O shopt`,
+/// `+O`, `--rcfile f`, `--init-file f`).
 fn shell_c_script(args: &[String]) -> Option<&str> {
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
-        if a.starts_with('-') && !a.starts_with("--") && a[1..].contains('c') {
-            return args.get(i + 1).map(String::as_str);
+        if matches!(a, "-o" | "+o" | "-O" | "+O" | "--rcfile" | "--init-file") {
+            i += 2;
+            continue;
         }
-        if !a.starts_with('-') {
-            return None; // `bash script.sh` — a file we cannot see
+        if a.starts_with("--") {
+            i += 1; // `--norc`, `--login`, …
+            continue;
         }
-        i += 1;
+        if (a.starts_with('-') || a.starts_with('+')) && a.len() > 1 {
+            if a.starts_with('-') && a[1..].contains('c') {
+                return args.get(i + 1).map(String::as_str);
+            }
+            i += 1;
+            continue;
+        }
+        return None; // `bash script.sh` — a file we cannot see
     }
     None
+}
+
+/// Whether `git`'s global options point it at another repository or tree
+/// (`--git-dir`, `--work-tree`).
+fn git_overrides_dir(args: &[String]) -> bool {
+    for a in args {
+        let a = a.as_str();
+        if a == "--git-dir"
+            || a == "--work-tree"
+            || a.starts_with("--git-dir=")
+            || a.starts_with("--work-tree=")
+        {
+            return true;
+        }
+        if !a.starts_with('-') {
+            break;
+        }
+    }
+    false
 }
 
 /// The directory `git [-C a] [-C b] …` runs in: each `-C` resolved against
@@ -1176,7 +1304,7 @@ fn git_dash_c_dir(args: &[String], base: &str) -> String {
 }
 
 /// Resolve `rel` against `base`. Absolute paths (`/x`, `\x`, `C:/x`) stand on
-/// their own; `~…` and a relative path with no base are unknown (empty).
+/// their own; `~…`, `$…` and a relative path with no base are unknown (empty).
 fn join_dir(base: &str, rel: &str) -> String {
     let rel = rel.trim();
     if rel.is_empty() {
@@ -1202,13 +1330,13 @@ fn join_dir(base: &str, rel: &str) -> String {
 /// really forces or deletes (not a dry-run), or any of the other kinds.
 pub fn is_sensitive(cmd: &SensitiveCommand) -> bool {
     match cmd {
-        SensitiveCommand::GitPush(i) => !i.dry_run && (i.force.is_some() || i.delete.is_some()),
+        SensitiveCommand::GitPush(i) => intent_is_sensitive(i),
         _ => true,
     }
 }
 
 /// Classify the SENSITIVE commands in a shell command string, without
-/// directories — a convenience over [`classify_commands`].
+/// directories — a convenience over [`classify_call`].
 ///
 /// A `git push` that force-updates (`--force`, `-f`, `--force-with-lease[=…]`,
 /// `--mirror`, or a `+refspec`) and/or deletes (`--delete`, `-d`, `:ref`); a
@@ -1271,6 +1399,7 @@ fn parse_git_push_args(args: &[&str]) -> GitPushIntent {
     let mut force_flag = false;
     let mut delete_flag = false;
     let mut tags = false;
+    let mut all_refs = false;
     let mut dry_run = false;
     let mut only_positional = false;
     let mut j = 0;
@@ -1283,8 +1412,10 @@ fn parse_git_push_args(args: &[&str]) -> GitPushIntent {
                 "--mirror" => {
                     force_flag = true;
                     tags = true;
+                    all_refs = true;
                 }
                 "--tags" => tags = true,
+                "--all" | "--branches" => all_refs = true,
                 "--delete" => delete_flag = true,
                 "--dry-run" => dry_run = true,
                 "-o" | "--push-option" | "--repo" | "--receive-pack" | "--exec" => j += 1,
@@ -1323,6 +1454,7 @@ fn parse_git_push_args(args: &[&str]) -> GitPushIntent {
 
     let mut forced: Vec<String> = Vec::new();
     let mut deleted: Vec<String> = Vec::new();
+    let mut matching = false;
     let mut unforced_named = 0usize;
     for spec in &refspecs {
         let (plus, body) = match spec.strip_prefix('+') {
@@ -1336,10 +1468,11 @@ fn parse_git_push_args(args: &[&str]) -> GitPushIntent {
             }
             continue;
         }
-        // `:ref` deletes `ref`; a bare `:` is the MATCHING refspec (push every
-        // branch that exists on both sides), not a deletion of "".
+        // `:ref` deletes `ref`; a bare `:` / `+:` is the MATCHING refspec
+        // (push every branch that exists on both sides).
         if let Some(dst) = body.strip_prefix(':') {
             if dst.is_empty() {
+                matching = true;
                 if plus || force_flag {
                     forced.push(String::new());
                 } else {
@@ -1358,12 +1491,11 @@ fn parse_git_push_args(args: &[&str]) -> GitPushIntent {
         }
     }
 
-    // `+:` forces every matching branch: unnamed, like a bare `--force`.
     let forced_all = forced.iter().any(String::is_empty);
     forced.retain(|r| !r.is_empty());
     // A force flag with no non-delete refspec forces the unnamed default
-    // (the current branch). A force flag beside ONLY `:ref` deletions forces
-    // nothing — there is no ref for it to apply to.
+    // (the current branch, or everything under --all/--mirror). A force flag
+    // beside ONLY `:ref` deletions forces nothing.
     let force = if forced_all {
         Some(Vec::new())
     } else if !forced.is_empty() {
@@ -1384,7 +1516,33 @@ fn parse_git_push_args(args: &[&str]) -> GitPushIntent {
         delete,
         tags,
         dry_run,
+        all_refs,
+        matching,
+        refspec_count: refspecs.len(),
     }
+}
+
+/// D8 clause (b): the push's ONE plain named destination, and which action
+/// it takes there. `None` for anything wider or less certain: several
+/// refspecs, `--all`/`--branches`/`--mirror`/`--tags`, a matching `:`/`+:`,
+/// an unnamed or expanded ref, a dry-run.
+fn single_plain_destination(i: &GitPushIntent) -> Option<(SensitiveAction, String)> {
+    if i.dry_run || i.all_refs || i.tags || i.matching || i.refspec_count != 1 {
+        return None;
+    }
+    let (action, refs) = match (&i.force, &i.delete) {
+        (Some(f), None) => (SensitiveAction::ForcePush, f),
+        (None, Some(d)) => (SensitiveAction::Delete, d),
+        _ => return None,
+    };
+    match refs.as_slice() {
+        [d] if is_plain_ref(d) => Some((action, d.clone())),
+        _ => None,
+    }
+}
+
+fn intent_is_sensitive(i: &GitPushIntent) -> bool {
+    !i.dry_run && (i.force.is_some() || i.delete.is_some())
 }
 
 fn classify_gh(args: &[String]) -> Option<SensitiveCommand> {
@@ -1555,26 +1713,36 @@ pub fn is_hosted_remote(url: &str) -> bool {
     }
 }
 
-/// The destination of a force-push or ref deletion, as far as the
-/// transcript can name it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DestRef {
-    /// A plain ref name — from the output's ref table, or a literal in the
-    /// command.
-    Named(String),
-    /// `HEAD` / `@`: the working dir's current branch, pushed to the
-    /// same-named remote branch.
-    CurrentBranch,
-    /// No refspec: whatever `push.default` picks — `@{push}`.
-    PushDefault,
-    /// A ref only the shell knew — `$B`, `$(git branch --show-current)`, a
-    /// glob. Never resolved, so it always notifies.
-    Unresolvable(String),
+/// `(lowercased host, full path)` of a remote URL — scheme form (port and
+/// userinfo dropped) or scp form. The path keeps every segment; only a
+/// trailing `/` and `.git` are dropped. `None` for a local path.
+pub fn normalize_remote_url(url: &str) -> Option<(String, String)> {
+    let u = strip_userinfo(url.trim());
+    if !is_hosted_remote(&u) {
+        return None;
+    }
+    let (host, path) = if let Some((_, rest)) = u.split_once("://") {
+        let (authority, path) = rest.split_once('/')?;
+        let host = authority.split(':').next().unwrap_or(authority);
+        (host.to_string(), path.to_string())
+    } else {
+        let (host, path) = u.split_once(':')?;
+        (
+            host.rsplit('@').next().unwrap_or(host).to_string(),
+            path.to_string(),
+        )
+    };
+    let path = path.trim_start_matches('/').trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    if host.is_empty() || path.is_empty() {
+        return None;
+    }
+    Some((host.to_ascii_lowercase(), path.to_string()))
 }
 
 /// Whether a declared ref is a PLAIN ref name. Anything the shell expands or
 /// git pattern-matches (`$`, backquote, `*`, `?`, `[`, `{`, `~`, `^`, `:`)
-/// is not: comparing it as text against the output would drop real refs.
+/// is not, and neither are `HEAD` / `@`.
 pub fn is_plain_ref(r: &str) -> bool {
     !r.is_empty()
         && !r.contains(['$', '`', '*', '?', '[', '{', '~', '^', ':'])
@@ -1582,31 +1750,107 @@ pub fn is_plain_ref(r: &str) -> bool {
         && r != "@"
 }
 
-fn declared_ref(r: &str) -> DestRef {
-    if r == "HEAD" || r == "@" {
-        DestRef::CurrentBranch
-    } else if is_plain_ref(r) {
-        DestRef::Named(r.to_string())
-    } else {
-        DestRef::Unresolvable(r.to_string())
-    }
+/// How a DECLARED (not output-evidenced) destination is named in the
+/// notification. Naming only — it never decides whether to notify.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactName {
+    /// The artifact text is final.
+    Literal,
+    /// `HEAD`: named after the working dir's current branch when git can say.
+    CurrentBranch,
+    /// No refspec: named after `@{push}` when git can say.
+    PushDefault,
 }
 
-/// The destination of a force-push or ref deletion. Carried to the
-/// dispatcher worker, where the D8 noise rule ([`ref_action_is_notable`]) is
-/// evaluated against git.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RefTarget {
-    pub dest: DestRef,
-    /// The remote NAME the command used (`origin` by default), or a
-    /// userinfo-stripped URL when the command gave one. Empty when several
-    /// push segments disagreed and the block could not be attributed.
+/// Everything D8's suppression rule looks at. Filled in two steps: the
+/// call-shape clauses from the transcript ([`interpret_tool_use`]), the
+/// git-config / remote / branch clauses on the dispatcher worker
+/// ([`complete_suppression_check`]). Every git-sourced field is `None` when
+/// git could not answer — and an unanswered clause never suppresses.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SuppressionCheck {
+    /// (a) the call contains exactly one `git push` segment (dry-runs count).
+    pub single_push: bool,
+    /// (b) that push's one plain named destination.
+    pub dest: Option<String>,
+    /// (c) the push's directory is known with certainty.
+    pub dir_certain: bool,
+    /// The push's directory and remote NAME (not a URL).
+    pub dir: String,
     pub remote: String,
-    /// The userinfo-stripped URL the output's `To <url>` line named, when it
-    /// named one.
-    pub remote_url: Option<String>,
-    /// `--tags` / `--mirror`.
-    pub tags_or_mirror: bool,
+    /// (d) no `remote.<r>.push`, no `remote.<r>.mirror`, `push.default` not
+    /// `matching`.
+    pub push_config_clean: Option<bool>,
+    /// (e) the output has exactly one `To` block (column 0, at least one
+    /// ref-table line), and it shows this action on `dest`.
+    pub output_confirms_dest: bool,
+    /// The `To` block's URL (userinfo stripped).
+    pub to_url: Option<String>,
+    /// (f) `to_url` equals `git remote get-url --push <remote>` by lowercased
+    /// host and full path.
+    pub url_matches_push_url: Option<bool>,
+    /// (g) the directory's current branch, the remote's default branch, and
+    /// whether `dest` is a tag.
+    pub current_branch: Option<String>,
+    pub default_branch: Option<String>,
+    pub dest_is_tag: Option<bool>,
+}
+
+/// Plan design decision D8, as decided after review round 3: a force-push or
+/// ref-deletion notice is SUPPRESSED ONLY in one narrow, fully verified
+/// shape — the agent force-pushing or deleting its OWN working branch, with
+/// nothing about the call left to interpretation. Every clause must hold:
+///
+/// - (a) exactly ONE `git push` segment in the call, dry-runs included;
+/// - (b) exactly one PLAIN named destination ([`is_plain_ref`]), with no
+///   `--all`, `--branches`, `--mirror`, `--tags`, `:` or `+:`;
+/// - (c) the working directory is known with certainty (see
+///   [`ClassifiedCall::dir_certain`]);
+/// - (d) no `remote.<r>.push`, no `remote.<r>.mirror`, and `push.default` is
+///   not `matching` in that directory;
+/// - (e) exactly one `To` block in the output, at column 0, with at least
+///   one ref-table line, whose forced/deleted ref IS that destination;
+/// - (f) the `To` URL matches `git remote get-url --push <remote>` by
+///   lowercased host and full path;
+/// - (g) the destination is the directory's current branch, and is not
+///   `main`, `master`, the remote's default branch, a tag, `release/*` or
+///   `hotfix/*`.
+///
+/// Anything else — including anything git could not answer — NOTIFIES.
+/// `publish` never reaches this function; it always notifies.
+///
+/// Accepted limitation: the current branch is read on the dispatcher worker
+/// after the command ran; a call that switched branches after pushing would
+/// be compared against the branch it ended on. A detached HEAD has no
+/// current branch, so it always notifies (noise, not loss).
+pub fn may_suppress(c: &SuppressionCheck) -> bool {
+    let Some(dest) = c.dest.as_deref() else {
+        return false;
+    };
+    if !c.single_push || !is_plain_ref(dest) || !c.dir_certain || c.dir.trim().is_empty() {
+        return false;
+    }
+    if c.push_config_clean != Some(true) {
+        return false;
+    }
+    if !c.output_confirms_dest || c.to_url.is_none() {
+        return false;
+    }
+    if c.url_matches_push_url != Some(true) {
+        return false;
+    }
+    let d = dest.strip_prefix("refs/heads/").unwrap_or(dest);
+    if dest.starts_with("refs/tags/") || c.dest_is_tag != Some(false) {
+        return false;
+    }
+    if d == "main" || d == "master" || d.starts_with("release/") || d.starts_with("hotfix/") {
+        return false;
+    }
+    match c.default_branch.as_deref() {
+        Some(db) if db != d => {}
+        _ => return false,
+    }
+    c.current_branch.as_deref() == Some(d)
 }
 
 /// A sensitive action that HAPPENED. Everything needed for the
@@ -1618,6 +1862,8 @@ pub struct DetectedAction {
     /// What was acted on: a ref, a release tag, a package version. Never a
     /// remote URL.
     pub artifact: String,
+    /// How a declared artifact is still to be named (see [`ArtifactName`]).
+    pub artifact_name: ArtifactName,
     /// One of [`reversibility`]'s wire strings.
     pub reversible: &'static str,
     /// The concrete revert handle — the prior sha of a force-updated ref, when
@@ -1626,13 +1872,13 @@ pub struct DetectedAction {
     /// `owner/repo`, when the command or its output named it.
     pub repo: Option<String>,
     /// When the action IS repo-scoped and its remote URL is still unknown:
-    /// the git remote (name) whose URL names the repo. `None` for a registry
-    /// publish, or when the URL is already known.
+    /// the git remote (name) whose URL names the repo.
     pub repo_from_remote: Option<String>,
-    /// The directory the command ran in (see [`ClassifiedCommand::dir`]).
+    /// The directory the command ran in, when the call pins it to one.
     pub working_dir: String,
-    /// Set for a git force-push / ref deletion — the D8 noise rule applies.
-    pub ref_target: Option<RefTarget>,
+    /// Set ONLY for the one action that could be the suppressible shape; the
+    /// worker completes and applies it. `None` = always notify.
+    pub suppression: Option<SuppressionCheck>,
 }
 
 fn cap_field(s: &str) -> String {
@@ -1665,31 +1911,17 @@ impl DetectedAction {
     }
 }
 
-/// One `To <url>` block of `git push` output: the ref table git prints for
-/// ONE push.
+/// One `To <url>` block of `git push` output.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct PushBlock {
     /// The userinfo-stripped URL from the `To` line.
     url: String,
+    /// Ref-table lines seen (a block with none is not a block).
+    table_lines: usize,
     /// `(destination ref, prior sha)` per forced update.
     forced: Vec<(String, String)>,
     /// Ref per deletion.
     deleted: Vec<String>,
-}
-
-/// What one `git push` printed: a ref table, or `Everything up-to-date`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PushUnit {
-    Block(PushBlock),
-    UpToDate,
-}
-
-/// What a tool call's output says its `git push`(es) did, in order.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct PushOutput {
-    units: Vec<PushUnit>,
-    /// `fatal:` / `error: failed to push`.
-    failed: bool,
 }
 
 /// A `--porcelain` ref-table line: `<flag>\t<from>:<to>\t<summary>`.
@@ -1716,29 +1948,56 @@ fn is_ref_table_line(t: &str) -> bool {
 }
 
 /// A ref name as the artifact names it: `refs/heads/` stripped (tags keep
-/// their `refs/tags/` prefix, which the D8 rule reads).
+/// their `refs/tags/` prefix).
 fn artifact_ref(r: &str) -> String {
     r.strip_prefix("refs/heads/").unwrap_or(r).to_string()
 }
 
-/// Parse push output, counting ref-table lines ONLY inside a `To <url>`
-/// block. `git fetch` / `git pull` in the same Bash call print the SAME
-/// table shape under a `From <url>` header — `+ a...b main -> origin/main
-/// (forced update)` — which is a fetch observing someone else's force-push,
-/// not this agent's action. A block closes on `From `, on any non-table
-/// line, or on the next `To `. Both the human and the `--porcelain` table
-/// formats are read.
-fn parse_push_output(output: &str) -> PushOutput {
-    let mut out = PushOutput::default();
+/// A ref name as compared across command and output.
+fn short_ref(r: &str) -> &str {
+    r.strip_prefix("refs/heads/")
+        .or_else(|| r.strip_prefix("refs/tags/"))
+        .unwrap_or(r)
+}
+
+/// Every `To <url>` block in a Bash call's output.
+///
+/// A block opens ONLY on a line that starts with `To ` at column 0 of the
+/// UNTRIMMED line and whose remainder is a single URL-shaped token — so
+/// `To avoid conflicts, …` in a log message, or an indented `To …`, is not
+/// one. It closes on the next `To`, or on any line that is not a ref-table
+/// line (human or `--porcelain`); a `From <url>` fetch table therefore never
+/// counts. A block with no ref-table line is dropped. Blocks are NOT matched
+/// to the push segments that printed them — nothing here depends on the
+/// order of interleaved stdout and stderr.
+fn parse_push_blocks(output: &str) -> Vec<PushBlock> {
+    let mut blocks = Vec::new();
     let mut open: Option<PushBlock> = None;
-    let close = |open: &mut Option<PushBlock>, out: &mut PushOutput| {
+    let close = |open: &mut Option<PushBlock>, blocks: &mut Vec<PushBlock>| {
         if let Some(b) = open.take() {
-            out.units.push(PushUnit::Block(b));
+            if b.table_lines > 0 {
+                blocks.push(b);
+            }
         }
     };
     for raw in output.lines() {
         let raw = raw.trim_end_matches('\r');
-        if let (Some(block), Some((flag, refs, summary))) = (open.as_mut(), porcelain_fields(raw)) {
+        if let Some(rest) = raw.strip_prefix("To ") {
+            let token = rest.trim();
+            if !token.is_empty() && !token.contains(char::is_whitespace) {
+                close(&mut open, &mut blocks);
+                open = Some(PushBlock {
+                    url: strip_userinfo(token),
+                    ..PushBlock::default()
+                });
+                continue;
+            }
+        }
+        let Some(block) = open.as_mut() else {
+            continue;
+        };
+        if let Some((flag, refs, summary)) = porcelain_fields(raw) {
+            block.table_lines += 1;
             let dst = refs.rsplit_once(':').map(|(_, d)| d).unwrap_or(refs);
             match flag {
                 '+' => {
@@ -1756,34 +2015,11 @@ fn parse_push_output(output: &str) -> PushOutput {
             continue;
         }
         let line = raw.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(url) = line.strip_prefix("To ") {
-            close(&mut open, &mut out);
-            open = Some(PushBlock {
-                url: strip_userinfo(url.trim()),
-                ..PushBlock::default()
-            });
-            continue;
-        }
-        if line.starts_with("fatal:") || line.starts_with("error: failed to push") {
-            out.failed = true;
-            close(&mut open, &mut out);
-            continue;
-        }
-        if line == "Everything up-to-date" {
-            close(&mut open, &mut out);
-            out.units.push(PushUnit::UpToDate);
-            continue;
-        }
-        let Some(block) = open.as_mut() else {
-            continue; // outside a To-block: fetch output, remote: lines, hints
-        };
         if !is_ref_table_line(line) {
-            close(&mut open, &mut out);
+            close(&mut open, &mut blocks);
             continue;
         }
+        block.table_lines += 1;
         if line.contains("(forced update)") {
             let toks: Vec<&str> = line.split_whitespace().collect();
             // ["+", "old...new", "src", "->", "dst", "(forced", "update)"]
@@ -1808,8 +2044,8 @@ fn parse_push_output(output: &str) -> PushOutput {
             }
         }
     }
-    close(&mut open, &mut out);
-    out
+    close(&mut open, &mut blocks);
+    blocks
 }
 
 /// Case-insensitive "any line starts with one of `prefixes`".
@@ -1820,306 +2056,8 @@ fn any_line_starts_with(output: &str, prefixes: &[&str]) -> bool {
     })
 }
 
-/// A ref name as compared across command and output: `refs/heads/` and
-/// `refs/tags/` stripped (git's human table prints short names).
-fn short_ref(r: &str) -> &str {
-    r.strip_prefix("refs/heads/")
-        .or_else(|| r.strip_prefix("refs/tags/"))
-        .unwrap_or(r)
-}
-
-/// Which destinations a set of intents declared for one arm (force or
-/// delete). `None` = UNCONSTRAINED: some intent left the ref unnamed, named
-/// `HEAD`, or named something only the shell could expand (`$B`,
-/// `$(git branch --show-current)`, a glob) — so every ref the output reports
-/// counts. Only plain names constrain.
-fn declared_dests(
-    intents: &[&GitPushIntent],
-    arm: impl Fn(&GitPushIntent) -> Option<&Vec<String>>,
-) -> Option<Vec<String>> {
-    let mut names = Vec::new();
-    for i in intents {
-        if let Some(refs) = arm(i) {
-            if refs.is_empty() || refs.iter().any(|r| !is_plain_ref(r)) {
-                return None;
-            }
-            names.extend(refs.iter().map(|r| short_ref(r).to_string()));
-        }
-    }
-    Some(names)
-}
-
-/// Turn ONE tool call — every command it classified (with each one's
-/// directory), and its one output — into the actions that happened,
-/// de-duplicated by `(action, artifact)`.
-///
-/// `failed` is `is_error` (or an interrupted command). It does not veto
-/// POSITIVE evidence — a forced/deleted line inside a `To` block, npm's
-/// `+ name@ver`, cargo's `Published` — because a push that updated one ref
-/// and was rejected on another exits non-zero after the first ref already
-/// moved. It does veto everything inferred from the command alone.
-pub fn interpret_tool_use(
-    commands: &[ClassifiedCommand],
-    output: &str,
-    failed: bool,
-) -> Vec<DetectedAction> {
-    let mut out = Vec::new();
-    let pushes: Vec<(&GitPushIntent, &str)> = commands
-        .iter()
-        .filter_map(|c| match &c.cmd {
-            SensitiveCommand::GitPush(i) => Some((i, c.dir.as_str())),
-            _ => None,
-        })
-        .collect();
-    out.extend(interpret_git_pushes(&pushes, output, failed));
-    for c in commands {
-        if !matches!(c.cmd, SensitiveCommand::GitPush(_)) {
-            out.extend(interpret_other(&c.cmd, output, &c.dir, failed));
-        }
-    }
-    let mut seen = std::collections::HashSet::new();
-    out.retain(|a| seen.insert((a.action, a.artifact.clone())));
-    out
-}
-
-fn intent_is_sensitive(i: &GitPushIntent) -> bool {
-    !i.dry_run && (i.force.is_some() || i.delete.is_some())
-}
-
-fn intent_remote(i: &GitPushIntent) -> String {
-    i.remote.clone().unwrap_or_else(|| "origin".to_string())
-}
-
-/// The actions one push block evidences, filtered by what `intents`
-/// declared.
-fn block_actions(
-    block: &PushBlock,
-    intents: &[&GitPushIntent],
-    dir: &str,
-    remote: &str,
-) -> Vec<DetectedAction> {
-    // A push to a local path is not an outward action.
-    if !is_hosted_remote(&block.url) {
-        return Vec::new();
-    }
-    let any_force = intents.iter().any(|i| i.force.is_some());
-    let any_delete = intents.iter().any(|i| i.delete.is_some());
-    let tags_or_mirror = intents.iter().any(|i| i.tags);
-    let force_dests = declared_dests(intents, |i| i.force.as_ref());
-    let delete_dests = declared_dests(intents, |i| i.delete.as_ref());
-    let matches = |declared: &Option<Vec<String>>, r: &str| match declared {
-        None => true,
-        Some(names) => names.iter().any(|n| n == short_ref(r)),
-    };
-    let repo = parse_repo_full_name(&block.url);
-    let make = |action, artifact: &str, reversible, undo| DetectedAction {
-        action,
-        artifact: artifact.to_string(),
-        reversible,
-        undo,
-        repo: repo.clone(),
-        repo_from_remote: None,
-        working_dir: dir.to_string(),
-        ref_target: Some(RefTarget {
-            dest: DestRef::Named(artifact.to_string()),
-            remote: remote.to_string(),
-            remote_url: Some(block.url.clone()),
-            tags_or_mirror,
-        }),
-    };
-    let mut out = Vec::new();
-    if any_force {
-        for (dst, prior) in &block.forced {
-            if !matches(&force_dests, dst) {
-                continue;
-            }
-            let (reversible, undo) = if prior.is_empty() {
-                (reversibility::NO, None)
-            } else {
-                (reversibility::RESTORE, Some(prior.clone()))
-            };
-            out.push(make(SensitiveAction::ForcePush, dst, reversible, undo));
-        }
-    }
-    if any_delete {
-        for r in &block.deleted {
-            if matches(&delete_dests, r) {
-                out.push(make(
-                    SensitiveAction::Delete,
-                    r,
-                    reversibility::RESTORE,
-                    None,
-                ));
-            }
-        }
-    }
-    out
-}
-
-/// What a sensitive push DECLARED, for when its output cannot be read: the
-/// output was silent (`-q`, redirected), or could not be told apart from a
-/// dry-run's. Only ever used for a call that did not fail.
-fn declared_actions(intent: &GitPushIntent, dir: &str) -> Vec<DetectedAction> {
-    let remote = intent_remote(intent);
-    let url = url_remote(&remote);
-    if url.as_deref().is_some_and(|u| !is_hosted_remote(u)) {
-        return Vec::new();
-    }
-    let repo = url.as_deref().and_then(parse_repo_full_name);
-    let make = |action, dest: DestRef, reversible| {
-        let artifact = match &dest {
-            DestRef::Named(n) => n.clone(),
-            DestRef::Unresolvable(r) => r.clone(),
-            DestRef::CurrentBranch | DestRef::PushDefault => CURRENT_BRANCH_ARTIFACT.to_string(),
-        };
-        DetectedAction {
-            action,
-            artifact,
-            reversible,
-            undo: None,
-            repo: repo.clone(),
-            repo_from_remote: if url.is_none() {
-                Some(remote.clone())
-            } else {
-                None
-            },
-            working_dir: dir.to_string(),
-            ref_target: Some(RefTarget {
-                dest,
-                remote: remote.clone(),
-                remote_url: url.clone(),
-                tags_or_mirror: intent.tags,
-            }),
-        }
-    };
-    let mut out = Vec::new();
-    if let Some(declared) = &intent.force {
-        // No prior sha is known, so the notification cannot name anything to
-        // restore FROM.
-        if declared.is_empty() {
-            out.push(make(
-                SensitiveAction::ForcePush,
-                DestRef::PushDefault,
-                reversibility::NO,
-            ));
-        }
-        for r in declared {
-            out.push(make(
-                SensitiveAction::ForcePush,
-                declared_ref(r),
-                reversibility::NO,
-            ));
-        }
-    }
-    if let Some(declared) = &intent.delete {
-        if declared.is_empty() {
-            // `xargs git push origin --delete`: the refs came from stdin.
-            out.push(make(
-                SensitiveAction::Delete,
-                DestRef::Unresolvable(format!("ref(s) on {remote}")),
-                reversibility::RESTORE,
-            ));
-        }
-        for r in declared {
-            out.push(make(
-                SensitiveAction::Delete,
-                declared_ref(r),
-                reversibility::RESTORE,
-            ));
-        }
-    }
-    out
-}
-
-/// Attribute the output's push units to the push segments that printed them.
-///
-/// When the number of units equals the number of push segments (every `git
-/// push` in the call — plain and dry-run ones included — prints exactly one
-/// `To` block or `Everything up-to-date`), unit *k* belongs to segment *k*:
-/// its declared destinations, its directory and its remote apply, and a
-/// dry-run's or a plain push's block is ignored. Otherwise the blocks are
-/// read against the union of the sensitive segments — except when a dry-run
-/// is present and the sensitive side is unconstrained, where a dry-run's
-/// forced lines could not be told apart; then the output is excluded and the
-/// declarations are reported instead.
-fn interpret_git_pushes(
-    pushes: &[(&GitPushIntent, &str)],
-    output: &str,
-    failed: bool,
-) -> Vec<DetectedAction> {
-    let sensitive: Vec<(&GitPushIntent, &str)> = pushes
-        .iter()
-        .copied()
-        .filter(|(i, _)| intent_is_sensitive(i))
-        .collect();
-    if sensitive.is_empty() {
-        return Vec::new();
-    }
-    let parsed = parse_push_output(output);
-    let declared = || -> Vec<DetectedAction> {
-        sensitive
-            .iter()
-            .flat_map(|(i, d)| declared_actions(i, d))
-            .collect()
-    };
-    let mut out = Vec::new();
-    if parsed.units.is_empty() {
-        // Silent output: report the declarations — never for a failed call.
-        if !parsed.failed && !failed {
-            out.extend(declared());
-        }
-        return out;
-    }
-    if parsed.units.len() == pushes.len() {
-        for (unit, (intent, dir)) in parsed.units.iter().zip(pushes) {
-            if let PushUnit::Block(b) = unit {
-                if intent_is_sensitive(intent) {
-                    out.extend(block_actions(b, &[*intent], dir, &intent_remote(intent)));
-                }
-            }
-        }
-        return out;
-    }
-    let intents: Vec<&GitPushIntent> = sensitive.iter().map(|(i, _)| *i).collect();
-    let has_dry_run = pushes.iter().any(|(i, _)| i.dry_run);
-    let force_open = intents.iter().any(|i| i.force.is_some())
-        && declared_dests(&intents, |i| i.force.as_ref()).is_none();
-    let delete_open = intents.iter().any(|i| i.delete.is_some())
-        && declared_dests(&intents, |i| i.delete.as_ref()).is_none();
-    if has_dry_run && (force_open || delete_open) {
-        if !failed {
-            out.extend(declared());
-        }
-        return out;
-    }
-    // One directory and one remote only when every sensitive segment agrees;
-    // otherwise unknown, which makes the D8 rule notify.
-    let dir = if sensitive.iter().all(|(_, d)| *d == sensitive[0].1) {
-        sensitive[0].1
-    } else {
-        ""
-    };
-    let remotes: Vec<String> = intents.iter().map(|i| intent_remote(i)).collect();
-    for unit in &parsed.units {
-        let PushUnit::Block(b) = unit else { continue };
-        let remote = remotes
-            .iter()
-            .find(|r| url_remote(r).as_deref() == Some(b.url.as_str()))
-            .cloned()
-            .or_else(|| {
-                remotes
-                    .iter()
-                    .all(|r| *r == remotes[0])
-                    .then(|| remotes[0].clone())
-            })
-            .unwrap_or_default();
-        out.extend(block_actions(b, &intents, dir, &remote));
-    }
-    out
-}
-
 /// The artifact of a force whose destination only git knows. The dispatcher
-/// worker replaces it with the resolved branch name.
+/// worker replaces it with the resolved branch name when it can.
 const CURRENT_BRANCH_ARTIFACT: &str = "the current branch";
 
 /// `Some(url)` when a remote was given as a URL (userinfo stripped), `None`
@@ -2139,6 +2077,204 @@ fn dir_basename(path: &str) -> &str {
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or("")
+}
+
+/// Turn ONE Bash call and its one output into the actions that happened,
+/// de-duplicated by `(action, artifact)`.
+///
+/// Git pushes, when the call holds a sensitive one:
+/// - if the output has any `To` block, EVERY forced or deleted ref in EVERY
+///   block is reported — positive evidence, whatever `failed` says, and
+///   whichever push printed it;
+/// - if it has none (quiet, redirected, a fatal before any ref moved), the
+///   pushes' DECLARED actions are reported — but only for a call that did
+///   not fail (`is_error`, interrupted, or a `fatal:` / `error: failed to
+///   push` line), since nothing then shows the push happened.
+///
+/// The one action that could be the suppressible shape carries a
+/// [`SuppressionCheck`] for the worker to complete; every other action
+/// notifies unconditionally.
+pub fn interpret_tool_use(
+    call: &ClassifiedCall,
+    output: &str,
+    failed: bool,
+) -> Vec<DetectedAction> {
+    let mut out = Vec::new();
+    let pushes: Vec<(&GitPushIntent, &str)> = call
+        .commands
+        .iter()
+        .filter_map(|c| match &c.cmd {
+            SensitiveCommand::GitPush(i) => Some((i, c.dir.as_str())),
+            _ => None,
+        })
+        .collect();
+    let sensitive: Vec<(&GitPushIntent, &str)> = pushes
+        .iter()
+        .copied()
+        .filter(|(i, _)| intent_is_sensitive(i))
+        .collect();
+    if !sensitive.is_empty() {
+        let blocks = parse_push_blocks(output);
+        // The suppression candidate: (a) one push segment, (b) one plain
+        // destination, (c) a certain directory.
+        let candidate = (call.push_segments == 1 && pushes.len() == 1)
+            .then(|| {
+                let (intent, dir) = pushes[0];
+                single_plain_destination(intent).map(|(a, d)| (a, d, intent, dir))
+            })
+            .flatten();
+        let dir_for_all = if pushes.len() == 1 { pushes[0].1 } else { "" };
+        if !blocks.is_empty() {
+            for block in &blocks {
+                if !is_hosted_remote(&block.url) {
+                    continue; // a push to a local path is not outward
+                }
+                let repo = parse_repo_full_name(&block.url);
+                let mut push = |action: SensitiveAction, r: &str, reversible, undo| {
+                    let suppression = candidate.as_ref().and_then(|(a, d, intent, dir)| {
+                        let confirms =
+                            blocks.len() == 1 && *a == action && short_ref(r) == short_ref(d);
+                        confirms.then(|| SuppressionCheck {
+                            single_push: true,
+                            dest: Some(d.clone()),
+                            dir_certain: call.dir_certain,
+                            dir: dir.to_string(),
+                            remote: intent.remote.clone().unwrap_or_default(),
+                            output_confirms_dest: true,
+                            to_url: Some(block.url.clone()),
+                            ..SuppressionCheck::default()
+                        })
+                    });
+                    out.push(DetectedAction {
+                        action,
+                        artifact: r.to_string(),
+                        artifact_name: ArtifactName::Literal,
+                        reversible,
+                        undo,
+                        repo: repo.clone(),
+                        repo_from_remote: None,
+                        working_dir: dir_for_all.to_string(),
+                        suppression,
+                    });
+                };
+                for (dst, prior) in &block.forced {
+                    let (reversible, undo) = if prior.is_empty() {
+                        (reversibility::NO, None)
+                    } else {
+                        (reversibility::RESTORE, Some(prior.clone()))
+                    };
+                    push(SensitiveAction::ForcePush, dst, reversible, undo);
+                }
+                for r in &block.deleted {
+                    push(SensitiveAction::Delete, r, reversibility::RESTORE, None);
+                }
+            }
+        } else {
+            let failed =
+                failed || any_line_starts_with(output, &["fatal:", "error: failed to push"]);
+            if !failed {
+                for (intent, dir) in &sensitive {
+                    out.extend(declared_actions(intent, dir));
+                }
+            }
+        }
+    }
+    for c in &call.commands {
+        if !matches!(c.cmd, SensitiveCommand::GitPush(_)) {
+            out.extend(interpret_other(&c.cmd, output, &c.dir, failed));
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|a| seen.insert((a.action, a.artifact.clone())));
+    out
+}
+
+/// What a sensitive push DECLARED, for when its output shows no `To` block.
+/// These always notify.
+fn declared_actions(intent: &GitPushIntent, dir: &str) -> Vec<DetectedAction> {
+    let remote = intent
+        .remote
+        .clone()
+        .unwrap_or_else(|| "origin".to_string());
+    let url = url_remote(&remote);
+    if url.as_deref().is_some_and(|u| !is_hosted_remote(u)) {
+        return Vec::new();
+    }
+    let repo = url.as_deref().and_then(parse_repo_full_name);
+    let make = |action, artifact: String, artifact_name, reversible| DetectedAction {
+        action,
+        artifact,
+        artifact_name,
+        reversible,
+        undo: None,
+        repo: repo.clone(),
+        repo_from_remote: if url.is_none() {
+            Some(remote.clone())
+        } else {
+            None
+        },
+        working_dir: dir.to_string(),
+        suppression: None,
+    };
+    let named = |r: &str| -> (String, ArtifactName) {
+        if r == "HEAD" || r == "@" {
+            (
+                CURRENT_BRANCH_ARTIFACT.to_string(),
+                ArtifactName::CurrentBranch,
+            )
+        } else {
+            (r.to_string(), ArtifactName::Literal)
+        }
+    };
+    let mut out = Vec::new();
+    if let Some(declared) = &intent.force {
+        if declared.is_empty() {
+            let (artifact, name) = if intent.all_refs || intent.matching {
+                (format!("all branches on {remote}"), ArtifactName::Literal)
+            } else {
+                (
+                    CURRENT_BRANCH_ARTIFACT.to_string(),
+                    ArtifactName::PushDefault,
+                )
+            };
+            out.push(make(
+                SensitiveAction::ForcePush,
+                artifact,
+                name,
+                reversibility::NO,
+            ));
+        }
+        for r in declared {
+            let (artifact, name) = named(r);
+            out.push(make(
+                SensitiveAction::ForcePush,
+                artifact,
+                name,
+                reversibility::NO,
+            ));
+        }
+    }
+    if let Some(declared) = &intent.delete {
+        if declared.is_empty() {
+            // `xargs git push origin --delete`: the refs came from stdin.
+            out.push(make(
+                SensitiveAction::Delete,
+                format!("ref(s) on {remote}"),
+                ArtifactName::Literal,
+                reversibility::RESTORE,
+            ));
+        }
+        for r in declared {
+            let (artifact, name) = named(r);
+            out.push(make(
+                SensitiveAction::Delete,
+                artifact,
+                name,
+                reversibility::RESTORE,
+            ));
+        }
+    }
+    out
 }
 
 fn interpret_other(
@@ -2207,7 +2343,8 @@ fn interpret_other(
                 repo,
                 repo_from_remote,
                 working_dir: working_dir.to_string(),
-                ref_target: None,
+                artifact_name: ArtifactName::Literal,
+                suppression: None,
             }]
         }
         SensitiveCommand::NpmPublish { spec } => {
@@ -2291,133 +2428,125 @@ fn registry_publish(artifact: String, working_dir: &str) -> DetectedAction {
         repo: None,
         repo_from_remote: None,
         working_dir: working_dir.to_string(),
-        ref_target: None,
+        artifact_name: ArtifactName::Literal,
+        suppression: None,
     }
 }
 
-// ── The D8 noise rule ────────────────────────────────────────────────────────
+// ── The worker: settle against git ───────────────────────────────────────────
 
-/// What git says about a ref action's surroundings. Every field is `None`
-/// when git could not answer — or, for the working-dir fields, when the
-/// pushed repo is not provably this working dir's — and an unanswered
-/// question never suppresses a notification.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RefFacts {
-    /// The working dir's checked-out branch (`git rev-parse --abbrev-ref
-    /// HEAD`); `None` on failure, a detached HEAD, or an ownership mismatch.
-    pub current_branch: Option<String>,
-    /// The remote's default branch (`git symbolic-ref --short
-    /// refs/remotes/<remote>/HEAD`, remote prefix stripped).
-    pub default_branch: Option<String>,
-    /// Whether the destination names a local tag (`git tag --list <dest>`).
-    pub dest_is_tag: Option<bool>,
-    /// Where an unnamed push goes (`git rev-parse --abbrev-ref
-    /// --symbolic-full-name @{push}`, remote prefix stripped).
-    pub push_dest: Option<String>,
-}
-
-/// Plan design decision D8 — which force-pushes and ref deletions are worth
-/// the operator's attention. Notify ONLY when the destination (with
-/// `refs/heads/` stripped) is:
-///
-/// 1. the remote's default branch, and `main` / `master` ALWAYS — a stale
-///    `refs/remotes/<remote>/HEAD` must not hide `main`;
-/// 2. a tag (`refs/tags/*`, a local tag of that name, or a `--tags` /
-///    `--mirror` push);
-/// 3. `release/*` or `hotfix/*`;
-/// 4. a branch that is NOT the working dir's current branch — someone
-///    else's branch, or at least not the one this agent is working on.
-///
-/// A force-push or delete of the agent's OWN non-default working branch is
-/// routine (rebase, amend, cleanup) and is suppressed. `dest` is `None` when
-/// the destination could not be resolved, and anything the rule cannot
-/// evaluate notifies: unknown must never suppress. `publish` never reaches
-/// this function; it always notifies.
-///
-/// Accepted limitations:
-/// - The current branch is read on the dispatcher worker AFTER the command
-///   ran, not at push time; a session that switched branches in the same
-///   Bash call is compared against the branch it ended on.
-/// - A detached HEAD has no current branch, so every force-push from one
-///   notifies. That is noise, not loss, and is accepted.
-pub fn ref_action_is_notable(dest: Option<&str>, tags_or_mirror: bool, facts: &RefFacts) -> bool {
-    if tags_or_mirror {
-        return true;
-    }
-    let Some(dest) = dest else {
-        return true;
-    };
-    if dest.starts_with("refs/tags/") || facts.dest_is_tag == Some(true) {
-        return true;
-    }
-    let d = dest.strip_prefix("refs/heads/").unwrap_or(dest);
-    if d.starts_with("release/") || d.starts_with("hotfix/") {
-        return true;
-    }
-    if d == "main" || d == "master" || facts.default_branch.as_deref() == Some(d) {
-        return true;
-    }
-    match facts.current_branch.as_deref() {
-        Some(cb) => d != cb,
-        None => true,
+/// Run git in `dir` and return `(exit code, trimmed stdout)`, or `None` when
+/// it could not run or timed out. Unlike [`git`], a non-zero exit is an
+/// ANSWER here: `git config --get` exits 1 for "not set".
+fn git_exit(dir: &Path, args: &[&str]) -> Option<(i32, String)> {
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.current_dir(dir).args(args);
+    match crate::process_helpers::run_with_timeout(cmd, git_timeout()) {
+        Ok(crate::process_helpers::TimedOutput::Completed(output)) => Some((
+            output.status.code()?,
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        )),
+        _ => None,
     }
 }
 
-/// The concrete destination of `dest`, given what git said. `None` =
-/// unresolved (notify).
-pub fn resolve_dest(dest: &DestRef, facts: &RefFacts) -> Option<String> {
-    match dest {
-        DestRef::Named(n) => Some(n.clone()),
-        DestRef::CurrentBranch => facts.current_branch.clone(),
-        DestRef::PushDefault => facts.push_dest.clone(),
-        DestRef::Unresolvable(_) => None,
+/// A git config key: `Some(None)` when unset (exit 1), `Some(Some(v))` when
+/// set, `None` when git could not answer.
+fn git_config_get(dir: &Path, key: &str) -> Option<Option<String>> {
+    match git_exit(dir, &["config", "--get-all", key])? {
+        (0, v) => Some(Some(v)),
+        (1, _) => Some(None),
+        _ => None,
     }
 }
 
-/// Ask git the questions [`ref_action_is_notable`] needs. Impure — run on
-/// the dispatcher worker, never the tail loop.
-///
-/// OWNERSHIP: the working-dir facts (current branch, `@{push}`) describe the
-/// pushed repo only if the push went to this working dir's `<remote>`. When
-/// the output's `To` URL names a different owner/repo than `git remote
-/// get-url <remote>` in the working dir — a `cd` the segment tracking could
-/// not follow, a subshell, a URL remote, a fork — they are withheld, so the
-/// rule notifies.
-fn gather_ref_facts(working_dir: &str, target: &RefTarget) -> RefFacts {
-    if working_dir.trim().is_empty() || target.remote.is_empty() {
-        return RefFacts::default();
+/// D8 clause (d): no `remote.<r>.push`, no `remote.<r>.mirror` (other than
+/// an explicit `false`), and `push.default` not `matching`.
+fn push_config_clean(dir: &Path, remote: &str) -> Option<bool> {
+    let push = git_config_get(dir, &format!("remote.{remote}.push"))?;
+    let mirror = git_config_get(dir, &format!("remote.{remote}.mirror"))?;
+    let default = git_config_get(dir, "push.default")?;
+    Some(
+        push.is_none()
+            && mirror.is_none_or(|m| m.trim().eq_ignore_ascii_case("false"))
+            && default.is_none_or(|d| !d.trim().eq_ignore_ascii_case("matching")),
+    )
+}
+
+/// Fill the git-sourced clauses (d), (f), (g) of a suppression check. Impure
+/// — the dispatcher worker only. Never called unless (a), (b), (c) and (e)
+/// already hold; each question git cannot answer stays `None`.
+pub fn complete_suppression_check(mut c: SuppressionCheck) -> SuppressionCheck {
+    if !c.single_push
+        || c.dest.is_none()
+        || !c.dir_certain
+        || !c.output_confirms_dest
+        || c.dir.trim().is_empty()
+        || c.remote.is_empty()
+        || url_remote(&c.remote).is_some()
+    {
+        return c;
     }
-    let dir = PathBuf::from(working_dir);
-    let remote_is_name = url_remote(&target.remote).is_none();
-    let owned = match &target.remote_url {
-        Some(pushed_url) => {
-            let pushed = parse_repo_full_name(pushed_url);
-            let local = remote_is_name
-                .then(|| git(&dir, &["remote", "get-url", &target.remote]))
-                .flatten()
-                .and_then(|u| parse_repo_full_name(&strip_userinfo(&u)));
-            pushed.is_some() && pushed == local
-        }
-        // No `To` line (quiet push): the command ran in this dir against
-        // this dir's own remote, which is all a quiet push can tell us.
-        None => remote_is_name,
-    };
-    let current_branch = owned
-        .then(|| git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]))
-        .flatten()
-        .filter(|b| !b.is_empty() && b != "HEAD");
-    let remote_prefix = format!("{}/", target.remote);
-    let default_branch = (owned && remote_is_name)
-        .then(|| {
-            let head_ref = format!("refs/remotes/{}/HEAD", target.remote);
-            git(&dir, &["symbolic-ref", "--short", &head_ref])
-        })
-        .flatten()
+    let dir = PathBuf::from(&c.dir);
+    c.push_config_clean = push_config_clean(&dir, &c.remote);
+    c.url_matches_push_url = git(&dir, &["remote", "get-url", "--push", &c.remote]).map(|u| {
+        let local = normalize_remote_url(&u);
+        local.is_some() && local == c.to_url.as_deref().and_then(normalize_remote_url)
+    });
+    c.current_branch =
+        git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).filter(|b| !b.is_empty() && b != "HEAD");
+    let remote_prefix = format!("{}/", c.remote);
+    let head_ref = format!("refs/remotes/{}/HEAD", c.remote);
+    c.default_branch = git(&dir, &["symbolic-ref", "--short", &head_ref])
         .map(|s| s.strip_prefix(&remote_prefix).unwrap_or(&s).to_string())
         .filter(|s| !s.is_empty());
-    let push_dest = (owned && remote_is_name)
-        .then(|| {
-            git(
+    if let Some(d) = c.dest.as_deref() {
+        let name = d.strip_prefix("refs/tags/").unwrap_or(d);
+        c.dest_is_tag = git_exit(
+            &dir,
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/tags/{name}"),
+            ],
+        )
+        .and_then(|(code, _)| match code {
+            0 => Some(true),
+            1 => Some(false),
+            _ => None,
+        });
+    }
+    c
+}
+
+/// Settle what a detected action still needs from git, on the dispatcher
+/// worker: the remote URL (dropping a push to a local path), the repo, a
+/// declared artifact's name, and — for the one suppressible shape — the D8
+/// rule. `None` means "do not notify".
+pub fn finalize_detected_action(mut action: DetectedAction) -> Option<DetectedAction> {
+    let dir = PathBuf::from(&action.working_dir);
+    let have_dir = !action.working_dir.trim().is_empty();
+    if action.repo.is_none() {
+        if let Some(remote) = action.repo_from_remote.as_deref() {
+            if have_dir {
+                if let Some(u) = git(&dir, &["remote", "get-url", remote]) {
+                    let u = strip_userinfo(&u);
+                    if !is_hosted_remote(&u) {
+                        debug!("commit_report: sensitive action targets a local-path remote — not notified");
+                        return None;
+                    }
+                    action.repo = parse_repo_full_name(&u);
+                }
+            }
+        }
+    }
+    if have_dir {
+        let resolved = match action.artifact_name {
+            ArtifactName::Literal => None,
+            ArtifactName::CurrentBranch => git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"])
+                .filter(|b| !b.is_empty() && b != "HEAD"),
+            ArtifactName::PushDefault => git(
                 &dir,
                 &[
                     "rev-parse",
@@ -2426,68 +2555,19 @@ fn gather_ref_facts(working_dir: &str, target: &RefTarget) -> RefFacts {
                     "@{push}",
                 ],
             )
-        })
-        .flatten()
-        // `@{push}` on another remote is not where THIS push went.
-        .and_then(|s| s.strip_prefix(&remote_prefix).map(str::to_string))
-        .filter(|s| !s.is_empty());
-    let dest_is_tag = match &target.dest {
-        DestRef::Named(d) => {
-            let name = d.strip_prefix("refs/tags/").unwrap_or(d);
-            git(&dir, &["tag", "--list", name]).map(|out| out.lines().any(|l| l.trim() == name))
-        }
-        _ => None,
-    };
-    RefFacts {
-        current_branch,
-        default_branch,
-        dest_is_tag,
-        push_dest,
-    }
-}
-
-/// Settle what a detected action still needs from git, on the dispatcher
-/// worker: the remote URL (dropping a push to a local path), the repo, the
-/// resolved destination, and — for a force-push or delete — the D8 noise
-/// rule. `None` means "do not notify".
-pub fn finalize_detected_action(mut action: DetectedAction) -> Option<DetectedAction> {
-    let url = action
-        .ref_target
-        .as_ref()
-        .and_then(|t| t.remote_url.clone())
-        .or_else(|| {
-            let remote = action.repo_from_remote.as_deref()?;
-            if action.working_dir.trim().is_empty() {
-                return None;
-            }
-            git(
-                &PathBuf::from(&action.working_dir),
-                &["remote", "get-url", remote],
-            )
-            .map(|u| strip_userinfo(&u))
-        });
-    if let Some(u) = url.as_deref() {
-        if !is_hosted_remote(u) {
-            debug!("commit_report: sensitive action targets a local-path remote — not notified");
-            return None;
-        }
-        if action.repo.is_none() {
-            action.repo = parse_repo_full_name(u);
+            .and_then(|s| s.split_once('/').map(|(_, b)| b.to_string()))
+            .filter(|s| !s.is_empty()),
+        };
+        if let Some(name) = resolved {
+            action.artifact = name;
         }
     }
-    if let Some(target) = action.ref_target.clone() {
-        let facts = gather_ref_facts(&action.working_dir, &target);
-        let dest = resolve_dest(&target.dest, &facts);
-        if matches!(target.dest, DestRef::CurrentBranch | DestRef::PushDefault) {
-            if let Some(d) = &dest {
-                action.artifact = d.clone();
-            }
-        }
-        if !ref_action_is_notable(dest.as_deref(), target.tags_or_mirror, &facts) {
+    if let Some(check) = action.suppression.take() {
+        if may_suppress(&complete_suppression_check(check)) {
             debug!(
                 action = action.action.as_str(),
                 artifact = %action.artifact,
-                "commit_report: force-push/delete of the working branch — suppressed by D8"
+                "commit_report: force-push/delete of the agent's own working branch — suppressed by D8"
             );
             return None;
         }
@@ -2498,7 +2578,7 @@ pub fn finalize_detected_action(mut action: DetectedAction) -> Option<DetectedAc
 // ── The pending map ──────────────────────────────────────────────────────────
 
 struct PendingAction {
-    commands: Vec<ClassifiedCommand>,
+    call: ClassifiedCall,
     observed_at: Instant,
 }
 
@@ -2509,16 +2589,17 @@ pub struct DetectedToolUse {
     pub actions: Vec<DetectedAction>,
 }
 
-/// PROCESS-GLOBAL memory of `tool_use_id`s whose notifications were handed
-/// to the worker, bounded to [`EMITTED_MEMORY`]. Claude `toolu_…` ids are
-/// globally unique, and the same `tool_use` can appear in two transcript
-/// files (a subagent's sidechain and its parent, a resumed session) tailed
-/// by two trackers — one notification per id, not one per file. It also
-/// covers a truncated transcript re-read from offset 0.
+/// PROCESS-GLOBAL memory of `tool_use_id`s whose notifications are reserved
+/// or handed to the worker, bounded to [`EMITTED_MEMORY`]. Claude `toolu_…`
+/// ids are globally unique, and the same `tool_use` can appear in two
+/// transcript files (a subagent's sidechain and its parent, a resumed
+/// session) tailed by two trackers — one notification per id, not one per
+/// file. It also covers a truncated transcript re-read from offset 0.
 ///
-/// An id is recorded only AFTER its job was accepted by the worker queue
-/// ([`dispatch_detected_tool_use`]), so a dropped dispatch leaves the id
-/// free for another transcript to report.
+/// [`dispatch_detected_tool_use`] RESERVES an id before handing its job to
+/// the worker and RELEASES it if the queue refuses the job, so a dropped
+/// dispatch leaves the id free for another transcript to report, and two
+/// transcripts can never both dispatch it.
 static EMITTED_TOOL_USES: Lazy<
     Mutex<(
         std::collections::VecDeque<String>,
@@ -2531,7 +2612,7 @@ static EMITTED_TOOL_USES: Lazy<
     ))
 });
 
-/// Whether `id`'s notifications were already handed to the worker.
+/// Whether `id` is reserved or already dispatched.
 pub fn emission_recorded(id: &str) -> bool {
     EMITTED_TOOL_USES
         .lock()
@@ -2540,12 +2621,12 @@ pub fn emission_recorded(id: &str) -> bool {
         .contains(id)
 }
 
-/// Record `id` as handed to the worker.
-pub(crate) fn record_emission(id: &str) {
+/// Reserve `id`. `false` when someone already holds it.
+pub(crate) fn reserve_emission(id: &str) -> bool {
     let mut g = EMITTED_TOOL_USES.lock().unwrap_or_else(|e| e.into_inner());
     let (order, set) = &mut *g;
     if !set.insert(id.to_string()) {
-        return;
+        return false;
     }
     if order.len() >= EMITTED_MEMORY {
         if let Some(old) = order.pop_front() {
@@ -2553,6 +2634,16 @@ pub(crate) fn record_emission(id: &str) {
         }
     }
     order.push_back(id.to_string());
+    true
+}
+
+/// Release a reservation whose job the worker queue refused.
+pub(crate) fn release_emission(id: &str) {
+    let mut g = EMITTED_TOOL_USES.lock().unwrap_or_else(|e| e.into_inner());
+    let (order, set) = &mut *g;
+    if set.remove(id) {
+        order.retain(|e| e != id);
+    }
 }
 
 /// Per-transcript memory of sensitive `tool_use`s awaiting their `tool_result`.
@@ -2684,14 +2775,14 @@ impl SensitiveActionTracker {
             ) else {
                 continue;
             };
-            let commands = classify_commands(command, transcript_cwd);
-            if !commands.iter().any(|c| is_sensitive(&c.cmd)) {
+            let call = classify_call(command, transcript_cwd);
+            if !call.any_sensitive() {
                 continue;
             }
             self.insert(
                 id.to_string(),
                 PendingAction {
-                    commands,
+                    call,
                     observed_at: now,
                 },
             );
@@ -2756,7 +2847,7 @@ impl SensitiveActionTracker {
                 .and_then(|i| i.as_bool())
                 == Some(true);
             let output = result_output(block, side);
-            let actions = interpret_tool_use(&pending.commands, &output, is_error || interrupted);
+            let actions = interpret_tool_use(&pending.call, &output, is_error || interrupted);
             if actions.is_empty() {
                 continue;
             }
@@ -2817,18 +2908,18 @@ fn tool_result_text(block: &serde_json::Value) -> String {
 /// job, which settles each against git ([`finalize_detected_action`]) and
 /// enqueues the notifications on the session outbox. Non-blocking.
 ///
-/// The `tool_use_id` is recorded as emitted only once the worker queue
-/// ACCEPTED the job. A refused job is a lost notification for an action that
-/// already happened — unlike a dropped commit-lineage report, nothing will
-/// re-report it — so it is WARNed as such, and the id stays free for another
-/// transcript carrying the same `tool_use` to report.
+/// The `tool_use_id` is RESERVED before the hand-off and RELEASED if the
+/// worker queue refuses the job. A refused job is a lost notification for an
+/// action that already happened — unlike a dropped commit-lineage report,
+/// nothing will re-report it — so it is WARNed as such, and the released id
+/// stays free for another transcript carrying the same `tool_use`.
 pub fn dispatch_detected_tool_use(
     detected: DetectedToolUse,
     lane: uuid::Uuid,
     registrar: Arc<crate::claude_session::coord_register::AiCoordRegistrar>,
 ) -> bool {
-    if emission_recorded(&detected.tool_use_id) {
-        return true;
+    if !reserve_emission(&detected.tool_use_id) {
+        return true; // another transcript holds it
     }
     let id = detected.tool_use_id.clone();
     let count = detected.actions.len();
@@ -2839,9 +2930,8 @@ pub fn dispatch_detected_tool_use(
             }
         }
     });
-    if accepted {
-        record_emission(&id);
-    } else {
+    if !accepted {
+        release_emission(&id);
         warn!(
             tool_use_id = %id,
             actions = count,
@@ -3432,17 +3522,89 @@ mod sensitive_action_tests {
         assert_eq!(resolve_working_dir("cd /abs && git push", "C:/w"), "/abs");
     }
 
-    // ── URL hygiene ──────────────────────────────────────────────────────
+    // ── Call-wide facts: push count and directory certainty ──────────────
 
-    fn at(cmd: &str) -> Vec<ClassifiedCommand> {
-        classify_commands(cmd, "C:/r")
+    #[test]
+    fn every_push_segment_counts_dry_runs_included() {
+        assert_eq!(
+            classify_call("git push -f origin x", "C:/w").push_segments,
+            1
+        );
+        assert_eq!(
+            classify_call("git push -n -f origin x && git push -f origin x", "C:/w").push_segments,
+            2
+        );
+        assert_eq!(
+            classify_call("git push origin a; bash -c 'git push -f origin b'", "C:/w")
+                .push_segments,
+            2,
+            "a nested shell's push counts too"
+        );
     }
 
-    fn one(cmd: SensitiveCommand, dir: &str) -> Vec<ClassifiedCommand> {
-        vec![ClassifiedCommand {
-            cmd,
-            dir: dir.to_string(),
-        }]
+    #[test]
+    fn directory_certainty() {
+        for (cmd, certain) in [
+            ("git push -f origin x", true),
+            ("cd sub && git push -f origin x", true),
+            ("cd /abs && git push -f origin x", true),
+            ("git -C sub push -f origin x", true),
+            ("pushd ../peer && git push -f origin x && popd", false),
+            ("popd; git push -f origin x", false),
+            ("(cd sub && git push -f origin x)", false),
+            ("{ cd sub; git push -f origin x; }", false),
+            ("cd - && git push -f origin x", false),
+            ("cd ~/r && git push -f origin x", false),
+            ("cd $R && git push -f origin x", false),
+            ("env -C sub git push -f origin x", false),
+            ("env --chdir=sub git push -f origin x", false),
+            ("sudo -D /r git push -f origin x", false),
+            ("git --git-dir=/r/.git push -f origin x", false),
+            ("git --work-tree /r push -f origin x", false),
+            ("GIT_DIR=/r/.git git push -f origin x", false),
+            ("export GIT_WORK_TREE=/r; git push -f origin x", false),
+            ("bash -c 'cd sub && git push -f origin x'", false),
+        ] {
+            assert_eq!(classify_call(cmd, "C:/w").dir_certain, certain, "{cmd:?}");
+        }
+        assert!(
+            !classify_call("git push -f origin x", "").dir_certain,
+            "no transcript cwd is no certainty"
+        );
+    }
+
+    #[test]
+    fn bash_value_options_do_not_hide_the_script() {
+        for cmd in [
+            "bash -o pipefail -c 'git fetch && git push -f origin main'",
+            "bash +o posix -c 'git push -f origin main'",
+            "bash -O extglob -c 'git push -f origin main'",
+            "bash --rcfile /dev/null -c 'git push -f origin main'",
+            "bash --init-file x --norc -c 'git push -f origin main'",
+        ] {
+            assert_eq!(
+                classify_sensitive_command(cmd).len(),
+                1,
+                "{cmd:?} should classify"
+            );
+        }
+    }
+
+    // ── URL hygiene ──────────────────────────────────────────────────────
+
+    fn call(cmd: &str) -> ClassifiedCall {
+        classify_call(cmd, "C:/r")
+    }
+
+    fn one(cmd: SensitiveCommand, dir: &str) -> ClassifiedCall {
+        ClassifiedCall {
+            commands: vec![ClassifiedCommand {
+                cmd,
+                dir: dir.to_string(),
+            }],
+            push_segments: 0,
+            dir_certain: true,
+        }
     }
 
     #[test]
@@ -3454,10 +3616,7 @@ mod sensitive_action_tests {
             "git@github.com:o/r.git",
             "scp form carries no secret"
         );
-
-        let intent = git_push(&format!("git push -f {tok} main"));
-        assert_eq!(intent.remote.as_deref(), Some("https://github.com/o/r.git"));
-        let got = interpret_tool_use(&at(&format!("git push -f {tok} main")), "", false);
+        let got = interpret_tool_use(&call(&format!("git push -f {tok} main")), "", false);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].repo.as_deref(), Some("o/r"));
         let body = got[0].body().to_string();
@@ -3468,10 +3627,8 @@ mod sensitive_action_tests {
         );
 
         let out = format!("To {tok}\n + 1a2b3c4...5d6e7f8 main -> main (forced update)\n");
-        let got = interpret_tool_use(&at("git push -f origin main"), &out, false);
+        let got = interpret_tool_use(&call("git push -f origin main"), &out, false);
         assert_eq!(got.len(), 1);
-        let t = got[0].ref_target.as_ref().unwrap();
-        assert_eq!(t.remote_url.as_deref(), Some("https://github.com/o/r.git"));
         assert!(!format!("{:?}", got[0]).contains("SECRET"));
     }
 
@@ -3496,34 +3653,53 @@ mod sensitive_action_tests {
             assert!(!is_hosted_remote(local), "{local}");
         }
         let out = "To /srv/git/r.git\n + 1a2b3c4...5d6e7f8 main -> main (forced update)\n";
-        let got = interpret_tool_use(&at("git push -f /srv/git/r.git main"), out, false);
-        assert!(got.is_empty());
+        assert!(
+            interpret_tool_use(&call("git push -f /srv/git/r.git main"), out, false).is_empty()
+        );
     }
 
-    // ── Result interpretation ────────────────────────────────────────────
+    #[test]
+    fn remote_urls_normalize_to_lowercased_host_and_full_path() {
+        let n = |u: &str| normalize_remote_url(u);
+        let want = Some(("github.com".to_string(), "o/r".to_string()));
+        assert_eq!(n("https://github.com/o/r.git"), want);
+        assert_eq!(n("https://GitHub.com/o/r"), want);
+        assert_eq!(n("git@github.com:o/r.git"), want);
+        assert_eq!(n("ssh://git@github.com:22/o/r.git"), want);
+        assert_eq!(n("https://x-access-token:t@github.com/o/r.git/"), want);
+        assert_ne!(n("https://github.com/o/r2.git"), want);
+        assert_ne!(
+            n("https://gitlab.com/group/sub/o/r.git"),
+            Some(("gitlab.com".to_string(), "o/r".to_string())),
+            "the FULL path, not its last two segments"
+        );
+        assert_eq!(n("/srv/r.git"), None);
+    }
+
+    // ── Output parsing ───────────────────────────────────────────────────
 
     #[test]
-    fn forced_update_names_ref_prior_sha_and_repo() {
-        let out = "To github.com:qontinui/qontinui-runner.git\n + 1a2b3c4...5d6e7f8 feat/x -> feat/x (forced update)\n";
-        let got = interpret_tool_use(&at("git push --force-with-lease origin feat/x"), out, false);
-        assert_eq!(got.len(), 1);
-        let a = &got[0];
-        assert_eq!(a.action, SensitiveAction::ForcePush);
-        assert_eq!(a.artifact, "feat/x");
-        assert_eq!(a.reversible, reversibility::RESTORE);
-        assert_eq!(a.undo.as_deref(), Some("1a2b3c4"));
-        assert_eq!(a.repo.as_deref(), Some("qontinui/qontinui-runner"));
-        assert_eq!(a.working_dir, "C:/r");
-        let t = a.ref_target.as_ref().unwrap();
-        assert_eq!(t.dest, DestRef::Named("feat/x".into()));
-        assert_eq!(t.remote, "origin");
+    fn a_block_needs_to_at_column_zero_a_url_token_and_a_table_line() {
+        // `To avoid …` in a log message is prose, not a block.
+        let out =
+            "To avoid conflicts, rebase first\n + 1111111...2222222 main -> main (forced update)\n";
+        assert!(parse_push_blocks(out).is_empty());
+        // An indented `To` is not git's.
+        let out = "  To github.com:o/r.git\n + 1111111...2222222 main -> main (forced update)\n";
+        assert!(parse_push_blocks(out).is_empty());
+        // A `To` with no ref-table line is not a block.
+        let out = "To github.com:o/r.git\nremote: Resolving deltas\n";
+        assert!(parse_push_blocks(out).is_empty());
+        // The real thing.
+        let out = "To github.com:o/r.git\n + 1111111...2222222 main -> main (forced update)\n";
+        assert_eq!(parse_push_blocks(out).len(), 1);
     }
 
     #[test]
     fn porcelain_ref_tables_are_read() {
         let out = "To github.com:o/r.git\n+\trefs/heads/feat/x:refs/heads/feat/x\t1a2b3c4...5d6e7f8 (forced update)\n-\t:refs/heads/old\t[deleted]\nDone\n";
         let got = interpret_tool_use(
-            &at("git push --porcelain -f origin feat/x :old"),
+            &call("git push --porcelain -f origin feat/x :old"),
             out,
             false,
         );
@@ -3541,127 +3717,145 @@ mod sensitive_action_tests {
     }
 
     #[test]
-    fn a_force_that_only_fast_forwarded_discarded_nothing() {
-        for out in [
-            "To github.com:o/r.git\n   1a2b3c4..5d6e7f8  main -> main\n",
-            "Everything up-to-date\n",
-        ] {
-            let got = interpret_tool_use(&at("git push -f origin main"), out, false);
-            assert!(got.is_empty(), "{out:?} discarded nothing: {got:?}");
-        }
+    fn fetch_tables_never_count() {
+        let out = "From github.com:o/r\n + 1111111...2222222 main -> origin/main (forced update)\n";
+        let got = interpret_tool_use(&call("git fetch && git push -f origin feat/x"), out, false);
+        assert!(
+            got.iter()
+                .all(|a| a.artifact == "feat/x" && a.undo.is_none()),
+            "no block → the declaration, never the fetch's ref: {got:?}"
+        );
+        let out = "To github.com:o/r.git\n + 3333333...4444444 feat/x -> feat/x (forced update)\nFrom github.com:o/r\n + 1111111...2222222 main -> origin/main (forced update)\n";
+        let got = interpret_tool_use(&call("git push -f origin feat/x; git fetch"), out, false);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].artifact, "feat/x");
+    }
+
+    // ── Result interpretation ────────────────────────────────────────────
+
+    #[test]
+    fn forced_update_names_ref_prior_sha_and_repo() {
+        let out = "To github.com:qontinui/qontinui-runner.git\n + 1a2b3c4...5d6e7f8 feat/x -> feat/x (forced update)\n";
+        let got = interpret_tool_use(
+            &call("git push --force-with-lease origin feat/x"),
+            out,
+            false,
+        );
+        assert_eq!(got.len(), 1);
+        let a = &got[0];
+        assert_eq!(a.action, SensitiveAction::ForcePush);
+        assert_eq!(a.artifact, "feat/x");
+        assert_eq!(a.reversible, reversibility::RESTORE);
+        assert_eq!(a.undo.as_deref(), Some("1a2b3c4"));
+        assert_eq!(a.repo.as_deref(), Some("qontinui/qontinui-runner"));
+        let s = a.suppression.as_ref().expect("the one suppressible shape");
+        assert_eq!(s.dest.as_deref(), Some("feat/x"));
+        assert_eq!(s.remote, "origin");
+        assert_eq!(s.dir, "C:/r");
+        assert!(s.single_push && s.dir_certain && s.output_confirms_dest);
+    }
+
+    /// Every forced or deleted ref in every block is reported — even a
+    /// fast-forward-only block reports nothing, and there is no filtering by
+    /// what the command declared.
+    #[test]
+    fn every_forced_or_deleted_ref_in_every_block_is_reported() {
+        let out = "To github.com:o/r.git\n + aaaaaaa...bbbbbbb feat/a -> feat/a (forced update)\n + ccccccc...ddddddd other -> other (forced update)\n - [deleted]         gone\n";
+        let got = interpret_tool_use(&call("git push -f origin feat/a"), out, false);
+        let arts: Vec<&str> = got.iter().map(|a| a.artifact.as_str()).collect();
+        assert_eq!(arts, vec!["feat/a", "other", "gone"]);
+        // Only the declared destination's own action may carry a check; the
+        // other refs in the block notify unconditionally.
+        assert!(got[0].suppression.is_some());
+        assert!(got[1].suppression.is_none() && got[2].suppression.is_none());
+        let out = "To github.com:o/r.git\n   1a2b3c4..5d6e7f8  main -> main\n";
+        assert!(interpret_tool_use(&call("git push -f origin main"), out, false).is_empty());
+    }
+
+    /// Review worked example: two pushes, output reordered by `2>&1 | cat`.
+    #[test]
+    fn two_pushes_with_reordered_output_notify_for_main() {
+        let c = call("git push -f origin main && git push origin feat 2>&1 | cat");
+        assert_eq!(c.push_segments, 2);
+        let out = "To github.com:o/r.git\n   1111111..2222222  feat -> feat\nTo github.com:o/r.git\n + 3333333...4444444 main -> main (forced update)\n";
+        let got = interpret_tool_use(&c, out, false);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].artifact, "main");
+        assert!(got[0].suppression.is_none(), "(a) fails: two push segments");
+    }
+
+    /// Review worked example: `-q --force --all` — no block, declared, and
+    /// `--all` is never the suppressible shape.
+    #[test]
+    fn a_quiet_force_all_push_notifies() {
+        let got = interpret_tool_use(&call("git push -q --force --all origin"), "", false);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].artifact, "all branches on origin");
+        assert!(got[0].suppression.is_none());
+    }
+
+    /// Review worked example: pushd to a peer's checkout, push, popd.
+    #[test]
+    fn the_pushd_popd_peer_branch_case_notifies() {
+        let c = call("pushd ../peer && git push -f origin feat/peer && popd");
+        assert!(!c.dir_certain);
+        let out =
+            "To github.com:o/r.git\n + 1111111...2222222 feat/peer -> feat/peer (forced update)\n";
+        let got = interpret_tool_use(&c, out, false);
+        assert_eq!(got.len(), 1);
+        let check = got[0].suppression.clone().expect("a,b,e hold; c does not");
+        assert!(!check.dir_certain);
+        assert!(!may_suppress(&complete_suppression_check(check)));
+        assert!(finalize_detected_action(got[0].clone()).is_some());
     }
 
     #[test]
     fn silent_output_reports_the_declared_force_without_undo() {
-        let got = interpret_tool_use(&at("git push -q --force"), "", false);
+        let got = interpret_tool_use(&call("git push -q --force"), "", false);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].artifact, CURRENT_BRANCH_ARTIFACT);
-        assert_eq!(
-            got[0].reversible,
-            reversibility::NO,
-            "no prior sha is known"
-        );
+        assert_eq!(got[0].artifact_name, ArtifactName::PushDefault);
+        assert_eq!(got[0].reversible, reversibility::NO);
         assert_eq!(got[0].undo, None);
         assert_eq!(got[0].repo_from_remote.as_deref(), Some("origin"));
-        assert_eq!(
-            got[0].ref_target.as_ref().unwrap().dest,
-            DestRef::PushDefault
-        );
-        assert!(interpret_tool_use(&at("git push -q --force"), "", true).is_empty());
-    }
-
-    #[test]
-    fn a_quiet_head_or_expanded_destination_is_not_taken_literally() {
-        let dest = |cmd: &str| {
-            interpret_tool_use(&at(cmd), "", false)[0]
-                .ref_target
-                .as_ref()
-                .unwrap()
-                .dest
-                .clone()
-        };
-        assert_eq!(dest("git push -q -f origin HEAD"), DestRef::CurrentBranch);
-        assert_eq!(
-            dest("git push -q -f origin \"$B\""),
-            DestRef::Unresolvable("$B".into())
-        );
-        assert_eq!(
-            dest("git push -q -f origin main"),
-            DestRef::Named("main".into())
+        assert!(got[0].suppression.is_none(), "no block → never suppressed");
+        assert!(interpret_tool_use(&call("git push -q --force"), "", true).is_empty());
+        assert!(
+            interpret_tool_use(
+                &call("git push -q --force"),
+                "fatal: Authentication failed\n",
+                false
+            )
+            .is_empty(),
+            "a fatal is a failure even when piped"
         );
     }
 
     #[test]
-    fn deleted_refs_are_read_from_the_output() {
-        let out = "To https://github.com/o/r.git\n - [deleted]         old-a\n";
-        let got = interpret_tool_use(&at("git push origin --delete old-a"), out, false);
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].action, SensitiveAction::Delete);
-        assert_eq!(got[0].artifact, "old-a");
-        assert_eq!(got[0].reversible, reversibility::RESTORE);
-        assert_eq!(got[0].repo.as_deref(), Some("o/r"));
+    fn declared_expanded_and_head_destinations() {
+        let got = interpret_tool_use(&call("git push -q -f origin HEAD"), "", false);
+        assert_eq!(got[0].artifact_name, ArtifactName::CurrentBranch);
+        let got = interpret_tool_use(&call("git push -q -f origin \"$B\""), "", false);
+        assert_eq!(got[0].artifact, "$B");
+        assert_eq!(got[0].artifact_name, ArtifactName::Literal);
     }
 
     #[test]
-    fn a_rejected_push_piped_to_tail_reports_nothing() {
-        let out = "To github.com:o/r.git\n ! [rejected]        main -> main (stale info)\nerror: failed to push some refs to 'github.com:o/r.git'\n";
-        let got = interpret_tool_use(&at("git push -f origin main 2>&1 | tail -3"), out, false);
-        assert!(got.is_empty());
-    }
-
-    // ── Round-2 blocking #1: declared destinations that are not plain names ──
-
-    #[test]
-    fn plain_ref_names() {
-        for plain in ["main", "feat/x", "refs/heads/feat/x", "v1.2.3"] {
-            assert!(is_plain_ref(plain), "{plain}");
-        }
-        for not_plain in [
-            "$B",
-            "$",
-            "$(git branch --show-current)",
-            "`git branch --show-current`",
-            "refs/heads/*",
-            "feat/?",
-            "feat/[ab]",
-            "{a,b}",
-            "main~1",
-            "main^",
-            "a:b",
-            "HEAD",
-            "@",
-            "",
-        ] {
-            assert!(!is_plain_ref(not_plain), "{not_plain}");
-        }
-    }
-
-    #[test]
-    fn a_command_substituted_destination_does_not_drop_the_forced_ref() {
+    fn expanded_destinations_keep_every_evidenced_ref() {
         let out = "To github.com:o/r.git\n + 1111111...2222222 main -> main (forced update)\n";
-        // Quoted: one word, `$(…)`.
-        let got = interpret_tool_use(
-            &at("git push -f origin \"$(git branch --show-current)\""),
-            out,
-            false,
-        );
-        assert_eq!(got.len(), 1, "{got:?}");
-        assert_eq!(got[0].artifact, "main");
-        // Unquoted: the lexer leaves a bare `$` fragment.
-        let got = interpret_tool_use(
-            &at("git push -f origin $(git branch --show-current)"),
-            out,
-            false,
-        );
-        assert_eq!(got.len(), 1, "{got:?}");
-        assert_eq!(got[0].artifact, "main");
-    }
-
-    #[test]
-    fn a_for_loop_delete_does_not_drop_the_deleted_refs() {
+        for cmd in [
+            "git push -f origin \"$(git branch --show-current)\"",
+            "git push -f origin $(git branch --show-current)",
+            "git push -f origin 'refs/heads/*:refs/heads/*'",
+        ] {
+            let got = interpret_tool_use(&call(cmd), out, false);
+            assert_eq!(got.len(), 1, "{cmd:?}: {got:?}");
+            assert_eq!(got[0].artifact, "main");
+            assert!(got[0].suppression.is_none(), "{cmd:?}: (b) fails");
+        }
         let out = "To github.com:o/r.git\n - [deleted]         old-a\nTo github.com:o/r.git\n - [deleted]         old-b\n";
         let got = interpret_tool_use(
-            &at("for b in old-a old-b; do git push origin --delete $b; done"),
+            &call("for b in old-a old-b; do git push origin --delete $b; done"),
             out,
             false,
         );
@@ -3670,113 +3864,16 @@ mod sensitive_action_tests {
     }
 
     #[test]
-    fn a_glob_refspec_does_not_drop_the_forced_refs() {
-        let out = "To github.com:o/r.git\n + 1111111...2222222 main -> main (forced update)\n + 3333333...4444444 dev -> dev (forced update)\n";
-        let got = interpret_tool_use(
-            &at("git push -f origin 'refs/heads/*:refs/heads/*'"),
-            out,
-            false,
-        );
-        let arts: Vec<&str> = got.iter().map(|a| a.artifact.as_str()).collect();
-        assert_eq!(arts, vec!["main", "dev"]);
-    }
-
-    // ── Block attribution ────────────────────────────────────────────────
-
-    #[test]
-    fn fetch_output_is_never_read_as_push_output() {
-        let out = "From github.com:o/r\n + 1111111...2222222 main       -> origin/main  (forced update)\n";
-        let got = interpret_tool_use(
-            &at("git fetch origin && git push -f origin feat/x"),
-            out,
-            false,
-        );
-        assert!(
-            got.iter()
-                .all(|a| a.artifact == "feat/x" && a.undo.is_none()),
-            "a fetch-only forced line is not a push: {got:?}"
-        );
-
-        let out = "From github.com:o/r\n + 1111111...2222222 main -> origin/main (forced update)\nTo github.com:o/r.git\n + 3333333...4444444 feat/x -> feat/x (forced update)\n";
-        let got = interpret_tool_use(
-            &at("git pull --rebase && git push -f origin feat/x"),
-            out,
-            false,
-        );
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].artifact, "feat/x");
-        assert_eq!(got[0].undo.as_deref(), Some("3333333"));
-    }
-
-    #[test]
-    fn a_from_line_closes_the_push_block() {
-        let out = "To github.com:o/r.git\n + 3333333...4444444 feat/x -> feat/x (forced update)\nFrom github.com:o/r\n + 1111111...2222222 main -> origin/main (forced update)\n";
-        let got = interpret_tool_use(&at("git push -f origin feat/x; git fetch"), out, false);
-        assert_eq!(got.len(), 1, "{got:?}");
-        assert_eq!(got[0].artifact, "feat/x");
-    }
-
-    #[test]
-    fn several_pushes_in_one_call_report_each_ref_once_in_its_own_dir() {
-        let out = "To github.com:o/r.git\n + aaaaaaa...bbbbbbb feat/a -> feat/a (forced update)\nTo github.com:o/r.git\n + ccccccc...ddddddd feat/b -> feat/b (forced update)\n";
-        let got = interpret_tool_use(
-            &at("git -C one push -f origin feat/a && git -C two push -f origin feat/b"),
-            out,
-            false,
-        );
-        let arts: Vec<(&str, &str)> = got
-            .iter()
-            .map(|a| (a.artifact.as_str(), a.working_dir.as_str()))
-            .collect();
-        assert_eq!(arts, vec![("feat/a", "C:/r/one"), ("feat/b", "C:/r/two")]);
-    }
-
-    /// #13: with one block per push, a dry-run's block is attributed to the
-    /// dry-run and ignored.
-    #[test]
-    fn a_dry_runs_forced_lines_are_never_reported() {
-        let out = "To github.com:o/r.git\n + 1111111...2222222 main -> main (forced update)\nTo github.com:o/r.git\n + 3333333...4444444 feat/x -> feat/x (forced update)\n";
-        let got = interpret_tool_use(
-            &at("git push -n -f origin main && git push -f origin feat/x"),
-            out,
-            false,
-        );
-        assert_eq!(got.len(), 1, "{got:?}");
-        assert_eq!(got[0].artifact, "feat/x");
-
-        // Unattributable (one block for two pushes) + unconstrained real
-        // push beside a dry-run: the output is excluded, the declaration is
-        // reported instead.
-        let out = "To github.com:o/r.git\n + 1111111...2222222 main -> main (forced update)\n";
-        let got = interpret_tool_use(
-            &at("git push -n -f origin main; git push -q -f"),
-            out,
-            false,
-        );
-        assert_eq!(got.len(), 1, "{got:?}");
-        assert_eq!(got[0].undo, None, "no sha taken from the dry-run's table");
-        assert_eq!(
-            got[0].ref_target.as_ref().unwrap().dest,
-            DestRef::PushDefault
-        );
-    }
-
-    #[test]
-    fn a_declared_destination_filters_the_reported_refs() {
-        let out = "To github.com:o/r.git\n + aaaaaaa...bbbbbbb feat/a -> feat/a (forced update)\n + ccccccc...ddddddd other -> other (forced update)\n";
-        let got = interpret_tool_use(&at("git push -f origin feat/a"), out, false);
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].artifact, "feat/a");
-        let out = "To github.com:o/r.git\n + aaaaaaa...bbbbbbb HEAD -> feat/z (forced update)\n";
-        let got = interpret_tool_use(&at("git push origin +HEAD"), out, false);
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].artifact, "feat/z");
+    fn a_rejected_push_piped_to_tail_reports_nothing() {
+        let out = "To github.com:o/r.git\n ! [rejected]        main -> main (stale info)\nerror: failed to push some refs to 'github.com:o/r.git'\n";
+        let got = interpret_tool_use(&call("git push -f origin main 2>&1 | tail -3"), out, false);
+        assert!(got.is_empty());
     }
 
     #[test]
     fn positive_evidence_wins_over_is_error() {
         let out = "To github.com:o/r.git\n + aaaaaaa...bbbbbbb feat/a -> feat/a (forced update)\n ! [rejected]        main -> main (fetch first)\nerror: failed to push some refs\n";
-        let got = interpret_tool_use(&at("git push -f origin feat/a main"), out, true);
+        let got = interpret_tool_use(&call("git push -f origin feat/a main"), out, true);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].artifact, "feat/a");
 
@@ -3800,7 +3897,6 @@ mod sensitive_action_tests {
         .is_empty());
     }
 
-    /// #9: a workspace publish reports every package, not the first.
     #[test]
     fn every_published_package_emits() {
         let npm = interpret_tool_use(
@@ -3822,7 +3918,7 @@ mod sensitive_action_tests {
     #[test]
     fn gh_release_create_reads_repo_from_the_release_url() {
         let got = interpret_tool_use(
-            &at("gh release create v2.0.0 --generate-notes"),
+            &call("gh release create v2.0.0 --generate-notes"),
             "https://github.com/qontinui/qontinui-web/releases/tag/v2.0.0\n",
             false,
         );
@@ -3831,12 +3927,12 @@ mod sensitive_action_tests {
         assert_eq!(got[0].artifact, "release v2.0.0");
         assert_eq!(got[0].reversible, reversibility::NO);
         assert_eq!(got[0].repo.as_deref(), Some("qontinui/qontinui-web"));
-        assert_eq!(got[0].ref_target, None, "publish is never noise-filtered");
+        assert_eq!(got[0].suppression, None, "publish is never suppressed");
     }
 
     #[test]
     fn gh_release_delete_is_roll_forward() {
-        let got = interpret_tool_use(&at("gh release delete v1 --yes -R o/r"), "", false);
+        let got = interpret_tool_use(&call("gh release delete v1 --yes -R o/r"), "", false);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].action, SensitiveAction::Delete);
         assert_eq!(got[0].reversible, reversibility::ROLL_FORWARD);
@@ -3852,16 +3948,6 @@ mod sensitive_action_tests {
         );
         assert_eq!(npm.len(), 1);
         assert_eq!(npm[0].artifact, "@qontinui/ui-bridge@0.27.0");
-        assert_eq!(npm[0].repo_from_remote, None);
-
-        let cargo = interpret_tool_use(
-            &one(SensitiveCommand::CargoPublish { package: None }, "C:/r"),
-            "   Uploading qontinui-schemas v0.4.1 (C:/r)\n   Published qontinui-schemas v0.4.1 at registry `crates-io`\n",
-            false,
-        );
-        assert_eq!(cargo.len(), 1);
-        assert_eq!(cargo[0].artifact, "crate qontinui-schemas v0.4.1");
-
         let failed = interpret_tool_use(
             &one(SensitiveCommand::NpmPublish { spec: None }, "C:/r"),
             "npm error code E403\n",
@@ -3881,15 +3967,6 @@ mod sensitive_action_tests {
             false,
         );
         assert_eq!(npm[0].artifact, "npm package in ./ui-kit");
-        let cargo = interpret_tool_use(
-            &one(
-                SensitiveCommand::CargoPublish { package: None },
-                "C:\\Users\\someone\\work\\crate-x\\",
-            ),
-            "",
-            false,
-        );
-        assert_eq!(cargo[0].artifact, "crate in ./crate-x");
         assert!(!npm[0].body().to_string().contains("someone"));
     }
 
@@ -3898,12 +3975,13 @@ mod sensitive_action_tests {
         let a = DetectedAction {
             action: SensitiveAction::ForcePush,
             artifact: "feat/x".into(),
+            artifact_name: ArtifactName::Literal,
             reversible: reversibility::RESTORE,
             undo: Some("1a2b3c4".into()),
             repo: Some("o/r".into()),
             repo_from_remote: None,
             working_dir: String::new(),
-            ref_target: None,
+            suppression: None,
         };
         assert_eq!(
             a.body(),
@@ -3920,172 +3998,133 @@ mod sensitive_action_tests {
             repo: None,
             ..a
         };
-        let body = b.body();
-        assert!(body.get("undo").is_none(), "never `undo: null`");
-        assert!(body.get("repo").is_none());
+        assert!(b.body().get("undo").is_none(), "never `undo: null`");
+        assert!(b.body().get("repo").is_none());
     }
 
-    // ── The D8 noise rule ────────────────────────────────────────────────
+    // ── The D8 suppression rule ──────────────────────────────────────────
 
-    fn facts(current: Option<&str>, default: Option<&str>, tag: Option<bool>) -> RefFacts {
-        RefFacts {
-            current_branch: current.map(String::from),
-            default_branch: default.map(String::from),
-            dest_is_tag: tag,
-            push_dest: None,
-        }
-    }
-
-    /// The D8 table. Each row: (dest, tags_or_mirror, facts, notify?, why).
-    #[test]
-    fn d8_noise_rule_table() {
-        let rows: Vec<(Option<&str>, bool, RefFacts, bool, &str)> = vec![
-            // Own non-default working branch → suppressed.
-            (
-                Some("feat/x"),
-                false,
-                facts(Some("feat/x"), Some("main"), Some(false)),
-                false,
-                "own branch",
-            ),
-            (
-                Some("refs/heads/feat/x"),
-                false,
-                facts(Some("feat/x"), Some("main"), None),
-                false,
-                "own branch, full ref",
-            ),
-            // (1) the default branch — and main/master ALWAYS.
-            (
-                Some("main"),
-                false,
-                facts(Some("main"), Some("main"), Some(false)),
-                true,
-                "default, even when checked out",
-            ),
-            (
-                Some("develop"),
-                false,
-                facts(Some("develop"), Some("develop"), None),
-                true,
-                "non-main default",
-            ),
-            (
-                Some("main"),
-                false,
-                facts(Some("main"), Some("develop"), None),
-                true,
-                "main even when origin/HEAD says develop (stale)",
-            ),
-            (
-                Some("master"),
-                false,
-                facts(Some("master"), Some("trunk"), None),
-                true,
-                "master even when origin/HEAD says otherwise",
-            ),
-            (
-                Some("master"),
-                false,
-                facts(Some("master"), None, None),
-                true,
-                "default unknown",
-            ),
-            // (2) tags.
-            (
-                Some("refs/tags/v1"),
-                false,
-                facts(Some("v1"), Some("main"), None),
-                true,
-                "refs/tags/*",
-            ),
-            (
-                Some("v1"),
-                false,
-                facts(Some("v1"), Some("main"), Some(true)),
-                true,
-                "a local tag of that name",
-            ),
-            (
-                Some("feat/x"),
-                true,
-                facts(Some("feat/x"), Some("main"), None),
-                true,
-                "--tags / --mirror",
-            ),
-            // (3) release/* and hotfix/*.
-            (
-                Some("release/2.0"),
-                false,
-                facts(Some("release/2.0"), Some("main"), None),
-                true,
-                "release/*",
-            ),
-            (
-                Some("hotfix/boom"),
-                false,
-                facts(Some("hotfix/boom"), Some("main"), None),
-                true,
-                "hotfix/*",
-            ),
-            // (4) a branch that is not the working dir's current branch.
-            (
-                Some("feat/other"),
-                false,
-                facts(Some("feat/x"), Some("main"), Some(false)),
-                true,
-                "someone else's branch",
-            ),
-            // Unknown never suppresses.
-            (
-                Some("feat/x"),
-                false,
-                facts(None, Some("main"), None),
-                true,
-                "current branch unknown / ownership mismatch",
-            ),
-            (
-                None,
-                false,
-                facts(Some("feat/x"), Some("main"), None),
-                true,
-                "destination unresolved",
-            ),
-        ];
-        for (dest, tags, f, want, why) in rows {
-            assert_eq!(
-                ref_action_is_notable(dest, tags, &f),
-                want,
-                "{why}: dest={dest:?} tags={tags} facts={f:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn destinations_resolve_from_git_facts() {
-        let f = RefFacts {
+    /// Every clause holding: the one shape that is suppressed.
+    fn verified() -> SuppressionCheck {
+        SuppressionCheck {
+            single_push: true,
+            dest: Some("feat/x".into()),
+            dir_certain: true,
+            dir: "C:/r".into(),
+            remote: "origin".into(),
+            push_config_clean: Some(true),
+            output_confirms_dest: true,
+            to_url: Some("https://github.com/o/r.git".into()),
+            url_matches_push_url: Some(true),
             current_branch: Some("feat/x".into()),
-            push_dest: Some("feat/up".into()),
-            ..RefFacts::default()
+            default_branch: Some("main".into()),
+            dest_is_tag: Some(false),
+        }
+    }
+
+    /// One row per way the suppression can FAIL, each flipping a single
+    /// clause of an otherwise verified check. Every row must notify.
+    #[test]
+    fn d8_every_failing_clause_notifies() {
+        assert!(
+            may_suppress(&verified()),
+            "the verified shape is suppressed"
+        );
+        type Tweak = fn(&mut SuppressionCheck);
+        let rows: Vec<(&str, Tweak)> = vec![
+            ("(a) two push segments", |c| c.single_push = false),
+            ("(b) no single destination", |c| c.dest = None),
+            ("(b) destination not plain", |c| c.dest = Some("$B".into())),
+            ("(b) destination HEAD", |c| c.dest = Some("HEAD".into())),
+            ("(c) directory uncertain", |c| c.dir_certain = false),
+            ("(c) directory unknown", |c| c.dir = String::new()),
+            ("(d) push config dirty", |c| {
+                c.push_config_clean = Some(false)
+            }),
+            ("(d) push config unanswerable", |c| {
+                c.push_config_clean = None
+            }),
+            ("(e) output does not confirm", |c| {
+                c.output_confirms_dest = false
+            }),
+            ("(e) no To URL", |c| c.to_url = None),
+            ("(f) URL differs", |c| c.url_matches_push_url = Some(false)),
+            ("(f) URL unanswerable", |c| c.url_matches_push_url = None),
+            ("(g) not the current branch", |c| {
+                c.current_branch = Some("feat/y".into())
+            }),
+            ("(g) current branch unknown / detached", |c| {
+                c.current_branch = None
+            }),
+            ("(g) main", |c| {
+                c.dest = Some("main".into());
+                c.current_branch = Some("main".into());
+                c.default_branch = Some("develop".into());
+            }),
+            ("(g) master", |c| {
+                c.dest = Some("master".into());
+                c.current_branch = Some("master".into());
+            }),
+            ("(g) the default branch", |c| {
+                c.dest = Some("develop".into());
+                c.current_branch = Some("develop".into());
+                c.default_branch = Some("develop".into());
+            }),
+            ("(g) default branch unknown", |c| c.default_branch = None),
+            ("(g) a tag", |c| c.dest_is_tag = Some(true)),
+            ("(g) tag-ness unknown", |c| c.dest_is_tag = None),
+            ("(g) refs/tags/*", |c| c.dest = Some("refs/tags/v1".into())),
+            ("(g) release/*", |c| {
+                c.dest = Some("release/2.0".into());
+                c.current_branch = Some("release/2.0".into());
+            }),
+            ("(g) hotfix/*", |c| {
+                c.dest = Some("hotfix/boom".into());
+                c.current_branch = Some("hotfix/boom".into());
+            }),
+        ];
+        for (why, tweak) in rows {
+            let mut c = verified();
+            tweak(&mut c);
+            assert!(!may_suppress(&c), "{why} must notify: {c:?}");
+        }
+    }
+
+    #[test]
+    fn single_plain_destination_is_narrow() {
+        let d = |cmd: &str| match &classify_commands(cmd, "C:/r")[0].cmd {
+            SensitiveCommand::GitPush(i) => single_plain_destination(i),
+            _ => panic!("{cmd}"),
         };
         assert_eq!(
-            resolve_dest(&DestRef::Named("main".into()), &f).as_deref(),
-            Some("main")
+            d("git push -f origin feat/x"),
+            Some((SensitiveAction::ForcePush, "feat/x".into()))
         );
         assert_eq!(
-            resolve_dest(&DestRef::CurrentBranch, &f).as_deref(),
-            Some("feat/x")
+            d("git push origin --delete old"),
+            Some((SensitiveAction::Delete, "old".into()))
         );
         assert_eq!(
-            resolve_dest(&DestRef::PushDefault, &f).as_deref(),
-            Some("feat/up"),
-            "push.default=upstream can push elsewhere than the branch name"
+            d("git push origin +feat/x"),
+            Some((SensitiveAction::ForcePush, "feat/x".into()))
         );
-        assert_eq!(resolve_dest(&DestRef::Unresolvable("$B".into()), &f), None);
-        assert_eq!(
-            resolve_dest(&DestRef::PushDefault, &RefFacts::default()),
-            None
-        );
+        for wide in [
+            "git push -f origin a b",
+            "git push -f --all origin",
+            "git push -f --branches origin",
+            "git push --mirror origin",
+            "git push -f --tags origin x",
+            "git push origin +:",
+            "git push -f origin :",
+            "git push -f",
+            "git push -f origin",
+            "git push -f origin HEAD",
+            "git push -f origin \"$B\"",
+            "git push -n -f origin x",
+            "git push -f origin x :y",
+        ] {
+            assert_eq!(d(wide), None, "{wide:?}");
+        }
     }
 
     // ── D8 end to end, against a real repository ─────────────────────────
@@ -4101,7 +4140,8 @@ mod sensitive_action_tests {
         assert!(ok, "git {args:?} failed in {}", dir.display());
     }
 
-    /// A repo on branch `feat/x` whose `origin` is github.com/o/r.
+    /// A repo on branch `feat/x` whose `origin` is github.com/o/r and whose
+    /// `origin/HEAD` names `main`.
     fn repo_on_feat_x() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
@@ -4112,72 +4152,110 @@ mod sensitive_action_tests {
             d,
             &["remote", "add", "origin", "https://github.com/o/r.git"],
         );
+        run_git(
+            d,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        run_git(d, &["config", "--local", "push.default", "simple"]);
         tmp
     }
 
-    fn forced(dest: DestRef, url: &str, dir: &str) -> DetectedAction {
-        DetectedAction {
-            action: SensitiveAction::ForcePush,
-            artifact: CURRENT_BRANCH_ARTIFACT.into(),
-            reversible: reversibility::NO,
-            undo: None,
-            repo: None,
-            repo_from_remote: None,
-            working_dir: dir.into(),
-            ref_target: Some(RefTarget {
-                dest,
-                remote: "origin".into(),
-                remote_url: Some(url.into()),
-                tags_or_mirror: false,
-            }),
-        }
+    fn forced_out(dest: &str, url: &str) -> String {
+        format!("To {url}\n + 1111111...2222222 {dest} -> {dest} (forced update)\n")
+    }
+
+    /// Classify + interpret + finalize, as the watcher and worker do.
+    fn notifies(cmd: &str, dir: &str, output: &str) -> Vec<DetectedAction> {
+        let c = classify_call(cmd, dir);
+        interpret_tool_use(&c, output, false)
+            .into_iter()
+            .filter_map(finalize_detected_action)
+            .collect()
     }
 
     #[test]
-    fn finalize_suppresses_only_the_owned_working_branch() {
+    fn end_to_end_only_the_verified_own_branch_shape_is_suppressed() {
         let repo = repo_on_feat_x();
         let dir = repo.path().to_string_lossy().to_string();
         let own = "https://github.com/o/r.git";
-        // Own branch, own repo → suppressed.
+
         assert!(
-            finalize_detected_action(forced(DestRef::Named("feat/x".into()), own, &dir)).is_none()
+            notifies(
+                "git push -f origin feat/x",
+                &dir,
+                &forced_out("feat/x", own)
+            )
+            .is_empty(),
+            "own branch, every clause verified → suppressed"
         );
-        // `HEAD` resolves to the current branch — suppressed, and named.
-        assert!(finalize_detected_action(forced(DestRef::CurrentBranch, own, &dir)).is_none());
-        // main always notifies.
-        assert!(
-            finalize_detected_action(forced(DestRef::Named("main".into()), own, &dir)).is_some()
+        assert_eq!(
+            notifies("git push -f origin main", &dir, &forced_out("main", own)).len(),
+            1,
+            "main always notifies"
         );
-        // Same branch name, DIFFERENT repo (a cd the tracking missed, a fork
-        // URL): ownership fails, so it notifies.
-        assert!(finalize_detected_action(forced(
-            DestRef::Named("feat/x".into()),
-            "https://github.com/someone-else/r.git",
-            &dir
-        ))
-        .is_some());
-        // Unnamed push with no upstream: `@{push}` is unanswerable → notify.
-        assert!(finalize_detected_action(forced(DestRef::PushDefault, own, &dir)).is_some());
-        // Unresolvable (`$B`) → notify.
-        assert!(
-            finalize_detected_action(forced(DestRef::Unresolvable("$B".into()), own, &dir))
-                .is_some()
+        assert_eq!(
+            notifies(
+                "git push -f origin feat/x",
+                &dir,
+                &forced_out("feat/x", "https://github.com/someone-else/r.git")
+            )
+            .len(),
+            1,
+            "(f) the To URL is not this remote's push URL"
         );
-        // Unknown directory → notify.
-        assert!(
-            finalize_detected_action(forced(DestRef::Named("feat/x".into()), own, "")).is_some()
+        assert_eq!(
+            notifies(
+                "git push -f origin feat/x && git push origin other",
+                &dir,
+                &forced_out("feat/x", own)
+            )
+            .len(),
+            1,
+            "(a) two push segments"
         );
+        assert_eq!(
+            notifies("git push -q -f origin feat/x", &dir, "").len(),
+            1,
+            "(e) no To block"
+        );
+    }
+
+    #[test]
+    fn end_to_end_push_config_defeats_suppression() {
+        let own = "https://github.com/o/r.git";
+        for (key, value) in [
+            ("remote.origin.push", "refs/heads/*:refs/heads/*"),
+            ("remote.origin.mirror", "true"),
+            ("push.default", "matching"),
+        ] {
+            let repo = repo_on_feat_x();
+            run_git(repo.path(), &["config", "--local", key, value]);
+            let dir = repo.path().to_string_lossy().to_string();
+            assert_eq!(
+                notifies(
+                    "git push -f origin feat/x",
+                    &dir,
+                    &forced_out("feat/x", own)
+                )
+                .len(),
+                1,
+                "(d) {key}={value} must notify"
+            );
+        }
     }
 
     #[test]
     fn a_quiet_head_push_is_named_after_the_current_branch() {
         let repo = repo_on_feat_x();
         let dir = repo.path().to_string_lossy().to_string();
-        let mut a = forced(DestRef::CurrentBranch, "https://github.com/o/r.git", &dir);
-        // Make it notable regardless of ownership, to observe the artifact.
-        a.ref_target.as_mut().unwrap().tags_or_mirror = true;
-        let got = finalize_detected_action(a).expect("tags always notify");
-        assert_eq!(got.artifact, "feat/x");
+        let got = notifies("git push -q -f origin HEAD", &dir, "");
+        assert_eq!(got.len(), 1, "a declared action always notifies");
+        assert_eq!(got[0].artifact, "feat/x");
+        assert_eq!(got[0].repo.as_deref(), Some("o/r"));
     }
 
     // ── Fixture transcripts through the pending map ──────────────────────
@@ -4367,7 +4445,7 @@ mod sensitive_action_tests {
         );
     }
 
-    /// The emitted-id record is written by a SUCCESSFUL dispatch
+    /// The emitted-id reservation is made by the dispatch
     /// ([`dispatch_detected_tool_use`]); once it is, a re-read transcript
     /// reports nothing.
     #[test]
@@ -4379,7 +4457,7 @@ mod sensitive_action_tests {
         let result = tool_result_line(&id, false, FORCED_OUTPUT);
         t.observe_line(&use_line, t0);
         assert_eq!(t.observe_line(&result, t0).len(), 1);
-        record_emission(&id); // what an accepted dispatch does
+        assert!(reserve_emission(&id)); // what the dispatch does
         t.observe_line(&use_line, t0);
         assert!(t.observe_line(&result, t0).is_empty());
     }
@@ -4395,13 +4473,16 @@ mod sensitive_action_tests {
         a.observe_line(&use_line, t0);
         b.observe_line(&use_line, t0);
         assert_eq!(a.observe_line(&result, t0).len(), 1);
-        record_emission(&id);
+        assert!(reserve_emission(&id));
         assert!(b.observe_line(&result, t0).is_empty());
+        assert!(
+            !reserve_emission(&id),
+            "a second dispatch cannot reserve it"
+        );
     }
 
-    /// #5: an id is recorded only after an ACCEPTED dispatch — if the first
-    /// transcript's dispatch was dropped (nothing recorded), the second
-    /// transcript still reports it.
+    /// An id reserved for a dispatch the queue then REFUSED is released, so
+    /// the second transcript still reports it.
     #[test]
     fn a_dropped_dispatch_leaves_the_id_free_for_another_transcript() {
         let id = uid("dropped");
@@ -4413,7 +4494,9 @@ mod sensitive_action_tests {
         a.observe_line(&use_line, t0);
         b.observe_line(&use_line, t0);
         assert_eq!(a.observe_line(&result, t0).len(), 1);
-        // No record_emission: the dispatch was refused.
+        // The dispatch reserved the id, then the queue refused the job.
+        assert!(reserve_emission(&id));
+        release_emission(&id);
         assert!(!emission_recorded(&id));
         assert_eq!(b.observe_line(&result, t0).len(), 1);
     }
