@@ -354,14 +354,41 @@ jobs:
             Get-Process -ErrorAction SilentlyContinue |
               Where-Object { $_.ProcessName -match 'Qontinui|setup' } |
               ForEach-Object { Write-Host ("alive: pid {0} {1} window='{2}'" -f $_.Id, $_.ProcessName, $_.MainWindowTitle) }
+            # The name filter above cannot see what the installer is WAITING ON
+            # when that is a child it spawned under another name — the NSIS
+            # uninstaller of a prior version runs as `Au_.exe`, a prerequisite
+            # bootstrapper under its own. Walk the installer's own descendants by
+            # ParentProcessId (so nothing outside its tree is listed or touched),
+            # print each with its command line, then stop them leaf-first by exact
+            # pid: an orphaned child would otherwise keep holding the install dir
+            # through both parity legs after its parent is gone.
+            $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+            $tree = [System.Collections.Generic.List[object]]::new()
+            $frontier = @($p.Id)
+            while ($frontier.Count -gt 0) {
+              $children = @($all | Where-Object { $frontier -contains $_.ParentProcessId -and $_.ProcessId -ne $p.Id })
+              $children | ForEach-Object { $tree.Add($_) }
+              $frontier = @($children | ForEach-Object { $_.ProcessId })
+            }
+            if ($tree.Count -eq 0) { Write-Host "installer has no live descendants." }
+            foreach ($c in $tree) {
+              $window = (Get-Process -Id $c.ProcessId -ErrorAction SilentlyContinue).MainWindowTitle
+              Write-Host ("descendant: pid {0} parent {1} {2} window='{3}' cmd={4}" -f $c.ProcessId, $c.ParentProcessId, $c.Name, $window, $c.CommandLine)
+            }
+            for ($j = $tree.Count - 1; $j -ge 0; $j--) {
+              Stop-Process -Id $tree[$j].ProcessId -Force -ErrorAction SilentlyContinue
+            }
             Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
           }
 
           # NSIS /S can return before the files are fully written, so poll for
           # the exe rather than sleeping a fixed amount. A base that is unset
           # (a service-account runner with no profile) contributes no candidate
-          # rather than a Join-Path binding error.
-          $candidates = foreach ($base in @($env:LOCALAPPDATA, $env:ProgramFiles)) {
+          # rather than a Join-Path binding error. The three bases are the
+          # locator's own (scripts/lib/installed-runner.ps1), in its order, so
+          # this poll never gives up on an install the locator would then find.
+          $bases = @($env:LOCALAPPDATA, $env:ProgramFiles, ${env:ProgramFiles(x86)})
+          $candidates = foreach ($base in $bases) {
             if ($base) { Join-Path $base 'Qontinui Runner\Qontinui Runner.exe' }
           }
           $installed = $false
@@ -376,7 +403,7 @@ jobs:
           # Diagnostic only. The locator in scripts/lib/installed-runner.ps1 is
           # what actually finds the exe, and it throws naming every path probed
           # rather than falling back to anything.
-          foreach ($base in @($env:LOCALAPPDATA, $env:ProgramFiles)) {
+          foreach ($base in $bases) {
             if ($base) { Get-ChildItem -LiteralPath $base -Depth 1 -Filter 'Qontinui Runner*' -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName } }
           }
         shell: pwsh
