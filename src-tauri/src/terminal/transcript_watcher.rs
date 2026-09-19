@@ -653,9 +653,10 @@ async fn tail_session(
                 // lookup (git) and the outbox write happen on the same
                 // bounded worker the push report uses.
                 if notify_actions {
-                    for action in action_tracker.observe_line(&line, std::time::Instant::now()) {
-                        super::commit_report::dispatch_detected_action(
-                            action,
+                    for detected in action_tracker.observe_line(&line, std::time::Instant::now()) {
+                        // Refusals are WARNed inside, as lost notifications.
+                        super::commit_report::dispatch_detected_tool_use(
+                            detected,
                             action_lane,
                             reg.clone(),
                         );
