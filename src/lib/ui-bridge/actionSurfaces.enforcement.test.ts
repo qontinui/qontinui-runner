@@ -395,6 +395,33 @@ describe("UI Bridge action surfaces — the falsification", () => {
   );
 
   it(
+    "an element map or entry that is only a BINDING turns this red (no id to find it by)",
+    () => {
+      // Element custom actions carry no `id`, so the shape pass cannot find
+      // one written elsewhere. The position pass must fail closed instead.
+      const found = scanFixture(
+        "boundElementActions.ts",
+        [
+          "const probe = { handler: (p: unknown) => p };",
+          "const customActions = { probe };",
+          "export const a = { customActions };",
+          "export const b = { customActions: { probe } };",
+          "export const c = { customActions: { probe: probe } };",
+          "export const d = {",
+          "  actions: [",
+          '    { id: "probe-late-spread", handler: guardedHandler("probe-late-spread", {}, () => 1), ...probe },',
+          "  ],",
+          "};",
+          "// Negative control: a cast around an inline map is still inline.",
+          "export const e = { customActions: { ok: { handler: () => 1 } } as const };",
+        ].join("\n"),
+      );
+      expect(violations(found).map((v) => v.line)).toEqual([3, 4, 5, 8]);
+    },
+    WALK_TIMEOUT,
+  );
+
+  it(
     "a guard binding against a DIFFERENT schema than the action publishes turns this red",
     () => {
       // Registration/handler drift, one level down: the wire advertises one

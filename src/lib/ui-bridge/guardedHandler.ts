@@ -79,8 +79,10 @@
  * the SDK hoists onto the response.
  *
  * Coercion: a clean numeric token becomes a number, so `{count: "2"}` arrives
- * as `2` — the same reading Tier 1 applies to typed text. `run` therefore
- * reads text fields through `parse.ts`'s `textArg`.
+ * as `2` — the same reading Tier 1 applies to typed text — EXCEPT in a field
+ * whose `paramSchema` sentence starts with `string`, which keeps the caller's
+ * exact text (`"007"` stays `"007"`; see `bind.ts::textFieldsOf`). `run` still
+ * reads text fields through `parse.ts`'s `textArg`, which is a no-op there.
  *
  * ## Exemptions from per-VALUE checking (never from the bag or key checks)
  *

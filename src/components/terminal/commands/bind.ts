@@ -193,7 +193,9 @@ export function textFieldsOf(paramSchema: Record<string, unknown> | undefined): 
  * group, hoisted so it is a property of BINDING rather than of whichever
  * resolver happened to run:
  *
- *   - a string is `coerceToken`'d, so `"3"` is the number 3 on every route;
+ *   - a string is `coerceToken`'d, so `"3"` is the number 3 on every route —
+ *     EXCEPT for a field listed in `textFields` (see {@link textFieldsOf}),
+ *     which a caller that named its arguments sent as exact text;
  *   - a finite number passes through;
  *   - `null` / `undefined` DROP the key, matching a regex group that did not
  *     participate — absent, which `parse.ts::readTextArg` reads as a state
@@ -461,7 +463,9 @@ export function bindCommand(resolution: Resolution, rawInput: string): BoundComm
       break;
     }
     case "ai": {
-      const coerced = coerceArgValues(resolution.modelArgs);
+      // The model NAMES its arguments, like a direct caller, so a declared
+      // text field keeps the exact string it sent.
+      const coerced = coerceArgValues(resolution.modelArgs, textFieldsOf(action.paramSchema));
       bag = coerced.args;
       invalid = coerced.invalid;
       absentKeys = coerced.absentKeys;

@@ -4,13 +4,13 @@
 #   pnpm exec vitest run src/lib/ui-bridge/actionSurfaces.enforcement.test.ts
 # after setting UPDATE_ACTION_SURFACE_GOLDEN=1.
 #
-# total: 171
+# total: 173
 #   guarded: 22
 #   literal: 54
 #   registry: 41
 #   delegated: 9
 #   builtin: 15
-#   fixture: 30
+#   fixture: 32
 
 src/App.tsx:213	literal	component	complete	schema=no	arity=0	effect=write
 src/App.tsx:229	guarded	component	go-to-step	schema=yes	arity=-	effect=read
@@ -108,18 +108,20 @@ src/components/terminal/commands/resolve.test.ts:694	fixture	free	-	schema=yes	a
 src/components/terminal/commands/resolve.test.ts:726	fixture	free	spawn-ai	schema=yes	arity=0	effect=-
 src/components/terminal/commands/uibridge.test.ts:37	fixture	free	test.echo	schema=yes	arity=1	effect=-
 src/components/terminal/commands/uibridge.test.ts:50	fixture	free	test.fail	schema=no	arity=0	effect=-
-src/components/terminal/commands/uibridge.test.ts:65	fixture	free	test.fail-code-only	schema=no	arity=0	effect=-
-src/components/terminal/commands/uibridge.test.ts:77	fixture	free	test.context	schema=yes	arity=-	effect=-
-src/components/terminal/commands/uibridge.test.ts:104	fixture	free	test.zone	schema=yes	arity=-	effect=-
-src/components/terminal/commands/uibridge.test.ts:120	fixture	free	test.mute	schema=yes	arity=-	effect=-
-src/components/terminal/commands/uibridge.test.ts:135	fixture	free	test.count	schema=yes	arity=-	effect=-
-src/components/terminal/commands/uibridge.test.ts:161	fixture	free	test.coerce	schema=yes	arity=-	effect=-
-src/components/terminal/commands/uibridge.test.ts:178	fixture	free	test.null	schema=yes	arity=-	effect=-
-src/components/terminal/commands/uibridge.test.ts:197	fixture	free	test.boom	schema=yes	arity=0	effect=-
-src/components/terminal/commands/uibridge.test.ts:214	fixture	free	test.hotkey	schema=yes	arity=-	effect=-
-src/components/terminal/commands/uibridge.test.ts:232	fixture	free	test.bare	schema=yes	arity=0	effect=-
-src/components/terminal/commands/uibridge.test.ts:262	fixture	free	test.proto	schema=yes	arity=0	effect=-
-src/components/terminal/commands/uibridge.test.ts:292	fixture	free	test.flagged	schema=yes	arity=0	effect=-
+src/components/terminal/commands/uibridge.test.ts:69	fixture	free	test.throws	schema=yes	arity=0	effect=-
+src/components/terminal/commands/uibridge.test.ts:88	fixture	free	test.text	schema=yes	arity=1	effect=-
+src/components/terminal/commands/uibridge.test.ts:103	fixture	free	test.fail-code-only	schema=no	arity=0	effect=-
+src/components/terminal/commands/uibridge.test.ts:115	fixture	free	test.context	schema=yes	arity=-	effect=-
+src/components/terminal/commands/uibridge.test.ts:142	fixture	free	test.zone	schema=yes	arity=-	effect=-
+src/components/terminal/commands/uibridge.test.ts:158	fixture	free	test.mute	schema=yes	arity=-	effect=-
+src/components/terminal/commands/uibridge.test.ts:173	fixture	free	test.count	schema=yes	arity=-	effect=-
+src/components/terminal/commands/uibridge.test.ts:199	fixture	free	test.coerce	schema=yes	arity=-	effect=-
+src/components/terminal/commands/uibridge.test.ts:216	fixture	free	test.null	schema=yes	arity=-	effect=-
+src/components/terminal/commands/uibridge.test.ts:235	fixture	free	test.boom	schema=yes	arity=0	effect=-
+src/components/terminal/commands/uibridge.test.ts:252	fixture	free	test.hotkey	schema=yes	arity=-	effect=-
+src/components/terminal/commands/uibridge.test.ts:270	fixture	free	test.bare	schema=yes	arity=0	effect=-
+src/components/terminal/commands/uibridge.test.ts:300	fixture	free	test.proto	schema=yes	arity=0	effect=-
+src/components/terminal/commands/uibridge.test.ts:330	fixture	free	test.flagged	schema=yes	arity=0	effect=-
 src/components/terminal/commands/usePromptLibraryCommands.test.ts:77	fixture	free	terminal.help	schema=no	arity=0	effect=-
 src/components/terminal/commands/usePromptLibraryCommands.test.ts:105	fixture	free	terminal.doc-finder	schema=no	arity=0	effect=-
 src/components/terminal/commands/usePromptLibraryCommands.ts:118	registry	free	-	schema=yes	arity=0	effect=-
