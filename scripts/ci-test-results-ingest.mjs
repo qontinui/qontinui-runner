@@ -32,6 +32,31 @@
  * USAGE
  *   node scripts/ci-test-results-ingest.mjs --log <path> --repo <owner/repo>
  *                                            --head-sha <sha> [--shard <platform>]
+ *                                            [--gating-outcome <outcome>]
+ *
+ * `--gating-outcome` is the GATING step's own `outcome` (Phase 4a of plan
+ * `2026-09-17-the-windows-test-gate-is-a-90-minute-build-wearing-a-test-shaped-bound`).
+ * Its ONLY effect is to make a disagreement VISIBLE: on anything other than
+ * `success` this script emits an `::error` annotation and a
+ * `$GITHUB_STEP_SUMMARY` line saying that the rows it just wrote for this head
+ * are UNQUALIFIED. **The POST body is byte-identical either way**, deliberately,
+ * and the tests pin that.
+ *
+ * WHY IT CANNOT DO MORE, verified at source on `qontinui-coord` `origin/main`
+ * 2026-09-19 (`crates/coord/src/test_run_effects.rs`). There is nowhere for a
+ * gating outcome to land: `ResultIngestRequest` carries no such field and no
+ * `#[serde(deny_unknown_fields)]`, so an added body key is **silently dropped**
+ * rather than rejected — a producer that "stamped" one would look correct and
+ * write nothing; `ResultItem` is `{test_id, outcome, duration_seconds, shard}`;
+ * `persist_test_results` writes a fixed column list whose `provenance` is a
+ * server-side constant; `source` is CHECK-constrained to
+ * `('ci','local','sandboxed','agent')` and silently coerced to `ci` otherwise,
+ * and it is the credibility axis feeding the Tier-7 merge gate, so it is not
+ * available to borrow; and `shard` is the platform-attribution axis Phase 0 of
+ * the flake plan added. The durable stamp is therefore a three-repo change
+ * (a `qontinui-web` alembic column, a `qontinui-coord` request field + INSERT,
+ * then a flag here) tracked as that plan's Phase 4b. Do not "finish the job" by
+ * adding a body key: it would write into a void that reads as success.
  *
  * ENV
  *   COORD_INGEST_TOKEN   Bearer token for the ingest route. Missing -> warn,
@@ -47,7 +72,7 @@
  *   invocation in ci.yml is broken and should be visible while wiring it up.
  */
 
-import { readFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 import { parseArgs as nodeParseArgs } from "node:util";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -119,11 +144,53 @@ export function buildIngestBody({ logText, repo, headSha, shard }) {
   };
 }
 
+/// The gating step outcomes GitHub can report. Anything else — an unexpanded
+/// `${{ … }}`, an empty string, a typo — is UNKNOWN, and UNKNOWN is announced,
+/// never read as `success`. Reading an unreadable outcome as a pass is exactly
+/// the silent-empty-is-unknown failure this flag exists to end.
+const KNOWN_GATING_OUTCOMES = new Set(["success", "failure", "cancelled", "skipped"]);
+
+/**
+ * Should this ingest be announced as UNQUALIFIED, and what should it say?
+ * PURE — no I/O — so the tests exercise it directly.
+ *
+ * `undefined` (the flag was not passed at all) is NOT a warning: every caller
+ * that predates the flag is correct as it stands, and turning their silence
+ * into an annotation would make the loud case indistinguishable from the
+ * ordinary one.
+ *
+ * @param {string|undefined} gatingOutcome
+ * @param {{repo: string, headSha: string, rows: number}} ctx
+ * @returns {{qualified: boolean, message: string|null}}
+ */
+export function gatingQualification(gatingOutcome, { repo, headSha, rows }) {
+  if (gatingOutcome === undefined || gatingOutcome === null) {
+    return { qualified: true, message: null };
+  }
+  if (gatingOutcome === "success") return { qualified: true, message: null };
+
+  const named = KNOWN_GATING_OUTCOMES.has(gatingOutcome)
+    ? `\`${gatingOutcome}\``
+    : `an unrecognised value \`${gatingOutcome}\` (UNKNOWN, not success)`;
+  return {
+    qualified: false,
+    message:
+      `${rows} row(s) are being recorded in coord.test_results for ${repo}@${headSha} ` +
+      `while the GATING step's outcome was ${named}. Those rows are UNQUALIFIED: ` +
+      `coord has no column that can carry a gating outcome (verified at source, ` +
+      `qontinui-coord crates/coord/src/test_run_effects.rs), so anything reading ` +
+      `"did this head's tests pass" from that store alone gets an answer with no ` +
+      `mention of the red check. Cross-read coord.pr_check_runs for this head. ` +
+      `The durable fix is Phase 4b of plan ` +
+      `2026-09-17-the-windows-test-gate-is-a-90-minute-build-wearing-a-test-shaped-bound.`,
+  };
+}
+
 function printUsage(stream) {
   stream.write(
     [
       "Usage: ci-test-results-ingest.mjs --log <path> --repo <owner/repo> --head-sha <sha>",
-      "                                  [--shard <platform>]",
+      "                                  [--shard <platform>] [--gating-outcome <outcome>]",
       "",
       "Best-effort: never fails the calling CI job. See file header.",
       "",
@@ -133,6 +200,8 @@ function printUsage(stream) {
       "  --head-sha <sha>     Commit the results belong to",
       "  --shard <string>     Matrix leg, e.g. the platform (ubuntu-22.04) —",
       "                       closes the platform-attribution gap Phase 0 found",
+      "  --gating-outcome <o> The GATING step's own outcome. Anything other than",
+      "                       'success' is announced loudly; the payload is unchanged",
       "  -h, --help           Print this help and exit 0",
       "",
     ].join("\n"),
@@ -156,6 +225,19 @@ function info(msg) {
 /// verdict, and is the difference between a silent loss and a visible one.
 function error(msg) {
   process.stdout.write(`::error title=test-results-ingest::${msg}\n`);
+}
+/// Append one markdown line to the job summary, where a human actually looks.
+/// Best-effort and silent on failure — this whole script is a diagnostic on a
+/// path that may already be red, and a summary it cannot write is not a reason
+/// to add noise.
+function stepSummary(markdown) {
+  const path = process.env.GITHUB_STEP_SUMMARY;
+  if (!path) return;
+  try {
+    appendFileSync(path, markdown + "\n", "utf8");
+  } catch {
+    /* nothing to do: `error()` above already carried the same text */
+  }
 }
 
 /// Split `results` into runs of at most `size`. PURE — no I/O, no clock — so
@@ -272,6 +354,7 @@ async function main(argv) {
         repo: { type: "string" },
         "head-sha": { type: "string" },
         shard: { type: "string" },
+        "gating-outcome": { type: "string" },
         help: { type: "boolean", short: "h" },
       },
       allowPositionals: false,
@@ -308,6 +391,24 @@ async function main(argv) {
   if (warning) {
     warn(warning);
     return 0;
+  }
+
+  // Phase 4a: announce an UNQUALIFIED ingest loudly, and change nothing else.
+  // Deliberately after `buildIngestBody` so the row count in the message is the
+  // real one, and deliberately before the token check so the disagreement is
+  // reported even on a box with no COORD_INGEST_TOKEN — the announcement is
+  // about what coord will hold, and a skipped POST is its own separate warning.
+  const qualification = gatingQualification(parsed.values["gating-outcome"], {
+    repo,
+    headSha,
+    rows: body.results.length,
+  });
+  if (!qualification.qualified) {
+    error(qualification.message);
+    stepSummary(
+      `### Test results recorded for a NON-SUCCESS gating step\n\n` +
+        `- ${qualification.message}\n`,
+    );
   }
 
   const token = process.env.COORD_INGEST_TOKEN;

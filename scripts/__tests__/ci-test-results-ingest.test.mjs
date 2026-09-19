@@ -324,3 +324,133 @@ test("the coord-report step pins its own COORD_HTTP_URL to empty, defeating the 
     `the ingest step must pin COORD_HTTP_URL to an empty string, got: ${assigned[0].trim()}`,
   );
 });
+
+// ---------------------------------------------------------------------------
+// Phase 4a of plan
+// `2026-09-17-the-windows-test-gate-is-a-90-minute-build-wearing-a-test-shaped-bound`:
+// `--gating-outcome` makes an UNQUALIFIED ingest LOUD, and changes nothing else.
+//
+// The second half of that sentence is the load-bearing one and is asserted
+// against a real POST rather than by inspection: coord's `ResultIngestRequest`
+// carries no `#[serde(deny_unknown_fields)]`, so a body key added here would be
+// SILENTLY DROPPED — a producer that looked correct and wrote nothing. Payload
+// identity is therefore pinned byte-for-byte, so the day someone "finishes the
+// job" by adding a field, this fails instead of shipping a void.
+// ---------------------------------------------------------------------------
+
+import { createServer } from "node:http";
+import { execFile } from "node:child_process";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { gatingQualification } from "../ci-test-results-ingest.mjs";
+
+const INGEST_CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "ci-test-results-ingest.mjs");
+
+test("gatingQualification: an ABSENT flag is not a warning", () => {
+  const q = gatingQualification(undefined, { repo: "o/r", headSha: "abc", rows: 3 });
+  assert.equal(q.qualified, true);
+  assert.equal(q.message, null);
+});
+
+test("gatingQualification: `success` is qualified", () => {
+  assert.equal(
+    gatingQualification("success", { repo: "o/r", headSha: "abc", rows: 3 }).qualified,
+    true,
+  );
+});
+
+test("gatingQualification: a non-success outcome is announced with the head and the count", () => {
+  const q = gatingQualification("failure", { repo: "o/r", headSha: "deadbee", rows: 7112 });
+  assert.equal(q.qualified, false);
+  assert.match(q.message, /7112 row\(s\)/);
+  assert.match(q.message, /o\/r@deadbee/);
+  assert.match(q.message, /UNQUALIFIED/);
+  assert.match(q.message, /pr_check_runs/);
+});
+
+test("gatingQualification: an UNRECOGNISED outcome is UNKNOWN, never read as success", () => {
+  const q = gatingQualification("${{ steps.run_rust_tests.outcome }}", {
+    repo: "o/r",
+    headSha: "abc",
+    rows: 1,
+  });
+  assert.equal(q.qualified, false);
+  assert.match(q.message, /UNKNOWN, not success/);
+});
+
+/// Run the CLI against a throwaway HTTP server and return {bodies, stdout}.
+function runIngest(args, logText) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const bodies = [];
+    const server = createServer((req, res) => {
+      let buf = "";
+      req.on("data", (c) => {
+        buf += c;
+      });
+      req.on("end", () => {
+        bodies.push(buf);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ parsed: 1, persisted: 1, failed: 0 }));
+      });
+    });
+    server.listen(0, "127.0.0.1", () => {
+      const port = server.address().port;
+      const dir = mkdtempSync(join(tmpdir(), "ingest-gating-"));
+      const logPath = join(dir, "cargo-test-output.log");
+      writeFileSync(logPath, logText, "utf8");
+      execFile(
+        process.execPath,
+        [INGEST_CLI, "--log", logPath, "--repo", "o/r", "--head-sha", "abc123", ...args],
+        {
+          env: {
+            ...process.env,
+            COORD_INGEST_TOKEN: "test-token",
+            COORD_HTTP_URL: `http://127.0.0.1:${port}`,
+            GITHUB_STEP_SUMMARY: "",
+          },
+        },
+        (err, stdout) => {
+          server.close();
+          if (err) return rejectPromise(err);
+          resolvePromise({ bodies, stdout });
+        },
+      );
+    });
+  });
+}
+
+test("the POST body is BYTE-IDENTICAL with and without --gating-outcome", async () => {
+  const plain = await runIngest([], GREEN_LOG);
+  const flagged = await runIngest(["--gating-outcome", "failure"], GREEN_LOG);
+
+  assert.equal(plain.bodies.length, 1, "the plain run must have POSTed exactly once");
+  assert.equal(flagged.bodies.length, 1, "the flagged run must have POSTed exactly once");
+  assert.equal(
+    flagged.bodies[0],
+    plain.bodies[0],
+    "--gating-outcome must not change one byte of the payload: coord has no field " +
+      "for it and would silently drop an added key",
+  );
+
+  // …and the announcement DOES fire, loudly, on exactly the flagged run.
+  assert.match(flagged.stdout, /::error title=test-results-ingest::.*UNQUALIFIED/s);
+  assert.doesNotMatch(plain.stdout, /UNQUALIFIED/);
+});
+
+test("--gating-outcome success stays silent", async () => {
+  const ok = await runIngest(["--gating-outcome", "success"], GREEN_LOG);
+  assert.equal(ok.bodies.length, 1);
+  assert.doesNotMatch(ok.stdout, /UNQUALIFIED/);
+});
+
+test("MUTATION: dropping the gating plumbing would break the loud case", () => {
+  // The mutation the plan names: remove the outcome plumbing so every ingest
+  // looks qualified. Modelled here so the assertion that catches it is visible.
+  const mutated = () => ({ qualified: true, message: null });
+  assert.equal(mutated().qualified, true);
+  // The real implementation must NOT behave that way on a non-success outcome:
+  assert.equal(
+    gatingQualification("failure", { repo: "o/r", headSha: "abc", rows: 1 }).qualified,
+    false,
+  );
+});
