@@ -1050,15 +1050,25 @@ pub async fn ui_bridge_list_runner_windows_handler(
 ///   in the browser/network process.
 ///
 /// **Unlabeled is treated as the safety net**, on purpose: an unlabeled pong
-/// (an older frontend bundle, an external caller, a curl) genuinely carries no
-/// provenance, and reading "unknown" as "the loop is pumping" would silently
-/// restore the blindness this split removes. The cost of that choice is
-/// bounded — the unlabeled pong still advances `ui_bridge_last_pong`, so
-/// readiness, `responsive` and `ui_stale` behave exactly as before.
+/// (an external caller, a curl) genuinely carries no provenance, and reading
+/// "unknown" as "the loop is pumping" would silently restore the blindness
+/// this split removes.
+///
+/// # `?label=` — which window sent it
+///
+/// Every webview built from the embedded bundle (the main window and every
+/// pop-out terminal window) answers the broadcast ping, so provenance alone
+/// cannot say whether the MAIN window is alive. `label` is the sender's Tauri
+/// window label; only a pong labeled with the main window's label stamps
+/// `ui_bridge_last_pong`. An absent label is NOT main evidence — the same
+/// "unknown is the weaker claim" stance as `source`. See
+/// [`crate::ui_error::ingest_window_pong`].
 #[derive(Debug, Default, Deserialize)]
 pub struct PongQuery {
     /// `"event"` | `"safety-net"`. Absent ⇒ safety net (see above).
     pub source: Option<String>,
+    /// The sending window's label. Absent ⇒ not main-window evidence.
+    pub label: Option<String>,
 }
 
 impl PongQuery {
@@ -1070,35 +1080,46 @@ impl PongQuery {
 
 /// Handle UI Bridge pong from frontend.
 ///
-/// Stores two stamps, not one: `ui_bridge_last_pong` (any provenance — "a
-/// renderer is alive") and, for `?source=event` only,
-/// `ui_error::record_event_pong` ("the native event loop delivered our ping").
-/// Keeping them apart is what lets `derived_status` express a hung UI thread
-/// behind a live renderer — see `crate::ui_error::LAST_EVENT_PONG_MS`.
+/// Routes through [`crate::ui_error::ingest_window_pong`], which stores up to
+/// two stamps: `ui_bridge_last_pong` ("the MAIN window's renderer is alive" —
+/// main-labeled pongs only) and, for `?source=event` from ANY window,
+/// `ui_error::record_event_pong`'s clock ("the native event loop delivered our
+/// ping"). Keeping them apart is what lets `derived_status` express a hung UI
+/// thread behind a live renderer — see `crate::ui_error::LAST_EVENT_PONG_MS` —
+/// and scoping the first to main is what stops a live pop-out from masking a
+/// dead main window.
 pub async fn ui_bridge_pong_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<PongQuery>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    state
-        .app_state
-        .ui_bridge_last_pong
-        .store(now, std::sync::atomic::Ordering::Relaxed);
     let event_provenance = query.is_event_provenance();
-    if event_provenance {
-        crate::ui_error::record_event_pong();
+    let main_window = crate::ui_error::ingest_window_pong(
+        &state.app_state.ui_bridge_last_pong,
+        query.label.as_deref(),
+        event_provenance,
+    );
+    // Unblock requests waiting for frontend readiness — but only on MAIN
+    // evidence: UI Bridge requests are served by the main window, so a
+    // pop-out mounting must not open the gate.
+    if main_window {
+        state.ui_bridge_ready.notify_waiters();
     }
-    // Unblock any requests waiting for frontend readiness
-    state.ui_bridge_ready.notify_waiters();
     Ok(Json(ApiResponse::success(serde_json::json!({
         "pong": true,
-        // Echoed so a caller (and a manual `curl`) can see which liveness fact
-        // it just asserted, rather than guessing at the default.
+        // Echoed so a caller (and a manual `curl`) can see which liveness
+        // facts it just asserted, rather than guessing at the defaults.
         "eventProvenance": event_provenance,
+        "mainWindow": main_window,
     }))))
+}
+
+/// The `windowLabel` an IPC response carries, for LIVENESS purposes.
+///
+/// Deliberately does not inherit the response dispatcher's pairing default
+/// (an omitted label is routed as `"main"`): for liveness an unlabeled
+/// response is not main-window evidence.
+pub(crate) fn response_window_label(response: &serde_json::Value) -> Option<&str> {
+    response.get("windowLabel").and_then(|v| v.as_str())
 }
 
 // NOTE: `POST /ui-bridge/heartbeat` used to live here as an IPC forward to a
@@ -1114,20 +1135,18 @@ pub async fn ui_bridge_ipc_response_handler(
 ) -> Json<ApiResponse<serde_json::Value>> {
     let pending = state.ui_bridge_pending.clone();
     let pending_count = state.ui_bridge_pending_count.clone();
+    // A response proves the window that sent it is alive, so it is a pong —
+    // main-window evidence only when it carries the main window's label.
+    // EVENT PROVENANCE, whatever the window: this answers a
+    // `ui-bridge-request` that the native event loop DELIVERED to the
+    // renderer. Only the return leg fell back to HTTP, so the delivery half
+    // still proves the loop pumped.
+    crate::ui_error::ingest_window_pong(
+        &state.app_state.ui_bridge_last_pong,
+        response_window_label(&response),
+        true,
+    );
     handle_ui_bridge_response(pending, pending_count, response).await;
-    // Also update pong timestamp since this proves the frontend is alive
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    state
-        .app_state
-        .ui_bridge_last_pong
-        .store(now, std::sync::atomic::Ordering::Relaxed);
-    // EVENT PROVENANCE: this is a response to a `ui-bridge-request` that the
-    // native event loop DELIVERED to the renderer. Only the return leg fell
-    // back to HTTP, so the delivery half still proves the loop pumped.
-    crate::ui_error::record_event_pong();
     Json(ApiResponse::success(
         serde_json::json!({ "received": true }),
     ))
@@ -1670,12 +1689,69 @@ mod pong_provenance_tests {
         }
     }
 
-    /// An unlabeled pong must still PARSE — an older frontend bundle, an
-    /// external tool or a bare `curl` keeps working and keeps the
-    /// any-provenance stamp fresh; only the event clock is withheld.
+    /// An unlabeled pong must still PARSE — an external tool or a bare
+    /// `curl` is not rejected. What it is withheld is covered below: no event
+    /// clock without `source=event`, no main-window stamp without `label`.
     #[test]
     fn missing_source_is_accepted_not_rejected() {
         assert_eq!(parse("").source, None);
+        assert_eq!(parse("").label, None);
+    }
+
+    /// `label` rides the wire beside `source`, percent-decoded, and is
+    /// independent of it.
+    #[test]
+    fn label_parses_alongside_source() {
+        let q = parse("source=event&label=main");
+        assert!(q.is_event_provenance());
+        assert_eq!(q.label.as_deref(), Some("main"));
+
+        let q = parse("source=safety-net&label=terminal%2D7");
+        assert!(!q.is_event_provenance());
+        assert_eq!(q.label.as_deref(), Some("terminal-7"));
+
+        // A label that tries to smuggle a second `label=main` stays ONE value.
+        let q = parse("label=a%26label%3Dmain");
+        assert_eq!(q.label.as_deref(), Some("a&label=main"));
+    }
+
+    /// The parsed label decides main-window evidence exactly as
+    /// `ui_error::is_main_window_pong` says: only the main label counts; an
+    /// absent one and a pop-out's do not.
+    #[test]
+    fn only_a_main_labeled_pong_is_main_window_evidence() {
+        let main = "main";
+        let is_main =
+            |q: &str| crate::ui_error::is_main_window_pong(parse(q).label.as_deref(), main);
+        assert!(is_main("source=event&label=main"));
+        assert!(is_main("source=safety-net&label=main"));
+        assert!(!is_main("source=event"));
+        assert!(!is_main(""));
+        assert!(!is_main("source=event&label=terminal-1"));
+        assert!(!is_main("label="));
+    }
+
+    /// IPC responses: the liveness label is the body's `windowLabel` as sent —
+    /// it must NOT inherit the dispatcher's routing default of `"main"`.
+    #[test]
+    fn ipc_response_liveness_label_does_not_default_to_main() {
+        use serde_json::json;
+        assert_eq!(
+            super::response_window_label(&json!({"requestId": "r", "windowLabel": "main"})),
+            Some("main")
+        );
+        assert_eq!(
+            super::response_window_label(&json!({"requestId": "r", "windowLabel": "terminal-2"})),
+            Some("terminal-2")
+        );
+        assert_eq!(
+            super::response_window_label(&json!({"requestId": "r"})),
+            None
+        );
+        assert_eq!(
+            super::response_window_label(&json!({"requestId": "r", "windowLabel": 5})),
+            None
+        );
     }
 }
 

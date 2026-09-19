@@ -52,7 +52,7 @@ import {
 } from "./ui-bridge-events";
 
 import type { UIBridgeRequestPayload, UIBridgeResponsePayload } from "./ui-bridge-events/types";
-import { httpSendResponse, httpSendPong } from "./ui-bridge-events/utils";
+import { httpSendResponse, httpSendPong, pongEventPayload } from "./ui-bridge-events/utils";
 
 /**
  * Hook that handles UI Bridge requests from Tauri events.
@@ -272,12 +272,19 @@ export function useUIBridgeEventHandler(): void {
         // Reaching this callback AT ALL means the native event loop delivered
         // the ping, so both legs below carry "event" provenance — including
         // the HTTP fallback, where only the JS→Rust return trip failed.
+        //
+        // Every pong carries this window's label. The ping is a broadcast, so
+        // pop-out terminal windows answer it too; Rust counts a pong as
+        // evidence that the MAIN window is alive only when it is labeled with
+        // the main window's label, so a live pop-out can no longer keep a
+        // crashed main renderer reading healthy (plan
+        // 2026-09-19-runner-render-process-crash-recovery-is-a-no-op-and-popout-pongs-mask-it).
         const unlistenPing = await listen("ui-bridge-ping", async () => {
           try {
-            await emit("ui-bridge-pong", { timestamp: Date.now() });
+            await emit("ui-bridge-pong", pongEventPayload(myWindowLabelRef.current));
           } catch {
             // Tauri event failed — use HTTP fallback
-            await httpSendPong("event");
+            await httpSendPong("event", myWindowLabelRef.current);
           }
         });
 
@@ -292,7 +299,7 @@ export function useUIBridgeEventHandler(): void {
         // keeps a separate event-provenance clock so the two cases are
         // distinguishable — see the 2026-08-19 plan.
         const pongInterval = setInterval(() => {
-          httpSendPong("safety-net").catch(() => {});
+          httpSendPong("safety-net", myWindowLabelRef.current).catch(() => {});
         }, 3000);
 
         log.debug("Listener set up successfully");
@@ -300,9 +307,10 @@ export function useUIBridgeEventHandler(): void {
         // Signal readiness immediately rather than waiting for next ping cycle.
         // This unblocks any Rust-side requests waiting on the readiness gate.
         // "safety-net": nothing was delivered to trigger it, so it asserts
-        // only that this renderer mounted — the readiness gate reads the
-        // any-provenance stamp, so its behavior is unchanged.
-        httpSendPong("safety-net").catch(() => {});
+        // only that this renderer mounted. Labeled like every other pong: the
+        // readiness gate waits for the MAIN window, so a pop-out mounting must
+        // not open it.
+        httpSendPong("safety-net", myWindowLabelRef.current).catch(() => {});
 
         // Store ping unlisten for cleanup
         const originalUnlisten = unlisten;
