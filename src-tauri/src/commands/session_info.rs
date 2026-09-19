@@ -392,6 +392,8 @@ pub struct TenancyRow {
 pub struct TenancyDataPlane {
     /// `"owned"` (a tenant is stamped on the registry session) | `"device"`
     /// (the default binding's credential; `tenantId` is that binding) |
+    /// `"unbacked"` (the owner `tenantId` is known but this device cannot
+    /// present it; `reason`: `device_cannot_present_tenant`) |
     /// `"unresolved"` | `"unknown"` (`reason`: `no_coord_session`,
     /// `default_binding_unknown`).
     pub status: String,
@@ -520,6 +522,17 @@ pub(crate) fn project_tenancy(
             status: "unresolved".to_string(),
             tenant_id: None,
             reason: None,
+        },
+        // The session's owner is KNOWN to be `t`, and this device holds no
+        // usable credential for it: the data-plane writes declare nothing and
+        // present nothing (see `TenantScope::Unbacked`). Reported with the
+        // owner so it compares against the row's stamp like `Owned` does, and
+        // with a reason, because "owned, but unpresentable" is exactly the
+        // state an operator reading this block needs to see.
+        Some(TenantScope::Unbacked(t)) => TenancyDataPlane {
+            status: "unbacked".to_string(),
+            tenant_id: Some(t.to_string()),
+            reason: Some("device_cannot_present_tenant".to_string()),
         },
         None => TenancyDataPlane {
             status: TENANCY_UNKNOWN.to_string(),
@@ -1190,6 +1203,29 @@ mod tests {
         assert_eq!(t.credential.slot.as_deref(), Some("tenant"));
         assert_eq!(t.credential.posture.status, TENANCY_OBSERVED);
         assert_eq!(t.credential.posture.value.as_deref(), Some("live"));
+    }
+
+    /// An `Unbacked` data plane names its known owner, says why nothing is
+    /// presented, and agrees with a row stamped to that same owner.
+    #[test]
+    fn tenancy_reports_an_unbacked_data_plane_with_its_owner() {
+        let b = tenant(0xB2);
+        let t = project_tenancy(
+            Some(&b.to_string()),
+            Some(crate::auth::TenantScope::Unbacked(b)),
+            &crate::coord_mcp::CredentialTenantRead::Resolved(Some(b)),
+            crate::auth::BindingTenantRead::Unknown,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(t.data_plane.status, "unbacked");
+        assert_eq!(t.data_plane.tenant_id, Some(b.to_string()));
+        assert_eq!(
+            t.data_plane.reason.as_deref(),
+            Some("device_cannot_present_tenant")
+        );
+        assert!(!t.diverged);
     }
 
     /// The published posture is the WORST slot's. A reading about tenant A's
