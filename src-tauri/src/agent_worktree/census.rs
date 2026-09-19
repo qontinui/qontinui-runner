@@ -1227,11 +1227,16 @@ pub(crate) fn qontinui_root() -> Option<PathBuf> {
 // Junction detection + sizing (the cross-platform-safe core).
 // ---------------------------------------------------------------------------
 
-/// True iff `path` is a reparse point (junction / symlink) on Windows.
-/// Always `false` on non-Windows (the runner ships on Windows; the
-/// non-windows arm exists so the crate type-checks + tests run on CI's
-/// other targets). Uses `symlink_metadata` so it inspects the link
-/// itself, never its target.
+/// True iff `path` is a link: a reparse point (junction / symlink) on
+/// Windows, a symlink everywhere else. The non-Windows arm is a real,
+/// shipped code path — the runner runs on Linux too, where an agent
+/// worktree's `node_modules` is a symlink into the canonical checkout —
+/// not a stub that only exists so CI type-checks. Uses `symlink_metadata`
+/// so it inspects the link itself, never its target.
+///
+/// To remove a path this returns `true` for, use [`remove_link`]: the
+/// removal call differs per platform, and the wrong one either fails or
+/// follows the link.
 pub fn is_junction(path: &Path) -> bool {
     #[cfg(windows)]
     {
@@ -1248,6 +1253,32 @@ pub fn is_junction(path: &Path) -> bool {
         std::fs::symlink_metadata(path)
             .map(|m| m.file_type().is_symlink())
             .unwrap_or(false)
+    }
+}
+
+/// Remove the link at `path` — ONLY the link, never its target, and never
+/// recursively. The caller must already have confirmed the path is a link
+/// with [`is_junction`]; this does not re-check.
+///
+/// - Windows: `remove_dir` removes a DIRECTORY link's reparse point (a
+///   junction, or a directory symlink) without touching what it points at.
+///   It refuses a Windows FILE symlink, which `is_junction` also reports —
+///   a safe failure, and not a case the reclaim callers meet: they only
+///   remove `node_modules` / `target` directory links.
+/// - Everywhere else: `remove_file`, i.e. `unlink(2)`, which removes a
+///   symlink itself whether its target is a directory, a file, or missing.
+///   `remove_dir` here would be `rmdir(2)`, which refuses a symlink with
+///   `ENOTDIR` ("Not a directory (os error 20)") — the defect that made
+///   every Linux reclaim of a worktree with a symlinked `node_modules`
+///   abort under INV-W4.
+pub(crate) fn remove_link(path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        std::fs::remove_dir(path)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::remove_file(path)
     }
 }
 

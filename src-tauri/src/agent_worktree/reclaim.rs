@@ -20,8 +20,10 @@
 //!      [`census::is_junction`]); a non-junction (a real dir that drifted)
 //!      is left untouched — we never recursively delete a real dir we
 //!      didn't expect to be a link;
-//!   2. `remove_dir` (NOT `remove_dir_all`) the reparse point — on Windows
-//!      this removes only the link, never its target;
+//!   2. remove ONLY the link, never recursing (NOT `remove_dir_all`), via
+//!      [`census::remove_link`]: `remove_dir` on the Windows reparse point,
+//!      `unlink(2)` (`remove_file`) on a symlink everywhere else — either
+//!      way the link goes and its target is never touched;
 //! and ONLY after all junctions are unlinked do we
 //! `git worktree remove --force` (or remove the dir).
 //!
@@ -98,7 +100,7 @@ use serde::Deserialize;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use super::census::{is_junction, CloneRootness};
+use super::census::{is_junction, remove_link, CloneRootness};
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Default reclaim poll cadence — 300s (5 min), matching the census.
@@ -469,9 +471,9 @@ pub(super) fn execute_step(step: &ReclaimStep) -> Result<(), String> {
 /// Unlink a junction WITHOUT recursing into it (INV-W4). Verifies the path
 /// is a reparse point BEFORE removing — a path that isn't a junction
 /// (already unlinked, or a real dir we didn't expect) is left untouched
-/// and reported as a success no-op. We use `remove_dir` (NOT
-/// `remove_dir_all`): on Windows that removes only the reparse point, not
-/// its target.
+/// and reported as a success no-op. The link is removed with
+/// [`remove_link`] (NOT `remove_dir_all`): `remove_dir` on a Windows
+/// reparse point, `unlink(2)` on a symlink elsewhere — never its target.
 fn unlink_junction(path: &Path) -> Result<(), String> {
     if !path.exists() && !is_junction(path) {
         // Already gone (or never existed) — idempotent no-op.
@@ -491,8 +493,8 @@ fn unlink_junction(path: &Path) -> Result<(), String> {
         );
         return Ok(());
     }
-    // Confirmed reparse point — remove ONLY the link.
-    match std::fs::remove_dir(path) {
+    // Confirmed link — remove ONLY the link.
+    match remove_link(path) {
         Ok(()) => {
             info!("worktree_reclaim: unlinked junction {}", path.display());
             Ok(())
@@ -735,9 +737,10 @@ fn create_junction(link: &Path, target: &Path) -> Result<(), String> {
     }
 }
 
-/// Non-Windows: junctions are a Windows concept; rejunction is a no-op
-/// (the runner ships on Windows — this arm exists so the crate builds on
-/// CI's other targets).
+/// Non-Windows: rejunction is a no-op that reports success. The runner
+/// does run on Linux, but recreating a drifted `node_modules` / `target`
+/// link as a symlink there is not implemented — this arm logs and returns
+/// `Ok(())` without creating anything.
 #[cfg(not(windows))]
 fn create_junction(link: &Path, _target: &Path) -> Result<(), String> {
     debug!(
@@ -2384,6 +2387,76 @@ mod tests {
         assert!(res.is_ok());
         assert!(real.exists(), "a real dir must survive an unlink_junction");
         assert!(real.join("keep.txt").exists(), "contents must survive");
+    }
+
+    /// The Linux reclaim defect: a worktree's `node_modules` is a symlink
+    /// into the canonical checkout, and the old `remove_dir` answered
+    /// ENOTDIR ("Not a directory (os error 20)"), so every removal aborted
+    /// under INV-W4. The link must go; the canonical tree must not.
+    #[cfg(unix)]
+    #[test]
+    fn unlink_junction_on_a_symlink_removes_only_the_link() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().join("canonical-node_modules");
+        std::fs::create_dir(&canonical).unwrap();
+        std::fs::write(canonical.join("keep.txt"), b"shared").unwrap();
+        let link = dir.path().join("node_modules");
+        symlink(&canonical, &link).unwrap();
+
+        let res = unlink_junction(&link);
+        assert!(res.is_ok(), "unlinking a symlink must succeed: {res:?}");
+        assert!(
+            std::fs::symlink_metadata(&link).is_err(),
+            "the link itself must be gone"
+        );
+        assert!(canonical.is_dir(), "the link's target must survive");
+        assert_eq!(
+            std::fs::read(canonical.join("keep.txt")).unwrap(),
+            b"shared",
+            "the target's contents must survive"
+        );
+
+        // Idempotent: the second call finds nothing and still succeeds.
+        assert!(unlink_junction(&link).is_ok());
+    }
+
+    /// A symlink to a regular FILE is unlinked the same way, and the file
+    /// it points at survives.
+    #[cfg(unix)]
+    #[test]
+    fn unlink_junction_on_a_file_symlink_removes_only_the_link() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("real.txt");
+        std::fs::write(&file, b"keep").unwrap();
+        let link = dir.path().join("link.txt");
+        symlink(&file, &link).unwrap();
+
+        assert!(unlink_junction(&link).is_ok());
+        assert!(
+            std::fs::symlink_metadata(&link).is_err(),
+            "the link itself must be gone"
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), b"keep", "the target must survive");
+    }
+
+    /// A dangling symlink (its target already gone) is still a link, and
+    /// is still removable — `exists()` is false for it, so only the
+    /// `is_junction` half of the absent-check keeps it from being skipped.
+    #[cfg(unix)]
+    #[test]
+    fn unlink_junction_removes_a_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("node_modules");
+        symlink(dir.path().join("gone"), &link).unwrap();
+
+        assert!(unlink_junction(&link).is_ok());
+        assert!(
+            std::fs::symlink_metadata(&link).is_err(),
+            "a dangling link must be removed too"
+        );
     }
 
     #[test]

@@ -361,7 +361,7 @@ use std::time::Duration;
 
 use tracing::{info, warn};
 
-use super::census::{is_junction, qontinui_root};
+use super::census::{is_junction, qontinui_root, remove_link};
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Env flag arming destructive removal. Unset/false → dry-run (log only).
@@ -1791,14 +1791,18 @@ fn looks_like_cargo_artifact(path: &Path) -> bool {
     has_cargo_marker(path) && has_profile
 }
 
-/// Junction-safe recursive removal. Unlinks any nested reparse point with
-/// `remove_dir` (link only, never recursing into its target) before deleting
-/// real content, then removes `dir` itself. Mirrors [`super::reclaim`] INV-W4.
+/// Junction-safe recursive removal. Removes any link — `dir` itself or a
+/// nested one — as a link only, never recursing into its target, before
+/// deleting real content, then removes `dir` itself. A top-level link goes
+/// through [`remove_link`] (`remove_dir` on a Windows junction, `unlink(2)`
+/// elsewhere); on Linux a nested symlink is never `is_dir()` under
+/// `symlink_metadata`, so it takes the `is_symlink()` arm and `remove_file`.
+/// Mirrors [`super::reclaim`] INV-W4.
 fn remove_junction_safe(dir: &Path) -> std::io::Result<()> {
     // `dir` itself must not be a reparse point — the caller guarantees it, but
     // defend anyway: unlink the link only.
     if is_junction(dir) {
-        return std::fs::remove_dir(dir);
+        return remove_link(dir);
     }
     let entries = std::fs::read_dir(dir)?;
     for entry in entries.flatten() {
@@ -3748,6 +3752,34 @@ mod tests {
         assert!(tgt.exists());
         remove_junction_safe(&tgt).unwrap();
         assert!(!tgt.exists());
+    }
+
+    /// A symlinked `dir` is unlinked as a link: on Linux the old
+    /// `remove_dir` answered ENOTDIR, and nothing may ever follow the link
+    /// into the tree it points at.
+    #[cfg(unix)]
+    #[test]
+    fn remove_junction_safe_on_a_symlink_removes_only_the_link() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("keep.txt"), b"canonical").unwrap();
+        let link = tmp.path().join("link");
+        symlink(&real, &link).unwrap();
+
+        remove_junction_safe(&link).expect("a symlink must be unlinkable");
+
+        assert!(
+            fs::symlink_metadata(&link).is_err(),
+            "the link itself must be gone"
+        );
+        assert!(real.is_dir(), "the link's target must survive");
+        assert_eq!(
+            fs::read(real.join("keep.txt")).unwrap(),
+            b"canonical",
+            "the target's contents must survive"
+        );
     }
 
     #[test]
