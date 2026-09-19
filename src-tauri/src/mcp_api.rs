@@ -1266,8 +1266,14 @@ async fn health(
         // NOT readiness — externally driven and one-way. See the derivation
         // comment above.
         "uiBridgeIpcObserved": ui_bridge_ipc_observed,
+        // `lastHeartbeat` is the MAIN window's last pong only — a pop-out's
+        // pong no longer advances it (plan 2026-09-19-runner-render-process-
+        // crash-recovery-is-a-no-op-and-popout-pongs-mask-it). `windowPongs`
+        // is the per-window breakdown behind it: which windows are answering,
+        // and how recently. Diagnostic only; no verdict reads it.
         "lastHeartbeat": last_pong,
         "heartbeatAgeMs": pong_age_ms,
+        "windowPongs": crate::ui_error::window_pong_report(now_ms),
         "uptimeSeconds": uptime_secs,
         "pendingRequests": pending_count,
         "circuitBreaker": format!("{:?}", circuit_breaker_state),
@@ -8845,6 +8851,7 @@ pub fn create_router(
 
         let pending_for_listener = pending.clone();
         let pending_count_for_listener = pending_count.clone();
+        let last_pong_for_listener = api_state.app_state.ui_bridge_last_pong.clone();
         let _listener_id = handle.listen("ui-bridge-response", move |event| {
             let pending = pending_for_listener.clone();
             let pending_count = pending_count_for_listener.clone();
@@ -8878,6 +8885,17 @@ pub fn create_router(
                     });
 
             if let Some(response) = response {
+                // A response proves the window that sent it is alive: it is
+                // MAIN-window evidence (`ui_bridge_last_pong`) only when its
+                // `windowLabel` is the main window's. Deliberately NOT the
+                // dispatcher's pairing default of "main" for an omitted label
+                // — for liveness, unlabeled is not main. The event clock was
+                // already stamped above, unconditionally.
+                crate::ui_error::ingest_window_pong(
+                    &last_pong_for_listener,
+                    crate::mcp::ui_bridge::capabilities::response_window_label(&response),
+                    false,
+                );
                 // Spawn a task to handle the response since we need async
                 let runtime = tokio::runtime::Handle::try_current();
                 if let Ok(rt) = runtime {
@@ -9195,21 +9213,26 @@ pub fn create_router(
 
         use tauri::Listener;
 
-        handle.listen("ui-bridge-pong", move |_event| {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64;
-            last_pong.store(now, std::sync::atomic::Ordering::Relaxed);
-            // EVENT PROVENANCE: this pong answered a `ui-bridge-ping` the
-            // event loop delivered, and travelled back as a Tauri event, so it
-            // proves the native loop is pumping. `ui_bridge_last_pong` above
-            // cannot carry that fact — the frontend also pongs unconditionally
-            // over HTTP, which WebView2 serves from its browser process while
-            // the UI thread is frozen.
-            crate::ui_error::record_event_pong();
-            // Unblock any requests waiting for frontend readiness
-            ready.notify_waiters();
+        handle.listen("ui-bridge-pong", move |event| {
+            // EVENT PROVENANCE, from whichever window answered: this pong
+            // answered a `ui-bridge-ping` the event loop delivered, and
+            // travelled back as a Tauri event, so it proves the native loop
+            // is pumping. `ui_bridge_last_pong` cannot carry that fact — the
+            // frontend also pongs unconditionally over HTTP, which WebView2
+            // serves from its browser process while the UI thread is frozen.
+            //
+            // MAIN-WINDOW evidence only when the payload's `label` is the main
+            // window's: the ping is a broadcast, so pop-out windows answer it
+            // too, and a live pop-out must not keep a dead main window reading
+            // alive (plan 2026-09-19-runner-render-process-crash-recovery-is-a-
+            // no-op-and-popout-pongs-mask-it).
+            let label = crate::ui_error::pong_event_label(event.payload());
+            let main_window =
+                crate::ui_error::ingest_window_pong(&last_pong, label.as_deref(), true);
+            // Unblock requests waiting for frontend readiness — main only.
+            if main_window {
+                ready.notify_waiters();
+            }
         });
     }
 

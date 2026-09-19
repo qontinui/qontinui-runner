@@ -41,16 +41,44 @@ export async function httpSendResponse(response: unknown): Promise<boolean> {
 export type PongSource = "event" | "safety-net";
 
 /**
+ * The URL of a `POST /ui-bridge/pong`, carrying BOTH halves of what the Rust
+ * side needs to know about a pong: its provenance (`source`, see
+ * {@link PongSource}) and the window that sent it (`label`).
+ *
+ * The label is what makes a pong evidence about the MAIN window. Every
+ * webview built from the embedded bundle — the main window and every pop-out
+ * terminal — mounts this handler and answers the broadcast `ui-bridge-ping`,
+ * so an unlabeled pong from a live pop-out is indistinguishable from one sent
+ * by the main window. Rust therefore stamps its renderer-alive clock
+ * (`AppState.ui_bridge_last_pong`) only for a pong labeled with the main
+ * window's label; a pop-out's pong is recorded per window for diagnostics
+ * and never keeps a dead main window reading alive (plan
+ * 2026-09-19-runner-render-process-crash-recovery-is-a-no-op-and-popout-pongs-mask-it).
+ */
+export function pongUrl(port: number | string, source: PongSource, windowLabel: string): string {
+  return `http://localhost:${port}/ui-bridge/pong?source=${source}&label=${encodeURIComponent(windowLabel)}`;
+}
+
+/**
+ * The payload of the Tauri `ui-bridge-pong` event. Carries the sender's window
+ * label for the same reason {@link pongUrl} does: the event is heard by one
+ * process-wide Rust listener that cannot otherwise tell which window emitted it.
+ */
+export function pongEventPayload(windowLabel: string): { timestamp: number; label: string } {
+  return { timestamp: Date.now(), label: windowLabel };
+}
+
+/**
  * Send a pong to the Rust backend via HTTP.
  *
- * Defaults to `"safety-net"`: an unlabeled pong genuinely carries no
- * provenance, and the Rust side treats unknown provenance as the weaker
- * claim rather than assuming the loop is healthy.
+ * Both arguments are required. `source` has no default because an unlabeled
+ * pong genuinely carries no provenance (Rust reads an absent one as the weaker
+ * "safety-net" claim), and `windowLabel` has none because an unlabeled pong is
+ * not evidence that the main window is alive.
  */
-export async function httpSendPong(source: PongSource = "safety-net"): Promise<boolean> {
+export async function httpSendPong(source: PongSource, windowLabel: string): Promise<boolean> {
   try {
-    const port = getApiPort();
-    const resp = await fetch(`http://localhost:${port}/ui-bridge/pong?source=${source}`, {
+    const resp = await fetch(pongUrl(getApiPort(), source, windowLabel), {
       method: "POST",
     });
     return resp.ok;

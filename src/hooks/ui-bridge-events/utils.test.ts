@@ -29,6 +29,8 @@ import {
   describeEvaluateBudget,
   evaluateTimeoutMessage,
   PAGE_EVALUATE_MIN_TIMEOUT_MS,
+  pongEventPayload,
+  pongUrl,
 } from "./utils";
 
 describe("isThenable", () => {
@@ -856,5 +858,33 @@ describe("toFindRequest - one filter seam for both discover and find", () => {
   it("lets an explicit includeHidden:false override the find seed", () => {
     const seeded = { includeHidden: true, ...toFindRequest({ include_hidden: false }) };
     expect(seeded.includeHidden).toBe(false);
+  });
+});
+
+// Every pong names the window that sent it. Rust treats a pong as evidence the
+// MAIN window is alive only when its label is the main window's — so a live
+// pop-out can no longer mask a crashed main renderer (plan
+// 2026-09-19-runner-render-process-crash-recovery-is-a-no-op-and-popout-pongs-mask-it).
+describe("pong window labels", () => {
+  it("pongUrl carries both the provenance and the sender's label", () => {
+    expect(pongUrl(9876, "event", "main")).toBe(
+      "http://localhost:9876/ui-bridge/pong?source=event&label=main",
+    );
+    expect(pongUrl("9877", "safety-net", "terminal-abc")).toBe(
+      "http://localhost:9877/ui-bridge/pong?source=safety-net&label=terminal-abc",
+    );
+  });
+
+  it("pongUrl percent-encodes a label so it cannot smuggle extra query params", () => {
+    const url = new URL(pongUrl(9876, "event", "a&label=main"));
+    expect(url.searchParams.getAll("label")).toEqual(["a&label=main"]);
+    expect(url.searchParams.get("source")).toBe("event");
+  });
+
+  it("pongEventPayload carries the sender's label beside the timestamp", () => {
+    const before = Date.now();
+    const payload = pongEventPayload("terminal-1");
+    expect(payload.label).toBe("terminal-1");
+    expect(payload.timestamp).toBeGreaterThanOrEqual(before);
   });
 });

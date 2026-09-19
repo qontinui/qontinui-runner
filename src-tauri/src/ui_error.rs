@@ -71,8 +71,9 @@
 //! * **The MAIN window's UI dying** — already covered, and by a signal with the
 //!   properties a health signal needs: [`ui_dead_now`] over
 //!   `ui_bridge_last_pong`. It is **self-clearing** (the next pong retracts it)
-//!   and it is **attributed to the right window** (only the main window's
-//!   frontend pongs). That is the shape a backend-observed health signal has to
+//!   and it is **attributed to the right window** (only a pong labeled with
+//!   the main window's label stamps it — see [`ingest_window_pong`]). That is
+//!   the shape a backend-observed health signal has to
 //!   have; `ui_error` is not it.
 
 use std::sync::Arc;
@@ -225,7 +226,8 @@ pub const UI_STALE_AFTER_MS: u64 = 30_000;
 /// trigger recovery, and a status that flaps would drive a recovery loop.
 /// Rust emits `ui-bridge-ping` unconditionally every 3s (`mcp_api.rs`
 /// startup wiring) and the frontend answers `ui-bridge-pong`, so `last_pong`
-/// advances on its own whenever any UI is alive. 90s is therefore **30
+/// advances on its own whenever the MAIN window's UI is alive (pop-out pongs
+/// do not advance it — [`ingest_window_pong`]). 90s is therefore **30
 /// consecutive missed pings** — far outside anything a GC pause or a busy
 /// main thread can produce.
 ///
@@ -386,6 +388,189 @@ pub fn last_event_pong_age_ms() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64;
     now_ms.saturating_sub(stamp)
+}
+
+// ───────────── renderer-alive pongs are scoped to the MAIN window ─────────────
+//
+// Plan 2026-09-19-runner-render-process-crash-recovery-is-a-no-op-and-popout-pongs-mask-it,
+// Phase 1.
+//
+// `ui-bridge-ping` is an unfiltered broadcast, and every webview built from the
+// embedded bundle — the main window AND every pop-out terminal window — mounts
+// `useUIBridgeEventHandler` and answers it. Until the pongs carried the
+// sender's window label, all of them landed in the one
+// `AppState::ui_bridge_last_pong` atom, so a single live pop-out kept a crashed
+// main renderer reading alive to every reader of that atom: `ui_dead`, the
+// heartbeat recovery backstop, the relay verdict, the UI-Bridge readiness gate,
+// `/health`, and the recovery ladder's own pong verification.
+//
+// The two stamps are scoped differently ON PURPOSE:
+//
+// * `ui_bridge_last_pong` means "the MAIN window's renderer is alive". Only a
+//   pong labeled with `qontinui_runner_lib::get_main_window_label()` stamps it.
+//   An UNLABELED pong is not main evidence either — every runner embeds its
+//   own frontend, so there is no older bundle to protect, and the only
+//   unlabeled sender left is an external caller, which is itself a masking
+//   source. Unknown provenance is the weaker claim, as for `?source=`.
+// * [`LAST_EVENT_PONG_MS`] means "the native event loop delivered our ping".
+//   There is ONE tao event loop per process, shared by every window, so a
+//   pop-out's event pong is genuine evidence it pumps. It stays process-wide;
+//   scoping it to main would make an occluded or crashed main read as a wedged
+//   loop, which is a different failure with a different remedy.
+//
+// Every pong, main or not, also lands in a small per-window map so `/health`
+// can show WHICH windows are answering — the one question the old single atom
+// made unanswerable during the 2026-09-18 incident.
+
+/// Key under which an unlabeled pong is recorded in the per-window map. Angle
+/// brackets make it impossible to collide with a real Tauri window label.
+pub const UNLABELED_PONG_KEY: &str = "<unlabeled>";
+
+/// Upper bound on the per-window pong map. Pop-out labels are unique per
+/// window and a closed window never retracts its entry, so without a bound a
+/// long-lived runner would accumulate one row per pop-out ever opened. The
+/// stalest row is evicted first — it is the one least likely to be alive.
+const WINDOW_PONG_MAP_CAP: usize = 32;
+
+/// `label → wall-clock ms of its last pong`, for diagnostics only. Nothing
+/// decides liveness from it; see [`window_pong_report`].
+static WINDOW_PONGS: std::sync::Mutex<std::collections::BTreeMap<String, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Is a pong from `label` evidence that the MAIN window's renderer is alive?
+///
+/// Pure. `None` (unlabeled) is never main evidence — see the section comment.
+pub fn is_main_window_pong(label: Option<&str>, main_label: &str) -> bool {
+    label == Some(main_label)
+}
+
+/// Ingest one liveness pong (or IPC response) from the window `label`.
+///
+/// * stamps `last_pong` (`AppState::ui_bridge_last_pong`) **only** when the
+///   label is the main window's;
+/// * stamps the process-wide event-loop clock ([`record_event_pong`]) when
+///   `event_provenance` is set, whatever window sent it;
+/// * records the pong in the per-window diagnostic map.
+///
+/// Returns whether the pong was main-window evidence, so a caller that also
+/// wakes the UI-Bridge readiness gate does so for the main window only — a
+/// pop-out mounting must not open a gate whose requests the main window
+/// serves.
+///
+/// This is the ONE writer of `ui_bridge_last_pong`; every pong and IPC-response
+/// path goes through it so the scoping rule cannot be applied at some sites
+/// and forgotten at others.
+pub fn ingest_window_pong(
+    last_pong: &std::sync::atomic::AtomicU64,
+    label: Option<&str>,
+    event_provenance: bool,
+) -> bool {
+    ingest_window_pong_at(
+        last_pong,
+        label,
+        event_provenance,
+        qontinui_runner_lib::get_main_window_label(),
+        now_ms_epoch(),
+    )
+}
+
+/// [`ingest_window_pong`] with the main label and the clock passed in, so the
+/// scoping rule is testable without a Tauri app or a real clock.
+pub fn ingest_window_pong_at(
+    last_pong: &std::sync::atomic::AtomicU64,
+    label: Option<&str>,
+    event_provenance: bool,
+    main_label: &str,
+    now_ms: u64,
+) -> bool {
+    let is_main = is_main_window_pong(label, main_label);
+    if is_main {
+        last_pong.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    }
+    if event_provenance {
+        LAST_EVENT_PONG_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    }
+    record_window_pong_diagnostic(label.unwrap_or(UNLABELED_PONG_KEY), now_ms);
+    is_main
+}
+
+fn record_window_pong_diagnostic(key: &str, now_ms: u64) {
+    // A poisoned lock only means a panic elsewhere mid-insert; the map is
+    // diagnostic, so recover it rather than dropping every later pong.
+    let mut map = WINDOW_PONGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    insert_bounded(&mut map, key, now_ms, WINDOW_PONG_MAP_CAP);
+}
+
+/// Insert `key → now_ms`, then evict the stalest rows until at most `cap`
+/// remain. Split out so the bound is testable on a local map rather than on
+/// the process-global one sibling tests write concurrently.
+fn insert_bounded(
+    map: &mut std::collections::BTreeMap<String, u64>,
+    key: &str,
+    now_ms: u64,
+    cap: usize,
+) {
+    map.insert(key.to_string(), now_ms);
+    while map.len() > cap {
+        let Some(stalest) = map
+            .iter()
+            .min_by_key(|(_, stamp)| **stamp)
+            .map(|(k, _)| k.clone())
+        else {
+            break;
+        };
+        map.remove(&stalest);
+    }
+}
+
+/// The sender's window label from a Tauri `ui-bridge-pong` event payload
+/// (`{ timestamp, label }`).
+///
+/// Tolerates the Tauri 2.x double-serialization the `ui-bridge-response`
+/// listener documents (the payload arriving as a JSON string that itself
+/// contains the object). Anything unparseable, or a payload without a string
+/// `label`, is `None` — an unlabeled pong, which is not main-window evidence.
+pub fn pong_event_label(payload: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let value = match value {
+        serde_json::Value::String(inner) => serde_json::from_str(&inner).ok()?,
+        other => other,
+    };
+    value.get("label")?.as_str().map(str::to_string)
+}
+
+/// One row of the per-window pong report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowPongRow {
+    /// The window label the pong carried, or [`UNLABELED_PONG_KEY`].
+    pub label: String,
+    /// Whether this window's pongs count as main-window evidence.
+    pub main: bool,
+    /// Wall-clock ms of this window's last pong.
+    pub last_pong: u64,
+    /// Age of `last_pong` at report time (saturating, for the NTP reason
+    /// [`ui_dead_now`] documents).
+    pub age_ms: u64,
+}
+
+/// The per-window pong map as report rows, ordered by label. Diagnostic only:
+/// liveness is decided from `ui_bridge_last_pong`, never from this.
+pub fn window_pong_report(now_ms: u64) -> Vec<WindowPongRow> {
+    let main_label = qontinui_runner_lib::get_main_window_label();
+    let map = WINDOW_PONGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    map.iter()
+        .map(|(label, stamp)| WindowPongRow {
+            label: label.clone(),
+            main: is_main_window_pong(Some(label), main_label),
+            last_pong: *stamp,
+            age_ms: now_ms.saturating_sub(*stamp),
+        })
+        .collect()
 }
 
 // ─────────────────── ping deliverability (2026-09-01 plan) ───────────────────
@@ -640,8 +825,10 @@ pub struct NativeUiInputs {
     /// just watched its own liveness getter time out, reporting `healthy`
     /// would be a fresh lie of exactly the kind this change removes.
     pub window_getter_unresponsive: bool,
-    /// `AppState::ui_bridge_last_pong` — a pong of ANY provenance. Proves the
-    /// renderer is alive; proves nothing about the native loop.
+    /// `AppState::ui_bridge_last_pong` — a MAIN-window pong of ANY provenance.
+    /// Proves the main renderer is alive; proves nothing about the native
+    /// loop. (The loop stamp below is process-wide on purpose — one tao loop
+    /// serves every window.)
     pub last_pong: u64,
     /// Age of `last_pong`. Meaningless when `last_pong == 0`.
     pub pong_age_ms: u64,
@@ -2250,5 +2437,198 @@ mod tests {
         for v in [PingDelivery::Corroborated, PingDelivery::Unknown] {
             assert_ne!(v, PingDelivery::Undeliverable, "{v:?} must still recover");
         }
+    }
+
+    // ── Phase 1 of plan 2026-09-19-runner-render-process-crash-recovery-is-a-
+    //    no-op-and-popout-pongs-mask-it: renderer-alive pongs are MAIN-scoped ──
+
+    fn wall_now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    /// The 2026-09-18 incident shape: the main renderer died, a pop-out kept
+    /// answering every ping. The main stamp must age out to `ui_dead` exactly
+    /// as if the pop-out did not exist.
+    #[test]
+    fn main_dead_while_a_popout_pongs_reads_ui_dead() {
+        let now = wall_now_ms();
+        let main_last = now - UI_DEAD_AFTER_MS - 1_000;
+        let last_pong = std::sync::atomic::AtomicU64::new(main_last);
+        for label in ["terminal-1", "terminal-2"] {
+            let was_main = ingest_window_pong_at(&last_pong, Some(label), true, "main", now);
+            assert!(!was_main, "a pop-out's pong is not main-window evidence");
+        }
+        assert_eq!(
+            last_pong.load(std::sync::atomic::Ordering::Relaxed),
+            main_last,
+            "a pop-out pong must not advance the main renderer-alive stamp"
+        );
+        assert!(
+            ui_dead_now(&last_pong),
+            "main silent past UI_DEAD_AFTER_MS must read dead even with pop-outs ponging"
+        );
+    }
+
+    /// Unlabeled pongs (an external `curl`, anything without `label`) are not
+    /// main evidence either — the only sender left without a label is itself
+    /// a masking source.
+    #[test]
+    fn unlabeled_pongs_only_do_not_keep_main_alive() {
+        let now = wall_now_ms();
+        let main_last = now - UI_DEAD_AFTER_MS - 5_000;
+        let last_pong = std::sync::atomic::AtomicU64::new(main_last);
+        for event in [false, true] {
+            assert!(!ingest_window_pong_at(&last_pong, None, event, "main", now));
+        }
+        assert_eq!(
+            last_pong.load(std::sync::atomic::Ordering::Relaxed),
+            main_last
+        );
+        assert!(ui_dead_now(&last_pong));
+
+        // And from boot: an unlabeled pong never makes a runner "ready".
+        let fresh = std::sync::atomic::AtomicU64::new(0);
+        assert!(!ingest_window_pong_at(&fresh, None, false, "main", now));
+        assert_eq!(fresh.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// A main-labeled pong, of either provenance, is main evidence.
+    #[test]
+    fn main_labeled_pong_keeps_main_alive() {
+        let now = wall_now_ms();
+        for event in [false, true] {
+            let last_pong = std::sync::atomic::AtomicU64::new(now - UI_DEAD_AFTER_MS - 1_000);
+            assert!(ingest_window_pong_at(
+                &last_pong,
+                Some("main"),
+                event,
+                "main",
+                now
+            ));
+            assert_eq!(last_pong.load(std::sync::atomic::Ordering::Relaxed), now);
+            assert!(!ui_dead_now(&last_pong));
+        }
+        // The comparison is against the CONFIGURED main label, not the literal.
+        let last_pong = std::sync::atomic::AtomicU64::new(0);
+        assert!(!ingest_window_pong_at(
+            &last_pong,
+            Some("main"),
+            false,
+            "primary",
+            now
+        ));
+        assert!(ingest_window_pong_at(
+            &last_pong,
+            Some("primary"),
+            false,
+            "primary",
+            now
+        ));
+    }
+
+    /// The event-loop clock stays PROCESS-WIDE: one tao loop serves every
+    /// window, so a pop-out's event pong proves it pumps. With main dead and a
+    /// pop-out alive the two verdicts must split — `ui_dead` true, the loop
+    /// NOT wedged — which is the correct pairing, not a contradiction.
+    #[test]
+    fn popout_event_pong_keeps_the_loop_clock_fresh_while_main_is_dead() {
+        let now = wall_now_ms();
+        let main_last = now - UI_DEAD_AFTER_MS - 1_000;
+        let last_pong = std::sync::atomic::AtomicU64::new(main_last);
+        ingest_window_pong_at(&last_pong, Some("terminal-9"), true, "main", now);
+
+        // The clock is process-global and sibling tests stamp it concurrently,
+        // so assert freshness rather than an exact value.
+        assert!(
+            now.saturating_sub(last_event_pong()) < 60_000,
+            "a pop-out event pong stamps the loop clock"
+        );
+        assert!(ui_dead_now(&last_pong), "main renderer is still dead");
+
+        let v = classify_native_ui(NativeUiInputs {
+            probe_wedged: None,
+            window_getter_unresponsive: false,
+            last_pong: main_last,
+            pong_age_ms: now - main_last,
+            last_event_pong: now,
+            event_pong_age_ms: 0,
+        });
+        assert_ne!(v.wedged, Some(true), "a pumping loop must not read wedged");
+        assert!(!v.events_undelivered);
+    }
+
+    /// A safety-net (non-event) pop-out pong stamps NEITHER clock's main half
+    /// and never the loop clock — it only lands in the diagnostic map.
+    #[test]
+    fn popout_safety_net_pong_is_diagnostic_only() {
+        let now = wall_now_ms();
+        let last_pong = std::sync::atomic::AtomicU64::new(7);
+        let label = "terminal-diag-only-test";
+        assert!(!ingest_window_pong_at(
+            &last_pong,
+            Some(label),
+            false,
+            "main",
+            now
+        ));
+        assert_eq!(last_pong.load(std::sync::atomic::Ordering::Relaxed), 7);
+        let row = window_pong_report(now)
+            .into_iter()
+            .find(|r| r.label == label)
+            .expect("every pong lands in the per-window map");
+        assert_eq!(row.last_pong, now);
+        assert_eq!(row.age_ms, 0);
+        assert!(!row.main);
+    }
+
+    #[test]
+    fn unlabeled_pongs_are_reported_under_a_key_no_window_can_have() {
+        let last_pong = std::sync::atomic::AtomicU64::new(0);
+        let now = wall_now_ms();
+        ingest_window_pong_at(&last_pong, None, false, "main", now);
+        assert!(window_pong_report(now + 5)
+            .iter()
+            .any(|r| r.label == UNLABELED_PONG_KEY && !r.main));
+    }
+
+    #[test]
+    fn window_pong_map_is_bounded_and_evicts_the_stalest() {
+        let mut map = std::collections::BTreeMap::new();
+        for i in 0..40u64 {
+            insert_bounded(&mut map, &format!("w-{i:03}"), 1_000 + i, 32);
+        }
+        assert_eq!(map.len(), 32);
+        assert!(map.contains_key("w-039"), "the newest row survives");
+        assert!(
+            !map.contains_key("w-000"),
+            "the stalest row is the one evicted"
+        );
+        assert!(!map.contains_key("w-007"));
+        assert!(map.contains_key("w-008"));
+        // Re-stamping an existing window does not grow the map.
+        insert_bounded(&mut map, "w-010", 5_000, 32);
+        assert_eq!(map.len(), 32);
+        assert_eq!(map["w-010"], 5_000);
+    }
+
+    #[test]
+    fn pong_event_label_reads_the_payload_in_both_serializations() {
+        assert_eq!(
+            pong_event_label(r#"{"timestamp":1,"label":"main"}"#).as_deref(),
+            Some("main")
+        );
+        // Tauri 2.x double-serialization.
+        assert_eq!(
+            pong_event_label(r#""{\"timestamp\":1,\"label\":\"terminal-3\"}""#).as_deref(),
+            Some("terminal-3")
+        );
+        // The legacy payload shape, garbage, and a non-string label: unlabeled.
+        assert_eq!(pong_event_label(r#"{"timestamp":1}"#), None);
+        assert_eq!(pong_event_label("not json"), None);
+        assert_eq!(pong_event_label(r#"{"label":5}"#), None);
+        assert_eq!(pong_event_label(""), None);
     }
 }
