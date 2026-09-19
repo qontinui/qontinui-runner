@@ -2434,10 +2434,22 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
                     // ONE count per unit per cycle. A unit whose pair was
                     // ALREADY retired was counted by the pre-check above and
                     // then pushed in the metadata-only shape; if that
-                    // status-less upsert is itself denied `permanent`, counting
-                    // it again would make `retired_permanent` exceed `scanned`.
+                    // status-less upsert is itself denied `permanent` (a shape
+                    // coord does not produce today), that is a FAILED
+                    // provenance push, not a second retirement — so it is an
+                    // error, counted and said, rather than a silent drop.
                     if status_write == StatusWrite::Allowed {
                         summary.retired_permanent += 1;
+                    } else {
+                        summary.errors += 1;
+                        metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            slug = %u.slug,
+                            route = %d.route,
+                            detail = %d.detail,
+                            "plan adapter: the metadata-only push of a permanently-retired \
+                             (slug, status) pair was refused"
+                        );
                     }
                 } else if let Some(d) = denial.as_ref().filter(|d| d.retires_the_principal()) {
                     if forbidden.retire_principal(&u.slug) {
@@ -2780,6 +2792,9 @@ struct LoopState {
     /// permanently denied. See [`newly_disappeared_slugs`].
     seen_slugs: HashSet<String>,
     warned_disappeared: HashSet<String>,
+    /// Whether the current streak of detector-skipping cycles has already
+    /// been WARNed about. Cleared by any cycle whose scans were complete.
+    detector_skip_warned: bool,
     /// Pushes coord has refused for good — a `403` on the principal (every
     /// status for that slug) or a `terminality: permanent` on one
     /// `(slug, status)` pair's status write. Owned by the loop (there is
@@ -2850,6 +2865,7 @@ impl LoopState {
             last_deps: HashMap::new(),
             seen_slugs: HashSet::new(),
             warned_disappeared: HashSet::new(),
+            detector_skip_warned: false,
             last_scan_unavailable: None,
             forbidden: RetiredSlugs::default(),
             forbidden_deps: HashSet::new(),
@@ -3416,7 +3432,16 @@ impl LoopState {
         // status was pushable. See [`LoopState::seen_slugs`] for why the
         // apply-memory is the wrong input here.
         self.seen_slugs.extend(active_slugs.iter().cloned());
-        // **The detector may only run on a COMPLETE picture of both dirs.**
+        // **The detector may only run on a COMPLETE read of both dirs.**
+        //
+        // Complete is not the same as CONSISTENT, and the gap is stated so it
+        // is not mistaken for a guarantee: when the active dir is read from a
+        // ref and the archive dir from a working tree that is behind it, a
+        // plan moved into the archive on the ref is absent from both reads
+        // while both are complete, and is warned about once (informational
+        // only — coord's row is never touched). Reading the archive from the
+        // same ref is the fix; it changes where archive stamps take their
+        // bytes, so it is left to its own change.
         //
         // "Disappeared" is a claim about ABSENCE, and both scans report absence
         // and failure with the same short vector. The ref arm already refuses
@@ -3445,15 +3470,21 @@ impl LoopState {
                      coord's derive engine — the adapter never pushes shipped/archived)"
                 );
             }
-        } else {
-            // One line per CYCLE, not per slug — the per-fault detail was
-            // already logged by the scan itself.
+            self.detector_skip_warned = false;
+        } else if !self.detector_skip_warned {
+            // Once per STREAK of skipped cycles, not per cycle: a standing
+            // fault (an unreadable plan file, a configured archive dir that
+            // does not exist) would otherwise WARN every minute. The per-fault
+            // detail is logged by the scan itself; a complete cycle re-arms
+            // this, so a recurrence is news again.
+            self.detector_skip_warned = true;
             tracing::warn!(
                 active_scan_complete,
                 archive_scan_complete,
                 known_slugs = self.seen_slugs.len(),
-                "plan adapter: disappeared-slug detection SKIPPED this cycle — a plan scan \
-                 was incomplete, so an absent slug is UNKNOWN rather than gone"
+                "plan adapter: disappeared-slug detection SKIPPED — a plan scan was \
+                 incomplete, so an absent slug is UNKNOWN rather than gone; skipping \
+                 until a complete scan (said once per streak)"
             );
         }
     }
@@ -7679,7 +7710,7 @@ mod tests {
     #[tokio::test]
     async fn defers_transition_when_real_agent_owns_unit() {
         // A real agent last drove the unit (its own agent-scoped actor). The
-        // file's status edge (vetted -> shipped) WOULD transition, but the proxy
+        // file's status edge (vetted -> in_progress) WOULD transition, but the proxy
         // must DEFER so it doesn't collapse the agent's transition to the system
         // actor: ZERO transitions emitted.
         let sink = FakeSink {
@@ -7705,9 +7736,12 @@ mod tests {
         .await;
         assert_eq!(*sink.transitions.lock().unwrap(), 0);
 
-        // File edited vetted -> shipped: transition WOULD fire, but defer.
+        // File edited vetted -> in_progress: transition WOULD fire, but defer.
+        // (A SETTABLE target: a transition onto a coord-derived word is not
+        // deferred — see
+        // `a_derived_transition_on_an_owned_unit_is_retired_not_deferred_forever`.)
         let s = reconcile_once(
-            &[unit("a", "shipped")],
+            &[unit("a", "in_progress")],
             &mut mem,
             &mut deps,
             &mut forb,
@@ -7728,7 +7762,7 @@ mod tests {
         // answer `RefreshOnly`, so `deferred` would read 0 from here on —
         // indistinguishable from "the divergence went away".
         let s3 = reconcile_once(
-            &[unit("a", "shipped")],
+            &[unit("a", "in_progress")],
             &mut mem,
             &mut deps,
             &mut forb,
@@ -8161,10 +8195,11 @@ mod tests {
     /// below: a 422 with NO permanent hint is still retried every cycle.
     #[tokio::test]
     async fn a_write_shaped_422_is_retired_only_when_coord_says_permanent() {
-        // Permanent: asked once, then the status write is withheld.
+        // Permanent: asked once, then the status write is withheld. coord
+        // scopes the refusal to the pair, so the status-less metadata upsert
+        // that follows is ACCEPTED — modelled with `deny_status`.
         let permanent = FakeSink {
-            upsert_write_status: Some(422),
-            upsert_write_body: Some(r#"{"error":"status_is_derived","message":"status `shipped` is derived (coord-computed from a predicate), not directly settable","terminality":"permanent"}"#.to_string()),
+            deny_status: Some(("vetted".to_string(), 422, r#"{"error":"status_is_derived","message":"status `shipped` is derived (coord-computed from a predicate), not directly settable","terminality":"permanent"}"#.to_string())),
             ..Default::default()
         };
         let mut r = Reconciler::new();
@@ -8184,6 +8219,28 @@ mod tests {
             Some(RetirementReason::PermanentForStatus)
         );
         assert_eq!(r.forb.retirement_for("a", "draft"), None, "pair, not slug");
+
+        // A coord that refused the status-LESS metadata upsert permanently too
+        // (not a shape it produces today): the pair is retired once, and each
+        // later refused provenance push is a VISIBLE error, never a silent
+        // drop that also stops counting.
+        let everything = FakeSink {
+            upsert_write_status: Some(422),
+            upsert_write_body: Some(r#"{"error":"status_is_derived","message":"status `shipped` is derived (coord-computed from a predicate), not directly settable","terminality":"permanent"}"#.to_string()),
+            ..Default::default()
+        };
+        let mut r = Reconciler::new();
+        let s1 = r.cycle(&everything, &[unit("a", "vetted")]).await;
+        assert_eq!((s1.retired_permanent, s1.errors), (1, 0));
+        for cycle in 1..3 {
+            let s = r.cycle(&everything, &[unit("a", "vetted")]).await;
+            assert_eq!(s.retired_permanent, 1, "cycle {cycle}");
+            assert_eq!(
+                s.errors, 1,
+                "cycle {cycle}: the refused metadata push is counted"
+            );
+        }
+        assert_eq!(r.metrics.snapshot().retired_permanent_total, 1);
 
         // No hint (an older coord, or a structural refusal coord gave no retry
         // semantics for): UNKNOWN retries, exactly as before.
@@ -8216,8 +8273,9 @@ mod tests {
     async fn a_permanent_terminality_retires_the_pair_and_logs_once() {
         let logs = CapturedLogs::start();
         let sink = FakeSink {
-            upsert_write_status: Some(422),
-            upsert_write_body: Some(r#"{"error":"status_is_derived","message":"status `shipped` is derived (coord-computed from a predicate), not directly settable","terminality":"permanent"}"#.to_string()),
+            // Refuses exactly the status write, at the pair scope coord's
+            // `permanent` covers; the later status-less upserts are accepted.
+            deny_status: Some(("vetted".to_string(), 422, r#"{"error":"status_is_derived","message":"status `shipped` is derived (coord-computed from a predicate), not directly settable","terminality":"permanent"}"#.to_string())),
             ..Default::default()
         };
         let mut r = Reconciler::new();
@@ -8486,7 +8544,9 @@ mod tests {
         assert_eq!(s1.conflicts, 0);
         assert_eq!(r.mem.get("a").map(String::as_str), Some("vetted"));
 
-        // A REAL agent transitions the unit in coord, out of band.
+        // Another writer moves the unit in coord, out of band — one whose
+        // history row carries no real-agent actor (here: `last_actor` is
+        // `None`), i.e. the unowned branch.
         sink.statuses
             .lock()
             .unwrap()
@@ -8653,6 +8713,67 @@ mod tests {
             !logs.text().contains("diverged from last-applied"),
             "the adapter must not report itself the winner of a race it withdrew from: {}",
             logs.text()
+        );
+    }
+
+    /// **A transition onto a coord-DERIVED status is not deferred to an
+    /// owner.** No identity can set `shipped`, so the transition cannot
+    /// overwrite what the owner holds — coord refuses it `permanent` and the
+    /// pair retires. Deferring instead re-derived the same edge every cycle and
+    /// paid a `last_actor` GET plus a `current_status` GET for it, forever if
+    /// coord's predicate never holds.
+    ///
+    /// Neuter check: drop the `is_coord_derived_status` fall-through in
+    /// `push_work_unit_with_status_write`'s deferral — cycles 2..4 defer and
+    /// the read counters climb.
+    #[tokio::test]
+    async fn a_derived_transition_on_an_owned_unit_is_retired_not_deferred_forever() {
+        let sink = FakeSink {
+            last_actor: Some("coord::derive_worker".to_string()),
+            deny_status: Some(("shipped".to_string(), 422, r#"{"error":"status_is_derived","message":"status `shipped` is derived (coord-computed from a predicate), not directly settable","terminality":"permanent"}"#.to_string())),
+            ..Default::default()
+        };
+        sink.statuses
+            .lock()
+            .unwrap()
+            .insert("a".to_string(), "in_progress".to_string());
+        let mut r = Reconciler::new();
+        let file = [unit("a", "shipped")];
+
+        let s1 = r.cycle(&sink, &file).await;
+        assert_eq!(s1.deferred, 0, "a write nobody can make protects nothing");
+        assert_eq!(
+            s1.retired_permanent, 1,
+            "coord refused it and the pair retired"
+        );
+        assert_eq!(*sink.transition_attempts.lock().unwrap(), 1);
+        let reads = *sink.current_status_calls.lock().unwrap();
+        let actor_reads = *sink.last_actor_calls.lock().unwrap();
+
+        for cycle in 2..5 {
+            let s = r.cycle(&sink, &file).await;
+            assert_eq!(s.deferred, 0, "cycle {cycle}");
+            assert_eq!(s.errors, 0, "cycle {cycle}");
+        }
+        assert_eq!(
+            *sink.current_status_calls.lock().unwrap(),
+            reads,
+            "no GET per cycle"
+        );
+        assert_eq!(
+            *sink.last_actor_calls.lock().unwrap(),
+            actor_reads,
+            "...of either kind"
+        );
+        assert_eq!(
+            *sink.transition_attempts.lock().unwrap(),
+            1,
+            "refused once, never re-sent"
+        );
+        assert_eq!(
+            sink.statuses.lock().unwrap().get("a").map(String::as_str),
+            Some("in_progress"),
+            "the owner's status is untouched"
         );
     }
 
@@ -10405,6 +10526,16 @@ Body.
         assert!(
             logs.text().contains("disappeared-slug detection SKIPPED"),
             "the skip is stated out loud; got: {}",
+            logs.text()
+        );
+        // A STANDING fault is said once per streak, not once per cycle.
+        state.tick(&sink, &metrics).await;
+        assert_eq!(
+            logs.text()
+                .matches("disappeared-slug detection SKIPPED")
+                .count(),
+            1,
+            "a second skipped cycle in the same streak must not re-WARN; got: {}",
             logs.text()
         );
 
