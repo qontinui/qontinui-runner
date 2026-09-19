@@ -1917,10 +1917,26 @@ impl TenantCredential {
 /// fallback that function applies when the requested tenant is the default
 /// binding. Omitting that arm is not a simplification — it would report a
 /// device unable to act in a tenant the selector serves happily.
+///
+/// `default_slot_serves` is the second half of that fallback arm, and it is an
+/// INPUT rather than a state because deciding it needs the token itself: the
+/// selector admits the legacy slot for the default binding only when that
+/// token is that binding's credential by [`legacy_token_serves_tenant`] — its
+/// `tenant_id` claim names the tenant, or it carries no claim on a device
+/// MEASURED to hold one binding with no slot of its own for that tenant (plan
+/// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`, P2).
+/// A `Usable` legacy slot is therefore NOT on its own enough to report "can
+/// act": callers compute this with [`legacy_slot_serves_default_tenant`], the
+/// one place that predicate lives, so the report and the selector cannot drift
+/// apart again. Reporting the looser answer would tell an operator a device can
+/// work a tenant whose write the selector refuses — the disagreement
+/// `credential_state_agrees_with_select_device_bearer_on_every_slot_state`
+/// exists to catch.
 pub fn credential_state(
     slot: SlotState,
     is_default: bool,
     default_slot: SlotState,
+    default_slot_serves: bool,
 ) -> TenantCredential {
     // A measured "cannot act" is only measurable when the tenant's own read
     // established something; an `Unreadable` slot with no usable fallback
@@ -1945,11 +1961,16 @@ pub fn credential_state(
         return no_fallback;
     }
     match default_slot {
-        SlotState::Usable => TenantCredential {
+        // Usable AND this tenant's: the selector hands it out. Usable but NOT
+        // this tenant's (a claim naming another tenant, or an unclaimed token
+        // on a device that cannot state one binding) is a measured refusal,
+        // exactly as the selector's `.filter(…)` makes it.
+        SlotState::Usable if default_slot_serves => TenantCredential {
             slot,
             selectable: Some(true),
             via_default_slot: true,
         },
+        SlotState::Usable => no_fallback,
         // Neither slot established anything.
         SlotState::Unreadable => TenantCredential {
             slot,
@@ -2007,6 +2028,27 @@ pub fn holds_credential_for(
             (_, SlotState::Absent) => Some(false),
             (_, SlotState::Unreadable) => None,
         },
+    }
+}
+
+/// Does the LEGACY slot's token serve the device's default binding — the
+/// `default_slot_serves` input [`credential_state`] takes.
+///
+/// One place, so a report and [`select_device_bearer`] cannot answer it
+/// differently: it applies [`legacy_token_serves_tenant`] with the device's
+/// MEASURED binding count, which is the same call the selector's legacy
+/// fallback makes. `false` whenever there is nothing to serve with (no usable
+/// token) or nobody to serve (no bound default tenant).
+pub(crate) fn legacy_slot_serves_default_tenant(
+    am: &AuthManager,
+    legacy: &SlotRead,
+    default_tenant: Option<&Uuid>,
+) -> bool {
+    match (legacy, default_tenant) {
+        (SlotRead::Usable(token), Some(t)) => {
+            legacy_token_serves_tenant(am, token, t, measured_device_binding_count())
+        }
+        _ => false,
     }
 }
 
@@ -3701,8 +3743,17 @@ mod bearer_selection_tests {
     /// (`!jwt.trim().is_empty()`) while [`select_device_bearer`] had refused
     /// it since Phase 1a. Driving both over one real store is what stops a
     /// future edit re-opening that gap.
+    ///
+    /// HERMETIC by construction: the selector's legacy fallback consults the
+    /// device's binding count, which `measured_device_binding_count` reads from
+    /// `paired_user.json` — so without a fixture this test would answer
+    /// differently on a paired box and on CI, and pin neither. The isolated
+    /// ambient pins it to a device stating ONE binding, the shape where the
+    /// legacy fallback is admissible at all.
     #[test]
     fn credential_state_agrees_with_select_device_bearer_on_every_slot_state() {
+        let amb = crate::test_env::isolated_ambient();
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
         let expired = jwt_for("expired", chrono::Utc::now().timestamp() - 3600);
         let slot_cases: Vec<(&str, Option<String>)> = vec![
             ("usable", Some(live_jwt("slot"))),
@@ -3732,15 +3783,32 @@ mod bearer_selection_tests {
                         mgr.store_tokens(j, "").unwrap();
                     }
                     let default_tenant = Some(if is_default { t } else { stranger });
+                    // A device stating exactly ONE binding, the default one.
+                    // Written per cell because `default_tenant` moves with it.
+                    std::fs::write(
+                        amb.dir().join("paired_user.json"),
+                        serde_json::json!({
+                            "default_tenant_id": default_tenant.unwrap().to_string(),
+                            "bindings": [{"tenant_id": default_tenant.unwrap().to_string()}]
+                        })
+                        .to_string(),
+                    )
+                    .unwrap();
 
                     // What the SELECTOR does — the thing that actually stops a
                     // session working.
                     let selected = select_device_bearer(&mgr, Some(&t), default_tenant);
                     // What a REPORT would say, through the shared rule.
+                    let legacy_read = read_legacy_slot(&mgr);
                     let cred = credential_state(
                         read_tenant_slot(&mgr, &t).state(),
                         default_tenant == Some(t),
-                        read_legacy_slot(&mgr).state(),
+                        legacy_read.state(),
+                        legacy_slot_serves_default_tenant(
+                            &mgr,
+                            &legacy_read,
+                            default_tenant.as_ref(),
+                        ),
                     );
 
                     assert_eq!(
@@ -3805,7 +3873,7 @@ mod bearer_selection_tests {
     #[test]
     fn credential_state_keeps_an_unreadable_slot_unknown() {
         // Non-default tenant, nothing readable about it.
-        let c = credential_state(SlotState::Unreadable, false, SlotState::Usable);
+        let c = credential_state(SlotState::Unreadable, false, SlotState::Usable, true);
         assert_eq!(
             c.can_act(),
             None,
@@ -3813,21 +3881,48 @@ mod bearer_selection_tests {
         );
         // Default tenant whose own slot is unreadable but whose legacy slot
         // is usable: the selector WOULD serve it, so this is a measured yes.
-        let c = credential_state(SlotState::Unreadable, true, SlotState::Usable);
+        let c = credential_state(SlotState::Unreadable, true, SlotState::Usable, true);
+        assert_eq!(c.can_act(), Some(true));
+        assert!(c.via_default_slot);
+        // ...and the same cell where that token is NOT this binding's
+        // credential (a claim naming another tenant, or an unclaimed token on a
+        // device that cannot state one binding) loses the fallback: with the
+        // tenant's OWN slot unreadable, nothing is established either way, so
+        // this stays UNKNOWN rather than becoming a measured no.
+        let c = credential_state(SlotState::Unreadable, true, SlotState::Usable, false);
+        assert_eq!(
+            c.can_act(),
+            None,
+            "a legacy slot that does not serve this binding cannot rescue an unreadable slot"
+        );
+        assert!(!c.via_default_slot);
+        // With the own slot MEASURED absent, the same non-serving legacy token
+        // is a measured NO — which is exactly what the selector's filter does,
+        // and the cell that would report "can act" if the serves term were
+        // dropped.
+        let c = credential_state(SlotState::Absent, true, SlotState::Usable, false);
+        assert_eq!(
+            c.can_act(),
+            Some(false),
+            "a usable legacy slot that does not serve this binding is not a credential for it"
+        );
+        assert!(!c.via_default_slot);
+        // ...and serving it is what makes the same cell a yes.
+        let c = credential_state(SlotState::Absent, true, SlotState::Usable, true);
         assert_eq!(c.can_act(), Some(true));
         assert!(c.via_default_slot);
         // Default tenant, both unreadable: still nothing established.
         assert_eq!(
-            credential_state(SlotState::Unreadable, true, SlotState::Unreadable).can_act(),
+            credential_state(SlotState::Unreadable, true, SlotState::Unreadable, false).can_act(),
             None
         );
         // A measured absence on both is a measured no.
         assert_eq!(
-            credential_state(SlotState::Absent, true, SlotState::Absent).can_act(),
+            credential_state(SlotState::Absent, true, SlotState::Absent, false).can_act(),
             Some(false)
         );
         // A usable own slot never needs (or claims) the fallback.
-        let c = credential_state(SlotState::Usable, true, SlotState::Usable);
+        let c = credential_state(SlotState::Usable, true, SlotState::Usable, true);
         assert_eq!(c.can_act(), Some(true));
         assert!(!c.via_default_slot);
     }
