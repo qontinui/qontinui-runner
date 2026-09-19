@@ -753,8 +753,46 @@ pub enum SensitiveCommand {
 
 // ── Shell tokenizing ─────────────────────────────────────────────────────────
 
-/// Split a shell command into segments of words — the quote-aware form of the
-/// split [`command_is_git_push`] does.
+/// [`shell_segments_ctx`] without the contexts — for tests.
+#[cfg(test)]
+pub(crate) fn shell_segments(command: &str) -> Vec<Vec<String>> {
+    shell_segments_ctx(command)
+        .into_iter()
+        .map(|(words, _)| words)
+        .collect()
+}
+
+/// How a segment is reached — what [`classify_call`] needs to know before
+/// trusting a `cd` in it to move the directory of what follows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SegCtx {
+    /// Reached through `&&` / `||`: runs only if an earlier status allows.
+    pub conditional: bool,
+    /// Part of a pipeline (`a | b`): runs in a subshell.
+    pub piped: bool,
+    /// Backgrounded with `&`: runs in a subshell.
+    pub background: bool,
+    /// Next to a `(` / `)`: inside a group or a `case` arm.
+    pub grouped: bool,
+}
+
+impl SegCtx {
+    fn merge(&mut self, o: SegCtx) {
+        self.conditional |= o.conditional;
+        self.piped |= o.piped;
+        self.background |= o.background;
+        self.grouped |= o.grouped;
+    }
+
+    /// Whether a `cd` in this segment may not run, or runs in a subshell.
+    fn unsure(&self) -> bool {
+        self.conditional || self.piped || self.background || self.grouped
+    }
+}
+
+/// Split a shell command into segments of words, each with how it is
+/// reached ([`SegCtx`]) — the quote-aware form of the split
+/// [`command_is_git_push`] does.
 ///
 /// The RULE is the same one that detector applies: a command is only what
 /// starts a segment (`;`, `&`, `&&`, `|`, `||`, newline, `(`, `)`), so
@@ -766,12 +804,14 @@ pub enum SensitiveCommand {
 /// same reason heredoc bodies are skipped, and `#` comments are dropped.
 /// Redirections stay attached to their word (`2>&1` is one word, not a
 /// segment break).
-pub(crate) fn shell_segments(command: &str) -> Vec<Vec<String>> {
+pub(crate) fn shell_segments_ctx(command: &str) -> Vec<(Vec<String>, SegCtx)> {
     struct Lexer {
-        segments: Vec<Vec<String>>,
+        segments: Vec<(Vec<String>, SegCtx)>,
         words: Vec<String>,
         cur: String,
         in_word: bool,
+        /// Context of the segment being built.
+        pending: SegCtx,
     }
     impl Lexer {
         fn end_word(&mut self) {
@@ -780,13 +820,29 @@ pub(crate) fn shell_segments(command: &str) -> Vec<Vec<String>> {
                 self.in_word = false;
             }
         }
-        fn end_segment(&mut self) {
+        /// End the segment; `next` is how the FOLLOWING segment is reached.
+        fn end_segment(&mut self, next: SegCtx) {
             self.end_word();
-            if !self.words.is_empty() {
-                self.segments.push(std::mem::take(&mut self.words));
+            if self.words.is_empty() {
+                self.pending.merge(next);
+            } else {
+                let ctx = std::mem::replace(&mut self.pending, next);
+                self.segments.push((std::mem::take(&mut self.words), ctx));
+            }
+        }
+        /// Mark the segment just ended (a `|` or `&` applies to it too).
+        fn mark_last(&mut self, o: SegCtx) {
+            if let Some((_, ctx)) = self.segments.last_mut() {
+                ctx.merge(o);
             }
         }
     }
+    const PLAIN: SegCtx = SegCtx {
+        conditional: false,
+        piped: false,
+        background: false,
+        grouped: false,
+    };
 
     let chars: Vec<char> = command.chars().collect();
     let n = chars.len();
@@ -795,6 +851,7 @@ pub(crate) fn shell_segments(command: &str) -> Vec<Vec<String>> {
         words: Vec::new(),
         cur: String::new(),
         in_word: false,
+        pending: PLAIN,
     };
     // Heredoc delimiters opened on the current line: (delimiter, strip_tabs).
     let mut heredocs: Vec<(String, bool)> = Vec::new();
@@ -844,7 +901,7 @@ pub(crate) fn shell_segments(command: &str) -> Vec<Vec<String>> {
                 i += 1;
             }
             '\n' => {
-                lx.end_segment();
+                lx.end_segment(PLAIN);
                 i += 1;
                 // Skip the bodies of any heredocs opened on the line just ended.
                 for (delim, strip_tabs) in std::mem::take(&mut heredocs) {
@@ -870,8 +927,35 @@ pub(crate) fn shell_segments(command: &str) -> Vec<Vec<String>> {
                     }
                 }
             }
-            ';' | '|' | '(' | ')' => {
-                lx.end_segment();
+            ';' => {
+                lx.end_segment(PLAIN);
+                i += 1;
+            }
+            '|' if i + 1 < n && chars[i + 1] == '|' => {
+                lx.end_segment(SegCtx {
+                    conditional: true,
+                    ..PLAIN
+                });
+                i += 2;
+            }
+            '|' => {
+                let piped = SegCtx {
+                    piped: true,
+                    ..PLAIN
+                };
+                lx.end_segment(piped);
+                lx.mark_last(piped);
+                i += 1;
+            }
+            '(' | ')' => {
+                let grouped = SegCtx {
+                    grouped: true,
+                    ..PLAIN
+                };
+                lx.end_segment(grouped);
+                if c == ')' {
+                    lx.mark_last(grouped);
+                }
                 i += 1;
             }
             '&' => {
@@ -882,10 +966,22 @@ pub(crate) fn shell_segments(command: &str) -> Vec<Vec<String>> {
                     // `2>&1` / `&>file` — part of a redirection word.
                     lx.cur.push('&');
                     lx.in_word = true;
+                    i += 1;
+                } else if i + 1 < n && chars[i + 1] == '&' {
+                    lx.end_segment(SegCtx {
+                        conditional: true,
+                        ..PLAIN
+                    });
+                    i += 2;
                 } else {
-                    lx.end_segment();
+                    // A lone `&` backgrounds the segment it ends.
+                    lx.end_segment(PLAIN);
+                    lx.mark_last(SegCtx {
+                        background: true,
+                        ..PLAIN
+                    });
+                    i += 1;
                 }
-                i += 1;
             }
             '#' if !lx.in_word => {
                 while i < n && chars[i] != '\n' {
@@ -930,7 +1026,7 @@ pub(crate) fn shell_segments(command: &str) -> Vec<Vec<String>> {
             }
         }
     }
-    lx.end_segment();
+    lx.end_segment(PLAIN);
     lx.segments
 }
 
@@ -1160,7 +1256,10 @@ pub fn classify_commands(command: &str, cwd: &str) -> Vec<ClassifiedCommand> {
 fn classify_into(st: &mut ClassifyState, command: &str, cwd: &str, depth: u8) {
     let grouped = has_unquoted_group(command);
     let mut dir = cwd.to_string();
-    for seg in shell_segments(command) {
+    // Depth of `if`/`case`/`while`/`until`/`for`/`select` blocks: a `cd`
+    // inside one may run zero times, or once per arm.
+    let mut block_depth: u32 = 0;
+    for (seg, ctx) in shell_segments_ctx(command) {
         // Directory changes a segment can make that are not a `cd`.
         for (k, w) in seg.iter().enumerate() {
             if w.starts_with("GIT_DIR=")
@@ -1177,7 +1276,46 @@ fn classify_into(st: &mut ClassifyState, command: &str, cwd: &str, depth: u8) {
                 st.dir_certain = false;
             }
         }
-        let words = command_words(&seg);
+        let lead = seg
+            .iter()
+            .find(|w| !is_env_assignment(w))
+            .map(String::as_str)
+            .unwrap_or("");
+        if matches!(lead, "fi" | "esac" | "done") {
+            block_depth = block_depth.saturating_sub(1);
+            continue;
+        }
+        let keyword_led = matches!(
+            lead,
+            "if" | "then"
+                | "elif"
+                | "else"
+                | "while"
+                | "until"
+                | "do"
+                | "!"
+                | "case"
+                | "for"
+                | "select"
+        );
+        if matches!(lead, "if" | "case" | "while" | "until" | "for" | "select") {
+            block_depth += 1;
+        }
+        let mut words = command_words(&seg);
+        let Some(first) = words.first() else {
+            continue;
+        };
+        // `source` / `.` / `eval` run code we cannot see (it may `cd`), and a
+        // `builtin` wraps a command — `builtin cd` is a `cd`.
+        if ["source", ".", "eval", "builtin"]
+            .iter()
+            .any(|p| program_is(first, p))
+        {
+            st.dir_certain = false;
+            if program_is(first, "builtin") {
+                words = &words[1..];
+            }
+        }
         let Some(program) = words.first() else {
             continue;
         };
@@ -1187,7 +1325,10 @@ fn classify_into(st: &mut ClassifyState, command: &str, cwd: &str, depth: u8) {
             continue;
         }
         if program_is(program, "cd") || program_is(program, "pushd") {
-            if grouped || depth > 0 {
+            // A `cd` that may not run, or runs in a subshell: reached through
+            // `&&`/`||`, in a pipeline, backgrounded, in a group, inside an
+            // `if`/`case`/loop, or in a nested shell.
+            if grouped || depth > 0 || ctx.unsure() || keyword_led || block_depth > 0 {
                 st.dir_certain = false;
             }
             let target = words[1..]
@@ -1260,8 +1401,9 @@ fn shell_c_script(args: &[String]) -> Option<&str> {
 /// Whether `git`'s global options point it at another repository or tree
 /// (`--git-dir`, `--work-tree`).
 fn git_overrides_dir(args: &[String]) -> bool {
-    for a in args {
-        let a = a.as_str();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
         if a == "--git-dir"
             || a == "--work-tree"
             || a.starts_with("--git-dir=")
@@ -1269,9 +1411,16 @@ fn git_overrides_dir(args: &[String]) -> bool {
         {
             return true;
         }
+        // Options whose VALUE is the next word — skipped exactly as
+        // `git_dash_c_dir` does, so `git -C . --git-dir=…` is still seen.
+        if matches!(a, "-C" | "-c" | "--namespace" | "--config-env") {
+            i += 2;
+            continue;
+        }
         if !a.starts_with('-') {
             break;
         }
+        i += 1;
     }
     false
 }
@@ -1343,6 +1492,7 @@ pub fn is_sensitive(cmd: &SensitiveCommand) -> bool {
 /// non-draft `gh release create` or a `gh release delete`; `npm publish`; and
 /// `cargo publish`. A `--dry-run` of any of them publishes nothing and is not
 /// sensitive, and neither is a plain push.
+#[cfg(test)]
 pub fn classify_sensitive_command(command: &str) -> Vec<SensitiveCommand> {
     classify_commands(command, "")
         .into_iter()
@@ -1819,10 +1969,25 @@ pub struct SuppressionCheck {
 /// Anything else — including anything git could not answer — NOTIFIES.
 /// `publish` never reaches this function; it always notifies.
 ///
-/// Accepted limitation: the current branch is read on the dispatcher worker
-/// after the command ran; a call that switched branches after pushing would
-/// be compared against the branch it ended on. A detached HEAD has no
-/// current branch, so it always notifies (noise, not loss).
+/// Accepted limitations of the notifier as a whole — known loss paths, kept
+/// visible rather than papered over:
+/// - A push made through something the classifier cannot read — a git
+///   alias (`git pf`), a script (`./release.sh`), a heredoc fed to a shell,
+///   `eval "$cmd"` — is not classified, so it is not reported at all.
+/// - A `run_in_background` push is not reported: its result only says the
+///   command started.
+/// - A `tool_result` that arrives more than [`PENDING_ACTION_TTL`] after its
+///   `tool_use` is dropped.
+/// - When the worker queue refuses a job, its `tool_use_id` is released; if
+///   the same `tool_use` sits in a second transcript that was already read
+///   past that line, nothing re-reports it (the refusal is WARNed).
+/// - Clause (g) reads the current branch on the worker AFTER the command
+///   ran; a call that switched branches after pushing is compared against
+///   the branch it ended on. A detached HEAD has no current branch, so it
+///   always notifies (noise, not loss).
+/// - git's human `To` table prints tags by short name, so a pushed tag that
+///   shares a branch's name reads as that branch; (g)'s tag check looks only
+///   at LOCAL tags.
 pub fn may_suppress(c: &SuppressionCheck) -> bool {
     let Some(dest) = c.dest.as_deref() else {
         return false;
@@ -1874,6 +2039,12 @@ pub struct DetectedAction {
     /// When the action IS repo-scoped and its remote URL is still unknown:
     /// the git remote (name) whose URL names the repo.
     pub repo_from_remote: Option<String>,
+    /// The remote URL the action went to, when known (the `To` block's, or a
+    /// URL remote's) — userinfo stripped.
+    pub remote_url: Option<String>,
+    /// The call FAILED and nothing confirmed the action: it is reported as
+    /// something that "may have" happened (see [`interpret_tool_use`]).
+    pub hedged: bool,
     /// The directory the command ran in, when the call pins it to one.
     pub working_dir: String,
     /// Set ONLY for the one action that could be the suppressible shape; the
@@ -1896,9 +2067,22 @@ impl DetectedAction {
     /// as `null`: coord's body is `deny_unknown_fields`, and `undo` in
     /// particular is unknown to a coord that predates the plan's Phase 4.
     pub fn body(&self) -> serde_json::Value {
+        let artifact = if self.hedged {
+            let verb = match self.action {
+                SensitiveAction::ForcePush => "force-pushed",
+                SensitiveAction::Delete => "deleted",
+                SensitiveAction::Publish => "published",
+            };
+            format!(
+                "{} (may have been {verb}: the call failed and no ref table confirmed it)",
+                self.artifact
+            )
+        } else {
+            self.artifact.clone()
+        };
         let mut body = serde_json::json!({
             "action": self.action.as_str(),
-            "artifact": cap_field(&self.artifact),
+            "artifact": cap_field(&artifact),
             "reversible": self.reversible,
         });
         if let Some(repo) = &self.repo {
@@ -1918,6 +2102,10 @@ struct PushBlock {
     url: String,
     /// Ref-table lines seen (a block with none is not a block).
     table_lines: usize,
+    /// EVERY destination ref the table named — forced, deleted, new,
+    /// fast-forwarded, up to date or rejected — so a declared destination
+    /// can be looked up in it.
+    refs: Vec<String>,
     /// `(destination ref, prior sha)` per forced update.
     forced: Vec<(String, String)>,
     /// Ref per deletion.
@@ -1999,6 +2187,7 @@ fn parse_push_blocks(output: &str) -> Vec<PushBlock> {
         if let Some((flag, refs, summary)) = porcelain_fields(raw) {
             block.table_lines += 1;
             let dst = refs.rsplit_once(':').map(|(_, d)| d).unwrap_or(refs);
+            block.refs.push(artifact_ref(dst));
             match flag {
                 '+' => {
                     let prior = summary
@@ -2020,6 +2209,17 @@ fn parse_push_blocks(output: &str) -> Vec<PushBlock> {
             continue;
         }
         block.table_lines += 1;
+        {
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            let named = toks
+                .iter()
+                .position(|t| *t == "->")
+                .and_then(|p| toks.get(p + 1))
+                .or_else(|| toks.last());
+            if let Some(dst) = named {
+                block.refs.push(artifact_ref(dst));
+            }
+        }
         if line.contains("(forced update)") {
             let toks: Vec<&str> = line.split_whitespace().collect();
             // ["+", "old...new", "src", "->", "dst", "(forced", "update)"]
@@ -2079,17 +2279,25 @@ fn dir_basename(path: &str) -> &str {
         .unwrap_or("")
 }
 
-/// Turn ONE Bash call and its one output into the actions that happened,
-/// de-duplicated by `(action, artifact)`.
+/// Turn ONE Bash call and its one output into the actions that happened.
 ///
 /// Git pushes, when the call holds a sensitive one:
-/// - if the output has any `To` block, EVERY forced or deleted ref in EVERY
-///   block is reported — positive evidence, whatever `failed` says, and
-///   whichever push printed it;
-/// - if it has none (quiet, redirected, a fatal before any ref moved), the
-///   pushes' DECLARED actions are reported — but only for a call that did
-///   not fail (`is_error`, interrupted, or a `fatal:` / `error: failed to
-///   push` line), since nothing then shows the push happened.
+/// - EVERY forced or deleted ref in EVERY `To` block is reported — positive
+///   evidence, whatever `failed` says, and whichever push printed it;
+/// - every sensitive push's DECLARED destination that appears in NO block's
+///   ref table (quiet, redirected, printed nothing, or its block was lost)
+///   is reported from the declaration. A destination only the shell could
+///   name (`HEAD`, `$B`, unnamed, `--all`) counts as absent unless some block
+///   shows a ref of that kind (forced / deleted).
+///
+/// When the call FAILED (`is_error`, interrupted, or a `fatal:` / `error:
+/// failed to push` line anywhere), a declared action is still reported —
+/// the failure may be unrelated, so "no block" is UNKNOWN, not "nothing
+/// happened" — but worded "may have …" and marked not reversible.
+///
+/// De-duplicated by action, artifact, repo, remote and working dir, so the
+/// same branch force-pushed to two remotes, or from two directories, is two
+/// notifications.
 ///
 /// The one action that could be the suppressible shape carries a
 /// [`SuppressionCheck`] for the worker to complete; every other action
@@ -2124,59 +2332,56 @@ pub fn interpret_tool_use(
             })
             .flatten();
         let dir_for_all = if pushes.len() == 1 { pushes[0].1 } else { "" };
-        if !blocks.is_empty() {
-            for block in &blocks {
-                if !is_hosted_remote(&block.url) {
-                    continue; // a push to a local path is not outward
-                }
-                let repo = parse_repo_full_name(&block.url);
-                let mut push = |action: SensitiveAction, r: &str, reversible, undo| {
-                    let suppression = candidate.as_ref().and_then(|(a, d, intent, dir)| {
-                        let confirms =
-                            blocks.len() == 1 && *a == action && short_ref(r) == short_ref(d);
-                        confirms.then(|| SuppressionCheck {
-                            single_push: true,
-                            dest: Some(d.clone()),
-                            dir_certain: call.dir_certain,
-                            dir: dir.to_string(),
-                            remote: intent.remote.clone().unwrap_or_default(),
-                            output_confirms_dest: true,
-                            to_url: Some(block.url.clone()),
-                            ..SuppressionCheck::default()
-                        })
-                    });
-                    out.push(DetectedAction {
-                        action,
-                        artifact: r.to_string(),
-                        artifact_name: ArtifactName::Literal,
-                        reversible,
-                        undo,
-                        repo: repo.clone(),
-                        repo_from_remote: None,
-                        working_dir: dir_for_all.to_string(),
-                        suppression,
-                    });
+        for block in &blocks {
+            if !is_hosted_remote(&block.url) {
+                continue; // a push to a local path is not outward
+            }
+            let repo = parse_repo_full_name(&block.url);
+            let mut push = |action: SensitiveAction, r: &str, reversible, undo| {
+                let suppression = candidate.as_ref().and_then(|(a, d, intent, dir)| {
+                    let confirms =
+                        blocks.len() == 1 && *a == action && short_ref(r) == short_ref(d);
+                    confirms.then(|| SuppressionCheck {
+                        single_push: true,
+                        dest: Some(d.clone()),
+                        dir_certain: call.dir_certain,
+                        dir: dir.to_string(),
+                        remote: intent.remote.clone().unwrap_or_default(),
+                        output_confirms_dest: true,
+                        to_url: Some(block.url.clone()),
+                        ..SuppressionCheck::default()
+                    })
+                });
+                out.push(DetectedAction {
+                    action,
+                    artifact: r.to_string(),
+                    artifact_name: ArtifactName::Literal,
+                    reversible,
+                    undo,
+                    repo: repo.clone(),
+                    repo_from_remote: None,
+                    remote_url: Some(block.url.clone()),
+                    working_dir: dir_for_all.to_string(),
+                    hedged: false,
+                    suppression,
+                });
+            };
+            for (dst, prior) in &block.forced {
+                let (reversible, undo) = if prior.is_empty() {
+                    (reversibility::NO, None)
+                } else {
+                    (reversibility::RESTORE, Some(prior.clone()))
                 };
-                for (dst, prior) in &block.forced {
-                    let (reversible, undo) = if prior.is_empty() {
-                        (reversibility::NO, None)
-                    } else {
-                        (reversibility::RESTORE, Some(prior.clone()))
-                    };
-                    push(SensitiveAction::ForcePush, dst, reversible, undo);
-                }
-                for r in &block.deleted {
-                    push(SensitiveAction::Delete, r, reversibility::RESTORE, None);
-                }
+                push(SensitiveAction::ForcePush, dst, reversible, undo);
             }
-        } else {
-            let failed =
-                failed || any_line_starts_with(output, &["fatal:", "error: failed to push"]);
-            if !failed {
-                for (intent, dir) in &sensitive {
-                    out.extend(declared_actions(intent, dir));
-                }
+            for r in &block.deleted {
+                push(SensitiveAction::Delete, r, reversibility::RESTORE, None);
             }
+        }
+        let call_failed =
+            failed || any_line_starts_with(output, &["fatal:", "error: failed to push"]);
+        for (intent, dir) in &sensitive {
+            out.extend(declared_actions(intent, dir, &blocks, call_failed));
         }
     }
     for c in &call.commands {
@@ -2185,13 +2390,28 @@ pub fn interpret_tool_use(
         }
     }
     let mut seen = std::collections::HashSet::new();
-    out.retain(|a| seen.insert((a.action, a.artifact.clone())));
+    out.retain(|a| {
+        seen.insert((
+            a.action,
+            a.artifact.clone(),
+            a.hedged,
+            a.repo.clone(),
+            a.repo_from_remote.clone(),
+            a.remote_url.clone(),
+            a.working_dir.clone(),
+        ))
+    });
     out
 }
 
-/// What a sensitive push DECLARED, for when its output shows no `To` block.
-/// These always notify.
-fn declared_actions(intent: &GitPushIntent, dir: &str) -> Vec<DetectedAction> {
+/// A sensitive push's DECLARED actions whose destination no `To` block
+/// accounts for. `hedged` = the call failed: still reported, as "may have".
+fn declared_actions(
+    intent: &GitPushIntent,
+    dir: &str,
+    blocks: &[PushBlock],
+    hedged: bool,
+) -> Vec<DetectedAction> {
     let remote = intent
         .remote
         .clone()
@@ -2201,11 +2421,26 @@ fn declared_actions(intent: &GitPushIntent, dir: &str) -> Vec<DetectedAction> {
         return Vec::new();
     }
     let repo = url.as_deref().and_then(parse_repo_full_name);
-    let make = |action, artifact: String, artifact_name, reversible| DetectedAction {
+    // Whether some block accounts for a declared destination: a plain name
+    // must appear in a table; anything else is covered only by a table line
+    // of the same kind (it could be that ref).
+    let any_forced = blocks.iter().any(|b| !b.forced.is_empty());
+    let any_deleted = blocks.iter().any(|b| !b.deleted.is_empty());
+    let accounted = |r: Option<&str>, kind_seen: bool| match r {
+        Some(r) if is_plain_ref(r) => blocks
+            .iter()
+            .any(|b| b.refs.iter().any(|x| short_ref(x) == short_ref(r))),
+        _ => kind_seen,
+    };
+    let make = |action, artifact: String, artifact_name| DetectedAction {
         action,
         artifact,
         artifact_name,
-        reversible,
+        reversible: if hedged || action == SensitiveAction::ForcePush {
+            reversibility::NO
+        } else {
+            reversibility::RESTORE
+        },
         undo: None,
         repo: repo.clone(),
         repo_from_remote: if url.is_none() {
@@ -2213,7 +2448,9 @@ fn declared_actions(intent: &GitPushIntent, dir: &str) -> Vec<DetectedAction> {
         } else {
             None
         },
+        remote_url: url.clone(),
         working_dir: dir.to_string(),
+        hedged,
         suppression: None,
     };
     let named = |r: &str| -> (String, ArtifactName) {
@@ -2228,7 +2465,7 @@ fn declared_actions(intent: &GitPushIntent, dir: &str) -> Vec<DetectedAction> {
     };
     let mut out = Vec::new();
     if let Some(declared) = &intent.force {
-        if declared.is_empty() {
+        if declared.is_empty() && !accounted(None, any_forced) {
             let (artifact, name) = if intent.all_refs || intent.matching {
                 (format!("all branches on {remote}"), ArtifactName::Literal)
             } else {
@@ -2237,41 +2474,29 @@ fn declared_actions(intent: &GitPushIntent, dir: &str) -> Vec<DetectedAction> {
                     ArtifactName::PushDefault,
                 )
             };
-            out.push(make(
-                SensitiveAction::ForcePush,
-                artifact,
-                name,
-                reversibility::NO,
-            ));
+            out.push(make(SensitiveAction::ForcePush, artifact, name));
         }
         for r in declared {
-            let (artifact, name) = named(r);
-            out.push(make(
-                SensitiveAction::ForcePush,
-                artifact,
-                name,
-                reversibility::NO,
-            ));
+            if !accounted(Some(r), any_forced) {
+                let (artifact, name) = named(r);
+                out.push(make(SensitiveAction::ForcePush, artifact, name));
+            }
         }
     }
     if let Some(declared) = &intent.delete {
-        if declared.is_empty() {
+        if declared.is_empty() && !accounted(None, any_deleted) {
             // `xargs git push origin --delete`: the refs came from stdin.
             out.push(make(
                 SensitiveAction::Delete,
                 format!("ref(s) on {remote}"),
                 ArtifactName::Literal,
-                reversibility::RESTORE,
             ));
         }
         for r in declared {
-            let (artifact, name) = named(r);
-            out.push(make(
-                SensitiveAction::Delete,
-                artifact,
-                name,
-                reversibility::RESTORE,
-            ));
+            if !accounted(Some(r), any_deleted) {
+                let (artifact, name) = named(r);
+                out.push(make(SensitiveAction::Delete, artifact, name));
+            }
         }
     }
     out
@@ -2344,6 +2569,8 @@ fn interpret_other(
                 repo_from_remote,
                 working_dir: working_dir.to_string(),
                 artifact_name: ArtifactName::Literal,
+                remote_url: None,
+                hedged: false,
                 suppression: None,
             }]
         }
@@ -2429,6 +2656,8 @@ fn registry_publish(artifact: String, working_dir: &str) -> DetectedAction {
         repo_from_remote: None,
         working_dir: working_dir.to_string(),
         artifact_name: ArtifactName::Literal,
+        remote_url: None,
+        hedged: false,
         suppression: None,
     }
 }
@@ -3819,16 +4048,39 @@ mod sensitive_action_tests {
         assert_eq!(got[0].undo, None);
         assert_eq!(got[0].repo_from_remote.as_deref(), Some("origin"));
         assert!(got[0].suppression.is_none(), "no block → never suppressed");
-        assert!(interpret_tool_use(&call("git push -q --force"), "", true).is_empty());
-        assert!(
-            interpret_tool_use(
-                &call("git push -q --force"),
-                "fatal: Authentication failed\n",
-                false
-            )
-            .is_empty(),
-            "a fatal is a failure even when piped"
+        assert!(!got[0].hedged);
+    }
+
+    /// A missing block plus a failure is UNKNOWN — the failure may be
+    /// unrelated — so the declared action is still reported, as "may have",
+    /// and never as reversible.
+    #[test]
+    fn a_failed_call_without_a_block_reports_may_have() {
+        for (output, failed) in [
+            ("", true),
+            ("fatal: Authentication failed\n", false),
+            ("fatal: unrelated error from another command\n", false),
+        ] {
+            let got = interpret_tool_use(&call("git push -q --force origin main"), output, failed);
+            assert_eq!(got.len(), 1, "{output:?}/{failed}: {got:?}");
+            assert!(got[0].hedged);
+            assert_eq!(got[0].reversible, reversibility::NO);
+            let artifact = got[0].body()["artifact"].as_str().unwrap().to_string();
+            assert!(
+                artifact.starts_with("main (may have been force-pushed"),
+                "{artifact}"
+            );
+        }
+        let got = interpret_tool_use(&call("git push -q origin --delete old"), "", true);
+        assert_eq!(
+            got[0].reversible,
+            reversibility::NO,
+            "hedged → not reversible"
         );
+        assert!(got[0].body()["artifact"]
+            .as_str()
+            .unwrap()
+            .contains("may have been deleted"));
     }
 
     #[test]
@@ -3980,7 +4232,9 @@ mod sensitive_action_tests {
             undo: Some("1a2b3c4".into()),
             repo: Some("o/r".into()),
             repo_from_remote: None,
+            remote_url: None,
             working_dir: String::new(),
+            hedged: false,
             suppression: None,
         };
         assert_eq!(
@@ -4000,6 +4254,118 @@ mod sensitive_action_tests {
         };
         assert!(b.body().get("undo").is_none(), "never `undo: null`");
         assert!(b.body().get("repo").is_none());
+    }
+
+    // ── Round-4: no silent loss ──────────────────────────────────────────
+
+    /// The same branch force-pushed to two remotes is two notifications;
+    /// so are two quiet pushes from two directories.
+    #[test]
+    fn dedup_keeps_distinct_remotes_and_directories() {
+        let out = "To github.com:me/r.git\n + 1111111...2222222 feat/x -> feat/x (forced update)\nTo github.com:up/r.git\n + 3333333...4444444 feat/x -> feat/x (forced update)\n";
+        let got = interpret_tool_use(
+            &call("git push -f origin feat/x; git push -f upstream feat/x"),
+            out,
+            false,
+        );
+        let repos: Vec<Option<&str>> = got.iter().map(|a| a.repo.as_deref()).collect();
+        assert_eq!(repos, vec![Some("me/r"), Some("up/r")]);
+
+        let got = interpret_tool_use(
+            &call("git -C a push -q -f origin feat/x; git -C b push -q -f origin feat/x"),
+            "",
+            false,
+        );
+        let dirs: Vec<&str> = got.iter().map(|a| a.working_dir.as_str()).collect();
+        assert_eq!(dirs, vec!["C:/r/a", "C:/r/b"]);
+    }
+
+    /// A block from ANOTHER push does not account for a quiet push's
+    /// destination: its declaration is still reported.
+    #[test]
+    fn a_quiet_push_beside_a_printing_push_still_notifies() {
+        let out = "To github.com:o/r.git\n * [new branch]      feat/y -> feat/y\n";
+        let got = interpret_tool_use(
+            &call("git push -q -f origin main; git push -u origin feat/y"),
+            out,
+            false,
+        );
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].artifact, "main");
+        assert!(!got[0].hedged);
+        // A destination that DOES appear in a table — rejected, up to date,
+        // fast-forwarded — is accounted for and not re-reported.
+        for line in [
+            " ! [rejected]        main -> main (fetch first)",
+            " = [up to date]      main -> main",
+            "   1111111..2222222  main -> main",
+        ] {
+            let out = format!("To github.com:o/r.git\n{line}\n");
+            assert!(
+                interpret_tool_use(&call("git push -f origin main"), &out, false).is_empty(),
+                "{line}"
+            );
+        }
+    }
+
+    /// Review example: a `cd` reached through `&&` may not have run.
+    #[test]
+    fn a_conditional_cd_to_a_peer_notifies() {
+        let c = call("[ -d ../peer ] && cd ../peer; git push -f origin feat/peer");
+        assert!(!c.dir_certain);
+        let out =
+            "To github.com:o/r.git\n + 1111111...2222222 feat/peer -> feat/peer (forced update)\n";
+        let got = interpret_tool_use(&c, out, false);
+        assert_eq!(got.len(), 1);
+        assert!(finalize_detected_action(got[0].clone()).is_some());
+    }
+
+    #[test]
+    fn cd_certainty_follows_how_the_cd_is_reached() {
+        for (cmd, certain) in [
+            ("cd sub && git push -f origin x", true),
+            ("cd sub; git push -f origin x", true),
+            ("cd sub || exit 1; git push -f origin x", true),
+            ("true && cd sub; git push -f origin x", false),
+            ("false || cd sub; git push -f origin x", false),
+            ("cd sub & git push -f origin x", false),
+            ("echo | cd sub; git push -f origin x", false),
+            (
+                "if [ -d sub ]; then cd sub; fi; git push -f origin x",
+                false,
+            ),
+            ("if cd sub; then git push -f origin x; fi", false),
+            (
+                "if true; then :; else cd sub; fi; git push -f origin x",
+                false,
+            ),
+            ("case $x in a) cd sub;; esac; git push -f origin x", false),
+            ("for d in sub; do cd $d; done; git push -f origin x", false),
+            ("while false; do cd sub; done; git push -f origin x", false),
+            ("source env.sh; git push -f origin x", false),
+            (". ./env.sh; git push -f origin x", false),
+            ("eval \"cd sub\"; git push -f origin x", false),
+            ("builtin cd sub; git push -f origin x", false),
+        ] {
+            assert_eq!(classify_call(cmd, "C:/w").dir_certain, certain, "{cmd:?}");
+        }
+        // `builtin cd` IS a cd: the directory moves.
+        assert_eq!(
+            classify_commands("builtin cd sub; git push -f origin x", "C:/w")[0].dir,
+            "C:/w/sub"
+        );
+    }
+
+    #[test]
+    fn git_dir_overrides_are_seen_behind_valued_options() {
+        for cmd in [
+            "git -C . --git-dir=/r/.git push -f origin x",
+            "git -c k=v --work-tree=/r push -f origin x",
+            "git -C sub --git-dir /r/.git push -f origin x",
+        ] {
+            assert!(!classify_call(cmd, "C:/w").dir_certain, "{cmd:?}");
+        }
+        assert!(classify_call("git -C sub -c k=v push -f origin x", "C:/w").dir_certain);
     }
 
     // ── The D8 suppression rule ──────────────────────────────────────────
