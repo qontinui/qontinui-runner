@@ -1042,14 +1042,29 @@ fn write_wedge_breadcrumb(kind: WedgeKind, unresponsive_for_secs: u64) {
 ///
 /// **The single writer for that file.** Every rung with an incident worth
 /// surviving the process goes through here: the backend and UI-thread wedge
-/// detectors in this module, and `webview_recovery`'s latched-recovery report
-/// (`recovery_wedged`). A second incident file would be one more observability
+/// detectors in this module, `webview_recovery`'s latched-recovery report
+/// (`recovery_wedged`), and `coord_outside_observer`'s four coord-liveness
+/// classes (`coord_unreachable`, `coord_worker_dead`, `coord_no_leader`,
+/// `coord_liveness_unknown` — plan
+/// `2026-09-12-merge-train-alerts-page-a-reader-and-act-on-nothing`
+/// Phase 3b). A second incident file would be one more observability
 /// channel nobody greps — and this one is already the first thing to read after
 /// an unexplained outage, because `runner-lifecycle.log` is truncated at every
 /// startup.
 ///
+/// Note the two FAMILIES that now share the file, because the distinction
+/// decides what a reader does next: the wedge reasons are about THIS RUNNER
+/// (it is sick, and the line explains why it stopped answering), while the
+/// `coord_*` reasons are about COORD (this runner is healthy and is reporting
+/// what it can see of a fleet service it has no lever on) — except
+/// `coord_liveness_unknown`, which is about NEITHER: it is this runner saying
+/// it has no view of coord at all, which is not a verdict on coord's health
+/// and must not be read as one.
+///
 /// `reason` is the stable, greppable token (`backend_wedged`,
-/// `ui_thread_wedged`, `recovery_wedged`); `detail` is the prose after it.
+/// `ui_thread_wedged`, `recovery_wedged`, `coord_unreachable`,
+/// `coord_worker_dead`, `coord_no_leader`, `coord_liveness_unknown`);
+/// `detail` is the prose after it.
 ///
 /// Best-effort by contract: the process is already sick, so a failure to write
 /// must never make it worse.

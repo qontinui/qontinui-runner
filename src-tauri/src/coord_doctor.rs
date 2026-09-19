@@ -1830,11 +1830,74 @@ fn nonce_is_registered(nonce: &str) -> bool {
 // configured coord `/mcp` endpoint, with the device bearer if present.
 // ---------------------------------------------------------------------------
 
-fn coord_reachable_check() -> (bool, String) {
-    // The shared tier-aware policy fn — the doctor and the loopback proxy can
-    // never disagree about the upstream OR its source (plan D4).
-    let (base, source) = crate::profiles::coord_base_with_source();
+/// The coord `/mcp` door this runner probes, resolved once.
+///
+/// Everything here EXCEPT the credential itself: the upstream, where the
+/// upstream came from, this machine's tenant pin, and a label naming which
+/// slot a caller's credential will come out of. The bearer is deliberately
+/// NOT a field — [`coord_reachable_check`] selects it raw because it REPORTS
+/// on the credential chain (`coord-auth-exempt(diagnostic)`), while an
+/// ordinary data-plane caller routes through `auth::attach_device_auth_for`
+/// so its call is counted. Sharing the resolution but not the selection is
+/// what lets both be true.
+///
+/// Second caller: `coord_outside_observer` (plan
+/// `2026-09-12-merge-train-alerts-page-a-reader-and-act-on-nothing` Phase 3b),
+/// which swaps `tools/list` for a `coord_query_workers` `tools/call` on the
+/// same door. The two sharing this function is the point — the defect this
+/// check's own comment records is precisely two probes disagreeing about
+/// which upstream and which slot they were testing.
+pub struct CoordMcpDoor {
+    /// The tier-aware coord base, with no trailing slash normalisation
+    /// applied — use [`Self::url`] for the `/mcp` endpoint and this for any
+    /// other route on the same host.
+    pub base: String,
+    /// Where the base came from, as `profiles::coord_base_with_source`
+    /// reports it. Printed on every verdict so a wrong-upstream probe is
+    /// legible rather than merely red.
+    pub base_source: crate::profiles::CoordBaseSource,
+    /// `<base>/mcp`.
+    pub url: String,
+    /// This machine's tenant pin, three-valued so a caller can tell
+    /// "single-tenant by design" from "cannot state its tenant".
+    pub pin: crate::tenant_pin::TenantPin,
+    /// The tenant to select a credential slot for, when there is one.
+    pub tenant: Option<uuid::Uuid>,
+    /// Which slot a credential selected from [`Self::pin`] comes out of —
+    /// a label for the report, never a credential.
+    pub probed_slot: &'static str,
+}
+
+/// Resolve [`CoordMcpDoor`] from this machine's policy + pin. No I/O beyond
+/// the local settings and `machine.json` reads those two helpers already do,
+/// and never a network call.
+pub fn resolve_coord_mcp_door() -> CoordMcpDoor {
+    // The shared tier-aware policy fn — the doctor, the loopback proxy and
+    // the outside observer can never disagree about the upstream OR its
+    // source (plan D4).
+    let (base, base_source) = crate::profiles::coord_base_with_source();
     let url = format!("{}/mcp", base.trim_end_matches('/'));
+    let pin = crate::tenant_pin::resolve_tenant_pin();
+    let tenant = pin.pinned();
+    let probed_slot = match (&pin, tenant.as_ref()) {
+        (crate::tenant_pin::TenantPin::Unresolvable, _) => "unresolvable-pin",
+        (_, Some(_)) => "per-tenant",
+        (_, None) => "default/legacy",
+    };
+    CoordMcpDoor {
+        base,
+        base_source,
+        url,
+        pin,
+        tenant,
+        probed_slot,
+    }
+}
+
+fn coord_reachable_check() -> (bool, String) {
+    let door = resolve_coord_mcp_door();
+    let url = door.url.clone();
+    let source = door.base_source;
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -1857,15 +1920,10 @@ fn coord_reachable_check() -> (bool, String) {
     //
     // `device_bearer_for` is the SAME selector the proxy calls, given the same
     // machine pin, so the two can no longer disagree about which slot is under
-    // test.
-    let pin = crate::tenant_pin::resolve_tenant_pin();
-    let tenant = pin.pinned();
-    let probed_slot = match (&pin, tenant.as_ref()) {
-        (crate::tenant_pin::TenantPin::Unresolvable, _) => "unresolvable-pin",
-        (_, Some(_)) => "per-tenant",
-        (_, None) => "default/legacy",
-    };
-    let bearer = crate::auth::device_bearer_for(tenant.as_ref());
+    // test. The pin and the slot LABEL come from `resolve_coord_mcp_door`
+    // above; the selection stays here, raw, because this check reports on it.
+    let probed_slot = door.probed_slot;
+    let bearer = crate::auth::device_bearer_for(door.tenant.as_ref());
     // Say WHICH credential answered, always. A green line that does not name
     // the slot it used is what let this check's divergence from the proxy stay
     // invisible for the life of the defect.
