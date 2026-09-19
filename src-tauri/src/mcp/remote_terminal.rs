@@ -5090,7 +5090,10 @@ mod grant_gate_tests {
             CreateRefusal::GrantUnknown.code()
         ));
         assert!(
-            refusal_warrants_a_coord_reread(GrantFamily::Attach, AttachRefusal::GrantUnknown.code()),
+            refusal_warrants_a_coord_reread(
+                GrantFamily::Attach,
+                AttachRefusal::GrantUnknown.code()
+            ),
             "the attach path races the directive exactly as create does"
         );
         // The family is load-bearing: one family's code must not satisfy the
@@ -5129,10 +5132,12 @@ mod grant_gate_tests {
         }
         // An unrecognised code is final too: an unknown refusal must not be a
         // way to make this device call coord.
-        assert!(!refusal_warrants_a_coord_reread(GrantFamily::Create, "something_else"));
+        assert!(!refusal_warrants_a_coord_reread(
+            GrantFamily::Create,
+            "something_else"
+        ));
         assert!(!refusal_warrants_a_coord_reread(GrantFamily::Create, ""));
     }
-
 
     /// The decision seam is unit-tested; its WIRING is not observable from any
     /// behavioural test in this process, and the wiring is exactly where a
@@ -5156,7 +5161,10 @@ mod grant_gate_tests {
         }
 
         let create = handler_body(RELAY, "async fn handle_terminal_create(");
-        assert!(create.contains("GrantFamily::Create"), "create handler lost its family");
+        assert!(
+            create.contains("GrantFamily::Create"),
+            "create handler lost its family"
+        );
         assert!(
             create.contains("crate::session::create::catch_up_now_within("),
             "create handler must re-read the CREATE feed"
