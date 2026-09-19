@@ -1238,6 +1238,8 @@ pub fn terminal_session_record_open(
         restored_from_boot_at: None,
         restore_tier: None,
         finished_at: None,
+        wind_down_outcome: None,
+        wind_down_at: None,
         finish_reason: None,
         finish_synced: false,
     };
@@ -1505,6 +1507,31 @@ pub(crate) fn close_outcome_response(outcome: &CloseOutcome) -> CommandResponse 
 pub fn terminal_session_list_open(
     store: tauri::State<'_, Arc<SessionLifecycleStore>>,
 ) -> Result<CommandResponse, String> {
+    // Coord's device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
+    // D3): restoring tabs respawns `claude --resume` sessions autonomously, so
+    // while the device is drained (or its drain state is unknown) the restore
+    // set is withheld and the response says so. Nothing is closed or consumed;
+    // the frontend re-runs the restore on `coord-drain-state-changed` once
+    // autonomous spawns may run again.
+    if let crate::coord_drain_state::DrainGate::Defer { reason, .. } =
+        crate::coord_drain_state::drain_gate_for_work(
+            crate::coord_drain_state::SpawnOrigin::BootResume,
+            "boot_resume:terminal_tabs",
+        )
+    {
+        tracing::warn!("terminal_session_list_open: restore deferred — {reason}");
+        return Ok(CommandResponse {
+            success: true,
+            message: Some(reason.clone()),
+            data: Some(serde_json::json!({
+                "sessions": [],
+                "deferredByDrain": {
+                    "state": crate::coord_drain_state::current().label(),
+                    "reason": reason,
+                },
+            })),
+        });
+    }
     let now = chrono::Utc::now().timestamp_millis();
     // The prior shutdown marker's `at` is one input to the anchor. It is
     // captured ONCE at boot (main.rs setup, before this command can run) —
@@ -2493,6 +2520,8 @@ async fn poll_and_record_session<F>(
                 restored_from_boot_at: None,
                 restore_tier: None,
                 finished_at: None,
+                wind_down_outcome: None,
+                wind_down_at: None,
                 finish_reason: None,
                 finish_synced: false,
             };
@@ -2582,6 +2611,8 @@ pub(crate) fn record_pinned_session_open(
         restored_from_boot_at: None,
         restore_tier: None,
         finished_at: None,
+        wind_down_outcome: None,
+        wind_down_at: None,
         finish_reason: None,
         finish_synced: false,
     });
@@ -2775,6 +2806,8 @@ mod tests {
             restored_from_boot_at: None,
             restore_tier: None,
             finished_at: None,
+            wind_down_outcome: None,
+            wind_down_at: None,
             finish_reason: None,
             finish_synced: false,
         }

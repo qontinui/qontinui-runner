@@ -3277,6 +3277,9 @@ async fn handle_chat_create(api_state: &Arc<ApiState>, data: &Value) -> Option<V
     let authz = crate::agent_authorization::authorize_spawn(
         None,
         crate::agent_authorization::SpawnPath::InSessionSubagent,
+        // A remote (relay) request, not an operator sitting at this runner
+        // (D3): autonomous, deferred by the coord device drain.
+        crate::coord_drain_state::SpawnOrigin::Unknown,
     )
     .await;
     if let Some(refusal) = authz.refusal() {
@@ -3875,6 +3878,32 @@ fn register_remote_created_session(
 }
 
 async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Option<Value> {
+    // Coord device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
+    // D3): a relay create — web, mobile or a remote runner — is a remote
+    // dispatch, not an operator sitting at this runner, so it is deferred while
+    // the device is drained or its drain state is unknown. Refused BEFORE the
+    // grant gate below, so a deferral spends no create grant.
+    if let crate::coord_drain_state::DrainGate::Defer { reason, class } =
+        crate::coord_drain_state::drain_gate_for_work(
+            crate::coord_drain_state::SpawnOrigin::Unknown,
+            // Caller-supplied request id — BOUNDED (review N4).
+            &crate::coord_drain_state::bounded_work_key(
+                "relay_terminal",
+                data.get("request_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-"),
+            ),
+        )
+    {
+        return Some(serde_json::json!({
+            "type": "error",
+            // `drain_unreadable` while the state is unknown, `device_drained`
+            // only when coord said drained.
+            "code": class.code(),
+            "message": reason,
+            "request_id": data.get("request_id"),
+        }));
+    }
     // D2 — the TARGET chooses. A frame with no `remote` block is the
     // operator-web / mobile path and keeps its caller-chosen `working_dir`;
     // one carrying a block is a REMOTE create, and `admitted` holds the

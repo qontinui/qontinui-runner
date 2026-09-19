@@ -224,19 +224,23 @@ pub fn launch_reflection(
             file_registry,
             file_lock,
             deps.app_state.pg_db.clone(),
-            Box::pin(async move {
-                controller
-                    .run(
-                        loop_config,
-                        setup_steps,        // setup automation steps (API requests)
-                        Vec::new(),         // setup prompt steps (none)
-                        verification_steps, // verification steps
-                        Vec::new(),         // agentic steps (prompt is in loop_config.base_prompt)
-                        completion_automation_steps, // completion automation steps (batch evaluation)
-                        completion_prompt_steps,     // completion prompt steps
-                    )
-                    .await
-            }),
+            Box::pin(crate::coord_drain_state::held_until_allowed(
+                crate::coord_drain_state::SpawnOrigin::Orchestration,
+                format!("reflection:{source_task_run_id}"),
+                async move {
+                    controller
+                        .run(
+                            loop_config,
+                            setup_steps,        // setup automation steps (API requests)
+                            Vec::new(),         // setup prompt steps (none)
+                            verification_steps, // verification steps
+                            Vec::new(), // agentic steps (prompt is in loop_config.base_prompt)
+                            completion_automation_steps, // completion automation steps (batch evaluation)
+                            completion_prompt_steps,     // completion prompt steps
+                        )
+                        .await
+                },
+            )),
         );
     }
 
@@ -418,19 +422,23 @@ pub fn launch_project_reflection(
             file_registry,
             file_lock,
             deps.app_state.pg_db.clone(),
-            Box::pin(async move {
-                controller
-                    .run(
-                        loop_config,
-                        setup_steps,
-                        Vec::new(),
-                        verification_steps,
-                        Vec::new(),
-                        completion_automation_steps,
-                        completion_prompt_steps,
-                    )
-                    .await
-            }),
+            Box::pin(crate::coord_drain_state::held_until_allowed(
+                crate::coord_drain_state::SpawnOrigin::Orchestration,
+                format!("reflection:{source_task_run_id}"),
+                async move {
+                    controller
+                        .run(
+                            loop_config,
+                            setup_steps,
+                            Vec::new(),
+                            verification_steps,
+                            Vec::new(),
+                            completion_automation_steps,
+                            completion_prompt_steps,
+                        )
+                        .await
+                },
+            )),
         );
     }
 
@@ -609,19 +617,23 @@ pub fn launch_ui_bridge_reflection(
             file_registry,
             file_lock,
             deps.app_state.pg_db.clone(),
-            Box::pin(async move {
-                controller
-                    .run(
-                        loop_config,
-                        setup_steps,
-                        Vec::new(),
-                        verification_steps,
-                        Vec::new(),
-                        completion_automation_steps,
-                        completion_prompt_steps,
-                    )
-                    .await
-            }),
+            Box::pin(crate::coord_drain_state::held_until_allowed(
+                crate::coord_drain_state::SpawnOrigin::Orchestration,
+                format!("reflection:{source_task_run_id}"),
+                async move {
+                    controller
+                        .run(
+                            loop_config,
+                            setup_steps,
+                            Vec::new(),
+                            verification_steps,
+                            Vec::new(),
+                            completion_automation_steps,
+                            completion_prompt_steps,
+                        )
+                        .await
+                },
+            )),
         );
     }
 

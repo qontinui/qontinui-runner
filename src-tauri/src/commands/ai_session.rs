@@ -122,6 +122,12 @@ pub struct SessionRecoverySummary {
     /// Per-session honest outcomes (one entry per successfully resumed
     /// session).
     pub sessions: Vec<SessionRecoveryOutcome>,
+    /// Set when coord's device drain DEFERRED the whole resume (plan
+    /// `2026-09-13-drained-runner-never-reaches-idle`, Phase 3): nothing was
+    /// resumed or marked failed — the rows stay `running` and resume once the
+    /// drain lifts. Serialized as `deferredByDrain`; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deferred_by_drain: Option<String>,
 }
 
 /// Tauri event name for the one-shot startup recovery summary (Phase 4).
@@ -494,6 +500,10 @@ pub async fn create_ai_session(
     let authz = crate::agent_authorization::authorize_spawn(
         None,
         crate::agent_authorization::SpawnPath::InSessionSubagent,
+        // The runner UI's own "new chat": an operator at this runner, so the
+        // coord device drain never defers it (D3) — the UI shows the draining
+        // banner instead.
+        crate::coord_drain_state::SpawnOrigin::OperatorChat,
     )
     .await;
     if let Some(refusal) = authz.refusal() {
@@ -1720,7 +1730,26 @@ pub async fn resume_ai_sessions(
         crash_recovery,
         resumed_count: 0,
         sessions: Vec::new(),
+        deferred_by_drain: None,
     };
+
+    // Coord's device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
+    // D3): a boot resume is autonomous. Checked before the first query, so a
+    // deferral neither resumes a session nor marks one failed — the rows stay
+    // `running`, and the boot task waits for the drain to lift and calls this
+    // again.
+    if let crate::coord_drain_state::DrainGate::Defer { reason, .. } =
+        crate::coord_drain_state::drain_gate_for_work(
+            crate::coord_drain_state::SpawnOrigin::BootResume,
+            "boot_resume:ai_sessions",
+        )
+    {
+        warn!("AI session resume: deferred — {reason}");
+        return SessionRecoverySummary {
+            deferred_by_drain: Some(reason),
+            ..empty_summary()
+        };
+    }
 
     // Grab AppState from Tauri's managed state — same pattern other resume
     // paths use. If unavailable we're being invoked before setup completes;
@@ -2077,6 +2106,7 @@ pub async fn resume_ai_sessions(
     }
 
     SessionRecoverySummary {
+        deferred_by_drain: None,
         crash_recovery,
         resumed_count: resumed,
         sessions: outcomes,
@@ -2394,6 +2424,7 @@ mod resume_tests {
     #[test]
     fn summary_assembles_count_and_crash_flag() {
         let summary = SessionRecoverySummary {
+            deferred_by_drain: None,
             crash_recovery: true,
             resumed_count: 2,
             sessions: vec![
@@ -2423,6 +2454,7 @@ mod resume_tests {
         // The frontend banner type mirrors this exact wire shape; pin it so a
         // rename can't silently break the honesty surfacing.
         let summary = SessionRecoverySummary {
+            deferred_by_drain: None,
             crash_recovery: true,
             resumed_count: 1,
             sessions: vec![outcome(
@@ -2452,6 +2484,7 @@ mod resume_tests {
     #[test]
     fn lossless_clean_session_serializes_honestly() {
         let summary = SessionRecoverySummary {
+            deferred_by_drain: None,
             crash_recovery: false,
             resumed_count: 1,
             sessions: vec![outcome(

@@ -418,6 +418,53 @@ pub enum GracefulExitOutcome {
         error: String,
         claude_pids: Vec<u32>,
     },
+    /// `claude` left, but the pane could NOT be proven clear at the moment of
+    /// the close, so nothing was killed and the tab was not closed. See
+    /// [`CloseTabResult`].
+    CloseRefused {
+        waited_ms: u64,
+        /// The `claude` pids present when `/exit` was typed.
+        claude_pids: Vec<u32>,
+        reason: String,
+    },
+    /// `claude` left and the close was ATTEMPTED, but what it achieved is not
+    /// known — the closing task panicked or was cancelled, or the pane was
+    /// already gone from the manager. Distinct from [`Self::CloseRefused`],
+    /// which is the positive statement that the pane was left untouched: this
+    /// one asserts nothing about the pane either way.
+    CloseOutcomeUnknown {
+        waited_ms: u64,
+        claude_pids: Vec<u32>,
+        detail: String,
+    },
+}
+
+/// What the close step did — the answer to the ONE question `drive` cannot ask
+/// itself, because the pane is reached only through the injected effects.
+///
+/// ## Why the close is allowed to refuse (Phase 1 review, hazard 2)
+///
+/// Between the last "gone" probe and the close there is a real window in which
+/// something can start a NEW `claude` in the pane. `TerminalSession::
+/// close_after_graceful_exit` decides whether to kill from `is_alive()`, which
+/// is a coarse proxy — it answers "is the pane's own shell running", not "is a
+/// live `claude` in this pane". Phase 1 could tolerate the window because
+/// nothing drove this primitive; the Phase 4 wind-down executor drives it on
+/// looping and steward panes, which are exactly the kinds with an external
+/// relauncher. The closer therefore re-proves the pane clear immediately before
+/// closing and REFUSES otherwise, and this type carries that refusal back so
+/// the outcome is honest rather than a false `Exited`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloseTabResult {
+    /// The pane was closed.
+    Closed,
+    /// The pane was left exactly as it was — a POSITIVE statement, only
+    /// returnable by a closer that decided not to act before acting.
+    Refused { reason: String },
+    /// The close was attempted and its result is not known. Never say
+    /// [`Self::Refused`] here: a closer that got as far as removing the pane
+    /// and then lost its task cannot claim the pane is untouched.
+    Unknown { detail: String },
 }
 
 fn pids_of(ids: &[ProcIdentity]) -> Vec<u32> {
@@ -445,7 +492,7 @@ where
     P: FnMut(Vec<ProcIdentity>) -> PF,
     PF: Future<Output = ClaudeProbe>,
     C: FnOnce() -> CF,
-    CF: Future<Output = ()>,
+    CF: Future<Output = CloseTabResult>,
 {
     // (1) The pane's processes.
     let initial = match probe(Vec::new()).await {
@@ -541,11 +588,28 @@ where
                 if view.subtree_claude.is_empty() && view.tracked_alive.is_empty() {
                     gone_streak += 1;
                     if gone_streak >= GONE_PROBES_REQUIRED {
-                        // (5) Gone.
-                        close_tab().await;
-                        return GracefulExitOutcome::Exited {
-                            waited_ms: millis(started.elapsed()),
-                            claude_pids,
+                        // (5) Gone. The closer re-proves the pane clear at the
+                        // moment of the close and may refuse — see
+                        // [`CloseTabResult`].
+                        return match close_tab().await {
+                            CloseTabResult::Closed => GracefulExitOutcome::Exited {
+                                waited_ms: millis(started.elapsed()),
+                                claude_pids,
+                            },
+                            CloseTabResult::Refused { reason } => {
+                                GracefulExitOutcome::CloseRefused {
+                                    waited_ms: millis(started.elapsed()),
+                                    claude_pids,
+                                    reason,
+                                }
+                            }
+                            CloseTabResult::Unknown { detail } => {
+                                GracefulExitOutcome::CloseOutcomeUnknown {
+                                    waited_ms: millis(started.elapsed()),
+                                    claude_pids,
+                                    detail,
+                                }
+                            }
                         };
                     }
                 } else {
@@ -919,10 +983,20 @@ mod tests {
         }
     }
 
-    fn recording_close(log: Log) -> impl FnOnce() -> std::future::Ready<()> {
+    fn recording_close(log: Log) -> impl FnOnce() -> std::future::Ready<CloseTabResult> {
         move || {
             log.lock().unwrap().push("close".to_string());
-            std::future::ready(())
+            std::future::ready(CloseTabResult::Closed)
+        }
+    }
+
+    /// A closer that finds the pane NOT clear and refuses (hazard 2).
+    fn refusing_close(log: Log) -> impl FnOnce() -> std::future::Ready<CloseTabResult> {
+        move || {
+            log.lock().unwrap().push("close-refused".to_string());
+            std::future::ready(CloseTabResult::Refused {
+                reason: "a claude reappeared in the pane".to_string(),
+            })
         }
     }
 
@@ -971,6 +1045,39 @@ mod tests {
                 "close",
             ]
         );
+    }
+
+    /// Hazard 2: a closer that cannot prove the pane clear refuses, and the
+    /// outcome says so rather than claiming a clean `Exited`.
+    #[tokio::test(start_paused = true)]
+    async fn a_close_that_refuses_is_reported_as_close_refused_not_exited() {
+        let log: Log = Arc::default();
+        let pane = FakePane::new(empty_prompt(), true);
+        let outcome = drive(
+            pane.write(log.clone()),
+            pane.screen(),
+            scripted_probe(
+                vec![
+                    readable(&[CLAUDE], 0, &[]),
+                    readable(&[], 0, &[]),
+                    readable(&[], 0, &[]),
+                ],
+                log.clone(),
+            ),
+            refusing_close(log.clone()),
+            timing(),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            GracefulExitOutcome::CloseRefused {
+                // Two 500 ms polls: the gone streak is reached on the second.
+                waited_ms: 1_000,
+                claude_pids: vec![42],
+                reason: "a claude reappeared in the pane".to_string(),
+            }
+        );
+        assert!(entries(&log).iter().any(|e| e == "close-refused"));
     }
 
     #[tokio::test(start_paused = true)]

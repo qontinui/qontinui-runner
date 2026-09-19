@@ -32,6 +32,7 @@ import type {
 } from "../types/aiData";
 import type { TaskRunMcpCallsDbResult } from "../types/mcp-config";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { invokeOperatorDoor } from "@/lib/operatorDoors";
 
 /**
  * Service for accessing AI data viewer data via Tauri commands.
@@ -68,12 +69,13 @@ export const aiDataService = {
     additionalSessions: number,
   ): Promise<AiDataResponse<TaskRun>> {
     try {
-      const response = await tracedFetch(`${getApiBase()}/task-runs/${taskId}/resume`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ additional_sessions: additionalSessions }),
-      });
-      const result = await response.json();
+      // As an OPERATOR (the Tauri twin of POST /task-runs/{id}/resume), which
+      // coord's device drain never defers.
+      const reply = await invokeOperatorDoor<{ success?: boolean; error?: string }>(
+        "operator_resume_task_run",
+        { id: taskId, request: { additional_sessions: additionalSessions } },
+      );
+      const result = reply.body;
       if (!result.success) {
         return { success: false, error: result.error || "Failed to resume task run" };
       }

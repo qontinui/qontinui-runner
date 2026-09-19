@@ -304,11 +304,24 @@ pub struct LiveClaudeProcess {
     /// holding memory, and a restart will still kill it. It means only that
     /// its session declared its work complete.
     pub blocks_restart: bool,
-    /// Wind-down eligibility — **DRY-RUN, reported only** (plan
-    /// `2026-09-13-drained-runner-never-reaches-idle`, Phase 1). Filled by
-    /// `GET /restart-readiness` for top-level terminal-hosted processes; `None`
-    /// — and omitted from the JSON — everywhere else, including every
-    /// background census and `/health`. Nothing acts on it.
+    /// Wind-down eligibility (plan
+    /// `2026-09-13-drained-runner-never-reaches-idle`). Filled for top-level
+    /// terminal-hosted processes; `None` — and omitted from the JSON —
+    /// everywhere else, including every background census and `/health`.
+    ///
+    /// ⚠ **NOT a dry run any more.** It was one in Phase 1, when the only
+    /// reader was `GET /restart-readiness`. Since Phase 4 the wind-down
+    /// executor (`session::wind_down_executor`) reads the same field and ACTS
+    /// on it — an `eligible` on a DRAINED device is a session the runner will
+    /// graceful-`/exit` on its next tick. Reading it costs nothing; writing a
+    /// wrong one closes a session.
+    ///
+    /// The two readers still differ, and the difference is the endpoint's, not
+    /// this field's: `/restart-readiness` reports whatever the verdict says
+    /// whether or not the runner is drained and closes nothing itself, while
+    /// the executor applies its own further gates (the drain, a wall-clock-jump
+    /// quarantine, a per-tick budget, and a re-check immediately before each
+    /// close). So `eligible` here is a candidacy, never a prediction.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wind_down: Option<qontinui_runner_lib::wind_down::WindDownView>,
 }
@@ -1009,6 +1022,8 @@ mod tests {
             restored_from_boot_at: None,
             restore_tier: None,
             finished_at: None,
+            wind_down_outcome: None,
+            wind_down_at: None,
             finish_reason: None,
             finish_synced: false,
         }

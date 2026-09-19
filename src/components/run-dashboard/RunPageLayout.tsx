@@ -11,6 +11,7 @@ import { RunSelector } from "../run-selection/RunSelector";
 import { useRunSelectionOptional } from "../../contexts/RunSelectionContext";
 import { getStatusColors } from "@/design-system";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { invokeOperatorDoor } from "@/lib/operatorDoors";
 
 /** Maps runner page titles to web run-detail tab names */
 const TAB_MAPPING: Record<string, string> = {
@@ -73,10 +74,9 @@ export function RunPageLayout({
             w.name.toLowerCase() === selectedRun.workflow_name!.toLowerCase(),
         ) || workflows[0];
       // Run the workflow
-      await tracedFetch(`${getApiBase()}/unified-workflows/${workflow.id}/run`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ monitor_index: 0 }),
+      await invokeOperatorDoor("operator_run_unified_workflow", {
+        id: workflow.id,
+        request: { monitor_index: 0 },
       });
       // Navigate to Active page after starting
       setTimeout(() => onNavigateToActive?.(), 100);

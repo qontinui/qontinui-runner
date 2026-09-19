@@ -334,6 +334,9 @@ pub fn launch_workflow_by_id(
         })
     });
 
+    // Held, never discarded, while coord's device drain defers autonomous
+    // spawns (plan `2026-09-13-drained-runner-never-reaches-idle`).
+    let hold_key = format!("auto_run:{generated_workflow_id}");
     if use_legacy {
         super::spawn_workflow_with_panic_guard(
             execution_id.clone(),
@@ -342,33 +345,37 @@ pub fn launch_workflow_by_id(
             file_registry,
             file_lock,
             pg_db_spawn,
-            Box::pin(async move {
-                let mut controller = super::LoopController::new(
-                    app_state,
-                    config_storage,
-                    app_handle.clone(),
-                    pid_tracker,
-                );
+            Box::pin(crate::coord_drain_state::held_until_allowed(
+                crate::coord_drain_state::SpawnOrigin::Orchestration,
+                hold_key,
+                async move {
+                    let mut controller = super::LoopController::new(
+                        app_state,
+                        config_storage,
+                        app_handle.clone(),
+                        pid_tracker,
+                    );
 
-                // Get session manager from app handle for interactive mode
-                let session_manager: Arc<crate::claude_session::SessionManager> = app_handle
-                    .state::<Arc<crate::claude_session::SessionManager>>()
-                    .inner()
-                    .clone();
-                controller = controller.with_session_manager(session_manager);
+                    // Get session manager from app handle for interactive mode
+                    let session_manager: Arc<crate::claude_session::SessionManager> = app_handle
+                        .state::<Arc<crate::claude_session::SessionManager>>()
+                        .inner()
+                        .clone();
+                    controller = controller.with_session_manager(session_manager);
 
-                controller
-                    .run(
-                        loop_config,
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                    )
-                    .await
-            }),
+                    controller
+                        .run(
+                            loop_config,
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                        )
+                        .await
+                },
+            )),
         );
     }
 

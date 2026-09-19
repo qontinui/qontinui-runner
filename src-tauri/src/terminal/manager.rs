@@ -622,6 +622,12 @@ impl TerminalManager {
     /// removes the pane from this manager and closes it — without a kill when
     /// the pane's own process already exited. A `claude` that outlives the
     /// deadline is reported `ExitStuck` and LEFT RUNNING.
+    ///
+    /// The close itself may REFUSE: it re-proves the pane clear one last time
+    /// immediately before removing it, so a `claude` relaunched in the window
+    /// after the driver's last probe is not killed. That answers
+    /// `CloseRefused`, never a false `Exited` — see
+    /// `crate::terminal::graceful_exit::CloseTabResult`.
     pub async fn graceful_exit(
         self: &std::sync::Arc<Self>,
         id: &str,
@@ -632,20 +638,79 @@ impl TerminalManager {
             .ok_or_else(|| format!("Terminal session not found: {}", id))?;
         let manager = std::sync::Arc::clone(self);
         let terminal_id = id.to_string();
+        let root_pid = session.pane_root_pid();
         Ok(session
             .graceful_exit_then(deadline, move || async move {
+                use crate::terminal::graceful_exit::{ClaudeProbe, CloseTabResult};
+                // ── The relaunch window (Phase 1 review, hazard 2) ──────────
+                //
+                // The driver proved the pane clear on two consecutive probes,
+                // but between the last of those and this close something can
+                // start a NEW `claude` in the pane — and looping and steward
+                // panes, which the Phase 4 wind-down executor closes, are
+                // exactly the kinds with an external relauncher. So re-prove it
+                // HERE, as the last act before the pane is removed from the
+                // manager, and refuse otherwise. FAIL-CLOSED: an unreadable
+                // process table refuses too, because the invariant this guards
+                // is "never kill a live `claude`", and an unreadable table is
+                // not evidence that there is none. A refusal leaves the pane
+                // exactly as it was (at worst a bare shell), which is cheap;
+                // killing a live `claude` is not.
+                //
+                // NARROWER than the driver's own gone-gate on purpose: that
+                // gate requires `subtree_claude.is_empty() &&
+                // tracked_alive.is_empty()`, this one re-proves only the
+                // subtree (the tracked set lives inside `drive` and is not
+                // reachable here). The scope is right for what this guard
+                // protects — `close_inner`'s kill reaches the PANE's process
+                // and nothing else, so a tracked `claude` that has drifted out
+                // of the subtree is not something this close could kill. It is
+                // narrower than the exit gate, which is why it is stated.
+                match crate::terminal::graceful_exit::probe_claude_under(root_pid, Vec::new()).await
+                {
+                    ClaudeProbe::Readable(view) if view.subtree_claude.is_empty() => {}
+                    ClaudeProbe::Readable(view) => {
+                        let pids: Vec<u32> = view.subtree_claude.iter().map(|p| p.pid).collect();
+                        return CloseTabResult::Refused {
+                            reason: format!(
+                                "a claude ({pids:?}) is in the pane again at the moment of the \
+                                 close — nothing killed, tab left open"
+                            ),
+                        };
+                    }
+                    ClaudeProbe::Unreadable(detail) => {
+                        return CloseTabResult::Refused {
+                            reason: format!(
+                                "the pane could not be re-proven clear before the close \
+                                 ({detail}) — nothing killed, tab left open"
+                            ),
+                        };
+                    }
+                }
                 let closing = terminal_id.clone();
                 match qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
                     manager.close_after_graceful_exit(&closing)
                 })
                 .await
                 {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => CloseTabResult::Closed,
+                    // NOT a refusal. `close_after_graceful_exit` removes the
+                    // pane from the manager BEFORE closing it, so once it has
+                    // been entered nothing may claim the pane was left as it
+                    // was — its own `Err` means the pane was already gone, and
+                    // a `JoinError` means the closing task died somewhere
+                    // inside. Both are UNKNOWN.
                     Ok(Err(e)) => {
-                        tracing::warn!(terminal_id = %terminal_id, error = %e, "graceful_exit: tab close failed")
+                        tracing::warn!(terminal_id = %terminal_id, error = %e, "graceful_exit: tab close failed");
+                        CloseTabResult::Unknown {
+                            detail: format!("the tab close failed: {e}"),
+                        }
                     }
                     Err(e) => {
-                        tracing::warn!(terminal_id = %terminal_id, error = %e, "graceful_exit: tab close task failed")
+                        tracing::warn!(terminal_id = %terminal_id, error = %e, "graceful_exit: tab close task failed");
+                        CloseTabResult::Unknown {
+                            detail: format!("the tab close task died: {e}"),
+                        }
                     }
                 }
             })
@@ -664,6 +729,12 @@ impl TerminalManager {
         };
 
         if let Ok(mut map) = self.remote_identities.lock() {
+            map.remove(id);
+        }
+        // Parity with `close` — a graceful close must drop the same per-pane
+        // maps, or a remote pane leaks its entry every time wind-down closes
+        // one (which, unlike the operator close, happens unattended).
+        if let Ok(mut map) = self.remote_panes.lock() {
             map.remove(id);
         }
 

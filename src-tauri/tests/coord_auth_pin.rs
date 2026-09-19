@@ -810,6 +810,12 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("claude_session/trust_gate.rs", "device", 1),
     ("commands/ai_settings.rs", "device", 1),
     ("commands/claims.rs", "session-noop", 1),
+    // `GET /coord/devices/me/drain` (plan
+    // `2026-09-13-drained-runner-never-reaches-idle`): `me` resolves to the
+    // device the JWT is for, the drain row is keyed by device_id, and the
+    // request carries no tenant field — `device` by construction, and it stays
+    // correct however many tenants this device is paired with.
+    ("coord_drain_state.rs", "device", 1),
     ("coord_http.rs", "device", 1),
     ("coord_http.rs", "escalated", 1),
     ("coord_http.rs", "session-noop", 1),
@@ -884,8 +890,16 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// same org as the artifacts that dir produces — and those are the upsert's,
 /// whose tenant is the plan's repo. When Phase 6 resolves that upsert's
 /// tenant, this site moves with it. So `work-owed` 16 -> 17.
+///
+/// Plan `2026-09-13-drained-runner-never-reaches-idle` Phase 3 adds one:
+/// `coord_drain_state.rs`'s `GET /coord/devices/me/drain`. It is `device` and
+/// not an owed class — `me` resolves to the device its own JWT was minted for,
+/// coord's drain row is keyed by device_id, and the request carries no tenant
+/// field for the runner to set or coord to derive. Nothing about it changes
+/// when this device is paired with more tenants, so there is no future phase
+/// for it to owe. So `device` 21 -> 22.
 const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
-    ("device", 21),
+    ("device", 22),
     ("session-noop", 10),
     ("session-owed", 0),
     ("work-owed", 17),
@@ -1043,8 +1057,8 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
         "every scanned defaulting call site should have been classified"
     );
     assert_eq!(
-        sites, 50,
-        "expected 50 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
+        sites, 51,
+        "expected 51 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
          session-scoped ones Phase 5 moved onto the tenant-STATING seam (52 - 12 = 40), plus 1 \
          new work-owed defaulting call site (mcp/plan_library.rs's upstream_get_raw, the \
          body-export forward, which shares upstream_get's qontinui-web base and its \
@@ -1069,7 +1083,10 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
          2026-09-13-coord-publishes-agent-jwts-on-a-redis-channel-fronted-by-an-unauthenticated-ws-firehose \
          Phase 3 then added agent_runtime's credential-door fetch (fetch_agent_credential, \
          session-noop: the path agent_id is the whole key and coord compares the bearer's \
-         device_id to the agent row); 49 to 50. Found {sites}. A change here \
+         device_id to the agent row); 49 to 50. Plan 2026-09-13-drained-runner-never-reaches-idle Phase 3 then added \
+         coord_drain_state.rs's `GET /coord/devices/me/drain` (device: `me` resolves to the \
+         device its own JWT was minted for, the drain row is keyed by device_id, and the \
+         request carries no tenant field for anyone to set or derive); 50 to 51. Found {sites}. A change here \
          is fine — it just has \
          to be deliberate. It goes DOWN when a site adopts \
          `attach_device_auth_for(.., TenantScope)`, and UP only when someone adds a new \

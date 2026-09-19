@@ -211,7 +211,7 @@ pub(crate) struct LocalBindingSet {
 ///    write-back.)
 /// 3. `None` — no source has a usable tenant. Callers must skip the
 ///    request (coord rejects with `400 tenant_id_required`).
-fn resolve_binding_set() -> Option<LocalBindingSet> {
+pub(crate) fn resolve_binding_set() -> Option<LocalBindingSet> {
     // Branch 1 — paired_user.json (v2-migrated view)
     if let Some(s) = qontinui_runner_lib::pair::read_paired_tenant_id_from_disk() {
         if let Ok(default_tenant) = uuid::Uuid::parse_str(s.trim()) {
@@ -1746,13 +1746,21 @@ fn is_false(b: &bool) -> bool {
 /// straight-write field that gates the auditor spawn. Detected via
 /// [`claude_code_probe`] (cached 60s). Failures are reported as
 /// `Err(String)` so the caller can log them; the loop never panics.
-pub async fn heartbeat_to_coord() -> Result<(), String> {
+///
+/// The `Ok` value says what the tick learned about coord's device drain
+/// (plan `2026-09-13-drained-runner-never-reaches-idle`, D2): the register
+/// response's `drain` object, or why no heartbeat was possible. The caller
+/// folds it into [`crate::coord_drain_state`].
+pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatOutcome, String> {
+    use crate::coord_drain_state::HeartbeatOutcome;
     // The register payload is machine-scoped end to end — see
     // `machine_state_publish_allowed`. A secondary has nothing honest to
     // contribute here (the primary keeps `last_seen_at` fresh), so it stays off
     // the wire entirely rather than sending a partial payload.
     if !machine_state_publish_allowed(crate::instance::owns_shared_root_state()) {
-        return Ok(());
+        return Ok(HeartbeatOutcome::NotSent {
+            why: "a secondary instance sends no register payload",
+        });
     }
     let device = match load_device_file() {
         Some(d) => d,
@@ -1761,7 +1769,9 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
                 "fleet::heartbeat: ~/.qontinui/machine.json missing — \
                  run `qontinui_profile device init` to enable fleet visibility. Skipping."
             );
-            return Ok(());
+            return Ok(HeartbeatOutcome::NotEnrolled {
+                why: "~/.qontinui/machine.json is missing",
+            });
         }
     };
 
@@ -1769,7 +1779,9 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
         Ok(id) => id,
         Err(e) => {
             warn!("fleet::heartbeat: machine.json device_id is not a valid UUID ({e}). Skipping.");
-            return Ok(());
+            return Ok(HeartbeatOutcome::NotEnrolled {
+                why: "machine.json device_id is not a UUID",
+            });
         }
     };
 
@@ -1780,7 +1792,9 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
                 "fleet::heartbeat: ~/.qontinui/profiles.json missing or active profile \
                  has no coord_url — no coord to heartbeat to. Skipping."
             );
-            return Ok(());
+            return Ok(HeartbeatOutcome::NotEnrolled {
+                why: "the active profile has no coord_url",
+            });
         }
     };
 
@@ -1788,7 +1802,12 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
         Some(b) => b,
         None => {
             warn_tenant_id_unresolvable_once();
-            return Ok(());
+            // Still a coord device (machine.json + coord URL): coord can hold
+            // it drained, so this is a miss that trends to Unknown unless the
+            // device-JWT `me/drain` read answers — never NotEnrolled.
+            return Ok(HeartbeatOutcome::NotSent {
+                why: "no tenant binding — the register heartbeat was not sent",
+            });
         }
     };
 
@@ -1923,7 +1942,11 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
                 tracing::debug!("fleet::heartbeat: tenant_id write-back non-fatal: {e}");
             }
         }
-        Ok(())
+        // D2: the same body carries this device's drain state. An absent or
+        // unparseable object folds to `Unknown`, never to clear.
+        Ok(HeartbeatOutcome::Registered {
+            drain: crate::coord_drain_state::parse_register_response(&body),
+        })
     } else {
         let body = resp.text().await.unwrap_or_default();
         // Phase 2 of the unknown-tenant plan: coord returns HTTP 400
@@ -2109,14 +2132,19 @@ pub fn spawn_heartbeat() {
                         warn!(
                             "fleet::heartbeat: {e} (consecutive_failures={consecutive_failures})"
                         );
+                        // Three of these in a row make the drain state Unknown.
+                        crate::coord_drain_state::note_heartbeat_failure(&e);
                     }
-                    Ok(()) if consecutive_failures > 0 => {
-                        info!(
-                        "fleet::heartbeat: recovered after {consecutive_failures} failed tick(s)"
-                    );
-                        consecutive_failures = 0;
+                    Ok(outcome) => {
+                        if consecutive_failures > 0 {
+                            info!(
+                                "fleet::heartbeat: recovered after {consecutive_failures} \
+                                 failed tick(s)"
+                            );
+                            consecutive_failures = 0;
+                        }
+                        crate::coord_drain_state::note_heartbeat(outcome).await;
                     }
-                    Ok(()) => {}
                 }
             }
         },

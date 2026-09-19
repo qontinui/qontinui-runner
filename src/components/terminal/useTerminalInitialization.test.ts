@@ -16,6 +16,8 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 import {
   fetchOpenRecords,
+  fetchRestoreSet,
+  mayClaimRecordedZone,
   claimInitForPage,
   buildResumeCmd,
   runVerifiedResume,
@@ -707,5 +709,100 @@ describe("applyDrainSkip (item 1 — the wiring, not just the decision)", () => 
       },
     });
     expect(seen).toContain("terminal_session_clear_restore_pending");
+  });
+});
+
+/**
+ * Plan `2026-09-13-drained-runner-never-reaches-idle`, Phase 3: while coord's
+ * device drain holds, `terminal_session_list_open` withholds the restore set
+ * with a `deferredByDrain` marker. That must never read as "no sessions".
+ */
+describe("fetchRestoreSet — coord device drain", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+  });
+
+  it("surfaces a drain deferral distinctly from an empty restore set", async () => {
+    mockInvoke.mockResolvedValueOnce({
+      success: true,
+      message: "coord has drained this device",
+      data: {
+        sessions: [],
+        deferredByDrain: { state: "drained", reason: "coord has drained this device" },
+      },
+    });
+    const out = await fetchRestoreSet("default");
+    expect(out.records).toEqual([]);
+    expect(out.deferredByDrain).toBe("coord has drained this device");
+  });
+
+  it("falls back to a generic reason when the marker carries none", async () => {
+    mockInvoke.mockResolvedValueOnce({
+      success: true,
+      data: { sessions: [], deferredByDrain: { state: "unknown" } },
+    });
+    expect((await fetchRestoreSet("default")).deferredByDrain).toBe(
+      "deferred by the coord device drain",
+    );
+  });
+
+  it("reports no deferral for a normal (or empty) restore set", async () => {
+    mockInvoke.mockResolvedValueOnce({
+      success: true,
+      data: { sessions: [rec({ claudeSessionId: "A" })] },
+    });
+    const normal = await fetchRestoreSet("default");
+    expect(normal.deferredByDrain).toBeNull();
+    expect(normal.records.map((r) => r.claudeSessionId)).toEqual(["A"]);
+
+    mockInvoke.mockResolvedValueOnce({ success: true, data: { sessions: [] } });
+    const empty = await fetchRestoreSet("default");
+    expect(empty).toEqual({ records: [], deferredByDrain: null });
+  });
+
+  it("keeps fetchOpenRecords' contract: a deferral yields no records", async () => {
+    mockInvoke.mockResolvedValueOnce({
+      success: true,
+      data: { sessions: [], deferredByDrain: { reason: "x" } },
+    });
+    expect(await fetchOpenRecords("default")).toEqual([]);
+  });
+});
+
+describe("mayClaimRecordedZone — drain re-run merges with existing tabs", () => {
+  it("lets a first restore claim any recorded zone", () => {
+    expect(mayClaimRecordedZone(false, 2, "t-new", { 2: "t-operator" })).toBe(true);
+  });
+
+  it("never lets a drain re-run take a zone an operator tab holds", () => {
+    expect(mayClaimRecordedZone(true, 2, "t-new", { 2: "t-operator" })).toBe(false);
+    expect(mayClaimRecordedZone(true, 2, "t-new", {})).toBe(true);
+    expect(mayClaimRecordedZone(true, 2, "t-same", { 2: "t-same" })).toBe(true);
+  });
+
+  it("never claims an unzoned record", () => {
+    expect(mayClaimRecordedZone(false, -1, "t", {})).toBe(false);
+  });
+});
+
+describe("reportTreeReset — drain deferral", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+  });
+
+  it("reports the open-record count as unknown while the drain withholds the set", async () => {
+    mockInvoke.mockImplementation((cmd: unknown) =>
+      cmd === "terminal_session_list_open"
+        ? Promise.resolve({
+            success: true,
+            data: { sessions: [], deferredByDrain: { state: "drained", reason: "x" } },
+          })
+        : Promise.resolve({ success: true, message: null, data: null }),
+    );
+    await reportTreeReset({ mountNumber: 2, pageIds: ["default"] });
+    expect(mockInvoke).toHaveBeenCalledWith(
+      "terminal_report_tree_reset",
+      expect.objectContaining({ mountNumber: 2, openRecordCount: undefined }),
+    );
   });
 });

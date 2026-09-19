@@ -85,6 +85,7 @@ mod constraint_engine;
 mod container;
 mod context;
 mod coord_doctor_cmd;
+mod coord_drain_state;
 mod coord_http;
 mod coord_mcp;
 mod coord_mcp_config;
@@ -105,6 +106,8 @@ mod display;
 mod doctor;
 mod dom_capture;
 mod drain;
+#[cfg(test)]
+mod runner_spawn_sites;
 // `embedded_pg` lives in the LIB crate as of P4 (lib-side consumers need it).
 // Re-bound here as `pub(crate)` so every existing `crate::embedded_pg::...`
 // path in this binary - including mcp_api.rs's /health reporting - keeps
@@ -1566,6 +1569,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             rt.block_on(async {
+                // Plan `2026-09-13-drained-runner-never-reaches-idle` D2: read
+                // this device's coord drain once at boot, before any restore or
+                // resume decides against the not-yet-read (Unknown) state. The
+                // boot resume awaits it; the heartbeat below keeps it fresh.
+                tokio::spawn(coord_drain_state::boot_read());
                 fleet::spawn_heartbeat();
                 // Budget re-assert rides THIS thread, not `fleet-publishers`,
                 // for the same reason the heartbeat does: the publisher
@@ -2366,6 +2374,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::ai_session::close_ai_session,
             commands::ai_session::commit_session_progress,
             commands::ai_session::create_ai_session,
+            coord_drain_state::coord_drain_state_get,
+            commands::operator_doors::operator_run_prompt,
+            commands::operator_doors::operator_run_unified_workflow,
+            commands::operator_doors::operator_execute_inline_workflow,
+            commands::operator_doors::operator_run_composed_workflow,
+            commands::operator_doors::operator_generate_unified_workflow_async,
+            commands::operator_doors::operator_resume_task_run,
+            commands::operator_doors::scheduler_run_task_now,
+            mcp::steward::steward_start,
             commands::ai_session::generate_workflow_from_session,
             commands::ai_session::get_ai_output,
             commands::ai_session::get_ai_session_state,
@@ -4626,6 +4643,17 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // boot-restored tabs; the loop itself waits a boot-settle delay
                 // before its first tick.
                 looping_agent_supervisor::start(app.handle());
+
+                // Wind-down executor (plan
+                // `2026-09-13-drained-runner-never-reaches-idle`, Phase 4):
+                // while coord holds this device DRAINED, close the sessions
+                // that are finished and idle past their grace period with a
+                // graceful `/exit`, so a drained runner actually reaches idle;
+                // on undrain, restart exactly the stewards the drain stopped.
+                // Started after the looping supervisor so the two agree about
+                // which tabs exist, and after the lifecycle store is managed
+                // (it records each outcome there).
+                session::wind_down_executor::start();
 
                 // Session-tracking health check (plan 2026-07-03-runner-
                 // session-tracking-drift-and-guardrails Phase 3 item 2): every

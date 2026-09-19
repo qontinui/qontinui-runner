@@ -9,6 +9,7 @@ import { Wrench, Loader2, AlertCircle, CheckCircle, ChevronDown } from "lucide-r
 import { cn } from "../../lib/utils";
 import { useFixWorkflow } from "../../hooks/useErrorMonitor";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { invokeOperatorDoor, doorError } from "@/lib/operatorDoors";
 
 interface FixErrorsButtonProps {
   /** Task run ID to scope errors to */
@@ -94,10 +95,8 @@ export function FixErrorsButton({
 
       // Execute the workflow inline without saving to the library
       // This prevents cluttering the workflow library with auto-generated fix workflows
-      const runResponse = await tracedFetch(`${getApiBase()}/unified-workflows/execute-inline`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const runReply = await invokeOperatorDoor("operator_execute_inline_workflow", {
+        request: {
           name: (workflow.name as string) || "Fix Application Errors",
           description: (workflow.description as string) || "",
           setup_steps: workflow.setup_steps || [],
@@ -107,20 +106,13 @@ export function FixErrorsButton({
           max_iterations:
             (workflow.settings as Record<string, unknown>)?.max_agentic_iterations || 10,
           targeted_error_ids: workflow.targeted_error_ids || [],
-        }),
+        },
       });
 
-      if (!runResponse.ok) {
-        const errorText = await runResponse.text();
-        let errorMessage = "Failed to run workflow";
-        try {
-          const errorData = JSON.parse(errorText);
-          errorMessage = errorData.error || errorMessage;
-        } catch {
-          errorMessage = errorText || errorMessage;
-        }
+      if (!runReply.ok) {
+        const errorMessage = doorError(runReply.body) || "Failed to run workflow";
         // Handle conflict (duplicate workflow) error specially
-        if (runResponse.status === 409) {
+        if (runReply.status === 409) {
           throw new Error(errorMessage);
         }
         throw new Error(errorMessage);

@@ -523,16 +523,43 @@ pub struct ResumeTaskRunRequest {
 /// 1. Reopening the task if it's not already running
 /// 2. Extracting the workflow ID from the task ID
 /// 3. Starting LoopController to execute the workflow
-pub async fn resume_task_run(
+/// `POST /task-runs/{id}/resume`. An HTTP caller is autonomous (`unknown`)
+/// under coord's device drain; the runner UI calls [`resume_task_run`] through
+/// `operator_resume_task_run`.
+pub async fn resume_task_run_http(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(request): Json<ResumeTaskRunRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    resume_task_run(
+        state,
+        id,
+        request,
+        crate::coord_drain_state::SpawnOrigin::Unknown,
+    )
+    .await
+}
+
+pub async fn resume_task_run(
+    state: Arc<ApiState>,
+    id: String,
+    request: ResumeTaskRunRequest,
+    origin: crate::coord_drain_state::SpawnOrigin,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     use crate::unified_workflow_executor::{
         extract_workflow_id_from_task_id, LoopConfig, LoopController,
     };
 
     info!("Resume task run request: {}", id);
+
+    // Coord's device drain: an autonomous caller is refused before the row is
+    // reopened.
+    if let crate::coord_drain_state::DrainGate::Defer { reason, class } =
+        crate::coord_drain_state::drain_gate_for_work(origin, &format!("resume_task_run:{id}"))
+    {
+        warn!("Resume task run {id} refused — {reason}");
+        return Err((StatusCode::CONFLICT, format!("{}: {reason}", class.code())));
+    }
 
     // Get the task run
     let task_run = state
@@ -2331,10 +2358,17 @@ pub async fn create_ai_session(
     let authz = crate::agent_authorization::authorize_spawn(
         None,
         crate::agent_authorization::SpawnPath::InSessionSubagent,
+        // An HTTP door: autonomous (`unknown`), deferred by the coord device drain.
+        crate::coord_drain_state::SpawnOrigin::Unknown,
     )
     .await;
     if let Some(refusal) = authz.refusal() {
-        return Err((StatusCode::FORBIDDEN, refusal));
+        let status = if authz.is_deferred_by_drain() {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::FORBIDDEN
+        };
+        return Err((status, refusal));
     }
 
     let task_run_id = uuid::Uuid::new_v4().to_string();
@@ -3120,7 +3154,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/task-runs/{id}/auto-continue",
             get(get_task_auto_continue).put(set_task_auto_continue),
         )
-        .route("/task-runs/{id}/resume", post(resume_task_run))
+        .route("/task-runs/{id}/resume", post(resume_task_run_http))
         .route(
             "/task-runs/{id}/generate-summary",
             post(generate_task_summary),

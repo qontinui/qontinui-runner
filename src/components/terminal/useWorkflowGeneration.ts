@@ -8,6 +8,7 @@ import { parsePlanMarkdown, summarizeParsedPlan } from "@/lib/workflow-builder/p
 import { buildPlanWorkflow } from "@/lib/workflow-builder/buildPlanWorkflow";
 import { buildPlanImplementationWorkflow } from "@/lib/workflow-builder/buildPlanImplementationWorkflow";
 import type { CommandResponse } from "./types";
+import { invokeOperatorDoor } from "@/lib/operatorDoors";
 
 interface GenerateWorkflowResponse {
   success: boolean;
@@ -299,10 +300,8 @@ export function useWorkflowGeneration({
           const data = result.data as GenerateWorkflowResponse;
           if (data.workflow) {
             // Auto-execute immediately — skip the preview panel
-            await tracedFetch(`${getApiBase()}/unified-workflows/execute-inline`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(data.workflow),
+            await invokeOperatorDoor("operator_execute_inline_workflow", {
+              request: data.workflow,
             });
             setRightPanelMode(null);
             setNotification({
@@ -337,10 +336,8 @@ export function useWorkflowGeneration({
   const handleExecute = useCallback(async () => {
     if (!generatedWorkflow) return;
     try {
-      await tracedFetch(`${getApiBase()}/unified-workflows/execute-inline`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(generatedWorkflow),
+      await invokeOperatorDoor("operator_execute_inline_workflow", {
+        request: generatedWorkflow,
       });
       setRightPanelMode(null);
       onNavigateToActive?.();
