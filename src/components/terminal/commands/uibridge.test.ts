@@ -61,6 +61,44 @@ describe("callRegistry", () => {
     await expect(callRegistry("test.fail", {})).rejects.toThrow(/zone 99 does not exist/);
   });
 
+  it("rethrows a THROWN handler error untouched — code, cause and identity", async () => {
+    // Its wire contract before binding moved in front of it. Folding the throw
+    // into a `CommandResult` and re-raising a bare `Error(message)` dropped
+    // `.code` / `.cause`; `runRegistryAction` is the arm that folds.
+    const original = Object.assign(new Error("boom"), { code: "E_SPAWN" });
+    register({
+      id: "test.throws",
+      slash: "/throws",
+      label: "Throws",
+      description: "test",
+      paramSchema: {},
+      handler: async () => {
+        throw original;
+      },
+    });
+    await expect(callRegistry("test.throws", {})).rejects.toBe(original);
+    await expect(runRegistryAction("test.throws", {})).resolves.toMatchObject({
+      ok: false,
+      code: "handler-threw",
+      message: "boom",
+    });
+  });
+
+  it("keeps a declared TEXT field's exact string on the direct route", async () => {
+    register({
+      id: "test.text",
+      slash: "/text",
+      label: "Text",
+      description: "test",
+      paramSchema: { command: "string (typed verbatim)", count: "number" },
+      handler: async (args) => ({ ok: true, value: args }),
+    });
+    await expect(callRegistry("test.text", { command: "1.10", count: "2" })).resolves.toEqual({
+      command: "1.10",
+      count: 2,
+    });
+  });
+
   it("falls back to `code` when `message` is absent", async () => {
     register({
       id: "test.fail-code-only",

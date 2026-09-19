@@ -155,6 +155,35 @@ export interface CoercedArgs {
   args: Record<string, unknown>;
   /** One sentence per value that cannot be an argument at all. */
   invalid: string[];
+  /**
+   * Keys the caller SENT whose value was `null` / `undefined`, and which were
+   * therefore dropped from `args` as absent. They still count for the
+   * undeclared-key gate: `{zzz: null}` names a key the action does not have,
+   * and dropping it before the gate looked would answer `✓` over it.
+   */
+  absentKeys: string[];
+}
+
+/**
+ * Fields whose declared type is TEXT — a `paramSchema` sentence that starts
+ * with `string`.
+ *
+ * A caller that NAMES its arguments (a UI Bridge action, `callRegistry`) and
+ * sends a JSON string for one of these meant that exact text. `coerceToken`
+ * turning `"007"` into `7` — which `textArg` then reads back as `"7"` — would
+ * save a profile under a different name or type a different command into a
+ * PTY. So these keep the caller's string. Typed routes are unaffected: there
+ * a token has no declared type until binding reads one, which is why they
+ * coerce.
+ */
+export function textFieldsOf(paramSchema: Record<string, unknown> | undefined): Set<string> {
+  const out = new Set<string>();
+  for (const [k, v] of Object.entries(paramSchema ?? {})) {
+    if (typeof v === "string" && /^string\b/.test(v.trim())) {
+      out.add(k.startsWith(FLAG_PREFIX) ? k.slice(FLAG_PREFIX.length) : k);
+    }
+  }
+  return out;
 }
 
 /**
@@ -199,16 +228,27 @@ export interface CoercedArgs {
  * whole surface is being fixed for. `defineProperty` creates the own data
  * property, so the key reaches the gate like every other undeclared name.
  */
-export function coerceArgValues(raw: unknown): CoercedArgs {
+export function coerceArgValues(
+  raw: unknown,
+  textFields: ReadonlySet<string> = new Set(),
+): CoercedArgs {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
-    return { args: {}, invalid: [`arguments must be an object (got ${describeBag(raw)})`] };
+    return {
+      args: {},
+      invalid: [`arguments must be an object (got ${describeBag(raw)})`],
+      absentKeys: [],
+    };
   }
   const args: Record<string, unknown> = {};
   const invalid: string[] = [];
+  const absentKeys: string[] = [];
   for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
-    if (value === null || value === undefined) continue;
+    if (value === null || value === undefined) {
+      absentKeys.push(key);
+      continue;
+    }
     if (typeof value === "string") {
-      defineArg(args, key, coerceToken(value));
+      defineArg(args, key, textFields.has(key) ? value : coerceToken(value));
       continue;
     }
     if (typeof value === "number" && Number.isFinite(value)) {
@@ -217,7 +257,7 @@ export function coerceArgValues(raw: unknown): CoercedArgs {
     }
     invalid.push(`"${key}" must be text or a number (got ${describeValue(value)})`);
   }
-  return { args, invalid };
+  return { args, invalid, absentKeys };
 }
 
 /**
@@ -245,10 +285,11 @@ function refusalFor(
   args: Record<string, unknown>,
   residue: readonly string[],
   invalid: readonly string[],
+  absentKeys: readonly string[] = [],
 ): string | null {
   if (invalid.length > 0) return `${action.slash}: ${invalid.join("; ")}`;
   const declared = declaredArgNames(action);
-  const undeclared = Object.keys(args)
+  const undeclared = [...new Set([...Object.keys(args), ...absentKeys])]
     .filter((k) => !declared.has(k))
     .sort();
   if (declared.size === 0 && (residue.length > 0 || undeclared.length > 0)) {
@@ -355,7 +396,7 @@ export function bindSchemaBag(
     }
     scalarSource = rest;
   }
-  const coerced = coerceArgValues(scalarSource);
+  const coerced = coerceArgValues(scalarSource, textFieldsOf(paramSchema));
   if (coerced.invalid.length > 0) {
     return { args: coerced.args, refusal: `${label}: ${coerced.invalid.join("; ")}` };
   }
@@ -363,7 +404,9 @@ export function bindSchemaBag(
     if (v === undefined || v === null) continue;
     defineArg(coerced.args, k, v);
   }
-  const undeclared = Object.keys(coerced.args)
+  // `absentKeys` too: a null-valued key is dropped as absent, but it is still
+  // a key the caller named, and an undeclared one must be refused.
+  const undeclared = [...new Set([...Object.keys(coerced.args), ...coerced.absentKeys])]
     .filter((k) => !declared.has(k))
     .sort();
   if (undeclared.length > 0) {
@@ -398,6 +441,7 @@ export function bindCommand(resolution: Resolution, rawInput: string): BoundComm
   let origin: ArgOrigin;
   let invalid: readonly string[] = [];
   let residue: readonly string[] = [];
+  let absentKeys: readonly string[] = [];
 
   switch (resolution.kind) {
     case "slash": {
@@ -420,13 +464,14 @@ export function bindCommand(resolution: Resolution, rawInput: string): BoundComm
       const coerced = coerceArgValues(resolution.modelArgs);
       bag = coerced.args;
       invalid = coerced.invalid;
+      absentKeys = coerced.absentKeys;
       origin = "preset";
       break;
     }
   }
 
   const args = applyDeclaredFlags(bag, rawInput, action, origin);
-  return { action, args, refusal: refusalFor(action, args, residue, invalid) };
+  return { action, args, refusal: refusalFor(action, args, residue, invalid, absentKeys) };
 }
 
 /**
@@ -439,10 +484,10 @@ export function bindCommand(resolution: Resolution, rawInput: string): BoundComm
  * it under its bare name like every other argument.
  */
 export function bindDirect(action: CommandAction, raw: Record<string, unknown>): BoundCommand {
-  const coerced = coerceArgValues(raw);
+  const coerced = coerceArgValues(raw, textFieldsOf(action.paramSchema));
   return {
     action,
     args: coerced.args,
-    refusal: refusalFor(action, coerced.args, [], coerced.invalid),
+    refusal: refusalFor(action, coerced.args, [], coerced.invalid, coerced.absentKeys),
   };
 }

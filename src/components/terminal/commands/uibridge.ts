@@ -69,12 +69,8 @@ export async function runRegistryAction<T = unknown>(
   args: Record<string, unknown>,
   source: ResolverContext["source"] = "uibridge",
 ): Promise<CommandResult<T>> {
-  const action = getById(actionId);
-  if (!action) return { ok: false, code: "unknown-action", message: NOT_FOUND(actionId) };
-  const bound = bindDirect(action, args);
-  if (bound.refusal !== null) return { ok: false, code: "invalid-args", message: bound.refusal };
   try {
-    return (await action.handler(bound.args, { source })) as CommandResult<T>;
+    return await invokeBound<T>(actionId, args, source);
   } catch (err) {
     return {
       ok: false,
@@ -82,6 +78,26 @@ export async function runRegistryAction<T = unknown>(
       message: err instanceof Error ? err.message : String(err),
     };
   }
+}
+
+/**
+ * Bind, then invoke — letting a THROWN handler error propagate untouched.
+ *
+ * Shared by both arms so the binding is written once. `runRegistryAction`
+ * folds a throw into a `CommandResult`; `callRegistry` must not, because its
+ * wire contract (before binding was added here) rethrew the handler's own
+ * error with its `.code`, `.cause` and stack intact.
+ */
+async function invokeBound<T>(
+  actionId: string,
+  args: Record<string, unknown>,
+  source: ResolverContext["source"],
+): Promise<CommandResult<T>> {
+  const action = getById(actionId);
+  if (!action) return { ok: false, code: "unknown-action", message: NOT_FOUND(actionId) };
+  const bound = bindDirect(action, args);
+  if (bound.refusal !== null) return { ok: false, code: "invalid-args", message: bound.refusal };
+  return (await action.handler(bound.args, { source })) as CommandResult<T>;
 }
 
 /**
@@ -105,7 +121,7 @@ export async function callRegistry<T = unknown>(
   actionId: string,
   args: Record<string, unknown>,
 ): Promise<T> {
-  const result = await runRegistryAction<T>(actionId, args);
+  const result = await invokeBound<T>(actionId, args, "uibridge");
   if (!result.ok) {
     throw new Error(result.message ?? result.code);
   }
