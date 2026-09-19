@@ -49,8 +49,6 @@ claude_session/runner.rs | run_claude_session_interactive_with_retry | helper | 
 commands/ai_session.rs | create_ai_session | operator | -
 commands/ai_session.rs | resume_ai_sessions | autonomous | resume_ai_sessions
 commands/config.rs | get_workspace_paths_impl | exempt | only resolves the spawn script's path for display; launches nothing
-commands/productivity.rs | launch_coordinator_session | operator | -
-commands/productivity.rs | spawn_worker_session | autonomous | spawn_worker_session
 commands/session.rs | session_start | operator | -
 commands/terminal.rs | create_terminal_session_backend | helper | create_terminal_session_backend(
 commands/terminal.rs | create_tracked_terminal_session_backend | helper | create_tracked_terminal_session_backend(
