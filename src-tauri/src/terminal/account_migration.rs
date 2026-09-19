@@ -699,6 +699,16 @@ pub fn migrate_session(
     // a false `work_unreported` for a session that merely failed to move.
     // (Coord admits exactly one `spawned → work_*` transition, so that false
     // negative would be irreversible.)
+    //
+    // The lift hands back an OWNED reservation on the continuation's anchor,
+    // taken under the same lock that removed the live row. It is held across
+    // the synchronous respawn below and settled by whichever re-pin arm runs,
+    // so the anchor is never in neither half of the registry and a same-anchor
+    // continuation dispatched during the hop is deferred by P3 rather than
+    // spawned alongside this one. Nothing between here and the `match spawned`
+    // can exit early — no `?`, no `return`; the trust gate's refusal is above —
+    // so the only unhanded exit is a panic, which the permit's RAII drop
+    // covers.
     let carried_continuation =
         crate::agent_runtime::take_continuation_registration(&record.terminal_id);
 
@@ -719,7 +729,7 @@ pub fn migrate_session(
     // the consuming device coord keys the outcome write on. Absent when the
     // session was not a continuation, or when the local device id is unreadable
     // (in which case nothing could report anyway).
-    let carried_gate_identity = carried_continuation.as_ref().and_then(|c| {
+    let carried_gate_identity = carried_continuation.as_ref().and_then(|(c, _reservation)| {
         let gate_id = c.gate_id?;
         let device_id = crate::agent_runtime::load_local_device_id()?;
         Some(crate::commands::terminal::GateIdentity {
@@ -773,11 +783,15 @@ pub fn migrate_session(
         Ok((terminal_id, _coord_session_id)) => {
             // Re-pin the continuation onto the terminal that now hosts it, so
             // the registry's dedup/cap view stays true and the eventual real
-            // exit still reports an outcome.
-            if let Some(carried) = carried_continuation {
+            // exit still reports an outcome. The permit taken by the lift is
+            // handed on here: the live row replaces the reservation under one
+            // lock, so the anchor moves from held-by-permit to
+            // held-by-session with no gap.
+            if let Some((carried, reservation)) = carried_continuation {
                 crate::agent_runtime::restore_continuation_registration(
                     terminal_id.clone(),
                     carried,
+                    reservation,
                 );
             }
             terminal_id
@@ -786,11 +800,14 @@ pub fn migrate_session(
             // The respawn failed and the old PTY is UNTOUCHED — the session is
             // exactly where it was, at its usage-limit prompt. Put the
             // registration back on it so the eventual real exit reports
-            // honestly. The caller emits `skipped` with this error.
-            if let Some(carried) = carried_continuation {
+            // honestly. The caller emits `skipped` with this error. The permit
+            // goes with it — the failed arm settles the reservation exactly
+            // like the successful one, just onto the OLD terminal id.
+            if let Some((carried, reservation)) = carried_continuation {
                 crate::agent_runtime::restore_continuation_registration(
                     record.terminal_id.clone(),
                     carried,
+                    reservation,
                 );
             }
             return Err(e);

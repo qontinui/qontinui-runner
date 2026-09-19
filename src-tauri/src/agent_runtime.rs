@@ -2531,20 +2531,31 @@ struct ContinuationRegistry {
     /// replaces it. Never counted toward P4 — the cap bounds RUNNING sessions,
     /// and a reservation is not one.
     ///
+    /// **The account-migration hop holds its anchor here for the whole
+    /// respawn.** The hop lifts a continuation off its terminal
+    /// ([`take_continuation_registration`]) and respawns `claude` — a
+    /// SYNCHRONOUS call of seconds, not an await — before re-pinning it
+    /// ([`restore_continuation_registration`]). The lift therefore takes an
+    /// OWNED reservation on the anchor in the same critical section that
+    /// removes the live row ([`Self::take_live_reserving_anchor`]), and the
+    /// re-pin settles it, so there is no instant at which this registry
+    /// believes the anchor is free. A same-anchor dispatch arriving inside the
+    /// window reads `Reserved` and is deferred for re-delivery — the same
+    /// answer it would get were the session not migrating. Before that, the
+    /// anchor was in neither half across the hop and such a dispatch passed
+    /// P3 and spawned, leaving TWO live continuation sessions on one anchor:
+    /// the double-spawn the reservation exists to prevent, reached by a route
+    /// the reservation did not cover (plan
+    /// `2026-09-19-the-account-migration-hop-leaves-its-anchor-unheld-so-a-same-anchor-continuation-double-spawns`).
+    ///
     /// **Keyed by anchor, OWNED by token.** A removal matching on the anchor
-    /// string alone lets a caller drop a reservation it never took, and the
-    /// account-migration window is the live instance rather than a
-    /// hypothetical: the hop lifts a continuation off its terminal
-    /// ([`take_continuation_registration`]), respawns `claude` (an await of
-    /// seconds), then re-pins it ([`restore_continuation_registration`]). In
-    /// between, the anchor is in neither half of this registry, so a
-    /// same-anchor dispatch legitimately passes P3 and reserves it — and a
-    /// by-key removal in the re-pin would steal that reservation, leaving the
-    /// restored session and the in-flight dispatch both live on one anchor
-    /// (the double-spawn the reservation exists to prevent) and the in-flight
-    /// dispatch's own later removal free to take a THIRD dispatch's. Carrying
-    /// the token makes every removal a no-op unless the remover holds the
-    /// entry it names.
+    /// string alone lets a caller drop a reservation it never took, and that
+    /// hazard survives the fix above: the re-pin now settles its OWN permit,
+    /// but a by-key removal anywhere would still steal whatever entry
+    /// currently sits under the key — freeing its holder's own later removal
+    /// to take a THIRD dispatch's, and putting two sessions on one anchor by
+    /// the other route. Carrying the token makes every removal a no-op unless
+    /// the remover holds the entry it names.
     pending_anchors: std::collections::HashMap<String, AnchorReservationToken>,
 }
 
@@ -2569,6 +2580,65 @@ impl ContinuationRegistry {
         );
     }
 
+    /// Lift the LIVE entry for `terminal_id` and, when it carried an
+    /// `anchor_key`, RESERVE that anchor — both under the ONE lock acquisition
+    /// this `&mut self` borrow represents.
+    ///
+    /// **The single lock is the whole property.** Removing the live row and
+    /// then reserving the anchor in a second acquisition reopens exactly the
+    /// gap this closes: a same-anchor dispatch scheduled between the two reads
+    /// the anchor as free, passes P3 and spawns, and the migration's re-pin
+    /// then puts a second live session on the same anchor. It is the same
+    /// reason the registry keeps ONE mutex for both halves (see
+    /// [`ContinuationRegistry`]).
+    ///
+    /// Returns the removed [`ContinuationSession`] with the permit that now
+    /// holds its anchor, or `None` when `terminal_id` was not a registered
+    /// continuation (an operator tab).
+    ///
+    /// **`Occupied` is defensive and NOT silent.** P3 makes it unreachable
+    /// today — [`evaluate_continuation_guard`]'s live scan runs before its
+    /// `pending_anchors` arm, so no dispatch can hold a reservation on an
+    /// anchor whose session is live — but this registry must never let one
+    /// caller displace another's token. The foreign entry is left exactly as
+    /// it stands, an [`AnchorReservation::none`] is carried instead, and a
+    /// `warn!` names the anchor so an unreachable state that becomes reachable
+    /// announces itself. The carried `anchor_key` survives that arm because
+    /// [`restore_continuation_registration`] re-pins from the
+    /// [`CarriedContinuation`], never from the permit.
+    fn take_live_reserving_anchor(
+        &mut self,
+        terminal_id: &str,
+    ) -> Option<(ContinuationSession, AnchorReservation)> {
+        let session = self.live.remove(terminal_id)?;
+        // Constructed INSIDE the critical section and returned out of it —
+        // never assigned over a live permit, whose `Drop` would re-lock the
+        // non-reentrant mutex this borrow already holds (the hazard
+        // `evaluate_continuation_guard` documents at length).
+        let reservation = match session.anchor_key.as_deref() {
+            Some(anchor) => match self.pending_anchors.entry(anchor.to_string()) {
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    tracing::warn!(
+                        anchor = %anchor,
+                        terminal_id = %terminal_id,
+                        "continuation lift found the anchor already reserved by another holder — \
+                         leaving that reservation intact and carrying no permit across the hop \
+                         (unreachable under P3; if this fires, the guard's ordering changed)"
+                    );
+                    AnchorReservation::none()
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    let token = next_anchor_reservation_token();
+                    slot.insert(token);
+                    AnchorReservation::owning(anchor.to_string(), token)
+                }
+            },
+            // An anchor-less continuation holds nothing to hold.
+            None => AnchorReservation::none(),
+        };
+        Some((session, reservation))
+    }
+
     /// Drop the [`Self::pending_anchors`] entry `anchor` names — but ONLY if
     /// this registry still holds that exact `token`, i.e. only if the caller is
     /// its owner.
@@ -2581,8 +2651,10 @@ impl ContinuationRegistry {
     /// and the second copy was reachable by no test at all — making it
     /// unconditional failed nothing, while re-opening exactly the
     /// steal-a-foreign-reservation class the token exists to close (see
-    /// [`Self::pending_anchors`] for the account-migration window that makes it
-    /// a live instance rather than a hypothetical). One comparison means
+    /// [`Self::pending_anchors`]). The account-migration hop now settles its
+    /// OWN permit through [`AnchorReservation::handed_to_registry`], so it is
+    /// no longer the standing instance of a by-key steal — the comparison is
+    /// what keeps any future remover from becoming one. One comparison means
     /// `stale_reservation_drop_cannot_steal_a_foreign_reservation` covers both
     /// paths, and making it unconditional fails that test.
     fn release_owned(&mut self, anchor: &str, token: AnchorReservationToken) {
@@ -3183,14 +3255,16 @@ fn evaluate_continuation_guard_live(
 ///
 /// **Touches [`ContinuationRegistry::live`] only — never `pending_anchors`.**
 /// This is the registration path for a caller that holds NO reservation: the
-/// account-migration re-pin ([`restore_continuation_registration`]), and the
-/// unit tests. A by-key removal here would steal the reservation a same-anchor
-/// dispatch legitimately takes during the migration window — see
-/// [`ContinuationRegistry::pending_anchors`] for the sequence. The dispatch
-/// that DOES hold a reservation registers through
-/// [`AnchorReservation::handed_to_registry`] instead, which inserts the live
-/// entry and gives its own permit back under one lock acquisition, so there is
-/// no instant at which a same-anchor dispatch sees neither.
+/// anchor-less arm of the account-migration re-pin
+/// ([`restore_continuation_registration`]), and the unit tests. A by-key
+/// removal here would steal whatever reservation currently sits under the
+/// anchor, which is not this caller's to take — see
+/// [`ContinuationRegistry::pending_anchors`]. Every caller that DOES hold a
+/// reservation registers through [`AnchorReservation::handed_to_registry`]
+/// instead — the dispatch path, and the migrating hop, which now carries an
+/// owned permit across the respawn — because that inserts the live entry and
+/// gives its own permit back under one lock acquisition, so there is no
+/// instant at which a same-anchor dispatch sees neither.
 fn register_continuation_session(
     terminal_id: String,
     anchor_key: Option<String>,
@@ -3247,8 +3321,18 @@ fn release_anchor_reservation(held: Option<(&str, AnchorReservationToken)>) {
 /// held by neither) and [`Self::release`] (the headless arm spawned; that path
 /// never registers, so the anchor goes back the moment the child exists —
 /// headless sessions are outside P3/P4).
+///
+/// **`pub(crate)` for one reason only: to be CARRIED.** The account-migration
+/// hop takes a permit in [`take_continuation_registration`] and hands it to
+/// [`restore_continuation_registration`] (`terminal::account_migration`), and
+/// a module-private type in those `pub(crate)` signatures is
+/// `E0446: private type in public interface`. Everything that gives the permit
+/// meaning stays private to this module — the [`Self::held`] field, the
+/// [`AnchorReservationToken`] inside it, and every constructor — so no caller
+/// outside can mint one, inspect one, or settle one; it can only move it from
+/// the lift to the re-pin, or drop it.
 #[must_use = "dropping the reservation releases the anchor immediately"]
-struct AnchorReservation {
+pub(crate) struct AnchorReservation {
     /// The anchor this reservation owns, with the token that proves the
     /// ownership. `None` holds nothing: an anchor-less continuation, or an
     /// evaluation that took no permit.
@@ -3512,7 +3596,12 @@ fn deregister_exited_continuation(terminal_id: &str) -> Option<ContinuationSessi
 /// `work_unreported` there would be a false negative on the fleet's most routine
 /// interruption, and an irreversible one (coord admits exactly one
 /// `spawned → work_*` move, so the resumed session could never correct it).
-#[derive(Debug, Clone)]
+///
+/// Deliberately NOT `Clone`: the derive had no caller (both production sites
+/// borrow with `as_ref()` and then move), and the permit that now travels
+/// beside it across the hop is a unique RAII capability — a second copy of the
+/// registration would invite a second re-pin the one permit cannot settle.
+#[derive(Debug)]
 pub(crate) struct CarriedContinuation {
     /// The anchor this continuation was spawned for (P3 dedup key).
     pub anchor_key: Option<String>,
@@ -3521,26 +3610,76 @@ pub(crate) struct CarriedContinuation {
 }
 
 /// Lift a continuation's registry entry off `terminal_id` WITHOUT treating the
-/// removal as an exit.
+/// removal as an exit — and WITHOUT ever letting go of its anchor.
 ///
 /// Call this BEFORE closing a PTY you are about to respawn: the entry is gone,
 /// so [`notify_continuation_terminal_exit`] finds nothing and posts no outcome,
 /// and the caller re-pins it onto the new terminal with
 /// [`restore_continuation_registration`]. `None` = this terminal was not a
 /// continuation (an operator tab), and the caller does nothing.
-pub(crate) fn take_continuation_registration(terminal_id: &str) -> Option<CarriedContinuation> {
-    deregister_exited_continuation(terminal_id).map(|s| CarriedContinuation {
-        anchor_key: s.anchor_key,
-        gate_id: s.gate_id,
+///
+/// **The returned [`AnchorReservation`] is the point.** The lift and the
+/// reservation happen under one lock ([`ContinuationRegistry::take_live_reserving_anchor`]),
+/// so the anchor passes straight from the live row to an owned permit with no
+/// instant in between. The caller MUST carry that permit to the re-pin —
+/// dropping it releases the anchor and reopens the window a same-anchor
+/// dispatch double-spawns through; `#[must_use]` makes an accidental drop a
+/// compiler warning. A panic between the two is the one exit the RAII drop is
+/// there to cover, and it is the correct behaviour there: nothing will re-pin.
+pub(crate) fn take_continuation_registration(
+    terminal_id: &str,
+) -> Option<(CarriedContinuation, AnchorReservation)> {
+    let lifted = lock_recover(continuation_sessions(), "continuation_sessions")
+        .take_live_reserving_anchor(terminal_id);
+    lifted.map(|(session, reservation)| {
+        (
+            CarriedContinuation {
+                anchor_key: session.anchor_key,
+                gate_id: session.gate_id,
+            },
+            reservation,
+        )
     })
 }
 
 /// Re-pin a [`CarriedContinuation`] onto a terminal id — the new PTY after a
 /// successful respawn, or the OLD one when the respawn failed (leaving it
 /// registered against a dead terminal is what lets
-/// [`prune_dead_continuations`] report the honest `work_unreported`).
-pub(crate) fn restore_continuation_registration(terminal_id: String, carried: CarriedContinuation) {
-    register_continuation_session(terminal_id, carried.anchor_key, carried.gate_id);
+/// [`prune_dead_continuations`] report the honest `work_unreported`) — and
+/// settle the permit [`take_continuation_registration`] handed out.
+///
+/// **The live row's `anchor_key` is `carried`'s, never the permit's**, and the
+/// two branches exist for exactly that reason.
+/// [`AnchorReservation::handed_to_registry`] derives the row it inserts from
+/// the permit it consumes, so calling it with an
+/// [`AnchorReservation::none`] — the anchor-less case, or the defensive
+/// `Occupied` arm of the lift — would re-pin the session with
+/// `anchor_key: None` and silently destroy its P3 dedup identity: a worse
+/// failure than the window this pair closes. So:
+///
+/// - the permit holds an anchor ⇒ hand it over, which inserts the live row and
+///   releases the pending entry under one lock. The anchor it carries is by
+///   construction the one the lift took off this terminal, so the inserted key
+///   equals `carried.anchor_key`;
+/// - the permit holds nothing ⇒ [`register_continuation_session`] with
+///   `carried.anchor_key`.
+///
+/// No THIRD settle path is added: both arms already existed, and
+/// [`ContinuationRegistry::release_owned`] stays the only remover of a
+/// `pending_anchors` entry, which is the property its own doc claims.
+pub(crate) fn restore_continuation_registration(
+    terminal_id: String,
+    carried: CarriedContinuation,
+    reservation: AnchorReservation,
+) {
+    if reservation.held.is_some() {
+        reservation.handed_to_registry(terminal_id, carried.gate_id);
+    } else {
+        // A permit over nothing: its drop is a no-op, and the anchor the
+        // session actually had lives on `carried`.
+        drop(reservation);
+        register_continuation_session(terminal_id, carried.anchor_key, carried.gate_id);
+    }
 }
 
 /// Default backstop-poll cadence (5 min). Env-tunable via
@@ -13217,6 +13356,21 @@ mod tests {
         clear_continuation_registry();
     }
 
+    /// Every LIVE registry entry sitting on `anchor`, as
+    /// `(terminal_id, anchor_key)`. Two rows here is the double-spawn the
+    /// migration-hop reservation exists to prevent; a row whose `anchor_key`
+    /// is `None` is the D2 failure (a re-pin that dropped the carried key).
+    fn live_on_anchor(anchor: &str) -> Vec<(String, Option<String>)> {
+        continuation_sessions()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .live
+            .values()
+            .filter(|s| s.anchor_key.as_deref() == Some(anchor))
+            .map(|s| (s.terminal_id.clone(), s.anchor_key.clone()))
+            .collect()
+    }
+
     /// Whether the registry currently holds a pending reservation for `anchor`.
     fn anchor_is_reserved(anchor: &str) -> bool {
         continuation_sessions()
@@ -13341,18 +13495,20 @@ mod tests {
         clear_continuation_registry();
     }
 
-    /// The account-migration window, which is the real caller that registers a
-    /// continuation WITHOUT holding a reservation: the hop lifts the live entry
-    /// off the old terminal ([`take_continuation_registration`]), respawns
-    /// `claude` — an await of seconds — and re-pins it
-    /// ([`restore_continuation_registration`]). In between, the anchor is in
-    /// neither half of the registry, so a same-anchor dispatch legitimately
-    /// passes P3 and reserves it. The re-pin must not take that reservation
-    /// with it: it owns no permit for the anchor, and a by-key removal there
-    /// would leave the restored session and the in-flight dispatch both live on
-    /// one anchor AND free the in-flight dispatch's own removal to take a third
-    /// dispatch's. Re-adding `pending_anchors.remove(anchor)` to
-    /// [`register_continuation_session`] fails this test.
+    /// The re-pin must never remove a `pending_anchors` entry it does not own.
+    ///
+    /// The setup that used to demonstrate that — a same-anchor dispatch
+    /// slipping into the migration window and taking the anchor — no longer
+    /// exists: the lift now carries an owned permit across the hop, so that
+    /// dispatch is REFUSED (`DuplicateAnchor(AnchorHolder::Reserved)`) and
+    /// there is no foreign reservation for the re-pin to steal. The property
+    /// is pinned here against a FOREIGN entry planted directly: the re-pin
+    /// settles its own permit and leaves the stranger's alone. Making
+    /// [`ContinuationRegistry::release_owned`] unconditional fails this test.
+    /// (The by-key steal through [`register_continuation_session`] is the
+    /// other route, covered by
+    /// `migration_lift_does_not_displace_a_foreign_reservation`, which is the
+    /// test that takes the permit-less arm.)
     #[test]
     fn migration_repin_cannot_steal_an_in_flight_dispatchs_reservation() {
         let _env_lock = env_lock();
@@ -13369,42 +13525,255 @@ mod tests {
         assert_eq!(verdict, ContinuationGuard::Proceed);
         reservation.handed_to_registry("term-old".to_string(), Some(gate));
 
-        // The migration lifts the registration before closing the old PTY.
-        let carried =
+        // The migration lifts the registration before closing the old PTY —
+        // and the anchor goes straight into an owned reservation.
+        let (carried, permit) =
             take_continuation_registration("term-old").expect("the live entry must be liftable");
         assert!(
-            !anchor_is_reserved(anchor),
-            "the lift leaves the anchor held by neither half — that is the window"
+            anchor_is_reserved(anchor),
+            "the lift must hold the anchor across the hop, not release it"
         );
 
-        // A same-anchor dispatch arrives inside the window and reserves.
-        let (verdict, in_flight) = evaluate_continuation_guard(Some(anchor), &live_all, &calm);
+        // A same-anchor dispatch arrives inside the window. It no longer finds
+        // the anchor free: specifically `Reserved`, not merely "not Proceed"
+        // (AtCap and ThreadPressure are refusals too and would prove nothing
+        // about the anchor).
         assert_eq!(
-            verdict,
-            ContinuationGuard::Proceed,
-            "with the registration lifted, the anchor really is free"
+            guard_verdict(Some(anchor), &live_all, &calm),
+            ContinuationGuard::DuplicateAnchor(AnchorHolder::Reserved),
+            "a same-anchor dispatch inside the migration window must be deferred, not admitted"
         );
-        assert!(anchor_is_reserved(anchor));
 
-        // The respawn lands and the migration re-pins the carried registration.
-        restore_continuation_registration("term-new".to_string(), carried);
+        // Now plant a FOREIGN entry under the same key — the state the token
+        // comparison exists for, reached here without a second dispatch.
+        let foreign_token: AnchorReservationToken = u64::MAX;
+        {
+            let mut registry = continuation_sessions()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            registry
+                .pending_anchors
+                .insert(anchor.to_string(), foreign_token);
+        }
+
+        // The respawn lands and the migration re-pins, settling ITS permit.
+        restore_continuation_registration("term-new".to_string(), carried, permit);
 
         assert!(
             anchor_is_reserved(anchor),
             "the re-pin must not remove a reservation it does not hold"
         );
         assert_eq!(
-            deregister_exited_continuation("term-new")
-                .expect("the continuation is registered against the new terminal")
-                .gate_id,
+            continuation_sessions()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .pending_anchors
+                .get(anchor)
+                .copied(),
+            Some(foreign_token),
+            "the entry left behind must be the FOREIGN one, untouched"
+        );
+        let moved = deregister_exited_continuation("term-new")
+            .expect("the continuation is registered against the new terminal");
+        assert_eq!(
+            moved.gate_id,
             Some(gate),
             "the hop still carries the gate onto the new terminal"
         );
-        // …and the owner is still the one that frees it.
-        drop(in_flight);
+        assert_eq!(
+            moved.anchor_key.as_deref(),
+            Some(anchor),
+            "the hop still carries the anchor onto the new terminal"
+        );
+
+        clear_continuation_registry();
+    }
+
+    /// Plan
+    /// `2026-09-19-the-account-migration-hop-leaves-its-anchor-unheld-so-a-same-anchor-continuation-double-spawns`:
+    /// the anchor a migrating continuation occupies is held CONTINUOUSLY from
+    /// the lift to the re-pin. There is no instant at which the registry
+    /// believes it is free, so a same-anchor dispatch arriving inside the
+    /// respawn window is deferred instead of spawning alongside the migrated
+    /// session.
+    ///
+    /// **This is the regression test, and it fails on `9f798e77b`**: there the
+    /// lift was `deregister_exited_continuation` alone, so the first assertion
+    /// below (`anchor_is_reserved` right after the lift) read `false` —
+    /// observed FAILING before the fix landed. Deleting the
+    /// `pending_anchors` insertion in
+    /// [`ContinuationRegistry::take_live_reserving_anchor`] reproduces that
+    /// failure.
+    #[test]
+    fn migration_hop_holds_the_anchor_across_the_respawn() {
+        let _env_lock = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
+        let live_all = |_id: &str| true;
+        let anchor = "claim:pr:qontinui/x#19";
+        let gate = uuid::Uuid::now_v7();
+
+        // A continuation is live on the anchor — the session about to migrate.
+        register_continuation_session("term-old".to_string(), Some(anchor.into()), Some(gate));
+
+        // 1. The hop lifts it. The anchor must be RESERVED, not free.
+        let (carried, permit) =
+            take_continuation_registration("term-old").expect("the live entry must be liftable");
+        assert!(
+            anchor_is_reserved(anchor),
+            "the lift must reserve the anchor under the same lock that removes the live row — \
+             this is the assertion that fails without the fix"
+        );
+        assert!(
+            live_on_anchor(anchor).is_empty(),
+            "the live row is gone during the hop; the permit is what holds the anchor"
+        );
+        assert_eq!(carried.anchor_key.as_deref(), Some(anchor));
+        assert_eq!(carried.gate_id, Some(gate));
+
+        // 2. A same-anchor continuation dispatched inside the window is
+        //    REFUSED — specifically `Reserved`. `AtCap` / `ThreadPressure` are
+        //    refusals too and would satisfy a weaker assertion while proving
+        //    nothing about the anchor.
+        assert_eq!(
+            guard_verdict(Some(anchor), &live_all, &calm),
+            ContinuationGuard::DuplicateAnchor(AnchorHolder::Reserved),
+            "a same-anchor dispatch inside the migration window must be deferred"
+        );
+
+        // 3. The respawn lands and the hop re-pins onto the new terminal.
+        restore_continuation_registration("term-new".to_string(), carried, permit);
+        assert_eq!(
+            live_on_anchor(anchor),
+            vec![("term-new".to_string(), Some(anchor.to_string()))],
+            "exactly ONE live session on the anchor, and its anchor_key is the carried one \
+             (a `handed_to_registry` on a `none()` permit would register `anchor_key: None`)"
+        );
         assert!(
             !anchor_is_reserved(anchor),
-            "the holder's own drop releases the anchor"
+            "the re-pin settles its own permit — the holder afterwards is the session"
+        );
+        // …and the anchor now reads as held by the LIVE session, not free.
+        assert_eq!(
+            guard_verdict(Some(anchor), &live_all, &calm),
+            ContinuationGuard::DuplicateAnchor(AnchorHolder::Live("term-new".to_string()))
+        );
+
+        clear_continuation_registry();
+    }
+
+    /// The `Err` arm of the same hop: the respawn fails, the OLD PTY is still
+    /// alive, and the registration goes back onto it. The anchor was held for
+    /// the whole failed attempt and ends held by exactly one live session —
+    /// the original terminal — with its `anchor_key` intact.
+    #[test]
+    fn migration_hop_err_arm_repins_the_old_terminal_still_holding_the_anchor() {
+        let _env_lock = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
+        let live_all = |_id: &str| true;
+        let anchor = "unit:u19:phase-err";
+        let gate = uuid::Uuid::now_v7();
+
+        register_continuation_session("term-old".to_string(), Some(anchor.into()), Some(gate));
+        let (carried, permit) =
+            take_continuation_registration("term-old").expect("the live entry must be liftable");
+        assert!(
+            anchor_is_reserved(anchor),
+            "the anchor is held across the attempt, whether or not the respawn succeeds"
+        );
+        assert_eq!(
+            guard_verdict(Some(anchor), &live_all, &calm),
+            ContinuationGuard::DuplicateAnchor(AnchorHolder::Reserved)
+        );
+
+        // `spawn_resumed_pane` returned Err: the old pane is untouched, so the
+        // registration goes straight back onto `term-old`.
+        restore_continuation_registration("term-old".to_string(), carried, permit);
+
+        assert_eq!(
+            live_on_anchor(anchor),
+            vec![("term-old".to_string(), Some(anchor.to_string()))],
+            "the failed hop ends with one live session on the anchor — the original one"
+        );
+        assert!(!anchor_is_reserved(anchor));
+        assert_eq!(
+            deregister_exited_continuation("term-old")
+                .expect("the continuation is registered against the old terminal")
+                .gate_id,
+            Some(gate),
+            "the failed hop still carries the gate, so the eventual real exit reports honestly"
+        );
+
+        clear_continuation_registry();
+    }
+
+    /// The defensive `Occupied` arm of
+    /// [`ContinuationRegistry::take_live_reserving_anchor`]. P3 makes it
+    /// unreachable today — a dispatch cannot reserve an anchor whose session is
+    /// live — so it is reached here by planting a foreign entry directly. Two
+    /// properties, and the second is the one that makes the arm safe rather
+    /// than merely quiet: the lift does NOT displace the stranger's token, and
+    /// the re-pin STILL carries `anchor_key`, because it re-registers from the
+    /// [`CarriedContinuation`] and not from the (empty) permit. Routing that
+    /// branch through `handed_to_registry` instead fails the second assertion
+    /// with `anchor_key: None`; re-adding `pending_anchors.remove(anchor)` to
+    /// [`register_continuation_session`] — the settle path this arm takes —
+    /// fails the third.
+    #[test]
+    fn migration_lift_does_not_displace_a_foreign_reservation() {
+        let _env_lock = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
+        let anchor = "claim:pr:qontinui/x#20";
+        let gate = uuid::Uuid::now_v7();
+
+        register_continuation_session("term-old".to_string(), Some(anchor.into()), Some(gate));
+        let foreign_token: AnchorReservationToken = u64::MAX;
+        {
+            let mut registry = continuation_sessions()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            registry
+                .pending_anchors
+                .insert(anchor.to_string(), foreign_token);
+        }
+
+        let (carried, permit) =
+            take_continuation_registration("term-old").expect("the live entry must be liftable");
+        assert_eq!(
+            continuation_sessions()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .pending_anchors
+                .get(anchor)
+                .copied(),
+            Some(foreign_token),
+            "the lift must not overwrite a reservation another holder owns"
+        );
+
+        restore_continuation_registration("term-new".to_string(), carried, permit);
+        assert_eq!(
+            live_on_anchor(anchor),
+            vec![("term-new".to_string(), Some(anchor.to_string()))],
+            "the Occupied arm carries no permit, so the re-pin must take anchor_key from the \
+             CarriedContinuation — dropping it would silently destroy the P3 dedup identity"
+        );
+        assert_eq!(
+            continuation_sessions()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .pending_anchors
+                .get(anchor)
+                .copied(),
+            Some(foreign_token),
+            "and the re-pin still removes nothing it does not own"
         );
 
         clear_continuation_registry();
@@ -14483,7 +14852,7 @@ mod tests {
         register_continuation_session("term-old".to_string(), Some("anchor-m".into()), Some(gate));
 
         // The migration lifts it before closing the old PTY.
-        let carried = take_continuation_registration("term-old")
+        let (carried, permit) = take_continuation_registration("term-old")
             .expect("a registered continuation must be liftable");
         assert_eq!(carried.gate_id, Some(gate));
         assert_eq!(carried.anchor_key.as_deref(), Some("anchor-m"));
@@ -14494,7 +14863,7 @@ mod tests {
         );
 
         // Re-pinned onto the new terminal, gate intact.
-        restore_continuation_registration("term-new".to_string(), carried);
+        restore_continuation_registration("term-new".to_string(), carried, permit);
         let moved = deregister_exited_continuation("term-new")
             .expect("the continuation must now be registered against the new terminal");
         assert_eq!(
