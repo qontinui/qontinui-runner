@@ -145,13 +145,18 @@ if (Test-Path -LiteralPath $log) {
 }
 
 # Survivors: every process created after the launch. Printed in full so the
-# next hang names its holder; only the product images are stopped.
+# next hang names its holder; only the product image is stopped. Taken after a
+# settle, because Stop-Process returns before the target is gone: on run
+# 35430735468 the census ran 130 ms after contract-smoke's own tree-kill and
+# listed the runner it had just stopped, with its WebView2 children, as alive.
+$settleSec = 3
+Start-Sleep -Seconds $settleSec
 $survivors = @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue |
     Where-Object { $_.CreationDate -and $_.CreationDate -gt $launchedAt -and $_.ProcessId -ne $PID })
 if ($survivors.Count -eq 0) {
-    Write-Host "invoke-ps51-detached: no process created since launch survives."
+    Write-Host "invoke-ps51-detached: no process created since launch survives ${settleSec}s after the host exited."
 } else {
-    Write-Host "invoke-ps51-detached: $($survivors.Count) process(es) created since launch still alive:"
+    Write-Host "invoke-ps51-detached: $($survivors.Count) process(es) created since launch still alive ${settleSec}s after the host exited:"
     foreach ($s in $survivors) {
         Write-Host ("  pid {0,-6} ppid {1,-6} {2}  created {3:HH:mm:ss}" -f $s.ProcessId, $s.ParentProcessId, $s.Name, $s.CreationDate)
     }
