@@ -21,7 +21,7 @@
  * passed` line two minutes before the kill is ONE BINARY OF 29, not the suite:
  * the largest binary (9905 tests) started at 02:58:22, was still emitting `ok`
  * lines at 03:00:25, and never reported at all. The run was ~62% complete
- * (7112 rows against a suite of 11,486).
+ * (7112 rows recorded against a suite of 11,486 by its `test result:` lines).
  * That is exactly the state this script must describe honestly rather than
  * summarising as a pass — see the all-`ok`-and-still-failed arm below.
  *
@@ -151,7 +151,13 @@ export function describeLog(text) {
       lineCount: 0,
     };
   }
-  const lines = text.split("\n").map(normalizeLogLine);
+  // Drop the trailing "" that `split` yields for a file ending in a newline,
+  // so `lineCount` is the number of LINES rather than of separators: a 2-line
+  // file used to report 3. `empty` below still answers the empty case, which
+  // `lineCount` alone cannot.
+  const raw = text.split("\n");
+  if (raw.length > 1 && raw[raw.length - 1] === "") raw.pop();
+  const lines = raw.map(normalizeLogLine);
   const { binaries, anyFailed } = tallyTestResults(lines);
   return {
     readable: true,

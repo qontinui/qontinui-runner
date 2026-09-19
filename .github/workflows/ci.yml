@@ -155,10 +155,16 @@ jobs:
     # Compute from 110, not 90. Attempt 1 of run 35043646051 ran 100m43s with
     # the 90-min step, i.e. 10m43s outside it, so the same shape under the split
     # reaches ~121m. The historical max windows job (110.6m) reaches ~130m ONLY
-    # IF its Rust step consumed the full 90 — an assumption, not a measurement,
-    # and this same block records max(success) 82 for that step, under which it
-    # is ~139m. Every one of those still fits under 150, which is why this cap
-    # is NOT changed here. Re-sizing against a re-measured window is Phase 5 of
+    # IF its Rust step consumed the full 90 — an assumption, not a measurement.
+    # Substituting the step's own max(success) of 82 gives ~139m instead, but
+    # that figure is ALSO an assumption and a weaker one: 82 is recorded in the
+    # `Build Rust tests` step comment below, from "44 windows samples after
+    # 2026-09-08", while the 110.6m job max above is from "90 sampled
+    # successful job runs, 2026-08-08..08-20" — two disjoint windows, so the
+    # two numbers were never measured on the same run. Every one of ~121m,
+    # ~130m and ~139m still fits under 150, which is why this cap is NOT
+    # changed here; Phase 5 should re-measure both ends on one window rather
+    # than combining these. Re-sizing against a re-measured window is Phase 5 of
     # 2026-09-17-the-windows-test-gate-is-a-90-minute-build-wearing-a-test-shaped-bound.
     timeout-minutes: 150
 
@@ -986,8 +992,13 @@ jobs:
       # ⚠️ READ WHAT THOSE 7112 ROWS ACTUALLY ARE — this comment said "a fully
       # passing suite" until a review counted them, and the count refutes it.
       # The full suite is 11,486 tests across 29 binaries — 11,368 passed plus
-      # 118 ignored, and the denominator has to be the count of rows this
-      # ingest EMITS, which includes `skip`. 7112 is **61.9%** of it. Only 1409
+      # 118 ignored, as its own `test result:` lines count it, and the
+      # `ignored` half belongs in the denominator because the ingest emits a
+      # `skip` row for each. 7112 is **61.9%** of it. (That denominator is the
+      # `test result:` arithmetic, not literally the emitted row count: the
+      # parser de-duplicates ids across binaries, so a review measured the
+      # emitted sets at 11,485 and 7111 against the ingest's own `11486/11486`
+      # and `7112/7112` lines. ±1 changes none of the figures below.) Only 1409
       # of those rows came from binaries that had reported a `test result:`;
       # the other 5703 came from the 9905-test binary that was still running
       # when the clock killed it. So coord did not receive a green suite — it
@@ -1004,10 +1015,19 @@ jobs:
       # makes the DISAGREEMENT loud (`::error` + job summary) when the gating
       # step did not succeed. It does NOT detect truncation — nothing here
       # knows how many tests the suite has — and the durable stamp is a
-      # three-repo change tracked as that plan's Phase 4b. TRUNCATION ITSELF IS
-      # A SEPARATE, UNCLOSED GAP, recorded as plan-library follow-up
+      # three-repo change tracked as that plan's Phase 4b, recorded as
+      # follow-up edge `953d8210-b326-4628-884d-3040412538b8`. TRUNCATION
+      # ITSELF IS A SEPARATE, UNCLOSED GAP, recorded as follow-up edge
       # `eff25606-d3e0-4307-9e9c-3ddbceb2b0aa`; do not read this flag as
       # covering it.
+      #
+      # Both are EDGE ids on plan artifact `ae8b3f39-1bc6-47ab-adbf-2fe607462b3c`,
+      # NOT artifact ids — read them back at
+      # `GET /api/v1/plan-library/followups` (they key on `edge_id`, with
+      # `to_id: null` because an unowned follow-up is the point). A review of
+      # this change probed `GET /api/v1/plan-library/<edge id>` — the ARTIFACT
+      # route — got a 404 and reported the ids as unresolvable, so the door is
+      # named here to stop the next reader repeating it.
       #
       # The flag does NOT change the payload — verified at source, coord's
       # `ResultIngestRequest` has no field that could carry a gating outcome and
@@ -1039,7 +1059,7 @@ jobs:
           #
           # Empty, not a literal host: the script reads
           # `process.env.COORD_HTTP_URL || DEFAULT_COORD_URL`
-          # (scripts/ci-test-results-ingest.mjs:321), so "" falls back to its
+          # (`DEFAULT_COORD_URL` in that script), so "" falls back to its
           # documented default — the same "empty means unset" contract
           # `Unpoison` itself relies on.
           COORD_HTTP_URL: ""

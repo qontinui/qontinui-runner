@@ -292,8 +292,14 @@ fn every_consumer_of_a_step_outcome_names_an_id_that_exists() {
     // expression naming an unknown step is not an error, it expands to the
     // EMPTY STRING — so a typo in a CONSUMER is silent, and every downstream
     // arm then reads UNKNOWN forever while every other test in this file stays
-    // green. Scan the whole job rather than the three consumers known today,
-    // so a fourth added later is covered without editing this test.
+    // green.
+    //
+    // EVERY string value of every step, recursively — not just `run:` and
+    // `if:`. GitHub evaluates the `steps` context in `env:`, `with:`, `name:`
+    // and `continue-on-error:` too, and a review demonstrated the gap by
+    // moving a typo'd reference into a step-level `env:` value, where a
+    // two-key scan found nothing. A comment promising to cover "a fourth
+    // consumer added later" has to actually cover one.
     let doc = ci_workflow();
     let steps = job_steps(&doc, "test");
 
@@ -306,22 +312,66 @@ fn every_consumer_of_a_step_outcome_names_an_id_that_exists() {
     let re = regex::Regex::new(r"steps\.([A-Za-z_][A-Za-z0-9_-]*)\.")
         .expect("the reference pattern compiles");
 
+    /// Every string leaf of a YAML value, with `run:` bodies stripped of their
+    /// shell comment lines — the same command-vs-comment distinction
+    /// `command_lines` exists for, so a comment naming a retired id cannot red
+    /// the build for no reason.
+    fn string_leaves(value: &serde_yaml::Value, key: Option<&str>, out: &mut Vec<String>) {
+        match value {
+            serde_yaml::Value::String(text) => {
+                if key == Some("run") {
+                    out.push(
+                        text.lines()
+                            .filter(|l| !l.trim_start().starts_with('#'))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    );
+                } else {
+                    out.push(text.clone());
+                }
+            }
+            serde_yaml::Value::Sequence(items) => {
+                for item in items {
+                    string_leaves(item, None, out);
+                }
+            }
+            serde_yaml::Value::Mapping(map) => {
+                for (k, v) in map {
+                    string_leaves(v, k.as_str(), out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     let mut referenced: Vec<String> = Vec::new();
     for step in &steps {
-        for key in ["run", "if"] {
-            if let Some(text) = step.get(key).and_then(|v| v.as_str()) {
-                for cap in re.captures_iter(text) {
-                    referenced.push(cap[1].to_string());
-                }
+        let mut leaves = Vec::new();
+        string_leaves(step, None, &mut leaves);
+        for text in &leaves {
+            for cap in re.captures_iter(text) {
+                referenced.push(cap[1].to_string());
             }
         }
     }
+
+    // A COUNT, not merely non-emptiness. `!is_empty()` would not notice the
+    // scan silently dropping four of the five references it should see, which
+    // is exactly the failure a two-key scan had.
     assert!(
-        !referenced.is_empty(),
-        "no `steps.<id>.` reference found anywhere in job `test` — this test \
-         would then be vacuous, and the split's three consumers should all \
-         match it"
+        referenced.len() >= 5,
+        "expected at least the 5 `steps.<id>.` references the split introduces \
+         (summariser x2, sampler x2, ingest x1) — found {}: {referenced:?}. A \
+         scan that silently stops seeing them is vacuous in the way this test \
+         exists to prevent.",
+        referenced.len()
     );
+    for id in ["build_rust_tests", "run_rust_tests"] {
+        assert!(
+            referenced.iter().any(|r| r == id),
+            "the scan must see at least one `steps.{id}.` reference; it found {referenced:?}"
+        );
+    }
 
     for id in &referenced {
         assert!(

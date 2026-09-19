@@ -50,9 +50,19 @@
  * WHAT IT DOES NOT CATCH, stated because the motivating incident is subtler
  * than it first reads. On run 35043646051 attempt 1 this script recorded 7112
  * rows for a job GitHub called `failure`. Those rows are not "a passing suite":
- * the full suite is **11,486** tests across 29 binaries (11,368 passed + 118
- * ignored — count the rows this script EMITS, which include `skip`, not the
- * `passed` sum), so 7112 is **61.9%** of it. Only **1409** of those rows came
+ * the full suite is **11,486** tests across 29 binaries — 11,368 passed + 118
+ * ignored, as its own `test result:` lines count it, and the `ignored` half
+ * matters because this script emits a `skip` row for each. So 7112 is
+ * **61.9%** of it.
+ *
+ * Note the denominator is the `test result:` ARITHMETIC, not literally the row
+ * count this script emits, and the two differ by a hair: `parseTestOutcomes`
+ * de-duplicates by `test_id` across binaries (worst outcome wins), and attempt
+ * 1's log carries ~100 ids that appear in more than one binary. A review
+ * measured the emitted sets at 11,485 and 7111 against the ingest's own
+ * `11486/11486` and `7112/7112` log lines. Nothing here turns on ±1 — 61.9%
+ * and 4374 are unchanged to the stated precision — but say which quantity is
+ * meant rather than eliding the difference. Only **1409** of those rows came
  * from binaries that had reported a `test result:`; the other **5703** came
  * from the one binary still executing when the clock killed it, and 4374 tests
  * never ran. coord therefore received a **silently truncated** row set, in a
@@ -60,8 +70,13 @@
  *
  * This flag announces that the gate did not succeed; it cannot detect
  * truncation, because nothing here knows how many tests the suite has. That is
- * a separate, UNCLOSED gap, recorded as plan-library follow-up
+ * a separate, UNCLOSED gap, recorded as plan-library follow-up EDGE
  * `eff25606-d3e0-4307-9e9c-3ddbceb2b0aa` rather than implied to be covered.
+ * That is an EDGE id on plan artifact `ae8b3f39-1bc6-47ab-adbf-2fe607462b3c`,
+ * not an artifact id: read it back at `GET /api/v1/plan-library/followups`
+ * (keyed `edge_id`, `to_id: null`). `GET /api/v1/plan-library/<edge id>` is
+ * the ARTIFACT route and correctly 404s — a review of this change probed it
+ * and reported the id unresolvable, so the door is named here.
  *
  * WHY IT CANNOT DO MORE, verified at source on `qontinui-coord` `origin/main`
  * 2026-09-19 (`crates/coord/src/test_run_effects.rs`). There is nowhere for a
