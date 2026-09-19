@@ -41,6 +41,7 @@ import { SuggestionsProvider } from "./suggestions";
 import { StatusStrip } from "./StatusStrip";
 import { ConductorStatusStrip } from "./ConductorStatusStrip";
 import { UnzonedChip } from "./UnzonedChip";
+import { HiddenWorkersChip } from "./HiddenWorkersChip";
 import { pickLayout } from "./useZoneLayout";
 import { buildCreatePlainTerminalAction } from "./createPlainTerminalAction";
 import {
@@ -154,6 +155,9 @@ function TerminalPageInner({
     updateTab,
     reconnectToExistingSessions,
     createPlanTab,
+    adoptWorkerTab,
+    hiddenWorkers,
+    restoreHiddenWorkers,
     pageId,
     zoneLayout,
     terminalRefs,
@@ -1022,6 +1026,7 @@ function TerminalPageInner({
     reconnectToExistingSessions,
     createTerminal,
     createPlanTab,
+    adoptWorkerTab,
     setInitialized,
     updateTab,
     zoneLayout,
@@ -1485,6 +1490,12 @@ function TerminalPageInner({
         <UnzonedChip
           unassignedCount={zoneLayout.unassignedTabIds.length}
           onOpen={() => dispatch({ type: "SET_SHOW_CONTROL_PANEL", payload: true })}
+        />
+        {/* The way back from closing a Conductor worker's cell. Renders
+            nothing when no worker view is hidden. */}
+        <HiddenWorkersChip
+          hidden={hiddenWorkers}
+          onRestoreAll={() => void restoreHiddenWorkers()}
         />
 
         {showDocFinder && (

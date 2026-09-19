@@ -39,9 +39,40 @@ interface CommandResponse {
 
 const STORAGE_KEY = "qontinui-ai-active-session";
 
-export function useAiSession() {
+export interface UseAiSessionOptions {
+  /**
+   * Attach to an EXISTING session by task run id instead of owning the
+   * operator's "active AI session" slot. Set by views that observe a session
+   * somebody else created — a Conductor worker's grid cell
+   * (`WorkerSessionCell`) — where the session id is a fact of the tab, not a
+   * choice to remember. When set, the hook never reads or writes the
+   * `qontinui-ai-active-session` storage key (so many cells can coexist
+   * without fighting over it), and switches to the id on mount and whenever
+   * it changes.
+   */
+  attachTo?: string | null;
+}
+
+/** Outcome of `sendMessage`, so a caller can show queued-vs-sent honestly. */
+export type SendMessageOutcome =
+  | { ok: true; queued: boolean; state: AiSessionState | null }
+  | { ok: false; error: string };
+
+/**
+ * How the last read of the attached session's state/history went. `pending`
+ * until the first read settles; `failed` carries `lastReadError`. A view must
+ * render `failed` as UNKNOWN, never as "closed" or as an empty transcript.
+ */
+export type SessionReadStatus = "pending" | "ok" | "failed";
+
+export function useAiSession(options: UseAiSessionOptions = {}) {
+  const attachTo = options.attachTo ?? null;
+  // Persistence belongs to the operator's own session slot only.
+  const persist = attachTo === null;
   const [taskRunId, setTaskRunId] = useState<string | null>(null);
   const [sessionState, setSessionState] = useState<AiSessionState>("disconnected");
+  const [readStatus, setReadStatus] = useState<SessionReadStatus>("pending");
+  const [lastReadError, setLastReadError] = useState<string | null>(null);
   const [messages, setMessages] = useState<AiMessage[]>([]);
   const [streamingContent, setStreamingContent] = useState("");
   const [streamingDroppedChars, setStreamingDroppedChars] = useState(0);
@@ -138,6 +169,9 @@ export function useAiSession() {
 
   // Restore session from localStorage on mount
   useEffect(() => {
+    // An attached view observes a session it was handed; the operator's
+    // remembered slot is not its business.
+    if (!persist) return;
     if (restoredRef.current) return;
     restoredRef.current = true;
 
@@ -238,7 +272,7 @@ export function useAiSession() {
         restorePollRef.current = null;
       }
     };
-  }, []);
+  }, [persist]);
 
   // Listen to Tauri events
   useEffect(() => {
@@ -305,6 +339,10 @@ export function useAiSession() {
       // Only process events for our session
       if (!taskRunIdRef.current || eventTaskRunId !== taskRunIdRef.current) return;
 
+      // A live state event is a fresh, authoritative read of the session.
+      setReadStatus("ok");
+      setLastReadError(null);
+
       // Flush streaming buffer on transition to ready or closed.
       // Reading `.text` folds every pending append, so a batched flush that
       // hasn't fired yet can never drop the tail of the response.
@@ -345,43 +383,89 @@ export function useAiSession() {
       // Set the new session
       setTaskRunId(newTaskRunId);
       taskRunIdRef.current = newTaskRunId; // Sync ref immediately
-      try {
-        instanceStorage.setItem(STORAGE_KEY, newTaskRunId);
-      } catch {
-        // Ignore storage errors
+      setReadStatus("pending");
+      setLastReadError(null);
+      if (persist) {
+        try {
+          instanceStorage.setItem(STORAGE_KEY, newTaskRunId);
+        } catch {
+          // Ignore storage errors
+        }
       }
 
-      // Check if session has a live CLI process
+      // Check if session has a live CLI process. A failed read is recorded as
+      // such (`readStatus: "failed"`) rather than rendered as "closed": a
+      // session whose state could not be read is UNKNOWN, not stopped.
+      //
+      // Every write below is guarded on `taskRunIdRef`, not just the status
+      // pair at the end: an `attachTo` change from A to B starts switch(B)
+      // while switch(A) is still awaiting its IPC, and an unguarded
+      // `setSessionState` / `setMessages` from A's tail landed AFTER B's,
+      // leaving the cell showing B's identity with A's state and transcript.
+      let readError: string | null = null;
+      let resolvedState: AiSessionState = "closed";
       try {
         const stateResponse = await invoke<CommandResponse>("get_ai_session_state", {
           taskRunId: newTaskRunId,
         });
         const state = stateResponse.data?.state as string | undefined;
         if (state && state !== "not_found" && state !== "closed") {
-          setSessionState(state as AiSessionState);
+          resolvedState = state as AiSessionState;
+        } else if (state) {
+          // Read succeeded: no live process — show as stopped/historical
+          resolvedState = "closed";
         } else {
-          // No live process — show as stopped/historical
-          setSessionState("closed");
+          readError = stateResponse.message
+            ? `state read failed: ${stateResponse.message}`
+            : "state read returned no state";
         }
-      } catch {
-        setSessionState("closed");
+      } catch (e) {
+        readError = `state read failed: ${e instanceof Error ? e.message : String(e)}`;
       }
+      if (taskRunIdRef.current !== newTaskRunId) return;
+      setSessionState(resolvedState);
 
       // Load messages from DB
+      let parsedMessages: AiMessage[] | null = null;
       try {
         const outputResponse = await invoke<CommandResponse>("get_ai_output", {
           taskRunId: newTaskRunId,
         });
         if (outputResponse.success && outputResponse.data?.output_log) {
-          const parsed = parseOutputLog(outputResponse.data.output_log as string);
-          setMessages(parsed);
+          parsedMessages = parseOutputLog(outputResponse.data.output_log as string);
+        } else if (!outputResponse.success) {
+          readError ??= `history read failed: ${outputResponse.message ?? "unknown error"}`;
         }
       } catch (e) {
         console.error("[useAiSession] Failed to load session messages:", e);
+        readError ??= `history read failed: ${e instanceof Error ? e.message : String(e)}`;
       }
+
+      // Only the session still being observed may settle the read; a
+      // switch that raced past this one owns the transcript and status now.
+      if (taskRunIdRef.current !== newTaskRunId) return;
+      if (parsedMessages) setMessages(parsedMessages);
+      setLastReadError(readError);
+      setReadStatus(readError ? "failed" : "ok");
     },
-    [resetStreaming],
+    [resetStreaming, persist],
   );
+
+  // Attached mode: follow `attachTo` on mount and on change. The switch is
+  // an IPC round-trip that settles in later microtasks; it is started off the
+  // effect body so no state is written synchronously during the effect, and
+  // a change of `attachTo` before it starts cancels the stale start (a switch
+  // that already started guards its own tail on `taskRunIdRef`).
+  useEffect(() => {
+    if (!attachTo) return;
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (!cancelled) void switchSession(attachTo);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [attachTo, switchSession]);
 
   const createSession = useCallback(
     async (taskName?: string) => {
@@ -399,10 +483,12 @@ export function useAiSession() {
           sessionStateRef.current = state;
           setMessages([]);
           resetStreaming();
-          try {
-            instanceStorage.setItem(STORAGE_KEY, newId);
-          } catch {
-            // Ignore storage errors
+          if (persist) {
+            try {
+              instanceStorage.setItem(STORAGE_KEY, newId);
+            } catch {
+              // Ignore storage errors
+            }
           }
           return newId;
         }
@@ -412,15 +498,18 @@ export function useAiSession() {
         return null;
       }
     },
-    [resetStreaming],
+    [resetStreaming, persist],
   );
 
   const sendMessage = useCallback(
-    async (content: string) => {
+    async (content: string): Promise<SendMessageOutcome> => {
       // Use ref to get the latest taskRunId — avoids stale closure when called
       // immediately after createSession (React state update hasn't flushed yet)
       const currentTaskRunId = taskRunIdRef.current;
-      if (!currentTaskRunId || sessionStateRef.current === "restoring") return;
+      if (!currentTaskRunId) return { ok: false, error: "no session attached" };
+      if (sessionStateRef.current === "restoring") {
+        return { ok: false, error: "session is still being restored" };
+      }
 
       // Retire any response still in flight BEFORE the user's message, so an
       // interrupted turn keeps its partial text and its retention-cap record
@@ -440,11 +529,20 @@ export function useAiSession() {
           message: content,
         });
 
-        if (response.data?.state) {
-          setSessionState(response.data.state as AiSessionState);
+        const state = (response.data?.state as AiSessionState | undefined) ?? null;
+        if (state) {
+          setSessionState(state);
         }
+        if (!response.success) {
+          return { ok: false, error: response.message ?? "send refused" };
+        }
+        // `send_user_message` reports `queued: true` when the session was
+        // mid-turn and parked the message for delivery after the turn ends
+        // (`ClaudeSession::send_user_message`); absent means sent now.
+        return { ok: true, queued: response.data?.queued === true, state };
       } catch (e) {
         console.error("[useAiSession] Failed to send message:", e);
+        return { ok: false, error: e instanceof Error ? e.message : String(e) };
       }
     },
     [commitStreamingBuffer],
@@ -464,11 +562,11 @@ export function useAiSession() {
     try {
       await invoke<CommandResponse>("close_ai_session", { taskRunId });
       setSessionState("closed");
-      instanceStorage.removeItem(STORAGE_KEY);
+      if (persist) instanceStorage.removeItem(STORAGE_KEY);
     } catch (e) {
       console.error("[useAiSession] Failed to close:", e);
     }
-  }, [taskRunId]);
+  }, [taskRunId, persist]);
 
   const rename = useCallback(
     async (name: string) => {
@@ -532,12 +630,21 @@ export function useAiSession() {
     resetStreaming();
     setIsGeneratingWorkflow(false);
     setToolActivity(null);
-    instanceStorage.removeItem(STORAGE_KEY);
-  }, [resetStreaming]);
+    setReadStatus("pending");
+    setLastReadError(null);
+    if (persist) instanceStorage.removeItem(STORAGE_KEY);
+  }, [resetStreaming, persist]);
 
   return {
     taskRunId,
     sessionState,
+    /**
+     * Whether `sessionState` / `messages` rest on a read that actually
+     * succeeded. `failed` means the session is UNKNOWN, whatever
+     * `sessionState` says; `lastReadError` names the failure.
+     */
+    readStatus,
+    lastReadError,
     messages,
     /**
      * Full retained text of the in-flight response. Updated on a coalesced

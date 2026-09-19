@@ -75,6 +75,9 @@ const STREAMING_CONSUMERS = [
   "../../pages/specs/SpecChatPanel.tsx",
   "../../pages/ui-bridge-integration/HookGenerationPanel.tsx",
   "../../pages/project-explainer/ProjectExplainerPage.tsx",
+  // Phase 2b of `2026-09-12-consolidate-local-orchestration-onto-conductor`:
+  // the grid cell for a Conductor worker renders the in-flight tail too.
+  "../terminal/WorkerSessionCell.tsx",
 ] as const;
 
 describe("streaming consumers all render through StreamingMessageView", () => {

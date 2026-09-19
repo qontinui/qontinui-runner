@@ -20,6 +20,7 @@ import {
   type ShellIntegrationEvent,
 } from "./TerminalInstance";
 import { PlanViewer } from "./PlanViewer";
+import { WorkerSessionCell } from "./WorkerSessionCell";
 import { SuggestionChip } from "./suggestions";
 import { ZoneHoverActions } from "./ZoneHoverActions";
 import type { LayoutPreset } from "./useZoneLayout";
@@ -558,8 +559,11 @@ function ZoneGridInner({
     [tabs, assignments, isFlowMode, nearViewport],
   );
 
+  // A Conductor worker's tab (`sessionBacked`) has no PTY and no scrollback
+  // to keep warm, so it never takes the hidden mount — an offscreen
+  // `TerminalInstance` would attach to a terminal id that names no process.
   const unassignedTerminals = tabs.filter(
-    (t) => tabClassification.get(t.id) === "hidden" && t.type !== "plan",
+    (t) => tabClassification.get(t.id) === "hidden" && t.type !== "plan" && !t.sessionBacked,
   );
 
   const renderHiddenTabs = (extraTabs: TerminalTab[]) =>
@@ -676,6 +680,12 @@ function ZoneGridInner({
             >
               {zoneTab.type === "plan" && zoneTab.planFilePath ? (
                 <PlanViewer filePath={zoneTab.planFilePath} visible={isVisible} />
+              ) : zoneTab.sessionBacked && zoneTab.taskRunId ? (
+                <WorkerSessionCell
+                  tab={zoneTab}
+                  taskRunId={zoneTab.taskRunId}
+                  visible={isVisible}
+                />
               ) : (
                 <TerminalInstance
                   ref={ref}
@@ -1583,7 +1593,10 @@ function ZoneCellInner({
                   the hidden mount (renderHiddenTabs) owns unassigned tabs. This
                   keeps the dual-mount race impossible (exactly-one-or-zero owner
                   per tab) that would otherwise evict UI Bridge registrations. */}
-              {shouldMountInstance && instanceHandlers && (
+              {shouldMountInstance && tab.sessionBacked && tab.taskRunId && (
+                <WorkerSessionCell tab={tab} taskRunId={tab.taskRunId} visible={!showCompactCard} />
+              )}
+              {shouldMountInstance && !tab.sessionBacked && instanceHandlers && (
                 <TerminalInstance
                   ref={terminalRefs.get(tab.id)}
                   terminalId={tab.id}
