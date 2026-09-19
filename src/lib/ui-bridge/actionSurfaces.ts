@@ -745,7 +745,7 @@ export function scanActionSurfaces(text: string, file: string): ActionSurface[] 
               "element custom action is not written inline — its handler cannot be enumerated; write the entry as an object literal",
           });
         }
-      } else if (name === "actions" && ts.isCallExpression(node.initializer)) {
+      } else if (name === "actions" && ts.isCallExpression(unwrap(node.initializer))) {
         // `actions: buildTerminalLaunchMenuActions(…)` — the whole list comes
         // from one factory, whose literals the shape pass judges where they
         // are written. Same reasoning as a spread.
@@ -755,7 +755,7 @@ export function scanActionSurfaces(text: string, file: string): ActionSurface[] 
           pass: "position",
           position: "component",
           form: "delegated",
-          id: calleeName(node.initializer),
+          id: calleeName(unwrap(node.initializer)),
           handlerArity: null,
           hasParamSchema: false,
           effect: null,
