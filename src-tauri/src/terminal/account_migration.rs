@@ -705,10 +705,22 @@ pub fn migrate_session(
     // the synchronous respawn below and settled by whichever re-pin arm runs,
     // so the anchor is never in neither half of the registry and a same-anchor
     // continuation dispatched during the hop is deferred by P3 rather than
-    // spawned alongside this one. Nothing between here and the `match spawned`
-    // can exit early — no `?`, no `return`; the trust gate's refusal is above —
-    // so the only unhanded exit is a panic, which the permit's RAII drop
-    // covers.
+    // spawned alongside this one.
+    //
+    // GUARD: anchor-held window OPENS here and closes at the matching GUARD
+    // marker on `match spawned` below. NOTHING between the two may exit early
+    // — no `?`, no `return`, no `unwrap`/`expect` you add. Every fallible step
+    // of this function is deliberately ABOVE this line (the `working_dir` and
+    // three `try_state` lookups, `copy_transcript`, and the trust-gate
+    // refusal), and it must stay that way. An early exit inserted inside the
+    // window drops `carried_continuation`, whose RAII drop releases the
+    // anchor, which silently reopens the double-spawn window this lift exists
+    // to close — with NO compiler warning, no clippy lint and no failing test,
+    // because `#[must_use]` does not fire on a value that IS bound and no test
+    // calls `migrate_session`. The RAII drop is the PANIC backstop only; the
+    // no-early-exit property is a reviewer obligation. If you need a new
+    // failure check here, put it above the lift or restructure so the compiler
+    // can enforce the pairing.
     let carried_continuation =
         crate::agent_runtime::take_continuation_registration(&record.terminal_id);
 
@@ -779,6 +791,9 @@ pub fn migrate_session(
             gate_identity: carried_gate_identity,
         },
     );
+    // GUARD: anchor-held window CLOSES here — both arms below settle the
+    // permit the lift took. See the matching GUARD marker at the lift for what
+    // may not appear between the two.
     let new_terminal_id = match spawned {
         Ok((terminal_id, _coord_session_id)) => {
             // Re-pin the continuation onto the terminal that now hosts it, so

@@ -2523,10 +2523,13 @@ struct ContinuationSession {
 struct ContinuationRegistry {
     /// Registered, running continuation sessions keyed by `terminal_id`.
     live: std::collections::HashMap<String, ContinuationSession>,
-    /// Anchors held by an in-flight dispatch, each mapped to the
+    /// Anchors held by an in-flight dispatch OR by a session mid-account-
+    /// migration, each mapped to the
     /// [`AnchorReservationToken`] of the ONE [`AnchorReservation`] that owns
-    /// it: inserted by [`evaluate_continuation_guard`] inside the P3 critical
-    /// section, and removed only by that owner — its drop on every non-spawn
+    /// it: inserted inside a registry critical section — by
+    /// [`evaluate_continuation_guard`] (the dispatch path) or by
+    /// [`Self::take_live_reserving_anchor`] (the migration lift) — and removed
+    /// only by that entry's owner: its drop on every non-spawn
     /// exit, or [`AnchorReservation::handed_to_registry`] when the live entry
     /// replaces it. Never counted toward P4 — the cap bounds RUNNING sessions,
     /// and a reservation is not one.
@@ -2596,14 +2599,30 @@ impl ContinuationRegistry {
     /// holds its anchor, or `None` when `terminal_id` was not a registered
     /// continuation (an operator tab).
     ///
-    /// **`Occupied` is defensive and NOT silent.** P3 makes it unreachable
-    /// today — [`evaluate_continuation_guard`]'s live scan runs before its
+    /// **`Occupied` is defensive and NOT silent.** It is unreachable **through
+    /// the dispatch path** — [`evaluate_continuation_guard`]'s live scan runs
+    /// before its
     /// `pending_anchors` arm, so no dispatch can hold a reservation on an
-    /// anchor whose session is live — but this registry must never let one
+    /// anchor whose session is live. That is narrower than "unreachable": it
+    /// does not rule out reaching this arm from a pre-existing
+    /// two-live-sessions-on-one-anchor state, which is exactly the state this
+    /// method exists to stop being created, and which
+    /// [`register_continuation_session`] can still re-create because it
+    /// inserts a `live` row without consulting `pending_anchors`. Either way
+    /// this registry must never let one
     /// caller displace another's token. The foreign entry is left exactly as
     /// it stands, an [`AnchorReservation::none`] is carried instead, and a
-    /// `warn!` names the anchor so an unreachable state that becomes reachable
-    /// announces itself. The carried `anchor_key` survives that arm because
+    /// `warn!` names the anchor so a state nobody expects announces itself.
+    ///
+    /// **Accepted residual, stated rather than hidden:** on this arm the
+    /// migrating session's anchor is held by a STRANGER's permit, so if that
+    /// stranger settles mid-hop the anchor goes free and the original
+    /// double-spawn window is back for the rest of the respawn. Leaving the
+    /// foreign token alone is still correct — displacing it is strictly worse,
+    /// since it frees the stranger's own later removal to take a third
+    /// holder's entry — and the `warn!` is what makes the residual visible.
+    ///
+    /// The carried `anchor_key` survives that arm because
     /// [`restore_continuation_registration`] re-pins from the
     /// [`CarriedContinuation`], never from the permit.
     fn take_live_reserving_anchor(
@@ -3249,9 +3268,15 @@ fn evaluate_continuation_guard_live(
     evaluate_continuation_guard(anchor_key, is_live, &crate::resource_guard::thread_pressure)
 }
 
-/// Register a freshly-spawned continuation session in the live registry (after
-/// `create_terminal_session_backend` succeeds). The entry is reaped lazily by
+/// Insert a live continuation row for a caller that holds NO reservation. The
+/// entry is reaped lazily by
 /// [`prune_dead_continuations`] the next time the guard runs.
+///
+/// (Its first line used to say "a freshly-spawned continuation session (after
+/// `create_terminal_session_backend` succeeds)". That has not been this
+/// function's caller for some time — the dispatch path registers through
+/// [`AnchorReservation::handed_to_registry`] — and the one production caller
+/// left is the permit-less arm named below.)
 ///
 /// **Touches [`ContinuationRegistry::live`] only — never `pending_anchors`.**
 /// This is the registration path for a caller that holds NO reservation: the
@@ -3623,9 +3648,22 @@ pub(crate) struct CarriedContinuation {
 /// so the anchor passes straight from the live row to an owned permit with no
 /// instant in between. The caller MUST carry that permit to the re-pin —
 /// dropping it releases the anchor and reopens the window a same-anchor
-/// dispatch double-spawns through; `#[must_use]` makes an accidental drop a
-/// compiler warning. A panic between the two is the one exit the RAII drop is
-/// there to cover, and it is the correct behaviour there: nothing will re-pin.
+/// dispatch double-spawns through.
+///
+/// ⚠️ **NOTHING MECHANICAL ENFORCES THAT, so read this before editing the
+/// caller.** The RAII drop is the PANIC backstop and nothing more: it makes a
+/// panic between the lift and the re-pin release the anchor, which is correct
+/// there because nothing will re-pin. The property that matters — *no early
+/// exit between the lift and the re-pin* — is a **reviewer obligation, not a
+/// compiler-checked one**. `#[must_use]` does not cover it: the permit IS used
+/// (it is bound at the lift), so inserting a `?` or a `return Err(..)` between
+/// the lift and `match spawned` drops it on the way out, releases the anchor,
+/// and silently reopens this window with **no compiler warning, no clippy
+/// lint, and no failing test** — none of the tests calls `migrate_session`.
+/// A `let (carried, _) = …` or `let Some((c, _permit)) = …` is the same silent
+/// drop. Both ends of the window in
+/// [`crate::terminal::account_migration::migrate_session`] carry a `GUARD:`
+/// marker comment so the span is greppable; keep them there.
 pub(crate) fn take_continuation_registration(
     terminal_id: &str,
 ) -> Option<(CarriedContinuation, AnchorReservation)> {
@@ -3672,6 +3710,30 @@ pub(crate) fn restore_continuation_registration(
     carried: CarriedContinuation,
     reservation: AnchorReservation,
 ) {
+    // The permit-holding branch inserts the live row from the PERMIT's anchor
+    // (`handed_to_registry` derives it there), so the two arguments must name
+    // the same anchor. They do by construction — `take_live_reserving_anchor`
+    // only mints an `owning(anchor)` permit when the lifted session's
+    // `anchor_key` IS that anchor — but a mismatched pair would re-pin the
+    // session under the WRONG P3 dedup identity, silently, which is the same
+    // class of failure as the `anchor_key: None` one the two arms exist to
+    // prevent. Free in release; turns "by construction" into something a test
+    // run checks.
+    //
+    // ⚠️ It is CONDITIONED on the permit holding one, and must stay that way.
+    // The permit-less arm is reached with a `carried.anchor_key` of `Some(..)`
+    // every time the defensive `Occupied` branch of the lift fires, so an
+    // unconditional `held == carried.anchor_key` compare would fire there and
+    // take `migration_lift_does_not_displace_a_foreign_reservation` down with
+    // it. The claim checked here is "IF a permit came back, its anchor is this
+    // session's" — never "a permit always came back".
+    if let Some((held_anchor, _)) = reservation.held.as_ref() {
+        debug_assert_eq!(
+            Some(held_anchor.as_str()),
+            carried.anchor_key.as_deref(),
+            "the permit's anchor must be the one the lift took off this terminal",
+        );
+    }
     if reservation.held.is_some() {
         reservation.handed_to_registry(terminal_id, carried.gate_id);
     } else {
@@ -5149,10 +5211,17 @@ async fn run_gate_continuation_inner(
                     focus_existing_continuation(existing_terminal_id);
                 }
                 AnchorHolder::Reserved => {
+                    // Two different holders reach this arm and the row does
+                    // not say which: a dispatch that passed the guard and has
+                    // not spawned yet, and — since the account-migration hop
+                    // began carrying an owned permit across its respawn — a
+                    // session mid-migration. Naming only the first would be
+                    // factually wrong for the second, so name both.
                     info!(
-                        "agent_runtime: gate-continuation deduped by anchor_key={:?} — another \
-                         dispatch for this anchor passed the guard and has not spawned yet; \
-                         skipping double-spawn",
+                        "agent_runtime: gate-continuation deduped by anchor_key={:?} — this \
+                         anchor is reserved by another holder (an in-flight dispatch that has \
+                         not spawned yet, or a session mid-account-migration); skipping \
+                         double-spawn, the row stays pending for re-delivery",
                         payload.anchor_key
                     );
                 }
@@ -13597,13 +13666,19 @@ mod tests {
     /// respawn window is deferred instead of spawning alongside the migrated
     /// session.
     ///
-    /// **This is the regression test, and it fails on `9f798e77b`**: there the
-    /// lift was `deregister_exited_continuation` alone, so the first assertion
-    /// below (`anchor_is_reserved` right after the lift) read `false` —
-    /// observed FAILING before the fix landed. Deleting the
-    /// `pending_anchors` insertion in
-    /// [`ContinuationRegistry::take_live_reserving_anchor`] reproduces that
-    /// failure.
+    /// **This is the regression test, and here is how to make it fail:**
+    /// delete the `pending_anchors` insertion in
+    /// [`ContinuationRegistry::take_live_reserving_anchor`]'s `Vacant` arm and
+    /// the first assertion below (`anchor_is_reserved` right after the lift)
+    /// goes red. That mutation is the checkable form and the one to re-run.
+    ///
+    /// Do NOT read it as "this test fails on the parent commit": as written it
+    /// could not COMPILE there — it destructures a tuple from
+    /// [`take_continuation_registration`] and passes three arguments to
+    /// [`restore_continuation_registration`], neither of which existed before
+    /// this change. What was observed failing at `9f798e77b`, before the fix,
+    /// was a standalone probe asserting the same property against the old
+    /// single-value signature.
     #[test]
     fn migration_hop_holds_the_anchor_across_the_respawn() {
         let _env_lock = env_lock();
