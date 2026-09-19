@@ -310,6 +310,21 @@ function propName(p: ts.ObjectLiteralElementLike): string | null {
   return null;
 }
 
+/** Strip `( … )`, `as T`, `satisfies T`, `<T>…` and `!` — none changes the value. */
+function unwrap(expr: ts.Expression): ts.Expression {
+  let e = expr;
+  while (
+    ts.isParenthesizedExpression(e) ||
+    ts.isAsExpression(e) ||
+    ts.isSatisfiesExpression(e) ||
+    ts.isTypeAssertionExpression(e) ||
+    ts.isNonNullExpression(e)
+  ) {
+    e = e.expression;
+  }
+  return e;
+}
+
 /**
  * The GUARD's name, only when it is called as a bare identifier. A method that
  * happens to be called `guardedHandler` (`x.guardedHandler(…)`) is not the
@@ -384,6 +399,8 @@ interface LiteralFacts {
   hasSlash: boolean;
   /** The literal spreads another object, which may carry the handler. */
   hasSpread: boolean;
+  /** A spread AFTER `handler`, which may replace the handler it follows. */
+  spreadAfterHandler: boolean;
 }
 
 function normalised(node: ts.Node): string {
@@ -403,8 +420,12 @@ function readLiteral(obj: ts.ObjectLiteralExpression): LiteralFacts {
   let effect: string | null = null;
   let hasSlash = false;
   let hasSpread = false;
+  let spreadAfterHandler = false;
   for (const p of obj.properties) {
-    if (ts.isSpreadAssignment(p)) hasSpread = true;
+    if (ts.isSpreadAssignment(p)) {
+      hasSpread = true;
+      if (hasHandler) spreadAfterHandler = true;
+    }
     const name = propName(p);
     if (name === null) continue;
     if (name === "paramSchema") {
@@ -455,6 +476,7 @@ function readLiteral(obj: ts.ObjectLiteralExpression): LiteralFacts {
     effect,
     hasSlash,
     hasSpread,
+    spreadAfterHandler,
   };
 }
 
@@ -475,6 +497,9 @@ function verdictForLiteral(
       return "entry spreads another object and declares no handler of its own — its handler cannot be decided here; write it as handler: guardedHandler(id, paramSchema, run)";
     }
     return null;
+  }
+  if (facts.spreadAfterHandler && position !== "free") {
+    return "a spread after `handler` may replace it — its handler cannot be decided here; put the handler last or drop the spread";
   }
   if (facts.guarded) {
     if (facts.guardSchemaText === null) {
@@ -618,6 +643,22 @@ export function scanActionSurfaces(text: string, file: string): ActionSurface[] 
 
   const visit = (node: ts.Node) => {
     // ── Pass 1: position ────────────────────────────────────────────────
+    if (ts.isShorthandPropertyAssignment(node) && node.name.text === "customActions") {
+      // `{ customActions }` — the map is a binding this pass cannot follow.
+      out.push({
+        file: rel,
+        line: at(node),
+        pass: "position",
+        position: "element",
+        form: "literal",
+        id: null,
+        handlerArity: null,
+        hasParamSchema: false,
+        effect: null,
+        violation:
+          "customActions is a shorthand binding — its handlers cannot be enumerated; write the map inline",
+      });
+    }
     if (ts.isPropertyAssignment(node)) {
       const name = propName(node);
       if (name === "actions" && ts.isArrayLiteralExpression(node.initializer)) {
@@ -658,8 +699,11 @@ export function scanActionSurfaces(text: string, file: string): ActionSurface[] 
           }
           pushEntry(el, "component");
         }
-      } else if (name === "customActions" && ts.isObjectLiteralExpression(node.initializer)) {
-        for (const p of node.initializer.properties) {
+      } else if (
+        name === "customActions" &&
+        ts.isObjectLiteralExpression(unwrap(node.initializer))
+      ) {
+        for (const p of (unwrap(node.initializer) as ts.ObjectLiteralExpression).properties) {
           if (ts.isSpreadAssignment(p)) {
             out.push({
               file: rel,
@@ -675,7 +719,28 @@ export function scanActionSurfaces(text: string, file: string): ActionSurface[] 
             });
             continue;
           }
-          if (ts.isPropertyAssignment(p)) pushEntry(p.initializer, "element");
+          const entry = ts.isPropertyAssignment(p) ? unwrap(p.initializer) : null;
+          if (entry && (ts.isObjectLiteralExpression(entry) || ts.isCallExpression(entry))) {
+            pushEntry(entry, "element");
+            continue;
+          }
+          // `{ probe }`, `{ probe: probe }`, a method, a conditional: the
+          // action is written somewhere this pass cannot follow, and an
+          // element custom action carries no `id` for the shape pass to find
+          // it by. Undecidable fails CLOSED.
+          out.push({
+            file: rel,
+            line: at(p),
+            pass: "position",
+            position: "element",
+            form: "literal",
+            id: null,
+            handlerArity: null,
+            hasParamSchema: false,
+            effect: null,
+            violation:
+              "element custom action is not written inline — its handler cannot be enumerated; write the entry as an object literal",
+          });
         }
       } else if (name === "actions" && ts.isCallExpression(node.initializer)) {
         // `actions: buildTerminalLaunchMenuActions(…)` — the whole list comes
@@ -695,8 +760,8 @@ export function scanActionSurfaces(text: string, file: string): ActionSurface[] 
         });
       } else if (
         name === "customActions" &&
-        !ts.isCallExpression(node.initializer) &&
-        !ts.isObjectLiteralExpression(node.initializer)
+        !ts.isCallExpression(unwrap(node.initializer)) &&
+        !ts.isObjectLiteralExpression(unwrap(node.initializer))
       ) {
         // `customActions: acts` / `customActions: live ? {…} : {}` — the map
         // is built somewhere this pass cannot follow, and element custom
@@ -715,7 +780,7 @@ export function scanActionSurfaces(text: string, file: string): ActionSurface[] 
           violation:
             "customActions is neither an object literal nor a factory call — its handlers cannot be enumerated; write the map inline",
         });
-      } else if (name === "customActions" && ts.isCallExpression(node.initializer)) {
+      } else if (name === "customActions" && ts.isCallExpression(unwrap(node.initializer))) {
         // `customActions: buildTerminalPaneCustomActions(…)` — the whole map
         // comes from one factory. Same reasoning as a spread.
         out.push({
@@ -724,7 +789,7 @@ export function scanActionSurfaces(text: string, file: string): ActionSurface[] 
           pass: "position",
           position: "element",
           form: "delegated",
-          id: calleeName(node.initializer),
+          id: calleeName(unwrap(node.initializer)),
           handlerArity: null,
           hasParamSchema: false,
           effect: null,
