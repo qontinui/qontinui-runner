@@ -357,9 +357,9 @@ static STRUCK_PHASE_TITLE: Lazy<Regex> =
 /// `(optional, later)`); declaring one would leave coord a phase that can
 /// never be covered. Arm A — an explicit `Phase N` heading — is NOT filtered:
 /// that is the author naming a phase, and whether it was deferred is its
-/// delivery state, not whether it exists (filtering headings too removed
-/// currently-declared phases from dozens of corpus plans, because these words
-/// also occur in ordinary phase titles).
+/// delivery state, not whether it exists (filtering headings too removes
+/// currently-declared phases, because these words also occur in ordinary
+/// phase titles; the census in the plan named on [`detect_phases`] measured it).
 static NOT_DELIVERED_MARKER: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
         r"(?i)not scheduled|not this plan|not built|not needed|\(defer|\bdeferred\b|\bdelegated\b|\bdropped\b|\bwithdrawn\b|\bsplit (?:out|to|into)\b|follow-?up plan|separate plan|\bits own plan\b|\bown plan, own vet\b|\bdischarged\b|\bmoot\b|\(optional\b|\bstretch\b|\bskip if\b|\bseparately\b|\(separate\)|\balready exists?\b",
@@ -614,9 +614,10 @@ fn heading_rank(name: &str) -> NameRank {
 /// any level, at a column-0 bold line that is not a `**Phase N` sentence (a
 /// bold pseudo-heading such as `**Definition of done**` or `**Phase 1 — x**`,
 /// whose numbered items are something else), and at a column-0 paragraph after
-/// its first item. A section whose introduction says its phases do not exist
-/// or were superseded opens no list ([`NOT_A_PHASE_LIST`]), and a list
-/// introduced by a procedure's `…:` declares only explicit phase titles.
+/// its first item. A section whose introduction says its phases do not exist,
+/// were superseded, or are not delivered by this plan opens no list and its
+/// tables declare nothing ([`NOT_A_PHASE_LIST`]); a list introduced by a
+/// procedure's `…:` declares only explicit phase titles.
 ///
 /// Never declared: fenced code ([`fenced_lines`]); blockquotes (status
 /// narration such as `> **Phase 4 is HELD**`); mid-line prose; and an arm B-D
@@ -639,6 +640,7 @@ fn detect_phases(body: &str) -> Vec<ParsedPhase> {
     };
     let mut list = PhaseList::Off;
     let mut in_section = false;
+    let mut disowned = false;
     let mut intro = String::new();
     let mut table = TableState::Outside;
 
@@ -668,6 +670,7 @@ fn detect_phases(body: &str) -> Vec<ParsedPhase> {
                     PhaseList::Off
                 };
                 intro.clear();
+                disowned = false;
                 let enumerated = text.len() != rest.trim().len();
                 (text, enumerated)
             } else {
@@ -739,6 +742,7 @@ fn detect_phases(body: &str) -> Vec<ParsedPhase> {
                     {
                         list = PhaseList::Off;
                         in_section = false;
+                        disowned = true;
                     }
                     PhaseList::Armed => intro = t.to_string(),
                     PhaseList::InList { .. } => list = PhaseList::Off,
@@ -768,7 +772,9 @@ fn detect_phases(body: &str) -> Vec<ParsedPhase> {
                         TableState::OtherTable
                     };
                 }
-                TableState::PhaseTable { name_col } if !TABLE_SEPARATOR_CELL.is_match(first) => {
+                TableState::PhaseTable { name_col }
+                    if !disowned && !TABLE_SEPARATOR_CELL.is_match(first) =>
+                {
                     if PHASE_TABLE_RANGE.is_match(first) {
                         continue;
                     }
@@ -1304,6 +1310,9 @@ mod tests {
     fn phases_a_section_intro_marked_not_delivered_opens_no_list() {
         let body = "# T\n\n## Phases\n\nDeferred to a follow-up plan.\n\n1. a\n2. b\n";
         assert!(indices(body).is_empty());
+        // Its tables declare nothing either, until the next heading.
+        let body = "# T\n\n## Phases\n\nThese phases were superseded.\n\n| Phase | Work |\n|---|---|\n| 1 | a |\n\n## Now\n\n| Phase | Work |\n|---|---|\n| 2 | b |\n";
+        assert_eq!(indices(body), vec![2]);
     }
 
     /// Corpus wording for work done elsewhere or not at all: `shipping
@@ -1350,7 +1359,11 @@ mod tests {
         // a heading, whatever name won (`by_heading`, not the name's rank).
         let body = "# T\n\n## Phase 4 execution record\n\n## Phases\n\n| Phase | Work |\n|---|---|\n| 4 | tests |\n\n## Later\n\n| Phase | Outcome |\n|---|---|\n| 4 | deferred |\n";
         let p = parse(body);
-        let got: Vec<(u32, &str)> = p.phases.iter().map(|x| (x.index, x.name.as_str())).collect();
+        let got: Vec<(u32, &str)> = p
+            .phases
+            .iter()
+            .map(|x| (x.index, x.name.as_str()))
+            .collect();
         assert_eq!(got, vec![(4, "tests")]);
     }
 
