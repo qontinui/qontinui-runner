@@ -193,6 +193,12 @@ class H(BaseHTTPRequestHandler):
                 else:
                     self._send(200, {"jsonrpc": "2.0", "id": rid, "result": tool_text({"hits": [{"id": "m1", "title": "DOSSIER x"}], "count": 1})})
                 return
+            if name == "coord_alert_queue":
+                if m == "empty-records":
+                    self._send(200, {"jsonrpc": "2.0", "id": rid, "result": tool_text({"alerts": [], "count": 0, "total_count": 0, "next_cursor": None})})
+                else:
+                    self._send(200, {"jsonrpc": "2.0", "id": rid, "result": tool_text({"alerts": [{"id": 7, "kind": "pr_merge_stuck"}], "count": 1, "total_count": 1, "next_cursor": None})})
+                return
             self._send(200, {"jsonrpc": "2.0", "id": rid, "result": tool_text({"device_id": "stub"})})
             return
         self._send(200, {"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "no such method"}})
@@ -416,6 +422,44 @@ OUT="$(cd "$CALL_CWD" && HOME="$FAKE_HOME" QONTINUI_ROOT="$ROOT" bash "$SCRIPT" 
 ERR="$(cat "$SANDBOX/err")"
 assert_lacks "(i) no advisory when rows are present"  "0 rows under known list keys" "$ERR"
 
+echo "== (i2) the agent alert queue's rows key (alerts) is a known list key"
+echo empty-records > "$STUB_MODE"
+OUT="$(cd "$CALL_CWD" && HOME="$FAKE_HOME" QONTINUI_ROOT="$ROOT" bash "$SCRIPT" call coord_alert_queue '{"domain":"cleanup"}' 2>"$SANDBOX/err")"
+RC=$?; ERR="$(cat "$SANDBOX/err")"
+assert_eq  "(i2) call exits 0 (the tool answered)"         "0" "$RC"
+assert_has "(i2) an empty queue carries the advisory"      "0 rows under known list keys" "$ERR"
+echo live > "$STUB_MODE"
+OUT="$(cd "$CALL_CWD" && HOME="$FAKE_HOME" QONTINUI_ROOT="$ROOT" bash "$SCRIPT" call coord_alert_queue '{"domain":"cleanup"}' 2>"$SANDBOX/err")"
+ERR="$(cat "$SANDBOX/err")"
+assert_lacks "(i2) no advisory over a populated queue"     "0 rows under known list keys" "$ERR"
+
+echo "== (i3) the PYTHON arm of rpc_result_rows counts the alerts key too"
+# (i2) runs whichever arm the box selects -- jq wherever jq is installed -- so
+# a regression confined to the python arm would pass it. Drive that arm
+# directly: lift rpc_result_rows out of the SUBJECT (so a mutant is what is
+# measured) and run it with JSON_READER pinned to a working python.
+I3_PY=""
+for c in python3 python; do
+  if command -v "$c" >/dev/null 2>&1 \
+     && [ "$("$c" -c 'import json;print(1)' </dev/null 2>/dev/null | tr -d '\r\n')" = "1" ]; then
+    I3_PY="$c"; break
+  fi
+done
+sed -n '/^rpc_result_rows() {$/,/^}$/p' "$SCRIPT" > "$SANDBOX/rows-fn.sh"
+if [ -z "$I3_PY" ]; then
+  bad "(i3) no working python to pin the python arm to"
+elif [ ! -s "$SANDBOX/rows-fn.sh" ]; then
+  bad "(i3) rpc_result_rows() not found in the subject"
+else
+  i3_rows() { # <tool JSON>
+    printf '%s' "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":$("$I3_PY" -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$1" | tr -d '\r')}]}}" \
+      | JSON_READER="$I3_PY" bash -c ". '$SANDBOX/rows-fn.sh'; rpc_result_rows" | tr -d '\r'
+  }
+  assert_eq "(i3) python arm: an empty alerts page counts 0"   "0"  "$(i3_rows '{"alerts":[],"count":0}')"
+  assert_eq "(i3) python arm: a populated alerts page counts 1" "1"  "$(i3_rows '{"alerts":[{"id":7}],"count":1}')"
+  assert_eq "(i3) python arm: no known key is -1, never 0"      "-1" "$(i3_rows '{"rows":[]}')"
+fi
+
 # ================================================================ the discharge
 if [ "${MC_MUTANT:-0}" = "1" ]; then
   :   # a re-run must not drive its own mutations
@@ -451,6 +495,9 @@ else
     # that as vacuous rather than counting it as a kill).
     mc_expect_red "drop the envelope arm, so an empty control read stays live=1" \
       "$SCRIPT" 's/^        live=0; tail=" envelope=UNKNOWN(key not confirmed)"$/        :/' \
+      -- bash "$0"
+    mc_expect_red "drop alerts from the PYTHON arm's key list only, so (i3) must catch it" \
+      "$SCRIPT" 's/^KEYS=("hits","records","results","items","findings","documents","work_units","gates","tools","alerts")$/KEYS=("hits","records","results","items","findings","documents","work_units","gates","tools")/' \
       -- bash "$0"
     mc_trailer "$((PASS + FAIL))"
   else

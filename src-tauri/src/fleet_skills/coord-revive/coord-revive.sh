@@ -554,13 +554,14 @@ sys.exit(0 if (isinstance(r,dict) and "content" in r and r.get("isError") is Tru
 # tool's JSON as a string — so that box is opened first when it is present; a
 # bare `result` object (tools/list's `tools`) is read directly. The closed
 # list, in order: hits, records, results, items, findings, documents,
-# work_units, gates, tools. Anything that is not an array under the matched key
-# is `-1`, never a count.
+# work_units, gates, tools, alerts (the agent alert queue's rows key, plan
+# 2026-09-18-notifications-are-agent-actions-and-alerts-are-agent-work). Anything
+# that is not an array under the matched key is `-1`, never a count.
 rpc_result_rows() {
   if [ "$JSON_READER" = jq ]; then
     jq -r '
       def rows: . as $r
-        | (["hits","records","results","items","findings","documents","work_units","gates","tools"]
+        | (["hits","records","results","items","findings","documents","work_units","gates","tools","alerts"]
            | map(select(. as $k | $r | has($k)))) as $present
         | if ($present | length) == 0 then -1
           else ($r[$present[0]] | if type == "array" then length else -1 end) end;
@@ -572,7 +573,7 @@ rpc_result_rows() {
         else ($res | rows) end' 2>/dev/null  # envelope-ok: a COUNT under the first present key of a closed list, -1 when none is present; no row value leaves it
   else
     "$JSON_READER" -c 'import json,sys
-KEYS=("hits","records","results","items","findings","documents","work_units","gates","tools")
+KEYS=("hits","records","results","items","findings","documents","work_units","gates","tools","alerts")
 def rows(r):
     for k in KEYS:
         if k in r:
@@ -2283,7 +2284,7 @@ if [ $# -gt 0 ]; then
           # scripted callers are unchanged. `-1` (no known key at all) says
           # nothing either way and prints nothing.
           if [ "$(printf '%s' "$VBODY" | rpc_result_rows)" = "0" ]; then
-            echo "coord-revive: $VERB -> 0 rows under known list keys (hits/records/results/items/findings/documents/work_units/gates/tools) - UNKNOWN(envelope) until confirmed against a known-present record; do not read this as an empty corpus" >&2
+            echo "coord-revive: $VERB -> 0 rows under known list keys (hits/records/results/items/findings/documents/work_units/gates/tools/alerts) - UNKNOWN(envelope) until confirmed against a known-present record; do not read this as an empty corpus" >&2
           fi
           echo "coord-revive: $VERB -> OK over $CFG_URL (nonce from $OWN_CFG_PATH, header $CFG_KEY_HEADER; source=own-mcp-json, nothing minted)" >&2; exit 0 ;;
         3) echo "coord-revive: $VERB -> RPC_ERROR (the tool answered with a JSON-RPC error - printed above; that is ITS answer, the door carried the call)" >&2; exit 3 ;;
@@ -3261,7 +3262,7 @@ floor_control_read() {
       echo "control-read: $what -> $rows row(s) under a known list key (confirmed)" >&2
       continue
     fi
-    FLOOR_ENVELOPE="$what answered 2xx with $rows row(s) under every known list key (hits/records/results/items/findings/documents/work_units/gates/tools)"
+    FLOOR_ENVELOPE="$what answered 2xx with $rows row(s) under every known list key (hits/records/results/items/findings/documents/work_units/gates/tools/alerts)"
     echo "control-read: $what -> UNKNOWN(envelope): $FLOOR_ENVELOPE - the key is unconfirmed, so this is NOT 'present but empty'" >&2
     break
   done
