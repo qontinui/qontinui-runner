@@ -8178,7 +8178,7 @@ struct ProvisionSessionBody {
 /// | 403 | `COORD_MCP_PROVISION_HANDSHAKE_MISMATCH` | handshake presented, not this runner start's key |
 /// | 403 | `COORD_MCP_PROVISION_NOT_OPTED_IN` | no opt-in marker on this machine |
 /// | 403 | `COORD_MCP_PROVISION_TENANT_NOT_PAIRED` | `tenant` named, and this runner holds no credential slot for it (`SpawnTenantRefusal::NotPaired`); the message names the tenant and the pairing heal. Nothing was minted |
-/// | 403 | `COORD_MCP_PROVISION_TENANT_WORKDIR_DECLARES_OTHER` | `tenant` named, and the cwd's own `.mcp.json` declares a coord-mcp key that does not resolve to it (`SpawnTenantRefusal::WorkdirDeclaresOtherTenant`). Not produced by `validate_spawn_tenant` today (that arm belongs to the cwd-declared check); reserved so a cwd problem never gets a pairing heal. Nothing was minted |
+/// | 403 | `COORD_MCP_PROVISION_TENANT_WORKDIR_DECLARES_OTHER` | `tenant` named, and the cwd's own `.mcp.json` declares a coord-mcp key that does not resolve to it (`SpawnTenantRefusal::WorkdirDeclaresOtherTenant`). Produced by the cwd-declared check (`check_workdir_declared_tenant`), run after admission whenever the cwd declares a coord-mcp — its own code so a cwd problem never gets a pairing heal. Nothing was minted |
 /// | 503 | `COORD_MCP_PROVISION_CREDENTIAL_STORE_UNREADABLE` | `tenant` named, and whether it is paired is UNKNOWN because the credential store could not be read (`SpawnTenantRefusal::CredentialStoreUnreadable`) — refused rather than guessed. Nothing was minted |
 /// | 503 | `COORD_MCP_PROVISION_PORT_UNRESOLVABLE` | bound port unresolvable — fail-closed |
 ///
@@ -8307,6 +8307,32 @@ fn provision_session_after_gate(body: &[u8]) -> axum::response::Response {
                 "coord-mcp provision-session: refused the named tenant ({code}) — {refusal}"
             );
             return provision_refusal(status, code, format!("tenant {tenant} refused — {refusal}"));
+        }
+        // Review W1 (2026-09-19): the cwd's OWN `.mcp.json` outranks an injected
+        // config in ways nobody has measured (`check_workdir_declared_tenant`'s
+        // doc), so a caller that NAMED a tenant while launching into a cwd whose
+        // declared key is pinned elsewhere would get a session on that other
+        // tenant — the exact outcome the prose above promises never happens.
+        // Same predicate and same arm as the spawn path
+        // (`coord_mcp::terminal_coord_mcp_for_spawn`): only a cwd that declares
+        // a coord-mcp is checked; a cwd with no `.mcp.json` is not a statement.
+        if crate::coord_mcp::workdir_declares_coord_mcp(cwd) {
+            if let Err(refusal) = crate::coord_mcp::check_workdir_declared_tenant(
+                cwd,
+                tenant,
+                crate::coord_mcp::resolve_bound_api_port(),
+            ) {
+                warn!(
+                    cwd = %cwd,
+                    tenant = %tenant,
+                    "coord-mcp provision-session: refused the named tenant (COORD_MCP_PROVISION_TENANT_WORKDIR_DECLARES_OTHER) — {refusal}"
+                );
+                return provision_refusal(
+                    axum::http::StatusCode::FORBIDDEN,
+                    "COORD_MCP_PROVISION_TENANT_WORKDIR_DECLARES_OTHER",
+                    format!("tenant {tenant} refused — {refusal}"),
+                );
+            }
         }
     }
 
