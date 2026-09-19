@@ -246,6 +246,11 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     "/ui-bridge/sdk/control/clipboard",
     "GET /ui-bridge/control/element/{id}/react-state",
     "GET /sessions/{id}/transcript",
+    // Returns the pre-edit snapshot text AND the current on-disk text of every
+    // file a session touched — local source content, the same class as the
+    // transcript above. Bounded per file / per report, but a bound on volume is
+    // not a bound on who may read it.
+    "GET /sessions/{id}/file-changes",
     "/session-repository",
     "/session-repository/*",
     "GET /health/diagnostic-screenshot",
