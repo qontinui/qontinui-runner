@@ -239,6 +239,27 @@ pub async fn create_terminal_handler(
         request.title, request.working_dir, request.intent_repo
     );
 
+    // Coord device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
+    // D3): an HTTP caller is autonomous — a script, an MCP tool, a peer — so
+    // while the device is drained (or its drain state is unknown) the door
+    // answers 409 before allocating anything. The runner UI's own "new
+    // terminal" is the `terminal_create` Tauri command, which is never deferred.
+    if let crate::coord_drain_state::DrainGate::Defer { reason, class } =
+        crate::coord_drain_state::drain_gate_for_work(
+            crate::coord_drain_state::SpawnOrigin::Unknown,
+            &format!(
+                "http_terminal:{}",
+                request.title.as_deref().unwrap_or("untitled")
+            ),
+        )
+    {
+        warn!("HTTP: refusing terminal create — {reason}");
+        return Err((
+            StatusCode::CONFLICT,
+            Json(crate::coord_drain_state::api_refusal(&reason, class)),
+        ));
+    }
+
     // The other half of D6: a `workingDir` the runner cannot use must come
     // back as a refusal naming the path, not as a 200 whose `workingDir` is
     // somewhere the caller never named. Checked here, on the REQUEST value,

@@ -79,6 +79,7 @@ import { Sidebar } from "./components/navigation";
 import { TerminalPage } from "./components/terminal";
 import { TerminalPageTabBar } from "./components/terminal/TerminalPageTabBar";
 import { SessionRecoveryBanner } from "./components/terminal/SessionRecoveryBanner";
+import { RunnerDrainBanner } from "./components/terminal/RunnerDrainBanner";
 import { useProjectPageActivation } from "./components/terminal/useProjectPageActivation";
 import { useTerminalPages } from "./components/terminal/useTerminalPages";
 import { useTerminalWindowActions } from "./components/terminal/useTerminalWindowActions";
@@ -842,6 +843,14 @@ function AppContent() {
                   than owning any session state.
                 */}
                   <SessionRecoveryBanner />
+                  {/*
+                  Coord device drain notice (plan
+                  `2026-09-13-drained-runner-never-reaches-idle`, Phase 3): while
+                  coord has drained this runner — or its drain state is unknown —
+                  autonomous spawns are deferred and this says so, with the
+                  deferred-work count. Operator actions still run.
+                */}
+                  <RunnerDrainBanner />
                   {showReorganize && (
                     <ReorganizeDialog
                       pages={terminalPages.pages}

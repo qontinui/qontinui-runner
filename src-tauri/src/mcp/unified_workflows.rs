@@ -945,11 +945,40 @@ pub async fn generate_unified_workflow_handler(
 /// 3. Saves the meta-workflow to the database
 /// 4. Creates a task run for the meta-workflow execution
 /// 5. Returns the task_run_id and meta_workflow_id for frontend polling
+/// `POST /unified-workflows/generate-async`. The generation runs as an AI
+/// workflow, so an HTTP caller is autonomous (`unknown`) under coord's device
+/// drain; the runner UI calls [`generate_unified_workflow_async`] through
+/// `operator_generate_unified_workflow_async`.
 pub async fn generate_unified_workflow_async_handler(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<workflow_generation::GenerateWorkflowRequest>,
 ) -> Result<Json<ApiResponse<GenerateWorkflowAsyncResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    generate_unified_workflow_async(
+        state,
+        request,
+        crate::coord_drain_state::SpawnOrigin::Unknown,
+    )
+    .await
+}
+
+pub async fn generate_unified_workflow_async(
+    state: Arc<ApiState>,
+    request: workflow_generation::GenerateWorkflowRequest,
+    origin: crate::coord_drain_state::SpawnOrigin,
+) -> Result<Json<ApiResponse<GenerateWorkflowAsyncResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     use crate::workflow_generation::meta_workflow::build_meta_workflow_template;
+
+    // Coord's device drain (plan `2026-09-13-drained-runner-never-reaches-idle`):
+    // an autonomous caller is refused before anything is created.
+    if let crate::coord_drain_state::DrainGate::Defer { reason, class } =
+        crate::coord_drain_state::drain_gate_for_work(origin, &"workflow_generation".to_string())
+    {
+        warn!("workflow generation refused — {reason}");
+        return Err((
+            StatusCode::CONFLICT,
+            Json(crate::coord_drain_state::api_refusal(&reason, class)),
+        ));
+    }
 
     info!(
         "Generating unified workflow async from description: {}...",
@@ -1335,12 +1364,43 @@ pub struct ExecuteInlineWorkflowRequest {
 /// 1. Fetching the workflow from the database
 /// 2. Converting phase steps to executable steps
 /// 3. Running setup -> verification -> agentic -> completion phases
-pub async fn run_unified_workflow(
+/// `POST /unified-workflows/{id}/run`. An HTTP caller — a script, an agent, or
+/// a UI-Bridge-driven start — is autonomous (`unknown`) under coord's device
+/// drain: 409 while it holds. The runner UI's own run buttons call
+/// [`run_unified_workflow`] through `operator_run_unified_workflow`.
+pub async fn run_unified_workflow_http(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
     Json(request): Json<RunUnifiedWorkflowRequest>,
 ) -> Result<Json<ApiResponse<RunUnifiedWorkflowResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    run_unified_workflow(
+        state,
+        id,
+        request,
+        crate::coord_drain_state::SpawnOrigin::Unknown,
+    )
+    .await
+}
+
+pub async fn run_unified_workflow(
+    state: Arc<ApiState>,
+    id: String,
+    request: RunUnifiedWorkflowRequest,
+    origin: crate::coord_drain_state::SpawnOrigin,
+) -> Result<Json<ApiResponse<RunUnifiedWorkflowResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("Running unified workflow: {}", id);
+
+    // Coord's device drain (plan `2026-09-13-drained-runner-never-reaches-idle`):
+    // an autonomous caller is refused before anything is created.
+    if let crate::coord_drain_state::DrainGate::Defer { reason, class } =
+        crate::coord_drain_state::drain_gate_for_work(origin, &format!("unified_workflow:{id}"))
+    {
+        warn!("unified workflow run refused — {reason}");
+        return Err((
+            StatusCode::CONFLICT,
+            Json(crate::coord_drain_state::api_refusal(&reason, class)),
+        ));
+    }
 
     // Fetch the workflow
     let mut workflow = match state.app_state.pg_db.get_unified_workflow(&id).await {
@@ -1906,14 +1966,48 @@ pub async fn get_last_inline_workflow(
 /// This endpoint is used by Quick Fix to run a generated workflow directly
 /// without cluttering the workflow library. The workflow is executed with
 /// a temporary ID and is not persisted.
-pub async fn execute_inline_workflow(
+/// `POST /unified-workflows/execute-inline`. An HTTP caller is autonomous
+/// (`unknown`) under coord's device drain; the runner UI calls
+/// [`execute_inline_workflow`] through `operator_execute_inline_workflow`.
+pub async fn execute_inline_workflow_http(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<ExecuteInlineWorkflowRequest>,
 ) -> Result<
     Json<ApiResponse<crate::step_executor::ExecutionResult>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
+    execute_inline_workflow(
+        state,
+        request,
+        crate::coord_drain_state::SpawnOrigin::Unknown,
+    )
+    .await
+}
+
+pub async fn execute_inline_workflow(
+    state: Arc<ApiState>,
+    request: ExecuteInlineWorkflowRequest,
+    origin: crate::coord_drain_state::SpawnOrigin,
+) -> Result<
+    Json<ApiResponse<crate::step_executor::ExecutionResult>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
     info!("Executing inline workflow: {}", request.name);
+
+    // Coord's device drain (plan `2026-09-13-drained-runner-never-reaches-idle`):
+    // an autonomous caller is refused before anything is created.
+    if let crate::coord_drain_state::DrainGate::Defer { reason, class } =
+        crate::coord_drain_state::drain_gate_for_work(
+            origin,
+            &format!("inline_workflow:{}", request.name),
+        )
+    {
+        warn!("inline workflow refused — {reason}");
+        return Err((
+            StatusCode::CONFLICT,
+            Json(crate::coord_drain_state::api_refusal(&reason, class)),
+        ));
+    }
 
     // Check for duplicate running error-fix workflows
     // This prevents multiple Quick Fix workflows from targeting the same errors
@@ -2463,14 +2557,45 @@ pub struct ComposedWorkflowResponse {
 ///
 /// Each workflow becomes a stage with its own verification-agentic loop.
 /// Stages execute sequentially with full output context accumulation.
-pub async fn run_composed_workflow(
+/// `POST /unified-workflows/run-composed`. An HTTP caller is autonomous
+/// (`unknown`) under coord's device drain; the runner UI's queue calls
+/// [`run_composed_workflow`] through `operator_run_composed_workflow`.
+pub async fn run_composed_workflow_http(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<RunComposedWorkflowRequest>,
+) -> Result<Json<ApiResponse<ComposedWorkflowResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    run_composed_workflow(
+        state,
+        request,
+        crate::coord_drain_state::SpawnOrigin::Unknown,
+    )
+    .await
+}
+
+pub async fn run_composed_workflow(
+    state: Arc<ApiState>,
+    request: RunComposedWorkflowRequest,
+    origin: crate::coord_drain_state::SpawnOrigin,
 ) -> Result<Json<ApiResponse<ComposedWorkflowResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     if request.workflow_ids.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(api_error("workflow_ids cannot be empty".to_string())),
+        ));
+    }
+
+    // Coord's device drain (plan `2026-09-13-drained-runner-never-reaches-idle`):
+    // an autonomous caller is refused before anything is created.
+    if let crate::coord_drain_state::DrainGate::Defer { reason, class } =
+        crate::coord_drain_state::drain_gate_for_work(
+            origin,
+            &format!("composed_workflow:{}", request.workflow_ids.join(",")),
+        )
+    {
+        warn!("composed workflow run refused — {reason}");
+        return Err((
+            StatusCode::CONFLICT,
+            Json(crate::coord_drain_state::api_refusal(&reason, class)),
         ));
     }
 
@@ -2923,7 +3048,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         )
         .route(
             "/unified-workflows/execute-inline",
-            post(execute_inline_workflow),
+            post(execute_inline_workflow_http),
         )
         .route(
             "/unified-workflows/last-inline",
@@ -2931,7 +3056,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         )
         .route(
             "/unified-workflows/run-composed",
-            post(run_composed_workflow),
+            post(run_composed_workflow_http),
         )
         .route("/slash-commands/sync", post(sync_slash_commands_handler))
         // Exploration pipeline endpoints
@@ -2955,7 +3080,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/unified-workflows/{id}/export",
             get(export_unified_workflow),
         )
-        .route("/unified-workflows/{id}/run", post(run_unified_workflow))
+        .route(
+            "/unified-workflows/{id}/run",
+            post(run_unified_workflow_http),
+        )
         .route(
             "/unified-workflows/{id}/stats",
             get(get_unified_workflow_stats),

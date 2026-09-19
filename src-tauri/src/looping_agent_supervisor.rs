@@ -387,6 +387,10 @@ async fn supervise_one(
         crate::agent_authorization::authorize_spawn(
             Some(&rec.def.name),
             crate::agent_authorization::SpawnPath::StandingContinuation,
+            crate::agent_authorization::DrainAdmission::work(
+                crate::coord_drain_state::SpawnOrigin::LoopingAgent,
+                looping_agent_work_key(&rec.def.id),
+            ),
         )
         .await
     } else {
@@ -504,6 +508,36 @@ async fn supervise_one(
     // slot, therefore you may spawn".
     let action = lease::gate_action(policy::decide(&input), holds_lease);
 
+    // Coord device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
+    // D6 / Phase 3). While the device is drained — or its drain state is
+    // unknown — the supervisor starts nothing and continues nothing: `Spawn`,
+    // `Relaunch` AND `Nudge` all become `None`. `Nudge` is included even though
+    // the registry gate below lets it through, because a nudge begins the next
+    // cycle of an autonomous loop, which is the work a drain exists to stop. The
+    // loop definition is untouched: the first tick after undrain decides afresh
+    // (a `FirstSpawn`/`DeathRespawn` if the tab has gone meanwhile).
+    let drain =
+        crate::coord_drain_state::drain_gate(crate::coord_drain_state::SpawnOrigin::LoopingAgent);
+    let undrained = action;
+    let action = drain_rewrite(undrained, &drain);
+    if action != undrained {
+        // Counted for the draining banner once per agent (the key is the
+        // agent id), and logged at debug: this repeats every tick while the
+        // drain holds, and the transition itself is logged by
+        // `coord_drain_state`.
+        if let crate::coord_drain_state::DrainGate::Defer { reason, .. } = &drain {
+            crate::coord_drain_state::record_deferral(
+                crate::coord_drain_state::SpawnOrigin::LoopingAgent,
+                &looping_agent_work_key(&rec.def.id),
+            );
+            debug!(
+                agent = %rec.def.id,
+                suppressed = ?undrained,
+                "looping_agent_supervisor: action suppressed by the coord device drain: {reason}"
+            );
+        }
+    }
+
     // Phase 4c action gate. Applied AFTER `policy::decide` so a refusal cannot
     // reach `Action::Relaunch`, which CLOSES the live tab before respawning —
     // a refusal discovered inside `do_spawn` would kill a running agent and
@@ -593,6 +627,26 @@ async fn supervise_one(
             let prompt = spawn_prompt(&rec.def, true).await;
             do_spawn(app, registry, &rec.def, prompt, false, true).await;
         }
+    }
+}
+
+/// The drain deferral key for a looping agent — its registry id.
+fn looping_agent_work_key(agent_id: &str) -> String {
+    format!("looping_agent:{agent_id}")
+}
+
+/// PURE: the device-drain rewrite of one tick's action (plan
+/// `2026-09-13-drained-runner-never-reaches-idle`, D6). While the drain defers
+/// the looping-agent origin, every action that starts or continues work —
+/// `Spawn`, `Relaunch`, `Nudge` — becomes `None`; the live tab, if any, is left
+/// exactly as it is. Under `Allow` the action passes through untouched.
+fn drain_rewrite(action: Action, drain: &crate::coord_drain_state::DrainGate) -> Action {
+    if drain.allows() {
+        return action;
+    }
+    match action {
+        Action::Spawn(_) | Action::Relaunch(_) | Action::Nudge => Action::None,
+        Action::None => Action::None,
     }
 }
 
@@ -847,6 +901,10 @@ async fn do_spawn(
     let authz = crate::agent_authorization::authorize_spawn(
         Some(&def.name),
         crate::agent_authorization::SpawnPath::StandingContinuation,
+        crate::agent_authorization::DrainAdmission::work(
+            crate::coord_drain_state::SpawnOrigin::LoopingAgent,
+            looping_agent_work_key(&def.id),
+        ),
     )
     .await;
     if !authz.allows_spawn() {
@@ -958,6 +1016,10 @@ async fn spawn_looping_agent_terminal(
     let authz = crate::agent_authorization::authorize_spawn(
         Some(&def.name),
         crate::agent_authorization::SpawnPath::StandingContinuation,
+        crate::agent_authorization::DrainAdmission::work(
+            crate::coord_drain_state::SpawnOrigin::LoopingAgent,
+            looping_agent_work_key(&def.id),
+        ),
     )
     .await;
     if let Some(refusal) = authz.refusal() {
@@ -1177,5 +1239,40 @@ pub(crate) fn status_snapshot(
         record: rec.clone(),
         tab_alive: liveness != Liveness::Dead,
         idle,
+    }
+}
+
+/// Plan `2026-09-13-drained-runner-never-reaches-idle`, Phase 3.
+#[cfg(test)]
+mod drain_rewrite_tests {
+    use super::*;
+    use crate::coord_drain_state::DrainGate;
+    use qontinui_runner_lib::looping_agent::policy::RelaunchReason;
+
+    const ACTIONS: [Action; 6] = [
+        Action::None,
+        Action::Spawn(SpawnReason::FirstSpawn),
+        Action::Spawn(SpawnReason::DeathRespawn),
+        Action::Nudge,
+        Action::Relaunch(RelaunchReason::ContextLow),
+        Action::Relaunch(RelaunchReason::CycleBudget),
+    ];
+
+    #[test]
+    fn a_deferring_drain_turns_spawn_relaunch_and_nudge_into_none() {
+        let defer = DrainGate::Defer {
+            reason: "drained".into(),
+            class: crate::coord_drain_state::DeferClass::Drained,
+        };
+        for action in ACTIONS {
+            assert_eq!(drain_rewrite(action, &defer), Action::None, "{action:?}");
+        }
+    }
+
+    #[test]
+    fn an_allowing_drain_leaves_every_action_untouched() {
+        for action in ACTIONS {
+            assert_eq!(drain_rewrite(action, &DrainGate::Allow), action);
+        }
     }
 }

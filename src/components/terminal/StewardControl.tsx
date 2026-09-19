@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { Bot } from "lucide-react";
 import { resolvePort } from "@/lib/runner-api";
 
@@ -57,6 +58,17 @@ interface StewardApiResponse<T> {
   success: boolean;
   data?: T;
   error?: string;
+}
+
+/**
+ * The reason a thrown action carries: a Tauri command's `Err(String)` rejects
+ * with the bare string (the `steward_start` refusals), `fetch` with an `Error`.
+ * Exported for tests.
+ */
+export function invokeErrorDetail(e: unknown): string {
+  if (typeof e === "string" && e.length > 0) return e;
+  if (e instanceof Error) return e.message;
+  return "request failed";
 }
 
 /** The roster endpoint: every steward plus its live status, in one request. */
@@ -205,27 +217,34 @@ export function StewardControl() {
       return next;
     });
     try {
-      const port = resolvePort();
-      const resp = await fetch(buildStewardUrl(port, kind, path), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: "{}",
-      });
-      // `fetch` does not throw on a non-2xx, so without this the button
-      // would fail silently. The backend deliberately puts its reason in the
-      // body — a 400 (a mode/interval the launcher refused to type into a
-      // shell), a 409 (already running) and, more importantly, the
-      // unattended-spawn resource-floor refusal that carries lane/headroom/
-      // floor detail. Discarding that leaves an operator with a button that
-      // does nothing and says nothing.
-      if (!resp.ok) {
-        const detail = await readErrorDetail(resp);
-        setErrors((prev) => ({ ...prev, [kind]: detail }));
+      if (path === "start") {
+        // START goes through the `steward_start` Tauri command, not the HTTP
+        // route: this button is an operator sitting at the runner, and the
+        // coord device drain defers only AUTONOMOUS starts (plan
+        // `2026-09-13-drained-runner-never-reaches-idle`, D3) — an HTTP caller
+        // cannot prove it is this UI. The command answers with the same
+        // validation, single-instance and resource-floor refusals, as its error.
+        await invoke("steward_start", { kind });
+      } else {
+        const port = resolvePort();
+        const resp = await fetch(buildStewardUrl(port, kind, path), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}",
+        });
+        // `fetch` does not throw on a non-2xx, so without this the button
+        // would fail silently. The backend deliberately puts its reason in the
+        // body. Discarding that leaves an operator with a button that does
+        // nothing and says nothing.
+        if (!resp.ok) {
+          const detail = await readErrorDetail(resp);
+          setErrors((prev) => ({ ...prev, [kind]: detail }));
+        }
       }
     } catch (e) {
       setErrors((prev) => ({
         ...prev,
-        [kind]: e instanceof Error ? e.message : "request failed",
+        [kind]: invokeErrorDetail(e),
       }));
     } finally {
       // Clear only THIS kind's flag. A single `busyKind` string was cleared

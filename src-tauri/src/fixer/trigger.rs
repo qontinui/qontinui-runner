@@ -223,6 +223,9 @@ pub async fn wait_for_children_complete(
 ///
 /// Returns the fixer task run ID or "skipped".
 pub fn launch_fixer(deps: FixerDeps, source_task_run_id: String) -> Result<String, String> {
+    // The drain-hold key, bound before `source_task_run_id` moves into the
+    // spawned work below (plan `2026-09-13-drained-runner-never-reaches-idle`).
+    let hold_key = format!("fixer:{source_task_run_id}");
     let pg_db = &deps.app_state.pg_db;
 
     // Guard check before committing to spawn
@@ -396,19 +399,23 @@ pub fn launch_fixer(deps: FixerDeps, source_task_run_id: String) -> Result<Strin
                 file_registry,
                 file_lock,
                 deps.app_state.pg_db.clone(),
-                Box::pin(async move {
-                    controller
-                        .run(
-                            loop_config,
-                            setup_steps,
-                            Vec::new(),
-                            verification_steps,
-                            Vec::new(),
-                            Vec::new(),
-                            Vec::new(),
-                        )
-                        .await
-                }),
+                Box::pin(crate::coord_drain_state::held_until_allowed(
+                    crate::coord_drain_state::SpawnOrigin::Orchestration,
+                    hold_key,
+                    async move {
+                        controller
+                            .run(
+                                loop_config,
+                                setup_steps,
+                                Vec::new(),
+                                verification_steps,
+                                Vec::new(),
+                                Vec::new(),
+                                Vec::new(),
+                            )
+                            .await
+                    },
+                )),
             );
         }
 

@@ -16,6 +16,7 @@ import type { WorkflowWithStats, QueuedWorkflow, WorkflowStats } from "./types";
 import type { UnifiedWorkflow } from "../../types/unified-workflow";
 import { getTotalStepCount } from "../../types/unified-workflow";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { invokeOperatorDoor } from "@/lib/operatorDoors";
 
 const STORAGE_KEY = "qontinui-workflow-queue";
 const OPTIONS_STORAGE_KEY = "qontinui-workflow-queue-options";
@@ -273,12 +274,11 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
         if (args !== undefined) {
           body.arguments = args;
         }
-        const response = await tracedFetch(`${getApiBase()}/unified-workflows/${workflowId}/run`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        });
-        const result = await response.json();
+        const reply = await invokeOperatorDoor<{ success?: boolean; error?: string }>(
+          "operator_run_unified_workflow",
+          { id: workflowId, request: body },
+        );
+        const result = reply.body;
         if (result.success) {
           onLog?.("success", "Started workflow execution");
           onNavigateToActive();
@@ -310,16 +310,17 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
 
     setIsExecuting(true);
     try {
-      const response = await tracedFetch(`${getApiBase()}/unified-workflows/run-composed`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          workflow_ids: queue.map((item) => item.workflow.id),
-          stop_on_failure: stopOnFailure,
-        }),
-      });
+      const reply = await invokeOperatorDoor<{ success?: boolean; error?: string }>(
+        "operator_run_composed_workflow",
+        {
+          request: {
+            workflow_ids: queue.map((item) => item.workflow.id),
+            stop_on_failure: stopOnFailure,
+          },
+        },
+      );
 
-      const result = await response.json();
+      const result = reply.body;
       if (result.success) {
         onLog?.("success", `Started composed workflow: ${queue.length} stages`);
         onNavigateToActive();

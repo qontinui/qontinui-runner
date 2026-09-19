@@ -641,19 +641,23 @@ fn launch_optimizer_internal(
                 file_registry,
                 file_lock,
                 app_state.pg_db.clone(),
-                Box::pin(async move {
-                    controller
-                        .run(
-                            loop_config,
-                            setup_steps,
-                            Vec::new(),
-                            verification_steps,
-                            Vec::new(),
-                            Vec::new(),
-                            Vec::new(),
-                        )
-                        .await
-                }),
+                Box::pin(crate::coord_drain_state::held_until_allowed(
+                    crate::coord_drain_state::SpawnOrigin::Orchestration,
+                    format!("meta_optimizer:{optimizer_type:?}"),
+                    async move {
+                        controller
+                            .run(
+                                loop_config,
+                                setup_steps,
+                                Vec::new(),
+                                verification_steps,
+                                Vec::new(),
+                                Vec::new(),
+                                Vec::new(),
+                            )
+                            .await
+                    },
+                )),
             );
         }
 

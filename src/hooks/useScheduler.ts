@@ -15,6 +15,7 @@ import type {
   UpdateScheduledTaskRequest,
 } from "../types/scheduler";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { invoke } from "@tauri-apps/api/core";
 
 interface ApiResponse<T> {
   success: boolean;
@@ -214,12 +215,16 @@ export function useScheduler(autoRefresh = true, refreshInterval = 30000): UseSc
       setLoading(true);
       setError(null);
       try {
-        await apiRequest("POST", `/scheduler/tasks/${id}/run`);
+        // As an OPERATOR (the Tauri twin of POST /scheduler/tasks/{id}/run),
+        // which coord's device drain never defers.
+        await invoke("scheduler_run_task_now", { id });
         // Refresh tasks to get updated last_run
         await loadTasks();
         return true;
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to run task");
+        setError(
+          typeof err === "string" ? err : err instanceof Error ? err.message : "Failed to run task",
+        );
         return false;
       } finally {
         setLoading(false);

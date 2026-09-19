@@ -228,6 +228,20 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 Ok(v) => v,
                 Err(e) => return TauriInvokeResponse::err(format!("bad args: {}", e)),
             };
+            // Coord device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
+            // D3): this is the HTTP proxy of `terminal_create`, not the runner UI,
+            // so its caller is autonomous and is deferred while the drain holds.
+            if let crate::coord_drain_state::DrainGate::Defer { reason, .. } =
+                crate::coord_drain_state::drain_gate_for_work(
+                    crate::coord_drain_state::SpawnOrigin::Unknown,
+                    &format!(
+                        "proxy_terminal:{}",
+                        a.title.as_deref().unwrap_or("untitled")
+                    ),
+                )
+            {
+                return TauriInvokeResponse::err(reason);
+            }
             let spawn_tenant = match spawn_tenant_or_invoke_error(a.tenant_id.as_deref()) {
                 Ok(tenant) => tenant,
                 Err(refusal) => return refusal,

@@ -1,4 +1,5 @@
-import { useEffect, useRef, useCallback } from "react";
+import { useEffect, useRef, useCallback, useState } from "react";
+import { autonomousResumeDetector, subscribeCoordDrainState } from "@/hooks/useCoordDrainState";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LAYOUT_PRESETS, FLOW_GRID_ID } from "./useZoneLayout";
@@ -41,15 +42,52 @@ export async function fetchOpenRecords(
   pageId: string,
   opts?: { knownPageIds?: readonly string[]; adoptOrphans?: boolean },
 ): Promise<TerminalSessionRecord[]> {
+  return (await fetchRestoreSet(pageId, opts)).records;
+}
+
+/** The restore set for a page, or the coord device drain's deferral of it. */
+export interface RestoreSet {
+  records: TerminalSessionRecord[];
+  /**
+   * Non-null when coord's device drain DEFERRED the restore (plan
+   * `2026-09-13-drained-runner-never-reaches-idle`, Phase 3): restoring tabs
+   * respawns sessions autonomously, so the backend withheld the set. This is
+   * NOT "no sessions" — the records are untouched and the restore must re-run
+   * once autonomous spawns are allowed again.
+   */
+  deferredByDrain: string | null;
+}
+
+/**
+ * {@link fetchOpenRecords}, keeping the drain deferral distinguishable from an
+ * empty restore set. Exported for unit tests.
+ */
+export async function fetchRestoreSet(
+  pageId: string,
+  opts?: { knownPageIds?: readonly string[]; adoptOrphans?: boolean },
+): Promise<RestoreSet> {
   let resp: CommandResponse | null;
   try {
     resp = await invoke<CommandResponse>("terminal_session_list_open");
   } catch (err) {
     console.warn("[TerminalPage] terminal_session_list_open failed:", err);
-    return [];
+    return { records: [], deferredByDrain: null };
   }
-  const sessions = (resp?.data as { sessions?: TerminalSessionRecord[] } | undefined)?.sessions;
-  if (!Array.isArray(sessions)) return [];
+  const data = resp?.data as
+    | { sessions?: TerminalSessionRecord[]; deferredByDrain?: { reason?: unknown } | null }
+    | undefined;
+  if (data?.deferredByDrain && typeof data.deferredByDrain === "object") {
+    const reason = data.deferredByDrain.reason;
+    return {
+      records: [],
+      deferredByDrain:
+        typeof reason === "string" && reason.length > 0
+          ? reason
+          : "deferred by the coord device drain",
+    };
+  }
+  const sessions = data?.sessions;
+  if (!Array.isArray(sessions)) return { records: [], deferredByDrain: null };
   const byId = new Map<string, TerminalSessionRecord>();
   for (const rec of sessions) {
     if (!rec || typeof rec.claudeSessionId !== "string") continue;
@@ -60,7 +98,7 @@ export async function fetchOpenRecords(
     }
     if (!byId.has(rec.claudeSessionId)) byId.set(rec.claudeSessionId, rec);
   }
-  return [...byId.values()];
+  return { records: [...byId.values()], deferredByDrain: null };
 }
 
 /**
@@ -298,8 +336,12 @@ export async function reportTreeReset(params: {
     let openRecordCount: number | undefined;
     try {
       const resp = await invoke<CommandResponse>("terminal_session_list_open");
-      const sessions = (resp?.data as { sessions?: unknown[] } | undefined)?.sessions;
-      if (Array.isArray(sessions)) openRecordCount = sessions.length;
+      const data = resp?.data as { sessions?: unknown[]; deferredByDrain?: unknown } | undefined;
+      // While coord's device drain withholds the restore set, `sessions` is
+      // empty by deferral, not by count — report the count as unknown.
+      if (!data?.deferredByDrain && Array.isArray(data?.sessions)) {
+        openRecordCount = data.sessions.length;
+      }
     } catch {
       // Count unavailable — a partial report is still worth a row.
     }
@@ -347,6 +389,26 @@ let documentMountCount = 0;
  * hold the Set in a ref. Exported so the per-pageId semantics can be unit-
  * tested without booting React (vitest `environment: "node"`).
  */
+/**
+ * May a restored record claim its RECORDED zone? On a first restore, always
+ * (records own their zones — see the binding loop). On a restore RE-RUN after a
+ * coord device drain lifted, the operator may have opened terminals in the
+ * meantime, so a record claims its zone only when that zone is empty or already
+ * holds this very tab; otherwise the tab is left unassigned and auto-fill places
+ * it in the first free zone. Exported for tests.
+ */
+export function mayClaimRecordedZone(
+  isDrainRerun: boolean,
+  zoneIndex: number,
+  tabId: string,
+  assignments: Record<number, string>,
+): boolean {
+  if (zoneIndex < 0) return false;
+  if (!isDrainRerun) return true;
+  const holder = assignments[zoneIndex];
+  return holder === undefined || holder === tabId;
+}
+
 export function claimInitForPage(seen: Set<string>, pageId: string): boolean {
   if (seen.has(pageId)) return false;
   seen.add(pageId);
@@ -819,9 +881,42 @@ export function useTerminalInitialization({
   // auto-save runs in the single page instance for whichever page is active.
   const restoreCompletePages = useRef<Set<string>>(new Set());
 
+  // Coord device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
+  // Phase 3): bumped each time autonomous spawns become allowed again. The init
+  // effect below depends on it, so a restore the drain deferred (which released
+  // its page guard) re-runs; a page whose restore already ran stays a no-op via
+  // `claimInitForPage`.
+  //
+  // The re-run is LAZY and PER PAGE: only the page this hook currently serves
+  // (the active page) re-runs on the epoch bump. Every other page whose restore
+  // was deferred had its guard released too, so it restores the next time it
+  // becomes active — nothing is lost, it simply waits for the operator to look.
+  //
+  // Pages whose restore the drain deferred, so their re-run merges into the
+  // tabs that exist by then instead of re-laying the page out.
+  const drainDeferredPages = useRef<Set<string>>(new Set());
+  // Live tabs, for the re-run's "already open" check (the init effect does not
+  // re-run on every tab change, so it cannot close over `tabs`).
+  const liveTabsRef = useRef(tabs);
+  useEffect(() => {
+    liveTabsRef.current = tabs;
+  }, [tabs]);
+  const [drainResumeEpoch, setDrainResumeEpoch] = useState(0);
+  useEffect(
+    () =>
+      subscribeCoordDrainState(autonomousResumeDetector(() => setDrainResumeEpoch((n) => n + 1))),
+    [],
+  );
+
   useEffect(() => {
     if (!claimInitForPage(didInitPages.current, pageId)) return;
     const initPageId = pageId;
+    // A re-run after a drain deferral merges with what the operator opened
+    // meanwhile (see `drainDeferredPages`). Its auto-save gate is closed for the
+    // duration of the restore, exactly like a first restore, and reopened by the
+    // same finally / drain timer.
+    const isDrainRerun = drainDeferredPages.current.delete(initPageId);
+    if (isDrainRerun) restoreCompletePages.current.delete(initPageId);
 
     // Per-page restore queue (Phase 3): local to this page's init run so a
     // second page initializing before this one's drain timer fires can't see
@@ -887,10 +982,30 @@ export function useTerminalInitialization({
         //    pins / focusedZone / scrollback) — matched by zoneIndex.
         const adoptOrphans = !didClaimOrphanAdoption.current;
         didClaimOrphanAdoption.current = true;
-        const openRecords = await fetchOpenRecords(pageId, {
+        const restoreSet = await fetchRestoreSet(pageId, {
           knownPageIds: loadKnownPageIds(),
           adoptOrphans,
         });
+        if (restoreSet.deferredByDrain !== null) {
+          // Coord device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
+          // Phase 3): the backend withheld the restore set because restoring
+          // tabs respawns sessions autonomously. Nothing spawned, records
+          // untouched. Unlike the indeterminate-reconnect abort above, the
+          // auto-save gate is OPENED (by the finally below): a drain can last
+          // hours, and terminals the operator opens meanwhile must persist. The
+          // once-per-page guard and the orphan-adoption claim are released so
+          // the restore re-runs — merging, not re-laying out — when
+          // `drainResumeEpoch` moves.
+          drainDeferredPages.current.add(initPageId);
+          didInitPages.current.delete(initPageId);
+          if (adoptOrphans) didClaimOrphanAdoption.current = false;
+          console.warn(
+            `[TerminalPage] restore for page "${initPageId}" deferred by the coord device ` +
+              `drain: ${restoreSet.deferredByDrain} — it re-runs when the drain lifts.`,
+          );
+          return;
+        }
+        const openRecords = restoreSet.records;
 
         // P1 defect (b): before ANY cold `claude --resume`, read which session
         // ids are ALREADY hosted by a live Claude process (Claude Code's own
@@ -942,7 +1057,8 @@ export function useTerminalInitialization({
         // Restore the layout preset from the cosmetic snapshot if it differs.
         // The restored layout is a starting point only — auto-grow may expand
         // it later so every live session keeps a visible zone.
-        if (saved && saved.layoutId !== zoneLayout.layoutId) {
+        // Not on a drain re-run: the operator's current layout wins.
+        if (!isDrainRerun && saved && saved.layoutId !== zoneLayout.layoutId) {
           // Accept a persisted `flow-grid` id (synthesized, not in the preset
           // table) alongside the static presets — else restoring into flow mode
           // silently drops back to the default and re-hides sessions past the 9th.
@@ -967,7 +1083,7 @@ export function useTerminalInitialization({
           //    the zone + re-attach the claudeSessionId; no resume needed.
           if (reconnectedSet.has(rec.terminalId)) {
             const tabId = rec.terminalId;
-            if (rec.zoneIndex >= 0) {
+            if (mayClaimRecordedZone(isDrainRerun, rec.zoneIndex, tabId, zoneLayout.assignments)) {
               zoneLayout.assignTabToZone(rec.zoneIndex, tabId);
               applyZoneCosmetics(rec.zoneIndex);
             }
@@ -1005,6 +1121,14 @@ export function useTerminalInitialization({
             }
           }
 
+          // A drain re-run never duplicates a session a live tab already shows.
+          if (
+            isDrainRerun &&
+            liveTabsRef.current.some((t) => t.claudeSessionId === rec.claudeSessionId)
+          ) {
+            continue;
+          }
+
           // b) Cold restart (no live pty): recreate the tab, bind its recorded
           //    zone, attach the session id, and (for pinned bindings) queue a
           //    `claude --resume` via the existing drain loop. The OPEN record
@@ -1026,7 +1150,7 @@ export function useTerminalInitialization({
           // `runVerifiedResume`). What is NOT done is re-asserting the record
           // from here: that refreshes `last_seen_at` and is what made ghost
           // rows immortal.
-          if (rec.zoneIndex >= 0) {
+          if (mayClaimRecordedZone(isDrainRerun, rec.zoneIndex, tabId, zoneLayout.assignments)) {
             zoneLayout.assignTabToZone(rec.zoneIndex, tabId);
             applyZoneCosmetics(rec.zoneIndex);
           }
@@ -1147,7 +1271,7 @@ export function useTerminalInitialization({
         //    only when we cold-started (no reconnected pty tabs). Cold start is
         //    now signalled by an EMPTY reconnect list — the `null` case aborted
         //    the whole restore above (P1 defect (a)).
-        if (saved && reconnectedTabIds.length === 0) {
+        if (!isDrainRerun && saved && reconnectedTabIds.length === 0) {
           for (const session of saved.sessions) {
             if (session.type !== "plan" || !session.planFilePath) continue;
             const tabId = createPlanTab(session.planFilePath);
@@ -1159,7 +1283,7 @@ export function useTerminalInitialization({
         }
 
         // 5) Focused zone from the cosmetic snapshot.
-        if (saved && saved.focusedZone >= 0) {
+        if (!isDrainRerun && saved && saved.focusedZone >= 0) {
           zoneLayout.setFocusedZone(saved.focusedZone);
         }
 
@@ -1313,6 +1437,7 @@ export function useTerminalInitialization({
     })();
   }, [
     pageId,
+    drainResumeEpoch,
     reconnectToExistingSessions,
     createTerminal,
     createPlanTab,

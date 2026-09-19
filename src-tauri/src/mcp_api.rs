@@ -9330,12 +9330,29 @@ pub fn create_router(
                 warn!("Startup recovery: previous shutdown was NOT clean — this is crash recovery");
             }
 
-            let summary = crate::commands::ai_session::resume_ai_sessions(
-                chat_sm,
-                chat_handle.clone(),
-                crash_recovery,
-            )
-            .await;
+            // Plan `2026-09-13-drained-runner-never-reaches-idle` D2: decide
+            // against a real drain read, not the not-yet-read state. Bounded —
+            // on timeout the gate sees Unknown and defers, which is fail-closed.
+            crate::coord_drain_state::await_boot_read(std::time::Duration::from_secs(15)).await;
+            let summary = loop {
+                let summary = crate::commands::ai_session::resume_ai_sessions(
+                    chat_sm.clone(),
+                    chat_handle.clone(),
+                    crash_recovery,
+                )
+                .await;
+                if summary.deferred_by_drain.is_none() {
+                    break summary;
+                }
+                // Deferred, never discarded: tell the UI why nothing resumed
+                // yet, then resume the moment autonomous spawns may run again.
+                crate::commands::ai_session::emit_session_recovery_summary(&chat_handle, &summary);
+                crate::coord_drain_state::wait_until_allowed(
+                    crate::coord_drain_state::SpawnOrigin::BootResume,
+                )
+                .await;
+                info!("AI session resume: the coord device drain lifted — resuming now");
+            };
 
             if summary.resumed_count > 0 {
                 info!(
@@ -13034,6 +13051,12 @@ mod memory_search_enrichment_tests {
     /// asserts a DELTA rather than an absolute.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_skip_lands_in_its_own_series_and_not_in_enriched() {
+        // Same serialisation as the other two counter-delta tests in this
+        // module: these assertions are a BEFORE/AFTER read of process-global
+        // atomics, so a sibling test incrementing `enriched` between the two
+        // reads fails this one. Without it the suite carries a latent race —
+        // observed failing here with left: 1, right: 0.
+        let _serialised = series_lock();
         let read = |k: &str| {
             memory_enrich_health_snapshot()
                 .get(k)

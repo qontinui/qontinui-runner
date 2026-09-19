@@ -315,19 +315,23 @@ pub fn launch_follow_up(deps: FollowUpDeps, source_task_run_id: String) -> Resul
             file_registry,
             file_lock,
             deps.app_state.pg_db.clone(),
-            Box::pin(async move {
-                controller
-                    .run(
-                        loop_config,
-                        setup_steps,        // setup automation steps (API requests)
-                        Vec::new(),         // setup prompt steps (none)
-                        verification_steps, // verification steps
-                        Vec::new(),         // agentic steps (prompt is in loop_config.base_prompt)
-                        Vec::new(),         // completion automation steps (none)
-                        Vec::new(),         // completion prompt steps (none)
-                    )
-                    .await
-            }),
+            Box::pin(crate::coord_drain_state::held_until_allowed(
+                crate::coord_drain_state::SpawnOrigin::Orchestration,
+                format!("follow_up:{source_task_run_id}"),
+                async move {
+                    controller
+                        .run(
+                            loop_config,
+                            setup_steps,        // setup automation steps (API requests)
+                            Vec::new(),         // setup prompt steps (none)
+                            verification_steps, // verification steps
+                            Vec::new(), // agentic steps (prompt is in loop_config.base_prompt)
+                            Vec::new(), // completion automation steps (none)
+                            Vec::new(), // completion prompt steps (none)
+                        )
+                        .await
+                },
+            )),
         );
     }
 
