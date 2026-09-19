@@ -368,6 +368,20 @@ test("gatingQualification: a non-success outcome is announced with the head and 
   assert.match(q.message, /pr_check_runs/);
 });
 
+test("gatingQualification: a non-success gate whose OWN rows carry a failure is NOT announced", () => {
+  // The ordinary red PR. coord's rows are correct and complete — `FAILED`
+  // entries included — so there is no disagreement, and firing the alarm on the
+  // commonest non-success path is how an alarm stops being read.
+  const q = gatingQualification("failure", {
+    repo: "o/r",
+    headSha: "abc",
+    rows: 2,
+    anyFailed: true,
+  });
+  assert.equal(q.qualified, true);
+  assert.equal(q.message, null);
+});
+
 test("gatingQualification: an UNRECOGNISED outcome is UNKNOWN, never read as success", () => {
   const q = gatingQualification("${{ steps.run_rust_tests.outcome }}", {
     repo: "o/r",
@@ -379,7 +393,7 @@ test("gatingQualification: an UNRECOGNISED outcome is UNKNOWN, never read as suc
 });
 
 /// Run the CLI against a throwaway HTTP server and return {bodies, stdout}.
-function runIngest(args, logText) {
+function runIngest(args, logText, extraEnv = {}) {
   return new Promise((resolvePromise, rejectPromise) => {
     const bodies = [];
     const server = createServer((req, res) => {
@@ -407,6 +421,7 @@ function runIngest(args, logText) {
             COORD_INGEST_TOKEN: "test-token",
             COORD_HTTP_URL: `http://127.0.0.1:${port}`,
             GITHUB_STEP_SUMMARY: "",
+            ...extraEnv,
           },
         },
         (err, stdout) => {
@@ -443,14 +458,63 @@ test("--gating-outcome success stays silent", async () => {
   assert.doesNotMatch(ok.stdout, /UNQUALIFIED/);
 });
 
-test("MUTATION: dropping the gating plumbing would break the loud case", () => {
-  // The mutation the plan names: remove the outcome plumbing so every ingest
-  // looks qualified. Modelled here so the assertion that catches it is visible.
+test("a RED suite under a failed gate stays quiet end to end", async () => {
+  // The same narrowing, exercised through the real CLI rather than the pure
+  // function, because the conjunct is computed in `main` from the parsed body.
+  const red = await runIngest(["--gating-outcome", "failure"], RED_LOG);
+  assert.equal(red.bodies.length, 1, "it must still ingest — the rows are real data");
+  assert.doesNotMatch(red.stdout, /UNQUALIFIED/);
+});
+
+test("the UNQUALIFIED notice reaches $GITHUB_STEP_SUMMARY, appended", async () => {
+  // Neither `stepSummary()` nor the summary branch was covered by any test —
+  // the byte-identity test above deliberately blanks GITHUB_STEP_SUMMARY.
+  const dir = mkdtempSync(join(tmpdir(), "ingest-summary-"));
+  const summary = join(dir, "summary.md");
+  writeFileSync(summary, "PRE-EXISTING\n", "utf8");
+
+  const r = await runIngest(["--gating-outcome", "failure"], GREEN_LOG, {
+    GITHUB_STEP_SUMMARY: summary,
+  });
+  assert.equal(r.bodies.length, 1);
+
+  const written = readFileSync(summary, "utf8");
+  assert.match(written, /^PRE-EXISTING$/m, "it must APPEND, never truncate");
+  assert.match(written, /Test results recorded for a NON-SUCCESS gating step/);
+  assert.match(written, /UNQUALIFIED/);
+});
+
+// ---------------------------------------------------------------------------
+// MUTATION PROOF — runs the REAL function under a mutated wrapper and asserts
+// that an assertion in THIS suite catches it. The test that stood here until
+// 2026-09-19 built a local stub and asserted the stub behaved as written, which
+// is a tautology that inflates the count and covers nothing.
+// ---------------------------------------------------------------------------
+
+test("MUTATION: dropping the gating plumbing is caught by this suite's own assertions", () => {
+  // The mutation: `main` never consults the flag, so everything looks qualified.
   const mutated = () => ({ qualified: true, message: null });
-  assert.equal(mutated().qualified, true);
-  // The real implementation must NOT behave that way on a non-success outcome:
-  assert.equal(
-    gatingQualification("failure", { repo: "o/r", headSha: "abc", rows: 1 }).qualified,
-    false,
-  );
+
+  // The assertion this suite already makes about a non-success, all-green gate:
+  const assertion = (fn) => {
+    const q = fn("failure", { repo: "o/r", headSha: "deadbee", rows: 7112, anyFailed: false });
+    assert.equal(q.qualified, false);
+    assert.match(q.message, /UNQUALIFIED/);
+  };
+
+  let realThrew = false;
+  try {
+    assertion(gatingQualification);
+  } catch {
+    realThrew = true;
+  }
+  assert.equal(realThrew, false, "the real implementation must satisfy it");
+
+  let mutantThrew = false;
+  try {
+    assertion(mutated);
+  } catch {
+    mutantThrew = true;
+  }
+  assert.equal(mutantThrew, true, "and the mutant must be caught by that same assertion");
 });

@@ -36,11 +36,27 @@
  *
  * `--gating-outcome` is the GATING step's own `outcome` (Phase 4a of plan
  * `2026-09-17-the-windows-test-gate-is-a-90-minute-build-wearing-a-test-shaped-bound`).
- * Its ONLY effect is to make a disagreement VISIBLE: on anything other than
- * `success` this script emits an `::error` annotation and a
- * `$GITHUB_STEP_SUMMARY` line saying that the rows it just wrote for this head
- * are UNQUALIFIED. **The POST body is byte-identical either way**, deliberately,
- * and the tests pin that.
+ * Its ONLY effect is to make a disagreement VISIBLE: when the gating step did
+ * NOT succeed and the parsed rows nevertheless carry no failure, this script
+ * emits an `::error` annotation and a `$GITHUB_STEP_SUMMARY` line saying that
+ * the rows it just wrote for this head are UNQUALIFIED. **The POST body is
+ * byte-identical either way**, deliberately, and the tests pin that.
+ *
+ * The all-green conjunct is deliberate. A non-success gate whose own rows carry
+ * a `FAILED` is the ordinary red PR: coord's rows are correct and complete, and
+ * announcing a disagreement there would fire the alarm on the common path until
+ * nobody read it.
+ *
+ * WHAT IT DOES NOT CATCH, stated because the motivating incident is subtler
+ * than it first reads. On run 35043646051 attempt 1 this script recorded 7112
+ * rows for a job GitHub called `failure`. Those rows are not "a passing suite":
+ * the full suite is 11,368 tests across 29 binaries, so 7112 is 62.6% of it,
+ * and 5709 of them came from the one binary still executing when the clock
+ * killed it. coord therefore received a **silently truncated** row set, in a
+ * shape byte-indistinguishable from a complete one. This flag announces that
+ * the gate did not succeed; it cannot detect truncation, because nothing here
+ * knows how many tests the suite has. That is a separate, uncemented gap, and
+ * it is recorded as a plan-library follow-up rather than implied to be covered.
  *
  * WHY IT CANNOT DO MORE, verified at source on `qontinui-coord` `origin/main`
  * 2026-09-19 (`crates/coord/src/test_run_effects.rs`). There is nowhere for a
@@ -163,11 +179,19 @@ const KNOWN_GATING_OUTCOMES = new Set(["success", "failure", "cancelled", "skipp
  * @param {{repo: string, headSha: string, rows: number}} ctx
  * @returns {{qualified: boolean, message: string|null}}
  */
-export function gatingQualification(gatingOutcome, { repo, headSha, rows }) {
+export function gatingQualification(gatingOutcome, { repo, headSha, rows, anyFailed }) {
   if (gatingOutcome === undefined || gatingOutcome === null) {
     return { qualified: true, message: null };
   }
   if (gatingOutcome === "success") return { qualified: true, message: null };
+
+  // NARROWED: a non-success gating step whose OWN rows carry a failure is the
+  // ordinary red PR, and there is no disagreement to announce — the rows coord
+  // holds are correct and complete, `FAILED` entries included. Alarming on
+  // every red PR is how an alarm stops being read, and this one exists for the
+  // case where coord's rows and GitHub's verdict DISAGREE. Only an all-green
+  // row set beside a non-success gate is that case.
+  if (anyFailed === true) return { qualified: true, message: null };
 
   const named = KNOWN_GATING_OUTCOMES.has(gatingOutcome)
     ? `\`${gatingOutcome}\``
@@ -402,6 +426,7 @@ async function main(argv) {
     repo,
     headSha,
     rows: body.results.length,
+    anyFailed: body.results.some((r) => r.outcome === "fail"),
   });
   if (!qualification.qualified) {
     error(qualification.message);
