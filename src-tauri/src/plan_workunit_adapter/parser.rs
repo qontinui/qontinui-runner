@@ -21,7 +21,10 @@
 //!    status — the property the future parity proof relies on.
 //! 2. **Richer projection.** We also extract [`ParsedWorkUnit::depends_on`]
 //!    (the canonical `Depends-On:` edges) and [`ParsedWorkUnit::phases`] (one
-//!    sub-unit per `Phase N` heading), which coord discarded.
+//!    sub-unit per declared phase — see [`detect_phases`]), which coord discarded.
+
+use once_cell::sync::Lazy;
+use regex::Regex;
 
 /// The operator's markdown convention, supplied as configuration rather than
 /// baked into fleet semantics. Today it carries the set of known lifecycle
@@ -68,9 +71,11 @@ impl Default for PlanConvention {
 /// One phase of a plan, projected to a work sub-unit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedPhase {
-    /// The phase number parsed from the `Phase N` heading.
+    /// The phase number the plan declares (heading, bold line, list item or
+    /// phase-table row — see [`detect_phases`]).
     pub index: u32,
-    /// The heading text (bold-span content or heading line), trimmed of markers.
+    /// The phase's name: bold-span content, heading line, list-item text or
+    /// the phase-table row's second cell, trimmed of markers.
     pub name: String,
 }
 
@@ -290,54 +295,223 @@ fn extract_depends_on(body: &str) -> Vec<String> {
     out
 }
 
-/// Detect `Phase N` headings (markdown `#`-heading or `**`-bold forms only —
-/// never mid-line prose) and project each to a [`ParsedPhase`], deduped by
-/// index (first occurrence wins), in document order.
+/// A heading that opens a **phase-list section** (arm C of [`detect_phases`]):
+/// after one leading enumerator (`4.`, `6.1`, `a.`, `§3`) is stripped, the
+/// heading's first word or two are `Phases` / `Phasing` — `## 4. Phases`,
+/// `## Proposed phases`, `### Phasing & value order`.
+///
+/// Anchored to the START of the heading on purpose: an unanchored `phases`
+/// match fired on `## Named follow-ups (deliberately NOT phases)` in the
+/// corpus census, turning a list of explicitly-NOT-phases into declarations.
+static PHASE_LIST_HEADING: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)^(?:[\w-]+\s*(?:/|&|and)?\s*)?phas(?:es|ing)\b").expect("valid regex")
+});
+
+/// One leading section enumerator on a heading: `4.`, `6.1`, `4)`, `§3`, `a.`.
+static HEADING_ENUMERATOR: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)^(?:§?\d+(?:\.\d+)*[.)]?|[a-z][.)])\s+").expect("valid regex")
+});
+
+/// A heading that is itself a single phase (`Phase 2 — push client`), which
+/// never opens a phase-LIST section.
+static SINGLE_PHASE_HEADING: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)^\W*phase\s+\d").expect("valid regex"));
+
+/// A table data row's first cell naming a phase: `1`, `**2**`, `Phase 3`, `P4`.
+static PHASE_TABLE_CELL: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^\**(?:Phase\s+|P)?(\d+)").expect("valid regex"));
+
+/// A table's separator-row cell: `---`, `:---`, `---:`, `:-:`.
+static TABLE_SEPARATOR_CELL: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^:?-+:?$").expect("valid regex"));
+
+/// `rest` begins with `Phase`, a whitespace boundary, then digits — the token
+/// shape arms A and B key on. Returns the index.
+fn phase_index_at(rest: &str) -> Option<u32> {
+    let after = rest.strip_prefix("Phase")?;
+    if !after.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    let digits: String = after
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+/// The content of a bold span, given the text just AFTER its opening `**`:
+/// everything up to the closing `**`, or the whole remainder when the span
+/// does not close on this line.
+fn bold_span(s: &str) -> String {
+    match s.find("**") {
+        Some(i) => s[..i].trim().to_string(),
+        None => s.trim_end_matches(['*']).trim().to_string(),
+    }
+}
+
+/// A list item's ordinal and content: `- x` / `* x` / `+ x` → `(None, "x")`,
+/// `3. x` / `3) x` → `(Some(3), "x")`; `None` for a line that is not a list
+/// item. `t` is already trimmed.
+fn list_item(t: &str) -> Option<(Option<u32>, &str)> {
+    for bullet in ["- ", "* ", "+ "] {
+        if let Some(rest) = t.strip_prefix(bullet) {
+            return Some((None, rest.trim_start()));
+        }
+    }
+    let digits_end = t.find(|c: char| !c.is_ascii_digit())?;
+    if digits_end == 0 {
+        return None;
+    }
+    let rest = &t[digits_end..];
+    let rest = rest.strip_prefix('.').or_else(|| rest.strip_prefix(')'))?;
+    if !rest.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    let n = t[..digits_end].parse().ok()?;
+    Some((Some(n), rest.trim_start()))
+}
+
+/// Where the scan stands relative to a Markdown table.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TableState {
+    /// Not inside a table.
+    Outside,
+    /// Inside a table whose header's first cell is `Phase` — its rows declare.
+    PhaseTable,
+    /// Inside any other table — its rows are ignored.
+    OtherTable,
+}
+
+/// Detect the phases a plan DECLARES and project each to a [`ParsedPhase`],
+/// deduped by index (first occurrence in document order wins), in document
+/// order. Fenced code blocks are skipped, and so is any list item or table
+/// row whose content opens with `~~` — a struck-through phase was dropped,
+/// and declaring it would hand coord a phase that can never be delivered.
+///
+/// Four arms, chosen from a census of how the plan corpus actually spells its
+/// phases (plan
+/// `2026-09-19-runner-detect-phases-misses-plans-that-list-phases-in-a-table-or-prose`):
+///
+/// - **A** — a `#`-heading or `**`-bold line: `Phase`, whitespace, digits.
+/// - **B** — a column-0 list item (`-`/`*`/`+`/`N.`/`N)`) opening `**Phase N`.
+///   Column 0 only: an indented sub-bullet is commentary about a phase.
+/// - **C** — a column-0 ordered item `N.` / `N)` in the DIRECT body of a
+///   phase-list section ([`PHASE_LIST_HEADING`]), i.e. before the next heading
+///   of any level — so numbered STEPS under a `### Phase 1` inside `## Phases`
+///   are not read as phases.
+/// - **D** — a data row of a table whose header's first cell is `Phase`, with a
+///   first cell of `N` / `**N**` / `Phase N` / `PN`.
+///
+/// Mid-line prose never declares, and neither does a blockquote line (status
+/// narration such as `> **Phase 4 is HELD**`).
 fn detect_phases(body: &str) -> Vec<ParsedPhase> {
     let mut out: Vec<ParsedPhase> = Vec::new();
+    let mut push = |index: u32, name: String| {
+        if !out.iter().any(|p| p.index == index) {
+            out.push(ParsedPhase { index, name });
+        }
+    };
+    let mut in_fence = false;
+    let mut in_phase_list = false;
+    let mut table = TableState::Outside;
+
     for line in body.lines() {
         let t = line.trim();
-        let started_bold = t.starts_with("**");
-        // The heading text after the leading marker (`#...` or `**`).
-        let rest = if t.starts_with('#') {
-            t.trim_start_matches('#').trim_start()
-        } else if started_bold {
-            &t[2..]
-        } else {
-            continue;
-        };
-        // Must be `Phase` followed by a whitespace boundary, then digits.
-        let after_phase = match rest.strip_prefix("Phase") {
-            Some(a) => a,
-            None => continue,
-        };
-        match after_phase.chars().next() {
-            Some(c) if c.is_whitespace() => {}
-            _ => continue,
-        }
-        let digits: String = after_phase
-            .trim_start()
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect();
-        let index: u32 = match digits.parse() {
-            Ok(n) => n,
-            Err(_) => continue,
-        };
-        if out.iter().any(|p| p.index == index) {
+        if t.starts_with("```") || t.starts_with("~~~") {
+            in_fence = !in_fence;
+            table = TableState::Outside;
             continue;
         }
-        // Name: for a bold heading, the bold-span content (up to the closing
-        // `**`); for a `#` heading, the whole line minus trailing markers.
-        let name = if started_bold {
-            match rest.find("**") {
-                Some(i) => rest[..i].trim().to_string(),
-                None => rest.trim_end_matches(['*']).trim().to_string(),
+        if in_fence {
+            continue;
+        }
+        if !t.starts_with('|') {
+            table = TableState::Outside;
+        }
+
+        // Arm A, heading form. Every real heading (1-6 `#` then whitespace)
+        // also re-decides whether the scan is inside a phase-list section.
+        if t.starts_with('#') {
+            let rest = t.trim_start_matches('#');
+            let level = t.len() - rest.len();
+            if level <= 6 && rest.starts_with(char::is_whitespace) {
+                let text = HEADING_ENUMERATOR.replace(rest.trim(), "");
+                in_phase_list =
+                    PHASE_LIST_HEADING.is_match(&text) && !SINGLE_PHASE_HEADING.is_match(&text);
             }
-        } else {
-            rest.trim_end_matches(['#', '*']).trim().to_string()
-        };
-        out.push(ParsedPhase { index, name });
+            let rest = rest.trim_start();
+            if let Some(index) = phase_index_at(rest) {
+                push(index, rest.trim_end_matches(['#', '*']).trim().to_string());
+            }
+            continue;
+        }
+
+        // Arm A, bold form.
+        if let Some(rest) = t.strip_prefix("**") {
+            if let Some(index) = phase_index_at(rest) {
+                push(index, bold_span(rest));
+            }
+            continue;
+        }
+
+        // Arms B and C: column-0 list items only.
+        if !line.starts_with([' ', '\t']) {
+            if let Some((ordinal, content)) = list_item(t) {
+                if content.starts_with("~~") {
+                    continue;
+                }
+                if let Some(rest) = content.strip_prefix("**") {
+                    if let Some(index) = phase_index_at(rest) {
+                        push(index, bold_span(rest));
+                        continue;
+                    }
+                }
+                if let (true, Some(index)) = (in_phase_list, ordinal) {
+                    let name = match content.strip_prefix("**") {
+                        Some(rest) => bold_span(rest),
+                        None => content.to_string(),
+                    };
+                    push(index, name);
+                }
+                continue;
+            }
+        }
+
+        // Arm D: tables.
+        if t.starts_with('|') {
+            let cells: Vec<&str> = t.trim_matches('|').split('|').map(str::trim).collect();
+            let first = cells.first().copied().unwrap_or("");
+            match table {
+                TableState::Outside => {
+                    let is_phase = first.trim_matches('*').trim().eq_ignore_ascii_case("phase");
+                    table = if is_phase {
+                        TableState::PhaseTable
+                    } else {
+                        TableState::OtherTable
+                    };
+                }
+                TableState::PhaseTable
+                    if !TABLE_SEPARATOR_CELL.is_match(first) && !first.starts_with("~~") =>
+                {
+                    let index = PHASE_TABLE_CELL
+                        .captures(first)
+                        .and_then(|caps| caps[1].parse().ok());
+                    if let Some(index) = index {
+                        let name = cells
+                            .get(1)
+                            .copied()
+                            .filter(|c| !c.is_empty())
+                            .unwrap_or(first)
+                            .trim_matches('*')
+                            .trim()
+                            .to_string();
+                        push(index, name);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
     out
 }
@@ -574,6 +748,124 @@ mod tests {
         );
         assert_eq!(p.phases[1].index, 2);
         assert_eq!(p.phases[1].name, "Phase 2: push client");
+    }
+
+    fn indices(body: &str) -> Vec<u32> {
+        parse(body).phases.iter().map(|p| p.index).collect()
+    }
+
+    /// Arm B: a column-0 bullet or ordered item opening `**Phase N`. The
+    /// indented sub-bullet is commentary, not a declaration.
+    #[test]
+    fn phases_arm_b_list_item_opening_bold_phase() {
+        let body = "# T\n\n- **Phase 1 — schema.** body\n1. **Phase 2 — wiring** (~40 LOC)\n  - **Phase 9 depends on this** indented\n";
+        let p = parse(body);
+        assert_eq!(indices(body), vec![1, 2]);
+        assert_eq!(p.phases[0].name, "Phase 1 — schema.");
+        assert_eq!(p.phases[1].name, "Phase 2 — wiring");
+    }
+
+    /// Arm C: ordered items in the DIRECT body of a phase-list section; the
+    /// section ends at the next heading of any level, and a nested item is not
+    /// column 0.
+    #[test]
+    fn phases_arm_c_numbered_list_under_a_phases_heading() {
+        let body = "# T\n\n## 4. Phases\n\n1. **Schema freeze** — author the schemas\n2. Rubric semantics\n   3. nested step\n\n## 5. Risks\n\n7. not a phase\n";
+        let p = parse(body);
+        assert_eq!(indices(body), vec![1, 2]);
+        assert_eq!(p.phases[0].name, "Schema freeze");
+        assert_eq!(p.phases[1].name, "Rubric semantics");
+    }
+
+    /// Arm C's heading rule is anchored: a heading that merely MENTIONS phases
+    /// (measured in the corpus) opens no phase list.
+    #[test]
+    fn phases_arm_c_ignores_a_heading_that_only_mentions_phases() {
+        let body = "# T\n\n## Named follow-ups (deliberately NOT phases)\n\n1. one\n2. two\n";
+        assert!(indices(body).is_empty());
+    }
+
+    /// Numbered STEPS under a `### Phase N` inside `## Phases` are steps, not
+    /// phases: the sub-heading ends the phase list's direct body.
+    #[test]
+    fn phases_arm_c_steps_under_a_phase_subheading_are_not_phases() {
+        let body = "# T\n\n## 5. Phases\n\n### Phase 1 — the guard\n\n1. hook\n2. prefilter\n3. message\n";
+        assert_eq!(indices(body), vec![1]);
+    }
+
+    /// Arm D: a table whose header's first cell is `Phase`. The separator row
+    /// and a struck-through row declare nothing; a table under any other
+    /// header declares nothing.
+    #[test]
+    fn phases_arm_d_table_keyed_on_a_phase_header() {
+        let body = "# T\n\n| Phase | Deliverable |\n|---|---|\n| 1 | re-export forms |\n| **2** | basis |\n| Phase 3 | label |\n| ~~4~~ | dropped |\n\n| # | Claim |\n|---|---|\n| 5 | not a phase |\n";
+        let p = parse(body);
+        assert_eq!(indices(body), vec![1, 2, 3]);
+        assert_eq!(p.phases[0].name, "re-export forms");
+    }
+
+    /// A struck-through item is a DROPPED phase: declaring it would give coord a
+    /// phase that can never be delivered.
+    #[test]
+    fn phases_struck_through_items_are_not_declared() {
+        let body = "# T\n\n## Phases\n\n0. probe\n1. ~~relay~~ **DROPPED**\n2. migrate\n- ~~**Phase 7 — gone**~~\n";
+        assert_eq!(indices(body), vec![0, 2]);
+    }
+
+    /// Fenced code and blockquotes never declare — a fenced example of the
+    /// grammar, or status narration, is not a phase list.
+    #[test]
+    fn phases_fences_and_blockquotes_do_not_declare() {
+        let body = "# T\n\n> **Phase 4 is HELD**, not forgotten.\n\n```\n## Phase 7\n**Phase 8 — example**\n| Phase | x |\n|---|---|\n| 9 | y |\n```\n\n~~~\n- **Phase 6 — example**\n~~~\n";
+        assert!(indices(body).is_empty());
+    }
+
+    /// Regression for the measured unit (`cf9ae0b2`): the parser used to
+    /// record only `{0}` from the bold `**Phase 0 is a gate, not a step.**`
+    /// line. The plan's real declaration is the numbered list under
+    /// `## 4. Phases` — `0.` … `5.`, with `1.` struck through as DROPPED —
+    /// which is exactly what its own status block reports.
+    #[test]
+    fn golden_measured_unit_declares_phases_0_2_3_4_5() {
+        let body = include_str!(
+            "fixtures/2026-09-04-coord-jetstream-durable-consumers-redis-subscriber-migration.md"
+        );
+        let u = parse_work_unit(
+            "2026-09-04-coord-jetstream-durable-consumers-redis-subscriber-migration",
+            "plans/2026-09-04-coord-jetstream-durable-consumers-redis-subscriber-migration.md",
+            body,
+            &conv(),
+        );
+        let got: Vec<u32> = u.phases.iter().map(|p| p.index).collect();
+        assert_eq!(got, vec![0, 2, 3, 4, 5], "phases: {:?}", u.phases);
+    }
+
+    /// Reproduces the plan-corpus census from the REAL parser (rather than a
+    /// port): point `QONTINUI_PHASE_CENSUS_DIR` at a `plans/` directory and run
+    /// `cargo test -p qontinui-runner --lib phase_census -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads a plans directory named by QONTINUI_PHASE_CENSUS_DIR"]
+    fn phase_census() {
+        let dir = std::env::var("QONTINUI_PHASE_CENSUS_DIR")
+            .expect("set QONTINUI_PHASE_CENSUS_DIR to a plans/ directory");
+        let (mut plans, mut zero, mut one, mut many) = (0u32, 0u32, 0u32, 0u32);
+        for entry in std::fs::read_dir(&dir).expect("readable plans dir").flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".md") || authored_at_from_stem(&name[..name.len() - 3]).is_none()
+            {
+                continue;
+            }
+            let Ok(body) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            plans += 1;
+            match detect_phases(&body).len() {
+                0 => zero += 1,
+                1 => one += 1,
+                _ => many += 1,
+            }
+        }
+        println!("phase_census plans={plans} zero={zero} one={one} two_or_more={many}");
     }
 
     // --- golden-file tests over the real plans corpus ------------------------
