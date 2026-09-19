@@ -1368,12 +1368,34 @@ fn allocate_request_body(
 /// The registry wins whenever it answers: a registered session's stamped tenant
 /// is the authority, and a spawn tenant that disagreed with it would be a
 /// runner-side drift this must not paper over.
+///
+/// The spawn tenant is DECLARED in the allocate body (`tenant_id`), so it goes
+/// through the gated [`crate::auth::TenantScope::for_bound_session`]: `Owned`
+/// only when this device can present that tenant's credential, else
+/// `Unbacked` — which declares nothing and presents nothing, rather than a
+/// body naming a tenant the bearer lookup will not back.
 fn allocate_tenant_scope(
     registry: crate::auth::TenantScope,
     spawn_tenant: Option<uuid::Uuid>,
 ) -> crate::auth::TenantScope {
+    allocate_tenant_scope_with(
+        registry,
+        spawn_tenant,
+        &crate::auth::device_holds_usable_binding,
+    )
+}
+
+/// [`allocate_tenant_scope`] with the binding predicate injected, so a test
+/// can pin it without a credential store on disk.
+fn allocate_tenant_scope_with(
+    registry: crate::auth::TenantScope,
+    spawn_tenant: Option<uuid::Uuid>,
+    device_is_bound_to: &dyn Fn(&uuid::Uuid) -> bool,
+) -> crate::auth::TenantScope {
     match (registry, spawn_tenant) {
-        (crate::auth::TenantScope::Unresolved, Some(t)) => crate::auth::TenantScope::Owned(t),
+        (crate::auth::TenantScope::Unresolved, Some(t)) => {
+            crate::auth::TenantScope::for_bound_session(Some(t), device_is_bound_to)
+        }
         (scope, _) => scope,
     }
 }
@@ -2815,7 +2837,7 @@ mod tests {
         }];
 
         // The pre-session interactive spawn: no registry tenant, spawn chose B.
-        let scope = allocate_tenant_scope(TenantScope::Unresolved, Some(b));
+        let scope = allocate_tenant_scope_with(TenantScope::Unresolved, Some(b), &|_| true);
         assert_eq!(scope, TenantScope::Owned(b));
         let body = allocate_request_body(&machine, None, &repos, None, None, scope);
         assert_eq!(body["tenant_id"], b.to_string());
@@ -2861,6 +2883,13 @@ mod tests {
             allocate_tenant_scope(TenantScope::Owned(a), Some(b)),
             TenantScope::Owned(a)
         );
+
+        // A spawn tenant this device cannot present is NOT declared: the scope
+        // is `Unbacked`, so the body carries no `tenant_id`.
+        let unbacked = allocate_tenant_scope_with(TenantScope::Unresolved, Some(b), &|_| false);
+        assert_eq!(unbacked, TenantScope::Unbacked(b));
+        let body = allocate_request_body(&machine, None, &repos, None, None, unbacked);
+        assert!(body.get("tenant_id").is_none(), "got: {body}");
     }
 
     #[test]
