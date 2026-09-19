@@ -902,6 +902,32 @@ async fn capability_manifest() -> impl axum::response::IntoResponse {
     )
 }
 
+/// The `/health` fields that state this runner's DEFAULT tenant — the tenant a
+/// session that names none is minted into (plan
+/// `2026-09-17-findings-carry-a-triage-stamp-and-the-steward-reads-since-last-run`,
+/// Design decision 8). Pure over the pin so the three-way rendering is
+/// unit-testable without a machine.json.
+///
+/// - `activeTenantId`: the UUID string when `machine.json::active_tenant_id`
+///   is set and well-formed, else `null`.
+/// - `activeTenantPin`: `"pinned"` | `"unpinned"` | `"unresolvable"`.
+///   `unpinned` is the legitimate single-tenant shape (key absent or JSON
+///   null). `unresolvable` is NOT "unset": it means `machine.json` is missing,
+///   unreadable, not JSON, or carries an `active_tenant_id` that is not a
+///   UUID — a machine that tried to state its tenant and produced garbage.
+///   `activeTenantId` is `null` for both, so a reader that needs to tell them
+///   apart reads the pin, never the id alone.
+fn active_tenant_health_fields(
+    pin: crate::session::tenant_pin::TenantPin,
+) -> (serde_json::Value, &'static str) {
+    use crate::session::tenant_pin::TenantPin;
+    match pin {
+        TenantPin::Pinned(t) => (serde_json::Value::String(t.to_string()), "pinned"),
+        TenantPin::Unpinned => (serde_json::Value::Null, "unpinned"),
+        TenantPin::Unresolvable => (serde_json::Value::Null, "unresolvable"),
+    }
+}
+
 /// Health check endpoint (also served at `/ui-bridge/health` and
 /// `/ui-bridge/status` — all three share this handler).
 /// Includes `uiBridge` metadata so the app discovery scanner can detect the runner.
@@ -935,6 +961,13 @@ async fn health(
 
     let status = if last_pong > 0 { "ok" } else { "starting" };
     let console_errors = state.ui_bridge_console_error_count.load(Ordering::Relaxed);
+    // `resolve_tenant_pin` is a synchronous file read (machine.json), so it
+    // goes to the blocking pool like every other I/O in this handler. A join
+    // error established nothing about the pin — `Unresolvable`, never a guess.
+    let pin = tokio::task::spawn_blocking(crate::session::tenant_pin::resolve_tenant_pin)
+        .await
+        .unwrap_or(crate::session::tenant_pin::TenantPin::Unresolvable);
+    let (active_tenant_id_json, active_tenant_pin) = active_tenant_health_fields(pin);
 
     // AI provider circuit breaker states
     let ai_provider_states: Vec<serde_json::Value> =
@@ -1504,6 +1537,14 @@ async fn health(
         // check completes, and permanently null on a repo-less install.
         "mainSha": main_sha_json,
         "buildDrift": build_drift_json,
+        // This runner's DEFAULT tenant — what a session that names no tenant
+        // is minted into (`machine.json::active_tenant_id`, read live per
+        // request via `resolve_tenant_pin()`, so re-pointing the pin shows
+        // here without a restart). `activeTenantPin` is the three-way verdict:
+        // `unresolvable` means a malformed/unreadable machine.json and is NOT
+        // "unset" — `unpinned` is unset. See `active_tenant_health_fields`.
+        "activeTenantId": active_tenant_id_json,
+        "activeTenantPin": active_tenant_pin,
         // The last `tools/list` drift observation the coord-mcp proxy made
         // (see `observed_coord_mcp_drift_json`): `null` = no `tools/list` has
         // passed through this process since boot — UNKNOWN, not zero;
@@ -3800,6 +3841,10 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_layering_triage",
     "coord_list_prompt_documents",
     "coord_list_worktrees",
+    // Plan 2026-09-17-findings-carry-a-triage-stamp-and-the-steward-reads-since-last-run
+    // Phase 2: the triage-stamp door. coord's `agent_tool_access::DEVICE_DEFAULT_TOOLS`
+    // is the grant authority; this list only forwards.
+    "coord_mark_findings_triaged",
     "coord_memory_overview",
     "coord_memory_record",
     "coord_memory_search",
@@ -8003,6 +8048,18 @@ struct ProvisionSessionBody {
     /// `coord_declare_intent`'s peer-overlap derivation is only meaningful if
     /// that workdir is the session's REAL cwd.
     cwd: String,
+    /// The tenant the caller wants the minted nonce BOUND to — a nonce
+    /// binding, never a bearer and never a header (plan
+    /// `2026-09-17-findings-carry-a-triage-stamp-and-the-steward-reads-since-last-run`,
+    /// Design decision 8). `Some(t)` is admitted through
+    /// [`crate::coord_mcp::validate_spawn_tenant`] BEFORE anything is minted
+    /// and then frozen onto the binding as `TenantPin::Pinned(t)` — the exact
+    /// plumbing the spawn picker's `--tenant` already drives — so the proxy
+    /// serves THAT tenant's credential per request or refuses; it never falls
+    /// back to another slot. Absent (`None`) keeps the machine pin, which is
+    /// what every caller before this field got.
+    #[serde(default)]
+    tenant: Option<uuid::Uuid>,
 }
 
 /// `POST /coord-mcp/provision-session` — mint coord device identity for a
@@ -8068,11 +8125,19 @@ struct ProvisionSessionBody {
 /// `coord_mcp::NonceLifetime`): the nonce is DEVICE-principal (never agent — no
 /// scope elevation), bound to the caller's `cwd`, and Ephemeral — bounded TTL,
 /// never written to disk, and revoked the instant the operator deletes the
-/// marker.
+/// marker. A fourth, since the optional `tenant` field: WHICH of this device's
+/// PAIRED tenants the binding names is caller-selectable, bounded by
+/// [`crate::coord_mcp::validate_spawn_tenant`] to tenants this device already
+/// holds a credential for — the field can never make a credential appear, only
+/// pick among the ones pairing already put here.
 ///
 /// # Contract
 ///
-/// Request: `{"cwd": "<absolute path to an existing directory>"}`.
+/// Request: `{"cwd": "<absolute path to an existing directory>", "tenant"?: "<uuid>"}`.
+/// `tenant` is optional and selects the NONCE BINDING's tenant (see
+/// [`ProvisionSessionBody::tenant`]); it is validated before the mint and a
+/// tenant this runner holds no credential for is a typed refusal, never a
+/// mint against another slot.
 ///
 /// `200` — body IS the `.mcp.json` document, verbatim and ready to write to a
 /// temp file and pass as `--mcp-config <path>`:
@@ -8101,12 +8166,19 @@ struct ProvisionSessionBody {
 ///
 /// | Status | `code` | Meaning |
 /// |---|---|---|
-/// | 400 | `COORD_MCP_PROVISION_INVALID_BODY` | body is not `{cwd:String}` |
+/// | 400 | `COORD_MCP_PROVISION_INVALID_BODY` | body is not `{cwd:String, tenant?:Uuid}` (a non-UUID `tenant` lands here) |
 /// | 400 | `COORD_MCP_PROVISION_INVALID_CWD` | `cwd` empty or not an existing dir |
 /// | 403 | `COORD_MCP_PROVISION_NO_HANDSHAKE` | no (or empty) `X-Qontinui-Loopback-Key` header |
 /// | 403 | `COORD_MCP_PROVISION_HANDSHAKE_MISMATCH` | handshake presented, not this runner start's key |
 /// | 403 | `COORD_MCP_PROVISION_NOT_OPTED_IN` | no opt-in marker on this machine |
+/// | 403 | `COORD_MCP_PROVISION_TENANT_NOT_PAIRED` | `tenant` named, and this runner holds no credential slot for it (`SpawnTenantRefusal::NotPaired`); the message names the tenant and the pairing heal. Nothing was minted |
+/// | 403 | `COORD_MCP_PROVISION_TENANT_WORKDIR_DECLARES_OTHER` | `tenant` named, and the cwd's own `.mcp.json` declares a coord-mcp key that does not resolve to it (`SpawnTenantRefusal::WorkdirDeclaresOtherTenant`). Produced by the cwd-declared check (`check_workdir_declared_tenant`), run after admission whenever the cwd declares a coord-mcp — its own code so a cwd problem never gets a pairing heal. Nothing was minted |
+/// | 503 | `COORD_MCP_PROVISION_CREDENTIAL_STORE_UNREADABLE` | `tenant` named, and whether it is paired is UNKNOWN because the credential store could not be read (`SpawnTenantRefusal::CredentialStoreUnreadable`) — refused rather than guessed. Nothing was minted |
 /// | 503 | `COORD_MCP_PROVISION_PORT_UNRESOLVABLE` | bound port unresolvable — fail-closed |
+///
+/// The tenant refusals come BEFORE the mint and never select a fallback slot:
+/// a session that asked for tenant T and got the machine's default would write
+/// into a tenant nobody named, which is the defect the field exists to end.
 ///
 /// Callers are expected to fail OPEN on every one of these: a launcher that
 /// cannot get identity must still launch the session, un-shimmed.
@@ -8114,20 +8186,6 @@ async fn coord_provision_session_handler(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
-    use axum::response::IntoResponse;
-
-    let err = |status: axum::http::StatusCode, code: &str, msg: String| {
-        (
-            status,
-            Json(serde_json::json!({
-                "success": false,
-                "error": msg,
-                "code": code,
-            })),
-        )
-            .into_response()
-    };
-
     // Gate FIRST — before parsing, before any registry or credential touch. An
     // unauthenticated caller therefore never reaches the body parser, the nonce
     // registry or the credential store; it costs one header read and one marker
@@ -8144,20 +8202,54 @@ async fn coord_provision_session_handler(
             denial.code(),
             denial.message()
         );
-        return err(
+        return provision_refusal(
             axum::http::StatusCode::FORBIDDEN,
             denial.code(),
             denial.message(),
         );
     }
 
-    let req: ProvisionSessionBody = match serde_json::from_slice(&body) {
+    provision_session_after_gate(&body)
+}
+
+/// One typed refusal body for the mint route — `{success:false, error, code}`
+/// with a non-2xx status, the runner's no-silent-empty rule (see the status
+/// table on [`coord_provision_session_handler`]).
+fn provision_refusal(
+    status: axum::http::StatusCode,
+    code: &str,
+    msg: String,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        status,
+        Json(serde_json::json!({
+            "success": false,
+            "error": msg,
+            "code": code,
+        })),
+    )
+        .into_response()
+}
+
+/// The post-gate half of [`coord_provision_session_handler`]: body parse, cwd
+/// check, tenant admission, mint. Split out so the tenant arm is testable
+/// without the process-global loopback handshake key the gate reads — the gate
+/// itself is pinned by `coord_provision_session_gate_tests`, and it MUST have
+/// passed before this runs (see the handler's security note).
+fn provision_session_after_gate(body: &[u8]) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let req: ProvisionSessionBody = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => {
-            return err(
+            return provision_refusal(
                 axum::http::StatusCode::BAD_REQUEST,
                 "COORD_MCP_PROVISION_INVALID_BODY",
-                format!("expected a JSON body of the shape {{\"cwd\": \"<path>\"}}: {e}"),
+                format!(
+                    "expected a JSON body of the shape {{\"cwd\": \"<path>\", \
+                     \"tenant\"?: \"<uuid>\"}}: {e}"
+                ),
             );
         }
     };
@@ -8169,18 +8261,81 @@ async fn coord_provision_session_handler(
     // canonicalization yields `\\?\`-prefixed paths that would never match them.
     let cwd = req.cwd.trim();
     if cwd.is_empty() || !std::path::Path::new(cwd).is_dir() {
-        return err(
+        return provision_refusal(
             axum::http::StatusCode::BAD_REQUEST,
             "COORD_MCP_PROVISION_INVALID_CWD",
             format!("cwd {cwd:?} is empty or not an existing directory"),
         );
     }
 
+    // A caller-named tenant is admitted BEFORE anything is minted (plan
+    // `2026-09-17-findings-carry-a-triage-stamp-and-the-steward-reads-since-last-run`
+    // Design decision 8): the same typed admission the spawn picker's
+    // `--tenant` passes through. A refusal names the tenant and the heal and
+    // mints NOTHING — never a nonce on the machine's default slot, which would
+    // hand the caller a session that writes into a tenant it did not name.
+    if let Some(tenant) = req.tenant {
+        use crate::coord_mcp::SpawnTenantRefusal;
+        if let Err(refusal) = crate::coord_mcp::validate_spawn_tenant(tenant) {
+            let (status, code) = match &refusal {
+                SpawnTenantRefusal::NotPaired { .. } => (
+                    axum::http::StatusCode::FORBIDDEN,
+                    "COORD_MCP_PROVISION_TENANT_NOT_PAIRED",
+                ),
+                SpawnTenantRefusal::CredentialStoreUnreadable { .. } => (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "COORD_MCP_PROVISION_CREDENTIAL_STORE_UNREADABLE",
+                ),
+                // `validate_spawn_tenant` never produces this arm today (it is
+                // the cwd-declared check's), but a refusal is a refusal: 403,
+                // nothing minted — under its OWN code, so a future caller of
+                // that check is not sent to pair a tenant for a cwd problem.
+                SpawnTenantRefusal::WorkdirDeclaresOtherTenant { .. } => (
+                    axum::http::StatusCode::FORBIDDEN,
+                    "COORD_MCP_PROVISION_TENANT_WORKDIR_DECLARES_OTHER",
+                ),
+            };
+            warn!(
+                cwd = %cwd,
+                tenant = %tenant,
+                "coord-mcp provision-session: refused the named tenant ({code}) — {refusal}"
+            );
+            return provision_refusal(status, code, format!("tenant {tenant} refused — {refusal}"));
+        }
+        // Review W1 (2026-09-19): the cwd's OWN `.mcp.json` outranks an injected
+        // config in ways nobody has measured (`check_workdir_declared_tenant`'s
+        // doc), so a caller that NAMED a tenant while launching into a cwd whose
+        // declared key is pinned elsewhere would get a session on that other
+        // tenant — the exact outcome the prose above promises never happens.
+        // Same predicate and same arm as the spawn path
+        // (`coord_mcp::terminal_coord_mcp_for_spawn`): only a cwd that declares
+        // a coord-mcp is checked; a cwd with no `.mcp.json` is not a statement.
+        if crate::coord_mcp::workdir_declares_coord_mcp(cwd) {
+            if let Err(refusal) = crate::coord_mcp::check_workdir_declared_tenant(
+                cwd,
+                tenant,
+                crate::coord_mcp::resolve_bound_api_port(),
+            ) {
+                warn!(
+                    cwd = %cwd,
+                    tenant = %tenant,
+                    "coord-mcp provision-session: refused the named tenant (COORD_MCP_PROVISION_TENANT_WORKDIR_DECLARES_OTHER) — {refusal}"
+                );
+                return provision_refusal(
+                    axum::http::StatusCode::FORBIDDEN,
+                    "COORD_MCP_PROVISION_TENANT_WORKDIR_DECLARES_OTHER",
+                    format!("tenant {tenant} refused — {refusal}"),
+                );
+            }
+        }
+    }
+
     // The shared mint core (§2) — fail-closed on an unresolvable bound port.
-    match crate::coord_mcp::provision_session_proxy_config(cwd) {
+    match crate::coord_mcp::provision_session_proxy_config(cwd, req.tenant) {
         Some(config) => {
             info!(
                 cwd = %cwd,
+                tenant = ?req.tenant,
                 "coord-mcp provision-session: minted an ephemeral device session config"
             );
             (axum::http::StatusCode::OK, Json(config)).into_response()
@@ -8192,7 +8347,7 @@ async fn coord_provision_session_handler(
                  mint (a config on a bootstrap-default port would be dead on any \
                  secondary/temp runner)"
             );
-            err(
+            provision_refusal(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 "COORD_MCP_PROVISION_PORT_UNRESOLVABLE",
                 "the runner's bound API port is unresolvable — refusing to mint a \
@@ -13535,6 +13690,34 @@ mod coord_mcp_body_gate_tests {
         );
     }
 
+    /// Plan `2026-09-17-findings-carry-a-triage-stamp-and-the-steward-reads-since-last-run`
+    /// Phase 2: the triage-stamp door forwards, and the source-text parser the
+    /// drift verdict runs over this file reads the entry back — the comment
+    /// above it must not hide it from, or add a phantom to, that parse.
+    #[test]
+    fn coord_mark_findings_triaged_is_allowed_and_parses_from_source() {
+        assert!(coord_mcp_tool_is_allowed("coord_mark_findings_triaged"));
+        assert!(
+            COORD_MCP_ALLOWED_TOOLS
+                .binary_search(&"coord_mark_findings_triaged")
+                .is_ok(),
+            "membership is a binary_search, so the entry must sit in sorted position"
+        );
+        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
+            .expect("mcp_api.rs parses");
+        assert_eq!(
+            parsed
+                .allowed
+                .iter()
+                .filter(|t| t.as_str() == "coord_mark_findings_triaged")
+                .count(),
+            1,
+            "the parser must read the entry exactly once: {:?}",
+            parsed.allowed
+        );
+        assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
+    }
+
     /// The MCP handshake + the legitimate coordination surface forwards.
     #[test]
     fn allows_handshake_and_coordination_tools() {
@@ -15649,6 +15832,229 @@ mod coord_provision_session_gate_tests {
             !super::csp_allows_eval(),
             "shipped CSP must not permit eval"
         );
+    }
+
+    /// Plan `2026-09-17-findings-carry-a-triage-stamp-and-the-steward-reads-since-last-run`
+    /// Phase 5: the body's optional `tenant` — absent, present as a UUID, and
+    /// refused (400 at the parser) when it is not one.
+    #[test]
+    fn provision_body_takes_an_optional_uuid_tenant() {
+        use super::ProvisionSessionBody;
+        let without: ProvisionSessionBody = serde_json::from_str(r#"{"cwd":"/tmp"}"#).unwrap();
+        assert_eq!(without.cwd, "/tmp");
+        assert_eq!(without.tenant, None);
+
+        let t = uuid::Uuid::from_u128(0xC3C3_0000_0000_4000_8000_0000_0000_00C3);
+        let with: ProvisionSessionBody =
+            serde_json::from_str(&format!(r#"{{"cwd":"/tmp","tenant":"{t}"}}"#)).unwrap();
+        assert_eq!(with.tenant, Some(t));
+
+        let null: ProvisionSessionBody =
+            serde_json::from_str(r#"{"cwd":"/tmp","tenant":null}"#).unwrap();
+        assert_eq!(null.tenant, None, "an explicit null is the same as absent");
+
+        assert!(
+            serde_json::from_str::<ProvisionSessionBody>(r#"{"cwd":"/tmp","tenant":"not-a-uuid"}"#)
+                .is_err(),
+            "a non-UUID tenant must not parse (it lands as COORD_MCP_PROVISION_INVALID_BODY)"
+        );
+    }
+
+    /// Phase 5, the load-bearing half: a `tenant` this runner holds no
+    /// credential for is a typed 403 naming the tenant, decided BEFORE the
+    /// mint — the nonce registry is byte-identical afterwards, so the caller
+    /// was never handed a session on the machine's default slot. Runs the
+    /// post-gate half directly: the gate is process-global state pinned by the
+    /// tests above, and it is not what this test is about.
+    #[tokio::test]
+    async fn an_unpaired_tenant_is_refused_before_anything_is_minted() {
+        let amb = crate::test_env::isolated_ambient();
+        let tenant = uuid::Uuid::from_u128(0xD4D4_0000_0000_4000_8000_0000_0000_00D4);
+        let cwd = amb.dir().join("provision-tenant-cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd_str = cwd.to_string_lossy().to_string();
+        let body = serde_json::json!({
+            "cwd": cwd_str,
+            "tenant": tenant.to_string(),
+        })
+        .to_string();
+
+        // Diagnostic only: the registry is process-global and sibling tests
+        // mint into it concurrently, so a whole-map before/after equality
+        // would race them. The property asserted below is caller-scoped.
+        let before = crate::coord_mcp::proxy_nonces().lock().unwrap().len();
+
+        let resp = super::provision_session_after_gate(body.as_bytes());
+        assert_eq!(resp.status(), 403);
+        let v = body_json(resp).await;
+        assert_eq!(v["success"], false);
+        assert_eq!(v["code"], "COORD_MCP_PROVISION_TENANT_NOT_PAIRED");
+        let err = v["error"].as_str().unwrap_or_default();
+        assert!(
+            err.contains(&tenant.to_string()),
+            "the refusal names the tenant: {err}"
+        );
+        assert!(
+            err.contains("qontinui_profile device pair --tenant-id"),
+            "the refusal names the heal: {err}"
+        );
+
+        let registry = crate::coord_mcp::proxy_nonces().lock().unwrap();
+        assert!(
+            registry.values().all(|b| b.workdir() != cwd_str),
+            "a refused tenant must mint NOTHING for the caller's cwd (registry had {before} \
+             bindings before, {} after)",
+            registry.len()
+        );
+    }
+
+    /// The gate still runs FIRST with a `tenant` in the body: no handshake ⇒
+    /// `_NO_HANDSHAKE`, and the denial carries neither the tenant string nor a
+    /// pairing verdict — an unauthenticated caller never learns this machine's
+    /// pairing state, exactly as it never learns its opt-in state.
+    #[tokio::test]
+    async fn a_tenant_in_the_body_does_not_bypass_the_gate_or_leak_pairing_state() {
+        let amb = crate::test_env::isolated_ambient();
+        let cwd = amb.dir().join("provision-gate-first-cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let tenant = uuid::Uuid::from_u128(0xA7A7_0000_0000_4000_8000_0000_0000_00A7);
+        let body = serde_json::json!({
+            "cwd": cwd.to_string_lossy(),
+            "tenant": tenant.to_string(),
+        })
+        .to_string();
+        let resp = provision_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/coord-mcp/provision-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+        let v = body_json(resp).await;
+        assert_eq!(v["code"], "COORD_MCP_PROVISION_NO_HANDSHAKE");
+        let text = v.to_string();
+        assert!(
+            !text.contains(&tenant.to_string()),
+            "an unauthenticated denial must not echo the tenant: {text}"
+        );
+        assert!(
+            !text.contains("TENANT_NOT_PAIRED") && !text.contains("pair --tenant-id"),
+            "an unauthenticated caller must not learn pairing state: {text}"
+        );
+    }
+
+    /// Phase 5: the tenant admission runs AFTER the cwd check (a bogus cwd is
+    /// still the cwd error) and the tenant refusal is not reachable by a body
+    /// that names no tenant — such a body reaches the mint, which in a unit
+    /// test fails closed on the unresolvable bound port, exactly as before.
+    #[tokio::test]
+    async fn a_body_naming_no_tenant_reaches_the_mint_unchanged() {
+        let amb = crate::test_env::isolated_ambient();
+        let cwd = amb.dir().join("provision-no-tenant-cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let body = serde_json::json!({ "cwd": cwd.to_string_lossy() }).to_string();
+        let resp = super::provision_session_after_gate(body.as_bytes());
+        assert_eq!(resp.status(), 503);
+        assert_eq!(
+            body_json(resp).await["code"],
+            "COORD_MCP_PROVISION_PORT_UNRESOLVABLE"
+        );
+
+        // A tenant named against a missing cwd: the cwd check wins, and the
+        // tenant is never consulted (no credential-store read for a fiction).
+        let tenant = uuid::Uuid::from_u128(0xE5E5_0000_0000_4000_8000_0000_0000_00E5);
+        let body = serde_json::json!({
+            "cwd": amb.dir().join("does-not-exist").to_string_lossy(),
+            "tenant": tenant.to_string(),
+        })
+        .to_string();
+        let resp = super::provision_session_after_gate(body.as_bytes());
+        assert_eq!(resp.status(), 400);
+        assert_eq!(
+            body_json(resp).await["code"],
+            "COORD_MCP_PROVISION_INVALID_CWD"
+        );
+    }
+
+    /// Phase 5: `/health`'s `activeTenantId` / `activeTenantPin` — the pin is
+    /// always one of the three strings, the id is a UUID string only when
+    /// pinned and `null` otherwise, and `unresolvable` is NOT rendered as
+    /// "unset".
+    #[test]
+    fn health_active_tenant_fields_render_all_three_pins() {
+        use super::active_tenant_health_fields;
+        use crate::session::tenant_pin::TenantPin;
+        const PINS: [&str; 3] = ["pinned", "unpinned", "unresolvable"];
+
+        let t = uuid::Uuid::from_u128(0xF6F6_0000_0000_4000_8000_0000_0000_00F6);
+        for (pin, want_id, want_pin) in [
+            (TenantPin::Pinned(t), Some(t), "pinned"),
+            (TenantPin::Unpinned, None, "unpinned"),
+            (TenantPin::Unresolvable, None, "unresolvable"),
+        ] {
+            let (id, pin_str) = active_tenant_health_fields(pin);
+            assert!(PINS.contains(&pin_str), "{pin_str}");
+            assert_eq!(pin_str, want_pin);
+            match want_id {
+                Some(t) => assert_eq!(id, serde_json::Value::String(t.to_string())),
+                None => assert!(id.is_null(), "{id}"),
+            }
+            // null-or-uuid, the contract a reader of the body relies on.
+            if !id.is_null() {
+                uuid::Uuid::parse_str(id.as_str().unwrap()).expect("a uuid string");
+            }
+        }
+        assert_ne!(
+            active_tenant_health_fields(TenantPin::Unresolvable).1,
+            active_tenant_health_fields(TenantPin::Unpinned).1,
+            "unresolvable must never read as unset"
+        );
+    }
+
+    /// The `/health` handler actually emits both keys under `data`, beside
+    /// `buildId` / `mainSha` / `buildDrift` (same source-scan technique as
+    /// `the_health_handler_emits_the_supervised_workers_block`).
+    #[test]
+    fn the_health_handler_emits_the_active_tenant_fields() {
+        let src = include_str!("mcp_api.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with("async fn health("))
+            .expect("the /health handler is `async fn health(`");
+        let end = lines[start..]
+            .iter()
+            .position(|l| *l == "}")
+            .map(|i| start + i)
+            .expect("the handler closes at column 0");
+        let region = lines[start..=end]
+            .iter()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            region.contains("\"activeTenantId\": active_tenant_id_json"),
+            "{region}"
+        );
+        assert!(
+            region.contains("\"activeTenantPin\": active_tenant_pin"),
+            "{region}"
+        );
+        assert!(
+            region.contains("spawn_blocking(crate::session::tenant_pin::resolve_tenant_pin)"),
+            "the pin must be read LIVE from resolve_tenant_pin(), on the blocking pool"
+        );
+        assert!(
+            region.contains("active_tenant_health_fields(pin)"),
+            "the fields must be rendered from that live pin"
+        );
+        assert!(src.contains(".route(\"/health\", get(health))"));
     }
 
     /// Phase 4: `/health.credentialDoors` states, per transport, whether it can
