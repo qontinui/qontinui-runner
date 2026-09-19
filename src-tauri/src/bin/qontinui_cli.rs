@@ -936,14 +936,24 @@ fn plan_workunit_backfill(args: &[String]) -> ExitCode {
     let summary = runtime.block_on(pwa::backfill_work_units_once(to_push, &sink));
 
     println!(
-        "scanned={} created={} refreshed={} transitioned={} deferred={} failed={}",
+        "scanned={} created={} refreshed={} transitioned={} deferred={} \
+         refused_permanently={} failed={}",
         summary.scanned,
         summary.created,
         summary.refreshed,
         summary.transitioned,
         summary.deferred,
+        summary.refused_permanently,
         summary.failed
     );
+    if summary.refused_permanently > 0 {
+        println!(
+            "note: {} unit(s) carry a status coord refused permanently (typically a \
+             coord-derived stamp such as `shipped`/`ready` that coord does not hold yet); \
+             their metadata was refreshed. Not an error.",
+            summary.refused_permanently
+        );
+    }
     if summary.deferred > 0 {
         println!(
             "note: {} unit(s) deferred — a real agent last drove them, so the markdown proxy \

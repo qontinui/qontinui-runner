@@ -2539,6 +2539,12 @@ pub struct WorkUnitBackfillSummary {
     pub deferred: u64,
     /// Units whose read or push errored. The pass continues past each one.
     pub failed: u64,
+    /// Units whose STATUS coord refused with `terminality: "permanent"` — in
+    /// practice a file stamped with a coord-DERIVED word (`shipped`/`ready`)
+    /// that coord does not yet hold. Not a failure: the unit's metadata upsert
+    /// runs before the refused status write, and no retry of the identical
+    /// request could succeed. The operator action, if any, is the stamp.
+    pub refused_permanently: u64,
     /// The deferred units, named. `deferred == deferred_units.len()`.
     pub deferred_units: Vec<DeferredUnit>,
 }
@@ -2618,12 +2624,22 @@ pub async fn backfill_work_units_once<S: WorkUnitSink + ?Sized>(
                 }
             },
             Err(e) => {
-                summary.failed += 1;
-                tracing::warn!(
-                    slug = %u.slug,
-                    error = %format!("{e:#}"),
-                    "plan backfill: push failed"
-                );
+                if denial_of(&e).is_some_and(|d| d.verdict.is_permanently_denied()) {
+                    summary.refused_permanently += 1;
+                    tracing::info!(
+                        slug = %u.slug,
+                        attempted_status = %u.status,
+                        "plan backfill: coord refused this unit's status permanently (metadata \
+                         was refreshed); not a failure — edit the stamp if it is wrong"
+                    );
+                } else {
+                    summary.failed += 1;
+                    tracing::warn!(
+                        slug = %u.slug,
+                        error = %format!("{e:#}"),
+                        "plan backfill: push failed"
+                    );
+                }
             }
         }
     }
@@ -8149,6 +8165,15 @@ mod tests {
         );
     }
 
+    /// A `permanent` refusal of a SETTABLE word, for the tests that exercise
+    /// the pair-scoped retirement on the `UpsertWithStatus` door. coord's only
+    /// `permanent` today is `status_is_derived`, which it never answers for
+    /// `vetted`; this body is deliberately not that one, so the fixture does not
+    /// teach a false model of which words coord derives. The mechanism under
+    /// test keys on `terminality`, never on the code.
+    const SYNTHETIC_PERMANENT: &str =
+        r#"{"error":"a_future_permanent_refusal","terminality":"permanent"}"#;
+
     /// Run `cycles` reconciles of the same one-unit corpus against `sink`,
     /// returning each cycle's summary. The retirement tests below differ only
     /// in the corpus and the sink, and a seven-argument call per cycle buries
@@ -8199,7 +8224,7 @@ mod tests {
         // scopes the refusal to the pair, so the status-less metadata upsert
         // that follows is ACCEPTED — modelled with `deny_status`.
         let permanent = FakeSink {
-            deny_status: Some(("vetted".to_string(), 422, r#"{"error":"status_is_derived","message":"status `shipped` is derived (coord-computed from a predicate), not directly settable","terminality":"permanent"}"#.to_string())),
+            deny_status: Some(("vetted".to_string(), 422, SYNTHETIC_PERMANENT.to_string())),
             ..Default::default()
         };
         let mut r = Reconciler::new();
@@ -8275,7 +8300,7 @@ mod tests {
         let sink = FakeSink {
             // Refuses exactly the status write, at the pair scope coord's
             // `permanent` covers; the later status-less upserts are accepted.
-            deny_status: Some(("vetted".to_string(), 422, r#"{"error":"status_is_derived","message":"status `shipped` is derived (coord-computed from a predicate), not directly settable","terminality":"permanent"}"#.to_string())),
+            deny_status: Some(("vetted".to_string(), 422, SYNTHETIC_PERMANENT.to_string())),
             ..Default::default()
         };
         let mut r = Reconciler::new();
@@ -9312,6 +9337,39 @@ mod tests {
             backfill_work_units_once(&[unit("bad", "draft"), unit("good", "draft")], &sink).await;
         assert_eq!(s.failed, 1);
         assert_eq!(s.created, 1);
+    }
+
+    /// A status coord refuses `permanent` is NOT a backfill failure: the
+    /// metadata upsert landed before the refused status write, and no retry of
+    /// the identical request could succeed. Counting it `failed` made the
+    /// one-shot CLI exit 1 for a unit with no fault.
+    ///
+    /// Neuter check: route the permanent denial back into `failed` and this
+    /// fails.
+    #[tokio::test]
+    async fn backfill_counts_a_permanent_status_refusal_separately_from_failure() {
+        let sink = FakeSink {
+            last_actor: Some("coord::derive_worker".to_string()),
+            deny_status: Some((
+                "shipped".to_string(),
+                422,
+                r#"{"error":"status_is_derived","terminality":"permanent"}"#.to_string(),
+            )),
+            ..Default::default()
+        };
+        sink.statuses
+            .lock()
+            .unwrap()
+            .insert("a".to_string(), "ready".to_string());
+        let s = backfill_work_units_once(&[unit("a", "shipped"), unit("b", "draft")], &sink).await;
+        assert_eq!(s.refused_permanently, 1, "the derived stamp was refused");
+        assert_eq!(s.failed, 0, "...and that is not a failure");
+        assert_eq!(s.created, 1, "the next unit still landed");
+        assert_eq!(
+            sink.statuses.lock().unwrap().get("a").map(String::as_str),
+            Some("ready"),
+            "coord's own status is untouched"
+        );
     }
 
     /// Idempotence must not rest on the backend echoing the status it was
