@@ -403,6 +403,33 @@ Do all four (they're fast and independent):
    **INCOMPLETE**, which is not an all-clear: the scan has a hole in it, so
    close the hole and re-run rather than reading it as clean.
 
+   **While you are here, RECORD THE BASELINE — same globs, one more command**
+   *(plan `2026-09-05-a-verification-report-never-states-the-tree-it-read`
+   Phase 5)*:
+   ```bash
+   bash <workspace-root>/qontinui-claude-config/scripts/landed-since.sh record         "<repo>/<path-the-plan-touches>/*" ...
+   ```
+   This is the ONE thing that cannot be recovered later. Everything in checks
+   1–4 reads a surface as it stands *now*; the question *"did a peer LAND my
+   work while I was building?"* needs a **starting point**, and nothing in this
+   fleet recorded one before this (verified 2026-09-05: no `baseline_sha` /
+   `session_start_sha` / `base_sha` anywhere in `scripts/` or `.claude/`). A
+   probe with no baseline is not a weaker probe; it is no probe. **Record once
+   per session**: `record` overwrites the baseline unconditionally, so if
+   `/preflight` step 4b already recorded one this session
+   (`test -f ~/.qontinui/landed-since/<session-id>.json`), skip it here — a
+   second record moves the start forward past whatever landed between. Exit `3` means, e.g.,
+   a glob reached no checkout or a fetch failed — the baseline covers less than
+   you asked for, which is UNKNOWN rather than clear.
+
+   The matching `check` runs **before every rebase** and at Step 4.7. Until it
+   existed, a rebase conflict was the FIRST signal that a peer had shipped your
+   work: occurrence 4's PR #583 landed 3 of the 4 defects the session was
+   fixing. `scan-worktree-wip.sh` above cannot see that — it reads uncommitted
+   work on disk, once, before the window opens — and neither can
+   `coord_conflict_check`, which scans UNMERGED branches, so the signal vanishes
+   at the moment the peer's branch merges and is deleted.
+
    This is not hypothetical. On 2026-08-19 this exact step caught a peer holding
    ~30 staged files that implemented a plan's Phase 1 — better than the plan
    did — after `coord_who_is_working_on` had returned `verdict: "clear"` twice
@@ -705,8 +732,23 @@ ledger when THAT row falls due — every min(max(its own TTL/3, 60 s), TTL/2)
 since its last ok, so a short-TTL row added to a loop already sleeping on long
 rows is still renewed inside its grant — replaying the owner token
 `<machine_id>:<agent_session_id>` on every request — coord matches on that pair,
-so a heartbeat without it renews nothing, answers `not_held`, and lets the claim
-age out anyway. `status --ledger "$CLAIM_LEDGER"` prints one line per row and a
+so a heartbeat without it renews nothing and lets the claim age out anyway.
+**It does not answer `not_held` - that is the RELEASE door's word.** Today
+`HeartbeatResult` (`claims.rs`) has exactly two variants, `ok` and `stolen`, and
+`heartbeat` folds BOTH non-renewals into `stolen`. What separates them is
+`current_holder`, not the verdict word: a NAMED holder is a token mismatch or a
+real theft - drop the owner token and coord names *you*, since you are still the
+stored owner - while `current_holder: null` means the key was already GONE and
+the grant had expired. `scripts/coord-claim-heartbeat.sh` makes that split for
+you and records the null case `lapsed`. The two have opposite recoveries - fix
+the owner token, versus a fresh `acquire` - so read `current_holder` before
+deciding which happened. (qontinui/qontinui-coord#2206, OPEN as this is written,
+gives the expired case its own `not_held` verdict on this door; `hb_row` already
+maps that word, so the LOOP needs no change when it deploys - though the
+discriminator above becomes the verdict word again, since #2206 also makes
+`current_holder` non-optional on `stolen`.)
+
+`status --ledger "$CLAIM_LEDGER"` prints one line per row and a
 verdict on its exit code: `LIVE` (0), `STALE` (3), `DEAD` (4), `STOLEN` (5),
 `LAPSED` (7), `EMPTY` (8).
 Anything but `LIVE` means the claim is **UNKNOWN, not held**.
@@ -981,12 +1023,30 @@ run. With the 30-minute net, the expected state here is **pre-dispatch** again.
 > transition — that only narrows the race to one sweep tick. The fix is that
 > §5.4 does not register the gate under this caller.
 >
-> ⛔ **And never withdraw a `unit_ready` gate you find stranded.** A `withdrawn`
-> row is never `cleared`, while `all_unit_gates_cleared`
-> (`work_unit_derive_worker.rs:337-353`) requires `total == cleared` across all
-> gates on the unit — so withdrawing one **permanently** prevents that unit from
-> deriving `ready`. Agents were already doing this before it was understood.
-> Record the `gate_id` and leave the row alone.
+> ⚠️ **Withdrawing a stranded record gate no longer FORECLOSES readiness — but
+> it does not PRODUCE it either (verified 2026-09-18 against the serving
+> build).** This block used to forbid withdrawal, and was right to: until
+> qontinui-coord **`47014372`** (*"fix: stop a retired gate permanently barring
+> its work unit from `ready`"*, an ancestor of the serving build `b826916e`) a
+> `withdrawn` row stayed in `total` forever, so the unit could never reach
+> `total == cleared` again even with a fresh cleared gate. That is gone.
+>
+> ⛔ **But `all_unit_gates_cleared` is `total > 0 && total == cleared`, and the
+> first conjunct matters.** The query now excludes archived, muted AND withdrawn
+> rows (`work_unit_derive_worker.rs:752` — the old `:337-353` citation had
+> drifted), so withdrawal REMOVES the row: withdraw the last counted gate and
+> `total = 0`, which is **vacuously false**. Coord's own regression test only
+> demonstrates the fix on a unit that keeps another cleared gate. So withdrawal
+> is **cleanup, not repair** — it un-pins the unit; reaching `ready` still needs
+> a counted gate driven to `cleared`. A unit that retains one promotes itself on
+> the next derive tick with zero writes.
+>
+> Mute and withdrawal are now indistinguishable to this predicate, so neither
+> helps a unit reach `ready` — the record gate must stay counted AND clear.
+> `failed` / `misconfigured` deliberately still block.
+>
+> ⚠️ Verified for the **ready-derivation path only**; other predicates are
+> UNVERIFIED. Record the `gate_id` either way. Canonical: `_gate-registration`.
 
 **Retiring the net is TWO calls, in this order: cancel, then MUTE.** The cancel is
 the race-safe stamp — it forecloses the dispatch. The mute is what unblocks the
@@ -1478,8 +1538,12 @@ re-heartbeating each row when it falls due, every min(max(its own TTL/3,
 The spawned phase
 agent does not need to heartbeat its own claim, and a phase running longer
 than 2 hours is no longer a special case. The loop replays the owner token
-on every request; a hand heartbeat must too, or it will not match and
-returns `not_held`.
+on every request; a hand heartbeat must too, or it will not match: coord
+answers `stolen` and names your OWN machine and session as the holder, since
+you are still the stored owner, and the claim ages out unrenewed. That is not
+`not_held` - today the heartbeat door has no such verdict (it is the release
+door's word). An EXPIRED claim is `stolen` with `current_holder: null`, which
+the loop records `lapsed`.
 
 **Read `status` at every phase boundary.** The loop can die — a killed pid, a
 box that slept. A single `stolen` or `lapsed` row no longer ends it: that row
@@ -2307,7 +2371,9 @@ stopping at the first door that answers:
   <workspace-root>/qontinui-claude-config/.claude/skills/coord-revive/coord-revive.sh
   call coord_agent_registry_effective '{}'`, spelled absolutely because a
   relative `.claude/skills/...` resolves only from a checkout that carries that
-  tree — a masked tool is not a dead end;
+  tree — a masked tool is not a dead end. If that absolute path is ALSO
+  absent (no such checkout on this box), this door hasn't answered either —
+  it is not a boundary, just keep stopping at the first door that DOES;
 - the device-authed HTTP twin `GET $COORD_HTTP_URL/coord/agent-registry/effective`
   (default `https://coord.qontinui.io`), reached over a held device JWT, the
   `/coord-mcp` proxy, or `scripts/coord-read.ps1 get`.
@@ -2409,7 +2475,7 @@ under a single stem naming only one of them.
 # RUN entry as `bash "$suite"` -- so it carried two real defects with no suite:
 # a cross-plan misattribution and a dedup that read the list `extend` was
 # mutating. Plan: 2026-09-04-review-arm-merge-is-untestable-python-in-a-markdown-file.
-cat <<'PATCH' | bash <workspace-root>/qontinui-claude-config/scripts/review-arm-record.sh
+cat <<'PATCH' | bash <workspace-root>/qontinui-claude-config/scripts/review-arm-record.sh --root <the worktree you reviewed>
 {
   "plan_stem": "<plan-stem>",
   "reads": [{"read_at": "<UTC ISO-8601>", "transport": "<the door that answered, or every door that failed>",
@@ -2417,7 +2483,7 @@ cat <<'PATCH' | bash <workspace-root>/qontinui-claude-config/scripts/review-arm-
              "row": <the served `code-reviewer` object VERBATIM, or a typed absence/failure>}],
   "reviews": [{"arm": "<one of the six>", "disposition_applied": "<the served disposition, or null>",
                "iterations": <n>, "findings_count": <n>,
-               "reviewed_head_sha": "<git rev-parse HEAD in the worktree, AT review time>",
+               "reviewed_head_sha": "<the head the REVIEWER states it read, from its own report>",
                "independent_of_author_context": <true|false>,
                "verified": "<what the reviewer read: the diff range, the files>",
                "against": "<what it was checked against: the plan phase, the task goals, the repo standards>"}],
@@ -2426,6 +2492,28 @@ cat <<'PATCH' | bash <workspace-root>/qontinui-claude-config/scripts/review-arm-
 }
 PATCH
 ```
+
+**`reviewed_tree` and `measured_head_sha` are NOT in the template because the
+script MEASURES them** *(plan
+`2026-09-05-a-verification-report-never-states-the-tree-it-read` Phase 3)*. It
+runs `scripts/lib/tree-identity.sh` over `--root` and stamps the resulting
+`tree: root=… head=… dirty=… dirty_files=… measured=…` line onto every
+`reviews[]` and `prs[]` row, beside the head. Do not type either one; a field
+the caller types is a placeholder, and this one exists precisely because the
+typed version could be — and was — the caller's *post-hoc* measurement rather
+than the reviewer's. Pass `--root` when the worktree you reviewed is not the
+current directory.
+
+**What happens when the reviewer's head and the script's measurement
+DISAGREE**: both are recorded (`reviewed_head_sha` keeps the reviewer's,
+`measured_head_sha` carries the measurement) and the row gains
+`head_sha_disagreement`. Neither is preferred, because each is the only
+evidence for a different fact — the reviewer's is what was READ, the
+measurement is what the checkout held when the record was written, and a gap
+between them IS the drift. A disagreement is a signal to re-review, not a field
+to tidy. When the measurement is UNRESOLVED (the root is not a git work tree,
+or the producer could not run) nothing is marked: a probe that did not look
+contradicts nothing.
 
 The script resolves the session id itself from
 `${QONTINUI_AGENT_SESSION_ID:-${CLAUDE_CODE_SESSION_ID:-}}`, writes
@@ -2442,20 +2530,32 @@ value copied from a document, this one included. The row is what a later reader
 re-derives the verdict from; a prose arm beside a summarised row is the misread
 that produced the dossier.
 
-**Four fields on the `reviews[]` row name the ONE thing a later fact can
+**Five fields on the `reviews[]` row name the ONE thing a later fact can
 contradict, and record the ONE thing policy says must be stored** *(plan
-`2026-09-03-every-verification-signal-is-written-by-the-implementer` Phase 3)*:
+`2026-09-03-every-verification-signal-is-written-by-the-implementer` Phase 3;
+the fifth from `2026-09-05-a-verification-report-never-states-the-tree-it-read`
+Phase 3)*:
 
-- **`reviewed_head_sha`** — `git rev-parse HEAD` in the worktree **at the moment
-  the review ran**, before anything else is committed. Every other field in this
-  artifact is the reviewer's own word; this one is the only identity coord can
-  later disagree with. Copy it onto the `prs[]` row when the PR opens (Step 4.5),
+- **`reviewed_head_sha`** — the head the reviewer states **it read, at read
+  time**, taken from the reviewer's own report rather than from a `git
+  rev-parse` you run afterwards. Every other field in this artifact is the
+  reviewer's own word; this one is the only identity coord can later disagree
+  with. Copy it onto the `prs[]` row when the PR opens (Step 4.5),
   and if you commit again after the review, **review again** and record the new
   head — a PR whose coord `head_sha` differs from the artifact's
   `reviewed_head_sha` carries code no review saw, and Step 4.7 fails it. The
   same value is written onto the PR body as `Coord-Reviewed-Head: <sha>` in
   Step 4.5, and it is that line — harvested into `coord.pr_labels` — not this
   artifact, that coord's `require_review` gate reads.
+- **`reviewed_tree`** — the tree-identity line the recorder MEASURED, and the
+  doctrine sentence above gains its missing half from it: *if the tree moves at
+  all, committed or not, review again.* `git rev-parse HEAD` does not move when
+  a tracked file is edited and never committed, so a commit-only identity is
+  blind **by construction** to the case that produced this plan — the worktree
+  edited during the review window, the reviewer's findings true of a tree that
+  no longer exists, and both shas unchanged because neither *can* change. The
+  digest moves. Step 4.7 compares the recorded line against a fresh measurement
+  and fails a `contradiction_tree_moved` exactly as it fails head drift.
 - **`independent_of_author_context`**, **`verified`**, **`against`** — the
   independence declaration served policy `verification-and-evidence`
   `independence-is-context-not-credential` makes mandatory: *"the independence
@@ -2523,6 +2623,43 @@ citation DOES derive `shipped` — measured 2026-09-04, 10 units affected, 9
 reading `delivery.shipped: true`, 8 off a SOLE docs-only citation. That is the
 defect the phase repairs; it is not a reason to omit the marker, which every
 lifecycle skill still requires.)*
+
+**DECLARE THE PHASES THIS PR DELIVERS.** When the plan has more than one phase,
+the marker line takes a delivery scope after the stem:
+
+```
+Plan: <plan-stem> phases: 2,3
+Plan: <plan-stem> delivers: complete
+Plan: <plan-stem> delivers: partial
+```
+
+Write the phases **this PR actually implements** — not the phases the plan has.
+`delivers: complete` is for a single PR that lands the whole plan;
+`delivers: partial` is for one that delivers less than all of it without a clean
+phase list.
+
+*(Plan `2026-09-13-coord-delivery-cannot-express-partial-delivery`, Phases 2b and
+5.)* **The scope is what stops a multi-phase plan being marked delivered off one
+landed phase.** coord's `shipped` is *"≥1 cited PR landed ∧ none blocking"* — it
+was never *"all phases done"* — so a genuine, correct, multi-file Phase-1 PR
+derives `shipped` for a plan with six phases open, the unit drops out of
+`/vet-imp-sweep`'s eligible set, and the remaining work is never dispatched
+again. Measured 2026-09-15 corpus-wide: **295 units** read `shipped` while their
+own `origin/main` stamp names remaining work, **277** of them with stated or
+structural residue.
+
+**A bare `Plan:` line is UNKNOWN, not "complete", and that is deliberate** — it
+is what every marker written before this convention means, and coord leaves those
+verdicts exactly as they are. So omitting the scope breaks nothing; it just
+leaves the axis asleep for your PR. Adding it is the only thing that makes the
+plan's remaining phases visible to the sweep.
+
+Mechanics worth knowing: the scope must be the FIRST thing after the stem
+(`Plan: <stem> phases: 1` — a `phases:` later in the line, or in prose, is
+ignored by design, because *"Phases 2 and 3 REMAIN"* would otherwise read as an
+attribution). Editing a PR body to ADD a scope works — coord attaches it to the
+existing citation on the `edited` webhook — but it never REPLACES a scope already
+recorded.
 
 **If a PR is already open without the marker**, do not force-push a body edit —
 backfill the citation instead, which is the door built for exactly this case:
@@ -2796,8 +2933,34 @@ review's own claim before the PR opens, coord's observation after — and this i
 the second stage.
 
 ```bash
-bash <workspace-root>/qontinui-claude-config/scripts/review-arm-corroborate.sh
+bash <workspace-root>/qontinui-claude-config/scripts/review-arm-corroborate.sh --tree-root <the worktree you reviewed>
 ```
+
+**Run the peer-land probe here too, and before every rebase** *(plan
+`2026-09-05-a-verification-report-never-states-the-tree-it-read` Phase 5)*:
+
+```bash
+bash <workspace-root>/qontinui-claude-config/scripts/landed-since.sh check
+```
+
+With no globs it re-uses the globs this session recorded; if `/preflight`
+step 4b recorded them rather than Step 0.45, pass the plan's globs explicitly —
+given globs replace the stored ones, and a repo with no recorded baseline reads
+`3`, never a false clean. Exit `1` names the
+commits, the files and the PR numbers that landed into your paths since you
+started — **read them before you rebase**, because the work may already be
+done and a conflict is a much worse way to find out. Exit `3` is INCOMPLETE (a
+failed fetch, a glob that reached no checkout, a missing baseline) and is never
+an all-clear. It answers a question no coord surface does: served policy
+`coordination` `concurrent-duplicate-discovered-at-write-time` says the
+advisory surfaces answer *"who has DECLARED this"*, not *"has this already been
+DONE"*.
+
+`--tree-root` names the checkout to RE-MEASURE (default: the current
+directory). It defaults to `$PWD` and you should pass it whenever the worktree
+you reviewed is not where you are standing — a re-measure of the wrong checkout
+is reported as `unknown_tree` (different roots are INCOMPARABLE, never "moved"),
+which is UNKNOWN rather than a false contradiction, but it establishes nothing.
 
 It resolves the artifact from the same
 `${QONTINUI_AGENT_SESSION_ID:-${CLAUDE_CODE_SESSION_ID:-}}` Step 4.4 keyed it
@@ -2811,9 +2974,9 @@ touched), and exits on the **worst** verdict:
 
 | exit | verdict | what it means | what you do |
 |---|---|---|---|
-| `0` | **CORROBORATED** | every PR's coord `head_sha` equals the artifact's `reviewed_head_sha`, and the coverage read found no PR coord holds for this session that `prs[]` omits | proceed — but read the `coverage=` half of the verdict line too, below |
-| `2` | **CONTRADICTION** | `contradiction_head_drift` — the PR carries code the review did not see; or `contradiction_uncovered_pr` — coord attributes a PR to this session that the artifact omits | **this is a failure of the review gate, not a note.** Re-review the head that is actually on the PR (Step 4.4 items 3–6 again, with the new `reviewed_head_sha`), or cover the omitted PR; then add the new head's `Coord-Reviewed-Head:` line to the PR body (`gh pr edit <n> --body-file <file>`, Step 4.5 — coord harvests it on `edited`) so the trailer coord's `require_review` gate reads and the artifact agree; then re-run this step. Do not proceed to Step 6 with a contradiction standing, and never edit the `corroboration[]` row by hand |
-| `3` | **UNKNOWN** | the card door did not answer, the card reads `confidence: unknown` or carries no `head_sha`, or the artifact predates `reviewed_head_sha` | UNKNOWN is never a pass and never a contradiction. Say so in the Step 6 report — *"corroboration UNKNOWN: <the detail the row carries>"* — and never report the review as corroborated |
+| `0` | **CORROBORATED** | every PR's coord `head_sha` equals the artifact's `reviewed_head_sha`, the re-measured tree equals the artifact's `reviewed_tree`, and the coverage read found no PR coord holds for this session that `prs[]` omits | proceed — but read the `coverage=` half of the verdict line too, below |
+| `2` | **CONTRADICTION** | `contradiction_head_drift` — the PR carries code the review did not see; `contradiction_tree_moved` — the **working tree** moved since the review measured it, committed or not; or `contradiction_uncovered_pr` — coord attributes a PR to this session that the artifact omits | **this is a failure of the review gate, not a note.** Re-review the head that is actually on the PR and the tree that is actually on disk (Step 4.4 items 3–6 again, which re-measures `reviewed_head_sha` and `reviewed_tree`), or cover the omitted PR; then add the new head's `Coord-Reviewed-Head:` line to the PR body (`gh pr edit <n> --body-file <file>`, Step 4.5 — coord harvests it on `edited`) so the trailer coord's `require_review` gate reads and the artifact agree; then re-run this step. Do not proceed to Step 6 with a contradiction standing, and never edit the `corroboration[]` row by hand |
+| `3` | **UNKNOWN** | the card door did not answer, the card reads `confidence: unknown` or carries no `head_sha`, the artifact predates `reviewed_head_sha` (`unknown_no_reviewed_head`) or `reviewed_tree` (`unknown_no_reviewed_tree`), or the tree could not be compared — the producer refused, a field is the unresolved sentinel, or the two lines name different checkouts (`unknown_tree`) | UNKNOWN is never a pass and never a contradiction. Say so in the Step 6 report — *"corroboration UNKNOWN: <the detail the row carries>"* — and never report the review as corroborated |
 | `4` | **USAGE** | no artifact, no session id | the same finding Step 6 item 6 names: the review gate never wrote its record |
 
 **The verdict line carries TWO halves — `heads=<n>/<m>` and `coverage=<…>` —
@@ -3186,6 +3349,17 @@ supersedes unit_ready for the dependency-gated case".)
   `phase_name` from the phase heading. Anchor = (work_unit_id, phase_name). The
   `unit_ready`/`unit_status` predicates carry this UUID, not the slug. Claim-bound
   deferrals use the claim-anchored shape (`claim_kind`+`resource_key`) instead.
+  **Omit `metadata` on this upsert — that is safe; sending it is not.** Since
+  coord `9368af3d` an upsert that OMITS `metadata` (or sends JSON `null`) leaves
+  the stored object byte-identical (plan
+  `2026-09-16-work-unit-upsert-without-metadata-wipes-the-phase-list`; before
+  it, this very call erased `metadata.phases`). A `metadata` object you DO send
+  REPLACES the stored one whole — every key you left out is dropped except
+  `attestations`, which coord preserves, and `{}` clears the rest — so add no
+  defensive read-merge-write here. If you must set a key (e.g. `area`), read the
+  row and send the full object, `phases` included; the runner's plan adapter
+  re-upserts scanned plans about every 68 s and can land between your read and
+  your write.
   With the UUID captured, also record it where the WIP-custody Stop hook reads
   it — this is the only step of this run that holds a real one, so without it the
   custody record's `work_unit_id` stays `null`:
@@ -3488,10 +3662,17 @@ instead of it.
 - **Parallel by default** — launch independent phases concurrently; only serialize when there are true data dependencies
 - **Edit work runs in an allocated worktree, never the primary checkout** — before launching a phase Agent that will `Edit` / `Write` / run `git` against a coord-registered repo, the coordinator allocates an isolated git worktree for that repo and passes that path as the Agent's working directory. The Agent treats that path as its repo root; every edit lands there, never in the operator's primary checkout. Sibling to the `/manual-test` "never touch the primary runner" rule — same shape (don't share the primary), different substrate (git worktree vs supervisor temp runner). Remove the worktree (and its isolated CARGO_TARGET_DIR, kept OUTSIDE the worktree) after the work ships. **Why:** see `plans/2026-05-28-isolate-session-edit-work-in-worktrees.md` — the proximate cause was two concurrent skill chains editing the same primary checkout simultaneously.
 
-  **Allocate THROUGH coord, and declare the plan** *(plan `2026-08-16-plan-corpus-authority-and-run-provenance` Phase 1)*. Do not open with a bare `git worktree add`. Call coord first:
+  **Allocate THROUGH coord, and declare the plan** *(plan `2026-08-16-plan-corpus-authority-and-run-provenance` Phase 1)*. Do not open with a bare `git worktree add`. Run the fleet's one command first:
+
+  ```bash
+  bash <workspace-root>/qontinui-claude-config/scripts/allocate-worktree.sh \
+    --repo <repo> --intent "<plan-stem>: <phase title>" --work-unit <plan-work-unit-uuid> [--build-required]
+  ```
+
+  It POSTs the LITERAL `https://coord.qontinui.io/agents/allocate` — an ANONYMOUS route: no runner, no mint, no cached credential, no `$COORD_HTTP_URL` (unset is an absent override, not a missing door; never substitute `127.0.0.1:9876`, which has no allocate route). `device_id` is a claim it reads from `$QONTINUI_MACHINE_ID` first, then `~/.qontinui/machine.json`, then any device JWT's payload, expired or not. It materialises every `worktrees[]` row (declared siblings included) at the RELATIVE path under the workspace root on the reserved branch, and refuses a STALE allocation whose branch already exists on origin (exit 9 — re-run, **and hand the leaked row back with `--done --branch <the reserved branch> --abandon` first**, since every real call mints a `coord.agent_worktrees` row the caller cannot retire and a bare retry loop leaks one per attempt; file it against `dossier:coord-allocate-returns-a-stale-allocation`). It **never switches the primary checkout's branch, on any answer** — the narrow claim, not "never touches it": `git worktree add` necessarily writes a branch ref and `.git/worktrees/<name>/` metadata into the primary's git dir, it fetches there, and a linked `node_modules` (below) makes the primary the write target for anything the worktree later installs. Output is three line kinds, not one: `agent_id <uuid>`; `<repo> <abs path> <branch>` per worktree; and, interleaved after a worktree that got one, `node_modules <link> -> <target>` and a trailing `cargo_config <path>`. What it sends (plan `2026-09-03-worktree-allocation-is-one-command-and-the-reflex-is-the-script`):
 
   ```
-  POST $COORD_HTTP_URL/agents/allocate
+  POST https://coord.qontinui.io/agents/allocate         // no Authorization header
   {
     "device_id":    "<this machine's device_id>",
     "repos":        [{"repo": "<repo>"}],          // parent_sha omitted → coord branches off clean origin/main
@@ -3509,8 +3690,8 @@ instead of it.
 
   **Two things the response can say that are NOT "here is your path" — handle both:**
 
-  1. **`worktrees[].worktree_path` is RELATIVE**, e.g. `agent-worktrees/<agent_id>/<repo>`. This is deliberate: coord runs on Linux/ECS and a host-absolute path would be meaningless to a Windows runner, so the consumer re-roots it. Re-root it under the workspace root — `<workspace-root>/<worktree_path>` — and create the checkout there with the **branch coord reserved**: `git -C <repo> worktree add -b <worktrees[].branch> <absolute-path> <worktrees[].parent_sha>`. Use coord's branch verbatim; it was arbitrated against the `BranchName` claim so two agents declaring the same intent get distinct names.
-  2. **`isolation.mode` may be `shared_branch` or `wait`, not `worktree`.** That field is coord's disk/build-slot budget decision (`policies::isolation`). On `wait`, do not force a worktree — report the `reason` / `blocking_resource` (typically `build_slot` or `disk_or_slot`) and retry, or fall back to a single serialized phase. On `shared_branch`, coord is telling you the canonical checkout can safely carry this branch. Treating every response as `worktree` re-creates the disk pressure the budget exists to prevent.
+  1. **`worktrees[].worktree_path` is RELATIVE**, e.g. `agent-worktrees/<agent_id>/<repo>`. This is deliberate: coord runs on Linux/ECS and a host-absolute path would be meaningless to a Windows runner, so the consumer re-roots it. Re-root it under the workspace root — `<workspace-root>/<worktree_path>` — and create the checkout there with the **branch coord reserved**: `git -C <repo> worktree add -b <worktrees[].branch> <absolute-path> <worktrees[].parent_sha>`. Use coord's branch verbatim — after `git ls-remote --heads origin '<branch>'` comes back EMPTY; a non-empty answer is a STALE allocation whose branch holds someone's live work (do not materialise, re-POST, never `--force-with-lease` onto it). It was arbitrated against the `BranchName` claim so two agents declaring the same intent get distinct names.
+  2. **`isolation.mode` may be `shared_branch` or `wait`, not `worktree`.** That field is coord's disk/build-slot budget decision (`policies::isolation`). On `wait`, do not force a worktree — report the `reason` / `blocking_resource` (typically `build_slot` or `disk_or_slot`) and retry, or fall back to a single serialized phase. **Never honor `shared_branch` from a session**: it means "put this branch in the primary checkout", which only the runner's lease-taking materializer can do safely; coord now answers it only to a request carrying `accepts_shared_branch: true`, which no recipe here sends (plan `2026-09-10-coord-allocate-answers-shared-branch-to-callers-that-cannot-honor-it`, claude-config #874). If an older coord still answers it, create the ISOLATED worktree exactly as in item 1 and leave the primary checkout alone — the script does. Treating every `wait` as `worktree` re-creates the disk pressure the budget exists to prevent.
 
   **Sibling build-dependency worktrees count.** The `qontinui-schemas` checkout a Rust phase needs to satisfy Cargo path deps must be allocated the same way, with the same `work_unit_id`. It is the nastiest class precisely because it belongs to *none* of the plan's declared repos — so even a "worktrees for this plan's repos" query misses it, and only the work-unit link reaches it.
 

@@ -34,7 +34,7 @@ cat $PWD/qontinui-web/backend/logs/app.log | tail -100
 # backend-URL resolution, executor). Daily-rolled with 14-file retention, so
 # resolve the newest — and glob the runner's app-data dev-logs dir as well as
 # the workspace one, because that is usually where it actually writes.
-# Exact dir: GET http://localhost:9876/log-sources/runner-log-sink
+# Exact dir: GET http://127.0.0.1:9876/log-sources/runner-log-sink
 # (`runner-tauri.log` is retired as a runner log — it is only stdout capture.)
 RDL="$LOCALAPPDATA/qontinui-runner/dev-logs"
 RUNNER_LOG=$(ls -t "$PWD"/.dev-logs/qontinui-runner.log.* \
@@ -61,7 +61,7 @@ cat $PWD/.dev-logs/python-ws-debug.log
 Log file locations:
 - qontinui-web backend (dev-start.ps1): `.dev-logs/backend.log`
 - qontinui-web frontend (dev-start.ps1): `.dev-logs/frontend.log`
-- qontinui-runner's own tracing sink: `qontinui-runner.log.<YYYY-MM-DD>` — daily-rolled, so glob and take the newest, and look in **both** `.dev-logs/` and `<LOCALAPPDATA>/qontinui-runner/dev-logs/` (the runner usually writes to the latter; exact path via `GET http://localhost:9876/log-sources/runner-log-sink`)
+- qontinui-runner's own tracing sink: `qontinui-runner.log.<YYYY-MM-DD>` — daily-rolled, so glob and take the newest, and look in **both** `.dev-logs/` and `<LOCALAPPDATA>/qontinui-runner/dev-logs/` (the runner usually writes to the latter; exact path via `GET http://127.0.0.1:9876/log-sources/runner-log-sink`)
 - qontinui-runner stdout, captured by the supervisor: `primary.log` (per-runner: `<runner_id>.log`), same two directories
 - Supervisor's own tracing: `.dev-logs/supervisor.log`
 - Python WebSocket debug: `.dev-logs/python-ws-debug.log`

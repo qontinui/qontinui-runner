@@ -44,8 +44,7 @@ Group changes by type:
 
 **CRITICAL RULES**:
 - NEVER include "Generated with Claude" or similar
-- NEVER include "Co-Authored-By: Claude"
-- NEVER include any AI attribution
+- Commit trailers follow the harness attribution rule: keep the `Co-Authored-By: <model>` and `Claude-Session:` lines the harness supplies, add no other attribution (aligned 2026-09-09)
 - NEVER commit `CLAUDE.md`
 
 **Commit message format**:
@@ -94,6 +93,26 @@ If `$1` is "push":
 ```bash
 git push origin <current-branch>
 ```
+
+> **Does a PR still carry this push?** If the current branch has a PR, coord may
+> already have landed it — `CLOSED`, `MERGED`, or still OPEN with its head on
+> `origin/main` by content — and the push then succeeds while nothing carries it
+> toward `main`. A shared checkout parked on a concluded PR's branch is the
+> common shape. Decide it by
+> `knowledge-base/qontinui-specific/coord-ff-lands.md` → "Pushing to a branch
+> whose PR may already have landed": check before the push and again after it,
+> and take that section's fresh-branch path when the PR carries nothing.
+
+> **Fail-fast push.** A push that prints NOTHING for 30 s is a credential prompt
+> you cannot see, never a slow network — do not wait, do not retry the bare
+> command. Inside a runner session the runner already sets the full
+> non-interactive posture, so a silent hang there is a BUG: kill it and report it
+> (a coord finding, plus the dossier `git-push-hang-credential-helper`). Outside
+> one, push with
+> `GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/qontinui-runner/askpass-disabled git -c credential.helper= -c credential.helper='!gh auth git-credential' push …`
+> — the empty helper MUST precede the gh helper, because git APPENDS credential
+> helpers rather than replacing them. Detail:
+> `knowledge-base/qontinui-specific/git-push-non-interactive.md`.
 
 ### Final Report
 

@@ -19,14 +19,14 @@ contract doc.
 - **`$QONTINUI_PLANS_DIR`** — the directory plans live in, and the directory this
   sweep scans. The qontinui runner injects it into agent sessions from its
   `paths.plans_dir` setting; a session launched outside the runner will not have it.
-  **If it is unset, ask the user once where plans live, or fall back to
-  `<workspace-root>/plans`** (a `plans/` directory beside the repos this session is
-  working in). Never assume an absolute path from another machine, and state the
+  **If it is unset, ask the user once where plans live, or DISCOVER one: from the
+  workspace root, `ls -d plans */plans 2>/dev/null` and use the directory that
+  actually exists** — say which, and ask when it finds none or more than one. Never
+  fall back to a directory you have not confirmed is there; a named fallback fails
+  silently on every machine that does not have it.
+  Never assume an absolute path from another machine, and state the
   directory you actually scanned in the report — a sweep of the wrong corpus reads
   exactly like a sweep with no open gates.
-- **`$QONTINUI_PLANS_ARCHIVE_DIR`** — optional, normally unset. When set and different
-  from `$QONTINUI_PLANS_DIR`, sweep it too: an archived plan can still carry a pending
-  gate, and a gate nobody evaluates is a silent stall.
 
 In `auto` mode this command edits plan files in place. If the plan directory is inside
 a git repo (`git -C "$QONTINUI_PLANS_DIR" rev-parse --is-inside-work-tree`), commit the
@@ -56,8 +56,7 @@ coord HTTP route is auth-gated.
 1. **Collect gates.** The plans dir can hold hundreds of files while only a few dozen
    carry a gate block, so **Grep first, then read only the hits** — globbing and
    parsing the whole corpus is impractical:
-   `Grep "GATE-SWEEP:BEGIN"` over `$QONTINUI_PLANS_DIR` (and
-   `$QONTINUI_PLANS_ARCHIVE_DIR` if set and different; skip `scout-*`, and
+   `Grep "GATE-SWEEP:BEGIN"` over `$QONTINUI_PLANS_DIR` (skip `scout-*`, and
    skip any file whose only `GATE-SWEEP` block is an example).
    In each hit, parse the YAML inside the `<!-- GATE-SWEEP:BEGIN -->…<!-- GATE-SWEEP:END -->`
    block. Consider only `state: pending` gates. Apply the filter substring if given.

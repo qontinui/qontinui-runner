@@ -753,17 +753,27 @@ write:
 ```powershell
 # Door 1: the in-process invoke mint. ApiResponse envelope - `data` IS the token.
 $jwt = ''; $mintSource = ''
-try {
-  $r = Invoke-RestMethod -Uri 'http://127.0.0.1:9876/ui-bridge/invoke/get_access_token_for_websocket' `
-       -Method Post -ContentType 'application/json' -Body '{}' -TimeoutSec 20
-  $jwt = [string]$r.data; $mintSource = 'runner-invoke'  # envelope-ok: PowerShell has no envelope arm; the invoke door answers data as the bare token
-} catch {
-  $status = 0; try { $status = [int]$_.Exception.Response.StatusCode } catch { }
-  $said = ''; try { $said = [string]$_.ErrorDetails.Message } catch { }
-  # ONLY the allowlist 400 (or a 404 for the route) opens door 2: this build
-  # predates the entry. The next runner START picks it up - never restart a
-  # running runner over it. Anything else is the runner's verdict; read $said.
-  if (-not (($status -eq 400 -and $said -match 'not in UI Bridge allowlist') -or $status -eq 404)) { throw }
+# Two names for one access_token slot: get_coord_device_token first (no tier
+# gate; `data: null` means this device is unpaired), then the older spelling.
+$absentNames = 0
+foreach ($route in 'ui-bridge/invoke/get_coord_device_token', 'ui-bridge/invoke/get_access_token_for_websocket') {
+  try {
+    $r = Invoke-RestMethod -Uri "http://127.0.0.1:9876/$route" `
+         -Method Post -ContentType 'application/json' -Body '{}' -TimeoutSec 20
+    $jwt = [string]$r.data; $mintSource = 'runner-invoke'  # envelope-ok: PowerShell has no envelope arm; the invoke door answers data as the bare token
+    break
+  } catch {
+    $status = 0; try { $status = [int]$_.Exception.Response.StatusCode } catch { }
+    $said = ''; try { $said = [string]$_.ErrorDetails.Message } catch { }
+    # ONLY the allowlist 400 (or a 404 for the route) moves to the next name:
+    # this build predates the entry. Anything else is the runner's verdict.
+    if (-not (($status -eq 400 -and $said -match 'not in UI Bridge allowlist') -or $status -eq 404)) { throw }
+    $absentNames++
+  }
+}
+if ($absentNames -eq 2) {
+  # Door 2 opens only when the build serves NEITHER name. A START of a newer
+  # build picks get_coord_device_token up - never restart a running runner over it.
   # Door 2: the WebView eval mint (CSP-refused on current builds; cannot answer
   # headless - check /health frontendReady first).
   $evalBody = @{

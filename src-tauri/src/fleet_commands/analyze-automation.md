@@ -63,7 +63,7 @@ BASE="$PWD"
 # These contain detailed workflow execution information.
 # The runner writes them next to its own sink, which is usually its app-data
 # dev-logs dir, NOT the workspace .dev-logs/ — so read both locations.
-# Exact dir: GET http://localhost:9876/log-sources/runner-log-sink
+# Exact dir: GET http://127.0.0.1:9876/log-sources/runner-log-sink
 RDL="$LOCALAPPDATA/qontinui-runner/dev-logs"
 tail -100 "$BASE"/.dev-logs/runner-general.jsonl "$RDL"/runner-general.jsonl 2>/dev/null
 tail -100 "$BASE"/.dev-logs/runner-actions.jsonl "$RDL"/runner-actions.jsonl 2>/dev/null
@@ -211,7 +211,7 @@ You are fixing a specific issue found during Qontinui automation testing.
 ### Runner Issues (qontinui-runner)
 - Check Rust code in `src-tauri/src/`
 - Check TypeScript in `src/`
-- Run: `cd qontinui-runner && cargo check` and `npm run typecheck`
+- Run: `cd qontinui-runner && cargo check --all-targets` and `npm run typecheck`
 
 ### Automation Issues
 - These may not require code fixes

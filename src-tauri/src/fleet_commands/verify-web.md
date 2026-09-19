@@ -63,11 +63,25 @@ isolated `qontinui_web_local` DB) → **frontend** on `:3011`
 `-Status` shows the `Local IdP`, `Local Coord`, `Local Backend`, and
 `Local Frontend` rows.
 
-### Step 2 — Coord preflight (turn the silent 502 into a clear message)
+`-VerifyWebStack` exits **5** when a stage or a liveness probe fails; read the
+`VERIFYWEB-STACK FAILED: ...` line in `.dev-logs/verifyweb-stack.log` for which.
+
+### Step 2 — Liveness preflight (turn the silent 502 into a clear message)
 
 `/operations/*` (which admin pages call) proxies to the local coord; if nothing
 listens there the backend returns a bare `502 coord is not reachable`. Probe
-first (the local coord is on the dedicated `:9871`, NOT canonical `:9870`):
+the stack first. On Windows, where `dev-start.ps1` runs:
+
+```powershell
+.\dev-start.ps1 -VerifyWebProbe
+# Read-only. One PROBE <svc> PASS|FAIL line each for idp (:8770 JWKS + minted
+# token), coord (:9871 /health), backend (:8011 /health) and frontend (:3011 /),
+# plus VERIFYWEB-PROBE markers in .dev-logs/verifyweb-stack.log.
+# Exit 0 = all pass. Exit 5 = a FAIL: do NOT proceed to admin-page assertions.
+```
+
+`dev-start.ps1` is Windows-by-substance, so off Windows check at least the coord
+by hand (the local coord is on the dedicated `:9871`, NOT canonical `:9870`):
 
 ```bash
 if curl -fsS http://localhost:9871/health >/dev/null 2>&1; then
@@ -169,7 +183,74 @@ repositories enrolled yet"). A 2xx alone is NOT a pass — read the returned DOM
 (`POST /control/find` is a best-effort convenience; a 0-match result there does
 NOT fail the gate when the snapshot shows the card.)
 
-### Step 5 — Teardown (ALWAYS)
+That gate answers **"is the right page there?"**. It does not answer **"does it
+look right?"** — it is a hand-written substring check on one snapshot, and it
+will happily pass a page whose controls overlap, whose text is clipped, or whose
+targets are unreachably small. Step 5 is the half that answers the second
+question.
+
+### Step 5 — Run the analyzer for a real verdict (the second half of the gate)
+
+`scripts/verify-page-verdict.sh` carries an arbitrary route through to a
+`vision-audit` verdict: it captures the page headlessly through the injected
+transport, normalizes the snapshot with qontinui-web's own shipped
+`normalize.ts`, runs the analyzer **built from the SHA `style-gate.lock` pins**,
+and prints machine JSON on stdout plus a summary on stderr. This is the step
+that turns "a tab" into "a verdict", and it is the reason a headless session no
+longer has to ship a UI change on unit tests alone.
+
+```bash
+# Same authenticated origin, same storageState the opener already seeded.
+# --storage-state is what carries the (app) auth wall past; everything else is
+# identical to auditing a bare public page.
+bash qontinui-claude-config/scripts/verify-page-verdict.sh \
+  --url "http://localhost:3011/admin/coord/onboarding-status" \
+  --storage-state .dev-logs/verifyweb/storage-state.json \
+  --expect-selector '[data-testid=connected-orgs]' \
+  > /tmp/verify-web-verdict.json
+VERDICT_RC=$?
+```
+
+Exit codes are distinct on purpose — read the status, do not just grep the JSON:
+
+| Exit | Meaning | What to do |
+|---|---|---|
+| `0` | PASS — no gated finding at or above `--fail-on` | proceed |
+| `2` | **GATE FAILED** — real findings; each names the offending element ids | fix the page, re-run |
+| `3` | **CAPTURE FAILURE** — the page was never observed | never read this as a pass; see the failure-mode table |
+| `4` | analyzer unavailable at the pinned SHA | the error names the exact build command |
+| `127` | local environment fault (node too old, normalize.ts absent) | fix the box |
+
+The verdict JSON stamps `analyzer.pinnedSha` and `analyzer.shaVerified`. **Quote
+the SHA in your report.** A verdict from an unpinned analyzer answers a
+different question than the Style Gate does, and `shaVerified:false` says so.
+
+**Interactions.** A state only reachable by clicking is reachable here too:
+`--step '<action> <json>'` and `--capture <id>` interleave in order, so one page
+load can yield several audited states (a closed panel, the open panel, the panel
+with details expanded). The transport is `ui-bridge-inject --exec-stdin`; the
+action surface is the shipped one in
+`ui-bridge/packages/ui-bridge/src/react/commandHandlers.ts`. **If the action you
+need does not exist, that is a UI Bridge gap — fix it in the Bridge and report
+it. Never route around it with a Playwright locator.**
+
+**`analyze` is the default and needs no spec** — that is the point: you can
+point it at the change you just made with nothing prepared. `vision-audit
+assert` is opt-in via `--assertions <file>`, and it presupposes an *authored*
+spec against *known element ids* (`{"type":"no_overlap","elements":["a","b"]}`);
+omit the ids and it is a **parse error, exit 1** — not a soft skip and not a gate
+failure. An `assert` PASS means "every assertion in the spec held", never "the
+page is fine", and the arm says so in its own `coverageNotes`. A fresh route has
+no committed baseline, so `no_layout_shift_since` has to be authored and
+baselined before it can say anything at all.
+
+Colour is deliberately **reported but never gated**: only the `color` analyzer
+reads pixels, this arm ships no screenshot capability (it feeds an obviously
+named 1×1 placeholder frame), and the parent plan's burn-in measured
+pixel-sampled contrast producing false 1.01:1 criticals. Layout, typography and
+elements are pure geometry over the snapshot and need no pixels at all.
+
+### Step 6 — Teardown (ALWAYS)
 
 ```bash
 kill -TERM "$INJECT_PID" 2>/dev/null || true   # release the Chromium tab
@@ -177,6 +258,7 @@ kill -TERM "$INJECT_PID" 2>/dev/null || true   # release the Chromium tab
 ```powershell
 .\dev-start.ps1 -StopVerifyWeb                 # backend + frontend + local coord + IdP
 # Docker deps are left running; -StopDocker to stop them too.
+# Exit 5 = a port (:3011/:8011/:8770) is still held, or ownership could not be proven.
 ```
 
 Leaving `injectPid` running leaks a Chromium process — always SIGTERM it, and
@@ -193,6 +275,10 @@ report the teardown in your final summary.
 | Admin data call → **502 `coord is not reachable`** | Local coord isn't listening on `:9871`. | Step 2 preflight; `dev-start.ps1 -VerifyWebStack` (the local coord binds the dedicated `:9871`, not canonical `:9870`). |
 | Admin data call → **403** | Coord is up but the dev identity isn't a tenant admin. | Confirm coord ran with `COORD_SSO_BOOTSTRAP_ADMIN_EMAILS=dev-local@no-reply.qontinui.io` (it does under `Start-LocalCoord`). Admin is granted on first login — re-open the tab so a fresh login runs. |
 | inject-cli err shows `INJECTED_EXPECT_SELECTOR_UNMET` | The `--expect-selector` you passed never mounted before the settle cap. | Raise `--settle-timeout`, or drop `--expect-selector` and snapshot after a short wait. |
+| `verify-page-verdict.sh` → **exit 3, "produced NO output (exit 0)"** | The inject CLI was invoked through its **bin symlink**. `isMain` compares `process.argv[1]` to the module URL without realpath, so under `node_modules/.bin/ui-bridge-inject` (= what `npx … ui-bridge-inject` resolves to) `main()` never runs: exit 0, zero output. | The script dereferences symlinks by default, so this only appears with `--no-deref-cli` or a wrapper that re-symlinks. Point `--inject-cli` at the real `dist/inject-cli.cjs`. **Never read the exit-0-no-output case as a pass** — that is what exit 3 exists to prevent. |
+| `verify-page-verdict.sh` → **exit 3, "N step(s) errored"** | A `--step` could not be performed (commonly `ELEMENT_NOT_FOUND`). The state analyzed would not be the state requested. | Fix the step's element id (read one from a no-step run's `textSample`/snapshot). If the *action* is missing rather than the element, that is a UI Bridge gap — fix the Bridge, do not substitute a locator. |
+| `-StopVerifyWeb` → **exit 5**, with `ERROR: ... NOT stopped -- port 8011 held by PID <n> (...)`, `ownership UNKNOWN -- ...` or `sweep ABORTED -- ...` | A port is still held, or dev-start refused to act. It stops the backend or frontend only when the recorded launcher is **alive**, matches its recorded `Win32_Process` creation time to the microsecond (a record from before this boot is proven only by that live match; otherwise it is STALE). It aborts the whole sweep if the tree contains a shell, terminal, editor, the desktop or Claude Code. Two records converge on their own and never need a hand: **a pid file with a creation time from before this boot** is deleted (unless its pid is still alive with exactly that creation time, which is the proof whatever the reported boot time says, and is stopped normally), and a **dead launcher with no live children over a free port** counts as stopped and its pid file is deleted. A **held port is always exit 5, with the pid file kept** unless the record was pre-boot (then it is already deleted and the holder is not the record's). What stays UNKNOWN (pid file kept) is a dead launcher with a live child, a live but unproven pid, or a protected process in the tree. The PID netstat names may itself be **dead**, because its socket is held by a live child that outlived it. The existing by-port stop still runs after a refusal. | Read the holder listing printed under the ERROR. It shows each live process whose `ParentProcessId` is the recorded or named pid, with its command line. A protected one reads `PROTECTED (...) -- do not stop`; every other one carries a per-pid `Stop-Process` line. Or query it yourself: `Get-CimInstance Win32_Process -Filter "ParentProcessId=<n>" \| Select-Object ProcessId,Name,CommandLine`. Stop a listed process by that pid only when its command line is this stack's backend (`python run.py`, `spawn_main`) or frontend (`next dev`). **Never kill by image name.** **Re-running `-StopVerifyWeb` converges** once those holders are gone. The one hand-delete case is a record (**verified, legacy or unverified**) whose pid is now held by a **live** process that is not this stack's launcher: it stays UNKNOWN on every run, so once the listing shows that pid alive as something that is not this stack's launcher, with nothing of this stack under it, delete that pid file. |
+| `verify-page-verdict.sh` → **exit 4** | No `vision-audit` built from the SHA `style-gate.lock` pins. | Run the build command the error prints, or `--build-pinned`. Do **not** reach for a `qontinui-schemas` HEAD build — it answers a different question; `--allow-unpinned-analyzer` exists only for a deliberate, stamped exception. |
 
 ---
 
@@ -212,6 +298,8 @@ rest. If Phase-1 lands with a different key name, update `DEV_TOKEN_LS_KEY` in
 ## References
 - Plan: `plans/2026-07-24-local-web-uibridge-verification-onramp.md`
 - Tab-opener: `qontinui-claude-config/scripts/verify-web-open-tab.sh`
+- Verdict arm: `qontinui-claude-config/scripts/verify-page-verdict.sh` (`--help`)
+- Plan: `plans/2026-08-26-headless-ui-bridge-verification-an-agent-can-run.md`
 - Stack bring-up/teardown: `dev-start.ps1 -VerifyWebStack` / `-StopVerifyWeb`
 - KB: `knowledge-base/qontinui-specific/ui-bridge.md` → "Local web admin-page verification"
 - Injected-transport internals: `.claude/commands/manual-test.md` (lines ~151-298)

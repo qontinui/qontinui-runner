@@ -9,13 +9,18 @@ Find and display workflow runs across all runner instances.
 
 ### Step 1: Discover All Runner Instances
 
+Read every coord/web/runner response through `scripts/lib/envelope.py` / `envelope.sh`; assert `count`-vs-rows agreement before acting on any zero; an `UNKNOWN:` line is UNKNOWN, not a negative. The per-door key
+names live in the helper's docstring, not here; `--first-of data,.` reads the
+`{data: …}` envelope or a bare body, and an unreadable one prints nothing.
+
 ```bash
 # Try each known port to find active instances
+ENV_PY="qontinui-claude-config/scripts/lib/envelope.py"
 for port in 9876 9877 9878; do
-  powershell -NoProfile -Command "(Invoke-WebRequest -Uri \"http://localhost:${port}/status\" -UseBasicParsing -TimeoutSec 2).Content" 2>/dev/null | python3 -c "
+  powershell -NoProfile -Command "(Invoke-WebRequest -Uri \"http://localhost:${port}/status\" -UseBasicParsing -TimeoutSec 2).Content" 2>/dev/null \
+    | python3 "$ENV_PY" require --door runner-status --first-of data,. | python3 -c "
 import json, sys
-d = json.load(sys.stdin)
-data = d.get('data', d)
+data = json.load(sys.stdin)
 print(f'Port {${port}}: {data.get(\"instance_name\", \"primary\")} (running)')
 " 2>/dev/null || true
 done
@@ -24,10 +29,10 @@ done
 Also try the instances endpoint for a complete picture:
 ```bash
 for port in 9876 9877 9878; do
-  powershell -NoProfile -Command "(Invoke-WebRequest -Uri \"http://localhost:${port}/instances\" -UseBasicParsing -TimeoutSec 2).Content" 2>/dev/null | python3 -c "
+  powershell -NoProfile -Command "(Invoke-WebRequest -Uri \"http://localhost:${port}/instances\" -UseBasicParsing -TimeoutSec 2).Content" 2>/dev/null \
+    | python3 "$ENV_PY" require --door runner-instances --first-of data,. | python3 -c "
 import json, sys
-d = json.load(sys.stdin)
-for inst in d.get('data', d):
+for inst in json.load(sys.stdin):
     print(f'  {str(inst.get(\"name\",\"primary\")):20} port:{inst[\"port\"]}  reachable:{inst[\"reachable\"]}')
 " 2>/dev/null && break || true
 done

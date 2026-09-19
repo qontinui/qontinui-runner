@@ -656,8 +656,11 @@ else
   echo "  axes: hosts=coord.qontinui.io prefixes=/coord/agent-* credentials=proxy-nonce,device-jwt unprobed=api.qontinui.io"
   # list: the six kinds with the SKELETON flag AS RENDERED. Read the flag: a
   # SKELETON row is the unedited seed - UNKNOWN, not intent - and UNKNOWN means
-  # the served row carried neither field, which is NOT `authored`.
-  python -c "import json,sys;d=json.load(sys.stdin);[print(f\"{x['kind']:18} {x['name']:40} v{x['current_version']} {x['skeleton']}\") for x in d['documents']]" < "$STEERING/STEERING-CACHE.json"  # envelope-ok: the local steering-cache render written by render-steering-cache.ps1, not a fleet door response
+  # the served row carried neither field, which is NOT `authored`. status= and
+  # withdrawn= are the served lifecycle AS STAMPED (a JSON boolean prints as
+  # true/false; any UNKNOWN sentence prints verbatim); a row with no such key is
+  # a render that predates the stamping, printed as UNKNOWN, never a default.
+  python -c "import json,sys;d=json.load(sys.stdin);u='UNKNOWN (cache predates status stamping)';[print(f\"{x['kind']:18} {x['name']:40} v{x['current_version']} {x['skeleton']} status={x.get('status',u)} withdrawn={json.dumps(x['withdrawn']) if isinstance(x.get('withdrawn'),bool) else x.get('withdrawn',u)}\") for x in d['documents']]" < "$STEERING/STEERING-CACHE.json"  # envelope-ok: the local steering-cache render written by render-steering-cache.ps1, not a fleet door response
   # get one: KIND and NAME are shell variables you set - never a positional,
   # which in a slash-command body is a harness placeholder.
   BODY=$(python -c "import json,sys;d=json.load(sys.stdin);print(next((x['body_file'] or '' for x in d['documents'] if x['kind']==sys.argv[1] and x['name']==sys.argv[2]),''))" "$KIND" "$NAME" < "$STEERING/STEERING-CACHE.json")  # envelope-ok: the local steering-cache render written by render-steering-cache.ps1, not a fleet door response
@@ -681,6 +684,13 @@ Rules for this rung, in addition to Step 5's:
   `/chart` still refuses cached input for its Step 1.2 filter — a
   ranking against a stale skeleton flag is the confident-wrong shape — so this
   rung feeds a **read**, not a ranking.
+- **`status` / `withdrawn` are printed as stamped, never recomputed here.** A
+  `decision_record` refuses work only at `status: accepted` (`/chart` Step 4),
+  so a list that dropped these two would show a `withdrawn` or `superseded`
+  record exactly like a live veto. `UNKNOWN (coord predates served status)` is
+  the render's own answer, and `/chart` Step 4 sends that one to the cached
+  body's frontmatter; a missing key means the render predates the stamping and
+  reads the same way. Neither is `accepted`, and neither is "not accepted".
 - **Dossier heads are in the same cache** (`dossiers/<slug>.md`, resolved by
   client-side title prefix; `STEERING-CACHE.json` says `dossiers_refreshed` and
   `dossier_hits_at_cap`). They are outside `/policy`'s two verbs; read them
@@ -820,8 +830,10 @@ rung-5 response**, not once at the top:
   `401` anonymous and `422` with a device JWT — a `422` there means the door is
   OPEN and only the body was wrong. (ii) **Prefix, not credential:** `POST
   https://coord.qontinui.io/agents/allocate` answers `422` anonymous while `POST
-  https://coord.qontinui.io/coord/agents/allocate` answers `401` — the same
-  capability, one path segment apart.
+  https://coord.qontinui.io/coord/agents/allocate` answers `404`
+  `no_such_route` (measured 2026-09-13; it answered `401` through 2026-09-06) —
+  the same capability, one path segment apart. That 404 body says explicitly it
+  is about the PATH, not the credential, and points at `POST /agents/allocate`.
   It is a **liveness and credential** axis, not a sixth rung: prompt documents
   live in coord and `api.qontinui.io` does not serve them, so a `404` for a
   policy path there is a statement about that program's route table and nothing
@@ -1127,14 +1139,17 @@ already draws for a document with no mirror, applied to a host instead of a file
 
 If a `.coord-mcp-status` breadcrumb sits in your cwd, quote its reason **and its
 age** in that report: it is the RUNNER's own record that this workdir's coord-mcp
-provisioning was degraded, and six of its thirteen reasons mean that pass wrote
+provisioning was degraded, and six of its fourteen reasons mean that pass wrote
 no `.mcp.json` — which names the cause of an exhausted cascade rather than
 restating its symptom (a stale config, a foreign one or an unparseable one can
 still be sitting there, so rung 2 probing one is not a contradiction). The
-other seven are the probe's typed verdicts (`TIMEOUT`, `CONNECT_REFUSED`,
+other eight are the probe's typed verdicts (`TIMEOUT`, `CONNECT_REFUSED`,
 `UNAUTHORIZED (401)`, `CREDENTIAL_REFRESHING (503)`, `HTTP <observed>`,
-`HTTP_200_NOT_MCP`, `TRANSPORT`) and mean the opposite: a config WAS written
-and gave no usable answer at spawn; only `TIMEOUT` cannot tell a dead port from a busy
+`HTTP_200_NOT_MCP`, `TRANSPORT`, and the runner-credential verdict — that last
+one meaning the `.mcp.json` and its nonce are FINE and the RUNNER's own coord
+credential cannot answer, so a new session will not help) and mean the opposite: a config WAS written
+— the first seven because the probe got no usable answer at spawn, the eighth
+because the runner's own credential is dark; only `TIMEOUT` cannot tell a dead port from a busy
 one, and says so (`NOT known dead`).
 
 **Age it before you quote it.** Line 2 is a JSON stamp carrying `written_at`,

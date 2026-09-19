@@ -25,7 +25,7 @@ When `$ARGUMENTS` matches a project name (`web`, `qontinui-web`, `runner`, `qont
 
 ```bash
 # List specs the runner already knows about for this app
-curl -s http://localhost:9876/apps/<APP_ID>/spec/list | jq '.specs[].specId'
+curl -s http://127.0.0.1:9876/apps/<APP_ID>/spec/list | jq '.specs[].specId'
 ```
 
 Also check on disk: `ls <repo_root>/specs/pages/` for directories containing `state-machine.derived.json`.
@@ -47,8 +47,17 @@ you: Phase 2 of that plan withdrew removal authority from the `undeclared`
 trigger. The cost of skipping this is now a permanent leak rather than data loss,
 which is a trade made deliberately — not a reason to skip it.)
 
+```bash
+bash <workspace-root>/qontinui-claude-config/scripts/allocate-worktree.sh --repo <repo> --intent "<what for>" [--work-unit <uuid>]
 ```
-POST $COORD_HTTP_URL/agents/allocate
+
+The script (plan `2026-09-03-worktree-allocation-is-one-command-and-the-reflex-is-the-script`)
+POSTs the LITERAL `https://coord.qontinui.io/agents/allocate` — anonymous: no
+runner, no mint, no cached credential, no `$COORD_HTTP_URL` — handles every
+response shape below, and materialises the result. What it sends:
+
+```
+POST https://coord.qontinui.io/agents/allocate      # no Authorization header
 {
   "device_id":  "<this machine's device_id>",
   "repos":      [{"repo": "<repo>"}],
@@ -69,8 +78,13 @@ Three response shapes you must handle, or the call is worse than useless:
    `git -C <repo> worktree add -b <worktrees[].branch> <absolute-path> <worktrees[].parent_sha>`.
 2. **`isolation.mode` may be `wait` or `shared_branch`.** On `wait`, coord is out
    of disk/build-slot budget — report `reason` / `blocking` and retry or
-   serialize; do not force a worktree. On `shared_branch`, the canonical checkout
-   can carry the branch.
+   serialize; do not force a worktree. **Never honor `shared_branch` from a
+   session** — it means "put the branch in the primary checkout", which only
+   the runner's lease-taking materializer can do safely; coord answers it only
+   to a request carrying `accepts_shared_branch: true`, which nothing here
+   sends (claude-config #874). If an older coord still answers it, create the
+   ISOLATED worktree as in item 1 and leave the primary checkout alone — the
+   script does exactly that.
 3. **HTTP 409 `repo_not_registered`** — the repo is not in
    `coord.canonical_repos`, so coord cannot decide a parent SHA. Supply
    `parent_sha` explicitly, or fall back to a plain `git worktree add` and say in
@@ -96,7 +110,7 @@ After all subagents complete, report a summary table: page slug, matchRate, stat
 
 When `$ARGUMENTS` is a page URL, slug, or file path, compute these derived constants:
 
-- **RUNNER** = `http://localhost:9876` (primary runner)
+- **RUNNER** = `http://127.0.0.1:9876` (primary runner)
 - **APP_ID** = infer from the URL or file path:
   - URLs containing `:3001` or files under `qontinui-web/` → `qontinui-web`
   - URLs containing `:9876` or files under `qontinui-runner/` → `qontinui-runner`

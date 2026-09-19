@@ -97,9 +97,12 @@ For each learning, `POST /productivity-knowledge` with:
 ```
 
 The endpoint embeds the `body` server-side via the existing pipeline at
-`qontinui-runner/src-tauri/src/rag/embeddings.rs` if `embedding_b64` is
-omitted. You only need to compute the embedding yourself if you want to
-override the default; otherwise leave the field absent.
+`qontinui-runner/src-tauri/src/rag/embeddings.rs` when the request omits
+`embedding_b64`, the optional field declared in
+`qontinui-runner/src-tauri/src/mcp/knowledge.rs` — `embedding_b64` is that
+endpoint's field, not a symbol in the embedding pipeline. You only need to
+compute the embedding yourself if you want to override the default; otherwise
+leave the field absent.
 
 ### 6. Report
 

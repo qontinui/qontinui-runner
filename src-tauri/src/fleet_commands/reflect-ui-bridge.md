@@ -52,8 +52,11 @@ echo "$LATEST_RUN"
 # Get the AI output from the most recent completed run
 TASK_ID=$(echo "$LATEST_RUN" | python -c "import sys,json; print(json.load(sys.stdin)['id'])" 2>/dev/null)
 
-# Try live API first (works for running tasks)
-curl -s "http://localhost:9876/task-runs/$TASK_ID/output?tail_chars=50000" 2>/dev/null | head -c 50000
+# Try live API first (works for running tasks). -f so a 404/500 envelope is not
+# piped into `head` and printed as though it were task output — the one failure
+# mode a reader here cannot detect. A miss is EXPECTED for a completed run, so it
+# stays quiet and non-fatal: the DB fallback below is that case's real source.
+curl -fsS "http://127.0.0.1:9876/task-runs/$TASK_ID/output?tail_chars=50000" 2>/dev/null | head -c 50000
 
 # Fallback: read from database (completed tasks)
 python -c "
@@ -166,7 +169,7 @@ tail -200 "$BASE/.dev-logs/browser-events.jsonl" 2>/dev/null
 
 # Console errors (may reveal UI Bridge SDK issues)
 curl -s https://qontinui.io/api/ui-bridge/control/console-errors 2>/dev/null
-curl -s http://localhost:9876/ui-bridge/control/console-errors 2>/dev/null
+curl -s http://127.0.0.1:9876/ui-bridge/control/console-errors 2>/dev/null
 ```
 
 ---
@@ -253,7 +256,7 @@ Implement improvements that can be completed now:
 3. **Small SDK changes** — Label improvements, noise reduction, discovery tweaks
 
 After TypeScript changes: `cd ui-bridge && npm run build`
-After Rust changes: `cd qontinui-runner/src-tauri && cargo check`
+After Rust changes: `cd qontinui-runner/src-tauri && cargo check --all-targets`
 
 ---
 
@@ -307,7 +310,7 @@ Include BOTH quick wins already implemented (with "Status: Implemented") AND lar
 Use the workflow generator to create a follow-up workflow from the implementation plan:
 
 ```bash
-curl -s -X POST 'http://localhost:9876/unified-workflows/generate-async' \
+curl -s -X POST 'http://127.0.0.1:9876/unified-workflows/generate-async' \
   -H 'Content-Type: application/json' \
   -d '{
     "description": "<FULL IMPLEMENTATION PLAN TEXT>",
@@ -328,7 +331,10 @@ If the generator fails, write the plan to
 `$QONTINUI_PLANS_DIR/ui-bridge-implementation-plan.md`. `$QONTINUI_PLANS_DIR` is the
 directory plans live in, injected by the qontinui runner from its `paths.plans_dir`
 setting; **if it is unset** — a session launched outside the runner will not have it —
-ask the user once where plans live, or fall back to `<workspace-root>/plans`. Never
+ask the user once where plans live, or DISCOVER one: from the workspace root,
+`ls -d plans */plans 2>/dev/null` and use the directory that actually exists. Never
+fall back to a directory you have not confirmed is there; a named fallback fails
+silently on every machine that does not have it. Never
 assume an absolute path from another machine.
 
 ---

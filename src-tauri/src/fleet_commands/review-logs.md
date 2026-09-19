@@ -31,7 +31,7 @@ Comprehensively review all log data from qontinui-web (frontend/backend) and qon
 `<LOCALAPPDATA>/qontinui-runner/dev-logs/`. Runner-authored files land there, not
 in the workspace `.dev-logs/`, unless `paths.dev_logs_dir` is overridden — so read
 both, and resolve the real one with
-`GET http://localhost:9876/log-sources/runner-log-sink`.
+`GET http://127.0.0.1:9876/log-sources/runner-log-sink`.
 
 | Log | Path | Format |
 |-----|------|--------|
@@ -89,7 +89,7 @@ tail -200 "$BASE/.dev-logs/frontend.err.log" 2>/dev/null
 # qontinui-runner's own tracing sink — daily-rolled `qontinui-runner.log.<date>`,
 # so resolve the NEWEST match, across BOTH dev-logs dirs: the runner usually
 # writes to its own app-data dir, not the workspace .dev-logs/.
-# Exact dir: GET http://localhost:9876/log-sources/runner-log-sink
+# Exact dir: GET http://127.0.0.1:9876/log-sources/runner-log-sink
 # (`runner-tauri.log` is retired as a runner log — it is only stdout capture.)
 RDL="$LOCALAPPDATA/qontinui-runner/dev-logs"
 RUNNER_LOG=$(ls -t "$BASE"/.dev-logs/qontinui-runner.log.* \
@@ -293,7 +293,7 @@ You are fixing {SERVICE} errors/warnings found in the logs.
 After fixes, run:
 - Python: `poetry run black . && poetry run isort . && poetry run mypy --package {PKG}`
 - TypeScript: `npm run typecheck && npm run lint`
-- Rust: `cargo check && cargo clippy`
+- Rust: `cargo check --all-targets && cargo clippy --all-targets`
 
 ## Report Format
 Return a structured report:
