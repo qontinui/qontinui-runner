@@ -109,7 +109,7 @@
 # build compares it against itself and reports PERFECT PARITY -- the exact
 # blindness this plan exists to end. That is made structural, not conventional,
 # by reusing Phase 6's locator verbatim (scripts/lib/installed-runner.ps1):
-# every candidate it builds ends in 'Qontinui Runner.exe', it refuses any path
+# every candidate it builds sits directly under a 'Qontinui Runner' install directory, it refuses any path
 # under target\debug or target\release, and it has NO null-returning path -- on
 # no match it THROWS, naming every path probed. This script adds nothing of its
 # own that could reach a build directory: $DevExe and $PublishedExe are resolved
@@ -286,7 +286,7 @@ function Stop-ParityProcessTree {
 function Start-ParityRunner {
     param([string]$ExePath, [int]$Port, [string]$Label)
 
-    # -LiteralPath: the published exe is "Qontinui Runner.exe" under
+    # -LiteralPath: the published exe is "qontinui-runner.exe" under
     # "...\Qontinui Runner\". The space is harmless, but a wildcard
     # metacharacter in a user-controlled install dir would make -Path glob.
     $resolved = (Resolve-Path -LiteralPath $ExePath -ErrorAction Stop).Path
@@ -582,11 +582,11 @@ if ($SummaryOut) {
     $md.Add("### Published-build capability parity")
     $md.Add("")
     if ($result.SchemaRefusal) {
-        $md.Add("**Refused — schema version mismatch.** $($result.SchemaRefusalReason)")
+        $md.Add("**Refused -- schema version mismatch.** $($result.SchemaRefusalReason)")
         $md.Add("")
         $md.Add("No defect count is reported. A row diff across two manifest formats is meaningless, and ``0`` would be a claim this run did not earn.")
     } else {
-        $md.Add("**parity_defects = $($result.ParityDefectCount)** (rung_differs $($result.RungDifferCount) + only_in_dev $($result.OnlyInDevCount)) — out of **$($result.ComparableCount) comparable** rows.")
+        $md.Add("**parity_defects = $($result.ParityDefectCount)** (rung_differs $($result.RungDifferCount) + only_in_dev $($result.OnlyInDevCount)) -- out of **$($result.ComparableCount) comparable** rows.")
         $md.Add("")
         $md.Add("**$($result.UnobservedCount) rows were unobserved** on at least one leg, so no comparison was possible for them. ``unknown`` is the absence of a reading, never agreement -- read ``parity_defects`` as a floor over the comparable set, not a verdict on the roster.")
         $md.Add("")
@@ -607,7 +607,7 @@ if ($SummaryOut) {
             $md.Add("| ``$($r.Id)`` | $devCell | $pubCell | $disp |")
         }
         $md.Add("")
-        $md.Add("Allowlisted expected differences: **$(@($result.Allowlist).Count)** entries" + $(if (@($result.Allowlist).Count -eq 0) { " — the allowlist is empty; nothing was excused." } else { ":" }))
+        $md.Add("Allowlisted expected differences: **$(@($result.Allowlist).Count)** entries" + $(if (@($result.Allowlist).Count -eq 0) { " -- the allowlist is empty; nothing was excused." } else { ":" }))
         foreach ($e in @($result.Allowlist)) {
             $md.Add("- ``$($e.Id)`` (dev ``$($e.DevRung)`` / published ``$($e.PublishedRung)``): $($e.Reason)")
         }
