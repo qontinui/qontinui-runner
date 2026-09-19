@@ -988,16 +988,24 @@ mod tests {
     }
 
     /// Arm D names: the first cell's own text wins, a Status column is skipped,
-    /// and a later heading renames a phase a table row named first. `1.5` is a
-    /// sub-item, not phase 1.
+    /// and a later heading renames a phase a table row named first. `0.5` is a
+    /// sub-item, not phase 0.
     #[test]
     fn phases_arm_d_names_and_heading_precedence() {
-        let body = "# T\n\n| Phase | Status | Deliverable |\n|---|---|---|\n| 1 | SHIPPED | Foundation |\n| **2a — base theory doc** | open | x |\n| 3 | open | y |\n| 1.5 | open | sub-item |\n\n### Phase 3 — the real name\n";
+        let body = "# T\n\n| Phase | Status | Deliverable |\n|---|---|---|\n| 1 | SHIPPED | Foundation |\n| **2a — base theory doc** | open | x |\n| 3 | open | y |\n| 0.5 | open | sub-item |\n\n### Phase 3 — the real name\n";
         let p = parse(body);
-        let got: Vec<(u32, &str)> = p.phases.iter().map(|x| (x.index, x.name.as_str())).collect();
+        let got: Vec<(u32, &str)> = p
+            .phases
+            .iter()
+            .map(|x| (x.index, x.name.as_str()))
+            .collect();
         assert_eq!(
             got,
-            vec![(1, "Foundation"), (2, "base theory doc"), (3, "Phase 3 — the real name")]
+            vec![
+                (1, "Foundation"),
+                (2, "base theory doc"),
+                (3, "Phase 3 — the real name")
+            ]
         );
     }
 
