@@ -1049,7 +1049,8 @@ mod tests {
     /// not phases.
     #[test]
     fn phases_arm_c_list_ends_at_a_bold_line_or_a_paragraph() {
-        let body = "# T\n\n## Phases\n\n1. build\n2. ship\n\nThen, once it lands:\n\n1. a\n2. b\n3. c\n";
+        let body =
+            "# T\n\n## Phases\n\n1. build\n2. ship\n\nThen, once it lands:\n\n1. a\n2. b\n3. c\n";
         assert_eq!(indices(body), vec![1, 2]);
         let body = "# T\n\n## 6. Phases\n\n**Definition of done, corrected**\n\n1. a\n2. b\n3. c\n";
         assert!(indices(body).is_empty());
@@ -1172,7 +1173,10 @@ mod tests {
                 1 => one += 1,
                 _ => many += 1,
             }
-            let row: Vec<String> = got.iter().map(|p| format!("{}:{}", p.index, p.name)).collect();
+            let row: Vec<String> = got
+                .iter()
+                .map(|p| format!("{}:{}", p.index, p.name))
+                .collect();
             println!("phase_census_row\t{name}\t[{}]", row.join(", "));
         }
         println!(
