@@ -8891,9 +8891,14 @@ pub fn create_router(
                 // dispatcher's pairing default of "main" for an omitted label
                 // — for liveness, unlabeled is not main. The event clock was
                 // already stamped above, unconditionally.
+                // No document nonce: a response body carries no `doc`, so it
+                // advances the stamp without ever claiming a new document —
+                // fail-closed for the recovery rungs, which credit a reload
+                // only on a CHANGED identity.
                 crate::ui_error::ingest_window_pong(
                     &last_pong_for_listener,
                     crate::mcp::ui_bridge::capabilities::response_window_label(&response),
+                    None,
                     false,
                 );
                 // Spawn a task to handle the response since we need async
@@ -9226,9 +9231,15 @@ pub fn create_router(
             // too, and a live pop-out must not keep a dead main window reading
             // alive (plan 2026-09-19-runner-render-process-crash-recovery-is-a-
             // no-op-and-popout-pongs-mask-it).
-            let label = crate::ui_error::pong_event_label(event.payload());
-            let main_window =
-                crate::ui_error::ingest_window_pong(&last_pong, label.as_deref(), true);
+            // …and the payload's `doc` nonce identifies the DOCUMENT, which is
+            // what tells a post-reload pong from the pre-reload page's.
+            let sender = crate::ui_error::pong_event_sender(event.payload());
+            let main_window = crate::ui_error::ingest_window_pong(
+                &last_pong,
+                sender.label.as_deref(),
+                sender.document.as_deref(),
+                true,
+            );
             // Unblock requests waiting for frontend readiness — main only.
             if main_window {
                 ready.notify_waiters();

@@ -1063,12 +1063,25 @@ pub async fn ui_bridge_list_runner_windows_handler(
 /// `ui_bridge_last_pong`. An absent label is NOT main evidence — the same
 /// "unknown is the weaker claim" stance as `source`. See
 /// [`crate::ui_error::ingest_window_pong`].
+///
+/// # `?doc=` — which DOCUMENT sent it
+///
+/// A reload replaces the document behind one window label, so the label alone
+/// cannot say whether a pong came from the reloaded page or from the one the
+/// reload was supposed to replace — and that is exactly the evidence a
+/// recovery rung is credited on. `doc` is the sender's per-bundle-load nonce
+/// (`src/hooks/ui-bridge-events/utils.ts` `DOCUMENT_NONCE`); Rust keeps the
+/// main window's current one and credits a rung only when it CHANGED. See
+/// [`crate::ui_error::document_identity_changed`].
 #[derive(Debug, Default, Deserialize)]
 pub struct PongQuery {
     /// `"event"` | `"safety-net"`. Absent ⇒ safety net (see above).
     pub source: Option<String>,
     /// The sending window's label. Absent ⇒ not main-window evidence.
     pub label: Option<String>,
+    /// The sending document's nonce. Absent ⇒ an unidentified document, which
+    /// is never read as a NEW one.
+    pub doc: Option<String>,
 }
 
 impl PongQuery {
@@ -1096,6 +1109,7 @@ pub async fn ui_bridge_pong_handler(
     let main_window = crate::ui_error::ingest_window_pong(
         &state.app_state.ui_bridge_last_pong,
         query.label.as_deref(),
+        query.doc.as_deref(),
         event_provenance,
     );
     // Unblock requests waiting for frontend readiness — but only on MAIN
@@ -1118,6 +1132,20 @@ pub async fn ui_bridge_pong_handler(
 /// Deliberately does not inherit the response dispatcher's pairing default
 /// (an omitted label is routed as `"main"`): for liveness an unlabeled
 /// response is not main-window evidence.
+///
+/// # Which responses actually carry one — the narrow, true statement
+///
+/// `useUIBridgeEventHandler`'s `sendResponse` stamps its own window's label on
+/// every response it sends that does not already carry one, so responses on
+/// THIS path are labeled. `useUIBridgeEvaluateHandler` is the one that is not
+/// universal: it echoes `windowLabel` only when the REQUEST carried one, and
+/// Rust omits it for main-window requests — so a main-window evaluate reply
+/// carries no label at all. Nothing regresses today, because that reply
+/// travels on its own event (`ui-bridge:evaluate-response`) and never reaches
+/// this function or the `ui-bridge-response` listener. If it ever did, it would
+/// arrive unlabeled and be refused as main evidence: correct by this rule, but
+/// a liveness signal silently lost, so route it through a labeled response
+/// rather than relaxing the rule here.
 pub(crate) fn response_window_label(response: &serde_json::Value) -> Option<&str> {
     response.get("windowLabel").and_then(|v| v.as_str())
 }
@@ -1141,9 +1169,16 @@ pub async fn ui_bridge_ipc_response_handler(
     // `ui-bridge-request` that the native event loop DELIVERED to the
     // renderer. Only the return leg fell back to HTTP, so the delivery half
     // still proves the loop pumped.
+    //
+    // No document nonce: a response body carries no `doc`, so it leaves the
+    // main window's recorded document identity alone. That is deliberately
+    // fail-closed for the recovery rungs — a response from the PRE-reload
+    // document advances the stamp but never the identity, so it cannot credit
+    // a reload it did not prove.
     crate::ui_error::ingest_window_pong(
         &state.app_state.ui_bridge_last_pong,
         response_window_label(&response),
+        None,
         true,
     );
     handle_ui_bridge_response(pending, pending_count, response).await;
@@ -1696,6 +1731,36 @@ mod pong_provenance_tests {
     fn missing_source_is_accepted_not_rejected() {
         assert_eq!(parse("").source, None);
         assert_eq!(parse("").label, None);
+        assert_eq!(parse("").doc, None);
+    }
+
+    /// `doc` rides the wire beside `source` and `label`, and is independent of
+    /// both: a pong may identify its window without identifying its document
+    /// (an older bundle, a `curl`), and that absence is never a new document.
+    #[test]
+    fn the_document_nonce_parses_independently_of_the_label() {
+        let q = parse("source=event&label=main&doc=n-1");
+        assert!(q.is_event_provenance());
+        assert_eq!(q.label.as_deref(), Some("main"));
+        assert_eq!(q.doc.as_deref(), Some("n-1"));
+
+        assert_eq!(parse("label=main").doc, None);
+        assert_eq!(parse("doc=n-2").label, None);
+        assert_eq!(parse("doc=a%26doc%3Db").doc.as_deref(), Some("a&doc=b"));
+
+        // The verdict the nonce feeds: only a CHANGED identity credits a rung.
+        assert!(crate::ui_error::document_identity_changed(
+            parse("doc=before").doc.as_deref(),
+            parse("doc=after").doc.as_deref()
+        ));
+        assert!(!crate::ui_error::document_identity_changed(
+            parse("doc=same").doc.as_deref(),
+            parse("doc=same").doc.as_deref()
+        ));
+        assert!(!crate::ui_error::document_identity_changed(
+            parse("doc=before").doc.as_deref(),
+            parse("label=main").doc.as_deref()
+        ));
     }
 
     /// `label` rides the wire beside `source`, percent-decoded, and is

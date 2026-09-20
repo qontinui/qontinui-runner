@@ -41,9 +41,44 @@ export async function httpSendResponse(response: unknown): Promise<boolean> {
 export type PongSource = "event" | "safety-net";
 
 /**
- * The URL of a `POST /ui-bridge/pong`, carrying BOTH halves of what the Rust
- * side needs to know about a pong: its provenance (`source`, see
- * {@link PongSource}) and the window that sent it (`label`).
+ * A random identity for THIS document, minted once when this module is first
+ * evaluated — i.e. once per bundle load, which is once per document.
+ *
+ * It is what makes a pong evidence about a *new* page rather than merely a
+ * recent one. `ICoreWebView2::Reload()` only ACCEPTS a navigation, and the
+ * pre-reload document keeps answering pings (and sending its unconditional 3 s
+ * safety-net pong) until the new document replaces it — so a timestamp alone
+ * lets a pong from the page the reload was meant to replace credit the reload.
+ * Rust records the main window's current nonce and credits the reload rung only
+ * when it CHANGED (plan
+ * 2026-09-19-runner-render-process-crash-recovery-is-a-no-op-and-popout-pongs-mask-it).
+ *
+ * Opaque and short-lived: it identifies a document, never a user or a session,
+ * and nothing persists it.
+ */
+export const DOCUMENT_NONCE: string = mintDocumentNonce();
+
+function mintDocumentNonce(): string {
+  try {
+    const c: Crypto | undefined = globalThis.crypto;
+    if (c && typeof c.randomUUID === "function") return c.randomUUID();
+    if (c && typeof c.getRandomValues === "function") {
+      return Array.from(c.getRandomValues(new Uint8Array(16)))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+    }
+  } catch {
+    // Fall through: a nonce is diagnostic evidence, never a reason to throw
+    // out of module initialization and take the whole bundle down with it.
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+/**
+ * The URL of a `POST /ui-bridge/pong`, carrying the three things the Rust side
+ * needs to know about a pong: its provenance (`source`, see {@link PongSource}),
+ * the window that sent it (`label`), and the document that sent it
+ * (`doc`, see {@link DOCUMENT_NONCE}).
  *
  * The label is what makes a pong evidence about the MAIN window. Every
  * webview built from the embedded bundle — the main window and every pop-out
@@ -56,16 +91,26 @@ export type PongSource = "event" | "safety-net";
  * 2026-09-19-runner-render-process-crash-recovery-is-a-no-op-and-popout-pongs-mask-it).
  */
 export function pongUrl(port: number | string, source: PongSource, windowLabel: string): string {
-  return `http://localhost:${port}/ui-bridge/pong?source=${source}&label=${encodeURIComponent(windowLabel)}`;
+  return (
+    `http://localhost:${port}/ui-bridge/pong?source=${source}` +
+    `&label=${encodeURIComponent(windowLabel)}&doc=${encodeURIComponent(DOCUMENT_NONCE)}`
+  );
 }
 
 /**
  * The payload of the Tauri `ui-bridge-pong` event. Carries the sender's window
- * label for the same reason {@link pongUrl} does: the event is heard by one
- * process-wide Rust listener that cannot otherwise tell which window emitted it.
+ * label for the same reason {@link pongUrl} does — the event is heard by one
+ * process-wide Rust listener that cannot otherwise tell which window emitted
+ * it — and this document's nonce for the same reason again: one window's
+ * pongs before and after a reload are otherwise distinguishable only by their
+ * timestamps.
  */
-export function pongEventPayload(windowLabel: string): { timestamp: number; label: string } {
-  return { timestamp: Date.now(), label: windowLabel };
+export function pongEventPayload(windowLabel: string): {
+  timestamp: number;
+  label: string;
+  doc: string;
+} {
+  return { timestamp: Date.now(), label: windowLabel, doc: DOCUMENT_NONCE };
 }
 
 /**
