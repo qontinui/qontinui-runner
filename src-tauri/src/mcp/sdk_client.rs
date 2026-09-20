@@ -94,6 +94,12 @@ impl SdkConnectionManager {
 /// Implemented on the `Mutex` rather than the manager because the lock
 /// is held for the whole round trip, exactly as the exploration engine's
 /// own helper used to hold it.
+///
+/// This DELIBERATELY bypasses `AppDispatcher::dispatch_active_http` and
+/// the free `sdk_request` below it: exploration has always issued the raw
+/// round trip against the active connection, so routing it through the
+/// dispatcher here would change its behaviour (responsiveness cache, URL
+/// routing) rather than preserve it. Do not "unify" the two.
 #[async_trait::async_trait]
 impl crate::exploration::SdkTransport for tokio::sync::Mutex<SdkConnectionManager> {
     async fn sdk_request(

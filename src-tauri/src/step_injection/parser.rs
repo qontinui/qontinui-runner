@@ -27,7 +27,7 @@ use crate::str_utils::truncate_str;
 /// the concrete config type — so this module names no execution type and
 /// the parser is exercisable against any step shape.
 pub trait InjectableStep: serde::de::DeserializeOwned {
-    /// The step's declared type, checked against [`ALLOWED_STEP_TYPES`].
+    /// The step's declared type, checked against the parser's allow-list.
     fn step_type(&self) -> &str;
     /// Force the phase an injected step runs in.
     fn set_phase(&mut self, phase: String);
