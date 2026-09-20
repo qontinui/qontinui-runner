@@ -27,7 +27,11 @@ type TransitionEffectsReturn = ReturnType<typeof useStateTransitionEffects>;
  */
 export type RestartOutcome =
   | { restarted: true; tabId: string; retiredTabId: string | null }
-  | { restarted: false; reason: "not-restartable" | "spawn-failed"; state?: string };
+  | {
+      restarted: false;
+      reason: "not-restartable" | "spawn-failed" | "worker-not-restartable";
+      state?: string;
+    };
 
 export interface TransitionEffectsContextValue extends TransitionEffectsReturn {
   handleRestartInZone: (zoneIdx: number) => Promise<RestartOutcome>;
@@ -96,6 +100,25 @@ export function TransitionEffectsProvider({ children }: TransitionEffectsProvide
       const oldTabId = zoneLayout.assignments[zoneIdx];
       const oldTab = tabs.find((t) => t.id === oldTabId);
       const state = oldTabId ? (stateTracking.sessionStates[oldTabId] ?? "idle") : "idle";
+      // A Conductor worker is not restartable HERE, whatever its state says.
+      // "Restart" means spawn a replacement PTY and retire the old pane, and
+      // neither half is meaningful for a worker: there is no PTY, the shell it
+      // would spawn in the worker's worktree is not a worker, and retiring the
+      // pane calls `closeTerminal`, which since #1553 HIDES the worker's cell
+      // while the worker keeps running. The Conductor owns a worker's lifetime
+      // — it re-dispatches a failed subtask itself.
+      //
+      // This guard is load-bearing rather than defensive: before the worker
+      // tracking tap landed, a worker tab's state was permanently `"idle"` and
+      // the `completed`/`error` test below excluded it by accident. Now that a
+      // finished worker correctly reads `"completed"`, BOTH restart paths reach
+      // it — the operator's Restart button and, with `zone-auto-restart` on,
+      // the 2 s auto-restart `useStateTransitionEffects` schedules on exactly
+      // that transition.
+      const oldTabIsWorker = oldTab?.sessionBacked === true;
+      if (oldTabIsWorker) {
+        return { restarted: false, reason: "worker-not-restartable", state };
+      }
       if (state !== "completed" && state !== "error") {
         return { restarted: false, reason: "not-restartable", state };
       }

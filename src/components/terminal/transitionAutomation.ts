@@ -68,6 +68,12 @@ export interface TransitionTab {
   id: string;
   title: string;
   exitCode?: number | null;
+  /**
+   * Conductor worker tab (`useTerminalManager.TerminalTab.sessionBacked`) — a
+   * view of an in-process session with no PTY behind it. See
+   * {@link isRestartable}.
+   */
+  sessionBacked?: boolean;
 }
 
 export interface EvaluateTransitionsInput {
@@ -162,9 +168,21 @@ export function matchesApprovalPattern(
  * is the common case. A non-zero code is a failure the operator should see,
  * so it is deliberately NOT restarted; `error`-state panes are excluded by the
  * caller's state predicate for the same reason.
+ *
+ * A Conductor worker tab is NEVER restartable. A restart spawns a replacement
+ * PTY in the old tab's cwd and retires the old pane; for a worker the first
+ * half produces a plain shell in the Conductor's isolated worktree and the
+ * second HIDES a still-running worker's cell (`closeTerminal` on a
+ * `sessionBacked` tab is a view operation since #1553). Its `exitCode` is
+ * `null` — the "clean exit" shape above — so without this test a finished
+ * worker satisfied the predicate outright, and the 2 s auto-restart countdown
+ * would fire on the very transition that says the worker did its job.
+ * `handleRestartInZone` refuses the same case; this stops the INTENT being
+ * formed, so no countdown is shown for an action that will not happen.
  */
 export function isRestartable(tab: TransitionTab | undefined): boolean {
   if (!tab) return false;
+  if (tab.sessionBacked) return false;
   return tab.exitCode === 0 || tab.exitCode === null || tab.exitCode === undefined;
 }
 
@@ -183,15 +201,8 @@ function zoneOf(assignments: Readonly<Record<number, string>>, tabId: string): n
  * header — deliberately does NOT advance `prev`.
  */
 export function evaluateTransitions(input: EvaluateTransitionsInput): TransitionOutcome {
-  const {
-    prev,
-    next,
-    tabs,
-    assignments,
-    autoApprovePatterns,
-    autoRestart,
-    getLastOutputLines,
-  } = input;
+  const { prev, next, tabs, assignments, autoApprovePatterns, autoRestart, getLastOutputLines } =
+    input;
 
   const newNeedsInput: string[] = [];
   const newErrors: string[] = [];
@@ -221,12 +232,7 @@ export function evaluateTransitions(input: EvaluateTransitionsInput): Transition
       // Auto-restart is armed on the completed edge only, and only for a zone
       // the tab actually occupies — a restart is a ZONE operation, so an
       // unassigned tab has nowhere to be restarted into.
-      if (
-        state === "completed" &&
-        autoRestart &&
-        zoneIdx !== undefined &&
-        isRestartable(tab)
-      ) {
+      if (state === "completed" && autoRestart && zoneIdx !== undefined && isRestartable(tab)) {
         restarts.push({ zoneIdx, tabId, title: tab?.title ?? tabId });
       }
     }

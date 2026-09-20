@@ -89,6 +89,53 @@ describe("isRestartable", () => {
   it("refuses a missing tab", () => {
     expect(isRestartable(undefined)).toBe(false);
   });
+
+  it("refuses a Conductor worker even though its exit code reads clean", () => {
+    // A worker tab carries `exitCode: null` — the "unreported exit" shape
+    // accepted above — so without the `sessionBacked` test a finished worker
+    // satisfies the predicate outright. Restarting it would spawn a plain
+    // shell in the Conductor's isolated worktree and then `closeTerminal` the
+    // worker's tab, which since #1553 HIDES a still-running worker's cell.
+    expect(isRestartable(TAB("w", { sessionBacked: true }))).toBe(false);
+    expect(isRestartable(TAB("w", { sessionBacked: true, exitCode: 0 }))).toBe(false);
+    expect(isRestartable(TAB("w", { sessionBacked: true, exitCode: null }))).toBe(false);
+  });
+});
+
+describe("evaluateTransitions — a Conductor worker is never auto-restarted", () => {
+  it("forms no restart intent on a worker's completed edge", () => {
+    // The transition this fires on is the one that says the worker DID its
+    // job. Auto-restart is armed on exactly that edge, so a worker reaching
+    // `completed` — which it now does, because the worker tracking tap feeds
+    // its real state — would otherwise schedule a 2s countdown to replace it
+    // with a shell.
+    const out = evaluateTransitions(
+      input({
+        prev: { w: "working" },
+        next: { w: "completed" },
+        tabs: [TAB("w", { title: "worker:T1", exitCode: null, sessionBacked: true })],
+        assignments: { 0: "w" },
+        autoRestart: true,
+      }),
+    );
+    expect(out.restarts).toEqual([]);
+    // The state change is still observed — the worker finishing is real news,
+    // it is only the restart that is wrong.
+    expect(out.newCompleted).toEqual(["w"]);
+  });
+
+  it("still forms one for an ordinary PTY tab on the same edge", () => {
+    const out = evaluateTransitions(
+      input({
+        prev: { t: "working" },
+        next: { t: "completed" },
+        tabs: [TAB("t", { title: "zsh", exitCode: null })],
+        assignments: { 0: "t" },
+        autoRestart: true,
+      }),
+    );
+    expect(out.restarts.map((r) => r.tabId)).toEqual(["t"]);
+  });
 });
 
 describe("evaluateTransitions — purity", () => {
@@ -139,9 +186,7 @@ describe("evaluateTransitions — purity", () => {
 
 describe("evaluateTransitions — edge detection", () => {
   it("detects a needs-input edge", () => {
-    const out = evaluateTransitions(
-      input({ prev: { a: "working" }, next: { a: "needs-input" } }),
-    );
+    const out = evaluateTransitions(input({ prev: { a: "working" }, next: { a: "needs-input" } }));
     expect(out.newNeedsInput).toEqual(["a"]);
     expect(out.newErrors).toEqual([]);
     expect(out.newCompleted).toEqual([]);
@@ -204,7 +249,10 @@ describe("evaluateTransitions — edge detection", () => {
 });
 
 describe("evaluateTransitions — auto-approve", () => {
-  const needsInput = { prev: { a: "working" as SessionState }, next: { a: "needs-input" as SessionState } };
+  const needsInput = {
+    prev: { a: "working" as SessionState },
+    next: { a: "needs-input" as SessionState },
+  };
 
   it("approves a tab whose trailing output matches", () => {
     const out = evaluateTransitions(
@@ -404,11 +452,7 @@ describe("evaluateTransitions — multi-tab", () => {
       }),
     );
     expect(out.stateChanges.map((s) => s.tabId)).toEqual(["a", "b", "c"]);
-    expect(out.stateChanges.map((s) => s.to)).toEqual([
-      "needs-input",
-      "error",
-      "completed",
-    ]);
+    expect(out.stateChanges.map((s) => s.to)).toEqual(["needs-input", "error", "completed"]);
   });
 
   it("reports an empty outcome for an empty diff", () => {

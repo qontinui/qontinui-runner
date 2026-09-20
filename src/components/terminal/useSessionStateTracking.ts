@@ -73,6 +73,27 @@ export interface UseSessionStateTrackingReturn {
    * reaches this one.
    */
   handleActivityDigest: (tabId: string, bytesDelta: number, lines: string[]) => void;
+  /**
+   * Feed tracking from a Conductor worker's `ai-output` stream — the third
+   * feed, for tabs that have no PTY and therefore emit neither
+   * `terminal-output` nor `terminal-activity` (`workerOutputTap.ts`).
+   *
+   * Identical bookkeeping to {@link UseSessionStateTrackingReturn.handleOutput}
+   * — `lastOutputTime`, the sparkline, `lastOutputLines` — with ONE deliberate
+   * omission: it never runs `detectSessionState`. A worker's state is reported
+   * authoritatively on `claude-session-state` and applied through
+   * {@link UseSessionStateTrackingReturn.applyWorkerSessionState}; running the
+   * PTY approval-prompt regexes over assistant markdown would invent a
+   * `needs-input` that a stream-json session cannot be in.
+   */
+  handleWorkerOutput: (tabId: string, text: string) => void;
+  /**
+   * Apply a Conductor worker's authoritative session state to the tab.
+   * `null` means the event said nothing about the state and the previous value
+   * stands — never write a default for an unknown
+   * (`verification-and-evidence` `unknown-must-not-render-as-a-default`).
+   */
+  applyWorkerSessionState: (tabId: string, state: SessionState | null) => void;
 }
 
 export function useSessionStateTracking(
@@ -378,6 +399,43 @@ export function useSessionStateTracking(
     [processOutput, hotStore],
   );
 
+  /**
+   * The Conductor-worker feed. See
+   * {@link UseSessionStateTrackingReturn.handleWorkerOutput} for why the
+   * pattern detector is deliberately absent here.
+   */
+  const handleWorkerOutput = useCallback(
+    (tabId: string, text: string) => {
+      if (text.length === 0) return;
+      lastOutputTimeRef.current[tabId] = Date.now();
+
+      if (!activityBuffersRef.current[tabId]) {
+        activityBuffersRef.current[tabId] = [];
+      }
+      const buf = activityBuffersRef.current[tabId];
+      if (buf.length === 0) buf.push(0);
+      buf[buf.length - 1] += text.length;
+
+      // No xterm buffer exists for a worker tab (no `TerminalInstance` ever
+      // mounts for one), so pass the empty reader and let `nextOutputLines`
+      // take its strip-and-dedupe fallback — the same path an unmounted PTY
+      // tab takes.
+      const nextLines = nextOutputLines([], text, () => hotStore.getLastOutputLines(tabId));
+      if (nextLines) {
+        hotStore.setTabOutputLines(tabId, nextLines);
+      }
+    },
+    [hotStore],
+  );
+
+  const applyWorkerSessionState = useCallback((tabId: string, state: SessionState | null) => {
+    if (state === null) return;
+    setSessionStates((prev) => {
+      if (prev[tabId] === state) return prev;
+      return { ...prev, [tabId]: state };
+    });
+  }, []);
+
   // Memoize the return so the value object's identity only changes when
   // something in it actually changed. Previously this was a bare object
   // literal, which made the whole `TerminalSessionContext` value churn on
@@ -393,7 +451,17 @@ export function useSessionStateTracking(
       handleExit,
       handleOutput,
       handleActivityDigest,
+      handleWorkerOutput,
+      applyWorkerSessionState,
     }),
-    [sessionStates, staleTabs, handleExit, handleOutput, handleActivityDigest],
+    [
+      sessionStates,
+      staleTabs,
+      handleExit,
+      handleOutput,
+      handleActivityDigest,
+      handleWorkerOutput,
+      applyWorkerSessionState,
+    ],
   );
 }

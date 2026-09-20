@@ -38,14 +38,28 @@ export interface ReconcilableTerminal {
    * excluded from the reconcile rather than replaced by a local shell.
    */
   remote?: unknown;
+  /**
+   * Conductor worker tab (`useTerminalManager.TerminalTab.sessionBacked`). It
+   * is a VIEW of an in-process session the Conductor owns, not a terminal this
+   * surface may move.
+   */
+  sessionBacked?: boolean;
 }
 
 /**
  * Pure: the terminals whose cwd is NOT the project root.
  *
- * Deliberately conservative — three classes are never reported:
+ * Deliberately conservative — four classes are never reported:
  *
  *   - **plan tabs** (`type === "plan"`) have no PTY and no cwd at all;
+ *   - **Conductor worker tabs** (`sessionBacked`) — a worker is ALIVE and its
+ *     `workingDir` is the isolated worktree the Conductor dispatched it into,
+ *     which is never the project root, so every worker matched the "outside"
+ *     test by construction. "Move them" would then have spawned a junk shell at
+ *     the project root per worker and called `closeTerminal` on each, which
+ *     since #1553 HIDES the worker's cell rather than closing anything — losing
+ *     sight of every running worker on one click. A worker's cwd is not the
+ *     operator's to correct;
  *   - **exited tabs** (`isAlive === false`) are tombstones; "moving" one would
  *     spawn a shell the operator never asked for;
  *   - **tabs with no `workingDir`** — an UNKNOWN cwd is not a known mismatch.
@@ -64,6 +78,7 @@ export function findTerminalsOutsideProject<T extends ReconcilableTerminal>(
   const normalizedRoot = normalizePathForCompare(root);
   return tabs.filter((t) => {
     if (t.type === "plan") return false;
+    if (t.sessionBacked) return false;
     if (t.remote) return false;
     if (!t.isAlive) return false;
     const wd = t.workingDir?.trim();

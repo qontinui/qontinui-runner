@@ -72,6 +72,15 @@ import {
   subscribeTerminalActivityStream,
 } from "../terminalEventDemux";
 import { publishRoster, releaseRoster } from "../terminalVisibilityTiers";
+import { listen } from "@tauri-apps/api/event";
+import {
+  WorkerOutputCoalescer,
+  workerSessionStateFor,
+  workerTabsByTaskRun,
+  workerTextFromAiOutput,
+  type WorkerAiOutputPayload,
+  type WorkerSessionStatePayload,
+} from "../workerOutputTap";
 
 import { useTerminalManager } from "../useTerminalManager";
 import { useZoneLayout } from "../useZoneLayout";
@@ -566,17 +575,31 @@ const PageSessionScope = memo(function PageSessionScope({
   // `tabs` set is the correct ownership filter (matches what the instances that
   // previously fed tracking covered).
   const tabIdSetRef = useRef<Set<string>>(new Set());
+  /** `taskRunId -> tabId` for this page's worker tabs; the worker tap's filter. */
+  const workerTabsByRunRef = useRef<Map<string, string>>(new Map());
+  const workerCoalescerRef = useRef(new WorkerOutputCoalescer());
   useEffect(() => {
     const ids = new Set(tabs.map((t) => t.id));
     tabIdSetRef.current = ids;
+    workerTabsByRunRef.current = workerTabsByTaskRun(tabs);
     // Drop decoders/buffers for tabs that closed so they don't accumulate.
     coalescerRef.current.retain(ids);
+    workerCoalescerRef.current.retain(ids);
     // Phase 5 — publish this scope's roster to the window-wide visibility
     // reconciler. A DECLARATION alone can never produce `unwatched`; the
     // absence of one has to, and the reconciler can only notice an absence for
     // ids it knows exist. Without the roster a tab whose pane just unmounted
     // would simply stop being mentioned and keep its old tier forever.
-    publishRoster(pageId, [...ids]);
+    //
+    // A Conductor worker tab is excluded: the roster's whole vocabulary is
+    // PTY visibility tiers, its id names no terminal, and no `TerminalInstance`
+    // ever declares a tier for it — so including it only pushed
+    // `terminal_set_visibility({ids:[<task run id>], tier:"unwatched"})` at the
+    // runner for a terminal that does not exist.
+    publishRoster(
+      pageId,
+      tabs.filter((t) => !t.sessionBacked).map((t) => t.id),
+    );
   }, [tabs, pageId]);
 
   // Release the roster when the whole page scope goes away, so its tabs stop
@@ -662,6 +685,100 @@ const PageSessionScope = memo(function PageSessionScope({
       // update would target unmounted state. Just release the listeners.
       unlisten();
       unlistenActivity();
+    };
+  }, []);
+
+  // ---- Conductor-worker tracking tap (post-#1553 follow-up) ----
+  //
+  // The third feed into `useSessionStateTracking`. The two taps above both key
+  // on a PTY: `terminal-output` for a watched terminal, `terminal-activity` for
+  // one the runner has gone quiet on. A Conductor worker has NO PTY at all
+  // (`WorkerSessionCell`, Phase 2b), so neither ever fires for it and every
+  // surface that reads `sessionStates` / `lastOutputLines` — the zone chip, the
+  // CompactZoneCard a virtualized zone renders instead of the cell, the
+  // StatusStrip pills, the needs-input/error cyclers — reported a working
+  // worker as an idle, silent terminal. This tap closes that, routing
+  // `ai-output` text and `claude-session-state` state through
+  // `workerOutputTap.ts`.
+  //
+  // Separate from the tap above rather than folded into it: that one is bound
+  // to the shared `terminal-output` demux and its coalescer holds a
+  // `TextDecoder` per terminal, neither of which applies here.
+  const handleWorkerOutputRef = useRef(stateTracking.handleWorkerOutput);
+  const applyWorkerSessionStateRef = useRef(stateTracking.applyWorkerSessionState);
+  useEffect(() => {
+    handleWorkerOutputRef.current = stateTracking.handleWorkerOutput;
+    applyWorkerSessionStateRef.current = stateTracking.applyWorkerSessionState;
+  }, [stateTracking.handleWorkerOutput, stateTracking.applyWorkerSessionState]);
+
+  useEffect(() => {
+    const coalescer = workerCoalescerRef.current;
+    let rafHandle: ReturnType<typeof requestAnimationFrame> | null = null;
+    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+    // Same rAF-plus-floor pairing as the PTY tap: rAF suspends in an occluded
+    // window, and a worker's state chip must not freeze because its page is
+    // backgrounded.
+    const WORKER_TAP_FLUSH_FLOOR_MS = 200;
+
+    const flush = () => {
+      if (rafHandle !== null) {
+        cancelAnimationFrame(rafHandle);
+        rafHandle = null;
+      }
+      if (timeoutHandle !== null) {
+        clearTimeout(timeoutHandle);
+        timeoutHandle = null;
+      }
+      const fn = handleWorkerOutputRef.current;
+      for (const [tabId, text] of coalescer.drain()) {
+        fn(tabId, text);
+      }
+    };
+    const scheduleFlush = () => {
+      if (rafHandle !== null || timeoutHandle !== null) return;
+      rafHandle = requestAnimationFrame(flush);
+      timeoutHandle = setTimeout(flush, WORKER_TAP_FLUSH_FLOOR_MS);
+    };
+
+    let disposed = false;
+    const unlisteners: Array<() => void> = [];
+    const attach = (fn: () => void) => {
+      if (disposed) fn();
+      else unlisteners.push(fn);
+    };
+
+    // Every page's scope hears every AI session's events — the Process Manager
+    // chats included — so the roster lookup is the ownership filter, exactly as
+    // `tabIdSetRef` is for the PTY tap. A run id this page holds no worker tab
+    // for is not ours and is dropped.
+    listen<WorkerAiOutputPayload>("ai-output", (event) => {
+      const runId = event.payload?.taskRunId;
+      if (!runId) return;
+      const tabId = workerTabsByRunRef.current.get(runId);
+      if (!tabId) return;
+      const text = workerTextFromAiOutput(event.payload);
+      if (text === null) return;
+      coalescer.push(tabId, text);
+      scheduleFlush();
+    }).then(attach);
+
+    // State is applied straight through: it is low-rate (one event per turn
+    // boundary), and delaying it by a frame would let the chip lag the text.
+    listen<WorkerSessionStatePayload>("claude-session-state", (event) => {
+      const runId = event.payload?.taskRunId;
+      if (!runId) return;
+      const tabId = workerTabsByRunRef.current.get(runId);
+      if (!tabId) return;
+      applyWorkerSessionStateRef.current(tabId, workerSessionStateFor(event.payload?.state));
+    }).then(attach);
+
+    return () => {
+      disposed = true;
+      if (rafHandle !== null) cancelAnimationFrame(rafHandle);
+      if (timeoutHandle !== null) clearTimeout(timeoutHandle);
+      // Same reasoning as the PTY tap: no trailing flush into a tracker that
+      // is unmounting with its page.
+      for (const fn of unlisteners) fn();
     };
   }, []);
 

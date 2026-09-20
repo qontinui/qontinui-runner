@@ -71,6 +71,27 @@ describe("findTerminalsOutsideProject", () => {
     expect(out).toEqual([]);
   });
 
+  it("does not report a Conductor worker, whose cwd is never the project root", () => {
+    // A worker tab is alive and its `workingDir` is the isolated worktree the
+    // Conductor dispatched it into, so it matched the "outside" test by
+    // construction — every running worker was offered for moving. [Move them]
+    // would spawn a junk shell at the project root per worker and then
+    // `closeTerminal` each one, which since #1553 HIDES a still-running
+    // worker's cell: one click and the operator loses sight of the whole run.
+    const out = findTerminalsOutsideProject(
+      [
+        tab({
+          id: "worker",
+          sessionBacked: true,
+          workingDir: "D:\\projects\\agent-worktrees\\01a0\\qontinui-runner",
+        }),
+        tab({ id: "out", workingDir: "D:\\projects\\book-notes" }),
+      ],
+      ROOT,
+    );
+    expect(out.map((t) => t.id)).toEqual(["out"]);
+  });
+
   it("reports nothing when no project is active", () => {
     const tabs = [tab({ workingDir: "D:\\elsewhere" })];
     expect(findTerminalsOutsideProject(tabs, null)).toEqual([]);
