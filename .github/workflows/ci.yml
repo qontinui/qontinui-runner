@@ -818,75 +818,109 @@ jobs:
 
       # ── RUN half ────────────────────────────────────────────
       #
-      # Executes the binaries the step above already built, so its clock is a
-      # TEST clock and is bounded like one.
+      # ⚠️ THIS STEP DELIBERATELY DOES NOT INVOKE CARGO, and that is the whole
+      # correction. The first cut ran `cargo test` here and BOTH legs expired at
+      # 20 minutes on run 35477464051 — not running tests, but RECOMPILING.
+      # cargo's own words, from the run step's log:
       #
-      # SIZED AGAINST THE WHOLE RUN PHASE, NOT ONE BINARY. Measured end to end
-      # on run 35043646051 attempt 2 (the green re-run of the same head), job
-      # 105381742778: first test output `running 1360 tests` at 21:51:04.68,
-      # last `test result:` at 21:56:30.56 — the run phase is **5m26s**. The
-      # `finished in 117.72s` figure quoted everywhere in this incident is one
-      # binary's harness time, not the phase; sizing a bound off it would have
-      # understated the real quantity by ~2.7x. 20 minutes is **3.7x** the
-      # measured phase.
+      #   Dirty qontinui-runner v1.0.11: the file
+      #   `target/debug/build/qontinui-runner-<hash>/out/tauri-codegen-assets/<sha>.html`
+      #   has changed (1789863156.702777538s, 4s AFTER last build at 1789863152.136709306s)
       #
-      # Say the margin out loud, because it is thinner than it looks and it
-      # SHRINKS: 3m07s of those 5m26s is the single 9905-test binary
-      # (21:53:11 -> 21:56:18), which grows with the suite. This bound gates a
-      # branch-protection-required check, so re-measure it the next time the
-      # suite grows materially — that is the plan's Phase 5, and this comment is
-      # the number it starts from.
+      # `tauri::generate_context!()` writes its codegen assets into `OUT_DIR`
+      # DURING the compilation of the lib, and they land ~4 s after the
+      # fingerprint cargo recorded for that same compilation — so the package is
+      # an input to itself and every SUBSEQUENT cargo invocation sees it Dirty.
+      # A single `cargo test` never notices, because it only checks freshness
+      # once. Splitting into two invocations makes cargo check twice, and the
+      # second check always fails. Measured on the ubuntu leg: `Compiling
+      # qontinui-runner` at 00:39:30, the main-crate rustc still running when
+      # the step was killed 20 minutes later (`Terminate orphan process: pid
+      # (10329) (rustc)`), with a cascade of ~12 bin/test targets rebuilt behind
+      # it. Not our build script — `src-tauri/build.rs` emits no
+      # `rerun-if-changed` into `OUT_DIR`; this is `tauri-build`/`tauri-codegen`
+      # (2.5). Recorded as a follow-up rather than worked around silently.
       #
-      # DOCTESTS ARE NOT THE REASON THIS IS NOT 2. `cargo test --no-run` does
-      # not build them and rustdoc compiles them here, which is true and was
-      # this comment's original justification — but measured, `Doc-tests
-      # qontinui_runner_lib` ran 21:56:25.26 -> 21:56:30.56, **5.3 s**. They are
-      # negligible. The real reason is simply that harness execution across 29
-      # binaries is 5.4 min.
+      # So the run half executes the binaries the build half ALREADY produced.
+      # cargo prints one `Executable \`<path>\`` line per test target under
+      # `--no-run`; this step recovers those paths from the build log and runs
+      # them. No cargo, no freshness check, no rebuild — ever. That is also what
+      # finally makes the bound below mean what it says.
       #
-      # What the bound still has to cover, and why it is generous rather than
-      # tight to 5m26s:
+      # THE BOUND IS UNCHANGED AT 20 AND IT WAS NEVER THE DEFECT. It is sized
+      # against run 35043646051 **attempt 2** — the green re-run, which carried
+      # all 29 `test result:` lines totalling 11,368 passed + 118 ignored =
+      # 11,486 tests — whose run phase is 5m26s (21:51:04.68 → 21:56:30.56).
+      # Attempt 1 is the truncated one (7 `test result:` lines, 7112 ingested
+      # rows), and no figure here comes from it. 20 minutes is 3.7x a COMPLETE
+      # suite's execution, and now that nothing compiles here it is 3.7x of
+      # exactly what it bounds.
       #
-      #   * per-test heartbeat stalls (the swap-thrash class from PR #84), and
-      #   * the macOS keychain hang — macOS is currently out of the matrix, but
-      #     QONTINUI_DISABLE_KEYCHAIN below is what actually neutralises it, and
-      #     it belongs on THIS step because this is where tests execute.
+      # What the bound still covers: per-test heartbeat stalls (the swap-thrash
+      # class from PR #84) and the macOS keychain hang, which
+      # QONTINUI_DISABLE_KEYCHAIN neutralises and which is a RUNTIME hang — so
+      # that env entry belongs here, where tests execute. `CARGO_BUILD_JOBS` no
+      # longer does: this step compiles nothing, so carrying a compile throttle
+      # would be cargo-cult.
       #
-      # `cargo test` (not a direct binary invocation) is deliberate: it
-      # re-resolves the workspace, which is seconds against the tree the build
-      # step just made fresh, and it keeps the log the coord ingest parses
-      # byte-identical to what a single unsplit step produced.
-      #
-      # `CARGO_BUILD_JOBS` is carried across because rustdoc still compiles the
-      # doctests here: dropping the throttle would retune that compile to
-      # cargo's default on exactly the platform the throttle exists for. The
-      # effect is small (5.3 s of doctests), the principle is not — one step
-      # silently running at a different parallelism than its sibling is how the
-      # current value went stale. Phase 3 step 2 retunes both together, after
-      # the sampler below has produced a peak.
-      #
-      # Both env entries are pinned by src-tauri/tests/ci_rust_test_steps_split.rs
-      # on BOTH steps, because both were deletable from this one with every
-      # test green until that review round.
+      # ⚠️ DOCTESTS ARE NOT RUN BY THIS STEP, and the cost is measured, not
+      # assumed. `cargo test --no-run` does not build them, so they have no
+      # `Executable` line to recover. On the last complete run the entire
+      # doctest target was: `Doc-tests qontinui_runner_lib` → `running 1 test` →
+      # `... ignored`. ONE doctest, and it does not execute — so today this
+      # loses exactly zero executed tests. It will not stay true by itself:
+      # recovering doctests needs a second cargo invocation, which is precisely
+      # what pays the rebuild above. Tracked as a follow-up.
       - name: Run Rust tests
         id: run_rust_tests
         timeout-minutes: 20
         env:
           QONTINUI_DISABLE_KEYCHAIN: "1"
-          CARGO_BUILD_JOBS: ${{ matrix.platform == 'windows-latest' && '2' || '1' }}
         run: |
           cd src-tauri
-          # `set -o pipefail` — defence in depth; see the build step. The tee is for the "Report
-          # test results to coord" step below, which parses this SAME output
-          # instead of running the suite a second time (plan
-          # 2026-08-30-runner-ci-has-no-flake-detection-so-one-flaky-test-freezes-the-train,
-          # Phase 1 redesigned). `cargo-test-output.log` is written HERE and
-          # nowhere else: the ingest's whole recognition gate is run-phase
-          # lines, so the run step owning this filename is a contract, not a
-          # convention. src-tauri/tests/ci_rust_test_steps_split.rs pins it.
+          # `set -o pipefail` — defence in depth; see the build step. It is also
+          # what carries the runner's exit status out of the `| tee` below, so a
+          # failing binary reds this step.
           set -o pipefail
-          cargo test --verbose 2>&1 | tee "$GITHUB_WORKSPACE/cargo-test-output.log"
-        shell: bash
+
+          # Recover the test binaries the build step already produced. Strip
+          # ANSI first: CARGO_TERM_COLOR is `always`, so the tee'd log carries
+          # escapes and a naive match finds nothing — which would look exactly
+          # like "no binaries" and pass vacuously.
+          BUILD_LOG="$GITHUB_WORKSPACE/cargo-test-build.log"
+          ESC=$(printf '\033')
+          BINS=()
+          while IFS= read -r line; do BINS+=("$line"); done < <(
+            sed -e "s/${ESC}\[[0-9;]*m//g" "$BUILD_LOG" \
+              | sed -n 's/^[[:space:]]*Executable `\(.*\)`[[:space:]]*$/\1/p'
+          )
+
+          # A vacuous pass here would be the exact defect this whole change is
+          # about, so refuse rather than report green over zero binaries.
+          if [ "${#BINS[@]}" -eq 0 ]; then
+            echo "::error title=No test binaries::found no \`Executable\` lines in $BUILD_LOG. Either the build step produced no test targets, or cargo's output format changed. Refusing to report a pass over zero binaries."
+            exit 1
+          fi
+          echo "recovered ${#BINS[@]} test binaries from the build step"
+
+          # Emit cargo's own `Running \`<path>\`` announcement before each
+          # binary. That line is not cosmetic: `binaryIdFromAnnouncementLine`
+          # (scripts/ci-flake-analyze.mjs) uses it to attribute each `test … ok`
+          # to its binary, so the coord ingest's rows keep their binary
+          # attribution exactly as they had it under `cargo test`.
+          #
+          # Fail-fast on the first failing binary, matching `cargo test`'s own
+          # default (it stops at the first failing target unless
+          # `--no-fail-fast`). Keeping that identical means this step's red/green
+          # meaning is unchanged by the switch.
+          run_all() {
+            local b
+            for b in "${BINS[@]}"; do
+              printf '     Running `%s`\n' "$b"
+              "$b" || return $?
+            done
+          }
+          run_all 2>&1 | tee "$GITHUB_WORKSPACE/cargo-test-output.log"
 
       # Phase 2 of the same plan: make an expiry name its own phase.
       #

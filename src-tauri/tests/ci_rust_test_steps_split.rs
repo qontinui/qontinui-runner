@@ -154,6 +154,14 @@ fn command_lines(step: &serde_yaml::Value, name: &str) -> String {
         .join("\n")
 }
 
+/// A real cargo INVOCATION, as opposed to the word "cargo" inside a log
+/// filename (`cargo-test-build.log`) or a sentence. Anchored on a cargo
+/// subcommand so `cargo-test-output.log` cannot match.
+static CARGO_INVOCATION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?m)(^|[|;&(]\s*|\s)cargo\s+(test|build|run|check|clippy|nextest)\b")
+        .expect("the cargo-invocation pattern compiles")
+});
+
 const BUILD: &str = "Build Rust tests";
 const RUN: &str = "Run Rust tests";
 
@@ -218,9 +226,43 @@ fn rust_tests_are_built_and_run_in_separate_bounded_steps() {
         "`{BUILD}` must invoke `cargo test --no-run`; without it both steps run \
          the suite and the split measures nothing"
     );
+
+    // THE assertion this file exists for after run 35477464051. A second cargo
+    // invocation re-checks freshness, and `tauri::generate_context!()` writes
+    // its codegen assets into OUT_DIR ~4 s AFTER the fingerprint cargo recorded
+    // for the very compilation that produced them — so the package is an input
+    // to itself and every later invocation rebuilds it. Both legs expired at 20
+    // minutes COMPILING, with rustc still running at the kill. The run half
+    // must therefore execute the binaries the build half already produced, and
+    // must never reach for cargo again.
     assert!(
-        !run_run.contains("--no-run"),
-        "`{RUN}` must actually run the suite, so it must not carry `--no-run`"
+        !CARGO_INVOCATION.is_match(&run_run),
+        "`{RUN}` must NOT invoke cargo. A second cargo invocation re-checks \
+         freshness, and this crate is permanently Dirty across invocations \
+         (tauri-codegen writes into OUT_DIR after the fingerprint), so it \
+         rebuilds the whole package inside the TEST clock — which is exactly \
+         what the split exists to prevent. Run the `Executable` paths the \
+         build half printed instead. Body was:\n{run_run}"
+    );
+    assert!(
+        run_run.contains("cargo-test-build.log"),
+        "`{RUN}` must recover the test-binary paths from the build half's log \
+         (`cargo-test-build.log`), which is where cargo printed one \
+         `Executable `<path>`` line per target under `--no-run`"
+    );
+    assert!(
+        run_run.contains("Running `%s`") || run_run.contains("Running `"),
+        "`{RUN}` must emit cargo's own ``Running `<path>``` announcement before \
+         each binary: `binaryIdFromAnnouncementLine` in \
+         scripts/ci-flake-analyze.mjs reads it to attribute each `test … ok` \
+         line to its binary, so dropping it silently strips the coord ingest's \
+         binary attribution"
+    );
+    assert!(
+        run_run.contains("Refusing to report a pass over zero binaries"),
+        "`{RUN}` must refuse when it recovers zero binaries. A green step over \
+         an empty binary list is a vacuous pass, which is the defect class this \
+         whole change is about"
     );
 
     // `set -o pipefail` before every `| tee`: without it `tee`'s exit code
@@ -441,49 +483,51 @@ fn an_expiry_is_explained_and_the_memory_peak_is_sampled() {
 }
 
 #[test]
-fn both_halves_keep_the_two_env_entries_the_split_argues_for() {
+fn the_compile_throttle_is_on_the_build_half_and_the_keychain_guard_on_both() {
     // Phase 3 step 2 will move the `CARGO_BUILD_JOBS` value once a soak window
-    // of peaks exists. What must not happen in the meantime is the expression
-    // being flattened to a single literal (which silently retunes the ubuntu
-    // leg too) or either entry being dropped from a half.
+    // of peaks exists. What must not happen meanwhile is the expression being
+    // flattened to a single literal, which silently retunes the ubuntu leg too.
     //
-    // BOTH halves, deliberately. An earlier version of this test read the build
-    // step only, while `ci.yml` spent a paragraph on why each entry belongs on
-    // the RUN step as well — `CARGO_BUILD_JOBS` because rustdoc compiles the
-    // doctests there, `QONTINUI_DISABLE_KEYCHAIN` because that is where tests
-    // actually execute and the keychain hang is a runtime hang. Both were
-    // deletable from the run step with every test green.
+    // ⚠️ `CARGO_BUILD_JOBS` is asserted on the BUILD half ONLY, and that
+    // narrowing is the point rather than an oversight. An earlier cut required
+    // it on both, back when the run half invoked `cargo test`. The run half now
+    // executes already-built binaries and compiles nothing, so a compile
+    // throttle there would be cargo-cult — and pinning one would actively
+    // mislead the next reader into thinking something still compiles.
+    //
+    // `QONTINUI_DISABLE_KEYCHAIN` goes the other way and IS required on both:
+    // it short-circuits `keychain_enabled()` in src-tauri/src/auth.rs, the
+    // macOS keychain hang is a RUNTIME hang, and the run half is where tests
+    // execute. macOS is out of the matrix today, which is exactly why dropping
+    // it would go unnoticed until it is re-added.
     let doc = ci_workflow();
     let steps = job_steps(&doc, "test");
 
+    let build_env = find_step(&steps, BUILD)
+        .get("env")
+        .unwrap_or_else(|| panic!("step `{BUILD}` must carry an `env:` mapping"));
+    let jobs = build_env
+        .get("CARGO_BUILD_JOBS")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("step `{BUILD}` must carry a `CARGO_BUILD_JOBS` env entry"));
+    assert!(
+        jobs.contains("matrix.platform") && jobs.contains("windows-latest"),
+        "`{BUILD}`'s `CARGO_BUILD_JOBS` must stay a per-platform expression, got \
+         `{jobs}` — the windows and ubuntu legs are throttled for different \
+         reasons (pagefile commit headroom vs the OOM killer) and a single \
+         literal retunes both at once"
+    );
+
     for name in [BUILD, RUN] {
-        let step = find_step(&steps, name);
-        let env = step
+        let env = find_step(&steps, name)
             .get("env")
             .unwrap_or_else(|| panic!("step `{name}` must carry an `env:` mapping"));
-
-        let jobs = env
-            .get("CARGO_BUILD_JOBS")
-            .and_then(|v| v.as_str())
-            .unwrap_or_else(|| panic!("step `{name}` must carry a `CARGO_BUILD_JOBS` env entry"));
-        assert!(
-            jobs.contains("matrix.platform") && jobs.contains("windows-latest"),
-            "step `{name}`'s `CARGO_BUILD_JOBS` must stay a per-platform \
-             expression, got `{jobs}` — the windows and ubuntu legs are \
-             throttled for different reasons (pagefile commit headroom vs the \
-             OOM killer) and a single literal retunes both at once"
-        );
-
         assert_eq!(
             env.get("QONTINUI_DISABLE_KEYCHAIN")
                 .and_then(|v| v.as_str()),
             Some("1"),
-            "step `{name}` must keep `QONTINUI_DISABLE_KEYCHAIN: \"1\"`. It \
-             short-circuits `keychain_enabled()` in src-tauri/src/auth.rs; \
-             without it the macOS keychain blocks indefinitely on a runner with \
-             no desktop session and eats the whole bound. macOS is out of the \
-             matrix today, which is exactly why dropping this would go unnoticed \
-             until it is re-added."
+            "step `{name}` must keep `QONTINUI_DISABLE_KEYCHAIN: \"1\"` — the \
+             macOS keychain hang is a runtime hang and eats the whole bound"
         );
     }
 }
