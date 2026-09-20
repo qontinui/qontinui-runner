@@ -663,7 +663,14 @@ impl TerminalManager {
             sessions.remove(id)
         };
 
+        // Both maps, exactly as [`Self::close`] and [`Self::close_all`] do.
+        // `remote_panes` was missed here when the pane map was added, so every
+        // remote tab torn down through `graceful_exit` leaked its
+        // `Arc<RemotePaneIo>` for the life of the process.
         if let Ok(mut map) = self.remote_identities.lock() {
+            map.remove(id);
+        }
+        if let Ok(mut map) = self.remote_panes.lock() {
             map.remove(id);
         }
 
@@ -868,7 +875,78 @@ pub(crate) fn command_implies_bypass_permissions(argv: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_trust_arm, command_implies_bypass_permissions, TrustArm};
+    use super::{apply_trust_arm, command_implies_bypass_permissions, TerminalManager, TrustArm};
+
+    /// Every close path clears BOTH remote maps. `close` and `close_all`
+    /// always did; `close_after_graceful_exit` cleared only the identity, so
+    /// a remote tab torn down by `graceful_exit` leaked its pane.
+    ///
+    /// Both removals run before the session lookup, so this pins the
+    /// bookkeeping without opening a PTY: the close still reports
+    /// "not found", and the maps are empty either way.
+    #[test]
+    fn every_close_path_clears_both_remote_maps() {
+        use crate::terminal::remote_pane_io::tests::RecordingSink;
+        use crate::terminal::remote_pane_io::{AttachedRing, RemoteFrameSink, RemotePaneIo};
+        use crate::terminal::types::RemoteTabIdentity;
+        use std::sync::Arc;
+
+        fn seed(tm: &TerminalManager, id: &str) {
+            tm.set_remote_identity(
+                id,
+                RemoteTabIdentity {
+                    device_id: "device-1".into(),
+                    device_label: "spaceship".into(),
+                    session_id: "session-1".into(),
+                    remote_terminal_id: "490212f5-aaaa-bbbb-cccc-dddddddddddd".into(),
+                    grant_jti: "jti-1".into(),
+                    history_available: false,
+                },
+            );
+            let sink: Arc<dyn RemoteFrameSink> = Arc::new(RecordingSink::default());
+            tm.set_remote_pane(
+                id,
+                Arc::new(RemotePaneIo::new(
+                    "jti-1",
+                    "490212f5-aaaa-bbbb-cccc-dddddddddddd",
+                    "grant.jwt",
+                    sink,
+                    80,
+                    24,
+                    AttachedRing::default(),
+                )),
+            );
+            assert!(tm.remote_identity(id).is_some());
+            assert!(tm.remote_pane(id).is_some());
+        }
+
+        // The path this test exists for.
+        let tm = TerminalManager::new();
+        seed(&tm, "graceful-tab");
+        assert!(tm.close_after_graceful_exit("graceful-tab").is_err());
+        assert!(
+            tm.remote_identity("graceful-tab").is_none(),
+            "graceful exit must drop the identity"
+        );
+        assert!(
+            tm.remote_pane("graceful-tab").is_none(),
+            "graceful exit must drop the pane too — this is the leak"
+        );
+
+        // The two paths that already did, pinned so they cannot regress into
+        // the same asymmetry.
+        let tm = TerminalManager::new();
+        seed(&tm, "closed-tab");
+        assert!(tm.close("closed-tab").is_err());
+        assert!(tm.remote_identity("closed-tab").is_none());
+        assert!(tm.remote_pane("closed-tab").is_none());
+
+        let tm = TerminalManager::new();
+        seed(&tm, "close-all-tab");
+        tm.close_all(std::time::Instant::now());
+        assert!(tm.remote_identity("close-all-tab").is_none());
+        assert!(tm.remote_pane("close-all-tab").is_none());
+    }
 
     fn account_with(projects: serde_json::Value) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
