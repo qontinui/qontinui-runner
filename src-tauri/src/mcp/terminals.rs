@@ -718,6 +718,18 @@ pub async fn close_terminal_handler(
 
     info!("HTTP: Closing terminal session: {}", id);
 
+    // The same honest remote-close OUTCOME as the two `terminal_close` doors
+    // (plan 2026-09-16-remote-tab-cannot-be-released-so-the-target-terminal-stays-claimed,
+    // Phase 1), though not in the same SHAPE: `ApiResponse` has no `message`
+    // field (`mcp/types.rs`), so both keys ride inside `data` here, while the
+    // Tauri command puts `message` on `CommandResponse` and the proxy puts it
+    // at the top of its body. A reader takes `remoteDetach` from `data` at
+    // this door.
+    //
+    // Probed BEFORE the close, which removes the identity and the pane.
+    // `None` for a local tab, whose response is unchanged.
+    let remote_probe = crate::commands::remote_attach::probe_remote_close(&terminal_manager, &id);
+
     spawn_blocking_tracked(move || manager.close(&terminal_id))
         .await
         .map_err(|e| {
@@ -735,10 +747,15 @@ pub async fn close_terminal_handler(
             )
         })?;
 
-    Ok(Json(ApiResponse::success(serde_json::json!({
+    let mut body = serde_json::json!({
         "closed": true,
         "id": id
-    }))))
+    });
+    if let Some(report) = remote_probe.map(|probe| probe.report()) {
+        body["message"] = serde_json::Value::String(report.message);
+        body["remoteDetach"] = report.remote_detach;
+    }
+    Ok(Json(ApiResponse::success(body)))
 }
 
 /// WebSocket endpoint for bidirectional terminal I/O.

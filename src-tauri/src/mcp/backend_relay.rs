@@ -4639,14 +4639,29 @@ async fn handle_terminal_close(api_state: &Arc<ApiState>, data: &Value) -> Optio
             return Some(refusal);
         }
 
+        // Same honest remote-close outcome as the two `terminal_close` doors
+        // (plan 2026-09-16-remote-tab-cannot-be-released-so-the-target-terminal-stays-claimed,
+        // Phase 1). Probed BEFORE the close, which removes the identity and the
+        // pane. `None` for a local tab, whose frame is unchanged — that is the
+        // ordinary case here, since this door usually closes a terminal this
+        // runner owns rather than one it has attached to.
+        let remote_probe = crate::commands::remote_attach::probe_remote_close(&tm, &terminal_id);
+
         let tm_clone = tm.clone();
         let id_clone = terminal_id.clone();
         match spawn_blocking_tracked(move || tm_clone.close(&id_clone)).await {
-            Ok(Ok(())) => Some(serde_json::json!({
-                "type": "terminal_closed",
-                "terminal_id": terminal_id,
-                "request_id": request_id,
-            })),
+            Ok(Ok(())) => {
+                let mut frame = serde_json::json!({
+                    "type": "terminal_closed",
+                    "terminal_id": terminal_id,
+                    "request_id": request_id,
+                });
+                if let Some(report) = remote_probe.map(|probe| probe.report()) {
+                    frame["message"] = serde_json::Value::String(report.message);
+                    frame["remote_detach"] = report.remote_detach;
+                }
+                Some(frame)
+            }
             Ok(Err(e)) => Some(serde_json::json!({
                 "type": "error",
                 "message": format!("Failed to close terminal: {}", e),

@@ -599,6 +599,87 @@ export function resolveSpawnWorkingDir(
 // `#[serde(rename_all = "camelCase")]`. Future serde renames break this
 // file at compile time instead of silently dropping events.
 
+/**
+ * What `terminal_close` answered about a REMOTE tab's relay binding — the
+ * `remoteDetach` object the Rust side renders (`commands::remote_attach::
+ * render_remote_close`). Only the fields this UI reads are typed; the runner
+ * may add more.
+ */
+export interface RemoteDetachReport {
+  /** `queued` | `failed` | `not_attempted` | `unknown`. */
+  outcome: string;
+  error: string | null;
+  /**
+   * Whether a relay connection held the outbound pump across the whole close.
+   * `null` means the connection CHANGED mid-close, so delivery is unknown —
+   * never read it as `false`.
+   */
+  relayPumpAttached: boolean | null;
+  targetDeviceId: string;
+  remoteTerminalId: string;
+}
+
+/**
+ * A remote close worth telling the operator about, with the runner's own
+ * wording. Named `...State` because `RemoteCloseNotice` is the COMPONENT that
+ * renders it.
+ */
+export interface RemoteCloseNoticeState {
+  tabId: string;
+  message: string;
+  report: RemoteDetachReport;
+}
+
+/**
+ * The ONLY outcome that raises no notice: the detach was queued AND one relay
+ * connection held the outbound pump for the whole close.
+ *
+ * WHAT THAT DOES AND DOES NOT PROVE. It does not prove a release. `attached`
+ * means a connection HOLDS the pump, not that its socket is alive — a
+ * half-open socket still holds it until its write fails
+ * (`mcp/remote_terminal.rs`, `outbound_pump_state`) — so this arm still
+ * covers a frame that never reaches the relay, and the runner's own message
+ * hedges accordingly ("the relay drops the binding IF it receives it").
+ * Staying silent here is a deliberate product call, not a claim: a notice on
+ * every remote close would be noise on the ordinary path, and only a
+ * re-attach of the same terminal can actually prove the binding is gone
+ * (that is the plan's Phase 0). The hedge is not lost — the runner's sentence
+ * is logged verbatim on this arm.
+ *
+ * Everything else — a failed queue, no detach attempted, no pane found, or a
+ * pump that changed mid-close — leaves the target's terminal claimed until
+ * this runner's relay connection drops or the grant expires, and the operator
+ * is the one who will try to re-attach. `relayPumpAttached === null` is
+ * UNKNOWN and deliberately falls on the noisy side: a silent close is
+ * indistinguishable from a broken one.
+ *
+ * Exported pure so the branch can be unit-tested without rendering.
+ */
+export function isCleanRemoteClose(report: RemoteDetachReport): boolean {
+  return report.outcome === "queued" && report.relayPumpAttached === true;
+}
+
+/**
+ * The `remoteDetach` object out of a `terminal_close` response, or `null` for
+ * a local tab (and for any response shape this build does not recognise —
+ * an unreadable answer is UNKNOWN, and UNKNOWN must not manufacture a notice
+ * about a tab that was never remote).
+ */
+export function parseRemoteDetach(data: unknown): RemoteDetachReport | null {
+  if (!data || typeof data !== "object") return null;
+  const raw = (data as { remoteDetach?: unknown }).remoteDetach;
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.outcome !== "string") return null;
+  return {
+    outcome: r.outcome,
+    error: typeof r.error === "string" ? r.error : null,
+    relayPumpAttached: typeof r.relayPumpAttached === "boolean" ? r.relayPumpAttached : null,
+    targetDeviceId: typeof r.targetDeviceId === "string" ? r.targetDeviceId : "",
+    remoteTerminalId: typeof r.remoteTerminalId === "string" ? r.remoteTerminalId : "",
+  };
+}
+
 export function useTerminalManager(
   pageId: string = "default",
   windowLabel: string = "main",
@@ -611,6 +692,13 @@ export function useTerminalManager(
 ) {
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
+  /**
+   * The last remote close that did NOT demonstrably release the target's
+   * terminal. One slot, not a queue: the operator closes remote tabs one at a
+   * time, and the newest answer is the one that matters.
+   */
+  const [remoteCloseNotice, setRemoteCloseNotice] =
+    useState<RemoteCloseNoticeState | null>(null);
   const nextTitleNum = useRef(1);
   const [initialized, setInitialized] = useState(false);
   /**
@@ -1434,11 +1522,41 @@ export function useTerminalManager(
     // Only invoke Rust close for terminal tabs (plan tabs and worker views
     // have no PTY)
     if (!id.startsWith("plan-") && !sessionBacked) {
+      // Whatever the last close left on screen, it does not describe THIS
+      // one. Clearing first means a stale warning can never be read as the
+      // outcome of the close the operator just performed — and a close that
+      // never answers (the `.catch` below) leaves no notice at all rather
+      // than the previous one.
+      setRemoteCloseNotice(null);
       invoke<CommandResponse>("terminal_close", { terminalId: id })
+        .then((res) => {
+          // A REMOTE tab's close reports what it did about the relay binding
+          // (plan 2026-09-16-remote-tab-cannot-be-released-so-the-target-
+          // terminal-stays-claimed, Phase 1). Discarding it — which this
+          // handler did until now — made a failed detach look exactly like a
+          // clean one, since the tab vanishes either way.
+          //
+          // `success === false` is guarded even though today's Tauri command
+          // rejects instead: a door that ever answers a failed close WITH a
+          // report must not raise a notice about a close that did not happen.
+          if (res?.success === false) return;
+          const report = parseRemoteDetach(res?.data);
+          if (!report) return; // local tab: nothing extra happened
+          const message = res.message ?? `Remote close outcome: ${report.outcome}`;
+          if (isCleanRemoteClose(report)) {
+            // Logged, not shown: see `isCleanRemoteClose` on what this arm
+            // does and does not prove. The runner's hedge is kept verbatim.
+            logger.info(`Remote tab ${id} closed: ${message}`);
+            return;
+          }
+          logger.warn(`Remote tab ${id} closed without a confirmed detach: ${message}`);
+          setRemoteCloseNotice({ tabId: id, message, report });
+        })
         .catch(() => {
           // Terminal may already be gone (e.g. removed out-of-band by
           // `DELETE /terminals/{id}`) — the re-sync below is what repairs the
-          // list either way.
+          // list either way. No notice: we have no answer to report, and an
+          // UNKNOWN must not render as a claim about the binding.
         })
         .finally(() => {
           // Re-read the authoritative list AFTER the close settles. The
@@ -1451,6 +1569,8 @@ export function useTerminalManager(
         });
     }
   }, [resyncTabs, applyHiddenWorkerState]);
+
+  const dismissRemoteCloseNotice = useCallback(() => setRemoteCloseNotice(null), []);
 
   const renameTab = useCallback((id: string, title: string) => {
     setTabs((prev) => prev.map((t) => (t.id === id ? { ...t, title } : t)));
@@ -1508,5 +1628,11 @@ export function useTerminalManager(
     hiddenWorkers,
     /** Bring hidden worker views back (all of them, or the named tab ids). */
     restoreHiddenWorkers,
+    /**
+     * The last remote tab close that did not demonstrably release the
+     * target's terminal, or `null`. Rendered by `RemoteCloseNotice`.
+     */
+    remoteCloseNotice,
+    dismissRemoteCloseNotice,
   };
 }

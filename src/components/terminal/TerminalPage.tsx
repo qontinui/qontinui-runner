@@ -85,6 +85,7 @@ import { rememberSessionId } from "./lastKnownSessionIds";
 import { useRegistryAwareness } from "./useRegistryAwareness";
 import { useMidSessionProbe, useMidSessionProbeEnabled } from "./useMidSessionProbe";
 import { MidSessionToast } from "./MidSessionToast";
+import { RemoteCloseNotice } from "./RemoteCloseNotice";
 import { HoldingLockBanner, shouldShowHoldingBanner } from "./HoldingLockBanner";
 import { WaitingLockBanner } from "./WaitingLockBanner";
 import { DeconflictAdvisoryBanner } from "./DeconflictAdvisoryBanner";
@@ -158,6 +159,8 @@ function TerminalPageInner({
     adoptWorkerTab,
     hiddenWorkers,
     restoreHiddenWorkers,
+    remoteCloseNotice,
+    dismissRemoteCloseNotice,
     pageId,
     zoneLayout,
     terminalRefs,
@@ -1563,6 +1566,17 @@ function TerminalPageInner({
             onClose={() => dispatch({ type: "SET_SHOW_OUTPUT_SEARCH", payload: false })}
             pageId={pageId}
           />
+        )}
+
+        {/* A remote tab whose close did not demonstrably hand the target's
+            terminal back. IN-FLOW (a sibling of OutputSearchBar), not an
+            overlay: it describes a tab that no longer exists, so floating it
+            over the zone grid would occlude a pane it does not describe —
+            and both corners of that container are already contended. See the
+            component's own docstring. Not gated on `activeId` for the same
+            reason: the tab it refers to is gone by now. */}
+        {remoteCloseNotice && (
+          <RemoteCloseNotice notice={remoteCloseNotice} onDismiss={dismissRemoteCloseNotice} />
         )}
 
         <div className="flex-1 flex flex-row overflow-hidden">

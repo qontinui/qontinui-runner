@@ -2108,8 +2108,9 @@ pub struct RemoteAttachClient {
 /// bumps the pump generation so the release is observable to
 /// [`RemoteAttachClient::outbound_pump_state`].
 pub struct OutboundPump<'a> {
-    /// `Some` for the pump's whole life; taken only in `drop`, so the lock
-    /// is released BEFORE the generation moves.
+    /// `Some` for the pump's whole life; taken only in `drop`, AFTER the
+    /// generation has moved — see the `Drop` impl for why that order is the
+    /// one that makes a handover observable.
     guard: Option<tokio::sync::MutexGuard<'a, mpsc::Receiver<Value>>>,
     generation: &'a std::sync::atomic::AtomicU64,
 }
@@ -2133,12 +2134,42 @@ impl std::ops::DerefMut for OutboundPump<'_> {
 
 impl Drop for OutboundPump<'_> {
     fn drop(&mut self) {
-        // Free the lock first: a bump while it is still held would read as
-        // the SAME connection to a sample taken just after the next holder
-        // acquires it but before that holder bumps.
-        drop(self.guard.take());
+        // BUMP FIRST, then free the lock. This ordering is what makes
+        // `stable_pump` sound, and the argument is a counting one:
+        //
+        // every handover moves the generation exactly twice — once here, once
+        // in `lock_outbound` when the next holder takes it — and this bump
+        // happens while we STILL HOLD the lock. So `(attached = true, gen =
+        // g)` can only ever be observed while the holder that last left the
+        // generation at `g` is the one holding: no other holder can reach the
+        // lock without `g` having already moved. Two equal `(true, g)`
+        // readings therefore prove no handover occurred between them, which
+        // is exactly what `stable_pump` concludes from them.
+        //
+        // Releasing first (the original order) leaves a window of two
+        // instructions in which the lock is free but neither bump has run: a
+        // new holder can acquire there and a sample taken in that window
+        // reads `(true, g)` — the previous holder's generation with the NEW
+        // holder attached — so a real handover reports as a stable pump.
+        //
+        // That residual is recorded as open in #1562's PLAN, under
+        // "Follow-ups identified during implementation": "`relayPumpAttached`
+        // can still read `true` instead of `null` if a reconnect lands
+        // between two adjacent statements of `OutboundPump::drop` ... Closing
+        // it needs a holder id set under the lock — judged not worth it in
+        // review round 4." (qontinui-dev-notes `plans/2026-09-16-remote-tab-
+        // cannot-be-released-so-the-target-terminal-stays-claimed.md` on
+        // origin/main — the note lives in the plan, NOT in a PR review, so
+        // `gh pr view 1562` does not show it.) It does not need a holder id;
+        // it needs these two statements in the other order.
+        //
+        // The concern the original order was reaching for — a bump while
+        // still held reading as the same connection — does not arise, because
+        // the comparison is against the EARLIER sample, and this bump moves
+        // the generation away from whatever that sample saw.
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        drop(self.guard.take());
     }
 }
 
@@ -2184,9 +2215,12 @@ impl RemoteAttachClient {
     /// connection ends the guard drops and the next connection takes over.
     ///
     /// The generation is bumped when a connection TAKES the pump and again
-    /// when it LETS GO (see [`OutboundPump`]), so a reading taken in the
-    /// instant between a new holder acquiring the lock and bumping the
-    /// counter still differs from one taken while the previous holder had it.
+    /// when it LETS GO (see [`OutboundPump`]), and the release bump happens
+    /// BEFORE the lock is freed — so no holder can ever be observed attached
+    /// under a generation an earlier holder was last seen at, and a reading
+    /// taken in the instant between a new holder acquiring the lock and
+    /// bumping the counter still differs from one taken while the previous
+    /// holder had it.
     pub async fn lock_outbound(&self) -> OutboundPump<'_> {
         let guard = self.out_rx.lock().await;
         self.pump_generation
@@ -2971,6 +3005,55 @@ mod tests {
         assert_eq!(client.outbound_pump_state(), (false, g0 + 2));
         let _next = client.lock_outbound().await;
         assert_eq!(client.outbound_pump_state(), (true, g0 + 3));
+    }
+
+    /// A CONTENDED handover: a second connection is queued on the pump when
+    /// the first lets go. Whatever the new holder observes must never equal
+    /// what was observed while the old holder had it, so `stable_pump` reports
+    /// the window as unknown rather than as a pump that never moved.
+    ///
+    /// This pins the two bumps a handover must produce. It does NOT pin the
+    /// statement ORDER inside `OutboundPump::drop` — a two-instruction
+    /// interleaving is not reachable from a unit test — and that order is
+    /// argued by the counting argument written there instead: the release
+    /// bump happens while the lock is still held, so no successor can be
+    /// observed attached under a generation its predecessor was last seen at.
+    #[tokio::test]
+    async fn a_queued_connection_taking_over_the_pump_is_never_a_stable_reading() {
+        use crate::commands::remote_attach::stable_pump;
+        use std::sync::Arc;
+
+        let client = Arc::new(RemoteAttachClient::new());
+        let (_, g0) = client.outbound_pump_state();
+
+        let pump = client.lock_outbound().await;
+        let held = client.outbound_pump_state();
+        assert_eq!(held, (true, g0 + 1));
+
+        let queued = Arc::clone(&client);
+        let waiter = tokio::spawn(async move {
+            let _taken = queued.lock_outbound().await;
+            queued.outbound_pump_state()
+        });
+        // Give the waiter a chance to block on the lock before we release it.
+        tokio::task::yield_now().await;
+
+        drop(pump);
+        let observed = waiter.await.expect("the queued connection took the pump");
+
+        assert_ne!(
+            observed, held,
+            "a handover must move the generation away from the previous holder's reading"
+        );
+        assert!(
+            observed.1 >= g0 + 3,
+            "a handover bumps twice (release + take), got {observed:?} from g0={g0}"
+        );
+        assert_eq!(
+            stable_pump(held, observed),
+            None,
+            "a close spanning this handover must report the pump as unknown"
+        );
     }
 
     const NOW: u64 = 1_700_000_000;
