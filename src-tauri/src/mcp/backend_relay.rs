@@ -606,13 +606,29 @@ impl BackendRelayState {
     pub async fn stop(&self) {
         let _ = self.shutdown_tx.send(true);
         if let Some(handle) = self.task_handle.lock().await.take() {
-            // Give graceful shutdown 3 seconds before aborting
+            // Give graceful shutdown 3 seconds before aborting.
+            //
+            // The abort is not belt-and-braces: without it the old relay loop
+            // keeps running past the timeout, and a relay started afterwards
+            // coexists with it — two loops, two writer tasks, two sockets. That
+            // is precisely the state the one-writer-per-socket invariant exists
+            // to prevent, and the per-iteration join below cannot prevent it,
+            // because it only orders the writers *within* one loop.
+            //
+            // Aborting is safe here for the same reason that join makes it
+            // safe: each iteration has already joined its own writer before
+            // looping, so no half-written frame outlives the task.
+            let abort = handle.abort_handle();
             match tokio::time::timeout(Duration::from_secs(3), handle).await {
                 Ok(_) => {
                     info!("Backend relay stopped gracefully");
                 }
                 Err(_) => {
-                    warn!("Backend relay did not stop in 3s; shutdown signal sent, moving on");
+                    abort.abort();
+                    warn!(
+                        "Backend relay did not stop in 3s; aborted it so a later start \
+                         cannot run two relay loops against two sockets"
+                    );
                 }
             }
         }
@@ -973,13 +989,12 @@ async fn relay_loop(
                 // actionable close reason if the socket dies before the ack.
                 let connected_ack = Arc::new(AtomicBool::new(false));
 
-                let (write, read) = ws_stream.split();
-                let write = Arc::new(Mutex::new(write));
+                let (mut write, read) = ws_stream.split();
 
                 // Send runner_info immediately. The backend uses this to
                 // upsert the `runners` row and replies with `connected`
                 // carrying the runner_id.
-                if let Err(e) = send_runner_info(&api_state, &write).await {
+                if let Err(e) = send_runner_info(&api_state, &mut write).await {
                     warn!("Failed to send runner_info: {}", e);
                     bump_quick_disconnects();
                     sleep_with_kick(
@@ -992,12 +1007,19 @@ async fn relay_loop(
                     continue;
                 }
 
+                // One owner for the write half. Producers enqueue onto the
+                // writer's lanes; nothing else touches the sink. The receivers
+                // cannot be cloned, so "one writer per socket" holds by
+                // construction.
+                let (writer, writer_rx) = RelayWriter::new();
+                let mut writer_handle = tokio::spawn(run_relay_writer(write, writer_rx));
+
                 // Run inbound, outbound, heartbeat, and keepalive concurrently.
-                let write_inbound = write.clone();
-                let write_outbound = write.clone();
-                let write_heartbeat = write.clone();
-                let write_keepalive = write.clone();
-                let write_remote = write.clone();
+                let write_inbound = writer.clone();
+                let write_outbound = writer.clone();
+                let write_heartbeat = writer.clone();
+                let write_keepalive = writer.clone();
+                let write_remote = writer.clone();
                 let state_inbound = api_state.clone();
                 let state_outbound = api_state.clone();
                 let state_heartbeat = api_state.clone();
@@ -1041,7 +1063,28 @@ async fn relay_loop(
                 let last_inbound_keepalive = last_inbound_ms.clone();
                 let connected_ack_inbound = connected_ack.clone();
 
+                // How the connected select ended. Recorded rather than acted
+                // on inside the arms, because every exit — including the
+                // shutdown `return` and the kick `continue` — must first tear
+                // the writer task down. A `return`/`continue` from inside an
+                // arm would jump past that and leave a detached task still
+                // holding this socket's sink while the next iteration opens a
+                // new one.
+                enum RelayLoopExit {
+                    /// A handler ended: fall through to the normal
+                    /// disconnect / backoff analysis below.
+                    HandlerEnded,
+                    Shutdown,
+                    Kicked,
+                }
+                let mut exit = RelayLoopExit::HandlerEnded;
+                let mut writer_finished = false;
+
                 tokio::select! {
+                    _ = &mut writer_handle => {
+                        writer_finished = true;
+                        warn!("Backend relay writer task ended");
+                    }
                     _ = handle_inbound(read, state_inbound, write_inbound, last_inbound_inbound, connected_ack_inbound) => {
                         warn!("Backend relay inbound handler ended");
                     }
@@ -1058,11 +1101,45 @@ async fn relay_loop(
                         warn!("Backend relay remote-attach pump ended");
                     }
                     _ = shutdown_clone.changed() => {
+                        exit = RelayLoopExit::Shutdown;
+                    }
+                    _ = kick_clone.changed() => {
+                        exit = RelayLoopExit::Kicked;
+                    }
+                }
+
+                // The writer must not outlive its socket, and a reconnect must
+                // never leave two writers alive.
+                //
+                // `tokio::select!` drops all of its futures when it returns, so
+                // by this line every `RelayWriter` clone held by a handler is
+                // gone; `writer` below is the last sender. Dropping it closes
+                // all three lanes, which the writer's own loop treats as
+                // end-of-life. The abort then makes the teardown immediate
+                // rather than waiting for a drain of frames destined for a
+                // socket that is being discarded — so a frame an enqueue
+                // already returned `Ok(())` for CAN still be discarded here.
+                // That is the one place the lanes' no-drop guarantee stops: it
+                // holds against a full lane, not against teardown, where the
+                // socket carrying the correlated request is going away
+                // regardless. Awaiting the handle means the task — and
+                // with it the `SplitSink`, and with it this socket's write half
+                // — is provably finished before the next iteration can open a
+                // replacement. `writer_finished` guards the await because
+                // polling an already-completed `JoinHandle` panics.
+                drop(writer);
+                if !writer_finished {
+                    writer_handle.abort();
+                    let _ = writer_handle.await;
+                }
+
+                match exit {
+                    RelayLoopExit::Shutdown => {
                         info!("Backend relay received shutdown signal");
                         mark_disconnected(&api_state).await;
                         return;
                     }
-                    _ = kick_clone.changed() => {
+                    RelayLoopExit::Kicked => {
                         info!(
                             "Backend relay kicked while connected — tearing down \
                              connection to re-evaluate idle gate (tier/enabled/JWT)"
@@ -1076,6 +1153,7 @@ async fn relay_loop(
                         kick_suppression_warned = false;
                         continue;
                     }
+                    RelayLoopExit::HandlerEnded => {}
                 }
 
                 // Remote session tabs (Phase 4): a connection that had reached
@@ -1298,13 +1376,353 @@ fn build_runner_info(
     })
 }
 
+// ---------------------------------------------------------------------------
+// The relay writer: one owner for the socket's write half.
+// ---------------------------------------------------------------------------
+
+/// Capacity of the bulk (data-plane) writer lane.
+///
+/// Deliberately the same order as the 256-slot `event_broadcast` channel that
+/// feeds it: the lane exists to absorb a burst, not to buffer a backlog. When
+/// it fills, the pressure lands on the broadcast, which is already a
+/// deliberately lossy lane that drops the oldest frames and says so
+/// (`Backend relay lagged, skipped N events`). A bigger lane would only move
+/// that loss later and add latency to every frame behind it.
+const RELAY_BULK_LANE_CAPACITY: usize = 256;
+
+/// Capacity of the reply lane.
+///
+/// Sized so that filling it is not a load signal but a verdict. Every frame on
+/// it answers an inbound request the backend is waiting on, and the backend
+/// issues those over the same socket the writer is failing to drain — so a
+/// thousand unanswered replies means the peer stopped reading long ago. The
+/// producer is the read loop, which must never park (see
+/// [`RelayWriter::try_send_reply`]), so a full lane ends the connection rather
+/// than blocking it or silently discarding an answer somebody is blocked on.
+///
+/// Unreachable under load, only under pathology: the lane holds *unwritten*
+/// replies, one per inbound request, and inbound requests arrive over the same
+/// socket the writer drains. In steady state its depth is 0 or 1 whatever the
+/// session count, because terminal output is not on this lane at all. Reaching
+/// 1024 requires the backend to have issued (and this runner to have answered)
+/// 1024 requests while the write direction moved nothing — a half-open socket,
+/// not a busy one.
+const RELAY_REPLY_LANE_CAPACITY: usize = 1024;
+
+/// Capacity of the liveness lane, which carries only the keepalive Ping and the
+/// 30s heartbeat.
+///
+/// Small on purpose. Both frames are *timer-paced and latest-wins-by-nature*: a
+/// heartbeat's value is its fresh `derived_status`, and a keepalive Ping's value
+/// is eliciting traffic now. If eight of them are already queued unwritten, the
+/// writer has been stalled for minutes and a ninth copy of a stale signal adds
+/// nothing, so it is coalesced away rather than queued or waited on. The PONG is
+/// NOT on this lane — see [`RelayWriter::send_pong`].
+const RELAY_LIVENESS_LANE_CAPACITY: usize = 8;
+
+/// Handle used by every producer to put a frame on the relay socket.
+///
+/// This replaces the `Arc<Mutex<SplitSink>>` that every writer used to lock.
+/// The mutex was the defect: `handle_outbound` held it across `w.send().await`,
+/// so while one terminal-output frame was in flight to a congested socket,
+/// `handle_inbound` could not answer the server's control-frame PING. With ~50
+/// shells producing output the wait ran past uvicorn's 20s `ws_ping_timeout`
+/// and the server killed the connection (`code=1011, reason=keepalive ping
+/// timeout`) roughly every 43 seconds, leaving the socket usable ~13% of the
+/// time. Nothing but [`run_relay_writer`] touches the sink now; producers
+/// enqueue and move on.
+///
+/// # The four lanes
+///
+/// | Lane | Bound | Prio | Producer | When it cannot take the frame |
+/// |---|---|---|---|---|
+/// | pong | 1 (replace) | 1 | read loop, per inbound PING | impossible — newest wins |
+/// | liveness | 8 | 2 | keepalive + heartbeat timers | coalesce (stale copy is worthless) |
+/// | reply | 1024 | 3 | read loop, per inbound request | connection is dead — report it |
+/// | bulk | 256 | 4 | `event_broadcast`, remote pump | park the producer |
+///
+/// Two splits carry the design, and both exist because **the read loop must
+/// never park**. `handle_inbound` is the only task that can see the server's
+/// PING, so a read loop that blocks is a dead connection no matter how well the
+/// writer prioritises.
+///
+/// - *pong vs liveness.* The Pong is the one liveness frame whose rate is set
+///   by the peer rather than by a local timer, so it is the one that could grow
+///   a queue without bound. It gets a single replace-slot instead of a queue.
+/// - *liveness vs reply.* Both were produced by `handle_inbound`, but a reply
+///   can carry a whole HTTP body (`handle_http_request`) while a liveness frame
+///   is a few bytes. They need different bounds and different verdicts on full.
+///
+/// An earlier two-lane version put replies on the bulk lane and awaited there.
+/// That re-created the original bug in a new place: a full bulk lane — i.e.
+/// exactly the ~50-shell congestion this change targets — parked the read loop,
+/// so the PING was never read, no PONG was ever offered, and the writer's
+/// priority could not rescue a frame that was never enqueued.
+#[derive(Clone)]
+pub(crate) struct RelayWriter {
+    pong: tokio::sync::watch::Sender<Option<Message>>,
+    liveness: tokio::sync::mpsc::Sender<Message>,
+    reply: tokio::sync::mpsc::Sender<Message>,
+    bulk: tokio::sync::mpsc::Sender<Message>,
+}
+
+/// The receiving half of a [`RelayWriter`], consumed by [`run_relay_writer`].
+pub(crate) struct RelayWriterRx {
+    pong: tokio::sync::watch::Receiver<Option<Message>>,
+    liveness: tokio::sync::mpsc::Receiver<Message>,
+    reply: tokio::sync::mpsc::Receiver<Message>,
+    bulk: tokio::sync::mpsc::Receiver<Message>,
+}
+
+/// What [`RelayWriter::send_liveness`] did with the frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LivenessSend {
+    /// Queued for the writer.
+    Queued,
+    /// The lane already held [`RELAY_LIVENESS_LANE_CAPACITY`] unwritten copies
+    /// of a signal whose only value is being current, so this one was dropped.
+    /// Not an error: the caller keeps its timer running.
+    Coalesced,
+}
+
+impl RelayWriter {
+    /// Build one lane set. Called once per socket; the receivers are moved
+    /// into that socket's writer task and cannot be cloned, which is what makes
+    /// "one writer per socket" a type-level property rather than a convention.
+    pub(crate) fn new() -> (Self, RelayWriterRx) {
+        let (pong_tx, pong_rx) = tokio::sync::watch::channel(None);
+        let (liveness_tx, liveness_rx) = tokio::sync::mpsc::channel(RELAY_LIVENESS_LANE_CAPACITY);
+        let (reply_tx, reply_rx) = tokio::sync::mpsc::channel(RELAY_REPLY_LANE_CAPACITY);
+        let (bulk_tx, bulk_rx) = tokio::sync::mpsc::channel(RELAY_BULK_LANE_CAPACITY);
+        (
+            Self {
+                pong: pong_tx,
+                liveness: liveness_tx,
+                reply: reply_tx,
+                bulk: bulk_tx,
+            },
+            RelayWriterRx {
+                pong: pong_rx,
+                liveness: liveness_rx,
+                reply: reply_rx,
+                bulk: bulk_rx,
+            },
+        )
+    }
+
+    /// Answer the server's keepalive PING. Synchronous, never blocks, and the
+    /// answer can never be lost for lack of room.
+    ///
+    /// This is the frame the whole change exists to protect, and it is the only
+    /// liveness frame whose rate the *peer* sets — every inbound PING makes one.
+    /// A queue would therefore grow as fast as the peer chose to ping while the
+    /// writer was stalled on a wedged socket, which on a runner already carrying
+    /// hundreds of threads and gigabytes is a real memory vector rather than a
+    /// theoretical one. "Unbounded" would not remove that bound, only relocate
+    /// it to the allocator.
+    ///
+    /// So the Pong gets a **single replace-slot**: depth exactly one, newest
+    /// wins, no growth at any ping rate. Coalescing is not a compromise here —
+    /// it is what the protocol asks for. RFC 6455 §5.5.3: *"If an endpoint
+    /// receives a Ping frame and has not yet sent Pong frame(s) in response to
+    /// previous Ping frame(s), the endpoint MAY elect to send a Pong frame for
+    /// only the most recently processed Ping frame."*
+    ///
+    /// Newest-wins is also the only *correct* coalescing direction, which is why
+    /// this is a replace-slot and not a "one already pending, skip" flag. A Pong
+    /// must echo its Ping's payload (§5.5.3), and `websockets` — the library
+    /// behind the uvicorn server that kills this connection — resolves a pending
+    /// ping and every earlier one when the matching payload comes back. Sending
+    /// the newest payload therefore clears the whole backlog; sending a stale
+    /// one would leave the newest ping outstanding and time out anyway.
+    pub(crate) fn send_pong(&self, msg: Message) -> Result<(), RelayWriteError> {
+        self.pong
+            .send(Some(msg))
+            .map_err(|_| RelayWriteError::WriterGone)
+    }
+
+    /// Enqueue the keepalive Ping or the 30s heartbeat. Synchronous, never
+    /// blocks.
+    ///
+    /// Bounded rather than unbounded because these are produced by timers that
+    /// keep firing whether or not the writer is draining: an unbounded lane
+    /// would grow linearly for as long as a wedged socket stayed wedged. Bounded
+    /// is safe here in a way it would not be for the Pong, because both frames
+    /// are worth sending only while current — see [`LivenessSend::Coalesced`].
+    pub(crate) fn send_liveness(&self, msg: Message) -> Result<LivenessSend, RelayWriteError> {
+        use tokio::sync::mpsc::error::TrySendError;
+        match self.liveness.try_send(msg) {
+            Ok(()) => Ok(LivenessSend::Queued),
+            Err(TrySendError::Full(_)) => Ok(LivenessSend::Coalesced),
+            Err(TrySendError::Closed(_)) => Err(RelayWriteError::WriterGone),
+        }
+    }
+
+    /// Enqueue a reply to an inbound request, **without ever blocking**.
+    ///
+    /// The caller is `handle_inbound`'s read loop. That loop parking is a
+    /// connection-killing event in its own right — it stops reading the socket,
+    /// so the server's PING is never seen and no PONG is ever offered — which
+    /// is why this is a `try_send` and not a `send().await`.
+    ///
+    /// A full lane is therefore reported, not waited on and not swallowed:
+    /// [`RelayWriteError::ReplyLaneFull`] tells the caller to end the
+    /// connection so the reconnect path can take over. Dropping the reply
+    /// instead would strand whichever backend request is blocked on its
+    /// `request_id` until that side times out — the exact silence this change
+    /// exists to remove.
+    ///
+    /// Ending the connection is the better failure, and it is not a silent one:
+    /// the teardown runs `RemoteAttachClient::on_relay_disconnected`, which
+    /// settles every in-flight create and attach with a typed
+    /// `relay_disconnected` refusal instead of leaving a source watching a
+    /// spinner for its full timeout.
+    #[must_use = "a full reply lane must end the connection, not be ignored"]
+    pub(crate) fn try_send_reply(&self, msg: Message) -> Result<(), RelayWriteError> {
+        use tokio::sync::mpsc::error::TrySendError;
+        self.reply.try_send(msg).map_err(|e| match e {
+            TrySendError::Full(_) => RelayWriteError::ReplyLaneFull,
+            TrySendError::Closed(_) => RelayWriteError::WriterGone,
+        })
+    }
+
+    /// Enqueue a bulk-lane frame, waiting when the lane is full.
+    ///
+    /// Blocking the producer is the intended behaviour here, and it is safe for
+    /// both bulk producers because neither one is the read loop and neither can
+    /// starve a liveness frame — they no longer share anything with it:
+    ///
+    /// - `handle_outbound` waiting here stops draining `event_broadcast`, so
+    ///   the 256-slot broadcast starts dropping its oldest events and logs
+    ///   `Backend relay lagged, skipped N events`. That is the pre-existing,
+    ///   deliberate lossy lane for terminal output; this change routes the
+    ///   overload to it instead of to the connection's liveness.
+    /// - `run_remote_attach_pump` waiting here stops draining the
+    ///   `RemoteAttachClient` queue, which applies backpressure to the remote
+    ///   panes' own bounded queue — the flow-control path that module already
+    ///   owns. Note it holds that client's outbound lock while parked, which
+    ///   keeps `outbound_pump_state().attached` true; that is the pre-existing
+    ///   shape, but the park can now last longer than a single socket write.
+    ///
+    /// Both live in the connection's `select!`, whose other arms keep being
+    /// polled while either is parked here, and a parked `send` resolves `Err`
+    /// immediately if the writer dies — so neither can wedge the connection.
+    pub(crate) async fn send_bulk(&self, msg: Message) -> Result<(), RelayWriteError> {
+        self.bulk
+            .send(msg)
+            .await
+            .map_err(|_| RelayWriteError::WriterGone)
+    }
+}
+
+/// How a relay write can fail now that no producer touches the socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelayWriteError {
+    /// The writer task has exited, so this socket is finished. Every producer
+    /// treats this the way it used to treat a `send` error: return, which ends
+    /// the connection's `select!` and drops into the reconnect path.
+    WriterGone,
+    /// The bounded reply lane is full: a thousand answers are queued for a peer
+    /// that is not reading them. Reported rather than waited on, because the
+    /// only producer is the read loop.
+    ReplyLaneFull,
+}
+
+impl std::fmt::Display for RelayWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WriterGone => f.write_str("relay writer task has exited (socket is gone)"),
+            Self::ReplyLaneFull => f.write_str(
+                "relay reply lane is full — the backend has stopped reading this socket",
+            ),
+        }
+    }
+}
+
+/// The socket's single writer.
+///
+/// Owns the `SplitSink` outright — moved in, never shared — and drains the four
+/// lanes with a **biased** `select!`, strictly in priority order. The worst a
+/// PONG can now wait is the single frame already in flight; before this task
+/// existed it waited for the mutex behind however long that same send took,
+/// *plus* it could not even be enqueued in the meantime, because the only way
+/// to offer a frame was to acquire the lock.
+///
+/// Strict priority cannot starve the lower lanes in practice: the pong slot
+/// holds at most one frame, the liveness lane is fed by two timers at 20s and
+/// 30s, and the reply lane takes one frame per inbound request, so all three
+/// are empty on the overwhelming majority of iterations and the select falls
+/// straight through to bulk. The tradeoff is deliberate and one-directional:
+/// under a pathological reply flood terminal output stalls on a *live*
+/// connection, which is strictly better than the connection dying every 43
+/// seconds.
+///
+/// Generic over the sink rather than over the socket so a test can substitute a
+/// sink it can stall on command — which is what
+/// `liveness_frame_is_not_starved_by_a_saturated_bulk_lane` does.
+pub(crate) async fn run_relay_writer<W>(mut sink: W, mut rx: RelayWriterRx)
+where
+    W: futures_util::Sink<Message> + Unpin,
+    W::Error: std::fmt::Display,
+{
+    let mut pong_open = true;
+    let mut liveness_open = true;
+    let mut reply_open = true;
+    let mut bulk_open = true;
+
+    loop {
+        let msg = tokio::select! {
+            biased;
+
+            // The replace-slot. `changed()` resolving means "a Pong is
+            // pending"; taking it yields the NEWEST payload, so any pings that
+            // arrived while the previous frame was in flight are answered by
+            // this one (RFC 6455 section 5.5.3).
+            c = rx.pong.changed(), if pong_open => match c {
+                Err(_) => { pong_open = false; continue; }
+                Ok(()) => match rx.pong.borrow_and_update().clone() {
+                    Some(m) => m,
+                    None => continue,
+                },
+            },
+            m = rx.liveness.recv(), if liveness_open => match m {
+                Some(m) => m,
+                None => { liveness_open = false; continue; }
+            },
+            m = rx.reply.recv(), if reply_open => match m {
+                Some(m) => m,
+                None => { reply_open = false; continue; }
+            },
+            m = rx.bulk.recv(), if bulk_open => match m {
+                Some(m) => m,
+                None => { bulk_open = false; continue; }
+            },
+            else => break,
+        };
+
+        if let Err(e) = sink.send(msg).await {
+            warn!(
+                "Backend relay writer: send failed, ending connection: {}",
+                e
+            );
+            return;
+        }
+    }
+
+    info!("Backend relay writer: all lanes closed, writer task ending");
+}
+
 /// Send the initial `runner_info` payload. The backend uses this to upsert
 /// the `runners` row keyed by (user_id, name) and replies with `connected`.
+///
+/// Written **directly to the sink**, before the writer task is spawned and
+/// therefore before the sink is moved into it. That is deliberate: this send's
+/// failure is a connection-level verdict the reconnect loop acts on
+/// synchronously (back off and retry), and an enqueue onto a lane could not
+/// report it.
 async fn send_runner_info<S>(
     api_state: &Arc<ApiState>,
-    write: &Arc<
-        Mutex<futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>>,
-    >,
+    write: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>,
 ) -> Result<(), String>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -1344,8 +1762,8 @@ where
 
     let info_text =
         serde_json::to_string(&runner_info).map_err(|e| format!("serialize runner_info: {}", e))?;
-    let mut w = write.lock().await;
-    w.send(Message::Text(info_text.into()))
+    write
+        .send(Message::Text(info_text.into()))
         .await
         .map_err(|e| format!("send runner_info: {}", e))?;
     info!("Sent runner_info to backend (port={})", port);
@@ -1358,9 +1776,7 @@ where
 async fn handle_inbound<S>(
     mut read: futures_util::stream::SplitStream<tokio_tungstenite::WebSocketStream<S>>,
     api_state: Arc<ApiState>,
-    write: Arc<
-        Mutex<futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>>,
-    >,
+    writer: RelayWriter,
     last_inbound_ms: Arc<AtomicU64>,
     // Set to `true` once the backend's `connected` application-ack has been
     // processed. If the socket closes/errors while this is still `false`, the
@@ -1400,8 +1816,21 @@ async fn handle_inbound<S>(
                     let response = handle_relay_command(&api_state, msg_type, &data).await;
                     if let Some(response) = response {
                         let response_text = serde_json::to_string(&response).unwrap_or_default();
-                        let mut w = write.lock().await;
-                        if let Err(e) = w.send(Message::Text(response_text.into())).await {
+                        // Non-blocking by construction: this is the read loop,
+                        // and a read loop that parks stops seeing the server's
+                        // PING, which kills the connection just as dead as the
+                        // mutex used to. A full lane is a verdict on the peer,
+                        // so end the connection rather than wait or discard.
+                        //
+                        // These replies may now be written ahead of
+                        // terminal-output frames that were queued before them.
+                        // That is safe because every reply carrying terminal
+                        // bytes — `terminal_buffer_response`, `terminal_attached`
+                        // — carries `start_offset` / `ring_start_offset` /
+                        // `total_bytes_produced` with it, and the consumer
+                        // splices from those offsets rather than from arrival
+                        // order.
+                        if let Err(e) = writer.try_send_reply(Message::Text(response_text.into())) {
                             warn!("Failed to send relay response: {}", e);
                             return;
                         }
@@ -1412,8 +1841,18 @@ async fn handle_inbound<S>(
                 }
             },
             Ok(Message::Ping(data)) => {
-                let mut w = write.lock().await;
-                let _ = w.send(Message::Pong(data)).await;
+                // THE frame this whole change exists for. uvicorn's
+                // `ws_ping_timeout` is 20s; `websockets` kills the connection
+                // with `code=1011, reason=keepalive ping timeout` when the PONG
+                // misses it. This enqueue is synchronous and cannot drop the
+                // frame (see `RelayWriter::send_liveness`), so the PONG's only
+                // remaining wait is the one bulk frame already in flight —
+                // never a mutex held behind a congested socket, and never a
+                // full-lane discard.
+                if let Err(e) = writer.send_pong(Message::Pong(data)) {
+                    warn!("Failed to enqueue keepalive PONG: {}", e);
+                    return;
+                }
             }
             Ok(Message::Close(frame)) => {
                 if let Some(ref f) = frame {
@@ -1571,14 +2010,7 @@ async fn handle_connected_message(api_state: &Arc<ApiState>, data: &Value) {
 /// The backend's `last_heartbeat` updates from this. On send failure the
 /// task ends, which causes the parent `tokio::select!` to drop the
 /// connection and reconnect.
-async fn run_heartbeat_sender<S>(
-    api_state: Arc<ApiState>,
-    write: Arc<
-        Mutex<futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>>,
-    >,
-) where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
+async fn run_heartbeat_sender(api_state: Arc<ApiState>, writer: RelayWriter) {
     let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
     interval.tick().await; // skip immediate first tick
 
@@ -1665,14 +2097,34 @@ async fn run_heartbeat_sender<S>(
             }
         };
 
-        let mut w = write.lock().await;
-        if let Err(e) = w.send(Message::Text(text.into())).await {
-            warn!("Heartbeat send failed: {}", e);
-            return;
+        // Liveness lane: the heartbeat is a fixed-cadence frame with
+        // no ordering relationship to terminal output, and the backend's
+        // `last_heartbeat` (and the `derived_status` it carries) is exactly the
+        // signal that must not be starved by a busy device.
+        match writer.send_liveness(Message::Text(text.into())) {
+            Ok(LivenessSend::Queued) => {}
+            Ok(LivenessSend::Coalesced) => {
+                // The lane already holds unwritten heartbeats, so the writer
+                // has been stalled for minutes. A ninth copy of a status that
+                // is already stale tells the backend nothing; keep the timer
+                // running and let the keepalive's staleness check or the
+                // socket error end the connection.
+                warn!(
+                    "Heartbeat coalesced: the liveness lane is full, so the relay                      writer has not drained in minutes"
+                );
+            }
+            Err(e) => {
+                warn!("Heartbeat send failed: {}", e);
+                return;
+            }
         }
-        drop(w);
 
         // Update last-heartbeat-at on shared state for the Settings UI.
+        //
+        // NOTE: this now records "handed to the writer", not "written to the
+        // socket". The distinction is bounded by the writer's own liveness —
+        // if the socket were failing, the writer would exit and the next
+        // `send_liveness` would return `WriterGone`, ending this task.
         if let Some(sm) = api_state.app_state.current_server_mode().await {
             sm.set_last_heartbeat_at(chrono::Utc::now().to_rfc3339())
                 .await;
@@ -1691,14 +2143,7 @@ async fn run_heartbeat_sender<S>(
 /// TCP can keep `wsConnected=true` on the runner indefinitely while the
 /// backend has already cleared `device.ws_session_id` — the exact bug
 /// observed in 2026-05-22.
-async fn run_keepalive_pinger<S>(
-    write: Arc<
-        Mutex<futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>>,
-    >,
-    last_inbound_ms: Arc<AtomicU64>,
-) where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
+async fn run_keepalive_pinger(writer: RelayWriter, last_inbound_ms: Arc<AtomicU64>) {
     let mut interval = tokio::time::interval(KEEPALIVE_PING_INTERVAL);
     interval.tick().await;
     loop {
@@ -1718,10 +2163,18 @@ async fn run_keepalive_pinger<S>(
             return;
         }
 
-        let mut w = write.lock().await;
-        if let Err(e) = w.send(Message::Ping(vec![].into())).await {
-            warn!("Keepalive ping failed: {}", e);
-            return;
+        // Liveness lane: a Ping serialised behind the output firehose cannot
+        // measure the socket it is meant to measure.
+        match writer.send_liveness(Message::Ping(vec![].into())) {
+            Ok(LivenessSend::Queued) | Ok(LivenessSend::Coalesced) => {
+                // Coalescing is harmless here: a Ping's only job is to elicit
+                // traffic now, and one is already queued unsent. The staleness
+                // check above is what actually ends a dead connection.
+            }
+            Err(e) => {
+                warn!("Keepalive ping failed: {}", e);
+                return;
+            }
         }
     }
 }
@@ -1735,20 +2188,18 @@ async fn run_keepalive_pinger<S>(
 /// ahead of the `reattach:<jti>` frames the `connected` ack queues. Returns
 /// only on a write failure, which ends the enclosing `select!` like every
 /// other arm.
-async fn run_remote_attach_pump<S>(
-    write: Arc<
-        Mutex<futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>>,
-    >,
-) where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
+async fn run_remote_attach_pump(writer: RelayWriter) {
     let client = crate::mcp::remote_terminal::client();
     let mut rx = client.lock_outbound().await;
     crate::mcp::remote_terminal::RemoteAttachClient::discard_backlog(&mut rx);
     while let Some(frame) = rx.recv().await {
         let text = serde_json::to_string(&frame).unwrap_or_default();
-        let mut w = write.lock().await;
-        if let Err(e) = w.send(Message::Text(text.into())).await {
+        // One ordered queue in, one ordered lane out. Every `remote_terminal_*`
+        // frame stays on the bulk lane: the pump drains a single ordered queue
+        // whose frames form per-pane streams (`attached` -> `buffer` ->
+        // `output`... -> `exit`), and promoting any of them to a faster lane
+        // would let a later frame overtake an earlier one for the same pane.
+        if let Err(e) = writer.send_bulk(Message::Text(text.into())).await {
             warn!("Failed to forward remote-attach frame to backend: {}", e);
             return;
         }
@@ -1764,15 +2215,18 @@ async fn run_remote_attach_pump<S>(
 /// - `ai-output` → `chat_response` (mobile chat sessions)
 /// - `session-state` → `chat_session_state`
 /// - `terminal-output` / `terminal-exit` → `terminal_output` / `terminal_exit`
-async fn handle_outbound<S>(
+///
+/// Every frame this produces takes the **bulk** lane, in the order the
+/// broadcast delivered it. That is what keeps per-terminal ordering exact: a
+/// given terminal's `terminal-output` frames and its final `terminal-exit` all
+/// arrive here on one broadcast, leave on one FIFO channel, and are written by
+/// one task, so nothing can reorder them and no frame of a terminal's stream
+/// ever travels on the lane that is allowed to overtake.
+async fn handle_outbound(
     event_rx: &mut broadcast::Receiver<Value>,
-    write: Arc<
-        Mutex<futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>>,
-    >,
+    writer: RelayWriter,
     api_state: Arc<ApiState>,
-) where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
+) {
     // The WS relay is per-connection and the ServerModeState clone is a
     // cheap Arc-backed handle that lives for the connection's lifetime, so
     // fetch it once up front. If it's absent at connection start (state not
@@ -1887,8 +2341,13 @@ async fn handle_outbound<S>(
                 };
 
                 let text = serde_json::to_string(&relay_msg).unwrap_or_default();
-                let mut w = write.lock().await;
-                if let Err(e) = w.send(Message::Text(text.into())).await {
+                // Bulk lane. When it is full this `await` parks, which stops
+                // draining `event_broadcast` and pushes the overload onto that
+                // channel's existing, deliberate lossy behaviour (the
+                // `Backend relay lagged` warning below). It can no longer stall
+                // a PONG, a heartbeat or a command reply, because it no longer
+                // shares anything with them.
+                if let Err(e) = writer.send_bulk(Message::Text(text.into())).await {
                     warn!("Failed to forward event to backend: {}", e);
                     return;
                 }
@@ -6743,5 +7202,514 @@ mod relay_routing_tests {
         let (msg_type, data) = dispatched(route_relay_frame("terminal_create", &frame));
         assert_eq!(msg_type, "terminal_create");
         assert_eq!(data, frame);
+    }
+}
+
+#[cfg(test)]
+mod relay_writer_tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::sync::Mutex as StdMutex;
+    use std::task::{Context, Poll, Waker};
+
+    // -----------------------------------------------------------------
+    // A sink the test can stall on command.
+    //
+    // `SinkExt::send` calls `poll_ready` -> `start_send` -> `poll_flush`, so
+    // each frame consumes exactly one unit of `budget` at `poll_ready`. With
+    // the budget at zero the writer parks mid-send, which is precisely the
+    // state that used to hold the shared mutex and strand the PONG. No timers
+    // and no sleeps are involved, so the tests below are deterministic rather
+    // than timing-dependent.
+    // -----------------------------------------------------------------
+
+    #[derive(Default)]
+    struct GateInner {
+        budget: usize,
+        waker: Option<Waker>,
+        written: Vec<Message>,
+    }
+
+    #[derive(Clone, Default)]
+    struct SinkGate {
+        inner: Arc<StdMutex<GateInner>>,
+    }
+
+    impl SinkGate {
+        /// Allow `n` more frames onto the wire.
+        fn release(&self, n: usize) {
+            let waker = {
+                let mut g = self.inner.lock().unwrap();
+                g.budget += n;
+                g.waker.take()
+            };
+            if let Some(w) = waker {
+                w.wake();
+            }
+        }
+
+        fn written(&self) -> Vec<Message> {
+            self.inner.lock().unwrap().written.clone()
+        }
+
+        fn written_len(&self) -> usize {
+            self.inner.lock().unwrap().written.len()
+        }
+
+        fn is_parked(&self) -> bool {
+            self.inner.lock().unwrap().waker.is_some()
+        }
+    }
+
+    struct GatedSink {
+        gate: SinkGate,
+    }
+
+    impl futures_util::Sink<Message> for GatedSink {
+        type Error = std::io::Error;
+
+        fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            let mut g = self.gate.inner.lock().unwrap();
+            if g.budget > 0 {
+                g.budget -= 1;
+                Poll::Ready(Ok(()))
+            } else {
+                g.waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+
+        fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+            self.gate.inner.lock().unwrap().written.push(item);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn text(s: &str) -> Message {
+        Message::Text(s.to_string().into())
+    }
+
+    fn as_text(m: &Message) -> Option<String> {
+        match m {
+            Message::Text(t) => Some(t.to_string()),
+            _ => None,
+        }
+    }
+
+    /// Let the writer task run until `cond` holds, or give up.
+    async fn settle(mut cond: impl FnMut() -> bool) -> bool {
+        for _ in 0..10_000 {
+            if cond() {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+        cond()
+    }
+
+    // -----------------------------------------------------------------
+    // The property this change exists to establish.
+    // -----------------------------------------------------------------
+
+    /// THE regression test for the P0.
+    ///
+    /// The bulk lane is saturated to capacity and the sink is stalled, which is
+    /// the exact state in which the old `Arc<Mutex<SplitSink>>` stranded a
+    /// control-frame reply behind the whole terminal-output backlog: the PONG
+    /// could not even be *offered*, because offering it meant taking the lock
+    /// `handle_outbound` was holding across its `send().await`. Here the PONG is
+    /// enqueued into a saturated writer and must still reach the wire within one
+    /// frame -- the single bulk frame already in flight.
+    ///
+    /// This asserts the PROPERTY (a control frame is not starved by a saturated
+    /// output lane), not the implementation. It fails if the `biased;` is
+    /// dropped from the writer's select, and fails hard if a control frame is
+    /// ever routed onto the bulk lane.
+    #[tokio::test]
+    async fn liveness_frame_is_not_starved_by_a_saturated_bulk_lane() {
+        // Repeated rather than run once, purely for mutation sensitivity.
+        // Deleting `biased;` from the writer's select leaves tokio picking a
+        // start branch at random, which passes a single round about half the
+        // time; across 12 independent rounds that survives with probability
+        // ~0.02%. The correct implementation passes every round deterministically.
+        const ROUNDS: usize = 12;
+
+        for round in 0..ROUNDS {
+            let gate = SinkGate::default();
+            let (writer, rx) = RelayWriter::new();
+            let sink = GatedSink { gate: gate.clone() };
+            let task = tokio::spawn(run_relay_writer(sink, rx));
+
+            // Saturate the output lane. The sink has no budget, so the writer
+            // parks inside the very first send and nothing drains.
+            for i in 0..RELAY_BULK_LANE_CAPACITY {
+                writer
+                    .send_bulk(text(&format!("bulk-{i}")))
+                    .await
+                    .expect("bulk lane should accept frames up to capacity");
+            }
+
+            // Let the writer pick up the first bulk frame and park mid-send.
+            settle(|| gate.written_len() > 0 || gate.is_parked()).await;
+
+            // The server's PING arrives now, with a full lane of output ahead
+            // of it.
+            writer
+                .send_pong(Message::Pong(vec![7].into()))
+                .expect("a PONG must always be accepted");
+
+            // Drain everything.
+            gate.release(RELAY_BULK_LANE_CAPACITY + 1);
+            assert!(
+                settle(|| gate.written_len() >= RELAY_BULK_LANE_CAPACITY + 1).await,
+                "round {round}: writer should drain every queued frame once the \
+                 sink unblocks"
+            );
+
+            let written = gate.written();
+            let pong_at = written
+                .iter()
+                .position(|m| matches!(m, Message::Pong(_)))
+                .expect("the PONG must reach the wire");
+
+            assert!(
+                pong_at <= 1,
+                "round {}: a PONG enqueued behind {} saturating output frames \
+                 reached the wire at position {} -- it must wait for at most the \
+                 one frame already in flight. This is the starvation that gets \
+                 the connection killed with `code=1011, reason=keepalive ping \
+                 timeout`. First frames: {:?}",
+                round,
+                RELAY_BULK_LANE_CAPACITY,
+                pong_at,
+                written.iter().take(4).collect::<Vec<_>>()
+            );
+
+            task.abort();
+        }
+    }
+
+    /// Per-terminal ordering: every bulk frame keeps its relative order, so a
+    /// terminal's output frames and its closing exit frame cannot be reordered
+    /// by the writer. Only the three higher lanes may overtake, and no terminal
+    /// stream data ever travels on any of them.
+    #[tokio::test]
+    async fn bulk_lane_preserves_frame_order_even_with_higher_lane_traffic() {
+        let gate = SinkGate::default();
+        let (writer, rx) = RelayWriter::new();
+        let task = tokio::spawn(run_relay_writer(GatedSink { gate: gate.clone() }, rx));
+
+        const OUT: usize = 32;
+        for i in 0..OUT {
+            writer.send_bulk(text(&format!("out-{i}"))).await.unwrap();
+            // Traffic on the two higher lanes between every pair of output
+            // frames. A Pong replaces rather than queues, and a Ping past the
+            // liveness lane's capacity coalesces — so the TOTAL frame count is
+            // deliberately not asserted here. What must hold is that none of
+            // that traffic disturbs the order of the bulk frames.
+            writer.send_pong(Message::Pong(vec![1].into())).unwrap();
+            writer.send_liveness(Message::Ping(vec![].into())).unwrap();
+        }
+        writer.send_bulk(text("exit")).await.unwrap();
+
+        gate.release(10_000);
+        // Settle on the BULK frames specifically: Text frames are exactly the
+        // bulk ones here, since Pong/Ping are not Text.
+        let bulk_count = || {
+            gate.written()
+                .iter()
+                .filter(|m| matches!(m, Message::Text(_)))
+                .count()
+        };
+        assert!(
+            settle(|| bulk_count() >= OUT + 1).await,
+            "expected {} bulk frames, saw {}",
+            OUT + 1,
+            bulk_count()
+        );
+
+        let bulk_order: Vec<String> = gate.written().iter().filter_map(as_text).collect();
+        let mut expected: Vec<String> = (0..OUT).map(|i| format!("out-{i}")).collect();
+        expected.push("exit".to_string());
+        assert_eq!(
+            bulk_order, expected,
+            "bulk frames must keep their exact relative order -- a terminal's \
+             output must never be reordered, and its exit must never overtake \
+             its final output"
+        );
+
+        task.abort();
+    }
+
+    /// A full output lane must never cost a control frame. The bulk lane is
+    /// filled to capacity (so a further `send_bulk` parks) while `send_pong`
+    /// keeps succeeding -- the no-drop guarantee stated on
+    /// `RelayWriter::send_pong`.
+    #[tokio::test(start_paused = true)]
+    async fn pong_slot_accepts_frames_while_the_bulk_lane_is_full() {
+        let (writer, _rx) = RelayWriter::new();
+
+        // No writer task at all: nothing drains, so the bulk lane fills and
+        // stays full.
+        for i in 0..RELAY_BULK_LANE_CAPACITY {
+            writer.send_bulk(text(&format!("bulk-{i}"))).await.unwrap();
+        }
+        // One more would block -- prove it rather than assuming it.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                writer.send_bulk(text("overflow")),
+            )
+            .await
+            .is_err(),
+            "the bulk lane is meant to be bounded; a full lane must park the \
+             producer rather than grow without limit"
+        );
+
+        // The control lane is unaffected, and stays unaffected.
+        for _ in 0..1_000 {
+            writer
+                .send_pong(Message::Pong(vec![1].into()))
+                .expect("a PONG must never be refused while the socket lives");
+        }
+    }
+
+    /// The writer must not outlive its socket. Dropping every sender is the
+    /// end-of-life signal, and the task ends on its own.
+    #[tokio::test]
+    async fn writer_task_ends_when_every_sender_is_dropped() {
+        let gate = SinkGate::default();
+        let (writer, rx) = RelayWriter::new();
+        let task = tokio::spawn(run_relay_writer(GatedSink { gate: gate.clone() }, rx));
+
+        let clone = writer.clone();
+        drop(writer);
+        drop(clone);
+
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+        assert!(
+            joined.is_ok(),
+            "the writer task must end once its last sender is dropped, so a \
+             reconnect cannot leave two writers on two sockets"
+        );
+    }
+
+    /// Once the writer is gone, every producer learns about it through its own
+    /// return value -- which is how each one ends and tears the connection down.
+    #[tokio::test]
+    async fn producers_observe_writer_death() {
+        let (writer, rx) = RelayWriter::new();
+        drop(rx);
+
+        assert_eq!(
+            writer.send_pong(Message::Pong(vec![].into())),
+            Err(RelayWriteError::WriterGone)
+        );
+        assert_eq!(
+            writer.send_bulk(text("out")).await,
+            Err(RelayWriteError::WriterGone)
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // The read loop must never park.
+    //
+    // `handle_inbound` is the only task that can see the server's PING, so a
+    // read loop that blocks is a dead connection no matter how well the writer
+    // prioritises. An earlier two-lane version of this type routed some replies
+    // onto the bounded bulk lane and awaited there, which parked the reader in
+    // exactly the congested state this whole change targets. These tests pin
+    // the property that fix established.
+    // -----------------------------------------------------------------
+
+    /// Every call the read loop makes must complete without awaiting the
+    /// network, even with BOTH bounded lanes saturated.
+    #[tokio::test(start_paused = true)]
+    async fn reader_paths_never_park_when_every_bounded_lane_is_full() {
+        let (writer, _rx) = RelayWriter::new();
+
+        // Saturate both bounded lanes. Nothing drains: there is no writer task.
+        for i in 0..RELAY_BULK_LANE_CAPACITY {
+            writer.send_bulk(text(&format!("bulk-{i}"))).await.unwrap();
+        }
+        for i in 0..RELAY_REPLY_LANE_CAPACITY {
+            writer
+                .try_send_reply(text(&format!("reply-{i}")))
+                .expect("reply lane should accept frames up to capacity");
+        }
+
+        // The reader's two calls, both of which must return synchronously.
+        // `now()` is the paused clock: if either of these awaited the network
+        // the test would hang rather than advance, and `start_paused` keeps a
+        // genuine non-blocking path at exactly zero elapsed time.
+        let before = tokio::time::Instant::now();
+
+        writer
+            .send_pong(Message::Pong(vec![9].into()))
+            .expect("a PONG must be accepted however saturated the data lanes are");
+
+        assert_eq!(
+            writer.try_send_reply(text("one-too-many")),
+            Err(RelayWriteError::ReplyLaneFull),
+            "a full reply lane must be REPORTED to the read loop, never waited \
+             on and never silently discarded — somebody is blocked on that \
+             request_id"
+        );
+
+        assert_eq!(
+            tokio::time::Instant::now(),
+            before,
+            "the read loop's write paths must not await anything: parking here \
+             stops the socket being read, so the server's PING is never seen \
+             and no PONG is ever offered"
+        );
+    }
+
+    /// The pong slot keeps its no-drop guarantee no matter how long the bounded
+    /// lanes stay full — this is where the PONG lives, and it is depth-1.
+    #[tokio::test(start_paused = true)]
+    async fn pong_slot_never_fills() {
+        let (writer, _rx) = RelayWriter::new();
+
+        for i in 0..RELAY_BULK_LANE_CAPACITY {
+            writer.send_bulk(text(&format!("bulk-{i}"))).await.unwrap();
+        }
+        for i in 0..RELAY_REPLY_LANE_CAPACITY {
+            writer.try_send_reply(text(&format!("reply-{i}"))).unwrap();
+        }
+
+        // Far more PONGs than any real socket would ever see in one lifetime.
+        for _ in 0..100_000 {
+            writer
+                .send_pong(Message::Pong(vec![1].into()))
+                .expect("the pong slot must never refuse a frame");
+        }
+    }
+
+    /// A saturated bulk lane must not delay a reply either — replies outrank
+    /// bulk, so an attach response cannot queue behind a 50-shell firehose.
+    #[tokio::test]
+    async fn a_reply_outranks_a_saturated_bulk_lane() {
+        let gate = SinkGate::default();
+        let (writer, rx) = RelayWriter::new();
+        let task = tokio::spawn(run_relay_writer(GatedSink { gate: gate.clone() }, rx));
+
+        for i in 0..RELAY_BULK_LANE_CAPACITY {
+            writer.send_bulk(text(&format!("bulk-{i}"))).await.unwrap();
+        }
+        settle(|| gate.written_len() > 0 || gate.is_parked()).await;
+
+        writer.try_send_reply(text("terminal_attached")).unwrap();
+
+        gate.release(RELAY_BULK_LANE_CAPACITY + 1);
+        assert!(settle(|| gate.written_len() >= RELAY_BULK_LANE_CAPACITY + 1).await);
+
+        let written = gate.written();
+        let reply_at = written
+            .iter()
+            .position(|m| as_text(m).as_deref() == Some("terminal_attached"))
+            .expect("the reply must reach the wire");
+        assert!(
+            reply_at <= 1,
+            "a reply reached the wire at position {reply_at}; it must wait for \
+             at most the one bulk frame already in flight"
+        );
+
+        task.abort();
+    }
+
+    /// The Pong is a replace-slot, not a queue: a peer that pings faster than
+    /// the writer drains cannot grow it, and what finally goes out is the
+    /// NEWEST payload.
+    ///
+    /// Both halves matter. Depth-1 is what stops an unbounded queue becoming a
+    /// memory vector on a runner already carrying hundreds of threads. Newest-
+    /// wins is what makes the coalescing correct rather than merely cheap: a
+    /// Pong must echo its Ping's payload (RFC 6455 section 5.5.3), and the
+    /// server library resolves a pending ping and every earlier one when the
+    /// matching payload returns — so the newest payload clears the whole
+    /// backlog, while a stale one would leave the newest ping outstanding and
+    /// time out anyway.
+    #[tokio::test]
+    async fn pong_coalesces_to_the_newest_payload_under_a_ping_flood() {
+        let gate = SinkGate::default();
+        let (writer, rx) = RelayWriter::new();
+        let task = tokio::spawn(run_relay_writer(GatedSink { gate: gate.clone() }, rx));
+
+        // One bulk frame so the writer is parked mid-send, exactly as it would
+        // be against a congested socket.
+        writer.send_bulk(text("in-flight")).await.unwrap();
+        settle(|| gate.is_parked()).await;
+
+        // The peer floods PINGs while the writer cannot move.
+        for i in 0u8..200 {
+            writer
+                .send_pong(Message::Pong(vec![i].into()))
+                .expect("the pong slot must never refuse");
+        }
+
+        // Drain generously — far more budget than there are frames.
+        gate.release(64);
+        assert!(settle(|| gate.written_len() >= 2).await);
+        // Nothing further can appear; let any extra work settle out.
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+
+        let written = gate.written();
+        let pongs: Vec<&Message> = written
+            .iter()
+            .filter(|m| matches!(m, Message::Pong(_)))
+            .collect();
+
+        assert_eq!(
+            pongs.len(),
+            1,
+            "200 PINGs while the writer was stalled must coalesce to ONE Pong,              not a 200-deep queue; wrote {:?}",
+            written.len()
+        );
+        assert!(
+            matches!(pongs[0], Message::Pong(p) if p.as_ref() == [199u8]),
+            "the surviving Pong must carry the NEWEST ping's payload, since that              is the one that clears the server's whole pending-ping set; got {:?}",
+            pongs[0]
+        );
+
+        task.abort();
+    }
+
+    /// The liveness lane (keepalive Ping + heartbeat) is bounded, and overflow
+    /// is reported as `Coalesced` rather than as an error or a park — the
+    /// timers keep running.
+    #[tokio::test(start_paused = true)]
+    async fn liveness_lane_coalesces_when_full_and_never_errors() {
+        let (writer, _rx) = RelayWriter::new();
+
+        for _ in 0..RELAY_LIVENESS_LANE_CAPACITY {
+            assert_eq!(
+                writer.send_liveness(Message::Ping(vec![].into())),
+                Ok(LivenessSend::Queued)
+            );
+        }
+        for _ in 0..1_000 {
+            assert_eq!(
+                writer.send_liveness(Message::Ping(vec![].into())),
+                Ok(LivenessSend::Coalesced),
+                "a full liveness lane must coalesce, never block and never error                  — a stale heartbeat or a redundant keepalive is worth nothing"
+            );
+        }
     }
 }
