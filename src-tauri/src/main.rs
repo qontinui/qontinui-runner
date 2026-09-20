@@ -3493,6 +3493,18 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // when already canonical.
                 qontinui_runner_lib::pair::ensure_device_initialized();
 
+                // One binding store (plan 2026-09-20 D4). Four
+                // `paired_user.json` copies were found on the operator box,
+                // and which one a process reads decides which tenants it
+                // believes exist. Merge the copies under a path THIS process
+                // would itself compute — the bare `data_local_dir()` default
+                // and a set `$QONTINUI_SECURE_STORAGE_DIR`, nothing found by
+                // scanning — into the canonical one, and leave each absorbed
+                // copy as `.superseded-<date>` rather than deleting it.
+                // Best-effort and fail-open: with no env override the
+                // candidate set is one path and this is a no-op.
+                let _ = qontinui_runner_lib::pair::converge_binding_store();
+
                 let app_handle = app.handle().clone();
                 let term_state: tauri::State<'_, std::sync::Arc<terminal::TerminalManager>> =
                     app.state();

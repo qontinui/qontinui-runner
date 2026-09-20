@@ -19201,6 +19201,24 @@ pub(crate) mod doctor {
         // than as "this box has no tenant slots".
         let slots_are_unknown = all_tenant_slots.is_empty();
 
+        // D4 (plan 2026-09-20): is the BINDING STORE split-brained? Four
+        // `paired_user.json` copies were found on the operator box and which
+        // one a process reads decides which tenants it believes exist. This
+        // compares only the copies this process would itself compute, FAILS
+        // on a binding-set / `default_tenant_id` disagreement, and merely
+        // REPORTS a `paired_at`-only difference — the only way the copies
+        // differ on a healthy box today, and a check that cries wolf gets
+        // disabled. An unreadable copy reads as UNKNOWN, never as agreement.
+        // `qontinui_runner_lib::` rather than `crate::`: this module is
+        // compiled into BOTH the lib and the bin, and only the lib has a
+        // `mod pair` in its crate root (the lib aliases itself with
+        // `extern crate self as qontinui_runner_lib`, so this one spelling
+        // resolves in both) — same idiom as `tenant_id_from_oauth_claim`
+        // above.
+        let binding_store = qontinui_runner_lib::pair::binding_store_check();
+        let binding_store_unknown = binding_store.is_unknown();
+        let binding_store_failed = binding_store.failed();
+
         let (verdict, layer, detail) = verdict_for(&selected, &legacy, slots_are_unknown, &pin);
 
         serde_json::json!({
@@ -19216,6 +19234,9 @@ pub(crate) mod doctor {
                 legacy_slot: legacy,
             },
             "tenant_slots_unknown": slots_are_unknown,
+            "binding_store": binding_store,
+            "binding_store_failed": binding_store_failed,
+            "binding_store_unknown": binding_store_unknown,
             "slot_health": crate::mcp::device_jwt_refresher::tenant_slot_health()
                 .map(|h| serde_json::json!({
                     "observed_at_unix": h.observed_at_unix,
