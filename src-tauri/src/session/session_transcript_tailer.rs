@@ -360,6 +360,28 @@ mod tests {
             .expect("register_sniffed_session")
     }
 
+    /// Transcript chunk offsets grouped by the coord session that emitted
+    /// them, in seq order within each — the grain `OutboxWriter::pending`
+    /// actually guarantees. Use this wherever a case spans more than one coord
+    /// session; the order BETWEEN sessions is decided by comparing two random
+    /// UUIDv7 low halves and is not a property worth asserting.
+    fn transcript_chunks(outbox: &OutboxWriter) -> std::collections::HashMap<Uuid, Vec<i64>> {
+        let mut by_session: std::collections::HashMap<Uuid, Vec<i64>> =
+            std::collections::HashMap::new();
+        for r in outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.event_kind == SessionEventKind::OutputChunk.as_str())
+        {
+            by_session
+                .entry(r.session_id)
+                .or_default()
+                .push(r.payload["chunk_offset"].as_i64().unwrap());
+        }
+        by_session
+    }
+
     fn transcript_offsets(outbox: &OutboxWriter) -> Vec<i64> {
         outbox
             .pending()
@@ -472,9 +494,34 @@ mod tests {
         // would collide with the pre-restart chunk under any read that joins
         // the two coord sessions by claude_code_session_id, and coord's
         // ON CONFLICT DO NOTHING would silently drop it.
+        //
+        // Joined by SESSION rather than compared as a flat list, because the
+        // flat comparison was a coin flip per run (observed on
+        // qontinui-runner#1583 as `left: [10, 0]`, coord finding `805876ba`).
+        // The cause is NOT test-run order and NOT append order:
+        // `OutboxWriter::pending` sorts by `(session_id, seq)`
+        // (`session/local_store.rs`), so the order between two sessions is
+        // decided entirely by comparing their two ids — and both are UUIDv7s
+        // from `session::uuid_v7()`, which uses `uuid::NoContext`
+        // (`usable_bits() == 0`), so two minted in the SAME MILLISECOND differ
+        // only in 74 RANDOM low bits. The registrar mints one per
+        // process and this test runs both within a millisecond on a fast
+        // filesystem, so which id sorts first is random per run. Running the
+        // test alone therefore neither reproduces the failure nor proves a
+        // fix.
+        //
+        // Joining by session is also STRICTER than sorting: it pins that the
+        // post-restart chunk is the one at 10, which is the property the
+        // test's name claims. A sorted `vec![0, 10]` would still pass if the
+        // two offsets had swapped owners.
+        let by_session = transcript_chunks(&outbox2);
         assert_eq!(
-            transcript_offsets(&outbox2),
-            vec![0, 10],
+            by_session.get(&first_coord_id).map(Vec::as_slice),
+            Some(&[0][..])
+        );
+        assert_eq!(
+            by_session.get(&second_coord_id).map(Vec::as_slice),
+            Some(&[10][..]),
             "offset lane survives the restart"
         );
         assert_eq!(t2.coverage().appends_emitted, 1);

@@ -7,14 +7,24 @@
 //! a rolling byte window only ever retains the bottom of a frame and misses
 //! mid-screen text. The grid always reflects what is actually on screen.
 //!
-//! [`snapshot_looks_idle`] is the ONE turn-complete recognizer in the runner.
-//! Its consumers: the looping-agent supervisor, the session message poller's
-//! PTY injection gate and the wind-down grid observation (both through
-//! `TerminalSession::looks_idle_quiescent` / `observe_grid_idle`, which add
-//! the quiescence debounce). A byte-identical copy used to live in
-//! `mcp/session_message_poller.rs` with a "extend BOTH sites" comment; it was
-//! deleted by plan `2026-09-13-drained-runner-never-reaches-idle` Phase 1, so
-//! there is now exactly one indicator list to extend.
+//! [`snapshot_looks_idle`] is the ONE turn-complete recognizer in the runner,
+//! and `TerminalSession::idle_quiescence_probe` is the ONE debounce around it.
+//! Its consumers, all of them: the looping-agent supervisor's tick and the
+//! session message poller's PTY injection gate, both through that probe
+//! (directly, or through the `TerminalSession::looks_idle_quiescent` bool gate
+//! over it); the wind-down grid observation through `observe_grid_idle`, whose
+//! generation check stands in for a debounce without sleeping; and two SINGLE
+//! reads with no debounce at all, deliberately — `terminal::graceful_exit`'s
+//! `prompt_ready_with`, which must judge the screen it is about to type into
+//! at that instant, and `looping_agent_supervisor::status_snapshot`, which
+//! reports rather than acts. A byte-identical copy of the PREDICATE used to
+//! live in `mcp/session_message_poller.rs` with an "extend BOTH sites"
+//! comment; it was deleted by plan
+//! `2026-09-13-drained-runner-never-reaches-idle` Phase 1, and the last copy
+//! of the DEBOUNCE around it — in the looping-agent supervisor, which needed
+//! the settled screen the old `bool` gate threw away — went in that plan's
+//! post-merge follow-up. So there is now exactly one indicator list to extend
+//! and one place the two-read rule lives.
 
 /// Working/processing indicators that mean Claude is mid-turn. If ANY appears
 /// on the rendered screen the terminal is NOT idle. Lowercased before match.

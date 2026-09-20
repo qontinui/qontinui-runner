@@ -1457,6 +1457,22 @@ pub struct TerminalSession {
     last_input: Mutex<PtyInputSlots>,
 }
 
+/// The settled screen behind a [`TerminalSession::idle_quiescence_probe`].
+///
+/// `lines`/`cursor_row` are the SECOND read — the screen as it stood after the
+/// debounce — which is the one a caller should judge, since the first read is
+/// by construction the one that might still have been streaming.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdleQuiescence {
+    /// The screen still looked idle after the debounce AND rendered
+    /// identically to the first read.
+    pub idle: bool,
+    /// The settled screen's rendered lines. Deliberately the only screen field
+    /// here: the cursor row is carried by nothing that reads this, and an
+    /// unread field is the defect class this change exists to remove.
+    pub lines: Vec<String>,
+}
+
 impl TerminalSession {
     /// Spawn a new terminal session with a shell process.
     ///
@@ -4163,15 +4179,41 @@ impl TerminalSession {
     /// message poller); wind-down observation uses [`Self::observe_grid_idle`],
     /// which does not sleep.
     pub async fn looks_idle_quiescent(&self, debounce: std::time::Duration) -> bool {
+        matches!(
+            self.idle_quiescence_probe(debounce).await,
+            Some(probe) if probe.idle
+        )
+    }
+
+    /// [`Self::looks_idle_quiescent`], keeping the SECOND read for a caller
+    /// that needs the settled screen as well as the verdict — the looping-agent
+    /// supervisor reads `snapshot_context_low` off it.
+    ///
+    /// `None` when the FIRST read was not idle: nothing was slept on and there
+    /// is no second read, which is the supervisor's existing behaviour (it
+    /// computes neither `idle` nor `context_low` in that case). `Some` carries
+    /// the quiescence verdict beside the settled lines, so a caller that wants
+    /// the screen does not have to re-derive the debounce — this is the ONE
+    /// implementation of it, as `looping_agent::idle`'s module docs claim for
+    /// the predicate underneath.
+    pub async fn idle_quiescence_probe(
+        &self,
+        debounce: std::time::Duration,
+    ) -> Option<IdleQuiescence> {
         use qontinui_runner_lib::looping_agent::idle::snapshot_looks_idle;
 
         let (lines_a, cursor_a) = self.grid_text();
         if !snapshot_looks_idle(&lines_a, cursor_a) {
-            return false;
+            return None;
         }
         tokio::time::sleep(debounce).await;
         let (lines_b, cursor_b) = self.grid_text();
-        snapshot_looks_idle(&lines_b, cursor_b) && lines_a == lines_b && cursor_a == cursor_b
+        Some(IdleQuiescence {
+            idle: snapshot_looks_idle(&lines_b, cursor_b)
+                && lines_a == lines_b
+                && cursor_a == cursor_b,
+            lines: lines_b,
+        })
     }
 
     /// The pane's root process id — the shell the PTY spawned — or `None` for
@@ -5447,6 +5489,51 @@ mod tests {
             panic!("still idle");
         };
         assert!(restarted > first, "{restarted} > {first}");
+    }
+
+    /// `idle_quiescence_probe` is the ONE debounce, and it hands back the
+    /// SETTLED screen so a caller does not re-derive it.
+    ///
+    /// `None` is reserved for "the first read was not idle" — the arm where
+    /// nothing is slept on and there is no second read. The looping-agent
+    /// supervisor depends on that distinction: it computes `context_low` off
+    /// the settled lines whenever the first read was idle, INCLUDING when the
+    /// debounce then says the screen moved, and skips both signals otherwise.
+    #[tokio::test]
+    async fn idle_quiescence_probe_returns_the_settled_screen_or_none() {
+        fn pane(screen: &str) -> TerminalSession {
+            let mut s = make_test_session(Arc::new(Mutex::new(Vec::new())));
+            s.grid = Arc::new(Mutex::new(Grid::new(200, 50)));
+            let mut parser = vte::Parser::new();
+            s.grid.lock().unwrap().feed(&mut parser, screen.as_bytes());
+            s
+        }
+
+        let idle = pane(&format!("done\r\n{}\r\n\u{276f} ", "\u{2500}".repeat(190)));
+        let probe = idle
+            .idle_quiescence_probe(Duration::from_millis(1))
+            .await
+            .expect("an idle first read yields a probe");
+        assert!(probe.idle, "a static idle screen settles idle");
+        assert!(
+            probe.lines.iter().any(|l| l.contains('\u{276f}')),
+            "the settled screen is handed back, not discarded: {:?}",
+            probe.lines
+        );
+        assert!(
+            idle.looks_idle_quiescent(Duration::from_millis(1)).await,
+            "the bool gate agrees with the probe it now delegates to"
+        );
+
+        // Mid-turn: the first read is not idle, so there is no second read.
+        let busy = pane("\u{273b} Thinking… (esc to interrupt)\r\n\u{276f} ");
+        assert!(
+            busy.idle_quiescence_probe(Duration::from_millis(1))
+                .await
+                .is_none(),
+            "a non-idle first read never sleeps and never returns a screen"
+        );
+        assert!(!busy.looks_idle_quiescent(Duration::from_millis(1)).await);
     }
 
     /// `/restart-readiness` observes every terminal-hosted pane per request and
