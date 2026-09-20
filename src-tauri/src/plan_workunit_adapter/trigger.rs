@@ -1739,7 +1739,7 @@ fn relative_source_path(root: Option<&str>, path: &Path) -> String {
 /// `source_path` — so moving the source does not churn a single coord row.
 /// `read_plans_for_cycle_arms_agree` pins that by construction.
 ///
-/// `Ok` carries a [`PlanDirScan`], whose `complete` flag says whether EVERY
+/// `Ok` carries a [`CycleScan`], whose `complete` flag says whether EVERY
 /// plan the source listed was read. Both arms can come back short without
 /// failing — the tree walk skips an unreadable or unstattable file, the ref
 /// walk skips a blob that will not read or is not UTF-8 — and a short `Ok`
@@ -1748,36 +1748,53 @@ pub fn read_plans_for_cycle(
     dir: &Path,
     conv: &PlanConvention,
     git: &dyn GitRefReader,
-) -> Result<PlanDirScan, String> {
+) -> Result<CycleScan, String> {
     use super::ref_scan::{read_ref_dir, resolve_scan_source, ScanSource};
     match resolve_scan_source(git, dir) {
-        ScanSource::WorkTree => Ok(scan_plan_dir(dir, conv)),
+        ScanSource::WorkTree => {
+            let scan = scan_plan_dir(dir, conv);
+            Ok(CycleScan {
+                units: scan.units,
+                // The tree walk's own completeness, carried through unchanged:
+                // a short `units` here still must not read as absence.
+                complete: scan.complete,
+                // No ref was listed, so the REF side is ABSENT — UNKNOWN, never
+                // an empty set. A zero here would be the claim that the default
+                // branch holds no plans, which nothing measured.
+                ref_census: None,
+            })
+        }
         ScanSource::Unavailable { reason } => Err(reason),
         ScanSource::Ref {
             repo_root,
             ref_name,
             rel_dir,
         } => match read_ref_dir(git, &repo_root, &ref_name, &rel_dir) {
-            Ok(read) => {
+            Ok(listing) => {
                 // Resolved ONCE per scan, as in `read_plan_dir`: it walks the
                 // ancestor chain for a `.git` and every entry shares the answer.
                 let source_root = super::body_push::derive_source_repo(dir);
-                let units = read
-                    .files
-                    .into_iter()
-                    .map(|f| {
-                        // The path a unit RECORDS is the one the tree scan
-                        // would have recorded — the ref is where the bytes
-                        // came from, not a different plan corpus.
-                        let path = dir.join(&f.name);
-                        let source_path = relative_source_path(source_root.as_deref(), &path);
-                        let slug = slug_from_filename(&path.to_string_lossy());
-                        parse_work_unit(&slug, &source_path, &f.body, conv)
-                    })
-                    .collect();
-                Ok(PlanDirScan {
-                    units,
-                    complete: read.complete,
+                let ref_census = ref_census_from_names(&listing.names, listing.ref_sha.clone());
+                // The census comes off the LISTING and `complete` qualifies the
+                // BLOBS, so a partial blob read shortens `units` without
+                // shortening the census — which is exactly why both travel.
+                let complete = listing.complete;
+                Ok(CycleScan {
+                    units: listing
+                        .files
+                        .into_iter()
+                        .map(|f| {
+                            // The path a unit RECORDS is the one the tree scan
+                            // would have recorded — the ref is where the bytes
+                            // came from, not a different plan corpus.
+                            let path = dir.join(&f.name);
+                            let source_path = relative_source_path(source_root.as_deref(), &path);
+                            let slug = slug_from_filename(&path.to_string_lossy());
+                            parse_work_unit(&slug, &source_path, &f.body, conv)
+                        })
+                        .collect(),
+                    complete,
+                    ref_census: Some(ref_census),
                 })
             }
             Err(e) => Err(format!(
@@ -1849,6 +1866,96 @@ fn classify_plan_entry(meta: std::io::Result<std::fs::Metadata>) -> PlanEntry {
         Ok(_) => PlanEntry::NotAPlan,
         Err(e) => PlanEntry::Unstattable(e),
     }
+}
+
+/// The REF census of an already-taken listing.
+///
+/// One constructor for both doors — the scanning arm of
+/// [`read_plans_for_cycle`] and the listing-only [`ref_census_only`] — so the
+/// two cannot drift on the source label, on how a name becomes a stem, or on
+/// whether the sha travels with it.
+fn ref_census_from_names(
+    names: &[String],
+    ref_sha: Option<String>,
+) -> super::body_push::PlanSlugCensus {
+    super::body_push::PlanSlugCensus::new(
+        super::body_push::SLUG_CENSUS_SOURCE_REF,
+        ref_sha,
+        names.iter().map(|n| slug_from_filename(n)),
+    )
+}
+
+/// The REF side's stem census ALONE: one `git ls-tree` at the ref this clone
+/// already holds. No fetch, no blob read, no parse, and no coord call.
+///
+/// This is what a cycle that will publish NO corpus can still honestly
+/// produce. The work-unit write posture
+/// ([`work_unit_write_posture`]) withholds coord work-unit READS AND WRITES on
+/// a multi-bound (or unknown-bound) device — a standing property of the
+/// device, not a passing failure. Withholding the census along with them made
+/// the ref side of the coverage question ABSENT on every cycle FOREVER on
+/// exactly the devices that hold both sides of it, and the first such cycle
+/// cleared the stems the web had already stored, because a report whose
+/// `censuses` omits a source stores that source as NULL. The cost objection
+/// that justifies skipping the SCAN does not reach the listing: the expensive
+/// part is the ~1,100 blob reads, and this door takes none of them.
+///
+/// Three outcomes, kept apart on purpose:
+///
+/// * `Ok(Some(census))` — the ref was listed; this is the reading.
+/// * `Ok(None)` — there is no ref side to read at all (the plans dir is not in
+///   a work tree, which is a supported layout). ABSENT, and an ANSWER.
+/// * `Err(reason)` — the listing could not be taken. Also ABSENT, but it is
+///   a FAULT, so the caller logs it (deduped — a clone with no `origin/HEAD`
+///   is one unchanging fault, and a WARN a minute for it is how the line that
+///   matters gets missed) [policy: `unknown-must-not-render-as-a-default`].
+pub fn ref_census_only(
+    dir: &Path,
+    git: &dyn GitRefReader,
+) -> Result<Option<super::body_push::PlanSlugCensus>, String> {
+    use super::ref_scan::{list_ref_plan_names, resolve_ref_listing_source, ScanSource};
+    match resolve_ref_listing_source(git, dir) {
+        // Not in a repo: the same `None` the WorkTree arm of
+        // `read_plans_for_cycle` reports. There is no ref, so there is no ref
+        // set — never an empty one, which would claim a default branch holds
+        // no plans.
+        ScanSource::WorkTree => Ok(None),
+        ScanSource::Unavailable { reason } => Err(reason),
+        ScanSource::Ref {
+            repo_root,
+            ref_name,
+            rel_dir,
+        } => match list_ref_plan_names(git, &repo_root, &ref_name, &rel_dir) {
+            Ok(listing) => Ok(Some(ref_census_from_names(&listing.names, listing.ref_sha))),
+            Err(e) => Err(format!(
+                "could not list `{ref_name}:{rel_dir}` in {}: {e}",
+                repo_root.display()
+            )),
+        },
+    }
+}
+
+/// One cycle's scan: the parsed units, and what the cycle can say about the
+/// REF side's stem set.
+///
+/// The two halves of this adapter scan different sources — the work-unit half
+/// reads the fetched REF, the body sync reads the WORKING TREE — so one device
+/// is the only thing in the fleet that holds both answers. This carries the
+/// ref half out to the scan-root report, where the web can difference it
+/// against the tree half instead of computing a ratio off one of them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CycleScan {
+    pub units: Vec<ParsedWorkUnit>,
+    /// `true` **iff** every plan the source listed was resolved and read —
+    /// the same flag [`PlanDirScan::complete`] carries, forwarded by both
+    /// arms. It qualifies `units` ONLY: `ref_census` is taken from the
+    /// LISTING, before any blob is read, so it survives the partial read this
+    /// flag reports.
+    pub complete: bool,
+    /// The `ref` census this cycle listed. `None` on the WORK-TREE arm: the
+    /// plans dir is not in a repo at all, so there is no ref side to report —
+    /// ABSENT (UNKNOWN), never an empty set.
+    pub ref_census: Option<super::body_push::PlanSlugCensus>,
 }
 
 /// Read + parse every `*.md` in `dir` (non-recursive — the plans dir is flat,
@@ -3198,7 +3305,12 @@ impl LoopState {
             // keeps being quoted until it ages out. The body sync's library
             // scan stays off here (unchanged); only its scan-root report runs.
             if let Some(bs) = self.body_sync.as_mut() {
-                bs.report_while_idle(metrics).await;
+                // BOTH stem sets ABSENT: no directory was enumerated and no
+                // ref was listed, so there is no census to take. (`state` is
+                // `not_scanning` here, which the web door forbids a census on
+                // for exactly this reason.)
+                bs.report_while_idle(metrics, ScanCensusInputs::absent())
+                    .await;
             }
             return;
         };
@@ -3232,7 +3344,8 @@ impl LoopState {
             match self.unknown_posture_streak {
                 1 => tracing::info!(
                     "plan adapter: coord's binding record is not available (fresh boot, or aged out) — withholding \
-                     work-unit pushes this cycle and re-checking next cycle"
+                     work-unit pushes this cycle and re-checking next cycle. The stem censuses are \
+                     unaffected: this cycle still LISTS the ref and the work tree and reports both"
                 ),
                 2 => tracing::warn!("{}", unknown_bindings_message()),
                 _ => {}
@@ -3277,8 +3390,64 @@ impl LoopState {
                 .work_unit_writes_withheld_total
                 .fetch_add(1, Ordering::Relaxed);
             metrics.cycles_total.fetch_add(1, Ordering::Relaxed);
+            // The posture withholds coord WORK-UNIT reads and writes. A stem
+            // census is NEITHER — it is one `git ls-tree` at the ref this
+            // clone already holds (see [`ref_census_only`]: no fetch, no blob
+            // read, no coord call), so the cost that justifies skipping the
+            // scan above does not reach it, and nothing here re-opens a
+            // withheld coord door.
+            //
+            // Withholding it too made the census permanently dark: a posture
+            // is a STANDING property of the device, so the ref side would have
+            // been ABSENT on every cycle forever — and the first such cycle
+            // would have cleared the stems the web already stored for this
+            // device, because a report whose `censuses` omits a source stores
+            // that source as NULL. The device that holds both sides of the
+            // coverage question is exactly the one most likely to be
+            // multi-bound.
+            let ref_census = {
+                let scan_dir = dir.clone();
+                let git = std::sync::Arc::clone(&self.git);
+                match tokio::task::spawn_blocking(move || ref_census_only(&scan_dir, git.as_ref()))
+                    .await
+                {
+                    Ok(Ok(census)) => {
+                        // Listed something, so the next unavailability is news
+                        // again — the same clearing the scanning arm does.
+                        self.last_scan_unavailable = None;
+                        census
+                    }
+                    // Deduped on the reason, like both scan-failure arms
+                    // below: one unchanging fault costs one line, not one a
+                    // minute.
+                    Ok(Err(reason)) => {
+                        if self.last_scan_unavailable.as_deref() != Some(reason.as_str()) {
+                            tracing::warn!(
+                                dir = %dir.display(),
+                                reason = %reason,
+                                "plan adapter: could not list the ref for the stem census on a \
+                                 withheld cycle; that side is reported ABSENT (never an empty set)"
+                            );
+                            self.last_scan_unavailable = Some(reason);
+                        }
+                        None
+                    }
+                    // The listing task did not complete, so the enumeration
+                    // never happened at all: ABSENT, never a fabricated zero.
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "plan adapter: the ref stem-census task did not complete on a \
+                             withheld cycle; that side is reported ABSENT"
+                        );
+                        None
+                    }
+                }
+            };
             if let Some(bs) = self.body_sync.as_mut() {
-                bs.run_cycle(&self.conv, metrics).await;
+                // Both sides travel: the ref census listed just above, and the
+                // work-tree census `run_cycle` takes of the active plans root.
+                bs.run_cycle(&self.conv, metrics, ref_census).await;
             }
             return;
         }
@@ -3310,7 +3479,7 @@ impl LoopState {
             })
             .await
             {
-                Ok(Ok(u)) => u,
+                Ok(Ok(scan)) => scan,
                 // Phase 2: `Err` is the ref saying it could not be read. It is
                 // NOT an empty corpus — publishing `Vec::new()` here would let
                 // reconcile treat every plan as disappeared.
@@ -3331,7 +3500,14 @@ impl LoopState {
                     // the reason the scan-root report sits ahead of the
                     // breaker pause and the `artifacts.is_empty()` return.
                     if let Some(bs) = self.body_sync.as_mut() {
-                        bs.report_while_idle(metrics).await;
+                        // BOTH stem sets ABSENT. The scan source was
+                        // unavailable, so nothing was listed — and a set that
+                        // was never listed is UNKNOWN. Sending `count: 0`
+                        // here would say "this side holds no plans", which is
+                        // the false zero this whole plan family exists to
+                        // remove.
+                        bs.report_while_idle(metrics, ScanCensusInputs::absent())
+                            .await;
                     }
                     metrics.cycles_total.fetch_add(1, Ordering::Relaxed);
                     return;
@@ -3360,7 +3536,15 @@ impl LoopState {
                         self.last_scan_unavailable = Some(reason);
                     }
                     if let Some(bs) = self.body_sync.as_mut() {
-                        bs.report_while_idle(metrics).await;
+                        // BOTH stem sets ABSENT, and this is the arm where it
+                        // matters most: the scan task did not COMPLETE, so the
+                        // enumeration never happened at all. A zero census
+                        // here would not even be stale — it would be
+                        // FABRICATED, a set nothing on this device ever
+                        // listed, and the web would store it as this device's
+                        // answer for the side.
+                        bs.report_while_idle(metrics, ScanCensusInputs::absent())
+                            .await;
                     }
                     // Counted like every other cycle: a FROZEN `cycles_total`
                     // reads as "the loop is dead", which is a different and
@@ -3373,6 +3557,10 @@ impl LoopState {
         // Read something, so the next unavailability is news again.
         self.last_scan_unavailable = None;
         let active_scan_complete = active_scan.complete;
+        // Taken BEFORE `units` moves out: the ref census is the work-unit
+        // half's listing of the ref, and it travels to the scan-root report
+        // even on a cycle whose `units` the reconcile then consumes.
+        let ref_census = active_scan.ref_census;
         let units = active_scan.units;
         self.bulk_seed(&units, sink, metrics).await;
         let summary = reconcile_once(
@@ -3450,7 +3638,10 @@ impl LoopState {
         }
         // Plan & prompt library body sync — opt-in, see `BodySync`.
         if let Some(bs) = self.body_sync.as_mut() {
-            bs.run_cycle(&self.conv, metrics).await;
+            // The ref census this cycle's listing produced travels with the
+            // body sync's own work-tree census, so ONE report carries both
+            // sides of the set difference as of ONE cycle.
+            bs.run_cycle(&self.conv, metrics, ref_census).await;
         }
 
         let active_slugs: HashSet<String> = units.iter().map(|u| u.slug.clone()).collect();
@@ -3606,7 +3797,8 @@ fn unknown_bindings_message() -> String {
     format!(
         "plan adapter: coord's binding set for this device is UNKNOWN — no fresh record at \
          {path} — so every coord work-unit read and write is WITHHELD rather than assuming this \
-         device is bound to one tenant. The record is written only by the PRIMARY runner's \
+         device is bound to one tenant (the stem censuses still travel: a listing is not a \
+         coord call). The record is written only by the PRIMARY runner's \
          register heartbeat: a supervisor-spawned secondary or temp runner never writes one \
          (and reads its own storage dir), so this posture is permanent there; on a primary, \
          check machine.json, the active profile's coord_url, and `fleet::heartbeat` warnings"
@@ -3628,8 +3820,10 @@ fn work_unit_write_posture_message(
             "plan adapter: this device is bound to {n} tenants and a plan's owning tenant is not \
              resolvable here — WITHHOLDING every coord work-unit read and write rather than filing \
              units under the default credential's tenant. The plan-library body sync is \
-             unaffected; a session registers its own plan's unit with coord_work_unit_upsert in \
-             its own tenant"
+             unaffected, and so are the stem censuses: this cycle still LISTS the ref (one \
+             `git ls-tree`, no fetch and no blob read) and the work tree, and reports both, so \
+             this device's coverage reading does not go dark. A session registers its own plan's \
+             unit with coord_work_unit_upsert in its own tenant"
         )),
         // `LoopState::tick` logs this posture through its own streak logic (info
         // first, warn once on a second consecutive cycle) and does not call here
@@ -4001,6 +4195,44 @@ pub struct BodySync {
     /// Whether the closed gate has been announced, so it is said once per
     /// body sync rather than every cycle.
     scan_report_gate_announced: bool,
+    /// `source -> digest` of the stem set the web last DELIVERED-AND-STORED
+    /// for that source, so an unchanged set travels as `slugs: null` plus its
+    /// digest instead of ~100 KB of stems on every heartbeat — which is what
+    /// keeps this report a heartbeat.
+    ///
+    /// Emptied whenever the web did NOT store the report (a failure, or a
+    /// `applied: false` that kept a newer reading): withholding a set the web
+    /// does not hold would have it clear that set to UNKNOWN on the digest
+    /// mismatch, which is the integrity property working against us.
+    last_census_digests: HashMap<String, String>,
+}
+
+/// What one cycle can say about the two stem sets, handed to the scan-root
+/// report.
+///
+/// The work-tree side is a DIRECTORY rather than a census because the report
+/// is deliberately sequenced ahead of the body sync's own walk (a paused or
+/// empty cycle is the one that most needs to report), so the enumeration
+/// happens inside the report — and only once the report is actually due.
+#[derive(Debug, Clone, Default)]
+pub struct ScanCensusInputs {
+    /// The REF listing this cycle made. `None` = ABSENT (UNKNOWN), never an
+    /// empty set.
+    pub ref_census: Option<super::body_push::PlanSlugCensus>,
+    /// The plans root to enumerate for the WORK-TREE census. `None` = this
+    /// cycle enumerated nothing, so that side is ABSENT too.
+    pub work_tree_dir: Option<PathBuf>,
+}
+
+impl ScanCensusInputs {
+    /// Both sides ABSENT — what every cycle that enumerated nothing sends.
+    ///
+    /// Named rather than defaulted so each idle call site says out loud that
+    /// it is reporting UNKNOWN, and so a reviewer can see at a glance that no
+    /// idle arm fabricates a zero.
+    pub fn absent() -> Self {
+        Self::default()
+    }
 }
 
 impl BodySync {
@@ -4022,6 +4254,7 @@ impl BodySync {
             last_scan_report_unapplied: false,
             scan_report_gate: scan_report_gate_closed(),
             scan_report_gate_announced: false,
+            last_census_digests: HashMap::new(),
         }
     }
 
@@ -4059,12 +4292,25 @@ impl BodySync {
     /// posting policy as an armed cycle. Without it a device whose plans dir
     /// was cleared goes silent and its last `measured` row is quoted until it
     /// ages out.
-    pub async fn report_while_idle(&mut self, metrics: &AdapterMetrics) {
+    ///
+    /// `censuses` is [`ScanCensusInputs::absent`] at every idle call site, and
+    /// is a PARAMETER rather than an assumption so each of those sites states
+    /// it: an idle cycle enumerated nothing, and nothing enumerated is
+    /// UNKNOWN, never zero.
+    pub async fn report_while_idle(
+        &mut self,
+        metrics: &AdapterMetrics,
+        censuses: ScanCensusInputs,
+    ) {
         if !(self.capture_gate)() {
             return;
         }
-        self.report_scan_root_if_due(Self::current_reading(metrics), std::time::Instant::now())
-            .await;
+        self.report_scan_root_if_due(
+            Self::current_reading(metrics),
+            std::time::Instant::now(),
+            censuses,
+        )
+        .await;
     }
 
     /// Publish this device's scan-root reading to the web read side
@@ -4082,6 +4328,7 @@ impl BodySync {
         &mut self,
         current: Option<ScanDivergence>,
         now: std::time::Instant,
+        censuses: ScanCensusInputs,
     ) {
         // Machine-scoped state: only the instance that owns shared root state
         // publishes it (see `ScanReportGate`). Checked first, on BOTH paths
@@ -4107,8 +4354,42 @@ impl BodySync {
         let Some(current) = current.filter(|_| due) else {
             return;
         };
+        // Enumerated only once the report is DUE: the work-tree listing is a
+        // `read_dir` this cycle would otherwise pay for and throw away.
+        let mut resolved: Vec<super::body_push::PlanSlugCensus> = Vec::new();
+        if let Some(ref_census) = censuses.ref_census {
+            resolved.push(ref_census);
+        }
+        if let Some(dir) = censuses.work_tree_dir {
+            // Small (one `read_dir` of ~1,800 entries) but still synchronous
+            // filesystem work on a runtime built with `worker_threads(1)`, so
+            // it goes to the blocking pool for the same reason the scan does.
+            match spawn_blocking_tracked(move || super::body_push::work_tree_census(&dir)).await {
+                Ok(census) => resolved.extend(census),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "plan library: the work-tree slug census task did not complete; that side \
+                     is reported ABSENT (never an empty set)"
+                ),
+            }
+        }
+        // Withhold a set the web already holds: `slugs: null` plus the digest
+        // that re-asserts it. The web KEEPS its stored set on a digest match
+        // and clears it to UNKNOWN on a mismatch, so this is only ever done
+        // against a digest a previous report is known to have landed.
+        let resolved: Vec<_> = resolved
+            .into_iter()
+            .map(|census| {
+                if self.last_census_digests.get(&census.source) == Some(&census.digest) {
+                    census.withheld()
+                } else {
+                    census
+                }
+            })
+            .collect();
         let report =
-            super::body_push::ScanRootReport::from_divergence(&current, chrono::Utc::now());
+            super::body_push::ScanRootReport::from_divergence(&current, chrono::Utc::now())
+                .with_censuses(resolved);
         match self.reporter.report_scan_root(&report).await {
             Ok(ack) => {
                 // Delivered either way — scheduling treats any 2xx as sent.
@@ -4137,6 +4418,40 @@ impl BodySync {
                     }
                     _ => {}
                 }
+                // REPLACED, never merged: a source this report left out is
+                // stored by the web as UNKNOWN, so a digest kept for it would
+                // re-assert a set the web no longer holds.
+                //
+                // The memory is kept ONLY on a positive, updating store, and
+                // each of the other three arms is a way the web does not hold
+                // the set this digest names:
+                //
+                //  * `applied: Some(false)` — a NEWER reading is stored and
+                //    this one changed nothing.
+                //  * `applied: None` — the body did not say (an older web
+                //    build, an unparseable answer). That is UNKNOWN, and
+                //    UNKNOWN does not get to render as "stored": withholding
+                //    against it bets a set the web may not hold. The
+                //    conservative arm costs one extra full census on an
+                //    ambiguous ack, which is rare by construction
+                //    [policy: `unknown-must-not-render-as-a-default`].
+                //  * `created` anything but `Some(false)` — `Some(true)` is
+                //    the row being INSERTED, and the insert arm stores the
+                //    census verbatim rather than carrying a withheld one
+                //    forward, so a `slugs: null` in THIS report was stored as
+                //    UNKNOWN. `None` is the SAME UNKNOWN as `applied`'s (an
+                //    older web build, an unparseable body) and gets the same
+                //    treatment — not-stored — which is why the spelling is
+                //    `== Some(false)` and not `!= Some(true)`: only a positive
+                //    "this UPDATED an existing row" licenses a withhold.
+                //    Costs nothing in the normal case: a first report already
+                //    has an empty memory.
+                let stored_the_set = ack.applied == Some(true) && ack.created == Some(false);
+                self.last_census_digests = if stored_the_set {
+                    report.census_digests()
+                } else {
+                    HashMap::new()
+                };
                 if self.last_scan_report_failure.take().is_some() {
                     tracing::info!(
                         state = %report.state,
@@ -4184,6 +4499,8 @@ impl BodySync {
                          not count toward its breaker; retrying after the backoff"
                     );
                 }
+                // Nothing landed, so nothing may be withheld next time.
+                self.last_census_digests.clear();
                 self.last_scan_report_failure = Some((failure.kind, now));
             }
         }
@@ -4192,7 +4509,16 @@ impl BodySync {
     /// One body-sync cycle. `metrics` is the reconcile loop's own — the tick
     /// that calls this has just recorded its scan-divergence reading there,
     /// and that reading is what the scan-root report publishes.
-    pub async fn run_cycle(&mut self, conv: &PlanConvention, metrics: &AdapterMetrics) {
+    ///
+    /// `ref_census` is what the work-unit half's ref listing saw this cycle —
+    /// the OTHER side of the coverage question, which only this device holds.
+    /// `None` means no ref was listed, which is ABSENT, never empty.
+    pub async fn run_cycle(
+        &mut self,
+        conv: &PlanConvention,
+        metrics: &AdapterMetrics,
+        ref_census: Option<super::body_push::PlanSlugCensus>,
+    ) {
         let gate_open = (self.capture_gate)();
         if let Some(message) = capture_gate_message(self.last_gate_open, gate_open) {
             tracing::info!(capture_enabled = gate_open, "{message}");
@@ -4207,8 +4533,25 @@ impl BodySync {
         // Those two are exactly the cycles whose corpus is NOT being refreshed
         // — a paused sync, an empty scan — so they are the last ones that
         // should go quiet about the scan source.
-        self.report_scan_root_if_due(Self::current_reading(metrics), std::time::Instant::now())
-            .await;
+        //
+        // The work-tree census is taken of the ACTIVE plans root alone — the
+        // one the reading's `source_repo` names — so the set difference the
+        // web computes stays scoped to a single `source_repo` rather than
+        // mixing the archive and prompts roots into one denominator.
+        let work_tree_dir = self
+            .roots
+            .iter()
+            .find(|r| r.label == super::body_push::PLANS_ROOT_LABEL)
+            .map(|r| r.dir.clone());
+        self.report_scan_root_if_due(
+            Self::current_reading(metrics),
+            std::time::Instant::now(),
+            ScanCensusInputs {
+                ref_census,
+                work_tree_dir,
+            },
+        )
+        .await;
         if self.breaker.should_skip_cycle() {
             return;
         }
@@ -4480,8 +4823,19 @@ mod tests {
         fetch: Result<(), String>,
         /// Phase 2: the canned depth-1 listing of `<ref>:<dir>`.
         ref_dir: Result<Vec<RefDirEntry>, String>,
+        /// Listings keyed by the ref `list_ref_dir` was ASKED for — a name or
+        /// an object id. Consulted before `ref_dir`, so a test can make the
+        /// listing at a resolved sha differ from the listing at the moving ref
+        /// name it resolved from.
+        ref_dir_by_rev: HashMap<String, Result<Vec<RefDirEntry>, String>>,
+        /// Every rev `list_ref_dir` was called with, in order.
+        listed_revs: Mutex<Vec<String>>,
         /// Phase 2: blob id -> its bytes, for `read_blobs`.
         blobs: HashMap<String, Result<String, String>>,
+        /// Panic instead of answering `work_tree_root`. The only way to make
+        /// a `spawn_blocking` scan task fail to JOIN, which is the arm where
+        /// the enumeration did not happen at all.
+        panic_on_work_tree_root: bool,
     }
 
     /// The fixed "now" every pure measurement in this module is taken at.
@@ -4505,7 +4859,10 @@ mod tests {
                 refresh_stamps: vec![Ok(Some(NOW - 60))],
                 fetch: Ok(()),
                 ref_dir: Ok(Vec::new()),
+                ref_dir_by_rev: HashMap::new(),
+                listed_revs: Mutex::new(Vec::new()),
                 blobs: HashMap::new(),
+                panic_on_work_tree_root: false,
             }
         }
 
@@ -4529,6 +4886,10 @@ mod tests {
 
     impl GitRefReader for FakeGit {
         fn work_tree_root(&self, _dir: &Path) -> Result<Option<PathBuf>, String> {
+            assert!(
+                !self.panic_on_work_tree_root,
+                "FakeGit: deliberately panicking so the blocking task fails to join"
+            );
             self.root.clone()
         }
         fn default_ref(&self, _repo_root: &Path) -> Result<String, String> {
@@ -4564,10 +4925,14 @@ mod tests {
         fn list_ref_dir(
             &self,
             _repo_root: &Path,
-            _ref_name: &str,
+            ref_name: &str,
             _rel_dir: &str,
         ) -> Result<Vec<RefDirEntry>, String> {
-            self.ref_dir.clone()
+            self.listed_revs.lock().unwrap().push(ref_name.to_string());
+            self.ref_dir_by_rev
+                .get(ref_name)
+                .cloned()
+                .unwrap_or_else(|| self.ref_dir.clone())
         }
 
         fn read_blobs(&self, _repo_root: &Path, ids: &[String]) -> Vec<Result<String, String>> {
@@ -4695,6 +5060,16 @@ mod tests {
             !got.complete,
             "a blob the listing named but the read could not produce is a GAP"
         );
+        // The CENSUS is the other set: what the listing SAW, `bad.md`
+        // included, because a plan whose blob will not read still EXISTS on
+        // the ref side and must stay in the denominator. `notes.txt` is not a
+        // plan on either.
+        assert_eq!(got.names, vec!["a.md", "b.md", "bad.md"]);
+        assert_eq!(
+            got.ref_sha.as_deref(),
+            Some("a".repeat(40)).as_deref(),
+            "the sha the stems were listed AT, resolved at the listing"
+        );
     }
 
     #[test]
@@ -4783,6 +5158,93 @@ mod tests {
             got.complete,
             "a name that is not a plan is excluded, not skipped — the read is whole"
         );
+        assert_eq!(got.names, vec!["real.md"], "and not in the census either");
+    }
+
+    /// **The census's stems and its `ref_sha` come from ONE resolution.**
+    ///
+    /// `rev_parse` runs FIRST and the listing is addressed by the object id it
+    /// returned. Resolving after the listing, by ref NAME, made them two reads
+    /// of a moving target in two `git` processes: a concurrent `git fetch` in
+    /// the same clone — routine on this fleet's shared checkouts — advances
+    /// `origin/main` between them, and the census then asserts stems listed at
+    /// A under a sha of B. Nothing about the report looks wrong afterwards,
+    /// which is why this needs a test rather than a comment.
+    ///
+    /// The fake answers the sha and the name with DIFFERENT listings, which is
+    /// what a fetch landing between the two calls looks like from in here.
+    ///
+    /// Neuter check: list at `ref_name` again and the stems come back as the
+    /// post-fetch set while `ref_sha` still names the pre-fetch commit.
+    #[test]
+    fn the_ref_listing_is_taken_at_the_resolved_sha_not_at_the_moving_ref_name() {
+        let sha = "a".repeat(40);
+        let git = FakeGit {
+            // What `origin/main` answers AFTER the concurrent fetch.
+            ref_dir: Ok(vec![RefDirEntry {
+                name: "2026-01-02-landed-since.md".into(),
+                id: "id-after".into(),
+            }]),
+            // What the resolved commit holds — the set actually being reported.
+            ref_dir_by_rev: [(
+                sha.clone(),
+                Ok(vec![RefDirEntry {
+                    name: "2026-01-01-at-the-sha.md".into(),
+                    id: "id-at".into(),
+                }]),
+            )]
+            .into_iter()
+            .collect(),
+            blobs: [
+                ("id-at".to_string(), Ok("# at the sha".to_string())),
+                ("id-after".to_string(), Ok("# landed since".to_string())),
+            ]
+            .into_iter()
+            .collect(),
+            ..FakeGit::healthy(0, 0)
+        };
+
+        let got =
+            super::super::ref_scan::read_ref_dir(&git, Path::new("/repo"), "origin/main", "plans")
+                .expect("listing succeeded");
+        assert_eq!(
+            *git.listed_revs.lock().unwrap(),
+            vec![sha.clone()],
+            "the listing is addressed by object id, not by the ref name"
+        );
+        assert_eq!(got.ref_sha.as_deref(), Some(sha.as_str()));
+        assert_eq!(
+            got.names,
+            vec!["2026-01-01-at-the-sha.md"],
+            "the stems are the ones the reported sha holds"
+        );
+        let files: Vec<_> = got.files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(files, vec!["2026-01-01-at-the-sha.md"]);
+    }
+
+    /// A rev that will not resolve leaves `ref_sha` UNKNOWN and still LISTS —
+    /// at the ref name, which is the only address left. The stems are the
+    /// reading; the sha only qualifies it, so losing the qualifier must not
+    /// lose the reading.
+    #[test]
+    fn an_unresolvable_rev_still_lists_at_the_name_with_an_unknown_sha() {
+        let git = FakeGit {
+            revs: HashMap::new(),
+            ref_dir: Ok(vec![RefDirEntry {
+                name: "2026-01-01-plan.md".into(),
+                id: "id-1".into(),
+            }]),
+            blobs: [("id-1".to_string(), Ok("# a plan".to_string()))]
+                .into_iter()
+                .collect(),
+            ..FakeGit::healthy(0, 0)
+        };
+        let got =
+            super::super::ref_scan::read_ref_dir(&git, Path::new("/repo"), "origin/main", "plans")
+                .expect("an unresolvable rev must not fail the listing");
+        assert_eq!(got.ref_sha, None, "UNKNOWN, never a guess");
+        assert_eq!(got.names, vec!["2026-01-01-plan.md"]);
+        assert_eq!(*git.listed_revs.lock().unwrap(), vec!["origin/main"]);
     }
 
     /// **The commit's headline claim, and the one nothing asserted before:**
@@ -4835,6 +5297,18 @@ mod tests {
         assert_eq!(
             tree.units, refd.units,
             "same bytes must parse to the same unit, or the source move churns coord"
+        );
+        // The CENSUS is where the arms deliberately differ: the tree arm
+        // listed no ref, so the ref side is ABSENT — UNKNOWN, never the empty
+        // set, which would claim the default branch holds no plans.
+        assert_eq!(tree.ref_census, None);
+        let census = refd.ref_census.expect("the ref arm listed a ref");
+        assert_eq!(census.source, "ref");
+        assert_eq!(census.count, 1);
+        assert_eq!(
+            census.slugs.as_deref(),
+            Some(["2026-01-01-a-plan".to_string()].as_slice()),
+            "STEMS, not file names — the same identity the corpus is keyed on"
         );
     }
 
@@ -5894,20 +6368,33 @@ mod tests {
     fn read_ref_dir_over_real_git_keeps_markdown_and_an_empty_plan() {
         let tmp = ref_scan_fixture();
         let clone = tmp.path().join("clone");
-        let read =
+        let listing =
             super::super::ref_scan::read_ref_dir(&ProcessGit, &clone, "origin/main", "plans")
                 .expect("a real plans dir reads");
-        assert!(read.complete, "every listed plan blob read");
-        let files = read.files;
-        let names: Vec<_> = files.iter().map(|f| f.name.as_str()).collect();
+        assert!(listing.complete, "every listed plan blob read");
+        let names: Vec<_> = listing.files.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(
             names,
             vec!["2026-01-01-normal.md", "2026-01-02-empty.md"],
             "markdown only, sorted; `.md`, `notes.txt`, the symlink and the subdir are all out"
         );
         assert_eq!(
-            files[1].body, "",
+            listing.files[1].body, "",
             "the empty plan survives with an empty body"
+        );
+        // The CENSUS runs the same filter over the same listing, and names
+        // the sha it was taken at.
+        assert_eq!(
+            listing.names,
+            vec!["2026-01-01-normal.md", "2026-01-02-empty.md"]
+        );
+        assert_eq!(
+            listing.ref_sha,
+            Some(
+                real_git(&clone, &["rev-parse", "origin/main"], None)
+                    .trim()
+                    .to_string()
+            )
         );
     }
 
@@ -5952,10 +6439,9 @@ mod tests {
         real_git(&clone, &["add", "-A"], None);
         real_git(&clone, &["commit", "-q", "-m", "parked"], None);
 
-        let units = read_plans_for_cycle(&plans, &PlanConvention::operator_default(), &ProcessGit)
-            .expect("a healthy clone scans")
-            .units;
-        let slugs: Vec<_> = units.iter().map(|u| u.slug.as_str()).collect();
+        let scan = read_plans_for_cycle(&plans, &PlanConvention::operator_default(), &ProcessGit)
+            .expect("a healthy clone scans");
+        let slugs: Vec<_> = scan.units.iter().map(|u| u.slug.as_str()).collect();
         assert!(
             !slugs.contains(&"2026-01-09-only-on-the-parked-branch"),
             "the parked branch's private plan must NOT reach the corpus: {slugs:?}"
@@ -5963,6 +6449,25 @@ mod tests {
         assert!(
             slugs.contains(&"2026-01-01-normal"),
             "the ref's plans must: {slugs:?}"
+        );
+        // And the census is taken from the same ref, over REAL git: the
+        // parked branch's private plan is absent from it too, and the sha it
+        // was listed at is the ref's own.
+        let census = scan.ref_census.expect("the ref arm listed a ref");
+        let listed = census.slugs.clone().expect("a fresh census carries stems");
+        assert!(
+            !listed.contains(&"2026-01-09-only-on-the-parked-branch".to_string()),
+            "the census is of the REF, not of the parked tree: {listed:?}"
+        );
+        assert!(listed.contains(&"2026-01-01-normal".to_string()));
+        assert_eq!(
+            census.ref_sha,
+            Some(
+                real_git(&clone, &["rev-parse", "origin/main"], None)
+                    .trim()
+                    .to_string()
+            ),
+            "the census names the sha its stems were listed at"
         );
     }
 
@@ -6388,12 +6893,28 @@ mod tests {
     // ---- BodySync's ordering rules, over a recording reporter ----
 
     /// Records every scan-root report it is handed; answers as configured.
-    #[derive(Default)]
     struct FakeReporter {
         sent: Mutex<Vec<super::super::body_push::ScanRootReport>>,
         fail: bool,
-        /// What a delivered report's `applied` says; `None` = `Some(true)`.
-        applied: Mutex<Option<bool>>,
+        /// The whole ack a delivered report gets. `applied: None` and
+        /// `created: None` are the UNKNOWN arms (an older web build, an
+        /// unparseable body) and are settable, because how the body sync
+        /// treats an UNKNOWN ack is itself a property under test.
+        ack: Mutex<super::super::body_push::ScanRootAck>,
+    }
+
+    impl Default for FakeReporter {
+        /// The ordinary answer: stored, onto a row that already existed.
+        fn default() -> Self {
+            Self {
+                sent: Mutex::new(Vec::new()),
+                fail: false,
+                ack: Mutex::new(super::super::body_push::ScanRootAck {
+                    applied: Some(true),
+                    created: Some(false),
+                }),
+            }
+        }
     }
 
     impl FakeReporter {
@@ -6429,9 +6950,7 @@ mod tests {
                     message: format!("report scan root -> 422 {{\"input\": \"attempt {n}\"}}"),
                 })
             } else {
-                Ok(super::super::body_push::ScanRootAck {
-                    applied: Some(self.applied.lock().unwrap().unwrap_or(true)),
-                })
+                Ok(self.ack.lock().unwrap().clone())
             }
         }
     }
@@ -6475,7 +6994,7 @@ mod tests {
         };
         let metrics = metrics_with(measured_with(Ok(Some(NOW - 60)), 2153, 11));
 
-        bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+        bs.run_cycle(&PlanConvention::operator_default(), &metrics, None)
             .await;
 
         assert_eq!(reporter.states(), vec!["measured"]);
@@ -6493,13 +7012,13 @@ mod tests {
         let mut bs = body_sync_reporting_to(reporter.clone(), true);
         let metrics = metrics_with(measured_with(Ok(Some(NOW - 60)), 0, 0));
 
-        bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+        bs.run_cycle(&PlanConvention::operator_default(), &metrics, None)
             .await;
         assert_eq!(reporter.states(), vec!["measured"]);
 
         // And the posting policy holds across cycles: the same reading is not
         // re-sent inside the heartbeat.
-        bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+        bs.run_cycle(&PlanConvention::operator_default(), &metrics, None)
             .await;
         assert_eq!(reporter.states().len(), 1);
     }
@@ -6522,7 +7041,7 @@ mod tests {
         for _ in 0..(TOTAL_FAILURE_CYCLES_BEFORE_PAUSE + 2) {
             // Skip the retry backoff so every cycle really attempts a post.
             bs.last_scan_report_failure = None;
-            bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+            bs.run_cycle(&PlanConvention::operator_default(), &metrics, None)
                 .await;
         }
 
@@ -6602,10 +7121,14 @@ mod tests {
         // elapse — the re-post carries the SECOND reading's instant.
         let reporter = std::sync::Arc::new(FakeReporter::default());
         let mut bs = body_sync_reporting_to(reporter.clone(), true);
-        bs.run_cycle(&PlanConvention::operator_default(), &metrics_with(first))
-            .await;
+        bs.run_cycle(
+            &PlanConvention::operator_default(),
+            &metrics_with(first),
+            None,
+        )
+        .await;
         let later = metrics_with(second);
-        bs.run_cycle(&PlanConvention::operator_default(), &later)
+        bs.run_cycle(&PlanConvention::operator_default(), &later, None)
             .await;
         assert_eq!(
             reporter.states().len(),
@@ -6617,7 +7140,7 @@ mod tests {
             posted,
             std::time::Instant::now() - SCAN_REPORT_HEARTBEAT - Duration::from_secs(1),
         ));
-        bs.run_cycle(&PlanConvention::operator_default(), &later)
+        bs.run_cycle(&PlanConvention::operator_default(), &later, None)
             .await;
         let sent = reporter.sent.lock().unwrap().clone();
         assert_eq!(sent.len(), 2, "the heartbeat re-posted");
@@ -6631,6 +7154,462 @@ mod tests {
         assert_ne!(sent[0].observed_at, sent[1].observed_at);
     }
 
+    // ---- the slug census (plan 2026-09-15-…-a-set-difference, Phase 2) ----
+
+    /// A body sync over one real plans root, so its cycles produce a
+    /// WORK-TREE census of an actual directory.
+    fn body_sync_over(dir: &Path, reporter: std::sync::Arc<FakeReporter>) -> BodySync {
+        BodySync::new(
+            vec![super::super::body_push::ScanRoot::new(
+                dir,
+                super::super::body_push::ScanRootKind::Plans,
+                super::super::body_push::PLANS_ROOT_LABEL,
+            )],
+            super::super::body_push::HttpArtifactSink::new("http://127.0.0.1:9"),
+            std::sync::Arc::new(|| true) as CaptureGate,
+        )
+        .with_reporter(reporter)
+        .with_scan_report_gate(owns_the_machine())
+    }
+
+    fn a_ref_census(stems: &[&str]) -> super::super::body_push::PlanSlugCensus {
+        super::super::body_push::PlanSlugCensus::new(
+            super::super::body_push::SLUG_CENSUS_SOURCE_REF,
+            Some("a".repeat(40)),
+            stems.iter().map(|s| (*s).to_string()),
+        )
+    }
+
+    /// One census per SOURCE, and the census of the side that fills the corpus
+    /// is of the ACTIVE plans root — the one the reading's `source_repo`
+    /// names — so the set difference the web computes stays scoped.
+    #[tokio::test]
+    async fn a_cycle_reports_both_sides_of_the_set_difference() {
+        let dir = one_plan_dir();
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        let mut bs = body_sync_over(dir.path(), reporter.clone());
+        let metrics = metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0));
+
+        bs.run_cycle(
+            &PlanConvention::operator_default(),
+            &metrics,
+            Some(a_ref_census(&[
+                "2026-01-01-one-plan",
+                "2026-01-02-only-on-the-ref",
+            ])),
+        )
+        .await;
+
+        let sent = reporter.sent.lock().unwrap().clone();
+        let censuses = sent[0]
+            .censuses
+            .clone()
+            .expect("both sides were enumerated");
+        assert_eq!(
+            censuses
+                .iter()
+                .map(|c| c.source.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ref", "work_tree"]
+        );
+        assert_eq!(
+            censuses[0].slugs.as_deref(),
+            Some(
+                [
+                    "2026-01-01-one-plan".to_string(),
+                    "2026-01-02-only-on-the-ref".to_string()
+                ]
+                .as_slice()
+            )
+        );
+        // The difference this exists to make computable: the tree is missing
+        // a plan the ref has, and the device says so as two SETS rather than
+        // as a ratio.
+        assert_eq!(
+            censuses[1].slugs.as_deref(),
+            Some(["2026-01-01-one-plan".to_string()].as_slice())
+        );
+        assert_eq!(censuses[1].ref_sha, None, "a tree census names no ref");
+    }
+
+    /// **The withheld-set heartbeat.** ~1,800 stems are ~100 KB and this
+    /// report goes out every cycle, so an UNCHANGED set travels as
+    /// `slugs: null` plus the digest that re-asserts it — and the moment the
+    /// set MOVES, the stems are sent again. Without this, "report the census
+    /// every cycle" would stop being a heartbeat.
+    ///
+    /// Neuter check: drop the `last_census_digests` lookup in
+    /// `report_scan_root_if_due` and the second report carries its stems.
+    #[tokio::test]
+    async fn an_unchanged_census_is_re_asserted_by_digest_not_re_sent() {
+        let dir = one_plan_dir();
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        let mut bs = body_sync_over(dir.path(), reporter.clone());
+        let conv = PlanConvention::operator_default();
+        let refc = || Some(a_ref_census(&["2026-01-01-one-plan"]));
+
+        // 1. First report: both sets in full — the web holds neither yet.
+        bs.run_cycle(
+            &conv,
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0)),
+            refc(),
+        )
+        .await;
+        // 2. The READING moved (so the report is due again) but neither set
+        //    did: both are withheld, digests unchanged.
+        bs.run_cycle(
+            &conv,
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 6, 0)),
+            refc(),
+        )
+        .await;
+        // 3. A plan lands in the tree. The tree digest moves, so those stems
+        //    travel again — while the ref set, still unchanged, stays withheld.
+        std::fs::write(
+            dir.path().join("2026-01-03-new.md"),
+            "# New\n\n> **Status: DRAFT**\n",
+        )
+        .unwrap();
+        bs.run_cycle(
+            &conv,
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 7, 0)),
+            refc(),
+        )
+        .await;
+
+        let sent = reporter.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 3);
+        let census = |i: usize, source: &str| {
+            sent[i]
+                .censuses
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|c| c.source == source)
+                .cloned()
+                .unwrap_or_else(|| panic!("report {i} carries a {source} census"))
+        };
+        assert!(
+            census(0, "ref").slugs.is_some(),
+            "first report sends the set"
+        );
+        assert!(census(0, "work_tree").slugs.is_some());
+
+        assert_eq!(
+            census(1, "ref").slugs,
+            None,
+            "unchanged: withheld, not re-sent"
+        );
+        assert_eq!(census(1, "work_tree").slugs, None);
+        assert_eq!(
+            (census(1, "ref").digest, census(1, "ref").count),
+            (census(0, "ref").digest.clone(), 1),
+            "a withheld set still carries the digest it is re-asserted BY, and its count"
+        );
+
+        assert_eq!(
+            census(2, "work_tree").slugs.as_deref(),
+            Some(
+                [
+                    "2026-01-01-one-plan".to_string(),
+                    "2026-01-03-new".to_string()
+                ]
+                .as_slice()
+            ),
+            "the set MOVED, so it travels in full"
+        );
+        assert_ne!(census(2, "work_tree").digest, census(0, "work_tree").digest);
+        assert_eq!(
+            census(2, "ref").slugs,
+            None,
+            "the other side did not move, and is still withheld"
+        );
+    }
+
+    /// **On the withheld arm, `count` is the EXACT size of the set the digest
+    /// names.** The server verifies the digest but cannot verify the
+    /// `truncated` flag, so it derives truncation as
+    /// `flag or count != <the size of the set it holds>`. A placeholder count
+    /// on this arm — a rounded number, a stale one, and worst of all a `0`,
+    /// which is `< listed` and so derives truncated too — makes the server read
+    /// the census as a FLOOR and take the whole `source_repo`'s coverage block
+    /// to UNKNOWN. It would do that SILENTLY, on the steady-state arm that runs
+    /// on almost every cycle, and nothing on the wire would complain: the
+    /// digest would still verify.
+    ///
+    /// So this asserts the equality the server derives its verdict from,
+    /// against the set the PREVIOUS report actually sent — not against
+    /// `count`'s own provenance, which is what a future refactor would break.
+    ///
+    /// Mutation proof (run 2026-09-17): setting `self.count = 0` inside
+    /// `PlanSlugCensus::withheld` fails this test on `count` while every other
+    /// assertion here — `slugs: None`, the matching digest, `truncated: false`
+    /// — still passes, which is exactly the silence the derived verdict exists
+    /// to catch.
+    #[tokio::test]
+    async fn a_withheld_census_carries_the_exact_size_of_the_set_its_digest_names() {
+        let dir = one_plan_dir();
+        std::fs::write(
+            dir.path().join("2026-01-02-second.md"),
+            "# Second\n\n> **Status: DRAFT**\n",
+        )
+        .unwrap();
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        let mut bs = body_sync_over(dir.path(), reporter.clone());
+        let conv = PlanConvention::operator_default();
+        let refc = || Some(a_ref_census(&["2026-01-01-one-plan", "2026-01-02-second"]));
+
+        bs.run_cycle(
+            &conv,
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0)),
+            refc(),
+        )
+        .await;
+        // The reading moves so the heartbeat is due again; neither SET does.
+        bs.run_cycle(
+            &conv,
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 6, 0)),
+            refc(),
+        )
+        .await;
+
+        let sent = reporter.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2);
+        let census = |i: usize, source: &str| {
+            sent[i]
+                .censuses
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|c| c.source == source)
+                .cloned()
+                .unwrap_or_else(|| panic!("report {i} carries a {source} census"))
+        };
+        for source in ["ref", "work_tree"] {
+            let first = census(0, source);
+            let held = census(1, source);
+            let listed = first
+                .slugs
+                .as_ref()
+                .expect("the first report sent the stems")
+                .len() as u64;
+            assert_eq!(listed, 2, "{source}: the fixture holds two stems");
+            assert_eq!(held.slugs, None, "{source}: the second report withholds");
+            assert_eq!(
+                held.digest, first.digest,
+                "{source}: withheld against the SAME set"
+            );
+            // The assertion the whole clause is about.
+            assert_eq!(
+                held.count, listed,
+                "{source}: a withheld census must carry the exact cardinality of the set its \
+                 digest names — the server derives `truncated` as `flag or count != listed`, so \
+                 any other value silently takes this source_repo's coverage to UNKNOWN"
+            );
+            assert!(
+                !held.truncated,
+                "{source}: and the flag agrees with the derived verdict"
+            );
+            // Stated as the server states it, so this fails on ANY divergence
+            // rather than only on the `count` field being wrong.
+            assert!(
+                !(held.truncated || held.count != listed),
+                "{source}: the server would derive TRUNCATED from this census"
+            );
+        }
+    }
+
+    /// A report the web did NOT store may not be re-asserted by digest: a
+    /// digest MISMATCH clears the stored set to UNKNOWN, so withholding
+    /// against a set the web never took would destroy it. Both ways of not
+    /// being stored — a failure, and a `applied: false` — re-send in full.
+    #[tokio::test]
+    async fn a_report_that_did_not_land_re_sends_the_sets_in_full() {
+        let dir = one_plan_dir();
+        let conv = PlanConvention::operator_default();
+
+        // (a) a delivered report the web DECLINED (it kept a newer reading).
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        reporter.ack.lock().unwrap().applied = Some(false);
+        let mut bs = body_sync_over(dir.path(), reporter.clone());
+        bs.run_cycle(
+            &conv,
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0)),
+            None,
+        )
+        .await;
+        assert!(bs.last_census_digests.is_empty(), "nothing was stored");
+        bs.run_cycle(
+            &conv,
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 6, 0)),
+            None,
+        )
+        .await;
+        let sent = reporter.sent.lock().unwrap().clone();
+        assert!(
+            sent[1].censuses.as_ref().unwrap()[0].slugs.is_some(),
+            "an unapplied report stored no set, so the next sends it in full"
+        );
+
+        // (b) a report that never arrived at all.
+        let failing = std::sync::Arc::new(FakeReporter::failing());
+        let mut bs = body_sync_over(dir.path(), failing.clone());
+        bs.last_census_digests
+            .insert("work_tree".to_string(), "stale".to_string());
+        bs.run_cycle(
+            &conv,
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0)),
+            None,
+        )
+        .await;
+        assert!(
+            bs.last_census_digests.is_empty(),
+            "a failure forgets what it thought the web held"
+        );
+    }
+
+    /// **Idle arm 1 of 3** — `tick`'s no-plans-dir early return (the first
+    /// `report_while_idle` call site; `trigger.rs:2614` when the plan was
+    /// written). Nothing is configured, so nothing was enumerated on either
+    /// side: both censuses ABSENT, never a zero. The web additionally refuses
+    /// any census on a `not_scanning` report, which is the same rule from the
+    /// other end.
+    #[tokio::test]
+    async fn idle_arm_no_plans_dir_reports_both_censuses_absent() {
+        let (_cell, reader) = switchable_paths();
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        let mut state = LoopState::new(
+            reader,
+            Some(super::super::body_push::HttpArtifactSink::new(
+                "http://127.0.0.1:9",
+            )),
+            std::sync::Arc::new(|| true) as CaptureGate,
+        )
+        .with_git(std::sync::Arc::new(FakeGit::healthy(0, 0)))
+        .with_scan_reporter(reporter.clone())
+        .with_scan_report_gate(owns_the_machine());
+
+        state
+            .tick(&FakeSink::default(), &AdapterMetrics::default())
+            .await;
+
+        let sent = reporter.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].state, "not_scanning");
+        assert_eq!(
+            sent[0].censuses, None,
+            "an enumeration that did not run is ABSENT, never an empty set"
+        );
+        assert_eq!(
+            serde_json::to_value(&sent[0]).unwrap()["censuses"],
+            serde_json::Value::Null
+        );
+    }
+
+    /// **Idle arm 2 of 3** — the `Ok(Err(reason))` publish-nothing arm (the
+    /// second `report_while_idle` call site; `trigger.rs:2668` when the plan
+    /// was written). The fetch failed, so the ref was never listed and the
+    /// body sync's own walk never ran. A readable plan is sitting in the dir,
+    /// which makes a fabricated work-tree census tempting and wrong: nothing
+    /// enumerated it this cycle.
+    #[tokio::test]
+    async fn idle_arm_unavailable_scan_source_reports_both_censuses_absent() {
+        let dir = one_plan_dir();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        let mut state = LoopState::new(
+            reader,
+            Some(super::super::body_push::HttpArtifactSink::new(
+                "http://127.0.0.1:9",
+            )),
+            std::sync::Arc::new(|| true) as CaptureGate,
+        )
+        .with_scan_report_gate(owns_the_machine())
+        .with_scan_reporter(reporter.clone())
+        .with_git(std::sync::Arc::new(FakeGit {
+            root: Ok(Some(dir.path().to_path_buf())),
+            fetch: Err("could not reach origin".to_string()),
+            ..FakeGit::healthy(0, 0)
+        }));
+
+        state
+            .tick(&FakeSink::default(), &AdapterMetrics::default())
+            .await;
+
+        let sent = reporter.sent.lock().unwrap().clone();
+        assert_eq!(
+            sent.len(),
+            1,
+            "the cycle that publishes nothing still reports"
+        );
+        assert_eq!(
+            sent[0].censuses, None,
+            "the scan source was unavailable, so NEITHER side was listed"
+        );
+    }
+
+    /// **Idle arm 3 of 3, and the one that matters most** — the `Err(e)`
+    /// scan-task-FAILED arm (the third `report_while_idle` call site;
+    /// `trigger.rs:2697` when the plan was written).
+    ///
+    /// Here the enumeration did not happen AT ALL — the blocking task did not
+    /// complete — so a `count: 0` would not merely be stale, it would be
+    /// FABRICATED: a set nothing on this device ever listed, which the web
+    /// would then store as this device's answer for that side and difference
+    /// against the other.
+    ///
+    /// Mutation proof (run 2026-09-17): making this arm pass a
+    /// `PlanSlugCensus::new(SLUG_CENSUS_SOURCE_REF, None, [])` instead of
+    /// `ScanCensusInputs::absent()` fails this test on the `censuses, None`
+    /// assertion, and reverting restores it.
+    #[tokio::test]
+    async fn idle_arm_failed_scan_task_reports_both_censuses_absent() {
+        let dir = one_plan_dir();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        let metrics = AdapterMetrics::default();
+        let mut state = LoopState::new(
+            reader,
+            Some(super::super::body_push::HttpArtifactSink::new(
+                "http://127.0.0.1:9",
+            )),
+            std::sync::Arc::new(|| true) as CaptureGate,
+        )
+        .with_scan_report_gate(owns_the_machine())
+        .with_scan_reporter(reporter.clone())
+        // A git reader that PANICS is how the `spawn_blocking` scan task
+        // fails to join — the arm's real-world cause (a panicking scan, a
+        // cancelled runtime) rather than a simulated return value.
+        .with_git(std::sync::Arc::new(FakeGit {
+            panic_on_work_tree_root: true,
+            ..FakeGit::healthy(0, 0)
+        }));
+
+        state.tick(&FakeSink::default(), &metrics).await;
+
+        assert_eq!(
+            metrics.snapshot().cycles_total,
+            1,
+            "a cycle that publishes nothing is still a cycle"
+        );
+        let sent = reporter.sent.lock().unwrap().clone();
+        assert_eq!(
+            sent.len(),
+            1,
+            "the failed cycle still reports its scan root"
+        );
+        assert_eq!(
+            sent[0].state, "unknown",
+            "the divergence probe panicked too, and says so rather than guessing"
+        );
+        assert_eq!(
+            sent[0].censuses, None,
+            "the enumeration never RAN — a zero here would be fabricated, not stale"
+        );
+    }
+
     /// A 2xx that says `applied: false` (the web kept a newer reading) is
     /// still DELIVERED for scheduling — not retried, not a failure — and the
     /// episode is tracked so its WARN fires once, clearing when a report is
@@ -6638,11 +7617,11 @@ mod tests {
     #[tokio::test]
     async fn an_unapplied_report_is_delivered_and_tracked_once() {
         let reporter = std::sync::Arc::new(FakeReporter::default());
-        *reporter.applied.lock().unwrap() = Some(false);
+        reporter.ack.lock().unwrap().applied = Some(false);
         let mut bs = body_sync_reporting_to(reporter.clone(), true);
         let metrics = metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0));
 
-        bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+        bs.run_cycle(&PlanConvention::operator_default(), &metrics, None)
             .await;
         assert!(
             bs.last_scan_report.is_some(),
@@ -6655,17 +7634,186 @@ mod tests {
         assert!(bs.last_scan_report_unapplied);
 
         // Inside the heartbeat nothing is re-sent, unapplied or not.
-        bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+        bs.run_cycle(&PlanConvention::operator_default(), &metrics, None)
             .await;
         assert_eq!(reporter.states().len(), 1);
 
         // The next post is applied: the episode ends.
-        *reporter.applied.lock().unwrap() = Some(true);
+        reporter.ack.lock().unwrap().applied = Some(true);
         let changed = metrics_with(measured_with(Ok(Some(NOW - 60)), 6, 0));
-        bs.run_cycle(&PlanConvention::operator_default(), &changed)
+        bs.run_cycle(&PlanConvention::operator_default(), &changed, None)
             .await;
         assert_eq!(reporter.states().len(), 2);
         assert!(!bs.last_scan_report_unapplied);
+    }
+
+    /// One ref census of a fixed set, for the withhold tests below.
+    fn one_ref_census() -> ScanCensusInputs {
+        ScanCensusInputs {
+            ref_census: Some(super::super::body_push::PlanSlugCensus::new(
+                "ref",
+                Some("a".repeat(40)),
+                ["2026-01-01-one".to_string(), "2026-01-02-two".to_string()],
+            )),
+            work_tree_dir: None,
+        }
+    }
+
+    /// The stems of the one census in report `n`, or `None` when it was
+    /// WITHHELD (`slugs: null` beside the digest that re-asserts them).
+    fn sent_slugs(reporter: &FakeReporter, n: usize) -> Option<Vec<String>> {
+        let sent = reporter.sent.lock().unwrap();
+        let censuses = sent[n]
+            .censuses
+            .clone()
+            .expect("the report carries censuses");
+        assert_eq!(censuses.len(), 1);
+        censuses[0].slugs.clone()
+    }
+
+    /// **A report that INSERTED the device's row must not be withheld
+    /// against.**
+    ///
+    /// The web carries a withheld census forward only on its UPDATE arm; an
+    /// INSERT stores what it was sent, so a `slugs: null` landing on a fresh
+    /// row stores the stem set as UNKNOWN. The runner would never re-send it,
+    /// because its own digest memory still matches its own re-enumeration —
+    /// the set would sit at UNKNOWN until a disk change or a restart moved the
+    /// digest. `created` is already on the wire; this reads it.
+    ///
+    /// Neuter check: stop clearing on `created == Some(true)` and the second
+    /// report below goes out withheld, against a row that holds no set.
+    #[tokio::test]
+    async fn a_created_row_is_never_withheld_against() {
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        reporter.ack.lock().unwrap().created = Some(true);
+        let mut bs = body_sync_reporting_to(reporter.clone(), true);
+
+        bs.report_while_idle(
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0)),
+            one_ref_census(),
+        )
+        .await;
+        assert!(
+            sent_slugs(&reporter, 0).is_some(),
+            "the first report always carries the stems"
+        );
+
+        // A changed reading, so the next report is due. The row was CREATED by
+        // the first one, so the set it holds is UNKNOWN and the stems travel
+        // again.
+        bs.report_while_idle(
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 6, 0)),
+            one_ref_census(),
+        )
+        .await;
+        assert_eq!(
+            sent_slugs(&reporter, 1),
+            Some(vec![
+                "2026-01-01-one".to_string(),
+                "2026-01-02-two".to_string()
+            ]),
+            "an insert stores a withheld census as NULL, so the stems must be re-sent"
+        );
+
+        // Once the web is UPDATING the row, the steady state is restored: the
+        // set travels only when it moves.
+        reporter.ack.lock().unwrap().created = Some(false);
+        bs.report_while_idle(
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 7, 0)),
+            one_ref_census(),
+        )
+        .await;
+        assert!(sent_slugs(&reporter, 2).is_some(), "stored, so remembered");
+        bs.report_while_idle(
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 8, 0)),
+            one_ref_census(),
+        )
+        .await;
+        assert_eq!(
+            sent_slugs(&reporter, 3),
+            None,
+            "the withhold still works — this fix must not cost the heartbeat its bandwidth"
+        );
+    }
+
+    /// **An ack that does not say `applied` is UNKNOWN, and UNKNOWN does not
+    /// render as "stored".**
+    ///
+    /// `None` is an older web build or an unparseable body. Withholding
+    /// against it bets the stems on a set the web may not hold, and the losing
+    /// side of that bet is silent: the row keeps a stale set, or none. The
+    /// conservative arm costs one extra full census (~100-200 KB) per
+    /// ambiguous ack [policy: `unknown-must-not-render-as-a-default`].
+    ///
+    /// Neuter check: key the memory off `applied != Some(false)` and the
+    /// second report goes out withheld.
+    #[tokio::test]
+    async fn an_ack_that_does_not_say_applied_does_not_license_a_withhold() {
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        reporter.ack.lock().unwrap().applied = None;
+        reporter.ack.lock().unwrap().created = None;
+        let mut bs = body_sync_reporting_to(reporter.clone(), true);
+
+        bs.report_while_idle(
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0)),
+            one_ref_census(),
+        )
+        .await;
+        bs.report_while_idle(
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 6, 0)),
+            one_ref_census(),
+        )
+        .await;
+        assert_eq!(
+            sent_slugs(&reporter, 1),
+            Some(vec![
+                "2026-01-01-one".to_string(),
+                "2026-01-02-two".to_string()
+            ]),
+            "a delivered-but-unconfirmed report is not evidence the web holds the set"
+        );
+    }
+
+    /// **An ack that does not say `created` is UNKNOWN too — and UNKNOWN is
+    /// not "stored" on this axis either.**
+    ///
+    /// The doc on `ScanRootAck::created` calls `None` "the same UNKNOWN as
+    /// `applied`'s, and is treated the same way — as not-stored". The code
+    /// spelled it `created != Some(true)`, which KEPT the digest memory on
+    /// `None` and withheld the next report's stems against a row that may hold
+    /// none: the last non-conservative cell of the truth table, and the same
+    /// defect as the `applied` one beside it. Only a positive `created: false`
+    /// — "this UPDATED an existing row" — licenses a withhold, because only the
+    /// update arm carries a withheld census forward.
+    ///
+    /// Neuter check: spell it `created != Some(true)` and the second report
+    /// below goes out withheld.
+    #[tokio::test]
+    async fn an_ack_that_does_not_say_created_does_not_license_a_withhold() {
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        reporter.ack.lock().unwrap().applied = Some(true);
+        reporter.ack.lock().unwrap().created = None;
+        let mut bs = body_sync_reporting_to(reporter.clone(), true);
+
+        bs.report_while_idle(
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0)),
+            one_ref_census(),
+        )
+        .await;
+        bs.report_while_idle(
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 6, 0)),
+            one_ref_census(),
+        )
+        .await;
+        assert_eq!(
+            sent_slugs(&reporter, 1),
+            Some(vec![
+                "2026-01-01-one".to_string(),
+                "2026-01-02-two".to_string()
+            ]),
+            "a report that does not say whether it INSERTED is not evidence the web holds the set"
+        );
     }
 
     /// Only the instance that owns the machine's shared state publishes its
@@ -6684,9 +7832,10 @@ mod tests {
         let mut bs = body_sync_reporting_to(reporter.clone(), true).with_scan_report_gate(gate);
         let metrics = metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0));
 
-        bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+        bs.run_cycle(&PlanConvention::operator_default(), &metrics, None)
             .await;
-        bs.report_while_idle(&metrics).await;
+        bs.report_while_idle(&metrics, ScanCensusInputs::absent())
+            .await;
         assert!(
             reporter.states().is_empty(),
             "a secondary publishes nothing, on either path"
@@ -6694,7 +7843,7 @@ mod tests {
         assert!(bs.scan_report_gate_announced, "and says why, once");
 
         owns.store(true, Ordering::SeqCst);
-        bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+        bs.run_cycle(&PlanConvention::operator_default(), &metrics, None)
             .await;
         assert_eq!(
             reporter.states(),
@@ -6711,9 +7860,11 @@ mod tests {
         )
         .with_reporter(silent.clone());
         unconfigured
-            .run_cycle(&PlanConvention::operator_default(), &metrics)
+            .run_cycle(&PlanConvention::operator_default(), &metrics, None)
             .await;
-        unconfigured.report_while_idle(&metrics).await;
+        unconfigured
+            .report_while_idle(&metrics, ScanCensusInputs::absent())
+            .await;
         assert!(silent.states().is_empty());
     }
 
@@ -6772,11 +7923,11 @@ mod tests {
     #[tokio::test]
     async fn the_body_sync_reposts_an_unapplied_reading_after_the_retry_interval() {
         let reporter = std::sync::Arc::new(FakeReporter::default());
-        *reporter.applied.lock().unwrap() = Some(false);
+        reporter.ack.lock().unwrap().applied = Some(false);
         let mut bs = body_sync_reporting_to(reporter.clone(), true);
         let metrics = metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0));
 
-        bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+        bs.run_cycle(&PlanConvention::operator_default(), &metrics, None)
             .await;
         assert_eq!(reporter.states().len(), 1);
         let (posted, _) = bs.last_scan_report.take().unwrap();
@@ -6784,7 +7935,7 @@ mod tests {
             posted,
             std::time::Instant::now() - SCAN_REPORT_RETRY_AFTER_FAILURE - Duration::from_secs(1),
         ));
-        bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+        bs.run_cycle(&PlanConvention::operator_default(), &metrics, None)
             .await;
         assert_eq!(reporter.states().len(), 2, "re-posted on the 5-min cadence");
     }
@@ -6795,9 +7946,10 @@ mod tests {
         let reporter = std::sync::Arc::new(FakeReporter::default());
         let mut bs = body_sync_reporting_to(reporter.clone(), false);
         let metrics = metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0));
-        bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+        bs.run_cycle(&PlanConvention::operator_default(), &metrics, None)
             .await;
-        bs.report_while_idle(&metrics).await;
+        bs.report_while_idle(&metrics, ScanCensusInputs::absent())
+            .await;
         assert!(reporter.states().is_empty());
     }
 
@@ -9814,6 +10966,117 @@ mod tests {
             "the active plan and the archive stamp both push when single-bound"
         );
         assert_eq!(metrics.snapshot().work_unit_writes_withheld_total, 0);
+    }
+
+    /// **A WITHHELD cycle still LISTS the ref, and still reports both stem
+    /// censuses.**
+    ///
+    /// The posture withholds coord work-unit reads and writes. A `git ls-tree`
+    /// is neither, and the cost objection that justifies skipping the SCAN —
+    /// ~1,100 blob reads to discard — does not reach a listing that reads no
+    /// blob at all.
+    ///
+    /// Withholding the census with them made it permanently dark on exactly
+    /// the device that holds BOTH sides of the coverage question: a posture is
+    /// a STANDING property (here the operator box's own shape — two local
+    /// bindings, no coord record — which is `WithheldMultiBound` on every tick
+    /// forever), so "not this cycle" meant "not ever". Worse, the first such
+    /// cycle CLEARED the stems the web already held, because a report whose
+    /// `censuses` omits a source stores that source as NULL.
+    ///
+    /// The fake's `fetch` is `Err`: the census reads the tracking ref this
+    /// clone already holds, so a failing fetch must not reach it — which also
+    /// proves no fetch sits on this path.
+    ///
+    /// Neuter check: hand `run_cycle` a `None` ref census on the withheld arm
+    /// (main's behaviour) and the REF assertion below fails.
+    #[tokio::test]
+    async fn a_withheld_cycle_still_lists_the_ref_stem_census() {
+        let dir = one_plan_dir();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut state = LoopState::new(
+            reader,
+            Some(super::super::body_push::HttpArtifactSink::new(
+                "http://127.0.0.1:9",
+            )),
+            std::sync::Arc::new(|| true) as CaptureGate,
+        )
+        .with_scan_report_gate(owns_the_machine())
+        .with_scan_reporter(reporter.clone())
+        .with_binding_count(2, None)
+        .with_git(std::sync::Arc::new(FakeGit {
+            root: Ok(Some(dir.path().to_path_buf())),
+            fetch: Err("a census-only listing must never fetch".to_string()),
+            ref_dir: Ok(vec![
+                // Out of order, and with a non-plan entry, so the census's own
+                // predicate and sort are what produce the answer.
+                RefDirEntry {
+                    name: "2026-01-02-two.md".to_string(),
+                    id: "blob-two".to_string(),
+                },
+                RefDirEntry {
+                    name: "2026-01-01-one.md".to_string(),
+                    id: "blob-one".to_string(),
+                },
+                RefDirEntry {
+                    name: "README.txt".to_string(),
+                    id: "blob-readme".to_string(),
+                },
+            ]),
+            ..FakeGit::healthy(3, 0)
+        }));
+
+        state.tick(&sink, &metrics).await;
+
+        // Still withheld: not one coord work-unit call, on any route.
+        assert_eq!(*sink.upsert_calls.lock().unwrap(), 0, "no upsert");
+        assert_eq!(
+            *sink.list_statuses_calls.lock().unwrap(),
+            0,
+            "no bulk seed read"
+        );
+        assert_eq!(
+            *sink.current_status_calls.lock().unwrap(),
+            0,
+            "no per-slug read"
+        );
+        assert!(sink.deps_calls.lock().unwrap().is_empty(), "no deps call");
+        assert_eq!(*sink.transitions.lock().unwrap(), 0);
+        assert_eq!(metrics.snapshot().work_unit_writes_withheld_total, 1);
+
+        let sent = reporter.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "the withheld cycle still reports");
+        let censuses = sent[0]
+            .censuses
+            .clone()
+            .expect("a withheld cycle enumerated both sides, so it carries censuses");
+        let ref_census = censuses
+            .iter()
+            .find(|c| c.source == super::super::body_push::SLUG_CENSUS_SOURCE_REF)
+            .expect("the REF side is a READING on a withheld cycle, not ABSENT");
+        assert_eq!(
+            ref_census.slugs,
+            Some(vec![
+                "2026-01-01-one".to_string(),
+                "2026-01-02-two".to_string()
+            ]),
+            "the `*.md` entries at the ref, sorted — and nothing else"
+        );
+        assert_eq!(
+            ref_census.ref_sha,
+            Some("a".repeat(40)),
+            "listed AT the resolved object id, and saying so"
+        );
+        assert!(
+            censuses
+                .iter()
+                .any(|c| c.source == super::super::body_push::SLUG_CENSUS_SOURCE_WORK_TREE),
+            "and the work-tree side travels with it: {censuses:?}"
+        );
     }
 
     /// An UNKNOWN coord binding set does not fall open to the local slot count

@@ -620,7 +620,7 @@ pub fn scan_roots(
             out.push(root);
         }
     };
-    push(plans_dir, ScanRootKind::Plans, "plans");
+    push(plans_dir, ScanRootKind::Plans, PLANS_ROOT_LABEL);
     push(archive_dir, ScanRootKind::Plans, "plans/archive");
     push(prompts_dir, ScanRootKind::Prompts, "prompts");
     out
@@ -633,6 +633,204 @@ pub struct SkippedFile {
     pub reason: &'static str,
 }
 
+/// One root's depth-1 entries, split the way [`scan_one_root`] splits them.
+///
+/// Both lists are sorted: `read_dir` order is filesystem-dependent, and a
+/// dry-run report has to be reproducible across runs and machines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RootListing {
+    /// The `*.md` files the scan will read.
+    files: Vec<PathBuf>,
+    /// Subdirectories, which are NOT descended into (the roots are flat,
+    /// matching [`super::trigger::read_plan_dir`]) — but they are RECORDED,
+    /// because a dry-run that silently omits them reads as "there is nothing
+    /// there" when the truth is "this was never looked at". Absence of a
+    /// report is not a report of absence.
+    subdirs: Vec<PathBuf>,
+    /// At least one entry of this directory that COULD have been a plan was
+    /// not read or classified — a `read_dir` iteration error (where the name
+    /// itself is unknown, so nothing can be ruled out), or metadata that would
+    /// not load for a `*.md` name.
+    ///
+    /// Scoped to entries that could be stems because the flag's only job is to
+    /// say whether the `*.md` set is a floor. A dangling symlink named
+    /// `notes.txt` is a PERMANENT metadata failure that could never have
+    /// changed that set, and letting it raise this flag put the census ABSENT
+    /// forever with no way back.
+    ///
+    /// Both lists above are then FLOORS rather than the whole directory, and
+    /// the two consumers part company on that: the scan publishes what it
+    /// could read (a partial corpus is still a corpus), while the work-tree
+    /// SLUG CENSUS reports ABSENT, because a census is an assertion about a
+    /// whole SET and a floor presented as a set under-reports the coverage
+    /// denominator — silently, with `count == len(slugs)` and
+    /// `truncated: false` [policy: `unknown-must-not-render-as-a-default`].
+    entries_errored: bool,
+}
+
+/// What one directory entry is, as far as this walk cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryKind {
+    Dir,
+    File,
+    /// Neither — a socket, a fifo, a device node. An ANSWER rather than a
+    /// failure, so it belongs in no list and taints nothing.
+    Other,
+}
+
+/// Whether a path's NAME could carry a plan stem — `extension() == "md"`,
+/// matching [`super::trigger::read_plan_dir`].
+///
+/// A NAME test, deliberately: `read_dir` hands the name over before any
+/// further syscall, so this answer survives the metadata read failing. That is
+/// what lets [`collect_listing`] decide whether a failed entry could ever have
+/// joined the stem set.
+fn could_be_a_stem(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("md")
+}
+
+/// Classify one entry the way `Path::is_dir` / `Path::is_file` do — FOLLOWING
+/// links — but returning the metadata error instead of swallowing it into a
+/// `false` that would land the entry in neither list, unreported.
+fn classify_entry(path: &Path) -> std::io::Result<EntryKind> {
+    let meta = std::fs::metadata(path)?;
+    Ok(if meta.is_dir() {
+        EntryKind::Dir
+    } else if meta.is_file() {
+        EntryKind::File
+    } else {
+        EntryKind::Other
+    })
+}
+
+/// Enumerate one root, depth 1.
+///
+/// Factored out of [`scan_one_root`] because the WORK-TREE slug census has to
+/// be exactly *what the scanner could see*: [`work_tree_census`] reads the set
+/// from HERE rather than re-deriving the `*.md` predicate, so the census and
+/// the scan cannot drift into two different answers about one directory.
+///
+/// `Err` is the directory read failing — which is UNKNOWN, not an empty
+/// directory, and the two callers keep that split. A PER-ENTRY failure is the
+/// same distinction one level down, and is reported through
+/// [`RootListing::entries_errored`] rather than through this `Result`: the
+/// directory did open, and what it yielded is a FLOOR. See [`collect_listing`].
+fn enumerate_root(dir: &Path) -> std::io::Result<RootListing> {
+    let entries = std::fs::read_dir(dir)?;
+    Ok(collect_listing(
+        dir,
+        entries.map(|e| e.map(|e| e.path())),
+        &classify_entry,
+    ))
+}
+
+/// The half of [`enumerate_root`] that runs after `read_dir` itself succeeded:
+/// classify each entry, and RECORD that any of them failed.
+///
+/// `read_dir` succeeding says only that the directory opened. Each entry is a
+/// separate syscall that can fail on its own — a transient Windows sharing
+/// violation, a permission blip, a mount hiccup — and so is the metadata read
+/// that decides whether an entry is a file or a directory. An entry failing
+/// either one is invisible to both lists, so a listing that did not record the
+/// failure would present a FLOOR as a complete reading, and a census built on
+/// it would assert `count == len(slugs)`, `truncated: false` for a directory it
+/// only partly saw. In the limit — every entry erroring — that is
+/// `count: 0, truncated: false`: a fabricated zero, reached without passing
+/// through any of the idle arms [policy: `unknown-must-not-render-as-a-default`].
+///
+/// Injecting `entries` and `classify` is what puts those arms under test: a
+/// test can create files, and cannot create a directory entry that errors.
+///
+/// The shared-construction property [`work_tree_census`] relies on survives the
+/// split, because it is about the PREDICATE — which paths count as plans — and
+/// both callers still take that from here. Error TOLERANCE is a separate axis,
+/// and the two callers are deliberately different on it.
+fn collect_listing<I>(
+    dir: &Path,
+    entries: I,
+    classify: &dyn Fn(&Path) -> std::io::Result<EntryKind>,
+) -> RootListing
+where
+    I: IntoIterator<Item = std::io::Result<PathBuf>>,
+{
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut subdirs: Vec<PathBuf> = Vec::new();
+    let mut entries_errored = false;
+    for entry in entries {
+        let path = match entry {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    error = %e,
+                    "plan library: a directory entry could not be read; this root's listing is a \
+                     FLOOR, not the whole directory"
+                );
+                entries_errored = true;
+                continue;
+            }
+        };
+        match classify(&path) {
+            Ok(EntryKind::Dir) => subdirs.push(path),
+            Ok(EntryKind::File) => {
+                if could_be_a_stem(&path) {
+                    files.push(path);
+                }
+            }
+            Ok(EntryKind::Other) => {}
+            // NARROWED on purpose: only an entry that could be a stem may
+            // poison the listing.
+            //
+            // `classify` FOLLOWS links, so a dangling symlink — and any
+            // permanently unreadable entry — answers `Err(NotFound)` every
+            // cycle. That is a knowable, standing answer, not a blip. Letting
+            // `notes.txt` or a broken link taint the listing sent this side
+            // ABSENT forever, with no recovery short of operator action, over
+            // an entry that could never have joined the `*.md` stem set the
+            // census is about.
+            //
+            // The test is on the NAME, which `read_dir` already handed us and
+            // which no failing syscall can take away. An entry whose name
+            // COULD be a stem is still unknown in kind (a directory named
+            // `x.md` is not a plan), so it still taints: in doubt, ABSENT.
+            // The `read_dir` ITERATION error above is different again and
+            // taints unconditionally — there not even the name is known, so
+            // nothing can be ruled out.
+            //
+            // Cost of the narrowing, stated: a non-`*.md` entry that fails to
+            // classify no longer raises `entries_errored`, so `scan_listing`
+            // files no `unreadable_entry` skip for it either. It is logged at
+            // debug and nothing else, which is the right weight for an entry
+            // the scanner would have ignored had it read cleanly.
+            Err(e) if !could_be_a_stem(&path) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %e,
+                    "plan library: a directory entry's metadata could not be read; its name is \
+                     not a `*.md` one, so it could not have been a plan and this root's listing \
+                     is NOT a floor"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "plan library: a directory entry's metadata could not be read, so it counts \
+                     as neither a file nor a subdirectory; this root's listing is a FLOOR"
+                );
+                entries_errored = true;
+            }
+        }
+    }
+    files.sort();
+    subdirs.sort();
+    RootListing {
+        files,
+        subdirs,
+        entries_errored,
+    }
+}
+
 /// Read + classify every `*.md` in one root (non-recursive, matching the flat
 /// layout [`super::trigger::read_plan_dir`] already assumes). A missing dir
 /// yields nothing; per-file IO errors are collected, never fatal.
@@ -641,8 +839,8 @@ pub fn scan_one_root(
     conv: &PlanConvention,
     skipped: &mut Vec<SkippedFile>,
 ) -> Vec<ScannedArtifact> {
-    let entries = match std::fs::read_dir(&root.dir) {
-        Ok(e) => e,
+    let listing = match enumerate_root(&root.dir) {
+        Ok(listing) => listing,
         Err(e) => {
             tracing::warn!(
                 dir = %root.dir.display(),
@@ -656,25 +854,34 @@ pub fn scan_one_root(
             return Vec::new();
         }
     };
-    let mut out = Vec::new();
-    // `read_dir` order is filesystem-dependent; sort so a dry-run report is
-    // reproducible across runs and machines.
-    let mut paths: Vec<PathBuf> = Vec::new();
-    // Subdirectories are NOT descended into (the roots are flat, matching
-    // `super::trigger::read_plan_dir`) — but they are RECORDED, because a
-    // dry-run that silently omits them reads as "there is nothing there" when
-    // the truth is "this was never looked at". Absence of a report is not a
-    // report of absence.
-    let mut subdirs: Vec<PathBuf> = Vec::new();
-    for path in entries.flatten().map(|e| e.path()) {
-        if path.is_dir() {
-            subdirs.push(path);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("md") && path.is_file() {
-            paths.push(path);
-        }
+    scan_listing(root, listing, conv, skipped)
+}
+
+/// [`scan_one_root`] over an already-taken listing.
+///
+/// Split out so the PARTIAL-listing arm is reachable from a test — and so the
+/// deliberate asymmetry with [`work_tree_census`] is stated where both halves
+/// can be read together. An entry this listing could not read is recorded as a
+/// skip and the scan continues: what it could read is still worth publishing,
+/// and unlike a census the corpus walk makes no claim to be a complete set.
+fn scan_listing(
+    root: &ScanRoot,
+    listing: RootListing,
+    conv: &PlanConvention,
+    skipped: &mut Vec<SkippedFile>,
+) -> Vec<ScannedArtifact> {
+    let RootListing {
+        files,
+        subdirs,
+        entries_errored,
+    } = listing;
+    if entries_errored {
+        skipped.push(SkippedFile {
+            path: root.dir.to_string_lossy().to_string(),
+            reason: "unreadable_entry",
+        });
     }
-    paths.sort();
-    subdirs.sort();
+    let mut out = Vec::new();
     for dir in subdirs {
         skipped.push(SkippedFile {
             path: dir.to_string_lossy().to_string(),
@@ -682,7 +889,7 @@ pub fn scan_one_root(
         });
     }
 
-    for path in paths {
+    for path in files {
         let path_str = path.to_string_lossy().to_string();
         let body = match std::fs::read_to_string(&path) {
             Ok(b) => b,
@@ -1403,15 +1610,38 @@ pub struct ScanRootAck {
     /// and kept it — this report was delivered but not stored. `None`: the
     /// body did not say (an older web build, or an unparseable body).
     pub applied: Option<bool>,
+    /// `Some(true)`: this report INSERTED the device's row rather than
+    /// updating one.
+    ///
+    /// It matters because the two arms store a WITHHELD census differently.
+    /// The carry-forward that turns `slugs: null` back into the stored set
+    /// only runs on the update arm; an insert stores the census verbatim, so a
+    /// withheld one lands as NULL — the stem set stored as UNKNOWN. The runner
+    /// would never re-send it, because its own memory still matches its own
+    /// re-enumeration, and the set would stay UNKNOWN until a disk change or a
+    /// restart moved the digest. So an insert CLEARS the digest memory: the
+    /// next report carries the stems in full.
+    ///
+    /// `None` is the same UNKNOWN as `applied`'s, and is treated the same way
+    /// — as not-stored — by [`super::trigger::BodySync`].
+    pub created: Option<bool>,
 }
 
 impl ScanRootAck {
-    /// Read `applied` out of the web's `{created, applied, row}` answer.
+    /// Read `applied` and `created` out of the web's `{created, applied, row}`
+    /// answer.
     pub fn from_body(body: &str) -> Self {
-        let applied = serde_json::from_str::<serde_json::Value>(body)
-            .ok()
-            .and_then(|v| v.get("applied").and_then(serde_json::Value::as_bool));
-        Self { applied }
+        let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+        let flag = |key: &str| {
+            parsed
+                .as_ref()
+                .and_then(|v| v.get(key))
+                .and_then(serde_json::Value::as_bool)
+        };
+        Self {
+            applied: flag("applied"),
+            created: flag("created"),
+        }
     }
 }
 
@@ -1474,6 +1704,15 @@ pub struct ScanRootReport {
     /// when it was posted. A heartbeat re-post of an unchanged reading sends
     /// the latest tick's measurement, so this ages honestly either way.
     pub observed_at: String,
+    /// The stem listings this cycle enumerated — at most one per source.
+    ///
+    /// `None` (an explicit `null` on the wire, per this struct's discipline)
+    /// is the same state as `[]` to the web door, and it is what an IDLE or
+    /// FAILED cycle sends: an enumeration that did not run is ABSENT, never a
+    /// zero. A `not_scanning` report may carry none at all, and
+    /// [`ScanRootReport::with_censuses`] enforces that rather than letting the
+    /// web refuse the whole report.
+    pub censuses: Option<Vec<PlanSlugCensus>>,
 }
 
 // The web door's field limits (`app/schemas/plan_library_scan_roots.py`,
@@ -1488,6 +1727,24 @@ const SCAN_ROOT_DETAIL_MAX_CHARS: usize = 4096;
 const SCAN_ROOT_SHA_MAX_CHARS: usize = 64;
 /// PostgreSQL BIGINT ceiling — the web's range for every count.
 const SCAN_ROOT_COUNT_MAX: u64 = i64::MAX as u64;
+
+// The slug census's own limits, from the same landed schema
+// (`SLUG_CENSUS_MAX`, `SLUG_CENSUS_MAX_PER_REPORT`, `_SLUG_MAX`). Same
+// consequence as every limit above: a census over one of them is a 422 for
+// the WHOLE report, forever, so the projection fits itself inside them.
+
+/// The most stems one census may carry on the wire (`SLUG_CENSUS_MAX`). Past
+/// it the sorted PREFIX is sent and `truncated` says so.
+const SCAN_ROOT_CENSUS_SLUG_MAX: usize = 5000;
+
+/// The most censuses one report may carry (`SLUG_CENSUS_MAX_PER_REPORT`) —
+/// one per source, and the web 422s a repeated `source`.
+const SCAN_ROOT_CENSUS_MAX_PER_REPORT: usize = 2;
+
+/// The per-stem CHARACTER cap (`_SLUG_MAX`). **512, not 255**: the web's 255
+/// is `work_unit_slug`'s bound on a DIFFERENT column, and the artifact
+/// `slug` the census lists is capped at 512.
+const SCAN_ROOT_CENSUS_STEM_MAX_CHARS: usize = 512;
 
 /// The marker a capped field ends with, inside its limit.
 const SCAN_ROOT_TRUNCATED_MARKER: &str = "…[truncated]";
@@ -1505,6 +1762,229 @@ fn cap_chars(value: Option<String>, max: usize) -> Option<String> {
         out.push_str(SCAN_ROOT_TRUNCATED_MARKER);
         out
     })
+}
+
+// ----------------------------------------------------------------------------
+// The slug census — plan
+// `2026-09-15-captured-vs-authored-coverage-is-a-set-difference`, Phase 2
+// ----------------------------------------------------------------------------
+
+/// The `ref` side: the stems the adapter's WORK-UNIT half lists at the fetched
+/// default branch ([`super::ref_scan::read_ref_dir`]).
+pub const SLUG_CENSUS_SOURCE_REF: &str = "ref";
+
+/// The `work_tree` side: the stems the BODY SYNC's own walk sees on disk
+/// ([`scan_one_root`]) — the half that actually fills the corpus, and the one
+/// the coverage question is really about.
+pub const SLUG_CENSUS_SOURCE_WORK_TREE: &str = "work_tree";
+
+/// The label [`scan_roots`] gives the ACTIVE plans dir, which is the root the
+/// scan-root report describes (its `source_repo` is that dir's). The
+/// work-tree census is taken of THAT root, not of the archive or prompts
+/// roots, so the set difference the web computes stays scoped to one
+/// `source_repo`.
+pub const PLANS_ROOT_LABEL: &str = "plans";
+
+/// The census digest, defined to match the web's `slug_census_digest` byte for
+/// byte: `sha256` over the stems **sorted and joined with a single `\n`**, no
+/// trailing newline, UTF-8.
+///
+/// `stems` must already be sorted — Rust's `[String]::sort` is byte order over
+/// UTF-8, which is code-point order, which is what Python's `sorted()` gives
+/// the other side.
+///
+/// It covers the stems **as sent**: a truncated census digests the prefix it
+/// transmitted, not the set it enumerated, because the digest is what the web
+/// re-computes to verify exactly what it stored.
+pub fn slug_census_digest(stems: &[String]) -> String {
+    let mut hasher = Sha256::new();
+    for (i, stem) in stems.iter().enumerate() {
+        if i > 0 {
+            hasher.update(b"\n");
+        }
+        hasher.update(stem.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// One side's plan-stem listing, as the device that scans enumerated it.
+///
+/// This is the DENOMINATOR the plan corpus has never had: every shipped
+/// capture surface counts a numerator, so "of the plans that exist, how many
+/// did the corpus capture?" has only ever been answered by ratios off a single
+/// git ref — which have read 76.5% and 101.8% for the same corpus. Two sets
+/// joined by `source_repo` make it a SET DIFFERENCE instead.
+///
+/// Three rules this type enforces rather than asserts, because the web 422s
+/// each of them and a 422 here mutes this device forever (the body is built
+/// from its configuration, so it is refused on every attempt):
+///
+/// 1. `digest` is [`slug_census_digest`] over `slugs` **as sent**.
+/// 2. `truncated` is true exactly when `count` exceeds the stems sent — the
+///    set is then a FLOOR in the sense `counts_are_floors` already means on
+///    this report: membership proves existence, absence proves nothing. No
+///    second word is minted for it.
+/// 3. `slugs: None` is NOT "no stems". It is *"unchanged since my last report,
+///    and `digest` says which set I mean"* — see [`Self::withheld`]. A census
+///    that did not happen is ABSENT from the report entirely; `count: 0` is
+///    the claim that the side really holds no plans, which is a reading.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PlanSlugCensus {
+    /// [`SLUG_CENSUS_SOURCE_REF`] or [`SLUG_CENSUS_SOURCE_WORK_TREE`]. At most
+    /// one census per source per report.
+    pub source: String,
+    /// What the ref pointed at when a `ref` census was listed. `None` for a
+    /// `work_tree` census, whose HEAD the report already carries as
+    /// `head_sha` — and `None` too when the rev would not resolve, which is
+    /// UNKNOWN: the stems were still listed.
+    pub ref_sha: Option<String>,
+    /// How many stems the device ENUMERATED on this side — exact, and not
+    /// bounded by [`SCAN_ROOT_CENSUS_SLUG_MAX`]. When `truncated` it exceeds
+    /// `slugs.len()`: it is the SET that is a floor, not this number.
+    pub count: u64,
+    /// [`slug_census_digest`] of the stems as sent. Required even when the
+    /// stems are withheld — it is what a withheld set is re-asserted BY.
+    pub digest: String,
+    /// The stems, SORTED. `None` = withheld, not empty.
+    pub slugs: Option<Vec<String>>,
+    pub truncated: bool,
+}
+
+impl PlanSlugCensus {
+    /// Build a census from the stems one side ENUMERATED, in any order.
+    ///
+    /// Everything the web would refuse is repaired here rather than sent to be
+    /// refused, and every repair moves `count` above the stems sent, so the
+    /// census honestly reads as a FLOOR:
+    ///
+    /// * an empty stem, or one over [`SCAN_ROOT_CENSUS_STEM_MAX_CHARS`], is
+    ///   DROPPED rather than capped — a capped stem is a different stem, and
+    ///   inventing a member of a set is worse than under-reporting it;
+    /// * duplicates collapse, because a census is a SET (the web 422s a
+    ///   repeat);
+    /// * past [`SCAN_ROOT_CENSUS_SLUG_MAX`] the sorted PREFIX is sent.
+    pub fn new(
+        source: &str,
+        ref_sha: Option<String>,
+        stems: impl IntoIterator<Item = String>,
+    ) -> Self {
+        let mut enumerated: u64 = 0;
+        let mut kept: Vec<String> = Vec::new();
+        for stem in stems {
+            enumerated = enumerated.saturating_add(1);
+            if stem.is_empty() || stem.chars().count() > SCAN_ROOT_CENSUS_STEM_MAX_CHARS {
+                continue;
+            }
+            kept.push(stem);
+        }
+        // Sorted BEFORE the truncation, so the prefix sent is the sorted one
+        // the web documents — and sorted is also the order the digest is over.
+        kept.sort();
+        kept.dedup();
+        kept.truncate(SCAN_ROOT_CENSUS_SLUG_MAX);
+        let digest = slug_census_digest(&kept);
+        Self {
+            source: source.to_string(),
+            // An object id is 40 or 64 hex chars; a longer one is not one, and
+            // a truncated sha would be a DIFFERENT (wrong) id — the same rule
+            // the report's own `ref_sha` follows.
+            ref_sha: ref_sha.filter(|sha| sha.chars().count() <= SCAN_ROOT_SHA_MAX_CHARS),
+            truncated: (kept.len() as u64) < enumerated,
+            count: enumerated.min(SCAN_ROOT_COUNT_MAX),
+            digest,
+            slugs: Some(kept),
+        }
+    }
+
+    /// The same census with its stems WITHHELD: `slugs: null` beside the
+    /// digest that re-asserts them.
+    ///
+    /// ~1,800 stems are ~100 KB and this report is a per-cycle heartbeat, so
+    /// the set travels only when it MOVES. The web keeps its stored set when
+    /// the digest matches and **clears it to UNKNOWN when it does not** — that
+    /// asymmetry is the integrity property, and it is why the caller may only
+    /// withhold against a digest it knows was stored.
+    ///
+    /// **`count` and `truncated` are carried through UNTOUCHED, and that is
+    /// load-bearing rather than incidental.** The server verifies the digest
+    /// but cannot verify the `truncated` flag, so it DERIVES truncation as
+    /// `flag or count != <size of the set it holds>`. A placeholder here — a
+    /// rounded number, a stale count, and worst of all a `0` — therefore reads
+    /// as a truncated census, and a truncated census is a FLOOR, which takes
+    /// the whole `source_repo`'s coverage block to UNKNOWN. Silently, and on
+    /// the steady-state arm that runs on almost every cycle.
+    ///
+    /// The invariant that keeps it honest: the caller withholds only when this
+    /// census's digest equals the stored one, and the digest is over the stems
+    /// SENT — so `count` is this cycle's true enumeration of a set the server
+    /// holds the same digest for. When the two genuinely disagree (the kept
+    /// set is unchanged but this cycle enumerated something it had to drop),
+    /// `count > listed` and `truncated` is already `true`: the derived verdict
+    /// and the flag agree, and both say FLOOR, which is the truth.
+    #[must_use]
+    pub fn withheld(mut self) -> Self {
+        self.slugs = None;
+        self
+    }
+}
+
+/// The WORK-TREE census of one scan root: every depth-1 `*.md` stem the body
+/// sync's own walk SEES in `dir` — the ones it parses AND the ones it skips
+/// (unreadable file, no markdown structure) alike.
+///
+/// That inclusion is the point: the denominator has to be *what the scanner
+/// could see*, not *what it managed to parse*, or a file the scanner chokes on
+/// disappears from both sides of the set difference and the coverage gap it
+/// causes becomes invisible.
+///
+/// `None` when the directory could not be listed. The enumeration did not
+/// happen, so the side is ABSENT (UNKNOWN) — never a zero, which would be the
+/// claim that the directory really holds no plans.
+pub fn work_tree_census(dir: &Path) -> Option<PlanSlugCensus> {
+    let listing = match enumerate_root(dir) {
+        Ok(listing) => listing,
+        Err(e) => {
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %e,
+                "plan library: cannot enumerate the plans dir for the work-tree slug census; \
+                 reporting that side ABSENT (never an empty set)"
+            );
+            return None;
+        }
+    };
+    census_from_listing(dir, &listing)
+}
+
+/// The census of an already-taken listing, or `None` when that listing is a
+/// FLOOR.
+///
+/// A partly-failed enumeration is not a smaller reading, it is NOT A READING:
+/// the wire carries `count` and `truncated: false` as the assertion that this
+/// is the whole side, and the web derives coverage as a set difference against
+/// it. An under-reported denominator does not surface as an error — it
+/// surfaces as "coverage is fine" for plans the census never saw. So the whole
+/// side goes ABSENT, which the reader already knows how to handle
+/// [policy: `unknown-must-not-render-as-a-default`].
+fn census_from_listing(dir: &Path, listing: &RootListing) -> Option<PlanSlugCensus> {
+    if listing.entries_errored {
+        tracing::warn!(
+            dir = %dir.display(),
+            files_seen = listing.files.len(),
+            "plan library: at least one entry of the plans dir could not be read, so this \
+             enumeration is a FLOOR; reporting the work-tree slug census ABSENT rather than \
+             asserting a partial set as the whole side"
+        );
+        return None;
+    }
+    Some(PlanSlugCensus::new(
+        SLUG_CENSUS_SOURCE_WORK_TREE,
+        None,
+        listing
+            .files
+            .iter()
+            .map(|p| slug_from_filename(&p.to_string_lossy())),
+    ))
 }
 
 /// Where [`super::trigger::BodySync`] sends a scan-root report.
@@ -1619,7 +2099,57 @@ impl ScanRootReport {
                 .and_then(|secs| chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0))
                 .unwrap_or(forwarded_at)
                 .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            // A projection of a READING alone knows of no enumeration; the
+            // cycle that ran one attaches it with `with_censuses`.
+            censuses: None,
         }
+    }
+
+    /// Attach the stem censuses this cycle enumerated.
+    ///
+    /// Two more of the web door's rules enforced here rather than forwarded to
+    /// be refused, for the same reason as the rest of the projection — a 422
+    /// on this body mutes the device forever:
+    ///
+    /// * **`not_scanning` carries NO census.** Nothing was scanned at all, so
+    ///   any listing beside it would be a count nobody took.
+    /// * **At most one census per `source`, and therefore at most two.** Two
+    ///   listings of one side leave which is stored to statement order; the
+    ///   first wins here, and the rest are dropped.
+    ///
+    /// An empty result is `None` rather than `Some(vec![])` — the two are one
+    /// state to the web, and explicit `null` is this struct's discipline.
+    #[must_use]
+    pub fn with_censuses(mut self, censuses: Vec<PlanSlugCensus>) -> Self {
+        if self.state == super::trigger::ScanDivergenceState::NotScanning.as_str() {
+            self.censuses = None;
+            return self;
+        }
+        let mut kept: Vec<PlanSlugCensus> = Vec::new();
+        for census in censuses {
+            if kept.len() >= SCAN_ROOT_CENSUS_MAX_PER_REPORT
+                || kept.iter().any(|k| k.source == census.source)
+            {
+                continue;
+            }
+            kept.push(census);
+        }
+        self.censuses = if kept.is_empty() { None } else { Some(kept) };
+        self
+    }
+
+    /// `source -> digest` for every census this report CARRIES.
+    ///
+    /// The caller's withheld-set memory is REPLACED by this rather than merged
+    /// into: the web stores a source with no entry as UNKNOWN, so a digest
+    /// remembered for a source this report left out would re-assert a set the
+    /// web no longer holds.
+    pub fn census_digests(&self) -> HashMap<String, String> {
+        self.censuses
+            .iter()
+            .flatten()
+            .map(|c| (c.source.clone(), c.digest.clone()))
+            .collect()
     }
 }
 
@@ -1764,9 +2294,15 @@ mod tests {
     }
 
     /// The field names and value shapes ARE the contract with the web half,
-    /// so they are written here as LITERALS: exactly these thirteen keys, no
+    /// so they are written here as LITERALS: exactly these fourteen keys, no
     /// identity field (the server takes the device and org from the token),
     /// `state` as the enum's snake_case tag, `observed_at` as RFC 3339 UTC.
+    ///
+    /// `censuses` is an explicit `null` on a reading that enumerated nothing —
+    /// the same wire discipline as every other optional field here, and the
+    /// one the web door was deliberately built to accept before anything sent
+    /// it (an unknown or refused key 422s the WHOLE report, and this body is
+    /// built from the device's configuration, so it would be refused forever).
     #[test]
     fn scan_root_report_wire_shape_is_the_contract() {
         let r = ScanRootReport::from_divergence(&measured(Some(300), 2153, 11), observed());
@@ -1788,6 +2324,7 @@ mod tests {
                 "counts_are_floors": false,
                 "detail": null,
                 "observed_at": "2026-09-11T12:34:56Z",
+                "censuses": null,
             })
         );
         for forbidden in ["device_id", "organization_id", "tenant_id"] {
@@ -1796,6 +2333,486 @@ mod tests {
                 "{forbidden} must come from the token"
             );
         }
+
+        // And with both sides enumerated, the census entry's own key set is
+        // the contract too — `extra="forbid"` applies to `PlanSlugCensus` as
+        // well, so an extra key there refuses the whole report just the same.
+        let both = ScanRootReport::from_divergence(&measured(Some(300), 2153, 11), observed())
+            .with_censuses(vec![
+                PlanSlugCensus::new(
+                    SLUG_CENSUS_SOURCE_REF,
+                    Some("c".repeat(40)),
+                    ["2026-01-02-b".to_string(), "2026-01-01-a".to_string()],
+                ),
+                PlanSlugCensus::new(
+                    SLUG_CENSUS_SOURCE_WORK_TREE,
+                    None,
+                    ["2026-01-01-a".to_string()],
+                ),
+            ]);
+        let v = serde_json::to_value(&both).unwrap();
+        assert_eq!(
+            v["censuses"],
+            serde_json::json!([
+                {
+                    "source": "ref",
+                    "ref_sha": "c".repeat(40),
+                    "count": 2,
+                    // sha256("2026-01-01-a\n2026-01-02-b")
+                    "digest": slug_census_digest(&[
+                        "2026-01-01-a".to_string(),
+                        "2026-01-02-b".to_string(),
+                    ]),
+                    // SORTED as sent, whatever order they were enumerated in.
+                    "slugs": ["2026-01-01-a", "2026-01-02-b"],
+                    "truncated": false,
+                },
+                {
+                    "source": "work_tree",
+                    "ref_sha": null,
+                    "count": 1,
+                    "digest": slug_census_digest(&["2026-01-01-a".to_string()]),
+                    "slugs": ["2026-01-01-a"],
+                    "truncated": false,
+                },
+            ])
+        );
+        assert_web_accepts(&v);
+    }
+
+    /// The digest is a CROSS-REPO contract — `sha256` over the stems sorted
+    /// and joined with a single `\n`, no trailing newline, UTF-8 — so it is
+    /// pinned against vectors computed on the OTHER side (Python's
+    /// `hashlib.sha256("\n".join(sorted(slugs)).encode())`), not against this
+    /// module's own code. A digest that only agrees with itself would let the
+    /// two halves drift and be discovered as a 422 in production.
+    #[test]
+    fn the_census_digest_matches_the_web_halfs_definition() {
+        assert_eq!(
+            slug_census_digest(&[]),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "the empty census digests the empty string, not a newline"
+        );
+        assert_eq!(
+            slug_census_digest(&["a".to_string()]),
+            "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+            "one stem digests itself — no trailing newline"
+        );
+        assert_eq!(
+            slug_census_digest(&["a".to_string(), "b".to_string()]),
+            "7e18f737311b2dc3b2f269dd78396b0351f14fb66efa879f768cb23181883c78"
+        );
+        // Enumeration order does not reach the digest: the census sorts first.
+        let unsorted = PlanSlugCensus::new(
+            SLUG_CENSUS_SOURCE_REF,
+            None,
+            [
+                "plan-b".to_string(),
+                "plan-c".to_string(),
+                "plan-a".to_string(),
+            ],
+        );
+        assert_eq!(
+            unsorted.digest, "9969415215802beddc42098d08a220b50574ae5009a1d0b1ad77dfe505302a4d",
+            "sha256 over the SORTED join, not the enumerated one"
+        );
+        assert_eq!(
+            unsorted.slugs.as_deref(),
+            Some(
+                [
+                    "plan-a".to_string(),
+                    "plan-b".to_string(),
+                    "plan-c".to_string()
+                ]
+                .as_slice()
+            )
+        );
+    }
+
+    /// **The truncation floor.** Past the web's `SLUG_CENSUS_MAX` the census
+    /// sends the SORTED PREFIX and says `truncated: true`; `count` stays the
+    /// exact number ENUMERATED, and the digest covers the stems AS SENT — the
+    /// web recomputes it over what it received and 422s a disagreement.
+    ///
+    /// The same floor carries every repair: a stem the web would refuse (too
+    /// long, empty) is DROPPED rather than capped into a stem that does not
+    /// exist, and a duplicate collapses — each of which pushes `count` above
+    /// the stems sent, which is exactly what `truncated` means. Membership
+    /// proves existence; absence proves nothing.
+    #[test]
+    fn a_census_past_the_cap_sends_a_sorted_prefix_as_a_floor() {
+        let stems: Vec<String> = (0..SCAN_ROOT_CENSUS_SLUG_MAX + 7)
+            .map(|i| format!("2026-01-01-plan-{i:06}"))
+            .collect();
+        let c = PlanSlugCensus::new(SLUG_CENSUS_SOURCE_WORK_TREE, None, stems.clone());
+        let sent = c.slugs.clone().unwrap();
+        assert_eq!(sent.len(), SCAN_ROOT_CENSUS_SLUG_MAX);
+        assert!(c.truncated);
+        assert_eq!(c.count, SCAN_ROOT_CENSUS_SLUG_MAX as u64 + 7);
+        assert!(
+            c.count > sent.len() as u64,
+            "the web refuses a truncation that did not happen"
+        );
+        let mut want = stems;
+        want.sort();
+        want.truncate(SCAN_ROOT_CENSUS_SLUG_MAX);
+        assert_eq!(sent, want, "the SORTED prefix, not the enumeration's first");
+        assert_eq!(
+            c.digest,
+            slug_census_digest(&sent),
+            "the digest covers the stems AS SENT, not the set enumerated"
+        );
+
+        // A stem over the web's 512-char cap is dropped, never capped: a
+        // capped stem is a DIFFERENT stem, and inventing a set member is worse
+        // than under-reporting one. The drop shows up as the same floor.
+        let long = "x".repeat(513);
+        let repaired = PlanSlugCensus::new(
+            SLUG_CENSUS_SOURCE_WORK_TREE,
+            None,
+            [
+                long.clone(),
+                "x".repeat(512),
+                String::new(),
+                "dup".to_string(),
+                "dup".to_string(),
+            ],
+        );
+        assert_eq!(repaired.count, 5, "five stems were ENUMERATED");
+        assert_eq!(
+            repaired.slugs.as_deref(),
+            Some(["dup".to_string(), "x".repeat(512)].as_slice()),
+            "512 is legal (it is the artifact slug's bound, not work_unit_slug's 255)"
+        );
+        assert!(repaired.truncated, "a repair is a floor, and says so");
+        assert!(
+            !repaired.slugs.unwrap().contains(&long),
+            "the over-long stem is absent, not truncated into a new one"
+        );
+    }
+
+    /// A withheld set is `slugs: null` beside the digest that re-asserts it —
+    /// "unchanged since my last report", never "no stems". Everything else,
+    /// `count` included, still travels.
+    #[test]
+    fn a_withheld_census_keeps_its_digest_and_its_count() {
+        let full = PlanSlugCensus::new(
+            SLUG_CENSUS_SOURCE_REF,
+            Some("d".repeat(40)),
+            ["a".to_string(), "b".to_string()],
+        );
+        let held = full.clone().withheld();
+        assert_eq!(held.slugs, None);
+        assert_eq!(held.digest, full.digest);
+        assert_eq!(held.count, 2);
+        assert_eq!(held.ref_sha, full.ref_sha);
+        assert!(!held.truncated);
+        let v = serde_json::to_value(&held).unwrap();
+        assert_eq!(v["slugs"], serde_json::Value::Null, "explicit null, not []");
+    }
+
+    /// Two of the web door's rules the projection enforces rather than
+    /// forwards to be refused: `not_scanning` carries NO census (nothing was
+    /// scanned, so any listing beside it is a count nobody took), and a
+    /// repeated `source` is dropped rather than sent (the web 422s it, which
+    /// would mute this device forever).
+    #[test]
+    fn the_projection_enforces_the_census_rules_the_web_would_refuse() {
+        let census = |source: &str| PlanSlugCensus::new(source, None, ["a".to_string()]);
+        let idle = ScanRootReport::from_divergence(
+            &super::super::trigger::ScanDivergence::not_scanning(),
+            observed(),
+        )
+        .with_censuses(vec![census(SLUG_CENSUS_SOURCE_WORK_TREE)]);
+        assert_eq!(idle.censuses, None);
+        assert_web_accepts(&serde_json::to_value(&idle).unwrap());
+
+        let doubled = ScanRootReport::from_divergence(&measured(Some(60), 0, 0), observed())
+            .with_censuses(vec![
+                census(SLUG_CENSUS_SOURCE_REF),
+                census(SLUG_CENSUS_SOURCE_REF),
+                census(SLUG_CENSUS_SOURCE_WORK_TREE),
+            ]);
+        let sources: Vec<&str> = doubled
+            .censuses
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|c| c.source.as_str())
+            .collect();
+        assert_eq!(
+            sources,
+            vec!["ref", "work_tree"],
+            "the first of a source wins"
+        );
+        assert_web_accepts(&serde_json::to_value(&doubled).unwrap());
+
+        // And nothing to attach is `null`, not `[]`.
+        let none = ScanRootReport::from_divergence(&measured(Some(60), 0, 0), observed())
+            .with_censuses(Vec::new());
+        assert_eq!(none.censuses, None);
+
+        // `census_digests` names exactly what the report CARRIES — the memory
+        // the withheld-set heartbeat is keyed on.
+        assert_eq!(
+            doubled.census_digests(),
+            [
+                ("ref".to_string(), census(SLUG_CENSUS_SOURCE_REF).digest),
+                (
+                    "work_tree".to_string(),
+                    census(SLUG_CENSUS_SOURCE_WORK_TREE).digest
+                ),
+            ]
+            .into_iter()
+            .collect::<HashMap<_, _>>()
+        );
+        assert!(idle.census_digests().is_empty());
+    }
+
+    /// **The work-tree census is what the scanner could SEE, not what it
+    /// managed to parse.** Every `*.md` the body sync's own walk enumerates is
+    /// in it — including the ones that walk then SKIPS — because a file the
+    /// scanner chokes on must not vanish from both sides of the set
+    /// difference, taking the coverage gap it causes with it.
+    ///
+    /// Pinned against `scan_one_root` itself rather than restated: the census
+    /// must equal the stems that walk produced UNION the stems it skipped.
+    #[test]
+    fn the_work_tree_census_is_every_stem_the_scan_could_see() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // Parsed fine.
+        std::fs::write(dir.join("2026-01-01-good.md"), "# A plan\n\nBody.\n").unwrap();
+        // Enumerated, then SKIPPED for `no_markdown_structure` — still a plan
+        // that EXISTS on this side, so still in the denominator.
+        std::fs::write(dir.join("2026-01-02-structureless.md"), "just words").unwrap();
+        // Not a plan file at all, and not in the census.
+        std::fs::write(dir.join("notes.txt"), "x").unwrap();
+        // A subdirectory is recorded as skipped by the scan but is not a stem.
+        std::fs::create_dir(dir.join("archive")).unwrap();
+        std::fs::write(dir.join("archive").join("2026-01-03-deep.md"), "# Deep\n").unwrap();
+
+        let census = work_tree_census(dir).expect("a readable dir has a census");
+        assert_eq!(census.source, "work_tree");
+        assert_eq!(census.ref_sha, None, "a tree census names no ref");
+        assert!(!census.truncated);
+        assert_eq!(
+            census.slugs.as_deref(),
+            Some(
+                [
+                    "2026-01-01-good".to_string(),
+                    "2026-01-02-structureless".to_string()
+                ]
+                .as_slice()
+            ),
+            "the skipped plan is IN the denominator; the .txt and the subdir plan are not"
+        );
+        assert_eq!(census.count, 2);
+
+        let root = ScanRoot::new(dir, ScanRootKind::Plans, PLANS_ROOT_LABEL);
+        let mut skipped = Vec::new();
+        let scanned = scan_one_root(&root, &PlanConvention::operator_default(), &mut skipped);
+        assert_eq!(scanned.len(), 1, "only one of the two parsed");
+        let mut seen: Vec<String> = scanned.iter().map(|a| a.upsert.slug.clone()).collect();
+        seen.extend(
+            skipped
+                .iter()
+                .filter(|s| s.reason != "subdirectory_not_scanned")
+                .map(|s| slug_from_filename(&s.path)),
+        );
+        seen.sort();
+        assert_eq!(
+            census.slugs.unwrap(),
+            seen,
+            "the census is EXACTLY what the scan saw: parsed plus skipped"
+        );
+
+        // An unreadable root is ABSENT, never a zero: `count: 0` is the claim
+        // that the side really holds no plans, which nothing measured here.
+        assert_eq!(work_tree_census(&dir.join("no-such-dir")), None);
+        // An EMPTY readable root IS a zero — that is a reading, not a silence.
+        let empty = tempfile::tempdir().unwrap();
+        let zero = work_tree_census(empty.path()).expect("a readable empty dir is a reading");
+        assert_eq!((zero.count, zero.truncated), (0, false));
+        assert_eq!(zero.slugs, Some(Vec::new()));
+        assert_eq!(zero.digest, slug_census_digest(&[]));
+    }
+
+    /// **A partly failed enumeration is ABSENT, never a smaller reading.**
+    ///
+    /// `read_dir` succeeding says only that the directory OPENED. Each entry is
+    /// its own syscall, and so is the metadata read that classifies it; either
+    /// can fail on a transient sharing violation, a permission blip, a mount
+    /// hiccup. Both failures used to be swallowed — `entries.flatten()` dropped
+    /// an erroring entry, and `is_dir()`/`is_file()` turned an unreadable
+    /// metadata into a `false` that landed the entry in NEITHER list — and the
+    /// census then went out as `count == len(slugs)` with `truncated: false`,
+    /// which is the wire's assertion that this is the WHOLE side. The web
+    /// computes coverage as a set difference against it, so an under-reported
+    /// denominator does not surface as an error: it surfaces as "coverage is
+    /// fine" for plans the census never saw. All entries erroring is the limit
+    /// case — `count: 0, truncated: false`, a fabricated zero reached without
+    /// passing through any of the three idle arms.
+    ///
+    /// Neither failure is constructible by a test that can only create files,
+    /// which is exactly why [`collect_listing`] takes its entries and its
+    /// classifier. The two consumers are pinned on the same listing, because
+    /// the point is that they DIFFER: the census goes ABSENT, the scan still
+    /// publishes what it read.
+    #[test]
+    fn a_partly_failed_enumeration_is_absent_on_the_census_and_still_scans() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let good = dir.join("2026-01-01-good.md");
+        std::fs::write(&good, "# A plan\n\nBody.\n").unwrap();
+        // Present on disk, but its metadata will not read this cycle.
+        let blocked = dir.join("2026-01-02-blocked.md");
+        std::fs::write(&blocked, "# Also a plan\n\nBody.\n").unwrap();
+
+        let blocked_for_closure = blocked.clone();
+        let sharing_violation = move |path: &Path| -> std::io::Result<EntryKind> {
+            if path == blocked_for_closure {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "the process cannot access the file because it is being used by another process",
+                ))
+            } else {
+                classify_entry(path)
+            }
+        };
+
+        let listing = collect_listing(
+            dir,
+            [Ok(good.clone()), Ok(blocked.clone())],
+            &sharing_violation,
+        );
+        assert!(
+            listing.entries_errored,
+            "an entry whose metadata would not read must be REPORTED, not dropped"
+        );
+        assert_eq!(
+            listing.files,
+            vec![good.clone()],
+            "and the entries that DID read are still listed"
+        );
+
+        assert_eq!(
+            census_from_listing(dir, &listing),
+            None,
+            "the census side is ABSENT: a floor must never be sent as a complete set"
+        );
+
+        let root = ScanRoot::new(dir, ScanRootKind::Plans, PLANS_ROOT_LABEL);
+        let mut skipped = Vec::new();
+        let scanned = scan_listing(
+            &root,
+            listing,
+            &PlanConvention::operator_default(),
+            &mut skipped,
+        );
+        assert_eq!(
+            scanned.len(),
+            1,
+            "the corpus walk still publishes what it could read"
+        );
+        assert!(
+            skipped.iter().any(|s| s.reason == "unreadable_entry"),
+            "and the dry-run report says an entry was lost: {skipped:?}"
+        );
+
+        // The `read_dir` ITERATION error is the same verdict — the other half
+        // of what `entries.flatten()` used to discard.
+        let iterated = collect_listing(
+            dir,
+            [
+                Ok(good.clone()),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "readdir failed mid-iteration",
+                )),
+            ],
+            &classify_entry,
+        );
+        assert!(iterated.entries_errored);
+        assert_eq!(census_from_listing(dir, &iterated), None);
+
+        // THE limit case: every entry errored. A `count: 0, truncated: false`
+        // census here is the fabricated zero, and it is precisely the shape an
+        // honest empty directory has — which is why the reading has to be
+        // ABSENT rather than small.
+        let all_failed = collect_listing(
+            dir,
+            [Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "readdir failed at the first entry",
+            ))],
+            &classify_entry,
+        );
+        assert!(all_failed.files.is_empty());
+        assert_eq!(
+            census_from_listing(dir, &all_failed),
+            None,
+            "zero-because-nothing-was-read is UNKNOWN, not an empty corpus"
+        );
+
+        // The honest empty reading is unchanged: a clean enumeration of an
+        // empty dir IS a zero, and still says so.
+        let empty = collect_listing(dir, Vec::new(), &classify_entry);
+        let zero = census_from_listing(dir, &empty).expect("a clean enumeration is a reading");
+        assert_eq!((zero.count, zero.truncated), (0, false));
+        assert_eq!(zero.slugs, Some(Vec::new()));
+    }
+
+    /// **An entry that could never have been a plan must not send the census
+    /// ABSENT.**
+    ///
+    /// `classify_entry` FOLLOWS links, so a dangling symlink — and any
+    /// permanently unreadable entry — answers `Err` on every cycle. That is a
+    /// knowable, standing answer. Tainting on it made a `notes.txt` in that
+    /// state report this side ABSENT *forever*, with no recovery short of
+    /// operator action, over an entry that could not have changed the `*.md`
+    /// stem set the census is an assertion about.
+    ///
+    /// The conservative direction is kept where it buys something: a failure
+    /// on a `*.md` NAME still taints, because there the entry could have been
+    /// a stem and its kind is exactly what was not established.
+    ///
+    /// Neuter check: taint on every classify error (the previous behaviour)
+    /// and the first census below goes ABSENT.
+    #[test]
+    fn an_entry_that_could_not_be_a_plan_does_not_taint_the_census() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let good = dir.join("2026-01-01-good.md");
+        std::fs::write(&good, "# A plan\n\nBody.\n").unwrap();
+
+        // The dangling-symlink shape, spelled as the metadata failure it
+        // produces: `classify_entry` on a path whose target is not there.
+        // Written this way rather than with a real symlink because creating
+        // one needs a privilege Windows does not grant by default, and the
+        // syscall answer is identical.
+        let dangling = dir.join("notes.txt");
+        assert!(classify_entry(&dangling).is_err(), "the premise");
+
+        let listing = collect_listing(dir, [Ok(good.clone()), Ok(dangling)], &classify_entry);
+        assert!(
+            !listing.entries_errored,
+            "a non-`*.md` name could not have joined the stem set, so the listing is not a floor"
+        );
+        let census = census_from_listing(dir, &listing).expect("the `*.md` set was read in full");
+        assert_eq!(census.slugs, Some(vec!["2026-01-01-good".to_string()]));
+        assert_eq!((census.count, census.truncated), (1, false));
+
+        // The same failure on a name that COULD be a stem still taints.
+        let missing_md = dir.join("2026-01-02-missing.md");
+        assert!(classify_entry(&missing_md).is_err(), "the premise");
+        let tainted = collect_listing(dir, [Ok(good), Ok(missing_md)], &classify_entry);
+        assert!(tainted.entries_errored);
+        assert_eq!(
+            census_from_listing(dir, &tainted),
+            None,
+            "in doubt about an entry that could be a stem: ABSENT"
+        );
     }
 
     /// UNKNOWN stays UNKNOWN on the wire: every absent field is an explicit
@@ -1890,7 +2907,8 @@ mod tests {
     /// module's code, so a projection that drifts from them fails here rather
     /// than as a refused report in production.
     fn assert_web_accepts(v: &serde_json::Value) {
-        const CONTRACT: [&str; 13] = [
+        const CONTRACT: [&str; 14] = [
+            "censuses",
             "state",
             "plans_dir",
             "repo_root",
@@ -1975,6 +2993,95 @@ mod tests {
             .unwrap_or_else(|e| panic!("observed_at {observed:?} is not RFC 3339: {e}"));
         assert!(observed.ends_with('Z'), "UTC with a Z suffix: {observed}");
         assert!(v["counts_are_floors"].is_boolean());
+
+        // (9) the slug census, restated from the web door's own rules.
+        let censuses = match &v["censuses"] {
+            // All three spellings of "no census" are ONE state to the web: the
+            // key omitted, `[]`, and an explicit `null`. This struct's
+            // discipline sends the third.
+            serde_json::Value::Null => Vec::new(),
+            other => other
+                .as_array()
+                .unwrap_or_else(|| panic!("censuses is a list or null: {v}"))
+                .clone(),
+        };
+        assert!(
+            censuses.len() <= 2,
+            "at most one census per source, so at most two: {v}"
+        );
+        assert!(
+            state != "not_scanning" || censuses.is_empty(),
+            "'not_scanning' carries no census — nothing was enumerated: {v}"
+        );
+        let mut sources: Vec<&str> = Vec::new();
+        for c in &censuses {
+            let obj = c.as_object().expect("a census is an object");
+            let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                vec!["count", "digest", "ref_sha", "slugs", "source", "truncated"],
+                "exactly the census fields — extra='forbid' there too: {c}"
+            );
+            let source = c["source"].as_str().expect("source is a string");
+            assert!(["ref", "work_tree"].contains(&source), "{source}");
+            assert!(
+                !sources.contains(&source),
+                "a repeated source is a 422: {v}"
+            );
+            sources.push(source);
+            let digest = c["digest"].as_str().expect("digest is a string");
+            assert_eq!(digest.len(), 64, "digest is exactly 64 chars: {digest}");
+            assert!(
+                digest
+                    .chars()
+                    .all(|ch| ch.is_ascii_digit() || ('a'..='f').contains(&ch)),
+                "digest is LOWERCASE hex: {digest}"
+            );
+            let count = c["count"].as_u64().expect("count is a non-negative int");
+            assert!(count <= i64::MAX as u64, "count {count} exceeds BIGINT");
+            assert!(c["truncated"].is_boolean());
+            if let Some(sha) = c["ref_sha"].as_str() {
+                assert!(sha.chars().count() <= 64, "ref_sha is an object id: {sha}");
+            }
+            match c["slugs"].as_array() {
+                // Withheld: "unchanged since my last report", re-asserted by
+                // the digest alone. Nothing below is decidable without stems.
+                None => assert!(c["slugs"].is_null(), "slugs is a list or null: {c}"),
+                Some(slugs) => {
+                    assert!(slugs.len() <= 5000, "at most SLUG_CENSUS_MAX stems: {c}");
+                    let stems: Vec<String> = slugs
+                        .iter()
+                        .map(|s| s.as_str().expect("a stem is a string").to_string())
+                        .collect();
+                    for stem in &stems {
+                        assert!(!stem.is_empty(), "a stem is non-empty: {c}");
+                        assert!(stem.chars().count() <= 512, "a stem fits _SLUG_MAX: {stem}");
+                    }
+                    let mut unique = stems.clone();
+                    unique.sort();
+                    unique.dedup();
+                    assert_eq!(unique.len(), stems.len(), "a census is a SET: {c}");
+                    assert_eq!(
+                        digest,
+                        slug_census_digest(&stems),
+                        "the web recomputes the digest over the stems AS SENT: {c}"
+                    );
+                    if c["truncated"].as_bool().unwrap() {
+                        assert!(
+                            count > stems.len() as u64,
+                            "a truncated census enumerated more than it sent: {c}"
+                        );
+                    } else {
+                        assert_eq!(
+                            count,
+                            stems.len() as u64,
+                            "an untruncated census sends every stem it counted: {c}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Every state the runner can report satisfies the web door's rules —

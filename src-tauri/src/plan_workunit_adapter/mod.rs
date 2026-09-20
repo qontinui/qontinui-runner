@@ -46,9 +46,10 @@ mod parity;
 
 pub use body_push::{
     backfill_once, build_artifact, build_report, classify_kind, extract_repos, push_artifact,
-    render_report, scan_all_roots, scan_roots, ArtifactKind, ArtifactSink, ArtifactSyncState,
-    ArtifactUpsert, BackfillReport, BackfillSummary, BodyPushOutcome, HttpArtifactSink, ScanRoot,
-    ScanRootAck, ScanRootFailure, ScanRootKind, ScanRootReport, ScanRootReporter, ScannedArtifact,
+    render_report, scan_all_roots, scan_roots, slug_census_digest, work_tree_census, ArtifactKind,
+    ArtifactSink, ArtifactSyncState, ArtifactUpsert, BackfillReport, BackfillSummary,
+    BodyPushOutcome, HttpArtifactSink, PlanSlugCensus, ScanRoot, ScanRootAck, ScanRootFailure,
+    ScanRootKind, ScanRootReport, ScanRootReporter, ScannedArtifact,
 };
 pub use parser::{
     parse_work_unit, slug_from_filename, ParsedPhase, ParsedWorkUnit, PlanConvention,
@@ -58,8 +59,8 @@ pub use trigger::{
     adapter_metrics, backfill_work_units_once, measure_scan_divergence, newly_disappeared_slugs,
     read_device_binding_count, read_plan_dir, reconcile_archive_once, reconcile_once,
     resolve_plans_archive_dir, resolve_plans_dir, resolve_prompts_dir, scan_plan_dir,
-    spawn_if_configured, work_unit_write_posture, ArchiveSummary, BindingCountReading,
+    spawn_if_configured, work_unit_write_posture, ArchiveSummary, BindingCountReading, CycleScan,
     GitRefReader, MetricsSnapshot, PathInputs, PathReader, PlanDirScan, ProcessGit,
-    ReconcileSummary, RetiredSlugs, RetirementReason, ScanDivergence, ScanDivergenceState,
-    WorkUnitBackfillSummary, WorkUnitWritePosture,
+    ReconcileSummary, RetiredSlugs, RetirementReason, ScanCensusInputs, ScanDivergence,
+    ScanDivergenceState, WorkUnitBackfillSummary, WorkUnitWritePosture,
 };
