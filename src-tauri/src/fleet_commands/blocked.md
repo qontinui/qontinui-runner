@@ -85,7 +85,8 @@ Every gate needs an anchor — one of two shapes:
 
 - **Plan-anchored (the usual case):** `(work_unit_id, phase_name)` — a plan tracked
   as a work unit.
-  - `work_unit_id` — `POST $COORD_HTTP_URL/coord/work-units/upsert` with `{ "slug":
+  - `work_unit_id` — the MCP tool **`coord_work_unit_upsert`**, or its REST twin
+    `POST $COORD_HTTP_URL/coord/work-units/upsert`, with `{ "slug":
     "<plan-stem>", "title": "<plan H1>" }` (idempotent on slug; slug = plan
     filename stem, no `.md`/path) → capture `work_unit_id` (a UUID) from the
     response, OR `GET $COORD_HTTP_URL/coord/agent-work-units/<slug>` to read an
@@ -247,7 +248,9 @@ session (the old `plan_ready`-needs-a-`plan_id` blocker is gone).
 **HTTP fallback** when MCP is unavailable — for a **plan-anchored** gate it is now
 TWO device-authed calls on coord's `require_jwt` sub-router (device/agent/service
 JWT all work), first reachable transport wins:
-1. **Upsert the work unit (always first):**
+1. **Upsert the work unit (always first):** MCP **`coord_work_unit_upsert`** —
+   the native twin, and it is a SEPARATE tool from `coord_register_gate`, so
+   reach for it even in a session where the register tool is masked — else
    `POST $COORD_HTTP_URL/coord/work-units/upsert {slug, title?, status?}` →
    **capture `work_unit_id`** from the response. `register-gate` does NOT upsert —
    it 404s `work_unit_not_found` if you skip this.
@@ -311,6 +314,11 @@ as "no such tool"). If the call fails as unknown / method-not-found:
 
 - Report exactly: **"gate NOT registered — coord_register_gate not in this
   session's tool allow-set"**, then
+- First establish WHICH tool is masked: the upsert half has its own tool,
+  **`coord_work_unit_upsert`**, and an allow-set omitting `coord_register_gate`
+  frequently still carries it. A `work_unit_id` back from that call proves the
+  MCP transport is alive and pins the failure on one tool — report that, not
+  "MCP is unavailable", which is a claim about a transport you did not test.
 - Fall back to the HTTP route (Step 5: device-authed `POST /coord/work-units/upsert`
   then `POST /coord/work-units/<slug>/register-gate` for a plan-anchored agent
   session, else `POST /coord/gates/register` for a claim-anchored gate), OR —

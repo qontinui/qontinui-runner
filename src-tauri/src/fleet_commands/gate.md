@@ -181,7 +181,9 @@ Every gate needs exactly ONE anchor:
 
 - **Plan-anchored (usual):** `(work_unit_id, phase_name)` — a plan tracked as a
   work unit.
-  - `work_unit_id` — `POST $COORD_HTTP_URL/coord/work-units/upsert` `{ "slug":"<stem>",
+  - `work_unit_id` — the MCP tool **`coord_work_unit_upsert`** where this session
+    has it, else its REST twin
+    `POST $COORD_HTTP_URL/coord/work-units/upsert`, with `{ "slug":"<stem>",
     "title":"<plan H1>" }` (idempotent on slug = plan filename stem) → **capture
     `work_unit_id`** (a UUID) from the response, OR
     `GET $COORD_HTTP_URL/coord/agent-work-units/<slug>` to read an existing id.
@@ -563,12 +565,22 @@ anchor `file_glob` + `resource_key`.
 
 ### Step 3 — REST through the runner's write forwarder, same proxy nonce (probe: `tools/list` → HTTP 200)
 
-<!-- lint-gate-door-parity: allow attest — this step IS the non-MCP rung of the
-     cascade. Steps 1-2 above are the MCP door for the same verbs; naming that
-     native tool inside the fallback that exists for when it is dead would
+<!-- lint-coord-door-parity: allow attest — this step IS the non-MCP rung of
+     the cascade. Steps 1-2 above are the MCP door for the same verb; naming
+     that native tool inside the fallback that exists for when it is dead would
      invert the step's whole subject. The tool name is deliberately NOT written
      in this comment: spelling it here would satisfy check #32's token test on
-     its own and quietly make this marker decorative. -->
+     its own and quietly make this marker decorative.
+
+     `upsert` is NOT exempt here, and the asymmetry is deliberate. This section
+     already back-references Step 2's `coord_register_gate` for the
+     claim-anchored fallback, which is how `register-gate` passes by token
+     presence rather than by exemption; the prose below does the same for the
+     upsert, naming Step 2's tool as the JSON-RPC twin of the forwarder call.
+     A back-reference keeps the guard ARMED on that verb where an exemption
+     would disarm it, and it reads as what it is — a pointer back up the
+     cascade, not an instruction to use the native door in the rung that exists
+     for its absence. -->
 
 Step 3 is Step 2's **REST twin**: the same proxy nonce, but plain HTTP routes on
 the runner's write forwarder instead of MCP JSON-RPC — for when the JSON-RPC
@@ -620,7 +632,10 @@ curl -fsS -X POST "$LIVE_URL/gates/<gate_id>/attest" \
 
 A successful register returns **`201` with `{ "gate_id": "<uuid>" }`**.
 `register-gate` does NOT upsert (404s `work_unit_not_found` if you skip the
-upsert). The claim-anchored `POST {runner}/coord-mcp/gates/register` (forwarding
+upsert). That first call is the REST twin of Step 2's `coord_work_unit_upsert`
+— same handler, same idempotence on the slug, same `work_unit_id` back — so if
+you are here because the JSON-RPC surface misbehaved rather than because the
+nonce is dead, either spelling mints the same unit. The claim-anchored `POST {runner}/coord-mcp/gates/register` (forwarding
 to coord's device-authed `POST /coord/gates/register-agent`) requires the
 Phase-1a/1b PRs of `2026-07-21-gate-cascade-step3-proxy-rebase` to be deployed
 in coord + the running runner — a 404 from either hop means they aren't yet;
@@ -1054,8 +1069,10 @@ An axis you skipped is not an axis that failed.
 
 ### Step 4b — The bootstrap credential: the one rung that needs no runner (probe: `POST $COORD_HTTP_URL/agents/credential` → HTTP 200 with a JWT-shaped `token`)
 
-<!-- lint-gate-door-parity: allow attest
-     lint-gate-door-parity: allow withdraw
+<!-- lint-coord-door-parity: allow attest
+     lint-coord-door-parity: allow withdraw
+     lint-coord-door-parity: allow upsert
+     lint-coord-door-parity: allow register-gate
      Same reason Step 3 carries its marker: this rung is reached ONLY after
      Step 1 established that the native MCP door is absent from this session,
      so naming that tool inside the fallback built for its absence inverts the
