@@ -205,6 +205,31 @@ __resolve_fleet_script() {
   done
   [ -z "$__RFS_PATH" ] && [ -n "$__FLEET_GIT_ROOT" ] \
     && __rfs_try "$__FLEET_GIT_ROOT/qontinui-claude-config/scripts/$__rfs_rel"
+  # THE BUNDLED RENDER, and it is LAST on purpose. Every rung above is a way of
+  # finding a qontinui-claude-config CHECKOUT, which is the source of truth and
+  # may carry a fix this render does not have yet -- the bundle lags by
+  # construction. So a checkout, wherever it is, always wins; this rung answers
+  # only for the population none of them can serve, which is the population the
+  # runner's skill bundle exists for: a device with no checkout at all, where
+  # `lib/envelope.sh` used to be unresolvable and this script exited 127 before
+  # probing a single door.
+  #
+  # `_scripts/` mirrors `scripts/` one level down, so `$__rfs_rel` is reused
+  # unchanged and `_scripts/lib/envelope.sh` is where `collect_text_files`
+  # provisions it. Check #64 (scripts/lint-skill-script-render.py) holds the
+  # render byte-identical to `scripts/` and gates the bundle's copy of it.
+  __rfs_try "$HERE/_scripts/$__rfs_rel"
+  # The physical twin, for uniformity with rungs 1 and 2. Unlike those this
+  # candidate contains no `..`, so it names the same file whenever $HERE is
+  # enterable; it costs one stat, and only on the path where everything else
+  # has already missed.
+  [ -n "$__FLEET_HERE_PHYS" ] && __rfs_try "$__FLEET_HERE_PHYS/_scripts/$__rfs_rel"
+  # A SIBLING skill's render. `pr-status.sh` carries this block byte for byte
+  # and resolves `coord-acting-bearer.sh` through it, so this rung is what
+  # spares the bundle a second copy of the same six files. `..` here is
+  # resolved by the kernel after any symlink, so it lands in the same
+  # `skills/` directory the running copy was provisioned into.
+  __rfs_try "$HERE/../coord-revive/_scripts/$__rfs_rel"
   return 0
 }
 
@@ -215,10 +240,11 @@ __resolve_fleet_script() {
 # one DOES print, and its `$( )` fork is deliberate: it runs only on the failure
 # path, where one fork buys the entire diagnosis.
 #
-# Every rung it names is one that actually emitted a candidate. Two of them are
-# CONDITIONAL -- $QONTINUI_ROOT and the git root -- and a message that claimed
-# them unconditionally would be the very defect this function exists against,
-# worse for the git rung because a reader cannot check that one by hand.
+# Every rung it names is one that actually emitted a candidate. THREE of them are
+# CONDITIONAL -- $QONTINUI_ROOT, the git root, and the physical-$HERE twin (which
+# rung 2 and the render rung share) -- and a message that claimed them
+# unconditionally would be the very defect this function exists against, worse
+# for the git rung because a reader cannot check that one by hand.
 __fleet_script_searched() {
   __fss_rel="$1"
   __fleet_script_init
@@ -231,12 +257,24 @@ __fleet_script_searched() {
   else
     __fss_qr="(the \$QONTINUI_ROOT rung emitted no candidate: it is UNSET)"
   fi
+  # The physical-$HERE twin is emitted by rung 2 and by the render rung, and by
+  # BOTH only when $__FLEET_HERE_PHYS is non-empty -- i.e. when $HERE reached
+  # here through a symlink. Naming it unconditionally is the same defect as
+  # naming an unset $QONTINUI_ROOT rung: on the ordinary path (logical ==
+  # physical) the message would claim two candidates the resolver never emitted.
+  if [ -n "$__FLEET_HERE_PHYS" ]; then
+    __fss_ph="the same path with \$HERE resolved physically"
+    __fss_ph2=" and the same path with \$HERE resolved physically"
+  else
+    __fss_ph="NOT the physical-\$HERE twin, which emitted no candidate: \$HERE is already physical"
+    __fss_ph2=""
+  fi
   if [ -n "$__FLEET_GIT_ROOT" ]; then
     __fss_gr="and $__FLEET_GIT_ROOT/qontinui-claude-config/scripts/$__fss_rel, the --git-common-dir workspace root"
   else
     __fss_gr="and NOT the --git-common-dir workspace root, which emitted no candidate: git did not resolve one from this cwd"
   fi
-  printf '%s' "searched \$HERE/../../../scripts/$__fss_rel, the same path with \$HERE resolved physically, $__fss_qr, every ancestor of HERE=$HERE both logical and physical for scripts/$__fss_rel and qontinui-claude-config/scripts/$__fss_rel, $__fss_gr"
+  printf '%s' "searched \$HERE/../../../scripts/$__fss_rel, $__fss_ph, $__fss_qr, every ancestor of HERE=$HERE both logical and physical for scripts/$__fss_rel and qontinui-claude-config/scripts/$__fss_rel, $__fss_gr, and LAST the bundled render at \$HERE/_scripts/$__fss_rel$__fss_ph2 and a sibling skill's at \$HERE/../coord-revive/_scripts/$__fss_rel"
 }
 
 # Dependency floor + typed door classification. Until 2026-08-31 this script

@@ -82,15 +82,16 @@ for fn in __fleet_script_init __rfs_try __resolve_fleet_script __fleet_script_se
   if grep -q "^$fn() {" "$INC"; then ok "block defines $fn"; else bad "block does not define $fn"; fi
 done
 
-# WHY 13 LINES BELOW CARRY `skill-self-path-ok`. Check #26 forbids a shipped
+# WHY 18 LINES BELOW CARRY `skill-self-path-ok`. Check #26 forbids a shipped
 # skill from reaching its OWN files by a rooted path, because the provisioned
 # copy will not have one. These lines do the opposite: they BUILD throwaway
 # checkout layouts under `mktemp -d` and hand them to the resolver as inputs.
-# Every one of them is rooted at $TMPROOT (WS, CFG, SIB, LN, DIRTRAP, ORPHAN
-# all derive from it) and is deleted by the EXIT trap; none names a file this
+# Every one of them is rooted at $TMPROOT (WS, CFG, SIB, LN, DIRTRAP, ORPHAN,
+# BUNDLE and BUNDLE_SIB all derive from it) and is deleted by the EXIT trap; none names a file this
 # script opens, and none survives the run. The layouts are the SUBJECT of the
-# test -- the defect it pins is that four helper lookups refused from a sibling
-# checkout -- so they cannot be spelled skill-relative without deleting the
+# test -- the defect it pins is that helper lookups refused from a sibling
+# checkout, and from a device with no checkout at all -- so they cannot be
+# spelled skill-relative without deleting the
 # property under test. Audited residual, not an exemption of convenience.
 # ---------------------------------------------------------------- fixtures
 # The config repo, at a depth NO fixed rung would guess, plus a sibling checkout
@@ -98,7 +99,13 @@ done
 WS="$TMPROOT/ws"
 CFG="$WS/qontinui-claude-config"
 mkdir -p "$CFG/scripts/lib" "$CFG/.claude/skills/coord-revive"  # skill-self-path-ok: fixture tree under mktemp -d, not this skill's own files
-for f in lib/envelope.sh lib/guard-decision-log.sh coord-acting-bearer.sh coord-provision-nonce.sh; do
+# The roster `coord-revive.sh` actually resolves. SIX, not the four this list
+# carried until the `_scripts/` render landed: `lib/native-path.sh` is sourced
+# by envelope.sh from beside itself, and `drain-closeout-spool.sh` is resolved
+# at the closeout-spool call site. A roster short of the real one lets case 2
+# report every helper reachable while one is not.
+HELPERS="lib/envelope.sh lib/native-path.sh lib/guard-decision-log.sh coord-acting-bearer.sh coord-provision-nonce.sh drain-closeout-spool.sh"
+for f in $HELPERS; do
   mkdir -p "$(dirname "$CFG/scripts/$f")"; : > "$CFG/scripts/$f"
 done
 SIB="$WS/qontinui-runner"
@@ -106,6 +113,30 @@ mkdir -p "$SIB/.claude/skills/coord-revive"  # skill-self-path-ok: fixture tree 
 mkdir -p "$WS/.claude/skills/coord-revive"          # workspace-root .claude, real dir  # skill-self-path-ok: fixture tree under mktemp -d, not this skill's own files
 ORPHAN="$TMPROOT/orphan/.claude/skills/coord-revive"  # skill-self-path-ok: fixture tree under mktemp -d, not this skill's own files
 mkdir -p "$ORPHAN"
+
+# THE LAYOUT THE WHOLE `_scripts/` RENDER EXISTS FOR: a provisioned skill
+# directory with its bundled render and NO qontinui-claude-config checkout
+# anywhere above it. Every rung but the last is a way of finding a checkout, so
+# before the render rung this layout resolved NOTHING and `coord-revive.sh`
+# exited 127 at its `lib/envelope.sh` lookup, before probing a single door.
+# $BUNDLE_SIB is the sibling skill (`pr-status`) that ships no render of its
+# own and reaches this one -- which is why the bundle carries six files and not
+# twelve.
+BUNDLE="$TMPROOT/bundle/.claude/skills/coord-revive"      # skill-self-path-ok: fixture tree under mktemp -d, not this skill's own files
+BUNDLE_SIB="$TMPROOT/bundle/.claude/skills/pr-status"     # skill-self-path-ok: fixture tree under mktemp -d, not this skill's own files
+mkdir -p "$BUNDLE_SIB"
+for f in $HELPERS; do
+  mkdir -p "$(dirname "$BUNDLE/_scripts/$f")"; : > "$BUNDLE/_scripts/$f"
+done
+
+# THE PRECEDENCE LAYOUT: a render AND a checkout in reach. The render is LAST
+# by design -- a checkout is the source of truth and may carry a fix the bundle
+# lags -- so this must resolve through `scripts/`, never through `_scripts/`.
+# It is built inside $CFG so both are genuinely reachable from one $HERE.
+for f in $HELPERS; do
+  mkdir -p "$(dirname "$CFG/.claude/skills/coord-revive/_scripts/$f")"  # skill-self-path-ok: fixture tree under mktemp -d, not this skill's own files
+  : > "$CFG/.claude/skills/coord-revive/_scripts/$f"                    # skill-self-path-ok: fixture tree under mktemp -d, not this skill's own files
+done
 
 # resolve <HERE> <QONTINUI_ROOT|-> <rel> -- echoes $__RFS_PATH, from a CWD with
 # no git repo above it so the last rung cannot reach the ambient workspace.
@@ -153,6 +184,15 @@ layout "workspace-root .claude as a real dir, ROOT unset" \
 # would be guessing, and every PASS above would mean nothing.
 layout "no config repo in reach -- must resolve to nothing" \
        "$ORPHAN" - ""
+# THE NEW LAST RUNG, in both of its arms and against its own precedence.
+layout "bundled render, NO config repo anywhere (the checkout-less device)" \
+       "$BUNDLE" - "$BUNDLE/_scripts/lib/envelope.sh"
+layout "a SIBLING skill's render (pr-status reaching coord-revive's copy)" \
+       "$BUNDLE_SIB" - "$BUNDLE/_scripts/lib/envelope.sh"
+# PRECEDENCE. Both are in reach; the CHECKOUT must win, or a stale bundled
+# render would start shadowing the repo the fleet edits.
+layout "render AND config repo in reach -- the checkout wins" \
+       "$CFG/.claude/skills/coord-revive" - "$CFG/scripts/lib/envelope.sh"  # skill-self-path-ok: fixture tree under mktemp -d, not this skill's own files
 
 # The symlink layout: <workspace-root>/.claude symlinked into the config repo.
 # Windows refuses `ln -s` without a privilege or MSYS=winsymlinks:nativestrict,
@@ -169,10 +209,22 @@ fi
 # ---------------------------------------------------------------- case 2
 # All four helpers resolve from the layout that used to refuse. This is the
 # defect itself: fixing envelope.sh alone left the other three refusing.
-echo "case 2 -- all four helpers from a sibling checkout, ROOT unset"
-for rel in lib/envelope.sh coord-acting-bearer.sh coord-provision-nonce.sh lib/guard-decision-log.sh; do
+echo "case 2 -- all six helpers from a sibling checkout, ROOT unset"
+for rel in $HELPERS; do
   got="$(resolve "$SIB/.claude/skills/coord-revive" - "$rel")"  # skill-self-path-ok: fixture tree under mktemp -d, not this skill's own files
   if same_file "$got" "$CFG/scripts/$rel"; then ok "$rel"; else bad "$rel -- got [${got:-<nothing>}]"; fi
+done
+
+# ---------------------------------------------------------------- case 2b
+# The same roster, from the layout with no checkout at all. This is the arm
+# that fails when a helper grows a sibling the render's roster does not carry
+# -- the residual plan
+# 2026-09-12-fleet-skills-bundle-ships-coord-revive-without-the-helpers-it-cannot-run-without
+# names, and the reason the end-to-end fixture is run as well as this one.
+echo "case 2b -- all six helpers from the bundled render, no checkout anywhere"
+for rel in $HELPERS; do
+  got="$(resolve "$BUNDLE" - "$rel")"
+  if same_file "$got" "$BUNDLE/_scripts/$rel"; then ok "$rel"; else bad "$rel -- got [${got:-<nothing>}]"; fi
 done
 
 # ---------------------------------------------------------------- case 3
@@ -365,6 +417,20 @@ else
       -- bash "$0"
     mc_expect_red "drop __rfs_try's -f test, so a directory is accepted" \
       "$SUBJECT" 's|\[ -f "\$1" \] && ||' \
+      -- bash "$0"
+    # THE NEW RUNG, both candidates at once. Deleting only the `$HERE/_scripts`
+    # line would leave the SIBLING candidate, and for a $HERE that is itself
+    # `coord-revive` that candidate names the same directory -- so the mutant
+    # would stay green and the discharge would be reporting a mutation the
+    # suite never caught. The rung is one rung; it is deleted as one.
+    mc_expect_red "drop the bundled-render rung, so a checkout-less device resolves nothing" \
+      "$SUBJECT" '\|_scripts/\$__rfs_rel"|d' \
+      -- bash "$0"
+    # The sibling candidate ALONE. `pr-status` ships no render of its own, so
+    # only this candidate serves it -- deleting it is how the bundle would
+    # silently grow a second copy of the same six files.
+    mc_expect_red "drop the sibling-skill render candidate, so pr-status resolves nothing" \
+      "$SUBJECT" '\|__rfs_try "\$HERE/../coord-revive/_scripts/\$__rfs_rel"|d' \
       -- bash "$0"
     # The suite's OWN assertion count, not the mutation count -- the trailer is
     # a measurement and 2 would be a wrong one.
