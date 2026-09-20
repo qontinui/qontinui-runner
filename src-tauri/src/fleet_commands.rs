@@ -1402,9 +1402,13 @@ mod tests {
                 continue;
             }
             checked += 1;
+            // Collapsed for uniformity with the other positive prose guards.
+            // Both current tokens are single words, so this is a no-op today;
+            // it makes a multi-word mechanic added later wrap-proof by default.
+            let normalised = collapse_ws(contents);
             for (token, why) in GATE_REGISTRATION_MECHANICS {
                 assert!(
-                    contents.contains(token),
+                    normalised.contains(&collapse_ws(token)),
                     "bundled agent command {name} documents gate registration but never \
                      mentions {token:?} — {why}. This file is provisioned into every \
                      spawned session and on a device with no qontinui-claude-config \
@@ -1518,6 +1522,21 @@ mod tests {
     /// within 67-81 characters (five sites across four files), while in the
     /// corrected bodies no such mention has a verdict within 400. `WINDOW` sits
     /// between the two.
+    ///
+    /// ## This guard is already wrap-proof — audited 2026-09-20, do not "fix" it
+    ///
+    /// It normalizes before matching (below), so its `WINDOW` and those
+    /// measured margins are both in NORMALIZED space and a re-wrap moves
+    /// neither. It is the prior art [`collapse_ws`] generalized from, not a
+    /// residue awaiting the same treatment. The audit that established this
+    /// swept every negative `contains` in this file: this one already
+    /// normalizes; `staged_fleet_commands_have_no_plan_path_hardcodes` and
+    /// `staged_fleet_commands_have_no_operator_local_paths` match filesystem
+    /// paths, which contain no whitespace and have no window; and the CRLF
+    /// fence check asserts line endings deliberately. So **no negative prose
+    /// guard in this file is wrap-sensitive**, and a wrapped violation cannot
+    /// escape one. Normalizing here on top of its own stripping would change
+    /// nothing except to make the margins above harder to re-derive.
     #[test]
     fn no_bundled_command_revives_the_retired_warnings_emptiness_test() {
         // Characters after a "non-empty warnings" mention within which a
@@ -1860,17 +1879,205 @@ mod tests {
         );
     }
 
-    /// Content probe selecting the bundled commands that teach the
-    /// `IN PROGRESS` delivery guard: a command teaches it iff it names the read
-    /// the whole guard is built on.
+    /// Collapse every run of ASCII whitespace to a single space.
+    ///
+    /// The bundled bodies are hard-wrapped markdown at ~80 columns, while the
+    /// prose these guards match is multi-word. A pure re-wrap — an edit that
+    /// changes **no words at all** — therefore splits a phrase across a line
+    /// break and a raw `contains` stops seeing it. That is not hypothetical:
+    /// `qontinui-claude-config#1027` re-wrapped a paragraph of `vet-imp.md` and
+    /// split three distinct phrases (the `IN PROGRESS` disposition anchor twice,
+    /// the arm-table order `4, 3, 2, 1, 5, then 6`, and `route to closeout`), so
+    /// a BYTE-FAITHFUL re-vendor of the canonical body fails guards here with
+    /// messages describing removals that never happened.
+    ///
+    /// Applied to BOTH haystack and needle, this makes the positive prose
+    /// guards match the rule rather than one particular line-wrapping of it.
+    /// [`no_bundled_command_revives_the_retired_warnings_emptiness_test`] has
+    /// done exactly this since it was written; these guards are catching up.
+    ///
+    /// **Whitespace only — markup is deliberately NOT stripped.** The wrapped
+    /// citations carry their backticks on both sides of the break, so collapsing
+    /// whitespace is sufficient. Stripping `` ` `` or `*` as well would widen
+    /// matching beyond the invariant, admitting a body that says the words
+    /// without marking them up as the anchor.
+    fn collapse_ws(s: &str) -> String {
+        s.split_ascii_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// The gate on [`collapse_ws`] — and its CONTROL.
+    ///
+    /// Clause (a) is the point of the change: a body whose phrase is split
+    /// across a newline satisfies the guard. Clause (b) is what makes (a)
+    /// meaningful — a body genuinely missing the phrase must still FAIL.
+    /// **Without (b) this normalisation is indistinguishable from deleting the
+    /// guards**, which is the one way a fix for a false failure becomes a
+    /// silent false pass.
+    ///
+    /// Two bounds on what this test covers, stated so it is not over-read:
+    ///
+    /// - It exercises [`collapse_ws`] **in isolation**, never a guard site, so
+    ///   it would not catch a site that collapsed only one side. No site is at
+    ///   risk today — every needle is a source literal with single spaces and
+    ///   no newlines, so collapsing the needle is a no-op there — but a needle
+    ///   that ever gains a newline makes one-sided collapse a real bug this
+    ///   test is blind to.
+    /// - `split_ascii_whitespace` is ASCII-only: it does not collapse a
+    ///   non-breaking space (`U+00A0`), a thin space, or `U+2028`. None of the
+    ///   bundled bodies contains whitespace outside `[ \t\n\r]` today, so this
+    ///   is latent — but an editor that inserts an NBSP re-arms the original
+    ///   defect with the same misleading message.
+    #[test]
+    fn collapsing_whitespace_survives_a_rewrap_and_still_fails_a_real_removal() {
+        // The real anchor, and the real wrap that hid it: `qontinui-claude-config`'s
+        // `vet-imp.md` carries this citation broken after "CONDITIONALLY".
+        let needle = collapse_ws("`IN PROGRESS` is CONDITIONALLY overwritable");
+
+        let one_line = "see `/vet-plan` §5 (\"`IN PROGRESS` is CONDITIONALLY overwritable\") for\nthe disposition.\n";
+        let rewrapped = "see `/vet-plan` §5 (\"`IN PROGRESS` is CONDITIONALLY\noverwritable\") for the disposition.\n";
+        // Indentation after the break, i.e. a wrap inside a list item or a
+        // blockquote — the run of whitespace is more than one character.
+        let rewrapped_indented =
+            "- see `/vet-plan` §5 (\"`IN PROGRESS` is CONDITIONALLY\n      overwritable\") for it.\n";
+
+        for (label, body) in [
+            ("unwrapped", one_line),
+            ("rewrapped", rewrapped),
+            ("rewrapped+indented", rewrapped_indented),
+        ] {
+            assert!(
+                collapse_ws(body).contains(&needle),
+                "(a) a {label} body carrying every word of the anchor must SATISFY the \
+                 guard — a pure re-wrap changes no words and must not read as a removal"
+            );
+        }
+
+        // (b) THE CONTROL. Each of these is genuinely missing something; none
+        // may pass, or the guards above assert nothing at all.
+        let genuinely_absent = [
+            // the disposition removed outright
+            (
+                "phrase deleted",
+                "see `/vet-plan` §5 for the disposition.\n",
+            ),
+            // a word dropped from the middle
+            (
+                "word dropped",
+                "see (\"`IN PROGRESS` is overwritable\") for the disposition.\n",
+            ),
+            // the load-bearing qualifier inverted
+            (
+                "qualifier changed",
+                "see (\"`IN PROGRESS` is FREELY overwritable\") for the disposition.\n",
+            ),
+            // right words, wrong order
+            (
+                "reordered",
+                "see (\"overwritable CONDITIONALLY is `IN PROGRESS`\") here.\n",
+            ),
+            // A word split in half. Genuinely absent under a correct
+            // implementation — and THE case that discriminates against the one
+            // over-collapse mutation the rest of this block is blind to: a
+            // `collapse_ws` that joined with "" instead of " " would fabricate
+            // the word boundary and match here. Without this case every
+            // assertion above passes under that mutation, and only the
+            // `assert_eq!` below catches it — which reads like a redundant unit
+            // check a later author may delete as noise.
+            (
+                "word split in half",
+                "see (\"`IN PROGRESS` is CONDITIONALLY over writable\") here.\n",
+            ),
+        ];
+        for (label, body) in genuinely_absent {
+            assert!(
+                !collapse_ws(body).contains(&needle),
+                "(b) CONTROL FAILED for {label:?}: a body genuinely missing the anchor \
+                 still matched, so whitespace collapsing has widened these guards into \
+                 asserting nothing. Narrow it back — the control is what separates this \
+                 change from deleting the guard"
+            );
+        }
+
+        // The deliberate bound: whitespace only. Markup is NOT stripped, so a
+        // body that says the words without marking them up as the anchor is
+        // still out of scope — matching them would widen the guards past the
+        // invariant they exist to assert.
+        assert!(
+            !collapse_ws("see IN PROGRESS is CONDITIONALLY overwritable here.\n").contains(&needle),
+            "collapse_ws must not strip markup: the backticked anchor and the bare \
+             words are different claims, and conflating them widens every guard that \
+             matches an anchor"
+        );
+        assert_eq!(
+            collapse_ws("a\t \n b  c\r\n"),
+            "a b c",
+            "every run of ASCII whitespace — tabs, CR, LF, multiple spaces — collapses \
+             to exactly one space, and the result is trimmed at both ends"
+        );
+    }
+
+    /// Content probe selecting the bundled commands that RESTATE `/vet-plan`'s
+    /// delivery **arm table**, and so must carry its clauses.
     ///
     /// Scoped by CONTENT rather than by filename, for the same reason
     /// [`bundled_gate_registration_commands_teach_the_mechanics`] is — the
     /// module doc's "nothing may assume the bundle is two commands" applies to
-    /// its tests too. Today this selects exactly `/vet-plan` and
-    /// `/implement-plan` and nothing else in the bundle; a third command that
-    /// grows the guard is covered the day it does.
-    const DELIVERY_READ: &str = "coord_work_unit_list_citations";
+    /// its tests too. Today this selects exactly `/vet-plan`, `/implement-plan`
+    /// and `/vet-imp`; a fourth command that grows the guard is covered the day
+    /// it does.
+    const ARM_TABLE_READ: &str = "coord_work_unit_list_citations";
+
+    /// Every door a bundled body may read delivery state through.
+    ///
+    /// **This is the half [`ARM_TABLE_READ`] used to do as well, and could
+    /// not.** One constant was answering two different questions — *"does this
+    /// body teach the delivery guard?"* and *"does this body restate the arm
+    /// table?"* — which is fine only while every body that reads delivery reads
+    /// it through the same tool. `verify-plan-status` does not: it reads
+    /// delivery through `coord_query_delivery` / `GET
+    /// /coord/twin/delivery/verdict`, and carries its own four-branch
+    /// disposition table whose divergence from `/vet-plan`'s is deliberate and
+    /// documented in its own body (*"Deliberate divergence, do not 'restore
+    /// consistency'"* — `/vet-plan` may write only `VETTED`, while `SHIPPED` is
+    /// that command's own state to write).
+    ///
+    /// So the clause loops keep asking the narrow question against
+    /// [`ARM_TABLE_READ`], while the cross-check below admits `ARM_TABLE_READ`
+    /// unconditionally and [`DIVERGENT_TABLE_DOOR`] only alongside a
+    /// [`DECLARED_DIVERGENCE`]. This set is what the failure message
+    /// ENUMERATES; it is not itself the predicate. Collapsing the two
+    /// questions back together would force a choice between two wrong answers:
+    /// writing a tool name into a body that does not use it purely to satisfy
+    /// a token probe, or deleting a true and useful cross-reference.
+    ///
+    /// Both entries are const references rather than repeated literals, so the
+    /// message cannot advertise a route the predicate does not honour — the
+    /// hand-copied-rule defect `NOT_USABLE_TEST`'s doc comment records this
+    /// file already paying for once.
+    const DELIVERY_GUARD_DOORS: &[&str] = &[ARM_TABLE_READ, DIVERGENT_TABLE_DOOR];
+
+    /// The one door a body may read delivery through WITHOUT restating the arm
+    /// table — admitted only alongside [`DECLARED_DIVERGENCE`].
+    const DIVERGENT_TABLE_DOOR: &str = "coord_query_delivery";
+
+    /// What a body must DECLARE to cite the shared disposition section without
+    /// restating `/vet-plan`'s arm table.
+    ///
+    /// [`DELIVERY_GUARD_DOORS`] alone would be an escape hatch: swapping
+    /// `coord_work_unit_list_citations` for `coord_query_delivery` in any body
+    /// would satisfy the cross-check while silently dropping that body out of
+    /// both clause loops. Requiring the divergence to be STATED makes the broad
+    /// door cost something — a body claiming its own table has to say so where
+    /// a reader will see it, which `verify-plan-status` already does.
+    /// **Known bound, recorded rather than papered over:** this is a prose key,
+    /// so a re-wording ("Divergence is deliberate") breaks it and the body would
+    /// have to restate the arm table or re-declare. A LONGER literal would be
+    /// more fragile, not less; the durable fix is a machine-stable marker in the
+    /// canonical qontinui-claude-config body (an HTML comment or a frontmatter
+    /// key), which is a change to that repo and out of this guard's scope.
+    /// Case is normalised away, and so is wrapping, so the two ways this file
+    /// has already been bitten cannot re-arm on it.
+    const DECLARED_DIVERGENCE: &str = "Deliberate divergence";
 
     /// The fail-closed clauses of the `IN PROGRESS` delivery guard, as
     /// `(token, why it is load-bearing)`.
@@ -1935,19 +2142,27 @@ mod tests {
     fn bundled_delivery_guard_commands_carry_the_fail_closed_clauses() {
         let mut checked = 0usize;
         for (name, contents) in FLEET_COMMANDS {
-            if !contents.contains(DELIVERY_READ) {
+            if !contents.contains(ARM_TABLE_READ) {
                 continue;
             }
             checked += 1;
-            let haystack = contents.to_lowercase();
+            // Whitespace-collapsed, so a hard-wrap that splits a clause across a
+            // line break is not read as the clause having been removed. Two of
+            // these clauses were split by a pure re-wrap in
+            // `qontinui-claude-config#1027`; ALL FOUR are multi-word and so
+            // wrap-sensitive. See [`collapse_ws`].
+            let haystack = collapse_ws(contents).to_lowercase();
             for (token, why) in IN_PROGRESS_DELIVERY_GUARD_CLAUSES {
                 assert!(
-                    haystack.contains(&token.to_lowercase()),
+                    haystack.contains(&collapse_ws(token).to_lowercase()),
                     "bundled agent command {name} teaches the `IN PROGRESS` delivery \
-                     guard (it names {DELIVERY_READ}) but never mentions {token:?} — \
+                     guard (it names {ARM_TABLE_READ}) but never mentions {token:?} — \
                      {why}. Without it this command's copy of the guard fails OPEN, and \
                      the failure is silent: the prose still reads complete. Add it in \
-                     qontinui-claude-config .claude/commands/{name}.md (then re-vendor)"
+                     qontinui-claude-config .claude/commands/{name}.md (then re-vendor). \
+                     Note the match is whitespace-insensitive, so a line break inside \
+                     the phrase is NOT what this is reporting — the words are genuinely \
+                     absent"
                 );
             }
         }
@@ -1955,16 +2170,54 @@ mod tests {
         // read from `implement-plan.md` while keeping its pointer sentence and
         // `checked` falls to 1 with every assertion above still green. So close
         // the loop from the other side — anything that CITES the shared section
-        // must also name the read that section is built on. That is exactly the
+        // must also name a delivery read. That is exactly the
         // "keep the two in sync" instruction the files state and could not
         // enforce, and unlike a `checked >= 2` floor it assumes nothing about
         // how many commands are in the bundle.
+        //
+        // The anchor is multi-word prose matched against hard-wrapped markdown,
+        // so BOTH sides are whitespace-collapsed: a body whose citation is
+        // wrapped is in scope exactly as one whose citation fits on a line.
+        // Before that, `verify-plan-status` cited this anchor across a line
+        // break and was therefore invisible here — outside the guard's scope
+        // while still telling readers to apply the section's disposition, which
+        // is verbatim the state this assertion's own message exists to prevent.
+        //
+        // ⚠️ The satisfier is DELIVERY_GUARD_DOORS **conditionally**, not
+        // unconditionally, and the condition is the whole point. Closing this
+        // loop worked originally because the satisfier and the clause-loop
+        // SELECTOR were one constant: anything citing the anchor had to name
+        // `coord_work_unit_list_citations`, which is exactly what puts it back
+        // in the clause loop above. Splitting the constant catches the DROP
+        // case but would let the SWAP case through — replace that one token
+        // with `coord_query_delivery` and a body leaves both clause loops
+        // silently, `checked` falls, and the `checked > 0` floor still passes.
+        //
+        // So a body qualifies on the broad door only while it PROVES it owns a
+        // divergent disposition table of its own, by declaring the divergence
+        // in as many words. That is what `verify-plan-status` genuinely does;
+        // a body that merely swaps the token does not, and still fails here.
         for (anchor, _) in CROSS_COMMAND_SECTION_ANCHORS {
+            let needle = collapse_ws(anchor);
+            // Lowercased for the same reason the clause loop above is, and
+            // stated there: capitalisation at a sentence start is not part of
+            // the rule, and a guard that fired on it would be asserting prose
+            // style. The declaration sits at the start of a bolded run in a
+            // table cell today, so moving it mid-sentence must not fire this.
+            let divergence = collapse_ws(DECLARED_DIVERGENCE).to_lowercase();
             for (name, contents) in FLEET_COMMANDS {
+                let normalised = collapse_ws(contents);
+                let restates_the_table = contents.contains(ARM_TABLE_READ);
+                let owns_a_divergent_table = contents.contains(DIVERGENT_TABLE_DOOR)
+                    && normalised.to_lowercase().contains(&divergence);
                 assert!(
-                    !contents.contains(anchor) || contents.contains(DELIVERY_READ),
+                    !normalised.contains(&needle)
+                        || restates_the_table
+                        || owns_a_divergent_table,
                     "bundled agent command {name} points readers at the {anchor:?} \
-                     section but no longer names {DELIVERY_READ}, so it has dropped out \
+                     section but neither names {ARM_TABLE_READ} nor declares a \
+                     divergent disposition table of its own ({DELIVERY_GUARD_DOORS:?} \
+                     plus {DECLARED_DIVERGENCE:?}), so it has dropped out \
                      of this guard's scope while still telling a reader to apply that \
                      section's disposition — the clauses above stop being checked for \
                      it and nothing else notices. Restore the delivery read in \
@@ -1977,7 +2230,7 @@ mod tests {
         }
         assert!(
             checked > 0,
-            "no bundled command mentions {DELIVERY_READ:?} — either the bundle lost its \
+            "no bundled command mentions {ARM_TABLE_READ:?} — either the bundle lost its \
              `IN PROGRESS` delivery guard entirely or this guard's content probe went \
              stale. Both need a human look; neither is a passing test"
         );
@@ -2009,10 +2262,15 @@ mod tests {
              bundle's cross-command pointers did not stop existing; the table did"
         );
         for (anchor, target) in CROSS_COMMAND_SECTION_ANCHORS {
+            let needle = collapse_ws(anchor);
             let mut defined = false;
             let mut citers: Vec<&&str> = Vec::new();
             for (name, contents) in FLEET_COMMANDS {
-                if !contents.contains(anchor) {
+                // Whitespace-collapsed on both sides: a citation the author
+                // hard-wrapped is still a citation, and reading it as absent is
+                // what let this edge go unwatched. See [`collapse_ws`].
+                let normalised = collapse_ws(contents);
+                if !normalised.contains(&needle) {
                     continue;
                 }
                 if name == target {
@@ -2020,6 +2278,13 @@ mod tests {
                     // does NOT match a prose mention, so a heading renamed while
                     // the old wording survives elsewhere in the file still fails
                     // — the case that would otherwise dangle the pointer silently.
+                    //
+                    // ⚠️ RAW on purpose, unlike the citation scan above. A
+                    // markdown heading cannot wrap, so collapsing buys nothing
+                    // here and COSTS the strictness the comment claims: against
+                    // a collapsed haystack a bare `#` ending any line (a closed
+                    // ATX heading, a fenced block, a table cell) followed by a
+                    // prose mention would satisfy it with the real heading gone.
                     defined = contents.contains(&format!("# {anchor}"));
                 } else {
                     citers.push(name);
@@ -2092,22 +2357,27 @@ mod tests {
     /// [`bundled_delivery_guard_commands_carry_the_fail_closed_clauses`] must
     /// also name [`CLEAN_LOOKING_UNKNOWN_ARMS`].
     ///
-    /// Same scope probe ([`DELIVERY_READ`]) and the same reasoning, so the two
+    /// Same scope probe ([`ARM_TABLE_READ`]) and the same reasoning, so the two
     /// compose: that guard keeps the arms a reader would miss, this one keeps
     /// the arms a reader would not.
     #[test]
     fn bundled_delivery_guard_commands_name_the_clean_looking_unknown_arms() {
         let mut checked = 0usize;
         for (name, contents) in FLEET_COMMANDS {
-            if !contents.contains(DELIVERY_READ) {
+            if !contents.contains(ARM_TABLE_READ) {
                 continue;
             }
             checked += 1;
+            // Collapsed for uniformity with its sibling guard. Every token here
+            // is currently a single word, so this is a no-op today -- it is the
+            // shape that matters: a multi-word arm added later is wrap-proof by
+            // construction rather than by the next author remembering.
+            let normalised = collapse_ws(contents);
             for (token, why) in CLEAN_LOOKING_UNKNOWN_ARMS {
                 assert!(
-                    contents.contains(token),
+                    normalised.contains(&collapse_ws(token)),
                     "bundled agent command {name} teaches the `IN PROGRESS` delivery \
-                     guard (it names {DELIVERY_READ}) but never mentions {token:?} — \
+                     guard (it names {ARM_TABLE_READ}) but never mentions {token:?} — \
                      {why}. A copy missing it fails OPEN on the one response shape that \
                      reads as a clean observation, and on a device with no \
                      qontinui-claude-config checkout this file is the ONLY copy; add it \
@@ -2117,7 +2387,7 @@ mod tests {
         }
         assert!(
             checked > 0,
-            "no bundled command mentions {DELIVERY_READ:?} — either the bundle lost its \
+            "no bundled command mentions {ARM_TABLE_READ:?} — either the bundle lost its \
              `IN PROGRESS` delivery guard entirely or this guard's content probe went \
              stale. Both need a human look; neither is a passing test"
         );
@@ -2127,7 +2397,7 @@ mod tests {
     /// OMIT `IN PROGRESS`.
     ///
     /// This is the original defect, encoded. The two guards above are scoped by
-    /// [`DELIVERY_READ`], so they say nothing about a command that teaches the
+    /// [`ARM_TABLE_READ`], so they say nothing about a command that teaches the
     /// lifecycle list while carrying no delivery guard AT ALL — which is
     /// exactly the state `/vet-plan` was in: `SHIPPED` / `SUPERSEDED` /
     /// `OBSOLETE` listed as protected, `IN PROGRESS` simply absent, and a vet
@@ -2149,8 +2419,11 @@ mod tests {
                 continue; // not a command that disposes of a plan lifecycle stamp
             }
             checked += 1;
+            // Whitespace-collapsed: this phrase is multi-word, and a pure
+            // re-wrap of the canonical body in qontinui-claude-config splits it
+            // without changing a single word. See [`collapse_ws`].
             assert!(
-                contents.contains("is CONDITIONALLY overwritable"),
+                collapse_ws(contents).contains(&collapse_ws("is CONDITIONALLY overwritable")),
                 "bundled agent command {name} teaches the do-not-overwrite lifecycle \
                  tokens but never says what to do with an `IN PROGRESS` stamp. That \
                  exact omission is what let a vet pass overwrite a plan whose work had \
