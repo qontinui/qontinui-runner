@@ -895,7 +895,12 @@ describe("pong window labels", () => {
 // document's — a reload only replaces the document, and the old one keeps
 // ponging on the same window label until it does.
 describe("document nonce", () => {
-  it("is a non-empty string, minted once per bundle load", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.resetModules();
+  });
+
+  it("is a non-empty string, stable within one bundle load", () => {
     expect(typeof DOCUMENT_NONCE).toBe("string");
     expect(DOCUMENT_NONCE.length).toBeGreaterThan(8);
     // Stable within a document: two pongs from one page must NOT look like
@@ -904,10 +909,72 @@ describe("document nonce", () => {
     expect(pongEventPayload("main").doc).toBe(pongEventPayload("terminal-1").doc);
   });
 
+  /**
+   * The load-bearing half, and the one the stability assertion above CANNOT
+   * make: the nonce must be MINTED per module evaluation, not baked in.
+   *
+   * Replacing `mintDocumentNonce()` with a constant string satisfies every
+   * other assertion in this describe — and silently breaks every reload
+   * verification, because Rust credits a rung only on a CHANGED nonce
+   * (`document_identity_changed`). A constant means `document_changed` is
+   * false forever: every reload waits out the full deadline and then
+   * destroys and rebuilds a perfectly healthy window.
+   *
+   * Two module evaluations = two documents, so their nonces must DIFFER.
+   */
+  it("is minted per module evaluation, so two documents never share one", async () => {
+    vi.resetModules();
+    const { DOCUMENT_NONCE: first } = await import("./utils");
+    vi.resetModules();
+    const { DOCUMENT_NONCE: second } = await import("./utils");
+
+    expect(typeof first).toBe("string");
+    expect(first.length).toBeGreaterThan(8);
+    expect(second).not.toBe(first);
+  });
+
   it("rides every pong, on both the HTTP and the Tauri leg", () => {
     expect(new URL(pongUrl(9876, "safety-net", "main")).searchParams.get("doc")).toBe(
       DOCUMENT_NONCE,
     );
     expect(pongEventPayload("main").doc).toBe(DOCUMENT_NONCE);
+  });
+
+  // The mint has three rungs because a nonce is diagnostic evidence and must
+  // never throw out of module initialization: `randomUUID`, then
+  // `getRandomValues`, then a timestamp + `Math.random()`. Only the first runs
+  // under vitest's default environment, so the other two are reached by
+  // stubbing `globalThis.crypto`.
+  it("falls back to getRandomValues when randomUUID is unavailable", async () => {
+    vi.stubGlobal("crypto", {
+      getRandomValues: (a: Uint8Array) => {
+        for (let i = 0; i < a.length; i += 1) a[i] = (i * 17 + 3) & 0xff;
+        return a;
+      },
+    });
+    vi.resetModules();
+    const { DOCUMENT_NONCE: nonce } = await import("./utils");
+    // 16 bytes, zero-padded hex — not a UUID, and not the last-resort form.
+    expect(nonce).toMatch(/^[0-9a-f]{32}$/);
+  });
+
+  it("falls back to a timestamp nonce when there is no crypto at all", async () => {
+    vi.stubGlobal("crypto", undefined);
+    vi.resetModules();
+    const { DOCUMENT_NONCE: nonce } = await import("./utils");
+    expect(nonce).toMatch(/^[0-9a-z]+-[0-9a-z]*$/);
+    expect(nonce).toContain("-");
+  });
+
+  it("falls back rather than throwing when crypto itself throws", async () => {
+    vi.stubGlobal("crypto", {
+      randomUUID: () => {
+        throw new Error("blocked by policy");
+      },
+    });
+    vi.resetModules();
+    // The whole bundle would fail to load if this threw.
+    const { DOCUMENT_NONCE: nonce } = await import("./utils");
+    expect(nonce).toMatch(/^[0-9a-z]+-[0-9a-z]*$/);
   });
 });
