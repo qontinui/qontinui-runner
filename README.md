@@ -298,6 +298,138 @@ Qontinui Runner uses JSON configurations created by qontinui-web or written manu
 
 See [qontinui documentation](https://github.com/qontinui/qontinui) for details.
 
+## Which tenant a session acts as (and what to do when it is refused)
+
+**If a coord call just failed with `terminal:tenant_...`, read this section and
+then open the doctor door below. It is the first thing to read, not the last.**
+
+### The door
+
+The runner serves a read-only credential diagnosis on loopback. It needs no
+working coord credential — that is the point, since it exists to answer *why
+you have no working credential*:
+
+```bash
+curl -s http://127.0.0.1:9876/coord-mcp/doctor -H "X-Coord-Mcp-Proxy-Key: $(cat ~/.qontinui/live-proxy-key)"
+```
+
+It reports, without ever printing a token: which tenant the proxy would select
+and **how that tenant was decided** (`credential.tenant_source`), every
+per-tenant credential slot this box holds with a `usable` bit and an
+`unusable_reason`, the legacy slot beside them, per-slot refresh health, and —
+when you give it a workspace — which declaration tier matched and the exact
+path it matched on.
+
+The workspace tiers are **per-workspace** and this door is **process-level**,
+so pass one:
+
+```bash
+# by path
+curl -s "http://127.0.0.1:9876/coord-mcp/doctor?workdir=D:/portofino-pizzeria" -H "X-Coord-Mcp-Proxy-Key: $(cat ~/.qontinui/live-proxy-key)"
+# or by session nonce, which cannot disagree with the proxy about your workspace
+curl -s "http://127.0.0.1:9876/coord-mcp/doctor?nonce=<your session nonce>" -H "X-Coord-Mcp-Proxy-Key: $(cat ~/.qontinui/live-proxy-key)"
+```
+
+With **no** workspace supplied, `credential.workspace_declaration` reports
+`"status": "not-evaluated"` and `"evaluated": false`. That is **UNKNOWN — the
+tiers were not read** — and it is deliberately *not* the same answer as
+`"status": "absent"`, which means the tiers *were* read and this workspace
+genuinely declares nothing. The two have opposite repairs: the first means *ask
+again with a workspace*; the second means *the machine pin decides*.
+
+### The authority order
+
+Highest wins. The first row that says anything is the answer.
+
+| # | Signal | Scope |
+|---|---|---|
+| 1 | The session's **frozen-at-mint binding pin** | this session |
+| 1a | `$QONTINUI_TENANT_ID` | the runner **process** — see the warning below |
+| 1b | `tenant:` in `<workspace>/.qontinui/config.yml` | the repo |
+| 1c | longest-matching path prefix in `~/.qontinui/tenant-map.json` | the machine |
+| 2 | `active_tenant_id` in `~/.qontinui/machine.json` | the machine |
+| 3 | nothing pinned | the default slot |
+| 4 | pin unreadable | the device JWT's own `tenant_id` claim, else refuse |
+
+**Row 1 outranks everything below it, `$QONTINUI_TENANT_ID` included.** A
+session whose nonce was minted pinned to tenant `t` holds a *credential* for
+`t`; an environment variable is not a credential, and neither is a file in a
+repo. Nothing outside a session can re-point a session that was provisioned
+against another tenant's slot.
+
+### The three declaration tiers, exactly as spelled
+
+1. **`$QONTINUI_TENANT_ID`** — a tenant uuid in the environment. Blank is not a
+   declaration.
+2. **`tenant:` in `<workspace>/.qontinui/config.yml`.** *Only* that key is
+   read; every other key is ignored. `config.yml` is qontinui-web's PR-merge
+   policy file, and a `config.yml` that does not parse as YAML is **ignored,
+   not a fault** — a broken merge-policy file must not take a session's
+   credential down. A `tenant:` key that *is* present and is not a uuid does
+   refuse.
+
+   ⚠ The path read is `<the session's workdir>/.qontinui/config.yml` — **the
+   session's own workdir, with no walk up to the repo root.** A session started
+   in `repo/packages/app` does not see `repo/.qontinui/config.yml`. For a
+   monorepo, or for any session that may start in a subdirectory, use tier 3,
+   whose prefix match covers a whole tree.
+3. **`~/.qontinui/tenant-map.json`** — longest-matching path prefix wins:
+
+   ```json
+   { "version": 1, "entries": [ { "path": "D:/portofino-pizzeria", "tenant": "<uuid>" } ] }
+   ```
+
+   For paths outside any repo, and for repos whose owner does not want tenancy
+   in a committed file.
+
+### What a declaration can and cannot do
+
+**A declaration may only SELECT a binding this machine already holds — it**
+**never creates one and never widens one.** Every declared tenant goes through the same
+admission rule the spawn path uses — admitted set: *slots this runner holds ∪
+the default binding*.
+
+A declaration naming a tenant this machine is **not** paired for, or a
+declaration that is present and unreadable as a tenant, **refuses the session's
+coord requests**. It does *not* fall back to the default tenant. Falling back
+would write into the wrong tenant and report `201`, and coord prompt documents
+have no delete.
+
+The refusals use one stable vocabulary, shared with the spawn path, so a spawn
+refusal and a proxy refusal teach the same thing:
+
+| Code | Means |
+|---|---|
+| `terminal:tenant_not_paired` | this runner holds no credential for that tenant |
+| `terminal:tenant_credential_store_unreadable` | the store could not be read, so membership is UNKNOWN — refused rather than guessed |
+| `terminal:tenant_workdir_declares_other_tenant` | the workdir's own `.mcp.json` resolves to a different tenant |
+| `terminal:tenant_declaration_unusable` | the declaration is present and is not a tenant uuid |
+
+### The heal
+
+When the tenant is right and simply has no credential on this box:
+
+```bash
+qontinui_profile device pair --tenant-id <uuid>
+```
+
+When the tenant is wrong, edit whichever tier `credential.workspace_declaration.matched_on`
+named. Starting a new session will not help — a new session in the same
+workspace reads the same declaration and is refused identically.
+
+### ⚠ `$QONTINUI_TENANT_ID` is not "one process"
+
+It reads like an override for a single agent. **On the proxy path it is not.**
+The process that reads it is the **runner**, and the runner serves *every*
+session on the box. Exporting it into the runner's environment re-points all of
+them at once — every workspace, every agent, until the runner restarts. That is
+the same blast radius as repointing `machine.json`, which is the machine-wide
+workaround the per-workspace tiers exist to replace.
+
+If you want one workspace to act as one tenant, use tier 2 or tier 3. Reserve
+`$QONTINUI_TENANT_ID` for a one-shot CLI you launch yourself, where the process
+reading it really is only yours.
+
 ## Troubleshooting
 
 ### Windows

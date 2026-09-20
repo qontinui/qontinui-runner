@@ -4229,22 +4229,61 @@ async fn coord_mcp_tool_policy_handler() -> Json<serde_json::Value> {
 /// The report reads the credential store, so it runs on the blocking pool for
 /// the same reason every other credential read on this file's request paths
 /// does.
-async fn coord_mcp_doctor_handler() -> Json<serde_json::Value> {
-    let report = tokio::task::spawn_blocking(crate::coord_mcp::doctor::report)
-        .await
-        .unwrap_or_else(|e| {
-            // A join failure is UNKNOWN about the credential, not a verdict on
-            // it — say so rather than rendering a confident "no-credential".
-            serde_json::json!({
-                "probed_at": chrono::Utc::now().to_rfc3339(),
-                "verdict": "unknown",
-                "layer": "none",
-                "detail": format!(
-                    "the doctor probe could not be run on this runner ({e}) — this says \
-                     nothing about the credential"
-                ),
-            })
-        });
+///
+/// # The optional workspace (Phase 5)
+///
+/// Plan `2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin`
+/// D5. The three workspace declaration tiers are per-WORKSPACE and this door is
+/// process-level, so it can only report them when the caller says which
+/// workspace. Two ways, both optional:
+///
+/// - `?workdir=<absolute path>` — ask for that path directly.
+/// - `?nonce=<session nonce>` — ask for whatever workspace that session was
+///   provisioned into, through the SAME [`crate::coord_mcp::workdir_for_nonce`]
+///   seam `session_tenant_or_refuse` uses. This is the honest one for "why was
+///   MY session refused", because it cannot disagree with the proxy about which
+///   workspace the session is in.
+///
+/// With **neither** supplied the tiers report `evaluated: false` /
+/// `not-evaluated` — UNKNOWN, never "this workspace declares no tenant". See
+/// [`crate::coord_mcp::doctor::WorkspaceDeclarationView`] for why those two
+/// answers must not collapse.
+///
+/// A `nonce` that resolves to no workdir leaves the tiers NOT EVALUATED rather
+/// than silently reporting for no workspace: an unknown nonce establishes
+/// nothing about a workspace. The route stays UNAUTHENTICATED, and the workdir
+/// echoed back is one the caller already supplied, so nothing new is disclosed.
+async fn coord_mcp_doctor_handler(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let report = tokio::task::spawn_blocking(move || {
+        let workspace = params
+            .get("workdir")
+            .map(|w| w.trim().to_string())
+            .filter(|w| !w.is_empty())
+            .or_else(|| {
+                params
+                    .get("nonce")
+                    .map(|n| n.trim())
+                    .filter(|n| !n.is_empty())
+                    .and_then(crate::coord_mcp::workdir_for_nonce)
+            });
+        crate::coord_mcp::doctor::report_for_workspace(workspace.as_deref())
+    })
+    .await
+    .unwrap_or_else(|e| {
+        // A join failure is UNKNOWN about the credential, not a verdict on
+        // it — say so rather than rendering a confident "no-credential".
+        serde_json::json!({
+            "probed_at": chrono::Utc::now().to_rfc3339(),
+            "verdict": "unknown",
+            "layer": "none",
+            "detail": format!(
+                "the doctor probe could not be run on this runner ({e}) — this says \
+                 nothing about the credential"
+            ),
+        })
+    });
     Json(report)
 }
 
