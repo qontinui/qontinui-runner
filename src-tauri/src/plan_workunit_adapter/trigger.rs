@@ -3500,14 +3500,42 @@ impl LoopState {
                     // the reason the scan-root report sits ahead of the
                     // breaker pause and the `artifacts.is_empty()` return.
                     if let Some(bs) = self.body_sync.as_mut() {
-                        // BOTH stem sets ABSENT. The scan source was
+                        // The REF set is ABSENT: the scan source was
                         // unavailable, so nothing was listed — and a set that
-                        // was never listed is UNKNOWN. Sending `count: 0`
-                        // here would say "this side holds no plans", which is
+                        // was never listed is UNKNOWN. Sending `count: 0` for
+                        // it would say "this side holds no plans", which is
                         // the false zero this whole plan family exists to
                         // remove.
-                        bs.report_while_idle(metrics, ScanCensusInputs::absent())
-                            .await;
+                        //
+                        // The WORK-TREE set is still READ, and this is the
+                        // arm where that distinction earns its keep. The
+                        // causes that land here are mostly STANDING, not
+                        // passing — `resolve_ref_listing_source` reports
+                        // `Unavailable` for a clone with no `origin/HEAD`
+                        // (`ProcessGit::default_ref` calls that "a real,
+                        // permanent configuration"), for a plans dir outside
+                        // its work-tree root, and for a plans dir that is
+                        // unpushed or ignored. Withholding BOTH sides here
+                        // would take this device's work-tree census dark on
+                        // every cycle FOREVER while the report kept going out
+                        // looking healthy — the same silent-permanent-absence
+                        // shape as the withheld-posture defect, reached from
+                        // a different arm.
+                        //
+                        // Reading it invents nothing: the work-tree census is
+                        // one `read_dir` and needs no git at all, and
+                        // `work_tree_census` returns ABSENT (never an empty
+                        // set) when the dir will not enumerate or the listing
+                        // is a floor. So this reports what was measured and
+                        // stays silent about what was not.
+                        bs.report_while_idle(
+                            metrics,
+                            ScanCensusInputs {
+                                ref_census: None,
+                                work_tree_dir: Some(dir.clone()),
+                            },
+                        )
+                        .await;
                     }
                     metrics.cycles_total.fetch_add(1, Ordering::Relaxed);
                     return;
@@ -3536,15 +3564,31 @@ impl LoopState {
                         self.last_scan_unavailable = Some(reason);
                     }
                     if let Some(bs) = self.body_sync.as_mut() {
-                        // BOTH stem sets ABSENT, and this is the arm where it
-                        // matters most: the scan task did not COMPLETE, so the
-                        // enumeration never happened at all. A zero census
-                        // here would not even be stale — it would be
+                        // The REF set is ABSENT, and this is the arm where
+                        // that matters most: the scan task did not COMPLETE,
+                        // so its enumeration never happened at all. A zero
+                        // census here would not even be stale — it would be
                         // FABRICATED, a set nothing on this device ever
                         // listed, and the web would store it as this device's
                         // answer for the side.
-                        bs.report_while_idle(metrics, ScanCensusInputs::absent())
-                            .await;
+                        //
+                        // The WORK-TREE set is read for the same reason as the
+                        // arm above: it shares nothing with the failed task —
+                        // no git, no blob reads, just one `read_dir` this
+                        // cycle has not spent — and a panicking scan task can
+                        // recur for as long as its cause stands. Its own
+                        // failure modes stay ABSENT rather than empty
+                        // (`work_tree_census` returns `None` when the dir will
+                        // not enumerate or the listing is a floor), so nothing
+                        // here can fabricate the zero the arm is guarding.
+                        bs.report_while_idle(
+                            metrics,
+                            ScanCensusInputs {
+                                ref_census: None,
+                                work_tree_dir: Some(dir.clone()),
+                            },
+                        )
+                        .await;
                     }
                     // Counted like every other cycle: a FROZEN `cycles_total`
                     // reads as "the loop is dead", which is a different and
@@ -3557,9 +3601,12 @@ impl LoopState {
         // Read something, so the next unavailability is news again.
         self.last_scan_unavailable = None;
         let active_scan_complete = active_scan.complete;
-        // Taken BEFORE `units` moves out: the ref census is the work-unit
-        // half's listing of the ref, and it travels to the scan-root report
-        // even on a cycle whose `units` the reconcile then consumes.
+        // Moved out before `units` is consumed by the reconcile below: the
+        // ref census is the work-unit half's listing of the ref, and it
+        // travels to the scan-root report on every cycle, including one whose
+        // units the reconcile then takes ownership of. (The two are disjoint
+        // fields, so the order of the two partial moves is not itself
+        // load-bearing.)
         let ref_census = active_scan.ref_census;
         let units = active_scan.units;
         self.bulk_seed(&units, sink, metrics).await;
@@ -7508,12 +7555,27 @@ mod tests {
 
     /// **Idle arm 2 of 3** — the `Ok(Err(reason))` publish-nothing arm (the
     /// second `report_while_idle` call site; `trigger.rs:2668` when the plan
-    /// was written). The fetch failed, so the ref was never listed and the
-    /// body sync's own walk never ran. A readable plan is sitting in the dir,
-    /// which makes a fabricated work-tree census tempting and wrong: nothing
-    /// enumerated it this cycle.
+    /// was written). The fetch failed, so the REF was never listed.
+    ///
+    /// The two sides are reported SEPARATELY here, which is the whole point of
+    /// carrying them separately. The ref side is ABSENT — nothing listed it.
+    /// The work-tree side is READ, because it shares nothing with the failure:
+    /// no git, no fetch, one `read_dir` of a directory that is sitting there
+    /// readable.
+    ///
+    /// This is not a fabricated census, which would be inventing a `count`
+    /// nobody took; it is a census this cycle actually TAKES. The distinction
+    /// is load-bearing because the causes that reach this arm are mostly
+    /// STANDING — a clone with no `origin/HEAD`, a plans dir outside its
+    /// work-tree root, an unpushed or ignored plans dir. Reporting both sides
+    /// absent here took the work-tree census dark on every cycle forever for
+    /// such a device, while the report kept going out looking healthy.
+    ///
+    /// Mutation proof (run 2026-09-20): revert this arm to
+    /// `ScanCensusInputs::absent()` and the `work_tree` assertions below fail;
+    /// restoring `work_tree_dir: Some(dir.clone())` passes them again.
     #[tokio::test]
-    async fn idle_arm_unavailable_scan_source_reports_both_censuses_absent() {
+    async fn idle_arm_unavailable_scan_source_reports_the_ref_absent_and_reads_the_work_tree() {
         let dir = one_plan_dir();
         let (cell, reader) = switchable_paths();
         *cell.lock().unwrap() = plans_dir_input(dir.path());
@@ -7543,9 +7605,28 @@ mod tests {
             1,
             "the cycle that publishes nothing still reports"
         );
+        let censuses = sent[0]
+            .censuses
+            .as_ref()
+            .expect("the work-tree side WAS listed, so the report carries a census");
+        assert!(
+            censuses
+                .iter()
+                .all(|c| c.source != super::super::body_push::SLUG_CENSUS_SOURCE_REF),
+            "the scan source was unavailable, so the REF side was never listed and must be \
+             ABSENT rather than an empty set"
+        );
+        let work_tree = censuses
+            .iter()
+            .find(|c| c.source == super::super::body_push::SLUG_CENSUS_SOURCE_WORK_TREE)
+            .expect("the work tree needs no git and was read");
         assert_eq!(
-            sent[0].censuses, None,
-            "the scan source was unavailable, so NEITHER side was listed"
+            work_tree.count, 1,
+            "the fixture holds exactly one plan, and this side was MEASURED rather than guessed"
+        );
+        assert!(
+            !work_tree.truncated,
+            "one plan is the whole side, not a floor"
         );
     }
 
@@ -7559,12 +7640,18 @@ mod tests {
     /// would then store as this device's answer for that side and difference
     /// against the other.
     ///
-    /// Mutation proof (run 2026-09-17): making this arm pass a
-    /// `PlanSlugCensus::new(SLUG_CENSUS_SOURCE_REF, None, [])` instead of
-    /// `ScanCensusInputs::absent()` fails this test on the `censuses, None`
-    /// assertion, and reverting restores it.
+    /// The WORK-TREE side is still read, for the same reason as arm 2: it
+    /// shares nothing with the task that failed. A panicking scan task recurs
+    /// for as long as its cause stands, so withholding both sides here is the
+    /// same permanent darkness from a different arm.
+    ///
+    /// Mutation proof (run 2026-09-20): making this arm pass a
+    /// `PlanSlugCensus::new(SLUG_CENSUS_SOURCE_REF, None, [])` fails the
+    /// ref-absent assertion below; reverting the arm to
+    /// `ScanCensusInputs::absent()` fails the work-tree assertions; the
+    /// shipped form passes both.
     #[tokio::test]
-    async fn idle_arm_failed_scan_task_reports_both_censuses_absent() {
+    async fn idle_arm_failed_scan_task_reports_the_ref_absent_and_reads_the_work_tree() {
         let dir = one_plan_dir();
         let (cell, reader) = switchable_paths();
         *cell.lock().unwrap() = plans_dir_input(dir.path());
@@ -7604,9 +7691,23 @@ mod tests {
             sent[0].state, "unknown",
             "the divergence probe panicked too, and says so rather than guessing"
         );
+        let censuses = sent[0]
+            .censuses
+            .as_ref()
+            .expect("the work-tree side WAS listed, so the report carries a census");
+        assert!(
+            censuses
+                .iter()
+                .all(|c| c.source != super::super::body_push::SLUG_CENSUS_SOURCE_REF),
+            "the ref enumeration never RAN — a zero for it would be fabricated, not stale"
+        );
+        let work_tree = censuses
+            .iter()
+            .find(|c| c.source == super::super::body_push::SLUG_CENSUS_SOURCE_WORK_TREE)
+            .expect("the work tree needs no git and did not depend on the failed task");
         assert_eq!(
-            sent[0].censuses, None,
-            "the enumeration never RAN — a zero here would be fabricated, not stale"
+            work_tree.count, 1,
+            "the fixture holds exactly one plan, measured by a read_dir the panic never touched"
         );
     }
 
