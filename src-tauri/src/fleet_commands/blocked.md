@@ -51,7 +51,8 @@ as free text. Map what you are waiting on to exactly one kind:
 | A PR merging | `pr_merged` | identify the PR (`repo` + `pr` number). It **does** clear on a coord-orchestrated repo: `gates::pr_merged_verdict` never reads GitHub's `merged` bool, it reads coord's OWN land record — `pr_state = 'merged'` **or** `close_cause ∈ {merged, commits_landed_via_other_pr}` — so **both** land shapes clear, and registration emits an informational steer, not a rejection. Two qualifications, both load-bearing: an explicitly `open`/`draft` `pr_state` carrying a land cause hits the **contradiction guard** and returns `Open` (not a clear — it converges once the PR leaves open/draft); and a **dying land** can leave it terminally `Failed` on work that is provably on `main`, whose discriminator is a `merged` `coord.merge_proposals` row for **this** PR — no merged proposal ⇒ the `Failed` is genuine (`author_closed` reaches `Failed` too, and its content is on `main` as well). Canonical: `_gate-registration`. ⚠️ The older *"never fires on a coord-orchestrated repo"* advice is **STALE** — true when learned (2026-07-11, on runner PR #744), fixed in coord days later by the land-aware `pr_merged_verdict`. **Before registering, apply `knowledge-base/qontinui-specific/coord-ff-lands.md` → "Pushing to a branch whose PR may already have landed"** (`gh pr view <n> --json state,headRefOid`). This gate clears on the land, so a commit pushed after coord lands the PR is watched by nothing. If that section says the PR no longer carries your commits, take its fresh-branch path and gate the new PR instead, unless the close was deliberate. If nothing is unlanded, the wait is over: register no `pr_merged` gate. If the PR does carry them but its head is not your local tip, push (or reconcile) first, then apply the section's after-push re-check before registering. Decide what is unlanded by content, not ancestry: after a rebase-land your SHA is never on `main` (`knowledge-base/qontinui-specific/coord-ff-lands.md` → "Ancestry is a one-way signal") |
 | Work landing on main of a **coord-orchestrated repo** | `commit_live` | `{repo, commit_sha, on_ref?}` — ancestor-of-main check; anchor a **post-land main SHA** (or use `unit_status` — **not `file_exists`, which is broken**), NEVER the pre-land branch-head SHA. That anchor **is** a coin-flip: it clears only if the rebase preserved the sha, and whether `main` moves between your read and coord's land is not predictable at registration time — so on a rewrite the SHA never becomes an ancestor and the gate rots open (gate `c14d103c`, 2026-07-11). The hazard is the pre-land SHA, **not** `pr_merged` |
 | A specific **device's running build** being at-or-past a SHA | `runner_served_sha` | `{device_id, repo, expected_sha}` — device-scoped, and NOT interchangeable with `commit_live`: `commit_live` only checks repo-main ancestry (the code has landed), while `runner_served_sha` checks that THAT device's currently-running binary is at-or-past `expected_sha` (the code has been rebuilt onto). Stays `open` while the commit has landed but the device hasn't restarted onto it — `verdict_reason` names the device's current build id when open (canonical: `_gate-registration`) |
-| A deploy going healthy | `deploy_healthy` | the service/env that must be healthy |
+| A deploy going healthy | `deploy_healthy` | `{service, expected_rev}` — **both required**, and it is a CONJUNCTION: healthy AND the deployed rev *includes* `expected_rev`, never a health-only check. `service` is an EXACT vocabulary, not free text — `coord` or `web`, **no variants**: not `qontinui-web`, not `qontinui-staging/web` (the target `coord_query_release_state` prints). The three lookups this predicate conjoins normalize differently and the health one does raw `==` on an alert key segment, so a near-miss spelling names an observation but no alert and the health half is SILENTLY SKIPPED — the gate could clear while a critical deploy alert was open. A service coord does not observe at all used to register cleanly and then fail closed on every tick forever, silently. Both are REFUSED at the door now. Canonical: `_gate-registration` → "Merged is not deployed" |
+| **Repo A must not ship until repo B's change is LIVE on the serving backend** | `deploy_healthy` | **not `pr_merged`** — merged is not deployed. `pr_merged` is a fact about a pull request and has no unknown arm; a rollback leaves it cleared TERMINALLY while the backend no longer carries the code. Set `expected_rev` to the landed commit of the upstream half. Registering `pr_merged` on a deploy-shaped `phase_name` now answers with a non-blocking `deploy_order_predicate_weaker:` steer (branch on the **prefix**, never on `warnings[].is_empty()`). For a SCHEMA change this is a third question again — `migration_at_head` is single-schema and coord has no predicate for "table X exists on database Y". Canonical: `_gate-registration` → "Merged is not deployed" |
 | A claim going terminal (released/expired) | `claim_terminal` | claim-anchored, not plan-anchored (`claim_kind`+`resource_key`) |
 | A human decision / judgment | `operator_approval` | `{prompt}` — notify-only; the only free-text-ish kind, and the human escape hatch |
 | CI going green | `ci_green` | the ref/workflow that must pass |
@@ -85,7 +86,8 @@ Every gate needs an anchor — one of two shapes:
 
 - **Plan-anchored (the usual case):** `(work_unit_id, phase_name)` — a plan tracked
   as a work unit.
-  - `work_unit_id` — `POST $COORD_HTTP_URL/coord/work-units/upsert` with `{ "slug":
+  - `work_unit_id` — the MCP tool **`coord_work_unit_upsert`**, or its REST twin
+    `POST $COORD_HTTP_URL/coord/work-units/upsert`, with `{ "slug":
     "<plan-stem>", "title": "<plan H1>" }` (idempotent on slug; slug = plan
     filename stem, no `.md`/path) → capture `work_unit_id` (a UUID) from the
     response, OR `GET $COORD_HTTP_URL/coord/agent-work-units/<slug>` to read an
@@ -247,7 +249,9 @@ session (the old `plan_ready`-needs-a-`plan_id` blocker is gone).
 **HTTP fallback** when MCP is unavailable — for a **plan-anchored** gate it is now
 TWO device-authed calls on coord's `require_jwt` sub-router (device/agent/service
 JWT all work), first reachable transport wins:
-1. **Upsert the work unit (always first):**
+1. **Upsert the work unit (always first):** MCP **`coord_work_unit_upsert`** —
+   the native twin, and it is a SEPARATE tool from `coord_register_gate`, so
+   reach for it even in a session where the register tool is masked — else
    `POST $COORD_HTTP_URL/coord/work-units/upsert {slug, title?, status?}` →
    **capture `work_unit_id`** from the response. `register-gate` does NOT upsert —
    it 404s `work_unit_not_found` if you skip this.
@@ -311,6 +315,11 @@ as "no such tool"). If the call fails as unknown / method-not-found:
 
 - Report exactly: **"gate NOT registered — coord_register_gate not in this
   session's tool allow-set"**, then
+- First establish WHICH tool is masked: the upsert half has its own tool,
+  **`coord_work_unit_upsert`**, and an allow-set omitting `coord_register_gate`
+  frequently still carries it. A `work_unit_id` back from that call proves the
+  MCP transport is alive and pins the failure on one tool — report that, not
+  "MCP is unavailable", which is a claim about a transport you did not test.
 - Fall back to the HTTP route (Step 5: device-authed `POST /coord/work-units/upsert`
   then `POST /coord/work-units/<slug>/register-gate` for a plan-anchored agent
   session, else `POST /coord/gates/register` for a claim-anchored gate), OR —
