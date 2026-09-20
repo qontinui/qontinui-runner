@@ -811,6 +811,22 @@ where
                      is NOT a floor"
                 );
             }
+            // ACCEPTED LIMIT, stated so an operator who hits it can find the
+            // sentence: an entry whose name COULD be a stem still taints the
+            // listing even when its failure is a DECIDED one. A dangling
+            // symlink named `<stem>.md` answers `NotFound` every cycle —
+            // `classify` follows links — so this side reports ABSENT for as
+            // long as the link stays broken, with only a per-cycle WARN to say
+            // so. That is the safe direction (never a false zero) but it is
+            // permanent darkness from a knowable cause, which is the shape
+            // this plan family exists to remove.
+            //
+            // It is NOT narrowed to the uncertain kinds (`PermissionDenied`,
+            // `Busy`) here on purpose: doing so would stop a file deleted
+            // mid-scan from tainting, and deciding whether that race should
+            // shrink the denominator is a separate judgement with its own
+            // tests — not a rider on this one. Tracked as a follow-up on
+            // 2026-09-15-captured-vs-authored-coverage-is-a-set-difference.
             Err(e) => {
                 tracing::warn!(
                     path = %path.display(),
