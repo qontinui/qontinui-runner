@@ -823,8 +823,9 @@ states that legitimately stop the lifecycle must stop it here too:
   it — the §5 paragraph that also states the rule runs too late to refuse
   anything), because the
   block read `IN PROGRESS` and its conditional guard refused (the work has
-  landed, or a live peer holds it — see `/vet-plan`'s "`IN PROGRESS` is
-  CONDITIONALLY overwritable"), because its own §0.25 delivery read landed on
+  landed, or a live peer holds it — see `/vet-plan`'s
+  "`IN PROGRESS` is CONDITIONALLY overwritable"), because its own §0.25
+  delivery read landed on
   **arm 1** — `shipped: true` ∧ `evidence_complete: true` with the phase axis
   corroborating it, the arm all three readers carry — and routed to closeout
   instead of vetting, or because it judged the plan's **overall
@@ -833,8 +834,9 @@ states that legitimately stop the lifecycle must stop it here too:
   user and stop.
 - **The work has ALREADY LANDED.** Independently of the stamp, read the derived
   delivery before proceeding:
-  `coord_work_unit_list_citations(<plan-stem>) -> .delivery`. **STOP** and route
-  to closeout — do not implement — only when EVERY one of these seven holds:
+  `coord_work_unit_list_citations(<plan-stem>) -> .delivery`. **STOP** and
+  route to closeout — do not implement — only when EVERY one of these seven
+  holds:
 
   1. `shipped: true`
   2. `evidence_complete: true`
@@ -851,8 +853,9 @@ states that legitimately stop the lifecycle must stop it here too:
   `shipped: true` is `/vet-plan`'s one non-inconclusive arm-6 sub-case: the
   implement case below), so the UNKNOWN arms 3 and 2 are ruled out
   before the closeout STOP of arm 1 is taken. An `IN PROGRESS` stamp is not
-  re-decided here: `/vet-plan` Step 0.25 already applied its "`IN PROGRESS` is
-  CONDITIONALLY overwritable" section, including its **unidentified default**
+  re-decided here: `/vet-plan` Step 0.25 already applied its
+  "`IN PROGRESS` is CONDITIONALLY overwritable" section, including its
+  **unidentified default**
   (an `IN PROGRESS` stamp with no session marker, or one that cannot be
   positively attributed at all, is a STOP, not an overwrite; a marker naming a
   probed-dead peer is case 2, adopt), before it rewrote the stamp.
