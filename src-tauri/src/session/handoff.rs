@@ -593,13 +593,14 @@ pub(super) enum CatchupKind {
 /// - `Handoff` and `Respawn` are driven by nothing else in the process. The
 ///   on-connect replay was their only backstop, which is the gap
 ///   [`CATCHUP_TICK`] exists to close.
-/// - `Attach` and `Create` each already have a process-lifetime 60 s poll
-///   task — `session::attach::start_poll_task` and
-///   `session::create::start_poll_task`, both spawned in `main.rs`, both on a
-///   `POLL_INTERVAL` equal to [`CATCHUP_TICK`]. Driving them from here as
-///   well issues two GETs a minute to each of those routes and delivers
-///   nothing the existing poll would not have delivered within the same
-///   minute.
+/// - `Attach` and `Create` each already have a process-lifetime poll task —
+///   `session::attach::start_poll_task` and `session::create::start_poll_task`,
+///   both spawned in `main.rs`, each on its own `POLL_INTERVAL`. Create's
+///   equals [`CATCHUP_TICK`]; attach's is SHORTER (15 s, sized against the
+///   source's `ATTACH_TIMEOUT` — see `session::attach::POLL_INTERVAL`).
+///   Driving either from here as well issues a second GET to a route its own
+///   task already polls at least as often, and delivers nothing that task
+///   would not have delivered within the same tick.
 ///
 /// Expressed as a function over the pass rather than as "which helper the
 /// select arm happens to call", because the asymmetry IS the decision and at
@@ -1550,9 +1551,10 @@ mod tests {
     }
 
     /// The tick drives ONLY the arms nothing else drives. `attach` and
-    /// `create` each have their own 60 s poll task in `main.rs`, so adding
-    /// them here is a doubled GET, not a second backstop. This test fails the
-    /// moment someone "restores symmetry" between the two passes.
+    /// `create` each have their own poll task in `main.rs`, each at least as
+    /// frequent as this tick, so adding them here is a doubled GET, not a
+    /// second backstop. This test fails the moment someone "restores symmetry"
+    /// between the two passes.
     #[test]
     fn the_tick_drives_only_the_arms_with_no_other_periodic_owner() {
         let ticked = catchups_for(CatchupPass::Tick);
@@ -1560,17 +1562,23 @@ mod tests {
         for owned_elsewhere in [CatchupKind::Attach, CatchupKind::Create] {
             assert!(
                 !ticked.contains(&owned_elsewhere),
-                "{owned_elsewhere:?} already has a 60s poll task; the tick must not double it"
+                "{owned_elsewhere:?} already has its own poll task; the tick must not double it"
             );
         }
     }
 
-    /// The doubling this split removes is only a doubling because the two
-    /// schedules coincide. Pinned so a change to either period is a decision
-    /// taken here rather than a silent re-divergence.
+    /// The doubling this split removes needs only that each polled arm runs at
+    /// least as often as this tick — NOT that the periods coincide, which is
+    /// what this test used to assert. Attach's no longer does: it is sized
+    /// against the source's `ATTACH_TIMEOUT`, because a grant a dropped push
+    /// lost must be recorded inside the source's own attach budget and every
+    /// source retry mints a fresh jti. Pinned so a change to either period is
+    /// a decision taken here rather than a silent re-divergence.
     #[test]
-    fn the_polled_arms_share_the_ticks_period() {
-        assert_eq!(crate::session::attach::POLL_INTERVAL, CATCHUP_TICK);
+    fn every_polled_arm_polls_at_least_as_often_as_the_tick() {
+        use crate::mcp::remote_terminal::ATTACH_TIMEOUT;
+        assert!(crate::session::attach::POLL_INTERVAL <= CATCHUP_TICK);
+        assert!(crate::session::attach::POLL_INTERVAL < ATTACH_TIMEOUT);
         assert_eq!(crate::session::create::POLL_INTERVAL, CATCHUP_TICK);
     }
 

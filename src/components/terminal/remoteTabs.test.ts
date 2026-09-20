@@ -3,6 +3,9 @@ import {
   applyRemoteMark,
   attachButtonState,
   attachErrorMessage,
+  attachWaitingMessage,
+  applyAttachWaiting,
+  type RemoteAttachWaiting,
   detachedRemoteTabs,
   fleetSessionAttachId,
   remoteBadgeLabel,
@@ -290,9 +293,7 @@ describe("remote history: the outcome is reported, never assumed", () => {
     const seen: RemoteHistoryOutcome[] = [];
     const d = detail((o) => seen.push(o));
     d.report?.({ rendered: false, reason: "a scrollback resync is in flight" });
-    expect(seen).toEqual([
-      { rendered: false, reason: "a scrollback resync is in flight" },
-    ]);
+    expect(seen).toEqual([{ rendered: false, reason: "a scrollback resync is in flight" }]);
   });
 
   it("is optional, so an unmounted pane reporting nothing is distinguishable", () => {
@@ -301,5 +302,62 @@ describe("remote history: the outcome is reported, never assumed", () => {
     const d = detail(undefined);
     expect(d.report).toBeUndefined();
     expect(() => d.report?.({ rendered: true, bytes: 3 })).not.toThrow();
+  });
+});
+
+describe("attachWaitingMessage (the target has not recorded the grant yet)", () => {
+  const waiting = (over: Partial<RemoteAttachWaiting> = {}): RemoteAttachWaiting => ({
+    deviceId: "dev-b",
+    sessionId: "sess-1",
+    waiting: true,
+    attempt: 3,
+    elapsedMs: 8_000,
+    windowMs: 80_000,
+    ...over,
+  });
+
+  it("names the attempt and puts a clock on the wait", () => {
+    const m = attachWaitingMessage(waiting());
+    expect(m).toContain("attempt 3");
+    expect(m).toContain("8s of up to 80s");
+  });
+
+  it("says the SAME grant is re-presented — a fresh mint per attempt was the defect", () => {
+    expect(attachWaitingMessage(waiting())).toContain("re-presenting the same grant");
+  });
+
+  it("is null when nothing is waiting, so no surface renders a stale line", () => {
+    expect(attachWaitingMessage(null)).toBeNull();
+    expect(attachWaitingMessage(undefined)).toBeNull();
+    expect(attachWaitingMessage(waiting({ waiting: false }))).toBeNull();
+  });
+});
+
+describe("applyAttachWaiting", () => {
+  const w = (sessionId: string, waitingFlag: boolean, attempt = 1): RemoteAttachWaiting => ({
+    deviceId: "dev-b",
+    sessionId,
+    waiting: waitingFlag,
+    attempt,
+    elapsedMs: attempt * 4000,
+    windowMs: 80_000,
+  });
+
+  it("keeps one entry per session and advances it", () => {
+    let map = applyAttachWaiting({}, w("a", true, 1));
+    map = applyAttachWaiting(map, w("b", true, 1));
+    map = applyAttachWaiting(map, w("a", true, 2));
+    expect(Object.keys(map).sort()).toEqual(["a", "b"]);
+    expect(map.a.attempt).toBe(2);
+  });
+
+  it("the closing update removes the key — a spinner must not outlive the wait", () => {
+    const map = applyAttachWaiting(applyAttachWaiting({}, w("a", true)), w("a", false));
+    expect(map).toEqual({});
+  });
+
+  it("a closing update for a session never seen waiting changes nothing", () => {
+    const before = { b: w("b", true) };
+    expect(applyAttachWaiting(before, w("a", false))).toBe(before);
   });
 });

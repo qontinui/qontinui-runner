@@ -14,8 +14,10 @@
 //! 2. **Catch-up** — `GET /sessions/attach-requests?device_id=<me>`, device-
 //!    bound exactly like `GET /sessions/respawn-requests`. Run on every coord
 //!    WS (re)connect beside the other two catch-ups, on every backend-relay
-//!    `connected` ack, and on a 60 s timer, so a grant minted while a socket
-//!    was down still reaches the table before its 15-minute life ends.
+//!    `connected` ack, and on a [`POLL_INTERVAL`] timer, so a grant minted
+//!    while a socket was down reaches the table inside the SOURCE's own attach
+//!    budget rather than merely inside the grant's 15-minute life — see that
+//!    constant for why the difference is the whole point.
 //!
 //! Either way the row lands in
 //! [`crate::mcp::remote_terminal::grants`], the table the relay's terminal
@@ -33,9 +35,37 @@ use super::handoff::HandoffError;
 use super::SessionRegistry;
 use crate::mcp::remote_terminal::{grants, now_epoch_secs, AttachGrant};
 
-/// Catch-up poll cadence. Grants live 900 s; one minute keeps the window a
-/// dropped push can hide in well inside that.
-pub const POLL_INTERVAL: Duration = Duration::from_secs(60);
+/// Catch-up poll cadence.
+///
+/// **Sized against the SOURCE's
+/// [`crate::mcp::remote_terminal::ATTACH_TIMEOUT`] (20 s), not against the
+/// grant's 900 s life** — the reading this constant carried until 2026-09-20,
+/// when it was 60 s "well inside" 900 s. The grant's life is what bounds how
+/// long a grant stays USEFUL; it says nothing about how long the source is
+/// willing to wait, and those are different clocks. A source that mints a
+/// grant and presents it immediately is refused `attach_grant_unknown` until
+/// this device has recorded the row, and every retry from the picker mints a
+/// FRESH jti — so a cadence longer than the source's attach budget turns a
+/// dropped push into a PERMANENT failure rather than a flaky one. That is the
+/// observed failure: attach from one box to a target polling at 60 s failed
+/// reproducibly, three times on-page.
+///
+/// At 15 s the worst-case discovery latency for a grant whose push was lost is
+/// one tick, which lands inside the 20 s budget with ~5 s of slack for the GET
+/// itself (measured sub-second against coord).
+///
+/// **The cost, stated rather than assumed:** this is an unconditional coord
+/// GET per tick on every runner in the fleet, so 60 s → 15 s takes it from 60
+/// to **240 requests/hour/device** — 4x on one small device-scoped route, with
+/// no payload growth and no per-session fan-out.
+///
+/// Two residues it deliberately does NOT close, both covered from the SOURCE
+/// side by the same-grant re-presentation in
+/// [`crate::commands::remote_attach`] rather than by shortening this further:
+/// a catch-up GET may take its full [`CATCHUP_TIMEOUT`] (10 s) and carry
+/// discovery past 20 s anyway; and a TARGET whose build predates this change
+/// still polls at 60 s, which no change on this side can shorten.
+pub const POLL_INTERVAL: Duration = Duration::from_secs(15);
 
 /// One attach request, as carried in the `attach_request` push payload and
 /// in each row of `GET /sessions/attach-requests`. Optional fields are read
@@ -243,8 +273,8 @@ pub(super) async fn run_catchup(
 }
 
 /// The background catch-up's HTTP budget. Generous because nothing is waiting
-/// on it — it runs on the 60 s poll and on the coord-WS / relay `connected`
-/// acks.
+/// on it — it runs on the [`POLL_INTERVAL`] poll and on the coord-WS / relay
+/// `connected` acks.
 pub const CATCHUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Run the catch-up once against the registry's coord — the door the backend
@@ -269,8 +299,8 @@ pub async fn catch_up_now_within(registry: &Arc<SessionRegistry>, timeout: Durat
     run_catchup(&http, &coord_url, registry.machine_id(), timeout).await;
 }
 
-/// The 60 s catch-up loop. Returns the handle so the caller can hold it for
-/// the process lifetime.
+/// The [`POLL_INTERVAL`] catch-up loop. Returns the handle so the caller can
+/// hold it for the process lifetime.
 pub fn start_poll_task(registry: Arc<SessionRegistry>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(POLL_INTERVAL);
@@ -377,6 +407,26 @@ mod tests {
         assert_eq!(g.expires_at, 1_788_775_200);
         assert_eq!(g.source_device_id, Uuid::from_u128(1).to_string());
         assert_eq!(g.terminal_id, None);
+    }
+
+    /// Item 3's whole point: the target must be able to LEARN a grant inside
+    /// the SOURCE's own attach budget, not merely inside the grant's life.
+    /// Every source retry mints a fresh jti, so a cadence at or past
+    /// [`crate::mcp::remote_terminal::ATTACH_TIMEOUT`] makes a dropped push a
+    /// permanent failure rather than a flaky one — which is exactly what was
+    /// observed at the old 60 s. Fails on any future widening of the poll.
+    #[test]
+    fn the_poll_lands_inside_the_sources_attach_timeout() {
+        use crate::mcp::remote_terminal::ATTACH_TIMEOUT;
+        assert!(
+            POLL_INTERVAL < ATTACH_TIMEOUT,
+            "poll {POLL_INTERVAL:?} vs attach budget {ATTACH_TIMEOUT:?}: a target that learns a grant more slowly than the source waits makes a dropped attach_request permanent"
+        );
+        // …and with room left for the GET itself inside the same budget.
+        assert!(
+            POLL_INTERVAL + Duration::from_secs(5) <= ATTACH_TIMEOUT,
+            "no slack left for the catch-up GET inside the attach budget"
+        );
     }
 
     /// The list envelope's `storage` marker round-trips, and rows decode.

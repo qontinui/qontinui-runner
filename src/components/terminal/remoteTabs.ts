@@ -268,3 +268,61 @@ export function decodeHistoryBase64(b64: string): Uint8Array {
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
 }
+
+// ---------------------------------------------------------------------------
+// The attach WAITING state (the target has not recorded the grant yet)
+// ---------------------------------------------------------------------------
+
+/**
+ * Tauri event the runner emits while it re-presents the SAME attach grant to a
+ * target that has not recorded it yet (Rust `REMOTE_ATTACH_WAITING_EVENT`).
+ *
+ * A target learns a grant from coord's push or from its own catch-up poll, so
+ * a dropped push leaves the source presenting a grant the target will not know
+ * for up to a whole poll tick. The runner now waits that tick out instead of
+ * failing — and the wait is bounded in tens of seconds, which is long enough
+ * that a spinner with nothing behind it would read as a hang. This event is
+ * what puts a clock on it.
+ */
+export const REMOTE_ATTACH_WAITING_EVENT = "terminal-remote-attach-waiting";
+
+export interface RemoteAttachWaiting {
+  deviceId: string;
+  sessionId: string;
+  /** False on the closing update — the wait is over, however it settled. */
+  waiting: boolean;
+  /** 1-based; the number of presentations of the SAME grant so far. */
+  attempt: number;
+  elapsedMs: number;
+  windowMs: number;
+}
+
+/**
+ * The inline line for a row that is waiting, or null when it is not.
+ *
+ * Deliberately says the grant is being re-presented rather than "retrying":
+ * what the operator must be able to tell is that the source is NOT minting a
+ * new capability per attempt, since that is what used to make this fail for
+ * good.
+ */
+export function attachWaitingMessage(w: RemoteAttachWaiting | null | undefined): string | null {
+  if (!w || !w.waiting) return null;
+  const secs = Math.max(0, Math.round(w.elapsedMs / 1000));
+  const budget = Math.max(0, Math.round(w.windowMs / 1000));
+  const attempts = `attempt ${w.attempt}`;
+  return `Waiting for the target to record the grant — re-presenting the same grant (${attempts}, ${secs}s of up to ${budget}s).`;
+}
+
+/** Fold one event into the per-session waiting map. A closing update removes the key. */
+export function applyAttachWaiting(
+  prev: Record<string, RemoteAttachWaiting>,
+  w: RemoteAttachWaiting,
+): Record<string, RemoteAttachWaiting> {
+  if (!w.waiting) {
+    if (!(w.sessionId in prev)) return prev;
+    const next = { ...prev };
+    delete next[w.sessionId];
+    return next;
+  }
+  return { ...prev, [w.sessionId]: w };
+}
