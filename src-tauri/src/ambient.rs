@@ -290,6 +290,7 @@ pub const AMBIENT_ENV_KEYS: &[&str] = &[
     "QONTINUI_STOP_HOOK_STATUS_OVERRIDE",
     "QONTINUI_SUPERVISOR_PORT",
     "QONTINUI_SUPERVISOR_URL",
+    "QONTINUI_TENANT_ID",
     "QONTINUI_TERMINAL_ID",
     "QONTINUI_TERMINAL_SANITIZE",
     "QONTINUI_TEST_AUTO_LOGIN_EMAIL",
@@ -1892,6 +1893,11 @@ mod tests {
         (
             "mcp/constraints_api.rs",
             "<repo>/.qontinui/<CONFIG_FILENAME> — same file as constraint_engine",
+        ),
+        (
+            "session/workspace_tenant.rs",
+            "<workspace>/.qontinui/config.yml — tier 2's repo-level `tenant:` declaration \
+             (the MACHINE-level tier 3 goes through ambient::qontinui_dir())",
         ),
         (
             "workflow/dag_sync.rs",
