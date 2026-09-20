@@ -138,13 +138,35 @@ pub const RECREATE_PONG_DEADLINE_MS: u64 = crate::ui_error::UI_STALE_AFTER_MS;
 /// bundle boot against a WebView2 profile that has just lost its render
 /// process, on a box loaded enough to have lost it. This file already argues
 /// exactly that allowance for the cold-profile build probe in
-/// [`RECOVERY_WEDGE_AFTER_MS`] — one [`RECOVERY_BACKOFF_MAX_MS`], 60 s — so
-/// the reload rung takes the same number rather than inventing a third.
+/// [`RECOVERY_WEDGE_AFTER_MS`], so the reload rung takes the same number —
+/// [`COLD_BUNDLE_BOOT_ALLOWANCE_MS`] — rather than inventing a third.
 ///
 /// The ceiling on it is [`RECOVERY_ATTEMPT_RESET_MS`], through
 /// [`RECOVERY_WEDGE_AFTER_MS`], of which this is one term;
 /// `recovery_wedge_threshold_cannot_drift_from_the_ladder` pins both.
-pub const RELOAD_PONG_DEADLINE_MS: u64 = RECOVERY_BACKOFF_MAX_MS;
+pub const RELOAD_PONG_DEADLINE_MS: u64 = COLD_BUNDLE_BOOT_ALLOWANCE_MS;
+
+/// How long a COLD WebView2 bundle boot may take on a loaded box before
+/// something is genuinely wrong.
+///
+/// # Why this is its own constant
+///
+/// Two costs in this file are the same question — "the frontend bundle is
+/// loading from scratch against a cold WebView2 profile; how long do we
+/// allow?" — and both used to be spelled [`RECOVERY_BACKOFF_MAX_MS`], which
+/// answers an unrelated one ("how long may the loop guard sleep between
+/// attempts?"). They were numerically equal, so retuning the backoff silently
+/// retuned the reload deadline and the wedge threshold's build allowance with
+/// it. Naming the shared meaning is what stops that: the backoff is now free
+/// to move without touching either.
+///
+/// The two users, both of them cold boots:
+///
+/// * [`RELOAD_PONG_DEADLINE_MS`] — a reload is a cold bundle boot against a
+///   profile that has just lost its render process.
+/// * the trailing term of [`RECOVERY_WEDGE_AFTER_MS`] — the allowance for
+///   `build_main_window`'s deliberately unbounded post-build probe.
+pub const COLD_BUNDLE_BOOT_ALLOWANCE_MS: u64 = 60_000;
 
 /// Poll interval while watching for a post-rung pong (either rung).
 const RUNG_PONG_POLL_MS: u64 = 250;
@@ -182,7 +204,7 @@ const RUNG_PONG_POLL_MS: u64 = 250;
 /// * [`RELOAD_PONG_DEADLINE_MS`] — the bounded post-reload pong watch. A run
 ///   that reloads, hears nothing and escalates pays it IN FULL before the
 ///   recreate's own costs above, all under the one latch.
-/// * a second [`RECOVERY_BACKOFF_MAX_MS`] as the allowance for the *unbounded*
+/// * [`COLD_BUNDLE_BOOT_ALLOWANCE_MS`] as the allowance for the *unbounded*
 ///   `build_main_window` probe: a cold WebView2 profile on a loaded box is slow
 ///   but healthy, so this bound has to be generous rather than tight — the
 ///   false-positive class [`verify_window_has_a_webview`] refuses to create.
@@ -195,7 +217,7 @@ pub const RECOVERY_WEDGE_AFTER_MS: u64 = RECOVERY_BACKOFF_MAX_MS
     + WINDOW_LABEL_RELEASE_TIMEOUT_MS
     + RECREATE_PONG_DEADLINE_MS
     + RELOAD_PONG_DEADLINE_MS
-    + RECOVERY_BACKOFF_MAX_MS;
+    + COLD_BUNDLE_BOOT_ALLOWANCE_MS;
 
 /// Browser args for the main window's WebView2 host.
 ///
@@ -1395,13 +1417,18 @@ pub enum RecoveryOutcome {
     Skipped { why: &'static str },
     /// The main webview was reloaded in place.
     ///
-    /// `verified: true` — a main-labeled pong landed strictly after the reload
-    /// was dispatched: the reloaded UI is demonstrably live. `verified: false`
-    /// — the pong stamp is not readable in this process (no managed
-    /// `AppState`), so the reload is UNKNOWN, deliberately not a failure, the
-    /// same stance recreate takes. A reload that was dispatched and heard
-    /// NOTHING never reports this variant: it escalates to recreate, whose
-    /// outcome then carries `escalated_from_reload`.
+    /// `verified: true` — a main-labeled pong from a DIFFERENT document landed
+    /// strictly after WebView2 ACCEPTED the reload (not merely after it was
+    /// dispatched: `with_webview` only enqueues, so the watch re-baselines
+    /// onto the acceptance instant — [`watch_for_main_pong`]). Both conjuncts
+    /// matter: the pre-reload page keeps ponging on the same window label
+    /// until the new document replaces it, so a timestamp alone would let the
+    /// very page the reload was meant to replace credit it.
+    /// `verified: false` — the pong stamp is not readable in this process (no
+    /// managed `AppState`), so the reload is UNKNOWN, deliberately not a
+    /// failure, the same stance recreate takes. A reload that was dispatched
+    /// and heard NOTHING never reports this variant: it escalates to recreate,
+    /// whose outcome then carries `escalated_from_reload`.
     Reloaded { verified: bool },
     /// The main window was destroyed and rebuilt, and (unless unverifiable)
     /// the rebuilt UI ponged. `escalated_from_reload` is `Some` when this run
@@ -1448,9 +1475,26 @@ pub enum ReloadEscalation {
     /// `Reload()` returned an error on the UI thread, or the dispatched
     /// closure was dropped without running.
     Refused { detail: String },
-    /// The reload was accepted, but no main-window pong landed within
-    /// `deadline_ms` of the dispatch — the reloaded page is not running a UI.
-    NoPong { deadline_ms: u64 },
+    /// No qualifying main-window pong landed within `deadline_ms` of the
+    /// **watch starting** — the reloaded page is not running a UI.
+    ///
+    /// `accepted` is WebView2's own answer, latched by [`AcceptanceWatch`],
+    /// and it is the difference between two genuinely different incidents:
+    ///
+    /// * `true` — WebView2 ran `Reload()` and accepted the navigation, and
+    ///   still nothing ponged. The reload took and the page came up dead.
+    /// * `false` — WebView2 never answered at all (the UI thread has not run
+    ///   the dispatched closure, or this platform's `eval` fallback has no
+    ///   answer to give), so whether the reload ever ran is UNKNOWN. Saying
+    ///   "accepted" here would be a claim nothing in this process can make,
+    ///   and this variant is rendered by [`Self::describe`] onto an
+    ///   operator-visible incident line.
+    ///
+    /// `deadline_ms` is measured from the START of the pong watch, not from
+    /// the dispatch and not from the acceptance: a `Rebaseline` shortens the
+    /// remaining wait rather than extending the total, so the whole watch
+    /// stays inside the one term [`RECOVERY_WEDGE_AFTER_MS`] budgets for it.
+    NoPong { deadline_ms: u64, accepted: bool },
 }
 
 impl ReloadEscalation {
@@ -1459,9 +1503,20 @@ impl ReloadEscalation {
         match self {
             Self::DispatchFailed { detail } => format!("reload could not be dispatched: {detail}"),
             Self::Refused { detail } => format!("WebView2 refused the reload: {detail}"),
-            Self::NoPong { deadline_ms } => {
-                format!("reload accepted, but no main-window pong within {deadline_ms}ms")
-            }
+            Self::NoPong {
+                deadline_ms,
+                accepted: true,
+            } => format!(
+                "reload accepted, but no main-window pong from a new document within \
+                 {deadline_ms}ms of the watch"
+            ),
+            Self::NoPong {
+                deadline_ms,
+                accepted: false,
+            } => format!(
+                "reload dispatched but WebView2 never answered it, and no main-window pong \
+                 from a new document within {deadline_ms}ms of the watch"
+            ),
         }
     }
 }
@@ -1639,8 +1694,15 @@ pub async fn trigger_ui_recovery(
         // The sequencing itself is `run_reload_rung`, which is unit-tested
         // over a canned watch; everything Tauri-shaped is inside the future it
         // is handed.
+        let last_pong = ui_bridge_last_pong(app);
         let rung = run_reload_rung(reload_main_webview(app).map(|dispatch| {
-            verify_reload_took(app, reload_dispatched_ms, document_at_dispatch, dispatch)
+            verify_reload_took(
+                last_pong,
+                reload_dispatched_ms,
+                document_at_dispatch,
+                crate::ui_error::main_document_nonce,
+                dispatch,
+            )
         }))
         .await;
         match rung {
@@ -1678,10 +1740,11 @@ pub async fn trigger_ui_recovery(
             // be fooled by" rather than as a refusal.
             let recreate_done_ms = now_ms();
             match watch_for_main_pong(
-                app,
+                ui_bridge_last_pong(app),
                 recreate_done_ms,
                 document_before_recreate,
                 RECREATE_PONG_DEADLINE_MS,
+                crate::ui_error::main_document_nonce,
                 || RungTick::Continue,
             )
             .await
@@ -1875,6 +1938,21 @@ enum RungTick {
 /// Watch `ui_bridge_last_pong` (MAIN-window pongs only) for `deadline_ms` and
 /// settle [`classify_rung_pong`] against `rung_done_ms`.
 ///
+/// # The seam, and why it is drawn here
+///
+/// `last_pong` is the stamp itself rather than an `AppHandle`, and
+/// `document_now` is the identity reader rather than a direct call to
+/// [`crate::ui_error::main_document_nonce`]. There is no way to build an
+/// `AppHandle` in a unit test (see `server_mode_makes_recovery_inert`), so
+/// while this function took one its whole body — the re-baseline, the
+/// two-conjunct predicate, the post-settle read in [`verify_reload_took`] —
+/// was unreachable from the suite: deleting any of them left it green. Both
+/// parameters are what a caller already has (`ui_bridge_last_pong(app)`, and
+/// the process-global nonce reader), so nothing about the production path
+/// changes; the seam only moves the untestable Tauri lookup one layer out.
+/// `None` means this process has no managed `AppState` — UNKNOWN, reported as
+/// `Unverifiable`, never a failure.
+///
 /// `signal` is polled on every tick the verdict is still `Waiting`; it may end
 /// the watch ([`RungTick::Abort`]) or move the baseline forward
 /// ([`RungTick::Rebaseline`]).
@@ -1896,13 +1974,14 @@ enum RungTick {
 /// Runs inside the recovery latch, which is accounted for: each rung's
 /// deadline is its own term in [`RECOVERY_WEDGE_AFTER_MS`].
 async fn watch_for_main_pong(
-    app: &tauri::AppHandle,
+    last_pong: Option<std::sync::Arc<AtomicU64>>,
     rung_done_ms: u64,
     document_at_rung: Option<String>,
     deadline_ms: u64,
+    mut document_now: impl FnMut() -> Option<String>,
     mut signal: impl FnMut() -> RungTick,
 ) -> RungWatch {
-    let Some(last_pong) = ui_bridge_last_pong(app) else {
+    let Some(last_pong) = last_pong else {
         return RungWatch::Settled(RungPongVerdict::Unverifiable);
     };
     let started_ms = latch_now_ms();
@@ -1914,7 +1993,7 @@ async fn watch_for_main_pong(
         let pong_ms = last_pong.load(Ordering::Relaxed);
         let document_changed = crate::ui_error::document_identity_changed(
             document_at_rung.as_deref(),
-            crate::ui_error::main_document_nonce().as_deref(),
+            document_now().as_deref(),
         );
         match classify_rung_pong(
             pong_ms,
@@ -2040,17 +2119,19 @@ struct ReloadWatchResult {
 /// [`watch_for_main_pong`] for the reload rung, with WebView2's own answer to
 /// the `Reload()` call as both the re-baseline and the abort source.
 async fn verify_reload_took(
-    app: &tauri::AppHandle,
+    last_pong: Option<std::sync::Arc<AtomicU64>>,
     reload_dispatched_ms: u64,
     document_at_dispatch: Option<String>,
+    document_now: impl FnMut() -> Option<String>,
     dispatch: ReloadDispatch,
 ) -> ReloadWatchResult {
     let mut acceptance = AcceptanceWatch::new(dispatch);
     let watch = watch_for_main_pong(
-        app,
+        last_pong,
         reload_dispatched_ms,
         document_at_dispatch,
         RELOAD_PONG_DEADLINE_MS,
+        document_now,
         || acceptance.poll(now_ms()),
     )
     .await;
@@ -2075,7 +2156,9 @@ async fn verify_reload_took(
 /// * a verified pong ⇒ `Reloaded { verified: true }`
 /// * an unreadable stamp ⇒ `Reloaded { verified: false }` (UNKNOWN, NOT a
 ///   failure — the same stance the recreate rung takes)
-/// * no pong by the deadline ⇒ escalate ([`ReloadEscalation::NoPong`])
+/// * no pong by the deadline ⇒ escalate ([`ReloadEscalation::NoPong`]),
+///   carrying whether WebView2 ever ANSWERED the call — both `Accepted` and
+///   `Unanswered` route here, and they are different incidents
 /// * a refusal, from the watch's abort OR latched after it settled ⇒ escalate
 /// * a dispatch error ⇒ escalate, without waiting on anything
 ///
@@ -2101,6 +2184,11 @@ where
          UI to pong"
     );
     let ReloadWatchResult { watch, acceptance } = watch.await;
+    // Read before the move below: `NoPong` reports whether WebView2 ever
+    // answered, because "accepted, then nothing ponged" and "never answered
+    // at all" are different incidents and `describe()` puts this on an
+    // operator-visible line.
+    let accepted = matches!(acceptance, ReloadAcceptance::Accepted { .. });
     if let ReloadAcceptance::Refused { detail } = acceptance {
         return Err(ReloadEscalation::Refused { detail });
     }
@@ -2120,6 +2208,7 @@ where
         RungWatch::Settled(RungPongVerdict::NoPong | RungPongVerdict::Waiting) => {
             Err(ReloadEscalation::NoPong {
                 deadline_ms: RELOAD_PONG_DEADLINE_MS,
+                accepted,
             })
         }
         RungWatch::Aborted(detail) => Err(ReloadEscalation::Refused { detail }),
@@ -2999,7 +3088,8 @@ mod tests {
         assert_eq!(
             run_reload_rung(Ok(async { settled(RungPongVerdict::NoPong) })).await,
             Err(ReloadEscalation::NoPong {
-                deadline_ms: RELOAD_PONG_DEADLINE_MS
+                deadline_ms: RELOAD_PONG_DEADLINE_MS,
+                accepted: true
             })
         );
         // `Waiting` cannot escape the watch, but if it ever did it is NOT a
@@ -3007,7 +3097,8 @@ mod tests {
         assert_eq!(
             run_reload_rung(Ok(async { settled(RungPongVerdict::Waiting) })).await,
             Err(ReloadEscalation::NoPong {
-                deadline_ms: RELOAD_PONG_DEADLINE_MS
+                deadline_ms: RELOAD_PONG_DEADLINE_MS,
+                accepted: true
             })
         );
 
@@ -3044,6 +3135,228 @@ mod tests {
             run_reload_rung(Ok(async { settled(RungPongVerdict::Unverifiable) })).await,
             Ok(RecoveryOutcome::Reloaded { verified: false })
         );
+    }
+
+    /// Round 1 hardened the reload watch in two places that NOTHING could
+    /// reach: the re-baseline onto WebView2's acceptance instant, and the
+    /// post-settle acceptance read. Both lived behind an `&tauri::AppHandle`,
+    /// which no unit test can build — so deleting either (or the whole reload
+    /// block in `trigger_ui_recovery`) left the suite green. `last_pong` is
+    /// now the stamp itself and `document_now` the identity reader, which is
+    /// what makes these tests possible.
+    ///
+    /// Here: the watch must re-baseline onto the ACCEPTANCE instant. A pong
+    /// stamped between the dispatch and the acceptance predates the navigation
+    /// WebView2 actually started — `with_webview` only enqueues — so it must
+    /// not credit the rung even when it carries a new document identity.
+    #[tokio::test]
+    async fn the_watch_re_baselines_onto_the_acceptance_instant() {
+        const DISPATCHED_MS: u64 = 10_000;
+        const ACCEPTED_MS: u64 = DISPATCHED_MS + 10;
+        let last_pong = std::sync::Arc::new(AtomicU64::new(0));
+        let pong = last_pong.clone();
+        let mut ticks = 0u32;
+
+        let watch = watch_for_main_pong(
+            Some(last_pong),
+            DISPATCHED_MS,
+            Some("doc-before".to_string()),
+            // One poll interval is all this needs: the watch measures its
+            // deadline from its own start, so it settles on the second tick.
+            1,
+            // A DIFFERENT document is ponging — the timestamp is the only
+            // thing standing between this and a false `Live`.
+            || Some("doc-after".to_string()),
+            || {
+                ticks += 1;
+                if ticks == 1 {
+                    // Stamped after the dispatch, BEFORE the acceptance.
+                    pong.store(DISPATCHED_MS + 1, Ordering::Relaxed);
+                    RungTick::Rebaseline {
+                        rung_done_ms: ACCEPTED_MS,
+                    }
+                } else {
+                    RungTick::Continue
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            watch,
+            RungWatch::Settled(RungPongVerdict::NoPong),
+            "a pong predating WebView2's acceptance must not credit the reload \
+             — delete the re-baseline and this reads Live"
+        );
+    }
+
+    /// The second conjunct, through the watch rather than through
+    /// `classify_rung_pong` directly: after the re-baseline, a pong stamped
+    /// one millisecond after the acceptance but carrying the SAME document is
+    /// the pre-reload page still answering pings. It must not settle `Live`.
+    #[tokio::test]
+    async fn an_unchanged_document_never_settles_live_after_the_rebaseline() {
+        const DISPATCHED_MS: u64 = 10_000;
+        const ACCEPTED_MS: u64 = DISPATCHED_MS + 10;
+        let last_pong = std::sync::Arc::new(AtomicU64::new(0));
+        let pong = last_pong.clone();
+        let mut ticks = 0u32;
+
+        let watch = watch_for_main_pong(
+            Some(last_pong),
+            DISPATCHED_MS,
+            Some("doc-before".to_string()),
+            1,
+            // The page the reload was meant to replace, still ponging.
+            || Some("doc-before".to_string()),
+            || {
+                ticks += 1;
+                if ticks == 1 {
+                    pong.store(ACCEPTED_MS + 1, Ordering::Relaxed);
+                    RungTick::Rebaseline {
+                        rung_done_ms: ACCEPTED_MS,
+                    }
+                } else {
+                    RungTick::Continue
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            watch,
+            RungWatch::Settled(RungPongVerdict::NoPong),
+            "the 2026-09-18 shape: a fresh timestamp from the OLD document is \
+             not evidence the reload took"
+        );
+
+        // …and the same watch with a changed identity does settle `Live`, so
+        // the assertion above is about the identity and not about the clock.
+        assert_eq!(
+            watch_for_main_pong(
+                Some(std::sync::Arc::new(AtomicU64::new(ACCEPTED_MS + 1))),
+                ACCEPTED_MS,
+                Some("doc-before".to_string()),
+                1,
+                || Some("doc-after".to_string()),
+                || RungTick::Continue,
+            )
+            .await,
+            RungWatch::Settled(RungPongVerdict::Live)
+        );
+    }
+
+    /// The post-settle acceptance read in `verify_reload_took`. A refusal that
+    /// arrives after the pong watch has already settled is still WebView2
+    /// saying "I never ran your call", so it must reach
+    /// `ReloadWatchResult.acceptance` and escalate.
+    ///
+    /// The watch settles `Live` on its FIRST classify here, so `signal` — and
+    /// with it `AcceptanceWatch::poll` — is never called from inside the loop:
+    /// only the read after the loop can find the refusal.
+    #[tokio::test]
+    async fn a_refusal_arriving_after_the_watch_settles_still_reaches_the_result() {
+        const DISPATCHED_MS: u64 = 10_000;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(Err("Reload(): E_FAIL".to_string())).unwrap();
+
+        let result = verify_reload_took(
+            Some(std::sync::Arc::new(AtomicU64::new(DISPATCHED_MS + 1))),
+            DISPATCHED_MS,
+            Some("doc-before".to_string()),
+            || Some("doc-after".to_string()),
+            ReloadDispatch { accepted: Some(rx) },
+        )
+        .await;
+
+        assert_eq!(
+            result.watch,
+            RungWatch::Settled(RungPongVerdict::Live),
+            "the pong settles first — that is the whole point of this case"
+        );
+        assert_eq!(
+            result.acceptance,
+            ReloadAcceptance::Refused {
+                detail: "Reload(): E_FAIL".to_string()
+            },
+            "delete the post-settle acceptance poll and this reads Unanswered"
+        );
+        assert_eq!(
+            run_reload_rung(Ok(async move { result })).await,
+            Err(ReloadEscalation::Refused {
+                detail: "Reload(): E_FAIL".to_string()
+            }),
+            "WebView2's refusal outranks a pong that arrived first"
+        );
+
+        // No managed `AppState` ⇒ no stamp to read ⇒ UNKNOWN, not a failure,
+        // and the acceptance still latches through the same post-settle read.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(Ok(())).unwrap();
+        let unverifiable = verify_reload_took(
+            None,
+            DISPATCHED_MS,
+            None,
+            || None,
+            ReloadDispatch { accepted: Some(rx) },
+        )
+        .await;
+        assert_eq!(
+            unverifiable.watch,
+            RungWatch::Settled(RungPongVerdict::Unverifiable)
+        );
+        assert!(matches!(
+            unverifiable.acceptance,
+            ReloadAcceptance::Accepted { .. }
+        ));
+    }
+
+    /// `NoPong` carries WebView2's own answer, because "accepted, then nothing
+    /// ponged" and "never answered at all" are different incidents — and
+    /// `describe()` puts this on an operator-visible line. The variant used to
+    /// say "reload accepted" for both, and to name a deadline it measured from
+    /// the dispatch rather than from the watch.
+    #[tokio::test]
+    async fn no_pong_reports_whether_webview2_ever_answered() {
+        async fn no_pong(
+            acceptance: ReloadAcceptance,
+        ) -> Result<RecoveryOutcome, ReloadEscalation> {
+            run_reload_rung(Ok(async move {
+                ReloadWatchResult {
+                    watch: RungWatch::Settled(RungPongVerdict::NoPong),
+                    acceptance,
+                }
+            }))
+            .await
+        }
+
+        let accepted = no_pong(ReloadAcceptance::Accepted { at_ms: 1 }).await;
+        assert_eq!(
+            accepted,
+            Err(ReloadEscalation::NoPong {
+                deadline_ms: RELOAD_PONG_DEADLINE_MS,
+                accepted: true
+            })
+        );
+        let line = accepted.unwrap_err().describe();
+        assert!(line.contains("reload accepted"), "{line}");
+        assert!(line.contains("of the watch"), "{line}");
+
+        // Unanswered is UNKNOWN: the escalation must not claim acceptance.
+        let unanswered = no_pong(ReloadAcceptance::Unanswered).await;
+        assert_eq!(
+            unanswered,
+            Err(ReloadEscalation::NoPong {
+                deadline_ms: RELOAD_PONG_DEADLINE_MS,
+                accepted: false
+            })
+        );
+        let line = unanswered.unwrap_err().describe();
+        assert!(
+            !line.contains("accepted"),
+            "an unanswered reload must not be described as accepted: {line}"
+        );
+        assert!(line.contains("never answered"), "{line}");
     }
 
     /// Finding 2: a refusal that lands AFTER the watch settled `Live` used to
@@ -3133,6 +3446,7 @@ mod tests {
         let escalated = serde_json::to_value(RecoveryOutcome::Recreated {
             escalated_from_reload: Some(ReloadEscalation::NoPong {
                 deadline_ms: RELOAD_PONG_DEADLINE_MS,
+                accepted: true,
             }),
         })
         .unwrap();
@@ -3180,7 +3494,10 @@ mod tests {
         let resp = RecoverUiResponse {
             reason: RecoveryReason::Manual.as_str(),
             result: RecoveryOutcome::Recreated {
-                escalated_from_reload: Some(ReloadEscalation::NoPong { deadline_ms: 7 }),
+                escalated_from_reload: Some(ReloadEscalation::NoPong {
+                    deadline_ms: 7,
+                    accepted: true,
+                }),
             },
             attempts: 1,
             exhausted: false,
@@ -3747,11 +4064,11 @@ mod tests {
              healthy run ({bounded}ms), or a slow-but-healthy recreate reports as wedged"
         );
         // …and the allowance over that is the cold-profile build, which is
-        // deliberately unbounded. It is one more `RECOVERY_BACKOFF_MAX_MS`.
+        // deliberately unbounded. It is one `COLD_BUNDLE_BOOT_ALLOWANCE_MS`.
         assert_eq!(
             RECOVERY_WEDGE_AFTER_MS - bounded,
-            RECOVERY_BACKOFF_MAX_MS,
-            "the build allowance must stay derived from RECOVERY_BACKOFF_MAX_MS"
+            COLD_BUNDLE_BOOT_ALLOWANCE_MS,
+            "the build allowance must stay derived from COLD_BUNDLE_BOOT_ALLOWANCE_MS"
         );
 
         // The upper end: the loop guard must not declare a FRESH incident
@@ -3775,8 +4092,17 @@ mod tests {
         // costs a full destroy/rebuild, so the running-frontend staleness
         // number is the wrong calibration for it. It must still be at least as
         // generous as the recreate's.
-        assert_eq!(RELOAD_PONG_DEADLINE_MS, RECOVERY_BACKOFF_MAX_MS);
+        //
+        // It is `COLD_BUNDLE_BOOT_ALLOWANCE_MS` and NOT `RECOVERY_BACKOFF_MAX_MS`
+        // on purpose: the backoff answers "how long may the loop guard sleep
+        // between attempts?", which is a different question that merely had
+        // the same answer. Naming the shared meaning is what lets one move
+        // without silently retuning the other.
+        assert_eq!(RELOAD_PONG_DEADLINE_MS, COLD_BUNDLE_BOOT_ALLOWANCE_MS);
         assert!(RELOAD_PONG_DEADLINE_MS >= RECREATE_PONG_DEADLINE_MS);
+        // The whole ladder still has to fit inside the incident reset window
+        // — the cold-boot allowance is a term of it twice over.
+        assert!(2 * COLD_BUNDLE_BOOT_ALLOWANCE_MS < RECOVERY_ATTEMPT_RESET_MS);
 
         // It stays under the dead threshold — but NOT for the reason this
         // comment used to give. The heartbeat backstop fires on the age of the

@@ -357,12 +357,25 @@ static LAST_EVENT_PONG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 
 /// Stamp an **event-provenance** pong. See [`LAST_EVENT_PONG_MS`] for which
 /// call sites qualify — and, more importantly, which do not.
+///
+/// `fetch_max`, not `store`: this is a "last pong" clock, so it must only ever
+/// move FORWARD. Two pongs racing here each sample their own instant before
+/// writing, so a thread preempted between its sample and its store would
+/// otherwise publish the older of the two and make the loop look staler than
+/// it is. [`record_event_pong_at`] is the other writer and takes the same
+/// care.
 pub fn record_event_pong() {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    LAST_EVENT_PONG_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    record_event_pong_at(now_ms);
+}
+
+/// [`record_event_pong`] with the instant passed in — the one place the
+/// forward-only rule is spelled, so no call site can forget it.
+fn record_event_pong_at(now_ms: u64) {
+    LAST_EVENT_PONG_MS.fetch_max(now_ms, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The last event-provenance pong stamp (ms since epoch), or 0 if none has
@@ -482,26 +495,48 @@ pub fn main_document_nonce() -> Option<String> {
 /// * `(Some(before), Some(after))` → the honest comparison. Equal means the
 ///   page that answered is the same one the rung was meant to replace, which is
 ///   exactly the false credit this check exists to refuse.
-/// * `(None, _)` → nothing was ponging an identified document before the rung,
-///   so there is no predecessor whose pong could be miscredited and the
-///   strictly-after timestamp is sound evidence on its own. This is also what
-///   keeps the check from WEAKENING the recreate rung on a runner whose main
-///   window never came up at all.
+/// * `(None, Some(_))` → nothing was ponging an identified document before the
+///   rung, and something identified is ponging now. There is no predecessor
+///   whose pong could be miscredited, so the strictly-after timestamp is sound
+///   evidence on its own. This is also what keeps the check from WEAKENING the
+///   recreate rung on a runner whose main window never came up at all.
+/// * `(None, None)` → nothing was identified before the rung and nothing is
+///   identified now. An unidentified pong after an unidentified void is no
+///   evidence of anything, least of all of a NEW document, so it is refused
+///   like every other absence. It cannot deadlock a rung: every pong the
+///   frontend sends carries `DOCUMENT_NONCE` on both legs
+///   (`src/hooks/ui-bridge-events/utils.ts`), so a rebuilt or reloaded window
+///   always identifies itself within the rung's deadline — the only
+///   nonce-less ingests in this crate are the IPC-response paths, which are
+///   deliberately fail-closed for exactly this reason.
 /// * `(Some(_), None)` → an identity vanished. Unreachable while this store
 ///   only ever moves forward to `Some`, and refused rather than assumed.
 pub fn document_identity_changed(at_rung: Option<&str>, now: Option<&str>) -> bool {
     match (at_rung, now) {
         (Some(before), Some(after)) => before != after,
-        (None, _) => true,
-        (Some(_), None) => false,
+        (None, Some(_)) => true,
+        // Both absences: nothing to compare, so nothing is proved.
+        (None, None) | (Some(_), None) => false,
     }
 }
 
 fn record_main_document_nonce(document: Option<&str>) {
+    record_main_document_nonce_into(&MAIN_DOCUMENT_NONCE, document);
+}
+
+/// [`record_main_document_nonce`] against a caller-supplied slot, so the
+/// value semantics (an empty or absent nonce leaves the last known identity
+/// alone; a new one replaces it) are testable on a LOCAL mutex rather than on
+/// the process-global [`MAIN_DOCUMENT_NONCE`] that sibling tests write
+/// concurrently. Same split, and the same reason, as [`insert_bounded`].
+fn record_main_document_nonce_into(
+    slot: &std::sync::Mutex<Option<String>>,
+    document: Option<&str>,
+) {
     let Some(document) = document.filter(|d| !d.is_empty()) else {
         return;
     };
-    let mut slot = MAIN_DOCUMENT_NONCE
+    let mut slot = slot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if slot.as_deref() != Some(document) {
@@ -563,7 +598,7 @@ pub fn ingest_window_pong_at(
         last_pong.store(now_ms, std::sync::atomic::Ordering::Relaxed);
     }
     if event_provenance {
-        LAST_EVENT_PONG_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+        record_event_pong_at(now_ms);
     }
     record_window_pong_diagnostic(label.unwrap_or(UNLABELED_PONG_KEY), now_ms);
     is_main
@@ -2331,6 +2366,24 @@ mod tests {
         );
     }
 
+    /// It is a "LAST pong" clock, so it may only ever move FORWARD — and that
+    /// has to be a property of the writer, not of the instants its callers
+    /// happen to pass. Two pongs racing each sample their own instant before
+    /// writing; with an unconditional `store` the one preempted in between
+    /// publishes the OLDER stamp and the loop reads staler than it is.
+    #[test]
+    fn the_event_clock_only_ever_moves_forward() {
+        let now = wall_now_ms();
+        record_event_pong_at(now);
+        // The preempted sibling: an older sample, written later.
+        record_event_pong_at(now.saturating_sub(30_000));
+        assert!(
+            last_event_pong() >= now,
+            "an older sample must not drag the last-pong clock backwards (read {})",
+            last_event_pong()
+        );
+    }
+
     #[test]
     fn event_dead_rung_tracks_the_pong_dead_rung() {
         // They are equal today and free to diverge; what may never happen is
@@ -2650,12 +2703,17 @@ mod tests {
         ingest_window_pong_at(&last_pong, Some("terminal-9"), None, true, "main", now);
 
         // The clock is process-global, so a sibling test may stamp it
-        // concurrently — but only ever FORWARD (every writer in the crate,
-        // test or not, passes a wall-clock instant). `>= now` is therefore the
-        // strongest assertion that cannot flake, and unlike an age window it
-        // cannot be satisfied by a stamp that predates this test's own ingest:
-        // delete the `LAST_EVENT_PONG_MS` store from `ingest_window_pong_at`
-        // and this fails, which a "younger than 60s" bound did not.
+        // concurrently — but only ever FORWARD, and that is a property of the
+        // WRITER (`record_event_pong_at`'s `fetch_max`), not merely of the
+        // instants its callers happen to pass. An unconditional `store` gave
+        // this assertion no such guarantee: a sibling preempted between
+        // sampling its instant and writing it would publish a stamp older
+        // than this test's own ingest and fail here for no defect at all.
+        // `>= now` is therefore the strongest assertion that cannot flake,
+        // and unlike an age window it cannot be satisfied by a stamp that
+        // predates this test's ingest: delete the event-clock stamp from
+        // `ingest_window_pong_at` and this fails, which a "younger than 60s"
+        // bound did not.
         assert!(
             last_event_pong() >= now,
             "a pop-out event pong stamps the loop clock (read {}, ingested at {now})",
@@ -2790,33 +2848,122 @@ mod tests {
         // Nothing was ponging an identified document before the rung, so there
         // is no predecessor to miscredit: the timestamp stands on its own.
         assert!(document_identity_changed(None, Some("after")));
-        assert!(document_identity_changed(None, None));
+        // …but an UNIDENTIFIED pong after an unidentified void proves nothing
+        // at all — least of all that a NEW document exists. Both absences are
+        // refused, like every other absence here.
+        assert!(
+            !document_identity_changed(None, None),
+            "an unidentified pong after an unidentified void is not evidence"
+        );
+    }
+
+    /// The `(None, None)` refusal above must not be able to deadlock a rung.
+    /// Every pong the frontend sends carries `DOCUMENT_NONCE` on both legs, so
+    /// a reloaded or rebuilt main window identifies itself the first time it
+    /// pongs — which flips the pair to `(None, Some(_))` (or `(Some, Some)`)
+    /// and lets the rung settle. Only the IPC-response paths ingest without a
+    /// nonce, and those are fail-closed by design.
+    #[test]
+    fn a_rebuilt_window_always_identifies_itself_so_the_refusal_cannot_deadlock() {
+        let slot = std::sync::Mutex::new(None);
+
+        // Before the rung: nothing identified (a runner whose main window
+        // never came up), and the nonce-less IPC-response path keeps it so.
+        record_main_document_nonce_into(&slot, None);
+        let before = slot.lock().unwrap().clone();
+        assert_eq!(before, None);
+        assert!(!document_identity_changed(
+            before.as_deref(),
+            slot.lock().unwrap().as_deref()
+        ));
+
+        // The rebuilt window's first pong carries its document.
+        record_main_document_nonce_into(&slot, Some("fresh-bundle-load"));
+        assert!(
+            document_identity_changed(before.as_deref(), slot.lock().unwrap().as_deref()),
+            "a rebuilt window's identified pong must settle the rung"
+        );
+    }
+
+    /// The value semantics of the main-document store, on a LOCAL slot: an
+    /// absent or empty nonce leaves the last known identity alone rather than
+    /// erasing it, and a new one replaces it. Split out of the global test
+    /// below for the same reason `insert_bounded` was — the process-global
+    /// `MAIN_DOCUMENT_NONCE` is written by sibling tests concurrently, so
+    /// exact-value assertions on it rest on an unwritten invariant.
+    #[test]
+    fn recording_a_document_nonce_refuses_every_absence() {
+        let slot = std::sync::Mutex::new(None);
+        let read = || slot.lock().unwrap().clone();
+
+        record_main_document_nonce_into(&slot, None);
+        assert_eq!(read(), None, "an absent nonce records nothing");
+        record_main_document_nonce_into(&slot, Some(""));
+        assert_eq!(read(), None, "an empty nonce records nothing");
+
+        record_main_document_nonce_into(&slot, Some("doc-a"));
+        assert_eq!(read().as_deref(), Some("doc-a"));
+
+        // Neither absence may ERASE what is already known.
+        record_main_document_nonce_into(&slot, None);
+        record_main_document_nonce_into(&slot, Some(""));
+        assert_eq!(read().as_deref(), Some("doc-a"));
+
+        // Re-recording the same identity is a no-op, and a new one replaces.
+        record_main_document_nonce_into(&slot, Some("doc-a"));
+        assert_eq!(read().as_deref(), Some("doc-a"));
+        record_main_document_nonce_into(&slot, Some("doc-d"));
+        assert_eq!(read().as_deref(), Some("doc-d"));
     }
 
     /// Only a MAIN-window pong that CARRIES a nonce moves the main document
     /// identity: a pop-out has its own document, and an unidentified pong must
     /// not erase what is known.
+    ///
+    /// This is the SMOKE assertion — that `ingest_window_pong_at` is actually
+    /// wired to the process-global store, and that the label scoping holds.
+    /// The value semantics live on a local slot in
+    /// `recording_a_document_nonce_refuses_every_absence`, because
+    /// `MAIN_DOCUMENT_NONCE` is process-global and any exact-value assertion
+    /// on it would otherwise rest on an unwritten "no sibling test ingests a
+    /// main pong carrying a document" invariant. The nonces here are unique to
+    /// this test so the wiring assertion says what it means even if that
+    /// invariant is broken later.
     #[test]
     fn only_a_main_labeled_pong_records_the_main_document_nonce() {
         let now = wall_now_ms();
         let last_pong = std::sync::atomic::AtomicU64::new(0);
+        let mine = "doc-main-label-scoping-test";
 
-        ingest_window_pong_at(&last_pong, Some("m"), Some("doc-a"), false, "m", now);
-        assert_eq!(main_document_nonce().as_deref(), Some("doc-a"));
+        ingest_window_pong_at(&last_pong, Some("m"), Some(mine), false, "m", now);
+        assert_eq!(
+            main_document_nonce().as_deref(),
+            Some(mine),
+            "a main-labeled pong carrying a nonce reaches the global store"
+        );
 
-        // A pop-out's document, and an unlabeled caller's: neither is main.
-        ingest_window_pong_at(&last_pong, Some("t-1"), Some("doc-b"), true, "m", now);
-        ingest_window_pong_at(&last_pong, None, Some("doc-c"), false, "m", now);
-        assert_eq!(main_document_nonce().as_deref(), Some("doc-a"));
-
-        // A main pong with no nonce (a curl) leaves the last known identity
-        // alone rather than blanking it.
+        // A pop-out's document, and an unlabeled caller's: neither is main,
+        // so neither may displace the main window's identity.
+        ingest_window_pong_at(
+            &last_pong,
+            Some("t-1"),
+            Some("doc-popout-never-main"),
+            true,
+            "m",
+            now,
+        );
+        ingest_window_pong_at(
+            &last_pong,
+            None,
+            Some("doc-unlabeled-never-main"),
+            false,
+            "m",
+            now,
+        );
+        // A main pong with no nonce (a curl, or an IPC response) leaves the
+        // last known identity alone rather than blanking it.
         ingest_window_pong_at(&last_pong, Some("m"), None, false, "m", now);
         ingest_window_pong_at(&last_pong, Some("m"), Some(""), false, "m", now);
-        assert_eq!(main_document_nonce().as_deref(), Some("doc-a"));
-
-        // …and the main window's reloaded document does move it.
-        ingest_window_pong_at(&last_pong, Some("m"), Some("doc-d"), false, "m", now);
-        assert_eq!(main_document_nonce().as_deref(), Some("doc-d"));
+        assert_eq!(main_document_nonce().as_deref(), Some(mine));
     }
 }
