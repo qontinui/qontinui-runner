@@ -62,9 +62,13 @@ export default [
       "react-hooks/preserve-manual-memoization": "warn",
       // UI Bridge Section 3 / Phase B5d: plugin is wired but the rule is
       // intentionally OFF until the codebase is progressively annotated with
-      // <State> wrappers. The runner's `lint` script uses `--max-warnings 0`,
-      // so a 'warn' setting (1355 unannotated sites) breaks CI for unrelated
-      // PRs. Flip this to 'warn' once the per-page annotation pass lands.
+      // <State> wrappers. A 'warn' setting would add 1483 warnings (measured
+      // 2026-09-20, 343 files) that nothing would act on: the `lint` script CI
+      // runs (.github/workflows/ci.yml:426,
+      // .github/workflows/stacked-pr-fastlane.yml:391) does NOT pass
+      // `--max-warnings 0`, and `lint:strict`, which does, is invoked nowhere.
+      // So 'warn' here would not be ENFORCED — see the `error` reasoning below.
+      // Flip this to 'error' once the per-page annotation pass lands.
       "@qontinui/ui-bridge/require-state-annotation": "off",
       // Plan `2026-09-04-effect-calculus-joins-the-component-action-registry`,
       // Phase 3 — the ratchet, shipped ON.
@@ -81,7 +85,7 @@ export default [
       // annotated all 64 registered actions FIRST, so this rule starts green;
       // it is a ratchet on a clean corpus rather than a promise to clean one
       // up later. `require-state-annotation` shipped "off until the codebase is
-      // progressively annotated" and has stayed off ever since across 1355
+      // progressively annotated" and has stayed off ever since across 1483
       // sites — a capability nobody switched on is a capability the product
       // does not have [policy: `capability-ships-enabled`]. Note also that
       // `lint` does NOT pass `--max-warnings 0`, so a `warn` here would be
