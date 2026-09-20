@@ -1835,6 +1835,56 @@ pub fn credential_state(
     }
 }
 
+/// Does this runner HOLD a credential for one tenant — tri-state, PURE over
+/// the two slot states it is handed (no I/O, same shape as
+/// [`credential_state`] so a unit test can drive every combination).
+///
+/// This is deliberately a WEAKER question than [`TenantCredential::can_act`]:
+/// a stored-but-expired JWT *is* a credential this runner holds (the
+/// refresher re-derives it, and `reconcile_paired_bindings_with` keeps such a
+/// binding and merely flags it), so `PresentButDead` answers `Some(true)`
+/// here while `can_act` answers `Some(false)`. The two questions have
+/// different users: `can_act` decides whether a session can work right now,
+/// this decides whether a `paired_user.json` `bindings` ENTRY is warranted.
+///
+/// The tri-state is the point. `None` is UNKNOWN — the store errored and
+/// nothing was established — and a caller that widens a binding set must
+/// treat it as "do not widen", never as a `true`. Returning `false` there
+/// would be just as wrong in the other direction for a caller that drops.
+/// (Served policy `verification-and-evidence`
+/// `unknown-must-not-render-as-a-default`; same reason
+/// [`BindingTenantRead`] has a third arm and `try_list_tenant_device_jwt_tenants`
+/// exists beside the `unwrap_or_default` collapse.)
+///
+/// The legacy `access_token` slot holds the DEFAULT binding's JWT (D4), so it
+/// is folded into the answer for the default tenant and for no other —
+/// exactly as [`select_device_bearer`] and [`credential_state`] do.
+pub fn holds_credential_for(
+    slot: SlotState,
+    is_default: bool,
+    default_slot: SlotState,
+) -> Option<bool> {
+    match slot {
+        // Issued for this tenant — alive or rotted, the runner holds it.
+        SlotState::Usable | SlotState::PresentButDead => Some(true),
+        // Nothing established for this tenant's own slot. The legacy
+        // fallback can still answer for the DEFAULT tenant, and only there.
+        SlotState::Unreadable if !is_default => None,
+        SlotState::Absent if !is_default => Some(false),
+        _ => match (slot, default_slot) {
+            // Own slot unreadable: a present legacy default still proves a
+            // credential; anything else leaves the tenant's own read UNKNOWN.
+            (SlotState::Unreadable, SlotState::Usable | SlotState::PresentButDead) => Some(true),
+            (SlotState::Unreadable, _) => None,
+            // Own slot measured absent: the legacy default is the whole
+            // answer, and an unreadable one establishes nothing.
+            (_, SlotState::Usable | SlotState::PresentButDead) => Some(true),
+            (_, SlotState::Absent) => Some(false),
+            (_, SlotState::Unreadable) => None,
+        },
+    }
+}
+
 /// Gate so the dead-default-slot warning is logged at most once per process.
 static DEAD_LEGACY_SLOT_WARNED: std::sync::Once = std::sync::Once::new();
 

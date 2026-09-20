@@ -3811,3 +3811,1098 @@ mod pair_code_hang_regression_tests {
         }
     }
 }
+
+// ============================================================================
+// One binding store — convergence + the split-brain doctor check
+// (plan 2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin, D4)
+// ============================================================================
+//
+// Four `paired_user.json` files were found on the operator box: the live one
+// under `%LOCALAPPDATA%` (what `paired_user_path()` computes with no env
+// override), a 2-month-stale v2 copy and a test-instance copy under
+// `%APPDATA%/…/instances/`, and a 4-month-stale LEGACY-shaped copy under
+// `%APPDATA%` whose reader cannot see the second binding at all. Which file a
+// process reads decides which tenants it believes exist.
+//
+// ## Why this does NOT scan the disk
+//
+// The canonical location is not a mystery and needs no discovery heuristic:
+// [`paired_user_path`] is deterministic — `$QONTINUI_SECURE_STORAGE_DIR` when
+// set and non-empty, else `dirs::data_local_dir()/com.qontinui.runner/`. So
+// the candidate set here is EXACTLY the paths this process would itself
+// compute ([`binding_store_candidate_paths`]): that override when set, and
+// the bare `data_local_dir()` default. Nothing else.
+//
+// Absorbing an arbitrary `paired_user.json` found by walking the filesystem
+// would be a binding-store WRITE driven by a path nobody authorized, and the
+// `instances/test-19f837ee6c6-6/` copy on the operator box is the concrete
+// proof that such a scan picks up test fixtures. Deciding priority for that
+// call: robustness.
+//
+// ## Why nothing is deleted
+//
+// Non-canonical copies are renamed `paired_user.json.superseded-<date>`, never
+// removed, so a misdiagnosis is recoverable by hand.
+
+/// The `paired_user.json` paths THIS process would itself compute — the only
+/// files [`converge_binding_store`] will ever read or rename.
+///
+/// Canonical first. With no override that is a one-element set and the merge
+/// is a no-op by construction; with an override set the bare
+/// `data_local_dir()` default is the one other candidate.
+pub fn binding_store_candidate_paths() -> Vec<PathBuf> {
+    binding_store_candidate_paths_with(std::env::var("QONTINUI_SECURE_STORAGE_DIR").ok())
+}
+
+/// Env-free core of [`binding_store_candidate_paths`] (same reason
+/// [`paired_user_path_with`] exists — no process-global `set_var` in tests).
+pub(crate) fn binding_store_candidate_paths_with(override_dir: Option<String>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    // Canonical: exactly what `paired_user_path()` resolves to.
+    if let Some(p) = paired_user_path_with(override_dir) {
+        out.push(p);
+    }
+    // The bare default, which an override-carrying process would otherwise
+    // strand. `paired_user_path_with(None)` IS that default.
+    if let Some(p) = paired_user_path_with(None) {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// What one [`converge_binding_store`] pass merged, withheld and renamed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BindingStoreMergeReport {
+    /// Non-canonical copies absorbed, each with the `.superseded-<date>`
+    /// name it now carries.
+    pub superseded: Vec<(PathBuf, PathBuf)>,
+    /// Copies that exist but could NOT be read or parsed. UNKNOWN: they are
+    /// neither merged nor renamed, because absorbing a file whose contents
+    /// were never established is not a merge, and renaming it would hide the
+    /// evidence.
+    pub unreadable: Vec<PathBuf>,
+    /// Tenants present in a non-canonical copy that were NOT merged into
+    /// `bindings` because this runner holds no credential for them (or the
+    /// credential store could not be read, which is UNKNOWN and therefore
+    /// also a no). Reported, never fabricated.
+    pub withheld_no_credential: Vec<String>,
+    /// Bindings actually added to the canonical file by this pass.
+    pub merged: Vec<String>,
+    /// Bindings whose `paired_at` was advanced from a newer copy.
+    pub refreshed: Vec<String>,
+    /// The canonical file was rewritten (a merge, or a legacy to v2 migration).
+    pub wrote_canonical: bool,
+    /// The canonical file was in the LEGACY single-tenant shape and has been
+    /// migrated in place to v2 by the `effective_bindings` read path.
+    pub migrated_legacy: bool,
+}
+
+/// Converge the binding store: merge every other copy under a path this
+/// process would itself compute into the canonical one, then leave each
+/// absorbed copy as `.superseded-<date>`.
+///
+/// Called once at runner start. Best-effort: every failure is logged and
+/// nothing it touches is load-bearing for the caller.
+pub fn converge_binding_store() -> BindingStoreMergeReport {
+    let paths = binding_store_candidate_paths();
+    let Some((canonical, others)) = paths.split_first() else {
+        tracing::warn!("converge_binding_store: could not resolve any paired_user.json path");
+        return BindingStoreMergeReport::default();
+    };
+    let mgr = crate::auth::AuthManager::new();
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let report = converge_binding_store_with(
+        canonical,
+        others,
+        &|t: &uuid::Uuid, is_default: bool| {
+            crate::auth::holds_credential_for(
+                crate::auth::read_tenant_slot(&mgr, t).state(),
+                is_default,
+                crate::auth::read_legacy_slot(&mgr).state(),
+            )
+        },
+        &today,
+    );
+    if report.wrote_canonical || !report.superseded.is_empty() || !report.unreadable.is_empty() {
+        tracing::info!(
+            "converge_binding_store: canonical={} merged={:?} refreshed={:?} \
+             migrated_legacy={} superseded={:?} withheld_no_credential={:?} unreadable={:?}",
+            canonical.display(),
+            report.merged,
+            report.refreshed,
+            report.migrated_legacy,
+            report
+                .superseded
+                .iter()
+                .map(|(a, b)| format!("{} -> {}", a.display(), b.display()))
+                .collect::<Vec<_>>(),
+            report.withheld_no_credential,
+            report.unreadable,
+        );
+    }
+    report
+}
+
+/// Path-parameterized core of [`converge_binding_store`] — explicit canonical
+/// path, explicit other-copy list, and an injected credential predicate so the
+/// unit tests run against a temp home with no keychain at all.
+///
+/// `holds_credential(tenant, is_default)` is [`crate::auth::holds_credential_for`]
+/// in production; `None` is UNKNOWN and is treated as "do not widen".
+pub(crate) fn converge_binding_store_with(
+    canonical: &std::path::Path,
+    others: &[PathBuf],
+    holds_credential: &dyn Fn(&uuid::Uuid, bool) -> Option<bool>,
+    today: &str,
+) -> BindingStoreMergeReport {
+    let mut report = BindingStoreMergeReport::default();
+
+    // The canonical file is the base. A missing one is not an invitation to
+    // synthesize a binding store out of stale copies: with nothing local to
+    // merge INTO there is no authority here to merge under, and pairing is
+    // the path that creates the file.
+    let Some(base) = read_paired_user_file_at(canonical) else {
+        if canonical.exists() {
+            report.unreadable.push(canonical.to_path_buf());
+        }
+        return report;
+    };
+
+    let base_was_legacy = !base.is_v2();
+    let mut bindings: Vec<PairedBinding> = base.effective_bindings();
+    let default_tenant = base.effective_default_tenant_id();
+    let mut changed = false;
+
+    for other in others {
+        if !other.exists() {
+            continue;
+        }
+        let Some(pf) = read_paired_user_file_at(other) else {
+            // UNKNOWN. Not merged, NOT renamed — see `unreadable`'s doc.
+            tracing::warn!(
+                "converge_binding_store: {} exists but could not be read/parsed — \
+                 left in place, contents UNKNOWN",
+                other.display()
+            );
+            report.unreadable.push(other.clone());
+            continue;
+        };
+
+        for cand in pf.effective_bindings() {
+            let key = cand.tenant_id.trim().to_string();
+            match bindings
+                .iter_mut()
+                .find(|b| b.tenant_id.trim() == key.as_str())
+            {
+                // Already bound here: newest `paired_at` per tenant wins.
+                // RFC3339 strings order lexicographically; a `None` sorts
+                // oldest, which is what `reconcile_paired_bindings_with`
+                // already assumes.
+                Some(existing) => {
+                    if cand.paired_at.is_some() && cand.paired_at > existing.paired_at {
+                        existing.paired_at = cand.paired_at.clone();
+                        existing.user_id = cand.user_id.clone();
+                        report.refreshed.push(key);
+                        changed = true;
+                    }
+                }
+                // A tenant this copy knows and the canonical file does not.
+                //
+                // *** NEVER merge into `bindings` a tenant with no
+                // credential. *** `bindings` deliberately holds only tenants
+                // this runner has a credential for — `reconcile_paired_bindings_with`
+                // flags the rest as `coord_only` and never fabricates an
+                // entry (see `CoordBoundTenantsFile`'s header, which exists
+                // precisely because that set is NOT a binding record). A
+                // merge that widened it would silently widen the admitted set
+                // `coord_mcp::spawn_tenant_admission` computes from this same
+                // file — i.e. a stale file on disk would grant a session a
+                // tenant no human paired it for. That is the one thing this
+                // plan's security argument forbids, reached from the other
+                // end, so the gate is here and it is fail-closed: a malformed
+                // tenant id and an UNREADABLE credential store both withhold.
+                None => {
+                    let Ok(t) = uuid::Uuid::parse_str(&key) else {
+                        tracing::warn!(
+                            "converge_binding_store: ignoring binding with malformed tenant_id \
+                             {key:?} in {}",
+                            other.display()
+                        );
+                        report.withheld_no_credential.push(key);
+                        continue;
+                    };
+                    let is_default = default_tenant.as_deref().map(str::trim) == Some(key.as_str());
+                    if holds_credential(&t, is_default) == Some(true) {
+                        bindings.push(cand);
+                        report.merged.push(key);
+                        changed = true;
+                    } else {
+                        report.withheld_no_credential.push(key);
+                    }
+                }
+            }
+        }
+
+        // Absorbed: the copy's contents were read and folded in (even when
+        // that folded in nothing). Supersede it so no future reader picks it.
+        match supersede_copy(other, today) {
+            Ok(to) => report.superseded.push((other.clone(), to)),
+            Err(e) => tracing::warn!(
+                "converge_binding_store: could not supersede {}: {e}",
+                other.display()
+            ),
+        }
+    }
+
+    // The legacy shape is migrated IN PLACE by the existing
+    // `effective_bindings` / `effective_default_tenant_id` read path: their
+    // synthesized view is simply written back as v2, so a legacy file stops
+    // hiding every binding but one from the next reader.
+    if base_was_legacy && !bindings.is_empty() {
+        report.migrated_legacy = true;
+        changed = true;
+    }
+
+    if changed {
+        // Mirrors track the DEFAULT binding (D4), exactly as
+        // `reconcile_paired_bindings_with` writes them.
+        let default_binding = default_tenant
+            .as_deref()
+            .and_then(|d| bindings.iter().find(|b| b.tenant_id.trim() == d.trim()));
+        let out = PairedUserFile {
+            user_id: default_binding
+                .map(|b| b.user_id.clone())
+                .unwrap_or_else(|| base.user_id.clone()),
+            tenant_id: default_tenant.clone(),
+            bindings,
+            default_tenant_id: default_tenant,
+        };
+        match write_paired_user_file(canonical, &out) {
+            Ok(()) => report.wrote_canonical = true,
+            Err(e) => tracing::warn!(
+                "converge_binding_store: write {} failed: {e}",
+                canonical.display()
+            ),
+        }
+    }
+
+    report
+}
+
+/// Rename an absorbed copy to `paired_user.json.superseded-<date>`. Never
+/// deletes: a misdiagnosis here must be recoverable by hand. A same-day
+/// re-run that would collide gets `-2`, `-3`, … rather than clobbering the
+/// earlier evidence.
+fn supersede_copy(from: &std::path::Path, today: &str) -> Result<PathBuf, String> {
+    let base = from.as_os_str().to_string_lossy().to_string();
+    for n in 1..=16u32 {
+        let suffix = if n == 1 {
+            format!(".superseded-{today}")
+        } else {
+            format!(".superseded-{today}-{n}")
+        };
+        let to = PathBuf::from(format!("{base}{suffix}"));
+        if to.exists() {
+            continue;
+        }
+        return std::fs::rename(from, &to)
+            .map(|()| to.clone())
+            .map_err(|e| format!("rename {} -> {}: {e}", from.display(), to.display()));
+    }
+    Err(format!(
+        "{}: 16 .superseded-{today}* names already taken",
+        from.display()
+    ))
+}
+
+// ----------------------------------------------------------------------------
+// The doctor check
+// ----------------------------------------------------------------------------
+
+/// One computed copy, described. Serialized into `/coord-mcp/doctor`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BindingStoreCopyView {
+    pub path: String,
+    /// Is this the file [`paired_user_path`] resolves to?
+    pub canonical: bool,
+    /// `present` | `absent` | `unreadable`.
+    pub read: &'static str,
+    /// The migrated binding set, sorted. `None` is UNKNOWN (unreadable) —
+    /// never an empty list, which would read as "bound to nothing".
+    pub tenants: Option<Vec<String>>,
+    pub default_tenant_id: Option<String>,
+    /// `Some(true)` when this copy is in the pre-v2 single-tenant shape.
+    pub legacy_shape: Option<bool>,
+    /// `tenant_id -> paired_at`, for the REPORT-only difference arm.
+    pub paired_at: Option<std::collections::BTreeMap<String, String>>,
+}
+
+/// The split-brain verdict over the computed copies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BindingStoreCheck {
+    /// `ok` | `report` | `fail` | `unknown`.
+    ///
+    /// - `fail` — two live copies disagree on the BINDING SET or on
+    ///   `default_tenant_id`. That is a real split brain: which file a
+    ///   process reads decides which tenants it believes exist.
+    /// - `report` — they agree on both, and differ only on `paired_at`.
+    ///   That is cosmetic, and it is the ONLY way the copies differ on the
+    ///   operator box today, so failing on it would fail a healthy machine
+    ///   from day one and get the check disabled. Deciding priority:
+    ///   robustness.
+    /// - `unknown` — a copy exists and could not be read. UNKNOWN is never
+    ///   "no disagreement" (same discipline as `tenant_slots_unknown` and
+    ///   `auth::BindingTenantRead::Unknown`).
+    /// - `ok` — fewer than two live copies, or they agree outright.
+    pub verdict: &'static str,
+    pub detail: String,
+    pub copies: Vec<BindingStoreCopyView>,
+}
+
+impl BindingStoreCheck {
+    /// Does this verdict FAIL the doctor?
+    pub fn failed(&self) -> bool {
+        self.verdict == "fail"
+    }
+    /// Is the comparison UNKNOWN? A caller must not read this as agreement.
+    pub fn is_unknown(&self) -> bool {
+        self.verdict == "unknown"
+    }
+}
+
+/// Inspect the `paired_user.json` copies this process would itself compute.
+/// Read-only — the doctor never writes.
+pub fn binding_store_check() -> BindingStoreCheck {
+    inspect_binding_store_paths(&binding_store_candidate_paths())
+}
+
+/// Path-parameterized core of [`binding_store_check`]. `paths[0]` is the
+/// canonical one.
+pub(crate) fn inspect_binding_store_paths(paths: &[PathBuf]) -> BindingStoreCheck {
+    let copies: Vec<BindingStoreCopyView> = paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| describe_binding_store_copy(p, i == 0))
+        .collect();
+
+    let live: Vec<&BindingStoreCopyView> = copies.iter().filter(|c| c.read != "absent").collect();
+    let unreadable = live.iter().filter(|c| c.read == "unreadable").count();
+    let readable: Vec<&&BindingStoreCopyView> =
+        live.iter().filter(|c| c.read == "present").collect();
+
+    // Order matters: a disagreement we CAN see is a fail even when another
+    // copy is unreadable, but an unreadable copy must never let "the rest
+    // agree" stand in for "no disagreement".
+    let sets_differ = readable
+        .windows(2)
+        .any(|w| w[0].tenants != w[1].tenants || w[0].default_tenant_id != w[1].default_tenant_id);
+    let paired_at_differs = readable
+        .windows(2)
+        .any(|w| w[0].paired_at != w[1].paired_at);
+
+    let (verdict, detail) = if sets_differ {
+        (
+            "fail",
+            format!(
+                "{} live paired_user.json copies disagree on the binding set or on \
+                 default_tenant_id — which file a process reads decides which tenants it \
+                 believes exist. Run the runner once to converge them (the non-canonical \
+                 copy is left as .superseded-<date>), or reconcile by hand.",
+                readable.len()
+            ),
+        )
+    } else if unreadable > 0 {
+        (
+            "unknown",
+            format!(
+                "{unreadable} of {} live paired_user.json copies could not be read — \
+                 agreement is UNKNOWN, not established. An unreadable copy is never \
+                 evidence of no disagreement.",
+                live.len()
+            ),
+        )
+    } else if paired_at_differs {
+        (
+            "report",
+            format!(
+                "{} live paired_user.json copies agree on the binding set and on \
+                 default_tenant_id, and differ only on paired_at — cosmetic, reported \
+                 rather than failed.",
+                readable.len()
+            ),
+        )
+    } else if readable.len() < 2 {
+        (
+            "ok",
+            format!(
+                "{} live paired_user.json copy/copies under a path this process computes — \
+                 nothing to disagree with.",
+                readable.len()
+            ),
+        )
+    } else {
+        (
+            "ok",
+            format!("{} live paired_user.json copies agree.", readable.len()),
+        )
+    };
+
+    BindingStoreCheck {
+        verdict,
+        detail,
+        copies,
+    }
+}
+
+fn describe_binding_store_copy(path: &std::path::Path, canonical: bool) -> BindingStoreCopyView {
+    let mut view = BindingStoreCopyView {
+        path: path.display().to_string(),
+        canonical,
+        read: "absent",
+        tenants: None,
+        default_tenant_id: None,
+        legacy_shape: None,
+        paired_at: None,
+    };
+    if !path.exists() {
+        return view;
+    }
+    let Some(pf) = read_paired_user_file_at(path) else {
+        // Present and unreadable. `tenants: None` stays UNKNOWN.
+        view.read = "unreadable";
+        return view;
+    };
+    view.read = "present";
+    let bindings = pf.effective_bindings();
+    let mut tenants: Vec<String> = bindings
+        .iter()
+        .map(|b| b.tenant_id.trim().to_string())
+        .collect();
+    tenants.sort();
+    tenants.dedup();
+    view.tenants = Some(tenants);
+    view.default_tenant_id = pf
+        .effective_default_tenant_id()
+        .map(|d| d.trim().to_string());
+    view.legacy_shape = Some(!pf.is_v2());
+    view.paired_at = Some(
+        bindings
+            .iter()
+            .filter_map(|b| {
+                b.paired_at
+                    .as_ref()
+                    .map(|p| (b.tenant_id.trim().to_string(), p.clone()))
+            })
+            .collect(),
+    );
+    view
+}
+
+// ============================================================================
+// D4 gate — "One binding store"
+// (plan 2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin)
+// ============================================================================
+//
+// Seeds the FOUR `paired_user.json` copies actually observed on the operator
+// box into a temp home and asserts the whole Phase-2 gate over them:
+//
+//   1. the runner converges the ones it would itself compute, and touches
+//      NOTHING else — the `instances/` and `instances/test-*/` copies survive
+//      byte-for-byte, because a disk scan that absorbed them would be a
+//      binding-store write driven by a path nobody authorized;
+//   2. both bindings survive the merge;
+//   3. the legacy single-tenant copy is migrated in place to v2;
+//   4. `bindings` gains NO tenant this runner has no credential for;
+//   5. the doctor check FAILS on a binding-set / `default_tenant_id`
+//      disagreement;
+//   6. the doctor check only REPORTS a `paired_at`-only difference;
+//   7. an unreadable copy reads as UNKNOWN, never as "no disagreement".
+#[cfg(test)]
+mod one_binding_store_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// `c231d9da…` on the operator box — the device default.
+    const DEFAULT_TENANT: &str = "c231d9da-1111-4111-8111-111111111111";
+    /// `7ac125b6…` on the operator box — Portofino, the second binding.
+    const SECOND_TENANT: &str = "7ac125b6-2222-4222-8222-222222222222";
+    /// A tenant NO slot exists for. The merge must never admit it.
+    const UNCREDENTIALED_TENANT: &str = "deadbeef-3333-4333-8333-333333333333";
+    const USER: &str = "11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+    /// The production predicate, with the store answers pinned: the two real
+    /// tenants have slots, everything else does not.
+    fn credentialed(tenant: &uuid::Uuid, is_default: bool) -> Option<bool> {
+        let slot = match tenant.to_string().as_str() {
+            DEFAULT_TENANT | SECOND_TENANT => crate::auth::SlotState::Usable,
+            _ => crate::auth::SlotState::Absent,
+        };
+        crate::auth::holds_credential_for(slot, is_default, crate::auth::SlotState::Usable)
+    }
+
+    fn write(path: &Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    /// v2 shape: `bindings` + `default_tenant_id` + the legacy mirrors.
+    fn v2(default_paired_at: &str, second_paired_at: &str) -> String {
+        format!(
+            r#"{{
+  "user_id": "{USER}",
+  "tenant_id": "{DEFAULT_TENANT}",
+  "bindings": [
+    {{"tenant_id": "{DEFAULT_TENANT}", "user_id": "{USER}", "paired_at": "{default_paired_at}"}},
+    {{"tenant_id": "{SECOND_TENANT}", "user_id": "{USER}", "paired_at": "{second_paired_at}"}}
+  ],
+  "default_tenant_id": "{DEFAULT_TENANT}"
+}}"#
+        )
+    }
+
+    /// The 4-month-stale `%APPDATA%/com.qontinui.runner/paired_user.json`:
+    /// pre-v2 single-tenant shape, no `bindings` array at all.
+    fn legacy() -> String {
+        format!(r#"{{"user_id": "{USER}", "tenant_id": "{DEFAULT_TENANT}"}}"#)
+    }
+
+    /// The four copies observed on the operator box, seeded under one temp
+    /// home. `local` stands in for `%LOCALAPPDATA%` (what `data_local_dir()`
+    /// computes) and `roaming` for `%APPDATA%`.
+    struct Box4 {
+        _tmp: tempfile::TempDir,
+        local: std::path::PathBuf,
+        roaming_legacy: std::path::PathBuf,
+        roaming_instances: std::path::PathBuf,
+        roaming_test_instance: std::path::PathBuf,
+    }
+
+    fn seed_operator_box() -> Box4 {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let local = root.join("Local/com.qontinui.runner/paired_user.json");
+        let roaming_legacy = root.join("Roaming/com.qontinui.runner/paired_user.json");
+        let roaming_instances = root.join("Roaming/com.qontinui.runner/instances/paired_user.json");
+        let roaming_test_instance =
+            root.join("Roaming/com.qontinui.runner/instances/test-19f837ee6c6-6/paired_user.json");
+
+        // Live copy: v2, both bindings, default paired 2026-09-17.
+        write(&local, &v2("2026-09-17T15:42:00Z", "2026-08-02T10:00:00Z"));
+        // 4-month-stale legacy copy: cannot see the second binding at all.
+        write(&roaming_legacy, &legacy());
+        // 2-month-stale v2 copy: same two tenants, older `paired_at`.
+        write(
+            &roaming_instances,
+            &v2("2026-07-21T09:00:00Z", "2026-07-21T09:00:00Z"),
+        );
+        // A test-instance fixture. A disk scan would absorb this.
+        write(
+            &roaming_test_instance,
+            &v2("2026-06-01T00:00:00Z", "2026-06-01T00:00:00Z"),
+        );
+
+        Box4 {
+            _tmp: tmp,
+            local,
+            roaming_legacy,
+            roaming_instances,
+            roaming_test_instance,
+        }
+    }
+
+    fn read_back(path: &Path) -> PairedUserFile {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    // ------------------------------------------------------------------
+    // 1 + 2 — converge the computed copies; both bindings survive
+    // ------------------------------------------------------------------
+
+    /// The candidate set is EXACTLY the two paths this process can compute:
+    /// a set `$QONTINUI_SECURE_STORAGE_DIR` (canonical, first) and the bare
+    /// `data_local_dir()` default. No third entry ever appears, whatever is
+    /// on disk.
+    #[test]
+    fn candidate_paths_are_only_what_this_process_computes() {
+        let with_override = binding_store_candidate_paths_with(Some("D:/override".to_string()));
+        assert_eq!(
+            with_override.first().map(|p| p.to_owned()),
+            paired_user_path_with(Some("D:/override".to_string())),
+            "canonical must be first and must be exactly what paired_user_path() resolves to"
+        );
+        assert!(
+            with_override.len() <= 2,
+            "at most the override + the bare default, never a scan: {with_override:?}"
+        );
+
+        // Set-but-EMPTY is the same as unset (see `paired_user_path_with`),
+        // so the candidate set collapses to one and the merge is a no-op.
+        assert_eq!(
+            binding_store_candidate_paths_with(Some(String::new())),
+            binding_store_candidate_paths_with(None),
+            "set-but-empty must resolve exactly like unset"
+        );
+        assert!(
+            binding_store_candidate_paths_with(None).len() <= 1,
+            "with no override there is ONE computed path, so the merge is a no-op by \
+             construction — this is what keeps the operator box's %APPDATA% copies out"
+        );
+    }
+
+    /// The gate's core: with the operator box's four copies seeded, a runner
+    /// whose canonical store is the stale-legacy one converges the copy it
+    /// would itself compute, keeps BOTH bindings, migrates the legacy shape,
+    /// and leaves the two `instances/` fixtures untouched.
+    #[test]
+    fn converges_only_the_computed_copies_and_keeps_both_bindings() {
+        let b = seed_operator_box();
+        let instances_before = std::fs::read(&b.roaming_instances).unwrap();
+        let test_instance_before = std::fs::read(&b.roaming_test_instance).unwrap();
+
+        // Canonical = the LEGACY copy (an instance-scoped runner pointed at
+        // `%APPDATA%`); the other computed path is the live v2 default.
+        let report = converge_binding_store_with(
+            &b.roaming_legacy,
+            &[b.local.clone()],
+            &credentialed,
+            "2026-09-20",
+        );
+
+        assert!(report.wrote_canonical, "canonical must be rewritten");
+        assert!(
+            report.migrated_legacy,
+            "the legacy single-tenant copy must be migrated in place to v2"
+        );
+        assert_eq!(
+            report.merged,
+            vec![SECOND_TENANT.to_string()],
+            "the second binding must be merged in"
+        );
+        assert!(
+            report.withheld_no_credential.is_empty(),
+            "both merged tenants hold a credential: {report:?}"
+        );
+
+        // 2 — both bindings survive, in v2 shape.
+        let merged = read_back(&b.roaming_legacy);
+        let mut tenants: Vec<String> = merged
+            .bindings
+            .iter()
+            .map(|x| x.tenant_id.clone())
+            .collect();
+        tenants.sort();
+        assert_eq!(
+            tenants,
+            vec![SECOND_TENANT.to_string(), DEFAULT_TENANT.to_string()],
+            "both bindings must survive the merge"
+        );
+        assert_eq!(
+            merged.default_tenant_id.as_deref(),
+            Some(DEFAULT_TENANT),
+            "default_tenant_id must be preserved (and promoted out of the legacy mirror)"
+        );
+        assert_eq!(
+            merged.tenant_id.as_deref(),
+            Some(DEFAULT_TENANT),
+            "the legacy mirror must keep tracking the default binding"
+        );
+
+        // 5 — the absorbed copy is superseded, never deleted.
+        assert_eq!(report.superseded.len(), 1);
+        let (from, to) = &report.superseded[0];
+        assert_eq!(from, &b.local);
+        assert!(
+            to.to_string_lossy()
+                .ends_with("paired_user.json.superseded-2026-09-20"),
+            "absorbed copy must be left as .superseded-<date>: {}",
+            to.display()
+        );
+        assert!(to.exists(), "the superseded file must still be on disk");
+        assert!(!b.local.exists(), "the absorbed copy must be moved aside");
+
+        // 1 — NOTHING under a path this process does not compute was touched.
+        assert_eq!(
+            std::fs::read(&b.roaming_instances).unwrap(),
+            instances_before,
+            "the %APPDATA%/instances/ copy is not a computed path — it must be untouched"
+        );
+        assert_eq!(
+            std::fs::read(&b.roaming_test_instance).unwrap(),
+            test_instance_before,
+            "the instances/test-*/ fixture must be untouched: a scan that absorbed it would \
+             fold a TEST FIXTURE into the binding store"
+        );
+    }
+
+    /// Newest `paired_at` per tenant wins, in both directions.
+    #[test]
+    fn newest_paired_at_per_tenant_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical = tmp.path().join("canonical/paired_user.json");
+        let other = tmp.path().join("other/paired_user.json");
+        // Canonical is older on the DEFAULT, newer on the SECOND.
+        write(
+            &canonical,
+            &v2("2026-07-21T09:00:00Z", "2026-09-01T00:00:00Z"),
+        );
+        write(&other, &v2("2026-09-17T15:42:00Z", "2026-06-01T00:00:00Z"));
+
+        let report = converge_binding_store_with(&canonical, &[other], &credentialed, "2026-09-20");
+        assert_eq!(report.refreshed, vec![DEFAULT_TENANT.to_string()]);
+
+        let merged = read_back(&canonical);
+        let at = |t: &str| {
+            merged
+                .bindings
+                .iter()
+                .find(|b| b.tenant_id == t)
+                .and_then(|b| b.paired_at.clone())
+                .unwrap()
+        };
+        assert_eq!(at(DEFAULT_TENANT), "2026-09-17T15:42:00Z", "newer wins");
+        assert_eq!(
+            at(SECOND_TENANT),
+            "2026-09-01T00:00:00Z",
+            "the canonical file's newer stamp must NOT be pulled backwards"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 4 — bindings gains no tenant that has no credential
+    // ------------------------------------------------------------------
+
+    /// The security invariant, stated as a test: a stale copy naming a tenant
+    /// this runner has NO credential for must not widen `bindings`, because
+    /// `coord_mcp::spawn_tenant_admission` reads the admitted set out of this
+    /// same file.
+    #[test]
+    fn never_merges_a_tenant_with_no_credential() {
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical = tmp.path().join("canonical/paired_user.json");
+        let other = tmp.path().join("other/paired_user.json");
+        write(
+            &canonical,
+            &v2("2026-09-17T15:42:00Z", "2026-08-02T10:00:00Z"),
+        );
+        write(
+            &other,
+            &format!(
+                r#"{{
+  "user_id": "{USER}",
+  "tenant_id": "{DEFAULT_TENANT}",
+  "bindings": [
+    {{"tenant_id": "{DEFAULT_TENANT}", "user_id": "{USER}", "paired_at": "2026-07-21T09:00:00Z"}},
+    {{"tenant_id": "{UNCREDENTIALED_TENANT}", "user_id": "{USER}", "paired_at": "2026-09-19T00:00:00Z"}},
+    {{"tenant_id": "not-a-uuid", "user_id": "{USER}", "paired_at": "2026-09-19T00:00:00Z"}}
+  ],
+  "default_tenant_id": "{DEFAULT_TENANT}"
+}}"#
+            ),
+        );
+
+        let report = converge_binding_store_with(&canonical, &[other], &credentialed, "2026-09-20");
+
+        assert!(
+            report.merged.is_empty(),
+            "nothing should have been merged: {report:?}"
+        );
+        assert_eq!(
+            report.withheld_no_credential,
+            vec![UNCREDENTIALED_TENANT.to_string(), "not-a-uuid".to_string()],
+            "both the credential-less tenant and the malformed id must be WITHHELD and reported"
+        );
+        let merged = read_back(&canonical);
+        assert!(
+            merged
+                .bindings
+                .iter()
+                .all(|b| b.tenant_id != UNCREDENTIALED_TENANT),
+            "a merge must never fabricate a binding for a tenant with no credential"
+        );
+        assert_eq!(merged.bindings.len(), 2);
+    }
+
+    /// UNKNOWN is not a yes. An unreadable credential store must withhold the
+    /// widening exactly as a measured absence does.
+    #[test]
+    fn an_unreadable_credential_store_withholds_the_widening() {
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical = tmp.path().join("canonical/paired_user.json");
+        let other = tmp.path().join("other/paired_user.json");
+        write(
+            &canonical,
+            &format!(
+                r#"{{"user_id":"{USER}","tenant_id":"{DEFAULT_TENANT}",
+  "bindings":[{{"tenant_id":"{DEFAULT_TENANT}","user_id":"{USER}","paired_at":"2026-09-17T15:42:00Z"}}],
+  "default_tenant_id":"{DEFAULT_TENANT}"}}"#
+            ),
+        );
+        write(&other, &v2("2026-07-21T09:00:00Z", "2026-07-21T09:00:00Z"));
+
+        // The whole store is UNREADABLE: every probe answers UNKNOWN.
+        let unknown = |_t: &uuid::Uuid, is_default: bool| {
+            crate::auth::holds_credential_for(
+                crate::auth::SlotState::Unreadable,
+                is_default,
+                crate::auth::SlotState::Unreadable,
+            )
+        };
+        assert_eq!(
+            unknown(&uuid::Uuid::parse_str(SECOND_TENANT).unwrap(), false),
+            None,
+            "an unreadable store must read as UNKNOWN, not as false"
+        );
+
+        let report = converge_binding_store_with(&canonical, &[other], &unknown, "2026-09-20");
+        assert!(report.merged.is_empty());
+        assert_eq!(
+            report.withheld_no_credential,
+            vec![SECOND_TENANT.to_string()]
+        );
+        assert_eq!(
+            read_back(&canonical).bindings.len(),
+            1,
+            "UNKNOWN must not widen the admitted set"
+        );
+    }
+
+    /// An unreadable OTHER copy is not merged AND not renamed: absorbing a
+    /// file whose contents were never established is not a merge, and
+    /// renaming it would hide the evidence.
+    #[test]
+    fn an_unreadable_copy_is_left_in_place_as_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical = tmp.path().join("canonical/paired_user.json");
+        let other = tmp.path().join("other/paired_user.json");
+        write(
+            &canonical,
+            &v2("2026-09-17T15:42:00Z", "2026-08-02T10:00:00Z"),
+        );
+        write(&other, "{ this is not json");
+
+        let report =
+            converge_binding_store_with(&canonical, &[other.clone()], &credentialed, "2026-09-20");
+        assert_eq!(report.unreadable, vec![other.clone()]);
+        assert!(
+            report.superseded.is_empty(),
+            "an unread copy is not absorbed"
+        );
+        assert!(other.exists(), "and it is left in place");
+        assert!(!report.wrote_canonical);
+    }
+
+    // ------------------------------------------------------------------
+    // 5 + 6 — the doctor check
+    // ------------------------------------------------------------------
+
+    /// FAILS on a binding-set disagreement, and again on a
+    /// `default_tenant_id` disagreement — the two ways a split brain changes
+    /// which tenants a process believes exist.
+    #[test]
+    fn doctor_check_fails_on_a_binding_set_or_default_tenant_disagreement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a/paired_user.json");
+        let b = tmp.path().join("b/paired_user.json");
+
+        // Binding-set disagreement: the legacy copy cannot see the second
+        // binding at all. This is the operator box's %APPDATA% copy.
+        write(&a, &v2("2026-09-17T15:42:00Z", "2026-08-02T10:00:00Z"));
+        write(&b, &legacy());
+        let check = inspect_binding_store_paths(&[a.clone(), b.clone()]);
+        assert_eq!(check.verdict, "fail", "{}", check.detail);
+        assert!(check.failed());
+        assert_eq!(
+            check.copies[1].legacy_shape,
+            Some(true),
+            "the legacy shape must be visible in the report"
+        );
+
+        // default_tenant_id disagreement, same binding set.
+        write(
+            &b,
+            &format!(
+                r#"{{"user_id":"{USER}","tenant_id":"{SECOND_TENANT}",
+  "bindings":[
+    {{"tenant_id":"{DEFAULT_TENANT}","user_id":"{USER}","paired_at":"2026-09-17T15:42:00Z"}},
+    {{"tenant_id":"{SECOND_TENANT}","user_id":"{USER}","paired_at":"2026-08-02T10:00:00Z"}}],
+  "default_tenant_id":"{SECOND_TENANT}"}}"#
+            ),
+        );
+        let check = inspect_binding_store_paths(&[a, b]);
+        assert_eq!(
+            check.verdict, "fail",
+            "same tenants, different default — still a split brain: {}",
+            check.detail
+        );
+    }
+
+    /// Only REPORTS a `paired_at`-only difference. This is the ONLY way the
+    /// copies differ on the operator box today, so a strict check would fail
+    /// a healthy machine from day one and get disabled.
+    #[test]
+    fn doctor_check_only_reports_a_paired_at_only_difference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a/paired_user.json");
+        let b = tmp.path().join("b/paired_user.json");
+        write(&a, &v2("2026-09-17T15:42:00Z", "2026-08-02T10:00:00Z"));
+        write(&b, &v2("2026-07-21T09:00:00Z", "2026-07-21T09:00:00Z"));
+
+        let check = inspect_binding_store_paths(&[a.clone(), b.clone()]);
+        assert_eq!(
+            check.verdict, "report",
+            "a paired_at-only difference is cosmetic: {}",
+            check.detail
+        );
+        assert!(!check.failed(), "and it must NOT fail the doctor");
+        assert!(check.detail.contains("paired_at"));
+
+        // Identical copies: plain ok.
+        write(&b, &v2("2026-09-17T15:42:00Z", "2026-08-02T10:00:00Z"));
+        assert_eq!(inspect_binding_store_paths(&[a, b]).verdict, "ok");
+    }
+
+    /// One copy (the shape of a box with no `$QONTINUI_SECURE_STORAGE_DIR`)
+    /// is `ok`, not a fail.
+    #[test]
+    fn doctor_check_is_ok_with_a_single_live_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a/paired_user.json");
+        let missing = tmp.path().join("b/paired_user.json");
+        write(&a, &v2("2026-09-17T15:42:00Z", "2026-08-02T10:00:00Z"));
+
+        let check = inspect_binding_store_paths(&[a, missing]);
+        assert_eq!(check.verdict, "ok", "{}", check.detail);
+        assert_eq!(check.copies[1].read, "absent");
+        assert_eq!(
+            check.copies[1].tenants, None,
+            "an ABSENT copy carries no binding list"
+        );
+    }
+
+    /// UNKNOWN discipline: an unreadable copy must never read as "no
+    /// disagreement", and a disagreement we CAN see still fails.
+    #[test]
+    fn doctor_check_reports_unknown_not_agreement_for_an_unreadable_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a/paired_user.json");
+        let b = tmp.path().join("b/paired_user.json");
+        write(&a, &v2("2026-09-17T15:42:00Z", "2026-08-02T10:00:00Z"));
+        write(&b, "\u{0}\u{1}not-json-at-all");
+
+        let check = inspect_binding_store_paths(&[a.clone(), b.clone()]);
+        assert_eq!(
+            check.verdict, "unknown",
+            "an undecryptable/corrupt copy is UNKNOWN, never 'the rest agree': {}",
+            check.detail
+        );
+        assert!(check.is_unknown());
+        assert!(!check.failed(), "unknown is not a fail either");
+        assert_eq!(check.copies[1].read, "unreadable");
+        assert_eq!(
+            check.copies[1].tenants, None,
+            "an unreadable copy must NOT report an empty binding list — absence is not zero"
+        );
+
+        // A visible disagreement beats the unknown: still a fail.
+        let c = tmp.path().join("c/paired_user.json");
+        write(&c, &legacy());
+        assert_eq!(
+            inspect_binding_store_paths(&[a, c, b]).verdict,
+            "fail",
+            "a disagreement we can see is not masked by a copy we cannot read"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Guard rails
+    // ------------------------------------------------------------------
+
+    /// A missing canonical file is never synthesized out of stale copies:
+    /// pairing creates that file, not a merge.
+    #[test]
+    fn a_missing_canonical_file_is_not_synthesized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical = tmp.path().join("canonical/paired_user.json");
+        let other = tmp.path().join("other/paired_user.json");
+        write(&other, &v2("2026-07-21T09:00:00Z", "2026-07-21T09:00:00Z"));
+
+        let report =
+            converge_binding_store_with(&canonical, &[other.clone()], &credentialed, "2026-09-20");
+        assert_eq!(report, BindingStoreMergeReport::default());
+        assert!(!canonical.exists());
+        assert!(other.exists(), "and the other copy is left alone");
+    }
+
+    /// A same-day re-run must not clobber the evidence it left last time.
+    #[test]
+    fn supersede_never_overwrites_earlier_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical = tmp.path().join("canonical/paired_user.json");
+        write(
+            &canonical,
+            &v2("2026-09-17T15:42:00Z", "2026-08-02T10:00:00Z"),
+        );
+
+        let other = tmp.path().join("other/paired_user.json");
+        write(&other, &v2("2026-07-21T09:00:00Z", "2026-07-21T09:00:00Z"));
+        let r1 =
+            converge_binding_store_with(&canonical, &[other.clone()], &credentialed, "2026-09-20");
+        write(&other, &v2("2026-07-22T09:00:00Z", "2026-07-22T09:00:00Z"));
+        let r2 = converge_binding_store_with(&canonical, &[other], &credentialed, "2026-09-20");
+
+        let n1 = &r1.superseded[0].1;
+        let n2 = &r2.superseded[0].1;
+        assert_ne!(n1, n2, "the second supersede must pick a fresh name");
+        assert!(n1.exists() && n2.exists(), "both must survive on disk");
+        assert!(n2.to_string_lossy().ends_with("-2"));
+    }
+
+    /// `auth::holds_credential_for` is a WEAKER question than `can_act`, and
+    /// the difference is deliberate: a rotted-but-stored JWT is still a
+    /// credential this runner holds, so its binding entry is warranted.
+    #[test]
+    fn holds_credential_for_is_tri_state_and_weaker_than_can_act() {
+        use crate::auth::{credential_state, holds_credential_for, SlotState};
+
+        assert_eq!(
+            holds_credential_for(SlotState::PresentButDead, false, SlotState::Absent),
+            Some(true),
+            "an expired slot IS a credential this runner holds"
+        );
+        assert_eq!(
+            credential_state(SlotState::PresentButDead, false, SlotState::Absent).can_act(),
+            Some(false),
+            "…while the session-can-act question answers no — the two differ on purpose"
+        );
+        assert_eq!(
+            holds_credential_for(SlotState::Usable, false, SlotState::Absent),
+            Some(true)
+        );
+        assert_eq!(
+            holds_credential_for(SlotState::Absent, false, SlotState::Usable),
+            Some(false),
+            "the legacy default slot answers for the DEFAULT tenant and no other"
+        );
+        assert_eq!(
+            holds_credential_for(SlotState::Absent, true, SlotState::Usable),
+            Some(true),
+            "…and for the default tenant it does answer (D4: it holds the default's JWT)"
+        );
+        assert_eq!(
+            holds_credential_for(SlotState::Absent, true, SlotState::Absent),
+            Some(false)
+        );
+        assert_eq!(
+            holds_credential_for(SlotState::Unreadable, false, SlotState::Usable),
+            None,
+            "an unreadable own-slot read establishes NOTHING for a non-default tenant"
+        );
+        assert_eq!(
+            holds_credential_for(SlotState::Absent, true, SlotState::Unreadable),
+            None,
+            "an unreadable default slot is UNKNOWN, never a measured no"
+        );
+    }
+}
