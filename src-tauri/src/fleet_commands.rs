@@ -2211,9 +2211,7 @@ mod tests {
                 let owns_a_divergent_table = contents.contains(DIVERGENT_TABLE_DOOR)
                     && normalised.to_lowercase().contains(&divergence);
                 assert!(
-                    !normalised.contains(&needle)
-                        || restates_the_table
-                        || owns_a_divergent_table,
+                    !normalised.contains(&needle) || restates_the_table || owns_a_divergent_table,
                     "bundled agent command {name} points readers at the {anchor:?} \
                      section but neither names {ARM_TABLE_READ} nor declares a \
                      divergent disposition table of its own ({DELIVERY_GUARD_DOORS:?} \
