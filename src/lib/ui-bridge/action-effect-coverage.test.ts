@@ -1,11 +1,30 @@
 /**
- * Enumerated coverage floor for the component-action `effect` safety class.
+ * Enumerated coverage floor for the `effect` safety class, over BOTH surfaces
+ * that carry one: component actions and element custom actions.
  *
  * Plan `2026-09-04-effect-calculus-joins-the-component-action-registry`,
- * Phase 2. Phase 1 proved ONE annotation crosses the SDK -> runner -> Rust
- * boundary; Phase 2 annotated all 60 registered actions. This test is what
- * stops that set decaying: it walks EVERY `useUIComponent({ ... })`
- * registration in `src/` and fails when any action lacks an `effect`.
+ * Phase 2 (component actions) and Phase 4 (element custom actions). Phase 1
+ * proved ONE annotation crosses the SDK -> runner -> Rust boundary; Phase 2
+ * annotated all registered component actions and Phase 4 annotated the 12
+ * element custom actions. This test is what stops either set decaying: it
+ * walks EVERY `useUIComponent({ ... })` registration and EVERY literal
+ * `customActions: { ... }` registration in `src/`, and fails when any action
+ * lacks an `effect`.
+ *
+ * WHY ELEMENT CUSTOM ACTIONS ARE WALKED HERE TOO. Phase 4 annotated them, but
+ * nothing enforced the annotation: the Phase-3 ESLint rule matches only
+ * `useUIComponent({ actions })`, and the CI effect fixture captures components
+ * only. Measured 2026-09-20 on `origin/main`, deleting `effect: "read"` from
+ * `TerminalBridgeProxies`' `focus` entry left `lint`, this test and
+ * `effect:fixture:check` ALL green. Eight of the twelve are `destructive` raw
+ * PTY writes, so that was the widest unratcheted surface in the calculus.
+ * Extending the Phase-3 lint rule to `customActions` object literals is the
+ * other half and lives in `ui-bridge`; this floor does not wait on a plugin
+ * publish, and an enumerated floor is in any case what the plan's graduation
+ * condition (a) actually names — the one in "Out of scope — named, not
+ * silently deferred", which gates a destructive-invocation guard, not a phase.
+ * It asks for "60/60 component actions and 9/9 element custom actions
+ * annotated"; those totals are now 64 and 12.
  *
  * WHY THE INVARIANT MATTERS. An absent `effect` is UNCLASSIFIED, never `read`
  * — the serializer forwards it undefaulted on purpose, and no verb in the
@@ -17,7 +36,7 @@
  * `src-tauri/src/mcp/ui_bridge/CONTRACT.md`, "The `effect` classification
  * rubric".
  *
- * WHY THIS IS A STATIC WALK AND NOT A MOUNT. Mounting the 18 registering
+ * WHY THIS IS A STATIC WALK AND NOT A MOUNT. Mounting the 27 registering
  * components needs Tauri IPC, a DOM, and most of the app's React context tree;
  * a mount-based walk would cover only the components it managed to mount and
  * report green while measuring a subset — coverage decided by what was
@@ -47,21 +66,42 @@ const SRC_ROOT = resolve(__dirname, "../..");
 const VALID_EFFECTS = new Set(["read", "write", "destructive"]);
 
 /**
- * Non-vacuity floors. Measured 2026-09-04: the walk finds 27
- * `useUIComponent` registrations carrying 60 actions between them. Only 18 of
- * the 27 declare an `actions` array at all — the other 9 register elements and
- * page state only, which is why the component floor is set at the
- * action-declaring count rather than at 27.
+ * Non-vacuity floors. Measured 2026-09-20 on `origin/main`: the walk finds 27
+ * `useUIComponent` registrations, 21 of which declare an `actions` array,
+ * carrying 64 actions between them; and 2 literal `customActions`
+ * registrations carrying 12 entries.
  *
- * Deliberately `>=`, not `===`. The invariant this file protects is "every
- * action is annotated", and pinning an exact total would red on every
- * legitimately-added component — a test that fails for the right reason at the
- * wrong times gets weakened, and a weakened test protects nothing. The floors
- * catch the failure mode that actually matters here: a walk that silently
- * stops finding registrations.
+ * `MIN_ELEMENT_SITES` counts FILES carrying at least one literal
+ * `customActions` map, not registrations — a second map added inside one of
+ * the two existing files does not move it. `MIN_ELEMENT_ACTIONS` is the floor
+ * that counts entries.
+ *
+ * `MIN_COMPONENTS` is counted against the ACTION-DECLARING registrations (21),
+ * not against all 27. Until 2026-09-20 the floor was 18 but the quantity
+ * compared to it was the full set of 27, so nine registrations could have
+ * vanished before it tripped — the comment described the intended measurement
+ * and the code measured something looser.
+ *
+ * Deliberately `>=`, not `===`: adding an action must never red this file, so
+ * the floors are one-directional. Because they are, they are set AT the
+ * measured corpus rather than below it — slack below the measurement buys
+ * nothing and costs the guarantee, since it is exactly the room in which the
+ * corpus can shrink silently. Before 2026-09-20 the action floor sat at 60
+ * against 64 and the component floor at 18 against a mis-measured 27, so four
+ * annotated actions and nine registrations could have disappeared with this
+ * file still green while its header claimed the corpus "cannot silently
+ * shrink".
+ *
+ * A DELETION IS THEREFORE EXPECTED TO MOVE A FLOOR, and that is the point:
+ * removing an annotated action is a deliberate act that should be visible in
+ * the diff and argued for in review, not absorbed by slack. #1463 deleted a
+ * registration (`usePageRegistration.ts`) and no floor moved, because the
+ * component floor was being compared against the wrong quantity.
  */
-const MIN_COMPONENTS = 18;
-const MIN_ACTIONS = 60;
+const MIN_COMPONENTS = 21;
+const MIN_ACTIONS = 64;
+const MIN_ELEMENT_SITES = 2;
+const MIN_ELEMENT_ACTIONS = 12;
 
 interface FoundAction {
   /** Component id as written (a template literal is rendered with its `${}`). */
@@ -162,11 +202,69 @@ function resolveFactoryReturn(
   return null;
 }
 
-function collect(): { actions: FoundAction[]; components: Set<string> } {
+interface Collected {
+  /** Component actions, from `useUIComponent({ actions: [...] })`. */
+  actions: FoundAction[];
+  /** Registrations that declare an `actions` property at all. */
+  components: Set<string>;
+  /** Element custom actions, from a literal `customActions: { ... }` map. */
+  elementActions: FoundAction[];
+  /** Files carrying at least one literal `customActions` registration. */
+  elementSites: Set<string>;
+}
+
+/**
+ * Resolve an expression to the object literal it denotes, following the same
+ * two indirections `resolveFactoryReturn` already follows for a component
+ * action: a factory call, and a module-scope `const` binding.
+ *
+ * This exists so the element walk is not a reason NOT to refactor. The two
+ * terminal `customActions` maps overlap on five identically-annotated entries
+ * (`sendKeys`, `writeToTerminal`, `paste`, `pasteText`, `getScrollback`), and
+ * hoisting them into a shared builder is the obvious next cleanup. Without
+ * resolution that cleanup would take the element floors to zero with no way to
+ * stay green — the floor penalising the de-duplication rather than a real loss
+ * of coverage. The component side already had `resolveFactoryReturn` for
+ * exactly this; the element side now shares it.
+ */
+function resolveObjectLiteral(
+  expr: ts.Expression,
+  corpus: ts.SourceFile[],
+): ts.ObjectLiteralExpression | null {
+  if (ts.isObjectLiteralExpression(expr)) return expr;
+  if (ts.isCallExpression(expr)) return resolveFactoryReturn(expr, corpus);
+  if (ts.isIdentifier(expr)) {
+    const name = expr.text;
+    for (const sf of corpus) {
+      let found: ts.ObjectLiteralExpression | null = null;
+      const visit = (node: ts.Node): void => {
+        if (found) return;
+        if (
+          ts.isVariableDeclaration(node) &&
+          ts.isIdentifier(node.name) &&
+          node.name.text === name &&
+          node.initializer &&
+          ts.isObjectLiteralExpression(node.initializer)
+        ) {
+          found = node.initializer;
+          return;
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(sf);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+function collect(): Collected {
   const files = sourceFiles(SRC_ROOT);
   const corpus = files.map(parse);
   const actions: FoundAction[] = [];
   const components = new Set<string>();
+  const elementActions: FoundAction[] = [];
+  const elementSites = new Set<string>();
 
   for (const sf of corpus) {
     const where = relative(SRC_ROOT, sf.fileName);
@@ -181,9 +279,52 @@ function collect(): { actions: FoundAction[]; components: Set<string> } {
       ) {
         const arg = node.arguments[0];
         const componentId = literalText(objectProperty(arg, "id")) ?? `<unreadable in ${where}>`;
-        components.add(componentId);
 
         const actionsNode = objectProperty(arg, "actions");
+        // The floor counts registrations that DECLARE an `actions` property.
+        // The other six carry nothing this file can assert on — five pass only
+        // `id` / `name` / `description` and one also passes `state`; any
+        // elements they expose come from separate `useUIElement` calls. Adding
+        // them would inflate the floor's denominator without adding coverage.
+        //
+        // Note this counts the PROPERTY, not a non-empty array:
+        // `components/app/TabContent.tsx` registers `actions: []` and is one of
+        // the 21, so the component floor can be held up by a registration
+        // carrying no annotated action. `MIN_ACTIONS` is the floor that counts
+        // actions.
+        if (actionsNode) components.add(componentId);
+
+        if (actionsNode && !ts.isArrayLiteralExpression(actionsNode)) {
+          // `actions` present but not enumerable here — e.g. `actions: props`
+          // or `actions: xs || []`. Reported as an UNMEASURED action rather
+          // than skipped, for the same reason an unreadable element is below:
+          // a walk that passes silently over a registration it cannot read
+          // reports coverage it did not measure [policy: `testing`
+          // `silent-empty-is-unknown`].
+          //
+          // This is the exact shape that hid the one unannotated action
+          // `require-action-effect` found when Phase 3 turned it on:
+          // `usePageRegistration.ts` forwarded `actions: actions || []` and
+          // this walk said nothing. The rule caught it; this floor did not.
+          // The rule RESOLVES such an expression, which is its job as an
+          // author-time ratchet. An enumerating floor does not guess: it
+          // reports what it cannot enumerate and makes someone look.
+          //
+          // CONSEQUENCE, stated so it is not a surprise: hoisting a fully
+          // annotated `actions: [...]` out of its call site leaves `lint`
+          // GREEN (the rule follows it) and this file RED (the walk will not).
+          // The two gates then disagree on a legal corpus. That is deliberate
+          // — a floor that guesses is not a floor — and the fix is to inline
+          // the array or to teach the walk that shape, never to drop the
+          // report.
+          actions.push({
+            component: componentId,
+            action: `<unenumerable actions: ${actionsNode.getText().slice(0, 60)}>`,
+            effect: undefined,
+            where,
+          });
+        }
+
         if (actionsNode && ts.isArrayLiteralExpression(actionsNode)) {
           for (const el of actionsNode.elements) {
             let literal: ts.ObjectLiteralExpression | null = null;
@@ -215,16 +356,71 @@ function collect(): { actions: FoundAction[]; components: Set<string> } {
           }
         }
       }
+
+      // ── Element custom actions ────────────────────────────────────────
+      // A REGISTRATION is a `customActions` property that RESOLVES to an
+      // object-literal map of entry objects — written inline, or reached
+      // through a factory call or a module-scope binding. The discriminator is
+      // structural, never a file or identifier allow-list.
+      //
+      // The same property name also appears on the PROJECTION side, where the
+      // initializer is a call that resolves to nothing local —
+      // `background-observer-service.ts` forwards
+      // `serializeElementCustomActions(el.customActions)`, whose callee is an
+      // SDK import with no declaration in this corpus. That hop cannot lose an
+      // annotation it never authored, and it has its own mutation-checked test
+      // asserting the `effect` survives it and that an unclassified entry
+      // stays unclassified (`src/services/background-observer-service.test.ts`).
+      // So an initializer that does not resolve HERE is treated as a
+      // projection and is not reported — a registration and a projection are
+      // otherwise indistinguishable at this property, and reporting every
+      // unresolved one would red on the serializer forever.
+      //
+      // The site and entry floors below are what stop that scoping being
+      // silently wrong: if a real registration ever changes into a shape this
+      // cannot resolve, the floors red rather than the walk quietly measuring
+      // less. That is the whole reason they are set AT the measurement.
+      if (ts.isPropertyAssignment(node) && propertyName(node.name) === "customActions") {
+        const map = resolveObjectLiteral(node.initializer, corpus);
+        if (map) {
+          elementSites.add(where);
+          for (const entry of map.properties) {
+            const value =
+              ts.isPropertyAssignment(entry) && entry.initializer
+                ? resolveObjectLiteral(entry.initializer, corpus)
+                : null;
+            if (!value) {
+              elementActions.push({
+                component: where,
+                action: `<unreadable custom action: ${entry.getText().slice(0, 60)}>`,
+                effect: undefined,
+                where,
+              });
+              continue;
+            }
+            elementActions.push({
+              component: propertyName(entry.name) ?? "<unreadable key>",
+              action:
+                literalText(objectProperty(value, "id")) ??
+                propertyName(entry.name) ??
+                "<unreadable id>",
+              effect: literalText(objectProperty(value, "effect")) ?? undefined,
+              where,
+            });
+          }
+        }
+      }
+
       ts.forEachChild(node, visit);
     };
     visit(sf);
   }
 
-  return { actions, components };
+  return { actions, components, elementActions, elementSites };
 }
 
-describe("component-action effect coverage", () => {
-  const { actions, components } = collect();
+describe("action `effect` coverage (component actions and element custom actions)", () => {
+  const { actions, components, elementActions, elementSites } = collect();
 
   it("found the whole registration corpus (non-vacuity floor)", () => {
     expect(components.size).toBeGreaterThanOrEqual(MIN_COMPONENTS);
@@ -247,6 +443,34 @@ describe("component-action effect coverage", () => {
 
   it("every declared `effect` is one of the three IREffect values", () => {
     const bad = actions
+      .filter((a) => a.effect !== undefined && !VALID_EFFECTS.has(a.effect))
+      .map((a) => `${a.component}.${a.action} = ${a.effect} (${a.where})`);
+
+    expect(bad).toEqual([]);
+  });
+
+  it("found the element custom-action corpus (non-vacuity floor)", () => {
+    expect(elementSites.size).toBeGreaterThanOrEqual(MIN_ELEMENT_SITES);
+    expect(elementActions.length).toBeGreaterThanOrEqual(MIN_ELEMENT_ACTIONS);
+  });
+
+  it("every registered element custom action declares an `effect`", () => {
+    const unannotated = elementActions
+      .filter((a) => a.effect === undefined)
+      .map((a) => `${a.component}.${a.action} (${a.where})`);
+
+    expect(
+      unannotated,
+      `${unannotated.length} element custom action(s) carry no \`effect\`. Eight of the ` +
+        "twelve registered here are `destructive` raw PTY writes, and an absent effect is " +
+        "UNCLASSIFIED, not `read`. Classify each against the rubric in " +
+        'src-tauri/src/mcp/ui_bridge/CONTRACT.md ("The `effect` classification rubric") ' +
+        "and annotate it at the registration.",
+    ).toEqual([]);
+  });
+
+  it("every declared element custom-action `effect` is one of the three IREffect values", () => {
+    const bad = elementActions
       .filter((a) => a.effect !== undefined && !VALID_EFFECTS.has(a.effect))
       .map((a) => `${a.component}.${a.action} = ${a.effect} (${a.where})`);
 
