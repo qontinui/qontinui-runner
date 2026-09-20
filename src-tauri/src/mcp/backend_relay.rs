@@ -2010,6 +2010,13 @@ const REMOTE_TARGET_ADMITTED: &[&str] = &[
 /// never reaches `handle_inbound`, the oneshot never resolves, and every remote
 /// tab dies on a 20s timeout: a feature-total break.
 const REMOTE_SOURCE_ADMITTED: &[&str] = &[
+    // `remote_terminal_created` was missing here AND from the dispatch arm
+    // until 2026-09-20. This list is checked FIRST, by `remote_frame_admitted`
+    // via `route_relay_frame`, so a create reply — which the target always
+    // builds WITH a `remote` block — was refused as "not part of the protocol"
+    // before dispatch was ever reached. Adding it to only one of the two
+    // places fixes nothing.
+    "remote_terminal_created",
     "remote_terminal_attached",
     "remote_terminal_output",
     "remote_terminal_exit",
@@ -2285,11 +2292,29 @@ async fn handle_relay_command(
         // has shipped that translation yet, instead of silently doing nothing
         // on a name mismatch.
         "terminal_flow" | "remote_terminal_flow" => handle_terminal_flow(api_state, data),
-        "remote_terminal_attached"
+        // `remote_terminal_created` BELONGS HERE and was missing until
+        // 2026-09-20. `RemoteTerminalClient::handle_inbound` carries an arm for
+        // it (`take_pending_create` → wake the waiter) that nothing ever routed
+        // to. A create reply carries a `remote` block, so it was refused by
+        // `remote_frame_admitted` at the admission list above — NOT by the `_`
+        // unknown-type arm below; either way it never reached its handler. The
+        // source then waited out `CREATE_TIMEOUT` (45 s) and reported the
+        // TARGET wedged or offline, while the target had spawned the terminal
+        // and replied correctly, leaving it running there unattached.
+        // Observed on merytshost 2026-09-18; coord finding a5f08a4d.
+        "remote_terminal_created"
+        | "remote_terminal_attached"
         | "remote_terminal_output"
         | "remote_terminal_exit"
         | "remote_terminal_buffer"
         | "remote_terminal_error" => {
+            // The return is "did this client CONSUME the frame"
+            // (`handle_inbound`'s own doc), NOT "did it wake a waiter": every
+            // arm for these six returns `true` unconditionally, warning
+            // internally on the no-waiter path. So there is nothing to branch
+            // on here, and a check would be dead code. The sibling `error` arm
+            // below checks it because `handle_inbound` genuinely can return
+            // `false` for that one.
             crate::mcp::remote_terminal::client().handle_inbound(&msg_type, data);
             None
         }
@@ -4201,10 +4226,22 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
                 });
                 // Echo the block a REMOTE create came under, so the relay can
                 // route the reply by grant as well as by the request id it
-                // minted — the same two keys every other target-side remote
-                // reply carries.
+                // minted.
+                //
+                // The TOP-LEVEL `grant_jti` is not decoration and its absence
+                // was a second, independent break: `parse_created` reads
+                // `data.get("grant_jti")` and returns `None` without it, so
+                // even a correctly routed reply was discarded as "malformed"
+                // and the waiter still timed out. `terminal_attached`,
+                // `terminal_buffer_response` and `refusal_frame` all set it;
+                // this reply was the only one that did not. Setting it here is
+                // idempotent if the relay also injects it.
                 if admitted.is_some() {
-                    frame["remote"] = crate::mcp::remote_terminal::remote_echo(data);
+                    let echo = crate::mcp::remote_terminal::remote_echo(data);
+                    if let Some(jti) = echo.get("grant_jti").filter(|v| !v.is_null()).cloned() {
+                        frame["grant_jti"] = jti;
+                    }
+                    frame["remote"] = echo;
                 }
                 Some(frame)
             }
@@ -4819,6 +4856,83 @@ mod tests {
     //! interval fires. That manifests as "ran the runner, took 10
     //! minutes to come online after a JWT expiry." These tests pin the
     //! shape so a tungstenite bump can't silently break it.
+
+    /// EVERY reply type `handle_inbound` can act on must pass BOTH gates on the
+    /// inbound path: the admission list, and the dispatch match.
+    ///
+    /// Both directions matter, and fixing one alone fixes nothing — that is
+    /// what made this defect survive a first repair attempt.
+    /// `remote_terminal_created` was absent from BOTH: `remote_frame_admitted`
+    /// refused it (a create reply always carries a `remote` block), and the
+    /// dispatch arm did not list it either. Either gate alone drops the frame,
+    /// the source waits out its 45 s CREATE_TIMEOUT, and it reports the TARGET
+    /// wedged while the target spawned the terminal and replied correctly.
+    ///
+    /// Nothing typed connects these three lists: they are string literals in
+    /// two files and a `match`. So the invariant is pinned by comparing them.
+    #[test]
+    fn every_reply_handle_inbound_knows_passes_both_inbound_gates() {
+        const DISPATCHER: &str = include_str!("backend_relay.rs");
+        const CLIENT: &str = include_str!("remote_terminal.rs");
+
+        // The reply types `handle_inbound` acts on, read from its own match
+        // rather than hardcoded, so a new arm is covered without anyone
+        // remembering this test.
+        let start = CLIENT
+            .find("fn handle_inbound(")
+            .expect("handle_inbound not found — signature changed?");
+        let body = &CLIENT[start..];
+        let end = body.find("\n    pub fn ").unwrap_or(body.len());
+        let known: Vec<&str> = {
+            let mut v: Vec<&str> = Vec::new();
+            for seg in body[..end].split('"').skip(1).step_by(2) {
+                if seg.starts_with("remote_terminal_") && !v.contains(&seg) {
+                    v.push(seg);
+                }
+            }
+            v
+        };
+        // EXACT, not a floor: converting one arm to a const would silently
+        // shrink the set and take that type out of the invariant.
+        assert_eq!(
+            known.len(),
+            6,
+            "expected 6 remote_terminal_* reply types in handle_inbound, got {known:?} — if a \
+             type was genuinely added or removed, update this count deliberately"
+        );
+
+        // Search only the REGIONS that gate the frame — never the whole file,
+        // or a prose mention (including this test's own doc comment) satisfies
+        // the check and it passes with the defect reintroduced.
+        let admit_start = DISPATCHER
+            .find("const REMOTE_SOURCE_ADMITTED:")
+            .expect("admission list not found");
+        let admit = &DISPATCHER[admit_start..admit_start
+            + DISPATCHER[admit_start..].find("];").expect("unterminated admission list")];
+
+        let disp_start = DISPATCHER
+            .find("fn handle_relay_command(")
+            .expect("dispatcher not found");
+        let disp_rest = &DISPATCHER[disp_start..];
+        let disp = &disp_rest[..disp_rest
+            .find("\"Unknown relay command type\"")
+            .expect("dispatcher's unknown arm not found")];
+
+        for ty in &known {
+            let lit = format!("\"{ty}\"");
+            assert!(
+                admit.contains(&lit),
+                "`{ty}` is handled by handle_inbound but is NOT in REMOTE_SOURCE_ADMITTED — \
+                 remote_frame_admitted refuses it before dispatch is reached, so the frame is \
+                 dropped and any peer waiting on it times out blaming the wrong machine"
+            );
+            assert!(
+                disp.contains(&lit),
+                "`{ty}` is admitted but NOT routed by the dispatch match — it falls through to \
+                 the unknown-type arm and is dropped, with the same consequence"
+            );
+        }
+    }
 
     use super::*;
     use crate::test_env::{env_lock, EnvVarRestore};
@@ -6455,6 +6569,7 @@ mod remote_admission_tests {
     #[test]
     fn source_role_return_frames_are_admitted() {
         for t in [
+            "remote_terminal_created",
             "remote_terminal_attached",
             "remote_terminal_output",
             "remote_terminal_exit",
