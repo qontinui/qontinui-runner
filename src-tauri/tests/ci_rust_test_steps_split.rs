@@ -157,9 +157,17 @@ fn command_lines(step: &serde_yaml::Value, name: &str) -> String {
 /// A real cargo INVOCATION, as opposed to the word "cargo" inside a log
 /// filename (`cargo-test-build.log`) or a sentence. Anchored on a cargo
 /// subcommand so `cargo-test-output.log` cannot match.
+/// Catches a toolchain selector (`cargo +1.95.0 test` — this repo pins 1.95.0
+/// and spells `+1.95.0` elsewhere in this very workflow), leading flags
+/// (`cargo --offline test`) and a path-qualified binary
+/// (`~/.cargo/bin/cargo test`). It cannot catch an indirected `$CARGO test`;
+/// no regex on the spelling can, and that is a deliberate bound rather than an
+/// oversight.
 static CARGO_INVOCATION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"(?m)(^|[|;&(]\s*|\s)cargo\s+(test|build|run|check|clippy|nextest)\b")
-        .expect("the cargo-invocation pattern compiles")
+    regex::Regex::new(
+        r"(?m)(^|[|;&(]\s*|\s|/)cargo(\s+\+\S+)?(\s+--?\S+)*\s+(test|build|run|check|clippy|nextest)\b",
+    )
+    .expect("the cargo-invocation pattern compiles")
 });
 
 const BUILD: &str = "Build Rust tests";
@@ -258,6 +266,46 @@ fn rust_tests_are_built_and_run_in_separate_bounded_steps() {
          line to its binary, so dropping it silently strips the coord ingest's \
          binary attribution"
     );
+    // ⚠️ THE ASSERTION THAT WOULD HAVE CAUGHT THE WORST BUG IN THIS FILE'S
+    // HISTORY. A rewrite of the run step dropped its `shell: bash` line, and
+    // nothing here noticed: five review rounds and a mutation-proof pass went
+    // by, while this file's own comments REASONED FROM `shell: bash` being
+    // present. This job's matrix includes windows-latest, GitHub's default
+    // shell there is PowerShell, and this workflow declares no `defaults:`
+    // block — so a bash body with no `shell:` is dot-sourced into pwsh and dies
+    // at parse, on a branch-protection-required check.
+    for name in [BUILD, RUN] {
+        assert_eq!(
+            find_step(&steps, name)
+                .get("shell")
+                .and_then(|v| v.as_str()),
+            Some("bash"),
+            "step `{name}` must declare `shell: bash`. The `test` job's matrix \
+             includes windows-latest, where the default shell is PowerShell and \
+             this bash body would fail to parse; the workflow carries no \
+             `defaults:` block to inherit from."
+        );
+    }
+
+    // cargo runs a test binary with cwd = the package manifest dir. Every path
+    // the run step recovers is absolute, so this `cd` looks removable — and a
+    // fixture read by relative path would then fail as if the TEST were broken.
+    assert!(
+        run_run.contains("cd src-tauri"),
+        "`{RUN}` must `cd src-tauri` before executing the binaries: cargo set \
+         that cwd for them, and this step is now the only thing reproducing it"
+    );
+
+    // Windows paths from cargo carry no forward slash, and bash PATH-searches a
+    // command word without one instead of exec'ing it (`absolute_program()`) —
+    // so the raw path dies `command not found` (127) on the windows leg.
+    assert!(
+        run_run.contains(r#"${b//\\//}"#),
+        "`{RUN}` must normalise backslashes before exec: cargo prints \
+         `D:\\a\\...\\foo.exe`, which contains no `/`, and bash looks such a \
+         word up in $PATH rather than executing it"
+    );
+
     assert!(
         run_run.contains("Refusing to report a pass over zero binaries"),
         "`{RUN}` must refuse when it recovers zero binaries. A green step over \

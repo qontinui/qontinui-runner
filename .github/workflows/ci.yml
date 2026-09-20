@@ -831,13 +831,24 @@ jobs:
       # DURING the compilation of the lib, and they land ~4 s after the
       # fingerprint cargo recorded for that same compilation — so the package is
       # an input to itself and every SUBSEQUENT cargo invocation sees it Dirty.
+      #
+      # ⚠️ THAT IS THE UBUNTU CAUSE. Windows fails the same way for a DIFFERENT
+      # file, and a fix aimed only at tauri-codegen would leave it Dirty. Job
+      # 105989072131 names a tauri `externalBin` SIDECAR instead:
+      #   Dirty qontinui-runner: the file
+      #   `src-tauri\binaries\qontinui_profile-x86_64-pc-windows-msvc.exe`
+      #   has changed (…, 24036100ns after last build at …)
+      # (`tauri.conf.json` `bundle.externalBin`, which this repo's own build.rs
+      # self-provisions as placeholder stubs). Same defect CLASS — the package
+      # is an input to itself — two different files. The conclusion is identical
+      # on both legs and is what this step acts on: never invoke cargo twice.
       # A single `cargo test` never notices, because it only checks freshness
       # once. Splitting into two invocations makes cargo check twice, and the
       # second check always fails. Measured on the ubuntu leg: `Compiling
       # qontinui-runner` at 00:39:30, the main-crate rustc still running when
       # the step was killed 20 minutes later (`Terminate orphan process: pid
-      # (10329) (rustc)`), with a cascade of ~12 bin/test targets rebuilt behind
-      # it. Not our build script — `src-tauri/build.rs` emits no
+      # (10329) (rustc)`), after 40 rustc invocations across 27 distinct crates
+      # and not one `running N tests` line. Not our build script — `src-tauri/build.rs` emits no
       # `rerun-if-changed` into `OUT_DIR`; this is `tauri-build`/`tauri-codegen`
       # (2.5). Recorded as a follow-up rather than worked around silently.
       #
@@ -868,19 +879,40 @@ jobs:
       # `Executable` line to recover. On the last complete run the entire
       # doctest target was: `Doc-tests qontinui_runner_lib` → `running 1 test` →
       # `... ignored`. ONE doctest, and it does not execute — so today this
-      # loses exactly zero executed tests. It will not stay true by itself:
+      # loses exactly zero EXECUTED tests. Two consequences it does have, stated
+      # because "zero" is easy to over-read: coord stops receiving that one
+      # `skip` row (`qontinui_runner_lib::…QueryBuilder (line 141)`), and this
+      # step's log now carries 28 `test result:` lines rather than the 29 the
+      # bound paragraph above counts. It will not stay true by itself:
       # recovering doctests needs a second cargo invocation, which is precisely
       # what pays the rebuild above. Tracked as a follow-up.
       - name: Run Rust tests
         id: run_rust_tests
         timeout-minutes: 20
+        # ⚠️ `shell: bash` is NOT optional and is not inherited. This job's
+        # matrix includes windows-latest, where GitHub's default shell is
+        # PowerShell, and this workflow declares no `defaults:` block — so a
+        # missing `shell:` here dot-sources a bash script into pwsh and dies at
+        # parse. An earlier cut of this step dropped the line while rewriting
+        # the body, and a review caught it before it ever ran.
+        #
+        # It also carries the errexit/pipefail contract: GitHub spells
+        # `shell: bash` as `bash --noprofile --norc -eo pipefail {0}`. The
+        # explicit `set -o pipefail` below is still worth keeping (it survives
+        # the shell being respelled), but do not read it as the only mechanism.
+        shell: bash
         env:
           QONTINUI_DISABLE_KEYCHAIN: "1"
         run: |
+          # KEEP THIS `cd`. It looks dead — every recovered path below is
+          # absolute — but it is now the ONLY thing reproducing cargo's own
+          # contract that a test binary runs with its cwd set to the package
+          # manifest directory. Delete it and any test reading a fixture by
+          # relative path fails in a way that reads as a test bug rather than a
+          # workflow one. Pinned by src-tauri/tests/ci_rust_test_steps_split.rs.
           cd src-tauri
-          # `set -o pipefail` — defence in depth; see the build step. It is also
-          # what carries the runner's exit status out of the `| tee` below, so a
-          # failing binary reds this step.
+          # `set -o pipefail` — see the build step. It carries the runner's exit
+          # status out of the `| tee` below, so a failing binary reds this step.
           set -o pipefail
 
           # Recover the test binaries the build step already produced. Strip
@@ -913,11 +945,24 @@ jobs:
           # default (it stops at the first failing target unless
           # `--no-fail-fast`). Keeping that identical means this step's red/green
           # meaning is unchanged by the switch.
+          #
+          # ⚠️ The backslash normalisation is load-bearing on windows-latest.
+          # cargo prints Windows paths with backslashes and NO forward slash
+          # anywhere in the word:
+          #   Executable `D:\a\qontinui-runner\...\deps\foo-50d7fbf0.exe`
+          # bash decides direct-exec vs `$PATH` lookup on whether the command
+          # word contains a `/` (`absolute_program()`), so such a word is
+          # PATH-SEARCHED and dies `command not found` (127) instead of running.
+          # `D:/a/...` execs correctly under MSYS. The ANNOUNCEMENT keeps the
+          # path exactly as cargo printed it — that line is byte-identical to
+          # cargo's own, and `binaryIdFromAnnouncementLine` splits on `[\\/]`
+          # so it reads either spelling.
           run_all() {
-            local b
+            local b exe
             for b in "${BINS[@]}"; do
               printf '     Running `%s`\n' "$b"
-              "$b" || return $?
+              exe="${b//\\//}"
+              "$exe" || return $?
             done
           }
           run_all 2>&1 | tee "$GITHUB_WORKSPACE/cargo-test-output.log"
