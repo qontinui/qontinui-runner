@@ -421,19 +421,23 @@ async fn supervise_one(
         }
     }
 
-    // Observe idle/context-low on the live grid (two-read quiescence debounce
-    // — never nudge into a frame that is still streaming).
+    // Observe idle/context-low on the live grid, through the ONE quiescence
+    // debounce (`TerminalSession::idle_quiescence_probe`) — never nudge into a
+    // frame that is still streaming. `None` means the first read was not idle,
+    // in which case neither signal is computed, exactly as before: this used to
+    // be a byte-for-byte copy of that debounce, the last one left after the
+    // predicate itself was consolidated into `looping_agent::idle`.
     let (mut idle, mut context_low) = (false, false);
     if let Some((_, session)) = &live {
-        let (lines_a, cursor_a) = session.grid_text();
-        if snapshot_looks_idle(&lines_a, cursor_a) {
-            tokio::time::sleep(IDLE_QUIESCENCE_DEBOUNCE).await;
-            let (lines_b, cursor_b) = session.grid_text();
-            idle = snapshot_looks_idle(&lines_b, cursor_b)
-                && lines_a == lines_b
-                && cursor_a == cursor_b;
-            context_low =
-                snapshot_context_low(&lines_b, rec.def.lifecycle_policy.context_low_threshold_pct);
+        if let Some(probe) = session
+            .idle_quiescence_probe(IDLE_QUIESCENCE_DEBOUNCE)
+            .await
+        {
+            idle = probe.idle;
+            context_low = snapshot_context_low(
+                &probe.lines,
+                rec.def.lifecycle_policy.context_low_threshold_pct,
+            );
         }
     }
 

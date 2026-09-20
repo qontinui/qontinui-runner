@@ -135,7 +135,7 @@ use qontinui_runner_lib::wind_down::{self, WindDownView};
 /// What the subtree cross-reference structurally cannot see. Emitted verbatim
 /// on every response so a reader is never invited to infer omniscience from a
 /// confident-looking count.
-pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree — each process, so a nested subagent counts alongside the agent that spawned it (`nested_under_claude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `has_live_children` is a hint that a child process is attached right now, never a verdict that a session is busy or idle, and is null when the snapshot never enumerated that pid — null means UNCOMPUTABLE, never \"no children\"; `session_status` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING; a NESTED subagent `claude` is never discounted by its ancestor's declaration (nobody declared IT finished), and a live `claude` whose own lifecycle record has no live terminal at all is invisible to this join and is attributed to whichever live terminal's subtree contains it, or to none; `windDown` (on each top-level terminal-hosted process) and `windDownCandidates` are a DRY-RUN wind-down eligibility report — nothing closes a session on them, they are computed whether or not the runner is drained, and a grid-idle window is only as old as the first `/restart-readiness` observation that saw the pane idle with no grid change since";
+pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree — each process, so a nested subagent counts alongside the agent that spawned it (`nestedUnderClaude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `hasLiveChildren` is a hint that a child process is attached right now, never a verdict that a session is busy or idle, and is null when the snapshot never enumerated that pid — null means UNCOMPUTABLE, never \"no children\"; `sessionStatus` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING; a NESTED subagent `claude` is never discounted by its ancestor's declaration (nobody declared IT finished), and a live `claude` whose own lifecycle record has no live terminal at all is invisible to this join and is attributed to whichever live terminal's subtree contains it, or to none; `windDown` (on each top-level terminal-hosted process) and `windDownCandidates` are a DRY-RUN wind-down eligibility report — nothing closes a session on them, they are computed whether or not the runner is drained, and a grid-idle window is only as old as the first `/restart-readiness` observation that saw the pane idle with no grid change since";
 
 /// `drain.covers` — the constant, honest scope of `POST /drain`.
 pub const DRAIN_COVERS: &str = "ai_sessions only";
@@ -2005,15 +2005,111 @@ mod tests {
         for claim in [
             "PROCESSES",
             "nested subagent",
-            "nested_under_claude",
+            "nestedUnderClaude",
             "root_count",
             "cwd",
             "null on Windows",
-            "has_live_children",
+            "hasLiveChildren",
             "never a verdict",
         ] {
             assert!(v.boundary.contains(claim), "boundary lost `{claim}`");
         }
+    }
+
+    /// No per-process field may appear in BOUNDARY under a spelling the
+    /// payload does not use.
+    ///
+    /// BOUNDARY is emitted verbatim as the endpoint's own self-description, so
+    /// a key named there that is not in the JSON sends a reader grepping for
+    /// something that is not in the response. `LiveClaudeProcess` is
+    /// `#[serde(rename_all = "camelCase")]` while `TerminalPlane` is NOT, and
+    /// that mixed provenance is what drifted the prose: the sentence carried
+    /// `has_live_children` / `session_status` / `nested_under_claude` against a
+    /// camelCase payload, beside a correct `root_count` from the plane and a
+    /// correct `windDown` added later in the same string.
+    ///
+    /// Derived from the SERIALIZED object rather than a literal list, in both
+    /// directions: every camelCase key BOUNDARY mentions must appear
+    /// backticked, and no key's snake_case twin may appear backticked at all.
+    /// A fourth field added to the sentence later is therefore covered too.
+    #[test]
+    fn boundary_names_process_fields_by_their_serialized_keys() {
+        fn to_snake(camel: &str) -> String {
+            let mut out = String::new();
+            for c in camel.chars() {
+                if c.is_ascii_uppercase() {
+                    out.push('_');
+                    out.push(c.to_ascii_lowercase());
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        }
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let json = serde_json::to_value(wind_down_proc(
+            1,
+            Some("sess"),
+            Some("finished"),
+            false,
+            false,
+        ))
+        .unwrap();
+        let keys: Vec<String> = json.as_object().unwrap().keys().cloned().collect();
+        assert!(
+            keys.iter().any(|k| k == "hasLiveChildren"),
+            "fixture did not serialize the field this test is about: {keys:?}"
+        );
+
+        let mut named = 0usize;
+        for key in &keys {
+            let snake = to_snake(key);
+            if snake == *key {
+                continue; // single-word key: no twin to confuse it with
+            }
+            // `session_status` is the ONE legitimate snake spelling in the
+            // sentence — but as `coord.sessions.session_status`, the coord
+            // COLUMN, so the backticked bare token must still be absent.
+            assert!(
+                !BOUNDARY.contains(&format!("`{snake}`")),
+                "BOUNDARY carries `{snake}`, which the payload spells `{key}`"
+            );
+            if BOUNDARY.contains(&format!("`{key}`")) {
+                named += 1;
+            }
+        }
+        assert!(
+            named >= 3,
+            "BOUNDARY should still name the per-process keys it describes; named {named}"
+        );
+
+        // `root_count` IS correct: it lives on TerminalPlane, which has no
+        // `rename_all`.
+        let plane =
+            serde_json::to_value(terminal_plane_from(&empty_report(now_ms), &[], now_ms)).unwrap();
+        assert!(plane.get("root_count").is_some(), "{plane}");
+        assert!(BOUNDARY.contains("`root_count`"));
+
+        // `windDownCandidates` is camelCase only by an explicit
+        // `#[serde(rename)]` on a struct with no `rename_all`, so it is the
+        // most fragile spelling in the sentence: dropping that attribute
+        // renames the field and nothing else would fail.
+        let verdict = serde_json::to_value(verdict_from(
+            &empty_report(now_ms),
+            &[],
+            Some(ai_plane_from(&[], &[], now_ms)),
+            vec![],
+            idle_drain(),
+            fresh_census(now_ms),
+            now_ms,
+        ))
+        .unwrap();
+        assert!(
+            verdict.get("windDownCandidates").is_some(),
+            "the #[serde(rename)] on wind_down_candidates is gone: {verdict}"
+        );
+        assert!(BOUNDARY.contains("`windDownCandidates`"));
     }
 
     #[test]
@@ -2552,7 +2648,7 @@ mod tests {
     /// is still running — the honest limitation this change must not hide.
     #[test]
     fn boundary_states_that_finishing_does_not_terminate_the_process() {
-        assert!(BOUNDARY.contains("session_status"));
+        assert!(BOUNDARY.contains("sessionStatus"));
         assert!(BOUNDARY.contains("PROCESS IS STILL RUNNING"));
         assert!(BOUNDARY.contains("NEVER \"not running\""));
         assert!(BOUNDARY.contains("ambiguous"));
