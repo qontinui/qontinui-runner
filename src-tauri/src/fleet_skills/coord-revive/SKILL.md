@@ -95,16 +95,18 @@ falls through to the next source. Only the runner mint's 401 ends L4.
 derives the workspace root from the cwd's `git rev-parse --git-common-dir`, so
 `bash <path-to-this-skill-dir>/coord-revive.sh` answers for the directory you
 run it *from*, whichever checkout's skill dir that path names. What the
-script's own location decides is only where it finds the four helpers it needs
-from the config repo's `scripts/` — `lib/envelope.sh`, `coord-acting-bearer.sh`,
-`coord-provision-nonce.sh` and `lib/guard-decision-log.sh` — and since #814 /
+script's own location decides is only where it finds the six helpers it needs
+from the config repo's `scripts/` — `lib/envelope.sh`, the `lib/native-path.sh`
+that sources beside it, `lib/guard-decision-log.sh`, `coord-acting-bearer.sh`,
+`coord-provision-nonce.sh` and `drain-closeout-spool.sh` — and since #814 /
 #845 that lookup is ONE resolver (`__resolve_fleet_script` in
 `.claude/skills/coord-revive/coord-revive.sh`) that works from any checkout: the
 original three fixed rungs first (`$HERE/../../../scripts/`, the same with
 `$HERE` resolved physically, `$QONTINUI_ROOT/qontinui-claude-config/scripts/`),
 then `$HERE` and every ancestor of it — logical and physical — tested for
 `scripts/` and for `qontinui-claude-config/scripts/`, then the
-`--git-common-dir` workspace root. The three fixed rungs alone assumed `$HERE` sat three levels
+`--git-common-dir` workspace root, and LAST the bundled render described below
+(`$HERE/_scripts/`, and a sibling skill's `$HERE/../coord-revive/_scripts/`). The three fixed rungs alone assumed `$HERE` sat three levels
 below the config repo, which holds for `<workspace-root>/.claude` (a symlink
 into it) and for a config-repo checkout new enough to ship `scripts/lib/` — and
 for nothing else: every other checkout carries its own REAL copy of the bundle,
@@ -142,6 +144,14 @@ grep -c '__resolve_fleet_script' <path-to-this-skill-dir>/coord-revive.sh
 # 0 -> pre-resolver copy: refuses from every checkout but the config repo and
 #      the workspace root, with "envelope.sh not found beside this skill"
 # >0 -> carries the resolver
+
+# The SECOND tell, and the one that matters on a device with no checkout: a
+# copy carrying the resolver still exits 127 there unless the render came with
+# it. The two are independent -- the resolver landed in #814/#845, the render
+# in a later bundle carry -- so read both.
+[ -r <path-to-this-skill-dir>/_scripts/lib/envelope.sh ] \
+  && echo "render present: runs with no config repo in reach" \
+  || echo "render ABSENT: needs a qontinui-claude-config checkout, or exits 127"
 ```
 
 Never restart the runner to refresh a copy (served policy `production-and-cost`
@@ -158,19 +168,39 @@ QONTINUI_ROOT=<workspace-root> bash <path-to-this-skill-dir>/coord-revive.sh
 Measured on a pre-resolver copy from `qontinui-coord` on 2026-09-12: exit 127
 and no `VERDICT:` line without the variable, a `VERDICT:` line with it.
 
-**The limit, stated so "any checkout" is not read as "anywhere".** The
-resolver finds a config-repo checkout; it cannot conjure one. The runner bundle
-ships this skill's directory and nothing under `scripts/` — none of the four
-helpers, nor the `lib/native-path.sh` that `lib/envelope.sh` sources when it
-is present — so on a device with no `qontinui-claude-config` checkout in reach
-of any rung, EVERY copy, resolver or not, exits 127 at the `envelope.sh` lookup
-before probing a single door. That is the one
-population the fleet-served-skills bundling was built for, and for this script
-it is not yet served; the gap is recorded rather than closed here (coord
-finding `92219d86-db0b-42c8-9e4d-d2cf7b2d2666`, plan
-`2026-09-12-fleet-skills-bundle-ships-coord-revive-without-the-helpers-it-cannot-run-without`),
-because closing it is a bundle-roster change plus a bundle-local rung in the
-resolver, not a documentation edit.
+**The device with no checkout at all, and the render that serves it.** The
+resolver finds a config-repo checkout; it cannot conjure one. So every rung
+above answers nothing on the one population the fleet-served-skills bundling
+was built for — a device with no `qontinui-claude-config` anywhere — and there
+EVERY copy, resolver or not, used to exit 127 at the `envelope.sh` lookup
+before probing a single door (coord finding
+`92219d86-db0b-42c8-9e4d-d2cf7b2d2666`, plan
+`2026-09-12-fleet-skills-bundle-ships-coord-revive-without-the-helpers-it-cannot-run-without`).
+
+That is what `_scripts/` is. The six helpers are rendered into this skill's own
+directory, one level down so the resolver's relative argument is reused
+unchanged (`_scripts/lib/envelope.sh`), and they therefore travel in the
+mechanism that already carries `SKILL.md` and `coord-revive.sh` — the runner
+walks the skill directory recursively and provisions each file at its own
+relative path. `pr-status.sh` carries the resolver block byte for byte and
+reaches this render through the sibling candidate, so the bundle ships six
+files and not twelve.
+
+Three properties of it, stated so the render is not over-read:
+
+- **`scripts/` is the source; `_scripts/` is a render.** It is regenerated by
+  copying, never edited, and check #64
+  (`scripts/lint-skill-script-render.py`) is red on a one-byte difference — and
+  red again when the runner bundle is missing any file of the roster, which is
+  the arm that keeps the carry from being silently skipped.
+- **The rung is LAST.** A checkout, wherever one is in reach, always wins: it
+  is the source of truth and may carry a fix the render does not have yet,
+  because the bundle lags by construction.
+- **The render lags exactly as the bundle does.** A device served through it
+  runs the helpers as of its runner build's carry date. That is the existing
+  bundle contract, not a new one. A copy whose `_scripts/` is absent altogether
+  is a build predating the carry — the second tell above reads it — and there
+  the 127 is still the honest answer.
 
 ### The AXES table: every verdict names what it did not ask
 
