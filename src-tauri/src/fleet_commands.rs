@@ -1574,7 +1574,9 @@ mod tests {
                          {WINDOW} characters by the not-usable verdict {verdict:?}, which is \
                          the superseded wording that COUNTS warnings instead of reading \
                          them. The rule is now: {NOT_USABLE_TEST}. Fix \
-                         src-tauri/src/fleet_commands/{name}.md - and if the demotion is \
+                         the canonical body qontinui-claude-config/.claude/commands/{name}.md and \
+                         re-vendor it here - editing the bundled copy alone is what reddens \
+                         check #15c on qontinui-claude-config `main`. And if the demotion is \
                          genuinely being restated next to a verdict, reword it rather than \
                          widen this guard. Offending window: {window:?}"
                     );
@@ -1784,7 +1786,8 @@ mod tests {
                     }
                     let verb = &caps["verb"];
                     violations.push(format!(
-                        "  src-tauri/src/fleet_commands/{name}.md:{}: `{}` — `{verb}` has a \
+                        "  qontinui-claude-config/.claude/commands/{name}.md (bundled here as \
+                         src-tauri/src/fleet_commands/{name}.md):{}: `{}` — `{verb}` has a \
                          device-authed twin. An agent must POST \
                          /coord/gates/<id>/agent/{verb}; the unprefixed route is the \
                          operator's and answers an agent 401. If this line IS documenting \
@@ -1965,7 +1968,10 @@ mod tests {
                      of this guard's scope while still telling a reader to apply that \
                      section's disposition — the clauses above stop being checked for \
                      it and nothing else notices. Restore the delivery read in \
-                     src-tauri/src/fleet_commands/{name}.md, or remove the pointer"
+                     the canonical body qontinui-claude-config/.claude/commands/{name}.md \
+                     and re-vendor it here (editing the bundled copy alone is what \
+                     reddens check #15c on qontinui-claude-config `main`), or remove the \
+                     pointer"
                 );
             }
         }
@@ -2032,7 +2038,10 @@ mod tests {
                 defined,
                 "bundled agent command(s) {citers:?} point readers at {target}'s \
                  {anchor:?} section, but {target} no longer contains that text. Either \
-                 restore the heading in src-tauri/src/fleet_commands/{target}.md or \
+                 restore the heading in the canonical body \
+                 qontinui-claude-config/.claude/commands/{target}.md and re-vendor it \
+                 here (editing the bundled copy alone is what reddens check #15c on \
+                 qontinui-claude-config `main`) or \
                  update every citation of it — a dangling pointer here drops the reader \
                  back to the behaviour the section exists to forbid"
             );
