@@ -12,7 +12,7 @@
 //!    `{ machine_id, machine_key: "mk_…", environment_id }` ONCE. We store the
 //!    key in `SecureStorage` and the rest in `~/.qontinui/env-agent.json`.
 //! 2. The runner's background task ([`spawn_env_capture`]) — or the one-shot
-//!    `qontinui_profile env capture` — runs the four collectors, builds the
+//!    `qontinui_profile env capture` — runs every collector, builds the
 //!    envelope, writes a last-envelope cache, and PUTs the envelope to
 //!    `{backend}/api/v1/devenv/agent/environments/{environment_id}/config`.
 //!
@@ -264,8 +264,12 @@ fn add_section(sections: &mut Map<String, Value>, name: &str, section: Option<Se
     }
 }
 
-/// Run all four collectors and assemble the envelope. Each collector is
+/// Run every collector and assemble the envelope. Each collector is
 /// best-effort; a failing/empty one is omitted (never aborts the others).
+///
+/// Deliberately not a count: this said "all four" while seven `add_section`
+/// calls stood below it, because each section that landed after the sentence
+/// was written left it one further out of date. The sections are the calls.
 pub async fn build_envelope() -> ConfigEnvelope {
     let mut sections = Map::new();
     let mut unknown_keys = Map::new();
