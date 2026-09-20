@@ -35,10 +35,12 @@ import {
 import {
   attachButtonState,
   attachErrorMessage,
+  attachWaitingMessage,
   fleetSessionAttachId,
   remoteSessionLabel,
   type RemoteTerminalInfoWire,
 } from "./remoteTabs";
+import { useRemoteAttachWaiting } from "./useRemoteAttachWaiting";
 import {
   createButtonState,
   describeRemoteCreateFailure,
@@ -403,6 +405,9 @@ export function FleetSessionPicker() {
 
   const { pageId, setActiveId } = useTerminalSession();
   const [attachState, setAttachState] = useState<Record<string, RowAttachState>>({});
+  /** The runner's own progress while it re-presents a grant the target has
+   * not recorded yet — keyed by session id, empty when nothing is waiting. */
+  const attachWaiting = useRemoteAttachWaiting();
   /** Per-DEVICE create state. Keyed by device id: the action belongs to the
    * group header, not to any one session row. */
   const [createState, setCreateState] = useState<Record<string, DeviceCreateState>>({});
@@ -930,6 +935,10 @@ export function FleetSessionPicker() {
                   const btn = attachButtonState(s, response?.deviceIdentityColumnsPresent);
                   const row = attachState[s.sessionId];
                   const pending = row?.pending === true;
+                  // The attach is not a single round trip: a target that has
+                  // not recorded the grant yet is waited out, same grant
+                  // re-presented, for up to a whole catch-up poll tick.
+                  const waitingLine = attachWaitingMessage(attachWaiting[s.sessionId]);
                   return (
                     <div
                       key={s.sessionId}
@@ -957,7 +966,8 @@ export function FleetSessionPicker() {
                           title={
                             btn.reason ??
                             (pending
-                              ? "Attaching — minting a grant and waiting for the remote runner"
+                              ? (waitingLine ??
+                                "Attaching — minting a grant and waiting for the remote runner")
                               : `Open a tab onto this session on ${g.label}`)
                           }
                           className="flex items-center gap-1 shrink-0 px-1.5 py-0.5 rounded text-[10px] bg-[#7aa2f7]/15 text-[#7aa2f7] hover:bg-[#7aa2f7]/30 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
@@ -967,7 +977,7 @@ export function FleetSessionPicker() {
                           ) : (
                             <Link2 className="w-2.5 h-2.5" />
                           )}
-                          {pending ? "Attaching…" : "Attach"}
+                          {pending ? (waitingLine ? "Waiting…" : "Attaching…") : "Attach"}
                         </button>
                       </div>
                       {(() => {
@@ -1011,6 +1021,16 @@ export function FleetSessionPicker() {
                           </div>
                         );
                       })()}
+                      {waitingLine && (
+                        <div
+                          data-ui-bridge-id={`terminal.fleet-session-attach-waiting.${s.sessionId}`}
+                          data-attach-wait-attempt={attachWaiting[s.sessionId]?.attempt}
+                          className="mt-0.5 text-[10px] text-[#e0af68] break-words"
+                          role="status"
+                        >
+                          {waitingLine}
+                        </div>
+                      )}
                       {row?.error && (
                         <div
                           data-ui-bridge-id={`terminal.fleet-session-attach-error.${s.sessionId}`}

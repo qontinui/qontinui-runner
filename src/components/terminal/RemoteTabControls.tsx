@@ -6,6 +6,7 @@ import type { CommandResponse } from "./types";
 import { useTerminalSession } from "./contexts/TerminalSessionContext";
 import {
   attachErrorMessage,
+  attachWaitingMessage,
   decodeHistoryBase64,
   remoteBadgeLabel,
   sessionLabelFromTitle,
@@ -13,6 +14,7 @@ import {
   type RemoteHistoryDetail,
   type RemoteTerminalInfoWire,
 } from "./remoteTabs";
+import { useRemoteAttachWaiting } from "./useRemoteAttachWaiting";
 
 /**
  * Zone-header controls for a REMOTE tab (plan
@@ -44,9 +46,14 @@ export function RemoteTabControls({
   const session = useTerminalSession();
   const [busy, setBusy] = useState<"history" | "reattach" | null>(null);
   const [note, setNote] = useState<string | null>(null);
+  // A reattach presents the SAME grant until the target records it, which can
+  // take a whole catch-up poll tick — so the busy state has to say so rather
+  // than spin silently.
+  const attachWaiting = useRemoteAttachWaiting();
 
   if (!badge || !tab.remote) return null;
   const remote = tab.remote;
+  const waitingLine = attachWaitingMessage(attachWaiting[remote.sessionId]);
 
   const loadHistory = async () => {
     if (busy) return;
@@ -158,13 +165,28 @@ export function RemoteTabControls({
           }}
           disabled={busy !== null}
           className={btn}
-          title="This remote pane ended (the session exited, or the grant expired). Mint a fresh grant and reattach to the same session."
+          title={
+            (busy === "reattach" ? waitingLine : null) ??
+            "This remote pane ended (the session exited, or the grant expired). Mint a fresh grant and reattach to the same session."
+          }
         >
           <RefreshCw className={`w-2.5 h-2.5 ${busy === "reattach" ? "animate-spin" : ""}`} />
-          {busy === "reattach" ? "reattaching…" : "reattach"}
+          {busy === "reattach" ? (waitingLine ? "waiting…" : "reattaching…") : "reattach"}
         </button>
       )}
-      {note && (
+      {/* The runner's own progress while it re-presents the grant. Shown in
+          place of the last note, because it is what is happening NOW. */}
+      {busy === "reattach" && waitingLine && (
+        <span
+          data-ui-bridge-id={`terminal.remote-attach-waiting.${tab.id}`}
+          className="text-[8px] text-[#e0af68] truncate max-w-[14rem]"
+          title={waitingLine}
+          role="status"
+        >
+          {waitingLine}
+        </span>
+      )}
+      {note && !(busy === "reattach" && waitingLine) && (
         <span
           data-ui-bridge-id={`terminal.remote-note.${tab.id}`}
           className="text-[8px] text-[#e0af68] truncate max-w-[14rem]"

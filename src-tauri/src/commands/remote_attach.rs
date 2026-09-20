@@ -22,7 +22,9 @@ use tauri::{Emitter, Manager};
 use tracing::{info, warn};
 
 use super::CommandResponse;
-use crate::mcp::remote_terminal::{client, ATTACH_TIMEOUT};
+use crate::mcp::remote_terminal::{
+    client, AttachError, AttachRefusal, AttachedReply, ATTACH_TIMEOUT,
+};
 use crate::session::SessionRegistry;
 use crate::settings::AcceptRemoteAttach;
 use crate::terminal::pane_io::PaneIo;
@@ -223,6 +225,16 @@ const SESSION_VISIBILITY_ATTEMPTS: u32 = 10;
 /// (`attach_forbidden`, a credential answer, a transport failure) is returned
 /// on the first attempt: retrying those would turn one honest refusal into a
 /// long silence ending in the same refusal.
+///
+/// **The grant flow races coord's outbox TWICE, and this helper covers only
+/// the first race.** The second one is on the TARGET's side and is served by
+/// [`present_grant_until_target_records_it`], under the very same rule: retry
+/// exactly the refusal that waiting can turn into an admission
+/// (`attach_grant_unknown`), return every settled one at once. The two stages
+/// are separate functions because the remedies are opposites — the mint race
+/// is fixed by asking AGAIN, the presentation race by presenting the SAME
+/// grant again. Minting a second grant to cure an `attach_grant_unknown` is
+/// the defect, not the fix: it is what made the failure permanent.
 pub(crate) async fn mint_attach_grant_awaiting_session(
     coord_base: &str,
     session_id: uuid::Uuid,
@@ -396,6 +408,257 @@ pub async fn terminal_attach_remote(
     .await
 }
 
+// ---------------------------------------------------------------------------
+// The target-side grant race — re-presenting the SAME grant
+// ---------------------------------------------------------------------------
+
+/// How long the source keeps re-presenting the SAME grant while the target has
+/// not recorded it yet.
+///
+/// **Sized against the TARGET's catch-up poll, which is a property of the
+/// target's BUILD and therefore not shortenable from here.** A target learns a
+/// grant from a push on `qontinui.sessions.<tenant>.<device>.attach_request`
+/// or from its catch-up `GET /sessions/attach-requests`; a target whose runner
+/// predates the on-demand re-read has only those two, so a dropped push leaves
+/// the poll as the only feed. That poll is 15 s on a runner carrying
+/// [`crate::session::attach::POLL_INTERVAL`] as it now stands, and **60 s on
+/// every build that predates it** — which is the population this window exists
+/// for. 80 s covers one whole 60 s tick plus the catch-up GET's own budget and
+/// clock skew, against a grant coord gives 900 s of life, so the wait spends a
+/// small fraction of the capability it is waiting on.
+///
+/// It bounds the RE-PRESENTATION schedule, not the wall clock: each
+/// presentation carries its own [`ATTACH_TIMEOUT`] (20 s), so a final attempt
+/// that times out can carry the total to ~100 s. A timeout is a settled stop
+/// (see [`present_grant_until_target_records_it`]), so that happens at most
+/// once and never compounds.
+pub(crate) const GRANT_LEARN_WINDOW: Duration = Duration::from_secs(80);
+
+/// Gap between two presentations of the same grant. Short enough that a 15 s
+/// poll is caught within a tick of recording the row, long enough that the
+/// window is a handful of relay round-trips rather than a busy loop: one frame
+/// per 4 s for at most ~20 frames, against a relay that carries every
+/// keystroke of every live tab.
+pub(crate) const GRANT_REPRESENT_INTERVAL: Duration = Duration::from_secs(4);
+
+/// Tauri event emitted while a grant is being re-presented, so the operator
+/// sees a WAITING state with a clock on it rather than a frozen button. A
+/// silent 80 s hang would be a worse defect than the one this closes.
+///
+/// The payload deliberately carries no `grant_jti`: the frontend has no use
+/// for a capability id, exactly as [`crate::terminal::types::RemoteTabIdentity`]
+/// withholds it.
+pub const REMOTE_ATTACH_WAITING_EVENT: &str = "terminal-remote-attach-waiting";
+
+/// One presentation of a grant through the relay. A trait so the retry policy
+/// below is unit-testable without a relay, a target, or a coord.
+pub(crate) trait GrantPresenter: Sync {
+    fn present<'a>(
+        &'a self,
+        grant: &'a str,
+        cols: u16,
+        rows: u16,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<AttachedReply, AttachError>> + Send + 'a>,
+    >;
+}
+
+/// The production presenter: one `remote_terminal_attach` frame through the
+/// relay, bounded by [`ATTACH_TIMEOUT`].
+pub(crate) struct RelayPresenter;
+
+impl GrantPresenter for RelayPresenter {
+    fn present<'a>(
+        &'a self,
+        grant: &'a str,
+        cols: u16,
+        rows: u16,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<AttachedReply, AttachError>> + Send + 'a>,
+    > {
+        Box::pin(async move { client().attach(grant, cols, rows, ATTACH_TIMEOUT).await })
+    }
+}
+
+/// Told, per attempt, that the target has not recorded the grant yet.
+pub(crate) trait AttachWaitObserver: Sync {
+    fn waiting(&self, attempt: u32, elapsed: Duration, window: Duration);
+}
+
+/// Emits [`REMOTE_ATTACH_WAITING_EVENT`] on the app handle, and remembers
+/// whether it ever did so the wait can be closed out exactly when it was
+/// opened — a `waiting: false` for a wait the frontend never saw would leave a
+/// stale key behind, and a missing one would leave a spinner forever.
+pub(crate) struct TauriWaitObserver {
+    app: tauri::AppHandle,
+    device_id: String,
+    session_id: String,
+    announced: std::sync::atomic::AtomicU32,
+}
+
+impl TauriWaitObserver {
+    pub(crate) fn new(app: &tauri::AppHandle, device_id: &str, session_id: &str) -> Self {
+        Self {
+            app: app.clone(),
+            device_id: device_id.to_string(),
+            session_id: session_id.to_string(),
+            announced: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    fn emit(&self, waiting: bool, attempt: u32, elapsed: Duration, window: Duration) {
+        if let Err(e) = self.app.emit(
+            REMOTE_ATTACH_WAITING_EVENT,
+            json!({
+                "deviceId": self.device_id,
+                "sessionId": self.session_id,
+                "waiting": waiting,
+                "attempt": attempt,
+                "elapsedMs": elapsed.as_millis() as u64,
+                "windowMs": window.as_millis() as u64,
+            }),
+        ) {
+            warn!(error = %e, "remote attach: attach-waiting emit failed");
+        }
+    }
+
+    /// Close the waiting state out — called however the attach settled.
+    pub(crate) fn settle(&self, elapsed: Duration, window: Duration) {
+        let attempts = self.announced.load(std::sync::atomic::Ordering::Relaxed);
+        if attempts > 0 {
+            self.emit(false, attempts, elapsed, window);
+        }
+    }
+}
+
+impl AttachWaitObserver for TauriWaitObserver {
+    fn waiting(&self, attempt: u32, elapsed: Duration, window: Duration) {
+        self.announced
+            .store(attempt, std::sync::atomic::Ordering::Relaxed);
+        info!(
+            device = %self.device_id,
+            session = %self.session_id,
+            attempt,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "remote attach: target has not recorded the grant yet — re-presenting the same grant"
+        );
+        self.emit(true, attempt, elapsed, window);
+    }
+}
+
+/// Present `grant` until the target records it, the window runs out, or a
+/// SETTLED refusal comes back.
+///
+/// **The same grant, every time.** Coord gives a grant 900 s and the target's
+/// table is keyed on the jti, so re-presenting one is a supported property, not
+/// a trick: `RemoteAttachGrants::unbind` documents same-grant re-presentation
+/// as the intended path for exactly this reason (the backend tears the
+/// attachment down on every source-socket drop and the source re-presents on
+/// reconnect). Minting a FRESH grant per attempt — what the picker's retry
+/// button did — is what made the failure permanent instead of flaky: the
+/// target's catch-up poll can only ever record the jtis coord published before
+/// the tick, never the one the next frame is about to present.
+///
+/// **Exactly one refusal is retried.** `attach_grant_unknown` is the one a
+/// target can turn into an admission merely by learning the row it has not
+/// read yet. Every other answer is a settled no and returns at once, so the
+/// operator is never made to wait out the window for a verdict that is already
+/// final: `attach_grant_expired`, `attach_grant_wrong_source`,
+/// `attach_terminal_mismatch` (the grant is bound to another terminal),
+/// `remote_attach_disabled`, `session_not_local`, `relay_unavailable`,
+/// `relay_disconnected` — and `timeout`, which means the target answered
+/// nothing at all. A timeout is not the race this covers: it is a wedged,
+/// offline or pre-feature target, which [`explain_relay_timeout`] already
+/// diagnoses, and re-presenting into it would spend the window 20 s at a time
+/// to reach the same conclusion.
+///
+/// **Bounds this respects, stated because they are easy to trip:**
+/// - `MAX_GRANTS` (256) capacity eviction — re-presenting inserts nothing into
+///   the target's table (only coord's push and the target's own catch-up do),
+///   so this adds no capacity pressure. A target whose table is full of live
+///   bindings refuses the insert, which looks like the race and is not one;
+///   the window runs out and the error says so.
+/// - `admit`'s `TerminalMismatch` on an already-bound grant — a re-present
+///   names no terminal, so it goes through `lookup` + `bind` rather than
+///   `admit`'s binding check, and re-binds to the SAME terminal. A grant bound
+///   elsewhere answers `attach_terminal_mismatch`, which is settled and stops
+///   the loop at once.
+/// - [`ATTACH_TIMEOUT`] — it bounds each PRESENTATION, not this window. The
+///   window schedules attempts; a presentation that times out ends the loop.
+///
+/// **How this composes with the RELAY's own one-shot re-present.** The relay
+/// re-presents a frame once, ~3 s after an `attach_grant_unknown`, inside a
+/// single request/reply exchange. The two cannot compound, for three reasons
+/// worth stating rather than trusting:
+/// 1. **One reply per request.** Each attempt here carries a fresh
+///    `request_id` and the client's pending slot is consumed by the FIRST
+///    reply (`take_pending`); a second reply for the same id is stray and
+///    logged. So the relay's extra frame can settle an attempt but never
+///    produce a second `AttachedReply`.
+/// 2. **One `Ok` ends the loop.** This function returns on the first success,
+///    so exactly one pane is ever registered — the duplicate-tab shape needs
+///    two successes, which cannot happen.
+/// 3. **Re-binding is idempotent.** If a presentation succeeded on the target
+///    while its reply was lost, the grant is already bound to that terminal;
+///    the next re-present names no terminal, so `bind` matches the SAME
+///    terminal id and returns true rather than double-binding. A grant bound
+///    to a DIFFERENT terminal answers `attach_terminal_mismatch`, which is
+///    settled here.
+///
+/// Their coverage simply adds: the relay's 3 s shot catches the sliver of poll
+/// phases falling inside it, and this window catches a whole tick. Removing
+/// either leaves the other correct.
+pub(crate) async fn present_grant_until_target_records_it(
+    presenter: &dyn GrantPresenter,
+    grant: &str,
+    cols: u16,
+    rows: u16,
+    window: Duration,
+    interval: Duration,
+    observer: &dyn AttachWaitObserver,
+) -> Result<AttachedReply, AttachError> {
+    let started = tokio::time::Instant::now();
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        match presenter.present(grant, cols, rows).await {
+            Ok(reply) => return Ok(reply),
+            Err(e) if e.code == AttachRefusal::GrantUnknown.code() => {
+                let elapsed = started.elapsed();
+                if elapsed.saturating_add(interval) >= window {
+                    return Err(grant_never_recorded(e, attempt, elapsed, window));
+                }
+                observer.waiting(attempt, elapsed, window);
+                tokio::time::sleep(interval).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// The exhausted-window error: the same typed code, with what was actually
+/// tried and the three things that look like this, so the operator is not left
+/// to guess which one they hit.
+fn grant_never_recorded(
+    mut e: AttachError,
+    attempts: u32,
+    elapsed: Duration,
+    window: Duration,
+) -> AttachError {
+    e.message = format!(
+        "{} — the SAME grant was presented {attempts} times over {:.0}s (bounded at {:.0}s) and \
+         the target never recorded it. A target whose runner predates the on-demand grant \
+         re-read learns a grant only from coord's push or its own catch-up poll, so this is \
+         either a lost push against a poll slower than that window, a grant table already full \
+         of live bindings, or a directive coord never published — the TARGET's runner log says \
+         which.",
+        e.message,
+        elapsed.as_secs_f32(),
+        window.as_secs_f32(),
+    );
+    e
+}
+
 /// Everything [`open_remote_tab`] needs that is not the manager or the app
 /// handle. A struct rather than eleven positional arguments, because two
 /// callers now build it: the attach command above, and the remote CREATE
@@ -434,23 +697,38 @@ pub(crate) async fn open_remote_tab(
         working_dir,
     } = req;
     let session_id = session_uuid.to_string();
-    let attached = client()
-        .attach(&minted.grant, cols, rows, ATTACH_TIMEOUT)
-        .await
-        .map_err(|mut e| {
-            if e.code == "timeout" {
-                e.message = explain_relay_timeout(
-                    "remote_terminal_attached",
-                    minted
-                        .target_device_id
-                        .as_deref()
-                        .unwrap_or(device_id.trim()),
-                    minted.target_runner.as_ref(),
-                    ATTACH_TIMEOUT.as_secs(),
-                );
-            }
-            e.to_string()
-        })?;
+    // The target learns this grant from coord's push or its own catch-up poll,
+    // and a lost push leaves only the poll — so the FIRST presentation of a
+    // freshly minted grant loses that race whenever the tick has not come
+    // round yet. Re-present the SAME grant across a whole tick rather than
+    // abandoning it; a fresh mint per attempt is what made this permanent.
+    let waiting = TauriWaitObserver::new(app_handle, device_id.trim(), &session_id);
+    let started = tokio::time::Instant::now();
+    let presented = present_grant_until_target_records_it(
+        &RelayPresenter,
+        &minted.grant,
+        cols,
+        rows,
+        GRANT_LEARN_WINDOW,
+        GRANT_REPRESENT_INTERVAL,
+        &waiting,
+    )
+    .await;
+    waiting.settle(started.elapsed(), GRANT_LEARN_WINDOW);
+    let attached = presented.map_err(|mut e| {
+        if e.code == "timeout" {
+            e.message = explain_relay_timeout(
+                "remote_terminal_attached",
+                minted
+                    .target_device_id
+                    .as_deref()
+                    .unwrap_or(device_id.trim()),
+                minted.target_runner.as_ref(),
+                ATTACH_TIMEOUT.as_secs(),
+            );
+        }
+        e.to_string()
+    })?;
     if attached.grant_jti != minted.grant_jti {
         client().discard_pending_output(&attached.grant_jti);
         return Err(format!(
@@ -1127,5 +1405,221 @@ mod remote_close_tests {
     fn a_local_tab_yields_no_remote_close_probe() {
         let tm = TerminalManager::new();
         assert!(probe_remote_close(&tm, "not-a-remote-tab").is_none());
+    }
+}
+
+#[cfg(test)]
+mod represent_tests {
+    use super::{
+        present_grant_until_target_records_it, AttachError, AttachWaitObserver, AttachedReply,
+        GrantPresenter, GRANT_LEARN_WINDOW, GRANT_REPRESENT_INTERVAL,
+    };
+    use crate::mcp::remote_terminal::ATTACH_TIMEOUT;
+    use crate::terminal::remote_pane_io::AttachedRing;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    fn unknown() -> AttachError {
+        AttachError {
+            code: "attach_grant_unknown".into(),
+            message: "no live attach grant with that jti on this device".into(),
+        }
+    }
+
+    fn reply(jti: &str) -> AttachedReply {
+        AttachedReply {
+            grant_jti: jti.into(),
+            terminal_id: "remote-term".into(),
+            ring: AttachedRing::default(),
+        }
+    }
+
+    /// A presenter that answers from a script and records every grant string it
+    /// was handed — which is what proves the SAME grant is re-presented.
+    struct Scripted {
+        replies: Mutex<VecDeque<Result<AttachedReply, AttachError>>>,
+        presented: Mutex<Vec<String>>,
+    }
+
+    impl Scripted {
+        fn new(replies: Vec<Result<AttachedReply, AttachError>>) -> Self {
+            Self {
+                replies: Mutex::new(replies.into()),
+                presented: Mutex::new(Vec::new()),
+            }
+        }
+        fn presented(&self) -> Vec<String> {
+            self.presented.lock().unwrap().clone()
+        }
+    }
+
+    impl GrantPresenter for Scripted {
+        fn present<'a>(
+            &'a self,
+            grant: &'a str,
+            _cols: u16,
+            _rows: u16,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<AttachedReply, AttachError>> + Send + 'a>,
+        > {
+            self.presented.lock().unwrap().push(grant.to_string());
+            let next = self
+                .replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Err(unknown()));
+            Box::pin(async move { next })
+        }
+    }
+
+    #[derive(Default)]
+    struct Recorder {
+        waits: Mutex<Vec<u32>>,
+    }
+
+    impl AttachWaitObserver for Recorder {
+        fn waiting(&self, attempt: u32, _elapsed: Duration, _window: Duration) {
+            self.waits.lock().unwrap().push(attempt);
+        }
+    }
+
+    /// **The regression the picker's retry button could not fix.** A target
+    /// that has not read coord's list yet answers `attach_grant_unknown`; the
+    /// source must present the VERY SAME grant again rather than mint a fresh
+    /// jti, because the target's catch-up poll can only ever record jtis coord
+    /// published before the tick. Without the re-present this returns the first
+    /// refusal and the attach fails permanently.
+    #[tokio::test(start_paused = true)]
+    async fn the_same_grant_is_re_presented_until_the_target_records_it() {
+        let presenter = Scripted::new(vec![
+            Err(unknown()),
+            Err(unknown()),
+            Err(unknown()),
+            Ok(reply("jti-1")),
+        ]);
+        let recorder = Recorder::default();
+        let started = tokio::time::Instant::now();
+        let got = present_grant_until_target_records_it(
+            &presenter,
+            "grant.jwt.SAME",
+            120,
+            40,
+            GRANT_LEARN_WINDOW,
+            GRANT_REPRESENT_INTERVAL,
+            &recorder,
+        )
+        .await
+        .expect("the target recorded the grant on its next poll");
+
+        assert_eq!(got.grant_jti, "jti-1");
+        let presented = presenter.presented();
+        assert_eq!(presented.len(), 4, "every refusal must be re-presented");
+        assert!(
+            presented.iter().all(|g| g == "grant.jwt.SAME"),
+            "a fresh grant per attempt is the defect, not the fix: {presented:?}"
+        );
+        // The operator saw a waiting state for each wait, not a frozen button.
+        assert_eq!(*recorder.waits.lock().unwrap(), vec![1, 2, 3]);
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            GRANT_REPRESENT_INTERVAL * 3
+        );
+    }
+
+    /// A settled no is answered at once. Making the operator wait out the whole
+    /// window for a verdict that is already final would be its own defect, so
+    /// every refusal but `attach_grant_unknown` returns on the first attempt —
+    /// including the `timeout` that means the target said nothing at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_settled_refusal_aborts_without_waiting_out_the_window() {
+        for code in [
+            "attach_grant_expired",
+            "attach_grant_wrong_source",
+            "attach_terminal_mismatch",
+            "remote_attach_disabled",
+            "session_not_local",
+            "relay_unavailable",
+            "relay_disconnected",
+            "timeout",
+        ] {
+            let presenter = Scripted::new(vec![Err(AttachError {
+                code: code.into(),
+                message: "settled".into(),
+            })]);
+            let recorder = Recorder::default();
+            let started = tokio::time::Instant::now();
+            let err = present_grant_until_target_records_it(
+                &presenter,
+                "grant.jwt.SAME",
+                120,
+                40,
+                GRANT_LEARN_WINDOW,
+                GRANT_REPRESENT_INTERVAL,
+                &recorder,
+            )
+            .await
+            .expect_err("a settled refusal");
+
+            assert_eq!(err.code, code);
+            assert_eq!(err.message, "settled", "{code} must be returned verbatim");
+            assert_eq!(presenter.presented().len(), 1, "{code} was re-presented");
+            assert!(
+                recorder.waits.lock().unwrap().is_empty(),
+                "{code} must not raise a waiting state"
+            );
+            assert_eq!(
+                tokio::time::Instant::now() - started,
+                Duration::ZERO,
+                "{code} must not spend the window"
+            );
+        }
+    }
+
+    /// The window bounds the wait, and the failure says what was tried instead
+    /// of repeating the bare refusal a single attempt would have given.
+    #[tokio::test(start_paused = true)]
+    async fn the_window_bounds_the_wait_and_the_failure_names_what_was_tried() {
+        let presenter = Scripted::new(Vec::new()); // every attempt: grant unknown
+        let recorder = Recorder::default();
+        let started = tokio::time::Instant::now();
+        let err = present_grant_until_target_records_it(
+            &presenter,
+            "grant.jwt.SAME",
+            120,
+            40,
+            GRANT_LEARN_WINDOW,
+            GRANT_REPRESENT_INTERVAL,
+            &recorder,
+        )
+        .await
+        .expect_err("the target never recorded it");
+
+        assert_eq!(err.code, "attach_grant_unknown");
+        assert!(err.message.contains("SAME grant"), "{}", err.message);
+        assert!(err.message.contains("80s"), "{}", err.message);
+        let waited = tokio::time::Instant::now() - started;
+        assert!(
+            waited < GRANT_LEARN_WINDOW && waited >= GRANT_LEARN_WINDOW - GRANT_REPRESENT_INTERVAL,
+            "the schedule must fill the window without overrunning it: {waited:?}"
+        );
+        assert!(presenter.presented().len() >= 2);
+    }
+
+    /// The window has to cover a whole catch-up tick of a target whose build
+    /// predates the shortened poll (60 s), plus margin — and stay inside the
+    /// ~70–90 s band a human will sit through. Each presentation carries its
+    /// own `ATTACH_TIMEOUT`, which is a per-attempt bound, not this one.
+    #[test]
+    fn the_window_covers_a_pre_change_targets_whole_poll_tick() {
+        assert!(GRANT_LEARN_WINDOW >= Duration::from_secs(70));
+        assert!(GRANT_LEARN_WINDOW <= Duration::from_secs(90));
+        assert!(GRANT_LEARN_WINDOW > Duration::from_secs(60));
+        assert!(GRANT_REPRESENT_INTERVAL < ATTACH_TIMEOUT);
+        assert!(
+            GRANT_LEARN_WINDOW > crate::session::attach::POLL_INTERVAL,
+            "the window must cover at least one tick of a target that polls as this one does"
+        );
     }
 }
