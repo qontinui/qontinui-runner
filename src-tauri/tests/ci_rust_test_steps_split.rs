@@ -157,12 +157,18 @@ fn command_lines(step: &serde_yaml::Value, name: &str) -> String {
 /// A real cargo INVOCATION, as opposed to the word "cargo" inside a log
 /// filename (`cargo-test-build.log`) or a sentence. Anchored on a cargo
 /// subcommand so `cargo-test-output.log` cannot match.
-/// Catches a toolchain selector (`cargo +1.95.0 test` — this repo pins 1.95.0
-/// and spells `+1.95.0` elsewhere in this very workflow), leading flags
+/// Catches a toolchain selector (`cargo +1.95.0 test`), leading flags
 /// (`cargo --offline test`) and a path-qualified binary
 /// (`~/.cargo/bin/cargo test`). It cannot catch an indirected `$CARGO test`;
 /// no regex on the spelling can, and that is a deliberate bound rather than an
 /// oversight.
+///
+/// The toolchain-selector arm guards a form this repo does NOT currently spell
+/// anywhere — `git grep 'cargo +'` finds no invocation — and an earlier version
+/// of this comment claimed it did, which was false. It is kept because
+/// `rust-toolchain.toml` pins `channel = "1.95.0"` and `+1.95.0` is the natural
+/// edit the next person reaches for; the pattern should not have to be widened
+/// in the same commit that reintroduces the defect.
 static CARGO_INVOCATION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(
         r"(?m)(^|[|;&(]\s*|\s|/)cargo(\s+\+\S+)?(\s+--?\S+)*\s+(test|build|run|check|clippy|nextest)\b",
