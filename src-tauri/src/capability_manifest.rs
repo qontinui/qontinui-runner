@@ -508,9 +508,7 @@ impl From<crate::agent_skills::AgentSkillSource> for Rung {
 /// - [`SkillSource::Builtin`] → [`Rung::Embedded`]. **Verified**, not assumed:
 ///   `skills::BUILTIN_SKILLS_JSON` is `include_str!("builtin.json")`.
 /// - [`SkillSource::User`] → [`Rung::DiskCache`]. Loaded by
-///   `workflow_generation::generator::skill_registry_with_pg` /
-///   `PgDb::list_user_skills` from this
-///   device's own database. Not a *file* cache, but the property the rung names
+///   `PgDb::list_user_skills` from this device's own database. Not a *file* cache, but the property the rung names
 ///   is the one that matters here: device-local state the runner itself wrote,
 ///   never carried by the build.
 /// - [`SkillSource::Community`] → [`Rung::Unknown`], and the reason is **not**

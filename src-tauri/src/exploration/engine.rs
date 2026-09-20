@@ -385,8 +385,9 @@ impl ExplorationEngine {
         ),
         String,
     > {
-        let snapshot =
-            sdk_request(sdk_conn, reqwest::Method::GET, "/control/snapshot", None).await?;
+        let snapshot = sdk_conn
+            .sdk_request(reqwest::Method::GET, "/control/snapshot", None)
+            .await?;
 
         let elements: Vec<Value> = snapshot
             .get("data")
@@ -420,17 +421,8 @@ impl ExplorationEngine {
 }
 
 // =============================================================================
-// SDK Communication (uses existing sdk_request infrastructure)
+// SDK Communication (over the `SdkTransport` the caller supplies)
 // =============================================================================
-
-async fn sdk_request(
-    sdk_conn: &dyn SdkTransport,
-    method: reqwest::Method,
-    path: &str,
-    body: Option<Value>,
-) -> Result<Value, String> {
-    sdk_conn.sdk_request(method, path, body).await
-}
 
 async fn execute_action(
     sdk_conn: &dyn SdkTransport,
@@ -442,7 +434,9 @@ async fn execute_action(
         urlencoding::encode(element_id)
     );
     let body = serde_json::json!({ "action": action, "params": {} });
-    sdk_request(sdk_conn, reqwest::Method::POST, &path, Some(body)).await?;
+    sdk_conn
+        .sdk_request(reqwest::Method::POST, &path, Some(body))
+        .await?;
     Ok(())
 }
 
