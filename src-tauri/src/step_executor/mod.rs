@@ -48,6 +48,11 @@ pub mod events;
 pub mod handlers;
 pub mod step_cache;
 
+/// Parser-against-the-real-config tests for `step_injection`, kept here
+/// beside the `InjectableStep` impl so the parser names no execution type.
+#[cfg(test)]
+mod injected_step_tests;
+
 // Re-export everything for backward compatibility.
 // External code uses `crate::step_executor::SomeType` — these ensure it still works.
 #[allow(unused_imports)]

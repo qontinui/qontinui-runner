@@ -9269,6 +9269,13 @@ pub fn create_router(
     // `State<'_, Arc<ApiState>>` can resolve it.
     app_handle.manage(api_state.clone());
 
+    // Register the supervision ring under its OWN type as well, so the
+    // trigger-system dispatcher (`git_supervision::handle_supervision_action`)
+    // can resolve just the state it needs instead of reaching through
+    // `ApiState`. Cheap: `SupervisionState` is an `Arc` handle, and both
+    // registrations share the same ring.
+    app_handle.manage(api_state.supervision_state.clone());
+
     // Spawn the background sweeper that evicts stale phone-home registrations.
     crate::mcp::app_registry::spawn_sweeper(api_state.app_registry.clone());
 

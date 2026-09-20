@@ -13,6 +13,54 @@ use crate::context;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
 // ============================================================================
+// Observation memory (prompt injection)
+// ============================================================================
+
+/// Fetch observation memory and render it as a prompt section.
+///
+/// The fetch half of what used to live in `context::resolution`: that
+/// module is now a pure formatter, so the PostgreSQL read sits here,
+/// beside the handlers that already own a `PgDb`.
+///
+/// Accepts either a `project_id` (project-scoped retrieval) or a
+/// `search_query` (e.g. workflow name) for relevance-based retrieval.
+/// Returns `None` when neither is usable, PG is unavailable, or nothing
+/// was found.
+pub async fn format_observation_memory_for_prompt(
+    pg_db: &crate::database::pg::PgDb,
+    project_id: Option<&str>,
+    search_query: Option<&str>,
+) -> Option<String> {
+    let observations = if let Some(pid) = project_id.filter(|s| !s.is_empty()) {
+        pg_db
+            .get_project_context(pid, None, 15)
+            .await
+            .unwrap_or_default()
+    } else if let Some(query) = search_query.filter(|s| !s.is_empty()) {
+        pg_db
+            .search_observations(query, None, 10)
+            .await
+            .unwrap_or_default()
+    } else {
+        return None;
+    };
+
+    let summaries: Vec<context::ObservationSummary> = observations
+        .into_iter()
+        .map(|o| context::ObservationSummary {
+            id: o.id,
+            title: o.title,
+            content_preview: o.content_preview,
+            observation_type: o.observation_type,
+            topic_key: o.topic_key,
+            revision_count: o.revision_count,
+        })
+        .collect();
+
+    context::format_observation_memory_for_prompt(&summaries)
+}
+
+// ============================================================================
 // Request Types
 // ============================================================================
 

@@ -5,7 +5,6 @@
 //! and builds co-occurrence data for state discovery.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use serde_json::Value;
 use tokio::sync::watch;
@@ -16,7 +15,31 @@ use super::cooccurrence::CooccurrenceBuilder;
 use super::discovery::{DiscoveryConfig, FingerprintStateDiscovery};
 use super::fingerprint::{self, FingerprintConfig};
 use super::types::*;
-use crate::mcp::sdk_client::SdkConnectionManager;
+
+// =============================================================================
+// Transport
+// =============================================================================
+
+/// The one thing the engine needs from whatever holds the SDK app
+/// connection: issue a single HTTP request against the connected app
+/// and hand back the parsed JSON body.
+///
+/// Declared here, in the consumer, and implemented on the connection
+/// manager by the module that owns it — so exploration names no
+/// transport type and stays testable against a stub.
+#[async_trait::async_trait]
+pub trait SdkTransport: Send + Sync {
+    /// Issue `method path` against the active SDK connection, with an
+    /// optional JSON body. `Err` when there is no active connection,
+    /// the request failed, the body did not parse, or the app answered
+    /// a non-success status.
+    async fn sdk_request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Value, String>;
+}
 
 // =============================================================================
 // Engine
@@ -72,7 +95,7 @@ impl ExplorationEngine {
     /// 6. Returns the discovery result
     pub async fn explore(
         &mut self,
-        sdk_conn: &Arc<tokio::sync::Mutex<SdkConnectionManager>>,
+        sdk_conn: &dyn SdkTransport,
         config: ExplorationConfig,
     ) -> Result<DiscoveryResult, String> {
         self.cancel_token = CancellationToken::new();
@@ -352,7 +375,7 @@ impl ExplorationEngine {
 
     async fn fetch_and_fingerprint(
         &self,
-        sdk_conn: &Arc<tokio::sync::Mutex<SdkConnectionManager>>,
+        sdk_conn: &dyn SdkTransport,
         fp_config: &FingerprintConfig,
     ) -> Result<
         (
@@ -401,45 +424,16 @@ impl ExplorationEngine {
 // =============================================================================
 
 async fn sdk_request(
-    sdk_conn: &Arc<tokio::sync::Mutex<SdkConnectionManager>>,
+    sdk_conn: &dyn SdkTransport,
     method: reqwest::Method,
     path: &str,
     body: Option<Value>,
 ) -> Result<Value, String> {
-    let conn_guard = sdk_conn.lock().await;
-    let conn = conn_guard
-        .active_connection()
-        .ok_or_else(|| "No active SDK app connection".to_string())?;
-
-    let url = format!("{}{}{}", conn.app_url, conn.base_path, path);
-    let mut request = conn.client.request(method, &url);
-
-    if let Some(body) = body {
-        request = request
-            .header("Content-Type", "application/json")
-            .json(&body);
-    }
-
-    let resp = request
-        .send()
-        .await
-        .map_err(|e| format!("SDK request failed: {}", e))?;
-
-    let status = resp.status();
-    let json: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse SDK response: {}", e))?;
-
-    if !status.is_success() {
-        return Err(format!("SDK app returned HTTP {}", status));
-    }
-
-    Ok(json)
+    sdk_conn.sdk_request(method, path, body).await
 }
 
 async fn execute_action(
-    sdk_conn: &Arc<tokio::sync::Mutex<SdkConnectionManager>>,
+    sdk_conn: &dyn SdkTransport,
     element_id: &str,
     action: &str,
 ) -> Result<(), String> {
