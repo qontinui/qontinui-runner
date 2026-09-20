@@ -848,9 +848,23 @@ jobs:
       # qontinui-runner` at 00:39:30, the main-crate rustc still running when
       # the step was killed 20 minutes later (`Terminate orphan process: pid
       # (10329) (rustc)`), after 40 rustc invocations across 27 distinct crates
-      # and not one `running N tests` line. Not our build script — `src-tauri/build.rs` emits no
-      # `rerun-if-changed` into `OUT_DIR`; this is `tauri-build`/`tauri-codegen`
-      # (2.5). Recorded as a follow-up rather than worked around silently.
+      # and not one `running N tests` line.
+      #
+      # OWNERSHIP, scoped per leg, because the obvious one-line summary is
+      # wrong. Not our build script ON UBUNTU — `src-tauri/build.rs` emits no
+      # `rerun-if-changed` into `OUT_DIR`, so that half is
+      # `tauri-build`/`tauri-codegen` (2.5) and is upstream. **The WINDOWS half
+      # IS ours.** That sidecar stub is written by our own
+      # `ensure_sidecar_placeholders()`. It is touch-if-absent rather than an
+      # unconditional rewrite (`if path.exists() { continue; }`), and
+      # `src-tauri/binaries/qontinui_profile-*` is gitignored — so on a fresh CI
+      # checkout it is ALWAYS absent, invocation 1's build script creates it
+      # inside the fingerprint window, and invocation 2 sees it changed.
+      # One-shot rather than perpetual, which is exactly why it never surfaced
+      # under a single `cargo test` and appeared the moment the step was split.
+      # Cheap for us to fix (write the stub before the fingerprint window, or
+      # emit it into `OUT_DIR`) and NOT blocked on upstream, unlike the ubuntu
+      # half. Both recorded as follow-ups rather than worked around silently.
       #
       # So the run half executes the binaries the build half ALREADY produced.
       # cargo prints one `Executable \`<path>\`` line per test target under
