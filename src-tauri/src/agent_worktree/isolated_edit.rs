@@ -483,14 +483,22 @@ async fn materialize_repos(
         // A repo outside the workspace root is materialized only from a
         // VERIFIED checkout of it: `default_canonical_path`'s layout-rule
         // fallback may name a same-named checkout of a different owner's repo.
-        let path = if super::canonical_paths::has_foreign_owner(repo) {
-            super::canonical_paths::resolve_checkout(repo)
-                .map_err(|e| AllocateError::Other(e.to_string()))?
-        } else {
-            super::canonical_paths::default_canonical_path(repo).map_err(|e| {
+        // That rule now lives in one place —
+        // `canonical_paths::worktree_source_checkout` — shared by every site
+        // that cuts a worktree, rather than each spelling it out and one of
+        // them drifting (post-merge follow-up to qontinui-runner#1563).
+        // Other readers of `default_canonical_path` (census, reclaim, claim
+        // keys) keep its unverified answer on purpose.
+        let path = super::canonical_paths::worktree_source_checkout(repo).map_err(|e| {
+            // A `workdir_not_a_checkout` refusal is passed through verbatim so
+            // its stable token LEADS the line a caller reports; every other
+            // failure keeps its historical context prefix.
+            if e.starts_with(super::canonical_paths::WORKDIR_NOT_A_CHECKOUT) {
+                AllocateError::Other(e)
+            } else {
                 AllocateError::Other(format!("canonical path for repo {repo:?}: {e}"))
-            })?
-        };
+            }
+        })?;
         canonical_paths.insert(repo.clone(), path);
     }
 

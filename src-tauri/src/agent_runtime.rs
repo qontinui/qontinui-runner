@@ -7323,7 +7323,16 @@ async fn run_agent_subprocess(
     let agent_id = payload.agent_id;
     for wt in &mut payload.worktrees {
         // Reuse the canonical-checkout resolver (do NOT re-derive `root/name`).
-        match crate::agent_worktree::canonical_paths::default_canonical_path(&wt.repo) {
+        // `worktree_source_checkout` is the same door `materialize_worktrees`
+        // cuts from, so one row's target root and its source tree come from
+        // the same rule. They are two independent LIVE resolutions, though —
+        // the settings map is re-read and the filesystem re-probed each time —
+        // so a Paths edit or a clone finishing between them can still make
+        // them disagree about where the checkout is. Sharing the rule makes
+        // them consistent, not verified: only the foreign-owner arm verifies,
+        // and a `qontinui/*` or bare slug still takes the layout rule
+        // unprobed, which is what #1563 deliberately left byte-for-byte alone.
+        match crate::agent_worktree::canonical_paths::worktree_source_checkout(&wt.repo) {
             Ok(canonical) => {
                 let repo_name = local_repo_name(&wt.repo);
                 wt.worktree_path =
@@ -7335,11 +7344,20 @@ async fn run_agent_subprocess(
             }
             Err(e) => {
                 // Skip rewriting this worktree (keep coord's emitted path) and
-                // log — better degraded than a panic. materialize_worktrees
-                // will surface a clear error if the path is unusable.
+                // log — better degraded than a panic. `materialize_worktrees`
+                // resolves the same repo through the same door and NORMALLY
+                // aborts the spawn there, so the coord-emitted path (a path on
+                // COORD's host, per the comment above) usually goes no further.
+                // Not a guarantee, and the gaps are worth naming: the two are
+                // separate live resolutions, so the second can succeed where
+                // this one failed; and even then, a coord-emitted path that
+                // happens to EXIST on this host is `continue`d as
+                // already-materialized. Either way the path reaches
+                // `primary_wt` and the PTY cwd.
                 warn!(
                     "agent_runtime: cannot resolve canonical path for repo {:?}: {e}; \
-                     leaving coord-emitted worktree_path unchanged",
+                     leaving coord-emitted worktree_path unchanged — the spawn \
+                     normally fails when materialize_worktrees resolves the same repo",
                     wt.repo
                 );
             }
@@ -7789,11 +7807,12 @@ async fn run_agent_subprocess(
     Ok(())
 }
 
-/// `git worktree add` each allocated worktree from its repo's primary
-/// tree under `QONTINUI_ROOT`.
+/// `git worktree add` each allocated worktree from the primary checkout
+/// [`crate::agent_worktree::canonical_paths::worktree_source_checkout`] resolves
+/// for its repo — under `QONTINUI_ROOT` for a `qontinui/*` or bare slug, and
+/// wherever the operator keeps it for anyone else's. That resolver raises the
+/// unresolved-workspace-root error itself, so this no longer pre-checks it.
 async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
-    let root = qontinui_root_dir()
-        .ok_or_else(|| anyhow::anyhow!("no qontinui-root directory configured"))?;
     // D3/D6 — the first act on a coord-delivered row is the `git worktree add`
     // below, so say here, once per row and before it, when coord did not
     // vouch for the sha. The sha is then used exactly as served (D6: no
@@ -7802,8 +7821,35 @@ async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
         wt.parent_sha_provenance
             .warn_if_not_fresh(&wt.repo, &wt.parent_sha);
     }
+    // Resolve EVERY row's source checkout before materializing ANY of them.
+    // This function has no unwind — the caller reports `spawn_failed` and
+    // returns — so a failure on row 2 strands row 1's worktree AND the branch
+    // `git worktree add -b` created in the operator's primary checkout. Coord
+    // DID allocate (the payload carries its agent id and per-row branch and
+    // parent sha); what no row names is the LOCAL directory, because the
+    // rewrite loop above replaced coord's `worktree_path` with this host's. The allocate path
+    // resolves up front for the same reason; its call site says
+    // "Resolve every row's checkout and target BEFORE any claim or disk write."
+    // (`agent_worktree/mod.rs`, above `plan_worktree_rows`).
+    //
+    // This closes the RESOLUTION arm only, which is the arm this change would
+    // otherwise have widened: the strict resolver refuses a foreign repo it
+    // cannot verify, a far more reachable per-row failure than the
+    // `!exists()` check that used to be the only one. The `git worktree add`
+    // below can still fail on row 2 and leave row 1 behind — pre-existing, and
+    // not made worse here, but not fixed either.
+    let mut planned = Vec::with_capacity(payload.worktrees.len());
     for wt in &payload.worktrees {
-        let repo_root = root.join(local_repo_name(&wt.repo));
+        // The tree this row's branch is cut from. Resolved through the shared
+        // door rather than `root.join(local_repo_name(..))`: that hand-rolled
+        // flat rule consulted neither `paths.repo_checkouts` nor the owner-root
+        // convention, so on a box whose workspace root holds a same-named
+        // checkout of ANOTHER owner's repo it cut the agent's branch off the
+        // wrong repository and reported the right one. Post-merge follow-up to
+        // qontinui-runner#1563, which closed that hazard on the allocate path
+        // and not here.
+        let repo_root = crate::agent_worktree::canonical_paths::worktree_source_checkout(&wt.repo)
+            .map_err(|e| anyhow::anyhow!("primary repo {} not resolved: {e}", wt.repo))?;
         if !repo_root.exists() {
             return Err(anyhow::anyhow!(
                 "primary repo {} not found at {}",
@@ -7811,6 +7857,15 @@ async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
                 repo_root.display()
             ));
         }
+        planned.push((wt, repo_root));
+    }
+    // Iterate the PAIRS, not two collections zipped: a `zip` silently stops at
+    // the shorter side, so a future `continue` added to the pass above would
+    // drop the tail rows with no error and no log — and if row 0 were the one
+    // dropped, the `primary_wt` its caller binds from `worktrees[0]` would be
+    // a path nothing ever created, which is the spawned-into-nothing shape
+    // this plan exists to close.
+    for (wt, repo_root) in planned {
         let wt_path = Path::new(&wt.worktree_path);
         if wt_path.exists() {
             info!(

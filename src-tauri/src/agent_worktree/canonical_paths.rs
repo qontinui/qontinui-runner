@@ -272,6 +272,37 @@ impl std::fmt::Display for CheckoutUnresolved {
         if let Some(d) = &self.detail {
             write!(f, " ({d})")?;
         }
+        // Name the escape hatch, and name it BEFORE the candidate list. Every
+        // rejection below is recoverable by the operator — a fork-origin clone,
+        // a remote not called `origin`, a checkout somewhere this device's
+        // conventions do not reach — and a reader told only which paths failed
+        // has no way to learn that a settings key exists which ends the
+        // argument. Ordered first because this whole string is posted as a
+        // gate's `spawn_failed` detail and coord keeps the first line,
+        // TRUNCATED: the reader furthest from the box is the one who cannot
+        // just open Settings, and the fixed-length remedy must outlive the
+        // variable-length path list rather than be cut by it.
+        //
+        // Only for a foreign owner: `checkout_candidates_in` builds a
+        // `SettingsMap` candidate under `has_foreign_owner` alone, so for any
+        // other slug this advice would be false.
+        // Suppressed once a `paths.repo_checkouts` entry is among the
+        // candidates: that operator has already found the key, and the line
+        // they need is the one saying why THEIR entry was rejected. Spending
+        // ~110 characters of a truncated line re-advertising it would push
+        // that reason off the end.
+        let already_mapped = self
+            .tried
+            .iter()
+            .any(|(_, why)| why.starts_with(CandidateSource::SettingsMap.label()));
+        if !self.tried.is_empty() && has_foreign_owner(&self.repo) && !already_mapped {
+            write!(
+                f,
+                "; map it in Settings -> Paths -> repo_checkouts \
+                 (`{}` = <absolute path>) to override every probe below",
+                self.repo
+            )?;
+        }
         if !self.tried.is_empty() {
             let tried: Vec<String> = self
                 .tried
@@ -309,18 +340,50 @@ pub fn origin_names_repo(url: &str, repo: &str) -> bool {
 /// [`default_canonical_path`] this never falls back to a path that is not
 /// there: a cwd is a claim that the repo is in it.
 pub fn resolve_checkout(repo: &str) -> Result<PathBuf, CheckoutUnresolved> {
-    let unresolved = |detail: String| CheckoutUnresolved {
-        repo: repo.to_string(),
-        tried: Vec::new(),
-        detail: Some(detail),
-    };
-    let root = crate::workspace_paths::runner_workspace_root()
-        .require()
-        .map_err(unresolved)?;
     let map = if has_foreign_owner(repo) {
         repo_checkouts_setting()
     } else {
         BTreeMap::new()
+    };
+    // The operator's own mapping is an ABSOLUTE path and needs no workspace
+    // root, so it is honoured before the root is required. Read the other way
+    // round, a box with no resolvable `$QONTINUI_ROOT` refused every foreign
+    // repo without ever consulting the most specific configuration on the
+    // machine.
+    //
+    // A near-miss is RECORDED rather than dropped, for the same reason the
+    // loop below records one: if the root then fails to resolve, this is the
+    // only line that can tell the operator their entry was read — otherwise a
+    // mistyped path and no entry at all produce the identical refusal.
+    let mut pre_tried: Vec<(PathBuf, String)> = Vec::new();
+    if let Some(mapped) = map_entry_for(&map, repo).map(PathBuf::from) {
+        match (mapped.has_root(), is_git_checkout(&mapped)) {
+            (true, true) => return Ok(mapped),
+            (true, false) => pre_tried.push((
+                mapped,
+                format!(
+                    "{}: not a git checkout",
+                    CandidateSource::SettingsMap.label()
+                ),
+            )),
+            (false, _) => pre_tried.push((
+                mapped,
+                format!(
+                    "{}: not an absolute path, so it was not probed",
+                    CandidateSource::SettingsMap.label()
+                ),
+            )),
+        }
+    }
+    let root = match crate::workspace_paths::runner_workspace_root().require() {
+        Ok(root) => root,
+        Err(detail) => {
+            return Err(CheckoutUnresolved {
+                repo: repo.to_string(),
+                tried: pre_tried,
+                detail: Some(detail),
+            })
+        }
     };
     resolve_checkout_in(
         &root,
@@ -345,7 +408,28 @@ fn resolve_checkout_in(
         tried: Vec::new(),
         detail: Some(e),
     })?;
-    let mut tried = Vec::with_capacity(candidates.len());
+    let mut tried = Vec::with_capacity(candidates.len() + 1);
+    // A relative map entry is not a candidate — it would resolve against the
+    // runner's own cwd, which names nothing the operator chose — but it must
+    // still be REPORTED. Silently dropped, it made the setting look broken:
+    // the operator set exactly the key the refusal tells them to set and got a
+    // byte-identical refusal back, with no line saying the entry was read and
+    // rejected for being relative.
+    // Gated exactly as `checkout_candidates_in` gates the map: for any other
+    // slug the map is never consulted, so reporting an entry here would imply
+    // an absolute one would have been used, which is false.
+    if let Some(v) = map_entry_for(map, repo).filter(|_| has_foreign_owner(repo)) {
+        let rejected = PathBuf::from(v);
+        if !rejected.has_root() {
+            tried.push((
+                rejected,
+                format!(
+                    "{}: not an absolute path, so it was not probed",
+                    CandidateSource::SettingsMap.label()
+                ),
+            ));
+        }
+    }
     for (path, source) in candidates {
         if !is_checkout(&path) {
             tried.push((path, format!("{}: not a git checkout", source.label())));
@@ -386,6 +470,51 @@ fn repo_checkouts_setting() -> BTreeMap<String, String> {
         return BTreeMap::new();
     }
     crate::config_facade::get_setting::<crate::settings::PathSettings>().repo_checkouts
+}
+
+/// The primary checkout a worktree for `repo` is **cut from** — the one door
+/// every worktree-SOURCE site goes through (`materialize_repos`,
+/// `materialize_worktrees`, the worktree-target rewrite beside it, and
+/// `declared_sibling_checkout`, which wraps this in an `Option` because a
+/// missing build sibling must degrade rather than fail).
+///
+/// Not every reader of [`default_canonical_path`]: the census, reclaim,
+/// on-demand and claim-key callers still take its unverified layout answer,
+/// which is right for them — they need *a* stable path or key, not a tree they
+/// are about to cut a branch from.
+///
+/// - a slug whose owner is not `qontinui` → [`resolve_checkout`], STRICTLY
+///   verified. A worktree is a claim that the branch it creates belongs to
+///   `repo`; cutting it from a same-named checkout of another owner's repo
+///   would have an agent edit and push a different repository.
+/// - a `qontinui/*` or bare slug → [`default_canonical_path`], the layout rule,
+///   unverified exactly as before. A box holding a subset of the repos, or a
+///   fork-origin clone of one of OUR repos, keeps working as it did.
+///
+/// The strictness is deliberately asymmetric, and it costs something: a
+/// FOREIGN repo whose checkout cannot be verified — a fork-origin clone, a
+/// remote not named `origin`, a `.git/config` that reaches its remotes through
+/// an `[include]` — is now REFUSED where the layout rule used to answer. That
+/// is the trade this rule exists to make: the layout rule's answer in exactly
+/// those cases may be another owner's repo, and a refusal an operator can fix
+/// with one `paths.repo_checkouts` entry (which [`CheckoutUnresolved`] names)
+/// is worth more than a silent wrong worktree.
+///
+/// Post-merge follow-up to qontinui-runner#1563. Phase 1 of plan
+/// `2026-09-12-continuation-for-a-repo-outside-the-workspace-root-spawns-into-an-empty-directory`
+/// spelled this rule out INLINE at the allocate path, and the other sites that
+/// turn a coord row into a checkout kept what they had: `materialize_worktrees`
+/// re-derived the flat rule by hand (`<root>/<basename>`), consulting neither
+/// `paths.repo_checkouts` nor the owner-root convention, so it and the target
+/// path resolved beside it could name two different repositories for one row.
+/// A rule written out at each call site only holds where somebody remembered
+/// it; this function is the door, so the next site inherits it instead.
+pub fn worktree_source_checkout(repo: &str) -> Result<PathBuf, String> {
+    if has_foreign_owner(repo) {
+        resolve_checkout(repo).map_err(|e| e.to_string())
+    } else {
+        default_canonical_path(repo)
+    }
 }
 
 /// `true` when `path` is `root` or lies beneath it — separator- and
@@ -1118,6 +1247,142 @@ mod checkout_resolution_tests {
             .map(|(p, u)| (PathBuf::from(p), u.to_string()))
             .collect();
         move |p: &Path| m.iter().find(|(k, _)| k == p).map(|(_, u)| u.clone())
+    }
+
+    /// Post-merge follow-up to qontinui-runner#1563. The door every
+    /// `git worktree add` source goes through dispatches on ownership: the
+    /// layout rule for our own repos, strict verification for anyone else's.
+    /// A relative `paths.repo_checkouts` entry is not probed — it would
+    /// resolve against the runner's own cwd — but it MUST be reported, or the
+    /// operator who followed the refusal's own advice gets a byte-identical
+    /// refusal back with nothing saying their entry was read and rejected.
+    #[test]
+    fn a_relative_settings_entry_is_reported_rather_than_dropped() {
+        let err = resolve_checkout_in(
+            &root(),
+            "acme/app",
+            &map(&[("acme/app", "../acme/app")]),
+            checkouts(&[]),
+            origins(&[]),
+        )
+        .expect_err("nothing is checked out, so this must not resolve");
+
+        let shown = err.to_string();
+        assert!(
+            shown.contains("../acme/app"),
+            "the rejected entry must appear in the refusal: {shown}"
+        );
+        assert!(
+            shown.contains("not an absolute path"),
+            "the refusal must say WHY it was rejected: {shown}"
+        );
+
+        // The map is demonstrably READ, not ignored — an absolute entry backed
+        // by a checkout resolves. (This changes two variables at once, so it
+        // does not by itself isolate relativeness; what does that is the
+        // `contains("../acme/app")` assertion above, which only holds because
+        // the relative entry was read and reported.)
+        assert_eq!(
+            resolve_checkout_in(
+                &root(),
+                "acme/app",
+                &map(&[("acme/app", "/srv/acme/app")]),
+                checkouts(&["/srv/acme/app"]),
+                origins(&[]),
+            )
+            .unwrap(),
+            PathBuf::from("/srv/acme/app"),
+            "an absolute map entry is the operator's assertion and needs no origin"
+        );
+
+        // The `has_root()` guard itself: a relative entry that IS a checkout
+        // must still be refused, or "reported rather than dropped" would have
+        // quietly become "probed".
+        resolve_checkout_in(
+            &root(),
+            "acme/app",
+            &map(&[("acme/app", "../acme/app")]),
+            checkouts(&["../acme/app"]),
+            origins(&[]),
+        )
+        .expect_err("a relative entry is never probed, even when it is a checkout");
+    }
+
+    #[test]
+    fn the_worktree_source_door_dispatches_on_ownership() {
+        let amb = crate::test_env::isolated_ambient();
+
+        // `qontinui/*` and bare slugs: the layout rule, unprobed. Asserted
+        // against the FIXTURE's own root rather than against
+        // `default_canonical_path` — an assertion whose expected value is the
+        // implementation of the arm under test cannot see that arm being wrong.
+        for slug in ["qontinui/qontinui-runner", "qontinui-runner"] {
+            assert_eq!(
+                worktree_source_checkout(slug).unwrap(),
+                amb.root().join("qontinui-runner"),
+                "{slug} must keep the unverified layout rule"
+            );
+        }
+
+        // A foreign owner with nothing checked out anywhere is REFUSED, and the
+        // refusal leads with the stable token a caller reports and a reader
+        // greps for — never a path that is merely same-named.
+        let err = worktree_source_checkout("no-such-owner-xyz/no-such-repo-xyz")
+            .expect_err("a foreign repo with no verified checkout must not resolve");
+        assert!(err.starts_with(WORKDIR_NOT_A_CHECKOUT), "{err}");
+        assert!(
+            // A distinctive fragment of the remedy clause — `repo_checkouts`
+            // alone would also match `CandidateSource::SettingsMap`'s label.
+            err.contains("to override every probe below"),
+            "the refusal must name the remedy: {err}"
+        );
+
+        // The arm both agent_runtime call sites turn on: a foreign repo laid
+        // out per owner beside the workspace root, whose `origin` names it, IS
+        // resolved — and to that checkout, not to the layout rule.
+        let owner_root = amb.root().parent().unwrap().join("acme").join("app");
+        std::fs::create_dir_all(owner_root.join(".git")).unwrap();
+        std::fs::write(
+            owner_root.join(".git").join("config"),
+            "[remote \"origin\"]\n\turl = https://github.com/acme/app.git\n",
+        )
+        .unwrap();
+        assert_eq!(worktree_source_checkout("acme/app").unwrap(), owner_root);
+
+        // Same directory, someone else's repo: refused rather than accepted for
+        // sharing a name. This is the whole point of the door.
+        std::fs::write(
+            owner_root.join(".git").join("config"),
+            "[remote \"origin\"]\n\turl = https://github.com/other/app.git\n",
+        )
+        .unwrap();
+        let err = worktree_source_checkout("acme/app")
+            .expect_err("a checkout whose origin names another owner is not this repo");
+        assert!(err.starts_with(WORKDIR_NOT_A_CHECKOUT), "{err}");
+    }
+
+    /// The discriminator `isolated_edit::materialize_repos` branches on: a
+    /// NON-checkout failure must NOT be mistaken for `workdir_not_a_checkout`,
+    /// or it would lose its context prefix and be reported as a missing
+    /// checkout. An empty or whitespace-only slug is ONE of the inputs that
+    /// reaches that `else` arm; any non-foreign slug on a box with no
+    /// resolvable workspace root reaches it too. They share a shape: the
+    /// failure happened before any checkout was looked for.
+    ///
+    /// Note a FOREIGN malformed slug does NOT — `acme/app/` has an owner, so
+    /// it goes to `resolve_checkout`, whose every refusal leads with the token
+    /// by construction. The discriminator is ownership, not malformedness, and
+    /// that is the right answer either way: both arms describe themselves
+    /// honestly.
+    #[test]
+    fn a_malformed_slug_does_not_masquerade_as_an_unresolved_checkout() {
+        let _amb = crate::test_env::isolated_ambient();
+        let err = worktree_source_checkout("")
+            .expect_err("an empty slug names no repo and must not resolve");
+        assert!(
+            !err.starts_with(WORKDIR_NOT_A_CHECKOUT),
+            "a malformed slug is not a missing checkout: {err}"
+        );
     }
 
     #[test]

@@ -1952,10 +1952,50 @@ struct PlannedWorktreeRow {
 
 /// The checkout a `declared_sibling` row is cut from when the caller did not
 /// request that repo: its canonical checkout, only if one is actually there.
+///
+/// Goes through [`canonical_paths::worktree_source_checkout`], the same door
+/// the three other worktree-source sites use, so the ownership rule has ONE
+/// spelling. A sibling whose owner is not `qontinui` is therefore resolved
+/// strictly: `default_canonical_path`'s layout-rule fallback names
+/// `<workspace-root>/<name>`, which on a box holding a same-named checkout of a
+/// DIFFERENT owner's repo is that other repo, and `.git` being present says
+/// only that the directory is *a* checkout, never that it is a checkout OF
+/// `repo`. Cutting a build sibling from it would hand the session a worktree of
+/// the wrong repository, silently — the failure
+/// `2026-09-12-continuation-for-a-repo-outside-the-workspace-root-spawns-into-an-empty-directory`
+/// Phase 1 closed on the requested side and left open here.
+///
+/// The `.git` filter still applies on top, because this resolver must answer
+/// `Option`: the layout-rule arm can name a directory that is not there, and
+/// unlike the other three sites a missing sibling must DEGRADE rather than
+/// fail. [`plan_worktree_rows`] skips it with a warning; a missing build
+/// dependency degrades the session, a wrong one corrupts it. (On the foreign
+/// arm the filter is redundant — `resolve_checkout` already proved `.git` —
+/// and it is written once rather than branched on.)
 fn declared_sibling_checkout(repo: &str) -> Option<PathBuf> {
-    canonical_paths::default_canonical_path(repo)
-        .ok()
-        .filter(|p| p.join(".git").exists())
+    match canonical_paths::worktree_source_checkout(repo) {
+        Ok(path) if path.join(".git").exists() => Some(path),
+        Ok(path) => {
+            debug!(
+                "allocate: declared build sibling '{repo}' resolves to {}, which is not a \
+                 checkout — skipping it (next line)",
+                path.display()
+            );
+            None
+        }
+        Err(e) => {
+            // Paired with the "skipping declared build sibling" line
+            // `plan_worktree_rows` logs next: that one says only that the
+            // sibling was skipped, which reads as ABSENT. This is the line
+            // that says it may well be present and simply could not be
+            // proven to be this repo.
+            warn!(
+                "allocate: declared build sibling '{repo}' is not cut from any checkout \
+                 this device can verify as '{repo}' — skipping it (next line); {e}"
+            );
+            None
+        }
+    }
 }
 
 /// Resolve every row of a `worktree` allocation to `(canonical, target)`.
@@ -3172,6 +3212,84 @@ mod tests {
             PathBuf::from("/ws/qontinui-root/qontinui-schemas"),
             "still cut from its own checkout"
         );
+    }
+
+    /// Write a checkout fixture: a `.git/config` naming `origin`, which is all
+    /// `origin_url` reads (it parses the file, it never runs `git`).
+    fn fixture_checkout(dir: &Path, origin: Option<&str>) {
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        if let Some(url) = origin {
+            std::fs::write(
+                dir.join(".git").join("config"),
+                format!("[remote \"origin\"]\n\turl = {url}\n"),
+            )
+            .unwrap();
+        }
+    }
+
+    /// Post-merge follow-up to qontinui-runner#1563. A build sibling owned by
+    /// someone other than `qontinui` is cut ONLY from a checkout verified to be
+    /// that repo.
+    ///
+    /// Drives the REAL `declared_sibling_checkout`, not an injected core: the
+    /// regression this guards against is the two arms being wired the wrong way
+    /// round at the call site, which an injected-resolver test cannot see.
+    #[test]
+    fn a_foreign_sibling_is_cut_only_from_a_verified_checkout() {
+        let amb = crate::test_env::isolated_ambient();
+        let root = amb.root();
+        let owner_root = root.parent().unwrap().join("acme").join("backend");
+
+        // The hazard, built for real: the workspace root holds a `backend`
+        // checkout of SOMEONE ELSE's repo, which is what the layout rule names
+        // and what the old `.git`-exists filter accepted.
+        fixture_checkout(
+            &root.join("backend"),
+            Some("https://github.com/portofino/backend.git"),
+        );
+        fixture_checkout(&owner_root, Some("https://github.com/other/backend.git"));
+        assert_eq!(
+            declared_sibling_checkout("acme/backend"),
+            None,
+            "no checkout on this box is verifiably acme/backend, so the sibling is \
+             skipped — never cut from the same-named checkout under the root"
+        );
+
+        // Same directory, now actually acme/backend: resolved, and to the
+        // owner-root checkout rather than to the layout rule's `<root>/backend`.
+        fixture_checkout(&owner_root, Some("git@github.com:acme/backend.git"));
+        assert_eq!(declared_sibling_checkout("acme/backend"), Some(owner_root));
+    }
+
+    /// The `qontinui/*` and bare-slug arms keep the layout rule untouched — no
+    /// settings read, no origin probe. A box that holds a subset of the repos,
+    /// or a fork-origin clone, must resolve exactly as it did before #1563.
+    ///
+    /// The fixture deliberately writes NO `origin`, so this fails the moment
+    /// the arms are swapped: strict resolution of a remote-less checkout
+    /// returns `None`.
+    ///
+    /// The bare-slug arm is unverified BY CONVENTION, not by proof: coord emits
+    /// `owner/name` on every allocation row, so a bare slug here is one of our
+    /// own repo names from a local caller. Nothing in the code enforces that,
+    /// which is why it is written down.
+    #[test]
+    fn a_qontinui_sibling_still_takes_the_layout_rule_unverified() {
+        let amb = crate::test_env::isolated_ambient();
+        let expected = amb.root().join("qontinui-schemas");
+        fixture_checkout(&expected, None);
+
+        for slug in ["qontinui/qontinui-schemas", "qontinui-schemas"] {
+            assert_eq!(
+                declared_sibling_checkout(slug),
+                Some(expected.clone()),
+                "{slug} must resolve by the layout rule with no origin probe"
+            );
+        }
+
+        // Still `None` — not a panic and not the layout path — when the box
+        // holds no such checkout: a missing build sibling degrades.
+        assert_eq!(declared_sibling_checkout("qontinui/qontinui-absent"), None);
     }
 
     #[test]
