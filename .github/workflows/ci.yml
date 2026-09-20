@@ -851,9 +851,15 @@ jobs:
       # and not one `running N tests` line.
       #
       # OWNERSHIP, scoped per leg, because the obvious one-line summary is
-      # wrong. Not our build script ON UBUNTU — `src-tauri/build.rs` emits no
-      # `rerun-if-changed` into `OUT_DIR`, so that half is
-      # `tauri-build`/`tauri-codegen` (2.5) and is upstream. **The WINDOWS half
+      # wrong. THE UBUNTU DIRTY WE MEASURED is not our build script's —
+      # `src-tauri/build.rs` emits no `rerun-if-changed` into `OUT_DIR`, and the
+      # path cargo named there is an `OUT_DIR` codegen asset, so that observed
+      # failure is `tauri-build`/`tauri-codegen` (2.5) and is upstream. Scoped
+      # to the observation rather than to the leg, because the ours-half
+      # mechanism below exists on ubuntu too: the same
+      # `ensure_sidecar_placeholders()` writes
+      # `qontinui_profile-x86_64-unknown-linux-gnu` under the same gitignore
+      # glob. Ubuntu simply tripped the upstream one first. **The WINDOWS half
       # IS ours.** That sidecar stub is written by our own
       # `ensure_sidecar_placeholders()`. It is touch-if-absent rather than an
       # unconditional rewrite (`if path.exists() { continue; }`), and
@@ -896,8 +902,11 @@ jobs:
       # loses exactly zero EXECUTED tests. Two consequences it does have, stated
       # because "zero" is easy to over-read: coord stops receiving that one
       # `skip` row (`qontinui_runner_lib::…QueryBuilder (line 141)`), and this
-      # step's log now carries 28 `test result:` lines rather than the 29 the
-      # bound paragraph above counts. It will not stay true by itself:
+      # step's log carries exactly ONE FEWER `test result:` line than an unsplit
+      # `cargo test` would produce. Stated as a delta on purpose: the absolute
+      # drifts with the target count — attempt 2 of 35043646051 built 28 test
+      # binaries, this branch builds 29 — and an absolute written here went
+      # stale inside a single PR. It will not stay true by itself:
       # recovering doctests needs a second cargo invocation, which is precisely
       # what pays the rebuild above. Tracked as a follow-up.
       - name: Run Rust tests
