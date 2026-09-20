@@ -1385,6 +1385,15 @@ pub struct TenantSlotHealth {
     /// self-heal working.
     pub cleared_on_expiry_total: u64,
     pub cleared_on_rejection_total: u64,
+    /// Tenants coord says this device is bound to that hold NO credential
+    /// here — or why that is UNKNOWN. See [`BindingGapReport`].
+    ///
+    /// Snapshotted from [`binding_gaps`] at publish time rather than computed
+    /// here: the pass walks the slots that EXIST and structurally cannot see a
+    /// tenant with none, so the report is composed by the loop from the same
+    /// blocking-pool read the eviction sweep uses, and lands here so the pass
+    /// and the gap answer are one snapshot instead of two surfaces.
+    pub binding_gaps: BindingGapReport,
 }
 
 static TENANT_SLOT_HEALTH: std::sync::OnceLock<std::sync::Mutex<Option<TenantSlotHealth>>> =
@@ -1430,6 +1439,7 @@ fn publish_tenant_slot_health(rows: Vec<TenantSlotHealthRow>) {
         degraded_slots: degraded,
         cleared_on_expiry_total: CLEARED_ON_EXPIRY_TOTAL.load(Ordering::Relaxed),
         cleared_on_rejection_total: CLEARED_ON_REJECTION_TOTAL.load(Ordering::Relaxed),
+        binding_gaps: binding_gaps(),
     };
     *tenant_slot_health_cell()
         .lock()
@@ -2086,6 +2096,138 @@ pub(crate) enum WritableSlotKeys {
     Unknown(&'static str),
 }
 
+// ===========================================================================
+// BINDING GAPS — the one residual of D2 (plan
+// `2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin`,
+// Phase 3). The warm-keeping loop itself shipped with Phase 8a of
+// `2026-07-02-session-scoped-multi-tenant-device-binding`; nothing here
+// rebuilds it.
+// ===========================================================================
+
+/// Tenants coord says this device is bound to for which this box holds NO
+/// credential at all — or why that question could not be answered.
+///
+/// # Why this is a tri-state and not a `Vec`
+///
+/// The warm-keeping pass walks the slots that EXIST
+/// ([`crate::auth::AuthManager::list_tenant_device_jwt_tenants`]). A tenant
+/// bound with no slot never enters it: there is nothing to refresh, nothing
+/// to clear and nothing to re-derive, so nothing ever asks for it. Making
+/// that visible is this phase's entire job — and the trap is that every
+/// input to the answer fails OPEN.
+///
+/// The bound set comes from the heartbeat sidecar `coord_bound_tenants.json`
+/// ([`qontinui_runner_lib::pair::coord_bound_tenants`]), NOT from
+/// `paired_user.json` `bindings`: that file deliberately holds only tenants
+/// this runner already has a credential for and never fabricates an entry,
+/// so `bindings ⊆ slots ∪ default` by construction and the difference is
+/// always empty. Measured 2026-09-20 on the dev box: the sidecar is ABSENT
+/// there, so a reader that took absence for zero would have printed
+/// *"no gaps"* on a box with a known gap.
+///
+/// `Gaps(vec![])` is a MEASURED zero. `Unknown` is silence. The two must
+/// never render the same way.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingGapReport {
+    /// MEASURED. Every bound tenant was compared against every credential
+    /// this box holds; these are the ones with none. Sorted, distinct.
+    Gaps(Vec<String>),
+    /// NOTHING was established — an absent or stale sidecar, an unreadable
+    /// slot store, or an unreadable `paired_user.json`. Never "no gaps".
+    Unknown(String),
+}
+
+/// Pure: which bound tenants have no credential on this box, or why that is
+/// UNKNOWN.
+///
+/// Every UNKNOWN arm aborts rather than contributing nothing, for the same
+/// reason [`resolve_writable_slot_keys`] does: each input collapses its
+/// failure into an absence, and an absence on the COVERED side manufactures a
+/// gap while an absence on the BOUND side erases one. Only a fully measured
+/// pair is a report.
+///
+/// The covered set is slots ∪ the default binding — the default tenant is
+/// served by the legacy `access_token` slot, so it is not a gap even with no
+/// `device_jwt:<t>` entry (see [`crate::auth::select_device_bearer`]).
+///
+/// **No mint.** This function reports; it does not act. Seeding a gap is
+/// Phase 4 and a separate PR.
+pub(crate) fn resolve_binding_gaps(
+    tenant_slots: Option<&[uuid::Uuid]>,
+    default_binding: crate::auth::BindingTenantRead,
+    bound: &qontinui_runner_lib::pair::CoordBoundTenantsRead,
+) -> BindingGapReport {
+    let bound = match bound {
+        qontinui_runner_lib::pair::CoordBoundTenantsRead::Unknown(why) => {
+            return BindingGapReport::Unknown((*why).to_string())
+        }
+        qontinui_runner_lib::pair::CoordBoundTenantsRead::Known(ids) => ids,
+    };
+    let Some(slots) = tenant_slots else {
+        return BindingGapReport::Unknown(
+            "the tenant device-JWT slot store could not be enumerated (an undecryptable \
+             store reads as EMPTY) — the covered set is UNKNOWN, so a gap cannot be \
+             distinguished from a slot this pass simply failed to see"
+                .to_string(),
+        );
+    };
+    let mut covered: std::collections::HashSet<uuid::Uuid> = slots.iter().copied().collect();
+    match default_binding {
+        // The legacy `access_token` slot serves the default binding, so a
+        // default tenant with no per-tenant slot is not a gap.
+        crate::auth::BindingTenantRead::Bound(t) => {
+            covered.insert(t);
+        }
+        // MEASURED: no default binding. Contributes nothing, and that is a
+        // fact rather than a gap.
+        crate::auth::BindingTenantRead::Unbound => {}
+        crate::auth::BindingTenantRead::Unknown => {
+            return BindingGapReport::Unknown(
+                "paired_user.json is unreadable or malformed — this box's DEFAULT binding \
+                 is UNKNOWN, so a bound tenant covered by the legacy slot cannot be told \
+                 apart from one with no credential at all"
+                    .to_string(),
+            );
+        }
+    }
+    BindingGapReport::Gaps(
+        bound
+            .iter()
+            .filter(|t| !covered.contains(t))
+            .map(|t| t.to_string())
+            .collect(),
+    )
+}
+
+static BINDING_GAPS: std::sync::OnceLock<std::sync::Mutex<BindingGapReport>> =
+    std::sync::OnceLock::new();
+
+/// Before any pass has read the sidecar, the answer is UNKNOWN — a process
+/// that has not looked has not found nothing.
+fn binding_gaps_cell() -> &'static std::sync::Mutex<BindingGapReport> {
+    BINDING_GAPS.get_or_init(|| {
+        std::sync::Mutex::new(BindingGapReport::Unknown(
+            "no refresher pass has read coord_bound_tenants.json yet in this process".to_string(),
+        ))
+    })
+}
+
+/// Record this pass's binding-gap report. ONE cell, read by
+/// [`publish_tenant_slot_health`] when it builds a snapshot, so the doctor and
+/// the loop cannot grow separate answers.
+pub(crate) fn publish_binding_gaps(report: BindingGapReport) {
+    *binding_gaps_cell().lock().expect("binding gaps poisoned") = report;
+}
+
+/// The most recent binding-gap report.
+pub(crate) fn binding_gaps() -> BindingGapReport {
+    binding_gaps_cell()
+        .lock()
+        .expect("binding gaps poisoned")
+        .clone()
+}
+
 /// Compose the two reads into a writable-key set, ABORTING on any UNKNOWN.
 ///
 /// # Why every input aborts rather than contributing nothing
@@ -2210,14 +2352,22 @@ struct SweepInputs {
     default_binding: crate::auth::BindingTenantRead,
     /// SPARE-only — see [`resolve_writable_slot_keys`].
     machine_pin: crate::session::tenant_pin::TenantPin,
+    /// Coord's authoritative bound-tenant set, or why it is UNKNOWN. Read in
+    /// THIS hop rather than a new one: it is the third small file in the same
+    /// directory as `paired_user.json`, and the eviction sweep's inputs are
+    /// already gathered here so none of it runs on the async executor. Feeds
+    /// [`resolve_binding_gaps`] only — nothing destructive reads it.
+    coord_bound_tenants: qontinui_runner_lib::pair::CoordBoundTenantsRead,
 }
 
-/// Blocking: reads the slot store, `paired_user.json` and `machine.json`.
+/// Blocking: reads the slot store, `paired_user.json`, `machine.json` and the
+/// heartbeat's `coord_bound_tenants.json` sidecar.
 fn read_sweep_inputs(auth_manager: &crate::auth::AuthManager) -> SweepInputs {
     SweepInputs {
         tenant_slots: auth_manager.try_list_tenant_device_jwt_tenants(),
         default_binding: crate::auth::default_binding_tenant_probe(),
         machine_pin: crate::session::tenant_pin::resolve_tenant_pin(),
+        coord_bound_tenants: qontinui_runner_lib::pair::coord_bound_tenants(),
     }
 }
 
@@ -2306,6 +2456,17 @@ fn writable_slot_keys_from(inputs: &SweepInputs) -> WritableSlotKeys {
         inputs.tenant_slots.as_ref().ok().map(|v| v.as_slice()),
         inputs.default_binding,
         inputs.machine_pin,
+    )
+}
+
+/// Pure: compose the same already-read [`SweepInputs`] into the binding-gap
+/// report. The machine pin is deliberately NOT an input — a pin is what this
+/// box ASKS for, not what coord says it is bound to.
+fn binding_gaps_from(inputs: &SweepInputs) -> BindingGapReport {
+    resolve_binding_gaps(
+        inputs.tenant_slots.as_ref().ok().map(|v| v.as_slice()),
+        inputs.default_binding,
+        &inputs.coord_bound_tenants,
     )
 }
 
@@ -3912,6 +4073,13 @@ async fn refresher_loop(
             .map(|v| !v.is_empty())
             .unwrap_or(false);
         let writable = writable_slot_keys_from(&sweep_inputs);
+        // D2's residual (Phase 3): the pass below walks the slots that EXIST,
+        // so a tenant bound with NO slot is structurally invisible to it.
+        // Composed here, from the SAME blocking-pool read, and published
+        // BEFORE the pass so the health snapshot it publishes carries this
+        // pass's answer. Report only — no mint is attempted for a gap; that
+        // is Phase 4 (`seed_a_bound_tenants_slot`), a separate change.
+        publish_binding_gaps(binding_gaps_from(&sweep_inputs));
         // Retire every upstream-verdict bucket this runner can no longer write
         // (a re-pair or an unpair), BEFORE the posture is derived from what is
         // left. Runs in BOTH branches because a re-pair can happen from either
@@ -5598,6 +5766,26 @@ mod tenant_slot_refresh_tests {
     struct MockState {
         failures: Arc<Mutex<Vec<(String, u16)>>>,
         bearers_seen: Arc<Mutex<Vec<String>>>,
+        /// Every MINT attempt this mock saw. Phase 3 reports gaps and must
+        /// never seed one — see [`mint_attempts`] on [`MockCapture`].
+        mint_attempts: Arc<Mutex<Vec<String>>>,
+    }
+
+    /// The ONE door in this module that mints a device JWT:
+    /// `try_device_machine_key_exchange` POSTs
+    /// `{web_base}/api/v1/devices/{id}/machine-credential/exchange` and
+    /// PERSISTS the result into this box's `access_token` slot. Wiring it into
+    /// the shared mock makes "no mint was attempted" an assertion rather than a
+    /// claim, for every test in this module that passes the mock as `web_base`.
+    async fn mint_tripwire(
+        State(s): State<MockState>,
+        Path(device_id): Path<String>,
+    ) -> (StatusCode, String) {
+        s.mint_attempts.lock().unwrap().push(device_id);
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":"the mint door must not be knocked on in phase 3"}"#.to_string(),
+        )
     }
 
     async fn handler(
@@ -5633,6 +5821,9 @@ mod tenant_slot_refresh_tests {
 
     struct MockCapture {
         bearers_seen: Arc<Mutex<Vec<String>>>,
+        /// Non-empty iff something knocked on the mint door. Phase 3 asserts
+        /// this stays empty.
+        mint_attempts: Arc<Mutex<Vec<String>>>,
     }
 
     fn spawn_mock(
@@ -5640,6 +5831,8 @@ mod tenant_slot_refresh_tests {
     ) -> (String, MockCapture, tokio::sync::oneshot::Sender<()>) {
         let bearers_seen = Arc::new(Mutex::new(Vec::new()));
         let bearers_h = bearers_seen.clone();
+        let mint_attempts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let mint_h = mint_attempts.clone();
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = std_listener.local_addr().expect("addr").port();
         std_listener.set_nonblocking(true).expect("nb");
@@ -5653,10 +5846,15 @@ mod tenant_slot_refresh_tests {
                 let state = MockState {
                     failures: Arc::new(Mutex::new(failures)),
                     bearers_seen: bearers_h,
+                    mint_attempts: mint_h,
                 };
                 // axum 0.8 path-param syntax: `{device_id}`.
                 let app: Router = Router::new()
                     .route("/devices/{device_id}/refresh-token", post(handler))
+                    .route(
+                        "/api/v1/devices/{device_id}/machine-credential/exchange",
+                        post(mint_tripwire),
+                    )
                     .with_state(state);
                 let listener =
                     tokio::net::TcpListener::from_std(std_listener).expect("tokio listener");
@@ -5670,7 +5868,10 @@ mod tenant_slot_refresh_tests {
         std::thread::sleep(Duration::from_millis(50));
         (
             format!("http://127.0.0.1:{port}"),
-            MockCapture { bearers_seen },
+            MockCapture {
+                bearers_seen,
+                mint_attempts,
+            },
             tx,
         )
     }
@@ -5690,6 +5891,12 @@ mod tenant_slot_refresh_tests {
         // same one, so the two suites serialise against each other and not
         // merely within themselves.
         super::posture_test_lock()
+    }
+
+    /// The sidecar state of a box whose `coord_bound_tenants.json` this test
+    /// is not about — UNKNOWN, which is what an absent one really is.
+    fn unread_sidecar() -> qontinui_runner_lib::pair::CoordBoundTenantsRead {
+        qontinui_runner_lib::pair::CoordBoundTenantsRead::Unknown("test: sidecar not read")
     }
 
     fn tenant(n: u8) -> uuid::Uuid {
@@ -7920,6 +8127,7 @@ mod tenant_slot_refresh_tests {
             tenant_slots: Err(anyhow::anyhow!("undecryptable store")),
             default_binding: crate::auth::BindingTenantRead::Bound(bound),
             machine_pin: TenantPin::Pinned(pinned),
+            coord_bound_tenants: unread_sidecar(),
         };
         let pins = inputs.posture_pin_inputs();
         assert_eq!(
@@ -7964,6 +8172,7 @@ mod tenant_slot_refresh_tests {
             tenant_slots: Ok(vec![]),
             default_binding: crate::auth::BindingTenantRead::Bound(bound),
             machine_pin: TenantPin::Pinned(pinned),
+            coord_bound_tenants: unread_sidecar(),
         };
         assert_eq!(
             derive_and_publish_posture(
@@ -8278,6 +8487,7 @@ mod tenant_slot_refresh_tests {
             tenant_slots: Err(anyhow::anyhow!("undecryptable store")),
             default_binding: crate::auth::BindingTenantRead::Bound(a),
             machine_pin: crate::session::tenant_pin::TenantPin::Pinned(a),
+            coord_bound_tenants: unread_sidecar(),
         };
         assert!(matches!(
             writable_slot_keys_from(&unreadable),
@@ -8287,6 +8497,7 @@ mod tenant_slot_refresh_tests {
             tenant_slots: Ok(vec![a]),
             default_binding: crate::auth::BindingTenantRead::Unbound,
             machine_pin: crate::session::tenant_pin::TenantPin::Unresolvable,
+            coord_bound_tenants: unread_sidecar(),
         };
         assert_eq!(
             writable_slot_keys_from(&readable),
@@ -8814,6 +9025,346 @@ mod tenant_slot_refresh_tests {
             retirements, writes,
             "every legacy-slot write must retire the old credential's streaks"
         );
+    }
+
+    // =======================================================================
+    // Phase 3 — binding-gap visibility (D2's residual). Plan
+    // `2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin`.
+    //
+    // The warm-keeping loop itself shipped with Phase 8a of
+    // `2026-07-02-session-scoped-multi-tenant-device-binding`. The first test
+    // below is therefore a REGRESSION test over behaviour that already exists,
+    // not a test of anything this phase added.
+    // =======================================================================
+
+    use qontinui_runner_lib::pair::CoordBoundTenantsRead;
+
+    /// A sidecar file seeded at `path`, stamped `observed_at`. Written as raw
+    /// JSON on purpose: the heartbeat's writer is lib-private, and pinning the
+    /// ON-DISK shape here is what proves the reader parses what the heartbeat
+    /// actually lays down (`pair.rs` `CoordBoundTenantsFile`).
+    fn seed_sidecar(path: &std::path::Path, ids: &[uuid::Uuid], observed_at: i64) {
+        let ids = ids
+            .iter()
+            .map(|t| format!("\"{t}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        std::fs::write(
+            path,
+            format!(r#"{{"tenant_ids":[{ids}],"observed_at":{observed_at}}}"#),
+        )
+        .expect("seed sidecar");
+    }
+
+    /// [`test_auth_manager`] with a device machine key already stored, so the
+    /// mint door is genuinely AVAILABLE — "no mint" is then a choice this
+    /// phase makes, not an accident of an unconfigured box
+    /// (`try_device_machine_key_exchange` returns early with no `dmk_`).
+    fn test_auth_manager_with_dmk(name: &str, dmk: &str) -> crate::auth::AuthManager {
+        let dir = std::env::temp_dir().join("qontinui_test_tenant_slots");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("{name}.enc"));
+        let _ = std::fs::remove_file(&path);
+        let seed =
+            crate::secure_storage::SecureStorage::with_path(path.clone()).expect("seed storage");
+        seed.store_device_machine_key(dmk).expect("seed dmk");
+        let storage = crate::secure_storage::SecureStorage::with_path(path).expect("storage");
+        crate::auth::AuthManager::with_storage(storage)
+    }
+
+    fn sidecar_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join("qontinui_test_binding_gaps")
+            .join(format!("{name}_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    /// GATE 1 — with two slots seeded and the clock pinned, the pass behaves
+    /// EXACTLY as it does today: the fresh slot is skipped, the stale one is
+    /// refreshed against `POST /devices/:id/refresh-token` presenting ITS OWN
+    /// token, each slot ends holding the right value, and the health rows say
+    /// so. Nothing in Phase 3 may move any of this.
+    #[tokio::test]
+    async fn two_slots_refresh_exactly_as_they_do_today() {
+        let _serialised = health_lock();
+        let mgr = test_auth_manager("p3_two_slots_unchanged");
+        let (fresh_t, stale_t) = (tenant(0), tenant(1));
+        // The pass reads `Utc::now()` itself, so "pinned" here means both
+        // tokens are minted from ONE `now` and the assertions are stated in
+        // terms of `plan_tenant_slot`'s thresholds rather than wall time.
+        let now = chrono::Utc::now().timestamp();
+        let fresh = synth_jwt(now + 3 * 60 * 60, "fresh-slot");
+        assert_eq!(
+            plan_tenant_slot(Some(now + 3 * 60 * 60), now),
+            TenantSlotPlan::SkipFresh,
+            "precondition: the clock makes this slot comfortably fresh"
+        );
+        let stale = synth_jwt(now + 30 * 60, "stale-slot");
+        assert_eq!(
+            plan_tenant_slot(Some(now + 30 * 60), now),
+            TenantSlotPlan::Refresh,
+            "precondition: the clock puts this slot inside the refresh window"
+        );
+        mgr.store_tenant_device_jwt(&fresh_t, &fresh)
+            .expect("fresh");
+        mgr.store_tenant_device_jwt(&stale_t, &stale)
+            .expect("stale");
+
+        let (base, cap, _shutdown) = spawn_mock(vec![]);
+        let outcomes =
+            refresh_tenant_slots(&mgr, &base, &base, DID, None, PosturePinInputs::UNPINNED).await;
+
+        assert_eq!(
+            outcomes,
+            vec![
+                (fresh_t, TenantSlotOutcome::SkippedFresh),
+                (stale_t, TenantSlotOutcome::Refreshed),
+            ],
+            "the shipped per-slot decision is unchanged"
+        );
+        assert_eq!(
+            cap.bearers_seen.lock().unwrap().clone(),
+            vec![stale.clone()],
+            "only the stale slot hits coord, and it presents ITS OWN token"
+        );
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&fresh_t).unwrap().as_deref(),
+            Some(fresh.as_str()),
+            "a fresh slot is left exactly as it was"
+        );
+        let expected_refreshed = format!("{stale}.refreshed");
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&stale_t).unwrap().as_deref(),
+            Some(expected_refreshed.as_str()),
+            "the refreshed slot holds what coord returned for ITS token"
+        );
+        let health = tenant_slot_health().expect("a pass publishes health");
+        assert_eq!(
+            health
+                .slots
+                .iter()
+                .map(|s| (s.tenant_id.as_str(), s.outcome.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (fresh_t.to_string().as_str(), "skipped-fresh"),
+                (stale_t.to_string().as_str(), "refreshed"),
+            ]
+        );
+        assert_eq!(health.degraded_slots, 0);
+        // GATE 5 — no mint in this phase.
+        assert!(
+            cap.mint_attempts.lock().unwrap().is_empty(),
+            "the pass must never knock on the machine-credential mint door"
+        );
+    }
+
+    /// GATE 2 — a tenant coord says this device is bound to, with NO slot and
+    /// not the default binding, is reported as a gap.
+    #[test]
+    fn a_bound_tenant_with_no_slot_is_a_gap() {
+        let (held, default_t, bound_only) = (tenant(0), tenant(1), tenant(2));
+        let report = resolve_binding_gaps(
+            Some(&[held]),
+            crate::auth::BindingTenantRead::Bound(default_t),
+            &CoordBoundTenantsRead::Known(vec![held, default_t, bound_only]),
+        );
+        assert_eq!(
+            report,
+            BindingGapReport::Gaps(vec![bound_only.to_string()]),
+            "the slotless, non-default bound tenant is the gap"
+        );
+        // The default binding is served by the LEGACY `access_token` slot, so
+        // it is not a gap even with no `device_jwt:<t>` entry.
+        assert_eq!(
+            resolve_binding_gaps(
+                Some(&[]),
+                crate::auth::BindingTenantRead::Bound(default_t),
+                &CoordBoundTenantsRead::Known(vec![default_t]),
+            ),
+            BindingGapReport::Gaps(vec![]),
+            "a MEASURED zero — every bound tenant has a credential"
+        );
+    }
+
+    /// GATE 3 — an ABSENT sidecar is UNKNOWN. This is the case measured on the
+    /// dev box on 2026-09-20, where a naive read would have printed "no gaps"
+    /// on a box with a known gap.
+    #[test]
+    fn an_absent_sidecar_reports_unknown_never_no_gaps() {
+        let dir = sidecar_dir("absent");
+        let read = qontinui_runner_lib::pair::coord_bound_tenants_at(
+            &dir.join("coord_bound_tenants.json"),
+            1_800_000_000,
+        );
+        assert!(
+            matches!(read, CoordBoundTenantsRead::Unknown(_)),
+            "an absent sidecar is UNKNOWN: {read:?}"
+        );
+        let report = resolve_binding_gaps(
+            Some(&[tenant(0)]),
+            crate::auth::BindingTenantRead::Bound(tenant(0)),
+            &read,
+        );
+        match &report {
+            BindingGapReport::Unknown(why) => assert!(
+                why.contains("ABSENT"),
+                "the report names WHICH silence it was: {why}"
+            ),
+            BindingGapReport::Gaps(g) => {
+                panic!("an absent sidecar must NEVER render as gaps (got {g:?})")
+            }
+        }
+        // And on the wire it is `{"unknown": …}` — not `{"gaps": []}`.
+        let wire = serde_json::to_value(&report).expect("serialize");
+        assert!(wire.get("unknown").is_some(), "wire shape: {wire}");
+        assert!(wire.get("gaps").is_none(), "wire shape: {wire}");
+    }
+
+    /// GATE 4 — a sidecar older than `COORD_BOUND_TENANTS_MAX_AGE_SECS` (24h)
+    /// is UNKNOWN too. A stale set would otherwise count an unpair forever,
+    /// and, worse here, would report "no gaps" from evidence nobody refreshed.
+    #[test]
+    fn a_stale_sidecar_reports_unknown_never_no_gaps() {
+        let dir = sidecar_dir("stale");
+        let path = dir.join("coord_bound_tenants.json");
+        let t0 = 1_800_000_000;
+        let (held, bound_only) = (tenant(0), tenant(2));
+        seed_sidecar(&path, &[held, bound_only], t0);
+
+        // Inside the window the very same file DOES report the gap…
+        let fresh_read = qontinui_runner_lib::pair::coord_bound_tenants_at(&path, t0 + 60);
+        assert_eq!(
+            resolve_binding_gaps(
+                Some(&[held]),
+                crate::auth::BindingTenantRead::Unbound,
+                &fresh_read,
+            ),
+            BindingGapReport::Gaps(vec![bound_only.to_string()])
+        );
+
+        // …and one second past 24h it reports nothing at all.
+        let stale_read = qontinui_runner_lib::pair::coord_bound_tenants_at(
+            &path,
+            t0 + qontinui_runner_lib::pair::COORD_BOUND_TENANTS_MAX_AGE_SECS + 1,
+        );
+        let report = resolve_binding_gaps(
+            Some(&[held]),
+            crate::auth::BindingTenantRead::Unbound,
+            &stale_read,
+        );
+        match &report {
+            BindingGapReport::Unknown(why) => {
+                assert!(why.contains("24h"), "names the window: {why}")
+            }
+            BindingGapReport::Gaps(g) => {
+                panic!("a stale sidecar must NEVER render as gaps (got {g:?})")
+            }
+        }
+        let wire = serde_json::to_value(&report).expect("serialize");
+        assert!(wire.get("unknown").is_some(), "wire shape: {wire}");
+        assert!(wire.get("gaps").is_none(), "wire shape: {wire}");
+    }
+
+    /// The OTHER two UNKNOWN arms, which the covered side owns. Both must
+    /// abort the report rather than manufacture a gap out of a failed read.
+    #[test]
+    fn an_unreadable_covered_side_is_unknown_not_a_gap() {
+        let (held, bound_only) = (tenant(0), tenant(2));
+        let bound = CoordBoundTenantsRead::Known(vec![held, bound_only]);
+        // An undecryptable slot store reads as EMPTY — which would report
+        // EVERY bound tenant as a gap.
+        assert!(matches!(
+            resolve_binding_gaps(None, crate::auth::BindingTenantRead::Unbound, &bound),
+            BindingGapReport::Unknown(_)
+        ));
+        // An unreadable `paired_user.json` hides the default binding — which
+        // would report the DEFAULT tenant as a gap.
+        assert!(matches!(
+            resolve_binding_gaps(
+                Some(&[held]),
+                crate::auth::BindingTenantRead::Unknown,
+                &bound
+            ),
+            BindingGapReport::Unknown(_)
+        ));
+    }
+
+    /// The composition over the real [`SweepInputs`] — the hop the sidecar
+    /// read was added to, rather than a new one.
+    #[test]
+    fn the_sweep_hop_composes_the_gap_report() {
+        let (held, bound_only) = (tenant(0), tenant(2));
+        let inputs = SweepInputs {
+            tenant_slots: Ok(vec![held]),
+            default_binding: crate::auth::BindingTenantRead::Unbound,
+            machine_pin: crate::session::tenant_pin::TenantPin::Pinned(held),
+            coord_bound_tenants: CoordBoundTenantsRead::Known(vec![held, bound_only]),
+        };
+        assert_eq!(
+            binding_gaps_from(&inputs),
+            BindingGapReport::Gaps(vec![bound_only.to_string()]),
+            "the machine pin is not an input — a pin is what this box ASKS for"
+        );
+    }
+
+    /// GATE 6 — the gap report reaches `/coord-mcp/doctor`, BESIDE `slots`,
+    /// and GATE 5 again end-to-end: running the pass with a gap published
+    /// knocks on no mint door.
+    #[tokio::test]
+    async fn the_gap_report_reaches_the_doctor_and_mints_nothing() {
+        let _serialised = health_lock();
+        let mgr = test_auth_manager_with_dmk("p3_doctor_surface", "dmk_phase3_tripwire");
+        let (held, bound_only) = (tenant(0), tenant(2));
+        let now = chrono::Utc::now().timestamp();
+        let fresh = synth_jwt(now + 3 * 60 * 60, "held");
+        mgr.store_tenant_device_jwt(&held, &fresh).expect("slot");
+
+        publish_binding_gaps(BindingGapReport::Gaps(vec![bound_only.to_string()]));
+        let (base, cap, _shutdown) = spawn_mock(vec![]);
+        let _ =
+            refresh_tenant_slots(&mgr, &base, &base, DID, None, PosturePinInputs::UNPINNED).await;
+
+        let report = crate::coord_mcp::doctor::report();
+        let gaps = report
+            .get("slot_health")
+            .and_then(|h| h.get("binding_gaps"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        assert_eq!(
+            gaps,
+            serde_json::json!({ "gaps": [bound_only.to_string()] }),
+            "the doctor carries the gap beside `slots`: {report}"
+        );
+        assert!(
+            report
+                .get("slot_health")
+                .and_then(|h| h.get("slots"))
+                .is_some(),
+            "…beside, not instead of: {report}"
+        );
+
+        // GATE 5, end to end: a published gap must not cause a mint.
+        assert!(
+            cap.mint_attempts.lock().unwrap().is_empty(),
+            "Phase 3 REPORTS a gap; seeding one is Phase 4 and a separate change"
+        );
+
+        // And the UNKNOWN arm survives the same round trip.
+        publish_binding_gaps(BindingGapReport::Unknown("sidecar absent".to_string()));
+        let _ =
+            refresh_tenant_slots(&mgr, &base, &base, DID, None, PosturePinInputs::UNPINNED).await;
+        let report = crate::coord_mcp::doctor::report();
+        assert_eq!(
+            report
+                .get("slot_health")
+                .and_then(|h| h.get("binding_gaps"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            serde_json::json!({ "unknown": "sidecar absent" }),
+            "UNKNOWN must reach the doctor as UNKNOWN, never as an empty gap list"
+        );
+        assert!(cap.mint_attempts.lock().unwrap().is_empty());
     }
 }
 
