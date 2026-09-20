@@ -2232,6 +2232,717 @@ pub(crate) fn binding_gaps() -> BindingGapReport {
         .clone()
 }
 
+// ===========================================================================
+// SEEDING A BOUND TENANT'S SLOT — D3 (plan
+// `2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin`,
+// Phase 4). Consumes Phase 3's [`BindingGapReport`] above.
+//
+// ## No new mint authority is invented here
+//
+// Of the three mint paths this runner has, exactly one needs no human, and it
+// is the one that cannot name a tenant:
+//
+// * `POST {web_base}/api/v1/devices/{id}/machine-credential/exchange`
+//   ([`try_device_machine_key_exchange`]) sends `X-Device-Machine-Key` and an
+//   EMPTY body — coord alone decides the tenant, and it mints the device's
+//   HOME tenant. Needs no human; cannot reach the tenant a gap names. Phase 4
+//   never calls it.
+// * `POST {pair_base}/api/v1/devices/pair-cli` takes an explicit `tenant_id`
+//   HINT (coord is the authority and re-validates server-side) and presents an
+//   OAuth/Cognito bearer.
+// * `qontinui_profile device pair --tenant-id <uuid>` — same bearer, the door
+//   the runner's own refusals already name (`SPAWN_TENANT_PAIRING_HINT`).
+//
+// So this phase adds no route, widens no allow-set, relaxes no refusal and
+// changes no device scope or TTL. It does two things with what already exists:
+//
+// **Arm A** — when a stored Cognito refresh token is still INSIDE its window,
+// take the free win: `pair-cli` with the GAP's tenant id, ONCE per gap per
+// lapse, never a retry loop.
+//
+// **Arm B** — otherwise ask the operator ONCE per tenant per lapse, naming the
+// tenant, the detector that fired, and the `qontinui_profile device pair` door.
+// "Once per lapse" is persisted to disk so a runner restart does not re-ask;
+// the operator's ruling behind this plan is that repeatedly asking a human
+// contradicts autonomous development.
+//
+// ## Two hazards this code exists to avoid
+//
+// 1. **Never the legacy slot.** [`try_refresh_once`] resolves its tenant
+//    through [`resolve_pair_tenant_id`]'s fallback chain and persists into the
+//    legacy `access_token` slot. Reusing it here would mint for the wrong
+//    tenant AND overwrite this box's live DEFAULT credential with another
+//    tenant's. Phase 4 passes the GAP's tenant id explicitly and persists
+//    through [`crate::auth::AuthManager::store_tenant_device_jwt_expecting`],
+//    which writes that tenant's own slot and nothing else.
+// 2. **Never a cross-tenant mint.** `pair-cli` forwards `tenant_id` as a HINT;
+//    coord decides. A returned JWT whose own `tenant_id` claim names a
+//    different tenant is REFUSED, not persisted — the same
+//    `expected_tenant` / [`crate::auth::TenantMismatch`] discipline
+//    `store_tokens_expecting` already applies on the legacy path.
+//
+// ## And never on UNKNOWN
+//
+// [`BindingGapReport`] is a tri-state. Only a MEASURED `Gaps(..)` may drive an
+// attempt or an ask. `Unknown` — an absent or >24 h-stale
+// `coord_bound_tenants.json`, an unreadable slot store, an unreadable
+// `paired_user.json` — means the bound set was never established, not that
+// there are gaps. On `Unknown` this module mints nothing, notifies nobody and
+// does not even touch the lapse record: a silence must not close a lapse any
+// more than it may open one.
+// ===========================================================================
+
+/// The frontend event carrying Arm B's ask. Its own event, not the shared
+/// [`AUTONOMY_CREDENTIAL_DARK_EVENT`]: that one holds ONE signal per
+/// *authority* and is reduced to a single banner, while this is one ask per
+/// *tenant* with a per-tenant action, and folding the two would make a second
+/// tenant's ask silently overwrite the first's.
+///
+/// Payload: `{tenant_id, detector, reason, message, cta, command}` — see
+/// [`binding_gap_ask_payload`].
+pub const AUTONOMY_BINDING_GAP_EVENT: &str = "autonomy-binding-gap";
+
+/// What this box may present to `pair-cli` for a seeding attempt, as a
+/// TRI-state rather than an `Option`.
+///
+/// The third arm is the one that matters. A Cognito refresh that failed
+/// TRANSIENTLY (network, 5xx, 429) leaves a possibly-stale access token in
+/// hand and establishes nothing: spending the lapse's single mint attempt on
+/// it would burn the free win on a blip, and asking the operator because a
+/// packet dropped is exactly the reflex this plan exists to remove. So a
+/// transient failure defers — neither arm runs, and the next pass re-decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SeedBearer<'a> {
+    /// A Cognito session exists and its refresh token is INSIDE its window.
+    /// Arm A is available.
+    InWindow(&'a str),
+    /// MEASURED unavailable: no Cognito session at all, or a refresh token
+    /// that is expired/revoked (`invalid_grant`). Arm B — ask once.
+    OutOfWindow(&'static str),
+    /// NOTHING was established this pass. Neither arm runs.
+    Undetermined(&'static str),
+}
+
+/// Classify [`refresh_cognito_bearer`]'s `(bearer, class)` pair into what
+/// seeding may do with it. Pure, so the three arms are testable without a
+/// Cognito endpoint.
+pub(crate) fn classify_seed_bearer(bearer: Option<&str>, class: RefreshClass) -> SeedBearer<'_> {
+    match class {
+        RefreshClass::NoSession => SeedBearer::OutOfWindow(
+            "no Cognito session on this box (no refresh token stored) — \
+             pair-cli has no bearer to present",
+        ),
+        RefreshClass::Hard => SeedBearer::OutOfWindow(
+            "the stored Cognito refresh token is expired or revoked (invalid_grant) — \
+             the ~30-day ceiling has been hit and no headless mint can reach this tenant",
+        ),
+        RefreshClass::Transient => SeedBearer::Undetermined(
+            "the Cognito refresh failed transiently (network/5xx/429) — whether the \
+             refresh token is still in window is UNKNOWN, so this pass neither spends \
+             the attempt nor asks the operator",
+        ),
+        RefreshClass::Ok => match bearer.map(str::trim).filter(|b| !b.is_empty()) {
+            Some(b) => SeedBearer::InWindow(b),
+            // `Ok` with no token at all is not a measured absence of a session
+            // (that is `NoSession`); it is a read that yielded nothing.
+            None => SeedBearer::Undetermined(
+                "the Cognito access token read back empty on an otherwise-healthy \
+                 refresh — bearer availability is UNKNOWN this pass",
+            ),
+        },
+    }
+}
+
+/// One tenant's state within the CURRENT lapse — the record that makes
+/// "exactly once" survive a restart.
+///
+/// A *lapse* is one contiguous episode of a tenant being reported as a gap. It
+/// opens when a MEASURED report first names the tenant and closes when a
+/// MEASURED report stops naming it. An `Unknown` report closes nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct GapAskRecord {
+    /// True once a `pair-cli` mint has actually been ATTEMPTED for this tenant
+    /// in this lapse — set on the attempt, not on its outcome, so a coord
+    /// refusal cannot become a retry loop.
+    #[serde(default)]
+    pub mint_attempted: bool,
+    /// True once the operator has been asked for this tenant in this lapse.
+    #[serde(default)]
+    pub notified: bool,
+    /// Unix seconds when this lapse was first observed — for the operator, and
+    /// so a record is never a bare `true`.
+    #[serde(default)]
+    pub first_seen: i64,
+}
+
+/// The on-disk lapse record, keyed by stringified tenant UUID.
+///
+/// A SIDECAR beside `paired_user.json` and `coord_bound_tenants.json`, for the
+/// same reason the latter is one: it is neither a binding nor a credential,
+/// nothing selects a slot from it, and a corrupt or absent one must degrade to
+/// "nobody has been asked yet" rather than take a credential down.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct GapAskState {
+    #[serde(default)]
+    pub tenants: std::collections::BTreeMap<String, GapAskRecord>,
+}
+
+impl GapAskState {
+    fn record(&self, tenant: &uuid::Uuid) -> Option<&GapAskRecord> {
+        self.tenants.get(&tenant.to_string())
+    }
+
+    fn entry(&mut self, tenant: &uuid::Uuid, now: i64) -> &mut GapAskRecord {
+        self.tenants
+            .entry(tenant.to_string())
+            .or_insert(GapAskRecord {
+                mint_attempted: false,
+                notified: false,
+                first_seen: now,
+            })
+    }
+
+    /// Close every lapse the MEASURED report no longer names, and report which
+    /// tenants were closed. Called only on a measured report — see the module
+    /// note on why an `Unknown` closes nothing.
+    fn close_lapses_not_in(&mut self, gaps: &[uuid::Uuid]) -> Vec<uuid::Uuid> {
+        let live: std::collections::HashSet<String> = gaps.iter().map(|t| t.to_string()).collect();
+        let closed: Vec<String> = self
+            .tenants
+            .keys()
+            .filter(|k| !live.contains(*k))
+            .cloned()
+            .collect();
+        for k in &closed {
+            self.tenants.remove(k);
+        }
+        closed
+            .iter()
+            .filter_map(|k| uuid::Uuid::parse_str(k).ok())
+            .collect()
+    }
+}
+
+/// Where the lapse record lives: beside `paired_user.json` and
+/// `coord_bound_tenants.json`, in whichever storage dir THIS process resolves
+/// (`QONTINUI_SECURE_STORAGE_DIR`, else the data-local default).
+pub(crate) fn binding_gap_ask_path() -> Option<std::path::PathBuf> {
+    qontinui_runner_lib::pair::coord_bound_tenants_path()
+        .map(|p| p.with_file_name("binding_gap_asks.json"))
+}
+
+/// Read the lapse record. FAIL-SOFT in exactly one direction: an absent,
+/// unreadable or malformed file reads as "nobody has been asked yet", so the
+/// worst a corrupt record can do is ask the operator one extra time — never
+/// suppress an ask forever, and never mint anything (a mint still needs a
+/// measured gap and an in-window bearer).
+pub(crate) fn load_gap_ask_state(path: &std::path::Path) -> GapAskState {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            warn!(
+                "device_jwt_refresher: {} is unreadable ({e}) — treating every lapse as \
+                 not-yet-asked",
+                path.display()
+            );
+            GapAskState::default()
+        }),
+        Err(_) => GapAskState::default(),
+    }
+}
+
+/// Persist the lapse record. Best-effort: a write failure only costs a repeat
+/// ask after a restart, and must never fail the pass.
+pub(crate) fn save_gap_ask_state(path: &std::path::Path, state: &GapAskState) {
+    let body = match serde_json::to_vec_pretty(state) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("device_jwt_refresher: serialize binding_gap_asks.json failed: {e}");
+            return;
+        }
+    };
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            warn!(
+                "device_jwt_refresher: mkdir {} failed: {e}",
+                parent.display()
+            );
+            return;
+        }
+    }
+    // Its own tmp name — never the one `write_paired_user_file` or
+    // `record_coord_bound_tenants_at` use.
+    let tmp = path.with_extension("json.gap-ask.tmp");
+    if let Err(e) = std::fs::write(&tmp, &body) {
+        warn!("device_jwt_refresher: write {} failed: {e}", tmp.display());
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        warn!(
+            "device_jwt_refresher: rename {} failed: {e}",
+            path.display()
+        );
+    }
+}
+
+/// The MEASURED gap set, or `None` when the report established nothing.
+///
+/// The single gate for the whole of Phase 4: `Unknown` returns `None` here and
+/// every caller does nothing at all.
+pub(crate) fn measured_gaps(report: &BindingGapReport) -> Option<Vec<uuid::Uuid>> {
+    match report {
+        BindingGapReport::Unknown(_) => None,
+        BindingGapReport::Gaps(ids) => Some(
+            ids.iter()
+                .filter_map(|s| uuid::Uuid::parse_str(s.trim()).ok())
+                .collect(),
+        ),
+    }
+}
+
+/// What this pass decided to do about ONE gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GapStep {
+    /// Arm A — a Cognito refresh token is in window; spend this lapse's ONE
+    /// mint attempt.
+    AttemptMint,
+    /// Arm B — ask the operator, once in this lapse.
+    Notify,
+    /// Already attempted AND already asked in this lapse. Silence is the
+    /// point.
+    Silent,
+    /// Bearer availability was not established this pass. Neither arm.
+    Defer,
+}
+
+/// Pure: what to do about one gap, given what this lapse has already spent.
+///
+/// Arm A outranks Arm B: a seeding that needs no human is always preferable to
+/// one that does. A lapse spends at most one mint attempt and at most one ask,
+/// in that order, and `Silent` afterwards — the cardinality is a property of
+/// this function plus the persisted record, not of how often the loop runs.
+pub(crate) fn plan_gap_step(record: Option<&GapAskRecord>, bearer: SeedBearer<'_>) -> GapStep {
+    let (attempted, notified) = record
+        .map(|r| (r.mint_attempted, r.notified))
+        .unwrap_or((false, false));
+    match bearer {
+        SeedBearer::InWindow(_) if !attempted => GapStep::AttemptMint,
+        // UNKNOWN never drives an ask: see [`SeedBearer::Undetermined`].
+        SeedBearer::Undetermined(_) if !notified => GapStep::Defer,
+        _ if !notified => GapStep::Notify,
+        _ => GapStep::Silent,
+    }
+}
+
+/// The outcome of ONE `pair-cli` seeding attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SeedOutcome {
+    /// Coord minted for the tenant that was asked for, and the JWT is now in
+    /// THAT tenant's slot. No human was involved.
+    Seeded,
+    /// Coord answered 2xx but the minted JWT's own `tenant_id` claim names a
+    /// DIFFERENT tenant. REFUSED — nothing persisted, in either slot.
+    TenantMismatch {
+        expected: uuid::Uuid,
+        returned: Option<uuid::Uuid>,
+    },
+    /// Coord (or the web backend fronting it) refused, or the transport
+    /// failed. The message is carried VERBATIM — a `400 tenant_not_bound` /
+    /// `422 tenant_ambiguous` is the operator's answer, not something for this
+    /// runner to paraphrase.
+    Refused(String),
+    /// The 2xx body carried no usable token.
+    EmptyToken,
+    /// The slot write itself failed.
+    PersistFailed(String),
+}
+
+impl SeedOutcome {
+    pub(crate) fn seeded(&self) -> bool {
+        matches!(self, SeedOutcome::Seeded)
+    }
+
+    /// The verbatim operator-facing line for a non-seeding outcome.
+    pub(crate) fn reason(&self) -> String {
+        match self {
+            SeedOutcome::Seeded => "seeded".to_string(),
+            SeedOutcome::TenantMismatch { expected, returned } => format!(
+                "coord minted for tenant {returned:?}, not the requested {expected} — \
+                 refused, not persisted"
+            ),
+            SeedOutcome::Refused(msg) => msg.clone(),
+            SeedOutcome::EmptyToken => "coord returned an empty token".to_string(),
+            SeedOutcome::PersistFailed(e) => format!("persisting the seeded slot failed: {e}"),
+        }
+    }
+}
+
+/// Arm A: seed ONE bound tenant's slot through `pair-cli`, with no human.
+///
+/// This is deliberately NOT [`try_refresh_once`]. That function resolves its
+/// tenant through [`resolve_pair_tenant_id`]'s fallback chain (OAuth claim →
+/// outgoing device-JWT claim → `machine.json`) and persists into the legacy
+/// `access_token` slot — reusing it here would mint for whichever tenant the
+/// chain happened to answer and overwrite this box's live DEFAULT credential
+/// with it. Here the tenant is the GAP's, passed explicitly, and the
+/// destination is that tenant's own slot.
+///
+/// `tenant_id` reaches coord as a HINT: coord is the authority and
+/// re-validates server-side, which is why a `400 tenant_not_bound` /
+/// `422 tenant_ambiguous` is a possible and expected answer. It is returned
+/// VERBATIM and the caller does not retry it.
+pub(crate) async fn seed_one_tenant_slot(
+    auth_manager: &crate::auth::AuthManager,
+    pair_base: &str,
+    oauth_bearer: &str,
+    device_id: &str,
+    user_id: &str,
+    tenant_id: uuid::Uuid,
+) -> SeedOutcome {
+    let base = pair_base.to_string();
+    let token = oauth_bearer.to_string();
+    let did = device_id.to_string();
+    let uid = user_id.to_string();
+
+    // `pair_with_auth_token_with_ids` is reqwest::blocking — it must run on
+    // the blocking pool or it stalls the tokio runtime.
+    let join = spawn_blocking_tracked(move || {
+        qontinui_runner_lib::pair::pair_with_auth_token_with_ids(
+            &base, &token, &did, &uid, tenant_id,
+        )
+    })
+    .await;
+
+    let resp = match join {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            // VERBATIM. `pair_with_auth_token_with_ids` formats a non-2xx as
+            // `POST <url> -> HTTP <status>: <body>`, so coord's own
+            // `tenant_not_bound` / `tenant_ambiguous` wording survives intact.
+            crate::util::egress_context::record_failure(
+                crate::util::egress_context::EgressClient::DeviceJwtRefresher,
+            );
+            return SeedOutcome::Refused(e);
+        }
+        Err(join_err) => return SeedOutcome::Refused(format!("pair task join failed: {join_err}")),
+    };
+
+    if resp.token.trim().is_empty() {
+        return SeedOutcome::EmptyToken;
+    }
+
+    // The per-tenant twin of `store_tokens_expecting`: a cross-tenant mint is
+    // refused rather than persisted, and the write touches ONLY
+    // `device_jwt:<tenant_id>` — never the legacy `access_token` slot.
+    match auth_manager.store_tenant_device_jwt_expecting(&tenant_id, resp.token.trim()) {
+        Ok(()) => {
+            info!(
+                "device_jwt_refresher: seeded the device-JWT slot for bound tenant \
+                 {tenant_id} with no human (pair-cli, Cognito refresh token in window)"
+            );
+            SeedOutcome::Seeded
+        }
+        Err(e) => {
+            if let Some(mismatch) = e.downcast_ref::<crate::auth::TenantMismatch>() {
+                DEVICE_JWT_REFRESH_TENANT_MISMATCH_TOTAL
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                warn!(
+                    "device_jwt_refresher: pair-cli minted for tenant {:?}, not the \
+                     requested {} — refusing to persist (the slot is left as it was)",
+                    mismatch.returned, mismatch.expected
+                );
+                SeedOutcome::TenantMismatch {
+                    expected: mismatch.expected,
+                    returned: mismatch.returned,
+                }
+            } else {
+                warn!("device_jwt_refresher: persisting the seeded slot failed: {e}");
+                SeedOutcome::PersistFailed(e.to_string())
+            }
+        }
+    }
+}
+
+/// Arm B's payload. Pure, so the gate can assert what the operator is actually
+/// shown without a Tauri app handle.
+///
+/// It names three things and no more: WHICH tenant, WHICH detector fired (so
+/// the ask is traceable to Phase 3's `binding_gaps` rather than being one more
+/// improvised credential request), and the ONE door that heals it — the same
+/// command `SPAWN_TENANT_PAIRING_HINT` already points refused sessions at.
+pub(crate) fn binding_gap_ask_payload(
+    tenant: &uuid::Uuid,
+    reason: &str,
+    first_seen: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "tenant_id": tenant.to_string(),
+        // WHICH detector fired — Phase 3's tri-state gap report.
+        "detector": "binding_gaps",
+        "reason": reason,
+        "message": format!(
+            "This device is bound to tenant {tenant} but holds no credential for it, \
+             and no headless mint can reach that tenant. Pair it once to restore \
+             autonomous sessions for this tenant."
+        ),
+        "cta": "device_pair_tenant",
+        "command": format!("qontinui_profile device pair --tenant-id {tenant}"),
+        "first_seen": first_seen,
+    })
+}
+
+/// What one seeding pass did, per tenant. Returned rather than emitted so the
+/// gate can drive several passes — and several simulated restarts — and count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GapAction {
+    /// Arm A succeeded: no human was asked.
+    Seeded(uuid::Uuid),
+    /// Arm A was spent and did not seed. The reason is VERBATIM.
+    MintFailed { tenant: uuid::Uuid, reason: String },
+    /// Arm B fired — ONCE for this tenant in this lapse.
+    Notified {
+        tenant: uuid::Uuid,
+        payload: serde_json::Value,
+    },
+    /// Already attempted and already asked in this lapse.
+    Silent(uuid::Uuid),
+    /// Bearer availability was not established this pass — neither arm ran.
+    Deferred(uuid::Uuid),
+    /// A MEASURED report stopped naming this tenant: the lapse closed and its
+    /// record was cleared, so a future lapse may ask again.
+    LapseClosed(uuid::Uuid),
+}
+
+/// Run one seeding pass over a MEASURED binding-gap report.
+///
+/// Path-and-bearer parameterised so the gate can drive it hermetically. The
+/// production wrapper is [`seed_bound_tenant_slots`].
+///
+/// Order of business, per gap:
+///   1. Arm A once — if a Cognito refresh token is in window and this lapse
+///      has not already spent its attempt. The attempt is recorded BEFORE the
+///      outcome is known, so a refusal cannot become a retry loop.
+///   2. Arm B once — if Arm A did not seed and the operator has not already
+///      been asked in this lapse.
+///   3. Silence.
+///
+/// On `Unknown` the caller never reaches here; see [`measured_gaps`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn seed_bound_tenant_slots_at(
+    auth_manager: &crate::auth::AuthManager,
+    state_path: &std::path::Path,
+    report: &BindingGapReport,
+    bearer: SeedBearer<'_>,
+    pair_base: &str,
+    device_id: Option<&str>,
+    user_id: Option<&str>,
+    now: i64,
+) -> Vec<GapAction> {
+    // THE UNKNOWN GATE. A report that established nothing drives no mint, no
+    // ask, and no change to the lapse record.
+    let Some(gaps) = measured_gaps(report) else {
+        return Vec::new();
+    };
+
+    let mut state = load_gap_ask_state(state_path);
+    let mut actions: Vec<GapAction> = state
+        .close_lapses_not_in(&gaps)
+        .into_iter()
+        .map(GapAction::LapseClosed)
+        .collect();
+
+    // `pair-cli` needs a device id and a paired user id as well as a bearer.
+    // Missing either is a MEASURED unavailability of Arm A, not an unknown —
+    // so Arm B is the right answer.
+    let mint_inputs = match (bearer, device_id, user_id) {
+        (SeedBearer::InWindow(b), Some(d), Some(u))
+            if !d.trim().is_empty() && !u.trim().is_empty() && !pair_base.trim().is_empty() =>
+        {
+            Some((b, d.trim().to_string(), u.trim().to_string()))
+        }
+        (SeedBearer::InWindow(_), _, _) => None,
+        _ => None,
+    };
+    let effective_bearer = match (&bearer, &mint_inputs) {
+        (SeedBearer::InWindow(_), None) => SeedBearer::OutOfWindow(
+            "a Cognito bearer is in window, but pair-cli also needs a device id \
+             (machine.json), a paired user id (paired_user.json) and a backend URL, \
+             and at least one is missing",
+        ),
+        _ => bearer,
+    };
+
+    for tenant in gaps {
+        match plan_gap_step(state.record(&tenant), effective_bearer) {
+            GapStep::Defer => {
+                if let SeedBearer::Undetermined(why) = effective_bearer {
+                    debug!(
+                        "device_jwt_refresher: binding gap for tenant {tenant} deferred — {why}"
+                    );
+                }
+                actions.push(GapAction::Deferred(tenant));
+                continue;
+            }
+            GapStep::Silent => {
+                actions.push(GapAction::Silent(tenant));
+                continue;
+            }
+            GapStep::AttemptMint => {
+                let (bearer_token, did, uid) = mint_inputs
+                    .as_ref()
+                    .map(|(b, d, u)| (*b, d.clone(), u.clone()))
+                    .expect("AttemptMint is only planned when the mint inputs resolved");
+                // Recorded BEFORE the call: this lapse has now spent its one
+                // attempt whatever comes back, which is what makes a coord
+                // refusal a report rather than a retry loop.
+                {
+                    let rec = state.entry(&tenant, now);
+                    rec.mint_attempted = true;
+                }
+                save_gap_ask_state(state_path, &state);
+
+                let outcome =
+                    seed_one_tenant_slot(auth_manager, pair_base, bearer_token, &did, &uid, tenant)
+                        .await;
+                if outcome.seeded() {
+                    // The lapse is over: the slot exists, so the next MEASURED
+                    // report will not name this tenant. Clear now so a future
+                    // lapse may ask again.
+                    state.tenants.remove(&tenant.to_string());
+                    save_gap_ask_state(state_path, &state);
+                    actions.push(GapAction::Seeded(tenant));
+                    continue;
+                }
+                let reason = outcome.reason();
+                warn!(
+                    "device_jwt_refresher: seeding tenant {tenant} via pair-cli did not \
+                     succeed — {reason} (no retry this lapse)"
+                );
+                actions.push(GapAction::MintFailed {
+                    tenant,
+                    reason: reason.clone(),
+                });
+                // Fall through to Arm B with the VERBATIM refusal as the
+                // operator-facing reason.
+                if !state.record(&tenant).map(|r| r.notified).unwrap_or(false) {
+                    let first_seen = {
+                        let rec = state.entry(&tenant, now);
+                        rec.notified = true;
+                        rec.first_seen
+                    };
+                    save_gap_ask_state(state_path, &state);
+                    actions.push(GapAction::Notified {
+                        tenant,
+                        payload: binding_gap_ask_payload(&tenant, &reason, first_seen),
+                    });
+                } else {
+                    actions.push(GapAction::Silent(tenant));
+                }
+            }
+            GapStep::Notify => {
+                let reason = match effective_bearer {
+                    SeedBearer::OutOfWindow(why) => why.to_string(),
+                    // Reached when this lapse already spent its mint attempt.
+                    _ => "this lapse has already spent its one headless mint attempt".to_string(),
+                };
+                let first_seen = {
+                    let rec = state.entry(&tenant, now);
+                    rec.notified = true;
+                    rec.first_seen
+                };
+                save_gap_ask_state(state_path, &state);
+                warn!(
+                    "device_jwt_refresher: asking the operator ONCE to pair bound tenant \
+                     {tenant} — {reason} (detector: binding_gaps)"
+                );
+                actions.push(GapAction::Notified {
+                    tenant,
+                    payload: binding_gap_ask_payload(&tenant, &reason, first_seen),
+                });
+            }
+        }
+    }
+
+    save_gap_ask_state(state_path, &state);
+    actions
+}
+
+/// Production wrapper: resolve the lapse-record path, the bearer, the device
+/// id, the user id and the backend base, then run one seeding pass.
+///
+/// The Cognito probe is PAID FOR ONLY when some gap still has its mint attempt
+/// to spend — a box with no gaps, or one whose gaps have all been attempted
+/// and asked about, touches Cognito not at all.
+pub(crate) async fn seed_bound_tenant_slots(
+    auth_manager: &crate::auth::AuthManager,
+    settings: &crate::settings::Settings,
+    report: &BindingGapReport,
+    now: i64,
+) -> Vec<GapAction> {
+    let Some(gaps) = measured_gaps(report) else {
+        return Vec::new();
+    };
+    let Some(state_path) = binding_gap_ask_path() else {
+        warn!(
+            "device_jwt_refresher: could not resolve the binding-gap lapse record path — \
+             skipping seeding rather than asking the operator on every pass"
+        );
+        return Vec::new();
+    };
+    // Nothing at all to do: no gap, and no stale lapse record to close.
+    if gaps.is_empty() && load_gap_ask_state(&state_path).tenants.is_empty() {
+        return Vec::new();
+    }
+
+    let unspent = {
+        let state = load_gap_ask_state(&state_path);
+        gaps.iter()
+            .any(|t| !state.record(t).map(|r| r.mint_attempted).unwrap_or(false))
+    };
+    let probe = if unspent {
+        Some(refresh_cognito_bearer(auth_manager).await)
+    } else {
+        None
+    };
+    let bearer = match &probe {
+        Some((b, class)) => classify_seed_bearer(b.as_deref(), *class),
+        None => SeedBearer::OutOfWindow(
+            "every open lapse has already spent its one headless mint attempt",
+        ),
+    };
+
+    let device_id = qontinui_runner_lib::pair::read_device_id_from_disk().ok();
+    let user_id = qontinui_runner_lib::pair::read_paired_user_id_from_disk();
+    let pair_base = resolve_pair_base(settings);
+
+    seed_bound_tenant_slots_at(
+        auth_manager,
+        &state_path,
+        report,
+        bearer,
+        &pair_base,
+        device_id.as_deref(),
+        user_id.as_deref(),
+        now,
+    )
+    .await
+}
+
+/// Emit Arm B's asks. Separated from the decision so the gate counts decisions
+/// and production emits them; an emit failure only `warn!`s.
+fn emit_binding_gap_asks(app: Option<&tauri::AppHandle>, actions: &[GapAction]) {
+    let Some(app) = app else { return };
+    for action in actions {
+        if let GapAction::Notified { tenant, payload } = action {
+            if let Err(e) = app.emit(AUTONOMY_BINDING_GAP_EVENT, payload) {
+                warn!(
+                    "device_jwt_refresher: failed to emit {AUTONOMY_BINDING_GAP_EVENT} for \
+                     tenant {tenant}: {e}"
+                );
+            }
+        }
+    }
+}
+
 /// Compose the two reads into a writable-key set, ABORTING on any UNKNOWN.
 ///
 /// # Why every input aborts rather than contributing nothing
@@ -4081,9 +4792,28 @@ async fn refresher_loop(
         // so a tenant bound with NO slot is structurally invisible to it.
         // Composed here, from the SAME blocking-pool read, and published
         // BEFORE the pass so the health snapshot it publishes carries this
-        // pass's answer. Report only — no mint is attempted for a gap; that
-        // is Phase 4 (`seed_a_bound_tenants_slot`), a separate change.
-        publish_binding_gaps(binding_gaps_from(&sweep_inputs));
+        // pass's answer.
+        let gap_report = binding_gaps_from(&sweep_inputs);
+        publish_binding_gaps(gap_report.clone());
+        // D3 (Phase 4): act on that report. Arm A takes the free win when a
+        // Cognito refresh token is still in window — `pair-cli` with the GAP's
+        // tenant id, persisted into THAT tenant's slot, once per gap per
+        // lapse. Arm B asks the operator exactly once per tenant per lapse,
+        // persisted across restarts. An UNKNOWN report drives neither.
+        //
+        // Runs here, beside the report it consumes and BEFORE the slot pass,
+        // so a tenant seeded this pass enters the warm-keeping loop on the
+        // next one by the ordinary route rather than a special case. The
+        // Cognito probe inside is paid for only when a gap still has its one
+        // attempt to spend, so a box with no gaps does no extra work.
+        let gap_actions = seed_bound_tenant_slots(
+            &auth_manager,
+            &settings_snapshot,
+            &gap_report,
+            chrono::Utc::now().timestamp(),
+        )
+        .await;
+        emit_binding_gap_asks(Some(&api_state.app_handle), &gap_actions);
         // Retire every upstream-verdict bucket this runner can no longer write
         // (a re-pair or an unpair), BEFORE the posture is derived from what is
         // left. Runs in BOTH branches because a re-pair can happen from either
@@ -9377,6 +10107,795 @@ mod tenant_slot_refresh_tests {
             "UNKNOWN must reach the doctor as UNKNOWN, never as an empty gap list"
         );
         assert!(cap.mint_attempts.lock().unwrap().is_empty());
+    }
+
+    // =======================================================================
+    // Phase 4 — seeding a bound tenant's slot (D3). Plan
+    // `2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin`.
+    //
+    // Everything here runs against an in-process mock that serves BOTH doors
+    // this module can mint through, so "Phase 4 used pair-cli and never the
+    // machine-credential exchange" is an assertion rather than a claim. No
+    // live coord, no `~/.qontinui`, no real `qontinui_profile device pair`.
+    // =======================================================================
+
+    /// What the Phase-4 mock should answer `POST /api/v1/devices/pair-cli`
+    /// with. `Mint` returns a device JWT carrying `tenant` as its own
+    /// `tenant_id` claim — which is how the cross-tenant case is built: mint
+    /// for a tenant OTHER than the one the request asked for.
+    #[derive(Clone)]
+    enum PairCliReply {
+        Mint(uuid::Uuid),
+        Refuse(StatusCode, &'static str),
+    }
+
+    #[derive(Clone)]
+    struct SeedMockState {
+        reply: PairCliReply,
+        /// Every pair-cli request body, in order. Its length IS the attempt
+        /// count the "does not retry-loop" gate asserts on.
+        pair_cli_bodies: Arc<Mutex<Vec<String>>>,
+        /// Every `machine-credential/exchange` knock. Phase 4 must never mint
+        /// through the door that persists into the LEGACY slot.
+        exchange_attempts: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct SeedMockCapture {
+        pair_cli_bodies: Arc<Mutex<Vec<String>>>,
+        exchange_attempts: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl SeedMockCapture {
+        fn pair_cli_attempts(&self) -> usize {
+            self.pair_cli_bodies.lock().unwrap().len()
+        }
+        fn last_tenant_hint(&self) -> Option<String> {
+            let bodies = self.pair_cli_bodies.lock().unwrap();
+            let last = bodies.last()?;
+            let v: serde_json::Value = serde_json::from_str(last).ok()?;
+            Some(v.get("tenant_id")?.as_str()?.to_string())
+        }
+    }
+
+    async fn pair_cli_handler(
+        State(s): State<SeedMockState>,
+        _h: HeaderMap,
+        b: axum::body::Bytes,
+    ) -> (StatusCode, String) {
+        s.pair_cli_bodies
+            .lock()
+            .unwrap()
+            .push(String::from_utf8_lossy(&b).to_string());
+        match s.reply {
+            PairCliReply::Mint(t) => {
+                let jwt = synth_jwt_tenant(&t, chrono::Utc::now().timestamp() + 4 * 60 * 60);
+                (
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "token": jwt,
+                        "user_id": UID,
+                        "device_id": DID,
+                        "tenant_id": t.to_string(),
+                    })
+                    .to_string(),
+                )
+            }
+            PairCliReply::Refuse(status, body) => (status, body.to_string()),
+        }
+    }
+
+    async fn seed_exchange_tripwire(
+        State(s): State<SeedMockState>,
+        Path(device_id): Path<String>,
+    ) -> (StatusCode, String) {
+        s.exchange_attempts.lock().unwrap().push(device_id);
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":"phase 4 must not mint through the legacy-slot door"}"#.to_string(),
+        )
+    }
+
+    fn spawn_seed_mock(
+        reply: PairCliReply,
+    ) -> (String, SeedMockCapture, tokio::sync::oneshot::Sender<()>) {
+        let pair_cli_bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let exchange_attempts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let (bodies_h, ex_h) = (pair_cli_bodies.clone(), exchange_attempts.clone());
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = std_listener.local_addr().expect("addr").port();
+        std_listener.set_nonblocking(true).expect("nb");
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("rt");
+            rt.block_on(async move {
+                let state = SeedMockState {
+                    reply,
+                    pair_cli_bodies: bodies_h,
+                    exchange_attempts: ex_h,
+                };
+                let app: Router = Router::new()
+                    .route("/api/v1/devices/pair-cli", post(pair_cli_handler))
+                    .route(
+                        "/api/v1/devices/{device_id}/machine-credential/exchange",
+                        post(seed_exchange_tripwire),
+                    )
+                    .with_state(state);
+                let listener =
+                    tokio::net::TcpListener::from_std(std_listener).expect("tokio listener");
+                let _ = axum::serve(listener, app)
+                    .with_graceful_shutdown(async {
+                        let _ = rx.await;
+                    })
+                    .await;
+            });
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        (
+            format!("http://127.0.0.1:{port}"),
+            SeedMockCapture {
+                pair_cli_bodies,
+                exchange_attempts,
+            },
+            tx,
+        )
+    }
+
+    /// A device JWT carrying a `tenant_id` claim — the shape the cross-tenant
+    /// refusal is built from. (The module's own [`synth_jwt`] carries `sub`.)
+    fn synth_jwt_tenant(tenant: &uuid::Uuid, exp: i64) -> String {
+        let header = b64url(b"{\"alg\":\"EdDSA\",\"typ\":\"JWT\"}");
+        let payload = b64url(format!("{{\"exp\":{exp},\"tenant_id\":\"{tenant}\"}}").as_bytes());
+        let sig = b64url(b"fake-sig");
+        format!("{header}.{payload}.{sig}")
+    }
+
+    /// A fresh, per-test lapse-record path. Never the real
+    /// `binding_gap_ask_path()` — these tests must not touch the operator's
+    /// box.
+    fn gap_state_path(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join("qontinui_test_gap_asks")
+            .join(format!("{name}_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir.join("binding_gap_asks.json")
+    }
+
+    const UID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+    fn gaps(ids: &[uuid::Uuid]) -> BindingGapReport {
+        BindingGapReport::Gaps(ids.iter().map(|t| t.to_string()).collect())
+    }
+
+    fn notified(actions: &[GapAction]) -> Vec<&serde_json::Value> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                GapAction::Notified { payload, .. } => Some(payload),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// GATE 1 — a bound tenant with NO slot is seeded WITHOUT a human when a
+    /// live Cognito refresh token is in window, via `pair-cli` carrying THAT
+    /// tenant id, and the JWT lands in THAT tenant's slot — not the legacy
+    /// `access_token` slot, which keeps holding this box's default credential.
+    #[tokio::test]
+    async fn an_in_window_cognito_session_seeds_a_bound_tenants_slot_with_no_human() {
+        let mgr = test_auth_manager("p4_seed_no_human");
+        let (default_t, gap_t) = (tenant(0), tenant(2));
+        let now = chrono::Utc::now().timestamp();
+        // This box's LIVE default credential — the thing a careless reuse of
+        // `try_refresh_once` would overwrite.
+        let default_jwt = synth_jwt_tenant(&default_t, now + 4 * 60 * 60);
+        mgr.store_tokens(&default_jwt, "").expect("default slot");
+
+        let (base, cap, _shutdown) = spawn_seed_mock(PairCliReply::Mint(gap_t));
+        let path = gap_state_path("seed_no_human");
+
+        let actions = seed_bound_tenant_slots_at(
+            &mgr,
+            &path,
+            &gaps(&[gap_t]),
+            SeedBearer::InWindow("cognito-access-token"),
+            &base,
+            Some(DID),
+            Some(UID),
+            now,
+        )
+        .await;
+
+        assert_eq!(
+            actions,
+            vec![GapAction::Seeded(gap_t)],
+            "the gap was seeded with no human"
+        );
+        assert_eq!(
+            cap.last_tenant_hint().as_deref(),
+            Some(gap_t.to_string().as_str()),
+            "pair-cli carried the GAP's tenant id, not the fallback chain's answer"
+        );
+        assert!(
+            mgr.get_tenant_device_jwt(&gap_t)
+                .expect("slot readable")
+                .is_some(),
+            "the seeded JWT lands in the GAP tenant's own slot"
+        );
+        assert_eq!(
+            mgr.get_access_token().expect("legacy slot"),
+            default_jwt,
+            "…and the LEGACY slot still holds this box's default credential"
+        );
+        assert!(
+            cap.exchange_attempts.lock().unwrap().is_empty(),
+            "no mint through the machine-credential exchange (it persists into \
+             the legacy slot and cannot name a tenant)"
+        );
+        assert!(notified(&actions).is_empty(), "a headless seed asks nobody");
+        // The lapse closed with the gap, so a LATER lapse may ask again.
+        assert!(
+            load_gap_ask_state(&path).tenants.is_empty(),
+            "a seeded gap leaves no open lapse behind"
+        );
+    }
+
+    /// GATE 2 — a mint whose returned `tenant_id` claim differs from the
+    /// expected tenant is REFUSED, not persisted, in either slot.
+    #[tokio::test]
+    async fn a_cross_tenant_mint_is_refused_and_never_persisted() {
+        let mgr = test_auth_manager("p4_cross_tenant_refused");
+        let (gap_t, other_t) = (tenant(2), tenant(3));
+        let now = chrono::Utc::now().timestamp();
+
+        // Coord answers 2xx but mints for SOMEONE ELSE.
+        let (base, cap, _shutdown) = spawn_seed_mock(PairCliReply::Mint(other_t));
+        let path = gap_state_path("cross_tenant");
+
+        let actions = seed_bound_tenant_slots_at(
+            &mgr,
+            &path,
+            &gaps(&[gap_t]),
+            SeedBearer::InWindow("cognito-access-token"),
+            &base,
+            Some(DID),
+            Some(UID),
+            now,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                actions.first(),
+                Some(GapAction::MintFailed { tenant, reason })
+                    if *tenant == gap_t && reason.contains("refused, not persisted")
+            ),
+            "a cross-tenant mint is a refusal: {actions:?}"
+        );
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&gap_t).expect("readable"),
+            None,
+            "nothing is filed under the tenant that was ASKED for"
+        );
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&other_t).expect("readable"),
+            None,
+            "nor under the tenant coord actually minted for"
+        );
+        assert!(
+            mgr.get_access_token().is_err() || mgr.get_access_token().unwrap().is_empty(),
+            "and never into the legacy slot"
+        );
+        assert_eq!(
+            cap.pair_cli_attempts(),
+            1,
+            "one attempt — a refused mint is not retried in this lapse"
+        );
+        // The operator is told, once, with the refusal as the reason.
+        assert_eq!(notified(&actions).len(), 1);
+    }
+
+    /// GATE 3 — exactly ONE notification per tenant per lapse. Driven over
+    /// SEVERAL passes and across a simulated runner RESTART (the state is
+    /// re-read from disk every pass, so a restart is simply another read), and
+    /// with two tenants so "one per tenant" is distinguishable from "one".
+    #[tokio::test]
+    async fn exactly_one_notification_per_tenant_per_lapse_across_passes_and_restarts() {
+        let mgr = test_auth_manager("p4_one_ask_per_lapse");
+        let (a, b) = (tenant(2), tenant(3));
+        let now = chrono::Utc::now().timestamp();
+        let path = gap_state_path("one_ask");
+        let (base, cap, _shutdown) = spawn_seed_mock(PairCliReply::Mint(a));
+
+        let mut all: Vec<GapAction> = Vec::new();
+        // Six passes. Each one re-reads the record from disk, which is exactly
+        // what a fresh process does — so this is also six "sessions".
+        for _ in 0..6 {
+            all.extend(
+                seed_bound_tenant_slots_at(
+                    &mgr,
+                    &path,
+                    &gaps(&[a, b]),
+                    // No Cognito session at all: Arm A is measured unavailable.
+                    SeedBearer::OutOfWindow("test: no cognito session"),
+                    &base,
+                    Some(DID),
+                    Some(UID),
+                    now,
+                )
+                .await,
+            );
+        }
+
+        let asks: Vec<uuid::Uuid> = all
+            .iter()
+            .filter_map(|x| match x {
+                GapAction::Notified { tenant, .. } => Some(*tenant),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            asks,
+            vec![a, b],
+            "ONE ask per tenant across six passes/sessions — not one per pass, \
+             not one per tenant per pass: {all:?}"
+        );
+        assert_eq!(
+            cap.pair_cli_attempts(),
+            0,
+            "Arm A is unavailable, so nothing was minted"
+        );
+        assert!(
+            cap.exchange_attempts.lock().unwrap().is_empty(),
+            "and the legacy-slot mint door was never knocked on"
+        );
+
+        // …and the "already asked" ruling is ON DISK, which is the whole of
+        // what survives a restart: a fresh process holds no memory of this
+        // lapse and re-reads exactly this file.
+        assert!(path.exists(), "the lapse record was persisted");
+        let on_disk = load_gap_ask_state(&path);
+        for t in [a, b] {
+            let rec = on_disk
+                .tenants
+                .get(&t.to_string())
+                .unwrap_or_else(|| panic!("tenant {t} has an on-disk lapse record"));
+            assert!(
+                rec.notified,
+                "a RESTARTED runner reads 'already asked' for tenant {t}: {rec:?}"
+            );
+            assert!(rec.first_seen > 0, "the lapse is dated, not a bare flag");
+        }
+
+        // The ask names the tenant, the DETECTOR that fired, and the one-click
+        // `qontinui_profile device pair --tenant-id <uuid>` action.
+        let payload = notified(&all)[0];
+        assert_eq!(payload["tenant_id"], serde_json::json!(a.to_string()));
+        assert_eq!(
+            payload["detector"],
+            serde_json::json!("binding_gaps"),
+            "the ask says WHICH gap detector fired: {payload}"
+        );
+        assert_eq!(
+            payload["command"],
+            serde_json::json!(format!("qontinui_profile device pair --tenant-id {a}")),
+            "the ask carries the heal SPAWN_TENANT_PAIRING_HINT already names: {payload}"
+        );
+        assert_eq!(payload["cta"], serde_json::json!("device_pair_tenant"));
+
+        // A LATER lapse may ask again: close it (the gap is measured gone),
+        // then re-open it.
+        let closed = seed_bound_tenant_slots_at(
+            &mgr,
+            &path,
+            &gaps(&[]),
+            SeedBearer::OutOfWindow("test: no cognito session"),
+            &base,
+            Some(DID),
+            Some(UID),
+            now,
+        )
+        .await;
+        assert_eq!(
+            closed
+                .iter()
+                .filter(|x| matches!(x, GapAction::LapseClosed(_)))
+                .count(),
+            2,
+            "a MEASURED report that stops naming a tenant closes its lapse"
+        );
+        let reopened = seed_bound_tenant_slots_at(
+            &mgr,
+            &path,
+            &gaps(&[a]),
+            SeedBearer::OutOfWindow("test: no cognito session"),
+            &base,
+            Some(DID),
+            Some(UID),
+            now,
+        )
+        .await;
+        assert_eq!(
+            notified(&reopened).len(),
+            1,
+            "a NEW lapse gets its own single ask — once per lapse, not once ever"
+        );
+    }
+
+    /// GATE 4a — a coord `400 tenant_not_bound` is reported VERBATIM and does
+    /// not retry-loop: five passes, ONE pair-cli attempt.
+    #[tokio::test]
+    async fn a_400_tenant_not_bound_is_verbatim_and_does_not_retry_loop() {
+        let mgr = test_auth_manager("p4_tenant_not_bound");
+        let gap_t = tenant(2);
+        let now = chrono::Utc::now().timestamp();
+        let path = gap_state_path("tenant_not_bound");
+        let (base, cap, _shutdown) = spawn_seed_mock(PairCliReply::Refuse(
+            StatusCode::BAD_REQUEST,
+            r#"{"detail":"tenant_not_bound"}"#,
+        ));
+
+        let mut all: Vec<GapAction> = Vec::new();
+        for _ in 0..5 {
+            all.extend(
+                seed_bound_tenant_slots_at(
+                    &mgr,
+                    &path,
+                    &gaps(&[gap_t]),
+                    SeedBearer::InWindow("cognito-access-token"),
+                    &base,
+                    Some(DID),
+                    Some(UID),
+                    now,
+                )
+                .await,
+            );
+        }
+
+        assert_eq!(
+            cap.pair_cli_attempts(),
+            1,
+            "ONE attempt per gap per lapse — a refusal is a report, not a retry loop"
+        );
+        let reason = all
+            .iter()
+            .find_map(|x| match x {
+                GapAction::MintFailed { reason, .. } => Some(reason.clone()),
+                _ => None,
+            })
+            .expect("the refused attempt is reported");
+        assert!(
+            reason.contains("tenant_not_bound") && reason.contains("400"),
+            "coord's refusal is carried VERBATIM: {reason}"
+        );
+        let asks = notified(&all);
+        assert_eq!(asks.len(), 1, "and the operator is asked exactly once");
+        assert!(
+            asks[0]["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("tenant_not_bound"),
+            "the ask carries coord's own words: {}",
+            asks[0]
+        );
+        assert_eq!(mgr.get_tenant_device_jwt(&gap_t).expect("readable"), None);
+    }
+
+    /// GATE 4b — the same for a `422 tenant_ambiguous`.
+    #[tokio::test]
+    async fn a_422_tenant_ambiguous_is_verbatim_and_does_not_retry_loop() {
+        let mgr = test_auth_manager("p4_tenant_ambiguous");
+        let gap_t = tenant(2);
+        let now = chrono::Utc::now().timestamp();
+        let path = gap_state_path("tenant_ambiguous");
+        let (base, cap, _shutdown) = spawn_seed_mock(PairCliReply::Refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            r#"{"detail":"tenant_ambiguous"}"#,
+        ));
+
+        let mut all: Vec<GapAction> = Vec::new();
+        for _ in 0..5 {
+            all.extend(
+                seed_bound_tenant_slots_at(
+                    &mgr,
+                    &path,
+                    &gaps(&[gap_t]),
+                    SeedBearer::InWindow("cognito-access-token"),
+                    &base,
+                    Some(DID),
+                    Some(UID),
+                    now,
+                )
+                .await,
+            );
+        }
+
+        assert_eq!(cap.pair_cli_attempts(), 1, "one attempt, not a loop");
+        let reason = all
+            .iter()
+            .find_map(|x| match x {
+                GapAction::MintFailed { reason, .. } => Some(reason.clone()),
+                _ => None,
+            })
+            .expect("the refused attempt is reported");
+        assert!(
+            reason.contains("tenant_ambiguous") && reason.contains("422"),
+            "verbatim: {reason}"
+        );
+        assert_eq!(notified(&all).len(), 1);
+    }
+
+    /// GATE 5 — an `unknown` binding-gap reading attempts NO mint and sends NO
+    /// notification, however many passes run and whatever the bearer says.
+    /// It must also not touch the lapse record: a silence closes nothing.
+    #[tokio::test]
+    async fn an_unknown_binding_gap_reading_mints_nothing_and_asks_nobody() {
+        let mgr = test_auth_manager("p4_unknown_no_action");
+        let gap_t = tenant(2);
+        let now = chrono::Utc::now().timestamp();
+        let path = gap_state_path("unknown");
+        let (base, cap, _shutdown) = spawn_seed_mock(PairCliReply::Mint(gap_t));
+
+        // Every UNKNOWN arm Phase 3 can produce.
+        for why in [
+            "coord_bound_tenants.json is ABSENT",
+            "the recorded set is older than 24h",
+            "the tenant device-JWT slot store could not be enumerated",
+            "paired_user.json is unreadable or malformed",
+        ] {
+            for _ in 0..3 {
+                let actions = seed_bound_tenant_slots_at(
+                    &mgr,
+                    &path,
+                    &BindingGapReport::Unknown(why.to_string()),
+                    SeedBearer::InWindow("cognito-access-token"),
+                    &base,
+                    Some(DID),
+                    Some(UID),
+                    now,
+                )
+                .await;
+                assert!(
+                    actions.is_empty(),
+                    "UNKNOWN is not 'no gaps' and it is not 'gaps' — it is silence: \
+                     {actions:?}"
+                );
+            }
+        }
+
+        assert_eq!(
+            cap.pair_cli_attempts(),
+            0,
+            "an unestablished bound set must NEVER drive a mint"
+        );
+        assert!(cap.exchange_attempts.lock().unwrap().is_empty());
+        assert!(!path.exists(), "and it does not even open a lapse record");
+
+        // And an UNKNOWN arriving mid-lapse must not CLOSE one either — the
+        // operator would then be asked again on the next measured pass.
+        let opened = seed_bound_tenant_slots_at(
+            &mgr,
+            &path,
+            &gaps(&[gap_t]),
+            SeedBearer::OutOfWindow("test: no cognito session"),
+            &base,
+            Some(DID),
+            Some(UID),
+            now,
+        )
+        .await;
+        assert_eq!(notified(&opened).len(), 1);
+        let during_silence = seed_bound_tenant_slots_at(
+            &mgr,
+            &path,
+            &BindingGapReport::Unknown("sidecar went absent".to_string()),
+            SeedBearer::OutOfWindow("test: no cognito session"),
+            &base,
+            Some(DID),
+            Some(UID),
+            now,
+        )
+        .await;
+        assert!(during_silence.is_empty());
+        let after = seed_bound_tenant_slots_at(
+            &mgr,
+            &path,
+            &gaps(&[gap_t]),
+            SeedBearer::OutOfWindow("test: no cognito session"),
+            &base,
+            Some(DID),
+            Some(UID),
+            now,
+        )
+        .await;
+        assert!(
+            notified(&after).is_empty(),
+            "an UNKNOWN in the middle of a lapse must not re-open the ask: {after:?}"
+        );
+    }
+
+    /// The bearer tri-state. `NoSession` and a dead refresh token are MEASURED
+    /// unavailability (Arm B); a transient Cognito failure establishes nothing
+    /// and must drive NEITHER arm — a dropped packet is not a reason to spend
+    /// the lapse's one mint attempt, and it is certainly not a reason to ask a
+    /// human.
+    #[test]
+    fn a_transient_cognito_failure_drives_neither_arm() {
+        assert!(matches!(
+            classify_seed_bearer(None, RefreshClass::NoSession),
+            SeedBearer::OutOfWindow(_)
+        ));
+        assert!(matches!(
+            classify_seed_bearer(Some("stale"), RefreshClass::Hard),
+            SeedBearer::OutOfWindow(_)
+        ));
+        assert!(matches!(
+            classify_seed_bearer(Some("stale"), RefreshClass::Transient),
+            SeedBearer::Undetermined(_)
+        ));
+        assert!(matches!(
+            classify_seed_bearer(Some("fresh"), RefreshClass::Ok),
+            SeedBearer::InWindow("fresh")
+        ));
+        assert!(matches!(
+            classify_seed_bearer(Some("   "), RefreshClass::Ok),
+            SeedBearer::Undetermined(_)
+        ));
+
+        // …and the plan honours it: Defer, not Notify, on a fresh lapse.
+        assert_eq!(
+            plan_gap_step(None, SeedBearer::Undetermined("blip")),
+            GapStep::Defer
+        );
+        assert_eq!(
+            plan_gap_step(None, SeedBearer::InWindow("t")),
+            GapStep::AttemptMint
+        );
+        assert_eq!(
+            plan_gap_step(None, SeedBearer::OutOfWindow("none")),
+            GapStep::Notify
+        );
+        let spent = GapAskRecord {
+            mint_attempted: true,
+            notified: false,
+            first_seen: 0,
+        };
+        assert_eq!(
+            plan_gap_step(Some(&spent), SeedBearer::InWindow("t")),
+            GapStep::Notify,
+            "the lapse's one attempt is spent — fall to the single ask"
+        );
+        let done = GapAskRecord {
+            mint_attempted: true,
+            notified: true,
+            first_seen: 0,
+        };
+        assert_eq!(
+            plan_gap_step(Some(&done), SeedBearer::InWindow("t")),
+            GapStep::Silent
+        );
+    }
+
+    /// A deferred pass leaves the lapse untouched, so the ask is still
+    /// available once the blip clears.
+    #[tokio::test]
+    async fn a_deferred_pass_neither_asks_nor_spends_the_attempt() {
+        let mgr = test_auth_manager("p4_deferred");
+        let gap_t = tenant(2);
+        let now = chrono::Utc::now().timestamp();
+        let path = gap_state_path("deferred");
+        let (base, cap, _shutdown) = spawn_seed_mock(PairCliReply::Mint(gap_t));
+
+        for _ in 0..3 {
+            let actions = seed_bound_tenant_slots_at(
+                &mgr,
+                &path,
+                &gaps(&[gap_t]),
+                SeedBearer::Undetermined("test: cognito refresh blipped"),
+                &base,
+                Some(DID),
+                Some(UID),
+                now,
+            )
+            .await;
+            assert_eq!(actions, vec![GapAction::Deferred(gap_t)]);
+        }
+        assert_eq!(cap.pair_cli_attempts(), 0);
+
+        // The blip clears — the free win is still available.
+        let actions = seed_bound_tenant_slots_at(
+            &mgr,
+            &path,
+            &gaps(&[gap_t]),
+            SeedBearer::InWindow("cognito-access-token"),
+            &base,
+            Some(DID),
+            Some(UID),
+            now,
+        )
+        .await;
+        assert_eq!(actions, vec![GapAction::Seeded(gap_t)]);
+        assert_eq!(cap.pair_cli_attempts(), 1);
+    }
+
+    /// An in-window bearer with no device id / user id is MEASURED
+    /// unavailability of Arm A, not an unknown: `pair-cli` cannot be called at
+    /// all, so the operator is asked once rather than the pass deferring
+    /// forever.
+    #[tokio::test]
+    async fn an_in_window_bearer_with_no_device_identity_asks_once() {
+        let mgr = test_auth_manager("p4_no_identity");
+        let gap_t = tenant(2);
+        let now = chrono::Utc::now().timestamp();
+        let path = gap_state_path("no_identity");
+        let (base, cap, _shutdown) = spawn_seed_mock(PairCliReply::Mint(gap_t));
+
+        let actions = seed_bound_tenant_slots_at(
+            &mgr,
+            &path,
+            &gaps(&[gap_t]),
+            SeedBearer::InWindow("cognito-access-token"),
+            &base,
+            None,
+            Some(UID),
+            now,
+        )
+        .await;
+        assert_eq!(notified(&actions).len(), 1, "{actions:?}");
+        assert_eq!(cap.pair_cli_attempts(), 0);
+    }
+
+    /// The lapse record round-trips, and a corrupt one fails SOFT in the one
+    /// safe direction: "nobody has been asked yet".
+    #[test]
+    fn a_corrupt_lapse_record_reads_as_nobody_asked_yet() {
+        let path = gap_state_path("corrupt");
+        assert_eq!(load_gap_ask_state(&path), GapAskState::default());
+
+        let mut state = GapAskState::default();
+        state.tenants.insert(
+            tenant(2).to_string(),
+            GapAskRecord {
+                mint_attempted: true,
+                notified: true,
+                first_seen: 1_800_000_000,
+            },
+        );
+        save_gap_ask_state(&path, &state);
+        assert_eq!(load_gap_ask_state(&path), state, "it round-trips on disk");
+
+        std::fs::write(&path, b"{not json").expect("corrupt it");
+        assert_eq!(
+            load_gap_ask_state(&path),
+            GapAskState::default(),
+            "a corrupt record costs one extra ask; it never suppresses one forever"
+        );
+    }
+
+    /// [`measured_gaps`] is the single UNKNOWN gate for the whole phase.
+    #[test]
+    fn measured_gaps_is_the_one_gate_on_unknown() {
+        assert_eq!(
+            measured_gaps(&BindingGapReport::Unknown("absent".into())),
+            None
+        );
+        assert_eq!(
+            measured_gaps(&BindingGapReport::Gaps(vec![])),
+            Some(vec![]),
+            "a MEASURED zero is a Some, and it CLOSES lapses"
+        );
+        assert_eq!(
+            measured_gaps(&gaps(&[tenant(2)])),
+            Some(vec![tenant(2)]),
+            "…and a measured gap parses back to its uuid"
+        );
+        assert_eq!(
+            measured_gaps(&BindingGapReport::Gaps(vec!["not-a-uuid".into()])),
+            Some(vec![]),
+            "an unparseable entry is dropped, never guessed at"
+        );
     }
 }
 
