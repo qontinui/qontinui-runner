@@ -777,17 +777,90 @@ pub fn coord_bound_tenant_count() -> Option<usize> {
 }
 
 pub(crate) fn coord_bound_tenant_count_at(path: &std::path::Path, now_unix: i64) -> Option<usize> {
-    let file: CoordBoundTenantsFile = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
-    let age = now_unix - file.observed_at;
-    if !(-300..=COORD_BOUND_TENANTS_MAX_AGE_SECS).contains(&age) {
-        return None;
+    // ONE parser (see [`coord_bound_tenants_at`]) so the count and the SET can
+    // never disagree about whether the record is evidence at all.
+    match coord_bound_tenants_at(path, now_unix) {
+        CoordBoundTenantsRead::Known(ids) => Some(ids.len()),
+        CoordBoundTenantsRead::Unknown(_) => None,
     }
-    Some(
+}
+
+/// What a read of `coord_bound_tenants.json` actually established — the SET,
+/// not just the count, as a tri-state.
+///
+/// Separated from `Option<Vec<_>>` on purpose. The whole reason this sidecar
+/// exists is that "I could not establish the bound set" and "coord says this
+/// device is bound to nothing" are different facts, and only the second one
+/// may ever be rendered as *"no gaps"*. `Known(vec![])` is a MEASURED zero;
+/// `Unknown` is silence, and it carries why so the operator-facing report can
+/// say which silence it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoordBoundTenantsRead {
+    /// The sidecar was read, parsed, and is inside its freshness window.
+    /// Sorted and distinct; only well-formed UUIDs survive.
+    Known(Vec<uuid::Uuid>),
+    /// NOTHING was established. Never "zero".
+    Unknown(&'static str),
+}
+
+/// Coord's authoritative bound-tenant SET for this device, or why it is
+/// UNKNOWN. See [`CoordBoundTenantsRead`].
+pub fn coord_bound_tenants() -> CoordBoundTenantsRead {
+    let Some(path) = coord_bound_tenants_path() else {
+        return CoordBoundTenantsRead::Unknown(
+            "the secure-storage dir could not be resolved, so coord_bound_tenants.json \
+             has no path on this box",
+        );
+    };
+    coord_bound_tenants_at(&path, chrono::Utc::now().timestamp())
+}
+
+pub fn coord_bound_tenants_at(path: &std::path::Path, now_unix: i64) -> CoordBoundTenantsRead {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return CoordBoundTenantsRead::Unknown(
+                "coord_bound_tenants.json is ABSENT — the heartbeat has never recorded \
+                 coord's binding set for this device here, so the bound set is UNKNOWN \
+                 (not zero)",
+            )
+        }
+        Err(_) => {
+            return CoordBoundTenantsRead::Unknown(
+                "coord_bound_tenants.json could not be read (permissions or I/O)",
+            )
+        }
+    };
+    let Ok(file) = serde_json::from_slice::<CoordBoundTenantsFile>(&bytes) else {
+        return CoordBoundTenantsRead::Unknown(
+            "coord_bound_tenants.json is malformed — nothing was established",
+        );
+    };
+    let age = now_unix - file.observed_at;
+    if age > COORD_BOUND_TENANTS_MAX_AGE_SECS {
+        // The heartbeat restamps hourly, so a live runner never reaches this.
+        // Getting here means the heartbeat is down or coord stopped echoing
+        // `tenant_ids` — an unpair seen by neither would otherwise be counted
+        // forever, and a stale set is not evidence.
+        return CoordBoundTenantsRead::Unknown(
+            "coord_bound_tenants.json is older than COORD_BOUND_TENANTS_MAX_AGE_SECS \
+             (24h) — the heartbeat is down or coord stopped echoing tenant_ids, so the \
+             bound set is UNKNOWN (not zero)",
+        );
+    }
+    if age < -300 {
+        return CoordBoundTenantsRead::Unknown(
+            "coord_bound_tenants.json is stamped implausibly in the future — the clock \
+             moved, so the record is not evidence",
+        );
+    }
+    CoordBoundTenantsRead::Known(
         file.tenant_ids
             .iter()
             .filter_map(|s| uuid::Uuid::parse_str(s.trim()).ok())
             .collect::<std::collections::BTreeSet<_>>()
-            .len(),
+            .into_iter()
+            .collect(),
     )
 }
 
@@ -3002,6 +3075,105 @@ mod tests {
             Some(1),
             "junk never inflates"
         );
+    }
+
+    /// Phase 3 of `2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin`
+    /// (D2's residual). The SET reader's tri-state: the two silences an
+    /// operator-facing binding-gap report must never render as "no gaps".
+    ///
+    /// Measured on the dev box 2026-09-20: the sidecar is ABSENT there, so a
+    /// reader that collapsed absence to `[]` would have reported zero gaps on
+    /// a box that has one. That is the whole reason this is not an
+    /// `Option<Vec<_>>`.
+    #[test]
+    fn coord_bound_tenants_set_is_a_tri_state_absent_and_stale_are_unknown() {
+        let dir = temp_dir_for("coord_bound_set_tristate");
+        let path = dir.join("coord_bound_tenants.json");
+        let t0 = 1_800_000_000;
+
+        // ABSENT — UNKNOWN, never an empty set.
+        match coord_bound_tenants_at(&path, t0) {
+            CoordBoundTenantsRead::Unknown(why) => assert!(
+                why.contains("ABSENT"),
+                "an absent sidecar names itself: {why}"
+            ),
+            other => panic!("an ABSENT sidecar must be UNKNOWN, never zero: {other:?}"),
+        }
+
+        assert!(record_coord_bound_tenants_at(&path, &[tc(), ta(), tb(), ta()], t0).unwrap());
+        assert_eq!(
+            coord_bound_tenants_at(&path, t0),
+            CoordBoundTenantsRead::Known({
+                let mut v = vec![ta(), tb(), tc()];
+                v.sort();
+                v
+            }),
+            "a fresh record is the deduped, sorted set"
+        );
+
+        // >24h old — UNKNOWN, never an empty set.
+        match coord_bound_tenants_at(&path, t0 + COORD_BOUND_TENANTS_MAX_AGE_SECS + 1) {
+            CoordBoundTenantsRead::Unknown(why) => assert!(
+                why.contains("24h"),
+                "a stale sidecar names its window: {why}"
+            ),
+            other => panic!("a STALE sidecar must be UNKNOWN, never zero: {other:?}"),
+        }
+        // …and one second inside the window is still evidence.
+        assert!(matches!(
+            coord_bound_tenants_at(&path, t0 + COORD_BOUND_TENANTS_MAX_AGE_SECS),
+            CoordBoundTenantsRead::Known(_)
+        ));
+
+        // Malformed — UNKNOWN.
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(matches!(
+            coord_bound_tenants_at(&path, t0),
+            CoordBoundTenantsRead::Unknown(_)
+        ));
+
+        // A MEASURED zero is `Known(vec![])`, which is a different fact.
+        assert!(record_coord_bound_tenants_at(&path, &[], t0).unwrap());
+        assert_eq!(
+            coord_bound_tenants_at(&path, t0),
+            CoordBoundTenantsRead::Known(vec![]),
+            "coord saying 'bound to nothing' is MEASURED, not UNKNOWN"
+        );
+
+        // Junk ids never inflate the set.
+        std::fs::write(
+            &path,
+            format!(r#"{{"tenant_ids":["{T_A}","junk","{T_A}"],"observed_at":{t0}}}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            coord_bound_tenants_at(&path, t0),
+            CoordBoundTenantsRead::Known(vec![ta()]),
+        );
+    }
+
+    /// The count is DERIVED from the set, so the two can never disagree about
+    /// whether a record is evidence.
+    #[test]
+    fn coord_bound_count_agrees_with_the_set_reader() {
+        let dir = temp_dir_for("coord_bound_count_agrees");
+        let path = dir.join("coord_bound_tenants.json");
+        let t0 = 1_800_000_000;
+        for now in [t0, t0 + COORD_BOUND_TENANTS_MAX_AGE_SECS + 1, t0 - 3600] {
+            let expected = match coord_bound_tenants_at(&path, now) {
+                CoordBoundTenantsRead::Known(v) => Some(v.len()),
+                CoordBoundTenantsRead::Unknown(_) => None,
+            };
+            assert_eq!(coord_bound_tenant_count_at(&path, now), expected);
+        }
+        assert!(record_coord_bound_tenants_at(&path, &[ta(), tb()], t0).unwrap());
+        for now in [t0, t0 + COORD_BOUND_TENANTS_MAX_AGE_SECS + 1, t0 - 3600] {
+            let expected = match coord_bound_tenants_at(&path, now) {
+                CoordBoundTenantsRead::Known(v) => Some(v.len()),
+                CoordBoundTenantsRead::Unknown(_) => None,
+            };
+            assert_eq!(coord_bound_tenant_count_at(&path, now), expected);
+        }
     }
 
     /// The sidecar never touches `paired_user.json` — the property that keeps

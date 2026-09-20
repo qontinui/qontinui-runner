@@ -19222,6 +19222,13 @@ pub(crate) mod doctor {
                     "degraded_slots": h.degraded_slots,
                     "cleared_on_expiry_total": h.cleared_on_expiry_total,
                     "cleared_on_rejection_total": h.cleared_on_rejection_total,
+                    // Beside `slots` on purpose: `slots` is what this box
+                    // HOLDS, `binding_gaps` is what coord says it is BOUND to
+                    // and holds nothing for. A reader who sees only the first
+                    // concludes "two healthy slots, nothing is missing" — the
+                    // exact reading this field exists to prevent. Its
+                    // `{"unknown": "<why>"}` arm is NOT "no gaps".
+                    "binding_gaps": h.binding_gaps,
                     "slots": h.slots.iter().map(|s| serde_json::json!({
                         "tenant_id": s.tenant_id,
                         "outcome": s.outcome,
