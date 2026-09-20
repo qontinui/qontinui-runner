@@ -1416,6 +1416,45 @@ impl AuthManager {
             .context("Failed to store per-tenant device JWT in secure storage")
     }
 
+    /// [`Self::store_tenant_device_jwt`], refusing to persist when the minted
+    /// token's own `tenant_id` claim names a DIFFERENT tenant than the slot it
+    /// is about to be written into.
+    ///
+    /// The per-tenant twin of [`Self::store_tokens_expecting`], and it exists
+    /// for the same incident: a mint path that forwards a tenant as a *hint*
+    /// (`pair-cli`, where coord is the authority and re-validates server-side)
+    /// can come back carrying a different tenant, and the runner must refuse
+    /// that credential rather than file it under the tenant it asked for.
+    /// `store_tokens_expecting` guards the LEGACY slot; nothing guarded a
+    /// per-tenant slot, because until plan
+    /// `2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin`
+    /// Phase 4 no mint wrote one directly (the only writers were
+    /// `persist_pairing` and [`Self::mirror_into_tenant_slot`], which keys off
+    /// the claim itself and so cannot mis-file).
+    ///
+    /// A token with NO decodable `tenant_id` claim stores exactly as
+    /// [`Self::store_tenant_device_jwt`] would: this guards against a WRONG
+    /// mint, it does not require every mint to carry a claim. On a mismatch the
+    /// returned error downcasts to [`TenantMismatch`], so a caller can tell
+    /// "the mint was for the wrong tenant" from an ordinary storage failure —
+    /// and the slot is left exactly as it was, empty or otherwise.
+    ///
+    /// This writes the per-tenant slot ONLY. It never touches the legacy
+    /// `access_token` slot, which holds this box's DEFAULT binding: seeding a
+    /// non-default tenant through the legacy slot would overwrite the live
+    /// default credential with another tenant's.
+    pub fn store_tenant_device_jwt_expecting(&self, tenant_id: &Uuid, jwt: &str) -> Result<()> {
+        let returned = jwt_tenant_claim(jwt);
+        if returned.is_some_and(|t| t != *tenant_id) {
+            return Err(TenantMismatch {
+                expected: *tenant_id,
+                returned,
+            }
+            .into());
+        }
+        self.store_tenant_device_jwt(tenant_id, jwt)
+    }
+
     /// Explicit-acquisition variant of [`Self::store_tenant_device_jwt`]:
     /// overwrites a present-but-unreadable file store from blank rather than
     /// refusing. The FIRST write of the explicit pairing path
@@ -3894,6 +3933,89 @@ mod bearer_selection_tests {
         mgr.store_tokens_expecting(&jwt, "", None).unwrap();
 
         assert_eq!(mgr.get_access_token().unwrap(), jwt);
+    }
+
+    // ======================================================================
+    // `store_tenant_device_jwt_expecting` — plan
+    // `2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin`
+    // Phase 4. The per-tenant twin of `store_tokens_expecting`.
+    // ======================================================================
+
+    /// A seeded credential whose claim MATCHES lands in THAT tenant's slot —
+    /// and the legacy `access_token` slot, which holds this box's DEFAULT
+    /// binding, is left untouched.
+    #[test]
+    fn store_tenant_device_jwt_expecting_writes_only_that_tenants_slot() {
+        let mgr = create_test_auth_manager("store_tenant_expecting_match");
+        let seeded = Uuid::parse_str("11111111-2222-4333-8444-5555555555c1").unwrap();
+        let default_t = Uuid::parse_str("22222222-3333-4444-5555-6666666666c2").unwrap();
+        let now = chrono::Utc::now().timestamp();
+        // The live DEFAULT credential this box already holds.
+        let default_jwt = jwt_with_tenant(&default_t, now + 60);
+        mgr.store_tokens(&default_jwt, "").unwrap();
+
+        let seeded_jwt = jwt_with_tenant(&seeded, now + 60);
+        mgr.store_tenant_device_jwt_expecting(&seeded, &seeded_jwt)
+            .unwrap();
+
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&seeded).unwrap().as_deref(),
+            Some(seeded_jwt.as_str()),
+            "the seeded JWT lands in the SEEDED tenant's own slot"
+        );
+        assert_eq!(
+            mgr.get_access_token().unwrap(),
+            default_jwt,
+            "the legacy slot still holds this box's DEFAULT credential"
+        );
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&default_t).unwrap().as_deref(),
+            Some(default_jwt.as_str()),
+            "and the default tenant's own mirrored slot is untouched"
+        );
+    }
+
+    /// A cross-tenant mint is REFUSED, and nothing is persisted under either
+    /// tenant.
+    #[test]
+    fn store_tenant_device_jwt_expecting_refuses_a_cross_tenant_mint() {
+        let mgr = create_test_auth_manager("store_tenant_expecting_mismatch");
+        let expected = Uuid::parse_str("11111111-2222-4333-8444-5555555555c3").unwrap();
+        let returned = Uuid::parse_str("22222222-3333-4444-5555-6666666666c4").unwrap();
+        let jwt = jwt_with_tenant(&returned, chrono::Utc::now().timestamp() + 60);
+
+        let err = mgr
+            .store_tenant_device_jwt_expecting(&expected, &jwt)
+            .expect_err("a cross-tenant mint must be refused");
+        let mismatch = err
+            .downcast_ref::<TenantMismatch>()
+            .expect("error must downcast to TenantMismatch");
+        assert_eq!(mismatch.expected, expected);
+        assert_eq!(mismatch.returned, Some(returned));
+
+        assert_eq!(mgr.get_tenant_device_jwt(&expected).unwrap(), None);
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&returned).unwrap(),
+            None,
+            "a refused mint is not quietly filed under the tenant it DID name"
+        );
+        assert!(mgr.get_access_token().is_err() || mgr.get_access_token().unwrap().is_empty());
+    }
+
+    /// No decodable claim → nothing to compare against, so it stores. This
+    /// guards a WRONG mint; it does not require every mint to carry a claim.
+    #[test]
+    fn store_tenant_device_jwt_expecting_stores_an_untenanted_token() {
+        let mgr = create_test_auth_manager("store_tenant_expecting_no_claim");
+        let t = Uuid::parse_str("11111111-2222-4333-8444-5555555555c5").unwrap();
+        let jwt = live_jwt("no-tenant-claim");
+
+        mgr.store_tenant_device_jwt_expecting(&t, &jwt).unwrap();
+
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&t).unwrap().as_deref(),
+            Some(jwt.as_str())
+        );
     }
 
     /// [`slot_jwt_is_usable`] itself, over the three unusable shapes and the
