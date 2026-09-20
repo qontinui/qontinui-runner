@@ -5151,9 +5151,55 @@ pub(crate) fn tenant_unresolvable_error() -> (u16, String) {
 /// | # | Signal | Behavior |
 /// |---|---|---|
 /// | 1 | binding pin `Pinned(t)` | select `t`'s slot — the multi-tenant discriminator |
+/// | 1a | `$QONTINUI_TENANT_ID` names `t` | select `t`'s slot — **only if admitted** (below) |
+/// | 1b | `<workspace>/.qontinui/config.yml` `tenant: t` | select `t`'s slot — **only if admitted** |
+/// | 1c | longest path prefix in `~/.qontinui/tenant-map.json` names `t` | select `t`'s slot — **only if admitted** |
 /// | 2 | request-time machine pin `Pinned(t)` | select `t`'s slot — resolved NOW, not at mint |
 /// | 3 | request-time machine pin `Unpinned` | the default slot (`device_bearer_for(None)`) — the legitimate single-tenant shape |
 /// | 4 | request-time machine pin `Unresolvable` | **only** refuses if the device JWT ALSO carries no `tenant_id` claim |
+///
+/// ## Rows 1a-1c: the session's tenant follows the WORKSPACE
+///
+/// Plan `2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin`
+/// D1, Phase 1. The machine pin (row 2) is machine-WIDE, so on a box that
+/// works in two tenants' repos it is wrong for every workspace but one, and
+/// the workaround in use has been repointing `machine.json` for the whole
+/// machine — which silently makes every OTHER workspace act as the wrong
+/// tenant. [`crate::session::workspace_tenant`] reads the three declarations;
+/// the first that says anything is the answer, and an ABSENT declaration at
+/// every tier contributes nothing and falls through to row 2 exactly as
+/// before.
+///
+/// **A declaration may only SELECT a binding this machine already holds.**
+/// Every declared tenant goes through [`spawn_tenant_admission`] — the SAME
+/// admission rule the spawn path uses (admitted set: "slots held ∪ the default
+/// binding"), lifted rather than re-written, because two copies of this rule
+/// is how the spawn path and the proxy path start disagreeing about the same
+/// question.
+///
+/// A declaration that fails admission, or that states a tenant we cannot
+/// parse, gets its OWN terminal decision
+/// ([`SessionTenantDecision::DeclaredTenantUnbound`] /
+/// [`SessionTenantDecision::DeclaredTenantUnusable`]) and refuses. **It must
+/// never be routed through [`crate::session::tenant_pin::TenantPin::Unresolvable`]**:
+/// row 4 falls back to the device JWT's own `tenant_id` claim — i.e. to the
+/// DEFAULT tenant — so reusing `Unresolvable` here would turn an unbound repo
+/// declaration into a silent cross-tenant write, which is the exact hole this
+/// tier exists to close.
+///
+/// **Why tier 1a does NOT beat row 1.** `$QONTINUI_TENANT_ID` reads like "an
+/// explicit override", and it overrides the machine pin — but not the
+/// session's own binding pin. A session whose nonce was minted `Pinned(t)` has
+/// a *credential* for `t` (see the paragraph above this table: the pin is the
+/// only thing that can tell two co-resident sessions apart). **An env var is
+/// not a credential.** Letting one re-point a session that was provisioned
+/// against another tenant's slot is precisely the "provenance is not a
+/// credential" defect from the other end.
+///
+/// Note that tiers 1b/1c need a workspace, which the session's binding
+/// supplies ([`workdir_for_nonce`]); a binding registered with no workdir
+/// genuinely has no workspace to ask, which is absence, not a fault. Tier 1a
+/// is process-scoped and applies either way.
 ///
 /// ## `Unresolvable` KEEPS its fail-closed fallback — deliberately
 ///
@@ -5178,24 +5224,37 @@ pub(crate) fn session_tenant_or_refuse(nonce: Option<&str>) -> Result<Option<Uui
     let binding_pin = nonce
         .map(proxy_session_pin_for_nonce)
         .unwrap_or(TenantPin::Unpinned);
+    // The workspace the session was provisioned into. `None` (a binding with
+    // no recorded workdir) is "no workspace to ask" — absence, not a fault.
+    let workdir = nonce.and_then(workdir_for_nonce);
     // THE Phase-1b read: the machine's tenant is sampled NOW, per request, not
     // recovered from whatever the binding froze at mint time.
     let live_pin = crate::session::tenant_pin::resolve_tenant_pin();
-    resolve_session_tenant(binding_pin, live_pin, device_jwt_claim_tenant)
+    resolve_session_tenant(
+        binding_pin,
+        || crate::session::workspace_tenant::read_workspace_declaration(workdir.as_deref()),
+        live_pin,
+        device_jwt_claim_tenant,
+        validate_spawn_tenant,
+    )
 }
 
 /// Pure-over-injected-parts core of [`session_tenant_or_refuse`], so the
 /// authority order is unit-testable without touching `$HOME`, the nonce
 /// registry, or the credential store.
 ///
-/// `jwt_claim_tenant` is called at most once, and only on the arm that needs
-/// it — it reads the credential store.
+/// `declaration`, `jwt_claim_tenant` and `admit` are each called at most once,
+/// and only on the arm that needs them — every one of them reads the
+/// filesystem (the workspace's files, the credential store, the slot store).
 pub(crate) fn resolve_session_tenant(
     binding_pin: crate::session::tenant_pin::TenantPin,
+    declaration: impl FnOnce() -> crate::session::workspace_tenant::WorkspaceDeclaration,
     live_pin: crate::session::tenant_pin::TenantPin,
     jwt_claim_tenant: impl FnOnce() -> Option<Uuid>,
+    admit: impl FnOnce(Uuid) -> Result<(), SpawnTenantRefusal>,
 ) -> Result<Option<Uuid>, (u16, String)> {
-    let decision = decide_session_tenant(binding_pin, live_pin, jwt_claim_tenant);
+    let decision =
+        decide_session_tenant(binding_pin, declaration, live_pin, jwt_claim_tenant, admit);
     match &decision {
         SessionTenantDecision::BindingPin {
             tenant,
@@ -5204,6 +5263,26 @@ pub(crate) fn resolve_session_tenant(
             "coord_mcp: session pinned to tenant {tenant} at mint time while this machine \
              now reads {live_pin:?} — honoring the session's own tenant (provenance \
              telemetry, not a credential-slot choice)"
+        ),
+        SessionTenantDecision::Declared { tenant, source } => tracing::debug!(
+            "coord_mcp: workspace declares tenant {tenant} via {source} — selecting that \
+             tenant's slot instead of this machine's pin ({live_pin:?})"
+        ),
+        SessionTenantDecision::DeclaredTenantUnbound {
+            tenant,
+            source,
+            refusal,
+        } => warn!(
+            "coord_mcp: REFUSING proxy request — {source} declares tenant {tenant}, which \
+             this runner may not act as ({}). A workspace may only SELECT a binding this \
+             machine already holds; refusing rather than falling back to the device's \
+             default tenant",
+            refusal.code()
+        ),
+        SessionTenantDecision::DeclaredTenantUnusable { source, detail } => warn!(
+            "coord_mcp: REFUSING proxy request — {source} states a tenant this runner \
+             cannot read ({detail}); refusing rather than ignoring a stated tenant, which \
+             would act as the device's default tenant"
         ),
         SessionTenantDecision::JwtClaim(t) => warn!(
             "coord_mcp: machine pin unresolvable; falling back to the \
@@ -5223,10 +5302,42 @@ pub(crate) fn resolve_session_tenant(
 /// apart from the logging so a READ-ONLY reporter (the session-info tenancy
 /// block, polled per zone) can ask the same question without emitting the
 /// proxy's per-request refusal warning on every poll.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// No longer `Copy`: rows 1a-1c carry the declaration's `source`, which names
+/// the file it matched on.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SessionTenantDecision {
     /// Row 1: the binding's own `Pinned` tenant.
     BindingPin { tenant: Uuid, live_differs: bool },
+    /// Rows 1a-1c: a workspace declaration named a tenant, and the admission
+    /// rule admitted it.
+    Declared {
+        tenant: Uuid,
+        source: crate::session::workspace_tenant::TenantDeclarationSource,
+    },
+    /// Rows 1a-1c, refused: a declaration named a tenant outside the admitted
+    /// set ("slots held ∪ the default binding"), or the credential store could
+    /// not be read so membership is UNKNOWN.
+    ///
+    /// **Terminal.** This must never be re-collapsed into
+    /// [`SessionTenantDecision::Unresolvable`], whose row 4 falls back to the
+    /// device JWT's own tenant claim — the default tenant. `refusal` is
+    /// carried whole so the refusal keeps the spawn path's stable code
+    /// (`terminal:tenant_not_paired` /
+    /// `terminal:tenant_credential_store_unreadable`) rather than flattening
+    /// two different heals into one.
+    DeclaredTenantUnbound {
+        tenant: Uuid,
+        source: crate::session::workspace_tenant::TenantDeclarationSource,
+        refusal: SpawnTenantRefusal,
+    },
+    /// Rows 1a-1c, refused: a declaration was PRESENT and could not be read as
+    /// a tenant. **Terminal**, for the same reason — and never `Unpinned`,
+    /// which would act as the device's default tenant.
+    DeclaredTenantUnusable {
+        source: crate::session::workspace_tenant::TenantDeclarationSource,
+        detail: String,
+    },
     /// Row 2: the machine's pin, read now.
     LivePin(Uuid),
     /// Row 3: the default slot.
@@ -5243,31 +5354,138 @@ impl SessionTenantDecision {
     pub(crate) fn into_result(self) -> Result<Option<Uuid>, (u16, String)> {
         match self {
             SessionTenantDecision::BindingPin { tenant, .. }
+            | SessionTenantDecision::Declared { tenant, .. }
             | SessionTenantDecision::LivePin(tenant)
             | SessionTenantDecision::JwtClaim(tenant) => Ok(Some(tenant)),
             SessionTenantDecision::DefaultSlot => Ok(None),
+            SessionTenantDecision::DeclaredTenantUnbound {
+                tenant,
+                source,
+                refusal,
+            } => Err(declared_tenant_unbound_error(tenant, &source, &refusal)),
+            SessionTenantDecision::DeclaredTenantUnusable { source, detail } => {
+                Err(declared_tenant_unusable_error(&source, &detail))
+            }
             SessionTenantDecision::Unresolvable => Err(tenant_unresolvable_error()),
         }
     }
 }
 
+/// The refusal for a workspace declaration naming a tenant this runner may not
+/// act as.
+///
+/// `403`, not the `503` of [`tenant_unresolvable_error`]: that one means "this
+/// machine cannot say who it is" (a broken box), while this one means "this
+/// workspace asked to be a tenant it is not allowed to be" — terminal, and an
+/// authorization answer rather than a health answer. Not `401`, which reads as
+/// a dead transport and sends the operator down `/coord-revive`.
+///
+/// The code and the heal are the spawn path's
+/// ([`SpawnTenantRefusal::code`], [`SPAWN_TENANT_PAIRING_HINT`]) so an agent
+/// reading a proxy refusal and an agent reading a spawn refusal learn the same
+/// thing and are sent to the same door.
+pub(crate) fn declared_tenant_unbound_error(
+    tenant: Uuid,
+    source: &crate::session::workspace_tenant::TenantDeclarationSource,
+    refusal: &SpawnTenantRefusal,
+) -> (u16, String) {
+    let code = refusal.code();
+    let body = match refusal {
+        SpawnTenantRefusal::CredentialStoreUnreadable { error, .. } => format!(
+            "{code}: {source} declares tenant {tenant}, and this runner's credential store \
+             could not be read ({error}), so whether it holds a credential for that tenant \
+             is UNKNOWN — refusing this session's coord requests rather than guessing. If \
+             the store is healthy and the tenant unpaired: {SPAWN_TENANT_PAIRING_HINT}"
+        ),
+        _ => format!(
+            "{code}: {source} declares tenant {tenant}, but this runner holds no coord \
+             credential for it — refusing this session's coord requests rather than falling \
+             back to the device's default tenant, which would write into the wrong tenant \
+             and report success. A workspace may only SELECT a binding this machine already \
+             holds. To fix: {SPAWN_TENANT_PAIRING_HINT}"
+        ),
+    };
+    (403, body)
+}
+
+/// The refusal for a declaration that is present and cannot be read as a
+/// tenant.
+///
+/// A new code in the SAME `terminal:tenant_*` family — there is no existing
+/// code for "the declaration itself is garbage", and a parallel vocabulary is
+/// what makes two refusals teach two different things about one machine.
+pub(crate) fn declared_tenant_unusable_error(
+    source: &crate::session::workspace_tenant::TenantDeclarationSource,
+    detail: &str,
+) -> (u16, String) {
+    (
+        403,
+        format!(
+            "terminal:tenant_declaration_unusable: {source} states a tenant this runner \
+             cannot read ({detail}) — refusing this session's coord requests rather than \
+             ignoring the statement, which would silently act as the device's default \
+             tenant. Correct the declaration to a tenant uuid this device is paired for, or \
+             remove it. If the tenant is right but unpaired: {SPAWN_TENANT_PAIRING_HINT}"
+        ),
+    )
+}
+
 /// The authority order itself, pure and silent. See [`resolve_session_tenant`].
 pub(crate) fn decide_session_tenant(
     binding_pin: crate::session::tenant_pin::TenantPin,
+    declaration: impl FnOnce() -> crate::session::workspace_tenant::WorkspaceDeclaration,
     live_pin: crate::session::tenant_pin::TenantPin,
     jwt_claim_tenant: impl FnOnce() -> Option<Uuid>,
+    admit: impl FnOnce(Uuid) -> Result<(), SpawnTenantRefusal>,
 ) -> SessionTenantDecision {
     use crate::session::tenant_pin::TenantPin;
+    use crate::session::workspace_tenant::WorkspaceDeclaration;
 
     // Row 1. The ONE authority the binding keeps: an explicitly pinned session
     // tenant. `machine.json` names a single active tenant, so on a
     // multi-tenant device it is the only thing that can tell two co-resident
     // sessions apart. It NAMES a tenant; it no longer selects a slot family.
+    //
+    // This sits ABOVE the workspace tiers on purpose, `$QONTINUI_TENANT_ID`
+    // included: a session minted `Pinned(t)` holds a CREDENTIAL for `t`, and
+    // an env var — or a repo file — is not a credential. Re-pointing such a
+    // session from the outside is "provenance is not a credential" inverted.
+    // Note the declaration closure is not even CALLED on this arm.
     if let TenantPin::Pinned(tenant) = binding_pin {
         return SessionTenantDecision::BindingPin {
             tenant,
             live_differs: live_pin != binding_pin,
         };
+    }
+
+    // Rows 1a-1c. What the WORKSPACE says. The first tier that states
+    // anything is the answer; absence at every tier contributes nothing and
+    // falls through to row 2 below exactly as before this block existed.
+    match declaration() {
+        WorkspaceDeclaration::Declared { tenant, source } => {
+            // A declaration SELECTS; it never grants. The admitted set is the
+            // spawn path's — `spawn_tenant_admission`, lifted, not rewritten.
+            return match admit(tenant) {
+                Ok(()) => SessionTenantDecision::Declared { tenant, source },
+                // TERMINAL. Deliberately NOT `TenantPin::Unresolvable`: row 4
+                // would fall through to the device JWT's own tenant claim,
+                // i.e. the default tenant, turning an unbound repo
+                // declaration into a silent cross-tenant write.
+                Err(refusal) => SessionTenantDecision::DeclaredTenantUnbound {
+                    tenant,
+                    source,
+                    refusal,
+                },
+            };
+        }
+        // Present but unreadable as a tenant. Also terminal, and for the same
+        // reason — ignoring a stated tenant acts as the DEFAULT tenant.
+        WorkspaceDeclaration::Unusable { source, detail } => {
+            return SessionTenantDecision::DeclaredTenantUnusable { source, detail };
+        }
+        // Absence is not a fault — the same field-absent-vs-value-malformed
+        // asymmetry `tenant_pin::pin_from_active_tenant_id` already encodes.
+        WorkspaceDeclaration::Absent => {}
     }
 
     // Rows 2-4. The binding carries no tenant — it is a restored nonce, an
@@ -5295,10 +5513,13 @@ pub(crate) fn session_tenant_decision(nonce: Option<&str>) -> SessionTenantDecis
     let binding_pin = nonce
         .map(proxy_session_pin_for_nonce)
         .unwrap_or(TenantPin::Unpinned);
+    let workdir = nonce.and_then(workdir_for_nonce);
     decide_session_tenant(
         binding_pin,
+        || crate::session::workspace_tenant::read_workspace_declaration(workdir.as_deref()),
         crate::session::tenant_pin::resolve_tenant_pin(),
         device_jwt_claim_tenant,
+        validate_spawn_tenant,
     )
 }
 
@@ -5346,7 +5567,10 @@ pub(crate) async fn session_bearer_and_tenant_or_refuse(
 #[cfg(test)]
 mod session_tenant_resolution_tests {
     use super::*;
+    use crate::auth::BindingTenantRead;
     use crate::session::tenant_pin::TenantPin;
+    use crate::session::workspace_tenant::{TenantDeclarationSource, WorkspaceDeclaration};
+    use std::cell::Cell;
 
     fn tenant(n: u8) -> Uuid {
         Uuid::from_bytes([n; 16])
@@ -5358,6 +5582,44 @@ mod session_tenant_resolution_tests {
         None
     }
 
+    /// The pre-Phase-1 shape: no workspace declaration at any tier, and an
+    /// admission rule nothing reaches. Every test written before rows 1a-1c
+    /// existed goes through this, so "absent declaration ⇒ the authority order
+    /// is exactly what it was" is asserted by the whole legacy suite, not by
+    /// one new case.
+    fn resolve(
+        binding_pin: TenantPin,
+        live_pin: TenantPin,
+        jwt_claim_tenant: impl FnOnce() -> Option<Uuid>,
+    ) -> Result<Option<Uuid>, (u16, String)> {
+        resolve_session_tenant(
+            binding_pin,
+            || WorkspaceDeclaration::Absent,
+            live_pin,
+            jwt_claim_tenant,
+            |t| panic!("an absent declaration must never reach admission (asked for {t})"),
+        )
+    }
+
+    /// Tier 3's source, for the declarations the decision-order tests inject.
+    fn map_source(prefix: &str) -> TenantDeclarationSource {
+        TenantDeclarationSource::TenantMap {
+            path: std::path::PathBuf::from("C:/home/.qontinui/tenant-map.json"),
+            prefix: Some(prefix.to_string()),
+        }
+    }
+
+    /// THE admission rule, not a stand-in: `spawn_tenant_admission` is the
+    /// function the SPAWN path uses, called here over injected inputs so the
+    /// proxy path is provably gated by the same rule — the whole point of
+    /// lifting it rather than writing a second one.
+    fn admits(
+        held: Vec<Uuid>,
+        default_binding: BindingTenantRead,
+    ) -> impl FnOnce(Uuid) -> Result<(), SpawnTenantRefusal> {
+        move |t| spawn_tenant_admission(t, Ok(held), default_binding)
+    }
+
     /// A `Pinned` binding NAMES the session's own tenant, and keeps naming it
     /// even when the machine has since moved its active tenant elsewhere. This
     /// is the one authority the pin retains: `machine.json` records a single
@@ -5367,7 +5629,7 @@ mod session_tenant_resolution_tests {
         let a = tenant(0xA1);
         let b = tenant(0xB2);
         assert_eq!(
-            resolve_session_tenant(TenantPin::Pinned(a), TenantPin::Pinned(b), no_claim),
+            resolve(TenantPin::Pinned(a), TenantPin::Pinned(b), no_claim),
             Ok(Some(a))
         );
     }
@@ -5381,7 +5643,7 @@ mod session_tenant_resolution_tests {
     fn a_tenantless_binding_resolves_at_request_time() {
         let t = tenant(0xC3);
         assert_eq!(
-            resolve_session_tenant(TenantPin::Unpinned, TenantPin::Pinned(t), no_claim),
+            resolve(TenantPin::Unpinned, TenantPin::Pinned(t), no_claim),
             Ok(Some(t)),
             "a restored/adopted nonce must resolve the machine's CURRENT tenant, \
              not fall back to the default slot because of how it was created"
@@ -5400,8 +5662,8 @@ mod session_tenant_resolution_tests {
         let a = tenant(0xD4);
         let b = tenant(0xE5);
 
-        let pinned = resolve_session_tenant(TenantPin::Pinned(a), TenantPin::Pinned(a), no_claim);
-        let unpinned = resolve_session_tenant(TenantPin::Unpinned, TenantPin::Pinned(a), no_claim);
+        let pinned = resolve(TenantPin::Pinned(a), TenantPin::Pinned(a), no_claim);
+        let unpinned = resolve(TenantPin::Unpinned, TenantPin::Pinned(a), no_claim);
         assert_eq!(
             pinned, unpinned,
             "a Pinned and an Unpinned binding for the same tenant must resolve the \
@@ -5409,7 +5671,7 @@ mod session_tenant_resolution_tests {
         );
         assert_eq!(pinned, Ok(Some(a)));
 
-        let other = resolve_session_tenant(TenantPin::Pinned(b), TenantPin::Pinned(a), no_claim);
+        let other = resolve(TenantPin::Pinned(b), TenantPin::Pinned(a), no_claim);
         assert_ne!(
             pinned, other,
             "two bindings for different tenants must resolve different credentials"
@@ -5428,7 +5690,7 @@ mod session_tenant_resolution_tests {
             Some(tenant(0xFF))
         };
         assert_eq!(
-            resolve_session_tenant(TenantPin::Unpinned, TenantPin::Unpinned, claim),
+            resolve(TenantPin::Unpinned, TenantPin::Unpinned, claim),
             Ok(None)
         );
         assert!(
@@ -5444,11 +5706,11 @@ mod session_tenant_resolution_tests {
     fn unresolvable_falls_back_to_the_device_jwt_claim() {
         let t = tenant(0x11);
         assert_eq!(
-            resolve_session_tenant(TenantPin::Unpinned, TenantPin::Unresolvable, || Some(t)),
+            resolve(TenantPin::Unpinned, TenantPin::Unresolvable, || Some(t)),
             Ok(Some(t))
         );
         assert_eq!(
-            resolve_session_tenant(TenantPin::Unresolvable, TenantPin::Unresolvable, || Some(t)),
+            resolve(TenantPin::Unresolvable, TenantPin::Unresolvable, || Some(t)),
             Ok(Some(t))
         );
     }
@@ -5456,7 +5718,7 @@ mod session_tenant_resolution_tests {
     /// …and when BOTH routes miss, it refuses — typed, not a bare 401.
     #[test]
     fn unresolvable_with_no_claim_refuses() {
-        let got = resolve_session_tenant(TenantPin::Unpinned, TenantPin::Unresolvable, no_claim);
+        let got = resolve(TenantPin::Unpinned, TenantPin::Unresolvable, no_claim);
         match got {
             Err((status, body)) => {
                 assert_eq!(status, 503);
@@ -5476,7 +5738,7 @@ mod session_tenant_resolution_tests {
     #[test]
     fn unresolvable_is_never_demoted_to_unpinned() {
         assert_ne!(
-            resolve_session_tenant(TenantPin::Unpinned, TenantPin::Unresolvable, no_claim),
+            resolve(TenantPin::Unpinned, TenantPin::Unresolvable, no_claim),
             Ok(None),
             "an unresolvable machine must never silently select the default slot"
         );
@@ -5488,8 +5750,374 @@ mod session_tenant_resolution_tests {
     fn a_repaired_machine_is_not_held_to_a_stale_unresolvable_binding() {
         let t = tenant(0x22);
         assert_eq!(
-            resolve_session_tenant(TenantPin::Unresolvable, TenantPin::Pinned(t), no_claim),
+            resolve(TenantPin::Unresolvable, TenantPin::Pinned(t), no_claim),
             Ok(Some(t))
+        );
+    }
+
+    // ================================================================
+    // Phase 1 (plan 2026-09-20-per-tenant-coord-credentials-and-a-
+    // workspace-tenant-pin, D1): rows 1a-1c — the session's tenant
+    // follows the WORKSPACE.
+    //
+    // Still hermetic: the declaration, the machine pin, the JWT claim and
+    // the admitted set are all injected, so nothing here reads `$HOME`,
+    // the credential store, or any workspace on this box.
+    // ================================================================
+
+    /// Tier 1. `$QONTINUI_TENANT_ID` — the spelling the fleet already uses —
+    /// beats the machine pin, and its parse rule is the shared one.
+    #[test]
+    fn the_env_override_resolves_over_the_machine_pin() {
+        let declared = tenant(0x31);
+        let machine = tenant(0x32);
+        assert_eq!(
+            resolve_session_tenant(
+                TenantPin::Unpinned,
+                || crate::session::workspace_tenant::classify_env(Some(&declared.to_string())),
+                TenantPin::Pinned(machine),
+                no_claim,
+                admits(vec![declared], BindingTenantRead::Bound(machine)),
+            ),
+            Ok(Some(declared)),
+            "a declared, admitted tenant must beat the machine-wide pin"
+        );
+    }
+
+    /// Tier 2. Only the `tenant:` key of `.qontinui/config.yml` is read, and a
+    /// declared tenant this device holds a slot for resolves.
+    #[test]
+    fn a_config_yml_tenant_key_resolves() {
+        let declared = tenant(0x33);
+        let path = std::path::PathBuf::from("D:/portofino-pizzeria/mobile/.qontinui/config.yml");
+        let yml = format!("version: 2\nmerge:\n  policy: squash\ntenant: \"{declared}\"\n");
+        assert_eq!(
+            resolve_session_tenant(
+                TenantPin::Unpinned,
+                || crate::session::workspace_tenant::classify_config_yml(
+                    &path,
+                    Some(yml.as_bytes())
+                ),
+                TenantPin::Pinned(tenant(0x34)),
+                no_claim,
+                admits(vec![declared], BindingTenantRead::Unbound),
+            ),
+            Ok(Some(declared))
+        );
+    }
+
+    /// Tier 3. `~/.qontinui/tenant-map.json` resolves by LONGEST matching path
+    /// prefix, so a map may name a root and a repo inside it and the inner
+    /// statement wins.
+    #[test]
+    fn the_path_map_resolves_by_longest_prefix() {
+        let outer = tenant(0x35);
+        let inner = tenant(0x36);
+        let path = std::path::PathBuf::from("C:/home/.qontinui/tenant-map.json");
+        let json = format!(
+            "{{\"version\":1,\"entries\":[\
+               {{\"path\":\"D:/\",\"tenant\":\"{outer}\"}},\
+               {{\"path\":\"D:/portofino-pizzeria\",\"tenant\":\"{inner}\"}}]}}"
+        );
+        assert_eq!(
+            resolve_session_tenant(
+                TenantPin::Unpinned,
+                || crate::session::workspace_tenant::classify_tenant_map(
+                    &path,
+                    "D:/portofino-pizzeria/mobile",
+                    Some(json.as_bytes())
+                ),
+                TenantPin::Unpinned,
+                no_claim,
+                admits(vec![inner, outer], BindingTenantRead::Unbound),
+            ),
+            Ok(Some(inner)),
+            "the more specific prefix must decide, not the enclosing one"
+        );
+    }
+
+    /// **THE security test of Phase 1.**
+    ///
+    /// A declaration naming a tenant outside the admitted set ("slots held ∪
+    /// the default binding") refuses — and specifically does **not** reach
+    /// row 4's device-JWT-claim arm, which would hand it the DEFAULT tenant.
+    /// That is the silent cross-tenant fallback the plan's vet found; routing
+    /// these arms through `TenantPin::Unresolvable` would reintroduce it.
+    ///
+    /// The shape mirrors this box: the Portofino tenant is present in
+    /// `paired_user.json` `bindings[]` but is neither the default binding nor
+    /// a tenant holding a slot, so it is NOT admitted.
+    #[test]
+    fn an_unbound_declaration_refuses_and_never_reaches_the_jwt_claim_arm() {
+        let declared = tenant(0x37); // "Portofino": bound, but no slot, not default
+        let default_tenant = tenant(0x38); // what the device JWT would claim
+        let claim_called = Cell::new(false);
+        let claim = || {
+            claim_called.set(true);
+            Some(default_tenant)
+        };
+
+        let decision = decide_session_tenant(
+            TenantPin::Unpinned,
+            || WorkspaceDeclaration::Declared {
+                tenant: declared,
+                source: map_source("D:/portofino-pizzeria"),
+            },
+            // Even the arm that WOULD consult the claim: an unresolvable
+            // machine pin. The declaration is terminal before it is reached.
+            TenantPin::Unresolvable,
+            claim,
+            admits(
+                vec![default_tenant],
+                BindingTenantRead::Bound(default_tenant),
+            ),
+        );
+
+        match &decision {
+            SessionTenantDecision::DeclaredTenantUnbound {
+                tenant,
+                refusal,
+                source,
+            } => {
+                assert_eq!(*tenant, declared);
+                assert_eq!(*refusal, SpawnTenantRefusal::NotPaired { tenant: declared });
+                assert_eq!(*source, map_source("D:/portofino-pizzeria"));
+            }
+            other => panic!("expected DeclaredTenantUnbound, got {other:?}"),
+        }
+
+        assert!(
+            !claim_called.get(),
+            "an unbound declaration must NEVER fall through to the device JWT's own \
+             tenant claim — that claim is the DEFAULT tenant, and reaching it is the \
+             silent cross-tenant fallback this decision exists to prevent"
+        );
+
+        match decision.into_result() {
+            Err((status, body)) => {
+                assert_eq!(status, 403);
+                assert!(
+                    body.contains("terminal:tenant_not_paired"),
+                    "the refusal must carry the spawn path's stable code: {body}"
+                );
+                assert!(
+                    body.contains(SPAWN_TENANT_PAIRING_HINT),
+                    "the refusal must name the heal: {body}"
+                );
+                assert!(
+                    body.contains(&declared.to_string()),
+                    "the refusal must name the tenant the door is for: {body}"
+                );
+                assert!(
+                    body.contains("D:/portofino-pizzeria"),
+                    "the refusal must name the door the declaration came through: {body}"
+                );
+                assert!(
+                    !body.contains(&default_tenant.to_string()),
+                    "a refusal must not resolve to, or even mention selecting, the \
+                     default tenant: {body}"
+                );
+            }
+            other => panic!("an unbound declaration must refuse, got {other:?}"),
+        }
+    }
+
+    /// The UNKNOWN arm of the same rule: an unreadable credential store does
+    /// not establish that the tenant is unpaired, so it refuses with the OTHER
+    /// spawn-path code (the heal differs — an operator sent to pair a tenant
+    /// that is already paired would be sent wrong).
+    #[test]
+    fn an_unreadable_credential_store_refuses_the_declaration_rather_than_guessing() {
+        let declared = tenant(0x39);
+        let decision = decide_session_tenant(
+            TenantPin::Unpinned,
+            || WorkspaceDeclaration::Declared {
+                tenant: declared,
+                source: TenantDeclarationSource::Env,
+            },
+            TenantPin::Unresolvable,
+            || panic!("must not reach the JWT-claim arm"),
+            |t| {
+                spawn_tenant_admission(
+                    t,
+                    Err("slot store undecryptable".to_string()),
+                    BindingTenantRead::Unknown,
+                )
+            },
+        );
+        match decision.into_result() {
+            Err((status, body)) => {
+                assert_eq!(status, 403);
+                assert!(
+                    body.contains("terminal:tenant_credential_store_unreadable"),
+                    "{body}"
+                );
+                assert!(body.contains(SPAWN_TENANT_PAIRING_HINT), "{body}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// A malformed declaration is `DeclaredTenantUnusable` and refuses. It is
+    /// **not** silently dropped: ignoring a stated tenant would act as the
+    /// device's default tenant, which is the same hole from the other end.
+    #[test]
+    fn a_malformed_declaration_refuses_and_is_never_silently_dropped() {
+        let machine = tenant(0x3A);
+        let decision = decide_session_tenant(
+            TenantPin::Unpinned,
+            || crate::session::workspace_tenant::classify_env(Some("portofino")),
+            TenantPin::Pinned(machine),
+            || panic!("must not reach the JWT-claim arm"),
+            |t| panic!("an unusable declaration names no tenant to admit (asked for {t})"),
+        );
+        match &decision {
+            SessionTenantDecision::DeclaredTenantUnusable { source, detail } => {
+                assert_eq!(*source, TenantDeclarationSource::Env);
+                assert!(detail.contains("portofino"), "{detail}");
+            }
+            other => panic!("expected DeclaredTenantUnusable, got {other:?}"),
+        }
+        match decision.into_result() {
+            Err((status, body)) => {
+                assert_eq!(status, 403);
+                assert!(
+                    body.contains("terminal:tenant_declaration_unusable"),
+                    "{body}"
+                );
+                assert!(body.contains("QONTINUI_TENANT_ID"), "{body}");
+                assert!(body.contains(SPAWN_TENANT_PAIRING_HINT), "{body}");
+                assert!(
+                    !body.contains(&machine.to_string()),
+                    "a refused declaration must not resolve the machine pin instead: {body}"
+                );
+            }
+            other => panic!("an unusable declaration must refuse, got {other:?}"),
+        }
+    }
+
+    /// THE robustness rule for tier 2. `.qontinui/config.yml` is
+    /// qontinui-web's PR-MERGE-POLICY file; a broken merge-policy file must
+    /// not take a session's credential down. Unparseable YAML is `Absent`, so
+    /// the machine pin still decides — a refusal here would be an outage on
+    /// every repo with a typo in an unrelated file.
+    #[test]
+    fn an_unparseable_config_yml_is_unpinned_not_a_refusal() {
+        let machine = tenant(0x3B);
+        let path = std::path::PathBuf::from("D:/repo/.qontinui/config.yml");
+        // An unclosed flow sequence hitting EOF: unambiguously a YAML parse
+        // error, and one that names `tenant:` — so a pass here cannot be the
+        // weaker "it parsed, there was just no tenant key".
+        const BROKEN: &[u8] = b"tenant: [unclosed-flow-sequence\n";
+        assert_eq!(
+            crate::session::workspace_tenant::classify_config_yml(&path, Some(BROKEN)),
+            WorkspaceDeclaration::Absent
+        );
+        assert_eq!(
+            resolve_session_tenant(
+                TenantPin::Unpinned,
+                || crate::session::workspace_tenant::classify_config_yml(&path, Some(BROKEN)),
+                TenantPin::Pinned(machine),
+                no_claim,
+                |t| panic!("a broken merge-policy file declares nothing to admit ({t})"),
+            ),
+            Ok(Some(machine)),
+            "a config.yml that is not YAML must not refuse, and must not be a tenant \
+             statement either"
+        );
+    }
+
+    /// Absence at every tier contributes nothing: the machine pin still
+    /// decides, and an `Unpinned` machine still keeps the default slot. This
+    /// is rows 2 and 3, unchanged, with the new block wired in.
+    #[test]
+    fn an_absent_declaration_falls_through_to_the_machine_pin_and_to_the_default_slot() {
+        let machine = tenant(0x3C);
+        assert_eq!(
+            resolve_session_tenant(
+                TenantPin::Unpinned,
+                || WorkspaceDeclaration::Absent,
+                TenantPin::Pinned(machine),
+                no_claim,
+                |t| panic!("absence must never reach admission ({t})"),
+            ),
+            Ok(Some(machine))
+        );
+        assert_eq!(
+            resolve_session_tenant(
+                TenantPin::Unpinned,
+                || WorkspaceDeclaration::Absent,
+                TenantPin::Unpinned,
+                no_claim,
+                |t| panic!("absence must never reach admission ({t})"),
+            ),
+            Ok(None),
+            "absence is not a fault — the default slot is still the legitimate \
+             single-tenant shape"
+        );
+    }
+
+    /// Row 4 is UNCHANGED by Phase 1: with no declaration, an `Unresolvable`
+    /// machine still reaches the device JWT's claim, and still refuses only
+    /// when that also misses.
+    #[test]
+    fn row_four_is_unchanged_when_no_declaration_is_present() {
+        let t = tenant(0x3D);
+        assert_eq!(
+            resolve_session_tenant(
+                TenantPin::Unpinned,
+                || WorkspaceDeclaration::Absent,
+                TenantPin::Unresolvable,
+                || Some(t),
+                |t| panic!("absence must never reach admission ({t})"),
+            ),
+            Ok(Some(t))
+        );
+        match resolve_session_tenant(
+            TenantPin::Unpinned,
+            || WorkspaceDeclaration::Absent,
+            TenantPin::Unresolvable,
+            no_claim,
+            |t| panic!("absence must never reach admission ({t})"),
+        ) {
+            Err((status, body)) => {
+                assert_eq!(status, 503);
+                assert!(
+                    body.contains("COORD_MCP_PROXY_TENANT_UNRESOLVABLE"),
+                    "{body}"
+                );
+            }
+            other => panic!("expected the unchanged row-4 refusal, got {other:?}"),
+        }
+    }
+
+    /// The session's frozen binding pin outranks ALL of it, the env override
+    /// included. A session minted `Pinned(t)` holds a CREDENTIAL for `t`; an
+    /// env var is not a credential. The declaration closure is not even
+    /// called.
+    #[test]
+    fn the_frozen_binding_pin_outranks_every_workspace_tier_including_the_env() {
+        let session = tenant(0x3E);
+        let declared = tenant(0x3F);
+        let read = Cell::new(false);
+        assert_eq!(
+            resolve_session_tenant(
+                TenantPin::Pinned(session),
+                || {
+                    read.set(true);
+                    crate::session::workspace_tenant::classify_env(Some(&declared.to_string()))
+                },
+                TenantPin::Pinned(declared),
+                no_claim,
+                admits(vec![session, declared], BindingTenantRead::Bound(declared)),
+            ),
+            Ok(Some(session)),
+            "$QONTINUI_TENANT_ID must not re-point a session that was provisioned \
+             against another tenant's slot"
+        );
+        assert!(
+            !read.get(),
+            "row 1 must not even READ the workspace declaration — it is terminal"
         );
     }
 }
@@ -9267,7 +9895,15 @@ pub(crate) fn validate_spawn_tenant(tenant: Uuid) -> Result<(), SpawnTenantRefus
 /// establishes nothing, so either one refuses as
 /// [`SpawnTenantRefusal::CredentialStoreUnreadable`] — the heal differs, and an
 /// operator sent to pair a tenant that is already paired would be sent wrong.
-fn spawn_tenant_admission(
+///
+/// **This now has a SECOND caller**, and that is the point. Plan
+/// `2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin` D1
+/// admits rows 1a-1c of [`decide_session_tenant`]'s authority order through
+/// this same function rather than re-deriving "may this runner act as that
+/// tenant?" on the proxy path. A change to the admitted set therefore moves
+/// two behaviours at once; the alternative is two rules that drift, which is
+/// strictly worse for a rule whose failure mode is a cross-tenant write.
+pub(crate) fn spawn_tenant_admission(
     tenant: Uuid,
     held: Result<Vec<Uuid>, String>,
     default_binding: crate::auth::BindingTenantRead,
