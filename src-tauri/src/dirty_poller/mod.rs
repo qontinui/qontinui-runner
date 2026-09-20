@@ -130,7 +130,8 @@ impl DirtyPollerState {
         coord_http_base: String,
         machine_id: uuid::Uuid,
     ) -> Option<Self> {
-        let token = agent_token::from_allocate_result(allocate)?;
+        let token =
+            agent_token::from_token_parts(&allocate.token, allocate.token_jti, allocate.token_exp)?;
         Self::with_shared_token(allocate, coord_http_base, machine_id, token)
     }
 

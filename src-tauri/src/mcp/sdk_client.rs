@@ -89,6 +89,52 @@ impl SdkConnectionManager {
     }
 }
 
+/// Serve `exploration`'s transport off the shared connection manager.
+///
+/// Implemented on the `Mutex` rather than the manager because the lock
+/// is held for the whole round trip, exactly as the exploration engine's
+/// own helper used to hold it.
+#[async_trait::async_trait]
+impl crate::exploration::SdkTransport for tokio::sync::Mutex<SdkConnectionManager> {
+    async fn sdk_request(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, String> {
+        let conn_guard = self.lock().await;
+        let conn = conn_guard
+            .active_connection()
+            .ok_or_else(|| "No active SDK app connection".to_string())?;
+
+        let url = format!("{}{}{}", conn.app_url, conn.base_path, path);
+        let mut request = conn.client.request(method, &url);
+
+        if let Some(body) = body {
+            request = request
+                .header("Content-Type", "application/json")
+                .json(&body);
+        }
+
+        let resp = request
+            .send()
+            .await
+            .map_err(|e| format!("SDK request failed: {}", e))?;
+
+        let status = resp.status();
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse SDK response: {}", e))?;
+
+        if !status.is_success() {
+            return Err(format!("SDK app returned HTTP {}", status));
+        }
+
+        Ok(json)
+    }
+}
+
 /// Request body for connecting to an SDK app
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

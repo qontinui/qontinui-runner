@@ -636,7 +636,7 @@ pub async fn ui_bridge_run_exploration_native(
         *cancel_guard = Some(engine.cancel_token());
     }
 
-    let result = engine.explore(&sdk_conn, config).await;
+    let result = engine.explore(sdk_conn.as_ref(), config).await;
 
     // Clear cancel token
     {

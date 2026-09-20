@@ -2592,7 +2592,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::discoveries::get_discovery_sync_status,
             commands::discoveries::get_pending_discoveries_cmd,
             commands::discoveries::sync_discoveries,
-            doctor::commands::doctor_get_status,
+            commands::doctor::doctor_get_status,
             doctor::commands::stop_process_by_pid,
             commands::durable_execution::get_iteration_commits,
             commands::durable_execution::get_iteration_diffs,

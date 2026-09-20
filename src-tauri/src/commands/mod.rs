@@ -185,6 +185,7 @@ pub mod deconflict; // resolve_escalation — the deconflict advisory banner's d
 pub mod dev_findings; // Dev-only: seed synthetic findings into the frontend tracker
 pub mod devenv_enroll; // Phase 2 — in-app devenv enrollment (no terminal); wraps env_agent::enroll
 pub mod discoveries;
+pub mod doctor; // Doctor health-status command (needs AppState, which lives here)
 pub mod durable_execution; // Conductor-inspired replay, rollback, iteration diffs
 pub mod event_search; // Unified full-text search across activity_timeline, observations, deferred_questions, error_events
 pub mod execution;

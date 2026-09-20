@@ -2131,7 +2131,7 @@ pub async fn run_prompt(
     // Use the prompt name (concise) rather than full prompt content (noisy) for search.
     let memory_query = prompt_name.as_str();
     if !memory_query.is_empty() {
-        if let Some(memory_section) = context::format_observation_memory_for_prompt(
+        if let Some(memory_section) = crate::mcp::contexts::format_observation_memory_for_prompt(
             &state.app_state.pg_db,
             None,
             Some(memory_query),
