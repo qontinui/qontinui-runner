@@ -29,6 +29,7 @@ import {
   describeEvaluateBudget,
   evaluateTimeoutMessage,
   PAGE_EVALUATE_MIN_TIMEOUT_MS,
+  DOCUMENT_NONCE,
   pongEventPayload,
   pongUrl,
 } from "./utils";
@@ -866,12 +867,12 @@ describe("toFindRequest - one filter seam for both discover and find", () => {
 // pop-out can no longer mask a crashed main renderer (plan
 // 2026-09-19-runner-render-process-crash-recovery-is-a-no-op-and-popout-pongs-mask-it).
 describe("pong window labels", () => {
-  it("pongUrl carries both the provenance and the sender's label", () => {
+  it("pongUrl carries the provenance, the sender's label and its document nonce", () => {
     expect(pongUrl(9876, "event", "main")).toBe(
-      "http://localhost:9876/ui-bridge/pong?source=event&label=main",
+      `http://localhost:9876/ui-bridge/pong?source=event&label=main&doc=${encodeURIComponent(DOCUMENT_NONCE)}`,
     );
     expect(pongUrl("9877", "safety-net", "terminal-abc")).toBe(
-      "http://localhost:9877/ui-bridge/pong?source=safety-net&label=terminal-abc",
+      `http://localhost:9877/ui-bridge/pong?source=safety-net&label=terminal-abc&doc=${encodeURIComponent(DOCUMENT_NONCE)}`,
     );
   });
 
@@ -879,6 +880,7 @@ describe("pong window labels", () => {
     const url = new URL(pongUrl(9876, "event", "a&label=main"));
     expect(url.searchParams.getAll("label")).toEqual(["a&label=main"]);
     expect(url.searchParams.get("source")).toBe("event");
+    expect(url.searchParams.getAll("doc")).toEqual([DOCUMENT_NONCE]);
   });
 
   it("pongEventPayload carries the sender's label beside the timestamp", () => {
@@ -886,5 +888,26 @@ describe("pong window labels", () => {
     const payload = pongEventPayload("terminal-1");
     expect(payload.label).toBe("terminal-1");
     expect(payload.timestamp).toBeGreaterThanOrEqual(before);
+  });
+});
+
+// The nonce is what tells a post-reload pong apart from the pre-reload
+// document's — a reload only replaces the document, and the old one keeps
+// ponging on the same window label until it does.
+describe("document nonce", () => {
+  it("is a non-empty string, minted once per bundle load", () => {
+    expect(typeof DOCUMENT_NONCE).toBe("string");
+    expect(DOCUMENT_NONCE.length).toBeGreaterThan(8);
+    // Stable within a document: two pongs from one page must NOT look like
+    // two different documents, or every rung would verify itself.
+    expect(pongEventPayload("main").doc).toBe(DOCUMENT_NONCE);
+    expect(pongEventPayload("main").doc).toBe(pongEventPayload("terminal-1").doc);
+  });
+
+  it("rides every pong, on both the HTTP and the Tauri leg", () => {
+    expect(new URL(pongUrl(9876, "safety-net", "main")).searchParams.get("doc")).toBe(
+      DOCUMENT_NONCE,
+    );
+    expect(pongEventPayload("main").doc).toBe(DOCUMENT_NONCE);
   });
 });

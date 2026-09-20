@@ -444,10 +444,77 @@ pub fn is_main_window_pong(label: Option<&str>, main_label: &str) -> bool {
     label == Some(main_label)
 }
 
+/// The document nonce the MAIN window's most recent identified pong carried,
+/// or `None` if no main-window pong has ever carried one in this process.
+///
+/// # Why a window label is not enough
+///
+/// A reload REPLACES the document behind one window label, and
+/// `ICoreWebView2::Reload()` only *accepts* the navigation — the pre-reload
+/// document keeps answering pings, and keeps sending its unconditional 3 s
+/// safety-net pong, until the new one takes over. So "a pong on the main label,
+/// stamped after the reload was dispatched" is satisfied by the very page the
+/// reload was supposed to replace. The frontend mints one nonce per bundle load
+/// (`src/hooks/ui-bridge-events/utils.ts` `DOCUMENT_NONCE`), which is one per
+/// document, and every pong carries it; a rung is credited only when the nonce
+/// CHANGED (see [`document_identity_changed`]).
+///
+/// Only a MAIN-window pong carrying a nonce writes this — a pop-out has its own
+/// document and its own nonce, and an unlabeled or nonce-less pong leaves the
+/// last known value alone rather than erasing it.
+static MAIN_DOCUMENT_NONCE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The main window's current document nonce. `None` = no main-window pong has
+/// ever identified its document — UNKNOWN, never "a new document".
+pub fn main_document_nonce() -> Option<String> {
+    MAIN_DOCUMENT_NONCE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Does the main window's document nonce prove a DIFFERENT document is ponging
+/// now than the one that was ponging when a recovery rung was dispatched?
+///
+/// Pure, and deliberately fail-closed on every absence — "an absent nonce is
+/// not evidence of a new document":
+///
+/// * `(Some(before), Some(after))` → the honest comparison. Equal means the
+///   page that answered is the same one the rung was meant to replace, which is
+///   exactly the false credit this check exists to refuse.
+/// * `(None, _)` → nothing was ponging an identified document before the rung,
+///   so there is no predecessor whose pong could be miscredited and the
+///   strictly-after timestamp is sound evidence on its own. This is also what
+///   keeps the check from WEAKENING the recreate rung on a runner whose main
+///   window never came up at all.
+/// * `(Some(_), None)` → an identity vanished. Unreachable while this store
+///   only ever moves forward to `Some`, and refused rather than assumed.
+pub fn document_identity_changed(at_rung: Option<&str>, now: Option<&str>) -> bool {
+    match (at_rung, now) {
+        (Some(before), Some(after)) => before != after,
+        (None, _) => true,
+        (Some(_), None) => false,
+    }
+}
+
+fn record_main_document_nonce(document: Option<&str>) {
+    let Some(document) = document.filter(|d| !d.is_empty()) else {
+        return;
+    };
+    let mut slot = MAIN_DOCUMENT_NONCE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if slot.as_deref() != Some(document) {
+        *slot = Some(document.to_string());
+    }
+}
+
 /// Ingest one liveness pong (or IPC response) from the window `label`.
 ///
 /// * stamps `last_pong` (`AppState::ui_bridge_last_pong`) **only** when the
 ///   label is the main window's;
+/// * records `document` as the main window's current document nonce, again
+///   only for a main-labeled pong ([`MAIN_DOCUMENT_NONCE`]);
 /// * stamps the process-wide event-loop clock ([`record_event_pong`]) when
 ///   `event_provenance` is set, whatever window sent it;
 /// * records the pong in the per-window diagnostic map.
@@ -463,11 +530,13 @@ pub fn is_main_window_pong(label: Option<&str>, main_label: &str) -> bool {
 pub fn ingest_window_pong(
     last_pong: &std::sync::atomic::AtomicU64,
     label: Option<&str>,
+    document: Option<&str>,
     event_provenance: bool,
 ) -> bool {
     ingest_window_pong_at(
         last_pong,
         label,
+        document,
         event_provenance,
         qontinui_runner_lib::get_main_window_label(),
         now_ms_epoch(),
@@ -479,12 +548,18 @@ pub fn ingest_window_pong(
 pub fn ingest_window_pong_at(
     last_pong: &std::sync::atomic::AtomicU64,
     label: Option<&str>,
+    document: Option<&str>,
     event_provenance: bool,
     main_label: &str,
     now_ms: u64,
 ) -> bool {
     let is_main = is_main_window_pong(label, main_label);
     if is_main {
+        // The nonce is published BEFORE the stamp, so a watcher that reads the
+        // stamp first (`webview_recovery::watch_for_main_pong`) and the nonce
+        // second can never see a fresh pong paired with the identity of the
+        // document that preceded it.
+        record_main_document_nonce(document);
         last_pong.store(now_ms, std::sync::atomic::Ordering::Relaxed);
     }
     if event_provenance {
@@ -525,20 +600,47 @@ fn insert_bounded(
     }
 }
 
-/// The sender's window label from a Tauri `ui-bridge-pong` event payload
-/// (`{ timestamp, label }`).
+/// Who sent a Tauri `ui-bridge-pong`, parsed out of its payload
+/// (`{ timestamp, label, doc }`).
+///
+/// Both halves are `Option` because both are absent from a payload this
+/// process did not write — and both absences read the same way: not evidence.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PongEventSender {
+    /// The sending window's Tauri label. `None` ⇒ not main-window evidence.
+    pub label: Option<String>,
+    /// The sending document's nonce. `None` ⇒ the document is unidentified,
+    /// which [`document_identity_changed`] never reads as a new one.
+    pub document: Option<String>,
+}
+
+/// Parse a Tauri `ui-bridge-pong` payload into its [`PongEventSender`].
 ///
 /// Tolerates the Tauri 2.x double-serialization the `ui-bridge-response`
 /// listener documents (the payload arriving as a JSON string that itself
-/// contains the object). Anything unparseable, or a payload without a string
-/// `label`, is `None` — an unlabeled pong, which is not main-window evidence.
-pub fn pong_event_label(payload: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+/// contains the object). Anything unparseable is an empty sender — an
+/// unlabeled, unidentified pong.
+pub fn pong_event_sender(payload: &str) -> PongEventSender {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return PongEventSender::default();
+    };
     let value = match value {
-        serde_json::Value::String(inner) => serde_json::from_str(&inner).ok()?,
+        serde_json::Value::String(inner) => match serde_json::from_str(&inner) {
+            Ok(v) => v,
+            Err(_) => return PongEventSender::default(),
+        },
         other => other,
     };
-    value.get("label")?.as_str().map(str::to_string)
+    let field = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    PongEventSender {
+        label: field("label"),
+        document: field("doc"),
+    }
 }
 
 /// One row of the per-window pong report.
@@ -2458,7 +2560,7 @@ mod tests {
         let main_last = now - UI_DEAD_AFTER_MS - 1_000;
         let last_pong = std::sync::atomic::AtomicU64::new(main_last);
         for label in ["terminal-1", "terminal-2"] {
-            let was_main = ingest_window_pong_at(&last_pong, Some(label), true, "main", now);
+            let was_main = ingest_window_pong_at(&last_pong, Some(label), None, true, "main", now);
             assert!(!was_main, "a pop-out's pong is not main-window evidence");
         }
         assert_eq!(
@@ -2481,7 +2583,9 @@ mod tests {
         let main_last = now - UI_DEAD_AFTER_MS - 5_000;
         let last_pong = std::sync::atomic::AtomicU64::new(main_last);
         for event in [false, true] {
-            assert!(!ingest_window_pong_at(&last_pong, None, event, "main", now));
+            assert!(!ingest_window_pong_at(
+                &last_pong, None, None, event, "main", now
+            ));
         }
         assert_eq!(
             last_pong.load(std::sync::atomic::Ordering::Relaxed),
@@ -2491,7 +2595,9 @@ mod tests {
 
         // And from boot: an unlabeled pong never makes a runner "ready".
         let fresh = std::sync::atomic::AtomicU64::new(0);
-        assert!(!ingest_window_pong_at(&fresh, None, false, "main", now));
+        assert!(!ingest_window_pong_at(
+            &fresh, None, None, false, "main", now
+        ));
         assert_eq!(fresh.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
@@ -2504,6 +2610,7 @@ mod tests {
             assert!(ingest_window_pong_at(
                 &last_pong,
                 Some("main"),
+                None,
                 event,
                 "main",
                 now
@@ -2516,6 +2623,7 @@ mod tests {
         assert!(!ingest_window_pong_at(
             &last_pong,
             Some("main"),
+            None,
             false,
             "primary",
             now
@@ -2523,6 +2631,7 @@ mod tests {
         assert!(ingest_window_pong_at(
             &last_pong,
             Some("primary"),
+            None,
             false,
             "primary",
             now
@@ -2538,13 +2647,19 @@ mod tests {
         let now = wall_now_ms();
         let main_last = now - UI_DEAD_AFTER_MS - 1_000;
         let last_pong = std::sync::atomic::AtomicU64::new(main_last);
-        ingest_window_pong_at(&last_pong, Some("terminal-9"), true, "main", now);
+        ingest_window_pong_at(&last_pong, Some("terminal-9"), None, true, "main", now);
 
-        // The clock is process-global and sibling tests stamp it concurrently,
-        // so assert freshness rather than an exact value.
+        // The clock is process-global, so a sibling test may stamp it
+        // concurrently — but only ever FORWARD (every writer in the crate,
+        // test or not, passes a wall-clock instant). `>= now` is therefore the
+        // strongest assertion that cannot flake, and unlike an age window it
+        // cannot be satisfied by a stamp that predates this test's own ingest:
+        // delete the `LAST_EVENT_PONG_MS` store from `ingest_window_pong_at`
+        // and this fails, which a "younger than 60s" bound did not.
         assert!(
-            now.saturating_sub(last_event_pong()) < 60_000,
-            "a pop-out event pong stamps the loop clock"
+            last_event_pong() >= now,
+            "a pop-out event pong stamps the loop clock (read {}, ingested at {now})",
+            last_event_pong()
         );
         assert!(ui_dead_now(&last_pong), "main renderer is still dead");
 
@@ -2570,6 +2685,7 @@ mod tests {
         assert!(!ingest_window_pong_at(
             &last_pong,
             Some(label),
+            None,
             false,
             "main",
             now
@@ -2588,7 +2704,7 @@ mod tests {
     fn unlabeled_pongs_are_reported_under_a_key_no_window_can_have() {
         let last_pong = std::sync::atomic::AtomicU64::new(0);
         let now = wall_now_ms();
-        ingest_window_pong_at(&last_pong, None, false, "main", now);
+        ingest_window_pong_at(&last_pong, None, None, false, "main", now);
         assert!(window_pong_report(now + 5)
             .iter()
             .any(|r| r.label == UNLABELED_PONG_KEY && !r.main));
@@ -2615,20 +2731,92 @@ mod tests {
     }
 
     #[test]
-    fn pong_event_label_reads_the_payload_in_both_serializations() {
+    fn pong_event_sender_reads_the_payload_in_both_serializations() {
         assert_eq!(
-            pong_event_label(r#"{"timestamp":1,"label":"main"}"#).as_deref(),
-            Some("main")
+            pong_event_sender(r#"{"timestamp":1,"label":"main","doc":"n1"}"#),
+            PongEventSender {
+                label: Some("main".to_string()),
+                document: Some("n1".to_string()),
+            }
         );
         // Tauri 2.x double-serialization.
         assert_eq!(
-            pong_event_label(r#""{\"timestamp\":1,\"label\":\"terminal-3\"}""#).as_deref(),
-            Some("terminal-3")
+            pong_event_sender(r#""{\"timestamp\":1,\"label\":\"terminal-3\",\"doc\":\"n2\"}""#),
+            PongEventSender {
+                label: Some("terminal-3".to_string()),
+                document: Some("n2".to_string()),
+            }
         );
-        // The legacy payload shape, garbage, and a non-string label: unlabeled.
-        assert_eq!(pong_event_label(r#"{"timestamp":1}"#), None);
-        assert_eq!(pong_event_label("not json"), None);
-        assert_eq!(pong_event_label(r#"{"label":5}"#), None);
-        assert_eq!(pong_event_label(""), None);
+        // The two halves are independent: a label without a nonce is a
+        // labeled pong from an unidentified document.
+        assert_eq!(
+            pong_event_sender(r#"{"timestamp":1,"label":"main"}"#),
+            PongEventSender {
+                label: Some("main".to_string()),
+                document: None,
+            }
+        );
+        // The legacy payload shape, garbage, and non-string fields: nothing.
+        for payload in [
+            r#"{"timestamp":1}"#,
+            "not json",
+            r#"{"label":5,"doc":5}"#,
+            "",
+            r#""not json either""#,
+        ] {
+            assert_eq!(
+                pong_event_sender(payload),
+                PongEventSender::default(),
+                "payload {payload:?}"
+            );
+        }
+    }
+
+    /// The document nonce is the evidence a rung's pong came from a NEW page
+    /// rather than the one the rung was meant to replace. Every absence is
+    /// refused rather than guessed — except "nothing was ponging before", the
+    /// one case with no predecessor to be fooled by.
+    #[test]
+    fn document_identity_is_evidence_only_when_it_actually_changed() {
+        assert!(document_identity_changed(Some("before"), Some("after")));
+        assert!(
+            !document_identity_changed(Some("same"), Some("same")),
+            "the page the reload was meant to replace must not credit it"
+        );
+        assert!(
+            !document_identity_changed(Some("before"), None),
+            "an absent nonce is not evidence of a new document"
+        );
+        // Nothing was ponging an identified document before the rung, so there
+        // is no predecessor to miscredit: the timestamp stands on its own.
+        assert!(document_identity_changed(None, Some("after")));
+        assert!(document_identity_changed(None, None));
+    }
+
+    /// Only a MAIN-window pong that CARRIES a nonce moves the main document
+    /// identity: a pop-out has its own document, and an unidentified pong must
+    /// not erase what is known.
+    #[test]
+    fn only_a_main_labeled_pong_records_the_main_document_nonce() {
+        let now = wall_now_ms();
+        let last_pong = std::sync::atomic::AtomicU64::new(0);
+
+        ingest_window_pong_at(&last_pong, Some("m"), Some("doc-a"), false, "m", now);
+        assert_eq!(main_document_nonce().as_deref(), Some("doc-a"));
+
+        // A pop-out's document, and an unlabeled caller's: neither is main.
+        ingest_window_pong_at(&last_pong, Some("t-1"), Some("doc-b"), true, "m", now);
+        ingest_window_pong_at(&last_pong, None, Some("doc-c"), false, "m", now);
+        assert_eq!(main_document_nonce().as_deref(), Some("doc-a"));
+
+        // A main pong with no nonce (a curl) leaves the last known identity
+        // alone rather than blanking it.
+        ingest_window_pong_at(&last_pong, Some("m"), None, false, "m", now);
+        ingest_window_pong_at(&last_pong, Some("m"), Some(""), false, "m", now);
+        assert_eq!(main_document_nonce().as_deref(), Some("doc-a"));
+
+        // …and the main window's reloaded document does move it.
+        ingest_window_pong_at(&last_pong, Some("m"), Some("doc-d"), false, "m", now);
+        assert_eq!(main_document_nonce().as_deref(), Some("doc-d"));
     }
 }
