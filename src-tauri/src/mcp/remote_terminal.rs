@@ -74,6 +74,18 @@ pub enum AttachRefusal {
 }
 
 impl AttachRefusal {
+    /// Every variant, in declaration order. Adding a variant means adding it
+    /// here too — `admit_terminal_attach`'s frame-shape invariant test walks
+    /// this list, and the exhaustive match it drives each variant through
+    /// will not compile until the new one is handled.
+    pub const ALL: [AttachRefusal; 5] = [
+        AttachRefusal::GrantUnknown,
+        AttachRefusal::GrantExpired,
+        AttachRefusal::TerminalMismatch,
+        AttachRefusal::Disabled,
+        AttachRefusal::SessionNotLocal,
+    ];
+
     pub fn code(self) -> &'static str {
         match self {
             AttachRefusal::GrantUnknown => "attach_grant_unknown",
@@ -1009,14 +1021,18 @@ where
             session = %grant.session_id,
             "remote attach: no local terminal hosts that coord session"
         );
-        return Err(json!({
-            "type": "remote_terminal_error",
-            "request_id": request_id,
-            "grant_jti": block.grant_jti,
-            "remote": remote_echo(data),
-            "code": AttachRefusal::SessionNotLocal.code(),
-            "message": AttachRefusal::SessionNotLocal.message(),
-        }));
+        // `"type": "error"` — the SAME spelling every other refusal here
+        // uses, and the reason this goes through `refusal_frame` rather than
+        // a hand-built frame. `remote_terminal_error` is the
+        // POST-translation type: the relay's `_route_target_error` is what
+        // turns a target `"error"` into a namespaced `remote_terminal_error`
+        // for the source. A target emitting the translated type directly
+        // bypasses that translator, matches no routing arm, and is dropped —
+        // which made `SessionNotLocal` a refusal no source could ever
+        // receive. The source side's own expectation of the
+        // `("remote_terminal_error", "session_not_local")` pair is INBOUND,
+        // i.e. after the relay has translated this frame.
+        return Err(refusal_frame(AttachRefusal::SessionNotLocal, data, None));
     };
 
     // Bind at first use; a re-attach must land on the same terminal.
@@ -3577,7 +3593,7 @@ mod tests {
             none,
         )
         .expect_err("not local");
-        assert_eq!(err["type"], "remote_terminal_error");
+        assert_eq!(err["type"], "error");
         assert_eq!(err["code"], "session_not_local");
         assert_eq!(err["grant_jti"], "j1");
         assert_eq!(err["request_id"], "att-1");
@@ -3628,6 +3644,120 @@ mod tests {
         )
         .expect_err("disabled");
         assert_eq!(err["code"], "remote_attach_disabled");
+    }
+
+    /// **Frame-shape invariant: EVERY `Err` frame `admit_terminal_attach`
+    /// can produce carries `"type": "error"`.**
+    ///
+    /// `"error"` is the PRE-translation type, and the only one the relay
+    /// routes from a target. qontinui-web's `_route_target_error` is what
+    /// turns a target `"error"` into a `remote_terminal_error` with a
+    /// namespaced code before the source ever sees it; a target that emits
+    /// the post-translation type itself matches no routing arm and is
+    /// discarded, so that refusal class can never reach a source under any
+    /// conditions. `SessionNotLocal` shipped exactly that way from the day
+    /// its spelling diverged — the source side pins
+    /// `("remote_terminal_error", "session_not_local")` as an expected
+    /// INBOUND pair, i.e. the shape AFTER the relay translates this frame.
+    /// No per-frame test caught it, because each asserted the shape it found.
+    /// (Surfaced by the merytshost attach-timeout investigation, which ruled
+    /// this class OUT as that incident's cause — `GrantUnknown` was the
+    /// refusal there, and it has always gone out routable.)
+    ///
+    /// So this walks `AttachRefusal::ALL` rather than a hand-written list of
+    /// frames, and drives each variant through an EXHAUSTIVE match: a
+    /// refusal variant added later cannot compile without a scenario here.
+    #[test]
+    fn every_refusal_frame_admit_terminal_attach_emits_is_a_pre_translation_error() {
+        let resolves_to = |t: &'static str| move |_sid: Uuid| Some((t.to_string(), ()));
+        let none = |_sid: Uuid| -> Option<(String, ())> { None };
+
+        let frame_for = |refusal: AttachRefusal| -> Value {
+            let table = RemoteAttachGrants::new();
+            match refusal {
+                AttachRefusal::GrantUnknown => admit_terminal_attach(
+                    &table,
+                    || AcceptRemoteAttach::Tenant,
+                    &attach_frame(Some(json!({"grant_jti": "ghost"}))),
+                    NOW,
+                    resolves_to("term-A"),
+                ),
+                AttachRefusal::GrantExpired => {
+                    table.insert(grant("j-exp", None, NOW + 600), NOW);
+                    admit_terminal_attach(
+                        &table,
+                        || AcceptRemoteAttach::Tenant,
+                        &attach_frame(Some(json!({"grant_jti": "j-exp"}))),
+                        NOW + 601,
+                        resolves_to("term-A"),
+                    )
+                }
+                AttachRefusal::TerminalMismatch => {
+                    table.insert(grant("j-bound", Some("term-A"), NOW + 600), NOW);
+                    admit_terminal_attach(
+                        &table,
+                        || AcceptRemoteAttach::Tenant,
+                        &attach_frame(Some(json!({"grant_jti": "j-bound"}))),
+                        NOW,
+                        resolves_to("term-B"),
+                    )
+                }
+                AttachRefusal::Disabled => {
+                    table.insert(grant("j-off", None, NOW + 600), NOW);
+                    admit_terminal_attach(
+                        &table,
+                        || AcceptRemoteAttach::Off,
+                        &attach_frame(Some(json!({"grant_jti": "j-off"}))),
+                        NOW,
+                        resolves_to("term-A"),
+                    )
+                }
+                AttachRefusal::SessionNotLocal => {
+                    table.insert(grant("j-nolocal", None, NOW + 600), NOW);
+                    admit_terminal_attach(
+                        &table,
+                        || AcceptRemoteAttach::Tenant,
+                        &attach_frame(Some(json!({"grant_jti": "j-nolocal"}))),
+                        NOW,
+                        none,
+                    )
+                }
+            }
+            .expect_err("the scenario must refuse")
+        };
+
+        for refusal in AttachRefusal::ALL {
+            let err = frame_for(refusal);
+            // The scenario really did reach THIS refusal, so the assertion
+            // below is about the variant it claims to be about.
+            assert_eq!(
+                err["code"],
+                refusal.code(),
+                "{refusal:?}: scenario produced the wrong refusal — {err}"
+            );
+            assert_eq!(
+                err["type"], "error",
+                "{refusal:?} must go out as the PRE-translation type — `remote_terminal_error` is what the relay translates it INTO, and a target emitting it directly is routed nowhere: {err}"
+            );
+            assert_eq!(err["message"], refusal.message(), "{refusal:?}");
+            // The keys the relay routes a remote-only reply by.
+            assert!(err.get("request_id").is_some(), "{refusal:?}");
+            assert!(err.get("grant_jti").is_some(), "{refusal:?}");
+            assert!(err.get("remote").is_some(), "{refusal:?}");
+        }
+
+        // The one `Err` arm that is not an `AttachRefusal` at all.
+        let empty = RemoteAttachGrants::new();
+        let err = admit_terminal_attach(
+            &empty,
+            || AcceptRemoteAttach::Tenant,
+            &attach_frame(None),
+            NOW,
+            resolves_to("term-A"),
+        )
+        .expect_err("no remote block");
+        assert_eq!(err["type"], "error");
+        assert_eq!(err["code"], "remote_block_required");
     }
 
     // ---- source-side client -----------------------------------------------
