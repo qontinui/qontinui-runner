@@ -3216,6 +3216,7 @@ pub mod emergency_quit {
         let cleanup = std::thread::spawn(move || {
             match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
+                .thread_name("aisess-stop-rt")
                 .build()
             {
                 Ok(rt) => {
@@ -3340,6 +3341,7 @@ pub mod emergency_quit {
         std::thread::spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
+                .thread_name("aisess-dereg-rt")
                 .build()
             else {
                 return;
