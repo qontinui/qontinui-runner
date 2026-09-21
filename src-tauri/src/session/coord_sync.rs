@@ -2325,7 +2325,12 @@ impl std::fmt::Display for FlagPollError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FlagPollError::Unauthorized { status, reason } => {
-                write!(f, "status {status}: {reason}")
+                // `{reason:?}`, not `{reason}`: this string originates in a
+                // response body, and nothing downstream of a `Display` impl
+                // can un-inject a newline that reaches a log. The report path
+                // escapes it for the same reason; a second, unescaped channel
+                // is exactly how that control gets lost.
+                write!(f, "status {status}: {reason:?}")
             }
             FlagPollError::Other(e) => f.write_str(e),
         }
@@ -2348,23 +2353,112 @@ impl std::fmt::Display for FlagPollError {
 ///
 /// Bounded: the `error` field is truncated, so a body that claims the shape
 /// without honouring the contract cannot write an unbounded line.
-fn coord_refusal_reason(body: &str) -> String {
+///
+/// **JSON is not enough to make a body coord's.** An intermediary answering
+/// `{"error":"invalid bearer eyJhbGciOi…"}` — a WAF or proxy reflecting the
+/// credential it just rejected — satisfies the shape exactly, and echoing it
+/// would paste the presented token into a log. So the echo is additionally
+/// gated on the ALPHABET coord's four literals are drawn from
+/// ([`is_coord_literal_shaped`]); anything else falls through to the shape
+/// line with the rest.
+///
+/// Takes a `Result` because the body may not have been read at all. A read
+/// error is NOT a measurement of the body and must not be rendered as one:
+/// `unwrap_or_default()` turned a mid-body connection reset into `""` and
+/// then reported "an unrecognized 0-byte body, so the refusal may not be
+/// coord's own", casting doubt on coord when the only established fact was a
+/// local read failure (served policy `verification-and-evidence`
+/// `unknown-must-not-render-as-a-default`).
+fn coord_refusal_reason(body: Result<&str, &str>) -> String {
     const MAX: usize = 200;
+    let body = match body {
+        Ok(b) => b,
+        Err(e) => {
+            return format!(
+                "the refusal body could not be READ ({e}) — nothing about it was measured, so \
+                 coord's stated cause is UNKNOWN; this says nothing either way about whose \
+                 refusal it was"
+            )
+        }
+    };
     let reason = serde_json::from_str::<JsonValue>(body)
         .ok()
-        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_owned));
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_owned))
+        .filter(|r| is_coord_literal_shaped(r));
     match reason {
         // By CHARS, not bytes: `String::truncate` panics on a non-boundary
-        // index, and a log-formatting helper must not be the thing that
-        // kills the poll loop.
+        // index, and a log-formatting helper must not be the thing that kills
+        // the poll loop. The charset gate above admits ASCII only, so a
+        // multi-byte cut is unreachable TODAY — the cut itself is not, and
+        // the gate is the thing a future edit widens.
         Some(r) if r.chars().count() > MAX => r.chars().take(MAX).chain(['…']).collect(),
         Some(r) => r,
         None => format!(
-            "no coord `error` field — an unrecognized {}-byte body, so the refusal may not be \
+            "no coord `error` field — an unrecognized {}-byte body{}, so the refusal may not be \
              coord's own",
-            body.len()
+            body.len(),
+            if body.len() >= REFUSAL_BODY_CAP {
+                // At the cap, so the length is a floor, not a measurement of
+                // the whole body. Say which.
+                " (at the read cap — the body may be longer)"
+            } else {
+                ""
+            }
         ),
     }
+}
+
+/// Whether a string is drawn from the alphabet coord's own stated causes are.
+///
+/// All four are compile-time literals of lowercase ASCII words joined by
+/// spaces or underscores — `auth_required`, `tenant_id does not match
+/// principal`, `strategy_admin_required`, `tenant_not_resolved` (verified
+/// against `qontinui-coord` `origin/main` `de4107e2`). A credential cannot
+/// survive this predicate: every bearer this runner presents is a JWT or a
+/// `qontinui_runner_*` opaque token, and both carry uppercase, digits, `.`
+/// or `-`.
+///
+/// Deliberately a CHARSET test and not an allowlist of the four literals: a
+/// literal coord adds should reach the operator, and an allowlist would
+/// silently report every new one by shape.
+fn is_coord_literal_shaped(reason: &str) -> bool {
+    !reason.is_empty()
+        && reason
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c == '_' || c == ' ')
+}
+
+/// How much of a refusal body this loop will buffer.
+///
+/// The LOG LINE was bounded from the start; the READ was not. `resp.text()`
+/// buffers whatever the peer sends, the client sets a timeout and no size
+/// cap, and this runs once per poll interval for the life of the process —
+/// so a misbehaving intermediary answering `403` with a large body had an
+/// unbounded, indefinitely repeating allocation on the other end of it.
+/// Coord's own bodies are tens of bytes.
+const REFUSAL_BODY_CAP: usize = 4 * 1024;
+
+/// Read at most [`REFUSAL_BODY_CAP`] bytes of a refusal body, and say so when
+/// the read FAILED rather than substituting an empty body for one.
+async fn read_refusal_body(mut resp: reqwest::Response) -> Result<String, String> {
+    let mut buf: Vec<u8> = Vec::new();
+    while buf.len() < REFUSAL_BODY_CAP {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let room = REFUSAL_BODY_CAP - buf.len();
+                buf.extend_from_slice(&chunk[..room.min(chunk.len())]);
+            }
+            Ok(None) => break,
+            // A partial read is still a read failure: what was buffered so
+            // far is not the body, and reporting its length would be a
+            // measurement of a truncation.
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    // Lossy rather than fatal: a cap can land mid-codepoint, and the result
+    // is only ever JSON-parsed or counted. A body that is genuinely not UTF-8
+    // fails the parse and is reported by shape, which is the right answer.
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Report a STANDING tenant-policy refusal once, not once per pass.
@@ -2412,13 +2506,28 @@ fn coord_refusal_reason(body: &str) -> String {
 /// first silence the second forever.
 #[derive(Default)]
 struct TenantPolicyAuthReporter {
-    /// The `(status, tenant asked about)` last reported out loud, if a
+    /// The `(status, tenant asked about, epoch)` last reported out loud, if a
     /// refusal is standing.
-    reported: Option<(u16, Uuid)>,
+    ///
+    /// **Only [`Self::clear`] ever takes it**, which is what keeps the
+    /// invariant `reported == None` ⟹ `suppressed == 0`: the one writer that
+    /// drops a standing refusal is the one that prints its count.
+    reported: Option<(u16, Uuid, u64)>,
     /// Passes suppressed since that report. Carried THROUGH a changed answer
     /// rather than reset by it, so a count is only ever dropped by being
     /// printed.
     suppressed: u64,
+    /// Bumped by [`Self::interrupted`], and part of the suppression key.
+    ///
+    /// This is how a transient pass breaks the silence WITHOUT voiding the
+    /// standing refusal: the key stops matching, so the next identical
+    /// `401`/`403` is reported again, while `reported` stays `Some` and the
+    /// recovery line the first report promised is still owed and still
+    /// printed. Clearing `reported` instead — which an earlier revision did —
+    /// bought the first half at the cost of the second, and stranded the
+    /// suppressed count in a closed episode for some unrelated future refusal
+    /// to print.
+    epoch: u64,
 }
 
 impl TenantPolicyAuthReporter {
@@ -2447,11 +2556,11 @@ impl TenantPolicyAuthReporter {
         asked_about: Uuid,
         presented: impl FnOnce() -> crate::auth::PresentedTenant,
     ) -> Option<String> {
-        if self.reported == Some((status, asked_about)) {
+        if self.reported == Some((status, asked_about, self.epoch)) {
             self.suppressed += 1;
             return None;
         }
-        self.reported = Some((status, asked_about));
+        self.reported = Some((status, asked_about, self.epoch));
         let suppressed = std::mem::replace(&mut self.suppressed, 0);
         let presented = presented();
         let carried = if suppressed == 0 {
@@ -2472,12 +2581,23 @@ impl TenantPolicyAuthReporter {
     /// status, a decode error).
     ///
     /// It emits nothing — the loop logs those at debug — but it DOES end the
-    /// standing refusal, so the next `401`/`403` is reported rather than
-    /// swallowed by a key that outlived the answer it described. The
-    /// suppressed count survives: it belongs to the quiet period, not to the
-    /// status that opened it, and is dropped only by being printed.
+    /// SILENCE, so the next `401`/`403` is reported rather than swallowed by
+    /// a key that outlived the answer it described.
+    ///
+    /// It ends the silence by bumping the epoch, NOT by dropping the standing
+    /// refusal, and the distinction is the whole of this method. The first
+    /// report ends *"one line will report the recovery"*, and that line is
+    /// owed across a transient blip — which is precisely the interleaving
+    /// this method exists for. Dropping `reported` voided the promise: a
+    /// `403`, `403`×N, blip, `200` sequence emitted no recovery line at all
+    /// (`clear`'s `?` returned early), and left the N suppressed passes in
+    /// the field for some unrelated later refusal to print as its own.
+    ///
+    /// The suppressed count survives either way: it belongs to the quiet
+    /// period, not to the status that opened it, and is dropped only by being
+    /// printed.
     fn interrupted(&mut self) {
-        self.reported = None;
+        self.epoch = self.epoch.wrapping_add(1);
     }
 
     /// Record a pass that succeeded; returns the one recovery line when a
@@ -2490,8 +2610,14 @@ impl TenantPolicyAuthReporter {
     /// established), but it does end the silence, so the next refusal is
     /// reported. Before `interrupted` existed it did neither, and a standing
     /// `403` key survived every 200-but-unparseable pass in between.
+    ///
+    /// It reports a refusal that an [`Self::interrupted`] pass intervened in,
+    /// because that pass ended the SILENCE and not the refusal — see there.
+    /// This is the only writer that drops `reported`, and it always prints
+    /// the count as it goes, which is the invariant that keeps a closed
+    /// episode's count from surfacing on an unrelated later line.
     fn clear(&mut self) -> Option<String> {
-        let (status, _tenant) = self.reported.take()?;
+        let (status, _tenant, _epoch) = self.reported.take()?;
         let suppressed = std::mem::replace(&mut self.suppressed, 0);
         Some(format!(
             "coord_sync: tenant-policy GET authorized again — the standing {status} cleared \
@@ -2536,7 +2662,8 @@ async fn fetch_session_coordination_flag(
             // actions; coord distinguishes them in the body and the earlier
             // revision of this function dropped it on the floor, then
             // reconstructed a guess from a local file read.
-            let reason = coord_refusal_reason(&resp.text().await.unwrap_or_default());
+            let body = read_refusal_body(resp).await;
+            let reason = coord_refusal_reason(body.as_deref().map_err(String::as_str));
             return Err(FlagPollError::Unauthorized {
                 status: code,
                 reason,
@@ -2768,6 +2895,10 @@ mod tests {
         /// When set, `GET /tenant-policy` answers this status carrying
         /// coord's own mismatch body instead of 200.
         tenant_policy_status: Option<u16>,
+        /// When set, `GET /tenant-policy` answers with this RAW body instead
+        /// of coord's own — the intermediary the refusal-body read is bounded
+        /// against.
+        tenant_policy_body: Option<String>,
     }
 
     impl CoordRecorder {
@@ -2905,6 +3036,13 @@ mod tests {
                         g.tenant_policy_queries
                             .push(q.get("tenant_id").cloned().unwrap_or_default());
                         match g.tenant_policy_status {
+                            // An INTERMEDIARY's body, when one is staged:
+                            // whatever it says, verbatim, as a proxy would.
+                            Some(s) if g.tenant_policy_body.is_some() => (
+                                AxumStatus::from_u16(s).unwrap_or(AxumStatus::FORBIDDEN),
+                                g.tenant_policy_body.clone().unwrap_or_default(),
+                            )
+                                .into_response(),
                             // Coord's REAL mismatch body, verbatim from
                             // `sessions::get_tenant_policy` — the thing the
                             // runner used to throw away.
@@ -5338,6 +5476,52 @@ mod tests {
         }
     }
 
+    /// F4(b) MUTATION PROOF — the refusal body READ is bounded, not just the
+    /// line built from it.
+    ///
+    /// `resp.text()` buffers whatever the peer sends. This loop polls once
+    /// per interval for the life of the process, so a misbehaving
+    /// intermediary answering `403` with a large body had an unbounded,
+    /// indefinitely repeating allocation behind it. Restore `resp.text()` and
+    /// the reported length becomes the whole 512 KiB instead of the cap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_large_refusal_body_is_read_only_up_to_the_cap() {
+        let _amb = crate::test_env::isolated_ambient();
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+
+        let huge = "A".repeat(512 * 1024);
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        {
+            let mut g = rec.lock().await;
+            g.tenant_policy_status = Some(403);
+            g.tenant_policy_body = Some(huge.clone());
+        }
+        let coord = CoordSync::new_for_test(
+            outbox,
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+
+        let err = fetch_session_coordination_flag(&coord.inner, Uuid::now_v7())
+            .await
+            .expect_err("a 403 must not be read as a flag");
+        let FlagPollError::Unauthorized { reason, .. } = err else {
+            panic!("a 403 must be typed as Unauthorized, got {err:?}");
+        };
+        assert!(
+            reason.contains(&REFUSAL_BODY_CAP.to_string()) && reason.contains("read cap"),
+            "the read must stop at the cap and SAY it stopped: {reason}"
+        );
+        assert!(
+            !reason.contains(&huge.len().to_string()),
+            "the whole body must never be buffered: {reason}"
+        );
+        assert!(!reason.contains("AAAA"), "and never echoed: {reason}");
+    }
+
     /// `{"error": …}` is the only field echoed, and it is bounded.
     ///
     /// Coord states every refusal on this chain as a compile-time literal in
@@ -5348,17 +5532,17 @@ mod tests {
     #[test]
     fn only_coords_error_field_is_echoed_and_it_is_bounded() {
         assert_eq!(
-            coord_refusal_reason(r#"{"error":"auth_required"}"#),
+            coord_refusal_reason(Ok(r#"{"error":"auth_required"}"#)),
             "auth_required"
         );
         assert_eq!(
-            coord_refusal_reason(r#"{"error":"tenant_id does not match principal"}"#),
+            coord_refusal_reason(Ok(r#"{"error":"tenant_id does not match principal"}"#)),
             "tenant_id does not match principal"
         );
 
         // A body that is not coord's contract is described, never echoed.
         let html = "<html><body>Forbidden by corporate-proxy, token=SECRET</body></html>";
-        let described = coord_refusal_reason(html);
+        let described = coord_refusal_reason(Ok(html));
         assert!(
             !described.contains("SECRET") && !described.contains("proxy"),
             "a non-coord body must not be pasted into a log line: {described}"
@@ -5370,15 +5554,90 @@ mod tests {
 
         // Bounded even when the shape IS honoured.
         let long = format!(r#"{{"error":"{}"}}"#, "x".repeat(5_000));
-        let bounded = coord_refusal_reason(&long);
+        let bounded = coord_refusal_reason(Ok(&long));
         assert!(
             bounded.chars().count() <= 201,
             "the echoed field must be truncated, got {} chars",
             bounded.chars().count()
         );
-        // Multi-byte at the cut: truncating by BYTES would panic here.
+        // Multi-byte: the charset gate rejects it before truncation ever sees
+        // it, so this now proves the gate rather than the cut — and either
+        // way a BYTE truncation at the cap would panic instead of returning.
         let wide = format!(r#"{{"error":"{}"}}"#, "é".repeat(5_000));
-        assert!(coord_refusal_reason(&wide).chars().count() <= 201);
+        let wide_out = coord_refusal_reason(Ok(&wide));
+        assert!(wide_out.chars().count() <= 201);
+        assert!(!wide_out.contains('é'), "{wide_out}");
+    }
+
+    /// F4(a) MUTATION PROOF — a JSON body is not a COORD body.
+    ///
+    /// The shape gate alone admits an intermediary that reflects the
+    /// credential it just rejected: a WAF answering
+    /// `{"error":"invalid bearer <jwt>"}` satisfies `error`-is-a-string
+    /// exactly, and echoing it pastes the presented token into a
+    /// `tracing::warn!`. Drop [`is_coord_literal_shaped`] from the filter and
+    /// this goes red on the token.
+    #[test]
+    fn a_json_lookalike_reflecting_the_credential_is_not_echoed() {
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJ0ZW5hbnRfaWQiOiJhIn0.SiGnAtUrE";
+        let reflected = format!(r#"{{"error":"invalid bearer {jwt}"}}"#);
+        let out = coord_refusal_reason(Ok(&reflected));
+        assert!(
+            !out.contains(jwt) && !out.contains("eyJ"),
+            "a body claiming coord's SHAPE but not its alphabet must not be echoed — this one \
+             carries the credential back: {out}"
+        );
+        assert!(
+            out.contains(&reflected.len().to_string()),
+            "it is still reported by shape: {out}"
+        );
+
+        // The four coord literals themselves stay echoable — the gate is a
+        // charset, not an allowlist, so a fifth literal reaches the operator.
+        for literal in [
+            "auth_required",
+            "tenant_id does not match principal",
+            "strategy_admin_required",
+            "tenant_not_resolved",
+            "some_future_cause coord adds",
+        ] {
+            assert_eq!(
+                coord_refusal_reason(Ok(&format!(r#"{{"error":"{literal}"}}"#))),
+                literal
+            );
+        }
+    }
+
+    /// F4(c) MUTATION PROOF — a read FAILURE is not a measurement.
+    ///
+    /// `unwrap_or_default()` turned a mid-body connection reset into `""` and
+    /// then reported "an unrecognized 0-byte body, so the refusal may not be
+    /// coord's own" — a doubt about coord manufactured out of a local read
+    /// error, one layer below the defect this commit exists to remove
+    /// (served policy `verification-and-evidence`
+    /// `unknown-must-not-render-as-a-default`). Collapse the `Err` arm back
+    /// into `Ok("")` and this goes red.
+    #[test]
+    fn a_body_that_could_not_be_read_is_unknown_not_a_zero_byte_body() {
+        let unread = coord_refusal_reason(Err("connection reset by peer"));
+        assert!(
+            unread.contains("UNKNOWN") && unread.contains("connection reset by peer"),
+            "a read failure must name itself: {unread}"
+        );
+        assert!(
+            !unread.contains("0-byte"),
+            "nothing was measured, so no length may be reported: {unread}"
+        );
+
+        // …and a body that genuinely WAS empty still reports as one, because
+        // that IS a measurement.
+        let empty = coord_refusal_reason(Ok(""));
+        assert!(empty.contains("0-byte"), "{empty}");
+        assert!(!empty.contains("UNKNOWN"), "{empty}");
+        assert_ne!(
+            unread, empty,
+            "an unread body and an empty one are different facts"
+        );
     }
 
     /// A device JWT of the shape coord issues — the `tenant_id` claim plus a
@@ -5562,9 +5821,86 @@ mod tests {
             .observe(403, MISMATCH, asked, || cred)
             .expect("a refusal after coord answered some other way is NEW information");
         assert!(
-            line.contains('5'),
+            line.contains("after 5 suppressed"),
             "and the quiet period it followed must not be silently discarded: {line}"
         );
+    }
+
+    /// F1 MUTATION PROOF — a transient blip must not VOID the recovery line
+    /// the standing refusal promised, nor strand its count.
+    ///
+    /// The first report ends "one line will report the recovery". Ending the
+    /// silence by clearing `reported` (rather than by bumping the epoch)
+    /// makes `clear`'s `?` return early on exactly this sequence — `403`,
+    /// `403`×5, a blip, `200` — so the promised line never arrives, and the
+    /// 5 suppressed passes sit in the field until some unrelated future
+    /// refusal prints them as its own. Both halves are asserted here:
+    /// revert [`TenantPolicyAuthReporter::interrupted`] to `self.reported =
+    /// None` and this goes red on the first `expect`.
+    #[test]
+    fn a_transient_failure_does_not_void_the_promised_recovery_line() {
+        let mut r = TenantPolicyAuthReporter::default();
+        let asked = Uuid::now_v7();
+        let cred = crate::auth::PresentedTenant::Tenant(Uuid::now_v7());
+
+        assert!(r.observe(403, MISMATCH, asked, || cred).is_some());
+        for _ in 0..5 {
+            assert!(r.observe(403, MISMATCH, asked, || cred).is_none());
+        }
+        r.interrupted();
+
+        let recovery = r
+            .clear()
+            .expect("the recovery line the first report PROMISED is owed across a blip");
+        assert!(
+            recovery.contains("after 5 suppressed"),
+            "and it must carry the quiet period's own count: {recovery}"
+        );
+        assert_eq!(
+            r.suppressed, 0,
+            "a count is dropped only by being PRINTED — leaving it set leaks a closed \
+             episode's 5 into an unrelated future refusal"
+        );
+        assert!(
+            r.clear().is_none(),
+            "and the recovery is reported exactly once"
+        );
+    }
+
+    /// The invariant the F1 regression broke: `reported == None` implies
+    /// `suppressed == 0`, for every interleaving of the three writers.
+    ///
+    /// `clear` is the only writer that may drop a standing refusal, and it
+    /// prints the count as it goes. `interrupted` was the first writer to
+    /// break that, and `clear` had been written assuming it.
+    #[test]
+    fn a_dropped_refusal_never_leaves_a_count_behind() {
+        let asked = Uuid::now_v7();
+        let cred = crate::auth::PresentedTenant::Tenant(Uuid::now_v7());
+        // Every word over {observe 403, observe 401, interrupted, clear} of
+        // length 4 — 256 interleavings, checked after every single step.
+        for word in 0..256u32 {
+            let mut r = TenantPolicyAuthReporter::default();
+            for step in 0..4 {
+                match (word >> (step * 2)) & 0b11 {
+                    0 => {
+                        r.observe(403, MISMATCH, asked, || cred);
+                    }
+                    1 => {
+                        r.observe(401, "auth_required", asked, || cred);
+                    }
+                    2 => r.interrupted(),
+                    _ => {
+                        r.clear();
+                    }
+                }
+                assert!(
+                    r.reported.is_some() || r.suppressed == 0,
+                    "word {word:08b} step {step}: a refusal dropped without printing its \
+                     count leaks that count into the next episode"
+                );
+            }
+        }
     }
 
     /// The suppressed count is dropped only by being PRINTED — a changed
@@ -5587,7 +5923,7 @@ mod tests {
             .observe(401, "auth_required", asked, || cred)
             .expect("a different status is reported");
         assert!(
-            line.contains("656"),
+            line.contains("after 656 suppressed"),
             "the 656 suppressed passes must be named by the line that ends them: {line}"
         );
         assert_eq!(r.suppressed, 0, "and only then are they cleared");
@@ -5664,7 +6000,7 @@ mod tests {
             .clear()
             .expect("a standing refusal that clears is reported");
         assert!(
-            line.contains("12"),
+            line.contains("after 12 suppressed"),
             "the suppressed count must be named: {line}"
         );
         assert!(line.contains("403"), "{line}");
@@ -5689,7 +6025,18 @@ mod tests {
                 reason: "auth_required".into()
             }
             .to_string(),
-            "status 401: auth_required"
+            r#"status 401: "auth_required""#
+        );
+        // The reason originates in a response body, so this channel escapes
+        // it exactly as the report path does. Unescaped, a body carrying a
+        // newline forges a second log line from inside one.
+        assert_eq!(
+            FlagPollError::Unauthorized {
+                status: 403,
+                reason: "a\nforged ERROR line".into()
+            }
+            .to_string(),
+            r#"status 403: "a\nforged ERROR line""#
         );
         assert_eq!(
             FlagPollError::Other("transport: x".into()).to_string(),
