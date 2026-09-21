@@ -86,6 +86,25 @@
  * that DOES carry a `classification` token is honoured when coord grows one,
  * and the local file overrides it.
  *
+ * THE CENSUS ARM (Phase 5 of the same plan). The nightly `census` job of
+ * `flake-escalation.yml` runs `scripts/test-interleave-census.mjs` in census
+ * mode — the built test binaries N times, every red re-run alone — and hands
+ * the report here as `--census <path>`. Every test the report labelled
+ * `SUITE-ONLY` is an escalation of its own, whether or not coord's rate has
+ * reached the threshold and whether or not any push to `main` failed it: the
+ * census IS the measurement (red k/N in the suite, green m/m alone, on a
+ * named tree and box), so it needs no second witness. A census escalation is
+ * an EVENT like a push-to-main occurrence: an existing issue gets a comment
+ * (and a reopen, and the `suite-only` retitle), never its body overwritten;
+ * only a test with no issue yet gets its body written from the census. The
+ * report doubles as the classification (`tests[<id>].label`), so `--census`
+ * needs no `--classification` beside it. Capped at `CENSUS_CAP`: a census
+ * that reds more tests than that in the suite while every one passes alone
+ * is a box-wide condition of the run (a starved runner, a port every test
+ * shares), not a crowd of sharers, and the json artifact is the place to read
+ * it. `--no-rate` is accepted with `--census` alone — the nightly `escalate`
+ * job already reads coord's rate at the same hour.
+ *
  * THE FIRST ESCALATION WAS DONE BY HAND. Before this reader existed, a session
  * read the endpoint, found `wedge_diagnostics::tests::a_spinning_child_reports_meaningful_cpu`
  * at flake_rate 0.400 (8 of 20), root-caused it as a test defect and fixed it
@@ -109,7 +128,7 @@
  *   node scripts/ci-flake-escalate.mjs --repo <owner/repo>
  *        [--min-occurrences 3] [--window N] [--run-url <url>] [--dry-run]
  *        [--run-id <id> --run-conclusion <success|failure|…>] [--no-rate]
- *        [--classification <path>]
+ *        [--classification <path>] [--census <path>]
  *
  * ENV
  *   COORD_HTTP_URL   coord base URL. Default https://coord.qontinui.io
@@ -135,6 +154,7 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { parseArgs as nodeParseArgs } from "node:util";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -154,6 +174,18 @@ export const DEFAULT_MIN_OCCURRENCES = 3;
 /// tests: that is a broken commit (a bad merge, a poisoned build), not a
 /// crowd of flakes, and it already has an owner — coord's red-main baseline.
 export const MAIN_RED_CAP = 10;
+
+/// The census arm files nothing when one census labels MORE than this many
+/// tests SUITE-ONLY: the Phase 0 measurement of plan
+/// `2026-09-17-runner-tests-share-in-process-mutable-state` found 4 over
+/// 11,758 tests, so a number an order of magnitude above it is a condition of
+/// the RUN (every executable sharing one starved box), and the census json
+/// artifact is where to read it — not twenty issues.
+export const CENSUS_CAP = 20;
+
+/// The label `scripts/test-interleave-census.mjs` gives the class (its
+/// `LABEL.SUITE_ONLY`); read from the report's `tests[<id>].label`.
+export const CENSUS_SUITE_ONLY_LABEL = "SUITE-ONLY";
 
 /// Every escalation issue carries this label; it is also the search key the
 /// upsert uses to find existing issues without scanning the whole tracker.
@@ -402,17 +434,79 @@ export function sliceGatingStep(logText) {
 }
 
 /**
- * Join the two arms on test id, so a test both arms name gets ONE issue
- * carrying both pieces of evidence. Rate-arm order is kept; main-red-only
- * tests follow, by id.
+ * The census arm over one census report (`scripts/test-interleave-census.mjs`
+ * census mode: `{header: {tree_sha, hostname, runs, solo_runs, started_at,
+ * …}, tests: {<id>: {suite_runs, suite_failures, failed_in_runs, solo_runs,
+ * solo_failures, label, sample_panic, …}}, summary, exit_code}`).
+ *
+ * Every test labelled SUITE-ONLY becomes an escalation carrying the census's
+ * own evidence and `classification: "suite_only"`. Tolerant of shape — a
+ * report with no `tests`, a record with no counts — because the caller runs
+ * under a scheduled job whose other steps must not be lost to a malformed
+ * artifact; a report that is not a census (no `tests` object) yields
+ * `{escalations: [], invalid: true}` so the caller can say so.
+ *
+ * @param {unknown} report
+ * @returns {{escalations: Array<{testId: string, classification: string, census: object}>,
+ *   suiteOnlyCount: number, capped: boolean, invalid: boolean, header: object}}
  */
-export function mergeEscalations(rate, mainRed) {
+export function selectCensusEscalations(report, { cap = CENSUS_CAP } = {}) {
+  const tests = report && typeof report === "object" ? report.tests : null;
+  if (!tests || typeof tests !== "object" || Array.isArray(tests)) {
+    return { escalations: [], suiteOnlyCount: 0, capped: false, invalid: true, header: {} };
+  }
+  const header =
+    report.header && typeof report.header === "object" && !Array.isArray(report.header)
+      ? report.header
+      : {};
+  const n = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
+  const suiteOnly = Object.entries(tests)
+    .filter(([, rec]) => rec && typeof rec === "object" && rec.label === CENSUS_SUITE_ONLY_LABEL)
+    .sort(([a], [b]) => a.localeCompare(b));
+  const capped = suiteOnly.length > cap;
+  const escalations = capped
+    ? []
+    : suiteOnly.map(([testId, rec]) => ({
+        testId,
+        classification: SUITE_ONLY_CLASSIFICATION,
+        census: {
+          suiteRuns: n(rec.suite_runs),
+          suiteFailures: n(rec.suite_failures),
+          failedInRuns: Array.isArray(rec.failed_in_runs) ? rec.failed_in_runs.map(Number) : [],
+          soloRuns: n(rec.solo_runs),
+          soloFailures: n(rec.solo_failures),
+          samplePanic: typeof rec.sample_panic === "string" ? rec.sample_panic : null,
+          treeSha: typeof header.tree_sha === "string" ? header.tree_sha : null,
+          hostname: typeof header.hostname === "string" ? header.hostname : null,
+          startedAt: typeof header.started_at === "string" ? header.started_at : null,
+        },
+      }));
+  return { escalations, suiteOnlyCount: suiteOnly.length, capped, invalid: false, header };
+}
+
+/**
+ * Join the arms on test id, so a test more than one arm names gets ONE issue
+ * carrying every piece of evidence. Rate-arm order is kept; main-red-only
+ * tests follow, by id; census-only tests after those, by id. A census hit on
+ * a test another arm also named stamps its `suite_only` classification (the
+ * census is a direct measurement, fresher than anything coord served).
+ */
+export function mergeEscalations(rate, mainRed, census) {
   const byId = new Map();
   for (const r of rate ?? []) byId.set(r.testId, { ...r });
   for (const m of mainRed ?? []) {
     const existing = byId.get(m.testId);
     if (existing) existing.mainRed = m.mainRed;
     else byId.set(m.testId, { testId: m.testId, mainRed: m.mainRed });
+  }
+  for (const c of census ?? []) {
+    const existing = byId.get(c.testId);
+    if (existing) {
+      existing.census = c.census;
+      existing.classification = c.classification;
+    } else {
+      byId.set(c.testId, { testId: c.testId, classification: c.classification, census: c.census });
+    }
   }
   return [...byId.values()];
 }
@@ -484,11 +578,20 @@ export function renderIssueBody(escalation, { repo, minK, window, runUrl, ciRunU
         .map(([k, v]) => `${k} ${v}`)
         .join(" · ")
     : null;
+  const censusOnly = !hasRate && !escalation.mainRed && escalation.census;
   const lines = [
-    hasRate
-      ? `coord's per-test flake history escalated this test (plan`
-      : `a push to \`main\` failed this test (plan`,
-    `\`2026-08-30-runner-ci-has-no-flake-detection-so-one-flaky-test-freezes-the-train\`, Phase 2).`,
+    ...(censusOnly
+      ? [
+          `the nightly interleave census found this test red in the full suite and green`,
+          `alone (plan \`2026-09-17-runner-tests-share-in-process-mutable-state\`, Phase 5;`,
+          `dossier \`${DOSSIER_SLUG}\`).`,
+        ]
+      : [
+          hasRate
+            ? `coord's per-test flake history escalated this test (plan`
+            : `a push to \`main\` failed this test (plan`,
+          `\`2026-08-30-runner-ci-has-no-flake-detection-so-one-flaky-test-freezes-the-train\`, Phase 2).`,
+        ]),
     ``,
     `| | |`,
     `|---|---|`,
@@ -511,6 +614,9 @@ export function renderIssueBody(escalation, { repo, minK, window, runUrl, ciRunU
     lines.push(
       `| failed on a push to \`main\` | ${renderMainRedCell(escalation.mainRed, ciRunUrl)} |`,
     );
+  }
+  if (escalation.census) {
+    lines.push(`| interleave census | ${renderCensusCell(escalation.census)} |`);
   }
   lines.push(
     `| repo | \`${repo ?? "?"}\` |`,
@@ -537,6 +643,16 @@ export function renderIssueBody(escalation, { repo, minK, window, runUrl, ciRunU
       `Read the SHA column before believing the word "flaky": three failures on three`,
       `commits of one PR is a broken PR that was iterated, not a flake. \`coord.test_results\``,
       `carries no ref, so the rate cannot tell those apart; the list can.`,
+      ``,
+    );
+  }
+  if (escalation.census?.samplePanic) {
+    lines.push(
+      `**Sample panic from the census** (the assertion, not the resource — the resource is what to find):`,
+      ``,
+      "```",
+      escalation.census.samplePanic,
+      "```",
       ``,
     );
   }
@@ -583,6 +699,50 @@ function renderClassificationCell(cls) {
 function renderMainRedCell(mainRed, ciRunUrl) {
   const shards = mainRed.shards.map((x) => `\`${x}\``).join(", ");
   return `${shards}${ciRunUrl ? ` — [the run](${ciRunUrl})` : ""}`;
+}
+
+/** The census's own measurement, in one cell: suite k/N (which runs), solo m/M, tree, box, when. */
+function renderCensusCell(census) {
+  const q = (v) => (v === null || v === undefined ? "?" : String(v));
+  const runs =
+    census.failedInRuns && census.failedInRuns.length > 0
+      ? ` (runs ${census.failedInRuns.join(", ")})`
+      : "";
+  const where = [
+    census.treeSha ? `tree \`${String(census.treeSha).slice(0, 9)}\`` : null,
+    census.hostname ? `box \`${census.hostname}\`` : null,
+    census.startedAt ? census.startedAt : null,
+  ]
+    .filter(Boolean)
+    .join(", ");
+  const soloGreen =
+    census.soloRuns === null || census.soloFailures === null
+      ? null
+      : census.soloRuns - census.soloFailures;
+  return (
+    `red **${q(census.suiteFailures)}/${q(census.suiteRuns)}** in the full suite${runs}, ` +
+    `green **${q(soloGreen)}/${q(census.soloRuns)}** alone` +
+    (where ? ` — ${where}` : "")
+  );
+}
+
+/**
+ * The comment a census hit appends to an EXISTING issue — an event, like a
+ * push-to-main occurrence, so the body (coord's snapshot, or the first arm's
+ * evidence) is never overwritten by the nightly.
+ */
+export function renderCensusComment(escalation, { runUrl, readAt } = {}) {
+  return [
+    `The nightly interleave census found this test SUITE-ONLY again — ` +
+      `${renderCensusCell(escalation.census)} (${readAt ?? "?"}).`,
+    ``,
+    ...(escalation.census?.samplePanic
+      ? ["```", escalation.census.samplePanic, "```", ``]
+      : []),
+    `Appended by \`scripts/ci-flake-escalate.mjs\` (census arm${runUrl ? `, [this run](${runUrl})` : ""}); ` +
+      `the body above is not touched by this arm. Plan ` +
+      `\`2026-09-17-runner-tests-share-in-process-mutable-state\`, dossier \`${DOSSIER_SLUG}\`.`,
+  ].join("\n");
 }
 
 /** The coord-sourced caveats — only meaningful when a coord read happened. */
@@ -898,7 +1058,7 @@ function printUsage(stream) {
       "usage: node scripts/ci-flake-escalate.mjs --repo <owner/repo>",
       "         [--min-occurrences N] [--window N] [--run-url <url>] [--dry-run]",
       "         [--run-id <id> --run-conclusion <c> [--run-attempt N]] [--no-rate]",
-      "         [--classification <path>]",
+      "         [--classification <path>] [--census <path>]",
       "",
       "Reads POST /coord/test-flakiness for <repo> and upserts one",
       "`flaky test: <test id>` GitHub issue (label `flake`) per test at or above",
@@ -910,6 +1070,9 @@ function printUsage(stream) {
       "(scripts/test-interleave-census.mjs); a test it labelled SUITE-ONLY is",
       "titled `suite-only test: <test id>` and labelled `suite-only` beside",
       "`flake` — the same issue, retitled, never a second one.",
+      "--census <path> is that script's CENSUS-mode json (the nightly job):",
+      "every test it labelled SUITE-ONLY is escalated on the census's own",
+      `evidence (capped at ${CENSUS_CAP} per census); --no-rate is accepted beside it.`,
       "",
     ].join("\n"),
   );
@@ -931,6 +1094,7 @@ async function main(argv) {
         "no-rate": { type: "boolean" },
         "dry-run": { type: "boolean" },
         classification: { type: "string" },
+        census: { type: "string" },
         help: { type: "boolean", short: "h" },
       },
       allowPositionals: false,
@@ -982,9 +1146,10 @@ async function main(argv) {
     process.stderr.write("ci-flake-escalate: --run-id and --run-conclusion go together\n");
     return 2;
   }
-  if (!rateArm && runId === undefined) {
+  const censusPath = parsed.values.census;
+  if (!rateArm && runId === undefined && censusPath === undefined) {
     process.stderr.write(
-      "ci-flake-escalate: --no-rate needs --run-id/--run-conclusion, else nothing runs\n",
+      "ci-flake-escalate: --no-rate needs --run-id/--run-conclusion or --census, else nothing runs\n",
     );
     return 2;
   }
@@ -1084,6 +1249,48 @@ async function main(argv) {
     }
   }
 
+  // The census arm: every SUITE-ONLY test of a census-mode report.
+  let censusArm = { escalations: [], suiteOnlyCount: 0, capped: false, invalid: false, header: {} };
+  if (censusPath !== undefined) {
+    let report;
+    try {
+      report = JSON.parse(readFileSync(censusPath, "utf8"));
+    } catch (err) {
+      error(
+        `census arm is DARK: ${censusPath} could not be read as JSON (${err?.message ?? err}). ` +
+          `Filing nothing from it: UNKNOWN is not "no SUITE-ONLY tests".`,
+      );
+      return 1;
+    }
+    censusArm = selectCensusEscalations(report);
+    if (censusArm.invalid) {
+      error(
+        `census arm is DARK: ${censusPath} carries no \`tests\` object — not a census report. ` +
+          `Filing nothing from it.`,
+      );
+      return 1;
+    }
+    const h = censusArm.header;
+    info(
+      `census arm: ${censusPath} (tree ${String(h.tree_sha ?? "?").slice(0, 9)}, box ${h.hostname ?? "?"}, ` +
+        `${h.runs ?? "?"} suite run(s), ${h.solo_runs ?? "?"} solo re-run(s)): ` +
+        `${censusArm.suiteOnlyCount} ${SUITE_ONLY_LABEL} test(s), ${censusArm.escalations.length} escalated` +
+        (censusArm.capped
+          ? ` (CAPPED at ${CENSUS_CAP}: a run-wide condition, not ${censusArm.suiteOnlyCount} sharers)`
+          : ""),
+    );
+    for (const e of censusArm.escalations) {
+      info(`  suite ${e.census.suiteFailures}/${e.census.suiteRuns}  alone ${e.census.soloFailures}/${e.census.soloRuns}  ${e.testId}`);
+    }
+    if (censusArm.capped) {
+      notice(
+        `census arm: ${censusArm.suiteOnlyCount} tests were SUITE-ONLY in one census — above the cap of ` +
+          `${CENSUS_CAP}, so this is treated as a condition of the run and nothing is filed; ` +
+          `read the census artifact.`,
+      );
+    }
+  }
+
   let classificationById = null;
   if (parsed.values.classification !== undefined) {
     const { byId, note } = readClassification(parsed.values.classification);
@@ -1099,7 +1306,7 @@ async function main(argv) {
   }
 
   const escalations = applyClassification(
-    mergeEscalations(rateEscalations, mainRed.escalations),
+    mergeEscalations(rateEscalations, mainRed.escalations, censusArm.escalations),
     classificationById,
   );
   if (escalations.length === 0) {
@@ -1108,7 +1315,12 @@ async function main(argv) {
   }
 
   const bodyOpts = { repo, minK: verdict.minK, window: verdict.window, runUrl, ciRunUrl, readAt };
-  const commentFor = (e) => (e.mainRed ? renderMainRedComment(e, { ciRunUrl, readAt }) : undefined);
+  const commentFor = (e) => {
+    const parts = [];
+    if (e.mainRed) parts.push(renderMainRedComment(e, { ciRunUrl, readAt }));
+    if (e.census) parts.push(renderCensusComment(e, { runUrl, readAt }));
+    return parts.length > 0 ? parts.join("\n\n---\n\n") : undefined;
+  };
   if (dryRun) {
     for (const e of escalations) {
       info(`DRY RUN — would upsert "${issueTitle(e.testId, e.classification)}":`);
