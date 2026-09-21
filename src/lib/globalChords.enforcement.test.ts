@@ -57,8 +57,11 @@
  *
  * A file that legitimately handles a bare `Escape` or an arrow key is ON
  * the roster, with that noted, rather than invisible. The roster is
- * therefore large — measured, not guessed: 20 files read a MODIFIER or an
- * unambiguous key field, and 184 more read only `key`/`code`. Adding a file
+ * therefore large — measured, not guessed, and RE-measured on 2026-09-21: 26
+ * files read a MODIFIER or an unambiguous key field, and 217 more read only
+ * `key`/`code`. (It said 20 and 184; both rosters had grown on main without
+ * the prose moving, which is why these numbers are re-derived from the two
+ * rosters rather than edited by one.) Adding a file
  * to either is a one-line, reviewable diff; the failure message prints the
  * exact lines to add or remove.
  *
@@ -249,6 +252,10 @@ const MODIFIER_FIELD_ROSTER: Record<string, string> = {
     "Alt+←/→ reorders the FOCUSED page tab — the non-drag alternative WCAG 2.5.7 " +
     "requires for drag-to-reorder. An ELEMENT-scoped `onKeyDown` on the tab button, " +
     "inventoried in KNOWN_KEY_CLAIMS.",
+  "components/terminal/WorkerSessionCell.tsx":
+    "steering textarea: Enter sends, Shift+Enter newlines. The file landed on main " +
+    "after this branch opened (`15cf2c860`, 2026-09-16); ELEMENT-scoped `onKeyDown` " +
+    "on the textarea, so it claims no global chord and needs no KNOWN_KEY_CLAIMS row.",
   "components/terminal/ZoneControlPanel.tsx": "textarea: Enter submits, Shift+Enter newlines",
   "components/terminal/ZoneGrid.tsx":
     "Ctrl/Cmd+CLICK multi-selects a zone. A pointer modifier, not a key chord.",

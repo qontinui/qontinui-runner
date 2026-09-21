@@ -501,6 +501,40 @@ function TerminalPageInner({
     // its `effect` — the four live in `terminalLaunchMenuActions.ts`, where a
     // node-environment test can spy both effects. The arrows defer the
     // `handleLaunchAiSession` read to invocation time (it is declared below).
+    //
+    // `require-action-effect` refuses a non-literal `actions` because it cannot
+    // enumerate one, and "unchecked is UNKNOWN, not annotated" is right. For
+    // the FACTORY-CALL form used here it is checked anyway, by two mechanisms
+    // this branch brings that the rule cannot see, and that fail red on drift
+    // rather than going quiet:
+    //   * `action-effect-coverage.test.ts` follows this factory into the list
+    //     it returns and pins all four ids ("the list factory's actions are
+    //     walked, not skipped"), records an unreadable element as
+    //     `effect: undefined`, and reds on any missing effect. This branch
+    //     added that list-factory support; main's copy of the test does not
+    //     have it.
+    //   * `actionSurfaces.ts` enumerates the four as `guarded free` surfaces in
+    //     the checked-in `__golden__/action-surfaces.txt` inventory, which
+    //     records each surface's `effect` and requires every guarded surface to
+    //     declare one. Neither the module nor the golden exists on main.
+    //
+    // WHAT THIS DIRECTIVE DOES NOT COVER, stated because the rule's own
+    // standard is that unchecked is UNKNOWN: eslint anchors every
+    // `require-action-effect` report on the `actions:` property node, so this
+    // line-scoped disable would also swallow a report for a DIFFERENT
+    // non-enumerable form here — `actions: someVar`, `actions: cond ? a : b`.
+    // `actionSurfaces.ts` has arms only for an array literal and a call and no
+    // fail-closed else, so such a change would go quiet rather than red. A
+    // blanket fail-closed `actions` arm was tried and is NOT viable: `actions:`
+    // is an ordinary property name, and it fires on four serialisation sites
+    // that register nothing (`background-observer-service.ts`,
+    // `changeTrackingHandler.ts`, `CommandBar.tsx` and a test). Closing it
+    // properly needs a registration-context check, which is its own change.
+    // Keep this registration a direct factory call.
+    //
+    // `--report-unused-disable-directives-severity error` fails the directive
+    // the day the rule stops reporting here at all.
+    // eslint-disable-next-line @qontinui/ui-bridge/require-action-effect -- see the comment above
     actions: buildTerminalLaunchMenuActions({
       callRegistry,
       launchAiSession: (count, configDir, context) =>
