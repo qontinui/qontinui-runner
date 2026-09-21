@@ -149,6 +149,47 @@ export const LABEL_SENTENCE = Object.freeze({
 
 export const DOSSIER_SLUG = "runner-tests-share-in-process-mutable-state";
 
+/**
+ * The wire token for a label — what the ingest carries on a
+ * `coord.test_results` row as `classification`, and what the escalator keys
+ * the `suite-only` title/label on (Phase 1). Only the three VERDICTS have a
+ * token; every non-answer (UNRESOLVED, UNRESOLVED (budget), UNPARSED, GREEN,
+ * or a label this build does not know) is `null`, so a downstream reader can
+ * never mistake "could not classify" for a class.
+ */
+export const CLASSIFICATION_TOKEN = Object.freeze({
+  [LABEL.SUITE_ONLY]: "suite_only",
+  [LABEL.SOLO_RED]: "solo_red",
+  [LABEL.BOTH_FLAKY]: "both_flaky",
+});
+
+/** @returns {"suite_only"|"solo_red"|"both_flaky"|null} */
+export function classificationTokenFor(label) {
+  return CLASSIFICATION_TOKEN[label] ?? null;
+}
+
+/**
+ * Test id → classification token out of a report this script wrote (either
+ * mode: both carry `tests[<id>].label`). Tolerant of any shape — a missing
+ * `tests`, a non-object, a record with no label — yielding an empty map
+ * rather than throwing, because every consumer runs under an exit-0-always
+ * or best-effort contract. Ids whose label has no token are OMITTED (their
+ * classification is null, the same as an id the report never saw).
+ *
+ * @param {unknown} report
+ * @returns {Map<string, "suite_only"|"solo_red"|"both_flaky">}
+ */
+export function classificationsFromReport(report) {
+  const out = new Map();
+  const tests = report && typeof report === "object" ? report.tests : null;
+  if (!tests || typeof tests !== "object" || Array.isArray(tests)) return out;
+  for (const [testId, rec] of Object.entries(tests)) {
+    const token = classificationTokenFor(rec && typeof rec === "object" ? rec.label : undefined);
+    if (token) out.set(testId, token);
+  }
+  return out;
+}
+
 // ===========================================================================
 // Pure: executables
 // ===========================================================================
