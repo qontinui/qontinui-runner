@@ -48,4 +48,14 @@ regexes = [
   # a credential; `generic-api-key` fires on it only because of the header name.
   # Exact literal, matching the entries above: any other key value stays scanned.
   '''dGhlIHNhbXBsZSBub25jZQ==''',
+  # The fake agent JWT the bundled return-to-main skill's own suite hands its
+  # curl stub (src-tauri/src/fleet_skills/return-to-main/recovery-ref-census-test.sh,
+  # the `/agents/credential` arm): header `{"alg":"none"}`, payload
+  # `{"exp":9999999999}`, signature the base64 of the literal "sig". It proves
+  # the census reads a minted token off the response; it opens nothing. The
+  # file is a byte-for-byte carry of qontinui-claude-config's
+  # `.claude/skills/return-to-main/` (the fleet-skills parity check compares
+  # them), so the fixture cannot be respelled here without forking the bundle.
+  # Exact literal, as above: any other token value in that tree stays scanned.
+  '''eyJhbGciOiJub25lIn0\.eyJleHAiOjk5OTk5OTk5OTl9\.c2ln''',
 ]
