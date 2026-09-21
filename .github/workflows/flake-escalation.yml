@@ -331,23 +331,42 @@ jobs:
           free -h
           df -h
 
-      # Build ONCE, from `src-tauri` — the directory ci.yml's gating step
-      # `cd`s into before `cargo test --verbose`, so the census resolves the
-      # same package set and the same executables. No frontend build:
-      # src-tauri/build.rs provisions a `../dist/index.html` placeholder when
-      # none exists (touch-if-absent), and no Rust test reads the built
-      # bundle. The census script's own `cargo test --no-run
-      # --message-format=json` afterwards is a cache hit against this build.
-      - name: Build the test executables (cargo test --no-run)
+      # Build ONCE, from `src-tauri` — the directory ci.yml's build half
+      # `cd`s into before `cargo test --no-run --verbose`, so the census
+      # resolves the same package set and the same executables. No frontend
+      # build: src-tauri/build.rs provisions a `../dist/index.html`
+      # placeholder when none exists (touch-if-absent), and no Rust test reads
+      # the built bundle.
+      #
+      # ⚠️ THIS IS THE ONLY CARGO INVOCATION IN THIS JOB. An earlier cut let
+      # the census script resolve executables itself with `cargo test --no-run
+      # --message-format=json` "as a cache hit against this build" — and on
+      # this crate a second cargo invocation is NEVER a cache hit: tauri-codegen
+      # writes into OUT_DIR after the fingerprint, and the sidecar stub is
+      # touch-if-absent inside the fingerprint window, so the package is an
+      # input to itself and every subsequent invocation sees it Dirty and
+      # recompiles (ci.yml's run half documents both, measured on run
+      # 35477464051). That would have been a second ~45-min cold build inside
+      # a job whose bound was sized for one. So `--verbose` here (cargo then
+      # prints one ``Executable `<path>` `` line per test target, the same
+      # form ci.yml's build half relies on), teed to a log the next step
+      # recovers the paths from.
+      - name: Build the test executables (cargo test --no-run --verbose)
         shell: bash
         run: |
           set -euo pipefail
           cd src-tauri
-          cargo test --no-run 2>&1 | tail -n 20
+          cargo test --no-run --verbose 2>&1 | tee "$GITHUB_WORKSPACE/cargo-test-build.log" | tail -n 20
 
-      # The census proper. `--workspace-root src-tauri` mirrors the gating
-      # step's cwd (and ci.yml's `Classify failed tests` step). Runs: the
-      # plan's 5 (dispatch may override). Solo re-runs: 3. The bound is the
+      # The census proper. `--exe-list` carries the executables recovered
+      # from the build log with the SAME recipe as ci.yml's run half and its
+      # `Classify failed tests` step (ANSI stripped — CARGO_TERM_COLOR may be
+      # set — then the path out of each ``Executable `<path>` ``), so the
+      # script's own cargo resolution is never reached and cargo is never
+      # invoked twice. Zero recovered executables is refused loudly rather
+      # than measured vacuously, matching the run half. `--workspace-root
+      # src-tauri` mirrors the gating step's cwd (and the classify step's).
+      # Runs: the plan's 5 (dispatch may override). Solo re-runs: 3. The bound is the
       # script's own `--budget-seconds` (solo re-runs past it are labelled
       # `UNRESOLVED (budget)`, a non-answer), never a step timeout. The
       # deadline is anchored at census START, so it covers the suite runs
@@ -377,9 +396,21 @@ jobs:
           set -uo pipefail
           runs="${CENSUS_RUNS:-5}"
           case "$runs" in ''|*[!0-9]*) runs=5 ;; esac
+          BUILD_LOG="$GITHUB_WORKSPACE/cargo-test-build.log"
+          EXE_LIST="$GITHUB_WORKSPACE/test-executables.txt"
+          ESC=$(printf '\033')
+          sed -e "s/${ESC}\[[0-9;]*m//g" "$BUILD_LOG" \
+            | sed -n 's/^[[:space:]]*Executable `\(.*\)`[[:space:]]*$/\1/p' > "$EXE_LIST"
+          if [ ! -s "$EXE_LIST" ]; then
+            echo "::error title=No test binaries::found no \`Executable\` lines in $BUILD_LOG. Either the build step produced no test targets, or cargo's output format changed. Refusing to run a census over zero binaries (exit 2: UNKNOWN, not clean)."
+            echo "exit_code=2" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "recovered $(wc -l < "$EXE_LIST") test binaries from the build step"
           node scripts/test-interleave-census.mjs \
             --runs "$runs" \
             --solo-runs 3 \
+            --exe-list "$EXE_LIST" \
             --workspace-root "$GITHUB_WORKSPACE/src-tauri" \
             --budget-seconds 3600 \
             --format pretty \
