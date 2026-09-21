@@ -5533,12 +5533,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 let tw_tailer = app
                     .try_state::<Arc<session::session_transcript_tailer::SessionTranscriptTailer>>()
                     .map(|s| s.inner().clone());
+                // Tail lifecycle knobs (idle park, parked retention) are
+                // spawn-time: read once here, never re-read by the watcher.
+                let tw_settings = crate::settings::get_transcript_watcher_settings();
                 if let Err(e) = crate::terminal::transcript_watcher::start_transcript_watcher(
                     tw_app_handle,
                     tw_pg,
                     workspace_paths,
                     tw_registrar,
                     tw_tailer,
+                    tw_settings,
                 ) {
                     tracing::warn!("transcript watcher failed to start: {}", e);
                 }

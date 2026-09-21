@@ -2257,6 +2257,54 @@ mod session_guard_tests {
     }
 }
 
+#[cfg(test)]
+mod transcript_watcher_settings_tests {
+    use super::*;
+
+    /// Contract: a fresh install and an empty settings.json both land on the
+    /// LIVE defaults — park after 10 min idle, retain a parked entry 24 h.
+    /// "No key present" must NOT mean "never park": that is the state that
+    /// ratcheted the blocking pool to 325 idle threads.
+    #[test]
+    fn transcript_watcher_defaults_are_live() {
+        for s in [
+            Settings::default(),
+            serde_json::from_str::<Settings>("{}").expect("empty object must deserialize"),
+        ] {
+            assert_eq!(s.transcript_watcher.tail_idle_timeout_secs, 600);
+            assert_eq!(s.transcript_watcher.tail_parked_retention_secs, 86_400);
+            assert_eq!(s.transcript_watcher, TranscriptWatcherSettings::default());
+        }
+    }
+
+    /// Explicit values round-trip untouched — including `0`, the documented
+    /// "never park" value, which must not be coerced to the default.
+    #[test]
+    fn transcript_watcher_explicit_values_round_trip() {
+        let parsed: Settings = serde_json::from_str(
+            r#"{"transcript_watcher": {"tail_idle_timeout_secs": 0,
+                 "tail_parked_retention_secs": 3600}}"#,
+        )
+        .expect("must deserialize");
+        assert_eq!(parsed.transcript_watcher.tail_idle_timeout_secs, 0);
+        assert_eq!(parsed.transcript_watcher.tail_parked_retention_secs, 3600);
+        let json = serde_json::to_string(&parsed).unwrap();
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.transcript_watcher, parsed.transcript_watcher);
+    }
+
+    /// A partial object fills the missing key from the default — shortening
+    /// the idle timeout alone must not zero the retention window.
+    #[test]
+    fn transcript_watcher_partial_object_fills_defaults() {
+        let parsed: Settings =
+            serde_json::from_str(r#"{"transcript_watcher": {"tail_idle_timeout_secs": 30}}"#)
+                .unwrap();
+        assert_eq!(parsed.transcript_watcher.tail_idle_timeout_secs, 30);
+        assert_eq!(parsed.transcript_watcher.tail_parked_retention_secs, 86_400);
+    }
+}
+
 // ============================================================================
 // Cloud Relay Settings
 // ============================================================================
@@ -2690,6 +2738,53 @@ impl Default for SessionGuardSettings {
     }
 }
 
+/// Transcript-tail lifecycle knobs for `terminal::transcript_watcher` (plan
+/// `2026-09-21-runner-blocking-pool-ratchets-to-peak-because-transcript-tails-rotate-every-idle-thread`,
+/// Phase 1).
+///
+/// A tail task is scheduled for every Claude transcript created while the
+/// runner runs. Before this section existed a tail ended ONLY when its file
+/// was deleted, so every tail ever started polled the file system once a
+/// second through tokio's blocking pool for the rest of the process's life —
+/// ~550 tails on the operator box, enough spawn traffic to rotate every idle
+/// pool thread before tokio's 10 s keep-alive could retire it. The pool then
+/// never shrank below its historical peak and the resource guard read that
+/// idle pool as load.
+///
+/// Both knobs are **spawn-time**: `start_transcript_watcher` reads them once
+/// at start, like every other watcher knob here, so a change reaches a box on
+/// its next runner start (served policy `production-and-cost`
+/// `runner-lifecycle` says that start is never forced).
+///
+/// A missing `transcript_watcher` key — every `settings.json` written before
+/// this section — loads the defaults via the struct-level `#[serde(default)]`,
+/// and a hand-edit naming one field keeps the default for the other.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TranscriptWatcherSettings {
+    /// Seconds a tail may see neither a `notify` wake nor byte growth before
+    /// it exits and PARKS (its byte cursor is kept in the registry so the next
+    /// `Modify` revives it from exactly where it stopped — nothing is re-read
+    /// and nothing is skipped). Default **600** (10 min). `0` = never park,
+    /// the pre-plan behaviour.
+    pub tail_idle_timeout_secs: u64,
+    /// Seconds a PARKED entry is retained before the registry sweep drops it.
+    /// Default **86 400** (24 h), so the registry is bounded by files touched
+    /// in a day rather than by files created since boot. A dropped entry is
+    /// not lost work: a later `Modify` re-tails the file from EOF, exactly as
+    /// a transcript the runner had never seen would be.
+    pub tail_parked_retention_secs: u64,
+}
+
+impl Default for TranscriptWatcherSettings {
+    fn default() -> Self {
+        Self {
+            tail_idle_timeout_secs: 600,
+            tail_parked_retention_secs: 24 * 60 * 60,
+        }
+    }
+}
+
 // `Clone` exists so [`read_settings_from_disk`] can serve a cached parse
 // instead of re-reading and re-parsing the file on every call (twice — once to
 // `Settings`, once to `serde_json::Value` for the migration check). Handing a
@@ -3049,6 +3144,10 @@ pub struct Settings {
     /// [`SessionGuardSettings`].
     #[serde(default)]
     pub session_guard: SessionGuardSettings,
+    /// Transcript-tail lifecycle knobs (idle park, parked retention). See
+    /// [`TranscriptWatcherSettings`]. Spawn-time.
+    #[serde(default)]
+    pub transcript_watcher: TranscriptWatcherSettings,
     /// Remote-attach preference (who may open a tab onto this device's
     /// sessions). See [`AcceptRemoteAttach`].
     #[serde(default)]
@@ -5753,6 +5852,15 @@ pub fn save_lock_yield_policy_settings(policy: LockYieldPolicySettings) -> Resul
 /// machine the operator used to have.
 pub fn get_session_guard_settings() -> SessionGuardSettings {
     load_settings().session_guard
+}
+
+/// Get the transcript-tail lifecycle knobs.
+///
+/// Read ONCE by `main.rs` when it starts `terminal::transcript_watcher` — the
+/// knobs are spawn-time, so there is no per-decision re-read the way
+/// [`get_session_guard_settings`] does it.
+pub fn get_transcript_watcher_settings() -> TranscriptWatcherSettings {
+    load_settings().transcript_watcher
 }
 
 /// Persist the live-session protection floors.

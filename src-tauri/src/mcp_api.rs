@@ -1521,6 +1521,19 @@ async fn health(
         // flat means every handle is being dropped, which reads identically
         // to "coord has not deployed the route" from the outside.
         "sessionHandles": crate::claude_session::session_handle::health_snapshot(),
+        // Plan 2026-09-21-runner-blocking-pool-ratchets-to-peak-because-
+        // transcript-tails-rotate-every-idle-thread, Phase 0: a census of this
+        // process's threads BY NAME (top 12, prefix-collapsed), memoised 30 s.
+        // `null` is UNKNOWN (the census could not be taken), never an empty
+        // list — served policy `verification-and-evidence`
+        // `silent-empty-is-unknown`. It is what separates "441 threads of
+        // load" from "441 threads, 325 of them an idle tokio blocking pool".
+        "threadCensus": crate::health_monitor::thread_name_census_json(),
+        // Same plan, Phase 0: the transcript-tail population — live, parked,
+        // started/ended since boot, and the last cohort wake (>25 tails woken
+        // inside 250 ms), which is the log line Evidence 5 of that plan was
+        // missing. `lastCohortWake: null` means none observed since boot.
+        "transcriptWatcher": crate::terminal::transcript_watcher::health_snapshot(),
         "ai": {
             "configured": ai_configured,
             "running": ai_running,
@@ -16550,6 +16563,45 @@ mod coord_provision_session_gate_tests {
             "the fields must be rendered from that live pin"
         );
         assert!(src.contains(".route(\"/health\", get(health))"));
+    }
+
+    /// Plan `2026-09-21-runner-blocking-pool-ratchets-to-peak-because-transcript-
+    /// tails-rotate-every-idle-thread` Phase 0: the by-name thread census and the
+    /// transcript-tail gauge are rendered INSIDE `async fn health` — a snapshot
+    /// function nobody calls renders nothing, and this is the same source-scan
+    /// pin the active-tenant fields use.
+    #[test]
+    fn the_health_handler_emits_the_thread_census_and_the_tails_gauge() {
+        let src = include_str!("mcp_api.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with("async fn health("))
+            .expect("the /health handler is `async fn health(`");
+        let end = lines[start..]
+            .iter()
+            .position(|l| *l == "}")
+            .map(|i| start + i)
+            .expect("the handler closes at column 0");
+        let region = lines[start..=end]
+            .iter()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .copied()
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+        assert!(
+            region.contains("\"threadCensus\": crate::health_monitor::thread_name_census_json()"),
+            "{region}"
+        );
+        assert!(
+            region.contains(
+                "\"transcriptWatcher\": crate::terminal::transcript_watcher::health_snapshot()"
+            ),
+            "{region}"
+        );
     }
 
     /// Phase 4: `/health.credentialDoors` states, per transport, whether it can
