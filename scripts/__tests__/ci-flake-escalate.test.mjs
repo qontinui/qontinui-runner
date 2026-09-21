@@ -12,6 +12,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  CENSUS_CAP,
+  CENSUS_SUITE_ONLY_LABEL,
   DEFAULT_MIN_OCCURRENCES,
   FLAKE_LABEL,
   MAIN_RED_CAP,
@@ -33,8 +35,10 @@ import {
   listFlakeIssues,
   mergeEscalations,
   planIssueActions,
+  renderCensusComment,
   renderIssueBody,
   renderMainRedComment,
+  selectCensusEscalations,
   selectEscalations,
   selectMainRedEscalations,
   sliceGatingStep,
@@ -1189,3 +1193,237 @@ test("the body names the classification, and for suite-only says what to do and 
   assert.doesNotMatch(none, /\| classification \|/, "no row when nothing was measured");
 });
 
+
+// ---------------------------------------------------------------------------
+// The census arm (Phase 5 of plan
+// 2026-09-17-runner-tests-share-in-process-mutable-state): a census-mode
+// report's SUITE-ONLY set is an escalation source of its own.
+// ---------------------------------------------------------------------------
+
+/** A census-mode report in the shape `scripts/test-interleave-census.mjs` writes. */
+function censusReport(tests, header = {}) {
+  return {
+    header: {
+      mode: "census",
+      tree_sha: "e60a8944f958e4010d46e53b18a6fdb99c7dd587",
+      hostname: "merytshost",
+      runs: 10,
+      solo_runs: 3,
+      started_at: "2026-09-21T11:36:10.846Z",
+      ...header,
+    },
+    tests,
+    summary: {},
+    exit_code: 1,
+  };
+}
+function suiteOnly(suiteFailures, failedInRuns, extra = {}) {
+  return {
+    suite_runs: 10,
+    suite_failures: suiteFailures,
+    failed_in_runs: failedInRuns,
+    solo_runs: 3,
+    solo_failures: 0,
+    label: CENSUS_SUITE_ONLY_LABEL,
+    reason: `red ${suiteFailures}/10 in the suite, green 3/3 alone`,
+    sample_panic: "thread 'x' panicked at src-tauri/src/mcp_api.rs:12621:9:\nassertion `left == right` failed",
+    ...extra,
+  };
+}
+const SOLO_RED_ID = "qontinui_runner::session::claude_hook::tests::session_restore_dir_is_under_qontinui_runner_not_dot_claude";
+const SINCE_ID = "qontinui_runner::tauri_command_audit::tests::since_filter";
+
+test("census: every SUITE-ONLY test escalates with the census's evidence and a suite_only classification; other labels do not", () => {
+  const report = censusReport({
+    [SINCE_ID]: suiteOnly(1, [2]),
+    [SUITE_ONLY_ID]: suiteOnly(4, [1, 3, 5, 7]),
+    [SOLO_RED_ID]: { ...suiteOnly(10, [1, 2, 3]), solo_failures: 3, label: "SOLO-RED" },
+    "b::flaky": { ...suiteOnly(2, [1, 2]), solo_failures: 1, label: "BOTH-FLAKY" },
+    "b::budget": { ...suiteOnly(1, [1]), label: "UNRESOLVED (budget)" },
+  });
+  const { escalations, suiteOnlyCount, capped, invalid } = selectCensusEscalations(report);
+  assert.equal(invalid, false);
+  assert.equal(capped, false);
+  assert.equal(suiteOnlyCount, 2);
+  assert.deepEqual(
+    escalations.map((e) => e.testId),
+    [SUITE_ONLY_ID, SINCE_ID],
+    "by id, only the SUITE-ONLY rows",
+  );
+  const e = escalations[0];
+  assert.equal(e.classification, SUITE_ONLY_CLASSIFICATION);
+  assert.deepEqual(e.census, {
+    suiteRuns: 10,
+    suiteFailures: 4,
+    failedInRuns: [1, 3, 5, 7],
+    soloRuns: 3,
+    soloFailures: 0,
+    samplePanic: "thread 'x' panicked at src-tauri/src/mcp_api.rs:12621:9:\nassertion `left == right` failed",
+    treeSha: "e60a8944f958e4010d46e53b18a6fdb99c7dd587",
+    hostname: "merytshost",
+    startedAt: "2026-09-21T11:36:10.846Z",
+  });
+});
+
+test("census: a report with no `tests` object is invalid — nothing escalates and the caller is told", () => {
+  for (const bad of [null, "x", [], {}, { header: {} }, { tests: [] }, { tests: "nope" }]) {
+    const r = selectCensusEscalations(bad);
+    assert.equal(r.invalid, true, JSON.stringify(bad));
+    assert.deepEqual(r.escalations, []);
+  }
+  const empty = selectCensusEscalations(censusReport({}));
+  assert.equal(empty.invalid, false, "an empty inventory is a valid, clean census");
+  assert.deepEqual(empty.escalations, []);
+});
+
+test("census: malformed rows degrade to nulls, never throw, and a missing header is tolerated", () => {
+  const { escalations } = selectCensusEscalations({
+    tests: { "b::t": { label: CENSUS_SUITE_ONLY_LABEL, suite_runs: "ten", failed_in_runs: "no" } },
+  });
+  assert.equal(escalations.length, 1);
+  assert.deepEqual(escalations[0].census, {
+    suiteRuns: null,
+    suiteFailures: null,
+    failedInRuns: [],
+    soloRuns: null,
+    soloFailures: null,
+    samplePanic: null,
+    treeSha: null,
+    hostname: null,
+    startedAt: null,
+  });
+  assert.match(renderIssueBody(escalations[0], { repo: "o/r" }), /red \*\*\?\/\?\*\* in the full suite, green \*\*\?\/\?\*\* alone/);
+});
+
+test("census: exactly CENSUS_CAP SUITE-ONLY tests is NOT capped; one more files nothing and says so", () => {
+  const at = {};
+  for (let i = 0; i < CENSUS_CAP; i += 1) at[`b::t${String(i).padStart(3, "0")}`] = suiteOnly(1, [1]);
+  const ok = selectCensusEscalations(censusReport(at));
+  assert.equal(ok.capped, false);
+  assert.equal(ok.escalations.length, CENSUS_CAP);
+  at["b::t999"] = suiteOnly(1, [1]);
+  const over = selectCensusEscalations(censusReport(at));
+  assert.equal(over.capped, true);
+  assert.equal(over.suiteOnlyCount, CENSUS_CAP + 1);
+  assert.deepEqual(over.escalations, [], "a run-wide condition is not N sharers");
+});
+
+test("census: merge — a census hit on a test the rate arm named stamps suite_only and carries the census; census-only tests follow by id", () => {
+  const rate = selectEscalations({ [SUITE_ONLY_ID]: tallied({ pass: 17, fail: 3 }) });
+  const { escalations: census } = selectCensusEscalations(
+    censusReport({ [SUITE_ONLY_ID]: suiteOnly(4, [1, 3, 5, 7]), "a::first": suiteOnly(1, [2]) }),
+  );
+  const merged = mergeEscalations(rate, [{ testId: "b::u", mainRed: { shards: ["x"] } }], census);
+  assert.deepEqual(
+    merged.map((e) => [e.testId, e.rule ?? null, e.classification ?? null, e.census?.suiteFailures ?? null]),
+    [
+      [SUITE_ONLY_ID, "tally", "suite_only", 4],
+      ["b::u", null, null, null],
+      ["a::first", null, "suite_only", 1],
+    ],
+  );
+});
+
+test("census-only body: the census header line, the census row, the sample panic, the suite-only classification — and no coord paragraphs", () => {
+  const { escalations } = selectCensusEscalations(censusReport({ [SUITE_ONLY_ID]: suiteOnly(4, [1, 3, 5, 7]) }));
+  const body = renderIssueBody(escalations[0], {
+    repo: "o/r",
+    runUrl: "https://github.com/o/r/actions/runs/9",
+    readAt: "x",
+  });
+  assert.match(body, /^the nightly interleave census found this test red in the full suite and green/);
+  assert.match(body, /2026-09-17-runner-tests-share-in-process-mutable-state/);
+  assert.match(
+    body,
+    /\| interleave census \| red \*\*4\/10\*\* in the full suite \(runs 1, 3, 5, 7\), green \*\*3\/3\*\* alone — tree `e60a8944f`, box `merytshost`, 2026-09-21T11:36:10.846Z \|/,
+  );
+  assert.match(body, /\| classification \| \*\*suite-only\*\*/);
+  assert.match(body, /Sample panic from the census/);
+  assert.match(body, /assertion `left == right` failed/);
+  assert.doesNotMatch(body, /flake_rate/);
+  assert.doesNotMatch(body, /failed on a push to `main`/);
+  assert.doesNotMatch(body, /Read the number before/, "no coord read happened");
+  assert.match(body, /escalated by \| \[this run\]\(https:\/\/github\.com\/o\/r\/actions\/runs\/9\)/);
+});
+
+test("census comment: an event naming the measurement and the panic, never the body", () => {
+  const { escalations } = selectCensusEscalations(censusReport({ [SINCE_ID]: suiteOnly(1, [2]) }));
+  const c = renderCensusComment(escalations[0], {
+    runUrl: "https://github.com/o/r/actions/runs/9",
+    readAt: "2026-09-22T06:40:00.000Z",
+  });
+  assert.match(c, /^The nightly interleave census found this test SUITE-ONLY again — red \*\*1\/10\*\* in the full suite \(runs 2\), green \*\*3\/3\*\* alone/);
+  assert.match(c, /\(2026-09-22T06:40:00\.000Z\)/);
+  assert.match(c, /assertion `left == right` failed/);
+  assert.match(c, /census arm, \[this run\]\(https:\/\/github\.com\/o\/r\/actions\/runs\/9\)/);
+  assert.match(c, /the body above is not touched by this arm/);
+});
+
+test("census: plan + apply — no issue creates under the suite-only title with both labels; an existing `flaky test:` issue is retitled and commented, its body untouched", () => {
+  const { escalations } = selectCensusEscalations(censusReport({ [SUITE_ONLY_ID]: suiteOnly(4, [1, 3, 5, 7]) }));
+  const [e] = escalations;
+  const created = planIssueActions(escalations, []);
+  assert.equal(created[0].action, "create");
+  assert.equal(created[0].title, SUITE_ONLY_TITLE_PREFIX + SUITE_ONLY_ID);
+  {
+    const { calls, gh } = recorder({ "issue create": "https://github.com/o/r/issues/50" });
+    applyAction(created[0], "BODY", "o/r", gh, { comment: renderCensusComment(e, {}) });
+    assert.deepEqual(calls[0].args.slice(0, 2), ["issue", "create"]);
+    assert.ok(calls[0].args.includes(SUITE_ONLY_LABEL) && calls[0].args.includes(FLAKE_LABEL));
+    assert.equal(calls[0].opts.input, "BODY", "a new issue gets the census body");
+  }
+  const existing = [{ number: 41, title: TITLE_PREFIX + SUITE_ONLY_ID, state: "OPEN" }];
+  const [action] = planIssueActions(escalations, existing);
+  assert.equal(action.action, "update");
+  assert.equal(action.retitle, true);
+  assert.equal(action.title, SUITE_ONLY_TITLE_PREFIX + SUITE_ONLY_ID);
+  const { calls, gh } = recorder();
+  applyAction(action, "BODY", "o/r", gh, { comment: renderCensusComment(e, {}) });
+  assert.deepEqual(
+    calls.map((c) => c.args.slice(0, 2)),
+    [
+      ["issue", "edit"],
+      ["issue", "comment"],
+    ],
+  );
+  assert.ok(calls[0].args.includes("--title"), "retitled");
+  assert.ok(!calls[0].args.includes("--body-file"), "the existing body is not overwritten by the nightly census");
+  assert.match(calls[1].opts.input, /^The nightly interleave census found this test SUITE-ONLY again/);
+});
+
+test("census: the CLI refuses --no-rate with neither --run-id nor --census, and accepts --no-rate --census", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const { writeFileSync, mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const script = new URL("../ci-flake-escalate.mjs", import.meta.url).pathname;
+  const refused = spawnSync(process.execPath, [script, "--repo", "o/r", "--no-rate"], { encoding: "utf8" });
+  assert.equal(refused.status, 2);
+  assert.match(refused.stderr, /--no-rate needs --run-id\/--run-conclusion or --census/);
+
+  const dir = mkdtempSync(join(tmpdir(), "census-"));
+  const path = join(dir, "census.json");
+  writeFileSync(path, JSON.stringify(censusReport({ [SINCE_ID]: suiteOnly(1, [2]) })));
+  const dry = spawnSync(
+    process.execPath,
+    [script, "--repo", "o/r", "--no-rate", "--census", path, "--dry-run", "--run-url", "https://github.com/o/r/actions/runs/9"],
+    { encoding: "utf8" },
+  );
+  assert.equal(dry.status, 0, dry.stderr + dry.stdout);
+  assert.match(dry.stdout, /census arm: .* 1 suite-only test\(s\), 1 escalated/);
+  assert.match(dry.stdout, new RegExp(`DRY RUN — would upsert "${SUITE_ONLY_TITLE_PREFIX}${SINCE_ID.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`));
+  assert.match(dry.stdout, /interleave census \| red \*\*1\/10\*\*/);
+
+  const clean = join(dir, "clean.json");
+  writeFileSync(clean, JSON.stringify(censusReport({})));
+  const nothing = spawnSync(process.execPath, [script, "--repo", "o/r", "--no-rate", "--census", clean], { encoding: "utf8" });
+  assert.equal(nothing.status, 0, nothing.stderr + nothing.stdout);
+  assert.match(nothing.stdout, /0 suite-only test\(s\), 0 escalated/);
+  assert.match(nothing.stdout, /nothing in o\/r to escalate/);
+
+  const broken = join(dir, "broken.json");
+  writeFileSync(broken, "{not json");
+  const dark = spawnSync(process.execPath, [script, "--repo", "o/r", "--no-rate", "--census", broken], { encoding: "utf8" });
+  assert.equal(dark.status, 1, "an unreadable census is UNKNOWN, loud, and files nothing");
+  assert.match(dark.stdout, /census arm is DARK/);
+});
