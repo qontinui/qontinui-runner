@@ -61,8 +61,9 @@
 //! The child is the leader of its own process group (a job object on Windows),
 //! so the timeout kill reaches the `bash` / `git` / MCP descendants a
 //! `/return-to-main` session is mid-way through, not `claude` alone; on a clean
-//! exit the group is released rather than reaped, matching
-//! [`crate::process_helpers::run_with_timeout`] on its clean-exit arm. What
+//! exit the group is released rather than reaped, and on an unreadable exit
+//! status it is reaped, matching [`crate::process_helpers::run_with_timeout`]
+//! on both arms. What
 //! this path does NOT do is watch the scheduler's `stop_signal` or the
 //! runtime's shutdown. What happens to the child then depends on HOW the
 //! runner ends: on the `std::process::exit` paths `main.rs` takes no
@@ -337,12 +338,16 @@ pub(crate) async fn launch(
                 (Ok(st.code()), false)
             }
             Ok(Err(e)) => {
-                // A tokio `wait()` error is in effect ECHILD — the leader is
-                // already gone and reaped elsewhere — so there is no live
-                // group to release or reap; disarm rather than kill. (This is
-                // the one arm that differs from `run_with_timeout`, which
-                // drops its guard on a wait error.)
-                tree.disarm();
+                // A tokio `wait()` error means the leader's status could not
+                // be read (in effect ECHILD). That says nothing about its
+                // descendants — a process group outlives its leader, and the
+                // control test on the tree guard relies on exactly that — so
+                // an unreadable status is closer to "unknown" than to
+                // "clean", and the guard is DROPPED (the group is reaped),
+                // as `run_with_timeout` does on its wait-error arm. Unreachable
+                // in practice: nothing in this binary does `waitpid(-1)` or
+                // ignores SIGCHLD, so tokio cannot lose the status today.
+                drop(tree);
                 (Err(e.to_string()), false)
             }
             Err(_elapsed) => {
