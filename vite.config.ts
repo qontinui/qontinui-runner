@@ -4,6 +4,7 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { version } from "./package.json";
+import { computeFrontendProvenance } from "./scripts/frontend-provenance.mjs";
 
 // Compute the runner build-id at Vite-build time. Format
 // `<git-sha-short>-<unix-ms>`. Vite is the *single source of truth* for the
@@ -70,6 +71,34 @@ export default defineConfig({
           type: "asset",
           fileName: "build-id.txt",
           source: RUNNER_BUILD_ID,
+        });
+      },
+    },
+    // Emit dist/provenance.json — WHAT TREE STATE this dist was built from, as
+    // a content hash over the module graph's git-unignored sources (plan
+    // 2026-08-23-build-provenance-assertion, Phase 1). `build.rs` re-hashes
+    // the recorded inputs and stamps `halvesAgree` into /health;
+    // `scripts/frontend-provenance.mjs verify` compares a runner's embedded
+    // hash with a worktree (a qontinui-claude-config temp-runner launcher is
+    // being added to shell it). Beside `build-id.txt`, never instead of it — the
+    // supervisor gate and `build.rs` both read that file. Never fails the
+    // build: an unmeasurable tree records `frontendSrcHash: "unknown"`.
+    {
+      name: "emit-build-provenance",
+      generateBundle() {
+        const provenance = computeFrontendProvenance({
+          root: __dirname,
+          moduleIds: [...this.getModuleIds()],
+          buildId: RUNNER_BUILD_ID,
+        });
+        if (provenance.unknownReason) {
+          this.warn(`build provenance could not be measured: ${provenance.unknownReason}`);
+        }
+        this.emitFile({
+          type: "asset",
+          fileName: "provenance.json",
+          // Compact: this file is embedded in the exe with the rest of dist/.
+          source: JSON.stringify(provenance),
         });
       },
     },

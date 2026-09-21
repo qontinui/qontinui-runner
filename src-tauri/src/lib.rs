@@ -210,6 +210,12 @@ pub mod http_disposition;
 // push client + trigger as siblings under this module.
 pub mod plan_workunit_adapter;
 
+// Compile-time build provenance for `/health` (plan
+// `2026-08-23-build-provenance-assertion`, Phase 4): reads back the tree-state
+// stamps `build.rs` emits. In the LIB crate so any crate's `/health` builder
+// reads the one definition.
+pub mod build_provenance;
+
 // Wedge diagnostics (Phase 4 of
 // `2026-08-30-runner-blocking-pool-exhaustion-and-wedge-diagnostics`). In the
 // LIB crate so both crates' `spawn_blocking` sites share ONE counter.

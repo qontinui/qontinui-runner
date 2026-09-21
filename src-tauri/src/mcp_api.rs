@@ -1548,6 +1548,13 @@ async fn health(
         // For "is this runner out of date", use `buildDrift` below — it is
         // the only field here that can change while the window is open.
         "buildId": env!("RUNNER_BUILD_ID"),
+        // WHAT TREE STATE the two build halves came from, as content hashes
+        // (gitDirty, treeHash, rustSrcHash, frontendSrcHash, halvesAgree) —
+        // compile-time constants, like `gitSha`/`buildId` above. Compare them
+        // against a worktree with `scripts/frontend-provenance.mjs verify`;
+        // `null` is "not measured", never "agree" (plan
+        // 2026-08-23-build-provenance-assertion, Phase 4).
+        "provenance": qontinui_runner_lib::build_provenance::health_json(),
         // origin/main's current SHA + drift verdict vs the embedded gitSha
         // (see `crate::build_drift`). All-null until the first background
         // check completes, and permanently null on a repo-less install.
@@ -1681,6 +1688,8 @@ async fn health(
         // the response root without descending into `data`. Same provenance
         // semantics — and same non-semantics — as `data.buildId` above.
         "buildId": env!("RUNNER_BUILD_ID"),
+        // Top-level mirror of `data.provenance`, for the same consumers.
+        "provenance": qontinui_runner_lib::build_provenance::health_json(),
         // Phase 3J.2 — top-level mirrors of `derived_status` and `ui_error`
         // so supervisor/fleet consumers can read them without descending into
         // the inner `data` block. The inner `data.status` / `data.derived_status`

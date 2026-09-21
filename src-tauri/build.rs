@@ -46,11 +46,13 @@ fn main() {
     // updated ACL (e.g. adding a window label); otherwise gen/ stays stale and
     // the new permission silently never takes effect until a clean build.
     println!("cargo:rerun-if-changed=capabilities");
-    // Force a re-run on every cargo build so RUNNER_BUILD_ID is re-read from
-    // the current `dist/build-id.txt` on every invocation. Without this, cargo
-    // caches the build-script output and re-stamps a stale value into the
-    // binary, so /health would report provenance for a dist the exe no longer
-    // embeds on rebuilds where no other input changed.
+    // Re-run when this script itself changes. This does NOT "force a re-run on
+    // every cargo build", which is what this comment used to claim: emitting
+    // ANY `rerun-if-changed` NARROWS cargo's default ("any file in the
+    // package") to exactly the paths listed, so this line watches build.rs and
+    // nothing else. `dist/build-id.txt` is re-read because `../dist` is watched
+    // above — not because of this line (plan
+    // 2026-08-23-build-provenance-assertion, D1).
     println!("cargo:rerun-if-changed=build.rs");
 
     // Embed the current git SHA so the running binary can report exactly which
@@ -196,6 +198,11 @@ fn main() {
     // `PAGE_TO_TAB` map — the only thing that decides whether a
     // `page/navigate` target actually goes anywhere (iter-12 item 3).
     generate_valid_navigate_pages();
+
+    // Stamp tree-state provenance (git dirty bit, tree hash, Rust-source hash,
+    // the embedded dist's frontend-source hash) and warn when the embedded dist
+    // no longer matches the frontend sources it was built from. Never fatal.
+    stamp_provenance();
 
     tauri_build::build()
 }
@@ -640,6 +647,469 @@ fn flags_carry_tokio_unstable<'a, I: IntoIterator<Item = &'a str>>(flags: I) -> 
     false
 }
 
+// ---------------------------------------------------------------------------
+// Build provenance (plan 2026-08-23-build-provenance-assertion, Phases 1b + 2)
+// ---------------------------------------------------------------------------
+//
+// The runner is built in two independent steps — Vite writes `dist/`, cargo
+// embeds it — and nothing asserted they describe the same tree. These stamps
+// record WHAT TREE STATE the binary was built from as content hashes, because
+// agents build from dirty worktrees as normal practice and a commit SHA says
+// nothing about uncommitted edits. `/health` surfaces them under `provenance`.
+//
+// This is a Rust PORT of `fold_lines` in `scripts/frontend-provenance.mjs`,
+// which is the canonical implementation (vite and the temp-runner launcher use
+// it). Both are pinned to `scripts/fixtures/provenance-fold.json` by a test on
+// each side — change the format in both or neither. The format:
+//   * one line per input, `<repo-relative path> <40-hex oid>`, or
+//     `<path> absent` for an input recorded at build time and since deleted;
+//   * git's own path spelling verbatim, sorted by UTF-8 byte value;
+//   * every line `\n`-terminated, the last included.
+// Oids and the fold are hashed with `git hash-object` on both sides, so
+// `core.autocrlf` normalization is identical everywhere.
+//
+// What these stamps can and cannot see (D1): cargo re-runs this script only
+// when a WATCHED path moves, so every stamp here is "as of the LAST
+// build-script run", not "as of this compile". Neither `src` nor `../src` is
+// watched, on purpose: a re-run changes these env values, and changed
+// build-script output rebuilds EVERY target of the package -- a bin-only edit
+// would recompile the whole lib and all bins, and a `.tsx` edit the whole
+// runner, under rust-analyzer too. Instead, `pnpm run build:exe`
+// (`scripts/build-exe.mjs`) sets QONTINUI_PROVENANCE_NONCE to a fresh value,
+// and this script declares `rerun-if-env-changed` on it: every build:exe
+// re-stamps, whether or not its Vite step rewrote `../dist`. Any build that
+// rewrites `../dist` (a watched path; `build-id.txt` carries a timestamp) also
+// re-stamps. What may NOT re-stamp is a bare `cargo build` after a Rust edit,
+// or the supervisor's path that builds on a PRIOR `dist/` after a failed
+// `npm run build` (its `frontend_stale_any`): that exe carries the previous
+// run's stamps. A launch-time `scripts/frontend-provenance.mjs verify` then
+// usually reports the Rust half as a mismatch naming `build:exe` -- but NOT
+// always: if the worktree is later returned to the stamped state (a stash, a
+// checkout, a revert) the comparison matches an exe built from different code.
+// The supervisor setting the nonce too closes its half of that; it is a
+// follow-up in qontinui-supervisor.
+//
+// Recompute failure is `unknown`, never `false` (D3): no git, no repo, an
+// unreadable input — the check produced no verdict, and saying "disagree"
+// would be a lie about a correct tree.
+
+/// Repo-root-relative pathspecs of the Rust half's binary-affecting inputs:
+/// the crate, its in-repo path dependencies, the vendored `[patch]`, and what
+/// `generate_context!` / `include_str!` embed. Must equal `RUST_SRC_PATHSPECS`
+/// in `scripts/frontend-provenance.mjs`. The `../qontinui-schemas` sibling is
+/// out of scope on purpose (sibling-pin-check.sh owns sibling drift).
+const RUST_SRC_PATHSPECS: &[&str] = &[
+    "src-tauri/src",
+    "src-tauri/build.rs",
+    "src-tauri/Cargo.toml",
+    "src-tauri/capabilities",
+    "src-tauri/tauri.conf.json",
+    "src-tauri/resources",
+    "src-tauri/icons",
+    "src-tauri/clorinde",
+    "crates/spec-check",
+    "crates/runner-stats",
+    "crates/runner-win32",
+    "vendor/tao-0.35.0",
+    "Cargo.toml",
+    "Cargo.lock",
+];
+
+const PROVENANCE_UNKNOWN: &str = "unknown";
+
+/// The fold text for `(path, oid)` entries; `None` is an absent input.
+fn fold_lines(entries: &[(String, Option<String>)]) -> String {
+    let mut rows: Vec<(String, &Option<String>)> = entries
+        .iter()
+        .map(|(p, o)| (p.replace('\\', "/"), o))
+        .collect();
+    // `str`'s `Ord` is byte-lexicographic over UTF-8 — LC_ALL=C order.
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out = String::new();
+    for (path, oid) in rows {
+        out.push_str(&path);
+        out.push(' ');
+        out.push_str(oid.as_deref().unwrap_or("absent"));
+        out.push('\n');
+    }
+    out
+}
+
+fn git_output(
+    root: &std::path::Path,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("git")
+        // A git inherited from a hook would answer about a different repository
+        // or index than `-C root` names.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_WORK_TREE")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run git: {e}"))?;
+    if let Some(bytes) = stdin {
+        // Feed stdin from a thread so a large stdout cannot deadlock the pipe.
+        let mut pipe = child.stdin.take().ok_or("git stdin unavailable")?;
+        let bytes = bytes.to_vec();
+        let writer = std::thread::spawn(move || pipe.write_all(&bytes));
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("git {args:?} failed: {e}"))?;
+        let wrote = writer.join();
+        // Git's own exit status first: a git that failed early surfaces to the
+        // writer as a broken pipe, and its stderr is the useful half.
+        let stdout = finish_git(args, out)?;
+        wrote
+            .map_err(|_| "git stdin writer panicked".to_string())?
+            .map_err(|e| format!("git {args:?} stdin: {e}"))?;
+        return Ok(stdout);
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("git {args:?} failed: {e}"))?;
+    finish_git(args, out)
+}
+
+fn finish_git(args: &[&str], out: std::process::Output) -> Result<Vec<u8>, String> {
+    if out.status.success() {
+        Ok(out.stdout)
+    } else {
+        Err(format!(
+            "git {args:?} exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+fn hash_text(root: &std::path::Path, text: &str) -> Result<String, String> {
+    let out = git_output(root, &["hash-object", "--stdin"], Some(text.as_bytes()))?;
+    Ok(String::from_utf8_lossy(&out).trim().to_string())
+}
+
+/// One `git hash-object --stdin-paths` over the paths that exist; a missing
+/// path is `None` (the `absent` marker).
+fn hash_paths(
+    root: &std::path::Path,
+    paths: &[String],
+) -> Result<Vec<(String, Option<String>)>, String> {
+    // A directory (e.g. an untracked symlink to one, which `ls-files` lists as a
+    // file) cannot be hash-object'ed: it is `absent`, the same rule the Node
+    // side applies. `is_dir` follows symlinks, like Node's `statSync`.
+    let present: Vec<&String> = paths
+        .iter()
+        .filter(|p| {
+            let q = root.join(p);
+            q.exists() && !q.is_dir()
+        })
+        .collect();
+    let mut oids: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    if !present.is_empty() {
+        let mut input = String::new();
+        for p in &present {
+            input.push_str(p);
+            input.push('\n');
+        }
+        let out = git_output(
+            root,
+            &["hash-object", "--stdin-paths"],
+            Some(input.as_bytes()),
+        )?;
+        let text = String::from_utf8_lossy(&out);
+        let lines: Vec<&str> = text.lines().collect();
+        if lines.len() != present.len() {
+            return Err(format!(
+                "git hash-object returned {} oids for {} paths",
+                lines.len(),
+                present.len()
+            ));
+        }
+        for (p, oid) in present.iter().zip(lines) {
+            oids.insert(p.as_str(), oid.trim().to_string());
+        }
+    }
+    Ok(paths
+        .iter()
+        .map(|p| (p.clone(), oids.get(p.as_str()).cloned()))
+        .collect())
+}
+
+fn unignored_paths(root: &std::path::Path, pathspecs: &[&str]) -> Result<Vec<String>, String> {
+    let mut args = vec![
+        "ls-files",
+        "-z",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "--",
+    ];
+    args.extend_from_slice(pathspecs);
+    let out = git_output(root, &args, None)?;
+    let mut paths: Vec<String> = out
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).replace('\\', "/"))
+        .collect();
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn rust_src_hash(root: &std::path::Path) -> Result<String, String> {
+    let inputs = unignored_paths(root, RUST_SRC_PATHSPECS)?;
+    hash_text(root, &fold_lines(&hash_paths(root, &inputs)?))
+}
+
+/// Paths `git status --porcelain -z` reports, rename/copy sources included.
+fn porcelain_paths(z: &[u8]) -> Vec<String> {
+    let fields: Vec<&[u8]> = z.split(|b| *b == 0).filter(|s| !s.is_empty()).collect();
+    let mut paths = Vec::new();
+    let mut i = 0;
+    while i < fields.len() {
+        let f = fields[i];
+        i += 1;
+        if f.len() < 4 {
+            continue;
+        }
+        let (x, y) = (f[0], f[1]);
+        paths.push(String::from_utf8_lossy(&f[3..]).replace('\\', "/"));
+        if matches!(x, b'R' | b'C') || matches!(y, b'R' | b'C') {
+            if let Some(orig) = fields.get(i) {
+                paths.push(String::from_utf8_lossy(orig).replace('\\', "/"));
+                i += 1;
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// `(dirty, tree_hash)`. A clean tree's hash IS `HEAD^{tree}`, checkable with
+/// one `git rev-parse`; a dirty tree folds `tree <HEAD^{tree}>` with every
+/// changed path's current oid. `--no-optional-locks` keeps `status` from
+/// taking the index lock a concurrent git command may hold. Nothing is written
+/// to the object store (`hash-object` without `-w`).
+fn tree_state(root: &std::path::Path) -> Result<(bool, String), String> {
+    let head_tree =
+        String::from_utf8_lossy(&git_output(root, &["rev-parse", "HEAD^{tree}"], None)?)
+            .trim()
+            .to_string();
+    let status = git_output(
+        root,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+            "-z",
+            "--untracked-files=all",
+        ],
+        None,
+    )?;
+    let changed = porcelain_paths(&status);
+    if changed.is_empty() {
+        return Ok((false, head_tree));
+    }
+    let fold = format!(
+        "tree {head_tree}\n{}",
+        fold_lines(&hash_paths(root, &changed)?)
+    );
+    Ok((true, hash_text(root, &fold)?))
+}
+
+/// Whether the embedded dist's recorded frontend inputs still hash to the
+/// `frontendSrcHash` recorded in `dist/provenance.json`.
+#[derive(Debug, PartialEq)]
+enum HalvesAgree {
+    Yes,
+    No {
+        recomputed: String,
+        differing: Vec<String>,
+    },
+    Unknown(String),
+}
+
+impl HalvesAgree {
+    fn wire(&self) -> &'static str {
+        match self {
+            HalvesAgree::Yes => "true",
+            HalvesAgree::No { .. } => "false",
+            HalvesAgree::Unknown(_) => PROVENANCE_UNKNOWN,
+        }
+    }
+}
+
+/// `(recorded frontendSrcHash, recorded inputs)` out of `provenance.json`.
+fn parse_provenance(json: &str) -> Result<(String, Vec<(String, Option<String>)>), String> {
+    let v: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("dist/provenance.json unparseable: {e}"))?;
+    let recorded = v
+        .get("frontendSrcHash")
+        .and_then(|h| h.as_str())
+        .filter(|h| !h.is_empty())
+        .unwrap_or(PROVENANCE_UNKNOWN)
+        .to_string();
+    let inputs = v
+        .get("inputs")
+        .and_then(|i| i.as_array())
+        .ok_or("dist/provenance.json has no inputs list")?
+        .iter()
+        .map(|e| {
+            let path = e
+                .get("path")
+                .and_then(|p| p.as_str())
+                .ok_or("an input has no path")?;
+            let oid = e.get("oid").and_then(|o| o.as_str()).map(str::to_string);
+            Ok((path.to_string(), oid))
+        })
+        .collect::<Result<Vec<_>, &str>>()?;
+    Ok((recorded, inputs))
+}
+
+fn check_halves(
+    root: &std::path::Path,
+    recorded: &str,
+    inputs: &[(String, Option<String>)],
+) -> HalvesAgree {
+    if recorded == PROVENANCE_UNKNOWN {
+        return HalvesAgree::Unknown("the frontend build could not measure its inputs".into());
+    }
+    if inputs.is_empty() {
+        // A fold over nothing would "match" any edit.
+        return HalvesAgree::Unknown("dist/provenance.json records no inputs".into());
+    }
+    let paths: Vec<String> = inputs.iter().map(|(p, _)| p.clone()).collect();
+    let now = match hash_paths(root, &paths) {
+        Ok(n) => n,
+        Err(e) => return HalvesAgree::Unknown(e),
+    };
+    let recomputed = match hash_text(root, &fold_lines(&now)) {
+        Ok(h) => h,
+        Err(e) => return HalvesAgree::Unknown(e),
+    };
+    if recomputed == recorded {
+        return HalvesAgree::Yes;
+    }
+    let before: std::collections::HashMap<&str, &Option<String>> =
+        inputs.iter().map(|(p, o)| (p.as_str(), o)).collect();
+    let differing = now
+        .iter()
+        .filter(|(p, o)| before.get(p.as_str()).copied() != Some(o))
+        .map(|(p, _)| p.clone())
+        .collect();
+    HalvesAgree::No {
+        recomputed,
+        differing,
+    }
+}
+
+fn stamp_provenance() {
+    // Manifest and lock only: an edit there rebuilds every target anyway, so
+    // re-running this script costs nothing extra. `src` / `../src` are NOT
+    // watched -- see the section comment for the cost and what keeps the
+    // stamps exact without them.
+    for p in ["Cargo.toml", "../Cargo.toml", "../Cargo.lock"] {
+        println!("cargo:rerun-if-changed={p}");
+    }
+    // Set to a fresh value by `pnpm run build:exe` so a sanctioned build always
+    // re-stamps (see the section comment).
+    println!("cargo:rerun-if-env-changed=QONTINUI_PROVENANCE_NONCE");
+
+    let root = git_output(
+        std::path::Path::new("."),
+        &["rev-parse", "--show-toplevel"],
+        None,
+    )
+    .map(|o| std::path::PathBuf::from(String::from_utf8_lossy(&o).trim()));
+
+    let (dirty, tree_hash, rust_hash) = match &root {
+        Ok(root) => {
+            let (dirty, tree) = match tree_state(root) {
+                Ok((d, t)) => (d.to_string(), t),
+                Err(_) => (
+                    PROVENANCE_UNKNOWN.to_string(),
+                    PROVENANCE_UNKNOWN.to_string(),
+                ),
+            };
+            let rust = rust_src_hash(root).unwrap_or_else(|_| PROVENANCE_UNKNOWN.to_string());
+            (dirty, tree, rust)
+        }
+        Err(_) => (
+            PROVENANCE_UNKNOWN.to_string(),
+            PROVENANCE_UNKNOWN.to_string(),
+            PROVENANCE_UNKNOWN.to_string(),
+        ),
+    };
+    println!("cargo:rustc-env=QONTINUI_GIT_DIRTY={dirty}");
+    println!("cargo:rustc-env=QONTINUI_TREE_HASH={tree_hash}");
+    println!("cargo:rustc-env=QONTINUI_RUST_SRC_HASH={rust_hash}");
+
+    // The embedded dist's own record. Absent is the normal state of a bare
+    // `cargo check` and of a dist built before Phase 1 — `unknown`, and a
+    // warning only when a real (build-id-stamped) dist lacks it.
+    let (frontend_hash, agree) = match std::fs::read_to_string("../dist/provenance.json") {
+        Err(_) => {
+            if std::path::Path::new("../dist/build-id.txt").exists() {
+                println!(
+                    "cargo:warning=dist/provenance.json is missing — this dist predates \
+                     provenance stamping, so /health cannot say which frontend sources the \
+                     binary embeds. Run `pnpm run build` (or `pnpm run build:exe`)."
+                );
+            }
+            (
+                PROVENANCE_UNKNOWN.to_string(),
+                HalvesAgree::Unknown("dist/provenance.json absent".into()),
+            )
+        }
+        Ok(json) => match (parse_provenance(&json), &root) {
+            (Err(e), _) => (PROVENANCE_UNKNOWN.to_string(), HalvesAgree::Unknown(e)),
+            (Ok((recorded, _)), Err(e)) => (recorded, HalvesAgree::Unknown(e.clone())),
+            (Ok((recorded, inputs)), Ok(root)) => {
+                let agree = check_halves(root, &recorded, &inputs);
+                (recorded, agree)
+            }
+        },
+    };
+    match &agree {
+        HalvesAgree::No {
+            recomputed,
+            differing,
+        } => {
+            let shown: Vec<&str> = differing.iter().take(5).map(String::as_str).collect();
+            println!(
+                "cargo:warning=the embedded dist is STALE: its frontend sources changed since \
+                 `pnpm run build` (recorded frontendSrcHash {frontend_hash}, now {recomputed}; \
+                 {} file(s) differ, e.g. {}). /health will report halvesAgree=false. Fix: \
+                 `pnpm run build:exe`.",
+                differing.len(),
+                shown.join(", ")
+            );
+        }
+        HalvesAgree::Unknown(why) if frontend_hash != PROVENANCE_UNKNOWN => {
+            println!(
+                "cargo:warning=could not verify the embedded dist against its frontend \
+                 sources ({why}); /health will report halvesAgree=null."
+            );
+        }
+        _ => {}
+    }
+    println!("cargo:rustc-env=QONTINUI_FRONTEND_SRC_HASH={frontend_hash}");
+    println!("cargo:rustc-env=QONTINUI_HALVES_AGREE={}", agree.wire());
+}
+
 /// Unit tests for the build script's pure helpers.
 ///
 /// These run under `cargo test --lib` because `src/wedge_diagnostics.rs` pulls
@@ -753,5 +1223,64 @@ mod tests {
             None,
             Some("  --cfg   tokio_unstable  ")
         ));
+    }
+}
+
+/// The provenance fold is a byte contract shared with
+/// `scripts/frontend-provenance.mjs`; the fixture pins both sides.
+#[cfg(test)]
+mod provenance_tests {
+    use super::{fold_lines, parse_provenance, porcelain_paths};
+
+    #[test]
+    fn fold_matches_the_shared_fixture() {
+        let fx: serde_json::Value =
+            serde_json::from_str(include_str!("../scripts/fixtures/provenance-fold.json")).unwrap();
+        let entries: Vec<(String, Option<String>)> = fx["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    e["path"].as_str().unwrap().to_string(),
+                    e["oid"].as_str().map(str::to_string),
+                )
+            })
+            .collect();
+        assert_eq!(fold_lines(&entries), fx["expected_fold"].as_str().unwrap());
+    }
+
+    #[test]
+    fn porcelain_parsing_keeps_rename_sources() {
+        let z = b" M src/a.rs\0R  src/new.rs\0src/old.rs\0?? untracked.txt\0";
+        assert_eq!(
+            porcelain_paths(z),
+            vec!["src/a.rs", "src/new.rs", "src/old.rs", "untracked.txt"]
+        );
+    }
+
+    #[test]
+    fn provenance_json_round_trips_and_absent_oids_are_none() {
+        let (h, inputs) = parse_provenance(
+            r#"{"frontendSrcHash":"abc","inputs":[{"path":"a","oid":"1"},{"path":"b","oid":null}]}"#,
+        )
+        .unwrap();
+        assert_eq!(h, "abc");
+        assert_eq!(
+            inputs,
+            vec![
+                ("a".to_string(), Some("1".to_string())),
+                ("b".to_string(), None)
+            ]
+        );
+        assert!(parse_provenance("{").is_err());
+        // A missing or empty hash is UNKNOWN, never "an empty hash to compare".
+        assert_eq!(
+            parse_provenance(r#"{"frontendSrcHash":"","inputs":[]}"#)
+                .unwrap()
+                .0,
+            "unknown"
+        );
+        assert!(parse_provenance(r#"{"frontendSrcHash":"h"}"#).is_err());
     }
 }
