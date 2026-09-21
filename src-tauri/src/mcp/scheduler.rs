@@ -71,7 +71,21 @@ pub struct UpdateSchedulerSettingsRequest {
     pub enabled: Option<bool>,
     pub max_concurrent: Option<u32>,
     pub default_auto_fix_on_failure: Option<bool>,
+    /// Absent = leave the zone alone; `null` = clear it back to local time;
+    /// a string = set it. Serde folds `null` into the outer `None` by default,
+    /// which made the clear arm unreachable from JSON — so the field is
+    /// deserialized explicitly (Phase 5a made the zone load-bearing).
+    #[serde(default, deserialize_with = "deserialize_double_option")]
     pub timezone: Option<Option<String>>,
+}
+
+/// `"timezone": null` -> `Some(None)`; `"timezone": "X"` -> `Some(Some(X))`;
+/// absent -> `None` (via `#[serde(default)]`).
+fn deserialize_double_option<'de, D>(d: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(d).map(Some)
 }
 
 // ============================================================================
@@ -365,6 +379,7 @@ pub async fn update_scheduler_settings(
         )
     })?;
 
+    let previous_timezone = settings.timezone.clone();
     if let Some(enabled) = request.enabled {
         settings.enabled = enabled;
     }
@@ -385,6 +400,7 @@ pub async fn update_scheduler_settings(
         }
         settings.timezone = timezone;
     }
+    let zone_changed = settings.timezone != previous_timezone;
 
     pg.update_scheduler_settings(&settings).await.map_err(|e| {
         (
@@ -392,6 +408,31 @@ pub async fn update_scheduler_settings(
             Json(api_error(format!("Failed to update settings: {}", e))),
         )
     })?;
+
+    // The tick fires off each task's STORED `next_run`, so a zone change must
+    // recompute them now or every enabled task honours the old zone once more
+    // (on a UTC+2 box: one more 06:20 firing — the defect 5a removes).
+    if zone_changed {
+        let zone = crate::scheduler::ScheduleZone::from_settings(&settings);
+        let now = chrono::Utc::now();
+        match pg.get_all_scheduled_tasks().await {
+            Ok(tasks) => {
+                for task in tasks.iter().filter(|t| t.enabled) {
+                    let next = crate::scheduler::compute_next_run(&task.schedule, now, zone)
+                        .map(|dt| dt.to_rfc3339());
+                    if let Err(e) = pg.update_task_next_run(&task.id, next.as_deref()).await {
+                        tracing::warn!(
+                            "scheduler: timezone changed but next_run for task {} was not recomputed: {e}",
+                            task.id
+                        );
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(
+                "scheduler: timezone changed but the task list could not be read for a next_run recompute: {e}"
+            ),
+        }
+    }
 
     Ok(Json(ApiResponse::success(())))
 }
@@ -493,4 +534,25 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         )
         .route("/scheduler/status", get(get_scheduler_status))
         .route("/scheduler/reconcile-now", post(reconcile_now))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UpdateSchedulerSettingsRequest;
+
+    /// Phase 5a: the three shapes of `timezone` on a settings PUT are three
+    /// different requests, and `null` (clear back to local time) must not fold
+    /// into "leave it alone".
+    #[test]
+    fn timezone_absent_null_and_string_are_three_different_requests() {
+        let absent: UpdateSchedulerSettingsRequest =
+            serde_json::from_str(r#"{"enabled":true}"#).unwrap();
+        assert_eq!(absent.timezone, None);
+        let null: UpdateSchedulerSettingsRequest =
+            serde_json::from_str(r#"{"timezone":null}"#).unwrap();
+        assert_eq!(null.timezone, Some(None));
+        let set: UpdateSchedulerSettingsRequest =
+            serde_json::from_str(r#"{"timezone":"Europe/Berlin"}"#).unwrap();
+        assert_eq!(set.timezone, Some(Some("Europe/Berlin".to_string())));
+    }
 }
