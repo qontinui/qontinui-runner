@@ -1787,7 +1787,28 @@ async fn handle_inbound<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    while let Some(msg_result) = read.next().await {
+    // Slow request/response frames run here instead of on the read loop — see
+    // `relay_frame_detaches`. Owned by this future, so when the connection's
+    // `select!` drops it every in-flight handler is aborted with the socket,
+    // exactly as an inline handler was cancelled before.
+    let mut detached: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    let detached_slots = Arc::new(tokio::sync::Semaphore::new(MAX_DETACHED_HANDLERS));
+    // A detached handler cannot `return` from the read loop, so a full reply
+    // lane is signalled here and the loop ends the connection at its next turn.
+    let detached_fatal = Arc::new(tokio::sync::Notify::new());
+
+    loop {
+        let msg_result = tokio::select! {
+            biased;
+            _ = detached_fatal.notified() => {
+                warn!("Backend relay: a detached handler could not queue its reply, ending connection");
+                return;
+            }
+            next = read.next() => match next {
+                Some(m) => m,
+                None => break,
+            },
+        };
         // Any inbound frame (including Pong, which we otherwise discard
         // below) is proof the server is reachable. Stamp the shared
         // timestamp before doing anything else so the keepalive pinger's
@@ -1813,7 +1834,54 @@ async fn handle_inbound<S>(
                         continue;
                     }
 
-                    let response = handle_relay_command(&api_state, msg_type, &data).await;
+                    let (msg_type, data) = match route_relay_frame(msg_type, &data) {
+                        RelayRoute::Refuse(frame) => {
+                            let text = serde_json::to_string(&frame).unwrap_or_default();
+                            if let Err(e) = writer.try_send_reply(Message::Text(text.into())) {
+                                warn!("Failed to send relay refusal: {}", e);
+                                return;
+                            }
+                            continue;
+                        }
+                        RelayRoute::Dispatch { msg_type, data } => (msg_type, data),
+                    };
+
+                    // Slow frames leave the read loop. A permit bounds how many
+                    // may run at once; with none free the frame runs inline as
+                    // it always did, so a flood degrades to the old
+                    // serial-with-backpressure behaviour instead of growing
+                    // without limit.
+                    if relay_frame_detaches(&msg_type) {
+                        if let Ok(permit) = detached_slots.clone().try_acquire_owned() {
+                            // Reap finished handlers so the set stays small
+                            // and a panic is reported, not silently held.
+                            while let Some(done) = detached.try_join_next() {
+                                if let Err(e) = done {
+                                    warn!("Detached relay handler failed: {}", e);
+                                }
+                            }
+                            let api_state = api_state.clone();
+                            let writer = writer.clone();
+                            let fatal = detached_fatal.clone();
+                            detached.spawn(async move {
+                                let _permit = permit;
+                                if let Some(response) =
+                                    dispatch_routed_frame(&api_state, &msg_type, &data).await
+                                {
+                                    let text = serde_json::to_string(&response).unwrap_or_default();
+                                    if let Err(e) =
+                                        writer.try_send_reply(Message::Text(text.into()))
+                                    {
+                                        warn!("Failed to send relay response: {}", e);
+                                        fatal.notify_one();
+                                    }
+                                }
+                            });
+                            continue;
+                        }
+                    }
+
+                    let response = dispatch_routed_frame(&api_state, &msg_type, &data).await;
                     if let Some(response) = response {
                         let response_text = serde_json::to_string(&response).unwrap_or_default();
                         // Non-blocking by construction: this is the read loop,
@@ -2480,7 +2548,7 @@ const REMOTE_SOURCE_ADMITTED: &[&str] = &[
 ];
 
 /// Envelope carriers. `command` / `chat` / `terminal` are not operations: the
-/// arm below re-enters `handle_relay_command` with the inner `subtype` and the
+/// arm below re-enters `route_relay_frame` with the inner `subtype` and the
 /// inner payload, and this predicate runs again there. Refusing the carrier
 /// would refuse a legitimate inner type whose `remote` block happens to sit at
 /// the envelope level rather than inside `payload`.
@@ -2524,7 +2592,7 @@ fn remote_frame_admitted(msg_type: &str, data: &Value) -> bool {
 
 /// Where one inbound relay frame is going, decided BEFORE any handler runs.
 ///
-/// Split out of [`handle_relay_command`] so the routing decision is testable
+/// Split out of [`dispatch_routed_frame`] so the routing decision is testable
 /// without an `ApiState` — which owns a `tauri::AppHandle` and cannot be built
 /// in a unit test. That gap is why
 /// `envelope_carriers_pass_through_and_the_inner_type_is_what_decides` passed
@@ -2650,18 +2718,47 @@ pub(crate) fn route_relay_frame(msg_type: &str, data: &Value) -> RelayRoute {
     RelayRoute::Refuse(remote_type_refusal(&msg_type, &data))
 }
 
-async fn handle_relay_command(
+/// How many detached handlers may run at once (see [`relay_frame_detaches`]).
+///
+/// Each may hold an HTTP body of up to [`RELAY_MAX_BODY_BYTES`], so the cap is
+/// what keeps detaching from trading a stalled read loop for unbounded memory.
+/// At the cap the frame runs inline, restoring the old backpressure.
+const MAX_DETACHED_HANDLERS: usize = 16;
+
+/// Whether a routed frame runs off the read loop.
+///
+/// The read loop is the only task that sees the server's PING, and it also
+/// stamps `last_inbound_ms`, which [`run_keepalive_pinger`] reads: a handler
+/// awaited inline keeps the PING unread and the socket looking silent, so a
+/// slow one takes the connection down at [`STALE_INBOUND_TIMEOUT`] no matter
+/// how well the writer prioritises the PONG. An `http_request` relay may run
+/// for its full 120 s timeout.
+///
+/// Only frames that are (a) slow and (b) correlated by `request_id` /
+/// `dispatch_id`, so a reply that overtakes a later frame's is harmless, are
+/// listed. Anything whose relative order matters — `terminal_input`,
+/// `terminal_resize`, `chat_message`, the `terminal_*` lifecycle — stays
+/// inline. `terminal_attach` and `terminal_create` also stay inline: their
+/// coord re-read is already throttled for exactly that reason.
+fn relay_frame_detaches(msg_type: &str) -> bool {
+    matches!(
+        msg_type,
+        "http_request"
+            | "dispatch"
+            | "chat_create"
+            | "chat_generate_workflow"
+            | DEVENV_ENROLL_COMMAND
+    )
+}
+
+/// Run one already-routed frame (see [`route_relay_frame`]) and return the
+/// reply to put on the socket, if any.
+async fn dispatch_routed_frame(
     api_state: &Arc<ApiState>,
     msg_type: &str,
     data: &Value,
 ) -> Option<Value> {
-    let (msg_type, data) = match route_relay_frame(msg_type, data) {
-        RelayRoute::Refuse(frame) => return Some(frame),
-        RelayRoute::Dispatch { msg_type, data } => (msg_type, data),
-    };
-    let data = &data;
-
-    match msg_type.as_str() {
+    match msg_type {
         // --------------------------------------------------------------
         // Phase 3 protocol — typed dispatch
         // --------------------------------------------------------------
@@ -2898,11 +2995,13 @@ fn devenv_auto_enroll_opted_out() -> bool {
 
 /// How long [`handle_devenv_enroll`] may hold the relay's inbound read loop.
 ///
-/// **This is a liveness budget, not a patience budget.** `handle_relay_command`
-/// is awaited SERIALLY inside `handle_inbound`'s read loop, and `last_inbound_ms`
-/// only advances when a frame is consumed — so for as long as this handler runs,
-/// the socket looks silent to [`run_keepalive_pinger`], which force-drops the
-/// connection at [`STALE_INBOUND_TIMEOUT`] (45s). Blowing that budget would take
+/// **This is a liveness budget, not a patience budget.** `devenv_enroll` is
+/// detached from the read loop (see [`relay_frame_detaches`]), but the budget is
+/// kept: when [`MAX_DETACHED_HANDLERS`] handlers are already running the frame
+/// is awaited inline on `handle_inbound`'s read loop, and `last_inbound_ms`
+/// only advances when a frame is consumed — so for as long as this handler runs
+/// there, the socket looks silent to [`run_keepalive_pinger`], which force-drops
+/// the connection at [`STALE_INBOUND_TIMEOUT`] (45s). Blowing that budget would take
 /// the whole device relay down — mobile proxying, terminal, chat and dispatch
 /// with it — AND drop the future carrying the `devenv_enroll_ack`, which is this
 /// plan's own silent-drop failure reproduced inside the mechanism meant to close
@@ -3053,9 +3152,9 @@ type DevenvEnrollJoin = Result<Result<enroll::EnrollOutcome, String>, tokio::tas
 /// Always returns an ack and never panics the relay — a panic here would take
 /// the whole device socket down with it.
 ///
-/// **Concurrency.** Do NOT rely on the read loop to serialize enrolls. It looks
-/// like it does — `handle_relay_command` is awaited serially — but
-/// `DEVENV_ENROLL_ACK_BUDGET` (20s) expires while `run_enroll`'s own POST is
+/// **Concurrency.** Do NOT rely on the read loop to serialize enrolls. It does
+/// not: `devenv_enroll` is detached from it (see [`relay_frame_detaches`]), and
+/// even awaited inline `DEVENV_ENROLL_ACK_BUDGET` (20s) expires while `run_enroll`'s own POST is
 /// still allowed 30s, and dropping a `spawn_blocking` `JoinHandle` does not
 /// cancel the task. So there is a ≥10s window in which the loop is free to
 /// dispatch a second `devenv_enroll` while the first is still writing. The real
@@ -5818,7 +5917,7 @@ mod tests {
     // The `http_request` PATH POLICY — review round 2, finding 1.
     //
     // Round 1 hardened the typed `terminal_create` frame. `http_request` is
-    // the sibling arm of the same `match` in `handle_relay_command`, and it is
+    // the sibling arm of the same `match` in `dispatch_routed_frame`, and it is
     // an unrestricted loopback proxy onto the runner's own API — so
     // `POST /terminals` with `working_dir` / `intent_repo` /
     // `agent_session_id` reached the SAME create handler with none of the
@@ -6693,13 +6792,13 @@ mod tests {
 
     /// Pins the command-type SPELLING qontinui-web sends.
     ///
-    /// The dispatch arm in `handle_relay_command` is written as the
+    /// The dispatch arm in `dispatch_routed_frame` is written as the
     /// `DEVENV_ENROLL_COMMAND` pattern rather than an inline literal, so there
     /// is no second copy of the string that can drift from this one: asserting
     /// the const's value is therefore equivalent to asserting the arm's.
     ///
     /// **What this does NOT pin**, deliberately stated rather than implied: that
-    /// `handle_relay_command`'s `match` still CONTAINS the arm. Reaching that
+    /// `dispatch_routed_frame`'s `match` still CONTAINS the arm. Reaching that
     /// `match` needs an `ApiState`, which owns a `tauri::AppHandle` and so is
     /// not constructible in a unit test. Deleting the arm would compile, and
     /// this test would still pass — the frame would fall through to the `_`
@@ -6793,7 +6892,7 @@ mod remote_admission_tests {
     //!
     //! These drive `remote_frame_admitted`, the PREDICATE the enforcement point
     //! calls — not the constants. A test that only reads the lists would pass
-    //! on a build where the `if` in `handle_relay_command` had been deleted.
+    //! on a build where the `if` in `dispatch_routed_frame` had been deleted.
 
     use super::remote_frame_admitted;
     use serde_json::json;
@@ -7202,6 +7301,52 @@ mod relay_routing_tests {
         let (msg_type, data) = dispatched(route_relay_frame("terminal_create", &frame));
         assert_eq!(msg_type, "terminal_create");
         assert_eq!(data, frame);
+    }
+
+    /// The slow request/response frames leave the read loop, and it is the
+    /// ROUTED type that decides — an envelope carrier must not hide one.
+    #[test]
+    fn slow_request_response_frames_detach_even_inside_an_envelope() {
+        for t in [
+            "http_request",
+            "dispatch",
+            "chat_create",
+            "chat_generate_workflow",
+            "devenv_enroll",
+        ] {
+            assert!(
+                super::relay_frame_detaches(t),
+                "{t} must run off the read loop"
+            );
+        }
+        let enveloped = json!({ "type": "chat", "subtype": "chat_create", "payload": {} });
+        let (msg_type, _) = dispatched(route_relay_frame("chat", &enveloped));
+        assert!(super::relay_frame_detaches(&msg_type));
+        // The carrier itself is never dispatched, so it never detaches.
+        assert!(!super::relay_frame_detaches("chat"));
+    }
+
+    /// Frames whose relative order matters must stay on the serial read loop:
+    /// detaching them would let a later frame overtake an earlier one.
+    #[test]
+    fn order_sensitive_frames_stay_inline() {
+        for t in [
+            "terminal_input",
+            "terminal_resize",
+            "terminal_create",
+            "terminal_attach",
+            "terminal_detach",
+            "terminal_flow",
+            "terminal_close",
+            "terminal_subscribe",
+            "terminal_unsubscribe",
+            "chat_message",
+            "chat_interrupt",
+            "chat_close",
+            "heartbeat",
+        ] {
+            assert!(!super::relay_frame_detaches(t), "{t} must stay inline");
+        }
     }
 }
 
