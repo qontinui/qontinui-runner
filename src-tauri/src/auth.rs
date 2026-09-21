@@ -2322,12 +2322,17 @@ pub enum PresentedTenant {
 /// exist for exactly this distinction and the coord doctor already prints
 /// them; this carries the same value to a log line.
 ///
-/// **No [`SlotState::Usable`] can appear in any of these, by construction.**
-/// [`select_device_bearer_result`] is the only thing that builds one, and it
-/// builds one only where a read did NOT yield a token — so the contradiction
-/// *"no credential (sent anonymously; slot usable)"* is unconstructible
-/// rather than merely unlikely. It was reachable while the cause came from a
-/// SECOND set of reads taken after the decision, which the refresher could
+/// **No PRODUCTION path builds one carrying [`SlotState::Usable`].** That is
+/// an invariant of the four construction sites, not of the type: this enum is
+/// `pub` with public variants and [`SlotState`] is public, so
+/// `NoCredential::Slot(SlotState::Usable)` is constructible by any caller, and
+/// the tests in `coord_sync` already build `Slot(..)` values by hand. What the
+/// four sites share is the reason — [`select_device_bearer_result`] (three) and
+/// [`select_scoped_bearer_lazy_result`] (one) build a cause only where a read
+/// did NOT yield a token, the `Usable` arm having already returned `Ok` — so
+/// the contradiction *"no credential (sent anonymously; slot usable)"* cannot
+/// be reported by the request path. It WAS reported while the cause came from
+/// a SECOND set of reads taken after the decision, which the refresher could
 /// land a slot in between; pinned by
 /// `the_reported_cause_is_the_selectors_own_reads`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3964,21 +3969,53 @@ mod bearer_selection_tests {
     /// store, for every cell — the F2 replacement for a pure mirror that was
     /// only ever driven against itself.
     ///
-    /// Three properties, each a mutation the old self-driven test could not
-    /// see:
+    /// Every assertion below is against something derived INDEPENDENTLY of the
+    /// function under test: the fixture this cell stored, or
+    /// [`credential_state`], the module's shared rule — a second derivation of
+    /// the same predicate over the same store. Comparing the selector's two
+    /// SHAPES to each other is not such a thing, and this test used to lead
+    /// with exactly that: [`select_device_bearer`] *is*
+    /// `select_device_bearer_result(..).ok()`, and `r.ok().is_some() ==
+    /// r.is_ok()` holds for every `Result` by definition, so the assertion
+    /// could not fail for any implementation of the selector while being
+    /// billed as the mutation-detecting one.
     ///
-    /// 1. **Ok/Err tracks the request path exactly.** Add a fall-through to
-    ///    the resolver and the `.ok()` wrapper changes with it, so nothing can
-    ///    start naming a slot that had no bearing on the refusal.
+    /// Three properties, each a mutation this catches:
+    ///
+    /// 1. **Both shapes hand back the token this cell stored, or nothing.**
+    ///    A hit that starts serving a slot the selector never consulted — a
+    ///    non-default tenant handed the legacy JWT — is a substitution, and
+    ///    every `Ok` cell here used to assert nothing whatsoever.
     /// 2. **Only the DEFAULT tenant's miss reports the legacy slot.** Telling
     ///    an operator to fix a credential the selector never consulted is the
     ///    same class of misdirection as the pairing advice this phase removed.
     /// 3. **No cause ever names a `Usable` slot.** A usable slot yields a
-    ///    token, and a cause is only built where there is none — so
-    ///    "sent anonymously; slot usable" is now unconstructible rather than
-    ///    merely unlikely. That rendering WAS reachable while the classifier
-    ///    re-read the slots after the decision and the refresher landed one in
-    ///    between.
+    ///    token, and a cause is only built where there is none — so *"sent
+    ///    anonymously; slot usable"* is reported by no production path (the
+    ///    type itself permits it; see [`NoCredential`]). That rendering WAS
+    ///    reachable while the classifier re-read the slots after the decision
+    ///    and the refresher landed one in between.
+    ///
+    /// **What the matrix covers, stated in states rather than fixtures.** The
+    /// cells are 4 own-slot fixtures × 3 legacy × 2 is-default, but `expired`
+    /// and `opaque` both classify [`SlotState::PresentButDead`], so the axes
+    /// drive 3 distinct [`SlotState`]s each: **18 of the 32** state-level
+    /// combinations (4 × 4 × 2). The 14 uncovered ones are exactly those
+    /// naming [`SlotState::Unreadable`], which is on neither axis because
+    /// reaching it needs a store that ERRORS and this module has no such
+    /// fixture. It is covered structurally instead — by
+    /// `credential_state_keeps_an_unreadable_slot_unknown` for the rule, and
+    /// by `a_credential_miss_names_which_of_the_four_causes_it_was` for the
+    /// rendering. Manufacturing an `Unreadable` cell here would assert against
+    /// the fabrication; an honest gap is worth more.
+    ///
+    /// Scopes: [`TenantScope::Owned`] and [`TenantScope::Device`] are both
+    /// driven on every cell. [`TenantScope::Unresolved`] is not — its own arm
+    /// refuses on a different axis (the binding count) before reading a slot
+    /// at all, and is pinned by
+    /// `the_unresolved_refusal_names_the_count_it_branched_on`,
+    /// `unresolved_scope_degrades_to_unauthenticated_on_multi_bound_device`
+    /// and `unresolved_and_device_diverge_exactly_when_multi_bound`.
     #[test]
     fn the_reported_cause_is_the_selectors_own_reads() {
         let expired = jwt_for("expired", chrono::Utc::now().timestamp() - 3600);
@@ -4012,45 +4049,110 @@ mod bearer_selection_tests {
                     let default_tenant = Some(if is_default { t } else { stranger });
                     let where_ =
                         format!("slot={slot_label} legacy={legacy_label} is_default={is_default}");
+                    let own_state = read_tenant_slot(&mgr, &t).state();
+                    let legacy_state = read_legacy_slot(&mgr).state();
+
+                    // The ONE token this cell may hand back for T, named from
+                    // the fixtures it stored rather than read back out of the
+                    // thing under test: T's own slot when that is usable, and
+                    // the legacy slot ONLY where T is the default binding.
+                    let expected: Option<&str> = if *slot_label == "usable" {
+                        slot.as_deref()
+                    } else if is_default && *legacy_label == "usable" {
+                        legacy.as_deref()
+                    } else {
+                        None
+                    };
 
                     let result = select_device_bearer_result(&mgr, Some(&t), default_tenant);
-                    let selected = select_device_bearer(&mgr, Some(&t), default_tenant);
+
+                    // Oracle: the module's shared credential rule, a SECOND
+                    // derivation of the same predicate over the same store —
+                    // not a second spelling of this call's own answer.
                     assert_eq!(
-                        result.is_ok(),
-                        selected.is_some(),
-                        "{where_}: the diagnostic and the request path must be ONE decision"
+                        credential_state(own_state, is_default, legacy_state).can_act(),
+                        Some(result.is_ok()),
+                        "{where_}: the diagnostic and the shared credential rule must be ONE \
+                         decision"
+                    );
+                    // And the request path lands on the same fixture — which
+                    // is what makes "these two are one decision" a claim about
+                    // this code rather than about `Result`.
+                    assert_eq!(
+                        select_device_bearer(&mgr, Some(&t), default_tenant).as_deref(),
+                        expected,
+                        "{where_}: the request path must hand back this cell's own fixture"
                     );
 
-                    let Err(cause) = result else { continue };
-                    match cause {
-                        NoCredential::Slot(own) => {
+                    match result {
+                        Ok(tok) => assert_eq!(
+                            Some(tok.as_str()),
+                            expected,
+                            "{where_}: a hit must be the fixture this cell stored — handing \
+                             back a slot the selector never consulted is a substitution"
+                        ),
+                        Err(NoCredential::Slot(own)) => {
                             assert!(
                                 !is_default,
                                 "{where_}: the default tenant's miss falls through to the \
                                  legacy slot, so it cannot be decided by one read"
                             );
                             assert_eq!(
-                                own,
-                                read_tenant_slot(&mgr, &t).state(),
+                                own, own_state,
                                 "{where_}: the cause must name the slot the selector read"
                             );
                             assert_ne!(own, SlotState::Usable, "{where_}");
                         }
-                        NoCredential::DefaultBindingFallback { own, legacy } => {
+                        Err(NoCredential::DefaultBindingFallback {
+                            own,
+                            legacy: legacy_seen,
+                        }) => {
                             assert!(
                                 is_default,
                                 "{where_}: only the DEFAULT tenant consults the legacy slot, \
                                  so only it may report one"
                             );
+                            assert_eq!(own, own_state, "{where_}");
                             assert_ne!(
                                 own,
                                 SlotState::Usable,
                                 "{where_}: a usable slot yields a token, never a cause"
                             );
-                            assert_ne!(legacy, SlotState::Usable, "{where_}");
-                            assert_eq!(legacy, read_legacy_slot(&mgr).state(), "{where_}");
+                            assert_ne!(legacy_seen, SlotState::Usable, "{where_}");
+                            assert_eq!(legacy_seen, legacy_state, "{where_}");
                         }
-                        other => panic!("{where_}: an Owned scope cannot reach {other:?}"),
+                        Err(other) => {
+                            panic!("{where_}: an Owned scope cannot reach {other:?}")
+                        }
+                    }
+
+                    // The DEVICE scope over the same store: it reads the
+                    // legacy slot and nothing else, whichever tenant is the
+                    // default, and never T's own.
+                    let device = select_scoped_bearer_lazy_result(
+                        &mgr,
+                        TenantScope::Device,
+                        default_tenant,
+                        || panic!("{where_}: the Device scope must not read the binding count"),
+                    );
+                    let device_expected: Option<&str> = if *legacy_label == "usable" {
+                        legacy.as_deref()
+                    } else {
+                        None
+                    };
+                    assert_eq!(
+                        device.as_deref().ok(),
+                        device_expected,
+                        "{where_}: the Device scope presents the DEFAULT slot's own token, or \
+                         nothing"
+                    );
+                    if let Err(cause) = device {
+                        assert_eq!(
+                            cause,
+                            NoCredential::Slot(legacy_state),
+                            "{where_}: a Device-scope miss names the legacy read that decided \
+                             it"
+                        );
                     }
                 }
             }
