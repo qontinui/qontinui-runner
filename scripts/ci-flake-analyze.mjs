@@ -216,6 +216,33 @@ const DOCTEST_HEADER_RE = /^Doc-tests\s+(\S+)$/;
 const HASH_SUFFIX_RE = /-[0-9a-f]{6,}$/i;
 
 /**
+ * The `<binary>` id of a built test executable's PATH: its basename, `.exe`
+ * stripped, cargo's `-<hash>` metadata suffix stripped. Returns `undefined`
+ * when the basename carries no hash — that is how a toolchain INVOCATION
+ * (`.../bin/rustc`) is told apart from a test binary being launched, and it is
+ * also what makes a hand-copied, un-hashed executable unresolvable rather than
+ * silently mis-attributed.
+ *
+ * This is the ONE normaliser for the `<binary>::<test path>` id grammar.
+ * `binaryIdFromAnnouncementLine` below applies it to a `Running` line, and
+ * `scripts/test-interleave-census.mjs` applies it to the `executable` field of
+ * `cargo test --no-run --message-format=json` so an id parsed from a log maps
+ * back to the executable that produced it by the same rule — a second
+ * normaliser there would be a second place for the two to drift apart (plan
+ * `2026-09-17-runner-tests-share-in-process-mutable-state`, Phase 0).
+ *
+ * @param {string} executablePath a Linux path or a Windows `.exe` path
+ * @returns {string|undefined}
+ */
+export function binaryIdFromExecutablePath(executablePath) {
+  const path = String(executablePath ?? "");
+  const base = path.split(/[\\/]/).pop() ?? path;
+  const noExt = base.replace(/\.exe$/i, "");
+  if (!HASH_SUFFIX_RE.test(noExt)) return undefined;
+  return noExt.replace(HASH_SUFFIX_RE, "");
+}
+
+/**
  * Does this (already-trimmed) line announce which binary subsequent `test ...`
  * lines belong to? Returns the binary/crate id, or `undefined` if the line is
  * either not an announcement at all, or is a `Running` line for a toolchain
@@ -226,15 +253,12 @@ const HASH_SUFFIX_RE = /-[0-9a-f]{6,}$/i;
  * @param {string} trimmedLine
  * @returns {string|undefined}
  */
-function binaryIdFromAnnouncementLine(trimmedLine) {
+export function binaryIdFromAnnouncementLine(trimmedLine) {
   const doc = DOCTEST_HEADER_RE.exec(trimmedLine);
   if (doc) return doc[1];
   const running = RUNNING_BINARY_RE.exec(trimmedLine);
   if (!running) return undefined;
-  const base = running[1].split(/[\\/]/).pop() ?? running[1];
-  const noExt = base.replace(/\.exe$/i, "");
-  if (!HASH_SUFFIX_RE.test(noExt)) return undefined;
-  return noExt.replace(HASH_SUFFIX_RE, "");
+  return binaryIdFromExecutablePath(running[1]);
 }
 
 /**
