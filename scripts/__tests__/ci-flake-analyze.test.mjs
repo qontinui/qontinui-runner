@@ -650,6 +650,8 @@ test("redactSecrets: JWTs, Bearer, GitHub tokens and any token/secret/password/j
   assert.equal(redactSecrets("token_count: 3, timeout_ms: 20"), "token_count=[redacted], timeout_ms: 20", "a `token_count` field is redacted (contains `token`); `timeout_ms` is not");
   assert.equal(redactSecrets("TokenKind::Secret and SecretString::expose_secret"), "TokenKind::Secret and SecretString::expose_secret", "a Rust path separator is not a key/value separator");
   assert.equal(redactSecrets('{"token": "a b c", "n": 1}'), '{"token"=[redacted], "n": 1}', "a quoted value with whitespace is consumed whole");
+  assert.equal(redactSecrets('{"token": "a \\"b\\" c", "n": 1}'), '{"token"=[redacted], "n": 1}', "an escaped quote inside the value is not its closing quote");
+  assert.equal(redactSecrets(redactSecrets('{"token": "a \\"b\\" c", "n": 1}')), '{"token"=[redacted], "n": 1}', "idempotent over the escaped-quote shape");
   assert.equal(redactSecrets("password=hun ter2"), "password=[redacted] ter2", "an unquoted value ends at whitespace (the tail is not the secret)");
   assert.equal(redactSecrets(null), "");
 });

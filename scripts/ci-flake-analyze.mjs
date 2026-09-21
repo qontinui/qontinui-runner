@@ -191,8 +191,9 @@ export function redactSecrets(text) {
     .replace(
       // `:(?!:)` keeps a Rust path separator (`TokenKind::Secret`) from
       // reading as key/value; a quoted value is consumed to its closing
-      // quote so `"token": "a b c"` cannot leak its tail.
-      /("?)([A-Za-z0-9_]*(?:token|secret|password|jwt|api_key)[A-Za-z0-9_]*)("?)\s*(?:=|:(?!:))\s*(?:"[^"]*"|[^\s",}]+)/gi,
+      // quote (skipping `\"` escapes, never past a newline) so
+      // `"token": "a b c"` and `"token": "a \"b\" c"` cannot leak a tail.
+      /("?)([A-Za-z0-9_]*(?:token|secret|password|jwt|api_key)[A-Za-z0-9_]*)("?)\s*(?:=|:(?!:))\s*(?:"(?:[^"\\\n]|\\.)*"?|[^\s",}]+)/gi,
       "$1$2$3=[redacted]",
     );
 }
