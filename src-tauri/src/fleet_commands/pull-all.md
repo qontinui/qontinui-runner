@@ -119,48 +119,164 @@ For each repository:
 
 5. **Stale-orphan scan (after handling the current branch).** Case D fires only when the orphan IS currently checked out. But typical operator flow is *merge PR → branch auto-deletes on remote → operator stays on `main`* — leaving an undetected stale orphan locally. Sweep them up via:
 
+   **Scan TWO classes, because `gone` alone is a blind spot.** `%(upstream:track)` reads **empty**, not `gone`, for a branch that never had tracking configured — no `-u` on the push, or a still-live remote branch the local config never pointed at — so a `gone`-only test never emits those branches at all. Measured 2026-09-16/17: **~19 of the 49** branches removed by hand that session sat in exactly that blind spot, several with a **still-existing** remote counterpart the scan never saw either. The scan below **widens**; it does not swap one blind spot for another. Every `gone` row still comes out, and the never-tracked population comes out beside it as a **separate, labelled class**, so the operator can tell *“upstream deleted”* from *“never tracked”* and pick the right next step for each. The currently-checked-out branch is still excluded (Case D's territory), and so is the repo default — an untracked `main` is not a cleanup candidate.
+
    ```bash
-   # The two field numbers are passed in as awk VARIABLES (`bcol`, `tcol`) and the program
-   # references them as `$bcol` / `$tcol`. Do NOT "simplify" those back to a dollar sign
-   # followed by a literal digit: in a slash-command markdown body such a sequence is a
-   # HARNESS ARGUMENT PLACEHOLDER, not an awk field reference. Claude Code substitutes the
-   # invocation's argument words into this body BEFORE injecting it, indexed from ZERO (the
-   # zeroth placeholder is the FIRST word), and the substitution is TEXTUAL — it does not
-   # know awk from shell. It would rewrite these field references into bare awk variable
-   # names, which awk reads as EMPTY uninitialised variables. Measured both shapes: with two
-   # argument words the scan prints one BLANK LINE per branch whose upstream is gone — the
-   # current-branch exclusion is defeated at the same time, so that one is emitted too; with
-   # three or more argument words it matches nothing and reports ZERO stale orphans. Both
-   # exit 0. Neither is an error — it is a silent wrong answer. (This comment spells no such
-   # sequence of its own on purpose: it would be substituted too, garbling the warning.)
-   git for-each-ref refs/heads/ --format='%(refname:short) %(upstream:track,nobracket)' \
-     | awk -v cur="$current" -v bcol=1 -v tcol=2 '$tcol == "gone" && $bcol != cur { print $bcol }'
+   # The three field numbers are passed in as awk VARIABLES (`bcol`, `tcol`, `ucol`) and the
+   # program references them as `$bcol` / `$tcol` / `$ucol`. Do NOT "simplify" those back to
+   # a dollar sign followed by a literal digit: in a slash-command markdown body such a
+   # sequence is a HARNESS ARGUMENT PLACEHOLDER, not an awk field reference. Claude Code
+   # substitutes the invocation's argument words into this body BEFORE injecting it, indexed
+   # from ZERO (the zeroth placeholder is the FIRST word), and the substitution is TEXTUAL —
+   # it does not know awk from shell. It would rewrite these field references into bare awk
+   # variable names, which awk reads as EMPTY uninitialised variables. Measured both shapes:
+   # with two argument words the scan prints one BLANK LINE per branch whose upstream is gone
+   # — the current-branch exclusion is defeated at the same time, so that one is emitted too;
+   # with three or more argument words it matches nothing and reports ZERO stale orphans.
+   # Both exit 0. Neither is an error — it is a silent wrong answer. (This comment spells no
+   # such sequence of its own on purpose: it would be substituted too, garbling the warning.)
+   #
+   # The separator is a TAB (`%09`), not a space: a refname can contain neither a tab nor any
+   # other ASCII control character, so the split is unambiguous even when the track field is
+   # empty — which is exactly the never-tracked case this scan exists to stop missing.
+   # `%(upstream)` is the third field: empty means NO upstream is configured at all, which is
+   # a different fact from `gone` (upstream configured, remote ref deleted).
+   git for-each-ref refs/heads/ \
+       --format='%(refname:short)%09%(upstream:track,nobracket)%09%(upstream)' \
+     | awk -F'\t' -v cur="$current" -v def="$default" -v bcol=1 -v tcol=2 -v ucol=3 '
+         $bcol == cur                 { next }
+         $tcol == "gone"              { print "gone" FS $bcol; next }
+         $ucol == "" && $bcol != def  { print "untracked" FS $bcol }'
    ```
 
    **For each hit, annotate with its merge status before recording it** — the operator needs that to decide between safe-delete (`git branch -d`) and force-delete (`git branch -D`). Without the annotation, the operator has to run `gh pr list --head <name> --state merged` once per stale branch by hand; with it, the report is directly actionable.
 
+   **ONE `gh` call per repo, not one per branch.** The per-branch form was already
+   mis-sized before this widening — measured on `qontinui-claude-config` 2026-09-20 the
+   scan yields **355** hits (251 `gone` + 104 never-tracked), so the old shape meant 355
+   sequential API calls for ONE repo, well into GitHub's secondary rate limit, times ~14
+   repos. Build the head→PR map once and look each branch up locally:
+
    ```bash
-   while IFS= read -r br; do
+   # One call per repo, and THREE failure modes that must not read as "no merged PR":
+   #  (a) the query fails with healthy auth — rate limit, 5xx, or a repo whose remote is
+   #      not a GitHub host at all (Phase 1 walks every git repo it finds, so this is
+   #      routine). `gh auth status` still SUCCEEDS, so step 6's check does not fire and
+   #      cannot be relied on here — gate the wording on `prmap_ok` instead.
+   #  (b) the map is TRUNCATED. `gh pr list` returns newest-first, so a cap drops the
+   #      OLDEST merged PRs — exactly the ones the oldest stale branches point at. This
+   #      repo had 989 merged PRs on 2026-09-20, eleven below a 1000 cap. A cap you
+   #      cannot detect is the silent-wrong-answer class this file exists to forbid, so
+   #      assert it was not hit rather than choosing a number and hoping.
+   #  (c) `mktemp` fails. An empty filename makes mawk read STDIN — which here is the
+   #      loop's own branch list — so the first iteration would swallow the scan and the
+   #      loop would end, exit 0. /dev/null closes that hole, but it does NOT by itself
+   #      fail closed: the verdict does. `prmap_ok` is forced to 0 on that path BEFORE
+   #      the query can run, which is what makes the annotation honest — see the branch
+   #      order below.
+   prmap=$(mktemp) || prmap=/dev/null
+   # NOTE the guard: `rm -f /dev/null` is a permission error as a normal user and, as
+   # root (CI containers routinely are), it UNLINKS THE DEVICE NODE for the life of the
+   # container. Guard both removals, not just this one.
+   trap '[ "$prmap" = /dev/null ] || rm -f "$prmap"' EXIT   # already trapping EXIT? CHAIN it
+   prmap_cap=5000
+   if [ "$prmap" = /dev/null ]; then
+     # No map file, so merge status cannot be established for ANY branch in this repo.
+     # This arm must come FIRST: `gh ... > /dev/null` SUCCEEDS and `wc -l < /dev/null`
+     # is 0, so letting the query run into /dev/null would satisfy both the success test
+     # and the truncation test and set prmap_ok=1 — "map is known good" — annotating
+     # every branch "no merged PR" with full confidence. That is the silent-wrong-answer
+     # class this whole block exists to prevent, reached through its own fallback.
+     prmap_ok=0
+   elif gh pr list --state merged --limit "$prmap_cap" --json number,headRefName \
+          -q '.[] | "\(.headRefName)\t\(.number)"' > "$prmap" 2>/dev/null; then
+     if [ "$(wc -l < "$prmap")" -ge "$prmap_cap" ]; then prmap_ok=truncated; else prmap_ok=1; fi
+   else
+     prmap_ok=0
+   fi
+
+   while IFS=$'\t' read -r cls br; do
      [ -z "$br" ] && continue
-     pr=$(gh pr list --head "$br" --state merged --json number -q '.[0].number' 2>/dev/null)
-     if [ -n "$pr" ]; then
-       STALE_ORPHANS+=("$repo: $br (PR #$pr merged — safe to force-delete)")
-     else
-       STALE_ORPHANS+=("$repo: $br (no merged PR — investigate; may hold WIP)")
-     fi
+     # Local lookup against the map; no network inside the loop. `</dev/null` so a
+     # degenerate $prmap can never consume the loop's stdin (see (c) above).
+     pr=$(awk -F'\t' -v b="$br" -v bcol=1 -v ncol=2 '$bcol == b { print $ncol; exit }' "$prmap" </dev/null)
+     # An absent $pr means "no merged PR" ONLY when the map is known good. Otherwise the
+     # honest annotation is that merge status was not established.
+     case "$prmap_ok" in
+       1)         unverified="" ;;
+       truncated) unverified="merge status unverified — merged-PR map truncated at $prmap_cap; older PRs missing" ;;
+       *)         unverified="merge status unverified — gh query failed" ;;
+     esac
+     case "$cls" in
+       gone)
+         if [ -n "$pr" ]; then
+           STALE_ORPHANS+=("$repo: $br (upstream gone; PR #$pr merged — safe to force-delete)")
+         else
+           STALE_ORPHANS+=("$repo: $br (upstream gone; ${unverified:-no merged PR — investigate; may hold WIP})")
+         fi
+         ;;
+       untracked)
+         # Local-only ref lookup, no network: a never-tracked branch may still have a live
+         # remote counterpart nobody ever pointed the local config at.
+         # Resolve the remote rather than hardcoding `origin`: this line makes a POSITIVE
+         # claim the operator acts on, so in a repo whose remote is named otherwise a
+         # hardcoded `origin` would assert "no remote counterpart" about a branch that has
+         # one. (Elsewhere in this file `origin` is hardcoded only for FETCHES, which fail
+         # visibly; an assertion must not.)
+         # `branch.<br>.remote` CAN be set while %(upstream) is empty (remote set, merge
+         # unset), so this lookup is not dead code for the untracked class. When it is
+         # empty, prefer `origin` — every other remote reference in this file hardcodes it
+         # — and fall back to the first remote only if there is no `origin`, SAYING SO,
+         # because `git remote | head -1` is alphabetical: in a repo with `aaa-fork` and
+         # `origin` it picks `aaa-fork` and would assert "no remote counterpart" about a
+         # branch that exists on origin. That is the false positive this block prevents.
+         rmt=$(git config --get "branch.$br.remote" 2>/dev/null)
+         assumed=""
+         if [ -z "$rmt" ]; then
+           if git remote | grep -qx origin; then rmt=origin
+           else rmt=$(git remote | head -1); assumed=", remote assumed"; fi
+         fi
+         if [ -z "$rmt" ]; then
+           rem="no remote configured in this repo"
+         elif git show-ref --verify --quiet "refs/remotes/$rmt/$br"; then
+           rem="remote counterpart still exists on '$rmt'$assumed"
+         else
+           rem="no remote counterpart on '$rmt'$assumed"
+         fi
+         if [ -n "$pr" ]; then
+           UNTRACKED_ORPHANS+=("$repo: $br (never tracked; $rem; PR #$pr merged)")
+         else
+           UNTRACKED_ORPHANS+=("$repo: $br (never tracked; $rem; ${unverified:-no merged PR — investigate; may hold WIP})")
+         fi
+         ;;
+     esac
    # Same awk-variable field references as the scan above, for the same reason — see the
    # comment there before touching them.
-   done < <(git for-each-ref refs/heads/ --format='%(refname:short) %(upstream:track,nobracket)' \
-              | awk -v cur="$current" -v bcol=1 -v tcol=2 '$tcol == "gone" && $bcol != cur { print $bcol }')
+   done < <(git for-each-ref refs/heads/ \
+              --format='%(refname:short)%09%(upstream:track,nobracket)%09%(upstream)' \
+            | awk -F'\t' -v cur="$current" -v def="$default" -v bcol=1 -v tcol=2 -v ucol=3 '
+                $bcol == cur                 { next }
+                $tcol == "gone"              { print "gone" FS $bcol; next }
+                $ucol == "" && $bcol != def  { print "untracked" FS $bcol }')
+   [ "$prmap" = /dev/null ] || rm -f "$prmap"
    ```
 
-   When `gh` is unavailable (see step 6), annotate every stale orphan with `(merge status unverified — gh unavailable)` instead of skipping the query — the operator still needs to see the branch exists.
+   **Three ways merge status can be UNESTABLISHED, and each gets its own wording** — the code above emits these; do not collapse them, and do not annotate any of them "no merged PR":
+   - the map query failed (rate limit, 5xx, a non-GitHub remote, or `gh` unavailable — note `gh auth status` succeeding does NOT rule the first three out): `merge status unverified — gh query failed`;
+   - the map was truncated at the cap, so the OLDEST merged PRs are missing: `merge status unverified — merged-PR map truncated at <cap>; older PRs missing`;
+   - `mktemp` failed, so there is no map at all: same `gh query failed` wording, reached through `prmap_ok=0`.
 
-   **Do NOT auto-delete** — same reasoning as Case D's "Do NOT auto-delete" rule. Even when a PR is confirmed merged, the operator is the one who decides whether to act on it (a stale orphan might be deliberately kept for archaeology, or might be the source of comments still referenced in the PR). The annotation removes the *verification* step; the delete step is theirs.
+   In every one of them the operator still needs to see the branch exists, so the hit is reported — with the status unestablished rather than asserted absent.
+
+   **Two properties of this section are DELIBERATE, and a widening must preserve both.**
+   (1) The scan **already** annotated every hit with its merge status — now via the repo's merged-PR map (`gh pr list --state merged`, built once above; the per-branch `--head` form it replaced is gone from the executable path) — so what was missing was *detection coverage*, not annotation — the never-tracked class is fed through the same annotation path and no annotation logic changed.
+   (2) `pull-all` **does NOT auto-delete**, by the explicit standing decision restated immediately below. The never-tracked class arms nothing: it is surfaced for the operator exactly as the `gone` class is, and adding it must never be read as licence to delete either one.
+
+   **Do NOT auto-delete** — same reasoning as Case D's "Do NOT auto-delete" rule, and it covers **both** classes. Even when a PR is confirmed merged, the operator is the one who decides whether to act on it (a stale orphan might be deliberately kept for archaeology, or might be the source of comments still referenced in the PR). The annotation removes the *verification* step; the delete step is theirs.
 
    Exclude the currently-checked-out branch from this scan; that's Case D's territory, and the report should not double-count.
 
-   Cost: one `gh pr list` per stale orphan. Typical N is 0–5; pathological N (50+ accumulated orphans) is the operator's signal that they should be doing this cleanup more often anyway.
+   Cost: **one** `gh pr list` per REPO (not per branch — see the map above), plus one local `awk` lookup and, for never-tracked hits, one local `git show-ref` per hit. No network inside the loop. ⚠️ **N is not 0–5 on this fleet and has not been for a long time** — measured on `qontinui-claude-config` alone on 2026-09-20: **355** hits (251 `gone` + 104 never-tracked) out of 387 local branches. The old "typical N is 0–5" was already wrong for the `gone` class before this widening; the never-tracked class simply makes the true size visible, because it was never being counted at all. A four-figure fleet total is the signal to run `/cleanup-steward`, not to run `/pull-all` more often.
 
 6. **If `gh` is unavailable or unauthenticated** (`gh auth status` fails): fall back to treating ALL non-default branches as "drifted feature branch" rather than "PR-protected." Less protective (a real open PR might get downgraded to feature-branch handling) but still correct: the answer is the same — don't pull it.
 
@@ -204,6 +320,7 @@ echo "=== Pull-all summary ==="
 if [ ${#PULLED[@]}              -gt 0 ]; then printf "Pulled (default branch): %s\n" "${PULLED[@]}";          fi
 if [ ${#ORPHAN_SWITCHED[@]}     -gt 0 ]; then printf "Orphan-switched (Case D, was on a deleted-upstream branch; now on default): %s\n" "${ORPHAN_SWITCHED[@]}"; fi
 if [ ${#STALE_ORPHANS[@]}       -gt 0 ]; then printf "Stale orphan (not checked out; upstream gone — cleanup candidate): %s\n" "${STALE_ORPHANS[@]}";       fi
+if [ ${#UNTRACKED_ORPHANS[@]}   -gt 0 ]; then printf "Never-tracked local branch (not checked out; no upstream ever configured — cleanup candidate): %s\n" "${UNTRACKED_ORPHANS[@]}"; fi
 if [ ${#PR_PROTECTED[@]}        -gt 0 ]; then printf "PR-protected (skipped):  %s\n" "${PR_PROTECTED[@]}";    fi
 if [ ${#DRIFTED_FEATURE[@]}     -gt 0 ]; then printf "Feature branch drifted (skipped): %s\n" "${DRIFTED_FEATURE[@]}"; fi
 if [ ${#DETACHED_HEAD[@]}       -gt 0 ]; then printf "Detached HEAD (skipped — finish in-flight op or checkout a branch): %s\n" "${DETACHED_HEAD[@]}";  fi
@@ -291,15 +408,32 @@ After processing all repositories, provide a summary:
   - `gh pr list --head <orphan-branch> --state merged` → was a PR merged? If yes, branch content is on default (likely via squash) and the local branch is safe to delete with `git branch -D <orphan-branch>`.
   - `git log --oneline origin/<default>..<orphan-branch>` → commits NOT directly in default (expected non-empty for squash-merged PRs even though content is merged).
 
-### Stale Orphan Branches (not checked out — local cleanup candidates)
+### Stale Orphan Branches (upstream GONE, not checked out — local cleanup candidates)
 Local branches whose upstream is gone but that aren't the currently-checked-out branch — typically the residue of "merge PR → branch auto-deletes on remote → operator stays on `main`". Pre-annotated with PR merge status so the operator can decide immediately; never auto-deleted.
-- repo-name: `<branch>` (PR #N merged — safe to force-delete)
+- repo-name: `<branch>` (upstream gone; PR #N merged — safe to force-delete)
   - `git branch -D <branch>`
-- repo-name: `<branch>` (no merged PR — investigate; may hold WIP)
+- repo-name: `<branch>` (upstream gone; no merged PR — investigate; may hold WIP)
   - `git log --oneline origin/<default>..<branch>` — see what's there
   - then `git branch -d <branch>` (safe-delete; refuses if commits would be lost) or `git branch -D <branch>` (force-delete; only after manual review)
-- repo-name: `<branch>` (merge status unverified — gh unavailable)
-  - Run `gh auth status` and retry, or check the PR manually before deleting
+- repo-name: `<branch>` (upstream gone; merge status unverified — gh query failed)
+  - Run `gh auth status` and retry. Note a healthy `gh auth status` does not clear this: the map query also fails on a rate limit, a 5xx, or a repo whose remote is not a GitHub host at all. Check the PR manually before deleting
+- repo-name: `<branch>` (upstream gone; merge status unverified — merged-PR map truncated at N; older PRs missing)
+  - The repo has more merged PRs than the map cap, and the map drops the OLDEST — which is where the oldest stale branches point. Raise the cap and re-run, or check this PR by hand
+
+### Never-Tracked Local Branches (NO upstream ever configured — local cleanup candidates)
+A **distinct class**, rendered separately on purpose: `%(upstream:track)` is *empty*, not `gone`, for these, so the `gone`-only scan never emitted them — ~19 of the 49 branches hand-removed on 2026-09-16/17 were in this blind spot. Empty means no upstream was ever configured (no `-u` on the push, or a live remote branch the local config never pointed at), which is **not** the same fact as "the remote branch was deleted" — hence the separate section. Same annotation path, same rule: **never auto-deleted**.
+- repo-name: `<branch>` (never tracked; remote counterpart still exists on '<remote>'; PR #N merged)
+  - The remote branch is still there — deleting the local ref loses nothing, but confirm the PR is the one you think it is first
+- repo-name: `<branch>` (never tracked; no remote counterpart on '<remote>'; PR #N merged)
+  - Content landed (likely via squash); `git branch -D <branch>` after review
+- repo-name: `<branch>` (never tracked; remote counterpart still exists on '<remote>'; no merged PR — investigate; may hold WIP)
+  - **The most interesting row in this class**: a branch with a LIVE remote counterpart and no merged PR — pushed at some point, never proposed, and never tracked locally. `git log --oneline origin/<default>..<branch>` to see what is there, and check whether the remote branch is someone else's live work before touching either ref
+- repo-name: `<branch>` (never tracked; no remote counterpart on '<remote>'; no merged PR — investigate; may hold WIP)
+  - `git log --oneline origin/<default>..<branch>` — see what's there; this is the class most likely to hold unpushed work, since nothing ever pushed it
+- repo-name: `<branch>` (never tracked; <remote status>; merge status unverified — gh query failed)
+  - As above — a healthy `gh auth status` does not clear it
+- repo-name: `<branch>` (never tracked; <remote status>; merge status unverified — merged-PR map truncated at N; older PRs missing)
+  - As above — raise the cap and re-run
 
 ### PR-Protected (skipped — has open PR)
 - repo-name (branch) — PR #N open; default has X new commits; branch X commits behind origin
@@ -335,6 +469,6 @@ Local branches whose upstream is gone but that aren't the currently-checked-out 
 - **Never force push** — this command only pulls
 - **Never rebase a branch with an open PR** — rewriting committed SHAs breaks the PR's review history. Always treat PR-protected branches as skipped (Phase 2, Case B).
 - **Never auto-stash on a non-default branch** — WIP on a feature branch belongs to that feature; pull-all has no business touching it. Auto-stashing is reserved for two paths only: (1) the default-branch fast-forward path (Case A); (2) the orphan-branch switch path (Case D), where the upstream is `gone` and staying on the branch is itself the worse option than stashing-then-switching.
-- **Never auto-delete an orphan branch** — even after Case D switches to default, the orphan local ref is retained. Squash-merged PRs leave their orphans with commits not directly in default by SHA, so a naive merge-check is wrong; force-deleted-without-merge orphans may hold real WIP. The Phase 4 report gives the user the exact commands; the decision is theirs. **Same rule applies to the Phase-2 step-5 stale-orphan scan** (orphans whose upstream is gone but that aren't currently checked out) — surface them in the "Stale Orphan Branches" report section; never auto-delete.
+- **Never auto-delete an orphan branch** — even after Case D switches to default, the orphan local ref is retained. Squash-merged PRs leave their orphans with commits not directly in default by SHA, so a naive merge-check is wrong; force-deleted-without-merge orphans may hold real WIP. The Phase 4 report gives the user the exact commands; the decision is theirs. **Same rule applies to BOTH classes of the Phase-2 step-5 stale-orphan scan** — orphans whose upstream is `gone` but that aren't currently checked out, and branches that never had an upstream configured at all (empty, not `gone`). Surface the first in the "Stale Orphan Branches" report section and the second in "Never-Tracked Local Branches"; never auto-delete either. Widening what the scan *detects* changes nothing about what `pull-all` is allowed to *do*.
 - **Background-sync default refs only when safe** — `git fetch origin "$default:$default"` updates the local default ref without checking it out, but it silently no-ops if you're already on default or have local commits ahead. Both no-ops are correct; do not work around them.
 - **Log every decision** so the user can review what was resolved and why
