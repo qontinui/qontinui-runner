@@ -1012,8 +1012,11 @@ async fn schedule_tail(
                     let on_disk = std::fs::metadata(&path_for_park).map(|m| m.len()).ok();
                     if revive_after_park(seen_len, on_disk) {
                         debug!(
-                            "transcript_watcher: {} parked at {} having last seen {} bytes but the file is {:?} bytes — reviving",
-                            session_id, cursor, seen_len, on_disk
+                            "transcript_watcher: {} parked at {} having last seen {} bytes but the file is {} bytes — reviving",
+                            session_id,
+                            cursor,
+                            seen_len,
+                            on_disk.unwrap_or(0)
                         );
                         let ev = Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
                             .add_path(path_for_park);
@@ -1048,6 +1051,11 @@ async fn schedule_tail(
 /// its cursor before the fragment on purpose and must then stay parked.
 /// An unreadable length is UNKNOWN and revives nothing — the next real
 /// `Modify` (or the metadata-error park on the revived tail) covers it.
+/// It is `!=` rather than `>` on purpose: a rewrite while parking (shorter
+/// file) must be caught too. A shrink to between the cursor and `seen_len`
+/// (a writer rewriting its own partial last line) therefore costs at most ONE
+/// revive — the revived reader re-seeds `seen_len` from the on-disk length on
+/// its first tick and the next park matches — so this is not a loop.
 fn revive_after_park(seen_len: u64, on_disk: Option<u64>) -> bool {
     on_disk.is_some_and(|len| len != seen_len)
 }
