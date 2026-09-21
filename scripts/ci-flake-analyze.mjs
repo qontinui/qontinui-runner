@@ -169,12 +169,16 @@ export function lastBinaryHasSummary(lines) {
 /**
  * Redact the secret-shaped substrings a captured test panic could carry
  * before it lands anywhere public — a GitHub issue body or comment, a Checks
- * annotation. The three shapes are the ones this fleet's test fixtures
- * actually mint: a JWT (`eyJ…` base64url header, a dot, more), a
- * `Bearer <token>` header, and a `token=`/`secret=`/`password=` pair.
- * Shared by `test-interleave-census.mjs` (annotations, the json's
- * `sample_panic`) and `ci-flake-escalate.mjs` (issue bodies, comments), so
- * the two consumers cannot drift. Idempotent.
+ * annotation. The shapes are the ones a panic message is likely to carry:
+ * a JWT (`eyJ…` base64url header, a dot, more); a `Bearer <token>` header;
+ * a GitHub token (`ghp_…`/`gho_…`/`ghu_…`/`ghs_…`/`ghr_…`, `github_pat_…`);
+ * and any key whose name contains `token`, `secret`, `password`, `jwt` or
+ * `api_key` followed by `=` or `:` — which covers an env pair
+ * (`GITHUB_TOKEN=ghp_…`), a Rust Debug field (`runner_token: "qr_…"`), a
+ * JSON member (`"token": "abc"`) and a query pair (`?token=…`) alike; the
+ * key is kept, the value is not. Shared by `test-interleave-census.mjs`
+ * (annotations, the json's `sample_panic`) and `ci-flake-escalate.mjs`
+ * (issue bodies, comments), so the two consumers cannot drift. Idempotent.
  *
  * @param {string} text
  * @returns {string}
@@ -183,7 +187,11 @@ export function redactSecrets(text) {
   return String(text ?? "")
     .replace(/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_.-]*/g, "[redacted]")
     .replace(/Bearer \S+/g, "Bearer [redacted]")
-    .replace(/\b(token|secret|password)=\S+/gi, "$1=[redacted]");
+    .replace(/gh[pousr]_[A-Za-z0-9]{20,}|github_pat_\S+/g, "[redacted]")
+    .replace(
+      /("?)([A-Za-z0-9_]*(?:token|secret|password|jwt|api_key)[A-Za-z0-9_]*)("?)\s*[=:]\s*"?[^\s",}]+"?/gi,
+      "$1$2$3=[redacted]",
+    );
 }
 
 /**
