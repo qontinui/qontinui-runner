@@ -958,9 +958,11 @@ fn render_counts() -> &'static [AtomicU64; PolicyRenderReason::COUNT] {
 /// ⚠️ **Be precise about what this buys.** At its one call site the guard is
 /// unreachable-false — `Off` and `Observe` have both already returned, so
 /// `mode` there can only be `On` — and moving that call above the early return
-/// would still pass everything, because nothing in the crate calls
-/// `policy_context`. So position still decides behaviour at that site; what the
-/// predicate adds is that the rule is now testable
+/// would still pass CI, because no TEST calls [`policy_context`]. (Production
+/// does: `mcp::sessions` calls it on every `SessionStart`. It is `pub async`
+/// and perfectly callable; what is hard is making it EXERCISABLE under test,
+/// since it reads env and talks to coord.) So position still decides behaviour
+/// at that site; what the predicate adds is that the rule is now testable
 /// (`the_tally_counts_only_the_mode_that_actually_injects`) and that a future
 /// caller inherits it by asking rather than by being placed correctly.
 pub fn should_count(mode: Mode) -> bool {
@@ -1061,6 +1063,14 @@ pub fn render_stats() -> PolicyRenderStats {
     // hand-written sum and silently under-report — the same class the derived
     // `slot()` closed one level down. `served_full_body` is the single source
     // of truth for which arms belong here.
+    //
+    // NOTE for whoever adds that ninth arm: `served_full_body` is a NEGATIVE
+    // list (everything except `Confirmed` and `PullFailed`), so a new arm lands
+    // INSIDE this total by default. That is the conservative direction for a
+    // metric whose job is catching a leaking seam — an over-count is visible,
+    // an under-count is the silence this whole phase exists to end — but it is
+    // a default, not a decision: if the new arm carries no body, add it to
+    // `served_full_body`'s exclusion list as well as to `ALL`.
     let full_body_total: u64 = PolicyRenderReason::ALL
         .iter()
         .filter(|r| r.served_full_body())
@@ -1715,10 +1725,11 @@ pub async fn policy_context(
     // POSITION is still what decides behaviour here: `Off` returned above, and
     // so did `Observe`, so by this line `mode` can only be `On` and
     // `should_count(mode)` is a constant `true`. Moving this call above the
-    // `observe` early-return would still compile and still pass every test,
-    // because nothing in the crate calls `policy_context` — it is an async fn
-    // that reads env and talks to coord, and making it callable from a test is
-    // a bigger change than this phase.
+    // `observe` early-return would still compile and still pass CI, because no
+    // TEST exercises this function. It is not dead — `mcp::sessions` calls it
+    // for every `SessionStart`, and the route is registered there — it is simply
+    // untested: it reads env and talks to coord, so making it EXERCISABLE under
+    // test is a bigger change than this phase.
     //
     // What the predicate buys is therefore NOT coverage of this call site. It
     // is that the RULE — "only the mode that actually injects is counted" — now
@@ -2583,7 +2594,11 @@ mod tests {
         // middle two are the round-1 defect: without the emptiness test they
         // would log as an empty field.
         for raw in [None, Some(""), Some("   "), Some("\t\n")] {
-            assert_eq!(source_for_log(raw), ABSENT_SOURCE, "{raw:?}");
+            // The LITERAL, not the const: this field is a grep contract like
+            // `PolicyRenderReason::as_str`'s eight labels, and comparing a
+            // const against itself would let the spelling change under every
+            // saved query without a test objecting.
+            assert_eq!(source_for_log(raw), "<absent>", "{raw:?}");
             assert!(!source_for_log(raw).is_empty(), "{raw:?}");
         }
         // Anything with content is echoed EXACTLY — the field's job is to say
