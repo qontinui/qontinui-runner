@@ -172,7 +172,6 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     ("bin/qontinui_cli.rs", "not-coord", 1),
     ("ci_node/reporting.rs", "device-jwt-required", 2),
     ("commands/ai_settings.rs", "not-coord", 3),
-    ("commands/productivity.rs", "user-jwt", 1),
     ("coord_doctor.rs", "diagnostic", 1),
     ("coord_mcp.rs", "not-coord", 1),
     ("credential_helper.rs", "device-jwt-required", 1),

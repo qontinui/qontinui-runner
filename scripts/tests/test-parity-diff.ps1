@@ -55,10 +55,10 @@
 # The first step of .github/workflows/published-parity.yml, before any compile.
 # It is NOT wired into ci.yml. The cost of doing so is real but smaller than an
 # earlier version of this comment claimed: ci.yml is inside ci-integrity.yml's
-# scope (that scope is the guard's own trigger, not a "guarded list" — the
+# scope (that scope is the guard's own trigger, not a "guarded list" -- the
 # hand-kept allowlist was replaced by the trigger itself), so a main-based PR
 # editing ci.yml goes red until its author declares the change. That is NOT an
-# operator review — the guard's own error text says "No operator is involved."
+# operator review -- the guard's own error text says "No operator is involved."
 # But note WHICH declaration, because the two are not interchangeable: adding a
 # whole new JOB is additive and needs only `ci:gate-change=declared`, while
 # adding a STEP to an existing job mutates that job's surface. The addition

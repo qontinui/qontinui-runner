@@ -123,6 +123,41 @@ describe("interpretCommand — gate + projection", () => {
     expect(result).toBeNull();
   });
 
+  it("fails the gate when the model reports NO usable confidence — D7", async () => {
+    // `raw.confidence < minConfidence` is a comparison, and a comparison
+    // against a missing value is `false`, so an absent confidence PASSED the
+    // gate that exists to stop a guess. Four spellings of "told us nothing",
+    // each on its own cache key so no hit masks the next.
+    for (const [key, confidence] of [
+      ["no confidence at all", undefined],
+      ["null confidence", null],
+      ["nan confidence", Number.NaN],
+      ["stringly confidence", "0.9"],
+    ] as Array<[string, unknown]>) {
+      mockedInvoke.mockResolvedValueOnce({ tool: "terminal.spawn", args: {}, confidence });
+      expect(await interpretCommand(key, { minConfidence: 0.4 }), key).toBeNull();
+    }
+    // The control: the SAME bag and tool, with a confidence that clears the
+    // floor, resolves. Without this the four above could be passing for any
+    // reason at all.
+    mockedInvoke.mockResolvedValueOnce({ tool: "terminal.spawn", args: {}, confidence: 0.9 });
+    expect(await interpretCommand("real confidence")).not.toBeNull();
+  });
+
+  it("passes a NON-OBJECT args bag through to the binder unlaundered — D4", async () => {
+    // `args: raw.args ?? {}` must normalise the ABSENT bag only. Laundering a
+    // malformed one into `{}` here is what let `{tool: "terminal.close",
+    // args: 5}` reach the handler with an empty bag and close the focused
+    // session, while `{args: "zz"}` was refused — one class, two answers.
+    mockedInvoke.mockResolvedValueOnce({ tool: "terminal.spawn", args: 5, confidence: 0.9 });
+    const scalar = await interpretCommand("scalar bag");
+    expect(scalar?.args).toBe(5 as unknown as Record<string, unknown>);
+
+    mockedInvoke.mockResolvedValueOnce({ tool: "terminal.spawn", args: null, confidence: 0.9 });
+    const absent = await interpretCommand("absent bag");
+    expect(absent?.args).toEqual({});
+  });
+
   it("returns null when the tool id is unknown to the registry", async () => {
     mockedInvoke.mockResolvedValueOnce({
       tool: "made.up.action",

@@ -96,7 +96,6 @@ mod coord_mcp_config;
 // in the runner process and NEVER in the dev-only supervisor.
 mod coord_outside_observer;
 mod coord_questions;
-mod coordinator;
 mod cost_management;
 mod crash_dumps;
 mod crash_observability;
@@ -204,7 +203,6 @@ mod playwright;
 mod pm_detect;
 mod process_capture;
 mod process_helpers;
-mod productivity;
 /// Projects dashboard — the server-side join over the saved-project
 /// registry (`ProjectSnapshot`). See `commands::saved_projects` for the
 /// registry itself.
@@ -233,6 +231,7 @@ mod safe_lock;
 mod saved_api_requests;
 mod scenarios;
 mod scheduler;
+mod scheduler_remote_agent;
 mod scheduler_service;
 mod schema_registry;
 mod screen;
@@ -1433,31 +1432,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
         let pg = select_db_arm(&rt, &profile);
 
-        // Phase 5 startup sweep (productivity-coordinator-completion-reports
-        // §9 "Memory pressure audit"): clear any stale
-        // `assignment_brief_extras` rows on tasks past `pending`. One-shot,
-        // idempotent — safe to run unconditionally. Skipped when the boot
-        // degraded, since there is no database to sweep.
-        //
-        // Gated on `pg_available()` rather than on the arm: before P4 this
-        // (and `bootstrap_dev_apps` below) sat INSIDE the external arm's
-        // success branch, so an embedded-arm runner silently never ran either.
-        // Keep it here.
+        // Gated on `pg_available()` rather than on the arm: before P4
+        // `bootstrap_dev_apps` sat INSIDE the external arm's success branch,
+        // so an embedded-arm runner silently never ran it. Keep it here.
         if crate::database::pg::pg_available() {
-            match rt.block_on(pg.clear_stale_assignment_brief_extras()) {
-                Ok(0) => {}
-                Ok(n) => warn!(
-                    "PG bootstrap: cleared {} stale assignment_brief_extras row(s) \
-                     on non-pending tasks",
-                    n
-                ),
-                Err(e) => warn!(
-                    "PG bootstrap: clear_stale_assignment_brief_extras failed \
-                     (non-fatal): {}",
-                    e
-                ),
-            }
-
             // spec-multi-app Stream F.1: register dev apps (runner, web,
             // supervisor) on startup so the multi-tenant Spec API has entries
             // to serve. Gated on `QONTINUI_DEV_BOOTSTRAP=1` so production
@@ -2160,9 +2138,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         doctor_handle: TokioMutex::new(None),        // Initialized in setup()
         url_lock_manager: Arc::new(crate::executor::UrlLockManager::new()),
         file_registry_manager: Arc::new(crate::executor::FileRegistryManager::new()),
-        upcoming_file_registry: Arc::new(
-            crate::executor::upcoming_file_registry::UpcomingFileRegistry::new(),
-        ),
         file_lock_manager: Arc::new(crate::executor::FileLockManager::new()),
         touch_events_tx: touch_events_tx.clone(),
         ui_bridge_failure_tracker:
@@ -2612,7 +2587,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::discoveries::get_discovery_sync_status,
             commands::discoveries::get_pending_discoveries_cmd,
             commands::discoveries::sync_discoveries,
-            doctor::commands::doctor_get_status,
+            commands::doctor::doctor_get_status,
             doctor::commands::stop_process_by_pid,
             commands::durable_execution::get_iteration_commits,
             commands::durable_execution::get_iteration_diffs,
@@ -2951,43 +2926,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             process_capture::commands::start_managed_process,
             process_capture::commands::stop_all_managed_processes,
             process_capture::commands::stop_managed_process,
-            commands::productivity::acknowledge_advisory,
-            commands::productivity::add_task_dependency,
-            commands::productivity::approve_recommendation,
-            commands::productivity::archive_plan,
-            commands::productivity::auto_review_task,
-            commands::productivity::backfill_completed_tasks_from_history,
-            commands::productivity::check_path_claims,
-            commands::productivity::get_coordinator_decisions,
-            commands::productivity::get_coordinator_leader,
-            commands::productivity::get_escalations,
-            commands::productivity::get_fleet_health,
             prompt_library::list_prompt_templates,
-            commands::productivity::get_coord_http_base,
             commands::coord_mode::get_coord_mode,
-            commands::productivity::spawn_from_plan,
-            commands::productivity::get_plan_recommendations,
-            commands::productivity::get_plan_tasks,
-            commands::productivity::get_recommendations,
-            commands::productivity::get_reflection,
-            commands::productivity::get_task_completion_report,
-            commands::productivity::get_task_detail,
-            commands::productivity::get_upcoming_claims,
-            commands::productivity::launch_coordinator_session,
-            commands::productivity::list_overlapping_intents,
-            commands::productivity::list_plans,
-            commands::productivity::list_plans_filtered,
-            commands::productivity::list_workers,
-            commands::productivity::preview_assignment_brief,
-            commands::productivity::reject_recommendation,
+            commands::deconflict::list_overlapping_intents,
             commands::deconflict::resolve_escalation,
-            commands::productivity::rewind_session,
             commands::knowledge::search_knowledge,
-            commands::productivity::spawn_worker_session,
-            commands::productivity::stop_coordinator_session,
-            commands::productivity::submit_task_completion_report,
-            commands::productivity::summarize_session,
-            commands::productivity::unarchive_plan,
             commands::project_logs::append_project_log,
             commands::project_logs::delete_project_config,
             commands::project_logs::get_project_directories,
@@ -5075,22 +5018,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 let dir = crate::logging::get_crash_dump_dir();
                 crash_dump_app_state.crash_dumps.scan_on_startup(&dir).await;
             });
-
-            // Rehydrate the productivity-stack upcoming-file registry from
-            // PG. The registry is in-memory, so without this any Coordinator
-            // / dispatcher lookups in the first few seconds after restart
-            // would miss claims attached to non-terminal tasks. See
-            // productivity-stack plan §3 "Persistence".
-            {
-                let upcoming_state: Arc<AppState> =
-                    app.state::<Arc<AppState>>().inner().clone();
-                tauri::async_runtime::spawn(async move {
-                    upcoming_state
-                        .upcoming_file_registry
-                        .rehydrate_from_pg(&upcoming_state.pg_db)
-                        .await;
-                });
-            }
 
             // Clear runner log files from previous session
             executor::FileLogger::clear_logs();

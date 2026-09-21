@@ -475,34 +475,30 @@ pub fn inject_contexts(
     (enhanced, used_ids)
 }
 
+/// One observation, reduced to exactly the fields the prompt section
+/// renders.
+///
+/// Declared here rather than borrowed from the storage layer so this
+/// module is a pure formatter: it names no database type, holds no
+/// connection, and is testable from a literal.
+#[derive(Debug, Clone)]
+pub struct ObservationSummary {
+    pub id: i64,
+    pub title: String,
+    pub content_preview: String,
+    pub observation_type: String,
+    pub topic_key: Option<String>,
+    pub revision_count: i32,
+}
+
 /// Format observation memory as a prompt section.
 ///
-/// Fetches relevant observations from PostgreSQL and formats them as a
-/// markdown section for injection into AI prompts. Returns None if PG
-/// is unavailable or no observations found.
+/// Pure formatting: the caller fetches the observations (from
+/// PostgreSQL or anywhere else) and hands them over. Returns None when
+/// there are none.
 ///
-/// Accepts either a project_id (for project-scoped retrieval) or a
-/// search_query (e.g. workflow name) for relevance-based retrieval.
 /// Uses progressive disclosure: 300-char previews with IDs.
-pub async fn format_observation_memory_for_prompt(
-    pg_db: &crate::database::pg::PgDb,
-    project_id: Option<&str>,
-    search_query: Option<&str>,
-) -> Option<String> {
-    let pg = pg_db;
-
-    let observations = if let Some(pid) = project_id.filter(|s| !s.is_empty()) {
-        pg.get_project_context(pid, None, 15)
-            .await
-            .unwrap_or_default()
-    } else if let Some(query) = search_query.filter(|s| !s.is_empty()) {
-        pg.search_observations(query, None, 10)
-            .await
-            .unwrap_or_default()
-    } else {
-        return None;
-    };
-
+pub fn format_observation_memory_for_prompt(observations: &[ObservationSummary]) -> Option<String> {
     if observations.is_empty() {
         return None;
     }
@@ -514,7 +510,7 @@ pub async fn format_observation_memory_for_prompt(
         observations.len()
     ));
 
-    for obs in &observations {
+    for obs in observations {
         let rev = if obs.revision_count > 1 {
             format!(" (rev {})", obs.revision_count)
         } else {

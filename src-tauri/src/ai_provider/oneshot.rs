@@ -88,9 +88,7 @@ pub enum OneshotError {
     /// `NoCredentials`; kept distinct so logs can tell them apart.
     Disabled,
     /// The hourly/per-call budget for this adapter is exhausted. Reserved
-    /// for future use — adapters today don't enforce a budget; the
-    /// [`coordinator::llm_decide::LlmBudget`] in use today is per-call-site,
-    /// not per-adapter.
+    /// for future use — adapters today don't enforce a budget.
     BudgetExhausted,
     /// The HTTP/transport call failed (connection refused, 5xx, timeout,
     /// malformed JSON from the provider, etc.). Message contains the

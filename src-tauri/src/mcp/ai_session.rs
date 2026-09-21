@@ -417,8 +417,8 @@ fn now_epoch_ms() -> u64 {
 ///
 /// Returns an empty array when no AI sessions are registered, or when
 /// `SessionManager` is not available in Tauri state (which would only
-/// happen during early startup). PTY workers and inline-PID
-/// registrations are intentionally excluded — see
+/// happen during early startup). Inline-PID registrations are
+/// intentionally excluded — see
 /// `SessionManager::snapshot` for the rationale.
 pub async fn idle_status(State(state): State<Arc<ApiState>>) -> Json<Vec<SessionIdleEntry>> {
     use crate::claude_session::manager::SessionManager;
@@ -2131,7 +2131,7 @@ pub async fn run_prompt(
     // Use the prompt name (concise) rather than full prompt content (noisy) for search.
     let memory_query = prompt_name.as_str();
     if !memory_query.is_empty() {
-        if let Some(memory_section) = context::format_observation_memory_for_prompt(
+        if let Some(memory_section) = crate::mcp::contexts::format_observation_memory_for_prompt(
             &state.app_state.pg_db,
             None,
             Some(memory_query),

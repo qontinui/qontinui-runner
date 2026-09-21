@@ -492,9 +492,14 @@ late.
 ### 2a — Is it WAITING on an observable condition? → a coord gate
 
 If the reason it is unfinished is a condition coord can watch flip, register a
-typed gate. **Use `/blocked`** — it is the canonical session-close procedure and
-already carries the predicate-selection table and the registration cascade
-(`_gate-registration` is the spec both implement).
+typed gate — the MCP tool **`coord_register_gate`** where this session has it,
+and the `work-units/<slug>/register-gate` REST route (named in the `unit_status`
+hazard below) where it does not. **Use `/blocked`** — it is the canonical
+session-close procedure and already carries the predicate-selection table and the
+full registration cascade over both transports (`_gate-registration` is the spec
+both implement). A REST route quoted in a hazard below is a route, not the only
+door: the tool reaches the same handler, so a bearer you cannot mint at
+session-close never means the gate cannot be set.
 
 Hazards that make a gate *look* registered when it is not, each of which this
 step must actively defeat:

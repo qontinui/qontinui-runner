@@ -1,7 +1,7 @@
 /**
  * Prompt-library `invoke` wrapper + wire types.
  *
- * Mirrors `coordinatorApi.ts`'s `getFleetHealth` pattern: one thin typed
+ * One thin typed
  * wrapper over the Rust `list_prompt_templates` Tauri command
  * (`src-tauri/src/prompt_library.rs`), which fetches coord's
  * `kind=prompt_template` prompt documents through the device-JWT agent
@@ -65,7 +65,7 @@ export interface PromptTemplate {
 }
 
 /**
- * Structured auth state — the `get_fleet_health` contract:
+ * Structured auth state:
  * - `ok`           — normal
  * - `unauthorized` — a device token was present but coord rejected it
  * - `unpaired`     — no device token locally (needs pairing)

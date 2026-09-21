@@ -2,7 +2,13 @@ import { useState, useRef, useEffect } from "react";
 import { LayoutGrid } from "lucide-react";
 import { LAYOUT_PRESETS, type LayoutPreset } from "./useZoneLayout";
 import { useUIComponent, UIBridgeComponentScope } from "@qontinui/ui-bridge";
-import { callRegistry } from "./commands";
+import { callRegistry, textArg } from "./commands";
+import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
+
+/** Hoisted so the registration and its guarded handler read one declaration. */
+const SELECT_LAYOUT_SCHEMA = {
+  layoutId: "string (use list-layouts to enumerate valid IDs)",
+} as const;
 
 interface ZoneLayoutPickerProps {
   currentLayoutId: string;
@@ -93,13 +99,18 @@ export function ZoneLayoutPicker({
         id: "select-layout",
         label: "Select Layout",
         description: "Switch the terminal grid to a named layout preset.",
-        paramSchema: { layoutId: "string (use list-layouts to enumerate valid IDs)" },
+        paramSchema: SELECT_LAYOUT_SCHEMA,
         // `write` — switches the grid preset and redistributes zone assignments. No
         // terminal is ended: `applyLayout` preserves in-range assignments and only
         // compacts out-of-range ones, and auto-grow re-expands to fit live tabs.
         effect: "write",
-        handler: async (params?: unknown) => {
-          const { layoutId } = (params ?? {}) as { layoutId?: string };
+        // `{layoutId: {}}` is truthy, so it passed `if (!layoutId)` and was
+        // stringified into the operator-facing sentence as
+        // `Unknown layoutId: "[object Object]"`; `{layoutId: []}` rendered the
+        // even less honest `Unknown layoutId: ""`. Binding refuses both by
+        // shape, before the message is composed.
+        handler: guardedHandler("select-layout", SELECT_LAYOUT_SCHEMA, async (args) => {
+          const layoutId = textArg(args, "layoutId");
           if (!layoutId) throw new Error("select-layout requires { layoutId: string }");
           // Validate up-front so the existing "Valid options: …" error
           // message stays intact for automation parsers. The registry
@@ -119,7 +130,7 @@ export function ZoneLayoutPicker({
           // landing point instead of two.
           await callRegistry("terminal.layout", { preset: layoutId });
           setOpen(false);
-        },
+        }),
       },
       {
         id: "list-layouts",
