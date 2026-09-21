@@ -304,7 +304,7 @@ pub(crate) const CALIBRATION_BASELINE: usize = 151;
 /// **It is a deliberately CONSERVATIVE cap, not the largest healthy process.**
 /// The anchor is explicitly PER-RUNTIME — the field is named
 /// `per_runtime_pool_capacity_default` — and this binary builds many runtimes
-/// (`app-rt`, `fleet-pub-rt`, `mcp-api-rt`, and the short-lived
+/// (Tauri's own global runtime, `fleet-pub-rt`, `mcp-api-rt`, and the short-lived
 /// current-thread ones), so *N* runtimes carry *N* × 512 of blocking-pool
 /// capacity that is healthy by tokio's own defaults. A process legitimately
 /// idling above 512 therefore gets LESS shift than its floor would justify,
