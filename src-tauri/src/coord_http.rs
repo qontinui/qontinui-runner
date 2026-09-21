@@ -155,13 +155,30 @@ pub fn coord_put(client: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwes
 /// to EQUAL the presented token's claim.
 ///
 /// **Takes `crate::auth::TenantScope`, not `qontinui_runner_lib::auth`'s**,
-/// unlike the three unparameterized helpers above. This module compiles into
-/// both the lib and the bin, where those are two DISTINCT types, so a caller
-/// in the bin — which is every scope-resolving call site in the runner, all of
-/// which spell `crate::auth::TenantScope` — could not name the lib's variant
-/// without a conversion that exists only to satisfy a path. Aligning with the
-/// crate-local module is what the ~50 `attach_device_auth*` call sites already
-/// do; only these helpers' own bodies differed.
+/// unlike the three unparameterized helpers above — and the reason is NOT a
+/// naming convenience. This module is declared in `main.rs` alone, so it
+/// compiles into the bin only and a bin caller could perfectly well name
+/// `qontinui_runner_lib::auth::TenantScope`; no conversion was ever required.
+///
+/// What forces the choice is that `auth` IS compiled twice — `lib.rs`'s
+/// `pub mod auth` and `main.rs`'s `mod auth` are two separate copies with
+/// SEPARATE STATICS. `DATA_PLANE_TOTAL` / `DATA_PLANE_AUTHED` (the
+/// coverage counters), `MISSING_TOKEN_WARNED`, `DEAD_LEGACY_SLOT_WARNED` and
+/// the `warn_once_per_tenant_*` sets each exist once per copy. Routing this
+/// helper through `crate::auth` puts the attach in the SAME copy as the
+/// `crate::auth::presented_tenant` call that diagnoses its refusals and as
+/// the other ~98 bin-side call sites, so the latch that says "already warned"
+/// and the counter that says "N of M authed" are the ones those sites read.
+/// Split across copies, a warning suppressed in one copy fires again from the
+/// other and neither counter is the whole story.
+///
+/// Residual, named rather than fixed here: [`coord_get`], [`coord_post`] and
+/// [`coord_put`] above still call the LIB copy's `attach_device_auth`, so the
+/// runner emits the identically-worded
+/// `"coord data-plane device-JWT coverage: X/Y (Z%)"` line from two
+/// independent counters and an operator sees two indistinguishable series.
+/// That split PRE-EXISTS this change and outlives it; converging the two
+/// copies is a census item, not a line to slip into this one.
 pub fn coord_get_for(
     client: &reqwest::Client,
     url: impl reqwest::IntoUrl,
