@@ -1003,6 +1003,31 @@ async fn policy_context(
 }
 
 // =============================================================================
+// /sessions/policy-context-stats
+// =============================================================================
+
+/// `GET /sessions/policy-context-stats` — how many sessions this runner
+/// injected the FULL policy body into since it started, and why
+/// (plan `2026-09-21-policy-body-still-crosses-the-sessionstart-boundary`,
+/// Phase 2).
+///
+/// The honesty gate in [`crate::mcp::policy_context::render_for_session`] fails
+/// OPEN: anything it cannot confirm gets the full body. That is correct and it
+/// was also invisible — a marker that never arrived looked exactly like a
+/// marker deliberately withheld on a `resume`, in every log and every metric,
+/// and the feature regressed to its pre-change behaviour for five days with
+/// nothing saying so.
+///
+/// One row per [`crate::mcp::policy_context::PolicyRenderReason`], plus
+/// `full_body_total` and `total`, so the ratio is computable from this one read
+/// — without grepping a transcript or a log. Counts are process-lifetime: a
+/// restart zeroes them, and the durable per-session record remains coord's
+/// `session_policy_reads`, which this route deliberately does not duplicate.
+async fn policy_context_stats() -> Json<crate::mcp::policy_context::PolicyRenderStats> {
+    Json(crate::mcp::policy_context::render_stats())
+}
+
+// =============================================================================
 // /sessions/<id>/context-low
 // =============================================================================
 
@@ -1250,6 +1275,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         )
         .route("/sessions/{id}/context-low", post(context_low))
         .route("/sessions/{id}/policy-context", get(policy_context))
+        .route("/sessions/policy-context-stats", get(policy_context_stats))
         // Mark a session's WORK finished (or unmark it). NOTE: this family has
         // no `route_entries()` and `manifest_matches_route_calls` does not reach
         // it — that test scans `src/mcp/ui_bridge` only, and its regex is
