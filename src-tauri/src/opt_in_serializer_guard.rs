@@ -143,24 +143,46 @@ const MIN_SERIALIZERS: usize = 15;
 /// as the failure message prints them. An entry that matches no finding fails
 /// the guard: a fixed module must leave the list.
 ///
-/// Every reason below is one of two shapes. "Phase 4" is the one site whose
-/// remedy is already scheduled: `mcp_api.rs`'s `series_lock` is deleted by
-/// Phase 4 of plan `2026-09-17-runner-tests-share-in-process-mutable-state`,
-/// which gives each test a private counter instance, so widening the lock now
-/// would be work the next PR removes. Every other reason states which tests
-/// stand outside the lock and why that is safe TODAY — the resource the lock
-/// guards is named, and the tests outside it do not reach that resource. That
-/// claim is a source reading by the author of the entry, not a proof; the
-/// nightly census is what checks it, and a `SUITE-ONLY` verdict on a module
-/// listed here means the reason was wrong and the fix is to take the lock,
-/// not to reword the entry.
+/// Every reason below states which tests stand outside the lock and why that
+/// is safe TODAY — the resource the lock guards is named, and the tests
+/// outside it do not reach that resource. That claim is a source reading by
+/// the author of the entry, not a proof; the nightly census is what checks
+/// it, and a `SUITE-ONLY` verdict on a module listed here means the reason
+/// was wrong and the fix is to take the lock, not to reword the entry.
+///
+/// The entry this list was seeded with — `mcp_api.rs`
+/// `memory_search_enrichment_tests` `series_lock`, the census's 7/20
+/// `SUITE-ONLY` red — is gone: Phase 4 of plan
+/// `2026-09-17-runner-tests-share-in-process-mutable-state` deleted that lock
+/// by giving each test a private `MemoryEnrichCounters`, which is the remedy
+/// this guard exists to push every other entry toward.
 const ALLOWLIST: &[(&str, &str, &str, &str)] = &[
     (
-        "mcp_api.rs",
-        "memory_search_enrichment_tests",
-        "series_lock",
-        "Phase 4 replaces series_lock with a per-test handle (MemoryEnrichCounters), which \
-         deletes the lock; the 7/20 SUITE-ONLY red the census measured is that phase's target",
+        "mcp/device_jwt_refresher.rs",
+        "tenant_slot_refresh_tests",
+        "health_lock",
+        "the lock serialises refresh_tenant_slots passes over the process-global posture cell, \
+         tenant_slot_health and the CLEARED_* counters; the five tests outside it \
+         (a_bound_tenant_with_no_slot_is_a_gap, an_absent_sidecar_reports_unknown_never_no_gaps, \
+         a_stale_sidecar_reports_unknown_never_no_gaps, an_unreadable_covered_side_is_unknown_not_a_gap, \
+         the_sweep_hop_composes_the_gap_report) are pure over explicit inputs — \
+         resolve_binding_gaps / binding_gaps_from on literal reads, and coord_bound_tenants_at on a \
+         uniquely named temp dir — and never call refresh_tenant_slots or read the snapshot. \
+         Enumerated after the 2026-09-21 rebase onto main, which added them; taking the lock in \
+         them is the trivial alternative and lives in that file, not this one",
+    ),
+    (
+        "mcp/session_message_poller.rs",
+        "tests",
+        "COUNTER_TEST_LOCK",
+        "the lock guards the process-global push counters (push_counters(), bumped only by \
+         record_push_miss / record_push_ok, which production reaches through \
+         surface_blocked_delivery and deliver_once); the only two tests that call either or \
+         read health_snapshot() for a value are the two that take it — the other 41 exercise \
+         the framing, tracker, cooldown and parse helpers and never touch a counter. Enumerated \
+         after the 2026-09-21 rebase onto main, which added the module's counter family; the \
+         per-test handle (MemoryEnrichCounters / TransportRungCounters in mcp_api.rs) is the \
+         remedy that would delete this entry",
     ),
     (
         "health_monitor.rs",
