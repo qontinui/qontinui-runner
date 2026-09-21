@@ -1563,20 +1563,48 @@ pub(crate) fn select_device_bearer(
     tenant: Option<&Uuid>,
     default_tenant: Option<Uuid>,
 ) -> Option<String> {
+    select_device_bearer_result(am, tenant, default_tenant).ok()
+}
+
+/// [`select_device_bearer`], keeping the CAUSE of a miss instead of discarding
+/// it — ONE implementation, two shapes.
+///
+/// The request path takes the `.ok()` wrapper above because a request has
+/// nothing to do with a cause; a DIAGNOSTIC takes this one. That split is the
+/// point: the reads that decide the miss are the reads that name it, in the
+/// same call, so there is no second copy of the fall-through to drift from
+/// this one and no window between deciding and classifying for the refresher
+/// to land a slot in.
+///
+/// It replaced a pure mirror (`no_credential_cause`) that re-derived the cause
+/// from a SECOND set of slot reads taken a moment later. Two defects came with
+/// that shape and both dissolve here: the mirror could disagree with the
+/// selector with nothing to catch it, and the second read could observe a slot
+/// the refresher had since made `Usable` — rendering *"no credential (sent
+/// anonymously; slot usable)"*, a cause contradicting the line it sits on.
+/// Neither is expressible now: `Usable` returns `Ok`, so no `Err` this
+/// function builds can carry it.
+pub(crate) fn select_device_bearer_result(
+    am: &AuthManager,
+    tenant: Option<&Uuid>,
+    default_tenant: Option<Uuid>,
+) -> Result<String, NoCredential> {
     let Some(t) = tenant else {
-        return legacy_slot_bearer(am);
+        return legacy_slot_bearer(am).map_err(NoCredential::Slot);
     };
     // Routed through [`read_tenant_slot`] so this selector and every REPORTER
     // of "can this device act in tenant T" apply one predicate. They did not:
     // `pair::reconcile_paired_bindings_with` tested non-empty PRESENCE, so a
     // bound tenant whose slot had EXPIRED was reported as workable while this
     // function had refused it since Phase 1a. See [`credential_state`].
-    match read_tenant_slot(am, t) {
+    let read = read_tenant_slot(am, t);
+    let own = read.state();
+    match read {
         // VALIDITY, not presence (Phase 1a). A slot that holds an expired or
         // opaque token is a MISS and falls through below exactly as an absent
         // slot does — never returned verbatim for the proxy to forward into a
         // 401 the caller sees only as "Command failed with no output".
-        SlotRead::Usable(jwt) => return Some(jwt),
+        SlotRead::Usable(jwt) => return Ok(jwt),
         SlotRead::PresentButDead => warn_once_per_tenant_dead_slot(t),
         SlotRead::Absent => {}
         SlotRead::Unreadable(e) => {
@@ -1587,27 +1615,32 @@ pub(crate) fn select_device_bearer(
     // legacy slot (pre-8a install, or a pairing that predates per-tenant
     // slots) — that slot IS this tenant's JWT, so fall back to it.
     if default_tenant.as_ref() == Some(t) {
-        return legacy_slot_bearer(am);
+        return legacy_slot_bearer(am)
+            .map_err(|legacy| NoCredential::DefaultBindingFallback { own, legacy });
     }
     warn_once_per_tenant_slot_miss(t);
-    None
+    Err(NoCredential::Slot(own))
 }
 
 /// Read the legacy `access_token` slot (the DEFAULT binding's JWT) with the
 /// original never-fatal posture + once-per-process missing-token warning.
-fn legacy_slot_bearer(am: &AuthManager) -> Option<String> {
+///
+/// `Err` carries the [`SlotState`] that decided the miss, so a caller
+/// diagnosing a refusal names the read this function actually took rather
+/// than one of its own.
+fn legacy_slot_bearer(am: &AuthManager) -> Result<String, SlotState> {
     match read_legacy_slot(am) {
         // Same validity gate as the per-tenant slot (Phase 1a): a dead default
         // credential must degrade to "no bearer" — which the proxy answers with
         // a typed refreshing/refusal status — rather than being forwarded.
-        SlotRead::Usable(token) => Some(token),
+        SlotRead::Usable(token) => Ok(token),
         SlotRead::PresentButDead => {
             DEAD_LEGACY_SLOT_WARNED.call_once(|| {
                 warn!(
                     "coord data-plane: the default device-JWT slot holds an expired or                      opaque token — treating it as ABSENT and sending coord calls                      unauthenticated rather than forwarding a credential coord will                      reject; the refresher re-mints it, or re-pair this runner"
                 );
             });
-            None
+            Err(SlotState::PresentButDead)
         }
         SlotRead::Absent => {
             MISSING_TOKEN_WARNED.call_once(|| {
@@ -1616,7 +1649,7 @@ fn legacy_slot_bearer(am: &AuthManager) -> Option<String> {
                      sending coord calls unauthenticated; pair this runner to authenticate"
                 );
             });
-            None
+            Err(SlotState::Absent)
         }
         SlotRead::Unreadable(e) => {
             MISSING_TOKEN_WARNED.call_once(|| {
@@ -1625,7 +1658,7 @@ fn legacy_slot_bearer(am: &AuthManager) -> Option<String> {
                      sending coord calls unauthenticated; pair this runner to authenticate"
                 );
             });
-            None
+            Err(SlotState::Unreadable)
         }
     }
 }
@@ -2205,16 +2238,31 @@ pub(crate) fn select_scoped_bearer_lazy(
     default_tenant: Option<Uuid>,
     binding_count: impl FnOnce() -> usize,
 ) -> Option<String> {
+    select_scoped_bearer_lazy_result(am, scope, default_tenant, binding_count).ok()
+}
+
+/// [`select_scoped_bearer_lazy`], keeping the CAUSE of a miss — the shape
+/// [`presented_tenant`] consumes. See [`select_device_bearer_result`] for why
+/// the cause is carried out of the decision rather than re-derived after it.
+pub(crate) fn select_scoped_bearer_lazy_result(
+    am: &AuthManager,
+    scope: TenantScope,
+    default_tenant: Option<Uuid>,
+    binding_count: impl FnOnce() -> usize,
+) -> Result<String, NoCredential> {
     match scope {
-        TenantScope::Owned(t) => select_device_bearer(am, Some(&t), default_tenant),
-        TenantScope::Device => select_device_bearer(am, None, default_tenant),
+        TenantScope::Owned(t) => select_device_bearer_result(am, Some(&t), default_tenant),
+        TenantScope::Device => select_device_bearer_result(am, None, default_tenant),
         TenantScope::Unresolved => {
             let count = binding_count();
             if count > 1 {
                 warn_once_unresolved_on_multi_bound(count);
-                return None;
+                // NOT an absence — a refusal, taken BEFORE any slot was read.
+                // The count is the one this arm actually branched on, so the
+                // diagnostic cannot name a different one.
+                return Err(NoCredential::UnresolvedOnMultiBound { bindings: count });
             }
-            select_device_bearer(am, None, default_tenant)
+            select_device_bearer_result(am, None, default_tenant)
         }
     }
 }
@@ -2273,6 +2321,15 @@ pub enum PresentedTenant {
 /// in the first place. [`SlotState`] and its [`SlotState::label`] already
 /// exist for exactly this distinction and the coord doctor already prints
 /// them; this carries the same value to a log line.
+///
+/// **No [`SlotState::Usable`] can appear in any of these, by construction.**
+/// [`select_device_bearer_result`] is the only thing that builds one, and it
+/// builds one only where a read did NOT yield a token — so the contradiction
+/// *"no credential (sent anonymously; slot usable)"* is unconstructible
+/// rather than merely unlikely. It was reachable while the cause came from a
+/// SECOND set of reads taken after the decision, which the refresher could
+/// land a slot in between; pinned by
+/// `the_reported_cause_is_the_selectors_own_reads`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoCredential {
     /// The state of the slot whose read decided the miss — T's own slot for
@@ -2321,26 +2378,6 @@ impl std::fmt::Display for PresentedTenant {
     }
 }
 
-/// Classify a credential MISS, PURE over the slot states it is handed — no
-/// I/O, same shape as [`credential_state`] and [`holds_credential_for`] so a
-/// unit test can drive every combination with no store at all.
-///
-/// Mirrors [`select_device_bearer`]'s fall-through arm for arm: for the
-/// DEFAULT tenant a miss on its own slot consults the legacy slot, so both
-/// reads decided the outcome and both are reported.
-///
-/// `own == SlotState::Usable` is unreachable through [`presented_tenant`] (a
-/// usable slot yields a token, not a miss) and is rendered honestly rather
-/// than special-cased, so a future caller that reaches it gets the label and
-/// not a lie.
-pub fn no_credential_cause(own: SlotState, is_default: bool, legacy: SlotState) -> NoCredential {
-    if is_default {
-        NoCredential::DefaultBindingFallback { own, legacy }
-    } else {
-        NoCredential::Slot(own)
-    }
-}
-
 /// What [`attach_device_auth_for`] WOULD present for `scope`, reduced to
 /// [`PresentedTenant`] — a diagnostic read, not a second credential path.
 ///
@@ -2349,37 +2386,32 @@ pub fn no_credential_cause(own: SlotState, is_default: bool, legacy: SlotState) 
 /// dropped; only the claim is returned. That is the whole reason this lives
 /// here rather than at the call site that wants to log the mismatch.
 ///
-/// On a MISS it pays a second, non-warning read through [`read_tenant_slot`]
-/// / [`read_legacy_slot`] to classify WHY — see [`NoCredential`]. That is the
-/// difference between a line an operator can act on and a line that asserts
-/// one of four causes at random.
+/// **ONE resolution, not two.** It calls the SAME resolver the request path
+/// calls, in its cause-carrying shape ([`select_scoped_bearer_lazy_result`]),
+/// and matches its `Err` straight through. It does not re-read the slots to
+/// work out why: the reads that decided the miss are the ones reported, so
+/// there is no mirror to drift, no second set of reads to pay for, and no
+/// window in which the refresher can make a slot `Usable` between the
+/// decision and its explanation. An earlier revision did re-read, and could
+/// render *"no credential (sent anonymously; slot usable)"* — a cause
+/// implying a credential was presentable, on a line whose whole subject is
+/// that none was.
 ///
 /// Costs local encrypted-file reads, so call it when reporting a refusal,
 /// not on every pass of a loop.
 pub fn presented_tenant(scope: TenantScope) -> PresentedTenant {
     let am = AuthManager::new();
-    let default_tenant = default_binding_tenant();
-    match select_scoped_bearer_lazy(&am, scope, default_tenant, device_binding_count) {
-        Some(token) => match jwt_tenant_claim(&token) {
+    match select_scoped_bearer_lazy_result(
+        &am,
+        scope,
+        default_binding_tenant(),
+        device_binding_count,
+    ) {
+        Ok(token) => match jwt_tenant_claim(&token) {
             Some(t) => PresentedTenant::Tenant(t),
             None => PresentedTenant::Untenanted,
         },
-        None => PresentedTenant::Anonymous(match scope {
-            TenantScope::Owned(t) => no_credential_cause(
-                read_tenant_slot(&am, &t).state(),
-                default_tenant == Some(t),
-                read_legacy_slot(&am).state(),
-            ),
-            TenantScope::Device => NoCredential::Slot(read_legacy_slot(&am).state()),
-            TenantScope::Unresolved => {
-                let bindings = device_binding_count();
-                if bindings > 1 {
-                    NoCredential::UnresolvedOnMultiBound { bindings }
-                } else {
-                    NoCredential::Slot(read_legacy_slot(&am).state())
-                }
-            }
-        }),
+        Err(why) => PresentedTenant::Anonymous(why),
     }
 }
 
@@ -3928,33 +3960,126 @@ mod bearer_selection_tests {
         );
     }
 
-    /// The classifier mirrors [`select_device_bearer`]'s fall-through: only
-    /// the DEFAULT tenant consults the legacy slot, so only it may report it.
+    /// The reported cause comes out of the SELECTOR's own reads, over a real
+    /// store, for every cell — the F2 replacement for a pure mirror that was
+    /// only ever driven against itself.
     ///
-    /// Reporting the legacy slot for a NON-default tenant would tell an
-    /// operator to fix a credential that had no bearing on the refusal — the
-    /// same class of misdirection as the pairing advice this phase removed.
+    /// Three properties, each a mutation the old self-driven test could not
+    /// see:
+    ///
+    /// 1. **Ok/Err tracks the request path exactly.** Add a fall-through to
+    ///    the resolver and the `.ok()` wrapper changes with it, so nothing can
+    ///    start naming a slot that had no bearing on the refusal.
+    /// 2. **Only the DEFAULT tenant's miss reports the legacy slot.** Telling
+    ///    an operator to fix a credential the selector never consulted is the
+    ///    same class of misdirection as the pairing advice this phase removed.
+    /// 3. **No cause ever names a `Usable` slot.** A usable slot yields a
+    ///    token, and a cause is only built where there is none — so
+    ///    "sent anonymously; slot usable" is now unconstructible rather than
+    ///    merely unlikely. That rendering WAS reachable while the classifier
+    ///    re-read the slots after the decision and the refresher landed one in
+    ///    between.
     #[test]
-    fn only_the_default_tenants_miss_reports_the_legacy_slot() {
-        for own in [
-            SlotState::Absent,
-            SlotState::PresentButDead,
-            SlotState::Unreadable,
-        ] {
-            assert_eq!(
-                no_credential_cause(own, false, SlotState::Usable),
-                NoCredential::Slot(own),
-                "a non-default tenant's miss is decided by its OWN slot alone"
-            );
-            assert_eq!(
-                no_credential_cause(own, true, SlotState::Absent),
-                NoCredential::DefaultBindingFallback {
-                    own,
-                    legacy: SlotState::Absent
-                },
-                "the default tenant falls through to the legacy slot, so both decided it"
-            );
+    fn the_reported_cause_is_the_selectors_own_reads() {
+        let expired = jwt_for("expired", chrono::Utc::now().timestamp() - 3600);
+        let slot_cases: Vec<(&str, Option<String>)> = vec![
+            ("usable", Some(live_jwt("slot"))),
+            ("expired", Some(expired.clone())),
+            ("opaque", Some("qontinui_runner_deadbeef".to_string())),
+            ("absent", None),
+        ];
+        let legacy_cases: Vec<(&str, Option<String>)> = vec![
+            ("usable", Some(live_jwt("legacy"))),
+            ("expired", Some(expired)),
+            ("absent", None),
+        ];
+
+        let t = tenant(0x31);
+        let stranger = tenant(0x32);
+        for (si, (slot_label, slot)) in slot_cases.iter().enumerate() {
+            for (li, (legacy_label, legacy)) in legacy_cases.iter().enumerate() {
+                for is_default in [false, true] {
+                    let mgr = create_test_auth_manager(&format!(
+                        "cause_{si}_{li}_{}",
+                        u8::from(is_default)
+                    ));
+                    if let Some(j) = slot {
+                        mgr.store_tenant_device_jwt(&t, j).unwrap();
+                    }
+                    if let Some(j) = legacy {
+                        mgr.store_tokens(j, "").unwrap();
+                    }
+                    let default_tenant = Some(if is_default { t } else { stranger });
+                    let where_ =
+                        format!("slot={slot_label} legacy={legacy_label} is_default={is_default}");
+
+                    let result = select_device_bearer_result(&mgr, Some(&t), default_tenant);
+                    let selected = select_device_bearer(&mgr, Some(&t), default_tenant);
+                    assert_eq!(
+                        result.is_ok(),
+                        selected.is_some(),
+                        "{where_}: the diagnostic and the request path must be ONE decision"
+                    );
+
+                    let Err(cause) = result else { continue };
+                    match cause {
+                        NoCredential::Slot(own) => {
+                            assert!(
+                                !is_default,
+                                "{where_}: the default tenant's miss falls through to the \
+                                 legacy slot, so it cannot be decided by one read"
+                            );
+                            assert_eq!(
+                                own,
+                                read_tenant_slot(&mgr, &t).state(),
+                                "{where_}: the cause must name the slot the selector read"
+                            );
+                            assert_ne!(own, SlotState::Usable, "{where_}");
+                        }
+                        NoCredential::DefaultBindingFallback { own, legacy } => {
+                            assert!(
+                                is_default,
+                                "{where_}: only the DEFAULT tenant consults the legacy slot, \
+                                 so only it may report one"
+                            );
+                            assert_ne!(
+                                own,
+                                SlotState::Usable,
+                                "{where_}: a usable slot yields a token, never a cause"
+                            );
+                            assert_ne!(legacy, SlotState::Usable, "{where_}");
+                            assert_eq!(legacy, read_legacy_slot(&mgr).state(), "{where_}");
+                        }
+                        other => panic!("{where_}: an Owned scope cannot reach {other:?}"),
+                    }
+                }
+            }
         }
+    }
+
+    /// The `Unresolved`-on-multi-bound refusal names the count it BRANCHED on
+    /// — the single read, not a second one taken afterwards.
+    #[test]
+    fn the_unresolved_refusal_names_the_count_it_branched_on() {
+        let mgr = create_test_auth_manager("cause_unresolved_multi_bound");
+        mgr.store_tokens(&live_jwt("legacy"), "").unwrap();
+
+        let mut reads = 0usize;
+        let cause = select_scoped_bearer_lazy_result(&mgr, TenantScope::Unresolved, None, || {
+            reads += 1;
+            4
+        })
+        .expect_err("a multi-bound device with no resolved tenant presents nothing");
+        assert_eq!(
+            cause,
+            NoCredential::UnresolvedOnMultiBound { bindings: 4 },
+            "the refusal must carry the count the arm branched on"
+        );
+        assert_eq!(
+            reads, 1,
+            "and it must be ONE read — re-reading it to explain the refusal is the \
+             mirror this phase removed"
+        );
     }
 
     /// The lazy resolver must not read `paired_user.json` for a scope that

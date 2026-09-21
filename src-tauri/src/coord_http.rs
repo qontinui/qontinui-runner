@@ -167,8 +167,17 @@ pub fn coord_put(client: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwes
 /// the `warn_once_per_tenant_*` sets each exist once per copy. Routing this
 /// helper through `crate::auth` puts the attach in the SAME copy as the
 /// `crate::auth::presented_tenant` call that diagnoses its refusals and as
-/// the other ~98 bin-side call sites, so the latch that says "already warned"
-/// and the counter that says "N of M authed" are the ones those sites read.
+/// the rest of this copy's `attach_device_auth*` call sites — the large
+/// majority of them, spread across three dozen modules — so the latch that
+/// says "already warned" and the counter that says "N of M authed" are the
+/// ones those sites read.
+///
+/// No count is pinned here on purpose. It moves with every call site added,
+/// and a grep wide enough to be worth quoting (`attach_device_auth`) also
+/// matches the LIB copy's own sites, this module's `use` lines and the doc
+/// comments referring to it — so any single number invites a reader to
+/// reproduce a different one and conclude the comment is wrong. The property
+/// that matters is "one copy of the statics", not "N".
 /// Split across copies, a warning suppressed in one copy fires again from the
 /// other and neither counter is the whole story.
 ///
