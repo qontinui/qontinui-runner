@@ -12,6 +12,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
+use qontinui_runner_lib::wedge_diagnostics::{capture_thread_name_census, ThreadNameCensus};
+
 /// Interval between health checks in seconds
 const HEALTH_CHECK_INTERVAL_SECS: u64 = 60;
 
@@ -1590,19 +1592,43 @@ pub(crate) fn thread_count_reading() -> Option<usize> {
 /// optimising.
 pub(crate) const THREAD_READING_TTL: Duration = Duration::from_millis(250);
 
-/// One memoized thread reading and the instant it was taken.
-#[derive(Debug, Clone, Copy)]
-struct ThreadReadingMemo {
+/// One memoized reading and the instant it was taken. Generic over the value
+/// so the thread COUNT (a `usize`, 250 ms) and the thread-NAME census (a
+/// [`ThreadNameCensus`], 30 s) share one memo mechanism rather than two.
+#[derive(Debug, Clone)]
+struct ReadingMemo<T> {
     taken_at: std::time::Instant,
-    count: usize,
+    value: T,
 }
 
 /// Process-global slot behind [`thread_count_reading_memoized`].
 ///
 /// `None` means "nothing read yet"; an entry older than [`THREAD_READING_TTL`]
 /// is present but never served, so a stale entry is inert rather than wrong.
-fn thread_reading_memo() -> &'static std::sync::Mutex<Option<ThreadReadingMemo>> {
-    static MEMO: std::sync::OnceLock<std::sync::Mutex<Option<ThreadReadingMemo>>> =
+fn thread_reading_memo() -> &'static std::sync::Mutex<Option<ReadingMemo<usize>>> {
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<Option<ReadingMemo<usize>>>> =
+        std::sync::OnceLock::new();
+    MEMO.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// How long one thread-NAME census is served before the next walk (plan
+/// `2026-09-21-runner-blocking-pool-ratchets-to-peak-because-transcript-tails-
+/// rotate-every-idle-thread`, Phase 0).
+///
+/// The walk opens a handle per thread (~450 on the operator box, a few
+/// milliseconds), and every consumer of it — the `/health` object, the 60 s
+/// "possible thread leak" line, and the spawn gate's graded reading, which is
+/// polled many times a second under a continuation burst — is answering a
+/// question whose true value moves on a scale of minutes: the pool the census
+/// exists to see is the one that never shrinks. Thirty seconds keeps a health
+/// poll and a log line from ever paying for a walk the other just did, and is
+/// still well inside the 60 s health tick, so the leak WARN's `top=` field is
+/// never more than one tick stale.
+pub(crate) const THREAD_NAME_CENSUS_TTL: Duration = Duration::from_secs(30);
+
+/// Process-global slot behind [`thread_name_census_memoized`].
+fn thread_name_census_memo() -> &'static std::sync::Mutex<Option<ReadingMemo<ThreadNameCensus>>> {
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<Option<ReadingMemo<ThreadNameCensus>>>> =
         std::sync::OnceLock::new();
     MEMO.get_or_init(|| std::sync::Mutex::new(None))
 }
@@ -1659,24 +1685,24 @@ fn thread_reading_memo() -> &'static std::sync::Mutex<Option<ThreadReadingMemo>>
 /// poison-recovering idiom, so a poisoned mutex costs nothing and the next
 /// caller either serves a live entry or takes a fresh reading. Nothing on any
 /// failure path fabricates a count.
-fn memoized_reading(
-    memo: &std::sync::Mutex<Option<ThreadReadingMemo>>,
+fn memoized_reading<T: Clone>(
+    memo: &std::sync::Mutex<Option<ReadingMemo<T>>>,
     now: std::time::Instant,
     ttl: Duration,
-    read: &dyn Fn() -> Option<usize>,
-) -> Option<usize> {
+    read: &dyn Fn() -> Option<T>,
+) -> Option<T> {
     let mut slot = memo.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(entry) = *slot {
+    if let Some(entry) = slot.as_ref() {
         if now.saturating_duration_since(entry.taken_at) < ttl {
-            return Some(entry.count);
+            return Some(entry.value.clone());
         }
     }
-    let count = read()?;
-    *slot = Some(ThreadReadingMemo {
+    let value = read()?;
+    *slot = Some(ReadingMemo {
         taken_at: now,
-        count,
+        value: value.clone(),
     });
-    Some(count)
+    Some(value)
 }
 
 /// [`thread_count_reading`], memoized for [`THREAD_READING_TTL`].
@@ -1696,6 +1722,69 @@ pub(crate) fn thread_count_reading_memoized() -> Option<usize> {
         &thread_count_reading,
     )
 }
+
+/// [`capture_thread_name_census`], memoized for [`THREAD_NAME_CENSUS_TTL`].
+///
+/// **This is the form every consumer reads** — `/health`'s `threadCensus`,
+/// the leak WARN's `top=` field, and `resource_guard`'s graded thread reading.
+/// Nothing in the runner calls the walk directly on a timer; a fresh walk is
+/// paid at most once per TTL, whoever asks first. UNKNOWN (`None`) is not
+/// memoized, exactly as for the count: a failed enumeration is retried on the
+/// next call rather than cached as blindness.
+pub(crate) fn thread_name_census_memoized() -> Option<ThreadNameCensus> {
+    memoized_reading(
+        thread_name_census_memo(),
+        std::time::Instant::now(),
+        THREAD_NAME_CENSUS_TTL,
+        &capture_thread_name_census,
+    )
+}
+
+/// The memoized census as the `/health` object serves it under `threadCensus`:
+/// `{ total, byName: [{name, count}], sampledAt }`, or JSON `null` when the
+/// census is UNKNOWN — never an empty list (served policy
+/// `verification-and-evidence` `silent-empty-is-unknown`).
+pub(crate) fn thread_name_census_json() -> serde_json::Value {
+    match thread_name_census_memoized() {
+        Some(census) => thread_name_census_to_json(&census),
+        None => serde_json::Value::Null,
+    }
+}
+
+/// PURE projection of a census onto the wire shape, so the key names and the
+/// timestamp format are pinned by a test rather than by a reader.
+fn thread_name_census_to_json(census: &ThreadNameCensus) -> serde_json::Value {
+    let sampled_at = chrono::DateTime::<chrono::Utc>::from(census.sampled_at).to_rfc3339();
+    serde_json::json!({
+        "total": census.total,
+        "byName": census
+            .by_name
+            .iter()
+            .map(|row| serde_json::json!({ "name": row.name, "count": row.count }))
+            .collect::<Vec<_>>(),
+        "sampledAt": sampled_at,
+    })
+}
+
+/// The top rows of a census as one log field: `name=count,name=count,…`, or
+/// `"unknown"` for an UNKNOWN census. PURE; [`log_metrics`] feeds it the
+/// memoized census so a 60 s log loop never pays for a walk the 30 s memo
+/// already did.
+fn census_top_field(census: Option<&ThreadNameCensus>, rows: usize) -> String {
+    match census {
+        None => "unknown".to_string(),
+        Some(c) => c
+            .by_name
+            .iter()
+            .take(rows)
+            .map(|row| format!("{}={}", row.name, row.count))
+            .collect::<Vec<_>>()
+            .join(","),
+    }
+}
+
+/// How many census rows the leak WARN carries inline.
+const LEAK_WARN_TOP_ROWS: usize = 3;
 
 /// Get current thread count, with an unreadable sensor rendered as `0`.
 ///
@@ -1760,9 +1849,15 @@ fn log_metrics(metrics: &HealthMetrics) {
     }
 
     if threads > THREAD_WARNING_THRESHOLD {
+        // `top=` names WHAT the threads are, on the same line as how many —
+        // `tokio-rt-worker=325` beside `threads=441` is the difference between
+        // a leak hunt and a one-line diagnosis. Memoized read: the 30 s census
+        // memo is what a 60 s loop consults, never a fresh walk.
+        let census = thread_name_census_memoized();
         warn!(
             threads = threads,
             threshold = THREAD_WARNING_THRESHOLD,
+            top = %census_top_field(census.as_ref(), LEAK_WARN_TOP_ROWS),
             "Thread count exceeds warning threshold - possible thread leak"
         );
     }
@@ -1967,6 +2062,14 @@ pub fn get_health_status() -> HealthStatus {
 mod tests {
     use super::*;
 
+    /// Serialises every test that STORES the process-global wedge atomics
+    /// (`BACKEND_WEDGED`, `UI_THREAD_WEDGED`, `MONITOR_CONSECUTIVE_FAILURES`).
+    /// Module-scoped on purpose: a `static` local to one test fn serialises
+    /// nothing against a second test that writes the same atom, which is how
+    /// `observe_publishes_the_failure_count_before_it_reports` read a `true`
+    /// that `stopping_the_monitor_clears_the_wedge_latches` had just stored.
+    static WEDGE_ATOMS_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     // sysinfo's per-process introspection (memory + thread count) returns 0
     // on macOS CI runners because the runner process lacks the entitlement
     // to read its own /proc-equivalent. The functions still don't panic, so
@@ -2018,6 +2121,103 @@ mod tests {
     // reader as arguments: a test can then COUNT snapshots, which is the only
     // property that matters here and the one an `Instant::now()`-driven,
     // process-global version could not express.
+
+    // ---- The thread-NAME census memo and its projections (plan
+    // `2026-09-21-runner-blocking-pool-ratchets-to-peak-because-transcript-tails-
+    // rotate-every-idle-thread`, Phase 0) ----
+
+    use qontinui_runner_lib::wedge_diagnostics::ThreadNameCount;
+
+    fn census(rows: &[(&str, usize)]) -> ThreadNameCensus {
+        ThreadNameCensus {
+            total: rows.iter().map(|(_, n)| n).sum(),
+            by_name: rows
+                .iter()
+                .map(|(name, count)| ThreadNameCount {
+                    name: name.to_string(),
+                    count: *count,
+                })
+                .collect(),
+            sampled_at: std::time::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+        }
+    }
+
+    /// The generic memo serves a census the same way it serves a count: one
+    /// walk inside the TTL, a second one past it, and an UNKNOWN never cached.
+    #[test]
+    fn the_census_memo_walks_once_per_ttl_and_never_caches_unknown() {
+        let memo = std::sync::Mutex::new(None);
+        let calls = Arc::new(AtomicU32::new(0));
+        let counter = Arc::clone(&calls);
+        let read = move || {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            match n {
+                0 => Some(census(&[("tokio-rt-worker", 325)])),
+                1 => None,
+                _ => Some(census(&[("app-rt", 16)])),
+            }
+        };
+        let t0 = std::time::Instant::now();
+
+        let first = memoized_reading(&memo, t0, THREAD_NAME_CENSUS_TTL, &read);
+        assert_eq!(first.as_ref().map(|c| c.total), Some(325));
+        let again = memoized_reading(
+            &memo,
+            t0 + THREAD_NAME_CENSUS_TTL - Duration::from_millis(1),
+            THREAD_NAME_CENSUS_TTL,
+            &read,
+        );
+        assert_eq!(again, first, "inside the TTL the same census is served");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one walk for two reads");
+
+        // Past the TTL the reader fails (UNKNOWN): served as None, NOT cached,
+        // and the next call walks again and gets the fresh census.
+        let expired = t0 + THREAD_NAME_CENSUS_TTL;
+        assert_eq!(
+            memoized_reading(&memo, expired, THREAD_NAME_CENSUS_TTL, &read),
+            None
+        );
+        let fresh = memoized_reading(&memo, expired, THREAD_NAME_CENSUS_TTL, &read);
+        assert_eq!(fresh.map(|c| c.total), Some(16));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// The wire shape `/health` serves: camelCase keys, RFC 3339 stamp, and an
+    /// UNKNOWN census is `null` rather than `{ byName: [] }`.
+    #[test]
+    fn the_census_json_shape_is_pinned() {
+        let c = census(&[("tokio-rt-worker", 325), ("terminal-reader-*", 19)]);
+        let v = thread_name_census_to_json(&c);
+        assert_eq!(v["total"], 344);
+        assert_eq!(v["byName"][0]["name"], "tokio-rt-worker");
+        assert_eq!(v["byName"][0]["count"], 325);
+        assert_eq!(v["byName"][1]["name"], "terminal-reader-*");
+        assert_eq!(v["byName"].as_array().map(Vec::len), Some(2));
+        assert_eq!(v["sampledAt"], "2027-01-15T08:00:00+00:00");
+        assert!(v.get("by_name").is_none(), "wire keys are camelCase");
+    }
+
+    /// `top=` carries the first three rows as `name=count`, and reads
+    /// `unknown` for an UNKNOWN census — never an empty string, which would
+    /// look like "no threads have names".
+    #[test]
+    fn the_leak_warn_top_field_names_three_rows_or_unknown() {
+        let c = census(&[
+            ("tokio-rt-worker", 325),
+            ("notify-rs windows loop", 19),
+            ("terminal-reader-*", 19),
+            ("terminal-waiter-*", 19),
+        ]);
+        assert_eq!(
+            census_top_field(Some(&c), LEAK_WARN_TOP_ROWS),
+            "tokio-rt-worker=325,notify-rs windows loop=19,terminal-reader-*=19"
+        );
+        assert_eq!(
+            census_top_field(Some(&census(&[("app-rt", 16)])), LEAK_WARN_TOP_ROWS),
+            "app-rt=16"
+        );
+        assert_eq!(census_top_field(None, LEAK_WARN_TOP_ROWS), "unknown");
+    }
 
     /// A counting reader: hands back `values[n]` for the nth call and records
     /// how many times it was asked. `usize::MAX` entries stand for an UNKNOWN
@@ -2889,6 +3089,7 @@ mod tests {
         // every close forever — while `/health`, which additionally checks
         // `is_running()`, correctly reported UNKNOWN. Two readers, two
         // answers, one atom.
+        let _g = WEDGE_ATOMS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let was_running = is_running();
         BACKEND_WEDGED.store(true, Ordering::SeqCst);
         UI_THREAD_WEDGED.store(true, Ordering::SeqCst);
@@ -3046,8 +3247,7 @@ mod tests {
     #[test]
     fn observe_publishes_the_failure_count_before_it_reports() {
         // Serialise: these are process-global atomics.
-        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = WEDGE_ATOMS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
         MONITOR_CONSECUTIVE_FAILURES.store(0, Ordering::SeqCst);
         BACKEND_WEDGED.store(false, Ordering::SeqCst);
