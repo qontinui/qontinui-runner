@@ -39,8 +39,18 @@
 //   Census (default) — for a local box or a scheduled job. Resolves the test
 //   executables, runs each one N times with libtest's default thread count,
 //   diffs the failure sets, re-runs every red alone K times, labels, and exits
-//   0 (no SUITE-ONLY, everything parsed) / 1 (≥ 1 SUITE-ONLY) / 2 (something
-//   unparsed — takes precedence, because an unparsed run can hide either).
+//   0 (no SUITE-ONLY and NO NON-ANSWERS) / 1 (≥ 1 SUITE-ONLY) / 2 (a
+//   non-answer — takes precedence, because a non-answer can hide either).
+//   A non-answer is: an unparsed suite run or solo re-run; the budget
+//   passing before a re-run (`UNRESOLVED (budget)`, or `budget_exhausted` in
+//   the header); or an `UNRESOLVED` whose reason is a RESOLUTION FAILURE (no
+//   built executable normalises to the id's prefix; no executable ran the
+//   named test; the executable changed on disk). The two BY-DESIGN
+//   `UNRESOLVED` reasons — a doctest, an id with no `<binary>::` prefix —
+//   are not: nothing this script could have done would answer them, and
+//   they are listed rather than gated. FAIL-CLOSED on purpose: until
+//   2026-09-21 a nightly whose solo phase never ran (budget gone, every red
+//   `UNRESOLVED (budget)`) exited 0 and printed "clean".
 //   SOLO-RED and BOTH-FLAKY do not move the exit code: they are `cargo test`'s
 //   own red, reported here for completeness, not the class this census gates.
 //
@@ -114,8 +124,10 @@ import { parseArgs as nodeParseArgs } from "node:util";
 
 import {
   binaryIdFromExecutablePath,
+  lastBinaryHasSummary,
   normalizeLogLine,
   parseTestOutcomes,
+  redactSecrets,
 } from "./ci-flake-analyze.mjs";
 
 // ===========================================================================
@@ -453,7 +465,10 @@ export function extractPanicText(outputText, name) {
   while (body.length > 0 && body[body.length - 1].trim() === "") body.pop();
   while (body.length > 0 && body[0].trim() === "") body.shift();
   if (body.length === 0) return null;
-  const text = body.join("\n");
+  // Redacted at CAPTURE, so every consumer of `sample_panic` — the json, the
+  // pretty block, the Checks annotation, the escalator's issue body — sees the
+  // same text and none can leak what the others hid.
+  const text = redactSecrets(body.join("\n"));
   return text.length > PANIC_TEXT_CAP ? `${text.slice(0, PANIC_TEXT_CAP)}…` : text;
 }
 
@@ -556,17 +571,64 @@ export function labelFor({
 }
 
 /**
- * Census-mode exit code. 2 (unparsed) takes precedence over 1 (SUITE-ONLY):
- * an unparsed run can hide either answer.
+ * The two `UNRESOLVED` reasons that are non-answers BY DESIGN — nothing this
+ * script could have done would produce a solo re-run for them — as opposed to
+ * a resolution FAILURE (no executable normalises to the prefix, no executable
+ * ran the name, the executable changed on disk), which means the census did
+ * not measure something it was supposed to. `resolveTestId` mints both.
  *
- * @param {{header: {unparsed: unknown[]}, tests: Record<string, {label: string}>}} report
+ * @param {string|null|undefined} reason
+ * @returns {boolean}
+ */
+export function isByDesignNonAnswer(reason) {
+  const r = String(reason ?? "");
+  return r.startsWith("doctest — ") || r.startsWith("id carries no `<binary>::` prefix");
+}
+
+/**
+ * Census-mode exit code. 2 takes precedence over 1 (SUITE-ONLY), because a
+ * non-answer can hide either answer. FAIL-CLOSED: 2 on any unparsed run or
+ * re-run, on the budget passing before a re-run (`UNRESOLVED (budget)`, or
+ * `header.budget_exhausted` — the header flag covers a budget that ran out
+ * with no candidate left to label), and on any `UNRESOLVED` whose reason is
+ * a resolution failure. The by-design non-answers (`isByDesignNonAnswer`)
+ * are listed, not gated.
+ *
+ * @param {{header: {unparsed: unknown[], budget_exhausted?: boolean}, tests: Record<string, {label: string, reason?: string}>}} report
  * @returns {0|1|2}
  */
 export function exitCodeFor(report) {
-  const labels = Object.values(report.tests).map((t) => t.label);
+  const recs = Object.values(report.tests);
+  const labels = recs.map((t) => t.label);
   if (report.header.unparsed.length > 0 || labels.includes(LABEL.UNPARSED)) return 2;
+  if (report.header.budget_exhausted === true || labels.includes(LABEL.UNRESOLVED_BUDGET)) return 2;
+  if (recs.some((t) => t.label === LABEL.UNRESOLVED && !isByDesignNonAnswer(t.reason))) return 2;
   if (labels.includes(LABEL.SUITE_ONLY)) return 1;
   return 0;
+}
+
+/**
+ * The non-answers that moved the exit code to 2, named — so the pretty
+ * summary and the log say WHY the verdict is UNKNOWN rather than only that.
+ * Pure over a built report.
+ *
+ * @param {ReturnType<typeof buildReport>} report
+ * @returns {string[]}
+ */
+export function nonAnswersFor(report) {
+  const out = [];
+  const h = report.header;
+  if (h.unparsed.length > 0) out.push(`${h.unparsed.length} unparsed suite run(s)`);
+  const recs = Object.entries(report.tests);
+  const count = (pred) => recs.filter(([, t]) => pred(t)).length;
+  const unparsedSolo = count((t) => t.label === LABEL.UNPARSED);
+  if (unparsedSolo) out.push(`${unparsedSolo} test(s) with an unparsed solo re-run`);
+  const budget = count((t) => t.label === LABEL.UNRESOLVED_BUDGET);
+  if (budget) out.push(`${budget} test(s) never re-run — budget passed`);
+  else if (h.budget_exhausted === true) out.push("the budget passed before the solo phase finished");
+  const failed = count((t) => t.label === LABEL.UNRESOLVED && !isByDesignNonAnswer(t.reason));
+  if (failed) out.push(`${failed} test(s) whose executable could not be resolved`);
+  return out;
 }
 
 // ===========================================================================
@@ -595,7 +657,7 @@ export function escapeAnnotationMessage(s) {
  */
 export function formatAnnotation(testId, rec) {
   const K = rec.solo_runs;
-  const panic = rec.sample_panic ? `; panic: ${rec.sample_panic}` : "";
+  const panic = rec.sample_panic ? `; panic: ${redactSecrets(rec.sample_panic)}` : "";
   let level;
   let body;
   switch (rec.label) {
@@ -674,6 +736,10 @@ export function formatPretty(report) {
   }
   out.push("Summary by label:");
   for (const [label, n] of Object.entries(report.summary)) out.push(`  ${label.padEnd(20)} ${n}`);
+  const nonAnswers = h.mode === "classify-from-log" ? [] : nonAnswersFor(report);
+  if (nonAnswers.length > 0) {
+    out.push(`NON-ANSWERS (fail-closed — the verdict is UNKNOWN, not clean): ${nonAnswers.join("; ")}`);
+  }
   out.push(`exit ${report.exit_code}`);
   return out.join("\n");
 }
@@ -681,6 +747,53 @@ export function formatPretty(report) {
 // ===========================================================================
 // Spawn layer (injectable)
 // ===========================================================================
+
+/**
+ * Kill a timed-out test binary AND everything it spawned. `child.kill` alone
+ * reaches the direct child: the runner's `process_helpers` / terminal tests
+ * spawn real grandchildren (a mock CLI, a shell), and one left behind after
+ * its parent's SIGKILL pins a hosted runner until the job's own bound trips
+ * — which is the very bound the census budget exists to stay under.
+ *
+ * POSIX: the child was spawned `detached: true`, so it leads its own process
+ * group and `kill(-pid, SIGKILL)` takes the whole tree. Windows: no groups —
+ * `taskkill /PID <pid> /T /F` walks the tree instead. Either way it is the
+ * TEST BINARY's own tree, never a session or the runner: this script only
+ * ever spawns the executables it resolved.
+ *
+ * Injectable (`platform`, `kill`, `taskkill`) so the POSIX and Windows arms
+ * are pinned by tests without a real process; falls back to `child.kill`
+ * when the group kill is refused (the child already gone, or never detached).
+ *
+ * @param {{pid?: number, kill: (signal: string) => boolean}} child
+ * @param {{platform?: string, kill?: (pid: number, signal: string) => void, taskkill?: (cmd: string, args: string[], opts: object) => unknown}} [io]
+ * @returns {"group"|"tree"|"child"|"none"} which arm actually ran
+ */
+export function killTree(child, { platform = process.platform, kill = process.kill, taskkill = spawnSync } = {}) {
+  const pid = child?.pid;
+  if (!pid) return "none";
+  if (platform === "win32") {
+    try {
+      taskkill("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+      return "tree";
+    } catch {
+      /* fall through to the direct kill */
+    }
+  } else {
+    try {
+      kill(-pid, "SIGKILL");
+      return "group";
+    } catch {
+      /* not a group leader, or already gone — fall through */
+    }
+  }
+  try {
+    child.kill("SIGKILL");
+    return "child";
+  } catch {
+    return "none";
+  }
+}
 
 /**
  * Run one executable to completion, capturing both streams. The ONLY place
@@ -710,6 +823,10 @@ export function defaultSpawn(executable, args, { cwd = null, env = process.env, 
         env,
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
+        // POSIX: own process group, so a timeout can kill the binary's whole
+        // tree (`killTree`). Not on Windows, where `detached` means a new
+        // console rather than a group and `taskkill /T` does the walking.
+        detached: process.platform !== "win32",
       });
     } catch (e) {
       settle({ stdout, stderr, code: null, signal: null, timedOut, spawnError: String(e?.message ?? e) });
@@ -719,13 +836,15 @@ export function defaultSpawn(executable, args, { cwd = null, env = process.env, 
       timeoutMs > 0
         ? setTimeout(() => {
             timedOut = true;
-            try {
-              child.kill("SIGKILL");
-            } catch {
-              /* already gone */
-            }
+            killTree(child);
           }, timeoutMs)
         : null;
+    // `setEncoding` so a multi-byte UTF-8 sequence split across two chunks
+    // decodes as one character; `stdout += <Buffer>` stringifies each chunk
+    // on its own and turns the split into U+FFFD — inside a panic message
+    // that is then compared and filed.
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
     child.stdout.on("data", (d) => {
       stdout += d;
     });
@@ -795,9 +914,11 @@ export function snapshotExecutables(executables, dir, { copy = copyFileSync, mkd
 /**
  * Fold one direct run of an executable into either a Map of outcomes or an
  * `unparsed` reason. Fail-closed on every non-answer: a timeout, a spawn
- * error, output the shared parser does not recognise, or a process that died
- * (non-zero, non-101 exit / a signal) without a single parsed failure — the
- * shape of an abort mid-run, whose remaining tests were never judged.
+ * error, output the shared parser does not recognise, a run whose output
+ * ends WITHOUT libtest's `test result:` summary line (the shape of an abort
+ * mid-run — with or without failures already printed — whose remaining tests
+ * were never judged; `lastBinaryHasSummary`), or a process that died
+ * (non-zero exit / a signal) without a single parsed failure.
  *
  * @param {string} executable
  * @param {{stdout: string, stderr: string, code: number|null, signal: string|null, timedOut: boolean, spawnError: string|null}} result
@@ -809,6 +930,14 @@ export function foldRunResult(executable, result) {
   if (result.timedOut) return { outcomes: null, reason: "timed out and was killed", text };
   const parsed = parseExecutableOutput(executable, text);
   if (parsed.unparsed) return { outcomes: null, reason: parsed.reason ?? "unparsed", text };
+  if (!lastBinaryHasSummary(text.split("\n").map(normalizeLogLine))) {
+    const how = result.signal ? `signal ${result.signal}` : `exit ${result.code}`;
+    return {
+      outcomes: null,
+      reason: `no test-result summary — the run died mid-way (${how}); the tests after the last printed outcome were never judged`,
+      text,
+    };
+  }
   const outcomes = new Map(parsed.tests.map((t) => [t.testId, t.outcome]));
   const failures = [...outcomes.values()].filter((o) => o === "fail").length;
   if (result.code !== 0 && failures === 0) {
@@ -931,6 +1060,7 @@ export async function soloRerunAll({ candidates, index, soloRuns, spawn, deadlin
         // (nothing else was running), not an unparsed run — except when the
         // parser saw nothing at all, which stays fail-closed as UNPARSED.
         if (result.timedOut) {
+          rec.executable = current.executable;
           rec.solo_failures += 1;
           if (!rec.sample_panic) rec.sample_panic = `solo re-run ${folded.reason} (${timeoutMs} ms)`;
           continue;
@@ -1028,6 +1158,17 @@ export async function runCensus({
     const merged = new Map();
     let anyParsed = false;
     for (const e of executables) {
+      // The deadline is anchored at census START and covers the suite runs
+      // too: a run that has not started when it passes is recorded as a
+      // non-answer (→ exit 2 through `exitCodeFor`), never silently skipped
+      // — five hung executables at the per-run timeout must not blow the
+      // job's bound before the json exists.
+      if (deadlineMs !== null && now() >= deadlineMs) {
+        const reason = "budget passed before this run";
+        unparsed.push({ run: r, executable: e.executable, reason });
+        log(`run ${r}/${runs}  ${e.executable}: UNPARSED — ${reason}`);
+        continue;
+      }
       log(`run ${r}/${runs}  ${e.executable}`);
       const expected = digests.get(e.executable);
       let current = null;
@@ -1060,7 +1201,9 @@ export async function runCensus({
         if (outcome === "fail") {
           reds += 1;
           if (!firstPanic.has(testId)) {
-            firstPanic.set(testId, extractPanicText(folded.text, splitTestId(testId).name));
+            // `exactNameFor`: libtest's `---- <name> stdout ----` header carries
+            // the bare name, never the ` - should panic` suffix the id keeps.
+            firstPanic.set(testId, extractPanicText(folded.text, exactNameFor(splitTestId(testId).name)));
           }
         }
       }
@@ -1170,7 +1313,7 @@ export async function classifyFromLog({
         suiteRuns: 1,
         suiteFailures: 1,
         failedInRuns: [1],
-        samplePanic: extractPanicText(logText, splitTestId(t.testId).name),
+        samplePanic: extractPanicText(logText, exactNameFor(splitTestId(t.testId).name)),
       }));
     log(`log: ${parsed.tests.length} outcomes, ${candidates.length} red; re-running each alone ${soloRuns}x`);
   }
@@ -1252,7 +1395,8 @@ function printUsage(stream) {
       "         [--run-timeout-seconds N] [--solo-timeout-seconds N] [--snapshot-dir <dir>]",
       "       node scripts/test-interleave-census.mjs --classify-from-log <log> [same flags]",
       "",
-      "exit (census): 0 no SUITE-ONLY and all runs parsed; 1 any SUITE-ONLY; 2 anything unparsed",
+      "exit (census): 0 no SUITE-ONLY and no non-answers; 1 any SUITE-ONLY; 2 any non-answer",
+      "               (unparsed, budget passed, or an executable that could not be resolved)",
       "exit (--classify-from-log): always 0; usage error 64",
       "",
     ].join("\n"),

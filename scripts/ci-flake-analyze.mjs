@@ -136,6 +136,57 @@ export function hasCargoTestOutput(lines) {
 }
 
 /**
+ * Did the LAST binary in this output print its `test result:` summary line?
+ *
+ * libtest prints that line last, on green and red alike (`test result: ok.`
+ * / `test result: FAILED.`), and only a process that DIED mid-run — an
+ * abort, a segfault, a kill — ends without it. `hasCargoTestOutput` cannot
+ * tell those apart: a run that printed three `... FAILED` lines and then
+ * aborted "has cargo test output" and still judged nothing after the abort.
+ * A consumer folding one executable's output (the interleave census) reads
+ * this to fail closed on that shape rather than count the partial run.
+ *
+ * Scoped to the last announced binary (`Running `…``/`Doc-tests …`), so a
+ * multi-binary log answers for the binary that was executing at the end;
+ * output with no announcement at all answers for the whole text.
+ *
+ * @param {string[]} lines normalised lines (see `normalizeLogLine`)
+ * @returns {boolean}
+ */
+export function lastBinaryHasSummary(lines) {
+  let sawSummary = false;
+  for (const line of lines) {
+    const t = line.trim();
+    if (binaryIdFromAnnouncementLine(t) !== undefined) {
+      sawSummary = false;
+      continue;
+    }
+    if (t.startsWith("test result:")) sawSummary = true;
+  }
+  return sawSummary;
+}
+
+/**
+ * Redact the secret-shaped substrings a captured test panic could carry
+ * before it lands anywhere public — a GitHub issue body or comment, a Checks
+ * annotation. The three shapes are the ones this fleet's test fixtures
+ * actually mint: a JWT (`eyJ…` base64url header, a dot, more), a
+ * `Bearer <token>` header, and a `token=`/`secret=`/`password=` pair.
+ * Shared by `test-interleave-census.mjs` (annotations, the json's
+ * `sample_panic`) and `ci-flake-escalate.mjs` (issue bodies, comments), so
+ * the two consumers cannot drift. Idempotent.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+export function redactSecrets(text) {
+  return String(text ?? "")
+    .replace(/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_.-]*/g, "[redacted]")
+    .replace(/Bearer \S+/g, "Bearer [redacted]")
+    .replace(/\b(token|secret|password)=\S+/gi, "$1=[redacted]");
+}
+
+/**
  * Extract failing test names from a cargo job log.
  *
  * Handles BOTH shapes cargo emits, because a log routinely contains only one:
