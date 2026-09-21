@@ -4299,15 +4299,114 @@ mod tests {
     /// [`config_report_never_reaches_the_settings_writer`] — this test's
     /// fingerprints match on a dev box whether or not the writer ran, because
     /// boot has already consumed the one-shot migration.
+    ///
+    /// # The config dir is a DEDICATED subdir, and the dir watch names entries
+    ///
+    /// Measured 2026-09-21 under two concurrent full-suite loops of one test
+    /// binary (red on run 11): this test panicked on the config DIR row with
+    /// `(true, Some(4096), mtime T)` before and `mtime T+4ms` after — size
+    /// unchanged, `settings.json` unchanged, so not the settings persist (which
+    /// Phase 3's canary in `settings::persist_allowed_from_this_thread` now
+    /// deflects anyway). The dir was the fixture's ROOT tempdir, because
+    /// `isolated_ambient()` points FIVE process-global keys at that one
+    /// directory — `QONTINUI_HOME`, `QONTINUI_CONFIG_DIR`,
+    /// `QONTINUI_SECURE_STORAGE_DIR`, `HOME`, `USERPROFILE` — and the ambient
+    /// READ canary's soft arm 3 lets an unguarded sibling proceed while a
+    /// fixture is live. Any sibling touching `$HOME/.something` bumps that
+    /// root's mtime, and a directory mtime cannot say whether the report
+    /// materialised something or a sibling wrote to its `HOME`.
+    ///
+    /// Two remedies, both in this test only. First, `QONTINUI_CONFIG_DIR` is
+    /// re-pointed (under the fixture's own `env_lock()`, restored on drop) at
+    /// `<fixture root>/config-under-test`, a subdir no other key aliases, and
+    /// the watched paths are derived AFTER that override so they point into
+    /// it; a write there is reachable only through `QONTINUI_CONFIG_DIR`, which
+    /// is exactly where the persist canary stands. Second, a directory's
+    /// fingerprint is its sorted entry list with each entry's `(len, mtime)`
+    /// rather than the dir's own mtime, and a mismatch prints the entries that
+    /// appeared, vanished or changed — so the next red names the FILE a
+    /// sibling wrote instead of a directory timestamp. Plan
+    /// `2026-09-17-runner-tests-share-in-process-mutable-state`, Phase 3.
     #[test]
     fn config_report_live_command_writes_nothing_it_reports_on() {
-        let _amb = crate::test_env::isolated_ambient();
-        fn fingerprint(
-            path: &std::path::Path,
-        ) -> (bool, Option<u64>, Option<std::time::SystemTime>) {
-            match std::fs::metadata(path) {
-                Ok(md) => (true, Some(md.len()), md.modified().ok()),
-                Err(_) => (false, None, None),
+        let amb = crate::test_env::isolated_ambient();
+        // The fixture holds `env_lock()` for its lifetime, so this override is
+        // serialised against every other env-touching test; the restore drops
+        // before the fixture (declaration order is reverse drop order).
+        let _config_dir_restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_CONFIG_DIR"]);
+        let config_under_test = amb.dir().join("config-under-test");
+        std::fs::create_dir_all(&config_under_test).expect("dedicated config dir");
+        std::env::set_var("QONTINUI_CONFIG_DIR", &config_under_test);
+
+        /// One entry of a directory fingerprint: `(name, len, mtime)`.
+        type Entry = (String, Option<u64>, Option<std::time::SystemTime>);
+
+        /// What a watched path looked like: absent, a file with `(len, mtime)`,
+        /// or a directory with its sorted entries. A directory's OWN mtime is
+        /// deliberately not part of it — see the doc comment above.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        enum Fingerprint {
+            Absent,
+            File {
+                len: u64,
+                mtime: Option<std::time::SystemTime>,
+            },
+            Dir {
+                entries: Vec<Entry>,
+            },
+        }
+
+        fn fingerprint(path: &std::path::Path) -> Fingerprint {
+            let Ok(md) = std::fs::metadata(path) else {
+                return Fingerprint::Absent;
+            };
+            if !md.is_dir() {
+                return Fingerprint::File {
+                    len: md.len(),
+                    mtime: md.modified().ok(),
+                };
+            }
+            let mut entries: Vec<Entry> = std::fs::read_dir(path)
+                .map(|rd| {
+                    rd.filter_map(Result::ok)
+                        .map(|e| {
+                            let name = e.file_name().to_string_lossy().into_owned();
+                            match e.metadata() {
+                                Ok(m) => (name, Some(m.len()), m.modified().ok()),
+                                Err(_) => (name, None, None),
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            entries.sort();
+            Fingerprint::Dir { entries }
+        }
+
+        /// Name what differs between two fingerprints of the same path.
+        fn describe_change(before: &Fingerprint, after: &Fingerprint) -> String {
+            match (before, after) {
+                (Fingerprint::Dir { entries: b }, Fingerprint::Dir { entries: a }) => {
+                    let names = |v: &[Entry]| -> Vec<String> {
+                        v.iter().map(|(n, _, _)| n.clone()).collect()
+                    };
+                    let (bn, an) = (names(b), names(a));
+                    let new: Vec<&String> = an.iter().filter(|n| !bn.contains(n)).collect();
+                    let gone: Vec<&String> = bn.iter().filter(|n| !an.contains(n)).collect();
+                    let changed: Vec<String> = b
+                        .iter()
+                        .filter_map(|(n, bl, bm)| {
+                            a.iter()
+                                .find(|(an_, _, _)| an_ == n)
+                                .filter(|(_, al, am)| (al, am) != (bl, bm))
+                                .map(|(_, al, am)| {
+                                    format!("{n} ({bl:?},{bm:?}) -> ({al:?},{am:?})")
+                                })
+                        })
+                        .collect();
+                    format!("new entries {new:?}, vanished entries {gone:?}, changed {changed:?}")
+                }
+                (b, a) => format!("{b:?} -> {a:?}"),
             }
         }
 
@@ -4333,17 +4432,28 @@ mod tests {
             "the test must actually be watching something"
         );
 
+        assert!(
+            watched.iter().any(|p| p.starts_with(&config_under_test)),
+            "the config dir and settings.json must resolve into the dedicated subdir \
+             {} — otherwise the override never took and the watch aliases HOME again: {watched:?}",
+            config_under_test.display()
+        );
+        assert!(
+            !watched.iter().any(|p| p == amb.dir()),
+            "the fixture ROOT must not be watched — five process-global keys alias it: {watched:?}"
+        );
+
         let before: Vec<_> = watched.iter().map(|p| fingerprint(p)).collect();
         let report = config_report_run();
         let after: Vec<_> = watched.iter().map(|p| fingerprint(p)).collect();
 
         for (i, path) in watched.iter().enumerate() {
-            assert_eq!(
-                before[i],
-                after[i],
-                "running the config report changed {} — a diagnostic that materializes the thing \
-                 it is describing changes the answer by asking the question",
-                path.display()
+            assert!(
+                before[i] == after[i],
+                "running the config report changed {}: {} — a diagnostic that materializes the \
+                 thing it is describing changes the answer by asking the question",
+                path.display(),
+                describe_change(&before[i], &after[i])
             );
         }
 
