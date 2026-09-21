@@ -623,7 +623,20 @@ pub fn render_confirmation(
 /// admitting, say, `resume` or a future `restart` to `classify_source`'s `Ok`
 /// arm would have killed the property here while this function went on
 /// "correctly" returning false and gating nothing. Delegation makes that
-/// impossible and turns the table test into a genuine pin.
+/// impossible: there is now one accepted set, and widening it widens both.
+///
+/// ⚠️ **What delegation does NOT do is make the agreement testable — it makes
+/// the question vacuous.** In `classify_source_splits_the_three_non_confirmable_shapes`
+/// the `assert!(source_permits_confirmation(raw))` beside each
+/// `assert_eq!(classify_source(raw), …)` now calls the same code twice and
+/// cannot detect a disagreement, because there is no longer anything that could
+/// disagree. Harmless, and worth naming so nobody reads those lines as
+/// protection. The real pin on the ACCEPTED SET is the hand-written
+/// `expect_confirmed` column in
+/// `only_startup_and_compact_may_confirm_a_matching_marker`, which pairs this
+/// predicate against [`render_for_session`]'s actual verdict over nine rows —
+/// that is the test the round-2 mutation (`classify_source` admitting `resume`)
+/// was caught by.
 pub fn source_permits_confirmation(raw_source: Option<&str>) -> bool {
     classify_source(raw_source).is_ok()
 }
@@ -811,22 +824,36 @@ fn short_sha(sha: Option<&str>) -> String {
     }
 }
 
-/// What an absent or empty optional renders as in the decision event. Never an
-/// empty field — see [`short_sha`].
+/// What an absent SHA renders as in the decision event. Never an empty field —
+/// see [`short_sha`].
 const ABSENT_FIELD: &str = "<none>";
 
+/// What an absent hook `source` renders as in the decision event. A separate
+/// sentinel from [`ABSENT_FIELD`] on purpose: "no marker" and "no source" are
+/// different findings, and a reader scanning the line should not have to check
+/// which field a `<none>` belongs to.
+const ABSENT_SOURCE: &str = "<absent>";
+
 /// The raw hook `source` as it reaches the log: what the hook actually sent, or
-/// `<absent>` when it sent nothing or nothing but whitespace.
+/// [`ABSENT_SOURCE`] when it sent nothing or nothing but whitespace.
 ///
 /// Distinct from [`normalize_source`]'s LABEL, which maps an absent source to
 /// `startup` and so cannot be used to tell the two apart — the exact ambiguity
 /// [`PolicyRenderReason::SourceAbsent`] exists to end. Empty is folded into
-/// absent here for the same reason `short_sha` folds it: a blank field reads as
-/// a broken one.
+/// absent for the same reason [`short_sha`] folds it: a blank field reads as a
+/// broken field rather than as an absent value.
+///
+/// **Deliberately logs the value UNTRIMMED**, where `short_sha` trims. The
+/// decision is made on the trimmed, lowercased value ([`classify_source`]), so
+/// the trimmed form is already implied by `reason`; what this field adds is
+/// what the hook literally put on the wire, and a `" startup "` whose padding
+/// were silently removed here would hide a hook bug rather than expose one.
+/// Only the emptiness TEST trims — a whitespace-only source is absent, not a
+/// value worth echoing.
 fn source_for_log(raw_source: Option<&str>) -> &str {
-    match raw_source.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(_) => raw_source.unwrap_or("<absent>"),
-        None => "<absent>",
+    match raw_source {
+        Some(raw) if !raw.trim().is_empty() => raw,
+        _ => ABSENT_SOURCE,
     }
 }
 
@@ -919,16 +946,23 @@ fn render_counts() -> &'static [AtomicU64; PolicyRenderReason::COUNT] {
 ///
 /// ONLY [`Mode::On`]. `Off` never reaches a decision at all, and `Observe`
 /// renders the would-be payload and then injects NOTHING — counting it would
-/// make `full_body_total` a count of sessions that did not receive a body, so
-/// a runner soaked in `observe` would report thousands of full-body injections
+/// make `full_body_total` a count of renders that were never delivered, so a
+/// runner soaked in `observe` would report thousands of full-body injections
 /// having made none.
 ///
-/// This is a function rather than the placement of a statement relative to
-/// [`policy_context`]'s `observe` early-return, because that placement is
-/// load-bearing and a `return` is not a thing a test can assert about: moving
-/// `record_render` above it compiles, passes every other test, and silently
-/// inverts the counter's meaning. A predicate can be pinned; a line number
-/// cannot. See `the_tally_counts_only_the_mode_that_actually_injects`.
+/// A function rather than a sentence in a comment, because the rule is worth
+/// pinning: moving `record_render` above [`policy_context`]'s `observe`
+/// early-return compiles, passes every other test, and silently inverts the
+/// counter's meaning.
+///
+/// ⚠️ **Be precise about what this buys.** At its one call site the guard is
+/// unreachable-false — `Off` and `Observe` have both already returned, so
+/// `mode` there can only be `On` — and moving that call above the early return
+/// would still pass everything, because nothing in the crate calls
+/// `policy_context`. So position still decides behaviour at that site; what the
+/// predicate adds is that the rule is now testable
+/// (`the_tally_counts_only_the_mode_that_actually_injects`) and that a future
+/// caller inherits it by asking rather than by being placed correctly.
 pub fn should_count(mode: Mode) -> bool {
     mode == Mode::On
 }
@@ -1022,12 +1056,16 @@ pub fn render_stats() -> PolicyRenderStats {
     let marker_mismatched = at(PolicyRenderReason::MarkerMismatched);
     let confirmed = at(PolicyRenderReason::Confirmed);
     let pull_failed = at(PolicyRenderReason::PullFailed);
-    let full_body_total = source_absent
-        + source_unrecognized
-        + source_not_confirmable
-        + body_unavailable
-        + marker_absent
-        + marker_mismatched;
+    // DERIVED from `ALL`, not written out as a six-term sum: a ninth full-body
+    // arm added to the enum, to `ALL` and to the struct would compile against a
+    // hand-written sum and silently under-report — the same class the derived
+    // `slot()` closed one level down. `served_full_body` is the single source
+    // of truth for which arms belong here.
+    let full_body_total: u64 = PolicyRenderReason::ALL
+        .iter()
+        .filter(|r| r.served_full_body())
+        .map(|r| at(*r))
+        .sum();
     PolicyRenderStats {
         source_absent,
         source_unrecognized,
@@ -1038,7 +1076,9 @@ pub fn render_stats() -> PolicyRenderStats {
         confirmed,
         pull_failed,
         full_body_total,
-        injections: full_body_total + confirmed + pull_failed,
+        // Likewise derived: every arm, so a new one cannot be left out of the
+        // denominator by forgetting to add a term here.
+        injections: PolicyRenderReason::ALL.iter().map(|r| at(*r)).sum(),
     }
 }
 
@@ -1671,9 +1711,21 @@ pub async fn policy_context(
     // `startup`; `source_raw` is what the hook actually sent, and `reason`
     // separates the three non-confirmable shapes the label cannot.
     //
-    // The counter is gated on `should_count` rather than on sitting below the
-    // `observe` early-return, so the rule is a predicate a test can pin instead
-    // of a line position nothing checks.
+    // Gated on BOTH `should_count` and position, and the honest reading is that
+    // POSITION is still what decides behaviour here: `Off` returned above, and
+    // so did `Observe`, so by this line `mode` can only be `On` and
+    // `should_count(mode)` is a constant `true`. Moving this call above the
+    // `observe` early-return would still compile and still pass every test,
+    // because nothing in the crate calls `policy_context` — it is an async fn
+    // that reads env and talks to coord, and making it callable from a test is
+    // a bigger change than this phase.
+    //
+    // What the predicate buys is therefore NOT coverage of this call site. It
+    // is that the RULE — "only the mode that actually injects is counted" — now
+    // exists as a testable thing (`the_tally_counts_only_the_mode_that_actually
+    // _injects`) instead of only as a sentence in a comment, and that any FUTURE
+    // caller inherits it by calling `should_count` rather than by being placed
+    // correctly. The residual is real and is recorded, not closed.
     if should_count(mode) {
         record_render(decision.reason);
     }
@@ -1768,6 +1820,27 @@ pub fn spawn_policy_body() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes every test that touches the process-global render counters.
+    ///
+    /// Module-level, not a `static` inside one test's body, because the counters
+    /// are shared by MORE THAN ONE test and `cargo test` runs a binary's tests on
+    /// parallel threads in one process (`.qontinui/ci.toml` runs `cargo test`,
+    /// not `nextest`, so there is no process-per-test isolation to fall back on).
+    /// A function-local lock cannot be taken by a sibling test, which is exactly
+    /// how the first version of this leaked: a second test recorded eight
+    /// increments unsynchronized, and when they landed between the counter test's
+    /// `before` and `after` every delta went off by one and failed as `2 != 1` —
+    /// reading as a SLOT-MAPPING BUG, the very defect this module was being fixed
+    /// for. An intermittent failure that accuses the wrong code is worse than no
+    /// test.
+    ///
+    /// Poison recovery per `CONTRIBUTING.md` ("Rust unit tests — env-var
+    /// hygiene"): a panicking holder must not cascade-fail its siblings. No
+    /// `Drop` guard is needed here — unlike an env var, a counter is never
+    /// "restored", and every assertion is on a DELTA precisely so that whatever a
+    /// previous holder left behind is irrelevant.
+    static COUNTER_LOCK: Mutex<()> = Mutex::new(());
 
     fn sample_payload() -> PolicyPayload {
         PolicyPayload {
@@ -2449,8 +2522,8 @@ mod tests {
     }
 
     /// ARM: `pull_failed`. The coord read failed, so the session got the
-    /// fail-open notice and NO policy body. Counted — otherwise `total` is not
-    /// the number of sessions this route injected into — but never counted as a
+    /// fail-open notice and NO policy body. Counted — otherwise `injections` is
+    /// not every `SessionStart` this route answered — but never counted as a
     /// full body, which it is not.
     #[test]
     fn a_failed_pull_reasons_pull_failed_and_is_not_a_full_body() {
@@ -2475,9 +2548,17 @@ mod tests {
     /// the three-way "why not".
     #[test]
     fn classify_source_splits_the_three_non_confirmable_shapes() {
+        // NOTE: the `source_permits_confirmation` assertions below are NOT a
+        // cross-check — that function delegates here, so they call the same code
+        // twice and nothing could disagree. They are kept as documentation that
+        // the two answers are one answer. The genuine pin on the accepted set is
+        // `only_startup_and_compact_may_confirm_a_matching_marker`.
         for raw in [Some("startup"), Some("compact"), Some(" Startup ")] {
             assert_eq!(classify_source(raw), Ok(()), "{raw:?}");
             assert!(source_permits_confirmation(raw), "{raw:?}");
+            // A present, non-blank source is echoed to the log VERBATIM —
+            // untrimmed, so padding a hook accidentally sent stays visible.
+            assert_eq!(source_for_log(raw), raw.unwrap(), "{raw:?}");
         }
         for (raw, expect) in [
             (None, PolicyRenderReason::SourceAbsent),
@@ -2490,6 +2571,30 @@ mod tests {
             assert_eq!(classify_source(raw), Err(expect), "{raw:?}");
             assert!(!source_permits_confirmation(raw), "{raw:?}");
         }
+    }
+
+    /// The raw source reaches the log as itself, or as an explicit sentinel —
+    /// never as a BLANK field, which reads as a broken field rather than as an
+    /// absent value. That was a round-1 finding on `short_sha`'s sibling, and
+    /// the fix shipped untested, so both halves are pinned here.
+    #[test]
+    fn the_raw_source_logs_verbatim_or_says_it_was_absent() {
+        // Absent, empty and whitespace-only all render as the sentinel. The
+        // middle two are the round-1 defect: without the emptiness test they
+        // would log as an empty field.
+        for raw in [None, Some(""), Some("   "), Some("\t\n")] {
+            assert_eq!(source_for_log(raw), ABSENT_SOURCE, "{raw:?}");
+            assert!(!source_for_log(raw).is_empty(), "{raw:?}");
+        }
+        // Anything with content is echoed EXACTLY — the field's job is to say
+        // what the hook put on the wire, so neither case nor padding is
+        // normalized away.
+        for raw in ["startup", " startup ", "COMPACT", "reload", "x"] {
+            assert_eq!(source_for_log(Some(raw)), raw);
+        }
+        // And the two sentinels stay distinct, so a reader never has to work out
+        // which field a `<none>` belonged to.
+        assert_ne!(ABSENT_SOURCE, ABSENT_FIELD);
     }
 
     /// Both SHAs reach the decision, and the log form is the SAME 12-character
@@ -2621,13 +2726,10 @@ mod tests {
     /// future test that records.
     #[test]
     fn the_counter_files_each_reason_separately_and_the_totals_add_up() {
-        // Serializes THIS test against a second invocation of itself (cargo
-        // re-runs are separate processes, but a future `#[test]` calling it
-        // twice is not). It does NOT exclude other tests — nothing else in this
-        // module records — which is why every assertion below is on a DELTA
-        // rather than an absolute.
-        static LOCK: Mutex<()> = Mutex::new(());
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Excludes every other counter-touching test in this binary — see
+        // `COUNTER_LOCK`. Assertions are still on DELTAS rather than absolutes,
+        // so an earlier holder's increments are irrelevant.
+        let _guard = COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let before = render_stats();
         // A distinct, non-uniform number of hits per reason, so a slot that
@@ -2658,13 +2760,6 @@ mod tests {
         // failed = 36 injections.
         assert_eq!(after.full_body_total - before.full_body_total, 21);
         assert_eq!(after.injections - before.injections, 36);
-        // `full_body_total` excludes exactly the confirmation and the failed
-        // pull — 36 - 21 == 7 + 8.
-        assert_eq!(
-            (after.injections - before.injections)
-                - (after.full_body_total - before.full_body_total),
-            15
-        );
     }
 
     /// `should_count` is the rule that keeps the tally a count of INJECTIONS.
@@ -2681,7 +2776,7 @@ mod tests {
         assert!(
             !should_count(Mode::Observe),
             "observe renders the payload and injects NOTHING — counting it makes \
-             full_body_total a count of sessions that got no body"
+             full_body_total a count of renders that were never delivered"
         );
         assert!(!should_count(Mode::Off));
     }
@@ -2700,7 +2795,12 @@ mod tests {
                 .unwrap_or_else(|| panic!("{} missing from ALL", reason.as_str()));
             assert!(slot < PolicyRenderReason::COUNT, "{}", reason.as_str());
         }
-        // And recording never panics, whatever the arm.
+        // Recording never panics, whatever the arm. This TOUCHES the shared
+        // counters, so it takes `COUNTER_LOCK` like every other test that does —
+        // without it these eight increments race the delta assertions in
+        // `the_counter_files_each_reason_separately_and_the_totals_add_up` and
+        // make it fail intermittently as though the slot mapping were wrong.
+        let _guard = COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for reason in PolicyRenderReason::ALL {
             record_render(reason);
         }

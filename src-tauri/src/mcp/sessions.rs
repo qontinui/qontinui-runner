@@ -1006,10 +1006,13 @@ async fn policy_context(
 // /sessions/policy-context-stats
 // =============================================================================
 
-/// `GET /sessions/policy-context-stats` — how many sessions this runner
-/// injected the FULL policy body into since it started, and why
-/// (plan `2026-09-21-policy-body-still-crosses-the-sessionstart-boundary`,
-/// Phase 2).
+/// `GET /sessions/policy-context-stats` — how many INJECTIONS carried the FULL
+/// policy body since this runner started, and why (plan
+/// `2026-09-21-policy-body-still-crosses-the-sessionstart-boundary`, Phase 2).
+///
+/// **Injections, not sessions** — see the warning below; the distinction is the
+/// difference between reading this route right and reading it backwards, so it
+/// belongs in the first sentence rather than only in a note further down.
 ///
 /// The honesty gate in [`crate::mcp::policy_context::render_for_session`] fails
 /// OPEN: anything it cannot confirm gets the full body. That is correct and it
