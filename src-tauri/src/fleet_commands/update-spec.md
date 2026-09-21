@@ -62,7 +62,8 @@ POST https://coord.qontinui.io/agents/allocate      # no Authorization header
   "device_id":  "<this machine's device_id>",
   "repos":      [{"repo": "<repo>"}],
   "intent":     "<what this worktree is for>",
-  "work_unit_id": "<the plan's work_unit_id UUID, WHEN THERE IS ONE>"
+  "work_unit_id": "<the plan's work_unit_id UUID, WHEN THERE IS ONE>",
+  "agent_session_id": "<$CLAUDE_CODE_SESSION_ID, else $CLAUDE_SESSION_ID — WHEN IT IS A LOWERCASE UUID>"
 }
 ```
 
