@@ -53,6 +53,36 @@
  *   node scripts/ci-test-results-ingest.mjs --log <path> --repo <owner/repo>
  *                                            --head-sha <sha> [--shard <platform>]
  *                                            [--gating-outcome <outcome>]
+ *                                            [--classification <path>]
+ *
+ * CLASSIFICATION (Phase 1 of plan
+ * `2026-09-17-runner-tests-share-in-process-mutable-state`). On a red run
+ * the `Classify failed tests (solo re-run)` step of ci.yml re-runs each
+ * failed test alone against the binaries the build half produced and writes
+ * `test-classification.json` (`scripts/test-interleave-census.mjs
+ * --classify-from-log`). Given `--classification <path>`, every pre-parsed
+ * `results` row this script builds carries
+ * `classification: "suite_only" | "solo_red" | "both_flaky" | null` — the
+ * three verdicts by test id; null for a test the report did not classify
+ * (green, UNRESOLVED, UNRESOLVED (budget), UNPARSED, or absent from it). A
+ * file that is absent (every green run), unreadable or not the report's
+ * shape is null on EVERY row and a `::notice`, never a failure: the
+ * classification is a diagnostic riding on the ingest, not a precondition
+ * of it. The token mapping is the census script's own
+ * (`classificationsFromReport`), so the two never drift.
+ *
+ * ⚠️ THE FIELD IS NOT SENT TO COORD, for the reason the `--gating-outcome`
+ * paragraph below states at length: `ResultItem` carries no such field and
+ * no `deny_unknown_fields`, so a `classification` key in the POST body would
+ * be silently dropped — written into a void that reads as success. The wire
+ * rows are therefore stripped to coord's `ResultItem` shape
+ * (`toWireRow`), byte-identical to what this script sent before the flag
+ * existed, and the tests pin that. The classification lives in this step's
+ * log (a per-label tally), in the classify step's Checks annotations, and in
+ * the json itself, which `ci-flake-escalate.mjs --classification` reads
+ * directly. Persisting it is the same three-repo change as the gating
+ * outcome (a `qontinui-web` alembic column, a `qontinui-coord` request field
+ * + INSERT, then one line here) — the plan's recorded coord gap.
  *
  * `--gating-outcome` is the GATING step's own `outcome` (Phase 4a of plan
  * `2026-09-17-the-windows-test-gate-is-a-90-minute-build-wearing-a-test-shaped-bound`).
@@ -144,6 +174,7 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { parseTestOutcomes } from "./ci-flake-analyze.mjs";
+import { classificationsFromReport } from "./test-interleave-census.mjs";
 
 const DEFAULT_COORD_URL = "https://coord.qontinui.io";
 const INGEST_PATH = "/coord/test-results/ingest";
@@ -174,14 +205,60 @@ const CHUNK_SIZE = 1000;
 const REQUEST_TIMEOUT_MS = 120_000;
 
 /**
+ * Read the classifier's json into a test id → token map. NEVER throws: an
+ * absent file (the green-run case, and the skipped-step case), an unreadable
+ * one, non-JSON, or a JSON value that is not the report's shape all yield
+ * `{ byId: null, note }` — and `byId: null` means "no classification",
+ * which `buildIngestBody` renders as null on every row.
+ *
+ * @param {string|undefined|null} path
+ * @param {{ read?: (p: string) => string }} [io]
+ * @returns {{ byId: Map<string, string>|null, note: string|null }}
+ */
+export function readClassification(path, { read = (p) => readFileSync(p, "utf8") } = {}) {
+  if (!path) return { byId: null, note: null };
+  let text;
+  try {
+    text = read(path);
+  } catch (err) {
+    return {
+      byId: null,
+      note: `classification file ${path} not readable (${err?.code ?? err?.message ?? err}); classification=null on every row`,
+    };
+  }
+  let report;
+  try {
+    report = JSON.parse(text);
+  } catch (err) {
+    return {
+      byId: null,
+      note: `classification file ${path} is not JSON (${err?.message ?? err}); classification=null on every row`,
+    };
+  }
+  if (!report || typeof report !== "object" || Array.isArray(report) || !report.tests || typeof report.tests !== "object") {
+    return {
+      byId: null,
+      note: `classification file ${path} carries no \`tests\` object; classification=null on every row`,
+    };
+  }
+  return { byId: classificationsFromReport(report), note: null };
+}
+
+/**
  * Build the `POST /coord/test-results/ingest` body from a parsed log. Pure —
  * no I/O — so this is what the unit tests exercise directly.
+ *
+ * `classification`, when given, is the id → token map `readClassification`
+ * produced; every row carries `classification` (the token, or null), so a
+ * reader of the rows can never confuse "not classified" with "field absent".
+ * The key is LOCAL to these pre-parsed rows: `toWireRow` strips it before
+ * the POST (see the header).
  *
  * @returns {{body: object|null, warning: string|null}} `body` is null when
  *   there is nothing worth sending (unparsed log, or zero named tests); the
  *   caller must surface `warning` rather than silently skip.
  */
-export function buildIngestBody({ logText, repo, headSha, shard }) {
+export function buildIngestBody({ logText, repo, headSha, shard, classification = null }) {
   const parsed = parseTestOutcomes(logText);
   if (parsed.unparsed) {
     return {
@@ -204,10 +281,23 @@ export function buildIngestBody({ logText, repo, headSha, shard }) {
         test_id: t.testId,
         outcome: t.outcome,
         ...(shard ? { shard } : {}),
+        classification: classification?.get?.(t.testId) ?? null,
       })),
     },
     warning: null,
   };
+}
+
+/**
+ * The row as coord's `ResultItem` reads it — `{test_id, outcome, shard?}` —
+ * with the local `classification` key removed. PURE, and pinned by the
+ * tests: the POST body must stay byte-identical to what this script sent
+ * before `--classification` existed, because a key coord silently drops
+ * would read as a successful write of nothing (see the header).
+ */
+export function toWireRow(row) {
+  const { classification: _dropped, ...wire } = row;
+  return wire;
 }
 
 /// The gating step outcomes GitHub can report. Anything else — an unexpanded
@@ -276,6 +366,7 @@ function printUsage(stream) {
     [
       "Usage: ci-test-results-ingest.mjs --log <path> --repo <owner/repo> --head-sha <sha>",
       "                                  [--shard <platform>] [--gating-outcome <outcome>]",
+      "                                  [--classification <path>]",
       "",
       "Best-effort: never fails the calling CI job. See file header.",
       "",
@@ -287,6 +378,12 @@ function printUsage(stream) {
       "                       closes the platform-attribution gap Phase 0 found",
       "  --gating-outcome <o> The GATING step's own outcome. Anything other than",
       "                       'success' is announced loudly; the payload is unchanged",
+      "  --classification <path>",
+      "                       The solo re-run classifier's json (test-interleave-",
+      "                       census.mjs --classify-from-log); each pre-parsed row then",
+      "                       carries classification: suite_only|solo_red|both_flaky|null,",
+      "                       tallied in this step's log. NOT sent to coord (no column).",
+      "                       Absent or unreadable -> null on every row, never a failure",
       "  -h, --help           Print this help and exit 0",
       "",
     ].join("\n"),
@@ -295,6 +392,10 @@ function printUsage(stream) {
 
 function warn(msg) {
   process.stdout.write(`::warning title=test-results-ingest::${msg}\n`);
+}
+/// For a routine, expected absence — the classification file on a green run.
+function noticeLine(msg) {
+  process.stdout.write(`::notice title=test-results-ingest::${msg}\n`);
 }
 function info(msg) {
   process.stdout.write(`[ci-test-results-ingest] ${msg}\n`);
@@ -399,7 +500,7 @@ async function postResults(url, body, token) {
     // Every chunk repeats repo/head_sha/source — coord keys on those and
     // appends, so N posts for one head are a supported shape (its own coverage
     // producer does exactly this per module).
-    const r = await postOneChunk(url, { ...body, results }, token);
+    const r = await postOneChunk(url, { ...body, results: results.map(toWireRow) }, token);
     if (r.ok) {
       sent += results.length;
       serverFailed += r.serverFailed ?? 0;
@@ -440,6 +541,7 @@ async function main(argv) {
         "head-sha": { type: "string" },
         shard: { type: "string" },
         "gating-outcome": { type: "string" },
+        classification: { type: "string" },
         help: { type: "boolean", short: "h" },
       },
       allowPositionals: false,
@@ -472,10 +574,27 @@ async function main(argv) {
     return 0;
   }
 
-  const { body, warning } = buildIngestBody({ logText, repo, headSha, shard });
+  const { byId: classification, note } = readClassification(parsed.values.classification);
+  if (note) noticeLine(note);
+
+  const { body, warning } = buildIngestBody({ logText, repo, headSha, shard, classification });
   if (warning) {
     warn(warning);
     return 0;
+  }
+  if (classification) {
+    const tally = {};
+    for (const r of body.results) {
+      if (r.classification) tally[r.classification] = (tally[r.classification] ?? 0) + 1;
+    }
+    const summary = Object.entries(tally)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([k, v]) => `${k}=${v}`)
+      .join(" ");
+    info(
+      `classification from ${parsed.values.classification}: ${classification.size} classified id(s) in the file, ` +
+        `${summary || "none"} on this leg's rows (not sent to coord — no column; see the header)`,
+    );
   }
 
   // Phase 4a: announce an UNQUALIFIED ingest loudly, and change nothing else.
