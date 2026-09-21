@@ -1793,11 +1793,27 @@ fn looks_like_cargo_artifact(path: &Path) -> bool {
 
 /// Junction-safe recursive removal. Removes any link — `dir` itself or a
 /// nested one — as a link only, never recursing into its target, before
-/// deleting real content, then removes `dir` itself. A top-level link goes
-/// through [`remove_link`] (`remove_dir` on a Windows junction, `unlink(2)`
-/// elsewhere); on Linux a nested symlink is never `is_dir()` under
-/// `symlink_metadata`, so it takes the `is_symlink()` arm and `remove_file`.
-/// Mirrors [`super::reclaim`] INV-W4.
+/// deleting real content, then removes `dir` itself. Every link arm goes
+/// through [`remove_link`], which picks the platform's and the link shape's
+/// own removal call. Mirrors [`super::reclaim`] INV-W4.
+///
+/// ## Why `is_symlink` is tested BEFORE `is_dir`
+///
+/// Measured on `x86_64-pc-windows-msvc`, rustc 1.95.0 (the pinned
+/// toolchain), under `symlink_metadata`: a directory junction (`mklink /J`),
+/// a directory symlink (`mklink /D`) and a file symlink all report
+/// `is_symlink() == true` and `is_dir() == false`. So a nested link on
+/// Windows lands in the `is_symlink` arm, exactly as one on Linux does — it
+/// never reaches the `is_dir` arm below, whatever its target is.
+///
+/// This is what the previous shape got wrong. It tested `is_dir()` first and
+/// handled a link only inside that arm, so every nested Windows junction
+/// fell through to a bare `let _ = std::fs::remove_file(&path)` —
+/// `PermissionDenied` (os error 5) on a junction, MEASURED, with the error
+/// discarded. The junction survived, the closing `remove_dir(dir)` then
+/// failed as "directory not empty", and the reap of any target tree holding
+/// a nested junction could never complete. Nothing was ever deleted through
+/// the link, so the defect was a permanent no-op, not a data loss.
 fn remove_junction_safe(dir: &Path) -> std::io::Result<()> {
     // `dir` itself must not be a reparse point — the caller guarantees it, but
     // defend anyway: unlink the link only.
@@ -1809,20 +1825,53 @@ fn remove_junction_safe(dir: &Path) -> std::io::Result<()> {
         let path = entry.path();
         let meta = std::fs::symlink_metadata(&path)?;
         let ft = meta.file_type();
-        if ft.is_dir() {
-            if is_junction(&path) || ft.is_symlink() {
-                // Reparse point — unlink the link, never recurse in.
-                let _ = std::fs::remove_dir(&path);
+        if ft.is_symlink() {
+            // A link — a Unix symlink, or a Windows junction / directory
+            // symlink / file symlink. Unlink it; never recurse in.
+            remove_nested_link(&path)?;
+        } else if ft.is_dir() {
+            if is_junction(&path) {
+                // A directory reparse point that is NOT a name surrogate, so
+                // `is_symlink` does not report it and it reads as a plain
+                // directory: a cloud placeholder, a dedup stub, an app-exec
+                // link. `is_junction` tests the raw reparse-point attribute
+                // and does see it. Unlink it rather than walking through it.
+                remove_nested_link(&path)?;
             } else {
                 remove_junction_safe(&path)?;
             }
-        } else if ft.is_symlink() {
-            let _ = std::fs::remove_file(&path);
         } else {
             std::fs::remove_file(&path)?;
         }
     }
     std::fs::remove_dir(dir)
+}
+
+/// Unlink one nested link found by [`remove_junction_safe`] — link only,
+/// never its target.
+///
+/// A link that vanished under us (a concurrent reaper pass, the agent's own
+/// cleanup) is an idempotent `Ok`. Every other error is LOGGED against the
+/// link's own path and then propagated, which fails the reap.
+///
+/// Propagating is what the old `let _ =` did not do, and it costs nothing:
+/// a link left in place makes the caller's closing `remove_dir(dir)` fail
+/// anyway, but as "directory not empty", which names neither the link nor
+/// the reason it survived. The reaper's caller reports the error against the
+/// candidate ROOT, so the `warn!` here is what names the entry.
+fn remove_nested_link(path: &Path) -> std::io::Result<()> {
+    match remove_link(path) {
+        Ok(()) => Ok(()),
+        // Already gone — a concurrent removal, not a failure.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => {
+            warn!(
+                "orphan_target_reaper: cannot unlink nested link {}: {e} (the link survives; its target is untouched)",
+                path.display()
+            );
+            Err(e)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4338,6 +4387,91 @@ mod tests {",
         assert!(
             real.join("debug/deps/precious.rlib").exists(),
             "content behind the junction must NOT be followed/deleted"
+        );
+    }
+
+    /// A NESTED junction, inside the tree being reaped — the case the
+    /// top-level test above does not reach.
+    ///
+    /// Before the fix the loop tested `is_dir()` first and handled a link
+    /// only within that arm. A junction reports `is_symlink() == true` and
+    /// `is_dir() == false` (asserted below, on the pinned toolchain), so it
+    /// fell through to a bare `let _ = std::fs::remove_file(&path)`, which is
+    /// `PermissionDenied` (os error 5) on a junction. The error was
+    /// discarded, the junction survived, the closing `remove_dir` failed as
+    /// "directory not empty", and the reap could never complete. With the old
+    /// loop this test fails on the `expect` below.
+    #[cfg(windows)]
+    #[test]
+    fn nested_windows_junction_is_unlinked_and_the_reap_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The canonical tree the nested junction points at, OUTSIDE the tree
+        // being reaped — following the link would be real data loss.
+        let outside = tmp.path().join("canonical");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("precious.rlib"), b"do-not-delete").unwrap();
+
+        // The tree to reap: real content, a real subdirectory, and a junction.
+        let tree = tmp.path().join("target-to-reap");
+        mk_target_root(&tree);
+        fs::write(tree.join("debug/deps/obj.o"), b"garbage").unwrap();
+        // `join("debug/linked")` would keep the forward slash verbatim, and
+        // `cmd` then reads `/linked` as a switch ("Invalid switch") — so
+        // `mklink_junction` fails and this test SKIPS instead of testing
+        // anything. Build the path one segment at a time.
+        let nested = tree.join("debug").join("linked");
+        if !mklink_junction(&nested, &outside) {
+            eprintln!("skipping: mklink /J unavailable in this environment");
+            return;
+        }
+
+        // The measurement this fix rests on, pinned as an assertion.
+        assert!(is_junction(&nested), "is_junction must see the nested link");
+        let ft = fs::symlink_metadata(&nested).unwrap().file_type();
+        assert!(ft.is_symlink(), "a junction must report is_symlink()");
+        assert!(
+            !ft.is_dir(),
+            "a junction must NOT report is_dir(), so a nested link can only reach the is_symlink arm"
+        );
+
+        remove_junction_safe(&tree).expect("the reap must complete");
+
+        assert!(!tree.exists(), "the whole reaped tree must be gone");
+        assert!(
+            outside.join("precious.rlib").exists(),
+            "content behind the nested junction must NOT be followed/deleted"
+        );
+    }
+
+    /// [`remove_nested_link`]'s contract, on every platform: a link that is
+    /// already gone is an idempotent `Ok`, and any OTHER error propagates.
+    ///
+    /// The old loop discarded both with `let _ =`. A non-empty plain
+    /// directory is the portable failure injection — `remove_link` reaches
+    /// `remove_dir` on Windows and `remove_file` on Unix, and both refuse it.
+    /// Nothing may be deleted on the failing path.
+    #[test]
+    fn remove_nested_link_tolerates_a_vanished_link_and_propagates_anything_else() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Already gone — a concurrent reaper pass, not a failure.
+        let missing = tmp.path().join("never-existed");
+        assert!(
+            remove_nested_link(&missing).is_ok(),
+            "a link that vanished under us must be an idempotent Ok"
+        );
+
+        // A real error must propagate, and must delete nothing.
+        let real = tmp.path().join("not-a-link");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("keep.txt"), b"data").unwrap();
+        assert!(
+            remove_nested_link(&real).is_err(),
+            "a removal that failed must propagate, never be swallowed"
+        );
+        assert!(
+            real.join("keep.txt").exists(),
+            "the failing path must have deleted nothing"
         );
     }
 
