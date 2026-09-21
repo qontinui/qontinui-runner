@@ -287,7 +287,8 @@ struct FnRecord {
     facts: BodyFacts,
 }
 
-fn is_test_attr(attr: &syn::Attribute) -> bool {
+/// Shared with `opt_in_serializer_guard`, which keys test fns the same way.
+pub(crate) fn is_test_attr(attr: &syn::Attribute) -> bool {
     attr.path()
         .segments
         .last()
@@ -425,8 +426,9 @@ fn scan_source(src: &str) -> syn::Result<FileReport> {
     Ok(report)
 }
 
-/// Every `.rs` file under `root`, in a stable order.
-fn rs_files(root: &Path) -> Vec<PathBuf> {
+/// Every `.rs` file under `root`, in a stable order. Shared with
+/// `opt_in_serializer_guard`, which walks the same tree.
+pub(crate) fn rs_files(root: &Path) -> Vec<PathBuf> {
     walkdir::WalkDir::new(root)
         .sort_by_file_name()
         .into_iter()
