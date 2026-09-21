@@ -1295,6 +1295,18 @@ const APP_RUNTIME_WORKER_THREADS_MAX: usize = 16;
 /// The env override for [`APP_RUNTIME_WORKER_THREADS_MAX`].
 const APP_RUNTIME_WORKER_THREADS_ENV: &str = "QONTINUI_APP_RUNTIME_WORKER_THREADS";
 
+/// The largest worker count the env override may ask for.
+///
+/// The override exists to be an ESCAPE HATCH in both directions, so it is
+/// deliberately allowed past [`APP_RUNTIME_WORKER_THREADS_MAX`] — that is how a
+/// box rolls this change back without a rebuild. But it is a thread count in the
+/// binary whose entire purpose here is to stop a thread count scaling without a
+/// bound, and tokio's builder only asserts `> 0` (`worker_threads` panics on
+/// zero and accepts anything else), so a typo'd extra zero would spawn 100 000
+/// threads unchallenged. 1024 is far above any deliberate setting on any fleet
+/// box and far below a value that could be meant.
+const APP_RUNTIME_WORKER_THREADS_OVERRIDE_MAX: usize = 1024;
+
 /// How many workers the application runtime gets on THIS machine.
 ///
 /// `min(available_parallelism, 16)`, or the env override when it names a usable
@@ -1323,6 +1335,14 @@ fn resolve_app_runtime_workers(cpus: usize, override_raw: Option<&str>) -> usize
     match override_raw {
         None => derived,
         Some(raw) => match raw.trim().parse::<usize>() {
+            Ok(n) if n > APP_RUNTIME_WORKER_THREADS_OVERRIDE_MAX => {
+                eprintln!(
+                    "app runtime: {APP_RUNTIME_WORKER_THREADS_ENV}={raw:?} is above the \
+                     {APP_RUNTIME_WORKER_THREADS_OVERRIDE_MAX}-worker override ceiling — \
+                     clamping to it. A value this large is a typo, not a setting."
+                );
+                APP_RUNTIME_WORKER_THREADS_OVERRIDE_MAX
+            }
             Ok(n) if n > 0 => n,
             _ => {
                 eprintln!(
@@ -1361,7 +1381,8 @@ mod app_runtime_tests {
     }
 
     /// An explicit override wins in BOTH directions — this is an operator
-    /// escape hatch, not a second cap.
+    /// escape hatch, not a second cap. That is what makes the change reversible
+    /// per box without a rebuild.
     #[test]
     fn an_explicit_override_wins_in_both_directions() {
         assert_eq!(resolve_app_runtime_workers(48, Some("2")), 2);
@@ -1369,16 +1390,40 @@ mod app_runtime_tests {
         assert_eq!(resolve_app_runtime_workers(48, Some("  8  ")), 8);
     }
 
+    /// ...but it is still BOUNDED. An escape hatch that honours a typo'd extra
+    /// zero would spawn 100 000 threads in the binary whose whole point here is
+    /// that a thread count must not scale without a bound. tokio's builder
+    /// asserts only `> 0`, so nothing downstream would catch it.
+    #[test]
+    fn an_absurd_override_is_clamped_rather_than_honoured() {
+        assert_eq!(
+            resolve_app_runtime_workers(4, Some("100000")),
+            APP_RUNTIME_WORKER_THREADS_OVERRIDE_MAX
+        );
+        // The boundary itself is honoured verbatim — the clamp starts above it.
+        assert_eq!(
+            resolve_app_runtime_workers(4, Some("1024")),
+            APP_RUNTIME_WORKER_THREADS_OVERRIDE_MAX
+        );
+        assert_eq!(resolve_app_runtime_workers(4, Some("1023")), 1023);
+    }
+
     /// A malformed or zero override is IGNORED, never honoured. A zero-worker
     /// runtime is not a stricter setting; it is a process nothing runs on, and
     /// silently accepting one would turn a typo into a dead runner.
     #[test]
     fn a_useless_override_is_ignored_rather_than_honoured() {
+        // 4 cores, NOT 48: on a 48-core box `derived` equals
+        // `APP_RUNTIME_WORKER_THREADS_MAX`, so asserting against the constant
+        // could not tell "fell back to the derived count" — which is what this
+        // test claims — from "returned the cap". At 4 they differ.
+        assert_ne!(4, APP_RUNTIME_WORKER_THREADS_MAX);
         for raw in ["0", "", "   ", "-1", "sixteen", "4.5", "1e3"] {
             assert_eq!(
-                resolve_app_runtime_workers(48, Some(raw)),
-                APP_RUNTIME_WORKER_THREADS_MAX,
-                "override {raw:?} must fall back to the derived count, not be honoured"
+                resolve_app_runtime_workers(4, Some(raw)),
+                4,
+                "override {raw:?} must fall back to the DERIVED count, not be \
+                 honoured and not be silently replaced by the cap"
             );
         }
     }
@@ -1393,17 +1438,29 @@ mod app_runtime_tests {
 
 /// Install the application runtime into Tauri's global slot.
 ///
-/// Called as the FIRST thing [`main`] does, because `tauri::async_runtime::set`
-/// PANICS when the slot is already filled and the slot is filled lazily by the
-/// first `tauri::async_runtime::{spawn, block_on, handle}` anywhere in the
-/// process.
+/// Called as the LAST thing [`main`] does before `run_app`, and nothing before
+/// it may touch a runtime: `tauri::async_runtime::set` PANICS when the slot is
+/// already filled, and the slot is filled lazily by the first
+/// `tauri::async_runtime::{spawn, block_on, handle}` anywhere in the process.
+/// The call site says why it is last rather than first — the CLI doors above it
+/// `process::exit`, and would otherwise pay for a runtime they discard.
 ///
 /// Fail-open in both directions, the same posture
-/// [`mcp_api::serve_on_dedicated_runtime`] takes for the same reason — a
+/// `mcp_api::serve_on_dedicated_runtime` takes for the same reason — a
 /// degraded runtime is strictly better than no runner:
 /// - a runtime we cannot BUILD leaves Tauri to build its own (today's behaviour);
 /// - a slot that is already TAKEN is caught rather than fatal, and the runtime
 ///   we built is dropped so it does not leave workers behind.
+///
+/// **What the already-taken branch looks like to an operator.**
+/// `startup_panic::install_startup_panic_hook` is installed EARLIER in `main`,
+/// and a global panic hook runs on every panic whether or not a `catch_unwind`
+/// swallows it. So the caught `set` panic still writes a `runner-panic.log` and
+/// still chains to the previous hook's backtrace. The runner then proceeds
+/// normally, so that artifact is a diagnostic, not a crash — it is named here
+/// because an operator finding it would otherwise reasonably read it as one.
+/// (It is not mistakable for a user-facing crash warning: `crash_dumps` scans a
+/// different directory for a different header format.)
 fn install_app_runtime() {
     let workers = app_runtime_worker_threads();
     let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -1430,8 +1487,25 @@ fn install_app_runtime() {
     .is_ok();
 
     if installed {
-        // Held for the life of the process; `set` took only a Handle.
-        let _ = APP_RUNTIME.set(rt);
+        // Held for the life of the process; `set` took only a Handle, so
+        // DROPPING this runtime would shut down the one Tauri just published.
+        // `install_app_runtime` runs exactly once, so the cell is empty here —
+        // but a `let _ =` would turn a future second call into exactly that
+        // silent shutdown, so the failure is made loud instead.
+        if let Err(orphan) = APP_RUNTIME.set(rt) {
+            // Unreachable: `install_app_runtime` has one call site and runs
+            // once. Spelled out anyway because the obvious `let _ =` would
+            // DROP `orphan` here — and `Runtime::drop` shuts the runtime down,
+            // which is precisely the runtime `tauri::async_runtime::set` is
+            // now holding a `Handle` to. Leaking it is the correct outcome for
+            // a process-lived runtime, and keeps this function fail-open
+            // rather than panicking on an impossible branch.
+            eprintln!(
+                "app runtime: the runtime cell was already filled; leaking the \
+                 second runtime rather than shutting down the installed one."
+            );
+            std::mem::forget(orphan);
+        }
     } else {
         eprintln!(
             "app runtime: Tauri's async runtime was already initialized before \

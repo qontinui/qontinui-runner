@@ -1819,7 +1819,11 @@ mod tests {
     ///
     /// Neuter check: move `spawn_blocking_in_lane`'s `BlockingSlot::enter_lane_in`
     /// so the lane is resolved INSIDE the closure, and this fails with the body
-    /// charged to `tokio-runtime-worker`.
+    /// charged to `tokio-rt-worker` — tokio 1.50's default thread name, the one
+    /// this module's [`TrackedBlockingBodies`] doc names. (The `by_spawning_thread`
+    /// fixtures below still spell the older `tokio-runtime-worker`; they are
+    /// arbitrary map KEYS chosen to exercise the serializer, not readings, so
+    /// they are left alone rather than churned.)
     fn assert_a_body_is_charged_to_its_spawner(table: &'static LaneTable) {
         const SPAWNER: &str = "lane-fixture-spawner";
         let observed = std::thread::Builder::new()
