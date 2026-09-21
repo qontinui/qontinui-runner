@@ -305,9 +305,13 @@ pub(crate) const CALIBRATION_BASELINE: usize = 151;
 /// **It is a deliberately CONSERVATIVE cap, not the largest healthy process.**
 /// The anchor is explicitly PER-RUNTIME — the field is named
 /// `per_runtime_pool_capacity_default` — and this binary builds many runtimes
-/// (Tauri's own global runtime, `fleet-pub-rt`, `mcp-api-rt`, and the short-lived
-/// current-thread ones), so *N* runtimes carry *N* × 512 of blocking-pool
-/// capacity that is healthy by tokio's own defaults. A process legitimately
+/// (`fleet-pub-rt`, `mcp-api-rt`, the short-lived current-thread ones), so
+/// *N* runtimes carry *N* × 512 of blocking-pool capacity that is healthy by
+/// tokio's own defaults. The application runtime's (`app-rt`) OWN idle pool is
+/// no longer part of the floor this cap bounds: the at-rest window is fed the
+/// GRADED reading (see [`record_at_rest_sample`]), which has that pool
+/// subtracted already, so only the other runtimes' pools remain in the floor
+/// and this cap is that much more conservative than it was. A process legitimately
 /// idling above 512 therefore gets LESS shift than its floor would justify,
 /// and the guard is correspondingly stricter on it. That is the intended
 /// direction: this constant is chosen to under-shift rather than over-shift,
@@ -528,7 +532,14 @@ pub(crate) fn record_at_rest_sample(total_threads: Option<usize>, live_sessions:
     // guard would then subtract it twice — once from the reading and once via
     // the shift — which is the composition a re-based ladder and a graded
     // reading can otherwise reach. An UNKNOWN census grades nothing out, so
-    // the window degrades to the raw reading, never to a permissive one.
+    // the window degrades to the raw reading, never to a permissive one. The
+    // one mixed case is transitional: a census UNKNOWN for a whole
+    // AT_REST_WINDOW_SAMPLES window that then returns leaves the floor raw
+    // while the reading is graded for the ticks until a graded sample enters
+    // the min-window — a double subtraction bounded to that window, and the
+    // reverse mix (census going UNKNOWN now) is strict. Do not "fix" it by
+    // feeding the window the raw count again; that re-creates the permanent
+    // double subtraction this comment exists to forbid.
     let total_threads = total_threads.map(|total| {
         graded_thread_reading(
             total,
