@@ -279,6 +279,12 @@ impl ChildTreeGuard {
         Self(None)
     }
 
+    /// [`Self::attach`] for a `tokio::process::Child` — the same no-op, so a
+    /// caller compiles on every platform.
+    pub fn attach_tokio(_child: &tokio::process::Child) -> Self {
+        Self(None)
+    }
+
     /// Post-spawn form for an [`Self::arm`]ed command: the child *is* its
     /// group leader, so its pid doubles as the pgid.
     pub fn attach_armed(child: &std::process::Child) -> Self {
@@ -2212,6 +2218,84 @@ mod timeout_tests {
             !pid_alive(server),
             "the process group was not reaped: pid {server} survived a bounded run"
         );
+    }
+
+    /// The tokio twins are what the scheduler's RemoteAgent timeout uses
+    /// (`scheduler_remote_agent`), and they are a separate code path from the
+    /// std pair above: `arm_tokio` on a `tokio::process::Command`,
+    /// `attach_armed_tokio` off a `tokio::process::Child`. A grandchild that
+    /// survives the guard's drop is exactly the orphaned `bash`/`git` the
+    /// round-1 review of that plan named.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_the_tokio_tree_guard_reaps_the_grandchild() {
+        let _serial = GAUGE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pidfile = dir.path().join("server.pid");
+
+        let mut cmd = tokio_no_window("sh");
+        cmd.args([
+            "-c",
+            &format!(
+                "sleep 30 & echo $! > '{}'; exec sleep 30",
+                pidfile.display()
+            ),
+        ]);
+        ChildTreeGuard::arm_tokio(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn");
+        let tree = ChildTreeGuard::attach_armed_tokio(&child);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pidfile.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let grandchild = read_pid(&pidfile);
+        assert!(
+            pid_alive(grandchild),
+            "fixture: the grandchild must be running before the kill"
+        );
+
+        drop(tree);
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pid_alive(grandchild) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !pid_alive(grandchild),
+            "the process group was not reaped: grandchild pid {grandchild} survived the guard's drop"
+        );
+    }
+
+    /// And the control: `disarm` releases the group, so a clean end kills
+    /// nothing the child left behind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disarming_the_tokio_tree_guard_leaves_the_grandchild_alone() {
+        let _serial = GAUGE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pidfile = dir.path().join("server.pid");
+
+        let mut cmd = tokio_no_window("sh");
+        cmd.args([
+            "-c",
+            &format!("sleep 30 & echo $! > '{}'", pidfile.display()),
+        ]);
+        ChildTreeGuard::arm_tokio(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn");
+        let tree = ChildTreeGuard::attach_armed_tokio(&child);
+        let _ = child.wait().await;
+        let grandchild = read_pid(&pidfile);
+        tree.disarm();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            pid_alive(grandchild),
+            "disarm must release, not reap: pid {grandchild} died"
+        );
+        // Clean up the fixture's survivor ourselves.
+        unsafe { libc::kill(grandchild, libc::SIGKILL) };
     }
 
     // ── EINTR regression (2026-08-30 round-3 review, HIGH) ──────────────────

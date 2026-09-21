@@ -62,12 +62,19 @@
 //! so the timeout kill reaches the `bash` / `git` / MCP descendants a
 //! `/return-to-main` session is mid-way through, not `claude` alone; on a clean
 //! exit the group is released rather than reaped, matching
-//! [`crate::process_helpers::run_with_timeout`]. What this path does NOT do is
-//! watch the scheduler's `stop_signal` or the runtime's shutdown: a scheduled
-//! child outlives a runner that exits mid-run, and its history row then stays
-//! `running` until the next runner start's reconciler looks at it. That is the
-//! same posture every other `tokio::spawn`ed scheduler task has today
-//! (`stop_scheduler_service` has no caller), stated here rather than implied.
+//! [`crate::process_helpers::run_with_timeout`] on its clean-exit arm. What
+//! this path does NOT do is watch the scheduler's `stop_signal` or the
+//! runtime's shutdown. What happens to the child then depends on HOW the
+//! runner ends: on the `std::process::exit` paths `main.rs` takes no
+//! destructor runs, the child outlives the runner, and its history row stays
+//! `running` until the next runner start's reconciler looks at it; on a path
+//! that DROPS the detached task holding the guard (a runtime shutdown, a
+//! `JoinHandle::abort`) the guard's drop kills the whole tree with no
+//! `finalize_async_execution`; and under a systemd unit with
+//! `KillMode=control-group` the cgroup kill takes the child regardless of
+//! process group. That is the same posture every other `tokio::spawn`ed
+//! scheduler task has today (`stop_scheduler_service` has no caller), stated
+//! here with its conditions rather than implied.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -330,6 +337,11 @@ pub(crate) async fn launch(
                 (Ok(st.code()), false)
             }
             Ok(Err(e)) => {
+                // A tokio `wait()` error is in effect ECHILD — the leader is
+                // already gone and reaped elsewhere — so there is no live
+                // group to release or reap; disarm rather than kill. (This is
+                // the one arm that differs from `run_with_timeout`, which
+                // drops its guard on a wait error.)
                 tree.disarm();
                 (Err(e.to_string()), false)
             }
