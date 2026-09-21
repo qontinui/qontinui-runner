@@ -544,7 +544,6 @@ pub(crate) const PROVENANCE_KEY: &str = "qontinui-provenance:";
 const RUNNER_BUILD: &str = env!("RUNNER_BUILD_ID");
 
 /// The parsed fields of one `qontinui-provenance:` line.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProvenanceLine {
     /// `builtin` / `served` / `disk_cache` — [`CommandSource::as_str`].
@@ -557,7 +556,6 @@ pub(crate) struct ProvenanceLine {
     pub runner_build: String,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl ProvenanceLine {
     /// Parse the text after [`PROVENANCE_KEY`]. `None` unless all four fields
     /// are present.
@@ -584,7 +582,6 @@ impl ProvenanceLine {
 }
 
 /// Why [`provenance_consistent`] refused a file.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProvenanceError {
     /// No well-formed `qontinui-provenance:` line at line 2 of a frontmatter
@@ -663,7 +660,6 @@ pub(crate) fn with_provenance(name: &str, body: &str, source: CommandSource) -> 
 /// empty (the one `with_provenance` created) — returning the parsed line and
 /// the original body, byte-for-byte. `None` when line 2 is not a well-formed
 /// provenance line inside a frontmatter opener.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn strip_provenance(text: &str) -> Option<(ProvenanceLine, String)> {
     let (first, rest) = split_first_line(text);
     if first != "---\n" && first != "---\r\n" {
@@ -685,7 +681,6 @@ pub(crate) fn strip_provenance(text: &str) -> Option<(ProvenanceLine, String)> {
 /// Check a provisioned command file against its own provenance line: strip the
 /// line, re-hash what remains, and compare with the recorded `blob`. Needs
 /// nothing but the file — no sibling checkout, no runner.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn provenance_consistent(text: &str) -> Result<ProvenanceLine, ProvenanceError> {
     let (line, body) = strip_provenance(text).ok_or(ProvenanceError::Missing)?;
     let actual = git_blob_id(body.as_bytes());
@@ -696,6 +691,82 @@ pub(crate) fn provenance_consistent(text: &str) -> Result<ProvenanceLine, Proven
             recorded: line.blob,
             actual,
         })
+    }
+}
+
+/// What a destination that ALREADY EXISTS says about itself, read back from its
+/// own provenance line just before [`provision_fleet_commands_into`] overwrites
+/// it.
+///
+/// This is the production reader of [`provenance_consistent`]. Without it the
+/// whole reader half of the provenance feature — [`ProvenanceLine`],
+/// [`ProvenanceError`], [`strip_provenance`], [`provenance_consistent`] — is
+/// reachable only from tests, and the module doc's claim that a provisioned
+/// file "is checkable on its own" holds only for a reader willing to hand-roll
+/// the `git hash-object` pipeline that doc spells out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Existing {
+    /// A runner wrote it and nothing has touched it since: the body still
+    /// hashes to the blob its own line records. Replacing it loses nothing, so
+    /// this is the silent, overwhelmingly common case.
+    Pristine,
+    /// A runner wrote it and it was EDITED afterwards. The overwrite below
+    /// discards that edit.
+    Edited(Box<EditedFile>),
+    /// No well-formed provenance line: a pre-provenance runner build wrote it,
+    /// or something that is not this provisioner did.
+    Unstamped,
+}
+
+/// The fields worth naming when an edited file is replaced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EditedFile {
+    /// Which rung supplied the bytes that were written (`CommandSource`).
+    source: String,
+    /// The `RUNNER_BUILD_ID` of the build that wrote the file.
+    runner_build: String,
+    /// `qontinui-claude-config:.claude/commands/<name>.md` — where the edit
+    /// SHOULD have gone.
+    canonical: String,
+    /// The blob the provenance line recorded when the file was written.
+    recorded: String,
+    /// What the body hashes to now.
+    actual: String,
+}
+
+/// Classify an existing destination. `None` when there is nothing to classify —
+/// the path does not exist, or is unreadable as UTF-8.
+///
+/// Fail-soft on purpose, exactly as `TrackedPaths::probe` is: every read error
+/// resolves to `None`, i.e. to writing exactly as before. Reading a file back
+/// is a logging concern and must never turn a provisioning pass into a failed
+/// session spawn.
+fn classify_existing(dst: &Path) -> Option<Existing> {
+    let text = std::fs::read_to_string(dst).ok()?;
+    match provenance_consistent(&text) {
+        Ok(_) => Some(Existing::Pristine),
+        Err(ProvenanceError::Missing) => Some(Existing::Unstamped),
+        Err(ProvenanceError::BlobMismatch { recorded, actual }) => {
+            // The error deliberately carries only the two blobs, so re-read the
+            // line for the rest. It parsed once inside `provenance_consistent`,
+            // so the fallback is unreachable; it keeps the classifier total
+            // rather than panicking inside a fail-soft provisioner.
+            let line = strip_provenance(&text)
+                .map(|(line, _)| line)
+                .unwrap_or_else(|| ProvenanceLine {
+                    source: String::new(),
+                    canonical: String::new(),
+                    blob: String::new(),
+                    runner_build: String::new(),
+                });
+            Some(Existing::Edited(Box::new(EditedFile {
+                source: line.source,
+                runner_build: line.runner_build,
+                canonical: line.canonical,
+                recorded,
+                actual,
+            })))
+        }
     }
 }
 
@@ -806,12 +877,8 @@ fn provision_fleet_commands_into(
         resolved.len(),
         capability_manifest::Rung::Embedded,
     )
-    .with_destination(commands_dir.display().to_string())
-    .with_detail(format!(
-        "{} embedded default(s), {} account override(s)",
-        registry.builtin_count(),
-        registry.override_count()
-    ));
+    .with_destination(commands_dir.display().to_string());
+    let mut edited = 0usize;
     for command in &resolved {
         let file_name = command.file_name();
         let dst = commands_dir.join(&file_name);
@@ -825,12 +892,58 @@ fn provision_fleet_commands_into(
             out.skip(file_name, capability_manifest::SkipReason::GitTracked);
             continue;
         }
+        // The write below is still unconditional — this reads the OUTGOING file
+        // only to say what is being lost. The tracked-file guard above covers
+        // the case where the enclosing REPO owns the file; nothing covered the
+        // case where a PERSON edited an untracked provisioned copy, and that
+        // overwrite has been silent since this provisioner was written.
+        match classify_existing(&dst) {
+            Some(Existing::Edited(e)) => {
+                edited += 1;
+                warn!(
+                    "fleet_commands: replacing {} — it was written by runner build \
+                     {} from the {} body and EDITED afterwards (its provenance line \
+                     records blob {}, its body now hashes to {}). That edit is being \
+                     discarded. Edit {} instead, then re-vendor.",
+                    dst.display(),
+                    e.runner_build,
+                    e.source,
+                    e.recorded,
+                    e.actual,
+                    e.canonical,
+                );
+            }
+            Some(Existing::Unstamped) => {
+                info!(
+                    "fleet_commands: replacing {} — it carries no provenance line, so \
+                     a pre-provenance runner build or something other than this \
+                     provisioner wrote it",
+                    dst.display()
+                );
+            }
+            // Pristine (a runner wrote it and nobody touched it) and absent are
+            // the ordinary paths, and say nothing.
+            Some(Existing::Pristine) | None => {}
+        }
         std::fs::write(
             &dst,
             with_provenance(&command.name, &command.body, command.source),
         )?;
         out.record_written();
     }
+    // Built after the loop rather than at construction so it can carry the
+    // read-back count; a pass that clobbered nobody's edits reads as before.
+    let mut detail = format!(
+        "{} embedded default(s), {} account override(s)",
+        registry.builtin_count(),
+        registry.override_count()
+    );
+    if edited > 0 {
+        detail.push_str(&format!(
+            "; replaced {edited} hand-edited file(s) — see the warnings above"
+        ));
+    }
+    out = out.with_detail(detail);
     // Nothing landed at all, so no rung answered for this session — a stated
     // outcome rather than a claim that the embedded floor delivered.
     if out.written == 0 {
@@ -1368,6 +1481,114 @@ mod tests {
              unevaluable gate rots `open` with nothing escalating on it",
         ),
     ];
+
+    /// A destination this provisioner wrote and NOBODY touched classifies as
+    /// pristine, so the ordinary re-provision says nothing.
+    #[test]
+    fn a_reprovisioned_untouched_destination_classifies_as_pristine() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let commands_dir = tmp.path().join(".claude").join("commands");
+        let registry = AgentCommandRegistry::new();
+        provision_fleet_commands_into(&commands_dir, &registry).expect("first pass");
+
+        let (name, _) = FLEET_COMMANDS[0];
+        let dst = commands_dir.join(format!("{name}.md"));
+        assert_eq!(classify_existing(&dst), Some(Existing::Pristine));
+
+        // And the second pass reports no clobbered edits.
+        let out = provision_fleet_commands_into(&commands_dir, &registry).expect("second pass");
+        assert_eq!(out.written, FLEET_COMMANDS.len());
+        assert!(
+            !out.detail.unwrap_or_default().contains("hand-edited"),
+            "an untouched re-provision must not claim it replaced an edit"
+        );
+    }
+
+    /// The case that was silent before: a provisioned file someone EDITED is
+    /// still overwritten, but the pass now names it — and the report counts it.
+    #[test]
+    fn a_hand_edited_destination_is_reported_before_it_is_replaced() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let commands_dir = tmp.path().join(".claude").join("commands");
+        let registry = AgentCommandRegistry::new();
+        provision_fleet_commands_into(&commands_dir, &registry).expect("first pass");
+
+        let (name, _) = FLEET_COMMANDS[0];
+        let dst = commands_dir.join(format!("{name}.md"));
+        let written = std::fs::read_to_string(&dst).expect("read provisioned");
+        let (line, _) = strip_provenance(&written).expect("provenance line");
+        std::fs::write(&dst, format!("{written}\nhand-written addition\n")).expect("edit it");
+
+        match classify_existing(&dst) {
+            Some(Existing::Edited(e)) => {
+                // The recorded blob is the one the file's own line carries, and
+                // the actual differs precisely because it was edited.
+                assert_eq!(e.recorded, line.blob);
+                assert_ne!(e.actual, e.recorded);
+                assert_eq!(e.source, "builtin");
+                assert_eq!(e.runner_build, line.runner_build);
+                assert_eq!(
+                    e.canonical,
+                    format!("qontinui-claude-config:.claude/commands/{name}.md"),
+                    "the warning must point at the canonical file, not the vendored copy"
+                );
+            }
+            other => panic!("an edited file must classify as Edited, got {other:?}"),
+        }
+
+        // The write itself is unchanged: the edit is still replaced, and the
+        // file is the freshly provisioned body again.
+        let out = provision_fleet_commands_into(&commands_dir, &registry).expect("second pass");
+        assert_eq!(
+            out.written,
+            FLEET_COMMANDS.len(),
+            "the overwrite still happens"
+        );
+        assert!(
+            out.detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("replaced 1 hand-edited file(s)"),
+            "the report must count the clobbered edit, got {:?}",
+            out.detail
+        );
+        assert_eq!(
+            classify_existing(&dst),
+            Some(Existing::Pristine),
+            "after the replacing pass the file is pristine again"
+        );
+    }
+
+    /// A file that carries no provenance line at all — a pre-provenance runner
+    /// build, or something that is not this provisioner — is `Unstamped`, not
+    /// mistaken for an edit.
+    #[test]
+    fn an_unstamped_destination_is_not_reported_as_an_edit() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let commands_dir = tmp.path().join(".claude").join("commands");
+        std::fs::create_dir_all(&commands_dir).expect("mkdir");
+
+        let (name, body) = FLEET_COMMANDS[0];
+        let dst = commands_dir.join(format!("{name}.md"));
+        std::fs::write(&dst, body).expect("write an unstamped body");
+        assert_eq!(classify_existing(&dst), Some(Existing::Unstamped));
+
+        let registry = AgentCommandRegistry::new();
+        let out = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
+        assert!(
+            !out.detail.unwrap_or_default().contains("hand-edited"),
+            "an unstamped file is not an edit of a runner-written one"
+        );
+    }
+
+    /// Classification is fail-soft: an absent path is `None`, and `None` writes
+    /// exactly as before. A missing destination is the normal first-pass case
+    /// and must never read as a finding.
+    #[test]
+    fn an_absent_destination_classifies_as_nothing_at_all() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        assert_eq!(classify_existing(&tmp.path().join("not-there.md")), None);
+    }
 
     /// The ONE statement of the REGISTERED-BUT-NOT-USABLE test, interpolated
     /// into the assertion messages below so the rule is written down once.
