@@ -773,9 +773,12 @@ export function killTree(child, { platform = process.platform, kill = process.ki
   const pid = child?.pid;
   if (!pid) return "none";
   if (platform === "win32") {
+    // `spawnSync` throws only when taskkill itself cannot start (ENOENT); an
+    // access-denied or a recycled PID comes back as a NON-ZERO STATUS with no
+    // throw, and reporting "tree" on that would skip the direct kill below.
     try {
-      taskkill("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
-      return "tree";
+      const res = taskkill("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+      if (res && res.status === 0) return "tree";
     } catch {
       /* fall through to the direct kill */
     }
@@ -800,25 +803,46 @@ export function killTree(child, { platform = process.platform, kill = process.ki
  * this script touches a child process; `runCensus` / `classifyFromLog` take
  * it as `spawn` so the tests substitute a stub.
  *
+ * A TIMEOUT SETTLES WITHOUT `close`. `close` fires only once both stdio
+ * pipes have ended, and a grandchild that `setsid`s itself out of the
+ * process group (so the group kill misses it) and holds the inherited
+ * stdout pipe keeps `close` from ever firing — the exact process the
+ * timeout exists to get past. So on a timeout the child's `exit` is
+ * listened for as well, and after `graceMs` without a `close` the two
+ * streams are destroyed and the run settles `timedOut: true` with whatever
+ * `exit` reported (or nulls if it never came).
+ *
+ * `spawnImpl` / `kill` / `graceMs` are injectable so the tests drive this
+ * with a fake child whose `close` never fires, without a real process.
+ *
  * @param {string} executable
  * @param {string[]} args
- * @param {{cwd?: string|null, env?: NodeJS.ProcessEnv, timeoutMs?: number}} [opts]
+ * @param {{cwd?: string|null, env?: NodeJS.ProcessEnv, timeoutMs?: number, graceMs?: number, spawnImpl?: typeof nodeSpawn, kill?: typeof killTree}} [opts]
  * @returns {Promise<{stdout: string, stderr: string, code: number|null, signal: string|null, timedOut: boolean, spawnError: string|null}>}
  */
-export function defaultSpawn(executable, args, { cwd = null, env = process.env, timeoutMs = 0 } = {}) {
+export const TIMEOUT_CLOSE_GRACE_MS = 5000;
+
+export function defaultSpawn(
+  executable,
+  args,
+  { cwd = null, env = process.env, timeoutMs = 0, graceMs = TIMEOUT_CLOSE_GRACE_MS, spawnImpl = nodeSpawn, kill = killTree } = {},
+) {
   return new Promise((resolvePromise) => {
     let child;
     let stdout = "";
     let stderr = "";
     let timedOut = false;
     let settled = false;
+    let grace = null;
+    let exited = null;
     const settle = (r) => {
       if (settled) return;
       settled = true;
+      if (grace) clearTimeout(grace);
       resolvePromise(r);
     };
     try {
-      child = nodeSpawn(executable, args, {
+      child = spawnImpl(executable, args, {
         cwd: cwd ?? undefined,
         env,
         stdio: ["ignore", "pipe", "pipe"],
@@ -832,11 +856,33 @@ export function defaultSpawn(executable, args, { cwd = null, env = process.env, 
       settle({ stdout, stderr, code: null, signal: null, timedOut, spawnError: String(e?.message ?? e) });
       return;
     }
+    const destroyStreams = () => {
+      for (const st of [child.stdout, child.stderr]) {
+        try {
+          st?.destroy?.();
+        } catch {
+          /* already gone */
+        }
+      }
+    };
     const timer =
       timeoutMs > 0
         ? setTimeout(() => {
             timedOut = true;
-            killTree(child);
+            kill(child);
+            // If `close` has not followed the kill within the grace, something
+            // still holds a pipe: stop waiting on it.
+            grace = setTimeout(() => {
+              destroyStreams();
+              settle({
+                stdout,
+                stderr,
+                code: exited?.code ?? null,
+                signal: exited?.signal ?? null,
+                timedOut,
+                spawnError: null,
+              });
+            }, graceMs);
           }, timeoutMs)
         : null;
     // `setEncoding` so a multi-byte UTF-8 sequence split across two chunks
@@ -854,6 +900,9 @@ export function defaultSpawn(executable, args, { cwd = null, env = process.env, 
     child.on("error", (e) => {
       if (timer) clearTimeout(timer);
       settle({ stdout, stderr, code: null, signal: null, timedOut, spawnError: String(e?.message ?? e) });
+    });
+    child.on("exit", (code, signal) => {
+      exited = { code, signal };
     });
     child.on("close", (code, signal) => {
       if (timer) clearTimeout(timer);
