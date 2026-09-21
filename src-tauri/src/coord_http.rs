@@ -171,6 +171,8 @@ pub fn coord_put(client: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwes
 /// majority of them, spread across three dozen modules — so the latch that
 /// says "already warned" and the counter that says "N of M authed" are the
 /// ones those sites read.
+/// Split across copies, a warning suppressed in one copy fires again from the
+/// other and neither counter is the whole story.
 ///
 /// No count is pinned here on purpose. It moves with every call site added,
 /// and a grep wide enough to be worth quoting (`attach_device_auth`) also
@@ -178,8 +180,6 @@ pub fn coord_put(client: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwes
 /// comments referring to it — so any single number invites a reader to
 /// reproduce a different one and conclude the comment is wrong. The property
 /// that matters is "one copy of the statics", not "N".
-/// Split across copies, a warning suppressed in one copy fires again from the
-/// other and neither counter is the whole story.
 ///
 /// Residual, named rather than fixed here: [`coord_get`], [`coord_post`] and
 /// [`coord_put`] above still call the LIB copy's `attach_device_auth`, so the
