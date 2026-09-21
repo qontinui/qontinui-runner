@@ -1317,7 +1317,7 @@ const APP_RUNTIME_WORKER_THREADS_OVERRIDE_MAX: usize = 1024;
 /// number. A value that does not parse, or `0`, is IGNORED with a warning
 /// rather than silently becoming a runtime nobody can schedule on — a zero
 /// worker count is not a stricter setting, it is a dead process.
-fn app_runtime_worker_threads() -> usize {
+pub(crate) fn app_runtime_worker_threads() -> usize {
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(APP_RUNTIME_WORKER_THREADS_MAX);

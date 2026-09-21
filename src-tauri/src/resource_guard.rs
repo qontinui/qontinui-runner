@@ -517,6 +517,28 @@ static AT_REST_WINDOW: Mutex<Option<AtRestWindow>> = Mutex::new(None);
 /// served policy `unknown-must-not-render-as-a-default` forbids. An unusable
 /// tick contributes nothing and the previous window stands.
 pub(crate) fn record_at_rest_sample(total_threads: Option<usize>, live_sessions: Option<usize>) {
+    // The window is fed the GRADED reading — the raw count minus the idle
+    // blocking pool the census attributes to the runtime (plan
+    // `2026-09-21-runner-blocking-pool-ratchets-to-peak-because-transcript-
+    // tails-rotate-every-idle-thread`, Phase 3) — so the two subtractions the
+    // thread lane now applies are DISJOINT: [`graded_thread_reading`] removes
+    // the idle pool from the READING, and [`machine_thread_shift`] removes the
+    // at-rest floor of everything else from the CEILING. Recording the raw
+    // count here would fold the idle pool into the floor as well, and the
+    // guard would then subtract it twice — once from the reading and once via
+    // the shift — which is the composition a re-based ladder and a graded
+    // reading can otherwise reach. An UNKNOWN census grades nothing out, so
+    // the window degrades to the raw reading, never to a permissive one.
+    let total_threads = total_threads.map(|total| {
+        graded_thread_reading(
+            total,
+            crate::health_monitor::thread_name_census_memoized().as_ref(),
+            qontinui_runner_lib::wedge_diagnostics::tracked_blocking_in_flight(),
+            RUNTIME_NAMES,
+            runtime_worker_threads(),
+        )
+        .graded
+    });
     let Some(at_rest) = at_rest_estimate(total_threads, live_sessions) else {
         return;
     };
@@ -1396,13 +1418,27 @@ fn compose_lanes(memory: SpawnGate, threads: SpawnGate) -> (SpawnGate, Option<Sp
 ///
 /// tokio's blocking pool is capped at `max_blocking_threads`, whose default is
 /// **512** (`runtime::Builder::new` sets `max_blocking_threads: 512` for every
-/// flavor; `runtime/builder.rs:288` on the pinned tokio 1.50.0). A pool that has
-/// reached that cap is no longer "idle threads the guard should look past" —
-/// it is the saturated shape of the 2026-08-29 wedge (540 threads, 119 parked
-/// in `CreateProcess`), and the clamp stops subtracting exactly there so the
-/// guard still counts it. Untracked bodies (`tokio::fs`, `tokio::process`)
-/// read as idle to this grading; the residue they can hide is bounded by this
-/// same number.
+/// flavor; `runtime/builder.rs:288` on the pinned tokio 1.50.0), so a census
+/// can never legitimately attribute more than `workers + 512` threads to one
+/// runtime. This clamp protects against a census that OVER-REPORTS — a second
+/// runtime sharing the name, a mis-tallied walk — and nothing else: in
+/// production `named - workers - in_flight` is at most 512 by construction,
+/// so the clamp is not reachable from a correct census and it is NOT what
+/// keeps a saturated pool counted.
+///
+/// **What this grading cannot see, stated so nobody reads the clamp as
+/// cover.** A pool thread inside an UNTRACKED body — `tokio::fs`,
+/// `tokio::process`, and every raw `tokio::task::spawn_blocking` site that
+/// does not take a `BlockingSlot` — is indistinguishable from an idle one
+/// here, because `in_flight` counts tracked bodies only. 512 pool threads
+/// all stuck in untracked `CreateProcess` calls (the 2026-08-29 wedge shape)
+/// would therefore grade out entirely and the lane would read `Proceed`.
+/// The guard is strict against TRACKED bodies (they stay counted); the
+/// untracked residue is closed only by coverage — converting raw
+/// `spawn_blocking` sites to `spawn_blocking_tracked` — which is the recorded
+/// follow-up on plan `2026-09-21-runner-blocking-pool-ratchets-to-peak-
+/// because-transcript-tails-rotate-every-idle-thread`, not by any number
+/// here.
 pub(crate) const IDLE_POOL_SUBTRAHEND_CAP: usize = 512;
 
 /// The thread names the application runtime's scheduler workers and blocking
@@ -1416,16 +1452,16 @@ pub(crate) const RUNTIME_NAMES: &[&str] = &["app-rt", "tokio-rt-worker"];
 /// The application runtime's scheduler worker count — the part of a
 /// [`RUNTIME_NAMES`] row that is NOT the blocking pool.
 ///
-/// tokio's default is `available_parallelism()` and that is what the Tauri
-/// runtime is built with today. Plan `2026-09-18-…-latch-not-back-pressure`
-/// PR 1 pins it to `min(cores, 16)`; when that lands this is the ONE place
-/// to read the pinned value from. An unreadable parallelism reads as `0`
-/// workers, which subtracts MORE (every named thread counts as pool) — the
-/// loosening direction — so it is the arm a future pin must also close.
+/// Plan `2026-09-18-…-latch-not-back-pressure` PR 1 (`db96c48f3`) builds the
+/// Tauri runtime with `crate::app_runtime_worker_threads()` workers —
+/// `min(available_parallelism, 16)` or the bounded env override — under the
+/// name `app-rt`. This reads the SAME resolver, so the subtrahend and the
+/// runtime can never disagree about how many of the named threads are
+/// scheduler workers rather than pool. Reading `available_parallelism()` here
+/// instead (the pre-PR-1 shape) over-counted workers by 16 on a 32-core box,
+/// which under-graded the pool — the strict direction, but wrong.
 pub(crate) fn runtime_worker_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(0)
+    crate::app_runtime_worker_threads()
 }
 
 /// A thread reading with the runtime's IDLE blocking pool graded out of it
@@ -2221,6 +2257,37 @@ mod tests {
     /// The clamp bites: 600 named beyond 32 workers is 568 idle, but only
     /// [`IDLE_POOL_SUBTRAHEND_CAP`] (512) may be subtracted, so a pool at
     /// tokio's own cap still counts.
+    /// The re-based ladder (`machine_thread_shift`) and the graded reading
+    /// subtract DISJOINT components: the at-rest window is fed the graded
+    /// reading, so the idle pool is never in the floor the shift is derived
+    /// from. Feeding it the RAW count would double-subtract — the shift would
+    /// carry the pool a second time. Pinned as arithmetic over the two pure
+    /// halves, because the live seam (`record_at_rest_sample`) writes a
+    /// process-global window.
+    #[test]
+    fn the_idle_pool_is_subtracted_once_not_twice() {
+        // The operator box: 441 threads, 325 named pool rows, 16 pinned
+        // workers, 3 tracked bodies in flight, 12 live sessions.
+        let census = name_census(&[("tokio-rt-worker", 325)]);
+        let graded = graded_thread_reading(441, Some(&census), 3, RUNTIME_NAMES, 16);
+        assert_eq!(graded.idle_pool, 306);
+        assert_eq!(graded.graded, 135);
+
+        // What the window sees when fed the GRADED reading: the floor of the
+        // non-pool threads, so the shift is derived from 135 - 36 = 99, which
+        // is below CALIBRATION_BASELINE and shifts NOTHING.
+        let floor_graded = at_rest_estimate(Some(graded.graded), Some(12));
+        assert_eq!(floor_graded, Some(99));
+        assert_eq!(machine_thread_shift(floor_graded), 0);
+
+        // What it would have seen fed the RAW count: the pool folded into the
+        // floor, a shift of ~254 on top of a reading that already excludes the
+        // same 306 threads — the double subtraction this composition forbids.
+        let floor_raw = at_rest_estimate(Some(441), Some(12));
+        assert_eq!(floor_raw, Some(405));
+        assert!(machine_thread_shift(floor_raw) > 200);
+    }
+
     #[test]
     fn the_subtrahend_is_capped_at_the_pool_ceiling() {
         let census = name_census(&[("tokio-rt-worker", 600)]);

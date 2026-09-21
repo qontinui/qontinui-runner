@@ -16588,10 +16588,7 @@ mod coord_provision_session_gate_tests {
             .filter(|l| !l.trim_start().starts_with("//"))
             .copied()
             .collect::<Vec<_>>()
-            .join(
-                "
-",
-            );
+            .join("\n");
         assert!(
             region.contains("\"threadCensus\": crate::health_monitor::thread_name_census_json()"),
             "{region}"
