@@ -730,7 +730,7 @@ impl OutboxWriter {
     /// sub-millisecond bits are random: two sessions registered in the same
     /// millisecond come back in an order no caller can predict. A reader that
     /// spans sessions must not assume the order it appended in (the transcript
-    /// tailer's restart test compares offsets as a sorted set for exactly this
+    /// tailer's restart test joins offsets by session id for exactly this
     /// reason).
     ///
     /// Incremental: only the bytes appended since the drain cursor are read.

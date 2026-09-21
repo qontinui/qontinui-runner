@@ -14645,6 +14645,62 @@ mod counter_handle_pins {
             .filter(|c| !c.is_whitespace())
             .collect()
     }
+    /// Every `static` declaration in `src`, as its line with the leading
+    /// visibility stripped — `pub static`, `pub(crate) static`,
+    /// `pub(super) static`, `pub(in path) static` all read as `static …`, so a
+    /// second global reintroduced with a visibility does not slip past a
+    /// `starts_with("static ")` check (a pre-PR review found exactly that
+    /// hole). Whole-line comments are skipped, since the docs here name
+    /// `static` in prose.
+    fn declared_statics(src: &str) -> Vec<&str> {
+        src.lines()
+            .map(str::trim_start)
+            .filter(|l| !l.starts_with("//"))
+            .filter_map(|l| {
+                let rest = if let Some(after) = l.strip_prefix("pub") {
+                    // `pub`, `pub(crate)`, `pub(super)`, `pub(in a::b)`.
+                    let after = after.trim_start();
+                    let after = match after.strip_prefix('(') {
+                        Some(inner) => inner.split_once(')').map(|(_, r)| r)?,
+                        None => after,
+                    };
+                    after.trim_start()
+                } else {
+                    l
+                };
+                rest.starts_with("static ").then_some(rest)
+            })
+            .collect()
+    }
+
+    /// The mutant the visibility-stripping exists for: a second global
+    /// reintroduced as `pub static` / `pub(crate) static` / `pub(in …) static`
+    /// is SEEN, so the one-static assertion above goes red on it. A doc line
+    /// naming `static` in prose is not.
+    #[test]
+    fn a_static_behind_a_visibility_is_still_a_static() {
+        const MUTANT: &str = "\
+/// a doc that says static in prose
+static ONE: T = T::new();
+pub static SEQ: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static TWO: T = T::new();
+pub(super) static THREE: T = T::new();
+pub(in crate::x) static FOUR: T = T::new();
+fn not_a_static() {}
+// static in a comment
+";
+        assert_eq!(
+            declared_statics(MUTANT),
+            vec![
+                "static ONE: T = T::new();",
+                "static SEQ: AtomicU64 = AtomicU64::new(0);",
+                "static TWO: T = T::new();",
+                "static THREE: T = T::new();",
+                "static FOUR: T = T::new();",
+            ]
+        );
+    }
+
     fn wrapper_body<'a>(prod: &'a str, signature: &str) -> (&'a str, String) {
         let start = prod.find(signature).unwrap_or_else(|| {
             panic!(
@@ -14724,11 +14780,7 @@ mod counter_handle_pins {
                 .find("\nfn degraded_body(")
                 .expect("`degraded_body` must follow the counter block");
         let block = &prod[block_start..block_end];
-        let statics: Vec<&str> = block
-            .lines()
-            .map(str::trim_start)
-            .filter(|l| l.starts_with("static "))
-            .collect();
+        let statics = declared_statics(block);
         assert_eq!(
             statics,
             vec!["static MEMORY_ENRICH: MemoryEnrichCounters = MemoryEnrichCounters::new();"],
@@ -14804,11 +14856,7 @@ mod counter_handle_pins {
                 .find("\nfn record_event_lane_miss(")
                 .expect("`record_event_lane_miss` must follow the counter block");
         let block = &prod[block_start..block_end];
-        let statics: Vec<&str> = block
-            .lines()
-            .map(str::trim_start)
-            .filter(|l| l.starts_with("static "))
-            .collect();
+        let statics = declared_statics(block);
         assert_eq!(
             statics,
             vec!["static TRANSPORT_RUNG: TransportRungCounters = TransportRungCounters::new();"],
