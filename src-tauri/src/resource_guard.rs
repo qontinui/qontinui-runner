@@ -342,8 +342,14 @@ pub(crate) const THREADS_PER_SESSION: usize = 3;
 
 /// How many observations the trailing window keeps.
 ///
-/// [`crate::fleet::resource_sample`] publishes every 30 s, so 40 samples is a
-/// **20-minute** window. The two directions this number trades between:
+/// At [`crate::fleet::resource_sample`]'s default 30 s tick that is nominally
+/// 20 minutes — but the tick is NOT fixed (`COORD_RESOURCE_SAMPLE_SECS` has a
+/// 10 s floor and no ceiling, plus ±20% jitter), so this bounds the window by
+/// COUNT only. [`AT_REST_SAMPLE_MAX_AGE`] is what bounds it in TIME, and the
+/// two together are what make the window's span a property of this module
+/// rather than of an env var it cannot see.
+///
+/// The two directions this number trades between:
 ///
 /// - LONGER is better at catching a genuinely quiet moment on a box that is
 ///   rarely idle, which is what makes the estimate a *floor* rather than an
@@ -351,10 +357,30 @@ pub(crate) const THREADS_PER_SESSION: usize = 3;
 /// - SHORTER is better at letting the baseline RISE when the process's real
 ///   floor rises, which is the property an all-time minimum does not have at
 ///   all (see [`AtRestWindow`]).
-///
-/// 20 minutes is long enough to span the gap between two sessions on a busy box
-/// and short enough that a leak is reflected within the hour.
 pub(crate) const AT_REST_WINDOW_SAMPLES: usize = 40;
+
+/// How old an observation may be and still count toward the floor.
+///
+/// **This is the bound that makes a STALLED publisher fail strict.** The
+/// sample count alone cannot do it: `record_at_rest_sample` is reached only
+/// from `fleet::resource_sample::collect_host_lane`, and `publish_once`
+/// returns before `collect()` on three independent conditions — no
+/// `machine.json`, no coord base, and no usable device JWT. Device JWTs are
+/// short-lived, so the third is a routine transient rather than an exotic one.
+///
+/// Without an age bound, a window filled while the box was loaded or mid-leak
+/// would sit there for the life of the process once the tick stopped, holding
+/// the ceilings shifted (up to 617/761) off data of unbounded age — the guard
+/// whose job is catching a thread leak would be the one whose loosening
+/// survived longest after its telemetry died. That is UNKNOWN rendering as a
+/// live measurement, which served policy
+/// `verification-and-evidence` `unknown-must-not-render-as-a-default` forbids.
+///
+/// With it, a stalled publisher decays to `None` within 20 minutes, the shift
+/// goes to zero, and the ceilings return to the shipped 256/400 — strict,
+/// which is the correct direction to fail.
+pub(crate) const AT_REST_SAMPLE_MAX_AGE: std::time::Duration =
+    std::time::Duration::from_secs(20 * 60);
 
 /// The trailing-window low-water mark of the process's at-rest thread floor.
 ///
@@ -379,33 +405,75 @@ pub(crate) const AT_REST_WINDOW_SAMPLES: usize = 40;
 ///
 /// ## Why one bad sample cannot pin it
 ///
-/// Two independent bounds. [`at_rest_estimate`] refuses an incoherent
-/// observation outright rather than saturating it to a low number, and even an
-/// accepted outlier ages out of the window within
-/// [`AT_REST_WINDOW_SAMPLES`] ticks. A permanent latch at a spuriously low
-/// baseline — which an all-time minimum offers no recovery from short of a
-/// runner restart, and served policy `production-and-cost` `runner-lifecycle`
-/// forbids that restart — is therefore unreachable.
+/// Three independent bounds. [`at_rest_estimate`] refuses an incoherent
+/// observation outright rather than saturating it to a low number; an accepted
+/// outlier ages out of the window within [`AT_REST_WINDOW_SAMPLES`] ticks; and
+/// it ages out in wall-clock time within [`AT_REST_SAMPLE_MAX_AGE`] however
+/// slowly the ticks arrive. A permanent latch at a spuriously low baseline —
+/// which an all-time minimum offers no recovery from short of a runner
+/// restart, and served policy `production-and-cost` `runner-lifecycle` forbids
+/// that restart — is therefore unreachable.
+///
+/// ## Why the clock is a PARAMETER
+///
+/// Every method takes `now` rather than reading [`std::time::Instant::now`]
+/// itself, so the ageing behaviour is unit-testable without sleeping and the
+/// type stays pure. [`Self::record`] and [`Self::baseline`] are the thin
+/// impure wrappers the process-global uses.
 #[derive(Debug, Default)]
 pub(crate) struct AtRestWindow {
-    /// The last [`AT_REST_WINDOW_SAMPLES`] accepted estimates, oldest first.
-    samples: std::collections::VecDeque<usize>,
+    /// The last [`AT_REST_WINDOW_SAMPLES`] accepted estimates as
+    /// `(observed_at, at_rest)`, oldest first.
+    samples: std::collections::VecDeque<(std::time::Instant, usize)>,
 }
 
 impl AtRestWindow {
-    /// Fold one accepted estimate in, evicting the oldest when full.
-    pub(crate) fn record(&mut self, at_rest: usize) {
-        if self.samples.len() == AT_REST_WINDOW_SAMPLES {
+    /// Fold one accepted estimate in at `now`, evicting by age and then by
+    /// count. PURE with respect to the clock.
+    pub(crate) fn record_at(&mut self, now: std::time::Instant, at_rest: usize) {
+        self.expire(now);
+        while self.samples.len() >= AT_REST_WINDOW_SAMPLES {
             self.samples.pop_front();
         }
-        self.samples.push_back(at_rest);
+        self.samples.push_back((now, at_rest));
     }
 
-    /// The low-water mark over the window, or `None` before the first accepted
-    /// sample. `None` is UNKNOWN and [`machine_thread_shift`] renders it as a
-    /// zero shift — the shipped constants, never a permissive default.
+    /// The low-water mark over the samples still within
+    /// [`AT_REST_SAMPLE_MAX_AGE`] of `now`, or `None` when none are.
+    ///
+    /// `None` is UNKNOWN and [`machine_thread_shift`] renders it as a zero
+    /// shift — the shipped constants, never a permissive default.
+    pub(crate) fn baseline_at(&self, now: std::time::Instant) -> Option<usize> {
+        self.samples
+            .iter()
+            .filter(|(at, _)| Self::is_fresh(now, *at))
+            .map(|(_, v)| *v)
+            .min()
+    }
+
+    /// Drop every sample older than [`AT_REST_SAMPLE_MAX_AGE`].
+    fn expire(&mut self, now: std::time::Instant) {
+        while matches!(self.samples.front(), Some((at, _)) if !Self::is_fresh(now, *at)) {
+            self.samples.pop_front();
+        }
+    }
+
+    /// `saturating_duration_since`, so a clock that appears to go backwards
+    /// (a sample stamped after `now`) reads as age ZERO — fresh — rather than
+    /// underflowing. Freshness is the conservative reading only because the
+    /// alternative here would DISCARD a just-taken sample.
+    fn is_fresh(now: std::time::Instant, at: std::time::Instant) -> bool {
+        now.saturating_duration_since(at) <= AT_REST_SAMPLE_MAX_AGE
+    }
+
+    /// [`Self::record_at`] at the current instant.
+    pub(crate) fn record(&mut self, at_rest: usize) {
+        self.record_at(std::time::Instant::now(), at_rest);
+    }
+
+    /// [`Self::baseline_at`] at the current instant.
     pub(crate) fn baseline(&self) -> Option<usize> {
-        self.samples.iter().copied().min()
+        self.baseline_at(std::time::Instant::now())
     }
 }
 
@@ -2626,6 +2694,64 @@ mod tests {
         assert_eq!(w.samples.len(), AT_REST_WINDOW_SAMPLES);
     }
 
+    /// **A STALLED PUBLISHER DECAYS TO UNKNOWN, IT DOES NOT FREEZE.**
+    ///
+    /// `record_at_rest_sample` is reached only from
+    /// `fleet::resource_sample::collect_host_lane`, and `publish_once` returns
+    /// before `collect()` with no `machine.json`, no coord base, or no usable
+    /// device JWT — the last of which is a routine transient, since device JWTs
+    /// are short-lived.
+    ///
+    /// A count-bounded-only window would keep a floor recorded while the box
+    /// was loaded for the LIFE OF THE PROCESS once the tick stopped, holding
+    /// the ceilings shifted off data of unbounded age. That is the one arm of
+    /// this change that would resolve PERMISSIVE, and it is the direction that
+    /// matters: the guard whose job is catching a thread leak would be the one
+    /// whose loosening outlived its own telemetry.
+    #[test]
+    fn a_stalled_publisher_decays_to_unknown_rather_than_freezing_a_stale_floor() {
+        let t0 = std::time::Instant::now();
+        let mut w = AtRestWindow::default();
+
+        // A loaded box fills the window with a high floor, then the publisher
+        // stops (no more `record_at` calls ever).
+        for i in 0..AT_REST_WINDOW_SAMPLES {
+            w.record_at(t0 + std::time::Duration::from_secs(i as u64), 402);
+        }
+        let last = t0 + std::time::Duration::from_secs(AT_REST_WINDOW_SAMPLES as u64);
+        assert_eq!(w.baseline_at(last), Some(402), "fresh samples still count");
+
+        // Inside the age bound the floor stands.
+        assert_eq!(
+            w.baseline_at(last + AT_REST_SAMPLE_MAX_AGE - std::time::Duration::from_secs(60)),
+            Some(402),
+        );
+
+        // Past it, every sample is stale and the answer is UNKNOWN — which
+        // `machine_thread_shift` renders as a ZERO shift, i.e. the shipped
+        // 256/400. Strict, not permissive.
+        let long_after = last + AT_REST_SAMPLE_MAX_AGE + std::time::Duration::from_secs(1);
+        assert_eq!(
+            w.baseline_at(long_after),
+            None,
+            "a window nothing has refreshed must read UNKNOWN, never a live floor"
+        );
+        assert_eq!(machine_thread_shift(w.baseline_at(long_after)), 0);
+        let merged = ceilings_for(w.baseline_at(long_after));
+        assert_eq!(merged.warn_thread_count, defaults().warn_thread_count);
+        assert_eq!(
+            merged.critical_thread_count,
+            defaults().critical_thread_count
+        );
+
+        // A clock that appears to go backwards reads as age zero rather than
+        // underflowing, so a just-taken sample is never discarded.
+        assert_eq!(
+            w.baseline_at(t0 - std::time::Duration::from_secs(0)),
+            Some(402)
+        );
+    }
+
     /// The calibration constants are the ones the shipped defaults were
     /// actually derived from — pinned so a future edit to either default has to
     /// come here and restate the relationship rather than silently changing
@@ -2700,6 +2826,21 @@ mod tests {
                             // not a term either party can author — it is a
                             // measurement of the box ([`machine_thread_shift`]) —
                             // so a bad fleet row still cannot walk the ceiling up.
+                            // The CRITICAL half of the same bound. Without
+                            // it the invariant is one-sided: a mutation that
+                            // applies the shift TWICE to critical only still
+                            // satisfies `critical >= warn`,
+                            // `critical >= THREAD_CEILING_MIN` and the warn
+                            // bound below, so the sweep would pass a ladder
+                            // that had walked the refusal ceiling up by an
+                            // extra `shift` on every box.
+                            assert!(
+                                merged.critical_thread_count
+                                    <= defaults().critical_thread_count + shift,
+                                "critical ceiling above the hardcoded default plus the \
+                                 machine shift: local({lw},{lc}) fleet({fw:?},{fc:?}) \
+                                 shift({shift}) {merged:?}"
+                            );
                             assert!(
                                 merged.warn_thread_count <= defaults().warn_thread_count + shift,
                                 "loosened: local({lw},{lc}) fleet({fw:?},{fc:?}) \
