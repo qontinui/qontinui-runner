@@ -28,6 +28,7 @@ import {
   classificationTokenFor,
   classificationsFromReport,
   classifyFromLog,
+  defaultSpawn,
   isByDesignNonAnswer,
   killTree,
   nonAnswersFor,
@@ -783,8 +784,22 @@ test("killTree: POSIX kills the process GROUP, Windows walks the tree with taskk
   assert.deepEqual(calls, [["kill", -4242, "SIGKILL"]], "negative pid = the group the detached child leads");
 
   calls.length = 0;
-  assert.equal(killTree(child, { platform: "win32", taskkill: (cmd, args) => calls.push([cmd, ...args]) }), "tree");
+  assert.equal(
+    killTree(child, { platform: "win32", taskkill: (cmd, args) => { calls.push([cmd, ...args]); return { status: 0 }; } }),
+    "tree",
+  );
   assert.deepEqual(calls, [["taskkill", "/PID", "4242", "/T", "/F"]]);
+
+  // `spawnSync` throws only on ENOENT; access denied / a recycled PID is a
+  // NON-ZERO STATUS with no throw, and must fall through to the direct kill.
+  calls.length = 0;
+  assert.equal(
+    killTree(child, { platform: "win32", taskkill: (cmd, args) => { calls.push([cmd, ...args]); return { status: 128 }; } }),
+    "child",
+  );
+  assert.deepEqual(calls, [["taskkill", "/PID", "4242", "/T", "/F"], ["child.kill", "SIGKILL"]]);
+  calls.length = 0;
+  assert.equal(killTree(child, { platform: "win32", taskkill: () => undefined }), "child", "no result object at all is not success either");
 
   calls.length = 0;
   const refuse = () => { throw new Error("ESRCH"); };
@@ -828,6 +843,70 @@ test("extractPanicText redacts secret-shaped text at capture, and the annotation
   const ann = formatAnnotation("x::a::b", { label: "SUITE-ONLY", solo_runs: 3, solo_failures: 0, reason: "r", sample_panic: `Bearer ${jwt}` });
   assert.doesNotMatch(ann, /eyJ/);
   assert.match(ann, /Bearer \[redacted\]/);
+
+  // The shapes a Rust panic actually prints: a Debug struct and a JSON body.
+  const shaped = libtestOutput([["a::b", "FAILED"]], {
+    panicFor: {
+      "a::b": [
+        "thread 'a::b' panicked at src/x.rs:1:1:",
+        `assertion failed: Settings { runner_token: "qr_live_abcdef123456", api_key: "sk-live-1", retries: 3 }`,
+        `body: {"token": "abc123", "n": 1} GITHUB_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123`,
+      ].join("\n"),
+    },
+  });
+  const shapedPanic = extractPanicText(shaped, "a::b");
+  for (const leak of ["qr_live", "sk-live", "abc123", "ghp_"]) assert.doesNotMatch(shapedPanic, new RegExp(leak), `leaked ${leak}`);
+  assert.match(shapedPanic, /runner_token=\[redacted\], api_key=\[redacted\], retries: 3/);
+  assert.match(shapedPanic, /"token"=\[redacted\], "n": 1\} GITHUB_TOKEN=\[redacted\]/);
+});
+
+test("defaultSpawn: a timeout settles even when `close` never fires — exit is honoured, streams destroyed, after the grace", async () => {
+  // A fake child: `exit` fires after the kill, `close` never does (a
+  // grandchild holds the inherited stdout pipe).
+  const { EventEmitter } = await import("node:events");
+  const stream = () => {
+    const st = new EventEmitter();
+    st.destroyed = false;
+    st.setEncoding = () => {};
+    st.destroy = () => { st.destroyed = true; };
+    return st;
+  };
+  const child = new EventEmitter();
+  child.pid = 777;
+  child.stdout = stream();
+  child.stderr = stream();
+  child.kill = () => true;
+  const killed = [];
+  const kill = (c) => { killed.push(c.pid); setTimeout(() => c.emit("exit", null, "SIGKILL"), 1); return "group"; };
+  const started = Date.now();
+  const r = await defaultSpawn("/bin/hang", [], { timeoutMs: 5, graceMs: 20, spawnImpl: () => child, kill });
+  assert.equal(r.timedOut, true);
+  assert.equal(r.signal, "SIGKILL", "the `exit` that did fire is what the result carries");
+  assert.equal(r.code, null);
+  assert.deepEqual(killed, [777]);
+  assert.equal(child.stdout.destroyed, true);
+  assert.equal(child.stderr.destroyed, true);
+  assert.ok(Date.now() - started < 2000, "settled by the grace, not by a `close` that never comes");
+
+  // …and with no `exit` either, it still settles with nulls.
+  const child2 = new EventEmitter();
+  child2.pid = 778;
+  child2.stdout = stream();
+  child2.stderr = stream();
+  child2.kill = () => true;
+  const r2 = await defaultSpawn("/bin/hang", [], { timeoutMs: 5, graceMs: 20, spawnImpl: () => child2, kill: () => "group" });
+  assert.deepEqual([r2.timedOut, r2.code, r2.signal, r2.spawnError], [true, null, null, null]);
+
+  // …while an ordinary `close` still wins and the grace never fires.
+  const child3 = new EventEmitter();
+  child3.pid = 779;
+  child3.stdout = stream();
+  child3.stderr = stream();
+  child3.kill = () => true;
+  setTimeout(() => { child3.stdout.emit("data", "running 1 test\n"); child3.emit("exit", 0, null); child3.emit("close", 0, null); }, 1);
+  const r3 = await defaultSpawn("/bin/ok", [], { timeoutMs: 5000, graceMs: 20, spawnImpl: () => child3, kill: () => { throw new Error("must not be called"); } });
+  assert.deepEqual([r3.timedOut, r3.code, r3.stdout], [false, 0, "running 1 test\n"]);
+  assert.equal(child3.stdout.destroyed, false);
 });
 
 test("runCensus: a should_panic test's panic block is found under its bare name", async () => {

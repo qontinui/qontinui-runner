@@ -613,17 +613,40 @@ test("lastBinaryHasSummary: true only when the LAST announced binary printed its
   assert.equal(lastBinaryHasSummary(L("2026-09-21T12:00:00.0000000Z \u001b[0mtest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s")), true);
 });
 
-test("redactSecrets: JWTs, Bearer tokens and token/secret/password pairs are replaced; everything else is untouched; idempotent", () => {
+test("redactSecrets: JWTs, Bearer, GitHub tokens and any token/secret/password/jwt/api_key key in env, Debug, JSON or query shape; idempotent", () => {
   const jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
-  const input = `Authorization: Bearer ${jwt}; also ${jwt} raw; token=abc123 Secret=x password=hunter2 not_a_token=fine`;
+  const input = `Authorization: Bearer ${jwt}; also ${jwt} raw; token=abc123 Secret=x password=hunter2`;
   const out = redactSecrets(input);
   assert.doesNotMatch(out, /eyJ/);
   assert.doesNotMatch(out, /abc123|hunter2/);
   assert.match(out, /Bearer \[redacted\]/);
   assert.match(out, /token=\[redacted\] Secret=\[redacted\] password=\[redacted\]/);
-  assert.match(out, /not_a_token=fine/, "a longer identifier ending in `token` is not a `token=` pair");
+
+  // The shapes a Rust panic actually prints. `\b` never fired between `_`
+  // and `T` in `GITHUB_TOKEN`, and a Debug field or a JSON member uses `:`.
+  const shapes = redactSecrets(
+    [
+      `Config { runner_token: "qr_live_abcdef123456", name: "x" }`,
+      `{"token": "abc123", "api_key": "sk-live-9999", "n": 1}`,
+      `GITHUB_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123 api_key=sk-abc-123 pat=github_pat_11AAA_bbb`,
+      `coord_jwt=eyJaaaaaaaaaaaaaaaa.b.c device_secret:  s3cr3t`,
+    ].join("\n"),
+  );
+  for (const leak of ["qr_live", "abc123", "sk-live", "ghp_", "sk-abc", "github_pat_11AAA", "eyJ", "s3cr3t"]) {
+    assert.doesNotMatch(shapes, new RegExp(leak), `leaked ${leak} in:\n${shapes}`);
+  }
+  assert.match(shapes, /runner_token=\[redacted\], name: "x"/, "the key survives, the value does not, the rest is untouched");
+  assert.match(shapes, /"token"=\[redacted\], "api_key"=\[redacted\], "n": 1/);
+  assert.match(shapes, /GITHUB_TOKEN=\[redacted\] api_key=\[redacted\]/);
+  assert.match(shapes, /device_secret=\[redacted\]/);
+
+  // A name that merely CONTAINS one of the words is redacted too — over-redaction
+  // is the safe side of a public issue.
+  assert.equal(redactSecrets("not_a_token=fine"), "not_a_token=[redacted]");
+
   assert.equal(redactSecrets(out), out, "idempotent");
+  assert.equal(redactSecrets(shapes), shapes, "idempotent over every shape");
   assert.equal(redactSecrets("assertion `left == right` failed\n  left: 2\n right: 1"), "assertion `left == right` failed\n  left: 2\n right: 1");
+  assert.equal(redactSecrets("token_count: 3, timeout_ms: 20"), "token_count=[redacted], timeout_ms: 20", "a `token_count` field is redacted (contains `token`); `timeout_ms` is not");
   assert.equal(redactSecrets(null), "");
 });
-
