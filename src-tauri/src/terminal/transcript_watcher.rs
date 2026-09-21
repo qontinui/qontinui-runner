@@ -114,8 +114,14 @@ pub(crate) enum TailExit {
     /// Neither a wake nor byte growth for the configured idle timeout, or the
     /// file's metadata was unreadable [`METADATA_ERROR_PARK_STREAK`] times in
     /// a row. The task is gone; `cursor` is what the registry keeps so the
-    /// next `Modify` revives the tail from exactly here.
-    Idle { cursor: u64 },
+    /// next `Modify` revives the tail from exactly here. `seen_len` is the
+    /// file length the tail last observed — which is NOT the cursor when the
+    /// file ends in an unterminated fragment — and it is what the exit
+    /// closure compares the on-disk length against to decide whether a
+    /// `Modify` was lost between the idle check and the park. Comparing
+    /// against the cursor instead revived every fragment-tailed file once per
+    /// idle timeout, forever.
+    Idle { cursor: u64, seen_len: u64 },
 }
 
 /// One step of a [`TailReader`].
@@ -970,7 +976,6 @@ async fn schedule_tail(
             cfg,
         )
         .await;
-        TAILS_ENDED_SINCE_BOOT.fetch_add(1, Ordering::Relaxed);
         settle_guard.armed = false;
         // Settle the registry entry THIS task owns. An idle exit parks the
         // cursor in place of the handle so the next `Modify` revives from it;
@@ -980,7 +985,7 @@ async fn schedule_tail(
         // newer task's entry.
         let mut map = tasks_for_exit.lock().await;
         match result {
-            Ok(TailExit::Idle { cursor }) => {
+            Ok(TailExit::Idle { cursor, seen_len }) => {
                 let parked = map.park_if_current(
                     &session_id,
                     task_id,
@@ -998,13 +1003,17 @@ async fn schedule_tail(
                 // dispatcher, whose `Revive` arm restarts the tail at this
                 // cursor. (A recursive `schedule_tail` from inside its own
                 // spawned task is an infinitely-sized future; the channel is
-                // the seam that already exists.)
+                // the seam that already exists.) The comparison is against
+                // the length the tail LAST SAW, not the cursor: a file ending
+                // in an unterminated fragment parks with its cursor before
+                // the fragment on purpose, and comparing to the cursor would
+                // revive it once per idle timeout forever.
                 if parked {
                     let on_disk = std::fs::metadata(&path_for_park).map(|m| m.len()).ok();
-                    if on_disk.is_some_and(|len| len != cursor) {
+                    if revive_after_park(seen_len, on_disk) {
                         debug!(
-                            "transcript_watcher: {} parked at {} but the file is {:?} bytes — reviving",
-                            session_id, cursor, on_disk
+                            "transcript_watcher: {} parked at {} having last seen {} bytes but the file is {:?} bytes — reviving",
+                            session_id, cursor, seen_len, on_disk
                         );
                         let ev = Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
                             .add_path(path_for_park);
@@ -1031,6 +1040,18 @@ async fn schedule_tail(
     });
 }
 
+/// Whether a tail that just parked must be revived immediately because the
+/// file moved between its last observation and the park (a `Modify` whose
+/// wake permit nobody will poll again). PURE, so the fragment case is pinned
+/// in a test: `on_disk` is compared with the length the tail LAST SAW, never
+/// with its cursor, because a file ending in an unterminated line parks with
+/// its cursor before the fragment on purpose and must then stay parked.
+/// An unreadable length is UNKNOWN and revives nothing — the next real
+/// `Modify` (or the metadata-error park on the revived tail) covers it.
+fn revive_after_park(seen_len: u64, on_disk: Option<u64>) -> bool {
+    on_disk.is_some_and(|len| len != seen_len)
+}
+
 /// Removes a tail's registry entry if its task unwinds past the normal
 /// settle in the exit closure of `schedule_tail`. Disarmed on every non-panic
 /// exit; `Drop` cannot await, so it hands the removal to a fresh task.
@@ -1043,16 +1064,29 @@ struct SettleGuard {
 
 impl Drop for SettleGuard {
     fn drop(&mut self) {
+        // Every task end counts, panic or not, so `tailsStartedSinceBoot -
+        // tailsEndedSinceBoot` stays the number of tasks actually alive.
+        TAILS_ENDED_SINCE_BOOT.fetch_add(1, Ordering::Relaxed);
         if !self.armed {
             return;
         }
         let tasks = self.tasks.clone();
         let session_id = std::mem::take(&mut self.session_id);
         let task_id = self.task_id;
-        warn!(
-            "transcript_watcher: tail task for {} unwound without settling; dropping its registry entry",
-            session_id
-        );
+        if std::thread::panicking() {
+            warn!(
+                "transcript_watcher: tail task for {} unwound without settling; dropping its registry entry",
+                session_id
+            );
+        } else {
+            // The future was dropped, not unwound: runtime shutdown. The
+            // spawn below is then dropped by the shutting-down runtime,
+            // which is fine — nothing is left to revive.
+            debug!(
+                "transcript_watcher: tail task for {} dropped before settling (runtime shutdown)",
+                session_id
+            );
+        }
         tauri::async_runtime::spawn(async move {
             tasks.lock().await.remove_if_current(&session_id, task_id);
         });
@@ -1134,6 +1168,7 @@ impl TailReader {
         if now.saturating_duration_since(self.last_activity) >= self.idle_timeout {
             Some(TailExit::Idle {
                 cursor: self.cursor,
+                seen_len: self.last_seen_len,
             })
         } else {
             None
@@ -1195,6 +1230,7 @@ impl TailReader {
                         );
                         return Ok(TailStep::Exit(TailExit::Idle {
                             cursor: self.cursor,
+                            seen_len: self.last_seen_len,
                         }));
                     }
                     continue; // Transient — retry on next tick.
@@ -1875,7 +1911,8 @@ mod tests {
             assert_eq!(
                 *step,
                 TailStep::Exit(TailExit::Idle {
-                    cursor: initial_len
+                    cursor: initial_len,
+                    seen_len: initial_len,
                 }),
                 "an idle exit carries the cursor at EOF of the initial content"
             );
@@ -2048,10 +2085,74 @@ mod tests {
         assert_eq!(
             step,
             TailStep::Exit(TailExit::Idle {
-                cursor: USER_LINE.len() as u64
+                cursor: USER_LINE.len() as u64,
+                seen_len: (USER_LINE.len() + partial.len()) as u64,
             }),
-            "parked at the cursor BEFORE the unterminated fragment"
+            "parked at the cursor BEFORE the unterminated fragment, having seen the whole file"
         );
+    }
+
+    /// The exit closure's revive decision, on the fragment case (round-2
+    /// finding 1): a file whose tail is an unterminated line parks with
+    /// `cursor` before the fragment and `seen_len` at the fragment's end; the
+    /// on-disk length equals `seen_len`, so NO synthetic revive — otherwise
+    /// the file would park and revive once per idle timeout forever. A real
+    /// append after the idle check (length past `seen_len`) DOES revive, a
+    /// rewrite while parking (length below it) does too, and an unreadable
+    /// length is UNKNOWN and revives nothing.
+    #[test]
+    fn a_fragment_tailed_file_stays_parked_and_only_real_movement_revives() {
+        let cursor = USER_LINE.len() as u64;
+        let seen_len = cursor + 27; // the unterminated fragment the tail saw
+        assert!(
+            !revive_after_park(seen_len, Some(seen_len)),
+            "fragment: stays parked"
+        );
+        assert!(
+            !revive_after_park(cursor, Some(cursor)),
+            "clean EOF: stays parked"
+        );
+        assert!(
+            revive_after_park(seen_len, Some(seen_len + 40)),
+            "append after the idle check"
+        );
+        assert!(
+            revive_after_park(seen_len, Some(3)),
+            "rewritten shorter while parking"
+        );
+        assert!(
+            !revive_after_park(seen_len, None),
+            "unreadable length is UNKNOWN"
+        );
+    }
+
+    /// And the reader side of the same contract: the fragment file's Idle
+    /// exit reports `seen_len` == the on-disk length, which is what makes the
+    /// closure above leave it parked.
+    #[tokio::test]
+    async fn a_fragment_tailed_idle_exit_reports_the_on_disk_length_as_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("fragment-seen.jsonl");
+        let partial = r#"{"type":"assistant","uuid":"a4""#;
+        std::fs::write(&p, format!("{USER_LINE}{partial}")).unwrap();
+        let mut reader = open_reader(&p, TailStart::Start, Duration::from_secs(1)).await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), reader.next_step())
+            .await
+            .unwrap()
+            .unwrap();
+        let step = tokio::time::timeout(Duration::from_secs(3), reader.next_step())
+            .await
+            .unwrap()
+            .unwrap();
+        let on_disk = std::fs::metadata(&p).unwrap().len();
+        match step {
+            TailStep::Exit(TailExit::Idle { cursor, seen_len }) => {
+                assert_eq!(cursor, USER_LINE.len() as u64);
+                assert_eq!(seen_len, on_disk);
+                assert!(!revive_after_park(seen_len, Some(on_disk)));
+            }
+            other => panic!("expected an idle exit, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -2091,7 +2192,8 @@ mod tests {
         assert_eq!(
             step,
             TailStep::Exit(TailExit::Idle {
-                cursor: USER_LINE.len() as u64
+                cursor: USER_LINE.len() as u64,
+                seen_len: USER_LINE.len() as u64,
             })
         );
     }
