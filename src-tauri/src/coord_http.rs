@@ -108,7 +108,7 @@ pub fn coord_client() -> Option<&'static reqwest::Client> {
 /// auth-coverage metric, so these reads now count toward the same
 /// unpaired→paired dogfood signal the write path reports.
 pub fn coord_get(client: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
-    // coord-tenant-scope(escalated): a shared helper, not a route call -- `url` is the caller's argument and its 21 downstream callers span session-, device- and work-scoped reads. The decision belongs at each caller via the existing `coord_get_for` (:123-129). Census E1.
+    // coord-tenant-scope(escalated): a shared helper, not a route call -- `url` is the caller's argument and its downstream callers (21 at the Census E1 reading; that number is a census snapshot, not a live count -- `grep` for it) span session-, device- and work-scoped reads. The decision belongs at each caller via the existing `coord_get_for` (:123-129). Callers adopt it one at a time as each establishes its own class: the tenant-policy poll (`session/coord_sync.rs::fetch_session_coordination_flag`) is the first, per plan `2026-09-17-device-holds-one-credential-slot-so-a-session-cannot-work-a-bound-tenant` P3.
     qontinui_runner_lib::auth::attach_device_auth(client.get(url))
 }
 
@@ -150,13 +150,24 @@ pub fn coord_put(client: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwes
 /// tenant's credential). This is the seam census E1 names as the resolution
 /// for [`coord_get`]'s 21 cross-class callers — each states its own scope here
 /// instead of inheriting one helper's guess.
-#[allow(dead_code)] // seam: session-scoped GET readers adopt as they gain tenants
+/// First adopter: `session/coord_sync.rs::fetch_session_coordination_flag`,
+/// the `/tenant-policy` poll, whose query names a tenant that coord requires
+/// to EQUAL the presented token's claim.
+///
+/// **Takes `crate::auth::TenantScope`, not `qontinui_runner_lib::auth`'s**,
+/// unlike the three unparameterized helpers above. This module compiles into
+/// both the lib and the bin, where those are two DISTINCT types, so a caller
+/// in the bin — which is every scope-resolving call site in the runner, all of
+/// which spell `crate::auth::TenantScope` — could not name the lib's variant
+/// without a conversion that exists only to satisfy a path. Aligning with the
+/// crate-local module is what the ~50 `attach_device_auth*` call sites already
+/// do; only these helpers' own bodies differed.
 pub fn coord_get_for(
     client: &reqwest::Client,
     url: impl reqwest::IntoUrl,
-    scope: qontinui_runner_lib::auth::TenantScope,
+    scope: crate::auth::TenantScope,
 ) -> reqwest::RequestBuilder {
-    qontinui_runner_lib::auth::attach_device_auth_for(client.get(url), scope)
+    crate::auth::attach_device_auth_for(client.get(url), scope)
 }
 
 /// True iff a non-empty device-JWT is currently stored.
