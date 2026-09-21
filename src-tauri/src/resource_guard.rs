@@ -152,7 +152,6 @@
 //! the quantity that collapsed to 7.25 GB during the incident.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use tauri::{AppHandle, Emitter};
@@ -300,15 +299,26 @@ pub(crate) const CALIBRATION_BASELINE: usize = 151;
 /// default** — the same number
 /// [`qontinui_runner_lib::wedge_diagnostics::BlockingBodies::per_runtime_pool_capacity_default`]
 /// publishes, and the number [`THREAD_CEILING_MIN`]'s own doc anchors the 400
-/// critical ceiling to. One runtime saturating its blocking pool is the largest
-/// at-rest floor that is a HEALTHY process rather than a leak.
+/// critical ceiling to.
+///
+/// **It is a deliberately CONSERVATIVE cap, not the largest healthy process.**
+/// The anchor is explicitly PER-RUNTIME — the field is named
+/// `per_runtime_pool_capacity_default` — and this binary builds many runtimes
+/// (`app-rt`, `fleet-pub-rt`, `mcp-api-rt`, and the short-lived
+/// current-thread ones), so *N* runtimes carry *N* × 512 of blocking-pool
+/// capacity that is healthy by tokio's own defaults. A process legitimately
+/// idling above 512 therefore gets LESS shift than its floor would justify,
+/// and the guard is correspondingly stricter on it. That is the intended
+/// direction: this constant is chosen to under-shift rather than over-shift,
+/// because the cost of under-shifting is a deferral and the cost of
+/// over-shifting is an admission the machine cannot honour.
 ///
 /// Past it the shift stops growing, so the effective ceilings cap at
 /// `512 + 105 = 617` warn and `512 + 249 = 761` critical. That bound is the
 /// whole answer to "does a slow leak eventually disable this lane?" — it does
-/// not: a process whose at-rest floor exceeds 512 has a leak the guard will not
-/// accommodate, and refusing work is then correct, because the next thing to
-/// fail is thread creation itself.
+/// not: the lane keeps refusing above the cap rather than chasing the leak
+/// upward, and refusing work is then correct, because the next thing to fail is
+/// thread creation itself.
 pub(crate) const AT_REST_BASELINE_MAX: usize = 512;
 
 /// OS threads attributable to one live terminal session.
@@ -330,13 +340,81 @@ pub(crate) const AT_REST_BASELINE_MAX: usize = 512;
 /// guard getting weaker exactly when it is needed.
 pub(crate) const THREADS_PER_SESSION: usize = 3;
 
-/// The lowest at-rest thread floor observed since this process started, or
-/// `None` before the first usable sample.
+/// How many observations the trailing window keeps.
 ///
-/// `usize::MAX` is the "nothing recorded yet" sentinel because it is the
-/// identity for the `min` this cell accumulates; [`at_rest_thread_baseline`]
-/// maps it back to `None` so no caller can mistake it for a reading.
-static AT_REST_BASELINE: AtomicUsize = AtomicUsize::new(usize::MAX);
+/// [`crate::fleet::resource_sample`] publishes every 30 s, so 40 samples is a
+/// **20-minute** window. The two directions this number trades between:
+///
+/// - LONGER is better at catching a genuinely quiet moment on a box that is
+///   rarely idle, which is what makes the estimate a *floor* rather than an
+///   average;
+/// - SHORTER is better at letting the baseline RISE when the process's real
+///   floor rises, which is the property an all-time minimum does not have at
+///   all (see [`AtRestWindow`]).
+///
+/// 20 minutes is long enough to span the gap between two sessions on a busy box
+/// and short enough that a leak is reflected within the hour.
+pub(crate) const AT_REST_WINDOW_SAMPLES: usize = 40;
+
+/// The trailing-window low-water mark of the process's at-rest thread floor.
+///
+/// ## Why a WINDOW and not a running minimum
+///
+/// This is the whole reason the type exists, and getting it wrong reinstates
+/// the defect the re-basing is meant to remove. The quantity being tracked is
+/// **monotonically increasing**: measured 2026-09-18 on the 48-core box, the
+/// runner started near 190 threads and sat at 424 after ~96 h, because ~227
+/// blocking-pool threads accumulate and are never retired.
+///
+/// **An all-time minimum over a rising series is just its first sample.** It
+/// would pin the baseline at the ~190 the process booted with, give a shift of
+/// 39 instead of ~240, and leave a runner idling at 424 sitting in
+/// `Warn(424 over 295)` — which is the exact band
+/// [`crate::agent_runtime::evaluate_continuation_guard`] defers in. The latch
+/// would return, unchanged in kind, with a longer fuse. A boot snapshot has the
+/// same defect for the same reason.
+///
+/// A bounded window is what makes the floor able to move in BOTH directions: it
+/// falls the moment the machine is quiet and rises as old samples age out.
+///
+/// ## Why one bad sample cannot pin it
+///
+/// Two independent bounds. [`at_rest_estimate`] refuses an incoherent
+/// observation outright rather than saturating it to a low number, and even an
+/// accepted outlier ages out of the window within
+/// [`AT_REST_WINDOW_SAMPLES`] ticks. A permanent latch at a spuriously low
+/// baseline — which an all-time minimum offers no recovery from short of a
+/// runner restart, and served policy `production-and-cost` `runner-lifecycle`
+/// forbids that restart — is therefore unreachable.
+#[derive(Debug, Default)]
+pub(crate) struct AtRestWindow {
+    /// The last [`AT_REST_WINDOW_SAMPLES`] accepted estimates, oldest first.
+    samples: std::collections::VecDeque<usize>,
+}
+
+impl AtRestWindow {
+    /// Fold one accepted estimate in, evicting the oldest when full.
+    pub(crate) fn record(&mut self, at_rest: usize) {
+        if self.samples.len() == AT_REST_WINDOW_SAMPLES {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(at_rest);
+    }
+
+    /// The low-water mark over the window, or `None` before the first accepted
+    /// sample. `None` is UNKNOWN and [`machine_thread_shift`] renders it as a
+    /// zero shift — the shipped constants, never a permissive default.
+    pub(crate) fn baseline(&self) -> Option<usize> {
+        self.samples.iter().copied().min()
+    }
+}
+
+/// The process-wide [`AtRestWindow`].
+///
+/// A `Mutex` rather than an atomic because the value is a window rather than a
+/// scalar, and the contention is one lock every 30 s against a spawn-path read.
+/// A poisoned lock reads as UNKNOWN — see [`at_rest_thread_baseline`].
+static AT_REST_WINDOW: Mutex<Option<AtRestWindow>> = Mutex::new(None);
 
 /// Record one `(total threads, live sessions)` observation and fold it into the
 /// at-rest floor.
@@ -345,14 +423,19 @@ static AT_REST_BASELINE: AtomicUsize = AtomicUsize::new(usize::MAX);
 /// readings two lines apart on its own 30 s publish tick — so this adds no
 /// sensor, no timer and no new call into the terminal registry.
 ///
-/// ## Why a low-water mark rather than a boot snapshot
+/// ## Where this does NOT run, stated rather than discovered
 ///
-/// A boot-only baseline does not survive this process. Measured 2026-09-18 on
-/// the 48-core box: the runner started near 190 threads and sat at 424 after
-/// ~96 h, because ~227 blocking-pool threads accumulate and are never retired.
-/// A ceiling derived from the boot figure would have re-latched within days —
-/// the same defect with a longer fuse. A running minimum tracks the floor the
-/// process actually has, on a box that never reaches zero sessions.
+/// That publish path is gated: `fleet::spawn_budget_republisher` returns early
+/// on a SECONDARY instance, and `resource_sample::publish_once` returns before
+/// `collect()` when `~/.qontinui/machine.json` is absent, when no coord base is
+/// configured, or when no device JWT resolves. On any such machine no sample is
+/// ever recorded, the baseline stays `None` and the shift stays **zero** — i.e.
+/// exactly the shipped 256 / 400. The inertness therefore fails toward today's
+/// behaviour and never toward a permissive one, but it IS inertness: a box that
+/// publishes no fleet telemetry does not get the re-basing. Sourcing the
+/// baseline from a path that runs regardless of fleet publishing is recorded as
+/// a follow-up on the plan rather than done here, because it needs a session
+/// count outside `resource_sample` and that is a second seam.
 ///
 /// ## Why EITHER `None` records nothing
 ///
@@ -363,10 +446,15 @@ static AT_REST_BASELINE: AtomicUsize = AtomicUsize::new(usize::MAX);
 /// floor, inflate the ceiling and loosen the guard precisely when the registry
 /// is broken — an UNKNOWN rendering as a permissive default, which is the shape
 /// served policy `unknown-must-not-render-as-a-default` forbids. An unusable
-/// tick contributes nothing and the previous floor stands.
+/// tick contributes nothing and the previous window stands.
 pub(crate) fn record_at_rest_sample(total_threads: Option<usize>, live_sessions: Option<usize>) {
-    if let Some(at_rest) = at_rest_estimate(total_threads, live_sessions) {
-        AT_REST_BASELINE.fetch_min(at_rest, Ordering::Relaxed);
+    let Some(at_rest) = at_rest_estimate(total_threads, live_sessions) else {
+        return;
+    };
+    if let Ok(mut guard) = AT_REST_WINDOW.lock() {
+        guard
+            .get_or_insert_with(AtRestWindow::default)
+            .record(at_rest);
     }
 }
 
@@ -378,6 +466,19 @@ pub(crate) fn record_at_rest_sample(total_threads: Option<usize>, live_sessions:
 /// this binary would then share — the same purity split
 /// [`merge_thread_ceilings_reporting`] keeps from
 /// [`effective_thread_ceilings`].
+///
+/// ## An INCOHERENT observation is UNKNOWN, not a low reading
+///
+/// `sessions * THREADS_PER_SESSION >= total` says the session-attributable
+/// threads are the entire process, which no live runner can be: the sampler,
+/// the publisher and the Tauri runtime are all unattributed to any session.
+/// Such a reading is a mis-count on one side or the other — a registry read
+/// taken mid-teardown, a thread sensor that undercounted — and the honest
+/// answer is `None`.
+///
+/// Saturating it to `Some(0)` instead would be actively dangerous: a zero folds
+/// into the window as a legitimate floor and drags the shift to zero for as
+/// long as it survives there.
 pub(crate) fn at_rest_estimate(
     total_threads: Option<usize>,
     live_sessions: Option<usize>,
@@ -385,16 +486,18 @@ pub(crate) fn at_rest_estimate(
     let (Some(total), Some(sessions)) = (total_threads, live_sessions) else {
         return None;
     };
-    Some(total.saturating_sub(sessions.saturating_mul(THREADS_PER_SESSION)))
+    let session_threads = sessions.saturating_mul(THREADS_PER_SESSION);
+    if session_threads >= total {
+        return None;
+    }
+    Some(total - session_threads)
 }
 
 /// The measured at-rest thread floor, or `None` when nothing usable has been
-/// sampled yet.
+/// sampled yet — or when the window's lock is poisoned, which is UNKNOWN for
+/// the same reason and degrades to the shipped constants.
 pub(crate) fn at_rest_thread_baseline() -> Option<usize> {
-    match AT_REST_BASELINE.load(Ordering::Relaxed) {
-        usize::MAX => None,
-        n => Some(n),
-    }
+    AT_REST_WINDOW.lock().ok()?.as_ref()?.baseline()
 }
 
 /// How far to re-base this machine's thread ladder, in threads. PURE.
@@ -875,6 +978,16 @@ pub(crate) fn merge_thread_ceilings_reporting(
     // term by the same amount and no source gains on any other. See
     // [`machine_thread_shift`] for why the ladder is re-based rather than
     // re-derived, and why that is not loosening.
+    //
+    // ONE consequence stated rather than discovered: a fleet or local term is
+    // no longer an ABSOLUTE ceiling. A fleet row setting `critical = 0` — the
+    // documented way to pin a machine to `THREAD_CEILING_MIN` — now enforces
+    // `THREAD_CEILING_MIN + shift`, up to 561. That follows directly from the
+    // ladder being a headroom figure, and it is the same property that keeps
+    // the operator's knob working in both directions; but an operator reaching
+    // for a fleet ceiling during a live thread-exhaustion incident should know
+    // they are setting headroom, not an absolute. An `absolute: true` fleet
+    // flag is recorded as a follow-up on the plan rather than invented here.
     let warn = tighten_ceiling(
         local.warn_thread_count,
         hardcoded.warn_thread_count,
@@ -2261,11 +2374,6 @@ mod tests {
         assert_eq!(tighten_ceiling(400, 400, Some(0)), THREAD_CEILING_MIN);
     }
 
-    /// THE CLAMP. No combination of the three terms may compose a ceiling the
-    /// runner is already over at rest — that is not a stricter guard, it is a
-    /// machine that can never start a session again, on eight unattended seams
-    /// with nobody to press "Start anyway".
-
     // ------------------------------------------------------------------
     // The latch, and the safety valve. Plan
     // `2026-09-18-the-runner-thread-pressure-guard-is-a-latch-not-back-pressure`.
@@ -2309,14 +2417,20 @@ mod tests {
     #[test]
     fn a_genuinely_loaded_high_core_runner_still_defers() {
         let merged = ceilings_for(Some(402));
+        // 402 - 151 = 251, so the re-based ladder is 507 / 651. Assert the
+        // LIMIT, not `o.observed`: `observed` is the argument echoed back
+        // unchanged, so asserting it would hold for every ceiling including the
+        // un-shifted one, and this arm would pass with the fix reverted.
+        assert_eq!(merged.warn_thread_count, 507);
+        assert_eq!(merged.critical_thread_count, 651);
         match evaluate_threads(Some(700), &merged) {
-            SpawnGate::Critical(o) => assert_eq!(o.observed, 700),
+            SpawnGate::Critical(o) => assert_eq!((o.observed, o.limit), (700, 651)),
             other => panic!("expected Critical far above the re-based ceiling, got {other:?}"),
         }
         // ARM B' — and the WARN band still exists between the two, which is the
         // band the continuation guard actually defers on.
         match evaluate_threads(Some(520), &merged) {
-            SpawnGate::Warn(o) => assert_eq!(o.observed, 520),
+            SpawnGate::Warn(o) => assert_eq!((o.observed, o.limit), (520, 507)),
             other => panic!("expected Warn inside the re-based warn band, got {other:?}"),
         }
     }
@@ -2392,19 +2506,23 @@ mod tests {
             merged.critical_thread_count,
             AT_REST_BASELINE_MAX + (defaults().critical_thread_count - CALIBRATION_BASELINE)
         );
+        // The LIMIT is the quantity the cap moves; `o.observed` is the argument
+        // echoed back and would assert nothing. 512 + 249 = 761.
+        assert_eq!(merged.critical_thread_count, 761);
         match evaluate_threads(Some(1_000), &merged) {
-            SpawnGate::Critical(o) => assert_eq!(o.observed, 1_000),
+            SpawnGate::Critical(o) => assert_eq!((o.observed, o.limit), (1_000, 761)),
             other => panic!("a leaking process must still be refused, got {other:?}"),
         }
     }
 
-    /// The at-rest tracker keeps the LOWEST floor it has seen, subtracts the
-    /// session load at the instant of each reading, and records NOTHING when
-    /// either half is UNKNOWN.
+    /// The at-rest estimate subtracts the session load at the instant of each
+    /// reading, and yields NOTHING when either half is UNKNOWN or when the two
+    /// halves are mutually incoherent.
     ///
-    /// Pure arithmetic only — the process-global cell is deliberately not
-    /// touched here, because a static shared with every other test in this
-    /// binary cannot be asserted on without ordering assumptions.
+    /// Pure arithmetic only — the process-global window is deliberately not
+    /// touched here. [`AtRestWindow`] is tested on its own instance instead
+    /// (see [`the_at_rest_window_can_rise_and_no_single_sample_can_pin_it`]),
+    /// so no test in this binary asserts on shared mutable state.
     #[test]
     fn the_at_rest_estimate_subtracts_session_load_and_never_invents_one() {
         // 424 threads with 11 live sessions is the 2026-09-18 reading.
@@ -2432,10 +2550,80 @@ mod tests {
             "zero sessions is a READING, not an absence — it must still sample"
         );
 
-        // A nonsensical reading saturates to 0 rather than wrapping to a huge
-        // floor, which would loosen the ceiling to its cap.
-        assert_eq!(at_rest_estimate(Some(1), Some(1000)), Some(0));
-        assert_eq!(at_rest_estimate(Some(10), Some(usize::MAX)), Some(0));
+        // An INCOHERENT reading is UNKNOWN, not a low floor. Saturating these
+        // to `Some(0)` would fold a zero into the window as a legitimate floor
+        // and drag the shift to zero for as long as it survived there — the
+        // guard silently reverting to the latch, with nothing said.
+        assert_eq!(at_rest_estimate(Some(1), Some(1000)), None);
+        assert_eq!(at_rest_estimate(Some(10), Some(usize::MAX)), None);
+        // The boundary: session threads EQUAL to the whole process is still
+        // incoherent — a live runner always carries unattributed threads.
+        assert_eq!(at_rest_estimate(Some(9), Some(3)), None);
+        assert_eq!(at_rest_estimate(Some(10), Some(3)), Some(1));
+    }
+
+    /// **The window must be able to RISE, and no single sample may pin it.**
+    ///
+    /// This is the property that separates a trailing window from the all-time
+    /// minimum it replaced, and getting it wrong reinstates the latch. The
+    /// tracked quantity rises over a process's life — 190 at boot, 424 after
+    /// ~96 h on the measured box — so an all-time minimum degenerates to the
+    /// FIRST sample, which is the boot figure, which is the defect.
+    ///
+    /// Asserted on a local [`AtRestWindow`], never the process-global one, so
+    /// this test shares no mutable state with any other test in this binary.
+    #[test]
+    fn the_at_rest_window_can_rise_and_no_single_sample_can_pin_it() {
+        let mut w = AtRestWindow::default();
+        assert_eq!(w.baseline(), None, "no sample yet is UNKNOWN, not zero");
+
+        // The real trajectory: boot low, then climb as the blocking pool
+        // accumulates. An all-time minimum would answer 190 forever.
+        for at_rest in [190, 240, 300, 402] {
+            w.record(at_rest);
+        }
+        assert_eq!(
+            w.baseline(),
+            Some(190),
+            "inside the window, the floor holds"
+        );
+
+        // Age the boot samples out. THIS is the assertion an all-time minimum
+        // fails: after the window turns over, the baseline must have RISEN to
+        // the floor the process actually has.
+        for _ in 0..AT_REST_WINDOW_SAMPLES {
+            w.record(402);
+        }
+        assert_eq!(
+            w.baseline(),
+            Some(402),
+            "the baseline must rise as old samples age out, or the ladder stays \
+             pinned to the boot floor and the latch returns"
+        );
+        assert_eq!(
+            machine_thread_shift(w.baseline()),
+            251,
+            "402 - 151; the shift the 48-core box actually needs"
+        );
+
+        // A single spuriously low outlier lowers the floor — the SAFE
+        // direction, the guard gets stricter — but only until it ages out.
+        w.record(12);
+        assert_eq!(w.baseline(), Some(12));
+        for _ in 0..AT_REST_WINDOW_SAMPLES {
+            w.record(402);
+        }
+        assert_eq!(
+            w.baseline(),
+            Some(402),
+            "an outlier must age out; an all-time minimum would be pinned at 12 \
+             for the life of the process, with no recovery short of a runner \
+             restart that `runner-lifecycle` forbids"
+        );
+
+        // The window is BOUNDED — it is sampled every 30 s for the life of a
+        // process that runs for days.
+        assert_eq!(w.samples.len(), AT_REST_WINDOW_SAMPLES);
     }
 
     /// The calibration constants are the ones the shipped defaults were
@@ -2456,6 +2644,10 @@ mod tests {
         );
     }
 
+    /// THE CLAMP. No combination of the three terms may compose a ceiling the
+    /// runner is already over at rest — that is not a stricter guard, it is a
+    /// machine that can never start a session again, on eight unattended seams
+    /// with nobody to press "Start anyway".
     #[test]
     fn no_combination_of_terms_can_make_the_machine_unspawnable() {
         let ceilings = [0usize, 1, 64, 151, THREAD_CEILING_MIN, 256, 400, usize::MAX];

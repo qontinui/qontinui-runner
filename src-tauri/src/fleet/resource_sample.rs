@@ -316,8 +316,23 @@ pub(crate) struct ResourceSample {
     /// and a spawn gate come to hold two opinions — see [`Self::thread_count`].
     ///
     /// **Host lane only**, same placement argument as the two fields above: the
-    /// thread count is a property of the runner PROCESS. `None` on every other
-    /// lane, and `None` here means UNKNOWN — never "no ceiling".
+    /// thread count is a property of the runner PROCESS. On the host lane it is
+    /// set unconditionally, so a `None` HERE means the reading came from a lane
+    /// that cannot own one — never "no ceiling", and never "unlimited".
+    ///
+    /// ## Not yet persisted — the coord column is a SEQUENCED follow-up
+    ///
+    /// `coord.device_resource_samples` carries `thread_count` and
+    /// `active_terminal_sessions` but no ceiling columns yet, and alembic in
+    /// qontinui-web is the sole author of `coord.*` schema. Until that revision
+    /// lands, coord's ingest captures both keys into
+    /// `ResourceSampleItem::unknown_fields` — CAPTURED, not rejected: that
+    /// struct deliberately does not carry `deny_unknown_fields`, precisely so a
+    /// forward-compatible publisher addition cannot 422 a whole best-effort
+    /// push. So publishing them now is safe and lossless on the wire, but a
+    /// consumer cannot READ them until the migration lands. The doc on
+    /// [`Self::thread_count`] tells a reader not to hardcode 256/400; this
+    /// field is how it will eventually know what to use instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) thread_warn_ceiling: Option<i32>,
     /// The critical ceiling [`Self::thread_count`] is actually judged against
@@ -2355,11 +2370,18 @@ MemAvailable:   15335424 kB
         let s = ResourceSample::empty(Lane::Host, None);
         let v = serde_json::to_value(&s).expect("serializes");
         let obj = v.as_object().expect("object");
-        for key in ["thread_count", "active_terminal_sessions"] {
+        for key in [
+            "thread_count",
+            "active_terminal_sessions",
+            "thread_warn_ceiling",
+            "thread_critical_ceiling",
+        ] {
             assert!(
                 !obj.contains_key(key),
                 "{key} must be absent when unmeasured — a 0 here reads as a \
-                 perfectly idle runner on the axis built to catch a wedged one"
+                 perfectly idle runner on the axis built to catch a wedged one, \
+                 and an absent CEILING must read as UNKNOWN rather than as \
+                 `no ceiling`"
             );
         }
     }
@@ -2379,6 +2401,10 @@ MemAvailable:   15335424 kB
         assert_eq!(wsl.lane, "wsl");
         assert_eq!(wsl.thread_count, None);
         assert_eq!(wsl.active_terminal_sessions, None);
+        // The ceilings describe the thread count of THIS process, so they are
+        // as host-lane-only as the reading they grade.
+        assert_eq!(wsl.thread_warn_ceiling, None);
+        assert_eq!(wsl.thread_critical_ceiling, None);
 
         let host = collect_host_lane();
         assert_eq!(host.lane, "host");
@@ -2393,6 +2419,21 @@ MemAvailable:   15335424 kB
         assert!(
             host.thread_count.is_some_and(|n| n > 0),
             "the host lane must carry a live process thread count"
+        );
+        // The ceilings the reading is judged against must actually SHIP beside
+        // it, or a consumer is back to hardcoding 256/400 — the drift
+        // `ResourceSample::thread_count`'s doc now warns about. Asserted on
+        // presence and on the ladder invariant, not on exact values: the shift
+        // is a property of the machine running the test.
+        let (warn, crit) = (
+            host.thread_warn_ceiling
+                .expect("host lane publishes a warn ceiling"),
+            host.thread_critical_ceiling
+                .expect("host lane publishes a critical ceiling"),
+        );
+        assert!(
+            warn > 0 && crit >= warn,
+            "the published ladder must be ordered and positive, got {warn}/{crit}"
         );
         // The session count forwards the accessor verbatim, including its
         // `None`. Under `cargo test` there is no Tauri runtime and no managed
@@ -2658,10 +2699,14 @@ MemAvailable:   15335424 kB
     /// The `usize -> i32` narrowing saturates rather than wrapping.
     ///
     /// A wrapped count is worse than no count: on a 64-bit host a thread figure
-    /// past `i32::MAX` would land NEGATIVE, and coord grades this column
-    /// against 256/400 — a negative reading grades `ok` on a box that just
-    /// exhausted its thread table. The value is absurd in practice, which is
-    /// exactly why nothing else would catch it.
+    /// past `i32::MAX` would land NEGATIVE, and a negative reading grades `ok`
+    /// against any ceiling at all — on a box that just exhausted its thread
+    /// table. (The ceilings it is graded against are no longer the constants
+    /// 256/400; they travel with the reading as
+    /// [`ResourceSample::thread_warn_ceiling`] and
+    /// [`ResourceSample::thread_critical_ceiling`]. The narrowing hazard is the
+    /// same either way.) The value is absurd in practice, which is exactly why
+    /// nothing else would catch it.
     #[test]
     fn the_usize_to_i32_narrowing_saturates_rather_than_wrapping() {
         let narrow = |n: usize| n.min(i32::MAX as usize) as i32;
@@ -2682,8 +2727,8 @@ MemAvailable:   15335424 kB
             body.matches("as i32").count(),
             body.matches("min(i32::MAX").count(),
             "every `as i32` in the host lane must be preceded by its clamp — a \
-             bare narrowing is how a count becomes a negative, and coord grades \
-             `thread_count` against 256/400, where a negative reads `ok`"
+             bare narrowing is how a count becomes a negative, and a negative \
+             reads `ok` against every ceiling this sample can carry"
         );
     }
 
