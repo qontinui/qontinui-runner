@@ -375,6 +375,62 @@ mod tests {
             .collect()
     }
 
+    /// Every `static` declaration in `src`, as its line with the leading
+    /// visibility stripped — `pub static`, `pub(crate) static`,
+    /// `pub(super) static`, `pub(in path) static` all read as `static …`, so a
+    /// second global reintroduced with a visibility does not slip past a
+    /// `starts_with("static ")` check (a pre-PR review found exactly that
+    /// hole). Whole-line comments are skipped, since the docs here name
+    /// `static` in prose.
+    fn declared_statics(src: &str) -> Vec<&str> {
+        src.lines()
+            .map(str::trim_start)
+            .filter(|l| !l.starts_with("//"))
+            .filter_map(|l| {
+                let rest = if let Some(after) = l.strip_prefix("pub") {
+                    // `pub`, `pub(crate)`, `pub(super)`, `pub(in a::b)`.
+                    let after = after.trim_start();
+                    let after = match after.strip_prefix('(') {
+                        Some(inner) => inner.split_once(')').map(|(_, r)| r)?,
+                        None => after,
+                    };
+                    after.trim_start()
+                } else {
+                    l
+                };
+                rest.starts_with("static ").then_some(rest)
+            })
+            .collect()
+    }
+
+    /// The mutant the visibility-stripping exists for: a second global
+    /// reintroduced as `pub static` / `pub(crate) static` / `pub(in …) static`
+    /// is SEEN, so the one-static assertion above goes red on it. A doc line
+    /// naming `static` in prose is not.
+    #[test]
+    fn a_static_behind_a_visibility_is_still_a_static() {
+        const MUTANT: &str = "\
+/// a doc that says static in prose
+static ONE: T = T::new();
+pub static SEQ: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static TWO: T = T::new();
+pub(super) static THREE: T = T::new();
+pub(in crate::x) static FOUR: T = T::new();
+fn not_a_static() {}
+// static in a comment
+";
+        assert_eq!(
+            declared_statics(MUTANT),
+            vec![
+                "static ONE: T = T::new();",
+                "static SEQ: AtomicU64 = AtomicU64::new(0);",
+                "static TWO: T = T::new();",
+                "static THREE: T = T::new();",
+                "static FOUR: T = T::new();",
+            ]
+        );
+    }
+
     /// The raw and squeezed body of the production fn whose signature line
     /// starts with `signature`. Panics — rather than returning an empty slice
     /// that would pass every negative assertion — when the signature is absent.
@@ -449,14 +505,11 @@ mod tests {
             );
         }
 
-        // ONE static. A `static SEQ` or an `OnceLock` ring reintroduced anywhere
-        // in the production half — inside a fn body included — is the second
-        // global this handle exists to prevent.
-        let statics: Vec<&str> = prod
-            .lines()
-            .map(str::trim_start)
-            .filter(|l| l.starts_with("static "))
-            .collect();
+        // ONE static. A `static SEQ` (or a `pub static SEQ` — the visibility is
+        // stripped by `declared_statics`) or an `OnceLock` ring reintroduced
+        // anywhere in the production half — inside a fn body included — is the
+        // second global this handle exists to prevent.
+        let statics = declared_statics(prod);
         assert_eq!(
             statics,
             vec!["static RING: TraceRing = TraceRing::new();"],
