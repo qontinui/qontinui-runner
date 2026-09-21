@@ -3,13 +3,9 @@
 //! Provides a session abstraction for executing multiple API requests
 //! with shared variable state. Variables extracted from one request
 //! are automatically available in subsequent requests.
-//!
-//! The session can be integrated with the StepExecutor's SharedVariableStore
-//! for proper variable chaining across workflow steps.
 
 use super::executor::ApiRequestExecutor;
 use super::types::{ApiRequestConfig, ApiRequestResult, CredentialType, CredentialValue};
-use crate::orchestrator::context_propagation::SharedVariableStore;
 use std::collections::HashMap;
 
 /// A session for executing chained API requests.
@@ -47,33 +43,6 @@ impl ApiRequestSession {
             executor,
             results: Vec::new(),
         }
-    }
-
-    /// Create a new session initialized from a SharedVariableStore.
-    ///
-    /// This imports all existing variables from the store, allowing the session
-    /// to use variables set by previous workflow steps.
-    pub fn from_shared_store(store: &SharedVariableStore) -> Self {
-        let vars = store.get_all();
-        Self::new(if vars.is_empty() { None } else { Some(vars) })
-    }
-
-    /// Sync all session variables back to a SharedVariableStore.
-    ///
-    /// Call this after executing requests to propagate extracted variables
-    /// back to the workflow's shared variable store.
-    pub fn sync_to_shared_store(&self, store: &SharedVariableStore) {
-        for (name, value) in self.get_variables() {
-            store.set(&name, value);
-        }
-    }
-
-    /// Import variables from a SharedVariableStore into this session.
-    ///
-    /// This merges the store's variables with the session's existing variables.
-    pub fn import_from_shared_store(&mut self, store: &SharedVariableStore) {
-        let vars = store.get_all();
-        self.executor.resolver().import_variables(&vars);
     }
 
     /// Execute a single API request within this session.

@@ -13,11 +13,9 @@
 
 pub mod playbook_parser;
 
-use crate::database::pg::PgDb;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
 use tracing::warn;
 
 // =============================================================================
@@ -446,24 +444,6 @@ impl SkillRegistry {
             builtin: load_builtin_skills(),
             user: Vec::new(),
         }
-    }
-
-    /// Create a registry with built-in skills + user skills loaded from PG.
-    ///
-    /// If `pg_db` is None or the query fails, only built-in skills are loaded.
-    /// Uses `Handle::current().block_on()` to call async PG methods from sync context.
-    pub fn with_pg(pg_db: Option<&Arc<PgDb>>) -> Self {
-        let mut registry = Self::new();
-        if let Some(pg) = pg_db {
-            let pg_clone = pg.clone();
-            let user_skills = tokio::runtime::Handle::current()
-                .block_on(async { pg_clone.list_user_skills().await.unwrap_or_default() });
-            if !user_skills.is_empty() {
-                tracing::debug!("Loaded {} user skills from PG", user_skills.len());
-                registry.user = user_skills;
-            }
-        }
-        registry
     }
 
     /// Register user-created skills (e.g., loaded from database).

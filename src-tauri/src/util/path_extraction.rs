@@ -575,8 +575,9 @@ fn build_system_prefix() -> String {
            plumbing; subfiles include `claude_api_warm.rs`, \
            `cache_aware_builder.rs`, `routing.rs`, `circuit_breaker.rs`, \
            `oauth/`.\n\
-         - `src-tauri/src/coordinator/` — workflow scheduler and decide loop \
-           (`act.rs`, `decide.rs`, `observe.rs`, `llm_decide.rs`).\n\
+         - `src-tauri/src/orchestration_loop/` — the Conductor: local \
+           multi-session orchestration (`conductor.rs`, `ledger.rs`, \
+           `org_chart.rs`).\n\
          - `src-tauri/src/database/pg/` — Postgres bindings, generated \
            Clorinde queries, migrations.\n\
          - `src-tauri/src/executor/` — workflow / step executor and \

@@ -27,6 +27,12 @@ import { preparePasteData } from "./preparePaste";
 import { attachBridgeInputRegistration } from "./bridgeInputRegistration";
 import { registerMountedTerminalView } from "./mountedTerminalViews";
 import { toPtySequence } from "./terminalKeySequence";
+import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
+import {
+  GET_SCROLLBACK_SCHEMA,
+  SEND_KEYS_SCHEMA,
+  TEXT_PAYLOAD_SCHEMA,
+} from "./terminalPaneActionSchemas";
 import {
   DEFAULT_SCROLLBACK_MAX_LINES,
   requireMaxLines,
@@ -469,19 +475,19 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
       // The IMPERATIVE handle, not the automation surface: every caller is
       // in-tree and `maxLines` is `number`-typed by tsc, so it needs no runtime
       // guard. It does share the default, so there is exactly one 500 to change.
+      //
+      // It reads through `scrollbackTail`, the SAME implementation the
+      // `getScrollback` custom action calls. It used to carry its own copy of
+      // the pre-iter-26 row walk, which spends the window on blank viewport
+      // padding — so a 3-line pane in a 34-row viewport answered "" here for
+      // any `maxLines` below 34 while the automation surface answered the
+      // content. Two readers of one buffer must not disagree about what "the
+      // last N lines" means (qontinui-runner#1301 found the same pair as
+      // byte-identical copies; main had since fixed only one of them).
       getScrollback: (maxLines = DEFAULT_SCROLLBACK_MAX_LINES) => {
         const backend = backendRef.current;
         if (!backend) return "";
-        const totalLines = backend.getBufferLength();
-        const startLine = Math.max(0, totalLines - maxLines);
-        const lines: string[] = [];
-        for (let i = startLine; i < totalLines; i++) {
-          const line = backend.getBufferLine(i);
-          if (line) {
-            lines.push(line);
-          }
-        }
-        return lines.join("\n");
+        return scrollbackTail(backend.getBufferLength(), (i) => backend.getBufferLine(i), maxLines);
       },
       scrollToBottom: () => {
         backendRef.current?.scrollToBottom();
@@ -1775,18 +1781,23 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
                 '(written verbatim), an array of key names (["Enter"]), or the SDK\'s ' +
                 'descriptor array ([{ key: "c", modifiers: { ctrl: true } }]). Fails ' +
                 "with TERMINAL_EXITED when the pane's process is gone.",
-              handler: async (params?: unknown) => {
-                // `toPtySequence` covers all three `keys` grammars. Before
-                // @qontinui/ui-bridge@0.24.0 (ui-bridge#165) the SDK's built-in
-                // `sendKeys` shadowed this handler, so it had never run and only
-                // ever anticipated the raw-string form — the two ARRAY forms the
-                // built-in used to serve would have been coerced by
-                // `TextEncoder.encode` and typed into the pane as the literal
-                // text "Enter" / "[object Object]", reported as success. See the
-                // header of `./terminalKeySequence.ts`.
-                const { keys } = (params || {}) as { keys?: unknown };
-                return throwIfWriteFailed(await writePtyRef.current(toPtySequence(keys)));
-              },
+              handler: guardedHandler(
+                "sendKeys",
+                SEND_KEYS_SCHEMA,
+                async (args) => {
+                  // `toPtySequence` covers all three `keys` grammars. Before
+                  // @qontinui/ui-bridge@0.24.0 (ui-bridge#165) the SDK's built-in
+                  // `sendKeys` shadowed this handler, so it had never run and only
+                  // ever anticipated the raw-string form — the two ARRAY forms the
+                  // built-in used to serve would have been coerced by
+                  // `TextEncoder.encode` and typed into the pane as the literal
+                  // text "Enter" / "[object Object]", reported as success. See the
+                  // header of `./terminalKeySequence.ts`.
+                  const { keys } = args as { keys?: unknown };
+                  return throwIfWriteFailed(await writePtyRef.current(toPtySequence(keys)));
+                },
+                { valuesCheckedBy: "handler" },
+              ),
             },
             writeToTerminal: {
               /**
@@ -1814,19 +1825,24 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
                 "Write text directly to the PTY (no keyboard events). Fails with " +
                 "WRITE_TEXT_INVALID when `text` is not a string, and with TERMINAL_EXITED " +
                 "when the pane's process is gone.",
-              handler: async (params?: unknown) => {
-                // TYPE-checked, not truthiness-checked (iter 24, item 2). The
-                // old `if (!text)` was a `string` ASSERTION: a non-string `text`
-                // sailed past it into `TextEncoder.encode`, which coerces via
-                // `String()`, so `{text: 42}` typed `42` and `{text: {a:1}}`
-                // typed `[object Object]` into a live shell — HTTP 200 with a
-                // byte count, because the write really did reach the PTY. Same
-                // class as the `sendKeys` P0, and it rejected the perfectly
-                // valid falsy string `"0"` into the bargain.
-                const { text } = (params || {}) as { text?: unknown };
-                const value = requireTextPayload(text, WRITE_TEXT_INVALID, "writeToTerminal");
-                return throwIfWriteFailed(await writePtyRef.current(value));
-              },
+              handler: guardedHandler(
+                "writeToTerminal",
+                TEXT_PAYLOAD_SCHEMA,
+                async (args) => {
+                  // TYPE-checked, not truthiness-checked (iter 24, item 2). The
+                  // old `if (!text)` was a `string` ASSERTION: a non-string `text`
+                  // sailed past it into `TextEncoder.encode`, which coerces via
+                  // `String()`, so `{text: 42}` typed `42` and `{text: {a:1}}`
+                  // typed `[object Object]` into a live shell — HTTP 200 with a
+                  // byte count, because the write really did reach the PTY. Same
+                  // class as the `sendKeys` P0, and it rejected the perfectly
+                  // valid falsy string `"0"` into the bargain.
+                  const { text } = args as { text?: unknown };
+                  const value = requireTextPayload(text, WRITE_TEXT_INVALID, "writeToTerminal");
+                  return throwIfWriteFailed(await writePtyRef.current(value));
+                },
+                { valuesCheckedBy: "handler" },
+              ),
             },
             paste: {
               /**
@@ -1889,21 +1905,26 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
                 "Paste literal text through the Ctrl+V path (bracketed-paste aware); no " +
                 "clipboard/keyboard. Fails with PASTE_TEXT_INVALID when `text` is not a " +
                 "string. For automated tests.",
-              handler: async (params?: unknown) => {
-                // Same TYPE guard as `writeToTerminal` (iter 24, items 2 & 3).
-                // Before it, a non-string `text` reached `preparePasteData`'s
-                // `text.replace(...)` and came back as `Er.replace is not a
-                // function` — a minified internal identifier handed to an
-                // automation caller as the whole diagnosis.
-                const { text } = (params || {}) as { text?: unknown };
-                const value = requireTextPayload(text, PASTE_TEXT_INVALID, "pasteText");
-                const b = backendRef.current;
-                const prepared = preparePasteData(value, b?.bracketedPasteMode ?? false);
-                // Same envelope as sendKeys / writeToTerminal: this is an
-                // automation surface, so a write that reached no process must
-                // not answer `success: true`.
-                return throwIfWriteFailed(await writePtyRef.current(prepared));
-              },
+              handler: guardedHandler(
+                "pasteText",
+                TEXT_PAYLOAD_SCHEMA,
+                async (args) => {
+                  // Same TYPE guard as `writeToTerminal` (iter 24, items 2 & 3).
+                  // Before it, a non-string `text` reached `preparePasteData`'s
+                  // `text.replace(...)` and came back as `Er.replace is not a
+                  // function` — a minified internal identifier handed to an
+                  // automation caller as the whole diagnosis.
+                  const { text } = args as { text?: unknown };
+                  const value = requireTextPayload(text, PASTE_TEXT_INVALID, "pasteText");
+                  const b = backendRef.current;
+                  const prepared = preparePasteData(value, b?.bracketedPasteMode ?? false);
+                  // Same envelope as sendKeys / writeToTerminal: this is an
+                  // automation surface, so a write that reached no process must
+                  // not answer `success: true`.
+                  return throwIfWriteFailed(await writePtyRef.current(prepared));
+                },
+                { valuesCheckedBy: "handler" },
+              ),
             },
             getScrollback: {
               /**
@@ -1926,32 +1947,37 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
               description:
                 "Read the terminal scrollback buffer as plain text. Fails with " +
                 "SCROLLBACK_MAX_LINES_INVALID when `maxLines` is not a positive integer.",
-              handler: (params?: unknown) => {
-                // VALIDATED, not asserted (iter 25). `as { maxLines?: number }`
-                // was a cast over an HTTP body: a non-number made `startLine`
-                // NaN, `NaN < totalLines` false, and this loop returned ""
-                // — while the proxy path, whose `slice(NaN)` is `slice(0)`,
-                // returned the WHOLE buffer for the same request. An automation
-                // reading "" concludes the pane is idle. Whether a pane is
-                // mounted or proxy-backed is a property of the viewport, so the
-                // same script got both answers at different moments. See
-                // `./terminalScrollbackParams.ts`.
-                const { maxLines } = (params || {}) as { maxLines?: unknown };
-                const limit = requireMaxLines(maxLines);
-                const b = backendRef.current;
-                if (!b) return "";
-                // COUNTS CONTENT LINES, not rendered rows (iter 26). The old
-                // `startLine = total - limit` walk spent the budget on
-                // `getBufferLength()`'s blank viewport padding and then threw
-                // the blanks away with `if (line)`, so a 3-line pane in a
-                // 34-row viewport answered `""` for every `maxLines` below 34 —
-                // including `maxLines: 1` — while the proxy path, counting real
-                // ring lines, answered the last line. Same request, HTTP 200 on
-                // both, and which one you got depended on where the flow grid
-                // had scrolled. `scrollbackTail` is the SINGLE implementation
-                // both paths now call.
-                return scrollbackTail(b.getBufferLength(), (i) => b.getBufferLine(i), limit);
-              },
+              handler: guardedHandler(
+                "getScrollback",
+                GET_SCROLLBACK_SCHEMA,
+                (args) => {
+                  // VALIDATED, not asserted (iter 25). `as { maxLines?: number }`
+                  // was a cast over an HTTP body: a non-number made `startLine`
+                  // NaN, `NaN < totalLines` false, and this loop returned ""
+                  // — while the proxy path, whose `slice(NaN)` is `slice(0)`,
+                  // returned the WHOLE buffer for the same request. An automation
+                  // reading "" concludes the pane is idle. Whether a pane is
+                  // mounted or proxy-backed is a property of the viewport, so the
+                  // same script got both answers at different moments. See
+                  // `./terminalScrollbackParams.ts`.
+                  const { maxLines } = args as { maxLines?: unknown };
+                  const limit = requireMaxLines(maxLines);
+                  const b = backendRef.current;
+                  if (!b) return "";
+                  // COUNTS CONTENT LINES, not rendered rows (iter 26). The old
+                  // `startLine = total - limit` walk spent the budget on
+                  // `getBufferLength()`'s blank viewport padding and then threw
+                  // the blanks away with `if (line)`, so a 3-line pane in a
+                  // 34-row viewport answered `""` for every `maxLines` below 34 —
+                  // including `maxLines: 1` — while the proxy path, counting real
+                  // ring lines, answered the last line. Same request, HTTP 200 on
+                  // both, and which one you got depended on where the flow grid
+                  // had scrolled. `scrollbackTail` is the SINGLE implementation
+                  // both paths now call.
+                  return scrollbackTail(b.getBufferLength(), (i) => b.getBufferLine(i), limit);
+                },
+                { valuesCheckedBy: "handler" },
+              ),
             },
           },
         }),

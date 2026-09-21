@@ -125,20 +125,42 @@ function literalText(node: ts.Expression | undefined): string | null {
 }
 
 /**
- * An action element is normally an object literal written inline. Exactly one
- * site builds it with a factory (`buildCreatePlainTerminalAction`), so the walk
- * FOLLOWS the call rather than skipping it — a skipped element is an
- * unmeasured action, which is the hole this test exists to close.
+ * An action element is normally an object literal written inline. Some sites
+ * build one with a factory (`buildCreatePlainTerminalAction`), and one builds
+ * a whole `actions` LIST with a factory (`buildTerminalLaunchMenuActions`, so
+ * its handlers can be tested under the node environment), so the walk FOLLOWS
+ * the call rather than skipping it — a skipped element is an unmeasured
+ * action, which is the hole this test exists to close.
+ *
+ * `want` picks the return shape: `"object"` for a single-action factory,
+ * `"array"` for a list factory.
  */
 function resolveFactoryReturn(
   call: ts.CallExpression,
   corpus: ts.SourceFile[],
 ): ts.ObjectLiteralExpression | null {
+  return resolveFactoryReturnOf(call, corpus, "object") as ts.ObjectLiteralExpression | null;
+}
+
+function resolveListFactoryReturn(
+  call: ts.CallExpression,
+  corpus: ts.SourceFile[],
+): ts.ArrayLiteralExpression | null {
+  return resolveFactoryReturnOf(call, corpus, "array") as ts.ArrayLiteralExpression | null;
+}
+
+function resolveFactoryReturnOf(
+  call: ts.CallExpression,
+  corpus: ts.SourceFile[],
+  want: "object" | "array",
+): ts.ObjectLiteralExpression | ts.ArrayLiteralExpression | null {
+  const matches = (e: ts.Expression) =>
+    want === "object" ? ts.isObjectLiteralExpression(e) : ts.isArrayLiteralExpression(e);
   if (!ts.isIdentifier(call.expression)) return null;
   const name = call.expression.text;
 
   for (const sf of corpus) {
-    let found: ts.ObjectLiteralExpression | null = null;
+    let found: ts.ObjectLiteralExpression | ts.ArrayLiteralExpression | null = null;
     const visit = (node: ts.Node): void => {
       if (found) return;
       if (ts.isFunctionDeclaration(node) && node.name?.text === name && node.body) {
@@ -148,7 +170,8 @@ function resolveFactoryReturn(
             const expr = ts.isParenthesizedExpression(n.expression)
               ? n.expression.expression
               : n.expression;
-            if (ts.isObjectLiteralExpression(expr)) found = expr;
+            if (matches(expr))
+              found = expr as ts.ObjectLiteralExpression | ts.ArrayLiteralExpression;
           }
           ts.forEachChild(n, walkBody);
         };
@@ -183,7 +206,22 @@ function collect(): { actions: FoundAction[]; components: Set<string> } {
         const componentId = literalText(objectProperty(arg, "id")) ?? `<unreadable in ${where}>`;
         components.add(componentId);
 
-        const actionsNode = objectProperty(arg, "actions");
+        let actionsNode = objectProperty(arg, "actions");
+        if (actionsNode && ts.isCallExpression(actionsNode)) {
+          // `actions: buildX(…)` — follow it into the list the factory
+          // returns. An unresolvable one is reported as an unreadable element
+          // below, never dropped.
+          const list = resolveListFactoryReturn(actionsNode, corpus);
+          if (!list) {
+            actions.push({
+              component: componentId,
+              action: `<unreadable actions factory: ${actionsNode.getText().slice(0, 60)}>`,
+              effect: undefined,
+              where,
+            });
+          }
+          actionsNode = list ?? undefined;
+        }
         if (actionsNode && ts.isArrayLiteralExpression(actionsNode)) {
           for (const el of actionsNode.elements) {
             let literal: ts.ObjectLiteralExpression | null = null;
@@ -251,6 +289,19 @@ describe("component-action effect coverage", () => {
       .map((a) => `${a.component}.${a.action} = ${a.effect} (${a.where})`);
 
     expect(bad).toEqual([]);
+  });
+
+  it("the list factory's actions are walked, not skipped", () => {
+    // `terminal-launch-menu` registers `actions: buildTerminalLaunchMenuActions(…)`.
+    // Pin that the walk reached all four, so a factory the resolver stops
+    // following reds here rather than silently shrinking the corpus.
+    const launch = actions.filter((a) => a.component === "terminal-launch-menu");
+    expect(launch.map((a) => a.action).sort()).toEqual([
+      "create-ai-session",
+      "create-best-account",
+      "create-plain",
+      "create-with-command",
+    ]);
   });
 
   it("the factory-built action carries its effect at RUNTIME, not only in source", () => {

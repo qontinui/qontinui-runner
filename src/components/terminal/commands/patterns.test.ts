@@ -58,8 +58,16 @@ describe("matchPattern — basic resolution", () => {
   });
 });
 
-describe("matchPattern — named groups → args", () => {
-  it("extracts named groups and numeric-coerces", () => {
+describe("matchPattern — named groups → RAW evidence", () => {
+  /**
+   * The groups come back as the operator SPELLED them. Numeric coercion used
+   * to happen here, inside the resolver, which made Tier 2's output
+   * already-bound arguments rather than evidence — and that is what forced
+   * `CommandBar`'s `presetArgs ?? parseArgs(...)`. Coercion now lives in
+   * `bind.ts::coerceArgValues`, with every other tier's;
+   * `crossRoute.test.ts` is what checks the two routes still agree AFTER it.
+   */
+  it("extracts named groups verbatim, uncoerced", () => {
     register(
       action({
         id: "swap",
@@ -70,7 +78,7 @@ describe("matchPattern — named groups → args", () => {
     const m = matchPattern("swap 1 4");
     expect(m).not.toBeNull();
     expect(m?.action.id).toBe("swap");
-    expect(m?.args).toEqual({ a: 1, b: 4 });
+    expect(m?.groups).toEqual({ a: "1", b: "4" });
   });
 
   it("leaves non-numeric tokens as strings", () => {
@@ -81,10 +89,10 @@ describe("matchPattern — named groups → args", () => {
         patterns: [/^layout\s+(?<preset>single|split|six-pack)$/i],
       }),
     );
-    expect(matchPattern("layout six-pack")?.args).toEqual({ preset: "six-pack" });
+    expect(matchPattern("layout six-pack")?.groups).toEqual({ preset: "six-pack" });
   });
 
-  it("omits optional groups when absent (does not set args field to undefined)", () => {
+  it("omits optional groups when absent (does not set the field to undefined)", () => {
     register(
       action({
         id: "maximize",
@@ -93,11 +101,11 @@ describe("matchPattern — named groups → args", () => {
       }),
     );
     const bare = matchPattern("maximize");
-    expect(bare?.args).toEqual({});
-    expect("zone" in (bare?.args ?? {})).toBe(false);
+    expect(bare?.groups).toEqual({});
+    expect("zone" in (bare?.groups ?? {})).toBe(false);
 
     const withZone = matchPattern("maximize 3");
-    expect(withZone?.args).toEqual({ zone: 3 });
+    expect(withZone?.groups).toEqual({ zone: "3" });
   });
 });
 
@@ -110,7 +118,7 @@ describe("matchPattern — input normalisation", () => {
         patterns: [/^swap\s+(?<a>\d+)\s+(?<b>\d+)$/i],
       }),
     );
-    expect(matchPattern("/swap 1 2")?.args).toEqual({ a: 1, b: 2 });
+    expect(matchPattern("/swap 1 2")?.groups).toEqual({ a: "1", b: "2" });
   });
 
   it("is case-insensitive when patterns carry the `i` flag", () => {
@@ -163,9 +171,9 @@ describe("matchPattern — multi-pattern arrays", () => {
         ],
       }),
     );
-    expect(matchPattern("focus 2")?.args).toEqual({ target: 2 });
-    expect(matchPattern("focus prev")?.args).toEqual({ target: "prev" });
-    expect(matchPattern("previous session")?.args).toEqual({ target: "previous" });
+    expect(matchPattern("focus 2")?.groups).toEqual({ target: "2" });
+    expect(matchPattern("focus prev")?.groups).toEqual({ target: "prev" });
+    expect(matchPattern("previous session")?.groups).toEqual({ target: "previous" });
   });
 });
 
@@ -180,8 +188,8 @@ describe("matchPattern — free-form trailing group", () => {
         ],
       }),
     );
-    expect(matchPattern("spawn-ai 3 best fix the failing test")?.args).toEqual({
-      count: 3,
+    expect(matchPattern("spawn-ai 3 best fix the failing test")?.groups).toEqual({
+      count: "3",
       account: "best",
       context: "fix the failing test",
     });
@@ -216,9 +224,9 @@ describe("matchPattern — a DECLARED flag is syntax, not a capture group", () =
 
   it("still matches when no declared flag was typed", () => {
     register(spawnAi);
-    expect(matchPattern("/spawn-ai 1 gmail")?.args).toEqual({ count: 1, account: "gmail" });
-    expect(matchPattern("/spawn-ai 1 gmail do the thing")?.args).toEqual({
-      count: 1,
+    expect(matchPattern("/spawn-ai 1 gmail")?.groups).toEqual({ count: "1", account: "gmail" });
+    expect(matchPattern("/spawn-ai 1 gmail do the thing")?.groups).toEqual({
+      count: "1",
       account: "gmail",
       context: "do the thing",
     });
@@ -232,8 +240,8 @@ describe("matchPattern — a DECLARED flag is syntax, not a capture group", () =
   it("is per-ACTION: an UNDECLARED --flag does not disturb anyone", () => {
     register(spawnAi);
     // `--nope` is not in spawn-ai's schema, so it is ordinary prompt text.
-    expect(matchPattern("/spawn-ai 1 gmail --nope 3")?.args).toEqual({
-      count: 1,
+    expect(matchPattern("/spawn-ai 1 gmail --nope 3")?.groups).toEqual({
+      count: "1",
       account: "gmail",
       context: "--nope 3",
     });
@@ -246,6 +254,6 @@ describe("matchPattern — a DECLARED flag is syntax, not a capture group", () =
         patterns: [/^tag\s+(?<tag>\S+)$/i],
       }),
     );
-    expect(matchPattern("/tag --tenant")?.args).toEqual({ tag: "--tenant" });
+    expect(matchPattern("/tag --tenant")?.groups).toEqual({ tag: "--tenant" });
   });
 });

@@ -100,12 +100,29 @@ struct LaneTable {
     /// A single process-global counter would be a category error, and the record
     /// it fed was one: this process runs several INDEPENDENT tokio runtimes, each
     /// with its own blocking pool and its own `max_blocking_threads` ceiling.
-    /// Verified in this crate, not assumed — the app's Tauri runtime (nothing
-    /// ever calls `tauri::async_runtime::set`), the dedicated multi-thread
-    /// `fleet-pub-rt` built in `main.rs` for the tree publisher / census /
-    /// reclaim callers, the `fleet-heartbeat` current-thread runtime, and a
-    /// further set of short-lived `new_current_thread` runtimes (`cognito`,
-    /// `embedded_pg`, `env_agent`, `pair`, `agent_commands`, the CLI binaries).
+    /// Verified in this crate, not assumed — the app's Tauri runtime (which
+    /// `main.rs` `install_app_runtime` now BUILDS and installs through
+    /// `tauri::async_runtime::set`, pinned and named `app-rt`; before that
+    /// change nothing called `set` and Tauri built its own, unnamed and one
+    /// worker per CPU), the dedicated multi-thread `fleet-pub-rt` built in
+    /// `main.rs` for the tree publisher / census / reclaim callers, the
+    /// `fleet-hb-rt` current-thread runtime, and a further set of short-lived
+    /// `new_current_thread` runtimes — `cognito-rt`, `pg-boot-rt`,
+    /// `pg-stop-rt`, `online-learn-rt`, `envagent-rt`, `pair-rt`,
+    /// `agentcmd-rt`, `skillfetch-rt`, `aisess-stop-rt`, `aisess-dereg-rt`,
+    /// the CLI binaries. **Every one of those names is now set explicitly**,
+    /// which is what makes the keys below discriminating: a lane still keyed
+    /// on tokio's default means a runtime this repo did not build.
+    ///
+    /// That last sentence is a COMPLETENESS claim, so it is only as true as
+    /// the enumeration above — and the enumeration is maintained by hand. The
+    /// first draft of this doc made the claim while three shipped runtimes
+    /// (`agent_skills::fetch_skills_blocking` and two in `mcp::ai_session`)
+    /// were still unnamed, which would have had an operator confidently
+    /// attributing first-party blocking bodies to a dependency. Re-derive it
+    /// rather than trusting it:
+    /// `grep -rn 'runtime::Builder::new_\(current_thread\|multi_thread\)' src-tauri/src`
+    /// and check each shipped hit sets `.thread_name`.
     /// Summing their in-flight bodies into one number and printing it over ONE
     /// runtime's 512-slot ceiling produces readings that are not merely coarse
     /// but false in both directions: a genuinely saturated Tauri pool reads as
@@ -601,7 +618,12 @@ pub struct TrackedBlockingBodies {
     /// tokio publishes no stable runtime identity without `tokio_unstable`.
     /// Tokio names a runtime's worker AND blocking threads from the same
     /// `thread_name`, so `fleet-pub-rt` is the dedicated publisher runtime and
-    /// `tokio-runtime-worker` is a runtime that did not set one. Threads with
+    /// `tokio-rt-worker` — tokio 1.50's default, NOT the `tokio-runtime-worker`
+    /// this doc named before it was measured — is a runtime that did not set
+    /// one. Since every runtime this crate builds now sets a name, a
+    /// `tokio-rt-worker` lane is a DEPENDENCY's runtime — as strong as the
+    /// hand-maintained enumeration on [`LaneTable`], which says how to
+    /// re-derive it rather than asking to be believed. Threads with
     /// no name appear as `<unnamed-thread>`; past [`MAX_BLOCKING_LANES`]
     /// distinct names the rest aggregate into `<other-threads>` rather than
     /// being lost.
@@ -1810,7 +1832,11 @@ mod tests {
     ///
     /// Neuter check: move `spawn_blocking_in_lane`'s `BlockingSlot::enter_lane_in`
     /// so the lane is resolved INSIDE the closure, and this fails with the body
-    /// charged to `tokio-runtime-worker`.
+    /// charged to `tokio-rt-worker` — tokio 1.50's default thread name, the one
+    /// this module's [`TrackedBlockingBodies`] doc names. (The `by_spawning_thread`
+    /// fixtures below still spell the older `tokio-runtime-worker`; they are
+    /// arbitrary map KEYS chosen to exercise the serializer, not readings, so
+    /// they are left alone rather than churned.)
     fn assert_a_body_is_charged_to_its_spawner(table: &'static LaneTable) {
         const SPAWNER: &str = "lane-fixture-spawner";
         let observed = std::thread::Builder::new()

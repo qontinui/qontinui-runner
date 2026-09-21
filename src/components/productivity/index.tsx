@@ -1,136 +1,55 @@
 /**
  * Productivity Page
  *
- * Top-level entry for the "Productivity" tab. Hosts a tiny local sub-view
- * router (`view: plans | coordinator | knowledge`) — only the `plans` view
- * has real content in Phase 1. The other two are placeholders that a later
- * phase will replace with the real CoordinatorDashboard / KnowledgeBrowser.
+ * Top-level entry for the "Productivity" tab. Interim shape after Phase 4 of
+ * plan `2026-09-12-consolidate-local-orchestration-onto-conductor` deleted
+ * the plan/task board and the coordinator dashboard: one heading and three
+ * panels, stacked and scrollable.
  *
- * Sub-view requests come from two places:
- *   - the local top-bar tabs (clicking one of the three view buttons)
- *   - the `productivity-set-view` window event dispatched by useAppNavigation
- *     when an alias like `productivity-coordinator` is requested via
- *     UI Bridge / pageNavigate.
+ *   - Knowledge — the browser rendered inline (`src/components/knowledge/`).
+ *     The Ctrl+Shift+E modal is mounted once at the App level
+ *     (`GlobalKnowledgeBrowser` in `App.tsx`), so this page mounts no second
+ *     copy.
+ *   - File activity — live dirty-worktree heatmap, held locks, hot files.
+ *   - Overlapping intents — coord's L2 view of agent pairs whose declared
+ *     paths intersect; UNKNOWN when the read fails.
+ *
+ * There is no sub-view router: every panel is on screen at once, so nothing
+ * needs to be navigated to and no page-mounted handshake exists.
  */
 
-import { useEffect, useState } from "react";
-import { ClipboardList, Bot, BookOpen } from "lucide-react";
-import type { LucideIcon } from "lucide-react";
-import { PlanTaskBoard } from "./PlanTaskBoard";
 import { KnowledgeBrowser } from "@/components/knowledge/KnowledgeBrowser";
-import { CoordinatorDashboard } from "./CoordinatorDashboard";
-import type { ProductivityView } from "./types";
-
-interface ViewTab {
-  id: ProductivityView;
-  label: string;
-  icon: LucideIcon;
-  uibridgeId: string;
-}
-
-const VIEW_TABS: ViewTab[] = [
-  {
-    id: "plans",
-    label: "Plans & Tasks",
-    icon: ClipboardList,
-    uibridgeId: "productivity.view-tab-plans",
-  },
-  {
-    id: "coordinator",
-    label: "Coordinator",
-    icon: Bot,
-    uibridgeId: "productivity.view-tab-coordinator",
-  },
-  {
-    id: "knowledge",
-    label: "Knowledge",
-    icon: BookOpen,
-    uibridgeId: "productivity.view-tab-knowledge",
-  },
-];
+import { FileActivityPanel } from "./FileActivityPanel";
+import { OverlappingIntentsPanel } from "./OverlappingIntentsPanel";
 
 export function ProductivityPage() {
-  const [view, setView] = useState<ProductivityView>("plans");
-  const [knowledgeModalOpen, setKnowledgeModalOpen] = useState(false);
-
-  // Listen for the "productivity-set-view" event dispatched by
-  // useAppNavigation when an alias like `productivity-coordinator` is
-  // requested via UI Bridge / pageNavigate.
-  //
-  // Also publish a mount-promise (window flag + one-shot event) so
-  // `dispatchProductivitySubView` in useAppNavigation can await mount
-  // before firing the event. Without this, dispatching synchronously
-  // after a tab switch races the just-mounted listener and the event
-  // is dropped, leaving the page on its default "plans" view.
-  useEffect(() => {
-    const handler = (e: Event) => {
-      const detail = (e as CustomEvent<{ view?: ProductivityView }>).detail;
-      if (detail?.view) {
-        setView(detail.view);
-      }
-    };
-    window.addEventListener("productivity-set-view", handler);
-    (window as unknown as Record<string, unknown>).__qontinuiProductivityReady = true;
-    window.dispatchEvent(new Event("productivity-page-mounted"));
-    return () => {
-      window.removeEventListener("productivity-set-view", handler);
-      delete (window as unknown as Record<string, unknown>).__qontinuiProductivityReady;
-    };
-  }, []);
-
   return (
     <div className="h-full flex flex-col bg-background" data-page-id="productivity">
-      {/* Top bar with sub-view tabs */}
-      <div className="flex items-center gap-1 px-3 py-2 border-b border-border bg-card/40">
-        <h1 className="text-h2 text-foreground mr-3">Productivity</h1>
-        <div className="flex items-center gap-1">
-          {VIEW_TABS.map((tab) => {
-            const Icon = tab.icon;
-            const active = view === tab.id;
-            return (
-              <button
-                key={tab.id}
-                onClick={() => setView(tab.id)}
-                data-ui-bridge-id={tab.uibridgeId}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
-                  active
-                    ? "bg-primary/15 text-primary"
-                    : "text-muted-foreground hover:text-foreground hover:bg-muted/30"
-                }`}
-                aria-pressed={active}
-              >
-                <Icon className="w-3.5 h-3.5" />
-                {tab.label}
-              </button>
-            );
-          })}
+      <div className="flex items-center px-3 py-2 border-b border-border bg-card/40">
+        <h1 className="text-h2 text-foreground">Productivity</h1>
+      </div>
+
+      <div className="flex-1 min-h-0 overflow-y-auto">
+        <div className="flex flex-col gap-4 p-4">
+          <section
+            role="region"
+            aria-labelledby="productivity-knowledge-heading"
+            className="flex flex-col rounded-lg border border-border bg-card/30 overflow-hidden"
+            data-ui-bridge-id="productivity.knowledge-section"
+          >
+            <h2 id="productivity-knowledge-heading" className="sr-only">
+              Knowledge
+            </h2>
+            <div className="h-[28rem]">
+              <KnowledgeBrowser mode="inline" />
+            </div>
+          </section>
+
+          <FileActivityPanel />
+
+          <OverlappingIntentsPanel />
         </div>
-        <button
-          onClick={() => setKnowledgeModalOpen(true)}
-          data-ui-bridge-id="productivity.open-knowledge-modal"
-          className="ml-auto flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium border border-border text-foreground hover:bg-muted/30"
-          title="Open knowledge browser (Ctrl+Shift+E)"
-        >
-          <BookOpen className="w-3.5 h-3.5" />
-          Knowledge
-        </button>
       </div>
-
-      {/* Sub-view content */}
-      <div className="flex-1 min-h-0 overflow-hidden">
-        {view === "plans" && <PlanTaskBoard />}
-        {view === "coordinator" && <CoordinatorDashboard />}
-        {view === "knowledge" && <KnowledgeBrowser mode="inline" />}
-      </div>
-
-      {/* Top-bar-button-triggered modal. Ctrl+Shift+E is mounted globally
-          at the App level so it works from any page; here the button
-          provides an in-tab trigger for users who prefer mouse. */}
-      <KnowledgeBrowser
-        mode="modal"
-        open={knowledgeModalOpen}
-        onClose={() => setKnowledgeModalOpen(false)}
-      />
     </div>
   );
 }

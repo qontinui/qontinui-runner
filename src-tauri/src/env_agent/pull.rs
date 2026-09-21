@@ -690,6 +690,13 @@ pub async fn pull_and_plan() -> Result<ApplyPlan, String> {
 pub fn pull_and_plan_blocking() -> Result<ApplyPlan, String> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
+        // Shared by all three env-agent blocking entry points on purpose:
+        // they are one subsystem, never concurrent, and each is a short-lived
+        // current-thread runtime. This is the one name in the set that is not
+        // 1:1 with a runtime — worth saying out loud, because
+        // `wedge_diagnostics::LaneTable` keys its blocking lanes off exactly
+        // this string.
+        .thread_name("envagent-rt")
         .build()
         .map_err(|e| format!("tokio runtime build failed: {e}"))?;
     rt.block_on(pull_and_plan())
