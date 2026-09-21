@@ -2241,21 +2241,103 @@ pub enum PresentedTenant {
     /// No usable credential resolved, so the request goes out
     /// UNAUTHENTICATED. On a tenant-scoped read this is the fail-closed
     /// slot MISS — never another tenant's credential.
-    Anonymous,
-    /// A credential resolved, but it carries no `tenant_id` claim (an opaque
-    /// `qontinui_runner_*` bearer, or a JWT coord minted without the claim).
+    ///
+    /// Carries WHY. [`select_device_bearer`] reaches `None` from four states
+    /// it ALREADY models as [`SlotState`], and they want four different
+    /// operator actions; a bare "no credential" forces the reader to pick
+    /// one, which is how a diagnostic ends up asserting a cause it never
+    /// measured. See [`NoCredential`].
+    Anonymous(NoCredential),
+    /// A credential resolved, but it carries no `tenant_id` claim — a JWT
+    /// coord minted without it.
+    ///
+    /// An opaque `qontinui_runner_*` bearer does NOT reach this arm, though
+    /// it is the first thing a reader expects to: this function only ever
+    /// sees tokens [`select_device_bearer`] returned, both slot readers gate
+    /// on [`slot_jwt_is_usable`], and that requires a decodable `exp`. An
+    /// opaque token is therefore [`SlotRead::PresentButDead`] — a miss —
+    /// and renders as [`PresentedTenant::Anonymous`], never as this.
     Untenanted,
     /// A credential claiming this tenant resolved.
     Tenant(Uuid),
 }
 
+/// Why [`presented_tenant`] resolved NO credential — the operator-action
+/// axis, kept out of the one-line collapse it would otherwise vanish into.
+///
+/// The four `None` paths through [`select_device_bearer`] are not one
+/// condition: an `Absent` slot was never issued (bind/mint one), a
+/// `PresentButDead` slot lapsed and the refresher re-derives it with no
+/// operator action at all, an `Unreadable` store is UNKNOWN and wants
+/// repair, and an unresolved scope on a multi-bound device never read a slot
+/// in the first place. [`SlotState`] and its [`SlotState::label`] already
+/// exist for exactly this distinction and the coord doctor already prints
+/// them; this carries the same value to a log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoCredential {
+    /// The state of the slot whose read decided the miss — T's own slot for
+    /// [`TenantScope::Owned`], the legacy `access_token` slot otherwise.
+    Slot(SlotState),
+    /// The queried tenant IS this device's default binding, so
+    /// [`select_device_bearer`] read T's own slot, missed, and fell through
+    /// to the legacy `access_token` slot — which missed too. BOTH states are
+    /// carried because either can be the one to act on, and choosing between
+    /// them here would be the same unmeasured guess this type exists to stop.
+    DefaultBindingFallback { own: SlotState, legacy: SlotState },
+    /// [`TenantScope::Unresolved`] on a device holding more than one
+    /// binding: [`select_scoped_bearer_lazy`] refuses BEFORE reading any
+    /// slot, so no slot state was measured. Not an absence — a refusal.
+    UnresolvedOnMultiBound { bindings: usize },
+}
+
+impl std::fmt::Display for NoCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NoCredential::Slot(s) => write!(f, "slot {}", s.label()),
+            NoCredential::DefaultBindingFallback { own, legacy } => write!(
+                f,
+                "slot {}, and this device's DEFAULT binding, whose legacy slot is {}",
+                own.label(),
+                legacy.label()
+            ),
+            NoCredential::UnresolvedOnMultiBound { bindings } => write!(
+                f,
+                "no slot read at all — the scope named no tenant on a device holding \
+                 {bindings} bindings, so the resolver refused rather than guess"
+            ),
+        }
+    }
+}
+
 impl std::fmt::Display for PresentedTenant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PresentedTenant::Anonymous => f.write_str("no credential (sent anonymously)"),
+            PresentedTenant::Anonymous(why) => {
+                write!(f, "no credential (sent anonymously; {why})")
+            }
             PresentedTenant::Untenanted => f.write_str("a credential with no tenant_id claim"),
             PresentedTenant::Tenant(t) => write!(f, "a credential for tenant {t}"),
         }
+    }
+}
+
+/// Classify a credential MISS, PURE over the slot states it is handed — no
+/// I/O, same shape as [`credential_state`] and [`holds_credential_for`] so a
+/// unit test can drive every combination with no store at all.
+///
+/// Mirrors [`select_device_bearer`]'s fall-through arm for arm: for the
+/// DEFAULT tenant a miss on its own slot consults the legacy slot, so both
+/// reads decided the outcome and both are reported.
+///
+/// `own == SlotState::Usable` is unreachable through [`presented_tenant`] (a
+/// usable slot yields a token, not a miss) and is rendered honestly rather
+/// than special-cased, so a future caller that reaches it gets the label and
+/// not a lie.
+pub fn no_credential_cause(own: SlotState, is_default: bool, legacy: SlotState) -> NoCredential {
+    if is_default {
+        NoCredential::DefaultBindingFallback { own, legacy }
+    } else {
+        NoCredential::Slot(own)
     }
 }
 
@@ -2267,15 +2349,37 @@ impl std::fmt::Display for PresentedTenant {
 /// dropped; only the claim is returned. That is the whole reason this lives
 /// here rather than at the call site that wants to log the mismatch.
 ///
-/// Costs a local encrypted-file read, so call it when reporting a refusal,
+/// On a MISS it pays a second, non-warning read through [`read_tenant_slot`]
+/// / [`read_legacy_slot`] to classify WHY — see [`NoCredential`]. That is the
+/// difference between a line an operator can act on and a line that asserts
+/// one of four causes at random.
+///
+/// Costs local encrypted-file reads, so call it when reporting a refusal,
 /// not on every pass of a loop.
 pub fn presented_tenant(scope: TenantScope) -> PresentedTenant {
-    match device_bearer_scoped(scope) {
-        None => PresentedTenant::Anonymous,
+    let am = AuthManager::new();
+    let default_tenant = default_binding_tenant();
+    match select_scoped_bearer_lazy(&am, scope, default_tenant, device_binding_count) {
         Some(token) => match jwt_tenant_claim(&token) {
             Some(t) => PresentedTenant::Tenant(t),
             None => PresentedTenant::Untenanted,
         },
+        None => PresentedTenant::Anonymous(match scope {
+            TenantScope::Owned(t) => no_credential_cause(
+                read_tenant_slot(&am, &t).state(),
+                default_tenant == Some(t),
+                read_legacy_slot(&am).state(),
+            ),
+            TenantScope::Device => NoCredential::Slot(read_legacy_slot(&am).state()),
+            TenantScope::Unresolved => {
+                let bindings = device_binding_count();
+                if bindings > 1 {
+                    NoCredential::UnresolvedOnMultiBound { bindings }
+                } else {
+                    NoCredential::Slot(read_legacy_slot(&am).state())
+                }
+            }
+        }),
     }
 }
 
@@ -3748,8 +3852,8 @@ mod bearer_selection_tests {
             format!("a credential for tenant {t}")
         );
         assert_eq!(
-            PresentedTenant::Anonymous.to_string(),
-            "no credential (sent anonymously)"
+            PresentedTenant::Anonymous(NoCredential::Slot(SlotState::Absent)).to_string(),
+            "no credential (sent anonymously; slot absent)"
         );
         assert_eq!(
             PresentedTenant::Untenanted.to_string(),
@@ -3757,13 +3861,98 @@ mod bearer_selection_tests {
         );
         // Whatever it renders, it must never be the token.
         for p in [
-            PresentedTenant::Anonymous,
+            PresentedTenant::Anonymous(NoCredential::Slot(SlotState::Absent)),
             PresentedTenant::Untenanted,
             PresentedTenant::Tenant(t),
         ] {
             assert!(
                 !p.to_string().contains(&jwt),
                 "a credential diagnostic must never render the token itself"
+            );
+        }
+    }
+
+    /// MUTATION PROOF for the four-cause split: a credential MISS is four
+    /// conditions with four different operator actions, and the diagnostic
+    /// must not collapse them.
+    ///
+    /// Before this, `presented_tenant` reduced the selector to
+    /// `Option<String>` and mapped `None` to one `Anonymous` rendering "no
+    /// credential (sent anonymously)" — after which the tenant-policy
+    /// report asserted the FIRST of the four ("this device holds no slot
+    /// for T; mint one"). On an EXPIRED slot that is wrong twice over: the
+    /// device does hold T's slot, and the refresher heals it with no
+    /// operator action at all.
+    ///
+    /// Collapse any two of these renderings and this test goes red.
+    #[test]
+    fn a_credential_miss_names_which_of_the_four_causes_it_was() {
+        let rendered = |c: NoCredential| PresentedTenant::Anonymous(c).to_string();
+
+        let absent = rendered(NoCredential::Slot(SlotState::Absent));
+        let dead = rendered(NoCredential::Slot(SlotState::PresentButDead));
+        let unreadable = rendered(NoCredential::Slot(SlotState::Unreadable));
+        let unresolved = rendered(NoCredential::UnresolvedOnMultiBound { bindings: 3 });
+        let fallback = rendered(NoCredential::DefaultBindingFallback {
+            own: SlotState::Absent,
+            legacy: SlotState::PresentButDead,
+        });
+
+        for (a, b) in [
+            (&absent, &dead),
+            (&absent, &unreadable),
+            (&absent, &unresolved),
+            (&absent, &fallback),
+            (&dead, &unreadable),
+            (&dead, &unresolved),
+            (&dead, &fallback),
+            (&unreadable, &unresolved),
+            (&unreadable, &fallback),
+            (&unresolved, &fallback),
+        ] {
+            assert_ne!(a, b, "two distinct causes rendered identically");
+        }
+
+        // Each carries the operator-action word its own `SlotState::label`
+        // already publishes, so a log reader and the coord doctor agree.
+        assert!(dead.contains(SlotState::PresentButDead.label()), "{dead}");
+        assert!(
+            unreadable.contains(SlotState::Unreadable.label()),
+            "{unreadable}"
+        );
+        assert!(unresolved.contains('3'), "{unresolved}");
+        assert!(
+            fallback.contains(SlotState::PresentButDead.label())
+                && fallback.contains(SlotState::Absent.label()),
+            "the default-binding fallback must report BOTH reads: {fallback}"
+        );
+    }
+
+    /// The classifier mirrors [`select_device_bearer`]'s fall-through: only
+    /// the DEFAULT tenant consults the legacy slot, so only it may report it.
+    ///
+    /// Reporting the legacy slot for a NON-default tenant would tell an
+    /// operator to fix a credential that had no bearing on the refusal — the
+    /// same class of misdirection as the pairing advice this phase removed.
+    #[test]
+    fn only_the_default_tenants_miss_reports_the_legacy_slot() {
+        for own in [
+            SlotState::Absent,
+            SlotState::PresentButDead,
+            SlotState::Unreadable,
+        ] {
+            assert_eq!(
+                no_credential_cause(own, false, SlotState::Usable),
+                NoCredential::Slot(own),
+                "a non-default tenant's miss is decided by its OWN slot alone"
+            );
+            assert_eq!(
+                no_credential_cause(own, true, SlotState::Absent),
+                NoCredential::DefaultBindingFallback {
+                    own,
+                    legacy: SlotState::Absent
+                },
+                "the default tenant falls through to the legacy slot, so both decided it"
             );
         }
     }
