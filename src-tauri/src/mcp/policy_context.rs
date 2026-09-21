@@ -91,7 +91,8 @@
 //! reason into a process-lifetime counter readable at
 //! `GET /sessions/policy-context-stats` ([`render_stats`]). It EXTENDS that
 //! event rather than adding a second one: two events per decision make a grep
-//! count answer twice.
+//! count answer twice. That counter's unit is an INJECTION, not a session —
+//! `compact` makes the two diverge, and [`PolicyRenderStats`] says how far.
 //!
 //! The reason is the FIRST unmet precondition, and the arms are deliberately
 //! not collapsed: a reason that lumps two causes together is the same blindness
@@ -577,7 +578,9 @@ pub fn render_confirmation(
     fetched_at: &str,
 ) -> String {
     let version = version_label(payload.protocol_version);
-    let short_sha: String = delivered_sha.chars().take(12).collect();
+    // The SAME prefix the render-decision log line carries, so an operator
+    // comparing a transcript against a log is comparing one string.
+    let short_sha: String = delivered_sha.chars().take(LOGGED_SHA_PREFIX).collect();
     let mut out = String::with_capacity(2 * 1024);
     out.push_str(&header(source, fetched_at));
     out.push_str("\n\n");
@@ -610,11 +613,19 @@ pub fn render_confirmation(
 /// source is not evidence of either, so it is treated like `resume`. Deliberately reads the raw value:
 /// [`normalize_source`] maps "absent" to `startup`, which is right for the
 /// header label and wrong for this decision.
+///
+/// **One gate, one implementation.** This DELEGATES to [`classify_source`],
+/// which is what the route actually calls. It used to carry its own `matches!`
+/// over the same accepted set, and after Phase 2 that copy had no production
+/// caller at all — the honesty property was enforced by `classify_source` while
+/// every doc in the module still named this function, and the only thing
+/// keeping the two agreeing was a hand-picked table in one test. A later change
+/// admitting, say, `resume` or a future `restart` to `classify_source`'s `Ok`
+/// arm would have killed the property here while this function went on
+/// "correctly" returning false and gating nothing. Delegation makes that
+/// impossible and turns the table test into a genuine pin.
 pub fn source_permits_confirmation(raw_source: Option<&str>) -> bool {
-    matches!(
-        raw_source.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("startup" | "compact")
-    )
+    classify_source(raw_source).is_ok()
 }
 
 // ===========================================================================
@@ -625,7 +636,7 @@ pub fn source_permits_confirmation(raw_source: Option<&str>) -> bool {
 /// Why one `SessionStart` got the render it got — one arm per distinguishable
 /// cause, and NEVER two causes folded into one arm.
 ///
-/// Five of the eight mean the FULL body crossed the hook boundary
+/// Six of the eight mean the FULL body crossed the hook boundary
 /// ([`Self::served_full_body`]); [`Self::Confirmed`] is the short confirmation —
 /// the denominator, without which the full-body count is a number with nothing
 /// to divide by; [`Self::PullFailed`] is neither, because that session got the
@@ -682,9 +693,8 @@ pub enum PolicyRenderReason {
     Confirmed,
     /// The coord pull failed outright, so the session got the fail-open notice
     /// ([`render_failure_notice`]) rather than either render. Counted so that
-    /// [`PolicyRenderStats::total`] equals the number of sessions this route
-    /// actually injected into — a denominator with a hole in it is not a
-    /// denominator.
+    /// [`PolicyRenderStats::injections`] equals every `SessionStart` this
+    /// route answered — a denominator with a hole in it is not a denominator.
     PullFailed,
 }
 
@@ -736,19 +746,25 @@ impl PolicyRenderReason {
         )
     }
 
-    /// Index into the counter array. Pinned to [`Self::ALL`]'s order by
-    /// construction, so a new arm cannot be added without a slot.
-    fn slot(self) -> usize {
-        match self {
-            PolicyRenderReason::SourceAbsent => 0,
-            PolicyRenderReason::SourceUnrecognized => 1,
-            PolicyRenderReason::SourceNotConfirmable => 2,
-            PolicyRenderReason::BodyUnavailable => 3,
-            PolicyRenderReason::MarkerAbsent => 4,
-            PolicyRenderReason::MarkerMismatched => 5,
-            PolicyRenderReason::Confirmed => 6,
-            PolicyRenderReason::PullFailed => 7,
-        }
+    /// Index into the counter array, DERIVED from [`Self::ALL`] rather than
+    /// hand-written beside it.
+    ///
+    /// The hand-written version claimed to be "pinned to `ALL`'s order by
+    /// construction" and was not — nothing derived it, and the compiler does
+    /// not force `ALL` to grow when an arm is added: `ALL: [Self; COUNT]` stays
+    /// well-typed as an 8-element literal, so a 9th arm compiles, passes every
+    /// test that iterates `ALL` (it never sees the new arm), and then indexes 8
+    /// into an 8-element array on the first session that hits it. A panic there
+    /// is a panic inside a FAIL-OPEN axum handler — the connection drops, the
+    /// hook gets no response, and the session lands in exactly the no-policy
+    /// state this module's header says it exists to end. Deriving the position
+    /// makes the doc claim true; [`record_render`] not indexing blindly makes
+    /// the remaining out-of-range case survivable.
+    ///
+    /// `None` means this arm is absent from `ALL` — unreachable while the two
+    /// agree, which `the_every_arm_is_listed_and_slots_are_in_range` asserts.
+    fn slot(self) -> Option<usize> {
+        Self::ALL.iter().position(|r| *r == self)
     }
 }
 
@@ -758,8 +774,12 @@ impl PolicyRenderReason {
 ///
 /// `Ok(())` means the source permits a confirmation (`startup`/`compact`);
 /// `Err(reason)` names which of the three non-confirmable shapes it was.
-/// Deliberately reads the raw value for the same reason
-/// [`source_permits_confirmation`] does.
+///
+/// **This is the ONE implementation of the honesty gate** —
+/// [`source_permits_confirmation`] delegates here, so the accepted set cannot
+/// be widened in one place and left narrow in the other. Deliberately reads the
+/// RAW value: [`normalize_source`] maps an absent source to `startup`, which is
+/// right for the header label and wrong for this decision.
 pub fn classify_source(raw_source: Option<&str>) -> Result<(), PolicyRenderReason> {
     match raw_source.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
         Some("startup" | "compact") => Ok(()),
@@ -781,9 +801,32 @@ pub const LOGGED_SHA_PREFIX: usize = 12;
 /// empty string in a log line reads as "the field is broken", not "there was
 /// no marker".
 fn short_sha(sha: Option<&str>) -> String {
-    match sha {
+    // The empty arm is the whole point of the contract: `Some("")` would
+    // otherwise render as a blank field, which reads as "this field is broken"
+    // rather than "there was no marker". A doc that states a property the
+    // function does not enforce is worth less than no doc.
+    match sha.map(str::trim).filter(|s| !s.is_empty()) {
         Some(s) => s.chars().take(LOGGED_SHA_PREFIX).collect(),
-        None => "<none>".to_string(),
+        None => ABSENT_FIELD.to_string(),
+    }
+}
+
+/// What an absent or empty optional renders as in the decision event. Never an
+/// empty field — see [`short_sha`].
+const ABSENT_FIELD: &str = "<none>";
+
+/// The raw hook `source` as it reaches the log: what the hook actually sent, or
+/// `<absent>` when it sent nothing or nothing but whitespace.
+///
+/// Distinct from [`normalize_source`]'s LABEL, which maps an absent source to
+/// `startup` and so cannot be used to tell the two apart — the exact ambiguity
+/// [`PolicyRenderReason::SourceAbsent`] exists to end. Empty is folded into
+/// absent here for the same reason `short_sha` folds it: a blank field reads as
+/// a broken one.
+fn source_for_log(raw_source: Option<&str>) -> &str {
+    match raw_source.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(_) => raw_source.unwrap_or("<absent>"),
+        None => "<absent>",
     }
 }
 
@@ -872,14 +915,60 @@ fn render_counts() -> &'static [AtomicU64; PolicyRenderReason::COUNT] {
     COUNTS.get_or_init(|| std::array::from_fn(|_| AtomicU64::new(0)))
 }
 
-/// Fold one decision into the process-lifetime tally. Called exactly once per
-/// injected session, beside the injection event.
-pub fn record_render(reason: PolicyRenderReason) {
-    render_counts()[reason.slot()].fetch_add(1, Ordering::Relaxed);
+/// Does a render made in this [`Mode`] belong in the tally?
+///
+/// ONLY [`Mode::On`]. `Off` never reaches a decision at all, and `Observe`
+/// renders the would-be payload and then injects NOTHING — counting it would
+/// make `full_body_total` a count of sessions that did not receive a body, so
+/// a runner soaked in `observe` would report thousands of full-body injections
+/// having made none.
+///
+/// This is a function rather than the placement of a statement relative to
+/// [`policy_context`]'s `observe` early-return, because that placement is
+/// load-bearing and a `return` is not a thing a test can assert about: moving
+/// `record_render` above it compiles, passes every other test, and silently
+/// inverts the counter's meaning. A predicate can be pinned; a line number
+/// cannot. See `the_tally_counts_only_the_mode_that_actually_injects`.
+pub fn should_count(mode: Mode) -> bool {
+    mode == Mode::On
 }
 
-/// A readable snapshot of the tally — the answer to "how many sessions got the
-/// full body since this runner started, and why", with no log grep.
+/// Fold one decision into the process-lifetime tally. Called exactly once per
+/// injection, gated on [`should_count`].
+pub fn record_render(reason: PolicyRenderReason) {
+    // Belt and braces with the derived `slot()`: this runs inside a FAIL-OPEN
+    // route, so an out-of-range index would turn a missing counter slot into a
+    // panicking hook and a session with no policy at all. Losing a count is a
+    // reporting gap; panicking here recreates the incident the module exists to
+    // prevent. `debug_assert` still makes the drift loud in a test build.
+    debug_assert!(
+        reason.slot().is_some(),
+        "{} is missing from PolicyRenderReason::ALL",
+        reason.as_str()
+    );
+    if let Some(slot) = reason.slot().and_then(|i| render_counts().get(i)) {
+        slot.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A readable snapshot of the tally — the answer to "how many INJECTIONS got
+/// the full body since this runner started, and why", with no log grep.
+///
+/// ⚠️ **The unit is an INJECTION, not a session, and `compact` is what makes
+/// the two diverge.** This route fires on every `SessionStart` hook, and
+/// `compact` is a CONFIRMABLE source, so one long-lived session contributes one
+/// count per compaction. A session that starts with no marker and then compacts
+/// four times with a matching one tallies `marker_absent: 1, confirmed: 4,
+/// injections: 5` — and an operator reading that as "80% confirmed, the seam is
+/// healthy" would have it exactly backwards: the true population is ONE session
+/// that got no confirmation at the only moment that mattered, its start. The
+/// `confirmed` share is inflated by precisely the longest-running sessions.
+///
+/// So read a per-SOURCE split before drawing a per-session conclusion, and
+/// treat `source_absent` / `marker_absent` as counts of STARTS gone wrong
+/// rather than as a minority of a population. A metric built to end a
+/// measurement error must not ship with one; this doc is the guard, because
+/// nothing in the numbers themselves says which unit they are in.
 ///
 /// Served at `GET /sessions/policy-context-stats`. Counts are since process
 /// start: the runner writes nothing durable here, because a per-session row
@@ -906,8 +995,11 @@ pub struct PolicyRenderStats {
     pub pull_failed: u64,
     /// The six full-body arms summed.
     pub full_body_total: u64,
-    /// Every arm summed — the number of sessions this route injected into.
-    pub total: u64,
+    /// Every arm summed — the number of INJECTIONS this route made, which is
+    /// the number of `SessionStart` hooks it answered in [`Mode::On`], NOT the
+    /// number of sessions: one session contributes one count per compaction.
+    /// See the type's own doc for why that distinction inverts a naive ratio.
+    pub injections: u64,
 }
 
 /// Snapshot [`record_render`]'s tally. Relaxed loads: the slots are counters,
@@ -915,7 +1007,13 @@ pub struct PolicyRenderStats {
 /// another is reading a live runner, which is the honest thing to show.
 pub fn render_stats() -> PolicyRenderStats {
     let c = render_counts();
-    let at = |r: PolicyRenderReason| c[r.slot()].load(Ordering::Relaxed);
+    // Same non-panicking read as `record_render`'s write: an arm absent from
+    // `ALL` reads as 0 rather than taking the stats route down with it.
+    let at = |r: PolicyRenderReason| {
+        r.slot()
+            .and_then(|i| c.get(i))
+            .map_or(0, |s| s.load(Ordering::Relaxed))
+    };
     let source_absent = at(PolicyRenderReason::SourceAbsent);
     let source_unrecognized = at(PolicyRenderReason::SourceUnrecognized);
     let source_not_confirmable = at(PolicyRenderReason::SourceNotConfirmable);
@@ -940,7 +1038,7 @@ pub fn render_stats() -> PolicyRenderStats {
         confirmed,
         pull_failed,
         full_body_total,
-        total: full_body_total + confirmed + pull_failed,
+        injections: full_body_total + confirmed + pull_failed,
     }
 }
 
@@ -1573,14 +1671,16 @@ pub async fn policy_context(
     // `startup`; `source_raw` is what the hook actually sent, and `reason`
     // separates the three non-confirmable shapes the label cannot.
     //
-    // Deliberately AFTER the `observe` early-return: observe mode injects
-    // nothing, and counting it would make `full_body_total` a count of
-    // sessions that did NOT receive a body.
-    record_render(decision.reason);
+    // The counter is gated on `should_count` rather than on sitting below the
+    // `observe` early-return, so the rule is a predicate a test can pin instead
+    // of a line position nothing checks.
+    if should_count(mode) {
+        record_render(decision.reason);
+    }
     info!(
         session = %session_key,
         source,
-        source_raw = raw_source.unwrap_or("<absent>"),
+        source_raw = source_for_log(raw_source),
         mode = mode.as_str(),
         bytes = text.len(),
         reason = decision.reason.as_str(),
@@ -2218,11 +2318,6 @@ mod tests {
                 render_for_session(&payload, Some(&sha), source, "2026-08-19T12:00:00Z");
             assert_eq!(d.reason, PolicyRenderReason::SourceAbsent, "{source:?}");
             assert_eq!(d.reason.as_str(), "source_absent");
-            assert_ne!(
-                d.reason,
-                PolicyRenderReason::SourceNotConfirmable,
-                "an absent source is a DEFECT; a resume is by design — never one label"
-            );
             assert!(d.served_full_body(), "{source:?}");
             assert!(!d.source_confirmable, "{source:?}");
             // Everything else about this session was fine — which is exactly
@@ -2500,7 +2595,12 @@ mod tests {
             "a confirmation and a failed pull carry no body and must not be counted as one"
         );
         // Slots are distinct, so no two reasons share a counter.
-        let mut slots: Vec<usize> = PolicyRenderReason::ALL.iter().map(|r| r.slot()).collect();
+        let mut slots: Vec<Option<usize>> =
+            PolicyRenderReason::ALL.iter().map(|r| r.slot()).collect();
+        assert!(
+            slots.iter().all(Option::is_some),
+            "every arm must resolve to a slot: {slots:?}"
+        );
         slots.sort_unstable();
         slots.dedup();
         assert_eq!(slots.len(), PolicyRenderReason::ALL.len());
@@ -2521,6 +2621,11 @@ mod tests {
     /// future test that records.
     #[test]
     fn the_counter_files_each_reason_separately_and_the_totals_add_up() {
+        // Serializes THIS test against a second invocation of itself (cargo
+        // re-runs are separate processes, but a future `#[test]` calling it
+        // twice is not). It does NOT exclude other tests — nothing else in this
+        // module records — which is why every assertion below is on a DELTA
+        // rather than an absolute.
         static LOCK: Mutex<()> = Mutex::new(());
         let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -2546,23 +2651,59 @@ mod tests {
         assert_eq!(after.confirmed - before.confirmed, 7);
         assert_eq!(after.pull_failed - before.pull_failed, 8);
 
-        // 1+2+3+4+5+6 full-body arms; the confirmation and the failed pull are
-        // in `total` but not in `full_body_total`.
+        // Hand-computed literals, NOT the same sum `render_stats` just made
+        // from the same locals: re-deriving `full_body_total` from the fields
+        // beside it passes on any implementation, including one that reads
+        // every slot as 0. 1+2+3+4+5+6 = 21 full-body; +7 confirmed +8 pull
+        // failed = 36 injections.
         assert_eq!(after.full_body_total - before.full_body_total, 21);
-        assert_eq!(after.total - before.total, 36);
+        assert_eq!(after.injections - before.injections, 36);
+        // `full_body_total` excludes exactly the confirmation and the failed
+        // pull — 36 - 21 == 7 + 8.
         assert_eq!(
-            after.full_body_total,
-            after.source_absent
-                + after.source_unrecognized
-                + after.source_not_confirmable
-                + after.body_unavailable
-                + after.marker_absent
-                + after.marker_mismatched
+            (after.injections - before.injections)
+                - (after.full_body_total - before.full_body_total),
+            15
         );
-        assert_eq!(
-            after.total,
-            after.full_body_total + after.confirmed + after.pull_failed
+    }
+
+    /// `should_count` is the rule that keeps the tally a count of INJECTIONS.
+    ///
+    /// Phase 2 originally expressed this as the POSITION of `record_render`
+    /// below `policy_context`'s `observe` early-return, guarded by five lines of
+    /// comment and nothing else. Moving that statement up compiled, passed every
+    /// test, and turned the counter into a tally of renders that were never
+    /// injected — a runner soaked in `observe` reporting a four-figure
+    /// `full_body_total` having delivered nothing. A predicate can be pinned.
+    #[test]
+    fn the_tally_counts_only_the_mode_that_actually_injects() {
+        assert!(should_count(Mode::On));
+        assert!(
+            !should_count(Mode::Observe),
+            "observe renders the payload and injects NOTHING — counting it makes \
+             full_body_total a count of sessions that got no body"
         );
+        assert!(!should_count(Mode::Off));
+    }
+
+    /// Every arm is reachable in the counter array, and none indexes past it.
+    ///
+    /// The slot is derived from `ALL`, so this is what makes the derivation's
+    /// promise real: a 9th arm left out of `ALL` compiles (`ALL: [Self; COUNT]`
+    /// stays a well-typed 8-element literal) and would otherwise be found only
+    /// by a panic inside the fail-open route.
+    #[test]
+    fn the_every_arm_is_listed_and_slots_are_in_range() {
+        for reason in PolicyRenderReason::ALL {
+            let slot = reason
+                .slot()
+                .unwrap_or_else(|| panic!("{} missing from ALL", reason.as_str()));
+            assert!(slot < PolicyRenderReason::COUNT, "{}", reason.as_str());
+        }
+        // And recording never panics, whatever the arm.
+        for reason in PolicyRenderReason::ALL {
+            record_render(reason);
+        }
     }
 
     /// The snapshot serializes under the exact keys the stats route publishes —
@@ -2579,7 +2720,14 @@ mod tests {
             );
         }
         assert!(obj.contains_key("full_body_total"));
-        assert!(obj.contains_key("total"));
+        assert!(
+            obj.contains_key("injections"),
+            "the unit is an injection, not a session — the key says so"
+        );
+        assert!(
+            !obj.contains_key("total"),
+            "`total` was the per-SESSION lie; it must not come back"
+        );
         assert_eq!(obj.len(), PolicyRenderReason::ALL.len() + 2);
     }
 
