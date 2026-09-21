@@ -109,9 +109,20 @@ struct LaneTable {
     /// `fleet-hb-rt` current-thread runtime, and a further set of short-lived
     /// `new_current_thread` runtimes — `cognito-rt`, `pg-boot-rt`,
     /// `pg-stop-rt`, `online-learn-rt`, `envagent-rt`, `pair-rt`,
-    /// `agentcmd-rt`, the CLI binaries. **Every one of those names is now set
-    /// explicitly**, which is what makes the keys below discriminating: a lane
-    /// still keyed on tokio's default means a runtime this repo did not build.
+    /// `agentcmd-rt`, `skillfetch-rt`, `aisess-stop-rt`, `aisess-dereg-rt`,
+    /// the CLI binaries. **Every one of those names is now set explicitly**,
+    /// which is what makes the keys below discriminating: a lane still keyed
+    /// on tokio's default means a runtime this repo did not build.
+    ///
+    /// That last sentence is a COMPLETENESS claim, so it is only as true as
+    /// the enumeration above — and the enumeration is maintained by hand. The
+    /// first draft of this doc made the claim while three shipped runtimes
+    /// (`agent_skills::fetch_skills_blocking` and two in `mcp::ai_session`)
+    /// were still unnamed, which would have had an operator confidently
+    /// attributing first-party blocking bodies to a dependency. Re-derive it
+    /// rather than trusting it:
+    /// `grep -rn 'runtime::Builder::new_\(current_thread\|multi_thread\)' src-tauri/src`
+    /// and check each shipped hit sets `.thread_name`.
     /// Summing their in-flight bodies into one number and printing it over ONE
     /// runtime's 512-slot ceiling produces readings that are not merely coarse
     /// but false in both directions: a genuinely saturated Tauri pool reads as
@@ -610,7 +621,9 @@ pub struct TrackedBlockingBodies {
     /// `tokio-rt-worker` — tokio 1.50's default, NOT the `tokio-runtime-worker`
     /// this doc named before it was measured — is a runtime that did not set
     /// one. Since every runtime this crate builds now sets a name, a
-    /// `tokio-rt-worker` lane is a DEPENDENCY's runtime. Threads with
+    /// `tokio-rt-worker` lane is a DEPENDENCY's runtime — as strong as the
+    /// hand-maintained enumeration on [`LaneTable`], which says how to
+    /// re-derive it rather than asking to be believed. Threads with
     /// no name appear as `<unnamed-thread>`; past [`MAX_BLOCKING_LANES`]
     /// distinct names the rest aggregate into `<other-threads>` rather than
     /// being lost.

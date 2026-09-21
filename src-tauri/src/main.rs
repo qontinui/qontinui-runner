@@ -1239,15 +1239,19 @@ mod headless_manifest_tests {
 // `2026-09-18-the-runner-thread-pressure-guard-is-a-latch-not-back-pressure`).
 // ---------------------------------------------------------------------------
 
-/// The application runtime, installed into Tauri's global slot at the top of
-/// [`main`] so Tauri never builds its own.
+/// The application runtime, installed into Tauri's global slot as the LAST
+/// thing [`main`] does before `run_app`, so Tauri never builds its own.
+///
+/// "Last, not first" is load-bearing and is argued at the call site: the CLI
+/// doors above it `process::exit`, so installing earlier would build a
+/// multi-worker runtime for `--capability-manifest` and then throw it away.
 ///
 /// Process-lived by construction. `tauri::async_runtime::set`'s own doc says
 /// *"you cannot drop the underlying `TokioRuntime`"*, and a `OnceLock` that
 /// lives for the program gives exactly that with no `Box::leak` and no
 /// `'static` transmute. It is filled ONLY after `set` has succeeded, so a
-/// runtime we could not install is dropped rather than left running 16 idle
-/// workers nobody can reach.
+/// runtime we could not install is dropped rather than left running
+/// [`app_runtime_worker_threads`] idle workers nobody can reach.
 static APP_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
 
 /// The cap on the application runtime's worker count.
@@ -1345,10 +1349,18 @@ fn resolve_app_runtime_workers(cpus: usize, override_raw: Option<&str>) -> usize
                 APP_RUNTIME_WORKER_THREADS_OVERRIDE_MAX
             }
             Ok(n) if n > 0 => n,
+            // A value too large for `usize` also lands here, because
+            // `parse::<usize>` reports overflow as `Err` and cannot be told
+            // apart from a malformed one by the error's kind on stable. It is
+            // called out rather than described as "not a positive integer",
+            // which it plainly is: the clamp above exists to catch a typo'd
+            // extra zero, so the typo with the MOST extra zeros must not be
+            // the one that gets the wrong explanation.
             _ => {
                 eprintln!(
-                    "app runtime: {APP_RUNTIME_WORKER_THREADS_ENV}={raw:?} is not a positive \
-                     integer — ignoring it and using {derived} workers."
+                    "app runtime: {APP_RUNTIME_WORKER_THREADS_ENV}={raw:?} is not a usable \
+                     worker count (not a positive integer, or too large to represent) — \
+                     ignoring it and using {derived} workers."
                 );
                 derived
             }
@@ -1401,12 +1413,25 @@ mod app_runtime_tests {
             resolve_app_runtime_workers(4, Some("100000")),
             APP_RUNTIME_WORKER_THREADS_OVERRIDE_MAX
         );
-        // The boundary itself is honoured verbatim — the clamp starts above it.
+        // Just above the ceiling clamps; just below is honoured verbatim.
+        assert_eq!(
+            resolve_app_runtime_workers(4, Some("1025")),
+            APP_RUNTIME_WORKER_THREADS_OVERRIDE_MAX
+        );
+        assert_eq!(resolve_app_runtime_workers(4, Some("1023")), 1023);
+
+        // The boundary VALUE is deliberately not asserted as evidence of which
+        // comparison is used, because it cannot be: honouring 1024 verbatim and
+        // clamping it both return 1024, so `>` and `>=` are indistinguishable
+        // here by return value. An assertion at 1024 would read as a boundary
+        // test and prove nothing — exactly the vacuous shape
+        // `a_useless_override_is_ignored_rather_than_honoured` below was
+        // rewritten to remove. It is asserted only as a REGRESSION on the
+        // value, with no claim about the comparison.
         assert_eq!(
             resolve_app_runtime_workers(4, Some("1024")),
             APP_RUNTIME_WORKER_THREADS_OVERRIDE_MAX
         );
-        assert_eq!(resolve_app_runtime_workers(4, Some("1023")), 1023);
     }
 
     /// A malformed or zero override is IGNORED, never honoured. A zero-worker
