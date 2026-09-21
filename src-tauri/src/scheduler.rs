@@ -590,13 +590,11 @@ mod tests {
     fn local_zone_agrees_with_chrono_local() {
         // Whatever this box's zone is, Local must produce the same instant
         // chrono::Local does for the same wall-clock slot.
-        use chrono::TimeZone;
         let from = utc("2026-06-10T00:00:00Z");
         let got = compute_next_run(&nightly(), from, ScheduleZone::Local).expect("next");
         let local = got.with_timezone(&chrono::Local);
         assert_eq!((local.format("%H:%M").to_string()), "04:20");
         assert!(got > from);
-        let _ = chrono::Local.timestamp_opt(0, 0); // keep TimeZone in scope
     }
 
     #[test]

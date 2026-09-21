@@ -7016,7 +7016,7 @@ async fn run_continuation_headless(
     let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port, None);
     // No per-spawn pin here: a gate continuation carries no account field —
     // the `pick_best_account` call above is the whole selection.
-    match spawn_claude_child(workdir, initial_prompt, None, coord_mcp, &[]).await {
+    match spawn_claude_child(workdir, initial_prompt, None, coord_mcp, &[], false).await {
         Ok((mut child, preconditions)) => {
             // The child exists and nothing will register it: give the anchor
             // back now rather than when the subprocess exits, or every later
@@ -7921,6 +7921,7 @@ async fn run_agent_subprocess(
             pinned_config_dir.as_deref(),
             coord_mcp,
             &[],
+            false,
         )
         .await
         {
@@ -8584,6 +8585,15 @@ pub(crate) async fn spawn_claude_child(
     // `--model` and `--allowedTools`, which is what makes its child a bounded
     // single-shot run whose exit is the completion signal.
     extra_args: &[String],
+    // Make the child the leader of its OWN process group (Unix; a no-op on
+    // Windows, where the caller attaches a job object after the spawn via
+    // `ChildTreeGuard::attach_armed_tokio`). A caller that will KILL the
+    // child on a deadline needs this, or the kill reaches `claude` alone and
+    // leaves its `bash`/`git`/MCP descendants running with nobody watching.
+    // The agent-runtime callers pass `false`: their children are never killed
+    // on a timer and a separate group would take them out of the runner's own
+    // signal delivery.
+    own_process_group: bool,
 ) -> anyhow::Result<(Child, SpawnPreconditions)> {
     let bin = claude_bin_path();
 
@@ -8618,6 +8628,9 @@ pub(crate) async fn spawn_claude_child(
     );
 
     let mut cmd = crate::process_helpers::tokio_no_window(&bin);
+    if own_process_group {
+        crate::process_helpers::ChildTreeGuard::arm_tokio(&mut cmd);
+    }
     cmd.args(extra_args)
         .current_dir(workdir)
         .stdin(Stdio::piped())

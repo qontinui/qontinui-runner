@@ -172,7 +172,11 @@ impl SchedulerService {
     /// The zone every cron expression is evaluated in — `settings.timezone`,
     /// `None` meaning the device's local zone (Phase 5a of plan
     /// `2026-09-13-nightly-return-to-main-sweep`). Read per call rather than
-    /// cached so an operator's settings write takes effect on the next tick.
+    /// cached, so every recompute sees the current setting; a settings write
+    /// that CHANGES the zone also recomputes every stored `next_run` on the
+    /// spot (`mcp::scheduler::update_scheduler_settings`), because the tick
+    /// fires off the stored instant and would otherwise honour the old zone
+    /// once more.
     /// A settings read failure is logged and falls back to local time: the
     /// only alternative is computing no next-run at all, which would silently
     /// stall every task.

@@ -43,16 +43,33 @@
 //! session has no exit: it idles at its prompt after the work, so "the job
 //! finished" is unobservable without an idle heuristic, `--max-turns` is a
 //! print-mode flag the interactive CLI ignores, and the terminal seam needs a
-//! Tauri webview, which is exactly what a headless Linux runner lacks (gate
-//! `c59bd18e` failed there with "no Tauri AppHandle"). A scheduled job is
+//! Tauri webview, which is exactly what a headless Linux runner lacks — the
+//! plan's Linux Phase-7 continuation, gate `c59bd18e`, recorded
+//! `consumed_outcome: "spawn_failed: no Tauri AppHandle (runner has no webview
+//! runtime) — cannot open a visible terminal"` at 2026-09-14T11:13Z
+//! (`coord_gate_list`, work unit `2026-09-13-nightly-return-to-main-sweep`). A
+//! scheduled job is
 //! unattended by definition — nobody is at the keyboard to answer an
 //! `AskUserQuestion` — so the interactive property bought nothing and cost the
 //! completion signal. The headless child is the shape whose end is its exit.
 //!
 //! The child's stdout/stderr are pumped to `~/.qontinui/scheduler-runs/<execution>.log`
 //! so a night's transcript survives the process.
+//!
+//! ## The child's tree, and the runner's own end
+//!
+//! The child is the leader of its own process group (a job object on Windows),
+//! so the timeout kill reaches the `bash` / `git` / MCP descendants a
+//! `/return-to-main` session is mid-way through, not `claude` alone; on a clean
+//! exit the group is released rather than reaped, matching
+//! [`crate::process_helpers::run_with_timeout`]. What this path does NOT do is
+//! watch the scheduler's `stop_signal` or the runtime's shutdown: a scheduled
+//! child outlives a runner that exits mid-run, and its history row then stays
+//! `running` until the next runner start's reconciler looks at it. That is the
+//! same posture every other `tokio::spawn`ed scheduler task has today
+//! (`stop_scheduler_service` has no caller), stated here rather than implied.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -274,9 +291,11 @@ pub(crate) async fn launch(
     );
 
     let (mut child, _preconditions) =
-        crate::agent_runtime::spawn_claude_child(&workdir_s, &prompt, None, coord_mcp, &args)
+        crate::agent_runtime::spawn_claude_child(&workdir_s, &prompt, None, coord_mcp, &args, true)
             .await
             .map_err(|e| format!("spawn scheduled session: {e:#}"))?;
+    // The whole tree, addressable by one kill (see the module doc).
+    let tree = crate::process_helpers::ChildTreeGuard::attach_armed_tokio(&child);
 
     let pid = child.id();
     if let Some(p) = pid {
@@ -305,13 +324,22 @@ pub(crate) async fn launch(
         let pump = tokio::spawn(pump_to_log(stdout, stderr, pump_log));
         let waited = tokio::time::timeout(timeout, child.wait()).await;
         let (status, timed_out) = match waited {
-            Ok(Ok(st)) => (Ok(st.code()), false),
-            Ok(Err(e)) => (Err(e.to_string()), false),
+            Ok(Ok(st)) => {
+                // Clean end: release the group, do not reap what it left.
+                tree.disarm();
+                (Ok(st.code()), false)
+            }
+            Ok(Err(e)) => {
+                tree.disarm();
+                (Err(e.to_string()), false)
+            }
             Err(_elapsed) => {
                 warn!(
-                    "scheduler: RemoteAgent task '{task_name}' hit its {}s timeout — killing pid={pid:?}",
+                    "scheduler: RemoteAgent task '{task_name}' hit its {}s timeout — killing pid={pid:?} and its process tree",
                     timeout.as_secs()
                 );
+                // Drop = kill the whole group / job; then reap the leader.
+                drop(tree);
                 let _ = child.kill().await;
                 (Ok(None), true)
             }
@@ -397,11 +425,6 @@ async fn pump_to_log(
         let _ = f.flush().await;
     }
 }
-
-/// Keep `Path` in scope for the doc links above without an unused-import lint
-/// when the module is compiled without tests.
-#[allow(dead_code)]
-fn _path_marker(_: &Path) {}
 
 #[cfg(test)]
 mod tests {
