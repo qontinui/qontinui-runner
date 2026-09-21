@@ -28,6 +28,8 @@ import {
   isRustTestJob,
   tallyFailingTests,
   evaluateProceedCriterion,
+  lastBinaryHasSummary,
+  redactSecrets,
 } from "../ci-flake-analyze.mjs";
 
 // ---------------------------------------------------------------------------
@@ -584,3 +586,44 @@ test("unparsed buckets downgrade a negative to ambiguous, never to a clean NOT M
   assert.equal(r.ambiguous, true);
   assert.equal(r.verdict, "MET-AMBIGUOUSLY (not met over what could be read)");
 });
+
+// ---------------------------------------------------------------------------
+// lastBinaryHasSummary — a run that died mid-way ends without `test result:`
+// ---------------------------------------------------------------------------
+
+test("lastBinaryHasSummary: true only when the LAST announced binary printed its summary line", () => {
+  const L = (t) => t.split("\n").map(normalizeLogLine);
+  assert.equal(lastBinaryHasSummary(L("running 1 test\ntest a ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s")), true);
+  assert.equal(lastBinaryHasSummary(L("running 2 tests\ntest a ... FAILED\ntest b ... ok")), false, "failures printed, no summary: died mid-way");
+  assert.equal(lastBinaryHasSummary(L("")), false);
+  // Two binaries: the first complete, the second cut off → false.
+  const two = [
+    "     Running `/t/deps/one-0123456789ab`",
+    "running 1 test",
+    "test a ... ok",
+    "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+    "     Running `/t/deps/two-0123456789ab`",
+    "running 3 tests",
+    "test b ... FAILED",
+  ].join("\n");
+  assert.equal(lastBinaryHasSummary(L(two)), false);
+  // …and true once the second prints its own.
+  assert.equal(lastBinaryHasSummary(L(two + "\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s")), true);
+  // With GitHub timestamps and ANSI, the same answer.
+  assert.equal(lastBinaryHasSummary(L("2026-09-21T12:00:00.0000000Z \u001b[0mtest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s")), true);
+});
+
+test("redactSecrets: JWTs, Bearer tokens and token/secret/password pairs are replaced; everything else is untouched; idempotent", () => {
+  const jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+  const input = `Authorization: Bearer ${jwt}; also ${jwt} raw; token=abc123 Secret=x password=hunter2 not_a_token=fine`;
+  const out = redactSecrets(input);
+  assert.doesNotMatch(out, /eyJ/);
+  assert.doesNotMatch(out, /abc123|hunter2/);
+  assert.match(out, /Bearer \[redacted\]/);
+  assert.match(out, /token=\[redacted\] Secret=\[redacted\] password=\[redacted\]/);
+  assert.match(out, /not_a_token=fine/, "a longer identifier ending in `token` is not a `token=` pair");
+  assert.equal(redactSecrets(out), out, "idempotent");
+  assert.equal(redactSecrets("assertion `left == right` failed\n  left: 2\n right: 1"), "assertion `left == right` failed\n  left: 2\n right: 1");
+  assert.equal(redactSecrets(null), "");
+});
+
