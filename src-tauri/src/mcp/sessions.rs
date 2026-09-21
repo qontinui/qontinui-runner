@@ -1019,10 +1019,18 @@ async fn policy_context(
 /// nothing saying so.
 ///
 /// One row per [`crate::mcp::policy_context::PolicyRenderReason`], plus
-/// `full_body_total` and `total`, so the ratio is computable from this one read
-/// — without grepping a transcript or a log. Counts are process-lifetime: a
-/// restart zeroes them, and the durable per-session record remains coord's
+/// `full_body_total` and `injections`, so the ratio is computable from this one
+/// read — without grepping a transcript or a log. Counts are process-lifetime:
+/// a restart zeroes them, and the durable per-session record remains coord's
 /// `session_policy_reads`, which this route deliberately does not duplicate.
+///
+/// ⚠️ **The unit is an INJECTION, not a session.** `compact` is a confirmable
+/// source and this route fires on every `SessionStart`, so one long-lived
+/// session contributes one count per compaction and the `confirmed` share is
+/// inflated by exactly the longest-running sessions. Read the per-source split
+/// before drawing a per-session conclusion — the full rationale, and the
+/// worked example that inverts a naive ratio, is on
+/// [`crate::mcp::policy_context::PolicyRenderStats`].
 async fn policy_context_stats() -> Json<crate::mcp::policy_context::PolicyRenderStats> {
     Json(crate::mcp::policy_context::render_stats())
 }
