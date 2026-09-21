@@ -126,8 +126,12 @@ pub async fn create_scheduled_task(
     }
 
     let now = chrono::Utc::now();
+    let zone = crate::scheduler::ScheduleZone::from_settings(
+        &pg.get_scheduler_settings().await.unwrap_or_default(),
+    );
     scheduled_task.next_run =
-        crate::scheduler::compute_next_run(&scheduled_task.schedule, now).map(|dt| dt.to_rfc3339());
+        crate::scheduler::compute_next_run(&scheduled_task.schedule, now, zone)
+            .map(|dt| dt.to_rfc3339());
 
     pg.insert_scheduled_task(&scheduled_task)
         .await
@@ -238,8 +242,12 @@ pub async fn update_scheduled_task(
     }
 
     let now = chrono::Utc::now();
+    let zone = crate::scheduler::ScheduleZone::from_settings(
+        &pg.get_scheduler_settings().await.unwrap_or_default(),
+    );
     scheduled_task.next_run = if scheduled_task.enabled {
-        crate::scheduler::compute_next_run(&scheduled_task.schedule, now).map(|dt| dt.to_rfc3339())
+        crate::scheduler::compute_next_run(&scheduled_task.schedule, now, zone)
+            .map(|dt| dt.to_rfc3339())
     } else {
         None
     };
@@ -367,6 +375,14 @@ pub async fn update_scheduler_settings(
         settings.default_auto_fix_on_failure = default_auto_fix;
     }
     if let Some(timezone) = request.timezone {
+        // Phase 5a: the zone is now READ (every cron site evaluates in it), so
+        // a value that does not parse is refused here rather than stored and
+        // silently ignored — `None` (local time) is always accepted.
+        if let Some(name) = timezone.as_deref() {
+            if let Err(e) = crate::scheduler::ScheduleZone::parse(name) {
+                return Err((StatusCode::BAD_REQUEST, Json(api_error(e))));
+            }
+        }
         settings.timezone = timezone;
     }
 
