@@ -44,8 +44,9 @@ gate; just list it.
   options Register / Skip), showing the derived anchor + predicate + condition.
   Under opt-in auto mode (env `QONTINUI_AUTO_GATE=1`) register without asking and
   report the gate_id.
-- **Anchor (zero user input):** `work_unit_id` (a UUID) from
-  `POST $COORD_HTTP_URL/coord/work-units/upsert` with the parent plan stem as
+- **Anchor (zero user input):** `work_unit_id` (a UUID) from the MCP tool
+  **`coord_work_unit_upsert`**, or its REST twin
+  `POST $COORD_HTTP_URL/coord/work-units/upsert`, with the parent plan stem as
   `slug` (capture the returned `work_unit_id`; or the device-authed
   `GET /coord/agent-work-units/<slug>` — the operator `GET /coord/work-units/<slug>`
   403s a device JWT);
@@ -55,7 +56,7 @@ gate; just list it.
 - **Register:** prefer MCP `coord_register_gate` (kinds: `pr_merged`,
   `deploy_healthy`, `claim_terminal`, `operator_approval`, `ci_green`,
   `ref_exists`, `metric_threshold`, `time_elapsed`, `unit_ready`,
-  `migration_at_head`, `infra_drift_clear`, `file_exists`, `sql_count`,
+  `migration_at_head`, `infra_drift_clear`, `file_exists`, `content_matches`, `sql_count`,
   `unit_status`, `gate_cleared`, `commit_live`, `runner_served_sha`; plus — **exception cases only,
   see the Continuation bullet below** — an optional typed `continuation` or legacy
   `continuation_prompt`). **HTTP fallback** when MCP is unavailable — for a
