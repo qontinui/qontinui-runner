@@ -22,7 +22,11 @@ import {
   binaryIdFromExecutablePath,
 } from "../ci-flake-analyze.mjs";
 import {
+  CLASSIFICATION_TOKEN,
+  LABEL,
   buildExecutableIndex,
+  classificationTokenFor,
+  classificationsFromReport,
   classifyFromLog,
   diffFailureSets,
   escapeAnnotationMessage,
@@ -886,4 +890,64 @@ test("parseCliArgs: defaults and the documented flags", () => {
   assert.equal(parseCliArgs(["--snapshot-dir", "/tmp/snap"]).snapshotDir, "/tmp/snap");
   assert.throws(() => parseCliArgs(["--runs", "0"]), /--runs must be a positive integer/);
   assert.throws(() => parseCliArgs(["--format", "xml"]), /--format must be pretty or json/);
+});
+
+// ---------------------------------------------------------------------------
+// The wire token (Phase 1): what the ingest carries and the escalator keys on
+// ---------------------------------------------------------------------------
+
+test("classificationTokenFor: exactly the three verdicts have a token; every non-answer is null", () => {
+  assert.equal(classificationTokenFor(LABEL.SUITE_ONLY), "suite_only");
+  assert.equal(classificationTokenFor(LABEL.SOLO_RED), "solo_red");
+  assert.equal(classificationTokenFor(LABEL.BOTH_FLAKY), "both_flaky");
+  for (const l of [LABEL.UNRESOLVED, LABEL.UNRESOLVED_BUDGET, LABEL.UNPARSED, LABEL.GREEN, "NEW", "", null, undefined]) {
+    assert.equal(classificationTokenFor(l), null, `label ${JSON.stringify(l)}`);
+  }
+  assert.deepEqual(Object.keys(CLASSIFICATION_TOKEN).sort(), [LABEL.BOTH_FLAKY, LABEL.SOLO_RED, LABEL.SUITE_ONLY].sort());
+});
+
+test("classificationsFromReport: id -> token out of a report of either mode, non-answers omitted, any shape tolerated", () => {
+  const report = {
+    header: { mode: "classify-from-log" },
+    tests: {
+      "b::x": { label: LABEL.SUITE_ONLY },
+      "b::y": { label: LABEL.SOLO_RED },
+      "b::z": { label: LABEL.BOTH_FLAKY },
+      "b::u": { label: LABEL.UNRESOLVED },
+      "b::p": { label: LABEL.UNPARSED },
+      "b::nolabel": {},
+      "b::null": null,
+    },
+  };
+  assert.deepEqual(
+    [...classificationsFromReport(report).entries()].sort(),
+    [["b::x", "suite_only"], ["b::y", "solo_red"], ["b::z", "both_flaky"]],
+  );
+  for (const bad of [null, undefined, 3, "s", [], {}, { tests: null }, { tests: [] }, { tests: "x" }]) {
+    assert.equal(classificationsFromReport(bad).size, 0, `shape ${JSON.stringify(bad)}`);
+  }
+});
+
+test("classificationsFromReport reads what classifyFromLog wrote (the two ends agree by construction)", async () => {
+  const { spawn } = stubSpawn({
+    suiteByRun: {},
+    solo: (exe, name) => (name === RING ? soloPass(exe, name) : soloFail(exe, name)),
+  });
+  const { report } = await classifyFromLog({
+    logText: CI_LOG,
+    executables: EXES,
+    soloRuns: 3,
+    spawn,
+    now: () => 0,
+  });
+  // Through JSON, as the ingest and the escalator read it off disk.
+  const byId = classificationsFromReport(JSON.parse(JSON.stringify(report)));
+  assert.deepEqual(
+    [...byId.entries()].sort(),
+    [
+      [RING_ID, "suite_only"],
+      ["qontinui_runner_lib::settings::tests::persist", "solo_red"],
+    ],
+    "the doctest's UNRESOLVED is omitted, not mapped",
+  );
 });
