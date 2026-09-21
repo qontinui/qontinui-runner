@@ -4234,14 +4234,27 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
                 // even a correctly routed reply was discarded as "malformed"
                 // and the waiter still timed out. `terminal_attached`,
                 // `terminal_buffer_response` and `refusal_frame` all set it;
-                // this reply was the only one that did not. Setting it here is
-                // idempotent if the relay also injects it.
-                if admitted.is_some() {
-                    let echo = crate::mcp::remote_terminal::remote_echo(data);
-                    if let Some(jti) = echo.get("grant_jti").filter(|v| !v.is_null()).cloned() {
-                        frame["grant_jti"] = jti;
-                    }
-                    frame["remote"] = echo;
+                // this reply was the only one that did not.
+                //
+                // TOP-LEVEL IS REACHABLE, and the evidence is in this repo
+                // rather than an assumption about the relay: `terminal_attached`
+                // puts `grant_jti` top-level and `parse_attached` requires it
+                // top-level, and that path works. Note the comment above about
+                // the relay dropping unknown TOP-LEVEL keys is about the
+                // `coordSessionId` it discusses, and is not a general rule —
+                // read against the attach precedent, not on its own.
+                if let Some(create) = admitted.as_ref() {
+                    // From the ADMITTED block, not re-derived from the wire:
+                    // `parse_remote_block` already validated and TRIMMED it,
+                    // while `remote_echo` does not trim — so re-deriving ships
+                    // a jti that disagrees with the one the grant was bound
+                    // under. It also removes a branch that could not be taken
+                    // (admission implies a non-empty jti) and whose only
+                    // failure mode, had it ever been reachable, was silently
+                    // omitting the key and reproducing the 45 s timeout this
+                    // commit closes. Same source the siblings use.
+                    frame["grant_jti"] = serde_json::json!(create.block.grant_jti);
+                    frame["remote"] = crate::mcp::remote_terminal::remote_echo(data);
                 }
                 Some(frame)
             }
@@ -4857,6 +4870,61 @@ mod tests {
     //! minutes to come online after a JWT expiry." These tests pin the
     //! shape so a tungstenite bump can't silently break it.
 
+    /// The `terminal_created` reply MUST carry the top-level keys
+    /// `parse_created` requires, or a correctly-routed frame is still
+    /// discarded as malformed and the waiter still times out for the full 45 s.
+    ///
+    /// This is the least verifiable third of the create path: the producer is
+    /// here and the consumer is `remote_terminal.rs`, with a relay in between,
+    /// and the existing `parse_created` tests all hand-build a frame that
+    /// already carries the key — so none of them can catch the producer
+    /// dropping it. This pins the PRODUCER.
+    #[test]
+    fn the_created_reply_carries_the_keys_its_parser_requires() {
+        const DISPATCHER: &str = include_str!("backend_relay.rs");
+        const CLIENT: &str = include_str!("remote_terminal.rs");
+
+        // What the parser demands, read from the parser rather than assumed.
+        let pstart = CLIENT
+            .find("fn parse_created(")
+            .expect("parse_created not found — renamed?");
+        let pbody = &CLIENT[pstart..];
+        let pbody = &pbody[..pbody.find("\nfn ").unwrap_or(pbody.len())];
+        assert!(
+            pbody.contains("get(\"grant_jti\")"),
+            "parse_created no longer reads a top-level grant_jti — if that is \
+             deliberate, this test and the producer should change together"
+        );
+
+        // The producer's reply-construction region.
+        let cstart = DISPATCHER
+            .find("\"type\": \"terminal_created\",")
+            .expect("terminal_created reply construction not found");
+        // Bounded STRUCTURALLY, by the sibling `Err` arm's own frame, not by a
+        // char count. A fixed window is a detector-reach bug waiting to happen:
+        // the first version used 1800, a later edit pushed the assignment to
+        // offset 2194, and the test then reported the production code missing
+        // a key it sets 400 characters further down — a false accusation
+        // indistinguishable from the real defect it is meant to catch.
+        let region_end = DISPATCHER[cstart..]
+            .find("\"type\": \"error\",")
+            .expect("the Err arm that bounds this region was not found");
+        let region = &DISPATCHER[cstart..cstart + region_end];
+        assert!(
+            region.contains("frame[\"grant_jti\"]"),
+            "the terminal_created reply does not set a top-level `grant_jti`. \
+             parse_created returns None without it, so the source discards the \
+             frame as malformed and waits out CREATE_TIMEOUT reporting the \
+             TARGET wedged — while the target spawned the terminal and replied."
+        );
+        // From the admitted block, not re-derived from the wire: the wire value
+        // is untrimmed and can disagree with the jti the grant was bound under.
+        assert!(
+            region.contains("create.block.grant_jti"),
+            "the jti must come from the ADMITTED block, as terminal_attached does"
+        );
+    }
+
     /// EVERY reply type `handle_inbound` can act on must pass BOTH gates on the
     /// inbound path: the admission list, and the dispatch match.
     ///
@@ -4892,8 +4960,11 @@ mod tests {
             }
             v
         };
-        // EXACT, not a floor: converting one arm to a const would silently
-        // shrink the set and take that type out of the invariant.
+        // A floor guard, deliberately not claimed as more: the extraction is
+        // textual, so a literal that survives elsewhere in the scanned window
+        // (an `unwrap_or("remote_terminal_error")`, say) keeps the count at 6
+        // even if its match arm is gone. It catches wholesale extraction
+        // failure, which is what it is for.
         assert_eq!(
             known.len(),
             6,
@@ -4901,22 +4972,32 @@ mod tests {
              type was genuinely added or removed, update this count deliberately"
         );
 
-        // Search only the REGIONS that gate the frame — never the whole file,
-        // or a prose mention (including this test's own doc comment) satisfies
-        // the check and it passes with the defect reintroduced.
+        // Search only the REGIONS that gate the frame, never the whole file:
+        // that is what stops prose OUTSIDE them — this test's own doc comment
+        // included — from satisfying the check. It asserts textual presence
+        // within a region, NOT that a match arm exists, so a quoted mention
+        // inside a region would still satisfy it. Keep mentions backticked.
         let admit_start = DISPATCHER
             .find("const REMOTE_SOURCE_ADMITTED:")
             .expect("admission list not found");
-        let admit = &DISPATCHER[admit_start..admit_start
-            + DISPATCHER[admit_start..].find("];").expect("unterminated admission list")];
+        let admit = &DISPATCHER[admit_start
+            ..admit_start
+                + DISPATCHER[admit_start..]
+                    .find("];")
+                    .expect("unterminated admission list")];
 
         let disp_start = DISPATCHER
             .find("fn handle_relay_command(")
             .expect("dispatcher not found");
         let disp_rest = &DISPATCHER[disp_start..];
+        // Anchored on the `_` ARM, not on the warn phrase: that phrase's FIRST
+        // occurrence after the fn is inside a comment ~50 lines earlier, which
+        // silently cut the scanned region short and left the arms after it
+        // outside this invariant — so a correctly-routed type appended near the
+        // end of the match would be falsely accused of not being routed.
         let disp = &disp_rest[..disp_rest
-            .find("\"Unknown relay command type\"")
-            .expect("dispatcher's unknown arm not found")];
+            .find("\n        _ => {")
+            .expect("dispatcher's `_` arm not found — was the match restructured?")];
 
         for ty in &known {
             let lit = format!("\"{ty}\"");
