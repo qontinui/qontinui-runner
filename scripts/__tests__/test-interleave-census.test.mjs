@@ -28,6 +28,9 @@ import {
   classificationTokenFor,
   classificationsFromReport,
   classifyFromLog,
+  isByDesignNonAnswer,
+  killTree,
+  nonAnswersFor,
   diffFailureSets,
   escapeAnnotationMessage,
   exactNameFor,
@@ -302,7 +305,34 @@ test("foldRunResult: a normal red run parses; an abort with no parsed failure is
   const abort = foldRunResult(LIB_EXE, result("running 3 tests\ntest a::b ... ok\n", { code: null, signal: "SIGSEGV" }));
   assert.equal(abort.outcomes, null);
   assert.match(abort.reason, /signal SIGSEGV/);
-  assert.match(abort.reason, /aborted mid-run/);
+  assert.match(abort.reason, /died mid-way/);
+
+  // A run that printed a FAILED and then died: it has "cargo test output" and a
+  // parsed failure, and until 2026-09-21 it folded as a complete red run. The
+  // tests after the abort were never judged, so it is a non-answer.
+  const partial = foldRunResult(
+    LIB_EXE,
+    result("running 3 tests\ntest a::b ... FAILED\ntest a::c ... ok\n", { code: null, signal: "SIGABRT" }),
+  );
+  assert.equal(partial.outcomes, null, "a red run with no summary line must NOT count as a complete run");
+  assert.match(partial.reason, /no test-result summary — the run died mid-way \(signal SIGABRT\)/);
+
+  // …while the same lines WITH the summary are a complete run (exit 101 is libtest's own red).
+  const complete = foldRunResult(
+    LIB_EXE,
+    result("running 2 tests\ntest a::b ... FAILED\ntest a::c ... ok\ntest result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n", { code: 101 }),
+  );
+  assert.equal(complete.reason, null);
+  assert.equal(complete.outcomes.get("qontinui_runner_lib::a::b"), "fail");
+
+  // The summary present, a non-zero non-libtest exit and no failure: still the
+  // original "aborted" arm (a process that failed AFTER judging everything green).
+  const weird = foldRunResult(
+    LIB_EXE,
+    result("running 1 test\ntest a::b ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n", { code: 3 }),
+  );
+  assert.equal(weird.outcomes, null);
+  assert.match(weird.reason, /exit 3.*aborted mid-run/);
 
   const timeout = foldRunResult(LIB_EXE, result("", { code: null, timedOut: true }));
   assert.equal(timeout.outcomes, null);
@@ -353,17 +383,81 @@ test("labelFor: every reason names the counts it was derived from", () => {
   assert.match(u.reason, /2 of 3 solo re-run\(s\) produced no recognisable libtest output/);
 });
 
+const DOCTEST_REASON = "doctest — rustdoc compiles it per run; `cargo test --no-run` builds no executable for `Doc-tests x`";
+const NO_PREFIX_REASON = "id carries no `<binary>::` prefix (the run's announcement line was missing), so no executable can be named for it";
+const RESOLUTION_FAILED_REASON = "no built test executable normalises to `zzz` (resolution failed)";
+
 test("exitCodeFor: 0 no reds, 1 any SUITE-ONLY, 2 unparsed (precedence)", () => {
   const rep = (labels, unparsed = []) => ({
     header: { unparsed },
-    tests: Object.fromEntries(labels.map((l, i) => [`t${i}`, { label: l }])),
+    tests: Object.fromEntries(labels.map((l, i) => [`t${i}`, typeof l === "string" ? { label: l } : l])),
   });
   assert.equal(exitCodeFor(rep([])), 0);
-  assert.equal(exitCodeFor(rep(["SOLO-RED", "BOTH-FLAKY", "UNRESOLVED"])), 0);
+  assert.equal(
+    exitCodeFor(rep(["SOLO-RED", "BOTH-FLAKY", { label: "UNRESOLVED", reason: DOCTEST_REASON }])),
+    0,
+    "a by-design non-answer does not gate",
+  );
   assert.equal(exitCodeFor(rep(["SOLO-RED", "SUITE-ONLY"])), 1);
   assert.equal(exitCodeFor(rep(["SUITE-ONLY"], [{ run: 1, executable: LIB_EXE, reason: "x" }])), 2);
   assert.equal(exitCodeFor(rep(["UNPARSED"])), 2);
   assert.equal(exitCodeFor(rep([], [{ run: 2, executable: LIB_EXE, reason: "timed out" }])), 2);
+});
+
+test("exitCodeFor: FAIL-CLOSED on every non-answer — budget, budget_exhausted, resolution failure — and 2 beats 1", () => {
+  const rep = (tests, header = {}) => ({ header: { unparsed: [], ...header }, tests });
+  // Until 2026-09-21 all three of these were exit 0 and the nightly printed "clean".
+  assert.equal(exitCodeFor(rep({ a: { label: "UNRESOLVED (budget)", reason: "…" } })), 2, "budget");
+  assert.equal(exitCodeFor(rep({}, { budget_exhausted: true })), 2, "header.budget_exhausted with nothing labelled");
+  assert.equal(
+    exitCodeFor(rep({ a: { label: "UNRESOLVED", reason: RESOLUTION_FAILED_REASON } })),
+    2,
+    "a resolution failure is a non-answer",
+  );
+  assert.equal(
+    exitCodeFor(rep({ a: { label: "UNRESOLVED", reason: "solo re-run of `x` executed no test of that name (0 tests ran) in /e — …" } })),
+    2,
+    "an executable that ran no test of the name is a non-answer",
+  );
+  assert.equal(exitCodeFor(rep({ a: { label: "UNRESOLVED" } })), 2, "an UNRESOLVED with no reason is not assumed by-design");
+  // By-design non-answers stay 0 (or 1 beside a SUITE-ONLY).
+  assert.equal(exitCodeFor(rep({ a: { label: "UNRESOLVED", reason: NO_PREFIX_REASON } })), 0);
+  assert.equal(
+    exitCodeFor(rep({ a: { label: "UNRESOLVED", reason: DOCTEST_REASON }, b: { label: "SUITE-ONLY", reason: "…" } })),
+    1,
+  );
+  // Precedence: a non-answer beside a SUITE-ONLY is 2 — the class may be larger than what was measured.
+  assert.equal(
+    exitCodeFor(rep({ a: { label: "SUITE-ONLY", reason: "…" }, b: { label: "UNRESOLVED (budget)", reason: "…" } })),
+    2,
+  );
+  assert.equal(isByDesignNonAnswer(DOCTEST_REASON), true);
+  assert.equal(isByDesignNonAnswer(NO_PREFIX_REASON), true);
+  assert.equal(isByDesignNonAnswer(RESOLUTION_FAILED_REASON), false);
+  assert.equal(isByDesignNonAnswer(null), false);
+});
+
+test("nonAnswersFor names each class that moved the verdict to UNKNOWN, and the pretty output prints it", () => {
+  const report = {
+    header: { mode: "census", unparsed: [{ run: 1, executable: LIB_EXE, reason: "budget passed before this run" }], budget_exhausted: true, executables: [], skipped_executables: [], collisions: [], runs: 1, solo_runs: 3, hostname: "h", started_at: "s", finished_at: "f", budget_seconds: 1 },
+    tests: {
+      a: { label: "UNRESOLVED (budget)", reason: "…", suite_runs: 1, suite_failures: 1, solo_runs: 0, solo_failures: 0 },
+      b: { label: "UNRESOLVED", reason: RESOLUTION_FAILED_REASON, suite_runs: 1, suite_failures: 1, solo_runs: 0, solo_failures: 0 },
+      c: { label: "UNRESOLVED", reason: DOCTEST_REASON, suite_runs: 1, suite_failures: 1, solo_runs: 0, solo_failures: 0 },
+      d: { label: "UNPARSED", reason: "…", suite_runs: 1, suite_failures: 1, solo_runs: 1, solo_failures: 0 },
+    },
+    summary: { "SUITE-ONLY": 0, "SOLO-RED": 0, "BOTH-FLAKY": 0, UNRESOLVED: 2, "UNRESOLVED (budget)": 1, UNPARSED: 1 },
+    exit_code: 2,
+  };
+  assert.deepEqual(nonAnswersFor(report), [
+    "1 unparsed suite run(s)",
+    "1 test(s) with an unparsed solo re-run",
+    "1 test(s) never re-run — budget passed",
+    "1 test(s) whose executable could not be resolved",
+  ]);
+  const pretty = formatPretty(report);
+  assert.match(pretty, /NON-ANSWERS \(fail-closed — the verdict is UNKNOWN, not clean\): 1 unparsed suite run\(s\); .*could not be resolved/);
+  assert.match(pretty, /budget 1s — EXHAUSTED/);
 });
 
 // ---------------------------------------------------------------------------
@@ -575,7 +669,7 @@ test("runCensus: a solo re-run that runs 0 tests is UNRESOLVED (the id is not th
   const report = await runCensus({ fingerprint: FP, executables: EXES, runs: 1, soloRuns: 3, spawn, now: () => 0, hostname: "h" });
   assert.equal(report.tests[RING_ID].label, "UNRESOLVED");
   assert.match(report.tests[RING_ID].reason, /executed no test of that name/);
-  assert.equal(report.exit_code, 0);
+  assert.equal(report.exit_code, 2, "a name no executable ran is a resolution failure — a non-answer, fail-closed");
 });
 
 test("runCensus: two executables sharing one id — the re-run asks each until one runs the test", async () => {
@@ -657,6 +751,101 @@ test("runCensus: --budget-seconds — the deadline passing leaves the rest UNRES
   assert.equal(report.header.budget_exhausted, true);
   assert.equal(report.header.budget_seconds, 3);
   assert.equal(calls.filter((c) => c.args.length > 0).length, 1);
+  assert.equal(report.exit_code, 2, "a budget that cut the solo phase short is UNKNOWN, never clean");
+});
+
+test("runCensus: the deadline is checked in the SUITE loop too — a run not started by then is a non-answer, exit 2, no spawn", async () => {
+  // 3 runs × 2 executables; the clock advances 1000 ms per spawn and the
+  // budget is 2 s, so run 1 completes (2 spawns → t=2000 ≥ deadline) and every
+  // later executable is recorded, not run — and never left to hang a bound.
+  let t = 0;
+  const { spawn: inner, calls } = stubSpawn({
+    suiteByRun: { [LIB_EXE]: [GREEN_LIB(), GREEN_LIB(), GREEN_LIB()], [BIN_EXE]: [GREEN_BIN(), GREEN_BIN(), GREEN_BIN()] },
+    solo: soloPass,
+  });
+  const spawn = async (...a) => {
+    t += 1000;
+    return inner(...a);
+  };
+  const report = await runCensus({ fingerprint: FP, executables: EXES, runs: 3, soloRuns: 3, spawn, now: () => t, budgetSeconds: 2, hostname: "h" });
+  assert.equal(calls.length, 2, "only run 1's two executables were spawned");
+  assert.equal(report.header.unparsed.length, 4, "runs 2 and 3, both executables");
+  for (const u of report.header.unparsed) assert.equal(u.reason, "budget passed before this run");
+  assert.deepEqual(report.header.unparsed.map((u) => u.run), [2, 2, 3, 3]);
+  assert.equal(report.exit_code, 2);
+  assert.match(formatPretty(report), /NON-ANSWERS .*4 unparsed suite run\(s\)/);
+});
+
+test("killTree: POSIX kills the process GROUP, Windows walks the tree with taskkill, and both fall back to the child", () => {
+  const calls = [];
+  const child = { pid: 4242, kill: (sig) => { calls.push(["child.kill", sig]); return true; } };
+  assert.equal(killTree(child, { platform: "linux", kill: (pid, sig) => calls.push(["kill", pid, sig]) }), "group");
+  assert.deepEqual(calls, [["kill", -4242, "SIGKILL"]], "negative pid = the group the detached child leads");
+
+  calls.length = 0;
+  assert.equal(killTree(child, { platform: "win32", taskkill: (cmd, args) => calls.push([cmd, ...args]) }), "tree");
+  assert.deepEqual(calls, [["taskkill", "/PID", "4242", "/T", "/F"]]);
+
+  calls.length = 0;
+  const refuse = () => { throw new Error("ESRCH"); };
+  assert.equal(killTree(child, { platform: "linux", kill: refuse }), "child", "group refused → direct kill");
+  assert.deepEqual(calls, [["child.kill", "SIGKILL"]]);
+  calls.length = 0;
+  assert.equal(killTree(child, { platform: "win32", taskkill: refuse }), "child");
+  assert.deepEqual(calls, [["child.kill", "SIGKILL"]]);
+
+  assert.equal(killTree({ pid: undefined, kill: () => true }, { platform: "linux" }), "none", "no pid: nothing to kill");
+  assert.equal(killTree({ pid: 1, kill: refuse }, { platform: "linux", kill: refuse }), "none");
+});
+
+test("runCensus: a timed-out solo re-run records the executable it ran against", async () => {
+  const { spawn } = stubSpawn({
+    suiteByRun: { [LIB_EXE]: [RED_LIB()], [BIN_EXE]: [GREEN_BIN()] },
+    solo: () => result("", { code: null, timedOut: true }),
+  });
+  const report = await runCensus({ fingerprint: FP, executables: EXES, runs: 1, soloRuns: 2, spawn, now: () => 0, hostname: "h" });
+  const rec = report.tests[RING_ID];
+  assert.equal(rec.executable, LIB_EXE, "the timed-out branch must still record which executable was run");
+  assert.equal(rec.solo_failures, 2);
+  assert.equal(rec.label, "SOLO-RED");
+  // The suite run's own panic was captured first and is kept — the timeout
+  // note only fills an EMPTY sample_panic.
+  assert.match(rec.sample_panic, /panicked at/);
+});
+
+test("extractPanicText redacts secret-shaped text at capture, and the annotation carries the redacted form", () => {
+  const jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abc";
+  const out = libtestOutput([["a::b", "FAILED"]], {
+    panicFor: { "a::b": `thread 'a::b' panicked:\nAuthorization: Bearer ${jwt}\nurl=http://x/?token=s3cr3t&y=1 password=hunter2 SECRET=z` },
+  });
+  const panic = extractPanicText(out, "a::b");
+  assert.doesNotMatch(panic, /eyJ/);
+  assert.doesNotMatch(panic, /hunter2|s3cr3t/);
+  assert.match(panic, /Bearer \[redacted\]/);
+  assert.match(panic, /token=\[redacted\]/);
+  assert.match(panic, /password=\[redacted\]/);
+  assert.match(panic, /SECRET=\[redacted\]/);
+  const ann = formatAnnotation("x::a::b", { label: "SUITE-ONLY", solo_runs: 3, solo_failures: 0, reason: "r", sample_panic: `Bearer ${jwt}` });
+  assert.doesNotMatch(ann, /eyJ/);
+  assert.match(ann, /Bearer \[redacted\]/);
+});
+
+test("runCensus: a should_panic test's panic block is found under its bare name", async () => {
+  const sp = "a::boom - should panic";
+  // libtest prints the id WITH the suffix on the result line and the BARE
+  // name on the `---- <name> stdout ----` header.
+  const red = result(
+    libtestOutput([[sp, "FAILED"]], { panicFor: { [sp]: "thread 'a::boom' panicked: did not panic as expected" } }).replace(
+      `---- ${sp} stdout ----`,
+      "---- a::boom stdout ----",
+    ),
+    { code: 101 },
+  );
+  const { spawn } = stubSpawn({ suiteByRun: { [LIB_EXE]: [red], [BIN_EXE]: [GREEN_BIN()] }, solo: soloPass });
+  const report = await runCensus({ fingerprint: FP, executables: EXES, runs: 1, soloRuns: 1, spawn, now: () => 0, hostname: "h" });
+  const rec = report.tests[`qontinui_runner_lib::${sp}`];
+  assert.ok(rec, "the id keeps the suffix");
+  assert.match(rec.sample_panic ?? "", /did not panic as expected/, "the block is keyed by the bare name libtest prints");
 });
 
 test("runCensus: a doctest id is UNRESOLVED, never SOLO-RED, and is not spawned", async () => {

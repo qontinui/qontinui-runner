@@ -120,9 +120,14 @@ on:
     branches: [main]
     paths:
       - scripts/ci-flake-escalate.mjs
-      # The parser the main-red arm imports; a change to it must run these
-      # tests too, not only ci-flake-analyze's own.
+      # Every module the escalator imports; a change to any of them must run
+      # these tests too, not only that module's own. ci-flake-analyze.mjs is
+      # the parser (main-red arm) and the shared redaction; the ingest module
+      # lends `readClassification`; the census module lends `DOSSIER_SLUG`
+      # and the json shape the census arm reads.
       - scripts/ci-flake-analyze.mjs
+      - scripts/ci-test-results-ingest.mjs
+      - scripts/test-interleave-census.mjs
       - scripts/__tests__/ci-flake-escalate.test.mjs
       - .github/workflows/flake-escalation.yml
 
@@ -366,16 +371,24 @@ jobs:
       # invoked twice. Zero recovered executables is refused loudly rather
       # than measured vacuously, matching the run half. `--workspace-root
       # src-tauri` mirrors the gating step's cwd (and the classify step's).
-      # Runs: the plan's 5 (dispatch may override). Solo re-runs: 3. The bound is the
-      # script's own `--budget-seconds` (solo re-runs past it are labelled
-      # `UNRESOLVED (budget)`, a non-answer), never a step timeout. The
-      # deadline is anchored at census START, so it covers the suite runs
-      # too: 60 min leaves room for 5 runs at several minutes each on a
-      # 2-core hosted runner and still fits under the job timeout after a
-      # ~45-60 min cold build. The script's exit code is RECORDED here and
-      # applied by the last step, so
+      # Runs: the plan's 5 (dispatch may override). Solo re-runs: 3. The
+      # bound is the script's own `--budget-seconds` (a solo re-run past it
+      # is `UNRESOLVED (budget)`; a SUITE run not started by then is recorded
+      # `unparsed` "budget passed before this run" — both non-answers, both
+      # exit 2), never a step timeout. The deadline is anchored at census
+      # START and is checked before every suite run as well as every solo
+      # re-run, so a hung executable cannot carry the job past its own bound
+      # before the json exists. Sizing: a COMPLETE pass of every executable
+      # is ~5-6 min on this leg (ci.yml's run half: "20 minutes is 3.7x a
+      # complete run", measured 5m26s on run 35043646051 attempt 2), so 5
+      # runs ≈ 30 min plus the solo phase fits in 60 min with the ~45-60 min
+      # cold build under the 150-min job cap. `--run-timeout-seconds 900`
+      # bounds ONE executable at 15 min — 3x the whole suite — so five hung
+      # binaries cost 75 min at most, not the script default's 5 × 30. The
+      # script's exit code is RECORDED here and applied by the last step, so
       # the artifact upload and the escalation below run whatever it was:
-      # 0 clean, 1 ≥ 1 SUITE-ONLY, 2 something unparsed (fail-closed).
+      # 0 clean, 1 ≥ 1 SUITE-ONLY, 2 any non-answer (fail-closed: unparsed,
+      # budget passed, or an executable that could not be resolved).
       #
       # NOT run under ci.yml's `Poison ambient state`. The poison exists to
       # make an ambient READER fail on the PR that adds it — a different
@@ -413,6 +426,7 @@ jobs:
             --exe-list "$EXE_LIST" \
             --workspace-root "$GITHUB_WORKSPACE/src-tauri" \
             --budget-seconds 3600 \
+            --run-timeout-seconds 900 \
             --format pretty \
             --out "$GITHUB_WORKSPACE/census.json"
           code=$?
@@ -464,8 +478,8 @@ jobs:
         run: |
           code="${CENSUS_EXIT:-2}"
           case "$code" in
-            0) echo "::notice title=interleave-census::clean — every executable parsed and no test was SUITE-ONLY" ;;
+            0) echo "::notice title=interleave-census::clean — every executable parsed, no test was SUITE-ONLY, and no non-answers (no budget cut, nothing unresolved)" ;;
             1) echo "::error title=interleave-census::SUITE-ONLY tests are present on main — see the census artifact and the suite-only issues (dossier runner-tests-share-in-process-mutable-state)" ;;
-            *) echo "::error title=interleave-census::the census could not measure (exit ${code}: an unparsed run, or the census step did not finish) — UNKNOWN, not clean" ;;
+            *) echo "::error title=interleave-census::the census could not measure (exit ${code}: an unparsed run, the budget passing before a run or re-run, an executable that could not be resolved, or the census step did not finish) — UNKNOWN, not clean" ;;
           esac
           exit "$code"
