@@ -2230,6 +2230,55 @@ pub fn device_bearer_scoped(scope: TenantScope) -> Option<String> {
     )
 }
 
+/// The one fact about a resolved credential that a diagnostic may say out
+/// loud: which tenant it claims, or that there is no credential at all.
+///
+/// Exists so a caller diagnosing a coord `401`/`403` can name the mismatch
+/// — *"asked about T, presented a credential for X"* — without ever touching
+/// the token itself. See [`presented_tenant`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentedTenant {
+    /// No usable credential resolved, so the request goes out
+    /// UNAUTHENTICATED. On a tenant-scoped read this is the fail-closed
+    /// slot MISS — never another tenant's credential.
+    Anonymous,
+    /// A credential resolved, but it carries no `tenant_id` claim (an opaque
+    /// `qontinui_runner_*` bearer, or a JWT coord minted without the claim).
+    Untenanted,
+    /// A credential claiming this tenant resolved.
+    Tenant(Uuid),
+}
+
+impl std::fmt::Display for PresentedTenant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PresentedTenant::Anonymous => f.write_str("no credential (sent anonymously)"),
+            PresentedTenant::Untenanted => f.write_str("a credential with no tenant_id claim"),
+            PresentedTenant::Tenant(t) => write!(f, "a credential for tenant {t}"),
+        }
+    }
+}
+
+/// What [`attach_device_auth_for`] WOULD present for `scope`, reduced to
+/// [`PresentedTenant`] — a diagnostic read, not a second credential path.
+///
+/// **The token never leaves this function.** It is resolved, its `tenant_id`
+/// claim is decoded (unverified — [`jwt_tenant_claim`]), and the token is
+/// dropped; only the claim is returned. That is the whole reason this lives
+/// here rather than at the call site that wants to log the mismatch.
+///
+/// Costs a local encrypted-file read, so call it when reporting a refusal,
+/// not on every pass of a loop.
+pub fn presented_tenant(scope: TenantScope) -> PresentedTenant {
+    match device_bearer_scoped(scope) {
+        None => PresentedTenant::Anonymous,
+        Some(token) => match jwt_tenant_claim(&token) {
+            Some(t) => PresentedTenant::Tenant(t),
+            None => PresentedTenant::Untenanted,
+        },
+    }
+}
+
 /// Warn once per process that an unresolved-tenant write degraded to
 /// unauthenticated on a multi-bound device.
 ///
@@ -3619,6 +3668,104 @@ mod bearer_selection_tests {
         assert_eq!(TenantScope::Owned(t).declared_tenant(), Some(t));
         assert_eq!(TenantScope::Device.declared_tenant(), None);
         assert_eq!(TenantScope::Unresolved.declared_tenant(), None);
+    }
+
+    /// THE TENANT-POLICY POLL'S SITUATION, as measured on the operator box on
+    /// 2026-09-17: a device bound to several tenants, whose legacy
+    /// `access_token` slot holds the DEFAULT binding's JWT, polling
+    /// `/tenant-policy?tenant_id=<a NON-default tenant>`.
+    ///
+    /// `Device` — what the defaulting `coord_get` wrapper asserts — hands back
+    /// the default binding's credential, so the request names one tenant and
+    /// carries another's. Coord's `sessions::get_tenant_policy` requires those
+    /// to be EQUAL, so it answers `403 auth_required` — the same body an
+    /// unauthenticated caller gets, which is why the runner read it for months
+    /// as "not paired yet" and advised a pairing flow it cannot reach.
+    ///
+    /// `Owned(queried)` is the fix, and this pins BOTH of its arms: the hit
+    /// presents the queried tenant's own slot, and the MISS presents NOTHING
+    /// rather than substituting the legacy one. That no-substitution rule is
+    /// the isolation guarantee, so a "fix" that fell back to the default slot
+    /// would be the original bug under a new name.
+    ///
+    /// Plan
+    /// `2026-09-17-device-holds-one-credential-slot-so-a-session-cannot-work-a-bound-tenant`
+    /// P3.
+    #[test]
+    fn the_tenant_policy_polls_scope_diverges_from_the_default_slot() {
+        let mgr = create_test_auth_manager("scope_tenant_policy_poll");
+        let default_tenant = tenant(0xD1);
+        let default_jwt = live_jwt("default.binding.jwt");
+        mgr.store_tokens(&default_jwt, "").unwrap();
+
+        // A non-default tenant this device DOES hold a slot for.
+        let held = tenant(0xD2);
+        let held_jwt = live_jwt("held.tenant.jwt");
+        mgr.store_tenant_device_jwt(&held, &held_jwt).unwrap();
+
+        // The defaulting wrapper's scope: the DEFAULT binding's credential,
+        // whatever tenant the query names. This is the defect.
+        assert_eq!(
+            select_scoped_bearer(&mgr, TenantScope::Device, Some(default_tenant), 3).as_deref(),
+            Some(default_jwt.as_str()),
+            "TenantScope::Device presents the legacy/default slot regardless of the query"
+        );
+
+        // The poll's scope: the credential for the tenant being asked about.
+        assert_eq!(
+            select_scoped_bearer(&mgr, TenantScope::Owned(held), Some(default_tenant), 3)
+                .as_deref(),
+            Some(held_jwt.as_str()),
+            "Owned(t) must present t's own slot — the equality coord checks"
+        );
+        assert_ne!(
+            select_scoped_bearer(&mgr, TenantScope::Owned(held), Some(default_tenant), 3),
+            select_scoped_bearer(&mgr, TenantScope::Device, Some(default_tenant), 3),
+            "the two scopes must diverge here, or the fix would be inert"
+        );
+
+        // A bound tenant with NO usable slot — the state the plan measured on
+        // this very box. Fail-closed: nothing, never the legacy slot.
+        let slotless = tenant(0xD3);
+        assert_eq!(
+            select_scoped_bearer(&mgr, TenantScope::Owned(slotless), Some(default_tenant), 3),
+            None,
+            "a slot MISS must stay a miss — substituting the default binding's credential is \
+             the cross-tenant presentation this scope exists to prevent"
+        );
+    }
+
+    /// The diagnostic the poll's refusal report is built on: it names the
+    /// tenant a credential CLAIMS, and it never yields the token.
+    #[test]
+    fn presented_tenant_reports_the_claim_and_the_absence() {
+        let t = tenant(0xD4);
+        let jwt = jwt_with_tenant(&t, chrono::Utc::now().timestamp() + 3 * 60 * 60);
+        assert_eq!(jwt_tenant_claim(&jwt), Some(t));
+
+        assert_eq!(
+            PresentedTenant::Tenant(t).to_string(),
+            format!("a credential for tenant {t}")
+        );
+        assert_eq!(
+            PresentedTenant::Anonymous.to_string(),
+            "no credential (sent anonymously)"
+        );
+        assert_eq!(
+            PresentedTenant::Untenanted.to_string(),
+            "a credential with no tenant_id claim"
+        );
+        // Whatever it renders, it must never be the token.
+        for p in [
+            PresentedTenant::Anonymous,
+            PresentedTenant::Untenanted,
+            PresentedTenant::Tenant(t),
+        ] {
+            assert!(
+                !p.to_string().contains(&jwt),
+                "a credential diagnostic must never render the token itself"
+            );
+        }
     }
 
     /// The lazy resolver must not read `paired_user.json` for a scope that

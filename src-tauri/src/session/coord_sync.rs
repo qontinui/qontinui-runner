@@ -2218,10 +2218,26 @@ async fn run_flag_poll_loop(inner: Arc<CoordSyncInner>, tenant_id: Uuid) {
         ?interval,
         "coord_sync: Phase 10 cutover-flag poll loop starting (dormant until flag flips)"
     );
+    let mut refusals = TenantPolicyAuthReporter::default();
     loop {
         match fetch_session_coordination_flag(&inner, tenant_id).await {
-            Ok(enabled) => inner.dual_write.apply(enabled),
-            Err(e) => {
+            Ok(enabled) => {
+                if let Some(line) = refusals.clear() {
+                    tracing::info!(%tenant_id, "{line}");
+                }
+                inner.dual_write.apply(enabled);
+            }
+            Err(FlagPollError::Unauthorized(status)) => {
+                // Resolving the presented credential costs a local file read,
+                // so it happens HERE — on the report path the throttle has
+                // already decided to take — and not on every pass.
+                if let Some(line) = refusals.observe(status, tenant_id, || {
+                    crate::auth::presented_tenant(tenant_policy_scope(tenant_id))
+                }) {
+                    tracing::warn!(%tenant_id, "{line}");
+                }
+            }
+            Err(FlagPollError::Other(e)) => {
                 // Leave the cached value as-is — a coord hiccup must not
                 // flip the gate in either direction.
                 tracing::debug!(
@@ -2235,39 +2251,174 @@ async fn run_flag_poll_loop(inner: Arc<CoordSyncInner>, tenant_id: Uuid) {
     }
 }
 
+/// The credential scope the tenant-policy poll presents.
+///
+/// `Owned(tenant_id)` — the tenant the poll is ASKING ABOUT, because
+/// `sessions::get_tenant_policy` requires the `?tenant_id=` query to equal the
+/// presented token's `tenant_id` claim. A request that names one tenant while
+/// carrying another's credential cannot satisfy that equality, so it is
+/// refused `403 {"error":"auth_required"}` — byte-identical to an
+/// unauthenticated caller's refusal, which is what made this defect read for
+/// months as "not paired yet".
+///
+/// That is exactly what the plain [`crate::coord_http::coord_get`] did here:
+/// it asserts [`TenantScope::Device`], which selects the LEGACY `access_token`
+/// slot — the DEFAULT binding's JWT — regardless of the tenant in the query
+/// string. The poll was correct only while the default binding happened to be
+/// the tenant frozen into this loop at process construction.
+///
+/// **Slot-miss posture is deliberately unchanged and is the isolation
+/// guarantee**: `select_device_bearer` returns `None` for a tenant this device
+/// holds no usable slot for, the request goes out unauthenticated, and coord
+/// answers. It must never fall back to the legacy slot — presenting another
+/// tenant's credential is the bug, not the recovery.
+///
+/// A named function rather than an inline expression so the call site and the
+/// refusal diagnostic below cannot drift apart: both ask this one question.
+fn tenant_policy_scope(tenant_id: Uuid) -> TenantScope {
+    TenantScope::Owned(tenant_id)
+}
+
+/// Why one tenant-policy poll pass produced no flag.
+///
+/// Split from the old flat `String` for one reason: a `401`/`403` is a
+/// STANDING condition (this device cannot present the tenant it is asking
+/// about) while everything else is a transient, and the two want opposite
+/// reporting. Collapsing them is what produced 656 consecutive identical
+/// warnings — one per minute for the life of the process.
+#[derive(Debug)]
+enum FlagPollError {
+    /// Coord refused the credential presented. Standing until the credential
+    /// or the tenant changes.
+    Unauthorized(u16),
+    /// Transport, other non-2xx, decode, or a missing field — transient.
+    Other(String),
+}
+
+impl std::fmt::Display for FlagPollError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FlagPollError::Unauthorized(s) => write!(f, "status {s}"),
+            FlagPollError::Other(e) => f.write_str(e),
+        }
+    }
+}
+
+/// Report a STANDING tenant-policy refusal once, not once per pass.
+///
+/// The measured defect this closes: the poll emitted **656 consecutive
+/// identical** `403` warnings, one per configured interval, for the life of
+/// the process — and the advice they carried ("retrying after device
+/// pairing/auth") named a flow the runner cannot reach, because pairing was
+/// never the missing thing. N identical lines are not N pieces of
+/// information.
+///
+/// What counts as "the same refusal" is the STATUS, and the silence is broken
+/// by exactly two things: coord answering differently, and the poll
+/// succeeding. The second is the one that matters — a device that acquires
+/// the queried tenant's slot stops being refused, so recovery arrives as a
+/// success, not as a changed credential — and it emits one line naming how
+/// many passes were suppressed, so the quiet period is legible rather than
+/// merely absent.
+///
+/// Keying on the credential TOO was considered and rejected: it would put a
+/// local encrypted-file read on every pass of a periodic loop to detect a
+/// change that, when it is the change anyone cares about, announces itself as
+/// a success on the very next pass. The cost is per-pass and permanent; the
+/// information is duplicated.
+///
+/// Deliberately per-loop state, not a process-global `Once`: two loops polling
+/// two tenants are two independent conditions, and a `Once` would let the
+/// first silence the second forever.
+#[derive(Default)]
+struct TenantPolicyAuthReporter {
+    /// The status last reported out loud, if a refusal is standing.
+    reported: Option<u16>,
+    /// Passes suppressed since that report.
+    suppressed: u64,
+}
+
+impl TenantPolicyAuthReporter {
+    /// Record one refused pass; returns the line to warn, or `None` when this
+    /// pass repeats a refusal already reported.
+    ///
+    /// `presented` is a closure, not a value, because resolving the credential
+    /// is a local encrypted-file read and the SUPPRESSED path — which is every
+    /// pass but the first — must not pay for it. It is called only on the pass
+    /// that actually emits a line.
+    fn observe(
+        &mut self,
+        status: u16,
+        asked_about: Uuid,
+        presented: impl FnOnce() -> crate::auth::PresentedTenant,
+    ) -> Option<String> {
+        if self.reported == Some(status) {
+            self.suppressed += 1;
+            return None;
+        }
+        self.reported = Some(status);
+        self.suppressed = 0;
+        let presented = presented();
+        Some(format!(
+            "coord_sync: tenant-policy GET refused ({status}) — asked about tenant \
+             {asked_about}, presented {presented}. Coord requires the query's tenant and the \
+             presented credential's tenant_id claim to MATCH, so this poll stays refused until \
+             this device holds a usable credential slot for {asked_about}; the cached cutover \
+             flag is kept meanwhile. Identical refusals from here on are suppressed — one line \
+             will report the recovery."
+        ))
+    }
+
+    /// Record a pass that succeeded; returns the one recovery line when a
+    /// refusal was standing, or `None` when nothing was.
+    fn clear(&mut self) -> Option<String> {
+        let status = self.reported.take()?;
+        let suppressed = std::mem::replace(&mut self.suppressed, 0);
+        Some(format!(
+            "coord_sync: tenant-policy GET authorized again — the standing {status} cleared \
+             after {suppressed} suppressed identical refusals"
+        ))
+    }
+}
+
 /// GET `/tenant-policy?tenant_id=<id>` and pull out
 /// `session_coordination_enabled`. Returns the bool on success; any
 /// transport / non-2xx / shape error is an `Err` the caller treats as
 /// "keep the cached value".
+///
+/// **Presents the credential for the tenant it is querying**
+/// ([`tenant_policy_scope`]), through the tenant-STATING
+/// [`crate::coord_http::coord_get_for`] seam rather than the defaulting
+/// `coord_get`. Never fatal in either direction: a tenant this device holds
+/// no usable slot for sends the request unauthenticated and coord answers,
+/// which is a retry-after-credential signal, not an error to propagate. This
+/// function no longer logs — the loop owns reporting, because only the loop
+/// can tell a standing refusal from a first one.
 async fn fetch_session_coordination_flag(
     inner: &Arc<CoordSyncInner>,
     tenant_id: Uuid,
-) -> Result<bool, String> {
+) -> Result<bool, FlagPollError> {
     let base = inner.coord_url.trim_end_matches('/');
     let url = format!("{base}/tenant-policy?tenant_id={tenant_id}");
-    let resp = crate::coord_http::coord_get(&inner.http, &url)
+    let resp = crate::coord_http::coord_get_for(&inner.http, &url, tenant_policy_scope(tenant_id))
         .send()
         .await
-        .map_err(|e| format!("transport: {e}"))?;
+        .map_err(|e| FlagPollError::Other(format!("transport: {e}")))?;
     let status = resp.status();
     if !status.is_success() {
-        if status.as_u16() == 401 || status.as_u16() == 403 {
-            // The tenant-policy poll can spin up before the device-JWT
-            // exists (it starts as soon as a tenant resolves). Once coord
-            // gates /tenant-policy with FleetPrincipal, the anonymous GET is
-            // rejected until the token lands. Not fatal — the loop keeps the
-            // cached cutover flag and re-ticks. One line.
-            tracing::warn!(
-                "coord_sync: tenant-policy GET unauthorized ({}) — retrying after device pairing/auth",
-                status.as_u16()
-            );
+        let code = status.as_u16();
+        if code == 401 || code == 403 {
+            return Err(FlagPollError::Unauthorized(code));
         }
-        return Err(format!("status {status}"));
+        return Err(FlagPollError::Other(format!("status {status}")));
     }
-    let body: JsonValue = resp.json().await.map_err(|e| format!("decode: {e}"))?;
+    let body: JsonValue = resp
+        .json()
+        .await
+        .map_err(|e| FlagPollError::Other(format!("decode: {e}")))?;
     body.get("session_coordination_enabled")
         .and_then(|v| v.as_bool())
-        .ok_or_else(|| "missing session_coordination_enabled field".to_string())
+        .ok_or_else(|| FlagPollError::Other("missing session_coordination_enabled field".into()))
 }
 
 // ---------------------------------------------------------------------------
@@ -4778,5 +4929,237 @@ mod tests {
         ] {
             assert!(!is_best_effort_kind(kind.as_str()), "{kind:?}");
         }
+    }
+
+    // ========================================================================
+    // P3 of plan
+    // `2026-09-17-device-holds-one-credential-slot-so-a-session-cannot-work-a-bound-tenant`
+    // — the tenant-policy poll presents the credential for the tenant it is
+    // querying, and reports a standing refusal once rather than once a minute.
+    // ========================================================================
+
+    /// SOURCE GUARD — the mutation proof for this phase.
+    ///
+    /// The defect was a CALL-SITE choice, not a value: the poll built its
+    /// request with [`crate::coord_http::coord_get`], which asserts
+    /// [`TenantScope::Device`] and therefore presents the LEGACY
+    /// `access_token` slot — the DEFAULT binding's JWT — no matter which
+    /// tenant the `?tenant_id=` query names. Coord's
+    /// `sessions::get_tenant_policy` requires those two to be equal, so the
+    /// request was refused `403 auth_required`, indistinguishable from an
+    /// unauthenticated caller's refusal.
+    ///
+    /// Nothing about the poll's VALUES changes when that call site regresses —
+    /// the url is identical, the tenant is identical, and every behavioural
+    /// assertion below still passes. The only observable is which helper the
+    /// call site names, so that is what this pins. Revert
+    /// `coord_get_for(.., tenant_policy_scope(tenant_id))` to `coord_get(..)`
+    /// and this test goes red; nothing else does.
+    #[test]
+    fn the_tenant_policy_poll_presents_the_tenant_it_queries() {
+        let src = include_str!("coord_sync.rs");
+        // Isolate the fetch body so the helper name appearing in a doc comment
+        // elsewhere in this file cannot satisfy the assertion.
+        let body = src
+            .split_once("async fn fetch_session_coordination_flag")
+            .expect("the tenant-policy fetch must exist")
+            .1
+            .split_once("\n}\n")
+            .expect("the fetch body must terminate")
+            .0;
+
+        assert!(
+            body.contains("coord_get_for(&inner.http, &url, tenant_policy_scope(tenant_id))"),
+            "the tenant-policy poll must present the credential for the tenant it QUERIES, via \
+             the tenant-stating `coord_get_for` seam. Body was:\n{body}"
+        );
+        assert!(
+            !body.contains("coord_http::coord_get(") && !body.contains("coord_get(&inner.http"),
+            "the tenant-policy poll must NOT use the defaulting `coord_get`: it asserts \
+             TenantScope::Device, which presents the legacy/default slot regardless of the \
+             tenant in the query string — the exact mismatch coord answers 403 to. Body \
+             was:\n{body}"
+        );
+    }
+
+    /// The scope itself: the tenant ASKED ABOUT, never the device default.
+    ///
+    /// `Device` would be a claim that this route takes no tenancy from the
+    /// bearer. `/tenant-policy` does — it compares the bearer's `tenant_id`
+    /// claim to the query — so `Device` here is not a shrug but a false
+    /// statement about the route.
+    #[test]
+    fn tenant_policy_scope_is_owned_by_the_queried_tenant() {
+        let t = Uuid::now_v7();
+        assert_eq!(tenant_policy_scope(t), TenantScope::Owned(t));
+        assert_ne!(tenant_policy_scope(t), TenantScope::Device);
+        assert_ne!(tenant_policy_scope(t), TenantScope::Unresolved);
+    }
+
+    /// A slot MISS must stay a miss. `TenantScope::Owned` routes through
+    /// `select_device_bearer`, whose documented posture is that a non-default
+    /// tenant with no usable slot yields `None` — the request goes out
+    /// unauthenticated and coord answers. Substituting the legacy slot would
+    /// be the original bug wearing the fix's name, so this pins that the scope
+    /// the poll declares is the one that carries the fail-closed rule.
+    #[test]
+    fn the_polls_scope_is_the_fail_closed_one() {
+        let queried = Uuid::now_v7();
+        match tenant_policy_scope(queried) {
+            TenantScope::Owned(t) => assert_eq!(t, queried),
+            other => panic!(
+                "the poll must declare Owned(queried tenant) — only that variant applies \
+                 select_device_bearer's no-substitution rule; got {other:?}"
+            ),
+        }
+        // And it names that tenant in the body-carrying form too, so a future
+        // reader cannot conclude the scope is decorative.
+        assert_eq!(
+            tenant_policy_scope(queried).declared_tenant(),
+            Some(queried)
+        );
+    }
+
+    /// N consecutive identical refusals produce ONE report, not N.
+    ///
+    /// The measured defect: 656 consecutive identical 403 warnings, one per
+    /// poll interval, for the life of the process.
+    #[test]
+    fn a_standing_refusal_is_reported_once_not_once_per_pass() {
+        let mut r = TenantPolicyAuthReporter::default();
+        let asked = Uuid::now_v7();
+        let presented = crate::auth::PresentedTenant::Tenant(Uuid::now_v7());
+
+        let line = r
+            .observe(403, asked, || presented)
+            .expect("the first refusal must be reported");
+        assert!(
+            line.contains(&asked.to_string()),
+            "the report must name the tenant asked about: {line}"
+        );
+        assert!(
+            line.contains(&presented.to_string()),
+            "the report must name the tenant its credential claims: {line}"
+        );
+        assert!(
+            !line.contains("pairing"),
+            "the advice must not name device pairing — pairing was never the missing thing, \
+             and naming a flow the runner cannot reach is half the defect: {line}"
+        );
+
+        for pass in 0..656 {
+            assert!(
+                r.observe(403, asked, || presented).is_none(),
+                "pass {pass} repeated an already-reported refusal and must stay quiet"
+            );
+        }
+        assert_eq!(r.suppressed, 656);
+    }
+
+    /// Coord answering differently is new information and breaks the silence;
+    /// the same answer never does.
+    #[test]
+    fn a_changed_status_breaks_the_silence() {
+        let asked = Uuid::now_v7();
+        let cred = crate::auth::PresentedTenant::Tenant(Uuid::now_v7());
+
+        let mut r = TenantPolicyAuthReporter::default();
+        assert!(r.observe(403, asked, || cred).is_some());
+        assert!(r.observe(403, asked, || cred).is_none());
+        assert!(
+            r.observe(401, asked, || cred).is_some(),
+            "coord answering differently is new information"
+        );
+        assert!(r.observe(401, asked, || cred).is_none());
+        assert!(
+            r.observe(403, asked, || cred).is_some(),
+            "and so is it answering differently again"
+        );
+    }
+
+    /// Resolving the presented credential is a local encrypted-file read, so
+    /// the SUPPRESSED path — every pass but the first — must not pay for it.
+    /// That is why `observe` takes a closure rather than a value: the read
+    /// happens only on the pass that emits a line.
+    #[test]
+    fn the_suppressed_path_never_reads_the_credential() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let reads = AtomicUsize::new(0);
+        let mut r = TenantPolicyAuthReporter::default();
+        let asked = Uuid::now_v7();
+        let cred = crate::auth::PresentedTenant::Tenant(Uuid::now_v7());
+        let mut read = || {
+            reads.fetch_add(1, Ordering::Relaxed);
+            cred
+        };
+
+        assert!(r.observe(403, asked, &mut read).is_some());
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        for _ in 0..100 {
+            assert!(r.observe(403, asked, &mut read).is_none());
+        }
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            1,
+            "a suppressed pass must cost no credential read at all — this loop runs for the \
+             life of the process"
+        );
+    }
+
+    /// Recovery emits exactly one line, naming how many passes were
+    /// suppressed — so the quiet period is legible rather than merely absent.
+    #[test]
+    fn recovery_reports_once_with_the_suppressed_count() {
+        let mut r = TenantPolicyAuthReporter::default();
+        let asked = Uuid::now_v7();
+        let cred = crate::auth::PresentedTenant::Anonymous;
+
+        assert!(r.clear().is_none(), "nothing standing, nothing to report");
+        assert!(r.observe(403, asked, || cred).is_some());
+        for _ in 0..12 {
+            assert!(r.observe(403, asked, || cred).is_none());
+        }
+        let line = r
+            .clear()
+            .expect("a standing refusal that clears is reported");
+        assert!(
+            line.contains("12"),
+            "the suppressed count must be named: {line}"
+        );
+        assert!(line.contains("403"), "{line}");
+        assert!(
+            r.clear().is_none(),
+            "a cleared condition must not report a second time"
+        );
+        assert!(
+            r.observe(403, asked, || cred).is_some(),
+            "a refusal after a recovery is a NEW condition and is reported again"
+        );
+    }
+
+    /// A 401/403 is typed apart from every other failure, because the two want
+    /// opposite reporting: one is standing, the rest are transient. Collapsing
+    /// them into a flat string is what produced the per-minute warning.
+    #[test]
+    fn unauthorized_is_typed_apart_from_transient_failures() {
+        assert_eq!(FlagPollError::Unauthorized(401).to_string(), "status 401");
+        assert_eq!(
+            FlagPollError::Other("transport: x".into()).to_string(),
+            "transport: x"
+        );
+
+        let src = include_str!("coord_sync.rs");
+        let body = src
+            .split_once("async fn fetch_session_coordination_flag")
+            .expect("the tenant-policy fetch must exist")
+            .1
+            .split_once("\n}\n")
+            .expect("the fetch body must terminate")
+            .0;
+        assert!(
+            !body.contains("tracing::warn!") && !body.contains("tracing::info!"),
+            "the fetch must not log a refusal itself — only the loop can tell a standing \
+             refusal from a first one, and a per-call warn is the defect. Body was:\n{body}"
+        );
     }
 }
