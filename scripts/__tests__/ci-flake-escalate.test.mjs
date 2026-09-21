@@ -16,12 +16,20 @@ import {
   FLAKE_LABEL,
   MAIN_RED_CAP,
   MAX_TITLE_LEN,
+  SUITE_ONLY_CLASSIFICATION,
+  SUITE_ONLY_LABEL,
+  SUITE_ONLY_TITLE_PREFIX,
   TITLE_PREFIX,
+  TITLE_PREFIXES,
   applyAction,
+  applyClassification,
+  classificationToken,
   classifyFlakinessResponse,
   ensureLabel,
   fetchRunJobs,
   issueTitle,
+  issueTitleCandidates,
+  labelsFor,
   listFlakeIssues,
   mergeEscalations,
   planIssueActions,
@@ -774,22 +782,40 @@ test("ensureLabel is a single --force create (idempotent under case and race)", 
   assert.equal(calls[0].opts.repo, "o/r");
 });
 
-test("listFlakeIssues unions the labelled list with the title search, by number", () => {
+test("listFlakeIssues unions both labelled lists with both title searches, by number", () => {
   const { calls, gh } = recorder({
-    "issue list": (args) =>
-      args.includes("--label")
-        ? JSON.stringify([{ number: 1, title: "flaky test: a", state: "OPEN" }])
+    "issue list": (args) => {
+      if (args.includes("--label")) {
+        return args.includes(SUITE_ONLY_LABEL)
+          ? JSON.stringify([{ number: 3, title: "suite-only test: c", state: "OPEN" }])
+          : JSON.stringify([{ number: 1, title: "flaky test: a", state: "OPEN" }]);
+      }
+      const q = args[args.indexOf("--search") + 1];
+      return q.includes(SUITE_ONLY_TITLE_PREFIX.trim())
+        ? JSON.stringify([
+            { number: 3, title: "suite-only test: c", state: "OPEN" },
+            { number: 4, title: "suite-only test: d (hand-filed, no label)", state: "CLOSED" },
+          ])
         : JSON.stringify([
             { number: 1, title: "flaky test: a", state: "OPEN" },
             { number: 2, title: "flaky test: b (hand-filed, no label)", state: "OPEN" },
-          ]),
+          ]);
+    },
   });
   const issues = listFlakeIssues("o/r", gh);
-  assert.deepEqual(issues.map((i) => i.number).sort(), [1, 2]);
-  assert.equal(calls.length, 2);
-  assert.ok(calls[0].args.includes("--label") && calls[0].args.includes(FLAKE_LABEL));
-  assert.ok(calls[1].args.includes("--search"));
-  assert.ok(calls[1].args.includes(`"${TITLE_PREFIX.trim()}" in:title`));
+  assert.deepEqual(issues.map((i) => i.number).sort(), [1, 2, 3, 4]);
+  assert.equal(calls.length, 4, "two labels + two title prefixes");
+  const labelled = calls.filter((c) => c.args.includes("--label"));
+  const searched = calls.filter((c) => c.args.includes("--search"));
+  assert.deepEqual(
+    labelled.map((c) => c.args[c.args.indexOf("--label") + 1]).sort(),
+    [FLAKE_LABEL, SUITE_ONLY_LABEL].sort(),
+  );
+  assert.deepEqual(
+    searched.map((c) => c.args[c.args.indexOf("--search") + 1]).sort(),
+    TITLE_PREFIXES.map((p) => `"${p.trim()}" in:title`).sort(),
+    "the lookup asks under BOTH prefixes, so an issue filed under either is found",
+  );
   for (const c of calls) {
     assert.ok(
       c.args.includes("--state") && c.args.includes("all"),
@@ -861,3 +887,305 @@ test("a test id with shell metacharacters reaches gh as one argv entry, unchange
   applyAction({ action: "create", title: issueTitle(id) }, "BODY", "o/r", gh);
   assert.equal(calls[0].args[3], `${TITLE_PREFIX}${id}`);
 });
+
+// ---------------------------------------------------------------------------
+// The suite-only arm (Phase 1 of plan
+// 2026-09-17-runner-tests-share-in-process-mutable-state): title, label,
+// ONE issue per id across the two prefixes — retitled, never duplicated.
+// ---------------------------------------------------------------------------
+
+const SUITE_ONLY_ID =
+  "qontinui_runner::mcp_api::memory_search_enrichment_tests::a_skip_lands_in_its_own_series_and_not_in_enriched";
+
+test("classificationToken accepts exactly the three tokens", () => {
+  assert.equal(classificationToken("suite_only"), "suite_only");
+  assert.equal(classificationToken("solo_red"), "solo_red");
+  assert.equal(classificationToken("both_flaky"), "both_flaky");
+  for (const v of ["SUITE-ONLY", "", null, undefined, 1, {}, "flaky"]) {
+    assert.equal(classificationToken(v), null, `value ${JSON.stringify(v)}`);
+  }
+});
+
+test("issueTitle: a suite_only classification selects the `suite-only test: ` prefix; anything else the plain one", () => {
+  assert.equal(issueTitle(WEDGE, SUITE_ONLY_CLASSIFICATION), `${SUITE_ONLY_TITLE_PREFIX}${WEDGE}`);
+  assert.equal(issueTitle(WEDGE, "solo_red"), `${TITLE_PREFIX}${WEDGE}`);
+  assert.equal(issueTitle(WEDGE, "both_flaky"), `${TITLE_PREFIX}${WEDGE}`);
+  assert.equal(issueTitle(WEDGE, null), issueTitle(WEDGE));
+  assert.deepEqual(issueTitleCandidates(WEDGE), [
+    `${TITLE_PREFIX}${WEDGE}`,
+    `${SUITE_ONLY_TITLE_PREFIX}${WEDGE}`,
+  ]);
+});
+
+test("issueTitle: a long id truncates under the suite-only prefix too, within the cap, deterministically", () => {
+  const long = "a::" + "x".repeat(400) + "::one";
+  const t = issueTitle(long, SUITE_ONLY_CLASSIFICATION);
+  assert.ok(t.length <= MAX_TITLE_LEN, `too long: ${t.length}`);
+  assert.ok(t.startsWith(`${SUITE_ONLY_TITLE_PREFIX}a::xxx`));
+  assert.equal(t, issueTitle(long, SUITE_ONLY_CLASSIFICATION));
+  assert.notEqual(t, issueTitle(long), "the two prefixes give two distinct titles");
+});
+
+test("labelsFor: suite_only carries `suite-only` beside `flake`; everything else `flake` alone", () => {
+  assert.deepEqual(labelsFor(SUITE_ONLY_CLASSIFICATION), [FLAKE_LABEL, SUITE_ONLY_LABEL]);
+  assert.deepEqual(labelsFor("solo_red"), [FLAKE_LABEL]);
+  assert.deepEqual(labelsFor(null), [FLAKE_LABEL]);
+});
+
+test("applyClassification: the local json overrides coord's token; an id it does not name keeps what it had", () => {
+  const byId = new Map([[WEDGE, "suite_only"]]);
+  const out = applyClassification(
+    [
+      { testId: WEDGE, classification: "both_flaky" },
+      { testId: MANIFEST, classification: "solo_red" },
+      { testId: "x::y", classification: "not-a-token" },
+      { testId: "x::z" },
+    ],
+    byId,
+  );
+  assert.deepEqual(
+    out.map((e) => [e.testId, e.classification]),
+    [
+      [WEDGE, "suite_only"],
+      [MANIFEST, "solo_red"],
+      ["x::y", null],
+      ["x::z", null],
+    ],
+  );
+  assert.deepEqual(
+    applyClassification([{ testId: WEDGE, classification: "solo_red" }], null).map((e) => e.classification),
+    ["solo_red"],
+    "no local file: coord's token stands",
+  );
+});
+
+test("selectEscalations carries a coord-served classification token when one exists, null otherwise", () => {
+  const esc = selectEscalations({
+    [WEDGE]: { ...prior(0.4), classification: "suite_only" },
+    [MANIFEST]: { ...prior(0.4), classification: "garbage" },
+    "a::b": prior(0.4),
+  });
+  const by = Object.fromEntries(esc.map((e) => [e.testId, e.classification]));
+  assert.equal(by[WEDGE], "suite_only");
+  assert.equal(by[MANIFEST], null);
+  assert.equal(by["a::b"], null);
+});
+
+test("mergeEscalations keeps the rate arm's classification on a test both arms name", () => {
+  const merged = mergeEscalations(
+    [{ testId: WEDGE, classification: "suite_only", rule: "tally" }],
+    [{ testId: WEDGE, mainRed: { shards: ["ubuntu-22.04"] } }],
+  );
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0].classification, "suite_only");
+  assert.deepEqual(merged[0].mainRed, { shards: ["ubuntu-22.04"] });
+});
+
+test("plan: a suite_only escalation with no issue creates under the suite-only title", () => {
+  const actions = planIssueActions([{ testId: SUITE_ONLY_ID, classification: "suite_only" }], []);
+  assert.deepEqual(actions, [
+    {
+      action: "create",
+      title: `${SUITE_ONLY_TITLE_PREFIX}${SUITE_ONLY_ID}`,
+      escalation: { testId: SUITE_ONLY_ID, classification: "suite_only" },
+      duplicates: [],
+      retitle: false,
+    },
+  ]);
+});
+
+test("plan: RETITLE, NOT DUPLICATE — an existing `flaky test:` issue is renamed when suite_only arrives", () => {
+  const actions = planIssueActions(
+    [{ testId: SUITE_ONLY_ID, classification: "suite_only" }],
+    [{ number: 41, title: issueTitle(SUITE_ONLY_ID), state: "OPEN" }],
+  );
+  assert.equal(actions.length, 1, "one test id, one action");
+  assert.equal(actions[0].action, "update");
+  assert.equal(actions[0].number, 41);
+  assert.equal(actions[0].retitle, true);
+  assert.equal(actions[0].title, `${SUITE_ONLY_TITLE_PREFIX}${SUITE_ONLY_ID}`);
+  assert.deepEqual(actions[0].duplicates, []);
+});
+
+test("plan: a CLOSED `flaky test:` issue hit by a suite_only escalation is reopened AND retitled", () => {
+  const actions = planIssueActions(
+    [{ testId: SUITE_ONLY_ID, classification: "suite_only" }],
+    [{ number: 41, title: issueTitle(SUITE_ONLY_ID), state: "CLOSED" }],
+  );
+  assert.deepEqual(
+    actions.map((a) => [a.action, a.number, a.retitle, a.title]),
+    [["reopen", 41, true, `${SUITE_ONLY_TITLE_PREFIX}${SUITE_ONLY_ID}`]],
+  );
+});
+
+test("plan: lookup under both prefixes — an unclassified escalation adopts an existing `suite-only test:` issue and keeps its title", () => {
+  const suiteTitle = issueTitle(SUITE_ONLY_ID, "suite_only");
+  const actions = planIssueActions(
+    [{ testId: SUITE_ONLY_ID }],
+    [{ number: 41, title: suiteTitle, state: "OPEN" }],
+  );
+  assert.deepEqual(
+    actions.map((a) => [a.action, a.number, a.retitle, a.title]),
+    [["update", 41, false, suiteTitle]],
+    "no classification this run does not move a title back",
+  );
+});
+
+test("plan: a later solo_red / both_flaky MEASUREMENT on a `suite-only test:` issue moves the title to the plain prefix — still the same issue", () => {
+  const suiteTitle = issueTitle(SUITE_ONLY_ID, "suite_only");
+  for (const cls of ["solo_red", "both_flaky"]) {
+    const actions = planIssueActions(
+      [{ testId: SUITE_ONLY_ID, classification: cls }],
+      [{ number: 41, title: suiteTitle, state: "OPEN" }],
+    );
+    // A measurement of the other arm is evidence and may move the title
+    // (the `suite-only` label is never removed, so the history stays);
+    // only an ABSENCE of classification leaves the title alone.
+    assert.equal(actions[0].action, "update", cls);
+    assert.equal(actions[0].number, 41, cls);
+    assert.equal(actions[0].retitle, true, `${cls}: the plain prefix is what this classification selects`);
+    assert.equal(actions[0].title, issueTitle(SUITE_ONLY_ID), cls);
+  }
+});
+
+test("plan: an issue under EACH prefix for one id — the lowest OPEN one owns, the other is a duplicate, never a third", () => {
+  const actions = planIssueActions(
+    [{ testId: SUITE_ONLY_ID, classification: "suite_only" }],
+    [
+      { number: 50, title: issueTitle(SUITE_ONLY_ID, "suite_only"), state: "OPEN" },
+      { number: 41, title: issueTitle(SUITE_ONLY_ID), state: "OPEN" },
+      { number: 7, title: issueTitle(SUITE_ONLY_ID), state: "CLOSED" },
+    ],
+  );
+  assert.equal(actions.length, 1);
+  assert.equal(actions[0].action, "update");
+  assert.equal(actions[0].number, 41);
+  assert.equal(actions[0].retitle, true);
+  assert.deepEqual(actions[0].duplicates, [50, 7]);
+});
+
+test("plan: the plain arm is unchanged — no classification, no existing issue, plain title", () => {
+  const actions = planIssueActions(ESC, []);
+  assert.equal(actions[0].title, issueTitle(WEDGE));
+  assert.equal(actions[0].retitle, false);
+});
+
+test("ensureLabel creates `suite-only` the same --force way as `flake`, and refuses an unknown label", () => {
+  const { calls, gh } = recorder();
+  ensureLabel("o/r", gh, SUITE_ONLY_LABEL);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].args.slice(0, 4), ["label", "create", SUITE_ONLY_LABEL, "--force"]);
+  assert.ok(calls[0].args.includes("--color") && calls[0].args.includes("--description"));
+  assert.match(
+    calls[0].args[calls[0].args.indexOf("--description") + 1],
+    /runner-tests-share-in-process-mutable-state/,
+  );
+  assert.throws(() => ensureLabel("o/r", gh, "made-up"), /no label spec/);
+});
+
+test("applyAction create: a suite_only escalation gets BOTH labels, one --label flag each", () => {
+  const { calls, gh } = recorder({ "issue create": "https://github.com/o/r/issues/77\n" });
+  const title = issueTitle(SUITE_ONLY_ID, "suite_only");
+  applyAction(
+    { action: "create", title, escalation: { testId: SUITE_ONLY_ID, classification: "suite_only" } },
+    "BODY",
+    "o/r",
+    gh,
+  );
+  assert.deepEqual(calls[0].args, [
+    "issue",
+    "create",
+    "--title",
+    title,
+    "--label",
+    FLAKE_LABEL,
+    "--label",
+    SUITE_ONLY_LABEL,
+    "--body-file",
+    "-",
+  ]);
+});
+
+test("applyAction update with retitle: ONE edit renames, adds `suite-only`, refreshes the body", () => {
+  const { calls, gh } = recorder();
+  const title = issueTitle(SUITE_ONLY_ID, "suite_only");
+  const ref = applyAction(
+    {
+      action: "update",
+      number: 41,
+      title,
+      retitle: true,
+      escalation: { testId: SUITE_ONLY_ID, classification: "suite_only", rule: "tally" },
+    },
+    "BODY",
+    "o/r",
+    gh,
+  );
+  assert.equal(ref, "#41");
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].args, [
+    "issue",
+    "edit",
+    "41",
+    "--add-label",
+    FLAKE_LABEL,
+    "--add-label",
+    SUITE_ONLY_LABEL,
+    "--title",
+    title,
+    "--body-file",
+    "-",
+  ]);
+  assert.equal(calls[0].opts.input, "BODY");
+});
+
+test("applyAction: a main-red-only suite_only hit on an existing issue retitles WITHOUT writing the body, then comments", () => {
+  const { calls, gh } = recorder();
+  const title = issueTitle(SUITE_ONLY_ID, "suite_only");
+  applyAction(
+    {
+      action: "update",
+      number: 41,
+      title,
+      retitle: true,
+      escalation: { testId: SUITE_ONLY_ID, classification: "suite_only", mainRed: { shards: ["ubuntu-22.04"] } },
+    },
+    "BODY",
+    "o/r",
+    gh,
+    { comment: "EVENT" },
+  );
+  assert.deepEqual(
+    calls.map((c) => c.args.slice(0, 2)),
+    [
+      ["issue", "edit"],
+      ["issue", "comment"],
+    ],
+  );
+  assert.ok(calls[0].args.includes("--title"), "the rename happens");
+  assert.ok(!calls[0].args.includes("--body-file"), "the nightly's body is not touched");
+  assert.equal(calls[0].opts.input, undefined);
+  assert.equal(calls[1].opts.input, "EVENT");
+});
+
+test("applyAction: no retitle and no classification is byte-for-byte the old argv", () => {
+  const { calls, gh } = recorder();
+  applyAction({ action: "update", number: 7, retitle: false }, "BODY", "o/r", gh);
+  assert.deepEqual(calls[0].args, ["issue", "edit", "7", "--add-label", FLAKE_LABEL, "--body-file", "-"]);
+});
+
+test("the body names the classification, and for suite-only says what to do and where the dossier is", () => {
+  const body = renderIssueBody(
+    { testId: SUITE_ONLY_ID, classification: "suite_only", mainRed: { shards: ["ubuntu-22.04"] } },
+    { repo: "o/r" },
+  );
+  assert.match(body, /\| classification \| \*\*suite-only\*\*/);
+  assert.match(body, /passes alone, red only in the full suite/);
+  assert.match(body, /NOT a flake/);
+  assert.match(body, /runner-tests-share-in-process-mutable-state/);
+  const solo = renderIssueBody({ testId: WEDGE, classification: "solo_red", mainRed: { shards: [] } }, {});
+  assert.match(solo, /\*\*solo-red\*\*/);
+  const none = renderIssueBody({ testId: WEDGE, mainRed: { shards: [] } }, {});
+  assert.doesNotMatch(none, /\| classification \|/, "no row when nothing was measured");
+});
+
