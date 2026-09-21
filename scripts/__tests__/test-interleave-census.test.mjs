@@ -16,6 +16,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { join } from "node:path";
 
 import {
   binaryIdFromAnnouncementLine,
@@ -1000,17 +1001,21 @@ test("snapshotExecutables copies each binary under <dir>/deps/<basename> and kee
   const out = snapshotExecutables(EXES, "/snap", { copy: (a, b) => copied.push([a, b]), mkdir: (d) => made.push(d) });
   // `deps` is the leaf the runner's ambient canary keys on; a flat copy
   // silently disarms it (measured 2026-09-21, four false SOLO-REDs).
-  assert.deepEqual(made, ["/snap/deps"]);
+  // Expected paths go through `join` too: the function builds them with
+  // `path.join`, which on Windows CI yields `\snap\deps`, and a literal
+  // `/snap/deps` was a Windows-only red (measured 2026-09-21, CI job 106492070163).
+  const depsDir = join("/snap", "deps");
+  assert.deepEqual(made, [depsDir]);
   assert.deepEqual(copied, [
-    [LIB_EXE, "/snap/deps/qontinui_runner_lib-a9341426b1692ff6"],
-    [BIN_EXE, "/snap/deps/qontinui_runner-0123456789abcdef"],
+    [LIB_EXE, join(depsDir, "qontinui_runner_lib-a9341426b1692ff6")],
+    [BIN_EXE, join(depsDir, "qontinui_runner-0123456789abcdef")],
   ]);
-  assert.equal(out[0].executable, "/snap/deps/qontinui_runner_lib-a9341426b1692ff6");
+  assert.equal(out[0].executable, join(depsDir, "qontinui_runner_lib-a9341426b1692ff6"));
   assert.equal(out[0].source, LIB_EXE);
   assert.equal(out[0].binaryId, "qontinui_runner_lib");
   assert.equal(out[0].cwd, "/home/box/qontinui-runner/src-tauri");
   // The copy still resolves to the same id through the shared normaliser.
-  assert.equal(buildExecutableIndex(out).byId.get("qontinui_runner_lib").executable, "/snap/deps/qontinui_runner_lib-a9341426b1692ff6");
+  assert.equal(buildExecutableIndex(out).byId.get("qontinui_runner_lib").executable, join(depsDir, "qontinui_runner_lib-a9341426b1692ff6"));
 });
 
 // ---------------------------------------------------------------------------
