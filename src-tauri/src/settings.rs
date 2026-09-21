@@ -2765,14 +2765,18 @@ pub struct TranscriptWatcherSettings {
     /// Seconds a tail may see neither a `notify` wake nor byte growth before
     /// it exits and PARKS (its byte cursor is kept in the registry so the next
     /// `Modify` revives it from exactly where it stopped — nothing is re-read
-    /// and nothing is skipped). Default **600** (10 min). `0` = never park,
-    /// the pre-plan behaviour.
+    /// and nothing is skipped). Default **600** (10 min). `0` disables the
+    /// IDLE park only — a file whose metadata is unreadable three polls in a
+    /// row still parks, whatever this says, so a deleted transcript never
+    /// polls forever.
     pub tail_idle_timeout_secs: u64,
     /// Seconds a PARKED entry is retained before the registry sweep drops it.
     /// Default **86 400** (24 h), so the registry is bounded by files touched
-    /// in a day rather than by files created since boot. A dropped entry is
-    /// not lost work: a later `Modify` re-tails the file from EOF, exactly as
-    /// a transcript the runner had never seen would be.
+    /// in a day rather than by files created since boot. A dropped entry
+    /// forgets its cursor: a later `Modify` re-tails the file from EOF, as a
+    /// transcript the runner had never seen would be, so bytes appended
+    /// between the drop and that first re-open are NOT delivered. That is the
+    /// trade the retention bound buys, and it is why the default is a day.
     pub tail_parked_retention_secs: u64,
 }
 

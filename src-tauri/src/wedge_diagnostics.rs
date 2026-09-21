@@ -1039,7 +1039,6 @@ pub fn capture_thread_name_census() -> Option<ThreadNameCensus> {
 /// The platform-independent tail of [`capture_thread_name_census`]: an empty
 /// walk is a failed enumeration (a live process has at least the calling
 /// thread), everything else is collapsed and stamped.
-#[allow(dead_code)]
 fn finish_thread_name_census(names: Vec<String>) -> Option<ThreadNameCensus> {
     if names.is_empty() {
         return None;

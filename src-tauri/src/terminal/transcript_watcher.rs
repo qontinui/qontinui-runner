@@ -560,6 +560,14 @@ async fn run_orchestrator(
         });
     }
 
+    // The event channel is created BEFORE discovery: every tail task holds
+    // a sender so an exit that parks a cursor with bytes already past it can
+    // feed itself back through the dispatcher as a `Modify` (see the exit
+    // closure in `schedule_tail`). One `mpsc` channel for all config dirs;
+    // each `notify` callback runs in a sync context so it uses `try_send`.
+    let (tx, mut rx) = mpsc::channel::<Event>(128);
+    let revive_tx = tx.clone();
+
     // ── 1. Discovery on startup ───────────────────────────────────────────
     //
     // For every (config_dir × workspace_path) pair, list current sessions and
@@ -608,6 +616,7 @@ async fn run_orchestrator(
                     tailer.clone(),
                     TailStart::Eof,
                     cfg,
+                    revive_tx.clone(),
                 )
                 .await;
             }
@@ -661,10 +670,6 @@ async fn run_orchestrator(
     }
 
     // ── 2. Live watching ──────────────────────────────────────────────────
-    //
-    // One `mpsc` channel for all config dirs. Each `notify` callback runs in
-    // a sync context so we use `try_send`.
-    let (tx, mut rx) = mpsc::channel::<Event>(128);
 
     let mut watchers: Vec<RecommendedWatcher> = Vec::new();
     for config_dir in &config_dirs {
@@ -739,6 +744,7 @@ async fn run_orchestrator(
                         tailer.clone(),
                         TailStart::Start,
                         cfg,
+                        revive_tx.clone(),
                     )
                     .await;
                 }
@@ -753,7 +759,9 @@ async fn run_orchestrator(
                                 h.wake.notify_one();
                                 ModifyAction::Woken
                             }
-                            Some(TailEntry::Parked { .. }) => ModifyAction::Revive,
+                            Some(TailEntry::Parked { cursor, .. }) => {
+                                ModifyAction::Revive { cursor: *cursor }
+                            }
                             None => ModifyAction::Fresh,
                         }
                     };
@@ -763,11 +771,16 @@ async fn run_orchestrator(
                                 record_cohort_wake(&w);
                             }
                         }
-                        ModifyAction::Revive => {
+                        ModifyAction::Revive { cursor } => {
                             // No `path_looks_like_workflow_session` sniff: the
                             // tail passed the in-task re-check before it
-                            // parked. `schedule_tail` starts it at the parked
-                            // cursor regardless of the start passed here.
+                            // parked. The cursor is carried OUT from under the
+                            // lock: if the retention sweep or a `Remove` drops
+                            // the parked entry between this decision and
+                            // `schedule_tail` re-taking the lock, the `None`
+                            // arm still starts at the parked cursor rather
+                            // than at EOF, so the append that woke us is not
+                            // skipped.
                             if let Some(w) = cohort.observe(&session_id, Instant::now()) {
                                 record_cohort_wake(&w);
                             }
@@ -779,8 +792,9 @@ async fn run_orchestrator(
                                 app_handle.clone(),
                                 registrar.clone(),
                                 tailer.clone(),
-                                TailStart::Eof,
+                                TailStart::At(cursor),
                                 cfg,
+                                revive_tx.clone(),
                             )
                             .await;
                         }
@@ -798,6 +812,7 @@ async fn run_orchestrator(
                                 tailer.clone(),
                                 TailStart::Eof,
                                 cfg,
+                                revive_tx.clone(),
                             )
                             .await;
                         }
@@ -835,8 +850,9 @@ async fn run_orchestrator(
 enum ModifyAction {
     /// A live tail was notified.
     Woken,
-    /// A parked entry exists; reschedule from its cursor.
-    Revive,
+    /// A parked entry exists; reschedule from its cursor (carried here so a
+    /// sweep racing the reschedule cannot downgrade the start to EOF).
+    Revive { cursor: u64 },
     /// No entry; treat as a create.
     Fresh,
 }
@@ -885,6 +901,7 @@ async fn schedule_tail(
     tailer: Option<Arc<SessionTranscriptTailer>>,
     requested: TailStart,
     cfg: TailConfig,
+    revive_tx: mpsc::Sender<Event>,
 ) {
     let mut map = tasks.lock().await;
     let start = match map.get(&session_id) {
@@ -929,6 +946,17 @@ async fn schedule_tail(
 
     tauri::async_runtime::spawn(async move {
         TAILS_STARTED_SINCE_BOOT.fetch_add(1, Ordering::Relaxed);
+        // Armed until the exit below settles the entry: a panic inside
+        // `tail_session` unwinds past the settle and would otherwise leave a
+        // `Live` handle whose `wake` nobody polls — every later `Modify`
+        // notified into the void and the file never tailed again until a
+        // `Remove`.
+        let mut settle_guard = SettleGuard {
+            tasks: tasks_for_exit.clone(),
+            session_id: session_id.clone(),
+            task_id,
+            armed: true,
+        };
         let result = tail_session(
             session_id.clone(),
             path,
@@ -943,6 +971,7 @@ async fn schedule_tail(
         )
         .await;
         TAILS_ENDED_SINCE_BOOT.fetch_add(1, Ordering::Relaxed);
+        settle_guard.armed = false;
         // Settle the registry entry THIS task owns. An idle exit parks the
         // cursor in place of the handle so the next `Modify` revives from it;
         // every other exit removes the entry so a reschedule works. Both are
@@ -952,7 +981,41 @@ async fn schedule_tail(
         let mut map = tasks_for_exit.lock().await;
         match result {
             Ok(TailExit::Idle { cursor }) => {
-                map.park_if_current(&session_id, task_id, path_for_park, cursor, Instant::now());
+                let parked = map.park_if_current(
+                    &session_id,
+                    task_id,
+                    path_for_park.clone(),
+                    cursor,
+                    Instant::now(),
+                );
+                // A `Modify` that landed between the idle check and this
+                // park notified a `wake` nobody will poll again. The write
+                // always precedes its event, and the dispatcher's
+                // `notify_one` runs under this same lock, so a length read
+                // HERE sees every append that lost permit stood for. If the
+                // file is not exactly at the parked cursor, do not leave it
+                // parked: feed a synthetic `Modify` back through the
+                // dispatcher, whose `Revive` arm restarts the tail at this
+                // cursor. (A recursive `schedule_tail` from inside its own
+                // spawned task is an infinitely-sized future; the channel is
+                // the seam that already exists.)
+                if parked {
+                    let on_disk = std::fs::metadata(&path_for_park).map(|m| m.len()).ok();
+                    if on_disk.is_some_and(|len| len != cursor) {
+                        debug!(
+                            "transcript_watcher: {} parked at {} but the file is {:?} bytes — reviving",
+                            session_id, cursor, on_disk
+                        );
+                        let ev = Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+                            .add_path(path_for_park);
+                        if revive_tx.try_send(ev).is_err() {
+                            warn!(
+                                "transcript_watcher: revive of {} was not queued (dispatcher channel full or closed); the next Modify will pick it up from offset {}",
+                                session_id, cursor
+                            );
+                        }
+                    }
+                }
             }
             Ok(TailExit::Cancelled) | Ok(TailExit::WorkflowTornDown) => {
                 map.remove_if_current(&session_id, task_id);
@@ -966,6 +1029,34 @@ async fn schedule_tail(
             }
         }
     });
+}
+
+/// Removes a tail's registry entry if its task unwinds past the normal
+/// settle in the exit closure of `schedule_tail`. Disarmed on every non-panic
+/// exit; `Drop` cannot await, so it hands the removal to a fresh task.
+struct SettleGuard {
+    tasks: SharedRegistry,
+    session_id: String,
+    task_id: u64,
+    armed: bool,
+}
+
+impl Drop for SettleGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let tasks = self.tasks.clone();
+        let session_id = std::mem::take(&mut self.session_id);
+        let task_id = self.task_id;
+        warn!(
+            "transcript_watcher: tail task for {} unwound without settling; dropping its registry entry",
+            session_id
+        );
+        tauri::async_runtime::spawn(async move {
+            tasks.lock().await.remove_if_current(&session_id, task_id);
+        });
+    }
 }
 
 /// The byte-cursor half of a tail: the wake/tick/cancel wait, the metadata
@@ -983,8 +1074,15 @@ struct TailReader {
     cancel: Arc<Notify>,
     /// Zero = never park.
     idle_timeout: Duration,
-    /// Reset on every wake and on every byte growth.
+    /// Reset on every wake and on every byte GROWTH — `len` rising past
+    /// `last_seen_len`, or complete lines actually consumed. NOT on "bytes past
+    /// the cursor": a file whose tail is an unterminated line has bytes past
+    /// the cursor on every poll forever, and resetting on that would keep such
+    /// a file (a session killed mid-write — exactly the dead file this park
+    /// exists for) at the 1 s base tick and never parked.
     last_activity: Instant,
+    /// The largest length the last poll saw; growth is measured against it.
+    last_seen_len: u64,
     metadata_err_streak: u32,
     /// The file shrank since the last delivered step; carried until the next
     /// `Appended` so the consumer can reset its per-file prefix state.
@@ -1012,6 +1110,7 @@ impl TailReader {
             session_id,
             path,
             file,
+            last_seen_len: cursor,
             cursor,
             wake,
             cancel,
@@ -1107,14 +1206,20 @@ impl TailReader {
                     self.session_id, self.cursor, len
                 );
                 self.cursor = 0;
+                self.last_seen_len = 0;
                 // Re-open to reset any internal seek state.
                 self.file = tokio::fs::File::open(&self.path).await?;
                 self.truncated_pending = true;
             }
+            if len > self.last_seen_len {
+                // Real growth. A poll that finds the same unterminated
+                // fragment it found last time is NOT activity.
+                self.last_activity = Instant::now();
+                self.last_seen_len = len;
+            }
             if len == self.cursor {
                 continue;
             }
-            self.last_activity = Instant::now();
 
             // ── 4. Read appended bytes line-by-line ───────────────────────
             if let Err(e) = self.file.seek(std::io::SeekFrom::Start(self.cursor)).await {
@@ -1155,6 +1260,9 @@ impl TailReader {
                 bytes.push_str(&line);
             }
             self.cursor += bytes_read;
+            if bytes_read > 0 {
+                self.last_activity = Instant::now();
+            }
             if bytes.is_empty() {
                 continue; // Only a partial line so far.
             }
@@ -1908,6 +2016,41 @@ mod tests {
             reader.cursor(),
             USER_LINE.len() as u64,
             "the cursor stops before the partial line so it is re-read once terminated"
+        );
+    }
+
+    /// A transcript whose last line is unterminated — a session killed
+    /// mid-write, exactly the dead file the park exists for — has bytes past
+    /// the cursor on EVERY poll. Growth is measured against the last length
+    /// seen, not against the cursor, so that file still idles and parks with
+    /// its cursor before the fragment. (Finding 2 of the 2026-09-21 review:
+    /// the first cut reset the idle clock on `len != cursor`, and such a file
+    /// polled at the base tick forever.)
+    #[tokio::test]
+    async fn a_file_ending_in_a_partial_line_still_idles_and_parks_before_the_fragment() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("partial-tail.jsonl");
+        let partial = r#"{"type":"assistant","uuid":"a3""#;
+        std::fs::write(&p, format!("{USER_LINE}{partial}")).unwrap();
+        let mut reader = open_reader(&p, TailStart::Start, Duration::from_secs(1)).await;
+        // The complete line is delivered once...
+        let step = tokio::time::timeout(Duration::from_secs(3), reader.next_step())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(step, TailStep::Appended { .. }));
+        // ...and then, with only the fragment left, the reader parks within
+        // the idle budget instead of re-reading the fragment every tick.
+        let step = tokio::time::timeout(Duration::from_secs(3), reader.next_step())
+            .await
+            .expect("the reader must idle out, not poll the fragment forever")
+            .unwrap();
+        assert_eq!(
+            step,
+            TailStep::Exit(TailExit::Idle {
+                cursor: USER_LINE.len() as u64
+            }),
+            "parked at the cursor BEFORE the unterminated fragment"
         );
     }
 
