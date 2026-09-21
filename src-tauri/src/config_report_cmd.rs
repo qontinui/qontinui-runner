@@ -4306,7 +4306,7 @@ mod tests {
     /// binary (red on run 11): this test panicked on the config DIR row with
     /// `(true, Some(4096), mtime T)` before and `mtime T+4ms` after — size
     /// unchanged, `settings.json` unchanged, so not the settings persist (which
-    /// Phase 3's canary in `settings::persist_allowed_from_this_thread` now
+    /// Phase 3's canary in `settings::persist_target_for_this_thread` now
     /// deflects anyway). The dir was the fixture's ROOT tempdir, because
     /// `isolated_ambient()` points FIVE process-global keys at that one
     /// directory — `QONTINUI_HOME`, `QONTINUI_CONFIG_DIR`,
