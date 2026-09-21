@@ -80,11 +80,12 @@
  * `scripts/test-interleave-census.mjs` writes (either mode; ci.yml's
  * `Classify failed tests` step writes `test-classification.json` on a red
  * PR run, and the Phase 5 census job hands its inventory over the same
- * flag). coord GAP: the ingest sends `classification` on every row, but
- * coord's `ResultItem` drops unknown fields and `POST /coord/test-flakiness`
- * serves no such field, so the rate arm cannot read it back yet; a prior
- * that DOES carry a `classification` token is honoured when coord grows one,
- * and the local file overrides it.
+ * flag). coord GAP: the ingest strips `classification` before the POST
+ * (`toWireRow` in ci-test-results-ingest.mjs) because coord's `ResultItem`
+ * has no such field, and `POST /coord/test-flakiness` serves none — so the
+ * rate arm cannot read it back yet; a prior that DOES carry a
+ * `classification` token is honoured when coord grows one, and the local
+ * file overrides it.
  *
  * THE CENSUS ARM (Phase 5 of the same plan). The nightly `census` job of
  * `flake-escalation.yml` runs `scripts/test-interleave-census.mjs` in census
@@ -159,7 +160,7 @@ import { parseArgs as nodeParseArgs } from "node:util";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { isRustTestJob, parseTestOutcomes, platformOfJobName } from "./ci-flake-analyze.mjs";
+import { isRustTestJob, parseTestOutcomes, platformOfJobName, redactSecrets } from "./ci-flake-analyze.mjs";
 import { readClassification } from "./ci-test-results-ingest.mjs";
 import { DOSSIER_SLUG } from "./test-interleave-census.mjs";
 
@@ -333,9 +334,10 @@ export function selectEscalations(priors, { minOccurrences = DEFAULT_MIN_OCCURRE
       modalOutcome: typeof prior.modal_outcome === "string" ? prior.modal_outcome : "unknown",
       outcomes: tally,
       recentFailures: Array.isArray(prior.recent_failures) ? prior.recent_failures : [],
-      // coord serves no such field today (the ingest's `classification` is
-      // dropped by `ResultItem`); honoured the day it does, and overridden by
-      // `--classification` (`applyClassification`).
+      // coord serves no such field today (the ingest strips `classification`
+      // before the POST — `toWireRow` — since `ResultItem` has no such field);
+      // honoured the day it does, and overridden by `--classification`
+      // (`applyClassification`).
       classification: classificationToken(prior.classification),
     });
   }
@@ -650,9 +652,7 @@ export function renderIssueBody(escalation, { repo, minK, window, runUrl, ciRunU
     lines.push(
       `**Sample panic from the census** (the assertion, not the resource — the resource is what to find):`,
       ``,
-      "```",
-      escalation.census.samplePanic,
-      "```",
+      ...panicFence(escalation.census.samplePanic),
       ``,
     );
   }
@@ -727,6 +727,22 @@ function renderCensusCell(census) {
 }
 
 /**
+ * A captured panic as a fenced block that cannot leak or break out. The
+ * text is redacted with the shared `redactSecrets` (the census redacts at
+ * capture too — this is the second lock, for a json written by an older
+ * census), and any run of three or more backticks inside it is spaced out
+ * so it cannot close the fence and turn the rest of the panic into markdown
+ * (or an `@mention`) in a PUBLIC issue.
+ *
+ * @param {string} text
+ * @returns {string[]} the lines, fence included
+ */
+export function panicFence(text) {
+  const safe = redactSecrets(text).replace(/`{3,}/g, (m) => m.split("").join("\u200b"));
+  return ["```", safe, "```"];
+}
+
+/**
  * The comment a census hit appends to an EXISTING issue — an event, like a
  * push-to-main occurrence, so the body (coord's snapshot, or the first arm's
  * evidence) is never overwritten by the nightly.
@@ -736,9 +752,7 @@ export function renderCensusComment(escalation, { runUrl, readAt } = {}) {
     `The nightly interleave census found this test SUITE-ONLY again — ` +
       `${renderCensusCell(escalation.census)} (${readAt ?? "?"}).`,
     ``,
-    ...(escalation.census?.samplePanic
-      ? ["```", escalation.census.samplePanic, "```", ``]
-      : []),
+    ...(escalation.census?.samplePanic ? [...panicFence(escalation.census.samplePanic), ``] : []),
     `Appended by \`scripts/ci-flake-escalate.mjs\` (census arm${runUrl ? `, [this run](${runUrl})` : ""}); ` +
       `the body above is not touched by this arm. Plan ` +
       `\`2026-09-17-runner-tests-share-in-process-mutable-state\`, dossier \`${DOSSIER_SLUG}\`.`,

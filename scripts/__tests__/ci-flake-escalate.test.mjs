@@ -34,6 +34,7 @@ import {
   labelsFor,
   listFlakeIssues,
   mergeEscalations,
+  panicFence,
   planIssueActions,
   renderCensusComment,
   renderIssueBody,
@@ -1426,4 +1427,43 @@ test("census: the CLI refuses --no-rate with neither --run-id nor --census, and 
   const dark = spawnSync(process.execPath, [script, "--repo", "o/r", "--no-rate", "--census", broken], { encoding: "utf8" });
   assert.equal(dark.status, 1, "an unreadable census is UNKNOWN, loud, and files nothing");
   assert.match(dark.stdout, /census arm is DARK/);
+});
+
+
+// ---------------------------------------------------------------------------
+// Public-issue hygiene: a captured panic is redacted and cannot escape its fence
+// ---------------------------------------------------------------------------
+
+test("panicFence redacts secret-shaped text and neutralises a fence-closing backtick run", () => {
+  const jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIn0.sig";
+  const panic = `thread 'x' panicked:\nAuthorization: Bearer ${jwt}\ntoken=abc secret=def PASSWORD=ghi\n\`\`\`\n@octocat pwned\n\`\`\`\`js`;
+  const lines = panicFence(panic);
+  assert.equal(lines[0], "```");
+  assert.equal(lines[lines.length - 1], "```");
+  const body = lines.slice(1, -1).join("\n");
+  assert.doesNotMatch(body, /eyJ/);
+  assert.doesNotMatch(body, /abc|def|ghi/);
+  assert.match(body, /Bearer \[redacted\]/);
+  assert.match(body, /token=\[redacted\] secret=\[redacted\] PASSWORD=\[redacted\]/);
+  assert.doesNotMatch(body, /```/, "no three consecutive backticks survive inside the fence");
+  assert.match(body, /@octocat pwned/, "the text itself is kept — only the fence-closer is defused");
+});
+
+test("renderIssueBody and renderCensusComment both route the census panic through panicFence", () => {
+  const esc = {
+    testId: WEDGE,
+    classification: "suite_only",
+    census: { suiteRuns: 5, suiteFailures: 2, soloRuns: 3, soloFailures: 0, samplePanic: "Bearer eyJaaaaaaaaaaaaaaaa.bbb\n```\nescaped" },
+  };
+  for (const text of [
+    renderIssueBody(esc, { repo: "o/r" }),
+    renderCensusComment(esc, { readAt: "t" }),
+  ]) {
+    assert.doesNotMatch(text, /eyJ/);
+    assert.match(text, /Bearer \[redacted\]/);
+    const fenced = text.split("```");
+    // opening fence, body, closing fence → exactly two fence markers, so the
+    // panic's own ``` did not add a third.
+    assert.equal(fenced.length, 3, `expected exactly one fenced block in:\n${text}`);
+  }
 });
