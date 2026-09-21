@@ -68,6 +68,12 @@ mcp/steward.rs | start_steward | autonomous | start_steward
 mcp/task_run_workflow_state.rs | resume_task_run | autonomous | resume_task_run
 mcp/task_runs.rs | create_ai_session | autonomous | create_ai_session
 mcp/task_runs.rs | resume_task_run | autonomous | resume_task_run
+# The scheduler's RemoteAgent launch (plan 2026-09-13-nightly-return-to-main-sweep, Phase 5b)
+# reaches spawn_claude_child directly instead of POSTing /prompts/run. All three of the
+# scheduler's entry points gate on the device drain before execute_task (tick's
+# partition_for_drain, reconcile_task's drain_gate_for_work, run_task_now's drain_gate);
+# the chain below names the periodic one.
+scheduler_remote_agent.rs | launch | autonomous | scheduler_service.rs::tick > scheduler_service.rs::execute_task > scheduler_service.rs::execute_task_with_context > scheduler_service.rs::launch_and_await_remote_agent > launch
 mcp/tauri_proxy.rs | dispatch | autonomous | dispatch
 mcp/terminals.rs | create_terminal_handler | autonomous | create_terminal_handler
 mcp/unified_workflows.rs | execute_inline_workflow | autonomous | execute_inline_workflow
