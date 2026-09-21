@@ -16,10 +16,22 @@
 # declared-flag spellings), so adding a pattern adds rows here. That is
 # intended: the diff this file produces IS the review surface.
 #
+# Rows whose key starts with a guillemet are the two routes a TYPED input
+# cannot reach, so they carry a hand-authored arg bag instead:
+#   «ai» <actionId> [<bag>] <input>   Tier 3 — the model named the action
+#                                      and returned <bag>. `chooseTier`'s
+#                                      Tier-3 arm was otherwise entered by
+#                                      no corpus input at all.
+#   «direct» <actionId> [<bag>]        `callRegistry` — UI Bridge handlers,
+#                                      suggestion chips, palette clicks and
+#                                      the Ctrl+Shift+H hotkey.
+# The bags are in `corpus.testkit.ts::ARG_BAGS`; `bool` / `object` / `array`
+# are the JSON shapes a regex group and a token can never produce.
+#
 # A row changing action or args is a semantic change and needs a reason in
 # the PR. A row changing only its verdict may be the stubbed context in
 # realRegistry.testkit.ts moving instead — check that first.
-# tier: golden   inputs: 2376
+# tier: golden   inputs: 2696
 
 /analyze	literal	terminal.analyze	[]	error:invalid-args	error /analyze: type must be one of: session-summary, architecture, change-impact, progress, cross-tab, page-architecture
 /analyze "1 gmail fix the bug"	literal	terminal.analyze	[["type","1 gmail fix the bug"]]	error:invalid-args	error /analyze: type must be one of: session-summary, architecture, change-impact, progress, cross-tab, page-architecture
@@ -2397,3 +2409,323 @@ yes all 1 gmail fix the bug	none	-	null	none	-
 yes all 1 gmail fix the bug --tenant	none	-	null	none	-
 yes all 3 best	none	-	null	none	-
 yes all 3 best --tenant	none	-	null	none	-
+«ai» terminal.analyze [alien] do the thing	ai	terminal.analyze	[["nonsense","x"]]	refused	error /analyze: takes no argument named "nonsense"
+«ai» terminal.analyze [bool] do the thing	ai	terminal.analyze	[]	refused	error /analyze: "type" must be text or a number (got true/false)
+«ai» terminal.analyze [empty] do the thing	ai	terminal.analyze	[]	error:invalid-args	error /analyze: type must be one of: session-summary, architecture, change-impact, progress, cross-tab, page-architecture
+«ai» terminal.analyze [valid] do the thing	ai	terminal.analyze	[["type","progress"]]	ok	ok /analyze ✓ produced 2 analysis panels — progress
+«ai» terminal.approve-all [alien] do the thing	ai	terminal.approve-all	[["nonsense","x"]]	refused	error /approve-all: takes no arguments (got "nonsense")
+«ai» terminal.approve-all [bool] do the thing	ai	terminal.approve-all	[]	refused	error /approve-all: "count" must be text or a number (got true/false)
+«ai» terminal.approve-all [empty] do the thing	ai	terminal.approve-all	[]	ok	error /approve-all ✗ approved 0 of 1 session — 1 TERMINAL_WRITE_FAILED
+«ai» terminal.approve-all [valid] do the thing	ai	terminal.approve-all	[]	ok	error /approve-all ✗ approved 0 of 1 session — 1 TERMINAL_WRITE_FAILED
+«ai» terminal.auto-approve [alien] do the thing	ai	terminal.auto-approve	[["nonsense","x"]]	refused	error /auto-approve: takes no argument named "nonsense"
+«ai» terminal.auto-approve [bool] do the thing	ai	terminal.auto-approve	[]	refused	error /auto-approve: "action" must be text or a number (got true/false)
+«ai» terminal.auto-approve [empty] do the thing	ai	terminal.auto-approve	[]	error:invalid-args	error /auto-approve: action is required (add, remove, list, clear)
+«ai» terminal.auto-approve [valid] do the thing	ai	terminal.auto-approve	[["action","list"],["pattern","yes"]]	ok	ok /auto-approve ✓ listed 1 auto-approve pattern — armed
+«ai» terminal.close [alien] do the thing	ai	terminal.close	[["nonsense","x"]]	refused	error /close: takes no argument named "nonsense"
+«ai» terminal.close [bool] do the thing	ai	terminal.close	[]	refused	error /close: "zone" must be text or a number (got true/false)
+«ai» terminal.close [empty] do the thing	ai	terminal.close	[]	ok	ok /close ✓ closed 1 session — tab-a
+«ai» terminal.close [valid] do the thing	ai	terminal.close	[["tabId","tab-1"],["zone",1]]	error:unknown-tab	error /close: "tab-1" is not an open tab id
+«ai» terminal.copy-names [alien] do the thing	ai	terminal.copy-names	[["nonsense","x"]]	refused	error /copy-names: takes no arguments (got "nonsense")
+«ai» terminal.copy-names [bool] do the thing	ai	terminal.copy-names	[]	refused	error /copy-names: "count" must be text or a number (got true/false)
+«ai» terminal.copy-names [empty] do the thing	ai	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
+«ai» terminal.copy-names [valid] do the thing	ai	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
+«ai» terminal.doc-finder [alien] do the thing	ai	terminal.doc-finder	[["nonsense","x"]]	refused	error /doc-finder: takes no arguments (got "nonsense")
+«ai» terminal.doc-finder [bool] do the thing	ai	terminal.doc-finder	[]	refused	error /doc-finder: "count" must be text or a number (got true/false)
+«ai» terminal.doc-finder [empty] do the thing	ai	terminal.doc-finder	[]	ok	ok /doc-finder ✓ opened the doc finder
+«ai» terminal.doc-finder [valid] do the thing	ai	terminal.doc-finder	[]	ok	ok /doc-finder ✓ opened the doc finder
+«ai» terminal.export-all [alien] do the thing	ai	terminal.export-all	[["nonsense","x"]]	refused	error /export-all: takes no arguments (got "nonsense")
+«ai» terminal.export-all [bool] do the thing	ai	terminal.export-all	[]	refused	error /export-all: "count" must be text or a number (got true/false)
+«ai» terminal.export-all [empty] do the thing	ai	terminal.export-all	[]	ok	ok /export-all ✓ exported 2 sessions
+«ai» terminal.export-all [valid] do the thing	ai	terminal.export-all	[]	ok	ok /export-all ✓ exported 2 sessions
+«ai» terminal.focus [alien] do the thing	ai	terminal.focus	[["nonsense","x"]]	refused	error /focus: takes no argument named "nonsense"
+«ai» terminal.focus [bool] do the thing	ai	terminal.focus	[]	refused	error /focus: "target" must be text or a number (got true/false)
+«ai» terminal.focus [empty] do the thing	ai	terminal.focus	[]	error:invalid-args	error /focus: target is required (a zone number, next, prev or needs-input)
+«ai» terminal.focus [valid] do the thing	ai	terminal.focus	[["target","next"]]	ok	ok /focus ✓ focused 1 zone
+«ai» terminal.generate-workflow [alien] do the thing	ai	terminal.generate-workflow	[["nonsense","x"]]	refused	error /generate: takes no arguments (got "nonsense")
+«ai» terminal.generate-workflow [bool] do the thing	ai	terminal.generate-workflow	[]	refused	error /generate: "count" must be text or a number (got true/false)
+«ai» terminal.generate-workflow [empty] do the thing	ai	terminal.generate-workflow	[]	error:no-session	error /generate: no session
+«ai» terminal.generate-workflow [valid] do the thing	ai	terminal.generate-workflow	[]	error:no-session	error /generate: no session
+«ai» terminal.history [alien] do the thing	ai	terminal.history	[["nonsense","x"]]	refused	error /history: takes no arguments (got "nonsense")
+«ai» terminal.history [bool] do the thing	ai	terminal.history	[]	refused	error /history: "count" must be text or a number (got true/false)
+«ai» terminal.history [empty] do the thing	ai	terminal.history	[]	ok	noop /history · no events showed
+«ai» terminal.history [valid] do the thing	ai	terminal.history	[]	ok	noop /history · no events showed
+«ai» terminal.layout [alien] do the thing	ai	terminal.layout	[["nonsense","x"]]	refused	error /layout: takes no argument named "nonsense"
+«ai» terminal.layout [bool] do the thing	ai	terminal.layout	[]	refused	error /layout: "preset" must be text or a number (got true/false)
+«ai» terminal.layout [empty] do the thing	ai	terminal.layout	[]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
+«ai» terminal.layout [valid] do the thing	ai	terminal.layout	[["preset","six-pack"]]	ok	ok /layout ✓ changed 1 layout — six-pack
+«ai» terminal.maximize [alien] do the thing	ai	terminal.maximize	[["nonsense","x"]]	refused	error /maximize: takes no argument named "nonsense"
+«ai» terminal.maximize [bool] do the thing	ai	terminal.maximize	[]	refused	error /maximize: "zone" must be text or a number (got true/false)
+«ai» terminal.maximize [empty] do the thing	ai	terminal.maximize	[]	ok	ok /maximize ✓ maximized zone 1
+«ai» terminal.maximize [valid] do the thing	ai	terminal.maximize	[["zone",1]]	ok	ok /maximize ✓ maximized zone 1
+«ai» terminal.metrics [alien] do the thing	ai	terminal.metrics	[["nonsense","x"]]	refused	error /metrics: takes no arguments (got "nonsense")
+«ai» terminal.metrics [bool] do the thing	ai	terminal.metrics	[]	refused	error /metrics: "count" must be text or a number (got true/false)
+«ai» terminal.metrics [empty] do the thing	ai	terminal.metrics	[]	ok	ok /metrics ✓ showed 8 metrics
+«ai» terminal.metrics [valid] do the thing	ai	terminal.metrics	[]	ok	ok /metrics ✓ showed 8 metrics
+«ai» terminal.mute [alien] do the thing	ai	terminal.mute	[["nonsense","x"]]	refused	error /mute: takes no arguments (got "nonsense")
+«ai» terminal.mute [bool] do the thing	ai	terminal.mute	[]	refused	error /mute: "count" must be text or a number (got true/false)
+«ai» terminal.mute [empty] do the thing	ai	terminal.mute	[]	ok	noop /mute · sound was already muted
+«ai» terminal.mute [valid] do the thing	ai	terminal.mute	[]	ok	noop /mute · sound was already muted
+«ai» terminal.orchestrate [alien] do the thing	ai	terminal.orchestrate	[["nonsense","x"]]	refused	error /orchestrate: takes no argument named "nonsense"
+«ai» terminal.orchestrate [bool] do the thing	ai	terminal.orchestrate	[]	refused	error /orchestrate: "goal" must be text or a number (got true/false)
+«ai» terminal.orchestrate [empty] do the thing	ai	terminal.orchestrate	[]	error:invalid-args	error /orchestrate: a goal (or recipe-id + args) is required
+«ai» terminal.orchestrate [valid] do the thing	ai	terminal.orchestrate	[["goal","fix the bug"]]	error:no-run-id	error /orchestrate: conductor did not return a run id
+«ai» terminal.plan-implement [alien] do the thing	ai	terminal.plan-implement	[["nonsense","x"]]	refused	error /plan-implement: takes no arguments (got "nonsense")
+«ai» terminal.plan-implement [bool] do the thing	ai	terminal.plan-implement	[]	refused	error /plan-implement: "count" must be text or a number (got true/false)
+«ai» terminal.plan-implement [empty] do the thing	ai	terminal.plan-implement	[]	error:no-plan	error /plan-implement: no PLAN*.md / TODO*.md file detected in workspace
+«ai» terminal.plan-implement [valid] do the thing	ai	terminal.plan-implement	[]	error:no-plan	error /plan-implement: no PLAN*.md / TODO*.md file detected in workspace
+«ai» terminal.plan-refresh [alien] do the thing	ai	terminal.plan-refresh	[["nonsense","x"]]	refused	error /plan-refresh: takes no arguments (got "nonsense")
+«ai» terminal.plan-refresh [bool] do the thing	ai	terminal.plan-refresh	[]	refused	error /plan-refresh: "count" must be text or a number (got true/false)
+«ai» terminal.plan-refresh [empty] do the thing	ai	terminal.plan-refresh	[]	ok	noop /plan-refresh · no plan files reloaded — no PLAN*.md / TODO*.md in the workspace
+«ai» terminal.plan-refresh [valid] do the thing	ai	terminal.plan-refresh	[]	ok	noop /plan-refresh · no plan files reloaded — no PLAN*.md / TODO*.md in the workspace
+«ai» terminal.plan-verify [alien] do the thing	ai	terminal.plan-verify	[["nonsense","x"]]	refused	error /plan-verify: takes no arguments (got "nonsense")
+«ai» terminal.plan-verify [bool] do the thing	ai	terminal.plan-verify	[]	refused	error /plan-verify: "count" must be text or a number (got true/false)
+«ai» terminal.plan-verify [empty] do the thing	ai	terminal.plan-verify	[]	error:no-plan	error /plan-verify: no PLAN*.md / TODO*.md file detected in workspace
+«ai» terminal.plan-verify [valid] do the thing	ai	terminal.plan-verify	[]	error:no-plan	error /plan-verify: no PLAN*.md / TODO*.md file detected in workspace
+«ai» terminal.prompt [alien] do the thing	ai	terminal.prompt	[["nonsense","x"]]	refused	error /prompt: takes no arguments (got "nonsense")
+«ai» terminal.prompt [bool] do the thing	ai	terminal.prompt	[]	refused	error /prompt: "count" must be text or a number (got true/false)
+«ai» terminal.prompt [empty] do the thing	ai	terminal.prompt	[]	ok	ok /prompt ✓ opened the prompt library
+«ai» terminal.prompt [valid] do the thing	ai	terminal.prompt	[]	ok	ok /prompt ✓ opened the prompt library
+«ai» terminal.restart [alien] do the thing	ai	terminal.restart	[["nonsense","x"]]	refused	error /restart: takes no argument named "nonsense"
+«ai» terminal.restart [bool] do the thing	ai	terminal.restart	[]	refused	error /restart: "zone" must be text or a number (got true/false)
+«ai» terminal.restart [empty] do the thing	ai	terminal.restart	[]	error:not-restartable	error /restart: session state is needs-input
+«ai» terminal.restart [valid] do the thing	ai	terminal.restart	[["zone",1]]	error:not-restartable	error /restart: session state is needs-input
+«ai» terminal.resume [alien] do the thing	ai	terminal.resume	[["nonsense","x"]]	refused	error /resume: takes no arguments (got "nonsense")
+«ai» terminal.resume [bool] do the thing	ai	terminal.resume	[]	refused	error /resume: "count" must be text or a number (got true/false)
+«ai» terminal.resume [empty] do the thing	ai	terminal.resume	[]	ok	ok /resume ✓ opened the sessions sidebar
+«ai» terminal.resume [valid] do the thing	ai	terminal.resume	[]	ok	ok /resume ✓ opened the sessions sidebar
+«ai» terminal.save-workflow [alien] do the thing	ai	terminal.save-workflow	[["nonsense","x"]]	refused	error /save-workflow: takes no arguments (got "nonsense")
+«ai» terminal.save-workflow [bool] do the thing	ai	terminal.save-workflow	[]	refused	error /save-workflow: "count" must be text or a number (got true/false)
+«ai» terminal.save-workflow [empty] do the thing	ai	terminal.save-workflow	[]	error:no-workflow	error /save-workflow: generate a workflow first via /generate
+«ai» terminal.save-workflow [valid] do the thing	ai	terminal.save-workflow	[]	error:no-workflow	error /save-workflow: generate a workflow first via /generate
+«ai» terminal.select-by-state [alien] do the thing	ai	terminal.select-by-state	[["nonsense","x"]]	refused	error /select-by-state: takes no argument named "nonsense"
+«ai» terminal.select-by-state [bool] do the thing	ai	terminal.select-by-state	[]	refused	error /select-by-state: "state" must be text or a number (got true/false)
+«ai» terminal.select-by-state [empty] do the thing	ai	terminal.select-by-state	[]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
+«ai» terminal.select-by-state [valid] do the thing	ai	terminal.select-by-state	[["state","idle"]]	ok	ok /select-by-state ✓ selected 1 zone — idle
+«ai» terminal.show-shortcuts [alien] do the thing	ai	terminal.show-shortcuts	[["nonsense","x"]]	refused	error /shortcuts: takes no arguments (got "nonsense")
+«ai» terminal.show-shortcuts [bool] do the thing	ai	terminal.show-shortcuts	[]	refused	error /shortcuts: "count" must be text or a number (got true/false)
+«ai» terminal.show-shortcuts [empty] do the thing	ai	terminal.show-shortcuts	[]	ok	ok /shortcuts ✓ opened the shortcuts overlay
+«ai» terminal.show-shortcuts [valid] do the thing	ai	terminal.show-shortcuts	[]	ok	ok /shortcuts ✓ opened the shortcuts overlay
+«ai» terminal.sort-zones [alien] do the thing	ai	terminal.sort-zones	[["nonsense","x"]]	refused	error /sort-zones: takes no arguments (got "nonsense")
+«ai» terminal.sort-zones [bool] do the thing	ai	terminal.sort-zones	[]	refused	error /sort-zones: "count" must be text or a number (got true/false)
+«ai» terminal.sort-zones [empty] do the thing	ai	terminal.sort-zones	[]	ok	noop /sort-zones · no zones moved — grid was already sorted
+«ai» terminal.sort-zones [valid] do the thing	ai	terminal.sort-zones	[]	ok	noop /sort-zones · no zones moved — grid was already sorted
+«ai» terminal.spawn [alien] do the thing	ai	terminal.spawn	[["nonsense","x"]]	refused	error /spawn: takes no argument named "nonsense"
+«ai» terminal.spawn [bool] do the thing	ai	terminal.spawn	[]	refused	error /spawn: "count" must be text or a number (got true/false)
+«ai» terminal.spawn [empty] do the thing	ai	terminal.spawn	[]	ok	ok /spawn ✓
+«ai» terminal.spawn [valid] do the thing	ai	terminal.spawn	[["count",1]]	ok	ok /spawn ✓
+«ai» terminal.spawn-ai [alien] do the thing	ai	terminal.spawn-ai	[["nonsense","x"]]	refused	error /spawn-ai: takes no argument named "nonsense"
+«ai» terminal.spawn-ai [bool] do the thing	ai	terminal.spawn-ai	[]	refused	error /spawn-ai: "count" must be text or a number (got true/false)
+«ai» terminal.spawn-ai [empty] do the thing	ai	terminal.spawn-ai	[]	ok	ok /spawn-ai ✓
+«ai» terminal.spawn-ai [valid] do the thing	ai	terminal.spawn-ai	[["account","gmail"],["context","fix the bug"],["count",1],["tenant","acme"]]	ok	ok /spawn-ai ✓
+«ai» terminal.spawn-with [alien] do the thing	ai	terminal.spawn-with	[["nonsense","x"]]	refused	error /spawn-with: takes no argument named "nonsense"
+«ai» terminal.spawn-with [bool] do the thing	ai	terminal.spawn-with	[]	refused	error /spawn-with: "count" must be text or a number (got true/false)
+«ai» terminal.spawn-with [empty] do the thing	ai	terminal.spawn-with	[]	error:invalid-command	error /spawn-with: command is required
+«ai» terminal.spawn-with [valid] do the thing	ai	terminal.spawn-with	[["command","ls"],["count",1]]	ok	ok /spawn-with ✓
+«ai» terminal.swap [alien] do the thing	ai	terminal.swap	[["nonsense","x"]]	refused	error /swap: takes no argument named "nonsense"
+«ai» terminal.swap [bool] do the thing	ai	terminal.swap	[]	refused	error /swap: "a" must be text or a number (got true/false)
+«ai» terminal.swap [empty] do the thing	ai	terminal.swap	[]	error:invalid-args	error /swap: a and b required
+«ai» terminal.swap [valid] do the thing	ai	terminal.swap	[["a",1],["b",2]]	ok	ok /swap ✓ moved 2 sessions
+«ai» terminal.tag-clear [alien] do the thing	ai	terminal.tag-clear	[["nonsense","x"]]	refused	error /tag-clear: takes no arguments (got "nonsense")
+«ai» terminal.tag-clear [bool] do the thing	ai	terminal.tag-clear	[]	refused	error /tag-clear: "count" must be text or a number (got true/false)
+«ai» terminal.tag-clear [empty] do the thing	ai	terminal.tag-clear	[]	ok	noop /tag-clear · no tag filters cleared
+«ai» terminal.tag-clear [valid] do the thing	ai	terminal.tag-clear	[]	ok	noop /tag-clear · no tag filters cleared
+«ai» terminal.tag-toggle [alien] do the thing	ai	terminal.tag-toggle	[["nonsense","x"]]	refused	error /tag: takes no argument named "nonsense"
+«ai» terminal.tag-toggle [bool] do the thing	ai	terminal.tag-toggle	[]	refused	error /tag: "tag" must be text or a number (got true/false)
+«ai» terminal.tag-toggle [empty] do the thing	ai	terminal.tag-toggle	[]	error:invalid-args	error /tag: tag required
+«ai» terminal.tag-toggle [valid] do the thing	ai	terminal.tag-toggle	[["tag","gmail"]]	error:unknown-tag	error /tag: "gmail" is not a zone tag (have: alpha)
+«ai» terminal.toggle-auto-focus [alien] do the thing	ai	terminal.toggle-auto-focus	[["nonsense","x"]]	refused	error /auto-focus: takes no arguments (got "nonsense")
+«ai» terminal.toggle-auto-focus [bool] do the thing	ai	terminal.toggle-auto-focus	[]	refused	error /auto-focus: "count" must be text or a number (got true/false)
+«ai» terminal.toggle-auto-focus [empty] do the thing	ai	terminal.toggle-auto-focus	[]	ok	ok /auto-focus ✓ enabled auto-focus
+«ai» terminal.toggle-auto-focus [valid] do the thing	ai	terminal.toggle-auto-focus	[]	ok	ok /auto-focus ✓ enabled auto-focus
+«ai» terminal.toggle-auto-restart [alien] do the thing	ai	terminal.toggle-auto-restart	[["nonsense","x"]]	refused	error /auto-restart: takes no arguments (got "nonsense")
+«ai» terminal.toggle-auto-restart [bool] do the thing	ai	terminal.toggle-auto-restart	[]	refused	error /auto-restart: "count" must be text or a number (got true/false)
+«ai» terminal.toggle-auto-restart [empty] do the thing	ai	terminal.toggle-auto-restart	[]	ok	ok /auto-restart ✓ enabled auto-restart
+«ai» terminal.toggle-auto-restart [valid] do the thing	ai	terminal.toggle-auto-restart	[]	ok	ok /auto-restart ✓ enabled auto-restart
+«ai» terminal.toggle-desktop-notify [alien] do the thing	ai	terminal.toggle-desktop-notify	[["nonsense","x"]]	refused	error /desktop-notify: takes no arguments (got "nonsense")
+«ai» terminal.toggle-desktop-notify [bool] do the thing	ai	terminal.toggle-desktop-notify	[]	refused	error /desktop-notify: "count" must be text or a number (got true/false)
+«ai» terminal.toggle-desktop-notify [empty] do the thing	ai	terminal.toggle-desktop-notify	[]	ok	ok /desktop-notify ✓ enabled desktop notifications
+«ai» terminal.toggle-desktop-notify [valid] do the thing	ai	terminal.toggle-desktop-notify	[]	ok	ok /desktop-notify ✓ enabled desktop notifications
+«ai» terminal.toggle-file-ownership [alien] do the thing	ai	terminal.toggle-file-ownership	[["nonsense","x"]]	refused	error /file-ownership: takes no arguments (got "nonsense")
+«ai» terminal.toggle-file-ownership [bool] do the thing	ai	terminal.toggle-file-ownership	[]	refused	error /file-ownership: "count" must be text or a number (got true/false)
+«ai» terminal.toggle-file-ownership [empty] do the thing	ai	terminal.toggle-file-ownership	[]	ok	ok /file-ownership ✓ opened the file-ownership heatmap
+«ai» terminal.toggle-file-ownership [valid] do the thing	ai	terminal.toggle-file-ownership	[]	ok	ok /file-ownership ✓ opened the file-ownership heatmap
+«ai» terminal.toggle-findings [alien] do the thing	ai	terminal.toggle-findings	[["nonsense","x"]]	refused	error /findings: takes no arguments (got "nonsense")
+«ai» terminal.toggle-findings [bool] do the thing	ai	terminal.toggle-findings	[]	refused	error /findings: "count" must be text or a number (got true/false)
+«ai» terminal.toggle-findings [empty] do the thing	ai	terminal.toggle-findings	[]	ok	ok /findings ✓ opened the findings panel
+«ai» terminal.toggle-findings [valid] do the thing	ai	terminal.toggle-findings	[]	ok	ok /findings ✓ opened the findings panel
+«ai» terminal.toggle-focus-mode [alien] do the thing	ai	terminal.toggle-focus-mode	[["nonsense","x"]]	refused	error /focus-mode: takes no arguments (got "nonsense")
+«ai» terminal.toggle-focus-mode [bool] do the thing	ai	terminal.toggle-focus-mode	[]	refused	error /focus-mode: "count" must be text or a number (got true/false)
+«ai» terminal.toggle-focus-mode [empty] do the thing	ai	terminal.toggle-focus-mode	[]	ok	ok /focus-mode ✓ enabled focus mode
+«ai» terminal.toggle-focus-mode [valid] do the thing	ai	terminal.toggle-focus-mode	[]	ok	ok /focus-mode ✓ enabled focus mode
+«ai» terminal.toggle-sessions-sidebar [alien] do the thing	ai	terminal.toggle-sessions-sidebar	[["nonsense","x"]]	refused	error /sessions: takes no arguments (got "nonsense")
+«ai» terminal.toggle-sessions-sidebar [bool] do the thing	ai	terminal.toggle-sessions-sidebar	[]	refused	error /sessions: "count" must be text or a number (got true/false)
+«ai» terminal.toggle-sessions-sidebar [empty] do the thing	ai	terminal.toggle-sessions-sidebar	[]	ok	ok /sessions ✓ opened the sessions sidebar
+«ai» terminal.toggle-sessions-sidebar [valid] do the thing	ai	terminal.toggle-sessions-sidebar	[]	ok	ok /sessions ✓ opened the sessions sidebar
+«ai» terminal.toggle-sound [alien] do the thing	ai	terminal.toggle-sound	[["nonsense","x"]]	refused	error /sound: takes no arguments (got "nonsense")
+«ai» terminal.toggle-sound [bool] do the thing	ai	terminal.toggle-sound	[]	refused	error /sound: "count" must be text or a number (got true/false)
+«ai» terminal.toggle-sound [empty] do the thing	ai	terminal.toggle-sound	[]	ok	ok /sound ✓ unmuted sound
+«ai» terminal.toggle-sound [valid] do the thing	ai	terminal.toggle-sound	[]	ok	ok /sound ✓ unmuted sound
+«ai» terminal.unmute [alien] do the thing	ai	terminal.unmute	[["nonsense","x"]]	refused	error /unmute: takes no arguments (got "nonsense")
+«ai» terminal.unmute [bool] do the thing	ai	terminal.unmute	[]	refused	error /unmute: "count" must be text or a number (got true/false)
+«ai» terminal.unmute [empty] do the thing	ai	terminal.unmute	[]	ok	ok /unmute ✓ unmuted sound
+«ai» terminal.unmute [valid] do the thing	ai	terminal.unmute	[]	ok	ok /unmute ✓ unmuted sound
+«direct» terminal.analyze [alien]	direct	terminal.analyze	[["nonsense","x"]]	threw	error /analyze: takes no argument named "nonsense"
+«direct» terminal.analyze [bool]	direct	terminal.analyze	[["type",true]]	threw	error /analyze: "type" must be text or a number (got true/false)
+«direct» terminal.analyze [empty]	direct	terminal.analyze	[]	threw	error /analyze: type must be one of: session-summary, architecture, change-impact, progress, cross-tab, page-architecture
+«direct» terminal.analyze [valid]	direct	terminal.analyze	[["type","progress"]]	ok	ok /analyze ✓ produced 2 analysis panels — progress
+«direct» terminal.approve-all [alien]	direct	terminal.approve-all	[["nonsense","x"]]	threw	error /approve-all: takes no arguments (got "nonsense")
+«direct» terminal.approve-all [bool]	direct	terminal.approve-all	[["count",true]]	threw	error /approve-all: "count" must be text or a number (got true/false)
+«direct» terminal.approve-all [empty]	direct	terminal.approve-all	[]	ok	error /approve-all ✗ approved 0 of 1 session — 1 TERMINAL_WRITE_FAILED
+«direct» terminal.approve-all [valid]	direct	terminal.approve-all	[]	ok	error /approve-all ✗ approved 0 of 1 session — 1 TERMINAL_WRITE_FAILED
+«direct» terminal.auto-approve [alien]	direct	terminal.auto-approve	[["nonsense","x"]]	threw	error /auto-approve: takes no argument named "nonsense"
+«direct» terminal.auto-approve [bool]	direct	terminal.auto-approve	[["action",true]]	threw	error /auto-approve: "action" must be text or a number (got true/false)
+«direct» terminal.auto-approve [empty]	direct	terminal.auto-approve	[]	threw	error /auto-approve: action is required (add, remove, list, clear)
+«direct» terminal.auto-approve [valid]	direct	terminal.auto-approve	[["action","list"],["pattern","yes"]]	ok	ok /auto-approve ✓ listed 1 auto-approve pattern — armed
+«direct» terminal.close [alien]	direct	terminal.close	[["nonsense","x"]]	threw	error /close: takes no argument named "nonsense"
+«direct» terminal.close [bool]	direct	terminal.close	[["zone",true]]	threw	error /close: "zone" must be text or a number (got true/false)
+«direct» terminal.close [empty]	direct	terminal.close	[]	ok	ok /close ✓ closed 1 session — tab-a
+«direct» terminal.close [valid]	direct	terminal.close	[["tabId","tab-1"],["zone",1]]	threw	error /close: "tab-1" is not an open tab id
+«direct» terminal.copy-names [alien]	direct	terminal.copy-names	[["nonsense","x"]]	threw	error /copy-names: takes no arguments (got "nonsense")
+«direct» terminal.copy-names [bool]	direct	terminal.copy-names	[["count",true]]	threw	error /copy-names: "count" must be text or a number (got true/false)
+«direct» terminal.copy-names [empty]	direct	terminal.copy-names	[]	threw	error /copy-names: no live Claude Code sessions found
+«direct» terminal.copy-names [valid]	direct	terminal.copy-names	[]	threw	error /copy-names: no live Claude Code sessions found
+«direct» terminal.doc-finder [alien]	direct	terminal.doc-finder	[["nonsense","x"]]	threw	error /doc-finder: takes no arguments (got "nonsense")
+«direct» terminal.doc-finder [bool]	direct	terminal.doc-finder	[["count",true]]	threw	error /doc-finder: "count" must be text or a number (got true/false)
+«direct» terminal.doc-finder [empty]	direct	terminal.doc-finder	[]	ok	ok /doc-finder ✓ opened the doc finder
+«direct» terminal.doc-finder [valid]	direct	terminal.doc-finder	[]	ok	ok /doc-finder ✓ opened the doc finder
+«direct» terminal.export-all [alien]	direct	terminal.export-all	[["nonsense","x"]]	threw	error /export-all: takes no arguments (got "nonsense")
+«direct» terminal.export-all [bool]	direct	terminal.export-all	[["count",true]]	threw	error /export-all: "count" must be text or a number (got true/false)
+«direct» terminal.export-all [empty]	direct	terminal.export-all	[]	ok	ok /export-all ✓ exported 2 sessions
+«direct» terminal.export-all [valid]	direct	terminal.export-all	[]	ok	ok /export-all ✓ exported 2 sessions
+«direct» terminal.focus [alien]	direct	terminal.focus	[["nonsense","x"]]	threw	error /focus: takes no argument named "nonsense"
+«direct» terminal.focus [bool]	direct	terminal.focus	[["target",true]]	threw	error /focus: "target" must be text or a number (got true/false)
+«direct» terminal.focus [empty]	direct	terminal.focus	[]	threw	error /focus: target is required (a zone number, next, prev or needs-input)
+«direct» terminal.focus [valid]	direct	terminal.focus	[["target","next"]]	ok	ok /focus ✓ focused 1 zone
+«direct» terminal.generate-workflow [alien]	direct	terminal.generate-workflow	[["nonsense","x"]]	threw	error /generate: takes no arguments (got "nonsense")
+«direct» terminal.generate-workflow [bool]	direct	terminal.generate-workflow	[["count",true]]	threw	error /generate: "count" must be text or a number (got true/false)
+«direct» terminal.generate-workflow [empty]	direct	terminal.generate-workflow	[]	threw	error /generate: no session
+«direct» terminal.generate-workflow [valid]	direct	terminal.generate-workflow	[]	threw	error /generate: no session
+«direct» terminal.history [alien]	direct	terminal.history	[["nonsense","x"]]	threw	error /history: takes no arguments (got "nonsense")
+«direct» terminal.history [bool]	direct	terminal.history	[["count",true]]	threw	error /history: "count" must be text or a number (got true/false)
+«direct» terminal.history [empty]	direct	terminal.history	[]	ok	noop /history · no events showed
+«direct» terminal.history [valid]	direct	terminal.history	[]	ok	noop /history · no events showed
+«direct» terminal.layout [alien]	direct	terminal.layout	[["nonsense","x"]]	threw	error /layout: takes no argument named "nonsense"
+«direct» terminal.layout [bool]	direct	terminal.layout	[["preset",true]]	threw	error /layout: "preset" must be text or a number (got true/false)
+«direct» terminal.layout [empty]	direct	terminal.layout	[]	threw	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
+«direct» terminal.layout [valid]	direct	terminal.layout	[["preset","six-pack"]]	ok	ok /layout ✓ changed 1 layout — six-pack
+«direct» terminal.maximize [alien]	direct	terminal.maximize	[["nonsense","x"]]	threw	error /maximize: takes no argument named "nonsense"
+«direct» terminal.maximize [bool]	direct	terminal.maximize	[["zone",true]]	threw	error /maximize: "zone" must be text or a number (got true/false)
+«direct» terminal.maximize [empty]	direct	terminal.maximize	[]	ok	ok /maximize ✓ maximized zone 1
+«direct» terminal.maximize [valid]	direct	terminal.maximize	[["zone",1]]	ok	ok /maximize ✓ maximized zone 1
+«direct» terminal.metrics [alien]	direct	terminal.metrics	[["nonsense","x"]]	threw	error /metrics: takes no arguments (got "nonsense")
+«direct» terminal.metrics [bool]	direct	terminal.metrics	[["count",true]]	threw	error /metrics: "count" must be text or a number (got true/false)
+«direct» terminal.metrics [empty]	direct	terminal.metrics	[]	ok	ok /metrics ✓ showed 8 metrics
+«direct» terminal.metrics [valid]	direct	terminal.metrics	[]	ok	ok /metrics ✓ showed 8 metrics
+«direct» terminal.mute [alien]	direct	terminal.mute	[["nonsense","x"]]	threw	error /mute: takes no arguments (got "nonsense")
+«direct» terminal.mute [bool]	direct	terminal.mute	[["count",true]]	threw	error /mute: "count" must be text or a number (got true/false)
+«direct» terminal.mute [empty]	direct	terminal.mute	[]	ok	noop /mute · sound was already muted
+«direct» terminal.mute [valid]	direct	terminal.mute	[]	ok	noop /mute · sound was already muted
+«direct» terminal.orchestrate [alien]	direct	terminal.orchestrate	[["nonsense","x"]]	threw	error /orchestrate: takes no argument named "nonsense"
+«direct» terminal.orchestrate [bool]	direct	terminal.orchestrate	[["goal",true]]	threw	error /orchestrate: "goal" must be text or a number (got true/false)
+«direct» terminal.orchestrate [empty]	direct	terminal.orchestrate	[]	threw	error /orchestrate: a goal (or recipe-id + args) is required
+«direct» terminal.orchestrate [valid]	direct	terminal.orchestrate	[["goal","fix the bug"]]	threw	error /orchestrate: conductor did not return a run id
+«direct» terminal.plan-implement [alien]	direct	terminal.plan-implement	[["nonsense","x"]]	threw	error /plan-implement: takes no arguments (got "nonsense")
+«direct» terminal.plan-implement [bool]	direct	terminal.plan-implement	[["count",true]]	threw	error /plan-implement: "count" must be text or a number (got true/false)
+«direct» terminal.plan-implement [empty]	direct	terminal.plan-implement	[]	threw	error /plan-implement: no PLAN*.md / TODO*.md file detected in workspace
+«direct» terminal.plan-implement [valid]	direct	terminal.plan-implement	[]	threw	error /plan-implement: no PLAN*.md / TODO*.md file detected in workspace
+«direct» terminal.plan-refresh [alien]	direct	terminal.plan-refresh	[["nonsense","x"]]	threw	error /plan-refresh: takes no arguments (got "nonsense")
+«direct» terminal.plan-refresh [bool]	direct	terminal.plan-refresh	[["count",true]]	threw	error /plan-refresh: "count" must be text or a number (got true/false)
+«direct» terminal.plan-refresh [empty]	direct	terminal.plan-refresh	[]	ok	noop /plan-refresh · no plan files reloaded — no PLAN*.md / TODO*.md in the workspace
+«direct» terminal.plan-refresh [valid]	direct	terminal.plan-refresh	[]	ok	noop /plan-refresh · no plan files reloaded — no PLAN*.md / TODO*.md in the workspace
+«direct» terminal.plan-verify [alien]	direct	terminal.plan-verify	[["nonsense","x"]]	threw	error /plan-verify: takes no arguments (got "nonsense")
+«direct» terminal.plan-verify [bool]	direct	terminal.plan-verify	[["count",true]]	threw	error /plan-verify: "count" must be text or a number (got true/false)
+«direct» terminal.plan-verify [empty]	direct	terminal.plan-verify	[]	threw	error /plan-verify: no PLAN*.md / TODO*.md file detected in workspace
+«direct» terminal.plan-verify [valid]	direct	terminal.plan-verify	[]	threw	error /plan-verify: no PLAN*.md / TODO*.md file detected in workspace
+«direct» terminal.prompt [alien]	direct	terminal.prompt	[["nonsense","x"]]	threw	error /prompt: takes no arguments (got "nonsense")
+«direct» terminal.prompt [bool]	direct	terminal.prompt	[["count",true]]	threw	error /prompt: "count" must be text or a number (got true/false)
+«direct» terminal.prompt [empty]	direct	terminal.prompt	[]	ok	ok /prompt ✓ opened the prompt library
+«direct» terminal.prompt [valid]	direct	terminal.prompt	[]	ok	ok /prompt ✓ opened the prompt library
+«direct» terminal.restart [alien]	direct	terminal.restart	[["nonsense","x"]]	threw	error /restart: takes no argument named "nonsense"
+«direct» terminal.restart [bool]	direct	terminal.restart	[["zone",true]]	threw	error /restart: "zone" must be text or a number (got true/false)
+«direct» terminal.restart [empty]	direct	terminal.restart	[]	threw	error /restart: session state is needs-input
+«direct» terminal.restart [valid]	direct	terminal.restart	[["zone",1]]	threw	error /restart: session state is needs-input
+«direct» terminal.resume [alien]	direct	terminal.resume	[["nonsense","x"]]	threw	error /resume: takes no arguments (got "nonsense")
+«direct» terminal.resume [bool]	direct	terminal.resume	[["count",true]]	threw	error /resume: "count" must be text or a number (got true/false)
+«direct» terminal.resume [empty]	direct	terminal.resume	[]	ok	ok /resume ✓ opened the sessions sidebar
+«direct» terminal.resume [valid]	direct	terminal.resume	[]	ok	ok /resume ✓ opened the sessions sidebar
+«direct» terminal.save-workflow [alien]	direct	terminal.save-workflow	[["nonsense","x"]]	threw	error /save-workflow: takes no arguments (got "nonsense")
+«direct» terminal.save-workflow [bool]	direct	terminal.save-workflow	[["count",true]]	threw	error /save-workflow: "count" must be text or a number (got true/false)
+«direct» terminal.save-workflow [empty]	direct	terminal.save-workflow	[]	threw	error /save-workflow: generate a workflow first via /generate
+«direct» terminal.save-workflow [valid]	direct	terminal.save-workflow	[]	threw	error /save-workflow: generate a workflow first via /generate
+«direct» terminal.select-by-state [alien]	direct	terminal.select-by-state	[["nonsense","x"]]	threw	error /select-by-state: takes no argument named "nonsense"
+«direct» terminal.select-by-state [bool]	direct	terminal.select-by-state	[["state",true]]	threw	error /select-by-state: "state" must be text or a number (got true/false)
+«direct» terminal.select-by-state [empty]	direct	terminal.select-by-state	[]	threw	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
+«direct» terminal.select-by-state [valid]	direct	terminal.select-by-state	[["state","idle"]]	ok	ok /select-by-state ✓ selected 1 zone — idle
+«direct» terminal.show-shortcuts [alien]	direct	terminal.show-shortcuts	[["nonsense","x"]]	threw	error /shortcuts: takes no arguments (got "nonsense")
+«direct» terminal.show-shortcuts [bool]	direct	terminal.show-shortcuts	[["count",true]]	threw	error /shortcuts: "count" must be text or a number (got true/false)
+«direct» terminal.show-shortcuts [empty]	direct	terminal.show-shortcuts	[]	ok	ok /shortcuts ✓ opened the shortcuts overlay
+«direct» terminal.show-shortcuts [valid]	direct	terminal.show-shortcuts	[]	ok	ok /shortcuts ✓ opened the shortcuts overlay
+«direct» terminal.sort-zones [alien]	direct	terminal.sort-zones	[["nonsense","x"]]	threw	error /sort-zones: takes no arguments (got "nonsense")
+«direct» terminal.sort-zones [bool]	direct	terminal.sort-zones	[["count",true]]	threw	error /sort-zones: "count" must be text or a number (got true/false)
+«direct» terminal.sort-zones [empty]	direct	terminal.sort-zones	[]	ok	noop /sort-zones · no zones moved — grid was already sorted
+«direct» terminal.sort-zones [valid]	direct	terminal.sort-zones	[]	ok	noop /sort-zones · no zones moved — grid was already sorted
+«direct» terminal.spawn [alien]	direct	terminal.spawn	[["nonsense","x"]]	threw	error /spawn: takes no argument named "nonsense"
+«direct» terminal.spawn [bool]	direct	terminal.spawn	[["count",true]]	threw	error /spawn: "count" must be text or a number (got true/false)
+«direct» terminal.spawn [empty]	direct	terminal.spawn	[]	ok	ok /spawn ✓
+«direct» terminal.spawn [valid]	direct	terminal.spawn	[["count",1]]	ok	ok /spawn ✓
+«direct» terminal.spawn-ai [alien]	direct	terminal.spawn-ai	[["nonsense","x"]]	threw	error /spawn-ai: takes no argument named "nonsense"
+«direct» terminal.spawn-ai [bool]	direct	terminal.spawn-ai	[["count",true]]	threw	error /spawn-ai: "count" must be text or a number (got true/false)
+«direct» terminal.spawn-ai [empty]	direct	terminal.spawn-ai	[]	ok	ok /spawn-ai ✓
+«direct» terminal.spawn-ai [valid]	direct	terminal.spawn-ai	[["account","gmail"],["context","fix the bug"],["count",1],["tenant","acme"]]	ok	ok /spawn-ai ✓
+«direct» terminal.spawn-with [alien]	direct	terminal.spawn-with	[["nonsense","x"]]	threw	error /spawn-with: takes no argument named "nonsense"
+«direct» terminal.spawn-with [bool]	direct	terminal.spawn-with	[["count",true]]	threw	error /spawn-with: "count" must be text or a number (got true/false)
+«direct» terminal.spawn-with [empty]	direct	terminal.spawn-with	[]	threw	error /spawn-with: command is required
+«direct» terminal.spawn-with [valid]	direct	terminal.spawn-with	[["command","ls"],["count",1]]	ok	ok /spawn-with ✓
+«direct» terminal.swap [alien]	direct	terminal.swap	[["nonsense","x"]]	threw	error /swap: takes no argument named "nonsense"
+«direct» terminal.swap [bool]	direct	terminal.swap	[["a",true]]	threw	error /swap: "a" must be text or a number (got true/false)
+«direct» terminal.swap [empty]	direct	terminal.swap	[]	threw	error /swap: a and b required
+«direct» terminal.swap [valid]	direct	terminal.swap	[["a",1],["b",2]]	ok	ok /swap ✓ moved 2 sessions
+«direct» terminal.tag-clear [alien]	direct	terminal.tag-clear	[["nonsense","x"]]	threw	error /tag-clear: takes no arguments (got "nonsense")
+«direct» terminal.tag-clear [bool]	direct	terminal.tag-clear	[["count",true]]	threw	error /tag-clear: "count" must be text or a number (got true/false)
+«direct» terminal.tag-clear [empty]	direct	terminal.tag-clear	[]	ok	noop /tag-clear · no tag filters cleared
+«direct» terminal.tag-clear [valid]	direct	terminal.tag-clear	[]	ok	noop /tag-clear · no tag filters cleared
+«direct» terminal.tag-toggle [alien]	direct	terminal.tag-toggle	[["nonsense","x"]]	threw	error /tag: takes no argument named "nonsense"
+«direct» terminal.tag-toggle [bool]	direct	terminal.tag-toggle	[["tag",true]]	threw	error /tag: "tag" must be text or a number (got true/false)
+«direct» terminal.tag-toggle [empty]	direct	terminal.tag-toggle	[]	threw	error /tag: tag required
+«direct» terminal.tag-toggle [valid]	direct	terminal.tag-toggle	[["tag","gmail"]]	threw	error /tag: "gmail" is not a zone tag (have: alpha)
+«direct» terminal.toggle-auto-focus [alien]	direct	terminal.toggle-auto-focus	[["nonsense","x"]]	threw	error /auto-focus: takes no arguments (got "nonsense")
+«direct» terminal.toggle-auto-focus [bool]	direct	terminal.toggle-auto-focus	[["count",true]]	threw	error /auto-focus: "count" must be text or a number (got true/false)
+«direct» terminal.toggle-auto-focus [empty]	direct	terminal.toggle-auto-focus	[]	ok	ok /auto-focus ✓ enabled auto-focus
+«direct» terminal.toggle-auto-focus [valid]	direct	terminal.toggle-auto-focus	[]	ok	ok /auto-focus ✓ enabled auto-focus
+«direct» terminal.toggle-auto-restart [alien]	direct	terminal.toggle-auto-restart	[["nonsense","x"]]	threw	error /auto-restart: takes no arguments (got "nonsense")
+«direct» terminal.toggle-auto-restart [bool]	direct	terminal.toggle-auto-restart	[["count",true]]	threw	error /auto-restart: "count" must be text or a number (got true/false)
+«direct» terminal.toggle-auto-restart [empty]	direct	terminal.toggle-auto-restart	[]	ok	ok /auto-restart ✓ enabled auto-restart
+«direct» terminal.toggle-auto-restart [valid]	direct	terminal.toggle-auto-restart	[]	ok	ok /auto-restart ✓ enabled auto-restart
+«direct» terminal.toggle-desktop-notify [alien]	direct	terminal.toggle-desktop-notify	[["nonsense","x"]]	threw	error /desktop-notify: takes no arguments (got "nonsense")
+«direct» terminal.toggle-desktop-notify [bool]	direct	terminal.toggle-desktop-notify	[["count",true]]	threw	error /desktop-notify: "count" must be text or a number (got true/false)
+«direct» terminal.toggle-desktop-notify [empty]	direct	terminal.toggle-desktop-notify	[]	ok	ok /desktop-notify ✓ enabled desktop notifications
+«direct» terminal.toggle-desktop-notify [valid]	direct	terminal.toggle-desktop-notify	[]	ok	ok /desktop-notify ✓ enabled desktop notifications
+«direct» terminal.toggle-file-ownership [alien]	direct	terminal.toggle-file-ownership	[["nonsense","x"]]	threw	error /file-ownership: takes no arguments (got "nonsense")
+«direct» terminal.toggle-file-ownership [bool]	direct	terminal.toggle-file-ownership	[["count",true]]	threw	error /file-ownership: "count" must be text or a number (got true/false)
+«direct» terminal.toggle-file-ownership [empty]	direct	terminal.toggle-file-ownership	[]	ok	ok /file-ownership ✓ opened the file-ownership heatmap
+«direct» terminal.toggle-file-ownership [valid]	direct	terminal.toggle-file-ownership	[]	ok	ok /file-ownership ✓ opened the file-ownership heatmap
+«direct» terminal.toggle-findings [alien]	direct	terminal.toggle-findings	[["nonsense","x"]]	threw	error /findings: takes no arguments (got "nonsense")
+«direct» terminal.toggle-findings [bool]	direct	terminal.toggle-findings	[["count",true]]	threw	error /findings: "count" must be text or a number (got true/false)
+«direct» terminal.toggle-findings [empty]	direct	terminal.toggle-findings	[]	ok	ok /findings ✓ opened the findings panel
+«direct» terminal.toggle-findings [valid]	direct	terminal.toggle-findings	[]	ok	ok /findings ✓ opened the findings panel
+«direct» terminal.toggle-focus-mode [alien]	direct	terminal.toggle-focus-mode	[["nonsense","x"]]	threw	error /focus-mode: takes no arguments (got "nonsense")
+«direct» terminal.toggle-focus-mode [bool]	direct	terminal.toggle-focus-mode	[["count",true]]	threw	error /focus-mode: "count" must be text or a number (got true/false)
+«direct» terminal.toggle-focus-mode [empty]	direct	terminal.toggle-focus-mode	[]	ok	ok /focus-mode ✓ enabled focus mode
+«direct» terminal.toggle-focus-mode [valid]	direct	terminal.toggle-focus-mode	[]	ok	ok /focus-mode ✓ enabled focus mode
+«direct» terminal.toggle-sessions-sidebar [alien]	direct	terminal.toggle-sessions-sidebar	[["nonsense","x"]]	threw	error /sessions: takes no arguments (got "nonsense")
+«direct» terminal.toggle-sessions-sidebar [bool]	direct	terminal.toggle-sessions-sidebar	[["count",true]]	threw	error /sessions: "count" must be text or a number (got true/false)
+«direct» terminal.toggle-sessions-sidebar [empty]	direct	terminal.toggle-sessions-sidebar	[]	ok	ok /sessions ✓ opened the sessions sidebar
+«direct» terminal.toggle-sessions-sidebar [valid]	direct	terminal.toggle-sessions-sidebar	[]	ok	ok /sessions ✓ opened the sessions sidebar
+«direct» terminal.toggle-sound [alien]	direct	terminal.toggle-sound	[["nonsense","x"]]	threw	error /sound: takes no arguments (got "nonsense")
+«direct» terminal.toggle-sound [bool]	direct	terminal.toggle-sound	[["count",true]]	threw	error /sound: "count" must be text or a number (got true/false)
+«direct» terminal.toggle-sound [empty]	direct	terminal.toggle-sound	[]	ok	ok /sound ✓ unmuted sound
+«direct» terminal.toggle-sound [valid]	direct	terminal.toggle-sound	[]	ok	ok /sound ✓ unmuted sound
+«direct» terminal.unmute [alien]	direct	terminal.unmute	[["nonsense","x"]]	threw	error /unmute: takes no arguments (got "nonsense")
+«direct» terminal.unmute [bool]	direct	terminal.unmute	[["count",true]]	threw	error /unmute: "count" must be text or a number (got true/false)
+«direct» terminal.unmute [empty]	direct	terminal.unmute	[]	ok	ok /unmute ✓ unmuted sound
+«direct» terminal.unmute [valid]	direct	terminal.unmute	[]	ok	ok /unmute ✓ unmuted sound

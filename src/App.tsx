@@ -107,6 +107,7 @@ import { instanceStorage } from "@/lib/instance-storage";
 import { ACTIVE_TAB_STORAGE_KEY, DEFAULT_TAB_ID, TAB_LIST } from "@/components/app/tab-types";
 import { toTabCanonical } from "@/hooks/ui-bridge-events/utils";
 import { acquireSingletonListener } from "@/hooks/ui-bridge-events/singleton-listener";
+import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
 
 import {
   NavigationProvider,
@@ -120,6 +121,9 @@ import {
 import type { LogSubTab } from "./components/app";
 
 import "./index.css";
+
+/** Hoisted so the registration and its guarded handler read one declaration. */
+const GO_TO_STEP_SCHEMA = { step: "number (0-6)" } as const;
 
 declare global {
   interface WindowEventMap {
@@ -230,13 +234,17 @@ function AppContent() {
           "Tier, Welcome, Projects, Processes, Dev Services, AI Provider, Claude Sessions. " +
           "NON-DESTRUCTIVE: opening flips in-memory view state only; the persisted " +
           "`setup_completed` setting is untouched.",
-        paramSchema: { step: "number (0-6)" },
+        paramSchema: GO_TO_STEP_SCHEMA,
         // `read` — in-memory VIEW state only; the persisted `setup_completed` setting is
         // untouched (the description above already says so). The rubric's view-toggle
         // case: it mutates something, but nothing persistent, so dim 1 risks nothing.
         effect: "read",
-        handler: (params?: unknown) => {
-          const { step } = (params ?? {}) as { step?: number };
+        // The `typeof step !== "number"` check below caught a non-scalar; what
+        // it could not see was an UNDECLARED key, which the old cast dropped
+        // in silence. Binding refuses `{step: 2, zzz: "x"}` rather than
+        // answering `success` over a field this action does not have.
+        handler: guardedHandler("go-to-step", GO_TO_STEP_SCHEMA, (args) => {
+          const { step } = args as { step?: number };
           if (
             typeof step !== "number" ||
             !Number.isInteger(step) ||
@@ -250,7 +258,7 @@ function AppContent() {
           setWizardStep(step);
           setSetupCompleted(false);
           return { success: true, step };
-        },
+        }),
       },
     ],
   });
@@ -1090,7 +1098,7 @@ function AppWithTutorials() {
           FileActivityPanel, TerminalTabBar tooltip ticks) so we don't
           burn three+ private intervals on the same cadence. Mounted
           here because every consumer of useNow1Hz lives under
-          AppContent — TerminalPage, CoordinatorDashboard, etc.
+          AppContent — TerminalPage, FileActivityPanel, etc.
         */}
         <Now1HzProvider>
           <AppContent />

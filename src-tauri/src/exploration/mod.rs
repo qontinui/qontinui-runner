@@ -24,5 +24,5 @@ pub mod fingerprint;
 pub mod types;
 
 pub use discovery::FingerprintStateDiscovery;
-pub use engine::ExplorationEngine;
+pub use engine::{ExplorationEngine, SdkTransport};
 pub use types::*;

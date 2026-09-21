@@ -1,15 +1,12 @@
 //! Tauri commands for the Doctor health monitoring service.
 //!
-//! These commands allow the frontend to query Doctor status and force-stop stuck processes.
-
-use std::sync::Arc;
+//! These commands force-stop stuck processes. The status query lives with
+//! the command handlers instead, because it resolves `AppState` out of
+//! Tauri's managed state and that type is owned there.
 
 use serde::Serialize;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
-
-use crate::commands::AppState;
-use crate::doctor::service::ProcessStatus;
 
 /// Health status info for a single monitored process (for frontend display).
 #[derive(Debug, Clone, Serialize)]
@@ -19,18 +16,6 @@ pub struct ProcessHealthInfo {
     pub label: String,
     pub status: String,
     pub inactive_checks: u32,
-}
-
-/// Query current Doctor health status of all monitored processes.
-#[tauri::command]
-pub async fn doctor_get_status(
-    app_state: tauri::State<'_, Arc<AppState>>,
-) -> Result<Vec<ProcessStatus>, String> {
-    let handle_lock = app_state.doctor_handle.lock().await;
-    match handle_lock.as_ref() {
-        Some(handle) => handle.query_status().await,
-        None => Ok(vec![]), // Doctor not started yet
-    }
 }
 
 /// Force stop a process by PID.
@@ -69,9 +54,6 @@ pub async fn stop_process_by_pid(pid: u32) -> Result<(), String> {
 /// Build the Tauri plugin that registers this module's command handlers.
 pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
     PluginBuilder::new("qontinui_doctor_commands")
-        .invoke_handler(tauri::generate_handler![
-            doctor_get_status,
-            stop_process_by_pid,
-        ])
+        .invoke_handler(tauri::generate_handler![stop_process_by_pid])
         .build()
 }

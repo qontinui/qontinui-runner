@@ -32,7 +32,7 @@
 //!
 //! Auth and network failures return `Ok` with a structured
 //! `auth: { state: ok | unauthorized | unpaired }` and a human `reason`
-//! (the `get_fleet_health` pattern) — never `Err` — so the modal can render
+//! (the `have_device_token` availability pattern) — never `Err` — so the modal can render
 //! an honest "not paired" / "coord unreachable" state. A document whose
 //! frontmatter fails to parse degrades to a parameterless prompt carrying
 //! its raw body and a `parse_error`, never dropped.
@@ -92,7 +92,7 @@ pub struct PromptTemplate {
     pub parse_error: Option<String>,
 }
 
-/// Structured auth state — the `get_fleet_health` contract.
+/// Structured auth state: `ok | unauthorized | unpaired` plus a reason.
 #[derive(Debug, Clone, Serialize)]
 pub struct PromptLibraryAuth {
     /// "ok" | "unauthorized" | "unpaired".

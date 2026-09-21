@@ -8,7 +8,7 @@
 //!   accepts an optional `role` field. Recognised roles dispatch the
 //!   matching slash-command body as the new session's first user message,
 //!   so the Coordinator can spawn an `auto-review` worker, a fresh
-//!   `coordinate` instance, etc., without a parallel HTTP route per role.
+//!   `auto-review` instance, etc., without a parallel HTTP route per role.
 //!   It also accepts a mutually-exclusive free-form `prompt` for work no role
 //!   covers — without it, an agent that had just written a task brief could
 //!   not hand it to a session, because the only alternatives were the five
@@ -47,13 +47,11 @@ use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 // =============================================================================
 
 /// Slash-command bodies the runner can dispatch automatically. Naming
-/// matches the `.claude/commands/<role>.md` filenames so `/coordinate`
+/// matches the `.claude/commands/<role>.md` filenames so `/auto-review`
 /// and friends can route by role string without a translation map.
 fn role_slash_command(role: &str) -> Option<&'static str> {
     match role {
         "auto-review" => Some("/auto-review"),
-        "coordinate" => Some("/coordinate"),
-        "decompose-plan" => Some("/decompose-plan"),
         "summarize-session" => Some("/summarize-session"),
         "implement-plan" => Some("/implement-plan"),
         _ => None,
@@ -231,8 +229,8 @@ async fn spawn_session(
                 return Err((
                     StatusCode::BAD_REQUEST,
                     format!(
-                        "Unknown role '{}'. Allowed: auto-review, coordinate, \
-                         decompose-plan, summarize-session, implement-plan",
+                        "Unknown role '{}'. Allowed: auto-review, \
+                         summarize-session, implement-plan",
                         role
                     ),
                 ));
@@ -260,7 +258,7 @@ async fn spawn_session(
     // `agent-spawn-authorization`). `/sessions/spawn` mints a session that
     // OUTLIVES the request that asked for it, so it is a
     // `standing_continuation`: a standing per-path opt-in, default OFF for a
-    // fresh user. The role (`auto-review`, `coordinate`, …) is the registry
+    // fresh user. The role (`auto-review`, `implement-plan`, …) is the registry
     // key when one was given; a plain spawn resolves against the per-path row.
     let decision = crate::agent_authorization::authorize_spawn(
         req.role.as_deref().filter(|r| !r.is_empty()),
@@ -345,8 +343,8 @@ async fn spawn_session(
     });
 
     // Build the initial prompt. For role-driven spawns the prompt IS the
-    // slash command line — Claude Code resolves `/coordinate` against the
-    // .claude/commands/coordinate.md body at session start. For plain
+    // slash command line — Claude Code resolves `/auto-review` against the
+    // .claude/commands/auto-review.md body at session start. For plain
     // spawns we fall back to a generic system prompt to match the existing
     // ad-hoc create_ai_session behaviour.
     let initial_prompt =
@@ -1167,8 +1165,8 @@ mod tests {
     #[test]
     fn a_role_still_wins_and_args_still_parameterise_it() {
         assert_eq!(
-            initial_prompt_for(Some("/coordinate"), None, None),
-            "/coordinate"
+            initial_prompt_for(Some("/auto-review"), None, None),
+            "/auto-review"
         );
         assert_eq!(
             initial_prompt_for(Some("/implement-plan"), Some(" my-plan "), None),

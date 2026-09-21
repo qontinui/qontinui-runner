@@ -12,6 +12,12 @@ import { PASTE_TEXT_INVALID, WRITE_TEXT_INVALID, requireTextPayload } from "./te
 import { writePtyById } from "./writePtyById";
 import { stripAnsi } from "./outputLineTracking";
 import { readLocalScrollbackRing } from "./backends/localScrollbackRing";
+import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
+import {
+  GET_SCROLLBACK_SCHEMA,
+  SEND_KEYS_SCHEMA,
+  TEXT_PAYLOAD_SCHEMA,
+} from "./terminalPaneActionSchemas";
 
 /**
  * Mount-independent UI Bridge elements for every terminal tab on a page.
@@ -286,33 +292,38 @@ const TerminalBridgeProxy = memo(function TerminalBridgeProxy({
               'as a raw string (written verbatim), an array of key names (["Enter"]), or ' +
               'the SDK\'s descriptor array ([{ key: "c", modifiers: { ctrl: true } }]). ' +
               "Fails with TERMINAL_EXITED when the pane's process is gone.",
-            handler: async (params?: unknown) => {
-              // MUST translate, exactly as the mounted path does
-              // (`TerminalInstance.tsx`'s `sendKeys` → `toPtySequence`).
-              //
-              // THE DEFECT this closes (manual-test-loop iter 23, item 1): this
-              // proxy handler was added after iteration 21 fixed the mounted
-              // path, and handed the raw `keys` value straight to
-              // `writePtyById`, whose `TextEncoder.encode` coerces anything
-              // non-string via `String()`. On a virtualized pane — the ONLY
-              // panes this proxy owns — `{keys:["Enter"]}` therefore typed the
-              // literal text `Enter`, `{keys:[{key:"Enter"}]}` typed
-              // `[object Object]`, and the untranslatable `"Enterr"` typed
-              // itself instead of failing SEND_KEYS_INVALID. All three answered
-              // `success: true` with a byte count, because the write genuinely
-              // reached the PTY. Those panes are live Claude/PowerShell
-              // sessions, so that was silent corruption of real work reported
-              // green — the exact failure `terminalKeySequence.ts` was written
-              // to prevent, reintroduced by a second code path.
-              //
-              // `toPtySequence` also owns the missing/empty `keys` rejection,
-              // so there is no separate guard here: an untranslatable key must
-              // THROW, never type its own name.
-              const { keys } = (params || {}) as { keys?: unknown };
-              return throwIfWriteFailed(
-                await writePtyById(terminalId, toPtySequence(keys), exitRef.current),
-              );
-            },
+            handler: guardedHandler(
+              "sendKeys",
+              SEND_KEYS_SCHEMA,
+              async (args) => {
+                // MUST translate, exactly as the mounted path does
+                // (`TerminalInstance.tsx`'s `sendKeys` → `toPtySequence`).
+                //
+                // THE DEFECT this closes (manual-test-loop iter 23, item 1): this
+                // proxy handler was added after iteration 21 fixed the mounted
+                // path, and handed the raw `keys` value straight to
+                // `writePtyById`, whose `TextEncoder.encode` coerces anything
+                // non-string via `String()`. On a virtualized pane — the ONLY
+                // panes this proxy owns — `{keys:["Enter"]}` therefore typed the
+                // literal text `Enter`, `{keys:[{key:"Enter"}]}` typed
+                // `[object Object]`, and the untranslatable `"Enterr"` typed
+                // itself instead of failing SEND_KEYS_INVALID. All three answered
+                // `success: true` with a byte count, because the write genuinely
+                // reached the PTY. Those panes are live Claude/PowerShell
+                // sessions, so that was silent corruption of real work reported
+                // green — the exact failure `terminalKeySequence.ts` was written
+                // to prevent, reintroduced by a second code path.
+                //
+                // `toPtySequence` also owns the missing/empty `keys` rejection,
+                // so there is no separate guard here: an untranslatable key must
+                // THROW, never type its own name.
+                const { keys } = args as { keys?: unknown };
+                return throwIfWriteFailed(
+                  await writePtyById(terminalId, toPtySequence(keys), exitRef.current),
+                );
+              },
+              { valuesCheckedBy: "handler" },
+            ),
           },
           writeToTerminal: {
             /**
@@ -340,17 +351,22 @@ const TerminalBridgeProxy = memo(function TerminalBridgeProxy({
               "Write text directly to the PTY by id (no mounted view). Fails with " +
               "WRITE_TEXT_INVALID when `text` is not a string, and with TERMINAL_EXITED " +
               "when the pane's process is gone.",
-            handler: async (params?: unknown) => {
-              // Item 2, and the same shape as `sendKeys` above: the old
-              // `if (!text)` was a `string` ASSERTION rather than a check, so a
-              // non-string `text` reached `TextEncoder.encode` and was coerced
-              // via `String()` — `{text: 42}` wrote `42` into a live shell and
-              // answered HTTP 200 with a byte count. It also rejected the
-              // perfectly valid falsy string `"0"`.
-              const { text } = (params || {}) as { text?: unknown };
-              const value = requireTextPayload(text, WRITE_TEXT_INVALID, "writeToTerminal");
-              return throwIfWriteFailed(await writePtyById(terminalId, value, exitRef.current));
-            },
+            handler: guardedHandler(
+              "writeToTerminal",
+              TEXT_PAYLOAD_SCHEMA,
+              async (args) => {
+                // Item 2, and the same shape as `sendKeys` above: the old
+                // `if (!text)` was a `string` ASSERTION rather than a check, so a
+                // non-string `text` reached `TextEncoder.encode` and was coerced
+                // via `String()` — `{text: 42}` wrote `42` into a live shell and
+                // answered HTTP 200 with a byte count. It also rejected the
+                // perfectly valid falsy string `"0"`.
+                const { text } = args as { text?: unknown };
+                const value = requireTextPayload(text, WRITE_TEXT_INVALID, "writeToTerminal");
+                return throwIfWriteFailed(await writePtyById(terminalId, value, exitRef.current));
+              },
+              { valuesCheckedBy: "handler" },
+            ),
           },
           paste: {
             /**
@@ -420,21 +436,28 @@ const TerminalBridgeProxy = memo(function TerminalBridgeProxy({
               "bracketed-paste-aware path as the mounted pane: the PTY's DEC 2004 state is " +
               "read from the runner's own VT parser by id. Fails with PASTE_TEXT_INVALID " +
               "when `text` is not a string.",
-            handler: async (params?: unknown) => {
-              const { text } = (params || {}) as { text?: unknown };
-              const value = requireTextPayload(text, PASTE_TEXT_INVALID, "pasteText");
-              // Item 6. `false` used to be hardcoded here with the note that
-              // bracketed-paste mode "is a property of the live xterm backend
-              // and is unknown here". It is not unknown — it was merely unasked
-              // for. The runner's server-side VT parser sees every output byte
-              // of every session, mounted or not, so the same DEC 2004 state
-              // the mounted path reads off xterm is available by id.
-              const prepared = preparePasteData(
-                value,
-                await bracketedPasteFor(terminalId, exitRef.current),
-              );
-              return throwIfWriteFailed(await writePtyById(terminalId, prepared, exitRef.current));
-            },
+            handler: guardedHandler(
+              "pasteText",
+              TEXT_PAYLOAD_SCHEMA,
+              async (args) => {
+                const { text } = args as { text?: unknown };
+                const value = requireTextPayload(text, PASTE_TEXT_INVALID, "pasteText");
+                // Item 6. `false` used to be hardcoded here with the note that
+                // bracketed-paste mode "is a property of the live xterm backend
+                // and is unknown here". It is not unknown — it was merely unasked
+                // for. The runner's server-side VT parser sees every output byte
+                // of every session, mounted or not, so the same DEC 2004 state
+                // the mounted path reads off xterm is available by id.
+                const prepared = preparePasteData(
+                  value,
+                  await bracketedPasteFor(terminalId, exitRef.current),
+                );
+                return throwIfWriteFailed(
+                  await writePtyById(terminalId, prepared, exitRef.current),
+                );
+              },
+              { valuesCheckedBy: "handler" },
+            ),
           },
           getScrollback: {
             /**
@@ -459,26 +482,31 @@ const TerminalBridgeProxy = memo(function TerminalBridgeProxy({
               "comes from the Rust PTY ring rather than the rendered buffer, with escape " +
               "sequences stripped. Fails with SCROLLBACK_MAX_LINES_INVALID when `maxLines` " +
               "is not a positive integer.",
-            handler: async (params?: unknown) => {
-              // VALIDATED, not asserted (iter 25). `as { maxLines?: number }`
-              // was a cast over an HTTP body: a non-number poisoned the slice
-              // below with NaN, and `slice(NaN)` is `slice(0)` — so THIS path
-              // answered with the WHOLE buffer while the mounted path, whose
-              // `NaN < total` loop guard is false, answered "". Same request,
-              // opposite answers, both HTTP 200. See `./terminalScrollbackParams.ts`.
-              const { maxLines } = (params || {}) as { maxLines?: unknown };
-              const limit = requireMaxLines(maxLines);
-              const ring = await readLocalScrollbackRing(terminalId);
-              if (!ring) return "";
-              const decoded = new TextDecoder().decode(ring.bytes);
-              // COUNTS CONTENT LINES (iter 26), through the SAME
-              // implementation the mounted path calls. The old raw
-              // `slice(len - limit)` counted every ring line including blanks,
-              // where the mounted path counted rendered rows including blank
-              // viewport padding — so `maxLines: 1` answered the last line here
-              // and `""` there, for identical content and an identical request.
-              return scrollbackTailOfLines(stripAnsi(decoded).split("\n"), limit);
-            },
+            handler: guardedHandler(
+              "getScrollback",
+              GET_SCROLLBACK_SCHEMA,
+              async (args) => {
+                // VALIDATED, not asserted (iter 25). `as { maxLines?: number }`
+                // was a cast over an HTTP body: a non-number poisoned the slice
+                // below with NaN, and `slice(NaN)` is `slice(0)` — so THIS path
+                // answered with the WHOLE buffer while the mounted path, whose
+                // `NaN < total` loop guard is false, answered "". Same request,
+                // opposite answers, both HTTP 200. See `./terminalScrollbackParams.ts`.
+                const { maxLines } = args as { maxLines?: unknown };
+                const limit = requireMaxLines(maxLines);
+                const ring = await readLocalScrollbackRing(terminalId);
+                if (!ring) return "";
+                const decoded = new TextDecoder().decode(ring.bytes);
+                // COUNTS CONTENT LINES (iter 26), through the SAME
+                // implementation the mounted path calls. The old raw
+                // `slice(len - limit)` counted every ring line including blanks,
+                // where the mounted path counted rendered rows including blank
+                // viewport padding — so `maxLines: 1` answered the last line here
+                // and `""` there, for identical content and an identical request.
+                return scrollbackTailOfLines(stripAnsi(decoded).split("\n"), limit);
+              },
+              { valuesCheckedBy: "handler" },
+            ),
           },
         },
       }),

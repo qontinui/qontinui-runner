@@ -1015,7 +1015,9 @@ fn run_claude_session_inline(
 
                             // Parse for step injection markers
                             if let Some(ref mut parser) = step_injection_parser {
-                                if let Some(injected_step) = parser.process_line(&complete_line) {
+                                if let Some(injected_step) =
+                                    parser.process_line::<ExecutionStepConfig>(&complete_line)
+                                {
                                     let _ = injected_step_tx.send(injected_step);
                                 }
                             }
@@ -1056,7 +1058,9 @@ fn run_claude_session_inline(
                 }
             }
             if let Some(ref mut parser) = step_injection_parser {
-                if let Some(injected_step) = parser.process_line(&line_buffer) {
+                if let Some(injected_step) =
+                    parser.process_line::<ExecutionStepConfig>(&line_buffer)
+                {
                     let _ = injected_step_tx.send(injected_step);
                 }
             }

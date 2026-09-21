@@ -9,7 +9,18 @@
 
 import { beforeAll, describe, expect, it } from "vitest";
 
-import { buildCorpus, exemplars, expandSource, heads, patternExemplars } from "./corpus.testkit";
+import {
+  ARG_BAGS,
+  ARG_FILL,
+  buildAiProbes,
+  buildCorpus,
+  buildDirectProbes,
+  declaredArgNames,
+  exemplars,
+  expandSource,
+  heads,
+  patternExemplars,
+} from "./corpus.testkit";
 import { matchPattern } from "./patterns";
 import { loadRealRegistry } from "./realRegistry.testkit";
 import type { CommandAction } from "./types";
@@ -124,5 +135,99 @@ describe("corpus — the cross is a cross, not an append", () => {
     // Anti-vacuity: a corpus that collapsed to a handful would make every
     // property downstream pass over almost nothing.
     expect(g).toBeGreaterThan(1000);
+  });
+});
+
+describe("corpus — the probe corpora reach the two routes a typed input cannot", () => {
+  /**
+   * The gap this closes. `bind` passed a hard `null` for Tier 3, so
+   * `chooseTier`'s Tier-3 arm was entered by NO corpus input — and a
+   * differential over 91,784 rows recorded `tier3 null` identically on both
+   * sides no matter what changed there.
+   */
+  it("actually takes the Tier-3 arm, for every action", async () => {
+    const { bind } = await import("./pipeline.testkit");
+    const probes = buildAiProbes(actions, "golden");
+    const byId = new Map(actions.map((a) => [a.id, a] as const));
+    const notAi: string[] = [];
+    for (const probe of probes) {
+      const action = byId.get(probe.actionId);
+      if (!action) continue;
+      const b = bind(probe.input, [], { action, args: probe.args, confidence: 0.9 });
+      if (b.route !== "ai" || b.actionId !== probe.actionId) notAi.push(probe.key);
+    }
+    expect(notAi.slice(0, 10), "these probes did not reach Tier 3").toEqual([]);
+    expect(new Set(probes.map((p) => p.actionId)).size).toBe(actions.length);
+  });
+
+  it("aims a direct-route probe at every action", () => {
+    const probes = buildDirectProbes(actions, "golden");
+    expect(new Set(probes.map((p) => p.actionId)).size).toBe(actions.length);
+  });
+
+  /**
+   * A fill table that misses a name degenerates the `valid` bag into a
+   * plausible-looking bag that errors for an unrelated reason — a probe that
+   * cannot distinguish "the validation refused it" from "the handler did".
+   */
+  it("has a fill for every argument name the registry declares", () => {
+    const missing = new Set<string>();
+    for (const a of actions) {
+      for (const k of declaredArgNames(a)) if (!(k in ARG_FILL)) missing.add(`${a.id}.${k}`);
+    }
+    expect(Array.from(missing).sort(), "add these to corpus.testkit.ts::ARG_FILL").toEqual([]);
+  });
+
+  /**
+   * The invariant the unconditional arity gate rests on: a Tier-2 named group
+   * binds an argument the action DECLARES. A group named anything else binds a
+   * key no handler reads — and, since the gate refuses undeclared keys, would
+   * refuse the pattern outright.
+   */
+  it("declares every Tier-2 named group in the action's own paramSchema", () => {
+    const undeclared: string[] = [];
+    for (const a of actions) {
+      const declared = new Set(declaredArgNames(a));
+      for (const p of a.patterns ?? []) {
+        for (const m of p.source.matchAll(/\(\?<([A-Za-z_$][\w$]*)>/g)) {
+          if (!declared.has(m[1])) undeclared.push(`${a.id} :: ${p.source} :: ${m[1]}`);
+        }
+      }
+    }
+    expect(undeclared).toEqual([]);
+  });
+
+  /**
+   * The arity gate is UNCONDITIONAL now, and it reads `paramSchema`. An action
+   * that OMITS the field therefore declares "takes no arguments" by accident
+   * rather than on purpose — every argument it is handed is refused, and the
+   * refusal names the argument rather than the omission. Every action in this
+   * registry declares one today (empty where it takes none); this is what says
+   * so when the next one does not.
+   */
+  it("declares a paramSchema on every action, even an empty one", () => {
+    const undeclared = actions.filter((a) => a.paramSchema === undefined).map((a) => a.id);
+    expect(
+      undeclared,
+      "an action with no paramSchema silently takes no arguments — declare {} " +
+        "if that is the intent, so the reader can tell it apart from an omission",
+    ).toEqual([]);
+  });
+
+  it("keeps every bag shape live somewhere in the registry", () => {
+    for (const bag of ARG_BAGS) {
+      const built = actions.map((a) => bag.build(a));
+      // A shape is LIVE when at least one action builds something other than
+      // an empty object from it. "Has keys" was the whole test, and it is the
+      // wrong liveness question for the three bags that are not objects at
+      // all: `Object.keys(5)` is `[]` and `Object.keys("zz")` is `["0","1"]`,
+      // and neither number says anything about the shape. Being a non-object
+      // IS the shape — it is the one iteration 11 measured running a handler
+      // bare — so it counts as live on its own.
+      const live = built.some(
+        (b) => b !== null && (typeof b !== "object" || Object.keys(b).length > 0),
+      );
+      expect(live || bag.name === "empty", bag.name).toBe(true);
+    }
   });
 });

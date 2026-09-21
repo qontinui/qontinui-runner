@@ -48,11 +48,9 @@ use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 /// | `Transient` | `CognitoRefreshFailedNoStoredToken` | network/5xx/429 refresh failure AND no usable stored token to fall back on | wait — autonomy self-recovers |
 /// | `Ok` | `CognitoAccessTokenUnreadable` | nothing failed to refresh, yet the store yielded no token | a credential-store read fault |
 ///
-/// `pub(crate)` because two operator-facing commands in two modules refuse on
-/// this — `commands::auth::get_user_projects` and
-/// `commands::productivity::spawn_from_plan`. The second used to hard-code
-/// "no Cognito session" for all four, which is the same collapse PR #1342
-/// removed from the first, at the site that PR cited as its model.
+/// `pub(crate)` for `commands::auth::get_user_projects`, which refuses on
+/// this. PR #1342 removed the collapse of all four into "no Cognito session"
+/// there; the deleted `spawn_from_plan` was its second consumer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BearerReason {
     NoCognitoSession,
@@ -204,10 +202,10 @@ fn no_bearer_error(reason: BearerReason) -> AppError {
 /// notification, but the auth-status path threw it away and folded four
 /// distinguishable states into one code.
 ///
-/// `pub(crate)` for `commands::productivity::spawn_from_plan`, which needs the
-/// same refresh-first derivation AND the same classification — it was calling
+/// `pub(crate)` so a second operator-facing command can reuse the same
+/// refresh-first derivation AND the same classification instead of calling
 /// the discarding wrapper and then asserting one of the four states in its
-/// refusal text.
+/// refusal text (the deleted `spawn_from_plan` did exactly that).
 pub(crate) async fn web_backend_user_bearer_classified(
     auth_manager: &AuthManager,
 ) -> Result<String, BearerReason> {

@@ -121,31 +121,65 @@ function fail(message) {
 const UNRESOLVED = Symbol("unresolved");
 
 /**
+ * Top-level `const NAME = <initializer>` bindings of the source file being
+ * captured, keyed by name.
+ *
+ * An action's `paramSchema` is legitimately HOISTED to a module constant when
+ * its guarded handler binds against the same declaration
+ * (`paramSchema: PROFILE_NAME_SCHEMA`, `handler: guardedHandler("…",
+ * PROFILE_NAME_SCHEMA, run)` — see `src/lib/ui-bridge/guardedHandler.ts`).
+ * Resolving only a same-file, top-level `const` keeps the capture a reading of
+ * the source rather than an evaluation of it: no import is followed, nothing
+ * is executed, and a `let`, a parameter, or a binding in another module still
+ * comes back UNRESOLVED.
+ */
+let constBindings = new Map();
+
+function collectConstBindings(sf) {
+  const map = new Map();
+  for (const stmt of sf.statements) {
+    if (!ts.isVariableStatement(stmt)) continue;
+    if ((stmt.declarationList.flags & ts.NodeFlags.Const) === 0) continue;
+    for (const decl of stmt.declarationList.declarations) {
+      if (ts.isIdentifier(decl.name) && decl.initializer) map.set(decl.name.text, decl.initializer);
+    }
+  }
+  return map;
+}
+
+/**
  * Evaluate the subset of expressions an action declaration legitimately uses:
  * literals, `+`-concatenated string literals (the `list-tabs` description is
- * written that way), object literals and array literals. Anything else — a
- * handler, an identifier, a call — comes back UNRESOLVED and is dropped by the
- * caller rather than guessed at.
+ * written that way), object literals, array literals, and an identifier bound
+ * by a same-file top-level `const` (see {@link collectConstBindings}).
+ * Anything else — a handler, a call, any other identifier — comes back
+ * UNRESOLVED and is dropped by the caller rather than guessed at.
  */
-function evalStatic(node) {
+function evalStatic(node, resolving = new Set()) {
   if (!node) return UNRESOLVED;
+  if (ts.isIdentifier(node)) {
+    const init = constBindings.get(node.text);
+    if (!init || resolving.has(node.text)) return UNRESOLVED;
+    return evalStatic(init, new Set([...resolving, node.text]));
+  }
   if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text;
   if (ts.isNumericLiteral(node)) return Number(node.text);
   if (node.kind === ts.SyntaxKind.TrueKeyword) return true;
   if (node.kind === ts.SyntaxKind.FalseKeyword) return false;
   if (node.kind === ts.SyntaxKind.NullKeyword) return null;
-  if (ts.isParenthesizedExpression(node)) return evalStatic(node.expression);
-  if (ts.isAsExpression(node) || ts.isSatisfiesExpression(node)) return evalStatic(node.expression);
+  if (ts.isParenthesizedExpression(node)) return evalStatic(node.expression, resolving);
+  if (ts.isAsExpression(node) || ts.isSatisfiesExpression(node))
+    return evalStatic(node.expression, resolving);
   if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
-    const left = evalStatic(node.left);
-    const right = evalStatic(node.right);
+    const left = evalStatic(node.left, resolving);
+    const right = evalStatic(node.right, resolving);
     if (typeof left === "string" && typeof right === "string") return left + right;
     return UNRESOLVED;
   }
   if (ts.isArrayLiteralExpression(node)) {
     const out = [];
     for (const el of node.elements) {
-      const v = evalStatic(el);
+      const v = evalStatic(el, resolving);
       if (v === UNRESOLVED) return UNRESOLVED;
       out.push(v);
     }
@@ -157,7 +191,7 @@ function evalStatic(node) {
       if (!ts.isPropertyAssignment(prop)) continue;
       const key = propertyName(prop.name);
       if (key === null) continue;
-      const v = evalStatic(prop.initializer);
+      const v = evalStatic(prop.initializer, resolving);
       if (v === UNRESOLVED) continue;
       out[key] = v;
     }
@@ -187,6 +221,7 @@ const ACTION_FIELDS = ["id", "label", "description", "paramSchema", "effect"];
 function readFixtureRegistration({ componentId: FIXTURE_COMPONENT_ID, file: SOURCE_FILE }) {
   const src = fs.readFileSync(SOURCE_FILE, "utf8");
   const sf = ts.createSourceFile(SOURCE_FILE, src, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  constBindings = collectConstBindings(sf);
 
   let found = null;
   const visit = (node) => {
@@ -296,7 +331,14 @@ function loadSerializeComponent() {
 
   // eslint-disable-next-line no-new-func -- deliberate: the function under test
   // must be the shipped one, not a re-implementation.
-  const factory = new Function("exports", "require", "module", "__filename", "__dirname", outputText);
+  const factory = new Function(
+    "exports",
+    "require",
+    "module",
+    "__filename",
+    "__dirname",
+    outputText,
+  );
   factory(moduleObj.exports, stubRequire, moduleObj, UTILS_TS, path.dirname(UTILS_TS));
 
   const fn = moduleObj.exports.serializeComponent;
@@ -396,15 +438,9 @@ if (!fs.existsSync(FIXTURE)) {
 const committed = fs.readFileSync(FIXTURE, "utf8");
 if (committed !== rendered) {
   console.error("");
-  console.error(
-    "ERROR: the captured /control/components body drifted from the committed fixture.",
-  );
-  console.error(
-    "       Something changed in a captured registration or in serializeComponent's",
-  );
-  console.error(
-    "       per-action allow-list. Confirm the change is intended, then run",
-  );
+  console.error("ERROR: the captured /control/components body drifted from the committed fixture.");
+  console.error("       Something changed in a captured registration or in serializeComponent's");
+  console.error("       per-action allow-list. Confirm the change is intended, then run");
   console.error("       `node scripts/capture-component-effect-fixture.cjs --update` and commit.");
   for (const note of effectDiagnostics(body)) console.error(`   ! ${note}`);
   console.error("");

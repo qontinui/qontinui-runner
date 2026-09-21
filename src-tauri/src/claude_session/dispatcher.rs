@@ -532,68 +532,6 @@ fn auto_register_file(
                     file_path: file_path.clone(),
                 });
 
-            // Productivity-stack §3 wiring: after the active registry is
-            // updated, peek the in-memory UpcomingFileRegistry for any
-            // *future* claims on this path. If the claimer's owning task
-            // is assigned to a session OTHER than this one, surface a
-            // `file-claim-foreign` event so the Coordinator dashboard can
-            // warn "session S is editing future-claim path P ahead of
-            // schedule". Advisory-only — does not block the edit.
-            //
-            // Cheap: one hashmap read on the registry plus, per claimer
-            // not owned by us, one PG row read. Runs in its own task so
-            // the path stays off the stdout reader thread. AppState is
-            // re-fetched at task entry rather than captured to keep the
-            // Send bound on the spawn closure simple.
-            let file_path_upc = file_path.clone();
-            let task_run_id_upc = task_run_id.clone();
-            let pg_db_upc = pg_db.clone();
-            let upcoming_registry = app_state.upcoming_file_registry.clone();
-            let handle_upc = app_handle.clone();
-            rt.spawn(async move {
-                let claimers = upcoming_registry.claimers_for_path(&file_path_upc).await;
-                if claimers.is_empty() {
-                    return;
-                }
-                let mut foreign: Vec<serde_json::Value> = Vec::new();
-                for c in &claimers {
-                    // The claim's task may be assigned to this session
-                    // (an *expected* edit) or to no one / another session
-                    // (a *foreign* edit ahead of schedule). Look up the
-                    // task once per claimer; the registry is small per
-                    // path so the fan-out is minimal.
-                    let assigned_session = match pg_db_upc.get_task_by_id(&c.task_id).await {
-                        Ok(Some(t)) => t.assigned_session_id,
-                        Ok(None) => None,
-                        Err(e) => {
-                            warn!("upcoming-claim lookup failed for task {}: {}", c.task_id, e);
-                            None
-                        }
-                    };
-                    let is_ours = assigned_session
-                        .as_deref()
-                        .map(|s| s == task_run_id_upc.as_str())
-                        .unwrap_or(false);
-                    if !is_ours {
-                        foreign.push(serde_json::json!({
-                            "plan_id": c.plan_id,
-                            "task_id": c.task_id,
-                            "path": c.path,
-                            "assigned_session_id": assigned_session,
-                        }));
-                    }
-                }
-                if !foreign.is_empty() {
-                    let payload = serde_json::json!({
-                        "type": "file-claim-foreign",
-                        "file_path": file_path_upc,
-                        "editing_session_id": task_run_id_upc,
-                        "claimers": foreign,
-                    });
-                    let _ = handle_upc.emit("file-claim-foreign", &payload);
-                }
-            });
-
             // Also register in the advisory registry (non-blocking, fire-and-forget)
             let file_path_reg = file_path.clone();
             let task_run_id_reg = task_run_id.clone();

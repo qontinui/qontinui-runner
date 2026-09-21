@@ -7,7 +7,9 @@
 //! launch surface (`commands::terminal` ×2, `commands::productivity` ×2,
 //! `mcp::terminals`, `mcp::tauri_proxy`, `mcp::backend_relay`) — seven copies of
 //! the same `ctx.session_worktrees_env_value().map(|v| vec![(KEY, v)])`
-//! expression. The only genuinely shared piece was the *transport*:
+//! expression. Five today: the two `commands::productivity` surfaces went with
+//! the plan/task board in Phase 4 of
+//! `2026-09-12-consolidate-local-orchestration-onto-conductor`. The only genuinely shared piece was the *transport*:
 //! `TerminalManager::create`'s `extra_env` parameter, which each surface
 //! filled in itself.
 //!

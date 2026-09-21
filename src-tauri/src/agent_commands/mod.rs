@@ -514,6 +514,7 @@ fn fetch_overrides_blocking(base_url: &str) -> FetchOutcome {
         .spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
+                .thread_name("agentcmd-rt")
                 .build()
             {
                 Ok(rt) => rt,

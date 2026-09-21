@@ -50,6 +50,27 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
+/// Build a [`SkillRegistry`] with built-in skills plus this device's user
+/// skills from PG.
+///
+/// The PG read lives here rather than on the registry so `crate::skills`
+/// names no database type. If `pg_db` is None or the query fails, only
+/// built-in skills are loaded. Uses `Handle::current().block_on()` to call
+/// async PG methods from this sync context.
+fn skill_registry_with_pg(pg_db: Option<&Arc<PgDb>>) -> SkillRegistry {
+    let mut registry = SkillRegistry::new();
+    if let Some(pg) = pg_db {
+        let pg_clone = pg.clone();
+        let user_skills = tokio::runtime::Handle::current()
+            .block_on(async { pg_clone.list_user_skills().await.unwrap_or_default() });
+        if !user_skills.is_empty() {
+            tracing::debug!("Loaded {} user skills from PG", user_skills.len());
+            registry.set_user_skills(user_skills);
+        }
+    }
+    registry
+}
+
 // ============================================================================
 // Public types
 // ============================================================================
@@ -1655,7 +1676,7 @@ pub fn generate_workflow(
         };
 
     // ── Load skill registry once (built-in + user skills from DB) ───────
-    let skill_registry = SkillRegistry::with_pg(pg_db);
+    let skill_registry = skill_registry_with_pg(pg_db);
 
     // ── Step 2–3: Verification ↔ Fixer loop ────────────────────────────────
     let verification_start = Instant::now();
@@ -2552,7 +2573,7 @@ Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
 
     // Inject skill catalog context (built-in + user skills from DB)
     // When tool_tags are specified, only include matching skills to reduce prompt bloat.
-    let skill_registry = SkillRegistry::with_pg(pg_db);
+    let skill_registry = skill_registry_with_pg(pg_db);
     let skills_section = match request.tool_tags.as_deref() {
         Some(tags) if !tags.is_empty() => {
             let tags_owned: Vec<String> = tags.iter().map(|s| s.to_string()).collect();

@@ -23,13 +23,40 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import { resolvedAction } from "./bind";
 import { buildCorpus } from "./corpus.testkit";
 import type { InterpretMatch } from "./interpret";
 import { matchPattern } from "./patterns";
-import { chooseTier, didYouMean } from "./rank";
+import { chooseTier, didYouMean, type TierChoice } from "./rank";
 import { loadRealRegistry } from "./realRegistry.testkit";
 import { resolve } from "./resolve";
 import type { CommandAction } from "./types";
+
+/**
+ * The head's action, or `null` for the `none` arm.
+ *
+ * `TierChoice.head` is a TOTAL sum type now, so "no tier owns this" is the
+ * `none` ARM rather than a `null` that also had to mean "the literal slash
+ * won" — see `bind.ts` for why that overload was the defect. These two
+ * readers keep the assertions below about the RULE rather than about the
+ * encoding.
+ */
+const headAction = (choice: TierChoice): CommandAction | null => resolvedAction(choice.head);
+
+/**
+ * The RAW evidence the winning tier captured: regex groups for `pattern`,
+ * the model's own JSON for `ai`, `null` for the arms that captured nothing.
+ *
+ * Uncoerced on purpose — `chooseTier` no longer binds arguments, it reports
+ * what its tier saw. `crossRoute.test.ts` is what checks the two routes still
+ * agree after `bind.ts` coerces.
+ */
+const headEvidence = (choice: TierChoice): Record<string, unknown> | null => {
+  const h = choice.head;
+  if (h.kind === "pattern") return h.groups;
+  if (h.kind === "ai") return h.modelArgs;
+  return null;
+};
 
 let actions: readonly CommandAction[];
 let byId: (id: string) => CommandAction;
@@ -66,7 +93,7 @@ describe("chooseTier — reroute safety, as a property over the whole registry",
     for (const c of collisions) {
       if (c.pattern.id === c.literal.id) continue;
       const { head } = choose(c.input);
-      if (head === null) continue;
+      if (head.kind === "none") continue;
       if (head.action.id === c.literal.id) continue;
       if (head.action.costly || head.action.destructive) {
         violations.push(
@@ -90,13 +117,13 @@ describe("chooseTier — reroute safety, as a property over the whole registry",
       const sameAction = c.pattern.id === c.literal.id;
       const safe = !c.pattern.costly && !c.pattern.destructive;
       if (sameAction || safe) {
-        // yield / reroute — Tier 2's args win, nothing is shadowed.
-        if (head?.action.id !== c.pattern.id || head.tier !== "pattern" || shadowed !== null) {
+        // yield / reroute — Tier 2's reading wins, nothing is shadowed.
+        if (head.kind !== "pattern" || head.action.id !== c.pattern.id || shadowed !== null) {
           unclassified.push(`${c.input}: expected yield/reroute to ${c.pattern.id}`);
         }
       } else {
         // refuse-and-name — the literal runs, the alternative is surfaced.
-        if (head !== null || shadowed?.action.id !== c.pattern.id) {
+        if (head.kind !== "none" || shadowed?.action.id !== c.pattern.id) {
           unclassified.push(`${c.input}: expected refuse-and-name for ${c.pattern.id}`);
         }
       }
@@ -118,7 +145,7 @@ describe("chooseTier — the costly / destructive gate", () => {
     // `/spawn` is a registered slash; `spawn 1 gmail` is `/spawn-ai`'s pattern.
     expect(byId("terminal.spawn-ai").costly).toBe(true);
     const { head, shadowed } = choose("/spawn 1 gmail");
-    expect(head).toBeNull();
+    expect(head.kind).toBe("none");
     expect(shadowed?.action.id).toBe("terminal.spawn-ai");
     expect(didYouMean("/spawn 1 gmail", byId("terminal.spawn"), shadowed)).toBe(
       "did you mean `/spawn-ai 1 gmail`?",
@@ -129,10 +156,10 @@ describe("chooseTier — the costly / destructive gate", () => {
     const target = byId("terminal.toggle-focus-mode");
     expect(target.costly).toBeUndefined();
     expect(target.destructive).toBeUndefined();
-    const { head, shadowed } = choose("/focus mode");
-    expect(head?.action.id).toBe("terminal.toggle-focus-mode");
-    expect(head?.tier).toBe("pattern");
-    expect(shadowed).toBeNull();
+    const c = choose("/focus mode");
+    expect(headAction(c)?.id).toBe("terminal.toggle-focus-mode");
+    expect(c.head.kind).toBe("pattern");
+    expect(c.shadowed).toBeNull();
   });
 
   /**
@@ -145,25 +172,25 @@ describe("chooseTier — the costly / destructive gate", () => {
    */
   it("refuses to reroute into a DESTRUCTIVE action", () => {
     const registry = { ...byId("terminal.toggle-focus-mode"), destructive: true };
-    const tier2 = { action: registry, args: {} };
+    const tier2 = { action: registry, groups: {} };
     const tier1 = resolve("/focus mode", []);
     const { head, shadowed } = chooseTier(tier1, tier2, null);
-    expect(head).toBeNull();
+    expect(head.kind).toBe("none");
     expect(shadowed?.action.id).toBe("terminal.toggle-focus-mode");
   });
 
   it("yields to Tier 2 when both routes name the SAME action", () => {
-    const { head, shadowed } = choose("/spawn 3 plain");
-    expect(head?.action.id).toBe("terminal.spawn");
-    expect(head?.presetArgs).toEqual({ count: 3 });
-    expect(shadowed).toBeNull();
+    const c = choose("/spawn 3 plain");
+    expect(headAction(c)?.id).toBe("terminal.spawn");
+    expect(headEvidence(c)).toEqual({ count: "3" });
+    expect(c.shadowed).toBeNull();
   });
 
   it("yields for an ALIAS of the same action", () => {
     // `/sort` is an alias of `/sort-zones`, whose pattern is `sort( zones)?`.
-    const { head } = choose("/sort zones");
-    expect(head?.action.id).toBe("terminal.sort-zones");
-    expect(head?.tier).toBe("pattern");
+    const c = choose("/sort zones");
+    expect(headAction(c)?.id).toBe("terminal.sort-zones");
+    expect(c.head.kind).toBe("pattern");
   });
 });
 
@@ -182,22 +209,24 @@ describe("chooseTier — Tier-3 ordering", () => {
     const input = "/spawn-with";
     const ai = tier3(byId("terminal.metrics"));
     const { head } = chooseTier(resolve(input, []), null, ai);
-    expect(head).toBeNull();
+    expect(head.kind).toBe("none");
   });
 
   it("puts Tier 3 above Tier 2 when no literal slash was typed", () => {
     const ai = tier3(byId("terminal.metrics"));
-    const { head } = chooseTier(resolve("show me the numbers", []), matchPattern("sort"), ai);
-    expect(head?.tier).toBe("ai");
-    expect(head?.action.id).toBe("terminal.metrics");
-    expect(head?.presetArgs).toEqual({ from: "model" });
-    expect(head?.confidence).toBe(0.9);
+    const c = chooseTier(resolve("show me the numbers", []), matchPattern("sort"), ai);
+    expect(c.head.kind).toBe("ai");
+    expect(headAction(c)?.id).toBe("terminal.metrics");
+    // The model's JSON, carried verbatim. `bind.ts` is what validates it —
+    // `chooseTier` reports what Tier 3 said, it does not bind it.
+    expect(headEvidence(c)).toEqual({ from: "model" });
+    expect(c.head.kind === "ai" ? c.head.confidence : null).toBe(0.9);
   });
 
   it("takes Tier 2 when Tier 3 is absent and no literal slash was typed", () => {
-    const { head } = chooseTier(resolve("sort zones", []), matchPattern("sort zones"), null);
-    expect(head?.tier).toBe("pattern");
-    expect(head?.action.id).toBe("terminal.sort-zones");
+    const c = chooseTier(resolve("sort zones", []), matchPattern("sort zones"), null);
+    expect(c.head.kind).toBe("pattern");
+    expect(headAction(c)?.id).toBe("terminal.sort-zones");
   });
 });
 
@@ -205,20 +234,20 @@ describe("chooseTier — Tier-3 ordering", () => {
 
 describe("chooseTier — every path that returns nothing", () => {
   it("returns nothing when no tier hit at all", () => {
-    expect(chooseTier([], null, null)).toEqual({ head: null, shadowed: null });
+    expect(chooseTier([], null, null)).toEqual({ head: { kind: "none" }, shadowed: null });
   });
 
   it("leaves a literal slash with NO Tier-2 hit on Tier 1", () => {
     // `/spawn-with` declares no patterns at all.
     const input = "/spawn-with";
     expect(matchPattern(input)).toBeNull();
-    expect(choose(input)).toEqual({ head: null, shadowed: null });
+    expect(choose(input)).toEqual({ head: { kind: "none" }, shadowed: null });
   });
 
   it("leaves a literal slash with args but no Tier-2 hit on Tier 1", () => {
     const input = "/swap 1";
     expect(matchPattern(input)).toBeNull();
-    expect(choose(input)).toEqual({ head: null, shadowed: null });
+    expect(choose(input)).toEqual({ head: { kind: "none" }, shadowed: null });
   });
 
   it("returns nothing for a fuzzy-only Tier-1 list", () => {
@@ -226,11 +255,11 @@ describe("chooseTier — every path that returns nothing", () => {
     const tier1 = resolve("sw", []);
     expect(tier1.length).toBeGreaterThan(0);
     expect(tier1.every((m) => !m.exact)).toBe(true);
-    expect(chooseTier(tier1, null, null)).toEqual({ head: null, shadowed: null });
+    expect(chooseTier(tier1, null, null)).toEqual({ head: { kind: "none" }, shadowed: null });
   });
 
   it("returns nothing for empty input", () => {
-    expect(choose("")).toEqual({ head: null, shadowed: null });
+    expect(choose("")).toEqual({ head: { kind: "none" }, shadowed: null });
   });
 
   it("ignores a NON-literal exact hit when deciding the literal arm", () => {
@@ -239,9 +268,9 @@ describe("chooseTier — every path that returns nothing", () => {
     const tier1 = resolve("spawn 3 plain", []);
     expect(tier1[0].exact).toBe(true);
     expect(tier1[0].literal).toBe(false);
-    const { head } = chooseTier(tier1, matchPattern("spawn 3 plain"), null);
-    expect(head?.action.id).toBe("terminal.spawn");
-    expect(head?.tier).toBe("pattern");
+    const c = chooseTier(tier1, matchPattern("spawn 3 plain"), null);
+    expect(headAction(c)?.id).toBe("terminal.spawn");
+    expect(c.head.kind).toBe("pattern");
   });
 });
 

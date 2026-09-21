@@ -62,30 +62,6 @@ pub struct DevSeedFindingPayload {
     pub source_session_id: Option<String>,
 }
 
-// ============================================================================
-// review-approved / review-rejected payloads
-// ============================================================================
-
-/// Payload shape for the `review-approved` and `review-rejected` Tauri events
-/// emitted by `commands::productivity::approve_recommendation` /
-/// `reject_recommendation` after a user resolves a medium-confidence
-/// recommendation card. Field names are explicit camelCase to match the
-/// `serde_json::json!()` literal previously used at the emit site.
-///
-/// Single struct shared by both channels: only `user_decision` differs
-/// (`"approved"` vs `"rejected"`), so a tagged enum would inflate the wire
-/// format without payoff.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[schemars(title = "RecommendationReviewDecisionPayload")]
-pub struct RecommendationReviewDecisionPayload {
-    #[serde(rename = "reviewId")]
-    pub review_id: String,
-    #[serde(rename = "taskId")]
-    pub task_id: String,
-    #[serde(rename = "userDecision")]
-    pub user_decision: String,
-}
-
 /// Code context for a finding (runner-local wire shape).
 ///
 /// Renamed in the schema registry to `RunnerFindingCodeContext` to

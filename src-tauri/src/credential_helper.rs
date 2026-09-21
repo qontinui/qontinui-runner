@@ -168,7 +168,7 @@ async fn fetch_registered_repos(coord_base: &str) -> Result<Vec<String>, String>
 /// All of them are local `rev-parse` / `config --local` writes, i.e.
 /// milliseconds when healthy; the hang class is an `index.lock`. Not periodic,
 /// but BURST-prone: the whole `setup_credential_helper` path runs once per
-/// `terminal_create` / `spawn_worker_session`, and ~130 concurrent session
+/// `terminal_create`, and ~130 concurrent session
 /// spawns were observed during the 2026-08-30 wedge — 130 unbounded
 /// `.output()` calls behind one wedged git is 130 lost blocking-pool threads.
 const GIT_CONFIG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);

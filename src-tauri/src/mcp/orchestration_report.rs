@@ -4,7 +4,7 @@
 //! this tool when it finishes a subtask, handing back a structured
 //! [`CompletionReport`] keyed by `(run_id, task_id)`. The tool is mounted as an
 //! HTTP route alongside the other runner MCP route modules (see
-//! `mcp_api.rs` — merged right after `completion_reports::routes()`), which is
+//! `mcp_api.rs`), which is
 //! how every "runner MCP tool" in this codebase is surfaced (each module
 //! exposes a `routes()` axum `Router`).
 //!

@@ -4,10 +4,10 @@
  * V1 surface for `productivity_knowledge`. Two modes:
  *
  *   - `modal` (default) — rendered as a centred modal over the app, with
- *     a backdrop. Triggered globally via `Ctrl+Shift+E` and via a
- *     "Knowledge" button on the Productivity tab top bar.
- *   - `inline` — embedded as a full-height panel in the Productivity
- *     tab's `knowledge` sub-view. No backdrop, no close button.
+ *     a backdrop. Triggered globally via `Ctrl+Shift+E` (`GlobalKnowledgeBrowser`
+ *     in `App.tsx` mounts the single copy).
+ *   - `inline` — always-mounted full-height panel, one of the three the
+ *     Productivity page stacks. No backdrop, no close button.
  *
  * v1 supports FTS-only search (per plan §6 Knowledge Browser). Vector
  * search is exposed via the PG layer for advanced callers but is not
@@ -25,8 +25,8 @@ import { GLOBAL_CHORDS, matchesChord } from "@/lib/globalChords";
 export interface KnowledgeBrowserProps {
   /**
    * `modal` overlays the page with a backdrop and a centred dialog.
-   * `inline` renders flush as a full-height panel (used by the
-   * Productivity tab's `knowledge` sub-view). Defaults to `modal`.
+   * `inline` renders flush as a full-height panel (the Productivity page's
+   * Knowledge panel). Defaults to `modal`.
    */
   mode?: "modal" | "inline";
   /**

@@ -919,6 +919,16 @@ pub(super) async fn wait_for_census_after(
 #[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
+/// Windows directory attribute bit (`FILE_ATTRIBUTE_DIRECTORY`). Set on a
+/// DIRECTORY reparse point (a junction, a `mklink /D` symlink) and clear on
+/// a FILE symlink — the one bit that tells those apart, since
+/// `FileType::is_dir` reports `false` for every reparse point and
+/// `FileType::is_symlink` reports `true` for all three. [`remove_link`]
+/// dispatches on it because the two removal calls each refuse the other's
+/// shape.
+#[cfg(windows)]
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+
 // ---------------------------------------------------------------------------
 // Wire types — coord deserializes these. Field names/shape are the
 // contract documented in the Phase 1 plan.
@@ -1260,11 +1270,16 @@ pub fn is_junction(path: &Path) -> bool {
 /// recursively. The caller must already have confirmed the path is a link
 /// with [`is_junction`]; this does not re-check.
 ///
-/// - Windows: `remove_dir` removes a DIRECTORY link's reparse point (a
-///   junction, or a directory symlink) without touching what it points at.
-///   It refuses a Windows FILE symlink, which `is_junction` also reports —
-///   a safe failure, and not a case the reclaim callers meet: they only
-///   remove `node_modules` / `target` directory links.
+/// - Windows: neither removal call handles every link shape, so dispatch on
+///   [`FILE_ATTRIBUTE_DIRECTORY`]. A DIRECTORY link (a junction, or a
+///   `mklink /D` symlink) takes `remove_dir`; a FILE symlink takes
+///   `remove_file`. Both remove the reparse point alone and never follow it.
+///   Measured on `x86_64-pc-windows-msvc`, rustc 1.95.0 (the pinned
+///   toolchain), each call REFUSES the other's shape: `remove_file` on a
+///   junction or a directory symlink is `PermissionDenied` (os error 5), and
+///   `remove_dir` on a file symlink is `NotADirectory` (os error 267). In
+///   every one of those cases the link survived and its target was
+///   untouched, so guessing is a silent no-removal, not a data loss.
 /// - Everywhere else: `remove_file`, i.e. `unlink(2)`, which removes a
 ///   symlink itself whether its target is a directory, a file, or missing.
 ///   `remove_dir` here would be `rmdir(2)`, which refuses a symlink with
@@ -1274,7 +1289,15 @@ pub fn is_junction(path: &Path) -> bool {
 pub(crate) fn remove_link(path: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        std::fs::remove_dir(path)
+        use std::os::windows::fs::MetadataExt;
+        // `symlink_metadata` inspects the link itself, never its target, so
+        // the attribute read cannot be answered by what the link points at.
+        let meta = std::fs::symlink_metadata(path)?;
+        if meta.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            std::fs::remove_dir(path)
+        } else {
+            std::fs::remove_file(path)
+        }
     }
     #[cfg(not(windows))]
     {
@@ -2970,6 +2993,106 @@ pub fn spawn_census() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`remove_link`] must handle every Windows link SHAPE, not only a
+    /// directory junction — `is_junction` reports all three, so all three
+    /// can reach it.
+    ///
+    /// Measured on `x86_64-pc-windows-msvc`, rustc 1.95.0: `remove_dir` on a
+    /// FILE symlink is `NotADirectory` (os error 267) and `remove_file` on a
+    /// junction or a directory symlink is `PermissionDenied` (os error 5).
+    /// Each call refuses the other's shape, which is why the helper
+    /// dispatches on `FILE_ATTRIBUTE_DIRECTORY` instead of picking one. With
+    /// the Windows arm reverted to a bare `remove_dir`, the file-symlink half
+    /// below fails.
+    #[cfg(windows)]
+    #[test]
+    fn remove_link_removes_every_windows_link_shape_and_never_its_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir_target = tmp.path().join("dir-target");
+        std::fs::create_dir(&dir_target).unwrap();
+        std::fs::write(dir_target.join("keep.txt"), b"canonical").unwrap();
+        let file_target = tmp.path().join("file-target.txt");
+        std::fs::write(&file_target, b"canonical-file").unwrap();
+
+        // (a) A directory junction. `mklink /J` needs no privilege.
+        let junction = tmp.path().join("junction");
+        let made = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &junction.to_string_lossy(),
+                &dir_target.to_string_lossy(),
+            ])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if made {
+            assert!(is_junction(&junction), "is_junction must see a junction");
+            remove_link(&junction).expect("a junction must be removable");
+            assert!(
+                std::fs::symlink_metadata(&junction).is_err(),
+                "the junction link itself must be gone"
+            );
+            assert!(
+                dir_target.join("keep.txt").exists(),
+                "the junction's target must survive"
+            );
+        } else {
+            eprintln!("skipping the junction half: mklink /J unavailable here");
+        }
+
+        // (b) A FILE symlink — the shape the previous `remove_dir`-only arm
+        // refused. Creating one needs the developer symlink privilege, so a
+        // box without it skips this half rather than failing.
+        let file_link = tmp.path().join("file-link.txt");
+        if std::os::windows::fs::symlink_file(&file_target, &file_link).is_ok() {
+            assert!(
+                is_junction(&file_link),
+                "is_junction reports a file symlink too, so remove_link must handle it"
+            );
+            remove_link(&file_link).expect("a file symlink must be removable");
+            assert!(
+                std::fs::symlink_metadata(&file_link).is_err(),
+                "the file link itself must be gone"
+            );
+            assert_eq!(
+                std::fs::read(&file_target).unwrap(),
+                b"canonical-file",
+                "the file link's target must survive"
+            );
+        } else {
+            eprintln!("skipping the file-symlink half: symlink privilege unavailable here");
+        }
+    }
+
+    /// A Unix symlink is unlinked with `unlink(2)` whatever it points at —
+    /// a directory, a file, or nothing — and its target is never touched.
+    #[cfg(unix)]
+    #[test]
+    fn remove_link_unlinks_a_unix_symlink_and_never_its_target() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir_target = tmp.path().join("dir-target");
+        std::fs::create_dir(&dir_target).unwrap();
+        std::fs::write(dir_target.join("keep.txt"), b"canonical").unwrap();
+
+        for (name, target) in [
+            ("to-dir", dir_target.clone()),
+            ("to-nothing", tmp.path().join("never-existed")),
+        ] {
+            let link = tmp.path().join(name);
+            symlink(&target, &link).unwrap();
+            assert!(is_junction(&link), "{name} must read as a link");
+            remove_link(&link).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(
+                std::fs::symlink_metadata(&link).is_err(),
+                "{name}: the link itself must be gone"
+            );
+        }
+        assert!(dir_target.join("keep.txt").exists(), "the target survives");
+    }
 
     /// The instance guard must sit on the POST CHOKEPOINT, not only on the
     /// periodic spawn.

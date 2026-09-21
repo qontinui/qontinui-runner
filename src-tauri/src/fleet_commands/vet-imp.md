@@ -823,47 +823,64 @@ states that legitimately stop the lifecycle must stop it here too:
   it — the §5 paragraph that also states the rule runs too late to refuse
   anything), because the
   block read `IN PROGRESS` and its conditional guard refused (the work has
-  landed, or a live peer holds it — see `/vet-plan`'s "`IN PROGRESS` is
-  CONDITIONALLY overwritable"), or because it judged the plan's **overall
+  landed, or a live peer holds it — see `/vet-plan`'s
+  "`IN PROGRESS` is CONDITIONALLY overwritable"), because its own §0.25
+  delivery read landed on
+  **arm 1** — `shipped: true` ∧ `evidence_complete: true` with the phase axis
+  corroborating it, the arm all three readers carry — and routed to closeout
+  instead of vetting, or because it judged the plan's **overall
   architectural direction wrong** and surfaced that instead of editing. In any of
   those cases do NOT proceed to implement — relay the vet skill's reason to the
   user and stop.
 - **The work has ALREADY LANDED.** Independently of the stamp, read the derived
   delivery before proceeding:
-  `coord_work_unit_list_citations(<plan-stem>) -> .delivery`. On
-  `shipped: true` ∧ `evidence_complete: true` ∧ an EMPTY `phases_remaining`,
-  **STOP** and route to closeout — do not implement. Read the response through
-  `/vet-plan`'s arm table in its stated order — **4, 3, 2, 1, 5, then 6**, with
-  arm 1 here additionally requiring an EMPTY `phases_remaining` (a non-empty
-  list is the implement case below, not arm 6) — so the UNKNOWN arms 3 and 2 are
-  ruled out before the closeout STOP of arm 1 is taken. An `IN PROGRESS` stamp is not re-decided here: `/vet-plan`
-  Step 0.25 already applied its "`IN PROGRESS` is CONDITIONALLY overwritable"
-  section, including its **unidentified default** (an `IN PROGRESS` stamp with
-  no session marker, or one that cannot be positively attributed at all, is a
-  STOP, not an overwrite; a marker naming a probed-dead peer is case 2, adopt),
-  before it rewrote the stamp.
+  `coord_work_unit_list_citations(<plan-stem>) -> .delivery`. **STOP** and
+  route to closeout — do not implement — only when EVERY one of these seven
+  holds:
 
-  > ⚠️ **`shipped: true` with a NON-EMPTY `phases_remaining` is NOT a stop — it
-  > is the single most valuable row this read can return.** coord is saying: at
-  > least one cited PR landed, and these declared phases have no landed
-  > evidence. IMPLEMENT THOSE PHASES. *(Plan
-  > `2026-09-13-coord-delivery-cannot-express-partial-delivery`, Phases 3 and 5.)*
-  >
-  > `shipped` has never meant *"all phases done"* — it is *"≥1 cited PR landed ∧
-  > none blocking"* — so a genuine Phase-1 PR on a six-phase plan derives it and
-  > the remaining five are never dispatched again. Measured 2026-09-15: **295
-  > units** read `shipped` against a non-terminal `origin/main` stamp, **277**
-  > with stated or structural residue. `phases_remaining` is the field that makes
-  > that condition readable instead of inferrable from prose.
-  >
-  > **An empty `phases_remaining` is not proof of completeness.** It is empty in
-  > four different situations and only one of them is "everything landed": the
-  > unit declares no phase list, a citation declared `complete`, **no landed
-  > citation carries a phase attribution at all**, or coverage really is total.
-  > The third is the common case today, and coord discloses it — `evidence_gaps`
-  > then carries a `NO PHASE ATTRIBUTION` entry. When that gap is present, the
-  > `shipped` in front of you rests on the citation count alone: fall through to
-  > the stamp arms rather than reading the empty list as a finished plan. Treat `evidence_complete: false`, or a top-level
+  1. `shipped: true`
+  2. `evidence_complete: true`
+  3. no top-level `merged_degraded_reason`
+  4. `phases_declared` is **not `null`**
+  5. `phases_remaining == []` — the LITERAL empty list, never `null`
+  6. that `[]` is **corroborated by the same response** (the corroboration rule
+     below)
+  7. `evidence_gaps` carries no `NO PHASE ATTRIBUTION` entry
+
+  Short of all seven it is a fall-through, not a stop. Read the response
+  through `/vet-plan`'s arm table in its stated order — **4, 3, 2, 1, 5, then
+  6** — with these seven as arm 1 here (a NON-EMPTY `phases_remaining` beside
+  `shipped: true` is `/vet-plan`'s one non-inconclusive arm-6 sub-case: the
+  implement case below), so the UNKNOWN arms 3 and 2 are ruled out
+  before the closeout STOP of arm 1 is taken. An `IN PROGRESS` stamp is not
+  re-decided here: `/vet-plan` Step 0.25 already applied its
+  "`IN PROGRESS` is CONDITIONALLY overwritable" section, including its
+  **unidentified default**
+  (an `IN PROGRESS` stamp with no session marker, or one that cannot be
+  positively attributed at all, is a STOP, not an overwrite; a marker naming a
+  probed-dead peer is case 2, adopt), before it rewrote the stamp.
+
+  **Conjunct 3 is carried explicitly even though that arm order already
+  enforces it** — `/vet-plan`'s arm 3 pre-empts arm 1 on a
+  `merged_degraded_reason` *"whatever `delivery` says"* — so that the seven
+  read correctly on their own, without the arm table beside them. On today's
+  code it is redundant with conjunct 2 (the degraded probe pushes its gap before
+  `evidence_complete = evidence_gaps.is_empty()` is computed, from the same
+  `merged_predicate_degraded_by` that fills the envelope field), but `/vet-plan`'s
+  own arm-3 text asserts the DECOUPLED reading — the field is *"present even when
+  the verdict could not be derived at all"* — and on that reading a reader
+  applying the other six without the arm table would STOP where `/vet-plan` answers
+  UNKNOWN. Naming it keeps the list safe to read on its own.
+
+  `phases_remaining: null` is UNKNOWN on
+  the phase axis, DISTINCT from `[]`: it falls through to the stamp arms, and you
+  say so plainly in the Step 5 report. Test
+  `null` BEFORE you test emptiness — a truthiness or emptiness test reads `null`
+  as falsy-empty and reproduces the exact false STOP plan
+  `2026-09-18-coord-fabricates-a-phase-declaration-and-silences-its-own-gap`
+  exists to prevent, so do not "simplify" the three-way read back to two.
+
+  Treat `evidence_complete: false`, or a top-level
   `merged_degraded_reason`, as **UNKNOWN rather than "undelivered"**, and a
   `no work-unit with that slug` error as *not-found* (say so; proceed).
   **Everything else is UNKNOWN too — that is the DEFAULT, not a gap.** Any other
@@ -877,19 +894,204 @@ states that legitimately stop the lifecycle must stop it here too:
   transport is dead and re-issue over the live door; if it still cannot be
   answered, say so plainly in the Step 5 report and let the stamp arms decide.
   Never let an unanswerable read silently license implementing. This mirrors
-  `/vet-plan`'s arm 6 — keep the two in sync.
+  `/vet-plan`'s arm 6 — keep the two in sync — and the STOP rule above must stay
+  in sync with `/vet-plan` §0.25 arm 1 and `/implement-plan` Step 0.5's
+  `IN PROGRESS` rule, which are the same contract read twice more.
 
-> **This arm exists because Step 3 cannot catch the class on its own.** Step 3
-> re-reads a stamp that **this chain's own Step 2 just wrote**, so the gate is
-> self-satisfying by construction: whatever `/vet-plan` stamped, Step 3 confirms.
-> Worse, the overwrite is not merely a missed guard — it **destroys the evidence
-> the downstream guard reads**. `/implement-plan` Step 0.45 check 1 surfaces a
-> foreign `IN PROGRESS` stamp to the operator, so a standalone
-> `/implement-plan` would at least have paused there; under `/vet-imp` it
-> cannot, because the stamp is `VETTED` by the time Step 0.45 looks. Do not
-> over-credit that check even when it does run: it offers a **Proceed anyway**
-> option rather than stopping. The delivery read is the only signal in this
-> chain that no earlier step can overwrite.
+  > ⚠️ **The corroboration rule — what entitles a literal `[]` to stop.** The
+  > literal `[]` may stop **only when the same response corroborates it**:
+  > `phases_declared_indices` is non-empty and every index in it also appears in
+  > `phases_delivered`. When `phases_declared_indices` is non-empty and
+  > `phases_delivered` does not cover it, `[]` contradicts its own neighbours —
+  > coord is claiming nothing remains while not having attributed every declared
+  > phase — so read
+  > it as UNKNOWN and fall through. An EMPTY `phases_declared_indices` is not
+  > corroboration either: there is nothing for the `[]` to be the answer to, so
+  > that is UNKNOWN as well — and so is a `null` one, which is how a coord build
+  > carrying the coord-fix plan's Phase 3 spells a declaration it could not
+  > establish (the coord-fix plan is `2026-09-18-coord-fabricates-a-phase-declaration-and-silences-its-own-gap`
+  > throughout this arm — not the plan you are running).
+  >
+  > **This test is deliberately BUILD-INDEPENDENT, and that is why it is the
+  > test.** `phases_declared_indices` and `phases_delivered` are already served
+  > beside `phases_remaining` by the coord build running today, so the rule needs
+  > no deployment tell — no version probe, no "has the nullable contract reached
+  > this tenant yet" question you would have to answer before you could read the
+  > field at all. It returns the same verdict on a PRE-contract coord (which
+  > spells every non-established state `[]`) and on a post-contract one (which
+  > spells them `null`), because on both it is the neighbours that decide.
+  > Verified against the measured shape: a live read of the work unit for plan
+  > `2026-09-18-coord-fabricates-a-phase-declaration-and-silences-its-own-gap`
+  > on 2026-09-18 returned `phases_declared: 5`,
+  > `phases_declared_indices: [1,2,3,4,5]`, `phases_delivered: []` and
+  > `phases_remaining: []` — declared indices non-empty, delivered covering none
+  > of them, so the `[]` is UNCORROBORATED and there is **no stop**. That is the
+  > correct outcome on either build. **What that example does and does not
+  > show:** the same read also returned `shipped: false`, so conjunct 1 had
+  > already ruled out a stop — it shows how the fields look, not that
+  > corroboration decided it. (On a build carrying the coord-fix plan's Phase 3
+  > the same unit reads `phases_remaining: null`, not `[]`; the verdict is the
+  > same, the spelling is not.)
+  >
+  > **What the rule costs — stated so you do not "fix" it.** A genuinely
+  > complete unit whose completeness was asserted some OTHER way fails
+  > corroboration and falls through to the stamp arms instead of stopping.
+  > **Two spellings, and the SECOND is the larger population today.** One: a
+  > citation declaring `complete`, which satisfies coord's coverage gate for a
+  > plan of any length while attributing no index at all, so `phases_delivered`
+  > stays empty. Two: landed citations carrying **no phase scope at all**, which
+  > leaves `phases_delivered` empty the same way. For a declaration of two or
+  > more phases that second spelling costs nothing new — coord raises the
+  > `NO PHASE ATTRIBUTION` gap there and the gap conjunct already blocked the
+  > stop. It bites on a **single-phase declaration**, where that gap is
+  > withheld on the build serving today (coord's Gap-5 arm requires
+  > `d.len() > 1` until the coord-fix plan's Phase 2) and the stop therefore
+  > used to fire: that is likely a large share of genuinely-complete one-phase plans on today's
+  > fleet, not an edge case. It is a FALSE NEGATIVE, and it is **not free** —
+  > say what actually catches it. The stamp arms do not read `origin/main`: in
+  > `/vet-plan` they read the status block captured from disk at §0.25 item 1,
+  > and here the stamp is the `VETTED` this chain's own Step 2 just wrote. A
+  > `SHIPPED`, `SUPERSEDED` or `OBSOLETE` stamp, or a foreign `IN PROGRESS`
+  > whose session left PRs, still stops at `/vet-plan`'s pre-edit capture; a
+  > complete plan still stamped `VETTED` or `DRAFT` (or `PARTIAL` / `NOT
+  > STARTED`) is re-vetted and re-implemented, and the only remaining MECHANICAL
+  > guard is `/implement-plan` Step 0.45 check 2 — a `git log origin/main -20`
+  > grep that misses anything older — though `/vet-plan` §2's claim verification
+  > may also notice the plan's premises are already met. That cost
+  > is accepted because a false STOP is worse — it abandons live work on a read
+  > where every field looked healthy, with no guard after it at all. Do not trade
+  > that protection away to buy back the false negative.
+
+  > ⚠️ **`shipped: true` with a NON-EMPTY `phases_remaining` is NOT a stop — it
+  > is the single most valuable row this read can return.** coord is saying: at
+  > least one cited PR landed, and these declared phases have no landed
+  > evidence. IMPLEMENT THOSE PHASES. *(Plan
+  > `2026-09-13-coord-delivery-cannot-express-partial-delivery`, Phases 3 and 5.)*
+  >
+  > `shipped` has never meant *"all phases done"* — it is *"≥1 cited PR landed ∧
+  > none blocking"*, narrowed by coord's phase gate only when a landed citation
+  > carries a phase attribution on a declaration of two or more phases — so a
+  > genuine Phase-1 PR carrying no phase scope on a six-phase plan derives it and
+  > the remaining five are never dispatched again. Measured 2026-09-15: **295
+  > units** read `shipped` against a non-terminal `origin/main` stamp, **277**
+  > with stated or structural residue. `phases_remaining` is the field that makes
+  > that condition readable instead of inferrable from prose.
+  >
+  > **An empty `phases_remaining` is not proof of completeness, and `null` is
+  > not empty.** The field is empty in four different situations and only one of
+  > them is "everything landed": the unit declares no phase list, a declaration
+  > exists but coord could not parse it, **no landed citation carries a phase
+  > attribution at all**, or coverage really is total. That fourth situation has
+  > two spellings and both count as total — every declared index carries a
+  > landed attribution, or **a single landed citation declared `complete`**,
+  > which satisfies coord's coverage gate whatever the declared count is. The
+  > corroboration rule above is what separates them: only the first spelling can
+  > corroborate itself, and the `complete` spelling deliberately falls through
+  > (see "What the rule costs"). Under the nullable contract *(plan
+  > `2026-09-18-coord-fabricates-a-phase-declaration-and-silences-its-own-gap`,
+  > Phase 3)* the first three render **`null`** — coord could not establish the
+  > phase axis — and only the fourth renders **`[]`**: coord looked and nothing
+  > remains.
+  >
+  > **Two fields, not one, and the names are close enough to mislead.**
+  > `phases_declared` is a **count** (`Option<usize>` — `null` exactly when coord
+  > never knew the plan's phase shape). The declared INDICES are a separate
+  > field, `phases_declared_indices`, and `phases_delivered` is the attributed
+  > union. So wherever this page says `phases_declared: null`, it is the COUNT that is null — do
+  > not go looking for a list under that name.
+  >
+  > The third situation is the common case today, and coord discloses it —
+  > `evidence_gaps` then carries a `NO PHASE ATTRIBUTION` entry. On the build
+  > serving today that disclosure is **withheld when the declaration has length
+  > 1**; the coord-fix plan's Phase 2 makes it unconditional, so do not read the
+  > conjunct as already-guaranteed cover. The SECOND situation — a declaration
+  > coord could not parse — has **no named gap on the build serving today**; a
+  > build carrying the coord-fix plan's Phase 5 names it (`UNREADABLE PHASE
+  > DECLARATION`, and `NO PHASE DECLARATION` for the first situation). The rule
+  > never keys on either name, so it gives the same verdict whichever build
+  > answers — do not add a conjunct that tests for them.
+  >
+  > On the serving build that second situation reads `phases_declared: null`
+  > beside `phases_remaining: []`; after the coord-fix plan's Phase 3 it reads
+  > `phases_remaining: null` and the `null` test catches it too. Conjunct 4
+  > (`phases_declared` is not `null`) is **implied by conjunct 6 on both
+  > builds**: a null count comes with an EMPTY `phases_declared_indices` today
+  > (coord renders the indices with `.unwrap_or_default()` off the same
+  > `Option`) and a `null` one after Phase 3, and corroboration refuses both. It
+  > is kept as a NAMED restatement of the state, not because anything depends on
+  > it alone; `/vet-plan`'s arm 1 omits it for exactly that subsumption reason.
+  >
+  > What neither catches is a declaration coord MIS-parsed through the
+  > positional fallback, so `1..=len` is fabricated. **On the build serving
+  > today** that is any list whose every index is UNREADABLE, which is not the
+  > same as unnumbered: the key may be absent, or PRESENT and rejected
+  > (`from_metadata`'s `>= 1` filter rejects `0`, and a string, a negative or an
+  > overflow is rejected too) — so do not rule the fallback out just because you
+  > can see an `index` key. For a single-entry list (the `cf9ae0b2` shape) it
+  > renders a non-null `phases_declared: 1` / `phases_declared_indices: [1]`
+  > and only corroboration catches it; for two or more entries the
+  > `NO PHASE ATTRIBUTION` gap also fires when nothing is attributed. **On a build carrying the coord-fix plan's
+  > Phases 1, 3 and 5**, index 0 is read as `0` and a present-but-rejected index
+  > is UNKNOWN (rendered `null`), so the fallback survives only for a list with
+  > NO `index` key at all — and that build names it:
+  > `phases_declaration_provenance: "positional"`.
+  >
+  > **Check the GAP LIST itself, never the `evidence_complete` flag.**
+  > `evidence_complete` is computed BEFORE the phase gap is appended
+  > (`evidence_complete = evidence_gaps.is_empty()`, and only then is the gap
+  > pushed), deliberately, so that a phase gap discloses without dropping the
+  > flag. `evidence_complete: true` beside a NON-EMPTY `evidence_gaps` is
+  > therefore reachable BY DESIGN — and both the identity `/vet-plan` states and
+  > the serving build's coord docstring (*"Empty iff `evidence_complete`"*;
+  > a build carrying the coord-fix plan says "NOT 'empty iff'") describe the
+  > pre-push moment, not the object in front of you. A reader who trusts either
+  > one will "simplify away" the gap conjunct. Read the list.
+  >
+  > Why the gap tell alone was not enough, and why `null` had to be distinct: on
+  > unit `cf9ae0b2` a single-entry `[{"index":0}]` declaration was parsed as a
+  > phantom `{1}`, the `len == 1` exemption silenced the `NO PHASE
+  > ATTRIBUTION` gap, and `phases_remaining: []` rendered *"nothing remains"* on
+  > a plan with four phases outstanding — every field of this arm read healthy
+  > and it STOPped a live chain. A defence keyed on a gap that the defect itself
+  > suppresses is not a defence; that is why the stop now turns on the
+  > corroboration rule, which the defect cannot fabricate **from silence**.
+  >
+  > **Bound that claim there, because corroboration is not proof.** It tests
+  > coord's own numbers against each other, not the declaration against the
+  > plan, so a declaration that is wrong *and* covered still corroborates.
+  > Constructible today: the same phantom `{1}` plus one landed citation whose
+  > marker carries `phases: 1` gives `phases_declared_indices: [1]` ⊆
+  > `phases_delivered: [1]`, `phases_remaining: []` and no gap — **corroborated,
+  > and it STOPs**, on a plan with phases outstanding. Same shape for any
+  > thinly-parsed multi-phase plan whose single landed PR cites the one index
+  > that was parsed. It is rare today only because phase attribution is rare,
+  > and the direction of travel is to make attribution common. That residue is
+  > not closed by any single phase, and not by this arm. The coord-fix plan's
+  > **Phase 1** closes only the present-but-rejected-index arm of the positional
+  > fallback (`[{"index":0}]` then reads `[0]`, and an unreadable index reads
+  > `null`). A thin but CORRECTLY numbered parse — the runner writing one entry
+  > for a five-phase plan, split to plan
+  > `2026-09-19-runner-detect-phases-misses-plans-that-list-phases-in-a-table-or-prose`
+  > — corroborates the same way, and coord cannot detect it at all: after Phase 1
+  > a `{0}` declaration beside one landed `phases: 0` citation STOPs just as the
+  > phantom `{1}` did.
+  >
+  > One last consequence for how you READ the field: never collapse `null` and
+  > `[]` when serialising the read. A `jq` `// []` default or a Python `or []`
+  > does exactly that, and re-arms the false STOP.
+
+  > **This arm exists because Step 3 cannot catch the class on its own.** Step 3
+  > re-reads a stamp that **this chain's own Step 2 just wrote**, so the gate is
+  > self-satisfying by construction: whatever `/vet-plan` stamped, Step 3 confirms.
+  > Worse, the overwrite is not merely a missed guard — it **destroys the evidence
+  > the downstream guard reads**. `/implement-plan` Step 0.45 check 1 surfaces a
+  > foreign `IN PROGRESS` stamp to the operator, so a standalone
+  > `/implement-plan` would at least have paused there; under `/vet-imp` it
+  > cannot, because the stamp is `VETTED` by the time Step 0.45 looks. Do not
+  > over-credit that check even when it does run: it offers a **Proceed anyway**
+  > option rather than stopping. The delivery read is the only signal in this
+  > chain that no earlier step can overwrite.
+
 - **The stamp is missing** for any other reason. Do not implement an unvetted
   plan; report what `/vet-plan` actually produced and stop.
 

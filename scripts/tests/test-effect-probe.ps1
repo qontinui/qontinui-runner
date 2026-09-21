@@ -2,13 +2,13 @@
 # test-effect-probe.ps1
 #
 # Mutation-tests the verdict half of contract-smoke Probe 2b
-# (scripts/lib/effect-probe.ps1). No runner, no supervisor, no network — pure
+# (scripts/lib/effect-probe.ps1). No runner, no supervisor, no network -- pure
 # decision logic over parsed JSON, runs in ~1s on any OS with pwsh.
 #
 # WHAT THIS EXISTS TO CATCH
 # -------------------------
 # Probe 2b's live half needs a supervisor and a Windows CI lane, so on most
-# machines its decision is never executed at all — let alone executed FAILING.
+# machines its decision is never executed at all -- let alone executed FAILING.
 # The defect the whole probe exists to catch (a per-action field silently
 # dropped by `serializeComponent`'s closed allow-list) is invisible to a check
 # that has only ever been observed green. These cases drive the verdict function
@@ -27,7 +27,7 @@ $checks = 0
 $Expected = @{ "list-tabs" = "read"; "switch-tab" = "write" }
 
 # Actions are built from JSON text rather than PSCustomObject literals so the
-# "key is absent" case is genuinely absent — the exact shape ConvertFrom-Json
+# "key is absent" case is genuinely absent -- the exact shape ConvertFrom-Json
 # produces for a serializer that dropped the field, not a null-valued property.
 function Surface {
     param([string]$Name, [string]$ActionsJson)
