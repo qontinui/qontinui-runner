@@ -300,13 +300,21 @@ pub(crate) async fn run_dispatch(
     // ceilings, never raises). Probed ONCE per dispatch — the answer cannot
     // change mid-build in any way worth re-reading, and the probe is a
     // blocking sysinfo refresh.
-    let host = host_sizing::derive(host_sizing::probe());
+    //
+    // Sized against this dispatch's SHARE of the host, not the whole of it: the
+    // node admits up to N dispatches side by side (the same N `admission.rs`
+    // admits against), and N dispatches each sized to the whole host
+    // oversubscribe it N-fold — see `host_sizing::share`.
+    let host_capacity = host_sizing::probe();
+    let concurrency = crate::settings::get_ci_node_settings()
+        .effective_max_concurrent_builds_for(host_capacity);
+    let host = host_sizing::derive(host_sizing::share(host_capacity, concurrency));
     let build_jobs = manifest.limits.effective_cargo_build_jobs(host);
     let test_threads = manifest.limits.effective_test_threads(host);
     sink.push(&format!(
         "[ci-node] manifest ok: {} step(s), {} sibling(s), {} tool(s), {} service(s); \
          cargo_build_jobs={build_jobs} test_threads={test_threads} \
-         (host sizing: {} / {})",
+         (host sizing: {} / {}, a 1/{concurrency} share of the host)",
         manifest.steps.len(),
         manifest.siblings.len(),
         manifest.tools.len(),

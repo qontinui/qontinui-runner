@@ -211,12 +211,37 @@ pub fn save_session_guard_settings(
 // CI node (the other resource lane on this machine)
 // ---------------------------------------------------------------------------
 
+/// The host-derived capacity suggestion the panel shows beside the
+/// `max_concurrent_builds` control (plan
+/// `2026-09-22-ci-capacity-is-hand-typed-...`, Phase 2): what an unset value
+/// resolves to on this host, the two host terms it was derived from, and which
+/// of them binds — so a value above it can be warned about by name.
+fn host_suggestion_json(cap: crate::ci_node::host_sizing::HostCapacity) -> serde_json::Value {
+    let (suggested, limiting_term) = crate::ci_node::host_sizing::suggestion_with_limit(cap);
+    serde_json::json!({
+        "suggested": suggested,
+        "cpus": cap.cpus,
+        "mem_gib": cap.mem_bytes.map(|b| b / (1024 * 1024 * 1024)),
+        "limiting_term": limiting_term,
+    })
+}
+
 /// Internal implementation of [`get_ci_node_settings`].
+///
+/// The response is the persisted [`CiNodeSettings`] plus one read-only key,
+/// `host_suggestion` (see [`host_suggestion_json`]). It is never written back:
+/// the save command takes the settings fields by name.
 fn get_ci_node_settings_impl() -> Result<CommandResponse, AppError> {
     info!("Getting CI-node settings");
 
     let ci_node = settings::get_ci_node_settings();
-    let data = serde_json::to_value(&ci_node)?;
+    let mut data = serde_json::to_value(&ci_node)?;
+    if let Some(obj) = data.as_object_mut() {
+        obj.insert(
+            "host_suggestion".to_string(),
+            host_suggestion_json(crate::ci_node::host_sizing::probe()),
+        );
+    }
 
     Ok(CommandResponse {
         success: true,
@@ -234,15 +259,31 @@ pub fn get_ci_node_settings() -> Result<CommandResponse, String> {
 /// Internal implementation of [`save_ci_node_settings`].
 fn save_ci_node_settings_impl(
     enabled: bool,
-    max_concurrent_builds: u32,
+    max_concurrent_builds: Option<u32>,
     repo_allowlist: Vec<String>,
     min_free_disk_gb: u64,
 ) -> Result<CommandResponse, AppError> {
     info!(
-        "Saving CI-node settings: enabled={}, max_concurrent_builds={}, \
+        "Saving CI-node settings: enabled={}, max_concurrent_builds={:?} (None = host suggestion), \
          repo_allowlist={:?}, min_free_disk_gb={}",
         enabled, max_concurrent_builds, repo_allowlist, min_free_disk_gb
     );
+
+    // An explicit value must sit in the range the remote door accepts
+    // (`ci_node::settings_directive`); `None` hands the choice to the host
+    // suggestion and needs no check.
+    if let Some(n) = max_concurrent_builds {
+        use crate::ci_node::settings_directive::{
+            MAX_CONCURRENT_BUILDS_MAX, MAX_CONCURRENT_BUILDS_MIN,
+        };
+        if !(MAX_CONCURRENT_BUILDS_MIN..=MAX_CONCURRENT_BUILDS_MAX).contains(&n) {
+            return Err(AppError::ConfigError(format!(
+                "max concurrent builds {n} is outside \
+                 {MAX_CONCURRENT_BUILDS_MIN}..={MAX_CONCURRENT_BUILDS_MAX} — the same range \
+                 ci_node::settings_directive accepts remotely"
+            )));
+        }
+    }
 
     // The same two values coord's remote configuration door refuses (see
     // `ci_node::settings_directive`): a wildcard allowlist, and a zero disk
@@ -294,7 +335,7 @@ fn save_ci_node_settings_impl(
 #[tauri::command]
 pub fn save_ci_node_settings(
     enabled: bool,
-    max_concurrent_builds: u32,
+    max_concurrent_builds: Option<u32>,
     repo_allowlist: Vec<String>,
     min_free_disk_gb: u64,
 ) -> Result<CommandResponse, String> {
@@ -425,7 +466,7 @@ mod tests {
             "qontinui/qontinui-runner".to_string()
         ]));
 
-        let err = save_ci_node_settings_impl(true, 1, vec!["*".to_string()], 20)
+        let err = save_ci_node_settings_impl(true, Some(1), vec!["*".to_string()], 20)
             .expect_err("a wildcard allowlist must not persist");
         assert!(String::from(err).contains("allowlist"));
     }
@@ -433,8 +474,40 @@ mod tests {
     /// A zero disk floor disables the guard it names, so it is refused.
     #[test]
     fn zero_disk_floor_is_refused() {
-        let err = save_ci_node_settings_impl(true, 1, Vec::new(), 0)
+        let err = save_ci_node_settings_impl(true, Some(1), Vec::new(), 0)
             .expect_err("a 0 GiB disk floor must not persist");
         assert!(String::from(err).contains("disk"));
+    }
+
+    /// An explicit concurrency outside the remote door's 1..=64 is refused;
+    /// the local door must not be the looser of the two.
+    #[test]
+    fn out_of_range_concurrency_is_refused() {
+        for n in [0, 65] {
+            let err = save_ci_node_settings_impl(true, Some(n), Vec::new(), 20)
+                .expect_err("out-of-range concurrency must not persist");
+            assert!(String::from(err).contains("concurrent"), "n={n}");
+        }
+    }
+
+    /// The panel's suggestion payload names the suggestion, both host terms and
+    /// the binding one.
+    #[test]
+    fn host_suggestion_payload_shape() {
+        let v = host_suggestion_json(crate::ci_node::host_sizing::HostCapacity {
+            mem_bytes: Some(368 * GIB),
+            cpus: 48,
+        });
+        assert_eq!(v["suggested"], 12);
+        assert_eq!(v["cpus"], 48);
+        assert_eq!(v["mem_gib"], 368);
+        assert_eq!(v["limiting_term"], "cores");
+        let unknown = host_suggestion_json(crate::ci_node::host_sizing::HostCapacity {
+            mem_bytes: None,
+            cpus: 8,
+        });
+        assert_eq!(unknown["suggested"], 1);
+        assert!(unknown["mem_gib"].is_null());
+        assert!(unknown["limiting_term"].is_null());
     }
 }
