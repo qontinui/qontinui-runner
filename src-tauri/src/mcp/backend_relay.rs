@@ -52,6 +52,7 @@ use qontinui_runner_lib::env_agent::{
     config::EnvAgentConfig,
     enroll::{self, EnrollParams},
 };
+use qontinui_types::runner::RunnerInstanceRole;
 use serde_json::Value;
 use tauri::Manager;
 use tokio::sync::{broadcast, watch, Mutex};
@@ -1347,6 +1348,102 @@ fn devenv_runner_info_block(
     })
 }
 
+/// Which runner instance on this box a `runner_info` came from.
+///
+/// Every runner instance on a machine — the primary on `:9876` and every
+/// supervisor-spawned secondary on `:9877-9899` — presents the SAME machine
+/// `device_id` (`machine_identity.rs`), so the backend cannot tell two sockets
+/// from one box apart by device identity alone (plan
+/// `2026-09-20-runner-selector-drives-a-transport-not-a-target`, reading A0.2:
+/// siblings collapse into one `coord.devices` row, last writer wins on `port`).
+/// This pair is what will let the backend keep one row per instance under that
+/// one device.
+///
+/// Wire keys are the TOP-LEVEL camelCase `instanceKey` / `instanceRole` (see
+/// [`build_runner_info`]). They are a separate contract from
+/// `devenv.instance_role`, which serves devenv enrollment suppression and is
+/// deliberately left untouched — the two happen to share a predicate, not a
+/// consumer. The role is the shared schema enum so its wire spelling is the
+/// one `qontinui_types::runner::RunnerInstance` declares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunnerInstanceIdentity {
+    /// Namespaced per-instance key — see [`RunnerInstanceIdentity::resolve`]
+    /// for exactly what is and is not guaranteed about it.
+    key: String,
+    role: RunnerInstanceRole,
+}
+
+impl RunnerInstanceIdentity {
+    /// Pure decision core — every input injected so it is testable without
+    /// touching process-global env.
+    ///
+    /// - `owns_shared_state`: [`crate::instance::owns_shared_root_state`] — the
+    ///   SAME primary/secondary predicate `devenv.instance_role` uses, so a
+    ///   nameless secondary (supervisor forgot `QONTINUI_INSTANCE_NAME`) reads
+    ///   as secondary here too rather than impersonating the primary.
+    /// - `runner_id`: `QONTINUI_RUNNER_ID`, set by the supervisor on every spawn
+    ///   from the runner's config id (`named-<port>-<uuid>` for a named runner,
+    ///   `test-<hex>` for a temp one) — unique by construction.
+    /// - `instance_name`: [`crate::instance::instance_name`]
+    ///   (`QONTINUI_INSTANCE_NAME`).
+    /// - `api_port`: this runner's bound API port.
+    ///
+    /// Keys, in precedence order. Each source carries its own namespace prefix,
+    /// so no value of one source can ever spell a key of another — a runner
+    /// NAMED `port:9878` keys as `name:port:9878`, never as the nameless
+    /// `:9878`'s `port:9878`, and a secondary can never produce the bare
+    /// `primary`, whatever it is named:
+    /// - primary → `primary`;
+    /// - secondary with `QONTINUI_RUNNER_ID` → `runner:<id>`. A named runner's
+    ///   id is persisted in the supervisor's settings with its config and
+    ///   reused on every restart, so this key is restart-stable for named
+    ///   runners; a temp runner's id is minted per spawn and a temp runner is
+    ///   never restarted as the same instance. Preferred over the name because
+    ///   the supervisor does not refuse two named runners with the same name;
+    /// - secondary with only `QONTINUI_INSTANCE_NAME` → `name:<name>` (a
+    ///   hand-launched secondary; unique only as far as its launcher chose);
+    /// - nameless secondary → `port:<api_port>`. **This fallback is only
+    ///   PORT-stable**: it survives a restart only if the instance comes back on
+    ///   the same port, and two different nameless instances that reuse a port
+    ///   over time share a key.
+    ///
+    /// Empty env values are treated as absent — the same rule
+    /// [`crate::instance::instance_name`] applies; any other value is used
+    /// verbatim (no trimming), so the key names exactly what the env said.
+    ///
+    /// **What is NOT guaranteed.** Two processes that each believe themselves
+    /// the primary (e.g. two copies both on the default port with no secondary
+    /// signal, one of which failed to bind) both report `primary`. Consumers —
+    /// the qontinui-web backend in particular — must treat two LIVE sockets
+    /// under one device reporting the same key as a conflict to surface, never
+    /// as a reconnect that silently overwrites the first.
+    fn resolve(
+        owns_shared_state: bool,
+        runner_id: Option<&str>,
+        instance_name: Option<&str>,
+        api_port: u16,
+    ) -> Self {
+        if owns_shared_state {
+            return Self {
+                key: "primary".to_string(),
+                role: RunnerInstanceRole::Primary,
+            };
+        }
+        let present = |v: Option<&str>| v.filter(|s| !s.is_empty()).map(str::to_string);
+        let key = if let Some(id) = present(runner_id) {
+            format!("runner:{id}")
+        } else if let Some(name) = present(instance_name) {
+            format!("name:{name}")
+        } else {
+            format!("port:{api_port}")
+        };
+        Self {
+            key,
+            role: RunnerInstanceRole::Secondary,
+        }
+    }
+}
+
 /// Build the whole `runner_info` payload. Extracted from [`send_runner_info`]
 /// purely so the wire keys can be pinned by a test — `"devenv"` in particular is
 /// a cross-repo string literal (qontinui-web `devices_ws.py` reads it) that no
@@ -1356,11 +1453,18 @@ fn devenv_runner_info_block(
 /// Field names are camelCase where the pre-existing backend contract is
 /// camelCase; the `devenv` block is snake_case because that is what the devenv
 /// half of the API speaks. Do not "normalize" either half.
+///
+/// `instanceKey` / `instanceRole` are the per-instance identity (see
+/// [`RunnerInstanceIdentity`]). Nothing reads them yet: qontinui-web
+/// `devices_ws.py` is to key one `coord.device_connections` row per instance
+/// on them in plan `2026-09-20-runner-selector-drives-a-transport-not-a-target`
+/// Phase 6 (web half).
 fn build_runner_info(
     name: String,
     hostname: Option<String>,
     port: u16,
     capabilities: Vec<String>,
+    instance: RunnerInstanceIdentity,
     devenv: Value,
 ) -> Value {
     serde_json::json!({
@@ -1372,6 +1476,8 @@ fn build_runner_info(
         "os": std::env::consts::OS,
         "osVersion": std::env::consts::ARCH,
         "capabilities": capabilities,
+        "instanceKey": instance.key,
+        "instanceRole": instance.role,
         "devenv": devenv,
     })
 }
@@ -1746,10 +1852,21 @@ where
     // local kill switch — see `devenv_runner_info_block` for why the block is
     // always present, and why both suppression signals must mirror
     // `devenv_enroll_refusal` exactly.
+    let owns_shared_state = crate::instance::owns_shared_root_state();
     let devenv = devenv_runner_info_block(
         EnvAgentConfig::load(),
-        crate::instance::owns_shared_root_state(),
+        owns_shared_state,
         devenv_auto_enroll_opted_out(),
+    );
+
+    // Per-instance identity under the shared machine `device_id` (plan
+    // `2026-09-20-runner-selector-drives-a-transport-not-a-target`, A0.2).
+    let runner_id = std::env::var("QONTINUI_RUNNER_ID").ok();
+    let instance = RunnerInstanceIdentity::resolve(
+        owns_shared_state,
+        runner_id.as_deref(),
+        instance_name.as_deref(),
+        port,
     );
 
     let runner_info = build_runner_info(
@@ -1757,6 +1874,7 @@ where
         hostname,
         port,
         capabilities,
+        instance,
         devenv,
     );
 
@@ -6857,6 +6975,7 @@ mod tests {
             Some("box-1".to_string()),
             9876,
             vec!["gui_automation".to_string()],
+            RunnerInstanceIdentity::resolve(true, None, None, 9876),
             devenv_runner_info_block(Some(enrolled_cfg()), true, false),
         );
 
@@ -6872,6 +6991,125 @@ mod tests {
         assert_eq!(payload["port"], 9876);
         assert!(payload.get("ipAddress").is_some());
         assert!(payload.get("osVersion").is_some());
+    }
+
+    /// `instanceKey` / `instanceRole` are TOP-LEVEL camelCase keys that
+    /// qontinui-web `devices_ws.py` is to read to key one
+    /// `coord.device_connections` row per instance (plan
+    /// `2026-09-20-runner-selector-drives-a-transport-not-a-target`, Phase 6
+    /// web half — not yet shipped). A typo would silently collapse every
+    /// instance on a box back into one — the A0.2 defect — so the spelling is
+    /// pinned here, and so is the fact that the pre-existing
+    /// `devenv.instance_role` contract is untouched beside it.
+    #[test]
+    fn runner_info_payload_carries_instance_key_and_role_under_their_wire_keys() {
+        let payload = build_runner_info(
+            "canary".to_string(),
+            Some("box-1".to_string()),
+            9877,
+            vec!["gui_automation".to_string()],
+            RunnerInstanceIdentity::resolve(false, Some("named-9877-abc"), Some("canary"), 9877),
+            devenv_runner_info_block(Some(enrolled_cfg()), false, false),
+        );
+
+        assert_eq!(payload["instanceKey"], "runner:named-9877-abc");
+        assert_eq!(payload["instanceRole"], "secondary");
+        // Not snake_case at the top level, and not nested in `devenv`.
+        assert!(payload.get("instance_key").is_none());
+        assert!(payload.get("instance_role").is_none());
+        assert!(payload["devenv"].get("instanceKey").is_none());
+        // The devenv block keeps its own, separate snake_case field.
+        assert_eq!(payload["devenv"]["instance_role"], "secondary");
+    }
+
+    /// The role's wire spelling is the shared schema enum's, not a local string.
+    #[test]
+    fn runner_instance_role_serializes_as_the_schema_spelling() {
+        let primary = RunnerInstanceIdentity::resolve(true, None, None, 9876);
+        let payload = build_runner_info(
+            "primary".to_string(),
+            None,
+            9876,
+            vec![],
+            primary,
+            devenv_runner_info_block(None, true, false),
+        );
+        assert_eq!(payload["instanceKey"], "primary");
+        assert_eq!(payload["instanceRole"], "primary");
+    }
+
+    #[test]
+    fn runner_instance_identity_primary_is_keyed_primary() {
+        // Even with supervisor env present, the primary is `primary`.
+        let id = RunnerInstanceIdentity::resolve(true, Some("primary"), None, 9876);
+        assert_eq!(id.key, "primary");
+        assert_eq!(id.role, RunnerInstanceRole::Primary);
+    }
+
+    #[test]
+    fn runner_instance_identity_prefers_the_supervisor_runner_id() {
+        // Keyed by runner id, not port: a restart onto a different port keeps
+        // the key.
+        let a = RunnerInstanceIdentity::resolve(false, Some("named-9877-u1"), Some("canary"), 9877);
+        let b = RunnerInstanceIdentity::resolve(false, Some("named-9877-u1"), Some("canary"), 9881);
+        assert_eq!(a.key, "runner:named-9877-u1");
+        assert_eq!(a.role, RunnerInstanceRole::Secondary);
+        assert_eq!(a, b);
+    }
+
+    /// The supervisor's `spawn-named` does not refuse a duplicate name, so two
+    /// runners named alike must still key apart by their distinct runner ids.
+    #[test]
+    fn runner_instance_identity_same_name_different_runner_ids_differ() {
+        let a = RunnerInstanceIdentity::resolve(false, Some("named-9877-u1"), Some("canary"), 9877);
+        let b = RunnerInstanceIdentity::resolve(false, Some("named-9878-u2"), Some("canary"), 9878);
+        assert_ne!(a.key, b.key);
+    }
+
+    /// A runner NAMED `port:9878` must not collide with a nameless runner on
+    /// `:9878` — each source carries its own namespace.
+    #[test]
+    fn runner_instance_identity_name_spelling_a_port_key_does_not_collide() {
+        let named = RunnerInstanceIdentity::resolve(false, None, Some("port:9878"), 9877);
+        let nameless = RunnerInstanceIdentity::resolve(false, None, None, 9878);
+        assert_eq!(named.key, "name:port:9878");
+        assert_eq!(nameless.key, "port:9878");
+        assert_ne!(named.key, nameless.key);
+    }
+
+    /// A secondary can never produce the bare `primary` key, whatever it is
+    /// named (e.g. a hand-launched `QONTINUI_INSTANCE_NAME=primary`).
+    #[test]
+    fn runner_instance_identity_secondary_named_primary_is_not_primary() {
+        let by_name = RunnerInstanceIdentity::resolve(false, None, Some("primary"), 9877);
+        let by_id = RunnerInstanceIdentity::resolve(false, Some("primary"), None, 9877);
+        assert_eq!(by_name.key, "name:primary");
+        assert_eq!(by_id.key, "runner:primary");
+        assert_eq!(by_name.role, RunnerInstanceRole::Secondary);
+        assert_ne!(by_name.key, "primary");
+        assert_ne!(by_id.key, "primary");
+    }
+
+    #[test]
+    fn runner_instance_identity_nameless_secondary_falls_back_to_port() {
+        // A secondary by another signal (non-default port / primary_port) with
+        // no QONTINUI_RUNNER_ID / QONTINUI_INSTANCE_NAME must never take the
+        // primary's key. Empty env values count as absent.
+        let id = RunnerInstanceIdentity::resolve(false, None, None, 9878);
+        assert_eq!(id.key, "port:9878");
+        assert_eq!(id.role, RunnerInstanceRole::Secondary);
+        let empty = RunnerInstanceIdentity::resolve(false, Some(""), Some(""), 9878);
+        assert_eq!(empty, id);
+    }
+
+    /// Documented limit, pinned so it is not mistaken for a guarantee: two
+    /// self-believed primaries report the same key, and the consumer must
+    /// treat that as a conflict.
+    #[test]
+    fn runner_instance_identity_two_self_believed_primaries_share_a_key() {
+        let a = RunnerInstanceIdentity::resolve(true, None, None, 9876);
+        let b = RunnerInstanceIdentity::resolve(true, None, None, 9876);
+        assert_eq!(a.key, b.key);
     }
 
     /// Pins the command-type SPELLING qontinui-web sends.
