@@ -35,7 +35,9 @@ use super::PgDb;
 impl PgDb {
     /// Insert a `session_emergent` row in `project.tasks` for an AI session
     /// that didn't come from a plan decomposition. Idempotent via the
-    /// partial unique index `idx_tasks_emergent_per_session` (alembic-owned);
+    /// partial unique index `idx_tasks_emergent_per_session` — created by this
+    /// repo's own `MACHINE_LOCAL_TABLES_DDL` self-heal (`database/pg/mod.rs`),
+    /// not by alembic, exactly as this module's header says;
     /// a second call for the same `assigned_session_id` returns `Ok(None)`.
     ///
     /// `assigned_session_id` is typically the worker's `task_run_id`
