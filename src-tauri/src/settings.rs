@@ -5685,10 +5685,15 @@ pub fn get_dev_logs_dir_override() -> Option<String> {
     crate::config_facade::get_dev_logs_dir_override()
 }
 
-/// Save Path settings
-pub fn save_path_settings(path_settings: PathSettings) -> Result<(), String> {
-    crate::config_facade::save_setting(path_settings)
-}
+// `save_path_settings` used to live here: a bare
+// `config_facade::save_setting(path_settings)` whole-struct REPLACE. It had no
+// callers (the Tauri command of the same name is
+// `commands::path_settings::save_path_settings`, which goes through the
+// merging patch path), and keeping it would have left a loaded footgun beside
+// the sign warning about it — a write through this function erases all four
+// keyed maps, which is exactly the erasure the patch/merge door was built to
+// remove. Deleted rather than deprecated. The live reader beside it,
+// `get_path_settings`, stays: `unified_workflow_executor::types` uses it.
 
 /// Save the dev_logs_dir override
 pub fn save_dev_logs_dir(dev_logs_dir: Option<String>) -> Result<(), String> {

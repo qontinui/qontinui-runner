@@ -5038,8 +5038,19 @@ impl BodySync {
 /// Blank is unset, everywhere: a path setting configured to `""` (or
 /// whitespace) disables that directory rather than scanning a directory
 /// named `""`.
+///
+/// **Trims what it returns**, so the scalar and the per-tenant arm
+/// ([`tenant_override`]) answer in the same shape. They used to disagree: this
+/// filtered on `trim()` and returned the value UNTRIMMED, so a hand-edited
+/// `settings.json` carrying `"plans_dir": " /x "` exported
+/// `QONTINUI_PLANS_DIR=" /x "` from the scalar and `/x` from a map entry — two
+/// spellings of one directory, reached through one resolver. Both save doors
+/// normalise on write, so only a hand edit produces it; the asymmetry is still
+/// removed here rather than relied on not to matter.
 fn non_blank(configured: Option<String>) -> Option<String> {
-    configured.filter(|s| !s.trim().is_empty())
+    configured
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// The per-tenant arm shared by all three resolvers: a **non-blank** entry for

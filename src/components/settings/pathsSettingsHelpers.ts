@@ -197,10 +197,7 @@ export const TENANT_MAP_FIELD = {
 export type TenantPathDrafts = Record<TenantPathField, Record<string, string>>;
 
 /** The saved map for one per-tenant directory; `{}` when none is stored. */
-export function tenantPathMap(
-  saved: PathSettings,
-  field: TenantPathField,
-): Record<string, string> {
+export function tenantPathMap(saved: PathSettings, field: TenantPathField): Record<string, string> {
   return saved[TENANT_MAP_FIELD[field]] ?? {};
 }
 
@@ -404,10 +401,25 @@ export function buildPathSettingsPayload(
       next[field] = value;
     }
   }
+  // ── The map fields, and the DELETE is as load-bearing as the assignment ──
+  //
+  // `next` starts as `{ ...saved }`, so every map key is ALREADY PRESENT with
+  // the value this panel loaded at mount. Assigning on the edited branch is
+  // therefore only half the rule: without the `delete` on the other branch,
+  // "the panel did not show this map, so it is omitting it" is false — the
+  // payload carries the panel's possibly-stale snapshot and the merge dutifully
+  // writes it back. A peer that set `plans_dir_by_tenant` through
+  // `PUT /settings/paths` while a single-tenant operator had this panel open
+  // would be silently REVERTED by that operator's next save: the same erasure
+  // class the patch/merge exists to close, re-entering through the branch meant
+  // to be inert. It is invisible in a single-writer test, which is why it has
+  // to be stated here rather than left to the reader.
   if (repoCheckouts !== undefined) {
     // `{}` is a DELIBERATE CLEAR, not an omission: under the save's merge,
     // deleting the key would leave the stored map in place.
     next.repo_checkouts = { ...repoCheckouts };
+  } else {
+    delete next.repo_checkouts;
   }
   if (tenantDrafts !== undefined) {
     // Same rule, and the same reason: a cleared per-tenant row must reach the
@@ -415,6 +427,10 @@ export function buildPathSettingsPayload(
     next.plans_dir_by_tenant = normalizeTenantPathMap(tenantDrafts.plans_dir);
     next.plans_archive_dir_by_tenant = normalizeTenantPathMap(tenantDrafts.plans_archive_dir);
     next.prompts_dir_by_tenant = normalizeTenantPathMap(tenantDrafts.prompts_dir);
+  } else {
+    delete next.plans_dir_by_tenant;
+    delete next.plans_archive_dir_by_tenant;
+    delete next.prompts_dir_by_tenant;
   }
   return next;
 }
