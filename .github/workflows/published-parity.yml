@@ -636,6 +636,17 @@ jobs:
       # The fifth hangable step, and the only one previously bounded nowhere.
       # A pure text diff over two already-written logs; it has never taken
       # measurable time. 5 minutes is ample margin, not a sizing estimate.
+      #
+      # This pairs continue-on-error with a step-level timeout-minutes --
+      # exactly the combination the ci.yml/ci-test-results-ingest.mjs
+      # comments (corrected in this same commit) call UNRECONCILED: a real
+      # incident (run 33545829387) showed it cancel the whole job; this
+      # commit's own Phase 0 experiment (run 35730892188) showed it did not.
+      # Accepted here anyway, unlike that step, because "Upload the
+      # row-level parity diff" and "Report the count" below both carry
+      # `if: always()`, which GitHub runs even through a job cancellation
+      # (unlike a plain `success()`/no-condition step) -- so even the
+      # cancel-the-job reading still lets this job report.
       - name: Behavioural axis — diff the two pass/fail sets
         continue-on-error: true
         timeout-minutes: 5
