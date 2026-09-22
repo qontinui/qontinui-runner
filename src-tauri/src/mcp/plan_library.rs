@@ -1006,22 +1006,77 @@ pub fn build_agent_upsert(
 /// Returns an empty vec when nothing is configured, and the caller then refuses
 /// every `source_path` — **fail closed**. An unconfigured runner having no
 /// confinement set must mean "no file reads", never "all file reads".
+///
+/// ## Why this is the UNION across every tenant, not one tenant's resolution
+///
+/// The three plan/prompt settings are keyed by tenant
+/// (`PathSettings::plans_dir_by_tenant` and its twins), and this door carries no
+/// principal to resolve *a* tenant from. If it resolved only the device default,
+/// a non-default tenant's own plans directory would fall **outside** the
+/// confinement and that tenant's write door would refuse that tenant's own
+/// files — a capability every session has today silently disappearing for every
+/// tenant that keyed a directory.
+///
+/// So the root set is the device default **plus every value of all three maps**,
+/// flattened exactly as `plans_archive_dir`, `prompts_dir` and `workspace_root`
+/// already are. This is the existing idiom extended rather than a widening of
+/// the door's semantics: the confinement means "the directories this device is
+/// configured to hold plans and prompts in", and keying a setting by tenant adds
+/// entries to that list without changing what the list means. It is also not a
+/// cross-tenant read of anything: confinement bounds which FILES may be read off
+/// this device's own disk, while who a captured artifact belongs to comes from
+/// the credential — see plan
+/// `2026-09-22-plans-dir-is-a-single-path-so-a-multi-bound-device-cannot-author-per-tenant`
+/// §2 D1.
 fn source_path_roots() -> Vec<PathBuf> {
-    let paths = crate::config_facade::get_setting::<crate::settings::PathSettings>();
-    // The active plans dir goes through the adapter's own resolver (the
-    // `paths.plans_dir` setting — there is no env override) so this door and
-    // the scan can never disagree about which directory is "the plans dir".
-    let plans = qontinui_runner_lib::plan_workunit_adapter::trigger::resolve_plans_dir(
-        paths.plans_dir.clone(),
-    );
+    source_path_roots_from(&crate::config_facade::get_setting::<
+        crate::settings::PathSettings,
+    >())
+}
+
+/// Pure core of [`source_path_roots`]: the settings are injected, so the
+/// confinement set this door computes is asserted directly rather than inferred
+/// from a resolver. Same wrapper/core split as
+/// [`crate::commands::path_settings::view_from`].
+fn source_path_roots_from(paths: &crate::settings::PathSettings) -> Vec<PathBuf> {
+    use qontinui_runner_lib::plan_workunit_adapter::trigger::{
+        resolve_plans_archive_dir, resolve_plans_dir, resolve_prompts_dir,
+    };
+
+    // Each configured directory goes through the adapter's own resolver (the
+    // `paths.*` settings — there is no env override) so this door and the scan
+    // can never disagree about which directory is "the plans dir". `None` for
+    // the tenant asks each resolver for the DEVICE DEFAULT; the per-tenant
+    // entries are unioned in beside it rather than resolved through it, because
+    // a resolver answers for ONE tenant and the confinement set is every
+    // tenant's answer at once.
     [
-        plans,
-        paths.plans_archive_dir.clone(),
-        paths.prompts_dir.clone(),
+        resolve_plans_dir(paths.plans_dir.clone(), &paths.plans_dir_by_tenant, None),
+        resolve_plans_archive_dir(
+            paths.plans_archive_dir.clone(),
+            &paths.plans_archive_dir_by_tenant,
+            None,
+        ),
+        resolve_prompts_dir(
+            paths.prompts_dir.clone(),
+            &paths.prompts_dir_by_tenant,
+            None,
+        ),
         paths.workspace_root.clone(),
     ]
     .into_iter()
     .flatten()
+    // Every per-tenant entry of all three maps, so a tenant that configured its
+    // own directory can still send a `source_path` from it.
+    .chain(
+        [
+            &paths.plans_dir_by_tenant,
+            &paths.plans_archive_dir_by_tenant,
+            &paths.prompts_dir_by_tenant,
+        ]
+        .into_iter()
+        .flat_map(|by_tenant| by_tenant.values().cloned()),
+    )
     .filter(|s| !s.trim().is_empty())
     // Canonicalized so the comparison in `confine_source_path` is between two
     // fully-resolved paths. A root that does not exist is dropped rather than
@@ -2168,6 +2223,84 @@ mod tests {
         r.source_path = Some(big.to_string_lossy().to_string());
         let err = resolve_body_within(&r, &roots).unwrap_err();
         assert!(err.contains("limit for an artifact body"), "got {err}");
+    }
+
+    // ---- the confinement set is the UNION across tenants -------------------
+
+    /// **The security-relevant claim of the per-tenant plans-dir change**, and
+    /// it is asserted directly on the function that BUILDS the confinement set
+    /// rather than through a resolver, because a resolver answers for one tenant
+    /// and this set has to admit every tenant's directory at once.
+    ///
+    /// A tenant that keys its own `plans_dir` must still be able to send a
+    /// `source_path` from it. If this set resolved only the device default, that
+    /// tenant's write door would refuse that tenant's own files — a capability
+    /// every session has today disappearing, silently, for every non-default
+    /// tenant. All three maps are unioned, because all three are keyed.
+    #[test]
+    fn the_confinement_set_admits_a_per_tenant_directory_that_is_not_the_device_default() {
+        let base = tempfile::tempdir().unwrap();
+        let mk = |name: &str| {
+            let d = base.path().join(name);
+            std::fs::create_dir(&d).unwrap();
+            std::fs::canonicalize(&d).unwrap()
+        };
+        let (device_plans, tenant_plans) = (mk("device-plans"), mk("tenant-plans"));
+        let (tenant_archive, tenant_prompts) = (mk("tenant-archive"), mk("tenant-prompts"));
+        let tenant = "7ac125b6-391b-4d64-8493-27305b25c5b9";
+        let entry = |dir: &std::path::Path| {
+            [(tenant.to_string(), dir.to_string_lossy().to_string())]
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+
+        let paths = crate::settings::PathSettings {
+            plans_dir: Some(device_plans.to_string_lossy().to_string()),
+            plans_dir_by_tenant: entry(&tenant_plans),
+            plans_archive_dir_by_tenant: entry(&tenant_archive),
+            prompts_dir_by_tenant: entry(&tenant_prompts),
+            ..crate::settings::PathSettings::default()
+        };
+        let roots = source_path_roots_from(&paths);
+
+        for dir in [
+            &device_plans,
+            &tenant_plans,
+            &tenant_archive,
+            &tenant_prompts,
+        ] {
+            assert!(
+                roots.contains(dir),
+                "{} must be inside the confinement set: {roots:?}",
+                dir.display()
+            );
+        }
+
+        // And the confinement actually admits a file from the per-tenant dir,
+        // which is the capability the union exists to keep.
+        let plan = tenant_plans.join("p.md");
+        std::fs::write(&plan, "# T\n").unwrap();
+        confine_source_path(&plan.to_string_lossy(), &roots)
+            .expect("a per-tenant plans dir must confine its own files");
+    }
+
+    /// Fail-closed is unchanged by the union: an unconfigured runner still has
+    /// NO confinement set, so every `source_path` is refused. A map that exists
+    /// but holds only blank values adds nothing — blank is unset per entry.
+    #[test]
+    fn an_unconfigured_runner_still_has_an_empty_confinement_set() {
+        assert!(source_path_roots_from(&crate::settings::PathSettings::default()).is_empty());
+
+        let blank_entries = crate::settings::PathSettings {
+            plans_dir_by_tenant: [(
+                "7ac125b6-391b-4d64-8493-27305b25c5b9".to_string(),
+                "  ".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..crate::settings::PathSettings::default()
+        };
+        assert!(source_path_roots_from(&blank_entries).is_empty());
     }
 
     // ---- the full-replace guard (cross-repo contract) ----------------------

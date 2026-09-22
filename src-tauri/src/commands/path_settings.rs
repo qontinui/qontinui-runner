@@ -35,15 +35,43 @@
 //! whitespace-only string becomes `None`. Blank means unset everywhere in this
 //! codebase (the resolvers, the migration, the session-env injection), and
 //! storing `Some("")` would make the on-disk file disagree with every reader
-//! of it. `strict_mode` and any field the UI does not show round-trip
-//! untouched because the whole struct is persisted.
+//! of it. The same per-entry rule applies inside every keyed map: a blank key
+//! or a blank value is not an entry.
+//!
+//! ## The save is a PATCH, because a whole-struct replace erased maps
+//!
+//! [`save`] takes [`PathSettingsPatch`], not a `PathSettings`, and the
+//! distinction is load-bearing. This module used to persist
+//! `|paths| *paths = normalize(settings)` — a whole-struct **replace** — and
+//! claimed "fields the caller does not show round-trip untouched **because the
+//! whole struct is persisted**". That was true of the UI and of nothing else:
+//! the preservation was implemented CLIENT-side, by
+//! `pathsSettingsHelpers.ts`'s `buildPathSettingsPayload` spreading the
+//! previously-fetched `configured` object. `repo_checkouts` carries
+//! `#[serde(default, skip_serializing_if = "…is_empty")]`, so a
+//! `PUT /settings/paths` body that simply omitted it deserialized to an empty
+//! map and **erased the operator's repo mappings**. An agent or a script
+//! composing a body by hand did that trivially, and keying three more maps by
+//! tenant would have multiplied the same defect by four.
+//!
+//! So the four map fields are `Option<BTreeMap<…>>` on the wire:
+//!
+//! - **absent, or JSON `null`** ⇒ leave the stored map untouched;
+//! - **`{}`** ⇒ a deliberate clear.
+//!
+//! The five `Option<String>` scalars keep today's semantics exactly — absent
+//! means unset, because the panel shows all five and sends all five, and a
+//! scalar a caller omits is a scalar it means to clear. `strict_mode` likewise
+//! defaults to `false` when absent, as it always has.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::config_facade;
 use crate::settings::PathSettings;
 use qontinui_runner_lib::plan_workunit_adapter::trigger::{
-    adapter_metrics, resolve_plans_dir, resolve_prompts_dir, MetricsSnapshot, ScanDivergence,
+    adapter_metrics, resolve_plans_archive_dir, resolve_plans_dir, resolve_prompts_dir,
+    MetricsSnapshot, ScanDivergence,
 };
 
 /// The adapter's last scan-source divergence reading, projected across the
@@ -112,6 +140,35 @@ impl From<&ScanDivergence> for ScanDivergenceView {
     }
 }
 
+/// What the three keyed directories resolve to for ONE named tenant.
+///
+/// Present in [`ResolvedPaths`] only when the caller named a tenant, which is
+/// what lets the panel show "this is where tenant X's sessions author" beside
+/// the device-wide answer. Every field is `Option` for the same reason the
+/// device-level ones are: an absent directory means the tier is off for that
+/// tenant, which is a reading rather than a gap.
+///
+/// **`tenant_id` here is the LOOKUP KEY the caller passed, echoed back — never
+/// an attribution claim.** It selects a stored string out of
+/// `PathSettings::plans_dir_by_tenant` and its twins; nothing downstream may
+/// read it as evidence of who owns a captured artifact, which comes from the
+/// credential (plan
+/// `2026-09-22-plans-dir-is-a-single-path-so-a-multi-bound-device-cannot-author-per-tenant`
+/// §2 D1). It is echoed verbatim, including a key the device is not currently
+/// bound to: resolution is honest about what it was asked, and the panel labels
+/// an unbound key rather than hiding it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvedForTenant {
+    /// The `tenant_id` the caller named, verbatim.
+    pub tenant_id: String,
+    /// `plans_dir_by_tenant[tenant_id]`, else the device-wide `plans_dir`.
+    pub plans_dir: Option<String>,
+    /// `plans_archive_dir_by_tenant[tenant_id]`, else `plans_archive_dir`.
+    pub plans_archive_dir: Option<String>,
+    /// `prompts_dir_by_tenant[tenant_id]`, else `prompts_dir`.
+    pub prompts_dir: Option<String>,
+}
+
 /// What each path setting resolves to **now**.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResolvedPaths {
@@ -139,6 +196,15 @@ pub struct ResolvedPaths {
     /// and reports `not_scanning`, so an off machine is a reading here, never
     /// an absence.
     pub plan_scan_divergence: Option<ScanDivergenceView>,
+    /// The same three keyed directories resolved **for one named tenant**.
+    ///
+    /// Present only when the caller named a `tenant_id`; with no tenant named
+    /// this whole field is absent and the view is byte-identical to the one
+    /// served before the settings were keyed. A caller that wants the device
+    /// answer asks for nothing, which is the only reading that cannot be
+    /// mistaken for a tenant's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_for_tenant: Option<ResolvedForTenant>,
 }
 
 /// The whole `paths` section: what is configured, and what is in effect.
@@ -146,6 +212,53 @@ pub struct ResolvedPaths {
 pub struct PathSettingsView {
     pub configured: PathSettings,
     pub resolved: ResolvedPaths,
+}
+
+/// The SAVE wire shape: a **patch** over the stored `paths` section.
+///
+/// Why this exists rather than accepting a whole [`PathSettings`]: see the
+/// module doc's "The save is a PATCH" section. In one line — a whole-struct
+/// replace let a caller that had never heard of `repo_checkouts` erase it by
+/// omission, and three tenant-keyed maps would have made that four ways to lose
+/// an operator's configuration.
+///
+/// The two field families behave differently ON PURPOSE:
+///
+/// - the five `Option<String>` **scalars** keep today's semantics — absent (or
+///   blank) means *unset*, because the panel shows all five and sends all five,
+///   so an omission there is a clear;
+/// - the four **maps** are `Option<BTreeMap<…>>` — absent or `null` means
+///   *leave the stored map alone*, `{}` means *clear it*. A map has no single
+///   field a panel "shows", so an omission there is far more likely to be
+///   ignorance of the field than an intent to empty it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PathSettingsPatch {
+    #[serde(default)]
+    pub dev_logs_dir: Option<String>,
+    #[serde(default)]
+    pub plans_dir: Option<String>,
+    #[serde(default)]
+    pub plans_archive_dir: Option<String>,
+    #[serde(default)]
+    pub prompts_dir: Option<String>,
+    #[serde(default)]
+    pub workspace_root: Option<String>,
+    /// Absent/`null` ⇒ the stored map survives; `{}` ⇒ a deliberate clear.
+    #[serde(default)]
+    pub plans_dir_by_tenant: Option<BTreeMap<String, String>>,
+    /// Absent/`null` ⇒ the stored map survives; `{}` ⇒ a deliberate clear.
+    #[serde(default)]
+    pub plans_archive_dir_by_tenant: Option<BTreeMap<String, String>>,
+    /// Absent/`null` ⇒ the stored map survives; `{}` ⇒ a deliberate clear.
+    #[serde(default)]
+    pub prompts_dir_by_tenant: Option<BTreeMap<String, String>>,
+    /// Absent/`null` ⇒ the stored map survives; `{}` ⇒ a deliberate clear.
+    /// Keyed by coord repo slug, not by tenant — this map is touched here only
+    /// to delete the erasure hazard it shared, never to key it by tenant.
+    #[serde(default)]
+    pub repo_checkouts: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub strict_mode: bool,
 }
 
 /// Blank → `None` for every `Option<String>` path field, and surrounding
@@ -160,32 +273,88 @@ pub fn normalize(settings: PathSettings) -> PathSettings {
         plans_archive_dir: non_blank(settings.plans_archive_dir),
         prompts_dir: non_blank(settings.prompts_dir),
         workspace_root: non_blank(settings.workspace_root),
+        plans_dir_by_tenant: normalize_entries(settings.plans_dir_by_tenant),
+        plans_archive_dir_by_tenant: normalize_entries(settings.plans_archive_dir_by_tenant),
+        prompts_dir_by_tenant: normalize_entries(settings.prompts_dir_by_tenant),
         // A blank slug or a blank path is not a mapping; both sides trimmed.
-        repo_checkouts: settings
-            .repo_checkouts
-            .into_iter()
-            .filter_map(|(slug, path)| {
-                let (slug, path) = (slug.trim().to_string(), path.trim().to_string());
-                (!slug.is_empty() && !path.is_empty()).then_some((slug, path))
-            })
-            .collect(),
+        repo_checkouts: normalize_entries(settings.repo_checkouts),
         strict_mode: settings.strict_mode,
     }
+}
+
+/// Per-entry trim-and-drop for a keyed path map: a blank key or a blank value
+/// is not an entry, and both sides are trimmed.
+///
+/// ⚠️ **Dropping a blank entry is NOT the same as dropping an unparseable
+/// key, and this function does only the first.** A tenant-keyed map whose key
+/// is not a currently-bound tenant UUID — or not a UUID at all — is PRESERVED
+/// (settings D2: the operator may be re-pairing, and losing their configured
+/// directory silently is the failure to avoid). Such a key is inert for
+/// resolution and renders in the UI as not-currently-bound. Only a key that is
+/// *nothing* is removed, because there is nothing to preserve.
+fn normalize_entries(map: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    map.into_iter()
+        .filter_map(|(key, value)| {
+            let (key, value) = (key.trim().to_string(), value.trim().to_string());
+            (!key.is_empty() && !value.is_empty()).then_some((key, value))
+        })
+        .collect()
+}
+
+/// Apply `patch` to the `stored` section: scalars replaced, maps merged.
+///
+/// The result is run through [`normalize`], so the persisted form is the
+/// canonical one whichever door the patch arrived at. Pure, so the "a
+/// pre-change body cannot erase a map" claim is asserted directly.
+pub fn merge(stored: &PathSettings, patch: PathSettingsPatch) -> PathSettings {
+    // `unwrap_or_else` is the whole fix: an absent (or null) map field takes the
+    // STORED map, so a caller that has never heard of the field cannot erase it;
+    // an explicit `{}` arrives as `Some(empty)` and clears.
+    normalize(PathSettings {
+        dev_logs_dir: patch.dev_logs_dir,
+        plans_dir: patch.plans_dir,
+        plans_archive_dir: patch.plans_archive_dir,
+        prompts_dir: patch.prompts_dir,
+        workspace_root: patch.workspace_root,
+        plans_dir_by_tenant: patch
+            .plans_dir_by_tenant
+            .unwrap_or_else(|| stored.plans_dir_by_tenant.clone()),
+        plans_archive_dir_by_tenant: patch
+            .plans_archive_dir_by_tenant
+            .unwrap_or_else(|| stored.plans_archive_dir_by_tenant.clone()),
+        prompts_dir_by_tenant: patch
+            .prompts_dir_by_tenant
+            .unwrap_or_else(|| stored.prompts_dir_by_tenant.clone()),
+        repo_checkouts: patch
+            .repo_checkouts
+            .unwrap_or_else(|| stored.repo_checkouts.clone()),
+        strict_mode: patch.strict_mode,
+    })
 }
 
 /// Build the view from inputs the caller already holds. Pure apart from the
 /// workspace resolver's `current_exe()` probe, so the projection is testable
 /// without a settings store or a running adapter.
+///
+/// `tenant` is an optional **lookup key**: when named, `resolved.resolved_for_tenant`
+/// carries the three keyed directories resolved for it, so a caller reads a
+/// *resolution* rather than having to re-implement the two-rung precedence over
+/// the raw struct. When it is `None` the view is byte-identical to the one this
+/// function produced before the settings were keyed — the device view.
 pub fn view_from(
     configured: PathSettings,
     adapter: &MetricsSnapshot,
     dev_logs_dir: String,
+    tenant: Option<&str>,
 ) -> PathSettingsView {
-    let plans_dir = resolve_plans_dir(configured.plans_dir.clone());
+    // The device-wide answers: no tenant, so every resolution falls through the
+    // map to the scalar. These are the directories the adapter's own reconcile
+    // loop runs on, which is why they stay the headline of the view.
+    let plans_dir = resolve_plans_dir(configured.plans_dir.clone(), &BTreeMap::new(), None);
     let resolved = ResolvedPaths {
         plan_tier_active: plans_dir.is_some(),
         plans_dir,
-        prompts_dir: resolve_prompts_dir(configured.prompts_dir.clone()),
+        prompts_dir: resolve_prompts_dir(configured.prompts_dir.clone(), &BTreeMap::new(), None),
         workspace_root: crate::workspace_paths::workspace_root_from(
             configured.workspace_root.as_deref(),
         )
@@ -197,6 +366,24 @@ pub fn view_from(
             .scan_divergence
             .as_ref()
             .map(ScanDivergenceView::from),
+        resolved_for_tenant: tenant.map(|tenant_id| ResolvedForTenant {
+            tenant_id: tenant_id.to_string(),
+            plans_dir: resolve_plans_dir(
+                configured.plans_dir.clone(),
+                &configured.plans_dir_by_tenant,
+                Some(tenant_id),
+            ),
+            plans_archive_dir: resolve_plans_archive_dir(
+                configured.plans_archive_dir.clone(),
+                &configured.plans_archive_dir_by_tenant,
+                Some(tenant_id),
+            ),
+            prompts_dir: resolve_prompts_dir(
+                configured.prompts_dir.clone(),
+                &configured.prompts_dir_by_tenant,
+                Some(tenant_id),
+            ),
+        }),
     };
     PathSettingsView {
         configured,
@@ -204,32 +391,54 @@ pub fn view_from(
     }
 }
 
-/// The live view: one settings read, one metrics snapshot.
-pub fn view() -> PathSettingsView {
+/// The live view: one settings read, one metrics snapshot. `tenant` as on
+/// [`view_from`].
+pub fn view(tenant: Option<&str>) -> PathSettingsView {
     view_from(
         config_facade::get_setting::<PathSettings>(),
         &adapter_metrics().snapshot(),
         crate::paths::get_dev_logs_dir_string(),
+        tenant,
     )
 }
 
-/// Persist the whole section (blank-normalised) and return the fresh view.
-pub fn save(settings: PathSettings) -> Result<PathSettingsView, String> {
-    let normalized = normalize(settings);
-    config_facade::update_setting::<PathSettings, _>(|paths| *paths = normalized)?;
-    Ok(view())
+/// Apply `patch` to the persisted section (blank-normalised, maps merged) and
+/// return the fresh **device** view.
+///
+/// The echoed view names no tenant on purpose: a save is a write to the whole
+/// section, and answering it with one tenant's resolution would invite a caller
+/// to read that as "what I just saved". A caller that wants a tenant's
+/// resolution asks for it by name on the read door.
+pub fn save(patch: PathSettingsPatch) -> Result<PathSettingsView, String> {
+    config_facade::update_setting::<PathSettings, _>(move |paths| *paths = merge(paths, patch))?;
+    Ok(view(None))
 }
 
 /// Return the `paths` section: configured values plus what each resolves to.
+///
+/// `tenant_id` is optional and is a **lookup key, never an attribution claim**:
+/// it selects one tenant's entry out of the keyed maps so `resolved.resolved_for_tenant`
+/// can report where that tenant's sessions actually author. Omit it for the
+/// device-wide view, which is exactly what this door served before the settings
+/// were keyed. A `tenant_id` the device is not bound to is answered honestly
+/// (the device default, with the key echoed) rather than refused — the operator
+/// may be re-pairing.
 #[tauri::command]
-pub fn get_path_settings() -> Result<PathSettingsView, String> {
-    Ok(view())
+pub fn get_path_settings(tenant_id: Option<String>) -> Result<PathSettingsView, String> {
+    Ok(view(tenant_id.as_deref()))
 }
 
-/// Persist the `paths` section and echo the fresh view. Blank strings are
-/// stored as unset; fields the UI does not show round-trip untouched.
+/// Persist the `paths` section and echo the fresh device view.
+///
+/// Blank strings are stored as unset. The five scalars are **replaced** —
+/// absent means unset. The four keyed maps (`plans_dir_by_tenant`,
+/// `plans_archive_dir_by_tenant`, `prompts_dir_by_tenant`, `repo_checkouts`) are
+/// **merged**: absent or `null` leaves the stored map untouched, and `{}` is a
+/// deliberate clear. That is a server-side guarantee, so a caller unaware of a
+/// map cannot erase it — which a whole-struct replace allowed until this patch
+/// type existed.
 #[tauri::command]
-pub fn save_path_settings(settings: PathSettings) -> Result<PathSettingsView, String> {
+pub fn save_path_settings(settings: PathSettingsPatch) -> Result<PathSettingsView, String> {
     save(settings)
 }
 
@@ -301,6 +510,22 @@ mod tests {
             plans_archive_dir: Some("\t".to_string()),
             prompts_dir: Some(" /prompts ".to_string()),
             workspace_root: None,
+            // Blank sides are dropped here too, per entry — and the
+            // unparseable-but-non-blank key is PRESERVED, which is the
+            // distinction asserted below.
+            plans_dir_by_tenant: [
+                (
+                    " c231d9da-0ca8-4fe4-bd81-0e3d6c20339a ".to_string(),
+                    " /a/plans ".to_string(),
+                ),
+                ("blank-value".to_string(), "  ".to_string()),
+                ("   ".to_string(), "/no-key".to_string()),
+                ("not-a-uuid".to_string(), "/still/kept".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            plans_archive_dir_by_tenant: Default::default(),
+            prompts_dir_by_tenant: Default::default(),
             repo_checkouts: [
                 (" acme/app ".to_string(), " /src/acme/app ".to_string()),
                 ("acme/blank-path".to_string(), "   ".to_string()),
@@ -325,6 +550,17 @@ mod tests {
             vec![("acme/app".to_string(), "/src/acme/app".to_string())],
             "a mapping with a blank side is dropped; the survivor is trimmed"
         );
+        assert_eq!(
+            stored.plans_dir_by_tenant.into_iter().collect::<Vec<_>>(),
+            vec![
+                (
+                    "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a".to_string(),
+                    "/a/plans".to_string()
+                ),
+                ("not-a-uuid".to_string(), "/still/kept".to_string()),
+            ],
+            "a blank key or value is dropped and the survivors trimmed — but an              UNPARSEABLE key is preserved (D2: the operator may be re-pairing)"
+        );
         assert!(stored.strict_mode);
     }
 
@@ -338,6 +574,14 @@ mod tests {
             plans_archive_dir: Some("/root/archive".to_string()),
             prompts_dir: None,
             workspace_root: Some("/root".to_string()),
+            plans_dir_by_tenant: [(
+                "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a".to_string(),
+                "/a/plans".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            plans_archive_dir_by_tenant: Default::default(),
+            prompts_dir_by_tenant: Default::default(),
             repo_checkouts: [("acme/app".to_string(), "/src/acme/app".to_string())]
                 .into_iter()
                 .collect(),
@@ -367,6 +611,7 @@ mod tests {
             },
             &snapshot(0, 0),
             "/logs".to_string(),
+            None,
         );
         assert!(!off.resolved.plan_tier_active);
         assert_eq!(off.resolved.plans_dir, None);
@@ -388,6 +633,7 @@ mod tests {
             },
             &snapshot(3, 2),
             "/logs".to_string(),
+            None,
         );
         assert!(on.resolved.plan_tier_active);
         assert_eq!(on.resolved.plans_dir.as_deref(), Some("/root/plans"));
@@ -409,6 +655,7 @@ mod tests {
             },
             &snapshot_with_divergence(1, 1, Some(parked_reading())),
             "/logs".to_string(),
+            None,
         );
         let d = view
             .resolved
@@ -475,6 +722,7 @@ mod tests {
             PathSettings::default(),
             &snapshot_with_divergence(1, 0, Some(ScanDivergence::not_scanning())),
             "/logs".to_string(),
+            None,
         );
         assert!(!view.resolved.plan_tier_active);
         let d = view
@@ -500,5 +748,254 @@ mod tests {
             serde_json::to_value(&d).unwrap(),
             serde_json::to_value(&measured_zero).unwrap()
         );
+    }
+
+    // ---- the save is a PATCH: an omitted map cannot be erased ---------------
+
+    const TENANT_A: &str = "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a";
+    const TENANT_B: &str = "7ac125b6-391b-4d64-8493-27305b25c5b9";
+
+    fn stored_with_both_maps() -> PathSettings {
+        PathSettings {
+            plans_dir: Some("/device/plans".to_string()),
+            plans_dir_by_tenant: [(TENANT_A.to_string(), "/a/plans".to_string())]
+                .into_iter()
+                .collect(),
+            repo_checkouts: [(
+                "portofino-pizzeria/mobile".to_string(),
+                "/elsewhere/mobile".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..PathSettings::default()
+        }
+    }
+
+    /// **THE claim of P3, and the one that FAILED before the fix.** A
+    /// `PUT /settings/paths` body composed by a caller that has never heard of
+    /// either map — a pre-change body, replayed verbatim — must leave BOTH
+    /// stored maps exactly as they were.
+    ///
+    /// Before the patch type existed, `save` was `*paths = normalize(settings)`
+    /// and both maps carried `skip_serializing_if = "…is_empty"`, so this body
+    /// deserialized to two empty maps and erased the operator's configuration.
+    /// The preservation the doc promised lived in the React helper, which an
+    /// agent or a script composing a body by hand does not run.
+    #[test]
+    fn a_pre_change_body_omitting_both_maps_erases_neither() {
+        // The shape the panel sent before this change: the five scalars and
+        // `strict_mode`, and no map field of any kind.
+        let pre_change_body = serde_json::json!({
+            "dev_logs_dir": null,
+            "plans_dir": "/device/plans",
+            "plans_archive_dir": null,
+            "prompts_dir": null,
+            "workspace_root": null,
+            "strict_mode": false
+        });
+        let patch: PathSettingsPatch =
+            serde_json::from_value(pre_change_body).expect("a pre-change body must deserialize");
+        assert_eq!(patch.plans_dir_by_tenant, None, "absent, not empty");
+        assert_eq!(patch.repo_checkouts, None, "absent, not empty");
+
+        let merged = merge(&stored_with_both_maps(), patch);
+        assert_eq!(
+            merged.plans_dir_by_tenant.get(TENANT_A).map(String::as_str),
+            Some("/a/plans"),
+            "a caller unaware of plans_dir_by_tenant must not erase it"
+        );
+        assert_eq!(
+            merged
+                .repo_checkouts
+                .get("portofino-pizzeria/mobile")
+                .map(String::as_str),
+            Some("/elsewhere/mobile"),
+            "the same latent defect repo_checkouts carried is fixed, not routed around"
+        );
+        assert_eq!(merged.plans_dir.as_deref(), Some("/device/plans"));
+    }
+
+    /// An explicit JSON `null` reads the same as absent — untouched. A client
+    /// that spells "I am not changing this" as `null` must not be punished for
+    /// it, so this pins the behaviour rather than leaving it to be discovered.
+    #[test]
+    fn an_explicit_null_map_leaves_the_stored_map_untouched() {
+        let patch: PathSettingsPatch = serde_json::from_value(serde_json::json!({
+            "plans_dir": "/device/plans",
+            "plans_dir_by_tenant": null,
+            "repo_checkouts": null
+        }))
+        .expect("must deserialize");
+        let merged = merge(&stored_with_both_maps(), patch);
+        assert_eq!(
+            merged.plans_dir_by_tenant.get(TENANT_A).map(String::as_str),
+            Some("/a/plans")
+        );
+        assert_eq!(merged.repo_checkouts.len(), 1);
+    }
+
+    /// An empty object is the DELIBERATE clear, and it must still work —
+    /// otherwise absent-means-untouched would leave no way to empty a map at
+    /// all, which is what the frontend helper's `delete` used to express.
+    #[test]
+    fn an_empty_object_is_a_deliberate_clear() {
+        let patch: PathSettingsPatch = serde_json::from_value(serde_json::json!({
+            "plans_dir": "/device/plans",
+            "plans_dir_by_tenant": {},
+            "repo_checkouts": {}
+        }))
+        .expect("must deserialize");
+        assert_eq!(patch.plans_dir_by_tenant, Some(BTreeMap::new()));
+
+        let merged = merge(&stored_with_both_maps(), patch);
+        assert!(
+            merged.plans_dir_by_tenant.is_empty(),
+            "an empty object clears"
+        );
+        assert!(merged.repo_checkouts.is_empty(), "an empty object clears");
+    }
+
+    /// A patch that SENDS a map replaces it wholesale rather than deep-merging
+    /// its entries — the panel edits a tenant list as a unit, so a removed row
+    /// has to be expressible, and a per-key merge would make removal impossible
+    /// for the same reason an omitted map used to make preservation impossible.
+    /// Entries are still trim-and-dropped per entry on the way in.
+    #[test]
+    fn a_sent_map_replaces_the_stored_one_entry_for_entry() {
+        let body = format!(
+            r#"{{"plans_dir":"/device/plans",
+                 "plans_dir_by_tenant":{{"{TENANT_B}":" /b/plans ","blank":"  "}}}}"#
+        );
+        let patch: PathSettingsPatch = serde_json::from_str(&body).expect("must deserialize");
+        let merged = merge(&stored_with_both_maps(), patch);
+        assert_eq!(
+            merged.plans_dir_by_tenant.into_iter().collect::<Vec<_>>(),
+            vec![(TENANT_B.to_string(), "/b/plans".to_string())],
+            "the sent map replaces the stored one; the blank entry is dropped and \
+             the survivor trimmed"
+        );
+    }
+
+    // ---- the per-tenant view -----------------------------------------------
+
+    /// The view answers a RESOLUTION for the named tenant while `configured`
+    /// still shows the raw struct — so a UI reads "where does tenant A actually
+    /// author" without re-implementing the two-rung precedence, and can still
+    /// show the operator what is stored.
+    #[test]
+    fn the_per_tenant_view_resolves_for_that_tenant_while_configured_stays_raw() {
+        let configured = PathSettings {
+            plans_dir: Some("/device/plans".to_string()),
+            plans_archive_dir: Some("/device/archive".to_string()),
+            prompts_dir: Some("/device/prompts".to_string()),
+            plans_dir_by_tenant: [(TENANT_A.to_string(), "/a/plans".to_string())]
+                .into_iter()
+                .collect(),
+            prompts_dir_by_tenant: [(TENANT_A.to_string(), "/a/prompts".to_string())]
+                .into_iter()
+                .collect(),
+            ..PathSettings::default()
+        };
+
+        let for_a = view_from(
+            configured.clone(),
+            &snapshot(1, 1),
+            "/logs".to_string(),
+            Some(TENANT_A),
+        );
+        let r = for_a
+            .resolved
+            .resolved_for_tenant
+            .as_ref()
+            .expect("a named tenant gets a resolution");
+        assert_eq!(r.tenant_id, TENANT_A);
+        assert_eq!(r.plans_dir.as_deref(), Some("/a/plans"));
+        assert_eq!(r.prompts_dir.as_deref(), Some("/a/prompts"));
+        assert_eq!(
+            r.plans_archive_dir.as_deref(),
+            Some("/device/archive"),
+            "a directory this tenant did not key falls back to the device default"
+        );
+        // The device-wide half of the view is unaffected by the named tenant.
+        assert_eq!(for_a.resolved.plans_dir.as_deref(), Some("/device/plans"));
+        // And `configured` is the raw struct, map and all — not a resolution.
+        assert_eq!(
+            for_a
+                .configured
+                .plans_dir_by_tenant
+                .get(TENANT_A)
+                .map(String::as_str),
+            Some("/a/plans")
+        );
+
+        // A tenant with no entries gets the device default for all three.
+        let for_b = view_from(
+            configured,
+            &snapshot(1, 1),
+            "/logs".to_string(),
+            Some(TENANT_B),
+        );
+        let r = for_b.resolved.resolved_for_tenant.expect("resolution");
+        assert_eq!(r.tenant_id, TENANT_B);
+        assert_eq!(r.plans_dir.as_deref(), Some("/device/plans"));
+        assert_eq!(r.prompts_dir.as_deref(), Some("/device/prompts"));
+    }
+
+    /// No tenant named ⇒ the DEVICE view, and `resolved_for_tenant` is ABSENT
+    /// from the wire rather than null. A reader that cannot tell "you did not
+    /// ask" from "this tenant has nothing" would render one as the other.
+    #[test]
+    fn no_tenant_named_serializes_the_device_view_with_no_tenant_field_at_all() {
+        let view = view_from(
+            PathSettings {
+                plans_dir: Some("/device/plans".to_string()),
+                plans_dir_by_tenant: [(TENANT_A.to_string(), "/a/plans".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..PathSettings::default()
+            },
+            &snapshot(1, 1),
+            "/logs".to_string(),
+            None,
+        );
+        assert_eq!(view.resolved.resolved_for_tenant, None);
+        let wire = serde_json::to_value(&view.resolved).expect("must serialize");
+        assert!(
+            !wire
+                .as_object()
+                .unwrap()
+                .contains_key("resolved_for_tenant"),
+            "the field must be absent, not null: {wire}"
+        );
+        assert_eq!(
+            view.resolved.plans_dir.as_deref(),
+            Some("/device/plans"),
+            "the device view ignores every map entry"
+        );
+    }
+
+    /// A tenant the device is not bound to — or a key that is not a UUID at all
+    /// — is answered HONESTLY rather than refused: the key is echoed and the
+    /// device default resolved. Refusing would leave the panel unable to show an
+    /// operator mid-re-pairing what their stored entry is.
+    #[test]
+    fn an_unbound_or_unparseable_tenant_key_resolves_the_device_default() {
+        for probe in ["not-a-uuid", TENANT_B, ""] {
+            let view = view_from(
+                PathSettings {
+                    plans_dir: Some("/device/plans".to_string()),
+                    plans_dir_by_tenant: [(TENANT_A.to_string(), "/a/plans".to_string())]
+                        .into_iter()
+                        .collect(),
+                    ..PathSettings::default()
+                },
+                &snapshot(1, 1),
+                "/logs".to_string(),
+                Some(probe),
+            );
+            let r = view.resolved.resolved_for_tenant.expect("resolution");
+            assert_eq!(r.tenant_id, probe, "the key is echoed verbatim");
+            assert_eq!(r.plans_dir.as_deref(), Some("/device/plans"));
+        }
     }
 }
