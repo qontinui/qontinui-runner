@@ -521,6 +521,48 @@ pub struct ThreadCensus {
     pub by_wait_reason: BTreeMap<String, usize>,
 }
 
+/// Per-thread NAME tally for THIS process — the sibling of [`ThreadCensus`]
+/// that answers "what are these threads?" rather than "what are they waiting
+/// on?" (plan `2026-09-21-runner-blocking-pool-ratchets-to-peak-because-
+/// transcript-tails-rotate-every-idle-thread`, Phase 0).
+///
+/// The names are the OS-level thread descriptions (`GetThreadDescription` on
+/// Windows, `/proc/self/task/*/comm` on Linux), which is where `std::thread::
+/// Builder::name` and tokio's `thread_name` both land. tokio's default worker
+/// name `tokio-rt-worker` is what the Tauri application runtime's scheduler
+/// workers AND its blocking pool carry until they are renamed, so a row for it
+/// counts both — the consumer subtracts the scheduler width itself.
+///
+/// `by_name` is PREFIX-COLLAPSED and capped at [`MAX_THREAD_NAME_ROWS`] rows
+/// (see [`collapse_thread_names`]): a per-terminal `terminal-reader-3f2a` is one
+/// row, `terminal-reader-*`, and never one row per session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ThreadNameCensus {
+    /// Every thread the enumeration saw, named or not, before the cap.
+    pub total: usize,
+    /// Top rows by count, then by name — capped, so the sum is ≤ `total`.
+    pub by_name: Vec<ThreadNameCount>,
+    /// When the walk ran. Wall-clock, because the consumer is a `/health`
+    /// reader comparing it against its own clock.
+    pub sampled_at: std::time::SystemTime,
+}
+
+/// One row of [`ThreadNameCensus::by_name`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ThreadNameCount {
+    pub name: String,
+    pub count: usize,
+}
+
+/// How many rows [`ThreadNameCensus::by_name`] keeps. Twelve covers every
+/// named family measured on the operator box (`tokio-rt-worker`, `notify-rs
+/// windows loop`, the two terminal families, the per-runtime singletons) with
+/// room to spare, and a `/health` object is read by humans.
+pub const MAX_THREAD_NAME_ROWS: usize = 12;
+
+/// The bucket a thread with no description lands in.
+pub const UNNAMED_THREAD: &str = "<unnamed>";
+
 /// One direct child process.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ChildProcess {
@@ -961,6 +1003,101 @@ pub fn capture_thread_census() -> Option<ThreadCensus> {
     None
 }
 
+/// Per-thread NAME census for this process — see [`ThreadNameCensus`].
+///
+/// Same three arms as [`capture_thread_census`], same doctrine: UNKNOWN is
+/// `None`, never an empty list. Cost on the operator box is a few
+/// milliseconds for ~450 threads (one `OpenThread` + `GetThreadDescription`
+/// pair per thread), so callers memoise it — `health_monitor::
+/// thread_name_census_memoized` holds it for 30 s.
+#[cfg(target_os = "linux")]
+pub fn capture_thread_name_census() -> Option<ThreadNameCensus> {
+    let entries = std::fs::read_dir("/proc/self/task").ok()?;
+    let mut names: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        // `comm` is the kernel's 15-byte thread name with a trailing newline;
+        // an unreadable one (the thread exited mid-walk) is still a thread that
+        // was counted, so it lands in the unnamed bucket rather than vanishing.
+        let name = std::fs::read_to_string(entry.path().join("comm"))
+            .map(|s| s.trim_end_matches('\n').to_string())
+            .unwrap_or_default();
+        names.push(name);
+    }
+    finish_thread_name_census(names)
+}
+
+#[cfg(target_os = "windows")]
+pub fn capture_thread_name_census() -> Option<ThreadNameCensus> {
+    finish_thread_name_census(windows_thread_census::names()?)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+pub fn capture_thread_name_census() -> Option<ThreadNameCensus> {
+    None
+}
+
+/// The platform-independent tail of [`capture_thread_name_census`]: an empty
+/// walk is a failed enumeration (a live process has at least the calling
+/// thread), everything else is collapsed and stamped.
+fn finish_thread_name_census(names: Vec<String>) -> Option<ThreadNameCensus> {
+    if names.is_empty() {
+        return None;
+    }
+    Some(ThreadNameCensus {
+        total: names.len(),
+        by_name: collapse_thread_names(names.iter().map(String::as_str)),
+        sampled_at: std::time::SystemTime::now(),
+    })
+}
+
+/// Collapse a list of thread names into the top [`MAX_THREAD_NAME_ROWS`] rows.
+/// PURE.
+///
+/// A name whose LAST `-`-separated segment is an id — hex or decimal digits,
+/// with at least one decimal digit so that `app-rt`, `mcp-api-rt` and a
+/// hypothetical `foo-cafe` stay whole — is folded onto `<prefix>-*`:
+/// `terminal-reader-3f2a` → `terminal-reader-*`, `terminal-waiter-17` →
+/// `terminal-waiter-*`. `tokio-rt-worker`, `app-rt`, `mcp-api-rt` and
+/// `notify-rs windows loop` are unchanged. An empty name is the
+/// [`UNNAMED_THREAD`] bucket.
+///
+/// Rows are ordered by count descending, then name ascending, so the output is
+/// deterministic for a given multiset of names.
+pub fn collapse_thread_names<'a>(names: impl Iterator<Item = &'a str>) -> Vec<ThreadNameCount> {
+    let mut tally: BTreeMap<String, usize> = BTreeMap::new();
+    for name in names {
+        *tally.entry(collapse_thread_name(name)).or_insert(0) += 1;
+    }
+    let mut rows: Vec<ThreadNameCount> = tally
+        .into_iter()
+        .map(|(name, count)| ThreadNameCount { name, count })
+        .collect();
+    rows.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+    rows.truncate(MAX_THREAD_NAME_ROWS);
+    rows
+}
+
+/// One name's collapsed form — the per-element rule of [`collapse_thread_names`].
+fn collapse_thread_name(name: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        return UNNAMED_THREAD.to_string();
+    }
+    match name.rsplit_once('-') {
+        Some((prefix, suffix)) if !prefix.is_empty() && looks_like_thread_id(suffix) => {
+            format!("{prefix}-*")
+        }
+        _ => name.to_string(),
+    }
+}
+
+/// `3f2a`, `17`, `0` — yes. `rt`, `worker`, `cafe`, `` — no.
+fn looks_like_thread_id(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment.chars().all(|c| c.is_ascii_hexdigit())
+        && segment.chars().any(|c| c.is_ascii_digit())
+}
+
 /// Direct-children census, via `sysinfo`'s native enumeration.
 ///
 /// `sysinfo` is used rather than a second hand-rolled `CreateToolhelp32Snapshot`
@@ -1152,45 +1289,148 @@ mod windows_thread_census {
         ) -> i32;
     }
 
-    pub(super) fn census() -> Option<ThreadCensus> {
-        let me = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessId() } as usize
-            as isize;
-
-        // `Vec<u64>`, not `Vec<u8>`: the buffer is reinterpreted as a
-        // `SYSTEM_PROCESS_INFORMATION` chain, which needs 8-byte alignment. A
-        // `Vec<u8>` is 1-byte aligned and the cast would be UB.
-        let mut words: usize = 128 * 1024; // 1 MiB
-        for _ in 0..MAX_ATTEMPTS {
-            let mut buf: Vec<u64> = vec![0u64; words];
-            let bytes = words * 8;
-            let mut needed: u32 = 0;
-            let status = unsafe {
-                NtQuerySystemInformation(
-                    SYSTEM_PROCESS_INFORMATION,
-                    buf.as_mut_ptr().cast(),
-                    bytes as u32,
-                    &mut needed,
-                )
-            };
-            if status == STATUS_INFO_LENGTH_MISMATCH {
-                let want = (needed as usize).div_ceil(8) + 8192;
-                words = want.max(words * 2);
-                continue;
-            }
-            if status < 0 {
-                return None;
-            }
-            return unsafe { tally(buf.as_ptr().cast::<u8>(), bytes, me) };
-        }
-        None
+    /// One completed `NtQuerySystemInformation(SystemProcessInformation)`
+    /// read: the 8-aligned buffer and the number of valid bytes in it.
+    ///
+    /// Shared by [`census`] and [`names`] so the grow-and-retry loop and the
+    /// find-own-process walk exist once.
+    struct ProcessTable {
+        words: Vec<u64>,
+        bytes: usize,
     }
 
-    /// Walk the process chain, find our own entry, tally its threads.
+    impl ProcessTable {
+        fn read() -> Option<ProcessTable> {
+            // `Vec<u64>`, not `Vec<u8>`: the buffer is reinterpreted as a
+            // `SYSTEM_PROCESS_INFORMATION` chain, which needs 8-byte alignment. A
+            // `Vec<u8>` is 1-byte aligned and the cast would be UB.
+            let mut words: usize = 128 * 1024; // 1 MiB
+            for _ in 0..MAX_ATTEMPTS {
+                let mut buf: Vec<u64> = vec![0u64; words];
+                let bytes = words * 8;
+                let mut needed: u32 = 0;
+                let status = unsafe {
+                    NtQuerySystemInformation(
+                        SYSTEM_PROCESS_INFORMATION,
+                        buf.as_mut_ptr().cast(),
+                        bytes as u32,
+                        &mut needed,
+                    )
+                };
+                if status == STATUS_INFO_LENGTH_MISMATCH {
+                    let want = (needed as usize).div_ceil(8) + 8192;
+                    words = want.max(words * 2);
+                    continue;
+                }
+                if status < 0 {
+                    return None;
+                }
+                return Some(ProcessTable { words: buf, bytes });
+            }
+            None
+        }
+
+        /// Walk the process chain, find our own entry, and hand its thread
+        /// records to `visit`. `None` when the walk fails or never finds us.
+        fn with_own_threads<T>(
+            &self,
+            visit: impl FnOnce(&[SystemThreadInformation]) -> T,
+        ) -> Option<T> {
+            let me = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessId() }
+                as usize as isize;
+            unsafe { own_threads(self.words.as_ptr().cast::<u8>(), self.bytes, me) }.map(
+                |(ptr, count)| {
+                    // SAFETY: `own_threads` bounds-checked `count` records at
+                    // `ptr` against the buffer, and the buffer outlives the
+                    // slice (it is borrowed from `self`).
+                    let threads = unsafe { core::slice::from_raw_parts(ptr, count) };
+                    visit(threads)
+                },
+            )
+        }
+    }
+
+    /// Per-thread wait-reason tally — [`super::capture_thread_census`]'s arm.
+    pub(super) fn census() -> Option<ThreadCensus> {
+        ProcessTable::read()?.with_own_threads(|threads| {
+            let mut by_wait_reason: BTreeMap<String, usize> = BTreeMap::new();
+            for t in threads {
+                *by_wait_reason
+                    .entry(wait_reason_name(t.wait_reason).to_string())
+                    .or_insert(0) += 1;
+            }
+            ThreadCensus {
+                total: threads.len(),
+                by_wait_reason,
+            }
+        })
+    }
+
+    /// Every thread's description — [`super::capture_thread_name_census`]'s
+    /// arm. One entry per thread the snapshot saw; a thread that has since
+    /// exited, or that carries no description, yields an empty string, which
+    /// the collapse renders as the unnamed bucket.
+    pub(super) fn names() -> Option<Vec<String>> {
+        ProcessTable::read()?.with_own_threads(|threads| {
+            threads
+                .iter()
+                .map(|t| thread_description(t.client_id.unique_thread as usize as u32))
+                .collect()
+        })
+    }
+
+    /// `GetThreadDescription` for one thread id, `""` when it cannot be read.
+    ///
+    /// `THREAD_QUERY_LIMITED_INFORMATION` is the least access that lets the
+    /// description be read and needs no privilege for a thread of our own
+    /// process. The returned buffer is allocated by the kernel32 side and is
+    /// ours to `LocalFree`.
+    fn thread_description(tid: u32) -> String {
+        use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
+        use windows_sys::Win32::System::Threading::{
+            GetThreadDescription, OpenThread, THREAD_QUERY_LIMITED_INFORMATION,
+        };
+
+        // SAFETY: plain FFI over a thread id; a stale id fails the open.
+        let handle = unsafe { OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, tid) };
+        if handle.is_null() {
+            return String::new();
+        }
+        let mut description: windows_sys::core::PWSTR = core::ptr::null_mut();
+        // SAFETY: `handle` is open with query access; `description` receives a
+        // buffer we free below, or stays null on failure.
+        let hr = unsafe { GetThreadDescription(handle, &mut description) };
+        let name = if hr >= 0 && !description.is_null() {
+            // SAFETY: a successful call hands back a NUL-terminated UTF-16
+            // string; we walk to the terminator and no further.
+            let text = unsafe {
+                let mut len = 0usize;
+                while *description.add(len) != 0 {
+                    len += 1;
+                }
+                String::from_utf16_lossy(core::slice::from_raw_parts(description, len))
+            };
+            // SAFETY: the buffer came from this call and is freed exactly once.
+            unsafe { LocalFree(description.cast()) };
+            text
+        } else {
+            String::new()
+        };
+        // SAFETY: closing the handle this function opened.
+        unsafe { CloseHandle(handle) };
+        name
+    }
+
+    /// Walk the process chain and locate our own thread records.
     ///
     /// # Safety
     /// `base` must point at `len` readable bytes holding the chain returned by
     /// `NtQuerySystemInformation(SystemProcessInformation)`.
-    unsafe fn tally(base: *const u8, len: usize, me: isize) -> Option<ThreadCensus> {
+    unsafe fn own_threads(
+        base: *const u8,
+        len: usize,
+        me: isize,
+    ) -> Option<(*const SystemThreadInformation, usize)> {
         let proc_size = core::mem::size_of::<SystemProcessInformation>();
         let thread_size = core::mem::size_of::<SystemThreadInformation>();
         let mut offset: usize = 0;
@@ -1217,18 +1457,13 @@ mod windows_thread_census {
                 if threads_at.checked_add(span)? > len {
                     return None;
                 }
-                let threads = base.add(threads_at) as *const SystemThreadInformation;
-                let mut by_wait_reason: BTreeMap<String, usize> = BTreeMap::new();
-                for i in 0..count {
-                    let t = &*threads.add(i);
-                    *by_wait_reason
-                        .entry(wait_reason_name(t.wait_reason).to_string())
-                        .or_insert(0) += 1;
+                if !threads_at.is_multiple_of(core::mem::align_of::<SystemThreadInformation>()) {
+                    return None;
                 }
-                return Some(ThreadCensus {
-                    total: count,
-                    by_wait_reason,
-                });
+                return Some((
+                    base.add(threads_at) as *const SystemThreadInformation,
+                    count,
+                ));
             }
 
             let next = spi.next_entry_offset as usize;
@@ -2688,6 +2923,177 @@ mod tests {
             summed, c.total,
             "the histogram must account for every thread it counted"
         );
+    }
+
+    // ---- thread-NAME census (plan 2026-09-21-runner-blocking-pool-ratchets…) ----
+
+    fn rows(names: &[&str]) -> Vec<(String, usize)> {
+        collapse_thread_names(names.iter().copied())
+            .into_iter()
+            .map(|r| (r.name, r.count))
+            .collect()
+    }
+
+    /// A trailing hex or decimal id collapses onto `<prefix>-*`; the runtime
+    /// names and a `notify-rs` loop stay whole.
+    #[test]
+    fn collapse_folds_id_suffixes_and_leaves_runtime_names_alone() {
+        let got = rows(&[
+            "terminal-reader-3f2a",
+            "terminal-reader-0b1c",
+            "terminal-waiter-17",
+            "terminal-waiter-3",
+            "tokio-rt-worker",
+            "tokio-rt-worker",
+            "app-rt",
+            "mcp-api-rt",
+            "notify-rs windows loop",
+        ]);
+        assert_eq!(
+            got,
+            vec![
+                ("terminal-reader-*".to_string(), 2),
+                ("terminal-waiter-*".to_string(), 2),
+                ("tokio-rt-worker".to_string(), 2),
+                ("app-rt".to_string(), 1),
+                ("mcp-api-rt".to_string(), 1),
+                ("notify-rs windows loop".to_string(), 1),
+            ]
+        );
+    }
+
+    /// Ordering is count DESCENDING, then name ASCENDING — deterministic for a
+    /// given multiset, and the biggest family is always row 0.
+    #[test]
+    fn collapse_orders_by_count_then_name() {
+        let got = rows(&["zeta", "alpha", "beta", "beta", "alpha"]);
+        assert_eq!(
+            got,
+            vec![
+                ("alpha".to_string(), 2),
+                ("beta".to_string(), 2),
+                ("zeta".to_string(), 1),
+            ]
+        );
+    }
+
+    /// Fifteen distinct names in, exactly twelve rows out — the twelve with
+    /// the highest counts.
+    #[test]
+    fn collapse_truncates_to_twelve_rows() {
+        let mut names: Vec<String> = Vec::new();
+        for i in 0..15 {
+            // `family-i` repeated (i + 1) times, so the counts are distinct
+            // and the cut is unambiguous: families 3..15 survive, 0..2 do not.
+            for _ in 0..=i {
+                names.push(format!("family{i}-worker"));
+            }
+        }
+        let got = collapse_thread_names(names.iter().map(String::as_str));
+        assert_eq!(got.len(), MAX_THREAD_NAME_ROWS);
+        assert_eq!(got[0].name, "family14-worker");
+        assert_eq!(got[0].count, 15);
+        assert_eq!(got[11].name, "family3-worker");
+        assert_eq!(got[11].count, 4);
+        assert!(got.iter().all(|r| r.name != "family2-worker"));
+    }
+
+    /// An empty or whitespace-only description is the `<unnamed>` bucket.
+    #[test]
+    fn collapse_buckets_unnamed_threads() {
+        let got = rows(&["", "  ", "tokio-rt-worker", ""]);
+        assert_eq!(
+            got,
+            vec![
+                (UNNAMED_THREAD.to_string(), 3),
+                ("tokio-rt-worker".to_string(), 1),
+            ]
+        );
+    }
+
+    /// The id rule needs at least one DECIMAL digit: `foo-cafe` is a name,
+    /// `foo-c4fe` is an id; a bare `-17` has no prefix and stays whole.
+    #[test]
+    fn collapse_id_rule_edges() {
+        assert_eq!(collapse_thread_name("foo-cafe"), "foo-cafe");
+        assert_eq!(collapse_thread_name("foo-c4fe"), "foo-*");
+        assert_eq!(collapse_thread_name("foo-0"), "foo-*");
+        assert_eq!(collapse_thread_name("-17"), "-17");
+        assert_eq!(collapse_thread_name("fleet-pub-rt-2"), "fleet-pub-rt-*");
+        assert_eq!(collapse_thread_name("livez-prober"), "livez-prober");
+        assert!(looks_like_thread_id("3f2a"));
+        assert!(looks_like_thread_id("17"));
+        assert!(!looks_like_thread_id(""));
+        assert!(!looks_like_thread_id("rt"));
+        assert!(!looks_like_thread_id("worker"));
+        assert!(!looks_like_thread_id("3f2a-"));
+    }
+
+    /// UNKNOWN is `None`: an empty walk never becomes an empty census.
+    #[test]
+    fn an_empty_walk_is_not_a_census() {
+        assert_eq!(finish_thread_name_census(Vec::new()), None);
+        let c = finish_thread_name_census(vec!["a".to_string(), "".to_string()])
+            .expect("two names make a census");
+        assert_eq!(c.total, 2);
+        assert_eq!(c.by_name.len(), 2);
+    }
+
+    /// The live census sees this test process and, on it, the thread this
+    /// test names — so the OS description path is exercised end to end rather
+    /// than only the pure collapse.
+    #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "windows")),
+        ignore = "no per-thread enumeration on this platform"
+    )]
+    fn the_thread_name_census_sees_a_named_thread_of_this_process() {
+        // Six, not one: the test binary runs every other test's thread
+        // alongside this one, each a count-1 row, and the census keeps only
+        // twelve rows. A family of six is never cut by a field of singletons.
+        const PROBES: usize = 6;
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let handles: Vec<_> = (0..PROBES)
+            .map(|i| {
+                let ready_tx = ready_tx.clone();
+                let rx = std::sync::Arc::clone(&rx);
+                std::thread::Builder::new()
+                    .name(format!("census-probe-{i}"))
+                    .spawn(move || {
+                        ready_tx.send(()).ok();
+                        // Parks until the sender is dropped, which unblocks
+                        // every probe in turn (each `recv` returns `Err`).
+                        let guard = rx.lock().unwrap_or_else(|e| e.into_inner());
+                        let _ = guard.recv();
+                    })
+                    .expect("spawn a named thread")
+            })
+            .collect();
+        for _ in 0..PROBES {
+            ready_rx.recv().expect("a probe thread started");
+        }
+
+        let c = capture_thread_name_census().expect("a native thread-name census");
+        assert!(
+            c.total > PROBES,
+            "this process has more threads than the probes"
+        );
+        let summed: usize = c.by_name.iter().map(|r| r.count).sum();
+        assert!(summed <= c.total, "capped rows cannot exceed the total");
+        let probe_row = c.by_name.iter().find(|r| r.name == "census-probe-*");
+        assert!(
+            probe_row.is_some_and(|r| r.count >= PROBES),
+            "the census must carry the {PROBES} threads this test named, collapsed onto one \
+             row; got {:?}",
+            c.by_name
+        );
+
+        drop(tx);
+        for h in handles {
+            h.join().ok();
+        }
     }
 
     #[test]

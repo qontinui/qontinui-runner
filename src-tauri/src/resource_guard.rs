@@ -160,6 +160,7 @@ use tracing::warn;
 use crate::fleet::resource_sample::Lane;
 use crate::mcp::fleet_policy_poller::SessionFloors;
 use crate::settings::SessionGuardSettings;
+use qontinui_runner_lib::wedge_diagnostics::ThreadNameCensus;
 
 /// Tauri event carrying a resource-guard observation to the webview.
 ///
@@ -304,9 +305,13 @@ pub(crate) const CALIBRATION_BASELINE: usize = 151;
 /// **It is a deliberately CONSERVATIVE cap, not the largest healthy process.**
 /// The anchor is explicitly PER-RUNTIME — the field is named
 /// `per_runtime_pool_capacity_default` — and this binary builds many runtimes
-/// (Tauri's own global runtime, `fleet-pub-rt`, `mcp-api-rt`, and the short-lived
-/// current-thread ones), so *N* runtimes carry *N* × 512 of blocking-pool
-/// capacity that is healthy by tokio's own defaults. A process legitimately
+/// (`fleet-pub-rt`, `mcp-api-rt`, the short-lived current-thread ones), so
+/// *N* runtimes carry *N* × 512 of blocking-pool capacity that is healthy by
+/// tokio's own defaults. The application runtime's (`app-rt`) OWN idle pool is
+/// no longer part of the floor this cap bounds: the at-rest window is fed the
+/// GRADED reading (see [`record_at_rest_sample`]), which has that pool
+/// subtracted already, so only the other runtimes' pools remain in the floor
+/// and this cap is that much more conservative than it was. A process legitimately
 /// idling above 512 therefore gets LESS shift than its floor would justify,
 /// and the guard is correspondingly stricter on it. That is the intended
 /// direction: this constant is chosen to under-shift rather than over-shift,
@@ -516,6 +521,35 @@ static AT_REST_WINDOW: Mutex<Option<AtRestWindow>> = Mutex::new(None);
 /// served policy `unknown-must-not-render-as-a-default` forbids. An unusable
 /// tick contributes nothing and the previous window stands.
 pub(crate) fn record_at_rest_sample(total_threads: Option<usize>, live_sessions: Option<usize>) {
+    // The window is fed the GRADED reading — the raw count minus the idle
+    // blocking pool the census attributes to the runtime (plan
+    // `2026-09-21-runner-blocking-pool-ratchets-to-peak-because-transcript-
+    // tails-rotate-every-idle-thread`, Phase 3) — so the two subtractions the
+    // thread lane now applies are DISJOINT: [`graded_thread_reading`] removes
+    // the idle pool from the READING, and [`machine_thread_shift`] removes the
+    // at-rest floor of everything else from the CEILING. Recording the raw
+    // count here would fold the idle pool into the floor as well, and the
+    // guard would then subtract it twice — once from the reading and once via
+    // the shift — which is the composition a re-based ladder and a graded
+    // reading can otherwise reach. An UNKNOWN census grades nothing out, so
+    // the window degrades to the raw reading, never to a permissive one. The
+    // one mixed case is transitional: a census UNKNOWN for a whole
+    // AT_REST_WINDOW_SAMPLES window that then returns leaves the floor raw
+    // while the reading is graded for the ticks until a graded sample enters
+    // the min-window — a double subtraction bounded to that window, and the
+    // reverse mix (census going UNKNOWN now) is strict. Do not "fix" it by
+    // feeding the window the raw count again; that re-creates the permanent
+    // double subtraction this comment exists to forbid.
+    let total_threads = total_threads.map(|total| {
+        graded_thread_reading(
+            total,
+            crate::health_monitor::thread_name_census_memoized().as_ref(),
+            qontinui_runner_lib::wedge_diagnostics::tracked_blocking_in_flight(),
+            RUNTIME_NAMES,
+            runtime_worker_threads(),
+        )
+        .graded
+    });
     let Some(at_rest) = at_rest_estimate(total_threads, live_sessions) else {
         return;
     };
@@ -1391,6 +1425,148 @@ fn compose_lanes(memory: SpawnGate, threads: SpawnGate) -> (SpawnGate, Option<Sp
     }
 }
 
+/// The most idle-pool threads [`graded_thread_reading`] will ever subtract.
+///
+/// tokio's blocking pool is capped at `max_blocking_threads`, whose default is
+/// **512** (`runtime::Builder::new` sets `max_blocking_threads: 512` for every
+/// flavor; `runtime/builder.rs:288` on the pinned tokio 1.50.0), so a census
+/// can never legitimately attribute more than `workers + 512` threads to one
+/// runtime. This clamp protects against a census that OVER-REPORTS — a second
+/// runtime sharing the name, a mis-tallied walk — and nothing else: in
+/// production `named - workers - in_flight` is at most 512 by construction,
+/// so the clamp is not reachable from a correct census and it is NOT what
+/// keeps a saturated pool counted.
+///
+/// **What this grading cannot see, stated so nobody reads the clamp as
+/// cover.** A pool thread inside an UNTRACKED body — `tokio::fs`,
+/// `tokio::process`, and every raw `tokio::task::spawn_blocking` site that
+/// does not take a `BlockingSlot` — is indistinguishable from an idle one
+/// here, because `in_flight` counts tracked bodies only. 512 pool threads
+/// all stuck in untracked `CreateProcess` calls (the 2026-08-29 wedge shape)
+/// would therefore grade out entirely and the lane would read `Proceed`.
+/// The guard is strict against TRACKED bodies (they stay counted); the
+/// untracked residue is closed only by coverage — converting raw
+/// `spawn_blocking` sites to `spawn_blocking_tracked` — which is the recorded
+/// follow-up on plan `2026-09-21-runner-blocking-pool-ratchets-to-peak-
+/// because-transcript-tails-rotate-every-idle-thread`, not by any number
+/// here.
+pub(crate) const IDLE_POOL_SUBTRAHEND_CAP: usize = 512;
+
+/// The thread names the application runtime's scheduler workers and blocking
+/// pool carry, in the order this binary has shipped them: `tokio-rt-worker` is
+/// tokio's default and what the Tauri runtime is named today; `app-rt` is the
+/// name plan `2026-09-18-the-runner-thread-pressure-guard-is-a-latch-not-
+/// back-pressure` PR 1 gives it. Both are listed so the grading survives that
+/// rename without a code change here; a census never carries both at once.
+pub(crate) const RUNTIME_NAMES: &[&str] = &["app-rt", "tokio-rt-worker"];
+
+/// The application runtime's scheduler worker count — the part of a
+/// [`RUNTIME_NAMES`] row that is NOT the blocking pool.
+///
+/// Plan `2026-09-18-…-latch-not-back-pressure` PR 1 (`db96c48f3`) builds the
+/// Tauri runtime with `crate::app_runtime_worker_threads()` workers —
+/// `min(available_parallelism, 16)` or the bounded env override — under the
+/// name `app-rt`. This reads the SAME resolver, so the subtrahend and the
+/// runtime can never disagree about how many of the named threads are
+/// scheduler workers rather than pool. Reading `available_parallelism()` here
+/// instead (the pre-PR-1 shape) over-counted workers by 16 on a 32-core box,
+/// which under-graded the pool — the strict direction, but wrong.
+pub(crate) fn runtime_worker_threads() -> usize {
+    crate::app_runtime_worker_threads()
+}
+
+/// A thread reading with the runtime's IDLE blocking pool graded out of it
+/// (plan `2026-09-21-runner-blocking-pool-ratchets-to-peak-because-transcript-
+/// tails-rotate-every-idle-thread`, Phase 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GradedThreadReading {
+    /// The raw OS thread count, as [`crate::health_monitor::thread_count_reading`]
+    /// measured it.
+    pub(crate) total: usize,
+    /// How many threads were graded out: named runtime threads beyond the
+    /// scheduler workers and beyond the tracked in-flight bodies, capped at
+    /// [`IDLE_POOL_SUBTRAHEND_CAP`].
+    pub(crate) idle_pool: usize,
+    /// `total − idle_pool` — the number the ceilings are judged against.
+    pub(crate) graded: usize,
+}
+
+/// PURE: grade an idle blocking pool out of a raw thread count.
+///
+/// `named` is the census count for the [`RUNTIME_NAMES`] rows (an UNKNOWN
+/// census is `0` named — the guard then degrades to today's strict reading,
+/// never to a permissive one, served policy `verification-and-evidence`
+/// `unknown-must-not-render-as-a-default`). Of those, `worker_threads` are the
+/// scheduler and `in_flight` are pool threads genuinely inside a tracked body,
+/// and both keep counting as load; what is left is the idle pool, subtracted
+/// up to [`IDLE_POOL_SUBTRAHEND_CAP`]. Every step saturates, so no input can
+/// make `graded` exceed `total` or underflow.
+pub(crate) fn graded_thread_reading(
+    total: usize,
+    census: Option<&ThreadNameCensus>,
+    in_flight: usize,
+    runtime_names: &[&str],
+    worker_threads: usize,
+) -> GradedThreadReading {
+    let named: usize = census
+        .map(|c| {
+            c.by_name
+                .iter()
+                .filter(|row| runtime_names.contains(&row.name.as_str()))
+                .map(|row| row.count)
+                .sum()
+        })
+        .unwrap_or(0);
+    let idle_pool = named
+        .saturating_sub(worker_threads)
+        .saturating_sub(in_flight)
+        .min(IDLE_POOL_SUBTRAHEND_CAP);
+    GradedThreadReading {
+        total,
+        idle_pool,
+        graded: total.saturating_sub(idle_pool),
+    }
+}
+
+/// Edge-triggered log of the thread lane's graded trip, so an operator reading
+/// a refusal that says "carrying 150 threads" beside a `/health` that says 441
+/// finds the line that reconciles the two. One line per change of severity
+/// (a trip, an escalation, and again after a clear), never one per poll: the
+/// continuation guard asks this lane every few minutes for every pending
+/// continuation, and `idle_pool` drifts by a few threads between polls.
+static LAST_GRADED_TRIP: Mutex<Option<&'static str>> = Mutex::new(None);
+
+fn note_graded_trip(verdict: &SpawnGate, reading: &GradedThreadReading) {
+    let key = verdict.tripped().map(|(severity, _)| severity);
+    let mut last = LAST_GRADED_TRIP.lock().unwrap_or_else(|e| e.into_inner());
+    if *last == key {
+        return;
+    }
+    *last = key;
+    if let Some((severity, obs)) = verdict.tripped() {
+        warn!(
+            lane = %obs.lane,
+            severity = severity,
+            threads = reading.total,
+            idle_pool = reading.idle_pool,
+            graded = reading.graded,
+            limit = obs.limit,
+            "resource_guard: {}",
+            graded_trip_message(severity, reading, obs.limit),
+        );
+    }
+}
+
+/// The reconciling sentence: raw, idle and graded on one line, beside the
+/// ceiling that was crossed. PURE so the wording is pinned by a test.
+fn graded_trip_message(severity: &str, reading: &GradedThreadReading, limit: u64) -> String {
+    format!(
+        "the thread lane tripped on the GRADED reading — {} threads, {} idle blocking-pool \
+         threads graded out, graded {} against the {}-thread {} ceiling",
+        reading.total, reading.idle_pool, reading.graded, limit, severity,
+    )
+}
+
 /// The thread lane's live verdict, folded and evaluated. Shared by
 /// [`probe_for_spawn`] and [`thread_pressure`] so the two can never drift.
 ///
@@ -1401,12 +1577,31 @@ fn compose_lanes(memory: SpawnGate, threads: SpawnGate) -> (SpawnGate, Option<Sp
 /// window. Reaching past it to `thread_count_reading` from a second site would
 /// silently restore the per-caller snapshot this seam exists to remove; see that
 /// constant's doc for why the staleness is free.
+///
+/// The reading handed to [`evaluate_threads`] is the GRADED one
+/// ([`graded_thread_reading`]): the raw count minus the runtime's idle
+/// blocking pool, which the 30 s thread-name census
+/// ([`crate::health_monitor::thread_name_census_memoized`]) makes visible and
+/// [`qontinui_runner_lib::wedge_diagnostics::tracked_blocking_in_flight`] keeps
+/// honest. `evaluate_threads` and the ceilings it compares against are
+/// untouched; the `GateObservation.observed` every refusal quotes is the
+/// graded number, and [`note_graded_trip`] logs the raw one beside it.
 fn thread_lane_verdict(local: &SessionGuardSettings) -> SpawnGate {
     let ceilings = effective_thread_ceilings(local);
-    evaluate_threads(
-        crate::health_monitor::thread_count_reading_memoized(),
-        &ceilings,
-    )
+    let Some(total) = crate::health_monitor::thread_count_reading_memoized() else {
+        return evaluate_threads(None, &ceilings);
+    };
+    let census = crate::health_monitor::thread_name_census_memoized();
+    let reading = graded_thread_reading(
+        total,
+        census.as_ref(),
+        qontinui_runner_lib::wedge_diagnostics::tracked_blocking_in_flight(),
+        RUNTIME_NAMES,
+        runtime_worker_threads(),
+    );
+    let verdict = evaluate_threads(Some(reading.graded), &ceilings);
+    note_graded_trip(&verdict, &reading);
+    verdict
 }
 
 /// The thread lane's verdict on its own, live — **the entry point for callers
@@ -2009,6 +2204,176 @@ mod tests {
             SpawnGate::Critical(o) => assert_eq!(o.limit, 150),
             other => panic!("expected Critical under transposed ceilings, got {other:?}"),
         }
+    }
+
+    // ---- The graded reading (plan 2026-09-21-runner-blocking-pool-ratchets-
+    // to-peak-because-transcript-tails-rotate-every-idle-thread, Phase 3) ----
+    //
+    // `evaluate_threads` above is untouched: these pin what is FED to it.
+
+    fn name_census(rows: &[(&str, usize)]) -> ThreadNameCensus {
+        use qontinui_runner_lib::wedge_diagnostics::ThreadNameCount;
+        ThreadNameCensus {
+            total: rows.iter().map(|(_, n)| n).sum(),
+            by_name: rows
+                .iter()
+                .map(|(name, count)| ThreadNameCount {
+                    name: name.to_string(),
+                    count: *count,
+                })
+                .collect(),
+            sampled_at: std::time::SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    /// The operator-box case: 440 threads of which 325 are `tokio-rt-worker`,
+    /// 32 scheduler workers, 3 bodies in flight ⇒ 290 idle pool threads are
+    /// graded out and the 150 that remain PROCEED under the shipped 256/400
+    /// ceilings — where the raw 440 was a refusal.
+    #[test]
+    fn an_idle_pool_is_graded_out_and_the_remainder_proceeds() {
+        let census = name_census(&[("tokio-rt-worker", 325), ("terminal-reader-*", 19)]);
+        let r = graded_thread_reading(440, Some(&census), 3, RUNTIME_NAMES, 32);
+        assert_eq!(
+            r,
+            GradedThreadReading {
+                total: 440,
+                idle_pool: 290,
+                graded: 150,
+            }
+        );
+        assert_eq!(
+            evaluate_threads(Some(r.graded), &defaults()),
+            SpawnGate::Proceed
+        );
+        assert!(matches!(
+            evaluate_threads(Some(r.total), &defaults()),
+            SpawnGate::Critical(_)
+        ));
+    }
+
+    /// UNKNOWN census ⇒ nothing is graded out ⇒ today's strict reading, and
+    /// today's `Critical`. Never the permissive direction.
+    #[test]
+    fn an_unknown_census_grades_nothing_out() {
+        let r = graded_thread_reading(440, None, 3, RUNTIME_NAMES, 32);
+        assert_eq!(r.idle_pool, 0);
+        assert_eq!(r.graded, 440);
+        assert!(matches!(
+            evaluate_threads(Some(r.graded), &defaults()),
+            SpawnGate::Critical(_)
+        ));
+    }
+
+    /// The clamp bites: 600 named beyond 32 workers is 568 idle, but only
+    /// [`IDLE_POOL_SUBTRAHEND_CAP`] (512) may be subtracted, so a pool at
+    /// tokio's own cap still counts.
+    /// The re-based ladder (`machine_thread_shift`) and the graded reading
+    /// subtract DISJOINT components: the at-rest window is fed the graded
+    /// reading, so the idle pool is never in the floor the shift is derived
+    /// from. Feeding it the RAW count would double-subtract — the shift would
+    /// carry the pool a second time. Pinned as arithmetic over the two pure
+    /// halves, because the live seam (`record_at_rest_sample`) writes a
+    /// process-global window.
+    #[test]
+    fn the_idle_pool_is_subtracted_once_not_twice() {
+        // The operator box: 441 threads, 325 named pool rows, 16 pinned
+        // workers, 3 tracked bodies in flight, 12 live sessions.
+        let census = name_census(&[("tokio-rt-worker", 325)]);
+        let graded = graded_thread_reading(441, Some(&census), 3, RUNTIME_NAMES, 16);
+        assert_eq!(graded.idle_pool, 306);
+        assert_eq!(graded.graded, 135);
+
+        // What the window sees when fed the GRADED reading: the floor of the
+        // non-pool threads, so the shift is derived from 135 - 36 = 99, which
+        // is below CALIBRATION_BASELINE and shifts NOTHING.
+        let floor_graded = at_rest_estimate(Some(graded.graded), Some(12));
+        assert_eq!(floor_graded, Some(99));
+        assert_eq!(machine_thread_shift(floor_graded), 0);
+
+        // What it would have seen fed the RAW count: the pool folded into the
+        // floor, a shift of ~254 on top of a reading that already excludes the
+        // same 306 threads — the double subtraction this composition forbids.
+        let floor_raw = at_rest_estimate(Some(441), Some(12));
+        assert_eq!(floor_raw, Some(405));
+        assert!(machine_thread_shift(floor_raw) > 200);
+    }
+
+    #[test]
+    fn the_subtrahend_is_capped_at_the_pool_ceiling() {
+        let census = name_census(&[("tokio-rt-worker", 600)]);
+        let r = graded_thread_reading(700, Some(&census), 0, RUNTIME_NAMES, 32);
+        assert_eq!(r.idle_pool, IDLE_POOL_SUBTRAHEND_CAP);
+        assert_eq!(r.idle_pool, 512);
+        assert_eq!(r.graded, 188);
+    }
+
+    /// A pool thread inside a tracked body keeps counting as load: 50 in
+    /// flight on the operator-box case raises the graded reading by exactly 50.
+    #[test]
+    fn in_flight_bodies_stay_counted() {
+        let census = name_census(&[("tokio-rt-worker", 325)]);
+        let idle = graded_thread_reading(440, Some(&census), 3, RUNTIME_NAMES, 32);
+        let busy = graded_thread_reading(440, Some(&census), 53, RUNTIME_NAMES, 32);
+        assert_eq!(idle.graded, 150);
+        assert_eq!(busy.graded, 200);
+        assert_eq!(busy.idle_pool, 240);
+        // The delta is the in-flight delta, one for one.
+        let fifty = graded_thread_reading(440, Some(&census), 50, RUNTIME_NAMES, 32);
+        assert_eq!(fifty.graded, 197);
+    }
+
+    /// The reconciling WARN names all three numbers and the ceiling, so a
+    /// refusal quoting the graded count and a `/health` quoting the raw one
+    /// can be read as the same measurement.
+    #[test]
+    fn the_graded_trip_message_carries_raw_idle_and_graded() {
+        let reading = GradedThreadReading {
+            total: 441,
+            idle_pool: 291,
+            graded: 150,
+        };
+        let msg = graded_trip_message("warn", &reading, 256);
+        assert!(msg.contains("441 threads"), "{msg}");
+        assert!(msg.contains("291 idle blocking-pool threads"), "{msg}");
+        assert!(msg.contains("graded 150"), "{msg}");
+        assert!(msg.contains("256-thread warn ceiling"), "{msg}");
+    }
+
+    /// A census naming only unrelated threads grades nothing out — the
+    /// subtraction is keyed on the runtime names, never on "most threads".
+    #[test]
+    fn unrelated_thread_names_are_not_a_pool() {
+        let census = name_census(&[
+            ("terminal-reader-*", 200),
+            ("notify-rs windows loop", 19),
+            ("<unnamed>", 40),
+        ]);
+        let r = graded_thread_reading(440, Some(&census), 3, RUNTIME_NAMES, 32);
+        assert_eq!(r.idle_pool, 0);
+        assert_eq!(r.graded, r.total);
+    }
+
+    /// Both runtime names count (the rename in the 09-18 plan's PR 1 must not
+    /// switch the grading off), and every arithmetic step saturates: a
+    /// census that claims more named threads than the total exists cannot
+    /// underflow the graded reading.
+    #[test]
+    fn the_grading_survives_the_runtime_rename_and_never_underflows() {
+        let renamed = name_census(&[("app-rt", 325)]);
+        assert_eq!(
+            graded_thread_reading(440, Some(&renamed), 3, RUNTIME_NAMES, 32).graded,
+            150
+        );
+        let impossible = name_census(&[("tokio-rt-worker", 900)]);
+        let r = graded_thread_reading(100, Some(&impossible), 0, RUNTIME_NAMES, 32);
+        assert_eq!(r.idle_pool, 512);
+        assert_eq!(r.graded, 0);
+        // More workers than named threads: nothing to subtract, no underflow.
+        let small = name_census(&[("tokio-rt-worker", 10)]);
+        let r = graded_thread_reading(100, Some(&small), 0, RUNTIME_NAMES, 32);
+        assert_eq!(r.idle_pool, 0);
+        assert_eq!(r.graded, 100);
     }
 
     /// The thread lane names itself through the shared lane vocabulary, never a

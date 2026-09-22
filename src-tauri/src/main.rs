@@ -1317,12 +1317,23 @@ const APP_RUNTIME_WORKER_THREADS_OVERRIDE_MAX: usize = 1024;
 /// number. A value that does not parse, or `0`, is IGNORED with a warning
 /// rather than silently becoming a runtime nobody can schedule on — a zero
 /// worker count is not a stricter setting, it is a dead process.
-fn app_runtime_worker_threads() -> usize {
-    let cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(APP_RUNTIME_WORKER_THREADS_MAX);
-    let raw = std::env::var(APP_RUNTIME_WORKER_THREADS_ENV).ok();
-    resolve_app_runtime_workers(cpus, raw.as_deref())
+///
+/// Resolved ONCE, on first call, and memoised: `install_app_runtime` is the
+/// first caller, so the cached value is by construction the count the runtime
+/// was actually built with, and every later reader — `resource_guard`'s
+/// idle-pool grading among them, polled many times a second under a
+/// continuation burst — gets that same number without re-reading the env or
+/// re-warning about a malformed override on every call. A later `set_var` on
+/// this process cannot move it, which is correct: the runtime did not move.
+pub(crate) fn app_runtime_worker_threads() -> usize {
+    static RESOLVED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(APP_RUNTIME_WORKER_THREADS_MAX);
+        let raw = std::env::var(APP_RUNTIME_WORKER_THREADS_ENV).ok();
+        resolve_app_runtime_workers(cpus, raw.as_deref())
+    })
 }
 
 /// The arithmetic of [`app_runtime_worker_threads`], PURE, so it can be tested
@@ -5533,12 +5544,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 let tw_tailer = app
                     .try_state::<Arc<session::session_transcript_tailer::SessionTranscriptTailer>>()
                     .map(|s| s.inner().clone());
+                // Tail lifecycle knobs (idle park, parked retention) are
+                // spawn-time: read once here, never re-read by the watcher.
+                let tw_settings = crate::settings::get_transcript_watcher_settings();
                 if let Err(e) = crate::terminal::transcript_watcher::start_transcript_watcher(
                     tw_app_handle,
                     tw_pg,
                     workspace_paths,
                     tw_registrar,
                     tw_tailer,
+                    tw_settings,
                 ) {
                     tracing::warn!("transcript watcher failed to start: {}", e);
                 }
