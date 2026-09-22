@@ -30,50 +30,18 @@ session. Carry the verdict as `unknown`, emit no Outcome tag, and SAY in the
 summary that no review existed — do not emit a failure summary either, which
 would be the same mistake in the other direction.
 
-> **The runner carries TWO copies of the old rule, and only one of them ends
-> by deletion. Both are verified at the runner's `origin/main` `4ad6d7350`,
-> 2026-09-16.**
->
-> - **`src-tauri/src/productivity/summarize.rs` — deleted, not corrected.**
->   It maps `Ok(None) => "approved"`. **Do not open a follow-up for this
->   half.** Phase 4 of
->   `2026-09-12-consolidate-local-orchestration-onto-conductor` removes
->   `src-tauri/src/productivity/` entirely, `summarize.rs` with it, along with
->   the `summarize_session` Tauri command; this command file drives the runner
->   over HTTP routes that survive (`POST /productivity-knowledge`,
->   `GET /sessions/<id>/latest-review`), so it is unaffected.
-> - **`src-tauri/src/fleet_commands/summarize-session.md` — a second
->   canonical copy, untouched by Phase 4's first four commits and corrected
->   in its final one.** Its lines 26-27 still read *"If
->   no review exists yet, treat the verdict as `approved` — i.e. emit a normal
->   summary, not a failure summary."* That file is not a staged copy of this
->   one: `src-tauri/src/fleet_commands.rs` says in its module header that the
->   `fleet_commands/*.md` files are the CANONICAL fleet-shipped sources
->   (`summarize-session` is registered in `FLEET_COMMANDS`), and
->   `provision_fleet_commands_into` writes each one into a spawned session's
->   working directory unless the destination already exists AND is tracked in
->   the enclosing repo (`provision_guard.rs`: `dst.exists() && contains(rel)`)
->   — false in an allocated worktree of any repo EXCEPT qontinui-claude-config,
->   which tracks its own copy at `.claude/commands/`, so there the tracked file
->   is left in place and is what the session reads. That exception is the point:
->   this copy wins exactly where it is tracked, and the runner's wins everywhere
->   else, and the
->   failure this rule exists to prevent — an unreviewed failed session
->   summarised as if it were a normal one — still happens in the majority
->   case.
->
-> **Status: the runner-side correction is CARRIED, not owed.** The Phase 4
-> qontinui-runner branch
-> `agent/eb2155ed4152-01a0a7d44995/2026-09-12-consolidate-local-orchestration-onto-conductor-ph`
-> rewrites those lines to the UNKNOWN rule above, byte-identical to the step-1
-> and step-5 text in this file (both copies diffed mechanically 2026-09-16).
-> **No follow-up is owed — do not open one.** The divergence is live on the
-> runner's `origin/main` (`4ad6d7350`, still blob `4b7004b7a`, still
-> `approved`) only until that PR merges, and this PR carries
-> `coord:downstream-of=qontinui/qontinui-runner#<n>`, which puts this repo on
-> the waiting side of that edge — so the two copies land in the safe order and
-> a spawned session never sees the corrected config copy beside an
-> uncorrected runner one.
+> **Why this rule is stated identically in two places.** The runner bundles a
+> copy of this file at `src-tauri/src/fleet_commands/summarize-session.md` and
+> `provision_fleet_commands_into` writes it into a spawned session's working
+> directory unless the destination already exists AND is tracked in the
+> enclosing repo (`provision_guard.rs`: `dst.exists() && contains(rel)`). That
+> is false in an allocated worktree of every repo EXCEPT this one, which tracks
+> its own copy at `.claude/commands/` — so THIS copy wins exactly where it is
+> tracked, and the bundled copy wins everywhere else, which is the majority
+> case. The two must therefore say the same thing: a session reading the
+> bundled copy is the normal case, not the exception. Edit this file, then
+> re-vendor into the runner; an edit made only in the runner is a fork
+> (`src-tauri/src/fleet_commands.rs`, module header).
 
 ### 2. Identify learnings
 
