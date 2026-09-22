@@ -1198,17 +1198,6 @@ and the body. Before writing your stamp:
    put it in **one trailing line inside your new block**, prefixed
    `History:`, `Started from:`, or `Previously:`. Never as a sibling
    blockquote.
-5. **Carry the `**Area:**` and `Depends-On:` declarations.** If the block you
-   are replacing carries a `` > **Area:** `<area>` `` line or a `Depends-On:`
-   declaration, carry each verbatim into your new block — `Depends-On:` as the
-   suffix of your new `> **Status:` line (or wherever in the block it stood),
-   `**Area:**` as a `>` line (conventionally directly under the Status line).
-   Either must stay inside that same blockquote: no blank line or non-`>` line
-   between it and the `> **Status:` line, and never a sibling blockquote.
-   The runner's plan scanner reads both only from this status
-   blockquote, into `metadata.area` and `metadata.depends_on`, and coord
-   replaces the pushed `metadata` on every upsert, so a stamp that drops
-   either erases it from the work unit on the next scan.
 
 This stamp is mandatory before Step 1. It makes concurrent agents see
 "another session is implementing this" via a quick `head -5 plan.md`
