@@ -98,7 +98,9 @@ pub fn scan_idle_touches_once() {
     // `context_watcher::SCAN_GATE::retain_live`).
     {
         let live: std::collections::HashSet<&String> = sessions.iter().map(|(t, _)| t).collect();
-        let mut guard = LAST_FIRED_SINCE_MS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = LAST_FIRED_SINCE_MS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(map) = guard.as_mut() {
             map.retain(|tid, _| live.contains(tid));
         }
@@ -122,7 +124,9 @@ pub fn scan_idle_touches_once() {
         }
 
         let already_fired_this_episode = {
-            let guard = LAST_FIRED_SINCE_MS.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = LAST_FIRED_SINCE_MS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             guard
                 .as_ref()
                 .and_then(|m| m.get(&tid))
@@ -149,7 +153,9 @@ pub fn scan_idle_touches_once() {
             Some(session.pinned_session_id()),
         ) {
             Ok(()) => {
-                let mut guard = LAST_FIRED_SINCE_MS.lock().unwrap_or_else(|e| e.into_inner());
+                let mut guard = LAST_FIRED_SINCE_MS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 guard.get_or_insert_with(HashMap::new).insert(tid, since_ms);
             }
             Err(e) => {
