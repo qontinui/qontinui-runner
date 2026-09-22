@@ -918,22 +918,93 @@ fn scan_listing(
                 continue;
             }
         };
-        if !has_document_structure(&body) {
-            skipped.push(SkippedFile {
-                path: path_str,
-                reason: "no_markdown_structure",
-            });
-            continue;
+        if let Some(a) = classify_one(root, path_str, &body, conv, skipped) {
+            out.push(a);
         }
-        let slug = slug_from_filename(&path_str);
-        let kind = classify_kind(root.kind, &slug, &body);
-        let parsed = parse_work_unit(&slug, &path_str, &body, conv);
-        out.push(build_artifact(&parsed, kind, root.source_repo.clone()));
     }
     out
 }
 
-/// Read + classify every root, in order.
+/// Classify ONE plan body into an artifact — everything after the bytes are in
+/// hand, shared VERBATIM by both byte sources.
+///
+/// Extracted so the ref arm ([`scan_one_root_at_ref`]) cannot drift from the
+/// work-tree arm on kind classification, slug derivation, the recorded path or
+/// the structure test. The two arms differing on any of those would be the
+/// document-layer twin of the parity defect
+/// [`super::trigger::read_plans_for_cycle`] already guards for the work-unit
+/// layer, and a divergence here is invisible in the corpus until a reader
+/// compares two devices.
+fn classify_one(
+    root: &ScanRoot,
+    path_str: String,
+    body: &str,
+    conv: &PlanConvention,
+    skipped: &mut Vec<SkippedFile>,
+) -> Option<ScannedArtifact> {
+    if !has_document_structure(body) {
+        skipped.push(SkippedFile {
+            path: path_str,
+            reason: "no_markdown_structure",
+        });
+        return None;
+    }
+    let slug = slug_from_filename(&path_str);
+    let kind = classify_kind(root.kind, &slug, body);
+    let parsed = parse_work_unit(&slug, &path_str, body, conv);
+    Some(build_artifact(&parsed, kind, root.source_repo.clone()))
+}
+
+/// Classify a root whose bytes came from a REF rather than from the working
+/// tree — the document-layer counterpart of
+/// [`super::trigger::read_plans_for_cycle`]'s `Ref` arm.
+///
+/// The RECORDED path is `root.dir.join(name)`, i.e. exactly the path the
+/// work-tree walk would have recorded for the same plan — for `source_path`
+/// FIDELITY, so a corpus row keeps naming a path that exists on the authoring
+/// box and a reader comparing two devices sees one convention.
+///
+/// It is NOT an identity requirement, and an earlier draft of this comment
+/// claimed it was ("a ref-relative path would mint a SECOND row per plan").
+/// That was false and is corrected here rather than quietly deleted, because a
+/// fabricated rationale is how the next editor "simplifies" a line that is
+/// load-bearing for something else. Identity is `(kind, slug, source_repo)`:
+/// `slug_from_filename` takes the BASENAME and strips `.md`, so it is
+/// path-prefix-independent, and `source_repo` comes from `ScanRoot::new`'s
+/// `derive_source_repo(&root.dir)` — from the root, never from the file path.
+/// A ref-relative path would update the SAME row with a different
+/// `source_path`. Worth keeping; not worth that claim.
+pub fn scan_one_root_at_ref(
+    root: &ScanRoot,
+    files: &[super::ref_scan::RefPlanFile],
+    conv: &PlanConvention,
+    skipped: &mut Vec<SkippedFile>,
+) -> Vec<ScannedArtifact> {
+    let mut out = Vec::new();
+    for f in files {
+        let path_str = root.dir.join(&f.name).to_string_lossy().to_string();
+        if let Some(a) = classify_one(root, path_str, &f.body, conv, skipped) {
+            out.push(a);
+        }
+    }
+    out
+}
+
+/// Read + classify every root, in order, FROM THE WORKING TREE.
+///
+/// ⚠️ **This is no longer the production scan.** Since Phase 3 of
+/// `2026-09-10-the-plan-scanner-reads-a-parked-working-tree-not-a-ref` the body
+/// sync resolves each root's source and reads the REF where there is one —
+/// [`super::trigger::scan_roots_at_source`] is what the cycle calls. This
+/// wrapper now has NO production caller at all — its remaining callers are
+/// this module's own tests. It said "for the CLI" until Phase 3, and Phase 3 is
+/// what removed the CLI's use of it (`qontinui_cli.rs` routes through
+/// `scan_roots_at_source` so the backfill cannot publish parked bytes into
+/// ref-sourced rows). Kept for tests that want a filesystem walk with no git in
+/// the way, and documented this precisely because reading a scan function's
+/// name as "what the runner does" is the mistake that let the document layer
+/// sit on a parked tree for a fortnight after the work-unit layer moved off it
+/// — a doc that misstates its own callers repeats it.
 pub fn scan_all_roots(
     roots: &[ScanRoot],
     conv: &PlanConvention,

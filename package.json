@@ -96,6 +96,8 @@
   "scripts": {
     "prebuild": "node scripts/check-frontend-toolchain.mjs",
     "build": "pnpm exec tsc && pnpm exec vite build",
+    "build:exe": "node scripts/build-exe.mjs",
+    "provenance:test": "node --test scripts/__tests__/frontend-provenance.test.mjs",
     "bundle:profile-sidecar": "node scripts/bundle-profile-sidecar.mjs",
     "build-storybook": "storybook build",
     "check": "npm run typecheck && npm run lint && npm run format:check && npm run validate:ws-actions && npm run vocab:check && npm run effect:fixture:check",

@@ -45,6 +45,7 @@ pub use resolution::{
     context_matches_touched_paths, format_contexts_for_prompt,
     format_observation_memory_for_prompt, format_single_context, inject_contexts,
     inject_contexts_scoped, record_contexts_used, resolve_contexts, resolve_contexts_scoped,
+    ObservationSummary,
 };
 
 // Re-export built-in contexts

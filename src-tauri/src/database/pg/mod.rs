@@ -22,8 +22,6 @@ pub mod compensation;
 pub mod completion_reports;
 pub mod contradiction;
 pub mod coordinator_decisions;
-pub mod coordinator_leader;
-pub mod coordinator_shadow_decisions;
 pub mod decision_trail;
 pub mod deferred_questions;
 pub mod entailment_cache;
@@ -54,7 +52,6 @@ pub mod orchestration;
 pub mod orchestration_loop;
 pub mod phase_results;
 pub mod pipeline_traces;
-pub mod plans;
 pub mod pr_watch_ops;
 pub mod process_sessions;
 pub mod productivity_knowledge;
@@ -282,8 +279,7 @@ pub(crate) fn parse_optional_workflow_id(id: Option<&str>) -> Result<Option<uuid
 /// DELIBERATELY NOT IN THIS LIST: `coord.agent_worktrees`, the single
 /// exclusion. coord genuinely authors those rows (`POST /agents/allocate`),
 /// so it stays `coord.*`; a later phase moves the runner off it to HTTP.
-pub const REHOMED_MACHINE_LOCAL_TABLES: [&str; 12] = [
-    "plans",
+pub const REHOMED_MACHINE_LOCAL_TABLES: [&str; 9] = [
     "tasks",
     "reviews",
     "worktrees",
@@ -292,9 +288,7 @@ pub const REHOMED_MACHINE_LOCAL_TABLES: [&str; 12] = [
     "process_session_output",
     "session_touched_files",
     "session_file_snapshots",
-    "coordinator_leader",
     "coordinator_decisions",
-    "coordinator_shadow_decisions",
 ];
 
 /// Idempotent self-provision DDL for [`REHOMED_MACHINE_LOCAL_TABLES`].
@@ -305,26 +299,37 @@ pub const REHOMED_MACHINE_LOCAL_TABLES: [&str; 12] = [
 /// re-home: without it a fresh embedded cluster has none of these tables and
 /// re-qualifying the SQL changes nothing.
 ///
-/// Statement order is FK order: `plans` → `tasks` → `reviews`, and
+/// Statement order is FK order: `tasks` → `reviews`, and
 /// `process_sessions` → `process_session_output`.
 ///
 /// COLUMN PROVENANCE.
-/// - `plans` — recreated from the `downgrade()` of alembic revision
-///   `coord_p4_03_drop_plans`, whose `upgrade()` DROPPED `coord.plans` (and
-///   `coord.tasks.plan_id`, and `coord.plan_status_history`) on the shared
-///   cluster. The runner's plan/task subsystem still binds both, so this
-///   table is not merely re-homed — it is the only place `plans` exists at
-///   all for the runner, and provisioning it here repairs a second live
-///   defect that was independent of the embedded-PG one.
-///   `plan_status_history` is NOT recreated: nothing in the runner reads it.
 /// - `tasks` — the live `coord.tasks` shape (`schema.pg.sql.generated`) PLUS
-///   the `plan_id UUID` column, its FK and `idx_tasks_plan`, all of which the
-///   same alembic revision dropped. `insert_task`, `list_tasks_for_plan`,
-///   `list_active_tasks_for_plan`, `mark_ready_for_unblocked` and the
-///   `WITH RECURSIVE depends_on` walk every one of them bind `plan_id`; the
-///   FK is now a within-schema one (`project.plans`), which is what
-///   `delete_plan`'s "tasks cascade-delete via FK" contract needs.
-/// - the other ten — the live shapes in `schema.pg.sql.generated`, checked
+///   the `plan_id UUID` column the alembic revision `coord_p4_03_drop_plans`
+///   dropped. The column stays because the emergent-task path still binds
+///   it, but it is a bare column: Phase 4 of
+///   `2026-09-12-consolidate-local-orchestration-onto-conductor` deleted the
+///   plan/task board, so `project.plans` is no longer created and the FK and
+///   `idx_tasks_plan` went with it (D2: stop creating, never `DROP` — an
+///   existing database keeps its orphaned `plans`, `coordinator_leader` and
+///   `coordinator_shadow_decisions` tables untouched).
+///   Two more indexes went the same way and under the same rule, but for
+///   DIFFERENT reasons — they are not one argument:
+///   - `idx_tasks_plan_identity_hash` is UNREACHABLE. It is partial on
+///     `WHERE identity_hash IS NOT NULL`, and `create_emergent_task` is now
+///     the only writer of `project.tasks` and writes neither `identity_hash`
+///     nor `assignment_brief_extras` — so nothing can ever satisfy the
+///     predicate and the index could only ever be empty.
+///   - `idx_reviews_pending_recommendations` is UNUSED, which is a different
+///     claim. Its predicate WAS `list_pending_recommendations` verbatim, and
+///     that query — its only reader — went with the board (a line above).
+///     Emptiness is NOT the reason and would be the wrong one: the predicate
+///     ends `AND user_decision IS NULL`, so a column nothing writes leaves
+///     every row matching, not none. An index with no reader is dead weight
+///     on every INSERT whether it is empty or full, which is why it goes.
+///   The COLUMNS stay: they are the table's shape, and a fresh cluster whose
+///   `CREATE TABLE` omitted them would diverge structurally from every
+///   installed base.
+/// - the other eight — the live shapes in `schema.pg.sql.generated`, checked
 ///   column by column against everything the owning `database/pg/*.rs`
 ///   module SELECTs, INSERTs or binds.
 ///
@@ -335,32 +340,9 @@ pub const REHOMED_MACHINE_LOCAL_TABLES: [&str; 12] = [
 pub const MACHINE_LOCAL_TABLES_DDL: &str = r#"
 CREATE SCHEMA IF NOT EXISTS project;
 
-CREATE TABLE IF NOT EXISTS project.plans (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    markdown_path   TEXT,
-    version_hash    TEXT,
-    status          TEXT NOT NULL DEFAULT 'draft',
-    title           TEXT,
-    summary         TEXT,
-    slug            TEXT,
-    content         TEXT,
-    authored_by     TEXT,
-    origin_path     TEXT,
-    archive_path    TEXT,
-    metadata        JSONB NOT NULL DEFAULT '{}'::jsonb,
-    ingested_status TEXT,
-    tenant_id       UUID,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_plans_slug
-    ON project.plans (slug) WHERE slug IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_plans_updated_at
-    ON project.plans (updated_at DESC);
-
 CREATE TABLE IF NOT EXISTS project.tasks (
     id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    plan_id                 UUID REFERENCES project.plans(id) ON DELETE CASCADE,
+    plan_id                 UUID,
     plan_version_hash       TEXT,
     phase_name              TEXT,
     sequence_in_phase       INTEGER,
@@ -386,7 +368,6 @@ CREATE TABLE IF NOT EXISTS project.tasks (
         OR (completion_report IS NOT NULL AND completion_source IS NOT NULL)
     )
 );
-CREATE INDEX IF NOT EXISTS idx_tasks_plan ON project.tasks (plan_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON project.tasks (status);
 CREATE INDEX IF NOT EXISTS idx_tasks_assigned_session
     ON project.tasks (assigned_session_id) WHERE assigned_session_id IS NOT NULL;
@@ -399,8 +380,6 @@ CREATE INDEX IF NOT EXISTS idx_tasks_work_unit
     ON project.tasks (work_unit_id) WHERE work_unit_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_emergent_per_session
     ON project.tasks (assigned_session_id) WHERE origin = 'session_emergent';
-CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_plan_identity_hash
-    ON project.tasks (plan_id, identity_hash) WHERE identity_hash IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS project.reviews (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -420,12 +399,6 @@ CREATE INDEX IF NOT EXISTS idx_reviews_task ON project.reviews (task_id);
 CREATE INDEX IF NOT EXISTS idx_reviews_verdict ON project.reviews (verdict);
 CREATE INDEX IF NOT EXISTS idx_reviews_reviewed_session
     ON project.reviews (reviewed_session_id);
-CREATE INDEX IF NOT EXISTS idx_reviews_pending_recommendations
-    ON project.reviews (created_at DESC)
-    WHERE verdict = 'approved'
-      AND confidence >= 0.7
-      AND confidence < 0.85
-      AND user_decision IS NULL;
 
 CREATE TABLE IF NOT EXISTS project.worktrees (
     id            TEXT PRIMARY KEY,
@@ -511,15 +484,6 @@ CREATE INDEX IF NOT EXISTS idx_sfs_session
 CREATE INDEX IF NOT EXISTS idx_sfs_session_file
     ON project.session_file_snapshots (session_id, file_path);
 
-CREATE TABLE IF NOT EXISTS project.coordinator_leader (
-    id           BOOLEAN PRIMARY KEY DEFAULT true,
-    instance_id  TEXT NOT NULL,
-    leased_until TIMESTAMPTZ NOT NULL,
-    acquired_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    renewed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT coordinator_leader_singleton CHECK (id = true)
-);
-
 CREATE TABLE IF NOT EXISTS project.coordinator_decisions (
     id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     session_id       TEXT NOT NULL,
@@ -546,25 +510,6 @@ CREATE INDEX IF NOT EXISTS idx_cd_open_escalations
     WHERE resolved = false
       AND auto_acted = false
       AND action IN ('escalate', 'kill-session', 'force-promote-to-worktree');
-
-CREATE TABLE IF NOT EXISTS project.coordinator_shadow_decisions (
-    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    instance_id      TEXT NOT NULL,
-    iteration        BIGINT NOT NULL,
-    observation_hash TEXT NOT NULL,
-    rule             TEXT NOT NULL,
-    action           TEXT NOT NULL,
-    target_id        TEXT,
-    reasoning        TEXT NOT NULL,
-    would_have_acted BOOLEAN NOT NULL,
-    taken_at         TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_csd_taken_at
-    ON project.coordinator_shadow_decisions (taken_at DESC);
-CREATE INDEX IF NOT EXISTS idx_csd_obs_hash
-    ON project.coordinator_shadow_decisions (observation_hash);
-CREATE INDEX IF NOT EXISTS idx_csd_instance
-    ON project.coordinator_shadow_decisions (instance_id, taken_at DESC);
 "#;
 
 /// The libpq `options` fragment that pins server message text to the C locale.
@@ -1393,8 +1338,13 @@ mod machine_local_schema_tests {
     /// Every `database/pg` module whose SQL was re-homed by P3, paired with
     /// its source text. `include_str!` pins the *shipped* SQL, so this is a
     /// real regression guard and not a restatement of the constant below.
-    const REHOMED_MODULE_SOURCES: [(&str, &str); 12] = [
-        ("plans.rs", include_str!("plans.rs")),
+    ///
+    /// `completion_reports.rs` left this list in Phase 4 of
+    /// `2026-09-12-consolidate-local-orchestration-onto-conductor` although the
+    /// FILE survives: every query in it went with the plan/task board, so what
+    /// remains is the `CompletionReport` wire types and no SQL at all. Pinning
+    /// a module with nothing to pin would assert only over a doc comment.
+    const REHOMED_MODULE_SOURCES: [(&str, &str); 8] = [
         ("tasks.rs", include_str!("tasks.rs")),
         ("reviews.rs", include_str!("reviews.rs")),
         ("worktrees.rs", include_str!("worktrees.rs")),
@@ -1409,20 +1359,8 @@ mod machine_local_schema_tests {
             include_str!("session_file_snapshots.rs"),
         ),
         (
-            "coordinator_leader.rs",
-            include_str!("coordinator_leader.rs"),
-        ),
-        (
             "coordinator_decisions.rs",
             include_str!("coordinator_decisions.rs"),
-        ),
-        (
-            "coordinator_shadow_decisions.rs",
-            include_str!("coordinator_shadow_decisions.rs"),
-        ),
-        (
-            "completion_reports.rs",
-            include_str!("completion_reports.rs"),
         ),
     ];
 
@@ -1507,7 +1445,6 @@ mod machine_local_schema_tests {
                 .find(&format!("CREATE TABLE IF NOT EXISTS project.{} (", t))
                 .unwrap_or_else(|| panic!("missing CREATE TABLE for {}", t))
         };
-        assert!(at("plans") < at("tasks"), "tasks.plan_id references plans");
         assert!(
             at("tasks") < at("reviews"),
             "reviews.task_id references tasks"

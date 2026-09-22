@@ -71,7 +71,9 @@ pub(crate) fn registry() -> &'static Mutex<HashMap<Uuid, AgentDaemons>> {
 /// missing daemon degrades observability/durability, never
 /// correctness.
 pub fn spawn_for_agent(allocate: &AllocateResult, coord_http_base: String, machine_id: Uuid) {
-    let Some(token) = agent_token::from_allocate_result(allocate) else {
+    let Some(token) =
+        agent_token::from_token_parts(&allocate.token, allocate.token_jti, allocate.token_exp)
+    else {
         info!(
             "agent_daemons: agent_id={} — no token in allocation; pusher+poller skipped (dev/no-JWT coord)",
             allocate.agent_id

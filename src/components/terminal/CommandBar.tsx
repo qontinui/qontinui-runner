@@ -53,18 +53,38 @@ import {
   type CommandResult,
   type InterpretMatch,
   type StatusKind,
+  type Resolution,
   renderCommandStatus,
+  resolvedAction,
   getAll,
   interpretCommand,
-  applyDeclaredFlags,
+  bindCommand,
   chooseTier,
   didYouMean,
   matchPattern,
-  parseArgs,
-  unboundTokens,
   resolve,
   subscribe,
 } from "./commands";
+import { noMatchEnterIsInert, tier3Eligible } from "./tier3EnterGate";
+
+/**
+ * How many argument slots the winning tier actually CAPTURED.
+ *
+ * Read off the resolution's own evidence rather than off bound args, so a
+ * click decision cannot depend on what binding later coerced or dropped. The
+ * `slash` arm captures nothing by construction — its evidence is the raw
+ * input, and whether that input carries arguments is the `argsTyped` test.
+ */
+function evidenceCount(resolution: Resolution): number {
+  switch (resolution.kind) {
+    case "pattern":
+      return Object.keys(resolution.groups).length;
+    case "ai":
+      return Object.keys(resolution.modelArgs).length;
+    default:
+      return 0;
+  }
+}
 
 const RECENTS_STORAGE_KEY = "terminal-command-bar-recents";
 const MAX_RECENTS = 6;
@@ -143,9 +163,6 @@ export const COMMAND_BAR_INPUT_ACTIONS: StandardAction[] = [
 // enough to let the operator finish typing a phrase, short enough that
 // they don't feel a lag after they stop.
 const TIER3_DEBOUNCE_MS = 600;
-// Minimum normalized-query length that's "meaningful enough" to spend a
-// subprocess call on. Below this, Tier-1 fuzzy carries the response.
-const TIER3_MIN_CHARS = 3;
 
 const PLACEHOLDER_EXAMPLES = [
   "/spawn-ai 3 best",
@@ -266,6 +283,10 @@ export function CommandBar() {
   // subprocess call is debounced + async, not a pure function of query.
   const [tier3Match, setTier3Match] = useState<InterpretMatch | null>(null);
   const [interpreting, setInterpreting] = useState(false);
+  // The query Tier 3 last ANSWERED for (match or no match). Until it equals
+  // the current query, a Tier-3-eligible line has not been judged by every
+  // tier yet — see the no-match Enter branch.
+  const [tier3SettledFor, setTier3SettledFor] = useState<string | null>(null);
 
   // Re-render when actions register / unregister.
   useRegistrySnapshot();
@@ -320,9 +341,11 @@ export function CommandBar() {
   // that the resolver cannot be tested against.
   //
   // When a higher tier wins, its action is filtered out of Tier 1's list so
-  // the dropdown doesn't show the same row twice. Pre-parsed args from that
-  // tier (regex named groups for Tier 2, model output for Tier 3) ride on
-  // the match as `presetArgs`.
+  // the dropdown doesn't show the same row twice. What rides on each row is
+  // the RESOLUTION — which tier owns it and what that tier observed (regex
+  // groups for Tier 2, the model's own JSON for Tier 3, nothing at all for
+  // Tier 1, whose evidence is the raw input). Never bound arguments:
+  // `bindCommand` is the one place those are built.
   const matches = useMemo(() => {
     type LocalMatch = {
       action: CommandAction;
@@ -331,8 +354,13 @@ export function CommandBar() {
       literal: boolean;
       recent: boolean;
       indices: number[];
-      /** Pre-extracted args from Tier-2 / Tier-3. Bypasses parseArgs. */
-      presetArgs?: Record<string, unknown>;
+      /**
+       * WHICH TIER owns this row and WHAT IT SAW. Enter hands this straight
+       * to `bindCommand` — the row carries evidence, never bound arguments,
+       * so there is no longer a field whose `undefined` doubles as a route
+       * tag (`commands/bind.ts`).
+       */
+      resolution: Resolution;
       /** Source tier — surfaces in the dropdown so operators can
        *  sanity-check the AI hit before pressing Enter. */
       tier?: "ai";
@@ -340,28 +368,30 @@ export function CommandBar() {
       confidence?: number;
     };
     const tier1 = resolve(query, recents);
+    // A Tier-1 row binds from the raw input; that IS its evidence.
+    const fromTier1 = (m: (typeof tier1)[number]): LocalMatch => ({
+      ...m,
+      resolution: { kind: "slash", action: m.action, literal: m.literal },
+    });
     const { head } = chooseTier(tier1, matchPattern(query), tier3Match);
-    const headMatch: LocalMatch | null = head
-      ? {
-          action: head.action,
-          exact: true,
-          literal: false,
-          recent: recents.includes(head.action.id),
-          indices: [],
-          presetArgs: head.presetArgs,
-          tier: head.tier === "ai" ? "ai" : undefined,
-          confidence: head.confidence,
-        }
-      : null;
+    if (head.kind === "none") return tier1.map(fromTier1);
 
-    if (!headMatch) return tier1 as LocalMatch[];
+    const headMatch: LocalMatch = {
+      action: head.action,
+      exact: true,
+      literal: false,
+      recent: recents.includes(head.action.id),
+      indices: [],
+      resolution: head,
+      tier: head.kind === "ai" ? "ai" : undefined,
+      confidence: head.kind === "ai" ? head.confidence : undefined,
+    };
 
     // Filter the lower tier(s) so the dropdown shows the head match
-    // once, not twice. Cast the spread to `LocalMatch[]` so the
-    // optional `tier` / `confidence` fields are reachable downstream.
+    // once, not twice.
     return [
       headMatch,
-      ...(tier1.filter((m) => m.action.id !== headMatch.action.id) as LocalMatch[]),
+      ...tier1.filter((m) => m.action.id !== headMatch.action.id).map(fromTier1),
     ];
   }, [query, recents, tier3Match]);
 
@@ -371,20 +401,17 @@ export function CommandBar() {
   // meaningful, fire the claude subprocess. Result lands in
   // `tier3Match` and prepends to the dropdown above.
   useEffect(() => {
-    const trimmed = query.trim();
     // Clear any previous result whenever the query changes — operator
     // is mid-typing or starting over, the prior Tier-3 hit no longer
-    // applies.
+    // applies. `tier3SettledFor` too: "settled" belongs to one RUN, not to a
+    // string — a line recalled from history, or edited away and back, is
+    // awaiting a fresh answer and must not read as already judged.
     setTier3Match(null);
+    setTier3SettledFor(null);
 
-    if (trimmed.length < TIER3_MIN_CHARS) {
-      setInterpreting(false);
-      return;
-    }
-    // Skip if Tier-1 / Tier-2 already nailed it — Tier-3 would burn a
-    // subprocess on a query that's already resolved.
-    const tier1Exact = resolve(query, recents).find((m) => m.exact);
-    if (tier1Exact || matchPattern(query)) {
+    // Skip below the length floor, and when Tier-1 / Tier-2 already nailed
+    // it — Tier-3 would burn a subprocess on a query that's already resolved.
+    if (!tier3Eligible(query, recents)) {
       setInterpreting(false);
       return;
     }
@@ -394,11 +421,14 @@ export function CommandBar() {
       setInterpreting(true);
       try {
         const result = await interpretCommand(query, { signal: controller.signal });
-        if (!controller.signal.aborted) {
-          setTier3Match(result);
-        }
+        if (!controller.signal.aborted) setTier3Match(result);
       } finally {
-        if (!controller.signal.aborted) setInterpreting(false);
+        if (!controller.signal.aborted) {
+          setInterpreting(false);
+          // Settled on a throw too, or a failed call would leave Enter inert
+          // on this line for good.
+          setTier3SettledFor(query);
+        }
       }
     }, TIER3_DEBOUNCE_MS);
 
@@ -471,67 +501,48 @@ export function CommandBar() {
   }, []);
 
   const execute = useCallback(
-    async (
-      action: CommandAction,
-      rawInput: string,
-      presetArgs?: Record<string, unknown>,
-      tier?: "ai",
-    ) => {
+    async (resolution: Resolution, rawInput: string) => {
+      // BIND FIRST. `bindCommand` is the single consumer of a resolution and
+      // the only place arguments are built, so `execute` no longer knows what
+      // a tier is — it runs what binding produced, or paints what binding
+      // refused. Four symmetric arms in, one arg bag out.
+      //
+      // Every route now gets, in one place: per-value coercion (Tier 1 had it
+      // per token, Tier 2 per regex group, Tier 3 had NOTHING and handed the
+      // model's raw JSON to handlers), declared-flag extraction, and the
+      // arity gate. The gate used to sit below this call behind a
+      // preset-args branch, i.e. on the slash route only, on a justification
+      // that held for Tier 2 and not for Tier 3 — see `commands/bind.ts`.
+      const bound = bindCommand(resolution, rawInput);
       // The previous verdict is retired the moment a new command runs —
       // that, not a timer, is what bounds the status line's lifetime.
       setStatus(null);
+      // BEFORE the `none` bail-out, not after. Recording only what resolved is
+      // what made `persistHistory`'s "a typo is exactly what you want back"
+      // false for the typo class; the Enter path above closes the same gap on
+      // the other side of this function.
       persistHistory(rawInput);
       setHistoryIdx(-1);
-      // Tier-2 / Tier-3 hits arrive with args already extracted (regex
-      // named groups for Tier-2, model output for Tier-3); use them
-      // verbatim rather than re-parsing positionally (positional parse
-      // on "spawn 3 best" against /spawn's 1-field schema would silently
-      // mis-bind).
-      //
-      // `applyDeclaredFlags` then runs on EVERY route, not just the slash
-      // one. Flag extraction used to be a property of `parseArgs`, which
-      // made it a property of the route that calls `parseArgs` — so a
-      // Tier-2 pattern ending in `.+` swallowed `/spawn-ai`'s declared
-      // `--tenant` and the handler's tenant guard never ran. Any future
-      // declared flag would have inherited that silently; it is a
-      // route-independent step now so it cannot.
-      // `origin` is load-bearing, not bookkeeping: the parsed bag was built
-      // from the raw input with its quoting intact, so re-scanning its string
-      // fields can only destroy information (it deleted words out of a quoted
-      // prompt — `parse.ts::applyDeclaredFlags`). A preset bag never saw the
-      // schema and still carries raw text, so it gets the full treatment.
-      const preset = presetArgs !== undefined;
-      const args = applyDeclaredFlags(
-        preset ? presetArgs : parseArgs(rawInput, action),
-        rawInput,
-        action,
-        preset ? "preset" : "parsed",
-      );
+      if (!bound) return;
+      const { action, args } = bound;
       // A Tier-2 phrasing the literal slash outranked because it names a
       // COSTLY (or destructive) neighbour. The protection stays — `/spawn`
       // must not launch paid sessions — but it stops being a dead end: every
       // failure verdict below names the command that would have run.
       const hint = didYouMean(rawInput, action, matchPattern(rawInput));
       const withHint = (text: string): string => (hint ? `${text} — ${hint}` : text);
-      // Trailing junk on a no-argument command. Only the SLASH route can
-      // carry it — Tier-2/Tier-3 arrive with `presetArgs` already bound —
-      // and only for an empty schema, where `parseArgs`'s catch-all is
-      // guarded off and quietly discards every token. `/mute please stop`
-      // used to render `/mute ✓`.
-      if (!presetArgs) {
-        const extra = unboundTokens(rawInput, action);
-        if (extra.length > 0) {
-          setStatus({
-            kind: "error",
-            text: withHint(`${action.slash}: takes no arguments (got "${extra.join(" ")}")`),
-          });
-          return;
-        }
+      // Arguments this action cannot take, on ANY route: trailing junk on an
+      // empty schema (`/mute please stop`), a key no `paramSchema` declares,
+      // or a value that is not text or a number. Refused BEFORE the handler,
+      // which is the last point at which it is still cheap.
+      if (bound.refusal !== null) {
+        setStatus({ kind: "error", text: withHint(bound.refusal) });
+        return;
       }
       let result: CommandResult;
       try {
         result = await action.handler(args, {
-          source: tier === "ai" ? "ai" : "slash",
+          source: resolution.kind === "ai" ? "ai" : "slash",
         });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -622,8 +633,40 @@ export function CommandBar() {
       if (e.key === "Enter") {
         e.preventDefault();
         if (selectedMatch) {
-          void execute(selectedMatch.action, query, selectedMatch.presetArgs, selectedMatch.tier);
+          void execute(selectedMatch.resolution, query);
+          return;
         }
+        // NO MATCH — and this is the commonest typo there is.
+        //
+        // `persistHistory`'s own comment says "Failed runs are recorded too —
+        // a typo is exactly what you want back", and it was false for the one
+        // case it names. A run that resolves and then fails IS recorded, but a
+        // line that matches nothing never reached `execute` at all: Enter with
+        // `selectedMatch === null` did nothing, silently, and ArrowUp could not
+        // recall the misspelling to fix a character of it. The claim is now
+        // true on both paths.
+        const typed = query.trim();
+        if (!typed) return;
+        // …but not while Tier 3 has yet to answer for this very line: during
+        // the debounce window or the subprocess call, "no match" is a verdict
+        // from two of three tiers, and the AI match can land under the error a
+        // moment later. Enter stays inert there, as it always was.
+        if (
+          noMatchEnterIsInert({
+            query,
+            interpreting,
+            eligible: tier3Eligible(query, recents),
+            settledFor: tier3SettledFor,
+          })
+        ) {
+          return;
+        }
+        persistHistory(query);
+        setHistoryIdx(-1);
+        setStatus({
+          kind: "error",
+          text: `No command matches "${typed}" — press Ctrl+Shift+K to browse, or ArrowUp to edit it.`,
+        });
         return;
       }
       if (e.key === "Escape") {
@@ -637,7 +680,19 @@ export function CommandBar() {
         return;
       }
     },
-    [matches.length, query, selectedMatch, execute, history, historyIdx, historyMode],
+    [
+      matches.length,
+      query,
+      selectedMatch,
+      execute,
+      history,
+      historyIdx,
+      historyMode,
+      persistHistory,
+      interpreting,
+      recents,
+      tier3SettledFor,
+    ],
   );
 
   // Typing anything by hand leaves history-browsing mode — the recalled
@@ -650,21 +705,23 @@ export function CommandBar() {
   }, []);
 
   const handleSuggestionClick = useCallback(
-    (action: CommandAction, presetArgs?: Record<string, unknown>, tier?: "ai") => {
+    (resolution: Resolution) => {
+      const action = resolvedAction(resolution);
+      if (!action) return;
       // If the user clicks an action that takes args and they haven't typed
-      // any AND we didn't pattern-match preset args, populate the input
+      // any AND the winning tier saw no arguments either, populate the input
       // rather than executing — they probably wanted to fill in the args.
       //
-      // "Pattern-matched preset args" means args the pattern actually BOUND,
-      // not merely that a pattern matched. Since a literal slash now yields
-      // to its own Tier-2 pattern (`rank.ts::chooseTier`), a bare `/close`
-      // arrives here with `presetArgs: {}` — the zone group is optional and
-      // matched nothing. Reading that as "the pattern filled the args in"
-      // turned a CLICK on the `/close` row from "prefill `/close ` so I can
-      // name a zone" into "close the focused zone now".
+      // "The tier saw arguments" means it CAPTURED something, not merely that
+      // it matched. Since a literal slash now yields to its own Tier-2 pattern
+      // (`rank.ts::chooseTier`), a bare `/close` arrives here with zero groups
+      // — the zone group is optional and matched nothing. Reading that as "the
+      // pattern filled the args in" turned a CLICK on the `/close` row from
+      // "prefill `/close ` so I can name a zone" into "close the focused zone
+      // now".
       const hasArgs = action.paramSchema && Object.keys(action.paramSchema).length > 0;
       const argsTyped = query.trim().length > action.slash.length;
-      const presetBound = presetArgs !== undefined && Object.keys(presetArgs).length > 0;
+      const presetBound = evidenceCount(resolution) > 0;
       if (hasArgs && !argsTyped && !presetBound) {
         // No `setSelectedIdx(idx)` here: `idx` indexes the list built for
         // the OLD query, and the new query (`/slash `) is an exact hit
@@ -674,7 +731,7 @@ export function CommandBar() {
         inputRef.current?.focus();
         return;
       }
-      void execute(action, query.trim().length > 0 ? query : action.slash, presetArgs, tier);
+      void execute(resolution, query.trim().length > 0 ? query : action.slash);
     },
     [execute, query],
   );
@@ -726,6 +783,19 @@ export function CommandBar() {
   // arrives, and removes the `dispatchEvent(FocusEvent('focus'))`
   // workaround from on-page slash tests.
   const dropdownVisible = (focused || query.trim().length > 0) && matches.length >= 0;
+
+  /**
+   * Whether a LISTBOX is actually on screen — which is not the same thing as
+   * whether the dropdown panel is.
+   *
+   * With zero matches the panel renders a "No match — press Ctrl+Shift+K"
+   * hint and no `role="listbox"` at all. `aria-expanded` was nonetheless bound
+   * to `dropdownVisible`, so a screen reader was told the combobox was
+   * EXPANDED while `aria-controls` was simultaneously withheld: announced as
+   * "expanded", with nothing to navigate to and no popup id to follow. The two
+   * attributes describe one fact and must be computed from one value.
+   */
+  const listboxVisible = dropdownVisible && matches.length > 0;
 
   return (
     <div data-page-element="command-bar" className="relative z-40 w-full shrink-0">
@@ -837,7 +907,7 @@ export function CommandBar() {
                         value={m.action.slash}
                         type="button"
                         onMouseDown={(e) => e.preventDefault() /* keep input focus */}
-                        onClick={() => handleSuggestionClick(m.action, m.presetArgs, m.tier)}
+                        onClick={() => handleSuggestionClick(m.resolution)}
                         onMouseEnter={() => setSelectedIdx(idx)}
                         className={`w-full flex items-center gap-2 px-3 py-1 text-[11px] text-left transition-colors ${
                           idx === selectedIdx
@@ -923,11 +993,11 @@ export function CommandBar() {
           // snapshot's `accessibleName` resolve on this too.
           aria-label="Terminal command bar"
           role="combobox"
-          aria-expanded={dropdownVisible}
+          aria-expanded={listboxVisible}
           aria-autocomplete="list"
-          aria-controls={dropdownVisible && matches.length > 0 ? LISTBOX_ID : undefined}
+          aria-controls={listboxVisible ? LISTBOX_ID : undefined}
           aria-activedescendant={
-            dropdownVisible && selectedMatch ? optionId(selectedMatch.action.id) : undefined
+            listboxVisible && selectedMatch ? optionId(selectedMatch.action.id) : undefined
           }
           placeholder={placeholder}
           spellCheck={false}

@@ -278,8 +278,6 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     "POST /steward/{kind}/start",
     "POST /prompts/run",
     "POST /task-runs/session",
-    "POST /coordinator/act",
-    "POST /coordinator/dispatch-action",
     "POST /orchestration-loop/*",
     "POST /worktrees/*",
     "POST /session-recap/analyze",

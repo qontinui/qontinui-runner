@@ -316,10 +316,135 @@ impl ScheduledTaskExt for ScheduledTask {
 // Schedule Computation
 // ============================================================================
 
-/// Compute the next run time for a schedule expression
+/// The zone a `Cron` schedule expression is evaluated in.
+///
+/// Plan `2026-09-13-nightly-return-to-main-sweep`, Phase 5a. Until this type
+/// existed both cron sites — [`compute_next_run`] and the reconciler's slot
+/// walk — evaluated the expression in `Utc` and ignored
+/// `SchedulerSettings::timezone` entirely, so a task written `20 4 * * *` on a
+/// UTC+2 box fired at 06:20 local (Phase 0.3 measured `nextRun
+/// 2026-09-14T04:20:00+00:00` for exactly that expression), and a `timezone`
+/// the operator set was read by nothing.
+///
+/// `SchedulerSettings::timezone` is documented as *"IANA name; `None` = local
+/// time"*, and that is what this type implements: [`Self::from_setting`] maps
+/// `None` to [`Self::Local`], an explicit `"UTC"` / `"Local"` to the matching
+/// variant, and any other string to a parsed IANA zone. The same spellings the
+/// trigger system's schedule watcher accepts.
+///
+/// DST is the cron crate's, not ours: a slot that falls in a spring-forward
+/// gap is SKIPPED (the local time does not exist), and an ambiguous fall-back
+/// slot yields both instants. `20 4 * * *` sits outside both transitions, so
+/// the nightly job fires once at 04:20 local on every night of the year — and
+/// at a DIFFERENT UTC instant on either side of a transition, which is the
+/// point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduleZone {
+    /// Coordinated universal time — the pre-5a behaviour, now opt-in.
+    Utc,
+    /// The device's local zone: `SchedulerSettings::timezone == None`.
+    Local,
+    /// An explicit IANA zone from `SchedulerSettings::timezone`.
+    Named(chrono_tz::Tz),
+}
+
+impl ScheduleZone {
+    /// Parse a `SchedulerSettings::timezone` value. `"UTC"` / `"UTC+0"` and
+    /// `"Local"` are matched case-insensitively; anything else must be an IANA
+    /// name (`Europe/Berlin`, `America/New_York`). Blank is refused rather than
+    /// read as local, so a settings write cannot store a value that means
+    /// nothing.
+    pub fn parse(name: &str) -> Result<Self, String> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(
+                "timezone is blank — omit it for local time, or name an IANA zone".to_string(),
+            );
+        }
+        if trimmed.eq_ignore_ascii_case("utc") || trimmed.eq_ignore_ascii_case("utc+0") {
+            return Ok(Self::Utc);
+        }
+        if trimmed.eq_ignore_ascii_case("local") {
+            return Ok(Self::Local);
+        }
+        trimmed.parse::<chrono_tz::Tz>().map(Self::Named).map_err(|_| {
+            format!(
+                "unknown timezone '{trimmed}' — use 'UTC', 'Local', or an IANA name such as 'Europe/Berlin'"
+            )
+        })
+    }
+
+    /// The zone the scheduler runs in, from the stored setting. `None` is
+    /// local time by contract. A stored value that does not parse (possible
+    /// only for a row written before `update_scheduler_settings` validated it)
+    /// falls back to local time with a warning rather than wedging every
+    /// task's next-run computation.
+    pub fn from_setting(setting: Option<&str>) -> Self {
+        match setting {
+            None => Self::Local,
+            Some(s) => match Self::parse(s) {
+                Ok(z) => z,
+                Err(e) => {
+                    tracing::warn!("scheduler: settings.timezone unusable ({e}); evaluating cron in local time");
+                    Self::Local
+                }
+            },
+        }
+    }
+
+    /// The zone from a whole `SchedulerSettings` row.
+    pub fn from_settings(settings: &SchedulerSettings) -> Self {
+        Self::from_setting(settings.timezone.as_deref())
+    }
+}
+
+/// Normalize a standard 5-field cron (min hr dom mon dow) to the crate's
+/// 6-field form by prepending `0` for seconds; 6- and 7-field expressions pass
+/// through. Shared by [`compute_next_run`] and the reconciler's slot walk so
+/// the two cannot disagree about what a slot is.
+pub fn normalize_cron(cron_expr: &str) -> String {
+    if cron_expr.split_whitespace().count() == 5 {
+        format!("0 {cron_expr}")
+    } else {
+        cron_expr.to_string()
+    }
+}
+
+/// Every cron instant strictly after `from`, in `zone`, as UTC. The iterator
+/// is unbounded for a repeating expression — callers take what they need.
+pub fn cron_after(
+    cron_expr: &str,
+    from: chrono::DateTime<chrono::Utc>,
+    zone: ScheduleZone,
+) -> Option<Box<dyn Iterator<Item = chrono::DateTime<chrono::Utc>>>> {
+    use cron::Schedule;
+    use std::str::FromStr;
+
+    let schedule = Schedule::from_str(&normalize_cron(cron_expr)).ok()?;
+    // `after` excludes `from` itself, in every zone.
+    let iter: Box<dyn Iterator<Item = chrono::DateTime<chrono::Utc>>> = match zone {
+        ScheduleZone::Utc => Box::new(schedule.after_owned(from)),
+        ScheduleZone::Local => Box::new(
+            schedule
+                .after_owned(from.with_timezone(&chrono::Local))
+                .map(|dt| dt.with_timezone(&chrono::Utc)),
+        ),
+        ScheduleZone::Named(tz) => Box::new(
+            schedule
+                .after_owned(from.with_timezone(&tz))
+                .map(|dt| dt.with_timezone(&chrono::Utc)),
+        ),
+    };
+    Some(iter)
+}
+
+/// Compute the next run time for a schedule expression, evaluating a `Cron`
+/// expression in `zone` (see [`ScheduleZone`]). `Once`, `Interval` and
+/// `Condition` carry their own instant and ignore the zone.
 pub fn compute_next_run(
     schedule: &ScheduleExpression,
     from: chrono::DateTime<chrono::Utc>,
+    zone: ScheduleZone,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
     match schedule {
         ScheduleExpression::Once(datetime_str) => {
@@ -329,22 +454,7 @@ pub fn compute_next_run(
                 .map(|dt| dt.with_timezone(&chrono::Utc))
                 .filter(|dt| *dt > from)
         }
-        ScheduleExpression::Cron(cron_expr) => {
-            // Use the cron crate to compute next run (requires 6 or 7 field expressions).
-            // Auto-normalize standard 5-field cron (min hr dom mon dow) by prepending "0" for seconds.
-            use cron::Schedule;
-            use std::str::FromStr;
-
-            let normalized = if cron_expr.split_whitespace().count() == 5 {
-                format!("0 {}", cron_expr)
-            } else {
-                cron_expr.clone()
-            };
-
-            Schedule::from_str(&normalized)
-                .ok()
-                .and_then(|schedule| schedule.after(&from).next())
-        }
+        ScheduleExpression::Cron(cron_expr) => cron_after(cron_expr, from, zone)?.next(),
         ScheduleExpression::Interval(seconds) => {
             // Next run is from + interval
             Some(from + chrono::Duration::seconds(*seconds as i64))
@@ -366,7 +476,7 @@ mod tests {
         // Test daily at 9 AM (6-field with seconds)
         let schedule = ScheduleExpression::Cron("0 0 9 * * *".to_string());
         let now = chrono::Utc::now();
-        let next = compute_next_run(&schedule, now);
+        let next = compute_next_run(&schedule, now, ScheduleZone::Utc);
         assert!(next.is_some());
     }
 
@@ -375,7 +485,7 @@ mod tests {
         // Standard 5-field cron (no seconds) should be auto-normalized
         let schedule = ScheduleExpression::Cron("0 3 * * *".to_string());
         let now = chrono::Utc::now();
-        let next = compute_next_run(&schedule, now);
+        let next = compute_next_run(&schedule, now, ScheduleZone::Utc);
         assert!(
             next.is_some(),
             "5-field cron '0 3 * * *' should be normalized and parsed"
@@ -386,7 +496,7 @@ mod tests {
     fn test_interval_schedule() {
         let schedule = ScheduleExpression::Interval(3600); // 1 hour
         let now = chrono::Utc::now();
-        let next = compute_next_run(&schedule, now);
+        let next = compute_next_run(&schedule, now, ScheduleZone::Utc);
         assert!(next.is_some());
         assert!(next.unwrap() > now);
     }
@@ -396,7 +506,7 @@ mod tests {
         let future = chrono::Utc::now() + chrono::Duration::hours(1);
         let schedule = ScheduleExpression::Once(future.to_rfc3339());
         let now = chrono::Utc::now();
-        let next = compute_next_run(&schedule, now);
+        let next = compute_next_run(&schedule, now, ScheduleZone::Utc);
         assert!(next.is_some());
     }
 
@@ -405,8 +515,112 @@ mod tests {
         let past = chrono::Utc::now() - chrono::Duration::hours(1);
         let schedule = ScheduleExpression::Once(past.to_rfc3339());
         let now = chrono::Utc::now();
-        let next = compute_next_run(&schedule, now);
+        let next = compute_next_run(&schedule, now, ScheduleZone::Utc);
         assert!(next.is_none());
+    }
+
+    fn utc(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .expect("rfc3339")
+            .with_timezone(&chrono::Utc)
+    }
+    const BERLIN: ScheduleZone = ScheduleZone::Named(chrono_tz::Europe::Berlin);
+    fn nightly() -> ScheduleExpression {
+        ScheduleExpression::Cron("20 4 * * *".to_string())
+    }
+
+    /// Phase 0.3's measured defect, pinned in the other direction: 04:20 local
+    /// in Berlin is 03:20Z under CET and 02:20Z under CEST — the two sides of
+    /// the 2026-03-29 spring-forward.
+    #[test]
+    fn cron_0420_local_across_spring_forward() {
+        assert_eq!(
+            compute_next_run(&nightly(), utc("2026-03-27T12:00:00Z"), BERLIN),
+            Some(utc("2026-03-28T03:20:00Z"))
+        );
+        assert_eq!(
+            compute_next_run(&nightly(), utc("2026-03-28T12:00:00Z"), BERLIN),
+            Some(utc("2026-03-29T02:20:00Z"))
+        );
+    }
+
+    #[test]
+    fn cron_0420_local_across_fall_back() {
+        // CEST -> CET at 2026-10-25 01:00Z.
+        assert_eq!(
+            compute_next_run(&nightly(), utc("2026-10-23T12:00:00Z"), BERLIN),
+            Some(utc("2026-10-24T02:20:00Z"))
+        );
+        assert_eq!(
+            compute_next_run(&nightly(), utc("2026-10-24T12:00:00Z"), BERLIN),
+            Some(utc("2026-10-25T03:20:00Z"))
+        );
+    }
+
+    #[test]
+    fn cron_in_an_explicit_iana_zone_west_of_utc() {
+        let ny = ScheduleZone::Named(chrono_tz::America::New_York);
+        // EDT is UTC-4: 04:20 local = 08:20Z.
+        assert_eq!(
+            compute_next_run(&nightly(), utc("2026-07-01T12:00:00Z"), ny),
+            Some(utc("2026-07-02T08:20:00Z"))
+        );
+    }
+
+    #[test]
+    fn cron_utc_zone_is_the_pre_5a_reading() {
+        assert_eq!(
+            compute_next_run(&nightly(), utc("2026-03-28T12:00:00Z"), ScheduleZone::Utc),
+            Some(utc("2026-03-29T04:20:00Z"))
+        );
+    }
+
+    #[test]
+    fn a_slot_inside_the_spring_gap_is_skipped_not_invented() {
+        // 02:30 local does not exist on 2026-03-29 in Berlin; the next real
+        // 02:30 CEST is on the 30th, at 00:30Z.
+        let s = ScheduleExpression::Cron("30 2 * * *".to_string());
+        assert_eq!(
+            compute_next_run(&s, utc("2026-03-28T12:00:00Z"), BERLIN),
+            Some(utc("2026-03-30T00:30:00Z"))
+        );
+    }
+
+    #[test]
+    fn local_zone_agrees_with_chrono_local() {
+        // Whatever this box's zone is, Local must produce the same instant
+        // chrono::Local does for the same wall-clock slot.
+        let from = utc("2026-06-10T00:00:00Z");
+        let got = compute_next_run(&nightly(), from, ScheduleZone::Local).expect("next");
+        let local = got.with_timezone(&chrono::Local);
+        assert_eq!((local.format("%H:%M").to_string()), "04:20");
+        assert!(got > from);
+    }
+
+    #[test]
+    fn zone_parse_accepts_utc_local_iana_and_refuses_junk() {
+        assert_eq!(ScheduleZone::parse("UTC"), Ok(ScheduleZone::Utc));
+        assert_eq!(ScheduleZone::parse(" utc+0 "), Ok(ScheduleZone::Utc));
+        assert_eq!(ScheduleZone::parse("local"), Ok(ScheduleZone::Local));
+        assert_eq!(
+            ScheduleZone::parse("America/New_York"),
+            Ok(ScheduleZone::Named(chrono_tz::America::New_York))
+        );
+        assert!(ScheduleZone::parse("Mars/Olympus").is_err());
+        assert!(ScheduleZone::parse("   ").is_err());
+        assert_eq!(ScheduleZone::from_setting(None), ScheduleZone::Local);
+        assert_eq!(
+            ScheduleZone::from_setting(Some("Mars/Olympus")),
+            ScheduleZone::Local
+        );
+        assert_eq!(ScheduleZone::from_setting(Some("Europe/Berlin")), BERLIN);
+    }
+
+    #[test]
+    fn normalize_cron_prepends_seconds_only_to_five_fields() {
+        assert_eq!(normalize_cron("20 4 * * *"), "0 20 4 * * *");
+        assert_eq!(normalize_cron("0 20 4 * * *"), "0 20 4 * * *");
+        assert_eq!(normalize_cron("0 20 4 * * * 2026"), "0 20 4 * * * 2026");
     }
 
     /// Build a default ScheduledTask suitable for backoff tests.

@@ -137,6 +137,19 @@ impl ChildTreeGuard {
     /// callers that care do not depend on the guard for correctness.
     pub fn attach(child: &std::process::Child) -> Self {
         use std::os::windows::io::AsRawHandle;
+        Self::attach_raw(child.as_raw_handle())
+    }
+
+    /// [`Self::attach`] for a `tokio::process::Child`. A tokio child whose
+    /// handle is already gone (it exited and was reaped) attaches nothing.
+    pub fn attach_tokio(child: &tokio::process::Child) -> Self {
+        match child.raw_handle() {
+            Some(h) => Self::attach_raw(h),
+            None => Self(None),
+        }
+    }
+
+    fn attach_raw(handle: std::os::windows::io::RawHandle) -> Self {
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
@@ -162,7 +175,7 @@ impl ChildTreeGuard {
                 CloseHandle(job);
                 return Self(None);
             }
-            if AssignProcessToJobObject(job, child.as_raw_handle() as _) == 0 {
+            if AssignProcessToJobObject(job, handle as _) == 0 {
                 // Closing an EMPTY kill-on-close job kills nothing, so this is a
                 // clean degrade rather than a half-armed guard.
                 CloseHandle(job);
@@ -176,6 +189,15 @@ impl ChildTreeGuard {
     /// Windows that is exactly [`Self::attach`].
     pub fn attach_armed(child: &std::process::Child) -> Self {
         Self::attach(child)
+    }
+
+    /// Pre-spawn half for a `tokio::process::Command`. No-op on Windows, as
+    /// [`Self::arm`] is.
+    pub fn arm_tokio(_cmd: &mut tokio::process::Command) {}
+
+    /// [`Self::attach_armed`] for a `tokio::process::Child`.
+    pub fn attach_armed_tokio(child: &tokio::process::Child) -> Self {
+        Self::attach_tokio(child)
     }
 
     /// Release the tree WITHOUT killing it.
@@ -244,6 +266,12 @@ impl ChildTreeGuard {
         cmd.process_group(0);
     }
 
+    /// [`Self::arm`] for a `tokio::process::Command` — the same `setpgid(0, 0)`
+    /// between fork and exec.
+    pub fn arm_tokio(cmd: &mut tokio::process::Command) {
+        cmd.process_group(0);
+    }
+
     /// No-op: without [`Self::arm`] the child shares OUR process group, and
     /// `killpg` on it would signal this process. Nothing is attached and
     /// nothing is reaped — exactly the previous behaviour.
@@ -251,10 +279,27 @@ impl ChildTreeGuard {
         Self(None)
     }
 
+    /// [`Self::attach`] for a `tokio::process::Child` — the same no-op, so a
+    /// caller compiles on every platform.
+    pub fn attach_tokio(_child: &tokio::process::Child) -> Self {
+        Self(None)
+    }
+
     /// Post-spawn form for an [`Self::arm`]ed command: the child *is* its
     /// group leader, so its pid doubles as the pgid.
     pub fn attach_armed(child: &std::process::Child) -> Self {
         Self(i32::try_from(child.id()).ok().filter(|pgid| *pgid > 1))
+    }
+
+    /// [`Self::attach_armed`] for a `tokio::process::Child`; a child that has
+    /// already been reaped (`id()` is `None`) attaches nothing.
+    pub fn attach_armed_tokio(child: &tokio::process::Child) -> Self {
+        Self(
+            child
+                .id()
+                .and_then(|pid| i32::try_from(pid).ok())
+                .filter(|pgid| *pgid > 1),
+        )
     }
 
     /// Release the group WITHOUT killing it.
@@ -2173,6 +2218,84 @@ mod timeout_tests {
             !pid_alive(server),
             "the process group was not reaped: pid {server} survived a bounded run"
         );
+    }
+
+    /// The tokio twins are what the scheduler's RemoteAgent timeout uses
+    /// (`scheduler_remote_agent`), and they are a separate code path from the
+    /// std pair above: `arm_tokio` on a `tokio::process::Command`,
+    /// `attach_armed_tokio` off a `tokio::process::Child`. A grandchild that
+    /// survives the guard's drop is exactly the orphaned `bash`/`git` the
+    /// round-1 review of that plan named.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_the_tokio_tree_guard_reaps_the_grandchild() {
+        let _serial = GAUGE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pidfile = dir.path().join("server.pid");
+
+        let mut cmd = tokio_no_window("sh");
+        cmd.args([
+            "-c",
+            &format!(
+                "sleep 30 & echo $! > '{}'; exec sleep 30",
+                pidfile.display()
+            ),
+        ]);
+        ChildTreeGuard::arm_tokio(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn");
+        let tree = ChildTreeGuard::attach_armed_tokio(&child);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pidfile.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let grandchild = read_pid(&pidfile);
+        assert!(
+            pid_alive(grandchild),
+            "fixture: the grandchild must be running before the kill"
+        );
+
+        drop(tree);
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pid_alive(grandchild) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !pid_alive(grandchild),
+            "the process group was not reaped: grandchild pid {grandchild} survived the guard's drop"
+        );
+    }
+
+    /// And the control: `disarm` releases the group, so a clean end kills
+    /// nothing the child left behind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disarming_the_tokio_tree_guard_leaves_the_grandchild_alone() {
+        let _serial = GAUGE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pidfile = dir.path().join("server.pid");
+
+        let mut cmd = tokio_no_window("sh");
+        cmd.args([
+            "-c",
+            &format!("sleep 30 & echo $! > '{}'", pidfile.display()),
+        ]);
+        ChildTreeGuard::arm_tokio(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn");
+        let tree = ChildTreeGuard::attach_armed_tokio(&child);
+        let _ = child.wait().await;
+        let grandchild = read_pid(&pidfile);
+        tree.disarm();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            pid_alive(grandchild),
+            "disarm must release, not reap: pid {grandchild} died"
+        );
+        // Clean up the fixture's survivor ourselves.
+        unsafe { libc::kill(grandchild, libc::SIGKILL) };
     }
 
     // ── EINTR regression (2026-08-30 round-3 review, HIGH) ──────────────────

@@ -702,6 +702,7 @@ fn fetch_skills_blocking(base_url: &str) -> FetchOutcome {
         .spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
+                .thread_name("skillfetch-rt")
                 .build()
             {
                 Ok(rt) => rt,

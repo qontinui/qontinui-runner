@@ -24,11 +24,9 @@ pub mod state;
 pub mod tool_policy_args;
 pub mod trust_gate;
 pub mod worker_message;
-pub mod worker_session;
 pub mod workspace_trust;
 pub mod writer;
 
 pub use manager::SessionManager;
 pub use session::ClaudeSession;
 pub use state::SessionState;
-pub use worker_session::WorkerSession;

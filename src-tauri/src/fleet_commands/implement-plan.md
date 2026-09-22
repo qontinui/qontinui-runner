@@ -414,11 +414,16 @@ Do all four (they're fast and independent):
    work while I was building?"* needs a **starting point**, and nothing in this
    fleet recorded one before this (verified 2026-09-05: no `baseline_sha` /
    `session_start_sha` / `base_sha` anywhere in `scripts/` or `.claude/`). A
-   probe with no baseline is not a weaker probe; it is no probe. **Record once
-   per session**: `record` overwrites the baseline unconditionally, so if
-   `/preflight` step 4b already recorded one this session
-   (`test -f ~/.qontinui/landed-since/<session-id>.json`), skip it here — a
-   second record moves the start forward past whatever landed between. Exit `3` means, e.g.,
+   probe with no baseline is not a weaker probe; it is no probe. **Record here
+   even if `/preflight` step 4b already recorded this session**: `record`
+   MERGES — a repo already in the baseline keeps its sha (a baseline never
+   moves forward past what a peer landed in between), a repo this plan reaches
+   for the first time is added at the sha just fetched, and the globs are
+   unioned; `kept <repo> <sha>` names each one it left alone. Until 2026-09-19
+   this line said *"record once per session — a second record overwrites"*,
+   and a `/vet-imp` session that recorded its round-1 runner globs then ran a
+   coord plan at round 3 had NO coord baseline and could not take one: `check`
+   answered INCOMPLETE for the very paths it was editing. Exit `3` means, e.g.,
    a glob reached no checkout or a fetch failed — the baseline covers less than
    you asked for, which is UNKNOWN rather than clear.
 
@@ -884,7 +889,7 @@ Rules:
 - If the existing block is `Status: VETTED <date>`, replace it with the IN PROGRESS line above and reference the vet date in the body (`Started from VETTED 2026-05-02.`).
 - If the existing block is `Status: DRAFT` or absent, add the IN PROGRESS block but warn the user in your first text turn that the plan was not vetted — give them a chance to abort and run `/vet-plan` first.
 - If the existing block is `Status: PARTIAL` or `Status: NOT STARTED` (set by `/verify-plan-status`), replace it with the IN PROGRESS block and capture the prior state in the body's `History:` line. Don't run `/vet-plan` first unless the user asks — `/verify-plan-status` doesn't supplant a vet pass, but a recent NOT STARTED is also not a reason to re-vet.
-- If the existing block is already `IN PROGRESS`, do NOT simply refresh the date and append your session marker. Apply the disposition in `/vet-plan`'s "`IN PROGRESS` is CONDITIONALLY overwritable" section (keep the two in sync) — including its **unidentified default**: a stamp carrying no session marker, or one you cannot positively attribute to your own current session, is a STOP, not an overwrite. A run that positively identifies the marker as its OWN current session id (a resume, or a Step 0.5 re-run) refreshes rather than takes over. Consult `coord_work_unit_list_citations(<plan-stem>).delivery` FIRST, applying that section's **full arm table in its stated order (4, 3, 2, 1, 5, then 6)**. The capture step here is Step 0.45 check 1, and unlike `/vet-plan` the stamp is still intact at this point — so read it and run the arms inline. In particular: `shipped: true` ∧ `evidence_complete: true` (arm 1) means the work has landed, so **STOP and route to closeout** rather than re-running phase agents against `main`; **the two UNKNOWN arms that a degraded read makes look clean are 2 and 3, and neither is an error shape** — `evidence_complete: false` is **arm 2 regardless of `shipped`** (the two derive independently — `shipped = inputs.delivered`, `evidence_complete = evidence_gaps.is_empty()` — so `shipped: true` ∧ `evidence_complete: false` is reachable, and keying arm 2 on `shipped: false` lets it fall through to the permissive arm), and a top-level `merged_degraded_reason` sitting BESIDE `delivery` is **arm 3**, evaluated ahead of every arm but 4 and **UNKNOWN whatever `delivery` says** — while it is set, every citation's `merged: false` is UNKNOWN rather than an observation. Both answer `200` with a parseable `delivery` and no `citations_error`, so neither is caught by arm 6; and **arm 6 is the DEFAULT** — any error other than `no work-unit with that slug`, any unparseable or non-2xx body, a `citations_error` / `delivery_error` key, an absent `delivery`, or the tool masked / absent / on a dead transport is **UNKNOWN, never "not delivered"**. On UNKNOWN do not treat the delivery read as evidence in either direction: run **`/coord-revive`** if the transport is dead, re-issue over the live door, and otherwise fall through to the stamp arms saying the read was inconclusive. Otherwise, an `IN PROGRESS` stamp carrying a session marker ≠ yours is a **live peer** unless you can positively verify the stamping session is dead with zero work products (transcript tail shows death; worktrees clean and 0 ahead of `origin/main`; no PRs and no branches for the plan). Verified-dead → adopt and append your marker, keeping the trail. Not verified → **STOP**; refreshing the date over a live peer is how PR #479 was built against work PR #468 had already merged.
+- If the existing block is already `IN PROGRESS`, do NOT simply refresh the date and append your session marker. Apply the disposition in `/vet-plan`'s "`IN PROGRESS` is CONDITIONALLY overwritable" section (keep the two in sync) — including its **unidentified default**: a stamp carrying no session marker, or one you cannot positively attribute to your own current session, is a STOP, not an overwrite. A run that positively identifies the marker as its OWN current session id (a resume, or a Step 0.5 re-run) refreshes rather than takes over. Consult `coord_work_unit_list_citations(<plan-stem>).delivery` FIRST, applying that section's **full arm table in its stated order (4, 3, 2, 1, 5, then 6)**. The capture step here is Step 0.45 check 1, and unlike `/vet-plan` the stamp is still intact at this point — so read it and run the arms inline. In particular: arm 1 — `shipped: true` ∧ `evidence_complete: true` ∧ the three phase-corroboration conjuncts `/vet-plan` §0.25 arm 1 states (`phases_remaining` the LITERAL `[]`, never `null`; that `[]` corroborated by a non-empty `phases_declared_indices` wholly inside `phases_delivered`; no `NO PHASE ATTRIBUTION` gap) — means the work has landed, so **STOP and route to closeout** rather than re-running phase agents against `main`. **Do not stop on `shipped` ∧ `evidence_complete` alone**: that pair is reachable on a unit with phases outstanding (plan `2026-09-18-coord-fabricates-a-phase-declaration-and-silences-its-own-gap`), and a response short of the phase conjuncts falls to arm 6 — fall through to the stamp arms; **the two UNKNOWN arms that a degraded read makes look clean are 2 and 3, and neither is an error shape** — `evidence_complete: false` is **arm 2 regardless of `shipped`** (the two derive independently — `shipped` from the landed citations and the phase-coverage gate, `evidence_complete = evidence_gaps.is_empty()` computed before the phase gaps are appended — so `shipped: true` ∧ `evidence_complete: false` is reachable, and keying arm 2 on `shipped: false` lets it fall through to the permissive arm), and a top-level `merged_degraded_reason` sitting BESIDE `delivery` is **arm 3**, evaluated ahead of every arm but 4 and **UNKNOWN whatever `delivery` says** — while it is set, every citation's `merged: false` is UNKNOWN rather than an observation. Both answer `200` with a parseable `delivery` and no `citations_error`, so neither is caught by arm 6; and **arm 6 is the DEFAULT** — any error other than `no work-unit with that slug`, any unparseable or non-2xx body, a `citations_error` / `delivery_error` key, an absent `delivery`, or the tool masked / absent / on a dead transport is **UNKNOWN, never "not delivered"**. On UNKNOWN do not treat the delivery read as evidence in either direction: run **`/coord-revive`** if the transport is dead, re-issue over the live door, and otherwise fall through to the stamp arms saying the read was inconclusive. Otherwise, an `IN PROGRESS` stamp carrying a session marker ≠ yours is a **live peer** unless you can positively verify the stamping session is dead with zero work products (transcript tail shows death; worktrees clean and 0 ahead of `origin/main`; no PRs and no branches for the plan). Verified-dead → adopt and append your marker, keeping the trail. Not verified → **STOP**; refreshing the date over a live peer is how PR #479 was built against work PR #468 had already merged.
 - If the existing block is `SHIPPED` / `SUPERSEDED` / `OBSOLETE`, STOP — implementing a shipped plan is almost certainly a mistake. Confirm with the user before proceeding.
 
 > **Why the delivery read and not just the token list.** The stamp is an
@@ -2943,10 +2948,11 @@ bash <workspace-root>/qontinui-claude-config/scripts/review-arm-corroborate.sh -
 bash <workspace-root>/qontinui-claude-config/scripts/landed-since.sh check
 ```
 
-With no globs it re-uses the globs this session recorded; if `/preflight`
-step 4b recorded them rather than Step 0.45, pass the plan's globs explicitly —
-given globs replace the stored ones, and a repo with no recorded baseline reads
-`3`, never a false clean. Exit `1` names the
+With no globs it re-uses every glob this session recorded — the union of
+`/preflight` step 4b's and Step 0.45's, since a second `record` merges rather
+than overwrites. Pass globs explicitly only to NARROW the question: given globs
+replace the stored ones, and a repo with no recorded baseline reads `3`, never
+a false clean. Exit `1` names the
 commits, the files and the PR numbers that landed into your paths since you
 started — **read them before you rebase**, because the work may already be
 done and a conflict is a much worse way to find out. Exit `3` is INCOMPLETE (a
@@ -3341,8 +3347,9 @@ supersedes unit_ready for the dependency-gated case".)
   gate?`, options Register / Skip), showing the derived anchor, predicate kind,
   and human-readable condition. Under opt-in auto mode (env `QONTINUI_AUTO_GATE=1`)
   register WITHOUT asking and report what was registered (gate_id + predicate).
-- **Anchor (zero user input):** `work_unit_id` (a UUID) from
-  `POST $COORD_HTTP_URL/coord/work-units/upsert` with the plan stem as `slug`
+- **Anchor (zero user input):** `work_unit_id` (a UUID) from the MCP tool
+  **`coord_work_unit_upsert`**, or its REST twin
+  `POST $COORD_HTTP_URL/coord/work-units/upsert`, with the plan stem as `slug`
   (capture the returned `work_unit_id`; or the device-authed
   `GET /coord/agent-work-units/<slug>` — the operator `GET /coord/work-units/<slug>`
   403s a device JWT);
@@ -3674,15 +3681,22 @@ instead of it.
   ```
   POST https://coord.qontinui.io/agents/allocate         // no Authorization header
   {
-    "device_id":    "<this machine's device_id>",
-    "repos":        [{"repo": "<repo>"}],          // parent_sha omitted → coord branches off clean origin/main
-    "intent":       "<plan-stem>: <phase title>",
-    "work_unit_id": "<the plan's work_unit_id UUID>",
-    "build_required": true                          // for a Rust/src-tauri/Cargo.toml footprint
+    "device_id":        "<this machine's device_id>",
+    "repos":            [{"repo": "<repo>"}],      // parent_sha omitted → coord branches off clean origin/main
+    "intent":           "<plan-stem>: <phase title>",
+    "work_unit_id":     "<the plan's work_unit_id UUID>",
+    "agent_session_id": "<$CLAUDE_CODE_SESSION_ID, else $CLAUDE_SESSION_ID>",  // omitted unless a lowercase uuid
+    "build_required":   true                       // for a Rust/src-tauri/Cargo.toml footprint
+    // NOTE: deliberately NO "build_target" line. It is optional, coord's own default
+    // is `shared`, and a copy-paste that pinned it would pin a value coord may change.
   }
   ```
 
-  `work_unit_id` is the UUID from `POST /coord/work-units/upsert` (the same one Step 0.5 transitions) — **not** the slug. It is the first thing that has ever written `coord.agent_worktrees.work_unit_id`, and it is what lets cleanup reap by *plan* instead of by disk heuristics. A `work_unit_id` coord cannot resolve is dropped with a warning, never an allocation failure, so a stale hint degrades to today's behaviour rather than blocking the phase.
+  **`build_required` is TRUE whenever the phase compiles, and that is now cheap.** The flag means "this work RUNS A BUILD", not "this work creates a target directory" — a build takes a build slot, holds the shared target's build lock (serialising every worktree sharing that target) and grows that target, whether or not it mints a directory. **Declaring `false` to get past a disk refusal is the exploit coord finding `17a091e6` records**, and it is not even a reliable dodge: coord's `needs_build` fires on any footprint path containing `.rs`, `cargo.toml`, `src-tauri` or `target/` whatever the flag says, and an absent footprint is derived from the `intent` text. What made the truthful answer expensive was the PRICE coord put on it — a flat 340 GB reserve (more free space than an ordinary laptop has) plus a whole accumulated `target/` — and plan `2026-09-13-coord-worktree-reserve-is-absolute-so-ordinary-disks-never-build` fixes both: the reserve is 10% of the binding volume (floored at the tenant disk floor, capped at 340 GB) and a shared-target build is charged what it writes. **`build_target` says WHERE the bytes land, and you normally OMIT it** — every cargo wrapper here (`scripts/cargo-guard.sh` for the runner, `scripts/cargo-verify.sh` for coord / schemas / supervisor / inspect) builds a linked worktree into the PRIMARY checkout's target, and a PreToolUse hook blocks raw `cargo` in those repos, so coord's `"shared"` default is the truthful value. Pass `--build-target dedicated` only when you deliberately opt out of the shared target (`CARGO_GUARD_TARGET`, or an explicit fresh `CARGO_TARGET_DIR`); that allocation is charged a whole cold target. **A `wait` verdict is still honoured either way** — "never force a worktree past a `wait`" remains the rule, and re-running without `--build-required` is not a way round it.
+
+  `agent_session_id` is what binds the `coord.agent_worktrees` row to THIS session — the author address `handoff-stuck-pr` resolves a conflicting PR to, and it moves the row onto the worktree sweep's bound (session-liveness) arm. Without it the row is born session-less (plan `2026-09-19-stuck-pr-handoff-reaches-no-author-on-54-of-54` P1). Like `device_id` it is a claim; an fkey refusal on it is retried once without the field, never an allocation failure.
+
+  `work_unit_id` is the UUID from the MCP tool `coord_work_unit_upsert`, or equivalently from its REST twin `POST /coord/work-units/upsert` (the same one Step 0.5 transitions) — **not** the slug. Either transport returns the same UUID; a session with no coord bearer may still hold the tool, so try whichever answers rather than skipping the hint. It is the first thing that has ever written `coord.agent_worktrees.work_unit_id`, and it is what lets cleanup reap by *plan* instead of by disk heuristics. A `work_unit_id` coord cannot resolve is dropped with a warning, never an allocation failure, so a stale hint degrades to today's behaviour rather than blocking the phase.
 
   **Why through coord and not by hand:** an agent *cannot* register a worktree it already created — `AllocateRepoSpec` is `{repo, parent_sha?}` only, the path is computed server-side by `suggest_worktree_path` and the branch by `decide_branch`, and `POST /agents/allocate-local` was removed as dead code in runner #443. There is no adopt-an-existing-path door. So a hand-rolled worktree is **undeclared**, and an undeclared worktree can be neither attributed to a session, nor pinned (`POST /coord/worktrees/:id/retention` is keyed on a ledger ROW id, which it does not have), nor drained by policy. It accumulates instead.
 

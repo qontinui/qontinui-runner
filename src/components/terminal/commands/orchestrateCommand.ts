@@ -54,7 +54,7 @@ interface OrchestrationRun {
  * Window CustomEvent name the `/orchestrate` handler dispatches to ask the
  * Terminal page-tab manager (`useTerminalPages`) to materialize + activate
  * the run's page. Mirrors the existing event-based navigation idiom
- * (`ui-bridge-navigate`, `navigate-to-active`, `productivity-set-view`):
+ * (`ui-bridge-navigate`, `navigate-to-active`):
  * keeping navigation event-driven means `/orchestrate` stays a
  * self-contained registry action and doesn't have to prop-drill a page
  * setter through App → providers → command ctx.

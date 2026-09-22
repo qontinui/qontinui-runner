@@ -8,8 +8,8 @@ use crate::commands::AppState;
 use crate::database::pg::PgDb;
 use crate::scheduler::{
     compute_next_run, condition_status_default, CatchUpPolicy, ConditionStatus, RepositoryWatch,
-    ScheduleExpression, ScheduledTask, ScheduledTaskExt, ScheduledTaskStatus, ScheduledTaskType,
-    TaskExecutionRecord, TaskExecutionRecordExt,
+    ScheduleExpression, ScheduleZone, ScheduledTask, ScheduledTaskExt, ScheduledTaskStatus,
+    ScheduledTaskType, TaskExecutionRecord, TaskExecutionRecordExt,
 };
 use chrono::{DateTime, Utc};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -169,15 +169,43 @@ impl SchedulerService {
         self.stop_signal.store(true, Ordering::SeqCst);
     }
 
+    /// The zone every cron expression is evaluated in — `settings.timezone`,
+    /// `None` meaning the device's local zone (Phase 5a of plan
+    /// `2026-09-13-nightly-return-to-main-sweep`). Read per call rather than
+    /// cached, so every recompute sees the current setting; a settings write
+    /// that CHANGES the zone also recomputes every stored `next_run` on the
+    /// spot (`mcp::scheduler::update_scheduler_settings`), because the tick
+    /// fires off the stored instant and would otherwise honour the old zone
+    /// once more.
+    /// A settings read failure is logged and falls back to local time: the
+    /// only alternative is computing no next-run at all, which would silently
+    /// stall every task.
+    async fn schedule_zone(&self) -> ScheduleZone {
+        match self.pg() {
+            Ok(pg) => match pg.get_scheduler_settings().await {
+                Ok(settings) => ScheduleZone::from_settings(&settings),
+                Err(e) => {
+                    warn!("scheduler: settings unreadable ({e}); evaluating cron in local time");
+                    ScheduleZone::Local
+                }
+            },
+            Err(e) => {
+                warn!("scheduler: {e}; evaluating cron in local time");
+                ScheduleZone::Local
+            }
+        }
+    }
+
     /// Update next_run for all tasks (DB-backed replacement for scheduler::update_all_next_runs)
     async fn update_all_next_runs_db(&self) -> Result<(), String> {
         let pg = self.pg()?;
         let tasks = pg.get_all_scheduled_tasks().await?;
         let now = chrono::Utc::now();
+        let zone = self.schedule_zone().await;
 
         for task in &tasks {
             let next = if task.enabled {
-                compute_next_run(&task.schedule, now).map(|dt| dt.to_rfc3339())
+                compute_next_run(&task.schedule, now, zone).map(|dt| dt.to_rfc3339())
             } else {
                 None
             };
@@ -521,35 +549,28 @@ impl SchedulerService {
                 max_turns,
                 timeout_seconds,
             } => {
-                // Clone every field out of the variant so the future can be
-                // 'static — same shape `launch_prompt`/`launch_auto_fix` use.
-                let prompt = prompt.clone();
-                let working_directory = working_directory.clone();
-                let allowed_tools = allowed_tools.clone();
-                let model = model.clone();
-                let mcp_connections = mcp_connections.clone();
-                let max_turns = *max_turns;
-                let timeout_seconds = *timeout_seconds;
-                let task_name_for_launch = task_name.clone();
+                // Phase 5b of plan `2026-09-13-nightly-return-to-main-sweep`:
+                // the runner's own in-binary spawn seam, not `/prompts/run`.
+                // Defaults as before (`max_turns = 50`, `timeout_seconds =
+                // 600`); the task's own values win when set.
+                let spec = crate::scheduler_remote_agent::RemoteAgentSpec {
+                    task_name: task_name.clone(),
+                    execution_id: String::new(), // stamped by launch_and_await_remote_agent
+                    prompt: prompt.clone(),
+                    working_directory: working_directory.clone(),
+                    model: model.clone(),
+                    allowed_tools: allowed_tools.clone(),
+                    mcp_connections: mcp_connections.clone(),
+                    max_turns: max_turns.unwrap_or(50),
+                    timeout: std::time::Duration::from_secs(timeout_seconds.unwrap_or(600)),
+                };
                 self.clone()
-                    .launch_and_poll(
+                    .launch_and_await_remote_agent(
                         task_id,
                         task_name,
                         auto_fix_on_failure,
                         catch_up,
-                        Box::pin(async move {
-                            self.launch_remote_agent(
-                                &task_name_for_launch,
-                                &prompt,
-                                working_directory.as_deref(),
-                                model.as_deref(),
-                                &allowed_tools,
-                                &mcp_connections,
-                                max_turns,
-                                timeout_seconds,
-                            )
-                            .await
-                        }),
+                        spec,
                     )
                     .await;
                 return;
@@ -748,7 +769,8 @@ impl SchedulerService {
         let backoff = task.launch_failure_backoff();
 
         let now = Utc::now();
-        let normal_next = compute_next_run(&task.schedule, now);
+        let zone = self.schedule_zone().await;
+        let normal_next = compute_next_run(&task.schedule, now, zone);
         let next_run = compute_launch_failed_next_run(normal_next, backoff, now);
         let backoff_seconds = backoff.map(|d| d.num_seconds()).unwrap_or(0);
         warn!(
@@ -894,36 +916,141 @@ impl SchedulerService {
                 });
             }
             Err(e) => {
-                // The launch path itself failed (HTTP error, missing
-                // session_id in response, prompt-resolve failure, etc.) —
-                // this is a LaunchFailed, not a runtime Failed. Mark
-                // accordingly so the backoff path fires.
-                record.mark_launch_failed(Some(e.clone()));
-                error!("Scheduler: task '{}' failed to launch: {}", task_name, e);
+                self.record_launch_failure(&task_id, &task_name, record, auto_fix_on_failure, e)
+                    .await;
+            }
+        }
+    }
 
-                if auto_fix_on_failure {
-                    if let Ok(session_id) = self.launch_auto_fix(true, false).await {
-                        record.mark_auto_fix_triggered(session_id);
-                    }
-                }
+    /// The launch path itself failed (HTTP error, missing session_id in the
+    /// response, a spawn refusal, a missing working directory, …) — a
+    /// LaunchFailed, not a runtime Failed. Records it so the backoff path
+    /// fires. Shared by the poll path and the in-binary RemoteAgent path.
+    async fn record_launch_failure(
+        &self,
+        task_id: &str,
+        task_name: &str,
+        mut record: TaskExecutionRecord,
+        auto_fix_on_failure: bool,
+        error: String,
+    ) {
+        record.mark_launch_failed(Some(error.clone()));
+        error!(
+            "Scheduler: task '{}' failed to launch: {}",
+            task_name, error
+        );
+
+        if auto_fix_on_failure {
+            if let Ok(session_id) = self.launch_auto_fix(true, false).await {
+                record.mark_auto_fix_triggered(session_id);
+            }
+        }
+
+        if let Ok(pg) = self.pg() {
+            if let Err(err) = pg.insert_execution_record(task_id, &record).await {
+                error!("Failed to record launch-failure execution: {}", err);
+            }
+            if let Err(err) = pg
+                .update_task_last_run(task_id, Some(&record.execution_id))
+                .await
+            {
+                error!("Failed to update task last_run: {}", err);
+            }
+        }
+
+        self.apply_launch_failure_backoff(task_id, task_name).await;
+
+        let mut running = self.running_tasks.write().await;
+        running.retain(|id| id != task_id);
+    }
+
+    /// Launch a `RemoteAgent` task through the runner's own spawn seam and
+    /// AWAIT the spawned `claude` child (Phase 5b of plan
+    /// `2026-09-13-nightly-return-to-main-sweep`).
+    ///
+    /// Same lifecycle as [`Self::launch_and_poll`] — a `Running` history row
+    /// the moment the child exists, `last_run` stamped, the launch-failure
+    /// streak cleared, and a detached task that settles the row — but the
+    /// completion signal is the child's exit rather than a `task_runs` poll,
+    /// so a scheduled session that finishes cleanly is recorded as a success
+    /// instead of being auto-failed by the zombie sweep (Phase 0.1's measured
+    /// defect). The child's exit code and the task's `timeout_seconds` decide
+    /// the outcome; see [`crate::scheduler_remote_agent`].
+    async fn launch_and_await_remote_agent(
+        self: Arc<Self>,
+        task_id: String,
+        task_name: String,
+        auto_fix_on_failure: bool,
+        catch_up: Option<CatchUpContext>,
+        mut spec: crate::scheduler_remote_agent::RemoteAgentSpec,
+    ) {
+        let mut record = <TaskExecutionRecord as TaskExecutionRecordExt>::new();
+        if let Some(ref ctx) = catch_up {
+            ctx.apply(&mut record);
+        }
+        let execution_id = record.execution_id.clone();
+        spec.execution_id = execution_id.clone();
+
+        // The bound API port, for the session's `.mcp.json` proxy shape —
+        // `None` (fail-closed) when no AppState is managed, exactly as the
+        // gate-continuation spawn passes it.
+        let bound_port = self
+            .app_state
+            .as_ref()
+            .map(|s| crate::mcp::types::runner_api_port(s));
+
+        match crate::scheduler_remote_agent::launch(spec, bound_port).await {
+            Ok(launch) => {
+                record.session_id = Some(launch.session_id.clone());
+                info!(
+                    "Scheduler: launched RemoteAgent task '{}' in-binary (session_id={}, cwd={}, log={:?})",
+                    task_name, launch.session_id, launch.workdir, launch.log_path
+                );
 
                 if let Ok(pg) = self.pg() {
-                    if let Err(err) = pg.insert_execution_record(&task_id, &record).await {
-                        error!("Failed to record launch-failure execution: {}", err);
+                    if let Err(e) = pg.insert_execution_record(&task_id, &record).await {
+                        error!("Failed to insert initial running execution record: {}", e);
                     }
-                    if let Err(err) = pg
+                    if let Err(e) = pg
                         .update_task_last_run(&task_id, Some(&record.execution_id))
                         .await
                     {
-                        error!("Failed to update task last_run: {}", err);
+                        error!("Failed to update task last_run: {}", e);
                     }
                 }
 
-                self.apply_launch_failure_backoff(&task_id, &task_name)
-                    .await;
+                // The child exists — that is "first successful start".
+                self.clear_launch_failure_counter(&task_id).await;
 
-                let mut running = self.running_tasks.write().await;
-                running.retain(|id| id != &task_id);
+                let service = self.clone();
+                let completion = launch.completion;
+                tokio::spawn(async move {
+                    let started = tokio::time::Instant::now();
+                    let outcome = completion.await;
+                    info!(
+                        "Scheduler: RemoteAgent task '{}' child ended (success={}, exit_code={:?}, timed_out={}, took {:?})",
+                        task_name,
+                        outcome.success,
+                        outcome.exit_code,
+                        outcome.timed_out,
+                        started.elapsed()
+                    );
+                    service
+                        .finalize_async_execution(
+                            task_id,
+                            task_name,
+                            execution_id,
+                            record,
+                            outcome.success,
+                            outcome.error,
+                            auto_fix_on_failure,
+                        )
+                        .await;
+                });
+            }
+            Err(e) => {
+                self.record_launch_failure(&task_id, &task_name, record, auto_fix_on_failure, e)
+                    .await;
             }
         }
     }
@@ -1017,13 +1144,40 @@ impl SchedulerService {
             }
         };
 
-        record.complete(success, error_message.clone());
         info!(
             "Scheduler: task '{}' finished (success: {}, took: {:?})",
             task_name,
             success,
             start.elapsed()
         );
+        self.finalize_async_execution(
+            task_id,
+            task_name,
+            execution_id,
+            record,
+            success,
+            error_message,
+            auto_fix_on_failure,
+        )
+        .await;
+    }
+
+    /// Settle an async execution's history row once its outcome is known:
+    /// complete the record, fire `auto_fix_on_failure`, write the row, recompute
+    /// `next_run`, and release the `running_tasks` slot. Shared by the
+    /// `task_runs` poller and the in-binary RemoteAgent completion.
+    #[allow(clippy::too_many_arguments)]
+    async fn finalize_async_execution(
+        &self,
+        task_id: String,
+        task_name: String,
+        execution_id: String,
+        mut record: TaskExecutionRecord,
+        success: bool,
+        error_message: Option<String>,
+        auto_fix_on_failure: bool,
+    ) {
+        record.complete(success, error_message);
 
         if !success && auto_fix_on_failure {
             info!(
@@ -1073,7 +1227,8 @@ impl SchedulerService {
         };
 
         let now = chrono::Utc::now();
-        let next = compute_next_run(&task.schedule, now).map(|dt| dt.to_rfc3339());
+        let zone = self.schedule_zone().await;
+        let next = compute_next_run(&task.schedule, now, zone).map(|dt| dt.to_rfc3339());
 
         if let Err(e) = pg.update_task_next_run(task_id, next.as_deref()).await {
             error!("Failed to update task next_run: {}", e);
@@ -1291,143 +1446,6 @@ After making fixes, run tests if applicable to verify the fixes work."#
 
         run_prompt_session_id(&response_json)
             .ok_or_else(|| "Auto-fix run endpoint omitted session_id".to_string())
-    }
-
-    /// Launch a `RemoteAgent` scheduled task via the runner's existing
-    /// ad-hoc `POST /prompts/run` surface.
-    ///
-    /// `RemoteAgent` is "an arbitrary Claude prompt as a scheduled task" —
-    /// no separate Claude CLI plumbing is needed. We forward the user's
-    /// prompt + tuning knobs to `/prompts/run`'s ad-hoc mode (mode 2:
-    /// `name + content`). The endpoint returns a `session_id` that doubles
-    /// as a `task_run_id`; the same `launch_and_poll` machinery used by
-    /// `Prompt`/`AutoFix` then takes over for completion polling.
-    ///
-    /// The new `RunPromptRequest` knobs are mapped as follows:
-    /// - `working_directory` → `--working-directory` flag on the spawn
-    ///   wrapper, becomes the spawned Claude CLI's CWD
-    /// - `model` → `--model` (Claude CLI native flag)
-    /// - `allowed_tools` → `--allowed-tools` (Claude CLI native flag)
-    /// - `max_turns` → `--max-turns` (Claude CLI native flag)
-    /// - `mcp_connections` → injected as a header section in the prompt
-    ///   (per-call MCP-config merging is not yet wired; tracked as Phase D
-    ///   follow-up in `tmp_scheduler_reliability_plan.md`)
-    ///
-    /// Defaults follow the plan: `max_turns = 50`, `timeout_seconds = 600`.
-    /// Failures are returned as `Result::Err` so the existing
-    /// `launch_and_poll` failure path can convert them into a `Failed`
-    /// `scheduler_history` row (Phase C will route these to `LaunchFailed`).
-    #[allow(clippy::too_many_arguments)]
-    async fn launch_remote_agent(
-        &self,
-        task_name: &str,
-        prompt: &str,
-        working_directory: Option<&str>,
-        model: Option<&str>,
-        allowed_tools: &[String],
-        mcp_connections: &[qontinui_types::scheduler::McpConnectionRef],
-        max_turns: Option<u32>,
-        timeout_seconds: Option<u64>,
-    ) -> Result<String, String> {
-        info!(
-            "Launching RemoteAgent task '{}' (model: {:?}, max_turns: {:?}, timeout: {:?}s)",
-            task_name, model, max_turns, timeout_seconds
-        );
-
-        // Plan defaults (see tmp_scheduler_reliability_plan.md, Phase D §5).
-        let effective_max_turns = max_turns.unwrap_or(50);
-        let effective_timeout = timeout_seconds.unwrap_or(600);
-
-        let mut request_body = serde_json::json!({
-            "name": format!("scheduled-remote-agent-{}", task_name),
-            "content": prompt,
-            "display_prompt": format!("Scheduler: RemoteAgent ({})", task_name),
-            "timeout_seconds": effective_timeout,
-            "max_sessions": 1,
-            "max_turns": effective_max_turns,
-        });
-
-        if let Some(wd) = working_directory {
-            request_body["working_directory"] = serde_json::json!(wd);
-        }
-        if let Some(m) = model {
-            request_body["model"] = serde_json::json!(m);
-        }
-        if !allowed_tools.is_empty() {
-            request_body["allowed_tools"] = serde_json::json!(allowed_tools);
-        }
-        if !mcp_connections.is_empty() {
-            request_body["mcp_connections"] = serde_json::json!(mcp_connections);
-        }
-
-        let (status, response_json) = self
-            .post_self(RUN_PROMPT_PATH, request_body)
-            .await
-            .map_err(|e| format!("Failed to launch RemoteAgent: {}", e))?;
-
-        if !(200..300).contains(&status) {
-            let error_text = match &response_json {
-                serde_json::Value::String(text) => text.clone(),
-                other => other.to_string(),
-            };
-            return Err(format!(
-                "RemoteAgent /prompts/run returned HTTP {}: {}",
-                status, error_text
-            ));
-        }
-
-        // The /prompts/run handler wraps the body in
-        // `{ "success": bool, "data": { ... } }` (see ApiResponse). We accept
-        // either a top-level `session_id` or `data.session_id` so the
-        // contract is the same as `launch_auto_fix`'s `Value::get` path.
-        let session_id_opt = run_prompt_session_id(&response_json);
-
-        match session_id_opt {
-            Some(sid) => {
-                info!(
-                    "RemoteAgent task '{}' launched with session_id={}",
-                    task_name, sid
-                );
-
-                // 30s no-activity guard (Phase D §5 + plan §4 hand-off note).
-                // Fire-and-forget: only logs a warning if no `task_runs` row
-                // appears for `sid` within 30s. The existing
-                // `poll_task_run_to_completion` poller will then surface
-                // the missing row as a failure via its
-                // `task_run {} disappeared from DB` branch.
-                if let Some(pg_db) = &self.pg_db {
-                    let pg = pg_db.clone();
-                    let sid_for_check = sid.clone();
-                    let task_name_for_check = task_name.to_string();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
-                        match pg.get_task_run(&sid_for_check).await {
-                            Ok(Some(_)) => {
-                                // Activity recorded — nothing to do.
-                            }
-                            Ok(None) => {
-                                warn!(
-                                    "RemoteAgent task '{}' (session_id={}) shows no task_runs activity within 30s of launch — possible silent spawn hang",
-                                    task_name_for_check, sid_for_check
-                                );
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "RemoteAgent task '{}' (session_id={}) 30s activity check failed to query task_runs: {}",
-                                    task_name_for_check, sid_for_check, e
-                                );
-                            }
-                        }
-                    });
-                }
-
-                Ok(sid)
-            }
-            None => Err(format!(
-                "RemoteAgent /prompts/run omitted session_id; response={}",
-                response_json
-            )),
-        }
     }
 
     /// Check if a specific task is currently running
@@ -1840,8 +1858,9 @@ fn plan_catch_up_actions(
 /// for the given schedule expression.
 ///
 /// - `Cron`: uses [`cron::Schedule::after(&from)`] to seek strictly past
-///   `from`, then takes while `t <= to`. Times are returned in `Utc`,
-///   matching the runner's convention (see [`compute_next_run`]).
+///   `from`, then takes while `t <= to`, evaluating the expression in
+///   `zone` (see [`ScheduleZone`]). Times are returned in `Utc`, matching
+///   the runner's convention (see [`compute_next_run`]).
 /// - `Interval(secs)`: synthesises slots at `from + secs`, `from + 2*secs`,
 ///   …, while each is `<= to`.
 /// - `Once(iso)`: returns the single parsed timestamp if it lies in
@@ -1857,6 +1876,7 @@ fn iter_slots_in_window(
     schedule: &ScheduleExpression,
     from: DateTime<Utc>,
     to: DateTime<Utc>,
+    zone: ScheduleZone,
 ) -> Vec<DateTime<Utc>> {
     if to <= from {
         return Vec::new();
@@ -1864,21 +1884,13 @@ fn iter_slots_in_window(
 
     match schedule {
         ScheduleExpression::Cron(cron_expr) => {
-            use cron::Schedule;
-            use std::str::FromStr;
-
-            // Match the same 5/6/7-field normalization as `compute_next_run`
-            // so the reconciler agrees with the live scheduler about what a
-            // slot is.
-            let normalized = if cron_expr.split_whitespace().count() == 5 {
-                format!("0 {}", cron_expr)
-            } else {
-                cron_expr.clone()
-            };
-
-            match Schedule::from_str(&normalized) {
-                Ok(schedule) => schedule
-                    .after(&from)
+            // The SAME normalization and the SAME zone as `compute_next_run`
+            // (`crate::scheduler::cron_after`), so the reconciler agrees with
+            // the live scheduler about which slots exist — Phase 5a's second
+            // site: with only the live side zone-aware, a catch-up across a
+            // DST boundary would walk slots the scheduler never scheduled.
+            match crate::scheduler::cron_after(cron_expr, from, zone) {
+                Some(iter) => iter
                     .take_while(|t| *t <= to)
                     // Hard cap to avoid pathological loops with sub-second
                     // crons; matching the spec's grace-window semantics any
@@ -1886,10 +1898,10 @@ fn iter_slots_in_window(
                     // certainly malformed for our use case.
                     .take(100_000)
                     .collect(),
-                Err(e) => {
+                None => {
                     warn!(
-                        "iter_slots_in_window: invalid cron '{}': {}; returning no slots",
-                        cron_expr, e
+                        "iter_slots_in_window: invalid cron '{}'; returning no slots",
+                        cron_expr
                     );
                     Vec::new()
                 }
@@ -1968,6 +1980,7 @@ impl SchedulerService {
             .map_err(|e| format!("reconcile_missed_runs: load tasks: {}", e))?;
 
         let now = Utc::now();
+        let zone = ScheduleZone::from_settings(&settings);
 
         for task in tasks {
             if !task.enabled {
@@ -1979,7 +1992,7 @@ impl SchedulerService {
                 continue;
             }
 
-            if let Err(e) = self.clone().reconcile_task(&task, now).await {
+            if let Err(e) = self.clone().reconcile_task(&task, now, zone).await {
                 error!(
                     "Scheduler reconciler: task '{}' (id={}) failed: {}",
                     task.name, task.id, e
@@ -1996,6 +2009,7 @@ impl SchedulerService {
         self: Arc<Self>,
         task: &ScheduledTask,
         now: DateTime<Utc>,
+        zone: ScheduleZone,
     ) -> Result<(), String> {
         let pg = self.pg()?;
 
@@ -2043,7 +2057,7 @@ impl SchedulerService {
             return Ok(());
         }
 
-        let candidates = iter_slots_in_window(&task.schedule, lookback_start, window_end);
+        let candidates = iter_slots_in_window(&task.schedule, lookback_start, window_end, zone);
         if candidates.is_empty() {
             return Ok(());
         }
@@ -2483,7 +2497,11 @@ mod tests {
     }
 
     // ========================================================================
-    // Phase D — RemoteAgent dispatcher tests (launch_remote_agent)
+    // `/prompts/run` launch tests (launch_prompt / launch_auto_fix). The
+    // RemoteAgent dispatcher no longer goes through this route — Phase 5b of
+    // plan `2026-09-13-nightly-return-to-main-sweep` moved it onto the in-binary
+    // spawn seam (`crate::scheduler_remote_agent`), whose pure parts are tested
+    // there.
     //
     // These exercise the HTTP boundary only — we never actually spawn Claude.
     // A tiny axum mock listens on a random port; QONTINUI_PORT is set so
@@ -2505,7 +2523,7 @@ mod tests {
     /// serialization; this restore gives cleanup.
     ///
     /// Note: these `#[tokio::test]`s hold `env_lock()` across the mock-server
-    /// round-trip because `launch_remote_agent` reads `QONTINUI_PORT` *during*
+    /// round-trip because `launch_prompt` reads `QONTINUI_PORT` *during*
     /// the awaited HTTP call, so the read must stay inside the lock. The mock
     /// is on localhost (sub-ms), so the extra serialization against other env
     /// tests in the binary is negligible — and correctness (no cross-module
@@ -2517,7 +2535,7 @@ mod tests {
     /// Spin up a tiny axum mock on a random localhost port that captures
     /// the most recent `/prompts/run` body and replies with `response`.
     /// Returns `(port, captured_body)` so the test can assert on the body
-    /// after `launch_remote_agent` returns.
+    /// after `launch_prompt` returns.
     async fn spawn_prompts_run_mock(
         response: axum::response::Response,
     ) -> (u16, Arc<tokio::sync::Mutex<Option<serde_json::Value>>>) {
@@ -2684,159 +2702,6 @@ mod tests {
         assert!(!runnable.iter().any(task_spawns_ai_session));
     }
 
-    #[tokio::test]
-    async fn test_launch_remote_agent_posts_full_body_when_all_fields_set() {
-        let _env_lock = env_lock();
-        let _env = restore_port();
-
-        let (port, captured) = spawn_prompts_run_mock(ok_response(serde_json::json!({
-            "session_id": "sid-123"
-        })))
-        .await;
-        std::env::set_var("QONTINUI_PORT", port.to_string());
-
-        let service = SchedulerService::new(None);
-        let mcp_conns = vec![qontinui_types::scheduler::McpConnectionRef {
-            name: "filesystem".to_string(),
-            url: Some("http://example.com/mcp".to_string()),
-        }];
-        let result = service
-            .launch_remote_agent(
-                "nightly-cleanup",
-                "List files in cwd.",
-                Some("/tmp/work"),
-                Some("claude-sonnet-4-6"),
-                &["Bash".to_string(), "Read".to_string()],
-                &mcp_conns,
-                Some(25),
-                Some(120),
-            )
-            .await;
-
-        assert_eq!(result.unwrap(), "sid-123");
-
-        let body = captured.lock().await.clone().expect("no body captured");
-        assert_eq!(body["name"], "scheduled-remote-agent-nightly-cleanup");
-        assert_eq!(body["content"], "List files in cwd.");
-        assert_eq!(body["max_sessions"], 1);
-        assert_eq!(body["timeout_seconds"], 120);
-        assert_eq!(body["max_turns"], 25);
-        assert_eq!(body["working_directory"], "/tmp/work");
-        assert_eq!(body["model"], "claude-sonnet-4-6");
-        assert_eq!(body["allowed_tools"], serde_json::json!(["Bash", "Read"]));
-        assert_eq!(body["mcp_connections"][0]["name"], "filesystem");
-        assert_eq!(body["mcp_connections"][0]["url"], "http://example.com/mcp");
-    }
-
-    #[tokio::test]
-    async fn test_launch_remote_agent_omits_optional_fields_when_none() {
-        let _env_lock = env_lock();
-        let _env = restore_port();
-
-        let (port, captured) = spawn_prompts_run_mock(ok_response(serde_json::json!({
-            "session_id": "sid-456"
-        })))
-        .await;
-        std::env::set_var("QONTINUI_PORT", port.to_string());
-
-        let service = SchedulerService::new(None);
-        let result = service
-            .launch_remote_agent("minimal", "do the thing", None, None, &[], &[], None, None)
-            .await;
-
-        assert_eq!(result.unwrap(), "sid-456");
-
-        let body = captured.lock().await.clone().expect("no body captured");
-        // Required fields present.
-        assert_eq!(body["name"], "scheduled-remote-agent-minimal");
-        assert_eq!(body["content"], "do the thing");
-        assert_eq!(body["max_sessions"], 1);
-        // Plan defaults.
-        assert_eq!(body["timeout_seconds"], 600);
-        assert_eq!(body["max_turns"], 50);
-        // Optional fields omitted entirely.
-        assert!(body.get("working_directory").is_none());
-        assert!(body.get("model").is_none());
-        assert!(body.get("allowed_tools").is_none());
-        assert!(body.get("mcp_connections").is_none());
-    }
-
-    #[tokio::test]
-    async fn test_launch_remote_agent_extracts_session_id_from_data_envelope() {
-        let _env_lock = env_lock();
-        let _env = restore_port();
-
-        // /prompts/run wraps successful responses in
-        // `{ "success": true, "data": { ... } }`.
-        let (port, _captured) = spawn_prompts_run_mock(ok_response(serde_json::json!({
-            "success": true,
-            "data": { "session_id": "wrapped-sid", "task_run_id": "wrapped-sid" }
-        })))
-        .await;
-        std::env::set_var("QONTINUI_PORT", port.to_string());
-
-        let service = SchedulerService::new(None);
-        let result = service
-            .launch_remote_agent("e", "p", None, None, &[], &[], None, None)
-            .await;
-
-        assert_eq!(result.unwrap(), "wrapped-sid");
-    }
-
-    #[tokio::test]
-    async fn test_launch_remote_agent_500_returns_err() {
-        let _env_lock = env_lock();
-        let _env = restore_port();
-
-        let err_resp = axum::response::Response::builder()
-            .status(500)
-            .header("content-type", "application/json")
-            .body(axum::body::Body::from(
-                serde_json::to_vec(&serde_json::json!({"error": "boom"})).unwrap(),
-            ))
-            .unwrap();
-        let (port, _captured) = spawn_prompts_run_mock(err_resp).await;
-        std::env::set_var("QONTINUI_PORT", port.to_string());
-
-        let service = SchedulerService::new(None);
-        let result = service
-            .launch_remote_agent("e", "p", None, None, &[], &[], None, None)
-            .await;
-
-        let err = result.unwrap_err();
-        assert!(
-            err.contains("HTTP 500"),
-            "expected HTTP 500 error, got: {}",
-            err
-        );
-    }
-
-    #[tokio::test]
-    async fn test_launch_remote_agent_missing_session_id_returns_err() {
-        let _env_lock = env_lock();
-        let _env = restore_port();
-
-        // 200 OK but no session_id anywhere.
-        let (port, _captured) = spawn_prompts_run_mock(ok_response(serde_json::json!({
-            "ok": true,
-            "data": { "task_run_id": "x" }
-        })))
-        .await;
-        std::env::set_var("QONTINUI_PORT", port.to_string());
-
-        let service = SchedulerService::new(None);
-        let result = service
-            .launch_remote_agent("e", "p", None, None, &[], &[], None, None)
-            .await;
-
-        let err = result.unwrap_err();
-        assert!(
-            err.contains("omitted session_id"),
-            "expected missing-session_id error, got: {}",
-            err
-        );
-    }
-
     // ========================================================================
     // Phase B — Missed-run reconciler tests
     //
@@ -2858,7 +2723,7 @@ mod tests {
         let now = Utc::now();
         let from = now - chrono::Duration::hours(6);
         let to = now;
-        let slots = iter_slots_in_window(&interval(3600), from, to);
+        let slots = iter_slots_in_window(&interval(3600), from, to, ScheduleZone::Utc);
         assert_eq!(slots.len(), 6, "expected 6 hourly slots in 6h window");
         // First slot should be from + 1h, last should be from + 6h == to.
         assert_eq!(
@@ -2875,10 +2740,15 @@ mod tests {
     fn reconciler_iter_slots_interval_empty_window() {
         // to <= from → empty.
         let now = Utc::now();
-        let slots = iter_slots_in_window(&interval(60), now, now);
+        let slots = iter_slots_in_window(&interval(60), now, now, ScheduleZone::Utc);
         assert!(slots.is_empty());
 
-        let slots = iter_slots_in_window(&interval(60), now, now - chrono::Duration::seconds(1));
+        let slots = iter_slots_in_window(
+            &interval(60),
+            now,
+            now - chrono::Duration::seconds(1),
+            ScheduleZone::Utc,
+        );
         assert!(slots.is_empty());
     }
 
@@ -2892,8 +2762,12 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let to = from + chrono::Duration::minutes(390); // exactly 07:00
-        let slots =
-            iter_slots_in_window(&ScheduleExpression::Cron("0 * * * *".to_string()), from, to);
+        let slots = iter_slots_in_window(
+            &ScheduleExpression::Cron("0 * * * *".to_string()),
+            from,
+            to,
+            ScheduleZone::Utc,
+        );
         assert_eq!(slots.len(), 7, "expected 01:00..=07:00 inclusive");
         // First slot is 01:00.
         let first = chrono::DateTime::parse_from_rfc3339("2026-01-01T01:00:00Z")
@@ -2907,6 +2781,43 @@ mod tests {
         assert_eq!(slots.last().copied(), Some(last));
     }
 
+    /// Phase 5a: a missed-slot reconcile across a DST boundary walks one slot
+    /// per LOCAL day, at the UTC instant each side of the transition puts
+    /// 04:20 local — the reconciler and the live scheduler share the one
+    /// zone-aware door (`crate::scheduler::cron_after`).
+    #[test]
+    fn reconciler_iter_slots_cron_across_a_dst_boundary_in_a_named_zone() {
+        let utc = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .expect("rfc3339")
+                .with_timezone(&Utc)
+        };
+        let berlin = ScheduleZone::Named(chrono_tz::Europe::Berlin);
+        let slots = iter_slots_in_window(
+            &ScheduleExpression::Cron("20 4 * * *".to_string()),
+            utc("2026-03-27T12:00:00Z"),
+            utc("2026-03-30T12:00:00Z"),
+            berlin,
+        );
+        assert_eq!(
+            slots,
+            vec![
+                utc("2026-03-28T03:20:00Z"), // CET, UTC+1
+                utc("2026-03-29T02:20:00Z"), // CEST from 01:00Z that morning
+                utc("2026-03-30T02:20:00Z"),
+            ]
+        );
+        // The same window in UTC is what the pre-5a reconciler produced —
+        // 04:20Z every day, i.e. 06:20 local after the transition.
+        let in_utc = iter_slots_in_window(
+            &ScheduleExpression::Cron("20 4 * * *".to_string()),
+            utc("2026-03-27T12:00:00Z"),
+            utc("2026-03-30T12:00:00Z"),
+            ScheduleZone::Utc,
+        );
+        assert_eq!(in_utc[1], utc("2026-03-29T04:20:00Z"));
+    }
+
     #[test]
     fn reconciler_iter_slots_once_inside_window() {
         let from = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
@@ -2914,7 +2825,12 @@ mod tests {
             .with_timezone(&Utc);
         let to = from + chrono::Duration::hours(2);
         let target = from + chrono::Duration::hours(1);
-        let slots = iter_slots_in_window(&ScheduleExpression::Once(target.to_rfc3339()), from, to);
+        let slots = iter_slots_in_window(
+            &ScheduleExpression::Once(target.to_rfc3339()),
+            from,
+            to,
+            ScheduleZone::Utc,
+        );
         assert_eq!(slots, vec![target]);
     }
 
@@ -2927,23 +2843,33 @@ mod tests {
 
         // Before window.
         let before = from - chrono::Duration::hours(1);
-        assert!(
-            iter_slots_in_window(&ScheduleExpression::Once(before.to_rfc3339()), from, to)
-                .is_empty()
-        );
+        assert!(iter_slots_in_window(
+            &ScheduleExpression::Once(before.to_rfc3339()),
+            from,
+            to,
+            ScheduleZone::Utc
+        )
+        .is_empty());
 
         // After window.
         let after = to + chrono::Duration::hours(1);
-        assert!(
-            iter_slots_in_window(&ScheduleExpression::Once(after.to_rfc3339()), from, to)
-                .is_empty()
-        );
+        assert!(iter_slots_in_window(
+            &ScheduleExpression::Once(after.to_rfc3339()),
+            from,
+            to,
+            ScheduleZone::Utc
+        )
+        .is_empty());
 
         // Exactly at `from` is excluded (same convention as cron's
         // `after(&from)`).
-        assert!(
-            iter_slots_in_window(&ScheduleExpression::Once(from.to_rfc3339()), from, to).is_empty()
-        );
+        assert!(iter_slots_in_window(
+            &ScheduleExpression::Once(from.to_rfc3339()),
+            from,
+            to,
+            ScheduleZone::Utc
+        )
+        .is_empty());
     }
 
     #[test]
@@ -2954,6 +2880,7 @@ mod tests {
             &ScheduleExpression::Condition(ConditionScheduleConfig::default()),
             now - chrono::Duration::hours(6),
             now,
+            ScheduleZone::Utc,
         );
         assert!(slots.is_empty());
     }
@@ -3041,7 +2968,8 @@ mod tests {
         // inside (lookback_start, window_end]. The "4 minutes ago" slot
         // (11:56) should be absent; the "6 minutes ago" slot (11:54)
         // should be present.
-        let slots = iter_slots_in_window(&interval(60), lookback_start, window_end);
+        let slots =
+            iter_slots_in_window(&interval(60), lookback_start, window_end, ScheduleZone::Utc);
 
         let four_min_ago = now - chrono::Duration::minutes(4);
         let six_min_ago = now - chrono::Duration::minutes(6);
@@ -3071,7 +2999,8 @@ mod tests {
         let grace = chrono::Duration::seconds(300);
         let window_end = now - grace;
 
-        let slots = iter_slots_in_window(&interval(3600), created_at, window_end);
+        let slots =
+            iter_slots_in_window(&interval(3600), created_at, window_end, ScheduleZone::Utc);
         // 3h - 5min = 2h55min. With hourly slots from created_at + 1h, we
         // get slots at +1h, +2h. (+3h would land at exactly `now`, which is
         // past window_end.)
@@ -3192,7 +3121,7 @@ mod tests {
         let backoff = task.launch_failure_backoff().expect("backoff present");
         assert_eq!(backoff.num_seconds(), 240);
 
-        let normal_next = compute_next_run(&task.schedule, now);
+        let normal_next = compute_next_run(&task.schedule, now, ScheduleZone::Utc);
         let next = compute_launch_failed_next_run(normal_next, Some(backoff), now)
             .expect("next_run is Some");
         // Cron/interval far-future wins, not the 240s backoff.
@@ -3215,7 +3144,7 @@ mod tests {
         task.record_launch_failure();
 
         let backoff = task.launch_failure_backoff().expect("backoff present");
-        let normal_next = compute_next_run(&task.schedule, now);
+        let normal_next = compute_next_run(&task.schedule, now, ScheduleZone::Utc);
         let next = compute_launch_failed_next_run(normal_next, Some(backoff), now)
             .expect("next_run is Some");
 

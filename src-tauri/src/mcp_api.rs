@@ -1521,6 +1521,19 @@ async fn health(
         // flat means every handle is being dropped, which reads identically
         // to "coord has not deployed the route" from the outside.
         "sessionHandles": crate::claude_session::session_handle::health_snapshot(),
+        // Plan 2026-09-21-runner-blocking-pool-ratchets-to-peak-because-
+        // transcript-tails-rotate-every-idle-thread, Phase 0: a census of this
+        // process's threads BY NAME (top 12, prefix-collapsed), memoised 30 s.
+        // `null` is UNKNOWN (the census could not be taken), never an empty
+        // list — served policy `verification-and-evidence`
+        // `silent-empty-is-unknown`. It is what separates "441 threads of
+        // load" from "441 threads, 325 of them an idle tokio blocking pool".
+        "threadCensus": crate::health_monitor::thread_name_census_json(),
+        // Same plan, Phase 0: the transcript-tail population — live, parked,
+        // started/ended since boot, and the last cohort wake (>25 tails woken
+        // inside 250 ms), which is the log line Evidence 5 of that plan was
+        // missing. `lastCohortWake: null` means none observed since boot.
+        "transcriptWatcher": crate::terminal::transcript_watcher::health_snapshot(),
         "ai": {
             "configured": ai_configured,
             "running": ai_running,
@@ -1548,6 +1561,13 @@ async fn health(
         // For "is this runner out of date", use `buildDrift` below — it is
         // the only field here that can change while the window is open.
         "buildId": env!("RUNNER_BUILD_ID"),
+        // WHAT TREE STATE the two build halves came from, as content hashes
+        // (gitDirty, treeHash, rustSrcHash, frontendSrcHash, halvesAgree) —
+        // compile-time constants, like `gitSha`/`buildId` above. Compare them
+        // against a worktree with `scripts/frontend-provenance.mjs verify`;
+        // `null` is "not measured", never "agree" (plan
+        // 2026-08-23-build-provenance-assertion, Phase 4).
+        "provenance": qontinui_runner_lib::build_provenance::health_json(),
         // origin/main's current SHA + drift verdict vs the embedded gitSha
         // (see `crate::build_drift`). All-null until the first background
         // check completes, and permanently null on a repo-less install.
@@ -1681,6 +1701,8 @@ async fn health(
         // the response root without descending into `data`. Same provenance
         // semantics — and same non-semantics — as `data.buildId` above.
         "buildId": env!("RUNNER_BUILD_ID"),
+        // Top-level mirror of `data.provenance`, for the same consumers.
+        "provenance": qontinui_runner_lib::build_provenance::health_json(),
         // Phase 3J.2 — top-level mirrors of `derived_status` and `ui_error`
         // so supervisor/fleet consumers can read them without descending into
         // the inner `data` block. The inner `data.status` / `data.derived_status`
@@ -9260,6 +9282,13 @@ pub fn create_router(
     // `State<'_, Arc<ApiState>>` can resolve it.
     app_handle.manage(api_state.clone());
 
+    // Register the supervision ring under its OWN type as well, so the
+    // trigger-system dispatcher (`git_supervision::handle_supervision_action`)
+    // can resolve just the state it needs instead of reaching through
+    // `ApiState`. Cheap: `SupervisionState` is an `Arc` handle, and both
+    // registrations share the same ring.
+    app_handle.manage(api_state.supervision_state.clone());
+
     // Spawn the background sweeper that evicts stale phone-home registrations.
     crate::mcp::app_registry::spawn_sweeper(api_state.app_registry.clone());
 
@@ -10327,33 +10356,6 @@ pub fn create_router(
         });
     }
 
-    // Productivity Coordinator (Rust) scheduler — Phase 1b of
-    // `productivity-coordinator-rust-promotion.md`, with Phase 1.5
-    // (`productivity-stack-product-readiness.md`) runtime toggle.
-    //
-    // The scheduler ALWAYS starts at boot now. Whether it does work each
-    // tick is governed by an Arc<AtomicBool> flag wrapped in
-    // `CoordinatorSchedulerHandle`. The flag's initial value still comes
-    // from the env var (`QONTINUI_COORDINATOR_RUST_SCHEDULER`) for first
-    // boot, but the `launch_coordinator_session` /
-    // `stop_coordinator_session` Tauri commands flip it at runtime via
-    // the handle stashed in Tauri state — no process restart needed.
-    {
-        let coord_config = crate::coordinator::config::CoordinatorSchedulerConfig::from_env();
-        tracing::info!(
-            "Coordinator (Rust) scheduler starting: initial_enabled={} interval={}s",
-            coord_config.rust_scheduler_enabled,
-            coord_config.interval_secs,
-        );
-        let scheduler_handle = crate::coordinator::scheduler::start_coordinator_scheduler(
-            api_state.clone(),
-            coord_config,
-        );
-        // Stash the runtime-toggle handle so launch_coordinator_session
-        // can flip the flag without a process restart.
-        app_handle.manage(scheduler_handle);
-    }
-
     // Physical device USB scanner (30-second interval)
     // Discovers ADB-attached Android devices and registers them with PhysicalDeviceRegistry.
     {
@@ -11050,18 +11052,13 @@ pub fn create_router(
         // plan library — an HTTP route rather than an MCP tool, per
         // plan_library's design decision D5.
         .merge(crate::mcp::session_repository::routes())
-        .merge(crate::mcp::coordinator::routes())
         .merge(crate::mcp::subagent_api::routes())
-        .merge(crate::mcp::completion_reports::routes())
         // Approach-D Conductor/Engine Phase 2 §3 — the `orchestration_report_subtask`
-        // MCP tool (POST /orchestration/report-subtask). Mounted alongside the
-        // other completion-report route modules.
+        // MCP tool (POST /orchestration/report-subtask).
         .merge(crate::mcp::orchestration_report::routes())
         // Approach-D Conductor/Engine Phase 3 — orchestration-run control
         // surface (start/list/status/stop). Mirrors orchestration_loop_api.
         .merge(crate::mcp::orchestration_run_api::routes())
-        .merge(crate::mcp::completion_sources::routes())
-        .merge(crate::mcp::reflection::routes())
         .merge(crate::mcp::sessions::routes())
         .merge(crate::mcp::tunnel_api::routes())
         .merge(crate::mcp::automation_runs::routes())
@@ -16566,6 +16563,42 @@ mod coord_provision_session_gate_tests {
             "the fields must be rendered from that live pin"
         );
         assert!(src.contains(".route(\"/health\", get(health))"));
+    }
+
+    /// Plan `2026-09-21-runner-blocking-pool-ratchets-to-peak-because-transcript-
+    /// tails-rotate-every-idle-thread` Phase 0: the by-name thread census and the
+    /// transcript-tail gauge are rendered INSIDE `async fn health` — a snapshot
+    /// function nobody calls renders nothing, and this is the same source-scan
+    /// pin the active-tenant fields use.
+    #[test]
+    fn the_health_handler_emits_the_thread_census_and_the_tails_gauge() {
+        let src = include_str!("mcp_api.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with("async fn health("))
+            .expect("the /health handler is `async fn health(`");
+        let end = lines[start..]
+            .iter()
+            .position(|l| *l == "}")
+            .map(|i| start + i)
+            .expect("the handler closes at column 0");
+        let region = lines[start..=end]
+            .iter()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            region.contains("\"threadCensus\": crate::health_monitor::thread_name_census_json()"),
+            "{region}"
+        );
+        assert!(
+            region.contains(
+                "\"transcriptWatcher\": crate::terminal::transcript_watcher::health_snapshot()"
+            ),
+            "{region}"
+        );
     }
 
     /// Phase 4: `/health.credentialDoors` states, per transport, whether it can

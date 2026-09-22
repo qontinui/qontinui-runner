@@ -1,0 +1,34 @@
+{
+  "//": "Pins the provenance fold byte format on BOTH sides: scripts/frontend-provenance.mjs foldLines and src-tauri/build.rs fold_lines must each produce `expected_fold` from `entries` (a null oid is an absent input). Change the format in both or neither (plan 2026-08-23-build-provenance-assertion).",
+  "entries": [
+    {
+      "path": "src/b.tsx",
+      "oid": "2222222222222222222222222222222222222222"
+    },
+    {
+      "path": "src\\App.tsx",
+      "oid": "1111111111111111111111111111111111111111"
+    },
+    {
+      "path": "src/Zeta.ts",
+      "oid": "3333333333333333333333333333333333333333"
+    },
+    {
+      "path": "src/á.ts",
+      "oid": "4444444444444444444444444444444444444444"
+    },
+    {
+      "path": "src/é.ts",
+      "oid": null
+    },
+    {
+      "path": "index.html",
+      "oid": "5555555555555555555555555555555555555555"
+    },
+    {
+      "path": "src/_x.ts",
+      "oid": "6666666666666666666666666666666666666666"
+    }
+  ],
+  "expected_fold": "index.html 5555555555555555555555555555555555555555\nsrc/App.tsx 1111111111111111111111111111111111111111\nsrc/Zeta.ts 3333333333333333333333333333333333333333\nsrc/_x.ts 6666666666666666666666666666666666666666\nsrc/b.tsx 2222222222222222222222222222222222222222\nsrc/á.ts 4444444444444444444444444444444444444444\nsrc/é.ts absent\n"
+}

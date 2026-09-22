@@ -606,6 +606,50 @@ else
   printf 'coord cred (now)   UNKNOWN - no coordCredential key in this /health body (build predates the field)\n'
 fi
 
+# THE RUNNER'S DEFAULT TENANT, from the same body. `activeTenantPin` is the
+# runner's three-way verdict on `machine.json::active_tenant_id` (plan
+# `2026-09-17-findings-carry-a-triage-stamp-and-the-steward-reads-since-last-run`
+# Phase 5): `pinned` carries `activeTenantId`, `unpinned` is the legitimate
+# single-tenant shape, and `unresolvable` is NOT "unset" - the file is missing,
+# unreadable, not JSON, or its value is not a UUID. It is what a
+# `/findings-steward` cycle without `--tenant` runs against, and it is CONTEXT
+# for Step 5, never this session's tenant. An absent key is a build predating
+# the field.
+LIVE_PIN=""
+LIVE_TENANT=""
+PIN_PRESENT=""
+case "$LIVE_BUILD" in *'"activeTenantPin"'*) PIN_PRESENT=1 ;; esac
+case "$LIVE_BUILD" in
+  *'"activeTenantPin":"'*)
+    LIVE_PIN="${LIVE_BUILD#*\"activeTenantPin\":\"}"
+    LIVE_PIN="${LIVE_PIN%%\"*}"
+    ;;
+esac
+case "$LIVE_BUILD" in
+  *'"activeTenantId":"'*)
+    LIVE_TENANT="${LIVE_BUILD#*\"activeTenantId\":\"}"
+    LIVE_TENANT="${LIVE_TENANT%%\"*}"
+    ;;
+esac
+if [ -z "$LIVE_BUILD" ]; then
+  printf 'default tenant     UNKNOWN - /health did not answer\n'
+else
+  case "$LIVE_PIN" in
+    pinned)       printf 'default tenant     pinned %s (machine.json::active_tenant_id)\n' "${LIVE_TENANT:-<unparsed>}" ;;
+    unpinned)     printf 'default tenant     unpinned (single-tenant; a --tenant-less /findings-steward reads its own door: default_source=session-binding)\n' ;;
+    unresolvable) printf 'default tenant     unresolvable - machine.json is missing, unreadable, not JSON, or active_tenant_id is not a UUID; a --tenant-less /findings-steward STOPS UNKNOWN\n' ;;
+    '')
+      # Present-but-unparsed is NOT "the build predates the field" -- the same
+      # split the coord cred row above makes.
+      if [ -n "$PIN_PRESENT" ]; then
+        printf 'default tenant     UNKNOWN - activeTenantPin is present but this reader could not parse a value out of it\n'
+      else
+        printf 'default tenant     UNKNOWN - no activeTenantPin key in this /health body (build predates the field)\n'
+      fi ;;
+    *)            printf 'default tenant     UNKNOWN - activeTenantPin=%s is not a value this reader knows\n' "$LIVE_PIN" ;;
+  esac
+fi
+
 if [ -z "$SPAWN_SHA" ] || [ -z "$LIVE_SHA" ]; then
   printf 'build cross-check  UNKNOWN (spawn=%s live=%s)\n' "${SPAWN_SHA:-?}" "${LIVE_SHA:-?}"
 elif [ "$SPAWN_SHA" = "$LIVE_SHA" ]; then
@@ -726,7 +770,9 @@ fi
 
 Read the rows, do not summarise them away: a `credential` tenant that differs
 from the `row` tenant is the wrong-tenant-write condition itself, and
-`current-default` is context only — after an operator switches the device
+`current-default` is context only (so is Step 4's `default tenant` row: the
+runner's `activeTenantPin`, what a `--tenant`-less `/findings-steward` cycle
+runs against, never this session's tenant) — after an operator switches the device
 default every running session legitimately differs from it. An `unknown`
 anywhere names its reason; carry the reason into the one-sentence summary.
 
@@ -863,6 +909,27 @@ if (-not "$runnerBody") {
   'coord cred (now)   UNKNOWN - no coordCredential key in this /health body (build predates the field)'
 }
 
+# The runner's default tenant, from the same body - see the bash twin in Step 4
+# for what the three pins mean.
+$livePin = ''; $liveTenant = ''
+if ("$runnerBody" -cmatch '"activeTenantPin"\s*:\s*"([^"]*)"') { $livePin = $Matches[1] }
+if ("$runnerBody" -cmatch '"activeTenantId"\s*:\s*"([^"]*)"') { $liveTenant = $Matches[1] }
+if (-not "$runnerBody") {
+  'default tenant     UNKNOWN - /health did not answer'
+} elseif ($livePin -ceq 'pinned') {
+  "default tenant     pinned $(if ($liveTenant) { $liveTenant } else { '<unparsed>' }) (machine.json::active_tenant_id)"
+} elseif ($livePin -ceq 'unpinned') {
+  'default tenant     unpinned (single-tenant; a --tenant-less /findings-steward reads its own door: default_source=session-binding)'
+} elseif ($livePin -ceq 'unresolvable') {
+  'default tenant     unresolvable - machine.json is missing, unreadable, not JSON, or active_tenant_id is not a UUID; a --tenant-less /findings-steward STOPS UNKNOWN'
+} elseif (-not $livePin -and ("$runnerBody" -cmatch '"activeTenantPin"')) {
+  'default tenant     UNKNOWN - activeTenantPin is present but this reader could not parse a value out of it'
+} elseif (-not $livePin) {
+  'default tenant     UNKNOWN - no activeTenantPin key in this /health body (build predates the field)'
+} else {
+  "default tenant     UNKNOWN - activeTenantPin=$livePin is not a value this reader knows"
+}
+
 # Step 4, from the /health body already fetched above - no second request.
 # `data.gitSha`, NOT the top-level `buildId`: see the long note in Step 4 for
 # why those are different shas from different build steps. The regex demands
@@ -922,6 +989,7 @@ runner  :9876       up (HTTP 200)
 supervisor :9875    DOWN (connection refused)
 live coord proxy    <path/to/.mcp.json>  (nonce#<fp>) | not swept
 build cross-check   AGREE | DISAGREE | UNKNOWN
+default tenant      pinned <uuid> | unpinned (...) | unresolvable - <why> | UNKNOWN - <why>
 
 === TENANCY (read from the runner now) ===
 row            tenant <uuid|<null>>  spawn-default <uuid|<null>> [<recorded|unknown> <reason>]  current-default <uuid> (context only)

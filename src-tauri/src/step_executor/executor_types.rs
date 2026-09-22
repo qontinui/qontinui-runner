@@ -49,6 +49,37 @@ impl std::fmt::Display for StepPhase {
     }
 }
 
+/// Let `step_injection`'s parser deserialize AI-emitted `[INJECT_STEP]`
+/// blocks straight into this config.
+///
+/// The parser declares what it needs; this is the only place the two are
+/// tied together, so the parser module names no execution type.
+impl crate::step_injection::parser::InjectableStep for ExecutionStepConfig {
+    fn step_type(&self) -> &str {
+        &self.step_type
+    }
+
+    fn set_phase(&mut self, phase: String) {
+        self.phase = Some(phase);
+    }
+
+    fn has_command_mode(&self) -> bool {
+        self.command_mode.is_some()
+    }
+
+    fn set_command_mode(&mut self, mode: String) {
+        self.command_mode = Some(mode);
+    }
+
+    fn has_id(&self) -> bool {
+        self.id.is_some()
+    }
+
+    fn set_id(&mut self, id: String) {
+        self.id = Some(id);
+    }
+}
+
 /// Configuration for a single execution step.
 ///
 /// Supports 3 core step types: command, ui_bridge, prompt.
