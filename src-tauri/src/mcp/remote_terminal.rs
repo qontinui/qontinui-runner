@@ -2689,8 +2689,12 @@ impl RemoteAttachClient {
     }
 
     /// Route one inbound frame. Returns `true` when this client consumed it.
-    /// Handles `remote_terminal_attached|output|exit|buffer|error` and a
-    /// generic `error` whose `request_id` names a pending attach.
+    /// Handles `remote_terminal_created|attached|output|exit|buffer|error` and
+    /// a generic `error` whose `request_id` names a pending attach.
+    ///
+    /// `created` was omitted from this list while its arm existed below, and
+    /// the relay dispatcher did not route it either — the two omissions agreed
+    /// with each other, which is part of why the gap survived.
     pub fn handle_inbound(&self, msg_type: &str, data: &Value) -> bool {
         let request_id = data.get("request_id").and_then(|v| v.as_str());
         let grant_jti = data.get("grant_jti").and_then(|v| v.as_str());

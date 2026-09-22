@@ -263,10 +263,39 @@ pub(crate) struct ResourceSample {
     /// widening — do not pattern-match the type off the neighbouring `BIGINT`
     /// saturation fields.
     ///
-    /// coord grades this warn at 256 / critical at 400, the same two numbers as
-    /// this runner's shipped [`crate::settings::SessionGuardSettings`]
-    /// `warn_thread_count` / `critical_thread_count`, so the dashboard's
-    /// verdict and the local spawn gate's cannot drift into two opinions.
+    /// ## ⚠️ The enforcing ceiling is NO LONGER a constant, and coord cannot
+    /// see it yet — so a consumer's grade of this number may disagree with
+    /// the guard's
+    ///
+    /// `resource_guard` re-bases each machine's thread ladder onto its own
+    /// measured at-rest floor, so on a high-core box the runner may enforce
+    /// e.g. 507 / 651 while coord's `DEFAULT_THREAD_WARN_COUNT` /
+    /// `DEFAULT_THREAD_CRITICAL_COUNT` still grade at 256 / 400. **That
+    /// divergence is real, known, and not closed by this field.**
+    ///
+    /// Publishing the effective ceilings beside the reading is the fix, and it
+    /// is deliberately NOT done here yet, because it would be inert and noisy:
+    /// `coord.device_resource_samples` has no ceiling columns (alembic in
+    /// qontinui-web is the sole author of `coord.*` schema, and no such
+    /// revision exists), so coord's ingest would route both keys into
+    /// `ResourceSampleItem::unknown_fields` — which it DROPS after emitting a
+    /// `tracing::warn!` naming them, on the log surface reserved for publisher
+    /// typos. At a 30 s tick that is ~2,880 warn lines per runner per day
+    /// buying a consumer nothing. The migration lands first; the publisher
+    /// follows it. Until then, grade this number knowing you may be grading it
+    /// against a ceiling the runner does not use.
+    ///
+    /// This doc used to say coord "grades this warn at 256 / critical at 400,
+    /// the same two numbers as this runner's shipped
+    /// [`crate::settings::SessionGuardSettings`] … so the dashboard's verdict
+    /// and the local spawn gate's cannot drift into two opinions." That was
+    /// true only while the ceilings were absolute constants. They are now
+    /// re-based onto each machine's measured at-rest thread floor
+    /// ([`crate::resource_guard::machine_thread_shift`]), so a
+    /// 48-core box enforces a different pair from a 4-core one and a hardcoded
+    /// 256/400 on the reader's side IS the drift that sentence promised could
+    /// not happen. Publishing the pair beside the reading is what keeps the
+    /// promise; hardcoding it is what breaks it.
     ///
     /// `None` when [`crate::health_monitor::thread_count_reading`] cannot read
     /// the sensor — UNKNOWN, never 0, for the reason [`Saturation`]'s "NULL,
@@ -850,6 +879,18 @@ fn collect_host_lane() -> ResourceSample {
     s.thread_count =
         crate::health_monitor::thread_count_reading().map(|n| n.min(i32::MAX as usize) as i32);
     s.active_terminal_sessions = live_terminal_session_count();
+
+    // Fold this tick into the at-rest thread floor the guard re-bases its
+    // ceilings onto. Both readings were just taken, on the same tick, two lines
+    // apart — which is exactly why the baseline lives off THIS loop and needs
+    // no sensor, timer or registry reach of its own. Either one UNKNOWN records
+    // nothing; see `record_at_rest_sample`.
+    crate::resource_guard::record_at_rest_sample(
+        s.thread_count.and_then(|n| usize::try_from(n).ok()),
+        s.active_terminal_sessions
+            .and_then(|n| usize::try_from(n).ok()),
+    );
+
     s.blocking_lanes = Some(
         tracked_blocking_by_thread()
             .into_iter()
@@ -2608,10 +2649,11 @@ MemAvailable:   15335424 kB
     /// The `usize -> i32` narrowing saturates rather than wrapping.
     ///
     /// A wrapped count is worse than no count: on a 64-bit host a thread figure
-    /// past `i32::MAX` would land NEGATIVE, and coord grades this column
-    /// against 256/400 — a negative reading grades `ok` on a box that just
-    /// exhausted its thread table. The value is absurd in practice, which is
-    /// exactly why nothing else would catch it.
+    /// past `i32::MAX` would land NEGATIVE, and a negative reading grades `ok`
+    /// against any ceiling at all — on a box that just exhausted its thread
+    /// table. (Which ceiling a consumer applies is now machine-dependent; the
+    /// narrowing hazard is the same either way.) The value is absurd in
+    /// practice, which is exactly why nothing else would catch it.
     #[test]
     fn the_usize_to_i32_narrowing_saturates_rather_than_wrapping() {
         let narrow = |n: usize| n.min(i32::MAX as usize) as i32;
@@ -2632,8 +2674,8 @@ MemAvailable:   15335424 kB
             body.matches("as i32").count(),
             body.matches("min(i32::MAX").count(),
             "every `as i32` in the host lane must be preceded by its clamp — a \
-             bare narrowing is how a count becomes a negative, and coord grades \
-             `thread_count` against 256/400, where a negative reads `ok`"
+             bare narrowing is how a count becomes a negative, and a negative \
+             reads `ok` against every ceiling this sample can carry"
         );
     }
 

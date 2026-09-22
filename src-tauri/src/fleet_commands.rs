@@ -2652,4 +2652,180 @@ mod tests {
              went stale"
         );
     }
+
+    /// The two `/health` keys the default-tenant card READS, spelled exactly as
+    /// `crate::mcp_api`'s health handler serves them.
+    ///
+    /// The PRODUCER half of this contract is already pinned from both ends in
+    /// `mcp_api.rs` — `health_active_tenant_fields_render_all_three_pins` over
+    /// the pure renderer, and `the_health_handler_emits_the_active_tenant_fields`
+    /// over the handler's own source. The CONSUMER half had nothing. Renaming a
+    /// key would redden `mcp_api.rs` and leave this card green while it silently
+    /// degrades to "build predates the field" — a clean-looking WRONG answer,
+    /// not an error, which is the same failure class
+    /// [`CLEAN_LOOKING_UNKNOWN_ARMS`] exists for one subsystem over.
+    const ACTIVE_TENANT_HEALTH_KEYS: [&str; 2] = ["activeTenantId", "activeTenantPin"];
+
+    /// Every arm the default-tenant card can print, as `(row, why it is
+    /// load-bearing)`.
+    ///
+    /// The card ships TWO readers of the same `/health` body — a bash one in
+    /// Step 4 and a PowerShell twin further down — so each of these appears
+    /// exactly twice in the canonical body, and the guard below asserts that
+    /// COUNT rather than mere presence. A re-vendor that updates one twin and
+    /// not the other is the drift this catches: both halves keep printing, the
+    /// prose still reads complete, and the two platforms quietly answer
+    /// differently about which tenant a `--tenant`-less `/findings-steward`
+    /// cycle would run against.
+    const DEFAULT_TENANT_CARD_ARMS: &[(&str, &str)] = &[
+        (
+            "default tenant UNKNOWN - /health did not answer",
+            "the no-body arm. Without it an unreachable runner falls through to the \
+             pin-value match, whose empty-string arm reports `activeTenantPin` as \
+             ABSENT — a statement about the runner's BUILD derived from a request that \
+             never arrived",
+        ),
+        (
+            "default tenant pinned",
+            "the arm that names a tenant. It is the only row a reader can act on, and \
+             the only one that must carry the uuid rather than describe it",
+        ),
+        (
+            "unpinned (single-tenant; a --tenant-less /findings-steward reads its own \
+             door: default_source=session-binding)",
+            "`unpinned` is the LEGITIMATE single-tenant shape (the key absent, or an \
+             explicit JSON null), not a fault — see `crate::session::tenant_pin`, whose \
+             whole reason for being a type is that this arm and the next one were once \
+             one `None`. The parenthetical is what stops a reader reading a correct \
+             machine as a broken one, and it is where the steward's `default_source` \
+             for this arm is actually named",
+        ),
+        (
+            "unresolvable - machine.json is missing, unreadable, not JSON, or \
+             active_tenant_id is not a UUID; a --tenant-less /findings-steward STOPS \
+             UNKNOWN",
+            "`unresolvable` is the fail-closed arm, and the reason must travel with it: \
+             the row states WHICH four conditions produce it, so it cannot be read as \
+             the benign `unpinned` above, and it states that a cycle STOPS rather than \
+             running against a guessed tenant",
+        ),
+        (
+            "activeTenantPin is present but this reader could not parse a value out of it",
+            "present-but-unparsed. Folding it into the absent arm below would report a \
+             READER defect as a statement about the runner's build — the same split the \
+             `coord cred (now)` row one screen up makes, for the same reason",
+        ),
+        (
+            "no activeTenantPin key in this /health body (build predates the field)",
+            "key-absent, the other side of that split. This is the ONLY arm entitled to \
+             blame the runner's build, and it is reachable today: a box running a build \
+             from before the field landed serves a body carrying neither key",
+        ),
+        (
+            "is not a value this reader knows",
+            "the unrecognised-value arm. `activeTenantPin` is a three-way enum; a fourth \
+             variant added server-side must read as UNKNOWN here, never fall through to \
+             a default. Served policy `verification-and-evidence` \
+             `unknown-must-not-render-as-a-default`",
+        ),
+    ];
+
+    /// Every bundled command that reads `/health`'s `activeTenantPin` must keep
+    /// all of [`DEFAULT_TENANT_CARD_ARMS`], in BOTH of its platform twins, and
+    /// must spell the [`ACTIVE_TENANT_HEALTH_KEYS`] the runner actually serves.
+    ///
+    /// These bodies are what ships (see the module doc): on a device with no
+    /// `qontinui-claude-config` checkout they are the ONLY copy, so an arm lost
+    /// in a re-vendor is an arm the fleet does not have. That is not
+    /// hypothetical in this directory — #1619 re-vendors 11 byte-drifted bodies
+    /// and #1658 exists to restore rows an earlier re-vendor silently reverted.
+    #[test]
+    fn bundled_default_tenant_cards_keep_every_arm_in_both_twins() {
+        let mut checked = 0usize;
+        for (name, contents) in FLEET_COMMANDS {
+            // Scope probe: the card is defined by READING the pin key, not by
+            // being named `whereami` — a second command that grows this row is
+            // in scope the moment it does.
+            if !contents.contains("activeTenantPin") {
+                continue;
+            }
+            checked += 1;
+
+            for key in ACTIVE_TENANT_HEALTH_KEYS {
+                assert!(
+                    contents.contains(key),
+                    "bundled agent command {name} reads the runner's default-tenant \
+                     fields but never names {key:?}. `/health` serves `activeTenantId` \
+                     and `activeTenantPin` together (`mcp_api.rs`, \
+                     `active_tenant_health_fields`); a card that parses only one of them \
+                     cannot tell `unpinned` from `unresolvable`, because the id is null \
+                     for BOTH"
+                );
+            }
+
+            // Whitespace-collapsed on both sides: these arms are long, and a
+            // pure re-wrap of the canonical body splits them without changing a
+            // word. See [`collapse_ws`]. Case-insensitive for the same reason
+            // the neighbouring clause guard is — the words are the invariant,
+            // their capitalisation is prose style.
+            let haystack = collapse_ws(contents).to_lowercase();
+            for (arm, why) in DEFAULT_TENANT_CARD_ARMS {
+                let needle = collapse_ws(arm).to_lowercase();
+                let seen = haystack.matches(&needle).count();
+                assert!(
+                    seen >= 2,
+                    "bundled agent command {name} prints the default-tenant row {arm:?} \
+                     {seen} time(s), not the 2 the card needs — {why}. The card carries \
+                     a bash reader AND a PowerShell twin of the same `/health` body, so \
+                     each arm is written twice; one occurrence means a re-vendor updated \
+                     one twin and left the other behind, and the two platforms now \
+                     disagree about this runner's default tenant. Restore it in \
+                     qontinui-claude-config .claude/commands/{name}.md (then re-vendor). \
+                     The match is whitespace- and case-insensitive, so neither a line \
+                     break inside the phrase nor a capitalisation change is what this is \
+                     reporting"
+                );
+            }
+
+            // The three-way split is the entire reason `TenantPin` is a type
+            // rather than an `Option<Uuid>`; a card that drops this sentence
+            // keeps all three arms and loses the one thing that stops the next
+            // editor collapsing `unresolvable` back into "unset".
+            assert!(
+                haystack.contains(&collapse_ws("is NOT \"unset\"").to_lowercase()),
+                "bundled agent command {name} prints all three `activeTenantPin` arms \
+                 but never says that `unresolvable` is NOT \"unset\". `unpinned` IS \
+                 unset; `unresolvable` is a machine that tried to state its tenant and \
+                 produced garbage, and `activeTenantId` is null for both — so a reader \
+                 who loses that sentence has no way left to tell a correctly-configured \
+                 single-tenant box from a broken one. `mcp_api.rs`'s \
+                 `health_active_tenant_fields_render_all_three_pins` asserts the same \
+                 invariant on the producing side"
+            );
+
+            // The REACHABILITY template is what a reader renders the card from.
+            // Dropping the row there while keeping both readers leaves the row
+            // printed but undocumented — and an undocumented row is the one a
+            // summariser drops.
+            assert!(
+                collapse_ws(contents).contains(&collapse_ws(
+                    "default tenant      pinned <uuid> | unpinned (...) | \
+                     unresolvable - <why> | UNKNOWN - <why>"
+                )),
+                "bundled agent command {name} reads `activeTenantPin` but its \
+                 REACHABILITY output template no longer lists the `default tenant` row \
+                 with all four of its shapes. The template is the copy a reader renders \
+                 from; a row missing there is a row that gets summarised away even while \
+                 the readers above still print it"
+            );
+        }
+        assert!(
+            checked > 0,
+            "no bundled command reads `/health`'s `activeTenantPin` — either the bundle \
+             lost the default-tenant card (qontinui-claude-config#1088, plan \
+             2026-09-17-findings-carry-a-triage-stamp-and-the-steward-reads-since-last-run \
+             Phase 5) or this guard's content probe went stale. Both are findings; \
+             neither is a pass"
+        );
+    }
 }

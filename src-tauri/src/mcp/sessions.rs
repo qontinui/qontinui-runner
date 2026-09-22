@@ -1003,6 +1003,42 @@ async fn policy_context(
 }
 
 // =============================================================================
+// /sessions/policy-context-stats
+// =============================================================================
+
+/// `GET /sessions/policy-context-stats` — how many INJECTIONS carried the FULL
+/// policy body since this runner started, and why (plan
+/// `2026-09-21-policy-body-still-crosses-the-sessionstart-boundary`, Phase 2).
+///
+/// **Injections, not sessions** — see the warning below; the distinction is the
+/// difference between reading this route right and reading it backwards, so it
+/// belongs in the first sentence rather than only in a note further down.
+///
+/// The honesty gate in [`crate::mcp::policy_context::render_for_session`] fails
+/// OPEN: anything it cannot confirm gets the full body. That is correct and it
+/// was also invisible — a marker that never arrived looked exactly like a
+/// marker deliberately withheld on a `resume`, in every log and every metric,
+/// and the feature regressed to its pre-change behaviour for five days with
+/// nothing saying so.
+///
+/// One row per [`crate::mcp::policy_context::PolicyRenderReason`], plus
+/// `full_body_total` and `injections`, so the ratio is computable from this one
+/// read — without grepping a transcript or a log. Counts are process-lifetime:
+/// a restart zeroes them, and the durable per-session record remains coord's
+/// `session_policy_reads`, which this route deliberately does not duplicate.
+///
+/// ⚠️ **The unit is an INJECTION, not a session.** `compact` is a confirmable
+/// source and this route fires on every `SessionStart`, so one long-lived
+/// session contributes one count per compaction and the `confirmed` share is
+/// inflated by exactly the longest-running sessions. Read the per-source split
+/// before drawing a per-session conclusion — the full rationale, and the
+/// worked example that inverts a naive ratio, is on
+/// [`crate::mcp::policy_context::PolicyRenderStats`].
+async fn policy_context_stats() -> Json<crate::mcp::policy_context::PolicyRenderStats> {
+    Json(crate::mcp::policy_context::render_stats())
+}
+
+// =============================================================================
 // /sessions/<id>/context-low
 // =============================================================================
 
@@ -1250,6 +1286,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         )
         .route("/sessions/{id}/context-low", post(context_low))
         .route("/sessions/{id}/policy-context", get(policy_context))
+        .route("/sessions/policy-context-stats", get(policy_context_stats))
         // Mark a session's WORK finished (or unmark it). NOTE: this family has
         // no `route_entries()` and `manifest_matches_route_calls` does not reach
         // it — that test scans `src/mcp/ui_bridge` only, and its regex is
