@@ -30,18 +30,50 @@ session. Carry the verdict as `unknown`, emit no Outcome tag, and SAY in the
 summary that no review existed — do not emit a failure summary either, which
 would be the same mistake in the other direction.
 
-> This file is the CANONICAL copy for a spawned session: `fleet_commands.rs`
-> ships these `.md` bodies, and `provision_fleet_commands_into` writes this one
-> into a session's working directory unless the destination already exists AND
-> is git-tracked there — false in an allocated worktree of any repo EXCEPT
-> qontinui-claude-config, which tracks its own copy at `.claude/commands/`, so
-> there the tracked file is left in place and is what the session reads. The rule above
-> is deliberately worded to match `.claude/commands/summarize-session.md` in
-> qontinui-claude-config, which corrected the same clause; the two must not
-> drift. The Rust default that used to contradict both
-> (`productivity/summarize.rs`, `Ok(None) => "approved"`) is deleted by Phase 4
-> of `2026-09-12-consolidate-local-orchestration-onto-conductor`, so there is no
-> third copy.
+> **The runner carries TWO copies of the old rule, and only one of them ends
+> by deletion. Both are verified at the runner's `origin/main` `4ad6d7350`,
+> 2026-09-16.**
+>
+> - **`src-tauri/src/productivity/summarize.rs` — deleted, not corrected.**
+>   It maps `Ok(None) => "approved"`. **Do not open a follow-up for this
+>   half.** Phase 4 of
+>   `2026-09-12-consolidate-local-orchestration-onto-conductor` removes
+>   `src-tauri/src/productivity/` entirely, `summarize.rs` with it, along with
+>   the `summarize_session` Tauri command; this command file drives the runner
+>   over HTTP routes that survive (`POST /productivity-knowledge`,
+>   `GET /sessions/<id>/latest-review`), so it is unaffected.
+> - **`src-tauri/src/fleet_commands/summarize-session.md` — a second
+>   canonical copy, untouched by Phase 4's first four commits and corrected
+>   in its final one.** Its lines 26-27 still read *"If
+>   no review exists yet, treat the verdict as `approved` — i.e. emit a normal
+>   summary, not a failure summary."* That file is not a staged copy of this
+>   one: `src-tauri/src/fleet_commands.rs` says in its module header that the
+>   `fleet_commands/*.md` files are the CANONICAL fleet-shipped sources
+>   (`summarize-session` is registered in `FLEET_COMMANDS`), and
+>   `provision_fleet_commands_into` writes each one into a spawned session's
+>   working directory unless the destination already exists AND is tracked in
+>   the enclosing repo (`provision_guard.rs`: `dst.exists() && contains(rel)`)
+>   — false in an allocated worktree of any repo EXCEPT qontinui-claude-config,
+>   which tracks its own copy at `.claude/commands/`, so there the tracked file
+>   is left in place and is what the session reads. That exception is the point:
+>   this copy wins exactly where it is tracked, and the runner's wins everywhere
+>   else, and the
+>   failure this rule exists to prevent — an unreviewed failed session
+>   summarised as if it were a normal one — still happens in the majority
+>   case.
+>
+> **Status: the runner-side correction is CARRIED, not owed.** The Phase 4
+> qontinui-runner branch
+> `agent/eb2155ed4152-01a0a7d44995/2026-09-12-consolidate-local-orchestration-onto-conductor-ph`
+> rewrites those lines to the UNKNOWN rule above, byte-identical to the step-1
+> and step-5 text in this file (both copies diffed mechanically 2026-09-16).
+> **No follow-up is owed — do not open one.** The divergence is live on the
+> runner's `origin/main` (`4ad6d7350`, still blob `4b7004b7a`, still
+> `approved`) only until that PR merges, and this PR carries
+> `coord:downstream-of=qontinui/qontinui-runner#<n>`, which puts this repo on
+> the waiting side of that edge — so the two copies land in the safe order and
+> a spawned session never sees the corrected config copy beside an
+> uncorrected runner one.
 
 ### 2. Identify learnings
 
@@ -72,7 +104,7 @@ often the most valuable learning.
 
 Each learning has an `area`. Pick one of: `executor`, `claude_session`,
 `dispatcher`, `database`, `ui-bridge`, `frontend`, `migrations`, `tests`,
-`coordinator`, `testing-infra`, or `other`. Be willing to invent new areas
+`orchestration`, `testing-infra`, or `other`. Be willing to invent new areas
 sparingly — they're free-form text and grouped via FTS.
 
 ### 4. Tag failed-attempt outcomes (REQUIRED for verdict=needs_fix /
