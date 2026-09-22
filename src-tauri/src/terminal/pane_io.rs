@@ -94,10 +94,21 @@ pub trait PaneIo: Send + Sync {
 
     /// Block until the pane's process ends and return its exit code.
     ///
-    /// Called from the waiter thread, at most once. The local mapping is
-    /// `0` on success and `1` otherwise, because `portable_pty` does not
-    /// expose the raw code on every platform; the session layer keeps that
-    /// contract rather than this trait inventing a richer one.
+    /// Called from the waiter thread, at most once. Returns
+    /// `portable_pty::ExitStatus::exit_code()` verbatim, widened to `i32`
+    /// (plan `2026-08-27-operator-touch-observation-runner-emitter` §2b). That
+    /// recovers genuine non-zero shell exit codes — `127` command-not-found,
+    /// `126` not-executable, `2` misuse, an explicit `exit N` — which a prior
+    /// `success()`-only mapping flattened to a bare `0`/`1`.
+    ///
+    /// ⚠️ This does **not** distinguish a crash from a signal: `ExitStatus` is
+    /// a private-field struct exposing only `success()`/`exit_code()`, and on
+    /// unix `From<std::process::ExitStatus>` maps a signalled process through
+    /// `status.code().unwrap_or(1)` — SIGKILL and SIGTERM both arrive as
+    /// `exit_code() == 1`, identically to an ordinary `exit 1`. A caller may
+    /// read a non-zero code as "genuine non-zero exit, cause otherwise
+    /// unknown" and no richer than that; no field derived from it may imply
+    /// signal attribution.
     fn wait(&self) -> Result<i32, String>;
 
     /// Terminate the pane's process tree, spending at most `budget` on any
@@ -265,9 +276,11 @@ impl PaneIo for LocalPty {
             return Err("child already waited on".to_string());
         };
         let status = child.wait().map_err(|e| e.to_string())?;
-        // ExitStatus doesn't expose the code directly on all platforms via
-        // portable-pty. Use success() check; non-zero falls back to 1.
-        Ok(if status.success() { 0 } else { 1 })
+        // Recover the real code (plan
+        // 2026-08-27-operator-touch-observation-runner-emitter §2b) instead of
+        // flattening every non-zero exit to a bare `1` — see the trait doc for
+        // what this can and cannot distinguish.
+        Ok(status.exit_code() as i32)
     }
 
     fn kill(&self, budget: Duration) -> Result<(), String> {
@@ -626,5 +639,52 @@ mod tests {
             matches!(pane.reader(), Err(_)),
             "no reader after the master is released"
         );
+    }
+
+    /// The §2b fix, pinned: a real non-zero shell exit code (127,
+    /// command-not-found) survives through `PtyPaneIo::wait` instead of
+    /// flattening to the old bare `1`. Plan
+    /// `2026-08-27-operator-touch-observation-runner-emitter` §2b.
+    #[test]
+    fn local_pty_recovers_the_real_nonzero_exit_code() {
+        let mut cmd = if cfg!(windows) {
+            let mut c = CommandBuilder::new("cmd");
+            c.arg("/C");
+            c.arg("exit 127");
+            c
+        } else {
+            let mut c = CommandBuilder::new("sh");
+            c.arg("-c");
+            c.arg("exit 127");
+            c
+        };
+        cmd.env("TERM", "xterm-256color");
+
+        let pane: Arc<dyn PaneIo> = Arc::new(
+            LocalPty::open("paneio-exit-code-test", 80, 24)
+                .expect("openpty")
+                .spawn(ScrubbedCommand::seal(cmd))
+                .expect("spawn"),
+        );
+        // Drain the reader so a full pipe can never wedge the wait — same
+        // discipline as the round-trip test above.
+        let mut reader = pane.reader().expect("reader");
+        let reader_thread = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+
+        let code = pane.wait().expect("wait");
+        assert_eq!(
+            code, 127,
+            "a real non-zero exit code must survive, not flatten to 1"
+        );
+        pane.release(Duration::from_secs(2)).expect("release");
+        let _ = reader_thread.join();
     }
 }

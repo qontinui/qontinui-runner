@@ -279,6 +279,13 @@ fn scan_interval() -> Duration {
 fn scan_once_blocking() {
     scan_grids_once();
     super::context_watcher::scan_terminals_once();
+    // Trigger 1 (idle_at_prompt) — plan
+    // 2026-08-27-operator-touch-observation-runner-emitter, Phase B2 §2a's
+    // RESOLVED seam. Rides the SAME tick as the context-exhaustion watcher
+    // above rather than the looping-agent supervisor's ticker, which sees
+    // only registered looping agents — see
+    // `operator_touch_watch`'s module docs for why that seam was rejected.
+    super::operator_touch_watch::scan_idle_touches_once();
 }
 
 pub fn spawn_grid_scan_loop() {
