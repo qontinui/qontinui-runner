@@ -2429,7 +2429,14 @@ mod script_tests {
     /// merely short a vector, so widening the byte vector could never have
     /// caught it.
     fn c0_reordering_locale(bash: &Path) -> String {
-        let listed = Command::new("locale").arg("-a").output();
+        // BOUNDED like every other spawn in this module: `locale -a` is a
+        // one-shot read, but an unbounded `.output()` parks the calling thread
+        // forever if it hangs, and this one runs in CI. The loop below already
+        // went through `output_with_timeout`; this call was the one that did
+        // not (caught by `scripts/check_untimed_subprocess.py`).
+        let mut listing = Command::new("locale");
+        listing.arg("-a");
+        let listed = output_with_timeout(listing, SCRIPT_BUDGET);
         let names: Vec<String> = listed
             .map(|o| {
                 String::from_utf8_lossy(&o.stdout)
