@@ -19,6 +19,13 @@ name: throwaway-timeout-pairing-experiment
 
 on:
   workflow_dispatch:
+  # workflow_dispatch alone is not invokable via API/CLI until the workflow
+  # file exists on the default branch -- GitHub only indexes dispatchable
+  # workflows from `main`. This is a THROWAWAY workflow on a branch, so push
+  # is what actually fires it here.
+  push:
+    branches:
+      - throwaway/timeout-pairing-experiment-e445ced6
 
 jobs:
   experiment:
