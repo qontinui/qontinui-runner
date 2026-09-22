@@ -1718,10 +1718,13 @@ mod tests {
         }
     }
 
-    /// Every status-blockquote `Area:` line on `qontinui-dev-notes`
+    /// Every status-blockquote `Area:` line but one on `qontinui-dev-notes`
     /// `origin/main` as of 2026-09-22 (`86208321`, plus the
     /// `2026-08-31-published-build-parity-check` line added by `171b0398`),
-    /// verbatim, each under the status line it sits beneath in its plan. Re-measure with
+    /// verbatim, each under the status line it sits beneath in its plan. The
+    /// twelfth, the parity plan's own head, is tested verbatim by
+    /// `inline_code_area_mention_is_not_a_key` below instead, because its point
+    /// is the inline-code mention that precedes the real key. Re-measure with
     /// `git grep -n 'Area:' origin/main -- plans/` filtered to the status block.
     const STATUS_BLOCK_AREA_FIXTURES: &[(&str, &str, Option<&str>)] = &[
         (
