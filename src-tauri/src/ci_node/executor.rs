@@ -177,10 +177,16 @@ impl StepOutcome {
 
 /// Run one dispatch end-to-end. Never panics; always POSTs a result (via
 /// the retrying reporter) and always cleans up the worktree it created.
+///
+/// `host` and `max_concurrent` are the host probe and the resolved capacity
+/// `admission::submit` admitted this dispatch against — passed through rather
+/// than re-read so the host share below is sized by the SAME N admission used.
 pub(crate) async fn run_dispatch(
     payload: CiDispatchPayload,
     root: PathBuf,
     cancel: CancellationToken,
+    host: host_sizing::HostCapacity,
+    max_concurrent: u32,
 ) {
     let base = {
         let pinned = payload.coord_http_url.trim().trim_end_matches('/');
@@ -297,18 +303,24 @@ pub(crate) async fn run_dispatch(
     };
 
     // Host-derived caps, bounded by the manifest's [limits] (which are
-    // ceilings, never raises). Probed ONCE per dispatch — the answer cannot
-    // change mid-build in any way worth re-reading, and the probe is a
-    // blocking sysinfo refresh.
+    // ceilings, never raises). The host was probed ONCE, at admission — total
+    // memory and cpu count cannot change mid-build in any way worth re-reading.
     //
     // Sized against this dispatch's SHARE of the host, not the whole of it: the
     // node admits up to N dispatches side by side (the same N `admission.rs`
-    // admits against), and N dispatches each sized to the whole host
+    // admitted this one against), and N dispatches each sized to the whole host
     // oversubscribe it N-fold — see `host_sizing::share`.
-    let host_capacity = host_sizing::probe();
-    let concurrency = crate::settings::get_ci_node_settings()
-        .effective_max_concurrent_builds_for(host_capacity);
-    let host = host_sizing::derive(host_sizing::share(host_capacity, concurrency));
+    //
+    // THE TRADE-OFF, stated so it is a choice and not a surprise: the partition
+    // is STATIC. A lone build on a big host still gets only 1/N of it — on
+    // 48c/368 GiB at N=12 that is 4 cargo jobs, not 48. Sizing by the LIVE
+    // running count instead would be unsafe: a build sized while it ran alone
+    // keeps its fat share, and every dispatch admitted after it would then
+    // oversubscribe the host — exactly the OOM class this exists to prevent.
+    // The operator's lever for fewer, fatter builds is a LOWER explicit
+    // `ci_node.max_concurrent_builds`, which widens each share.
+    let concurrency = max_concurrent.max(1);
+    let host = host_sizing::derive(host_sizing::share(host, concurrency));
     let build_jobs = manifest.limits.effective_cargo_build_jobs(host);
     let test_threads = manifest.limits.effective_test_threads(host);
     sink.push(&format!(

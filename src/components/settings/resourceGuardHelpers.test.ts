@@ -250,12 +250,16 @@ describe("max concurrent builds bound", () => {
     expect(MAX_CONCURRENT_BUILDS_MIN).toBe(rustConst("MAX_CONCURRENT_BUILDS_MIN"));
   });
 
-  it("parses empty input as 'use the suggestion' and clamps explicit values", () => {
-    expect(parseConcurrencyInput("")).toBeNull();
-    expect(parseConcurrencyInput("abc")).toBeNull();
-    expect(parseConcurrencyInput("17")).toBe(17);
-    expect(parseConcurrencyInput("0")).toBe(1);
-    expect(parseConcurrencyInput("999")).toBe(64);
+  it("commits clamped explicit values and reverts empty/invalid drafts, never to null", () => {
+    expect(parseConcurrencyInput("17", null)).toBe(17);
+    expect(parseConcurrencyInput("0", 4)).toBe(1);
+    expect(parseConcurrencyInput("999", 4)).toBe(64);
+    // Empty or garbage on blur reverts to what was there — an explicit value
+    // stays explicit, and an unset one stays unset. Only the "Use suggested"
+    // button writes null.
+    expect(parseConcurrencyInput("", 4)).toBe(4);
+    expect(parseConcurrencyInput("abc", 4)).toBe(4);
+    expect(parseConcurrencyInput("", null)).toBeNull();
   });
 
   it("warns above the suggestion, naming the limiting term, and never otherwise", () => {
