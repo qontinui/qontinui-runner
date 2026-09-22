@@ -1,0 +1,75 @@
+// Positive fixture: every cfg'd construct below ENDS early (a field, a
+// variant, a match arm), so each production hit after it MUST be reported.
+// Also the lexer's hard cases. Read as TEXT by
+// tests/workspace_assumptions_are_enumerated.rs; never compiled.
+struct Handles {
+    #[cfg(target_os = "windows")]
+    stdout_raw_handle: Option<isize>,
+    #[cfg(test)]
+    test_only: HashMap<String, u8>,
+    name: String,
+}
+
+fn after_cfg_field() -> &'static str {
+    "http://localhost:8000"
+}
+
+enum Mode {
+    Prod,
+    #[cfg(test)]
+    Test,
+}
+
+fn after_cfg_variant() -> &'static str {
+    "http://localhost:3001"
+}
+
+fn cfg_match_arm(m: Mode) -> &'static str {
+    match m {
+        #[cfg(test)]
+        Mode::Test => "/home/test-only-arm",
+        Mode::Prod => "D:/after/arm",
+    }
+}
+
+fn after_cfg_match_arm() -> &'static str {
+    "C:/after/the/match"
+}
+
+fn lexer_raw_string() -> &'static str {
+    let _ = r#"a "quoted" // not a comment"#;
+    "/home/someone/after-raw"
+}
+
+/* outer /* nested */ "http://localhost:8000" still inside the outer comment */
+fn lexer_nested_comment() -> &'static str {
+    "C:/after/nested"
+}
+
+fn lexer_chars() -> (char, char, &'static str) {
+    ('\'', '/', "http://127.0.0.1:9875/x")
+}
+
+fn lexer_lifetime<'a>(x: &'a str) -> &'a str {
+    let _: &'a str = "localhost:6379";
+    x
+}
+
+#[cfg(windows)]
+impl Handles {
+    fn windows_method_without_sibling() {}
+}
+
+#[cfg(windows)]
+mod win_outer {
+    #[cfg(test)]
+    mod tests {
+        fn inner_test() -> &'static str {
+            "http://localhost:8000"
+        }
+    }
+}
+
+fn after_nested_regions() -> u16 {
+    9875
+}

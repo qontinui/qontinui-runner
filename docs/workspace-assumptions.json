@@ -419,6 +419,62 @@
     },
     {
       "class": "os_bound_tooling",
+      "file": "src/accessibility/mod.rs",
+      "symbol": "find_hwnd_by_pid",
+      "excerpt": "cfg(windows)-only fn `find_hwnd_by_pid` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/accessibility/mod.rs",
+      "symbol": "find_hwnd_by_title",
+      "excerpt": "cfg(windows)-only fn `find_hwnd_by_title` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/accessibility/mod.rs",
+      "symbol": "is_java_window_class",
+      "excerpt": "cfg(windows)-only fn `is_java_window_class` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/accessibility/mod.rs",
+      "symbol": "last_connected_target_is_jvm",
+      "excerpt": "cfg(windows)-only fn `last_connected_target_is_jvm` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/accessibility/mod.rs",
+      "symbol": "probe_modules",
+      "excerpt": "cfg(windows)-only fn `probe_modules` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/accessibility/mod.rs",
+      "symbol": "process_has_jvm_dll",
+      "excerpt": "cfg(windows)-only fn `process_has_jvm_dll` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/accessibility/mod.rs",
+      "symbol": "window_class_for_target",
+      "excerpt": "cfg(windows)-only fn `window_class_for_target` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
       "file": "src/agent_skills/self_path.rs",
       "symbol": "const INTERPRETERS",
       "excerpt": "const INTERPRETERS: &str = \"bash|sh|pwsh|powershell|python3|python|node\";",
@@ -548,8 +604,32 @@
     {
       "class": "os_bound_tooling",
       "file": "src/crash_observability.rs",
+      "symbol": "install",
+      "excerpt": "cfg(windows)-only fn `install` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/crash_observability.rs",
+      "symbol": "read_exception",
+      "excerpt": "cfg(windows)-only fn `read_exception` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/crash_observability.rs",
       "symbol": "run_bounded",
       "excerpt": "cfg(windows)-only fn `run_bounded` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/crash_observability.rs",
+      "symbol": "top_level_filter",
+      "excerpt": "cfg(windows)-only fn `top_level_filter` has no cfg(not(windows)) sibling in this file",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -686,6 +766,22 @@
       "file": "src/fs_atomic.rs",
       "symbol": "is_transient_rename_denial",
       "excerpt": "cfg(windows)-only fn `is_transient_rename_denial` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/fs_perms.rs",
+      "symbol": "process_owner_sid_blob",
+      "excerpt": "cfg(windows)-only fn `process_owner_sid_blob` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/fs_perms.rs",
+      "symbol": "set_owner_only_dacl",
+      "excerpt": "cfg(windows)-only fn `set_owner_only_dacl` has no cfg(not(windows)) sibling in this file",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -884,6 +980,14 @@
     {
       "class": "os_bound_tooling",
       "file": "src/process_helpers.rs",
+      "symbol": "ChildTreeGuard::attach_raw",
+      "excerpt": "cfg(windows)-only fn `attach_raw` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/process_helpers.rs",
       "symbol": "cmd_no_window",
       "excerpt": "no_window(\"cmd.exe\")",
       "count": 1,
@@ -1027,6 +1131,102 @@
     },
     {
       "class": "os_bound_tooling",
+      "file": "src/wedge_diagnostics.rs",
+      "symbol": "NtQuerySystemInformation",
+      "excerpt": "cfg(windows)-only fn `NtQuerySystemInformation` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/wedge_diagnostics.rs",
+      "symbol": "ProcessTable::read",
+      "excerpt": "cfg(windows)-only fn `read` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/wedge_diagnostics.rs",
+      "symbol": "ProcessTable::with_own_threads",
+      "excerpt": "cfg(windows)-only fn `with_own_threads` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/wedge_diagnostics.rs",
+      "symbol": "census",
+      "excerpt": "cfg(windows)-only fn `census` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/wedge_diagnostics.rs",
+      "symbol": "names",
+      "excerpt": "cfg(windows)-only fn `names` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/wedge_diagnostics.rs",
+      "symbol": "own_threads",
+      "excerpt": "cfg(windows)-only fn `own_threads` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/wedge_diagnostics.rs",
+      "symbol": "thread_description",
+      "excerpt": "cfg(windows)-only fn `thread_description` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/win32_compat.rs",
+      "symbol": "ThreadDpiContextGuard::drop",
+      "excerpt": "cfg(windows)-only fn `drop` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/win32_compat.rs",
+      "symbol": "ThreadDpiContextGuard::is_active",
+      "excerpt": "cfg(windows)-only fn `is_active` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/win32_compat.rs",
+      "symbol": "ThreadDpiContextGuard::set_per_monitor_v2",
+      "excerpt": "cfg(windows)-only fn `set_per_monitor_v2` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/win32_compat.rs",
+      "symbol": "frame_inset",
+      "excerpt": "cfg(windows)-only fn `frame_inset` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/win32_compat.rs",
+      "symbol": "hwnd_from_tauri",
+      "excerpt": "cfg(windows)-only fn `hwnd_from_tauri` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
       "file": "src/window_manager.rs",
       "symbol": "activate_window_windows_by_pid",
       "excerpt": "cfg(windows)-only fn `activate_window_windows_by_pid` has no cfg(not(windows)) sibling in this file",
@@ -1038,6 +1238,14 @@
       "file": "src/window_manager.rs",
       "symbol": "list_windows_windows",
       "excerpt": "cfg(windows)-only fn `list_windows_windows` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/window_placement.rs",
+      "symbol": "ThreadDpiContextGuard::drop",
+      "excerpt": "cfg(windows)-only fn `drop` has no cfg(not(windows)) sibling in this file",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -1825,6 +2033,24 @@
     },
     {
       "class": "supervisor_dependency",
+      "file": "src/config_report_cmd.rs",
+      "symbol": "config_report_inputs",
+      "excerpt": "supervisor_injected_env: Some(supervisor_injected_reading(&env, now)),",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Fills the config report's supervisor_injected_env row from supervisor_injected_reading, which reads only this process's own env."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/config_report_cmd.rs",
+      "symbol": "supervisor_injected_reading",
+      "excerpt": "pub(crate) fn supervisor_injected_reading(",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Reports which supervisor-injected env names are present in THIS process's env; never contacts the supervisor. '0 present' is the correct reading on an operator box."
+    },
+    {
+      "class": "supervisor_dependency",
       "file": "src/database/pg/apps.rs",
       "symbol": "const DEV_SIBLING_APPS",
       "excerpt": "\"http://localhost:9875\",",
@@ -1879,6 +2105,15 @@
     },
     {
       "class": "supervisor_dependency",
+      "file": "src/mcp/ai_session.rs",
+      "symbol": "run_prompt",
+      "excerpt": "super::auto_continue::check_supervisor_available(),",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Passes check_supervisor_available() to runner_rules_prefix, which picks the supervisor-DOWN rules block when it is false."
+    },
+    {
+      "class": "supervisor_dependency",
       "file": "src/mcp/app_discovery.rs",
       "symbol": "const DESKTOP_APP_PORTS",
       "excerpt": "9875,",
@@ -1891,6 +2126,15 @@
       "file": "src/mcp/auto_continue.rs",
       "symbol": "check_supervisor_available",
       "excerpt": "let addr = crate::api_config::get_supervisor_socket_addr();",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "A 500 ms TCP probe that returns false when no supervisor listens; that false is what selects the supervisor-less briefing."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/mcp/auto_continue.rs",
+      "symbol": "check_supervisor_available",
+      "excerpt": "pub fn check_supervisor_available() -> bool {",
       "count": 1,
       "disposition": "fallback_correct",
       "note": "A 500 ms TCP probe that returns false when no supervisor listens; that false is what selects the supervisor-less briefing."
@@ -1933,11 +2177,20 @@
     },
     {
       "class": "supervisor_dependency",
+      "file": "src/mcp/session_briefing.rs",
+      "symbol": "session_briefing_handler",
+      "excerpt": "spawn_blocking_tracked(crate::mcp::auto_continue::check_supervisor_available)",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Same probe on a blocking thread for the /session-briefing panel; unwrap_or(false) falls back to the supervisor-down arm."
+    },
+    {
+      "class": "supervisor_dependency",
       "file": "src/orchestration_loop/loop_engine.rs",
       "symbol": "<module>",
       "excerpt": "use super::remote_client::{RunnerClient, SupervisorClient};",
       "count": 1,
-      "disposition": "defect(2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports)",
+      "disposition": "defect(2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)",
       "note": "Imports SupervisorClient for the orchestration loop; see handle_between_iterations."
     },
     {
@@ -1946,7 +2199,7 @@
       "symbol": "handle_between_iterations",
       "excerpt": "supervisor: &SupervisorClient,",
       "count": 1,
-      "disposition": "defect(2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports)",
+      "disposition": "defect(2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)",
       "note": "User-facing Orchestration Loop panel: the RestartRunner / RestartOnSignal between-iterations modes restart the target runner ONLY via the supervisor's POST /runners/{id}/restart, with no in-process path; with no supervisor (every operator install) the loop errors out. Violates the boundary in webview_recovery.rs's module doc."
     },
     {
@@ -1955,7 +2208,7 @@
       "symbol": "run_loop",
       "excerpt": "let supervisor = SupervisorClient::new(config.supervisor_port);",
       "count": 1,
-      "disposition": "defect(2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports)",
+      "disposition": "defect(2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)",
       "note": "Constructs the SupervisorClient that handle_between_iterations depends on."
     },
     {
@@ -1964,7 +2217,7 @@
       "symbol": "run_pipeline_loop",
       "excerpt": "supervisor: SupervisorClient,",
       "count": 1,
-      "disposition": "defect(2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports)",
+      "disposition": "defect(2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)",
       "note": "Pipeline variant of the same loop; passes SupervisorClient to handle_between_iterations."
     },
     {
@@ -1973,7 +2226,7 @@
       "symbol": "SupervisorClient::<impl>",
       "excerpt": "impl SupervisorClient {",
       "count": 1,
-      "disposition": "defect(2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports)",
+      "disposition": "defect(2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)",
       "note": "restart_runner: the :9875 HTTP call the orchestration loop's restart modes depend on."
     },
     {
@@ -1982,7 +2235,7 @@
       "symbol": "struct SupervisorClient",
       "excerpt": "pub struct SupervisorClient {",
       "count": 1,
-      "disposition": "defect(2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports)",
+      "disposition": "defect(2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)",
       "note": "The supervisor HTTP client used by the user-facing orchestration loop."
     },
     {
