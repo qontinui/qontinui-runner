@@ -286,10 +286,17 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
       failures.push(`session limits — ${String(err)}`);
     }
 
+    // Commit a pending concurrency draft HERE rather than relying on the input's
+    // blur: a synthetic click (UI Bridge) never moves focus, so
+    // without this a typed value would show on the page while the OLD one saved.
+    const builds =
+      buildsDraft !== null
+        ? parseConcurrencyInput(buildsDraft, ciNode.max_concurrent_builds)
+        : ciNode.max_concurrent_builds;
     try {
       const ciResult = await invoke<TauriResult<null>>("save_ci_node_settings", {
         enabled: ciNode.enabled,
-        maxConcurrentBuilds: ciNode.max_concurrent_builds,
+        maxConcurrentBuilds: builds,
         repoAllowlist: allowlist,
         minFreeDiskGb: ciNode.min_free_disk_gb,
       });
@@ -300,7 +307,8 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
       // comma the parser dropped does not linger as unsaved-looking text. Only
       // on success: rewriting the box after a REFUSED save would make the page
       // agree with a value the runner never stored.
-      setCiNode((c) => ({ ...c, repo_allowlist: allowlist }));
+      setCiNode((c) => ({ ...c, repo_allowlist: allowlist, max_concurrent_builds: builds }));
+      setBuildsDraft(null);
       setAllowlistText(allowlist.join("\n"));
       saved.push("CI-node settings");
     } catch (err) {
