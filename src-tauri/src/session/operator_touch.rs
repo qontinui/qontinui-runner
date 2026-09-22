@@ -170,8 +170,11 @@ pub fn emit_session_exit_if_nonzero(
     claude_code_session_id: Option<&str>,
     exit_code: Option<i32>,
 ) {
-    let Some(code) = exit_code.filter(|&c| is_genuine_nonzero_exit(Some(c))) else {
+    if !is_genuine_nonzero_exit(exit_code) {
         return;
+    }
+    let Some(code) = exit_code else {
+        return; // Unreachable given the check above; keeps `code` unwrapped below.
     };
     if let Err(e) = emit(
         registry,
