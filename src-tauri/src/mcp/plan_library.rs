@@ -1028,6 +1028,19 @@ pub fn build_agent_upsert(
 /// the credential — see plan
 /// `2026-09-22-plans-dir-is-a-single-path-so-a-multi-bound-device-cannot-author-per-tenant`
 /// §2 D1.
+///
+/// ⚠️ **The union is over VALUES, regardless of whether the key resolves.**
+/// `PathSettings` says an unparseable or currently-unbound tenant key is
+/// preserved and "inert for resolution (nothing looks it up)" — true of
+/// [`trigger::resolve_plans_dir`], and NOT true here: such an entry's directory
+/// is still unioned into this confinement set. The two docs would otherwise
+/// invite opposite conclusions, so it is stated rather than left to be
+/// rediscovered. It is deliberate on the same ground the preservation rule is:
+/// the operator configured that directory, and dropping it would break the
+/// re-pairing case the preservation exists for — a device mid-re-pair would
+/// have its write door start refusing files it accepted an hour earlier. The
+/// entry confers no reach the operator did not grant, because the only way to
+/// add one is the same `PUT /settings/paths` door that writes the scalars.
 fn source_path_roots() -> Vec<PathBuf> {
     source_path_roots_from(&crate::config_facade::get_setting::<
         crate::settings::PathSettings,

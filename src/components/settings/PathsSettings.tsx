@@ -13,8 +13,22 @@
  *
  * Wire contract (the D5 command pair, `commands/path_settings.rs`):
  *
- *   invoke<PathSettingsView>("get_path_settings")
- *   invoke<PathSettingsView>("save_path_settings", { settings: PathSettings })
+ *   invoke<PathSettingsView>("get_path_settings")               // tenantId?: string
+ *   invoke<PathSettingsView>("save_path_settings", { settings: PathSettingsPatch })
+ *
+ * `get_path_settings` takes an OPTIONAL `tenantId`; passing one adds
+ * `resolved.resolved_for_tenant` — that tenant's resolution of the three
+ * plan/prompt directories — while `configured` stays the raw struct. This panel
+ * passes none: it edits N tenants at once, so it states the fallback rule
+ * (entry, else the device scalar) rather than asking the runner to resolve one
+ * tenant and implying that answer covers the rows.
+ *
+ * `save_path_settings` takes a PATCH, not the whole struct. The five scalars
+ * behave as they always did (absent ⇒ unset), but the four MAP fields —
+ * `repo_checkouts` and the three `*_by_tenant` — are merged: **absent or null ⇒
+ * the stored map is left alone; `{}` ⇒ a deliberate clear.** That is why
+ * `buildPathSettingsPayload` must `delete` a map it is not asserting and send
+ * `{}` for one that was emptied; the two are not interchangeable.
  *
  * Both return the view directly (no `{ success, data }` wrapper, unlike
  * `get_session_guard_settings`); a failure rejects with a string. `save`
@@ -224,12 +238,9 @@ export function PathsSettings({ onLog }: PathsSettingsProps) {
     setDrafts((d) => ({ ...d, [field]: value }));
   }, []);
 
-  const setTenantDraft = useCallback(
-    (field: TenantPathField, tenantId: string, value: string) => {
-      setTenantDrafts((d) => ({ ...d, [field]: { ...d[field], [tenantId]: value } }));
-    },
-    [],
-  );
+  const setTenantDraft = useCallback((field: TenantPathField, tenantId: string, value: string) => {
+    setTenantDrafts((d) => ({ ...d, [field]: { ...d[field], [tenantId]: value } }));
+  }, []);
 
   /**
    * Native directory picker — the same call `ClaudeCliSection` and
@@ -725,10 +736,10 @@ function PerTenantPaths({
       <div className="space-y-1">
         <p className="text-xs font-medium">Per-tenant directories</p>
         <p className="text-[10px] text-muted-foreground">
-          This device is bound to {bound.size} tenants, so the plan and prompt directories can differ
-          per tenant. A path here is used for sessions launched for that tenant; a blank row means
-          that tenant uses the device-wide directory above. A session&rsquo;s tenant is stamped when
-          it is spawned and never changes, so a change here applies to future sessions.
+          This device is bound to {bound.size} tenants, so the plan and prompt directories can
+          differ per tenant. A path here is used for sessions launched for that tenant; a blank row
+          means that tenant uses the device-wide directory above. A session&rsquo;s tenant is
+          stamped when it is spawned and never changes, so a change here applies to future sessions.
         </p>
         {hasUnbound && (
           <p className="text-[10px] text-muted-foreground">
@@ -857,9 +868,7 @@ function TenantPathRow({
       <label htmlFor={inputId} title={tenantId} className="w-44 shrink-0 text-[10px] leading-tight">
         <code className="font-mono">{shortTenantId(tenantId)}</code>
         {isDeviceDefault && <span className="text-muted-foreground"> · device default</span>}
-        {!bound && (
-          <span className={getAccentColors("amber").text}> · not currently bound</span>
-        )}
+        {!bound && <span className={getAccentColors("amber").text}> · not currently bound</span>}
       </label>
       <input
         id={inputId}
