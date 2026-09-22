@@ -1954,7 +1954,7 @@ struct PendingOutput {
     bytes: usize,
     /// An exit or fatal error that arrived while the slot was open — i.e.
     /// between the target's `remote_terminal_attached` reply and
-    /// [`RemoteTerminalClient::register_pane`]. Applied to the pane as soon as
+    /// [`RemoteAttachClient::register_pane`]. Applied to the pane as soon as
     /// it registers.
     ///
     /// The window is the one the output buffer already exists for: from
@@ -2002,9 +2002,11 @@ pub struct AttachedReply {
 /// `None`: **UNKNOWN, not "attach later"** — there is no id to address a mint
 /// to and inventing one is not available.
 ///
-/// It rides INSIDE the reply's `terminal` object rather than beside it because
-/// the relay forwards that object verbatim and drops every top-level key it
-/// does not know (`remote_terminal_relay.py`, the `terminal_created` arm).
+/// The target still sends it INSIDE its reply's `terminal` object (as
+/// `coordSessionId`), the spelling every relay version passes through. The
+/// current relay (`remote_terminal_relay.py`, the `terminal_created` arm)
+/// lifts it to a declared top-level `coord_session_id`, which `parse_created`
+/// reads first, falling back to the inside spelling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatedReply {
     pub grant_jti: String,
@@ -5809,6 +5811,56 @@ mod created_reply_tests {
                 "a missing or blank coord session must not be guessed: {body}"
             );
         }
+    }
+
+    /// The `handle_inbound` half of the SOURCE side of a remote create:
+    /// `create` sends `remote_terminal_create` and parks a waiter, and the
+    /// relay's `remote_terminal_created` — the exact shape qontinui-web's relay
+    /// rebuilds, keyed by the request id `create` minted, no `remote` block —
+    /// wakes it and clears the slot. The `parse_created` tests above call the
+    /// parser directly and never touch the waiter. This does NOT cover the
+    /// 2026-09-20 break, which was upstream of here in `handle_relay_command`'s
+    /// dispatch match: that arm is pinned by `backend_relay`'s
+    /// `every_reply_handle_inbound_knows_passes_both_inbound_gates`.
+    #[tokio::test]
+    async fn a_relay_created_reply_wakes_the_pending_create() {
+        let client = RemoteAttachClient::new();
+        // A relay connection holds the pump, as it does in production.
+        let mut pump = client.lock_outbound().await;
+        let fut = client.create(
+            "grant.jwt",
+            120,
+            40,
+            Some("t"),
+            None,
+            None,
+            std::time::Duration::from_secs(5),
+        );
+        tokio::pin!(fut);
+        assert!(futures_util::poll!(fut.as_mut()).is_pending());
+        let sent = pump.try_recv().expect("create sent a frame");
+        assert_eq!(sent["type"], "remote_terminal_create");
+        let rid = sent["request_id"].as_str().unwrap().to_string();
+
+        assert!(client.handle_inbound(
+            "remote_terminal_created",
+            &json!({
+                "type": "remote_terminal_created",
+                "request_id": rid,
+                "grant_jti": "jti-c1",
+                "terminal_id": "t1",
+                "terminal": {"id": "t1"},
+                "coord_session_id": "5b0e3c8e-6d7a-4b7e-9c11-0f0e7a1d2b3c",
+            }),
+        ));
+        let reply = fut.await.expect("the waiter is woken with the reply");
+        assert_eq!(reply.grant_jti, "jti-c1");
+        assert_eq!(reply.terminal_id, "t1");
+        assert_eq!(
+            reply.coord_session_id.as_deref(),
+            Some("5b0e3c8e-6d7a-4b7e-9c11-0f0e7a1d2b3c")
+        );
+        assert!(client.pending_create.lock().unwrap().is_empty());
     }
 }
 
