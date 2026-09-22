@@ -134,24 +134,33 @@ pub fn scan_idle_touches_once() {
 
         // `&str`, not `Option` — a terminal with no identity-seam pin reports
         // an empty string, which `touch_payload` already treats as absent.
-        if let Err(e) = crate::session::operator_touch::emit(
+        //
+        // Latch the episode ONLY on a successful enqueue. `emit`'s `Err` means
+        // the LOCAL outbox append itself failed (disk full, poisoned lock) —
+        // nothing was durably recorded — so latching here regardless would
+        // silently drop the touch for the rest of a continuous idle episode,
+        // which for a wedged terminal can be hours. Leaving it unlatched
+        // means the very next tick retries, at the cost of one extra
+        // synchronous append attempt per tick until it succeeds.
+        match crate::session::operator_touch::emit(
             &registry,
             coord_session_id,
             crate::session::operator_touch::KIND_IDLE_AT_PROMPT,
             Some(session.pinned_session_id()),
         ) {
-            warn!(
-                terminal_id = %tid,
-                coord_session = %coord_session_id,
-                error = %e,
-                "operator_touch_watch: idle_at_prompt enqueue failed"
-            );
+            Ok(()) => {
+                let mut guard = LAST_FIRED_SINCE_MS.lock().unwrap_or_else(|e| e.into_inner());
+                guard.get_or_insert_with(HashMap::new).insert(tid, since_ms);
+            }
+            Err(e) => {
+                warn!(
+                    terminal_id = %tid,
+                    coord_session = %coord_session_id,
+                    error = %e,
+                    "operator_touch_watch: idle_at_prompt enqueue failed — will retry next tick"
+                );
+            }
         }
-
-        let mut guard = LAST_FIRED_SINCE_MS.lock().unwrap_or_else(|e| e.into_inner());
-        guard
-            .get_or_insert_with(HashMap::new)
-            .insert(tid, since_ms);
     }
 }
 
