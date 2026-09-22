@@ -1,0 +1,41 @@
+name: throwaway-timeout-pairing-experiment
+
+# Phase 0 of plan 2026-09-20-published-parity-timeout-ladder-and-cold-cache-loop.
+# Settles, by experiment rather than by (twice-repeated, never-measured)
+# assertion: does a `continue-on-error: true` step that trips its OWN
+# `timeout-minutes` cancel the WHOLE JOB, or does the step just fail and the
+# job continue?
+#
+# Step order is load-bearing: the post-step-carrying action is registered
+# FIRST, then the timing-out step, then a trivially green step. Post-steps run
+# in reverse registration order and only for actions whose main step already
+# ran, so if the timing-out step cancels the job outright, the action
+# registered before it never gets a chance to run its post-step either.
+#
+# Read three things from the run: the JOB conclusion, whether "after" ran,
+# and whether the rust-cache post-step ran or was skipped.
+#
+# Throwaway: deleted (branch + workflow file) once Phase 0 has a run id.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  experiment:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: register a post-step-carrying action FIRST
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          shared-key: "throwaway-timeout-pairing-experiment"
+
+      - name: continue-on-error step that trips its own timeout-minutes
+        continue-on-error: true
+        timeout-minutes: 1
+        run: sleep 180
+
+      - name: trivially green step AFTER the timing-out one
+        run: echo "the step after the timeout ran"
