@@ -1,0 +1,233 @@
+# Dispositions for docs/workspace-assumptions.{md,json} — the HAND-EDITED input.
+#
+# Keyed by (class, file, symbol); symbol is the ENCLOSING fn (or `const X`,
+# `struct X`, `Type::<impl>`, `<module>`) exactly as the roster prints it, so
+# line drift does not orphan an entry. A key with no entry is `unreviewed`.
+# An entry whose key matches no hit fails the freshness test.
+#
+# disposition = unreviewed | fallback_correct | dev_only_surface | defect(<plan stem>)
+#
+# After editing, regenerate the roster:
+#   UPDATE_WORKSPACE_ASSUMPTIONS=1 cargo-guard.sh test --test workspace_assumptions_are_enumerated
+#
+# First triage pass (plan 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports Phase 4):
+# every supervisor_dependency, tenant_literal and machine_path key. The
+# supervisor is dev-only; a user-facing path that depends on :9875 is a defect
+# (src-tauri/src/webview_recovery.rs module doc).
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/ambient.rs"
+symbol = "const AMBIENT_ENV_KEYS"
+disposition = "fallback_correct"
+note = "An inventory of env-var NAMES the ambient-isolation harness clears; nothing is read from the supervisor."
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/api_config.rs"
+symbol = "const DEFAULT_SUPERVISOR_PORT"
+disposition = "fallback_correct"
+note = "Resolver constant only; the dependency lives at each caller, which carries its own disposition."
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/api_config.rs"
+symbol = "get_supervisor_url"
+disposition = "fallback_correct"
+note = "Resolver only (env override, else 127.0.0.1:9875); returns a URL and contacts nothing. Callers carry their own disposition."
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/api_config.rs"
+symbol = "get_supervisor_socket_addr"
+disposition = "fallback_correct"
+note = "Resolver only; parses get_supervisor_url, contacts nothing."
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/database/pg/apps.rs"
+symbol = "const DEV_SIBLING_APPS"
+disposition = "dev_only_surface"
+note = "Registered only when <workspace-root>/qontinui-supervisor/frontend exists, i.e. only on a developer workspace."
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/env_agent/collectors.rs"
+symbol = "const KNOWN_DEV_PORTS"
+disposition = "dev_only_surface"
+note = "Liveness probe of the dev-topology ports for the env report; 'closed' is the correct reading on an operator box."
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/mcp/ai_session.rs"
+symbol = "const AI_SESSION_RULES_SUPERVISOR_AVAILABLE"
+disposition = "fallback_correct"
+note = "Chosen by runner_rules_prefix only when check_supervisor_available() is true; the supervisor-DOWN arm is used otherwise."
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/mcp/app_discovery.rs"
+symbol = "const DESKTOP_APP_PORTS"
+disposition = "fallback_correct"
+note = "One port in a discovery scan list; an absent listener is simply not discovered."
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/mcp/auto_continue.rs"
+symbol = "check_supervisor_available"
+disposition = "fallback_correct"
+note = "A 500 ms TCP probe that returns false when no supervisor listens; that false is what selects the supervisor-less briefing."
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/mcp/misc.rs"
+symbol = "spawn_instance"
+disposition = "fallback_correct"
+note = "Best-effort POST /runners registration after the instance is already launched; failure is logged at debug and the primary runner stays coordinator."
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/mcp/origin_guard.rs"
+symbol = "const DEFAULT_TRUSTED_ORIGINS"
+disposition = "dev_only_surface"
+note = "Admits the dev supervisor dashboard origin as Trusted. Nothing user-facing depends on it, but on a box with no supervisor any local listener on :9875 inherits that trust — worth a look by the origin-guard owner."
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/orchestration_loop/loop_engine.rs"
+symbol = "<module>"
+disposition = "defect(2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports)"
+note = "Imports SupervisorClient for the orchestration loop; see handle_between_iterations."
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/orchestration_loop/loop_engine.rs"
+symbol = "handle_between_iterations"
+disposition = "defect(2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports)"
+note = "User-facing Orchestration Loop panel: the RestartRunner / RestartOnSignal between-iterations modes restart the target runner ONLY via the supervisor's POST /runners/{id}/restart, with no in-process path; with no supervisor (every operator install) the loop errors out. Violates the boundary in webview_recovery.rs's module doc."
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/orchestration_loop/loop_engine.rs"
+symbol = "run_loop"
+disposition = "defect(2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports)"
+note = "Constructs the SupervisorClient that handle_between_iterations depends on."
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/orchestration_loop/loop_engine.rs"
+symbol = "run_pipeline_loop"
+disposition = "defect(2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports)"
+note = "Pipeline variant of the same loop; passes SupervisorClient to handle_between_iterations."
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/orchestration_loop/remote_client.rs"
+symbol = "SupervisorClient::<impl>"
+disposition = "defect(2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports)"
+note = "restart_runner: the :9875 HTTP call the orchestration loop's restart modes depend on."
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/orchestration_loop/remote_client.rs"
+symbol = "struct SupervisorClient"
+disposition = "defect(2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports)"
+note = "The supervisor HTTP client used by the user-facing orchestration loop."
+
+[[disposition]]
+class = "tenant_literal"
+file = "src/ai_provider/oauth_refresh.rs"
+symbol = "const CLIENT_ID"
+disposition = "fallback_correct"
+note = "Not a tenant: the public OAuth client id of the Claude CLI app, identical on every install."
+
+[[disposition]]
+class = "machine_path"
+file = "src/commands/accessibility.rs"
+symbol = "get_default_chrome_paths"
+disposition = "fallback_correct"
+note = "Standard Windows browser install locations inside a cfg!(windows) branch, used as existence-checked candidates."
+
+[[disposition]]
+class = "machine_path"
+file = "src/commands/global_log_sources.rs"
+symbol = "find_log_sources_with_ai"
+disposition = "fallback_correct"
+note = "Example paths in an AI prompt's prose, not a path the runner reads."
+
+[[disposition]]
+class = "machine_path"
+file = "src/commands/mobile.rs"
+symbol = "find_adb_path"
+disposition = "fallback_correct"
+note = "Last-resort candidate after the configured adb_path and PATH; existence-checked."
+
+[[disposition]]
+class = "machine_path"
+file = "src/commands/setup_wizard.rs"
+symbol = "discover_claude_config_dirs"
+disposition = "fallback_correct"
+note = "Probes the fleet's C:\\claude multi-account convention behind is_dir(); absent everywhere else, where CLAUDE_CONFIG_DIR and ~/.claude still apply."
+
+[[disposition]]
+class = "machine_path"
+file = "src/demo_workflows.rs"
+symbol = "update_workspace_paths"
+disposition = "fallback_correct"
+note = "Placeholder text REPLACED by the resolved temp dir; the literal is never used as a path."
+
+[[disposition]]
+class = "machine_path"
+file = "src/mcp/misc.rs"
+symbol = "launch_debug_chrome"
+disposition = "fallback_correct"
+note = "Standard Windows Chrome install locations, existence-checked candidates."
+
+[[disposition]]
+class = "machine_path"
+file = "src/mcp/test_fixtures.rs"
+symbol = "const DEFAULT_TEST_CONFIG_DIR"
+disposition = "dev_only_surface"
+note = "Debug-gated test-fixture injection endpoints for manual UI testing."
+
+[[disposition]]
+class = "machine_path"
+file = "src/mcp/test_fixtures.rs"
+symbol = "record_from_seed"
+disposition = "dev_only_surface"
+note = "Debug-gated test-fixture injection endpoints; C:/repo is a fake session's working dir."
+
+[[disposition]]
+class = "machine_path"
+file = "src/projects/snapshot.rs"
+symbol = "const NOISE_PREFIXES"
+disposition = "fallback_correct"
+note = "Filters the operator's C:\\claude agent-scratch rows out of project attribution; on another box it filters nothing, which only leaves some noise rows in the view."
+
+[[disposition]]
+class = "machine_path"
+file = "src/reflection/workflow.rs"
+symbol = "build_execution_analysis_steps"
+disposition = "fallback_correct"
+note = "Example path inside an AI prompt's prose."
+
+[[disposition]]
+class = "machine_path"
+file = "src/session_archive/discovery.rs"
+symbol = "discover_account_homes_from_env"
+disposition = "fallback_correct"
+note = "Probes C:/claude behind is_dir() on every platform, per its own doc comment; false everywhere else."
+
+[[disposition]]
+class = "machine_path"
+file = "src/step_executor/handlers/shell_command.rs"
+symbol = "ShellCommandHandler::find_git_bash"
+disposition = "fallback_correct"
+note = "Standard Git-for-Windows install locations, existence-checked candidates."
+
+[[disposition]]
+class = "machine_path"
+file = "src/step_output/script_emitter.rs"
+symbol = "build_prompt_split"
+disposition = "fallback_correct"
+note = "A worked example inside an AI prompt (HOME=/home/jq), not a path the runner reads."
