@@ -2512,6 +2512,19 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
         ..Default::default()
     };
     for u in parsed_units {
+        // A status-block `Area:` the parser rejected: warned here, once per
+        // plan per reconcile pass, and nowhere else — the parse is pure, and
+        // the plan-library body sync parses the same files. The push still
+        // runs, with `metadata.area` omitted. Deliberately repeated every
+        // pass: the declaration stays visible until the plan file is fixed.
+        if let Some(why) = &u.area_rejected {
+            tracing::warn!(
+                slug = %u.slug,
+                path = %u.source_path,
+                "plan adapter: status-block `Area:` rejected — {why}; \
+                 metadata.area omitted for this plan"
+            );
+        }
         // A push coord has already refused is not re-issued: the request would
         // be byte-identical, so the verdict would be too. Stopping here — rather
         // than merely muting the log — is what makes this a fix and not a mute:
@@ -9262,6 +9275,7 @@ mod tests {
             status: status.to_string(),
             depends_on,
             area: None,
+            area_rejected: None,
             phases: vec![],
             source_path: format!("plans/{slug}.md"),
             content: String::new(),
@@ -9566,6 +9580,93 @@ mod tests {
         assert_eq!(s2.scanned, 2);
         assert_eq!(s2.transitions, 0);
         assert_eq!(*sink.transitions.lock().unwrap(), 0);
+    }
+
+    /// A `Write` into a shared buffer, so a test can read what `tracing` logged.
+    #[derive(Clone, Default)]
+    struct LogBuf(std::sync::Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A rejected status-block `Area:` is warned by the reconcile — exactly
+    /// once per plan per pass — and the push still lands, with `metadata.area`
+    /// omitted. A unit with an accepted area is not warned and carries it.
+    #[tokio::test]
+    async fn reconcile_warns_once_per_pass_for_a_rejected_area() {
+        use super::super::parser::AreaRejection;
+        let buf = LogBuf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
+        let mut forb = RetiredSlugs::default();
+        let mut forb_deps: HashSet<String> = HashSet::new();
+        let bad = ParsedWorkUnit {
+            area_rejected: Some(AreaRejection::NotKebab("agent_worktree".to_string())),
+            ..unit("2026-01-01-bad-area", "draft")
+        };
+        let good = ParsedWorkUnit {
+            area: Some("ci-runners".to_string()),
+            ..unit("2026-01-01-good-area", "draft")
+        };
+        let units = vec![bad, good];
+        for _ in 0..2 {
+            reconcile_once(
+                &units,
+                &mut mem,
+                &mut deps,
+                &mut forb,
+                &mut forb_deps,
+                &sink,
+                &metrics,
+            )
+            .await;
+        }
+
+        let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let warned: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("status-block `Area:` rejected"))
+            .collect();
+        assert_eq!(
+            warned.len(),
+            2,
+            "one warning per pass for the one bad plan: {log}"
+        );
+        assert!(warned
+            .iter()
+            .all(|l| l.contains("2026-01-01-bad-area") && l.contains("agent_worktree")));
+
+        let upserts = sink.upserts.lock().unwrap();
+        let meta_for = |slug: &str| {
+            upserts
+                .iter()
+                .rev()
+                .find(|b| b.slug == slug)
+                .and_then(|b| b.metadata.clone())
+                .expect("the unit was pushed")
+        };
+        assert!(!meta_for("2026-01-01-bad-area")
+            .as_object()
+            .unwrap()
+            .contains_key("area"));
+        assert_eq!(meta_for("2026-01-01-good-area")["area"], "ci-runners");
     }
 
     #[tokio::test]

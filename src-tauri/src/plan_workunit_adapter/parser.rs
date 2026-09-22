@@ -94,8 +94,12 @@ pub struct ParsedWorkUnit {
     pub depends_on: Vec<String>,
     /// The plan's `Area:` from the status blockquote, when it satisfies coord's
     /// kebab grammar — pushed as work-unit `metadata.area`. `None` when absent
-    /// or rejected (a rejection is warned; see [`extract_area`]).
+    /// or rejected; see [`extract_area`].
     pub area: Option<String>,
+    /// Why a status-block area declaration was rejected, when one was. Carried
+    /// rather than logged here so the parse stays pure; the work-unit reconcile
+    /// is the one place that warns about it.
+    pub area_rejected: Option<AreaRejection>,
     /// Phase structure -> sub-units, in document order, deduped by index.
     pub phases: Vec<ParsedPhase>,
     /// Provenance back-link: the source file path the caller supplied.
@@ -317,32 +321,139 @@ pub(crate) fn is_kebab_case(s: &str) -> bool {
         })
 }
 
+/// Why a status-block area declaration was not accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AreaRejection {
+    /// A recognised key whose value fails [`is_kebab_case`] — kept verbatim.
+    NotKebab(String),
+    /// A recognised near-miss spelling of the key (`**Area**:`, `*Area:*`).
+    /// Its value is NOT read: the spelling itself is the defect to fix.
+    Misspelled(&'static str),
+}
+
+impl std::fmt::Display for AreaRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotKebab(v) => {
+                write!(f, "value {v:?} is not kebab-case ([a-z0-9]+(-[a-z0-9]+)*)")
+            }
+            Self::Misspelled(k) => {
+                write!(f, "key spelled {k:?}; write `**Area:**` (value not read)")
+            }
+        }
+    }
+}
+
 /// What the status blockquote declares about the plan's area.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum AreaDecl {
+pub enum AreaDecl {
     /// No `Area:` key in the status blockquote (including a plan whose only
-    /// `Area:` line sits outside it). Not a defect — nothing is warned.
+    /// `Area:` line sits outside it, e.g. in a second blockquote after a blank
+    /// line). Not a defect — nothing is warned.
     Absent,
     /// A key whose value satisfies [`is_kebab_case`].
     Accepted(String),
-    /// A key whose value does not — kept verbatim so the warning can name it.
-    Rejected(String),
+    /// A key that was found but not accepted — see [`AreaRejection`].
+    Rejected(AreaRejection),
 }
 
-/// Extract the plan's `Area:` from the status blockquote — the same block, and
-/// the same case-sensitive key convention, as [`extract_depends_on`]. A
-/// body-wide scan would pick up quoted `Area:` examples in plan prose.
+/// A key match on one line: its byte offset and what it resolves to.
+fn area_key_on_line(line: &str) -> Option<(usize, AreaDecl)> {
+    const BOLD: &str = "**Area:";
+    let mut best: Option<(usize, AreaDecl)> = None;
+    let mut consider = |pos: usize, decl: AreaDecl| {
+        if best.as_ref().is_none_or(|(b, _)| pos < *b) {
+            best = Some((pos, decl));
+        }
+    };
+
+    // (a) The bolded key, anywhere on the line: `**Area:**` (and the
+    //     Status-style `**Area: x**`, whose closer follows the value).
+    if let Some(pos) = line.find(BOLD) {
+        consider(pos, area_value(&line[pos + BOLD.len()..]));
+    }
+    // (b) The unbolded key, ONLY as the first token after `>`: prose such as
+    //     "covers the grey Area: see below" never counts.
+    let lead = line.len() - line.trim_start().len();
+    let after_gt = line
+        .trim_start()
+        .strip_prefix('>')
+        .unwrap_or(line.trim_start());
+    let content = after_gt.trim_start();
+    if let Some(rest) = content.strip_prefix("Area:") {
+        consider(lead, area_value(rest));
+    }
+    // (c) Recognised near-misses: rejected with the spelling named, so a
+    //     declaration never vanishes silently.
+    if let Some(pos) = line.find("**Area**:") {
+        consider(
+            pos,
+            AreaDecl::Rejected(AreaRejection::Misspelled("**Area**:")),
+        );
+    }
+    let mut from = 0;
+    while let Some(rel) = line[from..].find("*Area:*") {
+        let pos = from + rel;
+        from = pos + 1;
+        // Part of the bolded `**Area:**`, which (a) already handles.
+        if line[..pos].ends_with('*') {
+            continue;
+        }
+        consider(
+            pos,
+            AreaDecl::Rejected(AreaRejection::Misspelled("*Area:*")),
+        );
+        break;
+    }
+    best
+}
+
+/// Read the value that follows a key (see [`extract_area`] for the rule).
+fn area_value(after_key: &str) -> AreaDecl {
+    let rest = after_key
+        .strip_prefix("**")
+        .unwrap_or(after_key)
+        .trim_start();
+    // A bolded VALUE (`**Area:** **x**`): its opener goes, symmetrically with
+    // the trailing `*` trim below.
+    let rest = rest.strip_prefix("**").unwrap_or(rest);
+    let value = match rest.strip_prefix('`') {
+        Some(code) => code.split('`').next().unwrap_or(code),
+        None => rest
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(['.', ',', ';', ':', ')', '*']),
+    };
+    if is_kebab_case(value) {
+        AreaDecl::Accepted(value.to_string())
+    } else {
+        AreaDecl::Rejected(AreaRejection::NotKebab(value.to_string()))
+    }
+}
+
+/// Extract the plan's `Area:` from the status blockquote — the same block (the
+/// first `> **Status:` blockquote, up to its first non-`>` line), and the same
+/// case-sensitive key convention, as [`extract_depends_on`]. A body-wide scan
+/// would pick up quoted `Area:` examples in plan prose.
 ///
-/// **The key.** An occurrence of `Area:` counts only when it stands as a key:
-/// after stripping one optional `**` (the bold opener of `**Area:**`), what
-/// precedes it must be the line start, whitespace, or the blockquote `>`. So
-/// `> Area: x`, `> **Area:** x` and `**Repo:** … **Area:** x` are keys, while
-/// `` `Area:` `` (inline code, as in "scanner `Area:` parse") and `Sub-Area:`
-/// are not. The FIRST key in the block decides; a later one is never consulted,
-/// so a malformed declaration is reported rather than silently shadowed.
+/// **The key.** Two spellings count:
 ///
-/// **The value.** After the key, one optional `**` (the bold closer) and any
-/// whitespace are skipped. Then:
+/// * the bolded `**Area:**` (or `**Area: x**`) ANYWHERE on a status-block
+///   line — `**Repo:** … **Area:** x` and `` `repo`.**Area:** x `` included;
+/// * the unbolded `Area:` ONLY as the first token after `>` and whitespace
+///   (`> Area: x`). Mid-line prose — "covers the grey Area: see below" — and
+///   inline code (`` `Area:` ``) are never keys.
+///
+/// Two recognised near-misses, `**Area**:` and `*Area:*`, are
+/// [`AreaDecl::Rejected`] with [`AreaRejection::Misspelled`] and their value
+/// is not read. The FIRST key in the block (earliest line, then earliest
+/// position) decides; a later one is never consulted, so a malformed
+/// declaration is reported rather than silently shadowed.
+///
+/// **The value.** After the key, one optional `**` (the bold closer), any
+/// whitespace, and one optional `**` (a bolded value's opener) are skipped.
+/// Then:
 ///
 /// * if the next character is a backtick, the value is everything up to the
 ///   next backtick (`` `published-parity` (work-unit …) `` → `published-parity`;
@@ -350,42 +461,18 @@ pub(crate) enum AreaDecl {
 ///   grammar);
 /// * otherwise it is the first whitespace-delimited token with trailing
 ///   `.`, `,`, `;`, `:`, `)` and `*` removed (`Area: domain-cost-ledger.` →
-///   `domain-cost-ledger`).
+///   `domain-cost-ledger`, `**Area:** **x**` → `x`).
 ///
 /// Nothing else is normalised — no lowercasing, no `_`→`-`. The value is then
-/// judged by [`is_kebab_case`]: `` `agent_worktree` reclaim `` is
-/// [`AreaDecl::Rejected`] with `agent_worktree`, never guessed into shape.
-pub(crate) fn extract_area(body: &str) -> AreaDecl {
-    const KEY: &str = "Area:";
+/// judged by [`is_kebab_case`]: `` `agent_worktree` reclaim `` is rejected as
+/// `agent_worktree`, never guessed into shape.
+///
+/// Pure: this function and [`parse_work_unit`] log nothing. The work-unit
+/// reconcile warns about a rejection (`trigger::reconcile_once`).
+pub fn extract_area(body: &str) -> AreaDecl {
     for line in status_blockquote_lines(body) {
-        let mut search_from = 0usize;
-        while let Some(rel) = line[search_from..].find(KEY) {
-            let abs = search_from + rel;
-            search_from = abs + KEY.len();
-            let before = &line[..abs];
-            let before = before.strip_suffix("**").unwrap_or(before);
-            let boundary = before
-                .chars()
-                .next_back()
-                .is_none_or(|c| c.is_whitespace() || c == '>');
-            if !boundary {
-                continue;
-            }
-            let rest = &line[abs + KEY.len()..];
-            let rest = rest.strip_prefix("**").unwrap_or(rest).trim_start();
-            let value = match rest.strip_prefix('`') {
-                Some(code) => code.split('`').next().unwrap_or(code),
-                None => rest
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .trim_end_matches(['.', ',', ';', ':', ')', '*']),
-            };
-            return if is_kebab_case(value) {
-                AreaDecl::Accepted(value.to_string())
-            } else {
-                AreaDecl::Rejected(value.to_string())
-            };
+        if let Some((_, decl)) = area_key_on_line(line) {
+            return decl;
         }
     }
     AreaDecl::Absent
@@ -921,10 +1008,9 @@ fn detect_phases(body: &str) -> Vec<ParsedPhase> {
 /// Status defaults to `"draft"` when no `> **Status:` line is present; title
 /// defaults to `None` when no `# ` H1 is present (both matching coord).
 ///
-/// Not quite effect-free: a status-block `Area:` whose value fails coord's
-/// kebab grammar is logged with `tracing::warn!` (naming `source_path` and the
-/// rejected value) and yields `area: None`. The returned value stays a pure
-/// function of the inputs.
+/// A rejected status-block `Area:` yields `area: None` and is carried on
+/// `area_rejected`, not logged here: this parse also runs for the plan-library
+/// body sync, which must not repeat the warning.
 pub fn parse_work_unit(
     slug: &str,
     source_path: &str,
@@ -958,21 +1044,10 @@ pub fn parse_work_unit(
         }
     }
 
-    let area = match extract_area(body) {
-        AreaDecl::Absent => None,
-        AreaDecl::Accepted(area) => Some(area),
-        AreaDecl::Rejected(value) => {
-            // Per cycle, on purpose: a malformed declaration stays visible in
-            // the log until the plan is fixed, rather than being guessed into
-            // shape or dropped silently.
-            tracing::warn!(
-                path = %source_path,
-                rejected_area = %value,
-                "plan adapter: status-block `Area:` is not kebab-case \
-                 ([a-z0-9]+(-[a-z0-9]+)*); metadata.area omitted for this plan"
-            );
-            None
-        }
+    let (area, area_rejected) = match extract_area(body) {
+        AreaDecl::Absent => (None, None),
+        AreaDecl::Accepted(area) => (Some(area), None),
+        AreaDecl::Rejected(why) => (None, Some(why)),
     };
 
     ParsedWorkUnit {
@@ -981,6 +1056,7 @@ pub fn parse_work_unit(
         status: status.unwrap_or_else(|| "draft".to_string()),
         depends_on: extract_depends_on(body),
         area,
+        area_rejected,
         phases: detect_phases(body),
         source_path: source_path.to_string(),
         content: body.to_string(),
@@ -1565,6 +1641,10 @@ mod tests {
 
     // --- area ------------------------------------------------------------------
 
+    fn rej(value: impl Into<String>) -> AreaDecl {
+        AreaDecl::Rejected(AreaRejection::NotKebab(value.into()))
+    }
+
     /// The shared fixture list pinning [`is_kebab_case`] to coord's grammar,
     /// `[a-z0-9]+(-[a-z0-9]+)*`. The rejected half is exactly what the looser
     /// `^[a-z0-9][a-z0-9-]*$` would have admitted (`a--b`, `a-`) plus the
@@ -1634,11 +1714,7 @@ mod tests {
             "Published-Parity",
         ] {
             let body = format!("# T\n\n> **Status: DRAFT.**\n> **Area:** `{bad}`\n");
-            assert_eq!(
-                extract_area(&body),
-                AreaDecl::Rejected(bad.to_string()),
-                "{bad:?}"
-            );
+            assert_eq!(extract_area(&body), rej(bad.to_string()), "{bad:?}");
         }
     }
 
@@ -1715,11 +1791,17 @@ mod tests {
             let u = parse_work_unit(stem, &path, &body, &conv());
             assert_eq!(u.area.as_deref(), *want, "{stem}");
             let decl = extract_area(&body);
+            assert_eq!(
+                u.area_rejected,
+                want.is_none()
+                    .then(|| AreaRejection::NotKebab("agent_worktree".to_string())),
+                "{stem}: the rejection rides on the parsed unit for the reconcile to warn"
+            );
             match want {
                 Some(a) => assert_eq!(decl, AreaDecl::Accepted(a.to_string()), "{stem}"),
                 None => assert_eq!(
                     decl,
-                    AreaDecl::Rejected("agent_worktree".to_string()),
+                    rej("agent_worktree".to_string()),
                     "{stem}: rejected, and the warning names the value"
                 ),
             }
@@ -1769,6 +1851,7 @@ mod tests {
 ";
         assert_eq!(extract_area(body), AreaDecl::Absent);
         assert_eq!(parse(body).area, None);
+        assert_eq!(parse(body).area_rejected, None, "Absent is never warned");
     }
 
     #[test]
@@ -1791,10 +1874,7 @@ mod tests {
             AreaDecl::Accepted("ok-area".to_string())
         );
         let body = "> **Status: DRAFT.**\n> Area: Bad_Area\n> **Area:** `ok-area`\n";
-        assert_eq!(
-            extract_area(body),
-            AreaDecl::Rejected("Bad_Area".to_string())
-        );
+        assert_eq!(extract_area(body), rej("Bad_Area".to_string()));
     }
 
     /// Value delimiting: a backticked value ends at the closing backtick; an
@@ -1810,7 +1890,7 @@ mod tests {
         );
         assert_eq!(
             one("> **Area:** `a-b and more"),
-            AreaDecl::Rejected("a-b and more".to_string())
+            rej("a-b and more".to_string())
         );
         assert_eq!(
             one("> Area: a-b, then prose"),
@@ -1820,7 +1900,128 @@ mod tests {
             one("> **Area: a-b.**"),
             AreaDecl::Accepted("a-b".to_string())
         );
-        assert_eq!(one("> **Area:**"), AreaDecl::Rejected(String::new()));
+        assert_eq!(one("> **Area:**"), rej(String::new()));
+    }
+
+    /// Review round 1, item 2: mid-line prose `Area:` on the status line must
+    /// not shadow the real bolded key on the next line.
+    #[test]
+    fn prose_area_on_the_status_line_does_not_shadow_the_bold_key() {
+        let body =
+            "> **Status: DRAFT.** Covers the grey Area: see below.\n> **Area:** `fleet-tooling`\n";
+        assert_eq!(
+            extract_area(body),
+            AreaDecl::Accepted("fleet-tooling".to_string())
+        );
+        // ...and an unbolded key that is NOT the first token is not a key.
+        let body = "> **Status: DRAFT.**\n> See Area: nope\n";
+        assert_eq!(extract_area(body), AreaDecl::Absent);
+    }
+
+    /// The bolded key is accepted anywhere on the line — including glued to
+    /// preceding punctuation, with no whitespace boundary.
+    #[test]
+    fn bold_key_needs_no_boundary() {
+        let body = "> **Status: DRAFT.**\n> **Repo:** `qontinui-runner`.**Area:** fleet-tooling\n";
+        assert_eq!(
+            extract_area(body),
+            AreaDecl::Accepted("fleet-tooling".to_string())
+        );
+    }
+
+    /// Recognised near-miss spellings are rejected with the spelling named —
+    /// never silently absent — and their value is not read.
+    #[test]
+    fn near_miss_key_spellings_are_rejected_not_absent() {
+        for (line, spelling) in [
+            ("> **Area**: fleet-tooling", "**Area**:"),
+            ("> *Area:* fleet-tooling", "*Area:*"),
+            ("> **Repo:** x. *Area:* `fleet-tooling`", "*Area:*"),
+        ] {
+            let body = format!("> **Status: DRAFT.**\n{line}\n");
+            assert_eq!(
+                extract_area(&body),
+                AreaDecl::Rejected(AreaRejection::Misspelled(spelling)),
+                "{line:?}"
+            );
+            let u = parse(&body);
+            assert_eq!(u.area, None);
+            assert_eq!(u.area_rejected, Some(AreaRejection::Misspelled(spelling)));
+            assert!(
+                AreaRejection::Misspelled(spelling)
+                    .to_string()
+                    .contains(spelling),
+                "the warning text names the spelling"
+            );
+        }
+    }
+
+    /// A bolded VALUE loses its opener as well as its closer.
+    #[test]
+    fn bolded_value_is_unwrapped() {
+        let body = "> **Status: DRAFT.**\n> **Area:** **fleet-tooling**\n";
+        assert_eq!(
+            extract_area(body),
+            AreaDecl::Accepted("fleet-tooling".to_string())
+        );
+    }
+
+    /// A CRLF checkout reads the same as LF: the trailing `\r` is whitespace to
+    /// the token split and ends the blockquote at a blank `\r` line.
+    #[test]
+    fn crlf_body_resolves_like_lf() {
+        let body =
+            "# T\r\n\r\n> **Status: DRAFT.** Summary.\r\n> **Area:** `ci-runners`\r\n\r\nBody.\r\n";
+        assert_eq!(
+            extract_area(body),
+            AreaDecl::Accepted("ci-runners".to_string())
+        );
+        let body = "# T\r\n\r\n> **Status: DRAFT.**\r\n> Area: domain-cost-ledger\r\n";
+        assert_eq!(
+            extract_area(body),
+            AreaDecl::Accepted("domain-cost-ledger".to_string())
+        );
+        let body = "# T\r\n\r\n> **Status: DRAFT.**\r\n\r\n> **Area:** `ci-runners`\r\n";
+        assert_eq!(extract_area(body), AreaDecl::Absent);
+    }
+
+    /// The template's `> **Repo(s):**` shape: a SECOND blockquote after a blank
+    /// line is outside the status block, so an `**Area:**` there is Absent and
+    /// unwarned.
+    #[test]
+    fn area_in_a_second_blockquote_is_absent() {
+        let body = "# T\n\n> **Status: DRAFT.** Summary.\n\n> **Repo(s):** x\n> **Area:** `fleet-tooling`\n";
+        assert_eq!(extract_area(body), AreaDecl::Absent);
+        assert_eq!(parse(body).area_rejected, None);
+    }
+
+    /// The `/create-plan` template this binary bundles must put its `**Area:**`
+    /// line where the parser reads it. Extract the fenced plan template, fill
+    /// the `<area>` placeholder with a kebab value, and resolve it — so a
+    /// template edit that moves the line out of the status blockquote fails CI.
+    #[test]
+    fn create_plan_template_area_line_is_read_by_the_parser() {
+        let doc = include_str!("../fleet_commands/create-plan.md");
+        let open = "```markdown\n# Plan: <Title>\n";
+        let start = doc
+            .find(open)
+            .expect("create-plan.md carries the fenced plan template")
+            + "```markdown\n".len();
+        let len = doc[start..]
+            .find("\n```\n")
+            .expect("the plan template fence closes");
+        let template = &doc[start..start + len];
+        assert!(
+            template.contains("<area>"),
+            "the template carries the <area> placeholder"
+        );
+        let filled = template.replace("<area>", "published-parity");
+        assert_eq!(
+            extract_area(&filled),
+            AreaDecl::Accepted("published-parity".to_string())
+        );
+        // Unfilled, the placeholder is rejected (and so warned), not absent.
+        assert_eq!(extract_area(template), rej("<area>"));
     }
 
     // --- golden-file tests over the real plans corpus ------------------------
