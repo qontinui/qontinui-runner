@@ -1,0 +1,4 @@
+// Planted fixture for class `plans_dir`.
+fn planted_plans_dir(settings: &Settings) -> Option<PathBuf> {
+    settings.paths.plans_dir.clone().or_else(|| std::env::var("QONTINUI_PLANS_DIR").ok().map(PathBuf::from))
+}
