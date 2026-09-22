@@ -57,10 +57,14 @@
 //!
 //! ## Gates + posture
 //!
-//! 1. **Consent gate (hard)** — `Settings.cloud_sync_enabled` (default
-//!    false). Checked BEFORE anything else: with the toggle off,
-//!    [`enqueue_memory_record`] returns without writing to the outbox (or
-//!    even materializing it), so nothing leaves the machine.
+//! 1. **Consent gate (hard)** — `Settings.cloud_sync_enabled`. Default
+//!    `true` as of plan
+//!    `2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls`
+//!    §3.5 (ship-on with a reachable off-switch, per `engineering-priorities`
+//!    `capability-ships-enabled`) — an existing settings.json that already
+//!    wrote an explicit `false` keeps it. Checked BEFORE anything else: with
+//!    the toggle off, [`enqueue_memory_record`] returns without writing to
+//!    the outbox (or even materializing it), so nothing leaves the machine.
 //! 2. **Redaction** — every record's title + content pass through the shared
 //!    [`crate::session::redact`] sweep BEFORE the durable outbox write, so a
 //!    planted secret never persists locally, let alone egresses.

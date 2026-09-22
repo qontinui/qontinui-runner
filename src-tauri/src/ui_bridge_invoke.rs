@@ -549,6 +549,43 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         // token to be useful, so there is nothing to project.
         observe_projection: None,
     },
+    // ---- Gate-1 headless-reachable cloud-sync settings (plan
+    // 2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls §3.5) ----
+    //
+    // `get_cloud_sync_settings` / `save_cloud_sync_settings`
+    // (`crate::commands::cloud_sync_settings`) were, until this plan, wired
+    // only into the desktop `WebIntegrationSettings.tsx` settings panel via
+    // Tauri IPC -- unreachable from a headless (`QONTINUI_SERVER_MODE`)
+    // runner instance with no webview at all. Mirrors the
+    // `get_coord_device_token` precedent immediately above: the underlying
+    // fns are plain `settings.json` read/write with no webview dependency,
+    // so `Dispatch::InProcess` is what lets a headless box read and flip
+    // gate 1 of the session-history cloud-sync consent model over HTTP.
+    ProxyableCommand {
+        name: "get_cloud_sync_settings",
+        dispatch: Dispatch::InProcess,
+        description: "Return this runner's current cloud-sync consent settings -- gate 1 (`cloud_sync_enabled`) of the session-history cloud-sync consent model (already registered in Tauri; this entry only allowlists it over HTTP so a headless runner instance can read it without a desktop session). `Dispatch::InProcess`: a plain settings.json read, so it answers on a webview-less runner.",
+        args_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
+        response_schema: r#"{"type":"object","required":["success","data"],"properties":{"success":{"type":"boolean"},"message":{"type":["string","null"]},"data":{"type":"object","required":["cloud_sync_enabled"],"properties":{"cloud_sync_enabled":{"type":"boolean"}}}}}"#,
+        // Same FRONTEND-transport boot-probe caveat as `get_coord_device_token`
+        // above: probing routes through the webview regardless of `dispatch`,
+        // and would simply sit out the 10s timeout on a headless runner for no
+        // schema-drift benefit (no required key to miss). Opt out, matching
+        // every other `Dispatch::InProcess` entry in this table.
+        probe_with_empty_args: false,
+        observe_projection: None,
+    },
+    ProxyableCommand {
+        name: "save_cloud_sync_settings",
+        dispatch: Dispatch::InProcess,
+        description: "Persist this runner's `cloud_sync_enabled` consent flag -- gate 1 of the session-history cloud-sync consent model (already registered in Tauri; this entry only allowlists it over HTTP so a headless runner instance can flip it without a desktop session). `Dispatch::InProcess`: a plain settings.json write. `cloudSyncEnabled` is required.",
+        args_schema: r#"{"type":"object","required":["cloudSyncEnabled"],"properties":{"cloudSyncEnabled":{"type":"boolean"}}}"#,
+        response_schema: r#"{"type":"object","required":["success"],"properties":{"success":{"type":"boolean"},"message":{"type":["string","null"]},"data":{"type":"null"}}}"#,
+        // Required arg + mutates settings.json; an empty-args probe would
+        // both fail the required-key check and write nothing useful.
+        probe_with_empty_args: false,
+        observe_projection: None,
+    },
 ];
 
 /// Whether a command name is in the UI Bridge invoke allowlist.
@@ -766,6 +803,32 @@ mod tests {
     #[test]
     fn is_allowlisted_recognizes_coord_terminal_commands() {
         assert!(is_allowlisted("terminal_set_title"));
+    }
+
+    /// Plan `2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls`
+    /// §3.5: gate 1's cloud-sync settings commands must be reachable over
+    /// HTTP, in-process, so a headless runner can read/write them with no
+    /// desktop session.
+    #[test]
+    fn is_allowlisted_recognizes_cloud_sync_settings_commands() {
+        assert!(is_allowlisted("get_cloud_sync_settings"));
+        assert!(is_allowlisted("save_cloud_sync_settings"));
+        assert_eq!(
+            UI_BRIDGE_COMMANDS
+                .iter()
+                .find(|c| c.name == "get_cloud_sync_settings")
+                .unwrap()
+                .dispatch,
+            Dispatch::InProcess
+        );
+        assert_eq!(
+            UI_BRIDGE_COMMANDS
+                .iter()
+                .find(|c| c.name == "save_cloud_sync_settings")
+                .unwrap()
+                .dispatch,
+            Dispatch::InProcess
+        );
     }
 
     #[test]

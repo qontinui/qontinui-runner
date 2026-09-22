@@ -1354,10 +1354,20 @@ pub(super) fn build_child_intent(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    // This reads the raw persisted JSON directly rather than going through
+    // `Intent`'s `Deserialize` impl, so `Intent::share_output`'s own
+    // `#[serde(default = "default_true")]` (plan
+    // `2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls`
+    // §3.5) has no effect here — this fallback is a SECOND, independent
+    // default-resolution point that must be kept in sync by hand. A sparse
+    // source intent (predating this field, or from any other reason the key
+    // is absent) must resolve the same way a missing key resolves everywhere
+    // else: `true`, ship-on-by-default per `engineering-priorities`
+    // `capability-ships-enabled`.
     let share_output = src
         .get("share_output")
         .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+        .unwrap_or(true);
     let redact_secrets = src.get("redact_secrets").and_then(|v| v.as_bool());
     // Dual-read: coord renamed the wire key `plan_slug` → `work_unit_slug`.
     // Read the new name first and fall back to the legacy one so a source
@@ -1677,7 +1687,13 @@ mod tests {
         assert_eq!(intent.kind, SessionKind::TerminalClaude);
         assert!(intent.purpose.contains("handoff session"));
         assert!(intent.declared_paths.is_empty());
-        assert!(!intent.share_output);
+        // Ship-on-by-default (plan
+        // 2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls
+        // §3.5): a source intent that omits `share_output` entirely must
+        // resolve to `true` here too, matching `Intent::share_output`'s own
+        // serde default — this call site reads the raw JSON directly and so
+        // needed its own fallback fixed in step with that one.
+        assert!(intent.share_output);
         intent.validate().unwrap();
     }
 

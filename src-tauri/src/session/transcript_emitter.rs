@@ -24,9 +24,13 @@
 //! from the PTY counter, per the binding PK decision
 //! (`(session_id, stream, chunk_offset)` coord-side).
 //!
-//! ## Gates (all default-safe)
+//! ## Gates
 //!
-//! 1. **Runner-global** — `Settings.cloud_sync_enabled` (default false).
+//! 1. **Runner-global** — `Settings.cloud_sync_enabled`. Default `true` as
+//!    of plan `2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls`
+//!    §3.5 (`engineering-priorities` `capability-ships-enabled`: ship-on
+//!    with a reachable off-switch, not off-by-default) — an existing
+//!    settings.json that already wrote an explicit `false` keeps it.
 //!    Checked before anything is written: with the toggle off, no outbox
 //!    entry is created and nothing leaves the machine.
 //! 2. **Per-tenant** — enforced coord-side (`session_coordination_enabled`
