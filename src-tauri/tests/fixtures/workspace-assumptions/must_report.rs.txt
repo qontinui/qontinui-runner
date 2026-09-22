@@ -123,9 +123,14 @@ impl Console {
     pub fn win_only(&self) {}
 }
 
-// F5: an attribute-shaped line INSIDE a string literal is data. Before the
-// skeleton gate, this template's `#[cfg(test)]` opened a real region and
-// swallowed the hit after it.
+// A code-generating template whose lines are attribute-shaped. This block
+// demonstrates that such a template does NOT swallow what follows — and it
+// does not, either way: without the skeleton gate the template's `#[cfg(test)]`
+// opens a region that is never ENTERED (the skeleton blanks the template's
+// braces) and dies at the `;` ending this `const`, before `after_template` is
+// scanned. The gate itself is pinned where it IS observable — a hit on the very
+// line that would open the region — by
+// `attribute_shaped_lines_inside_string_literals_are_data`.
 pub const TEMPLATE: &str = r#"
 #[cfg(test)]
 mod tests {

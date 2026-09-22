@@ -896,10 +896,11 @@ fn scan_source(
                 //
                 // Bound, stated rather than implied: the scope opens at the
                 // block's `{`, and a line is scanned before its own braces are
-                // counted — so a ONE-LINE `extern "system" { fn OneLiner() ->
-                // u32; }` would still roster `OneLiner`. No such shape exists
-                // in this tree; a multi-line block, which is every one of them,
-                // is covered.
+                // counted — so a block whose HEADER LINE carries a declaration,
+                // the one-line `extern "system" { fn OneLiner() -> u32; }`
+                // above all, would still roster it. What is covered is a block
+                // whose header line carries no `fn`, which is all seven extern
+                // headers under `src/` today.
             } else if regions.iter().any(|r| r.flags.not_windows && item_level(r)) {
                 other_os_fns.insert(name.clone());
             } else if regions.iter().any(|r| r.flags.windows && !r.flags.test && item_level(r)) {
@@ -1814,6 +1815,37 @@ fn cfg_predicates_are_parsed_not_prefix_matched() {
     assert!(st.inner_cfg(&lines, |f| f.test));
     let lines = lex("#![cfg(not(test))]\nfn f() {}\n");
     assert!(!st.inner_cfg(&lines, |f| f.test));
+}
+
+/// The skeleton gate (F5): an attribute-shaped line that is really string DATA
+/// must neither open a region nor skip a whole file.
+///
+/// Pinned HERE rather than in `must_report.rs.txt`, because a template's bogus
+/// region is unobservable through the hits AFTER it: never entered (the
+/// skeleton blanks the template's braces), it dies at the next `;` or `,` at
+/// its own depth, or at the enclosing `}`. The one place it shows is the line
+/// that OPENS it — a region suppresses its own opening line — so that is what
+/// this asserts.
+#[test]
+fn attribute_shaped_lines_inside_string_literals_are_data() {
+    let st = Structure::new();
+    let classes = compile_classes();
+
+    let src = "fn holds_a_template() -> &'static str {\n    r#\"\n#[cfg(test)] the supervisor answers on 9875\n\"#\n}\n";
+    let hits = scan_source(&st, &classes, "fixture.rs", src, false);
+    assert!(
+        hits.iter()
+            .any(|h| h.class == "supervisor_dependency" && h.symbol == "holds_a_template"),
+        "an attribute-shaped line inside a string literal opened a cfg(test) region and \
+         swallowed the hit on its own line — attribute detection must be gated on the \
+         SKELETON, not on `code`. Got {hits:#?}"
+    );
+
+    let lines = lex("fn t() -> &'static str {\n    r#\"\n#![cfg(test)]\n\"#\n}\n");
+    assert!(
+        !st.inner_cfg(&lines, |f| f.test),
+        "a `#![cfg(test)]` line inside a string literal skipped the whole file"
+    );
 }
 
 /// Pointing the scan root at an empty dir fails on the floor rather than passing
