@@ -79,6 +79,7 @@ import { Sidebar } from "./components/navigation";
 import { TerminalPage } from "./components/terminal";
 import { TerminalPageTabBar } from "./components/terminal/TerminalPageTabBar";
 import { SessionRecoveryBanner } from "./components/terminal/SessionRecoveryBanner";
+import { AdvisoryStackProvider } from "./components/terminal/AdvisoryStack";
 import { RunnerDrainBanner } from "./components/terminal/RunnerDrainBanner";
 import { useProjectPageActivation } from "./components/terminal/useProjectPageActivation";
 import { useTerminalPages } from "./components/terminal/useTerminalPages";
@@ -782,66 +783,76 @@ function AppContent() {
               />
 
               <main className="flex-1 overflow-hidden relative">
-                <TabContent
-                  activeTab={activeTab}
-                  setActiveTab={setActiveTab}
-                  addLog={addLog}
-                  uiState={uiState}
-                  modalState={modalState}
-                  actionLogViewData={actionLogViewData}
-                  actionLogLoading={actionLogLoading}
-                  actionLogError={actionLogError}
-                  refreshActionLog={refreshActionLog}
-                  activeLogSubTab={activeLogSubTab}
-                  setActiveLogSubTab={setActiveLogSubTab}
-                  editWorkflowId={editWorkflowId}
-                  setEditWorkflowId={setEditWorkflowId}
-                  globalLogSourceSettings={globalLogSources.settings}
-                  projectSelection={projectSelection}
-                  projectLogs={projectLogs}
-                  lastRun={lastRun}
-                  lastRunWorkflowId={lastRunWorkflowId}
-                  lastRunWorkflowName={lastRunWorkflowName}
-                  isRunningLastWorkflow={isRunningLastWorkflow}
-                  handleRunLastWorkflow={handleRunLastWorkflow}
-                  handleGoToRecap={handleGoToRecap}
-                  handleCopyLogs={handleCopyLogs}
-                  clearActionLogs={clearActionLogs}
-                  clearAllLogs={clearAllLogs}
-                  errorMonitorScope={errorMonitorScope}
-                  clearErrorMonitorScope={clearErrorMonitorScope}
-                />
-                <div
-                  className={`absolute inset-0 flex flex-col ${activeTab === "terminal" ? "" : "hidden"}`}
-                >
-                  <TerminalPageTabBar
-                    pages={terminalPages.visiblePages}
-                    activePageId={terminalPages.activePageId}
-                    onSelectPage={terminalPages.setActivePageId}
-                    onAddPage={terminalPages.addPage}
-                    onRemovePage={terminalPages.removePage}
-                    onRenamePage={terminalPages.renamePage}
-                    onReorderPage={terminalPages.reorderPage}
-                    onReorganize={() => setShowReorganize(true)}
-                    isPinned={terminalPages.isPinned}
-                    onPopOut={() => {
-                      // Open a new pop-out OS window (same process) that hosts its
-                      // own terminal tabs — the visible counterpart to the
-                      // `open-terminal-window` UI Bridge action. New terminals
-                      // created in that window belong to it (window_assignments).
-                      void invoke("open_terminal_window", { placement: null }).catch((err) =>
-                        console.error("Failed to open pop-out window:", err),
-                      );
-                    }}
-                    onPopOutPage={(pageId) => {
-                      // Detach the whole page (all its terminals + zone layout)
-                      // into its own bound pop-out window.
-                      void popOutPage(pageId).catch((err) =>
-                        console.error("Failed to pop out page:", err),
-                      );
-                    }}
+                {/*
+                  Single owner of the top-right advisory corner (finding
+                  c91550f0, post-merge follow-up to #1633): mounts one
+                  `position: fixed` stack that `SessionRecoveryBanner` below
+                  and the terminal-page banners (`MidSessionToast`,
+                  `HoldingLockBanner`, `WaitingLockBanner`,
+                  `ResumeFailedBanner`) portal into via `AdvisorySlot`, so
+                  none of them can render superimposed on another.
+                */}
+                <AdvisoryStackProvider>
+                  <TabContent
+                    activeTab={activeTab}
+                    setActiveTab={setActiveTab}
+                    addLog={addLog}
+                    uiState={uiState}
+                    modalState={modalState}
+                    actionLogViewData={actionLogViewData}
+                    actionLogLoading={actionLogLoading}
+                    actionLogError={actionLogError}
+                    refreshActionLog={refreshActionLog}
+                    activeLogSubTab={activeLogSubTab}
+                    setActiveLogSubTab={setActiveLogSubTab}
+                    editWorkflowId={editWorkflowId}
+                    setEditWorkflowId={setEditWorkflowId}
+                    globalLogSourceSettings={globalLogSources.settings}
+                    projectSelection={projectSelection}
+                    projectLogs={projectLogs}
+                    lastRun={lastRun}
+                    lastRunWorkflowId={lastRunWorkflowId}
+                    lastRunWorkflowName={lastRunWorkflowName}
+                    isRunningLastWorkflow={isRunningLastWorkflow}
+                    handleRunLastWorkflow={handleRunLastWorkflow}
+                    handleGoToRecap={handleGoToRecap}
+                    handleCopyLogs={handleCopyLogs}
+                    clearActionLogs={clearActionLogs}
+                    clearAllLogs={clearAllLogs}
+                    errorMonitorScope={errorMonitorScope}
+                    clearErrorMonitorScope={clearErrorMonitorScope}
                   />
-                  {/*
+                  <div
+                    className={`absolute inset-0 flex flex-col ${activeTab === "terminal" ? "" : "hidden"}`}
+                  >
+                    <TerminalPageTabBar
+                      pages={terminalPages.visiblePages}
+                      activePageId={terminalPages.activePageId}
+                      onSelectPage={terminalPages.setActivePageId}
+                      onAddPage={terminalPages.addPage}
+                      onRemovePage={terminalPages.removePage}
+                      onRenamePage={terminalPages.renamePage}
+                      onReorderPage={terminalPages.reorderPage}
+                      onReorganize={() => setShowReorganize(true)}
+                      isPinned={terminalPages.isPinned}
+                      onPopOut={() => {
+                        // Open a new pop-out OS window (same process) that hosts its
+                        // own terminal tabs — the visible counterpart to the
+                        // `open-terminal-window` UI Bridge action. New terminals
+                        // created in that window belong to it (window_assignments).
+                        void invoke("open_terminal_window", { placement: null }).catch((err) =>
+                          console.error("Failed to open pop-out window:", err),
+                        );
+                      }}
+                      onPopOutPage={(pageId) => {
+                        // Detach the whole page (all its terminals + zone layout)
+                        // into its own bound pop-out window.
+                        void popOutPage(pageId).catch((err) =>
+                          console.error("Failed to pop out page:", err),
+                        );
+                      }}
+                    />
+                    {/*
                   Phase 4 — startup session-recovery banner. Subscribes to the
                   one-shot `session-recovery-summary` event emitted after
                   auto-reattach; renders a prominent (crash) or quiet (planned)
@@ -850,27 +861,27 @@ function AppContent() {
                   report. Composes with the session-visibility surfaces rather
                   than owning any session state.
                 */}
-                  <SessionRecoveryBanner />
-                  {/*
+                    <SessionRecoveryBanner />
+                    {/*
                   Coord device drain notice (plan
                   `2026-09-13-drained-runner-never-reaches-idle`, Phase 3): while
                   coord has drained this runner — or its drain state is unknown —
                   autonomous spawns are deferred and this says so, with the
                   deferred-work count. Operator actions still run.
                 */}
-                  <RunnerDrainBanner />
-                  {showReorganize && (
-                    <ReorganizeDialog
-                      pages={terminalPages.pages}
-                      onClose={() => setShowReorganize(false)}
-                      onApply={async (plan) => {
-                        await handleReorganize(plan);
-                        setShowReorganize(false);
-                      }}
-                    />
-                  )}
-                  <div className="flex-1 min-h-0">
-                    {/*
+                    <RunnerDrainBanner />
+                    {showReorganize && (
+                      <ReorganizeDialog
+                        pages={terminalPages.pages}
+                        onClose={() => setShowReorganize(false)}
+                        onApply={async (plan) => {
+                          await handleReorganize(plan);
+                          setShowReorganize(false);
+                        }}
+                      />
+                    )}
+                    <div className="flex-1 min-h-0">
+                      {/*
                     Phase 3 (mount-hydration lift): the terminal session state
                     provider is lifted ABOVE TerminalPage and made page-scoped
                     INSIDE the provider (one always-mounted PageSessionScope per
@@ -887,24 +898,25 @@ function AppContent() {
                     TerminalPage (== session.pageId) so the page's render logic
                     is untouched; the `key={activePageId}` remount is gone.
                   */}
-                    <WindowAssignmentsProvider>
-                      <TerminalSessionProvider
-                        pages={terminalPages.pages}
-                        activePageId={terminalPages.activePageId}
-                        onNavigateToBuilder={navigateToBuilder}
-                        onNavigateToActive={navigateToActive}
-                      >
-                        <TerminalPageProvider value={terminalPages.activePageId}>
-                          <TerminalPage
-                            onNavigateToBuilder={navigateToBuilder}
-                            onNavigateToActive={navigateToActive}
-                            onSessionCountChange={setTerminalSessionCount}
-                          />
-                        </TerminalPageProvider>
-                      </TerminalSessionProvider>
-                    </WindowAssignmentsProvider>
+                      <WindowAssignmentsProvider>
+                        <TerminalSessionProvider
+                          pages={terminalPages.pages}
+                          activePageId={terminalPages.activePageId}
+                          onNavigateToBuilder={navigateToBuilder}
+                          onNavigateToActive={navigateToActive}
+                        >
+                          <TerminalPageProvider value={terminalPages.activePageId}>
+                            <TerminalPage
+                              onNavigateToBuilder={navigateToBuilder}
+                              onNavigateToActive={navigateToActive}
+                              onSessionCountChange={setTerminalSessionCount}
+                            />
+                          </TerminalPageProvider>
+                        </TerminalSessionProvider>
+                      </WindowAssignmentsProvider>
+                    </div>
                   </div>
-                </div>
+                </AdvisoryStackProvider>
               </main>
             </div>
 

@@ -35,6 +35,8 @@
  */
 
 import { AlertTriangle, MessageSquareDashed, RotateCcw, X } from "lucide-react";
+import { useUIElement } from "@qontinui/ui-bridge";
+import { AdvisorySlot } from "./AdvisoryStack";
 import type { TerminalTab } from "./useTerminalManager";
 
 export interface ResumeFailedBannerProps {
@@ -72,91 +74,99 @@ export function ResumeFailedBanner({
 }: ResumeFailedBannerProps) {
   const failed = failedResumeTabs(tabs);
   const terminalOnly = terminalOnlyRestoreTabs(tabs);
+  const { ref } = useUIElement({
+    id: "terminal-resume-failed-banner",
+    type: "generic",
+    label: "Resume failed banner",
+  });
   if (failed.length === 0 && terminalOnly.length === 0) return null;
 
   return (
-    <div
-      data-ui-bridge-id="terminal.resume-failed-banner"
-      className="absolute top-2 right-2 z-30 w-[360px] rounded border shadow-lg p-2.5 bg-[#f7768e]/10 border-[#f7768e]/40"
-    >
-      {failed.length > 0 && (
-        <div className="flex items-start gap-2">
-          <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5 text-[#f7768e]" />
-          <div className="flex-1 min-w-0">
-            <div className="text-[12px] font-semibold text-[#c0caf5] leading-snug">
-              {failed.length === 1
-                ? "Session resume failed"
-                : `${failed.length} session resumes failed`}
-            </div>
-            <ul className="mt-1.5 space-y-1">
-              {failed.map((t) => (
-                <li
-                  key={t.id}
-                  data-ui-bridge-id="terminal.resume-failed-banner-item"
-                  data-terminal-id={t.id}
-                  className="flex items-center gap-2 text-[11px] leading-snug"
-                >
-                  <span className="text-[#c0caf5] font-medium truncate flex-1">{t.title}</span>
-                  <button
-                    type="button"
-                    data-ui-bridge-id="terminal.resume-failed-retry"
+    <AdvisorySlot>
+      <div
+        ref={ref}
+        data-ui-bridge-id="terminal.resume-failed-banner"
+        className="w-[360px] rounded border shadow-lg p-2.5 bg-[#f7768e]/10 border-[#f7768e]/40"
+      >
+        {failed.length > 0 && (
+          <div className="flex items-start gap-2">
+            <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5 text-[#f7768e]" />
+            <div className="flex-1 min-w-0">
+              <div className="text-[12px] font-semibold text-[#c0caf5] leading-snug">
+                {failed.length === 1
+                  ? "Session resume failed"
+                  : `${failed.length} session resumes failed`}
+              </div>
+              <ul className="mt-1.5 space-y-1">
+                {failed.map((t) => (
+                  <li
+                    key={t.id}
+                    data-ui-bridge-id="terminal.resume-failed-banner-item"
                     data-terminal-id={t.id}
-                    onClick={() => onRetryResume(t.id)}
-                    className="flex items-center gap-1 px-1.5 py-0.5 rounded border border-[#f7768e]/40 text-[#f7768e] hover:bg-[#f7768e]/15 text-[10px]"
-                    title="Retype the resume command and re-verify the Claude UI handshake"
+                    className="flex items-center gap-2 text-[11px] leading-snug"
                   >
-                    <RotateCcw className="w-2.5 h-2.5" />
-                    Retry resume
-                  </button>
-                </li>
-              ))}
-            </ul>
-          </div>
-        </div>
-      )}
-
-      {terminalOnly.length > 0 && (
-        <div className={`flex items-start gap-2 ${failed.length > 0 ? "mt-2" : ""}`}>
-          <MessageSquareDashed className="w-3.5 h-3.5 shrink-0 mt-0.5 text-[#7aa2f7]" />
-          <div className="flex-1 min-w-0">
-            <div className="text-[12px] font-semibold text-[#c0caf5] leading-snug">
-              {terminalOnly.length === 1
-                ? "Terminal restored — fresh conversation"
-                : `${terminalOnly.length} terminals restored — fresh conversations`}
-            </div>
-            <div className="text-[10px] text-[#a9b1d6] leading-snug mt-0.5">
-              The terminal and working directory were restored, but the previous conversation could
-              not be resumed by id — so it starts fresh. Nothing was lost from the terminal; only
-              the chat history did not carry over.
-            </div>
-            <ul className="mt-1.5 space-y-1">
-              {terminalOnly.map((t) => (
-                <li
-                  key={t.id}
-                  data-ui-bridge-id="terminal.restore-terminal-only-item"
-                  data-terminal-id={t.id}
-                  className="flex items-center gap-2 text-[11px] leading-snug"
-                >
-                  <span className="text-[#c0caf5] font-medium truncate flex-1">{t.title}</span>
-                  {onDismissTerminalOnly && (
+                    <span className="text-[#c0caf5] font-medium truncate flex-1">{t.title}</span>
                     <button
                       type="button"
-                      data-ui-bridge-id="terminal.restore-terminal-only-dismiss"
+                      data-ui-bridge-id="terminal.resume-failed-retry"
                       data-terminal-id={t.id}
-                      onClick={() => onDismissTerminalOnly(t.id)}
-                      className="flex items-center gap-1 px-1.5 py-0.5 rounded border border-[#7aa2f7]/40 text-[#7aa2f7] hover:bg-[#7aa2f7]/15 text-[10px]"
-                      title="Dismiss this fresh-conversation note"
+                      onClick={() => onRetryResume(t.id)}
+                      className="flex items-center gap-1 px-1.5 py-0.5 rounded border border-[#f7768e]/40 text-[#f7768e] hover:bg-[#f7768e]/15 text-[10px]"
+                      title="Retype the resume command and re-verify the Claude UI handshake"
                     >
-                      <X className="w-2.5 h-2.5" />
-                      Got it
+                      <RotateCcw className="w-2.5 h-2.5" />
+                      Retry resume
                     </button>
-                  )}
-                </li>
-              ))}
-            </ul>
+                  </li>
+                ))}
+              </ul>
+            </div>
           </div>
-        </div>
-      )}
-    </div>
+        )}
+
+        {terminalOnly.length > 0 && (
+          <div className={`flex items-start gap-2 ${failed.length > 0 ? "mt-2" : ""}`}>
+            <MessageSquareDashed className="w-3.5 h-3.5 shrink-0 mt-0.5 text-[#7aa2f7]" />
+            <div className="flex-1 min-w-0">
+              <div className="text-[12px] font-semibold text-[#c0caf5] leading-snug">
+                {terminalOnly.length === 1
+                  ? "Terminal restored — fresh conversation"
+                  : `${terminalOnly.length} terminals restored — fresh conversations`}
+              </div>
+              <div className="text-[10px] text-[#a9b1d6] leading-snug mt-0.5">
+                The terminal and working directory were restored, but the previous conversation
+                could not be resumed by id — so it starts fresh. Nothing was lost from the terminal;
+                only the chat history did not carry over.
+              </div>
+              <ul className="mt-1.5 space-y-1">
+                {terminalOnly.map((t) => (
+                  <li
+                    key={t.id}
+                    data-ui-bridge-id="terminal.restore-terminal-only-item"
+                    data-terminal-id={t.id}
+                    className="flex items-center gap-2 text-[11px] leading-snug"
+                  >
+                    <span className="text-[#c0caf5] font-medium truncate flex-1">{t.title}</span>
+                    {onDismissTerminalOnly && (
+                      <button
+                        type="button"
+                        data-ui-bridge-id="terminal.restore-terminal-only-dismiss"
+                        data-terminal-id={t.id}
+                        onClick={() => onDismissTerminalOnly(t.id)}
+                        className="flex items-center gap-1 px-1.5 py-0.5 rounded border border-[#7aa2f7]/40 text-[#7aa2f7] hover:bg-[#7aa2f7]/15 text-[10px]"
+                        title="Dismiss this fresh-conversation note"
+                      >
+                        <X className="w-2.5 h-2.5" />
+                        Got it
+                      </button>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        )}
+      </div>
+    </AdvisorySlot>
   );
 }
