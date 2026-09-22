@@ -154,6 +154,10 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
 
   const [ciNode, setCiNode] = useState<CiNodeSettingsValue>(DEFAULT_CI_NODE);
   const [hostSuggestion, setHostSuggestion] = useState<CiNodeHostSuggestion | null>(null);
+  // Text draft for the concurrency input while it is being edited (`null` =
+  // not editing). Committed on blur, so a transiently empty box never flips the
+  // setting to "use suggested".
+  const [buildsDraft, setBuildsDraft] = useState<string | null>(null);
   const [allowlistText, setAllowlistText] = useState("");
 
   const [loading, setLoading] = useState(true);
@@ -680,16 +684,20 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
             min={MAX_CONCURRENT_BUILDS_MIN}
             max={MAX_CONCURRENT_BUILDS_MAX}
             step={1}
-            value={ciNode.max_concurrent_builds ?? ""}
+            value={buildsDraft ?? ciNode.max_concurrent_builds ?? ""}
             placeholder={
               hostSuggestion ? `suggested ${hostSuggestion.suggested}` : "host suggestion"
             }
-            onChange={(e) =>
+            onChange={(e) => setBuildsDraft(e.target.value)}
+            onBlur={() => {
+              if (buildsDraft === null) return;
+              const draft = buildsDraft;
+              setBuildsDraft(null);
               setCiNode((c) => ({
                 ...c,
-                max_concurrent_builds: parseConcurrencyInput(e.target.value),
-              }))
-            }
+                max_concurrent_builds: parseConcurrencyInput(draft, c.max_concurrent_builds),
+              }));
+            }}
             disabled={!ciNode.enabled}
             className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
           />
@@ -708,7 +716,10 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
             <button
               type="button"
               data-ui-bridge-id="settings.resource-guard-max-builds-use-suggested"
-              onClick={() => setCiNode((c) => ({ ...c, max_concurrent_builds: null }))}
+              onClick={() => {
+                setBuildsDraft(null);
+                setCiNode((c) => ({ ...c, max_concurrent_builds: null }));
+              }}
               disabled={!ciNode.enabled || ciNode.max_concurrent_builds === null}
               className="text-[10px] px-2 py-0.5 rounded-md bg-muted/50 hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed"
             >
@@ -734,9 +745,9 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
               ) : null;
             })()}
           <p className="text-[10px] text-muted-foreground">
-            Also the build capacity this device advertises to coord. Leave empty to follow the host
-            suggestion; an explicit value always wins. Range {MAX_CONCURRENT_BUILDS_MIN}-
-            {MAX_CONCURRENT_BUILDS_MAX}.
+            Also the build capacity this device advertises to coord. Unset follows the host
+            suggestion; an explicit value always wins, and &quot;Use suggested&quot; returns to it.
+            Range {MAX_CONCURRENT_BUILDS_MIN}-{MAX_CONCURRENT_BUILDS_MAX}.
           </p>
         </div>
 

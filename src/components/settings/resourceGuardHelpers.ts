@@ -54,13 +54,15 @@ export interface CiNodeHostSuggestion {
 }
 
 /**
- * Parse the concurrency input. Empty or non-numeric means "use the host
- * suggestion" (`null`, which the runner persists as unset); anything numeric
- * is an explicit override clamped to the validator's range.
+ * Commit the concurrency input's text draft (called on blur, never per
+ * keystroke). Anything numeric is an explicit override clamped to the
+ * validator's range; empty or non-numeric text REVERTS to `previous` — it never
+ * silently switches to "use the host suggestion". The "Use suggested" button is
+ * the only way to write `null`.
  */
-export function parseConcurrencyInput(raw: string): number | null {
+export function parseConcurrencyInput(raw: string, previous: number | null): number | null {
   const n = parseInt(raw, 10);
-  if (!Number.isFinite(n)) return null;
+  if (!Number.isFinite(n)) return previous;
   return clampInt(
     n,
     MAX_CONCURRENT_BUILDS_MIN,

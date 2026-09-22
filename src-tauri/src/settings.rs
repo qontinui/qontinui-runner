@@ -2379,6 +2379,23 @@ mod ci_node_tests {
         assert_eq!(back.ci_node.max_concurrent_builds, None);
     }
 
+    /// None is omitted on disk (older builds fail on `null` in a `u32`), and an
+    /// explicit value is written.
+    #[test]
+    fn ci_node_unset_capacity_is_omitted_on_disk() {
+        let unset = serde_json::to_value(CiNodeSettings::default()).unwrap();
+        assert!(
+            unset.get("max_concurrent_builds").is_none(),
+            "None must be omitted, not null: {unset}"
+        );
+        let set = serde_json::to_value(CiNodeSettings {
+            max_concurrent_builds: Some(4),
+            ..CiNodeSettings::default()
+        })
+        .unwrap();
+        assert_eq!(set["max_concurrent_builds"], 4);
+    }
+
     /// The one accessor: an explicit value wins verbatim (floored at 1 for
     /// admission); None resolves to the host suggestion.
     #[test]
@@ -2718,7 +2735,11 @@ pub struct CiNodeSettings {
     /// settings.json carrying a number stays explicit. Read it through
     /// [`CiNodeSettings::effective_max_concurrent_builds`], never directly, so
     /// the advertised and admitted numbers cannot diverge.
-    #[serde(default)]
+    ///
+    /// `None` is OMITTED on disk rather than written as `null`: an older runner
+    /// build reading this file (a rollback) treats a missing key as its own
+    /// default, but fails to parse `null` into its `u32`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent_builds: Option<u32>,
     /// Repos this device may build. Entries match either the coord
     /// `owner/name` slug or the bare repo basename. Empty (the default)

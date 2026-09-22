@@ -136,7 +136,8 @@ pub(crate) fn suggestion_with_limit(cap: HostCapacity) -> (u32, Option<LimitingT
         return (UNKNOWN_HOST_SUGGESTED_SLOTS, None);
     };
     let by_cores = cap.cpus.max(1) / CPUS_PER_SLOT;
-    let by_mem = (mem / (BUILD_TOKENS_PER_SLOT * BYTES_PER_BUILD_TOKEN)).min(u32::MAX as u64) as u32;
+    let by_mem =
+        (mem / (BUILD_TOKENS_PER_SLOT * BYTES_PER_BUILD_TOKEN)).min(u32::MAX as u64) as u32;
     let limit = if by_cores <= by_mem {
         LimitingTerm::Cores
     } else {
