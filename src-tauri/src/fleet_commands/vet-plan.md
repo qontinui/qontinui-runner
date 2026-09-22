@@ -1312,6 +1312,11 @@ and the body. Before writing your stamp:
    in a separate `> **Edit:` block), include the salient info in
    **one trailing line inside your new block**, prefixed `History:` or
    `Previously:`. Never as a sibling blockquote.
+5. **Carry the `**Area:**` line.** If the block you are replacing carries a
+   `` > **Area:** `<area>` `` line, copy it verbatim into your new block. It is
+   the plan's work-unit `metadata.area`: the runner's plan scanner reads it
+   only from this status blockquote, and coord replaces `metadata` wholesale,
+   so a stamp that drops it erases the unit's area on the next scan.
 
 When `/vet-plan` and `/verify-plan-status` disagree on what the status
 should be (the plan is both VETTED *and* NOT STARTED — a vetted plan
