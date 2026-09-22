@@ -171,9 +171,12 @@ tests. A `cwd` that is not an existing directory is a 400, not a fallback.
 > window never opens. Deleting a command file whose role is still on the
 > allow-list, with no such edge declared, is the defect this note names.
 >
-> No such window is open as of 2026-09-22: `role_slash_command`
-> (`src-tauri/src/mcp/sessions.rs`) maps `auto-review`, `summarize-session` and
-> `implement-plan`, and all three have a command file here.
+> Whether that window is open right now is not this paragraph's to say.
+> Lint check #65 (`scripts/lint-role-command-roster.py`, CI job
+> `role-command-roster`) parses `role_slash_command`
+> (`src-tauri/src/mcp/sessions.rs`) at a pinned runner ref and asserts, per
+> role, that a command file exists both here and in the runner's bundle — read
+> its result instead of a restated point-in-time measurement.
 
 The `<failure-context block>` is the verdict-tagged `/summarize-session`
 markdown from Step 4, preceded by a one-line preamble:
