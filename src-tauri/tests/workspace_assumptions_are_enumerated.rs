@@ -72,7 +72,8 @@ use serde::{Deserialize, Serialize};
 
 /// The plan whose Phase 4 this roster is. NOT what a `defect(...)` cites: a
 /// defect cites the plan that owns its fix.
-const PLAN_STEM: &str = "2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports";
+const PLAN_STEM: &str =
+    "2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports";
 
 /// Vacuity floor on the number of `.rs` files actually scanned.
 ///
@@ -318,7 +319,9 @@ fn lex(src: &str) -> Vec<Line> {
         }
         // Raw string: r"..." / r#"..."# (optionally b-prefixed; the `b` was
         // already emitted as an ordinary char).
-        let prev_ident = i > 0 && is_ident(chars[i - 1]) && !(chars[i - 1] == 'b' && (i < 2 || !is_ident(chars[i - 2])));
+        let prev_ident = i > 0
+            && is_ident(chars[i - 1])
+            && !(chars[i - 1] == 'b' && (i < 2 || !is_ident(chars[i - 2])));
         if c == 'r' && !prev_ident {
             let mut j = i + 1;
             while j < n && chars[j] == '#' {
@@ -563,7 +566,10 @@ fn parse_pred(toks: &[Tok], i: &mut usize) -> Option<Pred> {
 /// The predicate of a `#[cfg(...)]` / `#![cfg(...)]` attribute (not `cfg_attr`).
 fn cfg_pred(attr: &str) -> Option<Pred> {
     let t = attr.trim();
-    let inner = t.strip_prefix("#![").or_else(|| t.strip_prefix("#["))?.trim_start();
+    let inner = t
+        .strip_prefix("#![")
+        .or_else(|| t.strip_prefix("#["))?
+        .trim_start();
     let rest = inner.strip_prefix("cfg")?.trim_start();
     let rest = rest.strip_prefix('(')?;
     let toks = tokenize_cfg(rest);
@@ -587,14 +593,27 @@ fn is_test_atom(n: &str, v: Option<&str>) -> bool {
 }
 
 fn is_windows_atom(n: &str, v: Option<&str>) -> bool {
-    (n == "windows" && v.is_none()) || (matches!(n, "target_os" | "target_family") && v == Some("windows"))
+    (n == "windows" && v.is_none())
+        || (matches!(n, "target_os" | "target_family") && v == Some("windows"))
 }
 
 fn is_unixish_atom(n: &str, v: Option<&str>) -> bool {
     (n == "unix" && v.is_none())
         || (n == "target_family" && v == Some("unix"))
         || (n == "target_os"
-            && matches!(v, Some("linux" | "macos" | "android" | "ios" | "freebsd" | "openbsd" | "netbsd" | "dragonfly")))
+            && matches!(
+                v,
+                Some(
+                    "linux"
+                        | "macos"
+                        | "android"
+                        | "ios"
+                        | "freebsd"
+                        | "openbsd"
+                        | "netbsd"
+                        | "dragonfly"
+                )
+            ))
 }
 
 /// Does `p` exclude Windows (`not(windows)`, `unix`, `target_os = "linux"`, …)?
@@ -672,16 +691,34 @@ fn starts_item(rest: &str) -> bool {
     if let Some(after) = r.strip_prefix("pub") {
         let after = after.trim_start();
         r = if after.starts_with('(') {
-            after.find(')').map_or(after, |i| after[i + 1..].trim_start())
+            after
+                .find(')')
+                .map_or(after, |i| after[i + 1..].trim_start())
         } else {
             after
         };
     }
-    let word: String = r.chars().take_while(|c| is_ident(*c) || *c == '!').collect();
+    let word: String = r
+        .chars()
+        .take_while(|c| is_ident(*c) || *c == '!')
+        .collect();
     matches!(
         word.as_str(),
-        "fn" | "impl" | "mod" | "struct" | "enum" | "trait" | "use" | "const" | "static" | "type"
-            | "extern" | "unsafe" | "async" | "union" | "macro_rules!" | "let"
+        "fn" | "impl"
+            | "mod"
+            | "struct"
+            | "enum"
+            | "trait"
+            | "use"
+            | "const"
+            | "static"
+            | "type"
+            | "extern"
+            | "unsafe"
+            | "async"
+            | "union"
+            | "macro_rules!"
+            | "let"
     )
 }
 
@@ -766,7 +803,11 @@ impl Structure {
 
     /// `(mod name, #[path] override)` for every `mod x;` declaration whose cfg
     /// satisfies `want`.
-    fn cfg_mod_decls(&self, lines: &[Line], want: fn(CfgFlags) -> bool) -> Vec<(String, Option<String>)> {
+    fn cfg_mod_decls(
+        &self,
+        lines: &[Line],
+        want: fn(CfgFlags) -> bool,
+    ) -> Vec<(String, Option<String>)> {
         let mut out = Vec::new();
         let mut pending: Vec<String> = Vec::new();
         for line in lines {
@@ -796,7 +837,8 @@ impl Structure {
     fn inner_cfg(&self, lines: &[Line], want: fn(CfgFlags) -> bool) -> bool {
         lines.iter().any(|l| {
             // Skeleton decides it IS an attribute; `code` supplies its text.
-            l.skel.trim_start().starts_with("#![") && want(CfgFlags::of(&[l.code.trim_start().to_string()]))
+            l.skel.trim_start().starts_with("#![")
+                && want(CfgFlags::of(&[l.code.trim_start().to_string()]))
         })
     }
 }
@@ -846,7 +888,8 @@ fn scan_source(
         // ---- attributes / item starts --------------------------------------
         // Attributes are read INSIDE open regions too: a `cfg(test)` module
         // inside a `cfg(windows)` one is its own, nested region.
-        let mut line_fn_name: Option<String> = st.fn_re.captures(&line.skel).map(|c| c[1].to_string());
+        let mut line_fn_name: Option<String> =
+            st.fn_re.captures(&line.skel).map(|c| c[1].to_string());
         {
             // Gate on the SKELETON: a template string whose line begins `#[cfg(test)]`
             // is data, not an attribute, and must not open a region (43 such
@@ -903,7 +946,10 @@ fn scan_source(
                 // headers under `src/` today.
             } else if regions.iter().any(|r| r.flags.not_windows && item_level(r)) {
                 other_os_fns.insert(name.clone());
-            } else if regions.iter().any(|r| r.flags.windows && !r.flags.test && item_level(r)) {
+            } else if regions
+                .iter()
+                .any(|r| r.flags.windows && !r.flags.test && item_level(r))
+            {
                 let q = match impl_stack.last() {
                     Some((t, _)) => format!("{t}::{name}"),
                     None => name.clone(),
@@ -962,7 +1008,8 @@ fn scan_source(
                 for (target, re, exclude) in &class.patterns {
                     let excluded = |t: &str| exclude.as_ref().is_some_and(|e| e.is_match(t));
                     excerpt = match target {
-                        Target::Code => (re.is_match(&line.code) && !excluded(&line.code)).then(|| excerpt_of(&line.code)),
+                        Target::Code => (re.is_match(&line.code) && !excluded(&line.code))
+                            .then(|| excerpt_of(&line.code)),
                         Target::Literal => line.literals.iter().find_map(|lit| {
                             let m = re.find(lit)?;
                             if excluded(lit) {
@@ -972,7 +1019,9 @@ fn scan_source(
                             // holding the match, not the line that opens it.
                             Some(if lit.contains('\n') {
                                 let start = lit[..m.start()].rfind('\n').map_or(0, |i| i + 1);
-                                let end = lit[m.start()..].find('\n').map_or(lit.len(), |i| m.start() + i);
+                                let end = lit[m.start()..]
+                                    .find('\n')
+                                    .map_or(lit.len(), |i| m.start() + i);
                                 excerpt_of(&lit[start..end])
                             } else {
                                 excerpt_of(&line.code)
@@ -1051,7 +1100,9 @@ fn scan_source(
                     // An entered item closes at its own `}`; anything — a field,
                     // variant or arm with no trailing comma — closes when the
                     // enclosing block does.
-                    regions.retain(|r| !((r.entered && depth == r.start_depth) || depth < r.start_depth));
+                    regions.retain(|r| {
+                        !((r.entered && depth == r.start_depth) || depth < r.start_depth)
+                    });
                 }
                 ';' => {
                     if bracket == 0 {
@@ -1062,11 +1113,16 @@ fn scan_source(
                             const_ctx = None;
                         }
                     }
-                    regions.retain(|r| !(!r.entered && depth == r.start_depth && bracket == r.start_bracket));
+                    regions.retain(|r| {
+                        !(!r.entered && depth == r.start_depth && bracket == r.start_bracket)
+                    });
                 }
                 ',' => {
                     regions.retain(|r| {
-                        !(r.comma_closes && !r.entered && depth == r.start_depth && bracket == r.start_bracket)
+                        !(r.comma_closes
+                            && !r.entered
+                            && depth == r.start_depth
+                            && bracket == r.start_bracket)
                     });
                 }
                 _ => {}
@@ -1168,7 +1224,11 @@ fn scan_tree(src_root: &Path, rel_base: &Path) -> ScanResult {
                 &mut test_files,
                 &mut test_dirs,
             ),
-            (|f: CfgFlags| f.windows && !f.test, &mut windows_files, &mut windows_dirs),
+            (
+                |f: CfgFlags| f.windows && !f.test,
+                &mut windows_files,
+                &mut windows_dirs,
+            ),
         ] {
             for (name, path) in st.cfg_mod_decls(&lines, kind) {
                 if let Some(p) = path {
@@ -1189,7 +1249,10 @@ fn scan_tree(src_root: &Path, rel_base: &Path) -> ScanResult {
             continue;
         }
         if test_files.contains(f) || under(&test_dirs) {
-            *result.skipped.entry("cfg(test) mod decl".into()).or_default() += 1;
+            *result
+                .skipped
+                .entry("cfg(test) mod decl".into())
+                .or_default() += 1;
             continue;
         }
         let rel = f
@@ -1199,7 +1262,9 @@ fn scan_tree(src_root: &Path, rel_base: &Path) -> ScanResult {
             .to_string()
             .replace('\\', "/");
         let win = windows_files.contains(f) || under(&windows_dirs);
-        result.hits.extend(scan_source(&st, &classes, &rel, src, win));
+        result
+            .hits
+            .extend(scan_source(&st, &classes, &rel, src, win));
         result.scanned_files += 1;
     }
     result
@@ -1290,8 +1355,10 @@ type Key = (String, String, String);
 
 fn load_dispositions(root: &Path) -> Result<BTreeMap<Key, Disposition>, String> {
     let path = root.join(DISPOSITIONS_TOML);
-    let text = fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let parsed: DispositionsFile = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let text =
+        fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let parsed: DispositionsFile =
+        toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut out = BTreeMap::new();
     for e in parsed.disposition {
         if !valid_disposition(&e.disposition) {
@@ -1315,7 +1382,10 @@ fn load_dispositions(root: &Path) -> Result<BTreeMap<Key, Disposition>, String> 
             reviewed: e.reviewed.into_iter().collect(),
         };
         if out.insert(key, d).is_some() {
-            return Err(format!("duplicate disposition key ({}, {}, {})", e.class, e.file, e.symbol));
+            return Err(format!(
+                "duplicate disposition key ({}, {}, {})",
+                e.class, e.file, e.symbol
+            ));
         }
     }
     Ok(out)
@@ -1447,7 +1517,9 @@ fn build_roster(root: &Path, hits: &[Hit]) -> Result<Built, String> {
         }
         for ex in &d.reviewed {
             if !used.contains(&(k.clone(), ex.clone())) {
-                orphan_dispositions.push(format!("({c}, {f}, {sym}) reviewed excerpt {ex:?} matches no hit"));
+                orphan_dispositions.push(format!(
+                    "({c}, {f}, {sym}) reviewed excerpt {ex:?} matches no hit"
+                ));
             }
         }
     }
@@ -1486,12 +1558,14 @@ fn render_md(roster: &Roster) -> String {
          a gate: the test fails only when this file is stale, never on a count. \
          `docs/workspace-assumptions.json` is the machine-readable twin.\n\n"
     ));
-    out.push_str("Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the \
+    out.push_str(
+        "Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the \
                   assumption degrades correctly off a workspace), `dev_only_surface` (only a \
                   developer box reaches it), `defect(<plan stem>)` (a user-facing path that \
                   depends on a workspace, cited to the plan that owns the fix). A disposition \
                   covers only the excerpts it was reviewed against; a later excerpt under the \
-                  same symbol renders `unreviewed` with a `NEW since review` note.\n\n");
+                  same symbol renders `unreviewed` with a `NEW since review` note.\n\n",
+    );
 
     let mut by_class: BTreeMap<&str, Vec<&Row>> = BTreeMap::new();
     for c in CLASSES {
@@ -1501,7 +1575,9 @@ fn render_md(roster: &Roster) -> String {
         by_class.entry(r.class.as_str()).or_default().push(r);
     }
 
-    out.push_str("| class | rows | hits | unreviewed | fallback_correct | dev_only_surface | defect |\n");
+    out.push_str(
+        "| class | rows | hits | unreviewed | fallback_correct | dev_only_surface | defect |\n",
+    );
     out.push_str("|---|---:|---:|---:|---:|---:|---:|\n");
     for c in CLASSES {
         let rows = &by_class[c.id];
@@ -1550,7 +1626,9 @@ fn render_md(roster: &Roster) -> String {
                     " | {} |\n",
                     r.capability
                         .as_deref()
-                        .map_or("— (no CAPABILITY_SPECS row)".to_string(), |c| format!("`{c}`"))
+                        .map_or("— (no CAPABILITY_SPECS row)".to_string(), |c| format!(
+                            "`{c}`"
+                        ))
                 ));
             } else {
                 out.push_str(" |\n");
@@ -1572,13 +1650,18 @@ fn row_ident(r: &Row) -> String {
 }
 
 fn staleness(checked: &str, fresh: &Roster) -> Vec<String> {
-    let old: Vec<Row> = serde_json::from_str::<Roster>(checked).map(|r| r.rows).unwrap_or_default();
+    let old: Vec<Row> = serde_json::from_str::<Roster>(checked)
+        .map(|r| r.rows)
+        .unwrap_or_default();
     let old_map: BTreeMap<String, &Row> = old.iter().map(|r| (row_ident(r), r)).collect();
     let new_map: BTreeMap<String, &Row> = fresh.rows.iter().map(|r| (row_ident(r), r)).collect();
     let mut out = Vec::new();
     for (k, r) in &new_map {
         match old_map.get(k) {
-            None => out.push(format!("HIT WITH NO ROW: {k}  (enclosing fn `{}` in {})", r.symbol, r.file)),
+            None => out.push(format!(
+                "HIT WITH NO ROW: {k}  (enclosing fn `{}` in {})",
+                r.symbol, r.file
+            )),
             Some(o) if o != r => out.push(format!(
                 "ROW CHANGED: {k}  (count {}→{}, disposition {}→{}, capability {:?}→{:?})",
                 o.count, r.count, o.disposition, r.disposition, o.capability, r.capability
@@ -1605,8 +1688,14 @@ fn workspace_assumption_roster_is_fresh() {
 
     let built = build_roster(&root, &result.hits).unwrap_or_else(|e| panic!("{e}"));
     let rows = &built.roster.rows;
-    let unreviewed = rows.iter().filter(|r| r.disposition == "unreviewed").count();
-    let defect = rows.iter().filter(|r| r.disposition.starts_with("defect(")).count();
+    let unreviewed = rows
+        .iter()
+        .filter(|r| r.disposition == "unreviewed")
+        .count();
+    let defect = rows
+        .iter()
+        .filter(|r| r.disposition.starts_with("defect("))
+        .count();
     let skipped_total: usize = result.skipped.values().sum();
     let skipped_detail = result
         .skipped
@@ -1627,7 +1716,11 @@ fn workspace_assumption_roster_is_fresh() {
     // counts — read them from the job log, or run the test locally.
     if let Ok(summary) = std::env::var("GITHUB_STEP_SUMMARY") {
         use std::io::Write;
-        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&summary) {
+        if let Ok(mut f) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&summary)
+        {
             let _ = writeln!(f, "workspace assumptions: `{counts}`");
         }
     }
@@ -1656,19 +1749,31 @@ fn workspace_assumption_roster_is_fresh() {
         );
         fs::write(&json_path, &json).expect("write roster json");
         fs::write(&md_path, &md).expect("write roster md");
-        println!("regenerated {} and {}", json_path.display(), md_path.display());
+        println!(
+            "regenerated {} and {}",
+            json_path.display(),
+            md_path.display()
+        );
         return;
     }
 
-    let checked_json = fs::read_to_string(&json_path).unwrap_or_default().replace("\r\n", "\n");
-    let checked_md = fs::read_to_string(&md_path).unwrap_or_default().replace("\r\n", "\n");
+    let checked_json = fs::read_to_string(&json_path)
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
+    let checked_md = fs::read_to_string(&md_path)
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
 
     let mut problems = staleness(&checked_json, &built.roster);
     for o in &built.orphan_dispositions {
-        problems.push(format!("DISPOSITION WITH NO HIT: {o} in {DISPOSITIONS_TOML}"));
+        problems.push(format!(
+            "DISPOSITION WITH NO HIT: {o} in {DISPOSITIONS_TOML}"
+        ));
     }
     if problems.is_empty() && checked_json != json {
-        problems.push("docs/workspace-assumptions.json differs from a fresh render (header/order)".into());
+        problems.push(
+            "docs/workspace-assumptions.json differs from a fresh render (header/order)".into(),
+        );
     }
     if checked_md != md {
         problems.push("docs/workspace-assumptions.md differs from a fresh render".into());
@@ -1694,7 +1799,8 @@ fn every_class_matches_its_planted_fixture() {
     let classes = compile_classes();
     for class in CLASSES {
         let path = root.join(FIXTURE_DIR).join(format!("{}.rs.txt", class.id));
-        let src = fs::read_to_string(&path).unwrap_or_else(|e| panic!("missing fixture {}: {e}", path.display()));
+        let src = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("missing fixture {}: {e}", path.display()));
         let hits = scan_source(&st, &classes, "fixture.rs", &src, false);
         let mine: Vec<&Hit> = hits.iter().filter(|h| h.class == class.id).collect();
         assert!(
@@ -1719,7 +1825,13 @@ fn excluded_regions_yield_no_hits() {
     let root = crate_root();
     let path = root.join(FIXTURE_DIR).join("excluded.rs.txt");
     let src = fs::read_to_string(&path).expect("excluded fixture");
-    let hits = scan_source(&Structure::new(), &compile_classes(), "fixture.rs", &src, false);
+    let hits = scan_source(
+        &Structure::new(),
+        &compile_classes(),
+        "fixture.rs",
+        &src,
+        false,
+    );
     assert!(hits.is_empty(), "excluded regions produced hits: {hits:#?}");
 }
 
@@ -1733,8 +1845,15 @@ fn constructs_that_end_early_do_not_swallow_later_hits() {
     let root = crate_root();
     let path = root.join(FIXTURE_DIR).join("must_report.rs.txt");
     let src = fs::read_to_string(&path).expect("must_report fixture");
-    let hits = scan_source(&Structure::new(), &compile_classes(), "fixture.rs", &src, false);
-    let got: BTreeSet<(String, String)> = hits.iter().cloned().map(|h| (h.class, h.symbol)).collect();
+    let hits = scan_source(
+        &Structure::new(),
+        &compile_classes(),
+        "fixture.rs",
+        &src,
+        false,
+    );
+    let got: BTreeSet<(String, String)> =
+        hits.iter().cloned().map(|h| (h.class, h.symbol)).collect();
     let want: BTreeSet<(String, String)> = [
         ("dev_ports", "after_cfg_field"),
         ("dev_ports", "after_cfg_variant"),
@@ -1745,7 +1864,10 @@ fn constructs_that_end_early_do_not_swallow_later_hits() {
         ("dev_ports", "lexer_chars"),
         ("supervisor_dependency", "lexer_chars"),
         ("dev_ports", "lexer_lifetime"),
-        ("os_bound_tooling", "Handles::windows_method_without_sibling"),
+        (
+            "os_bound_tooling",
+            "Handles::windows_method_without_sibling",
+        ),
         ("supervisor_dependency", "after_nested_regions"),
         ("machine_path", "after_nested_test_mod"),
         ("os_bound_tooling", "after_nested_test_mod"),
@@ -1763,7 +1885,10 @@ fn constructs_that_end_early_do_not_swallow_later_hits() {
     .iter()
     .map(|(c, s)| (c.to_string(), s.to_string()))
     .collect();
-    assert_eq!(got, want, "must_report fixture: hit set differs (left = got, right = want)");
+    assert_eq!(
+        got, want,
+        "must_report fixture: hit set differs (left = got, right = want)"
+    );
 
     // Spelled out, because these are what the region STACK and the `extern`-block
     // scope buy — and both sides wear the same (class, symbol) pair, so only the
