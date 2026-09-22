@@ -835,7 +835,7 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("git_supervision/commit_forwarder.rs", "work-owed", 1),
     ("install_effects_producer/coord_client.rs", "work-owed", 2),
     ("looping_agent_coord.rs", "device", 5),
-    ("mcp/plan_library.rs", "work-owed", 3),
+    ("mcp/plan_library.rs", "work-owed", 5),
     ("mcp/probe_executor.rs", "device", 1),
     ("plan_workunit_adapter/body_push.rs", "work-owed", 3),
     ("plan_workunit_adapter/push.rs", "work-owed", 6),
@@ -909,11 +909,19 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// field for the runner to set or coord to derive. Nothing about it changes
 /// when this device is paired with more tenants, so there is no future phase
 /// for it to owe. So `device` 21 -> 22.
+///
+/// Phase 5 of
+/// `2026-09-20-a-recorded-delivery-scope-is-permanent-so-a-mis-declared-phase-is-uncorrectable`
+/// added two new `mcp/plan_library.rs` forwards to the same qontinui-web base
+/// as its siblings — `upstream_put` (the edge-correction verb) and
+/// `upstream_delete` (the edge-retraction verb) — each with the same
+/// session-less, artifact-keyed posture and the same E3 open question. So
+/// `work-owed` 17 -> 19.
 const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
     ("device", 22),
     ("session-noop", 10),
     ("session-owed", 0),
-    ("work-owed", 17),
+    ("work-owed", 19),
     ("escalated", 2),
 ];
 
@@ -1072,8 +1080,8 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
         "every scanned defaulting call site should have been classified"
     );
     assert_eq!(
-        sites, 51,
-        "expected 51 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
+        sites, 53,
+        "expected 53 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
          session-scoped ones Phase 5 moved onto the tenant-STATING seam (52 - 12 = 40), plus 1 \
          new work-owed defaulting call site (mcp/plan_library.rs's upstream_get_raw, the \
          body-export forward, which shares upstream_get's qontinui-web base and its \
@@ -1101,7 +1109,11 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
          device_id to the agent row); 49 to 50. Plan 2026-09-13-drained-runner-never-reaches-idle Phase 3 then added \
          coord_drain_state.rs's `GET /coord/devices/me/drain` (device: `me` resolves to the \
          device its own JWT was minted for, the drain row is keyed by device_id, and the \
-         request carries no tenant field for anyone to set or derive); 50 to 51. Found {sites}. A change here \
+         request carries no tenant field for anyone to set or derive); 50 to 51. Phase 5 of \
+         2026-09-20-a-recorded-delivery-scope-is-permanent-so-a-mis-declared-phase-is-uncorrectable \
+         then added mcp/plan_library.rs's upstream_put and upstream_delete (both work-owed, the \
+         two new edge-correction/retraction forwards sharing upstream_post's qontinui-web base \
+         and session-less, artifact-keyed posture); 51 to 53. Found {sites}. A change here \
          is fine — it just has \
          to be deliberate. It goes DOWN when a site adopts \
          `attach_device_auth_for(.., TenantScope)`, and UP only when someone adds a new \
