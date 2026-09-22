@@ -17,6 +17,18 @@
  * and `buildPathSettingsPayload` is the one place a payload is assembled, so
  * the two directions cannot drift apart.
  *
+ * ## Absent vs. `{}` for the MAP fields
+ *
+ * The map fields (`repo_checkouts` and the three `*_by_tenant` maps) do NOT
+ * follow that rule, and the difference is deliberate. `save_path_settings`
+ * takes a PATCH for them: **absent leaves the stored map untouched, `{}` is a
+ * deliberate clear** (plan
+ * `2026-09-22-plans-dir-is-a-single-path-so-a-multi-bound-device-cannot-author-per-tenant`
+ * P3 — the server-side merge that closes the erasure hazard a caller unaware of
+ * a map used to open by omitting it). So an emptied box must send `{}`; sending
+ * nothing would be a silent no-op, and until P3 landed this helper `delete`d the
+ * key to mean "cleared", which under the merge means the opposite.
+ *
  * ## Configured vs. in effect
  *
  * The panel shows the value the runner is USING beside the value that is
@@ -50,6 +62,21 @@ export interface PathSettings {
    * {@link formatRepoCheckouts} / {@link parseRepoCheckouts}.
    */
   repo_checkouts?: Record<string, string>;
+  /**
+   * Per-tenant override of {@link PathSettings.plans_dir}, keyed by tenant UUID
+   * string. Absent from the wire when empty (the Rust side skips serializing an
+   * empty map), and the scalar beside it REMAINS the device-wide default:
+   * resolution is `by_tenant[tenant]`, then the scalar, then unset.
+   *
+   * A key the device is not currently bound to is preserved, never dropped (the
+   * plan's D2) — the operator may be re-pairing, and losing the path silently
+   * would be a config reset dressed as a cleanup.
+   */
+  plans_dir_by_tenant?: Record<string, string>;
+  /** Per-tenant override of {@link PathSettings.plans_archive_dir}. See {@link PathSettings.plans_dir_by_tenant}. */
+  plans_archive_dir_by_tenant?: Record<string, string>;
+  /** Per-tenant override of {@link PathSettings.prompts_dir}. See {@link PathSettings.plans_dir_by_tenant}. */
+  prompts_dir_by_tenant?: Record<string, string>;
   strict_mode: boolean;
 }
 
@@ -78,6 +105,26 @@ export interface ResolvedPaths {
    * never "in step". See {@link scanSourceStatus}.
    */
   plan_scan_divergence: ScanDivergenceView | null;
+  /**
+   * The same three plan/prompt directories resolved FOR ONE NAMED TENANT —
+   * present only when the caller passed a `tenantId` to `get_path_settings`
+   * (plan P3). Absent means "nobody named a tenant", which is the panel's own
+   * case: it edits N tenants at once, so it asks for the device view and states
+   * the fallback rule rather than claiming a resolution the runner did not make.
+   */
+  resolved_for_tenant?: ResolvedForTenant;
+}
+
+/**
+ * `view.resolved.resolved_for_tenant` — what the three per-tenant directories
+ * resolve to for the tenant the caller named. Each is `null` when that tenant
+ * has neither an entry nor a device-wide default, i.e. genuinely unset.
+ */
+export interface ResolvedForTenant {
+  tenant_id: string;
+  plans_dir: string | null;
+  plans_archive_dir: string | null;
+  prompts_dir: string | null;
 }
 
 /**
@@ -120,6 +167,119 @@ export type PathField = (typeof PATH_FIELDS)[number];
 
 /** The text-input values, one per edited field. `""` means "unset". */
 export type PathDrafts = Record<PathField, string>;
+
+/**
+ * The directories that can be overridden PER TENANT, in the order they are
+ * rendered. Only the plan/prompt corpus dirs are keyed by tenant: `workspace_root`,
+ * `dev_logs_dir`, `repo_checkouts` and `strict_mode` are device-wide by design
+ * (they describe the machine, not a tenant's authoring surface).
+ *
+ * `plans_archive_dir` has no device-wide box in this panel — it round-trips
+ * untouched — but it does get per-tenant rows, because the same operator
+ * requirement covers it (plan P5).
+ */
+export const TENANT_PATH_FIELDS = ["plans_dir", "plans_archive_dir", "prompts_dir"] as const;
+
+export type TenantPathField = (typeof TENANT_PATH_FIELDS)[number];
+
+/** Which `*_by_tenant` map holds each per-tenant directory. */
+export const TENANT_MAP_FIELD = {
+  plans_dir: "plans_dir_by_tenant",
+  plans_archive_dir: "plans_archive_dir_by_tenant",
+  prompts_dir: "prompts_dir_by_tenant",
+} as const satisfies Record<TenantPathField, keyof PathSettings>;
+
+/**
+ * The per-tenant input-box values: one map of `tenantId -> box text` per
+ * directory. `""` (or a missing key) means "no override — use the device-wide
+ * value", which is what an absent map entry means on the wire.
+ */
+export type TenantPathDrafts = Record<TenantPathField, Record<string, string>>;
+
+/** The saved map for one per-tenant directory; `{}` when none is stored. */
+export function tenantPathMap(
+  saved: PathSettings,
+  field: TenantPathField,
+): Record<string, string> {
+  return saved[TENANT_MAP_FIELD[field]] ?? {};
+}
+
+/**
+ * The tenant ids to render rows for, for one directory: every tenant the device
+ * is bound to (in the order the context reports them), then every id present in
+ * the SAVED map that is not among them, sorted.
+ *
+ * The second group is the plan's D2: an entry whose tenant the device is no
+ * longer bound to still renders — labelled as not currently bound — because a
+ * row nobody can see is a path the operator loses without being told.
+ */
+export function tenantIdsForField(
+  saved: PathSettings,
+  candidates: readonly string[],
+  field: TenantPathField,
+): string[] {
+  const bound: string[] = [];
+  for (const raw of candidates) {
+    const id = raw.trim();
+    if (id.length > 0 && !bound.includes(id)) bound.push(id);
+  }
+  const extra = Object.keys(tenantPathMap(saved, field))
+    .filter((id) => !bound.includes(id))
+    .sort((a, b) => a.localeCompare(b));
+  return [...bound, ...extra];
+}
+
+/**
+ * The per-tenant boxes for a loaded (or freshly saved) struct.
+ *
+ * Seeded from the SAVED maps only — a tenant the device is bound to but has no
+ * entry for simply has no key here, which the panel renders as an empty box.
+ * That keeps this pure and independent of when `TenantContext` finishes loading
+ * its candidate list, which happens after this panel's first render.
+ */
+export function tenantDraftsFrom(saved: PathSettings): TenantPathDrafts {
+  return {
+    plans_dir: { ...tenantPathMap(saved, "plans_dir") },
+    plans_archive_dir: { ...tenantPathMap(saved, "plans_archive_dir") },
+    prompts_dir: { ...tenantPathMap(saved, "prompts_dir") },
+  };
+}
+
+/**
+ * One per-tenant box map as it goes on the wire: keys and values trimmed, every
+ * blank value dropped (a blank box is "no override", never a directory named
+ * `""`), keys sorted so a comparison of two normalisations is stable.
+ */
+export function normalizeTenantPathMap(
+  draft: Record<string, string> | undefined,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!draft) return out;
+  for (const key of Object.keys(draft).sort((a, b) => a.localeCompare(b))) {
+    const tenantId = key.trim();
+    const value = normalizePathInput(draft[key]);
+    if (tenantId.length === 0 || value === undefined) continue;
+    out[tenantId] = value;
+  }
+  return out;
+}
+
+/** `true` when the per-tenant boxes would persist maps other than the saved ones. */
+export function tenantDraftsAreDirty(saved: PathSettings, drafts: TenantPathDrafts): boolean {
+  return TENANT_PATH_FIELDS.some(
+    (field) =>
+      JSON.stringify(normalizeTenantPathMap(drafts[field])) !==
+      JSON.stringify(normalizeTenantPathMap(tenantPathMap(saved, field))),
+  );
+}
+
+/** How many per-tenant overrides are stored, across all three directories. */
+export function storedTenantOverrideCount(saved: PathSettings): number {
+  return TENANT_PATH_FIELDS.reduce(
+    (total, field) => total + Object.keys(tenantPathMap(saved, field)).length,
+    0,
+  );
+}
 
 /**
  * Blank → `undefined`, otherwise the trimmed path.
@@ -222,11 +382,18 @@ export function draftsFrom(configured: PathSettings): PathDrafts {
  * (`plans_archive_dir`, `strict_mode`) round-trips untouched, then overwrites
  * only the four edited fields — DELETING a key whose draft is blank rather
  * than writing `""`, because absent is the wire form of unset.
+ *
+ * The MAP fields go the other way, for the reason the module doc gives: the save
+ * merges them, so `{}` is how an emptied box says "cleared" and an absent key
+ * says "leave what is stored alone". A caller that passes `repoCheckouts` or
+ * `tenantDrafts` is therefore asserting it edited that map; one that omits them
+ * is asserting it did not show it.
  */
 export function buildPathSettingsPayload(
   saved: PathSettings,
   drafts: PathDrafts,
   repoCheckouts?: Record<string, string>,
+  tenantDrafts?: TenantPathDrafts,
 ): PathSettings {
   const next: PathSettings = { ...saved };
   for (const field of PATH_FIELDS) {
@@ -238,12 +405,16 @@ export function buildPathSettingsPayload(
     }
   }
   if (repoCheckouts !== undefined) {
-    // Same absent-is-unset rule as the path fields: an empty map is omitted.
-    if (Object.keys(repoCheckouts).length === 0) {
-      delete next.repo_checkouts;
-    } else {
-      next.repo_checkouts = { ...repoCheckouts };
-    }
+    // `{}` is a DELIBERATE CLEAR, not an omission: under the save's merge,
+    // deleting the key would leave the stored map in place.
+    next.repo_checkouts = { ...repoCheckouts };
+  }
+  if (tenantDrafts !== undefined) {
+    // Same rule, and the same reason: a cleared per-tenant row must reach the
+    // runner as `{}` (or as a map without that key) to actually be cleared.
+    next.plans_dir_by_tenant = normalizeTenantPathMap(tenantDrafts.plans_dir);
+    next.plans_archive_dir_by_tenant = normalizeTenantPathMap(tenantDrafts.plans_archive_dir);
+    next.prompts_dir_by_tenant = normalizeTenantPathMap(tenantDrafts.prompts_dir);
   }
   return next;
 }

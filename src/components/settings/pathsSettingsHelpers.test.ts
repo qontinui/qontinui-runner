@@ -238,9 +238,16 @@ describe("repo checkouts — repos outside the workspace root", () => {
     ]);
   });
 
-  it("an emptied box removes the key; a filled one sets it; untouched leaves it", () => {
+  it("an emptied box sends {} to CLEAR; a filled one sets it; untouched round-trips the loaded map", () => {
+    // Absent no longer means "clear" — `save` MERGES the map fields, so a
+    // payload that omits `repo_checkouts` leaves the stored map untouched. An
+    // emptied box therefore has to say `{}` explicitly. This assertion used to
+    // read `"repo_checkouts" in cleared === false`, which was correct against
+    // the whole-struct replace and is exactly the silent no-op the merge
+    // introduces: the key was dropped, the server kept the old map, and
+    // clearing the textarea stopped working with nothing red.
     const cleared = buildPathSettingsPayload(WITH_MAP, draftsFrom(WITH_MAP), {});
-    expect("repo_checkouts" in cleared).toBe(false);
+    expect(cleared.repo_checkouts).toEqual({});
     expect(repoCheckoutsDirty(WITH_MAP, "")).toBe(true);
 
     const set = buildPathSettingsPayload(SAVED, draftsFrom(SAVED), { "acme/app": "/x" });
