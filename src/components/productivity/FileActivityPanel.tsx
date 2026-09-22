@@ -9,20 +9,16 @@
  *   3. Hot sessions   — top N most-active sessions in the same window,
  *      with their file count and latest activity.
  *
- * Lives at the bottom of `CoordinatorDashboard` as a sixth panel,
- * outside the productivity-stack spec-locked five-panel block. The
- * locked block asserts only `exists` for each panel (not relative
- * order), so appending here doesn't break the assertion — but the
- * spec's `Coordinator Dashboard — Five-Panel Stack` description gets
- * a parallel update in the same commit.
+ * One of the three panels on the interim Productivity page (plan
+ * `2026-09-12-consolidate-local-orchestration-onto-conductor` Phase 4
+ * deleted the coordinator dashboard this used to sit under).
  *
  * Per `proj_runner_analysis_state_split.md`, sibling-panel data
  * sharing in the runner is done through explicit channels — props
- * or CustomEvents — not implicit context. This panel currently
- * mirrors `WorkersPanel`'s "click reveals the Terminals page, user
- * picks their tab from there" pattern; per-tab focus is a documented
- * follow-up (the substrate to dispatch `setActiveId` across siblings
- * doesn't exist yet at the CoordinatorDashboard scope).
+ * or CustomEvents — not implicit context. Clicking a holder reveals the
+ * Terminals page and the user picks their tab from there; per-tab focus
+ * is a documented follow-up (the substrate to dispatch `setActiveId`
+ * across siblings doesn't exist at this page's scope).
  */
 
 import { useCallback, useMemo, useState } from "react";
@@ -84,11 +80,18 @@ export function lockYieldCooldownRemainingSecs(cooldownUntilMs: number, nowMs: n
 }
 
 /** Build the POST body for the Phase 1 `/file-locks/yield-request` endpoint
- *  using the synthetic Coordinator Dashboard requester identity per
- *  §Open Q5 of the lock-yield plan. The holder banner will display
- *  "Coordinator Dashboard has asked you to yield" — intentional signal
- *  that the request came from the global dashboard view, not a peer
- *  session. */
+ *  using a synthetic requester identity per §Open Q5 of the lock-yield plan —
+ *  the ask comes from an operator looking at a panel, not from a peer session.
+ *
+ *  `requester_name` is NOT a comment: `request_yield`
+ *  (`src-tauri/src/mcp/file_registry.rs`) copies it verbatim into the
+ *  `file-lock-yield-requested` payload, and the holder's banner renders it as
+ *  "<name> has asked you to yield". It therefore has to name a surface the
+ *  operator can actually go and find. It used to say "Coordinator Dashboard",
+ *  which Phase 4 of
+ *  `2026-09-12-consolidate-local-orchestration-onto-conductor` deleted; this
+ *  panel outlived it on the interim Productivity page, so the identity now
+ *  names the panel's real home. */
 export function buildYieldRequestBody(
   filePath: string,
   holderTaskRunId: string,
@@ -100,14 +103,13 @@ export function buildYieldRequestBody(
 } {
   return {
     file_path: filePath,
-    requester_task_run_id: "coordinator-dashboard",
-    requester_name: "Coordinator Dashboard",
+    requester_task_run_id: "productivity-file-activity",
+    requester_name: "File activity panel",
     holder_task_run_id: holderTaskRunId,
   };
 }
 
-/** Render relative-time label without pulling in date-fns again — the
- *  existing import in CoordinatorDashboard works, but the panel is
+/** Render relative-time label without pulling in date-fns — the panel is
  *  intentionally standalone so the unit test can mount it in isolation
  *  without configuring date-fns mocks. `nowMs` is injected for tests;
  *  production callers omit it. */
@@ -587,7 +589,7 @@ export function FileActivityPanel({
   }, []);
 
   const defaultJumpHandler = useCallback((_holderName: string) => {
-    // Mirror WorkersPanel: page-nav to Terminals; per-tab focus is a
+    // Page-nav to Terminals; per-tab focus is a
     // documented follow-up (the dashboard scope doesn't currently own
     // `setActiveId`).
     const handler = (

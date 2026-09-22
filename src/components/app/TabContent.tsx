@@ -477,7 +477,7 @@ export function TabContent({
           <PageRegistration
             id="productivity"
             name="Productivity"
-            description="Plan/task board, coordinator dashboard, and knowledge browser"
+            description="Knowledge browser, file activity, and overlapping agent intents"
           />
           <ProductivityPage />
         </div>

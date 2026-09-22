@@ -472,42 +472,8 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         probe_with_empty_args: false,
         observe_projection: None,
     },
-    // Productivity Stack — Phase 5 (in-product /summarize-session and /rewind-session replacements).
-    ProxyableCommand {
-        name: "summarize_session",
-        dispatch: Dispatch::Frontend,
-        description: "Summarize a finished AI session: extract learnings via the configured `OneshotLlm` and persist them to `productivity_knowledge`. Encodes the slash command's verdict-driven Outcome-tag rule (failed-attempt sessions get `## Outcome: APPROACH FAILED — do not retry without addressing X` prepended to each learning body). When no LLM provider is configured, falls back to inserting a single placeholder knowledge row with `area=\"other\"` and `body=\"LLM provider not configured; manual summary required.\"` so the user has a UI affordance.",
-        args_schema: r#"{"type":"object","required":["taskRunId"],"properties":{"taskRunId":{"type":"string"}}}"#,
-        response_schema: r#"{"type":"object","required":["taskRunId","verdict","learningCount","byArea","placeholder"],"properties":{"taskRunId":{"type":"string"},"verdict":{"type":"string"},"learningCount":{"type":"integer"},"byArea":{"type":"object","additionalProperties":{"type":"integer"}},"placeholder":{"type":"boolean"}}}"#,
-        // Required `taskRunId` arg; empty-args probe would always fail.
-        probe_with_empty_args: false,
-        observe_projection: None,
-    },
-    ProxyableCommand {
-        name: "rewind_session",
-        dispatch: Dispatch::Frontend,
-        description: "Rewind a failed AI session: restore pre-edit file snapshots (sha256-verified), kill the failed worker, and (by default) spawn a replacement with failure-context prepended. Pass `noReplay: true` for revert + leave-tab-empty (manual re-prompt). File-restore + kill are LLM-independent; the summarize step that builds the failure-context block silently skips when no LLM is configured.",
-        args_schema: r#"{"type":"object","required":["taskRunId"],"properties":{"taskRunId":{"type":"string"},"noReplay":{"type":["boolean","null"]}}}"#,
-        response_schema: r#"{"type":"object","required":["taskRunId","filesRestored","filesSkipped","summarized"],"properties":{"taskRunId":{"type":"string"},"filesRestored":{"type":"integer"},"filesSkipped":{"type":"integer"},"replaySessionId":{"type":["string","null"]},"summarized":{"type":"boolean"},"verdict":{"type":["string","null"]}}}"#,
-        // Required `taskRunId` arg; destructive (mutates filesystem +
-        // kills sessions). Probe-with-empty-args would always fail
-        // anyway, but mark explicit for safety.
-        probe_with_empty_args: false,
-        observe_projection: None,
-    },
-    // Productivity Stack — Phase 6 follow-up (worker observability).
-    ProxyableCommand {
-        name: "list_workers",
-        dispatch: Dispatch::Frontend,
-        description: "List every registered pty-backed Claude worker, joined with TerminalManager titles and the coordinator's view of each worker's currently-assigned task. Read-only observability for the Workers panel and external debugging tools. Returns an array of `{ taskRunId, terminalId, terminalTitle, state, assignedTaskId, createdAtMs }` ordered by worker creation time (oldest first). State is one of `\"ready\"`, `\"processing\"`, `\"closed\"`. Empty list when no workers are registered.",
-        args_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
-        response_schema: r#"{"type":"array","items":{"type":"object","required":["taskRunId","terminalId","state","createdAtMs"],"properties":{"taskRunId":{"type":"string"},"terminalId":{"type":"string"},"terminalTitle":{"type":["string","null"]},"state":{"type":"string","enum":["ready","processing","closed"]},"assignedTaskId":{"type":["string","null"]},"createdAtMs":{"type":"integer"}}}}"#,
-        // Read-only — empty args is the canonical call shape.
-        probe_with_empty_args: true,
-        observe_projection: None,
-    },
     // Coord/terminal smoke commands — bi-directional title sync (Phase 2
-    // of runner-dispatch-and-terminal-ux-fixes-plan) + worker spawn.
+    // of runner-dispatch-and-terminal-ux-fixes-plan).
     ProxyableCommand {
         name: "terminal_set_title",
         dispatch: Dispatch::Frontend,
@@ -516,17 +482,6 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         response_schema: r#"{"type":"object","required":["success"],"properties":{"success":{"type":"boolean"},"message":{"type":["string","null"]},"data":{"type":["object","null"]}}}"#,
         // Required `terminalId` + `title`; empty-args probe would always
         // fail, and a real call would mutate session state.
-        probe_with_empty_args: false,
-        observe_projection: None,
-    },
-    ProxyableCommand {
-        name: "spawn_worker_session",
-        dispatch: Dispatch::Frontend,
-        description: "Spawn a Claude-Code-backed worker PTY pre-sized to the dominant zone dimensions and register it under a fresh task_run_id in SessionManager.worker_sessions. Used by the Productivity tab Workers panel and coord soak smokes.",
-        args_schema: r#"{"type":"object","properties":{"titleHint":{"type":["string","null"]}},"additionalProperties":false}"#,
-        response_schema: r#"{"type":"object","required":["mode"],"properties":{"mode":{"type":"string"},"terminalId":{"type":["string","null"]},"taskRunId":{"type":["string","null"]}}}"#,
-        // Spawns a PTY child process — side-effectful even with empty
-        // args. Probe must skip.
         probe_with_empty_args: false,
         observe_projection: None,
     },
@@ -811,7 +766,6 @@ mod tests {
     #[test]
     fn is_allowlisted_recognizes_coord_terminal_commands() {
         assert!(is_allowlisted("terminal_set_title"));
-        assert!(is_allowlisted("spawn_worker_session"));
     }
 
     #[test]
@@ -837,7 +791,7 @@ mod tests {
         // Everything else is off by default, including invoke-allowlisted
         // commands: a trace must never leak just because a command exists.
         assert!(!traces_outbound("get_ui_error"));
-        assert!(!traces_outbound("spawn_worker_session"));
+        assert!(!traces_outbound("terminal_set_title"));
         assert!(!traces_outbound("definitely_not_a_command"));
         assert!(!traces_outbound(""));
     }

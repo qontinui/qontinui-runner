@@ -45,14 +45,11 @@ pub mod checks;
 pub mod code_semantics;
 pub mod command_relay;
 pub mod comparison_api;
-pub mod completion_reports;
-pub mod completion_sources;
 pub mod configs;
 pub mod constraints_api;
 pub mod container_status;
 pub mod contexts;
 pub mod continuation_verdict;
-pub mod coordinator;
 pub mod debug_builder_prompt;
 /// Debug-profile door onto `TerminalManager::graceful_exit` (plan
 /// `2026-09-13-drained-runner-never-reaches-idle` Phase 1). Present in every
@@ -132,7 +129,6 @@ pub mod query_tool;
 pub mod queue;
 pub mod rag;
 pub mod recordings;
-pub mod reflection;
 pub mod reflection_api;
 pub mod relay_binding; // UI Bridge relay registrant principal binding (plan 2026-09-17-ui-bridge-relay-registration-is-unauthenticated)
 pub mod relay_path_policy; // The closed allowlist of local API paths `backend_relay`'s `http_request` arm may reach (review round 2 finding 1; inverted to an allowlist in round 4)

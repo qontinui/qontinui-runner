@@ -523,8 +523,13 @@ pub(crate) fn operator_rows() -> Vec<(String, String)> {
 /// `claude` PTY with `--dangerously-skip-permissions`. The UI Bridge invoke
 /// allowlist is the borrow route, so every `operator` row must be absent from it.
 ///
+/// Both of those doors were deleted by Phase 4 of
+/// `2026-09-12-consolidate-local-orchestration-onto-conductor`, so neither name
+/// resolves any more — the history is kept because it is the reason this check
+/// exists, not because the sites do.
+///
 /// Derived from the ROSTER rather than a hardcoded name list, because a list of
-/// eight cannot catch the ninth: `launch_coordinator_session` is one allowlist
+/// eight cannot catch the ninth: any surviving `operator` row is one allowlist
 /// entry away from exactly the same hole, and this returns it the moment that
 /// entry is added.
 fn operator_sites_reachable_by_an_automation(rows: &Rows) -> Vec<String> {
@@ -672,20 +677,24 @@ fn every_operator_site_is_a_tauri_command() {
 }
 
 /// The mutation twin for the control above: a row that IS allowlisted must be
-/// returned, or the check is vacuous. `spawn_worker_session` is the real case
-/// the review found, so it is the fixture — it is `autonomous` now, and this
-/// asserts what the check WOULD have said while it was `operator`.
+/// returned, or the check is vacuous. `spawn_worker_session` was the real case
+/// the review found and was this fixture until Phase 4 deleted the command; the
+/// fixture is now `terminal_set_title`, which is allowlisted today. It is NOT an
+/// `operator` row in the real roster — the row below is synthetic, and asserts
+/// what the check WOULD say if a live allowlisted command were classed
+/// `operator`, exactly as it would have said of `spawn_worker_session`.
 #[test]
 fn an_allowlisted_operator_row_is_caught() {
     assert!(
-        crate::ui_bridge_invoke::is_allowlisted("spawn_worker_session"),
-        "fixture: spawn_worker_session must stay allowlisted — real callers need it"
+        crate::ui_bridge_invoke::is_allowlisted("terminal_set_title"),
+        "fixture: terminal_set_title must stay allowlisted — pick another allowlisted \
+         command here if it is ever removed, or this check goes vacuous"
     );
     let mut rows: Rows = BTreeMap::new();
     rows.insert(
         (
-            "commands/productivity.rs".to_string(),
-            "spawn_worker_session".to_string(),
+            "commands/terminal.rs".to_string(),
+            "terminal_set_title".to_string(),
         ),
         Row {
             class: "operator".to_string(),
@@ -694,16 +703,22 @@ fn an_allowlisted_operator_row_is_caught() {
     );
     assert_eq!(
         operator_sites_reachable_by_an_automation(&rows),
-        vec!["commands/productivity.rs:spawn_worker_session".to_string()],
+        vec!["commands/terminal.rs:terminal_set_title".to_string()],
         "an allowlisted `operator` row must be reported"
     );
 
     // And a row that is NOT allowlisted passes, so the check is not "always red".
+    // `terminal_create` is a real `operator` row and is deliberately off the
+    // allowlist — which is the property the control above enforces.
+    assert!(
+        !crate::ui_bridge_invoke::is_allowlisted("terminal_create"),
+        "fixture: terminal_create must stay OFF the allowlist"
+    );
     let mut clean: Rows = BTreeMap::new();
     clean.insert(
         (
-            "commands/productivity.rs".to_string(),
-            "launch_coordinator_session".to_string(),
+            "commands/terminal.rs".to_string(),
+            "terminal_create".to_string(),
         ),
         Row {
             class: "operator".to_string(),

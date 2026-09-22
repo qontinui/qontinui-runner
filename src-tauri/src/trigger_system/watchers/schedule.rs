@@ -2,7 +2,8 @@
 //!
 //! Uses the `cron` crate to parse cron expressions and calculates
 //! sleep durations between firings. Supports IANA timezone-aware scheduling
-//! via `chrono-tz` (e.g., "America/New_York", "Europe/London").
+//! via `chrono-tz` (e.g., "America/New_York", "Europe/London"), through the
+//! scheduler's shared [`ScheduleZone`].
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -12,49 +13,25 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::super::types::TriggerEvent;
+use crate::scheduler::ScheduleZone;
 
-/// Resolved timezone for schedule calculations.
-enum ResolvedTz {
-    Utc,
-    Local,
-    Iana(chrono_tz::Tz),
-}
-
-/// Parse a timezone string into a ResolvedTz.
-///
-/// Accepts: "UTC", "Local", or any IANA timezone (e.g., "America/New_York").
-fn parse_timezone(tz: &str) -> Result<ResolvedTz, String> {
-    if tz.eq_ignore_ascii_case("utc") || tz.eq_ignore_ascii_case("utc+0") {
-        return Ok(ResolvedTz::Utc);
-    }
-    if tz.eq_ignore_ascii_case("local") {
-        return Ok(ResolvedTz::Local);
-    }
-
-    // Try parsing as IANA timezone
-    tz.parse::<chrono_tz::Tz>()
-        .map(ResolvedTz::Iana)
-        .map_err(|_| {
-            format!(
-                "Unknown timezone '{}'. Use 'UTC', 'Local', or an IANA name like 'America/New_York'",
-                tz
-            )
-        })
-}
-
-/// Calculate the next fire time in UTC for a given schedule and timezone.
+/// The next fire time, in UTC, of an already-parsed schedule evaluated in
+/// `zone`. The zone type and its parser are the scheduler's
+/// [`ScheduleZone`] — one spelling of "UTC / Local / IANA name" for the
+/// whole binary rather than a private twin here (plan
+/// `2026-09-13-nightly-return-to-main-sweep`, Phase 5a).
 fn next_fire_utc(
     schedule: &cron::Schedule,
-    tz: &ResolvedTz,
+    zone: ScheduleZone,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
-    match tz {
-        ResolvedTz::Utc => schedule.upcoming(chrono::Utc).next(),
-        ResolvedTz::Local => schedule
+    match zone {
+        ScheduleZone::Utc => schedule.upcoming(chrono::Utc).next(),
+        ScheduleZone::Local => schedule
             .upcoming(chrono::Local)
             .next()
             .map(|dt| dt.with_timezone(&chrono::Utc)),
-        ResolvedTz::Iana(iana_tz) => schedule
-            .upcoming(*iana_tz)
+        ScheduleZone::Named(tz) => schedule
+            .upcoming(tz)
             .next()
             .map(|dt| dt.with_timezone(&chrono::Utc)),
     }
@@ -76,12 +53,12 @@ pub fn start_schedule(
         .map_err(|e| format!("Invalid cron expression '{}': {}", cron_expression, e))?;
 
     // Parse timezone
-    let resolved_tz = parse_timezone(&timezone)?;
+    let resolved_tz = ScheduleZone::parse(&timezone)?;
 
-    let tz_display = match &resolved_tz {
-        ResolvedTz::Utc => "UTC".to_string(),
-        ResolvedTz::Local => "Local".to_string(),
-        ResolvedTz::Iana(tz) => tz.to_string(),
+    let tz_display = match resolved_tz {
+        ScheduleZone::Utc => "UTC".to_string(),
+        ScheduleZone::Local => "Local".to_string(),
+        ScheduleZone::Named(tz) => tz.to_string(),
     };
 
     info!(
@@ -97,7 +74,7 @@ pub fn start_schedule(
             }
 
             // Calculate next fire time
-            let next_utc = match next_fire_utc(&schedule, &resolved_tz) {
+            let next_utc = match next_fire_utc(&schedule, resolved_tz) {
                 Some(dt) => dt,
                 None => {
                     warn!(

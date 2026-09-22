@@ -268,7 +268,7 @@ $SKIP_ROUTES = @{
 # ---------------------------------------------------------------------------
 # Routes whose handler can legitimately exceed the default 10s probe timeout.
 # vision/extract (PaddleOCR) and vision/describe (VLM) load a cold model via
-# llama-swap on first request — and llama-swap UNLOADS one model to load the
+# llama-swap on first request -- and llama-swap UNLOADS one model to load the
 # other, so describe can pay a full swap+load even right after extract ran;
 # 300s covers the worst observed cold swap. /control/specs is a disk scan
 # that can exceed 10s on a cold FS cache (fresh exe dir + Defender pass).
@@ -304,7 +304,7 @@ $EXPECTED_STATUS = @{
 
 # ---------------------------------------------------------------------------
 # -Profile ci skip set. EXACTLY the two model-loading routes: extract loads
-# PaddleOCR and describe loads a VLM, both via llama-swap — which does not run
+# PaddleOCR and describe loads a VLM, both via llama-swap -- which does not run
 # in CI. Their shape contracts are covered by the non-model probes; the model
 # paths stay in the dev profile. Skipped loudly (no silent caps).
 # ---------------------------------------------------------------------------
@@ -601,8 +601,8 @@ function Get-FreePort {
 function Start-DirectRunner {
     param([string]$ExePath, [int]$Port)
 
-    # -LiteralPath, not -Path: the published exe is "Qontinui Runner.exe" and
-    # lives under "…\Qontinui Runner\". A space is harmless to -Path, but the
+    # -LiteralPath, not -Path: the published exe is "qontinui-runner.exe" and
+    # lives under "...\Qontinui Runner\". A space is harmless to -Path, but the
     # install dir is user-controlled and a wildcard metacharacter ([ ] ? *) in
     # it would silently make -Path glob instead of address one file.
     $resolved = (Resolve-Path -LiteralPath $ExePath -ErrorAction Stop).Path
@@ -629,7 +629,7 @@ function Start-DirectRunner {
     $toSet = @{
         "QONTINUI_PORT"               = "$Port"
         "QONTINUI_INSTANCE_NAME"      = $instanceName
-        "QONTINUI_PRIMARY_PORT"       = "$Port"   # self — no primary in CI
+        "QONTINUI_PRIMARY_PORT"       = "$Port"   # self -- no primary in CI
         "QONTINUI_CONFIG_DIR"         = $configDir
         "QONTINUI_SECURE_STORAGE_DIR" = $configDir
         "WEBVIEW2_USER_DATA_FOLDER"   = $webviewDir
@@ -638,15 +638,15 @@ function Start-DirectRunner {
         # writes <QONTINUI_RUNNER_LOG_DIR>/runner-panic.log on any early-init
         # panic (startup_panic.rs); an exit code 2 is *defined* as a panic
         # caught by main()'s catch_unwind (main.rs:272-276). Without this the
-        # log lands in %LOCALAPPDATA%\qontinui-runner\dev-logs — outside the
-        # temp dir we dump on failure — so the crash cause stays invisible.
+        # log lands in %LOCALAPPDATA%\qontinui-runner\dev-logs -- outside the
+        # temp dir we dump on failure -- so the crash cause stays invisible.
         "QONTINUI_RUNNER_LOG_DIR"     = $logDir
     }
     foreach ($k in $toSet.Keys) {
         $prev[$k] = [System.Environment]::GetEnvironmentVariable($k, "Process")
         [System.Environment]::SetEnvironmentVariable($k, $toSet[$k], "Process")
     }
-    # CLAUDECODE removed — both spawners strip it so the embedded Claude CLI can start.
+    # CLAUDECODE removed -- both spawners strip it so the embedded Claude CLI can start.
     $prev["CLAUDECODE"] = [System.Environment]::GetEnvironmentVariable("CLAUDECODE", "Process")
     [System.Environment]::SetEnvironmentVariable("CLAUDECODE", $null, "Process")
 
@@ -686,7 +686,7 @@ function Start-DirectRunner {
 # processes and embedded CLI outlive the run and keep the temp WebView2 profile
 # locked. We therefore walk Win32_Process.ParentProcessId ourselves.
 #
-# The walk is strictly DOWNWARD from $RootPid — it can never climb to an
+# The walk is strictly DOWNWARD from $RootPid -- it can never climb to an
 # ancestor, which is why this does not use a tree-kill flag (`taskkill /T`):
 # on this box a mis-aimed tree kill would take out live editor/agent sessions.
 # Two further guards: a visited set (PID reuse can make the parent graph
@@ -740,7 +740,7 @@ function Stop-ProcessTree {
             Stop-Process -Id ([int]$target.ProcessId) -Force -ErrorAction Stop
             $killed++
         } catch {
-            # Already gone (it may have died with a sibling) — not an error.
+            # Already gone (it may have died with a sibling) -- not an error.
             Write-Host "  note: could not stop $($target.Name) ($($target.ProcessId)): $($_.Exception.Message)"
         }
     }
@@ -754,7 +754,7 @@ function Stop-ProcessTree {
 }
 
 # ---------------------------------------------------------------------------
-# Dump everything we captured from a direct-exe runner — its redirected
+# Dump everything we captured from a direct-exe runner -- its redirected
 # stdout/stderr plus any *.log files the runner wrote under its temp tree
 # (notably runner-panic.log, written on an early-init panic / exit code 2).
 # Called on early-exit AND on ready-timeout so a CI failure is diagnosable.
@@ -827,7 +827,7 @@ function Wait-DirectRunnerReady {
     #
     # What this smoke needs before it starts walking every UI_BRIDGE_ROUTES
     # entry is proof that a full UI Bridge IPC round-trip has actually
-    # completed — otherwise the first route probes land in the 503
+    # completed -- otherwise the first route probes land in the 503
     # transport-failure path and CI goes intermittently red. That is exactly
     # what the one-way latch in `AppState::frontend_ready` measures, and it is
     # the only thing that does.
@@ -880,7 +880,7 @@ function Wait-DirectRunnerReady {
                 }
             }
         } catch {
-            # connection refused / not-yet-listening — keep polling.
+            # connection refused / not-yet-listening -- keep polling.
         }
         # Shell is up but no IPC round-trip has completed yet: poke the UI
         # Bridge to force the first one, which flips the latch.
@@ -1008,7 +1008,7 @@ if ($DirectExe) {
 $exitCode = 0
 try {
     # Warm-up: prime the cold OCR/VLM models so the first *measured* slow-route
-    # request is warm. Belt-and-suspenders — the per-route timeout bump alone
+    # request is warm. Belt-and-suspenders -- the per-route timeout bump alone
     # makes the gate deterministic; warm-up failures are non-fatal. Skipped for
     # any model route that's in SKIP_ROUTES (e.g. both under -Profile ci, where
     # there's no llama-swap to warm).
@@ -1062,9 +1062,9 @@ try {
         } elseif ($status -eq 404) {
             # Body-aware 404 classifier: a route with a :param segment that
             # returns a structured JSON error envelope (success:false / any
-            # non-empty JSON error) is route-matched-but-resource-not-found —
+            # non-empty JSON error) is route-matched-but-resource-not-found --
             # the route IS registered, so PASS. A genuinely unregistered route
-            # falls through to axum's empty-body default 404 → keep FAIL.
+            # falls through to axum's empty-body default 404 -> keep FAIL.
             $hasParam = $r.Path -match ":[A-Za-z]+"
             $isStructuredErr = $false
             $rawBody = $res[1]
@@ -1228,7 +1228,7 @@ try {
     #
     # So it brings its own fixture rather than hoping for one. `settings-panel`
     # is registered by `src/components/settings/Settings.tsx` via
-    # `useUIComponent`, and the SDK unregisters a component on unmount — so the
+    # `useUIComponent`, and the SDK unregisters a component on unmount -- so the
     # probe first drives the runner to the settings tab
     # (POST /control/activate-tab/settings), then polls for the registration.
     # Every remaining outcome is a genuine failure of the boundary under test:

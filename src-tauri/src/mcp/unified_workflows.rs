@@ -871,7 +871,7 @@ pub async fn generate_unified_workflow_handler(
 
     // Inject observation memory into inline_context (async, before blocking spawn)
     let mut request = request;
-    if let Some(memory) = crate::context::format_observation_memory_for_prompt(
+    if let Some(memory) = crate::mcp::contexts::format_observation_memory_for_prompt(
         &state.app_state.pg_db,
         None,
         Some(&request.description),

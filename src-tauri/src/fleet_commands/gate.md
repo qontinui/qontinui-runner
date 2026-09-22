@@ -111,10 +111,11 @@ Do this first, regardless of which transport ends up carrying it.
 
 | What you are waiting on | Predicate kind | Shape / notes |
 |---|---|---|
-| A PR merging | `pr_merged` | `{repo, pr_number}` — works on coord-orchestrated repos too: since the land-aware `pr_merged_verdict` shipped it clears from coord's OWN ff-land provenance (`close_cause`), not a GitHub merge event, so the clear can lag GitHub's close slightly. Registration emits an informational steer, not a rejection. (The older "never fires on a coord-orchestrated repo" advice is STALE — corrected 2026-08-03 against `gates.rs` `pr_merged_verdict`.) |
+| A PR merging | `pr_merged` | `{repo, pr_number}` — works on coord-orchestrated repos too: since the land-aware `pr_merged_verdict` shipped it clears from coord's OWN ff-land provenance (`close_cause`), not a GitHub merge event, so the clear can lag GitHub's close slightly. Registration emits an informational steer, not a rejection. (The older "never fires on a coord-orchestrated repo" advice is STALE — corrected 2026-08-03 against `gates.rs` `pr_merged_verdict`.) ⚠️ If what you are really waiting on is a DEPLOY, this is the weaker predicate — see the deploy-order row below. A **work-unit-anchored** registration whose `phase_name` says so answers with a non-blocking `deploy_order_predicate_weaker:` steer; a **claim-anchored** one (`claim_kind` + `resource_key`) has no `phase_name` for the steer to read — coord refuses that field without a `work_unit_id` — so it gets **no steer at all** and the predicate choice is entirely yours. Both refusal and steer ship in qontinui-coord#2315, LANDED on coord `main` 2026-09-21 (`72c50b3f`) — landed, not necessarily serving, which is this row's own subject. |
 | Work landing on main of a **coord-orchestrated repo** | `commit_live` | `{repo, commit_sha, on_ref?}` — ancestor-of-main check; anchor a **post-land main SHA** (or use `unit_status` — **not `file_exists`, which is broken**), NEVER the pre-land branch-head SHA — rebase-land rewrites SHAs and the gate rots open |
 | A specific **device's running build** being at-or-past a SHA | `runner_served_sha` | `{device_id, repo, expected_sha}` — device-scoped, and NOT interchangeable with `commit_live`: `commit_live` only checks repo-main ancestry (the code has landed), while `runner_served_sha` checks that THAT device's currently-running binary is at-or-past `expected_sha` (the code has been rebuilt onto). Stays `open` while the commit has landed but the device hasn't restarted onto it — `verdict_reason` names the device's current build id when open (e.g. "device `<id>` is serving `<build>`, not yet at-or-past `<sha>` ... runner has not rebuilt onto the target"), which is the read-back signal for "still on the old build." Registered live 2026-09-02 (plan `2026-08-31-coord-mcp-credential-selection-by-binding-provenance`); missing from this table until then. |
-| A deploy going healthy | `deploy_healthy` | `{service, expected_rev}` — BOTH required; clears only when the service is healthy AND the deployed rev includes `expected_rev` (fail-closed if the deployed rev is unknown) |
+| A deploy going healthy | `deploy_healthy` | `{service, expected_rev}` — BOTH required; clears only when the service is healthy AND the deployed rev includes `expected_rev` (fail-closed if the deployed rev is unknown). `service` is an EXACT vocabulary, not free text — **`coord` or `web`, no variants**: not `qontinui-web`, not `qontinui-staging/web` (the target coord's own `coord_query_release_state` prints). The predicate conjoins three independently-implemented lookups that normalize differently, and the health one does raw `==` on an alert key's final `:`-segment, so a near-miss spelling names an observation but no alert and the health half is SILENTLY SKIPPED. Coord refuses an unresolvable `service`, and a blank `expected_rev`, at the door — **once the coord that answers you is SERVING qontinui-coord#2315**, which landed on coord `main` 2026-09-21 (`72c50b3f`) but whose deployment is a separate fact this file cannot state; read `coord_query_release_state` for `coord`. Until it does, a near-miss spelling is accepted and silently half-evaluates. Canonical: `_gate-registration` → "Merged is not deployed" |
+| **Repo A must not ship until repo B's change is LIVE on the serving backend** | `deploy_healthy` | **not `pr_merged`** — merged is not deployed. `pr_merged` is a fact about a pull request and has no unknown arm; a rollback leaves it cleared TERMINALLY while the backend no longer carries the code. Set `expected_rev` to the landed commit of the upstream half. Where coord does not observe the service at all, `deploy_healthy` cannot see it — use `commit_live` or `runner_served_sha` and say in the phase text which weaker thing you are gating on. Canonical: `_gate-registration` → "Merged is not deployed" |
 | A claim going terminal | `claim_terminal` | claim-anchored (`claim_kind`+`resource_key`) |
 | A human decision / judgment | `operator_approval` | `{prompt}` — notify-only; the human escape hatch |
 | CI going green | `ci_green` | `{repo, head_sha}` — a FIXED head SHA, not a branch name: the evaluator matches `coord.pr_check_runs_latest` rows BY head SHA, so a branch name matches nothing and the gate stays open forever |
@@ -181,7 +182,9 @@ Every gate needs exactly ONE anchor:
 
 - **Plan-anchored (usual):** `(work_unit_id, phase_name)` — a plan tracked as a
   work unit.
-  - `work_unit_id` — `POST $COORD_HTTP_URL/coord/work-units/upsert` `{ "slug":"<stem>",
+  - `work_unit_id` — the MCP tool **`coord_work_unit_upsert`** where this session
+    has it, else its REST twin
+    `POST $COORD_HTTP_URL/coord/work-units/upsert`, with `{ "slug":"<stem>",
     "title":"<plan H1>" }` (idempotent on slug = plan filename stem) → **capture
     `work_unit_id`** (a UUID) from the response, OR
     `GET $COORD_HTTP_URL/coord/agent-work-units/<slug>` to read an existing id.
@@ -563,12 +566,22 @@ anchor `file_glob` + `resource_key`.
 
 ### Step 3 — REST through the runner's write forwarder, same proxy nonce (probe: `tools/list` → HTTP 200)
 
-<!-- lint-gate-door-parity: allow attest — this step IS the non-MCP rung of the
-     cascade. Steps 1-2 above are the MCP door for the same verbs; naming that
-     native tool inside the fallback that exists for when it is dead would
+<!-- lint-coord-door-parity: allow attest — this step IS the non-MCP rung of
+     the cascade. Steps 1-2 above are the MCP door for the same verb; naming
+     that native tool inside the fallback that exists for when it is dead would
      invert the step's whole subject. The tool name is deliberately NOT written
      in this comment: spelling it here would satisfy check #32's token test on
-     its own and quietly make this marker decorative. -->
+     its own and quietly make this marker decorative.
+
+     `upsert` is NOT exempt here, and the asymmetry is deliberate. This section
+     already back-references Step 2's `coord_register_gate` for the
+     claim-anchored fallback, which is how `register-gate` passes by token
+     presence rather than by exemption; the prose below does the same for the
+     upsert, naming Step 2's tool as the JSON-RPC twin of the forwarder call.
+     A back-reference keeps the guard ARMED on that verb where an exemption
+     would disarm it, and it reads as what it is — a pointer back up the
+     cascade, not an instruction to use the native door in the rung that exists
+     for its absence. -->
 
 Step 3 is Step 2's **REST twin**: the same proxy nonce, but plain HTTP routes on
 the runner's write forwarder instead of MCP JSON-RPC — for when the JSON-RPC
@@ -620,7 +633,10 @@ curl -fsS -X POST "$LIVE_URL/gates/<gate_id>/attest" \
 
 A successful register returns **`201` with `{ "gate_id": "<uuid>" }`**.
 `register-gate` does NOT upsert (404s `work_unit_not_found` if you skip the
-upsert). The claim-anchored `POST {runner}/coord-mcp/gates/register` (forwarding
+upsert). That first call is the REST twin of Step 2's `coord_work_unit_upsert`
+— same handler, same idempotence on the slug, same `work_unit_id` back — so if
+you are here because the JSON-RPC surface misbehaved rather than because the
+nonce is dead, either spelling mints the same unit. The claim-anchored `POST {runner}/coord-mcp/gates/register` (forwarding
 to coord's device-authed `POST /coord/gates/register-agent`) requires the
 Phase-1a/1b PRs of `2026-07-21-gate-cascade-step3-proxy-rebase` to be deployed
 in coord + the running runner — a 404 from either hop means they aren't yet;
@@ -1054,8 +1070,10 @@ An axis you skipped is not an axis that failed.
 
 ### Step 4b — The bootstrap credential: the one rung that needs no runner (probe: `POST $COORD_HTTP_URL/agents/credential` → HTTP 200 with a JWT-shaped `token`)
 
-<!-- lint-gate-door-parity: allow attest
-     lint-gate-door-parity: allow withdraw
+<!-- lint-coord-door-parity: allow attest
+     lint-coord-door-parity: allow withdraw
+     lint-coord-door-parity: allow upsert
+     lint-coord-door-parity: allow register-gate
      Same reason Step 3 carries its marker: this rung is reached ONLY after
      Step 1 established that the native MCP door is absent from this session,
      so naming that tool inside the fallback built for its absence inverts the
@@ -1448,9 +1466,16 @@ success.
   **cannot be evaluated**, or when `initial_verdict` is a terminal state it can
   never clear from (`misconfigured` / `failed`). A non-empty `warnings[]` is
   **not** that signal: most warnings are informational — every `pr_merged` gate
-  on a coord-orchestrated repo carries one, and so does
+  on a coord-orchestrated repo carries one; so does
   `continuation_dropped_born_cleared:`, which drops only the continuation and
-  leaves a healthy gate. Read the warning text; do not count warnings. When the
+  leaves a healthy gate (on ANY predicate kind — it branches on the verdict, not
+  the predicate); and so does `deploy_order_predicate_weaker:`, which says a
+  `pr_merged` gate whose `phase_name` declares deploy intent clears EARLIER
+  than the condition it describes — the gate itself is fine (see the
+  deploy-order row in A1). That last one fires on the same predicate kind as
+  the orchestrated-repo steer, so the two co-occur and a healthy gate comes
+  back with **at least two** warnings. Read the warning text; branch on the
+  prefix; do not count warnings. When the
   verdict test DOES fire, do not report the item gated. Instead: re-check with
   `coord_check_gate_predicate {predicate}` **against a control whose answer you
   already know** (identical output on the control proves the *predicate* is dead,

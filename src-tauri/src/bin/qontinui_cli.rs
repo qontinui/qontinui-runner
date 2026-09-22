@@ -477,6 +477,7 @@ fn env_dir(key: &str) -> Option<String> {
 }
 
 fn plan_library_backfill(args: &[String]) -> ExitCode {
+    use qontinui_runner_lib::plan_workunit_adapter as pwa;
     use qontinui_runner_lib::plan_workunit_adapter::body_push as bp;
     use qontinui_runner_lib::plan_workunit_adapter::PlanConvention;
 
@@ -525,8 +526,20 @@ fn plan_library_backfill(args: &[String]) -> ExitCode {
     let mut per_root: Vec<(String, usize)> = Vec::new();
     let mut all: Vec<bp::ScannedArtifact> = Vec::new();
     let mut skipped: Vec<bp::SkippedFile> = Vec::new();
+    // Through the RESOLVED source, exactly as the reconcile loop does — never
+    // `scan_one_root`'s tree walk.
+    //
+    // This command pushes to the same `(kind, slug, source_repo)` rows the
+    // loop publishes, and CLAUDE.md names it as THE catch-up path for a box
+    // whose runner predates the body sync. A tree walk here would therefore
+    // overwrite every ref-sourced body with the parked one on a checkout
+    // behind its default branch — re-introducing the exact defect Phase 3
+    // removes, and with two writers alternating so the corpus flaps. One byte
+    // source for both writers is the whole point.
     for root in &roots {
-        let found = bp::scan_one_root(root, &conv, &mut skipped);
+        let (found, mut root_skipped) =
+            pwa::scan_roots_at_source(std::slice::from_ref(root), &conv, &pwa::trigger::ProcessGit);
+        skipped.append(&mut root_skipped);
         let label = format!(
             "{} [{}]",
             root.label,

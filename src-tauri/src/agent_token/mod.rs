@@ -12,7 +12,7 @@
 //! implementation.
 //!
 //! Standalone use (the modules' own unit/integration tests) still
-//! builds a private token via [`from_allocate_result`]; only the
+//! builds a private token via [`from_token_parts`]; only the
 //! production spawn path shares one.
 
 use std::sync::Arc;
@@ -220,19 +220,22 @@ pub struct AgentTokenHealth {
 /// One token slot shared by every daemon spawned for an agent.
 pub type SharedToken = Arc<RwLock<TokenSlot>>;
 
-/// Build a fresh shared token from a coord allocation. `None` when
-/// the allocation carried no token (coord JWT keys unconfigured / dev
-/// fallback) — callers skip daemon spawn and log + continue.
-pub fn from_allocate_result(
-    allocate: &crate::agent_worktree::AllocateResult,
-) -> Option<SharedToken> {
-    if allocate.token.is_empty() {
+/// Build a fresh shared token from a coord allocation's token parts.
+/// `None` when the allocation carried no token (coord JWT keys
+/// unconfigured / dev fallback) — callers skip daemon spawn and log +
+/// continue.
+///
+/// Takes the three fields rather than the allocation struct so this
+/// module names no allocation type: the bearer, its `jti`, and its
+/// bookkeeping expiry are all a token slot ever needed.
+pub fn from_token_parts(token: &str, jti: Uuid, exp: i64) -> Option<SharedToken> {
+    if token.is_empty() {
         return None;
     }
     Some(Arc::new(RwLock::new(TokenSlot {
-        token: allocate.token.clone(),
-        jti: allocate.token_jti,
-        exp: allocate.token_exp,
+        token: token.to_string(),
+        jti,
+        exp,
         health: RefreshHealth::default(),
     })))
 }

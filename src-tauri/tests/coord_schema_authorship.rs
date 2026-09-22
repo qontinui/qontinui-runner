@@ -13,9 +13,11 @@
 //! (non-`#[cfg(test)]`) Rust authors `coord.*` schema. Unlike the coord repo,
 //! the runner's production code now authors **zero** `coord.*` schema, so the
 //! allowlist is **EMPTY** — the gate enforces "no `coord.*` schema authoring in
-//! runner production code at all". The only remaining occurrence is a
-//! `#[cfg(test)]` fixture in `database/pg/tasks.rs`
-//! (`create_tasks_identity_hash_for_test`), which is correctly ignored.
+//! runner production code at all". The last `#[cfg(test)]` occurrence — the
+//! `create_tasks_identity_hash_for_test` fixture in `database/pg/tasks.rs`,
+//! which the gate correctly ignored — went with the plan/task board in Phase 4
+//! of `2026-09-12-consolidate-local-orchestration-onto-conductor`, so there is
+//! no `coord.*` DDL left in this repo at all.
 //!
 //! # The allowlist
 //!

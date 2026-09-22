@@ -8,7 +8,7 @@
 //!   accepts an optional `role` field. Recognised roles dispatch the
 //!   matching slash-command body as the new session's first user message,
 //!   so the Coordinator can spawn an `auto-review` worker, a fresh
-//!   `coordinate` instance, etc., without a parallel HTTP route per role.
+//!   `auto-review` instance, etc., without a parallel HTTP route per role.
 //!   It also accepts a mutually-exclusive free-form `prompt` for work no role
 //!   covers — without it, an agent that had just written a task brief could
 //!   not hand it to a session, because the only alternatives were the five
@@ -47,13 +47,11 @@ use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 // =============================================================================
 
 /// Slash-command bodies the runner can dispatch automatically. Naming
-/// matches the `.claude/commands/<role>.md` filenames so `/coordinate`
+/// matches the `.claude/commands/<role>.md` filenames so `/auto-review`
 /// and friends can route by role string without a translation map.
 fn role_slash_command(role: &str) -> Option<&'static str> {
     match role {
         "auto-review" => Some("/auto-review"),
-        "coordinate" => Some("/coordinate"),
-        "decompose-plan" => Some("/decompose-plan"),
         "summarize-session" => Some("/summarize-session"),
         "implement-plan" => Some("/implement-plan"),
         _ => None,
@@ -231,8 +229,8 @@ async fn spawn_session(
                 return Err((
                     StatusCode::BAD_REQUEST,
                     format!(
-                        "Unknown role '{}'. Allowed: auto-review, coordinate, \
-                         decompose-plan, summarize-session, implement-plan",
+                        "Unknown role '{}'. Allowed: auto-review, \
+                         summarize-session, implement-plan",
                         role
                     ),
                 ));
@@ -260,7 +258,7 @@ async fn spawn_session(
     // `agent-spawn-authorization`). `/sessions/spawn` mints a session that
     // OUTLIVES the request that asked for it, so it is a
     // `standing_continuation`: a standing per-path opt-in, default OFF for a
-    // fresh user. The role (`auto-review`, `coordinate`, …) is the registry
+    // fresh user. The role (`auto-review`, `implement-plan`, …) is the registry
     // key when one was given; a plain spawn resolves against the per-path row.
     let decision = crate::agent_authorization::authorize_spawn(
         req.role.as_deref().filter(|r| !r.is_empty()),
@@ -345,8 +343,8 @@ async fn spawn_session(
     });
 
     // Build the initial prompt. For role-driven spawns the prompt IS the
-    // slash command line — Claude Code resolves `/coordinate` against the
-    // .claude/commands/coordinate.md body at session start. For plain
+    // slash command line — Claude Code resolves `/auto-review` against the
+    // .claude/commands/auto-review.md body at session start. For plain
     // spawns we fall back to a generic system prompt to match the existing
     // ad-hoc create_ai_session behaviour.
     let initial_prompt =
@@ -1005,6 +1003,42 @@ async fn policy_context(
 }
 
 // =============================================================================
+// /sessions/policy-context-stats
+// =============================================================================
+
+/// `GET /sessions/policy-context-stats` — how many INJECTIONS carried the FULL
+/// policy body since this runner started, and why (plan
+/// `2026-09-21-policy-body-still-crosses-the-sessionstart-boundary`, Phase 2).
+///
+/// **Injections, not sessions** — see the warning below; the distinction is the
+/// difference between reading this route right and reading it backwards, so it
+/// belongs in the first sentence rather than only in a note further down.
+///
+/// The honesty gate in [`crate::mcp::policy_context::render_for_session`] fails
+/// OPEN: anything it cannot confirm gets the full body. That is correct and it
+/// was also invisible — a marker that never arrived looked exactly like a
+/// marker deliberately withheld on a `resume`, in every log and every metric,
+/// and the feature regressed to its pre-change behaviour for five days with
+/// nothing saying so.
+///
+/// One row per [`crate::mcp::policy_context::PolicyRenderReason`], plus
+/// `full_body_total` and `injections`, so the ratio is computable from this one
+/// read — without grepping a transcript or a log. Counts are process-lifetime:
+/// a restart zeroes them, and the durable per-session record remains coord's
+/// `session_policy_reads`, which this route deliberately does not duplicate.
+///
+/// ⚠️ **The unit is an INJECTION, not a session.** `compact` is a confirmable
+/// source and this route fires on every `SessionStart`, so one long-lived
+/// session contributes one count per compaction and the `confirmed` share is
+/// inflated by exactly the longest-running sessions. Read the per-source split
+/// before drawing a per-session conclusion — the full rationale, and the
+/// worked example that inverts a naive ratio, is on
+/// [`crate::mcp::policy_context::PolicyRenderStats`].
+async fn policy_context_stats() -> Json<crate::mcp::policy_context::PolicyRenderStats> {
+    Json(crate::mcp::policy_context::render_stats())
+}
+
+// =============================================================================
 // /sessions/<id>/context-low
 // =============================================================================
 
@@ -1131,8 +1165,8 @@ mod tests {
     #[test]
     fn a_role_still_wins_and_args_still_parameterise_it() {
         assert_eq!(
-            initial_prompt_for(Some("/coordinate"), None, None),
-            "/coordinate"
+            initial_prompt_for(Some("/auto-review"), None, None),
+            "/auto-review"
         );
         assert_eq!(
             initial_prompt_for(Some("/implement-plan"), Some(" my-plan "), None),
@@ -1252,6 +1286,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         )
         .route("/sessions/{id}/context-low", post(context_low))
         .route("/sessions/{id}/policy-context", get(policy_context))
+        .route("/sessions/policy-context-stats", get(policy_context_stats))
         // Mark a session's WORK finished (or unmark it). NOTE: this family has
         // no `route_entries()` and `manifest_matches_route_calls` does not reach
         // it — that test scans `src/mcp/ui_bridge` only, and its regex is

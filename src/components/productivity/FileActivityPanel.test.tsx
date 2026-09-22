@@ -2,7 +2,7 @@
  * Pure-helper tests for FileActivityPanel and fileActivityApi.
  *
  * The runner's vitest config is `environment: "node"` (no jsdom — see
- * CompletionReportSections.test.tsx for the same pattern). That means we
+ * CoordConnectionRequired.test.ts for the same pattern). That means we
  * can't render the panel and assert on its DOM. The plan's three Phase 2
  * test cases ("renders empty state", "click on hot session row calls
  * setActiveId", "window selector change triggers a re-fetch") map to:
@@ -295,15 +295,15 @@ describe("lockYieldCooldownRemainingSecs", () => {
   });
 });
 
-// ── buildYieldRequestBody — synthetic Coordinator Dashboard identity ───────
+// ── buildYieldRequestBody — synthetic File activity panel identity ─────────
 
 describe("buildYieldRequestBody — §Open Q5 synthetic requester identity", () => {
-  it("uses 'coordinator-dashboard' / 'Coordinator Dashboard' as requester", () => {
+  it("uses 'productivity-file-activity' / 'File activity panel' as requester", () => {
     const body = buildYieldRequestBody("src/foo.rs", "tab-B");
     expect(body).toEqual({
       file_path: "src/foo.rs",
-      requester_task_run_id: "coordinator-dashboard",
-      requester_name: "Coordinator Dashboard",
+      requester_task_run_id: "productivity-file-activity",
+      requester_name: "File activity panel",
       holder_task_run_id: "tab-B",
     });
   });
@@ -363,7 +363,7 @@ describe("yield-request POST dispatch — Phase 4 wire contract", () => {
     vi.restoreAllMocks();
   });
 
-  it("posts to /file-locks/yield-request with the Coordinator Dashboard body", async () => {
+  it("posts to /file-locks/yield-request with the File activity panel body", async () => {
     const fetchSpy = vi.fn<typeof fetch>().mockResolvedValue(
       new Response(JSON.stringify({ requested: true }), {
         status: 200,
@@ -381,14 +381,16 @@ describe("yield-request POST dispatch — Phase 4 wire contract", () => {
     expect((init!.headers as Record<string, string>)["Content-Type"]).toBe("application/json");
     // EXACT body shape — must match the Phase 1 Rust handler's
     // `YieldRequestRequest` deserializer. Any drift breaks the wire
-    // contract. §Open Q5 (synthetic Coordinator Dashboard identity) is
-    // pinned here too: a future refactor that swaps in a real
-    // task_run_id must update both this assertion AND
-    // `buildYieldRequestBody`.
+    // contract. §Open Q5 (synthetic requester identity) is pinned here
+    // too, and `requester_name` doubly so: the Rust handler copies it
+    // verbatim into the holder's "<name> has asked you to yield" banner,
+    // so it must always name a surface that exists. A future refactor
+    // that swaps in a real task_run_id must update both this assertion
+    // AND `buildYieldRequestBody`.
     expect(JSON.parse(init!.body as string)).toEqual({
       file_path: "src/foo.rs",
-      requester_task_run_id: "coordinator-dashboard",
-      requester_name: "Coordinator Dashboard",
+      requester_task_run_id: "productivity-file-activity",
+      requester_name: "File activity panel",
       holder_task_run_id: "tab-B",
     });
   });

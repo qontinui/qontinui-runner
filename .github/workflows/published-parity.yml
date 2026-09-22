@@ -127,7 +127,53 @@ jobs:
       # bug class these assertions exist to catch. Passing under pwsh 7 would
       # green-light a regression that still breaks the real thing.
       - name: Parity comparator unit tests (PS 5.1)
-        run: powershell -File scripts/tests/test-parity-diff.ps1
+        run: |
+          powershell -File scripts/tests/test-parity-diff.ps1
+          powershell -File scripts/tests/test-invoke-ps51-detached.ps1
+          powershell -File scripts/tests/test-installed-runner.ps1
+        shell: bash
+
+      # Every script below is run by `powershell -File` -- Windows PowerShell
+      # 5.1, which reads a file with no byte-order mark as the ANSI code page,
+      # not UTF-8. A UTF-8 em dash (E2 80 94) then decodes as `â€”`, and 0x94 is
+      # `”` -- a string delimiter to the 5.1 tokenizer. On 2026-09-19 (run
+      # 35408109575) three em dashes inside string literals in
+      # published-parity.ps1 produced "Missing ')' in method call" at PARSE
+      # time, so the manifest axis never ran and `parity-count` was empty -- 40
+      # minutes after the build, under continue-on-error, as a warning nobody
+      # reads. This step is the bound: no non-ASCII byte in a BOM-less script,
+      # and every script parses under the interpreter that will run it.
+      # Comments are held to the same rule as strings because the tokenizer
+      # decides which is which only after it has decoded the bytes.
+      - name: PS 5.1 scripts are ASCII and parse (the interpreter that runs them)
+        run: |
+          set -euo pipefail
+          status=0
+          for f in scripts/published-parity.ps1 scripts/contract-smoke.ps1 scripts/lib/*.ps1 scripts/tests/test-parity-diff.ps1 scripts/tests/test-invoke-ps51-detached.ps1 scripts/tests/test-installed-runner.ps1; do
+            [ "$(head -c3 "$f" | od -An -tx1 | tr -d ' \n')" = "efbbbf" ] && continue
+            # grep's exit 2 (no PCRE, unreadable file) must not read as "clean".
+            rc=0; LC_ALL=C grep -nP '[^\x00-\x7F]' "$f" || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              echo "::error file=$f::non-ASCII bytes in a BOM-less .ps1 -- Windows PowerShell 5.1 decodes them as ANSI (see the lines above)"
+              status=1
+            elif [ "$rc" -ge 2 ]; then
+              echo "::error file=$f::could not scan for non-ASCII bytes (grep exit $rc) -- UNKNOWN, not clean"
+              status=1
+            fi
+          done
+          powershell -NoProfile -Command '
+            $bad = 0
+            foreach ($f in @("scripts/published-parity.ps1", "scripts/contract-smoke.ps1", "scripts/tests/test-parity-diff.ps1", "scripts/tests/test-invoke-ps51-detached.ps1", "scripts/tests/test-installed-runner.ps1") + @(Get-ChildItem scripts/lib -Filter *.ps1 | ForEach-Object { $_.FullName })) {
+              $tokens = $null; $errors = $null
+              [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f).Path, [ref]$tokens, [ref]$errors)
+              if ($errors -and $errors.Count -gt 0) {
+                foreach ($e in $errors) { Write-Host ("::error file={0},line={1}::{2}" -f $f, $e.Extent.StartLineNumber, $e.Message) }
+                $bad++
+              } else { Write-Host ("parses under {0}: {1}" -f $PSVersionTable.PSVersion, $f) }
+            }
+            exit $bad
+          ' || status=1
+          exit $status
         shell: bash
 
       # Siblings. qontinui-schemas is a hard compile dependency
@@ -389,7 +435,7 @@ jobs:
           # this poll never gives up on an install the locator would then find.
           $bases = @($env:LOCALAPPDATA, $env:ProgramFiles, ${env:ProgramFiles(x86)})
           $candidates = foreach ($base in $bases) {
-            if ($base) { Join-Path $base 'Qontinui Runner\Qontinui Runner.exe' }
+            if ($base) { Join-Path $base 'Qontinui Runner\qontinui-runner.exe' }
           }
           $installed = $false
           for ($i = 1; $i -le 60; $i++) {
@@ -403,8 +449,17 @@ jobs:
           # Diagnostic only. The locator in scripts/lib/installed-runner.ps1 is
           # what actually finds the exe, and it throws naming every path probed
           # rather than falling back to anything.
+          # The install dir's top-level entries, not a name filter: on run
+          # 35429143803 a filter for 'Qontinui Runner*' printed the directory
+          # and nothing else, which is how the exe's real name (the cargo
+          # binary name, qontinui-runner.exe -- Tauri 2 does not rename it to
+          # productName) stayed unmeasured for one more run.
           foreach ($base in $bases) {
-            if ($base) { Get-ChildItem -LiteralPath $base -Depth 1 -Filter 'Qontinui Runner*' -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName } }
+            $dir = if ($base) { Join-Path $base 'Qontinui Runner' } else { $null }
+            if ($dir -and (Test-Path -LiteralPath $dir)) {
+              Write-Host "Install dir ${dir}:"
+              Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue | ForEach-Object { Write-Host ("  {0}{1}" -f $_.Name, $(if ($_.PSIsContainer) { '\' } else { '' })) }
+            }
           }
         shell: pwsh
 
@@ -417,10 +472,16 @@ jobs:
       # name — never `node.exe`, never `powershell.exe`, never a process-tree
       # flag. Do not copy this step onto a developer or operator machine; the
       # fleet's runner-lifecycle rule forbids exactly that.
+      # The image name is the cargo binary name on both builds (Tauri 2 does
+      # not rename it to productName), so the installed one is told apart by
+      # its path: never anything under a cargo target/ directory.
       - name: Stop any auto-launched published runner
         run: |
-          powershell -NoProfile -Command "Get-Process -Name 'Qontinui Runner' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; exit 0"
-        shell: bash
+          Get-Process -Name 'qontinui-runner' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -and $_.Path -notlike '*\target\*' } |
+            ForEach-Object { Write-Host "stopping pid $($_.Id) $($_.Path)"; Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
+          exit 0
+        shell: pwsh
         continue-on-error: true
 
       # -----------------------------------------------------------------------
@@ -430,19 +491,31 @@ jobs:
       # goes red. The script itself exits 0 for every parity outcome and 2 only
       # when the comparison could not happen; either way nothing downstream
       # depends on it.
+      #
+      # Through scripts/lib/invoke-ps51-detached.ps1, as are both smoke legs
+      # below: this script boots two runner instances, and a runner descendant
+      # that outlives the tree-kill holds any pipe the 5.1 host was given. The
+      # helper's header carries the measurement; the short form is that the
+      # dev smoke leg printed SMOKE-COMPLETE and then held its bash step open
+      # for 117 minutes behind `| tee`. `timeout-minutes` is the outer bound;
+      # the helper's -TimeoutSec is the inner one and is what produces the
+      # survivor listing.
       - name: Capability-manifest parity (development vs published)
         id: parity
         continue-on-error: true
+        timeout-minutes: 20
         env:
           # Same degraded-boot flag ci.yml's contract-smoke step uses: the
           # manifest door needs no database rows.
           QONTINUI_ALLOW_NO_DB: "1"
         run: |
-          powershell -File scripts/published-parity.ps1 \
-            -JsonOut parity-report/published-parity.json \
-            -SummaryOut "$GITHUB_STEP_SUMMARY" \
+          pwsh -File scripts/lib/invoke-ps51-detached.ps1 `
+            -ScriptPath scripts/published-parity.ps1 -LogPath parity-report/published-parity.log -TimeoutSec 900 `
+            -JsonOut parity-report/published-parity.json `
+            -SummaryOut "$env:GITHUB_STEP_SUMMARY" `
             -Annotate
-        shell: bash
+          exit $LASTEXITCODE
+        shell: pwsh
 
       # -----------------------------------------------------------------------
       # AXIS 2 — behaviour. Same exerciser, two artifacts.
@@ -457,33 +530,40 @@ jobs:
       # release builds when it is present, which would change the published
       # leg's behaviour relative to the dev leg for a reason that has nothing to
       # do with parity.
+      #
+      # NOT `powershell ... | tee smoke-dev.log` under bash: that is the shape
+      # that held this step open for 117 minutes after SMOKE-COMPLETE on
+      # 2026-09-19 (run 35408109575) -- see invoke-ps51-detached.ps1's header.
+      # The helper writes the same log the behavioural axis below reads.
       - name: Contract smoke — development build
         id: smoke_dev
         continue-on-error: true
+        timeout-minutes: 25
         env:
           QONTINUI_ALLOW_NO_DB: "1"
         run: |
-          set -o pipefail
-          powershell -File scripts/contract-smoke.ps1 \
-            -DirectExe target/debug/qontinui-runner.exe \
-            -Profile ci \
-            -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts \
-            2>&1 | tee smoke-dev.log
-        shell: bash
+          pwsh -File scripts/lib/invoke-ps51-detached.ps1 `
+            -ScriptPath scripts/contract-smoke.ps1 -LogPath smoke-dev.log -TimeoutSec 1200 `
+            -DirectExe target/debug/qontinui-runner.exe `
+            -Profile ci `
+            -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts
+          exit $LASTEXITCODE
+        shell: pwsh
 
       - name: Contract smoke — published build
         id: smoke_published
         continue-on-error: true
+        timeout-minutes: 25
         env:
           QONTINUI_ALLOW_NO_DB: "1"
         run: |
-          set -o pipefail
-          powershell -File scripts/contract-smoke.ps1 \
-            -UseInstalledExe \
-            -Profile ci \
-            -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts \
-            2>&1 | tee smoke-published.log
-        shell: bash
+          pwsh -File scripts/lib/invoke-ps51-detached.ps1 `
+            -ScriptPath scripts/contract-smoke.ps1 -LogPath smoke-published.log -TimeoutSec 1200 `
+            -UseInstalledExe `
+            -Profile ci `
+            -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts
+          exit $LASTEXITCODE
+        shell: pwsh
 
       # The behavioural diff. contract-smoke prints one line per probe as
       # "STATUS  METHOD  PATH  DETAIL" (Record, contract-smoke.ps1), so the
@@ -591,6 +671,7 @@ jobs:
           retention-days: 30
           path: |
             parity-report/published-parity.json
+            parity-report/published-parity.log
             smoke-dev.log
             smoke-published.log
             dev-routes.txt
