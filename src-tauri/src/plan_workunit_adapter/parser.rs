@@ -1719,8 +1719,9 @@ mod tests {
     }
 
     /// Every status-blockquote `Area:` line on `qontinui-dev-notes`
-    /// `origin/main` `86208321` (2026-09-22), verbatim, each under the status
-    /// line it sits beneath in its plan. Re-measure with
+    /// `origin/main` as of 2026-09-22 (`86208321`, plus the
+    /// `2026-08-31-published-build-parity-check` line added by `171b0398`),
+    /// verbatim, each under the status line it sits beneath in its plan. Re-measure with
     /// `git grep -n 'Area:' origin/main -- plans/` filtered to the status block.
     const STATUS_BLOCK_AREA_FIXTURES: &[(&str, &str, Option<&str>)] = &[
         (
@@ -1966,8 +1967,9 @@ mod tests {
         );
     }
 
-    /// A CRLF checkout reads the same as LF: the trailing `\r` is whitespace to
-    /// the token split and ends the blockquote at a blank `\r` line.
+    /// A CRLF checkout reads the same as LF: `str::lines()` strips the `\r\n`
+    /// pair, so the parser never sees a `\r`, and the blank `\r\n` line still
+    /// ends the blockquote.
     #[test]
     fn crlf_body_resolves_like_lf() {
         let body =
