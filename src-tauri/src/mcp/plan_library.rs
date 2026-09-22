@@ -10,6 +10,8 @@
 //! |---|---|---|
 //! | `POST /plan-library/artifacts` | `POST {web}/api/v1/plan-library` (+ edges) | **yes** |
 //! | `POST /plan-library/links` | `POST {web}/api/v1/plan-library/{id}/edges` | **yes** |
+//! | `DELETE /plan-library/links/{id}` | `DELETE {web}/api/v1/plan-library/edges/{id}` | **yes** |
+//! | `PUT /plan-library/links/{id}` | `PUT {web}/api/v1/plan-library/edges/{id}` | **yes** |
 //! | `GET /plan-library/search` | `GET {web}/api/v1/plan-library?…` | no |
 //! | `GET /plan-library/candidates` | `GET {web}/api/v1/plan-library/candidates?…` | no |
 //! | `GET /plan-library/artifacts/{id}` | `GET {web}/api/v1/plan-library/{id}[?include_coord]` | no |
@@ -25,7 +27,13 @@
 //!
 //! The export and divergent rows land plan
 //! `2026-09-06-plan-library-door-serves-no-plan-body`; the scan-roots row lands
-//! `2026-09-15-captured-vs-authored-coverage-is-a-set-difference` Phase 5.
+//! `2026-09-15-captured-vs-authored-coverage-is-a-set-difference` Phase 5. The
+//! `DELETE`/`PUT` link rows land Phase 5 of
+//! `2026-09-20-a-recorded-delivery-scope-is-permanent-so-a-mis-declared-phase-is-uncorrectable`
+//! — before them a recorded edge had no correction path at all: `POST
+//! /plan-library/{id}/edges` is idempotent on an IDENTICAL triple but silently
+//! APPENDS a second edge for a different one, which is how two permanent FALSE
+//! `supersedes` edges landed on a real artifact with no way to retract them.
 //! The export forward is the one route that does **not** wrap its answer in
 //! [`ApiResponse`] — it passes the upstream's `text/markdown` bytes and its
 //! `X-Content-Sha256` through unmodified, because the corpus-authority
@@ -103,7 +111,7 @@
 use axum::body::Bytes;
 use axum::extract::{Path, Query};
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::Value;
@@ -461,11 +469,38 @@ fn write_capability() -> serde_json::Map<String, Value> {
         "writeContract".to_string(),
         Value::String(WRITE_CONTRACT.to_string()),
     );
+    // The provenance edge relation vocabulary, MACHINE-READABLE rather than
+    // only prose a driver has to parse out of `writeContract`. Before this
+    // field existed, an agent learned the seven-value set only by triggering
+    // a 422 and reading its message — exactly the "learned by taking an
+    // error" shape the paragraph above exists to close for the two other
+    // contract facts. Spelled as LITERALS, matching every other mirror of
+    // this vocabulary in this file (`EdgeSpec::relation`'s doc, the
+    // `edge_payload` and `LinkRequest` refusal text): none of them derive
+    // from a shared constant, so a widening on the web side that is not
+    // carried here goes red in
+    // `the_refusal_message_names_the_whole_relation_vocabulary` rather than
+    // silently drifting.
+    m.insert(
+        "relations".to_string(),
+        serde_json::json!([
+            "produced_report",
+            "feeds",
+            "authored_plan",
+            "supersedes",
+            "depends_on",
+            "spawned_followup",
+            "refutes",
+        ]),
+    );
     m
 }
 
-/// The advertised write contract: the two rules a driver cannot infer from the
-/// request shape, and whose violation is silent rather than loud.
+/// The advertised write contract: the rules a driver cannot infer from the
+/// request shape, and whose violation is silent rather than loud — including
+/// the relation vocabulary (also published structured as `relations`) and the
+/// two edge-correction verbs added by Phase 5 of
+/// `2026-09-20-a-recorded-delivery-scope-is-permanent-so-a-mis-declared-phase-is-uncorrectable`.
 ///
 /// `source_repo` is the one that used to be undiscoverable in the damaging
 /// direction — nothing in the briefing clause or these read routes said it was
@@ -483,6 +518,21 @@ fn write_capability() -> serde_json::Map<String, Value> {
 /// doubt — would be a fresh instance of the very defect class this door's
 /// capability block exists to close.
 const WRITE_CONTRACT: &str = "\
+An edge's `relation` is one of produced_report | feeds | authored_plan | supersedes | \
+depends_on | spawned_followup | refutes — the same seven values `POST /plan-library/links`, \
+`DELETE /plan-library/links/{id}` and `PUT /plan-library/links/{id}` accept, also published \
+structured (not just in this prose) as this same read's `relations` array, so a caller does \
+not have to trigger a 422 to learn the set. A recorded edge is CORRECTABLE, not only \
+appendable: `POST /plan-library/links` re-posting an identical (from_id, to_id, relation) \
+triple is idempotent, but a DIFFERENT one off the same (from_id, relation) pair APPENDS a \
+second edge rather than replacing the first. `DELETE /plan-library/links/{id}` \
+(body: {\"reason\": \"...\"}) soft-deletes a wrongly-recorded edge — the row survives, \
+retracted_at/retracted_by/retracted_reason are stamped, and it drops out of ordinary reads. \
+`PUT /plan-library/links/{id}` (body: {\"relation\", \"to_id\", \"note\", \"reason\"}) \
+replaces relation/to_id/note IN PLACE and stamps source: \"corrected\" plus \
+corrected_by/corrected_at/corrected_reason, so a correction is distinguishable from an \
+original recording. Both require a non-empty `reason`: an unexplained retraction or \
+correction is exactly the silent overwrite this pair of doors exists to prevent. \
 POST /plan-library/artifacts identity is (organization, kind, slug, source_repo) — \
 `source_repo` is part of the key, so omitting it does NOT update an artifact that has \
 one, it creates a second row. Pass the same `source_repo` the artifact was captured \
@@ -682,6 +732,29 @@ pub struct LinkRequest {
     pub note: Option<String>,
     #[serde(default)]
     pub session_id: Option<String>,
+}
+
+/// `DELETE /plan-library/links/{id}` body — soft-delete a wrongly-recorded
+/// edge. `reason` is required and non-blank: an unexplained retraction is
+/// exactly the silent correction this door exists to prevent.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LinkRetractRequest {
+    pub reason: String,
+}
+
+/// `PUT /plan-library/links/{id}` body — replace a recorded edge's
+/// `relation` / `to_id` / `note` in place, a correction rather than a fresh
+/// observation. Mirrors [`EdgeSpec`]'s relation vocabulary; `to_id` is
+/// omittable only for `spawned_followup`, exactly as on create. `reason` is
+/// required and non-blank, same rationale as [`LinkRetractRequest`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct LinkCorrectRequest {
+    pub relation: String,
+    #[serde(default)]
+    pub to_id: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+    pub reason: String,
 }
 
 // ===========================================================================
@@ -903,6 +976,67 @@ async fn upstream_post(
     let url = format!("{}{}", web_base(), path);
     // coord-tenant-scope(work-owed): same non-coord helper against qontinui-web; same session-less, artifact-keyed posture and the same E3 open question. Phase 6.
     let resp = crate::auth::attach_device_auth(upstream_client().post(&url).json(body))
+        .send()
+        .await
+        .map_err(|e| transport_failure(path, e))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(upstream_failure(path, status, text));
+    }
+    serde_json::from_str(&text).map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(api_error(format!("{path}: unparseable upstream body: {e}"))),
+        )
+    })
+}
+
+/// PUT a JSON body to a web plan-library path — the correction verb.
+/// Mirrors [`upstream_post`] exactly except for the HTTP method; kept as its
+/// own function rather than a method-parameterized one so each call site
+/// reads its verb at a glance, matching this module's existing
+/// [`upstream_get`] / [`upstream_get_raw`] precedent for near-duplicate
+/// upstream helpers.
+async fn upstream_put(
+    path: &str,
+    body: &Value,
+) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
+    let url = format!("{}{}", web_base(), path);
+    // coord-tenant-scope(work-owed): same non-coord helper against qontinui-web as
+    // `upstream_post`; same session-less, artifact-keyed posture and the same E3 open
+    // question. Phase 6.
+    let resp = crate::auth::attach_device_auth(upstream_client().put(&url).json(body))
+        .send()
+        .await
+        .map_err(|e| transport_failure(path, e))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(upstream_failure(path, status, text));
+    }
+    serde_json::from_str(&text).map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(api_error(format!("{path}: unparseable upstream body: {e}"))),
+        )
+    })
+}
+
+/// DELETE with a JSON body against a web plan-library path — the retraction
+/// verb. A DELETE carrying a body is unusual but well within HTTP and
+/// `reqwest`; the body is how `reason` travels, and a query parameter would
+/// be no more RESTful for a required, potentially-long free-text field.
+/// Mirrors [`upstream_post`] otherwise.
+async fn upstream_delete(
+    path: &str,
+    body: &Value,
+) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
+    let url = format!("{}{}", web_base(), path);
+    // coord-tenant-scope(work-owed): same non-coord helper against qontinui-web as
+    // `upstream_post`; same session-less, artifact-keyed posture and the same E3 open
+    // question. Phase 6.
+    let resp = crate::auth::attach_device_auth(upstream_client().delete(&url).json(body))
         .send()
         .await
         .map_err(|e| transport_failure(path, e))?;
@@ -1326,6 +1460,90 @@ pub async fn create_link_handler(headers: HeaderMap, body: Bytes) -> ApiResult {
     Ok(Json(ApiResponse::success(upstream)))
 }
 
+/// The upstream path for one edge, or the 400 text for an `id` that is not a
+/// UUID. Mirrors [`artifact_upstream_path`]'s reasoning exactly: refused HERE
+/// rather than round-tripped to upstream for a 422, and normalising to the
+/// canonical hyphenated form means no `..`, `/` or `?` can ever reach the
+/// wire through this segment.
+fn edge_upstream_path(raw: &str) -> Result<String, String> {
+    match uuid::Uuid::parse_str(raw.trim()) {
+        Ok(id) => Ok(format!("/api/v1/plan-library/edges/{}", id.hyphenated())),
+        Err(e) => Err(format!(
+            "/plan-library/links/{{id}}: `id` must be an edge UUID (as returned by \
+             POST /plan-library/links or the `edges` array on an artifact read), got \
+             {raw:?}: {e}"
+        )),
+    }
+}
+
+/// `DELETE /plan-library/links/{id}` — soft-delete (retract) a
+/// wrongly-recorded edge. The row is never removed; upstream stamps
+/// `retracted_at` / `retracted_by` / `retracted_reason` and the edge drops
+/// out of ordinary reads. **Nonce-authorized, then kill switch, then dial**
+/// ([`authorize_write`]) — a retraction is a write with the same authority
+/// requirement as recording the edge in the first place.
+pub async fn retract_link_handler(
+    headers: HeaderMap,
+    Path(edge_id): Path<String>,
+    body: Bytes,
+) -> ApiResult {
+    authorize_write(&headers)?;
+    let req: LinkRetractRequest = parse_write_body(&body)?;
+    if req.reason.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(
+                "`reason` is required and must be non-empty — an unexplained retraction \
+                 is exactly the silent correction this door exists to prevent",
+            )),
+        ));
+    }
+    let path = edge_upstream_path(&edge_id)
+        .map_err(|msg| (StatusCode::BAD_REQUEST, Json(api_error(msg))))?;
+    let upstream = upstream_delete(&path, &serde_json::json!({"reason": req.reason})).await?;
+    Ok(Json(ApiResponse::success(upstream)))
+}
+
+/// `PUT /plan-library/links/{id}` — replace a recorded edge's `relation` /
+/// `to_id` / `note` in place, a correction rather than a fresh observation.
+/// **Nonce-authorized, then kill switch, then dial** ([`authorize_write`]).
+pub async fn correct_link_handler(
+    headers: HeaderMap,
+    Path(edge_id): Path<String>,
+    body: Bytes,
+) -> ApiResult {
+    authorize_write(&headers)?;
+    let req: LinkCorrectRequest = parse_write_body(&body)?;
+    if req.relation.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(
+                "`relation` is required (produced_report | feeds | authored_plan | \
+                 supersedes | depends_on | spawned_followup | refutes)",
+            )),
+        ));
+    }
+    if req.reason.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(
+                "`reason` is required and must be non-empty — an unexplained correction \
+                 is exactly the silent overwrite this door exists to prevent",
+            )),
+        ));
+    }
+    let path = edge_upstream_path(&edge_id)
+        .map_err(|msg| (StatusCode::BAD_REQUEST, Json(api_error(msg))))?;
+    let body = serde_json::json!({
+        "relation": req.relation,
+        "to_id": req.to_id,
+        "note": req.note,
+        "reason": req.reason,
+    });
+    let upstream = upstream_put(&path, &body).await?;
+    Ok(Json(ApiResponse::success(upstream)))
+}
+
 /// Query parameters this door forwards to the web list route. Anything else is
 /// dropped rather than passed through, so a typo cannot silently widen a read.
 const SEARCH_PARAMS: [&str; 9] = [
@@ -1527,6 +1745,8 @@ pub fn route_entries() -> &'static [(&'static str, &'static str, bool)] {
     &[
         ("POST", "/plan-library/artifacts", true),
         ("POST", "/plan-library/links", true),
+        ("DELETE", "/plan-library/links/{id}", true),
+        ("PUT", "/plan-library/links/{id}", true),
         ("GET", "/plan-library/search", false),
         ("GET", "/plan-library/candidates", false),
         ("GET", "/plan-library/artifacts/{id}", false),
@@ -1540,6 +1760,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/plan-library/artifacts", post(write_artifact_handler))
         .route("/plan-library/links", post(create_link_handler))
+        .route(
+            "/plan-library/links/{id}",
+            delete(retract_link_handler).put(correct_link_handler),
+        )
         .route("/plan-library/search", get(search_handler))
         .route("/plan-library/candidates", get(candidates_handler))
         .route("/plan-library/artifacts/{id}", get(read_artifact_handler))
@@ -2366,6 +2590,47 @@ mod tests {
                 "the EdgeSpec relation doc omits `{relation}`: {doc}"
             );
         }
+
+        // Mirror 4 — `correct_link_handler`'s own refusal (`PUT
+        // /plan-library/links/{id}`). It shares `create_link_handler`'s exact
+        // wording today, but is located by ITS OWN anchor (the function
+        // signature) rather than reusing Mirror 2's window, so a future
+        // divergence between the two refusals is still caught instead of
+        // trivially passing off Mirror 2's find.
+        let correct_message = window(&source_lines, "pub async fn correct_link_handler(", 0, 40);
+        for relation in VOCABULARY {
+            assert!(
+                correct_message.contains(relation),
+                "the correct_link_handler refusal omits `{relation}`: {correct_message}"
+            );
+        }
+
+        // Mirror 5 — the MACHINE-READABLE `relations` field `write_capability()`
+        // publishes, and the `writeContract` prose beside it. Phase 5 of
+        // `2026-09-20-a-recorded-delivery-scope-is-permanent-so-a-mis-declared-phase-is-uncorrectable`
+        // added both so the vocabulary is discoverable BEFORE a write, not only
+        // re-taught after a 422.
+        let _pin = pin("off");
+        let contract = with_flag(None, || with_write_capability(serde_json::json!({})));
+        let relations: Vec<&str> = contract["relations"]
+            .as_array()
+            .expect("relations is a published array")
+            .iter()
+            .map(|v| v.as_str().expect("each relation is a string"))
+            .collect();
+        for relation in VOCABULARY {
+            assert!(
+                relations.contains(&relation),
+                "the published `relations` array omits `{relation}`: {relations:?}"
+            );
+        }
+        let write_contract_text = contract["writeContract"].as_str().unwrap();
+        for relation in VOCABULARY {
+            assert!(
+                write_contract_text.contains(relation),
+                "writeContract prose omits `{relation}`: {write_contract_text}"
+            );
+        }
     }
 
     #[test]
@@ -2535,19 +2800,23 @@ mod tests {
 
     // ---- routes ------------------------------------------------------------
 
-    /// All eight routes are registered, and the split is exactly the
-    /// three-layer model: the two WRITES require a nonce (and sit behind the
+    /// All ten routes are registered, and the split is exactly the
+    /// three-layer model: the four WRITES require a nonce (and sit behind the
     /// kill switch and the dial), the six READS do not. `gated_flow.rs` makes
     /// the same distinction — "knowing a view exists is inert; opening it is
     /// the privileged act" — and Phase 6's whole value is an agent being able
-    /// to ask the candidate question.
+    /// to ask the candidate question. The two edge-correction writes added by
+    /// Phase 5 of
+    /// `2026-09-20-a-recorded-delivery-scope-is-permanent-so-a-mis-declared-phase-is-uncorrectable`
+    /// are DELETE and PUT rather than POST — the first departure from
+    /// "every write is a POST" this door has had.
     #[test]
     fn the_write_routes_require_a_nonce_and_the_read_routes_do_not() {
         let entries = route_entries();
-        assert_eq!(entries.len(), 8, "keep in lockstep with routes()");
+        assert_eq!(entries.len(), 10, "keep in lockstep with routes()");
         for (method, path, _) in entries {
             assert!(path.starts_with("/plan-library/"), "{path}");
-            assert!(matches!(*method, "GET" | "POST"));
+            assert!(matches!(*method, "GET" | "POST" | "PUT" | "DELETE"));
         }
         let gated: Vec<&str> = entries
             .iter()
@@ -2556,7 +2825,12 @@ mod tests {
             .collect();
         assert_eq!(
             gated,
-            vec!["/plan-library/artifacts", "/plan-library/links"]
+            vec![
+                "/plan-library/artifacts",
+                "/plan-library/links",
+                "/plan-library/links/{id}",
+                "/plan-library/links/{id}",
+            ]
         );
         let ungated: Vec<&str> = entries
             .iter()
@@ -2574,15 +2848,20 @@ mod tests {
                 "/plan-library/scan-roots"
             ]
         );
-        // Every nonce-requiring route is a POST and every open one a GET — a
-        // write that ever became open would break this too.
-        assert!(entries.iter().all(|(m, _, g)| *g == (*m == "POST")));
+        // Every nonce-requiring route is a write verb (POST / PUT / DELETE)
+        // and every open one a GET — a write that ever became open would
+        // break this too.
+        assert!(entries
+            .iter()
+            .all(|(m, _, g)| *g == matches!(*m, "POST" | "PUT" | "DELETE")));
 
         let _r: Router<Arc<ApiState>> = routes();
     }
 
-    /// The authorized surface is EXACTLY the two writes, and adding the export
-    /// and divergent reads widened it by nothing.
+    /// The authorized surface is EXACTLY the three write paths (four route
+    /// entries — DELETE and PUT share one path), and adding the export and
+    /// divergent reads (nor, later, the edge-correction pair) widened it by
+    /// nothing beyond what each phase explicitly added.
     ///
     /// The count assert above would still pass if a new row arrived with
     /// `requires_a_nonce = true`; this one is the standing invariant — the set
@@ -2598,13 +2877,17 @@ mod tests {
             .collect();
         assert_eq!(
             authorized,
-            ["/plan-library/artifacts", "/plan-library/links"]
-                .into_iter()
-                .collect::<std::collections::BTreeSet<_>>(),
-            "the nonce-authorized surface must stay exactly the two writes"
+            [
+                "/plan-library/artifacts",
+                "/plan-library/links",
+                "/plan-library/links/{id}",
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+            "the nonce-authorized surface must stay exactly these three write paths"
         );
 
-        // …and both new routes are on the open side, by name.
+        // …and both original new routes are on the open side, by name.
         let open: std::collections::BTreeSet<&str> = route_entries()
             .iter()
             .filter(|(_, _, nonce)| !*nonce)
@@ -2934,6 +3217,10 @@ mod tests {
                 get(export_artifact_handler),
             )
             .route("/plan-library/links", post(create_link_handler))
+            .route(
+                "/plan-library/links/{id}",
+                delete(retract_link_handler).put(correct_link_handler),
+            )
             .route("/plan-library/search", get(search_handler))
             .route("/plan-library/candidates", get(candidates_handler))
             .route("/plan-library/scan-roots", get(scan_roots_handler))
@@ -3302,9 +3589,17 @@ mod tests {
         )
     }
 
-    async fn post_raw(uri: &str, headers: &[(&str, &str)], body: &str) -> (StatusCode, Value) {
+    /// The method-generic core every `*_raw` / `*_json` helper below funnels
+    /// through, so DELETE and PUT drive the same hermetic `test_app()` path
+    /// POST always has.
+    async fn raw_request(
+        method: &str,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> (StatusCode, Value) {
         let mut b = Request::builder()
-            .method("POST")
+            .method(method)
             .uri(uri)
             .header("content-type", "application/json");
         for (k, v) in headers {
@@ -3320,13 +3615,34 @@ mod tests {
         (status, json)
     }
 
-    async fn post_json(uri: &str, nonce: Option<&str>, body: Value) -> (StatusCode, Value) {
+    async fn post_raw(uri: &str, headers: &[(&str, &str)], body: &str) -> (StatusCode, Value) {
+        raw_request("POST", uri, headers, body).await
+    }
+
+    async fn json_with_nonce(
+        method: &str,
+        uri: &str,
+        nonce: Option<&str>,
+        body: Value,
+    ) -> (StatusCode, Value) {
         let bearer = nonce.map(|n| format!("Bearer {n}"));
         let headers: Vec<(&str, &str)> = bearer
             .as_deref()
             .map(|b| vec![("authorization", b)])
             .unwrap_or_default();
-        post_raw(uri, &headers, &body.to_string()).await
+        raw_request(method, uri, &headers, &body.to_string()).await
+    }
+
+    async fn post_json(uri: &str, nonce: Option<&str>, body: Value) -> (StatusCode, Value) {
+        json_with_nonce("POST", uri, nonce, body).await
+    }
+
+    async fn delete_json(uri: &str, nonce: Option<&str>, body: Value) -> (StatusCode, Value) {
+        json_with_nonce("DELETE", uri, nonce, body).await
+    }
+
+    async fn put_json(uri: &str, nonce: Option<&str>, body: Value) -> (StatusCode, Value) {
+        json_with_nonce("PUT", uri, nonce, body).await
     }
 
     fn valid_artifact() -> Value {
@@ -3343,6 +3659,24 @@ mod tests {
             "relation": "authored_plan",
         })
     }
+
+    fn valid_retraction() -> Value {
+        serde_json::json!({"reason": "false supersedes claim, see finding 563585b4"})
+    }
+
+    fn valid_correction() -> Value {
+        serde_json::json!({
+            "relation": "authored_plan",
+            "to_id": "22222222-2222-2222-2222-222222222222",
+            "reason": "wrong target artifact",
+        })
+    }
+
+    /// A placeholder edge id for the correction routes — any well-formed UUID
+    /// works for every test below the nonce/kill-switch/dial gate, since
+    /// nothing past `authorize_write` is reached before the upstream call
+    /// they refuse ahead of.
+    const EDGE_ID_URI: &str = "/plan-library/links/33333333-3333-3333-3333-333333333333";
 
     /// Layer 1 over HTTP: no nonce ⇒ 401 with the proxy's own code, on BOTH
     /// write routes, with the switch off and the dial open — the other two
@@ -3374,6 +3708,127 @@ mod tests {
             );
             assert!(err.contains(".mcp.json"), "{uri}: {err}");
         }
+    }
+
+    /// The two edge-correction routes (`DELETE` / `PUT
+    /// /plan-library/links/{id}`, Phase 5 of
+    /// `2026-09-20-a-recorded-delivery-scope-is-permanent-so-a-mis-declared-phase-is-uncorrectable`)
+    /// sit behind the SAME three-layer gate as the two POST writes — nonce,
+    /// then kill switch, then dial — driven end to end here rather than
+    /// assumed from `authorize_write` being called: a handler that forgot the
+    /// call would compile clean and only this test would notice.
+    #[tokio::test]
+    async fn both_edge_correction_routes_are_gated_the_same_three_layers() {
+        let _guard = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_WRITE_FLAG]);
+
+        // Layer 1: no nonce ⇒ 401, dial open, switch off.
+        {
+            let _pin = pin("record");
+            std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
+            for (status, body) in [
+                delete_json(EDGE_ID_URI, None, valid_retraction()).await,
+                put_json(EDGE_ID_URI, None, valid_correction()).await,
+            ] {
+                assert_eq!(status, StatusCode::UNAUTHORIZED);
+                assert_eq!(body["code"], serde_json::json!(CODE_PROXY_UNAUTHORIZED));
+            }
+        }
+
+        // Layer 2: registered nonce, kill switch engaged ⇒ 403 killed.
+        {
+            let _pin = pin("record");
+            std::env::set_var(PLAN_LIBRARY_WRITE_FLAG, "0");
+            let nonce = registered_nonce();
+            for (status, body) in [
+                delete_json(EDGE_ID_URI, Some(&nonce), valid_retraction()).await,
+                put_json(EDGE_ID_URI, Some(&nonce), valid_correction()).await,
+            ] {
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                assert_eq!(body["code"], serde_json::json!(CODE_WRITE_KILLED));
+            }
+        }
+
+        // Layer 3: past the kill switch, dial off ⇒ 403 dial-off.
+        {
+            let _pin = pin("off");
+            std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
+            let nonce = registered_nonce();
+            for (status, body) in [
+                delete_json(EDGE_ID_URI, Some(&nonce), valid_retraction()).await,
+                put_json(EDGE_ID_URI, Some(&nonce), valid_correction()).await,
+            ] {
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                assert_eq!(body["code"], serde_json::json!(CODE_DIAL_OFF));
+            }
+        }
+    }
+
+    /// Both edge-correction routes require a non-empty `reason` — refused
+    /// BEFORE any upstream dial, matching the `edge_payload` /
+    /// `missing_replace_fields` precedent of refusing a malformed write body
+    /// locally rather than round-tripping it for an upstream 422.
+    #[tokio::test]
+    async fn both_edge_correction_routes_require_a_non_blank_reason() {
+        let _pin = pin("record");
+        let _guard = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_WRITE_FLAG]);
+        std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
+        let nonce = registered_nonce();
+
+        for reason in ["", "   "] {
+            let (status, body) = delete_json(
+                EDGE_ID_URI,
+                Some(&nonce),
+                serde_json::json!({"reason": reason}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "retract reason={reason:?}");
+            assert!(body["error"].as_str().unwrap().contains("`reason`"));
+
+            let (status, body) = put_json(
+                EDGE_ID_URI,
+                Some(&nonce),
+                serde_json::json!({
+                    "relation": "authored_plan",
+                    "to_id": "22222222-2222-2222-2222-222222222222",
+                    "reason": reason,
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "correct reason={reason:?}");
+            assert!(body["error"].as_str().unwrap().contains("`reason`"));
+        }
+    }
+
+    /// A non-UUID edge id is refused locally, the same `edge_upstream_path`
+    /// guard `artifact_upstream_path` gives the by-id artifact read — no `..`,
+    /// `/` or `?` ever reaches the wire through this segment.
+    #[tokio::test]
+    async fn a_non_uuid_edge_id_is_a_400_before_any_dial() {
+        let _pin = pin("record");
+        let _guard = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_WRITE_FLAG]);
+        std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
+        let nonce = registered_nonce();
+
+        let (status, body) = delete_json(
+            "/plan-library/links/not-a-uuid",
+            Some(&nonce),
+            valid_retraction(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("must be an edge UUID"));
+
+        let (status, body) = put_json(
+            "/plan-library/links/not-a-uuid",
+            Some(&nonce),
+            valid_correction(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("must be an edge UUID"));
     }
 
     /// A key this runner never minted is the same 401 under EITHER accepted
