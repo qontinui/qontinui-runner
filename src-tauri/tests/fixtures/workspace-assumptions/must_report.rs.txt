@@ -104,3 +104,35 @@ mod win_ffi {
         fn GetLastErrorShim() -> u32;
     }
 }
+
+// `extern "C" fn` is a FN, not an FFI block: its `{` is the fn's own. If it
+// armed the FFI scope, that arming would survive to the `impl Console {`
+// below, which would then swallow the `Console::` qualification (changing the
+// disposition KEY) and exempt `win_only` from the windows-sibling check — so
+// the rows here would read `launcher` with no `win_only` at all.
+extern "C" fn cb() -> u32 {
+    0
+}
+
+impl Console {
+    pub fn launcher() -> &'static str {
+        "powershell.exe"
+    }
+
+    #[cfg(windows)]
+    pub fn win_only(&self) {}
+}
+
+// F5: an attribute-shaped line INSIDE a string literal is data. Before the
+// skeleton gate, this template's `#[cfg(test)]` opened a real region and
+// swallowed the hit after it.
+pub const TEMPLATE: &str = r#"
+#[cfg(test)]
+mod tests {
+    fn t() {}
+}
+"#;
+
+fn after_template() -> &'static str {
+    "http://localhost:9875/health"
+}
