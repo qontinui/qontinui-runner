@@ -1089,6 +1089,16 @@ pub struct PathSettings {
     /// per-entry drop of a blank key or blank value, which removes a non-entry
     /// rather than an unattributed one.
     ///
+    /// ⚠️ **"Inert for resolution" means nothing looks the KEY up. It does NOT
+    /// mean the entry has no effect at all:** such an entry's VALUE is still
+    /// unioned into the plan-library write door's `source_path` confinement
+    /// allow-list (`mcp::plan_library::source_path_roots`, which reads values
+    /// and never inspects a key). That is deliberate and is the same
+    /// re-pairing argument — a device mid-re-pair would otherwise have its
+    /// write door start refusing files it accepted an hour earlier. The
+    /// back-reference is here because a reader arrives at this type first and
+    /// would otherwise take "inert" for "no effect".
+    ///
     /// Default (when empty): nothing keyed — exactly today's behaviour, since
     /// every resolution then falls through to the scalar.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]

@@ -144,31 +144,44 @@ describe("draftsFrom / buildPathSettingsPayload — the wire boundary", () => {
       plans_dir: "",
       workspace_root: "   ",
     });
-    expect("plans_dir" in payload).toBe(false);
-    expect("workspace_root" in payload).toBe(false);
-    expect("prompts_dir" in payload).toBe(false);
-    expect("dev_logs_dir" in payload).toBe(false);
+    // A SHOWN box that is empty is a CLEAR, and under the patch's
+    // absent-means-untouched rule the only way to say that is an explicit
+    // `null`. Omitting it would be a no-op — the stored value would survive.
+    expect(payload.plans_dir).toBeNull();
+    expect(payload.workspace_root).toBeNull();
+    expect(payload.prompts_dir).toBeNull();
+    expect(payload.dev_logs_dir).toBeNull();
+    // Still never an empty string: `""` would be a directory named "".
     expect(JSON.stringify(payload)).not.toContain('""');
   });
 
-  it("round-trips the fields the panel does not edit, untouched", () => {
-    // `plans_archive_dir` (being removed by PR #1288, not shown) and
-    // `strict_mode` (a behaviour flag, belongs elsewhere) must survive a save
-    // exactly as loaded — a panel that dropped them would be a silent reset.
+  it("OMITS the fields the panel does not edit, so the runner keeps them", () => {
+    // `plans_archive_dir` (not shown) and `strict_mode` (a behaviour flag that
+    // belongs elsewhere) must survive a save — and the way to achieve that
+    // flipped. They used to be RE-SENT verbatim from the loaded struct, which
+    // reads as preservation and is actually a blind last-writer-wins: a peer
+    // that changed either one while this panel sat open was reverted by the
+    // operator's next save. Under the patch they are OMITTED, so the runner
+    // keeps whatever it currently holds and this panel asserts nothing about
+    // fields it never showed.
     const payload = buildPathSettingsPayload(SAVED, {
       ...draftsFrom(SAVED),
       prompts_dir: "/home/me/qontinui-dev-notes/plans/prompts",
     });
-    expect(payload.plans_archive_dir).toBe(SAVED.plans_archive_dir);
-    expect(payload.strict_mode).toBe(true);
+    expect("plans_archive_dir" in payload).toBe(false);
+    expect("strict_mode" in payload).toBe(false);
+    // What it DID edit is stated explicitly.
     expect(payload.prompts_dir).toBe("/home/me/qontinui-dev-notes/plans/prompts");
     expect(payload.plans_dir).toBe(SAVED.plans_dir);
 
-    const falseStrict = buildPathSettingsPayload(
-      { ...SAVED, strict_mode: false },
+    // And it is genuinely independent of the loaded value, not accidentally
+    // absent because SAVED happened to lack it.
+    const withArchive = buildPathSettingsPayload(
+      { ...SAVED, strict_mode: false, plans_archive_dir: "/loaded/archive" },
       draftsFrom(SAVED),
     );
-    expect(falseStrict.strict_mode).toBe(false);
+    expect("plans_archive_dir" in withArchive).toBe(false);
+    expect("strict_mode" in withArchive).toBe(false);
   });
 
   it("trims what it does send", () => {
@@ -500,6 +513,12 @@ const MULTI: PathSettings = {
   plans_dir: "/device/plans",
   strict_mode: false,
   plans_dir_by_tenant: { [TENANT_B]: "/b/plans", [TENANT_GONE]: "/gone/plans" },
+  // All THREE maps are populated on purpose. With the archive map absent, the
+  // omission test's `"plans_archive_dir_by_tenant" in payload === false`
+  // assertion passed whether or not the builder deleted it — one of the three
+  // deletes was pinned by nothing, and the suite stayed green when it was
+  // removed.
+  plans_archive_dir_by_tenant: { [TENANT_A]: "/a/archive" },
   prompts_dir_by_tenant: { [TENANT_A]: "/a/prompts" },
 };
 
@@ -508,8 +527,13 @@ describe("tenantPathMap — an absent map reads as empty, never undefined", () =
     for (const field of ["plans_dir", "plans_archive_dir", "prompts_dir"] as const) {
       expect(tenantPathMap(SAVED, field)).toEqual({});
     }
-    expect(tenantPathMap(MULTI, "plans_archive_dir")).toEqual({});
+    expect(tenantPathMap(SAVED, "plans_archive_dir")).toEqual({});
     expect(tenantPathMap(MULTI, "plans_dir")).toEqual(MULTI.plans_dir_by_tenant);
+    // A COPY, not the live reference — mutating what comes back must not edit
+    // the loaded struct.
+    const borrowed = tenantPathMap(MULTI, "plans_dir");
+    borrowed["injected"] = "/nope";
+    expect(MULTI.plans_dir_by_tenant).not.toHaveProperty("injected");
   });
 });
 
@@ -603,7 +627,7 @@ describe("tenantDraftsFrom / tenantDraftsAreDirty", () => {
 
 describe("storedTenantOverrideCount", () => {
   it("counts every entry across all three maps", () => {
-    expect(storedTenantOverrideCount(MULTI)).toBe(3);
+    expect(storedTenantOverrideCount(MULTI)).toBe(4);
     expect(storedTenantOverrideCount(SAVED)).toBe(0);
   });
 });

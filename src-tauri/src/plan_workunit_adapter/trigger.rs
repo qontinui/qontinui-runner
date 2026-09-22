@@ -9265,6 +9265,32 @@ mod tests {
         );
     }
 
+    /// The SCALAR arm trims what it returns, exactly as the per-tenant arm does.
+    ///
+    /// Pinned separately because nothing else can see it: the product test
+    /// `an_empty_map_resolves_exactly_as_the_device_scalar_for_every_input` uses
+    /// `non_blank(scalar)` as its own oracle, so it stays green whatever
+    /// `non_blank` does, and `a_blank_entry_is_unset_per_entry_…` pins trimming
+    /// on the map arm only. Without this, the asymmetry could return unnoticed:
+    /// a hand-edited `settings.json` holding `" /x "` would export
+    /// `QONTINUI_PLANS_DIR=" /x "` from the scalar and `/x` from a map entry —
+    /// one directory, two spellings, through one resolver.
+    #[test]
+    fn the_scalar_arm_trims_exactly_as_the_per_tenant_arm_does() {
+        assert_eq!(
+            resolve_plans_dir(Some("  /x \t".to_string()), &no_overrides(), None).as_deref(),
+            Some("/x")
+        );
+        assert_eq!(
+            resolve_plans_archive_dir(Some(" /y ".to_string()), &no_overrides(), None).as_deref(),
+            Some("/y")
+        );
+        assert_eq!(
+            resolve_prompts_dir(Some("\t/z ".to_string()), &no_overrides(), None).as_deref(),
+            Some("/z")
+        );
+    }
+
     // ---- per-tenant resolution ---------------------------------------------
     //
     // These pin the RESOLVER's contract (which of the two rungs answers), not
