@@ -419,10 +419,16 @@ export function draftsFrom(configured: PathSettings): PathDrafts {
 /**
  * The struct to send to `save_path_settings`.
  *
- * Starts from the LOADED struct so every field the panel does not edit
- * (`plans_archive_dir`, `strict_mode`) round-trips untouched, then overwrites
- * only the four edited fields — DELETING a key whose draft is blank rather
- * than writing `""`, because absent is the wire form of unset.
+ * Built from an EMPTY object, stating only what this panel actually edited — see
+ * the comment in the body for why the old `{ ...saved }` spread was the bug. A
+ * field the panel does not edit (`plans_archive_dir`, `strict_mode`) is therefore
+ * OMITTED, and the runner's patch merge is what leaves it untouched; nothing
+ * round-trips through here. A shown-but-emptied box sends an explicit `null`,
+ * which is the wire form of "clear".
+ *
+ * `saved` is not read by this function and is retained only to avoid churning
+ * the call site and its tests; it carries no meaning. Do not reintroduce a
+ * spread of it.
  *
  * The MAP fields go the other way, for the reason the module doc gives: the save
  * merges them, so `{}` is how an emptied box says "cleared" and an absent key

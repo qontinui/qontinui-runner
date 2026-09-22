@@ -1169,8 +1169,10 @@ async fn get_path_settings(
 /// PUT /settings/paths
 ///
 /// Body: a `commands::path_settings::PathSettingsPatch`. Blank strings are
-/// stored as unset. The five scalar path fields are **replaced** — absent means
-/// unset, which is what the panel sends. The four keyed maps
+/// stored as unset. **Absence never changes a stored value, for every field.**
+/// The five scalar path fields read `null` as unset and a string as set, so an
+/// omitted scalar SURVIVES — do not re-send one to preserve it, which is the
+/// lost update the patch retired. The four keyed maps
 /// (`plans_dir_by_tenant`, `plans_archive_dir_by_tenant`,
 /// `prompts_dir_by_tenant`, `repo_checkouts`) are **merged**: absent or `null`
 /// leaves the stored map untouched, and `{}` is a deliberate clear.

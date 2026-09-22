@@ -497,13 +497,19 @@ pub fn get_path_settings(tenant_id: Option<String>) -> Result<PathSettingsView, 
 
 /// Persist the `paths` section and echo the fresh device view.
 ///
-/// Blank strings are stored as unset. The five scalars are **replaced** —
-/// absent means unset. The four keyed maps (`plans_dir_by_tenant`,
-/// `plans_archive_dir_by_tenant`, `prompts_dir_by_tenant`, `repo_checkouts`) are
-/// **merged**: absent or `null` leaves the stored map untouched, and `{}` is a
-/// deliberate clear. That is a server-side guarantee, so a caller unaware of a
-/// map cannot erase it — which a whole-struct replace allowed until this patch
-/// type existed.
+/// Blank strings are stored as unset. **Absence never changes a stored value,
+/// for EVERY field — scalars included, not just the maps.** The five scalars
+/// read `null` as unset and a string as set; the four keyed maps
+/// (`plans_dir_by_tenant`, `plans_archive_dir_by_tenant`,
+/// `prompts_dir_by_tenant`, `repo_checkouts`) read `{}` as a deliberate clear,
+/// and absent or `null` as "leave the stored map alone".
+///
+/// That is a server-side guarantee, so a caller unaware of a field cannot erase
+/// it — which the whole-struct replace this patch type retired allowed for every
+/// field. **So do NOT re-send a field you are not changing in order to preserve
+/// it.** Re-sending a value you read earlier is the lost update the patch exists
+/// to remove: it overwrites whatever a concurrent writer put there in between.
+/// The per-field rules are on [`PathSettingsPatch`]'s own fields.
 #[tauri::command]
 pub fn save_path_settings(settings: PathSettingsPatch) -> Result<PathSettingsView, String> {
     save(settings)
@@ -591,8 +597,21 @@ mod tests {
             ]
             .into_iter()
             .collect(),
-            plans_archive_dir_by_tenant: Default::default(),
-            prompts_dir_by_tenant: Default::default(),
+            // Populated, NOT Default: with these empty, deleting the
+            // `normalize_entries` call for either map left every test green,
+            // so the per-entry blank rule was pinned for one map of three.
+            plans_archive_dir_by_tenant: [
+                (format!(" {TENANT_A} "), " /a/archive ".to_string()),
+                ("archive-blank-value".to_string(), "  ".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            prompts_dir_by_tenant: [
+                (format!(" {TENANT_A} "), " /a/prompts ".to_string()),
+                ("prompts-blank-value".to_string(), " ".to_string()),
+            ]
+            .into_iter()
+            .collect(),
             repo_checkouts: [
                 (" acme/app ".to_string(), " /src/acme/app ".to_string()),
                 ("acme/blank-path".to_string(), "   ".to_string()),
@@ -627,6 +646,21 @@ mod tests {
                 ("not-a-uuid".to_string(), "/still/kept".to_string()),
             ],
             "a blank key or value is dropped and the survivors trimmed — but an              UNPARSEABLE key is preserved (D2: the operator may be re-pairing)"
+        );
+        // The same per-entry rule on the other two tenant maps. Deleting
+        // either `normalize_entries` call at the top of `normalize` fails here.
+        assert_eq!(
+            stored
+                .plans_archive_dir_by_tenant
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![(TENANT_A.to_string(), "/a/archive".to_string())],
+            "archive map: key and value trimmed, the blank-valued entry dropped"
+        );
+        assert_eq!(
+            stored.prompts_dir_by_tenant.into_iter().collect::<Vec<_>>(),
+            vec![(TENANT_A.to_string(), "/a/prompts".to_string())],
+            "prompts map: key and value trimmed, the blank-valued entry dropped"
         );
         assert!(stored.strict_mode);
     }
@@ -828,6 +862,16 @@ mod tests {
             plans_dir_by_tenant: [(TENANT_A.to_string(), "/a/plans".to_string())]
                 .into_iter()
                 .collect(),
+            // All FOUR maps are populated on purpose. With these two empty,
+            // swapping their `unwrap_or_else(|| stored…)` for
+            // `unwrap_or_default()` left every test green — the branch's
+            // headline claim was pinned for two maps of four.
+            plans_archive_dir_by_tenant: [(TENANT_A.to_string(), "/a/archive".to_string())]
+                .into_iter()
+                .collect(),
+            prompts_dir_by_tenant: [(TENANT_A.to_string(), "/a/prompts".to_string())]
+                .into_iter()
+                .collect(),
             repo_checkouts: [(
                 "portofino-pizzeria/mobile".to_string(),
                 "/elsewhere/mobile".to_string(),
@@ -863,6 +907,8 @@ mod tests {
         let patch: PathSettingsPatch =
             serde_json::from_value(pre_change_body).expect("a pre-change body must deserialize");
         assert_eq!(patch.plans_dir_by_tenant, None, "absent, not empty");
+        assert_eq!(patch.plans_archive_dir_by_tenant, None, "absent, not empty");
+        assert_eq!(patch.prompts_dir_by_tenant, None, "absent, not empty");
         assert_eq!(patch.repo_checkouts, None, "absent, not empty");
 
         let merged = merge(&stored_with_both_maps(), patch);
@@ -879,9 +925,24 @@ mod tests {
             Some("/elsewhere/mobile"),
             "the same latent defect repo_checkouts carried is fixed, not routed around"
         );
+        assert_eq!(
+            merged
+                .plans_archive_dir_by_tenant
+                .get(TENANT_A)
+                .map(String::as_str),
+            Some("/a/archive"),
+            "a caller unaware of plans_archive_dir_by_tenant must not erase it"
+        );
+        assert_eq!(
+            merged
+                .prompts_dir_by_tenant
+                .get(TENANT_A)
+                .map(String::as_str),
+            Some("/a/prompts"),
+            "a caller unaware of prompts_dir_by_tenant must not erase it"
+        );
         assert_eq!(merged.plans_dir.as_deref(), Some("/device/plans"));
     }
-
 
     /// **The round-2 finding, as a test.** The first cut of the patch made only
     /// the MAPS absent-means-keep and left the scalars on replace, justified by
