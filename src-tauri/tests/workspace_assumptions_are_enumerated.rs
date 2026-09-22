@@ -1753,7 +1753,10 @@ fn constructs_that_end_early_do_not_swallow_later_hits() {
         // `Console::` qualification, and `win_only` keeps its structural row.
         ("os_bound_tooling", "Console::launcher"),
         ("os_bound_tooling", "Console::win_only"),
-        // The attribute-shaped lines inside `TEMPLATE` are data, not a region.
+        // These two rows show only that the template does not swallow what
+        // FOLLOWS it — they stand with the skeleton gate and without it. The
+        // gate itself is pinned by
+        // `attribute_shaped_lines_inside_string_literals_are_data`.
         ("dev_ports", "after_template"),
         ("supervisor_dependency", "after_template"),
     ]
@@ -1823,9 +1826,11 @@ fn cfg_predicates_are_parsed_not_prefix_matched() {
 /// Pinned HERE rather than in `must_report.rs.txt`, because a template's bogus
 /// region is unobservable through the hits AFTER it: never entered (the
 /// skeleton blanks the template's braces), it dies at the next `;` or `,` at
-/// its own depth, or at the enclosing `}`. The one place it shows is the line
-/// that OPENS it — a region suppresses its own opening line — so that is what
-/// this asserts.
+/// its own depth, or at the enclosing `}`. Only a hit INSIDE the live region
+/// shows it; the line that OPENS it is the smallest such case, and is what
+/// this asserts. The third gate site, `cfg_mod_decls`, is NOT pinned here: it
+/// needs a `#[cfg(test)]` and a `mod x;` both inside one literal to fake a
+/// whole-file skip, and no such shape exists.
 #[test]
 fn attribute_shaped_lines_inside_string_literals_are_data() {
     let st = Structure::new();
