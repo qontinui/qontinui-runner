@@ -1423,6 +1423,7 @@ mod tests {
             status: status.to_string(),
             depends_on: vec!["2026-01-01-dep".to_string()],
             area: None,
+            area_rejected: None,
             phases: vec![ParsedPhase {
                 index: 1,
                 name: "Phase 1 — x".to_string(),
