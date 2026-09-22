@@ -16,7 +16,7 @@
 //! |-------------------------|----------------|
 //! | `repo_layout`           | sibling-repo names as path components in string literals (`ui-bridge` only as a bare name, `../ui-bridge` or `ui-bridge/packages`); `QONTINUI_ROOT` reads |
 //! | `dev_ports`             | `:8000` `:3001` `:9875` `:5432` `:5433` `:6379` `:9000` as host:port literals |
-//! | `supervisor_dependency` | `9875` / supervisor URL, port or client call sites |
+//! | `supervisor_dependency` | `9875` / supervisor URL, port or client call sites; calls to supervisor-named snake_case helpers |
 //! | `plans_dir`             | `.plans_dir` / `QONTINUI_PLANS_DIR` reads |
 //! | `tenant_literal`        | UUID literals |
 //! | `os_bound_tooling`      | `powershell` `pwsh` `cmd.exe` `taskkill` `schtasks` `.ps1` literals outside `cfg(windows)`; and a `cfg(windows)` fn with no non-windows sibling of the same name in its file |
@@ -42,8 +42,11 @@
 //! Every row carries a disposition from `docs/workspace-assumptions.dispositions.toml`,
 //! keyed by `(class, file, symbol)` — SYMBOL-keyed, so line drift does not orphan
 //! them — one of `unreviewed` (the default for a key with no entry),
-//! `fallback_correct`, `dev_only_surface`, or `defect(<plan stem>)`. A disposition
-//! entry whose key no longer matches any hit is itself staleness.
+//! `fallback_correct`, `dev_only_surface`, or `defect(<plan stem>)` — a defect
+//! cites the plan that owns its fix. Each entry lists the `reviewed` excerpts it
+//! was judged against; a new excerpt under the same key renders `unreviewed`
+//! (`NEW since review`) instead of inheriting the verdict. An entry, or a
+//! reviewed excerpt, that no longer matches any hit is itself staleness.
 //!
 //! `repo_layout` rows whose enclosing symbol is named in a `CAPABILITY_SPECS`
 //! `anchor` carry that row's id in `capability`; a `repo_layout` row with no
@@ -67,8 +70,8 @@ use std::path::{Path, PathBuf};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-/// The plan whose Phase 4 this is — the stem `defect(...)` dispositions cite
-/// when no dedicated defect plan exists yet.
+/// The plan whose Phase 4 this roster is. NOT what a `defect(...)` cites: a
+/// defect cites the plan that owns its fix.
 const PLAN_STEM: &str = "2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports";
 
 /// Vacuity floor on the number of `.rs` files actually scanned.
@@ -159,6 +162,18 @@ const CLASSES: &[ClassSpec] = &[
                 pattern: r"\b9875\b",
                 // `\u{9875}` is a CJK character escape, not a port.
                 exclude: Some(r"\\u\{9875\}"),
+            },
+            PatternSpec {
+                target: Target::Code,
+                // A call to any snake_case helper named for the supervisor —
+                // `check_supervisor_available()`, `supervisor_injected_reading()`.
+                // …or passes one by path as an argument
+                // (`spawn_blocking(auto_continue::check_supervisor_available)`).
+                // The in-process `worker_supervisor` / `task_supervisor`
+                // MODULES are not the dev supervisor, and a module path is
+                // followed by `::`, never by `,` or `)`.
+                pattern: r"\b[a-z0-9_]*(?:_supervisor|supervisor_)[a-z0-9_]*\s*\(|::[a-z0-9_]*(?:_supervisor|supervisor_)[a-z0-9_]*\s*[,)]",
+                exclude: None,
             },
             PatternSpec {
                 target: Target::Code,
@@ -414,44 +429,208 @@ fn lex(src: &str) -> Vec<Line> {
         cur!().skel.push(c);
         i += 1;
     }
-    lines
+    join_attribute_lines(lines)
+}
+
+/// Fold an attribute spanning several lines (`#[cfg(all(\n test,\n …))]`) into
+/// ONE logical line, so everything downstream sees the whole predicate. Line
+/// numbers are never reported, so merging lines costs nothing.
+fn join_attribute_lines(lines: Vec<Line>) -> Vec<Line> {
+    let balance = |s: &str| {
+        s.chars().fold(0i32, |b, c| match c {
+            '[' => b + 1,
+            ']' => b - 1,
+            _ => b,
+        })
+    };
+    let mut out: Vec<Line> = Vec::with_capacity(lines.len());
+    let mut iter = lines.into_iter();
+    while let Some(mut line) = iter.next() {
+        let t = line.skel.trim_start();
+        if t.starts_with("#[") || t.starts_with("#![") {
+            let mut open = balance(&line.skel);
+            let mut joined = 0;
+            while open > 0 && joined < 40 {
+                let Some(next) = iter.next() else { break };
+                open += balance(&next.skel);
+                line.code.push(' ');
+                line.code.push_str(&next.code);
+                line.skel.push(' ');
+                line.skel.push_str(&next.skel);
+                line.literals.extend(next.literals);
+                joined += 1;
+            }
+        }
+        out.push(line);
+    }
+    out
 }
 
 // ===========================================================================
 // Structure — enclosing symbol, cfg(test) / cfg(windows) regions.
 // ===========================================================================
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum CfgKind {
-    Test,
-    Windows,
-    NotWindows,
+/// A parsed `cfg(...)` predicate.
+#[derive(Debug)]
+enum Pred {
+    Atom(String, Option<String>),
+    All(Vec<Pred>),
+    Any(Vec<Pred>),
+    Not(Box<Pred>),
 }
 
-fn attr_kind(attr: &str) -> Option<CfgKind> {
-    let a: String = attr.chars().filter(|c| !c.is_whitespace()).collect();
-    if a.starts_with("#[cfg(test)]") || a.starts_with("#[cfg(all(test,") {
-        return Some(CfgKind::Test);
+#[derive(Debug, PartialEq)]
+enum Tok {
+    Ident(String),
+    Str(String),
+    LParen,
+    RParen,
+    Comma,
+    Eq,
+}
+
+fn tokenize_cfg(s: &str) -> Vec<Tok> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '(' => out.push(Tok::LParen),
+            ')' => out.push(Tok::RParen),
+            ',' => out.push(Tok::Comma),
+            '=' => out.push(Tok::Eq),
+            '"' => {
+                let mut j = i + 1;
+                let mut v = String::new();
+                while j < chars.len() && chars[j] != '"' {
+                    v.push(chars[j]);
+                    j += 1;
+                }
+                out.push(Tok::Str(v));
+                i = j;
+            }
+            c if is_ident(c) => {
+                let mut v = String::new();
+                while i < chars.len() && is_ident(chars[i]) {
+                    v.push(chars[i]);
+                    i += 1;
+                }
+                out.push(Tok::Ident(v));
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
     }
-    if a.starts_with("#[cfg(windows)]")
-        || a.starts_with("#[cfg(target_os=\"windows\")]")
-        || a.starts_with("#[cfg(all(windows,")
-        || a.starts_with("#[cfg(all(target_os=\"windows\",")
-    {
-        return Some(CfgKind::Windows);
+    out
+}
+
+fn parse_pred(toks: &[Tok], i: &mut usize) -> Option<Pred> {
+    let Some(Tok::Ident(name)) = toks.get(*i) else {
+        return None;
+    };
+    *i += 1;
+    match toks.get(*i) {
+        Some(Tok::LParen) if matches!(name.as_str(), "all" | "any" | "not") => {
+            *i += 1;
+            let mut items = Vec::new();
+            while !matches!(toks.get(*i), Some(Tok::RParen) | None) {
+                items.push(parse_pred(toks, i)?);
+                if toks.get(*i) == Some(&Tok::Comma) {
+                    *i += 1;
+                }
+            }
+            *i += 1; // `)`
+            Some(match name.as_str() {
+                "all" => Pred::All(items),
+                "any" => Pred::Any(items),
+                _ => Pred::Not(Box::new(items.into_iter().next()?)),
+            })
+        }
+        Some(Tok::Eq) => {
+            *i += 1;
+            let Some(Tok::Str(v)) = toks.get(*i) else {
+                return None;
+            };
+            *i += 1;
+            Some(Pred::Atom(name.clone(), Some(v.clone())))
+        }
+        _ => Some(Pred::Atom(name.clone(), None)),
     }
-    if a.starts_with("#[cfg(not(windows))]")
-        || a.starts_with("#[cfg(not(target_os=\"windows\"))]")
-        || a.starts_with("#[cfg(unix)]")
-        || a.starts_with("#[cfg(target_os=\"linux\")]")
-        || a.starts_with("#[cfg(target_os=\"macos\")]")
-        || a.starts_with("#[cfg(any(unix")
-        || a.starts_with("#[cfg(any(target_os=\"linux\"")
-        || a.starts_with("#[cfg(any(target_os=\"macos\"")
-    {
-        return Some(CfgKind::NotWindows);
+}
+
+/// The predicate of a `#[cfg(...)]` / `#![cfg(...)]` attribute (not `cfg_attr`).
+fn cfg_pred(attr: &str) -> Option<Pred> {
+    let t = attr.trim();
+    let inner = t.strip_prefix("#![").or_else(|| t.strip_prefix("#["))?.trim_start();
+    let rest = inner.strip_prefix("cfg")?.trim_start();
+    let rest = rest.strip_prefix('(')?;
+    let toks = tokenize_cfg(rest);
+    parse_pred(&toks, &mut 0)
+}
+
+/// Does every configuration satisfying `p` also satisfy `atom`? `test` under
+/// `all(...)` counts, under `not(...)` does not, under `any(...)` only when
+/// every branch requires it.
+fn requires(p: &Pred, atom: &dyn Fn(&str, Option<&str>) -> bool) -> bool {
+    match p {
+        Pred::Atom(n, v) => atom(n, v.as_deref()),
+        Pred::All(xs) => xs.iter().any(|x| requires(x, atom)),
+        Pred::Any(xs) => !xs.is_empty() && xs.iter().all(|x| requires(x, atom)),
+        Pred::Not(_) => false,
     }
-    None
+}
+
+fn is_test_atom(n: &str, v: Option<&str>) -> bool {
+    n == "test" && v.is_none()
+}
+
+fn is_windows_atom(n: &str, v: Option<&str>) -> bool {
+    (n == "windows" && v.is_none()) || (matches!(n, "target_os" | "target_family") && v == Some("windows"))
+}
+
+fn is_unixish_atom(n: &str, v: Option<&str>) -> bool {
+    (n == "unix" && v.is_none())
+        || (n == "target_family" && v == Some("unix"))
+        || (n == "target_os"
+            && matches!(v, Some("linux" | "macos" | "android" | "ios" | "freebsd" | "openbsd" | "netbsd" | "dragonfly")))
+}
+
+/// Does `p` exclude Windows (`not(windows)`, `unix`, `target_os = "linux"`, …)?
+fn excludes_windows(p: &Pred) -> bool {
+    match p {
+        Pred::Atom(n, v) => is_unixish_atom(n, v.as_deref()),
+        Pred::Not(inner) => requires(inner, &is_windows_atom),
+        Pred::All(xs) => xs.iter().any(excludes_windows),
+        Pred::Any(xs) => !xs.is_empty() && xs.iter().all(excludes_windows),
+    }
+}
+
+/// What a set of attributes on ONE item says about when it compiles.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct CfgFlags {
+    test: bool,
+    windows: bool,
+    not_windows: bool,
+}
+
+impl CfgFlags {
+    fn of(attrs: &[String]) -> Self {
+        let mut f = CfgFlags::default();
+        for a in attrs {
+            if let Some(p) = cfg_pred(a) {
+                f.test |= requires(&p, &is_test_atom);
+                f.windows |= requires(&p, &is_windows_atom);
+                f.not_windows |= excludes_windows(&p);
+            }
+        }
+        f
+    }
+
+    fn any(self) -> bool {
+        self.test || self.windows || self.not_windows
+    }
 }
 
 /// Split leading outer attributes off a trimmed code line. Returns the
@@ -476,7 +655,6 @@ fn split_attrs(line: &str) -> (Vec<String>, String) {
             }
         }
         let Some(end) = end else {
-            // Multi-line attribute: treat the whole line as attribute text.
             attrs.push(rest.to_string());
             return (attrs, String::new());
         };
@@ -486,10 +664,39 @@ fn split_attrs(line: &str) -> (Vec<String>, String) {
     (attrs, rest.to_string())
 }
 
+/// Does the text after the attributes start an ITEM (ends in `;` or a `{}`
+/// body) rather than a struct field, enum variant or match arm (ends in `,`
+/// or at the enclosing `}`)?
+fn starts_item(rest: &str) -> bool {
+    let mut r = rest.trim_start();
+    if let Some(after) = r.strip_prefix("pub") {
+        let after = after.trim_start();
+        r = if after.starts_with('(') {
+            after.find(')').map_or(after, |i| after[i + 1..].trim_start())
+        } else {
+            after
+        };
+    }
+    let word: String = r.chars().take_while(|c| is_ident(*c) || *c == '!').collect();
+    matches!(
+        word.as_str(),
+        "fn" | "impl" | "mod" | "struct" | "enum" | "trait" | "use" | "const" | "static" | "type"
+            | "extern" | "unsafe" | "async" | "union" | "macro_rules!" | "let"
+    )
+}
+
+/// One cfg'd item currently open. Regions nest (a `cfg(test)` module inside a
+/// `cfg(windows)` one), so they live on a stack.
 struct Region {
-    kind: CfgKind,
+    flags: CfgFlags,
     start_depth: i32,
+    start_bracket: i32,
     entered: bool,
+    /// A field / variant / match arm: it ends at the next `,` on its own level.
+    comma_closes: bool,
+    /// An `extern "…" { fn …; }` block: its fns are FFI declarations, not
+    /// implementations, so they never enter the windows-sibling check.
+    ffi: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -558,9 +765,9 @@ impl Structure {
         (!name.is_empty()).then_some(name)
     }
 
-    /// `(mod name, #[path] override)` for every `mod x;` declaration carrying
-    /// the given cfg kind.
-    fn cfg_mod_decls(&self, lines: &[Line], want: CfgKind) -> Vec<(String, Option<String>)> {
+    /// `(mod name, #[path] override)` for every `mod x;` declaration whose cfg
+    /// satisfies `want`.
+    fn cfg_mod_decls(&self, lines: &[Line], want: fn(CfgFlags) -> bool) -> Vec<(String, Option<String>)> {
         let mut out = Vec::new();
         let mut pending: Vec<String> = Vec::new();
         for line in lines {
@@ -569,7 +776,7 @@ impl Structure {
             if rest.is_empty() {
                 continue;
             }
-            if pending.iter().any(|a| attr_kind(a) == Some(want)) {
+            if want(CfgFlags::of(&pending)) {
                 if let Some(c) = self.mod_decl_re.captures(&rest) {
                     let path = pending
                         .iter()
@@ -582,16 +789,11 @@ impl Structure {
         out
     }
 
-    fn inner_cfg(&self, lines: &[Line], want: CfgKind) -> bool {
+    /// An inner `#![cfg(...)]` on the file itself.
+    fn inner_cfg(&self, lines: &[Line], want: fn(CfgFlags) -> bool) -> bool {
         lines.iter().any(|l| {
-            let t: String = l.code.chars().filter(|c| !c.is_whitespace()).collect();
-            match want {
-                CfgKind::Test => t.starts_with("#![cfg(test)]"),
-                CfgKind::Windows => {
-                    t.starts_with("#![cfg(windows)]") || t.starts_with("#![cfg(target_os=\"windows\")]")
-                }
-                CfgKind::NotWindows => false,
-            }
+            let t = l.code.trim_start();
+            t.starts_with("#![") && want(CfgFlags::of(&[t.to_string()]))
         })
     }
 }
@@ -627,7 +829,7 @@ fn scan_source(
     let mut pending_impl: Option<String> = None;
     let mut const_ctx: Option<(String, i32)> = None;
     let mut pending_attrs: Vec<String> = Vec::new();
-    let mut region: Option<Region> = None;
+    let mut regions: Vec<Region> = Vec::new();
     // cfg(windows) / non-windows fn names, for the sibling rule.
     let mut windows_fns: Vec<(String, String)> = Vec::new(); // (qualified symbol, bare name)
     let mut other_os_fns: BTreeSet<String> = BTreeSet::new();
@@ -636,45 +838,24 @@ fn scan_source(
         let skel_t = line.skel.trim();
 
         // ---- attributes / item starts --------------------------------------
+        // Attributes are read INSIDE open regions too: a `cfg(test)` module
+        // inside a `cfg(windows)` one is its own, nested region.
         let mut line_fn_name: Option<String> = st.fn_re.captures(&line.skel).map(|c| c[1].to_string());
-        if region.is_none() {
+        {
             let (attrs, rest) = split_attrs(&line.code);
             let had_attrs = !attrs.is_empty();
             pending_attrs.extend(attrs);
             if !rest.is_empty() && !pending_attrs.is_empty() {
-                let kinds: Vec<CfgKind> = pending_attrs.iter().filter_map(|a| attr_kind(a)).collect();
-                let kind = if kinds.contains(&CfgKind::Test) {
-                    Some(CfgKind::Test)
-                } else if kinds.contains(&CfgKind::Windows) {
-                    Some(CfgKind::Windows)
-                } else if kinds.contains(&CfgKind::NotWindows) {
-                    Some(CfgKind::NotWindows)
-                } else {
-                    None
-                };
-                match kind {
-                    Some(CfgKind::NotWindows) => {
-                        if let Some(name) = &line_fn_name {
-                            other_os_fns.insert(name.clone());
-                        }
-                    }
-                    Some(k) => {
-                        if k == CfgKind::Windows {
-                            if let Some(name) = &line_fn_name {
-                                let q = match impl_stack.last() {
-                                    Some((t, _)) => format!("{t}::{name}"),
-                                    None => name.clone(),
-                                };
-                                windows_fns.push((q, name.clone()));
-                            }
-                        }
-                        region = Some(Region {
-                            kind: k,
-                            start_depth: depth,
-                            entered: false,
-                        });
-                    }
-                    None => {}
+                let flags = CfgFlags::of(&pending_attrs);
+                if flags.any() {
+                    regions.push(Region {
+                        flags,
+                        start_depth: depth,
+                        start_bracket: bracket,
+                        entered: false,
+                        comma_closes: !starts_item(&rest),
+                        ffi: rest.trim_start().trim_start_matches("unsafe ").trim_start().starts_with("extern"),
+                    });
                 }
                 pending_attrs.clear();
             } else if !rest.is_empty() || (!had_attrs && !skel_t.is_empty()) {
@@ -682,8 +863,26 @@ fn scan_source(
             }
         }
 
-        let in_test = matches!(&region, Some(r) if r.kind == CfgKind::Test);
-        let in_windows = whole_file_windows || matches!(&region, Some(r) if r.kind == CfgKind::Windows);
+        let in_test = regions.iter().any(|r| r.flags.test);
+        let in_windows = whole_file_windows || regions.iter().any(|r| r.flags.windows);
+
+        // ---- the windows-sibling bookkeeping --------------------------------
+        // A fn is platform-bound when an open region says so and the fn sits at
+        // item level inside it (not a local fn nested in another fn's body).
+        if let (Some(name), false) = (&line_fn_name, in_test) {
+            let item_level = |r: &Region| fn_stack.last().is_none_or(|(_, d)| *d <= r.start_depth);
+            if regions.iter().any(|r| r.ffi) {
+                // FFI declaration — no body to have a sibling of.
+            } else if regions.iter().any(|r| r.flags.not_windows && item_level(r)) {
+                other_os_fns.insert(name.clone());
+            } else if regions.iter().any(|r| r.flags.windows && !r.flags.test && item_level(r)) {
+                let q = match impl_stack.last() {
+                    Some((t, _)) => format!("{t}::{name}"),
+                    None => name.clone(),
+                };
+                windows_fns.push((q, name.clone()));
+            }
+        }
 
         // ---- symbol for hits on this line ----------------------------------
         if fn_stack.is_empty() && const_ctx.is_none() {
@@ -785,7 +984,7 @@ fn scan_source(
                     } else if let Some(name) = pending_impl.take() {
                         impl_stack.push((name, depth));
                     }
-                    if let Some(r) = region.as_mut() {
+                    for r in regions.iter_mut() {
                         if !r.entered && depth == r.start_depth + 1 {
                             r.entered = true;
                         }
@@ -802,19 +1001,25 @@ fn scan_source(
                     if const_ctx.as_ref().is_some_and(|(_, d)| *d > depth) {
                         const_ctx = None;
                     }
-                    if region.as_ref().is_some_and(|r| r.entered && depth == r.start_depth) {
-                        region = None;
-                    }
+                    // An entered item closes at its own `}`; anything — a field,
+                    // variant or arm with no trailing comma — closes when the
+                    // enclosing block does.
+                    regions.retain(|r| !((r.entered && depth == r.start_depth) || depth < r.start_depth));
                 }
-                ';' if bracket == 0 => {
-                    pending_fn = None;
-                    pending_impl = None;
-                    if const_ctx.as_ref().is_some_and(|(_, d)| *d == depth) {
-                        const_ctx = None;
+                ';' => {
+                    if bracket == 0 {
+                        pending_fn = None;
+                        pending_impl = None;
+                        if const_ctx.as_ref().is_some_and(|(_, d)| *d == depth) {
+                            const_ctx = None;
+                        }
                     }
-                    if region.as_ref().is_some_and(|r| !r.entered && depth == r.start_depth) {
-                        region = None;
-                    }
+                    regions.retain(|r| !(!r.entered && depth == r.start_depth && bracket == r.start_bracket));
+                }
+                ',' => {
+                    regions.retain(|r| {
+                        !(r.comma_closes && !r.entered && depth == r.start_depth && bracket == r.start_bracket)
+                    });
                 }
                 _ => {}
             }
@@ -897,10 +1102,10 @@ fn scan_tree(src_root: &Path, rel_base: &Path) -> ScanResult {
             continue;
         };
         let lines = lex(&src);
-        if st.inner_cfg(&lines, CfgKind::Test) {
+        if st.inner_cfg(&lines, |f| f.test) {
             inner_test.insert(f.clone());
         }
-        if st.inner_cfg(&lines, CfgKind::Windows) {
+        if st.inner_cfg(&lines, |f| f.windows && !f.test) {
             windows_files.insert(f.clone());
         }
         let parent = f.parent().unwrap_or(src_root).to_path_buf();
@@ -910,8 +1115,12 @@ fn scan_tree(src_root: &Path, rel_base: &Path) -> ScanResult {
             parent.join(f.file_stem().unwrap_or_default())
         };
         for (kind, set_f, set_d) in [
-            (CfgKind::Test, &mut test_files, &mut test_dirs),
-            (CfgKind::Windows, &mut windows_files, &mut windows_dirs),
+            (
+                (|f: CfgFlags| f.test) as fn(CfgFlags) -> bool,
+                &mut test_files,
+                &mut test_dirs,
+            ),
+            (|f: CfgFlags| f.windows && !f.test, &mut windows_files, &mut windows_dirs),
         ] {
             for (name, path) in st.cfg_mod_decls(&lines, kind) {
                 if let Some(p) = path {
@@ -978,6 +1187,17 @@ struct DispositionEntry {
     disposition: String,
     #[serde(default)]
     note: Option<String>,
+    /// The exact excerpts this disposition was reviewed against. A hit under
+    /// the same key with any OTHER excerpt renders `unreviewed` — a new
+    /// assumption never silently inherits an old verdict.
+    #[serde(default)]
+    reviewed: Vec<String>,
+}
+
+struct Disposition {
+    disposition: String,
+    note: Option<String>,
+    reviewed: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1012,7 +1232,7 @@ fn valid_disposition(d: &str) -> bool {
 
 type Key = (String, String, String);
 
-fn load_dispositions(root: &Path) -> Result<BTreeMap<Key, (String, Option<String>)>, String> {
+fn load_dispositions(root: &Path) -> Result<BTreeMap<Key, Disposition>, String> {
     let path = root.join(DISPOSITIONS_TOML);
     let text = fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let parsed: DispositionsFile = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -1025,8 +1245,20 @@ fn load_dispositions(root: &Path) -> Result<BTreeMap<Key, (String, Option<String
                 e.disposition, e.class, e.file, e.symbol
             ));
         }
+        if e.disposition != "unreviewed" && e.reviewed.is_empty() {
+            return Err(format!(
+                "disposition {:?} for ({}, {}, {}) lists no `reviewed` excerpts — record the \
+                 excerpt(s) it was reviewed against",
+                e.disposition, e.class, e.file, e.symbol
+            ));
+        }
         let key = (e.class.clone(), e.file.clone(), e.symbol.clone());
-        if out.insert(key, (e.disposition, e.note)).is_some() {
+        let d = Disposition {
+            disposition: e.disposition,
+            note: e.note,
+            reviewed: e.reviewed.into_iter().collect(),
+        };
+        if out.insert(key, d).is_some() {
             return Err(format!("duplicate disposition key ({}, {}, {})", e.class, e.file, e.symbol));
         }
     }
@@ -1035,6 +1267,8 @@ fn load_dispositions(root: &Path) -> Result<BTreeMap<Key, (String, Option<String
 
 /// `(capability id, identifier tokens of its anchor)` for every CAPABILITY_SPECS
 /// row, read as TEXT out of `capability_manifest.rs` (this test builds no binary).
+/// Parsed per `CapabilitySpec { … }` block, so a spec missing an `anchor` yields
+/// no tokens for ITS id rather than shifting every later row by one.
 fn capability_anchors(root: &Path) -> Vec<(String, BTreeSet<String>)> {
     let src = fs::read_to_string(root.join("src/capability_manifest.rs")).unwrap_or_default();
     let Some(start) = src.find("pub const CAPABILITY_SPECS") else {
@@ -1044,17 +1278,20 @@ fn capability_anchors(root: &Path) -> Vec<(String, BTreeSet<String>)> {
     let body = &body[..body.find("\n];").unwrap_or(body.len())];
     let id_re = Regex::new(r#"\bid:\s*"([a-z_]+)""#).unwrap();
     let anchor_re = Regex::new(r#"\banchor:\s*"([^"]*)""#).unwrap();
-    let ids: Vec<String> = id_re.captures_iter(body).map(|c| c[1].to_string()).collect();
-    let anchors: Vec<String> = anchor_re.captures_iter(body).map(|c| c[1].to_string()).collect();
-    ids.into_iter()
-        .zip(anchors)
-        .map(|(id, a)| {
-            let toks = a
-                .split(|c: char| !is_ident(c))
-                .filter(|t| !t.is_empty())
-                .map(str::to_string)
-                .collect();
-            (id, toks)
+    body.split("CapabilitySpec {")
+        .skip(1)
+        .filter_map(|block| {
+            let id = id_re.captures(block)?[1].to_string();
+            let toks = anchor_re
+                .captures(block)
+                .map(|c| {
+                    c[1].split(|ch: char| !is_ident(ch))
+                        .filter(|t| !t.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some((id, toks))
         })
         .collect()
 }
@@ -1093,7 +1330,10 @@ fn capability_for(hit: &Hit, anchors: &[(String, BTreeSet<String>)]) -> Option<S
 
 struct Built {
     roster: Roster,
-    orphan_dispositions: Vec<Key>,
+    /// A disposition key, or one of its reviewed excerpts, that matches no hit.
+    orphan_dispositions: Vec<String>,
+    /// Rows under a dispositioned key whose excerpt was never reviewed.
+    new_since_review: usize,
 }
 
 fn build_roster(root: &Path, hits: &[Hit]) -> Result<Built, String> {
@@ -1104,15 +1344,27 @@ fn build_roster(root: &Path, hits: &[Hit]) -> Result<Built, String> {
     for h in hits {
         *counted.entry(h.clone()).or_default() += 1;
     }
-    let mut used: BTreeSet<Key> = BTreeSet::new();
+    let mut used: BTreeSet<(Key, String)> = BTreeSet::new();
+    let mut new_since_review = 0;
     let rows: Vec<Row> = counted
         .into_iter()
         .map(|(h, count)| {
             let key = (h.class.clone(), h.file.clone(), h.symbol.clone());
             let (disposition, note) = match dispositions.get(&key) {
-                Some((d, n)) => {
-                    used.insert(key);
-                    (d.clone(), n.clone())
+                Some(d) if d.reviewed.contains(&h.excerpt) || d.disposition == "unreviewed" => {
+                    used.insert((key, h.excerpt.clone()));
+                    (d.disposition.clone(), d.note.clone())
+                }
+                Some(d) => {
+                    new_since_review += 1;
+                    (
+                        "unreviewed".to_string(),
+                        Some(format!(
+                            "NEW since review — this key is `{}` for {} reviewed excerpt(s), not this one",
+                            d.disposition,
+                            d.reviewed.len()
+                        )),
+                    )
                 }
                 None => ("unreviewed".to_string(), None),
             };
@@ -1128,7 +1380,21 @@ fn build_roster(root: &Path, hits: &[Hit]) -> Result<Built, String> {
             }
         })
         .collect();
-    let orphan_dispositions = dispositions.keys().filter(|k| !used.contains(*k)).cloned().collect();
+    let mut orphan_dispositions = Vec::new();
+    for (k, d) in &dispositions {
+        let (c, f, sym) = k;
+        if d.disposition == "unreviewed" {
+            if !used.iter().any(|(uk, _)| uk == k) {
+                orphan_dispositions.push(format!("({c}, {f}, {sym}) matches no hit"));
+            }
+            continue;
+        }
+        for ex in &d.reviewed {
+            if !used.contains(&(k.clone(), ex.clone())) {
+                orphan_dispositions.push(format!("({c}, {f}, {sym}) reviewed excerpt {ex:?} matches no hit"));
+            }
+        }
+    }
     Ok(Built {
         roster: Roster {
             schema: 1,
@@ -1141,6 +1407,7 @@ fn build_roster(root: &Path, hits: &[Hit]) -> Result<Built, String> {
             rows,
         },
         orphan_dispositions,
+        new_since_review,
     })
 }
 
@@ -1166,7 +1433,9 @@ fn render_md(roster: &Roster) -> String {
     out.push_str("Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the \
                   assumption degrades correctly off a workspace), `dev_only_surface` (only a \
                   developer box reaches it), `defect(<plan stem>)` (a user-facing path that \
-                  depends on a workspace, cited to the plan that owns the fix).\n\n");
+                  depends on a workspace, cited to the plan that owns the fix). A disposition \
+                  covers only the excerpts it was reviewed against; a later excerpt under the \
+                  same symbol renders `unreviewed` with a `NEW since review` note.\n\n");
 
     let mut by_class: BTreeMap<&str, Vec<&Row>> = BTreeMap::new();
     for c in CLASSES {
@@ -1289,10 +1558,20 @@ fn workspace_assumption_roster_is_fresh() {
         .map(|(k, v)| format!("{v} {k}"))
         .collect::<Vec<_>>()
         .join(", ");
-    println!(
-        "unreviewed={unreviewed} defect={defect} scanned_files={} skipped_files={skipped_total} ({skipped_detail})",
-        result.scanned_files
+    let counts = format!(
+        "unreviewed={unreviewed} defect={defect} new_since_review={} scanned_files={} \
+         skipped_files={skipped_total} ({skipped_detail})",
+        built.new_since_review, result.scanned_files
     );
+    println!("{counts}");
+    // CI captures test stdout on a green run; the job summary is where a
+    // reader actually sees the counts.
+    if let Ok(summary) = std::env::var("GITHUB_STEP_SUMMARY") {
+        use std::io::Write;
+        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&summary) {
+            let _ = writeln!(f, "workspace assumptions: `{counts}`");
+        }
+    }
     let mut per_class: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
     for r in rows {
         let e = per_class.entry(r.class.as_str()).or_default();
@@ -1326,8 +1605,8 @@ fn workspace_assumption_roster_is_fresh() {
     let checked_md = fs::read_to_string(&md_path).unwrap_or_default().replace("\r\n", "\n");
 
     let mut problems = staleness(&checked_json, &built.roster);
-    for (c, f, s) in &built.orphan_dispositions {
-        problems.push(format!("DISPOSITION WITH NO HIT: ({c}, {f}, {s}) in {DISPOSITIONS_TOML}"));
+    for o in &built.orphan_dispositions {
+        problems.push(format!("DISPOSITION WITH NO HIT: {o} in {DISPOSITIONS_TOML}"));
     }
     if problems.is_empty() && checked_json != json {
         problems.push("docs/workspace-assumptions.json differs from a fresh render (header/order)".into());
@@ -1383,6 +1662,64 @@ fn excluded_regions_yield_no_hits() {
     let src = fs::read_to_string(&path).expect("excluded fixture");
     let hits = scan_source(&Structure::new(), &compile_classes(), "fixture.rs", &src, false);
     assert!(hits.is_empty(), "excluded regions produced hits: {hits:#?}");
+}
+
+/// Constructs that are cfg'd but END early — a struct field, an enum variant,
+/// a match arm — and the lexer's hard cases. Every hit after them MUST still
+/// be reported: this asserts the exact set, so a region that fails to close
+/// (and silently swallows the rest of the file) reds, and so does a lexer that
+/// mistakes a comment or a char literal for code.
+#[test]
+fn constructs_that_end_early_do_not_swallow_later_hits() {
+    let root = crate_root();
+    let path = root.join(FIXTURE_DIR).join("must_report.rs.txt");
+    let src = fs::read_to_string(&path).expect("must_report fixture");
+    let hits = scan_source(&Structure::new(), &compile_classes(), "fixture.rs", &src, false);
+    let got: BTreeSet<(String, String)> = hits.into_iter().map(|h| (h.class, h.symbol)).collect();
+    let want: BTreeSet<(String, String)> = [
+        ("dev_ports", "after_cfg_field"),
+        ("dev_ports", "after_cfg_variant"),
+        ("machine_path", "cfg_match_arm"),
+        ("machine_path", "after_cfg_match_arm"),
+        ("machine_path", "lexer_raw_string"),
+        ("machine_path", "lexer_nested_comment"),
+        ("dev_ports", "lexer_chars"),
+        ("supervisor_dependency", "lexer_chars"),
+        ("dev_ports", "lexer_lifetime"),
+        ("os_bound_tooling", "Handles::windows_method_without_sibling"),
+        ("supervisor_dependency", "after_nested_regions"),
+    ]
+    .iter()
+    .map(|(c, s)| (c.to_string(), s.to_string()))
+    .collect();
+    assert_eq!(got, want, "must_report fixture: hit set differs (left = got, right = want)");
+}
+
+/// cfg predicates are parsed, not prefix-matched: `test` anywhere as a positive
+/// `all(...)` atom counts, under `not(...)` it does not; same for windows.
+#[test]
+fn cfg_predicates_are_parsed_not_prefix_matched() {
+    let f = |a: &str| CfgFlags::of(&[a.to_string()]);
+    assert!(f("#[cfg(test)]").test);
+    assert!(f("#[cfg(all(feature = \"x\", test))]").test);
+    assert!(f("#[cfg(all( test , feature = \"x\" ))]").test);
+    assert!(f("#[cfg(any(test, all(test, unix)))]").test);
+    assert!(!f("#[cfg(not(test))]").test);
+    assert!(!f("#[cfg(any(test, feature = \"x\"))]").test);
+    assert!(!f("#[cfg_attr(test, derive(Debug))]").test);
+    assert!(f("#[cfg(all(unix, target_os = \"windows\"))]").windows);
+    assert!(f("#[cfg(target_family = \"windows\")]").windows);
+    assert!(!f("#[cfg(not(windows))]").windows);
+    assert!(f("#[cfg(not(windows))]").not_windows);
+    assert!(f("#[cfg(any(target_os = \"linux\", target_os = \"macos\"))]").not_windows);
+    assert!(!f("#[cfg(any(unix, windows))]").not_windows);
+
+    // Inner attributes, including a multi-line one (joined by the lexer).
+    let st = Structure::new();
+    let lines = lex("//! doc\n#![cfg(all(\n    feature = \"z\",\n    test\n))]\nfn f() {}\n");
+    assert!(st.inner_cfg(&lines, |f| f.test));
+    let lines = lex("#![cfg(not(test))]\nfn f() {}\n");
+    assert!(!st.inner_cfg(&lines, |f| f.test));
 }
 
 /// Pointing the scan root at an empty dir fails on the floor rather than passing

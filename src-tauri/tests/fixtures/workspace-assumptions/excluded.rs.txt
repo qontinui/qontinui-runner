@@ -34,3 +34,39 @@ fn test_only_helper() -> &'static str {
 
 #[cfg(test)]
 use std::env::var as _unused_in_tests;
+
+// cfg predicates that are test-only without `test` coming first.
+#[cfg(all(feature = "x", test))]
+fn t1() -> &'static str {
+    "http://localhost:8000"
+}
+
+#[cfg(all(
+    test,
+    feature = "y"
+))]
+fn t2() -> &'static str {
+    "C:/Users/x"
+}
+
+// A cfg(test) module nested inside a cfg(windows) one is still test-only.
+#[cfg(windows)]
+mod win_only {
+    #[cfg(test)]
+    mod tests {
+        fn t() -> &'static str {
+            "http://localhost:8000"
+        }
+    }
+}
+
+// Platform modules with a sibling of the same fn: no structural hit.
+#[cfg(windows)]
+mod plat {
+    pub fn open() {}
+}
+
+#[cfg(any(unix, target_os = "macos"))]
+mod plat {
+    pub fn open() {}
+}
