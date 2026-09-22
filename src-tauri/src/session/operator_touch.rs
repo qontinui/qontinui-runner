@@ -238,11 +238,20 @@ mod tests {
 
     #[test]
     fn genuine_nonzero_exit_predicate_is_honest_about_unknown() {
-        assert!(!is_genuine_nonzero_exit(None), "unknown is not proof of non-zero");
-        assert!(!is_genuine_nonzero_exit(Some(0)), "a clean exit is not a touch");
+        assert!(
+            !is_genuine_nonzero_exit(None),
+            "unknown is not proof of non-zero"
+        );
+        assert!(
+            !is_genuine_nonzero_exit(Some(0)),
+            "a clean exit is not a touch"
+        );
         assert!(is_genuine_nonzero_exit(Some(1)));
         assert!(is_genuine_nonzero_exit(Some(127)));
-        assert!(is_genuine_nonzero_exit(Some(-1)), "a negative/unusual code is still non-zero");
+        assert!(
+            is_genuine_nonzero_exit(Some(-1)),
+            "a negative/unusual code is still non-zero"
+        );
     }
 
     #[test]
