@@ -73,3 +73,34 @@ mod win_outer {
 fn after_nested_regions() -> u16 {
     9875
 }
+
+// Region STACK, both directions. The outer `cfg(windows)` must survive the
+// inner `cfg(test)` module: after `tests` closes we are still inside windows,
+// so the `taskkill` literal below is NOT reported (os_bound_tooling is
+// suppressed under windows) while the machine_path literal beside it IS.
+// Flatten the stack to a single region and both verdicts flip.
+#[cfg(windows)]
+mod win_stack {
+    #[cfg(test)]
+    mod tests {
+        fn t() -> &'static str {
+            "D:/test-only"
+        }
+    }
+
+    pub fn after_nested_test_mod() -> &'static str {
+        let _ = std::process::Command::new("taskkill").arg("/F").status();
+        "D:/reported-under-windows"
+    }
+}
+
+// An FFI declaration inside an already-cfg'd module: the `extern` block, not
+// the cfg attribute, is what exempts it from the windows-sibling check —
+// a declaration has no body and so can never grow a sibling.
+#[cfg(windows)]
+mod win_ffi {
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn GetLastErrorShim() -> u32;
+    }
+}

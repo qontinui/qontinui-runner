@@ -77,8 +77,8 @@ const PLAN_STEM: &str = "2026-09-20-published-runner-parity-count-comes-from-a-r
 /// Vacuity floor on the number of `.rs` files actually scanned.
 ///
 /// Derived at authoring (2026-09-22, `784129948`): `git ls-files 'src-tauri/src/*.rs'`
-/// listed 1569 files; the sweep scanned 1553 and skipped 16 (14 declared through
-/// `#[cfg(test)] mod x;`, 2 carrying `#![cfg(test)]`). The floor sits well under
+/// listed 1569 files; the sweep scanned 1553 and skipped 16 (13 declared through
+/// `#[cfg(test)] mod x;`, 3 carrying `#![cfg(test)]`). The floor sits well under
 /// that so ordinary deletions do not
 /// trip it, and far above zero so a broken walker, a moved root or an empty dir
 /// cannot pass with "0 hits".
@@ -694,9 +694,6 @@ struct Region {
     entered: bool,
     /// A field / variant / match arm: it ends at the next `,` on its own level.
     comma_closes: bool,
-    /// An `extern "…" { fn …; }` block: its fns are FFI declarations, not
-    /// implementations, so they never enter the windows-sibling check.
-    ffi: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -712,6 +709,7 @@ struct Structure {
     impl_re: Regex,
     const_re: Regex,
     item_re: Regex,
+    extern_block_re: Regex,
     mod_decl_re: Regex,
     path_attr_re: Regex,
 }
@@ -723,6 +721,7 @@ impl Structure {
             impl_re: Regex::new(r"^(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?(impl|trait)\b(.*)$").unwrap(),
             const_re: Regex::new(r"^(?:pub(?:\([^)]*\))?\s+)?(const|static)\s+(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)").unwrap(),
             item_re: Regex::new(r"^(?:pub(?:\([^)]*\))?\s+)?(struct|enum|union|type|trait|mod|macro_rules!)\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap(),
+            extern_block_re: Regex::new(r#"^(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?extern\b[^;]*$"#).unwrap(),
             mod_decl_re: Regex::new(r"^(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;").unwrap(),
             path_attr_re: Regex::new(r#"#\[path\s*=\s*"([^"]+)"\]"#).unwrap(),
         }
@@ -771,7 +770,11 @@ impl Structure {
         let mut out = Vec::new();
         let mut pending: Vec<String> = Vec::new();
         for line in lines {
-            let (attrs, rest) = split_attrs(&line.code);
+            let (attrs, rest) = if line.skel.trim_start().starts_with("#[") {
+                split_attrs(&line.code)
+            } else {
+                (Vec::new(), line.code.trim().to_string())
+            };
             pending.extend(attrs);
             if rest.is_empty() {
                 continue;
@@ -792,8 +795,8 @@ impl Structure {
     /// An inner `#![cfg(...)]` on the file itself.
     fn inner_cfg(&self, lines: &[Line], want: fn(CfgFlags) -> bool) -> bool {
         lines.iter().any(|l| {
-            let t = l.code.trim_start();
-            t.starts_with("#![") && want(CfgFlags::of(&[t.to_string()]))
+            // Skeleton decides it IS an attribute; `code` supplies its text.
+            l.skel.trim_start().starts_with("#![") && want(CfgFlags::of(&[l.code.trim_start().to_string()]))
         })
     }
 }
@@ -825,6 +828,9 @@ fn scan_source(
     // (name, depth at which its body opened)
     let mut fn_stack: Vec<(String, i32)> = Vec::new();
     let mut impl_stack: Vec<(String, i32)> = Vec::new();
+    // Depth at which each open `extern "…" {` block's body started.
+    let mut extern_stack: Vec<i32> = Vec::new();
+    let mut pending_extern = false;
     let mut pending_fn: Option<String> = None;
     let mut pending_impl: Option<String> = None;
     let mut const_ctx: Option<(String, i32)> = None;
@@ -842,7 +848,17 @@ fn scan_source(
         // inside a `cfg(windows)` one is its own, nested region.
         let mut line_fn_name: Option<String> = st.fn_re.captures(&line.skel).map(|c| c[1].to_string());
         {
-            let (attrs, rest) = split_attrs(&line.code);
+            // Gate on the SKELETON: a template string whose line begins `#[cfg(test)]`
+            // is data, not an attribute, and must not open a region (43 such
+            // attribute-shaped lines live inside string literals today). The
+            // attribute TEXT still comes from `code`, which keeps the literals a
+            // predicate needs (`target_os = "windows"`).
+            let is_attr_line = line.skel.trim_start().starts_with("#[");
+            let (attrs, rest) = if is_attr_line {
+                split_attrs(&line.code)
+            } else {
+                (Vec::new(), line.code.trim().to_string())
+            };
             let had_attrs = !attrs.is_empty();
             pending_attrs.extend(attrs);
             if !rest.is_empty() && !pending_attrs.is_empty() {
@@ -854,7 +870,6 @@ fn scan_source(
                         start_bracket: bracket,
                         entered: false,
                         comma_closes: !starts_item(&rest),
-                        ffi: rest.trim_start().trim_start_matches("unsafe ").trim_start().starts_with("extern"),
                     });
                 }
                 pending_attrs.clear();
@@ -871,8 +886,13 @@ fn scan_source(
         // item level inside it (not a local fn nested in another fn's body).
         if let (Some(name), false) = (&line_fn_name, in_test) {
             let item_level = |r: &Region| fn_stack.last().is_none_or(|(_, d)| *d <= r.start_depth);
-            if regions.iter().any(|r| r.ffi) {
-                // FFI declaration — no body to have a sibling of.
+            if !extern_stack.is_empty() {
+                // An `extern "…" { fn …; }` DECLARATION. It has no body, so it
+                // can never have a non-windows sibling — rostering it would be
+                // a row no code change could ever resolve. Tracked as its own
+                // scope rather than off the cfg attribute that opened the
+                // region: the `extern` block is usually bare INSIDE an already
+                // cfg'd module (`wedge_diagnostics::windows_thread_census`).
             } else if regions.iter().any(|r| r.flags.not_windows && item_level(r)) {
                 other_os_fns.insert(name.clone());
             } else if regions.iter().any(|r| r.flags.windows && !r.flags.test && item_level(r)) {
@@ -973,6 +993,11 @@ fn scan_source(
         if let Some(name) = st.impl_name(skel_t) {
             pending_impl = Some(name);
         }
+        // `extern "C" fn foo()` is a fn, not a block — only a bodied block with
+        // no `fn` on its header line opens an FFI scope.
+        if line_fn_name.is_none() && st.extern_block_re.is_match(skel_t) {
+            pending_extern = true;
+        }
         for ch in line.skel.chars() {
             match ch {
                 '(' | '[' => bracket += 1,
@@ -981,6 +1006,9 @@ fn scan_source(
                     depth += 1;
                     if let Some(name) = pending_fn.take() {
                         fn_stack.push((name, depth));
+                    } else if pending_extern {
+                        pending_extern = false;
+                        extern_stack.push(depth);
                     } else if let Some(name) = pending_impl.take() {
                         impl_stack.push((name, depth));
                     }
@@ -998,6 +1026,9 @@ fn scan_source(
                     while impl_stack.last().is_some_and(|(_, d)| *d > depth) {
                         impl_stack.pop();
                     }
+                    while extern_stack.last().is_some_and(|d| *d > depth) {
+                        extern_stack.pop();
+                    }
                     if const_ctx.as_ref().is_some_and(|(_, d)| *d > depth) {
                         const_ctx = None;
                     }
@@ -1010,6 +1041,7 @@ fn scan_source(
                     if bracket == 0 {
                         pending_fn = None;
                         pending_impl = None;
+                        pending_extern = false;
                         if const_ctx.as_ref().is_some_and(|(_, d)| *d == depth) {
                             const_ctx = None;
                         }
@@ -1190,6 +1222,14 @@ struct DispositionEntry {
     /// The exact excerpts this disposition was reviewed against. A hit under
     /// the same key with any OTHER excerpt renders `unreviewed` — a new
     /// assumption never silently inherits an old verdict.
+    ///
+    /// **The pin's resolution is one excerpt per (line, class), and excerpts are
+    /// truncated at 137 chars.** So it does NOT notice: a second matching line
+    /// inside the same multi-line string literal (that blob yields ONE row
+    /// however many endpoints it holds — `mcp/ai_session.rs` carries three
+    /// `:9875` URLs in one row), or an edit past the truncation point (10
+    /// excerpts are truncated today). Within one symbol, those edits keep the
+    /// reviewed verdict silently; a re-read of the symbol is what catches them.
     #[serde(default)]
     reviewed: Vec<String>,
 }
@@ -1565,7 +1605,10 @@ fn workspace_assumption_roster_is_fresh() {
     );
     println!("{counts}");
     // CI captures test stdout on a green run; the job summary is where a
-    // reader actually sees the counts.
+    // reader actually sees the counts. GitHub Actions ONLY: the runner's own
+    // CI-node lane (`.qontinui/ci.toml`) sets no `GITHUB_STEP_SUMMARY` and
+    // passes a closed env allowlist, so a green run there still shows no
+    // counts — read them from the job log, or run the test locally.
     if let Ok(summary) = std::env::var("GITHUB_STEP_SUMMARY") {
         use std::io::Write;
         if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&summary) {
@@ -1675,7 +1718,7 @@ fn constructs_that_end_early_do_not_swallow_later_hits() {
     let path = root.join(FIXTURE_DIR).join("must_report.rs.txt");
     let src = fs::read_to_string(&path).expect("must_report fixture");
     let hits = scan_source(&Structure::new(), &compile_classes(), "fixture.rs", &src, false);
-    let got: BTreeSet<(String, String)> = hits.into_iter().map(|h| (h.class, h.symbol)).collect();
+    let got: BTreeSet<(String, String)> = hits.iter().cloned().map(|h| (h.class, h.symbol)).collect();
     let want: BTreeSet<(String, String)> = [
         ("dev_ports", "after_cfg_field"),
         ("dev_ports", "after_cfg_variant"),
@@ -1688,11 +1731,40 @@ fn constructs_that_end_early_do_not_swallow_later_hits() {
         ("dev_ports", "lexer_lifetime"),
         ("os_bound_tooling", "Handles::windows_method_without_sibling"),
         ("supervisor_dependency", "after_nested_regions"),
+        ("machine_path", "after_nested_test_mod"),
+        ("os_bound_tooling", "after_nested_test_mod"),
     ]
     .iter()
     .map(|(c, s)| (c.to_string(), s.to_string()))
     .collect();
     assert_eq!(got, want, "must_report fixture: hit set differs (left = got, right = want)");
+
+    // Spelled out, because these are what the region STACK and the `extern`-block
+    // scope buy — and both sides wear the same (class, symbol) pair, so only the
+    // EXCERPT tells them apart. Flatten the stack and `after_nested_test_mod`
+    // stops being windows-only (no structural row) and starts reporting its
+    // `taskkill` literal instead: the pair survives, the meaning inverts.
+    let os_bound_excerpts: Vec<&str> = hits
+        .iter()
+        .filter(|h| h.class == OS_BOUND && h.symbol == "after_nested_test_mod")
+        .map(|h| h.excerpt.as_str())
+        .collect();
+    assert_eq!(
+        os_bound_excerpts.len(),
+        1,
+        "expected exactly one os_bound_tooling hit on `after_nested_test_mod`, got {os_bound_excerpts:?}"
+    );
+    assert!(
+        os_bound_excerpts[0].starts_with("cfg(windows)-only fn"),
+        "the outer cfg(windows) region did not survive the nested cfg(test) module — regions \
+         must be a STACK, not one region at a time. Got {:?} instead of the structural row.",
+        os_bound_excerpts[0]
+    );
+    assert!(
+        !got.contains(&(OS_BOUND.to_string(), "GetLastErrorShim".to_string())),
+        "an `extern \"…\"` FFI declaration was rostered as a windows-only fn with no \
+         sibling — a row no code change can ever resolve"
+    );
 }
 
 /// cfg predicates are parsed, not prefix-matched: `test` anywhere as a positive

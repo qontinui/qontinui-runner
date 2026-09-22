@@ -1132,14 +1132,6 @@
     {
       "class": "os_bound_tooling",
       "file": "src/wedge_diagnostics.rs",
-      "symbol": "NtQuerySystemInformation",
-      "excerpt": "cfg(windows)-only fn `NtQuerySystemInformation` has no cfg(not(windows)) sibling in this file",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "os_bound_tooling",
-      "file": "src/wedge_diagnostics.rs",
       "symbol": "ProcessTable::read",
       "excerpt": "cfg(windows)-only fn `read` has no cfg(not(windows)) sibling in this file",
       "count": 1,
