@@ -23,8 +23,9 @@
  * (entry, else the device scalar) rather than asking the runner to resolve one
  * tenant and implying that answer covers the rows.
  *
- * `save_path_settings` takes a PATCH, not the whole struct. The five scalars
- * behave as they always did (absent ⇒ unset), but the four MAP fields —
+ * `save_path_settings` takes a PATCH, not the whole struct. Absence never
+ * changes a stored value, for EVERY field: the five scalars take `null` ⇒ unset
+ * and a string ⇒ set, so an omitted scalar survives. The four MAP fields —
  * `repo_checkouts` and the three `*_by_tenant` — are merged: **absent or null ⇒
  * the stored map is left alone; `{}` ⇒ a deliberate clear.** That is why
  * `buildPathSettingsPayload` must `delete` a map it is not asserting and send
@@ -287,13 +288,18 @@ export function PathsSettings({ onLog }: PathsSettingsProps) {
       const checkouts = parseRepoCheckouts(checkoutsDraft);
       if (checkouts.errors.length > 0) return;
       // The per-tenant maps are PATCH fields: they are sent only when the rows
-      // were SHOWN. A panel that did not render them has no business asserting
-      // what they should contain — omitting them leaves what is stored alone.
+      // were SHOWN **and actually edited**. Sending them because they were
+      // merely rendered asserts this panel's MOUNT-TIME snapshot, which erases
+      // any row a concurrent writer added in between — the same lost update the
+      // patch door exists to remove, and `repo_checkouts` is gated the same way
+      // for the same reason. Not-dirty ⇒ omitted ⇒ the stored maps survive.
+      const tenantMapsDirty =
+        showSwitcher && tenantDraftsAreDirty(view.configured, tenantDrafts);
       const payload = buildPathSettingsPayload(
         view.configured,
         drafts,
         checkouts.entries,
-        showSwitcher ? tenantDrafts : undefined,
+        tenantMapsDirty ? tenantDrafts : undefined,
       );
       const fresh = await invoke<PathSettingsView>("save_path_settings", { settings: payload });
       // Re-render from what the runner STORED, not from what was sent: the

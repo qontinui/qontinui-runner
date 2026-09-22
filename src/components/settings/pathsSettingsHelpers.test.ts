@@ -278,8 +278,8 @@ describe("repo checkouts — repos outside the workspace root", () => {
     // must be genuinely ABSENT — not re-sent from the snapshot the panel loaded.
     // Re-sending it is a no-op for a lone writer and a silent REVERT of a peer
     // who wrote the map while this panel was open, which is the erasure class
-    // the merge exists to close. The payload builder spreads `saved`, so only an
-    // explicit delete makes the omission real.
+    // the merge exists to close. The builder assembles from an EMPTY object, so
+    // the key is absent unless this panel explicitly asserted the map.
     const untouched = buildPathSettingsPayload(WITH_MAP, draftsFrom(WITH_MAP));
     expect("repo_checkouts" in untouched).toBe(false);
   });
@@ -662,8 +662,8 @@ describe("buildPathSettingsPayload — the per-tenant maps are PATCH fields", ()
   });
 
   it("OMITS all three maps when the panel did not render them", () => {
-    // The single-tenant branch. `next` starts as a spread of `saved`, so the
-    // keys are present unless deleted — and re-sending the panel's snapshot
+    // The single-tenant branch. The builder assembles from an EMPTY object, so
+    // the keys are absent unless asserted — and re-sending the panel's snapshot
     // would REVERT a peer who wrote the map while this panel was open.
     const payload = buildPathSettingsPayload(MULTI, draftsFrom(MULTI));
     expect("plans_dir_by_tenant" in payload).toBe(false);
