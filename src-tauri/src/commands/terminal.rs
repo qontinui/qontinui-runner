@@ -369,7 +369,12 @@ pub async fn terminal_create(
                 // `terminal_close` command, so a double-close (exit +
                 // explicit close) is a no-op.
                 let close_registry = registry.clone();
-                session.set_on_exit(Box::new(move |coord_id| {
+                // Fixed at spawn (`TerminalSession::pinned_session_id` doc) —
+                // safe to capture as an owned String for the on-exit hook,
+                // which fires once the session's identity is long past
+                // changing.
+                let exit_pinned_session_id = session.pinned_session_id().to_string();
+                session.set_on_exit(Box::new(move |coord_id, exit_code| {
                     if let Err(e) = close_registry.close_by_id(coord_id) {
                         warn!(
                             coord_session = %coord_id,
@@ -377,6 +382,15 @@ pub async fn terminal_create(
                             "terminal exit hook: coord session close failed"
                         );
                     }
+                    // Trigger 4 (session_exit) — plan
+                    // 2026-08-27-operator-touch-observation-runner-emitter,
+                    // Phase B2 §2b/§2c.
+                    crate::session::operator_touch::emit_session_exit_if_nonzero(
+                        &close_registry,
+                        coord_id,
+                        Some(&exit_pinned_session_id),
+                        exit_code,
+                    );
                 }));
 
                 // Attach the output pipe so PTY output streams to coord.
@@ -2277,7 +2291,8 @@ pub(crate) fn create_terminal_session_backend(
                 // spawn on.
                 let exited_terminal_id = info.id.clone();
                 let exit_rt_handle = tokio::runtime::Handle::try_current().ok();
-                session.set_on_exit(Box::new(move |coord_id| {
+                let exit_pinned_session_id = session.pinned_session_id().to_string();
+                session.set_on_exit(Box::new(move |coord_id, exit_code| {
                     if let Err(e) = close_registry.close_by_id(coord_id) {
                         warn!(
                             coord_session = %coord_id,
@@ -2288,6 +2303,15 @@ pub(crate) fn create_terminal_session_backend(
                     crate::agent_runtime::notify_continuation_terminal_exit(
                         &exited_terminal_id,
                         exit_rt_handle.as_ref(),
+                    );
+                    // Trigger 4 (session_exit) — plan
+                    // 2026-08-27-operator-touch-observation-runner-emitter,
+                    // Phase B2 §2b/§2c.
+                    crate::session::operator_touch::emit_session_exit_if_nonzero(
+                        &close_registry,
+                        coord_id,
+                        Some(&exit_pinned_session_id),
+                        exit_code,
                     );
                 }));
                 let rx = session.subscribe_output();

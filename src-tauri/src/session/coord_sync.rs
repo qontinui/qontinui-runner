@@ -651,16 +651,20 @@ pub(crate) fn transport_rung_drain_dropped() -> TransportRungDrainDropped {
 /// record instead of breaking the batch, and the record is Ack-dropped once
 /// [`BEST_EFFORT_MAX_ATTEMPTS`] is spent.
 ///
-/// All three are coord writes that are NOT session lifecycle events — a
-/// helper task, and the two closeout kinds from plan
-/// `2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline`.
-/// Stalling a session's `started`/`closed` behind any of them would be worse
-/// than losing one of them, which is exactly the trade the posture encodes.
+/// All these are coord writes that are NOT session lifecycle events — a
+/// helper task, the two closeout kinds from plan
+/// `2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline`, an
+/// agent-notification, and an operator touch (plan
+/// `2026-08-27-operator-touch-observation-runner-emitter` §2c: "Emit is
+/// best-effort and must never block or slow a session"). Stalling a
+/// session's `started`/`closed` behind any of them would be worse than
+/// losing one of them, which is exactly the trade the posture encodes.
 fn is_best_effort_kind(kind: &str) -> bool {
     kind == SessionEventKind::HelperTaskCreated.as_str()
         || kind == SessionEventKind::GateRegistration.as_str()
         || kind == SessionEventKind::FindingPosted.as_str()
         || kind == SessionEventKind::AgentNotification.as_str()
+        || kind == SessionEventKind::OperatorTouch.as_str()
 }
 
 /// How many per-session push chains run at once (plan
@@ -1070,6 +1074,30 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // generic arm below turns into an Ack-drop (a retry could never
             // fix a body the queue cannot edit).
             let url = format!("{base}/coord/agent-findings");
+            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&rec.payload), scope)
+                .send()
+                .await
+        }
+        "operator_touch" => {
+            // Operator-touch observation (plan
+            // 2026-08-27-operator-touch-observation-runner-emitter, Phase B2,
+            // targeting the coord write route Phase B1 shipped as
+            // qontinui-coord#2288). POST /coord/sessions/operator-touch with
+            // the payload forwarded VERBATIM — built by
+            // crate::session::operator_touch, which already derived the
+            // idempotency key coord's write boundary requires. coord ignores
+            // any `tenant_id` in the body (it comes from the device JWT), so
+            // there is nothing here to reshape.
+            //
+            // ⚠️ THIS ARM IS LOAD-BEARING, same hazard as
+            // "coord-transport-rung" above: without it the kind falls to the
+            // `other` catch-all below, which ACKs and DROPS at debug level —
+            // written durably, drained, silently discarded, acked as
+            // delivered — and the plan's whole premise (a fleet-wide count of
+            // how often an agent stops short) would read a clean, wrong zero.
+            // See `every_session_outbox_kind_has_a_dispatch_arm` and
+            // `operator_touch_posts_to_the_dedicated_route`.
+            let url = format!("{base}/coord/sessions/operator-touch");
             crate::auth::attach_device_auth_for(inner.http.post(&url).json(&rec.payload), scope)
                 .send()
                 .await
@@ -2727,6 +2755,7 @@ mod tests {
             SessionEventKind::Finished,
             SessionEventKind::CoordTransportRung,
             SessionEventKind::AgentNotification,
+            SessionEventKind::OperatorTouch,
         ] {
             let arm = format!("\"{}\" =>", kind.as_str());
             assert!(
@@ -2883,6 +2912,8 @@ mod tests {
         /// of 201 (still recording the body) — drives the mirror-drop arms
         /// (404 unknown session id, 405 no ingest route).
         events_status: Option<u16>,
+        /// Bodies accepted by `POST /coord/sessions/operator-touch`.
+        operator_touches: Vec<JsonValue>,
         /// The `Authorization` header each `GET /tenant-policy` carried, in
         /// order. `None` = the request went out UNAUTHENTICATED, which is
         /// the fail-closed slot-miss posture and an observable in its own
@@ -3175,6 +3206,24 @@ mod tests {
                     },
                 ),
             )
+            .route(
+                "/coord/sessions/operator-touch",
+                post(
+                    |AxumState(state): AxumState<Arc<TokMutex<CoordRecorder>>>,
+                     Json(body): Json<JsonValue>| async move {
+                        let mut g = state.lock().await;
+                        g.operator_touches.push(body.clone());
+                        (
+                            AxumStatus::OK,
+                            Json(json!({
+                                "recorded": true,
+                                "session_id": JsonValue::Null,
+                            })),
+                        )
+                            .into_response()
+                    },
+                ),
+            )
             .with_state(rec.clone());
 
         let rec_clone = rec.clone();
@@ -3459,6 +3508,94 @@ mod tests {
         drop(g);
 
         // ACKed (at-least-once delivery confirmed).
+        wait_until(Duration::from_secs(3), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+    }
+
+    /// The plan's highest-consequence risk, made concrete for the
+    /// `operator_touch` kind: an empty `operator_touches` recording here means
+    /// `push_record` has no arm for it and the row was silently ACK-dropped by
+    /// the catch-all — the exact failure `every_session_outbox_kind_has_a_dispatch_arm`
+    /// exists to catch at the source level, pinned here end-to-end through a
+    /// real drain. Also asserts the arm hits the DEDICATED route (not
+    /// `/sessions/:id/events`, which every restore/transport-rung kind shares)
+    /// and forwards `crate::session::operator_touch`'s payload verbatim — no
+    /// `tenant_id`, no reshaping.
+    #[tokio::test]
+    async fn drain_pushes_operator_touch_to_the_dedicated_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let _registry = build_registry(coord.clone());
+
+        let machine_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let payload = crate::session::operator_touch::touch_payload(
+            crate::session::operator_touch::KIND_PERMISSION_PROMPT,
+            session_id,
+            Some("harness-session-abc"),
+            1_726_000_020,
+        );
+        outbox
+            .record(
+                machine_id,
+                session_id,
+                SessionEventKind::OperatorTouch,
+                payload,
+            )
+            .unwrap();
+        let _drain = coord.start_drain_task();
+
+        wait_until(Duration::from_secs(5), || {
+            let r = rec.try_lock();
+            r.map(|g| !g.operator_touches.is_empty()).unwrap_or(false)
+        })
+        .await;
+
+        let g = rec.lock().await;
+        assert_eq!(
+            g.operator_touches.len(),
+            1,
+            "exactly one POST /coord/sessions/operator-touch — an empty \
+             `operator_touches` here means push_record has no `operator_touch` \
+             arm and the row was Ack-DROPPED by the catch-all"
+        );
+        assert!(
+            g.events.is_empty(),
+            "operator_touch must NOT ride /sessions/:id/events — it is its own route"
+        );
+        let body = &g.operator_touches[0];
+        assert_eq!(
+            body["kind"],
+            json!(crate::session::operator_touch::KIND_PERMISSION_PROMPT)
+        );
+        assert_eq!(
+            body["idempotency_key"],
+            json!(format!("{session_id}:permission_prompt:1726000020"))
+        );
+        assert_eq!(
+            body["source"],
+            json!(crate::session::operator_touch::SOURCE_RUNNER_HOOK)
+        );
+        assert_eq!(body["claude_code_session_id"], json!("harness-session-abc"));
+        // The producer never sends a tenant, a reason_code, or a
+        // policy_authorized guess — coord derives identity from the device
+        // JWT and defaults the rest (module header, `operator_touch::touch_payload`).
+        assert!(body.get("tenant_id").is_none());
+        assert!(body.get("reason_code").is_none());
+        assert!(body.get("policy_authorized").is_none());
+        drop(g);
+
+        // ACKed (at-least-once delivery confirmed) — the fake route answers
+        // 200, which is a success status for this best-effort kind.
         wait_until(Duration::from_secs(3), || {
             outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
         })

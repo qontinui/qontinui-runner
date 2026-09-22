@@ -4336,7 +4336,8 @@ fn register_remote_created_session(
                 // leaving a ghost for coord's stale watcher to reap. Same
                 // idempotent door the explicit close uses.
                 let close_registry = registry.clone();
-                session.set_on_exit(Box::new(move |id| {
+                let exit_pinned_session_id = session.pinned_session_id().to_string();
+                session.set_on_exit(Box::new(move |id, exit_code| {
                     if let Err(e) = close_registry.close_by_id(id) {
                         warn!(
                             coord_session = %id,
@@ -4344,6 +4345,15 @@ fn register_remote_created_session(
                             "remote create: coord session close failed on PTY exit"
                         );
                     }
+                    // Trigger 4 (session_exit) — plan
+                    // 2026-08-27-operator-touch-observation-runner-emitter,
+                    // Phase B2 §2b/§2c.
+                    crate::session::operator_touch::emit_session_exit_if_nonzero(
+                        &close_registry,
+                        id,
+                        Some(&exit_pinned_session_id),
+                        exit_code,
+                    );
                 }));
                 let rx = session.subscribe_output();
                 registry.attach_output_pipe(coord_id, rx, true);
