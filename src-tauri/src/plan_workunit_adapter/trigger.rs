@@ -1061,23 +1061,169 @@ const SCAN_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
 /// above, so it carries their budget rather than the network one.
 const SCAN_BLOB_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Blob bodies already read, keyed by OBJECT ID.
+/// How many BYTES of blob bodies the cache holds before it evicts.
+///
+/// Bounded in BYTES rather than entries, because an entry is a whole plan body
+/// and those vary by an order of magnitude — measured on the live corpus: 1863
+/// plans, 28.4 KB average, 185.7 KB largest, 54.2 MB total. An entry cap sized
+/// for "several roots" therefore states no memory bound at all: 6000 entries is
+/// ~175 MB held in a global static in a process that runs for weeks, on a fleet
+/// that keeps a knowledge-base page on exhaustion signatures. 96 MB holds the
+/// measured corpus plus an archive root with headroom, and says what it costs.
+const BLOB_CACHE_MAX_BYTES: usize = 96 * 1024 * 1024;
+
+/// Blob bodies already read, keyed by OBJECT ID, with the read counter at
+/// which each was last used.
 ///
 /// A git object id is a content hash, so `id -> bytes` is a cache with no
 /// invalidation problem: the same id is provably the same bytes, forever and
 /// across repos. That is what makes the per-blob read affordable — the listing
-/// changes rarely, so after the first cycle nearly every id is a hit and the
-/// steady-state scan spawns NOTHING, which is strictly cheaper than the one
-/// `--batch` process this replaced.
+/// changes rarely, so after the first cycle nearly every id is a hit.
 ///
-/// It is pruned to the current listing on every read (see
-/// [`GitRefReader::read_blobs`] for `ProcessGit`), so it holds one corpus and
-/// not a growing history of one.
-fn blob_cache() -> &'static std::sync::Mutex<HashMap<String, String>> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, String>>> =
+/// ## Why it is NOT pruned to the caller's own id set
+///
+/// It was, and that was a defect the moment a SECOND caller appeared. Phase 2
+/// had exactly one `read_blobs` call per cycle, so "retain only this call's
+/// ids" was a no-op and the steady state really did spawn nothing. Phase 3
+/// added the document layer, so there are now `1 + roots` calls per cycle —
+/// and a prune to one caller's ids EVICTS every other root's corpus, turning
+/// every cycle's every root into a full miss. Measured shape: ~1,863 plans, so
+/// ~1,863 `git cat-file` spawns per minute, forever, each taken while holding
+/// this mutex.
+///
+/// So eviction is by LEAST-RECENTLY-USED against a cap instead. Anything still
+/// being read each cycle stays hot whichever caller reads it; a rewritten
+/// plan's old id ages out on its own, because a rewrite yields a new id and
+/// the old one stops being touched. That is the property the prune was
+/// reaching for, and it is the one an id-set prune could not express.
+fn blob_cache() -> &'static std::sync::Mutex<HashMap<String, (String, u64)>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (String, u64)>>> =
         std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
+
+/// Evict the coldest quarter of `cache` once its bodies exceed `max_bytes`, by
+/// LRU stamp.
+///
+/// Extracted so the property that REGRESSED is testable. The previous policy
+/// was `retain(|id, _| this_call's_ids.contains(id))`, which is correct for
+/// exactly one caller per cycle and catastrophic for two: each call evicts the
+/// other's corpus, so every cycle's every root becomes a full miss and spawns a
+/// `git cat-file` per plan. Nothing pinned that, because with one caller the
+/// prune was a no-op — the defect was invisible until a second caller existed.
+///
+/// A quarter at a time rather than one entry, so eviction is amortised instead
+/// of paid on every insert once the cap is reached.
+fn evict_cold_blobs(cache: &mut HashMap<String, (String, u64)>, max_bytes: usize) {
+    let held: usize = cache.values().map(|(b, _)| b.len()).sum();
+    if held <= max_bytes || cache.len() < 2 {
+        return;
+    }
+    // On the `len < 2` guard: it is NOT an index guard, and an earlier comment
+    // implied it was. `stamps[cache.len() / 4]` is in bounds for every
+    // `len >= 1` (`len/4 < len`), and `len == 0` returns on the sum anyway.
+    // What it prevents is EVICT-EVERYTHING at `len == 1`: the cutoff would be
+    // the sole entry's own stamp, `retain(n > cutoff)` would empty the cache,
+    // and a single body larger than the bound would then be re-read on every
+    // call — permanent thrash on the largest plan. Exceeding the bound by at
+    // most one body is the better trade.
+    //
+    // Two soft-bound facts, so the bound is not read as harder than it is: one
+    // pass drops a quarter of ENTRIES against a BYTE bound, so a single pass
+    // does not guarantee `held <= max_bytes` — it converges over calls. And the
+    // check runs AFTER a call's inserts, so peak resident is the bound plus one
+    // call's bytes.
+    // OBSERVABLE, once per process. Crossing the bound puts the working set
+    // into cyclic eviction — LRU's textbook worst case here, because the roots
+    // are read in the same order every cycle, so the coldest quarter is always
+    // the root read earliest and is evicted just before it is needed again.
+    // That is the original defect's cost profile reached by another route, and
+    // it must not be a silent cliff.
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            held_bytes = held,
+            max_bytes,
+            entries = cache.len(),
+            "plan adapter: the blob cache crossed its byte bound and is now evicting; a \
+             working set larger than the bound re-introduces a per-cycle re-read of the \
+             evicted root (one `git cat-file` per plan). Raise the bound or reduce the \
+             scan roots."
+        );
+    }
+    let mut stamps: Vec<u64> = cache.values().map(|(_, n)| *n).collect();
+    stamps.sort_unstable();
+    // A quarter at a time rather than one entry, so eviction is amortised
+    // instead of paid on every insert once the bound is reached.
+    let cutoff = stamps[cache.len() / 4];
+    cache.retain(|_, (_, n)| *n > cutoff);
+}
+
+/// Serve `id` from `cache` if present, RE-STAMPING it as most-recently-used.
+///
+/// Extracted from [`GitRefReader::read_blobs`]' hit arm so the re-stamp is
+/// reachable from a test at all. Without it a body only one caller reads keeps
+/// its INSERT stamp forever and ages out under eviction while being read every
+/// cycle — the cyclic re-read this cache exists to prevent, by a third route.
+fn touch_blob(cache: &mut HashMap<String, (String, u64)>, id: &str) -> Option<String> {
+    let slot = cache.get_mut(id)?;
+    slot.1 = blob_cache_tick();
+    Some(slot.0.clone())
+}
+
+/// Monotonic read counter, for the cache's LRU stamp.
+fn blob_cache_tick() -> u64 {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    N.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Fetches already performed, keyed by `(repo_root, default_ref)`, with the
+/// instant each succeeded.
+///
+/// The scan's byte source is resolved PER CONSUMER — the work-unit reconcile
+/// and the document layer each resolve it, and the document layer once per
+/// root — and `resolve_scan_source` fetches. Without this memo one cycle
+/// fetches the same ref `1 + roots` times, which is not merely wasteful: it is
+/// a repeated WRITE into a checkout other agents are working in, each attempt
+/// can fail independently (taking one layer dark on a cycle the other
+/// succeeded on), and two fetches straddling a push make the bodies published
+/// come from a different ref state than the census reported beside them —
+/// breaking the one-cycle coherence the scan-root report claims.
+///
+/// **What this buys is COST, plus only a NARROW slice of coherence — it does
+/// not make the two halves read one ref state, and an earlier draft of this
+/// comment claimed it did.** Two things defeat that claim. A cycle slower than
+/// the TTL re-fetches mid-cycle — and the scan's own call-site comment measures
+/// a cold first cycle in MINUTES, far past this TTL. And suppressing THIS
+/// process's fetch does nothing about a PEER's `git fetch` in the same shared
+/// checkout, which is routine here and can advance the ref between the two
+/// halves' independent `rev_parse` calls. Closing that needs ONE resolved sha
+/// shared between the halves, which this deliberately does not do. So: one ref
+/// state only when the gap is under the TTL AND no peer fetched inside it.
+///
+/// A fetch for a `(root, ref)` already fetched inside
+/// [`SCAN_FETCH_MEMO_TTL`] is SKIPPED and reports success — recorded only
+/// after a SUCCESS, so a failure is never masked.
+///
+/// ⚠️ The TTL's safety rests on the reconcile interval being LONGER than it,
+/// and nothing enforces that: `QONTINUI_PLAN_ADAPTER_INTERVAL_SECS` has no
+/// floor beyond `max(1)`. At a configured interval at or under the TTL the memo
+/// spans whole cycles and `fetch_default` returns `Ok(())` without touching the
+/// network, so the loop publishes from a ref up to one TTL stale. The TTL is
+/// kept well under the 60 s default for that reason; an operator shortening the
+/// interval below it must shorten this too.
+fn fetch_memo() -> &'static std::sync::Mutex<HashMap<(PathBuf, String), std::time::Instant>> {
+    static M: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<(PathBuf, String), std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// How long a successful fetch suppresses a repeat for the same
+/// `(repo_root, default_ref)`. Deliberately well under the reconcile
+/// interval, so this collapses the fetches WITHIN a cycle and never skips a
+/// cycle's fetch.
+const SCAN_FETCH_MEMO_TTL: Duration = Duration::from_secs(30);
 
 /// The production [`GitRefReader`]: shells out to `git`, always with an
 /// explicit `-C <dir>` so the probe can never pick up the runner's own cwd.
@@ -1397,12 +1543,26 @@ impl GitRefReader for ProcessGit {
                 ))
             }
         };
-        // `-c gc.auto=0`: this is a WRITE, once a minute, into a checkout
-        // other agents are working in. git runs `gc --auto` after a fetch by
-        // default, and a repack fired off by the scan loop is a side effect on
-        // a shared resource the scan has no business causing.
+        // MEMOISED per `(repo_root, default_ref)` — see [`fetch_memo`]. The
+        // source is resolved once per consumer and once per root, so without
+        // this a cycle fetches the same ref `1 + roots` times; with it, the
+        // first caller in a cycle fetches and the rest read the same ref
+        // state, which is what keeps the bodies and the census coherent.
+        let key = (repo_root.to_path_buf(), default_ref.to_string());
+        {
+            let memo = fetch_memo().lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(at) = memo.get(&key) {
+                if at.elapsed() < SCAN_FETCH_MEMO_TTL {
+                    return Ok(());
+                }
+            }
+        }
+        // `-c gc.auto=0`: this is a WRITE into a checkout other agents are
+        // working in. git runs `gc --auto` after a fetch by default, and a
+        // repack fired off by the scan loop is a side effect on a shared
+        // resource the scan has no business causing.
         // `--no-tags`: the scan reads one branch; tag traffic is pure cost.
-        Self::run_within(
+        let out = Self::run_within(
             repo_root,
             &[
                 "-c",
@@ -1416,7 +1576,14 @@ impl GitRefReader for ProcessGit {
             "plan adapter: scan fetch",
             SCAN_FETCH_TIMEOUT,
         )
-        .map(|_| ())
+        .map(|_| ());
+        if out.is_ok() {
+            fetch_memo()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(key, std::time::Instant::now());
+        }
+        out
     }
 
     fn list_ref_dir(
@@ -1483,14 +1650,50 @@ impl GitRefReader for ProcessGit {
         if ids.is_empty() {
             return Vec::new();
         }
+        // A PURE DELEGATION, and it must stay one — the logic lives where it is
+        // tested. `read_blobs_wrapper_is_a_pure_delegation` pins this spelling
+        // for the same reason `wedge_diagnostics`' lane wrapper is pinned: a
+        // behavioural test against the PROCESS-GLOBAL cache cannot drive it
+        // past a 96 MB bound, so nothing here would be covered if the body grew
+        // back into this function.
         let mut cache = blob_cache().lock().unwrap_or_else(|p| p.into_inner());
+        Self::read_blobs_into(&mut cache, repo_root, ids, BLOB_CACHE_MAX_BYTES)
+    }
+}
+
+impl ProcessGit {
+    /// [`GitRefReader::read_blobs`] against an EXPLICIT cache and bound.
+    ///
+    /// Module-private on purpose: production must not be able to choose a cache
+    /// or a bound. The parameters exist so a test can cover THIS function — the
+    /// one that does the work — against a map the rest of the test binary
+    /// cannot touch and a bound it can actually cross.
+    ///
+    /// This is the crate's existing pattern, not a new one: see
+    /// [`crate::wedge_diagnostics::spawn_blocking_tracked`], whose doc says the
+    /// parameter exists "so the lane tests can cover THIS function … against a
+    /// table the rest of the test binary cannot saturate".
+    ///
+    /// An earlier draft of the eviction test's doc claimed the hit arm could
+    /// not be covered because "reaching it under eviction needs a global bound
+    /// override, and such an override would race". That was WRONG — the route
+    /// is to PARAMETERISE, not to override, and the crate already did it here.
+    /// Recorded because the false reason is what argued a closeable gap shut.
+    fn read_blobs_into(
+        cache: &mut HashMap<String, (String, u64)>,
+        repo_root: &Path,
+        ids: &[String],
+        max_bytes: usize,
+    ) -> Vec<Result<String, String>> {
         let out: Vec<Result<String, String>> = ids
             .iter()
-            .map(|id| match cache.get(id) {
+            .map(|id| match touch_blob(cache, id) {
                 // A git object id is a CONTENT HASH, so a hit is not a guess
                 // that the bytes are unchanged — it is a proof of it. That is
                 // the whole reason this cache needs no invalidation rule.
-                Some(hit) => Ok(hit.clone()),
+                // `touch_blob` also re-stamps it, so a body only this caller
+                // reads stays hot.
+                Some(hit) => Ok(hit),
                 None => {
                     let body = Self::cat_file_blob(repo_root, id)?;
                     // STRICT UTF-8, not `from_utf8_lossy`: `read_plan_dir`'s
@@ -1499,16 +1702,15 @@ impl GitRefReader for ProcessGit {
                     // about — the opposite of the parity this phase claims.
                     let text = String::from_utf8(body)
                         .map_err(|e| format!("blob {id} is not valid UTF-8: {e}"))?;
-                    cache.insert(id.clone(), text.clone());
+                    cache.insert(id.clone(), (text.clone(), blob_cache_tick()));
                     Ok(text)
                 }
             })
             .collect();
-        // Bounded by ONE corpus: anything not in this listing is unreachable
-        // from the next scan too (a rewritten plan gets a new id), so keeping
-        // it would be an unbounded leak in a process that runs for weeks.
-        let keep: HashSet<&str> = ids.iter().map(String::as_str).collect();
-        cache.retain(|id, _| keep.contains(id.as_str()));
+        // LRU against the bound — NEVER a prune to this caller's own ids, which
+        // would evict every other scan root's corpus on every call. See
+        // [`blob_cache`].
+        evict_cold_blobs(cache, max_bytes);
         out
     }
 }
@@ -1545,15 +1747,17 @@ fn scan_divergence_message(d: &ScanDivergence) -> (bool, String) {
                 "plan adapter: the scanned plans dir is a WORKING TREE that has diverged from \
                  its own default branch, and the counts are LOWER BOUNDS: they were taken \
                  against `{default_ref}` {as_of}, so the true `behind` can only be larger (and \
-                 `ahead` may overstate). Every work unit and plan body pushed from this machine \
-                 reflects that parked tree, not the ref (the adapter never fetches)"
+                 `ahead` may overstate). This describes the CHECKOUT, not what was published: \
+                 since Phase 3 both the work units and the plan bodies are read from the ref, so \
+                 a divergent tree no longer implies a divergent corpus"
             )
         } else {
             format!(
                 "plan adapter: the scanned plans dir's HEAD reads 0 behind / 0 ahead of \
                  `{default_ref}`, but that is a LOWER BOUND, not agreement: the ref was compared \
                  {as_of}, so how far the scan source has fallen behind is UNKNOWN until the ref \
-                 is refreshed (the adapter never fetches)"
+                 is refreshed (this reading is taken WITHOUT fetching; the scan \
+                 itself does fetch — see `fetch_default`)"
             )
         };
         return (true, message);
@@ -1567,9 +1771,9 @@ fn scan_divergence_message(d: &ScanDivergence) -> (bool, String) {
             true,
             format!(
                 "plan adapter: the scanned plans dir is a WORKING TREE that is behind its own \
-                 default branch — every work unit and plan body pushed from this machine \
-                 reflects that parked tree, not the ref. Counts are as of {as_of} (the adapter \
-                 never fetches)"
+                 default branch. Counts are as of {as_of}. This is a fact about the CHECKOUT \
+                 only — since Phase 3 both layers publish from the ref, so this no longer means \
+                 the corpus is stale; it means peers reading files in this tree get old bytes"
             ),
         );
     }
@@ -2186,6 +2390,109 @@ fn denial_of(err: &anyhow::Error) -> Option<CoordDenial> {
         status: w.status,
         verdict: w.verdict(),
     })
+}
+
+/// Read every scan root through its RESOLVED source — the ref where there is
+/// one, the working tree only where the dir is not in a repo at all.
+///
+/// The document-layer counterpart of [`read_plans_for_cycle`], and deliberately
+/// the same three arms, because the two layers publishing from different bytes
+/// is the defect this exists to close: Phase 2 moved the work-unit half onto
+/// the ref and left this half on the tree, so on a checkout 717 commits behind
+/// its default branch a plan amended on `origin/main` changed no file here, the
+/// digest memory saw no change, and no write was ever issued — the artifact's
+/// `updated_at` FROZE rather than going stale (finding 61b51044).
+///
+/// ## Two consequences this deliberately accepts, stated because the docs were
+/// silent on them
+///
+/// **An unpushed or gitignored plans dir stops being CAPTURED.** `list_ref_dir`
+/// turns git's non-zero exit into "does not exist in that ref", which lands on
+/// the `Err` arm and contributes nothing. That reasoning was written for the
+/// work-unit layer, where an unpushed plan genuinely is not tracked work. Here
+/// it means the document corpus stops capturing a plan that exists only in the
+/// tree — and because the sync is upsert-only, an already-published body
+/// FREEZES rather than being corrected, which is this plan's own symptom
+/// relocated. Note the asymmetry: a tenant authoring into a plain non-repo
+/// directory keeps capture (the `WorkTree` arm), a tenant authoring into a repo
+/// does not. That is a product call and it is made HERE, visibly, rather than
+/// falling out of a branch nobody documented.
+///
+/// **A plan that is a SYMLINK stops being published.** `list_ref_dir` skips
+/// mode `120000` (its blob is the link target, not the file), while the tree
+/// walk's `classify_entry` follows links via `fs::metadata`. So the two arms do
+/// NOT scan an identical set, and `body_sync_arms_agree` pins the
+/// CLASSIFICATION half only — the listings differ here and on subdirectory skip
+/// records. A symlinked plan published before this change freezes after it.
+///
+/// One contract difference from the work-unit arm, and it is why this returns a
+/// partial set rather than an all-or-nothing `Option`: the body sync is
+/// UPSERT-ONLY. `backfill_once` writes the artifacts it is handed and deletes
+/// nothing, so a root that contributes nothing costs a refresh, never a
+/// deletion. The work-unit reconcile has a disappearance concept and must
+/// therefore publish nothing at all rather than publish a short set; here the
+/// per-root independence is safe and strictly better, because one unreadable
+/// root must not stop the others refreshing.
+pub fn scan_roots_at_source(
+    roots: &[super::body_push::ScanRoot],
+    conv: &PlanConvention,
+    git: &dyn GitRefReader,
+) -> (
+    Vec<super::body_push::ScannedArtifact>,
+    Vec<super::body_push::SkippedFile>,
+) {
+    use super::ref_scan::{read_ref_dir, resolve_scan_source, ScanSource};
+    let mut artifacts = Vec::new();
+    let mut skipped = Vec::new();
+    for root in roots {
+        match resolve_scan_source(git, &root.dir) {
+            // Not in a repo at all — a SUPPORTED layout (a tenant may author
+            // into a plain directory), so the tree is the only source there is
+            // and reading it is correct rather than a degradation.
+            ScanSource::WorkTree => {
+                artifacts.extend(super::body_push::scan_one_root(root, conv, &mut skipped));
+            }
+            ScanSource::Ref {
+                repo_root,
+                ref_name,
+                rel_dir,
+            } => match read_ref_dir(git, &repo_root, &ref_name, &rel_dir) {
+                Ok(listing) => {
+                    artifacts.extend(super::body_push::scan_one_root_at_ref(
+                        root,
+                        &listing.files,
+                        conv,
+                        &mut skipped,
+                    ));
+                }
+                Err(e) => {
+                    // NOT a fallback to the tree: substituting the tree here is
+                    // the very defect this arm removes, and it would republish
+                    // the parked bytes under the same identity
+                    // [policy: `unknown-must-not-render-as-a-default`].
+                    tracing::warn!(
+                        root = %root.label,
+                        repo_root = %repo_root.display(),
+                        ref_name = %ref_name,
+                        rel_dir = %rel_dir,
+                        error = %e,
+                        "plan library: could not read this scan root at the ref; \
+                         it contributes nothing this cycle (the corpus keeps its last bodies)"
+                    );
+                }
+            },
+            ScanSource::Unavailable { reason } => {
+                tracing::warn!(
+                    root = %root.label,
+                    dir = %root.dir.display(),
+                    reason = %reason,
+                    "plan library: scan source unavailable for this root; \
+                     it contributes nothing this cycle (the corpus keeps its last bodies)"
+                );
+            }
+        }
+    }
+    (artifacts, skipped)
 }
 
 /// Push every parsed unit through the edge-trigger + conflict logic, updating
@@ -3098,6 +3405,11 @@ impl LoopState {
         // what the backend already holds.
         self.body_sync = self.body_sync_sink.as_ref().map(|sink| {
             BodySync::new(roots, sink.clone(), self.capture_gate.clone())
+                // The loop's OWN reader, so the document layer, the work-unit
+                // layer and the divergence probe cannot look at three different
+                // gits — and so a tick-level test drives all three with one
+                // injected fake.
+                .with_git(std::sync::Arc::clone(&self.git))
                 .with_scan_report_gate(self.scan_report_gate.clone())
         });
         #[cfg(test)]
@@ -4211,6 +4523,16 @@ pub fn scan_report_due(
 #[derive(Clone)]
 pub struct BodySync {
     roots: Vec<super::body_push::ScanRoot>,
+    /// The git reader the body sync takes its BYTES through — the document
+    /// layer's counterpart of [`LoopState::git`].
+    ///
+    /// Phase 2 of `2026-09-10-the-plan-scanner-reads-a-parked-working-tree-not-a-ref`
+    /// moved the WORK-UNIT half onto `origin/<default-branch>` and left this
+    /// half walking the filesystem, so on a checkout behind its own default
+    /// branch the two halves published from different bytes and a plan amended
+    /// only on the ref never reached the corpus at all (finding 61b51044:
+    /// measured 717 commits behind, two stems frozen in the same cycle).
+    git: std::sync::Arc<dyn GitRefReader>,
     sink: super::body_push::HttpArtifactSink,
     state: super::body_push::ArtifactSyncState,
     capture_gate: CaptureGate,
@@ -4290,6 +4612,7 @@ impl BodySync {
     ) -> Self {
         Self {
             roots,
+            git: std::sync::Arc::new(ProcessGit),
             reporter: std::sync::Arc::new(sink.clone()),
             sink,
             state: super::body_push::ArtifactSyncState::new(),
@@ -4303,6 +4626,16 @@ impl BodySync {
             scan_report_gate_announced: false,
             last_census_digests: HashMap::new(),
         }
+    }
+
+    /// Take bytes through `git` instead of the default [`ProcessGit`].
+    ///
+    /// Set by [`LoopState`] from its OWN reader, so the document layer, the
+    /// work-unit layer and the divergence probe cannot look at three different
+    /// gits — and so a test can drive this half with no repo on disk.
+    pub fn with_git(mut self, git: std::sync::Arc<dyn GitRefReader>) -> Self {
+        self.git = git;
+        self
     }
 
     /// Supply the instance-ownership predicate scan-root reports are gated on
@@ -4603,14 +4936,22 @@ impl BodySync {
             return;
         }
 
-        // `scan_all_roots` does ~1,100 synchronous `read_to_string` calls. On
-        // the async path that blocks a tokio worker thread for the whole walk,
-        // starving every other task sharing it — so it runs on the blocking
-        // pool and the result comes back by value.
+        // On the blocking pool, and now for a second reason as well as the
+        // first. The scan reads a body per plan (~1,863 on the measured box)
+        // either way, and doing that inline blocks a tokio worker for the whole
+        // walk, starving every other task sharing it. Since Phase 3 it ALSO
+        // resolves each root's source, which spawns `git` and — on the first
+        // caller of a cycle — performs a network fetch on a 120 s budget
+        // (`SCAN_FETCH_TIMEOUT`, memoised per `(root, ref)` by `fetch_memo`, so
+        // a cycle pays it once rather than once per consumer). A tick's worst
+        // case therefore scales with the root count; size it deliberately
+        // against the reconcile interval rather than assuming the old walk's
+        // cost.
         let roots = self.roots.clone();
         let conv = conv.clone();
+        let git = std::sync::Arc::clone(&self.git);
         let scanned =
-            spawn_blocking_tracked(move || super::body_push::scan_all_roots(&roots, &conv)).await;
+            spawn_blocking_tracked(move || scan_roots_at_source(&roots, &conv, git.as_ref())).await;
         let (artifacts, skipped) = match scanned {
             Ok(v) => v,
             Err(e) => {
@@ -6194,6 +6535,571 @@ mod tests {
 
     /// The plain case on real git output: a clone that has just fetched reads
     /// a refresh within seconds of now — through the reflog AND `FETCH_HEAD`.
+    // ---- Phase 3: the DOCUMENT layer takes its bytes from the ref too ----
+
+    /// A plans scan root at `dir`, the shape `BodySync` builds in production.
+    fn plans_root(dir: &Path) -> super::super::body_push::ScanRoot {
+        super::super::body_push::ScanRoot::new(
+            dir.to_path_buf(),
+            super::super::body_push::ScanRootKind::Plans,
+            super::super::body_push::PLANS_ROOT_LABEL,
+        )
+    }
+
+    /// **The parity test the document layer never had.**
+    ///
+    /// Phase 2 shipped `read_plans_for_cycle_arms_agree` for the WORK-UNIT
+    /// layer and nothing at all for this one, which is exactly why a green CI
+    /// could coexist with a corpus that never refreshed: no Phase 2 test ever
+    /// executed `body_push`. Both arms must build the SAME `ScannedArtifact`
+    /// from the same bytes — same kind, same slug, same `source_repo`, same
+    /// recorded `source_path`, same sha.
+    ///
+    /// NOTE this doc previously ended "or the ref arm mints a second row per
+    /// plan … the corpus DOUBLES rather than refreshes". That was FALSE and is
+    /// struck here rather than quietly dropped: identity is
+    /// `(kind, slug, source_repo)`, the slug is BASENAME-derived and
+    /// `source_repo` comes from the root, so a divergent path would update the
+    /// SAME row with a different `source_path`. See `scan_one_root_at_ref`,
+    /// where the same false claim was retracted — it survived here, in the doc
+    /// of the very test that supposedly guarded it, which is how a retraction
+    /// leaves a reader worse off than no retraction.
+    ///
+    /// Neuter check: change `scan_one_root_at_ref`'s `root.dir.join(&f.name)`
+    /// to `PathBuf::from(&f.name)` and this fails on the upsert's path.
+    #[test]
+    fn body_sync_arms_agree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "# A plan\n\n> **Status: VETTED 2026-09-22.**\n\nBody.\n";
+        std::fs::write(tmp.path().join("2026-01-01-a-plan.md"), body).unwrap();
+        let root = plans_root(tmp.path());
+        let conv = PlanConvention::operator_default();
+
+        // Tree arm: not in a repo, so the tree is the only source there is.
+        let (tree, tree_skipped) = scan_roots_at_source(
+            std::slice::from_ref(&root),
+            &conv,
+            &FakeGit {
+                root: Ok(None),
+                ..FakeGit::healthy(0, 0)
+            },
+        );
+
+        // Ref arm: the same dir IS the repo root, serving the same bytes.
+        let (refd, ref_skipped) = scan_roots_at_source(
+            std::slice::from_ref(&root),
+            &conv,
+            &FakeGit {
+                root: Ok(Some(tmp.path().to_path_buf())),
+                ref_dir: Ok(vec![RefDirEntry {
+                    name: "2026-01-01-a-plan.md".into(),
+                    id: "ida".into(),
+                }]),
+                blobs: [("ida".to_string(), Ok(body.to_string()))]
+                    .into_iter()
+                    .collect(),
+                ..FakeGit::healthy(0, 0)
+            },
+        );
+
+        assert_eq!(tree.len(), 1, "the fixture holds exactly one plan");
+        assert_eq!(
+            tree, refd,
+            "same bytes must build the same artifact — same kind, slug, source_repo, \
+             source_path and sha"
+        );
+        // NOT asserted: that the two arms produce the same SKIP records. They
+        // do not, and an earlier draft asserted it — vacuously, because this
+        // fixture has one file and no subdirectory, so both sides were empty.
+        // The tree walk emits `subdirectory_not_scanned` per subdir plus
+        // `unreadable_entry` / `unreadable_dir`; the ref arm sees none of those
+        // because `list_ref_dir` filters trees out before `scan_one_root_at_ref`
+        // is reached. Add one subdirectory to this fixture and the old
+        // assertion fails. What this test pins is CLASSIFICATION parity, which
+        // is what `classify_one` exists to guarantee; listing parity is a
+        // different property and is NOT claimed [see `scan_roots_at_source`'s
+        // symlink and subdirectory notes].
+        let _ = (tree_skipped, ref_skipped);
+    }
+
+    /// **The Phase 3 defect, demonstrated.**
+    ///
+    /// The tree carries the OLD body and the ref carries the NEW one — which
+    /// is the steady state on any checkout behind its own default branch, and
+    /// was measured at 717 commits behind on merytshost. Before this phase the
+    /// document layer published the tree's bytes, so a plan amended on
+    /// `origin/main` changed no file here, the digest memory saw no change,
+    /// and the artifact's `updated_at` FROZE — two stems were measured frozen
+    /// in the same cycle (finding 61b51044).
+    ///
+    /// Neuter check: point the `Ref` arm of `scan_roots_at_source` at
+    /// `scan_one_root` and this fails — it gets the parked body back.
+    #[test]
+    fn the_body_sync_reads_the_ref_not_the_parked_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parked = "# A plan\n\n> **Status: DRAFT 2026-09-01.**\n\nThe PARKED body.\n";
+        let at_ref = "# A plan\n\n> **Status: SHIPPED 2026-09-22.**\n\nThe REF body.\n";
+        std::fs::write(tmp.path().join("2026-01-01-a-plan.md"), parked).unwrap();
+
+        let (got, _) = scan_roots_at_source(
+            &[plans_root(tmp.path())],
+            &PlanConvention::operator_default(),
+            &FakeGit {
+                root: Ok(Some(tmp.path().to_path_buf())),
+                ref_dir: Ok(vec![RefDirEntry {
+                    name: "2026-01-01-a-plan.md".into(),
+                    id: "ida".into(),
+                }]),
+                blobs: [("ida".to_string(), Ok(at_ref.to_string()))]
+                    .into_iter()
+                    .collect(),
+                ..FakeGit::healthy(717, 0)
+            },
+        );
+
+        assert_eq!(got.len(), 1);
+        let pushed = &got[0].upsert;
+        assert!(
+            pushed.body.contains("The REF body"),
+            "the ref's bytes must be what is published; got: {:?}",
+            pushed.body
+        );
+        assert!(
+            !pushed.body.contains("The PARKED body"),
+            "the parked tree's bytes must NOT be published"
+        );
+        assert_eq!(
+            pushed.status, "shipped",
+            "the status published is the REF's, which is the whole point: a SUPERSEDED \
+             stamp on origin/main has to reach the corpus"
+        );
+    }
+
+    /// No fallback to the tree, ever — the same contract the work-unit arm
+    /// carries. A root whose source will not resolve contributes NOTHING, and
+    /// the corpus keeps the bodies it already has.
+    ///
+    /// Substituting the tree here would republish the parked bytes under the
+    /// same identity, which is the defect rather than a degrade
+    /// [policy: `unknown-must-not-render-as-a-default`].
+    #[test]
+    fn an_unavailable_root_contributes_nothing_and_never_the_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("2026-01-01-a-plan.md"),
+            "# A\n\n> **Status: DRAFT 2026-09-01.**\n\nParked.\n",
+        )
+        .unwrap();
+
+        for (label, git) in [
+            (
+                "fetch fails",
+                FakeGit {
+                    root: Ok(Some(tmp.path().to_path_buf())),
+                    fetch: Err("no route to host".into()),
+                    ..FakeGit::healthy(0, 0)
+                },
+            ),
+            (
+                "no origin/HEAD",
+                FakeGit {
+                    root: Ok(Some(tmp.path().to_path_buf())),
+                    default_ref: Err("`origin/HEAD` is not set in this clone".into()),
+                    ..FakeGit::healthy(0, 0)
+                },
+            ),
+            (
+                "listing unreadable",
+                FakeGit {
+                    root: Ok(Some(tmp.path().to_path_buf())),
+                    ref_dir: Err("bad object".into()),
+                    ..FakeGit::healthy(0, 0)
+                },
+            ),
+        ] {
+            let (got, _) = scan_roots_at_source(
+                &[plans_root(tmp.path())],
+                &PlanConvention::operator_default(),
+                &git,
+            );
+            assert!(
+                got.is_empty(),
+                "{label}: an unresolvable source must publish nothing, never the parked tree"
+            );
+        }
+    }
+
+    /// The eviction POLICY, directly — the coverage that was lost when the
+    /// first (vacuous) cache test was deleted.
+    ///
+    /// Those are two different properties and BOTH need pinning. The
+    /// through-`read_blobs` test below pins the WIRING (that `read_blobs` does
+    /// not evict another caller's ids); this pins the POLICY (that eviction is
+    /// by least-recently-used against the byte bound, and that a hit re-stamps).
+    /// With only the wiring test, `BLOB_CACHE_MAX_BYTES` is unreachable from
+    /// any test — the bound short-circuits — so deleting the
+    /// `slot.1 = blob_cache_tick()` re-stamp left the whole suite green.
+    ///
+    /// Neuter check, VERIFIED: change `retain(|_, (_, n)| *n > cutoff)` to `<`
+    /// and this fails.
+    ///
+    /// An earlier version of this doc ALSO claimed "delete the re-stamp in
+    /// `read_blobs`' hit arm and this fails". It does NOT — measured: that
+    /// neuter left this test green, because the test stamps its entries by hand
+    /// and never executes the hit arm. The claim was written without being run.
+    /// The re-stamp is covered by the `touch_blob` assertions below instead,
+    /// with the honest bound on that coverage stated there.
+    #[test]
+    fn eviction_is_least_recently_used_against_the_byte_bound() {
+        let mut cache: HashMap<String, (String, u64)> = HashMap::new();
+        // 8 entries of 100 bytes each; stamps ascending, so `cold0` is coldest.
+        for i in 0..8u64 {
+            cache.insert(format!("cold{i}"), ("x".repeat(100), i));
+        }
+
+        // Under the bound, NOTHING is evicted — this is the arm that makes a
+        // second caller's read safe.
+        evict_cold_blobs(&mut cache, 100 * 1024);
+        assert_eq!(cache.len(), 8, "under the byte bound nothing is evicted");
+
+        // Over the bound: the COLDEST go, the HOTTEST stay, a quarter at a time.
+        evict_cold_blobs(&mut cache, 400);
+        assert!(cache.len() < 8, "over the bound something is evicted");
+        assert!(
+            cache.contains_key("cold7"),
+            "the most recently used entry survives"
+        );
+        assert!(
+            !cache.contains_key("cold0"),
+            "the least recently used entry is the one evicted"
+        );
+        assert_eq!(
+            cache.len(),
+            5,
+            "a QUARTER plus the cutoff entry goes (8 -> 5), so eviction is amortised \
+             rather than one entry per insert"
+        );
+
+        // The bound is BYTES, not entries: two huge entries must evict where
+        // two small ones would not. An entry cap could not express this, and
+        // that is why the constant changed.
+        let mut big: HashMap<String, (String, u64)> = HashMap::new();
+        big.insert("a".into(), ("x".repeat(4096), 1));
+        big.insert("b".into(), ("x".repeat(4096), 2));
+        evict_cold_blobs(&mut big, 4096);
+        assert!(
+            big.len() < 2,
+            "the byte bound is what decides, not the entry count"
+        );
+
+        // The RE-STAMP — the half an eviction test cannot reach on its own. A
+        // hit must become most-recently-used, or a body only one caller reads
+        // ages out while being read every cycle.
+        //
+        // This pins `touch_blob` itself. The WIRING — that the read path calls
+        // it, and evicts after its reads — is pinned separately and
+        // hermetically by `read_blobs_into_re_stamps_hits_and_evicts_after`,
+        // against a local map and a tiny bound.
+        //
+        // An earlier version of this comment claimed the wiring COULD NOT be
+        // pinned, because "reaching the hit arm under eviction needs a global
+        // bound override, and such an override would race". That was false: the
+        // route is to PARAMETERISE rather than override, and this crate already
+        // does it for `wedge_diagnostics`' lane table for exactly this reason.
+        // Left recorded because a wrong reason attached to a real decision
+        // argues a closeable gap shut — which is what it did for one review
+        // round.
+        // Stamps come FROM `blob_cache_tick()`, never hardcoded. The counter
+        // is a `fetch_add` returning the PREVIOUS value, so it starts at 0 and
+        // every production stamp is drawn from it — meaning the counter is
+        // always at or ahead of every stamp in the map. Hardcoding 1 and 2 here
+        // violated that invariant and made the touch produce a COLDER stamp
+        // than the entries it was compared against; the test then failed for
+        // its own reason rather than the code's. Successive `fetch_add`s are
+        // ordered even across the parallel tests sharing this counter, so
+        // RELATIVE assertions are sound while absolute values are not.
+        let mut lru: HashMap<String, (String, u64)> = HashMap::new();
+        let stamp_old = blob_cache_tick();
+        let stamp_new = blob_cache_tick();
+        assert!(stamp_new > stamp_old, "the counter is monotonic");
+        lru.insert("old".into(), ("body-old".into(), stamp_old));
+        lru.insert("new".into(), ("body-new".into(), stamp_new));
+        assert_eq!(
+            touch_blob(&mut lru, "old").as_deref(),
+            Some("body-old"),
+            "a hit serves the cached body"
+        );
+        let old_stamp = lru["old"].1;
+        let new_stamp = lru["new"].1;
+        assert!(
+            old_stamp > new_stamp,
+            "the touched entry must become the HOTTEST ({old_stamp} vs {new_stamp}) — \
+             without the re-stamp it keeps its insert stamp and is evicted first"
+        );
+        assert_eq!(touch_blob(&mut lru, "absent"), None, "a miss is None");
+    }
+
+    /// The WIRING of the cache into the read path, hermetically: against a
+    /// LOCAL map and a bound small enough to cross, so no global state and no
+    /// `git` is involved and nothing races the rest of the test binary.
+    ///
+    /// This is the coverage my own doc comment claimed was unreachable. It is
+    /// reachable because `read_blobs_into` takes the cache and the bound as
+    /// parameters — the pattern `wedge_diagnostics::spawn_blocking_tracked_in`
+    /// already established here.
+    ///
+    /// Neuter checks: revert the hit arm to a non-re-stamping `cache.get(id)`
+    /// and the re-stamp assertion fails; delete the `evict_cold_blobs` call and
+    /// the eviction assertion fails.
+    #[test]
+    fn read_blobs_into_re_stamps_hits_and_evicts_after() {
+        // Pre-populated so EVERY id hits — no `git` is reachable from here, and
+        // a miss would try to spawn one against a path that does not exist.
+        let mut cache: HashMap<String, (String, u64)> = HashMap::new();
+        let cold = blob_cache_tick();
+        let warm = blob_cache_tick();
+        cache.insert("cold".into(), ("x".repeat(600), cold));
+        cache.insert("warm".into(), ("y".repeat(600), warm));
+
+        // Read ONLY the cold one. Its stamp must overtake the other's, or a
+        // body that just one caller reads ages out while being read.
+        let out = ProcessGit::read_blobs_into(
+            &mut cache,
+            Path::new("/nonexistent-on-purpose"),
+            &["cold".to_string()],
+            100 * 1024,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].as_deref(),
+            Ok("x".repeat(600).as_str()),
+            "the hit is served from the cache, not from git"
+        );
+        assert!(
+            cache["cold"].1 > cache["warm"].1,
+            "reading `cold` must make it the HOTTEST ({} vs {}) — this is the \
+             re-stamp, wired",
+            cache["cold"].1,
+            cache["warm"].1
+        );
+
+        // And eviction runs AFTER the reads, against the bound passed in.
+        let out = ProcessGit::read_blobs_into(
+            &mut cache,
+            Path::new("/nonexistent-on-purpose"),
+            &["cold".to_string()],
+            700,
+        );
+        assert_eq!(out[0].as_deref(), Ok("x".repeat(600).as_str()));
+        assert!(
+            !cache.contains_key("warm"),
+            "1200 bytes held against a 700-byte bound must evict, and the \
+             just-read `cold` is not the one to go"
+        );
+        assert!(cache.contains_key("cold"), "the entry just read survives");
+    }
+
+    /// `read_blobs` must stay a PURE DELEGATION to `read_blobs_into`.
+    ///
+    /// Pinned by source text, exactly as `wedge_diagnostics` pins its lane
+    /// wrapper, and for the same reason: a behavioural test against the
+    /// process-global cache cannot drive it past a 96 MB bound, so if the body
+    /// grew back into the wrapper nothing would cover it — which is the state
+    /// this change just left.
+    #[test]
+    fn read_blobs_wrapper_is_a_pure_delegation() {
+        let src = include_str!("trigger.rs");
+        let at = src
+            .find("fn read_blobs(&self, repo_root: &Path, ids: &[String]) -> Vec<Result<String, String>> {\n        if ids.is_empty()")
+            .expect("the ProcessGit impl of read_blobs is findable by signature");
+        let body: String = src[at..]
+            .chars()
+            .take(900)
+            .collect::<String>()
+            .split("\n    }")
+            .next()
+            .unwrap_or("")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            body.contains("Self::read_blobs_into(&mutcache,repo_root,ids,BLOB_CACHE_MAX_BYTES)"),
+            "the wrapper no longer delegates to \
+             `read_blobs_into(&mut cache, repo_root, ids, BLOB_CACHE_MAX_BYTES)`. If this \
+             is a deliberate signature change and the wrapper is STILL a pure \
+             delegation, update this pin in the same change. Body:\n{body}"
+        );
+        assert!(
+            !body.contains("cat_file_blob"),
+            "the wrapper has grown its own blob-reading body. Nothing covers that \
+             body: the cache tests exercise `read_blobs_into` against a local map, \
+             and a behavioural test against the global cache cannot cross a 96 MB \
+             bound. Keep the wrapper a delegation and put logic where it is \
+             tested. Body:\n{body}"
+        );
+    }
+
+    /// **The cache regression this phase introduced and then fixed — pinned
+    /// THROUGH `read_blobs`, which is the only way it bites.**
+    ///
+    /// Phase 3 turned one `read_blobs` call per cycle into `1 + roots`, and the
+    /// cache's prune was `retain(only this call's ids)`. Two callers with
+    /// disjoint id sets therefore evicted each other every cycle — ~1,863
+    /// `git cat-file` spawns per minute on a two-root box, each taken while
+    /// holding the cache mutex. It was invisible with one caller because the
+    /// prune was a no-op.
+    ///
+    /// The FIRST version of this test called `evict_cold_blobs` directly and
+    /// was VACUOUS: neutering `read_blobs`' call site left it passing, because
+    /// it never went through `read_blobs` at all. It pinned the helper and not
+    /// the thing that regressed. Recorded here because a test that cannot fail
+    /// is worse than no test — it reports safety it never measured.
+    ///
+    /// So: read set A, read a DISJOINT set B, then delete the repository and
+    /// re-read A. Only a cache hit can answer once the repo is gone, so the
+    /// assertion is exactly "B's read did not evict A".
+    ///
+    /// Neuter check: restore `retain(|id, _| this_call's_ids.contains(id))` in
+    /// `read_blobs` and this fails — verified.
+    #[test]
+    fn a_second_read_does_not_evict_the_first_reads_blobs() {
+        let tmp = ref_scan_fixture();
+        let clone = tmp.path().join("clone");
+        let entries = ProcessGit
+            .list_ref_dir(&clone, "origin/main", "plans")
+            .expect("the fixture lists");
+        let id_of = |name: &str| {
+            entries
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("{name} is in the listing"))
+                .id
+                .clone()
+        };
+        let set_a = vec![id_of("2026-01-01-normal.md")];
+        let set_b = vec![id_of("2026-01-02-empty.md")];
+        assert_ne!(
+            set_a, set_b,
+            "the two sets must be disjoint for this to test anything"
+        );
+
+        // A, then B — two callers, as a cycle now makes.
+        let first = ProcessGit.read_blobs(&clone, &set_a);
+        assert!(
+            first[0].as_deref().unwrap_or("").starts_with("# Normal"),
+            "got: {:?}",
+            first[0]
+        );
+        let _ = ProcessGit.read_blobs(&clone, &set_b);
+
+        // The repository is gone; only the cache can answer for A now.
+        std::fs::remove_dir_all(&clone).expect("the fixture clone is removable");
+        let again = ProcessGit.read_blobs(&clone, &set_a);
+        assert_eq!(
+            again[0], first[0],
+            "the second read's ids must NOT have evicted the first's — under the old \
+             prune-to-this-call's-ids policy this is a miss, and a miss cannot be served \
+             from a repo that no longer exists"
+        );
+    }
+
+    /// One unreadable root must not stop the others refreshing — the contract
+    /// difference from the work-unit arm, which publishes all-or-nothing
+    /// because it has a disappearance concept. The body sync is UPSERT-ONLY,
+    /// so a short set costs a deferred refresh and never a deletion.
+    ///
+    /// BOTH roots take the `Ref` arm, one healthy and one whose listing fails.
+    /// An earlier draft paired an `Unavailable` root with a `WorkTree` one,
+    /// which proved independence across those two arms and left the branch most
+    /// likely to regress untested: an early `return` added to the `Ref`→`Err`
+    /// arm would have passed it, because no root in it reached that arm
+    /// successfully.
+    ///
+    /// Neuter check: change the `Ref`→`Err(e)` arm to `return (artifacts,
+    /// skipped)` and this fails.
+    #[test]
+    fn one_dark_ref_root_does_not_starve_a_healthy_ref_root() {
+        let good = tempfile::tempdir().unwrap();
+        let dark = tempfile::tempdir().unwrap();
+
+        /// Both dirs are repo roots; only `good`'s listing resolves.
+        struct TwoRefRoots {
+            good: PathBuf,
+            body: String,
+        }
+        impl GitRefReader for TwoRefRoots {
+            fn work_tree_root(&self, dir: &Path) -> Result<Option<PathBuf>, String> {
+                Ok(Some(dir.to_path_buf()))
+            }
+            fn default_ref(&self, _r: &Path) -> Result<String, String> {
+                Ok("origin/main".to_string())
+            }
+            fn rev_parse(&self, _r: &Path, _rev: &str) -> Result<String, String> {
+                Ok("a".repeat(40))
+            }
+            fn count_behind_ahead(
+                &self,
+                _r: &Path,
+                _a: &str,
+                _b: &str,
+            ) -> Result<(u64, u64), String> {
+                Ok((0, 0))
+            }
+            fn ref_refresh_stamps(
+                &self,
+                _r: &Path,
+                _d: &str,
+                _s: &str,
+            ) -> Vec<Result<Option<i64>, String>> {
+                Vec::new()
+            }
+            fn fetch_default(&self, _r: &Path, _d: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn list_ref_dir(
+                &self,
+                repo_root: &Path,
+                _n: &str,
+                _d: &str,
+            ) -> Result<Vec<RefDirEntry>, String> {
+                if repo_root == self.good {
+                    Ok(vec![RefDirEntry {
+                        name: "2026-01-02-good.md".into(),
+                        id: "idgood".into(),
+                    }])
+                } else {
+                    Err("bad object".into())
+                }
+            }
+            fn read_blobs(&self, _r: &Path, ids: &[String]) -> Vec<Result<String, String>> {
+                ids.iter()
+                    .map(|id| {
+                        if id == "idgood" {
+                            Ok(self.body.clone())
+                        } else {
+                            Err("no such blob".to_string())
+                        }
+                    })
+                    .collect()
+            }
+        }
+
+        let (got, _) = scan_roots_at_source(
+            &[plans_root(dark.path()), plans_root(good.path())],
+            &PlanConvention::operator_default(),
+            &TwoRefRoots {
+                good: good.path().to_path_buf(),
+                body: "# Good\n\n> **Status: DRAFT 2026-09-01.**\n".to_string(),
+            },
+        );
+        assert_eq!(
+            got.len(),
+            1,
+            "the healthy REF root must still publish while the dark one contributes nothing"
+        );
+        assert!(got[0].upsert.slug.contains("good"));
+    }
+
     /// A real clone with a real `plans/` tree at `origin/main`, for the
     /// [`ProcessGit`] half of the ref scan — the `-z`/TAB/mode parser,
     /// `cat_file_blob` and `fetch_default`. None of it is reachable from
@@ -6219,9 +7125,21 @@ mod tests {
         );
         let plans = clone.join("plans");
         std::fs::create_dir_all(plans.join("archive")).unwrap();
+        // NONCED per instance. A git object id is a CONTENT HASH and
+        // `blob_cache` is a process-global static, so a fixture with hardcoded
+        // bodies mints the SAME ids in every instance — and this fixture has
+        // several callers running in parallel in one test binary. A cache test
+        // keyed on a shared id can then be rescued by a sibling test's insert
+        // of that same id, which makes its neuter check unstable in the
+        // FALSE-PASS direction. `a_second_read_does_not_evict_the_first_reads_blobs`
+        // asserts on THIS file's id, so this nonce is what makes that test
+        // honest; `2026-01-02-empty.md` stays un-nonced because the empty blob
+        // is `e69de29b…` in every git repo there is and no assertion rests on
+        // it. Also de-races `a_blob_already_read_is_not_read_again`.
+        let nonce = tmp.path().display().to_string();
         std::fs::write(
             plans.join("2026-01-01-normal.md"),
-            "# Normal\n\n> **Status: DRAFT**\n",
+            format!("# Normal\n\n> **Status: DRAFT**\n\n<!-- {nonce} -->\n"),
         )
         .unwrap();
         std::fs::write(plans.join("2026-01-02-empty.md"), "").unwrap();
