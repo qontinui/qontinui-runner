@@ -6533,8 +6533,6 @@ mod tests {
         (tmp, reader, sha)
     }
 
-    /// The plain case on real git output: a clone that has just fetched reads
-    /// a refresh within seconds of now — through the reflog AND `FETCH_HEAD`.
     // ---- Phase 3: the DOCUMENT layer takes its bytes from the ref too ----
 
     /// A plans scan root at `dir`, the shape `BodySync` builds in production.
@@ -7436,6 +7434,8 @@ mod tests {
         );
     }
 
+    /// The plain case on real git output: a clone that has just fetched reads
+    /// a refresh within seconds of now — through the reflog AND `FETCH_HEAD`.
     #[test]
     fn process_git_reads_a_just_fetched_ref_as_refreshed_now() {
         let tmp = tempfile::tempdir().unwrap();
@@ -9261,6 +9261,7 @@ mod tests {
             title: None,
             status: status.to_string(),
             depends_on,
+            area: None,
             phases: vec![],
             source_path: format!("plans/{slug}.md"),
             content: String::new(),

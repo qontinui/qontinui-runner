@@ -92,6 +92,10 @@ pub struct ParsedWorkUnit {
     /// Canonical `Depends-On:` plan stems from the status blockquote, deduped
     /// and order-preserving.
     pub depends_on: Vec<String>,
+    /// The plan's `Area:` from the status blockquote, when it satisfies coord's
+    /// kebab grammar — pushed as work-unit `metadata.area`. `None` when absent
+    /// or rejected (a rejection is warned; see [`extract_area`]).
+    pub area: Option<String>,
     /// Phase structure -> sub-units, in document order, deduped by index.
     pub phases: Vec<ParsedPhase>,
     /// Provenance back-link: the source file path the caller supplied.
@@ -293,6 +297,98 @@ fn extract_depends_on(body: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// coord's own area grammar, `[a-z0-9]+(-[a-z0-9]+)*`: non-empty, lowercase
+/// ASCII letters and digits in segments joined by single hyphens.
+///
+/// A byte-for-byte mirror of `is_kebab_case` in `qontinui-coord`
+/// `crates/coord/src/work_unit_registry.rs`, which is what coord's
+/// `area=` filter and its `metadata_area_warnings` judge a stored area by. A
+/// looser local predicate (`^[a-z0-9][a-z0-9-]*$`) would admit `a--b` and
+/// `a-`, which coord would then warn on and no canonical filter would match.
+pub(crate) fn is_kebab_case(s: &str) -> bool {
+    !s.is_empty()
+        && s.split('-').all(|seg| {
+            !seg.is_empty()
+                && seg
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        })
+}
+
+/// What the status blockquote declares about the plan's area.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AreaDecl {
+    /// No `Area:` key in the status blockquote (including a plan whose only
+    /// `Area:` line sits outside it). Not a defect — nothing is warned.
+    Absent,
+    /// A key whose value satisfies [`is_kebab_case`].
+    Accepted(String),
+    /// A key whose value does not — kept verbatim so the warning can name it.
+    Rejected(String),
+}
+
+/// Extract the plan's `Area:` from the status blockquote — the same block, and
+/// the same case-sensitive key convention, as [`extract_depends_on`]. A
+/// body-wide scan would pick up quoted `Area:` examples in plan prose.
+///
+/// **The key.** An occurrence of `Area:` counts only when it stands as a key:
+/// after stripping one optional `**` (the bold opener of `**Area:**`), what
+/// precedes it must be the line start, whitespace, or the blockquote `>`. So
+/// `> Area: x`, `> **Area:** x` and `**Repo:** … **Area:** x` are keys, while
+/// `` `Area:` `` (inline code, as in "scanner `Area:` parse") and `Sub-Area:`
+/// are not. The FIRST key in the block decides; a later one is never consulted,
+/// so a malformed declaration is reported rather than silently shadowed.
+///
+/// **The value.** After the key, one optional `**` (the bold closer) and any
+/// whitespace are skipped. Then:
+///
+/// * if the next character is a backtick, the value is everything up to the
+///   next backtick (`` `published-parity` (work-unit …) `` → `published-parity`;
+///   an unclosed backtick takes the rest of the line, which then fails the
+///   grammar);
+/// * otherwise it is the first whitespace-delimited token with trailing
+///   `.`, `,`, `;`, `:`, `)` and `*` removed (`Area: domain-cost-ledger.` →
+///   `domain-cost-ledger`).
+///
+/// Nothing else is normalised — no lowercasing, no `_`→`-`. The value is then
+/// judged by [`is_kebab_case`]: `` `agent_worktree` reclaim `` is
+/// [`AreaDecl::Rejected`] with `agent_worktree`, never guessed into shape.
+pub(crate) fn extract_area(body: &str) -> AreaDecl {
+    const KEY: &str = "Area:";
+    for line in status_blockquote_lines(body) {
+        let mut search_from = 0usize;
+        while let Some(rel) = line[search_from..].find(KEY) {
+            let abs = search_from + rel;
+            search_from = abs + KEY.len();
+            let before = &line[..abs];
+            let before = before.strip_suffix("**").unwrap_or(before);
+            let boundary = before
+                .chars()
+                .next_back()
+                .is_none_or(|c| c.is_whitespace() || c == '>');
+            if !boundary {
+                continue;
+            }
+            let rest = &line[abs + KEY.len()..];
+            let rest = rest.strip_prefix("**").unwrap_or(rest).trim_start();
+            let value = match rest.strip_prefix('`') {
+                Some(code) => code.split('`').next().unwrap_or(code),
+                None => rest
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim_end_matches(['.', ',', ';', ':', ')', '*']),
+            };
+            return if is_kebab_case(value) {
+                AreaDecl::Accepted(value.to_string())
+            } else {
+                AreaDecl::Rejected(value.to_string())
+            };
+        }
+    }
+    AreaDecl::Absent
 }
 
 /// A heading that opens a **phase-list section** (arms B and C of
@@ -824,6 +920,11 @@ fn detect_phases(body: &str) -> Vec<ParsedPhase> {
 ///
 /// Status defaults to `"draft"` when no `> **Status:` line is present; title
 /// defaults to `None` when no `# ` H1 is present (both matching coord).
+///
+/// Not quite effect-free: a status-block `Area:` whose value fails coord's
+/// kebab grammar is logged with `tracing::warn!` (naming `source_path` and the
+/// rejected value) and yields `area: None`. The returned value stays a pure
+/// function of the inputs.
 pub fn parse_work_unit(
     slug: &str,
     source_path: &str,
@@ -857,11 +958,29 @@ pub fn parse_work_unit(
         }
     }
 
+    let area = match extract_area(body) {
+        AreaDecl::Absent => None,
+        AreaDecl::Accepted(area) => Some(area),
+        AreaDecl::Rejected(value) => {
+            // Per cycle, on purpose: a malformed declaration stays visible in
+            // the log until the plan is fixed, rather than being guessed into
+            // shape or dropped silently.
+            tracing::warn!(
+                path = %source_path,
+                rejected_area = %value,
+                "plan adapter: status-block `Area:` is not kebab-case \
+                 ([a-z0-9]+(-[a-z0-9]+)*); metadata.area omitted for this plan"
+            );
+            None
+        }
+    };
+
     ParsedWorkUnit {
         slug: slug.to_string(),
         title,
         status: status.unwrap_or_else(|| "draft".to_string()),
         depends_on: extract_depends_on(body),
+        area,
         phases: detect_phases(body),
         source_path: source_path.to_string(),
         content: body.to_string(),
@@ -1442,6 +1561,266 @@ mod tests {
         println!(
             "phase_census plans={plans} skipped={skipped} zero={zero} one={one} two_or_more={many}"
         );
+    }
+
+    // --- area ------------------------------------------------------------------
+
+    /// The shared fixture list pinning [`is_kebab_case`] to coord's grammar,
+    /// `[a-z0-9]+(-[a-z0-9]+)*`. The rejected half is exactly what the looser
+    /// `^[a-z0-9][a-z0-9-]*$` would have admitted (`a--b`, `a-`) plus the
+    /// shapes the plan corpus actually produced (`agent_worktree`, prose).
+    const KEBAB_ACCEPTED: &[&str] = &[
+        "a",
+        "0",
+        "a1",
+        "ci-runners",
+        "coord-tests",
+        "published-parity",
+        "domain-cost-ledger",
+        "new-project-initiation",
+        "fleet-tooling",
+        "v2-api-3",
+    ];
+    const KEBAB_REJECTED: &[&str] = &[
+        "",
+        "a--b",
+        "a-",
+        "-a",
+        "-",
+        "A",
+        "Published-Parity",
+        "agent_worktree",
+        "a b",
+        "a.b",
+        "ümlaut",
+        "`x`",
+    ];
+
+    #[test]
+    fn kebab_predicate_matches_coords_grammar() {
+        for ok in KEBAB_ACCEPTED {
+            assert!(is_kebab_case(ok), "{ok:?} must be accepted");
+        }
+        for bad in KEBAB_REJECTED {
+            assert!(!is_kebab_case(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    /// The same fixture list, driven through the extractor: every accepted
+    /// value resolves whether bold, un-bolded or backticked, and every rejected
+    /// non-empty value comes back verbatim as `Rejected` — never normalised.
+    #[test]
+    fn extract_area_applies_the_kebab_fixtures() {
+        for ok in KEBAB_ACCEPTED {
+            for line in [
+                format!("> **Area:** `{ok}`"),
+                format!("> Area: {ok}"),
+                format!("> **Area:** {ok}."),
+            ] {
+                let body = format!("# T\n\n> **Status: DRAFT.**\n{line}\n");
+                assert_eq!(
+                    extract_area(&body),
+                    AreaDecl::Accepted(ok.to_string()),
+                    "{line:?}"
+                );
+            }
+        }
+        for bad in [
+            "a--b",
+            "a-",
+            "-a",
+            "A",
+            "agent_worktree",
+            "Published-Parity",
+        ] {
+            let body = format!("# T\n\n> **Status: DRAFT.**\n> **Area:** `{bad}`\n");
+            assert_eq!(
+                extract_area(&body),
+                AreaDecl::Rejected(bad.to_string()),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// Every status-blockquote `Area:` line on `qontinui-dev-notes`
+    /// `origin/main` `86208321` (2026-09-22), verbatim, each under the status
+    /// line it sits beneath in its plan. Re-measure with
+    /// `git grep -n 'Area:' origin/main -- plans/` filtered to the status block.
+    const STATUS_BLOCK_AREA_FIXTURES: &[(&str, &str, Option<&str>)] = &[
+        (
+            "2026-08-31-published-build-parity-check",
+            "> **Area:** `published-parity` (work-unit `metadata.area`; added 2026-09-22 by plan `2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports` Phase 3).",
+            Some("published-parity"),
+        ),
+        (
+            "2026-09-14-a-poison-ci-runner-takes-every-job-and-no-detector-sees-it",
+            "> **Area:** `ci-runners` (work-unit `metadata.area`, exactly that key).",
+            Some("ci-runners"),
+        ),
+        (
+            "2026-09-15-two-closeout-scripts-fail-silently-on-a-windows-box",
+            "> History: **Status: DRAFT 2026-09-15.** Authored at closeout by session `ff515a63` (spaceship) under `planning-and-scope` `finish-to-zero-includes-the-defect-underneath` (v6), from three defects met in one `/implement-plan` run (one of them, the allocator's CRLF path, was already fixed by qontinui-claude-config#961 while this session ran — finding `914bc31a` — so it is recorded here as prior art, not as a phase) of `2026-09-14-a-poison-ci-runner-takes-every-job-and-no-detector-sees-it`. Evidence: coord finding `7f5da040` (fleet-infra) and finding `b4bb2273` (landed-since CRLF). Not vetted; not implemented. **Repo:** `qontinui/qontinui-claude-config` (`scripts/`). **Area:** `fleet-tooling`.",
+            Some("fleet-tooling"),
+        ),
+        (
+            "2026-09-19-coord-tests-fail-on-a-windows-crlf-checkout",
+            "> **Repo:** `qontinui-coord`. **Area:** `coord-tests`. Line references are to",
+            Some("coord-tests"),
+        ),
+        (
+            "2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists",
+            "> **Area:** `published-parity`.",
+            Some("published-parity"),
+        ),
+        (
+            "2026-09-20-the-second-ratchet-domain-is-operations-and-its-cost-is-compared-to-the-first",
+            "> Area: domain-cost-ledger",
+            Some("domain-cost-ledger"),
+        ),
+        (
+            "2026-09-22-a-fan-out-skill-rediscovers-the-worktree-cap-once-per-subagent",
+            "> **Repo:** `qontinui/qontinui-claude-config` (`.claude/commands/`). **Area:** `fleet-tooling`.",
+            Some("fleet-tooling"),
+        ),
+        (
+            "2026-09-22-new-project-initiation-pr-f-doctor-step-and-funnel-telemetry",
+            "> **Area:** `new-project-initiation` (work-unit `metadata.area`, exactly that key).",
+            Some("new-project-initiation"),
+        ),
+        // The measured free-text forms: rejected, with the value named.
+        (
+            "2026-09-19-orphan-target-reaper-cannot-remove-a-nested-windows-junction",
+            "> **Repo:** `qontinui-runner`. **Area:** `agent_worktree` orphan target reaper.",
+            None,
+        ),
+        (
+            "2026-09-19-runner-reclaim-cannot-unlink-a-symlink-on-linux",
+            "> **Repo:** `qontinui-runner`. **Area:** `agent_worktree` reclaim. Line references are to",
+            None,
+        ),
+        (
+            "2026-09-21-rejunction-on-linux-reports-success-without-creating-a-link",
+            "> **Repo:** `qontinui-runner`. **Area:** `agent_worktree` reclaim, the `Rejunction` action.",
+            None,
+        ),
+    ];
+
+    #[test]
+    fn status_block_area_fixtures_from_the_corpus() {
+        for (stem, line, want) in STATUS_BLOCK_AREA_FIXTURES {
+            let body = format!(
+                "# {stem}\n\n> **Status: DRAFT 2026-09-22.** Summary.\n>\n{line}\n\nBody.\n"
+            );
+            let path = format!("plans/{stem}.md");
+            let u = parse_work_unit(stem, &path, &body, &conv());
+            assert_eq!(u.area.as_deref(), *want, "{stem}");
+            let decl = extract_area(&body);
+            match want {
+                Some(a) => assert_eq!(decl, AreaDecl::Accepted(a.to_string()), "{stem}"),
+                None => assert_eq!(
+                    decl,
+                    AreaDecl::Rejected("agent_worktree".to_string()),
+                    "{stem}: rejected, and the warning names the value"
+                ),
+            }
+        }
+    }
+
+    /// The parity plan's own head, verbatim: its `**Repo(s):**` line mentions
+    /// "scanner `Area:` parse" INSIDE the status block and BEFORE the real key.
+    /// That inline-code mention is not a key (a backtick precedes it), so the
+    /// declaration two lines on wins.
+    #[test]
+    fn inline_code_area_mention_is_not_a_key() {
+        let body = "# The published-runner parity count comes from a run, not from reports\n\
+\n\
+> **Status: IN PROGRESS 2026-09-22.** Implementation started by session\n\
+> Depends-On: 2026-08-31-published-build-parity-check\n\
+>\n\
+> **Repo(s):** `qontinui-runner` (harness, workflow, scanner `Area:` parse, sweep),\n\
+> `qontinui-claude-config` (`/create-plan` header convention, knowledge-base page,\n\
+> capability-doctor cross-link), `qontinui-dev-notes` (plan stamps only). No\n\
+> `qontinui-coord` or `qontinui-web` change; no `coord.*` schema change.\n\
+> **Area:** `published-parity` (work-unit `metadata.area`, exactly that key — and see\n\
+> Phase 3: today this line reaches no work unit).\n\
+";
+        assert_eq!(
+            extract_area(body),
+            AreaDecl::Accepted("published-parity".to_string())
+        );
+        assert_eq!(parse(body).area.as_deref(), Some("published-parity"));
+    }
+
+    /// `2026-09-02-coord-train-activity-idle-unserved-fires-on-a-moving-train`,
+    /// verbatim: its `**Area:**` line sits OUTSIDE the status blockquote (after
+    /// the blank line that ends it). Not read, and — being `Absent`, not
+    /// `Rejected` — not warned either.
+    #[test]
+    fn area_outside_the_status_block_is_absent_not_rejected() {
+        let body = "# coord's merge-status classifier calls a served PR \"orchestrator stalled\"\n\
+\n\
+> **Status: IN PROGRESS 2026-09-02.** Implementation started by session\n\
+> **inherits** this defect rather than fixing it — see \"Interaction with\n\
+> in-flight work\" below.\n\
+\n\
+**Repo:** `qontinui-coord`\n\
+**Area:** `coord-merge-train`\n\
+**Slug:** `2026-09-02-coord-train-activity-idle-unserved-fires-on-a-moving-train`\n\
+";
+        assert_eq!(extract_area(body), AreaDecl::Absent);
+        assert_eq!(parse(body).area, None);
+    }
+
+    #[test]
+    fn no_status_block_and_no_area_are_absent() {
+        assert_eq!(extract_area("# T\n\n**Area:** `x`\n"), AreaDecl::Absent);
+        assert_eq!(
+            extract_area("# T\n\n> **Status: DRAFT.** no area here\n"),
+            AreaDecl::Absent
+        );
+    }
+
+    /// Key boundaries: `Sub-Area:` is not a key, and the FIRST real key decides
+    /// even when a later one would have been valid — a malformed declaration is
+    /// reported, not shadowed.
+    #[test]
+    fn area_key_boundary_and_first_key_decides() {
+        let body = "> **Status: DRAFT.** Sub-Area: nope\n> **Area:** `ok-area`\n";
+        assert_eq!(
+            extract_area(body),
+            AreaDecl::Accepted("ok-area".to_string())
+        );
+        let body = "> **Status: DRAFT.**\n> Area: Bad_Area\n> **Area:** `ok-area`\n";
+        assert_eq!(
+            extract_area(body),
+            AreaDecl::Rejected("Bad_Area".to_string())
+        );
+    }
+
+    /// Value delimiting: a backticked value ends at the closing backtick; an
+    /// unclosed one takes the rest of the line (and fails); a bare value is the
+    /// first whitespace token with trailing punctuation removed; an empty value
+    /// is rejected as `""`.
+    #[test]
+    fn area_value_delimiting() {
+        let one = |line: &str| extract_area(&format!("> **Status: DRAFT.**\n{line}\n"));
+        assert_eq!(
+            one("> **Area:** `a-b` (and more prose)"),
+            AreaDecl::Accepted("a-b".to_string())
+        );
+        assert_eq!(
+            one("> **Area:** `a-b and more"),
+            AreaDecl::Rejected("a-b and more".to_string())
+        );
+        assert_eq!(
+            one("> Area: a-b, then prose"),
+            AreaDecl::Accepted("a-b".to_string())
+        );
+        assert_eq!(
+            one("> **Area: a-b.**"),
+            AreaDecl::Accepted("a-b".to_string())
+        );
+        assert_eq!(one("> **Area:**"), AreaDecl::Rejected(String::new()));
     }
 
     // --- golden-file tests over the real plans corpus ------------------------
