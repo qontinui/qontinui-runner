@@ -893,6 +893,13 @@ fn scan_source(
                 // scope rather than off the cfg attribute that opened the
                 // region: the `extern` block is usually bare INSIDE an already
                 // cfg'd module (`wedge_diagnostics::windows_thread_census`).
+                //
+                // Bound, stated rather than implied: the scope opens at the
+                // block's `{`, and a line is scanned before its own braces are
+                // counted — so a ONE-LINE `extern "system" { fn OneLiner() ->
+                // u32; }` would still roster `OneLiner`. No such shape exists
+                // in this tree; a multi-line block, which is every one of them,
+                // is covered.
             } else if regions.iter().any(|r| r.flags.not_windows && item_level(r)) {
                 other_os_fns.insert(name.clone());
             } else if regions.iter().any(|r| r.flags.windows && !r.flags.test && item_level(r)) {
@@ -987,15 +994,23 @@ fn scan_source(
         }
 
         // ---- structure -----------------------------------------------------
+        // Read BEFORE the `take()` below moves the name out: `line_fn_name` is
+        // `None` afterwards whatever the line held, so testing it after the
+        // move would make the `extern "C" fn` guard below a no-op.
+        let had_fn_on_line = line_fn_name.is_some();
         if let Some(name) = line_fn_name.take() {
             pending_fn = Some(name);
         }
         if let Some(name) = st.impl_name(skel_t) {
             pending_impl = Some(name);
         }
-        // `extern "C" fn foo()` is a fn, not a block — only a bodied block with
-        // no `fn` on its header line opens an FFI scope.
-        if line_fn_name.is_none() && st.extern_block_re.is_match(skel_t) {
+        // `extern "C" fn foo() {}` is a FN, not an FFI block: its `{` belongs to
+        // the fn. Letting it arm `pending_extern` would leave that arming alive
+        // until some LATER unclaimed `{` — an `impl` or `mod` header — which
+        // would then be mistaken for an FFI scope, costing every symbol inside
+        // it its `Type::` qualification (and so its disposition key) and
+        // exempting its cfg(windows) fns from the sibling check.
+        if !had_fn_on_line && st.extern_block_re.is_match(skel_t) {
             pending_extern = true;
         }
         for ch in line.skel.chars() {
@@ -1733,6 +1748,13 @@ fn constructs_that_end_early_do_not_swallow_later_hits() {
         ("supervisor_dependency", "after_nested_regions"),
         ("machine_path", "after_nested_test_mod"),
         ("os_bound_tooling", "after_nested_test_mod"),
+        // An `extern "C" fn` must not arm the FFI scope: both rows keep their
+        // `Console::` qualification, and `win_only` keeps its structural row.
+        ("os_bound_tooling", "Console::launcher"),
+        ("os_bound_tooling", "Console::win_only"),
+        // The attribute-shaped lines inside `TEMPLATE` are data, not a region.
+        ("dev_ports", "after_template"),
+        ("supervisor_dependency", "after_template"),
     ]
     .iter()
     .map(|(c, s)| (c.to_string(), s.to_string()))
