@@ -111,6 +111,24 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # FIRST, before any compile: the rust-cache `shared-key` coupling this
+      # job depends on for its warmth. The `Swatinem/rust-cache@v2` step below
+      # reads by `shared-key: "test"` -- ci.yml's `test` job's own cache key,
+      # not a key this job earns itself (it is read-only here, `save-if:
+      # "false"`) -- so the value is a silent, load-bearing assumption about a
+      # DIFFERENT workflow file. If `test` is ever renamed, this job goes cold
+      # every night with no error, exactly as it did before `shared-key` was
+      # added ("No cache found." on every run). Fail loudly at the door
+      # instead: assert ci.yml still declares a job with that id.
+      - name: Assert ci.yml still has a job named "test" (the rust-cache shared-key)
+        shell: bash
+        run: |
+          if ! grep -qE '^  test:' .github/workflows/ci.yml; then
+            echo "::error::ci.yml no longer declares a job named 'test'. This job's Swatinem/rust-cache step reads shared-key: \"test\" -- ci.yml's job id -- to get main's warm cache. If that job was renamed, rename the shared-key here to match, or this workflow silently runs cold every night."
+            exit 1
+          fi
+          echo "ci.yml still declares job 'test' -- shared-key coupling holds."
+
       # FIRST, before any compile: the classifier's own unit test. It needs no
       # binary, no install and no network and runs in ~1s, so a broken harness
       # fails here instead of after a 25-minute build and two exe boots. Same
@@ -253,6 +271,14 @@ jobs:
           # unrestricted, so with the shared key above this job gets main's
           # warm cache (measured 2026-09-17 on ci main run 35179013554: the
           # same build took 4m34s + 17m35s warm).
+          #
+          # `cache-on-failure` would be a NO-OP here while this is "false" --
+          # that flag only relaxes the SUCCESS precondition on a save that
+          # `save-if` has already turned off unconditionally. If you are here
+          # because a `Post Run Swatinem/rust-cache@v2` step read `skipped` on
+          # a cancelled/failed run, that is EXPECTED and means nothing: this
+          # job never saved anything to lose, on any conclusion. Its warmth
+          # comes entirely from ci.yml's `test` job cache, above.
           save-if: "false"
 
       - name: Install frontend dependencies
@@ -260,7 +286,31 @@ jobs:
 
       # The DEVELOPMENT leg's artifact. `--no-bundle`: this job installs the
       # PUBLISHED bundle from the release, it does not build one.
+      #
+      # `timeout-minutes: 60` — the previously unbounded rung. NOT
+      # `continue-on-error`: a build that genuinely fails is a real signal and
+      # should redden the run, unlike the reporting steps below it, so a
+      # timeout here fails the step normally and the job walks out through its
+      # post-steps rather than being cancelled outright.
+      #
+      # Sizing: warm builds measure 20.6-28.4 min (n=6); the one cold build
+      # that ever COMPLETED took 54.0 min, and the one that was killed by the
+      # then-75-minute job bound was censored at >=73.9 min -- so the cold
+      # distribution straddles anything in the 54-74 range and no bound here
+      # can be an observed maximum, only a ceiling past which we give up. 60
+      # sits above the completed cold observation (with real margin, unlike a
+      # ~55 bound which would leave under a minute over it) and below the
+      # censored one: it tolerates the cold case this job has actually seen
+      # finish and gives up on the one it has not. There is no self-healing
+      # story behind this number -- a killed run does not bank the cache on
+      # its way out (see save-if below) -- so a cold night here means ci.yml's
+      # own `test`-job cache is cold or its key moved, which is rare and is
+      # not this job's to fix. Effective ladder with this bound: 65 (the four
+      # already-bounded steps, by their INNER TimeoutSec bounds, not the outer
+      # backstops) + 60 + ~4.5 of unbounded scaffolding + 5 (the behavioural
+      # axis, below) = ~134.5 of the job's 150-minute budget.
       - name: Build Tauri app (development)
+        timeout-minutes: 60
         run: pnpm run tauri build --debug --no-bundle
 
       # -----------------------------------------------------------------------
@@ -583,8 +633,12 @@ jobs:
       # The manifest can only see capabilities somebody enumerated in
       # CAPABILITY_SPECS; the behavioural axis is what notices the ones nobody
       # did.
+      # The fifth hangable step, and the only one previously bounded nowhere.
+      # A pure text diff over two already-written logs; it has never taken
+      # measurable time. 5 minutes is ample margin, not a sizing estimate.
       - name: Behavioural axis — diff the two pass/fail sets
         continue-on-error: true
+        timeout-minutes: 5
         run: |
           # contract-smoke's Record emits "STATUS  METHOD  PATH  DETAIL" and only
           # ever PASS / FAIL / SKIP. A handful of synthetic rows reuse a path
