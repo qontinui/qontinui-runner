@@ -3,9 +3,14 @@
 //! independent gates by plan `2026-07-10-split-cloud-sync-consent`).
 //!
 //! Frontend surface for two independent runner-global toggles:
-//! - `cloud_sync_enabled` — gate 1, AI content sync. When off (the
-//!   default), the transcript emitter and tenant memory sync write nothing
-//!   to the session outbox and nothing leaves the machine.
+//! - `cloud_sync_enabled` — gate 1, AI content sync. Default ON as of plan
+//!   `2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls`
+//!   §3.5 (`engineering-priorities` `capability-ships-enabled`: ship-on
+//!   with a reachable off-switch — this command pair, plus the desktop
+//!   settings panel). When off, the transcript emitter and tenant memory
+//!   sync write nothing to the session outbox and nothing leaves the
+//!   machine. An existing settings.json that already wrote an explicit
+//!   `false` keeps it — the default flip only affects a fresh install.
 //! - `session_metadata_sync_enabled` — gate 2, session metadata sync. When
 //!   off, the restore-record emitter writes nothing. Default ON — this half
 //!   carries no conversation content.

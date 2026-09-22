@@ -255,6 +255,8 @@ in_process_dispatch_table! {
         "dismiss_recent_crash" => in_process_dismiss_recent_crash(state),
         "get_coord_device_token" => in_process_get_coord_device_token(args),
         "get_access_token_for_websocket" => in_process_get_access_token_for_websocket(args),
+        "get_cloud_sync_settings" => in_process_get_cloud_sync_settings(args),
+        "save_cloud_sync_settings" => in_process_save_cloud_sync_settings(args),
     }
 }
 
@@ -516,6 +518,81 @@ fn coord_device_token_tenant_arg(args: &Value) -> Result<Option<String>, String>
         (Some(a), _) => Ok(Some(a)),
         (None, b) => Ok(b),
     }
+}
+
+/// In-process arm for `get_cloud_sync_settings`
+/// (`crate::commands::cloud_sync_settings::get_cloud_sync_settings`) — plan
+/// `2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls`
+/// §3.5.
+///
+/// A plain `fn() -> Result<CommandResponse, String>` that reads
+/// `cloud_sync_enabled` off `settings.json` — needs neither `ApiState` nor
+/// the webview, which is what lets a headless (`QONTINUI_SERVER_MODE`)
+/// runner answer it, mirroring `get_coord_device_token` immediately above.
+/// Takes no arguments; a non-empty `args` object is a 400 rather than
+/// silently ignored.
+async fn in_process_get_cloud_sync_settings(
+    args: &Value,
+) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
+    const COMMAND: &str = "get_cloud_sync_settings";
+
+    match args {
+        Value::Null => {}
+        Value::Object(o) if o.is_empty() => {}
+        _ => {
+            return Err(in_process_bad_args(
+                COMMAND,
+                "takes no arguments — send `{}`",
+            ))
+        }
+    }
+
+    let response = crate::commands::cloud_sync_settings::get_cloud_sync_settings()
+        .map_err(|e| in_process_command_failed(COMMAND, e))?;
+
+    serde_json::to_value(response).map_err(|e| {
+        in_process_command_failed(COMMAND, format!("could not serialize response: {}", e))
+    })
+}
+
+/// In-process arm for `save_cloud_sync_settings`
+/// (`crate::commands::cloud_sync_settings::save_cloud_sync_settings`) — plan
+/// `2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls`
+/// §3.5.
+///
+/// A plain `fn(bool) -> Result<CommandResponse, String>` that writes
+/// `cloud_sync_enabled` to `settings.json` — needs neither `ApiState` nor the
+/// webview, so it answers headless. `cloudSyncEnabled` is required (Tauri v2
+/// camelCases the Rust snake_case `cloud_sync_enabled` parameter on the
+/// wire, matching every other boolean arg in this allowlist).
+async fn in_process_save_cloud_sync_settings(
+    args: &Value,
+) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
+    const COMMAND: &str = "save_cloud_sync_settings";
+
+    let cloud_sync_enabled = match args.get("cloudSyncEnabled") {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Null) | None => {
+            return Err(in_process_bad_args(
+                COMMAND,
+                "`cloudSyncEnabled` (boolean) is required",
+            ))
+        }
+        Some(_) => {
+            return Err(in_process_bad_args(
+                COMMAND,
+                "`cloudSyncEnabled` must be a boolean",
+            ))
+        }
+    };
+
+    let response =
+        crate::commands::cloud_sync_settings::save_cloud_sync_settings(cloud_sync_enabled)
+            .map_err(|e| in_process_command_failed(COMMAND, e))?;
+
+    serde_json::to_value(response).map_err(|e| {
+        in_process_command_failed(COMMAND, format!("could not serialize response: {}", e))
+    })
 }
 
 /// What [`perform_invoke_round_trip`] does with a request, decided before any
@@ -910,6 +987,14 @@ mod in_process_dispatch_tests {
         // Credential-returning, so content trigger 3 of `security-and-autonomy`;
         // the same shrink-not-grow argument applies: `page/evaluate` exposed this
         // token on the same unauthenticated loopback port.
+        //
+        // `get_cloud_sync_settings` / `save_cloud_sync_settings` joined for plan
+        // `2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls`
+        // §3.5: they carry no credential at all (a local consent flag, not a
+        // token), and are already reachable via the eval-based `page/evaluate`
+        // path on any windowed runner — the shrink-not-grow argument applies
+        // just as directly, and this pair is what makes the setting reachable
+        // on a HEADLESS runner in the first place.
         let mut in_process: Vec<&str> = all_entries()
             .filter(|c| c.dispatch == Dispatch::InProcess)
             .map(|c| c.name)
@@ -920,8 +1005,10 @@ mod in_process_dispatch_tests {
             vec![
                 "dismiss_recent_crash",
                 "get_access_token_for_websocket",
+                "get_cloud_sync_settings",
                 "get_coord_device_token",
-                "redeem_pair_code"
+                "redeem_pair_code",
+                "save_cloud_sync_settings",
             ]
         );
     }
