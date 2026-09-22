@@ -222,9 +222,8 @@ const ALLOWLIST: &[AllowlistEntry] = &[
             "retain_pending_drops_vanished_messages",
             "surfacing_env_parsing_defaults",
             "block_reason_wire_values",
-            "open_record_with_no_worker_resolves_terminal",
+            "open_record_resolves_terminal",
             "a_typed_record_routes_only_when_its_binding_is_known_and_confirmed",
-            "open_record_with_registered_worker_resolves_pty",
             "closed_record_resolves_none",
             "absent_record_resolves_none",
             "blocked_log_fires_on_first_sighting_then_once_per_window",
@@ -242,7 +241,7 @@ const ALLOWLIST: &[AllowlistEntry] = &[
         reason: "the lock guards the process-global push counters (push_counters(), bumped only by \
          record_push_miss / record_push_ok, which production reaches through \
          surface_blocked_delivery and deliver_once); the only two tests that call either or \
-         read health_snapshot() for a value are the two that take it — the other 41 exercise \
+         read health_snapshot() for a value are the two that take it — the other 40 exercise \
          the framing, tracker, cooldown and parse helpers and never touch a counter. Enumerated \
          after the 2026-09-21 rebase onto main, which added the module's counter family; the \
          per-test handle (MemoryEnrichCounters / TransportRungCounters in mcp_api.rs) is the \
