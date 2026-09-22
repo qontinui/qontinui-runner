@@ -2326,7 +2326,7 @@ mod ci_node_tests {
             serde_json::from_str::<Settings>("{}").expect("empty object must deserialize"),
         ] {
             assert!(!s.ci_node.enabled);
-            assert_eq!(s.ci_node.max_concurrent_builds, 1);
+            assert_eq!(s.ci_node.max_concurrent_builds, None);
             assert!(s.ci_node.repo_allowlist.is_empty());
             assert_eq!(s.ci_node.min_free_disk_gb, 20);
         }
@@ -2342,7 +2342,7 @@ mod ci_node_tests {
         )
         .expect("must deserialize");
         assert!(parsed.ci_node.enabled);
-        assert_eq!(parsed.ci_node.max_concurrent_builds, 2);
+        assert_eq!(parsed.ci_node.max_concurrent_builds, Some(2));
         assert_eq!(
             parsed.ci_node.repo_allowlist,
             vec!["qontinui/qontinui-runner".to_string()]
@@ -2359,9 +2359,49 @@ mod ci_node_tests {
     fn ci_node_partial_object_fills_defaults() {
         let parsed: Settings = serde_json::from_str(r#"{"ci_node": {"enabled": true}}"#).unwrap();
         assert!(parsed.ci_node.enabled);
-        assert_eq!(parsed.ci_node.max_concurrent_builds, 1);
+        assert_eq!(parsed.ci_node.max_concurrent_builds, None);
         assert!(parsed.ci_node.repo_allowlist.is_empty());
         assert_eq!(parsed.ci_node.min_free_disk_gb, 20);
+    }
+
+    /// An existing settings.json carrying `1` (the old default, written out
+    /// by every prior save) stays an explicit 1 — it is never reinterpreted
+    /// as "use the suggestion". And an explicit `null` round-trips as None.
+    #[test]
+    fn ci_node_explicit_one_stays_explicit_and_null_is_unset() {
+        let one: Settings =
+            serde_json::from_str(r#"{"ci_node": {"max_concurrent_builds": 1}}"#).unwrap();
+        assert_eq!(one.ci_node.max_concurrent_builds, Some(1));
+        let null: Settings =
+            serde_json::from_str(r#"{"ci_node": {"max_concurrent_builds": null}}"#).unwrap();
+        assert_eq!(null.ci_node.max_concurrent_builds, None);
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&null).unwrap()).unwrap();
+        assert_eq!(back.ci_node.max_concurrent_builds, None);
+    }
+
+    /// The one accessor: an explicit value wins verbatim (floored at 1 for
+    /// admission); None resolves to the host suggestion.
+    #[test]
+    fn ci_node_effective_capacity_prefers_explicit_then_suggestion() {
+        use crate::ci_node::host_sizing::HostCapacity;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let big = HostCapacity {
+            mem_bytes: Some(368 * GIB),
+            cpus: 48,
+        };
+        let mut ci = CiNodeSettings::default();
+        assert_eq!(ci.configured_or_suggested_builds(big), 12);
+        assert_eq!(ci.effective_max_concurrent_builds_for(big), 12);
+        ci.max_concurrent_builds = Some(3);
+        assert_eq!(ci.configured_or_suggested_builds(big), 3);
+        assert_eq!(ci.effective_max_concurrent_builds_for(big), 3);
+        assert_eq!(ci.effective_max_concurrent_builds(), 3);
+        ci.max_concurrent_builds = Some(0);
+        assert_eq!(ci.configured_or_suggested_builds(big), 0);
+        assert_eq!(ci.effective_max_concurrent_builds_for(big), 1);
+        assert_eq!(ci.effective_max_concurrent_builds(), 1);
+        ci.max_concurrent_builds = None;
+        assert!(ci.effective_max_concurrent_builds() >= 1);
     }
 }
 
@@ -2669,9 +2709,17 @@ pub struct CiNodeSettings {
     #[serde(default)]
     pub enabled: bool,
     /// Maximum concurrent CI builds admitted by the executor, and the value
-    /// advertised via the device budget POST when enabled. Default 1.
-    #[serde(default = "default_ci_node_max_concurrent_builds")]
-    pub max_concurrent_builds: u32,
+    /// advertised via the device budget POST when enabled.
+    ///
+    /// `None` (the default, and what a missing key loads as) means "never
+    /// configured — use the host's suggestion"
+    /// ([`crate::ci_node::host_sizing::suggested_concurrent_builds`]).
+    /// `Some(n)` is an explicit operator value and always wins; an existing
+    /// settings.json carrying a number stays explicit. Read it through
+    /// [`CiNodeSettings::effective_max_concurrent_builds`], never directly, so
+    /// the advertised and admitted numbers cannot diverge.
+    #[serde(default)]
+    pub max_concurrent_builds: Option<u32>,
     /// Repos this device may build. Entries match either the coord
     /// `owner/name` slug or the bare repo basename. Empty (the default)
     /// means no repo is runnable — allowlisting is a deliberate act.
@@ -2700,19 +2748,51 @@ pub struct CiNodeSettings {
     pub canonical_converge: bool,
 }
 
-fn default_ci_node_max_concurrent_builds() -> u32 {
-    1
-}
-
 fn default_ci_node_min_free_disk_gb() -> u64 {
     20
+}
+
+impl CiNodeSettings {
+    /// The CI slot count this node ADVERTISES for `host`: the explicit value
+    /// verbatim (including a deliberate `0`, an opinion the budget publish must
+    /// carry), else the host suggestion. Pure — `fleet::build_budget_request`
+    /// reads this.
+    pub(crate) fn configured_or_suggested_builds(
+        &self,
+        host: crate::ci_node::host_sizing::HostCapacity,
+    ) -> u32 {
+        match self.max_concurrent_builds {
+            Some(n) => n,
+            None => crate::ci_node::host_sizing::suggested_concurrent_builds(host),
+        }
+    }
+
+    /// The concurrency the executor ADMITS against for `host` — the same
+    /// number as [`Self::configured_or_suggested_builds`], floored at 1 exactly
+    /// as admission always has been (and as coord's `ci_dispatch` floors it).
+    /// Pure.
+    pub(crate) fn effective_max_concurrent_builds_for(
+        &self,
+        host: crate::ci_node::host_sizing::HostCapacity,
+    ) -> u32 {
+        self.configured_or_suggested_builds(host).max(1)
+    }
+
+    /// [`Self::effective_max_concurrent_builds_for`] against the live host.
+    /// An explicit value never touches the host; only `None` probes it.
+    pub fn effective_max_concurrent_builds(&self) -> u32 {
+        match self.max_concurrent_builds {
+            Some(n) => n.max(1),
+            None => self.effective_max_concurrent_builds_for(crate::ci_node::host_sizing::probe()),
+        }
+    }
 }
 
 impl Default for CiNodeSettings {
     fn default() -> Self {
         Self {
             enabled: false,
-            max_concurrent_builds: default_ci_node_max_concurrent_builds(),
+            max_concurrent_builds: None,
             repo_allowlist: Vec::new(),
             min_free_disk_gb: default_ci_node_min_free_disk_gb(),
             canonical_converge: false,

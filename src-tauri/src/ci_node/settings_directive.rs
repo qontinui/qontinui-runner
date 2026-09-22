@@ -59,8 +59,8 @@ const MAX_ALLOWLIST_ENTRY_LEN: usize = 200;
 /// Concurrency bounds. A directive asking for 0 is a mistake, not a request to
 /// idle — `admission` clamps 0 up to 1 anyway, so accepting it would persist a
 /// number that lies about what the device does.
-const MAX_CONCURRENT_BUILDS_MIN: u32 = 1;
-const MAX_CONCURRENT_BUILDS_MAX: u32 = 64;
+pub(crate) const MAX_CONCURRENT_BUILDS_MIN: u32 = 1;
+pub(crate) const MAX_CONCURRENT_BUILDS_MAX: u32 = 64;
 /// `min_free_disk_gb` bounds. **0 disables the guard** — see the module doc.
 const MIN_FREE_DISK_GB_MIN: u64 = 1;
 const MIN_FREE_DISK_GB_MAX: u64 = 100_000;
@@ -235,7 +235,9 @@ pub(crate) fn validate(
 
     Ok(CiNodeSettings {
         enabled: directive.enabled,
-        max_concurrent_builds: directive.max_concurrent_builds,
+        // A remotely configured value is an explicit operator override, by
+        // definition — never "use the host suggestion".
+        max_concurrent_builds: Some(directive.max_concurrent_builds),
         repo_allowlist: allowlist,
         min_free_disk_gb: directive.min_free_disk_gb,
         // No range to check — it is a boolean grant. What it needs instead is
@@ -270,7 +272,9 @@ pub(crate) fn apply(directive: CiSettingsDirective) {
         "enabled={} repos={} concurrency={} min_free_disk_gb={}",
         settings.enabled,
         settings.repo_allowlist.len(),
-        settings.max_concurrent_builds,
+        settings
+            .max_concurrent_builds
+            .map_or_else(|| "suggested".to_string(), |n| n.to_string()),
         settings.min_free_disk_gb,
     );
     match crate::settings::save_ci_node_settings(settings) {
@@ -372,8 +376,17 @@ mod tests {
         assert_eq!(d.max_concurrent_builds, 1);
         assert_eq!(d.min_free_disk_gb, 20);
 
-        // And the resulting settings equal the shipped inert default exactly.
-        assert_eq!(validate(&d).unwrap(), CiNodeSettings::default());
+        // And the resulting settings equal the shipped inert default, except
+        // that a directive's concurrency is always EXPLICIT: a remotely
+        // configured value is an operator override, never "use the host
+        // suggestion" (plan 2026-09-22-ci-capacity-is-hand-typed-..., Phase 2).
+        assert_eq!(
+            validate(&d).unwrap(),
+            CiNodeSettings {
+                max_concurrent_builds: Some(1),
+                ..CiNodeSettings::default()
+            }
+        );
     }
 
     /// THE allowlist boundary: no wildcard, in any spelling, from any surface.

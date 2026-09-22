@@ -301,7 +301,7 @@ pub(crate) fn admission_decision(
             "repo {repo:?} is not in this device's ci_node.repo_allowlist"
         ));
     }
-    if running_count >= settings.max_concurrent_builds.max(1) as usize {
+    if running_count >= settings.effective_max_concurrent_builds() as usize {
         return Admission::Defer;
     }
     if headroom_defers(headroom) {
@@ -821,7 +821,7 @@ fn start_build(payload: CiDispatchPayload, settings: CiNodeSettings) {
         let mut state = ci_state().lock().unwrap();
         // Re-check the cap under the lock (submit's read was unlocked
         // in-between for the disk probe).
-        if state.running.len() >= settings.max_concurrent_builds.max(1) as usize {
+        if state.running.len() >= settings.effective_max_concurrent_builds() as usize {
             drop(state);
             info!(
                 "ci_node: slot taken while gating — deferring dispatch {}",
@@ -947,7 +947,7 @@ mod tests {
     fn settings(enabled: bool, allow: &[&str], cap: u32) -> CiNodeSettings {
         CiNodeSettings {
             enabled,
-            max_concurrent_builds: cap,
+            max_concurrent_builds: Some(cap),
             repo_allowlist: allow.iter().map(|s| s.to_string()).collect(),
             min_free_disk_gb: 20,
             canonical_converge: false,

@@ -70,9 +70,12 @@ import {
   bytesToGib,
   clampGib,
   clampInt,
+  concurrencyAboveSuggestionWarning,
   effectiveSessionFloorsGib,
   effectiveThreadCeilings,
   gibToBytes,
+  parseConcurrencyInput,
+  type CiNodeHostSuggestion,
   parseRepoAllowlist,
   sessionFloorsAreInverted,
   threadCeilingsAreInverted,
@@ -101,7 +104,8 @@ export interface SessionGuardSettingsValue {
 /** Wire shape of `settings::CiNodeSettings`. */
 export interface CiNodeSettingsValue {
   enabled: boolean;
-  max_concurrent_builds: number;
+  /** `null` = never configured: the runner uses its host suggestion. */
+  max_concurrent_builds: number | null;
   repo_allowlist: string[];
   min_free_disk_gb: number;
 }
@@ -125,7 +129,7 @@ const DEFAULT_SESSION_GUARD: SessionGuardSettingsValue = {
 
 const DEFAULT_CI_NODE: CiNodeSettingsValue = {
   enabled: false,
-  max_concurrent_builds: 1,
+  max_concurrent_builds: null,
   repo_allowlist: [],
   min_free_disk_gb: 20,
 };
@@ -149,6 +153,7 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
   const [guardEnabled, setGuardEnabled] = useState(DEFAULT_SESSION_GUARD.enabled);
 
   const [ciNode, setCiNode] = useState<CiNodeSettingsValue>(DEFAULT_CI_NODE);
+  const [hostSuggestion, setHostSuggestion] = useState<CiNodeHostSuggestion | null>(null);
   const [allowlistText, setAllowlistText] = useState("");
 
   const [loading, setLoading] = useState(true);
@@ -164,7 +169,9 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
         // whole ladder, so a partial load would render a half-truth.
         const [guardResult, ciResult] = await Promise.all([
           invoke<TauriResult<SessionGuardSettingsValue>>("get_session_guard_settings"),
-          invoke<TauriResult<CiNodeSettingsValue>>("get_ci_node_settings"),
+          invoke<
+            TauriResult<CiNodeSettingsValue & { host_suggestion?: CiNodeHostSuggestion | null }>
+          >("get_ci_node_settings"),
         ]);
         if (cancelled) return;
 
@@ -181,8 +188,12 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
         }
 
         if (ciResult?.success && ciResult.data) {
-          const c = { ...DEFAULT_CI_NODE, ...ciResult.data };
+          // `host_suggestion` is a read-only sibling of the settings fields,
+          // not a setting: split it off so it never rides into saved state.
+          const { host_suggestion, ...persisted } = ciResult.data;
+          const c = { ...DEFAULT_CI_NODE, ...persisted };
           setCiNode(c);
+          setHostSuggestion(host_suggestion ?? null);
           setAllowlistText(c.repo_allowlist.join("\n"));
           onLog("debug", "CI-node settings loaded");
         } else {
@@ -669,24 +680,63 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
             min={MAX_CONCURRENT_BUILDS_MIN}
             max={MAX_CONCURRENT_BUILDS_MAX}
             step={1}
-            value={ciNode.max_concurrent_builds}
+            value={ciNode.max_concurrent_builds ?? ""}
+            placeholder={
+              hostSuggestion ? `suggested ${hostSuggestion.suggested}` : "host suggestion"
+            }
             onChange={(e) =>
               setCiNode((c) => ({
                 ...c,
-                max_concurrent_builds: clampInt(
-                  parseInt(e.target.value, 10),
-                  MAX_CONCURRENT_BUILDS_MIN,
-                  MAX_CONCURRENT_BUILDS_MAX,
-                  DEFAULT_CI_NODE.max_concurrent_builds,
-                ),
+                max_concurrent_builds: parseConcurrencyInput(e.target.value),
               }))
             }
             disabled={!ciNode.enabled}
             className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
           />
+          <div className="flex items-center justify-between gap-2">
+            <p
+              data-ui-bridge-id="settings.resource-guard-max-builds-suggestion"
+              className="text-[10px] text-muted-foreground"
+            >
+              {hostSuggestion
+                ? `Suggested ${hostSuggestion.suggested} for this host (${hostSuggestion.cpus} cores, ${
+                    hostSuggestion.mem_gib ?? "unknown"
+                  } GB)`
+                : "Suggestion unavailable"}
+              {ciNode.max_concurrent_builds === null ? " — in use (not set explicitly)." : "."}
+            </p>
+            <button
+              type="button"
+              data-ui-bridge-id="settings.resource-guard-max-builds-use-suggested"
+              onClick={() => setCiNode((c) => ({ ...c, max_concurrent_builds: null }))}
+              disabled={!ciNode.enabled || ciNode.max_concurrent_builds === null}
+              className="text-[10px] px-2 py-0.5 rounded-md bg-muted/50 hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {hostSuggestion ? `Use suggested (${hostSuggestion.suggested})` : "Use suggested"}
+            </button>
+          </div>
+          {ciNode.enabled &&
+            (() => {
+              const warning = concurrencyAboveSuggestionWarning(
+                ciNode.max_concurrent_builds,
+                hostSuggestion,
+              );
+              return warning ? (
+                <div
+                  data-ui-bridge-id="settings.resource-guard-max-builds-above-suggestion"
+                  className={`p-2 ${getAccentColors("amber").bg} rounded-md flex gap-2`}
+                >
+                  <TriangleAlert
+                    className={`w-3.5 h-3.5 ${getAccentColors("amber").text} shrink-0 mt-0.5`}
+                  />
+                  <p className={`text-[10px] ${getAccentColors("amber").text}`}>{warning}</p>
+                </div>
+              ) : null;
+            })()}
           <p className="text-[10px] text-muted-foreground">
-            Also the build capacity this device advertises to coord. Range{" "}
-            {MAX_CONCURRENT_BUILDS_MIN}-{MAX_CONCURRENT_BUILDS_MAX}.
+            Also the build capacity this device advertises to coord. Leave empty to follow the host
+            suggestion; an explicit value always wins. Range {MAX_CONCURRENT_BUILDS_MIN}-
+            {MAX_CONCURRENT_BUILDS_MAX}.
           </p>
         </div>
 
