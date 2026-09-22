@@ -158,28 +158,22 @@ and `spawn_request_deserializes_cwd_and_defaults_it_to_none` in that file's
 tests. A `cwd` that is not an existing directory is a 400, not a fallback.
 
 > ⚠️ **Cross-repo landing dependency — the allow-list and the command files
-> are two repos, and the allow-list is the permissive half.** A role ON the
-> list whose `.md` was deleted here does **not** 400: the spawn SUCCEEDS and
-> hands the new session a slash command that does not exist. At the runner's
-> `origin/main` `4ad6d7350` (verified 2026-09-16) `role_slash_command` still
-> maps `"coordinate" => Some("/coordinate")` and
-> `"decompose-plan" => Some("/decompose-plan")`, while **neither command file
-> exists in this repo** — `decompose-plan.md` was deleted by `ae26f5b0` and
-> `coordinate.md` by plan
-> `2026-09-12-consolidate-local-orchestration-onto-conductor` Phase 4. Both
-> are therefore live spawn-into-nothing paths until that plan's
-> qontinui-runner half lands and drops the two arms. **The ordering is a
-> coord dep-edge label at PR time, not a thing to keep in your head:** the
+> are two repos, and the allow-list is the permissive half.** A role ON
+> `role_slash_command`'s list whose `.md` has been deleted does **not** 400:
+> the spawn SUCCEEDS and hands the new session a slash command that does not
+> exist. So deleting a command file here while its role is still on the
+> runner's allow-list opens a spawn-into-nothing window.
+>
+> **Order it with a coord dep edge at PR time rather than by hand:** the
 > qontinui-claude-config PR that deletes a command file carries
-> `coord:downstream-of=qontinui/qontinui-runner#<n>` — the waiting side of
-> the edge — so the runner PR that drops the allow-list arm lands FIRST and
-> the spawn-into-nothing window never opens. Deleting a command file whose
-> role is still on the allow-list, with no such edge declared, is the defect
-> this note names. **This is not advice for a hypothetical future PR:
-> `coordinate.md` was already deleted by `66eb8098`, an earlier commit on this
-> branch, so the PR that must carry
-> `coord:downstream-of=qontinui/qontinui-runner#<n>` — pointed at the Phase 4
-> qontinui-runner PR — is the one about to be opened for THIS branch.**
+> `coord:downstream-of=qontinui/qontinui-runner#<n>` — the waiting side of the
+> edge — so the runner PR that drops the allow-list arm lands FIRST and the
+> window never opens. Deleting a command file whose role is still on the
+> allow-list, with no such edge declared, is the defect this note names.
+>
+> No such window is open as of 2026-09-22: `role_slash_command`
+> (`src-tauri/src/mcp/sessions.rs`) maps `auto-review`, `summarize-session` and
+> `implement-plan`, and all three have a command file here.
 
 The `<failure-context block>` is the verdict-tagged `/summarize-session`
 markdown from Step 4, preceded by a one-line preamble:
