@@ -54,15 +54,25 @@
 //! composing a body by hand did that trivially, and keying three more maps by
 //! tenant would have multiplied the same defect by four.
 //!
-//! So the four map fields are `Option<BTreeMap<…>>` on the wire:
+//! So EVERY field on the patch reads the same way:
 //!
-//! - **absent, or JSON `null`** ⇒ leave the stored map untouched;
-//! - **`{}`** ⇒ a deliberate clear.
+//! - **absent** ⇒ leave the stored value alone;
+//! - **an explicit value** (`"/x"`, `{"k":"v"}`, `true`) ⇒ set it;
+//! - **`null`** (scalars) or **`{}`** (maps) ⇒ clear it.
 //!
-//! The five `Option<String>` scalars keep today's semantics exactly — absent
-//! means unset, because the panel shows all five and sends all five, and a
-//! scalar a caller omits is a scalar it means to clear. `strict_mode` likewise
-//! defaults to `false` when absent, as it always has.
+//! ⚠️ **The first cut of this applied absent-means-keep to the MAPS ONLY**, and
+//! justified leaving the scalars on replace with "the panel shows all five and
+//! sends all five, so a scalar a caller omits is a scalar it means to clear."
+//! **The panel shows FOUR.** `plans_archive_dir` was re-sent verbatim from the
+//! struct the panel loaded at mount, and `strict_mode` — a bare `bool` whose
+//! serde default is `false` — was set OFF by any caller that omitted it. Both
+//! are the same lost-update the map fix closed, on fields the panel never
+//! displays, and for a replace-scalar an omission cannot be fixed client-side
+//! because absent IS the clear.
+//!
+//! Hence one rule instead of two families: nothing changes by silence. A caller
+//! states what it means to change — which is the shape every non-UI caller has,
+//! and the reason `double_option` exists so `null` and absent stay distinct.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -222,27 +232,52 @@ pub struct PathSettingsView {
 /// omission, and three tenant-keyed maps would have made that four ways to lose
 /// an operator's configuration.
 ///
-/// The two field families behave differently ON PURPOSE:
+/// **Every field means the same thing: ABSENT ⇒ leave the stored value alone.**
+/// Present-and-explicit is the only way to change anything —
+/// `"/x"` / `{"k":"v"}` / `true` sets, and `null` / `{}` clears.
 ///
-/// - the five `Option<String>` **scalars** keep today's semantics — absent (or
-///   blank) means *unset*, because the panel shows all five and sends all five,
-///   so an omission there is a clear;
-/// - the four **maps** are `Option<BTreeMap<…>>` — absent or `null` means
-///   *leave the stored map alone*, `{}` means *clear it*. A map has no single
-///   field a panel "shows", so an omission there is far more likely to be
-///   ignorance of the field than an intent to empty it.
+/// It reached that uniformity in two steps, and the second is worth stating
+/// because the first looked finished. Round one made only the four MAPS
+/// absent-means-keep, on the reasoning that "a map has no single field a panel
+/// shows, so an omission is more likely ignorance of the field than intent to
+/// empty it", while the scalars kept replace semantics justified as "the panel
+/// shows all five and sends all five, so an omission there is a clear."
+///
+/// **That justification was false, and the field it was false about is exactly
+/// the one that got hurt.** The panel shows FOUR (`plans_dir`, `prompts_dir`,
+/// `workspace_root`, `dev_logs_dir`) and sent five: `plans_archive_dir` was
+/// re-sent verbatim from the struct the panel loaded at mount, and `strict_mode`
+/// the same. Under replace, that is a blind last-writer-wins — a peer that set
+/// `plans_archive_dir` through `PUT /settings/paths` while an operator had the
+/// panel open was silently reverted by that operator's next save. Identical to
+/// the map hazard in every respect except that `delete` could not fix it, since
+/// for a replace-scalar an omission IS the clear.
+///
+/// So the rule is now one rule rather than two families with a rationale each.
+/// A caller states what it means to change and omits the rest; nothing is
+/// changed by silence. That also makes the door safe for a caller that knows
+/// about *some* fields — the shape every non-UI caller actually has.
+///
+/// `double_option` is what makes `null` distinguishable from absent for the
+/// scalars: plain `Option<Option<T>>` folds both to `None`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PathSettingsPatch {
-    #[serde(default)]
-    pub dev_logs_dir: Option<String>,
-    #[serde(default)]
-    pub plans_dir: Option<String>,
-    #[serde(default)]
-    pub plans_archive_dir: Option<String>,
-    #[serde(default)]
-    pub prompts_dir: Option<String>,
-    #[serde(default)]
-    pub workspace_root: Option<String>,
+    /// Absent ⇒ the stored value survives; `null` ⇒ unset; a string ⇒ set.
+    #[serde(default, deserialize_with = "double_option")]
+    pub dev_logs_dir: Option<Option<String>>,
+    /// Absent ⇒ the stored value survives; `null` ⇒ unset; a string ⇒ set.
+    #[serde(default, deserialize_with = "double_option")]
+    pub plans_dir: Option<Option<String>>,
+    /// Absent ⇒ the stored value survives; `null` ⇒ unset; a string ⇒ set.
+    /// The panel does not show this field, which is why absent must not clear it.
+    #[serde(default, deserialize_with = "double_option")]
+    pub plans_archive_dir: Option<Option<String>>,
+    /// Absent ⇒ the stored value survives; `null` ⇒ unset; a string ⇒ set.
+    #[serde(default, deserialize_with = "double_option")]
+    pub prompts_dir: Option<Option<String>>,
+    /// Absent ⇒ the stored value survives; `null` ⇒ unset; a string ⇒ set.
+    #[serde(default, deserialize_with = "double_option")]
+    pub workspace_root: Option<Option<String>>,
     /// Absent/`null` ⇒ the stored map survives; `{}` ⇒ a deliberate clear.
     #[serde(default)]
     pub plans_dir_by_tenant: Option<BTreeMap<String, String>>,
@@ -257,8 +292,29 @@ pub struct PathSettingsPatch {
     /// to delete the erasure hazard it shared, never to key it by tenant.
     #[serde(default)]
     pub repo_checkouts: Option<BTreeMap<String, String>>,
+    /// Absent ⇒ the stored flag survives. It was a bare `bool` with
+    /// `#[serde(default)]`, which is the same hazard in its most dangerous
+    /// shape: `false` is the serde default, so a caller that omitted the field
+    /// silently turned strict mode OFF. The panel does not show it either.
     #[serde(default)]
-    pub strict_mode: bool,
+    pub strict_mode: Option<bool>,
+}
+
+/// Deserialize into `Option<Option<T>>` so an ABSENT field and an explicit
+/// `null` are different values.
+///
+/// Serde folds both to `None` for a plain `Option<Option<T>>`, which is
+/// precisely the distinction [`PathSettingsPatch`] is built on: absent must mean
+/// *leave the stored value alone* and `null` must mean *clear it*. With
+/// `#[serde(default, deserialize_with = "double_option")]` an absent field takes
+/// the `Default` (`None`) and never reaches this function, while a present one —
+/// `null` included — arrives here and is wrapped `Some(..)`.
+fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer).map(Some)
 }
 
 /// Blank → `None` for every `Option<String>` path field, and surrounding
@@ -301,21 +357,32 @@ fn normalize_entries(map: BTreeMap<String, String>) -> BTreeMap<String, String> 
         .collect()
 }
 
-/// Apply `patch` to the `stored` section: scalars replaced, maps merged.
+/// Apply `patch` to the `stored` section: **an absent field keeps the stored
+/// value, for every field there is.**
 ///
 /// The result is run through [`normalize`], so the persisted form is the
 /// canonical one whichever door the patch arrived at. Pure, so the "a
-/// pre-change body cannot erase a map" claim is asserted directly.
+/// pre-change body cannot erase anything" claim is asserted directly.
 pub fn merge(stored: &PathSettings, patch: PathSettingsPatch) -> PathSettings {
-    // `unwrap_or_else` is the whole fix: an absent (or null) map field takes the
-    // STORED map, so a caller that has never heard of the field cannot erase it;
-    // an explicit `{}` arrives as `Some(empty)` and clears.
+    // One `unwrap_or_else` per field, and that uniformity IS the fix: an absent
+    // field takes the STORED value, so a caller that has never heard of a field
+    // cannot change it. An explicit value sets; an explicit `null` (scalars) or
+    // `{}` (maps) clears. The scalars carry `Option<Option<_>>` so those two
+    // cases are distinguishable at all — see `double_option`.
     normalize(PathSettings {
-        dev_logs_dir: patch.dev_logs_dir,
-        plans_dir: patch.plans_dir,
-        plans_archive_dir: patch.plans_archive_dir,
-        prompts_dir: patch.prompts_dir,
-        workspace_root: patch.workspace_root,
+        dev_logs_dir: patch
+            .dev_logs_dir
+            .unwrap_or_else(|| stored.dev_logs_dir.clone()),
+        plans_dir: patch.plans_dir.unwrap_or_else(|| stored.plans_dir.clone()),
+        plans_archive_dir: patch
+            .plans_archive_dir
+            .unwrap_or_else(|| stored.plans_archive_dir.clone()),
+        prompts_dir: patch
+            .prompts_dir
+            .unwrap_or_else(|| stored.prompts_dir.clone()),
+        workspace_root: patch
+            .workspace_root
+            .unwrap_or_else(|| stored.workspace_root.clone()),
         plans_dir_by_tenant: patch
             .plans_dir_by_tenant
             .unwrap_or_else(|| stored.plans_dir_by_tenant.clone()),
@@ -328,7 +395,7 @@ pub fn merge(stored: &PathSettings, patch: PathSettingsPatch) -> PathSettings {
         repo_checkouts: patch
             .repo_checkouts
             .unwrap_or_else(|| stored.repo_checkouts.clone()),
-        strict_mode: patch.strict_mode,
+        strict_mode: patch.strict_mode.unwrap_or(stored.strict_mode),
     })
 }
 
@@ -813,6 +880,99 @@ mod tests {
             "the same latent defect repo_checkouts carried is fixed, not routed around"
         );
         assert_eq!(merged.plans_dir.as_deref(), Some("/device/plans"));
+    }
+
+
+    /// **The round-2 finding, as a test.** The first cut of the patch made only
+    /// the MAPS absent-means-keep and left the scalars on replace, justified by
+    /// "the panel shows all five and sends all five". It shows FOUR. So a
+    /// caller that omits `plans_archive_dir` — which is every caller that does
+    /// not display it, the panel included — used to CLEAR it, and a peer's
+    /// concurrent write to that field was reverted by the next save.
+    ///
+    /// The fix is that absent means untouched for every field there is, so this
+    /// pins the scalar half of it. It fails against a replace-scalar patch.
+    #[test]
+    fn an_absent_scalar_leaves_the_stored_one_alone() {
+        let stored = PathSettings {
+            plans_dir: Some("/device/plans".to_string()),
+            plans_archive_dir: Some("/device/archive".to_string()),
+            prompts_dir: Some("/device/prompts".to_string()),
+            workspace_root: Some("/device/root".to_string()),
+            dev_logs_dir: Some("/device/logs".to_string()),
+            strict_mode: true,
+            ..PathSettings::default()
+        };
+        // A caller that knows about ONE field and says nothing about the rest.
+        let patch: PathSettingsPatch =
+            serde_json::from_value(serde_json::json!({ "plans_dir": "/somewhere/else" }))
+                .expect("must deserialize");
+        assert_eq!(patch.plans_archive_dir, None, "absent, not Some(None)");
+        assert_eq!(patch.strict_mode, None, "absent, not Some(false)");
+
+        let merged = merge(&stored, patch);
+        assert_eq!(merged.plans_dir.as_deref(), Some("/somewhere/else"));
+        assert_eq!(
+            merged.plans_archive_dir.as_deref(),
+            Some("/device/archive"),
+            "the field the panel does not show must survive a save that omits it"
+        );
+        assert_eq!(merged.prompts_dir.as_deref(), Some("/device/prompts"));
+        assert_eq!(merged.workspace_root.as_deref(), Some("/device/root"));
+        assert_eq!(merged.dev_logs_dir.as_deref(), Some("/device/logs"));
+        assert!(
+            merged.strict_mode,
+            "an omitted strict_mode must not turn strict mode OFF — its serde \
+             default is false, which is the most dangerous shape this had"
+        );
+    }
+
+    /// The other half of the same rule: `null` is how a caller CLEARS a scalar,
+    /// and it has to stay distinguishable from absent or there is no way to
+    /// unset anything. This is what `double_option` buys — a plain
+    /// `Option<Option<T>>` folds both to `None` and the two cases collapse.
+    #[test]
+    fn an_explicit_null_scalar_clears_it_while_absent_does_not() {
+        let stored = PathSettings {
+            plans_dir: Some("/device/plans".to_string()),
+            plans_archive_dir: Some("/device/archive".to_string()),
+            strict_mode: true,
+            ..PathSettings::default()
+        };
+        let patch: PathSettingsPatch = serde_json::from_value(serde_json::json!({
+            "plans_dir": null,
+            "strict_mode": false
+        }))
+        .expect("must deserialize");
+        assert_eq!(
+            patch.plans_dir,
+            Some(None),
+            "an explicit null is Some(None) — present, and asking for unset"
+        );
+
+        let merged = merge(&stored, patch);
+        assert_eq!(merged.plans_dir, None, "null clears");
+        assert!(!merged.strict_mode, "an explicit false sets");
+        assert_eq!(
+            merged.plans_archive_dir.as_deref(),
+            Some("/device/archive"),
+            "and the one nobody mentioned is still untouched"
+        );
+    }
+
+    /// A blank string is still unset — `normalize` owns that, and it must keep
+    /// owning it after the scalars became three-state. Blank is how a text box
+    /// says "clear", and it must not become a directory named `""`.
+    #[test]
+    fn a_blank_scalar_is_still_unset_not_a_directory_named_empty() {
+        let stored = PathSettings {
+            plans_dir: Some("/device/plans".to_string()),
+            ..PathSettings::default()
+        };
+        let patch: PathSettingsPatch =
+            serde_json::from_value(serde_json::json!({ "plans_dir": "   " }))
+                .expect("must deserialize");
+        assert_eq!(merge(&stored, patch).plans_dir, None);
     }
 
     /// An explicit JSON `null` reads the same as absent — untouched. A client

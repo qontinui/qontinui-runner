@@ -2260,6 +2260,7 @@ mod tests {
         };
         let (device_plans, tenant_plans) = (mk("device-plans"), mk("tenant-plans"));
         let (tenant_archive, tenant_prompts) = (mk("tenant-archive"), mk("tenant-prompts"));
+        let unbound_plans = mk("unbound-plans");
         let tenant = "7ac125b6-391b-4d64-8493-27305b25c5b9";
         let entry = |dir: &std::path::Path| {
             [(tenant.to_string(), dir.to_string_lossy().to_string())]
@@ -2267,9 +2268,20 @@ mod tests {
                 .collect::<std::collections::BTreeMap<_, _>>()
         };
 
+        let mut plans_map = entry(&tenant_plans);
+        // A key that is not a UUID at all. The doc on `source_path_roots` states
+        // as a SECURITY property that the union is over values "regardless of
+        // whether the key resolves"; without this entry the fixture pins only
+        // the first half, and a future `normalize_entries` that started
+        // validating keys would break the property with every test still green.
+        plans_map.insert(
+            "not-a-uuid".to_string(),
+            unbound_plans.to_string_lossy().to_string(),
+        );
+
         let paths = crate::settings::PathSettings {
             plans_dir: Some(device_plans.to_string_lossy().to_string()),
-            plans_dir_by_tenant: entry(&tenant_plans),
+            plans_dir_by_tenant: plans_map,
             plans_archive_dir_by_tenant: entry(&tenant_archive),
             prompts_dir_by_tenant: entry(&tenant_prompts),
             ..crate::settings::PathSettings::default()
@@ -2281,6 +2293,7 @@ mod tests {
             &tenant_plans,
             &tenant_archive,
             &tenant_prompts,
+            &unbound_plans,
         ] {
             assert!(
                 roots.contains(dir),

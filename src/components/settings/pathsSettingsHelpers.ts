@@ -17,17 +17,27 @@
  * and `buildPathSettingsPayload` is the one place a payload is assembled, so
  * the two directions cannot drift apart.
  *
- * ## Absent vs. `{}` for the MAP fields
+ * ## The SAVE is a patch, and absent means "do not touch"
  *
- * The map fields (`repo_checkouts` and the three `*_by_tenant` maps) do NOT
- * follow that rule, and the difference is deliberate. `save_path_settings`
- * takes a PATCH for them: **absent leaves the stored map untouched, `{}` is a
- * deliberate clear** (plan
+ * That rule governs what `get_path_settings` REPORTS. What a save SENDS is a
+ * different type — {@link PathSettingsPatch} — with one rule of its own:
+ * **absent means "leave the stored value alone"**, an explicit value sets, and
+ * `null` (scalars) or `{}` (maps) clears (plan
  * `2026-09-22-plans-dir-is-a-single-path-so-a-multi-bound-device-cannot-author-per-tenant`
  * P3 — the server-side merge that closes the erasure hazard a caller unaware of
- * a map used to open by omitting it). So an emptied box must send `{}`; sending
- * nothing would be a silent no-op, and until P3 landed this helper `delete`d the
- * key to mean "cleared", which under the merge means the opposite.
+ * a field used to open by omitting it).
+ *
+ * Two consequences this file exists to get right, both of which have already
+ * been got wrong once:
+ *
+ * - **A shown-but-emptied box sends `null`, not nothing.** Under the merge,
+ *   omission is a no-op; this helper used to `delete` the key to mean "cleared",
+ *   which now means the opposite.
+ * - **The payload is built from an EMPTY object**, never by spreading the loaded
+ *   struct. A key present only because it was spread asserts a value the panel
+ *   never edited, so the save writes the panel's mount-time snapshot back over
+ *   whatever a peer changed meanwhile — a last-writer-wins on every field the
+ *   panel does not display, invisible to any single-writer test.
  *
  * ## Configured vs. in effect
  *
@@ -78,6 +88,34 @@ export interface PathSettings {
   /** Per-tenant override of {@link PathSettings.prompts_dir}. See {@link PathSettings.plans_dir_by_tenant}. */
   prompts_dir_by_tenant?: Record<string, string>;
   strict_mode: boolean;
+}
+
+/**
+ * Wire shape of `commands::path_settings::PathSettingsPatch` — what a SAVE
+ * sends, which is NOT a `PathSettings`.
+ *
+ * **One rule for every field: absent means "leave the stored value alone".** An
+ * explicit value sets; `null` (scalars) or `{}` (maps) clears. So a payload
+ * states only what the caller actually edited, and silence changes nothing —
+ * which is what makes the door safe for a caller that knows about some fields
+ * and not others, the shape every non-UI caller has.
+ *
+ * Every field is optional for that reason, and `buildPathSettingsPayload`
+ * assembles one from an EMPTY object rather than from the loaded struct: a key
+ * present only because it was spread is an assertion nobody made, and the save
+ * would write the panel's mount-time snapshot over a peer's change.
+ */
+export interface PathSettingsPatch {
+  dev_logs_dir?: string | null;
+  plans_dir?: string | null;
+  plans_archive_dir?: string | null;
+  prompts_dir?: string | null;
+  workspace_root?: string | null;
+  repo_checkouts?: Record<string, string>;
+  plans_dir_by_tenant?: Record<string, string>;
+  plans_archive_dir_by_tenant?: Record<string, string>;
+  prompts_dir_by_tenant?: Record<string, string>;
+  strict_mode?: boolean;
 }
 
 /** What is in effect right now, as reported by `get_path_settings`. */
@@ -198,7 +236,13 @@ export type TenantPathDrafts = Record<TenantPathField, Record<string, string>>;
 
 /** The saved map for one per-tenant directory; `{}` when none is stored. */
 export function tenantPathMap(saved: PathSettings, field: TenantPathField): Record<string, string> {
-  return saved[TENANT_MAP_FIELD[field]] ?? {};
+  // A COPY, not the live reference. Every caller today is read-only, so this is
+  // not a bug being fixed — it is a footgun being removed: `tenantDraftsFrom`
+  // spreads the result into editable drafts, and a future caller that mutated
+  // what it got back would be editing `view.configured` in place. The panel
+  // would then compare its drafts against an already-changed "saved" and read
+  // clean, which is the worst shape a dirty check can fail in.
+  return { ...(saved[TENANT_MAP_FIELD[field]] ?? {}) };
 }
 
 /**
@@ -391,47 +435,42 @@ export function buildPathSettingsPayload(
   drafts: PathDrafts,
   repoCheckouts?: Record<string, string>,
   tenantDrafts?: TenantPathDrafts,
-): PathSettings {
-  const next: PathSettings = { ...saved };
-  for (const field of PATH_FIELDS) {
-    const value = normalizePathInput(drafts[field]);
-    if (value === undefined) {
-      delete next[field];
-    } else {
-      next[field] = value;
-    }
-  }
-  // ── The map fields, and the DELETE is as load-bearing as the assignment ──
+): PathSettingsPatch {
+  // ── Built from NOTHING, not from the loaded struct ───────────────────────
   //
-  // `next` starts as `{ ...saved }`, so every map key is ALREADY PRESENT with
-  // the value this panel loaded at mount. Assigning on the edited branch is
-  // therefore only half the rule: without the `delete` on the other branch,
-  // "the panel did not show this map, so it is omitting it" is false — the
-  // payload carries the panel's possibly-stale snapshot and the merge dutifully
-  // writes it back. A peer that set `plans_dir_by_tenant` through
-  // `PUT /settings/paths` while a single-tenant operator had this panel open
-  // would be silently REVERTED by that operator's next save: the same erasure
-  // class the patch/merge exists to close, re-entering through the branch meant
-  // to be inert. It is invisible in a single-writer test, which is why it has
-  // to be stated here rather than left to the reader.
+  // This used to be `{ ...saved }` plus overwrites, and the spread was the bug.
+  // Under the patch's one rule — ABSENT means "leave the stored value alone" —
+  // a key that is present because it was spread is an ASSERTION the panel never
+  // made: it carries the panel's mount-time snapshot, and the save writes it
+  // back over whatever a peer changed in between. That is a last-writer-wins on
+  // every field the panel does not display (`plans_archive_dir`, `strict_mode`,
+  // and every map when the rows are hidden), and it is invisible with a single
+  // writer, which is why it survived a review round.
+  //
+  // So the payload is assembled from an empty object and states only what this
+  // panel actually edited. `null` is how a shown-but-emptied box says "clear";
+  // omission says "I am not talking about this field".
+  const next: PathSettingsPatch = {};
+  for (const field of PATH_FIELDS) {
+    // `normalizePathInput` gives `undefined` for a blank box, and a blank box
+    // IS a clear — so it becomes an explicit `null`, never an omission.
+    next[field] = normalizePathInput(drafts[field]) ?? null;
+  }
   if (repoCheckouts !== undefined) {
-    // `{}` is a DELIBERATE CLEAR, not an omission: under the save's merge,
-    // deleting the key would leave the stored map in place.
+    // `{}` is a DELIBERATE CLEAR: under the merge, omitting the key would leave
+    // the stored map in place.
     next.repo_checkouts = { ...repoCheckouts };
-  } else {
-    delete next.repo_checkouts;
   }
   if (tenantDrafts !== undefined) {
-    // Same rule, and the same reason: a cleared per-tenant row must reach the
-    // runner as `{}` (or as a map without that key) to actually be cleared.
+    // Same rule: a cleared per-tenant row must reach the runner as `{}` (or as
+    // a map without that key) to actually be cleared.
     next.plans_dir_by_tenant = normalizeTenantPathMap(tenantDrafts.plans_dir);
     next.plans_archive_dir_by_tenant = normalizeTenantPathMap(tenantDrafts.plans_archive_dir);
     next.prompts_dir_by_tenant = normalizeTenantPathMap(tenantDrafts.prompts_dir);
-  } else {
-    delete next.plans_dir_by_tenant;
-    delete next.plans_archive_dir_by_tenant;
-    delete next.prompts_dir_by_tenant;
   }
+  // `plans_archive_dir` and `strict_mode` are deliberately NEVER sent: this
+  // panel does not show them, so it has nothing to say about them, and saying
+  // nothing is now how that is expressed.
   return next;
 }
 
