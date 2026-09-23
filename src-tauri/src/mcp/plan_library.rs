@@ -3819,7 +3819,10 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body["error"].as_str().unwrap().contains("must be an edge UUID"));
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("must be an edge UUID"));
 
         let (status, body) = put_json(
             "/plan-library/links/not-a-uuid",
@@ -3828,7 +3831,10 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body["error"].as_str().unwrap().contains("must be an edge UUID"));
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("must be an edge UUID"));
     }
 
     /// A key this runner never minted is the same 401 under EITHER accepted
