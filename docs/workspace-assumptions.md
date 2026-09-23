@@ -11,7 +11,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `repo_layout` | 55 | 68 | 55 | 0 | 0 | 0 |
 | `dev_ports` | 27 | 27 | 27 | 0 | 0 | 0 |
 | `supervisor_dependency` | 32 | 32 | 0 | 22 | 4 | 6 |
-| `plans_dir` | 30 | 31 | 30 | 0 | 0 | 0 |
+| `plans_dir` | 32 | 33 | 32 | 0 | 0 | 0 |
 | `tenant_literal` | 1 | 1 | 0 | 1 | 0 | 0 |
 | `os_bound_tooling` | 105 | 106 | 105 | 0 | 0 | 0 |
 | `machine_path` | 22 | 22 | 0 | 20 | 2 | 0 |
@@ -145,12 +145,12 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/orchestration_loop/remote_client.rs` | `SupervisorClient::<impl>` | `impl SupervisorClient {` | 1 | defect(2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor) — restart_runner: the :9875 HTTP call the orchestration loop's restart modes depend on. |
 | `src/orchestration_loop/remote_client.rs` | `struct SupervisorClient` | `pub struct SupervisorClient {` | 1 | defect(2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor) — The supervisor HTTP client used by the user-facing orchestration loop. |
 
-## `plans_dir` (30 rows)
+## `plans_dir` (32 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
 | `src/agent_worktree/session_env.rs` | `const PLANS_DIR_ENV` | `pub const PLANS_DIR_ENV: &str = "QONTINUI_PLANS_DIR";` | 1 | unreviewed |
-| `src/agent_worktree/session_env.rs` | `session_env` | `qontinui_runner_lib::plan_workunit_adapter::resolve_plans_dir(paths.plans_dir),` | 1 | unreviewed |
+| `src/agent_worktree/session_env.rs` | `session_env` | `paths.plans_dir,` | 1 | unreviewed |
 | `src/ambient.rs` | `const AMBIENT_ENV_KEYS` | `"QONTINUI_PLANS_DIR",` | 1 | unreviewed |
 | `src/bin/qontinui_cli.rs` | `const USAGE` | `--plans-dir <path> Active plans dir (default: $QONTINUI_PLANS_DIR)` | 1 | unreviewed |
 | `src/bin/qontinui_cli.rs` | `const USAGE` | `--plans-dir <path> Active plans dir (default: $QONTINUI_PLANS_DIR).` | 1 | unreviewed |
@@ -166,15 +166,17 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/bin/qontinui_cli.rs` | `resolve_backfill_plans_dir` | `resolve_backfill_plans_dir_from(flag, env_dir("QONTINUI_PLANS_DIR"))` | 1 | unreviewed |
 | `src/bin/qontinui_cli.rs` | `resolve_backfill_plans_dir_from` | `nonblank(plans_env).map(\|v\| (v, "QONTINUI_PLANS_DIR"))` | 1 | unreviewed |
 | `src/commands/path_settings.rs` | `ScanDivergenceView::from` | `plans_dir: d.plans_dir.clone(),` | 1 | unreviewed |
+| `src/commands/path_settings.rs` | `merge` | `plans_dir: patch.plans_dir.unwrap_or_else(\|\| stored.plans_dir.clone()),` | 1 | unreviewed |
 | `src/commands/path_settings.rs` | `normalize` | `plans_dir: non_blank(settings.plans_dir),` | 1 | unreviewed |
-| `src/commands/path_settings.rs` | `view_from` | `let plans_dir = resolve_plans_dir(configured.plans_dir.clone());` | 1 | unreviewed |
+| `src/commands/path_settings.rs` | `view_from` | `configured.plans_dir.clone(),` | 1 | unreviewed |
+| `src/commands/path_settings.rs` | `view_from` | `let plans_dir = resolve_plans_dir(configured.plans_dir.clone(), &BTreeMap::new(), None);` | 1 | unreviewed |
 | `src/main.rs` | `run_app` | `plans_dir: p.plans_dir,` | 1 | unreviewed |
-| `src/main.rs` | `runner_plans_dir_setting` | `qontinui_runner_lib::plan_workunit_adapter::resolve_plans_dir(paths.plans_dir)` | 1 | unreviewed |
-| `src/mcp/plan_library.rs` | `source_path_roots` | `paths.plans_dir.clone(),` | 1 | unreviewed |
+| `src/main.rs` | `runner_plans_dir_setting` | `paths.plans_dir,` | 1 | unreviewed |
+| `src/mcp/plan_library.rs` | `source_path_roots_from` | `resolve_plans_dir(paths.plans_dir.clone(), &paths.plans_dir_by_tenant, None),` | 1 | unreviewed |
 | `src/plan_workunit_adapter/body_push.rs` | `ScanRootReport::from_divergence` | `plans_dir: cap_chars(d.plans_dir.clone(), SCAN_ROOT_PATH_MAX_CHARS),` | 1 | unreviewed |
 | `src/plan_workunit_adapter/trigger.rs` | `LoopState::apply_resolution` | `coord from this runner. Arm it by setting 'paths.plans_dir' in the Paths \` | 1 | unreviewed |
 | `src/plan_workunit_adapter/trigger.rs` | `LoopState::apply_resolution` | `setting = "paths.plans_dir",` | 1 | unreviewed |
-| `src/plan_workunit_adapter/trigger.rs` | `ResolvedDirs::resolve` | `plans: resolve_plans_dir(inputs.plans_dir),` | 1 | unreviewed |
+| `src/plan_workunit_adapter/trigger.rs` | `ResolvedDirs::resolve` | `plans: resolve_plans_dir(inputs.plans_dir, &no_tenant_overrides, None),` | 1 | unreviewed |
 | `src/plan_workunit_adapter/trigger.rs` | `record_scan_divergence` | `plans_dir = ?divergence.plans_dir,` | 2 | unreviewed |
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `"plans_dir_migration: recorded paths.plans_dir = {value:?} from the retired env \` | 1 | unreviewed |
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `let existing = get_setting::<PathSettings>().plans_dir;` | 1 | unreviewed |
