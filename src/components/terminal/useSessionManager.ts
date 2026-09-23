@@ -346,7 +346,7 @@ export interface UseSessionManagerReturn {
   activeCount: number;
   // Session-model counts for the Terminal-page StatusStrip (Claude
   // sessions, not PTY tabs). See `statusCounts` for the bucketing.
-  sessionCount: number;
+  claudeSessionCount: number;
   workingCount: number;
   idleCount: number;
   completedCount: number;
@@ -397,7 +397,7 @@ const STATUS_PRIORITY: Record<SessionLiveStatus, number> = {
 
 /** Counts surfaced to the Terminal-page StatusStrip pills. */
 export interface StatusCounts {
-  sessionCount: number;
+  claudeSessionCount: number;
   workingCount: number;
   idleCount: number;
   completedCount: number;
@@ -457,9 +457,10 @@ export function computeStatusCounts(sessions: readonly StatusCountsInput[]): Sta
   // Total = the live managed set: working + idle + needs-input + error +
   // completed. Equivalently the count of sessions that survived the
   // dormant/orphan filter above. Reconciles with the per-bucket pills.
-  const sessionCount = workingCount + idleCount + needsInputLive + errorCount + completedCount;
+  const claudeSessionCount =
+    workingCount + idleCount + needsInputLive + errorCount + completedCount;
   return {
-    sessionCount,
+    claudeSessionCount,
     workingCount,
     idleCount,
     completedCount,
@@ -1201,7 +1202,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     needsInputCount,
     activeCount,
     // Session-model counts for the StatusStrip (excludes PTY-only tabs).
-    sessionCount: statusCounts.sessionCount,
+    claudeSessionCount: statusCounts.claudeSessionCount,
     workingCount: statusCounts.workingCount,
     idleCount: statusCounts.idleCount,
     completedCount: statusCounts.completedCount,

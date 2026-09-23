@@ -90,10 +90,11 @@ const zoneLayout = {
 };
 
 /**
- * Every attention signal at zero and no plan loaded, so `isMultiZone` is the
- * ONLY thing that can keep the strip on screen.
+ * Every attention signal at zero and no plan loaded, so `isMultiSession` (the
+ * strip's local, formerly misnamed `isMultiZone`) is the ONLY thing that can
+ * keep the strip on screen.
  */
-function mountScenario(tabs: RosterTab[], sessionCount: number) {
+function mountScenario(tabs: RosterTab[], claudeSessionCount: number) {
   Object.assign(sessionValue, {
     tabs,
     sessionStates: {},
@@ -101,7 +102,7 @@ function mountScenario(tabs: RosterTab[], sessionCount: number) {
     zoneLayout,
     workflowGen: { planFileName: null, isPlanLoading: false },
     sessionManager: {
-      sessionCount,
+      claudeSessionCount,
       needsInputCount: 0,
       errorCount: 0,
       workingCount: 0,
@@ -167,5 +168,9 @@ describe("StatusStrip auto-hide gate", () => {
     const html = mountScenario([], 2);
     expect(html).toContain('data-page-element="status-strip"');
     expect(html).toContain("2 sessions");
+    // The tooltip must not claim external sessions are "on this page" — only
+    // the live-terminal half of the union is scoped to this window.
+    expect(html).toContain("2 sessions — 2 Claude (incl. external), 0 live terminals on this page");
+    expect(html).not.toContain("2 sessions on this page");
   });
 });
