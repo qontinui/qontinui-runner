@@ -26,12 +26,14 @@
 
 import { useEffect, useState } from "react";
 import { AlertTriangle, RotateCcw, X } from "lucide-react";
+import { useUIElement } from "@qontinui/ui-bridge";
 import {
   useSessionRecovery,
   type ClaimStatus,
   type SessionRecoveryOutcome,
   type WipStatus,
 } from "@/hooks/useSessionRecovery";
+import { AdvisorySlot } from "./AdvisoryStack";
 
 /** Human-readable, HONEST resume-fidelity label for one session. */
 export function fidelityLabel(s: SessionRecoveryOutcome): string {
@@ -93,6 +95,12 @@ export function SessionRecoveryBanner() {
     if (summary) setDismissed(false);
   }, [summary]);
 
+  const { ref } = useUIElement({
+    id: "terminal-session-recovery-banner",
+    type: "generic",
+    label: "Session recovery banner",
+  });
+
   if (!summary || dismissed) return null;
   if (summary.resumedCount === 0) return null;
 
@@ -101,79 +109,86 @@ export function SessionRecoveryBanner() {
 
   // Accent: red for crash recovery, soft slate/blue for a planned restart.
   const accent = crash ? "#f7768e" : "#7aa2f7";
-  const containerBg = crash ? "bg-[#f7768e]/10 border-[#f7768e]/40" : "bg-[#7aa2f7]/8 border-[#7aa2f7]/30";
+  const containerBg = crash
+    ? "bg-[#f7768e]/10 border-[#f7768e]/40"
+    : "bg-[#7aa2f7]/8 border-[#7aa2f7]/30";
 
   const heading = crash
     ? `Recovered ${summary.resumedCount} session${summary.resumedCount === 1 ? "" : "s"} after an unexpected restart`
     : `${summary.resumedCount} session${summary.resumedCount === 1 ? "" : "s"} resumed`;
 
   return (
-    <div
-      data-ui-bridge-id="terminal.session-recovery-banner"
-      data-crash-recovery={crash ? "true" : "false"}
-      className={`absolute top-2 right-2 z-30 w-[360px] rounded border shadow-lg p-2.5 ${containerBg}`}
-    >
-      <div className="flex items-start gap-2">
-        {crash ? (
-          <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" style={{ color: accent }} />
-        ) : (
-          <RotateCcw className="w-3.5 h-3.5 shrink-0 mt-0.5" style={{ color: accent }} />
-        )}
-        <div className="flex-1 min-w-0">
-          <div className="text-[12px] font-semibold text-[#c0caf5] leading-snug">{heading}</div>
+    <AdvisorySlot>
+      <div
+        ref={ref}
+        data-ui-bridge-id="terminal.session-recovery-banner"
+        data-crash-recovery={crash ? "true" : "false"}
+        className={`w-[360px] rounded border shadow-lg p-2.5 ${containerBg}`}
+      >
+        <div className="flex items-start gap-2">
+          {crash ? (
+            <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" style={{ color: accent }} />
+          ) : (
+            <RotateCcw className="w-3.5 h-3.5 shrink-0 mt-0.5" style={{ color: accent }} />
+          )}
+          <div className="flex-1 min-w-0">
+            <div className="text-[12px] font-semibold text-[#c0caf5] leading-snug">{heading}</div>
 
-          {/* Quiet mode: when nothing is degraded, the heading is enough — but
+            {/* Quiet mode: when nothing is degraded, the heading is enough — but
               we still list per-session honesty so a lossy/degraded resume is
               never hidden behind a calm summary line. */}
-          <ul className="mt-1.5 space-y-1">
-            {sessions.map((s) => {
-              const degraded = isDegraded(s);
-              const claim = claimLabel(s.claimStatus);
-              const wip = wipLabel(s.wipStatus);
-              return (
-                <li
-                  key={s.taskRunId}
-                  data-ui-bridge-id="terminal.session-recovery-banner-item"
-                  data-task-run-id={s.taskRunId}
-                  data-degraded={degraded ? "true" : "false"}
-                  className="text-[11px] leading-snug"
-                >
-                  <div className="flex items-baseline gap-1.5">
-                    <span className="text-[#c0caf5] font-medium truncate">{s.title}</span>
-                    <span
-                      className={isLossy(s) ? "text-[#e0af68]" : "text-[#9ece6a]"}
-                      title={isLossy(s) ? "Earlier context may be missing" : "Full transcript restored"}
-                    >
-                      {fidelityLabel(s)}
-                    </span>
-                  </div>
-                  {claim && (
-                    <div className="text-[10px] text-[#e0af68]/90 mt-0.5">{claim}</div>
-                  )}
-                  {wip && (
-                    <div
-                      className={`text-[10px] mt-0.5 ${
-                        s.wipStatus === "kept-for-manual" ? "text-[#e0af68]/90" : "text-[#9ece6a]/80"
-                      }`}
-                    >
-                      {wip}
+            <ul className="mt-1.5 space-y-1">
+              {sessions.map((s) => {
+                const degraded = isDegraded(s);
+                const claim = claimLabel(s.claimStatus);
+                const wip = wipLabel(s.wipStatus);
+                return (
+                  <li
+                    key={s.taskRunId}
+                    data-ui-bridge-id="terminal.session-recovery-banner-item"
+                    data-task-run-id={s.taskRunId}
+                    data-degraded={degraded ? "true" : "false"}
+                    className="text-[11px] leading-snug"
+                  >
+                    <div className="flex items-baseline gap-1.5">
+                      <span className="text-[#c0caf5] font-medium truncate">{s.title}</span>
+                      <span
+                        className={isLossy(s) ? "text-[#e0af68]" : "text-[#9ece6a]"}
+                        title={
+                          isLossy(s) ? "Earlier context may be missing" : "Full transcript restored"
+                        }
+                      >
+                        {fidelityLabel(s)}
+                      </span>
                     </div>
-                  )}
-                </li>
-              );
-            })}
-          </ul>
+                    {claim && <div className="text-[10px] text-[#e0af68]/90 mt-0.5">{claim}</div>}
+                    {wip && (
+                      <div
+                        className={`text-[10px] mt-0.5 ${
+                          s.wipStatus === "kept-for-manual"
+                            ? "text-[#e0af68]/90"
+                            : "text-[#9ece6a]/80"
+                        }`}
+                      >
+                        {wip}
+                      </div>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+          <button
+            type="button"
+            aria-label="Dismiss recovery summary"
+            data-ui-bridge-id="terminal.session-recovery-banner-dismiss"
+            onClick={() => setDismissed(true)}
+            className="text-[#c0caf5]/70 hover:text-[#c0caf5] leading-none px-1"
+          >
+            <X className="w-3 h-3" />
+          </button>
         </div>
-        <button
-          type="button"
-          aria-label="Dismiss recovery summary"
-          data-ui-bridge-id="terminal.session-recovery-banner-dismiss"
-          onClick={() => setDismissed(true)}
-          className="text-[#c0caf5]/70 hover:text-[#c0caf5] leading-none px-1"
-        >
-          <X className="w-3 h-3" />
-        </button>
       </div>
-    </div>
+    </AdvisorySlot>
   );
 }

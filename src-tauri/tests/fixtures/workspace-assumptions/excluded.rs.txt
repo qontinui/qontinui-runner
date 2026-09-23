@@ -1,0 +1,72 @@
+// Negative fixture: every pattern below sits somewhere the sweep must NOT look.
+// "http://localhost:8000" "C:\\Users\\x" "/home/someone" "powershell" 9875
+/* block comment: "qontinui-dev-notes/plans" 0f8fad5b-d9cb-469f-a165-70867728950e */
+/// doc comment: QONTINUI_PLANS_DIR, paths.plans_dir, SUPERVISOR_URL
+fn clean() -> u32 {
+    let c = '"'; // a char literal that must not open a string
+    let _ = c;
+    2
+}
+
+#[cfg(windows)]
+fn only_windows() {
+    let _ = std::process::Command::new("taskkill").arg("/F").status();
+}
+
+#[cfg(not(windows))]
+fn only_windows() {}
+
+#[cfg(test)]
+mod tests {
+    fn helper() -> &'static str {
+        "http://localhost:8000"
+    }
+    #[test]
+    fn t() {
+        let _ = ("D:/x", "/home/me", 9875, "qontinui-web/backend", "0f8fad5b-d9cb-469f-a165-70867728950e");
+    }
+}
+
+#[cfg(test)]
+fn test_only_helper() -> &'static str {
+    "powershell"
+}
+
+#[cfg(test)]
+use std::env::var as _unused_in_tests;
+
+// cfg predicates that are test-only without `test` coming first.
+#[cfg(all(feature = "x", test))]
+fn t1() -> &'static str {
+    "http://localhost:8000"
+}
+
+#[cfg(all(
+    test,
+    feature = "y"
+))]
+fn t2() -> &'static str {
+    "C:/Users/x"
+}
+
+// A cfg(test) module nested inside a cfg(windows) one is still test-only.
+#[cfg(windows)]
+mod win_only {
+    #[cfg(test)]
+    mod tests {
+        fn t() -> &'static str {
+            "http://localhost:8000"
+        }
+    }
+}
+
+// Platform modules with a sibling of the same fn: no structural hit.
+#[cfg(windows)]
+mod plat {
+    pub fn open() {}
+}
+
+#[cfg(any(unix, target_os = "macos"))]
+mod plat {
+    pub fn open() {}
+}

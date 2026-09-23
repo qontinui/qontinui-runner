@@ -83,11 +83,12 @@ grammar and stops: no sweep, no finding. A usage error is not a night's record.
 ## Step 0 — Resolve the helpers once, and run the whole night from a copy
 
 The scripts live in this skill's own directory — Phase 6 moved them there so
-that, once the runner half of the same plan bundles this directory, a
-runner-only device (no config-repo checkout) carries them in the runner's
-fleet-skill bundle; `scripts/<name>.sh` is now an exec wrapper onto the copy
-here. One resolver still covers both rungs, skill directory first, so a
-checkout that predates the move resolves too. Substitute
+that a runner-only device (no config-repo checkout) carries them in the
+runner's fleet-skill bundle; the runner half (runner PR #1646,
+`src-tauri/src/fleet_skills/return-to-main/`) has landed, so this directory is
+bundled on any runner build built after it. `scripts/<name>.sh` is now an exec
+wrapper onto the copy here. One resolver still covers both rungs, skill
+directory first, so a checkout that predates the move resolves too. Substitute
 the two placeholders: the harness names this skill's base directory when it
 loads the skill, and in a scheduled run the session's working directory IS the
 workspace root (the task's `working_directory`) — the directory whose depth-1

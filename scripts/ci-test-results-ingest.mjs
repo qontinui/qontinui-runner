@@ -22,12 +22,32 @@
  * The gating verdict is `cargo test`'s own exit code from the EARLIER step;
  * this one is pure best-effort telemetry, run with `if: always()` so a
  * failed suite's results reach coord too. The caller should additionally set
- * `continue-on-error: true` on this step as defence in depth — but avoid
- * pairing that with a GitHub Actions `timeout-minutes` on the SAME step: a
- * `continue-on-error` step that hits its OWN `timeout-minutes` cancels the
- * whole job, not just the step (learned the expensive way in this plan's
- * nextest revert). This script bounds its own network call internally
- * instead, so no step-level timeout is needed here.
+ * `continue-on-error: true` on this step as defence in depth. This script
+ * bounds its own network call internally, so no step-level `timeout-minutes`
+ * is needed here regardless of the paragraph below.
+ *
+ * MEASURED, not asserted: Phase 0 of plan
+ * 2026-08-31-published-build-parity-check's 2026-09-20 follow-up ran a
+ * throwaway `continue-on-error: true` step that tripped its own
+ * `timeout-minutes: 1` (github.com/qontinui/qontinui-runner/actions/runs/35730892188,
+ * job step "continue-on-error step that trips its own timeout-minutes",
+ * 2026-09-22). The step failed at exactly its bound
+ * (`##[error]...has timed out after 1 minutes.`); the JOB did NOT cancel;
+ * the next step ran immediately; a post-step (Swatinem/rust-cache) ran too;
+ * the job concluded `success`. So pairing `continue-on-error` with a
+ * step's own `timeout-minutes` did not, in this controlled run, cancel the
+ * whole job.
+ *
+ * This is UNRECONCILED, not a correction, against `7ff875ec4`
+ * ("revert(ci): drop the nextest shadow"), which reported the opposite from
+ * a real incident on 2026-09-01 (run 33545829387: the nextest shadow step
+ * recorded `cancelled`, every later step `skipped`, despite `if: always()`
+ * on the ingest step) — that run's raw logs have since aged out of GitHub's
+ * retention, so the discrepancy could not be re-diagnosed from source. Do
+ * not treat either observation as authoritative over the other; both are
+ * measurements of the same claim, on different occasions, with opposite
+ * results. What is unaffected either way: this script needs no step-level
+ * timeout because it bounds its own network call internally.
  *
  * USAGE
  *   node scripts/ci-test-results-ingest.mjs --log <path> --repo <owner/repo>

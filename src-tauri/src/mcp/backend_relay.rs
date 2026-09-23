@@ -4631,8 +4631,14 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
         // The shared session-env contribution (`QONTINUI_SESSION_WORKTREES` +
         // the configured plan directories) onto the PTY, derived before the
         // ctx is parked. See `agent_worktree::session_env`.
+        //
+        // No tenant key, for the same reason there is no spawn tenant above: the
+        // frame came over the relay from another machine and names no tenant, so
+        // reading one off it would let the remote party choose which of this
+        // device's per-tenant plan directories a session authors into. `None`
+        // resolves the device default.
         let extra_env =
-            crate::agent_worktree::session_env::session_extra_env(isolated_ctx.as_ref());
+            crate::agent_worktree::session_env::session_extra_env(isolated_ctx.as_ref(), None);
 
         // Kept for the coord registration below, which runs after `title` has
         // been moved into the spawn.
