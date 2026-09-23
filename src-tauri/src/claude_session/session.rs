@@ -414,15 +414,12 @@ impl ClaudeSession {
             working_dir,
             &ai_settings.claude_cli,
             // Phase 8b (B2): thread the session's RECORDED tenant so the
-            // federated pool agrees with the coord record + JWT slot by
-            // construction. `stamp_session_tenant` records the coord side
-            // from `machine.json::active_tenant_id` (spawn input else
-            // this pin); resolving the SAME source here — rather than
-            // letting `build_federation_ctx` fall back to
-            // `paired_user.json::default_tenant_id` — is what closes the
-            // split-brain. `None` on a single-tenant install (coord
-            // resolves the sole binding server-side).
-            crate::session::dual_write::resolve_active_tenant_id(),
+            // federated pool agrees with the coord record + JWT slot. The
+            // coord side is stamped by `AiCoordRegistrar` from this SAME
+            // resolver (the machine.json pin, else — on an unpinned device —
+            // the paired_user.json default binding). `None` on an
+            // unresolvable or unpaired machine.
+            crate::session::resolve_new_session_tenant(),
         ) {
             Ok(ctx) => Some(ctx),
             Err(reason) => {

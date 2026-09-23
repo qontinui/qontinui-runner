@@ -2529,7 +2529,10 @@ mod failed_task_run_teardown_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let outbox =
             Arc::new(OutboxWriter::open(dir.path().join("outbox.jsonl")).expect("outbox open"));
-        (AiCoordRegistrar::new(outbox, uuid::Uuid::new_v4()), dir)
+        (
+            AiCoordRegistrar::with_tenant_resolver(outbox, uuid::Uuid::new_v4(), || None),
+            dir,
+        )
     }
 
     /// G3 REGRESSION. `create_ai_session` now registers the coord session and

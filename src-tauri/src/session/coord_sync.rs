@@ -2000,7 +2000,9 @@ fn transport_error(e: &reqwest::Error) -> String {
 /// Resolution order:
 /// 1. The record payload — the `started` create body carries the full
 ///    intent (whose `tenant_id` the registry stamped at creation), and a
-///    top-level `tenant_id` is honored for future event kinds.
+///    top-level `tenant_id` is the carrier for sessions OUTSIDE the registry:
+///    `AiCoordRegistrar` stamps one on every row of its sessions (create and
+///    thin rows alike) and on their transcript `output_chunk` rows.
 /// 2. The live [`SessionRegistry`] record for `rec.session_id` — thin
 ///    payloads (heartbeat / state_change / closed) carry no intent, but the
 ///    registry still holds the session's stamped tenant while it's alive.
@@ -2527,8 +2529,9 @@ async fn bootstrap_then_register(
 fn rebuild_create_body(rec: &OutboxRecord) -> JsonValue {
     // tenant_id resolution order: the intent/payload body (Phase 8b: the
     // registry stamps the session's tenant into the intent at creation —
-    // spawn input or the machine.json default-for-new-sessions, so this arm
-    // is the common case now) → the device's `active_tenant_id` from
+    // spawn input, else the machine.json pin, else on an unpinned device the
+    // paired default binding; `AiCoordRegistrar` stamps a top-level
+    // `tenant_id` from the same resolver — so this arm is the common case) → the device's `active_tenant_id` from
     // `~/.qontinui/machine.json` (pre-8b outbox rows) → nil. The
     // machine.json fallback is what makes a single-tenant operator's
     // sessions visible on their tenant-scoped dashboard: without it, every
