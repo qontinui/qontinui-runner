@@ -1768,6 +1768,7 @@ pub(crate) fn settings_derived_inputs() -> SettingsDerivedInputs {
         mut settings,
         provenance,
         error,
+        path: _,
     } = crate::settings::read_settings_from_disk();
 
     crate::settings::apply_web_integration_env_overlay(&mut settings);
