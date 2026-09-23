@@ -1458,6 +1458,17 @@ async fn health(
         // with a serving emitter used to be diagnosable only by log grep on
         // the emitting box.
         "transportRung": transport_rung_health_snapshot(),
+        // The coord session outbox drain (qontinui-runner manual-test-loop
+        // 2026-09-23): `pending` rows and the `oldestUnackedAt` among them as
+        // of the drain's last tick (`observedAt`; `pending: null` = no tick
+        // yet, UNKNOWN rather than empty), `lastAckAt` of anything coord
+        // accepted, and `lastFailure {kind, status, at}` — `kind` one of
+        // server_error / rate_limited / unauthorized / rejected / conflict /
+        // network / timeout. `retryingSessions` are on their own backoff;
+        // `quarantinedSessions` had their rows moved to the
+        // `<outbox>.quarantine.jsonl` sidecar after failing while coord served
+        // everything else. A stalled drain used to be invisible from here.
+        "sessionOutbox": crate::session::coord_sync::session_outbox_health_json(),
         // Session-message push evidence (plan
         // 2026-09-07-session-message-delivery-is-blind-and-park-collection-
         // resolves-on-a-guess, Phase 4): every tick the poller could not push
