@@ -38,7 +38,8 @@ Required env:
                        flow; if absent the skill exits with an error.
 
 Optional env:
-  COORD_URL          — coord base URL. Default http://localhost:9870.
+  COORD_URL          — coord base URL (then COORD_HTTP_URL). Default
+                       https://coord.qontinui.io.
 
 Examples:
   set-label.sh --repo qontinui/qontinui-coord --pr 75 \
@@ -468,7 +469,7 @@ fi
 # with no dependency edge). The REST call carries no such query, and — unlike
 # `gh pr edit` — does NOT create a missing dynamic-value label as a side
 # effect; that is done explicitly below, on the 404 this route reports for one.
-echo "step 1/2: gh api POST repos/$REPO/issues/$PR/labels \"$LABEL\""
+echo "step 1/3: gh api POST repos/$REPO/issues/$PR/labels \"$LABEL\""
 
 # gh's stderr is CAPTURED rather than let straight through, so that a
 # `'<label>' not found` can be answered here instead of left for the caller to
@@ -538,60 +539,324 @@ fi
 echo "ok: gh added label \"$LABEL\" to $REPO#$PR"
 
 # ----- step 2: coord-side ingest hook ----------------------------------------
+#
+# WRONG-TENANT GUARD (coord finding for 2026-09-23; same class as
+# qontinui-claude-config#1104 in handoff-stuck-pr.sh). `POST /pr-merge/labels`
+# carries no credential: coord writes the row under the tenant of
+# QONTINUI_AGENT_ID's `coord.agent_worktrees` row. On a device bound to several
+# tenants that row is frequently stamped with the WRONG one -- an anonymous
+# allocate that names no tenant resolves to the device's legacy pointer (coord
+# `agent_worktrees::resolve_device_tenant`, P5a still `shadow`) -- and coord's
+# own ownership check (`labels_routes::resolve_ingest_tenant`,
+# COORD_LABEL_INGEST_OWNERSHIP_MODE) defaults to `shadow`, which meters the
+# disagreement and writes under the inherited tenant anyway. Measured
+# 2026-09-23: two `coord:stacked-on=` rows written under meryts-2-0 (b3ecb579)
+# for qontinui/* PRs, and every cross-repo `upstream-of` / `downstream-of`
+# refused as "not registered to this tenant".
+#
+# So before the real write, this step PROVES the write tenant owns $REPO:
+#   2a. a probe -- the same POST with `labels: []` in `merge` mode, which writes
+#       and deletes no pr_labels row (it does re-run coord's dependency-edge
+#       resync for the PR, which may prune an edge that is already stale) -- reads back the tenant coord
+#       would write under (the response's `tenant_id`);
+#   2b. a device credential FOR that tenant (a static token whose `tenant_id`
+#       claim is that tenant, else POST /agents/credential naming it; a minted
+#       token claiming any other tenant is rejected, never used) asks
+#       `GET /pr-merge/<owner%2Fname>/<pr>/author-session`, which answers 200
+#       only when the caller's tenant owns the repo and 404 otherwise (coord
+#       `pr_merge::get_author_session`). gh has just proven the PR exists, so a
+#       404 REFUTES ownership.
+# Proven -> the real POST. Refuted, or anything that is not a proof (no device
+# id, no credential for that tenant, a 401/5xx/transport failure) -> the coord
+# row is WITHHELD and the script exits 5 saying which. That is the fail-closed
+# direction: the GitHub label is the canonical copy, it is already applied, and
+# coord's merge ordering reads the dependency edge from it; a wrong-tenant row
+# is what does harm. A probe answered with a well-formed body (`written` and
+# `rejected` present) whose `tenant_id` KEY is absent means coord's `enforce`
+# arm re-tenanted the write itself (the field is omitted exactly then), so
+# coord made the ownership decision and 2b is skipped. Any other body -- empty,
+# non-JSON, a null tenant_id -- is UNKNOWN and withholds.
 
-PAYLOAD=$(python3 -c "
-import json, sys
-print(json.dumps({
-    'agent_id': sys.argv[1],
-    'repo': sys.argv[2],
-    'pr_number': int(sys.argv[3]),
-    'labels': [sys.argv[4]],
-}))
-" "$QONTINUI_AGENT_ID" "$REPO" "$PR" "$LABEL")
+TMPD="$(mktemp -d)" || { echo "error: mktemp -d failed" >&2; exit 4; }
+trap 'rm -rf "$TMPD"' EXIT
+HTTP_CONNECT_TIMEOUT="${COORD_PR_LABEL_CONNECT_TIMEOUT:-5}"
+HTTP_TIMEOUT="${COORD_PR_LABEL_HTTP_TIMEOUT:-20}"
+RC_WITHHELD=5
 
-echo "step 2/2: POST $COORD_URL/pr-merge/labels"
-# -w appends the HTTP code on its own line; plain -sS exits 0 on HTTP 4xx/5xx,
-# which is how a 422 tenant_resolution_failed once printed as "ok, written=0".
-RAW=$(curl -sS -w '\n%{http_code}' -X POST "$COORD_URL/pr-merge/labels" \
-  -H "Content-Type: application/json" \
-  -d "$PAYLOAD") || {
-    echo "error: POST $COORD_URL/pr-merge/labels failed (coord unreachable?)" >&2
-    echo "       gh-side label add succeeded; reconciler will eventually pick it up." >&2
-    exit 4
+# A native curl opens -o itself; on an MSYS box the POSIX path must cross as a
+# Windows one -- the same helper handoff-stuck-pr.sh / coord-revive use.
+curl_path() { if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else printf '%s' "$1"; fi; }
+
+is_uuid() {
+  local re='^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$'
+  [[ "$1" =~ $re ]]
 }
-HTTP_CODE=${RAW##*$'\n'}
-RESPONSE=${RAW%$'\n'*}
 
-if [[ "$HTTP_CODE" != 2* ]]; then
-  echo "error: coord ingest returned HTTP $HTTP_CODE — body: $RESPONSE" >&2
-  if [[ "$RESPONSE" == *tenant_resolution_failed* ]]; then
+# jwt_claim <jwt> <claim> -> the payload claim as a string, or nothing. Reads the
+# PAYLOAD only (base64url, not encrypted) and never prints the token.
+jwt_claim() {
+  H_JWT="$1" H_CLAIM="$2" python3 - <<'PY' 2>/dev/null || true
+import base64, json, os
+try:
+    seg = os.environ["H_JWT"].split(".")[1]
+    seg += "=" * (-len(seg) % 4)
+    v = json.loads(base64.urlsafe_b64decode(seg)).get(os.environ["H_CLAIM"])  # envelope-ok: a JWT claim, not a fleet response envelope
+    print(v if isinstance(v, (str, int, float)) and not isinstance(v, bool) else "")
+except Exception:
+    print("")
+PY
+}
+
+jwt_shaped() {
+  case "$1" in "" | *[!A-Za-z0-9._-]* ) return 1 ;; esac
+  [ "$(printf '%s' "$1" | tr -cd '.' | wc -c | tr -d '[:space:]')" = "2" ]
+}
+
+# jwt-cascade-selection: each source ($COORD_DEVICE_JWT, then the file, then a
+# coord mint from `POST $COORD_URL/agents/credential` -- not the runner) is gated
+# on VALIDITY by jwt_usable_for -- shape, exp >= 60 s away and the wanted tenant --
+# and a source that fails falls through to the next, so a stale static token
+# never shadows the one behind it (#366).
+# jwt_usable_for <jwt> <tenant> -> 0 iff JWT-shaped, exp >= 60 s away, and its
+# `tenant_id` claim IS <tenant> (case-folded: coord's claims are lowercase).
+jwt_usable_for() {
+  local exp claim now
+  jwt_shaped "$1" || return 1
+  exp="$(jwt_claim "$1" exp)"; exp="${exp%%.*}"
+  [[ "$exp" =~ ^[0-9]+$ ]] || return 1
+  now="$(date +%s)"
+  (( exp - now > 60 )) || return 1
+  claim="$(jwt_claim "$1" tenant_id)"
+  [ "${claim,,}" = "${2,,}" ]
+}
+
+# device_id -> this box's coord device id ($QONTINUI_MACHINE_ID, else
+# ~/.qontinui/machine.json `device_id` / `machine_id`), or nothing.
+device_id() {
+  local home_dir="${HOME:-${USERPROFILE:-}}" mf
+  if [ -n "${QONTINUI_MACHINE_ID:-}" ]; then printf '%s' "$QONTINUI_MACHINE_ID"; return 0; fi
+  mf="$home_dir/.qontinui/machine.json"
+  [ -n "$home_dir" ] && [ -r "$mf" ] || return 0
+  python3 -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(0)
+if not isinstance(d, dict): sys.exit(0)
+v=d.get("device_id") or d.get("machine_id") or ""  # envelope-ok: machine.json is a local config file, not a fleet response
+print(v if isinstance(v,str) else "")' < "$mf" 2>/dev/null | tr -d '[:space:]' || true
+}
+
+# stage_bearer_for <tenant> -> writes `Authorization: Bearer <jwt>` to
+# $TMPD/bearer.hdr (0600, never on argv) and prints its source (env|file|mint),
+# or prints `rejected(<why>)` and writes nothing. Only a token whose `tenant_id`
+# claim IS <tenant> is ever staged: a token for another tenant would answer the
+# ownership door about the WRONG tenant, which is the defect this guards.
+stage_bearer_for() {
+  local want="$1" home_dir="${HOME:-${USERPROFILE:-}}" jwt="" src="" why="" f dev code c
+  rm -f "$TMPD/bearer.hdr"
+  f="$(printf '%s' "${COORD_DEVICE_JWT:-}" | tr -d '[:space:]')"
+  if [ -n "$f" ]; then
+    if jwt_usable_for "$f" "$want"; then jwt="$f"; src=env
+    else why="\$COORD_DEVICE_JWT is stale or claims another tenant"; fi
+  fi
+  if [ -z "$jwt" ] && [ -n "$home_dir" ] && [ -r "$home_dir/.qontinui/coord-device-jwt" ]; then
+    f="$(tr -d '[:space:]' < "$home_dir/.qontinui/coord-device-jwt" 2>/dev/null || true)"
+    if jwt_usable_for "$f" "$want"; then jwt="$f"; src=file
+    else why="${why:+$why; }~/.qontinui/coord-device-jwt is stale or claims another tenant"; fi
+  fi
+  if [ -z "$jwt" ]; then
+    dev="$(device_id)"
+    if [ -z "$dev" ]; then
+      why="${why:+$why; }no device_id (\$QONTINUI_MACHINE_ID / ~/.qontinui/machine.json) to mint with"
+    else
+      ( umask 077; : > "$TMPD/mint.json" )
+      code="$(curl -sS -o "$(curl_path "$TMPD/mint.json")" -w '%{http_code}' \
+        --connect-timeout "$HTTP_CONNECT_TIMEOUT" -m "$HTTP_TIMEOUT" \
+        -X POST "$COORD_URL/agents/credential" -H "Content-Type: application/json" \
+        -d "$(H_DEV="$dev" H_TENANT="$want" python3 -c 'import json,os; print(json.dumps({"device_id":os.environ["H_DEV"],"tenant_id":os.environ["H_TENANT"]}))')" \
+        2>/dev/null)" || code="000"
+      if [ "$code" = 200 ]; then
+        f="$(python3 -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(0)
+if isinstance(d, dict):
+    for k in ("token","agent_jwt","jwt","access_token"):  # envelope-ok: the spellings coord-revive L5 reads
+        v=d.get(k)
+        if isinstance(v,str) and v: print(v); break' < "$TMPD/mint.json" 2>/dev/null | tr -d '[:space:]' || true)"
+        c="$(jwt_claim "$f" tenant_id)"
+        if jwt_usable_for "$f" "$want"; then jwt="$f"; src=mint
+        elif jwt_shaped "$f" && [ "${c,,}" = "${want,,}" ]; then why="${why:+$why; }POST /agents/credential for tenant $want returned a token that is expired or carries no exp -- not used"
+        else why="${why:+$why; }POST /agents/credential for tenant $want returned a token claiming tenant ${c:-<none>} (a coord predating the tenant_id field mints for the device's legacy pointer) -- not used"; fi
+      else
+        why="${why:+$why; }POST /agents/credential for tenant $want answered HTTP $code"
+      fi
+      rm -f "$TMPD/mint.json"
+    fi
+  fi
+  if [ -n "$jwt" ]; then
+    ( umask 077; printf 'Authorization: Bearer %s\n' "$jwt" > "$TMPD/bearer.hdr" )
+    printf '%s' "$src"
+  else
+    printf 'rejected(%s)' "${why:-no credential}"
+  fi
+}
+
+# post_labels <labels-json-array> -> POSTs to /pr-merge/labels; sets POST_CODE
+# (000 on a transport failure) and POST_BODY.
+post_labels() {
+  local payload
+  payload="$(H_AGENT="$QONTINUI_AGENT_ID" H_REPO="$REPO" H_PR="$PR" H_LABELS="$1" python3 -c '
+import json, os
+print(json.dumps({
+    "agent_id": os.environ["H_AGENT"],
+    "repo": os.environ["H_REPO"],
+    "pr_number": int(os.environ["H_PR"]),
+    "labels": json.loads(os.environ["H_LABELS"]),
+    "mode": "merge",
+}))')"
+  : > "$TMPD/post.json"
+  POST_CODE="$(curl -sS -o "$(curl_path "$TMPD/post.json")" -w '%{http_code}' \
+    --connect-timeout "$HTTP_CONNECT_TIMEOUT" -m "$HTTP_TIMEOUT" \
+    -X POST "$COORD_URL/pr-merge/labels" -H "Content-Type: application/json" \
+    -d "$payload" 2>/dev/null)" || POST_CODE="000"
+  POST_CODE="${POST_CODE:-000}"
+  POST_BODY="$(cat "$TMPD/post.json" 2>/dev/null || true)"
+}
+
+# json_field <field> -> reads $POST_BODY; prints the field, or nothing.
+json_field() {
+  printf '%s' "$POST_BODY" | H_F="$1" python3 -c 'import json,os,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(0)
+v=d.get(os.environ["H_F"]) if isinstance(d, dict) else None  # envelope-ok: the /pr-merge/labels response body, read field by field
+if isinstance(v, list): print(len(v))
+elif v is not None: print(v)' 2>/dev/null || true
+}
+
+# probe_tenant -> reads $POST_BODY: `tenant:<value>` when the key is present
+# and a string, `absent` when the body is a well-formed label-set response
+# with NO tenant_id key (coord's enforce arm re-tenanted), `bad` otherwise.
+probe_tenant() {
+  printf '%s' "$POST_BODY" | python3 -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print("bad"); sys.exit(0)
+if not isinstance(d, dict) or "written" not in d or "rejected" not in d: print("bad"); sys.exit(0)  # envelope-ok: the /pr-merge/labels response body
+if "tenant_id" not in d: print("absent"); sys.exit(0)
+v=d["tenant_id"]
+print("tenant:"+v if isinstance(v,str) and v else "bad")' 2>/dev/null || echo bad
+}
+
+# bearer_url_ok -> 0 iff $COORD_URL is https or loopback http: a device JWT is
+# never sent in clear text to an arbitrary host.
+bearer_url_ok() {
+  case "$COORD_URL" in *@*) return 1 ;; esac  # userinfo would retarget the host
+  case "$COORD_URL" in
+    https://*|http://127.0.0.1|http://127.0.0.1:[0-9]*|http://127.0.0.1/*|http://localhost|http://localhost:[0-9]*|http://localhost/*|"http://[::1]"*) return 0 ;;
+  esac
+  return 1
+}
+
+# non_2xx_exit -> the shared report for a non-2xx /pr-merge/labels answer.
+non_2xx_exit() {
+  echo "error: coord ingest returned HTTP $POST_CODE — body: $POST_BODY" >&2
+  if [[ "$POST_BODY" == *tenant_resolution_failed* ]]; then
     echo "       QONTINUI_AGENT_ID must be an agent id coord knows (an agent_worktrees" >&2
     echo "       row, e.g. an ~/.qontinui/agent-runs/<uuid> id) — a session id or gate" >&2
     echo "       registered_by id does NOT resolve to a tenant." >&2
   fi
+  if [[ "$POST_BODY" == *repo_not_owned_by_tenant* ]]; then
+    echo "       coord's own ownership check (enforce) refused: no single tenant this" >&2
+    echo "       agent's device is bound to owns $REPO. No row was written." >&2
+    echo "       gh-side label add succeeded (canonical); merge ordering reads it from GitHub." >&2
+    exit "$RC_WITHHELD"
+  fi
   echo "       gh-side label add succeeded (canonical); coord.pr_labels is out of sync" >&2
   echo "       until the reconciler ingests the GitHub label event." >&2
   exit 4
-fi
+}
 
-# Parse the response — `written` should be 1, `rejected` should be empty.
-if command -v python3 >/dev/null 2>&1; then
-  TENANT_ID=$(echo "$RESPONSE" | python3 -c "import json, sys; d = json.load(sys.stdin); print(d.get('tenant_id', '?'))" 2>/dev/null || echo "?")
-  WRITTEN=$(echo "$RESPONSE" | python3 -c "import json, sys; d = json.load(sys.stdin); print(d.get('written', 0))" 2>/dev/null || echo "0")
-  REJECTED=$(echo "$RESPONSE" | python3 -c "import json, sys; d = json.load(sys.stdin); print(len(d.get('rejected', [])))" 2>/dev/null || echo "0")
-else
-  TENANT_ID="?"
-  WRITTEN="?"
-  REJECTED="?"
+withhold() { # <why>
+  echo "WITHHELD: coord.pr_labels row NOT written -- $1" >&2
+  echo "       gh-side label add succeeded (canonical), and coord's merge ordering reads" >&2
+  echo "       the dependency edge from the GitHub label, so nothing is lost by withholding." >&2
+  echo "       To also record the coord_skill row, use a QONTINUI_AGENT_ID allocated under the" >&2
+  echo "       tenant that owns $REPO (a wrong-tenant row is what this guard exists to prevent)." >&2
+  exit "$RC_WITHHELD"
+}
+
+echo "step 2/3: probe the tenant coord would write under (POST $COORD_URL/pr-merge/labels, labels=[] -- writes no pr_labels row)"
+post_labels '[]'
+if [[ "$POST_CODE" == 000 ]]; then
+  echo "error: POST $COORD_URL/pr-merge/labels failed (coord unreachable?)" >&2
+  echo "       gh-side label add succeeded; reconciler will eventually pick it up." >&2
+  exit 4
 fi
+[[ "$POST_CODE" == 2* ]] || non_2xx_exit
+PROBE="$(probe_tenant)"
+WRITE_TENANT=""
+case "$PROBE" in
+  tenant:*) WRITE_TENANT="${PROBE#tenant:}"; WRITE_TENANT="${WRITE_TENANT,,}" ;;
+  absent) : ;;
+  *) withhold "the probe answered HTTP $POST_CODE with a body that is not a label-set response ($(printf '%s' "$POST_BODY" | head -c 200)); the write tenant is UNKNOWN" ;;
+esac
+OWNER_NOTE=""
+if [[ "$PROBE" == absent ]]; then
+  OWNER_NOTE="coord derived the tenant from repo ownership itself (the probe echoed no tenant_id: COORD_LABEL_INGEST_OWNERSHIP_MODE=enforce re-tenanted it)"
+elif ! is_uuid "$WRITE_TENANT"; then
+  withhold "the probe answered tenant_id '$WRITE_TENANT', which is not a uuid; the write tenant is UNKNOWN"
+elif ! bearer_url_ok; then
+  withhold "ownership of $REPO by the write tenant $WRITE_TENANT is UNKNOWN: COORD_URL=$COORD_URL is neither https nor loopback, so no device credential is sent to it"
+else
+  BEARER_SRC="$(stage_bearer_for "$WRITE_TENANT")"
+  case "$BEARER_SRC" in
+    rejected*)
+      withhold "ownership of $REPO by the write tenant $WRITE_TENANT is UNKNOWN: no credential for that tenant (${BEARER_SRC#rejected})" ;;
+  esac
+  ENC_REPO="${REPO//\//%2F}"
+  : > "$TMPD/door.json"
+  DOOR_CODE="$(curl -sS -o "$(curl_path "$TMPD/door.json")" -w '%{http_code}' \
+    --connect-timeout "$HTTP_CONNECT_TIMEOUT" -m "$HTTP_TIMEOUT" \
+    -H "@$(curl_path "$TMPD/bearer.hdr")" \
+    "$COORD_URL/pr-merge/$ENC_REPO/$PR/author-session" 2>/dev/null)" || DOOR_CODE="000"
+  rm -f "$TMPD/bearer.hdr"
+  case "${DOOR_CODE:-000}" in
+    200) OWNER_NOTE="proven: tenant $WRITE_TENANT owns $REPO (author-session door answered 200, bearer=$BEARER_SRC)" ;;
+    404) withhold "the write tenant $WRITE_TENANT does NOT own $REPO as coord knows it (author-session door answered 404 under a token claiming it, bearer=$BEARER_SRC; coord answers the same 404 for a repo it has not registered). Most likely QONTINUI_AGENT_ID's worktree row carries the wrong tenant -- the multi-tenant-device defect" ;;
+    *)   withhold "ownership of $REPO by the write tenant $WRITE_TENANT is UNKNOWN: the author-session door answered HTTP ${DOOR_CODE:-000} (bearer=$BEARER_SRC)" ;;
+  esac
+fi
+echo "ok: owner check: $OWNER_NOTE"
+
+echo "step 3/3: POST $COORD_URL/pr-merge/labels \"$LABEL\""
+post_labels "$(H_L="$LABEL" python3 -c 'import json,os; print(json.dumps([os.environ["H_L"]]))')"
+if [[ "$POST_CODE" == 000 ]]; then
+  echo "error: POST $COORD_URL/pr-merge/labels failed (coord unreachable?)" >&2
+  echo "       gh-side label add succeeded; reconciler will eventually pick it up." >&2
+  exit 4
+fi
+[[ "$POST_CODE" == 2* ]] || non_2xx_exit
+
+TENANT_ID="$(json_field tenant_id)"; TENANT_ID="${TENANT_ID:-?}"
+WRITTEN="$(json_field written)"; WRITTEN="${WRITTEN:-0}"
+REJECTED="$(json_field rejected)"; REJECTED="${REJECTED:-0}"
 
 if [[ "$REJECTED" != "0" ]]; then
-  echo "error: coord rejected the label — body: $RESPONSE" >&2
+  echo "error: coord rejected the label — body: $POST_BODY" >&2
   exit 4
 fi
 
 if [[ "$WRITTEN" == "0" ]]; then
-  echo "error: coord wrote no pr_labels row (written=0, nothing rejected?) — body: $RESPONSE" >&2
+  echo "error: coord wrote no pr_labels row (written=0, nothing rejected?) — body: $POST_BODY" >&2
+  exit 4
+fi
+
+# The write must land where the probe said it would. A different tenant here
+# means the agent row changed between the two calls; say so rather than print
+# an unqualified ok.
+if [[ -n "$WRITE_TENANT" && "$TENANT_ID" != "?" && "${TENANT_ID,,}" != "$WRITE_TENANT" ]]; then
+  echo "error: coord wrote under tenant $TENANT_ID, not the proven $WRITE_TENANT — body: $POST_BODY" >&2
+  echo "       A coord_skill row for \"$LABEL\" on $REPO#$PR now EXISTS under tenant $TENANT_ID" >&2
+  echo "       (the agent row changed between probe and write). Removing it needs the" >&2
+  echo "       admin-gated DELETE /pr-merge/labels/<owner>/<repo>/<pr>/<label>; report it." >&2
   exit 4
 fi
 
