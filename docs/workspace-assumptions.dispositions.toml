@@ -1,0 +1,390 @@
+# Dispositions for docs/workspace-assumptions.{md,json} — the HAND-EDITED input.
+#
+# Keyed by (class, file, symbol); symbol is the ENCLOSING fn (or `const X`,
+# `struct X`, `Type::<impl>`, `<module>`) exactly as the roster prints it, so
+# line drift does not orphan an entry. A key with no entry is `unreviewed`.
+#
+# disposition = unreviewed | fallback_correct | dev_only_surface | defect(<plan stem>)
+#   - defect(<stem>) cites the plan that OWNS THE FIX, not this roster's plan.
+# reviewed = the exact roster excerpts the disposition was judged against. A
+#   hit under the same key with any other excerpt renders `unreviewed`
+#   ("NEW since review") until someone reads it and adds it here. An entry, or
+#   a reviewed excerpt, that matches no hit fails the freshness test.
+#
+# After editing, regenerate the roster:
+#   UPDATE_WORKSPACE_ASSUMPTIONS=1 cargo-guard.sh test --test workspace_assumptions_are_enumerated
+#
+# First triage pass (plan 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports Phase 4):
+# every supervisor_dependency, tenant_literal and machine_path key. The
+# supervisor is dev-only; a user-facing path that depends on :9875 is a defect
+# (src-tauri/src/webview_recovery.rs module doc).
+
+[[disposition]]
+class = "machine_path"
+file = "src/commands/accessibility.rs"
+symbol = "get_default_chrome_paths"
+disposition = "fallback_correct"
+note = "Standard Windows browser install locations inside a cfg!(windows) branch, used as existence-checked candidates."
+reviewed = [
+    "r\"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe\",",
+    "r\"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe\",",
+    "r\"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe\",",
+    "r\"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe\",",
+    "r\"C:\\Users\\%USERNAME%\\AppData\\Local\\Google\\Chrome\\Application\\chrome.exe\",",
+]
+
+[[disposition]]
+class = "machine_path"
+file = "src/commands/global_log_sources.rs"
+symbol = "find_log_sources_with_ai"
+disposition = "fallback_correct"
+note = "Example paths in an AI prompt's prose, not a path the runner reads."
+reviewed = [
+    "\"C:/ProgramData, %APPDATA%, etc.\"",
+    "{{\\\"name\\\": \\\"Application Log\\\", \\\"type\\\": \\\"file\\\", \\\"path\\\": \\\"C:/ProgramData/AppName/logs/app.log\\\", \\\"description\\\": \\\"Main applicati...",
+]
+
+[[disposition]]
+class = "machine_path"
+file = "src/commands/mobile.rs"
+symbol = "find_adb_path"
+disposition = "fallback_correct"
+note = "Last-resort candidate after the configured adb_path and PATH; existence-checked."
+reviewed = [
+    "PathBuf::from(r\"C:\\Android\\sdk\\platform-tools\\adb.exe\"),",
+]
+
+[[disposition]]
+class = "machine_path"
+file = "src/commands/setup_wizard.rs"
+symbol = "discover_claude_config_dirs"
+disposition = "fallback_correct"
+note = "Probes the fleet's C:\\claude multi-account convention behind is_dir(); absent everywhere else, where CLAUDE_CONFIG_DIR and ~/.claude still apply."
+reviewed = [
+    "let claude_root = std::path::Path::new(\"C:\\\\claude\");",
+]
+
+[[disposition]]
+class = "machine_path"
+file = "src/demo_workflows.rs"
+symbol = "update_workspace_paths"
+disposition = "fallback_correct"
+note = "Placeholder text REPLACED by the resolved temp dir; the literal is never used as a path."
+reviewed = [
+    "script.replace(\"C:/temp/qontinui-demo\", &demo_base_str)",
+]
+
+[[disposition]]
+class = "machine_path"
+file = "src/mcp/misc.rs"
+symbol = "launch_debug_chrome"
+disposition = "fallback_correct"
+note = "Standard Windows Chrome install locations, existence-checked candidates."
+reviewed = [
+    "r\"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe\",",
+    "r\"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe\",",
+]
+
+[[disposition]]
+class = "machine_path"
+file = "src/mcp/test_fixtures.rs"
+symbol = "const DEFAULT_TEST_CONFIG_DIR"
+disposition = "dev_only_surface"
+note = "Debug-gated test-fixture injection endpoints for manual UI testing."
+reviewed = [
+    "const DEFAULT_TEST_CONFIG_DIR: &str = \"C:\\\\claude\\\\.claude-test-fixture\";",
+]
+
+[[disposition]]
+class = "machine_path"
+file = "src/mcp/test_fixtures.rs"
+symbol = "record_from_seed"
+disposition = "dev_only_surface"
+note = "Debug-gated test-fixture injection endpoints; C:/repo is a fake session's working dir."
+reviewed = [
+    "working_dir: seed.working_dir.clone().or(Some(\"C:/repo\".to_string())),",
+]
+
+[[disposition]]
+class = "machine_path"
+file = "src/projects/snapshot.rs"
+symbol = "const NOISE_PREFIXES"
+disposition = "fallback_correct"
+note = "Filters the operator's C:\\claude agent-scratch rows out of project attribution; on another box it filters nothing, which only leaves some noise rows in the view."
+reviewed = [
+    "const NOISE_PREFIXES: [&str; 1] = [\"c:\\\\claude\\\\\"];",
+]
+
+[[disposition]]
+class = "machine_path"
+file = "src/reflection/workflow.rs"
+symbol = "build_execution_analysis_steps"
+disposition = "fallback_correct"
+note = "Example path inside an AI prompt's prose."
+reviewed = [
+    "Reasoning: The AI spent 3 iterations searching for project files because it didn't know the workspace root. The conversation output shows...",
+]
+
+[[disposition]]
+class = "machine_path"
+file = "src/session_archive/discovery.rs"
+symbol = "discover_account_homes_from_env"
+disposition = "fallback_correct"
+note = "Probes C:/claude behind is_dir() on every platform, per its own doc comment; false everywhere else."
+reviewed = [
+    "Some(PathBuf::from(\"C:\\\\claude\")),",
+]
+
+[[disposition]]
+class = "machine_path"
+file = "src/step_executor/handlers/shell_command.rs"
+symbol = "ShellCommandHandler::find_git_bash"
+disposition = "fallback_correct"
+note = "Standard Git-for-Windows install locations, existence-checked candidates."
+reviewed = [
+    "r\"C:\\Program Files (x86)\\Git\\bin\\bash.exe\",",
+    "r\"C:\\Program Files (x86)\\Git\\usr\\bin\\bash.exe\",",
+    "r\"C:\\Program Files\\Git\\bin\\bash.exe\",",
+    "r\"C:\\Program Files\\Git\\usr\\bin\\bash.exe\",",
+]
+
+[[disposition]]
+class = "machine_path"
+file = "src/step_output/script_emitter.rs"
+symbol = "build_prompt_split"
+disposition = "fallback_correct"
+note = "A worked example inside an AI prompt (HOME=/home/jq), not a path the runner reads."
+reviewed = [
+    "\"outputPreview: \\\"# local overrides\\\\nHOME=/home/jq\\\\nPATH=/usr/local/bin:/usr/bin:/bin\\\\nLANG=en_US.UTF-8\\\\nSHELL=/bin/bash\\\\nrecent_fil...",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/ambient.rs"
+symbol = "const AMBIENT_ENV_KEYS"
+disposition = "fallback_correct"
+note = "An inventory of env-var NAMES the ambient-isolation harness clears; nothing is read from the supervisor."
+reviewed = [
+    "\"QONTINUI_SUPERVISOR_PORT\",",
+    "\"QONTINUI_SUPERVISOR_URL\",",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/api_config.rs"
+symbol = "const DEFAULT_SUPERVISOR_PORT"
+disposition = "fallback_correct"
+note = "Resolver constant only; the dependency lives at each caller, which carries its own disposition."
+reviewed = [
+    "pub const DEFAULT_SUPERVISOR_PORT: u16 = 9875;",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/api_config.rs"
+symbol = "get_supervisor_socket_addr"
+disposition = "fallback_correct"
+note = "Resolver only; parses get_supervisor_url, contacts nothing."
+reviewed = [
+    "format!(\"127.0.0.1:{}\", DEFAULT_SUPERVISOR_PORT)",
+    "let url = get_supervisor_url();",
+    "pub fn get_supervisor_socket_addr() -> String {",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/api_config.rs"
+symbol = "get_supervisor_url"
+disposition = "fallback_correct"
+note = "Resolver only (env override, else 127.0.0.1:9875); returns a URL and contacts nothing. Callers carry their own disposition."
+reviewed = [
+    ".unwrap_or_else(|_| format!(\"http://127.0.0.1:{}\", DEFAULT_SUPERVISOR_PORT))",
+    "pub fn get_supervisor_url() -> String {",
+    "std::env::var(\"QONTINUI_SUPERVISOR_URL\")",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/config_report_cmd.rs"
+symbol = "config_report_inputs"
+disposition = "fallback_correct"
+note = "Fills the config report's supervisor_injected_env row from supervisor_injected_reading, which reads only this process's own env."
+reviewed = [
+    "supervisor_injected_env: Some(supervisor_injected_reading(&env, now)),",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/config_report_cmd.rs"
+symbol = "supervisor_injected_reading"
+disposition = "fallback_correct"
+note = "Reports which supervisor-injected env names are present in THIS process's env; never contacts the supervisor. '0 present' is the correct reading on an operator box."
+reviewed = [
+    "pub(crate) fn supervisor_injected_reading(",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/database/pg/apps.rs"
+symbol = "const DEV_SIBLING_APPS"
+disposition = "dev_only_surface"
+note = "Registered only when <workspace-root>/qontinui-supervisor/frontend exists, i.e. only on a developer workspace."
+reviewed = [
+    "\"http://localhost:9875\",",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/env_agent/collectors.rs"
+symbol = "const KNOWN_DEV_PORTS"
+disposition = "dev_only_surface"
+note = "Liveness probe of the dev-topology ports for the env report; 'closed' is the correct reading on an operator box."
+reviewed = [
+    "(\"supervisor\", 9875),",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/mcp/ai_session.rs"
+symbol = "const AI_SESSION_RULES_SUPERVISOR_AVAILABLE"
+disposition = "fallback_correct"
+note = "Chosen by runner_rules_prefix only when check_supervisor_available() is true; the supervisor-DOWN arm is used otherwise."
+reviewed = [
+    "**Supervisor API (port 9875):**",
+    "Invoke-RestMethod -Uri \"http://localhost:9875/runner/restart\" -Method Post -ContentType \"application/json\" -Body '{\"rebuild\": true, \"trig...",
+    "Invoke-RestMethod -Uri \"http://localhost:9875/runner/restart\" -Method Post -ContentType \"application/json\" -Body '{\"trigger_auto_continue...",
+    "Invoke-RestMethod -Uri \"http://localhost:9875/workflow-loop/signal-restart\" -Method Post",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/mcp/ai_session.rs"
+symbol = "run_prompt"
+disposition = "fallback_correct"
+note = "Passes check_supervisor_available() to runner_rules_prefix, which picks the supervisor-DOWN rules block when it is false."
+reviewed = [
+    "super::auto_continue::check_supervisor_available(),",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/mcp/app_discovery.rs"
+symbol = "const DESKTOP_APP_PORTS"
+disposition = "fallback_correct"
+note = "One port in a discovery scan list; an absent listener is simply not discovered."
+reviewed = [
+    "9875,",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/mcp/auto_continue.rs"
+symbol = "check_supervisor_available"
+disposition = "fallback_correct"
+note = "A 500 ms TCP probe that returns false when no supervisor listens; that false is what selects the supervisor-less briefing."
+reviewed = [
+    "let addr = crate::api_config::get_supervisor_socket_addr();",
+    "pub fn check_supervisor_available() -> bool {",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/mcp/misc.rs"
+symbol = "spawn_instance"
+disposition = "fallback_correct"
+note = "Best-effort POST /runners registration after the instance is already launched; failure is logged at debug and the primary runner stays coordinator."
+reviewed = [
+    "None => format!(\"{}/runners\", crate::api_config::get_supervisor_url()),",
+    "let sup_url = match std::env::var(\"QONTINUI_SUPERVISOR_PORT\")",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/mcp/origin_guard.rs"
+symbol = "const DEFAULT_TRUSTED_ORIGINS"
+disposition = "dev_only_surface"
+note = "Admits the dev supervisor dashboard origin as Trusted. Nothing user-facing depends on it, but on a box with no supervisor any local listener on :9875 inherits that trust — worth a look by the origin-guard owner."
+reviewed = [
+    "\"http://127.0.0.1:9875\",",
+    "\"http://localhost:9875\",",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/mcp/session_briefing.rs"
+symbol = "session_briefing_handler"
+disposition = "fallback_correct"
+note = "Same probe on a blocking thread for the /session-briefing panel; unwrap_or(false) falls back to the supervisor-down arm."
+reviewed = [
+    "spawn_blocking_tracked(crate::mcp::auto_continue::check_supervisor_available)",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/orchestration_loop/loop_engine.rs"
+symbol = "<module>"
+disposition = "defect(2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)"
+note = "Imports SupervisorClient for the orchestration loop; see handle_between_iterations."
+reviewed = [
+    "use super::remote_client::{RunnerClient, SupervisorClient};",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/orchestration_loop/loop_engine.rs"
+symbol = "handle_between_iterations"
+disposition = "defect(2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)"
+note = "User-facing Orchestration Loop panel: the RestartRunner / RestartOnSignal between-iterations modes restart the target runner ONLY via the supervisor's POST /runners/{id}/restart, with no in-process path; with no supervisor (every operator install) the loop errors out. Violates the boundary in webview_recovery.rs's module doc."
+reviewed = [
+    "supervisor: &SupervisorClient,",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/orchestration_loop/loop_engine.rs"
+symbol = "run_loop"
+disposition = "defect(2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)"
+note = "Constructs the SupervisorClient that handle_between_iterations depends on."
+reviewed = [
+    "let supervisor = SupervisorClient::new(config.supervisor_port);",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/orchestration_loop/loop_engine.rs"
+symbol = "run_pipeline_loop"
+disposition = "defect(2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)"
+note = "Pipeline variant of the same loop; passes SupervisorClient to handle_between_iterations."
+reviewed = [
+    "supervisor: SupervisorClient,",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/orchestration_loop/remote_client.rs"
+symbol = "SupervisorClient::<impl>"
+disposition = "defect(2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)"
+note = "restart_runner: the :9875 HTTP call the orchestration loop's restart modes depend on."
+reviewed = [
+    "impl SupervisorClient {",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/orchestration_loop/remote_client.rs"
+symbol = "struct SupervisorClient"
+disposition = "defect(2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)"
+note = "The supervisor HTTP client used by the user-facing orchestration loop."
+reviewed = [
+    "pub struct SupervisorClient {",
+]
+
+[[disposition]]
+class = "tenant_literal"
+file = "src/ai_provider/oauth_refresh.rs"
+symbol = "const CLIENT_ID"
+disposition = "fallback_correct"
+note = "Not a tenant: the public OAuth client id of the Claude CLI app, identical on every install."
+reviewed = [
+    "const CLIENT_ID: &str = \"9d1c250a-e61b-44d9-88ed-5944d1962f5e\";",
+]

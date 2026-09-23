@@ -47,7 +47,7 @@ use super::push::{
     push_work_unit_with_status_write, PushOutcomeKind, SetDepsOutcome, StatusWrite, WorkUnitSink,
 };
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -2512,6 +2512,19 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
         ..Default::default()
     };
     for u in parsed_units {
+        // A status-block `Area:` the parser rejected: warned here, once per
+        // plan per reconcile pass, and nowhere else — the parse is pure, and
+        // the plan-library body sync parses the same files. The push still
+        // runs, with `metadata.area` omitted. Deliberately repeated every
+        // pass: the declaration stays visible until the plan file is fixed.
+        if let Some(why) = &u.area_rejected {
+            tracing::warn!(
+                slug = %u.slug,
+                path = %u.source_path,
+                "plan adapter: status-block `Area:` rejected — {why}; \
+                 metadata.area omitted for this plan"
+            );
+        }
         // A push coord has already refused is not re-issued: the request would
         // be byte-identical, so the verdict would be too. Stopping here — rather
         // than merely muting the log — is what makes this a fix and not a mute:
@@ -3193,11 +3206,31 @@ struct ResolvedDirs {
 }
 
 impl ResolvedDirs {
+    /// The reconcile loop resolves the **device default** — no tenant, and
+    /// therefore no per-tenant map — and that is a deliberate, named limitation
+    /// rather than an oversight.
+    ///
+    /// Scanning N per-tenant roots requires attributing each root's pushes to
+    /// *its own* tenant, and that attribution comes from the credential, never
+    /// from which directory a file was found in (plan
+    /// `2026-09-22-plans-dir-is-a-single-path-so-a-multi-bound-device-cannot-author-per-tenant`
+    /// §2 D1). Pushing tenant B's directory under a bearer whose organization is
+    /// A's would file B's plans as A's while *claiming* to be declared — strictly
+    /// worse than today's fusion. So the multi-root scan is gated on the corpus's
+    /// tenant axis landing, and until then the empty map plus `None` tenant makes
+    /// the fall-through to the scalar explicit at the call site: per-tenant
+    /// *authoring* works from the session-launch side, per-tenant *capture*
+    /// waits.
     fn resolve(inputs: PathInputs) -> Self {
+        let no_tenant_overrides = BTreeMap::new();
         Self {
-            plans: resolve_plans_dir(inputs.plans_dir),
-            archive: resolve_plans_archive_dir(inputs.plans_archive_dir),
-            prompts: resolve_prompts_dir(inputs.prompts_dir),
+            plans: resolve_plans_dir(inputs.plans_dir, &no_tenant_overrides, None),
+            archive: resolve_plans_archive_dir(
+                inputs.plans_archive_dir,
+                &no_tenant_overrides,
+                None,
+            ),
+            prompts: resolve_prompts_dir(inputs.prompts_dir, &no_tenant_overrides, None),
         }
     }
 }
@@ -5005,15 +5038,54 @@ impl BodySync {
 /// Blank is unset, everywhere: a path setting configured to `""` (or
 /// whitespace) disables that directory rather than scanning a directory
 /// named `""`.
+///
+/// **Trims what it returns**, so the scalar and the per-tenant arm
+/// ([`tenant_override`]) answer in the same shape. They used to disagree: this
+/// filtered on `trim()` and returned the value UNTRIMMED, so a hand-edited
+/// `settings.json` carrying `"plans_dir": " /x "` exported
+/// `QONTINUI_PLANS_DIR=" /x "` from the scalar and `/x` from a map entry — two
+/// spellings of one directory, reached through one resolver. Both save doors
+/// normalise on write, so only a hand edit produces it; the asymmetry is still
+/// removed here rather than relied on not to matter.
 fn non_blank(configured: Option<String>) -> Option<String> {
-    configured.filter(|s| !s.trim().is_empty())
+    configured
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
-/// Resolve the **active** plans directory from the runner's
-/// `PathSettings::plans_dir`, or `None` when the markdown-plan tier is off.
+/// The per-tenant arm shared by all three resolvers: a **non-blank** entry for
+/// `tenant` in `by_tenant`, trimmed, or `None`.
 ///
-/// There is deliberately **no environment override**. The one that used to
-/// sit above this setting was a backward-compatibility shim for a
+/// Blank-is-unset applies **per entry**, not just to the device scalar: an
+/// entry configured to `""` falls through to the scalar rather than naming a
+/// directory called `""`. And a `None` tenant never reads the map at all —
+/// three session-launch paths have no acting tenant by design, and "no tenant"
+/// must mean "the device default", never "some entry".
+///
+/// Lookup is an **exact** match on the canonical tenant-id form the device
+/// reports (`Uuid::to_string()` — lowercase, hyphenated), which is what
+/// `commands::tenant::get_active_tenant`'s `candidates` and every spawn-tenant
+/// admission carry. A key in any other shape is therefore inert here, and that
+/// is deliberate: settings D2 says an unparseable or currently-unbound key is
+/// PRESERVED (the operator may be re-pairing) and never resolves.
+fn tenant_override(by_tenant: &BTreeMap<String, String>, tenant: Option<&str>) -> Option<String> {
+    let value = by_tenant.get(tenant?)?.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// Resolve the **active** plans directory for `tenant` from the runner's
+/// `PathSettings`, or `None` when the markdown-plan tier is off for it.
+///
+/// Two rungs, in order: `plans_dir_by_tenant[tenant]` when `tenant` is named
+/// and its entry is non-blank, then the device-wide `plans_dir` scalar. A
+/// tenant with no entry, and a launch with no tenant at all, both land on the
+/// scalar — the fall-back is what keeps the markdown-plan tier armed for the
+/// launch paths that have no acting tenant by design (a coord-spawned gate
+/// continuation, a relayed spawn, a steward) instead of failing them closed.
+/// Plan `2026-09-22-plans-dir-is-a-single-path-so-a-multi-bound-device-cannot-author-per-tenant`.
+///
+/// There is deliberately **no environment override** on either rung. The one
+/// that used to sit above this setting was a backward-compatibility shim for a
 /// pre-settings deployment, and it silently outranked the setting — the
 /// settings UI could show a directory that was not the one in effect. It was
 /// migrated into the setting once at boot (the binary's `plans_dir_migration`)
@@ -5021,33 +5093,53 @@ fn non_blank(configured: Option<String>) -> Option<String> {
 ///
 /// Kept as its own name rather than having callers spell the filter
 /// themselves because it is the documented seam every surface that needs
-/// "the plans dir" goes through — the adapter, the session-env injection and
-/// the plan-library read door — so they resolve it identically by
-/// construction. The three resolvers share one body for the same reason they
-/// keep three names: each is the seam for one directory.
-pub fn resolve_plans_dir(configured: Option<String>) -> Option<String> {
-    non_blank(configured)
+/// "the plans dir" goes through — the adapter, the session-env injection, the
+/// settings view, the `harness` capture door and the plan-library write door —
+/// so they resolve it identically by construction. The three resolvers share
+/// one body for the same reason they keep three names: each is the seam for one
+/// directory.
+///
+/// **Pure on purpose**, so it stays the unit the per-tenant contract is
+/// asserted on: everything it knows arrives as an argument, and every consumer
+/// re-reads the settings itself on every call.
+pub fn resolve_plans_dir(
+    configured: Option<String>,
+    by_tenant: &BTreeMap<String, String>,
+    tenant: Option<&str>,
+) -> Option<String> {
+    tenant_override(by_tenant, tenant).or_else(|| non_blank(configured))
 }
 
-/// Resolve the plans **archive** directory (D4) from
+/// Resolve the plans **archive** directory (D4) for `tenant` from
+/// `PathSettings::plans_archive_dir_by_tenant` then
 /// `PathSettings::plans_archive_dir`. Deliberately not derivable from the
 /// active dir (it commonly lives in a different repo), and blank counts as
-/// unset — see [`resolve_plans_dir`].
-pub fn resolve_plans_archive_dir(configured: Option<String>) -> Option<String> {
-    non_blank(configured)
+/// unset per entry as well as on the scalar — see [`resolve_plans_dir`] for the
+/// precedence and for why `None` tenant means the device default.
+pub fn resolve_plans_archive_dir(
+    configured: Option<String>,
+    by_tenant: &BTreeMap<String, String>,
+    tenant: Option<&str>,
+) -> Option<String> {
+    tenant_override(by_tenant, tenant).or_else(|| non_blank(configured))
 }
 
 /// Resolve the **prompts** directory (plan `2026-08-10-plan-and-prompt-library-in-web`
-/// Phase 2) from `PathSettings::prompts_dir`: the third scan root, and the
-/// value exported to agent sessions as `QONTINUI_PROMPTS_DIR`.
+/// Phase 2) for `tenant`: the third scan root, and the value exported to agent
+/// sessions as `QONTINUI_PROMPTS_DIR`. `prompts_dir_by_tenant` first, then the
+/// `prompts_dir` scalar.
 ///
 /// **Not derivable from the plans dir.** `/create-plan` currently *guesses*
 /// `$QONTINUI_PLANS_DIR/../prompts/*.md`, which is exactly the guess this
 /// setting exists to replace — the operator's prompts live in more than one
 /// repo and the sibling-of-plans relationship does not hold in general. Blank
 /// counts as unset — see [`resolve_plans_dir`].
-pub fn resolve_prompts_dir(configured: Option<String>) -> Option<String> {
-    non_blank(configured)
+pub fn resolve_prompts_dir(
+    configured: Option<String>,
+    by_tenant: &BTreeMap<String, String>,
+    tenant: Option<&str>,
+) -> Option<String> {
+    tenant_override(by_tenant, tenant).or_else(|| non_blank(configured))
 }
 
 /// Spawn the reconcile loop iff a coord base resolves for this runner
@@ -6533,8 +6625,6 @@ mod tests {
         (tmp, reader, sha)
     }
 
-    /// The plain case on real git output: a clone that has just fetched reads
-    /// a refresh within seconds of now — through the reflog AND `FETCH_HEAD`.
     // ---- Phase 3: the DOCUMENT layer takes its bytes from the ref too ----
 
     /// A plans scan root at `dir`, the shape `BodySync` builds in production.
@@ -7436,6 +7526,8 @@ mod tests {
         );
     }
 
+    /// The plain case on real git output: a clone that has just fetched reads
+    /// a refresh within seconds of now — through the reflog AND `FETCH_HEAD`.
     #[test]
     fn process_git_reads_a_just_fetched_ref_as_refreshed_now() {
         let tmp = tempfile::tempdir().unwrap();
@@ -9117,13 +9209,32 @@ mod tests {
 
     // ---- path resolution (settings only) ------------------------------------
 
+    /// No per-tenant entries anywhere — the state every runner is in until an
+    /// operator keys one.
+    fn no_overrides() -> BTreeMap<String, String> {
+        BTreeMap::new()
+    }
+
+    /// `commands::tenant::get_active_tenant`'s canonical key form: lowercase,
+    /// hyphenated `Uuid::to_string()`.
+    const TENANT_A: &str = "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a";
+    const TENANT_B: &str = "7ac125b6-391b-4d64-8493-27305b25c5b9";
+
+    fn keyed(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
     /// The setting is the ONLY source. There is no env rung above it any
-    /// more, and this resolver reads nothing but its argument — so the value
+    /// more, and this resolver reads nothing but its arguments — so the value
     /// the settings UI shows is, by construction, the value in effect.
     #[test]
     fn the_setting_is_the_only_source_of_the_plans_dir() {
         assert_eq!(
-            resolve_plans_dir(Some("/settings/plans".to_string())).as_deref(),
+            resolve_plans_dir(Some("/settings/plans".to_string()), &no_overrides(), None)
+                .as_deref(),
             Some("/settings/plans")
         );
     }
@@ -9132,17 +9243,241 @@ mod tests {
     /// the adapter's opt-in contract rests on.
     #[test]
     fn nothing_configured_resolves_to_none() {
-        assert_eq!(resolve_plans_dir(None), None);
-        assert_eq!(resolve_plans_archive_dir(None), None);
-        assert_eq!(resolve_prompts_dir(None), None);
+        assert_eq!(resolve_plans_dir(None, &no_overrides(), None), None);
+        assert_eq!(resolve_plans_archive_dir(None, &no_overrides(), None), None);
+        assert_eq!(resolve_prompts_dir(None, &no_overrides(), None), None);
     }
 
     /// A blank setting is unset, not a directory named "" — for all three.
     #[test]
     fn blank_setting_resolves_to_none() {
-        assert_eq!(resolve_plans_dir(Some("  ".to_string())), None);
-        assert_eq!(resolve_plans_archive_dir(Some("".to_string())), None);
-        assert_eq!(resolve_prompts_dir(Some("\t".to_string())), None);
+        assert_eq!(
+            resolve_plans_dir(Some("  ".to_string()), &no_overrides(), None),
+            None
+        );
+        assert_eq!(
+            resolve_plans_archive_dir(Some("".to_string()), &no_overrides(), None),
+            None
+        );
+        assert_eq!(
+            resolve_prompts_dir(Some("\t".to_string()), &no_overrides(), None),
+            None
+        );
+    }
+
+    /// The SCALAR arm trims what it returns, exactly as the per-tenant arm does.
+    ///
+    /// Pinned separately because nothing else can see it: the product test
+    /// `an_empty_map_resolves_exactly_as_the_device_scalar_for_every_input` uses
+    /// `non_blank(scalar)` as its own oracle, so it stays green whatever
+    /// `non_blank` does, and `a_blank_entry_is_unset_per_entry_…` pins trimming
+    /// on the map arm only. Without this, the asymmetry could return unnoticed:
+    /// a hand-edited `settings.json` holding `" /x "` would export
+    /// `QONTINUI_PLANS_DIR=" /x "` from the scalar and `/x` from a map entry —
+    /// one directory, two spellings, through one resolver.
+    #[test]
+    fn the_scalar_arm_trims_exactly_as_the_per_tenant_arm_does() {
+        assert_eq!(
+            resolve_plans_dir(Some("  /x \t".to_string()), &no_overrides(), None).as_deref(),
+            Some("/x")
+        );
+        assert_eq!(
+            resolve_plans_archive_dir(Some(" /y ".to_string()), &no_overrides(), None).as_deref(),
+            Some("/y")
+        );
+        assert_eq!(
+            resolve_prompts_dir(Some("\t/z ".to_string()), &no_overrides(), None).as_deref(),
+            Some("/z")
+        );
+    }
+
+    // ---- per-tenant resolution ---------------------------------------------
+    //
+    // These pin the RESOLVER's contract (which of the two rungs answers), not
+    // the threading of a tenant into it — the threading is pinned by the
+    // compiler at every call site plus the session-env tests that assert the
+    // admitted spawn tenant is what reaches this function.
+
+    /// GUARANTEE: resolver contract. An empty map is exactly today's answer,
+    /// for every combination of scalar and tenant — which is what makes keying
+    /// the setting a no-op on every device that has not keyed one.
+    #[test]
+    fn an_empty_map_resolves_exactly_as_the_device_scalar_for_every_input() {
+        for scalar in [None, Some("/settings/plans".to_string())] {
+            for tenant in [None, Some(TENANT_A), Some("not-a-uuid")] {
+                assert_eq!(
+                    resolve_plans_dir(scalar.clone(), &no_overrides(), tenant),
+                    non_blank(scalar.clone()),
+                    "scalar={scalar:?} tenant={tenant:?}"
+                );
+                assert_eq!(
+                    resolve_plans_archive_dir(scalar.clone(), &no_overrides(), tenant),
+                    non_blank(scalar.clone())
+                );
+                assert_eq!(
+                    resolve_prompts_dir(scalar.clone(), &no_overrides(), tenant),
+                    non_blank(scalar.clone())
+                );
+            }
+        }
+    }
+
+    /// GUARANTEE: resolver contract. The whole point of the plan — a tenant
+    /// WITH an entry gets its own directory, a tenant WITHOUT one gets the
+    /// device default, and a launch naming no tenant gets the device default.
+    /// All three directories, because P5 adopted the shape for all three.
+    ///
+    /// The tenant-B arm is the load-bearing one: B must get the DEVICE DEFAULT
+    /// — not A's directory, and not nothing.
+    #[test]
+    fn a_keyed_tenant_wins_while_every_other_tenant_gets_the_device_default() {
+        let map = keyed(&[(TENANT_A, "/tenant-a/plans")]);
+        let scalar = || Some("/device/plans".to_string());
+
+        assert_eq!(
+            resolve_plans_dir(scalar(), &map, Some(TENANT_A)).as_deref(),
+            Some("/tenant-a/plans"),
+            "the keyed tenant's own entry wins over the scalar"
+        );
+        assert_eq!(
+            resolve_plans_dir(scalar(), &map, Some(TENANT_B)).as_deref(),
+            Some("/device/plans"),
+            "a tenant with no entry falls back to the DEVICE DEFAULT — never \
+             another tenant's directory, and never nothing"
+        );
+        assert_eq!(
+            resolve_plans_dir(scalar(), &map, None).as_deref(),
+            Some("/device/plans"),
+            "a launch with no acting tenant gets the device default"
+        );
+
+        // Same three rungs on the archive and prompts twins.
+        let archive = keyed(&[(TENANT_A, "/tenant-a/archive")]);
+        assert_eq!(
+            resolve_plans_archive_dir(
+                Some("/device/archive".to_string()),
+                &archive,
+                Some(TENANT_A)
+            )
+            .as_deref(),
+            Some("/tenant-a/archive")
+        );
+        assert_eq!(
+            resolve_plans_archive_dir(
+                Some("/device/archive".to_string()),
+                &archive,
+                Some(TENANT_B)
+            )
+            .as_deref(),
+            Some("/device/archive")
+        );
+        let prompts = keyed(&[(TENANT_B, "/tenant-b/prompts")]);
+        assert_eq!(
+            resolve_prompts_dir(
+                Some("/device/prompts".to_string()),
+                &prompts,
+                Some(TENANT_B)
+            )
+            .as_deref(),
+            Some("/tenant-b/prompts")
+        );
+        assert_eq!(
+            resolve_prompts_dir(
+                Some("/device/prompts".to_string()),
+                &prompts,
+                Some(TENANT_A)
+            )
+            .as_deref(),
+            Some("/device/prompts")
+        );
+    }
+
+    /// GUARANTEE: resolver contract. A keyed tenant with NO device scalar still
+    /// gets its directory — the map is an override, not a decoration on a
+    /// configured default. And the unkeyed tenant on that same device gets
+    /// `None`, i.e. the tier is off for it, exactly as it is today.
+    #[test]
+    fn a_keyed_tenant_resolves_even_with_no_device_default() {
+        let map = keyed(&[(TENANT_A, "/tenant-a/plans")]);
+        assert_eq!(
+            resolve_plans_dir(None, &map, Some(TENANT_A)).as_deref(),
+            Some("/tenant-a/plans")
+        );
+        assert_eq!(resolve_plans_dir(None, &map, Some(TENANT_B)), None);
+        assert_eq!(resolve_plans_dir(None, &map, None), None);
+    }
+
+    /// GUARANTEE: resolver contract. Blank-is-unset applies PER ENTRY, so an
+    /// entry configured to whitespace is unset for that tenant — it falls
+    /// through to the scalar rather than naming a directory called `""`. And a
+    /// value with surrounding whitespace is trimmed, as every other path rung
+    /// trims.
+    #[test]
+    fn a_blank_entry_is_unset_per_entry_not_a_directory_named_empty() {
+        let map = keyed(&[
+            (TENANT_A, "   "),
+            (TENANT_B, "  /tenant-b/plans \t"),
+            ("blank-and-no-scalar", ""),
+        ]);
+        assert_eq!(
+            resolve_plans_dir(Some("/device/plans".to_string()), &map, Some(TENANT_A)).as_deref(),
+            Some("/device/plans"),
+            "a blank entry falls through to the scalar"
+        );
+        assert_eq!(
+            resolve_plans_dir(None, &map, Some(TENANT_A)),
+            None,
+            "a blank entry with no scalar beneath it is unset, not Some(\"\")"
+        );
+        assert_eq!(
+            resolve_plans_dir(None, &map, Some("blank-and-no-scalar")),
+            None
+        );
+        assert_eq!(
+            resolve_plans_dir(None, &map, Some(TENANT_B)).as_deref(),
+            Some("/tenant-b/plans"),
+            "surrounding whitespace is trimmed off a per-tenant value too"
+        );
+    }
+
+    /// GUARANTEE: resolver contract, D2. An unparseable or currently-unbound
+    /// key is PRESERVED in the map (the operator may be re-pairing) and is
+    /// simply inert: nothing looks it up, no lookup panics on it, and it never
+    /// leaks into another tenant's resolution or into the device default.
+    #[test]
+    fn a_garbage_key_never_panics_and_never_resolves() {
+        let map = keyed(&[
+            ("", "/empty-key"),
+            ("   ", "/blank-key"),
+            ("not-a-uuid", "/garbage"),
+            ("C231D9DA-0CA8-4FE4-BD81-0E3D6C20339A", "/wrong-case"),
+            ("c231d9da-0ca8-4fe4-bd81-0e3d6c20339a/../etc", "/traversal"),
+            ("🙂", "/emoji"),
+        ]);
+        let scalar = || Some("/device/plans".to_string());
+
+        // The canonical form of that upper-case key does not resolve through it:
+        // lookup is exact, so a non-canonical key is unattributed, not aliased.
+        assert_eq!(
+            resolve_plans_dir(scalar(), &map, Some(TENANT_A)).as_deref(),
+            Some("/device/plans")
+        );
+        assert_eq!(
+            resolve_plans_dir(scalar(), &map, None).as_deref(),
+            Some("/device/plans")
+        );
+        for probe in ["", "   ", "🙂", "not-a-uuid-either", TENANT_B] {
+            // Every garbage key is inert for every other probe; only an exact
+            // hit answers, which is the point of asserting the exact strings
+            // separately below.
+            let answered = resolve_plans_dir(None, &map, Some(probe));
+            assert!(
+                answered.is_none() || map.get(probe).map(String::as_str) == answered.as_deref(),
+                "probe {probe:?} resolved to {answered:?}, which is not its own entry"
+            );
+        }
+        // And the keys really are still there — preserved, not dropped.
+        assert_eq!(map.len(), 6, "every key survives, however unparseable");
     }
 
     // ---- the body-sync failure breaker ----------------------------------
@@ -9261,6 +9596,8 @@ mod tests {
             title: None,
             status: status.to_string(),
             depends_on,
+            area: None,
+            area_rejected: None,
             phases: vec![],
             source_path: format!("plans/{slug}.md"),
             content: String::new(),
@@ -9565,6 +9902,93 @@ mod tests {
         assert_eq!(s2.scanned, 2);
         assert_eq!(s2.transitions, 0);
         assert_eq!(*sink.transitions.lock().unwrap(), 0);
+    }
+
+    /// A `Write` into a shared buffer, so a test can read what `tracing` logged.
+    #[derive(Clone, Default)]
+    struct LogBuf(std::sync::Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A rejected status-block `Area:` is warned by the reconcile — exactly
+    /// once per plan per pass — and the push still lands, with `metadata.area`
+    /// omitted. A unit with an accepted area is not warned and carries it.
+    #[tokio::test]
+    async fn reconcile_warns_once_per_pass_for_a_rejected_area() {
+        use super::super::parser::AreaRejection;
+        let buf = LogBuf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
+        let mut forb = RetiredSlugs::default();
+        let mut forb_deps: HashSet<String> = HashSet::new();
+        let bad = ParsedWorkUnit {
+            area_rejected: Some(AreaRejection::NotKebab("agent_worktree".to_string())),
+            ..unit("2026-01-01-bad-area", "draft")
+        };
+        let good = ParsedWorkUnit {
+            area: Some("ci-runners".to_string()),
+            ..unit("2026-01-01-good-area", "draft")
+        };
+        let units = vec![bad, good];
+        for _ in 0..2 {
+            reconcile_once(
+                &units,
+                &mut mem,
+                &mut deps,
+                &mut forb,
+                &mut forb_deps,
+                &sink,
+                &metrics,
+            )
+            .await;
+        }
+
+        let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let warned: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("status-block `Area:` rejected"))
+            .collect();
+        assert_eq!(
+            warned.len(),
+            2,
+            "one warning per pass for the one bad plan: {log}"
+        );
+        assert!(warned
+            .iter()
+            .all(|l| l.contains("2026-01-01-bad-area") && l.contains("agent_worktree")));
+
+        let upserts = sink.upserts.lock().unwrap();
+        let meta_for = |slug: &str| {
+            upserts
+                .iter()
+                .rev()
+                .find(|b| b.slug == slug)
+                .and_then(|b| b.metadata.clone())
+                .expect("the unit was pushed")
+        };
+        assert!(!meta_for("2026-01-01-bad-area")
+            .as_object()
+            .unwrap()
+            .contains_key("area"));
+        assert_eq!(meta_for("2026-01-01-good-area")["area"], "ci-runners");
     }
 
     #[tokio::test]

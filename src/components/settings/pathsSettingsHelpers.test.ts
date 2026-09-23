@@ -22,11 +22,17 @@ import {
   formatRefAge,
   formatRepoCheckouts,
   normalizePathInput,
+  normalizeTenantPathMap,
   parseRepoCheckouts,
   planScanStatusLabel,
   repoCheckoutsDirty,
   resolvedDiffers,
   scanSourceStatus,
+  storedTenantOverrideCount,
+  tenantDraftsAreDirty,
+  tenantDraftsFrom,
+  tenantIdsForField,
+  tenantPathMap,
   type PathSettings,
   type ScanDivergenceView,
 } from "./pathsSettingsHelpers";
@@ -138,31 +144,44 @@ describe("draftsFrom / buildPathSettingsPayload — the wire boundary", () => {
       plans_dir: "",
       workspace_root: "   ",
     });
-    expect("plans_dir" in payload).toBe(false);
-    expect("workspace_root" in payload).toBe(false);
-    expect("prompts_dir" in payload).toBe(false);
-    expect("dev_logs_dir" in payload).toBe(false);
+    // A SHOWN box that is empty is a CLEAR, and under the patch's
+    // absent-means-untouched rule the only way to say that is an explicit
+    // `null`. Omitting it would be a no-op — the stored value would survive.
+    expect(payload.plans_dir).toBeNull();
+    expect(payload.workspace_root).toBeNull();
+    expect(payload.prompts_dir).toBeNull();
+    expect(payload.dev_logs_dir).toBeNull();
+    // Still never an empty string: `""` would be a directory named "".
     expect(JSON.stringify(payload)).not.toContain('""');
   });
 
-  it("round-trips the fields the panel does not edit, untouched", () => {
-    // `plans_archive_dir` (being removed by PR #1288, not shown) and
-    // `strict_mode` (a behaviour flag, belongs elsewhere) must survive a save
-    // exactly as loaded — a panel that dropped them would be a silent reset.
+  it("OMITS the fields the panel does not edit, so the runner keeps them", () => {
+    // `plans_archive_dir` (not shown) and `strict_mode` (a behaviour flag that
+    // belongs elsewhere) must survive a save — and the way to achieve that
+    // flipped. They used to be RE-SENT verbatim from the loaded struct, which
+    // reads as preservation and is actually a blind last-writer-wins: a peer
+    // that changed either one while this panel sat open was reverted by the
+    // operator's next save. Under the patch they are OMITTED, so the runner
+    // keeps whatever it currently holds and this panel asserts nothing about
+    // fields it never showed.
     const payload = buildPathSettingsPayload(SAVED, {
       ...draftsFrom(SAVED),
       prompts_dir: "/home/me/qontinui-dev-notes/plans/prompts",
     });
-    expect(payload.plans_archive_dir).toBe(SAVED.plans_archive_dir);
-    expect(payload.strict_mode).toBe(true);
+    expect("plans_archive_dir" in payload).toBe(false);
+    expect("strict_mode" in payload).toBe(false);
+    // What it DID edit is stated explicitly.
     expect(payload.prompts_dir).toBe("/home/me/qontinui-dev-notes/plans/prompts");
     expect(payload.plans_dir).toBe(SAVED.plans_dir);
 
-    const falseStrict = buildPathSettingsPayload(
-      { ...SAVED, strict_mode: false },
+    // And it is genuinely independent of the loaded value, not accidentally
+    // absent because SAVED happened to lack it.
+    const withArchive = buildPathSettingsPayload(
+      { ...SAVED, strict_mode: false, plans_archive_dir: "/loaded/archive" },
       draftsFrom(SAVED),
     );
-    expect(falseStrict.strict_mode).toBe(false);
+    expect("plans_archive_dir" in withArchive).toBe(false);
+    expect("strict_mode" in withArchive).toBe(false);
   });
 
   it("trims what it does send", () => {
@@ -238,9 +257,16 @@ describe("repo checkouts — repos outside the workspace root", () => {
     ]);
   });
 
-  it("an emptied box removes the key; a filled one sets it; untouched leaves it", () => {
+  it("an emptied box sends {} to CLEAR; a filled one sets it; untouched round-trips the loaded map", () => {
+    // Absent no longer means "clear" — `save` MERGES the map fields, so a
+    // payload that omits `repo_checkouts` leaves the stored map untouched. An
+    // emptied box therefore has to say `{}` explicitly. This assertion used to
+    // read `"repo_checkouts" in cleared === false`, which was correct against
+    // the whole-struct replace and is exactly the silent no-op the merge
+    // introduces: the key was dropped, the server kept the old map, and
+    // clearing the textarea stopped working with nothing red.
     const cleared = buildPathSettingsPayload(WITH_MAP, draftsFrom(WITH_MAP), {});
-    expect("repo_checkouts" in cleared).toBe(false);
+    expect(cleared.repo_checkouts).toEqual({});
     expect(repoCheckoutsDirty(WITH_MAP, "")).toBe(true);
 
     const set = buildPathSettingsPayload(SAVED, draftsFrom(SAVED), { "acme/app": "/x" });
@@ -248,8 +274,14 @@ describe("repo checkouts — repos outside the workspace root", () => {
     expect(repoCheckoutsDirty(SAVED, "acme/app = /x")).toBe(true);
     expect(repoCheckoutsDirty(SAVED, "")).toBe(false);
 
+    // A caller that passes no map is asserting it did not SHOW one, so the key
+    // must be genuinely ABSENT — not re-sent from the snapshot the panel loaded.
+    // Re-sending it is a no-op for a lone writer and a silent REVERT of a peer
+    // who wrote the map while this panel was open, which is the erasure class
+    // the merge exists to close. The builder assembles from an EMPTY object, so
+    // the key is absent unless this panel explicitly asserted the map.
     const untouched = buildPathSettingsPayload(WITH_MAP, draftsFrom(WITH_MAP));
-    expect(untouched.repo_checkouts).toEqual(WITH_MAP.repo_checkouts);
+    expect("repo_checkouts" in untouched).toBe(false);
   });
 
   it("a box with errors is dirty, so the panel never reads it as saved", () => {
@@ -461,5 +493,196 @@ describe("scanSourceStatus — a reading for another directory is not this one's
   it("says nothing is scanned when the tier is off, whatever the last reading was", () => {
     expect(status(measured(), { plans_dir: null, plan_tier_active: false }).tone).toBe("off");
     expect(status(null, { plans_dir: null, plan_tier_active: false }).tone).toBe("off");
+  });
+});
+
+// ── Per-tenant directory overrides ─────────────────────────────────────────
+//
+// The scalars stay the DEVICE-WIDE DEFAULT and each `*_by_tenant` map is an
+// override beside them. Two properties carry the whole design and neither is
+// visible from the panel, so they are pinned here: a stored key that is not
+// currently bound SURVIVES (a device mid-re-pair must not lose that tenant's
+// configured path), and an omitted map means ABSENT on the wire, because the
+// save MERGES and a re-sent snapshot would silently revert a peer's write.
+
+const TENANT_A = "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a";
+const TENANT_B = "7ac125b6-391b-4d64-8493-27305b25c5b9";
+const TENANT_GONE = "00000000-0000-0000-0000-00000000dead";
+
+const MULTI: PathSettings = {
+  plans_dir: "/device/plans",
+  strict_mode: false,
+  plans_dir_by_tenant: { [TENANT_B]: "/b/plans", [TENANT_GONE]: "/gone/plans" },
+  // All THREE maps are populated on purpose. With the archive map absent, the
+  // omission test's `"plans_archive_dir_by_tenant" in payload === false`
+  // assertion passed whether or not the builder deleted it — one of the three
+  // deletes was pinned by nothing, and the suite stayed green when it was
+  // removed.
+  plans_archive_dir_by_tenant: { [TENANT_A]: "/a/archive" },
+  prompts_dir_by_tenant: { [TENANT_A]: "/a/prompts" },
+};
+
+describe("tenantPathMap — an absent map reads as empty, never undefined", () => {
+  it("gives every field a map even when the struct carries none", () => {
+    for (const field of ["plans_dir", "plans_archive_dir", "prompts_dir"] as const) {
+      expect(tenantPathMap(SAVED, field)).toEqual({});
+    }
+    expect(tenantPathMap(SAVED, "plans_archive_dir")).toEqual({});
+    expect(tenantPathMap(MULTI, "plans_dir")).toEqual(MULTI.plans_dir_by_tenant);
+    // A COPY, not the live reference — mutating what comes back must not edit
+    // the loaded struct.
+    const borrowed = tenantPathMap(MULTI, "plans_dir");
+    borrowed["injected"] = "/nope";
+    expect(MULTI.plans_dir_by_tenant).not.toHaveProperty("injected");
+  });
+});
+
+describe("tenantIdsForField — bound first, then stored-but-unbound", () => {
+  it("lists bound tenants in context order, then unbound stored keys sorted", () => {
+    // TENANT_GONE has a stored path and is NOT bound: it must still be listed,
+    // after the bound ones, or the panel silently hides a path it will save.
+    expect(tenantIdsForField(MULTI, [TENANT_A, TENANT_B], "plans_dir")).toEqual([
+      TENANT_A,
+      TENANT_B,
+      TENANT_GONE,
+    ]);
+  });
+
+  it("sorts several unbound keys rather than trusting object order", () => {
+    const saved: PathSettings = {
+      strict_mode: false,
+      plans_dir_by_tenant: { zzz: "/z", aaa: "/a", mmm: "/m" },
+    };
+    expect(tenantIdsForField(saved, [], "plans_dir")).toEqual(["aaa", "mmm", "zzz"]);
+  });
+
+  it("lists bound tenants that have no stored entry at all", () => {
+    expect(tenantIdsForField(SAVED, [TENANT_A, TENANT_B], "plans_dir")).toEqual([
+      TENANT_A,
+      TENANT_B,
+    ]);
+  });
+
+  it("trims and de-duplicates the candidate list, and drops blanks", () => {
+    const messy = [" " + TENANT_A + " ", TENANT_A, "", "   "];
+    expect(tenantIdsForField(SAVED, messy, "plans_dir")).toEqual([TENANT_A]);
+  });
+});
+
+describe("normalizeTenantPathMap — blank is unset PER ENTRY", () => {
+  it("drops a blank value and a blank key instead of storing either", () => {
+    const drafted = { [TENANT_A]: "   ", [TENANT_B]: "/b", "  ": "/orphan" };
+    expect(normalizeTenantPathMap(drafted)).toEqual({ [TENANT_B]: "/b" });
+  });
+
+  it("trims both sides and emits keys in a fixed order", () => {
+    const out = normalizeTenantPathMap({ zzz: "  /z  ", aaa: "/a" });
+    expect(out).toEqual({ aaa: "/a", zzz: "/z" });
+    expect(Object.keys(out)).toEqual(["aaa", "zzz"]);
+  });
+
+  it("reads undefined as an empty map rather than throwing", () => {
+    expect(normalizeTenantPathMap(undefined)).toEqual({});
+  });
+});
+
+describe("tenantDraftsFrom / tenantDraftsAreDirty", () => {
+  it("is clean straight after a load", () => {
+    expect(tenantDraftsAreDirty(MULTI, tenantDraftsFrom(MULTI))).toBe(false);
+    expect(tenantDraftsAreDirty(SAVED, tenantDraftsFrom(SAVED))).toBe(false);
+  });
+
+  it("copies the maps rather than aliasing the loaded struct", () => {
+    const drafts = tenantDraftsFrom(MULTI);
+    drafts.plans_dir[TENANT_B] = "/edited";
+    expect(MULTI.plans_dir_by_tenant?.[TENANT_B]).toBe("/b/plans");
+  });
+
+  it("ignores whitespace that would not be persisted", () => {
+    const drafts = tenantDraftsFrom(MULTI);
+    drafts.plans_dir[TENANT_B] = "  /b/plans  ";
+    expect(tenantDraftsAreDirty(MULTI, drafts)).toBe(false);
+  });
+
+  it("sees an edited, an added and a cleared row", () => {
+    const edited = tenantDraftsFrom(MULTI);
+    edited.plans_dir[TENANT_B] = "/b/elsewhere";
+    expect(tenantDraftsAreDirty(MULTI, edited)).toBe(true);
+
+    const added = tenantDraftsFrom(MULTI);
+    added.plans_dir[TENANT_A] = "/a/plans";
+    expect(tenantDraftsAreDirty(MULTI, added)).toBe(true);
+
+    const cleared = tenantDraftsFrom(MULTI);
+    cleared.plans_dir[TENANT_B] = "";
+    expect(tenantDraftsAreDirty(MULTI, cleared)).toBe(true);
+  });
+
+  it("notices a change in the archive or prompts map, not only the plans one", () => {
+    const drafts = tenantDraftsFrom(MULTI);
+    drafts.prompts_dir[TENANT_A] = "/a/elsewhere";
+    expect(tenantDraftsAreDirty(MULTI, drafts)).toBe(true);
+  });
+});
+
+describe("storedTenantOverrideCount", () => {
+  it("counts every entry across all three maps", () => {
+    expect(storedTenantOverrideCount(MULTI)).toBe(4);
+    expect(storedTenantOverrideCount(SAVED)).toBe(0);
+  });
+});
+
+describe("buildPathSettingsPayload — the per-tenant maps are PATCH fields", () => {
+  it("sends {} for a map whose every row was emptied — a DELIBERATE clear", () => {
+    const drafts = tenantDraftsFrom(MULTI);
+    drafts.plans_dir[TENANT_B] = "";
+    drafts.plans_dir[TENANT_GONE] = "";
+    const payload = buildPathSettingsPayload(MULTI, draftsFrom(MULTI), undefined, drafts);
+    // NOT absent: absent means "leave the stored map alone" under the merge, so
+    // an emptied panel has to say `{}` or the Clear button does nothing.
+    expect(payload.plans_dir_by_tenant).toEqual({});
+  });
+
+  it("sends the map WITHOUT the key when one row of several is cleared", () => {
+    const drafts = tenantDraftsFrom(MULTI);
+    drafts.plans_dir[TENANT_B] = "";
+    const payload = buildPathSettingsPayload(MULTI, draftsFrom(MULTI), undefined, drafts);
+    expect(payload.plans_dir_by_tenant).toEqual({ [TENANT_GONE]: "/gone/plans" });
+  });
+
+  it("preserves a stored-but-unbound key through an unrelated edit", () => {
+    const drafts = tenantDraftsFrom(MULTI);
+    drafts.plans_dir[TENANT_A] = "/a/plans";
+    const payload = buildPathSettingsPayload(MULTI, draftsFrom(MULTI), undefined, drafts);
+    expect(payload.plans_dir_by_tenant).toEqual({
+      [TENANT_A]: "/a/plans",
+      [TENANT_B]: "/b/plans",
+      [TENANT_GONE]: "/gone/plans",
+    });
+  });
+
+  it("OMITS all three maps when the panel did not render them", () => {
+    // The single-tenant branch. The builder assembles from an EMPTY object, so
+    // the keys are absent unless asserted — and re-sending the panel's snapshot
+    // would REVERT a peer who wrote the map while this panel was open.
+    const payload = buildPathSettingsPayload(MULTI, draftsFrom(MULTI));
+    expect("plans_dir_by_tenant" in payload).toBe(false);
+    expect("plans_archive_dir_by_tenant" in payload).toBe(false);
+    expect("prompts_dir_by_tenant" in payload).toBe(false);
+  });
+
+  it("leaves the device-wide scalars alone while editing a tenant row", () => {
+    const drafts = tenantDraftsFrom(MULTI);
+    drafts.plans_dir[TENANT_B] = "/b/elsewhere";
+    const payload = buildPathSettingsPayload(MULTI, draftsFrom(MULTI), undefined, drafts);
+    expect(payload.plans_dir).toBe("/device/plans");
+  });
+
+  it("does not mutate the loaded struct's maps", () => {
+    const before = JSON.stringify(MULTI);
+    const drafts = tenantDraftsFrom(MULTI);
+    drafts.plans_dir[TENANT_B] = "";
+    buildPathSettingsPayload(MULTI, draftsFrom(MULTI), undefined, drafts);
+    expect(JSON.stringify(MULTI)).toBe(before);
   });
 });

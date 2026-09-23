@@ -662,7 +662,9 @@ async fn start_steward(
         // (a steward runs in the shared checkout), so `QONTINUI_SESSION_WORKTREES`
         // is omitted exactly as before — but a steward is an agent session and
         // must still learn where the plans live. See `agent_worktree::session_env`.
-        crate::agent_worktree::session_env::session_extra_env(None),
+        // No tenant key either: a steward runs under the machine default tenant
+        // (`None` below), so it reads the device-default directories.
+        crate::agent_worktree::session_env::session_extra_env(None, None),
         // UNATTENDED spawn — respect the critical floor. A steward is a
         // long-running autonomous agent session; starting one on a box
         // that is already out of commit is how the incident's `claude`-inside-a-
