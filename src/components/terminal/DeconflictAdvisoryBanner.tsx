@@ -26,18 +26,19 @@
  * the parent enforces.
  *
  * Visual language mirrors `HoldingLockBanner` — same soft-amber
- * `#e0af68` accent at lower saturation, `absolute top-14 right-2 w-[340px]`
- * within `TerminalPage`'s own zone-grid container.
+ * `#e0af68` accent at lower saturation, `w-[340px]`.
  *
- * As of #1671 this is no longer coordinated with the lock-yield banners'
- * position: `HoldingLockBanner` / `WaitingLockBanner` / `MidSessionToast`
- * now portal into `AdvisoryStack`'s app-root-level `position: fixed`
- * container instead of rendering locally, so the `top-14` offset here is
- * no longer calibrated against a `top-2` banner actually rendered above it
- * in this container — it is simply this banner's own fixed local position.
- * `DeconflictAdvisoryBanner` was deliberately left out of that stack (not
- * one of the five banners named in finding c91550f0); wiring it in is
- * follow-up work, not something this component can assume has happened.
+ * Post-merge follow-up to #1683: this banner now portals into
+ * `AdvisoryStack`'s shared `position: fixed` container via `AdvisorySlot`,
+ * same as `HoldingLockBanner` / `WaitingLockBanner` / `MidSessionToast` /
+ * `ResumeFailedBanner` / `SessionRecoveryBanner`. Before this it stayed
+ * `absolute top-14 right-2` in `TerminalPage`'s own zone-grid container —
+ * a position #1671 had already made meaningless, since it was calibrated
+ * against a `HoldingLockBanner`/`WaitingLockBanner` that no longer rendered
+ * anywhere near it once those two moved into the stack. Joining the stack
+ * gives this banner the same never-overlaps-a-sibling guarantee finding
+ * c91550f0 established for the other five, rather than leaving it as the
+ * one top-right advisory banner exempt from it.
  */
 
 import { useEffect, useState } from "react";
@@ -45,6 +46,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { AlertTriangle, X } from "lucide-react";
 import { createLogger } from "@/lib/logger";
+import { AdvisorySlot } from "./AdvisoryStack";
 
 const logger = createLogger("DeconflictAdvisoryBanner");
 
@@ -186,34 +188,36 @@ export function DeconflictAdvisoryBanner({ taskRunId }: DeconflictAdvisoryBanner
   }
 
   return (
-    <div
-      data-ui-bridge-id="terminal.deconflict-advisory-banner"
-      data-task-run-id={taskRunId}
-      className="absolute top-14 right-2 z-30 w-[340px] space-y-1.5"
-    >
-      {advisories.map((a) => (
-        <div
-          key={a.decisionId}
-          data-ui-bridge-id="terminal.deconflict-advisory-banner-card"
-          data-advisory-decision-id={a.decisionId}
-          className="p-2.5 rounded border bg-[#e0af68]/10 border-[#e0af68]/35 shadow-lg"
-        >
-          <div className="flex items-start gap-2">
-            <AlertTriangle className="w-3.5 h-3.5 shrink-0 text-[#e0af68] mt-0.5" />
-            <div className="text-[11px] text-[#c0caf5] leading-snug flex-1">{a.reasoning}</div>
-            <button
-              type="button"
-              aria-label="Dismiss advisory"
-              data-ui-bridge-id="terminal.deconflict-advisory-banner-dismiss"
-              data-advisory-decision-id={a.decisionId}
-              onClick={() => void handleDismiss(a.decisionId)}
-              className="text-[#e0af68] hover:text-[#c0caf5] leading-none px-1"
-            >
-              <X className="w-3 h-3" />
-            </button>
+    <AdvisorySlot>
+      <div
+        data-ui-bridge-id="terminal.deconflict-advisory-banner"
+        data-task-run-id={taskRunId}
+        className="w-[340px] space-y-1.5"
+      >
+        {advisories.map((a) => (
+          <div
+            key={a.decisionId}
+            data-ui-bridge-id="terminal.deconflict-advisory-banner-card"
+            data-advisory-decision-id={a.decisionId}
+            className="p-2.5 rounded border bg-[#e0af68]/10 border-[#e0af68]/35 shadow-lg"
+          >
+            <div className="flex items-start gap-2">
+              <AlertTriangle className="w-3.5 h-3.5 shrink-0 text-[#e0af68] mt-0.5" />
+              <div className="text-[11px] text-[#c0caf5] leading-snug flex-1">{a.reasoning}</div>
+              <button
+                type="button"
+                aria-label="Dismiss advisory"
+                data-ui-bridge-id="terminal.deconflict-advisory-banner-dismiss"
+                data-advisory-decision-id={a.decisionId}
+                onClick={() => void handleDismiss(a.decisionId)}
+                className="text-[#e0af68] hover:text-[#c0caf5] leading-none px-1"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            </div>
           </div>
-        </div>
-      ))}
-    </div>
+        ))}
+      </div>
+    </AdvisorySlot>
   );
 }
