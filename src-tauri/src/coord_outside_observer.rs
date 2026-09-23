@@ -220,8 +220,9 @@ const FINDING_TITLE_MAX_BYTES: usize = 500;
 /// (`qontinui-coord` `findings.rs`): refused, never truncated, over it.
 const FINDING_BODY_MAX_BYTES: usize = 8 * 1024;
 
-/// Appended where [`finding_body`] cut the evidence. [`post_finding`] keys
-/// its full-read log line on it, which is what makes the promise true.
+/// Appended where [`finding_body`] cut the evidence. [`post_finding`] logs the
+/// full read whenever the body does not carry it whole, which is what makes
+/// the marker's promise true.
 const FINDING_EVIDENCE_CUT: &str = "\n… [evidence cut to fit coord's finding-body cap; the full \
                                     read is in the posting runner's log]";
 
@@ -1873,7 +1874,9 @@ async fn post_finding(
     let device_id = qontinui_runner_lib::machine_identity::read_device_id()
         .unwrap_or_else(|_| "unknown".to_string());
     let finding = finding_body(report, &door.url);
-    if finding.contains(FINDING_EVIDENCE_CUT) {
+    // Keyed on the read being ABSENT from the body, not on the cut marker:
+    // the last-resort whole-body cut in `finding_body` can drop the marker.
+    if !finding.contains(report.raw.as_str()) {
         // The finding's evidence was cut to fit coord's cap; this line is
         // where the cut part survives, on a headless runner as on any other.
         warn!(
