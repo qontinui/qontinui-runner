@@ -8431,8 +8431,13 @@ fn provision_agent_definitions_from_root(
 /// `2026-08-04-remove-hardcoded-machine-paths-from-product-code`; its
 /// `D:/qontinui-root` Windows arm shipped the author's machine layout inside an
 /// open-source binary. [`crate::workspace_paths`] is now the single door.
+///
+/// Through `workspace_paths::workspace_root_readonly`: the same value, without
+/// entering `load_settings_full` (a settings writer by side effect) just to
+/// learn a path. Plan
+/// `2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json`.
 pub(crate) fn qontinui_root_dir() -> Option<PathBuf> {
-    crate::workspace_paths::workspace_root()
+    crate::workspace_paths::workspace_root_readonly()
 }
 
 /// The local primary-checkout directory NAME for a coord repo slug. Coord uses
