@@ -12,6 +12,10 @@ use super::executor_types::{ExecutionResult, VerificationPhaseResult};
 /// cmd.exe doesn't support "KEY=VALUE command" syntax, so we parse out
 /// env vars to pass them via Command::env() instead.
 /// Example: "SKIP_WEB_SERVER=1 npx test" -> ([("SKIP_WEB_SERVER", "1")], "npx test")
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_env_prefix_for_cmd(command: &str) -> (Vec<(String, String)>, String) {
     let mut envs = Vec::new();
     let mut remaining = command.trim();

@@ -396,6 +396,10 @@ const INHERENTLY_HUMAN: &[PatternId] =
 ///
 /// This is the anchoring surface: everything else in this module matches
 /// against the START of this string.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn last_non_empty_paragraph(text: &str) -> Option<&str> {
     let mut end = text.len();
     let bytes = text.as_bytes();
@@ -461,6 +465,10 @@ fn find_paragraph_break(s: &str) -> Option<usize> {
 /// heading hashes, emphasis markers, and the numeric part of an ordered-list
 /// marker. Nothing that carries meaning is touched, so anchoring still applies
 /// to the paragraph's actual first word.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn strip_leading_decoration(p: &str) -> &str {
     let mut s = p.trim_start();
     loop {
@@ -552,6 +560,10 @@ const WAIT_CONNECTIVES: &[&str] = &[
 ///
 /// Requires BOTH a connective and a signal phrase at or after it, so a signal
 /// merely named in passing does not count.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn matched_signal(norm: &str) -> Option<&'static str> {
     let wait_at = WAIT_CONNECTIVES.iter().filter_map(|c| norm.find(c)).min()?;
     let tail = &norm[wait_at..];

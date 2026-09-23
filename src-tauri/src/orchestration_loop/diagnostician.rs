@@ -12,6 +12,10 @@ use crate::ai_router::TaskContext;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Run the full diagnostic evaluation: capture state, run assertions, triage if failed.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub async fn run_diagnostic(
     runner: &RunnerClient,
     config: &DiagnosePhaseConfig,
@@ -258,6 +262,10 @@ fn parse_triage_response(response: &str) -> (RootCauseCategory, String, Option<S
 }
 
 /// Extract a JSON block from a response that may contain markdown code fences.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_json_block(text: &str) -> String {
     if let Some(start) = text.find("```json") {
         let after_fence = &text[start + 7..];

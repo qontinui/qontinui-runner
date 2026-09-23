@@ -431,6 +431,10 @@ fn build_system_prompt(
     out
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub async fn plan_intent_handler(
     State(_state): State<Arc<ApiState>>,
     Json(request): Json<PlanIntentRequest>,

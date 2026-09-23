@@ -770,6 +770,10 @@ mod tests {
         rest.as_bytes().first() == Some(&PLACEHOLDER_OPEN) || rest.starts_with(PLACEHOLDER_ELISION)
     }
 
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn check_paths(
         dir: &Dir<'_>,
         forbidden: &[&str],
@@ -892,6 +896,10 @@ mod tests {
     /// [`provision_fleet_skills_for_session`] writes this tree to.
     const SKILL_CITATION_PREFIX: &str = ".claude/skills/";
 
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn check_citations(dir: &Dir<'_>, c: &mut Citations) {
         for file in dir.files() {
             let Some(text) = file.contents_utf8() else {
@@ -942,7 +950,15 @@ mod tests {
     /// the filename, because `…/coord-revive.sh.` closing a sentence names
     /// `coord-revive.sh`, and a guard that looked for `coord-revive.sh.` would
     /// report a missing file that is sitting right there.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn split_skill_citation(rest: &str) -> Option<(&str, &str)> {
+        #[expect(
+            clippy::string_slice,
+            reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+        )]
         fn component(s: &str) -> &str {
             let end = s
                 .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')))

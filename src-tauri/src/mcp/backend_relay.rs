@@ -5479,6 +5479,10 @@ mod tests {
     /// `a_relay_shaped_created_reply_passes_admission` (routing) and
     /// `remote_terminal::created_reply_tests` (parsing + waking the waiter).
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn the_created_reply_echoes_the_admitted_grant_jti() {
         const DISPATCHER: &str = include_str!("backend_relay.rs");
 
@@ -5524,6 +5528,10 @@ mod tests {
     /// Nothing typed connects these three lists: they are string literals in
     /// two files and a `match`. So the invariant is pinned by comparing them.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn every_reply_handle_inbound_knows_passes_both_inbound_gates() {
         const DISPATCHER: &str = include_str!("backend_relay.rs");
         const CLIENT: &str = include_str!("remote_terminal.rs");

@@ -256,6 +256,10 @@ const CFG_TEST_BRACE_WINDOW: usize = 1;
 /// costs a spurious finding someone must look at; a range that is too large
 /// silently hides an anonymous coord writer forever. Those are not comparable,
 /// so every ambiguous case collapses to `(i, i)` — skip the attribute line only.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn cfg_test_ranges(lines: &[&str]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -412,6 +416,10 @@ fn statement_start(lines: &[&str], i: usize) -> usize {
 }
 
 /// Extract the kind from `coord-auth-exempt(<kind>):`.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn exempt_kind(window: &str) -> Option<String> {
     let at = window.find(EXEMPT_MARKER)?;
     let rest = &window[at + EXEMPT_MARKER.len()..];
@@ -420,6 +428,10 @@ fn exempt_kind(window: &str) -> Option<String> {
 }
 
 #[test]
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn every_coord_write_is_authenticated_or_annotated() {
     let root = src_root();
     let mut files = Vec::new();
@@ -906,6 +918,10 @@ const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
 ];
 
 /// Extract the kind from `coord-tenant-scope(<kind>):`.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn tenant_scope_kind(window: &str) -> Option<String> {
     let at = window.find(TENANT_SCOPE_MARKER)?;
     let rest = &window[at + TENANT_SCOPE_MARKER.len()..];

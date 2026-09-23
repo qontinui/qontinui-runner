@@ -175,6 +175,10 @@ pub fn start_pr_watcher(
 ///
 /// Groups watches by GitHub token so we create one client per unique token
 /// rather than one per PR (avoids wasteful reqwest client creation).
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 async fn poll_active_prs(
     pg_db: &PgDb,
     default_client: &GitHubClient,
@@ -239,6 +243,10 @@ async fn poll_active_prs(
 }
 
 /// Poll a single PR and take action if state changed.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 async fn poll_single_pr(
     pg_db: &PgDb,
     client: &GitHubClient,

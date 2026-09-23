@@ -202,6 +202,10 @@ impl ActionPlanCache {
 }
 
 /// Normalize a URL by stripping query string and fragment.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn normalize_url(url: &str) -> String {
     // Find the earliest '?' or '#' and truncate
     let end = [url.find('?'), url.find('#')]

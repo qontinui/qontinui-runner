@@ -1919,6 +1919,10 @@ mod tests {
     /// only exemption is `ui_error::report_ui_error` / `ui_error::clear_ui_error`
     /// — the FRONTEND's own `#[tauri::command]`s, named once in `main.rs`'s
     /// `invoke_handler` list. Those are the sanctioned writer, not a bypass.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn ui_error_writer_hits(code: &str) -> Vec<String> {
         const ANCHOR: &str = "ui_error";
         const WRITE_VERBS: [&str; 2] = ["report", "clear"];

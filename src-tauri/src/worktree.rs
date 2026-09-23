@@ -496,6 +496,10 @@ pub(crate) fn compute_premerge_conflicts(
 ///
 /// Renames (`R old -> new`) are normalised to the new path; the index has
 /// already moved on so the new name is what would collide with the merge.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub(crate) fn parse_dirty_paths(
     porcelain: &str,
     include_untracked: bool,

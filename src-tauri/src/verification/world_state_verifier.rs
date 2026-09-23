@@ -274,6 +274,10 @@ fn extract_content(body: &serde_json::Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn parse_judgement(content: &str) -> Result<WsmJudgement, VerifierError> {
     // Find a JSON object in the content — strip markdown fences if present.
     let trimmed = content.trim();

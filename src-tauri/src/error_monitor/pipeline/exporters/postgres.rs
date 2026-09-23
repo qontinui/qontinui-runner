@@ -138,6 +138,10 @@ mod tests {
     /// hid: it looked like working dedup as long as you restarted between
     /// samples. The suppressor belongs to `EventBusExporter` alone.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn no_signature_dedup_runs_ahead_of_persistence() {
         let src = include_str!("../../service.rs");
         let chain_start = src

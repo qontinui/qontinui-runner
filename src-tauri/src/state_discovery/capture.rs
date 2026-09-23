@@ -752,6 +752,10 @@ mod tests {
     /// if the `runner-tabs` enricher in `App.tsx` actually returns it — from
     /// the imported constant, not a local shadow of the same name.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn the_frontend_stamps_the_same_app_id_the_runner_registers() {
         // cargo runs tests with CWD = crate root (src-tauri).
         let source = std::fs::read_to_string("../src/lib/ui-bridge/use-discovered-specs.ts")
@@ -1006,6 +1010,10 @@ mod tests {
     ///
     /// Deliberately derived from the SQL rather than hand-copied: the point of
     /// the bind tests is that nobody has to keep two lists in their head.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn placeholders(sql: &str) -> (usize, std::collections::BTreeSet<usize>) {
         let mut used = std::collections::BTreeSet::new();
         let bytes = sql.as_bytes();

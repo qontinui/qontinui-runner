@@ -325,6 +325,10 @@ impl CheckHandler {
     /// Extract Unix-style KEY=VALUE env prefixes from a command string.
     /// cmd.exe doesn't support inline env vars like `SKIP_WEB_SERVER=1 npx ...`,
     /// so we parse them out and pass via Command::env() instead.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn extract_env_prefix_for_cmd(command: &str) -> (Vec<(String, String)>, String) {
         let mut envs = Vec::new();
         let mut remaining = command.trim();
@@ -354,6 +358,10 @@ impl CheckHandler {
     ///
     /// This function detects such commands, extracts the Python code, writes it to a
     /// temp file, and returns a modified command that references the temp file instead.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn fix_python_inline_quoting(command: &str) -> (String, Option<std::path::PathBuf>) {
         // Look for `python -c "` or `python3 -c "` pattern
         let python_c_patterns = ["python -c \"", "python3 -c \""];
@@ -749,6 +757,10 @@ impl CheckHandler {
     }
 
     /// Execute AI review check — uses AI to semantically review a file
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     async fn execute_ai_review_check(
         step: &ExecutionStepConfig,
         step_name: &str,

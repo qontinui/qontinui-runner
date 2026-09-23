@@ -371,6 +371,10 @@ async fn fetch_config_uncached() -> Option<ComplianceConfig> {
 /// object whose `schema` is exactly [`SCHEMA`] and whose `items` is an array.
 /// Prose alone never satisfies that; an inline mention, malformed JSON, a wrong
 /// schema string, and a non-array `items` all fail closed.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn extract_compliance_block(text: &str) -> Option<Value> {
     let mut last: Option<Value> = None;
     let mut offset = 0usize;
@@ -398,6 +402,10 @@ pub fn extract_compliance_block(text: &str) -> Option<Value> {
 /// Retries at successive `{` positions (bounded by [`MAX_BRACE_ATTEMPTS`]) so a
 /// stray brace in the opener's own comment — `<!-- POLICY_COMPLIANCE v1 {see
 /// plan} -->` — does not make a genuine block undetectable.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn first_valid_json_after(rest: &str) -> Option<Value> {
     // Skip an opening fence line (```json / ``` / ~~~json) if one is next.
     let after_fence = {
@@ -477,6 +485,10 @@ pub fn scan_transcript(slice: &str) -> Option<Value> {
 
 /// Read the last [`TRANSCRIPT_TAIL_BYTES`] of a transcript, dropping the
 /// (probably truncated) first line when the file was larger than the window.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn read_transcript_tail(path: &Path) -> Option<String> {
     let mut f = std::fs::File::open(path).ok()?;
     let len = f.metadata().ok()?.len();

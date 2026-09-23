@@ -852,6 +852,10 @@ unix  2      [ ACC ]     STREAM     LISTENING     12345 /run/foo.sock
     /// The variant is the PUBLISHER's, and this pins that division structurally
     /// so a future edit cannot quietly move it.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn collect_never_returns_the_unavailable_source() {
         const SRC: &str = include_str!("socket_census.rs");
         let prod = SRC
@@ -871,6 +875,10 @@ unix  2      [ ACC ]     STREAM     LISTENING     12345 /run/foo.sock
     /// The probe must be bounded and non-blocking-forever by construction.
     /// Structural, because a wedged `ss` cannot be produced deterministically.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn the_probe_is_bounded_and_kills_what_it_times_out_on() {
         const SRC: &str = include_str!("socket_census.rs");
         let prod = SRC

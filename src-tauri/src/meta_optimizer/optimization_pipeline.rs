@@ -290,6 +290,10 @@ impl OptimizationPipeline {
     ///
     /// Called repeatedly by the orchestrator until the pool is complete.
     /// Returns updated cycle result with duel/winner info.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     pub async fn run_duels_and_promote(
         &self,
         pool_id: &str,
@@ -579,6 +583,10 @@ impl OptimizationPipeline {
     ///
     /// Starts with aggregate metrics, then appends concrete low-reward input/output
     /// examples from span events so the rewrite LLM sees *what actually failed*.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     async fn gather_failure_evidence(&self, target: &PromptGroupMetrics) -> String {
         let mut evidence = format!(
             "Agent: {} | Phase: {} | Failure rate: {:.1}% | Samples: {} | Mean score: {:.2} | Mean iterations: {:.1} | Mean cost: ${:.4}",

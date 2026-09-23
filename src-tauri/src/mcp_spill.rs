@@ -1221,6 +1221,10 @@ pub fn bounded_tool_name(tool: &str) -> Cow<'_, str> {
 /// partial: a reader must never have to infer from length alone that it is
 /// holding a fragment. The ellipsis is counted inside `max`, so the result is
 /// never longer than asked for — which is what the header bound rests on.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn truncate_on_char_boundary(value: &str, max: usize) -> Cow<'_, str> {
     /// Three bytes, and reserved out of `max` rather than added to it.
     const ELLIPSIS: &str = "…";

@@ -650,6 +650,10 @@ fn categorize_file(path: &str) -> String {
     .to_string()
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_types(diff_content: &str, repo_name: &str) -> Vec<TypeDefinition> {
     let mut types = Vec::new();
     let mut current_file = String::new();
@@ -743,6 +747,10 @@ fn extract_types(diff_content: &str, repo_name: &str) -> Vec<TypeDefinition> {
     types
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_endpoints(diff_content: &str, repo_name: &str) -> Vec<EndpointInfo> {
     let mut endpoints = Vec::new();
     let mut current_file = String::new();
@@ -781,6 +789,10 @@ fn extract_endpoints(diff_content: &str, repo_name: &str) -> Vec<EndpointInfo> {
     endpoints
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_db_changes(diff_content: &str, repo_name: &str) -> Vec<DbChange> {
     let mut changes = Vec::new();
     let mut current_file = String::new();
@@ -837,6 +849,10 @@ fn extract_db_changes(diff_content: &str, repo_name: &str) -> Vec<DbChange> {
     changes
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_components(diff_content: &str, repo_name: &str) -> Vec<ComponentInfo> {
     let mut components = Vec::new();
     let mut current_file = String::new();
@@ -999,6 +1015,10 @@ fn extract_imports(content: &str, language: &str) -> Vec<String> {
 // String parsing helpers
 // ============================================================================
 
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_after_keyword(content: &str, keyword: &str) -> Option<String> {
     let trimmed = content.trim();
     if let Some(idx) = trimmed.find(keyword) {
@@ -1019,6 +1039,10 @@ fn extract_table_name(sql: &str) -> Option<String> {
         .or_else(|| extract_table_name_after(sql, "create table"))
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_table_name_after(sql: &str, keyword: &str) -> Option<String> {
     let upper = sql.to_uppercase();
     let kw_upper = keyword.to_uppercase();
@@ -1046,6 +1070,10 @@ fn extract_table_name_after(sql: &str, keyword: &str) -> Option<String> {
     None
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn parse_axum_route(content: &str, file: &str, repo: &str) -> Option<EndpointInfo> {
     // .route("/path", get(handler))
     let route_start = content.find(".route(\"")?;
@@ -1076,6 +1104,10 @@ fn parse_axum_route(content: &str, file: &str, repo: &str) -> Option<EndpointInf
     })
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_quoted_after(content: &str, keyword: &str) -> Option<String> {
     let idx = content.find(keyword)?;
     let rest = &content[idx + keyword.len()..];

@@ -293,6 +293,10 @@ const REPO_STOPWORDS: [&str; 10] = [
 /// on `,` `+` `;`, and keep the first bare token of each chunk. Order-preserving
 /// and deduped. Returns empty when the line is absent — most of the corpus has
 /// no `Repo(s):` line at all, which is a real empty, not a parse failure.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn extract_repos(body: &str) -> Vec<String> {
     const MARKER: &str = "**Repo(s):**";
     let mut lines = body.lines();
@@ -1139,6 +1143,10 @@ pub fn build_report(
 }
 
 /// Render the report as the operator-facing text the backfill subcommand prints.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn render_report(report: &BackfillReport) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();

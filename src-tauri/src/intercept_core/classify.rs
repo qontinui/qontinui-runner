@@ -412,6 +412,10 @@ pub fn classify_pip(args: &[String]) -> Classification {
 /// [`PackageSpecInput`]. The version split is on the FIRST PEP-508 comparator
 /// (`==`, `>=`, `<=`, `~=`, `!=`, `>`, `<`, `===`) — NOT on `@` (which in pip is
 /// a PEP-508 URL/direct-reference, left attached to the name conservatively).
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn parse_pip_spec(token: &str) -> PackageSpecInput {
     // Find the earliest comparator position.
     const OPS: &[&str] = &["===", "==", ">=", "<=", "~=", "!=", ">", "<"];

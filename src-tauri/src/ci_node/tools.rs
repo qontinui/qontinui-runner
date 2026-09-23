@@ -1869,6 +1869,10 @@ fn write_python_shim(bin_dir: &Path, stem: &str, module: &str) -> Result<PathBuf
 /// short `-eNAME=VALUE` all redact; the first version of this function handled
 /// only the separated form and passed the other two through verbatim, which is
 /// exactly the shape a future caller is most likely to write.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub(super) fn redacted_argv(args: &[&str]) -> Vec<String> {
     /// `NAME=VALUE` -> `NAME=<redacted>`; a token with no `=` carries no value
     /// and is returned as-is.
