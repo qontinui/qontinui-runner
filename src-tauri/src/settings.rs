@@ -2309,6 +2309,7 @@ mod tier_tests {
             settings: Settings::default(),
             provenance: SettingsProvenance::Unreadable,
             error: Some("parse failed: expected value at line 1".to_string()),
+            path: None,
         };
         let msg = loaded.unreadable_message();
         assert!(msg.contains("settings.json could not be read"), "{msg}");
@@ -4167,6 +4168,18 @@ pub struct LoadedSettings {
     /// Human-readable reason the load was non-authoritative
     /// (`None` for `Loaded` / `FreshInstall`).
     pub error: Option<String>,
+    /// The `settings.json` path this load READ — `None` only when the path
+    /// itself could not be resolved (always an `Unreadable` load).
+    ///
+    /// Every persist that follows a load writes HERE, and nowhere else: the
+    /// load-time migration persist in [`load_settings_full`] and the
+    /// read-modify-write in [`update_settings`]. Resolving the path a second
+    /// time at persist time is how a `FreshInstall` read from one directory
+    /// was written as a defaults document over the file in another, after
+    /// `QONTINUI_CONFIG_DIR` changed in between (plan
+    /// `2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json`,
+    /// D2).
+    pub path: Option<PathBuf>,
 }
 
 impl LoadedSettings {
@@ -4361,6 +4374,7 @@ pub(crate) fn read_settings_from_disk() -> LoadedSettings {
                 settings: Settings::default(),
                 provenance: SettingsProvenance::Unreadable,
                 error: Some(error),
+                path: None,
             };
         }
     };
@@ -4383,6 +4397,7 @@ fn read_settings_from_path(path: &std::path::Path) -> LoadedSettings {
             settings: Settings::default(),
             provenance: SettingsProvenance::Unreadable,
             error: Some(error),
+            path: Some(path.to_path_buf()),
         }
     };
 
@@ -4396,6 +4411,7 @@ fn read_settings_from_path(path: &std::path::Path) -> LoadedSettings {
                 settings: Settings::default(),
                 provenance: SettingsProvenance::FreshInstall,
                 error: None,
+                path: Some(path.to_path_buf()),
             };
         }
         Err(e) => return unreadable(format!("stat failed: {e}")),
@@ -4410,6 +4426,7 @@ fn read_settings_from_path(path: &std::path::Path) -> LoadedSettings {
                         settings: hit.settings.clone(),
                         provenance: SettingsProvenance::Loaded,
                         error: None,
+                        path: Some(path.to_path_buf()),
                     };
                 }
             }
@@ -4453,6 +4470,7 @@ fn read_settings_from_path(path: &std::path::Path) -> LoadedSettings {
                 settings: s,
                 provenance: SettingsProvenance::Loaded,
                 error: None,
+                path: Some(path.to_path_buf()),
             }
         }
         // BOUNDED, deliberately not `{e}`. `serde_json::Error`'s Display for a
@@ -4609,8 +4627,9 @@ pub fn load_settings_full() -> LoadedSettings {
 fn complete_settings_load(loaded: LoadedSettings) -> LoadedSettings {
     let LoadedSettings {
         mut settings,
-        provenance,
-        error,
+        mut provenance,
+        mut error,
+        path: read_path,
     } = loaded;
 
     // The document EXACTLY as the file has it, captured before the first
@@ -4764,11 +4783,27 @@ fn complete_settings_load(loaded: LoadedSettings) -> LoadedSettings {
         }
     }
     if should_persist_migration(needs_persist, is_secondary, provenance) {
-        // The target is resolved ONCE, by the gate, and the write goes through
-        // that same path — never through `save_settings`'s own re-resolution of
-        // `QONTINUI_CONFIG_DIR`, which could name a different directory by the
-        // time it ran (see `persist_target_for_this_thread`).
-        match persist_target_for_this_thread() {
+        // The target is the path this load READ (D2) — never a fresh
+        // resolution of `QONTINUI_CONFIG_DIR`, which may name a different
+        // directory by now: exactly how a test's `FreshInstall` read of an
+        // empty fixture dir was once written over the operator's real file.
+        // See `persist_target_for_this_thread`.
+        let target = persist_target_for_this_thread(read_path.as_deref());
+        // D3: a `FreshInstall` is one `NotFound`, observed once. If the file is
+        // there now (or an atomic write into it is in flight), the defaults
+        // this load built are NOT the user's state — refuse, and stop calling
+        // this load authoritative.
+        let refusal = match &target {
+            Ok(Some(path)) => fresh_install_persist_refusal(provenance, path),
+            _ => None,
+        };
+        match target {
+            Ok(Some(_)) if refusal.is_some() => {
+                let refusal = refusal.unwrap_or_default();
+                error!("refusing FreshInstall persist: {refusal}");
+                provenance = SettingsProvenance::Unreadable;
+                error = Some(format!("refused FreshInstall persist: {refusal}"));
+            }
             Ok(Some(target)) => {
                 let to_persist = document_to_persist(&on_disk, &settings, tier_migration);
                 if let Err(e) = save_settings_at(&target, &to_persist) {
@@ -4832,6 +4867,7 @@ fn complete_settings_load(loaded: LoadedSettings) -> LoadedSettings {
         settings,
         provenance,
         error,
+        path: read_path,
     }
 }
 
@@ -4863,19 +4899,43 @@ fn complete_settings_load(loaded: LoadedSettings) -> LoadedSettings {
 /// The closure sees the on-disk document. Callers that need the *effective*
 /// (overlaid) values to compute the new one should read them separately with
 /// [`load_settings`] before calling.
+///
+/// 3. **Writes the file it read** ([`LoadedSettings::path`]), never a path
+///    resolved afresh after the read — and refuses a `FreshInstall` base whose
+///    file has appeared since ([`fresh_install_persist_refusal`]). A
+///    `FreshInstall` read is authoritative, so without that refusal this door
+///    would write defaults-plus-one-field over a file that just arrived. Plan
+///    `2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json`,
+///    D2 + D3.
 pub fn update_settings<F>(mutate: F) -> Result<(), String>
 where
     F: FnOnce(&mut Settings),
 {
-    let loaded = read_settings_from_disk();
+    update_settings_from(read_settings_from_disk(), mutate)
+}
+
+/// [`update_settings`] over a read the caller already took — split so a test
+/// can move the environment between the read and the write, the interleaving
+/// the persist must be immune to.
+fn update_settings_from<F>(loaded: LoadedSettings, mutate: F) -> Result<(), String>
+where
+    F: FnOnce(&mut Settings),
+{
     if !loaded.is_authoritative() {
         let msg = loaded.unreadable_message();
         error!("update_settings refused: {msg}");
         return Err(msg);
     }
+    let target = read_path_as_target(loaded.path.as_deref())?;
+    if let Some(refusal) = fresh_install_persist_refusal(loaded.provenance, &target) {
+        error!("update_settings refused: refusing FreshInstall persist: {refusal}");
+        return Err(format!(
+            "settings were not changed: {refusal}. Retry — the next read sees that file."
+        ));
+    }
     let mut settings = loaded.settings;
     mutate(&mut settings);
-    save_settings(&settings)
+    save_settings_at(&target, &settings)
 }
 
 /// Tri-state runner tier: a settings-read failure means the tier is UNKNOWN,
@@ -5344,22 +5404,27 @@ pub(crate) fn should_persist_migration(
 ///    real config dir the test process already runs against, as before this
 ///    gate existed.
 ///
-/// The gate resolves the target path ONCE and hands it back, and the caller
-/// writes through [`save_settings_at`] with that path — not through
-/// [`save_settings`], whose own `get_settings_path()` re-resolves
-/// `QONTINUI_CONFIG_DIR` and would decide the directory a second time. So the
-/// decision and the write see the same key value. **The window that remains,
-/// stated so it is scheduled rather than discovered:** arm 2 is a check
-/// against `live_guard_count()`, and a sibling can construct its
-/// `IsolatedAmbient` between that read and the `atomic_write`. The path was
-/// resolved before the fixture rewrote the key, so the bytes land in the
-/// directory arm 2 decided on (the real config dir, or whatever the key named
-/// then) — not in the new fixture — but that persist is neither counted in
-/// `PERSIST_DEFLECTIONS` nor logged. Narrowed by resolving once, not closed:
-/// closing it means holding `env_lock()` across check-and-write, and the
-/// caller may be the armed test's own thread already holding it (the
-/// re-entrant lock is fine) or a worker thread that would then block on the
-/// armed test — the D2 cost, made into a deadlock. Deflect stays the design.
+/// The gate does not resolve a path at all: it judges, and hands back, the
+/// path the LOAD READ ([`LoadedSettings::path`]), and the caller writes
+/// through [`save_settings_at`] with it. It used to resolve the target itself,
+/// at persist time — after the read — and that gap was the whole defect of
+/// plan `2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json`:
+/// a test read `FreshInstall` from a sibling's empty fixture dir, the fixture
+/// dropped (restoring the operator's unset `QONTINUI_CONFIG_DIR`), arm 2 then
+/// saw no live guard, and the fresh resolution named the operator's real file.
+/// With the read path as the target, the environment can change between read
+/// and write without changing where the bytes go — they go back where they
+/// came from, or nowhere.
+///
+/// **The window that remains, stated so it is scheduled rather than
+/// discovered:** arm 2 is a check against `live_guard_count()`, and a sibling
+/// can construct its `IsolatedAmbient` between that check and the
+/// `atomic_write`. The bytes still land in the directory that was READ — not in
+/// the new fixture — but that persist is neither counted in
+/// `PERSIST_DEFLECTIONS` nor logged. Closing it means holding `env_lock()`
+/// across check-and-write, and the caller may be a worker thread that would
+/// then block on the armed test — the D2 cost of the 2026-09-17 plan, made into
+/// a deadlock. Deflect stays the design.
 ///
 /// Otherwise — a sibling's fixture is live and this thread is unarmed — the
 /// persist is **deflected**: `None` is returned, the in-memory settings are
@@ -5400,14 +5465,82 @@ pub(crate) fn should_persist_migration(
 ///
 /// Plan `2026-09-17-runner-tests-share-in-process-mutable-state`, Phase 3.
 ///
-/// Returns `Ok(Some(path))` — the settings path to write through — when the
+/// Returns `Ok(Some(path))` — the read path, to write through — when the
 /// persist may proceed, `Ok(None)` when it is deflected, and `Err` when the
-/// path itself does not resolve (the same error [`save_settings`] would have
-/// returned).
+/// load carried no read path (see [`read_path_as_target`]).
 #[cfg(not(test))]
 #[inline(always)]
-fn persist_target_for_this_thread() -> Result<Option<PathBuf>, String> {
-    resolve_settings_path().map(Some)
+fn persist_target_for_this_thread(read_path: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    read_path_as_target(read_path).map(Some)
+}
+
+/// The persist target for a load: its read path, or an error — never a path
+/// resolved afresh. A load with no read path is one whose path did not
+/// resolve, which is always `Unreadable` and never persists, so reaching the
+/// `Err` means a caller built a `LoadedSettings` by hand; it is refused rather
+/// than "helpfully" re-resolved, because re-resolving is the defect.
+fn read_path_as_target(read_path: Option<&Path>) -> Result<PathBuf, String> {
+    read_path.map(Path::to_path_buf).ok_or_else(|| {
+        "the settings load carried no read path — refusing to resolve one afresh for \
+         the write"
+            .to_string()
+    })
+}
+
+/// How recent a `settings.json.tmp.*` sibling must be to count as an atomic
+/// write IN FLIGHT for [`fresh_install_persist_refusal`]. `atomic_write`
+/// removes its temp file on every error path, so one older than this is the
+/// leftover of a crashed writer — counting it forever would leave a genuine
+/// first run unable ever to persist its `local_user_id`.
+const IN_FLIGHT_TMP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// D3 of plan
+/// `2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json`:
+/// `FreshInstall` must be EARNED, not inferred from one `NotFound`.
+///
+/// A `FreshInstall` load is authoritative — its defaults are allowed to be
+/// written — on the strength of a single stat that found no file. Before that
+/// write, re-stat the target: if a `settings.json` exists there now, or the
+/// directory holds a recent `settings.json.tmp.*` (an [`atomic_write`] about
+/// to rename into place), the defaults are NOT the user's state and writing
+/// them would replace the real file. Returns the reason to refuse, or `None`
+/// to proceed; always `None` for any other provenance.
+///
+/// A backstop, not the primary fix: persisting to the read path (D2) is what
+/// keeps a test from reaching the operator's file, and `atomic_write` is
+/// create-then-rename, so a real file is never transiently absent on Linux. One
+/// stat (plus one directory read) on the rare `FreshInstall` persist path only.
+///
+/// [`atomic_write`]: crate::fs_atomic::atomic_write
+fn fresh_install_persist_refusal(provenance: SettingsProvenance, path: &Path) -> Option<String> {
+    if provenance != SettingsProvenance::FreshInstall {
+        return None;
+    }
+    if fs::symlink_metadata(path).is_ok() {
+        return Some(format!("{} appeared since the read", path.display()));
+    }
+    let prefix = format!("{}.tmp.", path.file_name()?.to_string_lossy());
+    let entries = fs::read_dir(path.parent()?).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let recent = entry
+            .metadata()
+            .and_then(|md| md.modified())
+            .ok()
+            .and_then(|mtime| mtime.elapsed().ok())
+            .is_none_or(|age| age < IN_FLIGHT_TMP_MAX_AGE);
+        if recent {
+            return Some(format!(
+                "an atomic write into {} is in flight ({name})",
+                path.display()
+            ));
+        }
+    }
+    None
 }
 
 /// How many load-time persists this test process has deflected. See
@@ -5434,10 +5567,10 @@ fn persist_deflected_sentence(target: &str) -> String {
 
 /// See the `#[cfg(not(test))]` twin above for the rule and the argument.
 #[cfg(test)]
-fn persist_target_for_this_thread() -> Result<Option<PathBuf>, String> {
-    // Resolved ONCE, before the decision, and returned to the caller: the
-    // directory the gate judged is the directory the bytes go to.
-    let resolved = resolve_settings_path();
+fn persist_target_for_this_thread(read_path: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    // The READ path, judged and returned: the directory the gate decides on is
+    // the directory the load read, and the one the bytes go to.
+    let resolved = read_path_as_target(read_path);
     if crate::test_env::thread_is_guarded() || crate::test_env::live_guard_count() == 0 {
         return resolved.map(Some);
     }
@@ -7328,7 +7461,6 @@ mod config_dir_race_tests {
     /// and the persist gate's arm 2 is OPEN — the persist is really attempted,
     /// and this cannot pass because a canary swallowed the write.
     #[test]
-    #[ignore = "red until Phase 3 of plan 2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json persists to the path that was read"]
     fn a_fresh_install_read_in_one_dir_never_persists_into_another() {
         let _g = crate::test_env::env_lock();
         let _restore = crate::test_env::EnvVarRestore::capture(RACE_ENV_KEYS);
@@ -7378,6 +7510,147 @@ mod config_dir_race_tests {
             "the minted local_user_id must have been persisted into the directory \
              that was READ ({}), got: {persisted_a:?}",
             dir_a.path().display()
+        );
+    }
+
+    /// Read a `FreshInstall` from a fresh tempdir with the env pointed at it.
+    fn fresh_install_in(dir: &Path) -> LoadedSettings {
+        point_env_at(dir);
+        let loaded = read_settings_from_disk();
+        assert_eq!(loaded.provenance, SettingsProvenance::FreshInstall);
+        assert_eq!(loaded.path.as_deref(), Some(dir.join(SETTINGS_FILE).as_path()));
+        loaded
+    }
+
+    /// D3, load path: a `FreshInstall` read, then the file APPEARS at the read
+    /// path before the persist. The persist is refused, the file is untouched,
+    /// and the load stops calling itself authoritative.
+    #[test]
+    fn a_fresh_install_persist_is_refused_when_the_file_appeared_since_the_read() {
+        let _g = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(RACE_ENV_KEYS);
+        let dir_a = tempfile::tempdir().expect("tempdir A");
+        let loaded = fresh_install_in(dir_a.path());
+
+        let appeared = dir_a.path().join(SETTINGS_FILE);
+        std::fs::write(&appeared, OPERATORS_FILE).expect("the file appears");
+        let completed = complete_settings_load(loaded);
+
+        assert_eq!(
+            std::fs::read_to_string(&appeared).expect("still there"),
+            OPERATORS_FILE,
+            "a FreshInstall persist overwrote a file that appeared after the read"
+        );
+        assert_eq!(
+            completed.provenance,
+            SettingsProvenance::Unreadable,
+            "defaults built from a NotFound that is no longer true are not the user's state"
+        );
+        let why = completed.error.expect("the refusal is carried as the error");
+        assert!(why.contains("appeared since the read"), "{why}");
+    }
+
+    /// D3, load path: a recent `settings.json.tmp.*` sibling is an atomic write
+    /// about to rename into place — refuse. A STALE one (a crashed writer's
+    /// leftover) is not, or a genuine first run could never persist.
+    #[test]
+    fn a_fresh_install_persist_is_refused_while_an_atomic_write_is_in_flight() {
+        let _g = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(RACE_ENV_KEYS);
+        let dir_a = tempfile::tempdir().expect("tempdir A");
+        let loaded = fresh_install_in(dir_a.path());
+
+        let tmp = dir_a.path().join(format!("{SETTINGS_FILE}.tmp.4242.0.0"));
+        std::fs::write(&tmp, b"{}").expect("in-flight temp file");
+        let completed = complete_settings_load(loaded);
+
+        assert!(
+            !dir_a.path().join(SETTINGS_FILE).exists(),
+            "the persist must not race an in-flight atomic write"
+        );
+        assert_eq!(completed.provenance, SettingsProvenance::Unreadable);
+        assert!(completed.error.unwrap_or_default().contains("in flight"));
+
+        // The same temp file, aged past the in-flight bound, no longer blocks.
+        let old = std::time::SystemTime::now() - IN_FLIGHT_TMP_MAX_AGE * 2;
+        std::fs::File::options()
+            .write(true)
+            .open(&tmp)
+            .and_then(|f| f.set_modified(old))
+            .expect("age the temp file");
+        assert_eq!(
+            fresh_install_persist_refusal(
+                SettingsProvenance::FreshInstall,
+                &dir_a.path().join(SETTINGS_FILE)
+            ),
+            None,
+            "a stale temp file is a crash leftover, not a write in flight"
+        );
+    }
+
+    /// The refusal is `FreshInstall`-only: a `Loaded` document's persist
+    /// overwrites its own file by design.
+    #[test]
+    fn the_refusal_never_applies_to_a_loaded_document() {
+        // Reads no env, but takes the module's serialiser like every sibling
+        // (`opt_in_serializer_guard`): a module whose serialiser only some
+        // tests take is how a locked test goes red at random.
+        let _g = crate::test_env::env_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(SETTINGS_FILE);
+        std::fs::write(&path, OPERATORS_FILE).expect("write");
+        assert_eq!(
+            fresh_install_persist_refusal(SettingsProvenance::Loaded, &path),
+            None
+        );
+        assert!(fresh_install_persist_refusal(SettingsProvenance::FreshInstall, &path).is_some());
+    }
+
+    /// D2, `update_settings`: the read-modify-write writes the file it READ,
+    /// even when the env names another directory by the time it writes.
+    #[test]
+    fn update_settings_writes_the_file_it_read_not_the_one_the_env_names_now() {
+        let _g = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(RACE_ENV_KEYS);
+        let dir_a = tempfile::tempdir().expect("tempdir A");
+        let dir_b = tempfile::tempdir().expect("tempdir B");
+        let operators_file = dir_b.path().join(SETTINGS_FILE);
+        std::fs::write(&operators_file, OPERATORS_FILE).expect("plant B");
+
+        let loaded = fresh_install_in(dir_a.path());
+        std::env::set_var("QONTINUI_CONFIG_DIR", dir_b.path());
+        update_settings_from(loaded, |s| s.setup_completed = true).expect("A is writable");
+
+        assert_eq!(
+            std::fs::read_to_string(&operators_file).expect("B"),
+            OPERATORS_FILE,
+            "update_settings wrote a FreshInstall base over the file the env names NOW"
+        );
+        let written: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir_a.path().join(SETTINGS_FILE)).expect("A written"),
+        )
+        .expect("json");
+        assert_eq!(written["setup_completed"], true);
+    }
+
+    /// D3, `update_settings`: a `FreshInstall` base whose file appeared since
+    /// the read is refused with an error, and the file is untouched.
+    #[test]
+    fn update_settings_refuses_a_fresh_install_base_whose_file_appeared() {
+        let _g = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(RACE_ENV_KEYS);
+        let dir_a = tempfile::tempdir().expect("tempdir A");
+        let loaded = fresh_install_in(dir_a.path());
+
+        let appeared = dir_a.path().join(SETTINGS_FILE);
+        std::fs::write(&appeared, OPERATORS_FILE).expect("the file appears");
+        let err = update_settings_from(loaded, |s| s.setup_completed = true)
+            .expect_err("a vanished NotFound must not license a defaults write");
+
+        assert!(err.contains("appeared since the read"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&appeared).expect("still there"),
+            OPERATORS_FILE
         );
     }
 }
