@@ -127,15 +127,3 @@ function buildDescription(wrapper: InstalledWrapper, action: ActionDescriptor): 
   const display = wrapper.manifest?.displayName ?? wrapper.id;
   return `${display}: ${action.id}`;
 }
-
-/**
- * Filter wrappers to those whose `status` is acceptable for tool injection.
- * Treats unknown / undefined status as acceptable — the runner may not
- * surface status on the list endpoint, and we'd rather expose a tool whose
- * dispatch lazy-spawns the wrapper than hide it because of a stale field.
- */
-export function isWrapperEligibleForTools(wrapper: InstalledWrapper): boolean {
-  const status = wrapper.status;
-  if (!status) return true;
-  return status === "running" || status === "idle" || status === "unknown";
-}
