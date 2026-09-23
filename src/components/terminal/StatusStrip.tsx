@@ -182,8 +182,8 @@ export function StatusStrip() {
   // so working = active-in-zone + active-external, idle = stale-tab `frozen`
   // still open here, and dormant/orphaned historical transcripts are dropped.
   const {
-    sessionCount,
-    needsInputCount: sessionNeedsInputCount,
+    claudeSessionCount,
+    needsInputCount: claudeNeedsInputCount,
     errorCount: sessionErrorCount,
     workingCount,
     completedCount,
@@ -202,8 +202,8 @@ export function StatusStrip() {
   // tab-scoped one and any session-only surplus is reported as `+N external`.
   const { actionable: needsInputCount, external: externalNeedsInputCount } = useMemo(
     () =>
-      splitNeedsInput(sessionNeedsInputCount, countTabsInState(tabs, sessionStates, "needs-input")),
-    [sessionNeedsInputCount, tabs, sessionStates],
+      splitNeedsInput(claudeNeedsInputCount, countTabsInState(tabs, sessionStates, "needs-input")),
+    [claudeNeedsInputCount, tabs, sessionStates],
   );
 
   // File-lock "stuck" pill still operates on PTY tabs (a lock is held by
@@ -237,12 +237,18 @@ export function StatusStrip() {
 
   // See {@link unionSessionCount} — gating on the Claude-session count alone
   // hid the entire strip on a page holding live PTY tabs and no Claude session.
+  //
+  // Named for the population it counts: Claude sessions UNIONed with live PTY
+  // tabs. It is NOT a zone count (that is `zoneLayout.layout.zones.length`,
+  // and `zoneLayout.isMultiZone` is the only multi-ZONE predicate) — these
+  // locals were once spelled `zoneCount` / `isMultiZone`, a three-way naming
+  // collision with the layout notion on this very page.
   const liveTabCount = useMemo(() => countLiveTabs(tabs), [tabs]);
-  const zoneCount = useMemo(
-    () => unionSessionCount(sessionCount, liveTabCount),
-    [sessionCount, liveTabCount],
+  const sessionOrPaneCount = useMemo(
+    () => unionSessionCount(claudeSessionCount, liveTabCount),
+    [claudeSessionCount, liveTabCount],
   );
-  const isMultiZone = zoneCount > 1;
+  const isMultiSession = sessionOrPaneCount > 1;
 
   const wrapperCount = wrapperTools.length;
 
@@ -261,14 +267,14 @@ export function StatusStrip() {
   // Wrapper tools are present almost every session, so gating on them kept
   // the strip permanently pinned open — defeating the auto-hide-when-idle
   // principle. The wrapper affordance now only renders when the strip is
-  // already up for a genuine signal (attention, multi-zone, or a plan).
+  // already up for a genuine signal (attention, multi-session, or a plan).
   const hasContent =
     activeTagFilters.size > 0 ||
     needsInputCount > 0 ||
     externalNeedsInputCount > 0 ||
     errorCount > 0 ||
     stuckLocks > 0 ||
-    isMultiZone ||
+    isMultiSession ||
     planFileName !== null ||
     isPlanLoading;
 
@@ -441,27 +447,31 @@ export function StatusStrip() {
           )}
         </div>
       )}
-      {/* Phase 9f — session count pill. Multi-zone only; informational. */}
-      {isMultiZone && (
+      {/* Phase 9f — session count pill. Multi-session only; informational. */}
+      {isMultiSession && (
         <Pill
           icon={<TerminalSquare className="w-2.5 h-2.5" />}
-          text={`${zoneCount} sessions`}
+          text={`${sessionOrPaneCount} sessions`}
           color="#565f89"
           // Reports the same unioned number the pill is gated on. Showing
-          // `sessionCount` here would have rendered "0 sessions" on the very
-          // page the union exists to keep visible (two live PTYs, no Claude
-          // session), so both inputs are disclosed in the tooltip instead.
+          // `claudeSessionCount` here would have rendered "0 sessions" on the
+          // very page the union exists to keep visible (two live PTYs, no
+          // Claude session), so both inputs are disclosed in the tooltip
+          // instead. The tooltip does NOT say "on this page": the Claude count
+          // includes active-external sessions, which by definition have no
+          // tab in this window.
           title={
-            `${zoneCount} sessions on this page — ` +
-            `${sessionCount} Claude, ${liveTabCount} live terminal${liveTabCount === 1 ? "" : "s"}`
+            `${sessionOrPaneCount} sessions — ` +
+            `${claudeSessionCount} Claude (incl. external), ` +
+            `${liveTabCount} live terminal${liveTabCount === 1 ? "" : "s"} on this page`
           }
         />
       )}
 
       {/* Minimap toggle. Gated on `zoneLayout.isMultiZone` — the SAME
           predicate `ZoneMinimap` returns null on — and deliberately NOT on
-          the local `isMultiZone` (`sessionCount > 1`) used by the pills
-          above. Those two count different things (zones vs. Claude
+          the local `isMultiSession` (sessions ∪ live tabs > 1) used by the
+          pills above. Those two count different things (zones vs.
           sessions), so gating on the wrong one yields a button that toggles
           a widget which never renders, or a visible widget with no button. */}
       {zoneLayout.isMultiZone && <MinimapToggle />}
@@ -471,7 +481,7 @@ export function StatusStrip() {
           attention-grabbing needs-input / error counts already have
           dedicated pills above. Renders dot-then-count per state in
           its native color so the dense layout stays legible. */}
-      {isMultiZone && hasBreakdown && (
+      {isMultiSession && hasBreakdown && (
         <span
           className="flex items-center gap-2 px-1.5 py-0.5 text-[10px] leading-none whitespace-nowrap text-[#565f89]"
           title="Session state breakdown"
