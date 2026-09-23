@@ -295,11 +295,15 @@ pub fn restore_record_payload(
 /// `classifyRestoreAction` (`"auto-resume"` ⇔ [`RestoreTier::Full`]). Pure,
 /// and the ONLY place the emitter decides a tier.
 ///
-/// Gate 1 (the id) is DEFENCE IN DEPTH: the load-bearing fix is the ingress
-/// gate on `POST /control/session-open` (runner#1373), which keeps an unsafe id
-/// out of the local registry altogether. This gate exists so the mirror cannot
-/// promise a peer a resume the frontend classifier would refuse, whatever
-/// route a record took into the registry.
+/// Gate 1 (the id) is DEFENCE IN DEPTH. Two ingress gates stop an unsafe id
+/// becoming a confirmed authoritative record: `POST /control/session-open`
+/// refuses it (runner#1373), and `handoff`'s
+/// `registry_record_from_restore_payload` materializes a peer's unsafe id as a
+/// provisional terminal-only record. Neither covers every route into the
+/// registry — an `observed` bind derives its id from a transcript file stem
+/// with no charset check — so this gate exists so the mirror can never promise
+/// a peer a resume the frontend classifier would refuse, whatever route a
+/// record took.
 pub fn mirrored_restore_tier(
     rec: &TerminalSessionRecord,
     transcript_exists: Option<bool>,
