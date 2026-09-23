@@ -4868,6 +4868,17 @@ mod bearer_selection_tests {
     /// and `unresolved_and_device_diverge_exactly_when_multi_bound`.
     #[test]
     fn the_reported_cause_is_the_selectors_own_reads() {
+        // The legacy fallback is now gated on `legacy_token_serves_tenant`,
+        // whose claimless arm reads the device's MEASURED binding count out of
+        // `paired_user.json` — so without a fixture this test would answer
+        // differently on a paired box and on CI, and pin neither. The isolated
+        // ambient pins it to a device stating ONE binding, the shape where the
+        // legacy fallback is admissible at all.
+        let amb = crate::test_env::isolated_ambient();
+        // NEVER the real OS credential store: `store_tokens` writes the
+        // keychain unless this is set, and `isolated_ambient` captures the key
+        // for restore without setting it.
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
         let expired = jwt_for("expired", chrono::Utc::now().timestamp() - 3600);
         let slot_cases: Vec<(&str, Option<String>)> = vec![
             ("usable", Some(live_jwt("slot"))),
@@ -4897,18 +4908,40 @@ mod bearer_selection_tests {
                         mgr.store_tokens(j, "").unwrap();
                     }
                     let default_tenant = Some(if is_default { t } else { stranger });
+                    // A device stating exactly ONE binding, the default one.
+                    // Written per cell because `default_tenant` moves with it.
+                    std::fs::write(
+                        amb.dir().join("paired_user.json"),
+                        serde_json::json!({
+                            "default_tenant_id": default_tenant.unwrap().to_string(),
+                            "bindings": [{"tenant_id": default_tenant.unwrap().to_string()}]
+                        })
+                        .to_string(),
+                    )
+                    .unwrap();
                     let where_ =
                         format!("slot={slot_label} legacy={legacy_label} is_default={is_default}");
                     let own_state = read_tenant_slot(&mgr, &t).state();
-                    let legacy_state = read_legacy_slot(&mgr).state();
+                    let legacy_read = read_legacy_slot(&mgr);
+                    let legacy_state = legacy_read.state();
+                    let legacy_serves = legacy_slot_serves_default_tenant(
+                        &mgr,
+                        &legacy_read,
+                        default_tenant.as_ref(),
+                    );
 
                     // The ONE token this cell may hand back for T, named from
                     // the fixtures it stored rather than read back out of the
                     // thing under test: T's own slot when that is usable, and
-                    // the legacy slot ONLY where T is the default binding.
+                    // the legacy slot ONLY where T is the default binding AND
+                    // that token is T's. The fixtures' legacy JWT carries no
+                    // `tenant_id` claim, so it is T's only under the claimless
+                    // arm — one measured binding (above) AND no slot of T's
+                    // own, which the expired/opaque cells fail because they
+                    // DID store one.
                     let expected: Option<&str> = if *slot_label == "usable" {
                         slot.as_deref()
-                    } else if is_default && *legacy_label == "usable" {
+                    } else if is_default && *legacy_label == "usable" && slot.is_none() {
                         legacy.as_deref()
                     } else {
                         None
@@ -4920,7 +4953,8 @@ mod bearer_selection_tests {
                     // derivation of the same predicate over the same store —
                     // not a second spelling of this call's own answer.
                     assert_eq!(
-                        credential_state(own_state, is_default, legacy_state).can_act(),
+                        credential_state(own_state, is_default, legacy_state, legacy_serves)
+                            .can_act(),
                         Some(result.is_ok()),
                         "{where_}: the diagnostic and the shared credential rule must be ONE \
                          decision"
@@ -4970,6 +5004,35 @@ mod bearer_selection_tests {
                             );
                             assert_ne!(legacy_seen, SlotState::Usable, "{where_}");
                             assert_eq!(legacy_seen, legacy_state, "{where_}");
+                        }
+                        // The cause the claim check adds: a USABLE legacy token
+                        // that is not this tenant's. Reachable only where the
+                        // legacy fallback was consulted at all (the default
+                        // tenant) and the token did not serve it — here, the
+                        // claimless token beside a slot T already owns.
+                        Err(NoCredential::DefaultBindingClaimMismatch { own, claimed }) => {
+                            assert!(
+                                is_default,
+                                "{where_}: only the DEFAULT tenant consults the legacy slot, \
+                                 so only it may report one"
+                            );
+                            assert_eq!(own, own_state, "{where_}");
+                            assert_ne!(
+                                own,
+                                SlotState::Usable,
+                                "{where_}: a usable slot yields a token, never a cause"
+                            );
+                            assert_eq!(
+                                legacy_state,
+                                SlotState::Usable,
+                                "{where_}: this cause is only reachable over a USABLE legacy \
+                                 token — an unusable one is a DefaultBindingFallback"
+                            );
+                            assert_eq!(
+                                claimed, None,
+                                "{where_}: the fixture's legacy JWT carries no tenant_id claim, \
+                                 so the cause must say so rather than name a tenant"
+                            );
                         }
                         Err(other) => {
                             panic!("{where_}: an Owned scope cannot reach {other:?}")
