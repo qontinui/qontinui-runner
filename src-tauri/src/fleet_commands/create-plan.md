@@ -393,11 +393,33 @@ and the plan misleads every later reader
 
 That has already happened. This command previously described a six-tier
 `non_author_allows_identities` ladder over `{device, agent, session}` for the
-work-unit check. **That was wrong about the code**: verified on qontinui-coord
-`origin/main` 2026-09-03, `work_unit_registry::authorize_target_transition`
-takes two `Option<&str>` keys and does a flat `owner == attester` compare;
-`non_author_allows_identities` is called only from `gates.rs`. Fourteen plan
-status blocks now carry that invented ladder as fact.
+work-unit check. **That was wrong about the code**: re-verified on qontinui-coord
+`origin/main` 2026-09-23 at `037fc1a8f`,
+`work_unit_registry::authorize_target_transition` takes the two actor keys
+**plus an optional `independence` declaration** (`{verified, against, context}`),
+and does the flat `owner == attester` compare **only when no declaration is
+sent** — a well-formed one authorizes an Attested transition without that
+compare, while still refusing `attester_unresolved` when the caller's token
+derives no actor key; `non_author_allows_identities` is called only from
+`gates.rs`. Fourteen plan status blocks now carry that invented ladder as fact.
+
+⚠️ **Whether the coord instance serving YOU advertises that declaration is a
+READ, never an assumption — and NOT the one your own tool list answers.**
+Measured 2026-09-23: the authoring session's advertised
+`coord_work_unit_transition` schema carried four properties while the door
+carried six, so a session trusting its own tool list would have recorded "not
+served" when the door said otherwise. Read the door — `coord-revive.sh tools`,
+then look for `independence` in that tool's `inputSchema` — and take the worked
+declaration from `/vet-plan` → `self_attestation_forbidden`; if your own tool
+list is the stale one, send it with
+`coord-revive.sh call coord_work_unit_transition '<json>'` rather than the tool
+your session advertises, and verify by read — a zero exit is not evidence the
+write landed. The declaration is STORED on the unit, so one you did not earn is
+a false witness statement with your actor key beside it.
+
+⚠️ **Never re-allocate to get past a refusal** — a fresh allocate issues a NEW
+agent id the legacy compare would admit, which the refusal itself names *"a
+known defect being tracked, not a sanctioned route"*.
 
 What you may safely rely on, because it is mechanism rather than policy: the
 plan FILE's own status stamp is always yours to write, and the coord transition
