@@ -829,13 +829,17 @@ async fn displaced_or_foreign_teardown_cannot_delete_holder() {
 
 /// R5.
 #[tokio::test]
-async fn reload_race_tombstone() {
+async fn reload_race_reservation() {
     let s = spawn(BindingConfig::default()).await;
     let (holder, ack) = s.ws_register(Some(GOOD), "app").await;
     assert_eq!(ack["type"], "registered");
     holder.close().await;
+    // Wait for the teardown to RELEASE the id, not to delete the row: a
+    // released row is retained as its holder's reservation, so it stops being
+    // live (and leaves `list_live` and every routing reader) while staying
+    // present for `claim` to refuse against.
     let deadline = tokio::time::Instant::now() + PROMPT;
-    while s.relay.app_registry.get("app").await.is_some() {
+    while s.relay.app_registry.get_live("app").await.is_some() {
         assert!(
             tokio::time::Instant::now() < deadline,
             "holder teardown never ran"
@@ -847,7 +851,7 @@ async fn reload_race_tombstone() {
     assert_eq!(
         ack_refusal_code(&reply),
         Some("UIB_REGISTRATION_HELD"),
-        "a foreign principal claimed a tombstoned id: {reply}"
+        "a foreign principal claimed a reserved id: {reply}"
     );
 
     let (_again, reply) = s.ws_register(Some(GOOD), "app").await;
@@ -857,18 +861,18 @@ async fn reload_race_tombstone() {
     );
 }
 
-/// Finding 1 / R5: a registration that ends by EXPIRY is tombstoned too.
+/// R5: a registration that ends by EXPIRY stays reserved for its holder.
 ///
 /// `beforeunload` is not the only way a browser registration ends — a tab
 /// crash, an OOM kill, a sleep, or Chrome throttling a backgrounded tab's
-/// 10 s phone-home past the 30 s TTL all end it by expiry instead. If the
-/// sweeper evicted untombstoned, R1 would turn that into a PERMANENT lockout:
-/// an attacker claims the swept id and renews it every 10 s, and the
-/// returning tab is refused forever — strictly worse than main, where it
-/// simply re-took its slot. That is the "one more way to be locked out" cost
-/// the plan's ranking used to REJECT option A.
+/// 10 s phone-home past the 30 s TTL all end it by expiry instead. Without a
+/// reservation, R1 turns that into a PERMANENT lockout: an attacker claims
+/// the freed id and renews it every 10 s, and the returning tab is refused
+/// forever — strictly worse than main, where it simply re-took its slot. That
+/// is the "one more way to be locked out" cost the plan's ranking used to
+/// REJECT option A.
 #[tokio::test]
-async fn expiry_tombstones_the_holder_so_a_missed_heartbeat_is_not_a_lockout() {
+async fn an_expired_registration_stays_reserved_for_its_holder() {
     let s = spawn(BindingConfig::default()).await;
     let (status, body) = s
         .post(
@@ -969,13 +973,6 @@ async fn a_live_ws_holder_is_not_displaceable_once_its_registry_row_is_gone() {
         s.relay.app_registry.get("app").await.is_none(),
         "precondition: no registry row"
     );
-    assert!(
-        s.relay
-            .binding
-            .tombstone_holder(&crate::mcp::relay_binding::app_tombstone_key("app"))
-            .is_none(),
-        "precondition: no live tombstone"
-    );
 
     let (_evil, reply) = s.ws_register(Some(EVIL), "app").await;
     assert_eq!(
@@ -1032,7 +1029,7 @@ async fn ws_touch_keeps_refreshing_a_row_an_http_phone_home_took_over() {
             .await,
         "the conn guard is meaningless for an HTTP entry, and the holder's own          principal must not be blocked from refreshing it"
     );
-    assert_eq!(s.relay.app_registry.sweep(&s.relay.binding).await, 0);
+    assert_eq!(s.relay.app_registry.sweep().await, 0);
 }
 
 /// H2 / R1-slot on the HTTP door: `POST /ui-bridge/apps/register` must not
@@ -1075,62 +1072,6 @@ async fn an_http_register_cannot_displace_a_live_ws_holder_the_registry_forgot()
         "the refused claim must have written nothing"
     );
     assert_eq!(conn_for(&s, "app").await, Some(holder_conn));
-}
-
-/// H3: the tombstone map's global ceiling must not let an attacker PREVENT a
-/// chosen victim's reservation either.
-///
-/// The per-principal bound alone only stopped *eviction by one principal*. The
-/// bucket key is `class:origin` and one domain yields unlimited origins, so
-/// 16 sub-origins x 64 filled the map, and the victim's own write then found
-/// `mine == 0`, a full map, and was silently DROPPED — the same outcome at the
-/// same cost. The ceiling now evicts the soonest-to-expire of the LARGEST
-/// bucket, which a victim holding one reservation is never in.
-#[test]
-fn a_multi_origin_flood_cannot_prevent_a_victims_reservation() {
-    let binding = RelayBinding::new(BindingConfig::default());
-    let evil_at = |n: usize| Principal::Browser {
-        class: crate::mcp::origin_guard::OriginClass::Foreign,
-        origin: NormOrigin::parse(&format!("https://s{n}.evil.example")).unwrap(),
-    };
-    // Fill from enough distinct origins to reach the GLOBAL ceiling without
-    // any single one reaching the per-principal bound.
-    let origins = (MAX_TOMBSTONES / MAX_TOMBSTONES_PER_PRINCIPAL) + 4;
-    for o in 0..origins {
-        for i in 0..MAX_TOMBSTONES_PER_PRINCIPAL {
-            binding.tombstone(app_tombstone_key(&format!("squat-{o}-{i}")), &evil_at(o));
-        }
-    }
-    let total = binding.health_json()["tombstones"].as_u64().unwrap() as usize;
-    assert!(total <= MAX_TOMBSTONES, "the map is still bounded: {total}");
-
-    // Now the victim reloads. Its reservation must be WRITTEN, not dropped.
-    let good = Principal::Browser {
-        class: crate::mcp::origin_guard::OriginClass::Foreign,
-        origin: NormOrigin::parse(GOOD).unwrap(),
-    };
-    let victim = app_tombstone_key("victim-app");
-    binding.tombstone(victim.clone(), &good);
-    assert_eq!(
-        binding.tombstone_holder(&victim),
-        Some(good),
-        "a multi-origin flood silently PREVENTED the victim's reservation"
-    );
-    // And the eviction is observable, not silent — on its OWN /health field,
-    // never under `rules`, where a shadow box would report it as a refusal.
-    assert!(
-        binding.health_json()["tombstoneEvictions"]
-            .as_u64()
-            .unwrap_or(0)
-            >= 1,
-        "the ceiling must be counted on /health: {}",
-        binding.health_json()
-    );
-    assert!(
-        binding.health_json()["rules"]["R5-tombstoneEvicted"].is_null(),
-        "an eviction is an operational event, not a rule verdict: {}",
-        binding.health_json()
-    );
 }
 
 /// M1: an attacker holding an open socket on an id it first-claimed must not
@@ -1312,7 +1253,7 @@ async fn a_sweep_inside_the_reservation_window_leaves_the_id_held() {
 
     // The sweeper runs, inside the reservation window.
     assert_eq!(
-        s.relay.app_registry.sweep(&s.relay.binding).await,
+        s.relay.app_registry.sweep().await,
         0,
         "a row inside its reservation window must be retained"
     );
@@ -1321,12 +1262,8 @@ async fn a_sweep_inside_the_reservation_window_leaves_the_id_held() {
         "the row IS the reservation"
     );
     assert!(
-        s.relay
-            .binding
-            .tombstone_holder(&crate::mcp::relay_binding::app_tombstone_key("app"))
-            .is_none(),
-        "expiry writes no tombstone any more — there is no collect-then-write \
-         ordering for a queued writer to slip into"
+        s.relay.app_registry.get("app").await.is_some(),
+        "the row IS the reservation — nothing is written anywhere else"
     );
 
     let (status, body) = s
@@ -1387,185 +1324,235 @@ async fn a_reserved_but_expired_row_is_not_dispatchable() {
     );
 }
 
-/// H-3, shape A, measured by the reviewer: 1023 attacker origins holding ONE
-/// reservation each. Every bucket ties, so "evict the largest bucket" fell out
-/// of `HashMap` order and the victim went after ~888 further writes.
-#[test]
-fn a_small_and_numerous_flood_cannot_evict_a_victims_single_reservation() {
-    let binding = RelayBinding::new(BindingConfig::default());
-    let good = Principal::Browser {
-        class: crate::mcp::origin_guard::OriginClass::Foreign,
-        origin: NormOrigin::parse(GOOD).unwrap(),
-    };
-    let victim = app_tombstone_key("victim-app");
-    binding.tombstone(victim.clone(), &good);
-
-    for i in 0..(MAX_TOMBSTONES * 2) {
-        let p = Principal::Browser {
-            class: crate::mcp::origin_guard::OriginClass::Foreign,
-            origin: NormOrigin::parse(&format!("https://s{i}.evil.example")).unwrap(),
-        };
-        binding.tombstone(app_tombstone_key(&format!("squat-{i}")), &p);
-    }
-
-    assert_eq!(
-        binding.tombstone_holder(&victim),
-        Some(good),
-        "a one-reservation-per-origin flood evicted the victim's single reservation"
-    );
-}
-
-/// H-3, shape B, measured by the reviewer: the victim legitimately holds the
-/// LARGEST bucket (a multi-app origin), and "evict the largest bucket" landed
-/// on it deterministically, every time. Bucket size is attacker-chosen, so
-/// ranking by raw size is the same shape of flaw as ranking by "do I hold
-/// any".
-#[test]
-fn a_victim_holding_the_largest_bucket_is_not_the_eviction_target() {
-    let binding = RelayBinding::new(BindingConfig::default());
-    let good = Principal::Browser {
-        class: crate::mcp::origin_guard::OriginClass::Foreign,
-        origin: NormOrigin::parse(GOOD).unwrap(),
-    };
-    // A plausible multi-app origin: more reservations than any attacker
-    // origin, but well under its fair share of the map.
-    let victim_keys: Vec<String> = (0..33)
-        .map(|i| app_tombstone_key(&format!("victim-app-{i}")))
-        .collect();
-    for k in &victim_keys {
-        binding.tombstone(k.clone(), &good);
-    }
-
-    for o in 0..31 {
-        let p = Principal::Browser {
-            class: crate::mcp::origin_guard::OriginClass::Foreign,
-            origin: NormOrigin::parse(&format!("https://s{o}.evil.example")).unwrap(),
-        };
-        for i in 0..32 {
-            binding.tombstone(app_tombstone_key(&format!("squat-{o}-{i}")), &p);
-        }
-    }
-
-    let survived = victim_keys
-        .iter()
-        .filter(|k| binding.tombstone_holder(k).is_some())
-        .count();
-
-    // What fair share actually guarantees, stated exactly rather than
-    // wished for: a bucket keeps its SHARE. With 32 buckets and a 1024-entry
-    // map that is 32, so a victim legitimately holding 33 may lose the one
-    // reservation it holds ABOVE its share — and nothing beyond it. That is
-    // materially different from the rule this replaced, under which the
-    // victim was the target deterministically and lost reservation after
-    // reservation while every attacker bucket kept all 32 of its own.
-    let share = MAX_TOMBSTONES / 32;
-    assert!(
-        survived >= share,
-        "the victim was stripped below its fair share: {survived} of \
-         {} survived, share is {share}",
-        victim_keys.len()
-    );
-    assert!(
-        survived >= victim_keys.len() - 1,
-        "the victim lost more than its above-share surplus: {survived} of {}",
-        victim_keys.len()
-    );
-}
-
-/// H-3, the decisive arm: at a FULL map where every bucket sits at exactly its
-/// fair share, the principal doing the writing pays — not whichever bucket a
-/// size comparison happens to rank first.
+/// The structural completion: an EXPLICIT release keeps its reservation on the
+/// row, exactly like an expiry, so a well-behaved SDK is not punished for
+/// behaving well.
 ///
-/// This is the case that separates fair-share-plus-self-eviction from "evict
-/// the largest bucket". With every bucket tied, a size ranking has to fall
-/// back on iteration order and takes a reservation from a bucket that did
-/// nothing, while the writer's own bucket — already at its full share — is
-/// untouched. `a_victim_holding_the_largest_bucket_is_not_the_eviction_target`
-/// does NOT distinguish the two rules once ties break deterministically; this
-/// one does.
-#[test]
-fn at_a_saturated_map_the_writer_pays_not_a_bystander() {
-    let binding = RelayBinding::new(BindingConfig::default());
-    let buckets = 32usize;
-    let per = MAX_TOMBSTONES / buckets; // exactly the fair share
-    let origin = |n: usize| Principal::Browser {
-        class: crate::mcp::origin_guard::OriginClass::Foreign,
-        origin: NormOrigin::parse(&format!("https://b{n:02}.example")).unwrap(),
-    };
-    let key = |n: usize, i: usize| app_tombstone_key(&format!("b{n:02}-{i}"));
+/// The shape this replaces kept expiry on the row but put an explicit release
+/// into a globally-bounded side map that unrelated principals could displace.
+/// That inverted the incentive — an app that sent its `beforeunload` DELETE
+/// moved its reservation from the unforgeable row into an attackable map and
+/// ended up LESS protected than an app that simply vanished. Here the two
+/// endings are pinned to behave identically.
+#[tokio::test]
+async fn an_explicit_release_reserves_the_id_exactly_like_an_expiry() {
+    for release_explicitly in [true, false] {
+        let s = spawn(BindingConfig::default()).await;
+        let (status, _) = s
+            .post(
+                "/ui-bridge/apps/register",
+                browser(GOOD),
+                json!({ "appId": "app", "appName": "Victim", "appType": "web",
+                        "transport": "http", "baseUrl": GOOD, "origin": GOOD }),
+            )
+            .await;
+        assert_eq!(status, 200);
 
-    for n in 0..buckets {
-        for i in 0..per {
-            binding.tombstone(key(n, i), &origin(n));
+        if release_explicitly {
+            // The well-behaved path: `beforeunload` DELETE.
+            let (status, body) = s
+                .delete("/ui-bridge/apps/register/app", browser(GOOD))
+                .await;
+            assert_eq!(status, 200, "{body}");
+            assert_eq!(body["data"], true);
+        } else {
+            // The vanish path: stop heartbeating.
+            assert!(
+                s.relay
+                    .app_registry
+                    .test_age_entry("app", REGISTRATION_TTL_MS + 1_000)
+                    .await
+            );
         }
+
+        // Either way it is gone from everything that routes or lists…
+        assert!(
+            s.relay
+                .app_registry
+                .list_live()
+                .await
+                .iter()
+                .all(|e| e.app.app_id != "app"),
+            "release_explicitly={release_explicitly}: still listed"
+        );
+        assert!(
+            s.relay.app_registry.get_live("app").await.is_none(),
+            "release_explicitly={release_explicitly}: still routable"
+        );
+        // …and either way the id is still RESERVED for its holder.
+        let (status, body) = s
+            .post(
+                "/ui-bridge/apps/register",
+                browser(EVIL),
+                json!({ "appId": "app", "appName": "Squatter", "appType": "web",
+                        "transport": "http", "baseUrl": EVIL, "origin": EVIL }),
+            )
+            .await;
+        assert_eq!(
+            status, 409,
+            "release_explicitly={release_explicitly}: the id was not reserved: {body}"
+        );
+        assert_eq!(code(&body), Some("UIB_REGISTRATION_HELD"), "{body}");
+
+        // The holder itself gets it back at once.
+        let (status, body) = s
+            .post(
+                "/ui-bridge/apps/register",
+                browser(GOOD),
+                json!({ "appId": "app", "appName": "Victim", "appType": "web",
+                        "transport": "http", "baseUrl": GOOD, "origin": GOOD }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "release_explicitly={release_explicitly}: holder locked out: {body}"
+        );
     }
-    assert_eq!(
-        binding.health_json()["tombstones"].as_u64().unwrap() as usize,
-        MAX_TOMBSTONES,
-        "precondition: the map is exactly full, every bucket at its share"
-    );
-
-    // b31 is the bystander a size ranking would pick: with every bucket tied,
-    // `max_by_key` keeps the LAST maximum in key order.
-    let bystander_before = (0..per)
-        .filter(|i| binding.tombstone_holder(&key(31, *i)).is_some())
-        .count();
-    assert_eq!(bystander_before, per);
-
-    // b05 — already at its full share — asks for one more.
-    binding.tombstone(app_tombstone_key("b05-extra"), &origin(5));
-
-    let bystander_after = (0..per)
-        .filter(|i| binding.tombstone_holder(&key(31, *i)).is_some())
-        .count();
-    assert_eq!(
-        bystander_after, per,
-        "a bystander bucket at its fair share lost a reservation to someone \
-         else's write"
-    );
-    let writer_after = (0..per)
-        .filter(|i| binding.tombstone_holder(&key(5, *i)).is_some())
-        .count();
-    assert_eq!(
-        writer_after,
-        per - 1,
-        "the writer, already at its share, must have paid for its own extra \
-         reservation"
-    );
-    assert!(binding
-        .tombstone_holder(&app_tombstone_key("b05-extra"))
-        .is_some());
 }
 
-/// M-c: a bucket is a quota, so it has to cost something to mint. A keyed tab
-/// principal (Phase 2) is 32 client-side random bytes — unlimited `log_key`s
-/// for free — so everything without a verified origin shares ONE bucket.
-#[test]
-fn principals_with_no_verified_origin_share_one_tombstone_bucket() {
-    let a = Principal::TabKey {
-        digest: key_digest("key-a"),
-    };
-    let b = Principal::TabKey {
-        digest: key_digest("key-b"),
-    };
-    assert_ne!(a.log_key_for_test(), b.log_key_for_test());
-    assert_eq!(a.tombstone_bucket(), b.tombstone_bucket());
+/// Critical 1, structurally: a reservation cannot be displaced by unrelated
+/// principals, however many of them there are and whatever their origins sort
+/// like.
+///
+/// The rule this replaces ranked candidates inside one globally-bounded map,
+/// and every ranking tried was steerable. `share = MAX / buckets` is integer
+/// division, so at ≥1024 buckets the share is 0 and "never evict at or under
+/// your share" became vacuous in exactly the saturated regime the ceiling
+/// existed for; and ties fell to the lexicographically greatest origin, which
+/// an attacker simply picks (`http://` sorts below every `https://`).
+///
+/// The fixture below is the one that exposed it: the earlier test used
+/// `s{i}.evil.example` and passed only because `'g' < 's'`. Here the attacker
+/// origins sort BOTH ABOVE AND BELOW the victim's, and `http://` is included,
+/// because the reservation no longer depends on any comparison at all.
+#[tokio::test]
+async fn a_reservation_is_not_displaceable_by_other_principals() {
+    let s = spawn(BindingConfig::default()).await;
+    let (status, _) = s
+        .post(
+            "/ui-bridge/apps/register",
+            browser(GOOD),
+            json!({ "appId": "victim-app", "appName": "Victim", "appType": "web",
+                    "transport": "http", "baseUrl": GOOD, "origin": GOOD }),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (status, _) = s
+        .delete("/ui-bridge/apps/register/victim-app", browser(GOOD))
+        .await;
+    assert_eq!(status, 200);
+
+    // Sorting below the victim (`a…`, and `http://` below every `https://`),
+    // above it (`z…`), and at the old fixture's value (`s…`).
+    for (n, origin) in [
+        "https://a0.evil.example",
+        "https://a1.evil.example",
+        "http://a2.evil.example",
+        "https://s0.evil.example",
+        "https://z0.evil.example",
+        "http://localhost:3001",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let (status, body) = s
+            .post(
+                "/ui-bridge/apps/register",
+                browser(origin),
+                json!({ "appId": format!("squat-{n}"), "appName": "S", "appType": "web",
+                        "transport": "http", "baseUrl": origin, "origin": origin }),
+            )
+            .await;
+        assert_eq!(status, 200, "{origin}: {body}");
+        let (status, _) = s
+            .delete(
+                &format!("/ui-bridge/apps/register/squat-{n}"),
+                browser(origin),
+            )
+            .await;
+        assert_eq!(status, 200);
+    }
+
+    // The victim's reservation is untouched by every one of them.
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            browser(EVIL),
+            json!({ "appId": "victim-app", "appName": "Squatter", "appType": "web",
+                    "transport": "http", "baseUrl": EVIL, "origin": EVIL }),
+        )
+        .await;
     assert_eq!(
-        Principal::Opaque {
-            class: crate::mcp::origin_guard::OriginClass::Foreign
-        }
-        .tombstone_bucket(),
-        a.tombstone_bucket()
+        status, 409,
+        "the victim's reservation was displaced: {body}"
     );
-    // …while a verified origin is its own bucket, and the loopback aliases
-    // that are ONE principal are deliberately separate buckets: a bucket is a
-    // quota, not an identity.
-    let good = Principal::Browser {
-        class: crate::mcp::origin_guard::OriginClass::Foreign,
-        origin: NormOrigin::parse(GOOD).unwrap(),
-    };
-    assert_eq!(good.tombstone_bucket(), GOOD);
-    assert_ne!(good.tombstone_bucket(), a.tombstone_bucket());
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            browser(GOOD),
+            json!({ "appId": "victim-app", "appName": "Victim", "appType": "web",
+                    "transport": "http", "baseUrl": GOOD, "origin": GOOD }),
+        )
+        .await;
+    assert_eq!(status, 200, "the holder lost its own reservation: {body}");
+}
+
+/// Operator trust frees its id the moment it releases it — the same carve-out
+/// the expiry arm has, on the release path.
+#[tokio::test]
+async fn an_operator_trust_release_frees_the_id_at_once() {
+    let s = spawn(BindingConfig::default()).await;
+    let (status, _) = s
+        .post(
+            "/ui-bridge/apps/register",
+            agent(),
+            json!({ "appId": "app", "appName": "Synthetic", "appType": "web",
+                    "transport": "http", "baseUrl": "http://127.0.0.1:65535" }),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (status, _) = s.delete("/ui-bridge/apps/register/app", agent()).await;
+    assert_eq!(status, 200);
+    assert!(
+        s.relay.app_registry.get("app").await.is_none(),
+        "an agent's released row must not linger as a reservation"
+    );
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            browser(GOOD),
+            json!({ "appId": "app", "appName": "Page", "appType": "web",
+                    "transport": "http", "baseUrl": GOOD, "origin": GOOD }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+}
+
+/// Major 4: the ceilings bound BYTES as well as rows.
+#[tokio::test]
+async fn an_oversized_app_id_is_refused_at_the_register_door() {
+    let s = spawn(BindingConfig::default()).await;
+    let huge = "x".repeat(crate::mcp::app_registry::MAX_APP_ID_LEN + 1);
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            agent(),
+            json!({ "appId": huge, "appName": "Big", "appType": "web",
+                    "transport": "http", "baseUrl": "http://127.0.0.1:65535" }),
+        )
+        .await;
+    assert_eq!(status, 400, "an unbounded appId was accepted: {body}");
+
+    let ok = "x".repeat(crate::mcp::app_registry::MAX_APP_ID_LEN);
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            agent(),
+            json!({ "appId": ok, "appName": "Big", "appType": "web",
+                    "transport": "http", "baseUrl": "http://127.0.0.1:65535" }),
+        )
+        .await;
+    assert_eq!(status, 200, "the cap is off by one: {body}");
 }
 
 /// R7.
@@ -2253,83 +2240,6 @@ fn principal_same_folds_loopback_aliases_and_nothing_else() {
     };
     assert!(!opaque.same(&opaque));
     assert!(!opaque.may_displace(&b("https://a.example")));
-}
-
-/// The R5 tombstone map: reserved for its holder, cleared on re-claim, never
-/// written for operator trust, and swept by the registry's existing tick.
-#[test]
-fn tombstones_reserve_for_the_holder_and_sweep() {
-    let binding = RelayBinding::new(BindingConfig::default());
-    let good = Principal::Browser {
-        class: crate::mcp::origin_guard::OriginClass::Foreign,
-        origin: NormOrigin::parse(GOOD).unwrap(),
-    };
-    let key = app_tombstone_key("app");
-
-    assert!(binding.tombstone_holder(&key).is_none());
-    binding.tombstone(key.clone(), &good);
-    assert_eq!(binding.tombstone_holder(&key), Some(good.clone()));
-    assert_eq!(binding.health_json()["tombstones"], 1);
-
-    binding.clear_tombstone(&key);
-    assert!(binding.tombstone_holder(&key).is_none());
-
-    // Operator trust never tombstones: an agent's id is free the moment it
-    // lets go, which is what `agent_flow_unchanged`'s DELETE relies on.
-    binding.tombstone(
-        key.clone(),
-        &Principal::OperatorTrust {
-            class: crate::mcp::origin_guard::OriginClass::NonBrowser,
-        },
-    );
-    assert!(binding.tombstone_holder(&key).is_none());
-
-    // The sweep drops EXPIRED entries and keeps live ones. Without a seam
-    // this test would only ever have asserted the trivial arm — its name said
-    // "and sweep" while nothing ever expired.
-    binding.tombstone(key.clone(), &good);
-    assert_eq!(binding.sweep_tombstones(), 0, "a live tombstone stays");
-    assert!(binding.tombstone_holder(&key).is_some());
-    binding.test_expire_tombstones();
-    assert_eq!(binding.sweep_tombstones(), 1, "an expired tombstone goes");
-    assert!(binding.tombstone_holder(&key).is_none());
-    assert_eq!(binding.health_json()["tombstones"], 0);
-}
-
-/// Finding 3: the tombstone map is bounded PER PRINCIPAL, so flooding it from
-/// one origin cannot evict another origin's reservation.
-///
-/// Every tombstone has the same 60 s lifetime, so a purely global "evict the
-/// soonest to expire" bound always evicts the OLDEST — which is always the
-/// victim's, because the attacker's are newer by construction. First-claim
-/// squatting of unheld ids is an accepted non-goal, so an attacker really can
-/// register and DELETE as many fresh ids as it likes.
-#[test]
-fn a_tombstone_flood_from_one_principal_cannot_evict_anothers() {
-    let binding = RelayBinding::new(BindingConfig::default());
-    let good = Principal::Browser {
-        class: crate::mcp::origin_guard::OriginClass::Foreign,
-        origin: NormOrigin::parse(GOOD).unwrap(),
-    };
-    let evil = Principal::Browser {
-        class: crate::mcp::origin_guard::OriginClass::Foreign,
-        origin: NormOrigin::parse(EVIL).unwrap(),
-    };
-    let victim = app_tombstone_key("victim-app");
-    binding.tombstone(victim.clone(), &good);
-
-    // Far past both ceilings.
-    for i in 0..(MAX_TOMBSTONES * 2) {
-        binding.tombstone(app_tombstone_key(&format!("squat-{i}")), &evil);
-    }
-
-    assert_eq!(
-        binding.tombstone_holder(&victim),
-        Some(good),
-        "the victim's reservation was evicted by another principal's flood"
-    );
-    let total = binding.health_json()["tombstones"].as_u64().unwrap() as usize;
-    assert!(total <= MAX_TOMBSTONES, "the map is still bounded: {total}");
 }
 
 #[test]

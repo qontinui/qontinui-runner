@@ -680,6 +680,20 @@ pub(crate) async fn register_app(
         }
     };
 
+    // Major 4: bound the KEY, not just the count of rows. A row now outlives
+    // its TTL as a reservation, so an unbounded `appId` would let one origin
+    // park its quota of rows on multi-megabyte keys for the whole window,
+    // against a 100 MB body limit.
+    if req.app_id.chars().count() > crate::mcp::app_registry::MAX_APP_ID_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error(format!(
+                "appId exceeds {} characters",
+                crate::mcp::app_registry::MAX_APP_ID_LEN
+            ))),
+        ));
+    }
+
     // R4's transport arm: only the WS handler creates WebSocket entries, so a
     // browser page phoning home may not declare one. `useCommandRelay` always
     // sends `transport:"http"`.
@@ -878,12 +892,20 @@ pub(crate) async fn list_registered_apps(
 }
 
 /// Explicit deregistration — useful on `beforeunload` when the SDK can still
-/// send a beacon. Returns `true` if an entry was removed.
+/// send a beacon. Returns `true` if a live entry was released.
 ///
 /// R2: only the holder's own principal, or an operator-trust caller, may
-/// remove an entry; anyone else gets `UIB_REGISTRATION_HELD`. A browser
-/// principal's released id is then tombstoned for `BINDING_TOMBSTONE_MS`, so
-/// a page polling `/ui-bridge/apps/registered` cannot win the reload race.
+/// release an entry; anyone else gets `UIB_REGISTRATION_HELD`.
+///
+/// "Released" is not always "removed". An operator-trust holder's row is
+/// dropped outright — an agent's id is free the moment it lets go — while a
+/// browser holder's row is RETAINED, marked released, and so stops being live:
+/// it leaves `/ui-bridge/apps/registered` and every routing reader at once,
+/// but stays present as that holder's own reservation for
+/// `BINDING_TOMBSTONE_MS`, so a page polling the registered list cannot win
+/// the reload race. Keeping the reservation on the row is what makes the two
+/// ways a registration can end — this DELETE and a plain expiry — behave
+/// identically, rather than punishing the SDK that bothers to send a beacon.
 pub(crate) async fn deregister_app(
     State(state): State<RelayState>,
     requester: Option<Extension<RequesterPrincipal>>,
@@ -1120,7 +1142,10 @@ async fn dispatch_to_app_inner(
     app_id: &str,
     req: &AppDispatchRequest,
 ) -> (StatusCode, ApiResponse<serde_json::Value>) {
-    let entry = match registry.get(app_id).await {
+    // `get_live`: a reservation-only row is not dispatchable, and answering
+    // 404 here is the same status `dispatch`'s `NotRegistered` maps to —
+    // reached truthfully instead of after building a payload from a dead row.
+    let entry = match registry.get_live(app_id).await {
         Some(e) => e,
         None => {
             return (

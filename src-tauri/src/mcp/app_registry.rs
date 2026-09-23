@@ -20,8 +20,8 @@ use tokio::sync::RwLock;
 
 use super::app_discovery::DiscoveredApp;
 use super::relay_binding::{
-    app_tombstone_key, BindingMode, Principal, Refusal, RelayBinding, BINDING_TOMBSTONE_MS,
-    RULE_R1, RULE_R1_SLOT, RULE_R2, RULE_R5, RULE_R5_KEEP_ALIVE,
+    BindingMode, Principal, Refusal, RelayBinding, BINDING_TOMBSTONE_MS, RULE_R1, RULE_R1_SLOT,
+    RULE_R2, RULE_R5, RULE_R5_KEEP_ALIVE,
 };
 
 /// Entries older than this (in ms) are considered stale and evicted.
@@ -68,7 +68,24 @@ pub struct RegisteredApp {
     /// 30-second heartbeat window without sending heartbeats. `None` means
     /// "use the global default."
     pub keep_alive_ms: Option<i64>,
+    /// When the holder EXPLICITLY released this id (`DELETE`, WebSocket
+    /// teardown), if it did. The row is kept after a release so the id stays
+    /// reserved for its holder — see [`Self::reserved_until`] — but a released
+    /// row is never live, so it is invisible to `list_live` and `get_live` and
+    /// therefore to `/ui-bridge/apps/registered` and to every routing reader.
+    pub released_at_ms: Option<i64>,
 }
+
+/// Registry ceiling. Rows now outlive their TTL (they carry the reservation),
+/// so residency is longer and needs a bound of its own. Reservation-only rows
+/// are evicted before live ones.
+pub const MAX_ROWS: usize = 4096;
+
+/// Longest accepted `appId`. The ceilings bound the COUNT of rows, not their
+/// BYTES: without this, one origin could hold its quota of rows keyed on
+/// multi-megabyte strings for a whole reservation window, against a 100 MB
+/// body limit.
+pub const MAX_APP_ID_LEN: usize = 256;
 
 impl RegisteredApp {
     /// The header origin the runner VERIFIED this registrant at. `None` for
@@ -82,11 +99,33 @@ impl RegisteredApp {
         self.principal.class_str()
     }
 
-    /// Within its TTL (per-entry `keep_alive_ms`, else the global default) —
-    /// exactly the predicate `list_live` and `sweep` use, so the registry
-    /// never refuses a claim on an entry it does not serve.
+    /// Within its TTL (per-entry `keep_alive_ms`, else the global default) and
+    /// not explicitly released. This is what `list_live` and `get_live` serve,
+    /// so a reservation-only row is invisible to every reader that routes.
     pub(crate) fn is_live(&self, now: i64) -> bool {
-        now - self.last_seen_ms <= self.keep_alive_ms.unwrap_or(REGISTRATION_TTL_MS)
+        self.released_at_ms.is_none()
+            && now - self.last_seen_ms <= self.keep_alive_ms.unwrap_or(REGISTRATION_TTL_MS)
+    }
+
+    /// How long this id stays RESERVED for its holder after the registration
+    /// ends — `BINDING_TOMBSTONE_MS` past whichever way it ended.
+    ///
+    /// BOTH endings are carried by the row, which is the whole point. An
+    /// earlier shape kept expiry on the row but put an explicit release into a
+    /// globally-bounded side map that unrelated principals could displace.
+    /// That inverted the incentive: an SDK that behaves well and sends its
+    /// `beforeunload` DELETE moved its reservation from the unforgeable row
+    /// into an attackable map, and ended up LESS protected than an app that
+    /// simply vanished.
+    pub(crate) fn reserved_until(&self) -> i64 {
+        match self.released_at_ms {
+            Some(released) => released + BINDING_TOMBSTONE_MS,
+            None => {
+                self.last_seen_ms
+                    + self.keep_alive_ms.unwrap_or(REGISTRATION_TTL_MS)
+                    + BINDING_TOMBSTONE_MS
+            }
+        }
     }
 }
 
@@ -115,8 +154,9 @@ impl AppRegistry {
     /// holder (plan `2026-09-17-ui-bridge-relay-registration-is-unauthenticated`,
     /// "Holding a claim is atomic").
     ///
-    /// Refuses with `UIB_REGISTRATION_HELD` when a LIVE entry, or a live
-    /// tombstone, belongs to a principal this one may not displace (R1, R5).
+    /// Refuses with `UIB_REGISTRATION_HELD` when a LIVE row, or a row still
+    /// inside its RESERVATION, belongs to a principal this one may not
+    /// displace (R1, R5).
     ///
     /// The `transport` + `websocket_conn_id` pair must be consistent:
     /// `Websocket` requires `Some(conn_id)`, `Http` requires `None`. The
@@ -140,7 +180,6 @@ impl AppRegistry {
     ) -> Result<Claimed, Refusal> {
         let mode = binding.config.binding;
         let now = chrono::Utc::now().timestamp_millis();
-        let key = app_tombstone_key(&app.app_id);
         let mut w = self.inner.write().await;
 
         let mut keep_alive_ms = keep_alive_ms;
@@ -173,29 +212,26 @@ impl AppRegistry {
                         )?;
                     }
                 }
-                // R5, held ON THE ROW. A row past its TTL but not yet swept
-                // used to fall straight through to the tombstone map — which
-                // is EMPTY until the sweeper runs, and `SWEEP_INTERVAL_MS` is
-                // 15 s while `list_live` drops the row from
-                // `/ui-bridge/apps/registered` at the TTL, which is exactly
-                // the attacker's signal. Polling at 1 Hz won roughly 14 times
-                // in 15. So the reservation is a property of the ROW, running
-                // from the row's own expiry; the sweep tombstone only covers
-                // the window after the row is truly gone.
+                // R5, held ON THE ROW, for BOTH ways a registration ends —
+                // expiry and explicit release. `reserved_until` knows which.
+                //
+                // There is no side map. Two earlier shapes are recorded so
+                // they are not re-invented: a row past its TTL but not yet
+                // swept used to fall through to a tombstone map that was
+                // EMPTY until the sweeper ran 15 s later, while `list_live`
+                // had already dropped the row from
+                // `/ui-bridge/apps/registered` — the attacker's signal; and an
+                // explicitly released id used to move into that same globally
+                // bounded map, where unrelated principals could evict it, so
+                // an SDK that sent its `beforeunload` DELETE ended up LESS
+                // protected than one that simply vanished.
                 Some(existing) => {
-                    let reserved_until = existing.last_seen_ms
-                        + existing.keep_alive_ms.unwrap_or(REGISTRATION_TTL_MS)
-                        + BINDING_TOMBSTONE_MS;
-                    // The operator-trust carve-out, mirroring
-                    // `tombstone_until`: an agent's id is free the moment its
-                    // registration ends, expiry included. Without this an
-                    // agent that registered with `keepAliveSecs: 3600` and
-                    // stopped heartbeating would lock a legitimate browser
-                    // page out of that id for 60 s past a one-hour TTL — and
-                    // only when the sweeper had not yet run, which is the very
-                    // timing dependence this arm exists to delete, sign
-                    // flipped.
-                    if now <= reserved_until
+                    // The operator-trust carve-out: an agent's id is free the
+                    // moment its registration ends, expiry included. Without
+                    // it, an agent that registered with `keepAliveSecs: 3600`
+                    // and stopped heartbeating would lock a legitimate browser
+                    // page out of that id for 60 s past a one-hour TTL.
+                    if now <= existing.reserved_until()
                         && !existing.principal.is_operator_trust()
                         && !principal.may_displace(&existing.principal)
                     {
@@ -207,20 +243,9 @@ impl AppRegistry {
                         )?;
                     }
                 }
-                // No row at all: the sweeper has been here, so the
-                // reservation (if any) is in the tombstone map.
-                None => {
-                    if let Some(prev) = binding.tombstone_holder(&key) {
-                        if !principal.may_displace(&prev) {
-                            binding.meter(
-                                mode,
-                                principal,
-                                route,
-                                Refusal::registration_held(RULE_R5),
-                            )?;
-                        }
-                    }
-                }
+                // No row: the reservation, if there was one, has lapsed and
+                // the sweeper has been through.
+                None => {}
             }
             // R5's second arm: a browser principal may not park an entry past
             // the heartbeat window. COUNTED in both modes so Phase 4 can see
@@ -248,7 +273,77 @@ impl AppRegistry {
             }
         }
 
-        binding.clear_tombstone(&key);
+        // Row ceiling — SELF-EVICTION ONLY.
+        //
+        // A claimant at the ceiling may give up a row of ITS OWN (its
+        // soonest-to-lapse reservation-only row; operator trust may take any,
+        // since `may_displace` is what "its own" means here). It may never
+        // cause another principal's row to be dropped, so no ranking over
+        // other principals' rows exists to be steered. That is the lesson the
+        // deleted tombstone map paid for three times over: "evict the soonest
+        // to expire" is "evict the oldest", which is always the victim's
+        // because an attacker's rows are newer by construction; "evict the
+        // largest bucket" is attacker-chosen because bucket size is; and
+        // `share = MAX / buckets` divides to ZERO once the bucket count
+        // reaches the ceiling, at which point every bucket is "over its
+        // share" and the tie falls to whichever origin the comparison ranks
+        // last — an origin an attacker simply picks.
+        //
+        // Consequences of refusing instead, stated so they are chosen rather
+        // than discovered:
+        //
+        // - A full registry cannot be used to TAKE an id. Claiming an id that
+        //   already has a row replaces it rather than growing the map, so the
+        //   ceiling is not even consulted — a holder reclaiming its own live
+        //   or reserved id is admitted at a full map.
+        // - The cost of saturation is that a BRAND NEW id cannot be
+        //   registered until a reservation lapses (≤ 60 s past a TTL). That
+        //   falls on whoever arrives next, with no attacker control over who.
+        // - It applies in EVERY mode, `off` included, because an unbounded
+        //   in-process map is a memory-exhaustion defect rather than a
+        //   routing rule, and the kill switch must not re-open it. It is
+        //   counted on `/health` as `registryFullRefusals`, never under
+        //   `rules`.
+        if !w.contains_key(&app.app_id) && w.len() >= MAX_ROWS {
+            // The claimant's own soonest-to-lapse reservation-only row, tie-broken
+            // by key so the choice never depends on `HashMap` iteration order.
+            // Written as a fold rather than `min_by_key` so the tie-break costs
+            // no allocation: `min_by_key` would clone every key it compares,
+            // and this runs under the registry's write lock.
+            let mine = {
+                let mut best: Option<(&String, i64)> = None;
+                for (k, e) in w.iter() {
+                    if e.is_live(now) || !principal.may_displace(&e.principal) {
+                        continue;
+                    }
+                    let until = e.reserved_until();
+                    let better = match best {
+                        None => true,
+                        Some((bk, buntil)) => (until, k.as_str()) < (buntil, bk.as_str()),
+                    };
+                    if better {
+                        best = Some((k, until));
+                    }
+                }
+                best.map(|(k, _)| k.clone())
+            };
+            match mine {
+                Some(v) => {
+                    w.remove(&v);
+                }
+                None => {
+                    binding.count_registry_full();
+                    tracing::warn!(
+                        class = principal.class_str(),
+                        max_rows = MAX_ROWS,
+                        route = route,
+                        "ui-bridge binding: the app registry is at its row ceiling and this principal holds no row of its own to give up; the claim is refused rather than displacing another principal's row (counted on /health uiBridgeBinding.registryFullRefusals)"
+                    );
+                    return Err(Refusal::registry_full());
+                }
+            }
+        }
+
         w.insert(
             app.app_id.clone(),
             RegisteredApp {
@@ -259,6 +354,7 @@ impl AppRegistry {
                 transport,
                 websocket_conn_id,
                 keep_alive_ms,
+                released_at_ms: None,
             },
         );
         Ok(Claimed { keep_alive_ms })
@@ -271,8 +367,8 @@ impl AppRegistry {
     ///   displaced it. `None` is the HTTP `DELETE` path, which has no conn.
     /// - A caller that is neither the holder principal nor operator trust is
     ///   refused with `UIB_REGISTRATION_HELD`.
-    /// - A browser principal's released id is tombstoned for
-    ///   `BINDING_TOMBSTONE_MS`.
+    /// - A browser or keyed holder's released id stays RESERVED on its own
+    ///   row for `BINDING_TOMBSTONE_MS`; operator trust frees it at once.
     ///
     /// `Ok(false)` means "nothing to remove", which includes the conn-guard
     /// miss: that is not a refusal, it is a stale teardown.
@@ -294,16 +390,26 @@ impl AppRegistry {
                 return Ok(false);
             }
         }
+        if entry.released_at_ms.is_some() {
+            // Already released and sitting out its reservation.
+            return Ok(false);
+        }
         if mode != BindingMode::Off && !principal.may_displace(&entry.principal) {
             binding.meter(mode, principal, route, Refusal::registration_held(RULE_R2))?;
         }
-        let removed = w.remove(app_id);
-        if mode != BindingMode::Off {
-            if let Some(entry) = removed.as_ref() {
-                binding.tombstone(app_tombstone_key(app_id), &entry.principal);
-            }
+        // Operator trust frees its id immediately; a browser or keyed holder
+        // keeps it RESERVED, on the row, for `BINDING_TOMBSTONE_MS`. Either
+        // way the row stops being live, so it leaves `list_live` and every
+        // routing reader at once — a release is still a release.
+        let holder_is_operator = entry.principal.is_operator_trust();
+        if mode == BindingMode::Off || holder_is_operator {
+            return Ok(w.remove(app_id).is_some());
         }
-        Ok(removed.is_some())
+        let now = chrono::Utc::now().timestamp_millis();
+        if let Some(e) = w.get_mut(app_id) {
+            e.released_at_ms = Some(now);
+        }
+        Ok(true)
     }
 
     /// Lightweight liveness refresh — bumps `last_seen_ms` to "now" without
@@ -325,7 +431,7 @@ impl AppRegistry {
     ///
     /// For that `Http` case the socket's own `principal` decides instead.
     /// "R1 already vetted whoever took the id" is NOT sufficient, and was
-    /// wrong across a tombstone lapse: an attacker that first-claimed an
+    /// wrong across a reservation lapse: an attacker that first-claimed an
     /// unheld id over WebSocket (an accepted non-goal) and keeps its socket
     /// open would otherwise refresh the VICTIM's row on every inbound frame
     /// once the victim re-registered that id over HTTP.
@@ -386,44 +492,30 @@ impl AppRegistry {
         let now = chrono::Utc::now().timestamp_millis();
         let r = self.inner.read().await;
         r.values()
-            .filter(|e| now - e.last_seen_ms <= e.keep_alive_ms.unwrap_or(REGISTRATION_TTL_MS))
+            // ONE definition of freshness, shared with `get_live` and the
+            // reservation arm. A second inline copy here is what let a
+            // released row keep appearing in `/ui-bridge/apps/registered`.
+            .filter(|e| e.is_live(now))
             .cloned()
             .collect()
     }
 
-    /// Drop entries whose RESERVATION has lapsed — `last_seen_ms + ttl +
-    /// BINDING_TOMBSTONE_MS`, not the bare TTL. Returns the number dropped.
+    /// Drop rows whose RESERVATION has lapsed — see
+    /// [`RegisteredApp::reserved_until`], which covers expiry AND explicit
+    /// release. Returns the number dropped.
     ///
-    /// Retaining the row through its reservation window is what makes R5 hold
-    /// without any dependence on when the sweeper happens to run. The row
-    /// itself IS the reservation, so:
+    /// The row IS the reservation, so this takes no binding and writes
+    /// nothing: R5 cannot depend on when the sweeper happens to run, and
+    /// there is no side map for a queued writer to race.
     ///
-    /// - there is no window between the TTL and the next 15 s tick in which
-    ///   the id looks unheld (the attacker used to win that window ~14 times
-    ///   in 15 by polling at 1 Hz, because `list_live` drops the row from
-    ///   `/ui-bridge/apps/registered` at the TTL — the attacker's signal —
-    ///   while nothing yet reserved it);
-    /// - the sweeper writes no tombstones at all, so there is no
-    ///   collect-then-write ordering for a queued writer to slip into;
-    /// - the reservation's length cannot vary with sweeper lag, because
-    ///   nothing about it is computed at sweep time.
-    ///
-    /// The tombstone map is therefore only the EXPLICIT-release path
-    /// (`DELETE`, WebSocket teardown), where the row is deliberately removed
-    /// before its reservation has run out.
-    ///
-    /// Readers are unaffected: `list_live` filters on the TTL and is what
-    /// serves `/ui-bridge/apps/registered`, and the routing paths use
-    /// [`Self::get_live`]. A retained-but-expired row is visible only to
-    /// [`Self::get`] and to `claim`'s reservation arm.
-    pub async fn sweep(&self, _binding: &RelayBinding) -> usize {
+    /// Readers are unaffected: `list_live` and [`Self::get_live`] filter on
+    /// `is_live`, which a retained row fails. A reservation-only row is
+    /// visible only to [`Self::get`] and to `claim`'s reservation arm.
+    pub async fn sweep(&self) -> usize {
         let now = chrono::Utc::now().timestamp_millis();
         let mut w = self.inner.write().await;
         let before = w.len();
-        w.retain(|_, e| {
-            now - e.last_seen_ms
-                <= e.keep_alive_ms.unwrap_or(REGISTRATION_TTL_MS) + BINDING_TOMBSTONE_MS
-        });
+        w.retain(|_, e| now <= e.reserved_until());
         before - w.len()
     }
 
@@ -474,8 +566,8 @@ impl AppRegistry {
             .expect("an operator-trust release is always admitted")
     }
 
-    /// Test-only: drop a row WITHOUT tombstoning it, so a test can isolate a
-    /// rule that must hold on the LIVE routing slot alone. Ageing a row cannot
+    /// Test-only: drop a row outright (no reservation), so a test can isolate
+    /// a rule that must hold on the LIVE routing slot alone. Ageing a row cannot
     /// do this deterministically: a WebSocket holder's client auto-pongs the
     /// 20 s ping, and every inbound frame refreshes `last_seen_ms`, so a test
     /// that ages the row races that refresh and ends up exercising plain R1
@@ -503,22 +595,18 @@ impl AppRegistry {
 }
 
 /// Spawn a background sweeper. Call once from AppHandle setup.
-///
-/// The same tick sweeps the binding's tombstone map (R5), so the bounded
-/// map needs no timer of its own.
-pub fn spawn_sweeper(registry: Arc<AppRegistry>, binding: Arc<RelayBinding>) {
+pub fn spawn_sweeper(registry: Arc<AppRegistry>) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_millis(SWEEP_INTERVAL_MS));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            let evicted = registry.sweep(&binding).await;
+            let evicted = registry.sweep().await;
             if evicted > 0 {
-                tracing::debug!("[app-registry] evicted {} stale app(s)", evicted);
-            }
-            let expired = binding.sweep_tombstones();
-            if expired > 0 {
-                tracing::debug!("[app-registry] expired {} binding tombstone(s)", expired);
+                tracing::debug!(
+                    "[app-registry] dropped {} row(s) whose reservation lapsed",
+                    evicted
+                );
             }
         }
     });
@@ -531,12 +619,6 @@ pub fn spawn_sweeper(registry: Arc<AppRegistry>, binding: Arc<RelayBinding>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// A default binding for the registry's own fixtures. The binding RULES
-    /// are exercised in `relay_binding/tests.rs`, over a real socket.
-    fn binding() -> Arc<RelayBinding> {
-        RelayBinding::new(crate::mcp::relay_binding::BindingConfig::default())
-    }
-
     fn sample_app(app_id: &str) -> DiscoveredApp {
         DiscoveredApp {
             app_id: app_id.to_string(),
@@ -717,7 +799,7 @@ mod tests {
         assert_eq!(live[0].keep_alive_ms, Some(300_000));
 
         // Sweep must NOT evict the entry either.
-        let evicted = reg.sweep(&binding()).await;
+        let evicted = reg.sweep().await;
         assert_eq!(evicted, 0, "sweep must respect per-entry keep_alive_ms");
         assert!(reg.get("long-lived").await.is_some());
     }
@@ -753,7 +835,7 @@ mod tests {
         // `2026-09-17-ui-bridge-relay-registration-is-unauthenticated`. This
         // test asserted the old contract, where the two coincided.
         assert_eq!(
-            reg.sweep(&binding()).await,
+            reg.sweep().await,
             0,
             "a row inside its reservation window is retained, not swept"
         );
@@ -768,7 +850,7 @@ mod tests {
             w.get_mut("brief").unwrap().last_seen_ms -= BINDING_TOMBSTONE_MS;
         }
         assert_eq!(
-            reg.sweep(&binding()).await,
+            reg.sweep().await,
             1,
             "sweep must evict once the reservation has lapsed too"
         );
@@ -791,5 +873,221 @@ mod tests {
             reg.list_live().await.is_empty(),
             "None keep_alive_ms must fall through to global default"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // The row ceiling (R5's resource bound)
+    // ------------------------------------------------------------------
+
+    const VICTIM_ORIGIN: &str = "https://good.example";
+
+    fn browser(origin: &str) -> Principal {
+        Principal::Browser {
+            class: crate::mcp::origin_guard::OriginClass::Foreign,
+            origin: crate::mcp::origin_guard::NormOrigin::parse(origin).unwrap(),
+        }
+    }
+
+    fn default_binding() -> Arc<RelayBinding> {
+        RelayBinding::new(crate::mcp::relay_binding::BindingConfig::default())
+    }
+
+    /// Register `app_id` as `principal`, and optionally release it so the row
+    /// is left as a reservation only.
+    async fn claim_as(
+        reg: &AppRegistry,
+        binding: &RelayBinding,
+        principal: &Principal,
+        app_id: &str,
+    ) -> Result<(), Refusal> {
+        reg.claim(
+            binding,
+            principal,
+            "test",
+            None,
+            sample_app(app_id),
+            None,
+            AppTransport::Http,
+            None,
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Attacker origins that sort BOTH BELOW and ABOVE the victim's
+    /// `https://good.example`, including `http://` ones (which sort below
+    /// every `https://`).
+    ///
+    /// The spread is load-bearing history, not decoration. The rule this
+    /// replaced ranked candidates by a comparison over OTHER principals'
+    /// entries, and the repo's own fixture used `s{i}.evil.example`, which
+    /// survived ONLY because `'g' < 's'`; flipping the prefix to `a{i}`
+    /// evicted the victim on the first fresh write. A property that can pass
+    /// by naming luck is not pinned, so every run spans the victim from both
+    /// sides.
+    ///
+    /// The set is SMALL and reused on purpose: each origin ends up holding
+    /// hundreds of rows, so the flood drives real self-evictions instead of
+    /// stalling on the capacity refusal after one row apiece. That is what
+    /// puts the eviction path under test while the victim's row is the oldest
+    /// — the single row every "soonest to expire" ranking picked.
+    const ATTACKER_ORIGINS: [&str; 8] = [
+        "http://a.evil.example",
+        "https://a.evil.example",
+        "https://b.evil.example",
+        "https://f.evil.example",
+        "https://h.evil.example",
+        "https://s.evil.example",
+        "https://z.evil.example",
+        "http://localhost:3001",
+    ];
+
+    fn attacker_origin(i: usize) -> &'static str {
+        ATTACKER_ORIGINS[i % ATTACKER_ORIGINS.len()]
+    }
+
+    /// The victim's RESERVATION survives a flood that saturates the row
+    /// ceiling, however the attackers' origins sort against it — and the id
+    /// stays unclaimable by them while it does.
+    #[tokio::test]
+    async fn a_flood_at_the_row_ceiling_cannot_displace_another_principals_reservation() {
+        let reg = AppRegistry::new();
+        let binding = default_binding();
+        let victim = browser(VICTIM_ORIGIN);
+
+        // The victim registers and then releases — the well-behaved
+        // `beforeunload` path. Its reservation is the OLDEST in the map, which
+        // is exactly what every "evict the soonest to expire" rule picked.
+        claim_as(&reg, &binding, &victim, "victim-app")
+            .await
+            .expect("the victim's own claim is admitted");
+        assert!(reg
+            .release(&binding, "victim-app", &victim, None, "test")
+            .await
+            .expect("the holder may release its own id"));
+
+        // Well past the ceiling, from origins on both sides of the victim's.
+        for i in 0..(MAX_ROWS + 1024) {
+            let p = browser(attacker_origin(i));
+            // Admitted or refused for capacity — either is fine. What is not
+            // fine is the victim paying for it.
+            let _ = claim_as(&reg, &binding, &p, &format!("squat-{i}")).await;
+            let _ = reg
+                .release(&binding, &format!("squat-{i}"), &p, None, "test")
+                .await;
+        }
+
+        assert!(
+            reg.get("victim-app").await.is_some(),
+            "the victim's reservation row was evicted by a flood of other principals"
+        );
+        let evil = browser("https://evil.example");
+        let refusal = claim_as(&reg, &binding, &evil, "victim-app")
+            .await
+            .expect_err("the victim's reserved id must still be held");
+        assert_eq!(
+            refusal.code,
+            crate::mcp::relay_binding::CODE_REGISTRATION_HELD
+        );
+        claim_as(&reg, &binding, &victim, "victim-app")
+            .await
+            .expect("the holder must get its own reserved id back");
+    }
+
+    /// The same flood must not reach a LIVE row either. A ceiling that falls
+    /// back to "evict the oldest live row" would be an R1 bypass by flooding:
+    /// the victim's row is the oldest by construction.
+    #[tokio::test]
+    async fn a_flood_at_the_row_ceiling_cannot_evict_a_live_holder() {
+        let reg = AppRegistry::new();
+        let binding = default_binding();
+        let victim = browser(VICTIM_ORIGIN);
+        claim_as(&reg, &binding, &victim, "victim-app")
+            .await
+            .expect("the victim's own claim is admitted");
+
+        // Live rows, never released, so nothing in the map is ever
+        // reservation-only and the ceiling has no lawful victim at all.
+        for i in 0..(MAX_ROWS + 1024) {
+            let _ = claim_as(
+                &reg,
+                &binding,
+                &browser(attacker_origin(i)),
+                &format!("live-{i}"),
+            )
+            .await;
+        }
+
+        assert!(
+            reg.get_live("victim-app").await.is_some(),
+            "a live holder was evicted to make room for another principal's row"
+        );
+        let evil = browser("https://evil.example");
+        let refusal = claim_as(&reg, &binding, &evil, "victim-app")
+            .await
+            .expect_err("a live holder is not displaceable");
+        assert_eq!(
+            refusal.code,
+            crate::mcp::relay_binding::CODE_REGISTRATION_HELD
+        );
+    }
+
+    /// The saturated arm, stated exactly: a principal with nothing of its own
+    /// to give up is REFUSED (`UIB_REGISTRY_FULL`, 503) rather than taking
+    /// someone else's row — while a principal that does hold a lapsing row of
+    /// its own keeps being admitted by self-eviction, so the ceiling is not a
+    /// self-DoS for a legitimately churning app.
+    #[tokio::test]
+    async fn at_the_row_ceiling_a_principal_with_nothing_of_its_own_is_refused() {
+        let reg = AppRegistry::new();
+        let binding = default_binding();
+        let filler = browser("https://filler.example");
+
+        for i in 0..MAX_ROWS {
+            claim_as(&reg, &binding, &filler, &format!("f-{i}"))
+                .await
+                .expect("filling below the ceiling is admitted");
+            assert!(reg
+                .release(&binding, &format!("f-{i}"), &filler, None, "test")
+                .await
+                .unwrap());
+        }
+
+        // A principal holding nothing: refused, not served at someone's cost.
+        let newcomer = browser("https://newcomer.example");
+        let refusal = claim_as(&reg, &binding, &newcomer, "fresh")
+            .await
+            .expect_err("a full registry must refuse rather than displace");
+        assert_eq!(refusal.code, crate::mcp::relay_binding::CODE_REGISTRY_FULL);
+        assert_eq!(
+            refusal.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(binding.health_json()["registryFullRefusals"], 1);
+        assert!(
+            binding.health_json()["rules"]["capacity"].is_null(),
+            "a capacity refusal is an operational event, not a rule verdict: {}",
+            binding.health_json()
+        );
+
+        // …while the principal that owns the lapsing rows keeps going, paying
+        // out of its own.
+        claim_as(&reg, &binding, &filler, "f-new")
+            .await
+            .expect("self-eviction must keep a churning holder admitted");
+        assert_eq!(
+            reg.inner.read().await.len(),
+            MAX_ROWS,
+            "the ceiling still bounds the map"
+        );
+
+        // And an operator-trust claim is never starved by a browser flood.
+        let agent = Principal::OperatorTrust {
+            class: crate::mcp::origin_guard::OriginClass::NonBrowser,
+        };
+        claim_as(&reg, &binding, &agent, "agent-app")
+            .await
+            .expect("operator trust must not be locked out by a browser flood");
     }
 }

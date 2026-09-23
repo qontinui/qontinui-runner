@@ -329,7 +329,11 @@ async fn fetch_live_snapshot(
         Some(d) => d.clone(),
         None => return Err(SnapshotFetchError::NotConnected),
     };
-    let entry = match registry.get(&app_id).await {
+    // `get_live`: with `get`, a reservation-only row passed this check and
+    // failed later inside `dispatch`, which this function maps to
+    // `SnapshotFetchError::Network` — mis-reporting a dead app as a network
+    // fault. `NotConnected` is the truthful answer and is what this arm says.
+    let entry = match registry.get_live(&app_id).await {
         Some(e) => e,
         None => return Err(SnapshotFetchError::NotConnected),
     };
