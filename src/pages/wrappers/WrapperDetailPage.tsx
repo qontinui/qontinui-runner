@@ -177,7 +177,7 @@ export function WrapperDetailPage({
                     {wrapper.manifest.displayName ?? wrapper.id}
                   </h1>
                   <p className="text-xs text-muted-foreground font-mono truncate">
-                    {wrapper.packageName}
+                    {wrapper.package_name}
                     <span className="ml-1 text-muted-foreground/70">v{wrapper.version}</span>
                   </p>
                 </div>
