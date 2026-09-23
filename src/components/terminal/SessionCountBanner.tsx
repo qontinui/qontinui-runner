@@ -23,8 +23,14 @@ import { AlertTriangle, X } from "lucide-react";
 import { usePerfCaps } from "@/lib/perfCaps";
 
 export interface SessionCountBannerProps {
-  /** Number of open terminal sessions. */
-  sessionCount: number;
+  /**
+   * Number of open terminal PANES (PTY tabs on this page) — NOT the
+   * Claude-session count the status strip shows. The advisory is about
+   * memory / render cost, which scales with panes, so panes are the honest
+   * population; the name says so because a `number` of the wrong population
+   * type-checks perfectly at the call site.
+   */
+  openPaneCount: number;
   /**
    * Advisory threshold. Defaults to
    * `settings.performance.max_sessions_warn`, read here rather than by the
@@ -54,25 +60,25 @@ export interface SessionCountBannerProps {
  * operator typed is the reading that matches what the control says.)
  */
 export function shouldShowSessionCountBanner(
-  sessionCount: number,
+  openPaneCount: number,
   threshold: number,
   dismissed: boolean,
 ): boolean {
   if (dismissed) return false;
-  if (sessionCount <= 0) return false;
-  return sessionCount >= threshold;
+  if (openPaneCount <= 0) return false;
+  return openPaneCount >= threshold;
 }
 
 /**
  * Has the count fallen back under the threshold, so a prior dismissal should
  * be forgotten? Exported for the same test reason.
  */
-export function shouldResetDismissal(sessionCount: number, threshold: number): boolean {
-  return sessionCount < threshold;
+export function shouldResetDismissal(openPaneCount: number, threshold: number): boolean {
+  return openPaneCount < threshold;
 }
 
 export function SessionCountBanner({
-  sessionCount,
+  openPaneCount,
   threshold: thresholdProp,
 }: SessionCountBannerProps) {
   const caps = usePerfCaps();
@@ -84,19 +90,19 @@ export function SessionCountBanner({
   // "adjust state when a prop changes" pattern, which avoids the extra
   // commit an effect would schedule on a page that is already the render-cost
   // hot spot this plan is about.
-  const below = shouldResetDismissal(sessionCount, threshold);
+  const below = shouldResetDismissal(openPaneCount, threshold);
   const [wasBelow, setWasBelow] = useState(below);
   if (below !== wasBelow) {
     setWasBelow(below);
     if (below) setDismissed(false);
   }
 
-  if (!shouldShowSessionCountBanner(sessionCount, threshold, dismissed)) return null;
+  if (!shouldShowSessionCountBanner(openPaneCount, threshold, dismissed)) return null;
 
   return (
     <div
       data-ui-bridge-id="terminal.session-count-banner"
-      data-session-count={sessionCount}
+      data-open-pane-count={openPaneCount}
       data-session-threshold={threshold}
       className="mx-2 mb-1 p-2.5 rounded border bg-[#e0af68]/10 border-[#e0af68]/35"
     >
@@ -104,7 +110,7 @@ export function SessionCountBanner({
         <AlertTriangle className="w-3.5 h-3.5 shrink-0 text-[#e0af68] mt-0.5" />
         <div className="text-[11px] text-[#c0caf5] leading-snug flex-1">
           <div>
-            <span className="font-semibold">{sessionCount} sessions open</span> (advisory threshold{" "}
+            <span className="font-semibold">{openPaneCount} panes open</span> (advisory threshold{" "}
             {threshold}). Nothing is blocked — this is a heads-up that memory and render cost grow
             with open panes.
           </div>
