@@ -17,9 +17,9 @@
  *   - **N stuck on lock Xm** — count + max age of `kind:"waiting"`
  *     entries in `fileLockStates`. Clicking focuses the longest-stuck
  *     waiter's zone.
- *   - **N errors** — clickable, cycles to the next errored zone (an
- *     inline mirror of `focusNextNeedsInput`'s walk for `state ==="error"`,
- *     since `useZoneLayout` doesn't expose a dedicated cycler).
+ *   - **N errors** — clickable, cycles to the next errored zone via
+ *     `zoneLayout.focusNextError` — the same parameterized walk
+ *     (`focusNextInState`) the needs-input pill uses.
  *   - **Wrapper tools** — an icon-only affordance (click → popover list),
  *     read from `useWrapperTools`. The raw count is deliberately NOT shown
  *     as text and does NOT keep the strip open (see `hasContent`): it is
@@ -273,21 +273,7 @@ export function StatusStrip() {
     isPlanLoading;
 
   const focusNextError = useCallback(() => {
-    // Inline mirror of `useZoneLayout.focusNextNeedsInput`'s walk,
-    // looking for `error` instead. Cycles starting at `focusedZone + 1`
-    // and wraps around. Un-maximizes on hit so the operator can see
-    // the zone (same posture as the needs-input cycler).
-    const zones = zoneLayout.layout.zones.length;
-    const start = zoneLayout.focusedZone;
-    for (let i = 1; i <= zones; i++) {
-      const candidate = (start + i) % zones;
-      const tabId = zoneLayout.assignments[candidate];
-      if (tabId && sessionStates[tabId] === "error") {
-        zoneLayout.setFocusedZone(candidate);
-        if (zoneLayout.maximizedZone !== null) zoneLayout.setMaximizedZone(null);
-        return;
-      }
-    }
+    zoneLayout.focusNextError(sessionStates);
   }, [zoneLayout, sessionStates]);
 
   const focusLongestStuck = useCallback(() => {

@@ -677,7 +677,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
             ? "needs-input"
             : raw;
       // These two now REPORT whether focus moved, which is the only honest
-      // source for it: the cap is `min(zones, tabs)` — a four-zone grid
+      // source for it: they land only on OCCUPIED zones — a four-zone grid
       // holding one session has nowhere to go — and re-deriving that here
       // from `layout.zones.length` alone would answer `focused 1 zone` for a
       // no-op, which is the very shape this phase removes.
