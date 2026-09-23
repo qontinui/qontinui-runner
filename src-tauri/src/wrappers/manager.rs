@@ -145,18 +145,7 @@ impl WrapperManager {
             ));
         }
 
-        // A non-routable record (Degraded) still owns its subprocess — which is
-        // why the UI offers Stop for it. Replacing it below via `insert` would
-        // drop that `Child` handle without killing it and orphan the process,
-        // so tear it down first.
-        if self.runtimes.read().await.contains_key(wrapper_id) {
-            if let Err(e) = self.stop(wrapper_id).await {
-                warn!(
-                    "wrappers: stop('{}') before respawning a non-routable record failed: {}",
-                    wrapper_id, e
-                );
-            }
-        }
+        self.retire_unroutable(wrapper_id).await;
 
         let port = pick_free_port()
             .map_err(|e| format!("failed to allocate port for '{}': {}", wrapper_id, e))?;
@@ -221,6 +210,31 @@ impl WrapperManager {
             .await
             .insert(wrapper_id.to_string(), runtime);
         Ok(port)
+    }
+
+    /// Tear down a runtime record that is present but NOT routable (i.e.
+    /// `Degraded`) before `spawn` replaces it. Such a record still owns its
+    /// subprocess — which is why the UI offers Stop for it — and replacing it
+    /// via `insert` would drop that `Child` handle without killing it,
+    /// orphaning the process. A routable record is never touched (the fast
+    /// path returns it). Returns whether a record was retired.
+    async fn retire_unroutable(&self, wrapper_id: &str) -> bool {
+        let unroutable = self
+            .runtimes
+            .read()
+            .await
+            .get(wrapper_id)
+            .is_some_and(|rt| rt.state != WrapperState::Running);
+        if !unroutable {
+            return false;
+        }
+        if let Err(e) = self.stop(wrapper_id).await {
+            warn!(
+                "wrappers: stop('{}') before respawning a non-routable record failed: {}",
+                wrapper_id, e
+            );
+        }
+        true
     }
 
     /// Stop a running wrapper. SIGTERM first, then force-kill after
@@ -577,6 +591,42 @@ mod tests {
         assert_eq!(status.port, Some(41234));
         manager.stop("w").await.unwrap();
         assert_eq!(manager.status("w").await.state, WrapperState::Stopped);
+    }
+
+    /// `spawn` retires a Degraded record before replacing it, killing the
+    /// subprocess it still owns instead of dropping (orphaning) the handle.
+    /// Uses a real `sleep` child so the kill is observed, hence unix-only;
+    /// the decision half is covered cross-platform below.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retire_unroutable_kills_the_degraded_child() {
+        let (manager, _tmp) = manager_with(WrapperState::Degraded).await;
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id().unwrap();
+        manager.runtimes.write().await.get_mut("w").unwrap().child = Some(child);
+
+        assert!(manager.retire_unroutable("w").await);
+        assert_eq!(manager.status("w").await.state, WrapperState::Stopped);
+        // The process is gone (reaped by `stop`'s wait): signal 0 fails.
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "degraded child {pid} survived retire_unroutable");
+    }
+
+    /// Decision half: a routable (Running) record is never retired, and an
+    /// absent record is a no-op.
+    #[tokio::test]
+    async fn retire_unroutable_leaves_running_and_absent_alone() {
+        let (manager, _tmp) = manager_with(WrapperState::Running).await;
+        assert!(!manager.retire_unroutable("w").await);
+        assert_eq!(manager.port_for("w").await, Some(41234));
+        assert!(!manager.retire_unroutable("absent").await);
+        let (degraded, _tmp2) = manager_with(WrapperState::Degraded).await;
+        assert!(degraded.retire_unroutable("w").await);
+        assert_eq!(degraded.status("w").await.state, WrapperState::Stopped);
     }
 
     /// Negative control: the same record in `Running` IS routable.

@@ -54,7 +54,7 @@ const STYLES: Record<
 };
 
 export function StatusBadge({ status = "unknown", label, size = "sm" }: StatusBadgeProps) {
-  const known = status in STYLES ? status : "unknown";
+  const known: WrapperStatus = Object.hasOwn(STYLES, status) ? status : "unknown";
   const style = STYLES[known];
   const sizing = size === "md" ? "px-2.5 py-1 text-xs" : "px-2 py-0.5 text-[11px]";
   const Icon = style.Icon;
