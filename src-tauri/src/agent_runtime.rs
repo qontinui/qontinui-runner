@@ -9288,7 +9288,15 @@ async fn post_spawn_failed(
         );
         return SpawnReportOutcome::Undelivered;
     };
-    // coord-tenant-scope(session-noop): agent_id is a parameter; spawn-failed only sets status=abandoned by agent_id and persists no tenant. Nothing to thread. Terminal. Credential: the runner sends attach_device_auth, i.e. the DEFAULT binding's device JWT — the agent token in LaunchPayload.jwt is not used on this path. Any 4xx (401/403, and coord's 404 for an unknown agent) is classed Rejected below and not retried. coord is moving to trust this report only from a matching device token, or an agent token whose agent_id matches; both pass today because the route never 401s, so a future credential change must keep one of the two.
+    // coord-tenant-scope(session-noop): agent_id is a parameter; spawn-failed persists no tenant. Nothing to thread. Terminal.
+    // Credential: the runner sends attach_device_auth, i.e. the DEFAULT binding's device JWT — the agent token in
+    // LaunchPayload.jwt is not used on this path. coord (agents_spawn.rs post_spawn_failed / spawn_failed_for_reporter)
+    // never 401s; it decides whether the reporter is VERIFIED (spawn_admission::reporter_owns_allocation: a PAIRED device
+    // token naming one of the allocation's devices, or the agent's own token). A verified report sets status=abandoned
+    // (and, for a `deferred_load:` reason, retires the dedup marker); an unverified one only abandons an allocation still
+    // `allocated`, never an `active` session, and still answers 200. So a credential change that stops this JWT being a
+    // paired token for the allocation's device silently downgrades the report. Any 4xx (e.g. coord's 404 for an unknown
+    // agent) is classed Rejected below and not retried.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)
