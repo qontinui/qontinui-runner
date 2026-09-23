@@ -87,19 +87,6 @@ pub enum DeliverySpec {
     None,
 }
 
-/// The handshake/failure pattern sets a provider's resume produces, consumed
-/// by `resumeVerification` (plan §4 `resume_handshake_patterns`). Patterns are
-/// plain substrings matched against ANSI-stripped terminal output.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct HandshakePatterns {
-    /// Substrings whose presence confirms the resume landed (the conversation
-    /// re-opened).
-    pub success: Vec<String>,
-    /// Substrings whose presence means the resume FAILED (id not found,
-    /// expired, picker error) — drives the `ResumeFailedBanner`.
-    pub failure: Vec<String>,
-}
-
 /// One provider's session-management contract. Implemented once per provider.
 /// Phase 1 ships the trait + the registry seam; Phase 2 fills the Claude impl.
 pub trait SessionProviderAdapter: Send + Sync {
@@ -124,9 +111,6 @@ pub trait SessionProviderAdapter: Send + Sync {
     /// `CLAUDE_CONFIG_DIR`; Gemini `HOME`/project separation.
     fn account_isolation(&self, account: Option<&str>) -> BTreeMap<String, String>;
 
-    /// Success/failure handshake patterns for `resumeVerification` (plan §4).
-    fn resume_handshake_patterns(&self) -> HandshakePatterns;
-
     /// Declared restore capability for honest UX (plan §4).
     fn restore_tier(&self) -> RestoreTier;
 }
@@ -134,8 +118,15 @@ pub trait SessionProviderAdapter: Send + Sync {
 /// The Claude reference adapter — Phase 1 PLACEHOLDER. The trait surface
 /// compiles and returns sensible defaults; **Phase 2 fills the resume/hook
 /// bodies** (move `aiLaunchCommand.ts`'s `--session-id` logic behind
-/// `launch_with_identity`, ship the bundled `--settings` hook, wire the
-/// handshake patterns from `resumeVerification.ts`). No path here panics.
+/// `launch_with_identity`, ship the bundled `--settings` hook). No path here
+/// panics.
+///
+/// Resume handshake/failure markers are deliberately NOT part of this trait:
+/// the only consumer is the frontend's `resumeVerification.ts`, and their
+/// single home is `src/components/terminal/providerAdapter.ts`. A Rust copy
+/// existed here with no production caller and was deleted (plan
+/// 2026-08-23-single-source-derived-facts item 9) — re-add one only with a
+/// real caller and a cross-language drift guard.
 pub struct ClaudeAdapter;
 
 impl SessionProviderAdapter for ClaudeAdapter {
@@ -215,33 +206,6 @@ impl SessionProviderAdapter for ClaudeAdapter {
         env
     }
 
-    fn resume_handshake_patterns(&self) -> HandshakePatterns {
-        // Mirror of `resumeVerification.ts` — the SUCCESS set is the Claude TUI
-        // handshake markers (the CLI took over the terminal); the FAILURE set is
-        // definitive "the requested session did NOT resume" evidence (unknown id
-        // / fell through to the session picker), checked BEFORE success since a
-        // failure dialog is itself Claude UI. Plain substrings matched against
-        // ANSI-stripped output (the TS uses regexes; these are the literal
-        // substrings those regexes key on, since the trait contract is
-        // substring-based).
-        HandshakePatterns {
-            success: vec![
-                "? for shortcuts".to_string(),  // status-line hint under the input box
-                "esc to interrupt".to_string(), // shown while Claude is working
-                "bypass permissions".to_string(), // permission-mode indicator
-                "Welcome to Claude".to_string(), // launch banner
-                "Welcome back to Claude".to_string(), // resumed-banner variant
-            ],
-            failure: vec![
-                "No conversation found".to_string(), // `--resume <unknown-id>` error
-                "No conversations found".to_string(), // empty-history variant
-                "No conversations to resume".to_string(),
-                "Select a session to resume".to_string(), // interactive picker frame
-                "Select a conversation to resume".to_string(),
-            ],
-        }
-    }
-
     fn restore_tier(&self) -> RestoreTier {
         RestoreTier::Full
     }
@@ -307,15 +271,6 @@ mod tests {
             a.account_isolation(Some("C:/cfg")).get("CLAUDE_CONFIG_DIR"),
             Some(&"C:/cfg".to_string())
         );
-
-        // resume_handshake_patterns ports the real sets from resumeVerification.ts
-        // (non-empty success + failure; failure is checked first by consumers).
-        let hp = a.resume_handshake_patterns();
-        assert!(hp.success.iter().any(|s| s.contains("for shortcuts")));
-        assert!(hp
-            .failure
-            .iter()
-            .any(|s| s.contains("No conversation found")));
     }
 
     #[test]
