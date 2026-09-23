@@ -135,3 +135,26 @@ export function splitNeedsInput(
     external: Math.max(0, sessionNeedsInputCount - tabNeedsInputCount),
   };
 }
+
+/**
+ * The needs-input / error counts the WINDOW TITLE shows.
+ *
+ * THE DEFECT: the title counted `Object.values(sessionStates)` directly, with
+ * no intersection against the live `tabs` list. A closed tab whose
+ * `sessionStates` entry had not been reaped kept inflating the title's
+ * waiting / error count after the tab was gone — and the title is the one
+ * surface visible when the window is NOT focused, i.e. exactly when the
+ * operator relies on it and cannot cross-check it against the status strip.
+ *
+ * So the title counts through {@link countTabsInState}, the same tab-scoped
+ * evidence the strip's actionable counts and the zone cyclers run on.
+ */
+export function windowTitleCounts(
+  tabs: readonly { id: string }[] | undefined | null,
+  sessionStates: Record<string, SessionState> | undefined | null,
+): { needsInputCount: number; errorCount: number } {
+  return {
+    needsInputCount: countTabsInState(tabs, sessionStates, "needs-input"),
+    errorCount: countTabsInState(tabs, sessionStates, "error"),
+  };
+}
