@@ -245,10 +245,7 @@ export function pickLayout(totalTabs: number): string {
  * gate-continuation sessions dock as invisible zoneless tabs behind a small
  * layout — operators ran blind to mid-implementation work for an hour.
  */
-export function computeAutoGrowLayoutId(
-  currentLayoutId: string,
-  tabCount: number,
-): string | null {
+export function computeAutoGrowLayoutId(currentLayoutId: string, tabCount: number): string | null {
   // Already in flow-grid: `synthesizeFlowGrid(tabCount)` gives one zone per tab,
   // so the layout is always full-capacity — no grow target, no render loop.
   if (currentLayoutId === FLOW_GRID_ID) return null;
@@ -436,6 +433,53 @@ export function applyLayoutAssignments(
 
 // ── Hook ───────────────────────────────────────────────────────────────────
 
+/**
+ * Unassigned tab IDs, split by liveness. `unassignedTabIds` is the
+ * hidden-but-LIVE set that the UnzonedChip / control-panel "N more" count is
+ * contractually about — exited tombstones are excluded so a dead session
+ * never inflates it. `exitedUnassignedTabIds` surfaces those tombstones
+ * separately (e.g. "N exited") and drives the dismiss affordance. When no
+ * liveness set is threaded, every tab is treated as live (prior behavior).
+ *
+ * The ONE derivation of this split: `useZoneLayout` exposes it, and every
+ * surface (TerminalPage's UnzonedChip, ZoneControlPanel's Unassigned / Exited
+ * sections) consumes the hook's value rather than re-deriving it. Order
+ * follows `tabIds`.
+ */
+export function partitionUnassignedTabIds(
+  tabIds: readonly string[],
+  assignments: ZoneAssignments,
+  liveTabIds?: ReadonlySet<string>,
+): { unassignedTabIds: string[]; exitedUnassignedTabIds: string[] } {
+  const assignedTabIdSet = new Set(Object.values(assignments));
+  const isLive = (id: string) => (liveTabIds ? liveTabIds.has(id) : true);
+  const unassignedTabIds: string[] = [];
+  const exitedUnassignedTabIds: string[] = [];
+  for (const id of tabIds) {
+    if (assignedTabIdSet.has(id)) continue;
+    if (isLive(id)) unassignedTabIds.push(id);
+    else exitedUnassignedTabIds.push(id);
+  }
+  return { unassignedTabIds, exitedUnassignedTabIds };
+}
+
+/**
+ * Resolve tab ids (e.g. `unassignedTabIds`) back to their tab objects, in id
+ * order, dropping any id with no matching tab.
+ */
+export function tabsForIds<T extends { id: string }>(
+  ids: readonly string[],
+  tabs: readonly T[],
+): T[] {
+  const byId = new Map(tabs.map((t) => [t.id, t] as const));
+  const out: T[] = [];
+  for (const id of ids) {
+    const tab = byId.get(id);
+    if (tab) out.push(tab);
+  }
+  return out;
+}
+
 export function useZoneLayout(
   tabIds: string[],
   pageId: string = "default",
@@ -615,18 +659,11 @@ export function useZoneLayout(
     });
   }, []);
 
-  /**
-   * Unassigned tab IDs, split by liveness. `unassignedTabIds` is the
-   * hidden-but-LIVE set that the UnzonedChip / control-panel "N more" count is
-   * contractually about — exited tombstones are excluded so a dead session
-   * never inflates it. `exitedUnassignedTabIds` surfaces those tombstones
-   * separately (e.g. "N exited") and drives the dismiss affordance. When no
-   * liveness set is threaded, every tab is treated as live (prior behavior).
-   */
-  const assignedTabIdSet = new Set(Object.values(assignments));
-  const isLive = (id: string) => (liveTabIds ? liveTabIds.has(id) : true);
-  const unassignedTabIds = tabIds.filter((id) => !assignedTabIdSet.has(id) && isLive(id));
-  const exitedUnassignedTabIds = tabIds.filter((id) => !assignedTabIdSet.has(id) && !isLive(id));
+  const { unassignedTabIds, exitedUnassignedTabIds } = partitionUnassignedTabIds(
+    tabIds,
+    assignments,
+    liveTabIds,
+  );
 
   /** Is this a multi-zone layout? */
   const isMultiZone = layout.zones.length > 1;
