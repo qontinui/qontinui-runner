@@ -1447,28 +1447,60 @@ pub fn record_usage_snapshot(results: &[AccountUsageInfo]) {
 
 /// Probe every configured account and refresh the selection usage snapshot.
 ///
-/// Called off the hot path — at startup and on a periodic timer (see
-/// `main.rs`) — so a runner whose Settings/Terminal UI is never opened (e.g. a
-/// headless or co-pilot-only runner) still has fresh weekly-usage pace data
-/// for `pick_best_account`. No-op when fewer than two accounts are configured
-/// (single-account runners have nothing to choose between).
+/// Called on demand — `account_migration` re-probes before acting on a usage
+/// limit — directly at startup, and through [`refresh_fleet_usage_report`] on
+/// the periodic timer (see `main.rs`), so a runner whose Settings/Terminal UI is
+/// never opened (e.g. a headless or co-pilot-only runner) still has fresh
+/// weekly-usage pace data for `pick_best_account`. No-op when fewer than two
+/// accounts are configured (single-account runners have nothing to choose
+/// between).
 ///
 /// Returns the fresh per-account results so callers that need more than the
 /// recorded snapshot (e.g. `account_migration`'s reset-time-aware cooldown)
 /// don't have to re-probe. Also mirrors the stats to coord's twin
-/// (best-effort, fire-and-forget).
+/// (best-effort, fire-and-forget) — accounts only; the prepaid probe is a
+/// network round-trip to the provider that the latency-sensitive migration
+/// path must not pay.
 pub async fn refresh_account_usage_snapshot() -> Vec<AccountUsageInfo> {
+    refresh_usage(false).await
+}
+
+/// The periodic fleet report: [`refresh_account_usage_snapshot`] PLUS the
+/// prepaid (pay-as-you-go) balances, mirrored to coord on the same body.
+///
+/// Unlike the accounts half this reports on a runner with fewer than two
+/// Claude accounts too: a prepaid balance is money on the account whatever the
+/// Claude roster looks like, and gating it on the account count would leave
+/// every single-account runner's balance with no fleet copy — which is the
+/// whole defect of plan `2026-09-12-prepaid-balance-is-a-fleet-fact-with-no-ingest`.
+pub async fn refresh_fleet_usage_report() -> Vec<AccountUsageInfo> {
+    refresh_usage(true).await
+}
+
+async fn refresh_usage(include_prepaid: bool) -> Vec<AccountUsageInfo> {
     let config_dirs = crate::settings::get_claude_config_dirs();
-    if config_dirs.len() < 2 {
-        return Vec::new();
+    let results = if config_dirs.len() < 2 {
+        Vec::new()
+    } else {
+        let futures: Vec<_> = config_dirs
+            .into_iter()
+            .map(|dir| async move { probe_account_usage(dir).await })
+            .collect();
+        let results = futures::future::join_all(futures).await;
+        record_usage_snapshot(&results);
+        results
+    };
+    let prepaid = if include_prepaid {
+        crate::ai_provider::prepaid_balance::get_prepaid_balances().await
+    } else {
+        Vec::new()
+    };
+    // Nothing measured, nothing to say. An empty `prepaid` makes coord write
+    // nothing for that half, so the accounts-only caller can never blank a
+    // balance the timer reported.
+    if !results.is_empty() || !prepaid.is_empty() {
+        usage_twin_report::report_to_coord(&results, &prepaid).await;
     }
-    let futures: Vec<_> = config_dirs
-        .into_iter()
-        .map(|dir| async move { probe_account_usage(dir).await })
-        .collect();
-    let results = futures::future::join_all(futures).await;
-    record_usage_snapshot(&results);
-    usage_twin_report::report_to_coord(&results).await;
     results
 }
 
@@ -1507,9 +1539,48 @@ mod usage_twin_report {
         is_active: bool,
     }
 
+    /// One prepaid provider balance — SHARED CONTRACT with coord's
+    /// `claude_account_usage::WirePrepaid`. Money is integer MICROS (1e-6 of
+    /// one `currency` unit) parsed exactly from the provider's decimal string
+    /// (`PrepaidBalanceInfo::*_micros`), never converted through `f64`. Every
+    /// measured field is `Option` and serializes `null` when unknown: coord
+    /// stores `null` as NOT REPORTED and a real `0` as "out of credit", and
+    /// those must not collapse. `error` is `Some` exactly when the probe
+    /// failed.
+    #[derive(Serialize)]
+    struct WirePrepaid<'a> {
+        provider: &'a str,
+        label: &'a str,
+        currency: Option<&'a str>,
+        balance_micros: Option<i64>,
+        granted_micros: Option<i64>,
+        topped_up_micros: Option<i64>,
+        is_available: Option<bool>,
+        error: Option<&'a str>,
+    }
+
+    impl<'a> WirePrepaid<'a> {
+        fn from_info(p: &'a crate::ai_provider::prepaid_balance::PrepaidBalanceInfo) -> Self {
+            Self {
+                provider: &p.provider,
+                label: &p.label,
+                currency: p.currency.as_deref(),
+                balance_micros: p.balance_micros,
+                granted_micros: p.granted_micros,
+                topped_up_micros: p.topped_up_micros,
+                is_available: p.is_available,
+                error: p.error.as_deref(),
+            }
+        }
+    }
+
     #[derive(Serialize)]
     struct WireBody<'a> {
         accounts: Vec<WireAccount<'a>>,
+        /// Prepaid balances measured on the same refresh — a DIFFERENT object
+        /// family from `accounts` (keyed by provider, money not utilization),
+        /// stored by coord in its own `coord.prepaid_balances` table.
+        prepaid: Vec<WirePrepaid<'a>>,
         /// The machine-global selection strategy, snake_case
         /// (`"manual"` | `"least_usage"` — see
         /// [`crate::settings::AccountSelectionMode::as_str`]). Per-REPORT, not
@@ -1520,7 +1591,10 @@ mod usage_twin_report {
         account_selection_mode: &'static str,
     }
 
-    pub(super) async fn report_to_coord(results: &[super::AccountUsageInfo]) {
+    pub(super) async fn report_to_coord(
+        results: &[super::AccountUsageInfo],
+        prepaid: &[crate::ai_provider::prepaid_balance::PrepaidBalanceInfo],
+    ) {
         if std::env::var_os("QONTINUI_ACCOUNT_USAGE_REPORT_DISABLED").is_some() {
             return;
         }
@@ -1559,6 +1633,7 @@ mod usage_twin_report {
                     is_active: active_dirs.contains(&r.config_dir),
                 })
                 .collect(),
+            prepaid: prepaid.iter().map(WirePrepaid::from_info).collect(),
             account_selection_mode: crate::claude_accounts::effective_selection_mode().as_str(),
         };
         let client = match reqwest::Client::builder()
@@ -1574,6 +1649,7 @@ mod usage_twin_report {
             Ok(resp) if resp.status().is_success() => {
                 debug!(
                     accounts = results.len(),
+                    prepaid = prepaid.len(),
                     "account usage mirrored to coord twin"
                 );
             }
@@ -1609,6 +1685,7 @@ mod usage_twin_report {
                     error: false,
                     is_active: true,
                 }],
+                prepaid: Vec::new(),
                 account_selection_mode: "least_usage",
             };
             let v = serde_json::to_value(&body).expect("serializes");
@@ -1646,11 +1723,79 @@ mod usage_twin_report {
                     error: true,
                     is_active: false,
                 }],
+                prepaid: Vec::new(),
                 account_selection_mode: "manual",
             };
             let v = serde_json::to_value(&body).expect("serializes");
             assert_eq!(v["accounts"][0]["is_active"], serde_json::json!(false));
             assert_eq!(v["account_selection_mode"], serde_json::json!("manual"));
+        }
+
+        fn prepaid_info(
+            balance_micros: Option<i64>,
+            error: Option<&str>,
+        ) -> crate::ai_provider::prepaid_balance::PrepaidBalanceInfo {
+            crate::ai_provider::prepaid_balance::PrepaidBalanceInfo {
+                provider: "deepseek".into(),
+                label: "DeepSeek".into(),
+                currency: balance_micros.map(|_| "USD".to_string()),
+                balance: balance_micros.map(|m| m as f64 / 1e6),
+                granted_balance: None,
+                topped_up_balance: balance_micros.map(|m| m as f64 / 1e6),
+                is_available: balance_micros.map(|m| m > 0),
+                error: error.map(str::to_string),
+                balance_micros,
+                granted_micros: None,
+                topped_up_micros: balance_micros,
+            }
+        }
+
+        /// The prepaid wire KEYS are the same shared contract, one struct
+        /// over: coord's `WirePrepaid` deserializes exactly these names, and a
+        /// rename on either side is silently dropped by serde. Pin every key.
+        #[test]
+        fn prepaid_wire_key_names_are_the_shared_contract() {
+            let info = prepaid_info(Some(19_280_000), None);
+            let body = WireBody {
+                accounts: Vec::new(),
+                prepaid: vec![WirePrepaid::from_info(&info)],
+                account_selection_mode: "manual",
+            };
+            let v = serde_json::to_value(&body).expect("serializes");
+            let p = &v["prepaid"][0];
+            let mut keys: Vec<&str> = p.as_object().expect("object").keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                vec![
+                    "balance_micros", "currency", "error", "granted_micros",
+                    "is_available", "label", "provider", "topped_up_micros",
+                ]
+            );
+            assert_eq!(p["provider"], serde_json::json!("deepseek"));
+            // Integer micros — never a float on the coord wire.
+            assert_eq!(p["balance_micros"], serde_json::json!(19_280_000));
+            assert!(p["balance_micros"].is_i64());
+            // Unknown is an explicit null, never 0.
+            assert!(p["granted_micros"].is_null());
+        }
+
+        /// An errored probe ships `error` and nulls — never zeros, which coord
+        /// would store as "out of credit".
+        #[test]
+        fn errored_prepaid_probe_ships_nulls_not_zeros() {
+            // The REAL error constructor, so a regression that reintroduces
+            // best-effort zeros there is caught here too.
+            let info = crate::ai_provider::prepaid_balance::PrepaidBalanceInfo::error(
+                "deepseek",
+                "DeepSeek",
+                "API error (401)".to_string(),
+            );
+            let v = serde_json::to_value(WirePrepaid::from_info(&info)).expect("serializes");
+            assert_eq!(v["error"], serde_json::json!("API error (401)"));
+            for k in ["balance_micros", "granted_micros", "topped_up_micros", "is_available", "currency"] {
+                assert!(v[k].is_null(), "{k} must be null on an errored probe, got {}", v[k]);
+            }
         }
     }
 }
