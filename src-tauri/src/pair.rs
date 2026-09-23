@@ -5061,7 +5061,11 @@ mod one_binding_store_tests {
             "an expired slot IS a credential this runner holds"
         );
         assert_eq!(
-            credential_state(SlotState::PresentButDead, false, SlotState::Absent).can_act(),
+            // `false`: an ABSENT legacy slot has no token to serve the default
+            // binding with, which is also what `legacy_slot_serves_default_tenant`
+            // answers for it. Irrelevant on this row anyway — `is_default` is
+            // false, so `credential_state` never consults it.
+            credential_state(SlotState::PresentButDead, false, SlotState::Absent, false).can_act(),
             Some(false),
             "…while the session-can-act question answers no — the two differ on purpose"
         );

@@ -22094,6 +22094,10 @@ mod spawn_tenant_credential_tests {
     #[test]
     fn a_provision_session_tenant_pins_the_minted_session_nonce() {
         let amb = crate::test_env::isolated_ambient();
+        // The mint route's binding is EPHEMERAL, and `live_binding` only
+        // answers for one while the opt-in marker is present — without this
+        // the nonce reads as unregistered and the pin is unobservable.
+        let _marker = MarkerOverride::set(true);
         amb.write_active_tenant_id(tenant_a());
         pair(tenant_b());
         let wd = workdir(&amb, "p2-pin");
@@ -22118,6 +22122,7 @@ mod spawn_tenant_credential_tests {
     #[test]
     fn a_tenantless_provision_session_is_unchanged() {
         let amb = crate::test_env::isolated_ambient();
+        let _marker = MarkerOverride::set(true);
         amb.write_active_tenant_id(tenant_a());
         let wd = workdir(&amb, "p2-none");
 
