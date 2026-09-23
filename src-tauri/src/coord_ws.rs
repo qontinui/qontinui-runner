@@ -8,10 +8,17 @@
 //! normalization and connect with a bare `?pattern=<redis glob>` and no
 //! credential. Plan
 //! `2026-09-13-coord-publishes-agent-jwts-on-a-redis-channel-fronted-by-an-unauthenticated-ws-firehose`
-//! Phase 2 closed that: coord now requires a device JWT at the upgrade and
-//! replaced the caller-supplied glob with a CLOSED set of named
-//! subscriptions, each mapped server-side to the pattern the TOKEN's
-//! principal is entitled to. `?pattern=` is refused 400 by that coord.
+//! Phase 2 closed that: every lane presents a device JWT and names one of
+//! coord's CLOSED set of subscriptions (`?subscribe=<name>`), which coord maps
+//! server-side to the pattern the TOKEN's principal is entitled to
+//! (qontinui-coord `crates/coord/src/ws.rs`, `resolve_subscription`). A
+//! `?subscribe=` upgrade with NO token is refused 403
+//! `subscription_scope_required`; a token that is present but bad is refused
+//! as a credential failure, never downgraded to anonymous. `?pattern=` is no
+//! longer how the scope is chosen: alongside a token it only narrows the
+//! principal's entitlement, and WITHOUT one it is admitted only inside a
+//! legacy allowlist (`anonymous_entitlement`) and refused 403
+//! `pattern_out_of_scope` outside it. This module never sends `?pattern=`.
 //!
 //! This module is the single place that knows both halves:
 //!
@@ -346,7 +353,8 @@ pub(crate) fn build_upgrade_request(
         warn!(
             "{lane}: no device JWT available for the coord /ws upgrade (unpaired runner, \
              empty credential slot, or unreadable secure storage) — connecting WITHOUT a \
-             credential; a coord that requires one will refuse the upgrade 401"
+             credential; coord refuses a tokenless `?subscribe=` upgrade 403 \
+             subscription_scope_required"
         );
     }
     upgrade_request_with(ws_url, token.as_deref())
@@ -376,9 +384,12 @@ fn upgrade_request_with(
 }
 
 /// Name an upgrade refusal so a 401/403 flap is diagnosable from the log: the
-/// HTTP status plus the `error` field of coord's JSON refusal body (coord's
-/// refusals are `{"error": "<code>", …}`). Only the code is logged, never the
-/// request — the URL carries the token.
+/// HTTP status plus the `error` field of coord's JSON refusal body. Coord's
+/// refusals are `{"error": "<message>", "code": "<code>", …}`, so what lands in
+/// `error=` is coord's human-readable MESSAGE; the machine code names quoted in
+/// the hints below (`subscription_scope_required`, …) are what that message
+/// corresponds to, not what is printed. Never the request — the URL carries
+/// the token.
 ///
 /// `pub(crate)`, not `pub`: [`connect`] is the only caller and the only way a
 /// lane obtains one of these errors, so a `pub` spelling advertised an entry
@@ -394,16 +405,20 @@ pub(crate) fn log_upgrade_failure(lane: &str, e: &tungstenite::Error) {
                 .unwrap_or_default();
             let hint = match status {
                 400 => {
-                    " — coord refused the request shape; a `?pattern=` query is no longer \
-                        accepted (this build sends `?subscribe=`, so check for a proxy rewrite)"
+                    " — the upgrade request itself was rejected before coord's /ws handler \
+                        answered (coord's scope refusals are 403, not 400); check for a proxy \
+                        rewrite of the URL"
                 }
                 401 => {
-                    " — coord requires a device JWT on the upgrade and none was accepted \
-                        (unpaired runner, expired credential, or revoked device)"
+                    " — a device JWT was presented and rejected (expired, from another coord, \
+                        bad signature or otherwise invalid, revoked, or coord holding no keys; \
+                        the error message says which); a MISSING JWT is refused 403 instead"
                 }
                 403 => {
-                    " — the credential was accepted but this subscription is not admitted \
-                        for its principal"
+                    " — not admitted: no credential was sent (coord code \
+                        subscription_scope_required), the credential verified but is a \
+                        capability grant rather than a principal, or the principal cannot \
+                        resolve this subscription"
                 }
                 _ => "",
             };

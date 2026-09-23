@@ -10,11 +10,14 @@
 //!
 //! Coord dual-publishes the request on
 //! `qontinui.sessions.<tenant>.<target-device>.respawn_request`, i.e. the
-//! subject family [`super::handoff`] already PSUBSCRIBEs as
-//! `qontinui.sessions.*`. So this module adds **no second socket, no second
-//! poll loop and no new pattern** — [`super::handoff::connect_and_pump`]
-//! forwards every frame here as well, and [`super::handoff::run_catchup`]
-//! runs the respawn catch-up alongside the handoff one.
+//! subject family [`super::handoff`] already receives through the
+//! `?subscribe=sessions` lane, which coord resolves from the upgrade credential
+//! to `qontinui.sessions.<tenant>.<self-device>.*` (see
+//! `qontinui_runner_lib::coord_ws::Subscription::Sessions`). So this module
+//! adds **no second socket, no second poll loop and no new pattern** —
+//! [`super::handoff::connect_and_pump`] forwards every frame here as well, and
+//! [`super::handoff::run_catchup`] runs the respawn catch-up alongside the
+//! handoff one.
 //!
 //! ⚠️ The two arms are disambiguated ONLY by the channel's trailing segment.
 //! The shipped [`super::handoff::parse_handoff_push`] filters on

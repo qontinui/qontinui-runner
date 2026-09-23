@@ -56,9 +56,10 @@
 //!
 //!    The tick drives only the arms with no OTHER periodic owner — handoff
 //!    and respawn. The remote-attach and remote-create arms that share this
-//!    socket's on-connect replay each already have their own 60 s poll task
-//!    in `main.rs`, on the same period, so putting them on this tick as well
-//!    would double their GETs and deliver nothing sooner.
+//!    socket's on-connect replay each already have their own poll task in
+//!    `main.rs` (`attach::POLL_INTERVAL`, `create::POLL_INTERVAL`), each at
+//!    least as frequent as this tick, so putting them on this tick as well
+//!    would add GETs and deliver nothing sooner.
 //!    [`catchups_for`] is where that split lives.
 //!
 //! ## Receiver flow (one handoff)
