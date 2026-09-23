@@ -57,10 +57,15 @@ pub enum RestoreTier {
 ///   `RestoreTier` union in `src/components/terminal/providerAdapter.ts`, and the
 ///   `"terminal-only"` arm of `classifyRestoreAction`'s `RestoreAction`.
 ///
-/// Neither spelling is written out anywhere else in Rust: every producer and
-/// parser goes through these four functions, so the underscore/hyphen fork is
-/// an explicit conversion at a named seam rather than two literals that happen
-/// to disagree. The cross-seam fixture
+/// In production Rust code the RESTORE-TIER wire vocabulary is written only
+/// here: the emitter's `TIER_FULL` / `TIER_TERMINAL_ONLY` are const-derived
+/// from [`RestoreTier::wire_str`], and `handoff` parses a peer's payload with
+/// [`RestoreTier::from_wire_str`] — so the underscore/hyphen fork is an
+/// explicit conversion at a named seam rather than two literals that happen to
+/// disagree. (Doc comments and test fixtures still quote the literals; the
+/// lifecycle store's `"terminal-only"` is the outcome vocabulary below, a
+/// different concept that happens to share the frontend spelling.) The
+/// cross-seam fixture
 /// (`src/components/terminal/__fixtures__/restore-tier-crossproduct.json`)
 /// carries both spellings per row and both test suites read it.
 ///
