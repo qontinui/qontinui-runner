@@ -404,6 +404,9 @@ async fn sign_out_full_impl() -> Result<(), AppError> {
 
     let auth_manager = AuthManager::new();
     auth_manager.clear_all_credentials()?;
+    // Recorded binding-gap asks, and the bound set they came from, name the
+    // tenants of the account that just left.
+    crate::mcp::device_jwt_refresher::forget_binding_gap_evidence();
     // A pending GitHub connect is bound to the identity that just left.
     crate::commands::setup_wizard::clear_pending_connect();
 
@@ -442,6 +445,9 @@ pub async fn reset_credential_store() -> Result<(), String> {
         error!("reset_credential_store: {msg}");
         msg
     })?;
+    // The recorded binding-gap asks and bound set may name another account's
+    // tenants now.
+    crate::mcp::device_jwt_refresher::forget_binding_gap_evidence();
     info!(
         "reset_credential_store: credential store deleted — LoginScreen sign-in will start fresh"
     );
@@ -1494,6 +1500,9 @@ pub async fn qontinui_sign_out() -> Result<(), String> {
             e
         );
     }
+    // The account-switch path: recorded binding-gap asks and the bound set
+    // they came from belong to the account that is leaving.
+    crate::mcp::device_jwt_refresher::forget_binding_gap_evidence();
     // A pending GitHub connect (setup-wizard clone picker) holds a coord
     // connect-state minted under the account that is leaving; the next
     // account's click must mint its own rather than reuse it.
@@ -1621,6 +1630,51 @@ pub async fn get_coord_credential_posture() -> Option<serde_json::Value> {
     crate::mcp::device_jwt_refresher::coord_credential_posture().map(|s| s.to_json())
 }
 
+/// Read the OPEN binding-gap asks — one per bound tenant this device holds no
+/// credential for, recorded once per lapse by the device-JWT refresher.
+///
+/// The PULL half of the ask (plan
+/// `2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin`,
+/// route-around review MAJOR 4). The `autonomy-binding-gap` event has no
+/// replay, so an ask recorded before the UI registered its listener would
+/// otherwise be spent on nobody; the UI reads this on mount and on every
+/// nudge. `null` means the record's path could not be resolved on this box —
+/// UNKNOWN, not "no asks".
+#[tauri::command]
+pub async fn get_binding_gap_asks() -> Option<Vec<serde_json::Value>> {
+    let path = crate::mcp::device_jwt_refresher::binding_gap_ask_path()?;
+    tokio::task::spawn_blocking(move || {
+        // Re-checked against coord's bound set under the ask window on EVERY
+        // read: an ask outlives the pass that recorded it, and must not keep
+        // asking to re-pair a tenant coord unbound while the heartbeat was down.
+        // A tenant that now holds a slot is no longer asked about; an
+        // unreadable store is UNKNOWN (null), never "no asks".
+        // A signed-out box (no credential in any slot) serves no asks.
+        let bound = qontinui_runner_lib::pair::coord_bound_tenants_for_ask();
+        let am = crate::auth::AuthManager::new();
+        let slots = am.try_list_tenant_device_jwt_tenants().ok();
+        let legacy = am
+            .get_access_token()
+            .map(|t| !t.trim().is_empty())
+            .unwrap_or(false);
+        // Asks are served only to the signed-in account that owns them.
+        let account = crate::mcp::device_jwt_refresher::binding_gap_ask_account(
+            legacy,
+            slots.as_deref(),
+            qontinui_runner_lib::pair::read_paired_user_id_from_disk(),
+        );
+        crate::mcp::device_jwt_refresher::open_binding_gap_asks(
+            &path,
+            &bound,
+            slots.as_deref(),
+            account.as_deref(),
+        )
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 /// Build the Tauri plugin that registers this module's command handlers.
 ///
 /// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
@@ -1645,6 +1699,7 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             get_coord_device_token,
             kick_device_jwt_refresher_cmd,
             get_coord_credential_posture,
+            get_binding_gap_asks,
         ])
         .build()
 }

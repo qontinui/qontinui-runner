@@ -2775,6 +2775,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::auth::get_runner_tier,
             commands::auth::kick_device_jwt_refresher_cmd,
             commands::auth::get_coord_credential_posture,
+            commands::auth::get_binding_gap_asks,
             commands::auth::logout,
             commands::auth::qontinui_sign_out,
             commands::auth::reset_credential_store,
