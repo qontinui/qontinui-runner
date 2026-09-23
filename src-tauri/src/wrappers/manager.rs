@@ -145,7 +145,12 @@ impl WrapperManager {
             ));
         }
 
-        self.retire_unroutable(wrapper_id).await;
+        // Re-check under ONE write lock: the health loop (which does not take
+        // the spawn lock) may have flipped a Degraded record back to Running
+        // since the fast path missed, in which case that record wins.
+        if let ExistingRecord::Routable(port) = self.claim_or_retire(wrapper_id).await {
+            return Ok(port);
+        }
 
         let port = pick_free_port()
             .map_err(|e| format!("failed to allocate port for '{}': {}", wrapper_id, e))?;
@@ -212,70 +217,38 @@ impl WrapperManager {
         Ok(port)
     }
 
-    /// Tear down a runtime record that is present but NOT routable (i.e.
-    /// `Degraded`) before `spawn` replaces it. Such a record still owns its
-    /// subprocess — which is why the UI offers Stop for it — and replacing it
-    /// via `insert` would drop that `Child` handle without killing it,
-    /// orphaning the process. A routable record is never touched (the fast
-    /// path returns it). Returns whether a record was retired.
-    async fn retire_unroutable(&self, wrapper_id: &str) -> bool {
-        let unroutable = self
-            .runtimes
-            .read()
-            .await
-            .get(wrapper_id)
-            .is_some_and(|rt| rt.state != WrapperState::Running);
-        if !unroutable {
-            return false;
+    /// Settle an existing runtime record before `spawn` replaces it,
+    /// atomically: under ONE write lock, a Running record is kept and its port
+    /// returned (spawn must not start a second process), and any other record
+    /// (Degraded) is REMOVED; its child is then killed and reaped outside the
+    /// lock. A Degraded record still owns its subprocess — which is why the
+    /// UI offers Stop for it — and letting `spawn`'s `insert` replace it would
+    /// drop that `Child` handle without killing it, orphaning the process.
+    /// A separate read-then-stop would race the health loop, which can flip
+    /// Degraded -> Running between the two without holding the spawn lock.
+    async fn claim_or_retire(&self, wrapper_id: &str) -> ExistingRecord {
+        let removed = {
+            let mut runtimes = self.runtimes.write().await;
+            match runtimes.get(wrapper_id) {
+                Some(rt) if rt.state == WrapperState::Running => {
+                    return ExistingRecord::Routable(rt.port);
+                }
+                Some(_) => runtimes.remove(wrapper_id),
+                None => return ExistingRecord::Absent,
+            }
+        };
+        if let Some(runtime) = removed {
+            terminate_runtime(wrapper_id, runtime).await;
         }
-        if let Err(e) = self.stop(wrapper_id).await {
-            warn!(
-                "wrappers: stop('{}') before respawning a non-routable record failed: {}",
-                wrapper_id, e
-            );
-        }
-        true
+        ExistingRecord::Retired
     }
 
     /// Stop a running wrapper. SIGTERM first, then force-kill after
     /// `STOP_GRACE` if the child hasn't exited.
     pub async fn stop(&self, wrapper_id: &str) -> Result<(), String> {
-        let mut runtime = match self.runtimes.write().await.remove(wrapper_id) {
-            Some(rt) => rt,
-            None => return Ok(()), // No-op if not running
-        };
-        let mut child = match runtime.child.take() {
-            Some(c) => c,
-            None => return Ok(()),
-        };
-
-        // tokio::process::Child has `start_kill` which on Windows uses
-        // TerminateProcess and on unix sends SIGKILL. There's no portable
-        // SIGTERM equivalent in tokio; on Windows the runner's other
-        // managers (ProcessCaptureManager) also use TerminateProcess, so
-        // we follow that precedent. If a wrapper needs graceful shutdown
-        // semantics it should declare its own /shutdown HTTP path which
-        // higher-level callers can invoke before `stop`.
-        if let Err(e) = child.start_kill() {
-            warn!(
-                "wrappers: start_kill('{}') failed: {} — proceeding to wait",
-                wrapper_id, e
-            );
-        }
-
-        // Wait up to STOP_GRACE for the child to exit.
-        match tokio::time::timeout(STOP_GRACE, child.wait()).await {
-            Ok(Ok(status)) => {
-                debug!("wrappers: '{}' exited with {}", wrapper_id, status);
-            }
-            Ok(Err(e)) => warn!("wrappers: wait('{}') failed: {}", wrapper_id, e),
-            Err(_) => {
-                warn!(
-                    "wrappers: '{}' did not exit within {:?}, killing",
-                    wrapper_id, STOP_GRACE
-                );
-                let _ = child.kill().await;
-            }
+        let removed = self.runtimes.write().await.remove(wrapper_id);
+        if let Some(runtime) = removed {
+            terminate_runtime(wrapper_id, runtime).await;
         }
         Ok(())
     }
@@ -543,6 +516,56 @@ pub fn node_available() -> bool {
         .unwrap_or(false)
 }
 
+/// What `claim_or_retire` found for a wrapper about to be (re)spawned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingRecord {
+    /// A Running record exists; `spawn` returns this port.
+    Routable(u16),
+    /// A non-routable (Degraded) record existed and was removed + terminated.
+    Retired,
+    /// No record — nothing to settle.
+    Absent,
+}
+
+/// Kill and reap a runtime record's child that has ALREADY been removed from
+/// the map (so no lock is held while waiting). SIGTERM-equivalent first, then
+/// force-kill after `STOP_GRACE` if the child hasn't exited.
+async fn terminate_runtime(wrapper_id: &str, mut runtime: WrapperRuntime) {
+    let mut child = match runtime.child.take() {
+        Some(c) => c,
+        None => return,
+    };
+
+    // tokio::process::Child has `start_kill` which on Windows uses
+    // TerminateProcess and on unix sends SIGKILL. There's no portable
+    // SIGTERM equivalent in tokio; on Windows the runner's other
+    // managers (ProcessCaptureManager) also use TerminateProcess, so
+    // we follow that precedent. If a wrapper needs graceful shutdown
+    // semantics it should declare its own /shutdown HTTP path which
+    // higher-level callers can invoke before `stop`.
+    if let Err(e) = child.start_kill() {
+        warn!(
+            "wrappers: start_kill('{}') failed: {} — proceeding to wait",
+            wrapper_id, e
+        );
+    }
+
+    // Wait up to STOP_GRACE for the child to exit.
+    match tokio::time::timeout(STOP_GRACE, child.wait()).await {
+        Ok(Ok(status)) => {
+            debug!("wrappers: '{}' exited with {}", wrapper_id, status);
+        }
+        Ok(Err(e)) => warn!("wrappers: wait('{}') failed: {}", wrapper_id, e),
+        Err(_) => {
+            warn!(
+                "wrappers: '{}' did not exit within {:?}, killing",
+                wrapper_id, STOP_GRACE
+            );
+            let _ = child.kill().await;
+        }
+    }
+}
+
 /// Provided so the bare `Path` import is exercised; future install code
 /// will resolve `<root>/<id>` via this.
 #[allow(dead_code)]
@@ -599,33 +622,43 @@ mod tests {
     /// the decision half is covered cross-platform below.
     #[cfg(unix)]
     #[tokio::test]
-    async fn retire_unroutable_kills_the_degraded_child() {
+    async fn claim_or_retire_kills_the_degraded_child() {
         let (manager, _tmp) = manager_with(WrapperState::Degraded).await;
         let child = Command::new("sleep").arg("30").spawn().unwrap();
         let pid = child.id().unwrap();
         manager.runtimes.write().await.get_mut("w").unwrap().child = Some(child);
 
-        assert!(manager.retire_unroutable("w").await);
+        assert_eq!(manager.claim_or_retire("w").await, ExistingRecord::Retired);
         assert_eq!(manager.status("w").await.state, WrapperState::Stopped);
-        // The process is gone (reaped by `stop`'s wait): signal 0 fails.
+        // The process is gone (reaped by `terminate_runtime`): signal 0 fails.
         let alive = std::process::Command::new("kill")
             .args(["-0", &pid.to_string()])
             .status()
             .unwrap()
             .success();
-        assert!(!alive, "degraded child {pid} survived retire_unroutable");
+        assert!(!alive, "degraded child {pid} survived claim_or_retire");
     }
 
-    /// Decision half: a routable (Running) record is never retired, and an
-    /// absent record is a no-op.
+    /// Decision half: a Running record is returned untouched (spawn must not
+    /// start a second process — the health-loop race case), a Degraded one is
+    /// retired, and an absent one is a no-op.
     #[tokio::test]
-    async fn retire_unroutable_leaves_running_and_absent_alone() {
+    async fn claim_or_retire_keeps_running_retires_degraded_ignores_absent() {
         let (manager, _tmp) = manager_with(WrapperState::Running).await;
-        assert!(!manager.retire_unroutable("w").await);
+        assert_eq!(
+            manager.claim_or_retire("w").await,
+            ExistingRecord::Routable(41234)
+        );
         assert_eq!(manager.port_for("w").await, Some(41234));
-        assert!(!manager.retire_unroutable("absent").await);
+        assert_eq!(manager.status("w").await.state, WrapperState::Running);
+
+        assert_eq!(
+            manager.claim_or_retire("absent").await,
+            ExistingRecord::Absent
+        );
+
         let (degraded, _tmp2) = manager_with(WrapperState::Degraded).await;
-        assert!(degraded.retire_unroutable("w").await);
+        assert_eq!(degraded.claim_or_retire("w").await, ExistingRecord::Retired);
         assert_eq!(degraded.status("w").await.state, WrapperState::Stopped);
     }
 
