@@ -1892,7 +1892,7 @@ fn cap_chars(value: Option<String>, max: usize) -> Option<String> {
 // ----------------------------------------------------------------------------
 
 /// The `ref` side: the stems the adapter's WORK-UNIT half lists at the fetched
-/// default branch ([`super::ref_scan::read_ref_dir`]).
+/// default branch ([`super::ref_scan::read_ref_dir_at`]).
 pub const SLUG_CENSUS_SOURCE_REF: &str = "ref";
 
 /// The `work_tree` side: the stems the BODY SYNC's own walk sees on disk
