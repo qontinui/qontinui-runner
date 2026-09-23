@@ -417,9 +417,12 @@ your session advertises, and verify by read — a zero exit is not evidence the
 write landed. The declaration is STORED on the unit, so one you did not earn is
 a false witness statement with your actor key beside it.
 
-⚠️ **Never re-allocate to get past a refusal** — a fresh allocate issues a NEW
-agent id the legacy compare would admit, which the refusal itself names *"a
-known defect being tracked, not a sanctioned route"*.
+⚠️ **Never re-allocate to get past `self_attestation_forbidden`** — a fresh
+allocate issues a NEW agent id the legacy compare would admit, which that
+refusal itself names *"a known defect being tracked, not a sanctioned route"*.
+That prohibition is that refusal's alone: `attester_unresolved` wants a device-
+or agent-identified caller, which is a credential remedy rather than a route
+around a control.
 
 What you may safely rely on, because it is mechanism rather than policy: the
 plan FILE's own status stamp is always yours to write, and the coord transition
