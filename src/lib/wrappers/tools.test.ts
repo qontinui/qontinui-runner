@@ -11,7 +11,7 @@ import type { InstalledWrapper, WrapperTransport } from "./types";
 function wrapper(transport: WrapperTransport): InstalledWrapper {
   return {
     id: `w-${transport}`,
-    packageName: "@acme/w",
+    package_name: "@acme/w",
     version: "1.0.0",
     manifest: { manifestVersion: 1, id: `w-${transport}`, displayName: "W", transport },
     actions: [],
