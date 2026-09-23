@@ -78,9 +78,9 @@ describe("ruleStuckNeedsInput", () => {
       stateEntryMs: { "t-a": NOW - 20_000 },
     });
     expect(ruleStuckNeedsInput(baseCtx)).toEqual([]);
-    expect(
-      ruleStuckNeedsInput({ ...baseCtx, stateEntryMs: { "t-a": NOW - 31_000 } }),
-    ).toHaveLength(1);
+    expect(ruleStuckNeedsInput({ ...baseCtx, stateEntryMs: { "t-a": NOW - 31_000 } })).toHaveLength(
+      1,
+    );
   });
 
   it("formats elapsed time into s/m/h buckets", () => {
@@ -108,6 +108,22 @@ describe("ruleStuckNeedsInput", () => {
 });
 
 describe("ruleLayoutMismatch", () => {
+  it("suggests flow-grid past 9 tabs — the canonical ladder, not a capped copy", () => {
+    // The file's former private copy topped out at full-grid, which cannot
+    // show 12 tabs; the canonical pickLayout grows into flow-grid.
+    const [chip] = ruleLayoutMismatch(
+      ctx({ tabsCount: 12, zoneCount: 9, currentLayoutId: "full-grid" }),
+    );
+    expect(chip.args).toEqual({ preset: "flow-grid" });
+    expect(chip.slash).toBe("/layout flow-grid");
+    expect(chip.headline).toBe("Switch to Flow Grid — show all 12 sessions");
+  });
+
+  it("names a fixed preset by the preset table's display name", () => {
+    const [chip] = ruleLayoutMismatch(ctx({ tabsCount: 7, zoneCount: 4, currentLayoutId: "quad" }));
+    expect(chip.headline).toBe("Switch to Full Grid — show all 7 sessions");
+  });
+
   it("fires when tabsCount > zoneCount * 1.2 AND suggested preset differs", () => {
     expect(
       ruleLayoutMismatch(
