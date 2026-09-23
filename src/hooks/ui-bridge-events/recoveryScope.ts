@@ -196,12 +196,13 @@ export function recoveryVerdict(result: unknown): RecoveryVerdict {
  * `attemptSucceeded`, the scoped-attempt verdict `as_recovery_failure`
  * (`ai_analyze.rs`) keys its Ok-arm on, and
  * `code`, which stays alongside it so a data-only reader still sees the typed
- * token. Fields already present here win over the stamped ones, so setting
+ * token. Fields already present here win over the stamped ones, and `extra` is
+ * spread FIRST so it can never overwrite `code` or the verdict — setting
  * `attemptSucceeded: true` from a failure path is not possible by accident.
  */
 export function recoveryFailureData(
   code: string,
   extra: Record<string, unknown> = {},
 ): Record<string, unknown> {
-  return { code, attemptSucceeded: false, ...extra };
+  return { ...extra, code, attemptSucceeded: false };
 }

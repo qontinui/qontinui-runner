@@ -691,8 +691,15 @@ pub fn classify_transport_error(error_msg: &str) -> UiBridgeError {
     if let Some(typed) = typed_frontend_code(error_msg) {
         return typed;
     }
-    // Transport-level errors
-    if error_msg.contains("did not become ready") {
+    // Transport-level errors.
+    //
+    // The readiness gate (`request::ui_bridge_request_sync_in_window`) fails
+    // with the SERIALIZED `gather_readiness_diagnostics` body, whose marker is
+    // `"error":"frontend_not_ready"` — it never contains the prose "did not
+    // become ready" (only its serialization-failure fallback does). Matching
+    // the prose alone classified every real readiness timeout as
+    // `INTERNAL_ERROR` (HTTP 500) instead of `FRONTEND_NOT_READY` (503).
+    if error_msg.contains("did not become ready") || error_msg.contains("\"frontend_not_ready\"") {
         // Try to parse the diagnostics JSON that gather_readiness_diagnostics produced
         let diagnostics = serde_json::from_str::<serde_json::Value>(error_msg)
             .unwrap_or_else(|_| serde_json::json!({"raw": error_msg}));

@@ -571,22 +571,64 @@ async fn bridge_mutation(
     params: serde_json::Value,
 ) -> Result<ActionResult> {
     let start = std::time::Instant::now();
-    match ui_bridge::ui_bridge_request_sync(state, command, params).await {
-        Ok(data) => Ok(ActionResult {
+    let result = ui_bridge::ui_bridge_request_sync(state, command, params).await;
+    Ok(action_result_for(
+        result,
+        start.elapsed().as_millis().to_string(),
+    ))
+}
+
+/// Map a UI Bridge IPC result onto an [`ActionResult`] with the SAME verdict
+/// and classification the HTTP surface gives it (`request::wrap_ipc_result`).
+///
+/// A frontend refusal does not arrive as `Err`: the IPC round-trip succeeds and
+/// carries `{success: false, error, code}` in `Ok`. Only transport failures
+/// (timeout, readiness, circuit breaker, concurrency) are `Err`. So both arms
+/// can fail:
+///
+/// - `Ok` with `success == false` → failure; the handler's own typed `code`
+///   field wins (`typed_frontend_code_by_name`), else the error message is
+///   classified. The payload is kept in `data` for context.
+/// - `Ok` otherwise (`success` true or absent) → success.
+/// - `Err` → failure, classified from the transport message.
+fn action_result_for(
+    result: std::result::Result<serde_json::Value, String>,
+    duration_ms: String,
+) -> ActionResult {
+    match result {
+        Ok(data) if data.get("success").and_then(|v| v.as_bool()) == Some(false) => {
+            let error_msg = data
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| "UI bridge call failed".to_string());
+            let classified = data
+                .get("code")
+                .and_then(|v| v.as_str())
+                .and_then(|name| ui_bridge::types::typed_frontend_code_by_name(name, &error_msg))
+                .unwrap_or_else(|| ui_bridge::classify_transport_error(&error_msg));
+            ActionResult {
+                success: false,
+                data: Some(Json(data)),
+                error: Some(error_detail_from(classified, error_msg)),
+                duration_ms,
+            }
+        }
+        Ok(data) => ActionResult {
             success: true,
             data: Some(Json(data)),
             error: None,
-            duration_ms: start.elapsed().as_millis().to_string(),
-        }),
-        Err(e) => {
-            let error_detail = error_detail_for(e);
-            Ok(ActionResult {
-                success: false,
-                data: None,
-                error: Some(error_detail),
-                duration_ms: start.elapsed().as_millis().to_string(),
-            })
-        }
+            duration_ms,
+        },
+        Err(e) => ActionResult {
+            success: false,
+            data: None,
+            error: Some(error_detail_from(
+                ui_bridge::classify_transport_error(&e),
+                e,
+            )),
+            duration_ms,
+        },
     }
 }
 
@@ -603,16 +645,18 @@ fn gql_status_to_domain(status: GqlFindingStatus) -> crate::findings::types::Fin
     }
 }
 
-/// Classify a UI Bridge failure through the SAME classifier the HTTP surface
-/// uses (`classify_transport_error`), so a GraphQL client sees the identical
-/// code, recovery hint and context an MCP/HTTP caller would. A private
-/// substring classifier stood here until 2026-09-23; it could only ever emit
-/// the 13 codes the old hand-copied GraphQL enum carried.
-fn error_detail_for(error_msg: String) -> super::types::UiBridgeErrorDetail {
-    let classified = ui_bridge::classify_transport_error(&error_msg);
+/// Build the GraphQL error detail from a canonical classification, so a
+/// GraphQL client sees the identical code, recovery hint and context an
+/// MCP/HTTP caller would. A private substring classifier stood here until
+/// 2026-09-23; it could only ever emit the 13 codes the old hand-copied
+/// GraphQL enum carried.
+fn error_detail_from(
+    classified: ui_bridge::UiBridgeError,
+    message: String,
+) -> super::types::UiBridgeErrorDetail {
     super::types::UiBridgeErrorDetail {
         code: classified.code,
-        message: error_msg,
+        message,
         recovery: classified.recovery.as_ref().map(recovery_hint_wire),
         context: classified.context.map(Json),
     }
@@ -633,28 +677,107 @@ fn recovery_hint_wire(hint: &ui_bridge::RecoveryHint) -> String {
 mod tests {
     use super::*;
     use crate::graphql::types::UiBridgeErrorCode;
+    use serde_json::json;
 
-    /// A handler's typed frontend code — one the retired private classifier
-    /// could not name, because the old GraphQL enum lacked it — reaches the
-    /// GraphQL detail with the canonical code and hint.
+    fn run(result: std::result::Result<serde_json::Value, String>) -> ActionResult {
+        action_result_for(result, "0".into())
+    }
+
+    /// A frontend refusal arrives as `Ok({success:false, error, code})`, not
+    /// `Err`. It must be a failure carrying the handler's own typed code — a
+    /// code the retired private classifier could not even name.
     #[test]
-    fn error_detail_carries_typed_frontend_code_and_hint() {
-        let detail = error_detail_for("SEND_KEYS_INVALID: 'modifiers' must be an array".into());
+    fn frontend_refusal_in_ok_is_a_failure_with_its_typed_code() {
+        let out = run(Ok(json!({
+            "success": false,
+            "error": "SEND_KEYS_INVALID: 'modifiers' must be an array",
+            "code": "SEND_KEYS_INVALID",
+        })));
+        assert!(!out.success);
+        let detail = out.error.expect("failure carries a detail");
         assert_eq!(detail.code, UiBridgeErrorCode::SendKeysInvalid);
         assert_eq!(detail.recovery.as_deref(), Some("FIX_REQUEST"));
         assert_eq!(
             detail.message,
             "SEND_KEYS_INVALID: 'modifiers' must be an array"
         );
+        assert!(
+            out.data.is_some(),
+            "the refusal payload is kept for context"
+        );
+    }
+
+    /// With no `code` field the message is classified — including the
+    /// `"<CODE>: "` prefix contract.
+    #[test]
+    fn frontend_refusal_without_code_field_is_classified_from_message() {
+        let out = run(Ok(json!({
+            "success": false,
+            "error": "TERMINAL_NO_MOUNTED_VIEW: terminal has no mounted view",
+        })));
+        assert!(!out.success);
+        assert_eq!(
+            out.error.unwrap().code,
+            UiBridgeErrorCode::TerminalNoMountedView
+        );
+    }
+
+    /// Positive controls: `success: true` and absent `success` stay success.
+    #[test]
+    fn healthy_ok_stays_success() {
+        for data in [
+            json!({ "success": true, "clicked": true }),
+            json!({ "clicked": true }),
+        ] {
+            let out = run(Ok(data.clone()));
+            assert!(out.success, "{data} is a healthy response");
+            assert!(out.error.is_none());
+            assert_eq!(out.data.map(|j| j.0), Some(data));
+        }
     }
 
     #[test]
-    fn error_detail_renders_data_carrying_hint_as_json() {
-        let detail = error_detail_for("request timed out after 5000ms".into());
+    fn transport_timeout_renders_data_carrying_hint_as_json() {
+        let out = run(Err("UI Bridge request timed out after 5000ms".into()));
+        assert!(!out.success);
+        let detail = out.error.unwrap();
         assert_eq!(detail.code, UiBridgeErrorCode::Timeout);
         assert_eq!(
             detail.recovery.as_deref(),
             Some(r#"{"RETRY_AFTER_MS":1000}"#)
+        );
+    }
+
+    /// The exact string `request.rs` returns when the permit wait times out.
+    #[test]
+    fn transport_concurrency_limit_is_classified() {
+        let out = run(Err(
+            "UI Bridge concurrency limit reached (timeout acquiring permit)".into(),
+        ));
+        assert_eq!(
+            out.error.unwrap().code,
+            UiBridgeErrorCode::ConcurrencyLimitReached
+        );
+    }
+
+    /// The readiness gate returns the SERIALIZED `gather_readiness_diagnostics`
+    /// body (shape copied from `request.rs`). It must classify as
+    /// `FRONTEND_NOT_READY` with the diagnostics as context — before this
+    /// change the shared classifier only matched prose this body never
+    /// contains, and answered `INTERNAL_ERROR` on HTTP as well.
+    #[test]
+    fn transport_readiness_diagnostics_json_is_frontend_not_ready() {
+        let body = json!({
+            "error": "frontend_not_ready",
+            "diagnostics": { "last_pong_age_ms": null, "sdk_connected": false, "hint": "x" }
+        });
+        let out = run(Err(serde_json::to_string(&body).unwrap()));
+        let detail = out.error.unwrap();
+        assert_eq!(detail.code, UiBridgeErrorCode::FrontendNotReady);
+        assert_eq!(detail.context.map(|j| j.0), Some(body));
+        assert_eq!(
+            detail.recovery.as_deref(),
+            Some(r#"{"RETRY_AFTER_MS":2000}"#)
         );
     }
 }

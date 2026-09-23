@@ -166,7 +166,12 @@ describe("recoveryFailureData (item 4)", () => {
   });
 
   it("carries the caller's context through without letting it overwrite the verdict", () => {
-    const out = recoveryFailureData(RECOVERY_TARGET_MISSING, { elementId: "btn-1" });
+    const out = recoveryFailureData(RECOVERY_TARGET_MISSING, {
+      elementId: "btn-1",
+      // Hostile/mistaken context: both keys must lose to the failure verdict.
+      attemptSucceeded: true,
+      code: "SOMETHING_ELSE",
+    });
     expect(out.elementId).toBe("btn-1");
     expect(out.attemptSucceeded).toBe(false);
     expect(out.code).toBe(RECOVERY_TARGET_MISSING);
