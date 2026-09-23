@@ -579,12 +579,7 @@ async fn bridge_mutation(
             duration_ms: start.elapsed().as_millis().to_string(),
         }),
         Err(e) => {
-            let error_detail = super::types::UiBridgeErrorDetail {
-                code: classify_error(&e),
-                message: e,
-                recovery: None,
-                context: None,
-            };
+            let error_detail = error_detail_for(e);
             Ok(ActionResult {
                 success: false,
                 data: None,
@@ -608,35 +603,58 @@ fn gql_status_to_domain(status: GqlFindingStatus) -> crate::findings::types::Fin
     }
 }
 
-/// Classify an error message into a typed error code.
-fn classify_error(error_msg: &str) -> super::types::UiBridgeErrorCode {
-    use super::types::UiBridgeErrorCode;
-    let msg = error_msg.to_lowercase();
-    if msg.contains("timed out") || msg.contains("timeout") {
-        UiBridgeErrorCode::Timeout
-    } else if msg.contains("circuit breaker") {
-        UiBridgeErrorCode::CircuitBreakerOpen
-    } else if msg.contains("concurrency") || msg.contains("semaphore") {
-        UiBridgeErrorCode::ConcurrencyLimitReached
-    } else if msg.contains("unresponsive") || msg.contains("not responsive") {
-        UiBridgeErrorCode::FrontendUnresponsive
-    } else if msg.contains("not found") && msg.contains("window") {
-        UiBridgeErrorCode::WindowNotFound
-    } else if msg.contains("not found") && msg.contains("element") {
-        UiBridgeErrorCode::ElementNotFound
-    } else if msg.contains("not visible") {
-        UiBridgeErrorCode::ElementNotVisible
-    } else if msg.contains("not enabled") || msg.contains("disabled") {
-        UiBridgeErrorCode::ElementNotEnabled
-    } else if msg.contains("stale") {
-        UiBridgeErrorCode::ElementStale
-    } else if msg.contains("action failed") {
-        UiBridgeErrorCode::ActionFailed
-    } else if msg.contains("assertion") && msg.contains("failed") {
-        UiBridgeErrorCode::AssertionFailed
-    } else if msg.contains("unknown") && msg.contains("assertion") {
-        UiBridgeErrorCode::UnknownAssertionType
-    } else {
-        UiBridgeErrorCode::InternalError
+/// Classify a UI Bridge failure through the SAME classifier the HTTP surface
+/// uses (`classify_transport_error`), so a GraphQL client sees the identical
+/// code, recovery hint and context an MCP/HTTP caller would. A private
+/// substring classifier stood here until 2026-09-23; it could only ever emit
+/// the 13 codes the old hand-copied GraphQL enum carried.
+fn error_detail_for(error_msg: String) -> super::types::UiBridgeErrorDetail {
+    let classified = ui_bridge::classify_transport_error(&error_msg);
+    super::types::UiBridgeErrorDetail {
+        code: classified.code,
+        message: error_msg,
+        recovery: classified.recovery.as_ref().map(recovery_hint_wire),
+        context: classified.context.map(Json),
+    }
+}
+
+/// The recovery hint's serde wire spelling as a string: `"RESNAPSHOT"` for a
+/// unit hint, the compact JSON (`{"RETRY_AFTER_MS":1000}`) for a data-carrying
+/// one — the same value an HTTP caller reads under `recovery`.
+fn recovery_hint_wire(hint: &ui_bridge::RecoveryHint) -> String {
+    match serde_json::to_value(hint) {
+        Ok(serde_json::Value::String(s)) => s,
+        Ok(other) => other.to_string(),
+        Err(e) => format!("UNSERIALIZABLE_RECOVERY_HINT: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graphql::types::UiBridgeErrorCode;
+
+    /// A handler's typed frontend code — one the retired private classifier
+    /// could not name, because the old GraphQL enum lacked it — reaches the
+    /// GraphQL detail with the canonical code and hint.
+    #[test]
+    fn error_detail_carries_typed_frontend_code_and_hint() {
+        let detail = error_detail_for("SEND_KEYS_INVALID: 'modifiers' must be an array".into());
+        assert_eq!(detail.code, UiBridgeErrorCode::SendKeysInvalid);
+        assert_eq!(detail.recovery.as_deref(), Some("FIX_REQUEST"));
+        assert_eq!(
+            detail.message,
+            "SEND_KEYS_INVALID: 'modifiers' must be an array"
+        );
+    }
+
+    #[test]
+    fn error_detail_renders_data_carrying_hint_as_json() {
+        let detail = error_detail_for("request timed out after 5000ms".into());
+        assert_eq!(detail.code, UiBridgeErrorCode::Timeout);
+        assert_eq!(
+            detail.recovery.as_deref(),
+            Some(r#"{"RETRY_AFTER_MS":1000}"#)
+        );
     }
 }

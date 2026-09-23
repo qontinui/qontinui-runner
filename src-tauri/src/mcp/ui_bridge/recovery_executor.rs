@@ -60,7 +60,15 @@ pub struct RecoverySuggestion {
 #[serde(rename_all = "camelCase")]
 pub struct RecoveryOutcome {
     /// `true` when either the structured command-retry path or the LLM
-    /// fallback ultimately made the original action succeed.
+    /// fallback ultimately made the ORIGINAL action succeed, re-verified by an
+    /// independent retry ([`original_action_now_succeeds`]).
+    ///
+    /// NOT the frontend's `attemptSucceeded` (the `ai_recovery_attempt`
+    /// payload, which decides `/ai/recovery/attempt`'s HTTP status in
+    /// `ai_analyze::as_recovery_failure`). That one says only "the scoped
+    /// executor acted on the addressed element"; this one is the stricter bar.
+    /// They legitimately disagree — pinned by
+    /// `scoped_attempt_success_does_not_imply_recovered`.
     pub recovered: bool,
     /// Which path produced the (attempted) recovery.
     pub via: RecoveryVia,
@@ -167,7 +175,47 @@ fn llm_recovery_enabled() -> bool {
     llm_recovery_flag_enabled(std::env::var(LLM_RECOVERY_ENV).ok().as_deref())
 }
 
-/// Actions that MUTATE input state. A recovery step may never dispatch one.
+/// Actions that MUTATE input state — the ONE declaration of the list.
+///
+/// Two enforcement points refuse these as recovery steps, deliberately, so
+/// neither is a single point of failure across the IPC trust boundary: the
+/// runner's [`is_write_action`] here, and the frontend's `isWriteAction` in
+/// `src/hooks/ui-bridge-events/recoveryScope.ts`. The CHECKS stay two; the LIST
+/// is one. The frontend does not restate it — it imports
+/// [`WRITE_ACTIONS_FIXTURE`], which is generated from this constant and
+/// drift-gated by `write_actions_fixture_matches_rust_declaration`.
+///
+/// Entries are lowercase, because both checks compare the trimmed, lowercased
+/// action name.
+pub const WRITE_ACTIONS: &[&str] = &[
+    "type",
+    "settext",
+    "setvalue",
+    "fill",
+    "input",
+    "paste",
+    "append",
+    "clear",
+    "select",
+    "selectoption",
+    "check",
+    "uncheck",
+    "toggle",
+    "submit",
+    "upload",
+    "setfiles",
+    "sendkeys",
+    "presskey",
+    "writetoterminal",
+];
+
+/// The generated JSON the frontend imports its write-action list from,
+/// relative to the repository root. Regenerate with
+/// `QONTINUI_UPDATE_WRITE_ACTIONS=1 cargo test --bin qontinui-runner
+/// write_actions_fixture_matches_rust_declaration`.
+pub const WRITE_ACTIONS_FIXTURE: &str = "src/hooks/ui-bridge-events/writeActions.generated.json";
+
+/// Whether `action` MUTATES input state. A recovery step may never dispatch one.
 ///
 /// Recovery exists to make a previously-addressed action possible again —
 /// scroll it into view, wait for it to enable, refresh stale refs. Writing on
@@ -176,28 +224,7 @@ fn llm_recovery_enabled() -> bool {
 /// never addressed. Repositioning stays allowed; writes do not.
 pub fn is_write_action(action: &str) -> bool {
     let a = action.trim().to_ascii_lowercase();
-    matches!(
-        a.as_str(),
-        "type"
-            | "settext"
-            | "setvalue"
-            | "fill"
-            | "input"
-            | "paste"
-            | "append"
-            | "clear"
-            | "select"
-            | "selectoption"
-            | "check"
-            | "uncheck"
-            | "toggle"
-            | "submit"
-            | "upload"
-            | "setfiles"
-            | "sendkeys"
-            | "presskey"
-            | "writetoterminal"
-    )
+    WRITE_ACTIONS.contains(&a.as_str())
 }
 
 /// Map a recovery `command` string to a UI Bridge IPC dispatch against the
@@ -301,6 +328,16 @@ async fn execute_recovery_command(
     }
 }
 
+/// The OUTER recovery verdict, shared by both tiers: given the result of
+/// retrying the ORIGINAL action, `Some(result)` iff it now succeeds. This — not
+/// whether a recovery step (or the frontend's scoped attempt) answered — is
+/// what sets [`RecoveryOutcome::recovered`].
+fn original_action_now_succeeds(
+    retry: Result<serde_json::Value, String>,
+) -> Option<serde_json::Value> {
+    retry.ok().filter(is_ipc_success)
+}
+
 /// True when an IPC response (or original-action result) represents success.
 fn is_ipc_success(data: &serde_json::Value) -> bool {
     // Absent `success` is treated as success (matches `wrap_ipc_result`'s
@@ -384,9 +421,10 @@ pub async fn attempt_recovery(
         match execute_recovery_command(state, &command, element_id).await {
             Ok(_) => {
                 // Retry the original action exactly once.
-                match ui_bridge_request_sync(state, "execute_action", original_action.clone()).await
-                {
-                    Ok(retry) if is_ipc_success(&retry) => {
+                match original_action_now_succeeds(
+                    ui_bridge_request_sync(state, "execute_action", original_action.clone()).await,
+                ) {
+                    Some(retry) => {
                         outcome.recovered = true;
                         outcome.via = RecoveryVia::StructuredCommand;
                         outcome.command_chosen = chosen_command.clone();
@@ -395,7 +433,7 @@ pub async fn attempt_recovery(
                             .await;
                         return outcome;
                     }
-                    Ok(_) | Err(_) => {
+                    None => {
                         warn!(
                             "recovery_executor: original action still failed after '{}'; \
                              degrading to LLM fallback",
@@ -445,10 +483,9 @@ pub async fn attempt_recovery(
             // above. Hardcoding it true reported success for an LLM step that
             // had touched an unrelated element and left the addressed action
             // just as broken as before.
-            let retry = ui_bridge_request_sync(state, "execute_action", original_action.clone())
-                .await
-                .ok()
-                .filter(is_ipc_success);
+            let retry = original_action_now_succeeds(
+                ui_bridge_request_sync(state, "execute_action", original_action.clone()).await,
+            );
             match retry {
                 Some(retry) => {
                     outcome.recovered = true;
@@ -704,6 +741,96 @@ mod tests {
                 "{ok:?} is a repositioning action, not a write"
             );
         }
+    }
+
+    /// The frontend's `WRITE_ACTIONS` is imported from a JSON fixture
+    /// generated from [`WRITE_ACTIONS`]. This is the drift gate: the fixture
+    /// must equal the Rust declaration exactly (same members, same order), and
+    /// the failure names the symmetric difference, so a string added to EITHER
+    /// side alone — the Rust constant, or the fixture the frontend reads —
+    /// fails here with the missing member named.
+    #[test]
+    fn write_actions_fixture_matches_rust_declaration() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(WRITE_ACTIONS_FIXTURE);
+        let expected = format!(
+            "{}\n",
+            serde_json::to_string_pretty(WRITE_ACTIONS).expect("serialize WRITE_ACTIONS")
+        );
+        if std::env::var("QONTINUI_UPDATE_WRITE_ACTIONS").as_deref() == Ok("1") {
+            std::fs::write(&path, &expected).expect("write write-actions fixture");
+            return;
+        }
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let fixture: Vec<String> =
+            serde_json::from_str(&raw).expect("write-actions fixture is a JSON string array");
+        let rust: std::collections::BTreeSet<&str> = WRITE_ACTIONS.iter().copied().collect();
+        let json: std::collections::BTreeSet<&str> = fixture.iter().map(String::as_str).collect();
+        let only_rust: Vec<_> = rust.difference(&json).collect();
+        let only_json: Vec<_> = json.difference(&rust).collect();
+        assert!(
+            only_rust.is_empty() && only_json.is_empty(),
+            "write-action lists diverge across the IPC seam — only in Rust \
+             WRITE_ACTIONS: {only_rust:?}; only in {WRITE_ACTIONS_FIXTURE} (the \
+             frontend's list): {only_json:?}. Regenerate the fixture with \
+             QONTINUI_UPDATE_WRITE_ACTIONS=1 cargo test --bin qontinui-runner \
+             write_actions_fixture_matches_rust_declaration"
+        );
+        assert_eq!(
+            raw, expected,
+            "{WRITE_ACTIONS_FIXTURE} has the right members but is not the generated \
+             form (order/formatting); regenerate it"
+        );
+    }
+
+    #[test]
+    fn write_actions_are_lowercase_and_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for a in WRITE_ACTIONS {
+            assert_eq!(
+                *a,
+                a.trim().to_ascii_lowercase(),
+                "{a:?} must be normalized"
+            );
+            assert!(seen.insert(*a), "{a:?} is listed twice");
+            assert!(is_write_action(a));
+        }
+    }
+
+    /// Plan 2026-08-23-single-source-derived-facts item 8: the inner and outer
+    /// verdicts answer different questions and MAY disagree — by design. A
+    /// scoped attempt that acted on the addressed element (frontend
+    /// `attemptSucceeded: true`, so `/ai/recovery/attempt` answers 200) while
+    /// the original action still fails on retry is inner-true / outer-false.
+    /// Pinned so nobody "fixes" it by unifying the two values.
+    #[test]
+    fn scoped_attempt_success_does_not_imply_recovered() {
+        // Inner: the frontend's happy-path payload for the scoped attempt.
+        let attempt = json!({ "attemptSucceeded": true, "elementId": "btn-1" });
+        let inner = super::super::ai_analyze::as_recovery_failure(Ok(axum::Json(
+            crate::mcp::types::ApiResponse::success(attempt.clone()),
+        )));
+        assert!(
+            inner.is_ok(),
+            "the scoped attempt succeeded, so the route answers 200"
+        );
+        assert_eq!(
+            attempt[super::super::ai_analyze::ATTEMPT_SUCCEEDED],
+            json!(true)
+        );
+
+        // Outer: the independent retry of the ORIGINAL action still fails.
+        let retry_still_failing = Ok(json!({ "success": false, "error": "still disabled" }));
+        assert!(
+            original_action_now_succeeds(retry_still_failing).is_none(),
+            "the original action is still broken, so RecoveryOutcome.recovered stays false"
+        );
+
+        // And the outer verdict does go true when the retry succeeds.
+        assert!(original_action_now_succeeds(Ok(json!({ "success": true }))).is_some());
+        assert!(original_action_now_succeeds(Err("ipc timeout".into())).is_none());
     }
 
     #[test]
