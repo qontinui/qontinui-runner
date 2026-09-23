@@ -44,6 +44,68 @@ pub enum RestoreTier {
     TerminalOnly,
 }
 
+/// The two spellings of the SAME "restorable-at" concept, and the one place
+/// that converts between them (plan `2026-08-23-single-source-derived-facts`,
+/// item 1 step 4 — the vocabulary fork).
+///
+/// - The **coord wire** spelling (`"full"` / `"terminal_only"`, underscore) is
+///   what the `restore-record` session event carries in `restore_tier`
+///   (`restore_record_emitter`) and what a peer's `handoff` parses back. It is
+///   stored verbatim in `coord.session_events`, so it is a binding contract and
+///   does not change.
+/// - The **frontend** spelling (`"full"` / `"terminal-only"`, hyphen) is the TS
+///   `RestoreTier` union in `src/components/terminal/providerAdapter.ts`, and the
+///   `"terminal-only"` arm of `classifyRestoreAction`'s `RestoreAction`.
+///
+/// Neither spelling is written out anywhere else in Rust: every producer and
+/// parser goes through these four functions, so the underscore/hyphen fork is
+/// an explicit conversion at a named seam rather than two literals that happen
+/// to disagree. The cross-seam fixture
+/// (`src/components/terminal/__fixtures__/restore-tier-crossproduct.json`)
+/// carries both spellings per row and both test suites read it.
+///
+/// NOT the same concept as the lifecycle store's `RESTORE_TIER_RESUMED` /
+/// `RESTORE_TIER_TERMINAL_ONLY` / `RESTORE_TIER_FAILED`: those record what
+/// HAPPENED when a restore was attempted, not what a record is restorable AT.
+impl RestoreTier {
+    /// The coord wire spelling (`restore-record` event `restore_tier`).
+    pub const fn wire_str(self) -> &'static str {
+        match self {
+            RestoreTier::Full => "full",
+            RestoreTier::TerminalOnly => "terminal_only",
+        }
+    }
+
+    /// Parse the coord wire spelling. `None` for anything else — including the
+    /// frontend's hyphenated `"terminal-only"`, which is a different vocabulary
+    /// and must be converted with [`RestoreTier::from_frontend_str`].
+    pub fn from_wire_str(s: &str) -> Option<Self> {
+        match s {
+            "full" => Some(RestoreTier::Full),
+            "terminal_only" => Some(RestoreTier::TerminalOnly),
+            _ => None,
+        }
+    }
+
+    /// The frontend spelling (TS `RestoreTier` in `providerAdapter.ts`).
+    pub const fn frontend_str(self) -> &'static str {
+        match self {
+            RestoreTier::Full => "full",
+            RestoreTier::TerminalOnly => "terminal-only",
+        }
+    }
+
+    /// Parse the frontend spelling. `None` for anything else — including the
+    /// wire's underscored `"terminal_only"`.
+    pub fn from_frontend_str(s: &str) -> Option<Self> {
+        match s {
+            "full" => Some(RestoreTier::Full),
+            "terminal-only" => Some(RestoreTier::TerminalOnly),
+            _ => None,
+        }
+    }
+}
+
 /// The spawn recipe an adapter produces so the runner can launch the provider
 /// with a KNOWN-up-front session id (plan §4 `launch_with_identity`). The
 /// runner injects `env` into the PTY child, runs `argv`, and records
@@ -227,6 +289,30 @@ pub fn adapter_for(provider: &str) -> Box<dyn SessionProviderAdapter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_tier_spellings_round_trip_and_do_not_cross() {
+        for tier in [RestoreTier::Full, RestoreTier::TerminalOnly] {
+            assert_eq!(RestoreTier::from_wire_str(tier.wire_str()), Some(tier));
+            assert_eq!(
+                RestoreTier::from_frontend_str(tier.frontend_str()),
+                Some(tier)
+            );
+        }
+        // The pinned literals: the wire value is a stored coord contract, the
+        // frontend value is the TS union — a change to either is a contract
+        // change, not a refactor.
+        assert_eq!(RestoreTier::TerminalOnly.wire_str(), "terminal_only");
+        assert_eq!(RestoreTier::TerminalOnly.frontend_str(), "terminal-only");
+        assert_eq!(RestoreTier::Full.wire_str(), "full");
+        assert_eq!(RestoreTier::Full.frontend_str(), "full");
+        // The two vocabularies do not silently accept each other's spelling —
+        // that acceptance is exactly the unconverted seam this API replaces.
+        assert_eq!(RestoreTier::from_wire_str("terminal-only"), None);
+        assert_eq!(RestoreTier::from_frontend_str("terminal_only"), None);
+        assert_eq!(RestoreTier::from_wire_str(""), None);
+        assert_eq!(RestoreTier::from_wire_str("FULL"), None);
+    }
 
     #[test]
     fn adapter_for_resolves_claude_and_defaults_unknown() {
