@@ -15,6 +15,7 @@ import {
   splitNeedsInput,
   unionErrorCount,
   unionSessionCount,
+  windowTitleCounts,
 } from "./sessionCounts";
 
 describe("countTabsInState", () => {
@@ -112,5 +113,32 @@ describe("splitNeedsInput", () => {
     // The two models settle at different times; a tab-scoped count ahead of
     // the session bucketing must not render "+-1 external".
     expect(splitNeedsInput(0, 2)).toEqual({ actionable: 2, external: 0 });
+  });
+});
+
+describe("windowTitleCounts", () => {
+  it("counts one live needs-input tab as 1 (positive case)", () => {
+    // Without this, a helper returning 0 always would pass the stale case.
+    const tabs = [{ id: "a" }, { id: "b" }];
+    const states = { a: "needs-input", b: "working" } as const;
+    expect(windowTitleCounts(tabs, states)).toEqual({ needsInputCount: 1, errorCount: 0 });
+  });
+
+  it("drops to 0 once the needs-input tab is closed but its state entry is not reaped", () => {
+    // Tab `a` was closed: it is gone from `tabs`, but `sessionStates` still
+    // carries its entry. The title must not keep counting it.
+    const tabs = [{ id: "b" }];
+    const states = { a: "needs-input", b: "working" } as const;
+    expect(windowTitleCounts(tabs, states)).toEqual({ needsInputCount: 0, errorCount: 0 });
+  });
+
+  it("applies the same live-tab filter to the error count", () => {
+    const states = { a: "error", b: "error" } as const;
+    expect(windowTitleCounts([{ id: "a" }, { id: "b" }], states).errorCount).toBe(2);
+    expect(windowTitleCounts([{ id: "b" }], states).errorCount).toBe(1);
+  });
+
+  it("returns zeros for absent inputs", () => {
+    expect(windowTitleCounts(undefined, undefined)).toEqual({ needsInputCount: 0, errorCount: 0 });
   });
 });
