@@ -126,7 +126,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::intent::Intent;
-use super::restore_record_emitter::{RESTORE_RECORD_EVENT, TIER_FULL};
+use super::restore_record_emitter::{RESTORE_RECORD_EVENT, TIER_FULL, TIER_TERMINAL_ONLY};
 use super::session_lifecycle_store::{
     SessionLifecycleStore, TerminalSessionRecord, DEFAULT_PROVIDER, ORIGIN_AUTHORITATIVE,
 };
@@ -1131,13 +1131,28 @@ async fn materialize_restore_registry(
 
     let record = registry_record_from_restore_payload(&payload, &terminal_id, source_session_id);
     let session_key = record.claude_session_id.clone();
-    let tier_full = record.confirmed_at.is_some();
+    // `confirmed_at` is `Some` iff the payload mirrored `full` WITH an id, so
+    // this is an exact readback of the materialized tier. Logged in the wire
+    // vocabulary via the shared constants (never a re-typed literal), beside the
+    // payload's own `restore_tier` verbatim — the two differ only when the
+    // payload was malformed (a `full` with no id, an unknown or absent tier),
+    // which is exactly the case worth seeing.
+    let materialized_tier = if record.confirmed_at.is_some() {
+        TIER_FULL
+    } else {
+        TIER_TERMINAL_ONLY
+    };
+    let mirrored_tier = payload
+        .get("restore_tier")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<absent>");
     lifecycle_store.record_open(record);
     tracing::info!(
         source = %source_session_id,
         child = %child_id,
         session = %session_key,
-        tier = if tier_full { "full" } else { "terminal_only" },
+        tier = materialized_tier,
+        mirrored_tier = %mirrored_tier,
         "session handoff: materialized restore-registry record"
     );
 }
@@ -1272,7 +1287,7 @@ fn registry_record_from_restore_payload(
     let tier = payload
         .get("restore_tier")
         .and_then(|v| v.as_str())
-        .unwrap_or("terminal_only");
+        .unwrap_or(TIER_TERMINAL_ONLY);
 
     let (claude_session_id, confirmed_at) = match (tier, authoritative_id) {
         (t, Some(id)) if t == TIER_FULL => {

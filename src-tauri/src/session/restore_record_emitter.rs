@@ -50,17 +50,36 @@
 //! ## Tier honesty
 //!
 //! `restore_tier` mirrors the frontend restore classifier
-//! (`classifyRestoreAction` in `useTerminalInitialization.ts`): `"full"` —
-//! the provider can deterministically resume the conversation by id — is
-//! claimed ONLY for a CONFIRMED (`confirmed_at` set) record of AUTHORITATIVE
-//! or OBSERVED origin (observed = the continuous binder's process-anchored
-//! transcript bind — resume-safe, unlike the mtime-guess `reconciled`) whose
-//! provider adapter declares [`RestoreTier::Full`]. Everything
-//! else (provisional phantom shells, reconciled ids, terminal-only
-//! providers) is `"terminal_only"` with a null `authoritative_session_id` —
-//! the remote materialization then restores terminal+cwd+command with a
-//! fresh conversation, never a resume typed against an id that can't (or
-//! shouldn't) resume.
+//! (`classifyRestoreAction` in `useTerminalInitialization.ts`), gate for gate.
+//! `"full"` — the provider can deterministically resume the conversation by
+//! id — is claimed ONLY when ALL FIVE of the classifier's gates pass:
+//!
+//! 1. the id is shell-safe ([`crate::session::session_id::is_valid_session_id`],
+//!    the Rust twin of the frontend's `isValidSessionId`; the frontend answers
+//!    `"skip-invalid"` here);
+//! 2. the origin is AUTHORITATIVE or OBSERVED (observed = the continuous
+//!    binder's process-anchored transcript bind — resume-safe, unlike the
+//!    mtime-guess `reconciled`);
+//! 3. the record is CONFIRMED (`confirmed_at` set);
+//! 4. its transcript was not probed ABSENT (unknown never downgrades);
+//! 5. its provider adapter declares [`RestoreTier::Full`].
+//!
+//! Everything else (invalid ids, provisional phantom shells, reconciled ids,
+//! transcript-less confirmations, terminal-only providers) is
+//! `"terminal_only"` with a null `authoritative_session_id`, and the id is
+//! never interpolated into `launch_command` — the remote materialization then
+//! restores terminal+cwd+command with a fresh conversation, never a resume
+//! typed against an id that can't (or shouldn't) resume.
+//!
+//! The mirror claim is ENFORCED, not asserted: the test
+//! `emitter_tier_matches_the_frontend_classifier_on_every_crossproduct_row`
+//! (this module) and the vitest `restoreTierCrossProduct.test.ts` (next to the
+//! classifier) both read the SAME committed table,
+//! `src/components/terminal/__fixtures__/restore-tier-crossproduct.json` — the
+//! full 72-row cross product of the five gates' inputs. The vitest pins the
+//! table to `classifyRestoreAction`; the Rust test pins it to
+//! [`restore_record_payload`]. A gate added or dropped on either side turns
+//! one of the two red.
 //!
 //! ## Failure posture
 //!
@@ -74,7 +93,8 @@ use serde_json::{json, Value as JsonValue};
 use uuid::Uuid;
 
 use super::local_store::OutboxWriter;
-use super::provider_adapter::{adapter_for, RestoreTier};
+use super::provider_adapter::{adapter_for, RestoreTier, SessionProviderAdapter};
+use super::session_id::is_valid_session_id;
 use super::session_lifecycle_store::{
     TerminalSessionRecord, ORIGIN_AUTHORITATIVE, ORIGIN_OBSERVED,
 };
@@ -85,12 +105,16 @@ use super::SessionEventKind;
 /// [`SessionEventKind::RestoreRecord`]`.as_str()`.
 pub const RESTORE_RECORD_EVENT: &str = "restore-record";
 
-/// Wire value of the full restore tier (provider resume with authoritative
-/// id).
-pub const TIER_FULL: &str = "full";
-/// Wire value of the terminal-only restore tier (terminal+cwd+command,
-/// fresh conversation).
-pub const TIER_TERMINAL_ONLY: &str = "terminal_only";
+/// COORD WIRE spelling of the full restore tier (provider resume with
+/// authoritative id). Derived from [`RestoreTier::wire_str`] — the one place
+/// the wire spelling is written — so the constant cannot drift from the enum.
+pub const TIER_FULL: &str = RestoreTier::Full.wire_str();
+/// COORD WIRE spelling of the terminal-only restore tier
+/// (terminal+cwd+command, fresh conversation): `"terminal_only"`, underscore.
+/// The frontend spells the same concept `"terminal-only"` (hyphen); the
+/// conversion is [`RestoreTier::from_wire_str`] / [`RestoreTier::frontend_str`],
+/// never a second literal.
+pub const TIER_TERMINAL_ONLY: &str = RestoreTier::TerminalOnly.wire_str();
 
 /// Resolves a registry record's hosting `terminal_id` to the coord session
 /// UUID mirroring that terminal (the id `terminal_create` stored via
@@ -230,10 +254,15 @@ impl std::fmt::Debug for RestoreRecordEmitter {
 }
 
 /// Build the binding wire payload for one registry record. Pure — the tier
-/// decision mirrors the frontend `classifyRestoreAction` gate exactly:
-/// `"full"` requires authoritative origin AND confirmation AND a transcript
-/// that was not probed-absent AND a [`RestoreTier::Full`] provider; everything
-/// else degrades honestly to `"terminal_only"` with a null authoritative id.
+/// decision is [`mirrored_restore_tier`], which carries ALL FIVE of the
+/// frontend `classifyRestoreAction` gates: `"full"` requires a shell-safe id
+/// ([`crate::session::session_id::is_valid_session_id`]) AND authoritative or
+/// observed origin AND confirmation AND a transcript that was not
+/// probed-absent AND a [`RestoreTier::Full`] provider; everything else
+/// degrades honestly to `"terminal_only"` with a null authoritative id. The
+/// equivalence is pinned row-by-row by
+/// `emitter_tier_matches_the_frontend_classifier_on_every_crossproduct_row`
+/// against the same fixture the frontend classifier's vitest reads.
 ///
 /// `transcript_exists` is the record's transcript probe result: `Some(false)`
 /// only when the probe positively determined there is NO transcript, `None`
@@ -254,17 +283,58 @@ pub fn restore_record_payload(
     machine_id: Uuid,
     transcript_exists: Option<bool>,
 ) -> JsonValue {
-    let adapter = adapter_for(&rec.provider);
+    restore_record_payload_for_adapter(
+        rec,
+        machine_id,
+        transcript_exists,
+        adapter_for(&rec.provider).as_ref(),
+    )
+}
+
+/// The five-gate "restorable at" predicate — the Rust half of the frontend
+/// `classifyRestoreAction` (`"auto-resume"` ⇔ [`RestoreTier::Full`]). Pure,
+/// and the ONLY place the emitter decides a tier.
+///
+/// Gate 1 (the id) is DEFENCE IN DEPTH: the load-bearing fix is the ingress
+/// gate on `POST /control/session-open` (runner#1373), which keeps an unsafe id
+/// out of the local registry altogether. This gate exists so the mirror cannot
+/// promise a peer a resume the frontend classifier would refuse, whatever
+/// route a record took into the registry.
+pub fn mirrored_restore_tier(
+    rec: &TerminalSessionRecord,
+    transcript_exists: Option<bool>,
+    provider_tier: RestoreTier,
+) -> RestoreTier {
     // `observed` sits with `authoritative` here, mirroring
     // `classifyRestoreAction`: a confirmed observed bind is process-anchored to
     // its transcript (never the mtime guess `reconciled` quarantines), so its
     // id is resume-safe.
-    let full = matches!(
-        rec.origin.as_deref(),
-        Some(ORIGIN_AUTHORITATIVE) | Some(ORIGIN_OBSERVED)
-    ) && rec.confirmed_at.is_some()
+    let full = is_valid_session_id(&rec.claude_session_id)
+        && matches!(
+            rec.origin.as_deref(),
+            Some(ORIGIN_AUTHORITATIVE) | Some(ORIGIN_OBSERVED)
+        )
+        && rec.confirmed_at.is_some()
         && transcript_exists != Some(false)
-        && adapter.restore_tier() == RestoreTier::Full;
+        && provider_tier == RestoreTier::Full;
+    if full {
+        RestoreTier::Full
+    } else {
+        RestoreTier::TerminalOnly
+    }
+}
+
+/// [`restore_record_payload`] over an explicit adapter — the seam the
+/// cross-product test uses to drive a terminal-only provider, which no shipped
+/// adapter declares yet.
+fn restore_record_payload_for_adapter(
+    rec: &TerminalSessionRecord,
+    machine_id: Uuid,
+    transcript_exists: Option<bool>,
+    adapter: &dyn SessionProviderAdapter,
+) -> JsonValue {
+    let full =
+        mirrored_restore_tier(rec, transcript_exists, adapter.restore_tier()) == RestoreTier::Full;
 
     let (tier, authoritative_session_id, launch_command) = if full {
         (
@@ -523,6 +593,233 @@ mod tests {
         assert_eq!(
             unknown["restore_tier"], TIER_FULL,
             "UNKNOWN must not downgrade — it is not evidence of absence"
+        );
+    }
+
+    // -- item 1 step 2: the fifth gate ---------------------------------------
+
+    /// A confirmed authoritative record whose id fails the shell-safety gate
+    /// is `terminal_only` with a null id — the frontend classifies it
+    /// `"skip-invalid"` — and the raw id never reaches `launch_command`.
+    #[test]
+    fn payload_refuses_full_for_an_id_that_fails_the_shell_safety_gate() {
+        let machine = Uuid::new_v4();
+        for bad in ["abc; rm -rf /", "$(id)", "abc\n", "a b", ""] {
+            let p = restore_record_payload(&rec(bad, "t"), machine, Some(true));
+            assert_eq!(p["restore_tier"], TIER_TERMINAL_ONLY, "id {bad:?}");
+            assert!(p["authoritative_session_id"].is_null(), "id {bad:?}");
+            assert_eq!(p["launch_command"], "claude", "id {bad:?} leaked into argv");
+        }
+        // Negative control: the same record with a safe id is full.
+        let ok = restore_record_payload(&rec("sess-1", "t"), machine, Some(true));
+        assert_eq!(ok["restore_tier"], TIER_FULL);
+    }
+
+    // -- the cross-seam guard (plan item 1 Verification, 12c #2) -------------
+
+    /// The shared table. The vitest `restoreTierCrossProduct.test.ts` pins it
+    /// to `classifyRestoreAction`; this module pins it to the emitter.
+    const CROSSPRODUCT_FIXTURE: &str = include_str!(
+        "../../../src/components/terminal/__fixtures__/restore-tier-crossproduct.json"
+    );
+
+    /// The fixture's terminal-only provider. No shipped adapter declares
+    /// [`RestoreTier::TerminalOnly`], so this test supplies one (the vitest
+    /// supplies its TS twin through a module mock); everything but the tier
+    /// delegates to the real Claude adapter.
+    const FIXTURE_TERMINAL_ONLY_PROVIDER: &str = "fixture-terminal-only";
+
+    struct FixtureTerminalOnlyAdapter;
+
+    impl SessionProviderAdapter for FixtureTerminalOnlyAdapter {
+        fn provider(&self) -> &'static str {
+            FIXTURE_TERMINAL_ONLY_PROVIDER
+        }
+        fn launch_with_identity(
+            &self,
+            cwd: &str,
+            account: Option<&str>,
+        ) -> crate::session::provider_adapter::LaunchSpec {
+            crate::session::provider_adapter::ClaudeAdapter.launch_with_identity(cwd, account)
+        }
+        fn capture_hook_delivery(
+            &self,
+            cwd: &str,
+        ) -> crate::session::provider_adapter::DeliverySpec {
+            crate::session::provider_adapter::ClaudeAdapter.capture_hook_delivery(cwd)
+        }
+        fn resume_command(&self, session_id: &str, account: Option<&str>) -> Vec<String> {
+            crate::session::provider_adapter::ClaudeAdapter.resume_command(session_id, account)
+        }
+        fn account_isolation(
+            &self,
+            account: Option<&str>,
+        ) -> std::collections::BTreeMap<String, String> {
+            crate::session::provider_adapter::ClaudeAdapter.account_isolation(account)
+        }
+        fn resume_handshake_patterns(&self) -> crate::session::provider_adapter::HandshakePatterns {
+            crate::session::provider_adapter::ClaudeAdapter.resume_handshake_patterns()
+        }
+        fn restore_tier(&self) -> RestoreTier {
+            RestoreTier::TerminalOnly
+        }
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct FixtureRow {
+        id_kind: String,
+        session_id: String,
+        origin: String,
+        confirmed: bool,
+        transcript: String,
+        provider_tier: String,
+        provider: String,
+        action: String,
+        wire_tier: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Fixture {
+        rows: Vec<FixtureRow>,
+    }
+
+    fn fixture_rows() -> Vec<FixtureRow> {
+        serde_json::from_str::<Fixture>(CROSSPRODUCT_FIXTURE)
+            .expect("restore-tier-crossproduct.json parses")
+            .rows
+    }
+
+    /// The Rust emitter's tier equals the TS classifier's verdict on every row
+    /// of the shared cross product (`"auto-resume"` ⇔ `"full"`). The
+    /// shell-metacharacter rows are the ones that failed before the fifth gate.
+    #[test]
+    fn emitter_tier_matches_the_frontend_classifier_on_every_crossproduct_row() {
+        let _amb = crate::test_env::isolated_ambient();
+        let machine = Uuid::new_v4();
+        let rows = fixture_rows();
+
+        // Completeness, enumerated independently of the fixture: a truncated
+        // or de-duplicated table must fail here, not silently shrink the pin.
+        let mut expected_keys = HashSet::new();
+        for id_kind in ["valid", "shell-metacharacter"] {
+            for origin in ["authoritative", "observed", "reconciled"] {
+                for confirmed in [true, false] {
+                    for transcript in ["present", "absent", "unprobed"] {
+                        for provider_tier in ["full", "terminal-only"] {
+                            expected_keys.insert(format!(
+                                "{id_kind}|{origin}|{confirmed}|{transcript}|{provider_tier}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        let actual_keys: HashSet<String> = rows
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}|{}|{}|{}|{}",
+                    r.id_kind, r.origin, r.confirmed, r.transcript, r.provider_tier
+                )
+            })
+            .collect();
+        assert_eq!(rows.len(), 72, "fixture must carry the full cross product");
+        assert_eq!(
+            actual_keys, expected_keys,
+            "fixture rows ≠ the cross product"
+        );
+
+        // The `claude` rows go through the REAL registry: pin that it is still
+        // the full-tier provider the fixture says it is.
+        assert_eq!(adapter_for("claude").restore_tier(), RestoreTier::Full);
+
+        let mut full_rows = 0;
+        for r in &rows {
+            let label = format!(
+                "row {}|{}|{}|{}|{} (id {:?})",
+                r.id_kind, r.origin, r.confirmed, r.transcript, r.provider_tier, r.session_id
+            );
+            // The id kind must be what the Rust gate says it is — otherwise the
+            // row is testing the JS/Rust regex-dialect divergence documented in
+            // `session_id.rs`, not the predicate.
+            assert_eq!(
+                is_valid_session_id(&r.session_id),
+                r.id_kind == "valid",
+                "{label}: id kind disagrees with is_valid_session_id"
+            );
+
+            let mut record = rec(&r.session_id, "t");
+            record.origin = Some(r.origin.clone());
+            record.confirmed_at = r.confirmed.then_some(3);
+            record.provider = r.provider.clone();
+            let transcript_exists = match r.transcript.as_str() {
+                "present" => Some(true),
+                "absent" => Some(false),
+                "unprobed" => None,
+                other => panic!("{label}: unknown transcript axis {other:?}"),
+            };
+
+            let declared_tier = RestoreTier::from_frontend_str(&r.provider_tier)
+                .unwrap_or_else(|| panic!("{label}: providerTier is not a frontend tier"));
+            let payload = match declared_tier {
+                RestoreTier::Full => {
+                    assert_eq!(r.provider, "claude", "{label}");
+                    restore_record_payload(&record, machine, transcript_exists)
+                }
+                RestoreTier::TerminalOnly => {
+                    assert_eq!(r.provider, FIXTURE_TERMINAL_ONLY_PROVIDER, "{label}");
+                    restore_record_payload_for_adapter(
+                        &record,
+                        machine,
+                        transcript_exists,
+                        &FixtureTerminalOnlyAdapter,
+                    )
+                }
+            };
+
+            // The TS verdict, converted across the seam explicitly: only
+            // "auto-resume" is the full tier.
+            let ts_tier = match r.action.as_str() {
+                "auto-resume" => RestoreTier::Full,
+                "terminal-only" | "skip-invalid" => RestoreTier::TerminalOnly,
+                other => panic!("{label}: unknown RestoreAction {other:?}"),
+            };
+            assert_eq!(
+                RestoreTier::from_wire_str(&r.wire_tier),
+                Some(ts_tier),
+                "{label}: fixture wireTier disagrees with its own action"
+            );
+
+            let emitted = payload["restore_tier"].as_str().unwrap_or_default();
+            assert_eq!(
+                emitted,
+                ts_tier.wire_str(),
+                "{label}: emitter mirrors {emitted:?}, classifyRestoreAction says {:?}",
+                r.action
+            );
+            match ts_tier {
+                RestoreTier::Full => {
+                    full_rows += 1;
+                    assert_eq!(payload["authoritative_session_id"], r.session_id.as_str());
+                }
+                RestoreTier::TerminalOnly => {
+                    assert!(payload["authoritative_session_id"].is_null(), "{label}");
+                    assert!(
+                        !payload["launch_command"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .contains(&r.session_id),
+                        "{label}: id interpolated into a terminal-only launch_command"
+                    );
+                }
+            }
+        }
+        // Negative control: an emitter that returned terminal_only
+        // unconditionally would satisfy every other row.
+        assert!(
+            full_rows > 0,
+            "no row is full on both sides — the pin is vacuous"
         );
     }
 }
