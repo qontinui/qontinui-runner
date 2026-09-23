@@ -13860,6 +13860,95 @@ Body.
         assert!(logged.contains("2026-02-03-linked"));
     }
 
+    /// **The same protection on the ARCHIVE side.** `archive_scan.dangling_link_slugs`
+    /// is chained into `present_archive` exactly as the active arm chains its
+    /// own into `present_active` — this pins that the archive chain is wired,
+    /// not just present in the diff.
+    ///
+    /// A slug first seen in the active dir moves to the archive dir as a
+    /// working symlink (no warning: it is genuinely present there). Its
+    /// TARGET then goes missing while the link's name stays in the archive
+    /// dir — the same race as the active-side test, on the other scan.
+    ///
+    /// Neuter check: drop `.chain(archive_dangling)` from `present_archive`
+    /// in `LoopState::tick` — cycle 3 below then warns falsely.
+    #[tokio::test]
+    async fn a_dangling_archived_link_is_present_to_the_disappearance_detector() {
+        let logs = CapturedLogs::start();
+        let dir = tempfile::tempdir().unwrap();
+        let archive = tempfile::tempdir().unwrap();
+        let targets = tempfile::tempdir().unwrap();
+
+        let slug_file = dir.path().join("2026-02-04-archived.md");
+        std::fs::write(&slug_file, "# A\n\n> **Status: DRAFT**\n").unwrap();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = PathInputs {
+            plans_archive_dir: Some(archive.path().to_string_lossy().to_string()),
+            ..plans_dir_input(dir.path())
+        };
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut state = tick_state(reader);
+
+        // Cycle 1: seen in the active dir.
+        state.tick(&sink, &metrics).await;
+        assert!(
+            state.seen_slugs.contains("2026-02-04-archived"),
+            "the plan file was read from the active dir"
+        );
+
+        // Cycle 2: moved out of active into the archive dir, as a WORKING
+        // symlink (target present) — genuinely there, no dangling-link
+        // protection needed yet.
+        std::fs::remove_file(&slug_file).unwrap();
+        let target = targets.path().join("archived-target.md");
+        std::fs::write(&target, "# A\n\n> **Status: DRAFT**\n").unwrap();
+        let link = archive.path().join("2026-02-04-archived.md");
+        if let Err(e) = try_symlink(&target, &link) {
+            eprintln!("SKIPPED: this platform refused to create a symlink ({e})");
+            return;
+        }
+        state.tick(&sink, &metrics).await;
+        assert_eq!(
+            logs.text()
+                .matches("disappeared from the active dir")
+                .count(),
+            0,
+            "moved into the archive dir via a working link — genuinely present"
+        );
+
+        // Cycle 3: the archived link's TARGET goes missing; the link's name
+        // stays in the archive dir. Without `archive_dangling`, this slug
+        // would be absent from both `present_active` and `present_archive`
+        // and warn falsely.
+        std::fs::remove_file(&target).unwrap();
+        state.tick(&sink, &metrics).await;
+        assert_eq!(
+            logs.text()
+                .matches("disappeared from the active dir")
+                .count(),
+            0,
+            "a dangling archive link has not left the archive dir; got: {}",
+            logs.text()
+        );
+        assert!(
+            state.warned_disappeared.is_empty(),
+            "...and poisons nothing"
+        );
+
+        // Cycle 4: the archive link itself goes away — a real disappearance,
+        // surfaced once.
+        std::fs::remove_file(&link).unwrap();
+        state.tick(&sink, &metrics).await;
+        let logged = logs.text();
+        assert_eq!(
+            logged.matches("disappeared from the active dir").count(),
+            1,
+            "the real disappearance is surfaced exactly once; got: {logged}"
+        );
+        assert!(logged.contains("2026-02-04-archived"));
+    }
+
     /// **The same property on main's REF scan.** A blob the listing names but
     /// the read cannot produce (corrupt, or not UTF-8) comes back `Ok` and
     /// SHORT — `read_ref_dir` refuses only the wholesale failure. Before the
