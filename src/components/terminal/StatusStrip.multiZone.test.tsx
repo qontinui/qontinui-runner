@@ -94,7 +94,14 @@ const zoneLayout = {
  * strip's local, formerly misnamed `isMultiZone`) is the ONLY thing that can
  * keep the strip on screen.
  */
-function mountScenario(tabs: RosterTab[], claudeSessionCount: number) {
+function mountScenario(
+  tabs: RosterTab[],
+  claudeSessionCount: number,
+  working: { workingCount: number; externalWorkingCount: number } = {
+    workingCount: 0,
+    externalWorkingCount: 0,
+  },
+) {
   Object.assign(sessionValue, {
     tabs,
     sessionStates: {},
@@ -105,7 +112,7 @@ function mountScenario(tabs: RosterTab[], claudeSessionCount: number) {
       claudeSessionCount,
       needsInputCount: 0,
       errorCount: 0,
-      workingCount: 0,
+      ...working,
       completedCount: 0,
       idleCount: 0,
     },
@@ -172,5 +179,34 @@ describe("StatusStrip auto-hide gate", () => {
     // the live-terminal half of the union is scoped to this window.
     expect(html).toContain("2 sessions — 2 Claude (incl. external), 0 live terminals on this page");
     expect(html).not.toContain("2 sessions on this page");
+  });
+});
+
+describe("StatusStrip working count (UI-4)", () => {
+  /** The strip's visible text, tags stripped and whitespace collapsed. */
+  function text(html: string): string {
+    return html
+      .replace(/<[^>]*>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  it("headlines the page's workers and reports external sessions apart — THE DEFECT", () => {
+    // One worker in a zone on this page, four other `claude` processes on the
+    // box. `workingCount` buckets all five; the strip is the PAGE's status.
+    const html = mountScenario(TWO_LIVE_TABS, 5, { workingCount: 5, externalWorkingCount: 4 });
+    expect(text(html)).toContain("1 working +4 external");
+    expect(text(html)).not.toContain("5 working");
+  });
+
+  it("omits the external suffix when every worker is on this page", () => {
+    const html = mountScenario(TWO_LIVE_TABS, 2, { workingCount: 2, externalWorkingCount: 0 });
+    expect(text(html)).toContain("2 working");
+    expect(text(html)).not.toContain("external");
+  });
+
+  it("still reports external workers when none run on this page", () => {
+    const html = mountScenario(TWO_LIVE_TABS, 3, { workingCount: 3, externalWorkingCount: 3 });
+    expect(text(html)).toContain("0 working +3 external");
   });
 });

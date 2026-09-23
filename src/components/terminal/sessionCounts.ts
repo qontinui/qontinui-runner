@@ -137,6 +137,39 @@ export function splitNeedsInput(
 }
 
 /**
+ * Split the working count into what runs ON THIS PAGE and what runs elsewhere.
+ *
+ * THE DEFECT (UI-4): `workingCount` buckets `active-in-zone` AND
+ * `active-external` sessions — the latter are other `claude` processes on the
+ * box with no tab in this window — while the strip it headlines is labelled
+ * "Terminal page status". One page worker and four external sessions read
+ * "5 working", a count of work this page is not doing.
+ *
+ * Same shape as {@link splitNeedsInput}: the headline is page-scoped and the
+ * external remainder is reported as `+M external` — surfaced, not folded in
+ * and not dropped. The external share is clamped to `[0, workingCount]` so a
+ * transiently inconsistent pair can never render a negative page count.
+ */
+export function splitWorking(
+  workingCount: number,
+  externalWorkingCount: number,
+): { page: number; external: number } {
+  const external = Math.max(0, Math.min(externalWorkingCount, workingCount));
+  return { page: workingCount - external, external };
+}
+
+/**
+ * Render the working segment of the state-breakdown pill: `N working`, plus
+ * ` +M external` when external sessions are running. Returns `null` when there
+ * is nothing to show, so the caller can gate the segment on it.
+ */
+export function formatWorking(split: { page: number; external: number }): string | null {
+  if (split.page === 0 && split.external === 0) return null;
+  const headline = `${split.page} working`;
+  return split.external > 0 ? `${headline} +${split.external} external` : headline;
+}
+
+/**
  * The needs-input / error counts the WINDOW TITLE shows.
  *
  * THE DEFECT: the title counted `Object.values(sessionStates)` directly, with
