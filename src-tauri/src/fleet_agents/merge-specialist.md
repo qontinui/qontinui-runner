@@ -339,29 +339,30 @@ agent's working tree). Coord's executor doesn't run these either; if
 the rulebook's natural answer is "wipe and retry," set
 `action="escalate_operator"`.
 
-## How the executor uses your decision
+## Who uses your decision
 
-The executor at `qontinui-coord/src/pr_merge/executor.rs` parses your
-`MERGE_DECISION` line, persists the row to `coord.merge_decisions` with
-`decided_by='specialist'`, then dispatches:
+**Your caller, and nothing else.** Until this note, this section described a
+coord executor that parsed your line, persisted it with
+`decided_by='specialist'`, and dispatched a side effect per action. Every row of
+that table named something that no longer happens; the section is kept, corrected,
+because the *actions* are still the right vocabulary and a reader has to know
+what each one does and does not set in motion.
 
-| `action`             | Side effect |
-|----------------------|-------------|
-| `merge`              | INSERT `coord.merge_proposals` → existing scheduler land path; flip PR-event to `MERGING`. |
-| `wait`               | Insert `coord.pr_events` row `event_kind='specialist_wait'`; predicate re-runs at `next_check_at`. |
-| `rebase`             | Publish `events.coord.pr.<tenant>.<repo>.<pr_num>.diagnosis` with `"action":"rebase_requested"`. Author agent receives it via the NATS feedback loop (Phase 7). |
-| `reject`             | Publish diagnosis + post a PR comment via App-token + close the PR. |
-| `escalate_operator`  | INSERT `coord.alerts(kind='merge_escalation', tenant_id=...)`. Operator dashboard surfaces it. |
+| `action`             | What actually happens now |
+|----------------------|---------------------------|
+| `merge`              | Nothing automatic. No `coord.merge_proposals` row is inserted on your say-so and no PR-event flips to `MERGING`. Your caller must take it to the ordinary merge train, where coord's own predicate decides — and coord is still the sole merge authority (`git-operations` `merge-authority`). |
+| `wait`               | Nothing automatic. No `coord.pr_events` row is written; `event_kind='specialist_wait'` is not produced by any live path. `next_check_at` binds only a caller who schedules it. |
+| `rebase`             | Nothing automatic. No `events.coord.pr.….diagnosis` frame carrying `"action":"rebase_requested"` is published on your behalf; the author-facing NATS feedback loop is not fed from here. |
+| `reject`             | Nothing automatic — and this is the row where that matters most. Coord's `github_close_with_comment` helper survives in `executor.rs` — it is one of the only two PR-closing HTTP paths coord has — but `mod.rs`'s own grep-audited callsite census says its callers are coord's land/close surfaces and nothing else. Your `reject` closes nothing and comments nowhere. |
+| `escalate_operator`  | Nothing automatic, and there is no longer an operator surface behind it (details: the canonical `qontinui-claude-config` `.claude/agents/merge-specialist.md`). |
 
-The executor adds two safety wrappers ON TOP of your decision:
-
-- **Confidence floor.** If your `confidence < tenant.confidence_threshold`,
-  the executor FORCES `escalate_operator` even when you said `merge`.
-  Don't try to defeat this by inflating `confidence`; the post-decision
-  audit catches the drift.
-- **Citation gate.** If `rule_citations: []`, the executor FORCES
-  `escalate_operator` per
-  `feedback_explicit_instruction_over_convenient_interpretation`.
+Two gates this file used to promise are also gone: there is **no confidence floor** forcing
+`escalate_operator` under a tenant threshold, **no citation gate** re-routing an
+empty `rule_citations`, and **no post-decision audit** catching either drift.
+Both counters still render (`pr_merge_specialist_uncited_decisions_total`,
+`pr_merge_specialist_confidence_below_floor_total`) and both are permanently
+zero, so a dashboard reading them green is measuring an absence, not a
+compliance.
 
 ## Operating discipline
 
