@@ -40,7 +40,7 @@ What makes it checkable rather than a matter of trust:
   retention gates of Step 4 (coord rows, which delete nothing when they are
   registered), and one coord finding. The only credential it touches is the
   device JWT the reconciliation census stages in a mode-600 header file to
-  READ coord's gate list.
+  READ coord's gate list — one per repo, for the tenant proven to own it.
 - `--reap` is the other thing a scheduled session may be handed. A retention
   gate registered 14 days earlier cleared, and coord spawned
   `/return-to-main --reap <repo> <wip_ref> --device <id>`. Its only possible
@@ -862,7 +862,7 @@ bash "$CENSUS" --root "$RTM_WS" >"$RUN_DIR/census.json" 2>"$RUN_DIR/census.err";
 |---|---|---|
 | `0` | Every snapshot has a live gate, or there are none | Report the count |
 | `1` | Some snapshot `NEEDS_GATE`, and every ref was decided | Register each one's `registration`, read it back |
-| `3` | UNKNOWN: coord's gate list could not be read for some ref (see its `reason`), or there is no device id | Register the decided `NEEDS_GATE` entries. Report every `UNKNOWN` ref as **not reconciled**, with its reason, and never as gated |
+| `3` | UNKNOWN: coord's gate list could not be read for some ref, or the tenant owning that ref's origin repo could not be proven (see its `reason`), or there is no device id | Register the decided `NEEDS_GATE` entries. Report every `UNKNOWN` ref as **not reconciled**, with its reason, and never as gated |
 | `4` | Usage | A defect in this skill's call; quote the message |
 
 A snapshot counts as ungated when it has no gate at all, or when every gate on
@@ -883,6 +883,15 @@ coord_register_gate(
   gate_class="routine-review"
 )
 ```
+
+**Register under the ref's `tenant_id`.** The census looked the gates up under
+the tenant PROVEN to own the checkout's origin repo, and says which in each
+ref's `tenant_id`. `coord_register_gate` writes under this session's coord
+tenant (`coord_query_identity` `tenant_id`). When the two differ, do NOT
+register: a gate written under the other tenant is invisible to the next
+census, which then offers the same registration again every night. Report
+that ref as **not reconciled — the session's coord tenant is not the repo's**
+(plan `2026-09-23-ccfg-scripts-mint-device-credentials-with-no-tenant`).
 
 A registration succeeded only if it returned a `gate_id` and its initial verdict
 is neither `misconfigured` nor `failed` [policy: coordination
