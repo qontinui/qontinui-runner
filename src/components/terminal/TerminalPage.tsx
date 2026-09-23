@@ -1489,7 +1489,7 @@ function TerminalPageInner({
             re-arms once the count drops back under the threshold. The banner
             reads the threshold from the caps store itself, so this page does
             not subscribe to it. */}
-        <SessionCountBanner sessionCount={tabs.length} />
+        <SessionCountBanner openPaneCount={tabs.length} />
 
         {uiState.showTimeline && zoneLayout.isMultiZone && (
           <ZoneTimeline
