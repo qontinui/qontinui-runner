@@ -30,9 +30,11 @@
 
 import { useState } from "react";
 import { Hourglass } from "lucide-react";
+import { useUIElement } from "@qontinui/ui-bridge";
 import { getApiPort } from "@/lib/runner-api";
 import { createLogger } from "@/lib/logger";
 import { REQUEST_YIELD_COOLDOWN_MS } from "@/lib/lock-yield";
+import { AdvisorySlot } from "./AdvisoryStack";
 import { useNow1Hz } from "./useNow1Hz";
 
 const logger = createLogger("WaitingLockBanner");
@@ -225,8 +227,7 @@ export function WaitingLockBanner({
 
   let buttonTitle: string;
   if (unresolvedHolder) {
-    buttonTitle =
-      "Can't identify the holder session — try from your tab's waiting indicator";
+    buttonTitle = "Can't identify the holder session — try from your tab's waiting indicator";
   } else if (inCooldown) {
     buttonTitle = `Cooldown — request again in ${cooldownLeft}s`;
   } else {
@@ -243,19 +244,16 @@ export function WaitingLockBanner({
     setCooldownUntilMs(Date.now() + REQUEST_YIELD_COOLDOWN_MS);
     try {
       const f = fetchImpl ?? globalThis.fetch;
-      const resp = await f(
-        `http://127.0.0.1:${getApiPort()}/file-locks/yield-request`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            file_path: filePath,
-            requester_task_run_id: taskRunId,
-            requester_name: taskRunName,
-            holder_task_run_id: blockerTaskRunId,
-          }),
-        },
-      );
+      const resp = await f(`http://127.0.0.1:${getApiPort()}/file-locks/yield-request`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          file_path: filePath,
+          requester_task_run_id: taskRunId,
+          requester_name: taskRunName,
+          holder_task_run_id: blockerTaskRunId,
+        }),
+      });
       if (!resp.ok) {
         logger.warn(
           `yield-request POST returned ${resp.status} for ${filePath} (requester=${taskRunId}, holder=${blockerTaskRunId})`,
@@ -270,18 +268,26 @@ export function WaitingLockBanner({
     ? `Request yield from ${blockerName}`
     : "Request yield from holder";
 
+  const { ref } = useUIElement({
+    id: "terminal-waiting-lock-banner",
+    type: "generic",
+    label: "Waiting lock banner",
+  });
+
   return (
-    <div
-      data-ui-bridge-id="terminal.waiting-lock-banner"
-      data-task-run-id={taskRunId}
-      data-file-path={filePath}
-      className="absolute top-2 right-2 z-30 w-[340px] p-2.5 rounded border bg-[#7aa2f7]/10 border-[#7aa2f7]/40 shadow-lg"
-    >
-      <div className="flex items-start gap-2">
-        <Hourglass className="w-3.5 h-3.5 shrink-0 text-[#7aa2f7] mt-0.5" />
-        <div className="text-[11px] text-[#c0caf5] leading-snug flex-1">
-          {message}
-          {/*
+    <AdvisorySlot>
+      <div
+        ref={ref}
+        data-ui-bridge-id="terminal.waiting-lock-banner"
+        data-task-run-id={taskRunId}
+        data-file-path={filePath}
+        className="w-[340px] p-2.5 rounded border bg-[#7aa2f7]/10 border-[#7aa2f7]/40 shadow-lg"
+      >
+        <div className="flex items-start gap-2">
+          <Hourglass className="w-3.5 h-3.5 shrink-0 text-[#7aa2f7] mt-0.5" />
+          <div className="text-[11px] text-[#c0caf5] leading-snug flex-1">
+            {message}
+            {/*
             Phase 2 (stuck-session heartbeat) — inline "(holder idle Xm)"
             suffix. Subdued color so the headline reads naturally; the
             idle cue is supplementary information, not the primary
@@ -289,8 +295,7 @@ export function WaitingLockBanner({
             noise on transient typing/thinking pauses (Open Q3 in the
             plan; threshold tuneable via the constant).
           */}
-          {holderIdleMs !== undefined &&
-            holderIdleMs > HOLDER_IDLE_DISPLAY_THRESHOLD_MS && (
+            {holderIdleMs !== undefined && holderIdleMs > HOLDER_IDLE_DISPLAY_THRESHOLD_MS && (
               <span
                 data-ui-bridge-id="terminal.waiting-lock-banner-holder-idle"
                 data-task-run-id={taskRunId}
@@ -300,39 +305,40 @@ export function WaitingLockBanner({
                 (holder idle {formatIdleDuration(holderIdleMs)})
               </span>
             )}
+          </div>
+        </div>
+        {longWaitSignal && (
+          <div
+            data-ui-bridge-id="terminal.waiting-lock-banner-long-wait-advisory"
+            data-task-run-id={taskRunId}
+            data-file-path={filePath}
+            className="mt-1.5 ml-5 text-[10px] text-[#a9b1d6]/80 leading-snug"
+          >
+            <strong className="text-[#c0caf5]">{longWaitSignal.holderName}</strong> says
+            they&apos;ll be a while. Request yield or cancel?
+            {longWaitSignal.estimatedRemainingMs !== undefined &&
+              ` (${formatEstimate(longWaitSignal.estimatedRemainingMs)})`}
+          </div>
+        )}
+        <div className="mt-2 flex items-center gap-1.5">
+          <button
+            type="button"
+            data-ui-bridge-id="terminal.waiting-lock-banner-request-yield"
+            data-task-run-id={taskRunId}
+            data-file-path={filePath}
+            disabled={buttonDisabled}
+            onClick={() => void handleRequestYield()}
+            title={buttonTitle}
+            className={
+              buttonDisabled
+                ? "px-2 py-0.5 rounded text-[10px] font-medium border border-[#565f89]/30 text-[#565f89]/60 cursor-not-allowed"
+                : "px-2 py-0.5 rounded text-[10px] font-medium bg-[#7aa2f7] text-[#1a1b26] hover:bg-[#bb9af7] transition-colors"
+            }
+          >
+            {inCooldown ? `Cooldown ${cooldownLeft}s` : buttonLabel}
+          </button>
         </div>
       </div>
-      {longWaitSignal && (
-        <div
-          data-ui-bridge-id="terminal.waiting-lock-banner-long-wait-advisory"
-          data-task-run-id={taskRunId}
-          data-file-path={filePath}
-          className="mt-1.5 ml-5 text-[10px] text-[#a9b1d6]/80 leading-snug"
-        >
-          <strong className="text-[#c0caf5]">{longWaitSignal.holderName}</strong>{" "}
-          says they&apos;ll be a while. Request yield or cancel?
-          {longWaitSignal.estimatedRemainingMs !== undefined &&
-            ` (${formatEstimate(longWaitSignal.estimatedRemainingMs)})`}
-        </div>
-      )}
-      <div className="mt-2 flex items-center gap-1.5">
-        <button
-          type="button"
-          data-ui-bridge-id="terminal.waiting-lock-banner-request-yield"
-          data-task-run-id={taskRunId}
-          data-file-path={filePath}
-          disabled={buttonDisabled}
-          onClick={() => void handleRequestYield()}
-          title={buttonTitle}
-          className={
-            buttonDisabled
-              ? "px-2 py-0.5 rounded text-[10px] font-medium border border-[#565f89]/30 text-[#565f89]/60 cursor-not-allowed"
-              : "px-2 py-0.5 rounded text-[10px] font-medium bg-[#7aa2f7] text-[#1a1b26] hover:bg-[#bb9af7] transition-colors"
-          }
-        >
-          {inCooldown ? `Cooldown ${cooldownLeft}s` : buttonLabel}
-        </button>
-      </div>
-    </div>
+    </AdvisorySlot>
   );
 }

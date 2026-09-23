@@ -305,7 +305,6 @@ project.template_lifecycle_events
 project.template_performance
 project.test_associations
 project.test_deficiencies
-project.test_notification_preferences
 project.test_results
 project.test_screenshots
 project.ticket_provider_configs
@@ -546,9 +545,6 @@ coord.prepaid_balances
 coord.primary_tree_branch_events
 coord.primary_trees
 coord.priority_sets
-coord.process_session_output
-coord.process_session_output_id_seq
-coord.process_sessions
 coord.prompt_document_claim_states
 coord.prompt_document_kind_tiers
 coord.prompt_document_proposals
@@ -581,13 +577,11 @@ coord.session_compliance_config_versions
 coord.session_events
 coord.session_events_id_seq
 coord.session_expectations
-coord.session_file_snapshots
 coord.session_handle_lineage
 coord.session_handles
 coord.session_messages
 coord.session_output
 coord.session_policy_reads
-coord.session_touched_files
 coord.sessions
 coord.speculative_chains
 coord.stack_edges
@@ -619,6 +613,7 @@ coord.wip_attribution
 coord.work_plans
 coord.work_unit_deps
 coord.work_unit_dispatches
+coord.work_unit_phase_attestations
 coord.work_unit_pr_citations
 coord.work_unit_status_history
 coord.work_unit_vet_evidence

@@ -163,9 +163,10 @@ impl SupervisionState {
 /// `SupervisionProposal`. Converts the raw `TriggerEvent` payload into a
 /// `GitSupervisionEvent` and records it on the supervision ring.
 ///
-/// Resolves the `SupervisionState` via the Tauri-managed `Arc<ApiState>`
-/// singleton — keeps the trigger system from having to thread an extra
-/// dependency through `TriggerExecutorDeps`.
+/// Resolves the `SupervisionState` out of Tauri's managed state by its
+/// own type — keeps the trigger system from having to thread an extra
+/// dependency through `TriggerExecutorDeps`, and keeps this module from
+/// naming the API state that happens to carry the same handle.
 ///
 /// `event_type` is the trigger system's event type string (e.g.
 /// `"git_commit"`, `"git_branch_switch"`, `"git_tag"`, `"file_changed"`).
@@ -179,11 +180,11 @@ pub async fn handle_supervision_action(
     provenance: &str,
 ) {
     use tauri::Manager;
-    let api_state = match app_handle.try_state::<std::sync::Arc<crate::mcp::types::ApiState>>() {
+    let supervision_state = match app_handle.try_state::<SupervisionState>() {
         Some(s) => s.inner().clone(),
         None => {
             warn!(
-                "SupervisionProposal dispatch skipped: ApiState not yet registered \
+                "SupervisionProposal dispatch skipped: SupervisionState not yet registered \
                  (event_type={}, provenance={})",
                 event_type, provenance
             );
@@ -193,10 +194,7 @@ pub async fn handle_supervision_action(
 
     let kind = trigger_event_type_to_supervision_kind(event_type);
     let event = GitSupervisionEvent::new(kind, event_data, provenance);
-    api_state
-        .supervision_state
-        .record_event(event, app_handle)
-        .await;
+    supervision_state.record_event(event, app_handle).await;
 }
 
 /// Map a trigger-system event type to the supervision event kind exposed

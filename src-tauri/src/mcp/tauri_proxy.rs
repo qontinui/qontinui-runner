@@ -285,9 +285,14 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
 
             // The shared session-env contribution (`QONTINUI_SESSION_WORKTREES`
             // + the configured plan directories) onto the PTY, derived before
-            // the ctx is parked. See `agent_worktree::session_env`.
-            let extra_env =
-                crate::agent_worktree::session_env::session_extra_env(isolated_ctx.as_ref());
+            // the ctx is parked. See `agent_worktree::session_env`. The admitted
+            // spawn tenant selects that tenant's plan/prompt directories where
+            // the device keys them — a lookup key, never an attribution claim.
+            let spawn_tenant_key = spawn_tenant.map(|t| t.to_string());
+            let extra_env = crate::agent_worktree::session_env::session_extra_env(
+                isolated_ctx.as_ref(),
+                spawn_tenant_key.as_deref(),
+            );
 
             match tm.create(
                 a.title,

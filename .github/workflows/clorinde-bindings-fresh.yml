@@ -337,6 +337,13 @@ jobs:
         working-directory: qontinui-runner
         env:
           PAT_AVAILABLE: ${{ secrets.CLORINDE_AUTOCOMMIT_TOKEN != '' }}
+          # Branch name via env, not `${{ }}` splicing: a refname may contain
+          # `" $ ( ) ; & |`, which would be executable shell here. Same reason as
+          # the "Resolve qontinui-web ref" step above and
+          # .github/actions/checkout-sibling. No `|| github.ref_name` fallback:
+          # this step's `if:` requires a pull_request payload, so head_ref is
+          # never empty when it runs and a fallback arm would be unreachable.
+          BRANCH: ${{ github.head_ref }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -348,7 +355,7 @@ jobs:
             echo "::warning::CLORINDE_AUTOCOMMIT_TOKEN not set; pushing with GITHUB_TOKEN (downstream workflows will NOT re-trigger)."
             echo "::warning::Configure a fine-grained PAT with 'Contents: write' permission on qontinui-runner and add as 'CLORINDE_AUTOCOMMIT_TOKEN' secret."
           fi
-          if ! git push origin HEAD:${{ github.head_ref }}; then
+          if ! git push origin "HEAD:$BRANCH"; then
             echo "::error::Push failed (concurrent update on branch?). Falling back to artifact upload."
             exit 1
           fi

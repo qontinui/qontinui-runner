@@ -579,7 +579,7 @@ conclusive ones). **Arm 6 is the DEFAULT**: anything not positively matched by
 | 4 | the error `no work-unit with that slug` (the MCP tool appends ` in your tenant`; the HTTP twin's 404 body deliberately does not, so it cannot leak whether the slug belongs to another tenant — match on the short form) | The unit does not exist. **The COMMONEST case** — a first-time vet of a `DRAFT` plan has no work unit, because §5.4 upserts it at the *end* of this run. | **Proceed to vet, and SAY the read was not-found.** An absent unit and an uncited-but-present unit are different facts; do not fold one into the other. |
 | 3 | a top-level `merged_degraded_reason` is present | **UNKNOWN, whatever `delivery` says.** The field sits BESIDE `delivery` and is present even when the verdict could not be derived at all; while it is set, every citation's `merged: false` is UNKNOWN rather than an observation. | Treat as arm 2. |
 | 2 | `evidence_complete: false` — **regardless of `shipped`** | **UNKNOWN — never "undelivered".** `evidence_gaps` names each gap. | Fall through to the stamp arms and **say the read was inconclusive**, per `verification-and-evidence` `unknown-must-not-render-as-a-default`. |
-| 1 | `shipped: true` ∧ `evidence_complete: true` | The plan is closed **in substance**. | **Do NOT vet** (see "Act here" below). Route to closeout. |
+| 1 | `shipped: true` ∧ `evidence_complete: true` ∧ the phase axis CORROBORATES it (the three extra conjuncts below the table — do not apply this arm without them) | The plan is closed **in substance**. | **Do NOT vet** (see "Act here" below). Route to closeout. |
 | 5 | `delivery` present ∧ no `merged_degraded_reason` ∧ `evidence_complete: true` ∧ `shipped: false` | A clean, complete observation of *not delivered* — including the zero-citation case. | Proceed to vet. |
 | 6 | **DEFAULT — anything not positively matched above.** Any error other than arm 4's, any unparseable or non-2xx body, a `citations_error` / `delivery_error` key, an absent `delivery`, or the tool masked / absent / on a dead transport (`"Command failed with no output"`) | **UNKNOWN.** Includes coord's `citation surface unavailable for work-unit …` (whose own text says it is NOT "this unit has no citations") and its generic `citation list failed: …`. | Treat as arm 2. On a dead transport run **`/coord-revive`** and re-issue over the live door before concluding anything. |
 
@@ -592,11 +592,134 @@ fleet. If a response does not positively satisfy arm 5, it is not arm 5.
 
 Arm 2 drops any condition on `shipped` for the same reason. `shipped` and
 `evidence_complete` are derived independently (`delivery_view::derive_delivery_from`:
-`shipped = inputs.delivered`, `evidence_complete = evidence_gaps.is_empty()`),
+`shipped` from the landed citations and the phase-coverage gate,
+`evidence_complete = evidence_gaps.is_empty()` computed before any phase gap is
+appended),
 and the "merged predicate degraded" gap is **unit-independent** — it fires for
 every unit during a pre-migration window. So `shipped: true ∧
 evidence_complete: false` is reachable, and keying arm 2 on `shipped: false`
 let it fall through to the permissive arm.
+
+**Arm 1 carries a PHASE conjunct, because `evidence_complete: true` is not
+enough on its own.** `shipped` has never meant *"all phases done"* — it is
+*"≥1 cited PR landed ∧ none blocking"*, narrowed by coord's phase gate only when a
+landed citation carries a phase attribution on a declaration of two or more
+phases — so a genuine Phase-1 PR carrying no phase scope on a five-phase plan
+derives it. And the gap that would disclose the difference cannot be read
+off the flag: coord appends the phase gap to `evidence_gaps` **after**
+`evidence_complete` is computed (`evidence_complete = evidence_gaps.is_empty()`,
+and only then is the gap pushed), deliberately, so that it discloses without
+dropping the flag. `evidence_complete: true` beside a NON-EMPTY `evidence_gaps`
+is therefore reachable **by design**, and the identity restated in the paragraph
+above — like the serving build's coord docstring, *"Empty iff `evidence_complete`"*
+(a build carrying plan `2026-09-18-coord-fabricates-a-phase-declaration-and-silences-its-own-gap` says "NOT 'empty iff'") — describes
+the pre-push moment, not the object in front of you. **Read the gap LIST itself
+for the `NO PHASE ATTRIBUTION` entry; a `true` flag does not rule it out.** So
+arm 1 additionally requires all three of:
+
+- `phases_remaining == []` — the LITERAL empty list. `null` is UNKNOWN on the
+  phase axis and is **not** empty; test `null` before you test emptiness, and
+  never collapse the two when serialising the read (a `jq` `// []` default or a
+  Python `or []` does exactly that);
+- **that `[]` corroborated by the same response**: `phases_declared_indices` is
+  non-empty and every index in it also appears in `phases_delivered`. When
+  `phases_declared_indices` is non-empty and `phases_delivered` does not cover
+  it, `[]` contradicts its own neighbours — coord is claiming nothing remains
+  while not having attributed every declared phase — so read it as UNKNOWN and
+  fall through. An
+  EMPTY `phases_declared_indices` is not corroboration either, and neither is a
+  `null` one — the spelling the nullable contract (plan
+  `2026-09-18-coord-fabricates-a-phase-declaration-and-silences-its-own-gap`
+  Phase 3) gives a declaration coord could not establish; and
+- no `NO PHASE ATTRIBUTION` entry in `evidence_gaps`.
+
+A response failing any of those **is not arm 1**: it falls to arm 6, the
+DEFAULT, whose action is arm 2's — fall through to the stamp
+arms and say the read was inconclusive on the phase axis. **One sub-case is not
+inconclusive:** a NON-EMPTY `phases_remaining` beside `shipped: true` is a clean
+reading of PARTIAL delivery — report it as *"partially delivered, phases <list>
+remain — proceed"*; the action is the same. The corroboration test
+is deliberately **build-independent**: `phases_declared_indices` and
+`phases_delivered` are already served beside `phases_remaining` by the coord
+build running today, so it needs no deployment tell and returns the same verdict
+before and after the nullable contract lands. Note the field names are close
+enough to mislead — `phases_declared` is a **count** (`Option<usize>`, `null`
+when coord never knew the plan's phase shape); the declared INDICES are the
+separate field used above.
+
+**Three conjuncts here against `/vet-imp` Step 3's seven, and every difference
+is deliberate — do not "reconcile" it by deleting one.** Two of `/vet-imp`'s
+seven are carried here by something other than a conjunct:
+
+- `phases_declared` is not `null` — **corroboration subsumes it**, because
+  `phases_declared_indices` and `phases_declared` are projections of the same
+  declaration value (`Option<DeclaredPhases>` before that plan's Phase 5,
+  `PhaseDeclaration` after it), so a non-empty indices list cannot sit beside a
+  null count.
+- no top-level `merged_degraded_reason` — **arm ORDER subsumes it**, because
+  arm 3 is evaluated before arm 1 and answers UNKNOWN whatever `delivery` says.
+  `/vet-imp` Step 3 reads through this same arm order and ALSO names the term,
+  so its seven conjuncts read correctly on their own; this arm must not delete
+  arm 3 and rely on a conjunct instead.
+
+The remaining two of `/vet-imp`'s seven are `shipped` and `evidence_complete`,
+which this arm's own row already carries. The two arms therefore accept exactly
+the same responses; if you ever change one, change the other, because they are
+one contract read three times — the third reading is `/implement-plan`'s
+`IN PROGRESS` rule (Step 0.5), which defers to this arm's conjuncts.
+
+The cost is a **false negative**: a genuinely complete unit whose completeness
+was asserted some OTHER way falls through to the stamp arms. Two spellings, and the second is the larger population today. One: a citation
+declaring `complete`, which satisfies coord's coverage gate for a plan of any
+length while attributing no index at all. Two: landed citations carrying **no
+phase scope at all**, which leaves `phases_delivered` empty the same way — for
+a declaration of two or more phases that costs nothing new, because the
+`NO PHASE ATTRIBUTION` gap fires there and the third conjunct already blocked
+the arm; it bites on a **single-phase declaration**, where coord withholds that
+gap on the build serving today (its Gap-5 arm requires `d.len() > 1` until that
+plan's Phase 2) and arm 1 therefore used to fire. That is likely a large share of
+genuinely-complete one-phase plans on today's fleet (unmeasured — phase
+attribution is rare), not an edge case.
+
+**That false negative is not free — say what actually catches it.** The stamp
+arms read the status block captured from disk at item 1, a stamp that lags by
+construction (see above). A `SHIPPED`, `SUPERSEDED` or `OBSOLETE` stamp, or a
+foreign `IN PROGRESS` whose session left PRs, still stops there; a complete plan
+still stamped `VETTED` or `DRAFT` (or `PARTIAL` / `NOT STARTED`) is re-vetted, and under `/vet-imp` the only
+remaining MECHANICAL guard is `/implement-plan` Step 0.45 check 2 — a `git log
+origin/main -20` grep that misses anything older — though §2's claim
+verification may also notice the plan's premises are already met. It is accepted because a false *"do NOT
+vet"* is worse and has no guard after it at all: it abandons live work on a read
+where every field looked healthy. That is not hypothetical — on unit `cf9ae0b2`
+a single-entry `[{"index":0}]` declaration was parsed as a phantom `{1}`, the
+length-1 exemption silenced the `NO PHASE ATTRIBUTION` gap, and
+`phases_remaining: []` rendered *"nothing remains"* on a plan with four phases
+outstanding. A defence keyed on a gap that the defect itself suppresses is not a
+defence, which is why this arm turns on corroboration rather than on the gap
+alone.
+
+**Corroboration is a bound, not a proof — do not overstate it.** It catches that
+defect only *from silence*: it tests coord's own numbers against each other, not
+the declaration against the plan, so a declaration that is wrong *and* covered
+still corroborates. The same phantom `{1}` beside one landed citation whose
+marker carries `phases: 1` gives `phases_declared_indices: [1]` ⊆
+`phases_delivered: [1]`, `phases_remaining: []` and no gap — **corroborated, so
+arm 1 fires**, on a plan with phases outstanding. That residue is closed by no
+single phase and not by this arm: plan
+`2026-09-18-coord-fabricates-a-phase-declaration-and-silences-its-own-gap`'s
+Phase 1 closes only the present-but-rejected-index arm of the positional
+fallback, and a thin but correctly numbered parse (the runner-side under-read,
+plan `2026-09-19-runner-detect-phases-misses-plans-that-list-phases-in-a-table-or-prose`)
+corroborates the same way and is invisible to coord; it is rare today only because phase attribution is rare, and
+the direction of travel is to make attribution common.
+
+*(Plan `2026-09-18-coord-fabricates-a-phase-declaration-and-silences-its-own-gap`.
+Its §3 deliberately excluded `/vet-plan` on the grounds that this skill "does not
+read the field at all" — true, and precisely **why** the hazard lives here rather
+than a reason it is safe. `/vet-imp` Step 2 runs this skill to completion, so an
+unhardened arm 1 STOPs the chain before `/vet-imp` Step 3 ever reads
+`phases_remaining` and its own hardened arm is unreachable. This conjunct is a
+deliberate addition beyond that plan's stated scope.)*
 
 **Do NOT invent a "no citations ⇒ UNKNOWN" arm.** Coord already treats an empty
 `citations` array as a complete observation
@@ -1216,6 +1339,54 @@ rewrite. (`PARTIAL` and `NOT STARTED` are fine to overwrite — your vet
 pass produces fresher information.)
 
 ##### `IN PROGRESS` is CONDITIONALLY overwritable — consumes Step 0.25
+
+This section is the fleet's canonical arm table for that token. The shared
+guard block below states the invariant every plan-status writer carries; the
+arms after it are this command's own, and they are what the block points at.
+
+**The block is byte-identical in every carrier and is never adapted per command
+— so read its "the stamp already there" through this command's own capture.**
+For `/vet-plan` the stamp is NOT re-read here: §4 has already rewritten the
+plan, so "the stamp already there" means **Step 0.25's capture** of it (the
+verbatim token, date and session marker), and the five rules are applied to that
+captured value. Rule 2's resume branch — refresh the date, keep the trail —
+likewise describes the writer's own token; `/vet-plan` writes `VETTED`, so a
+resume here means proceeding to that write with the trail kept, never re-dating
+an `IN PROGRESS` line. The table below this section states the same split for
+both carriers, and `/implement-plan` sits on the other side of it: its capture
+is Step 0.45 check 1 and its stamp is still intact, so it reads the stamp
+inline.
+
+<!-- status-guard:start -->
+> **`IN PROGRESS` is a GUARDED STATE — it is never freely overwritable.**
+> *(Roster and gate: `.claude/commands/_status-writers.md`, check #64. The full
+> arm table and its evaluation order: `/vet-plan`, "`IN PROGRESS` is
+> CONDITIONALLY overwritable".)* Before this command writes, replaces,
+> downgrades or re-dates a plan's lifecycle stamp, read the stamp already there
+> and apply these five rules.
+>
+> 1. **An `IN PROGRESS` stamp is a conditional STOP, not a value to replace.**
+>    It protects a live peer's in-flight work.
+> 2. **The discriminator is the SESSION MARKER, not the token.** A marker that
+>    IS your own current session id is a resume: refresh the date and keep the
+>    trail, never take over. A marker that is a different session id is a LIVE
+>    PEER unless you can positively verify that session died with zero work
+>    products — transcript tail shows death, its worktrees clean and 0 ahead of
+>    `origin/main`, and no PRs and no branches for the plan. Verified dead, and
+>    only then, adopt it and append your own marker.
+> 3. **No marker, or one you cannot positively attribute, is the UNIDENTIFIED
+>    DEFAULT: STOP.** Not an overwrite, and not an adoption. Adoption is the
+>    earned branch; stopping is the fallback.
+> 4. **Do not LAUNDER it.** Rewriting the token into `NOT STARTED`, `PARTIAL`,
+>    `DRAFT`, a terminal state or a bare re-date converts a hard STOP into a
+>    state the other writers declare freely overwritable, and every downstream
+>    reader then sees a well-formed stamp written by a trusted skill. That is
+>    this guard's failure mode: laundering, not bypass (#485).
+> 5. **An UNKNOWN is not permission.** A delivery read that is degraded, masked,
+>    non-2xx, unparseable or carrying `merged_degraded_reason` leaves the
+>    stamp's meaning unestablished. Fall through to STOP, never to overwrite,
+>    and say the read was inconclusive.
+<!-- status-guard:end -->
 
 `IN PROGRESS` is deliberately **not** a fourth unconditional token in the list
 above, and adding it as one would be a regression: it has three dispositions,
@@ -2444,8 +2615,9 @@ leave it in the report.
   options Register / Skip), showing the derived anchor + predicate + condition.
   Under opt-in auto mode (env `QONTINUI_AUTO_GATE=1`) register without asking and
   note the gate_id in the report.
-- **Anchor (zero user input):** `work_unit_id` (a UUID) from
-  `POST $COORD_HTTP_URL/coord/work-units/upsert` with the plan stem as `slug`
+- **Anchor (zero user input):** `work_unit_id` (a UUID) from the MCP tool
+  **`coord_work_unit_upsert`**, or its REST twin
+  `POST $COORD_HTTP_URL/coord/work-units/upsert`, with the plan stem as `slug`
   (capture the returned `work_unit_id`; or the device-authed
   `GET /coord/agent-work-units/<slug>` — the operator `GET /coord/work-units/<slug>`
   403s a device JWT);
@@ -2455,7 +2627,8 @@ leave it in the report.
   `deploy_healthy`, `claim_terminal`, `operator_approval`, `ci_green`,
   `ref_exists`, `metric_threshold`, `time_elapsed`, `unit_ready`,
   `migration_at_head`, `infra_drift_clear`, `file_exists`, `sql_count`,
-  `unit_status`, `gate_cleared`, `commit_live`, `runner_served_sha`; plus — **exception cases only,
+  `unit_status`, `gate_cleared`, `commit_live`, `runner_served_sha`,
+  `schema_object_exists`; plus — **exception cases only,
   see the Continuation bullet below** — an optional typed `continuation` or legacy
   `continuation_prompt`). **HTTP fallback** when MCP is unavailable — for a
   plan-anchored gate it is now TWO device-authed calls on coord's `require_jwt`

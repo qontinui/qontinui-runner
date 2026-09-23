@@ -76,11 +76,18 @@ export interface TerminalTab {
   /** Claude config dir for the session (set on resume). */
   claudeConfigDir?: string;
   /**
-   * Coordinator `task_run_id` for tabs backed by a registered `WorkerSession`.
-   * Presence is the worker marker — `ZoneGrid::onTitleChange` skips the local
-   * `renameTab` + backend `terminal_set_title` invoke so worker tabs stay
-   * pinned at `Worker N` in the tab strip. Mirrors the Phase 1 backend gate
-   * (`set_title_unless_worker`) on the frontend side.
+   * Orchestration `task_run_id`, copied from the `TerminalSessionRecord` of a
+   * Conductor worker (`dispatch_subtask` in
+   * `orchestration_loop/ai_session_executor.rs`). `workerTabFromRecord` is
+   * its only writer and always sets {@link sessionBacked} beside it, so a tab
+   * carrying this is a worker view and never a pty tab.
+   *
+   * It is an identity, not a behaviour switch: `WorkerSessionCell` keys the
+   * conversation and steering channels on it, and `closeTerminal` records it
+   * so a hidden worker can be found again. The `Worker N` title pin is NOT
+   * enforced from here — see `ZoneGrid::onTitleChange`, which no longer tests
+   * this field because a worker never mounts the `TerminalInstance` that
+   * reports OSC titles.
    */
   taskRunId?: string;
   /**
@@ -128,12 +135,6 @@ export interface TerminalTab {
    * real tab.
    */
   __synthetic?: boolean;
-}
-
-/** Tauri event payload from `commands::productivity::spawn_worker_session`. */
-interface WorkerRegisteredPayload {
-  terminalId: string;
-  taskRunId: string;
 }
 
 /**
@@ -205,10 +206,17 @@ export function shouldIngestCreatedTerminal(
 /**
  * Pure helper: fold a `terminal-created` payload into the existing tab list.
  * Returns the next tabs array — the SAME identity when the terminal already
- * exists (dedup), otherwise a new array with the tab appended. `pendingTaskRunId`
- * is the worker mark drained from the race buffer by the caller (or `undefined`);
- * `pendingBypass` is the bypass-permissions mark drained the same way (a
- * `terminal-bypass-permissions` event that arrived before this `terminal-created`).
+ * exists (dedup), otherwise a new array with the tab appended. `pendingBypass`
+ * is the bypass-permissions mark drained from the race buffer by the caller (a
+ * `terminal-bypass-permissions` event that arrived before this
+ * `terminal-created`); `pendingRemote` is the remote identity drained the same
+ * way.
+ *
+ * This path never stamps a `taskRunId`. Every tab it builds is a PTY tab, and
+ * the only worker mark it ever carried came from the event-based marking drain
+ * that went with the Productivity scheduler — a Conductor worker's tab is
+ * built by `workerTabFromRecord` instead, off a durable
+ * `TerminalSessionRecord`.
  *
  * Exported so `useTerminalManager.test.ts` can drive the ingest + dedup contract
  * without booting React.
@@ -216,7 +224,6 @@ export function shouldIngestCreatedTerminal(
 export function reduceCreatedTerminal(
   tabs: TerminalTab[],
   info: TerminalInfo,
-  pendingTaskRunId: string | undefined,
   pendingBypass = false,
   pendingRemote?: RemoteTabIdentity,
 ): TerminalTab[] {
@@ -231,7 +238,6 @@ export function reduceCreatedTerminal(
       exitCode: info.exitCode ?? null,
       workingDir: info.workingDir || undefined,
       createdAt: info.createdAt,
-      taskRunId: pendingTaskRunId,
       bypassPermissions: pendingBypass || undefined,
       remote: pendingRemote,
     },
@@ -257,33 +263,11 @@ export function nextActiveIdAfterIngest(info: TerminalInfo, isNewTab: boolean): 
 
 /**
  * Pure helper: decide whether `tabs` should be replaced when applying a
- * worker mark for `terminalId`. Returns the next tabs array (same identity
- * if no change), and a `buffered` flag the caller uses to record the mark
- * in `pendingWorkerMarks` when the tab record hasn't arrived yet.
- *
- * Exported so `useTerminalManager.test.ts` can drive the race-safety + idempotency
- * contract without booting React.
- */
-export function applyWorkerMark(
-  tabs: TerminalTab[],
-  terminalId: string,
-  taskRunId: string,
-): { tabs: TerminalTab[]; buffered: boolean } {
-  const idx = tabs.findIndex((t) => t.id === terminalId);
-  if (idx < 0) return { tabs, buffered: true };
-  if (tabs[idx].taskRunId === taskRunId) return { tabs, buffered: false };
-  const next = tabs.slice();
-  next[idx] = { ...tabs[idx], taskRunId };
-  return { tabs: next, buffered: false };
-}
-
-/**
- * Pure helper: decide whether `tabs` should be replaced when applying a
  * bypass-permissions mark for `terminalId`. Returns the next tabs array (same
  * identity if no change), and a `buffered` flag the caller uses to record the
  * mark in `pendingBypassMarks` when the tab record hasn't arrived yet.
  *
- * Mirrors `applyWorkerMark` — the `terminal-bypass-permissions` event can
+ * Sibling of `applyRemoteMark` — the `terminal-bypass-permissions` event can
  * arrive before OR after `terminal-created` lands the tab in React state.
  * Exported so `useTerminalManager.test.ts` can drive the race-safety +
  * idempotency contract without booting React.
@@ -469,7 +453,7 @@ export interface HiddenWorker {
  *    a re-sync must not clobber them.
  *
  * Returns the SAME array reference when nothing changed, so the caller can skip
- * a render (same contract as `applyWorkerMark` / `reconcilePages`).
+ * a render (same contract as `applyBypassMark` / `reconcilePages`).
  *
  * `backendTerminals` MUST already be filtered to this page — the caller owns
  * that filter because it also owns the `pageId || "default"` normalization.
@@ -702,20 +686,12 @@ export function useTerminalManager(
   const nextTitleNum = useRef(1);
   const [initialized, setInitialized] = useState(false);
   /**
-   * Worker marks (`terminalId → taskRunId`) received from the Rust side
-   * before their tab record exists in React state. The Tauri command path
-   * emits `terminal-created` then `worker-registered` in order, but their
-   * arrival order at the webview is not strictly guaranteed; on reconnect
-   * we also call `list_workers` while `terminal_list` is mid-flight, so a
-   * buffer is the simplest race-safe shape.
-   */
-  const pendingWorkerMarks = useRef<Map<string, string>>(new Map());
-  /**
    * Bypass-permissions marks (`terminalId`) received from the Rust
    * `terminal-bypass-permissions` event before their tab record exists in
-   * React state. Same race shape as `pendingWorkerMarks`: the event is emitted
-   * right after `terminal-created`, but arrival order at the webview is not
-   * strictly guaranteed (and reconnect rebuilds tabs without re-firing it).
+   * React state. The event is emitted right after `terminal-created`, but
+   * arrival order at the webview is not strictly guaranteed (and reconnect
+   * rebuilds tabs without re-firing it), so a buffer is the simplest
+   * race-safe shape.
    */
   const pendingBypassMarks = useRef<Set<string>>(new Set());
   /**
@@ -749,16 +725,6 @@ export function useTerminalManager(
    * gone), so it stays bounded by the live tab count.
    */
   const settledIdsRef = useRef<Set<string>>(new Set());
-
-  const markAsWorker = useCallback((terminalId: string, taskRunId: string) => {
-    setTabs((prev) => {
-      const result = applyWorkerMark(prev, terminalId, taskRunId);
-      if (result.buffered) {
-        pendingWorkerMarks.current.set(terminalId, taskRunId);
-      }
-      return result.tabs;
-    });
-  }, []);
 
   /**
    * Add the grid tab for a Conductor worker's lifecycle record. Idempotent:
@@ -977,10 +943,6 @@ export function useTerminalManager(
       // Drain the race buffer OUTSIDE the reducer so the `setTabs` updater
       // stays pure (React StrictMode double-invokes updaters in dev; a
       // delete-inside-reducer would miss on the second pass).
-      const pendingTaskRunId = pendingWorkerMarks.current.get(info.id);
-      if (pendingTaskRunId !== undefined) {
-        pendingWorkerMarks.current.delete(info.id);
-      }
       const pendingBypass = pendingBypassMarks.current.has(info.id);
       if (pendingBypass) {
         pendingBypassMarks.current.delete(info.id);
@@ -999,7 +961,7 @@ export function useTerminalManager(
       const wasNew = !ingestedIds.current.has(info.id);
       const selectId = nextActiveIdAfterIngest(info, wasNew);
       setTabs((prev) =>
-        reduceCreatedTerminal(prev, info, pendingTaskRunId, pendingBypass, pendingRemote),
+        reduceCreatedTerminal(prev, info, pendingBypass, pendingRemote),
       );
       if (selectId !== null) {
         ingestedIds.current.add(info.id);
@@ -1020,25 +982,6 @@ export function useTerminalManager(
       unlisten?.();
     };
   }, [pageId]);
-
-  // Mirror the Phase 1 backend worker gate on the frontend. The Rust side
-  // emits `worker-registered` right after `SessionManager::register_worker`
-  // succeeds in `commands::productivity::spawn_worker_session`; consuming
-  // it here lets `ZoneGrid::onTitleChange` skip OSC 0/2 `renameTab` for
-  // worker pty tabs.
-  useEffect(() => {
-    let unlisten: (() => void) | null = null;
-    listen<WorkerRegisteredPayload>("worker-registered", (event) => {
-      const { terminalId, taskRunId } = event.payload;
-      if (!terminalId || !taskRunId) return;
-      markAsWorker(terminalId, taskRunId);
-    }).then((fn) => {
-      unlisten = fn;
-    });
-    return () => {
-      unlisten?.();
-    };
-  }, [markAsWorker]);
 
   // Bypass-aware needs-input detection (plan
   // `2026-06-07-runner-continuation-defer-and-phantom-needs-input.md`).
@@ -1091,14 +1034,12 @@ export function useTerminalManager(
             const terminals = (result.data as { terminals: TerminalInfo[] }).terminals;
             const info = terminals.find((t) => t.id === id);
             if (!info) return;
-            const pendingTaskRunId = pendingWorkerMarks.current.get(id);
-            if (pendingTaskRunId !== undefined) pendingWorkerMarks.current.delete(id);
             const pendingBypass = pendingBypassMarks.current.has(id);
             if (pendingBypass) pendingBypassMarks.current.delete(id);
             const pendingRemote = pendingRemoteMarks.current.get(id);
             if (pendingRemote !== undefined) pendingRemoteMarks.current.delete(id);
             setTabs((prev) =>
-              reduceCreatedTerminal(prev, info, pendingTaskRunId, pendingBypass, pendingRemote),
+              reduceCreatedTerminal(prev, info, pendingBypass, pendingRemote),
             );
             ingestedIds.current.add(id);
             setActiveId(id);
@@ -1229,30 +1170,12 @@ export function useTerminalManager(
       // Select the last tab (most recently created)
       setActiveId(reconnectedTabs[reconnectedTabs.length - 1].id);
 
-      // Backfill the Phase 2 worker marker for reconnected tabs. The Rust
-      // `SessionManager` keeps `WorkerSession` registrations across reloads
-      // of the React tree, so a `worker-registered` event won't re-fire for
-      // these tabs — we have to ask. Fire-and-forget; if it fails the
-      // worker tabs simply lose the gate on the frontend (backend gate
-      // still holds).
-      invoke<Array<{ terminal_id: string; task_run_id: string }>>("list_workers")
-        .then((workers) => {
-          for (const w of workers) {
-            if (w.terminal_id && w.task_run_id) {
-              markAsWorker(w.terminal_id, w.task_run_id);
-            }
-          }
-        })
-        .catch((err) => {
-          logger.warn(`list_workers backfill failed: ${err}`);
-        });
-
       return reconnectedTabs.map((t) => t.id);
     } catch (err) {
       console.error("[TerminalManager] Failed to reconnect:", err);
       return null;
     }
-  }, [pageId, markAsWorker]);
+  }, [pageId]);
 
   /** Mark a tab as having completed reconnection (buffer replayed). */
   const markReconnected = useCallback((id: string) => {
@@ -1617,7 +1540,6 @@ export function useTerminalManager(
      */
     resyncTabs,
     markReconnected,
-    markAsWorker,
     markAsBypass,
     markAsRemote,
     adoptWorkerTab,

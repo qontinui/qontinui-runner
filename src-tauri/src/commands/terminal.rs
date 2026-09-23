@@ -7,7 +7,6 @@ use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Manager;
 use tracing::{debug, info, warn};
 
-use crate::claude_session::SessionManager;
 use crate::commands::CommandResponse;
 use crate::error::AppError;
 use crate::session::pane_store::{PaneKey, PaneSessionStore};
@@ -206,7 +205,17 @@ pub async fn terminal_create(
     // the configured plan directories). Derived from the live isolated edit
     // context before it is parked on the session; each var is omitted when it
     // does not resolve. See `agent_worktree::session_env`.
-    let extra_env = crate::agent_worktree::session_env::session_extra_env(isolated_ctx.as_ref());
+    //
+    // The admitted spawn tenant rides along as the plan/prompt directory LOOKUP
+    // KEY: a device bound to several tenants may keep each one's plans
+    // elsewhere, and this is the tenant the picker chose for this launch. It
+    // selects a stored path and nothing more — attribution of anything the
+    // session captures comes from the credential, never from this.
+    let spawn_tenant_key = spawn_tenant_id.map(|t| t.to_string());
+    let extra_env = crate::agent_worktree::session_env::session_extra_env(
+        isolated_ctx.as_ref(),
+        spawn_tenant_key.as_deref(),
+    );
     // Phase 6 (B4): the whole blocking spawn (PTY open, identity seam, child
     // exec) runs on a BLOCKING thread, matching the AI path
     // (`commands::ai_session`). It used to be a bare synchronous call on a
@@ -470,26 +479,14 @@ pub fn terminal_write(
 /// a `terminal-title-changed` event so other webview windows / WS
 /// subscribers stay consistent.
 ///
-/// Worker pin (plan `2026-05-12-claude-auto-title-suppression-worker-tabs-plan.md`):
-/// goes through [`TerminalManager::set_title_unless_worker`] so OSC 0
-/// titles emitted by Claude inside a worker pty are silently dropped —
-/// `Worker N` stays pinned for the lifetime of the tab. Non-worker
-/// terminals (manual `claude` from the Terminal tab, PowerShell, etc.)
-/// keep the existing follow-the-child behaviour.
 #[tauri::command]
 pub fn terminal_set_title(
     terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
-    session_manager: tauri::State<'_, Arc<SessionManager>>,
     app_handle: tauri::AppHandle,
     terminal_id: String,
     title: String,
 ) -> Result<CommandResponse, String> {
-    terminal_manager.set_title_unless_worker(
-        session_manager.inner().as_ref(),
-        &terminal_id,
-        title,
-        &app_handle,
-    )?;
+    terminal_manager.set_title(&terminal_id, title, &app_handle)?;
     Ok(CommandResponse {
         success: true,
         message: None,
@@ -2155,8 +2152,13 @@ pub(crate) fn create_terminal_session_backend(
     // convenience for `claude` launches is appended into `command` by the
     // caller (gate-continuation in `agent_runtime.rs`), since only the caller
     // knows the launch is `claude`.
+    // No acting tenant: a gate continuation is coord-spawned, so no picker chose
+    // one (`tenant_id: None` below), and there is nothing here to key the
+    // plan/prompt directories by. `None` resolves the DEVICE DEFAULT, which is
+    // what this path has always been handed — inventing a tenant would let
+    // something other than the picker decide which directory it authors into.
     let mut env_pairs: Vec<(String, String)> =
-        crate::agent_worktree::session_env::session_env(isolated_ctx.as_ref());
+        crate::agent_worktree::session_env::session_env(isolated_ctx.as_ref(), None);
     // Account selection: pin the spawned PTY to the account the caller chose
     // (gate continuations set `capture_hint.config_dir` to the selected,
     // token-bearing account). Without this, a backend-spawned `claude` inherits

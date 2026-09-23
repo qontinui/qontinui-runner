@@ -7,7 +7,9 @@
 //! launch surface (`commands::terminal` ×2, `commands::productivity` ×2,
 //! `mcp::terminals`, `mcp::tauri_proxy`, `mcp::backend_relay`) — seven copies of
 //! the same `ctx.session_worktrees_env_value().map(|v| vec![(KEY, v)])`
-//! expression. The only genuinely shared piece was the *transport*:
+//! expression. Five today: the two `commands::productivity` surfaces went with
+//! the plan/task board in Phase 4 of
+//! `2026-09-12-consolidate-local-orchestration-onto-conductor`. The only genuinely shared piece was the *transport*:
 //! `TerminalManager::create`'s `extra_env` parameter, which each surface
 //! filled in itself.
 //!
@@ -24,9 +26,13 @@
 //! | Var | Source | Omitted when |
 //! |---|---|---|
 //! | `QONTINUI_SESSION_WORKTREES` | the launch's [`IsolatedEditContext`] | no context / no materialized worktrees |
-//! | `QONTINUI_PLANS_DIR` | `PathSettings::plans_dir` | markdown-plan tier off |
-//! | `QONTINUI_PLANS_ARCHIVE_DIR` | `PathSettings::plans_archive_dir` | no archive location configured |
-//! | `QONTINUI_PROMPTS_DIR` | `PathSettings::prompts_dir` | no prompts location configured |
+//! | `QONTINUI_PLANS_DIR` | `PathSettings::plans_dir_by_tenant[tenant]`, else `plans_dir` | markdown-plan tier off for that tenant |
+//! | `QONTINUI_PLANS_ARCHIVE_DIR` | `plans_archive_dir_by_tenant[tenant]`, else `plans_archive_dir` | no archive location configured |
+//! | `QONTINUI_PROMPTS_DIR` | `prompts_dir_by_tenant[tenant]`, else `prompts_dir` | no prompts location configured |
+//!
+//! Each of the three directories is resolved **for the launching tenant** —
+//! see [`session_env`]'s `tenant` parameter for what that key is and why `None`
+//! is a first-class answer rather than a gap.
 //!
 //! The two plan vars are a **pre-existing contract** this module finally
 //! produces: `qontinui-stack/scripts/resolve-plan-deps.py` and the
@@ -71,12 +77,6 @@ pub const PLANS_ARCHIVE_DIR_ENV: &str = "QONTINUI_PLANS_ARCHIVE_DIR";
 /// state its own fallback rather than assume a path.
 pub const PROMPTS_DIR_ENV: &str = "QONTINUI_PROMPTS_DIR";
 
-/// Normalize a configured directory string: a blank value is *unset*, never a
-/// directory named `""`.
-fn non_blank(value: Option<String>) -> Option<String> {
-    value.filter(|s| !s.trim().is_empty())
-}
-
 /// Assemble the env pairs from already-resolved values. Pure — the IO-free
 /// core [`session_env`] is built on, and the unit under test for the
 /// "every var present / every var omitted" drift guard.
@@ -98,7 +98,8 @@ fn build_session_env(
 }
 
 /// The full environment contribution for a session launched with `ctx` (the
-/// launch's [`IsolatedEditContext`], or `None` for a shared-checkout launch).
+/// launch's [`IsolatedEditContext`], or `None` for a shared-checkout launch)
+/// on behalf of `tenant`.
 ///
 /// Callers that build their own `Vec` (e.g. the backend-spawn path, which also
 /// appends `CLAUDE_CONFIG_DIR` and the agent git identity) `extend` with this;
@@ -115,22 +116,63 @@ fn build_session_env(
 /// directories by construction. Settings are re-read here on every launch, so
 /// a change in the Paths settings section reaches the next session with no
 /// restart.
-pub fn session_env(ctx: Option<&IsolatedEditContext>) -> Vec<(String, String)> {
+///
+/// ## `tenant`: the launching tenant, as a lookup key
+///
+/// A device may be bound to N coord tenants, each of which may keep its plans
+/// and prompts somewhere else (`PathSettings::plans_dir_by_tenant` and its two
+/// twins). `tenant` is the id the spawn was admitted under — canonical
+/// `Uuid::to_string()` form — and it selects that tenant's directories when it
+/// has any. It is a **lookup key only**: nothing downstream may read it as
+/// evidence of who owns a captured artifact, which comes from the credential
+/// (plan `2026-09-22-plans-dir-is-a-single-path-so-a-multi-bound-device-cannot-author-per-tenant`
+/// §2 D1).
+///
+/// **`None` is a first-class answer, not a gap.** Three launch paths have no
+/// acting tenant by design — a coord-spawned gate continuation, a spawn relayed
+/// from another machine, and a steward running under the machine default — and
+/// a launch whose tenant does not resolve passes `None` and gets the device
+/// default, unchanged from before this setting was keyed. Inventing a tenant for
+/// those paths would let something other than the picker choose which of this
+/// device's directories a session authors into.
+pub fn session_env(
+    ctx: Option<&IsolatedEditContext>,
+    tenant: Option<&str>,
+) -> Vec<(String, String)> {
     // One settings read for all three directories — `get_setting` re-reads and
     // re-parses the whole settings file on every call.
     let paths = get_setting::<PathSettings>();
     build_session_env(
         ctx.and_then(|c| c.session_worktrees_env_value()),
-        qontinui_runner_lib::plan_workunit_adapter::resolve_plans_dir(paths.plans_dir),
-        non_blank(paths.plans_archive_dir),
-        qontinui_runner_lib::plan_workunit_adapter::resolve_prompts_dir(paths.prompts_dir),
+        qontinui_runner_lib::plan_workunit_adapter::resolve_plans_dir(
+            paths.plans_dir,
+            &paths.plans_dir_by_tenant,
+            tenant,
+        ),
+        // Routed through the archive resolver rather than this module's own
+        // `non_blank` so the per-tenant rung applies here too — the seam is
+        // what keeps the scan roots and the launched session agreeing.
+        qontinui_runner_lib::plan_workunit_adapter::resolve_plans_archive_dir(
+            paths.plans_archive_dir,
+            &paths.plans_archive_dir_by_tenant,
+            tenant,
+        ),
+        qontinui_runner_lib::plan_workunit_adapter::resolve_prompts_dir(
+            paths.prompts_dir,
+            &paths.prompts_dir_by_tenant,
+            tenant,
+        ),
     )
 }
 
 /// [`session_env`] in the shape `TerminalManager::create`'s `extra_env`
 /// parameter takes: `None` rather than an empty vec when nothing resolves.
-pub fn session_extra_env(ctx: Option<&IsolatedEditContext>) -> Option<Vec<(String, String)>> {
-    let pairs = session_env(ctx);
+/// `tenant` carries the same meaning as on [`session_env`].
+pub fn session_extra_env(
+    ctx: Option<&IsolatedEditContext>,
+    tenant: Option<&str>,
+) -> Option<Vec<(String, String)>> {
+    let pairs = session_env(ctx, tenant);
     if pairs.is_empty() {
         None
     } else {
@@ -141,6 +183,9 @@ pub fn session_extra_env(ctx: Option<&IsolatedEditContext>) -> Option<Vec<(Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qontinui_runner_lib::plan_workunit_adapter::{
+        resolve_plans_archive_dir, resolve_plans_dir, resolve_prompts_dir,
+    };
 
     fn lookup<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
         pairs
@@ -223,19 +268,159 @@ mod tests {
     }
 
     /// A blank archive/prompts setting is treated as unset — never exported
-    /// as `""`. Both go through the same resolver contract.
+    /// as `""`. All three go through the same resolver contract, which is the
+    /// only place the rule is now spelled: this module used to carry its own
+    /// `non_blank` copy for the archive dir and no longer does.
     #[test]
     fn blank_dir_settings_are_unset() {
-        assert_eq!(non_blank(Some("   ".to_string())), None);
-        assert_eq!(non_blank(Some(String::new())), None);
+        let none = no_overrides();
         assert_eq!(
-            non_blank(Some("/w/dev-notes/plans".to_string())).as_deref(),
-            Some("/w/dev-notes/plans")
-        );
-        assert!(build_session_env(None, None, non_blank(Some("   ".to_string())), None).is_empty());
-        assert_eq!(
-            qontinui_runner_lib::plan_workunit_adapter::resolve_prompts_dir(Some("  ".to_string())),
+            resolve_plans_archive_dir(Some("   ".to_string()), &none, None),
             None
         );
+        assert_eq!(
+            resolve_plans_archive_dir(Some(String::new()), &none, None),
+            None
+        );
+        assert_eq!(
+            resolve_plans_archive_dir(Some("/w/dev-notes/plans".to_string()), &none, None)
+                .as_deref(),
+            Some("/w/dev-notes/plans")
+        );
+        assert!(build_session_env(
+            None,
+            None,
+            resolve_plans_archive_dir(Some("   ".to_string()), &none, None),
+            None
+        )
+        .is_empty());
+        assert_eq!(
+            resolve_prompts_dir(Some("  ".to_string()), &none, None),
+            None
+        );
+    }
+
+    // ---- per-tenant resolution at launch -----------------------------------
+    //
+    // Two distinct guarantees, and each test below says which one it gives:
+    //
+    //  (a) THE RESOLVER CONTRACT — which of the two rungs answers for a given
+    //      tenant. Asserted here on the resolvers, with the launch's own
+    //      settings shape, because `session_env`/`session_extra_env` read the
+    //      settings store and cannot be driven in a unit test.
+    //  (b) THE THREADING — that the tenant a launch was ADMITTED under is the
+    //      one that reaches the resolver. That is pinned by the compiler: the
+    //      `tenant` parameter is mandatory, so all six launch sites had to name
+    //      a value, and the three that have a spawn tenant in scope pass it
+    //      while the three that have none by design pass `None`. The drift
+    //      guards above (`emits_every_dir_var_when_configured` and friends)
+    //      exercise `build_session_env` only and can see NEITHER guarantee —
+    //      which is why these live separately rather than being folded in.
+
+    fn no_overrides() -> std::collections::BTreeMap<String, String> {
+        std::collections::BTreeMap::new()
+    }
+
+    fn keyed(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    const TENANT_A: &str = "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a";
+    const TENANT_B: &str = "7ac125b6-391b-4d64-8493-27305b25c5b9";
+
+    /// GUARANTEE (a), the resolver contract, in the exact shape the launch
+    /// applies it: tenant A has an entry, and a **tenant-B launch** on the same
+    /// device gets the DEVICE DEFAULT — not A's directory, and not nothing.
+    /// This is the one assertion that distinguishes a correct per-tenant
+    /// override from a leak between tenants.
+    #[test]
+    fn a_tenant_b_launch_gets_the_device_default_never_tenant_as_directory() {
+        let plans = keyed(&[(TENANT_A, "/tenant-a/plans")]);
+        let device = || Some("/device/plans".to_string());
+
+        let for_b = resolve_plans_dir(device(), &plans, Some(TENANT_B));
+        assert_eq!(for_b.as_deref(), Some("/device/plans"));
+
+        let pairs_for_b = build_session_env(None, for_b, None, None);
+        assert_eq!(lookup(&pairs_for_b, PLANS_DIR_ENV), Some("/device/plans"));
+
+        let pairs_for_a = build_session_env(
+            None,
+            resolve_plans_dir(device(), &plans, Some(TENANT_A)),
+            None,
+            None,
+        );
+        assert_eq!(lookup(&pairs_for_a, PLANS_DIR_ENV), Some("/tenant-a/plans"));
+    }
+
+    /// GUARANTEE (a). All three directories are keyed, so a launch for a tenant
+    /// that keys all three is handed all three of ITS OWN — the plans var
+    /// switching tenant while the prompts var silently stayed device-wide would
+    /// be the half-shipped version of this capability.
+    #[test]
+    fn all_three_dir_vars_resolve_per_tenant_at_launch() {
+        let tenant = Some(TENANT_B);
+        let pairs = build_session_env(
+            None,
+            resolve_plans_dir(
+                Some("/device/plans".to_string()),
+                &keyed(&[(TENANT_B, "/b/plans")]),
+                tenant,
+            ),
+            resolve_plans_archive_dir(
+                Some("/device/archive".to_string()),
+                &keyed(&[(TENANT_B, "/b/archive")]),
+                tenant,
+            ),
+            resolve_prompts_dir(
+                Some("/device/prompts".to_string()),
+                &keyed(&[(TENANT_B, "/b/prompts")]),
+                tenant,
+            ),
+        );
+        assert_eq!(lookup(&pairs, PLANS_DIR_ENV), Some("/b/plans"));
+        assert_eq!(lookup(&pairs, PLANS_ARCHIVE_DIR_ENV), Some("/b/archive"));
+        assert_eq!(lookup(&pairs, PROMPTS_DIR_ENV), Some("/b/prompts"));
+        assert_eq!(pairs.len(), 3);
+    }
+
+    /// GUARANTEE (a) + the absent-not-empty invariant this module exists to
+    /// hold. A tenant with no entry on a device with no scalar gets **no
+    /// `QONTINUI_PLANS_DIR` key at all** — never `QONTINUI_PLANS_DIR=""`,
+    /// because a skill's "unset ⇒ use the documented fallback" clause keys off
+    /// the key's absence.
+    #[test]
+    fn an_unkeyed_tenant_with_no_device_default_omits_the_var_entirely() {
+        let plans = keyed(&[(TENANT_A, "/tenant-a/plans")]);
+        let for_b = resolve_plans_dir(None, &plans, Some(TENANT_B));
+        assert_eq!(for_b, None);
+        let pairs = build_session_env(None, for_b, None, None);
+        assert_eq!(lookup(&pairs, PLANS_DIR_ENV), None);
+        assert!(pairs.is_empty(), "an absent value is an absent KEY");
+    }
+
+    /// GUARANTEE (a). The three launch paths that have no acting tenant by
+    /// design — a coord-spawned gate continuation, a relayed spawn, a steward —
+    /// pass `None`, and `None` must resolve to the device default rather than to
+    /// nothing. Turning the plan tier off for those paths is exactly the
+    /// fail-closed regression the fall-back rung exists to prevent.
+    #[test]
+    fn a_launch_with_no_acting_tenant_still_gets_the_device_default() {
+        let plans = keyed(&[(TENANT_A, "/tenant-a/plans")]);
+        let pairs = build_session_env(
+            None,
+            resolve_plans_dir(Some("/device/plans".to_string()), &plans, None),
+            resolve_plans_archive_dir(Some("/device/archive".to_string()), &no_overrides(), None),
+            resolve_prompts_dir(Some("/device/prompts".to_string()), &no_overrides(), None),
+        );
+        assert_eq!(lookup(&pairs, PLANS_DIR_ENV), Some("/device/plans"));
+        assert_eq!(
+            lookup(&pairs, PLANS_ARCHIVE_DIR_ENV),
+            Some("/device/archive")
+        );
+        assert_eq!(lookup(&pairs, PROMPTS_DIR_ENV), Some("/device/prompts"));
     }
 }

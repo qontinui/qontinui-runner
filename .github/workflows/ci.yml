@@ -1013,9 +1013,19 @@ jobs:
       # deliberately left alone. Folding the two together would make one roster
       # row assert two things and leave its lockstep check meaningless.
       #
-      # `continue-on-error` with NO step-level `timeout-minutes`: pairing those
-      # two cancels the whole JOB on trip rather than the step (the mechanism
-      # that broke the reverted nextest shadow — see the ingest script header).
+      # `continue-on-error` with NO step-level `timeout-minutes`: the reverted
+      # nextest shadow (scripts/ci-test-results-ingest.mjs header) paired the
+      # two and its step recorded `cancelled` with every later step `skipped`
+      # (run 33545829387, 2026-09-01) -- but a controlled re-measurement, Phase
+      # 0 of plan 2026-08-31-published-build-parity-check's 2026-09-20
+      # follow-up, tripped the same pairing (run 35730892188, 2026-09-22) and
+      # the job did NOT cancel: the timed-out step failed at its bound, the
+      # next step ran immediately, a post-step ran, the job concluded
+      # `success`. The two observations disagree and the earlier run's logs
+      # have since aged out of retention, so this is UNRECONCILED, not
+      # corrected -- see the ingest script header for both citations. This
+      # step avoids the question rather than resolving it: no step-level
+      # `timeout-minutes` here, of either kind.
       - name: Explain which Rust test phase the bound expired in
         if: failure()
         continue-on-error: true

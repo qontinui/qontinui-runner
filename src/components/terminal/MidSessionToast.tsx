@@ -10,6 +10,9 @@
  * the launch sheet.
  */
 
+import { useUIElement } from "@qontinui/ui-bridge";
+
+import { AdvisorySlot } from "./AdvisoryStack";
 import type { MidSessionProbeState } from "./useMidSessionProbe";
 import type { PredictedCollision } from "./useSessionManager";
 
@@ -49,8 +52,7 @@ export function formatToastSummary(state: MidSessionProbeState): ToastSummary {
   // construction (one file held by one or more sessions). The
   // "other sessions" half pluralizes on whether ANY collision row has
   // more than one holder OR there's more than one collision row.
-  const multipleHolders =
-    n > 1 || collisions.some((c) => (c.other_holders?.length ?? 0) > 1);
+  const multipleHolders = n > 1 || collisions.some((c) => (c.other_holders?.length ?? 0) > 1);
   const fileWord = n === 1 ? "file" : "files";
   const sessionWord = multipleHolders ? "other sessions" : "another session";
   const header = `${n} ${fileWord} held by ${sessionWord}`;
@@ -78,50 +80,52 @@ interface MidSessionToastProps {
   onJumpToHolder?: (holderName: string) => void;
 }
 
-export function MidSessionToast({
-  state,
-  onDismiss,
-  onJumpToHolder,
-}: MidSessionToastProps) {
+export function MidSessionToast({ state, onDismiss, onJumpToHolder }: MidSessionToastProps) {
   const { header, rows } = formatToastSummary(state);
+  const { ref } = useUIElement({
+    id: "terminal-mid-session-toast",
+    type: "generic",
+    label: "Mid-session collision toast",
+  });
   return (
-    <div
-      data-testid="mid-session-toast"
-      className="absolute top-2 right-2 z-30 w-[280px] p-2 rounded border bg-[#e0af68]/15 border-[#e0af68]/40 shadow-lg"
-    >
-      <div className="flex items-start gap-2">
-        <div className="text-[10px] uppercase tracking-wider text-[#e0af68] flex-1">
-          {header}
+    <AdvisorySlot>
+      <div
+        ref={ref}
+        data-testid="mid-session-toast"
+        className="w-[280px] p-2 rounded border bg-[#e0af68]/15 border-[#e0af68]/40 shadow-lg"
+      >
+        <div className="flex items-start gap-2">
+          <div className="text-[10px] uppercase tracking-wider text-[#e0af68] flex-1">{header}</div>
+          <button
+            type="button"
+            data-testid="mid-session-toast-dismiss"
+            aria-label="Dismiss conflict warning"
+            onClick={onDismiss}
+            className="text-[#e0af68] hover:text-[#c0caf5] leading-none px-1"
+          >
+            ×
+          </button>
         </div>
-        <button
-          type="button"
-          data-testid="mid-session-toast-dismiss"
-          aria-label="Dismiss conflict warning"
-          onClick={onDismiss}
-          className="text-[#e0af68] hover:text-[#c0caf5] leading-none px-1"
-        >
-          ×
-        </button>
+        <ul className="mt-1.5 space-y-0.5">
+          {rows.map((row) => {
+            const clickable = Boolean(onJumpToHolder);
+            return (
+              <li
+                key={row.file_path}
+                data-testid="mid-session-toast-row"
+                className={`flex items-center gap-2 text-[10px] ${
+                  clickable ? "cursor-pointer hover:bg-[#e0af68]/10 rounded px-1 -mx-1" : ""
+                }`}
+                onClick={() => onJumpToHolder?.(row.holder_name)}
+                title={row.file_path}
+              >
+                <span className="font-mono text-[#c0caf5] truncate">{row.basename}</span>
+                <span className="text-[#a9b1d6] truncate ml-auto">{row.holders_label}</span>
+              </li>
+            );
+          })}
+        </ul>
       </div>
-      <ul className="mt-1.5 space-y-0.5">
-        {rows.map((row) => {
-          const clickable = Boolean(onJumpToHolder);
-          return (
-            <li
-              key={row.file_path}
-              data-testid="mid-session-toast-row"
-              className={`flex items-center gap-2 text-[10px] ${
-                clickable ? "cursor-pointer hover:bg-[#e0af68]/10 rounded px-1 -mx-1" : ""
-              }`}
-              onClick={() => onJumpToHolder?.(row.holder_name)}
-              title={row.file_path}
-            >
-              <span className="font-mono text-[#c0caf5] truncate">{row.basename}</span>
-              <span className="text-[#a9b1d6] truncate ml-auto">{row.holders_label}</span>
-            </li>
-          );
-        })}
-      </ul>
-    </div>
+    </AdvisorySlot>
   );
 }

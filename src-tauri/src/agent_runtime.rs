@@ -2868,7 +2868,7 @@ enum AnchorHolder {
     /// up) — the reservation [`evaluate_continuation_guard`] takes inside its
     /// P3 critical section — or a session mid-account-migration, whose lift
     /// holds the anchor across the respawn
-    /// ([`ContinuationRegistry::take_live_reserving_anchor`]). No terminal
+    /// ([`ContinuationRegistry::take_live_reserving_anchor`]).
     /// The variant carries no `terminal_id` either way, so there is nothing to
     /// focus — not because no terminal exists (during a migration the OLD pane
     /// is untouched and still running at its limit prompt; it is closed only
@@ -7016,7 +7016,7 @@ async fn run_continuation_headless(
     let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port, None);
     // No per-spawn pin here: a gate continuation carries no account field —
     // the `pick_best_account` call above is the whole selection.
-    match spawn_claude_child(workdir, initial_prompt, None, coord_mcp).await {
+    match spawn_claude_child(workdir, initial_prompt, None, coord_mcp, &[], false).await {
         Ok((mut child, preconditions)) => {
             // The child exists and nothing will register it: give the anchor
             // back now rather than when the subprocess exits, or every later
@@ -7920,6 +7920,8 @@ async fn run_agent_subprocess(
             &payload.initial_prompt,
             pinned_config_dir.as_deref(),
             coord_mcp,
+            &[],
+            false,
         )
         .await
         {
@@ -8567,15 +8569,31 @@ pub(crate) fn finalize_headless_child_env(
 /// conjuncts instead of minting it, and at a conservative dial setting a spawn
 /// whose trust cannot be derived returns [`SpawnBlocked`] rather than starting a
 /// child that will hang on a dialog no one can answer.
-async fn spawn_claude_child(
+pub(crate) async fn spawn_claude_child(
     workdir: &str,
     initial_prompt: &str,
     account_config_dir_override: Option<&str>,
     // What THIS session's coord-mcp provisioning did, decided by the caller
-    // before it got here (both callers provision immediately above their spawn).
+    // before it got here (every caller provisions immediately above its spawn).
     // Threaded through to `finalize_headless_child_env`, which renders the
     // briefing whose memory clause it gates.
     coord_mcp: crate::coord_mcp::CoordMcpDelivery,
+    // Extra `claude` CLI flags, verbatim and in order, placed before the env
+    // finalize. The agent-runtime callers pass none (their child reads the
+    // prompt from stdin with no flags at all); the scheduler's RemoteAgent
+    // launch (`crate::scheduler_remote_agent`) passes `-p`, `--max-turns`,
+    // `--model` and `--allowedTools`, which is what makes its child a bounded
+    // single-shot run whose exit is the completion signal.
+    extra_args: &[String],
+    // Make the child the leader of its OWN process group (Unix; a no-op on
+    // Windows, where the caller attaches a job object after the spawn via
+    // `ChildTreeGuard::attach_armed_tokio`). A caller that will KILL the
+    // child on a deadline needs this, or the kill reaches `claude` alone and
+    // leaves its `bash`/`git`/MCP descendants running with nobody watching.
+    // The agent-runtime callers pass `false`: their children are never killed
+    // on a timer and a separate group would take them out of the runner's own
+    // signal delivery.
+    own_process_group: bool,
 ) -> anyhow::Result<(Child, SpawnPreconditions)> {
     let bin = claude_bin_path();
 
@@ -8610,7 +8628,11 @@ async fn spawn_claude_child(
     );
 
     let mut cmd = crate::process_helpers::tokio_no_window(&bin);
-    cmd.current_dir(workdir)
+    if own_process_group {
+        crate::process_helpers::ChildTreeGuard::arm_tokio(&mut cmd);
+    }
+    cmd.args(extra_args)
+        .current_dir(workdir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

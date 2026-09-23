@@ -160,6 +160,7 @@ use tracing::warn;
 use crate::fleet::resource_sample::Lane;
 use crate::mcp::fleet_policy_poller::SessionFloors;
 use crate::settings::SessionGuardSettings;
+use qontinui_runner_lib::wedge_diagnostics::ThreadNameCensus;
 
 /// Tauri event carrying a resource-guard observation to the webview.
 ///
@@ -279,6 +280,375 @@ pub(crate) const SESSION_FLOOR_MAX_BYTES: u64 = 12 * 1024 * 1024 * 1024;
 /// below the shipped warn ceiling. A machine clamped all the way down to it
 /// still starts sessions: 151 is not above 200.
 pub(crate) const THREAD_CEILING_MIN: usize = 200;
+
+/// The idle thread count the shipped 256 / 400 ceilings were chosen against.
+///
+/// [`THREAD_CEILING_MIN`]'s doc records the measurement: **150-151 threads with
+/// no session running**, sampled 2026-08-30 on the Linux dev box. The HIGHER of
+/// that pair is pinned here on purpose — it yields the SMALLER headroom
+/// (`256 - 151 = 105`, `400 - 151 = 249`) and therefore the stricter guard, and
+/// pinning one number is what makes [`machine_thread_shift`] exactly zero on
+/// the machine the constants were authored for.
+///
+/// Do not "fix" this to 150. The pair was a range; picking either end is a
+/// choice, and this is the conservative one.
+pub(crate) const CALIBRATION_BASELINE: usize = 151;
+
+/// The largest at-rest thread floor [`machine_thread_shift`] will re-base onto.
+///
+/// Anchored, not guessed: **512 is tokio's per-runtime `max_blocking_threads`
+/// default** — the same number
+/// [`qontinui_runner_lib::wedge_diagnostics::BlockingBodies::per_runtime_pool_capacity_default`]
+/// publishes, and the number [`THREAD_CEILING_MIN`]'s own doc anchors the 400
+/// critical ceiling to.
+///
+/// **It is a deliberately CONSERVATIVE cap, not the largest healthy process.**
+/// The anchor is explicitly PER-RUNTIME — the field is named
+/// `per_runtime_pool_capacity_default` — and this binary builds many runtimes
+/// (`fleet-pub-rt`, `mcp-api-rt`, the short-lived current-thread ones), so
+/// *N* runtimes carry *N* × 512 of blocking-pool capacity that is healthy by
+/// tokio's own defaults. The application runtime's (`app-rt`) OWN idle pool is
+/// no longer part of the floor this cap bounds: the at-rest window is fed the
+/// GRADED reading (see [`record_at_rest_sample`]), which has that pool
+/// subtracted already, so only the other runtimes' pools remain in the floor
+/// and this cap is that much more conservative than it was. A process legitimately
+/// idling above 512 therefore gets LESS shift than its floor would justify,
+/// and the guard is correspondingly stricter on it. That is the intended
+/// direction: this constant is chosen to under-shift rather than over-shift,
+/// because the cost of under-shifting is a deferral and the cost of
+/// over-shifting is an admission the machine cannot honour.
+///
+/// Past it the shift stops growing, so the effective ceilings cap at
+/// `512 + 105 = 617` warn and `512 + 249 = 761` critical. That bound is the
+/// whole answer to "does a slow leak eventually disable this lane?" — it does
+/// not: the lane keeps refusing above the cap rather than chasing the leak
+/// upward, and refusing work is then correct, because the next thing to fail is
+/// thread creation itself.
+pub(crate) const AT_REST_BASELINE_MAX: usize = 512;
+
+/// OS threads attributable to one live terminal session.
+///
+/// **3, from the control's own documentation**, not from the thread-name census.
+/// [`crate::agent_runtime::DEFAULT_CONTINUATION_SESSION_CAP`]'s doc derives
+/// "roughly 3 OS threads per continuation session" from the 2026-08-29 wedge's
+/// own arithmetic (540 threads at ~130 sessions over a 150-151 idle baseline).
+/// The 2026-09-18 census finds only 2 NAMED per-session threads
+/// (`terminal-waiter`, `terminal-reader`) but also shows per-session
+/// `pipe-drain` and `transcript-scan`, so 2 is a floor and 3 is the measured
+/// figure.
+///
+/// The direction of the error matters more than its size, and this is the safe
+/// direction: this constant is SUBTRACTED from a live reading to estimate the
+/// at-rest floor, so over-subtracting lowers the baseline, lowers the ceiling
+/// and biases the guard toward STRICTNESS. Under-subtracting would let session
+/// load leak into the baseline and loosen the ceiling as the box fills — the
+/// guard getting weaker exactly when it is needed.
+pub(crate) const THREADS_PER_SESSION: usize = 3;
+
+/// How many observations the trailing window keeps.
+///
+/// At [`crate::fleet::resource_sample`]'s default 30 s tick that is nominally
+/// 20 minutes — but the tick is NOT fixed (`COORD_RESOURCE_SAMPLE_SECS` has a
+/// 10 s floor and no ceiling, plus ±20% jitter), so this bounds the window by
+/// COUNT only. [`AT_REST_SAMPLE_MAX_AGE`] is what bounds it in TIME, and the
+/// two together are what make the window's span a property of this module
+/// rather than of an env var it cannot see.
+///
+/// The two directions this number trades between:
+///
+/// - LONGER is better at catching a genuinely quiet moment on a box that is
+///   rarely idle, which is what makes the estimate a *floor* rather than an
+///   average;
+/// - SHORTER is better at letting the baseline RISE when the process's real
+///   floor rises, which is the property an all-time minimum does not have at
+///   all (see [`AtRestWindow`]).
+pub(crate) const AT_REST_WINDOW_SAMPLES: usize = 40;
+
+/// How old an observation may be and still count toward the floor.
+///
+/// **This is the bound that makes a STALLED publisher fail strict.** The
+/// sample count alone cannot do it: `record_at_rest_sample` is reached only
+/// from `fleet::resource_sample::collect_host_lane`, and `publish_once`
+/// returns before `collect()` on three independent conditions — no
+/// `machine.json`, no coord base, and no usable device JWT. Device JWTs are
+/// short-lived, so the third is a routine transient rather than an exotic one.
+///
+/// Without an age bound, a window filled while the box was loaded or mid-leak
+/// would sit there for the life of the process once the tick stopped, holding
+/// the ceilings shifted (up to 617/761) off data of unbounded age — the guard
+/// whose job is catching a thread leak would be the one whose loosening
+/// survived longest after its telemetry died. That is UNKNOWN rendering as a
+/// live measurement, which served policy
+/// `verification-and-evidence` `unknown-must-not-render-as-a-default` forbids.
+///
+/// With it, a stalled publisher decays to `None` within 20 minutes, the shift
+/// goes to zero, and the ceilings return to the shipped 256/400 — strict,
+/// which is the correct direction to fail.
+pub(crate) const AT_REST_SAMPLE_MAX_AGE: std::time::Duration =
+    std::time::Duration::from_secs(20 * 60);
+
+/// The trailing-window low-water mark of the process's at-rest thread floor.
+///
+/// ## Why a WINDOW and not a running minimum
+///
+/// This is the whole reason the type exists, and getting it wrong reinstates
+/// the defect the re-basing is meant to remove. The quantity being tracked is
+/// **monotonically increasing**: measured 2026-09-18 on the 48-core box, the
+/// runner started near 190 threads and sat at 424 after ~96 h, because ~227
+/// blocking-pool threads accumulate and are never retired.
+///
+/// **An all-time minimum over a rising series is just its first sample.** It
+/// would pin the baseline at the ~190 the process booted with, give a shift of
+/// 39 instead of ~240, and leave a runner idling at 424 sitting in
+/// `Warn(424 over 295)` — which is the exact band
+/// [`crate::agent_runtime::evaluate_continuation_guard`] defers in. The latch
+/// would return, unchanged in kind, with a longer fuse. A boot snapshot has the
+/// same defect for the same reason.
+///
+/// A bounded window is what makes the floor able to move in BOTH directions: it
+/// falls the moment the machine is quiet and rises as old samples age out.
+///
+/// ## Why one bad sample cannot pin it
+///
+/// Three independent bounds. [`at_rest_estimate`] refuses an incoherent
+/// observation outright rather than saturating it to a low number; an accepted
+/// outlier ages out of the window within [`AT_REST_WINDOW_SAMPLES`] ticks; and
+/// it ages out in wall-clock time within [`AT_REST_SAMPLE_MAX_AGE`] however
+/// slowly the ticks arrive. A permanent latch at a spuriously low baseline —
+/// which an all-time minimum offers no recovery from short of a runner
+/// restart, and served policy `production-and-cost` `runner-lifecycle` forbids
+/// that restart — is therefore unreachable.
+///
+/// ## Why the clock is a PARAMETER
+///
+/// Every method takes `now` rather than reading [`std::time::Instant::now`]
+/// itself, so the ageing behaviour is unit-testable without sleeping and the
+/// type stays pure. [`Self::record`] and [`Self::baseline`] are the thin
+/// impure wrappers the process-global uses.
+#[derive(Debug, Default)]
+pub(crate) struct AtRestWindow {
+    /// The last [`AT_REST_WINDOW_SAMPLES`] accepted estimates as
+    /// `(observed_at, at_rest)`, oldest first.
+    samples: std::collections::VecDeque<(std::time::Instant, usize)>,
+}
+
+impl AtRestWindow {
+    /// Fold one accepted estimate in at `now`, evicting by age and then by
+    /// count. PURE with respect to the clock.
+    pub(crate) fn record_at(&mut self, now: std::time::Instant, at_rest: usize) {
+        self.expire(now);
+        while self.samples.len() >= AT_REST_WINDOW_SAMPLES {
+            self.samples.pop_front();
+        }
+        self.samples.push_back((now, at_rest));
+    }
+
+    /// The low-water mark over the samples still within
+    /// [`AT_REST_SAMPLE_MAX_AGE`] of `now`, or `None` when none are.
+    ///
+    /// `None` is UNKNOWN and [`machine_thread_shift`] renders it as a zero
+    /// shift — the shipped constants, never a permissive default.
+    pub(crate) fn baseline_at(&self, now: std::time::Instant) -> Option<usize> {
+        self.samples
+            .iter()
+            .filter(|(at, _)| Self::is_fresh(now, *at))
+            .map(|(_, v)| *v)
+            .min()
+    }
+
+    /// Drop every sample older than [`AT_REST_SAMPLE_MAX_AGE`].
+    fn expire(&mut self, now: std::time::Instant) {
+        while matches!(self.samples.front(), Some((at, _)) if !Self::is_fresh(now, *at)) {
+            self.samples.pop_front();
+        }
+    }
+
+    /// `saturating_duration_since`, so a clock that appears to go backwards
+    /// (a sample stamped after `now`) reads as age ZERO — fresh — rather than
+    /// underflowing. Freshness is the conservative reading only because the
+    /// alternative here would DISCARD a just-taken sample.
+    fn is_fresh(now: std::time::Instant, at: std::time::Instant) -> bool {
+        now.saturating_duration_since(at) <= AT_REST_SAMPLE_MAX_AGE
+    }
+
+    /// [`Self::record_at`] at the current instant.
+    pub(crate) fn record(&mut self, at_rest: usize) {
+        self.record_at(std::time::Instant::now(), at_rest);
+    }
+
+    /// [`Self::baseline_at`] at the current instant.
+    pub(crate) fn baseline(&self) -> Option<usize> {
+        self.baseline_at(std::time::Instant::now())
+    }
+}
+
+/// The process-wide [`AtRestWindow`].
+///
+/// A `Mutex` rather than an atomic because the value is a window rather than a
+/// scalar, and the contention is one lock every 30 s against a spawn-path read.
+/// A poisoned lock reads as UNKNOWN — see [`at_rest_thread_baseline`].
+static AT_REST_WINDOW: Mutex<Option<AtRestWindow>> = Mutex::new(None);
+
+/// Record one `(total threads, live sessions)` observation and fold it into the
+/// at-rest floor.
+///
+/// Called from [`crate::fleet::resource_sample`], which already takes BOTH
+/// readings two lines apart on its own 30 s publish tick — so this adds no
+/// sensor, no timer and no new call into the terminal registry.
+///
+/// ## Where this does NOT run, stated rather than discovered
+///
+/// That publish path is gated: `fleet::spawn_budget_republisher` returns early
+/// on a SECONDARY instance, and `resource_sample::publish_once` returns before
+/// `collect()` when `~/.qontinui/machine.json` is absent, when no coord base is
+/// configured, or when no device JWT resolves. On any such machine no sample is
+/// ever recorded, the baseline stays `None` and the shift stays **zero** — i.e.
+/// exactly the shipped 256 / 400. The inertness therefore fails toward today's
+/// behaviour and never toward a permissive one, but it IS inertness: a box that
+/// publishes no fleet telemetry does not get the re-basing. Sourcing the
+/// baseline from a path that runs regardless of fleet publishing is recorded as
+/// a follow-up on the plan rather than done here, because it needs a session
+/// count outside `resource_sample` and that is a second seam.
+///
+/// ## Why EITHER `None` records nothing
+///
+/// `thread_count` is `None` on an unreadable sensor;
+/// `active_terminal_sessions` is `None` when the `TerminalManager` mutex is
+/// poisoned, when there is no Tauri runtime, and when there is no managed state
+/// at all. Substituting `0` for the session count would INFLATE the estimated
+/// floor, inflate the ceiling and loosen the guard precisely when the registry
+/// is broken — an UNKNOWN rendering as a permissive default, which is the shape
+/// served policy `unknown-must-not-render-as-a-default` forbids. An unusable
+/// tick contributes nothing and the previous window stands.
+pub(crate) fn record_at_rest_sample(total_threads: Option<usize>, live_sessions: Option<usize>) {
+    // The window is fed the GRADED reading — the raw count minus the idle
+    // blocking pool the census attributes to the runtime (plan
+    // `2026-09-21-runner-blocking-pool-ratchets-to-peak-because-transcript-
+    // tails-rotate-every-idle-thread`, Phase 3) — so the two subtractions the
+    // thread lane now applies are DISJOINT: [`graded_thread_reading`] removes
+    // the idle pool from the READING, and [`machine_thread_shift`] removes the
+    // at-rest floor of everything else from the CEILING. Recording the raw
+    // count here would fold the idle pool into the floor as well, and the
+    // guard would then subtract it twice — once from the reading and once via
+    // the shift — which is the composition a re-based ladder and a graded
+    // reading can otherwise reach. An UNKNOWN census grades nothing out, so
+    // the window degrades to the raw reading, never to a permissive one. The
+    // one mixed case is transitional: a census UNKNOWN for a whole
+    // AT_REST_WINDOW_SAMPLES window that then returns leaves the floor raw
+    // while the reading is graded for the ticks until a graded sample enters
+    // the min-window — a double subtraction bounded to that window, and the
+    // reverse mix (census going UNKNOWN now) is strict. Do not "fix" it by
+    // feeding the window the raw count again; that re-creates the permanent
+    // double subtraction this comment exists to forbid.
+    let total_threads = total_threads.map(|total| {
+        graded_thread_reading(
+            total,
+            crate::health_monitor::thread_name_census_memoized().as_ref(),
+            qontinui_runner_lib::wedge_diagnostics::tracked_blocking_in_flight(),
+            RUNTIME_NAMES,
+            runtime_worker_threads(),
+        )
+        .graded
+    });
+    let Some(at_rest) = at_rest_estimate(total_threads, live_sessions) else {
+        return;
+    };
+    if let Ok(mut guard) = AT_REST_WINDOW.lock() {
+        guard
+            .get_or_insert_with(AtRestWindow::default)
+            .record(at_rest);
+    }
+}
+
+/// The at-rest floor one `(total threads, live sessions)` observation implies,
+/// or `None` when the observation cannot support one. PURE.
+///
+/// Split out from [`record_at_rest_sample`] so the UNKNOWN arms are settleable
+/// in a test without writing to a process-global cell that every other test in
+/// this binary would then share — the same purity split
+/// [`merge_thread_ceilings_reporting`] keeps from
+/// [`effective_thread_ceilings`].
+///
+/// ## An INCOHERENT observation is UNKNOWN, not a low reading
+///
+/// `sessions * THREADS_PER_SESSION >= total` says the session-attributable
+/// threads are the entire process, which no live runner can be: the sampler,
+/// the publisher and the Tauri runtime are all unattributed to any session.
+/// Such a reading is a mis-count on one side or the other — a registry read
+/// taken mid-teardown, a thread sensor that undercounted — and the honest
+/// answer is `None`.
+///
+/// Saturating it to `Some(0)` instead would be actively dangerous: a zero folds
+/// into the window as a legitimate floor and drags the shift to zero for as
+/// long as it survives there.
+pub(crate) fn at_rest_estimate(
+    total_threads: Option<usize>,
+    live_sessions: Option<usize>,
+) -> Option<usize> {
+    let (Some(total), Some(sessions)) = (total_threads, live_sessions) else {
+        return None;
+    };
+    let session_threads = sessions.saturating_mul(THREADS_PER_SESSION);
+    if session_threads >= total {
+        return None;
+    }
+    Some(total - session_threads)
+}
+
+/// The measured at-rest thread floor, or `None` when nothing usable has been
+/// sampled yet — or when the window's lock is poisoned, which is UNKNOWN for
+/// the same reason and degrades to the shipped constants.
+pub(crate) fn at_rest_thread_baseline() -> Option<usize> {
+    AT_REST_WINDOW.lock().ok()?.as_ref()?.baseline()
+}
+
+/// How far to re-base this machine's thread ladder, in threads. PURE.
+///
+/// ## Why the ladder moves at all
+///
+/// A thread ceiling is a HEADROOM figure wearing an absolute number's clothes.
+/// 256 and 400 mean "105 and 249 threads of room above a runner that idles at
+/// 151" — that is how [`THREAD_CEILING_MIN`]'s doc derives them and how
+/// [`crate::agent_runtime::DEFAULT_CONTINUATION_SESSION_CAP`]'s doc converts
+/// them to ~35 and ~83 sessions. Enforced as absolutes on a machine whose idle
+/// floor is 400, they are not a stricter guard: they are a LATCH. Every
+/// continuation is deferred, the deferral frees ~3 threads against a floor of
+/// ~400, and so the deferral cannot clear the condition that caused it.
+/// Measured 2026-09-06..09-18: 616 thread-pressure-deferred continuations,
+/// 11,744 deferral events, 178 never consumed.
+///
+/// ## Why EVERY term is shifted, and why that is not "loosening"
+///
+/// The shift is applied to the FOLDED ceiling, i.e. after `min(local,
+/// hardcoded, fleet)` and after the [`THREAD_CEILING_MIN`] clamp, so it moves
+/// all three terms by the same amount. Nothing gains on anything else:
+///
+/// - a fleet row still cannot walk this machine past the hardcoded default —
+///   the property `no_combination_of_terms_can_make_the_machine_unspawnable`
+///   defends, now stated against `defaults() + shift` rather than against a
+///   number that only meant anything on one machine;
+/// - the operator's knob still works in BOTH directions, with no change to
+///   [`SessionGuardSettings`]'s type and no change to what the settings panel
+///   sends. Set 300 on a box shifted by 251 and the ceiling is 551; set 600 and
+///   it is 851. The ladder moved; the knob did not;
+/// - [`THREAD_CEILING_MIN`]'s guarantee is preserved and strengthened, because
+///   "a ceiling below the runner's own at-rest thread count is a machine that
+///   can never spawn again" now holds against the MEASURED floor instead of
+///   against a constant guessed at one.
+///
+/// ## The two UNKNOWN arms
+///
+/// No baseline yet, and a baseline at or below [`CALIBRATION_BASELINE`], both
+/// give a shift of ZERO — today's 256 / 400, byte for byte. UNKNOWN degrades to
+/// the shipped constants; it never degrades to a permissive default.
+pub(crate) fn machine_thread_shift(baseline: Option<usize>) -> usize {
+    baseline
+        .map(|b| {
+            b.min(AT_REST_BASELINE_MAX)
+                .saturating_sub(CALIBRATION_BASELINE)
+        })
+        .unwrap_or(0)
+}
 
 /// What a lane measures, and therefore which direction is bad.
 ///
@@ -693,8 +1063,9 @@ pub(crate) fn merge_floors_reporting(
 pub(crate) fn merge_thread_ceilings(
     local: &SessionGuardSettings,
     fleet: SessionFloors,
+    machine_shift: usize,
 ) -> SessionGuardSettings {
-    merge_thread_ceilings_reporting(local, fleet).0
+    merge_thread_ceilings_reporting(local, fleet, machine_shift).0
 }
 
 /// [`merge_thread_ceilings`], plus the ladder coercion it had to apply — still
@@ -702,18 +1073,35 @@ pub(crate) fn merge_thread_ceilings(
 pub(crate) fn merge_thread_ceilings_reporting(
     local: &SessionGuardSettings,
     fleet: SessionFloors,
+    machine_shift: usize,
 ) -> (SessionGuardSettings, Option<LadderCoercion>) {
     let hardcoded = SessionGuardSettings::default();
+    // The shift is added AFTER the fold and after the clamp, so it moves every
+    // term by the same amount and no source gains on any other. See
+    // [`machine_thread_shift`] for why the ladder is re-based rather than
+    // re-derived, and why that is not loosening.
+    //
+    // ONE consequence stated rather than discovered: a fleet or local term is
+    // no longer an ABSOLUTE ceiling. A fleet row setting `critical = 0` — the
+    // documented way to pin a machine to `THREAD_CEILING_MIN` — now enforces
+    // `THREAD_CEILING_MIN + shift`, up to 561. That follows directly from the
+    // ladder being a headroom figure, and it is the same property that keeps
+    // the operator's knob working in both directions; but an operator reaching
+    // for a fleet ceiling during a live thread-exhaustion incident should know
+    // they are setting headroom, not an absolute. An `absolute: true` fleet
+    // flag is recorded as a follow-up on the plan rather than invented here.
     let warn = tighten_ceiling(
         local.warn_thread_count,
         hardcoded.warn_thread_count,
         fleet.warn_thread_count.map(|n| n as usize),
-    );
+    )
+    .saturating_add(machine_shift);
     let requested_critical = tighten_ceiling(
         local.critical_thread_count,
         hardcoded.critical_thread_count,
         fleet.critical_thread_count.map(|n| n as usize),
-    );
+    )
+    .saturating_add(machine_shift);
     let (critical, coercion) = coerce_ceiling_ladder(warn, requested_critical);
     (
         SessionGuardSettings {
@@ -927,6 +1315,10 @@ pub(crate) fn effective_thread_ceilings(local: &SessionGuardSettings) -> Session
     let (ceilings, coercion) = merge_thread_ceilings_reporting(
         local,
         crate::mcp::fleet_policy_poller::fleet_session_floors(lane),
+        // The SECOND impure read this seam owns, and it belongs here for the
+        // same reason the fleet cache does: `merge_thread_ceilings_reporting`
+        // is pure and must stay settleable in a test.
+        machine_thread_shift(at_rest_thread_baseline()),
     );
     note_ladder_coercion(lane, coercion);
     ceilings
@@ -1033,6 +1425,148 @@ fn compose_lanes(memory: SpawnGate, threads: SpawnGate) -> (SpawnGate, Option<Sp
     }
 }
 
+/// The most idle-pool threads [`graded_thread_reading`] will ever subtract.
+///
+/// tokio's blocking pool is capped at `max_blocking_threads`, whose default is
+/// **512** (`runtime::Builder::new` sets `max_blocking_threads: 512` for every
+/// flavor; `runtime/builder.rs:288` on the pinned tokio 1.50.0), so a census
+/// can never legitimately attribute more than `workers + 512` threads to one
+/// runtime. This clamp protects against a census that OVER-REPORTS — a second
+/// runtime sharing the name, a mis-tallied walk — and nothing else: in
+/// production `named - workers - in_flight` is at most 512 by construction,
+/// so the clamp is not reachable from a correct census and it is NOT what
+/// keeps a saturated pool counted.
+///
+/// **What this grading cannot see, stated so nobody reads the clamp as
+/// cover.** A pool thread inside an UNTRACKED body — `tokio::fs`,
+/// `tokio::process`, and every raw `tokio::task::spawn_blocking` site that
+/// does not take a `BlockingSlot` — is indistinguishable from an idle one
+/// here, because `in_flight` counts tracked bodies only. 512 pool threads
+/// all stuck in untracked `CreateProcess` calls (the 2026-08-29 wedge shape)
+/// would therefore grade out entirely and the lane would read `Proceed`.
+/// The guard is strict against TRACKED bodies (they stay counted); the
+/// untracked residue is closed only by coverage — converting raw
+/// `spawn_blocking` sites to `spawn_blocking_tracked` — which is the recorded
+/// follow-up on plan `2026-09-21-runner-blocking-pool-ratchets-to-peak-
+/// because-transcript-tails-rotate-every-idle-thread`, not by any number
+/// here.
+pub(crate) const IDLE_POOL_SUBTRAHEND_CAP: usize = 512;
+
+/// The thread names the application runtime's scheduler workers and blocking
+/// pool carry, in the order this binary has shipped them: `tokio-rt-worker` is
+/// tokio's default and what the Tauri runtime is named today; `app-rt` is the
+/// name plan `2026-09-18-the-runner-thread-pressure-guard-is-a-latch-not-
+/// back-pressure` PR 1 gives it. Both are listed so the grading survives that
+/// rename without a code change here; a census never carries both at once.
+pub(crate) const RUNTIME_NAMES: &[&str] = &["app-rt", "tokio-rt-worker"];
+
+/// The application runtime's scheduler worker count — the part of a
+/// [`RUNTIME_NAMES`] row that is NOT the blocking pool.
+///
+/// Plan `2026-09-18-…-latch-not-back-pressure` PR 1 (`db96c48f3`) builds the
+/// Tauri runtime with `crate::app_runtime_worker_threads()` workers —
+/// `min(available_parallelism, 16)` or the bounded env override — under the
+/// name `app-rt`. This reads the SAME resolver, so the subtrahend and the
+/// runtime can never disagree about how many of the named threads are
+/// scheduler workers rather than pool. Reading `available_parallelism()` here
+/// instead (the pre-PR-1 shape) over-counted workers by 16 on a 32-core box,
+/// which under-graded the pool — the strict direction, but wrong.
+pub(crate) fn runtime_worker_threads() -> usize {
+    crate::app_runtime_worker_threads()
+}
+
+/// A thread reading with the runtime's IDLE blocking pool graded out of it
+/// (plan `2026-09-21-runner-blocking-pool-ratchets-to-peak-because-transcript-
+/// tails-rotate-every-idle-thread`, Phase 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GradedThreadReading {
+    /// The raw OS thread count, as [`crate::health_monitor::thread_count_reading`]
+    /// measured it.
+    pub(crate) total: usize,
+    /// How many threads were graded out: named runtime threads beyond the
+    /// scheduler workers and beyond the tracked in-flight bodies, capped at
+    /// [`IDLE_POOL_SUBTRAHEND_CAP`].
+    pub(crate) idle_pool: usize,
+    /// `total − idle_pool` — the number the ceilings are judged against.
+    pub(crate) graded: usize,
+}
+
+/// PURE: grade an idle blocking pool out of a raw thread count.
+///
+/// `named` is the census count for the [`RUNTIME_NAMES`] rows (an UNKNOWN
+/// census is `0` named — the guard then degrades to today's strict reading,
+/// never to a permissive one, served policy `verification-and-evidence`
+/// `unknown-must-not-render-as-a-default`). Of those, `worker_threads` are the
+/// scheduler and `in_flight` are pool threads genuinely inside a tracked body,
+/// and both keep counting as load; what is left is the idle pool, subtracted
+/// up to [`IDLE_POOL_SUBTRAHEND_CAP`]. Every step saturates, so no input can
+/// make `graded` exceed `total` or underflow.
+pub(crate) fn graded_thread_reading(
+    total: usize,
+    census: Option<&ThreadNameCensus>,
+    in_flight: usize,
+    runtime_names: &[&str],
+    worker_threads: usize,
+) -> GradedThreadReading {
+    let named: usize = census
+        .map(|c| {
+            c.by_name
+                .iter()
+                .filter(|row| runtime_names.contains(&row.name.as_str()))
+                .map(|row| row.count)
+                .sum()
+        })
+        .unwrap_or(0);
+    let idle_pool = named
+        .saturating_sub(worker_threads)
+        .saturating_sub(in_flight)
+        .min(IDLE_POOL_SUBTRAHEND_CAP);
+    GradedThreadReading {
+        total,
+        idle_pool,
+        graded: total.saturating_sub(idle_pool),
+    }
+}
+
+/// Edge-triggered log of the thread lane's graded trip, so an operator reading
+/// a refusal that says "carrying 150 threads" beside a `/health` that says 441
+/// finds the line that reconciles the two. One line per change of severity
+/// (a trip, an escalation, and again after a clear), never one per poll: the
+/// continuation guard asks this lane every few minutes for every pending
+/// continuation, and `idle_pool` drifts by a few threads between polls.
+static LAST_GRADED_TRIP: Mutex<Option<&'static str>> = Mutex::new(None);
+
+fn note_graded_trip(verdict: &SpawnGate, reading: &GradedThreadReading) {
+    let key = verdict.tripped().map(|(severity, _)| severity);
+    let mut last = LAST_GRADED_TRIP.lock().unwrap_or_else(|e| e.into_inner());
+    if *last == key {
+        return;
+    }
+    *last = key;
+    if let Some((severity, obs)) = verdict.tripped() {
+        warn!(
+            lane = %obs.lane,
+            severity = severity,
+            threads = reading.total,
+            idle_pool = reading.idle_pool,
+            graded = reading.graded,
+            limit = obs.limit,
+            "resource_guard: {}",
+            graded_trip_message(severity, reading, obs.limit),
+        );
+    }
+}
+
+/// The reconciling sentence: raw, idle and graded on one line, beside the
+/// ceiling that was crossed. PURE so the wording is pinned by a test.
+fn graded_trip_message(severity: &str, reading: &GradedThreadReading, limit: u64) -> String {
+    format!(
+        "the thread lane tripped on the GRADED reading — {} threads, {} idle blocking-pool \
+         threads graded out, graded {} against the {}-thread {} ceiling",
+        reading.total, reading.idle_pool, reading.graded, limit, severity,
+    )
+}
+
 /// The thread lane's live verdict, folded and evaluated. Shared by
 /// [`probe_for_spawn`] and [`thread_pressure`] so the two can never drift.
 ///
@@ -1043,12 +1577,31 @@ fn compose_lanes(memory: SpawnGate, threads: SpawnGate) -> (SpawnGate, Option<Sp
 /// window. Reaching past it to `thread_count_reading` from a second site would
 /// silently restore the per-caller snapshot this seam exists to remove; see that
 /// constant's doc for why the staleness is free.
+///
+/// The reading handed to [`evaluate_threads`] is the GRADED one
+/// ([`graded_thread_reading`]): the raw count minus the runtime's idle
+/// blocking pool, which the 30 s thread-name census
+/// ([`crate::health_monitor::thread_name_census_memoized`]) makes visible and
+/// [`qontinui_runner_lib::wedge_diagnostics::tracked_blocking_in_flight`] keeps
+/// honest. `evaluate_threads` and the ceilings it compares against are
+/// untouched; the `GateObservation.observed` every refusal quotes is the
+/// graded number, and [`note_graded_trip`] logs the raw one beside it.
 fn thread_lane_verdict(local: &SessionGuardSettings) -> SpawnGate {
     let ceilings = effective_thread_ceilings(local);
-    evaluate_threads(
-        crate::health_monitor::thread_count_reading_memoized(),
-        &ceilings,
-    )
+    let Some(total) = crate::health_monitor::thread_count_reading_memoized() else {
+        return evaluate_threads(None, &ceilings);
+    };
+    let census = crate::health_monitor::thread_name_census_memoized();
+    let reading = graded_thread_reading(
+        total,
+        census.as_ref(),
+        qontinui_runner_lib::wedge_diagnostics::tracked_blocking_in_flight(),
+        RUNTIME_NAMES,
+        runtime_worker_threads(),
+    );
+    let verdict = evaluate_threads(Some(reading.graded), &ceilings);
+    note_graded_trip(&verdict, &reading);
+    verdict
 }
 
 /// The thread lane's verdict on its own, live — **the entry point for callers
@@ -1653,6 +2206,176 @@ mod tests {
         }
     }
 
+    // ---- The graded reading (plan 2026-09-21-runner-blocking-pool-ratchets-
+    // to-peak-because-transcript-tails-rotate-every-idle-thread, Phase 3) ----
+    //
+    // `evaluate_threads` above is untouched: these pin what is FED to it.
+
+    fn name_census(rows: &[(&str, usize)]) -> ThreadNameCensus {
+        use qontinui_runner_lib::wedge_diagnostics::ThreadNameCount;
+        ThreadNameCensus {
+            total: rows.iter().map(|(_, n)| n).sum(),
+            by_name: rows
+                .iter()
+                .map(|(name, count)| ThreadNameCount {
+                    name: name.to_string(),
+                    count: *count,
+                })
+                .collect(),
+            sampled_at: std::time::SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    /// The operator-box case: 440 threads of which 325 are `tokio-rt-worker`,
+    /// 32 scheduler workers, 3 bodies in flight ⇒ 290 idle pool threads are
+    /// graded out and the 150 that remain PROCEED under the shipped 256/400
+    /// ceilings — where the raw 440 was a refusal.
+    #[test]
+    fn an_idle_pool_is_graded_out_and_the_remainder_proceeds() {
+        let census = name_census(&[("tokio-rt-worker", 325), ("terminal-reader-*", 19)]);
+        let r = graded_thread_reading(440, Some(&census), 3, RUNTIME_NAMES, 32);
+        assert_eq!(
+            r,
+            GradedThreadReading {
+                total: 440,
+                idle_pool: 290,
+                graded: 150,
+            }
+        );
+        assert_eq!(
+            evaluate_threads(Some(r.graded), &defaults()),
+            SpawnGate::Proceed
+        );
+        assert!(matches!(
+            evaluate_threads(Some(r.total), &defaults()),
+            SpawnGate::Critical(_)
+        ));
+    }
+
+    /// UNKNOWN census ⇒ nothing is graded out ⇒ today's strict reading, and
+    /// today's `Critical`. Never the permissive direction.
+    #[test]
+    fn an_unknown_census_grades_nothing_out() {
+        let r = graded_thread_reading(440, None, 3, RUNTIME_NAMES, 32);
+        assert_eq!(r.idle_pool, 0);
+        assert_eq!(r.graded, 440);
+        assert!(matches!(
+            evaluate_threads(Some(r.graded), &defaults()),
+            SpawnGate::Critical(_)
+        ));
+    }
+
+    /// The clamp bites: 600 named beyond 32 workers is 568 idle, but only
+    /// [`IDLE_POOL_SUBTRAHEND_CAP`] (512) may be subtracted, so a pool at
+    /// tokio's own cap still counts.
+    /// The re-based ladder (`machine_thread_shift`) and the graded reading
+    /// subtract DISJOINT components: the at-rest window is fed the graded
+    /// reading, so the idle pool is never in the floor the shift is derived
+    /// from. Feeding it the RAW count would double-subtract — the shift would
+    /// carry the pool a second time. Pinned as arithmetic over the two pure
+    /// halves, because the live seam (`record_at_rest_sample`) writes a
+    /// process-global window.
+    #[test]
+    fn the_idle_pool_is_subtracted_once_not_twice() {
+        // The operator box: 441 threads, 325 named pool rows, 16 pinned
+        // workers, 3 tracked bodies in flight, 12 live sessions.
+        let census = name_census(&[("tokio-rt-worker", 325)]);
+        let graded = graded_thread_reading(441, Some(&census), 3, RUNTIME_NAMES, 16);
+        assert_eq!(graded.idle_pool, 306);
+        assert_eq!(graded.graded, 135);
+
+        // What the window sees when fed the GRADED reading: the floor of the
+        // non-pool threads, so the shift is derived from 135 - 36 = 99, which
+        // is below CALIBRATION_BASELINE and shifts NOTHING.
+        let floor_graded = at_rest_estimate(Some(graded.graded), Some(12));
+        assert_eq!(floor_graded, Some(99));
+        assert_eq!(machine_thread_shift(floor_graded), 0);
+
+        // What it would have seen fed the RAW count: the pool folded into the
+        // floor, a shift of ~254 on top of a reading that already excludes the
+        // same 306 threads — the double subtraction this composition forbids.
+        let floor_raw = at_rest_estimate(Some(441), Some(12));
+        assert_eq!(floor_raw, Some(405));
+        assert!(machine_thread_shift(floor_raw) > 200);
+    }
+
+    #[test]
+    fn the_subtrahend_is_capped_at_the_pool_ceiling() {
+        let census = name_census(&[("tokio-rt-worker", 600)]);
+        let r = graded_thread_reading(700, Some(&census), 0, RUNTIME_NAMES, 32);
+        assert_eq!(r.idle_pool, IDLE_POOL_SUBTRAHEND_CAP);
+        assert_eq!(r.idle_pool, 512);
+        assert_eq!(r.graded, 188);
+    }
+
+    /// A pool thread inside a tracked body keeps counting as load: 50 in
+    /// flight on the operator-box case raises the graded reading by exactly 50.
+    #[test]
+    fn in_flight_bodies_stay_counted() {
+        let census = name_census(&[("tokio-rt-worker", 325)]);
+        let idle = graded_thread_reading(440, Some(&census), 3, RUNTIME_NAMES, 32);
+        let busy = graded_thread_reading(440, Some(&census), 53, RUNTIME_NAMES, 32);
+        assert_eq!(idle.graded, 150);
+        assert_eq!(busy.graded, 200);
+        assert_eq!(busy.idle_pool, 240);
+        // The delta is the in-flight delta, one for one.
+        let fifty = graded_thread_reading(440, Some(&census), 50, RUNTIME_NAMES, 32);
+        assert_eq!(fifty.graded, 197);
+    }
+
+    /// The reconciling WARN names all three numbers and the ceiling, so a
+    /// refusal quoting the graded count and a `/health` quoting the raw one
+    /// can be read as the same measurement.
+    #[test]
+    fn the_graded_trip_message_carries_raw_idle_and_graded() {
+        let reading = GradedThreadReading {
+            total: 441,
+            idle_pool: 291,
+            graded: 150,
+        };
+        let msg = graded_trip_message("warn", &reading, 256);
+        assert!(msg.contains("441 threads"), "{msg}");
+        assert!(msg.contains("291 idle blocking-pool threads"), "{msg}");
+        assert!(msg.contains("graded 150"), "{msg}");
+        assert!(msg.contains("256-thread warn ceiling"), "{msg}");
+    }
+
+    /// A census naming only unrelated threads grades nothing out — the
+    /// subtraction is keyed on the runtime names, never on "most threads".
+    #[test]
+    fn unrelated_thread_names_are_not_a_pool() {
+        let census = name_census(&[
+            ("terminal-reader-*", 200),
+            ("notify-rs windows loop", 19),
+            ("<unnamed>", 40),
+        ]);
+        let r = graded_thread_reading(440, Some(&census), 3, RUNTIME_NAMES, 32);
+        assert_eq!(r.idle_pool, 0);
+        assert_eq!(r.graded, r.total);
+    }
+
+    /// Both runtime names count (the rename in the 09-18 plan's PR 1 must not
+    /// switch the grading off), and every arithmetic step saturates: a
+    /// census that claims more named threads than the total exists cannot
+    /// underflow the graded reading.
+    #[test]
+    fn the_grading_survives_the_runtime_rename_and_never_underflows() {
+        let renamed = name_census(&[("app-rt", 325)]);
+        assert_eq!(
+            graded_thread_reading(440, Some(&renamed), 3, RUNTIME_NAMES, 32).graded,
+            150
+        );
+        let impossible = name_census(&[("tokio-rt-worker", 900)]);
+        let r = graded_thread_reading(100, Some(&impossible), 0, RUNTIME_NAMES, 32);
+        assert_eq!(r.idle_pool, 512);
+        assert_eq!(r.graded, 0);
+        // More workers than named threads: nothing to subtract, no underflow.
+        let small = name_census(&[("tokio-rt-worker", 10)]);
+        let r = graded_thread_reading(100, Some(&small), 0, RUNTIME_NAMES, 32);
+        assert_eq!(r.idle_pool, 0);
+        assert_eq!(r.graded, 100);
+    }
+
     /// The thread lane names itself through the shared lane vocabulary, never a
     /// literal — the same rule the fleet-limit cache's `for_lane` depends on.
     #[test]
@@ -2022,7 +2745,7 @@ mod tests {
         assert_eq!(evaluate("host", Some(0), &merged), SpawnGate::Proceed);
 
         // Same for the thread lane, whose fleet term is likewise limits-only.
-        let merged = merge_thread_ceilings(&off, fleet_threads(Some(10), Some(20)));
+        let merged = merge_thread_ceilings(&off, fleet_threads(Some(10), Some(20)), 0);
         assert!(!merged.enabled);
         assert_eq!(evaluate_threads(Some(9_999), &merged), SpawnGate::Proceed);
     }
@@ -2075,13 +2798,341 @@ mod tests {
     fn an_absent_fleet_ceiling_contributes_nothing() {
         assert_eq!(tighten_ceiling(400, 400, None), 400);
         assert_eq!(
-            merge_thread_ceilings(&defaults(), SessionFloors::default()),
+            merge_thread_ceilings(&defaults(), SessionFloors::default(), 0),
             defaults(),
             "the dormant fleet term must leave a default machine exactly as it was"
         );
         // …and a zero fleet ceiling, which IS a statement, is still bounded by
         // the clamp rather than taken literally.
         assert_eq!(tighten_ceiling(400, 400, Some(0)), THREAD_CEILING_MIN);
+    }
+
+    // ------------------------------------------------------------------
+    // The latch, and the safety valve. Plan
+    // `2026-09-18-the-runner-thread-pressure-guard-is-a-latch-not-back-pressure`.
+    // ------------------------------------------------------------------
+
+    /// The effective ceilings for a machine whose at-rest floor is `baseline`.
+    fn ceilings_for(baseline: Option<usize>) -> SessionGuardSettings {
+        merge_thread_ceilings(
+            &defaults(),
+            SessionFloors::default(),
+            machine_thread_shift(baseline),
+        )
+    }
+
+    /// **ARM A — the latch. This is the test that fails on `origin/main`.**
+    ///
+    /// A 48-core runner measured 2026-09-18 (device `eb2155ed`): 424 OS
+    /// threads, ZERO sessions running, an at-rest floor of ~402. Against the
+    /// absolute 400 this returns `Critical(424 over 400)` and
+    /// `agent_runtime::evaluate_continuation_guard` defers every gate
+    /// continuation — 616 of them over 12 days, 11,744 deferral events, 178
+    /// never consumed.
+    ///
+    /// It is a LATCH rather than back-pressure because the deferral frees
+    /// `THREADS_PER_SESSION` threads against a floor of ~402: the act the guard
+    /// takes cannot move the quantity the guard read. With no sessions running
+    /// there is not even that.
+    #[test]
+    fn a_high_core_runner_at_rest_does_not_defer() {
+        let merged = ceilings_for(Some(402));
+        assert_eq!(
+            evaluate_threads(Some(424), &merged),
+            SpawnGate::Proceed,
+            "a runner sitting at its own at-rest floor with zero sessions must \
+             not be refused: {merged:?}"
+        );
+    }
+
+    /// **ARM B — the safety valve.** A latch is being fixed, not a guard
+    /// removed. Genuine load on the same machine still refuses.
+    #[test]
+    fn a_genuinely_loaded_high_core_runner_still_defers() {
+        let merged = ceilings_for(Some(402));
+        // 402 - 151 = 251, so the re-based ladder is 507 / 651. Assert the
+        // LIMIT, not `o.observed`: `observed` is the argument echoed back
+        // unchanged, so asserting it would hold for every ceiling including the
+        // un-shifted one, and this arm would pass with the fix reverted.
+        assert_eq!(merged.warn_thread_count, 507);
+        assert_eq!(merged.critical_thread_count, 651);
+        match evaluate_threads(Some(700), &merged) {
+            SpawnGate::Critical(o) => assert_eq!((o.observed, o.limit), (700, 651)),
+            other => panic!("expected Critical far above the re-based ceiling, got {other:?}"),
+        }
+        // ARM B' — and the WARN band still exists between the two, which is the
+        // band the continuation guard actually defers on.
+        match evaluate_threads(Some(520), &merged) {
+            SpawnGate::Warn(o) => assert_eq!((o.observed, o.limit), (520, 507)),
+            other => panic!("expected Warn inside the re-based warn band, got {other:?}"),
+        }
+    }
+
+    /// **ARM C — the machine the constants were calibrated on is EXACTLY
+    /// unchanged**, not approximately. `shift` is zero at and below
+    /// [`CALIBRATION_BASELINE`], so this is the shipped 256 / 400 byte for
+    /// byte — which is what makes the re-basing safe to ship to a fleet whose
+    /// other boxes were never mis-bounded.
+    #[test]
+    fn the_calibrated_box_is_byte_identical() {
+        for baseline in [
+            None,
+            Some(0),
+            Some(120),
+            Some(150),
+            Some(CALIBRATION_BASELINE),
+        ] {
+            let merged = ceilings_for(baseline);
+            assert_eq!(
+                merged.warn_thread_count,
+                defaults().warn_thread_count,
+                "baseline {baseline:?} must not move the warn ceiling"
+            );
+            assert_eq!(
+                merged.critical_thread_count,
+                defaults().critical_thread_count,
+                "baseline {baseline:?} must not move the critical ceiling"
+            );
+            assert_eq!(
+                evaluate_threads(Some(300), &merged),
+                SpawnGate::Warn(thread_observation(300, 256))
+            );
+        }
+    }
+
+    /// **ARM D — no baseline is UNKNOWN, and UNKNOWN keeps the shipped
+    /// constants.** It must never render as a permissive default: a machine
+    /// that cannot measure its own floor gets the guard it has today, not a
+    /// weaker one.
+    #[test]
+    fn an_unknown_baseline_keeps_the_shipped_ceilings() {
+        assert_eq!(machine_thread_shift(None), 0);
+        let merged = ceilings_for(None);
+        match evaluate_threads(Some(424), &merged) {
+            SpawnGate::Critical(o) => assert_eq!(o.limit, 400),
+            other => panic!("UNKNOWN must fall back to the shipped 400, got {other:?}"),
+        }
+    }
+
+    /// **ARM E — the bound holds, so a leak cannot disable the lane.**
+    ///
+    /// The baseline is capped at [`AT_REST_BASELINE_MAX`] (tokio's per-runtime
+    /// blocking-pool default), so the ceilings cap too. Without this the
+    /// low-water mark would chase a monotone leak upward forever and the lane
+    /// would go inert on exactly the boxes that need it.
+    #[test]
+    fn a_runaway_baseline_cannot_disable_the_lane() {
+        let capped = machine_thread_shift(Some(AT_REST_BASELINE_MAX));
+        for baseline in [AT_REST_BASELINE_MAX + 1, 10_000, usize::MAX] {
+            assert_eq!(
+                machine_thread_shift(Some(baseline)),
+                capped,
+                "the shift must stop growing past AT_REST_BASELINE_MAX"
+            );
+        }
+        let merged = ceilings_for(Some(usize::MAX));
+        assert_eq!(
+            merged.warn_thread_count,
+            AT_REST_BASELINE_MAX + (defaults().warn_thread_count - CALIBRATION_BASELINE)
+        );
+        assert_eq!(
+            merged.critical_thread_count,
+            AT_REST_BASELINE_MAX + (defaults().critical_thread_count - CALIBRATION_BASELINE)
+        );
+        // The LIMIT is the quantity the cap moves; `o.observed` is the argument
+        // echoed back and would assert nothing. 512 + 249 = 761.
+        assert_eq!(merged.critical_thread_count, 761);
+        match evaluate_threads(Some(1_000), &merged) {
+            SpawnGate::Critical(o) => assert_eq!((o.observed, o.limit), (1_000, 761)),
+            other => panic!("a leaking process must still be refused, got {other:?}"),
+        }
+    }
+
+    /// The at-rest estimate subtracts the session load at the instant of each
+    /// reading, and yields NOTHING when either half is UNKNOWN or when the two
+    /// halves are mutually incoherent.
+    ///
+    /// Pure arithmetic only — the process-global window is deliberately not
+    /// touched here. [`AtRestWindow`] is tested on its own instance instead
+    /// (see [`the_at_rest_window_can_rise_and_no_single_sample_can_pin_it`]),
+    /// so no test in this binary asserts on shared mutable state.
+    #[test]
+    fn the_at_rest_estimate_subtracts_session_load_and_never_invents_one() {
+        // 424 threads with 11 live sessions is the 2026-09-18 reading.
+        assert_eq!(at_rest_estimate(Some(424), Some(11)), Some(391));
+        // Over-subtracting is the SAFE direction: it lowers the estimated
+        // floor, which lowers the ceiling, which makes the guard stricter. 2 is
+        // the census floor (`terminal-waiter` + `terminal-reader`); 3 is what
+        // `DEFAULT_CONTINUATION_SESSION_CAP`'s doc measures.
+        assert_eq!(THREADS_PER_SESSION, 3);
+        assert!(
+            at_rest_estimate(Some(424), Some(11)).unwrap() < 424usize.saturating_sub(11 * 2),
+            "3 must estimate a LOWER floor than the census's 2, or the bias \
+             points at looseness"
+        );
+
+        // EITHER half UNKNOWN produces no sample at all. A `0` substituted for
+        // the session count would raise the estimated floor, raise the ceiling
+        // and loosen the guard exactly when the terminal registry is broken.
+        assert_eq!(at_rest_estimate(None, Some(1)), None);
+        assert_eq!(at_rest_estimate(Some(400), None), None);
+        assert_eq!(at_rest_estimate(None, None), None);
+        assert_eq!(
+            at_rest_estimate(Some(400), Some(0)),
+            Some(400),
+            "zero sessions is a READING, not an absence — it must still sample"
+        );
+
+        // An INCOHERENT reading is UNKNOWN, not a low floor. Saturating these
+        // to `Some(0)` would fold a zero into the window as a legitimate floor
+        // and drag the shift to zero for as long as it survived there — the
+        // guard silently reverting to the latch, with nothing said.
+        assert_eq!(at_rest_estimate(Some(1), Some(1000)), None);
+        assert_eq!(at_rest_estimate(Some(10), Some(usize::MAX)), None);
+        // The boundary: session threads EQUAL to the whole process is still
+        // incoherent — a live runner always carries unattributed threads.
+        assert_eq!(at_rest_estimate(Some(9), Some(3)), None);
+        assert_eq!(at_rest_estimate(Some(10), Some(3)), Some(1));
+    }
+
+    /// **The window must be able to RISE, and no single sample may pin it.**
+    ///
+    /// This is the property that separates a trailing window from the all-time
+    /// minimum it replaced, and getting it wrong reinstates the latch. The
+    /// tracked quantity rises over a process's life — 190 at boot, 424 after
+    /// ~96 h on the measured box — so an all-time minimum degenerates to the
+    /// FIRST sample, which is the boot figure, which is the defect.
+    ///
+    /// Asserted on a local [`AtRestWindow`], never the process-global one, so
+    /// this test shares no mutable state with any other test in this binary.
+    #[test]
+    fn the_at_rest_window_can_rise_and_no_single_sample_can_pin_it() {
+        let mut w = AtRestWindow::default();
+        assert_eq!(w.baseline(), None, "no sample yet is UNKNOWN, not zero");
+
+        // The real trajectory: boot low, then climb as the blocking pool
+        // accumulates. An all-time minimum would answer 190 forever.
+        for at_rest in [190, 240, 300, 402] {
+            w.record(at_rest);
+        }
+        assert_eq!(
+            w.baseline(),
+            Some(190),
+            "inside the window, the floor holds"
+        );
+
+        // Age the boot samples out. THIS is the assertion an all-time minimum
+        // fails: after the window turns over, the baseline must have RISEN to
+        // the floor the process actually has.
+        for _ in 0..AT_REST_WINDOW_SAMPLES {
+            w.record(402);
+        }
+        assert_eq!(
+            w.baseline(),
+            Some(402),
+            "the baseline must rise as old samples age out, or the ladder stays \
+             pinned to the boot floor and the latch returns"
+        );
+        assert_eq!(
+            machine_thread_shift(w.baseline()),
+            251,
+            "402 - 151; the shift the 48-core box actually needs"
+        );
+
+        // A single spuriously low outlier lowers the floor — the SAFE
+        // direction, the guard gets stricter — but only until it ages out.
+        w.record(12);
+        assert_eq!(w.baseline(), Some(12));
+        for _ in 0..AT_REST_WINDOW_SAMPLES {
+            w.record(402);
+        }
+        assert_eq!(
+            w.baseline(),
+            Some(402),
+            "an outlier must age out; an all-time minimum would be pinned at 12 \
+             for the life of the process, with no recovery short of a runner \
+             restart that `runner-lifecycle` forbids"
+        );
+
+        // The window is BOUNDED — it is sampled every 30 s for the life of a
+        // process that runs for days.
+        assert_eq!(w.samples.len(), AT_REST_WINDOW_SAMPLES);
+    }
+
+    /// **A STALLED PUBLISHER DECAYS TO UNKNOWN, IT DOES NOT FREEZE.**
+    ///
+    /// `record_at_rest_sample` is reached only from
+    /// `fleet::resource_sample::collect_host_lane`, and `publish_once` returns
+    /// before `collect()` with no `machine.json`, no coord base, or no usable
+    /// device JWT — the last of which is a routine transient, since device JWTs
+    /// are short-lived.
+    ///
+    /// A count-bounded-only window would keep a floor recorded while the box
+    /// was loaded for the LIFE OF THE PROCESS once the tick stopped, holding
+    /// the ceilings shifted off data of unbounded age. That is the one arm of
+    /// this change that would resolve PERMISSIVE, and it is the direction that
+    /// matters: the guard whose job is catching a thread leak would be the one
+    /// whose loosening outlived its own telemetry.
+    #[test]
+    fn a_stalled_publisher_decays_to_unknown_rather_than_freezing_a_stale_floor() {
+        let t0 = std::time::Instant::now();
+        let mut w = AtRestWindow::default();
+
+        // A loaded box fills the window with a high floor, then the publisher
+        // stops (no more `record_at` calls ever).
+        for i in 0..AT_REST_WINDOW_SAMPLES {
+            w.record_at(t0 + std::time::Duration::from_secs(i as u64), 402);
+        }
+        let last = t0 + std::time::Duration::from_secs(AT_REST_WINDOW_SAMPLES as u64);
+        assert_eq!(w.baseline_at(last), Some(402), "fresh samples still count");
+
+        // Inside the age bound the floor stands.
+        assert_eq!(
+            w.baseline_at(last + AT_REST_SAMPLE_MAX_AGE - std::time::Duration::from_secs(60)),
+            Some(402),
+        );
+
+        // Past it, every sample is stale and the answer is UNKNOWN — which
+        // `machine_thread_shift` renders as a ZERO shift, i.e. the shipped
+        // 256/400. Strict, not permissive.
+        let long_after = last + AT_REST_SAMPLE_MAX_AGE + std::time::Duration::from_secs(1);
+        assert_eq!(
+            w.baseline_at(long_after),
+            None,
+            "a window nothing has refreshed must read UNKNOWN, never a live floor"
+        );
+        assert_eq!(machine_thread_shift(w.baseline_at(long_after)), 0);
+        let merged = ceilings_for(w.baseline_at(long_after));
+        assert_eq!(merged.warn_thread_count, defaults().warn_thread_count);
+        assert_eq!(
+            merged.critical_thread_count,
+            defaults().critical_thread_count
+        );
+
+        // A clock that appears to go backwards reads as age zero rather than
+        // underflowing, so a just-taken sample is never discarded.
+        assert_eq!(
+            w.baseline_at(t0 - std::time::Duration::from_secs(0)),
+            Some(402)
+        );
+    }
+
+    /// The calibration constants are the ones the shipped defaults were
+    /// actually derived from — pinned so a future edit to either default has to
+    /// come here and restate the relationship rather than silently changing
+    /// what a ceiling MEANS.
+    #[test]
+    fn the_calibration_baseline_reproduces_the_shipped_headrooms() {
+        assert_eq!(defaults().warn_thread_count - CALIBRATION_BASELINE, 105);
+        assert_eq!(defaults().critical_thread_count - CALIBRATION_BASELINE, 249);
+        assert!(
+            CALIBRATION_BASELINE > crate::health_monitor::THREAD_WARNING_THRESHOLD,
+            "the calibration baseline is a MEASURED idle count, not a threshold"
+        );
+        assert_eq!(
+            AT_REST_BASELINE_MAX, 512,
+            "tokio's per-runtime max_blocking_threads default — the anchor, not a round number"
+        );
     }
 
     /// THE CLAMP. No combination of the three terms may compose a ceiling the
@@ -2092,41 +3143,86 @@ mod tests {
     fn no_combination_of_terms_can_make_the_machine_unspawnable() {
         let ceilings = [0usize, 1, 64, 151, THREAD_CEILING_MIN, 256, 400, usize::MAX];
         let fleets = [None, Some(0), Some(1), Some(64), Some(300), Some(u32::MAX)];
-        for lw in ceilings {
-            for lc in ceilings {
-                for fw in fleets {
-                    for fc in fleets {
-                        let merged = merge_thread_ceilings(
-                            &SessionGuardSettings {
-                                warn_thread_count: lw,
-                                critical_thread_count: lc,
-                                ..defaults()
-                            },
-                            fleet_threads(fw, fc),
-                        );
-                        assert!(
-                            merged.critical_thread_count >= THREAD_CEILING_MIN,
-                            "unspawnable: local({lw},{lc}) fleet({fw:?},{fc:?}) {merged:?}"
-                        );
-                        assert!(
-                            merged.critical_thread_count >= merged.warn_thread_count,
-                            "inverted: local({lw},{lc}) fleet({fw:?},{fc:?}) {merged:?}"
-                        );
-                        assert!(
-                            merged.warn_thread_count <= defaults().warn_thread_count,
-                            "loosened: local({lw},{lc}) fleet({fw:?},{fc:?}) {merged:?}"
-                        );
-                        // The MEASURED at-rest count (150-151 on 2026-08-30)
-                        // still proceeds under EVERY composable configuration.
-                        // This is the property the clamp exists to buy, and the
-                        // reading it has to be measured against — the stale
-                        // 100-130 band in `health_monitor`'s doc would have let
-                        // a clamp of 150 pass this test and wedge the box.
-                        assert_eq!(
-                            evaluate_threads(Some(151), &merged),
-                            SpawnGate::Proceed,
-                            "an idle runner must never be refused: {merged:?}"
-                        );
+        // Every shift a real machine can produce: none (unknown or a box at or
+        // below the calibration baseline), this fleet's 48-core box, and the
+        // capped maximum.
+        let shifts = [
+            0,
+            machine_thread_shift(Some(402)),
+            machine_thread_shift(Some(usize::MAX)),
+        ];
+        for shift in shifts {
+            for lw in ceilings {
+                for lc in ceilings {
+                    for fw in fleets {
+                        for fc in fleets {
+                            let merged = merge_thread_ceilings(
+                                &SessionGuardSettings {
+                                    warn_thread_count: lw,
+                                    critical_thread_count: lc,
+                                    ..defaults()
+                                },
+                                fleet_threads(fw, fc),
+                                shift,
+                            );
+                            assert!(
+                                merged.critical_thread_count >= THREAD_CEILING_MIN,
+                                "unspawnable: local({lw},{lc}) fleet({fw:?},{fc:?}) {merged:?}"
+                            );
+                            assert!(
+                                merged.critical_thread_count >= merged.warn_thread_count,
+                                "inverted: local({lw},{lc}) fleet({fw:?},{fc:?}) {merged:?}"
+                            );
+                            // NOT loosened — stated against the RE-BASED ladder.
+                            //
+                            // This assertion used to read `<= defaults()
+                            // .warn_thread_count` with the same failure label, and
+                            // that spelling only ever meant what it says on a
+                            // machine whose at-rest floor is the one the defaults
+                            // were calibrated against (151). On a box that idles at
+                            // 400 it did not defend the guard: it WAS the latch,
+                            // because it pinned the ceiling below a reading the
+                            // process carries with zero sessions running.
+                            //
+                            // The property being defended is unchanged and is
+                            // restated here in the units that survive re-basing: no
+                            // combination of LOCAL and FLEET terms may loosen past
+                            // the hardcoded default for this machine. `shift` is
+                            // not a term either party can author — it is a
+                            // measurement of the box ([`machine_thread_shift`]) —
+                            // so a bad fleet row still cannot walk the ceiling up.
+                            // The CRITICAL half of the same bound. Without
+                            // it the invariant is one-sided: a mutation that
+                            // applies the shift TWICE to critical only still
+                            // satisfies `critical >= warn`,
+                            // `critical >= THREAD_CEILING_MIN` and the warn
+                            // bound below, so the sweep would pass a ladder
+                            // that had walked the refusal ceiling up by an
+                            // extra `shift` on every box.
+                            assert!(
+                                merged.critical_thread_count
+                                    <= defaults().critical_thread_count + shift,
+                                "critical ceiling above the hardcoded default plus the \
+                                 machine shift: local({lw},{lc}) fleet({fw:?},{fc:?}) \
+                                 shift({shift}) {merged:?}"
+                            );
+                            assert!(
+                                merged.warn_thread_count <= defaults().warn_thread_count + shift,
+                                "loosened: local({lw},{lc}) fleet({fw:?},{fc:?}) \
+                             shift({shift}) {merged:?}"
+                            );
+                            // The MEASURED at-rest count (150-151 on 2026-08-30)
+                            // still proceeds under EVERY composable configuration.
+                            // This is the property the clamp exists to buy, and the
+                            // reading it has to be measured against — the stale
+                            // 100-130 band in `health_monitor`'s doc would have let
+                            // a clamp of 150 pass this test and wedge the box.
+                            assert_eq!(
+                                evaluate_threads(Some(151), &merged),
+                                SpawnGate::Proceed,
+                                "an idle runner must never be refused: {merged:?}"
+                            );
+                        }
                     }
                 }
             }
@@ -2177,7 +3273,7 @@ mod tests {
     #[test]
     fn a_fleet_critical_ceiling_with_a_null_warn_column_cannot_invert_the_ladder() {
         let (merged, coercion) =
-            merge_thread_ceilings_reporting(&defaults(), fleet_threads(None, Some(120)));
+            merge_thread_ceilings_reporting(&defaults(), fleet_threads(None, Some(120)), 0);
 
         // The warn ceiling is NOT lowered to meet the critical one: that would
         // enforce a ceiling nobody stated, below the measured at-rest band,
@@ -2213,7 +3309,7 @@ mod tests {
             ..defaults()
         };
         let (merged, coercion) =
-            merge_thread_ceilings_reporting(&owner, fleet_threads(None, Some(210)));
+            merge_thread_ceilings_reporting(&owner, fleet_threads(None, Some(210)), 0);
 
         // The warn ceiling is NOT dragged down to 210: that would enforce a
         // limit neither party stated, tightening past both inputs.
@@ -2240,7 +3336,7 @@ mod tests {
             ..defaults()
         };
         let (merged, coercion) =
-            merge_thread_ceilings_reporting(&inverted, SessionFloors::default());
+            merge_thread_ceilings_reporting(&inverted, SessionFloors::default(), 0);
         assert_eq!(merged.warn_thread_count, 240, "warn is never dragged down");
         assert_eq!(
             merged.critical_thread_count, 240,
@@ -2265,7 +3361,8 @@ mod tests {
             critical_thread_count: 240,
             ..defaults()
         };
-        let (merged, coercion) = merge_thread_ceilings_reporting(&equal, SessionFloors::default());
+        let (merged, coercion) =
+            merge_thread_ceilings_reporting(&equal, SessionFloors::default(), 0);
         assert_eq!(merged, equal);
         assert_eq!(coercion, None);
     }
@@ -2279,7 +3376,7 @@ mod tests {
         let reading = Some(320);
 
         // Local ceilings alone: 320 is between 150 and 400, so it warns.
-        let local_only = merge_thread_ceilings(&local, SessionFloors::default());
+        let local_only = merge_thread_ceilings(&local, SessionFloors::default(), 0);
         assert!(matches!(
             evaluate_threads(reading, &local_only),
             SpawnGate::Warn(_)
@@ -2287,7 +3384,7 @@ mod tests {
 
         // The tenant declares a 300-thread critical ceiling; the same reading
         // is now a refusal.
-        let merged = merge_thread_ceilings(&local, fleet_threads(None, Some(300)));
+        let merged = merge_thread_ceilings(&local, fleet_threads(None, Some(300)), 0);
         assert_eq!(
             evaluate_threads(reading, &merged),
             SpawnGate::Critical(thread_observation(320, 300))
@@ -2314,7 +3411,7 @@ mod tests {
         assert_eq!(floors.warn_thread_count, 200);
         assert_eq!(floors.critical_thread_count, 300);
 
-        let ceilings = merge_thread_ceilings(&local, fleet_threads(None, Some(250)));
+        let ceilings = merge_thread_ceilings(&local, fleet_threads(None, Some(250)), 0);
         assert_eq!(ceilings.critical_thread_count, 250);
         // The owner tightened their warn ceiling to 200 and it survives: 200 is
         // below the hardcoded 256 (so the `min` keeps it) and at the clamp (so
@@ -2431,7 +3528,7 @@ mod tests {
     /// band; `admit_spawn` refuses only past the critical ceiling.
     #[test]
     fn the_warn_band_is_the_band_phase_one_defers_in() {
-        let guard = merge_thread_ceilings(&defaults(), SessionFloors::default());
+        let guard = merge_thread_ceilings(&defaults(), SessionFloors::default(), 0);
 
         // A continuation-deferring reading: over the warn ceiling, under the
         // critical one. `admit_spawn` would still let a human's terminal start.

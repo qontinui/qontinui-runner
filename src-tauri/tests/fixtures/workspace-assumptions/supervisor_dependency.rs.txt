@@ -1,0 +1,4 @@
+// Planted fixture for class `supervisor_dependency`.
+fn planted_supervisor_dependency() -> String {
+    format!("http://127.0.0.1:{}/health", 9875)
+}

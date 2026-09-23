@@ -5,7 +5,7 @@
 //! keychain operations from `crate::config_facade`.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::Json,
     routing::{delete, get, post},
@@ -1115,34 +1115,76 @@ async fn save_discovery_ports_setting(
 // Path Settings
 // ============================================================================
 
-/// GET /settings/paths
+/// Query for `GET /settings/paths`.
+///
+/// **This door carries no principal** — no extractor, no `DeviceTokenContext`,
+/// nothing a tenant could be derived from — so a caller that wants a tenant's
+/// resolution has to NAME it. That is a fact about this route, not a design
+/// preference. A named tenant here is a **lookup key, never an attribution
+/// claim**: it selects a stored string out of the tenant-keyed path maps, and
+/// nothing downstream may read it as evidence of who owns a captured artifact
+/// (plan `2026-09-22-plans-dir-is-a-single-path-so-a-multi-bound-device-cannot-author-per-tenant`
+/// §2 D1). Trusting it costs nothing that matters because the thing it reads is
+/// a device-local filesystem setting.
+#[derive(Debug, Default, serde::Deserialize)]
+struct PathSettingsQuery {
+    /// Optional tenant UUID string. Omitted ⇒ the device-wide view.
+    #[serde(default)]
+    tenant_id: Option<String>,
+}
+
+/// GET /settings/paths[?tenant_id=<uuid>]
 ///
 /// The `paths` section: the configured struct plus what each field resolves
 /// to now (`commands::path_settings::PathSettingsView`) — the HTTP twin of the
 /// `get_path_settings` Tauri command, so the UI Bridge can drive the section.
-async fn get_path_settings() -> Result<
+///
+/// With `tenant_id`, `resolved.resolved_for_tenant` additionally carries the
+/// three keyed directories (`plans_dir`, `plans_archive_dir`, `prompts_dir`)
+/// resolved for THAT tenant — its own entry where it has one, the device-wide
+/// scalar where it does not. Without it the response is byte-identical to the
+/// one this route served before the settings were keyed, `resolved_for_tenant`
+/// included: the field is absent rather than null.
+async fn get_path_settings(
+    Query(query): Query<PathSettingsQuery>,
+) -> Result<
     Json<ApiResponse<crate::commands::path_settings::PathSettingsView>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
-    let view = spawn_blocking_tracked(crate::commands::path_settings::view)
-        .await
-        .map_err(|e| {
-            error!("Failed to get path settings: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Task failed: {}", e))),
-            )
-        })?;
+    let view = spawn_blocking_tracked(move || {
+        crate::commands::path_settings::view(query.tenant_id.as_deref())
+    })
+    .await
+    .map_err(|e| {
+        error!("Failed to get path settings: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Task failed: {}", e))),
+        )
+    })?;
 
     Ok(Json(ApiResponse::success(view)))
 }
 
 /// PUT /settings/paths
 ///
-/// Body: a whole `PathSettings`. Blank strings are stored as unset; fields the
-/// caller does not show round-trip untouched. Answers the fresh view.
+/// Body: a `commands::path_settings::PathSettingsPatch`. Blank strings are
+/// stored as unset. **Absence never changes a stored value, for every field.**
+/// The five scalar path fields read `null` as unset and a string as set, so an
+/// omitted scalar SURVIVES — do not re-send one to preserve it, which is the
+/// lost update the patch retired. The four keyed maps
+/// (`plans_dir_by_tenant`, `plans_archive_dir_by_tenant`,
+/// `prompts_dir_by_tenant`, `repo_checkouts`) are **merged**: absent or `null`
+/// leaves the stored map untouched, and `{}` is a deliberate clear.
+///
+/// That merge is a **server-side** guarantee, and it replaces a claim that was
+/// never true of this route. The doc here used to say "fields the caller does
+/// not show round-trip untouched", but the save was a whole-struct replace and
+/// the preservation lived in the React helper — so a `PUT` from an agent or a
+/// script that omitted `repo_checkouts` erased it. Answers the fresh **device**
+/// view; ask `GET` with a `tenant_id` for a tenant's resolution.
 async fn save_path_settings(
-    Json(payload): Json<settings::PathSettings>,
+    Json(payload): Json<crate::commands::path_settings::PathSettingsPatch>,
 ) -> Result<
     Json<ApiResponse<crate::commands::path_settings::PathSettingsView>>,
     (StatusCode, Json<ApiResponse<()>>),

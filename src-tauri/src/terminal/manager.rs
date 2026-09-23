@@ -379,8 +379,8 @@ impl TerminalManager {
         // Bypass-aware needs-input hint — emitted only when the spawn command
         // implies bypassed permissions. Emitted AFTER `terminal-created`; the
         // frontend listener buffers a bypass mark whose tab record hasn't
-        // landed yet (mirrors the existing worker-registered race buffer), so
-        // either delivery order is safe.
+        // landed yet (the same race buffer the deleted `worker-registered`
+        // emit relied on), so either delivery order is safe.
         if bypass_permissions {
             if let Err(e) = emitter.emit(
                 "terminal-bypass-permissions",
@@ -546,45 +546,6 @@ impl TerminalManager {
             &payload,
         );
         Ok(())
-    }
-
-    /// Like [`Self::set_title`], but silently drops the update when the
-    /// terminal is registered with a `WorkerSession` in `session_manager`.
-    /// Used by the `terminal_set_title` Tauri command to pin `Worker N`
-    /// tab titles against OSC 0 drift from the embedded Claude CLI.
-    ///
-    /// Why: PR #98 (`0b61fa70a`, `feat(coord): worker readiness gate +
-    /// terminal UX fixes from coord soak`) made title sync bidirectional,
-    /// so OSC 0 titles emitted by Claude inside a worker pty overwrite
-    /// both the in-memory `TerminalSession.title` AND the UI tab strip
-    /// via `ZoneGrid::onTitleChange → invoke("terminal_set_title")`.
-    /// `Worker N` is the at-a-glance identifier operators (and the
-    /// Coordinator's `project.tasks.assigned_session_id` join) use to
-    /// triage workers — preserving it requires gating the post-spawn
-    /// title mutations from worker-backed ptys.
-    ///
-    /// Non-worker terminals (manual `POST /terminals`, dashboard launch
-    /// buttons, etc.) keep the existing OSC 0 follow-the-child behaviour
-    /// through the unguarded [`Self::set_title`] path. Direct internal
-    /// callers (e.g. a future "rename tab from settings" UI) should
-    /// continue to invoke `set_title` directly — the gate applies only
-    /// to the OSC 0 echo path.
-    pub fn set_title_unless_worker(
-        &self,
-        session_manager: &SessionManager,
-        id: &str,
-        title: String,
-        app_handle: &AppHandle,
-    ) -> Result<(), String> {
-        if session_manager.find_worker_by_terminal_id(id).is_some() {
-            debug!(
-                terminal_id = id,
-                title = %title,
-                "dropping OSC 0 title update for worker-backed terminal"
-            );
-            return Ok(());
-        }
-        self.set_title(id, title, app_handle)
     }
 
     /// Remove and close a terminal session.
@@ -793,43 +754,6 @@ impl TerminalManager {
                 None
             }
         }
-    }
-
-    /// Return the `(cols, rows)` of the largest currently-registered
-    /// terminal — "largest" measured by `cols * rows` cell count. Falls
-    /// back to `(120, 30)` (the historical `create()` default) when no
-    /// sessions exist.
-    ///
-    /// Phase 4 of the 2026-05-11 dispatch-fix plan: worker tabs spawned
-    /// into a zone where another tab is currently visible mount under
-    /// `display: none`. xterm.js's fit-addon then can't measure the
-    /// container, so the backend PTY stays at the 120×30 default until
-    /// the user activates the tab. Pre-sizing the new PTY to the
-    /// dominant zone dims means Coordinator dispatch lands on a PTY
-    /// matching the eventual visible size (Claude doesn't have to wrap
-    /// twice). Fallback dims match what `create()` would have used on
-    /// `None, None`, so behaviour is identical when there's no signal to
-    /// crib from.
-    pub fn dominant_zone_dims(&self) -> (u16, u16) {
-        let sessions = match self.sessions.lock() {
-            Ok(s) => s,
-            Err(e) => {
-                error!("Sessions lock poisoned in dominant_zone_dims: {}", e);
-                return (120, 30);
-            }
-        };
-        let mut best: Option<(u16, u16, u32)> = None;
-        for sess in sessions.values() {
-            let info = sess.info();
-            let area = (info.cols as u32).saturating_mul(info.rows as u32);
-            if area == 0 {
-                continue;
-            }
-            if best.map(|(_, _, a)| area > a).unwrap_or(true) {
-                best = Some((info.cols, info.rows, area));
-            }
-        }
-        best.map(|(c, r, _)| (c, r)).unwrap_or((120, 30))
     }
 
     /// Snapshot of `(session_id, Arc<TerminalSession>)` pairs for

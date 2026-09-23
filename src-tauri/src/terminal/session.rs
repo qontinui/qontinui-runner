@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::broadcast;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use portable_pty::CommandBuilder;
@@ -898,8 +898,10 @@ fn paste_block_from_body(body: &str) -> Vec<u8> {
 }
 
 /// Build the exact byte sequence [`TerminalSession::submit_prompt`] writes.
-/// Exposed so tests (and the worker_session unit test) can assert the
-/// submit framing without spinning up a real PTY.
+/// Exposed so tests can assert the submit framing without spinning up a real
+/// PTY. (The `worker_session` unit test was its other consumer until Phase 4
+/// of `2026-09-12-consolidate-local-orchestration-onto-conductor` deleted the
+/// worker plane.)
 ///
 /// Shares [`paste_block`]'s neutralize-then-frame composition with the
 /// production path — see that function on why the composition, rather than
@@ -1386,21 +1388,6 @@ pub struct TerminalSession {
     output_tx: broadcast::Sender<String>,
     /// Server-side cell grid produced by the VT parser tee in the reader thread.
     grid: Arc<Mutex<Grid>>,
-    /// One-shot sender fired by the reader thread when it observes the
-    /// first OSC 0 / OSC 2 title from the child process. Used by
-    /// `spawn_worker_session` (Phase 1) to gate `Initializing → Ready` on
-    /// readline visibility: Claude Code's CLI emits an OSC 0 title
-    /// (`"✳ Claude Code"`) on startup, so this resolves ~150–300 ms after
-    /// child spawn. Wrapped in `Mutex<Option<...>>` because the sender is
-    /// consumed (`take()`'d) on first fire — subsequent OSC 0s do not
-    /// re-fire.
-    first_osc_title_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
-    /// One-shot receiver, taken at most once by
-    /// [`Self::subscribe_first_osc_title`]. After the take, callers that
-    /// ask again get `None` and should treat the worker as already ready
-    /// (the OSC may have fired before they could subscribe, in which case
-    /// the sender already consumed the slot above).
-    first_osc_title_rx: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
     /// Coord-native session id, set after `register_external()` wires this
     /// terminal into the coordinator's session plane. `None` until wired;
     /// read by `terminal_close` so it can close the coord mirror.
@@ -1793,16 +1780,6 @@ impl TerminalSession {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        // Phase 1: one-shot fired by the reader thread on the first OSC
-        // 0/2 title transition. The session owns the receiver until a
-        // caller (`spawn_worker_session`) takes it via
-        // `subscribe_first_osc_title`; the reader owns the sender via
-        // an Arc<Mutex<Option<...>>> slot and `take`s it on first fire.
-        let (osc_title_tx, osc_title_rx) = oneshot::channel::<()>();
-        let first_osc_title_tx = Arc::new(Mutex::new(Some(osc_title_tx)));
-        let first_osc_title_rx: Arc<Mutex<Option<oneshot::Receiver<()>>>> =
-            Arc::new(Mutex::new(Some(osc_title_rx)));
-
         // Get an output reader from the pane
         let mut reader = io.reader()?;
 
@@ -1834,7 +1811,6 @@ impl TerminalSession {
         let reader_output_tx = output_tx.clone();
         let reader_grid = grid.clone();
         let reader_grid_generation = grid_generation.clone();
-        let reader_osc_title_tx = first_osc_title_tx.clone();
         let reader_coord_session_id = coord_session_id.clone();
         let reader_agent_status_last = agent_status_last.clone();
         // Per-session OSC 9999 coalescer — see
@@ -2056,53 +2032,26 @@ impl TerminalSession {
                                 );
 
                             // Tee through the VT parser into the per-session cell grid.
-                            // Detect the first OSC 0/2 title transition by
-                            // checking whether the grid's title became
-                            // `Some` *during* this parser advance. The
-                            // sender lives in an `Arc<Mutex<Option<...>>>`
-                            // slot we drain on first fire — subsequent
-                            // title changes don't re-fire. Worker dispatch
-                            // gating in `spawn_worker_session` only needs
-                            // the one-shot signal.
                             //
                             // The OSC 9999 agent-status sideband (plan
                             // `2026-08-11-coord-hook-sourced-agent-status`
-                            // Channel 2) rides the SAME before/after shape: read
+                            // Channel 2) uses a before/after shape: read
                             // the monotonic sideband seq here, compare it after
                             // the advance, and only clone/drain the payload when
                             // it actually moved. The common case — no sideband in
                             // this chunk — costs one extra `u64` read inside a
                             // lock we were already taking, and no allocation.
-                            let (title_was_none, sideband_seq_before) = reader_grid
+                            let sideband_seq_before = reader_grid
                                 .lock()
                                 .ok()
-                                .map(|g| (g.title().is_none(), g.agent_status_sideband_seq()))
-                                .unwrap_or((false, 0));
+                                .map(|g| g.agent_status_sideband_seq())
+                                .unwrap_or(0);
                             advance_grid(
                                 &reader_grid,
                                 &reader_grid_generation,
                                 &mut parser,
                                 &data,
                             );
-                            if title_was_none {
-                                let title_is_now_some = reader_grid
-                                    .lock()
-                                    .ok()
-                                    .map(|g| g.title().is_some())
-                                    .unwrap_or(false);
-                                if title_is_now_some {
-                                    if let Ok(mut slot) = reader_osc_title_tx.lock() {
-                                        if let Some(tx) = slot.take() {
-                                            // Receiver may have been
-                                            // dropped (caller didn't
-                                            // subscribe). Ignore — the
-                                            // sender simply discards the
-                                            // signal.
-                                            let _ = tx.send(());
-                                        }
-                                    }
-                                }
-                            }
 
                             // Sync-output-aware emit (Phase 4). Read the live
                             // DEC-2026 state straight after the advance above:
@@ -2332,8 +2281,6 @@ impl TerminalSession {
             created_at,
             output_tx,
             grid,
-            first_osc_title_tx,
-            first_osc_title_rx,
             coord_session_id,
             agent_status_last,
             grid_idle_tracker: Mutex::new(qontinui_runner_lib::wind_down::GridIdleTracker::new()),
@@ -3570,8 +3517,8 @@ impl TerminalSession {
         let report = sanitize_submit_body_reporting(message);
 
         // Say so when the body was rewritten. This is the choke point ALL
-        // inbound producers reach — the submit-prompt route, worker_session,
-        // auto_response, account_migration, looping_agent_supervisor — but
+        // inbound producers reach — the submit-prompt route, auto_response,
+        // account_migration, looping_agent_supervisor — but
         // only the route can report a rewrite to its caller, and only into a
         // JSON field no client reads. Without this line a neutralizer that
         // mangles legitimate content (a recorded risk: agents paste diffs
@@ -3989,26 +3936,6 @@ impl TerminalSession {
             .lock()
             .map(|g| g.clone())
             .unwrap_or_else(|e| e.into_inner().clone())
-    }
-
-    /// Take the one-shot receiver that resolves when the reader thread
-    /// observes the first OSC 0/2 title from the child process. Returns
-    /// `None` if a previous caller already took the receiver — callers
-    /// should treat that as "already initialized" and skip the wait.
-    /// `Some(rx)` resolves to `Ok(())` when the title lands, or
-    /// `Err(oneshot::error::RecvError)` if the session closes before any
-    /// OSC 0/2 arrives (caller should fall back to a timeout regardless).
-    ///
-    /// Used by `spawn_worker_session` (Phase 1) to gate
-    /// `Initializing → Ready` on Claude CLI readline visibility — the CLI
-    /// emits its OSC 0 title (`"✳ Claude Code"`) ~150–300 ms after
-    /// startup, so the rx resolves well before the 8 s fallback timeout
-    /// the dispatcher uses.
-    pub fn subscribe_first_osc_title(&self) -> Option<oneshot::Receiver<()>> {
-        self.first_osc_title_rx
-            .lock()
-            .ok()
-            .and_then(|mut slot| slot.take())
     }
 
     /// Get the scrollback buffer contents and the byte offset where the data starts.
@@ -5058,7 +4985,6 @@ mod tests {
     fn make_test_session(buf: Arc<Mutex<Vec<u8>>>) -> TerminalSession {
         let writer: Box<dyn Write + Send> = Box::new(CapturingWriter(buf));
         let (output_tx, _) = broadcast::channel::<String>(1);
-        let (osc_title_tx, osc_title_rx) = oneshot::channel::<()>();
         TerminalSession {
             id: "test".to_string(),
             title: Arc::new(Mutex::new("test".to_string())),
@@ -5092,8 +5018,6 @@ mod tests {
             created_at: 0,
             output_tx,
             grid: Arc::new(Mutex::new(Grid::new(80, 24))),
-            first_osc_title_tx: Arc::new(Mutex::new(Some(osc_title_tx))),
-            first_osc_title_rx: Arc::new(Mutex::new(Some(osc_title_rx))),
             coord_session_id: Arc::new(Mutex::new(None)),
             agent_status_last: Arc::new(Mutex::new(None)),
             grid_idle_tracker: Mutex::new(qontinui_runner_lib::wind_down::GridIdleTracker::new()),
@@ -7555,17 +7479,6 @@ mod tests {
         assert!(session.input_line_buf.lock().unwrap().is_empty());
         // ...and the PTY itself still received every byte, unchanged.
         assert_eq!(buf.lock().unwrap().as_slice(), b"claude --resume\r");
-    }
-
-    #[test]
-    fn subscribe_first_osc_title_returns_some_once() {
-        // The receiver can be taken at most once. Subsequent takes return
-        // `None` — `spawn_worker_session` interprets that as "already
-        // ready, skip the wait".
-        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let session = make_test_session(buf);
-        assert!(session.subscribe_first_osc_title().is_some());
-        assert!(session.subscribe_first_osc_title().is_none());
     }
 
     /// Spawn a real `portable-pty` child that prints `marker`, drive a

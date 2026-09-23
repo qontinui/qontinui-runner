@@ -108,7 +108,7 @@ pub fn coord_client() -> Option<&'static reqwest::Client> {
 /// auth-coverage metric, so these reads now count toward the same
 /// unpaired→paired dogfood signal the write path reports.
 pub fn coord_get(client: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
-    // coord-tenant-scope(escalated): a shared helper, not a route call -- `url` is the caller's argument and its 21 downstream callers span session-, device- and work-scoped reads. The decision belongs at each caller via the existing `coord_get_for` (:123-129). Census E1.
+    // coord-tenant-scope(escalated): a shared helper, not a route call -- `url` is the caller's argument and its downstream callers (21 at the Census E1 reading; that number is a census snapshot, not a live count -- `grep` for it) span session-, device- and work-scoped reads. The decision belongs at each caller via the existing `coord_get_for` (:123-129). Callers adopt it one at a time as each establishes its own class: the tenant-policy poll (`session/coord_sync.rs::fetch_session_coordination_flag`) is the first, per plan `2026-09-17-device-holds-one-credential-slot-so-a-session-cannot-work-a-bound-tenant` P3.
     qontinui_runner_lib::auth::attach_device_auth(client.get(url))
 }
 
@@ -150,20 +150,57 @@ pub fn coord_put(client: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwes
 /// tenant's credential). This is the seam census E1 names as the resolution
 /// for [`coord_get`]'s 21 cross-class callers — each states its own scope here
 /// instead of inheriting one helper's guess.
-#[allow(dead_code)] // seam: session-scoped GET readers adopt as they gain tenants
+/// First adopter: `session/coord_sync.rs::fetch_session_coordination_flag`,
+/// the `/tenant-policy` poll, whose query names a tenant that coord requires
+/// to EQUAL the presented token's claim.
+///
+/// **Takes `crate::auth::TenantScope`, not `qontinui_runner_lib::auth`'s**,
+/// unlike the three unparameterized helpers above — and the reason is NOT a
+/// naming convenience. This module is declared in `main.rs` alone, so it
+/// compiles into the bin only and a bin caller could perfectly well name
+/// `qontinui_runner_lib::auth::TenantScope`; no conversion was ever required.
+///
+/// What forces the choice is that `auth` IS compiled twice — `lib.rs`'s
+/// `pub mod auth` and `main.rs`'s `mod auth` are two separate copies with
+/// SEPARATE STATICS. `DATA_PLANE_TOTAL` / `DATA_PLANE_AUTHED` (the
+/// coverage counters), `MISSING_TOKEN_WARNED`, `DEAD_LEGACY_SLOT_WARNED` and
+/// the `warn_once_per_tenant_*` sets each exist once per copy. Routing this
+/// helper through `crate::auth` puts the attach in the SAME copy as the
+/// `crate::auth::presented_tenant` call that diagnoses its refusals and as
+/// the rest of this copy's `attach_device_auth*` call sites — the large
+/// majority of them, spread across three dozen modules — so the latch that
+/// says "already warned" and the counter that says "N of M authed" are the
+/// ones those sites read.
+/// Split across copies, a warning suppressed in one copy fires again from the
+/// other and neither counter is the whole story.
+///
+/// No count is pinned here on purpose. It moves with every call site added,
+/// and a grep wide enough to be worth quoting (`attach_device_auth`) also
+/// matches the LIB copy's own sites, this module's `use` lines and the doc
+/// comments referring to it — so any single number invites a reader to
+/// reproduce a different one and conclude the comment is wrong. The property
+/// that matters is "one copy of the statics", not "N".
+///
+/// Residual, named rather than fixed here: [`coord_get`], [`coord_post`] and
+/// [`coord_put`] above still call the LIB copy's `attach_device_auth`, so the
+/// runner emits the identically-worded
+/// `"coord data-plane device-JWT coverage: X/Y (Z%)"` line from two
+/// independent counters and an operator sees two indistinguishable series.
+/// That split PRE-EXISTS this change and outlives it; converging the two
+/// copies is a census item, not a line to slip into this one.
 pub fn coord_get_for(
     client: &reqwest::Client,
     url: impl reqwest::IntoUrl,
-    scope: qontinui_runner_lib::auth::TenantScope,
+    scope: crate::auth::TenantScope,
 ) -> reqwest::RequestBuilder {
-    qontinui_runner_lib::auth::attach_device_auth_for(client.get(url), scope)
+    crate::auth::attach_device_auth_for(client.get(url), scope)
 }
 
 /// True iff a non-empty device-JWT is currently stored.
 ///
 /// Callers that must distinguish "unpaired" (no token locally) from
 /// "token present but rejected" (coord 401/403) use this — e.g.
-/// `get_fleet_health`'s structured `auth` state. Mirrors the availability
+/// `prompt_library`'s structured `auth` state. Mirrors the availability
 /// check inside [`coord_get`]; never fatal, never panics.
 pub fn have_device_token() -> bool {
     qontinui_runner_lib::auth::device_bearer().is_some()

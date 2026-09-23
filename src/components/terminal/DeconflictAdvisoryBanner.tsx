@@ -26,13 +26,18 @@
  * the parent enforces.
  *
  * Visual language mirrors `HoldingLockBanner` — same soft-amber
- * `#e0af68` accent at lower saturation. The banner is positioned in the
- * same overlay slot above the active terminal so a session that hits
- * BOTH a lock-yield event AND a deconflict advisory stacks them in
- * priority order (lock first, deconflict below). The two banners never
- * fight for the same screen real estate because the lock-yield banners
- * are absolutely positioned to `top-2 right-2 w-[340px]` and this banner
- * sits below them in the document flow with the same width budget.
+ * `#e0af68` accent at lower saturation, `absolute top-14 right-2 w-[340px]`
+ * within `TerminalPage`'s own zone-grid container.
+ *
+ * As of #1671 this is no longer coordinated with the lock-yield banners'
+ * position: `HoldingLockBanner` / `WaitingLockBanner` / `MidSessionToast`
+ * now portal into `AdvisoryStack`'s app-root-level `position: fixed`
+ * container instead of rendering locally, so the `top-14` offset here is
+ * no longer calibrated against a `top-2` banner actually rendered above it
+ * in this container — it is simply this banner's own fixed local position.
+ * `DeconflictAdvisoryBanner` was deliberately left out of that stack (not
+ * one of the five banners named in finding c91550f0); wiring it in is
+ * follow-up work, not something this component can assume has happened.
  */
 
 import { useEffect, useState } from "react";
@@ -73,10 +78,7 @@ export interface DeconflictAdvisory {
  *    - target_id matches the current tab.
  *
  *  Decoupled from React state so the test pin can drive it directly. */
-export function isMatchingAdvisory(
-  advisory: DeconflictAdvisory,
-  taskRunId: string,
-): boolean {
+export function isMatchingAdvisory(advisory: DeconflictAdvisory, taskRunId: string): boolean {
   return (
     advisory.rule === "deconflict" &&
     advisory.sessionId.startsWith("deconflicter-") &&
@@ -171,10 +173,7 @@ export function DeconflictAdvisoryBanner({ taskRunId }: DeconflictAdvisoryBanner
         resolution: "dismissed",
       });
     } catch (err) {
-      logger.warn(
-        `resolve_escalation('${decisionId}','dismissed') failed; advisory re-shown`,
-        err,
-      );
+      logger.warn(`resolve_escalation('${decisionId}','dismissed') failed; advisory re-shown`, err);
       // Re-fetch the advisory if it's still in our state? Too noisy —
       // dismissal is purely visual, the PG row staying unresolved is
       // acceptable. A future re-render of the same tab won't see this
@@ -201,9 +200,7 @@ export function DeconflictAdvisoryBanner({ taskRunId }: DeconflictAdvisoryBanner
         >
           <div className="flex items-start gap-2">
             <AlertTriangle className="w-3.5 h-3.5 shrink-0 text-[#e0af68] mt-0.5" />
-            <div className="text-[11px] text-[#c0caf5] leading-snug flex-1">
-              {a.reasoning}
-            </div>
+            <div className="text-[11px] text-[#c0caf5] leading-snug flex-1">{a.reasoning}</div>
             <button
               type="button"
               aria-label="Dismiss advisory"

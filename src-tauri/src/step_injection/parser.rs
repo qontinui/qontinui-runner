@@ -19,11 +19,28 @@ use regex::Regex;
 use std::sync::OnceLock;
 use tracing::warn;
 
-use crate::step_executor::ExecutionStepConfig;
 use crate::str_utils::truncate_str;
 
+/// What the parser needs of the step type it deserializes into.
+///
+/// Declared here, in the parser, and implemented by the module that owns
+/// the concrete config type — so this module names no execution type and
+/// the parser is exercisable against any step shape.
+pub trait InjectableStep: serde::de::DeserializeOwned {
+    /// The step's declared type, checked against the parser's allow-list.
+    fn step_type(&self) -> &str;
+    /// Force the phase an injected step runs in.
+    fn set_phase(&mut self, phase: String);
+    /// Whether an explicit command mode was supplied.
+    fn has_command_mode(&self) -> bool;
+    fn set_command_mode(&mut self, mode: String);
+    /// Whether the step carried its own id.
+    fn has_id(&self) -> bool;
+    fn set_id(&mut self, id: String);
+}
+
 /// Maximum number of injected steps per agentic phase.
-const MAX_INJECTED_STEPS: usize = 20;
+pub(crate) const MAX_INJECTED_STEPS: usize = 20;
 
 static INJECT_STEP_START: OnceLock<Regex> = OnceLock::new();
 static INJECT_STEP_END: OnceLock<Regex> = OnceLock::new();
@@ -62,8 +79,8 @@ impl InjectedStepParser {
     }
 
     /// Process a line of AI output.
-    /// Returns Some(ExecutionStepConfig) when a complete block is parsed.
-    pub fn process_line(&mut self, line: &str) -> Option<ExecutionStepConfig> {
+    /// Returns `Some(T)` when a complete block is parsed.
+    pub fn process_line<T: InjectableStep>(&mut self, line: &str) -> Option<T> {
         let start_pattern = get_start_pattern();
         let end_pattern = get_end_pattern();
 
@@ -115,36 +132,37 @@ impl InjectedStepParser {
         None
     }
 
-    /// Try to parse the accumulated content as JSON into an ExecutionStepConfig.
-    fn try_parse_step(&mut self, content: &str) -> Option<ExecutionStepConfig> {
+    /// Try to parse the accumulated content as JSON into a step config.
+    fn try_parse_step<T: InjectableStep>(&mut self, content: &str) -> Option<T> {
         let trimmed = content.trim();
         if trimmed.is_empty() {
             warn!("INJECT_STEP: Empty block content, skipping");
             return None;
         }
 
-        match serde_json::from_str::<ExecutionStepConfig>(trimmed) {
+        match serde_json::from_str::<T>(trimmed) {
             Ok(mut step) => {
                 // Validate step_type
-                if !ALLOWED_STEP_TYPES.contains(&step.step_type.as_str()) {
+                if !ALLOWED_STEP_TYPES.contains(&step.step_type()) {
                     warn!(
                         "INJECT_STEP: Invalid step_type '{}', allowed: {:?}",
-                        step.step_type, ALLOWED_STEP_TYPES
+                        step.step_type(),
+                        ALLOWED_STEP_TYPES
                     );
                     return None;
                 }
 
                 // Force phase to verification
-                step.phase = Some("verification".to_string());
+                step.set_phase("verification".to_string());
 
                 // Default command_mode to "shell" for command-type steps
-                if step.step_type == "command" && step.command_mode.is_none() {
-                    step.command_mode = Some("shell".to_string());
+                if step.step_type() == "command" && !step.has_command_mode() {
+                    step.set_command_mode("shell".to_string());
                 }
 
                 // Generate UUID id if none provided
-                if step.id.is_none() {
-                    step.id = Some(uuid::Uuid::new_v4().to_string());
+                if !step.has_id() {
+                    step.set_id(uuid::Uuid::new_v4().to_string());
                 }
 
                 self.steps_parsed += 1;
@@ -171,201 +189,5 @@ impl InjectedStepParser {
     /// Get the number of steps parsed so far.
     pub fn steps_parsed(&self) -> usize {
         self.steps_parsed
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_api_request_step() {
-        let mut parser = InjectedStepParser::new();
-
-        assert!(parser.process_line("[INJECT_STEP]").is_none());
-        assert!(parser
-            .process_line(r#"{"type": "api_request", "name": "Verify KB entry", "api_url": "http://localhost:9876/knowledge", "api_method": "GET"}"#)
-            .is_none());
-
-        let step = parser
-            .process_line("[/INJECT_STEP]")
-            .expect("Should parse step");
-
-        assert_eq!(step.step_type, "api_request");
-        assert_eq!(step.name, Some("Verify KB entry".to_string()));
-        assert_eq!(step.phase, Some("verification".to_string()));
-        assert!(step.id.is_some()); // UUID generated
-    }
-
-    #[test]
-    fn test_parse_multiline_json() {
-        let mut parser = InjectedStepParser::new();
-
-        parser.process_line("[INJECT_STEP]");
-        parser.process_line("{");
-        parser.process_line(r#"  "type": "check_command","#);
-        parser.process_line(r#"  "name": "Check file exists","#);
-        parser.process_line(r#"  "promptContent": "ls -la /tmp/test""#);
-        parser.process_line("}");
-
-        let step = parser
-            .process_line("[/INJECT_STEP]")
-            .expect("Should parse multiline step");
-
-        assert_eq!(step.step_type, "check_command");
-        assert_eq!(step.name, Some("Check file exists".to_string()));
-        assert_eq!(step.phase, Some("verification".to_string()));
-    }
-
-    #[test]
-    fn test_parse_prompt_step() {
-        let mut parser = InjectedStepParser::new();
-
-        parser.process_line("[INJECT_STEP]");
-        parser.process_line(
-            r#"{"type": "prompt", "name": "Verify fix applied", "promptContent": "Check that the fix was correctly applied to the codebase."}"#,
-        );
-
-        let step = parser
-            .process_line("[/INJECT_STEP]")
-            .expect("Should parse prompt step");
-
-        assert_eq!(step.step_type, "prompt");
-        assert_eq!(
-            step.prompt_content,
-            Some("Check that the fix was correctly applied to the codebase.".to_string())
-        );
-    }
-
-    #[test]
-    fn test_invalid_step_type_rejected() {
-        let mut parser = InjectedStepParser::new();
-
-        parser.process_line("[INJECT_STEP]");
-        parser.process_line(r#"{"type": "dangerous_action", "name": "Bad step"}"#);
-
-        let result = parser.process_line("[/INJECT_STEP]");
-        assert!(result.is_none(), "Invalid step_type should be rejected");
-    }
-
-    #[test]
-    fn test_malformed_json_discarded() {
-        let mut parser = InjectedStepParser::new();
-
-        parser.process_line("[INJECT_STEP]");
-        parser.process_line("this is not json at all");
-
-        let result = parser.process_line("[/INJECT_STEP]");
-        assert!(result.is_none(), "Malformed JSON should be discarded");
-        assert_eq!(parser.steps_parsed(), 0);
-    }
-
-    #[test]
-    fn test_empty_block_discarded() {
-        let mut parser = InjectedStepParser::new();
-
-        parser.process_line("[INJECT_STEP]");
-        let result = parser.process_line("[/INJECT_STEP]");
-        assert!(result.is_none(), "Empty block should be discarded");
-    }
-
-    #[test]
-    fn test_multiple_blocks() {
-        let mut parser = InjectedStepParser::new();
-
-        // First block
-        parser.process_line("[INJECT_STEP]");
-        parser.process_line(
-            r#"{"type": "api_request", "name": "Check 1", "api_url": "http://localhost:9876/check1", "api_method": "GET"}"#,
-        );
-        let step1 = parser
-            .process_line("[/INJECT_STEP]")
-            .expect("Should parse first step");
-        assert_eq!(step1.name, Some("Check 1".to_string()));
-
-        // Second block
-        parser.process_line("[INJECT_STEP]");
-        parser.process_line(
-            r#"{"type": "prompt", "name": "Check 2", "promptContent": "Verify something"}"#,
-        );
-        let step2 = parser
-            .process_line("[/INJECT_STEP]")
-            .expect("Should parse second step");
-        assert_eq!(step2.name, Some("Check 2".to_string()));
-
-        assert_eq!(parser.steps_parsed(), 2);
-    }
-
-    #[test]
-    fn test_cap_enforcement() {
-        let mut parser = InjectedStepParser::new();
-
-        // Parse MAX_INJECTED_STEPS steps
-        for i in 0..MAX_INJECTED_STEPS {
-            parser.process_line("[INJECT_STEP]");
-            parser.process_line(&format!(
-                r#"{{"type": "prompt", "name": "Step {}", "promptContent": "Check {}"}}"#,
-                i, i
-            ));
-            let result = parser.process_line("[/INJECT_STEP]");
-            assert!(result.is_some(), "Step {} should parse", i);
-        }
-
-        assert_eq!(parser.steps_parsed(), MAX_INJECTED_STEPS);
-
-        // Next step should be rejected
-        parser.process_line("[INJECT_STEP]");
-        parser.process_line(
-            r#"{"type": "prompt", "name": "Over limit", "promptContent": "Should fail"}"#,
-        );
-        let result = parser.process_line("[/INJECT_STEP]");
-        assert!(result.is_none(), "Over-cap step should be rejected");
-    }
-
-    #[test]
-    fn test_case_insensitive_markers() {
-        let mut parser = InjectedStepParser::new();
-
-        parser.process_line("[inject_step]");
-        parser.process_line(r#"{"type": "prompt", "name": "Test", "promptContent": "hi"}"#);
-
-        let step = parser
-            .process_line("[/inject_step]")
-            .expect("Should parse case-insensitive");
-
-        assert_eq!(step.step_type, "prompt");
-    }
-
-    #[test]
-    fn test_phase_always_forced_to_verification() {
-        let mut parser = InjectedStepParser::new();
-
-        parser.process_line("[INJECT_STEP]");
-        // JSON explicitly sets phase to "agentic" — should be overridden
-        parser.process_line(
-            r#"{"type": "prompt", "name": "Test", "phase": "agentic", "promptContent": "hi"}"#,
-        );
-
-        let step = parser.process_line("[/INJECT_STEP]").expect("Should parse");
-
-        assert_eq!(
-            step.phase,
-            Some("verification".to_string()),
-            "Phase must be forced to verification"
-        );
-    }
-
-    #[test]
-    fn test_existing_id_preserved() {
-        let mut parser = InjectedStepParser::new();
-
-        parser.process_line("[INJECT_STEP]");
-        parser.process_line(
-            r#"{"type": "prompt", "id": "my-custom-id", "name": "Test", "promptContent": "hi"}"#,
-        );
-
-        let step = parser.process_line("[/INJECT_STEP]").expect("Should parse");
-
-        assert_eq!(step.id, Some("my-custom-id".to_string()));
     }
 }

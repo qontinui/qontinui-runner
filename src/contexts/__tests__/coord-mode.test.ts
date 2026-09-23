@@ -3,7 +3,7 @@
  * `2026-08-18-runner-embedded-pg-parity-and-coord-http-migration` §6.4.
  *
  * The runner's vitest config is `environment: "node"` (no jsdom — see
- * `FleetHealthPanel.test.tsx` for the same constraint), so these exercise the
+ * `FileActivityPanel.test.tsx` for the same constraint), so these exercise the
  * pure derivations and the shared fetch rather than a rendered tree. Those
  * are the load-bearing parts: every gated surface branches on
  * `deriveCoordGating`'s output, and the panels' own derivations
@@ -184,6 +184,6 @@ describe("coordCallsReady — the fail-open window (§6.4)", () => {
  * silent on every runner build predating `get_coord_mode` — and every
  * assertion in this file would still pass, because none of them render the
  * provider. Under `environment: "node"` there is no renderer to drive it (see
- * FleetHealthPanel.test.tsx for the same constraint); closing this needs a
+ * FileActivityPanel.test.tsx for the same constraint); closing this needs a
  * DOM environment for this file, not another pure-function assertion.
  */

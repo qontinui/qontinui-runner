@@ -396,6 +396,42 @@ next subsection governs when.**
 
 ##### Overwriting `IN PROGRESS` — conditional, because this skill can LAUNDER it
 
+This skill is the writer the laundering failure was first measured on (#485):
+it downgraded a guarded `IN PROGRESS` to `NOT STARTED`, a token every other
+writer declares freely overwritable. The shared guard block states the rule;
+the subsection after it is this skill's own disposition.
+
+<!-- status-guard:start -->
+> **`IN PROGRESS` is a GUARDED STATE — it is never freely overwritable.**
+> *(Roster and gate: `.claude/commands/_status-writers.md`, check #64. The full
+> arm table and its evaluation order: `/vet-plan`, "`IN PROGRESS` is
+> CONDITIONALLY overwritable".)* Before this command writes, replaces,
+> downgrades or re-dates a plan's lifecycle stamp, read the stamp already there
+> and apply these five rules.
+>
+> 1. **An `IN PROGRESS` stamp is a conditional STOP, not a value to replace.**
+>    It protects a live peer's in-flight work.
+> 2. **The discriminator is the SESSION MARKER, not the token.** A marker that
+>    IS your own current session id is a resume: refresh the date and keep the
+>    trail, never take over. A marker that is a different session id is a LIVE
+>    PEER unless you can positively verify that session died with zero work
+>    products — transcript tail shows death, its worktrees clean and 0 ahead of
+>    `origin/main`, and no PRs and no branches for the plan. Verified dead, and
+>    only then, adopt it and append your own marker.
+> 3. **No marker, or one you cannot positively attribute, is the UNIDENTIFIED
+>    DEFAULT: STOP.** Not an overwrite, and not an adoption. Adoption is the
+>    earned branch; stopping is the fallback.
+> 4. **Do not LAUNDER it.** Rewriting the token into `NOT STARTED`, `PARTIAL`,
+>    `DRAFT`, a terminal state or a bare re-date converts a hard STOP into a
+>    state the other writers declare freely overwritable, and every downstream
+>    reader then sees a well-formed stamp written by a trusted skill. That is
+>    this guard's failure mode: laundering, not bypass (#485).
+> 5. **An UNKNOWN is not permission.** A delivery read that is degraded, masked,
+>    non-2xx, unparseable or carrying `merged_degraded_reason` leaves the
+>    stamp's meaning unestablished. Fall through to STOP, never to overwrite,
+>    and say the read was inconclusive.
+<!-- status-guard:end -->
+
 `IN PROGRESS` is the only lifecycle token whose overwrite is **load-bearing in
 another command**. `/vet-plan` §5 ("`IN PROGRESS` is CONDITIONALLY
 overwritable") and `/implement-plan` Step 0.5 both treat it as a conditional

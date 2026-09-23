@@ -2,7 +2,7 @@
  * Pure-helper tests for the project card's status derivation.
  *
  * The runner's vitest config is `environment: "node"` (no jsdom — same
- * constraint as FleetHealthPanel.test.tsx), so the JSX is not renderable here.
+ * constraint as FileActivityPanel.test.tsx), so the JSX is not renderable here.
  * The load-bearing logic is `deriveCardStatus`, tested below.
  */
 

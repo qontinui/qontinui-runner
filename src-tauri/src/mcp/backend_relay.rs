@@ -2460,15 +2460,28 @@ const REMOTE_TARGET_ADMITTED: &[&str] = &[
 /// device. They touch no local PTY: `handle_inbound` routes them to the owning
 /// `RemotePaneIo` by `grant_jti`.
 ///
-/// They MUST be admitted, and the reason is in this repo rather than in the
-/// broker: the target builds these replies WITH a `remote` block itself —
+/// A HEDGE, not the live gate. This list binds only a frame carrying a
+/// `remote` block, and no frame qontinui-web's relay sends a source carries
+/// one: it REBUILDS every return frame (`remote_terminal_relay.py`) and routes
+/// by its own attachment record, so `remote_frame_admitted` admits them before
+/// reading this list. The TARGET does build its replies with a block —
 /// `remote_echo(data)` on the `terminal_attached` reply, on
 /// `terminal_buffer_response`, and on every typed refusal in
-/// `remote_terminal::refusal_frame` — because those are "the keys the web relay
-/// routes a remote-only reply by". Refusing them would mean the attach reply
-/// never reaches `handle_inbound`, the oneshot never resolves, and every remote
-/// tab dies on a 20s timeout: a feature-total break.
+/// `remote_terminal::refusal_frame` — so a relay that ever forwarded that echo
+/// would have the return path refused here before `handle_inbound`, the
+/// oneshot never resolving and every remote tab dying on a timeout. Listing
+/// every return type keeps that from being a feature-total break.
 const REMOTE_SOURCE_ADMITTED: &[&str] = &[
+    // `remote_terminal_created` was added here on 2026-09-20 for CONSISTENCY
+    // with its five siblings, not because its absence dropped anything. This
+    // list only binds a frame that carries a `remote` block, and the one
+    // producer of this type — qontinui-web's `remote_terminal_relay.py`
+    // (`if frame_type == "terminal_created"`) — REBUILDS the frame from the
+    // target's `terminal_created` with no `remote` block, so
+    // `remote_frame_admitted` returns `true` for it before reading this list.
+    // The load-bearing omission was the dispatch arm in `handle_relay_command`.
+    // Listed anyway, so a relay that ever echoes the block does not reopen it.
+    "remote_terminal_created",
     "remote_terminal_attached",
     "remote_terminal_output",
     "remote_terminal_exit",
@@ -2744,11 +2757,29 @@ async fn handle_relay_command(
         // has shipped that translation yet, instead of silently doing nothing
         // on a name mismatch.
         "terminal_flow" | "remote_terminal_flow" => handle_terminal_flow(api_state, data),
-        "remote_terminal_attached"
+        // `remote_terminal_created` BELONGS HERE and was missing until
+        // 2026-09-20 — THIS was the break. `RemoteAttachClient::handle_inbound`
+        // carries an arm for it (`take_pending_create` → wake the waiter) that
+        // nothing ever routed to: the relay's frame carries no `remote` block,
+        // so it passed admission and fell to the `_` unknown-type arm below.
+        // The source then waited out `CREATE_TIMEOUT` (45 s) and reported the
+        // TARGET wedged or offline, while the target had spawned the terminal
+        // and replied correctly, leaving it running there unattached.
+        // Observed on merytshost 2026-09-18; coord finding a5f08a4d.
+        // `a_relay_shaped_created_reply_passes_admission` pins the relay's shape.
+        "remote_terminal_created"
+        | "remote_terminal_attached"
         | "remote_terminal_output"
         | "remote_terminal_exit"
         | "remote_terminal_buffer"
         | "remote_terminal_error" => {
+            // The return is "did this client CONSUME the frame"
+            // (`handle_inbound`'s own doc), NOT "did it wake a waiter": every
+            // arm for these six returns `true` unconditionally, warning
+            // internally on the no-waiter path. So there is nothing to branch
+            // on here, and a check would be dead code. The sibling `error` arm
+            // below checks it because `handle_inbound` genuinely can return
+            // `false` for that one.
             crate::mcp::remote_terminal::client().handle_inbound(&msg_type, data);
             None
         }
@@ -3313,10 +3344,10 @@ async fn relay_http_to_base(base: &str, data: &Value) -> Value {
     // Since round 4 this is a TOTAL ALLOWLIST, not a denylist of dangerous
     // prefixes: round 3's `GUARDED_PREFIXES` still let this arm reach
     // `POST /execute-python`, `POST /sessions/spawn` + `/sessions/{id}/message`
-    // and `POST /ui-bridge/invoke/{get_coord_device_token,spawn_worker_session}`
+    // and `POST /ui-bridge/invoke/{get_coord_device_token,terminal_create}`
     // — arbitrary code, a process in any directory with its stdin, the coord
-    // device JWT, and a Claude-backed PTY — because nobody had thought to name
-    // them. An unlisted path is now refused whatever it is and whenever it was
+    // device JWT, and a PTY — because nobody had thought to name them. An
+    // unlisted path is now refused whatever it is and whenever it was
     // added. The refusal is decided on a NORMALISED path and the request is
     // forwarded verbatim; see `mcp::relay_path_policy` for the list and how it
     // was derived from the two real clients.
@@ -4591,8 +4622,14 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
         // The shared session-env contribution (`QONTINUI_SESSION_WORKTREES` +
         // the configured plan directories) onto the PTY, derived before the
         // ctx is parked. See `agent_worktree::session_env`.
+        //
+        // No tenant key, for the same reason there is no spawn tenant above: the
+        // frame came over the relay from another machine and names no tenant, so
+        // reading one off it would let the remote party choose which of this
+        // device's per-tenant plan directories a session authors into. `None`
+        // resolves the device default.
         let extra_env =
-            crate::agent_worktree::session_env::session_extra_env(isolated_ctx.as_ref());
+            crate::agent_worktree::session_env::session_extra_env(isolated_ctx.as_ref(), None);
 
         // Kept for the coord registration below, which runs after `title` has
         // been moved into the spawn.
@@ -4643,10 +4680,12 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
                         registration_repo,
                     ) {
                         if let Some(obj) = terminal.as_object_mut() {
-                            // INSIDE the terminal object on purpose: the relay
-                            // forwards that object verbatim and drops every
-                            // top-level key it does not know, so a sibling
-                            // field would never reach the source.
+                            // INSIDE the terminal object on purpose: the
+                            // relay reads a top-level `coord_session_id`
+                            // first and falls back to `terminal.coordSessionId`,
+                            // but a relay predating that dropped every
+                            // top-level key it did not know. This spelling
+                            // reaches the source through both.
                             obj.insert(
                                 "coordSessionId".to_string(),
                                 serde_json::Value::String(coord_id.to_string()),
@@ -4661,9 +4700,25 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
                 });
                 // Echo the block a REMOTE create came under, so the relay can
                 // route the reply by grant as well as by the request id it
-                // minted — the same two keys every other target-side remote
-                // reply carries.
-                if admitted.is_some() {
+                // minted.
+                //
+                // The TOP-LEVEL `grant_jti` matches what `terminal_attached`,
+                // `terminal_buffer_response` and `refusal_frame` all carry.
+                // The source's `parse_created` reads the RELAY's `grant_jti`,
+                // never this one, so its absence was never a break: the web
+                // relay does not forward
+                // this frame. It REBUILDS `remote_terminal_created` and sets
+                // `grant_jti` from its OWN attachment record (`att.grant_jti`,
+                // `remote_terminal_relay.py`), correlated by the request id it
+                // minted. So this key is a consistency echo, never the value
+                // the source is woken with.
+                if let Some(create) = admitted.as_ref() {
+                    // From the ADMITTED block, not re-derived from the wire:
+                    // `parse_remote_block` already validated and TRIMMED it,
+                    // while `remote_echo` does not trim — so re-deriving ships
+                    // a jti that disagrees with the one the grant was bound
+                    // under. Same source the siblings use.
+                    frame["grant_jti"] = serde_json::json!(create.block.grant_jti);
                     frame["remote"] = crate::mcp::remote_terminal::remote_echo(data);
                 }
                 Some(frame)
@@ -5294,6 +5349,140 @@ mod tests {
     //! interval fires. That manifests as "ran the runner, took 10
     //! minutes to come online after a JWT expiry." These tests pin the
     //! shape so a tungstenite bump can't silently break it.
+
+    /// The target's `terminal_created` reply for a REMOTE create echoes a
+    /// top-level `grant_jti`, as `terminal_attached`,
+    /// `terminal_buffer_response` and `refusal_frame` do, taken from the
+    /// ADMITTED block.
+    ///
+    /// This is a sibling-consistency pin, NOT the source's contract. The source
+    /// never sees this frame: qontinui-web's relay rebuilds it as
+    /// `remote_terminal_created` and sets `grant_jti` from its own attachment
+    /// record. What the source parses is pinned by
+    /// `a_relay_shaped_created_reply_passes_admission` (routing) and
+    /// `remote_terminal::created_reply_tests` (parsing + waking the waiter).
+    #[test]
+    fn the_created_reply_echoes_the_admitted_grant_jti() {
+        const DISPATCHER: &str = include_str!("backend_relay.rs");
+
+        // The producer's reply-construction region.
+        let cstart = DISPATCHER
+            .find("\"type\": \"terminal_created\",")
+            .expect("terminal_created reply construction not found");
+        // Bounded STRUCTURALLY, by the sibling `Err` arm's own frame, not by a
+        // char count. A fixed window is a detector-reach bug waiting to happen:
+        // the first version used 1800, a later edit pushed the assignment to
+        // offset 2194, and the test then reported the production code missing
+        // a key it sets 400 characters further down — a false accusation
+        // indistinguishable from the real defect it is meant to catch.
+        let region_end = DISPATCHER[cstart..]
+            .find("\"type\": \"error\",")
+            .expect("the Err arm that bounds this region was not found");
+        let region = &DISPATCHER[cstart..cstart + region_end];
+        assert!(
+            region.contains("frame[\"grant_jti\"]"),
+            "the terminal_created reply does not echo a top-level `grant_jti`, \
+             unlike every sibling target-side remote reply"
+        );
+        // From the admitted block, not re-derived from the wire: the wire value
+        // is untrimmed and can disagree with the jti the grant was bound under.
+        assert!(
+            region.contains("create.block.grant_jti"),
+            "the jti must come from the ADMITTED block, as terminal_attached does"
+        );
+    }
+
+    /// EVERY reply type `handle_inbound` can act on must pass BOTH gates on the
+    /// inbound path: the admission list, and the dispatch match.
+    ///
+    /// `remote_terminal_created` was absent from both until 2026-09-20. The
+    /// dispatch omission was the live break: the relay's frame carries no
+    /// `remote` block, so it passed admission and fell to the `_` arm, the
+    /// source waited out its 45 s CREATE_TIMEOUT, and it reported the TARGET
+    /// wedged while the target had spawned the terminal and replied. The
+    /// admission gate binds only a frame WITH a `remote` block, so its omission
+    /// was latent — pinned too, so a relay that ever echoes the block cannot
+    /// reopen the same drop one gate earlier.
+    ///
+    /// Nothing typed connects these three lists: they are string literals in
+    /// two files and a `match`. So the invariant is pinned by comparing them.
+    #[test]
+    fn every_reply_handle_inbound_knows_passes_both_inbound_gates() {
+        const DISPATCHER: &str = include_str!("backend_relay.rs");
+        const CLIENT: &str = include_str!("remote_terminal.rs");
+
+        // The reply types `handle_inbound` acts on, read from its own match
+        // rather than hardcoded, so a new arm is covered without anyone
+        // remembering this test.
+        let start = CLIENT
+            .find("fn handle_inbound(")
+            .expect("handle_inbound not found — signature changed?");
+        let body = &CLIENT[start..];
+        let end = body.find("\n    pub fn ").unwrap_or(body.len());
+        let known: Vec<&str> = {
+            let mut v: Vec<&str> = Vec::new();
+            for seg in body[..end].split('"').skip(1).step_by(2) {
+                if seg.starts_with("remote_terminal_") && !v.contains(&seg) {
+                    v.push(seg);
+                }
+            }
+            v
+        };
+        // A floor guard, deliberately not claimed as more: the extraction is
+        // textual, so a literal that survives elsewhere in the scanned window
+        // (an `unwrap_or("remote_terminal_error")`, say) keeps the count at 6
+        // even if its match arm is gone. It catches wholesale extraction
+        // failure, which is what it is for.
+        assert_eq!(
+            known.len(),
+            6,
+            "expected 6 remote_terminal_* reply types in handle_inbound, got {known:?} — if a \
+             type was genuinely added or removed, update this count deliberately"
+        );
+
+        // Search only the REGIONS that gate the frame, never the whole file:
+        // that is what stops prose OUTSIDE them — this test's own doc comment
+        // included — from satisfying the check. It asserts textual presence
+        // within a region, NOT that a match arm exists, so a quoted mention
+        // inside a region would still satisfy it. Keep mentions backticked.
+        let admit_start = DISPATCHER
+            .find("const REMOTE_SOURCE_ADMITTED:")
+            .expect("admission list not found");
+        let admit = &DISPATCHER[admit_start
+            ..admit_start
+                + DISPATCHER[admit_start..]
+                    .find("];")
+                    .expect("unterminated admission list")];
+
+        let disp_start = DISPATCHER
+            .find("fn handle_relay_command(")
+            .expect("dispatcher not found");
+        let disp_rest = &DISPATCHER[disp_start..];
+        // Anchored on the `_` ARM, not on the warn phrase: that phrase's FIRST
+        // occurrence after the fn is inside a comment ~50 lines earlier, which
+        // silently cut the scanned region short and left the arms after it
+        // outside this invariant — so a correctly-routed type appended near the
+        // end of the match would be falsely accused of not being routed.
+        let disp = &disp_rest[..disp_rest
+            .find("\n        _ => {")
+            .expect("dispatcher's `_` arm not found — was the match restructured?")];
+
+        for ty in &known {
+            let lit = format!("\"{ty}\"");
+            assert!(
+                admit.contains(&lit),
+                "`{ty}` is handled by handle_inbound but is NOT in REMOTE_SOURCE_ADMITTED — \
+                 remote_frame_admitted would refuse it before dispatch whenever it carries a \
+                 `remote` block (latent today: the relay sends none), and any peer waiting on \
+                 it would time out blaming the wrong machine"
+            );
+            assert!(
+                disp.contains(&lit),
+                "`{ty}` is admitted but NOT routed by the dispatch match — it falls through to \
+                 the unknown-type arm and is dropped, with the same consequence"
+            );
+        }
+    }
 
     use super::*;
     use crate::test_env::{env_lock, EnvVarRestore};
@@ -5970,10 +6159,10 @@ mod tests {
                 "/ui-bridge/invoke/get_coord_device_token",
                 "{}".to_string(),
             ),
-            // A Claude-backed PTY (`commands::productivity::spawn_worker_session`).
+            // A PTY spawn (`commands::terminal::terminal_create`).
             (
                 "POST",
-                "/ui-bridge/invoke/spawn_worker_session",
+                "/ui-bridge/invoke/terminal_create",
                 "{}".to_string(),
             ),
             // Spawn a process in a caller-chosen directory (`mcp::sessions`)…
@@ -6923,13 +7112,16 @@ mod remote_admission_tests {
         }
     }
 
-    /// SOURCE-role return frames MUST be admitted: this repo builds them WITH a
-    /// `remote` block (`remote_echo`), because those are the keys the relay
-    /// routes a reply by. Refusing them would mean the attach reply never
-    /// reaches `handle_inbound` and every remote tab dies on a timeout.
+    /// SOURCE-role return frames MUST be admitted even when they carry a
+    /// `remote` block. The relay rebuilds them today and sends none (see
+    /// `a_relay_shaped_created_reply_passes_admission`), but the TARGET builds
+    /// its replies with one (`remote_echo`), and a relay that ever forwarded
+    /// that block must not have the attach reply refused before
+    /// `handle_inbound`, which would kill every remote tab on a timeout.
     #[test]
     fn source_role_return_frames_are_admitted() {
         for t in [
+            "remote_terminal_created",
             "remote_terminal_attached",
             "remote_terminal_output",
             "remote_terminal_exit",
@@ -7068,6 +7260,41 @@ mod relay_routing_tests {
                 panic!("expected a refusal, got a dispatch of {msg_type}: {data}")
             }
         }
+    }
+
+    /// The EXACT shape qontinui-web's relay sends a source for a remote create
+    /// (`remote_terminal_relay.py`, the `terminal_created` arm): rebuilt, with
+    /// a relay-set top-level `grant_jti` and NO `remote` block. So admission is
+    /// decided by `parse_remote_block` finding nothing, never by
+    /// `REMOTE_SOURCE_ADMITTED` — which is why the 2026-09-20 break was the
+    /// dispatch arm alone. This pins that routing reading; the arm itself is
+    /// pinned by `every_reply_handle_inbound_knows_passes_both_inbound_gates`,
+    /// and the waiter wake-up by `remote_terminal`'s
+    /// `a_relay_created_reply_wakes_the_pending_create`.
+    #[test]
+    fn a_relay_shaped_created_reply_passes_admission() {
+        let relay_shaped = json!({
+            "type": "remote_terminal_created",
+            "request_id": "rid-1",
+            "grant_jti": "jti-c1",
+            "terminal_id": "t1",
+            "terminal": { "id": "t1" },
+            "coord_session_id": null,
+        });
+        assert!(relay_shaped.get("remote").is_none());
+        let (msg_type, data) =
+            dispatched(route_relay_frame("remote_terminal_created", &relay_shaped));
+        assert_eq!(msg_type, "remote_terminal_created");
+        assert_eq!(data, relay_shaped, "routing must not reshape the frame");
+
+        // And the latent half: were a relay to forward the target's `remote`
+        // echo, the frame is admitted too rather than refused one gate early.
+        // `remote_echo` writes only `source_device_id` + `grant_jti` — the
+        // `attach_block` shape, no `kind`.
+        let mut echoed = relay_shaped.clone();
+        echoed["remote"] = attach_block();
+        let (msg_type, _) = dispatched(route_relay_frame("remote_terminal_created", &echoed));
+        assert_eq!(msg_type, "remote_terminal_created");
     }
 
     /// **The finding-1 scenario-B frame.** An ATTACH block on the envelope over

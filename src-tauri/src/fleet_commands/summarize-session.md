@@ -21,10 +21,27 @@ discovery.
 `GET /sessions/<task_run_id>/transcript`. If the session is still running,
 abort: "session is not yet complete; summarise after `done` state".
 
-Also fetch the session's verdict (the `reviews.verdict` for the most recent
-review of any task assigned to this session, if one exists). This drives the
-Outcome tag in step 5. If no review exists yet, treat the verdict as
-`approved` — i.e. emit a normal summary, not a failure summary.
+Also fetch the session's verdict: `GET /sessions/<task_run_id>/latest-review`
+→ `review.verdict` (`review` is `null` when no review exists). This drives the
+Outcome tag in step 5. A `null` review is **UNKNOWN — never `approved`**: no
+review having run is not a review that passed, and resolving that absence to
+the permissive value is how an unreviewed failure gets summarised as a normal
+session. Carry the verdict as `unknown`, emit no Outcome tag, and SAY in the
+summary that no review existed — do not emit a failure summary either, which
+would be the same mistake in the other direction.
+
+> **Why this rule is stated identically in two places.** The runner bundles a
+> copy of this file at `src-tauri/src/fleet_commands/summarize-session.md` and
+> `provision_fleet_commands_into` writes it into a spawned session's working
+> directory unless the destination already exists AND is tracked in the
+> enclosing repo (`provision_guard.rs`: `dst.exists() && contains(rel)`). That
+> is false in an allocated worktree of every repo EXCEPT this one, which tracks
+> its own copy at `.claude/commands/` — so THIS copy wins exactly where it is
+> tracked, and the bundled copy wins everywhere else, which is the majority
+> case. The two must therefore say the same thing: a session reading the
+> bundled copy is the normal case, not the exception. Edit this file, then
+> re-vendor into the runner; an edit made only in the runner is a fork
+> (`src-tauri/src/fleet_commands.rs`, module header).
 
 ### 2. Identify learnings
 
@@ -55,7 +72,7 @@ often the most valuable learning.
 
 Each learning has an `area`. Pick one of: `executor`, `claude_session`,
 `dispatcher`, `database`, `ui-bridge`, `frontend`, `migrations`, `tests`,
-`coordinator`, `testing-infra`, or `other`. Be willing to invent new areas
+`orchestration`, `testing-infra`, or `other`. Be willing to invent new areas
 sparingly — they're free-form text and grouped via FTS.
 
 ### 4. Tag failed-attempt outcomes (REQUIRED for verdict=needs_fix /
@@ -79,7 +96,10 @@ line is parsed by the knowledge browser to surface failure-mode warnings
 distinctly.
 
 For `verdict=approved` sessions, omit the Outcome tag — the body is a
-positive learning and standing in for it would be misleading.
+positive learning and standing in for it would be misleading. For
+`verdict=unknown` (no review existed — step 1) omit it too, but for the
+opposite reason: there is no verdict to tag either way. Say so in the body —
+"no review had run on this session" — so the row is not read as an approval.
 
 ### 5. Persist
 
