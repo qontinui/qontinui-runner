@@ -1050,6 +1050,60 @@ pub struct PathSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plans_dir: Option<String>,
 
+    /// Per-tenant override of [`Self::plans_dir`], keyed by **tenant UUID
+    /// string** in the canonical form the device itself reports
+    /// (`Uuid::to_string()` — lowercase, hyphenated; that is what
+    /// `commands::tenant::get_active_tenant`'s `candidates` and the spawn
+    /// picker carry).
+    ///
+    /// **Why this exists.** A device may be bound to N coord tenants, and
+    /// `plans_dir` is one string for the whole runner — so every tenant's
+    /// sessions were handed the same `QONTINUI_PLANS_DIR` and every tenant's
+    /// plans were authored into one directory. An entry here wins over the
+    /// scalar **for that tenant only**; a tenant with no entry falls back to
+    /// the scalar, which stays the DEVICE-WIDE DEFAULT. Plan
+    /// `2026-09-22-plans-dir-is-a-single-path-so-a-multi-bound-device-cannot-author-per-tenant`.
+    ///
+    /// **The scalar is deliberately kept rather than replaced by this map.**
+    /// "the path for this device" and "the path for this tenant on this
+    /// device" are two real questions; three session-launch paths have no
+    /// acting tenant *by design* (a coord-spawned gate continuation, a relayed
+    /// spawn, a steward), and under a map-only shape they would get no
+    /// directory at all — a working unattended path failing closed on a value
+    /// it may not have.
+    ///
+    /// **Resolution** goes through
+    /// [`qontinui_runner_lib::plan_workunit_adapter::resolve_plans_dir`], the
+    /// one seam every consumer shares, so the scan, the session launch, the
+    /// settings view and the plan-library write door can never disagree.
+    /// Blank-is-unset applies **per entry**: an entry configured to `""` is
+    /// unset for that tenant (which falls back to the scalar), never a
+    /// directory named `""`.
+    ///
+    /// **An unparseable or currently-unbound key is PRESERVED, never
+    /// dropped.** A device that loses a binding must not silently lose that
+    /// tenant's configured path — the operator may be re-pairing. Such a key
+    /// is inert for resolution (nothing looks it up) and renders in the UI as
+    /// not-currently-bound, which is `unknown-must-not-render-as-a-default`
+    /// applied to a config map. Note this is NOT the same as `normalize`'s
+    /// per-entry drop of a blank key or blank value, which removes a non-entry
+    /// rather than an unattributed one.
+    ///
+    /// ⚠️ **"Inert for resolution" means nothing looks the KEY up. It does NOT
+    /// mean the entry has no effect at all:** such an entry's VALUE is still
+    /// unioned into the plan-library write door's `source_path` confinement
+    /// allow-list (`mcp::plan_library::source_path_roots`, which reads values
+    /// and never inspects a key). That is deliberate and is the same
+    /// re-pairing argument — a device mid-re-pair would otherwise have its
+    /// write door start refusing files it accepted an hour earlier. The
+    /// back-reference is here because a reader arrives at this type first and
+    /// would otherwise take "inert" for "no effect".
+    ///
+    /// Default (when empty): nothing keyed — exactly today's behaviour, since
+    /// every resolution then falls through to the scalar.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub plans_dir_by_tenant: std::collections::BTreeMap<String, String>,
+
     /// An additional location plans may be read from or archived into, per the
     /// user's own convention — exported to agent sessions as
     /// `QONTINUI_PLANS_ARCHIVE_DIR`. The runner only carries the value; which
@@ -1063,6 +1117,20 @@ pub struct PathSettings {
     /// Override example: `D:\qontinui-root\qontinui-dev-notes\plans`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plans_archive_dir: Option<String>,
+
+    /// Per-tenant override of [`Self::plans_archive_dir`], keyed by tenant UUID
+    /// string. The twin of [`Self::plans_dir_by_tenant`] in every respect —
+    /// same key space, same "an entry wins for that tenant, no entry falls back
+    /// to the scalar, blank-is-unset per entry, an unparseable or unbound key is
+    /// preserved" contract — resolved through
+    /// [`qontinui_runner_lib::plan_workunit_adapter::resolve_plans_archive_dir`].
+    ///
+    /// The archive location is a per-operator convention rather than a
+    /// derivation of the active dir, so it is exactly as tenant-specific as the
+    /// active dir is: a device authoring for two tenants commonly archives into
+    /// two different repos.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub plans_archive_dir_by_tenant: std::collections::BTreeMap<String, String>,
 
     /// Directory holding the operator's markdown **prompts** — the third scan
     /// root of the plan & prompt library, and the value exported to agent
@@ -1082,6 +1150,20 @@ pub struct PathSettings {
     /// Override example: `D:\qontinui-root\prompts`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompts_dir: Option<String>,
+
+    /// Per-tenant override of [`Self::prompts_dir`], keyed by tenant UUID
+    /// string. The twin of [`Self::plans_dir_by_tenant`] in every respect —
+    /// same key space, same "an entry wins for that tenant, no entry falls back
+    /// to the scalar, blank-is-unset per entry, an unparseable or unbound key is
+    /// preserved" contract — resolved through
+    /// [`qontinui_runner_lib::plan_workunit_adapter::resolve_prompts_dir`].
+    ///
+    /// Prompts are keyed for the same reason plans are: the operator's stated
+    /// requirement is plans *and prompts* per tenant, and a prompt library is a
+    /// tenant's own material — leaving it device-wide would ship half the
+    /// capability.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub prompts_dir_by_tenant: std::collections::BTreeMap<String, String>,
 
     /// The **workspace root**: the directory holding the Qontinui repo
     /// checkouts (`<root>/qontinui-runner`, `<root>/qontinui-coord`, …). The
@@ -1246,6 +1328,9 @@ mod path_settings_tests {
             plans_archive_dir: Some("/w/dev-notes/plans".to_string()),
             prompts_dir: Some("/w/prompts".to_string()),
             workspace_root: Some("/w".to_string()),
+            plans_dir_by_tenant: Default::default(),
+            plans_archive_dir_by_tenant: Default::default(),
+            prompts_dir_by_tenant: Default::default(),
             repo_checkouts: [(
                 "portofino-pizzeria/mobile".to_string(),
                 "/elsewhere/mobile".to_string(),
@@ -1275,6 +1360,97 @@ mod path_settings_tests {
         assert_eq!(parsed.workspace_root.as_deref(), Some("/w"));
     }
 
+    /// The three tenant-keyed maps round-trip verbatim, keys and all — and are
+    /// **ABSENT** from the serialized form when empty, which is what makes
+    /// keying the settings a no-op on the on-disk file of every device that has
+    /// not keyed one. A `"plans_dir_by_tenant": {}` appearing in every
+    /// operator's `settings.json` would be a diff for nothing.
+    #[test]
+    fn the_tenant_keyed_maps_round_trip_and_are_absent_when_empty() {
+        let empty = serde_json::to_value(PathSettings::default()).expect("must serialize");
+        let obj = empty.as_object().expect("an object");
+        for key in [
+            "plans_dir_by_tenant",
+            "plans_archive_dir_by_tenant",
+            "prompts_dir_by_tenant",
+        ] {
+            assert!(
+                !obj.contains_key(key),
+                "an empty {key} must not serialize, got {empty}"
+            );
+        }
+
+        let tenant = "7ac125b6-391b-4d64-8493-27305b25c5b9";
+        let entry = |dir: &str| {
+            [(tenant.to_string(), dir.to_string())]
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let settings = PathSettings {
+            plans_dir: Some("/device/plans".to_string()),
+            plans_dir_by_tenant: entry("/b/plans"),
+            plans_archive_dir_by_tenant: entry("/b/archive"),
+            prompts_dir_by_tenant: entry("/b/prompts"),
+            ..PathSettings::default()
+        };
+        let json = serde_json::to_string(&settings).expect("must serialize");
+        let parsed: PathSettings = serde_json::from_str(&json).expect("must deserialize");
+        assert_eq!(
+            parsed.plans_dir_by_tenant.get(tenant).map(String::as_str),
+            Some("/b/plans")
+        );
+        assert_eq!(
+            parsed
+                .plans_archive_dir_by_tenant
+                .get(tenant)
+                .map(String::as_str),
+            Some("/b/archive")
+        );
+        assert_eq!(
+            parsed.prompts_dir_by_tenant.get(tenant).map(String::as_str),
+            Some("/b/prompts")
+        );
+        assert_eq!(
+            parsed.plans_dir.as_deref(),
+            Some("/device/plans"),
+            "the scalar remains the device-wide default beside the map"
+        );
+    }
+
+    /// An unparseable or currently-unbound key survives a round trip
+    /// byte-for-byte (D2: the operator may be re-pairing, and a lost binding
+    /// must not silently lose that tenant's configured directory). `BTreeMap`
+    /// also fixes the ORDER, which matters because this file is diffed by hand.
+    #[test]
+    fn an_unparseable_tenant_key_survives_serialization_in_a_fixed_order() {
+        let settings = PathSettings {
+            plans_dir_by_tenant: [
+                ("zzz-not-a-uuid", "/garbage"),
+                ("7ac125b6-391b-4d64-8493-27305b25c5b9", "/b/plans"),
+                ("c231d9da-0ca8-4fe4-bd81-0e3d6c20339a", "/a/plans"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+            ..PathSettings::default()
+        };
+        let json = serde_json::to_string(&settings).expect("must serialize");
+        let parsed: PathSettings = serde_json::from_str(&json).expect("must deserialize");
+        assert_eq!(
+            parsed
+                .plans_dir_by_tenant
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec![
+                "7ac125b6-391b-4d64-8493-27305b25c5b9",
+                "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+                "zzz-not-a-uuid",
+            ],
+            "every key survives, in a deterministic order"
+        );
+    }
+
     /// Settings persisted before the fields existed must still load — the
     /// `#[serde(default)]` path, i.e. every runner upgrading into this change.
     #[test]
@@ -1285,6 +1461,9 @@ mod path_settings_tests {
         assert_eq!(parsed.plans_dir, None);
         assert_eq!(parsed.plans_archive_dir, None);
         assert_eq!(parsed.prompts_dir, None);
+        assert!(parsed.plans_dir_by_tenant.is_empty());
+        assert!(parsed.plans_archive_dir_by_tenant.is_empty());
+        assert!(parsed.prompts_dir_by_tenant.is_empty());
         assert!(parsed.strict_mode);
     }
 
@@ -5617,10 +5796,15 @@ pub fn get_dev_logs_dir_override() -> Option<String> {
     crate::config_facade::get_dev_logs_dir_override()
 }
 
-/// Save Path settings
-pub fn save_path_settings(path_settings: PathSettings) -> Result<(), String> {
-    crate::config_facade::save_setting(path_settings)
-}
+// `save_path_settings` used to live here: a bare
+// `config_facade::save_setting(path_settings)` whole-struct REPLACE. It had no
+// callers (the Tauri command of the same name is
+// `commands::path_settings::save_path_settings`, which goes through the
+// merging patch path), and keeping it would have left a loaded footgun beside
+// the sign warning about it — a write through this function erases all four
+// keyed maps, which is exactly the erasure the patch/merge door was built to
+// remove. Deleted rather than deprecated. The live reader beside it,
+// `get_path_settings`, stays: `unified_workflow_executor::types` uses it.
 
 /// Save the dev_logs_dir override
 pub fn save_dev_logs_dir(dev_logs_dir: Option<String>) -> Result<(), String> {

@@ -825,9 +825,21 @@ fn boot_embedded_pg(rt: &tokio::runtime::Runtime) -> Arc<crate::database::pg::Pg
 /// adapter's own `resolve_plans_dir`, so "blank counts as unset" holds here
 /// exactly as it does on the scan. A `fn` pointer rather than a closure
 /// because the door type is `fn() -> Option<String>`.
+///
+/// **It resolves the DEVICE DEFAULT, permanently and on purpose — never a
+/// `plans_dir_by_tenant` entry.** This feeds a device-wide telemetry capture,
+/// which has no acting tenant: keying it by one would make the published value
+/// depend on whichever tenant asked last, so the capture would report a
+/// directory no reader could attribute. The per-tenant rung belongs on the
+/// surfaces that DO have an acting tenant — the session launch and the settings
+/// view — and the confinement union belongs on the plan-library write door.
 fn runner_plans_dir_setting() -> Option<String> {
     let paths = crate::config_facade::get_setting::<crate::settings::PathSettings>();
-    qontinui_runner_lib::plan_workunit_adapter::resolve_plans_dir(paths.plans_dir)
+    qontinui_runner_lib::plan_workunit_adapter::resolve_plans_dir(
+        paths.plans_dir,
+        &paths.plans_dir_by_tenant,
+        None,
+    )
 }
 
 /// Parse a boolean env lever the way the rest of the boot path does.

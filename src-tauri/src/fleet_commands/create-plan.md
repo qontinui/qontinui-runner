@@ -295,6 +295,9 @@ the existing corpus in `plans/*.md`).
 # Plan: <Title>
 
 > **Status: DRAFT <YYYY-MM-DD>.** <one-line summary of what this plan does>.
+> **Area:** `<area>` — work-unit `metadata.area`; kebab-case only,
+> `[a-z0-9]+(-[a-z0-9]+)*`, in THIS blockquote; free text here is dropped with a
+> warning. Omit the line when no area applies.
 
 > **Repo(s):** <repo1>[, <repo2>...]
 
