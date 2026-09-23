@@ -4,7 +4,7 @@
  * The Terminal page counts three genuinely different populations that
  * routinely and legitimately differ in both directions:
  *
- *   - **Claude sessions** (`useSessionManager`'s session count) —
+ *   - **Claude sessions** (`useSessionManager`'s `claudeSessionCount`) —
  *     machine-wide transcript sessions, including `active-external` ones with
  *     no tab in this window.
  *   - **Open panes** (`tabs.length`) — PTY tabs owned by this page.
@@ -105,8 +105,8 @@ export function countLiveTabs(tabs: readonly { isAlive?: boolean }[] | undefined
  * `statusCounts` is bucketed over session records. Max can never double-count
  * an overlapping session and never reads below either input.
  */
-export function unionSessionCount(sessionCount: number, liveTabCount: number): number {
-  return Math.max(sessionCount, liveTabCount);
+export function unionSessionCount(claudeSessionCount: number, liveTabCount: number): number {
+  return Math.max(claudeSessionCount, liveTabCount);
 }
 
 /**
@@ -127,12 +127,12 @@ export function unionSessionCount(sessionCount: number, liveTabCount: number): n
  * and not silently dropped.
  */
 export function splitNeedsInput(
-  sessionNeedsInputCount: number,
+  claudeNeedsInputCount: number,
   tabNeedsInputCount: number,
 ): { actionable: number; external: number } {
   return {
     actionable: tabNeedsInputCount,
-    external: Math.max(0, sessionNeedsInputCount - tabNeedsInputCount),
+    external: Math.max(0, claudeNeedsInputCount - tabNeedsInputCount),
   };
 }
 
