@@ -9997,8 +9997,17 @@ pub(crate) const SPAWN_TENANT_PAIRING_HINT: &str =
 /// that authors a prompt document into the wrong tenant and gets a `201`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SpawnTenantRefusal {
-    /// This runner holds no device-JWT slot for the tenant and it is not the
-    /// default binding.
+    /// This runner cannot show a credential for the tenant: it holds no
+    /// device-JWT slot of the tenant's own, AND the default-binding route does
+    /// not supply one.
+    ///
+    /// That second clause is wider than "it is not the default binding", which
+    /// is what this said before the legacy slot was tightened. It ALSO fires
+    /// when the tenant *is* the default binding but the legacy slot's token
+    /// cannot be shown to be its — a `tenant_id` claim naming someone else, or
+    /// a claimless token on a device that cannot be measured to hold exactly
+    /// one binding ([`crate::auth::legacy_token_serves_tenant`]). The `Display`
+    /// text was always right about this; only this comment was stale.
     NotPaired { tenant: Uuid },
     /// The credential store could not be read, so whether the tenant is paired
     /// is UNKNOWN — refused rather than guessed.

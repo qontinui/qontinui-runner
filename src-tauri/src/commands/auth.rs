@@ -1695,8 +1695,34 @@ pub(crate) fn coord_device_token_for(
                     None => {
                         // Fail closed: an UNREADABLE slot store cannot show that
                         // t has no slot of its own, so it never admits the token.
-                        default_tenant == Some(t)
-                            && matches!(&held.slots, Ok(slots) if !slots.contains(&t))
+                        let admitted = default_tenant == Some(t)
+                            && matches!(&held.slots, Ok(slots) if !slots.contains(&t));
+                        // This is a SECOND copy of half of
+                        // `auth::legacy_token_serves_tenant`, positioned to drift
+                        // against the module's "one place" doctrine. It is safe
+                        // by construction — a conjunction on top of a token the
+                        // selector already admitted, so it can only narrow, never
+                        // widen — and the invariant that makes that true is worth
+                        // asserting rather than asserting in prose: anything this
+                        // door admits, the shared predicate admits too. If the
+                        // copy ever drifts the other way, every debug build and
+                        // every test trips here instead of silently handing out a
+                        // token whose provenance the door cannot state. (The
+                        // shared call also arms a once-per-process warning; that
+                        // is idempotent and debug-only.)
+                        debug_assert!(
+                            !admitted
+                                || crate::auth::legacy_token_serves_tenant(
+                                    am,
+                                    jwt,
+                                    &t,
+                                    crate::auth::measured_device_binding_count(),
+                                ),
+                            "the device-token door admitted a claimless legacy token that \
+                             `legacy_token_serves_tenant` refuses — the door's local copy of \
+                             the rule has drifted wider than the selector's"
+                        );
+                        admitted
                     }
                 }
             })

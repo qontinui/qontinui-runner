@@ -2003,8 +2003,24 @@ pub fn credential_state(
 /// exists beside the `unwrap_or_default` collapse.)
 ///
 /// The legacy `access_token` slot holds the DEFAULT binding's JWT (D4), so it
-/// is folded into the answer for the default tenant and for no other —
-/// exactly as [`select_device_bearer`] and [`credential_state`] do.
+/// is folded into the answer for the default tenant and for no other — the same
+/// SHAPE [`select_device_bearer`] and [`credential_state`] use.
+///
+/// **It deliberately stops short of their rule, and the divergence is the whole
+/// point of the split.** Those two now also require the legacy token to be the
+/// default binding's — its `tenant_id` claim must name it, or the claimless arm
+/// of [`legacy_token_serves_tenant`] must admit it — which is why
+/// `credential_state` grew a fourth input (`default_slot_serves`) and this
+/// function did not. This question is "is a `paired_user.json` `bindings` ENTRY
+/// warranted?", and that is warranted by the PAIRING RECORD, not by whichever
+/// token happens to be sitting in the slot: a binding whose token is rotted,
+/// claimless, or momentarily another tenant's is still a binding this device
+/// holds, and the refresher's job — not the reconciler's — is to heal it.
+/// Feeding `default_slot_serves` in here would make a claim-check drop binding
+/// rows, which is the destructive direction. So the two answers differ on
+/// purpose, in the same direction the `PresentButDead` divergence already goes
+/// (see the paragraph above), and `credential_state` remains the only one of
+/// the two that may promise a session can act.
 pub fn holds_credential_for(
     slot: SlotState,
     is_default: bool,
