@@ -203,10 +203,14 @@ export function resolveLayout(layoutId: string, tabCount: number): LayoutPreset 
 
 /**
  * Pick the smallest layout preset whose zone count fits `totalTabs` live tabs,
- * capped at the largest preset (`full-grid`, 9 zones). Pure — exported so the
- * `+ new terminal` quick-launch path, the in-hook auto-grow effect, and the
- * unit test can all share ONE mapping (the prior copy lived inline in
- * `TerminalPage.tsx`).
+ * growing past the largest fixed preset (`full-grid`, 9 zones) into the
+ * synthesized `flow-grid`. Pure — exported so EVERY consumer shares ONE
+ * mapping: the `+ new terminal` quick-launch path
+ * ({@link computeQuickLaunchLayoutId}, called from `useZoneActions`), the
+ * in-hook auto-grow effect ({@link computeAutoGrowLayoutId}), the
+ * layout-mismatch suggestion chip (`suggestions/rules.ts`), and the unit test.
+ * Inline copies once lived in `TerminalPage.tsx`, `useZoneActions.ts` and
+ * `suggestions/rules.ts`; the latter two had drifted (no flow-grid rung).
  *
  * Mapping: 1→single, 2→split, 3-4→quad, 5-6→six-pack, 7-9→full-grid,
  * ≥10→flow-grid (the synthesized past-9 scrolling grid — no fixed preset ceiling
@@ -257,6 +261,39 @@ export function computeAutoGrowLayoutId(currentLayoutId: string, tabCount: numbe
   // Grow only — never pick a target with fewer/equal zones than current.
   if (target.zones.length <= current.zones.length) return null;
   return targetId;
+}
+
+/**
+ * The `+ new terminal` quick-launch layout decision (`useZoneActions`'
+ * `createAndAssignTerminal`): given the layout BEFORE the spawn and the tab
+ * count AFTER it, return the layout id to switch to, or `null` to leave the
+ * layout alone.
+ *
+ * It switches only when the new tab has nowhere to go (`totalTabs` exceeds the
+ * zone count, or every zone is already occupied), and the target is always the
+ * canonical {@link pickLayout} — this used to be a fourth inline copy of the
+ * ladder with no `>= 10 → flow-grid` rung, so from the 11th tab on it picked
+ * `full-grid` while the layout was already `flow-grid`: the layout SHRANK
+ * (11 zones → 9), `applyLayoutAssignments` compacted every tab at zone ≥ 9 into
+ * whatever holes existed, and the auto-grow effect regrew the layout but not
+ * the arrangement — one silent re-shuffle of the operator's grid per spawn.
+ *
+ * Grow-only, like every other path `pickLayout` feeds: a target with fewer
+ * zones than the current layout is refused (`null`), so this path can never
+ * be the one that compacts assignments.
+ */
+export function computeQuickLaunchLayoutId(
+  currentLayoutId: string,
+  currentZoneCount: number,
+  hasEmptyZone: boolean,
+  totalTabs: number,
+): string | null {
+  const needsRoom = totalTabs > currentZoneCount || (!hasEmptyZone && totalTabs > 1);
+  if (!needsRoom) return null;
+  const target = pickLayout(totalTabs);
+  if (target === currentLayoutId) return null;
+  if (resolveLayout(target, totalTabs).zones.length < currentZoneCount) return null;
+  return target;
 }
 
 // ── Zone Assignment ────────────────────────────────────────────────────────
