@@ -52,6 +52,16 @@
 # refuted and unknown are BOTH "not proven": a caller renders UNKNOWN and acts
 # under no tenant. They differ only in what the note can say.
 
+# The Python 3 every helper below runs: $CTC_PY, else `python3`, else a Python 3
+# spelled `python` (Git Bash on Windows ships only that spelling).
+if [ -z "${CTC_PY:-}" ]; then
+  if command -v python3 >/dev/null 2>&1; then
+    CTC_PY=python3
+  elif command -v python >/dev/null 2>&1 && python -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1; then
+    CTC_PY=python
+  fi
+fi
+
 ctc_is_uuid() {
   local re='^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$'
   [[ "${1:-}" =~ $re ]]
@@ -74,21 +84,6 @@ _ctc_url_ok() {
   [[ "$u" =~ $re_https ]] || [[ "$u" =~ $re_loop ]]
 }
 
-# _ctc_claim <jwt> <claim> -> the payload claim, or nothing. Payload only; the
-# token is never printed.
-_ctc_claim() {
-  H_JWT="$1" H_CLAIM="$2" "${CTC_PY:-python3}" - <<'PY' 2>/dev/null | tr -d '\r' || true
-import base64, json, os
-try:
-    seg = os.environ["H_JWT"].split(".")[1]
-    seg += "=" * (-len(seg) % 4)
-    v = json.loads(base64.urlsafe_b64decode(seg)).get(os.environ["H_CLAIM"])  # envelope-ok: a JWT claim, not a fleet response envelope
-    print(v if isinstance(v, (str, int, float)) and not isinstance(v, bool) else "")
-except Exception:
-    print("")
-PY
-}
-
 _ctc_shaped() {
   case "$1" in "" | *[!A-Za-z0-9._-]*) return 1 ;; esac
   [ "$(printf '%s' "$1" | tr -cd '.' | wc -c | tr -d '[:space:]')" = 2 ]
@@ -99,13 +94,36 @@ _ctc_shaped() {
 # tenant asked for (`_ctc_usable_for`), so a stale or other-tenant
 # $COORD_DEVICE_JWT falls through to the file and then to the mint.
 _ctc_usable_for() { # <jwt> <tenant>
-  local exp claim
   _ctc_shaped "$1" || return 1
-  exp="$(_ctc_claim "$1" exp)"; exp="${exp%%.*}"
+  _ctc_facts_ok "$(_ctc_facts "$1")" "$2"
+}
+
+# _ctc_facts_ok "<exp> <tenant_id>" <tenant> -> 0 iff exp is more than 60 s
+# away AND the tenant_id claim IS <tenant> (case-folded).
+_ctc_facts_ok() {
+  local exp="${1%% *}" claim="${1#* }"
+  exp="${exp%%.*}"
   [[ "$exp" =~ ^[0-9]+$ ]] || return 1
   (( exp - $(date +%s) > 60 )) || return 1
-  claim="$(_ctc_claim "$1" tenant_id)"
   [ -n "$claim" ] && [ "${claim,,}" = "${2,,}" ]
+}
+
+# _ctc_facts <jwt> -> "<exp> <tenant_id>" (either may be empty) in ONE
+# interpreter start: this runs for every candidate token, and a Python start
+# per claim doubled the cost of every caller's run.
+_ctc_facts() {
+  H_JWT="$1" "${CTC_PY:-python3}" - <<'PY' 2>/dev/null | tr -d '\r' || true
+import base64, json, os
+try:
+    seg = os.environ["H_JWT"].split(".")[1]
+    seg += "=" * (-len(seg) % 4)
+    d = json.loads(base64.urlsafe_b64decode(seg))
+    e, t = d.get("exp"), d.get("tenant_id")  # envelope-ok: JWT claims, not a fleet response envelope
+    e = str(int(e)) if isinstance(e, (int, float)) and not isinstance(e, bool) else ""
+    print(e + " " + (t if isinstance(t, str) else ""))
+except Exception:
+    print(" ")
+PY
 }
 
 _ctc_device() {
@@ -118,18 +136,15 @@ _ctc_device() {
 }
 
 _ctc_machine_json_field() { # <file> <key>... -> the first non-empty string value
-  "${CTC_PY:-python3}" - "$@" <<'PY' 2>/dev/null | tr -d '\r[:space:]' || true
-import json, sys
-try:
-    d = json.load(open(sys.argv[1]))
-except Exception:
-    sys.exit(0)
-if isinstance(d, dict):
-    for k in sys.argv[2:]:
-        v = d.get(k)  # envelope-ok: machine.json is a local config file, not a fleet response
-        if isinstance(v, str) and v:
-            print(v); break
-PY
+  # Read with grep, not an interpreter: this runs on every caller's hot path.
+  # machine.json is a flat object of uuid/hostname strings, so the first
+  # `"key": "value"` pair is exact.
+  local k v f="$1"; shift
+  for k in "$@"; do
+    v="$(grep -o "\"$k\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$f" 2>/dev/null | head -1 | sed 's/.*:[[:space:]]*"//; s/"$//' | tr -d '\r[:space:]')"
+    [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+  done
+  return 0
 }
 
 # _ctc_mint <tenant-or-empty> <outfile> -> prints the HTTP code; the body lands
@@ -138,10 +153,15 @@ _ctc_mint() {
   local dev body
   dev="$(_ctc_device)"
   [ -n "$dev" ] || { printf 'nodev'; return 0; }
-  body="$(H_DEV="$dev" H_T="$1" "${CTC_PY:-python3}" -c 'import json,os
+  if ctc_is_uuid "$dev" && { [ -z "$1" ] || ctc_is_uuid "$1"; }; then
+    # Both are uuids, so no character in them needs JSON escaping.
+    if [ -n "$1" ]; then body="{\"device_id\":\"$dev\",\"tenant_id\":\"$1\"}"; else body="{\"device_id\":\"$dev\"}"; fi
+  else
+    body="$(H_DEV="$dev" H_T="$1" "${CTC_PY:-python3}" -c 'import json,os
 b={"device_id":os.environ["H_DEV"]}
 if os.environ.get("H_T"): b["tenant_id"]=os.environ["H_T"]
 print(json.dumps(b))' | tr -d '\r')"
+  fi
   ( umask 077; : > "$2" )
   local code
   code="$("${CTC_CURL:-curl}" -sS -o "$(_ctc_np "$2")" -w '%{http_code}' --connect-timeout 10 -m "${CTC_TIMEOUT:-30}" \
@@ -155,6 +175,28 @@ print(json.dumps(b))' | tr -d '\r')"
 # surfaces it as CTC_TRANSPORT=1 so a caller can say "unreachable" rather than
 # "unproven".
 _ctc_mark() { [ "$1" = 000 ] && : > "$CTC_TMP/ctc.transport"; return 0; }
+
+_ctc_token_facts() { # <mint-body-file> -> "<token> <exp> <tenant_id>" (any may be empty)
+  "${CTC_PY:-python3}" - "$1" <<'PY' 2>/dev/null | tr -d '\r' || true
+import base64, json, sys
+tok, e, t = "", "", ""
+try:
+    d = json.load(open(sys.argv[1]))
+    if isinstance(d, dict):
+        for k in ("token", "agent_jwt", "jwt", "access_token"):  # envelope-ok: the spellings coord-revive L5 reads
+            v = d.get(k)
+            if isinstance(v, str) and v:
+                tok = v.strip(); break
+    seg = tok.split(".")[1]; seg += "=" * (-len(seg) % 4)
+    c = json.loads(base64.urlsafe_b64decode(seg))
+    e, t = c.get("exp"), c.get("tenant_id")  # envelope-ok: JWT claims, not a fleet response envelope
+    e = str(int(e)) if isinstance(e, (int, float)) and not isinstance(e, bool) else ""
+    t = t if isinstance(t, str) else ""
+except Exception:
+    pass
+print("%s %s %s" % (tok if " " not in tok else "", e or "", t or ""))
+PY
+}
 
 _ctc_token_of() { # <mint-body-file> -> the token, or nothing
   "${CTC_PY:-python3}" - "$1" <<'PY' 2>/dev/null | tr -d '\r[:space:]' || true
@@ -204,15 +246,16 @@ ctc_stage_for_tenant() {
     elif [ "$code" != 200 ]; then
       printf 'POST /agents/credential for tenant %s answered HTTP %s' "$want" "${code:-000}" > "$slot.rejected"
     else
-      f="$(_ctc_token_of "$slot.body")"
-      c="$(_ctc_claim "$f" tenant_id)"
-      if _ctc_usable_for "$f" "$want"; then
+      # One interpreter start for the token AND its claims (the hot path).
+      c="$(_ctc_token_facts "$slot.body")"; f="${c%% *}"; c="${c#* }"
+      if _ctc_shaped "$f" && _ctc_facts_ok "$c" "$want"; then
         jwt="$f"; src=mint
         ( umask 077; printf '%s\n' "$jwt" > "$slot.jwt" )
       else
         # A coord that ignores `tenant_id` mints for the device's legacy
         # pointer. That token is NOT used: every read under it would answer
         # about the wrong tenant.
+        c="${c#* }"
         printf 'POST /agents/credential for tenant %s returned a token claiming %s (or one that is expired / exp-less) -- not used' "$want" "${c:-<none>}" > "$slot.rejected"
       fi
     fi
@@ -291,11 +334,12 @@ _ctc_probe() {
     -H "@$(_ctc_np "$CTC_TMP/bearer.hdr")" "$(_ctc_url)/pr-merge/$enc/0/author-session" 2>/dev/null)" || code=000
   _ctc_mark "${code:-000}"
   if [ "$code" = 200 ]; then
-    "${CTC_PY:-python3}" - "$CTC_TMP/ctc.probe.json" "$1" <<'PY' >/dev/null 2>&1 || code=bad
-import json, sys
-d = json.load(open(sys.argv[1]))
-sys.exit(0 if isinstance(d, dict) and d.get("repo") == sys.argv[2] else 1)  # envelope-ok: the author-session body, one field
-PY
+    # The 200 must be ABOUT this repo. Read in bash, not an interpreter: this
+    # runs once per repo per candidate, on every caller's hot path. A slug has
+    # no quote or backslash in it, so the first "repo" string value is exact.
+    local body re='"repo"[[:space:]]*:[[:space:]]*"([^"]*)"'
+    body="$(cat "$CTC_TMP/ctc.probe.json" 2>/dev/null)"
+    if ! [[ "$body" =~ $re ]] || [ "${BASH_REMATCH[1]}" != "$1" ]; then code=bad; fi
   fi
   printf '%s' "${code:-000}"
 }

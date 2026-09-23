@@ -116,8 +116,12 @@ if url.endswith("/coord/agent-gates"):
           open(f).read() if os.path.exists(f) else '{"gates":[],"count":0,"shown":0,"total":0,"offset":0,"truncated":false}')
 sys.stdout.write("000"); sys.exit(7)
 STUBEOF
-chmod +x "$STUB"   # Linux refuses to exec a file without it; MSYS would run it anyway, which hid this
-export RECOVERY_CENSUS_CURL="$STUB"
+# Invoked through a bash wrapper naming the Python 3 this suite resolved: on
+# Git Bash for Windows the only spelling is often `python`, so a
+# `#!/usr/bin/env python3` shebang would not run there.
+printf '#!/usr/bin/env bash\nexec "%s" "%s" "$@"\n' "$PY" "$STUB" > "$SANDBOX/curl-stub.sh"
+chmod +x "$STUB" "$SANDBOX/curl-stub.sh"   # Linux refuses to exec a file without it; MSYS would run it anyway, which hid this
+export RECOVERY_CENSUS_CURL="$SANDBOX/curl-stub.sh"
 export TA="aaaaaaaa-0000-4000-8000-000000000001" TB="bbbbbbbb-0000-4000-8000-000000000002" TP="cccccccc-0000-4000-8000-000000000003"
 # Every fixture repo's origin is github.com/org/<name>, owned by $TA; the
 # device is bound to $TB (owns nothing) and $TA, in that order, so a proof has
