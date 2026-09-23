@@ -3980,6 +3980,16 @@ pub(crate) enum ConfigDirSource {
     /// No usable `QONTINUI_CONFIG_DIR`; the platform config dir +
     /// `com.qontinui.runner`.
     PlatformConfigDir,
+    /// No usable `QONTINUI_CONFIG_DIR`, and this process is a TEST HARNESS:
+    /// the platform dir would be the operator's real `settings.json`, so the
+    /// resolver answered `ambient::deflected_config_dir()` instead. Never
+    /// produced by a shipped or dev runner (`canary_armed()` is false there).
+    ///
+    /// Reported as its own arm, rather than passed off as
+    /// [`ConfigDirSource::PlatformConfigDir`], so `config_report` layer 2 run
+    /// inside a test says where the directory actually came from. Plan
+    /// `2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json`.
+    TestDeflected,
 }
 
 impl ConfigDirSource {
@@ -3988,6 +3998,7 @@ impl ConfigDirSource {
         match self {
             ConfigDirSource::EnvConfigDir => "env:QONTINUI_CONFIG_DIR",
             ConfigDirSource::PlatformConfigDir => "platform_config_dir",
+            ConfigDirSource::TestDeflected => "test_deflected",
         }
     }
 }
@@ -4009,11 +4020,29 @@ impl ConfigDirSource {
 /// The `Err` arm is a genuine "could not resolve", never a fallback: a caller
 /// (and `config_report` layer 2) gets an error string naming what failed rather
 /// than a plausible-looking directory nothing was actually read from.
+///
+/// # In a test process, the platform arm is never taken
+///
+/// When `QONTINUI_CONFIG_DIR` is unset or empty, the platform arm names the
+/// operator's real `settings.json`. A test harness therefore consults
+/// `ambient::test_config_dir_override` first and, on its say-so, answers the
+/// deflected hermetic dir as [`ConfigDirSource::TestDeflected`] — or panics
+/// naming this resolver, for a thread under `strict_canary()`. The lib's
+/// `profiles::settings_json_path` consults the SAME decision, so the two
+/// resolvers of this one file cannot disagree inside a test. A non-test process
+/// gets `None` from the override and resolves exactly as before. Plan
+/// `2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json`,
+/// D1.
 pub(crate) fn resolve_config_dir() -> Result<(PathBuf, ConfigDirSource), String> {
-    resolve_config_dir_from(
-        std::env::var("QONTINUI_CONFIG_DIR").ok(),
-        dirs::config_dir(),
-    )
+    let env_config_dir = std::env::var("QONTINUI_CONFIG_DIR").ok();
+    if env_config_dir.as_deref().is_none_or(str::is_empty) {
+        if let Some(dir) = qontinui_runner_lib::ambient::test_config_dir_override(
+            "settings::resolve_config_dir",
+        ) {
+            return Ok((dir, ConfigDirSource::TestDeflected));
+        }
+    }
+    resolve_config_dir_from(env_config_dir, dirs::config_dir())
 }
 
 /// [`resolve_config_dir`] as a PURE function of its two inputs, so the
@@ -7350,5 +7379,123 @@ mod config_dir_race_tests {
              that was READ ({}), got: {persisted_a:?}",
             dir_a.path().display()
         );
+    }
+}
+
+/// D1 of plan
+/// `2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json`: a
+/// test process cannot resolve the operator's config dir.
+///
+/// This binary is a test harness through `canary_armed()`'s runtime detection
+/// (the bin crate is not `cfg(test)` from the lib's side), so every assertion
+/// here is ALSO the proof that the detection reaches [`resolve_config_dir`].
+/// The non-test arm (d) is pinned on the pure decision in
+/// `ambient::tests`, because no test can run inside a non-test process.
+#[cfg(test)]
+mod config_dir_deflection_tests {
+    use super::*;
+    use qontinui_runner_lib::ambient::deflected_config_dir;
+
+    /// (a) With `QONTINUI_CONFIG_DIR` unset — and with it exported EMPTY, the
+    /// same "unset" by the shared emptiness rule — an unguarded test resolves
+    /// the deflected dir, never `dirs::config_dir()`. The lib's second resolver
+    /// of the same file agrees, because it asks the same decision.
+    #[test]
+    fn an_unguarded_resolution_with_the_var_unset_is_deflected() {
+        let _g = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_CONFIG_DIR"]);
+
+        for value in [None, Some("")] {
+            match value {
+                None => std::env::remove_var("QONTINUI_CONFIG_DIR"),
+                Some(v) => std::env::set_var("QONTINUI_CONFIG_DIR", v),
+            }
+            let (dir, source) = resolve_config_dir().expect("a deflected dir always resolves");
+            assert_eq!(source, ConfigDirSource::TestDeflected, "value {value:?}");
+            assert_eq!(source.as_str(), "test_deflected");
+            assert_eq!(dir, deflected_config_dir(), "value {value:?}");
+            if let Some(real) = dirs::config_dir() {
+                assert_ne!(
+                    dir,
+                    real.join("com.qontinui.runner"),
+                    "a test process resolved the operator's real config dir"
+                );
+            }
+            assert_eq!(
+                resolve_settings_path().expect("resolves"),
+                dir.join(SETTINGS_FILE)
+            );
+
+            let (lib_path, lib_source) = qontinui_runner_lib::profiles::settings_json_path();
+            assert_eq!(lib_source.as_str(), "test_deflected");
+            assert_eq!(
+                lib_path,
+                Some(dir.join(SETTINGS_FILE)),
+                "the two settings.json resolvers must agree inside a test"
+            );
+        }
+    }
+
+    /// A non-empty `QONTINUI_CONFIG_DIR` is honoured exactly as before: in a
+    /// test process it is a fixture's directory, never the operator's.
+    #[test]
+    fn a_set_var_is_honoured_unchanged() {
+        let _g = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_CONFIG_DIR"]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("QONTINUI_CONFIG_DIR", tmp.path());
+        let (dir, source) = resolve_config_dir().expect("resolves");
+        assert_eq!(dir, tmp.path());
+        assert_eq!(source, ConfigDirSource::EnvConfigDir);
+    }
+
+    /// (b) Under `strict_canary()` the same resolution panics, naming the
+    /// resolver.
+    #[test]
+    #[should_panic(expected = "runner config dir resolved by settings::resolve_config_dir")]
+    fn a_strict_unguarded_resolution_panics_naming_the_source() {
+        let _g = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_CONFIG_DIR"]);
+        std::env::remove_var("QONTINUI_CONFIG_DIR");
+        let _strict = crate::test_env::strict_canary();
+        let _ = resolve_config_dir();
+    }
+
+    /// (c) The arm-3 exclusion. A fixture is live on THIS thread and the var is
+    /// removed under it; a spawned thread — unguarded, while a guard IS live
+    /// in the process — still deflects. The ambient READ canary would let that
+    /// thread proceed (its deliberately soft arm 3), and that softness is
+    /// precisely the read-then-persist window this decision closes.
+    #[test]
+    fn an_unguarded_thread_deflects_even_while_a_sibling_fixture_is_live() {
+        let _amb = crate::test_env::isolated_ambient();
+        std::env::remove_var("QONTINUI_CONFIG_DIR");
+
+        let (dir, source, canary) = std::thread::spawn(|| {
+            assert!(!crate::test_env::thread_is_guarded());
+            assert!(crate::test_env::live_guard_count() > 0);
+            let (dir, source) = resolve_config_dir().expect("resolves");
+            (
+                dir,
+                source,
+                qontinui_runner_lib::ambient::canary("config_dir_deflection_tests probe"),
+            )
+        })
+        .join()
+        .expect("the default (deflect) arm must not panic");
+
+        assert_eq!(
+            canary,
+            qontinui_runner_lib::ambient::Verdict::Proceed,
+            "precondition: the READ canary's arm 3 lets this thread through"
+        );
+        assert_eq!(source, ConfigDirSource::TestDeflected);
+        assert_eq!(dir, deflected_config_dir());
+
+        // The guarded thread itself, with the var removed, deflects too —
+        // silently — rather than falling through to the platform dir.
+        let (dir, source) = resolve_config_dir().expect("resolves");
+        assert_eq!(source, ConfigDirSource::TestDeflected);
+        assert_eq!(dir, deflected_config_dir());
     }
 }

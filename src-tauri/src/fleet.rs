@@ -3648,8 +3648,13 @@ fn spawn_skill_parity_pass_if_due() {
 /// Still `Option`: a miss means this publish pass finds no repos and says so
 /// (see the "QONTINUI_ROOT to override. Skipping." log below), which is honest
 /// degradation rather than an error.
+///
+/// Through `workspace_paths::workspace_root_readonly`: the same value, without
+/// entering `load_settings_full` (a settings writer by side effect) just to
+/// learn a path. Plan
+/// `2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json`.
 fn qontinui_root() -> Option<PathBuf> {
-    crate::workspace_paths::workspace_root()
+    crate::workspace_paths::workspace_root_readonly()
 }
 
 /// Decide which branch (if any) the `behind_default_count` rev-list should

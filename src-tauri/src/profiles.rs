@@ -568,6 +568,14 @@ pub enum SettingsJsonPathSource {
     /// No `QONTINUI_CONFIG_DIR`; the platform config dir +
     /// `com.qontinui.runner` was used.
     PlatformConfigDir,
+    /// No `QONTINUI_CONFIG_DIR`, in a TEST HARNESS: the platform dir would be
+    /// the operator's real `settings.json` — which this module both reads and
+    /// WRITES ([`apply_tier_edit_at`], [`promote_tier_to_account`]) — so the
+    /// hermetic `ambient::deflected_config_dir()` was used instead. Decided by
+    /// [`crate::ambient::test_config_dir_override`], the same call
+    /// `settings::resolve_config_dir` makes, so the two resolvers agree inside
+    /// a test as they do outside one. Never produced by a non-test process.
+    TestDeflected,
     /// Neither available — `dirs::config_dir()` returned `None`, so there is no
     /// path at all. The value is `None`, never a guess.
     Unresolvable,
@@ -579,6 +587,7 @@ impl SettingsJsonPathSource {
         match self {
             SettingsJsonPathSource::EnvConfigDir => "env:QONTINUI_CONFIG_DIR",
             SettingsJsonPathSource::PlatformConfigDir => "platform_config_dir",
+            SettingsJsonPathSource::TestDeflected => "test_deflected",
             SettingsJsonPathSource::Unresolvable => "unresolvable",
         }
     }
@@ -599,6 +608,11 @@ impl std::fmt::Display for SettingsJsonPathSource {
 /// `settings::resolve_config_dir_from`. See
 /// [`SettingsJsonPathSource::EnvConfigDir`] for why that has to hold now that
 /// this module WRITES the file as well as reading it.
+///
+/// In a test harness with no usable `QONTINUI_CONFIG_DIR` the platform arm is
+/// replaced by [`crate::ambient::test_config_dir_override`]'s hermetic dir
+/// ([`SettingsJsonPathSource::TestDeflected`]) — the one decision
+/// `settings::resolve_config_dir` consults too.
 pub fn settings_json_path() -> (Option<PathBuf>, SettingsJsonPathSource) {
     if let Some(dir) = std::env::var("QONTINUI_CONFIG_DIR")
         .ok()
@@ -607,6 +621,12 @@ pub fn settings_json_path() -> (Option<PathBuf>, SettingsJsonPathSource) {
         return (
             Some(PathBuf::from(dir).join("settings.json")),
             SettingsJsonPathSource::EnvConfigDir,
+        );
+    }
+    if let Some(dir) = crate::ambient::test_config_dir_override("profiles::settings_json_path") {
+        return (
+            Some(dir.join("settings.json")),
+            SettingsJsonPathSource::TestDeflected,
         );
     }
     match dirs::config_dir() {

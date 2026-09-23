@@ -1229,8 +1229,13 @@ fn resolve_tenant_id() -> Option<Uuid> {
 /// `pub(crate)` so the Phase 5 fs_backstop poller enumerates governed canonical
 /// checkouts under the SAME workspace root the census walks — no second
 /// root-resolution to drift from.
+///
+/// Through `workspace_paths::workspace_root_readonly`: the same value, without
+/// entering `load_settings_full` (a settings writer by side effect) just to
+/// learn a path. Plan
+/// `2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json`.
 pub(crate) fn qontinui_root() -> Option<PathBuf> {
-    crate::workspace_paths::workspace_root()
+    crate::workspace_paths::workspace_root_readonly()
 }
 
 // ---------------------------------------------------------------------------

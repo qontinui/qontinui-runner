@@ -2437,7 +2437,14 @@ mod tests {
             LayerReading::Known { value, source, .. } => {
                 assert!(!value.is_empty(), "a known config dir must have a value");
                 assert!(
-                    ["env:QONTINUI_CONFIG_DIR", "platform_config_dir"].contains(&source.as_str()),
+                    [
+                        "env:QONTINUI_CONFIG_DIR",
+                        "platform_config_dir",
+                        // What a test process reports with no fixture: the
+                        // hermetic dir the platform arm is deflected to.
+                        "test_deflected",
+                    ]
+                    .contains(&source.as_str()),
                     "unexpected config dir arm: {source}"
                 );
             }
