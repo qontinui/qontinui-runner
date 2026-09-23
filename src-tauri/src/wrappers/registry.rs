@@ -839,4 +839,36 @@ mod tests {
             .collect();
         assert!(debris.is_empty(), "temp files left behind: {debris:?}");
     }
+
+    /// `Wrapper` has no `#[serde(rename_all = "camelCase")]`, so `GET
+    /// /wrappers` and `GET /wrappers/:id` serialize it snake_case. TS
+    /// `InstalledWrapper` (src/lib/wrappers/types.ts) must mirror that exact
+    /// shape — plan 2026-08-23-single-source-derived-facts follow-up: the
+    /// mismatch left `packageName`/`installPath`/`installedAt`/`updatedAt`
+    /// always `undefined` at runtime, so installed-wrapper package names
+    /// rendered blank.
+    #[test]
+    fn wrapper_wire_shape_matches_the_ts_mirror() {
+        let json = serde_json::to_value(synthetic_wrapper("w", 1)).unwrap();
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "actions",
+                "id",
+                "install_path",
+                "installed_at",
+                "manifest",
+                "package_name",
+                "updated_at",
+                "version",
+            ]
+        );
+    }
 }

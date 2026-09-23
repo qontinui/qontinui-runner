@@ -661,9 +661,6 @@ mod tests {
         ) -> std::collections::BTreeMap<String, String> {
             crate::session::provider_adapter::ClaudeAdapter.account_isolation(account)
         }
-        fn resume_handshake_patterns(&self) -> crate::session::provider_adapter::HandshakePatterns {
-            crate::session::provider_adapter::ClaudeAdapter.resume_handshake_patterns()
-        }
         fn restore_tier(&self) -> RestoreTier {
             RestoreTier::TerminalOnly
         }

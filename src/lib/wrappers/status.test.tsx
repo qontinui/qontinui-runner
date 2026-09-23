@@ -40,7 +40,7 @@ function statusInfo(state: WrapperStatusInfo["state"]): WrapperStatusInfo {
 
 const WRAPPER: InstalledWrapper = {
   id: "w",
-  packageName: "@acme/w",
+  package_name: "@acme/w",
   version: "1.0.0",
   manifest: { manifestVersion: 1, id: "w", displayName: "W", transport: "api" },
   actions: [],

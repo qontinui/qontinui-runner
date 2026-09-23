@@ -51,7 +51,7 @@ export function AboutTab({ wrapper }: AboutTabProps) {
     (wrapper.manifest as { repository?: string }).repository;
 
   const rows: MetaRow[] = [
-    { label: "Package", value: <code className="font-mono text-sm">{wrapper.packageName}</code> },
+    { label: "Package", value: <code className="font-mono text-sm">{wrapper.package_name}</code> },
     { label: "Version", value: <span className="text-sm">{wrapper.version}</span> },
     { label: "Transport", value: <span className="text-sm">{wrapper.manifest.transport}</span> },
     {
