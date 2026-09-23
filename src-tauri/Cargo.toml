@@ -423,13 +423,24 @@ suspicious = { level = "deny", priority = 1 }
 # `tokio_postgres::Row::get` (listed in the repo-root clippy.toml) panics on a
 # NULL/type/index mismatch and kills the enclosing spawned task silently. Every
 # pre-existing site carries a fn-level `#[expect]` (scripts/row-get-expect-sweep.py);
-# `src/row_get_ratchet.rs` pins that count as a ceiling. ONE lint at deny — never
+# `src/expect_ratchet.rs` pins that count as a ceiling. ONE lint at deny — never
 # `-D warnings`. Priority 2, like the grandfathered allows below: a single lint
 # at the SAME priority as a group (`correctness` = 1) trips
 # `clippy::lint_groups_priority`, and the specific level must outrank the group.
 # Plan 2026-09-03-coord-row-get-panic-class-closed-by-lint-and-supervisor.
 disallowed_methods = { level = "deny", priority = 2 }
-perf = { level = "warn", priority = 1 }
+# `&s[..n]` on a `&str` PANICS when `n` is not a char boundary — a multibyte
+# character straddling the cut kills the handler or task that sliced (the class
+# `e99e64491` swept by hand, and that regressed twice in qontinui-coord). Every
+# site that PREDATES this gate carries a fn-level `#[expect(clippy::string_slice)]`
+# (scripts/row-get-expect-sweep.py --lint clippy::string_slice); `src/expect_ratchet.rs`
+# pins that count as a ceiling. A site that lands AFTER the gate is never
+# grandfathered: it migrates to `str::get`, `char_indices`, or
+# `crate::str_utils::truncate_str` instead. Priority 2 for the same
+# `lint_groups_priority` reason as `disallowed_methods` above.
+# Plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate.
+string_slice = { level = "deny", priority = 2 }
+perf ={ level = "warn", priority = 1 }
 complexity = { level = "warn", priority = 0 }
 style = { level = "warn", priority = 0 }
 pedantic = { level = "allow", priority = 0 }

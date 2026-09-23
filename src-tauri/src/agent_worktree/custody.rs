@@ -236,6 +236,10 @@ pub fn parse_session_trailers(body: &str) -> (Option<String>, Option<String>) {
     (id, name)
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn strip_trailer(line: &str, key: &str) -> Option<String> {
     // BYTE comparison, not `line[..key.len()]`.
     //
@@ -692,6 +696,10 @@ fn label_for(
 }
 
 /// First uuid segment, or the whole id when it is shorter/not a uuid.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn short_id(id: &str) -> &str {
     match id.find('-') {
         Some(i) if i >= 6 => &id[..i],

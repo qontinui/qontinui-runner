@@ -6161,6 +6161,10 @@ const CONDITION_REPORT_BEARER_MARKER: &str = "Authorization: Bearer ";
 /// moved, or a prompt whose only marker hits are operator text. That is
 /// fail-closed: the caller logs the unreported reason rather than POSTing a
 /// guess at a credential.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn condition_report_token(payload: &ConditionCheckPayload) -> Option<String> {
     if let Some(explicit) = payload.report_token.as_deref() {
         let explicit = explicit.trim();
@@ -11333,6 +11337,10 @@ mod tests {
     /// detail that carries it on the wire is bounded to 64 chars and to
     /// `[A-Za-z0-9_.-]`, everything else becoming `_`.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn credential_deferral_detail_is_bounded_and_sanitized() {
         // The sanitizer itself.
         assert_eq!(

@@ -1354,6 +1354,10 @@ fn reroot_cargo_override(
 /// `"<prefix>/<agent_id>/<rest>"` token to `"<local_root>/<agent_id>/<rest>"`
 /// by re-anchoring at the `/<agent_id>/` segment. Operates on
 /// already-forward-slash-normalized `contents`.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn reanchor_by_agent_id(contents: &str, agent_id: &str, local_root: &str) -> String {
     let anchor = format!("/{agent_id}/");
     let mut out = String::with_capacity(contents.len());

@@ -276,6 +276,10 @@ pub fn execute_review_subtask(
 /// Called from `mark_task_completed` BEFORE the status is written. Returns `true`
 /// if the task should complete normally (approved/inconclusive), `false` if the
 /// caller should redirect to `mark_task_failed` (changes requested).
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub async fn process_review_outcome(
     pg: &Arc<PgDb>,
     review_task_run_id: &str,

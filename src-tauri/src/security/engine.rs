@@ -398,6 +398,10 @@ fn is_metadata_endpoint(domain: &str) -> bool {
 
 /// Check if a domain matches any pattern in a list.
 /// Supports exact match and wildcard prefix (e.g., `*.example.com`).
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn domain_matches_list(domain: &str, patterns: &[String]) -> bool {
     let domain_lower = domain.to_lowercase();
     for pattern in patterns {

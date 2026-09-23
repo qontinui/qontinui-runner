@@ -131,6 +131,10 @@ fn sql_literal(s: &str) -> String {
 /// - `<ws>\<repo>-wt-<slug>\<rest>`                → `<ws>\<repo>\<rest>`
 ///
 /// Returns `None` when the path is not worktree-resident.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub(crate) fn map_worktree_path(normalized: &str) -> Option<String> {
     let sep = std::path::MAIN_SEPARATOR;
     let segments: Vec<&str> = normalized.split(sep).collect();
@@ -225,6 +229,10 @@ pub(crate) fn attribute(roots: &[ProjectRoot], raw_path: &str) -> Option<String>
 ///
 /// Normalization is not reproducible in SQL (it resolves the machine's live
 /// `subst` table), so this enumerates the inverse instead.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn prefix_spellings(normalized_root: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
 

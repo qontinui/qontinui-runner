@@ -120,6 +120,10 @@ fn resolve_variables(text: &str, context: &HandlerContext) -> String {
 ///   `click on "Sign In"` → ("CLICK", "Sign In")
 ///   `type "hello" into email field` → ("TYPE", "email field")
 ///   `select "Option A"` → ("SELECT", "Option A")
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn parse_action_description(desc: &str) -> (String, String) {
     let desc_lower = desc.to_lowercase();
 

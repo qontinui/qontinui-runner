@@ -3673,6 +3673,10 @@ fn behind_default_compare_branch<'a>(branch: &str, default_branch: &'a str) -> O
 /// `None` when the directory isn't a git repo (no `.git/` dir). All
 /// `git` calls use `process_helpers::no_window("git")` so they go through the operator's
 /// PATH-resolved git — same as the rest of the runner.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     let dot_git = repo_path.join(".git");
     if !dot_git.exists() {
@@ -4106,6 +4110,10 @@ struct RestoreParams {
 /// Apply one safe verdict to one repo's working tree. Blocking git via the
 /// caller's `spawn_blocking`. Returns the outcome to record. NEVER performs an
 /// unsafe op regardless of the verdict (defense in depth, plan §5).
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn apply_pull_verdict_blocking(
     repo_path: &std::path::Path,
     verdict_kind: &str,
@@ -4289,6 +4297,10 @@ fn apply_pull_verdict_blocking(
 /// aborts on failure with a distinct outcome (idempotent — the next publish
 /// tick re-evaluates whatever state the tree was left in; every intermediate
 /// state is a valid git state strictly no staler than the parked one).
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn apply_restore_default_blocking(
     repo_path: &std::path::Path,
     repo_str: &str,

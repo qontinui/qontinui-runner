@@ -54,6 +54,10 @@ impl HardenRule for ReplaceJqWithPython {
 /// Pure function: map a command string that pipes into `jq` to an
 /// equivalent `python -c` assertion. Returns `None` if no pattern
 /// matched.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn replace_jq_with_python(cmd: &str) -> Option<String> {
     let pipe_idx = cmd.find("| jq ")?;
     let curl_part = cmd[..pipe_idx].trim();

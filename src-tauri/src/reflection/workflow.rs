@@ -312,6 +312,10 @@ fn resolve_file_path(raw_path: &str, project_root: Option<&str>) -> Option<PathB
 }
 
 /// Pre-read up to 10 files, max 300 lines each, max 50KB total.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn pre_read_files(paths: &[PathBuf]) -> String {
     let mut result = String::new();
     let mut total_bytes = 0usize;

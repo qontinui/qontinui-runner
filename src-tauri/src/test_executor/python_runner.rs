@@ -58,6 +58,10 @@ struct PythonAssertion {
 /// Extract the last JSON object from a string containing multiple JSON outputs.
 /// This handles the case where user code prints JSON before the wrapper.
 /// The wrapper always prints last, so we want that JSON.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_last_json(input: &str) -> Option<String> {
     // Split by common line endings and find the last valid JSON
     let lines: Vec<&str> = input.lines().collect();

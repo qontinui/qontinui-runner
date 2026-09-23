@@ -267,6 +267,10 @@ pub fn compose_spawn_prompt_in(
 }
 
 /// The content-addressed file name for a composed spawn prompt.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn spawn_prompt_file_name(content: &str) -> String {
     let digest = hex::encode(Sha256::digest(content.as_bytes()));
     format!("spawn-{}.md", &digest[..16])
@@ -652,6 +656,10 @@ mod tests {
     /// one file, different content never shares a name, and nothing else (no
     /// temp file) is left in the directory.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn composed_files_are_content_addressed_and_written_once() {
         let tmp = tempfile::tempdir().unwrap();
         let a = compose_spawn_prompt_in(tmp.path(), Some("BRIEF"), "BODY").unwrap();
@@ -963,6 +971,10 @@ mod script_tests {
 
     /// The `claude` wrapper block of a posix integration script, without the
     /// OSC/prompt plumbing (which writes to `/dev/tty`).
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn wrapper_block(script: &str) -> &str {
         let start = script
             .find("# ── Claude Code runner context")
@@ -1211,6 +1223,10 @@ mod script_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn powershell_wrapper_uses_the_file_carrier_only_when_the_file_exists() {
         if Command::new("pwsh").arg("-v").output().is_err() {
             eprintln!("skipping: pwsh not on PATH");

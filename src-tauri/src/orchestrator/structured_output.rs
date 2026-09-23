@@ -617,6 +617,10 @@ pub fn parse_worker_output(output: &str) -> ParsedWorkerOutput {
 /// Looks for:
 /// - ```json:worker_output ... ```
 /// - ```json\n{"work_summary":...} ... ```
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_json_block(output: &str) -> Option<String> {
     // Try labeled block first: ```json:worker_output
     if let Some(start) = output.find("```json:worker_output") {
@@ -680,6 +684,10 @@ fn parse_legacy_output(output: &str, _iteration: u32) -> WorkerOutput {
 }
 
 /// Extract content after a marker.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_marker_content(output: &str, marker: &str) -> Option<String> {
     if let Some(start) = output.find(marker) {
         let after = &output[start + marker.len()..];
@@ -692,6 +700,10 @@ fn extract_marker_content(output: &str, marker: &str) -> Option<String> {
 }
 
 /// Parse findings from legacy format.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn parse_legacy_findings(output: &str) -> Vec<StructuredFinding> {
     let mut findings = Vec::new();
     let mut search_pos = 0;
@@ -729,6 +741,10 @@ fn parse_legacy_findings(output: &str) -> Vec<StructuredFinding> {
 }
 
 /// Extract description text after a finding marker.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_finding_description(text: &str) -> String {
     let trimmed = text.trim_start();
 
@@ -742,6 +758,10 @@ fn extract_finding_description(text: &str) -> String {
 }
 
 /// Parse overrides from legacy format.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn parse_legacy_overrides(output: &str) -> Vec<StructuredOverride> {
     let mut overrides = Vec::new();
     let mut remaining = output;
@@ -783,6 +803,10 @@ fn parse_legacy_overrides(output: &str) -> Vec<StructuredOverride> {
 }
 
 /// Extract a field value from content (e.g., "Item: value").
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_field(content: &str, field_name: &str) -> Option<String> {
     let pattern = format!("{}:", field_name);
     if let Some(start) = content.find(&pattern) {

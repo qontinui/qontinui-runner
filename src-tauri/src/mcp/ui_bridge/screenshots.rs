@@ -1512,6 +1512,10 @@ mod visibility_sweep_payload_tests {
     //! actually issues.
 
     /// The body of `ui_bridge_visibility_handler`, production source only.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn visibility_handler_body() -> &'static str {
         let source = include_str!("screenshots.rs");
         let start = source
@@ -1819,6 +1823,10 @@ mod visibility_min_ratio_contract_tests {
     /// The handler must gate BEFORE it sweeps — an out-of-range threshold
     /// must not be able to produce a report at all.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn the_handler_validates_before_it_discovers() {
         let src = include_str!("screenshots.rs");
         let start = src
@@ -1948,6 +1956,10 @@ mod sweep_discover_tests {
     /// shape of the original defect, and of `/control/visibility` as first
     /// written — still fails here, which is the whole reason the guard exists.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn discover_payload_is_shared_by_every_sweep() {
         // Scan only the PRODUCTION half of the file: everything below the
         // `#[cfg(test)]` marker is this module, which necessarily mentions the
@@ -1993,6 +2005,10 @@ mod sweep_discover_tests {
     /// helper is written inline AS the argument, while a literal is
     /// conventionally bound to a `let` a few lines ABOVE it. A forward-only
     /// window sees the first and misses the second.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn site_asks_for_every_element(production: &str, at: usize) -> bool {
         let arg = call_argument_text(&production[at..]);
         if arg.contains("discover_all_elements_payload()") {
@@ -2016,6 +2032,10 @@ mod sweep_discover_tests {
     /// The text of a call's arguments: from `rest`'s start to the paren that
     /// closes the enclosing call. Depth-tracked, so a nested `helper()` does not
     /// terminate the scan early.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn call_argument_text(rest: &str) -> &str {
         let mut depth = 0usize;
         for (i, c) in rest.char_indices() {

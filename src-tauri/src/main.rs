@@ -348,12 +348,13 @@ mod tier_matrix_tests;
 // Plan `2026-08-25-runner-test-suite-env-isolation` Phase 2.
 #[cfg(test)]
 mod env_write_lock_guard;
-// Source-scan ratchet for the `tokio_postgres::Row::get` deny lint: the
-// fn-level `#[expect(clippy::disallowed_methods)]` count only falls, and the
-// gate (repo-root clippy.toml + the two deny levels in Cargo.toml) stays wired.
-// Plan 2026-09-03-coord-row-get-panic-class-closed-by-lint-and-supervisor.
+// Source-scan ratchets for the deny lints that grandfather sites with a
+// fn-level `#[expect]` (`clippy::disallowed_methods` for `Row::get`,
+// `clippy::string_slice`): each count only falls, and each gate stays wired.
+// Plans 2026-09-03-coord-row-get-panic-class-closed-by-lint-and-supervisor and
+// 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate.
 #[cfg(test)]
-mod row_get_ratchet;
+mod expect_ratchet;
 mod turn_ending_shadow;
 mod worktree;
 mod wrappers;

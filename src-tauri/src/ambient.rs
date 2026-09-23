@@ -1869,6 +1869,10 @@ mod tests {
     /// Does a literal spell the `.qontinui` DIRECTORY — `".qontinui"`,
     /// `"{}/.qontinui/machine.json"` — as opposed to the bundle identifier
     /// `com.qontinui.runner`, where `.qontinui` is a segment of a dotted name?
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn spells_the_qontinui_dir(lit: &str) -> bool {
         lit.match_indices(".qontinui").any(|(at, _)| {
             let before = lit[..at].chars().next_back();

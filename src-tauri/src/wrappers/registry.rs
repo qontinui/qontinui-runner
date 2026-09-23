@@ -632,6 +632,10 @@ async fn run_manifest_only(cwd: &Path, entry: &Path) -> Result<String, RegistryE
     }
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()

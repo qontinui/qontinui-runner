@@ -495,6 +495,10 @@ mod manifest_drift_tests {
     /// doesn't expose `Router::routes()`, so we can't introspect the live
     /// router at runtime. Re-evaluate if axum adds router introspection.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn manifest_matches_route_calls() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let ui_bridge_dir = PathBuf::from(manifest_dir).join("src/mcp/ui_bridge");
@@ -616,6 +620,10 @@ mod manifest_drift_tests {
     /// next to qontinui-runner: this test is best-effort, not a hard
     /// dependency on the dev-tree layout.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn sdk_manifest_routes_are_exposed_by_runner() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let sdk_types_path = PathBuf::from(manifest_dir)

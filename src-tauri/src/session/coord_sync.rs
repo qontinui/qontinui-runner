@@ -2756,7 +2756,10 @@ mod tests {
             .expect("the finished arm must exist")
             .1;
         // Bound the scan to this arm's body.
-        let body = &arm[..arm.find("\n        \"").unwrap_or(arm.len().min(1200))];
+        let body = match arm.find("\n        \"") {
+            Some(end) => arm.get(..end).unwrap_or(arm),
+            None => crate::str_utils::truncate_str(arm, 1200),
+        };
 
         assert!(
             body.contains("{base}/sessions/{}") && body.contains("rec.session_id"),

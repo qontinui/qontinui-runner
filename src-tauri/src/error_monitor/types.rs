@@ -356,6 +356,10 @@ impl ErrorEvent {
     ///
     /// Fields are length-prefixed so `("ab", "c")` and `("a", "bc")` cannot
     /// collide into the same digest.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     pub fn compute_signature_hash(&self) -> String {
         use sha2::{Digest, Sha256};
 

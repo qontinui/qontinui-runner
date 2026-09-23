@@ -106,6 +106,10 @@ impl AiMiddleware for ContextCompactionMiddleware {
 /// Output: `file|tokens\na.rs|100\nb.rs|200`
 ///
 /// Saves 38-64% on structured data payloads.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn compact_json_arrays(text: &str) -> String {
     // Find JSON arrays that are at least 3 objects
     let mut result = text.to_string();
@@ -283,6 +287,10 @@ fn compact_markdown_tables(text: &str) -> String {
 // =============================================================================
 
 /// Truncate long output blocks (test results, build logs) to first+last N lines.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn trim_verbose_outputs(text: &str) -> String {
     VERBOSE_BLOCK_PATTERN
         .replace_all(text, |caps: &regex::Captures| {
@@ -435,6 +443,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn test_deduplicate_sections() {
         let repeated = "unique context here";
         let dup = "x".repeat(120); // >100 chars

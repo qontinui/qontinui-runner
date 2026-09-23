@@ -809,6 +809,10 @@ fn execute_scan_workspace(input: &DiscoveryInput) -> Result<String, String> {
 /// those files and injects their contents into the discovery context. This is
 /// critical for prompts like "read X and implement what it describes" where
 /// the file IS the task specification.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn execute_read_referenced_files(input: &DiscoveryInput) -> Result<String, String> {
     if input.referenced_files.is_empty() {
         return Ok(String::new());
@@ -1772,6 +1776,10 @@ fn build_http_client(config: &DiscoveryConfig) -> Result<reqwest::blocking::Clie
 }
 
 /// Extract the origin (scheme + host + port) from a URL.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_origin(url: &str) -> Option<String> {
     // Simple extraction: find the third slash or end
     if let Some(scheme_end) = url.find("://") {
@@ -1787,6 +1795,10 @@ fn extract_origin(url: &str) -> Option<String> {
 }
 
 /// Truncate text at a line boundary, keeping it under `max_chars`.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn truncate_at_line_boundary(text: &str, max_chars: usize) -> String {
     if text.len() <= max_chars {
         return text.to_string();

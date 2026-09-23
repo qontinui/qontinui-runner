@@ -205,6 +205,10 @@ fn substitute_variables(input: &str) -> String {
 /// Extract Unix-style env var prefixes (KEY=VALUE) from a command string.
 /// Returns the extracted env vars and the remaining command.
 /// Example: "SKIP_WEB_SERVER=1 npx playwright test" -> ([("SKIP_WEB_SERVER", "1")], "npx playwright test")
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_env_prefix(command: &str) -> (Vec<(String, String)>, String) {
     let mut envs = Vec::new();
     let mut remaining = command.trim();

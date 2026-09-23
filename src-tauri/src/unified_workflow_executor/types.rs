@@ -1094,6 +1094,10 @@ impl AgenticOutcome {
 ///     "unified-workflow-abc-1234567890"
 /// );
 /// ```
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn get_parent_task_id(execution_id: &str) -> String {
     // Check if this is a composed run child: composed-run-{timestamp}-workflow-{n}
     if let Some(pos) = execution_id.rfind("-workflow-") {

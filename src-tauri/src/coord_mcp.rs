@@ -396,6 +396,10 @@ static LOOPBACK_HANDSHAKE_KEY: std::sync::OnceLock<String> = std::sync::OnceLock
 ///
 /// The secret itself is NEVER logged — the log line names the path and a short
 /// prefix only, matching the rotation log's discipline.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub(crate) fn publish_loopback_handshake_key(port: u16) -> Option<std::path::PathBuf> {
     let secret = LOOPBACK_HANDSHAKE_KEY.get_or_init(|| {
         use rand::RngCore;
@@ -3710,6 +3714,10 @@ fn read_rotation_log_tail_at(path: &Path) -> RotationTail {
 /// Drop the first line of a mid-file tail read — it is almost certainly a
 /// fragment of a longer line, and a fragment of JSON parses as nothing. A read
 /// that started at byte 0 is whole and is returned untouched.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn drop_partial_first_line(raw: &str, truncated: bool) -> &str {
     if !truncated {
         return raw;
@@ -7191,6 +7199,10 @@ impl<'a> ProxyConfigIdentity<'a> {
     /// re-spawns of the same identity (so a rotation rewrites the SAME path the
     /// live shim is reading), distinct across identities, and free of any
     /// path-length or character hazard the raw workdir carries.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     pub(crate) fn credential_file_name(&self) -> String {
         use sha2::{Digest as _, Sha256};
         let mut h = Sha256::new();
@@ -11750,6 +11762,10 @@ mod tests {
     /// DEFAULT (no handshake presented) is denied. Pure resolver ⇒ no
     /// process-env, `OnceLock` or home-dir mutation.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn session_identity_gate_requires_handshake_and_marker_and_defaults_denied() {
         let _amb = crate::test_env::isolated_ambient();
         const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -13412,6 +13428,10 @@ mod tests {
     /// workdir, principal and terminal — the property that makes a rotation
     /// land on the file a live shim is reading and never on a neighbour's.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn stdio_credential_file_name_is_stable_and_identity_distinct() {
         let a1 = ProxyConfigIdentity::device("D:/repo/one", None).credential_file_name();
         let a2 = ProxyConfigIdentity::device("D:/repo/one", None).credential_file_name();
@@ -17946,6 +17966,10 @@ mod tests {
     /// dead key must not append a line per attempt: one line per key per
     /// window, with the suppressed repeats counted into the next one.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn reject_throttle_admits_once_per_window_and_counts_suppressed() {
         let prefix = format!("thr{}", &uuid::Uuid::new_v4().simple().to_string()[..5]);
 
@@ -18397,6 +18421,10 @@ mod phase2_proxy_header_shape_tests {
     /// write — silently destroying the mint→write→evict join that made the
     /// 2026-08-19 incident reconstructible at all.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn rotation_write_line_carries_a_non_empty_key_prefix_for_the_new_shape() {
         let _amb = crate::test_env::isolated_ambient();
         let log_dir = rotation_log_test_dir();
@@ -20913,6 +20941,10 @@ mod runner_credential_tests {
     /// needs a Tauri-backed `ApiState`; neither is constructible in a unit
     /// test.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn the_handler_heals_before_it_refuses_and_keeps_the_retryable_degrade() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs");
         let text = std::fs::read_to_string(&src).expect("read mcp_api.rs");
@@ -21017,6 +21049,10 @@ mod runner_credential_tests {
     /// it off an AGENT principal's answer would serve a device-scope caller a
     /// list coord composed for a different principal.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn the_catalogue_is_recorded_only_from_a_device_principal_refusal() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs");
         let text = std::fs::read_to_string(&src).expect("read mcp_api.rs");

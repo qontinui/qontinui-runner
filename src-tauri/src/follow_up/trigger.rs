@@ -66,6 +66,10 @@ pub fn should_launch_follow_up(
     clippy::disallowed_methods,
     reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
 )]
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 async fn should_launch_follow_up_pg(
     pg_db: &crate::database::pg::PgDb,
     source_task_run_id: &str,

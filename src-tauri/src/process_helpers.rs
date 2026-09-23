@@ -57,6 +57,10 @@ pub fn tokio_no_window<S: AsRef<std::ffi::OsStr>>(program: S) -> tokio::process:
 /// same way on both platforms is also what lets a Linux CI run pin the Windows
 /// behaviour — the alternative is a check that can only be tested where the
 /// bug does not occur. Case-insensitive because Windows paths are.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn program_is_git(program: &std::ffi::OsStr) -> bool {
     let s = program.to_string_lossy();
     let base = s.rsplit(['/', '\\']).next().unwrap_or(s.as_ref());

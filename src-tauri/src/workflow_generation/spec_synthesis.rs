@@ -118,6 +118,10 @@ fn detect_test_runner(discovery_context: &str) -> TestRunner {
 }
 
 /// Try to extract a working directory from the discovery context.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn detect_working_dir(discovery_context: &str) -> Option<String> {
     // Look for common patterns like "frontend/", "src/", "packages/" in the context
     for keyword in &["working_dir", "cwd", "root_dir"] {
@@ -355,6 +359,10 @@ fn shell_escape_single_quoted(s: &str) -> String {
 /// shell meta-characters (`;`, `&&`, `||`, `|`, redirects, or substitutions).
 /// Commands that legitimately need these operators should be placed in a script
 /// file and referenced by path instead.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn derive_command(criterion: &AcceptanceCriterion, working_dir: &Option<String>) -> String {
     let hint = &criterion.verification_hint;
 

@@ -360,7 +360,7 @@ fn read_current_branch(repo_path: &str) -> String {
                 branch.to_string()
             } else {
                 // Detached HEAD -- return the commit hash
-                content[..8.min(content.len())].to_string()
+                crate::str_utils::truncate_str(content, 8).to_string()
             }
         }
         Err(_) => "unknown".to_string(),

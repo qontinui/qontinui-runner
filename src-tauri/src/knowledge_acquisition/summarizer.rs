@@ -39,6 +39,10 @@ pub fn needs_summarization(content: &str) -> bool {
 }
 
 /// LLM-based summarization using Claude API
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 async fn llm_summarize(content: &str, query: &str, max_length: usize) -> Result<String, String> {
     let api_key = ai_keychain()
         .get("claude_api")
@@ -118,6 +122,10 @@ async fn llm_summarize(content: &str, query: &str, max_length: usize) -> Result<
 }
 
 /// Smart truncation: try to break at paragraph/sentence boundaries
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn truncate_smart(content: &str, max_length: usize) -> String {
     if content.len() <= max_length {
         return content.to_string();

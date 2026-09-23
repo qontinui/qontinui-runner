@@ -136,6 +136,10 @@ pub fn slug_from_filename(path: &str) -> String {
 /// metadata included — not just the date. The calendar check
 /// (`NaiveDate::from_ymd_opt`) turns such a stem into `None`, which the wire
 /// omits, so the rest of the upsert still lands.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn authored_at_from_stem(stem: &str) -> Option<String> {
     let b = stem.as_bytes();
     if b.len() < 11 {
@@ -164,6 +168,10 @@ pub fn authored_at_from_stem(stem: &str) -> Option<String> {
 /// `draft`). Returns the underscore-normalized canonical status on a match.
 /// Ported verbatim from coord's `match_known_status`, with the vocabulary
 /// supplied by [`PlanConvention`] instead of a hardcoded constant.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn match_known_status(s: &str, conv: &PlanConvention) -> Option<String> {
     let lower = s.to_lowercase();
     let mut best: Option<&str> = None;
@@ -257,6 +265,10 @@ fn status_blockquote_lines(body: &str) -> Vec<&str> {
 
 /// True iff `tok` is a date-prefixed plan stem (`YYYY-MM-DD-<kebab>`), the same
 /// token shape the canonical `resolve-plan-deps.py` keeps.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn is_plan_stem(tok: &str) -> bool {
     let b = tok.as_bytes();
     if b.len() < 12 {
@@ -284,6 +296,10 @@ fn is_plan_stem(tok: &str) -> bool {
 /// Mirrors `resolve-plan-deps.py`: every case-sensitive `Depends-On:`
 /// occurrence contributes the date-prefixed stem tokens on the REMAINDER of
 /// that physical line; union deduped, order-preserving.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_depends_on(body: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for line in status_blockquote_lines(body) {
@@ -358,6 +374,10 @@ pub enum AreaDecl {
 }
 
 /// A key match on one line: its byte offset and what it resolves to.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn area_key_on_line(line: &str) -> Option<(usize, AreaDecl)> {
     const BOLD: &str = "**Area:";
     let mut best: Option<(usize, AreaDecl)> = None;
@@ -601,6 +621,10 @@ fn phase_index_at(rest: &str) -> Option<u32> {
 /// The content of a bold span, given the text just AFTER its opening `**`:
 /// everything up to the closing `**`, or the whole remainder when the span
 /// does not close on this line.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn bold_span(s: &str) -> String {
     match s.find("**") {
         Some(i) => s[..i].trim().to_string(),
@@ -612,6 +636,10 @@ fn bold_span(s: &str) -> String {
 /// `3. x` / `3) x` → `(Some(3), "x")`; `None` for a line that is not a list
 /// item. `t` is already trimmed. The marker must be followed by whitespace, so
 /// `-x` and `1.5 x` are not items.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn list_item(t: &str) -> Option<(Option<u32>, &str)> {
     let marker_end = if t.starts_with(['-', '*', '+']) {
         1
@@ -811,6 +839,10 @@ fn heading_rank(name: &str) -> NameRank {
 /// are heuristics over free-form Markdown, not a grammar the corpus agreed to;
 /// the census in the plan above is the evidence for each one, and a miss is the
 /// intended failure mode.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn detect_phases(body: &str) -> Vec<ParsedPhase> {
     let lines: Vec<&str> = body.lines().collect();
     let fenced = fenced_lines(&lines);
@@ -2005,6 +2037,10 @@ mod tests {
     /// the `<area>` placeholder with a kebab value, and resolve it — so a
     /// template edit that moves the line out of the status blockquote fails CI.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn create_plan_template_area_line_is_read_by_the_parser() {
         let doc = include_str!("../fleet_commands/create-plan.md");
         let open = "```markdown\n# Plan: <Title>\n";

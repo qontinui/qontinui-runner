@@ -69,6 +69,10 @@ fn extract_field_value(body: &str, field: &str) -> Option<String> {
         .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn count_lines_up_to(src: &str, byte_offset: usize) -> usize {
     let clamped = byte_offset.min(src.len());
     src[..clamped].bytes().filter(|&b| b == b'\n').count() + 1
