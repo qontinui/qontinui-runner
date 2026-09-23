@@ -756,6 +756,12 @@ async fn read_register_frame(
     if frame.app_id.trim().is_empty() {
         return Err("register frame missing appId".to_string());
     }
+    if frame.app_id.chars().count() > crate::mcp::app_registry::MAX_APP_ID_LEN {
+        return Err(format!(
+            "register frame appId exceeds {} characters",
+            crate::mcp::app_registry::MAX_APP_ID_LEN
+        ));
+    }
     Ok(frame)
 }
 

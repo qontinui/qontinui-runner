@@ -2209,7 +2209,14 @@ pub(crate) async fn try_ws_dispatch_for_app(
     http_path: &str,
     payload: serde_json::Value,
 ) -> Option<Result<serde_json::Value, String>> {
-    let entry = registry.get(app_id).await?;
+    // `get_live`, not `get`. This is a ROUTING reader by its own contract:
+    // `None` means "fall through to IPC", `Some(Err)` means "surface this".
+    // A row now outlives its TTL as a reservation, so `get` would answer
+    // `Some` for a dead WS app, `dispatch` would then read `get_live` and
+    // return `NotRegistered`, and the caller would turn that into a 400 —
+    // converting a crashed wrapper's 15 s outage with working fallthrough
+    // into 90 s of hard 400s for an app the runner also serves over IPC.
+    let entry = registry.get_live(app_id).await?;
     if entry.transport != AppTransport::Websocket {
         return None;
     }
@@ -5350,6 +5357,79 @@ mod ws_dispatch_selection_tests {
     use reqwest::Method;
     use serde_json::json;
     use std::time::Duration;
+
+    /// Critical 2: `try_ws_dispatch_for_app` is a ROUTING reader — `None`
+    /// means "fall through to IPC", `Some(Err)` means "surface this error".
+    ///
+    /// A registry row now outlives its TTL as an R5 reservation, so reading
+    /// `get` here would answer `Some` for a dead WS app; `dispatch` reads
+    /// `get_live` and returns `NotRegistered`, and callers turn that into a
+    /// 400. A crashed wrapper for an app the runner also serves over IPC
+    /// would go from a 15 s outage with working fallthrough to 90 s of hard
+    /// 400s. It must answer `None` instead.
+    #[tokio::test]
+    async fn a_reservation_only_row_falls_through_to_ipc_rather_than_erroring() {
+        let registry = AppRegistry::new();
+        let ws = WsConnectionManager::new();
+        let (_conn, _rx) = ws.test_register("wapp").await;
+        registry
+            .upsert(
+                sample_app("wapp"),
+                None,
+                AppTransport::Websocket,
+                Some(1),
+                None,
+            )
+            .await;
+        let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(2));
+        let dispatcher = AppDispatcher::new(registry.clone(), relay.clone());
+
+        // Live: it takes the WS path (Some).
+        let live = try_ws_dispatch_for_app(
+            &registry,
+            &dispatcher,
+            "wapp",
+            "noop",
+            Method::POST,
+            "/x",
+            json!({}),
+        )
+        .await;
+        assert!(
+            live.is_some(),
+            "precondition: a live WS row is dispatched over WS"
+        );
+
+        // The wrapper crashes; the row lingers only as a reservation.
+        assert!(
+            registry
+                .test_age_entry(
+                    "wapp",
+                    crate::mcp::app_registry::REGISTRATION_TTL_MS + 1_000
+                )
+                .await
+        );
+        assert!(
+            registry.get("wapp").await.is_some(),
+            "precondition: the row is retained as a reservation"
+        );
+
+        let out = try_ws_dispatch_for_app(
+            &registry,
+            &dispatcher,
+            "wapp",
+            "noop",
+            Method::POST,
+            "/x",
+            json!({}),
+        )
+        .await;
+        assert!(
+            out.is_none(),
+            "a reservation-only row must fall through to IPC, not surface an \
+             error the caller turns into a 400: {out:?}"
+        );
+    }
 
     fn sample_app(app_id: &str) -> DiscoveredApp {
         DiscoveredApp {

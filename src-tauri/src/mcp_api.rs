@@ -9307,12 +9307,8 @@ pub fn create_router(
     // registrations share the same ring.
     app_handle.manage(api_state.supervision_state.clone());
 
-    // Spawn the background sweeper that evicts stale phone-home registrations
-    // (and, on the same tick, expired relay-binding tombstones).
-    crate::mcp::app_registry::spawn_sweeper(
-        api_state.app_registry.clone(),
-        api_state.relay_binding.clone(),
-    );
+    // Spawn the background sweeper that drops rows whose reservation lapsed.
+    crate::mcp::app_registry::spawn_sweeper(api_state.app_registry.clone());
 
     // Set up UI Bridge response listener
     // This listens for "ui-bridge-response" events from the React frontend

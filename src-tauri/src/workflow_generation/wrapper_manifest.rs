@@ -369,6 +369,7 @@ mod tests {
                 None
             },
             keep_alive_ms: None,
+            released_at_ms: None,
         }
     }
 

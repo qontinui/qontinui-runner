@@ -404,7 +404,9 @@ async fn select_app_payload(
     ws_payload: serde_json::Value,
     http_body: Option<serde_json::Value>,
 ) -> serde_json::Value {
-    match registry.get(app_id).await.map(|e| e.transport) {
+    // `get_live`: this picks the payload SHAPE by transport, and must agree
+    // with what `dispatch` (which reads `get_live`) will actually do.
+    match registry.get_live(app_id).await.map(|e| e.transport) {
         Some(AppTransport::Websocket) => ws_payload,
         _ => http_body.unwrap_or(serde_json::Value::Null),
     }

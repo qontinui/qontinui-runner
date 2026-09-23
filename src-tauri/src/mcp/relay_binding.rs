@@ -21,7 +21,7 @@
 //!
 //! # Phase 1 (this state of the file)
 //!
-//! [`Principal`], [`Principal::same`], [`Refusal`], the tombstone map and
+//! [`Principal`], [`Principal::same`], [`Refusal`] and
 //! [`RelayBinding::meter`] land here, and the WebSocket relay plus the app
 //! registry consult them (R1, R2, R3-WS, R4, R5, R-opaque).
 //! [`RelayBinding::health_json`] is served by the production `/health`
@@ -31,7 +31,7 @@
 //!
 //! [`RequesterPrincipal`]: crate::mcp::origin_guard::RequesterPrincipal
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -65,6 +65,10 @@ pub const CODE_OPAQUE_ORIGIN: &str = "UIB_OPAQUE_ORIGIN";
 /// A result was posted by someone other than the connection or tab the
 /// command was routed to (R3).
 pub const CODE_COMMAND_NOT_YOURS: &str = "UIB_COMMAND_NOT_YOURS";
+/// The registry is at its row ceiling and this principal has nothing of its
+/// own to give up. A CAPACITY condition, not a rule verdict — see
+/// [`Refusal::registry_full`].
+pub const CODE_REGISTRY_FULL: &str = "UIB_REGISTRY_FULL";
 
 pub const RULE_R1: &str = "R1";
 pub const RULE_R2: &str = "R2";
@@ -84,25 +88,17 @@ pub const RULE_R5_KEEP_ALIVE: &str = "R5-keepAlive";
 /// one counter. (It does not reduce ring pressure — both ids share the ring.)
 pub const RULE_R1_SLOT: &str = "R1-slot";
 pub const RULE_OPAQUE: &str = "R-opaque";
+/// Not a rule id: the label [`Refusal::registry_full`] carries so the denial
+/// payload still names what refused it. It is deliberately NOT one of the
+/// `R*` ids and is never passed to [`RelayBinding::meter`], because a
+/// capacity refusal must not appear among the `rules` counters Phase 4's
+/// graduation is decided from.
+pub const RULE_CAPACITY: &str = "capacity";
 
 /// How long a browser principal's released `appId` / `tabId` stays reserved
 /// for it (R5). Closes the reload race: a tab reloads, and an attacker
 /// polling `/ui-bridge/apps/registered` must not get the id first.
 pub const BINDING_TOMBSTONE_MS: i64 = 60_000;
-
-/// Ceiling on the whole tombstone map, so a page spraying fresh ids cannot
-/// grow it without bound.
-pub(crate) const MAX_TOMBSTONES: usize = 1024;
-
-/// Ceiling on ONE principal's tombstones, which is what actually makes R5
-/// hold: a global ceiling alone is adversarially evictable. Every tombstone
-/// has the same 60 s lifetime, so "evict the soonest to expire" is always
-/// "evict the OLDEST", which is always the victim's — an attacker who
-/// registers and DELETEs `MAX_TOMBSTONES` fresh ids (first-claim squatting is
-/// an accepted non-goal, so each succeeds) would evict the victim's reload
-/// reservation and hand itself the reload race back. Bounding per principal
-/// means one principal only ever evicts its OWN.
-pub(crate) const MAX_TOMBSTONES_PER_PRINCIPAL: usize = 64;
 
 /// How many `(rule, class, route)` tuples `/health` reports.
 const MAX_RECENT_TUPLES: usize = 20;
@@ -154,10 +150,42 @@ impl Refusal {
         }
     }
 
-    /// `409` for "someone else holds it", `403` for "you are not who you say".
+    /// The registry is at [`MAX_ROWS`] and the claimant holds no row of its
+    /// own to give up.
+    ///
+    /// This is the SAFE saturated arm, and the choice is the whole point.
+    /// Every rule that ranks OTHER principals' rows for eviction has been
+    /// measured steerable: "evict the soonest to expire" is "evict the
+    /// oldest", which is always the victim's because an attacker's rows are
+    /// newer by construction; "evict the largest bucket" is attacker-chosen
+    /// because bucket size is; and a fair-share bound divides to zero once
+    /// the bucket count reaches the ceiling, so ties fall to whichever origin
+    /// a comparison happens to rank last — which an attacker simply picks.
+    /// So no principal's row is ever removed to make room for another
+    /// principal's write. A claimant may only give up its OWN; otherwise it
+    /// is refused, and the cost falls on whoever arrives next with no
+    /// attacker control over who that is.
+    ///
+    /// A saturated registry therefore cannot be used to TAKE an id: claiming
+    /// an id that already has a row never reaches the ceiling (the row is
+    /// replaced, not added), so a holder reclaiming its own reserved id is
+    /// admitted even at a full map.
+    ///
+    /// [`MAX_ROWS`]: crate::mcp::app_registry::MAX_ROWS
+    pub const fn registry_full() -> Self {
+        Self {
+            code: CODE_REGISTRY_FULL,
+            rule: RULE_CAPACITY,
+            message: "The app registry is at its row ceiling; retry once a reservation lapses",
+        }
+    }
+
+    /// `409` for "someone else holds it", `503` for "no capacity", `403` for
+    /// "you are not who you say".
     pub fn status(&self) -> StatusCode {
         match self.code {
             CODE_REGISTRATION_HELD => StatusCode::CONFLICT,
+            CODE_REGISTRY_FULL => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::FORBIDDEN,
         }
     }
@@ -294,24 +322,6 @@ impl Principal {
         self.is_operator_trust() || self.same(holder)
     }
 
-    /// The key a tombstone's fair-share bucket is counted under.
-    ///
-    /// The VERIFIED HEADER ORIGIN, never [`Self::log_key`]: a bucket is a
-    /// quota, so it has to cost something to mint. An origin costs DNS and a
-    /// certificate. `log_key` becomes `tabkey:<digest>` for a keyed tab in
-    /// Phase 2, which is 32 random bytes minted client-side — unlimited
-    /// buckets for free, which would turn any fair-share rule into its
-    /// opposite. Everything without a verified origin therefore shares ONE
-    /// bucket and, between them, one share.
-    pub fn tombstone_bucket(&self) -> String {
-        match self {
-            Self::Browser { origin, .. } => origin.as_origin_string(),
-            // Operator trust never tombstones; a keyed or opaque principal has
-            // no origin the runner verified, so they pool.
-            _ => "<unverified>".to_string(),
-        }
-    }
-
     /// A stable key for the "log once per principal+rule" set.
     #[cfg(test)]
     pub fn log_key_for_test(&self) -> String {
@@ -325,7 +335,15 @@ impl Principal {
             Self::Browser { class, origin } => {
                 format!("{}:{}", class.as_str(), origin.as_origin_string())
             }
-            Self::TabKey { digest } => format!("tabkey:{}", &digest[..16.min(digest.len())]),
+            // `str::get`, never `&digest[..n]`: a byte slice at a non-char
+            // boundary PANICS, and this lands AFTER the `clippy::string_slice`
+            // deny gate, which never grandfathers a new site (src-tauri/
+            // Cargo.toml). The digest is hex today, so every boundary is a char
+            // boundary — but that is a property of the caller, not of this fn,
+            // and the whole point of the gate is not to rest on one.
+            Self::TabKey { digest } => {
+                format!("tabkey:{}", digest.get(..16).unwrap_or(digest.as_str()))
+            }
             Self::Opaque { class } => format!("opaque:{}", class.as_str()),
         }
     }
@@ -474,39 +492,25 @@ impl BindingCounters {
     }
 }
 
-/// A released browser-principal id, reserved for its previous holder until
-/// `expires_at_ms` (R5).
-#[derive(Debug, Clone)]
-struct Tombstone {
-    holder: Principal,
-    expires_at_ms: i64,
-}
-
-/// Config, counters and the tombstone map: ONE instance per router, shared by
+/// Config and counters: ONE instance per router, shared by
 /// every request as an `Arc` on `ApiState` (and so on every [`RelayState`]
 /// extracted from it).
 #[derive(Debug, Default)]
 pub struct RelayBinding {
     pub config: BindingConfig,
     pub counters: BindingCounters,
-    /// `"app:<id>"` / `"tab:<id>"` → the principal that just released it.
-    tombstones: Mutex<HashMap<String, Tombstone>>,
     /// The last [`MAX_RECENT_TUPLES`] `(rule, class, route)` triples, for
     /// `/health`. No origin: for a Foreign requester that would name the
     /// other sites that reached this runner.
     recent: Mutex<VecDeque<(&'static str, &'static str, &'static str)>>,
     /// "principal+rule already logged" — one WARN per pair, not per request.
     logged: Mutex<HashSet<String>>,
-    /// Tombstone reservations displaced by the global ceiling. An operational
-    /// event, kept OUT of `rules` — see `tombstone_until`.
-    tombstone_evictions: AtomicU64,
-    /// Evicted keys already WARNed about, so a flood is one line per displaced
-    /// reservation rather than one per request.
-    evicted_logged: Mutex<HashSet<String>>,
-    /// Writes refused because the map was full and NOTHING was above its fair
-    /// share. Distinct from an eviction: nobody lost a reservation, the
-    /// arrival did not get one.
-    tombstone_drops: AtomicU64,
+    /// Claims refused because the registry was at its row ceiling
+    /// ([`Refusal::registry_full`]). An operational CAPACITY event, kept out
+    /// of `rules` on purpose: a shadow box must not report anything that
+    /// reads as a rule refusal in the signal Phase 4's graduation is decided
+    /// from, and the ceiling applies in every mode.
+    registry_full_refusals: AtomicU64,
 }
 
 impl RelayBinding {
@@ -514,13 +518,17 @@ impl RelayBinding {
         Arc::new(Self {
             config,
             counters: BindingCounters::default(),
-            tombstones: Mutex::new(HashMap::new()),
             recent: Mutex::new(VecDeque::new()),
             logged: Mutex::new(HashSet::new()),
-            tombstone_evictions: AtomicU64::new(0),
-            evicted_logged: Mutex::new(HashSet::new()),
-            tombstone_drops: AtomicU64::new(0),
+            registry_full_refusals: AtomicU64::new(0),
         })
+    }
+
+    /// Count one capacity refusal. Not `meter`: the ceiling is a resource
+    /// bound rather than a binding rule, so it neither honours `shadow` nor
+    /// lands among the `rules` counters.
+    pub fn count_registry_full(&self) {
+        self.registry_full_refusals.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Apply `mode` to a computed refusal.
@@ -582,17 +590,6 @@ impl RelayBinding {
         }
     }
 
-    fn first_eviction_sighting(&self, evicted_key: &str) -> bool {
-        let mut seen = self
-            .evicted_logged
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if seen.len() >= MAX_LOGGED_SIGHTINGS {
-            seen.clear();
-        }
-        seen.insert(evicted_key.to_string())
-    }
-
     fn push_recent(&self, rule: &'static str, class: &'static str, route: &'static str) {
         let mut recent = self.recent.lock().unwrap_or_else(|e| e.into_inner());
         if recent.len() >= MAX_RECENT_TUPLES {
@@ -615,193 +612,6 @@ impl RelayBinding {
         logged.insert(format!("{}|{}", principal.log_key(), rule))
     }
 
-    // -- Tombstones (R5) -------------------------------------------------
-
-    /// Reserve `key` for `holder` for [`BINDING_TOMBSTONE_MS`] from now.
-    /// See [`Self::tombstone_until`] for the carve-outs and the ceiling.
-    pub fn tombstone(&self, key: String, holder: &Principal) {
-        self.tombstone_until(
-            key,
-            holder,
-            chrono::Utc::now().timestamp_millis() + BINDING_TOMBSTONE_MS,
-        );
-    }
-
-    /// Reserve `key` for `holder` until an EXPLICIT instant.
-    ///
-    /// Operator-trust releases are NOT tombstoned: an agent's id is free the
-    /// moment it lets go. A reservation whose instant has already passed is
-    /// not written at all.
-    ///
-    /// Only the EXPLICIT-release path reaches here. Expiry is handled by the
-    /// registry retaining the row through its reservation window, so this map
-    /// no longer has to cover it.
-    ///
-    /// # The ceiling
-    ///
-    /// Bounded per bucket ([`MAX_TOMBSTONES_PER_PRINCIPAL`]) and then
-    /// globally ([`MAX_TOMBSTONES`]). A bucket is a VERIFIED ORIGIN
-    /// ([`Principal::tombstone_bucket`]).
-    ///
-    /// At the global ceiling the victim is chosen by FAIR-SHARE EXCESS:
-    /// `share = MAX / buckets`, and only a bucket strictly above its share is
-    /// eligible, picked by largest excess and tie-broken by bucket key so the
-    /// choice never depends on `HashMap` iteration order. Two earlier rules
-    /// were measured wrong and are recorded here so they are not re-invented:
-    /// "evict the globally soonest" always picked the victim, because every
-    /// reservation has the same lifetime so soonest == oldest == the one
-    /// written before the flood; and "evict the largest bucket" is
-    /// attacker-chosen too — 1023 origins holding one each tie at one and the
-    /// winner fell out of hash order, while a victim that legitimately holds
-    /// the largest bucket (a multi-app origin) was evicted every single time.
-    ///
-    /// When NOTHING exceeds its share the incoming principal evicts its OWN
-    /// soonest — self-eviction, never victim-eviction. Only if it holds none
-    /// either does the globally soonest go, and in that state the map is
-    /// saturated by `MAX` distinct verified origins each at its share, the
-    /// incoming write is the newest, and the eviction lands on whoever wrote
-    /// longest ago.
-    pub fn tombstone_until(&self, key: String, holder: &Principal, expires_at_ms: i64) {
-        if holder.is_operator_trust() {
-            return;
-        }
-        let now = chrono::Utc::now().timestamp_millis();
-        if expires_at_ms <= now {
-            return;
-        }
-        let bucket = holder.tombstone_bucket();
-        let mut map = self.tombstones.lock().unwrap_or_else(|e| e.into_inner());
-        map.retain(|_, t| t.expires_at_ms > now);
-
-        if !map.contains_key(&key) {
-            // ONE pass for every decision below: per-bucket count and each
-            // bucket's soonest-to-expire key, tie-broken by key so a bucket's
-            // representative is deterministic too.
-            let mut counts: BTreeMap<String, (usize, String, i64)> = BTreeMap::new();
-            for (k, t) in map.iter() {
-                let b = t.holder.tombstone_bucket();
-                match counts.get_mut(&b) {
-                    Some(e) => {
-                        e.0 += 1;
-                        if (t.expires_at_ms, k.as_str()) < (e.2, e.1.as_str()) {
-                            e.1 = k.clone();
-                            e.2 = t.expires_at_ms;
-                        }
-                    }
-                    None => {
-                        counts.insert(b, (1, k.clone(), t.expires_at_ms));
-                    }
-                }
-            }
-            let mine = counts.get(&bucket).map(|e| e.0).unwrap_or(0);
-
-            // Who pays for this write, in order:
-            //
-            //   1. me, if my own bucket is already at its per-bucket cap;
-            //   2. me, if my bucket is at or above its FAIR SHARE — the
-            //      incoming write is the one causing the overflow, so a
-            //      principal that already has its share pays for wanting more
-            //      before anyone under their share does;
-            //   3. the bucket furthest ABOVE its fair share, tie-broken by
-            //      bucket key (`counts` is a BTreeMap, so this is key order
-            //      and never hash order);
-            //   4. nobody — the write is DROPPED.
-            //
-            // Step 4 is reachable only when every bucket is at or under its
-            // share, which at a full map means ~`MAX_TOMBSTONES` distinct
-            // VERIFIED origins. Dropping there is symmetric: it falls on
-            // whoever arrives next, with no attacker control over who that is.
-            // That is the opposite of the earlier dropped-write arm, which an
-            // attacker could force against a CHOSEN victim from 16 origins.
-            let share = MAX_TOMBSTONES / (counts.len() + usize::from(mine == 0)).max(1);
-            let my_soonest = counts.get(&bucket).map(|e| e.1.clone());
-            let victim = if mine >= MAX_TOMBSTONES_PER_PRINCIPAL {
-                my_soonest
-            } else if map.len() < MAX_TOMBSTONES {
-                None
-            } else if mine > 0 && mine >= share {
-                my_soonest
-            } else {
-                counts
-                    .iter()
-                    .filter(|(_, e)| e.0 > share)
-                    .max_by_key(|(_, e)| e.0 - share)
-                    .map(|(_, e)| e.1.clone())
-            };
-
-            // Step 4: nothing was chosen and the map is full — do not insert.
-            if victim.is_none() && map.len() >= MAX_TOMBSTONES {
-                self.tombstone_drops.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-
-            if let Some(v) = victim {
-                if map.remove(&v).is_some() {
-                    // An operational EVENT, not a rule verdict: counted on its
-                    // own `/health` field rather than under `rules`, where a
-                    // shadow box would otherwise report "refusals" beside
-                    // `binding: "shadow"` in the exact signal Phase 4 reads.
-                    self.tombstone_evictions.fetch_add(1, Ordering::Relaxed);
-                    // Deduped on the EVICTED bucket, not the incoming
-                    // principal: under a flood the incoming principal differs
-                    // every request, which made this one line per request.
-                    if self.first_eviction_sighting(&v) {
-                        tracing::warn!(
-                            ceiling = MAX_TOMBSTONES,
-                            buckets = counts.len(),
-                            "ui-bridge binding (R5): the tombstone map hit its global ceiling and displaced a reservation (logged once per evicted reservation; counted on /health uiBridgeBinding.tombstoneEvictions)"
-                        );
-                    }
-                }
-            }
-        }
-
-        map.insert(
-            key,
-            Tombstone {
-                holder: holder.clone(),
-                expires_at_ms,
-            },
-        );
-    }
-
-    /// The principal still holding `key`'s tombstone, if it has not expired.
-    pub fn tombstone_holder(&self, key: &str) -> Option<Principal> {
-        let now = chrono::Utc::now().timestamp_millis();
-        let map = self.tombstones.lock().unwrap_or_else(|e| e.into_inner());
-        map.get(key)
-            .filter(|t| t.expires_at_ms > now)
-            .map(|t| t.holder.clone())
-    }
-
-    /// Drop `key`'s tombstone — called when the id is claimed again.
-    pub fn clear_tombstone(&self, key: &str) {
-        let mut map = self.tombstones.lock().unwrap_or_else(|e| e.into_inner());
-        map.remove(key);
-    }
-
-    /// Test-only seam: backdate every tombstone past its expiry, so a test
-    /// can exercise [`Self::sweep_tombstones`]'s real arm without sleeping
-    /// 60 s.
-    #[cfg(test)]
-    pub fn test_expire_tombstones(&self) {
-        let now = chrono::Utc::now().timestamp_millis();
-        let mut map = self.tombstones.lock().unwrap_or_else(|e| e.into_inner());
-        for t in map.values_mut() {
-            t.expires_at_ms = now - 1;
-        }
-    }
-
-    /// Drop every expired tombstone. Driven by `app_registry::spawn_sweeper`'s
-    /// existing tick rather than a second timer. Returns how many went.
-    pub fn sweep_tombstones(&self) -> usize {
-        let now = chrono::Utc::now().timestamp_millis();
-        let mut map = self.tombstones.lock().unwrap_or_else(|e| e.into_inner());
-        let before = map.len();
-        map.retain(|_, t| t.expires_at_ms > now);
-        before - map.len()
-    }
-
     /// The `/health` `uiBridgeBinding` block, served by the production
     /// handler (`mcp_api::health`). Phase 4's graduation of R6, R8 and
     /// R9-unkeyed is decided from these counters, so they have to be readable
@@ -819,27 +629,21 @@ impl RelayBinding {
             "activeBinding": self.config.active_binding.as_str(),
             "bindingEnv": ENV_BINDING,
             "activeBindingEnv": ENV_ACTIVE_BINDING,
-            "tombstoneMs": BINDING_TOMBSTONE_MS,
-            // An operational event, deliberately NOT under `rules`: a shadow
-            // box must not report anything that reads as a refusal in the
-            // signal Phase 4's graduation is decided from.
-            "tombstoneEvictions": self.tombstone_evictions.load(Ordering::Relaxed),
-            "tombstoneDrops": self.tombstone_drops.load(Ordering::Relaxed),
-            "tombstones": self
-                .tombstones
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .len(),
+            // How long an id stays RESERVED for its holder after its
+            // registration ends. The reservation lives on the registry ROW;
+            // there is no side map.
+            "reservationMs": BINDING_TOMBSTONE_MS,
+            "maxRows": crate::mcp::app_registry::MAX_ROWS,
+            // An operational CAPACITY event, deliberately NOT under `rules`:
+            // it fires in every mode (an unbounded in-process map is a
+            // memory-exhaustion defect the kill switch must not re-open), so
+            // reporting it beside `binding: "shadow"` would put a non-refusal
+            // in exactly the signal Phase 4's graduation reads.
+            "registryFullRefusals": self.registry_full_refusals.load(Ordering::Relaxed),
             "rules": self.counters.rules_json(),
             "recent": recent,
         })
     }
-}
-
-/// The tombstone key for an `appId`. Tab ids get `tab:` in Phase 2, so the two
-/// namespaces can never collide.
-pub fn app_tombstone_key(app_id: &str) -> String {
-    format!("app:{app_id}")
 }
 
 /// What the UI Bridge relay handlers need, as `Arc` clones of `ApiState`'s
@@ -854,7 +658,7 @@ pub struct RelayState {
     pub sdk_connection: Arc<tokio::sync::Mutex<SdkConnectionManager>>,
     pub ui_bridge_relay: Arc<RelayRegistry>,
     pub app_dispatcher: Arc<AppDispatcher>,
-    /// The binding config, counters and tombstones every rule reads.
+    /// The binding config and counters every rule reads.
     pub binding: Arc<RelayBinding>,
 }
 
