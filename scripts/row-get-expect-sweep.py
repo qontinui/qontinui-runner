@@ -72,8 +72,10 @@ What this script does, per pass:
   4. Repeats until clippy exits 0 with zero `disallowed_methods` and zero
      `unfulfilled_lint_expectations` diagnostics.
 
-Unattributable sites TERMINATE the loop, they do not spin it: every pass asserts
-the diagnostic count strictly fell; on a no-progress pass the residual
+Unattributable sites TERMINATE the loop, they do not spin it: a pass that
+reports exactly the previous pass's site set, or that can attribute nothing,
+is no progress (a count comparison would misfire here, where each pass can
+lint a crate the previous one never reached); on a no-progress pass the residual
 `file:line` list is printed and the script exits 2. Those sites (a `Row::get`
 inside a module-level `static`/`const`/`Lazy` initializer or a `macro_rules!`
 body) are handled by hand -- an `#[expect]` on the enclosing non-fn item, or a
@@ -338,10 +340,18 @@ def fn_carries_attribute(lines: list[str], fn_idx: int) -> bool:
         if stripped.startswith("#[") or stripped.startswith("//"):
             j -= 1
             continue
-        if stripped.endswith(")]") or stripped.endswith("]"):
-            # The last line of some other multi-line attribute: step to its start.
-            k = j
-            while k >= 0 and not lines[k].strip().startswith("#["):
+        if stripped.endswith("]"):
+            # The last line of some other multi-line attribute: step to its
+            # start, never past an item boundary (a blank line, or a line
+            # ending an item with `}` / `;`), so a statement that merely ends in
+            # `]` cannot borrow a neighbouring fn's attribute stack.
+            k = j - 1
+            while k >= 0:
+                inner = lines[k].strip()
+                if inner.startswith("#["):
+                    break
+                if not inner or inner.endswith("}") or inner.endswith(";"):
+                    return False
                 k -= 1
             if k < 0:
                 return False
@@ -516,7 +526,9 @@ def attribute_starts(text: str):
     following lines up to the one that is exactly `)]`. `compact` is the joined
     text with all whitespace removed, so `#[expect(clippy::disallowed_methods`
     matches either spelling and prose quoting the attribute inside a comment
-    does not. Mirrors `attribute_starts` in `expect_ratchet.rs`.
+    does not. The Rust ratchet (`flatten_attributes` in `expect_ratchet.rs`)
+    joins until the brackets balance rather than until a `)]` line; the two
+    agree on both spellings this script reads and writes.
     """
     lines = text.splitlines()
     i = 0

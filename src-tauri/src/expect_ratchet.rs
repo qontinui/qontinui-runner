@@ -93,8 +93,12 @@ mod tests {
             ],
         },
         // Plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate: the
-        // count the sweep left on both clippy legs after the arbitrary-text
-        // truncations migrated to `str_utils::truncate_str`. Only sites that
+        // count the sweep left once BOTH required clippy legs were clean —
+        // ubuntu (`--all-targets`) and `x86_64-pc-windows-msvc`, the latter
+        // completed from the `Clippy (windows)` job's own log in the SAME PR
+        // that landed the gate, so it is the initial count, not a raise —
+        // after the arbitrary-text truncations migrated to
+        // `str_utils::truncate_str`. Only sites that
         // PREDATE the gate are ever grandfathered — a site that lands after it
         // migrates instead (the lesson of qontinui-coord plan
         // 2026-09-21-coord-string-slice-sites-are-re-swept-instead-of-migrated-and-red-main-blocks-nobody).
@@ -214,15 +218,10 @@ mod tests {
         /// The attribute's LINT LIST: everything before a `reason=` key, so a
         /// lint name quoted inside some other attribute's reason text is not
         /// mistaken for a lint the attribute governs.
-        #[expect(
-            clippy::string_slice,
-            reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-        )]
         fn lint_list(&self) -> &str {
-            match self.flat.find("reason=") {
-                Some(i) => &self.flat[..i],
-                None => &self.flat,
-            }
+            self.flat
+                .split_once("reason=")
+                .map_or(self.flat.as_str(), |(list, _)| list)
         }
         /// Does the lint list name `lint` (bare name) as a whole path segment?
         fn names_lint(&self, lint: &str) -> bool {

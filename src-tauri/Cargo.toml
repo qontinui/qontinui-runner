@@ -440,7 +440,7 @@ disallowed_methods = { level = "deny", priority = 2 }
 # `lint_groups_priority` reason as `disallowed_methods` above.
 # Plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate.
 string_slice = { level = "deny", priority = 2 }
-perf ={ level = "warn", priority = 1 }
+perf = { level = "warn", priority = 1 }
 complexity = { level = "warn", priority = 0 }
 style = { level = "warn", priority = 0 }
 pedantic = { level = "allow", priority = 0 }
