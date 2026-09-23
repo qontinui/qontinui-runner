@@ -201,6 +201,10 @@ fn normalize_path_with_aliases(path: &str, aliases: &[(String, String)]) -> Stri
 /// Rewrite an MSYS/Git-Bash drive root: `/d/foo/bar` → `D:/foo/bar`,
 /// `/d` → `D:`. Anything else is returned unchanged.
 #[cfg(windows)]
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn rewrite_msys_root(path: &str) -> String {
     let b = path.as_bytes();
     if b.len() < 2 || b[0] != b'/' || !b[1].is_ascii_alphabetic() {
@@ -221,6 +225,10 @@ fn rewrite_msys_root(path: &str) -> String {
 /// One pass of subst resolution. Returns `Some(rewritten)` when `path`'s
 /// drive letter is an alias, `None` when it is not (the fixed point).
 #[cfg(windows)]
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn resolve_subst_once(path: &str, aliases: &[(String, String)]) -> Option<String> {
     let b = path.as_bytes();
     if b.len() < 2 || !b[0].is_ascii_alphabetic() || b[1] != b':' {
