@@ -6,6 +6,59 @@ import reactHooks from "eslint-plugin-react-hooks";
 import uiBridgePlugin from "@qontinui/ui-bridge-eslint-plugin";
 import globals from "globals";
 
+/**
+ * Plan `2026-08-23-single-source-derived-facts`, item 12b(b) — the
+ * rename-enforcer for the Terminal page's population names.
+ *
+ * The Terminal page counts three genuinely different populations that
+ * routinely and legitimately differ in both directions: Claude transcript
+ * sessions (machine-wide, incl. active-external ones with no tab here), open
+ * PTY panes/tabs on this page, and layout zones (CSS grid cells). No type
+ * distinguishes them — all three are `number` — so the only defence is the
+ * name. The bare `sessionCount` has named at least three of them in this tree
+ * (a status-strip gate whose input was silently re-pointed from tabs to Claude
+ * sessions; a banner fed `tabs.length` that printed "N sessions open"), so it
+ * is banned here as a DECLARED name — variable, destructured binding,
+ * parameter, object / interface / class key, or JSX prop. Reading someone
+ * else's field is not flagged; declaring one is.
+ *
+ * Deliberately narrow: this cannot catch a wrong population under a correct
+ * name (that is domain semantics no AST carries). It only refuses the name
+ * that makes the confusion free to write.
+ *
+ * Flat config REPLACES a rule's options across blocks rather than merging
+ * them, so any later block that sets `no-restricted-syntax` for files under
+ * `src/components/terminal/**` must spread `TERMINAL_POPULATION_NAME_SELECTORS`
+ * into its own list, or this guard silently switches off there.
+ */
+const BANNED_POPULATION_NAMES = "/^(sessionCount|sessionNeedsInputCount)$/";
+const POPULATION_NAME_MESSAGE =
+  "Bare `sessionCount` / `sessionNeedsInputCount` names no population. The Terminal page " +
+  "counts three that legitimately differ: Claude sessions (`claudeSessionCount`), open PTY " +
+  "panes (`openPaneCount`) and layout zones (`zoneCount`). Name the one you mean " +
+  "(plan 2026-08-23-single-source-derived-facts, item 12b).";
+const TERMINAL_POPULATION_NAME_SELECTORS = [
+  // const sessionCount = …
+  `VariableDeclarator > Identifier.id[name=${BANNED_POPULATION_NAMES}]`,
+  // const { sessionCount } = … / const { x: sessionCount } = …
+  `ObjectPattern > Property > Identifier.value[name=${BANNED_POPULATION_NAMES}]`,
+  // const [sessionCount] = …
+  `ArrayPattern > Identifier[name=${BANNED_POPULATION_NAMES}]`,
+  // function f(sessionCount) / (sessionCount = 0) => …
+  `:function > Identifier.params[name=${BANNED_POPULATION_NAMES}]`,
+  `:function > AssignmentPattern > Identifier.left[name=${BANNED_POPULATION_NAMES}]`,
+  // type-level signatures: (sessionCount: number) => void
+  `:matches(TSFunctionType, TSMethodSignature, TSDeclareFunction, TSCallSignatureDeclaration, TSConstructSignatureDeclaration) > Identifier.params[name=${BANNED_POPULATION_NAMES}]`,
+  // { sessionCount: n } / interface { sessionCount: number } / class { sessionCount = 0 }
+  // (ObjectExpression only: a destructuring key is a READ of someone else's
+  // field, and its bound name is already covered by the ObjectPattern arm.)
+  `ObjectExpression > Property > Identifier.key[name=${BANNED_POPULATION_NAMES}]`,
+  `TSPropertySignature > Identifier.key[name=${BANNED_POPULATION_NAMES}]`,
+  `PropertyDefinition > Identifier.key[name=${BANNED_POPULATION_NAMES}]`,
+  // <SessionCountBanner sessionCount={…} />
+  `JSXAttribute > JSXIdentifier.name[name=${BANNED_POPULATION_NAMES}]`,
+].map((selector) => ({ selector, message: POPULATION_NAME_MESSAGE }));
+
 export default [
   js.configs.recommended,
   {
@@ -102,6 +155,13 @@ export default [
       // resolution configuration, not a suppression list. An import it cannot
       // follow is REPORTED as unresolved, never assumed annotated.
       "@qontinui/ui-bridge/require-action-effect": ["error", { importAliases: { "@/": "src" } }],
+    },
+  },
+  {
+    // Population-name guard — see TERMINAL_POPULATION_NAME_SELECTORS above.
+    files: ["src/components/terminal/**/*.{ts,tsx}"],
+    rules: {
+      "no-restricted-syntax": ["error", ...TERMINAL_POPULATION_NAME_SELECTORS],
     },
   },
   {
