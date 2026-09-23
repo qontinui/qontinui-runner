@@ -22116,6 +22116,58 @@ mod spawn_tenant_credential_tests {
         );
     }
 
+    /// W1, the half a route test cannot reach: with the kill switch thrown, the
+    /// tenant the caller named produces a nonce that is NOT pinned to it.
+    ///
+    /// `mcp_api`'s `the_kill_switch_stops_a_named_tenant_reaching_this_doors_admission`
+    /// observes the same decision at the route (it forks on admission, the only
+    /// thing visible there without a bound port); this observes the CONSEQUENCE
+    /// on the binding, by feeding the mint exactly what the handler now feeds
+    /// it — `credential_spawn_tenant(Some(B))` — instead of `Some(B)` raw.
+    #[test]
+    fn the_kill_switch_leaves_a_named_tenants_mint_on_the_machine_pin() {
+        let amb = crate::test_env::isolated_ambient();
+        // Same reason as `a_provision_session_tenant_pins_the_minted_session_nonce`
+        // above, and it is load-bearing HERE in a way it is not there: the mint's
+        // binding is ephemeral, `live_binding` answers for one only while the
+        // opt-in marker is present, and `MARKER_OVERRIDE` is a process-global
+        // that `isolated_ambient`'s env lock does not cover. Without this guard
+        // the pin reads `Unpinned` whenever no concurrent test happens to be
+        // holding the override — and `Unpinned` SATISFIES the `assert_ne!`
+        // below, so the test would report success while observing nothing.
+        let _marker = MarkerOverride::set(true);
+        amb.write_active_tenant_id(tenant_a());
+        pair(tenant_b());
+        let wd = workdir(&amb, "w1-killswitch");
+
+        // Safe to mutate: `isolated_ambient` holds the process-wide env lock and
+        // this key is in `ambient::AMBIENT_ENV_KEYS`, so it is restored on drop.
+        std::env::set_var(SPAWN_TENANT_CREDENTIAL_ENV, "0");
+        let doc =
+            provision_session_proxy_config_at(&wd, PORT, credential_spawn_tenant(Some(tenant_b())));
+        let nonce = nonce_of(&doc);
+        assert_ne!(
+            proxy_session_pin_for_nonce(&nonce),
+            TenantPin::Pinned(tenant_b()),
+            "the switch is thrown, so the named tenant must not reach the binding"
+        );
+        assert_eq!(
+            proxy_session_pin_for_nonce(&nonce),
+            TenantPin::Pinned(tenant_a()),
+            "and what it falls back to is the MACHINE pin, not nothing"
+        );
+
+        // The same call with the switch absent still pins B — so the assertion
+        // above is about the switch, not about the fixture.
+        std::env::remove_var(SPAWN_TENANT_CREDENTIAL_ENV);
+        let doc =
+            provision_session_proxy_config_at(&wd, PORT, credential_spawn_tenant(Some(tenant_b())));
+        assert_eq!(
+            proxy_session_pin_for_nonce(&nonce_of(&doc)),
+            TenantPin::Pinned(tenant_b())
+        );
+    }
+
     /// P2 acceptance 3. `{cwd}` alone is the mint as it was before the route
     /// took a tenant: the http document shape verbatim, one ephemeral device
     /// binding, and the MACHINE's pin.
