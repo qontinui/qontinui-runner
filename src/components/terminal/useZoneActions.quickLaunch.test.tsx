@@ -45,14 +45,21 @@ function denseAssignments(ids: string[]): ZoneAssignments {
 
 /**
  * Mount the hook against `existing` tabs in `layoutId`, spawn one terminal,
- * and return every `setLayoutId` call it made.
+ * and return every `setLayoutId` call it made. Pass `ids` when `assignments`
+ * names specific tabs, so the hook sees the same tab roster the assignments
+ * describe.
  */
 async function spawnOne(
   existing: number,
   layoutId: string,
   assignments?: ZoneAssignments,
+  ids: string[] = tabIds(existing),
 ): Promise<string[]> {
-  const ids = tabIds(existing);
+  expect(ids).toHaveLength(existing);
+  if (assignments) {
+    // Every assigned tab must be one the hook is told exists.
+    for (const id of Object.values(assignments)) expect(ids).toContain(id);
+  }
   const layout = resolveLayout(layoutId, existing);
   const setLayoutId = vi.fn();
   let actions: ReturnType<typeof useZoneActions> | null = null;
@@ -136,7 +143,7 @@ describe("the assignment-scramble regression", () => {
 
   it("spawning the 12th tab keeps the tab at zone 10 at zone 10", async () => {
     // The real hook makes no layout call at all on this state...
-    expect(await spawnOne(11, "flow-grid", arranged)).toEqual([]);
+    expect(await spawnOne(11, "flow-grid", arranged, ids)).toEqual([]);
     expect(computeQuickLaunchLayoutId("flow-grid", 11, false, 12)).toBeNull();
     // ...so the flow-grid simply regrows to 12 zones and the only assignment
     // pass is the hook's reconcile, which preserves every in-range assignment.
