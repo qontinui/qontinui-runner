@@ -114,31 +114,47 @@ describe("createAndAssignTerminal — layout choice rides the canonical pickLayo
 });
 
 describe("the assignment-scramble regression", () => {
-  // 11 tabs in flow-grid with a distinctive arrangement: `t-known` parked at
-  // zone 10, zone 3 deliberately empty (a hole compaction would fill).
-  const ids = [...tabIds(10), "t-known"];
-  const arranged: ZoneAssignments = {};
-  [0, 1, 2, 4, 5, 6, 7, 8, 9].forEach((z, i) => (arranged[z] = ids[i]));
-  arranged[11] = ids[9];
-  arranged[10] = "t-known";
+  // A REAL 11-tab flow-grid state: flow-grid synthesizes exactly one zone per
+  // tab, so 11 tabs -> zones 0..10, every one occupied. The arrangement is
+  // distinctive rather than creation order: `t-known` was created FIRST but the
+  // operator parked it in the last zone (10), and everyone else shifted down.
+  const ids = ["t-known", ...tabIds(10)];
+  const arranged: ZoneAssignments = { 10: "t-known" };
+  tabIds(10).forEach((id, z) => (arranged[z] = id));
 
-  it("spawning the 12th tab keeps the tab at zone 10 at zone 10", () => {
+  it("fixture is a reachable state: 11 zones, all occupied, nothing out of range", () => {
+    const zones = resolveLayout("flow-grid", ids.length).zones.length;
+    expect(zones).toBe(11);
+    expect(
+      Object.keys(arranged)
+        .map(Number)
+        .sort((a, b) => a - b),
+    ).toEqual(Array.from({ length: 11 }, (_, z) => z));
+    // Reconcile at the current zone count is a no-op: this is a settled state.
+    expect(reconcileAssignments(arranged, ids, zones)).toBe(arranged);
+  });
+
+  it("spawning the 12th tab keeps the tab at zone 10 at zone 10", async () => {
+    // The real hook makes no layout call at all on this state...
+    expect(await spawnOne(11, "flow-grid", arranged)).toEqual([]);
+    expect(computeQuickLaunchLayoutId("flow-grid", 11, false, 12)).toBeNull();
+    // ...so the flow-grid simply regrows to 12 zones and the only assignment
+    // pass is the hook's reconcile, which preserves every in-range assignment.
     const withNew = [...ids, "t-new"];
-    // The quick-launch decision no longer shrinks the layout...
-    expect(computeQuickLaunchLayoutId("flow-grid", 11, true, 12)).toBeNull();
-    // ...so the only assignment pass is the hook's reconcile at the grown
-    // zone count, which preserves every in-range assignment.
-    const next = reconcileAssignments(arranged, withNew, 12);
+    const grownZones = resolveLayout("flow-grid", withNew.length).zones.length;
+    expect(grownZones).toBe(12);
+    const next = reconcileAssignments(arranged, withNew, grownZones);
     expect(next[10]).toBe("t-known");
-    // The new tab lands in the hole, not on top of anyone.
-    expect(next[3]).toBe("t-new");
+    // The new tab lands in the new zone, not on top of anyone.
+    expect(next[11]).toBe("t-new");
+    for (let z = 0; z < 10; z++) expect(next[z]).toBe(arranged[z]);
   });
 
   it("anti-vacuity: the old shrink path WOULD have moved it", () => {
-    // What `setLayoutId("full-grid")` fed `applyLayoutAssignments` before the
-    // fix. Zones 9-11 do not exist in a 9-zone layout: their tabs overflow into
-    // the lowest holes (here only zone 3), and whatever does not fit is left
-    // unzoned — `t-known` loses zone 10 either way. That is the scramble.
+    // What the inline ladder's `setLayoutId("full-grid")` fed
+    // `applyLayoutAssignments` before the fix: zones 9 and 10 do not exist in
+    // a 9-zone layout and there is no hole to compact into, so `t-known` is
+    // left unzoned — it loses zone 10. That is the scramble.
     const shrunk = applyLayoutAssignments(arranged, ids, 9);
     expect(shrunk[10]).toBeUndefined();
     expect(Object.values(shrunk)).not.toContain("t-known");
@@ -147,8 +163,9 @@ describe("the assignment-scramble regression", () => {
 
 describe("computeQuickLaunchLayoutId — grow-only", () => {
   it("never returns a layout with fewer zones than the current one", () => {
-    // Every zone of a 9-zone full-grid occupied by 3 stale assignments' worth
-    // of tabs: pickLayout(4) is quad (4 zones) — a shrink, refused.
+    // A full-grid (9 zones) with no empty zone but only 4 tabs after the spawn
+    // (e.g. assignments not yet reconciled after closes): pickLayout(4) is
+    // quad (4 zones) — a shrink, refused.
     expect(computeQuickLaunchLayoutId("full-grid", 9, false, 4)).toBeNull();
   });
 });
