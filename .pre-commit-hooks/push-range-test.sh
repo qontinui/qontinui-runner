@@ -998,6 +998,24 @@ git -C "$WORK" commit --quiet -m "add a page under the embedded directory"
 run_prepush
 check "adding a file under an include_dir! tree -> gate ATTEMPTED" "yes" "$(cargo_ran)"
 
+# An embed spelling the deriver cannot read (a raw string) makes the input set
+# UNKNOWN. UNKNOWN must run the gate, never skip it: deleting the file that
+# raw-string embed names is a compile error the scoped diff cannot see.
+embed_fixture
+printf 'const RAW: &str = include_str!(r"../../docs/raw.md");\n' >> "$WORK/src-tauri/src/embed.rs"
+printf '# raw\n' > "$WORK/docs/raw.md"
+git -C "$WORK" add -A >/dev/null
+git -C "$WORK" commit --quiet -m "add an embed spelling the deriver cannot read"
+git -C "$WORK" update-ref refs/remotes/origin/main HEAD
+git -C "$WORK" rm --quiet docs/raw.md
+git -C "$WORK" commit --quiet -m "delete the raw-string embed target"
+run_prepush
+check "unreadable embed spelling (UNKNOWN input set) -> gate ATTEMPTED" "yes" "$(cargo_ran)"
+case "$HOOK_OUT" in
+    *"could not tell which files outside src-tauri/"*) pass_note "and it names the UNKNOWN as the reason" ;;
+    *) fail_note "expected the UNKNOWN-input-set note, got: $HOOK_OUT" ;;
+esac
+
 echo
 if [ "$SKIP" -gt 0 ]; then
     printf '%d passed, %d failed, %d SKIPPED (arms not exercised in this environment)\n' \

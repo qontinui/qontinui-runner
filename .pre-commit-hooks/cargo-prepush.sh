@@ -117,7 +117,11 @@ if [[ -f "$PUSH_RANGE_LIB" && -f "$CRATE_INPUTS_LIB" ]]; then
       # ONE call: `crate_input_paths` leaves the embed subset in
       # CRATE_INPUT_EMBEDS, so the excuse predicate below does not pay a second
       # `git grep` over the same tip.
-      if inputs_out="$(crate_input_paths "$ROOT" "$_tip"; printf '\034%s' "$CRATE_INPUT_EMBEDS")"; then
+      # `&&`, never `;`: a command substitution's status is its LAST command's,
+      # so `crate_input_paths …; printf …` returned printf's 0 and silently
+      # discarded an UNKNOWN (rc 1) — the hook then skipped cargo on a range
+      # it could not scope, the false skip this gate exists to prevent.
+      if inputs_out="$(crate_input_paths "$ROOT" "$_tip" && printf '\034%s' "$CRATE_INPUT_EMBEDS")"; then
         embeds_out="${inputs_out#*$'\034'}"
         inputs_out="${inputs_out%%$'\034'*}"
         while IFS= read -r _line; do
