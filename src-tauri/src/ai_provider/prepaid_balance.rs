@@ -106,7 +106,9 @@ pub(crate) fn decimal_str_to_micros(s: &str) -> Option<i64> {
     if int_part.is_empty() && frac_part.is_empty() {
         return None;
     }
-    if !int_part.bytes().all(|b| b.is_ascii_digit()) || !frac_part.bytes().all(|b| b.is_ascii_digit()) {
+    if !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    {
         return None;
     }
     // Precision beyond 1e-6 is accepted only when it carries no value.
@@ -114,8 +116,16 @@ pub(crate) fn decimal_str_to_micros(s: &str) -> Option<i64> {
     if dropped.bytes().any(|b| b != b'0') {
         return None;
     }
-    let int_val: i64 = if int_part.is_empty() { 0 } else { int_part.parse().ok()? };
-    let mut frac_val: i64 = if kept.is_empty() { 0 } else { kept.parse().ok()? };
+    let int_val: i64 = if int_part.is_empty() {
+        0
+    } else {
+        int_part.parse().ok()?
+    };
+    let mut frac_val: i64 = if kept.is_empty() {
+        0
+    } else {
+        kept.parse().ok()?
+    };
     for _ in kept.len()..6 {
         frac_val = frac_val.checked_mul(10)?;
     }
@@ -511,7 +521,11 @@ mod tests {
         // `(x * 1e6) as i64` yields 8_199_999 — a lost micro. The string path
         // must not.
         assert_eq!(decimal_str_to_micros("8.2"), Some(8_200_000));
-        assert_ne!((8.2_f64 * 1e6) as i64, 8_200_000, "premise: the f64 path is lossy");
+        assert_ne!(
+            (8.2_f64 * 1e6) as i64,
+            8_200_000,
+            "premise: the f64 path is lossy"
+        );
         assert_eq!(decimal_str_to_micros("4.35"), Some(4_350_000));
         assert_eq!(decimal_str_to_micros("7"), Some(7_000_000));
         assert_eq!(decimal_str_to_micros(".5"), Some(500_000));
@@ -532,8 +546,12 @@ mod tests {
     /// twins stay off it (they are the coord wire's, not this route's).
     #[test]
     fn error_row_serializes_nulls_and_hides_micros() {
-        let v = serde_json::to_value(PrepaidBalanceInfo::error("deepseek", "DeepSeek", "x".into()))
-            .expect("serializes");
+        let v = serde_json::to_value(PrepaidBalanceInfo::error(
+            "deepseek",
+            "DeepSeek",
+            "x".into(),
+        ))
+        .expect("serializes");
         assert!(v["balance"].is_null());
         assert!(v["currency"].is_null());
         assert!(v["is_available"].is_null());

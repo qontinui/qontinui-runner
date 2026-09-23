@@ -1763,13 +1763,24 @@ mod usage_twin_report {
             };
             let v = serde_json::to_value(&body).expect("serializes");
             let p = &v["prepaid"][0];
-            let mut keys: Vec<&str> = p.as_object().expect("object").keys().map(String::as_str).collect();
+            let mut keys: Vec<&str> = p
+                .as_object()
+                .expect("object")
+                .keys()
+                .map(String::as_str)
+                .collect();
             keys.sort_unstable();
             assert_eq!(
                 keys,
                 vec![
-                    "balance_micros", "currency", "error", "granted_micros",
-                    "is_available", "label", "provider", "topped_up_micros",
+                    "balance_micros",
+                    "currency",
+                    "error",
+                    "granted_micros",
+                    "is_available",
+                    "label",
+                    "provider",
+                    "topped_up_micros",
                 ]
             );
             assert_eq!(p["provider"], serde_json::json!("deepseek"));
@@ -1793,8 +1804,18 @@ mod usage_twin_report {
             );
             let v = serde_json::to_value(WirePrepaid::from_info(&info)).expect("serializes");
             assert_eq!(v["error"], serde_json::json!("API error (401)"));
-            for k in ["balance_micros", "granted_micros", "topped_up_micros", "is_available", "currency"] {
-                assert!(v[k].is_null(), "{k} must be null on an errored probe, got {}", v[k]);
+            for k in [
+                "balance_micros",
+                "granted_micros",
+                "topped_up_micros",
+                "is_available",
+                "currency",
+            ] {
+                assert!(
+                    v[k].is_null(),
+                    "{k} must be null on an errored probe, got {}",
+                    v[k]
+                );
             }
         }
     }
