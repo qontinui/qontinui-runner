@@ -34,9 +34,20 @@ import type {
 import { ISSUE_CATEGORIES, ISSUE_SEVERITIES } from "@qontinui/shared-types";
 import { useDiscoveredSpecs } from "@/lib/ui-bridge/use-discovered-specs";
 import { SEVERITY_STYLES, CATEGORY_STYLES, STATUS_STYLES } from "./issue-styles";
-import { computeIssueHeaderStats, type IssueStatusFilter } from "./issueHeaderStats";
+import {
+  computeIssueHeaderStats,
+  type IssueStatusFilter,
+  type LoadedIssueFilters,
+} from "./issueHeaderStats";
 
 type StatusFilter = IssueStatusFilter;
+
+/** Filter values at mount — seeds both the controls and `loadedFilters`. */
+const DEFAULT_ISSUE_FILTERS: LoadedIssueFilters = {
+  status: "active",
+  category: "all",
+  severity: "all",
+};
 
 // ============================================================================
 // Badge & ConfidenceBar
@@ -435,12 +446,20 @@ function CreateIssueForm({
 
 export function GlobalIssuesPanel() {
   const [issues, setIssues] = useState<KnownIssue[]>([]);
+  // The server-side filters `issues` was ACTUALLY fetched with. The filter
+  // controls change immediately, but `issues` keeps the previous result until
+  // the refetch lands (or for good, if it fails) — so the header must label the
+  // loaded population by these, never by the live control values.
+  const [loadedFilters, setLoadedFilters] = useState<LoadedIssueFilters>(DEFAULT_ISSUE_FILTERS);
+  // Monotonic request id: a slower, older response must not overwrite a newer
+  // one (which would pair stale rows with the newer label, or vice versa).
+  const loadSeqRef = useRef(0);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>("active");
-  const [categoryFilter, setCategoryFilter] = useState<string>("all");
-  const [severityFilter, setSeverityFilter] = useState<string>("all");
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>(DEFAULT_ISSUE_FILTERS.status);
+  const [categoryFilter, setCategoryFilter] = useState<string>(DEFAULT_ISSUE_FILTERS.category);
+  const [severityFilter, setSeverityFilter] = useState<string>(DEFAULT_ISSUE_FILTERS.severity);
   const [searchQuery, setSearchQuery] = useState("");
 
   const [showForm, setShowForm] = useState(false);
@@ -452,20 +471,30 @@ export function GlobalIssuesPanel() {
   // ------ Data loading ------
 
   const loadIssues = useCallback(async () => {
+    const seq = ++loadSeqRef.current;
+    const requested: LoadedIssueFilters = {
+      status: statusFilter,
+      category: categoryFilter,
+      severity: severityFilter,
+    };
     setIsLoading(true);
     setError(null);
     try {
       const query: ListKnownIssuesQuery = {};
-      if (statusFilter !== "all") query.status = statusFilter;
-      if (categoryFilter !== "all") query.category = categoryFilter;
-      if (severityFilter !== "all") query.severity = severityFilter;
+      if (requested.status !== "all") query.status = requested.status;
+      if (requested.category !== "all") query.category = requested.category;
+      if (requested.severity !== "all") query.severity = requested.severity;
 
       const result = await invoke<KnownIssue[]>("list_known_issues", { query });
+      if (seq !== loadSeqRef.current) return;
+      // Rows and the filters they were fetched with move TOGETHER.
       setIssues(result);
+      setLoadedFilters(requested);
     } catch (err) {
+      if (seq !== loadSeqRef.current) return;
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setIsLoading(false);
+      if (seq === loadSeqRef.current) setIsLoading(false);
     }
   }, [statusFilter, categoryFilter, severityFilter]);
 
@@ -517,14 +546,8 @@ export function GlobalIssuesPanel() {
   // Every header number describes the list below it and names its
   // population — see `computeIssueHeaderStats`.
   const stats = useMemo(
-    () =>
-      computeIssueHeaderStats(issues, filteredIssues, {
-        status: statusFilter,
-        category: categoryFilter,
-        severity: severityFilter,
-        searchQuery,
-      }),
-    [issues, filteredIssues, statusFilter, categoryFilter, severityFilter, searchQuery],
+    () => computeIssueHeaderStats(issues, filteredIssues, { ...loadedFilters, searchQuery }),
+    [issues, filteredIssues, loadedFilters, searchQuery],
   );
 
   // ------ Actions ------

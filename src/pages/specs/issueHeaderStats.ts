@@ -18,10 +18,20 @@
 
 export type IssueStatusFilter = "all" | "active" | "resolved" | "monitoring";
 
-export interface IssueHeaderFilters {
+/**
+ * The server-side filters a set of issues was FETCHED with. The header labels
+ * by these, not by the live filter controls: after a filter change the loaded
+ * rows still belong to the previous filter until the refetch lands (or
+ * indefinitely, if it fails), and labelling them with the new filter would
+ * mis-state their population.
+ */
+export interface LoadedIssueFilters {
   status: IssueStatusFilter;
   category: string;
   severity: string;
+}
+
+export interface IssueHeaderFilters extends LoadedIssueFilters {
   searchQuery: string;
 }
 
@@ -58,6 +68,8 @@ function statusPopulationLabel(status: IssueStatusFilter): string {
 export function computeIssueHeaderStats(
   fetched: readonly IssueLike[],
   shown: readonly IssueLike[],
+  /** `status`/`category`/`severity` must be the filters `fetched` was loaded
+   *  with (see {@link LoadedIssueFilters}); `searchQuery` is the live box. */
   filters: IssueHeaderFilters,
 ): IssueHeaderStats {
   const searchActive = filters.searchQuery.trim().length > 0;
