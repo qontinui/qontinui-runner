@@ -20,21 +20,21 @@ function s(liveStatus: StatusCountsInput["liveStatus"], isOrphaned = false): Sta
 describe("computeStatusCounts", () => {
   it("excludes a dormant session from the total and from idle", () => {
     const counts = computeStatusCounts([s("dormant")]);
-    expect(counts.sessionCount).toBe(0);
+    expect(counts.claudeSessionCount).toBe(0);
     expect(counts.idleCount).toBe(0);
     expect(counts.workingCount).toBe(0);
   });
 
   it("excludes an orphaned (tab-less) frozen transcript", () => {
     const counts = computeStatusCounts([s("frozen", /* isOrphaned */ true)]);
-    expect(counts.sessionCount).toBe(0);
+    expect(counts.claudeSessionCount).toBe(0);
     expect(counts.idleCount).toBe(0);
   });
 
   it("counts a tab-backed (non-orphan) frozen session as idle", () => {
     const counts = computeStatusCounts([s("frozen", /* isOrphaned */ false)]);
     expect(counts.idleCount).toBe(1);
-    expect(counts.sessionCount).toBe(1);
+    expect(counts.claudeSessionCount).toBe(1);
     expect(counts.workingCount).toBe(0);
   });
 
@@ -42,13 +42,13 @@ describe("computeStatusCounts", () => {
     const counts = computeStatusCounts([s("active-in-zone"), s("active-external")]);
     expect(counts.workingCount).toBe(2);
     expect(counts.idleCount).toBe(0);
-    expect(counts.sessionCount).toBe(2);
+    expect(counts.claudeSessionCount).toBe(2);
   });
 
   it("counts needs-input toward need-input and the total", () => {
     const counts = computeStatusCounts([s("needs-input")]);
     // needs-input survives the dormant/orphan filter → contributes to the total
-    expect(counts.sessionCount).toBe(1);
+    expect(counts.claudeSessionCount).toBe(1);
     expect(counts.workingCount).toBe(0);
     expect(counts.idleCount).toBe(0);
   });
@@ -57,7 +57,7 @@ describe("computeStatusCounts", () => {
     const counts = computeStatusCounts([s("error"), s("completed")]);
     expect(counts.errorCount).toBe(1);
     expect(counts.completedCount).toBe(1);
-    expect(counts.sessionCount).toBe(2);
+    expect(counts.claudeSessionCount).toBe(2);
   });
 
   it("operator's exact scenario: 1 working + 2 idle + N historical ⇒ total=3", () => {
@@ -77,22 +77,19 @@ describe("computeStatusCounts", () => {
       s("frozen", /* isOrphaned */ true),
     ];
     const counts = computeStatusCounts(sessions);
-    expect(counts.sessionCount).toBe(3);
+    expect(counts.claudeSessionCount).toBe(3);
     expect(counts.workingCount).toBe(1);
     expect(counts.idleCount).toBe(2);
     // 0 needs-input in this scenario; total must reconcile with the pills.
-    expect(
-      counts.workingCount +
-        counts.idleCount +
-        counts.completedCount +
-        counts.errorCount,
-    ).toBe(counts.sessionCount);
+    expect(counts.workingCount + counts.idleCount + counts.completedCount + counts.errorCount).toBe(
+      counts.claudeSessionCount,
+    );
   });
 
   it("returns all-zero for an empty session list", () => {
     const counts = computeStatusCounts([]);
     expect(counts).toEqual({
-      sessionCount: 0,
+      claudeSessionCount: 0,
       workingCount: 0,
       idleCount: 0,
       completedCount: 0,

@@ -489,8 +489,9 @@ function ZoneGridInner({
     return () => clearInterval(interval);
   }, []);
 
-  const isMultiZone = layout.zones.length > 1;
-  const showLabels = isMultiZone;
+  // `zoneLayout.isMultiZone` is the ONE multi-zone definition
+  // (`useZoneLayout`); this file used to carry an inline copy of it.
+  const showLabels = zoneLayout.isMultiZone;
   const autoCompact = false;
   const forceCompact = viewMode === "compact";
 
@@ -781,7 +782,7 @@ function ZoneGridInner({
           onCancelRestart={onCancelRestart}
           isDropTarget={gridState.dropTargetZone === zoneIdx}
           showLabels={showLabels}
-          isMultiZone={isMultiZone}
+          isMultiZone={zoneLayout.isMultiZone}
           autoCompact={autoCompact}
           forceCompact={forceCompact}
           showFilterInput={gridState.showFilterInput}
