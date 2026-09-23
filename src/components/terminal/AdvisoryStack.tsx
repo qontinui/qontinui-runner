@@ -14,11 +14,16 @@
  *
  * `AdvisoryStackProvider` mounts ONE `position: fixed` container near the
  * app root; `AdvisorySlot` portals a banner's content into it from wherever
- * that banner actually lives in the tree, so the five stay unaware of each
+ * that banner actually lives in the tree, so its users stay unaware of each
  * other while never sharing a corner unstacked. `fixed` rather than
  * `absolute`: the slots live in different positioned ancestors, and a
  * viewport anchor is the only one all of them agree on regardless of which
  * container they render from.
+ *
+ * A sixth banner, `DeconflictAdvisoryBanner`, joined as a #1683 follow-up —
+ * it wasn't one of the five c91550f0 originally named, but it shares the
+ * same top-right corner and the same failure mode, so it gets the same
+ * guarantee.
  *
  * The container anchors at `top-20`, not `top-2`: unlike the `absolute`
  * positioning it replaced (which was relative to `App.tsx`'s `<main>`, itself

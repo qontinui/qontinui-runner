@@ -1671,8 +1671,12 @@ function TerminalPageInner({
                 emergent-task wiring (the `create_emergent_task` calls in
                 `commands/ai_session.rs` and `mcp/ai_session.rs`) ensures
                 every AI tab has one.
-                Lives below the lock-yield banners by document order so
-                they stack instead of overlapping. */}
+                Renders here in local document order, but that no longer
+                determines its stacking position: as of the #1683 follow-up
+                it portals into `AdvisoryStack`'s shared fixed container via
+                `AdvisorySlot`, the same as the lock-yield banners above, so
+                it never overlaps them regardless of where in this tree it's
+                declared. */}
             {activeTab?.claudeSessionId && (
               <DeconflictAdvisoryBanner taskRunId={activeTab.claudeSessionId} />
             )}
