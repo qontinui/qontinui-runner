@@ -1404,7 +1404,14 @@ pub struct TerminalSession {
     /// registration completes; cloned into the waiter at spawn time.
     /// Idempotent against the frontend `terminal_close` path because
     /// `SessionRegistry::close` is itself idempotent.
-    on_exit: Arc<Mutex<Option<Box<dyn Fn(uuid::Uuid) + Send + Sync>>>>,
+    /// Widened from `Fn(uuid::Uuid)` to also carry the exit code (plan
+    /// `2026-08-27-operator-touch-observation-runner-emitter` §2b/§2c,
+    /// Phase B2): the coord-close callback still receives the coord session
+    /// id, and now also the PTY's real exit code (recovered by the §2b
+    /// `pane_io` fix), which the `session_exit` operator-touch trigger needs
+    /// and which the low-level waiter thread has no other route to hand to
+    /// its callers.
+    on_exit: Arc<Mutex<Option<Box<dyn Fn(uuid::Uuid, Option<i32>) + Send + Sync>>>>,
     /// Phase 2 of `plans/2026-05-28-isolate-session-edit-work-in-worktrees.md`.
     /// When the session declared edit intent on a registered repo and
     /// `worktree_mode_enabled()` was true at spawn time, this carries
@@ -2154,7 +2161,7 @@ impl TerminalSession {
         // so the waiter reads them at exit time rather than capturing a
         // value that isn't known yet at spawn. (`coord_session_id` itself is
         // declared above the reader thread, which also needs a clone of it.)
-        let on_exit: Arc<Mutex<Option<Box<dyn Fn(uuid::Uuid) + Send + Sync>>>> =
+        let on_exit: Arc<Mutex<Option<Box<dyn Fn(uuid::Uuid, Option<i32>) + Send + Sync>>>> =
             Arc::new(Mutex::new(None));
 
         // Spawn waiter thread: detects process exit
@@ -2229,7 +2236,7 @@ impl TerminalSession {
                                 coord_session = %coord_id,
                                 "terminal exit — closing coord session mirror"
                             );
-                            cb(coord_id);
+                            cb(coord_id, code);
                         }
                     }
                 }
@@ -4031,8 +4038,12 @@ impl TerminalSession {
     /// (the runner no longer self-closes abandoned sessions; coord_sync A3).
     /// The callback receives the coord session id and must be idempotent
     /// (it shares the close path with the frontend `terminal_close`
-    /// command — `SessionRegistry::close_by_id` is already idempotent).
-    pub fn set_on_exit(&self, hook: Box<dyn Fn(uuid::Uuid) + Send + Sync>) {
+    /// command — `SessionRegistry::close_by_id` is already idempotent). It
+    /// also receives the PTY's real exit code (plan
+    /// `2026-08-27-operator-touch-observation-runner-emitter` §2b/§2c) —
+    /// `None` when the waiter itself failed to observe a status, never a
+    /// synthesized value.
+    pub fn set_on_exit(&self, hook: Box<dyn Fn(uuid::Uuid, Option<i32>) + Send + Sync>) {
         if let Ok(mut slot) = self.on_exit.lock() {
             *slot = Some(hook);
         }
