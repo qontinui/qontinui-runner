@@ -632,6 +632,10 @@ async fn run_manifest_only(cwd: &Path, entry: &Path) -> Result<String, RegistryE
     }
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
@@ -834,5 +838,37 @@ mod tests {
             .filter(|n| n != INDEX_FILE)
             .collect();
         assert!(debris.is_empty(), "temp files left behind: {debris:?}");
+    }
+
+    /// `Wrapper` has no `#[serde(rename_all = "camelCase")]`, so `GET
+    /// /wrappers` and `GET /wrappers/:id` serialize it snake_case. TS
+    /// `InstalledWrapper` (src/lib/wrappers/types.ts) must mirror that exact
+    /// shape — plan 2026-08-23-single-source-derived-facts follow-up: the
+    /// mismatch left `packageName`/`installPath`/`installedAt`/`updatedAt`
+    /// always `undefined` at runtime, so installed-wrapper package names
+    /// rendered blank.
+    #[test]
+    fn wrapper_wire_shape_matches_the_ts_mirror() {
+        let json = serde_json::to_value(synthetic_wrapper("w", 1)).unwrap();
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "actions",
+                "id",
+                "install_path",
+                "installed_at",
+                "manifest",
+                "package_name",
+                "updated_at",
+                "version",
+            ]
+        );
     }
 }

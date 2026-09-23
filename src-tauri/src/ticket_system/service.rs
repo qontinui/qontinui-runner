@@ -192,6 +192,10 @@ async fn poll_and_sync(
     Ok(())
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 async fn create_task_from_ticket(
     pg_db: &Arc<PgDb>,
     ticket: &Ticket,

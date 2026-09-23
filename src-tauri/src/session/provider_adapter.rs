@@ -44,6 +44,73 @@ pub enum RestoreTier {
     TerminalOnly,
 }
 
+/// The two spellings of the SAME "restorable-at" concept, and the one place
+/// that converts between them (plan `2026-08-23-single-source-derived-facts`,
+/// item 1 step 4 — the vocabulary fork).
+///
+/// - The **coord wire** spelling (`"full"` / `"terminal_only"`, underscore) is
+///   what the `restore-record` session event carries in `restore_tier`
+///   (`restore_record_emitter`) and what a peer's `handoff` parses back. It is
+///   stored verbatim in `coord.session_events`, so it is a binding contract and
+///   does not change.
+/// - The **frontend** spelling (`"full"` / `"terminal-only"`, hyphen) is the TS
+///   `RestoreTier` union in `src/components/terminal/providerAdapter.ts`, and the
+///   `"terminal-only"` arm of `classifyRestoreAction`'s `RestoreAction`.
+///
+/// In production Rust code the RESTORE-TIER wire vocabulary is written only
+/// here: the emitter's `TIER_FULL` / `TIER_TERMINAL_ONLY` are const-derived
+/// from [`RestoreTier::wire_str`], and `handoff` parses a peer's payload with
+/// [`RestoreTier::from_wire_str`] — so the underscore/hyphen fork is an
+/// explicit conversion at a named seam rather than two literals that happen to
+/// disagree. (Doc comments and test fixtures still quote the literals; the
+/// lifecycle store's `"terminal-only"` is the outcome vocabulary below, a
+/// different concept that happens to share the frontend spelling.) The
+/// cross-seam fixture
+/// (`src/components/terminal/__fixtures__/restore-tier-crossproduct.json`)
+/// carries both spellings per row and both test suites read it.
+///
+/// NOT the same concept as the lifecycle store's `RESTORE_TIER_RESUMED` /
+/// `RESTORE_TIER_TERMINAL_ONLY` / `RESTORE_TIER_FAILED`: those record what
+/// HAPPENED when a restore was attempted, not what a record is restorable AT.
+impl RestoreTier {
+    /// The coord wire spelling (`restore-record` event `restore_tier`).
+    pub const fn wire_str(self) -> &'static str {
+        match self {
+            RestoreTier::Full => "full",
+            RestoreTier::TerminalOnly => "terminal_only",
+        }
+    }
+
+    /// Parse the coord wire spelling. `None` for anything else — including the
+    /// frontend's hyphenated `"terminal-only"`, which is a different vocabulary
+    /// and must be converted with [`RestoreTier::from_frontend_str`].
+    pub fn from_wire_str(s: &str) -> Option<Self> {
+        match s {
+            "full" => Some(RestoreTier::Full),
+            "terminal_only" => Some(RestoreTier::TerminalOnly),
+            _ => None,
+        }
+    }
+
+    /// The frontend spelling (TS `RestoreTier` in `providerAdapter.ts`).
+    pub const fn frontend_str(self) -> &'static str {
+        match self {
+            RestoreTier::Full => "full",
+            RestoreTier::TerminalOnly => "terminal-only",
+        }
+    }
+
+    /// Parse the frontend spelling. `None` for anything else — including the
+    /// wire's underscored `"terminal_only"`.
+    pub fn from_frontend_str(s: &str) -> Option<Self> {
+        match s {
+            "full" => Some(RestoreTier::Full),
+            "terminal-only" => Some(RestoreTier::TerminalOnly),
+            _ => None,
+        }
+    }
+}
+
 /// The spawn recipe an adapter produces so the runner can launch the provider
 /// with a KNOWN-up-front session id (plan §4 `launch_with_identity`). The
 /// runner injects `env` into the PTY child, runs `argv`, and records
@@ -87,19 +154,6 @@ pub enum DeliverySpec {
     None,
 }
 
-/// The handshake/failure pattern sets a provider's resume produces, consumed
-/// by `resumeVerification` (plan §4 `resume_handshake_patterns`). Patterns are
-/// plain substrings matched against ANSI-stripped terminal output.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct HandshakePatterns {
-    /// Substrings whose presence confirms the resume landed (the conversation
-    /// re-opened).
-    pub success: Vec<String>,
-    /// Substrings whose presence means the resume FAILED (id not found,
-    /// expired, picker error) — drives the `ResumeFailedBanner`.
-    pub failure: Vec<String>,
-}
-
 /// One provider's session-management contract. Implemented once per provider.
 /// Phase 1 ships the trait + the registry seam; Phase 2 fills the Claude impl.
 pub trait SessionProviderAdapter: Send + Sync {
@@ -124,9 +178,6 @@ pub trait SessionProviderAdapter: Send + Sync {
     /// `CLAUDE_CONFIG_DIR`; Gemini `HOME`/project separation.
     fn account_isolation(&self, account: Option<&str>) -> BTreeMap<String, String>;
 
-    /// Success/failure handshake patterns for `resumeVerification` (plan §4).
-    fn resume_handshake_patterns(&self) -> HandshakePatterns;
-
     /// Declared restore capability for honest UX (plan §4).
     fn restore_tier(&self) -> RestoreTier;
 }
@@ -134,8 +185,15 @@ pub trait SessionProviderAdapter: Send + Sync {
 /// The Claude reference adapter — Phase 1 PLACEHOLDER. The trait surface
 /// compiles and returns sensible defaults; **Phase 2 fills the resume/hook
 /// bodies** (move `aiLaunchCommand.ts`'s `--session-id` logic behind
-/// `launch_with_identity`, ship the bundled `--settings` hook, wire the
-/// handshake patterns from `resumeVerification.ts`). No path here panics.
+/// `launch_with_identity`, ship the bundled `--settings` hook). No path here
+/// panics.
+///
+/// Resume handshake/failure markers are deliberately NOT part of this trait:
+/// the only consumer is the frontend's `resumeVerification.ts`, and their
+/// single home is `src/components/terminal/providerAdapter.ts`. A Rust copy
+/// existed here with no production caller and was deleted (plan
+/// 2026-08-23-single-source-derived-facts item 9) — re-add one only with a
+/// real caller and a cross-language drift guard.
 pub struct ClaudeAdapter;
 
 impl SessionProviderAdapter for ClaudeAdapter {
@@ -215,33 +273,6 @@ impl SessionProviderAdapter for ClaudeAdapter {
         env
     }
 
-    fn resume_handshake_patterns(&self) -> HandshakePatterns {
-        // Mirror of `resumeVerification.ts` — the SUCCESS set is the Claude TUI
-        // handshake markers (the CLI took over the terminal); the FAILURE set is
-        // definitive "the requested session did NOT resume" evidence (unknown id
-        // / fell through to the session picker), checked BEFORE success since a
-        // failure dialog is itself Claude UI. Plain substrings matched against
-        // ANSI-stripped output (the TS uses regexes; these are the literal
-        // substrings those regexes key on, since the trait contract is
-        // substring-based).
-        HandshakePatterns {
-            success: vec![
-                "? for shortcuts".to_string(),  // status-line hint under the input box
-                "esc to interrupt".to_string(), // shown while Claude is working
-                "bypass permissions".to_string(), // permission-mode indicator
-                "Welcome to Claude".to_string(), // launch banner
-                "Welcome back to Claude".to_string(), // resumed-banner variant
-            ],
-            failure: vec![
-                "No conversation found".to_string(), // `--resume <unknown-id>` error
-                "No conversations found".to_string(), // empty-history variant
-                "No conversations to resume".to_string(),
-                "Select a session to resume".to_string(), // interactive picker frame
-                "Select a conversation to resume".to_string(),
-            ],
-        }
-    }
-
     fn restore_tier(&self) -> RestoreTier {
         RestoreTier::Full
     }
@@ -263,6 +294,30 @@ pub fn adapter_for(provider: &str) -> Box<dyn SessionProviderAdapter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_tier_spellings_round_trip_and_do_not_cross() {
+        for tier in [RestoreTier::Full, RestoreTier::TerminalOnly] {
+            assert_eq!(RestoreTier::from_wire_str(tier.wire_str()), Some(tier));
+            assert_eq!(
+                RestoreTier::from_frontend_str(tier.frontend_str()),
+                Some(tier)
+            );
+        }
+        // The pinned literals: the wire value is a stored coord contract, the
+        // frontend value is the TS union — a change to either is a contract
+        // change, not a refactor.
+        assert_eq!(RestoreTier::TerminalOnly.wire_str(), "terminal_only");
+        assert_eq!(RestoreTier::TerminalOnly.frontend_str(), "terminal-only");
+        assert_eq!(RestoreTier::Full.wire_str(), "full");
+        assert_eq!(RestoreTier::Full.frontend_str(), "full");
+        // The two vocabularies do not silently accept each other's spelling —
+        // that acceptance is exactly the unconverted seam this API replaces.
+        assert_eq!(RestoreTier::from_wire_str("terminal-only"), None);
+        assert_eq!(RestoreTier::from_frontend_str("terminal_only"), None);
+        assert_eq!(RestoreTier::from_wire_str(""), None);
+        assert_eq!(RestoreTier::from_wire_str("FULL"), None);
+    }
 
     #[test]
     fn adapter_for_resolves_claude_and_defaults_unknown() {
@@ -307,15 +362,6 @@ mod tests {
             a.account_isolation(Some("C:/cfg")).get("CLAUDE_CONFIG_DIR"),
             Some(&"C:/cfg".to_string())
         );
-
-        // resume_handshake_patterns ports the real sets from resumeVerification.ts
-        // (non-empty success + failure; failure is checked first by consumers).
-        let hp = a.resume_handshake_patterns();
-        assert!(hp.success.iter().any(|s| s.contains("for shortcuts")));
-        assert!(hp
-            .failure
-            .iter()
-            .any(|s| s.contains("No conversation found")));
     }
 
     #[test]

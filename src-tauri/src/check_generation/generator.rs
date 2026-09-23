@@ -317,6 +317,10 @@ fn parse_ai_response(
 }
 
 /// Extract JSON array from response that might be wrapped in markdown
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_json_array(response: &str) -> Result<String, String> {
     let response = response.trim();
 

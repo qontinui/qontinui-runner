@@ -119,6 +119,10 @@ fn walk(dir: &Path, files: &mut Vec<PathBuf>) {
 ///   - the function body text (naive brace-balancing)
 ///
 /// Returns `Vec<(name, body)>` for all **sync** tauri commands in the file.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_sync_tauri_commands(source: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let bytes = source.as_bytes();
@@ -213,6 +217,10 @@ fn extract_sync_tauri_commands(source: &str) -> Vec<(String, String)> {
     out
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn strip_line_comments(body: &str) -> String {
     body.lines()
         .map(|line| match line.find("//") {

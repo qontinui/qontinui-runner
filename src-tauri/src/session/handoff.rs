@@ -126,7 +126,9 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::intent::Intent;
-use super::restore_record_emitter::{RESTORE_RECORD_EVENT, TIER_FULL};
+use super::provider_adapter::RestoreTier;
+use super::restore_record_emitter::{RESTORE_RECORD_EVENT, TIER_FULL, TIER_TERMINAL_ONLY};
+use super::session_id::is_valid_session_id;
 use super::session_lifecycle_store::{
     SessionLifecycleStore, TerminalSessionRecord, DEFAULT_PROVIDER, ORIGIN_AUTHORITATIVE,
 };
@@ -1131,13 +1133,29 @@ async fn materialize_restore_registry(
 
     let record = registry_record_from_restore_payload(&payload, &terminal_id, source_session_id);
     let session_key = record.claude_session_id.clone();
-    let tier_full = record.confirmed_at.is_some();
+    // The tier this record was MATERIALIZED at: `confirmed_at` is `Some` iff
+    // the payload parsed as wire `full` AND carried a non-blank, shell-safe id
+    // (see `registry_record_from_restore_payload`). Logged in the wire
+    // vocabulary via the shared constants (never a re-typed literal), beside the
+    // payload's own `restore_tier` verbatim — the two differ exactly when this
+    // machine downgraded the payload (a `full` with an absent, blank or unsafe
+    // id, or an unknown or absent tier), which is the case worth seeing.
+    let materialized_tier = if record.confirmed_at.is_some() {
+        TIER_FULL
+    } else {
+        TIER_TERMINAL_ONLY
+    };
+    let mirrored_tier = payload
+        .get("restore_tier")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<absent>");
     lifecycle_store.record_open(record);
     tracing::info!(
         source = %source_session_id,
         child = %child_id,
         session = %session_key,
-        tier = if tier_full { "full" } else { "terminal_only" },
+        tier = materialized_tier,
+        mirrored_tier = %mirrored_tier,
         "session handoff: materialized restore-registry record"
     );
 }
@@ -1238,7 +1256,8 @@ fn latest_restore_record_from_sse(buf: &str) -> Option<serde_json::Value> {
 ///   keyed by that id, origin `authoritative`, CONFIRMED (the emitter only
 ///   claims `full` for source-confirmed records) — the classifier
 ///   auto-resumes the conversation via the provider's `--resume <id>`.
-/// - anything else (`terminal_only`, or a malformed `full` with no id) →
+/// - anything else (`terminal_only`, an unknown tier, or a `full` whose id is
+///   absent or fails [`is_valid_session_id`]) →
 ///   a deterministic per-source key (UUIDv5 of `source_session_id` under
 ///   [`HANDOFF_PROVISIONAL_KEY_NS`], so a materialization retry upserts the
 ///   SAME record instead of piling up duplicates), origin `authoritative`,
@@ -1264,25 +1283,35 @@ fn registry_record_from_restore_payload(
         .get("cwd")
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    // The peer's id is an INGRESS into this machine's registry: a peer on a
+    // build predating the emitter's shell-safety gate can still mirror `full`
+    // for an unsafe id. Such an id is treated exactly like no id — it never
+    // becomes a confirmed authoritative record here (plan
+    // `2026-08-23-single-source-derived-facts` item 1).
     let authoritative_id = payload
         .get("authoritative_session_id")
         .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+        // Validated RAW, not trimmed: trimming would turn `"abc\n"` into a
+        // "safe" `"abc"`, and the emitter never pads an id it sends.
+        .filter(|s| is_valid_session_id(s));
+    // Parsed through the one wire-vocabulary parser; an absent or unknown
+    // spelling (including the frontend's hyphenated `terminal-only`) is not
+    // `full`, so it degrades to terminal-only.
     let tier = payload
         .get("restore_tier")
         .and_then(|v| v.as_str())
-        .unwrap_or("terminal_only");
+        .and_then(RestoreTier::from_wire_str);
 
     let (claude_session_id, confirmed_at) = match (tier, authoritative_id) {
-        (t, Some(id)) if t == TIER_FULL => {
+        (Some(RestoreTier::Full), Some(id)) => {
             (id.to_string(), Some(chrono::Utc::now().timestamp_millis()))
         }
-        // Honest degrade: no resumable id ⇒ terminal-only semantics under a
-        // DETERMINISTIC per-source key (a real UUID, so shell-safety
-        // validation and future confirmations behave normally; v5 of the
-        // source session id, so a materialization retry is idempotent —
-        // record_open upserts by this key instead of minting a duplicate).
+        // Honest degrade: no resumable id (absent, blank, or shell-unsafe) ⇒
+        // terminal-only semantics under a DETERMINISTIC per-source key (a real
+        // UUID, so shell-safety validation and future confirmations behave
+        // normally; v5 of the source session id, so a materialization retry is
+        // idempotent — record_open upserts by this key instead of minting a
+        // duplicate).
         _ => (
             Uuid::new_v5(&HANDOFF_PROVISIONAL_KEY_NS, source_session_id.as_bytes()).to_string(),
             None,
@@ -1981,6 +2010,64 @@ mod tests {
         assert_eq!(rec.working_dir.as_deref(), Some("C:/repo"));
         assert_eq!(rec.terminal_id, "term-child");
         assert_eq!(rec.state, "open");
+    }
+
+    /// A peer's `full` payload whose `authoritative_session_id` fails the
+    /// shell-safety gate materializes EXACTLY like a `terminal_only` payload:
+    /// provisional (no `confirmed_at`), under the per-source key — never a
+    /// confirmed authoritative record carrying the unsafe id. A peer on a build
+    /// predating the emitter's gate can still send this shape.
+    #[test]
+    fn restore_payload_full_with_unsafe_id_materializes_like_terminal_only() {
+        let source = Uuid::new_v4();
+        let terminal_only = registry_record_from_restore_payload(
+            &restore_payload(TIER_TERMINAL_ONLY, None),
+            "term-child",
+            source,
+        );
+        for bad in ["abc; rm -rf /", "$(id)", "abc\n", "a b", "abc|tee x"] {
+            let rec = registry_record_from_restore_payload(
+                &restore_payload(TIER_FULL, Some(bad)),
+                "term-child",
+                source,
+            );
+            assert!(
+                rec.confirmed_at.is_none(),
+                "unsafe id {bad:?} was confirmed"
+            );
+            assert_ne!(
+                rec.claude_session_id,
+                bad.trim(),
+                "unsafe id {bad:?} became the key"
+            );
+            assert_eq!(
+                rec.claude_session_id, terminal_only.claude_session_id,
+                "unsafe id {bad:?} must take the terminal_only key"
+            );
+        }
+        // Positive control: the same payload with a safe id IS confirmed under it.
+        let ok = registry_record_from_restore_payload(
+            &restore_payload(TIER_FULL, Some("11111111-2222-3333-4444-555555555555")),
+            "term-child",
+            source,
+        );
+        assert_eq!(ok.claude_session_id, "11111111-2222-3333-4444-555555555555");
+        assert!(ok.confirmed_at.is_some());
+    }
+
+    /// The tier is parsed as the WIRE vocabulary: the frontend's hyphenated
+    /// `terminal-only`, or any unknown spelling, is not `full`.
+    #[test]
+    fn restore_payload_tier_parses_only_the_wire_vocabulary() {
+        let source = Uuid::new_v4();
+        for tier in ["terminal-only", "FULL", "garbage"] {
+            let rec = registry_record_from_restore_payload(
+                &restore_payload(tier, Some("sess-full-1")),
+                "term-child",
+                source,
+            );
+            assert!(rec.confirmed_at.is_none(), "tier {tier:?} was read as full");
+        }
     }
 
     /// A `terminal_only` payload materializes a PROVISIONAL authoritative

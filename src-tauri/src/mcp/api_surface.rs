@@ -462,6 +462,10 @@ fn scan_mcp_routes(src_tauri: &Path) -> Vec<McpRoute> {
     routes
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn parse_route_line(line: &str) -> Option<(String, String, String)> {
     let trimmed = line.trim();
     if !trimmed.contains(".route(") {
@@ -736,6 +740,10 @@ fn scan_clorinde_queries(src_tauri: &Path) -> Vec<ClorindeQuery> {
     queries
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_table_from_sql(sql: &str) -> Option<String> {
     let upper = sql.to_uppercase();
     for keyword in &["FROM ", "INTO ", "UPDATE ", "JOIN "] {
@@ -809,6 +817,10 @@ fn scan_db_tables(src_tauri: &Path) -> Vec<DbTable> {
     tables
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_create_table_name(line: &str) -> Option<String> {
     let upper = line.to_uppercase();
     let idx = upper.find("CREATE TABLE")?;
@@ -1223,6 +1235,10 @@ fn find_fn_signature(lines: &[&str], start: usize) -> Option<String> {
     }
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn parse_fn_signature(sig: &str) -> (String, Vec<String>, String) {
     // Extract fn name
     let name = sig
@@ -1265,6 +1281,10 @@ fn parse_fn_signature(sig: &str) -> (String, Vec<String>, String) {
     (name, params, return_type)
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_quoted_string(s: &str) -> Option<String> {
     let quote = if s.contains('"') {
         '"'

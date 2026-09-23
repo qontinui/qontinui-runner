@@ -898,6 +898,10 @@ pub fn local_worktree_shape(dir: &Path, roots: &[(String, PathBuf)]) -> LocalWor
 /// checkout is everything before `/.git/worktrees/`. Pure over a string so the
 /// separator handling (git writes forward slashes even on Windows; a
 /// hand-edited file may not) is directly testable.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn primary_checkout_from_gitdir(raw: &str) -> Option<PathBuf> {
     let line = raw
         .lines()

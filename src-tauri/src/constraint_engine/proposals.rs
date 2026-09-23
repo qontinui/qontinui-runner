@@ -105,6 +105,10 @@ const MARKER_END: &str = "[/CONSTRAINT_PROPOSAL]";
 /// Extracts all `[CONSTRAINT_PROPOSAL]...[/CONSTRAINT_PROPOSAL]` blocks
 /// and converts them into typed proposals. Invalid blocks are logged and
 /// skipped — we never fail the workflow due to a malformed proposal.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn parse_proposals(output: &str) -> Vec<ConstraintProposal> {
     let mut proposals = Vec::new();
     let mut search_pos = 0;

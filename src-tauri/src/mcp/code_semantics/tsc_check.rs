@@ -158,6 +158,10 @@ fn strip_jsonc_comments(src: &str) -> String {
 }
 
 /// Best-effort `"<key>": true` match over de-commented JSONC.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn json_flag_true(stripped: &str, key: &str) -> bool {
     let needle = format!("\"{key}\"");
     let mut from = 0;
@@ -226,6 +230,10 @@ fn parse_tsc_output(stdout: &str) -> Vec<TscError> {
 /// first `): error ` so a Windows drive path (`C:\a\b.ts`) parses correctly: the
 /// location paren is the LAST `(` before that anchor (file paths don't contain
 /// `(`), and the path is everything before it.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn parse_diagnostic_header(line: &str) -> Option<TscError> {
     const ANCHOR: &str = "): error ";
     let anchor = line.find(ANCHOR)?;

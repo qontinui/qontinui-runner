@@ -203,10 +203,14 @@ export function resolveLayout(layoutId: string, tabCount: number): LayoutPreset 
 
 /**
  * Pick the smallest layout preset whose zone count fits `totalTabs` live tabs,
- * capped at the largest preset (`full-grid`, 9 zones). Pure — exported so the
- * `+ new terminal` quick-launch path, the in-hook auto-grow effect, and the
- * unit test can all share ONE mapping (the prior copy lived inline in
- * `TerminalPage.tsx`).
+ * growing past the largest fixed preset (`full-grid`, 9 zones) into the
+ * synthesized `flow-grid`. Pure — exported so EVERY consumer shares ONE
+ * mapping: the `+ new terminal` quick-launch path
+ * ({@link computeQuickLaunchLayoutId}, called from `useZoneActions`), the
+ * in-hook auto-grow effect ({@link computeAutoGrowLayoutId}), the
+ * layout-mismatch suggestion chip (`suggestions/rules.ts`), and the unit test.
+ * Inline copies once lived in `TerminalPage.tsx`, `useZoneActions.ts` and
+ * `suggestions/rules.ts`; the latter two had drifted (no flow-grid rung).
  *
  * Mapping: 1→single, 2→split, 3-4→quad, 5-6→six-pack, 7-9→full-grid,
  * ≥10→flow-grid (the synthesized past-9 scrolling grid — no fixed preset ceiling
@@ -245,10 +249,7 @@ export function pickLayout(totalTabs: number): string {
  * gate-continuation sessions dock as invisible zoneless tabs behind a small
  * layout — operators ran blind to mid-implementation work for an hour.
  */
-export function computeAutoGrowLayoutId(
-  currentLayoutId: string,
-  tabCount: number,
-): string | null {
+export function computeAutoGrowLayoutId(currentLayoutId: string, tabCount: number): string | null {
   // Already in flow-grid: `synthesizeFlowGrid(tabCount)` gives one zone per tab,
   // so the layout is always full-capacity — no grow target, no render loop.
   if (currentLayoutId === FLOW_GRID_ID) return null;
@@ -260,6 +261,39 @@ export function computeAutoGrowLayoutId(
   // Grow only — never pick a target with fewer/equal zones than current.
   if (target.zones.length <= current.zones.length) return null;
   return targetId;
+}
+
+/**
+ * The `+ new terminal` quick-launch layout decision (`useZoneActions`'
+ * `createAndAssignTerminal`): given the layout BEFORE the spawn and the tab
+ * count AFTER it, return the layout id to switch to, or `null` to leave the
+ * layout alone.
+ *
+ * It switches only when the new tab has nowhere to go (`totalTabs` exceeds the
+ * zone count, or every zone is already occupied), and the target is always the
+ * canonical {@link pickLayout} — this used to be a fourth inline copy of the
+ * ladder with no `>= 10 → flow-grid` rung, so from the 11th tab on it picked
+ * `full-grid` while the layout was already `flow-grid`: the layout SHRANK
+ * (11 zones → 9), `applyLayoutAssignments` compacted every tab at zone ≥ 9 into
+ * whatever holes existed, and the auto-grow effect regrew the layout but not
+ * the arrangement — one silent re-shuffle of the operator's grid per spawn.
+ *
+ * Grow-only, like every other path `pickLayout` feeds: a target with fewer
+ * zones than the current layout is refused (`null`), so this path can never
+ * be the one that compacts assignments.
+ */
+export function computeQuickLaunchLayoutId(
+  currentLayoutId: string,
+  currentZoneCount: number,
+  hasEmptyZone: boolean,
+  totalTabs: number,
+): string | null {
+  const needsRoom = totalTabs > currentZoneCount || (!hasEmptyZone && totalTabs > 1);
+  if (!needsRoom) return null;
+  const target = pickLayout(totalTabs);
+  if (target === currentLayoutId) return null;
+  if (resolveLayout(target, totalTabs).zones.length < currentZoneCount) return null;
+  return target;
 }
 
 // ── Zone Assignment ────────────────────────────────────────────────────────
@@ -436,6 +470,81 @@ export function applyLayoutAssignments(
 
 // ── Hook ───────────────────────────────────────────────────────────────────
 
+/**
+ * Unassigned tab IDs, split by liveness. `unassignedTabIds` is the
+ * hidden-but-LIVE set that the UnzonedChip / control-panel "N more" count is
+ * contractually about — exited tombstones are excluded so a dead session
+ * never inflates it. `exitedUnassignedTabIds` surfaces those tombstones
+ * separately (e.g. "N exited") and drives the dismiss affordance. When no
+ * liveness set is threaded, every tab is treated as live (prior behavior).
+ *
+ * The ONE derivation of this split: `useZoneLayout` exposes it, and every
+ * surface (TerminalPage's UnzonedChip, ZoneControlPanel's Unassigned / Exited
+ * sections) consumes the hook's value rather than re-deriving it. Order
+ * follows `tabIds`.
+ */
+export function partitionUnassignedTabIds(
+  tabIds: readonly string[],
+  assignments: ZoneAssignments,
+  liveTabIds?: ReadonlySet<string>,
+): { unassignedTabIds: string[]; exitedUnassignedTabIds: string[] } {
+  const assignedTabIdSet = new Set(Object.values(assignments));
+  const isLive = (id: string) => (liveTabIds ? liveTabIds.has(id) : true);
+  const unassignedTabIds: string[] = [];
+  const exitedUnassignedTabIds: string[] = [];
+  for (const id of tabIds) {
+    if (assignedTabIdSet.has(id)) continue;
+    if (isLive(id)) unassignedTabIds.push(id);
+    else exitedUnassignedTabIds.push(id);
+  }
+  return { unassignedTabIds, exitedUnassignedTabIds };
+}
+
+/**
+ * The zone walk every focus cycler shares: starting AFTER `focusedZone` and
+ * wrapping (the last candidate is `focusedZone` itself), return the first zone
+ * index in `[0, zoneCount)` holding an assigned tab that satisfies `matches`,
+ * or `null` if none does.
+ *
+ * It walks every zone of the layout and skips unassigned slots. It must NOT be
+ * clamped to `min(zoneCount, tabCount)`: `reconcileAssignments` does not keep
+ * assignments dense — per-zone tab pickers, drag-and-drop, `/swap`, Ctrl-swap
+ * and closing the tabs in low zones all leave tabs at high indices — so a
+ * clamp strands exactly those tabs.
+ */
+export function findNextZone(
+  zoneCount: number,
+  focusedZone: number,
+  assignments: ZoneAssignments,
+  matches: (tabId: string) => boolean,
+  direction: 1 | -1 = 1,
+): number | null {
+  if (zoneCount <= 0) return null;
+  for (let i = 1; i <= zoneCount; i++) {
+    const candidate = (((focusedZone + direction * i) % zoneCount) + zoneCount) % zoneCount;
+    const tabId = assignments[candidate];
+    if (tabId && matches(tabId)) return candidate;
+  }
+  return null;
+}
+
+/**
+ * Resolve tab ids (e.g. `unassignedTabIds`) back to their tab objects, in id
+ * order, dropping any id with no matching tab.
+ */
+export function tabsForIds<T extends { id: string }>(
+  ids: readonly string[],
+  tabs: readonly T[],
+): T[] {
+  const byId = new Map(tabs.map((t) => [t.id, t] as const));
+  const out: T[] = [];
+  for (const id of ids) {
+    const tab = byId.get(id);
+    if (tab) out.push(tab);
+  }
+  return out;
+}
+
 export function useZoneLayout(
   tabIds: string[],
   pageId: string = "default",
@@ -585,28 +694,37 @@ export function useZoneLayout(
   const focusedTabId = assignments[focusedZone] ?? null;
 
   /**
-   * The number of zones focus can actually cycle through.
+   * Keyboard zone navigation (`Ctrl+Tab` / `/focus next|prev`). Walks EVERY
+   * zone of the layout and lands only on OCCUPIED ones (a zone with a tab
+   * assigned) — see {@link findNextZone}.
    *
-   * It is `min(zones, tabs)`, NOT the zone count: a four-zone grid holding one
-   * session has nowhere to move focus to. That distinction is the reason these
-   * two report — `/focus next` cannot compute the cap for itself without
-   * copying this expression, and a copied cap is exactly the kind of drift
-   * this pipeline keeps rediscovering. One place owns it, and it says whether
-   * focus moved.
+   * These report whether focus moved, which is the only honest source for it:
+   * `/focus next` cannot compute the answer for itself without copying this
+   * walk, and a copied walk is exactly the kind of drift this pipeline keeps
+   * rediscovering. A four-zone grid holding one session has nowhere to move
+   * focus to (`changed: false`) — but that is decided by which zones are
+   * occupied, NOT by `min(zones, tabs)`: assignments are not dense (a tab can
+   * sit in zone 3 with zones 0-1 empty), and the old `min` cap cycled focus
+   * between empty zones there while the occupied ones stayed unreachable.
    */
-  const focusableZoneCount = Math.min(layout.zones.length, tabIds.length);
+  const focusAdjacentZone = useCallback(
+    (direction: 1 | -1): { changed: boolean } => {
+      const next = findNextZone(
+        layout.zones.length,
+        focusedZone,
+        assignments,
+        () => true,
+        direction,
+      );
+      if (next === null || next === focusedZone) return { changed: false };
+      setFocusedZone(next);
+      return { changed: true };
+    },
+    [layout.zones.length, focusedZone, assignments],
+  );
 
-  const focusNextZone = useCallback((): { changed: boolean } => {
-    if (focusableZoneCount <= 1) return { changed: false };
-    setFocusedZone((prev) => (prev + 1) % focusableZoneCount);
-    return { changed: true };
-  }, [focusableZoneCount]);
-
-  const focusPrevZone = useCallback((): { changed: boolean } => {
-    if (focusableZoneCount <= 1) return { changed: false };
-    setFocusedZone((prev) => (prev - 1 + focusableZoneCount) % focusableZoneCount);
-    return { changed: true };
-  }, [focusableZoneCount]);
+  const focusNextZone = useCallback(() => focusAdjacentZone(1), [focusAdjacentZone]);
+  const focusPrevZone = useCallback(() => focusAdjacentZone(-1), [focusAdjacentZone]);
 
   const toggleMaximize = useCallback((zoneIndex?: number) => {
     setMaximizedZone((prev) => {
@@ -615,53 +733,59 @@ export function useZoneLayout(
     });
   }, []);
 
-  /**
-   * Unassigned tab IDs, split by liveness. `unassignedTabIds` is the
-   * hidden-but-LIVE set that the UnzonedChip / control-panel "N more" count is
-   * contractually about — exited tombstones are excluded so a dead session
-   * never inflates it. `exitedUnassignedTabIds` surfaces those tombstones
-   * separately (e.g. "N exited") and drives the dismiss affordance. When no
-   * liveness set is threaded, every tab is treated as live (prior behavior).
-   */
-  const assignedTabIdSet = new Set(Object.values(assignments));
-  const isLive = (id: string) => (liveTabIds ? liveTabIds.has(id) : true);
-  const unassignedTabIds = tabIds.filter((id) => !assignedTabIdSet.has(id) && isLive(id));
-  const exitedUnassignedTabIds = tabIds.filter((id) => !assignedTabIdSet.has(id) && !isLive(id));
+  const { unassignedTabIds, exitedUnassignedTabIds } = partitionUnassignedTabIds(
+    tabIds,
+    assignments,
+    liveTabIds,
+  );
 
   /** Is this a multi-zone layout? */
   const isMultiZone = layout.zones.length > 1;
 
   /**
-   * Focus the next zone whose session is in "needs-input" state.
-   * Cycles starting from focusedZone + 1, wrapping around.
-   * Returns true if a needs-input zone was found.
+   * THE state cycler: focus the next zone (after `focusedZone`, wrapping)
+   * whose tab is in `state`, and un-maximize so the operator can see it.
+   * Returns whether such a zone was found.
+   *
+   * Walks all `layout.zones.length` zones, skipping unassigned slots — never
+   * `min(zones, tabs)`. Assignments are not dense, so that clamp made a pill
+   * reading "2 need input · Tab to cycle" unable to reach tabs parked in
+   * zones 2 and 3 of a four-zone grid, while the (then hand-copied, unclamped)
+   * error cycler beside it reached them fine. ONE parameterized walk now
+   * serves every pill; the named cyclers below are thin bindings.
+   */
+  const focusNextInState = useCallback(
+    (sessionStates: Record<string, SessionState>, state: SessionState): boolean => {
+      const next = findNextZone(
+        layout.zones.length,
+        focusedZone,
+        assignments,
+        (tabId) => sessionStates[tabId] === state,
+      );
+      if (next === null) return false;
+      setFocusedZone(next);
+      setMaximizedZone(null);
+      return true;
+    },
+    [layout.zones.length, focusedZone, assignments],
+  );
+
+  /**
+   * Focus the next "needs-input" zone; when none is waiting, fall back to the
+   * next errored zone (both are "needs the operator"). Returns true if either
+   * was found.
    */
   const focusNextNeedsInput = useCallback(
-    (sessionStates: Record<string, SessionState>): boolean => {
-      const maxZones = Math.min(layout.zones.length, tabIds.length);
-      for (let i = 1; i <= maxZones; i++) {
-        const candidate = (focusedZone + i) % maxZones;
-        const tabId = assignments[candidate];
-        if (tabId && sessionStates[tabId] === "needs-input") {
-          setFocusedZone(candidate);
-          // Also un-maximize so the user can see the zone
-          setMaximizedZone(null);
-          return true;
-        }
-      }
-      // Fallback: try error states
-      for (let i = 1; i <= maxZones; i++) {
-        const candidate = (focusedZone + i) % maxZones;
-        const tabId = assignments[candidate];
-        if (tabId && sessionStates[tabId] === "error") {
-          setFocusedZone(candidate);
-          setMaximizedZone(null);
-          return true;
-        }
-      }
-      return false;
-    },
-    [layout.zones.length, tabIds.length, focusedZone, assignments],
+    (sessionStates: Record<string, SessionState>): boolean =>
+      focusNextInState(sessionStates, "needs-input") || focusNextInState(sessionStates, "error"),
+    [focusNextInState],
+  );
+
+  /** Focus the next errored zone (the status strip's "N errors" pill). */
+  const focusNextError = useCallback(
+    (sessionStates: Record<string, SessionState>): boolean =>
+      focusNextInState(sessionStates, "error"),
+    [focusNextInState],
   );
 
   return {
@@ -681,6 +805,8 @@ export function useZoneLayout(
     unassignedTabIds,
     exitedUnassignedTabIds,
     isMultiZone,
+    focusNextInState,
     focusNextNeedsInput,
+    focusNextError,
   };
 }

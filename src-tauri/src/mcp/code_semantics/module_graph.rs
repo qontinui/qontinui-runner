@@ -273,6 +273,10 @@ pub(super) async fn run_cli_structured(prompt: String) -> Option<String> {
 /// Extract the first balanced JSON object/array from a string, ignoring prose and
 /// ```json code fences and respecting string literals (so a `}` inside a string
 /// doesn't close the scan early).
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub(super) fn extract_json(s: &str) -> Option<&str> {
     let bytes = s.as_bytes();
     let start = bytes.iter().position(|&b| b == b'{' || b == b'[')?;

@@ -233,6 +233,10 @@ async fn fetch_url_gist(client: &reqwest::Client, url: &str) -> Option<String> {
 
 /// Extract `http(s)://` URLs from free text. Issue refs like `owner/repo#123`
 /// are normalized to a GitHub API/issue URL when they look like a GitHub ref.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_urls(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();

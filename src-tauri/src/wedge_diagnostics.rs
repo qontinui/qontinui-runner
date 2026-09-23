@@ -915,12 +915,20 @@ pub fn linux_state_name(state: char) -> &'static str {
 /// parentheses (`(tokio (weird) name)`), so the only correct parse splits at
 /// the LAST `)` rather than tokenising from the left. Pure, and tested against
 /// exactly that hostile case.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn parse_proc_stat_state(stat: &str) -> Option<char> {
     let after_comm = &stat[stat.rfind(')')? + 1..];
     after_comm.split_whitespace().next()?.chars().next()
 }
 
 /// Extract the parent pid (field 4) from a `/proc/<pid>/stat` line.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn parse_proc_stat_ppid(stat: &str) -> Option<u32> {
     let after_comm = &stat[stat.rfind(')')? + 1..];
     after_comm.split_whitespace().nth(1)?.parse().ok()
@@ -1818,6 +1826,10 @@ mod tests {
     /// So the enforcement is here, at the source level: no call site anywhere
     /// under `src/` may take a slot and discard it in the same expression.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn no_call_site_discards_a_blocking_slot() {
         let mut offenders = Vec::new();
         let mut bindings = 0usize;
@@ -1902,6 +1914,10 @@ mod tests {
     /// `include_str!` rather than a directory walk: the compiler resolves it, so
     /// this pin cannot end up scanning the wrong tree and passing vacuously.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn the_public_spawn_wrapper_only_delegates() {
         const SRC: &str = include_str!("wedge_diagnostics.rs");
         const SIGNATURE: &str = "pub fn spawn_blocking_tracked<F, R>(f: F)";
@@ -2812,6 +2828,10 @@ mod tests {
     /// A record built against a hung capturer is still a valid, complete record
     /// — every field present, the unavailable ones naming why.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn a_timed_out_capture_still_produces_a_complete_record() {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2850,6 +2870,10 @@ mod tests {
     /// A capturer whose worker answers normally produces values, and the record
     /// lands in the day-stamped file the record's own timestamp names.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn a_healthy_capture_lands_a_value_record_in_the_days_file() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut rig = WedgeDiagnostics::with_capturer(

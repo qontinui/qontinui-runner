@@ -104,6 +104,10 @@ struct AppContext {
 
 impl AppContext {
     /// Extract application context from a workflow and its description.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn from_workflow(workflow: &UnifiedWorkflow, _description: &str) -> Self {
         let workflow_json = serde_json::to_string(workflow).unwrap_or_default();
 
@@ -1026,6 +1030,10 @@ fn rewrite_ui_bridge_url_string(
 ///
 /// We standardize the host to `localhost` (matches the rest of the codebase's
 /// convention) regardless of whether the input used `localhost` or `127.0.0.1`.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn rewrite_localhost_port_for_ui_bridge(input: &str, runner_port: u16) -> String {
     // Simple scan — avoid pulling in a regex dep for a pattern this narrow.
     // At each position we look for whichever host needle comes first, consume

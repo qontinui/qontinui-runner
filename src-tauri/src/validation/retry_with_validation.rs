@@ -95,6 +95,10 @@ impl std::fmt::Display for StructuredOutputError {
 /// Extract a JSON block from LLM output text.
 ///
 /// Looks for ```json ... ``` blocks first, then falls back to bare JSON objects.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn extract_json_from_output(output: &str) -> Option<String> {
     // Try ```json block first
     if let Some(start) = output.find("```json") {

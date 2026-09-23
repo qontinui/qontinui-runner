@@ -780,6 +780,10 @@ pub async fn rename_ai_session(
 /// with any in-memory accumulated output from the live session that hasn't
 /// been persisted yet (e.g., the current or most recent AI response).
 #[tauri::command]
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub async fn get_ai_output(
     app_state: tauri::State<'_, StorageCompartment>,
     session_manager: tauri::State<'_, Arc<SessionManager>>,
@@ -1291,6 +1295,10 @@ pub async fn promote_session_to_worktree(
 /// `success: false` with the error message; no parent refresh is needed
 /// because committing doesn't mutate session state the chat UI cares about.
 #[tauri::command]
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub async fn commit_session_progress(
     app: tauri::AppHandle,
     task_run_id: String,

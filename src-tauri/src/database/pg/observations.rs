@@ -11,6 +11,10 @@ use super::PgDb;
 use crate::database::types::*;
 
 /// Strip `<private>...</private>` tags from content, replacing with `[REDACTED]`.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn strip_private_tags(content: &str) -> String {
     let mut result = String::with_capacity(content.len());
     let mut rest = content;

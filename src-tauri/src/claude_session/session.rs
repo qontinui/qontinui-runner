@@ -1596,6 +1596,10 @@ impl ClaudeSession {
     /// Mirrors the flush block in [`Self::close`], but leaves stdin, the state
     /// machine, and the persister thread alive — the session keeps running
     /// until the seam's `close_all_sessions` tears it down.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     pub fn flush_pending_output(&self) {
         if let Some(ref tx) = self.turn_persist_tx {
             if let Ok(buf) = self.accumulated_output.lock() {
@@ -1665,6 +1669,10 @@ impl ClaudeSession {
         }
     }
 
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     pub fn close(&self) -> Result<(), String> {
         info!("Closing session {}", self.session_id);
 

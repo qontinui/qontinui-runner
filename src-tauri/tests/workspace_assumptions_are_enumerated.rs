@@ -654,6 +654,10 @@ impl CfgFlags {
 
 /// Split leading outer attributes off a trimmed code line. Returns the
 /// attributes and the remaining item text.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn split_attrs(line: &str) -> (Vec<String>, String) {
     let mut attrs = Vec::new();
     let mut rest = line.trim();
@@ -686,6 +690,10 @@ fn split_attrs(line: &str) -> (Vec<String>, String) {
 /// Does the text after the attributes start an ITEM (ends in `;` or a `{}`
 /// body) rather than a struct field, enum variant or match arm (ends in `,`
 /// or at the enclosing `}`)?
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn starts_item(rest: &str) -> bool {
     let mut r = rest.trim_start();
     if let Some(after) = r.strip_prefix("pub") {
@@ -766,6 +774,10 @@ impl Structure {
 
     /// The type name an `impl`/`trait` header names, e.g.
     /// `impl<T> Foo for Bar<T> where …` → `Bar`.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn impl_name(&self, skel_trimmed: &str) -> Option<String> {
         let caps = self.impl_re.captures(skel_trimmed)?;
         let mut rest = caps.get(2)?.as_str().trim_start().to_string();
@@ -855,6 +867,10 @@ fn excerpt_of(code: &str) -> String {
 
 /// Scan one source file's text. `whole_file_windows` suppresses the literal
 /// half of `os_bound_tooling` for a file that only compiles on Windows.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn scan_source(
     st: &Structure,
     classes: &[CompiledClass],
@@ -1395,6 +1411,10 @@ fn load_dispositions(root: &Path) -> Result<BTreeMap<Key, Disposition>, String> 
 /// row, read as TEXT out of `capability_manifest.rs` (this test builds no binary).
 /// Parsed per `CapabilitySpec { … }` block, so a spec missing an `anchor` yields
 /// no tokens for ITS id rather than shifting every later row by one.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn capability_anchors(root: &Path) -> Vec<(String, BTreeSet<String>)> {
     let src = fs::read_to_string(root.join("src/capability_manifest.rs")).unwrap_or_default();
     let Some(start) = src.find("pub const CAPABILITY_SPECS") else {

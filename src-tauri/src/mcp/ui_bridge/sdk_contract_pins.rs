@@ -131,6 +131,10 @@ fn lf(src: &str) -> String {
 /// Shared so the default read and the override validation cannot drift — they
 /// previously used the same threshold over different text, and a rename of the
 /// scraped literal would have changed one silently.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn count_routes(src: &str) -> usize {
     match src.find("UI_BRIDGE_ROUTES") {
         Some(i) => src[i..].matches("path: '").count(),
@@ -478,6 +482,10 @@ fn include_expected_is_parsed_and_echoed_but_never_applied() {
 /// would otherwise have to INFER these from the handler body — which is
 /// precisely the inference this phase was asked to remove.
 #[test]
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn visibility_handler_pins_its_status_and_default_commitments() {
     let src = lf(SCREENSHOTS_SRC);
     let src = src.as_str();
@@ -615,6 +623,10 @@ fn tabs_body_must_not_collide_with_sdk_relay_field_names() {
 /// dead relay, and a poller that cannot tell them apart gives up on a bridge
 /// that was merely still coming up.
 #[test]
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn tabs_route_is_infallible_and_reports_empty_in_the_body() {
     let src = lf(RELAY_SRC);
     let src = src.as_str();
@@ -755,6 +767,10 @@ const SDK_ABSENT_DECLARED_ENV: &str = "QONTINUI_UI_BRIDGE_SDK_ABSENT";
 ///   there and does not answer is a different fact, and a positively wrong one.
 
 #[test]
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn sdk_sibling_checkout_is_present_and_parseable() {
     // THE DEFAULT PATH IS THE ONE THAT DECIDES, and that is the whole point.
     //

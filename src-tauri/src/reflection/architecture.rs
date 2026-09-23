@@ -94,6 +94,10 @@ pub struct ImpactAnalysis {
 // =============================================================================
 
 /// Normalize a raw file path: lowercase, forward slashes, strip `./` prefix and drive letters.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn normalize_component_path(raw: &str) -> String {
     let mut path = raw.replace('\\', "/").to_lowercase();
     // Strip drive letters like C:/

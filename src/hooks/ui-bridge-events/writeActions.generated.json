@@ -1,0 +1,21 @@
+[
+  "type",
+  "settext",
+  "setvalue",
+  "fill",
+  "input",
+  "paste",
+  "append",
+  "clear",
+  "select",
+  "selectoption",
+  "check",
+  "uncheck",
+  "toggle",
+  "submit",
+  "upload",
+  "setfiles",
+  "sendkeys",
+  "presskey",
+  "writetoterminal"
+]

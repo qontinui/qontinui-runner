@@ -358,6 +358,10 @@ pub(crate) fn build_inline_child_command(
 /// If `pid_tracker` is provided, the child process PID will be stored there so it can be
 /// killed by the stop_ai_analysis endpoint.
 #[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn run_claude_session_inline(
     working_dir: &str,
     prompt: &str,

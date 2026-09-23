@@ -65,6 +65,10 @@ pub struct DispatcherResult {
 ///
 /// Returns the extracted text (if any).
 #[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn dispatch_line(
     line: &str,
     app_handle: &tauri::AppHandle,
@@ -610,6 +614,10 @@ fn auto_register_file(
 ///
 /// All errors are logged at warn-level — snapshots are advisory and a
 /// failure here MUST NOT block the edit (per Phase 4 §10 mitigation).
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 async fn capture_pre_edit_snapshot(
     app_handle: &tauri::AppHandle,
     pg_db: &std::sync::Arc<crate::database::pg::PgDb>,

@@ -624,6 +624,10 @@ impl Grid {
     /// needle is compiled as a regex; otherwise it's a case-sensitive
     /// substring match. Returns at most one hit per row (the leftmost),
     /// matching how a user would scan the screen.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     pub fn search(&self, needle: &str, regex: bool) -> Result<Vec<SearchHit>, SearchError> {
         if needle.is_empty() {
             return Ok(Vec::new());

@@ -129,6 +129,10 @@ fn parse_mypy_output(stdout: &str) -> Vec<MypyError> {
 
 /// Parse a single mypy diagnostic line. Returns `None` for non-error severities
 /// and malformed lines.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn parse_mypy_line(line: &str) -> Option<MypyError> {
     // Split into the leading `path:line:col` locator and the remainder.
     // The path may contain Windows drive colons, so we parse from the RIGHT of
@@ -176,6 +180,10 @@ fn parse_locator(locator: &str) -> Option<(String, u32, u32)> {
 }
 
 /// Split a trailing ` [code]` from a mypy message. Returns `(message, code)`.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn split_trailing_code(s: &str) -> (String, Option<String>) {
     if s.ends_with(']') {
         if let Some(open) = s.rfind('[') {
@@ -245,6 +253,10 @@ fn extract_py_decls(src: &str) -> Vec<Decl> {
 }
 
 /// The leading identifier of `s` (up to `(`, `:`, whitespace, or `=`).
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn ident_prefix(s: &str) -> Option<String> {
     let end = s
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
@@ -258,6 +270,10 @@ fn ident_prefix(s: &str) -> Option<String> {
 
 /// Normalize a declaration line for signature-change comparison: collapse
 /// internal whitespace, drop a trailing `:` and any trailing comment.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn normalize_decl(line: &str) -> String {
     let no_comment = match line.find(" #") {
         Some(i) => &line[..i],
