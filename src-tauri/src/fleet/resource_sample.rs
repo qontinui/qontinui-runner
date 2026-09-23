@@ -848,7 +848,8 @@ fn collect_host_lane() -> ResourceSample {
     let ci = crate::settings::get_ci_node_settings();
     let (running, queued) = crate::ci_node::admission::occupancy();
     if ci.enabled {
-        s.build_slots_total = Some(ci.max_concurrent_builds.max(1).min(i32::MAX as u32) as i32);
+        s.build_slots_total =
+            Some(ci.effective_max_concurrent_builds().min(i32::MAX as u32) as i32);
     }
     s.build_slots_busy = Some(running.min(i32::MAX as usize) as i32);
     s.build_queue_depth = Some(queued.min(i32::MAX as usize) as i32);

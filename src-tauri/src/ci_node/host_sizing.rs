@@ -92,6 +92,78 @@ pub(crate) fn derive(cap: HostCapacity) -> HostSizing {
     }
 }
 
+/// Cargo build tokens that make up ONE concurrent CI dispatch slot, in this
+/// module's own units ([`BYTES_PER_BUILD_TOKEN`] each). A slot is therefore
+/// 4 × 3 GiB = 12 GiB of build-token headroom.
+const BUILD_TOKENS_PER_SLOT: u64 = 4;
+/// Usable cpus that make up ONE concurrent CI dispatch slot. Paired with
+/// [`BUILD_TOKENS_PER_SLOT`] so a slot carries one build token per core — the
+/// same token↔core pairing [`derive`] applies when it caps `build_jobs` at
+/// `cpus`.
+const CPUS_PER_SLOT: u32 = 4;
+/// What a host with an unreadable memory probe is offered: a single slot, for
+/// the same reason [`UNKNOWN_HOST_BUILD_JOBS`] is 1.
+const UNKNOWN_HOST_SUGGESTED_SLOTS: u32 = 1;
+
+/// Which host term bounds [`suggested_concurrent_builds`]. Surfaced so the
+/// settings panel can name WHY a value above the suggestion is risky.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LimitingTerm {
+    Cores,
+    Memory,
+}
+
+/// How many CI dispatches this host can run side by side — a SUGGESTION for
+/// `ci_node.max_concurrent_builds` when the operator has not set one.
+///
+/// `derive` answers parallelism *within* one dispatch; this answers how many
+/// dispatches, in the same units: one slot is [`BUILD_TOKENS_PER_SLOT`] build
+/// tokens and [`CPUS_PER_SLOT`] cores, and the host gets as many slots as BOTH
+/// terms allow, never fewer than 1. Unreadable memory yields 1 — guessing high
+/// on an unknown host is the OOM, guessing low is merely slow.
+///
+/// Pure. Pair it with [`share`] at dispatch time: admitting N dispatches is only
+/// safe if each one then sizes itself against a 1/N share of the host.
+pub(crate) fn suggested_concurrent_builds(cap: HostCapacity) -> u32 {
+    suggestion_with_limit(cap).0
+}
+
+/// [`suggested_concurrent_builds`] plus the term that bound it (`None` when
+/// memory is unreadable and the answer is the conservative fallback).
+pub(crate) fn suggestion_with_limit(cap: HostCapacity) -> (u32, Option<LimitingTerm>) {
+    let Some(mem) = cap.mem_bytes.filter(|m| *m > 0) else {
+        return (UNKNOWN_HOST_SUGGESTED_SLOTS, None);
+    };
+    let by_cores = cap.cpus.max(1) / CPUS_PER_SLOT;
+    let by_mem =
+        (mem / (BUILD_TOKENS_PER_SLOT * BYTES_PER_BUILD_TOKEN)).min(u32::MAX as u64) as u32;
+    let limit = if by_cores <= by_mem {
+        LimitingTerm::Cores
+    } else {
+        LimitingTerm::Memory
+    };
+    (by_cores.min(by_mem).max(1), Some(limit))
+}
+
+/// One dispatch's share of the host when `n` dispatches run concurrently.
+///
+/// **Why this exists.** [`derive`] sizes one dispatch against whatever capacity
+/// it is handed. Handed the WHOLE host while `n` dispatches run side by side,
+/// each takes all of it and the node oversubscribes `n`-fold — `n × cpus` cargo
+/// jobs and `n ×` the build-token memory, which is the OOM class this module
+/// exists to prevent. So the executor derives from `share(probe(), n)`, where
+/// `n` is the capacity the node admits against. `n` is clamped to at least 1,
+/// and a share never drops below 1 cpu; `derive`'s own floors then keep a thin
+/// share at 1 build job. Unreadable memory stays unreadable.
+pub(crate) fn share(cap: HostCapacity, n: u32) -> HostCapacity {
+    let n = n.max(1);
+    HostCapacity {
+        mem_bytes: cap.mem_bytes.map(|m| m / n as u64),
+        cpus: (cap.cpus / n).max(1),
+    }
+}
+
 /// Read the host's capacity. Blocking (a sysinfo memory refresh), so callers
 /// run it once per dispatch rather than per step.
 ///
@@ -208,6 +280,108 @@ mod tests {
         });
         assert_eq!(s.cargo_build_jobs, 1);
         assert_eq!(s.test_threads, 1);
+    }
+
+    fn cap(gib: u64, cpus: u32) -> HostCapacity {
+        HostCapacity {
+            mem_bytes: Some(gib * GIB),
+            cpus,
+        }
+    }
+
+    /// The five devices measured on 2026-09-22 (`GET /coord/fleet`), GB read
+    /// as GiB. Plan `2026-09-22-ci-capacity-is-hand-typed-...`, Phase 2.
+    #[test]
+    fn suggestion_matches_the_measured_fleet() {
+        for (cpus, gib, want, name) in [
+            (48, 368, 12, "merytshost"),
+            (32, 125, 8, "spaceship"),
+            (16, 31, 2, "MSI"),
+            (8, 31, 2, "monster"),
+            (8, 15, 1, "nomad"),
+        ] {
+            assert_eq!(
+                suggested_concurrent_builds(cap(gib, cpus)),
+                want,
+                "{name}: {cpus}c/{gib}GiB"
+            );
+        }
+    }
+
+    /// The suggestion never drops to 0 — a tiny or unreadable host gets 1.
+    #[test]
+    fn suggestion_is_never_zero() {
+        assert_eq!(suggested_concurrent_builds(cap(1, 1)), 1);
+        assert_eq!(suggested_concurrent_builds(cap(1, 0)), 1);
+        for mem_bytes in [None, Some(0)] {
+            assert_eq!(
+                suggested_concurrent_builds(HostCapacity {
+                    mem_bytes,
+                    cpus: 64
+                }),
+                1
+            );
+        }
+    }
+
+    /// The limiting term names the binding constraint.
+    #[test]
+    fn suggestion_names_its_limiting_term() {
+        assert_eq!(
+            suggestion_with_limit(cap(368, 48)),
+            (12, Some(LimitingTerm::Cores))
+        );
+        assert_eq!(
+            suggestion_with_limit(cap(31, 16)),
+            (2, Some(LimitingTerm::Memory))
+        );
+        assert_eq!(
+            suggestion_with_limit(HostCapacity {
+                mem_bytes: None,
+                cpus: 8
+            }),
+            (1, None)
+        );
+    }
+
+    /// Per-dispatch partitioning: 12 dispatches on merytshost each size
+    /// against a 1/12 share, not the whole host.
+    #[test]
+    fn a_share_sizes_one_of_n_dispatches() {
+        let host = cap(368, 48);
+        let s = derive(share(host, 12));
+        // share = 30.67 GiB / 4 cpus → build min(10, 4) = 4, tests min(30, 4) = 4.
+        assert_eq!(s.cargo_build_jobs, 4);
+        assert_eq!(s.test_threads, 4);
+        // Unpartitioned, the same host hands EACH dispatch 48 of each.
+        assert_eq!(derive(host).cargo_build_jobs, 48);
+    }
+
+    /// N = 1 (and a degenerate N = 0) is exactly the old whole-host derive.
+    #[test]
+    fn a_share_of_one_is_the_whole_host() {
+        for host in [
+            cap(368, 48),
+            cap(7, 8),
+            HostCapacity {
+                mem_bytes: None,
+                cpus: 4,
+            },
+        ] {
+            assert_eq!(share(host, 1), host);
+            assert_eq!(share(host, 0), host);
+            assert_eq!(derive(share(host, 1)), derive(host));
+        }
+    }
+
+    /// A share never reports zero cpus, even when N exceeds the core count.
+    #[test]
+    fn a_share_keeps_at_least_one_cpu() {
+        let s = share(cap(64, 4), 12);
+        assert_eq!(s.cpus, 1);
+        let d = derive(s);
+        assert_eq!(d.cargo_build_jobs, 1);
+        assert_eq!(d.test_threads, 1);
     }
 
     /// The probe is IO, so this only asserts the invariant every caller
