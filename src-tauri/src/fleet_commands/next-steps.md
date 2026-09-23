@@ -166,10 +166,12 @@ gate; just list it.
   `self_attestation_forbidden`; if your own tool list is the stale one, send it
   with `coord-revive.sh call coord_work_unit_transition '<json>'` rather than
   the tool your session advertises, and verify by read — a zero exit is not
-  evidence the write landed. ⚠️ **Never re-allocate to get past a refusal**: a
-  fresh allocate issues a NEW agent id the legacy compare would admit, which the
-  refusal itself names *"a known defect being tracked, not a sanctioned
-  route"*. For the work-unit rule read policy live rather than restating it:
+  evidence the write landed. ⚠️ **Never re-allocate to get past
+  `self_attestation_forbidden`**: a fresh allocate issues a NEW agent id the
+  legacy compare would admit, which that refusal itself names *"a known defect
+  being tracked, not a sanctioned route"*. That prohibition is that refusal's
+  alone — `attester_unresolved` wants a device- or agent-identified caller,
+  which is a credential remedy rather than a route around a control. For the work-unit rule read policy live rather than restating it:
   `/policy get policy plan-discipline` and `verification-and-evidence`
   [policy: never-pin-a-mutable-policy-value]. (Canonical for gates:
   `_gate-registration` → "`gate_class`".)
