@@ -6059,15 +6059,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // runners whose Settings/Terminal UI never polls usage. This
                 // loop ONLY refreshes the cache — re-picking is deferred to
                 // the next unit of AI work (so warm-provider prompt-cache
-                // locality within a unit is preserved). `refresh_*` is a
-                // no-op unless ≥2 accounts are configured.
+                // locality within a unit is preserved). The account half is a
+                // no-op unless ≥2 accounts are configured; the prepaid half
+                // (`refresh_fleet_usage_report`) reports regardless.
+                //
+                // The immediate first tick is NOT skipped: it is the first
+                // prepaid report, run here rather than in the startup call
+                // above so the provider round-trip never sits in front of
+                // `pick_best_account`. Its account half is served from the
+                // probe cache the startup refresh just filled.
                 tauri::async_runtime::spawn(async {
                     let mut tick =
                         tokio::time::interval(tokio::time::Duration::from_secs(10 * 60));
-                    tick.tick().await; // consume the immediate first tick (just refreshed)
                     loop {
                         tick.tick().await;
-                        commands::ai_settings::refresh_account_usage_snapshot().await;
+                        commands::ai_settings::refresh_fleet_usage_report().await;
                     }
                 });
             });
