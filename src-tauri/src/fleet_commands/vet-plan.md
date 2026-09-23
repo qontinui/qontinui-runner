@@ -213,11 +213,12 @@ so the next author does not reintroduce them:
   attester did not hold the AUTHOR'S CONTEXT, a subagent with a fresh context
   window QUALIFIES, and it needs no distinct session id, credential or device.
 
-**LANDED is not SERVED — and today they disagree. Read which one you are on
-rather than trusting either paragraph below.**
+**LANDED is not SERVED. They AGREE here today — read 2026-09-23 — but that is a
+read you re-take, not a fact this file can hold for you.**
 
-*Landed.* qontinui-coord `origin/main` HAS caught up (verified 2026-09-23 at
-`037fc1a8f`): a transition to an ATTESTED target (`vetted` / `superseded` /
+*Landed.* qontinui-coord `origin/main` HAS caught up (verified 2026-09-23
+against `origin/main` tip `037fc1a8f` — the ref that was READ, not the commit
+that landed the arm): a transition to an ATTESTED target (`vetted` / `superseded` /
 `obsolete`) takes an optional `independence` object —
 `work_unit_registry::IndependenceDeclaration` (qontinui-coord
 `crates/coord/src/work_unit_registry.rs`), the three required non-blank strings
@@ -228,27 +229,57 @@ at `metadata.attestations`, with the transition FAILING if it cannot be stored.
 Only that DECLARATION ARM landed: the plan's own status block still reads
 *"Phases 2-4 are NOT delivered"*, so do not cite it as delivered.
 
-*Served.* **Whether the coord instance serving YOU exposes that field is a
-separate fact you READ, never assume.** The test is the transition tool's own
-advertised schema: if `coord_work_unit_transition` carries no `independence`
-property, your deployment predates the arm and the legacy actor-key compare is
-what you will meet — and that schema is `additionalProperties: false`, so
-sending the field anyway is REFUSED, not ignored. **Measured on this tenant
-2026-09-23: NOT served** — the advertised schema carried only `slug`,
-`to_status`, `from_status` and `reason`, and a real `-> vetted` transition was
-refused `self_attestation_forbidden`.
+*Served — and REACHABLE here.* **Whether the coord instance serving YOU exposes
+that field is a fact you READ — and NOT the one your own tool list answers.**
+Read 2026-09-23 over the loopback coord-mcp door (`coord-revive.sh tools`),
+`coord_work_unit_transition` advertised `independence` alongside `slug`,
+`to_status`, `from_status`, `reason` and `vet_evidence` — and a real transition
+carrying a declaration was **accepted by the schema rather than refused by
+name**, reaching the CAS guard (`from_status mismatch`).
 
-So until your own deployment serves the field, the existing guidance is still
-the correct one: **expect a refusal**, treat it as waivable bookkeeping
-[policy: bookkeeping-writes-waivable-at-the-floor], and never report the work as
-blocked because a status string could not be written. Publishing the plan buys
-reviewability; it does not by itself supply an attester.
-§5.4 covers what to write when the ladder actually refuses.
+⚠️ **That settles SERVED and nothing more — do not over-read it.** The CAS is
+checked BEFORE the attestation authz (§5.4 Step C), so **no authorization
+verdict was obtained**, and the declaration's well-formedness — evaluated inside
+`authorize_target_transition`, which never ran — was never tested. What the
+probe establishes is exactly one thing: the field was not refused by name, and
+an unknown argument IS refused by name.
 
-⚠️ **Do NOT re-allocate to get past the refusal.** A fresh allocate issues a NEW
-agent id, so the actor-key compare WOULD then admit you — *"a known defect being
-tracked, not a sanctioned route"*, in the refusal message's own words. A `vetted`
-stamp obtained that way is indistinguishable from a real review forever after.
+⚠️ **The read that said otherwise was the authoring session's OWN advertised
+tool list rather than the door, and that is what put a "NOT served" verdict in
+this file in the first place.** On that same day that list carried four
+properties while the door carried six. WHICH of the two moved is not
+established — a boot-time capture going stale and a coord-mcp build change
+between the two reads produce the identical observation — and it does not change
+the remedy: read the door. The mistake also manufactured its own corroboration:
+the `self_attestation_forbidden` refusal recorded beside it was sent WITHOUT a
+declaration, because the session's own tool had no field for one — a consequence
+of the first reading, not a second signal. Coord finding
+`b69e906d-2316-4ba2-9164-eaa08e647a42`, superseding `0ca3a132`.
+
+So read the DOOR: `coord-revive.sh tools`, then look for `independence` in that
+tool's `inputSchema`. If your own tool list is the stale one, send the
+declaration with `coord-revive.sh call coord_work_unit_transition '<json>'`
+rather than the tool your session advertises, and verify by read — a zero exit
+is not evidence the write landed. The worked declaration is in §5.4 Step C's
+`self_attestation_forbidden` bullet.
+
+Caveats, all live. A well-formed declaration is still refused
+`attester_unresolved` when your token derives no SoD actor key — a declaration
+waives the owner comparison, not the witness. It does NOT waive that, and §5.4's
+credential remedy is what applies there. Conversely it DOES clear
+`owner_unresolved`, deliberately. And where a refusal IS what you meet, it stays
+waivable bookkeeping [policy: bookkeeping-writes-waivable-at-the-floor]: never
+report the work as blocked because a status string could not be written.
+Publishing the plan buys reviewability; it does not by itself supply an
+attester. §5.4 covers what to write when the check actually refuses.
+
+⚠️ **Do NOT re-allocate to get past `self_attestation_forbidden`.** A fresh
+allocate issues a NEW agent id, so the actor-key compare WOULD then admit you —
+*"a known defect being tracked, not a sanctioned route"*, in that refusal
+message's own words. A `vetted` stamp obtained that way is indistinguishable
+from a real review forever after. (This prohibition is that refusal's alone;
+`attester_unresolved` wants a device- or agent-identified caller, which is
+§5.4's remedy, not a route around anything.)
 
 ## Decision policy (binding)
 
@@ -1470,7 +1501,8 @@ non-degraded arm-5 reading. Only case 2's four checks separate case 2 from case
 them you may not be able to write.** `plan-discipline` "Closeout" assigns
 closeout to the unit's **owner**, and the coord statuses are gated: `shipped` is
 derived (`422 status_is_derived`) and `vetted` / `superseded` / `obsolete` are
-attested (`403 self_attestation_forbidden` when you own the unit). So stamp the
+attested (`403 self_attestation_forbidden` when you own the unit **and send no
+`independence` declaration**). So stamp the
 **plan file** terminal status — always yours to write — and treat the coord
 transition as best-effort, reporting it as owed if refused. `/implement-plan`
 Step 6 draws the same distinction; do not report a closeout complete on the
@@ -2417,8 +2449,8 @@ even on the path that does not attest.
 > receipt or a read comes back carrying your entries, "submitted" is UNKNOWN, not
 > stored.**
 
-Attempt this even though it usually fails, because when it DOES land it is
-strictly better: `vetted` is the documented lifecycle status, and coord's derive
+Attempt this — with an `independence` declaration it is expected to LAND, and
+without one it usually fails — because when it does land it is strictly better: `vetted` is the documented lifecycle status, and coord's derive
 worker promotes `vetted` + all-gates-cleared → the derived status `ready`. No
 agent-reachable route produces `ready` any other way (the operator-transition route
 can set it directly, but that is not yours). It lands when the attester is
@@ -2457,7 +2489,7 @@ is always present when a receipt is, because "which arm" has no sensible default
 
 | `admitted_on` | What actually happened |
 |---|---|
-| `identity` | the ordinary actor-key comparison passed — you were a different actor from the owner. **Your manifest did not carry this**, even if you sent one |
+| `identity` | ⚠️ **Two different things land here and coord does not distinguish them**: the ordinary actor-key comparison passed (you were a different actor from the owner), OR a well-formed `independence` declaration authorized it — both return `Authorized::Normal` (`policies::lifecycle_autonomy`), and there is no declaration tag. So `identity` is **NOT evidence that you were a different actor**. Say which you sent; the declaration itself is the distinguishing record, stored at `metadata.attestations`. **Your manifest did not carry this**, even if you sent one |
 | `graduation` | a graduated actor self-attested; the flywheel's track record carried it, not your evidence |
 | `no_transition` | the write stored a manifest without changing any status, so no authz question was asked at all |
 
@@ -2521,7 +2553,12 @@ Three 403 codes are expected here and NONE is a failure of the vet:
 - **`owner_unresolved`** — the unit has no recorded owner at all (a row predating
   the ownership widening, or one created by a token carrying no device id). SoD
   cannot be evaluated, so it is refused rather than passed vacuously. An ordinary
-  Free transition claims ownership and un-strands it.
+  Free transition claims ownership and un-strands it. ⚠️ **A well-formed
+  `independence` declaration does NOT meet this refusal**: it evidences the
+  attester's context, and an unresolved owner is deliberately not an obstacle to
+  it (pinned in coord by
+  `a_declaration_attests_an_ownerless_unit_but_never_anonymously`). This is the
+  one refusal a declaration actually removes.
 - **`attester_unresolved`** — YOUR token derives no actor key, i.e. it carries a
   `tenant_id` but no `device_id`. This is the one you will hit on the acting-user
   service token (transport tier 3 above). Fall back the same way, but say in your
@@ -2558,9 +2595,10 @@ failed. Two facts so you do not burn a cycle looking for a way around it:
   (a) That six-tier ladder is the **GATE** side (`gates_authority.rs`). The
   WORK-UNIT attestation this step performs goes through
   `work_unit_registry::authorize_target_transition`, which is a flat
-  `owner_actor_key != attester_key` compare — its own doc comment records the
-  divergence between the two and files closing it as a follow-up. Do not read
-  the tier analysis as describing what refuses your `vetted` write.
+  `owner_actor_key != attester_key` compare **only when no `independence`
+  declaration is sent** — its own doc comment records the divergence between the
+  two and files closing it as a follow-up. Do not read the tier analysis as
+  describing what refuses your `vetted` write.
   (b) *"A subagent you spawn does not qualify"* is true of the ACTOR-KEY test
   and is no longer the operative rule. Under [policy:
   `independence-is-context-not-credential`] a fresh-context subagent is
@@ -2741,13 +2779,29 @@ leave it in the report.
   `agent_non_author` IS usable when the clearer is a different device or carries
   proven session identity. ⚠️ **The sentence that used to follow — "the work-unit
   attestation check now routes through this SAME ladder" — is FALSE and was
-  removed 2026-09-03.** Verified on qontinui-coord `origin/main`:
-  `work_unit_registry::authorize_target_transition` takes the two actor keys
-  plus an optional `independence` declaration, and does a flat
-  `owner == attester` compare when no declaration is sent;
+  removed 2026-09-03.** Re-verified on qontinui-coord `origin/main` 2026-09-23 at
+  `037fc1a8f`: `work_unit_registry::authorize_target_transition` takes the two
+  actor keys **plus an optional `independence` declaration**
+  (`{verified, against, context}`), and does the flat `owner == attester`
+  compare **only when no declaration is sent** — a well-formed one authorizes an
+  Attested transition without that compare, while still refusing
+  `attester_unresolved` when the caller's token derives no actor key;
   `non_author_allows_identities` is called only from `gates.rs`. The ladder is
   real for GATES and fictional for work-unit attestation — do not carry it
-  across. For the work-unit rule read policy live rather than restating it:
+  across. ⚠️ **Whether the coord instance serving YOU advertises that field is a
+  READ — and NOT the one your own tool list answers.** Measured 2026-09-23: the
+  authoring session's advertised `coord_work_unit_transition` schema carried
+  four properties while the door carried six, so a session trusting its own tool
+  list would have recorded "not served" when the door said otherwise. Read the
+  door — `coord-revive.sh tools`, then look for `independence` in that tool's
+  `inputSchema` — and take the worked declaration from `/vet-plan` →
+  `self_attestation_forbidden`; if your own tool list is the stale one, send it
+  with `coord-revive.sh call coord_work_unit_transition '<json>'` rather than
+  the tool your session advertises, and verify by read — a zero exit is not
+  evidence the write landed. ⚠️ **Never re-allocate to get past
+  `self_attestation_forbidden`**: a fresh allocate issues a NEW agent id the
+  legacy compare would admit, which that refusal itself names *"a known defect
+  being tracked, not a sanctioned route"*. For the work-unit rule read policy live rather than restating it:
   `/policy get policy plan-discipline` and `verification-and-evidence`
   [policy: never-pin-a-mutable-policy-value]. (Canonical for gates:
   `_gate-registration` → "`gate_class`".)
@@ -2896,7 +2950,7 @@ Brief — under 150 words. State:
   origin/main <short-sha>` — and **quote the sha**, not just the date. It is
   what lets the next reader tell a citation that has gone stale from one that
   was always wrong, without re-resolving every row
-- **The evidence manifest** (§2a): quote `stored` from the transition's `vet_evidence` receipt — the count coord **kept**, never the count you sent — and `admitted_on`, the arm that actually carried the transition (`identity` / `graduation` / `no_transition`). **Read both; do not infer either.** No receipt at all means the running coord has no manifest surface: say *built but not stored*. If you fell back to `vetted_unattested`, name the identity refusal that sent you there (`self_attestation_forbidden` / `owner_unresolved` / `attester_unresolved`) — never the manifest, which admits nothing
+- **The evidence manifest** (§2a): quote `stored` from the transition's `vet_evidence` receipt — the count coord **kept**, never the count you sent — and `admitted_on`, the arm that actually carried the transition (`identity` / `graduation` / `no_transition`). **Read both; do not infer either.** ⚠️ Where you sent an `independence` declaration, SAY SO explicitly: `admitted_on` reads `identity` on that path too, so it cannot be quoted as evidence of an actor difference. No receipt at all means the running coord has no manifest surface: say *built but not stored*. If you fell back to `vetted_unattested`, name the identity refusal that sent you there (`self_attestation_forbidden` / `owner_unresolved` / `attester_unresolved`) — never the manifest, which admits nothing
 - Open questions you **resolved using the Decision policy**, with the deciding priority in parentheses (e.g. "picked registry-backed lookup (scalability)")
 - Anything you flagged for the user that you did NOT auto-fix — limit this to product/scope/stakeholder calls the Decision policy can't decide; engineering trade-offs should already be resolved in the plan
 
