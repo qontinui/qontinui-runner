@@ -2045,12 +2045,30 @@ mod device_token_door_tests {
 
     /// A structurally valid, unexpired device JWT carrying `tenant`'s claim —
     /// distinct per tenant, so an assertion can tell whose token came back.
+    ///
+    /// **`exp` is sampled ONCE per process, not per call.** Several tests store
+    /// `jwt_for(t)` and then assert the door handed back `jwt_for(t)` — a second
+    /// call. With a per-call `now + 3600` those two strings differ whenever the
+    /// calls straddle a second boundary, so the assertion was a time race that
+    /// passed on a fast box and failed on a slow one. It failed exactly that way
+    /// on `test (windows-latest)` (`the_kill_switch_restores_the_default_slot`,
+    /// two `Ok(Some("***"))` that were not equal — the redacting `Debug` hid
+    /// that the payloads differed by one second). Memoising the deadline makes
+    /// the helper a stable identity per tenant while keeping the token
+    /// genuinely unexpired, which is what every caller actually needs.
+    fn jwt_exp() -> u64 {
+        static EXP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *EXP.get_or_init(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after the unix epoch")
+                .as_secs()
+                + 3_600
+        })
+    }
+
     fn jwt_for(tenant: uuid::Uuid) -> String {
-        let exp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            + 3_600;
+        let exp = jwt_exp();
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
         let payload = URL_SAFE_NO_PAD.encode(
             serde_json::json!({"sub_type": "device", "tenant_id": tenant, "exp": exp}).to_string(),
@@ -2097,6 +2115,21 @@ mod device_token_door_tests {
         am.store_tenant_device_jwt(&b, &jwt_for(b)).unwrap();
         assert_eq!(am.try_list_tenant_device_jwt_tenants().unwrap().len(), 2);
         (am, a, b)
+    }
+
+    /// The fixture invariant three assertions in this module silently rely on:
+    /// `jwt_for(t)` is ONE string for the life of the process, so "the door
+    /// returned the token we stored" is a real comparison rather than a race
+    /// against the wall clock. Fails on a per-call `exp` only when the two calls
+    /// straddle a second, which is why it needs to be asserted rather than
+    /// observed.
+    #[test]
+    fn the_token_fixture_is_stable_across_calls() {
+        let t = tenant(0xA1);
+        assert_eq!(jwt_for(t), jwt_for(t));
+        assert_ne!(jwt_for(t), jwt_for(tenant(0xB2)));
+        assert_eq!(crate::auth::jwt_tenant_claim(&jwt_for(t)), Some(t));
+        assert!(crate::auth::looks_like_jwt(&jwt_for(t)));
     }
 
     /// P3 acceptance 1. Two tenant slots and no argument: refused, typed, and
