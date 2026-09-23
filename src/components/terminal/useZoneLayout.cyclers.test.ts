@@ -11,12 +11,15 @@
  * fallback, and the un-maximize — are tested where they live.
  *
  * vitest runs `environment: "node"` with no DOM and no React test renderer, so
- * the hook is driven through a minimal hooks harness: `react` is mocked with a
- * slot-indexed `useState` whose setters really update state, `useCallback`
- * returns its function, `useRef` a ref, and `useEffect` is inert (the effects
- * only reconcile/persist, and the persisted fixture is already reconciled).
- * Each `render()` re-invokes the hook against the current state, exactly as
- * React would re-render after a state update.
+ * the hook is driven through a minimal hooks harness: `react` is mocked with
+ * slot-indexed `useState` / `useRef` / `useEffect`. Setters really update
+ * state; effects RUN after each render when their deps change (so the hook's
+ * reconcile and auto-grow effects act on the fixture exactly as they would in
+ * React), and the host re-renders until state settles. Each `render()` is one
+ * such settled render. Every fixture is additionally asserted to be a settled
+ * state up front — `reconcileAssignments` returns it unchanged and
+ * `computeAutoGrowLayoutId` wants no grow — so no test can pass on a state
+ * the hook would have rewritten.
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -28,14 +31,28 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const harness = vi.hoisted(() => {
   const slots: unknown[] = [];
   let cursor = 0;
+  let dirty = false;
+  let pendingEffects: Array<() => void> = [];
+  const depsChanged = (prev: unknown[] | undefined, next: unknown[] | undefined) =>
+    !prev || !next || prev.length !== next.length || prev.some((d, k) => !Object.is(d, next[k]));
   return {
-    slots,
     reset() {
       slots.length = 0;
       cursor = 0;
+      dirty = false;
+      pendingEffects = [];
     },
     beginRender() {
       cursor = 0;
+      dirty = false;
+      pendingEffects = [];
+    },
+    /** Run the effects queued by the last render; true if any state changed. */
+    flushEffects(): boolean {
+      const effects = pendingEffects;
+      pendingEffects = [];
+      for (const run of effects) run();
+      return dirty;
     },
     useState<T>(init: T | (() => T)) {
       const slot = cursor++;
@@ -43,9 +60,24 @@ const harness = vi.hoisted(() => {
         slots[slot] = typeof init === "function" ? (init as () => T)() : init;
       }
       const set = (v: T | ((prev: T) => T)) => {
-        slots[slot] = typeof v === "function" ? (v as (p: T) => T)(slots[slot] as T) : v;
+        const next = typeof v === "function" ? (v as (p: T) => T)(slots[slot] as T) : v;
+        if (!Object.is(next, slots[slot])) dirty = true;
+        slots[slot] = next;
       };
       return [slots[slot] as T, set] as const;
+    },
+    useRef<T>(init: T) {
+      const slot = cursor++;
+      if (!(slot in slots)) slots[slot] = { current: init };
+      return slots[slot] as { current: T };
+    },
+    useEffect(effect: () => void, deps?: unknown[]) {
+      const slot = cursor++;
+      const prev = slots[slot] as unknown[] | undefined;
+      if (depsChanged(prev, deps)) {
+        slots[slot] = deps;
+        pendingEffects.push(effect);
+      }
     },
   };
 });
@@ -53,8 +85,8 @@ const harness = vi.hoisted(() => {
 vi.mock("react", () => ({
   useState: harness.useState,
   useCallback: <F>(fn: F) => fn,
-  useRef: <T>(init: T) => ({ current: init }),
-  useEffect: () => {},
+  useRef: harness.useRef,
+  useEffect: harness.useEffect,
 }));
 
 const persisted = vi.hoisted(() => ({ value: null as unknown }));
@@ -66,7 +98,10 @@ vi.mock("@/lib/instance-storage", () => ({
 }));
 
 import {
+  computeAutoGrowLayoutId,
   findNextZone,
+  reconcileAssignments,
+  resolveLayout,
   useZoneLayout,
   type SessionState,
   type ZoneAssignments,
@@ -149,25 +184,45 @@ describe("findNextZone — keyboard zone navigation (any occupied zone)", () => 
 // ---------------------------------------------------------------------------
 
 /**
- * A `quad` (4 zones) holding TWO tabs parked in zones 2 and 3. Two tabs is
- * the point: a hook that handed the walk `tabIds.length` (2) instead of
- * `layout.zones.length` (4) would only ever visit the empty zones 0 and 1.
+ * A `quad` (4 zones) holding tabs parked in high zones. By default TWO tabs in
+ * zones 2 and 3 — two is the point: a hook that handed the walk
+ * `tabIds.length` (2) instead of `layout.zones.length` (4) would only ever
+ * visit the empty zones 0 and 1.
  */
-function mountSparseQuad(opts: { focusedZone?: number; assignments?: ZoneAssignments } = {}) {
+function mountSparseQuad(
+  opts: { focusedZone?: number; assignments?: ZoneAssignments; tabIds?: string[] } = {},
+) {
   harness.reset();
-  persisted.value = {
-    layoutId: "quad",
-    assignments: opts.assignments ?? { 2: "tab-x", 3: "tab-y" },
-    focusedZone: opts.focusedZone ?? 0,
-  };
-  const tabIds = ["tab-x", "tab-y"];
-  // Named like a component: it is the harness's stand-in for one, re-invoked
-  // per "render" against the current hook state.
+  const assignments = opts.assignments ?? { 2: "tab-x", 3: "tab-y" };
+  const tabIds = opts.tabIds ?? ["tab-x", "tab-y"];
+
+  // The fixture must be a state real React would leave alone: reconcile is a
+  // no-op on it (same identity) and auto-grow wants nothing.
+  const zones = resolveLayout("quad", tabIds.length).zones.length;
+  expect(zones).toBe(4);
+  expect(reconcileAssignments(assignments, tabIds, zones)).toBe(assignments);
+  expect(computeAutoGrowLayoutId("quad", tabIds.length)).toBeNull();
+
+  persisted.value = { layoutId: "quad", assignments, focusedZone: opts.focusedZone ?? 0 };
+  // Named like a component: it is the harness's stand-in for one render.
   function ZoneLayoutHost() {
     harness.beginRender();
     return useZoneLayout(tabIds, "cyclers-test", "main");
   }
-  return ZoneLayoutHost;
+  // One settled render: render, run the effects that render queued, and
+  // re-render until state stops changing — what React does after a commit.
+  function renderSettled() {
+    for (let pass = 0; pass < 10; pass++) {
+      const result = ZoneLayoutHost();
+      if (!harness.flushEffects()) return result;
+    }
+    throw new Error("zone layout did not settle within 10 renders");
+  }
+  // Settle once, then prove the effects left the fixture as mounted.
+  const first = renderSettled();
+  expect(first.assignments).toEqual(assignments);
+  expect(first.layoutId).toBe("quad");
+  return renderSettled;
 }
 
 describe("useZoneLayout — state cyclers (hook level)", () => {
@@ -254,14 +309,22 @@ describe("useZoneLayout — keyboard zone navigation (hook level)", () => {
   });
 
   it("reports changed:false when the only occupied zone is already focused", () => {
-    const render = mountSparseQuad({ focusedZone: 3, assignments: { 3: "tab-y" } });
+    const render = mountSparseQuad({
+      focusedZone: 3,
+      assignments: { 3: "tab-y" },
+      tabIds: ["tab-y"],
+    });
     expect(render().focusNextZone()).toEqual({ changed: false });
     expect(render().focusPrevZone()).toEqual({ changed: false });
     expect(render().focusedZone).toBe(3);
   });
 
   it("moves (changed:true) from an empty zone to the single occupied one", () => {
-    const render = mountSparseQuad({ focusedZone: 0, assignments: { 3: "tab-y" } });
+    const render = mountSparseQuad({
+      focusedZone: 0,
+      assignments: { 3: "tab-y" },
+      tabIds: ["tab-y"],
+    });
     expect(render().focusNextZone()).toEqual({ changed: true });
     expect(render().focusedZone).toBe(3);
   });
