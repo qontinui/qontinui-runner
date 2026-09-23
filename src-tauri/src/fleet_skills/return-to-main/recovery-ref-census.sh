@@ -35,23 +35,30 @@
 # Output: one JSON object on stdout:
 #   {"tool","schema","device","root","coord_url","credential","refs":[{"repo",
 #    "checkout","wip_ref","sha","status":"GATED"|"NEEDS_GATE"|"UNKNOWN","reason",
-#    "gates":[{"gate_id","verdict","consumed_outcome","live"}],
+#    "tenant_id","gates":[{"gate_id","verdict","consumed_outcome","live"}],
 #    "registration":{…}|null}],"counts":{"refs","gated","needs_gate","unknown"},
 #    "error"}
 #   `registration` (NEEDS_GATE only) is the coord_register_gate argument object,
 #   verbatim: claim_kind, resource_key, predicate, continuation,
 #   clearance_audience, gate_class.
+#   `tenant_id` is the tenant PROVEN to own the checkout's origin repo -- the
+#   tenant the gates were looked up in, and so the tenant a NEEDS_GATE
+#   registration must be made under (null when unproven, which is UNKNOWN).
 # ENV  COORD_HTTP_URL (default https://coord.qontinui.io), RECOVERY_CENSUS_CURL
 #      (curl override; the suite's stub), RECOVERY_CENSUS_NO_MINT=1,
-#      RECOVERY_CENSUS_TIMEOUT (seconds per call, default 60). Credential:
-#      $COORD_DEVICE_JWT, ~/.qontinui/coord-device-jwt (each only while its exp
-#      is >60 s away), then POST /agents/credential with the device id. Staged
-#      in a mode-600 header file, passed as `curl -H @file`, never on argv.
+#      RECOVERY_CENSUS_TIMEOUT (seconds per call, default 60). Credential: per
+#      repo, for the tenant PROVEN to own the checkout's origin
+#      (lib/coord-tenant-credential.sh): $COORD_DEVICE_JWT or
+#      ~/.qontinui/coord-device-jwt only while its exp is >60 s away AND its
+#      tenant_id claim is that tenant, else POST /agents/credential naming it.
+#      Staged in a mode-600 header file, passed as `curl -H @file`, never on
+#      argv.
 #
 # EXIT
 #   0  every snapshot has a live gate (or there are none)
 #   1  at least one snapshot NEEDS_GATE, and every ref was decided
-#   3  UNKNOWN: coord could not be read for some ref, or no device id
+#   3  UNKNOWN: coord could not be read for some ref, the tenant owning some
+#      ref's repo could not be proven, or no device id
 #   4  usage
 # ---- END HELP
 
@@ -117,45 +124,36 @@ if [ -z "$DEVICE" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# The credential. The same cascade land-evidence.sh stages.
-jwt_shaped() { case "$1" in "" | *[!A-Za-z0-9._-]*) return 1 ;; esac; [ "$(printf '%s' "$1" | tr -cd '.' | wc -c | tr -d ' ')" = 2 ]; }
-jwt_exp_future() {
-  local seg exp
-  seg="$(printf '%s' "$1" | cut -d. -f2 | tr '_-' '/+')"
-  case $(( ${#seg} % 4 )) in 2) seg="$seg==" ;; 3) seg="$seg=" ;; esac
-  exp="$(printf '%s' "$seg" | base64 --decode 2>/dev/null | grep -o '"exp"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*$')"
-  [ -n "$exp" ] && [ $((exp - $(date +%s))) -gt 60 ]
-}
+# The credential: per REPO, for the tenant PROVEN to own it
+# (lib/coord-tenant-credential.sh; plan
+# 2026-09-23-ccfg-scripts-mint-device-credentials-with-no-tenant, Phase 2).
+# `/coord/agent-gates` is tenant-scoped, and a tenant-less mint on a device
+# bound to several tenants lands on the legacy pointer -- measured 2026-09-23:
+# 3 gates under that token, 500 under the tenant that owns qontinui/*. A
+# retention gate looked for under the wrong tenant is invisible, so the ref
+# would read NEEDS_GATE and be registered a second time. A ref whose owning
+# tenant cannot be PROVEN (no GitHub origin, every bound tenant 404s, the door
+# or the mint fails) is UNKNOWN -- never NEEDS_GATE, never GATED.
 np() { native_path_w "$1"; }
-# jwt-cascade-selection: both STATIC sources are gated on SHAPE and on `exp`
-# BEFORE selection -- `jwt_shaped` && `jwt_exp_future` (exp more than 60 s away)
-# at both rungs below -- so an expired or malformed $COORD_DEVICE_JWT falls
-# THROUGH to ~/.qontinui/coord-device-jwt instead of shadowing it (#366: the
-# first USABLE source wins, not the first with bytes). The predicate is spelled
-# `jwt_exp_future` rather than `jwt_fresh`, which is the only reason check #E's
-# FRESH_RE does not see it. The third rung is not static: it mints via
-# /agents/credential when neither static rung yielded a usable token, unless
-# RECOVERY_CENSUS_NO_MINT=1 -- so a stale token cannot shadow the mint either.
-stage_bearer() { # -> prints source; writes $TMP/bearer.hdr (0600)
-  local jwt="" src=none e f
-  rm -f "$TMP/bearer.hdr"
-  e="$(printf '%s' "${COORD_DEVICE_JWT:-}" | tr -d '[:space:]')"
-  if jwt_shaped "$e" && jwt_exp_future "$e"; then jwt="$e"; src=env
-  elif [ -n "$home" ] && [ -r "$home/.qontinui/coord-device-jwt" ]; then
-    f="$(tr -d '[:space:]' < "$home/.qontinui/coord-device-jwt" 2>/dev/null)"
-    jwt_shaped "$f" && jwt_exp_future "$f" && { jwt="$f"; src=file; }
+CTC_OK=0
+if [ -r "$LIB_DIR/coord-tenant-credential.sh" ]; then
+  # shellcheck source=../../../scripts/lib/coord-tenant-credential.sh
+  . "$LIB_DIR/coord-tenant-credential.sh" && declare -F ctc_owner_tenant >/dev/null 2>&1 && CTC_OK=1
+fi
+export CTC_TMP="$TMP" CTC_CURL="$CURL" CTC_COORD_URL="$COORD_URL" CTC_TIMEOUT="$NET_TIMEOUT" CTC_DEVICE="$DEVICE"
+[ "${RECOVERY_CENSUS_NO_MINT:-0}" = 1 ] && export CTC_NO_MINT=1
+declare -A OWNER_STATE=() OWNER_TENANT=() OWNER_NOTE=()
+# owner_of <checkout> -> sets O_SLUG O_STATE O_TENANT O_NOTE (cached per slug)
+owner_of() {
+  O_SLUG="$(ctc_origin_slug "$1")"; O_TENANT=""
+  if [ -z "$O_SLUG" ]; then
+    O_STATE=unknown; O_NOTE="its origin is not a github.com owner/name, so no tenant can be proven to own it"; return 0
   fi
-  if [ -z "$jwt" ] && [ "${RECOVERY_CENSUS_NO_MINT:-0}" != 1 ]; then
-    ( umask 077; : > "$TMP/mint.json" )
-    if [ "$("$CURL" -sS -o "$(np "$TMP/mint.json")" -w '%{http_code}' --connect-timeout 10 -m "$NET_TIMEOUT" \
-           -X POST "$COORD_URL/agents/credential" -H 'Content-Type: application/json' -d "{\"device_id\":\"$DEVICE\"}" 2>/dev/null)" = 200 ]; then
-      f="$(grep -o '"\(token\|agent_jwt\|jwt\|access_token\)"[[:space:]]*:[[:space:]]*"[^"]*"' "$TMP/mint.json" | head -1 | sed 's/.*:[[:space:]]*"//; s/"$//')"
-      jwt_shaped "$f" && { jwt="$f"; src=mint; }
-    fi
-    rm -f "$TMP/mint.json"
+  if [ -z "${OWNER_STATE[$O_SLUG]+s}" ]; then
+    ctc_owner_tenant "$O_SLUG"
+    OWNER_STATE[$O_SLUG]="$CTC_STATE"; OWNER_TENANT[$O_SLUG]="$CTC_TENANT"; OWNER_NOTE[$O_SLUG]="$CTC_NOTE"
   fi
-  [ -n "$jwt" ] && ( umask 077; printf 'Authorization: Bearer %s\n' "$jwt" > "$TMP/bearer.hdr" )
-  printf '%s' "$src"
+  O_STATE="${OWNER_STATE[$O_SLUG]}"; O_TENANT="${OWNER_TENANT[$O_SLUG]}"; O_NOTE="${OWNER_NOTE[$O_SLUG]}"
 }
 
 PY=""
@@ -179,7 +177,7 @@ for gitdir in "$ROOT"/*/.git; do
 done
 
 CRED="not_needed"
-[ "${#REFS[@]}" -gt 0 ] && CRED="$(stage_bearer)"
+[ "${#REFS[@]}" -gt 0 ] && CRED="owner_tenant_per_repo"
 
 registration_json() { # <repo> <wip_ref>
   printf '{"claim_kind":"recovery_ref","resource_key":%s,"predicate":{"kind":"time_elapsed","duration_secs":1209600},"continuation":{"action":"run_skill","skill":"return-to-main","args":["--reap",%s,%s,"--device",%s],"target_device_id":%s},"clearance_audience":"agent","gate_class":"routine-review"}' \
@@ -189,7 +187,7 @@ registration_json() { # <repo> <wip_ref>
 OUT_REFS=""; N_GATED=0; N_NEED=0; N_UNK=0; ERR=""
 [ -n "$PY" ] || ERR="no Python 3 interpreter to parse coord's gate listing"
 [ -n "$ERR" ] || [ -r "$LIB_DIR/envelope.py" ] || ERR="lib/envelope.py is not readable in $LIB_DIR"
-[ "$CRED" = none ] && ERR="no usable device JWT (env, ~/.qontinui/coord-device-jwt, bootstrap mint all missed)"
+[ -n "$ERR" ] || [ "$CTC_OK" = 1 ] || ERR="lib/coord-tenant-credential.sh is not usable in $LIB_DIR, so no tenant can be proven to own any repo"
 
 cat >"$TMP/classify.py" <<'PYEOF'
 import json, sys
@@ -225,9 +223,14 @@ i=0
 for row in ${REFS[@]+"${REFS[@]}"}; do
   IFS=$'\x1f' read -r repo co ref sha <<<"$row"
   i=$((i + 1))
-  status=""; reason=""; gates="[]"; reg="null"
+  status=""; reason=""; gates="[]"; reg="null"; tenant=""; rcred=""
+  [ -n "$ERR" ] || owner_of "$co"
   if [ -n "$ERR" ]; then
     status=UNKNOWN; reason="$ERR"
+  elif [ "$O_STATE" != proven ]; then
+    status=UNKNOWN; reason="the tenant owning ${O_SLUG:-the origin repo of this checkout} is not proven, so its retention gates cannot be looked up: $O_NOTE"
+  elif rcred="$(ctc_stage_for_tenant "$O_TENANT")"; tenant="$O_TENANT"; [ "${rcred#rejected}" != "$rcred" ]; then
+    status=UNKNOWN; reason="no credential for $O_SLUG's tenant $O_TENANT: ${rcred#rejected}"
   else
     : > "$TMP/g.$i.json"
     code="$("$CURL" -sS -G -o "$(np "$TMP/g.$i.json")" -w '%{http_code}' --connect-timeout 10 -m "$NET_TIMEOUT" \
@@ -237,7 +240,7 @@ for row in ${REFS[@]+"${REFS[@]}"}; do
               --data-urlencode "limit=100" \
               "$COORD_URL/coord/agent-gates" 2>"$TMP/g.$i.err")"
     if [ "$code" != 200 ]; then
-      status=UNKNOWN; reason="GET /coord/agent-gates answered HTTP ${code:-000} (credential: $CRED) $(head -1 "$TMP/g.$i.err" | cut -c1-120)"
+      status=UNKNOWN; reason="GET /coord/agent-gates answered HTTP ${code:-000} (tenant $tenant, credential: $rcred) $(head -1 "$TMP/g.$i.err" | cut -c1-120)"
     elif ! "$PY" "$(np "$TMP/classify.py")" "$DEVICE:$repo:$ref" "$(np "$LIB_DIR")" <"$TMP/g.$i.json" >"$TMP/c.$i.out" 2>/dev/null
     then
       status=UNKNOWN; reason="coord's gate listing for this anchor did not parse, was truncated, or carried a row outside the requested anchor"
@@ -254,7 +257,7 @@ for row in ${REFS[@]+"${REFS[@]}"}; do
     fi
   fi
   case "$status" in GATED) N_GATED=$((N_GATED + 1)) ;; NEEDS_GATE) N_NEED=$((N_NEED + 1)) ;; *) N_UNK=$((N_UNK + 1)) ;; esac
-  OUT_REFS="${OUT_REFS:+$OUT_REFS,}{\"repo\":$(js "$repo"),\"checkout\":$(js "$co"),\"wip_ref\":$(js "$ref"),\"sha\":$(js "$sha"),\"status\":$(js "$status"),\"reason\":$(js "$reason"),\"gates\":$gates,\"registration\":$reg}"
+  OUT_REFS="${OUT_REFS:+$OUT_REFS,}{\"repo\":$(js "$repo"),\"checkout\":$(js "$co"),\"wip_ref\":$(js "$ref"),\"sha\":$(js "$sha"),\"status\":$(js "$status"),\"reason\":$(js "$reason"),\"tenant_id\":$(jsn "$tenant"),\"gates\":$gates,\"registration\":$reg}"
 done
 
 printf '{"tool":"recovery-ref-census.sh","schema":1,"device":%s,"root":%s,"coord_url":%s,"credential":%s,"refs":[%s],"counts":{"refs":%d,"gated":%d,"needs_gate":%d,"unknown":%d},"error":%s}\n' \
