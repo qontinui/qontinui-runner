@@ -1,5 +1,6 @@
 /**
- * Pure-helper tests for the StatusStrip's two count reconciliations.
+ * Pure-helper tests for the Terminal page's count reconciliations
+ * (`sessionCounts.ts`, promoted out of `StatusStrip.tsx`).
  *
  * The runner's vitest config is `environment: "node"` (no jsdom), so the strip
  * itself can't be rendered here — the counting rules are extracted as pure
@@ -14,7 +15,7 @@ import {
   splitNeedsInput,
   unionErrorCount,
   unionSessionCount,
-} from "./StatusStrip";
+} from "./sessionCounts";
 
 describe("countTabsInState", () => {
   it("counts only tabs that are still in the live tab list", () => {
