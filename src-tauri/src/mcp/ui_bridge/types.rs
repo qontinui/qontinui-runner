@@ -270,8 +270,17 @@ pub struct DiscoverStatesRequest {
 
 /// Machine-readable error codes for UI Bridge operations.
 /// Enables AI agents to match on error type rather than parsing strings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// This is the ONLY declaration of the vocabulary. The GraphQL surface
+/// (`graphql::types::UiBridgeErrorCode`, published in `graphql/schema.graphql`)
+/// is a re-export of this very type via the `async_graphql::Enum` derive, so a
+/// variant added here reaches GraphQL clients with no second list to update.
+/// The GraphQL value names and the serde wire names are both
+/// SCREAMING_SNAKE_CASE; `ui_bridge_error_code_graphql_names_equal_serde_wire_names`
+/// (`graphql/schema.rs`) pins that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, async_graphql::Enum)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[graphql(rename_items = "SCREAMING_SNAKE_CASE")]
 pub enum UiBridgeErrorCode {
     // Transport errors
     Timeout,
@@ -818,7 +827,7 @@ pub fn typed_frontend_code_by_name(code_name: &str, message: &str) -> Option<UiB
         .iter()
         .find(|(name, _)| *name == code_name)
         .map(|(_, code)| UiBridgeError {
-            code: code.clone(),
+            code: *code,
             message: message.to_string(),
             recovery: Some(recovery_hint_for(code)),
             context: None,
@@ -839,7 +848,7 @@ pub fn typed_frontend_code(error_msg: &str) -> Option<UiBridgeError> {
         if let Some(rest) = error_msg.strip_prefix(prefix) {
             if rest.starts_with(": ") {
                 return Some(UiBridgeError {
-                    code: code.clone(),
+                    code: *code,
                     message: error_msg.to_string(),
                     recovery: Some(recovery_hint_for(code)),
                     context: None,
