@@ -1,0 +1,143 @@
+// Positive fixture: every cfg'd construct below ENDS early (a field, a
+// variant, a match arm), so each production hit after it MUST be reported.
+// Also the lexer's hard cases. Read as TEXT by
+// tests/workspace_assumptions_are_enumerated.rs; never compiled.
+struct Handles {
+    #[cfg(target_os = "windows")]
+    stdout_raw_handle: Option<isize>,
+    #[cfg(test)]
+    test_only: HashMap<String, u8>,
+    name: String,
+}
+
+fn after_cfg_field() -> &'static str {
+    "http://localhost:8000"
+}
+
+enum Mode {
+    Prod,
+    #[cfg(test)]
+    Test,
+}
+
+fn after_cfg_variant() -> &'static str {
+    "http://localhost:3001"
+}
+
+fn cfg_match_arm(m: Mode) -> &'static str {
+    match m {
+        #[cfg(test)]
+        Mode::Test => "/home/test-only-arm",
+        Mode::Prod => "D:/after/arm",
+    }
+}
+
+fn after_cfg_match_arm() -> &'static str {
+    "C:/after/the/match"
+}
+
+fn lexer_raw_string() -> &'static str {
+    let _ = r#"a "quoted" // not a comment"#;
+    "/home/someone/after-raw"
+}
+
+/* outer /* nested */ "http://localhost:8000" still inside the outer comment */
+fn lexer_nested_comment() -> &'static str {
+    "C:/after/nested"
+}
+
+fn lexer_chars() -> (char, char, &'static str) {
+    ('\'', '/', "http://127.0.0.1:9875/x")
+}
+
+fn lexer_lifetime<'a>(x: &'a str) -> &'a str {
+    let _: &'a str = "localhost:6379";
+    x
+}
+
+#[cfg(windows)]
+impl Handles {
+    fn windows_method_without_sibling() {}
+}
+
+#[cfg(windows)]
+mod win_outer {
+    #[cfg(test)]
+    mod tests {
+        fn inner_test() -> &'static str {
+            "http://localhost:8000"
+        }
+    }
+}
+
+fn after_nested_regions() -> u16 {
+    9875
+}
+
+// Region STACK, both directions. The outer `cfg(windows)` must survive the
+// inner `cfg(test)` module: after `tests` closes we are still inside windows,
+// so the `taskkill` literal below is NOT reported (os_bound_tooling is
+// suppressed under windows) while the machine_path literal beside it IS.
+// Flatten the stack to a single region and both verdicts flip.
+#[cfg(windows)]
+mod win_stack {
+    #[cfg(test)]
+    mod tests {
+        fn t() -> &'static str {
+            "D:/test-only"
+        }
+    }
+
+    pub fn after_nested_test_mod() -> &'static str {
+        let _ = std::process::Command::new("taskkill").arg("/F").status();
+        "D:/reported-under-windows"
+    }
+}
+
+// An FFI declaration inside an already-cfg'd module: the `extern` block, not
+// the cfg attribute, is what exempts it from the windows-sibling check —
+// a declaration has no body and so can never grow a sibling.
+#[cfg(windows)]
+mod win_ffi {
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn GetLastErrorShim() -> u32;
+    }
+}
+
+// `extern "C" fn` is a FN, not an FFI block: its `{` is the fn's own. If it
+// armed the FFI scope, that arming would survive to the `impl Console {`
+// below, which would then swallow the `Console::` qualification (changing the
+// disposition KEY) and exempt `win_only` from the windows-sibling check — so
+// the rows here would read `launcher` with no `win_only` at all.
+extern "C" fn cb() -> u32 {
+    0
+}
+
+impl Console {
+    pub fn launcher() -> &'static str {
+        "powershell.exe"
+    }
+
+    #[cfg(windows)]
+    pub fn win_only(&self) {}
+}
+
+// A code-generating template whose lines are attribute-shaped. This block
+// demonstrates that such a template does NOT swallow what follows — and it
+// does not, either way: without the skeleton gate the template's `#[cfg(test)]`
+// opens a region that is never ENTERED (the skeleton blanks the template's
+// braces) and dies at the `;` ending this `const`, before `after_template` is
+// scanned. The gate itself is pinned where it IS observable — a hit on the very
+// line that would open the region — by
+// `attribute_shaped_lines_inside_string_literals_are_data`.
+pub const TEMPLATE: &str = r#"
+#[cfg(test)]
+mod tests {
+    fn t() {}
+}
+"#;
+
+fn after_template() -> &'static str {
+    "http://localhost:9875/health"
+}

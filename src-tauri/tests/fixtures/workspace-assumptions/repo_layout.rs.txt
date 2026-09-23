@@ -1,0 +1,6 @@
+// Planted fixture for class `repo_layout`. Read as TEXT by
+// tests/workspace_assumptions_are_enumerated.rs; never compiled.
+fn planted_repo_layout(root: &Path) -> PathBuf {
+    let _ = std::env::var("QONTINUI_ROOT");
+    root.join("qontinui-claude-config").join(".claude/commands")
+}

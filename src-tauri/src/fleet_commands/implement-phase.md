@@ -287,7 +287,8 @@ trigger is NOT a gate; skip those and just report the blocker.
   `deploy_healthy`, `claim_terminal`, `operator_approval`, `ci_green`,
   `ref_exists`, `metric_threshold`, `time_elapsed`, `unit_ready`,
   `migration_at_head`, `infra_drift_clear`, `file_exists`, `sql_count`,
-  `unit_status`, `gate_cleared`, `commit_live`, `runner_served_sha`; plus — **exception cases only,
+  `unit_status`, `gate_cleared`, `commit_live`, `runner_served_sha`,
+  `schema_object_exists`; plus — **exception cases only,
   see the Continuation bullet below** — an optional typed `continuation` or legacy
   `continuation_prompt` e.g. `run /implement-phase <stem> "<phase>"`). **HTTP
   fallback** when MCP is unavailable — for a plan-anchored gate it is now TWO

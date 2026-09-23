@@ -1,0 +1,4 @@
+// Planted fixture for class `machine_path`.
+fn planted_machine_path() -> [&'static str; 2] {
+    ["D:/qontinui-root", "/home/someone/.qontinui"]
+}

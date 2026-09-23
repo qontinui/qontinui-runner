@@ -1,0 +1,4 @@
+// Planted fixture for class `dev_ports`.
+fn planted_dev_ports() -> &'static str {
+    "http://localhost:8000/api/v1"
+}

@@ -348,9 +348,15 @@ pub struct TransitionBody {
 
 /// Build the `metadata` JSON pushed alongside the work-unit: the enrichment
 /// coord's old slug+status projection discarded — phase sub-units, dependency
-/// edges, and the source-file back-link.
+/// edges, the source-file back-link, and the plan's `area`.
+///
+/// `area` is emitted only when the status block declares a kebab-case one
+/// ([`super::parser::extract_area`]); otherwise the KEY IS OMITTED, never sent
+/// as `null` or `""`. coord's upsert replaces `metadata` wholesale, so for a
+/// plan-backed unit the plan file is the single author of its area: a plan
+/// that declares none sends none.
 pub fn build_metadata(u: &ParsedWorkUnit) -> serde_json::Value {
-    serde_json::json!({
+    let mut m = serde_json::json!({
         "depends_on": u.depends_on,
         "phases": u
             .phases
@@ -358,7 +364,11 @@ pub fn build_metadata(u: &ParsedWorkUnit) -> serde_json::Value {
             .map(|p| serde_json::json!({"index": p.index, "name": p.name}))
             .collect::<Vec<_>>(),
         "source_path": u.source_path,
-    })
+    });
+    if let Some(area) = &u.area {
+        m["area"] = serde_json::Value::String(area.clone());
+    }
+    m
 }
 
 /// The pure edge-trigger decision: given the file's parsed status and the
@@ -1008,6 +1018,18 @@ pub async fn push_work_unit_with_status_write<S: WorkUnitSink + ?Sized>(
     })
 }
 
+/// The archive stamp's `metadata`: `archive_path`, plus the plan's `area` when
+/// its status block declares one. coord replaces `metadata` wholesale, so an
+/// archive stamp without the area would erase it from the unit — the same
+/// omit-when-`None` rule as [`build_metadata`].
+fn archive_metadata(u: &ParsedWorkUnit) -> serde_json::Value {
+    let mut m = serde_json::json!({ "archive_path": u.source_path });
+    if let Some(area) = &u.area {
+        m["area"] = serde_json::Value::String(area.clone());
+    }
+    m
+}
+
 /// Stamp `metadata.archive_path` for a plan found in the archive directory —
 /// a **metadata-only** upsert (`status: None`, no transition, ever).
 ///
@@ -1032,7 +1054,7 @@ pub async fn push_archive_metadata<S: WorkUnitSink + ?Sized>(
         title: u.title.clone(),
         // NEVER a status write from the archive scan (D4).
         status: None,
-        metadata: Some(serde_json::json!({ "archive_path": u.source_path })),
+        metadata: Some(archive_metadata(u)),
         by_actor: Some(ADAPTER_ACTOR.to_string()),
         // Harmless under coord's COALESCE, and it means a plan that only ever
         // exists in the archive still gets dated.
@@ -1400,6 +1422,8 @@ mod tests {
             title: Some("T".to_string()),
             status: status.to_string(),
             depends_on: vec!["2026-01-01-dep".to_string()],
+            area: None,
+            area_rejected: None,
             phases: vec![ParsedPhase {
                 index: 1,
                 name: "Phase 1 — x".to_string(),
@@ -1582,6 +1606,47 @@ mod tests {
         assert_eq!(m["depends_on"][0], "2026-01-01-dep");
         assert_eq!(m["phases"][0]["index"], 1);
         assert_eq!(m["source_path"], "plans/s.md");
+    }
+
+    /// `area` rides in `metadata` when the plan declares one, and the KEY is
+    /// absent — not `null`, not `""` — when it does not.
+    #[test]
+    fn build_metadata_area_present_when_some_absent_when_none() {
+        let with = ParsedWorkUnit {
+            area: Some("published-parity".to_string()),
+            ..unit("s", "vetted")
+        };
+        let m = build_metadata(&with);
+        assert_eq!(m["area"], serde_json::json!("published-parity"));
+
+        let m = build_metadata(&unit("s", "vetted"));
+        assert!(
+            !m.as_object().unwrap().contains_key("area"),
+            "a None area must omit the key entirely: {m}"
+        );
+        // ...and the rest of the enrichment is unchanged by the omission.
+        assert_eq!(m["source_path"], "plans/s.md");
+    }
+
+    /// The archive stamp is a wholesale `metadata` replacement too, so it must
+    /// carry a declared area rather than erase it — and omit it when `None`.
+    #[tokio::test]
+    async fn archive_stamp_keeps_a_declared_area() {
+        let sink = FakeSink::default();
+        let u = ParsedWorkUnit {
+            area: Some("ci-runners".to_string()),
+            ..unit("2026-01-01-archived", "shipped")
+        };
+        push_archive_metadata(&sink, &u).await.unwrap();
+        let none = unit("2026-01-01-archived-2", "shipped");
+        push_archive_metadata(&sink, &none).await.unwrap();
+
+        let ups = sink.upserts.lock().unwrap();
+        let first = ups[0].metadata.as_ref().unwrap();
+        assert_eq!(first["area"], serde_json::json!("ci-runners"));
+        assert_eq!(first["archive_path"], serde_json::json!(u.source_path));
+        let second = ups[1].metadata.as_ref().unwrap();
+        assert!(!second.as_object().unwrap().contains_key("area"));
     }
 
     #[tokio::test]
