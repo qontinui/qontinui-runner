@@ -904,8 +904,8 @@ export function GlobalIssuesPanel() {
             <p className="text-xs mt-1">
               {searchQuery
                 ? "Try adjusting your search or filters"
-                : statusFilter !== "all"
-                  ? `No ${statusFilter} issues. Try changing the status filter.`
+                : loadedFilters.status !== "all"
+                  ? `No ${loadedFilters.status} issues. Try changing the status filter.`
                   : "Create a new issue to start tracking known problems."}
             </p>
           </div>
