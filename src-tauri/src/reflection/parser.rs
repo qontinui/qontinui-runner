@@ -119,6 +119,10 @@ impl ReflectionFixParser {
 
     /// Process a line of AI output.
     /// Returns Some(ParsedReflectionFix) when a complete block is parsed.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     pub fn process_line(&mut self, line: &str) -> Option<ParsedReflectionFix> {
         let start_pattern = get_start_pattern();
         let end_pattern = get_end_pattern();

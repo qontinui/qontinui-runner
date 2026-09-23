@@ -112,11 +112,11 @@ impl WrapperManager {
         let lock = self.spawn_lock_for(wrapper_id).await;
         let _guard = lock.lock().await;
 
-        // Fast path: already running.
-        if let Some(rt) = self.runtimes.read().await.get(wrapper_id) {
-            if rt.state == WrapperState::Running {
-                return Ok(rt.port);
-            }
+        // Fast path: already routable. `port_for` is the one Rust definition
+        // of "routable" (Running only); the frontend mirrors it as
+        // `isWrapperRoutable` in `src/lib/wrappers/status.ts`.
+        if let Some(port) = self.port_for(wrapper_id).await {
+            return Ok(port);
         }
 
         let wrapper = self
@@ -143,6 +143,13 @@ impl WrapperManager {
                 wrapper_id,
                 entry.display()
             ));
+        }
+
+        // Re-check under ONE write lock: the health loop (which does not take
+        // the spawn lock) may have flipped a Degraded record back to Running
+        // since the fast path missed, in which case that record wins.
+        if let ExistingRecord::Routable(port) = self.claim_or_retire(wrapper_id).await {
+            return Ok(port);
         }
 
         let port = pick_free_port()
@@ -210,45 +217,38 @@ impl WrapperManager {
         Ok(port)
     }
 
+    /// Settle an existing runtime record before `spawn` replaces it,
+    /// atomically: under ONE write lock, a Running record is kept and its port
+    /// returned (spawn must not start a second process), and any other record
+    /// (Degraded) is REMOVED; its child is then killed and reaped outside the
+    /// lock. A Degraded record still owns its subprocess — which is why the
+    /// UI offers Stop for it — and letting `spawn`'s `insert` replace it would
+    /// drop that `Child` handle without killing it, orphaning the process.
+    /// A separate read-then-stop would race the health loop, which can flip
+    /// Degraded -> Running between the two without holding the spawn lock.
+    async fn claim_or_retire(&self, wrapper_id: &str) -> ExistingRecord {
+        let removed = {
+            let mut runtimes = self.runtimes.write().await;
+            match runtimes.get(wrapper_id) {
+                Some(rt) if rt.state == WrapperState::Running => {
+                    return ExistingRecord::Routable(rt.port);
+                }
+                Some(_) => runtimes.remove(wrapper_id),
+                None => return ExistingRecord::Absent,
+            }
+        };
+        if let Some(runtime) = removed {
+            terminate_runtime(wrapper_id, runtime).await;
+        }
+        ExistingRecord::Retired
+    }
+
     /// Stop a running wrapper. SIGTERM first, then force-kill after
     /// `STOP_GRACE` if the child hasn't exited.
     pub async fn stop(&self, wrapper_id: &str) -> Result<(), String> {
-        let mut runtime = match self.runtimes.write().await.remove(wrapper_id) {
-            Some(rt) => rt,
-            None => return Ok(()), // No-op if not running
-        };
-        let mut child = match runtime.child.take() {
-            Some(c) => c,
-            None => return Ok(()),
-        };
-
-        // tokio::process::Child has `start_kill` which on Windows uses
-        // TerminateProcess and on unix sends SIGKILL. There's no portable
-        // SIGTERM equivalent in tokio; on Windows the runner's other
-        // managers (ProcessCaptureManager) also use TerminateProcess, so
-        // we follow that precedent. If a wrapper needs graceful shutdown
-        // semantics it should declare its own /shutdown HTTP path which
-        // higher-level callers can invoke before `stop`.
-        if let Err(e) = child.start_kill() {
-            warn!(
-                "wrappers: start_kill('{}') failed: {} — proceeding to wait",
-                wrapper_id, e
-            );
-        }
-
-        // Wait up to STOP_GRACE for the child to exit.
-        match tokio::time::timeout(STOP_GRACE, child.wait()).await {
-            Ok(Ok(status)) => {
-                debug!("wrappers: '{}' exited with {}", wrapper_id, status);
-            }
-            Ok(Err(e)) => warn!("wrappers: wait('{}') failed: {}", wrapper_id, e),
-            Err(_) => {
-                warn!(
-                    "wrappers: '{}' did not exit within {:?}, killing",
-                    wrapper_id, STOP_GRACE
-                );
-                let _ = child.kill().await;
-            }
+        let removed = self.runtimes.write().await.remove(wrapper_id);
+        if let Some(runtime) = removed {
+            terminate_runtime(wrapper_id, runtime).await;
         }
         Ok(())
     }
@@ -279,8 +279,12 @@ impl WrapperManager {
         }
     }
 
-    /// Return the live port for a wrapper, if any. Used by the dispatch
-    /// router to build the HTTP target URL after a successful spawn.
+    /// Return the port dispatch may route to, if any: `Running` ONLY. A
+    /// `Degraded` wrapper keeps its runtime record (and its subprocess, so it
+    /// can still be stopped) but is not routable — `spawn` replaces it
+    /// instead of reusing it. The frontend mirrors this split as
+    /// `isWrapperRoutable` / `isWrapperProcessAlive`
+    /// (`src/lib/wrappers/status.ts`).
     pub async fn port_for(&self, wrapper_id: &str) -> Option<u16> {
         self.runtimes
             .read()
@@ -512,9 +516,191 @@ pub fn node_available() -> bool {
         .unwrap_or(false)
 }
 
+/// What `claim_or_retire` found for a wrapper about to be (re)spawned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingRecord {
+    /// A Running record exists; `spawn` returns this port.
+    Routable(u16),
+    /// A non-routable (Degraded) record existed and was removed + terminated.
+    Retired,
+    /// No record — nothing to settle.
+    Absent,
+}
+
+/// Kill and reap a runtime record's child that has ALREADY been removed from
+/// the map (so no lock is held while waiting). SIGTERM-equivalent first, then
+/// force-kill after `STOP_GRACE` if the child hasn't exited.
+async fn terminate_runtime(wrapper_id: &str, mut runtime: WrapperRuntime) {
+    let mut child = match runtime.child.take() {
+        Some(c) => c,
+        None => return,
+    };
+
+    // tokio::process::Child has `start_kill` which on Windows uses
+    // TerminateProcess and on unix sends SIGKILL. There's no portable
+    // SIGTERM equivalent in tokio; on Windows the runner's other
+    // managers (ProcessCaptureManager) also use TerminateProcess, so
+    // we follow that precedent. If a wrapper needs graceful shutdown
+    // semantics it should declare its own /shutdown HTTP path which
+    // higher-level callers can invoke before `stop`.
+    if let Err(e) = child.start_kill() {
+        warn!(
+            "wrappers: start_kill('{}') failed: {} — proceeding to wait",
+            wrapper_id, e
+        );
+    }
+
+    // Wait up to STOP_GRACE for the child to exit.
+    match tokio::time::timeout(STOP_GRACE, child.wait()).await {
+        Ok(Ok(status)) => {
+            debug!("wrappers: '{}' exited with {}", wrapper_id, status);
+        }
+        Ok(Err(e)) => warn!("wrappers: wait('{}') failed: {}", wrapper_id, e),
+        Err(_) => {
+            warn!(
+                "wrappers: '{}' did not exit within {:?}, killing",
+                wrapper_id, STOP_GRACE
+            );
+            let _ = child.kill().await;
+        }
+    }
+}
+
 /// Provided so the bare `Path` import is exercised; future install code
 /// will resolve `<root>/<id>` via this.
 #[allow(dead_code)]
 pub fn install_path_for(root: &Path, id: &str) -> PathBuf {
     root.join(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Insert a runtime record in `state` with no child process — the
+    /// shape a wrapper has after the health loop flips it (the process is
+    /// still owned by the record; only its health verdict changed).
+    async fn manager_with(state: WrapperState) -> (Arc<WrapperManager>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = WrapperRegistry::new(tmp.path().to_path_buf()).await;
+        let manager = WrapperManager::new(registry);
+        let now = Instant::now();
+        manager.runtimes.write().await.insert(
+            "w".to_string(),
+            WrapperRuntime {
+                id: "w".to_string(),
+                port: 41234,
+                pid: Some(7),
+                child: None,
+                started_at: now,
+                last_dispatch: now,
+                consecutive_failures: HEALTH_MAX_RETRIES,
+                state,
+            },
+        );
+        (manager, tmp)
+    }
+
+    /// The contract the frontend's `isWrapperRoutable` /
+    /// `isWrapperProcessAlive` (`src/lib/wrappers/status.ts`) mirror: a
+    /// `Degraded` wrapper still has a live runtime record (so `stop` has
+    /// something to stop) but `port_for` refuses to route to it.
+    #[tokio::test]
+    async fn degraded_is_alive_but_not_routable() {
+        let (manager, _tmp) = manager_with(WrapperState::Degraded).await;
+        assert_eq!(manager.port_for("w").await, None);
+        let status = manager.status("w").await;
+        assert_eq!(status.state, WrapperState::Degraded);
+        assert_eq!(status.port, Some(41234));
+        manager.stop("w").await.unwrap();
+        assert_eq!(manager.status("w").await.state, WrapperState::Stopped);
+    }
+
+    /// `spawn` retires a Degraded record before replacing it, killing the
+    /// subprocess it still owns instead of dropping (orphaning) the handle.
+    /// Uses a real `sleep` child so the kill is observed, hence unix-only;
+    /// the decision half is covered cross-platform below.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claim_or_retire_kills_the_degraded_child() {
+        let (manager, _tmp) = manager_with(WrapperState::Degraded).await;
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id().unwrap();
+        manager.runtimes.write().await.get_mut("w").unwrap().child = Some(child);
+
+        assert_eq!(manager.claim_or_retire("w").await, ExistingRecord::Retired);
+        assert_eq!(manager.status("w").await.state, WrapperState::Stopped);
+        // The process is gone (reaped by `terminate_runtime`): signal 0 fails.
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "degraded child {pid} survived claim_or_retire");
+    }
+
+    /// Decision half: a Running record is returned untouched (spawn must not
+    /// start a second process — the health-loop race case), a Degraded one is
+    /// retired, and an absent one is a no-op.
+    #[tokio::test]
+    async fn claim_or_retire_keeps_running_retires_degraded_ignores_absent() {
+        let (manager, _tmp) = manager_with(WrapperState::Running).await;
+        assert_eq!(
+            manager.claim_or_retire("w").await,
+            ExistingRecord::Routable(41234)
+        );
+        assert_eq!(manager.port_for("w").await, Some(41234));
+        assert_eq!(manager.status("w").await.state, WrapperState::Running);
+
+        assert_eq!(
+            manager.claim_or_retire("absent").await,
+            ExistingRecord::Absent
+        );
+
+        let (degraded, _tmp2) = manager_with(WrapperState::Degraded).await;
+        assert_eq!(degraded.claim_or_retire("w").await, ExistingRecord::Retired);
+        assert_eq!(degraded.status("w").await.state, WrapperState::Stopped);
+    }
+
+    /// Negative control: the same record in `Running` IS routable.
+    #[tokio::test]
+    async fn running_is_routable() {
+        let (manager, _tmp) = manager_with(WrapperState::Running).await;
+        assert_eq!(manager.port_for("w").await, Some(41234));
+    }
+
+    /// Pin the `GET /wrappers/:id/status` wire shape the TS
+    /// `WrapperStatusInfo` mirrors: the field is `state` (NOT `status`), the
+    /// values are lowercase, and absent options serialize as `null`.
+    #[tokio::test]
+    async fn status_wire_shape_matches_the_ts_mirror() {
+        let (manager, _tmp) = manager_with(WrapperState::Degraded).await;
+        let json = serde_json::to_value(manager.status("w").await).unwrap();
+        assert_eq!(json["state"], "degraded");
+        assert!(json.get("status").is_none());
+        assert_eq!(json["port"], 41234);
+        assert_eq!(json["consecutive_health_failures"], HEALTH_MAX_RETRIES);
+        let stopped = serde_json::to_value(manager.status("absent").await).unwrap();
+        assert_eq!(stopped["state"], "stopped");
+        assert!(stopped["port"].is_null());
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "consecutive_health_failures",
+                "id",
+                "last_dispatch_at_ms",
+                "pid",
+                "port",
+                "started_at_ms",
+                "state",
+            ]
+        );
+    }
 }

@@ -29,7 +29,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { dispatchAction, listWrappers } from "@/lib/wrappers/api";
 import {
   buildWrapperTools,
-  isWrapperEligibleForTools,
+  isWrapperToolEligible,
   type WrapperToolDefinition,
   type WrapperToolRouteTable,
 } from "@/lib/wrappers/tools";
@@ -75,9 +75,11 @@ export function useWrapperTools(enabled: boolean = true): UseWrapperToolsResult 
     setLoading(true);
     setError(null);
     try {
-      const list = await listWrappers();
-      const eligible = list.filter(isWrapperEligibleForTools);
-      setWrappers(eligible);
+      // Eligibility is the transport `spawn` accepts, not runtime state: the
+      // former `status` filter read a field the wire never sends, so it
+      // admitted everything (plan 2026-08-23-single-source-derived-facts
+      // item 10) — including transports whose every dispatch fails.
+      setWrappers((await listWrappers()).filter(isWrapperToolEligible));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setWrappers([]);

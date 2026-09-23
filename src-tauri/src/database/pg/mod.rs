@@ -1627,6 +1627,10 @@ mod lc_messages_tests {
     /// window is bounded to `build_pool`'s own body so this test cannot match
     /// its own assertion text.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn build_pool_applies_the_c_locale() {
         let src = include_str!("mod.rs");
         let start = src.find("fn build_pool(").expect("build_pool still exists");

@@ -349,6 +349,10 @@ pub fn parse_org_chart_response(
 }
 
 /// Extract JSON object from a response that may contain markdown code fences.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_json_from_response(response: &str) -> Result<String, String> {
     // Try direct parse first
     if serde_json::from_str::<serde_json::Value>(response).is_ok() {

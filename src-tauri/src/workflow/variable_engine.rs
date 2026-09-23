@@ -63,6 +63,10 @@ impl VariableStore {
     /// Supports: ==, !=, basic boolean evaluation.
     /// Returns true if the condition evaluates to true, false otherwise.
     /// Returns true for unparseable conditions (fail-open for forward compat).
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     pub fn evaluate_condition(&self, condition: &str) -> bool {
         // Handle == and !=
         for op in &["!=", "=="] {

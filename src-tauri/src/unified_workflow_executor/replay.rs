@@ -101,6 +101,10 @@ impl ReplayManager {
     /// Prepare a replay by resetting git state and clearing downstream checkpoints.
     ///
     /// Returns a `ResumePoint` that can be used to re-enter the loop controller.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     pub async fn prepare_replay(
         &self,
         execution_id: &str,

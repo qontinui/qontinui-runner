@@ -280,6 +280,10 @@ impl QueryRoot {
 
     /// Get task run output with optional offset/limit for pagination.
     /// Defaults to last 10000 characters (tail) if no offset specified.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     async fn task_run_output(
         &self,
         ctx: &Context<'_>,

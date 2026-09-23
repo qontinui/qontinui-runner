@@ -200,6 +200,10 @@ pub async fn enable_tcpip(serial: String, port: u16) -> Result<(), String> {
 
 /// Read the device's primary Wi-Fi IPv4 address. Tries `ip route` first (parses
 /// `src <ip>`), then falls back to `ip -4 addr show wlan0`.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub async fn get_wlan_ipv4(serial: String) -> Result<Option<String>, String> {
     let route = shell_capture_string(serial.clone(), "ip route".to_string()).await?;
     for line in route.lines() {

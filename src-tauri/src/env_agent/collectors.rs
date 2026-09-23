@@ -2050,6 +2050,10 @@ fn poetry_declared_deps(table: &toml::map::Map<String, toml::Value>) -> Vec<(Str
 ///    section without passing [`sanitize_url`] — the function this file calls
 ///    the single choke point that guarantees a credential cannot leak. A second
 ///    path onto the wire that bypasses the choke point defeats the choke point.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn pep621_declared_deps(items: &[toml::Value]) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for req in items.iter().filter_map(|v| v.as_str()) {
@@ -3660,6 +3664,10 @@ fn invariant_class(shape: &PathShape, tracked: &Path) -> &'static str {
 /// Render `paths.plans_dir` relative to the workspace root. **Pure —
 /// unit-tested.** See the section header for why the absolute path is never
 /// published.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn plans_dir_relative(root: &Path, reading: &PlansDirReading) -> String {
     let configured = match reading {
         PlansDirReading::Unread => return PLANS_DIR_UNREAD.to_string(),

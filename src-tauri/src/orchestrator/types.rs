@@ -287,6 +287,10 @@ pub trait WorkerSignalExt: Sized {
 }
 
 impl WorkerSignalExt for WorkerSignal {
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn parse_from_output(output: &str) -> Option<Self> {
         // Check for [WORK_COMPLETE] marker
         if output.contains("[WORK_COMPLETE]") {
@@ -557,6 +561,10 @@ impl CriterionOverrideExt for CriterionOverride {
         self
     }
 
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn parse_from_output(output: &str, iteration: u32) -> Vec<Self> {
         let mut overrides = Vec::new();
         let mut remaining = output;
@@ -608,6 +616,10 @@ impl CriterionOverrideExt for CriterionOverride {
 ///
 /// Previously a private method on `CriterionOverride`; free function here
 /// because the trait doesn't need to expose it.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_field(content: &str, field_name: &str) -> Option<String> {
     let pattern = format!("{}:", field_name);
     if let Some(start) = content.find(&pattern) {

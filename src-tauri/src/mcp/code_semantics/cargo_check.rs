@@ -390,6 +390,10 @@ fn extract_pub_items(src: &str) -> Vec<Decl> {
 
 /// Strip a leading `pub` / `pub(crate)` / `pub(in ...)` visibility from a line,
 /// returning the remainder. `None` if the line is not `pub`.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn strip_pub(line: &str) -> Option<&str> {
     let rest = line.strip_prefix("pub")?;
     // Must be followed by whitespace or `(`.
@@ -405,6 +409,10 @@ fn strip_pub(line: &str) -> Option<&str> {
 }
 
 /// Strip `async`/`unsafe`/`extern "..."` qualifiers that may precede `fn`.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn strip_fn_qualifiers(line: &str) -> String {
     let mut s = line.to_string();
     loop {
@@ -432,6 +440,10 @@ fn strip_fn_qualifiers(line: &str) -> String {
 
 /// The item's identifier after its keyword. For most kinds the name is the next
 /// identifier; for `fn` it's up to `(`/`<`/whitespace.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn item_name(rest: &str, _kind: &str) -> Option<String> {
     let end = rest
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
@@ -445,6 +457,10 @@ fn item_name(rest: &str, _kind: &str) -> Option<String> {
 
 /// Normalize a Rust declaration line for signature comparison: take everything up
 /// to the body/terminator (`{`, `;`, or ` = `), collapse whitespace.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn normalize_rust_decl(line: &str) -> String {
     let head = line
         .split('{')

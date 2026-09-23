@@ -392,6 +392,10 @@ pub enum UrlUserinfo {
 ///
 /// [`UrlUserinfo::WithPassword`] wins over [`UrlUserinfo::UserOnly`] wherever
 /// both occur, since the reason a reader is shown must be the worst one present.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn url_userinfo(value: &str) -> Option<UrlUserinfo> {
     let bytes = value.as_bytes();
     let scheme_char = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'.' | b'-');

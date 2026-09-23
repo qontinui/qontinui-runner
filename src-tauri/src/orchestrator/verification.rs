@@ -908,6 +908,10 @@ Respond with JSON only."#,
     }
 
     /// Parse the verification agent's response.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     pub fn parse_response(
         response: &str,
         criterion_id: &str,
@@ -1085,6 +1089,10 @@ impl AiVerifier {
     ///
     /// Kept for backward compatibility with tests and any remaining callers.
     #[allow(dead_code)]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn build_vision_prompt(
         system_prompt: &str,
         user_prompt: &str,

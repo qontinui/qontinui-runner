@@ -80,6 +80,10 @@ pub async fn get_events(
 /// When `stream=false` (default): returns `{ "data": { "output": "...", "length": N } }`.
 /// When `stream=true`: returns SSE that polls output every 2s until the task completes.
 /// The `offset` param (non-streaming) slices the output from that byte position.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub async fn get_output(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,

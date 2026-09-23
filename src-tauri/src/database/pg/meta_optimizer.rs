@@ -4728,6 +4728,10 @@ mod tests {
     ];
 
     /// Column names declared by a `CREATE TABLE <table> (...)` block.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn declared_columns(table: &str) -> Vec<String> {
         let header = format!("CREATE TABLE {} (\n", table);
         let start = GENERATED_SCHEMA
@@ -4752,6 +4756,10 @@ mod tests {
     }
 
     /// Every identifier written as `<alias>.<ident>` in `sql`.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn aliased_identifiers(sql: &str, alias: &str) -> Vec<String> {
         let needle = format!("{}.", alias);
         let bytes = sql.as_bytes();

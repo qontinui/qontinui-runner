@@ -279,6 +279,10 @@ fn generate_valid_tab_ids() {
 /// flat list of double-quoted strings, and `generate_valid_tab_ids` asserts a
 /// sane count, so a shape change fails the build loudly instead of silently
 /// producing a short list.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn parse_ts_valid_tab_ids(source: &str) -> Vec<String> {
     let Some(decl) = source.find("const VALID_TAB_IDS") else {
         panic!(
@@ -399,6 +403,10 @@ fn generate_valid_navigate_pages() {
 /// `parse_ts_valid_tab_ids` uses. Same tradeoff though: a deliberate small
 /// parser plus a sanity assert on the count, so a shape change fails the build
 /// loudly instead of silently producing a short list.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn parse_ts_page_to_tab_keys(source: &str) -> Vec<String> {
     let Some(decl) = source.find("const PAGE_TO_TAB") else {
         panic!(

@@ -312,6 +312,10 @@ pub struct UrlLockInfo {
 /// Strips trailing slashes and path segments after the UI Bridge base.
 /// For example, `http://localhost:3001/api/ui-bridge/sdk/execute` becomes
 /// `http://localhost:3001/api/ui-bridge`.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn normalize_url(url: &str) -> String {
     let trimmed = url.trim_end_matches('/');
 

@@ -18,6 +18,7 @@ import { Package, MoreVertical, Play, Square, RefreshCw, Trash2, ArrowRight } fr
 import { StatusBadge } from "./StatusBadge";
 import { TransportBadge } from "./TransportBadge";
 import type { InstalledWrapper, WrapperStatus } from "@/lib/wrappers/types";
+import { wrapperLifecycleControl } from "@/lib/wrappers/status";
 
 export interface WrapperCardProps {
   wrapper: InstalledWrapper;
@@ -54,7 +55,9 @@ export function WrapperCard({
     return () => document.removeEventListener("mousedown", onDocClick);
   }, [menuOpen]);
 
-  const isRunning = status === "running" || status === "degraded";
+  // Stop for a live process (running OR degraded — a degraded wrapper still
+  // owns its subprocess); routability is stated by the status badge.
+  const lifecycle = wrapperLifecycleControl(status);
   const actionCount = wrapper.actions?.length ?? 0;
 
   return (
@@ -97,7 +100,7 @@ export function WrapperCard({
                   className="absolute right-0 top-full mt-1 z-20 min-w-[160px] rounded-md border border-border bg-card shadow-lg py-1"
                   role="menu"
                 >
-                  {isRunning ? (
+                  {lifecycle === "stop" ? (
                     <MenuItem
                       icon={Square}
                       label="Stop"

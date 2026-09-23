@@ -1023,6 +1023,10 @@ pub async fn ui_bridge_page_force_close_handler(
 /// for both spellings. Query and fragment are carried through verbatim so an
 /// absolute URL resolves exactly as its relative form would — an absolute
 /// spelling must never be more permissive than the relative one.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub(crate) fn same_origin_absolute_path(url: &str) -> Option<String> {
     let rest = url
         .strip_prefix("http://")
@@ -2805,6 +2809,10 @@ mod navigate_route_gate_tests {
     /// verbatim (same keys, same order) — the same staleness proof
     /// `valid_tab_ids_match_typescript_union` gives the tab gate.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn valid_navigate_pages_match_the_typescript_map() {
         // cargo runs tests with CWD = crate root (src-tauri).
         let source = std::fs::read_to_string("../src/components/app/useAppNavigation.ts")
@@ -2938,6 +2946,10 @@ mod tab_activate_tests {
     /// verbatim (same ids, same order). Proves the build-script codegen ran
     /// against the current source rather than a cached/stale OUT_DIR.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn valid_tab_ids_match_typescript_union() {
         // cargo runs tests with CWD = crate root (src-tauri).
         let source = std::fs::read_to_string("../src/components/app/tab-types.ts")
@@ -3224,6 +3236,10 @@ mod page_evaluate_escaping_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn expression_with_quotes_and_backslashes_roundtrips() {
         // A nasty mix: embedded double-quote, single-quote, backslash, and
         // unicode. serde_json must escape all of these such that the emitted
@@ -3674,6 +3690,10 @@ mod close_door_tests {
     /// A SOURCE assertion because the failure needs a saturated tokio blocking
     /// pool to reproduce.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn the_close_request_probe_join_is_wrapped_in_a_timeout() {
         let src = include_str!("page.rs");
         let start = src
@@ -3710,6 +3730,10 @@ mod close_door_tests {
     /// clearing the atom, so this door answered `Wedged` off a dead monitor —
     /// refusing every close forever — while `/health` correctly said UNKNOWN.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn the_close_door_reads_the_latch_through_the_same_guard_as_health() {
         let src = include_str!("page.rs");
         let start = src
@@ -3924,6 +3948,10 @@ mod refresh_response_honesty_tests {
     /// 12 -> 1 after it). This fix must not touch that path, so guard that
     /// the stamp is wired to the soft handler ONLY.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn the_hard_refresh_handler_is_not_stamped() {
         let src = include_str!("page.rs");
         let start = src

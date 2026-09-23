@@ -43,6 +43,10 @@ impl LoopController {
     /// This replaces `run_verification_agentic_loop` with the same signature
     /// and behavior, but delegates each phase to a small handler that returns
     /// the next `LoopState`.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     pub(crate) async fn run_loop_state_machine(
         &self,
         config: &mut LoopConfig,
@@ -3492,6 +3496,10 @@ impl LoopController {
     /// Record compensation commit, capture iteration diff, record git observation.
     ///
     /// Original lines: 3899-4023
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     async fn handle_advance_iteration(
         &self,
         ctx: &mut LoopContext,

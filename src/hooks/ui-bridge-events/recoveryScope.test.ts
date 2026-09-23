@@ -12,6 +12,7 @@ import {
   recoveryVerdict,
   scopeRecoveryExecutor,
 } from "./recoveryScope";
+import writeActionsGenerated from "./writeActions.generated.json";
 
 describe("isWriteAction", () => {
   it("catches every input-mutating action, case- and space-insensitively", () => {
@@ -32,6 +33,20 @@ describe("isWriteAction", () => {
   it("leaves repositioning actions alone", () => {
     for (const ok of ["click", "focus", "blur", "scrollIntoView", "hover"]) {
       expect(isWriteAction(ok), ok).toBe(false);
+    }
+  });
+
+  // The list is the runner's `WRITE_ACTIONS` (recovery_executor.rs), generated
+  // into writeActions.generated.json and drift-gated on the Rust side by
+  // `write_actions_fixture_matches_rust_declaration`. This half pins that the
+  // frontend check refuses exactly that set — every generated member, in any
+  // case/spacing — so the two enforcement points agree on one list.
+  it("refuses every action in the runner-generated write-action list", () => {
+    expect(writeActionsGenerated.length).toBeGreaterThan(0);
+    for (const w of writeActionsGenerated) {
+      expect(w, "generated entries are normalized").toBe(w.trim().toLowerCase());
+      expect(isWriteAction(w), w).toBe(true);
+      expect(isWriteAction(` ${w.toUpperCase()} `), w).toBe(true);
     }
   });
 });
@@ -105,8 +120,8 @@ describe("scopeRecoveryExecutor", () => {
 });
 
 describe("recoveryVerdict", () => {
-  it("reports recovered ONLY when the executor itself succeeded", () => {
-    expect(recoveryVerdict({ success: true })).toEqual({ recovered: true, reason: null });
+  it("reports attemptSucceeded ONLY when the executor itself succeeded", () => {
+    expect(recoveryVerdict({ success: true })).toEqual({ attemptSucceeded: true, reason: null });
   });
 
   it("does not launder a failed executor run into a recovery", () => {
@@ -115,15 +130,15 @@ describe("recoveryVerdict", () => {
       errorCode: "UB-ELEM-NOT-FOUND",
       error: 'Could not find element matching: "the thing"',
     });
-    expect(v.recovered).toBe(false);
+    expect(v.attemptSucceeded).toBe(false);
     expect(v.reason).toContain("UB-ELEM-NOT-FOUND");
   });
 
-  it("treats a missing/garbage result as not recovered", () => {
-    expect(recoveryVerdict(null).recovered).toBe(false);
-    expect(recoveryVerdict(undefined).recovered).toBe(false);
-    expect(recoveryVerdict("recovered!").recovered).toBe(false);
-    expect(recoveryVerdict({}).recovered).toBe(false);
+  it("treats a missing/garbage result as a failed attempt", () => {
+    expect(recoveryVerdict(null).attemptSucceeded).toBe(false);
+    expect(recoveryVerdict(undefined).attemptSucceeded).toBe(false);
+    expect(recoveryVerdict("recovered!").attemptSucceeded).toBe(false);
+    expect(recoveryVerdict({}).attemptSucceeded).toBe(false);
   });
 });
 
@@ -133,8 +148,9 @@ describe("recoveryVerdict", () => {
 //
 // `/ai/recovery/attempt` answered a typed refusal with HTTP 200
 // `{"success":true,"recovered":false}`. The frontend DID send
-// `{success:false, error:"RECOVERY_UNSCOPED: …", data:{recovered:false}}`, but
-// the runner's response dispatcher forwarded only `response.data` when the
+// `{success:false, error:"RECOVERY_UNSCOPED: …", data:{recovered:false}}` (that field is
+// `attemptSucceeded` since plan 2026-08-23-single-source-derived-facts item 8),
+// but the runner's response dispatcher forwarded only `response.data` when the
 // handler supplied one — so `success` and `error` never reached the HTTP layer.
 // `extract_response_data` (`src-tauri/src/mcp/ui_bridge/request.rs`) now stamps
 // the envelope's verdict onto `data` for every handler, so this payload no
@@ -145,20 +161,25 @@ describe("recoveryFailureData (item 4)", () => {
   it("carries the verdict fields the envelope cannot, and nothing it already carries", () => {
     expect(recoveryFailureData(RECOVERY_UNSCOPED)).toEqual({
       code: RECOVERY_UNSCOPED,
-      recovered: false,
+      attemptSucceeded: false,
     });
   });
 
   it("carries the caller's context through without letting it overwrite the verdict", () => {
-    const out = recoveryFailureData(RECOVERY_TARGET_MISSING, { elementId: "btn-1" });
+    const out = recoveryFailureData(RECOVERY_TARGET_MISSING, {
+      elementId: "btn-1",
+      // Hostile/mistaken context: both keys must lose to the failure verdict.
+      attemptSucceeded: true,
+      code: "SOMETHING_ELSE",
+    });
     expect(out.elementId).toBe("btn-1");
-    expect(out.recovered).toBe(false);
+    expect(out.attemptSucceeded).toBe(false);
     expect(out.code).toBe(RECOVERY_TARGET_MISSING);
   });
 
-  it("never reports recovered:true — a failure payload has exactly one verdict", () => {
+  it("never reports attemptSucceeded:true — a failure payload has exactly one verdict", () => {
     for (const code of [RECOVERY_UNSCOPED, RECOVERY_TARGET_MISSING, RECOVERY_FAILED]) {
-      expect(recoveryFailureData(code).recovered).toBe(false);
+      expect(recoveryFailureData(code).attemptSucceeded).toBe(false);
     }
   });
 });

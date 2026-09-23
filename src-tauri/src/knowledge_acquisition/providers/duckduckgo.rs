@@ -188,6 +188,10 @@ fn parse_results(html: &str, query: &str, max_results: usize) -> Vec<KnowledgeRe
 
 /// Decode DuckDuckGo redirect URLs
 /// DDG wraps result URLs like: //duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com&rut=...
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn decode_ddg_url(raw: &str) -> String {
     if raw.contains("duckduckgo.com/l/") || raw.contains("duckduckgo.com/l?") {
         if let Some(start) = raw.find("uddg=") {

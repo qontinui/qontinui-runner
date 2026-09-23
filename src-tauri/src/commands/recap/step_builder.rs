@@ -40,6 +40,10 @@ fn calculate_timestamps(
 
 /// Strip "(iteration N)" suffix from a step name.
 /// The iteration info is shown in the phase container header, so it's redundant in step names.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn strip_iteration_suffix(name: &str) -> String {
     if let Some(idx) = name.rfind(" (iteration ") {
         name[..idx].to_string()
@@ -191,6 +195,10 @@ fn is_automation_ai_task(
 }
 
 /// Build AI session steps from task run data and events.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn build_ai_session_steps(
     task_run: &TaskRun,
     events: &[TaskRunEvent],
@@ -370,6 +378,10 @@ fn checkpoint_to_recap_step(checkpoint: &StepCheckpoint) -> RecapStep {
 /// 3. AI sessions from task_run.sessions_count and output_log parsing
 /// 4. step_execution events from task_run_events
 /// 5. Named workflow events (fallback)
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn build_steps(
     task_run: &TaskRun,
     automations: &[TaskRunAutomation],

@@ -207,6 +207,10 @@ pub fn analyze_with_defaults(working_dir: &str) -> Result<ParsedOutput, String> 
 }
 
 /// Extract function/method type information from a parsed Python file
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_function_type_info(
     source: &str,
     tree: &tree_sitter::Tree,
@@ -291,6 +295,10 @@ fn extract_function_type_info(
 }
 
 /// Analyze function parameters for type annotations
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn analyze_parameters(source: &str, params_node: tree_sitter::Node) -> (usize, usize, Vec<String>) {
     let mut total_params = 0;
     let mut typed_params = 0;
@@ -368,6 +376,10 @@ fn analyze_parameters(source: &str, params_node: tree_sitter::Node) -> (usize, u
 }
 
 /// Get the parameter name from a default_parameter node
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn get_default_param_name(source: &str, node: tree_sitter::Node) -> String {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -379,6 +391,10 @@ fn get_default_param_name(source: &str, node: tree_sitter::Node) -> String {
 }
 
 /// Get the parameter name from a splat pattern node
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn get_splat_param_name(source: &str, node: tree_sitter::Node) -> String {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {

@@ -48,6 +48,10 @@ impl HardenRule for FixCurlSfInPiped {
 
 /// Pure function: drop the `-f` flag from the first `curl -<flags>`
 /// invocation in a piped command.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn fix_curl_sf_in_piped_commands(cmd: &str) -> String {
     if !cmd.contains("curl ") || !cmd.contains("| ") {
         return cmd.to_string();

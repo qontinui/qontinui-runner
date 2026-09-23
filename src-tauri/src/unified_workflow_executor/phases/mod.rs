@@ -1136,6 +1136,10 @@ fn extract_diff_stat_from_observation(content: &str) -> Option<String> {
 /// Extract changed file paths from a git diff stat observation.
 ///
 /// Parses lines like ` src/foo/bar.rs | 12 +++---` into `["src/foo/bar.rs"]`.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_changed_files_from_observation(content: &str) -> Vec<String> {
     if !content.starts_with("Git changes after iteration") {
         return Vec::new();
@@ -1243,6 +1247,10 @@ fn failure_file_path_regex() -> &'static regex::Regex {
 /// Parses verification failure output (typecheck errors, test failures, stack traces)
 /// to find referenced files, then reads their current contents so the AI has them
 /// immediately without needing tool calls.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_and_preread_failure_files(
     failure_context: &str,
     project_path: Option<&str>,
@@ -1361,6 +1369,10 @@ fn extract_and_preread_failure_files(
 /// On iteration 2+, extracts file paths from observations (git diff output) of
 /// prior iterations, then reads the current state of those files. This gives the
 /// AI immediate access to files it previously modified without needing tool calls.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn preread_previously_edited_files(
     _execution_id: &str,
     current_iteration: u32,

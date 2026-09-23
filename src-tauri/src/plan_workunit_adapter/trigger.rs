@@ -1966,6 +1966,7 @@ pub fn read_plans_for_cycle(
                 // an empty set. A zero here would be the claim that the default
                 // branch holds no plans, which nothing measured.
                 ref_census: None,
+                dangling_link_slugs: scan.dangling_link_slugs,
             })
         }
         ScanSource::Unavailable { reason } => Err(reason),
@@ -1999,6 +2000,7 @@ pub fn read_plans_for_cycle(
                         .collect(),
                     complete,
                     ref_census: Some(ref_census),
+                    dangling_link_slugs: Vec::new(),
                 })
             }
             Err(e) => Err(format!(
@@ -2033,6 +2035,22 @@ pub struct PlanDirScan {
     /// single failure makes it `false` — the PARTIAL read is the nastier
     /// shape, because the vector still looks plausible.
     pub complete: bool,
+    /// Stems whose `*.md` NAME is in the directory as a DANGLING symlink —
+    /// resolved as not-a-plan, so absent from `units` without clearing
+    /// `complete` (see [`is_dangling_symlink`]).
+    ///
+    /// Carried because "not a plan" and "not there" are different claims, and
+    /// the disappeared-slug detector asks the second: a link whose target is
+    /// briefly missing (a non-atomic rewrite of the target) has NOT left the
+    /// active dir, and warning about it would burn the slug's warn-once for
+    /// the life of the process. Read ONLY as presence, never as a plan.
+    ///
+    /// The price, accepted on purpose: a link that stays broken for good is
+    /// SILENT to the detector too, because its name never leaves. It is not
+    /// silent overall — the scan logs it every cycle at debug, and the
+    /// body-sync dry-run names it as a `dangling_symlink` skip — and a missed
+    /// warning is the recoverable direction, where a false one burns the slug.
+    pub dangling_link_slugs: Vec<String>,
 }
 
 /// What one `*.md` directory entry turned out to be, once its metadata was
@@ -2057,6 +2075,11 @@ enum PlanEntry {
     /// Resolved, and genuinely not a plan — a DIRECTORY named `*.md`. Skipping
     /// it is the guard's legitimate purpose and costs the scan nothing.
     NotAPlan,
+    /// A symlink whose target is not there — see [`is_dangling_symlink`].
+    /// RESOLVED, like [`PlanEntry::NotAPlan`], and so it does not clear
+    /// [`PlanDirScan::complete`]; kept as its own arm so the skip is logged
+    /// under its real name rather than as a directory.
+    DanglingLink,
     /// The listing yielded the name and `stat` refused it. A GAP, not a skip.
     Unstattable(std::io::Error),
 }
@@ -2064,12 +2087,67 @@ enum PlanEntry {
 /// Classify one entry from its metadata result. Pure, so the `Err` arm is
 /// testable on every platform — including a box where no unprivileged process
 /// can manufacture a real `stat` failure.
-fn classify_plan_entry(meta: std::io::Result<std::fs::Metadata>) -> PlanEntry {
+///
+/// `lstat` is consulted ONLY on a failed `stat`, to tell the one DECIDED
+/// failure (a dangling symlink) from the uncertain ones — see
+/// [`is_dangling_symlink`].
+fn classify_plan_entry(
+    meta: std::io::Result<std::fs::Metadata>,
+    lstat: impl FnOnce() -> std::io::Result<std::fs::Metadata>,
+) -> PlanEntry {
     match meta {
         Ok(m) if m.is_file() => PlanEntry::Read,
         Ok(_) => PlanEntry::NotAPlan,
+        Err(e) if is_dangling_symlink(&e, lstat) => PlanEntry::DanglingLink,
         Err(e) => PlanEntry::Unstattable(e),
     }
+}
+
+/// Whether a failed, link-FOLLOWING `stat` failed because the entry is a
+/// DANGLING SYMLINK — `stat` says `NotFound` while `lstat` finds a symlink.
+///
+/// That is a DECIDED answer, and the only metadata failure that is: the entry
+/// is a link, and there is no plan behind it. Both plan-dir walks (this
+/// module's [`scan_plan_dir`] and `body_push`'s listing, which the work-tree
+/// slug census is taken from) resolve it as NOT A PLAN rather than as a gap.
+/// Treated as a gap it was PERMANENT darkness from a knowable cause: the link
+/// answers the same way every cycle, so the work-tree census reported ABSENT
+/// and this scan reported PARTIAL — disarming the disappeared-slug detector —
+/// for as long as nobody noticed the link.
+///
+/// Not-a-plan is also what the REF side already says about the same entry:
+/// `ProcessGit::list_ref_dir` skips every mode-`120000` entry, so a link is
+/// never a ref stem either.
+///
+/// Deliberately narrow. Every OTHER failure still reads as a gap:
+///
+///  * `stat` refused for any other reason (`PermissionDenied`, EIO, ESTALE,
+///    ELOOP) — the entry's kind is exactly what was not established.
+///  * `stat` says `NotFound` and `lstat` does too — a file removed between
+///    `read_dir` and `stat`, or one being replaced by an unlink-then-create
+///    (a `git checkout` does exactly that). The name may be back a moment
+///    later, so shrinking the stem set on it would under-report a plan that
+///    exists; the gap costs one cycle and recovers by itself.
+///  * `lstat` failing at all — nothing was decided.
+///
+/// A link that WORKED last cycle and breaks this one therefore drops its stem
+/// from a COMPLETE scan's plans and from the work-tree census — which may be
+/// only the one cycle a non-atomic rewrite of the TARGET takes, the same race
+/// as a vanished plain file, landing on the decided side. That is tolerable
+/// for both because neither remembers: the census is re-taken every report.
+/// The one consumer that DOES remember — the disappeared-slug detector, whose
+/// warn-once set is never pruned — is kept off it by
+/// [`PlanDirScan::dangling_link_slugs`], which counts the link's NAME as
+/// present.
+///
+/// `lstat` is a thunk so it is only issued for a `NotFound` — the one kind that
+/// can be decided — rather than on every failed `stat`.
+pub(super) fn is_dangling_symlink(
+    stat_err: &std::io::Error,
+    lstat: impl FnOnce() -> std::io::Result<std::fs::Metadata>,
+) -> bool {
+    stat_err.kind() == std::io::ErrorKind::NotFound
+        && lstat().is_ok_and(|m| m.file_type().is_symlink())
 }
 
 /// The REF census of an already-taken listing.
@@ -2160,15 +2238,18 @@ pub struct CycleScan {
     /// plans dir is not in a repo at all, so there is no ref side to report —
     /// ABSENT (UNKNOWN), never an empty set.
     pub ref_census: Option<super::body_push::PlanSlugCensus>,
+    /// [`PlanDirScan::dangling_link_slugs`], forwarded by the WORK-TREE arm.
+    /// Always empty on the ref arm, which skips every symlink at the listing.
+    pub dangling_link_slugs: Vec<String>,
 }
 
 /// Read + parse every `*.md` in `dir` (non-recursive — the plans dir is flat,
 /// matching coord's `walk_root`), reporting whether the walk was COMPLETE.
 /// IO errors on individual files — a refused `stat` as well as a refused read
 /// — are logged and skipped; a missing dir yields an empty vec. All of those
-/// clear [`PlanDirScan::complete`]. A DIRECTORY named `*.md` is the one entry
-/// skipped WITHOUT clearing it: it is resolved, and it is genuinely not a
-/// plan.
+/// clear [`PlanDirScan::complete`]. A DIRECTORY named `*.md` and a DANGLING
+/// symlink named `*.md` are the two entries skipped WITHOUT clearing it: each
+/// is resolved, and genuinely not a plan (see [`is_dangling_symlink`]).
 ///
 /// The absolute path is still what is OPENED and what is logged on an IO
 /// error; only the path RECORDED on the parsed unit is made relative — see
@@ -2181,6 +2262,7 @@ pub fn scan_plan_dir(dir: &Path, conv: &PlanConvention) -> PlanDirScan {
             return PlanDirScan {
                 units: Vec::new(),
                 complete: false,
+                dangling_link_slugs: Vec::new(),
             };
         }
     };
@@ -2189,6 +2271,7 @@ pub fn scan_plan_dir(dir: &Path, conv: &PlanConvention) -> PlanDirScan {
     let source_root = super::body_push::derive_source_repo(dir);
     let mut out = Vec::new();
     let mut complete = true;
+    let mut dangling_link_slugs = Vec::new();
     for entry in entries {
         let entry = match entry {
             Ok(e) => e,
@@ -2209,9 +2292,18 @@ pub fn scan_plan_dir(dir: &Path, conv: &PlanConvention) -> PlanDirScan {
         if path.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
         }
-        match classify_plan_entry(path.metadata()) {
+        match classify_plan_entry(path.metadata(), || path.symlink_metadata()) {
             PlanEntry::Read => {}
             PlanEntry::NotAPlan => continue,
+            PlanEntry::DanglingLink => {
+                tracing::debug!(
+                    path = %path.display(),
+                    "plan adapter: a plans-dir entry is a dangling symlink; resolved as NOT a \
+                     plan, so the scan stays COMPLETE"
+                );
+                dangling_link_slugs.push(slug_from_filename(&path.to_string_lossy()));
+                continue;
+            }
             PlanEntry::Unstattable(e) => {
                 tracing::warn!(
                     path = %path.display(),
@@ -2238,6 +2330,7 @@ pub fn scan_plan_dir(dir: &Path, conv: &PlanConvention) -> PlanDirScan {
     PlanDirScan {
         units: out,
         complete,
+        dangling_link_slugs,
     }
 }
 
@@ -3953,6 +4046,7 @@ impl LoopState {
         // fields, so the order of the two partial moves is not itself
         // load-bearing.)
         let ref_census = active_scan.ref_census;
+        let active_dangling = active_scan.dangling_link_slugs;
         let units = active_scan.units;
         self.bulk_seed(&units, sink, metrics).await;
         let summary = reconcile_once(
@@ -4005,6 +4099,7 @@ impl LoopState {
                         PlanDirScan {
                             units: Vec::new(),
                             complete: false,
+                            dangling_link_slugs: Vec::new(),
                         }
                     }
                 }
@@ -4015,9 +4110,11 @@ impl LoopState {
             None => PlanDirScan {
                 units: Vec::new(),
                 complete: true,
+                dangling_link_slugs: Vec::new(),
             },
         };
         let archive_scan_complete = archive_scan.complete;
+        let archive_dangling = archive_scan.dangling_link_slugs;
         let archived = archive_scan.units;
         if !archived.is_empty() {
             let asum = reconcile_archive_once(&archived, sink, metrics).await;
@@ -4067,10 +4164,24 @@ impl LoopState {
         // `runner-lifecycle`. Only the scan's own `complete` flag
         // distinguishes a short read from a short directory.
         if active_scan_complete && archive_scan_complete {
+            // A dangling link's NAME is still in its dir: the plan has not
+            // LEFT it, whatever its target is doing this cycle — so it counts
+            // as present here, and only here (it was never read, so it is not
+            // SEEN above). See `PlanDirScan::dangling_link_slugs`.
+            let present_active: HashSet<String> = active_slugs
+                .iter()
+                .cloned()
+                .chain(active_dangling)
+                .collect();
+            let present_archive: HashSet<String> = archive_slugs
+                .iter()
+                .cloned()
+                .chain(archive_dangling)
+                .collect();
             for slug in newly_disappeared_slugs(
                 &self.seen_slugs,
-                &active_slugs,
-                &archive_slugs,
+                &present_active,
+                &present_archive,
                 &mut self.warned_disappeared,
             ) {
                 tracing::warn!(
@@ -6701,8 +6812,9 @@ mod tests {
         // NOT asserted: that the two arms produce the same SKIP records. They
         // do not, and an earlier draft asserted it — vacuously, because this
         // fixture has one file and no subdirectory, so both sides were empty.
-        // The tree walk emits `subdirectory_not_scanned` per subdir plus
-        // `unreadable_entry` / `unreadable_dir`; the ref arm sees none of those
+        // The tree walk emits `subdirectory_not_scanned` per subdir,
+        // `dangling_symlink` per broken `*.md` link, plus `unreadable_entry` /
+        // `unreadable_dir`; the ref arm sees none of those
         // because `list_ref_dir` filters trees out before `scan_one_root_at_ref`
         // is reached. Add one subdirectory to this fixture and the old
         // assertion fails. What this test pins is CLASSIFICATION parity, which
@@ -6997,6 +7109,10 @@ mod tests {
     /// grew back into the wrapper nothing would cover it — which is the state
     /// this change just left.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn read_blobs_wrapper_is_a_pure_delegation() {
         let src = include_str!("trigger.rs");
         let at = src
@@ -13200,14 +13316,21 @@ Body.
         );
         assert!(!partial.complete, "...but the scan is PARTIAL and says so");
 
-        // 4. UNSTATTABLE: listed, and `stat` refuses it — the arm
-        //    `Path::is_file()` swallowed. A dangling symlink is the portable
-        //    spelling. Its OWN tempdir: reusing case 3's leaves that case's
-        //    unreadable file behind, which clears `complete` by itself and
-        //    makes this case prove nothing.
+        // 4. A DANGLING SYMLINK: listed, and `stat` refuses it with
+        //    `NotFound` — but `lstat` finds the link, so it is a DECIDED
+        //    not-a-plan and the scan stays COMPLETE (`is_dangling_symlink`).
+        //    It used to be this test's portable spelling of an unstattable
+        //    entry, which is how a standing broken link came to hold the scan
+        //    PARTIAL — and the disappeared-slug detector disarmed — forever.
+        //    The genuinely unstattable arm (`PermissionDenied`, a name gone
+        //    mid-scan) is pinned by
+        //    `an_entry_that_cannot_be_statted_is_a_gap_not_a_skip`. Its OWN
+        //    tempdir: reusing case 3's leaves that case's unreadable file
+        //    behind, which clears `complete` by itself and makes this case
+        //    prove nothing.
         //
-        //    Neuter check: restore `if !path.is_file() { continue; }` and the
-        //    `complete` assertion below fails.
+        //    Neuter check: drop the `DanglingLink` arm from
+        //    `classify_plan_entry` and the `complete` assertion below fails.
         let dir4 = tempfile::tempdir().unwrap();
         std::fs::write(
             dir4.path().join("2026-01-03-c.md"),
@@ -13221,19 +13344,23 @@ Body.
                     std::fs::metadata(&dangling).is_err(),
                     "precondition: the link must be UNSTATTABLE"
                 );
-                let unstattable = scan_plan_dir(dir4.path(), &conv);
-                assert_eq!(unstattable.units.len(), 1);
+                let dangling_scan = scan_plan_dir(dir4.path(), &conv);
+                assert_eq!(dangling_scan.units.len(), 1);
                 assert!(
-                    !unstattable.complete,
-                    "an entry the OS LISTED but could not STAT is a gap, not a silent skip"
+                    dangling_scan.complete,
+                    "a dangling symlink is a DECIDED not-a-plan, never a standing gap"
+                );
+                assert_eq!(
+                    dangling_scan.dangling_link_slugs,
+                    vec!["2026-01-04-d".to_string()],
+                    "...whose NAME is still carried, as presence only"
                 );
             }
             Err(e) => {
                 // Not a pass: an explicit, printed inability to run this case.
                 eprintln!(
-                    "SKIPPED case 4 (unstattable entry): this platform refused to create a \
-                     symlink ({e}). The Err arm is pinned by \
-                     `an_entry_that_cannot_be_statted_is_a_gap_not_a_skip` instead."
+                    "SKIPPED case 4 (dangling symlink): this platform refused to create a \
+                     symlink ({e})."
                 );
             }
         }
@@ -13260,25 +13387,51 @@ Body.
         let file = dir.path().join("x.md");
         std::fs::write(&file, "x").unwrap();
         assert!(matches!(
-            classify_plan_entry(file.metadata()),
+            classify_plan_entry(file.metadata(), || file.symlink_metadata()),
             PlanEntry::Read
         ));
         assert!(
             matches!(
-                classify_plan_entry(dir.path().metadata()),
+                classify_plan_entry(dir.path().metadata(), || dir.path().symlink_metadata()),
                 PlanEntry::NotAPlan
             ),
             "a DIRECTORY named `*.md` is resolved and genuinely not a plan"
         );
         assert!(
             matches!(
-                classify_plan_entry(Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "EACCES",
-                ))),
+                classify_plan_entry(
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "EACCES",
+                    )),
+                    || panic!("lstat must not be consulted for a non-NotFound failure"),
+                ),
                 PlanEntry::Unstattable(_)
             ),
             "a REFUSED stat is a hole in the scan, never `not a plan`"
+        );
+        // `NotFound` with NOTHING behind the name either — the entry went
+        // away between `read_dir` and `stat`. Uncertain (it may be an
+        // unlink-then-create in flight), so still a gap.
+        let gone = dir.path().join("gone.md");
+        assert!(
+            matches!(
+                classify_plan_entry(gone.metadata(), || gone.symlink_metadata()),
+                PlanEntry::Unstattable(_)
+            ),
+            "a name that vanished mid-scan is UNCERTAIN, so it is a gap"
+        );
+        // `NotFound` on a REGULAR file's lstat is the same uncertain shape:
+        // only a SYMLINK makes the `NotFound` a decided answer.
+        assert!(
+            matches!(
+                classify_plan_entry(
+                    Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                    || file.symlink_metadata(),
+                ),
+                PlanEntry::Unstattable(_)
+            ),
+            "NotFound from stat plus a non-link lstat decides nothing"
         );
     }
 
@@ -13344,6 +13497,70 @@ Body.
             "the real disappearance is surfaced exactly once; got: {logged}"
         );
         assert!(logged.contains("2026-02-02-b"));
+    }
+
+    /// **A symlinked plan whose TARGET goes missing has not left the active
+    /// dir, so it must not burn its warn-once.**
+    ///
+    /// A dangling link is a DECIDED not-a-plan (`is_dangling_symlink`), which
+    /// keeps the scan COMPLETE and so arms the detector — and a non-atomic
+    /// rewrite of the target makes a working link dangle for one cycle. Were
+    /// the link's stem simply absent, that cycle would warn falsely and insert
+    /// the slug into `warned_disappeared`, which is never pruned: the REAL
+    /// removal in cycle 3 would then say nothing.
+    ///
+    /// Neuter check: pass `&active_slugs` instead of `&present_active` to
+    /// `newly_disappeared_slugs` — cycle 2 warns and cycle 3 is silent.
+    #[tokio::test]
+    async fn a_dangling_plan_link_is_present_to_the_disappearance_detector() {
+        let logs = CapturedLogs::start();
+        let dir = tempfile::tempdir().unwrap();
+        let targets = tempfile::tempdir().unwrap();
+        let target = targets.path().join("real-plan.md");
+        std::fs::write(&target, "# L\n\n> **Status: DRAFT**\n").unwrap();
+        let link = dir.path().join("2026-02-03-linked.md");
+        if let Err(e) = try_symlink(&target, &link) {
+            eprintln!("SKIPPED: this platform refused to create a symlink ({e})");
+            return;
+        }
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut state = tick_state(reader);
+
+        state.tick(&sink, &metrics).await;
+        assert!(
+            state.seen_slugs.contains("2026-02-03-linked"),
+            "the working link was read as a plan"
+        );
+
+        // The TARGET goes away; the link's name stays.
+        std::fs::remove_file(&target).unwrap();
+        state.tick(&sink, &metrics).await;
+        assert_eq!(
+            logs.text()
+                .matches("disappeared from the active dir")
+                .count(),
+            0,
+            "a link whose target is missing has not left the dir; got: {}",
+            logs.text()
+        );
+        assert!(
+            state.warned_disappeared.is_empty(),
+            "...and poisons nothing"
+        );
+
+        // The LINK goes away: that is a real disappearance, surfaced once.
+        std::fs::remove_file(&link).unwrap();
+        state.tick(&sink, &metrics).await;
+        let logged = logs.text();
+        assert_eq!(
+            logged.matches("disappeared from the active dir").count(),
+            1,
+            "the real disappearance is surfaced exactly once; got: {logged}"
+        );
+        assert!(logged.contains("2026-02-03-linked"));
     }
 
     /// **The same property on main's REF scan.** A blob the listing names but

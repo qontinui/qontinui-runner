@@ -293,6 +293,10 @@ const REPO_STOPWORDS: [&str; 10] = [
 /// on `,` `+` `;`, and keep the first bare token of each chunk. Order-preserving
 /// and deduped. Returns empty when the line is absent — most of the corpus has
 /// no `Repo(s):` line at all, which is a real empty, not a parse failure.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn extract_repos(body: &str) -> Vec<String> {
     const MARKER: &str = "**Repo(s):**";
     let mut lines = body.lines();
@@ -635,7 +639,7 @@ pub struct SkippedFile {
 
 /// One root's depth-1 entries, split the way [`scan_one_root`] splits them.
 ///
-/// Both lists are sorted: `read_dir` order is filesystem-dependent, and a
+/// Every list is sorted: `read_dir` order is filesystem-dependent, and a
 /// dry-run report has to be reproducible across runs and machines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RootListing {
@@ -647,16 +651,22 @@ struct RootListing {
     /// there" when the truth is "this was never looked at". Absence of a
     /// report is not a report of absence.
     subdirs: Vec<PathBuf>,
+    /// `*.md` entries that are DANGLING SYMLINKS — resolved as not-a-plan (see
+    /// [`super::trigger::is_dangling_symlink`]), so they are in neither list
+    /// above and taint nothing. RECORDED for the same reason `subdirs` is: the
+    /// dry-run report names them instead of letting them vanish unexplained.
+    dangling_links: Vec<PathBuf>,
     /// At least one entry of this directory that COULD have been a plan was
     /// not read or classified — a `read_dir` iteration error (where the name
     /// itself is unknown, so nothing can be ruled out), or metadata that would
     /// not load for a `*.md` name.
     ///
     /// Scoped to entries that could be stems because the flag's only job is to
-    /// say whether the `*.md` set is a floor. A dangling symlink named
-    /// `notes.txt` is a PERMANENT metadata failure that could never have
-    /// changed that set, and letting it raise this flag put the census ABSENT
-    /// forever with no way back.
+    /// say whether the `*.md` set is a floor. A permanently unreadable
+    /// `notes.txt` could never have changed that set, and letting it raise
+    /// this flag put the census ABSENT forever with no way back. (A dangling
+    /// symlink of either name no longer reaches this flag at all — it is
+    /// resolved into `dangling_links` or ignored.)
     ///
     /// Both lists above are then FLOORS rather than the whole directory, and
     /// the two consumers part company on that: the scan publishes what it
@@ -676,6 +686,9 @@ enum EntryKind {
     /// Neither — a socket, a fifo, a device node. An ANSWER rather than a
     /// failure, so it belongs in no list and taints nothing.
     Other,
+    /// A symlink with nothing behind it. Also an ANSWER — see
+    /// [`super::trigger::is_dangling_symlink`] — so it taints nothing either.
+    DanglingLink,
 }
 
 /// Whether a path's NAME could carry a plan stem — `extension() == "md"`,
@@ -692,8 +705,18 @@ fn could_be_a_stem(path: &Path) -> bool {
 /// Classify one entry the way `Path::is_dir` / `Path::is_file` do — FOLLOWING
 /// links — but returning the metadata error instead of swallowing it into a
 /// `false` that would land the entry in neither list, unreported.
+///
+/// The one failure resolved rather than returned is a DANGLING symlink, the
+/// same rule [`super::trigger::scan_plan_dir`] applies, through the same
+/// predicate — so the census and the work-unit scan cannot disagree on it.
 fn classify_entry(path: &Path) -> std::io::Result<EntryKind> {
-    let meta = std::fs::metadata(path)?;
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if super::trigger::is_dangling_symlink(&e, || std::fs::symlink_metadata(path)) => {
+            return Ok(EntryKind::DanglingLink);
+        }
+        Err(e) => return Err(e),
+    };
     Ok(if meta.is_dir() {
         EntryKind::Dir
     } else if meta.is_file() {
@@ -755,6 +778,7 @@ where
 {
     let mut files: Vec<PathBuf> = Vec::new();
     let mut subdirs: Vec<PathBuf> = Vec::new();
+    let mut dangling_links: Vec<PathBuf> = Vec::new();
     let mut entries_errored = false;
     for entry in entries {
         let path = match entry {
@@ -778,16 +802,19 @@ where
                 }
             }
             Ok(EntryKind::Other) => {}
+            Ok(EntryKind::DanglingLink) => {
+                if could_be_a_stem(&path) {
+                    dangling_links.push(path);
+                }
+            }
             // NARROWED on purpose: only an entry that could be a stem may
             // poison the listing.
             //
-            // `classify` FOLLOWS links, so a dangling symlink — and any
-            // permanently unreadable entry — answers `Err(NotFound)` every
-            // cycle. That is a knowable, standing answer, not a blip. Letting
-            // `notes.txt` or a broken link taint the listing sent this side
-            // ABSENT forever, with no recovery short of operator action, over
-            // an entry that could never have joined the `*.md` stem set the
-            // census is about.
+            // A permanently unreadable entry answers `Err` every cycle. That
+            // is a standing answer, not a blip. Letting an unreadable
+            // `notes.txt` taint the listing sent this side ABSENT forever,
+            // with no recovery short of operator action, over an entry that
+            // could never have joined the `*.md` stem set the census is about.
             //
             // The test is on the NAME, which `read_dir` already handed us and
             // which no failing syscall can take away. An entry whose name
@@ -811,22 +838,17 @@ where
                      is NOT a floor"
                 );
             }
-            // ACCEPTED LIMIT, stated so an operator who hits it can find the
-            // sentence: an entry whose name COULD be a stem still taints the
-            // listing even when its failure is a DECIDED one. A dangling
-            // symlink named `<stem>.md` answers `NotFound` every cycle —
-            // `classify` follows links — so this side reports ABSENT for as
-            // long as the link stays broken, with only a per-cycle WARN to say
-            // so. That is the safe direction (never a false zero) but it is
-            // permanent darkness from a knowable cause, which is the shape
-            // this plan family exists to remove.
+            // An entry whose name COULD be a stem and whose kind could not be
+            // established taints the listing. The one DECIDED failure — a
+            // dangling symlink — never reaches here: `classify_entry` resolves
+            // it to `DanglingLink` above, which is what stopped a broken
+            // `<stem>.md` link from holding this side ABSENT forever.
             //
-            // It is NOT narrowed to the uncertain kinds (`PermissionDenied`,
-            // `Busy`) here on purpose: doing so would stop a file deleted
-            // mid-scan from tainting, and deciding whether that race should
-            // shrink the denominator is a separate judgement with its own
-            // tests — not a rider on this one. Tracked as a follow-up on
-            // 2026-09-15-captured-vs-authored-coverage-is-a-set-difference.
+            // Everything that does reach here is UNCERTAIN, including a name
+            // that vanished between `read_dir` and `stat`: that may be an
+            // unlink-then-create in flight (a `git checkout`), so shrinking
+            // the stem set on it would under-report a plan that exists. One
+            // ABSENT cycle, recovering by itself, is the honest cost.
             Err(e) => {
                 tracing::warn!(
                     path = %path.display(),
@@ -840,9 +862,11 @@ where
     }
     files.sort();
     subdirs.sort();
+    dangling_links.sort();
     RootListing {
         files,
         subdirs,
+        dangling_links,
         entries_errored,
     }
 }
@@ -889,6 +913,7 @@ fn scan_listing(
     let RootListing {
         files,
         subdirs,
+        dangling_links,
         entries_errored,
     } = listing;
     if entries_errored {
@@ -898,6 +923,12 @@ fn scan_listing(
         });
     }
     let mut out = Vec::new();
+    for link in dangling_links {
+        skipped.push(SkippedFile {
+            path: link.to_string_lossy().to_string(),
+            reason: "dangling_symlink",
+        });
+    }
     for dir in subdirs {
         skipped.push(SkippedFile {
             path: dir.to_string_lossy().to_string(),
@@ -1112,6 +1143,10 @@ pub fn build_report(
 }
 
 /// Render the report as the operator-facing text the backfill subcommand prints.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn render_report(report: &BackfillReport) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
@@ -2813,10 +2848,7 @@ mod tests {
             dir,
             [
                 Ok(good.clone()),
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "readdir failed mid-iteration",
-                )),
+                Err(std::io::Error::other("readdir failed mid-iteration")),
             ],
             &classify_entry,
         );
@@ -2829,8 +2861,7 @@ mod tests {
         // ABSENT rather than small.
         let all_failed = collect_listing(
             dir,
-            [Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            [Err(std::io::Error::other(
                 "readdir failed at the first entry",
             ))],
             &classify_entry,
@@ -2853,10 +2884,9 @@ mod tests {
     /// **An entry that could never have been a plan must not send the census
     /// ABSENT.**
     ///
-    /// `classify_entry` FOLLOWS links, so a dangling symlink — and any
-    /// permanently unreadable entry — answers `Err` on every cycle. That is a
-    /// knowable, standing answer. Tainting on it made a `notes.txt` in that
-    /// state report this side ABSENT *forever*, with no recovery short of
+    /// A permanently unreadable entry answers `Err` on every cycle. That is a
+    /// standing answer. Tainting on it made a `notes.txt` in that state report
+    /// this side ABSENT *forever*, with no recovery short of
     /// operator action, over an entry that could not have changed the `*.md`
     /// stem set the census is an assertion about.
     ///
@@ -2873,15 +2903,14 @@ mod tests {
         let good = dir.join("2026-01-01-good.md");
         std::fs::write(&good, "# A plan\n\nBody.\n").unwrap();
 
-        // The dangling-symlink shape, spelled as the metadata failure it
-        // produces: `classify_entry` on a path whose target is not there.
-        // Written this way rather than with a real symlink because creating
-        // one needs a privilege Windows does not grant by default, and the
-        // syscall answer is identical.
-        let dangling = dir.join("notes.txt");
-        assert!(classify_entry(&dangling).is_err(), "the premise");
+        // A listed name whose metadata will not load: here, one with nothing
+        // on disk behind it at all, which `classify_entry` cannot resolve
+        // (no link either — see
+        // `a_dangling_symlink_is_resolved_not_a_floor` for that shape).
+        let unreadable = dir.join("notes.txt");
+        assert!(classify_entry(&unreadable).is_err(), "the premise");
 
-        let listing = collect_listing(dir, [Ok(good.clone()), Ok(dangling)], &classify_entry);
+        let listing = collect_listing(dir, [Ok(good.clone()), Ok(unreadable)], &classify_entry);
         assert!(
             !listing.entries_errored,
             "a non-`*.md` name could not have joined the stem set, so the listing is not a floor"
@@ -2890,7 +2919,9 @@ mod tests {
         assert_eq!(census.slugs, Some(vec!["2026-01-01-good".to_string()]));
         assert_eq!((census.count, census.truncated), (1, false));
 
-        // The same failure on a name that COULD be a stem still taints.
+        // The same failure on a name that COULD be a stem still taints —
+        // this is also the vanished-mid-scan shape, which is UNCERTAIN (an
+        // unlink-then-create may be in flight).
         let missing_md = dir.join("2026-01-02-missing.md");
         assert!(classify_entry(&missing_md).is_err(), "the premise");
         let tainted = collect_listing(dir, [Ok(good), Ok(missing_md)], &classify_entry);
@@ -2899,6 +2930,67 @@ mod tests {
             census_from_listing(dir, &tainted),
             None,
             "in doubt about an entry that could be a stem: ABSENT"
+        );
+    }
+
+    /// **A DANGLING `*.md` symlink is a decided not-a-plan: the census stays
+    /// a reading, and the dry-run report names the link.**
+    ///
+    /// `classify_entry` FOLLOWS links, so a broken `<stem>.md` link answers
+    /// `NotFound` on every cycle. Read as a gap, that held the work-tree
+    /// census ABSENT for as long as the link stayed broken — permanent
+    /// darkness from a knowable cause. `lstat` finds the link, which DECIDES
+    /// the entry: not a plan, exactly as the ref side (which skips every
+    /// mode-`120000` entry) already says.
+    ///
+    /// Neuter check: drop the `is_dangling_symlink` arm from `classify_entry`
+    /// and the census below goes ABSENT.
+    #[test]
+    fn a_dangling_symlink_is_resolved_not_a_floor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let good = dir.join("2026-01-01-good.md");
+        std::fs::write(&good, "# A plan\n\nBody.\n").unwrap();
+        let link = dir.join("2026-01-02-linked.md");
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(dir.join("no-such-target.md"), &link);
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(dir.join("no-such-target.md"), &link);
+        if let Err(e) = made {
+            // Not a pass: an explicit, printed inability to run this case.
+            eprintln!("SKIPPED: this platform refused to create a symlink ({e})");
+            return;
+        }
+        assert!(std::fs::metadata(&link).is_err(), "the premise: it dangles");
+        assert_eq!(classify_entry(&link).unwrap(), EntryKind::DanglingLink);
+
+        let listing = enumerate_root(dir).unwrap();
+        assert!(!listing.entries_errored, "a decided entry is not a floor");
+        assert_eq!(listing.files, vec![good]);
+        assert_eq!(listing.dangling_links, vec![link.clone()]);
+
+        let census = census_from_listing(dir, &listing).expect("the census is a READING");
+        assert_eq!(census.slugs, Some(vec!["2026-01-01-good".to_string()]));
+        assert_eq!((census.count, census.truncated), (1, false));
+
+        let root = ScanRoot::new(dir, ScanRootKind::Plans, PLANS_ROOT_LABEL);
+        let mut skipped = Vec::new();
+        let scanned = scan_listing(
+            &root,
+            listing,
+            &PlanConvention::operator_default(),
+            &mut skipped,
+        );
+        assert_eq!(scanned.len(), 1);
+        assert!(
+            skipped
+                .iter()
+                .any(|s| s.reason == "dangling_symlink" && s.path == link.to_string_lossy()),
+            "the dry-run report names the link rather than dropping it: {skipped:?}"
+        );
+        assert!(
+            !skipped.iter().any(|s| s.reason == "unreadable_entry"),
+            "and does not report it as a lost entry: {skipped:?}"
         );
     }
 

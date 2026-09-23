@@ -284,6 +284,10 @@ fn inner_event_system_unit_tests_pass() {
 
 /// Extract the substring between `start` and the next occurrence of `end`
 /// after `start`. Returns `None` if either marker is missing.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_between<'a>(src: &'a str, start: &str, end: &str) -> Option<&'a str> {
     let s = src.find(start)? + start.len();
     let rest = &src[s..];

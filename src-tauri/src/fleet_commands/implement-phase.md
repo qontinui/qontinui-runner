@@ -367,12 +367,31 @@ trigger is NOT a gate; skip those and just report the blocker.
   `agent_non_author` IS usable when the clearer is a different device or carries
   proven session identity. ⚠️ **The sentence that used to follow — "the work-unit
   attestation check now routes through this SAME ladder" — is FALSE and was
-  removed 2026-09-03.** Verified on qontinui-coord `origin/main`:
-  `work_unit_registry::authorize_target_transition` takes two `Option<&str>`
-  keys and does a flat `owner == attester` compare;
+  removed 2026-09-03.** Re-verified on qontinui-coord `origin/main` 2026-09-23 at
+  `037fc1a8f`: `work_unit_registry::authorize_target_transition` takes the two
+  actor keys **plus an optional `independence` declaration**
+  (`{verified, against, context}`), and does the flat `owner == attester`
+  compare **only when no declaration is sent** — a well-formed one authorizes an
+  Attested transition without that compare, while still refusing
+  `attester_unresolved` when the caller's token derives no actor key;
   `non_author_allows_identities` is called only from `gates.rs`. The ladder is
   real for GATES and fictional for work-unit attestation — do not carry it
-  across. For the work-unit rule read policy live rather than restating it:
+  across. ⚠️ **Whether the coord instance serving YOU advertises that field is a
+  READ — and NOT the one your own tool list answers.** Measured 2026-09-23: the
+  authoring session's advertised `coord_work_unit_transition` schema carried
+  four properties while the door carried six, so a session trusting its own tool
+  list would have recorded "not served" when the door said otherwise. Read the
+  door — `coord-revive.sh tools`, then look for `independence` in that tool's
+  `inputSchema` — and take the worked declaration from `/vet-plan` →
+  `self_attestation_forbidden`; if your own tool list is the stale one, send it
+  with `coord-revive.sh call coord_work_unit_transition '<json>'` rather than
+  the tool your session advertises, and verify by read — a zero exit is not
+  evidence the write landed. ⚠️ **Never re-allocate to get past
+  `self_attestation_forbidden`**: a fresh allocate issues a NEW agent id the
+  legacy compare would admit, which that refusal itself names *"a known defect
+  being tracked, not a sanctioned route"*. That prohibition is that refusal's
+  alone — `attester_unresolved` wants a device- or agent-identified caller,
+  which is a credential remedy rather than a route around a control. For the work-unit rule read policy live rather than restating it:
   `/policy get policy plan-discipline` and `verification-and-evidence`
   [policy: never-pin-a-mutable-policy-value]. (Canonical for gates:
   `_gate-registration` → "`gate_class`".)

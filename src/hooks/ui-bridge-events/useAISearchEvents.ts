@@ -1163,14 +1163,19 @@ export function useAISearchEvents(
             await sendResponse({
               requestId,
               type,
-              success: verdict.recovered,
-              data: verdict.recovered
-                ? { recovered: true, ...attempted }
+              success: verdict.attemptSucceeded,
+              // `attemptSucceeded`, not `recovered`: this reports the SCOPED
+              // attempt only. Whether the original action now succeeds is the
+              // runner's separate `RecoveryOutcome.recovered` question.
+              data: verdict.attemptSucceeded
+                ? { attemptSucceeded: true, ...attempted }
                 : // A recovery that RAN and did not recover must not reach the
                   // caller as an HTTP 200 success either — the envelope's
                   // `success: false` below is what the runner now propagates.
                   recoveryFailureData(RECOVERY_FAILED, attempted),
-              error: verdict.recovered ? undefined : (verdict.reason ?? "recovery did not succeed"),
+              error: verdict.attemptSucceeded
+                ? undefined
+                : (verdict.reason ?? "recovery did not succeed"),
               timestamp: Date.now(),
             });
           } catch (err) {

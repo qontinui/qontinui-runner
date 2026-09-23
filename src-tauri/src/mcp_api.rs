@@ -1458,6 +1458,17 @@ async fn health(
         // with a serving emitter used to be diagnosable only by log grep on
         // the emitting box.
         "transportRung": transport_rung_health_snapshot(),
+        // The coord session outbox drain (qontinui-runner manual-test-loop
+        // 2026-09-23): `pending` rows and the `oldestUnackedAt` among them as
+        // of the drain's last tick (`observedAt`; `pending: null` = no tick
+        // yet, UNKNOWN rather than empty), `lastAckAt` of anything coord
+        // accepted, and `lastFailure {kind, status, at}` — `kind` one of
+        // server_error / rate_limited / unauthorized / rejected / conflict /
+        // network / timeout. `retryingSessions` are on their own backoff;
+        // `quarantinedSessions` had their rows moved to the
+        // `<outbox>.quarantine.jsonl` sidecar after failing while coord served
+        // everything else. A stalled drain used to be invisible from here.
+        "sessionOutbox": crate::session::coord_sync::session_outbox_health_json(),
         // Session-message push evidence (plan
         // 2026-09-07-session-message-delivery-is-blind-and-park-collection-
         // resolves-on-a-guess, Phase 4): every tick the poller could not push
@@ -15603,6 +15614,10 @@ mod coord_claims_proxy_tests {
     /// technique `ui_error`'s writer guard uses. It fails against a
     /// `coord_mcp_proxy_handler` that does not make the call.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn the_coord_mcp_proxy_reports_its_upstream_verdict_to_the_posture() {
         // From CARGO_MANIFEST_DIR, never the CWD: a test binary can be run
         // from anywhere.
@@ -15647,6 +15662,10 @@ mod coord_claims_proxy_tests {
     /// `coord_mcp_url_with_source()` would still dial coord and still hand the
     /// caller `token_expired`, which is the whole incident.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn the_coord_mcp_proxy_refuses_locally_on_a_dead_runner_credential() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs");
         let text = std::fs::read_to_string(&src).expect("read mcp_api.rs");

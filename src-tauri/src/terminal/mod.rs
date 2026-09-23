@@ -1464,7 +1464,7 @@ mod tests {
 "
             ),
             "clause must open with a blank line, got: {:?}",
-            &memory_clause()[..memory_clause().len().min(20)]
+            crate::str_utils::truncate_str(&memory_clause(), 20)
         );
     }
 
@@ -1546,7 +1546,7 @@ mod tests {
 "
             ),
             "conditional clause must open with a blank line, got: {:?}",
-            &memory_clause_conditional()[..memory_clause_conditional().len().min(20)]
+            crate::str_utils::truncate_str(&memory_clause_conditional(), 20)
         );
     }
 

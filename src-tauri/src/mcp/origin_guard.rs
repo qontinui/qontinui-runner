@@ -1616,6 +1616,10 @@ fn settings_allowed_origins() -> Arc<Vec<NormOrigin>> {
 /// is called). Pure over source text so the tripwire can be proven on a
 /// synthetic input.
 #[cfg(test)]
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub(crate) fn registrations_after_apply(src: &str) -> Vec<String> {
     let Some(start) = src.find("pub fn create_router(") else {
         return vec!["create_router not found".to_string()];

@@ -15,12 +15,15 @@
  * 1. **Scoped** — recovery may only touch the element the caller addressed.
  * 2. **Never writes** — recovery repositions (scroll, focus, wait, resnapshot);
  *    it does not invent input on the caller's behalf.
- * 3. **Honest** — `recovered` is read off the executor's own verdict.
+ * 3. **Honest** — `attemptSucceeded` is read off the executor's own verdict.
  *
- * A leaf module (zero imports), for the same reason `terminalWriteResult.ts`
- * is one: `useAISearchEvents` pulls React and the bridge, so nothing exported
- * from it is testable under the runner's `environment: "node"` vitest config.
+ * A leaf module (its only import is the generated write-action JSON), for the
+ * same reason `terminalWriteResult.ts` is one: `useAISearchEvents` pulls React
+ * and the bridge, so nothing exported from it is testable under the runner's
+ * `environment: "node"` vitest config.
  */
+
+import writeActionsGenerated from "./writeActions.generated.json";
 
 /** Machine-readable refusal: the caller did not say which element to recover. */
 export const RECOVERY_UNSCOPED = "RECOVERY_UNSCOPED";
@@ -36,31 +39,16 @@ export const RECOVERY_TARGET_MISSING = "RECOVERY_TARGET_MISSING";
 export const RECOVERY_FAILED = "RECOVERY_FAILED";
 
 /**
- * Actions that MUTATE input state. Kept in lockstep with the runner-side
- * `is_write_action` in `src-tauri/src/mcp/ui_bridge/recovery_executor.rs`:
- * both ends refuse, so neither is the single point of failure.
+ * Actions that MUTATE input state. The LIST is not declared here: it is the
+ * runner's `WRITE_ACTIONS` constant in
+ * `src-tauri/src/mcp/ui_bridge/recovery_executor.rs`, generated into
+ * `writeActions.generated.json` and drift-gated by the Rust test
+ * `write_actions_fixture_matches_rust_declaration`. The CHECK stays two —
+ * this `isWriteAction` and the runner's `is_write_action` both refuse, so
+ * neither is the single point of failure across the IPC seam — but a string
+ * can no longer be added to one side's list alone.
  */
-const WRITE_ACTIONS = new Set([
-  "type",
-  "settext",
-  "setvalue",
-  "fill",
-  "input",
-  "paste",
-  "append",
-  "clear",
-  "select",
-  "selectoption",
-  "check",
-  "uncheck",
-  "toggle",
-  "submit",
-  "upload",
-  "setfiles",
-  "sendkeys",
-  "presskey",
-  "writetoterminal",
-]);
+const WRITE_ACTIONS: ReadonlySet<string> = new Set<string>(writeActionsGenerated);
 
 /** True when `action` would mutate input state, so recovery must refuse it. */
 export function isWriteAction(action: string): boolean {
@@ -147,16 +135,28 @@ export function scopeRecoveryExecutor<T extends object>(bridge: T, targetElement
   }) as T;
 }
 
-/** The honest recovery verdict, read off the executor's own response. */
+/**
+ * The honest verdict on the SCOPED ATTEMPT, read off the executor's own
+ * response.
+ *
+ * Deliberately NOT named `recovered`. The runner's
+ * `RecoveryOutcome.recovered` (`recovery_executor.rs`) answers a different,
+ * stricter question — "does the ORIGINAL action now succeed?", re-verified by
+ * an independent retry. This answers only "did the scoped executor act on the
+ * addressed element?". The two can legitimately disagree (the right element
+ * was clicked, the original action is still broken: attempt `true`, outer
+ * `false`), and one word for both hid which question was being answered.
+ */
 export interface RecoveryVerdict {
-  /** `true` ONLY when the executor itself reported success. */
-  recovered: boolean;
+  /** `true` ONLY when the scoped executor itself reported success on the
+   *  addressed element. Says nothing about the original action. */
+  attemptSucceeded: boolean;
   /** The executor's failure reason, when it failed. */
   reason: string | null;
 }
 
 /**
- * Derive `recovered` from the executor's response instead of asserting it.
+ * Derive `attemptSucceeded` from the executor's response instead of asserting it.
  *
  * The old handler hardcoded `recovered: true` on any resolved executor call,
  * so a recovery that found no element, fell below the confidence threshold, or
@@ -164,13 +164,13 @@ export interface RecoveryVerdict {
  */
 export function recoveryVerdict(result: unknown): RecoveryVerdict {
   if (result === null || typeof result !== "object") {
-    return { recovered: false, reason: "recovery executor returned no result" };
+    return { attemptSucceeded: false, reason: "recovery executor returned no result" };
   }
   const r = result as { success?: unknown; error?: unknown; errorCode?: unknown };
-  if (r.success === true) return { recovered: true, reason: null };
+  if (r.success === true) return { attemptSucceeded: true, reason: null };
   const code = typeof r.errorCode === "string" ? r.errorCode : null;
   const message = typeof r.error === "string" ? r.error : "recovery did not succeed";
-  return { recovered: false, reason: code ? `${code}: ${message}` : message };
+  return { attemptSucceeded: false, reason: code ? `${code}: ${message}` : message };
 }
 
 /**
@@ -192,15 +192,17 @@ export function recoveryVerdict(result: unknown): RecoveryVerdict {
  * `success: false` — plus `error`, `code` and `hint` — onto the forwarded
  * payload for EVERY handler, so the per-call-site mirroring is gone from here.
  *
- * What remains is the part that was never envelope duplication: `recovered`,
- * the verdict `as_recovery_failure` (`ai_analyze.rs`) keys its Ok-arm on, and
+ * What remains is the part that was never envelope duplication:
+ * `attemptSucceeded`, the scoped-attempt verdict `as_recovery_failure`
+ * (`ai_analyze.rs`) keys its Ok-arm on, and
  * `code`, which stays alongside it so a data-only reader still sees the typed
- * token. Fields already present here win over the stamped ones, so setting
- * `recovered: true` from a failure path is not possible by accident.
+ * token. Fields already present here win over the stamped ones, and `extra` is
+ * spread FIRST so it can never overwrite `code` or the verdict — setting
+ * `attemptSucceeded: true` from a failure path is not possible by accident.
  */
 export function recoveryFailureData(
   code: string,
   extra: Record<string, unknown> = {},
 ): Record<string, unknown> {
-  return { code, recovered: false, ...extra };
+  return { ...extra, code, attemptSucceeded: false };
 }

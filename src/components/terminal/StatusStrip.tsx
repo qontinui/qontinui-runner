@@ -17,9 +17,9 @@
  *   - **N stuck on lock Xm** — count + max age of `kind:"waiting"`
  *     entries in `fileLockStates`. Clicking focuses the longest-stuck
  *     waiter's zone.
- *   - **N errors** — clickable, cycles to the next errored zone (an
- *     inline mirror of `focusNextNeedsInput`'s walk for `state ==="error"`,
- *     since `useZoneLayout` doesn't expose a dedicated cycler).
+ *   - **N errors** — clickable, cycles to the next errored zone via
+ *     `zoneLayout.focusNextError` — the same parameterized walk
+ *     (`focusNextInState`) the needs-input pill uses.
  *   - **Wrapper tools** — an icon-only affordance (click → popover list),
  *     read from `useWrapperTools`. The raw count is deliberately NOT shown
  *     as text and does NOT keep the strip open (see `hasContent`): it is
@@ -60,9 +60,15 @@ import { useHotField } from "./useTerminalHotStore";
 import { useWrapperTools } from "@/hooks/useWrapperTools";
 import { BatchActions } from "./BatchActions";
 import { MinimapToggle } from "./MinimapToggle";
+import {
+  countLiveTabs,
+  countTabsInState,
+  splitNeedsInput,
+  unionErrorCount,
+  unionSessionCount,
+} from "./sessionCounts";
 
 const HEARTBEAT_MS = 1_000;
-
 
 function formatAge(ms: number): string {
   const sec = Math.max(0, Math.floor(ms / 1000));
@@ -115,123 +121,6 @@ const STATE_COLORS: Record<SessionState, string> = {
   completed: "#9ece6a",
   error: "#f7768e",
 };
-
-/**
- * How many PTY TABS on this page are currently in `state`.
- *
- * This is the evidence every *actionable* affordance on the terminal page
- * already runs on: the zone renderer's colouring, `focusNextNeedsInput` /
- * `focusNextError`'s walk over `zoneLayout.assignments`, and `BatchActions`'
- * `needsInputTabs`. Keyed by tab id, filtered through the live `tabs` list so
- * a stale `sessionStates` entry for a closed tab can't inflate it.
- */
-export function countTabsInState(
-  tabs: readonly { id: string }[] | undefined | null,
-  sessionStates: Record<string, SessionState> | undefined | null,
-  state: SessionState,
-): number {
-  if (!tabs || !sessionStates) return 0;
-  let n = 0;
-  for (const tab of tabs) {
-    if (sessionStates[tab.id] === state) n++;
-  }
-  return n;
-}
-
-/**
- * The error count the strip actually shows: the Claude-session bucketing
- * UNIONed with the page's own tab-scoped `error` states.
- *
- * THE DEFECT: `statusCounts.errorCount` buckets *Claude sessions*
- * (`useSessionManager`), while everything else on this page — the zone
- * renderer's red border, and `focusNextError`'s walk right below — reads
- * `sessionStates[tabId]`, keyed by PTY tab. A tab whose PTY died carries
- * `sessionStates[tab] === "error"` but has no live Claude session to bucket,
- * so the pill read `0 errors` (and `hasContent` hid the strip outright) on a
- * page that was simultaneously painting that tab as errored and would happily
- * cycle to it. The count and the cycler have to answer to the same evidence.
- *
- * `Math.max` is the union, not a fudge: the two sets OVERLAP (a tab-backed
- * session in error is counted by both) and share no key to dedupe on —
- * `sessionStates` is keyed by terminal-tab id, `statusCounts` is bucketed over
- * session records. Max can never double-count an overlapping error and never
- * reads below either input, so the pill is present whenever either surface
- * has something to point at.
- */
-export function unionErrorCount(sessionErrorCount: number, tabErrorCount: number): number {
-  return Math.max(sessionErrorCount, tabErrorCount);
-}
-
-/**
- * How many PTY TABS on this page are currently LIVE.
- *
- * Counts `isAlive` truthily — the same spelling of liveness the rest of this
- * page already runs on (`TerminalSessionContext`'s `liveTabIds`,
- * `useProjectTerminalReconcile`'s `if (!t.isAlive) return false`, and
- * `buildTerminalSessionRoster`'s `isAlive: Boolean(t.isAlive)`). A tab whose
- * PTY has exited is a tombstone the operator cannot work in, so counting every
- * historical tab would re-open the strip on a page with nothing running — the
- * mirror image of the defect below, and exactly the inflation
- * `statusCounts` was introduced to avoid (18 tabs -> "18 sessions").
- */
-export function countLiveTabs(tabs: readonly { isAlive?: boolean }[] | undefined | null): number {
-  if (!tabs) return 0;
-  let n = 0;
-  for (const tab of tabs) {
-    if (tab.isAlive) n++;
-  }
-  return n;
-}
-
-/**
- * The session count the strip's multi-zone pills gate on: the Claude-session
- * bucketing UNIONed with this page's own live PTY tabs.
- *
- * THE DEFECT: `hasContent` read a UNIONed `errorCount` (see
- * {@link unionErrorCount}) right beside an un-unioned `isMultiZone`, which was
- * a bare `sessionCount > 1` off `useSessionManager.statusCounts`. That count
- * buckets *Claude sessions* — the comment at its destructuring site says so
- * outright — so two live PTY tabs with no Claude session attached scored 0 and
- * the whole status surface refused to render on a page that plainly had two
- * terminals in it. One boolean expression cannot honestly mix a unioned input
- * with an un-unioned one.
- *
- * `Math.max` is the union for the same reason it is in {@link unionErrorCount}:
- * the two sets OVERLAP (a tab-backed Claude session is counted by both) and
- * share no key to dedupe on — `tabs` is keyed by terminal-tab id,
- * `statusCounts` is bucketed over session records. Max can never double-count
- * an overlapping session and never reads below either input.
- */
-export function unionSessionCount(sessionCount: number, liveTabCount: number): number {
-  return Math.max(sessionCount, liveTabCount);
-}
-
-/**
- * Split the needs-input signal into what this page can ACT on and what it can
- * only report.
- *
- * THE DEFECT: the pill counted Claude sessions while the two things it
- * advertises — "Tab to cycle" (`focusNextNeedsInput`, a walk over zone
- * assignments) and the `BatchActions` buttons rendered beside it
- * (`needsInputTabs`) — both operate on PTY tabs. An active-EXTERNAL session
- * waiting for input has no tab in this window, so the strip claimed "2 need
- * input · Tab to cycle" while cycling reached one of them and Approve-all
- * would have written to one. The count a control claims must be the count
- * that control can reach.
- *
- * So the headline number is the tab-scoped one, and the remainder is
- * surfaced separately as `+N external` — reported, not silently folded in
- * and not silently dropped.
- */
-export function splitNeedsInput(
-  sessionNeedsInputCount: number,
-  tabNeedsInputCount: number,
-): { actionable: number; external: number } {
-  return {
-    actionable: tabNeedsInputCount,
-    external: Math.max(0, sessionNeedsInputCount - tabNeedsInputCount),
-  };
-}
 
 export function StatusStrip() {
   const session = useTerminalSession();
@@ -293,8 +182,8 @@ export function StatusStrip() {
   // so working = active-in-zone + active-external, idle = stale-tab `frozen`
   // still open here, and dormant/orphaned historical transcripts are dropped.
   const {
-    sessionCount,
-    needsInputCount: sessionNeedsInputCount,
+    claudeSessionCount,
+    needsInputCount: claudeNeedsInputCount,
     errorCount: sessionErrorCount,
     workingCount,
     completedCount,
@@ -313,8 +202,8 @@ export function StatusStrip() {
   // tab-scoped one and any session-only surplus is reported as `+N external`.
   const { actionable: needsInputCount, external: externalNeedsInputCount } = useMemo(
     () =>
-      splitNeedsInput(sessionNeedsInputCount, countTabsInState(tabs, sessionStates, "needs-input")),
-    [sessionNeedsInputCount, tabs, sessionStates],
+      splitNeedsInput(claudeNeedsInputCount, countTabsInState(tabs, sessionStates, "needs-input")),
+    [claudeNeedsInputCount, tabs, sessionStates],
   );
 
   // File-lock "stuck" pill still operates on PTY tabs (a lock is held by
@@ -348,12 +237,18 @@ export function StatusStrip() {
 
   // See {@link unionSessionCount} — gating on the Claude-session count alone
   // hid the entire strip on a page holding live PTY tabs and no Claude session.
+  //
+  // Named for the population it counts: Claude sessions UNIONed with live PTY
+  // tabs. It is NOT a zone count (that is `zoneLayout.layout.zones.length`,
+  // and `zoneLayout.isMultiZone` is the only multi-ZONE predicate) — these
+  // locals were once spelled `zoneCount` / `isMultiZone`, a three-way naming
+  // collision with the layout notion on this very page.
   const liveTabCount = useMemo(() => countLiveTabs(tabs), [tabs]);
-  const zoneCount = useMemo(
-    () => unionSessionCount(sessionCount, liveTabCount),
-    [sessionCount, liveTabCount],
+  const sessionOrPaneCount = useMemo(
+    () => unionSessionCount(claudeSessionCount, liveTabCount),
+    [claudeSessionCount, liveTabCount],
   );
-  const isMultiZone = zoneCount > 1;
+  const isMultiSession = sessionOrPaneCount > 1;
 
   const wrapperCount = wrapperTools.length;
 
@@ -372,33 +267,19 @@ export function StatusStrip() {
   // Wrapper tools are present almost every session, so gating on them kept
   // the strip permanently pinned open — defeating the auto-hide-when-idle
   // principle. The wrapper affordance now only renders when the strip is
-  // already up for a genuine signal (attention, multi-zone, or a plan).
+  // already up for a genuine signal (attention, multi-session, or a plan).
   const hasContent =
     activeTagFilters.size > 0 ||
     needsInputCount > 0 ||
     externalNeedsInputCount > 0 ||
     errorCount > 0 ||
     stuckLocks > 0 ||
-    isMultiZone ||
+    isMultiSession ||
     planFileName !== null ||
     isPlanLoading;
 
   const focusNextError = useCallback(() => {
-    // Inline mirror of `useZoneLayout.focusNextNeedsInput`'s walk,
-    // looking for `error` instead. Cycles starting at `focusedZone + 1`
-    // and wraps around. Un-maximizes on hit so the operator can see
-    // the zone (same posture as the needs-input cycler).
-    const zones = zoneLayout.layout.zones.length;
-    const start = zoneLayout.focusedZone;
-    for (let i = 1; i <= zones; i++) {
-      const candidate = (start + i) % zones;
-      const tabId = zoneLayout.assignments[candidate];
-      if (tabId && sessionStates[tabId] === "error") {
-        zoneLayout.setFocusedZone(candidate);
-        if (zoneLayout.maximizedZone !== null) zoneLayout.setMaximizedZone(null);
-        return;
-      }
-    }
+    zoneLayout.focusNextError(sessionStates);
   }, [zoneLayout, sessionStates]);
 
   const focusLongestStuck = useCallback(() => {
@@ -566,27 +447,31 @@ export function StatusStrip() {
           )}
         </div>
       )}
-      {/* Phase 9f — session count pill. Multi-zone only; informational. */}
-      {isMultiZone && (
+      {/* Phase 9f — session count pill. Multi-session only; informational. */}
+      {isMultiSession && (
         <Pill
           icon={<TerminalSquare className="w-2.5 h-2.5" />}
-          text={`${zoneCount} sessions`}
+          text={`${sessionOrPaneCount} sessions`}
           color="#565f89"
           // Reports the same unioned number the pill is gated on. Showing
-          // `sessionCount` here would have rendered "0 sessions" on the very
-          // page the union exists to keep visible (two live PTYs, no Claude
-          // session), so both inputs are disclosed in the tooltip instead.
+          // `claudeSessionCount` here would have rendered "0 sessions" on the
+          // very page the union exists to keep visible (two live PTYs, no
+          // Claude session), so both inputs are disclosed in the tooltip
+          // instead. The tooltip does NOT say "on this page": the Claude count
+          // includes active-external sessions, which by definition have no
+          // tab in this window.
           title={
-            `${zoneCount} sessions on this page — ` +
-            `${sessionCount} Claude, ${liveTabCount} live terminal${liveTabCount === 1 ? "" : "s"}`
+            `${sessionOrPaneCount} sessions — ` +
+            `${claudeSessionCount} Claude (incl. external), ` +
+            `${liveTabCount} live terminal${liveTabCount === 1 ? "" : "s"} on this page`
           }
         />
       )}
 
       {/* Minimap toggle. Gated on `zoneLayout.isMultiZone` — the SAME
           predicate `ZoneMinimap` returns null on — and deliberately NOT on
-          the local `isMultiZone` (`sessionCount > 1`) used by the pills
-          above. Those two count different things (zones vs. Claude
+          the local `isMultiSession` (sessions ∪ live tabs > 1) used by the
+          pills above. Those two count different things (zones vs.
           sessions), so gating on the wrong one yields a button that toggles
           a widget which never renders, or a visible widget with no button. */}
       {zoneLayout.isMultiZone && <MinimapToggle />}
@@ -596,7 +481,7 @@ export function StatusStrip() {
           attention-grabbing needs-input / error counts already have
           dedicated pills above. Renders dot-then-count per state in
           its native color so the dense layout stays legible. */}
-      {isMultiZone && hasBreakdown && (
+      {isMultiSession && hasBreakdown && (
         <span
           className="flex items-center gap-2 px-1.5 py-0.5 text-[10px] leading-none whitespace-nowrap text-[#565f89]"
           title="Session state breakdown"

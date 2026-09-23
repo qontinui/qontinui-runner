@@ -662,6 +662,10 @@ fn store_cached(key: &str, expression: &str, model_id: &str) {
 /// Build the Tier-1 cache key. The schema hint is canonicalised (sorted
 /// keys, whitespace-free JSON) so two calls with the same logical shape
 /// hit the same entry regardless of key order.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn build_cache_key(goal: &str, schema_hint: &serde_json::Value, output_preview: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(goal.as_bytes());
@@ -1059,7 +1063,7 @@ fn truncate_for_log(s: &str) -> String {
     if s.len() <= 200 {
         s.to_string()
     } else {
-        format!("{}…", &s[..200.min(s.len())])
+        format!("{}…", crate::str_utils::truncate_str(s, 200))
     }
 }
 
@@ -1379,6 +1383,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn build_prompt_split_contains_version_suffix() {
         let (system_prefix, _user) = build_prompt_split("g", &serde_json::json!({}), "p");
         // The trailing `Emitter system v3` marker lets intentional

@@ -266,6 +266,10 @@ fn extract_imports_from_node(
 }
 
 /// Extract imports from a regular import statement (import foo.bar)
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_regular_import(node: &tree_sitter::Node, source: &str, imports: &mut Vec<ImportInfo>) {
     let line = node.start_position().row as u32 + 1;
 
@@ -292,6 +296,10 @@ fn extract_regular_import(node: &tree_sitter::Node, source: &str, imports: &mut 
 }
 
 /// Extract imports from a from-import statement (from foo import bar)
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_from_import(
     node: &tree_sitter::Node,
     source: &str,
