@@ -34,8 +34,9 @@ import type {
 import { ISSUE_CATEGORIES, ISSUE_SEVERITIES } from "@qontinui/shared-types";
 import { useDiscoveredSpecs } from "@/lib/ui-bridge/use-discovered-specs";
 import { SEVERITY_STYLES, CATEGORY_STYLES, STATUS_STYLES } from "./issue-styles";
+import { computeIssueHeaderStats, type IssueStatusFilter } from "./issueHeaderStats";
 
-type StatusFilter = "all" | "active" | "resolved" | "monitoring";
+type StatusFilter = IssueStatusFilter;
 
 // ============================================================================
 // Badge & ConfidenceBar
@@ -513,15 +514,18 @@ export function GlobalIssuesPanel() {
 
   // ------ Stats ------
 
-  const stats = useMemo(() => {
-    return {
-      total: issues.length,
-      critical: issues.filter((i) => i.severity === "critical" && i.status === "active").length,
-      high: issues.filter((i) => i.severity === "high" && i.status === "active").length,
-      medium: issues.filter((i) => i.severity === "medium" && i.status === "active").length,
-      low: issues.filter((i) => i.severity === "low" && i.status === "active").length,
-    };
-  }, [issues]);
+  // Every header number describes the list below it and names its
+  // population — see `computeIssueHeaderStats`.
+  const stats = useMemo(
+    () =>
+      computeIssueHeaderStats(issues, filteredIssues, {
+        status: statusFilter,
+        category: categoryFilter,
+        severity: severityFilter,
+        searchQuery,
+      }),
+    [issues, filteredIssues, statusFilter, categoryFilter, severityFilter, searchQuery],
+  );
 
   // ------ Actions ------
 
@@ -674,16 +678,25 @@ export function GlobalIssuesPanel() {
             <Bug className="w-4 h-4 text-amber-400" />
             <span className="text-sm font-semibold">All Issues</span>
             <div className="flex items-center gap-1.5 ml-1">
-              <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-white/10 text-muted-foreground">
-                {stats.total}
+              <span
+                className="text-[10px] px-1.5 py-0.5 rounded-full bg-white/10 text-muted-foreground"
+                title={stats.badgeTitle}
+              >
+                {stats.badgeText}
               </span>
               {stats.critical > 0 && (
-                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-red-500/15 text-red-400">
+                <span
+                  className="text-[10px] px-1.5 py-0.5 rounded-full bg-red-500/15 text-red-400"
+                  title="Active critical issues in the list below"
+                >
                   {stats.critical} crit
                 </span>
               )}
               {stats.high > 0 && (
-                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-orange-500/15 text-orange-400">
+                <span
+                  className="text-[10px] px-1.5 py-0.5 rounded-full bg-orange-500/15 text-orange-400"
+                  title="Active high-severity issues in the list below"
+                >
                   {stats.high} high
                 </span>
               )}
