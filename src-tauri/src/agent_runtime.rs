@@ -2868,7 +2868,7 @@ enum AnchorHolder {
     /// up) — the reservation [`evaluate_continuation_guard`] takes inside its
     /// P3 critical section — or a session mid-account-migration, whose lift
     /// holds the anchor across the respawn
-    /// ([`ContinuationRegistry::take_live_reserving_anchor`]). No terminal
+    /// ([`ContinuationRegistry::take_live_reserving_anchor`]).
     /// The variant carries no `terminal_id` either way, so there is nothing to
     /// focus — not because no terminal exists (during a migration the OLD pane
     /// is untouched and still running at its limit prompt; it is closed only

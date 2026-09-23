@@ -28,8 +28,68 @@ export const SESSION_FLOOR_MIN_GIB = 0.25;
 export const SESSION_FLOOR_MAX_GIB = 128;
 export const DISK_FLOOR_MIN_GIB = 1;
 export const DISK_FLOOR_MAX_GIB = 2000;
+// Concurrent CI builds. 64 is the Rust validator's bound
+// (`src-tauri/src/ci_node/settings_directive.rs` `MAX_CONCURRENT_BUILDS_MAX`),
+// and qontinui-web's CI-node panel and backend schema both allow 1-64 too. A UI
+// that refuses what the validator accepts is a second, undocumented policy —
+// which is what the old hardware-independent 16 was. The per-host recommendation
+// is the `host_suggestion` the runner returns, shown as a warning, never a
+// clamp. `resourceGuardHelpers.test.ts` reads the Rust constant from source so
+// the two cannot drift apart again.
 export const MAX_CONCURRENT_BUILDS_MIN = 1;
-export const MAX_CONCURRENT_BUILDS_MAX = 16;
+export const MAX_CONCURRENT_BUILDS_MAX = 64;
+
+/**
+ * The runner's host-derived capacity suggestion, returned beside
+ * `settings::CiNodeSettings` by `get_ci_node_settings` (Rust:
+ * `commands::resource_guard_settings::host_suggestion_json`, over
+ * `ci_node::host_sizing::suggestion_with_limit`). `mem_gib` and
+ * `limiting_term` are null when the host's memory could not be read.
+ */
+export interface CiNodeHostSuggestion {
+  suggested: number;
+  cpus: number;
+  mem_gib: number | null;
+  limiting_term: "cores" | "memory" | null;
+}
+
+/**
+ * Commit the concurrency input's text draft (called on blur, never per
+ * keystroke). Anything numeric is an explicit override clamped to the
+ * validator's range; empty or non-numeric text REVERTS to `previous` — it never
+ * silently switches to "use the host suggestion". The "Use suggested" button is
+ * the only way to write `null`.
+ */
+export function parseConcurrencyInput(raw: string, previous: number | null): number | null {
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n)) return previous;
+  return clampInt(
+    n,
+    MAX_CONCURRENT_BUILDS_MIN,
+    MAX_CONCURRENT_BUILDS_MAX,
+    MAX_CONCURRENT_BUILDS_MIN,
+  );
+}
+
+/**
+ * The inline warning for an explicit value above the host suggestion, naming
+ * the term that bounds it — or `null` when there is nothing to warn about
+ * (unset, at or below the suggestion, or no suggestion loaded). A
+ * recommendation, never a clamp: the value still saves.
+ */
+export function concurrencyAboveSuggestionWarning(
+  value: number | null,
+  suggestion: CiNodeHostSuggestion | null,
+): string | null {
+  if (value === null || suggestion === null || value <= suggestion.suggested) return null;
+  const term =
+    suggestion.limiting_term === "memory"
+      ? `memory (${suggestion.mem_gib ?? "?"} GB at 12 GB per build)`
+      : suggestion.limiting_term === "cores"
+        ? `cores (${suggestion.cpus} at 4 per build)`
+        : "an unreadable memory probe";
+  return `${value} is above the suggested ${suggestion.suggested} for this host, which is bounded by ${term}. Each build also gets a smaller share of the host.`;
+}
 
 // Typing bounds on the two thread-ceiling inputs. Wider than anything the
 // runner will enforce, on purpose — the same relationship the GiB inputs have to

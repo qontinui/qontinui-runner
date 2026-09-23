@@ -13,8 +13,23 @@
  *
  * Wire contract (the D5 command pair, `commands/path_settings.rs`):
  *
- *   invoke<PathSettingsView>("get_path_settings")
- *   invoke<PathSettingsView>("save_path_settings", { settings: PathSettings })
+ *   invoke<PathSettingsView>("get_path_settings")               // tenantId?: string
+ *   invoke<PathSettingsView>("save_path_settings", { settings: PathSettingsPatch })
+ *
+ * `get_path_settings` takes an OPTIONAL `tenantId`; passing one adds
+ * `resolved.resolved_for_tenant` — that tenant's resolution of the three
+ * plan/prompt directories — while `configured` stays the raw struct. This panel
+ * passes none: it edits N tenants at once, so it states the fallback rule
+ * (entry, else the device scalar) rather than asking the runner to resolve one
+ * tenant and implying that answer covers the rows.
+ *
+ * `save_path_settings` takes a PATCH, not the whole struct. Absence never
+ * changes a stored value, for EVERY field: the five scalars take `null` ⇒ unset
+ * and a string ⇒ set, so an omitted scalar survives. The four MAP fields —
+ * `repo_checkouts` and the three `*_by_tenant` — are merged: **absent or null ⇒
+ * the stored map is left alone; `{}` ⇒ a deliberate clear.** That is why
+ * `buildPathSettingsPayload` must `delete` a map it is not asserting and send
+ * `{}` for one that was emptied; the two are not interchangeable.
  *
  * Both return the view directly (no `{ success, data }` wrapper, unlike
  * `get_session_guard_settings`); a failure rejects with a string. `save`
@@ -28,6 +43,26 @@
  * it) and `strict_mode` is a behaviour flag that belongs with the workflow
  * settings; both round-trip through a save untouched
  * (`buildPathSettingsPayload`).
+ *
+ * ## Per-tenant directories
+ *
+ * Plan
+ * `2026-09-22-plans-dir-is-a-single-path-so-a-multi-bound-device-cannot-author-per-tenant`,
+ * P4. A device can be bound to N coord tenants, so the three plan/prompt
+ * directories carry a `<field>_by_tenant` map beside the scalar: the map is the
+ * override for one tenant's sessions, the scalar remains the DEVICE-WIDE
+ * DEFAULT, and resolution is `by_tenant[tenant]` → scalar → unset.
+ *
+ * Those rows render only when `useTenant().showSwitcher` — the existing
+ * `candidates.length > 1` gate (`TenantContext.tsx`), reused rather than
+ * duplicated, so a single-tenant operator sees exactly the panel they saw
+ * before. Rows are labelled with `shortTenantId` and the annotations this
+ * frontend can actually derive; there is no tenant display name anywhere in it,
+ * and inventing one here is explicitly out of scope (the plan's §5).
+ *
+ * The maps are PATCH fields on the save (`{}` clears, absent leaves the stored
+ * map untouched), so this panel sends them only when it showed them —
+ * `buildPathSettingsPayload`'s fourth argument.
  *
  * Every field shows the value IN EFFECT beside the value CONFIGURED, because
  * the two can genuinely differ: `workspace_root` yields to `$QONTINUI_ROOT` /
@@ -44,8 +79,11 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { Check, FolderOpen, FolderTree, Info, TriangleAlert, X } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
 import { getAccentColors } from "@/design-system";
+import { useTenant } from "@/contexts/TenantContext";
+import { shortTenantId } from "@/components/terminal/SpawnTenantPicker";
 import {
   PATH_FIELDS,
+  TENANT_PATH_FIELDS,
   buildPathSettingsPayload,
   divergenceKind,
   draftsAreDirty,
@@ -56,10 +94,17 @@ import {
   planScanStatusLabel,
   repoCheckoutsDirty,
   scanSourceStatus,
+  storedTenantOverrideCount,
+  tenantDraftsAreDirty,
+  tenantDraftsFrom,
+  tenantIdsForField,
   type PathDrafts,
   type PathField,
+  type PathSettings,
   type PathSettingsView,
   type ResolvedPaths,
+  type TenantPathDrafts,
+  type TenantPathField,
 } from "./pathsSettingsHelpers";
 import type { LogFunction } from "./types";
 
@@ -108,6 +153,27 @@ const FIELD_COPY: Record<PathField, PathFieldCopy> = {
   },
 };
 
+/**
+ * What a per-tenant row overrides, per directory. Deliberately shorter than
+ * {@link FIELD_COPY}: the device-wide rows above already say what each directory
+ * does, and repeating it once per tenant is the clutter the `showSwitcher` gate
+ * exists to avoid.
+ */
+const TENANT_FIELD_COPY: Record<TenantPathField, { label: string; does: string }> = {
+  plans_dir: {
+    label: "Plans directory",
+    does: "Sessions launched for this tenant get this directory as QONTINUI_PLANS_DIR.",
+  },
+  plans_archive_dir: {
+    label: "Plans archive directory",
+    does: "Where this tenant's archived plans live. The device-wide value is not edited in this panel and round-trips untouched.",
+  },
+  prompts_dir: {
+    label: "Prompts directory",
+    does: "Sessions launched for this tenant get this directory as QONTINUI_PROMPTS_DIR.",
+  },
+};
+
 /** The one honest answer to "when does this apply?" — see the module doc. */
 const TAKES_EFFECT =
   "Changes apply within the next scan interval (60 s by default); newly launched sessions see them immediately. No runner restart is needed — except the dev logs directory, which the runner resolves once at start-up.";
@@ -119,11 +185,23 @@ export function PathsSettings({ onLog }: PathsSettingsProps) {
   const [view, setView] = useState<PathSettingsView | null>(null);
   const [drafts, setDrafts] = useState<PathDrafts>(() => draftsFrom({ strict_mode: false }));
   const [checkoutsDraft, setCheckoutsDraft] = useState("");
+  // The per-tenant boxes. Seeded from the saved maps, so a tenant with no
+  // override has no key here and renders as an empty box — which is also what
+  // it means on the wire.
+  const [tenantDrafts, setTenantDrafts] = useState<TenantPathDrafts>(() =>
+    tenantDraftsFrom({ strict_mode: false }),
+  );
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loadAttempt, setLoadAttempt] = useState(0);
+  // The tenants this device is bound to, and the existing no-clutter gate.
+  // `candidates` is populated from a LOCAL `paired_user.json` read with no coord
+  // round-trip (`commands/tenant.rs:193` → `pair::read_paired_binding_tenant_ids`),
+  // so these rows work offline; an EMPTY list is UNKNOWN about the bindings,
+  // never evidence of a single tenant.
+  const { candidates, showSwitcher, defaultTenantIdForNewSessions } = useTenant();
 
   useEffect(() => {
     let cancelled = false;
@@ -135,6 +213,7 @@ export function PathsSettings({ onLog }: PathsSettingsProps) {
         setView(loaded);
         setDrafts(draftsFrom(loaded.configured));
         setCheckoutsDraft(formatRepoCheckouts(loaded.configured.repo_checkouts));
+        setTenantDrafts(tenantDraftsFrom(loaded.configured));
         setError(null);
         onLog("debug", "Path settings loaded");
       } catch (err) {
@@ -160,26 +239,44 @@ export function PathsSettings({ onLog }: PathsSettingsProps) {
     setDrafts((d) => ({ ...d, [field]: value }));
   }, []);
 
+  const setTenantDraft = useCallback((field: TenantPathField, tenantId: string, value: string) => {
+    setTenantDrafts((d) => ({ ...d, [field]: { ...d[field], [tenantId]: value } }));
+  }, []);
+
   /**
    * Native directory picker — the same call `ClaudeCliSection` and
    * `ProjectsPage` make. A cancelled dialog resolves `null` and changes
    * nothing; a picker that cannot open is reported, not swallowed.
+   *
+   * One picker for both row kinds, so the device-wide and per-tenant boxes
+   * cannot drift on how a cancellation or a failure is handled.
    */
+  const pickDirectory = useCallback(async (): Promise<string | null> => {
+    let selected: string | string[] | null;
+    try {
+      selected = await open({ directory: true, multiple: false });
+    } catch (err) {
+      console.error("Directory picker failed:", err);
+      onLog("error", `Could not open the folder picker: ${String(err)}`);
+      return null;
+    }
+    return typeof selected === "string" && selected.length > 0 ? selected : null;
+  }, [onLog]);
+
   const browse = useCallback(
     async (field: PathField) => {
-      let selected: string | string[] | null;
-      try {
-        selected = await open({ directory: true, multiple: false });
-      } catch (err) {
-        console.error("Directory picker failed:", err);
-        onLog("error", `Could not open the folder picker: ${String(err)}`);
-        return;
-      }
-      if (typeof selected === "string" && selected.length > 0) {
-        setDraft(field, selected);
-      }
+      const selected = await pickDirectory();
+      if (selected !== null) setDraft(field, selected);
     },
-    [onLog, setDraft],
+    [pickDirectory, setDraft],
+  );
+
+  const browseTenant = useCallback(
+    async (field: TenantPathField, tenantId: string) => {
+      const selected = await pickDirectory();
+      if (selected !== null) setTenantDraft(field, tenantId, selected);
+    },
+    [pickDirectory, setTenantDraft],
   );
 
   const saveSettings = async () => {
@@ -190,7 +287,20 @@ export function PathsSettings({ onLog }: PathsSettingsProps) {
     try {
       const checkouts = parseRepoCheckouts(checkoutsDraft);
       if (checkouts.errors.length > 0) return;
-      const payload = buildPathSettingsPayload(view.configured, drafts, checkouts.entries);
+      // The per-tenant maps are PATCH fields: they are sent only when the rows
+      // were SHOWN **and actually edited**. Sending them because they were
+      // merely rendered asserts this panel's MOUNT-TIME snapshot, which erases
+      // any row a concurrent writer added in between — the same lost update the
+      // patch door exists to remove, and `repo_checkouts` is gated the same way
+      // for the same reason. Not-dirty ⇒ omitted ⇒ the stored maps survive.
+      const tenantMapsDirty =
+        showSwitcher && tenantDraftsAreDirty(view.configured, tenantDrafts);
+      const payload = buildPathSettingsPayload(
+        view.configured,
+        drafts,
+        checkouts.entries,
+        tenantMapsDirty ? tenantDrafts : undefined,
+      );
       const fresh = await invoke<PathSettingsView>("save_path_settings", { settings: payload });
       // Re-render from what the runner STORED, not from what was sent: the
       // resolved half is what tells the operator whether the change is in
@@ -198,6 +308,7 @@ export function PathsSettings({ onLog }: PathsSettingsProps) {
       setView(fresh);
       setDrafts(draftsFrom(fresh.configured));
       setCheckoutsDraft(formatRepoCheckouts(fresh.configured.repo_checkouts));
+      setTenantDrafts(tenantDraftsFrom(fresh.configured));
       setSaveSuccess(true);
       onLog("success", "Path settings saved");
       setTimeout(() => setSaveSuccess(false), 3000);
@@ -226,7 +337,11 @@ export function PathsSettings({ onLog }: PathsSettingsProps) {
 
   const checkoutErrors = parseRepoCheckouts(checkoutsDraft).errors;
   const dirty = view
-    ? draftsAreDirty(view.configured, drafts) || repoCheckoutsDirty(view.configured, checkoutsDraft)
+    ? draftsAreDirty(view.configured, drafts) ||
+      repoCheckoutsDirty(view.configured, checkoutsDraft) ||
+      // Only when the rows are shown: what is not rendered is not editable, and
+      // an unrendered map is not sent.
+      (showSwitcher && tenantDraftsAreDirty(view.configured, tenantDrafts))
     : false;
 
   return (
@@ -304,6 +419,16 @@ export function PathsSettings({ onLog }: PathsSettingsProps) {
               </p>
             </div>
           </div>
+
+          <PerTenantPaths
+            showSwitcher={showSwitcher}
+            candidates={candidates}
+            defaultTenantId={defaultTenantIdForNewSessions}
+            configured={view.configured}
+            drafts={tenantDrafts}
+            onChange={setTenantDraft}
+            onBrowse={(field, tenantId) => void browseTenant(field, tenantId)}
+          />
 
           <div className="flex justify-end items-center gap-3">
             {dirty && !saving && (
@@ -557,6 +682,231 @@ function RepoCheckoutsField({ draft, errors, onChange }: RepoCheckoutsFieldProps
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+// ── Per-tenant directories ──────────────────────────────────────────────────
+
+interface PerTenantPathsProps {
+  /** `useTenant().showSwitcher` — the ONLY gate on these rows. */
+  showSwitcher: boolean;
+  /** The tenants this device is bound to, as the context reports them. */
+  candidates: readonly string[];
+  /** The device's default tenant for new sessions, annotated on its row. */
+  defaultTenantId: string | null;
+  configured: PathSettings;
+  drafts: TenantPathDrafts;
+  onChange: (field: TenantPathField, tenantId: string, value: string) => void;
+  onBrowse: (field: TenantPathField, tenantId: string) => void;
+}
+
+/**
+ * One row per bound tenant, per per-tenant directory — behind `showSwitcher`.
+ *
+ * The gate is reused, not re-derived: `showSwitcher` is `candidates.length > 1`
+ * in `TenantContext`, and a second predicate here would be a second answer to
+ * "does this operator see tenant UI?". A single-tenant operator therefore sees
+ * the panel exactly as it was, and when `candidates` is EMPTY — which is
+ * UNKNOWN about the bindings, not evidence of one tenant — the note below says
+ * so instead of the rows implying anything.
+ */
+function PerTenantPaths({
+  showSwitcher,
+  candidates,
+  defaultTenantId,
+  configured,
+  drafts,
+  onChange,
+  onBrowse,
+}: PerTenantPathsProps) {
+  const bound = new Set(candidates.map((id) => id.trim()).filter((id) => id.length > 0));
+  const storedOverrides = storedTenantOverrideCount(configured);
+
+  if (!showSwitcher) {
+    return <TenantBindingNote boundCount={bound.size} storedOverrides={storedOverrides} />;
+  }
+
+  const groups = TENANT_PATH_FIELDS.map((field) => ({
+    field,
+    ids: tenantIdsForField(configured, candidates, field),
+  }));
+  const hasUnbound = groups.some(({ ids }) => ids.some((id) => !bound.has(id)));
+  const defaultId = defaultTenantId?.trim() ?? "";
+
+  return (
+    <div
+      data-ui-bridge-id="settings.paths-per-tenant"
+      className="rounded-lg bg-card/50 p-4 space-y-5"
+    >
+      <div className="space-y-1">
+        <p className="text-xs font-medium">Per-tenant directories</p>
+        <p className="text-[10px] text-muted-foreground">
+          This device is bound to {bound.size} tenants, so the plan and prompt directories can
+          differ per tenant. A path here is used for sessions launched for that tenant; a blank row
+          means that tenant uses the device-wide directory above. A session&rsquo;s tenant is
+          stamped when it is spawned and never changes, so a change here applies to future sessions.
+        </p>
+        {hasUnbound && (
+          <p className="text-[10px] text-muted-foreground">
+            A row marked <strong>not currently bound</strong> is a path stored for a tenant this
+            device has no binding for right now. It is kept rather than dropped — the device may be
+            re-pairing — and clearing the box is what removes it.
+          </p>
+        )}
+      </div>
+
+      {groups.map(({ field, ids }) => (
+        <div key={field} className="space-y-1.5">
+          <p className="text-xs font-medium">{TENANT_FIELD_COPY[field].label}</p>
+          <p className="text-[10px] text-muted-foreground">
+            {TENANT_FIELD_COPY[field].does} Device-wide default:{" "}
+            <code>{normalizePathInput(configured[field]) ?? "(unset)"}</code>
+          </p>
+          {ids.map((tenantId) => (
+            <TenantPathRow
+              key={tenantId}
+              field={field}
+              tenantId={tenantId}
+              draft={drafts[field][tenantId] ?? ""}
+              bound={bound.has(tenantId)}
+              isDeviceDefault={tenantId === defaultId}
+              onChange={(value) => onChange(field, tenantId, value)}
+              onBrowse={() => onBrowse(field, tenantId)}
+              onClear={() => onChange(field, tenantId, "")}
+            />
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * What the panel says when it shows no per-tenant rows.
+ *
+ * Two cases, and only the first is a statement the operator needs: an EMPTY
+ * candidate list is UNKNOWN about this device's bindings —
+ * `read_paired_binding_tenant_ids` returns an empty vec for an absent or
+ * unreadable `paired_user.json` and never an error — so it must not read as
+ * "this device has one tenant". A device that does report exactly one binding
+ * gets nothing at all, unless per-tenant paths are stored, in which case saying
+ * they survive the save is cheaper than an operator wondering.
+ */
+function TenantBindingNote({
+  boundCount,
+  storedOverrides,
+}: {
+  boundCount: number;
+  storedOverrides: number;
+}) {
+  if (boundCount > 0 && storedOverrides === 0) return null;
+  const accent = getAccentColors("slate");
+  const stored =
+    storedOverrides === 0
+      ? null
+      : `${storedOverrides} per-tenant ${storedOverrides === 1 ? "directory is" : "directories are"} stored; a save from this panel leaves them untouched.`;
+  return (
+    <div
+      data-ui-bridge-id="settings.paths-per-tenant-note"
+      data-content-role="status"
+      data-content-label="per-tenant directories"
+      className={`p-3 ${accent.bg} rounded-lg flex items-start gap-2`}
+    >
+      <Info className={`w-4 h-4 ${accent.text} shrink-0 mt-0.5`} />
+      <div className="space-y-0.5">
+        <p className={`text-xs font-medium ${accent.text}`}>
+          {boundCount === 0
+            ? "Per-tenant directories: this device's tenant bindings are unknown"
+            : "Per-tenant directories: not shown for a single-tenant device"}
+        </p>
+        <p className={`text-[10px] ${accent.text}`}>
+          {boundCount === 0
+            ? "The bindings are read from this machine's own pairing record, and an absent or unreadable one reads as an empty list — which is not evidence that the device is bound to exactly one tenant. Until a binding is recorded, every directory above is device-wide."
+            : "This device reports one tenant binding, so the directories above are the whole story."}
+          {stored !== null && ` ${stored}`}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+interface TenantPathRowProps {
+  field: TenantPathField;
+  tenantId: string;
+  /** The input-box value. `""` means "no override for this tenant". */
+  draft: string;
+  /** `false` when the id is stored but the device is not bound to it (D2). */
+  bound: boolean;
+  isDeviceDefault: boolean;
+  onChange: (value: string) => void;
+  onBrowse: () => void;
+  onClear: () => void;
+}
+
+/**
+ * One tenant's override of one directory.
+ *
+ * Labelled with `shortTenantId` — the only labelling affordance this frontend
+ * has, since `candidates` is raw UUIDs and no tenant display name exists
+ * anywhere in it — plus the two annotations that ARE derivable here: the device
+ * default, and D2's not-currently-bound. The full id is the label's `title`, so
+ * nothing is hidden by the truncation. Resolving a human-readable name needs a
+ * coord round-trip and a widened wire type, and is deliberately not started here.
+ */
+function TenantPathRow({
+  field,
+  tenantId,
+  draft,
+  bound,
+  isDeviceDefault,
+  onChange,
+  onBrowse,
+  onClear,
+}: TenantPathRowProps) {
+  const slug = `${field.replace(/_/g, "-")}-tenant-${tenantId}`;
+  const inputId = `paths-${slug}`;
+  const bridgeId = `settings.paths-${slug}`;
+  const isSet = normalizePathInput(draft) !== undefined;
+
+  return (
+    <div className="flex gap-2 items-center">
+      <label htmlFor={inputId} title={tenantId} className="w-44 shrink-0 text-[10px] leading-tight">
+        <code className="font-mono">{shortTenantId(tenantId)}</code>
+        {isDeviceDefault && <span className="text-muted-foreground"> · device default</span>}
+        {!bound && <span className={getAccentColors("amber").text}> · not currently bound</span>}
+      </label>
+      <input
+        id={inputId}
+        data-ui-bridge-id={bridgeId}
+        type="text"
+        spellCheck={false}
+        autoComplete="off"
+        value={draft}
+        placeholder="Uses the device-wide directory above"
+        onChange={(e) => onChange(e.target.value)}
+        className="flex-1 min-w-0 px-2.5 py-1.5 text-sm font-mono bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
+      />
+      <button
+        type="button"
+        data-ui-bridge-id={`${bridgeId}-browse`}
+        onClick={onBrowse}
+        title="Choose a directory for this tenant"
+        className="px-3 py-1.5 bg-muted hover:bg-muted/70 rounded-md text-xs font-medium transition-colors flex items-center gap-1.5 shrink-0"
+      >
+        <FolderOpen className="w-3.5 h-3.5" />
+        Browse…
+      </button>
+      <button
+        type="button"
+        data-ui-bridge-id={`${bridgeId}-clear`}
+        onClick={onClear}
+        disabled={!isSet}
+        title="Remove this tenant's override"
+        className="px-3 py-1.5 bg-muted hover:bg-muted/70 rounded-md text-xs font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+      >
+        Clear
+      </button>
     </div>
   );
 }

@@ -1340,6 +1340,54 @@ pass produces fresher information.)
 
 ##### `IN PROGRESS` is CONDITIONALLY overwritable — consumes Step 0.25
 
+This section is the fleet's canonical arm table for that token. The shared
+guard block below states the invariant every plan-status writer carries; the
+arms after it are this command's own, and they are what the block points at.
+
+**The block is byte-identical in every carrier and is never adapted per command
+— so read its "the stamp already there" through this command's own capture.**
+For `/vet-plan` the stamp is NOT re-read here: §4 has already rewritten the
+plan, so "the stamp already there" means **Step 0.25's capture** of it (the
+verbatim token, date and session marker), and the five rules are applied to that
+captured value. Rule 2's resume branch — refresh the date, keep the trail —
+likewise describes the writer's own token; `/vet-plan` writes `VETTED`, so a
+resume here means proceeding to that write with the trail kept, never re-dating
+an `IN PROGRESS` line. The table below this section states the same split for
+both carriers, and `/implement-plan` sits on the other side of it: its capture
+is Step 0.45 check 1 and its stamp is still intact, so it reads the stamp
+inline.
+
+<!-- status-guard:start -->
+> **`IN PROGRESS` is a GUARDED STATE — it is never freely overwritable.**
+> *(Roster and gate: `.claude/commands/_status-writers.md`, check #64. The full
+> arm table and its evaluation order: `/vet-plan`, "`IN PROGRESS` is
+> CONDITIONALLY overwritable".)* Before this command writes, replaces,
+> downgrades or re-dates a plan's lifecycle stamp, read the stamp already there
+> and apply these five rules.
+>
+> 1. **An `IN PROGRESS` stamp is a conditional STOP, not a value to replace.**
+>    It protects a live peer's in-flight work.
+> 2. **The discriminator is the SESSION MARKER, not the token.** A marker that
+>    IS your own current session id is a resume: refresh the date and keep the
+>    trail, never take over. A marker that is a different session id is a LIVE
+>    PEER unless you can positively verify that session died with zero work
+>    products — transcript tail shows death, its worktrees clean and 0 ahead of
+>    `origin/main`, and no PRs and no branches for the plan. Verified dead, and
+>    only then, adopt it and append your own marker.
+> 3. **No marker, or one you cannot positively attribute, is the UNIDENTIFIED
+>    DEFAULT: STOP.** Not an overwrite, and not an adoption. Adoption is the
+>    earned branch; stopping is the fallback.
+> 4. **Do not LAUNDER it.** Rewriting the token into `NOT STARTED`, `PARTIAL`,
+>    `DRAFT`, a terminal state or a bare re-date converts a hard STOP into a
+>    state the other writers declare freely overwritable, and every downstream
+>    reader then sees a well-formed stamp written by a trusted skill. That is
+>    this guard's failure mode: laundering, not bypass (#485).
+> 5. **An UNKNOWN is not permission.** A delivery read that is degraded, masked,
+>    non-2xx, unparseable or carrying `merged_degraded_reason` leaves the
+>    stamp's meaning unestablished. Fall through to STOP, never to overwrite,
+>    and say the read was inconclusive.
+<!-- status-guard:end -->
+
 `IN PROGRESS` is deliberately **not** a fourth unconditional token in the list
 above, and adding it as one would be a regression: it has three dispositions,
 and the file stamp cannot tell them apart in either direction.
@@ -2579,7 +2627,8 @@ leave it in the report.
   `deploy_healthy`, `claim_terminal`, `operator_approval`, `ci_green`,
   `ref_exists`, `metric_threshold`, `time_elapsed`, `unit_ready`,
   `migration_at_head`, `infra_drift_clear`, `file_exists`, `sql_count`,
-  `unit_status`, `gate_cleared`, `commit_live`, `runner_served_sha`; plus — **exception cases only,
+  `unit_status`, `gate_cleared`, `commit_live`, `runner_served_sha`,
+  `schema_object_exists`; plus — **exception cases only,
   see the Continuation bullet below** — an optional typed `continuation` or legacy
   `continuation_prompt`). **HTTP fallback** when MCP is unavailable — for a
   plan-anchored gate it is now TWO device-authed calls on coord's `require_jwt`
