@@ -216,6 +216,15 @@ const FINDING_TOPIC: &str = "coord-merge-train";
 /// posts once per episode, so a refused title is a lost finding.
 const FINDING_TITLE_MAX_BYTES: usize = 500;
 
+/// coord's `FINDING_BODY_MAX_BYTES` for `kind: "investigation"`
+/// (`qontinui-coord` `findings.rs`): refused, never truncated, over it.
+const FINDING_BODY_MAX_BYTES: usize = 8 * 1024;
+
+/// Appended where [`finding_body`] cut the evidence. [`post_finding`] keys
+/// its full-read log line on it, which is what makes the promise true.
+const FINDING_EVIDENCE_CUT: &str = "\n… [evidence cut to fit coord's finding-body cap; the full \
+                                    read is in the posting runner's log]";
+
 /// The honest-unknown subclass coord returns for a ledger it cannot read
 /// (pre-migration, or a replica that has never observed a row). Never a clean
 /// fleet — see the module doc.
@@ -1779,32 +1788,70 @@ fn finding_title(summary: &str, device_id: &str) -> String {
 }
 
 /// The finding's body: the class title, the FULL summary (the title may have
-/// been cut to fit), then the evidence, method and advice.
+/// been cut to fit), then the evidence, method and advice — bounded to coord's
+/// [`FINDING_BODY_MAX_BYTES`].
+///
+/// Only the EVIDENCE is ever cut. It is the pretty-printed read of every
+/// dead or leaderless worker, so it grows with exactly the event this
+/// observer exists for — a leader dying takes every leader-gated worker with
+/// it — and an over-cap body is a 400 on a once-per-episode post, i.e. a lost
+/// finding. The full read still travels on this runner's notification
+/// (`UserFacingError::details`) when the runner has a UI, and [`post_finding`]
+/// logs it in full whenever a cut happens — so a headless runner keeps it too.
 fn finding_body(report: &Report, door_url: &str) -> String {
-    format!(
-        "{}\n\n{}\n\nEVIDENCE — the `{WORKERS_TOOL}` read this verdict was computed from:\n\n{}\n\n\
-             METHOD: one JSON-RPC `tools/call` for `{WORKERS_TOOL}` against {} from inside a \
-             runner process, on the ~{}s cadence of `session::coord_sync`'s heartbeat loop. \
-             The predicate is `coord_outside_observer::classify_ledger` + \
-             `ObserverState::observe` (plan \
-             2026-09-12-merge-train-alerts-page-a-reader-and-act-on-nothing Phase 3b): a \
-             leader-gated worker rolling up `dead` after the \
-             `verdict_from_rolled_off_replica` discrimination, or `no_leader_tick` held for \
-             {} consecutive probes.\n\n\
-             WHAT A PEER SHOULD DO DIFFERENTLY: this is an OUTSIDE observation — coord's own \
-             leader-gated pager cannot report it, which is the whole reason it exists. Read \
-             `coord_query_workers` with the worker's name for the per-replica rows. \
+    let advice = match report.class {
+        FaultClass::WorkerDead => {
+            "Read `coord_query_workers` with the worker's name for the per-replica rows. \
              `last_tick_secs_ago` may be a follower's `follower_skip`, so a fresh value there \
-             does not refute a dead verdict; read `last_work_tick_secs_ago` (null is \
-             UNKNOWN, never fresh) and `leader_body_in_flight_secs` instead. The runner \
-             that posted this has no lever on coord and did not attempt one.",
+             does not refute a dead verdict; read `last_work_tick_secs_ago` (null is UNKNOWN, \
+             never fresh) and `leader_body_in_flight_secs` instead."
+        }
+        _ => {
+            "Read `coord_query_workers` with each worker name listed in the evidence for the \
+             per-replica rows, and check coord's leader lease and replica presence."
+        }
+    };
+    let head = format!(
+        "{}\n\n{}\n\nEVIDENCE — the `{WORKERS_TOOL}` read this verdict was computed from:\n\n",
         report.class.title(),
         report.summary,
-        report.raw,
-        door_url,
-        PROBE_PERIOD_SECS,
-        CADENCES_TO_FIRE,
-    )
+    );
+    let tail = format!(
+        "\n\nMETHOD: one JSON-RPC `tools/call` for `{WORKERS_TOOL}` against {door_url} from \
+         inside a runner process, on the ~{PROBE_PERIOD_SECS}s cadence of \
+         `session::coord_sync`'s heartbeat loop. The predicate is \
+         `coord_outside_observer::classify_ledger` + `ObserverState::observe` (plan \
+         2026-09-12-merge-train-alerts-page-a-reader-and-act-on-nothing Phase 3b): a \
+         leader-gated worker rolling up `dead` after the `verdict_from_rolled_off_replica` \
+         discrimination, or `no_leader_tick` held for {CADENCES_TO_FIRE} consecutive \
+         probes.\n\n\
+         WHAT A PEER SHOULD DO DIFFERENTLY: this is an OUTSIDE observation — coord's own \
+         leader-gated pager cannot report it, which is the whole reason it exists. {advice} \
+         The runner that posted this has no lever on coord and did not attempt one."
+    );
+    let budget = FINDING_BODY_MAX_BYTES.saturating_sub(head.len() + tail.len());
+    let evidence = if report.raw.len() <= budget {
+        std::borrow::Cow::Borrowed(report.raw.as_str())
+    } else {
+        let mut end = budget
+            .saturating_sub(FINDING_EVIDENCE_CUT.len())
+            .min(report.raw.len());
+        while !report.raw.is_char_boundary(end) {
+            end -= 1;
+        }
+        std::borrow::Cow::Owned(format!("{}{FINDING_EVIDENCE_CUT}", &report.raw[..end]))
+    };
+    let mut body = format!("{head}{evidence}{tail}");
+    // Last resort: a summary long enough to eat the evidence budget on its
+    // own. Cut the whole body on a char boundary rather than send a 400.
+    if body.len() > FINDING_BODY_MAX_BYTES {
+        let mut end = FINDING_BODY_MAX_BYTES;
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        body.truncate(end);
+    }
+    body
 }
 
 /// Carry the observation to coord as a finding, so a session arriving later
@@ -1825,9 +1872,19 @@ async fn post_finding(
     // the same shape `mcp_api::post_coord_mcp_drift_finding` posts.
     let device_id = qontinui_runner_lib::machine_identity::read_device_id()
         .unwrap_or_else(|_| "unknown".to_string());
+    let finding = finding_body(report, &door.url);
+    if finding.contains(FINDING_EVIDENCE_CUT) {
+        // The finding's evidence was cut to fit coord's cap; this line is
+        // where the cut part survives, on a headless runner as on any other.
+        warn!(
+            class = report.class.breadcrumb_reason(),
+            raw = %report.raw,
+            "coord outside observer: finding evidence cut to fit coord's body cap; full read follows"
+        );
+    }
     let body = json!({
         "title": finding_title(&report.summary, &device_id),
-        "body": finding_body(report, &door.url),
+        "body": finding,
         "kind": "investigation",
         "topic": FINDING_TOPIC,
         "resource_keys": [
@@ -2477,6 +2534,67 @@ mod tests {
         );
         assert!(finding.contains("last_work_tick_secs_ago"), "{finding}");
         assert!(!finding.contains("`live_status` beside"), "{finding}");
+    }
+
+    /// A leader dying takes every leader-gated worker `dead` at once, and each
+    /// report's `raw` carries ALL of them — so the body grows with exactly the
+    /// event it reports. At coord's 40-row list cap, all-absent, 80-char
+    /// names, it must still fit coord's 8 KiB cap, cutting only the evidence.
+    #[test]
+    fn a_leader_death_sized_finding_body_fits_coords_cap_and_keeps_its_advice() {
+        let rows: Vec<JsonValue> = (0..40)
+            .map(|i| dead_row(&format!("{i:02}{}", "w".repeat(78)), true, false))
+            .collect();
+        let body = ledger_body(40, JsonValue::Array(rows));
+        let ProbeOutcome::Read(read) = classify_ledger(&body) else {
+            panic!("expected a Read");
+        };
+        let mut state = ObserverState::default();
+        let reports = state.observe(&ProbeOutcome::Read(read));
+        assert_eq!(reports.len(), 40, "every dead worker still fires");
+        let report = &reports[0];
+        assert!(
+            report.raw.len() > FINDING_BODY_MAX_BYTES,
+            "the fixture must force a cut"
+        );
+
+        let finding = finding_body(report, "https://coord.example/mcp");
+        assert!(
+            finding.len() <= FINDING_BODY_MAX_BYTES,
+            "{} bytes",
+            finding.len()
+        );
+        assert!(finding.contains("evidence cut to fit"), "a cut says so");
+        assert!(
+            finding.contains(&report.summary),
+            "the summary is never the part cut"
+        );
+        assert!(
+            finding.ends_with("did not attempt one."),
+            "the method and advice are never the part cut"
+        );
+        assert!(finding.contains("last_work_tick_secs_ago"));
+    }
+
+    #[test]
+    fn a_no_leader_finding_gets_advice_for_its_own_class() {
+        let report = Report {
+            class: FaultClass::NoLeader,
+            summary: "coord reports 12 leader-gated workers with no leader.".to_string(),
+            raw: "x".repeat(20_000),
+            post_finding: true,
+        };
+        let finding = finding_body(&report, "https://coord.example/mcp");
+        assert!(
+            finding.len() <= FINDING_BODY_MAX_BYTES,
+            "{} bytes",
+            finding.len()
+        );
+        assert!(finding.contains("leader lease"), "{finding}");
+        assert!(
+            !finding.contains("does not refute a dead verdict"),
+            "dead-worker advice does not belong on a no-leader finding"
+        );
     }
 
     #[test]
