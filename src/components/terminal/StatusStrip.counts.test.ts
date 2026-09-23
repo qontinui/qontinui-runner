@@ -1,6 +1,8 @@
 /**
  * Pure-helper tests for the Terminal page's count reconciliations
- * (`sessionCounts.ts`, promoted out of `StatusStrip.tsx`).
+ * (`sessionCounts.ts`, promoted out of `StatusStrip.tsx`). The file keeps its
+ * pre-move name deliberately: coord's blast-radius gate reads a renamed test file
+ * as an untouched caller of the moved exports (removes-referenced-export).
  *
  * The runner's vitest config is `environment: "node"` (no jsdom), so the strip
  * itself can't be rendered here — the counting rules are extracted as pure
