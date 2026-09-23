@@ -4563,11 +4563,26 @@ pub fn load_settings_full() -> LoadedSettings {
     #[cfg(test)]
     SETTINGS_FULL_LOADS.with(|c| c.set(c.get() + 1));
 
+    complete_settings_load(read_settings_from_disk())
+}
+
+/// The second half of [`load_settings_full`]: every overlay, the tier /
+/// `local_user_id` migration and its persist, applied to a document that
+/// [`read_settings_from_disk`] already produced.
+///
+/// Split out so the READ and the PERSIST can be driven as two halves by a test
+/// that changes the environment in between — which is exactly the interleaving
+/// that let a test binary write a defaults document over the operator's real
+/// `settings.json` (plan
+/// `2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json`,
+/// `config_dir_race_tests`). Production has exactly one caller,
+/// [`load_settings_full`], which runs the two halves back to back.
+fn complete_settings_load(loaded: LoadedSettings) -> LoadedSettings {
     let LoadedSettings {
         mut settings,
         provenance,
         error,
-    } = read_settings_from_disk();
+    } = loaded;
 
     // The document EXACTLY as the file has it, captured before the first
     // overlay touches it. Every persist below is built from THIS, never from
@@ -7198,5 +7213,142 @@ mod load_persist_tests {
             settings_path.display()
         );
         assert!(after > before, "the strict arm counts as a deflection");
+    }
+}
+
+/// The read-in-one-directory / persist-into-another race, driven
+/// deterministically. Plan
+/// `2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json`,
+/// Phase 1.
+///
+/// # What was happening
+///
+/// The runner's own test binary, run with the operator's real `HOME`, replaced
+/// `~/.config/com.qontinui.runner/settings.json` with a defaults document five
+/// times in one afternoon — a fresh `local_user_id` each time, `paths` emptied,
+/// `log_sources` and `managed_processes` gone. The writer was attributed by PID
+/// from the `settings.json.tmp.<pid>.*` temp name to
+/// `target-agent/debug/deps/qontinui_runner-*` running `coord_mcp` tests.
+///
+/// The interleaving: a test with no fixture reaches [`load_settings_full`]
+/// while a SIBLING's `isolated_ambient()` has `QONTINUI_CONFIG_DIR` pointed at
+/// an empty tempdir, so the read is a `FreshInstall` and mints a
+/// `local_user_id`. The sibling's fixture drops, restoring the operator's
+/// (unset) value, and only THEN does the persist run — and it used to resolve
+/// the path a second time, landing on the real file.
+///
+/// Real threads would make that a flake; these tests hold [`env_lock`] and
+/// drive the two halves ([`read_settings_from_disk`], then
+/// [`complete_settings_load`]) with the environment repointed in between, so
+/// the interleaving happens on every run.
+///
+/// [`env_lock`]: crate::test_env::env_lock
+#[cfg(test)]
+mod config_dir_race_tests {
+    use super::*;
+
+    /// Every env input the two halves read on this path, captured and restored
+    /// as one set.
+    const RACE_ENV_KEYS: &[&str] = &[
+        "QONTINUI_CONFIG_DIR",
+        "QONTINUI_SECURE_STORAGE_DIR",
+        "QONTINUI_INSTANCE_NAME",
+        "QONTINUI_SERVER_MODE",
+        "QONTINUI_RUNNER_TIER",
+        "QONTINUI_RUNNER_TOKEN",
+        "QONTINUI_WEB_BACKEND_URL",
+        "QONTINUI_DISABLE_KEYCHAIN",
+        "XDG_CONFIG_HOME",
+    ];
+
+    /// A stand-in for the operator's real file: non-default in exactly the
+    /// fields the recorded resets destroyed.
+    const OPERATORS_FILE: &str = r#"{
+  "local_user_id": "operator-local-user-id-must-survive",
+  "tier": "local",
+  "tier_initialized": true,
+  "paths": { "plans_dir": "/operator/plans" }
+}"#;
+
+    /// Point every env input at `dir` as a primary runner with no pairing and
+    /// no keychain, so the load is authoritative, the persist gate is OPEN and
+    /// nothing reaches the machine.
+    fn point_env_at(dir: &Path) {
+        std::env::set_var("QONTINUI_CONFIG_DIR", dir);
+        std::env::set_var("QONTINUI_SECURE_STORAGE_DIR", dir);
+        std::env::set_var("XDG_CONFIG_HOME", dir);
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        for key in [
+            "QONTINUI_INSTANCE_NAME",
+            "QONTINUI_SERVER_MODE",
+            "QONTINUI_RUNNER_TIER",
+            "QONTINUI_RUNNER_TOKEN",
+            "QONTINUI_WEB_BACKEND_URL",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
+    /// THE reproduction. Read `FreshInstall` from empty dir A, repoint
+    /// `QONTINUI_CONFIG_DIR` at dir B (the operator's file), run the persist
+    /// half exactly as [`load_settings_full`] does, and require B's bytes to
+    /// be untouched.
+    ///
+    /// Holding `env_lock()` excludes every `IsolatedAmbient` in the process
+    /// (each holds that lock for its whole life), so `live_guard_count()` is 0
+    /// and the persist gate's arm 2 is OPEN — the persist is really attempted,
+    /// and this cannot pass because a canary swallowed the write.
+    #[test]
+    #[ignore = "red until Phase 3 of plan 2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json persists to the path that was read"]
+    fn a_fresh_install_read_in_one_dir_never_persists_into_another() {
+        let _g = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(RACE_ENV_KEYS);
+
+        let dir_a = tempfile::tempdir().expect("tempdir A");
+        let dir_b = tempfile::tempdir().expect("tempdir B");
+        let operators_file = dir_b.path().join(SETTINGS_FILE);
+        std::fs::write(&operators_file, OPERATORS_FILE).expect("plant B");
+
+        // The read: a sibling's fixture has the config dir pointed at an EMPTY
+        // tempdir.
+        point_env_at(dir_a.path());
+        let loaded = read_settings_from_disk();
+        assert_eq!(
+            loaded.provenance,
+            SettingsProvenance::FreshInstall,
+            "dir A is empty, so the read must be a FreshInstall — the provenance \
+             that mints a local_user_id and requests the persist"
+        );
+
+        // The fixture drops: the env now names a directory holding the
+        // operator's real file.
+        std::env::set_var("QONTINUI_CONFIG_DIR", dir_b.path());
+        let completed = complete_settings_load(loaded);
+        assert!(
+            !completed.settings.local_user_id.trim().is_empty(),
+            "the load must have minted a local_user_id, or no persist was requested \
+             and this test proves nothing"
+        );
+
+        let after = std::fs::read_to_string(&operators_file).expect("B must still exist");
+        assert_eq!(
+            after, OPERATORS_FILE,
+            "a FreshInstall read in {} was persisted OVER the file in {} — the path \
+             was resolved again at persist time instead of reusing the one that was \
+             read",
+            dir_a.path().display(),
+            dir_b.path().display()
+        );
+
+        // …and the persist was not merely suppressed: it went to the directory
+        // that was actually read.
+        let persisted_a =
+            std::fs::read_to_string(dir_a.path().join(SETTINGS_FILE)).unwrap_or_default();
+        assert!(
+            persisted_a.contains(&completed.settings.local_user_id),
+            "the minted local_user_id must have been persisted into the directory \
+             that was READ ({}), got: {persisted_a:?}",
+            dir_a.path().display()
+        );
     }
 }
