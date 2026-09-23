@@ -12,6 +12,7 @@ import { useZoneMetadata } from "./useZoneMetadata";
 import { useStateTransitionEffects } from "../useStateTransitionEffects";
 import { useWindowTitle } from "../useWindowTitle";
 import { getTerminalHotStore } from "../terminalHotStore";
+import { windowTitleCounts } from "../sessionCounts";
 
 type TransitionEffectsReturn = ReturnType<typeof useStateTransitionEffects>;
 
@@ -154,11 +155,13 @@ export function TransitionEffectsProvider({ children }: TransitionEffectsProvide
     addHistoryEvent,
   });
 
-  // Window title: show needs-input/error counts
-  const needsInputCount = Object.values(stateTracking.sessionStates).filter(
-    (s) => s === "needs-input",
-  ).length;
-  const errorCount = Object.values(stateTracking.sessionStates).filter((s) => s === "error").length;
+  // Window title: show needs-input/error counts over the LIVE tabs only —
+  // see `windowTitleCounts` (a stale `sessionStates` entry for a closed tab
+  // must not inflate the one count visible while the window is unfocused).
+  const { needsInputCount, errorCount } = useMemo(
+    () => windowTitleCounts(tabs, stateTracking.sessionStates),
+    [tabs, stateTracking.sessionStates],
+  );
   useWindowTitle(needsInputCount, errorCount, zoneLayout.isMultiZone);
 
   const value = useMemo<TransitionEffectsContextValue>(
