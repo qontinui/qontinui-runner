@@ -90,11 +90,14 @@
 //!   a handle wraps is still enumerated on its own terms — `MARKER_OVERRIDE_LOCK`
 //!   is listed as cross-module — and a test reaching the handle by a path call
 //!   is credited with the static.)
-//! * A unit-mutex static declared inside a `#[test]` fn's own body
-//!   (`health_monitor.rs`, `observe_publishes_the_failure_count_before_it_reports`)
-//!   serialises nothing — only that one test can reach it. Listed as
-//!   `scoped-to-one-test` and reported as a finding of its own kind, because
-//!   the doc comment above it says "serialise" and the lock does not.
+//! * A unit-mutex static declared inside a `#[test]` fn's own body serialises
+//!   nothing — only that one test can reach it. Listed as `scoped-to-one-test`
+//!   and reported as a finding of its own kind, because the doc comment above
+//!   such a static habitually says "serialise" and the lock does not. The
+//!   shape had one instance when this guard was written
+//!   (`health_monitor.rs`, `observe_publishes_the_failure_count_before_it_reports`);
+//!   it was hoisted to the module-level `WEDGE_ATOMS_SERIAL` on main, so no
+//!   example is named here — a named example is a hostage to the next fix.
 //!
 //! # Known limits
 //!
@@ -246,18 +249,6 @@ const ALLOWLIST: &[AllowlistEntry] = &[
          after the 2026-09-21 rebase onto main, which added the module's counter family; the \
          per-test handle (MemoryEnrichCounters / TransportRungCounters in mcp_api.rs) is the \
          remedy that would delete this entry",
-    },
-    AllowlistEntry {
-        file: "health_monitor.rs",
-        module: "tests",
-        serializer: "SERIAL",
-        outside_the_lock: &[
-        ],
-        reason: "scoped-to-one-test: declared inside observe_publishes_the_failure_count_before_it_reports, \
-         so it serialises that test against nothing; the other test that writes \
-         BACKEND_WEDGED (stopping_the_monitor_clears_the_wedge_latches) asserts on the \
-         latches it sets itself. Hoisting the static and taking it in both is a follow-up \
-         recorded here, not silence",
     },
     AllowlistEntry {
         file: "agent_runtime.rs",
@@ -689,6 +680,150 @@ const ALLOWLIST: &[AllowlistEntry] = &[
          port, memory clause) or take posture_test_lock() directly and are credited",
     },
     AllowlistEntry {
+        file: "health_monitor.rs",
+        module: "tests",
+        serializer: "WEDGE_ATOMS_SERIAL",
+        outside_the_lock: &[
+            "test_collect_metrics",
+            "statm_parser_reads_resident_pages_not_virtual",
+            "test_health_status",
+            "the_census_memo_walks_once_per_ttl_and_never_caches_unknown",
+            "the_census_json_shape_is_pinned",
+            "the_leak_warn_top_field_names_three_rows_or_unknown",
+            "two_reads_inside_the_ttl_take_one_snapshot",
+            "a_read_after_the_ttl_takes_a_fresh_snapshot",
+            "an_unknown_reading_is_retried_rather_than_cached",
+            "the_memo_is_fail_open_on_a_poisoned_lock",
+            "the_memoized_entry_point_agrees_with_the_live_sensor",
+            "healthy_probes_never_escalate",
+            "escalates_exactly_once_at_the_threshold",
+            "a_single_success_resets_the_streak",
+            "re_escalates_periodically_while_still_wedged",
+            "recovery_is_reported_only_if_we_had_escalated",
+            "the_reported_elapsed_is_measured_not_multiplied",
+            "re_escalations_keep_measuring_from_the_original_onset",
+            "the_onset_is_the_first_failed_probe_not_the_threshold_crossing",
+            "a_reversed_clock_degrades_to_zero_rather_than_panicking",
+            "the_watchdog_writes_a_breadcrumb_while_the_runtime_is_fully_parked",
+            "a_runtime_hosted_watchdog_would_be_silenced_by_the_wedge",
+            "a_stalled_monitor_thread_is_reported_even_when_it_says_healthy",
+            "watchdog_breadcrumbs_are_rate_limited_while_the_condition_persists",
+            "a_never_started_monitor_is_not_a_stall",
+            "ui_thread_rung_escalates_on_the_same_noise_floor",
+            "one_pumping_sample_clears_the_ui_thread_streak",
+            "ui_thread_rung_reports_recovery_only_after_escalating",
+            "the_two_rungs_do_not_share_a_streak",
+            "breadcrumb_reasons_are_distinct_and_stable",
+            "the_default_rung_is_the_backend_rung",
+            "the_probes_cannot_dominate_the_sample_cadence",
+            "an_unknown_probe_releases_a_latched_wedge_but_is_not_a_recovery",
+            "unknown_never_escalates_and_never_manufactures_a_release",
+            "an_unknown_release_resets_the_onset_for_the_next_incident",
+            "ui_thread_detection_latency_stays_in_the_tens_of_seconds",
+            "the_heartbeat_clock_is_monotonic_and_never_zero",
+            "no_heartbeat_stamp_is_taken_from_the_wall_clock",
+            "detection_latency_stays_under_a_minute",
+            "a_wedge_is_named_backend_wedged_even_when_the_metrics_loop_is_stalled",
+            "a_stalled_metrics_loop_is_reported_as_its_own_condition",
+            "a_stalled_probe_thread_still_outranks_a_stale_wedge_flag",
+            "a_probe_that_never_returns_is_bounded_and_reads_as_a_failure",
+            "the_probe_loop_builds_its_diagnostics_rig_at_start",
+            "the_default_detector_still_builds_no_rig",
+            "the_probe_loop_does_not_share_a_thread_with_the_metrics_work",
+        ],
+        reason: "the lock serialises the three process-global wedge atomics the watchdog reads — \
+         BACKEND_WEDGED, UI_THREAD_WEDGED and MONITOR_CONSECUTIVE_FAILURES (plus \
+         MONITOR_HEARTBEAT_MS, stamped by the same publish). The COMPLETE reach set, because \
+         this reason is the checklist the next author checks a new test against. Six functions \
+         touch the atomics DIRECTLY: WedgeDetector::publish, WedgeDetector::dispatch (it calls \
+         publish first for every action and then stores the latch-release arms itself), \
+         stop_health_monitor, live_watchdog_sample, backend_wedged and ui_thread_wedged. Four \
+         more reach dispatch as its entry points — observe, observe_at, observe_unknown and \
+         observe_unknown_at, the last its own entry point rather than merely the body of \
+         observe_unknown. Two production starters reach them transitively and are the most \
+         plausible call a new test would make: start_health_monitor, whose probe thread calls \
+         observe_at / observe_unknown_at, and start_wedge_watchdog, which hands \
+         live_watchdog_sample to the watchdog loop. That is the whole list — twelve names, and \
+         a test calling ANY of them owes the lock. The two tests that take it are the only ones \
+         in the module that call any: the module's reader calls (four call expressions on three \
+         lines) all sit inside stopping_the_monitor_clears_the_wedge_latches, and the one \
+         direct publish() call sits inside observe_publishes_the_failure_count_before_it_reports, \
+         both under the lock. \
+         The 46 outside drive the PURE halves — WedgeDetector::step_at / step_unknown_at against an injected Instant, \
+         WatchdogState::step over literal WatchdogSample values built by the sample / sample2 \
+         helpers, the ThreadNameCensus memo, the statm parser, monotonic_now_ms, and two \
+         source-scanning tests over this file's own include_str! — and call none of the twelve. \
+         Enumerated after the 2026-09-23 \
+         rebase onto main, which HOISTED this static: it replaced the scoped-to-one-test \
+         SERIAL declared inside observe_publishes_the_failure_count_before_it_reports, the \
+         follow-up the entry this one supersedes had recorded. Taking the lock in the other 46 \
+         would serialise a module that is otherwise fully parallel; a per-test handle for the \
+         atomics is the remedy that would delete this entry",
+    },
+    AllowlistEntry {
+        file: "mcp/policy_context.rs",
+        module: "tests",
+        serializer: "COUNTER_LOCK",
+        outside_the_lock: &[
+            "mode_parses_the_three_values_and_defaults_to_on",
+            "mode_flag_env_name_is_the_documented_one",
+            "list_url_uses_the_device_authed_door_not_the_operator_one",
+            "document_url_uses_the_device_authed_door_not_the_operator_one",
+            "document_url_percent_encodes_the_name_and_urls_never_carry_a_tenant",
+            "both_urls_carry_the_session_start_injection_marker",
+            "attribution_parses_only_a_real_uuid_and_never_invents_one",
+            "the_caller_session_header_is_set_only_when_there_is_a_session",
+            "the_cache_round_trips_both_validators",
+            "render_injection_carries_the_protocol_body_and_a_versioned_index",
+            "render_injection_states_an_unknown_version_instead_of_eliding_it",
+            "render_injection_degrades_honestly_when_only_the_body_is_missing",
+            "render_injection_never_presents_an_empty_index_as_authoritative",
+            "render_policy_body_is_deterministic_and_embedded_verbatim_in_the_full_render",
+            "a_matching_marker_gets_the_short_confirmation_without_the_body",
+            "only_startup_and_compact_may_confirm_a_matching_marker",
+            "a_missing_or_stale_marker_gets_the_full_body",
+            "a_matching_marker_on_a_confirmable_source_reasons_confirmed",
+            "an_absent_source_reasons_source_absent_and_not_the_resume_arm",
+            "an_unknown_source_reasons_source_unrecognized",
+            "a_resume_or_clear_reasons_source_not_confirmable",
+            "a_payload_with_no_body_reasons_body_unavailable",
+            "a_confirmable_source_with_no_marker_reasons_marker_absent",
+            "a_marker_for_another_body_reasons_marker_mismatched",
+            "a_failed_pull_reasons_pull_failed_and_is_not_a_full_body",
+            "classify_source_splits_the_three_non_confirmable_shapes",
+            "the_raw_source_logs_verbatim_or_says_it_was_absent",
+            "the_decision_carries_both_shas_and_logs_the_same_prefix_the_text_shows",
+            "the_reason_names_the_first_unmet_precondition_and_the_facts_all_survive",
+            "every_reason_has_a_distinct_stable_label_and_six_mean_full_body",
+            "the_arm_count_is_pinned_to_the_arm_list",
+            "the_tally_counts_only_the_mode_that_actually_injects",
+            "the_stats_snapshot_publishes_one_key_per_reason_plus_the_two_totals",
+            "delivered_sha_parses_only_a_full_sha256_hex",
+            "delivered_sha_is_read_from_the_header_only",
+            "tenant_of_jwt_reads_the_claim_and_rejects_non_uuids",
+            "failure_notice_names_the_reason_and_the_agent_door",
+            "envelope_is_the_claude_session_start_hook_contract",
+            "every_source_is_accepted_and_unknown_ones_read_as_startup",
+            "parse_index_reads_both_envelope_shapes_and_keeps_current_version",
+            "parse_index_skips_unaddressable_entries_and_tolerates_missing_fields",
+            "parse_document_version_reads_flat_and_enveloped_rows",
+        ],
+        reason: "the lock guards the process-global render tally — the COUNTS slot array behind \
+         render_counts(), written only by record_render and read only by render_stats. The two \
+         tests that take it are the only ones that WRITE it \
+         (the_counter_files_each_reason_separately_and_the_totals_add_up asserts on deltas, \
+         the_every_arm_is_listed_and_slots_are_in_range records once per arm). Of the 42 \
+         outside, 41 never touch the tally at all — they exercise the flag parse, the two URL \
+         builders, the marker/decision classifier, the render text and the JSON parsers over \
+         explicit inputs — and the one that does, \
+         the_stats_snapshot_publishes_one_key_per_reason_plus_the_two_totals, calls \
+         render_stats() only to serialise the snapshot and assert on its KEY SET and length; it \
+         reads no counter VALUE, so a concurrent record_render cannot change its verdict. No \
+         test in the module calls the policy_context handler, the only other record_render \
+         caller. Enumerated after the 2026-09-23 rebase onto main, which added this serialiser; \
+         a per-test counter handle is the remedy that would delete this entry",
+    },
+    AllowlistEntry {
         file: "wedge_diagnostics.rs",
         module: "tests",
         serializer: "POOL_SERIAL",
@@ -718,10 +853,30 @@ const ALLOWLIST: &[AllowlistEntry] = &[
             "proc_stat_is_parsed_from_the_last_paren",
             "wait_reasons_render_the_kernels_names",
             "linux_states_render_long_hand",
+            "collapse_folds_id_suffixes_and_leaves_runtime_names_alone",
+            "collapse_orders_by_count_then_name",
+            "collapse_truncates_to_twelve_rows",
+            "collapse_buckets_unnamed_threads",
+            "collapse_id_rule_edges",
+            "an_empty_walk_is_not_a_census",
+            "the_thread_name_census_sees_a_named_thread_of_this_process",
         ],
-        reason: "guards the process-global LANES slot counts; the 25 tests outside it drive a private \
-         LaneTable (fresh_lane_table / spawn_blocking_tracked_in), scan this file's source, \
-         or measure a child process — the per-test-handle shape this plan generalises",
+        reason: "guards the process-global LANES slot counts; 31 of the 32 tests outside it drive a \
+         private LaneTable (fresh_lane_table / spawn_blocking_tracked_in), scan this file's \
+         source, or measure a child process — the per-test-handle shape this plan generalises. \
+         The 32nd is lane_resolution_routes_to_the_table_it_was_handed, which DOES touch LANES: \
+         it calls current_thread_lane() on purpose, to prime the global memo before asserting \
+         that resolution against a private table does not leak it. That permanently consumes \
+         one global lane for this thread's name and races nothing — every assertion is on the \
+         private table, and the global index appears only inside an assertion message. Its own \
+         doc comment in wedge_diagnostics.rs states the same exception and its one residual; \
+         this clause names it so the two do not disagree. The \
+         last seven arrived with the 2026-09-23 rebase onto main and are the thread-name \
+         census: collapse_thread_name(s) / looks_like_thread_id / finish_thread_name_census \
+         over literal name lists, and one live capture_thread_name_census over six threads it \
+         names itself. LANES is reachable only through current_thread_lane \
+         (BlockingSlot::enter), tracked_blocking_in_flight and tracked_blocking_by_thread; none \
+         of the seven calls any of them",
     },
 ];
 
