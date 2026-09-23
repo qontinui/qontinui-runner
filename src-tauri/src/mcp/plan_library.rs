@@ -309,8 +309,9 @@ fn write_killed_error() -> (StatusCode, Json<ApiResponse<()>>) {
         CODE_WRITE_KILLED,
         format!(
             "the plan-library write door is KILLED on this machine: {PLAN_LIBRARY_WRITE_FLAG}=0 \
-             is set in the runner's environment. POST /plan-library/artifacts and \
-             POST /plan-library/links refuse until it is unset (absent means on; only the \
+             is set in the runner's environment. POST /plan-library/artifacts, \
+             POST /plan-library/links, and DELETE / PUT /plan-library/links/{{id}} refuse \
+             until it is unset (absent means on; only the \
              exact value \"0\" kills) — the switch is read per request, so no restart is \
              needed. GET /plan-library/search and GET /plan-library/candidates work \
              regardless and advertise this switch."
@@ -755,6 +756,11 @@ pub struct LinkCorrectRequest {
     #[serde(default)]
     pub note: Option<String>,
     pub reason: String,
+    /// Same caller-chosen label as [`LinkRequest::session_id`]: folded into
+    /// the note's attribution by [`provenance_note`], so a correction is as
+    /// attributable as the create it corrects.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 // ===========================================================================
@@ -1580,7 +1586,7 @@ pub async fn correct_link_handler(
     Path(edge_id): Path<String>,
     body: Bytes,
 ) -> ApiResult {
-    authorize_write(&headers)?;
+    let principal = authorize_write(&headers)?;
     let req: LinkCorrectRequest = parse_write_body(&body)?;
     if req.relation.trim().is_empty() {
         return Err((
@@ -1605,7 +1611,7 @@ pub async fn correct_link_handler(
     let body = serde_json::json!({
         "relation": req.relation,
         "to_id": req.to_id,
-        "note": req.note,
+        "note": provenance_note(req.note.as_deref(), &principal, req.session_id.as_deref()),
         "reason": req.reason,
     });
     let upstream = upstream_put(&path, &body).await?;
@@ -3882,12 +3888,14 @@ mod tests {
     /// call would compile clean and only this test would notice.
     #[tokio::test]
     async fn both_edge_correction_routes_are_gated_the_same_three_layers() {
-        let _guard = crate::test_env::env_lock();
-        let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_WRITE_FLAG]);
-
+        // Each layer takes the dial pin BEFORE the env lock — the crate-wide
+        // order `pin` documents — so this test cannot deadlock against one
+        // that takes them the same way.
         // Layer 1: no nonce ⇒ 401, dial open, switch off.
         {
             let _pin = pin("record");
+            let _guard = crate::test_env::env_lock();
+            let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_WRITE_FLAG]);
             std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
             for (status, body) in [
                 delete_json(EDGE_ID_URI, None, valid_retraction()).await,
@@ -3901,6 +3909,8 @@ mod tests {
         // Layer 2: registered nonce, kill switch engaged ⇒ 403 killed.
         {
             let _pin = pin("record");
+            let _guard = crate::test_env::env_lock();
+            let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_WRITE_FLAG]);
             std::env::set_var(PLAN_LIBRARY_WRITE_FLAG, "0");
             let nonce = registered_nonce();
             for (status, body) in [
@@ -3915,6 +3925,8 @@ mod tests {
         // Layer 3: past the kill switch, dial off ⇒ 403 dial-off.
         {
             let _pin = pin("off");
+            let _guard = crate::test_env::env_lock();
+            let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_WRITE_FLAG]);
             std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
             let nonce = registered_nonce();
             for (status, body) in [
