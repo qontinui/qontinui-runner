@@ -204,21 +204,51 @@ so the next author does not reintroduce them:
 - It described a six-tier `non_author_allows_identities` ladder over
   `{device, agent, session}` for the work-unit check. **That is not the code.**
   On qontinui-coord `origin/main`,
-  `work_unit_registry::authorize_target_transition` takes two `Option<&str>`
-  keys and does a flat `owner == attester` compare;
+  `work_unit_registry::authorize_target_transition` takes the two actor keys
+  **plus an optional `independence` declaration**, and does a flat
+  `owner == attester` compare **when no declaration is sent**;
   `non_author_allows_identities` is called only from `gates.rs`.
 - It said *"a subagent never qualifies"*. The operator ruled the opposite on
-  2026-09-03: independence means the attester did not hold the AUTHOR'S CONTEXT,
-  a subagent with a fresh context window QUALIFIES, and it needs no distinct
-  session id. The code has not caught up yet — plan
-  `2026-09-03-work-unit-attestation-is-unreachable-unauditable-and-bypassable`
-  closes that gap.
+  2026-09-03, and **that ruling stands unchanged**: independence means the
+  attester did not hold the AUTHOR'S CONTEXT, a subagent with a fresh context
+  window QUALIFIES, and it needs no distinct session id, credential or device.
 
-Until it does, expect a refusal, treat it as waivable bookkeeping
+**LANDED is not SERVED — and today they disagree. Read which one you are on
+rather than trusting either paragraph below.**
+
+*Landed.* qontinui-coord `origin/main` HAS caught up (verified 2026-09-23 at
+`037fc1a8f`): a transition to an ATTESTED target (`vetted` / `superseded` /
+`obsolete`) takes an optional `independence` object —
+`work_unit_registry::IndependenceDeclaration` (qontinui-coord
+`crates/coord/src/work_unit_registry.rs`), the three required non-blank strings
+`verified` / `against` / `context`, `deny_unknown_fields`, each bounded by
+`work_unit_registry::INDEPENDENCE_FIELD_MAX` (a BYTE bound) — consumed by
+`policies::lifecycle_autonomy::authorize_target_transition_graduated` and STORED
+at `metadata.attestations`, with the transition FAILING if it cannot be stored.
+Only that DECLARATION ARM landed: the plan's own status block still reads
+*"Phases 2-4 are NOT delivered"*, so do not cite it as delivered.
+
+*Served.* **Whether the coord instance serving YOU exposes that field is a
+separate fact you READ, never assume.** The test is the transition tool's own
+advertised schema: if `coord_work_unit_transition` carries no `independence`
+property, your deployment predates the arm and the legacy actor-key compare is
+what you will meet — and that schema is `additionalProperties: false`, so
+sending the field anyway is REFUSED, not ignored. **Measured on this tenant
+2026-09-23: NOT served** — the advertised schema carried only `slug`,
+`to_status`, `from_status` and `reason`, and a real `-> vetted` transition was
+refused `self_attestation_forbidden`.
+
+So until your own deployment serves the field, the existing guidance is still
+the correct one: **expect a refusal**, treat it as waivable bookkeeping
 [policy: bookkeeping-writes-waivable-at-the-floor], and never report the work as
 blocked because a status string could not be written. Publishing the plan buys
 reviewability; it does not by itself supply an attester.
 §5.4 covers what to write when the ladder actually refuses.
+
+⚠️ **Do NOT re-allocate to get past the refusal.** A fresh allocate issues a NEW
+agent id, so the actor-key compare WOULD then admit you — *"a known defect being
+tracked, not a sanctioned route"*, in the refusal message's own words. A `vetted`
+stamp obtained that way is indistinguishable from a real review forever after.
 
 ## Decision policy (binding)
 
@@ -2712,8 +2742,9 @@ leave it in the report.
   proven session identity. ⚠️ **The sentence that used to follow — "the work-unit
   attestation check now routes through this SAME ladder" — is FALSE and was
   removed 2026-09-03.** Verified on qontinui-coord `origin/main`:
-  `work_unit_registry::authorize_target_transition` takes two `Option<&str>`
-  keys and does a flat `owner == attester` compare;
+  `work_unit_registry::authorize_target_transition` takes the two actor keys
+  plus an optional `independence` declaration, and does a flat
+  `owner == attester` compare when no declaration is sent;
   `non_author_allows_identities` is called only from `gates.rs`. The ladder is
   real for GATES and fictional for work-unit attestation — do not carry it
   across. For the work-unit rule read policy live rather than restating it:
