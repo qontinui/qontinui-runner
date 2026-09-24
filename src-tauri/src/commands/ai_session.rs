@@ -1588,6 +1588,7 @@ async fn reacquire_and_restore_session_worktree(
         phase: None,
         agent_session_id: Some(agent_session_id),
         spawn_tenant: None,
+        shared_branch: crate::agent_worktree::SharedBranchPolicy::Honor,
     })
     .await
     {
