@@ -69,65 +69,67 @@ DEV="11111111-2222-4333-8444-555555555555"
 # pointer tenant $TP, the multi-tenant-device defect); POST /mcp answers the
 # device's bindings; the author-session door answers 200 only when the bearer's
 # claim is the owner in $STUB_OWNERS. Every request's bearer claim is logged.
-STUB="$SANDBOX/curl-stub.py"
+STUB="$SANDBOX/curl-stub.sh"
+# The stub is BASH, deliberately: the census suite runs on the windows-latest
+# roster, and a Python stub invoked as curl answered nothing there (every mint
+# read HTTP 000) while this shape has run there since the suite landed.
 cat >"$STUB" <<'STUBEOF'
-#!/usr/bin/env python3
-import base64, json, os, re, sys, time
-d = os.environ["STUB_DIR"]; env = os.environ.get
-args = sys.argv[1:]
-open(os.path.join(d, "argv.log"), "a").write(" ".join(args) + "\n")
-out = body = url = None; hdrs = []; rk = ""
-i = 0
-while i < len(args):
-    a = args[i]
-    if a == "-o": out = args[i + 1]; i += 2
-    elif a == "-d": body = args[i + 1]; i += 2
-    elif a == "-H": hdrs.append(args[i + 1]); i += 2
-    elif a == "--data-urlencode":
-        if args[i + 1].startswith("resource_key="): rk = args[i + 1][len("resource_key="):]
-        i += 2
-    elif a in ("-w", "-m", "--connect-timeout", "-X"): i += 2
-    elif a.startswith("http"): url = a; i += 1
-    else: i += 1
-def jwt(t):
-    enc = lambda o: base64.urlsafe_b64encode(json.dumps(o).encode()).decode().rstrip("=")
-    return enc({"alg": "none"}) + "." + enc({"tenant_id": t, "exp": int(time.time()) + 3600}) + ".c2ln"
-def claim():
-    for h in hdrs:
-        if h.startswith("@"):
-            t = open(h[1:]).read().split("Bearer ", 1)[1].strip()
-            seg = t.split(".")[1]; seg += "=" * (-len(seg) % 4)
-            return json.loads(base64.urlsafe_b64decode(seg)).get("tenant_id")
-def reply(code, obj):
-    open(out, "w").write(obj if isinstance(obj, str) else json.dumps(obj))
-    sys.stdout.write(str(code)); sys.exit(0)
-if url.endswith("/agents/credential"):
-    b = json.loads(body)
-    t = b.get("tenant_id") if (env("STUB_MINT", "honour") == "honour" and b.get("tenant_id")) else env("TP")
-    reply(200, {"token": jwt(t)})
-if url.endswith("/mcp"):
-    reply(200, {"result": {"structuredContent": {"device_tenant_bindings": {"tenant_ids": [{"tenant_id": x} for x in env("STUB_BINDINGS", "").split()]}}}})
-m = re.search(r"/pr-merge/(.+)/0/author-session$", url)
-if m:
-    repo = m.group(1).replace("%2F", "/")
-    owners = dict(p.split("=") for p in env("STUB_OWNERS", "").split())
-    if owners.get(repo) == claim(): reply(200, {"repo": repo, "pr": 0, "resolved": False})
-    reply(404, {"error": "no author session"})
-if url.endswith("/coord/agent-gates"):
-    key = re.sub(r"[^A-Za-z0-9._-]", "_", rk)
-    open(os.path.join(d, "queried.log"), "a").write(rk + "\n")
-    open(os.path.join(d, "gates-claims.log"), "a").write("%s\n" % claim())
-    f = os.path.join(d, key + ".json")
-    reply(int(open(os.path.join(d, key + ".code")).read()) if os.path.exists(os.path.join(d, key + ".code")) else 200,
-          open(f).read() if os.path.exists(f) else '{"gates":[],"count":0,"shown":0,"total":0,"offset":0,"truncated":false}')
-sys.stdout.write("000"); sys.exit(7)
+#!/usr/bin/env bash
+out=""; rk=""; url=""; body=""; hdr=""
+printf '%s\n' "$*" >>"$STUB_DIR/argv.log"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -d) body="$2"; shift 2 ;;
+    -H) case "$2" in @*) hdr="${2#@}" ;; esac; shift 2 ;;
+    -w|-m|--connect-timeout|-X) shift 2 ;;
+    --data-urlencode) case "$2" in resource_key=*) rk="${2#resource_key=}" ;; esac; shift 2 ;;
+    http*) url="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+b64url() { base64 | tr -d '\n=' | tr '/+' '_-'; }
+jwt() { # <tenant>
+  printf '%s.%s.c2ln' "$(printf '{"alg":"none"}' | b64url)" \
+    "$(printf '{"tenant_id":"%s","exp":%s}' "$1" "$(( $(date +%s) + 3600 ))" | b64url)"
+}
+claim() { # the bearer's tenant_id claim, read from the -H @file
+  local t seg
+  [ -n "$hdr" ] && [ -r "$hdr" ] || return 0
+  t="$(sed -n 's/^Authorization: Bearer //p' "$hdr" | tr -d '\r\n')"
+  seg="$(printf '%s' "$t" | cut -d. -f2 | tr '_-' '/+')"
+  case $(( ${#seg} % 4 )) in 2) seg="$seg==" ;; 3) seg="$seg=" ;; esac
+  printf '%s' "$seg" | base64 -d 2>/dev/null | sed -n 's/.*"tenant_id":"\([^"]*\)".*/\1/p'
+}
+case "$url" in
+  */agents/credential)
+    t="$(printf '%s' "$body" | sed -n 's/.*"tenant_id":"\([^"]*\)".*/\1/p')"
+    { [ "${STUB_MINT:-honour}" = honour ] && [ -n "$t" ]; } || t="$TP"
+    printf '{"token":"%s"}' "$(jwt "$t")" >"$out"; printf 200; exit 0 ;;
+  */mcp)
+    ids=""; for x in $STUB_BINDINGS; do ids="${ids:+$ids,}{\"tenant_id\":\"$x\"}"; done
+    printf '{"result":{"structuredContent":{"device_tenant_bindings":{"tenant_ids":[%s]}}}}' "$ids" >"$out"; printf 200; exit 0 ;;
+  */0/author-session)
+    repo="${url#*/pr-merge/}"; repo="${repo%/0/author-session}"; repo="${repo//%2F//}"
+    c="$(claim)"
+    for pair in $STUB_OWNERS; do
+      if [ "${pair%%=*}" = "$repo" ] && [ "${pair#*=}" = "$c" ] && [ -n "$c" ]; then
+        printf '{"repo":"%s","pr":0,"resolved":false}' "$repo" >"$out"; printf 200; exit 0
+      fi
+    done
+    printf '{"error":"no author session"}' >"$out"; printf 404; exit 0 ;;
+  */coord/agent-gates)
+    key="$(printf '%s' "$rk" | tr -c 'A-Za-z0-9._-' '_')"
+    printf '%s\n' "$rk" >>"$STUB_DIR/queried.log"
+    printf '%s\n' "$(claim)" >>"$STUB_DIR/gates-claims.log"
+    if [ -f "$STUB_DIR/$key.json" ]; then cat "$STUB_DIR/$key.json" >"$out"; else printf '{"gates":[],"count":0,"shown":0,"total":0,"offset":0,"truncated":false}' >"$out"; fi
+    if [ -f "$STUB_DIR/$key.code" ]; then cat "$STUB_DIR/$key.code"; else printf 200; fi
+    exit 0 ;;
+esac
+printf 000; exit 7
 STUBEOF
-# Invoked through a bash wrapper naming the Python 3 this suite resolved: on
-# Git Bash for Windows the only spelling is often `python`, so a
-# `#!/usr/bin/env python3` shebang would not run there.
-printf '#!/usr/bin/env bash\nexec "%s" "%s" "$@"\n' "$PY" "$STUB" > "$SANDBOX/curl-stub.sh"
-chmod +x "$STUB" "$SANDBOX/curl-stub.sh"   # Linux refuses to exec a file without it; MSYS would run it anyway, which hid this
-export RECOVERY_CENSUS_CURL="$SANDBOX/curl-stub.sh"
+chmod +x "$STUB"   # Linux refuses to exec a file without it; MSYS would run it anyway, which hid this
+export RECOVERY_CENSUS_CURL="$STUB"
 export TA="aaaaaaaa-0000-4000-8000-000000000001" TB="bbbbbbbb-0000-4000-8000-000000000002" TP="cccccccc-0000-4000-8000-000000000003"
 # Every fixture repo's origin is github.com/org/<name>, owned by $TA; the
 # device is bound to $TB (owns nothing) and $TA, in that order, so a proof has
@@ -255,7 +257,7 @@ eq "F2 --only f2 scans f2 alone" '["f2"]' "$(printf '%s' "$OUT" | "$PY" -c 'impo
 # --- G: no device; the bearer stays off argv --------------------------------------
 CENSUS_DEV="" run "$WS"
 eq "G1 no device id -> exit 3" 3 "$RC"
-lacks "G2 the minted bearer never appears on curl's argv" "eyJhbGciOiAibm9uZSJ9" "$(cat "$SANDBOX"/stub*/argv.log 2>/dev/null)"
+lacks "G2 the minted bearer never appears on curl's argv" "eyJhbGciOiJub25lIn0" "$(cat "$SANDBOX"/stub*/argv.log 2>/dev/null)"
 lacks "G3 ... nor does an Authorization value" "Bearer" "$(cat "$SANDBOX"/stub*/argv.log 2>/dev/null)"
 
 # --- H: the tenant the gates are read under ---------------------------------------
