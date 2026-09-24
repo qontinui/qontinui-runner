@@ -104,8 +104,8 @@ pub use manager::{TerminalManager, TrustArm};
 ///
 /// **Identifiers are deliberately NOT listed.** The matching `*_EMAIL` /
 /// `*_USERNAME` variables name an account, they do not authenticate one, and
-/// skills legitimately read them (e.g. `commands/setup_wizard.rs:52` reads
-/// `QONTINUI_TEST_AUTO_LOGIN_EMAIL`). Adding them here would break working
+/// skills legitimately read them (e.g. `commands/setup_wizard.rs`
+/// `setup_bypassed_by_env` reads `QONTINUI_TEST_AUTO_LOGIN_EMAIL`). Adding them here would break working
 /// consumers for no security gain.
 ///
 /// **Consumers that still work.** `commands/setup_wizard.rs` reads the RUNNER's
