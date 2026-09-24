@@ -632,6 +632,14 @@ send an empty string.)
   same call on this same key inside the same harness session. **A re-reserve by
   the same owner token is a renewal, not a conflict** — proceed, and do **not**
   release at the end of this run; the acquirer releases.
+  **`renewed` is only as narrow as the door's owner token.** Over
+  `coord_reserve_resource` (MCP) that token is the bare DEVICE, so a second
+  session on this same box re-reserving the plan ALSO reads `renewed`; only the
+  HTTP `/claims/acquire` fallback, which carries `agent_session_id`, makes it
+  session-scoped. So a `renewed` is YOUR hold only if something earlier in THIS
+  session reserved the plan (you are nested under `/vet-imp`, or this run
+  re-reserves its own key). If nothing did, treat it as `held` by a same-box
+  peer — the rule below.
 - **`held` by a DIFFERENT owner — STOP.** Do not stamp, do not edit the plan, do
   not launch a phase agent. Report the holder, then run **Step 0.6's
   conflict-resolution flow verbatim** (`AskUserQuestion`, header `Claim
@@ -740,20 +748,21 @@ since its last ok, so a short-TTL row added to a loop already sleeping on long
 rows is still renewed inside its grant — replaying the owner token
 `<machine_id>:<agent_session_id>` on every request — coord matches on that pair,
 so a heartbeat without it renews nothing and lets the claim age out anyway.
-**It does not answer `not_held` - that is the RELEASE door's word.** Today
-`HeartbeatResult` (`claims.rs`) has exactly two variants, `ok` and `stolen`, and
-`heartbeat` folds BOTH non-renewals into `stolen`. What separates them is
+On a coord predating qontinui/qontinui-coord#2206 the heartbeat never answered
+`not_held` (that was only the RELEASE door's word): `HeartbeatResult`
+(`claims.rs`) had exactly two variants, `ok` and `stolen`, and `heartbeat`
+folded BOTH non-renewals into `stolen`. What separated them there is
 `current_holder`, not the verdict word: a NAMED holder is a token mismatch or a
 real theft - drop the owner token and coord names *you*, since you are still the
 stored owner - while `current_holder: null` means the key was already GONE and
 the grant had expired. `scripts/coord-claim-heartbeat.sh` makes that split for
 you and records the null case `lapsed`. The two have opposite recoveries - fix
 the owner token, versus a fresh `acquire` - so read `current_holder` before
-deciding which happened. (qontinui/qontinui-coord#2206, OPEN as this is written,
-gives the expired case its own `not_held` verdict on this door; `hb_row` already
-maps that word, so the LOOP needs no change when it deploys - though the
-discriminator above becomes the verdict word again, since #2206 also makes
-`current_holder` non-optional on `stolen`.)
+deciding which happened. That is the shape of a coord PREDATING
+qontinui/qontinui-coord#2206. #2206 landed 2026-09-17 and is deployed: a current
+coord answers the expired case `not_held` and makes `current_holder`
+non-optional on `stolen`, so there the verdict word IS the discriminator again.
+`hb_row` maps both spellings, so the LOOP reads either coord correctly.
 
 `status --ledger "$CLAIM_LEDGER"` prints one line per row and a
 verdict on its exit code: `LIVE` (0), `STALE` (3), `DEAD` (4), `STOLEN` (5),
@@ -1582,10 +1591,11 @@ agent does not need to heartbeat its own claim, and a phase running longer
 than 2 hours is no longer a special case. The loop replays the owner token
 on every request; a hand heartbeat must too, or it will not match: coord
 answers `stolen` and names your OWN machine and session as the holder, since
-you are still the stored owner, and the claim ages out unrenewed. That is not
-`not_held` - today the heartbeat door has no such verdict (it is the release
-door's word). An EXPIRED claim is `stolen` with `current_holder: null`, which
-the loop records `lapsed`.
+you are still the stored owner, and the claim ages out unrenewed. A token
+mismatch is never `not_held` on this door. An EXPIRED claim is: a current coord
+(qontinui/qontinui-coord#2206, deployed) answers `not_held`, while one predating
+#2206 answered `stolen` with `current_holder: null`. The loop records either as
+`lapsed`.
 
 **Read `status` at every phase boundary.** The loop can die — a killed pid, a
 box that slept. A single `stolen` or `lapsed` row no longer ends it: that row
@@ -1892,6 +1902,11 @@ agent prompt:
 > - **`Granted`** / **`claimed`** → you hold the reservation; proceed to author.
 >   (Reserve answers **exclusion only** now — there is no `forking_siblings`
 >   field to check here either; see the next bullet.)
+> - **`renewed`** → your owner token already held it and coord extended it —
+>   proceed to author, but whoever reserved it first owns the release. Over the
+>   MCP door the owner token is the DEVICE, so this also answers a second
+>   session on the same box; if you did not reserve this key earlier in THIS
+>   session, treat `renewed` as `held` by a same-box peer and coordinate.
 > - **`Held { holder }`** → another agent owns it. **Do NOT hand-pick a
 >   value.** Wait for release (poll `coord_claim_check`) or coordinate with
 >   the holder, then re-reserve.
