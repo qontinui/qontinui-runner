@@ -61,6 +61,7 @@ import { ResourceGuardDialog } from "./components/ResourceGuardDialog";
 import { AutoUpdateChecker } from "./components/AutoUpdateChecker";
 import { ConflictModal } from "./components/ConflictModal";
 import { StolenBanner } from "./components/StolenBanner";
+import { RendererMemoryWatchdogNotices } from "./components/RendererMemoryWatchdogNotices";
 import { IncomingHandoffToastBridge } from "./components/session/IncomingHandoffToastBridge";
 import { WebIntegrationAuthBanner } from "./components/WebIntegrationAuthBanner";
 import { ApprovalDialog } from "./components/dag-workflow-editor";
@@ -1003,6 +1004,14 @@ function AppContent() {
           */}
             <ConflictModal />
             <StolenBanner />
+            {/*
+              Plan 2026-06-09-runner-renderer-memory-watchdog-and-twin-slo
+              Phase 1 — the two surfaces the renderer-memory self-watchdog owes
+              its operator: §6 Q2's pre-reload countdown (announced, not
+              cancellable) and §6 Q3's persistent "restart recommended" banner.
+              Renders nothing until `renderer-memory-watchdog` fires.
+            */}
+            <RendererMemoryWatchdogNotices showToast={showToast} />
           </div>
         </div>
         {/*
