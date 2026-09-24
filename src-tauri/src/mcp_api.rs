@@ -4059,6 +4059,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_migration_queue",
     "coord_mute_gate",
     "coord_notify_sensitive_action",
+    "coord_operator_touch_classify",
     "coord_orient",
     "coord_post_finding",
     "coord_pr_status",
