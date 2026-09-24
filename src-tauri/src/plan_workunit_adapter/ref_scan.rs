@@ -285,7 +285,11 @@ pub struct RefListing {
     /// `false` when at least one listed `*.md` blob was skipped (unreadable,
     /// or not UTF-8). A short `files` is then NOT evidence that the skipped
     /// plans are absent from the ref — see
-    /// [`super::trigger::CycleScan::complete`], which this feeds.
+    /// [`super::trigger::CycleScan::complete`], which this feeds on the
+    /// work-unit half. On the document half, `scan_roots_at_source` turns it
+    /// into one `unreadable_file` skip per missing stem (or one root-level
+    /// `unreadable_entry` if no stem is missing), so the catch-up dry run
+    /// reports the gap instead of a short count with no explanation.
     ///
     /// It qualifies `files` ONLY. `names` is taken from the listing before a
     /// single blob is read, so the census stays whole across exactly the

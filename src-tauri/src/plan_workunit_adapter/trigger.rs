@@ -2516,6 +2516,7 @@ pub fn scan_roots_at_source(
                 .and_then(|sha| read_ref_dir_at(git, &repo_root, &ref_name, sha, &rel_dir))
             {
                 Ok(listing) => {
+                    record_ref_listing_gaps(root, &listing, &mut skipped);
                     artifacts.extend(super::body_push::scan_one_root_at_ref(
                         root,
                         &listing.files,
@@ -2528,6 +2529,10 @@ pub fn scan_roots_at_source(
                     // the very defect this arm removes, and it would republish
                     // the parked bytes under the same identity
                     // [policy: `unknown-must-not-render-as-a-default`].
+                    skipped.push(super::body_push::SkippedFile {
+                        path: root.dir.to_string_lossy().to_string(),
+                        reason: "unreadable_ref",
+                    });
                     tracing::warn!(
                         root = %root.label,
                         repo_root = %repo_root.display(),
@@ -2540,6 +2545,10 @@ pub fn scan_roots_at_source(
                 }
             },
             ScanSource::Unavailable { reason } => {
+                skipped.push(super::body_push::SkippedFile {
+                    path: root.dir.to_string_lossy().to_string(),
+                    reason: "scan_source_unavailable",
+                });
                 tracing::warn!(
                     root = %root.label,
                     dir = %root.dir.display(),
@@ -2551,6 +2560,48 @@ pub fn scan_roots_at_source(
         }
     }
     (artifacts, skipped)
+}
+
+/// Record what a ref listing could NOT read as `SkippedFile`s — the ref-arm
+/// twin of the work-tree arm's `unreadable_file` / `unreadable_entry` records
+/// in `body_push::scan_listing`.
+///
+/// [`super::ref_scan::read_ref_dir_at`] logs each blob it could not read and
+/// clears [`super::ref_scan::RefListing::complete`], but until this existed
+/// nothing consumed that flag and no skip was recorded — so a catch-up dry run
+/// over a ref-sourced root reported a PARTIAL scan as a whole one: the missing
+/// plan was absent from both the artifact count and the skipped list. Absence
+/// of a report is not a report of absence
+/// [policy: `unknown-must-not-render-as-a-default`].
+///
+/// Each stem the listing NAMED but did not return is recorded individually, at
+/// the path the work-tree walk would have recorded it at. A short `read_blobs`
+/// answer lands here too, because `names` is taken before any blob is read. An
+/// incomplete listing with no missing name (which `read_ref_dir_at` cannot
+/// produce today) is still recorded, at the root, so the flag can never be
+/// cleared without a trace.
+fn record_ref_listing_gaps(
+    root: &super::body_push::ScanRoot,
+    listing: &super::ref_scan::RefListing,
+    skipped: &mut Vec<super::body_push::SkippedFile>,
+) {
+    if listing.complete {
+        return;
+    }
+    let read: HashSet<&str> = listing.files.iter().map(|f| f.name.as_str()).collect();
+    let before = skipped.len();
+    for name in listing.names.iter().filter(|n| !read.contains(n.as_str())) {
+        skipped.push(super::body_push::SkippedFile {
+            path: root.dir.join(name).to_string_lossy().to_string(),
+            reason: "unreadable_file",
+        });
+    }
+    if skipped.len() == before {
+        skipped.push(super::body_push::SkippedFile {
+            path: root.dir.to_string_lossy().to_string(),
+            reason: "unreadable_entry",
+        });
+    }
 }
 
 /// Push every parsed unit through the edge-trigger + conflict logic, updating
@@ -6906,9 +6957,10 @@ mod tests {
         )
         .unwrap();
 
-        for (label, git) in [
+        for (label, reason, git) in [
             (
                 "fetch fails",
+                "scan_source_unavailable",
                 FakeGit {
                     root: Ok(Some(tmp.path().to_path_buf())),
                     fetch: Err("no route to host".into()),
@@ -6917,6 +6969,7 @@ mod tests {
             ),
             (
                 "no origin/HEAD",
+                "scan_source_unavailable",
                 FakeGit {
                     root: Ok(Some(tmp.path().to_path_buf())),
                     default_ref: Err("`origin/HEAD` is not set in this clone".into()),
@@ -6925,6 +6978,7 @@ mod tests {
             ),
             (
                 "listing unreadable",
+                "unreadable_ref",
                 FakeGit {
                     root: Ok(Some(tmp.path().to_path_buf())),
                     ref_dir: Err("bad object".into()),
@@ -6932,7 +6986,7 @@ mod tests {
                 },
             ),
         ] {
-            let (got, _) = scan_roots_at_source(
+            let (got, skipped) = scan_roots_at_source(
                 &[plans_root(tmp.path())],
                 &PlanConvention::operator_default(),
                 &git,
@@ -6942,7 +6996,100 @@ mod tests {
                 got.is_empty(),
                 "{label}: an unresolvable source must publish nothing, never the parked tree"
             );
+            // ...and the dry-run report SAYS the root contributed nothing,
+            // rather than rendering a root with zero plans and zero skips.
+            //
+            // Neuter check: drop either root-level `skipped.push` in
+            // `scan_roots_at_source` and the matching labels fail here.
+            assert_eq!(
+                skipped,
+                vec![super::super::body_push::SkippedFile {
+                    path: tmp.path().to_string_lossy().to_string(),
+                    reason,
+                }],
+                "{label}: a dark root must be RECORDED as skipped"
+            );
         }
+    }
+
+    /// A ref listing that could not read one blob publishes the rest AND
+    /// records the missing plan as skipped — the ref-arm twin of the tree
+    /// walk's `unreadable_file`. Before this, `RefListing::complete` was
+    /// dropped on the document half, so the catch-up dry run reported a
+    /// partial root as a whole one: the plan was absent from the count and
+    /// from the skipped list alike.
+    ///
+    /// Neuter check: make `record_ref_listing_gaps` return immediately and
+    /// this fails on the skipped list.
+    #[test]
+    fn a_partial_ref_listing_records_each_unread_plan_as_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "# A plan
+
+> **Status: DRAFT 2026-09-01.**
+
+Body.
+";
+        let git = FakeGit {
+            root: Ok(Some(tmp.path().to_path_buf())),
+            ref_dir: Ok(vec![
+                RefDirEntry {
+                    name: "2026-01-01-good.md".into(),
+                    id: "idg".into(),
+                },
+                RefDirEntry {
+                    name: "2026-01-02-bad.md".into(),
+                    id: "idb".into(),
+                },
+            ]),
+            blobs: [
+                ("idg".to_string(), Ok(body.to_string())),
+                ("idb".to_string(), Err("corrupt".to_string())),
+            ]
+            .into_iter()
+            .collect(),
+            ..FakeGit::healthy(0, 0)
+        };
+        let (got, skipped) = scan_roots_at_source(
+            &[plans_root(tmp.path())],
+            &PlanConvention::operator_default(),
+            &git,
+            &CycleRefPin::default(),
+        );
+        assert_eq!(got.len(), 1, "the readable plan is still published");
+        assert_eq!(
+            skipped,
+            vec![super::super::body_push::SkippedFile {
+                path: tmp
+                    .path()
+                    .join("2026-01-02-bad.md")
+                    .to_string_lossy()
+                    .to_string(),
+                reason: "unreadable_file",
+            }],
+            "the unread plan is named, at the path the tree walk would record"
+        );
+
+        // A WHOLE listing records nothing: the gap record is for gaps only.
+        let (whole, none) = scan_roots_at_source(
+            &[plans_root(tmp.path())],
+            &PlanConvention::operator_default(),
+            &FakeGit {
+                blobs: [
+                    ("idg".to_string(), Ok(body.to_string())),
+                    ("idb".to_string(), Ok(body.to_string())),
+                ]
+                .into_iter()
+                .collect(),
+                ..git
+            },
+            &CycleRefPin::default(),
+        );
+        assert_eq!(whole.len(), 2);
+        assert!(
+            none.is_empty(),
+            "a complete listing skips nothing: {none:?}"
+        );
     }
 
     /// The eviction POLICY, directly — the coverage that was lost when the
