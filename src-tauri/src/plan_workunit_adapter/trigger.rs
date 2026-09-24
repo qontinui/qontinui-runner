@@ -7009,6 +7009,13 @@ mod tests {
                 }],
                 "{label}: a dark root must be RECORDED as skipped"
             );
+            // ...and the catch-up CLI's by-root table can tell it from an
+            // empty root, which is what it keys the UNKNOWN rendering on.
+            assert_eq!(
+                super::super::body_push::root_dark_reason(tmp.path(), &skipped),
+                Some(reason),
+                "{label}: the root-level record is what marks the root dark"
+            );
         }
     }
 
@@ -7068,6 +7075,14 @@ Body.
                 reason: "unreadable_file",
             }],
             "the unread plan is named, at the path the tree walk would record"
+        );
+        assert_eq!(
+            super::super::body_push::RootYield::of(tmp.path(), got.len(), &skipped),
+            super::super::body_push::RootYield::Partial {
+                read: 1,
+                unreadable: 1
+            },
+            "a partial root was READ in part: its count is a floor, not UNKNOWN"
         );
 
         // A WHOLE listing records nothing: the gap record is for gaps only.
