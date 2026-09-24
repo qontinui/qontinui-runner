@@ -668,6 +668,13 @@ impl ProcessFailureKind {
 ///   `2026-08-19-runner-blocked-ui-thread-cannot-be-closed` Phase 4. **Detect
 ///   and surface only**: see [`plan_action`] for why no action can help, and
 ///   [`report_native_ui_thread_hang`] for the surface it does use.
+/// * [`RecoveryReason::RendererMemoryPressure`] — the renderer-memory
+///   self-watchdog (`crate::renderer_watchdog`), plan
+///   `2026-06-09-runner-renderer-memory-watchdog-and-twin-slo` Phase 1. The
+///   one reason raised **before** anything has failed: the renderer is alive
+///   and the browser process is healthy, so this starts on the cheap
+///   [`RecoveryAction::Reload`] rung, which is exactly the tear-down-the-
+///   document reclaim the watchdog wants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryReason {
@@ -675,6 +682,7 @@ pub enum RecoveryReason {
     HeartbeatStale,
     Manual,
     NativeUiThreadHung,
+    RendererMemoryPressure,
 }
 
 impl RecoveryReason {
@@ -684,6 +692,7 @@ impl RecoveryReason {
             Self::HeartbeatStale => "heartbeat_stale",
             Self::Manual => "manual",
             Self::NativeUiThreadHung => "native_ui_thread_hung",
+            Self::RendererMemoryPressure => "renderer_memory_pressure",
         }
     }
 }
@@ -769,8 +778,15 @@ pub fn plan_action(reason: RecoveryReason, attempt: u32) -> RecoveryAction {
         // detection, because exiting destroys every in-flight session — 102 of
         // them in the originating incident.
         RecoveryReason::NativeUiThreadHung => RecoveryAction::None,
-        // Renderer death, an unresponsive renderer, a stale heartbeat, or an
-        // operator poke: try the cheap rung first, escalate if asked again.
+        // Renderer death, an unresponsive renderer, a stale heartbeat, an
+        // operator poke, or the memory watchdog acting BEFORE a death: try the
+        // cheap rung first, escalate if asked again.
+        //
+        // `RendererMemoryPressure` belongs here rather than beside
+        // `BrowserExited`: the browser process is alive, and the reload rung —
+        // a native `ICoreWebView2::Reload()` that tears the document down — is
+        // precisely the reclaim the watchdog is asking for. A recreate would
+        // work too but costs a window rebuild, so it stays the escalation.
         _ => {
             if attempt == 0 {
                 RecoveryAction::Reload
@@ -3542,6 +3558,7 @@ mod tests {
                 RecoveryReason::HeartbeatStale,
                 RecoveryReason::Manual,
                 RecoveryReason::NativeUiThreadHung,
+                RecoveryReason::RendererMemoryPressure,
             ])
             .collect();
         for reason in all {
