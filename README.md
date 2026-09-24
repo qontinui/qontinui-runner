@@ -310,7 +310,7 @@ working coord credential — that is the point, since it exists to answer *why
 you have no working credential*:
 
 ```bash
-curl -s http://127.0.0.1:9876/coord-mcp/doctor -H "X-Coord-Mcp-Proxy-Key: $(cat ~/.qontinui/live-proxy-key)"
+curl -s http://127.0.0.1:9876/coord-mcp/doctor
 ```
 
 It reports, without ever printing a token: which tenant the proxy would select
@@ -324,11 +324,33 @@ The workspace tiers are **per-workspace** and this door is **process-level**,
 so pass one:
 
 ```bash
-# by path
-curl -s "http://127.0.0.1:9876/coord-mcp/doctor?workdir=D:/portofino-pizzeria" -H "X-Coord-Mcp-Proxy-Key: $(cat ~/.qontinui/live-proxy-key)"
-# or by session nonce, which cannot disagree with the proxy about your workspace
-curl -s "http://127.0.0.1:9876/coord-mcp/doctor?nonce=<your session nonce>" -H "X-Coord-Mcp-Proxy-Key: $(cat ~/.qontinui/live-proxy-key)"
+# by path: what a NEW session opened there would resolve to
+curl -s "http://127.0.0.1:9876/coord-mcp/doctor?workdir=D:/portofino-pizzeria"
+# or as YOUR session: present your own proxy nonce the way the proxy reads it —
+# in the Authorization header, taken from your session's .mcp.json (or, when
+# that file launches the stdio shim, from the credential file it names) and fed
+# to curl on stdin (-H @-), so it never lands in a URL, your shell history or argv
+CRED=$(jq -r '.mcpServers["coord-mcp"] | if .type == "stdio" then .args[2] else empty end' .mcp.json)
+H=$(jq -er '(.mcpServers["coord-mcp"].headers // .headers)
+  | "Authorization: " + (.Authorization
+      // (if .["X-Coord-Mcp-Proxy-Key"] then "Bearer " + .["X-Coord-Mcp-Proxy-Key"]
+          else error("no coord-mcp nonce") end))' "${CRED:-.mcp.json}") \
+  && printf '%s\n' "$H" | curl -s -H @- http://127.0.0.1:9876/coord-mcp/doctor
 ```
+
+If no nonce can be found the recipe sends nothing rather than silently asking
+the machine-level question. A key the runner does not recognise is answered
+`verdict: refuses` at the `runner-nonce` layer, exactly as the proxy answers it.
+
+The session form reports what the proxy does for the key you PRESENT: it
+applies that session's frozen binding pin (row 1 below), which a `?workdir=`
+read cannot know about, and for an agent session it reports the agent's own
+token rather than a device credential. It describes the key you send, so send
+the one your session actually uses — a session launched with `--mcp-config
+<file>` presents the key in THAT file, not in the directory's `.mcp.json`
+(pass that path instead of `.mcp.json` above). The nonce is a credential, so the door **refuses** it as a
+URL query parameter (`400 nonce_in_query_refused`), and refuses a request that
+names both a workdir and a nonce rather than picking one.
 
 With **no** workspace supplied, `credential.workspace_declaration` reports
 `"status": "not-evaluated"` and `"evaluated": false`. That is **UNKNOWN — the
