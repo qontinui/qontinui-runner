@@ -431,7 +431,7 @@ deployment predates it. Only a curl that fails to **connect** leaves the
 deployment in question, and then the verdict is **UNKNOWN**, never "coord is
 down". Whatever you conclude, name both probes in the rung-3 line of your
 report — and never let a rung-3 failure be reported as a policy answer. The
-stamped form of that line is `bash .claude/skills/coord-revive/coord-revive.sh --floor-claim`:
+stamped form of that line is `bash <workspace-root>/qontinui-claude-config/.claude/skills/coord-revive/coord-revive.sh --floor-claim`:
 it runs this same probe as one door of its cascade and prints a `FLOOR-CLAIM:`
 block (probe time, runner build, this box's load, one line per door) — paste
 that block; a `verdict=UNKNOWN` there (sampled under own load) means the
@@ -1198,10 +1198,14 @@ exist" are searches, and a cascade of probes is a sample:
 <!-- detector-reach-fence:start -->
 > **A capability negative cites a CENSUS, never a probe.** Before recording
 > "no door", "agents cannot", "this route does not exist" or any other claim
-> that a capability is ABSENT, run `bash scripts/coord-route-census.sh
-> <fragment>` (qontinui-claude-config; reads `origin/main` of BOTH
-> `qontinui-coord` and `qontinui-web`, never a working tree and never a live
-> host) and paste its trailer verbatim beside the claim:
+> that a capability is ABSENT, run
+> `bash <workspace-root>/qontinui-claude-config/scripts/coord-route-census.sh <fragment>`
+> — spelled absolutely, because a bare `scripts/...` resolves only from a
+> checkout of `qontinui-claude-config`, and a session standing anywhere else
+> gets exit 127
+> (it reads `origin/main` of BOTH `qontinui-coord` and `qontinui-web`, never
+> a working tree and never a live host) — and paste its trailer verbatim
+> beside the claim:
 > `census: fragment=<f> hosts_read=coord.qontinui.io,api.qontinui.io ref=<sha>,<sha> routes=<n> unextracted=<n> unmounted=<n> generated=<ISO time>`
 > — the line that parses under `CENSUS_TRAILER_RE` in
 > `scripts/detector_reach/__init__.py`. A 401, 404 or 405 on ONE spelling of
