@@ -53,7 +53,13 @@ export GIT_CONFIG_KEY_1=user.email GIT_CONFIG_VALUE_1=census-test@example.invali
 export RECOVERY_CENSUS_NO_MINT=0 HOME="$SANDBOX/home" USERPROFILE="$SANDBOX/home"
 unset COORD_DEVICE_JWT QONTINUI_MACHINE_ID COORD_HTTP_URL QONTINUI_TENANT_ID
 mkdir -p "$HOME"
-PY="$(command -v python3 || command -v python)"
+# Resolved by RUNNING it: on Windows `python3` is often the Store alias,
+# present on PATH and unable to run.
+PY=""
+for _c in python3 python; do
+  "$_c" -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1 && { PY="$(command -v "$_c")"; break; }
+done
+[ -n "$PY" ] || { echo "FATAL: no runnable Python 3 (python3 or python)"; exit 1; }
 DEV="11111111-2222-4333-8444-555555555555"
 
 # --- the curl stub -----------------------------------------------------------
@@ -259,6 +265,7 @@ REF="$(mkrepo "$WS" h1)"
 fixture "$STUB_DIR" "$DEV:h1:$REF" "[$(row "$DEV:h1:$REF" open run_skill null)]"
 run "$WS"
 eq "H1 the owning tenant's gate is found: exit 0" 0 "$RC"
+[ "$RC" = 0 ] || printf '       reasons: %s\n' "$(printf '%s' "$OUT" | "$PY" -c 'import json,sys; print([r.get("reason") for r in json.load(sys.stdin).get("refs",[])])' 2>&1 | cut -c1-1500)"
 eq "H2 the gates were read under the OWNING tenant's token" "$TA" "$(sort -u "$STUB_DIR/gates-claims.log")"
 has "H3 the ref names the tenant it was looked up in" "\"tenant_id\":\"$TA\"" "$OUT"
 # A coord that ignores tenant_id hands back the pointer tenant's token, whose

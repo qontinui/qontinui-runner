@@ -160,6 +160,8 @@ PY=""
 for c in python3 python; do
   command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1 && { PY="$c"; break; }
 done
+# The tenant library runs the same interpreter this script proved runs.
+[ -n "$PY" ] && export CTC_PY="$PY"
 
 # ---------------------------------------------------------------------------
 # The refs.

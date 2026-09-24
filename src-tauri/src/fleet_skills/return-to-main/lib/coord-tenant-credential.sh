@@ -54,12 +54,15 @@
 
 # The Python 3 every helper below runs: $CTC_PY, else `python3`, else a Python 3
 # spelled `python` (Git Bash on Windows ships only that spelling).
+# Resolved by RUNNING it, not by `command -v`: on Windows a `python3` on PATH
+# is often the Store alias, which exists and does not run. One start, at load.
 if [ -z "${CTC_PY:-}" ]; then
-  if command -v python3 >/dev/null 2>&1; then
-    CTC_PY=python3
-  elif command -v python >/dev/null 2>&1 && python -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1; then
-    CTC_PY=python
-  fi
+  for _ctc_c in python3 python; do
+    if "$_ctc_c" -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1; then
+      CTC_PY="$_ctc_c"; break
+    fi
+  done
+  unset _ctc_c
 fi
 
 ctc_is_uuid() {
