@@ -150,6 +150,27 @@ describe("useZoneLayout — closing a flow-grid terminal hides no other terminal
     expect(drawnNowhere(r, tabIds)).toEqual([]);
   });
 
+  it("re-applying flow-grid after a close moves no tile", () => {
+    // `/layout flow-grid`, a profile load and a quick or AI launch all call
+    // `setLayoutId(FLOW_GRID_ID)` while already in flow mode. Sized by the
+    // bare tab count (9), that compacted t9 into the hole at zone 3, so it
+    // would wear zone 3's label, notes and pin.
+    const before = ids(10);
+    const render = mount(FLOW_GRID_ID, before, dense(before));
+    render();
+    const after = without(before, "t3");
+    render(after).setFocusedZone(9);
+
+    render().setLayoutId(FLOW_GRID_ID);
+    const r = render();
+    const expected = dense(before);
+    delete expected[3];
+    expect(r.assignments).toStrictEqual(expected);
+    expect(r.layout.zones).toHaveLength(10);
+    // Zone 9 is still rendered, so focus on it is not clamped away.
+    expect(r.focusedZone).toBe(9);
+  });
+
   it("preset layouts are unchanged: a close leaves its zone empty and the size fixed", () => {
     const before = ["a", "b", "c", "d"];
     const render = mount("quad", before, dense(before));

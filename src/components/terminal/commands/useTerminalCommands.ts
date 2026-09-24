@@ -1025,7 +1025,8 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       // the id: it clears the maximized zone, re-flows unassigned tabs into
       // empty zones (`applyLayoutAssignments`), and clamps the focused zone.
       // So re-applying the CURRENT preset is a real operation — it is how an
-      // operator un-maximizes and re-packs the grid — and short-circuiting it
+      // operator un-maximizes and places unassigned tabs (an assigned tab never
+      // moves, since zone metadata is keyed by index) — and short-circuiting it
       // on `layoutId` equality would have silently deleted that, including
       // for `ZoneLayoutPicker`, which routes its clicks through this handler.
       // What was dishonest was never the call; it was reporting the same `✓`
