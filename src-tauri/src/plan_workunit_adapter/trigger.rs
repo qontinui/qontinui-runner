@@ -46,8 +46,8 @@ use super::push::{
     push_archive_metadata, push_work_unit, push_work_unit_with_remote,
     push_work_unit_with_status_write, PushOutcomeKind, SetDepsOutcome, StatusWrite, WorkUnitSink,
 };
-use crate::auth::TenantScope;
 use super::ref_scan::CycleRefPin;
+use crate::auth::TenantScope;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -10596,6 +10596,7 @@ Body.
                 &mut forb_deps,
                 &sink,
                 &metrics,
+                TenantScope::Unresolved,
             )
             .await;
         }
@@ -12467,7 +12468,7 @@ Body.
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
-        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb = RetiredSlugs::default();
         let units = vec![
             unit_with_deps("a", "vetted", vec!["dep-1".to_string()]),
             unit_with_deps("b", "in_progress", vec!["dep-2".to_string()]),
@@ -12705,7 +12706,12 @@ Body.
             .lock()
             .unwrap()
             .insert("a".to_string(), "ready".to_string());
-        let s = backfill_work_units_once(&[unit("a", "shipped"), unit("b", "draft")], &sink).await;
+        let s = backfill_work_units_once(
+            &[unit("a", "shipped"), unit("b", "draft")],
+            &sink,
+            TenantScope::Unresolved,
+        )
+        .await;
         assert_eq!(s.refused_permanently, 1, "the derived stamp was refused");
         assert_eq!(s.failed, 0, "...and that is not a failure");
         assert_eq!(s.created, 1, "the next unit still landed");
@@ -12732,7 +12738,12 @@ Body.
             upsert_write_body: Some(SYNTHETIC_PERMANENT.to_string()),
             ..Default::default()
         };
-        let s = backfill_work_units_once(&[unit("c", "vetted")], &upsert_refused).await;
+        let s = backfill_work_units_once(
+            &[unit("c", "vetted")],
+            &upsert_refused,
+            TenantScope::Unresolved,
+        )
+        .await;
         assert_eq!(s.failed, 1, "a refused upsert landed nothing: a failure");
         assert_eq!(s.refused_permanently, 0);
     }

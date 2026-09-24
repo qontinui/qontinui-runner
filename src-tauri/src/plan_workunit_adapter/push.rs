@@ -632,12 +632,12 @@ pub trait WorkUnitSink: Send + Sync {
 ///
 /// `last_applied` is the status this adapter last applied for `u.slug` (its
 /// client-side memory). Returns the [`PushOutcome`]; the caller updates its
-    /// last-applied memory from [`PushOutcome::applied_status`] — **never** from
-    /// `u.status`, which may have been withdrawn from the wire.
-    ///
-    /// `scope` is the tenant that owns the unit, resolved by the caller from the
-    /// plan's repo. It is threaded in rather than derived here so this function
-    /// stays pure of IO beyond the sink — the property its fake-sink tests rest on.
+/// last-applied memory from [`PushOutcome::applied_status`] — **never** from
+/// `u.status`, which may have been withdrawn from the wire.
+///
+/// `scope` is the tenant that owns the unit, resolved by the caller from the
+/// plan's repo. It is threaded in rather than derived here so this function
+/// stays pure of IO beyond the sink — the property its fake-sink tests rest on.
 pub async fn push_work_unit<S: WorkUnitSink + ?Sized>(
     sink: &S,
     u: &ParsedWorkUnit,
@@ -892,21 +892,21 @@ pub async fn push_work_unit_with_status_write<S: WorkUnitSink + ?Sized>(
 
     let (kind, applied_status) = match &action {
         PushAction::UpsertWithStatus => {
-                // `None` for a coord-DERIVED status — see [`settable_status`].
-                // The write degrades to the metadata-only shape rather than
-                // being 422'd whole.
-                let sent = settable_status(&u.status);
-                sink.upsert(
-                    &UpsertBody {
-                        slug: u.slug.clone(),
-                        title: u.title.clone(),
-                        status: sent.clone(),
-                        metadata: Some(metadata),
-                        by_actor: Some(ADAPTER_ACTOR.to_string()),
-                        authored_at,
-                    },
-                    scope,
-                )
+            // `None` for a coord-DERIVED status — see [`settable_status`].
+            // The write degrades to the metadata-only shape rather than
+            // being 422'd whole.
+            let sent = settable_status(&u.status);
+            sink.upsert(
+                &UpsertBody {
+                    slug: u.slug.clone(),
+                    title: u.title.clone(),
+                    status: sent.clone(),
+                    metadata: Some(metadata),
+                    by_actor: Some(ADAPTER_ACTOR.to_string()),
+                    authored_at,
+                },
+                scope,
+            )
             .await?;
             // Exactly what went on the wire: `None` when the status was
             // withdrawn, so the caller records no status it did not apply.
@@ -1092,20 +1092,20 @@ pub async fn push_archive_metadata<S: WorkUnitSink + ?Sized>(
     u: &ParsedWorkUnit,
     scope: TenantScope,
 ) -> Result<()> {
-        sink.upsert(
-            &UpsertBody {
-                slug: u.slug.clone(),
-                title: u.title.clone(),
-                // NEVER a status write from the archive scan (D4).
-                status: None,
-                metadata: Some(archive_metadata(u)),
-                by_actor: Some(ADAPTER_ACTOR.to_string()),
-                // Harmless under coord's COALESCE, and it means a plan that only ever
-                // exists in the archive still gets dated.
-                authored_at: authored_at_from_stem(&u.slug),
-            },
-            scope,
-        )
+    sink.upsert(
+        &UpsertBody {
+            slug: u.slug.clone(),
+            title: u.title.clone(),
+            // NEVER a status write from the archive scan (D4).
+            status: None,
+            metadata: Some(archive_metadata(u)),
+            by_actor: Some(ADAPTER_ACTOR.to_string()),
+            // Harmless under coord's COALESCE, and it means a plan that only ever
+            // exists in the archive still gets dated.
+            authored_at: authored_at_from_stem(&u.slug),
+        },
+        scope,
+    )
     .await
 }
 
@@ -1702,9 +1702,13 @@ mod tests {
             area: Some("ci-runners".to_string()),
             ..unit("2026-01-01-archived", "shipped")
         };
-        push_archive_metadata(&sink, &u).await.unwrap();
+        push_archive_metadata(&sink, &u, TenantScope::Unresolved)
+            .await
+            .unwrap();
         let none = unit("2026-01-01-archived-2", "shipped");
-        push_archive_metadata(&sink, &none).await.unwrap();
+        push_archive_metadata(&sink, &none, TenantScope::Unresolved)
+            .await
+            .unwrap();
 
         let ups = sink.upserts.lock().unwrap();
         let first = ups[0].metadata.as_ref().unwrap();
@@ -1737,7 +1741,9 @@ mod tests {
         for derived in ["shipped", "ready"] {
             let sink = FakeSink::default();
             let u = unit("2026-01-01-p", derived);
-            let out = push_work_unit(&sink, &u, None).await.unwrap();
+            let out = push_work_unit(&sink, &u, None, TenantScope::Unresolved)
+                .await
+                .unwrap();
             // ...and the push REPORTS that it applied nothing, which is what
             // stops the caller recording a word coord was never sent.
             assert_eq!(
@@ -1776,9 +1782,14 @@ mod tests {
         // A settable status is untouched — the filter is two words wide, not a
         // blanket status suppression.
         let sink = FakeSink::default();
-        push_work_unit(&sink, &unit("2026-01-02-q", "vetted"), None)
-            .await
-            .unwrap();
+        push_work_unit(
+            &sink,
+            &unit("2026-01-02-q", "vetted"),
+            None,
+            TenantScope::Unresolved,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             sink.upserts.lock().unwrap()[0].status,
             Some("vetted".to_string()),
@@ -1797,15 +1808,25 @@ mod tests {
     #[tokio::test]
     async fn applied_status_is_what_went_on_the_wire_never_what_was_parsed() {
         let settable = FakeSink::default();
-        let out = push_work_unit(&settable, &unit("s", "vetted"), None)
-            .await
-            .unwrap();
+        let out = push_work_unit(
+            &settable,
+            &unit("s", "vetted"),
+            None,
+            TenantScope::Unresolved,
+        )
+        .await
+        .unwrap();
         assert_eq!(out.applied_status.as_deref(), Some("vetted"));
 
         let withdrawn = FakeSink::default();
-        let out = push_work_unit(&withdrawn, &unit("s", "shipped"), None)
-            .await
-            .unwrap();
+        let out = push_work_unit(
+            &withdrawn,
+            &unit("s", "shipped"),
+            None,
+            TenantScope::Unresolved,
+        )
+        .await
+        .unwrap();
         assert_eq!(out.kind, PushOutcomeKind::Created, "the upsert SUCCEEDS...");
         assert_eq!(
             out.applied_status, None,
@@ -1818,9 +1839,14 @@ mod tests {
             remote: Some("vetted".to_string()),
             ..Default::default()
         };
-        let out = push_work_unit(&edge, &unit("s", "shipped"), Some("vetted"))
-            .await
-            .unwrap();
+        let out = push_work_unit(
+            &edge,
+            &unit("s", "shipped"),
+            Some("vetted"),
+            TenantScope::Unresolved,
+        )
+        .await
+        .unwrap();
         assert_eq!(out.applied_status.as_deref(), Some("shipped"));
 
         // A deferral wrote nothing at all.
@@ -1829,9 +1855,14 @@ mod tests {
             last_actor: Some("device:d:agent:a".to_string()),
             ..Default::default()
         };
-        let out = push_work_unit(&deferred, &unit("s", "in_progress"), Some("vetted"))
-            .await
-            .unwrap();
+        let out = push_work_unit(
+            &deferred,
+            &unit("s", "in_progress"),
+            Some("vetted"),
+            TenantScope::Unresolved,
+        )
+        .await
+        .unwrap();
         assert!(matches!(out.kind, PushOutcomeKind::Deferred { .. }));
         assert_eq!(out.applied_status, None);
     }
@@ -1849,9 +1880,14 @@ mod tests {
             remote: Some("in_progress".to_string()),
             ..Default::default()
         };
-        let out = push_work_unit(&sink, &unit("s", "shipped"), Some("shipped"))
-            .await
-            .unwrap();
+        let out = push_work_unit(
+            &sink,
+            &unit("s", "shipped"),
+            Some("shipped"),
+            TenantScope::Unresolved,
+        )
+        .await
+        .unwrap();
         assert_eq!(out.kind, PushOutcomeKind::Refreshed);
         assert!(!out.conflict, "the adapter withdrew from this race");
         assert_eq!(
@@ -1866,9 +1902,14 @@ mod tests {
             remote: Some("in_progress".to_string()),
             ..Default::default()
         };
-        let out = push_work_unit(&settable, &unit("s", "vetted"), Some("vetted"))
-            .await
-            .unwrap();
+        let out = push_work_unit(
+            &settable,
+            &unit("s", "vetted"),
+            Some("vetted"),
+            TenantScope::Unresolved,
+        )
+        .await
+        .unwrap();
         assert!(
             out.conflict,
             "a real divergence on a word we DO write still surfaces"
@@ -1916,9 +1957,14 @@ mod tests {
             remote: Some("vetted".to_string()),
             ..Default::default()
         };
-        let out = push_work_unit(&sink, &unit("2026-01-03-r", "shipped"), Some("vetted"))
-            .await
-            .unwrap();
+        let out = push_work_unit(
+            &sink,
+            &unit("2026-01-03-r", "shipped"),
+            Some("vetted"),
+            TenantScope::Unresolved,
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(out.kind, PushOutcomeKind::Transitioned { .. }));
         let trs = sink.transitions.lock().unwrap();
@@ -2434,9 +2480,14 @@ mod tests {
             remote: Some("in_progress".to_string()),
             ..Default::default()
         };
-        let out = push_work_unit(&sink, &unit("s", "vetted"), Some("vetted"))
-            .await
-            .unwrap();
+        let out = push_work_unit(
+            &sink,
+            &unit("s", "vetted"),
+            Some("vetted"),
+            TenantScope::Unresolved,
+        )
+        .await
+        .unwrap();
         assert!(out.conflict, "the remote diverged from last-applied");
         assert_eq!(
             out.kind,
@@ -2473,9 +2524,14 @@ mod tests {
             remote: None,
             ..Default::default()
         };
-        let out = push_work_unit(&sink, &unit("s", "vetted"), Some("vetted"))
-            .await
-            .unwrap();
+        let out = push_work_unit(
+            &sink,
+            &unit("s", "vetted"),
+            Some("vetted"),
+            TenantScope::Unresolved,
+        )
+        .await
+        .unwrap();
         assert_eq!(out.kind, PushOutcomeKind::Refreshed);
         assert!(!out.conflict, "an absent row is not a divergence");
         assert_eq!(
