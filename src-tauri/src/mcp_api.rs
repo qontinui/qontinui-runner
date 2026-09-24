@@ -4287,6 +4287,46 @@ async fn coord_mcp_doctor_handler() -> Json<serde_json::Value> {
     Json(report)
 }
 
+/// `GET /coord-mcp/terminal-status?ids=<comma-separated terminal ids>` — the
+/// Terminal page's title-bar dot, one light per open terminal. See
+/// `coord_mcp::terminal_status` for what green/yellow/red each mean; this
+/// handler is a thin JSON wrapper with no policy of its own.
+///
+/// Missing or empty `ids` answers an empty map rather than erroring — the
+/// frontend polls this once per open terminal set, and an empty set (no
+/// terminals mounted yet) is a legitimate poll, not a caller mistake.
+///
+/// No percent-decoding: terminal ids are runner-generated (uuid-shaped), so
+/// a raw comma split is exact and avoids pulling in a decoding dependency
+/// for input that is never operator-typed.
+async fn coord_mcp_terminal_status_handler(
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+) -> Json<serde_json::Value> {
+    let ids: Vec<String> = raw_query
+        .as_deref()
+        .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("ids=")))
+        .map(|raw| {
+            raw.split(',')
+                .map(|id| id.trim().to_string())
+                .filter(|id| !id.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let statuses = tokio::task::spawn_blocking(move || {
+        ids.into_iter()
+            .map(|id| {
+                let status = crate::coord_mcp::terminal_status::for_terminal(&id);
+                (id, status)
+            })
+            .collect::<std::collections::HashMap<String, crate::coord_mcp::terminal_status::TerminalCoordStatus>>()
+    })
+    .await
+    .unwrap_or_default();
+
+    Json(serde_json::json!({ "statuses": statuses }))
+}
+
 /// Is this request body a `tools/list` (single or anywhere in a batch)?
 ///
 /// Deliberately permissive about the batch case: only a `tools/list` response
@@ -10897,6 +10937,15 @@ pub fn create_router(
         // a derived `kid` / `exp` / usability bit. A `kid` is a public key
         // identifier that coord itself publishes in its JWKS.
         .route("/coord-mcp/doctor", get(coord_mcp_doctor_handler))
+        // Per-terminal coord-mcp light for the Terminal page's title-bar dot
+        // (green/yellow/red). Same unauthenticated posture as `.../doctor`
+        // immediately above, and for the same reason: it discloses no
+        // secret, only a derived verdict, and it exists precisely to answer
+        // a terminal whose credential may be dead.
+        .route(
+            "/coord-mcp/terminal-status",
+            get(coord_mcp_terminal_status_handler),
+        )
         // Session coord-identity MINT route (plan
         // 2026-07-17-universal-coord-device-identity-for-any-session §1) — how a
         // session the runner did NOT spawn (a bare terminal, a cron-fired agent)

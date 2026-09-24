@@ -9,6 +9,8 @@ import { TenantBadge } from "../TenantBadge";
 import { RemoteTabControls } from "../RemoteTabControls";
 import { useTerminalWindowActions } from "../useTerminalWindowActions";
 import { SessionInfoDropdown } from "../SessionInfoDropdown";
+import { CoordAvailabilityDot } from "../CoordAvailabilityDot";
+import type { TerminalCoordStatus } from "../useCoordTerminalStatus";
 
 /**
  * UI Bridge registration spec for a zone header (boot-restore remediation
@@ -58,6 +60,7 @@ export function ZoneLabel({
   filterActive,
   onTogglePrompts,
   promptsVisible,
+  coordStatus,
 }: {
   tab: TerminalTab;
   state: SessionState;
@@ -78,6 +81,9 @@ export function ZoneLabel({
   /** Omitted when the tab has no Claude session — there are no prompts to show. */
   onTogglePrompts?: () => void;
   promptsVisible?: boolean;
+  /** Undefined for a plain (non-Claude) tab — {@link CoordAvailabilityDot}
+   *  renders nothing in that case rather than a misleading red dot. */
+  coordStatus?: TerminalCoordStatus;
 }) {
   const [showSelector, setShowSelector] = useState(false);
   const [editingLabel, setEditingLabel] = useState(false);
@@ -144,6 +150,11 @@ export function ZoneLabel({
         }`}
         style={{ backgroundColor: STATE_BORDER_COLORS[state] }}
       />
+      {/* Coord-mcp availability — green/yellow/red per terminal, since two
+          terminals can be bound to different tenants and disagree about
+          whether coord is reachable at all. Self-hides on a plain (non-Claude)
+          tab, which never gets a proxy nonce in the first place. */}
+      <CoordAvailabilityDot status={coordStatus} />
       <span className="text-[10px] text-[#a9b1d6] truncate font-medium">{tab.title}</span>
 
       {/* Honesty label (Phase 5): interactive PTY shells are non-durable — a

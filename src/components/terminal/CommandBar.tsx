@@ -242,6 +242,14 @@ function useRotatingPlaceholder(): string {
 export function CommandBar() {
   const [query, setQuery] = useState("");
   const [focused, setFocused] = useState(false);
+  // Set on an actual blur, cleared on focus or on any further typing.
+  // `dropdownVisible` below ORs `focused` with "has query text" so an
+  // external driver that sets the value without a native focus event can
+  // still open the dropdown — but that OR also meant a real blur could
+  // never close it once the input held text. This flag lets blur win
+  // while leaving the external-driver path (which re-fires `handleChange`
+  // and clears it) untouched.
+  const [dismissedAfterBlur, setDismissedAfterBlur] = useState(false);
   const [selectedIdx, setSelectedIdx] = useState(0);
   /** Previous `query`, so the selection can be reset the moment the
    *  query changes — see the derived-state block below `matches`. */
@@ -702,6 +710,10 @@ export function CommandBar() {
   const handleChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     setQuery(e.target.value);
     setHistoryIdx(-1);
+    // Fresh input activity re-arms the dropdown even if a prior blur
+    // dismissed it — this is also the path an external driver's
+    // value-set-without-focus takes, so it must stay open on that path.
+    setDismissedAfterBlur(false);
   }, []);
 
   const handleSuggestionClick = useCallback(
@@ -744,6 +756,9 @@ export function CommandBar() {
     }
     blurTimerRef.current = window.setTimeout(() => {
       setFocused(false);
+      // The CLI was deselected — close the popup even if `query` still
+      // holds text (a typed-but-not-executed command left in the box).
+      setDismissedAfterBlur(true);
       blurTimerRef.current = null;
     }, 120);
   }, []);
@@ -754,6 +769,7 @@ export function CommandBar() {
       blurTimerRef.current = null;
     }
     setFocused(true);
+    setDismissedAfterBlur(false);
   }, []);
 
   // ── Focus tracked from the INPUT's own events, not React's synthetic
@@ -782,7 +798,14 @@ export function CommandBar() {
   // query content makes match-surfacing correct regardless of how input
   // arrives, and removes the `dispatchEvent(FocusEvent('focus'))`
   // workaround from on-page slash tests.
-  const dropdownVisible = (focused || query.trim().length > 0) && matches.length >= 0;
+  //
+  // `!dismissedAfterBlur` is what lets an actual blur win: without it, a
+  // query left in the box (typed but not executed) kept the popup open
+  // permanently once the CLI was deselected, since the two clauses were a
+  // plain OR. Typing again (real or driven) clears the flag in
+  // `handleChange`, so the external-driver case above is unaffected.
+  const dropdownVisible =
+    (focused || (query.trim().length > 0 && !dismissedAfterBlur)) && matches.length >= 0;
 
   /**
    * Whether a LISTBOX is actually on screen — which is not the same thing as

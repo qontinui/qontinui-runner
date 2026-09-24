@@ -65,6 +65,7 @@ import {
 } from "./flowScrollRouting";
 import { writeToTerminalById } from "./writeToTerminalById";
 import { useTabHotSlice } from "./useTerminalHotStore";
+import { useCoordTerminalStatus, type TerminalCoordStatus } from "./useCoordTerminalStatus";
 
 export type ViewMode = "auto" | "full" | "compact";
 
@@ -273,6 +274,10 @@ function ZoneGridInner({
   const onFirstInput = shellIntegration.handleFirstInput;
   const onShellIntegration = shellIntegration.handleShellIntegration;
   const commandHistories = shellIntegration.commandHistories;
+  // Per-tab coord-mcp availability (green/yellow/red title-bar dot). Same
+  // shape as `commandHistories` above: a hook whose polling lives here so
+  // `ZoneCell` stays a pure-props renderer.
+  const coordStatusByTabId = useCoordTerminalStatus(tabs);
   const { state: uiState } = useUIStateCx();
   const viewMode = uiState.viewMode;
   const selectedZones = uiState.selectedZones;
@@ -774,6 +779,7 @@ function ZoneGridInner({
           zoneTags={zoneTags}
           activeTagFilters={activeTagFilters}
           commandHistories={commandHistories}
+          coordStatusByTabId={coordStatusByTabId}
           focusMode={focusMode}
           zoneNotes={zoneNotes}
           onSetZoneNote={onSetZoneNote}
@@ -994,6 +1000,7 @@ function ZoneCellInner({
   zoneTags,
   activeTagFilters,
   commandHistories,
+  coordStatusByTabId,
   focusMode,
   zoneNotes,
   onSetZoneNote,
@@ -1069,6 +1076,8 @@ function ZoneCellInner({
    */
   activeTagFilters?: Set<string>;
   commandHistories?: Record<string, { command: string; exitCode: number; timestamp: number }[]>;
+  /** Green/yellow/red per Claude-bound tab id; absent for a plain shell tab. */
+  coordStatusByTabId?: Record<string, TerminalCoordStatus>;
   focusMode?: boolean;
   zoneNotes?: Record<number, string>;
   onSetZoneNote?: (zoneIndex: number, note: string) => void;
@@ -1464,6 +1473,7 @@ function ZoneCellInner({
               filterActive={!!zoneFilters[zoneIdx]}
               onTogglePrompts={promptsAvailable ? handleTogglePrompts : undefined}
               promptsVisible={showPromptsPanel}
+              coordStatus={coordStatusByTabId?.[tab.id]}
             />
           )}
           {/* D1: the single-zone layout renders no `ZoneLabel`, so before this

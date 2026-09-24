@@ -20007,6 +20007,177 @@ pub(crate) mod doctor {
     }
 }
 
+/// Per-terminal coord-mcp availability, for the Terminal page's title-bar
+/// dot. Two terminals under DIFFERENT tenants can disagree — that is the
+/// whole reason this exists rather than reusing the single device-wide
+/// [`doctor::report`] everywhere.
+///
+/// Deliberately the same shape as `doctor`: pure over local, no-network
+/// state (the live [`proxy_nonces`] registry plus the credential store), so
+/// polling it on every open terminal costs nothing and never itself times
+/// out. It answers a narrower question than "can this terminal reach coord
+/// right now" — it answers "would the proxy even ATTEMPT a call for this
+/// terminal, and with a credential it believes is usable". A `green` that
+/// turns out wrong because coord itself is down surfaces through the
+/// existing per-call error paths; this dot is not a live network probe and
+/// does not claim to be one.
+pub(crate) mod terminal_status {
+    use super::*;
+
+    /// The three-state light the frontend renders as a colored circle.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+    #[serde(rename_all = "lowercase")]
+    pub(crate) enum Light {
+        /// A nonce is bound to this terminal AND the proxy would send a
+        /// bearer it believes is usable. "Fully available."
+        Green,
+        /// A nonce is bound, but the credential picture is incomplete or
+        /// degraded (an unusable-but-selected bearer, or an undecryptable
+        /// tenant-slot store beside a usable legacy slot). Some doors may
+        /// still work; nothing here should be trusted blindly. "Partially
+        /// available."
+        Yellow,
+        /// Either no nonce is bound to this terminal at all (the transport
+        /// itself is dead), or one is bound but selection MISSES entirely —
+        /// no call for this terminal could reach coord authenticated.
+        /// "Completely unavailable."
+        Red,
+    }
+
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub(crate) struct TerminalCoordStatus {
+        pub light: Light,
+        /// `doctor::verdict_for`'s verdict string (`ok` / `degraded` /
+        /// `unknown` / `no-credential` / `refuses`), or `"no-nonce"` when no
+        /// binding names this terminal at all. Distinct from `light` so a
+        /// caller that wants the raw reason doesn't have to invert the
+        /// three-way collapse.
+        pub verdict: &'static str,
+        pub detail: String,
+        pub has_nonce: bool,
+    }
+
+    /// Resolve one terminal's light. `terminal_id` is the runner's own PTY
+    /// id (`NonceBinding::terminal_id`), the same id the frontend already
+    /// carries as `TerminalTab.id`.
+    pub(crate) fn for_terminal(terminal_id: &str) -> TerminalCoordStatus {
+        let binding = {
+            let map = proxy_nonces().lock().expect("proxy nonce map poisoned");
+            map.values()
+                .find(|b| b.terminal_id.as_deref() == Some(terminal_id))
+                .cloned()
+        };
+
+        let Some(binding) = binding else {
+            return TerminalCoordStatus {
+                light: light_for_verdict("no-nonce"),
+                verdict: "no-nonce",
+                detail: "no coord-mcp proxy nonce is bound to this terminal — the transport \
+                          was never provisioned, or has since been evicted"
+                    .to_string(),
+                has_nonce: false,
+            };
+        };
+
+        // The binding's OWN tenant when it recorded one — that's what lets
+        // two terminals disagree. Only a binding that never sampled a
+        // tenant (`Unpinned`/`Unresolvable` — see `NonceBinding::session_pin`
+        // docs) falls back to the device's current pin.
+        let pin = match binding.session_pin {
+            crate::session::tenant_pin::TenantPin::Pinned(t) => {
+                crate::session::tenant_pin::TenantPin::Pinned(t)
+            }
+            _ => crate::session::tenant_pin::resolve_tenant_pin(),
+        };
+        let tenant = match &pin {
+            crate::session::tenant_pin::TenantPin::Pinned(t) => Some(*t),
+            _ => None,
+        };
+
+        let am = crate::auth::AuthManager::new();
+        let legacy = crate::auth::SlotDescriptor::describe(am.get_access_token().ok().as_deref());
+        // Same "absence is not zero" reading `doctor::report` uses: an
+        // undecryptable store reads as an empty list, so emptiness alone is
+        // UNKNOWN, not "this box has no tenant slots".
+        let slots_are_unknown = am.list_tenant_device_jwt_tenants().is_empty();
+
+        let selected = crate::auth::device_bearer_for(tenant.as_ref())
+            .as_deref()
+            .map(|t| crate::auth::SlotDescriptor::describe(Some(t)));
+
+        let (verdict, _layer, detail) =
+            doctor::verdict_for(&selected, &legacy, slots_are_unknown, &pin);
+
+        TerminalCoordStatus {
+            light: light_for_verdict(verdict),
+            verdict,
+            detail,
+            has_nonce: true,
+        }
+    }
+
+    /// Collapse `doctor::verdict_for`'s five-way verdict onto the three-state
+    /// light. Pure and separately tested so the collapse can be pinned
+    /// without standing up the credential store or the nonce registry.
+    ///
+    /// `ok` is the only green; `degraded` and `unknown` are yellow — the
+    /// proxy might still succeed on some doors, but nothing here should be
+    /// trusted blindly; everything else (`no-credential`, `refuses`, and the
+    /// synthetic `no-nonce` this module adds for an unbound terminal) is red.
+    fn light_for_verdict(verdict: &str) -> Light {
+        match verdict {
+            "ok" => Light::Green,
+            "degraded" | "unknown" => Light::Yellow,
+            _ => Light::Red,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn ok_is_the_only_green() {
+            assert_eq!(light_for_verdict("ok"), Light::Green);
+        }
+
+        #[test]
+        fn degraded_and_unknown_are_yellow() {
+            assert_eq!(light_for_verdict("degraded"), Light::Yellow);
+            assert_eq!(light_for_verdict("unknown"), Light::Yellow);
+        }
+
+        #[test]
+        fn no_credential_refuses_and_no_nonce_are_red() {
+            assert_eq!(light_for_verdict("no-credential"), Light::Red);
+            assert_eq!(light_for_verdict("refuses"), Light::Red);
+            assert_eq!(light_for_verdict("no-nonce"), Light::Red);
+        }
+
+        #[test]
+        fn an_unrecognised_verdict_fails_closed_to_red() {
+            // Never green/yellow on a string this collapse doesn't know —
+            // a future `doctor::verdict_for` arm must not silently read as
+            // available.
+            assert_eq!(light_for_verdict("some-future-verdict-string"), Light::Red);
+        }
+
+        /// A terminal with no registered nonce at all — the common case for
+        /// a plain shell tab, and the fail-closed case for a Claude-bound
+        /// tab whose transport died. Exercises the real `for_terminal` path
+        /// rather than just the pure collapse: `proxy_nonces()` is a fresh,
+        /// empty map for any id this test invents, so this needs no
+        /// credential-store or filesystem setup.
+        #[test]
+        fn an_unbound_terminal_id_is_red_no_nonce() {
+            let status = for_terminal("test-terminal-id-with-no-binding-ever-minted");
+            assert_eq!(status.light, Light::Red);
+            assert_eq!(status.verdict, "no-nonce");
+            assert!(!status.has_nonce);
+        }
+    }
+}
+
 /// Phase 5a — the credential doctor's verdict logic and its disclosure bound.
 #[cfg(test)]
 mod coord_mcp_doctor_tests {
