@@ -31,9 +31,9 @@ const CLONE_SCRUB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 
 /// Explicit opt-out of the first-run SetupWizard. Its writer is the
 /// supervisor, which sets it to `1` on Temp runner spawns
-/// (qontinui-supervisor `env_forwarders.rs`, shipped as a separate change —
-/// until that lands no spawn sets it, and only the auto-login trigger below
-/// applies).
+/// (qontinui-supervisor `env_forwarders.rs`, `SETUP_WIZARD_BYPASS_ENV`,
+/// qontinui-supervisor#197). A supervisor built before that sets nothing, and
+/// only the auto-login trigger below applies.
 pub(crate) const SETUP_WIZARD_BYPASS_ENV: &str = "QONTINUI_SETUP_WIZARD_BYPASS";
 
 /// The supervisor's test auto-login variable — the older, implicit bypass.
