@@ -7760,6 +7760,14 @@ impl CoordWriteTarget {
             CoordWriteTarget::WorkUnitUpsert
             | CoordWriteTarget::WorkUnitTransition { .. }
             | CoordWriteTarget::WorkUnitSetDeps { .. } => false,
+            // The label door derives its audit actor from the VERIFIED
+            // PRINCIPAL — `actor_from_auth` (the agent id for an agent token,
+            // else the device id) — and reads no caller-session header at all.
+            // Checked against the door's own implementation in
+            // qontinui-coord#2282 (and #1887, which it supersedes): zero
+            // occurrences of the header in either diff. So the forward must
+            // NOT carry it.
+            CoordWriteTarget::PrLabelsDeclare | CoordWriteTarget::PrLabelsRetract => false,
         }
     }
 }
@@ -8143,6 +8151,7 @@ async fn forward_coord_write_post(
         coord_base_source,
         spool,
         tenant,
+        caller_session,
     )
     .await
 }
@@ -8161,6 +8170,7 @@ async fn forward_coord_write(
     // this forwarder is a real coord WRITE behind a real guard, so there is no
     // `upstream_authenticates` question here — the answer is always yes.
     tenant: Option<uuid::Uuid>,
+    caller_session: Option<uuid::Uuid>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
