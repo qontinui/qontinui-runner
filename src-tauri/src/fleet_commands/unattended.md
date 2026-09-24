@@ -346,10 +346,14 @@ Independently of capture, audit this session against `planning-and-scope`
 <!-- detector-reach-fence:start -->
 > **A capability negative cites a CENSUS, never a probe.** Before recording
 > "no door", "agents cannot", "this route does not exist" or any other claim
-> that a capability is ABSENT, run `bash scripts/coord-route-census.sh
-> <fragment>` (qontinui-claude-config; reads `origin/main` of BOTH
-> `qontinui-coord` and `qontinui-web`, never a working tree and never a live
-> host) and paste its trailer verbatim beside the claim:
+> that a capability is ABSENT, run
+> `bash <workspace-root>/qontinui-claude-config/scripts/coord-route-census.sh <fragment>`
+> — spelled absolutely, because a bare `scripts/...` resolves only from a
+> checkout of `qontinui-claude-config`, and a session standing anywhere else
+> gets exit 127
+> (it reads `origin/main` of BOTH `qontinui-coord` and `qontinui-web`, never
+> a working tree and never a live host) — and paste its trailer verbatim
+> beside the claim:
 > `census: fragment=<f> hosts_read=coord.qontinui.io,api.qontinui.io ref=<sha>,<sha> routes=<n> unextracted=<n> unmounted=<n> generated=<ISO time>`
 > — the line that parses under `CENSUS_TRAILER_RE` in
 > `scripts/detector_reach/__init__.py`. A 401, 404 or 405 on ONE spelling of
@@ -675,10 +679,14 @@ the census trailer is part of the body, or the finding is not posted.
 <!-- detector-reach-fence:start -->
 > **A capability negative cites a CENSUS, never a probe.** Before recording
 > "no door", "agents cannot", "this route does not exist" or any other claim
-> that a capability is ABSENT, run `bash scripts/coord-route-census.sh
-> <fragment>` (qontinui-claude-config; reads `origin/main` of BOTH
-> `qontinui-coord` and `qontinui-web`, never a working tree and never a live
-> host) and paste its trailer verbatim beside the claim:
+> that a capability is ABSENT, run
+> `bash <workspace-root>/qontinui-claude-config/scripts/coord-route-census.sh <fragment>`
+> — spelled absolutely, because a bare `scripts/...` resolves only from a
+> checkout of `qontinui-claude-config`, and a session standing anywhere else
+> gets exit 127
+> (it reads `origin/main` of BOTH `qontinui-coord` and `qontinui-web`, never
+> a working tree and never a live host) — and paste its trailer verbatim
+> beside the claim:
 > `census: fragment=<f> hosts_read=coord.qontinui.io,api.qontinui.io ref=<sha>,<sha> routes=<n> unextracted=<n> unmounted=<n> generated=<ISO time>`
 > — the line that parses under `CENSUS_TRAILER_RE` in
 > `scripts/detector_reach/__init__.py`. A 401, 404 or 405 on ONE spelling of

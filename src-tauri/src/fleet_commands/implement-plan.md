@@ -691,7 +691,7 @@ the **explicitly-timed** fallback ALSO fails is the arm below reached:
 > **Coord unreachable** (connection error, timeout, non-2xx, unparseable body)
 > on a device that DID resolve a machine UUID: this is **UNKNOWN, not free.** Do
 > not stamp and do not launch any phase agent. Report the transport failure
-> verbatim, run `bash .claude/skills/coord-revive/coord-revive.sh --floor-claim` from the real cwd,
+> verbatim, run `bash <workspace-root>/qontinui-claude-config/.claude/skills/coord-revive/coord-revive.sh --floor-claim` from the real cwd,
 > paste its `FLOOR-CLAIM:` block verbatim, and re-issue over the door it
 > reports LIVE. "No door is live" is licensed ONLY by that block reading
 > `verdict=FLOOR`; then surface to the operator via `AskUserQuestion`

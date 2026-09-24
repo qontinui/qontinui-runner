@@ -1,5 +1,5 @@
 ---
-description: One transport-agnostic door to register, attest, or withdraw a coord gate — runs the native MCP tool, an auto-discovered loopback proxy (JSON-RPC), REST writes through the runner's proxy-nonce write forwarder, or coord's generic remote MCP door (POST /mcp, device JWT), plus four residual file-independent credentials (an in-process proxy nonce minted from the local runner, which is the only mint that answers on a headless box; then a device JWT from the runner's UI Bridge; then an acting-bearer mint from $COORD_AGENT_JWT; then Step 4b's bootstrap credential, an anonymous POST /agents/credential that needs no runner at all) — so you never touch ports, nonces, or proxies. Use it whenever coord_register_gate is not a visible tool.
+description: One transport-agnostic door to register, attest, or withdraw a coord gate — runs the native MCP tool, an auto-discovered loopback proxy (JSON-RPC), REST writes through the runner's proxy-nonce write forwarder, or coord's generic remote MCP door (POST /mcp, device JWT), plus four residual file-independent credentials (an in-process proxy nonce minted from the local runner, which is the only mint that answers on a headless box; then a device JWT from the runner's UI Bridge; then an acting-bearer mint from $COORD_AGENT_JWT; then Step 4b's bootstrap credential (register only), an anonymous POST /agents/credential that needs no runner at all) — so you never touch ports, nonces, or proxies. Use it whenever coord_register_gate is not a visible tool.
 argument-hint: "register|attest|withdraw [args]"
 allowed-tools: Read, Bash, Glob, Grep, ToolSearch
 ---
@@ -735,7 +735,7 @@ bare file another runner start has since rewritten), `..._INVALID_BODY` /
 > doors. Name both probes you ran.
 >
 > **The stamped form of both probes is one command:**
-> `bash .claude/skills/coord-revive/coord-revive.sh --floor-claim` runs this same
+> `bash <workspace-root>/qontinui-claude-config/.claude/skills/coord-revive/coord-revive.sh --floor-claim` runs this same
 > unauthenticated probe as one door of its cascade and prints a `FLOOR-CLAIM:`
 > block carrying the probe time, the runner build, this box's load and a
 > per-door table — the block Step 5's report pastes. The bare `curl` stays
@@ -1178,12 +1178,19 @@ curl -sS -o /dev/null -w '%{http_code}\n' -m 20 -H @"$(hdrp)" \
   "$COORD_HTTP_URL/coord/agent-findings?limit=1"   # must be 200
 ```
 
-**Then spend the bearer ONLY on the device-authed hand-written REST routes Step
-3 already spells out** — `POST $COORD_HTTP_URL/coord/work-units/upsert`,
-`POST $COORD_HTTP_URL/coord/work-units/<stem>/register-gate`,
-`POST $COORD_HTTP_URL/coord/gates/<gate_id>/attest`,
-`POST $COORD_HTTP_URL/coord/gates/<gate_id>/withdraw` — with the header FILE,
-never the token on argv. **Never carry it onto `POST $COORD_HTTP_URL/mcp`**:
+**Then spend the bearer ONLY on the REGISTRATION routes Step 3 already spells
+out** — `POST $COORD_HTTP_URL/coord/work-units/upsert` and
+`POST $COORD_HTTP_URL/coord/work-units/<stem>/register-gate` — with the header
+FILE, never the token on argv. **ATTEST and WITHDRAW are not on this rung.**
+coord refuses them to an anonymously minted credential (`403
+bootstrap_credential_scope`, plan
+`2026-09-23-anonymous-agent-credential-mint-can-act-as-any-registered-device`,
+decision finding `a777c0e6`): anyone can mint this bearer for any registered
+device, so it proves nothing about who is clearing or withdrawing a gate. A
+`403` with that code is the boundary, not an outage — do not retry it on
+another bootstrap mint; attest or withdraw over a door that carries a paired
+device JWT or the runner's proxy nonce (Steps 1–4a), or report the gate spec
+as unattested. **Never carry it onto `POST $COORD_HTTP_URL/mcp`**:
 that door's device-JWT-only constraint is unchanged, and this bearer is
 `sub_type=agent` with a DEVICE subject (`sub=device:<uuid>`) and no `agent_id`
 claim. `coord-revive.sh`'s `PARTIAL_BOOTSTRAP` block states why in full; this
@@ -1269,7 +1276,7 @@ and point at the self-check:
 > PASS that refutes a fleet-wide claim).
 > Run **`coord doctor`** (runner self-check — names the one failing link + its
 > fix) to diagnose the missing credential, then re-run `/gate`.
-> `FLOOR-CLAIM:` <the block `bash .claude/skills/coord-revive/coord-revive.sh --floor-claim` printed,
+> `FLOOR-CLAIM:` <the block `bash <workspace-root>/qontinui-claude-config/.claude/skills/coord-revive/coord-revive.sh --floor-claim` printed,
 > pasted verbatim — probe time, runner build, this box's load, one line per
 > door>.
 
@@ -1314,10 +1321,14 @@ a gate here — a seven-line probe report is still a sample, not a search:
 <!-- detector-reach-fence:start -->
 > **A capability negative cites a CENSUS, never a probe.** Before recording
 > "no door", "agents cannot", "this route does not exist" or any other claim
-> that a capability is ABSENT, run `bash scripts/coord-route-census.sh
-> <fragment>` (qontinui-claude-config; reads `origin/main` of BOTH
-> `qontinui-coord` and `qontinui-web`, never a working tree and never a live
-> host) and paste its trailer verbatim beside the claim:
+> that a capability is ABSENT, run
+> `bash <workspace-root>/qontinui-claude-config/scripts/coord-route-census.sh <fragment>`
+> — spelled absolutely, because a bare `scripts/...` resolves only from a
+> checkout of `qontinui-claude-config`, and a session standing anywhere else
+> gets exit 127
+> (it reads `origin/main` of BOTH `qontinui-coord` and `qontinui-web`, never
+> a working tree and never a live host) — and paste its trailer verbatim
+> beside the claim:
 > `census: fragment=<f> hosts_read=coord.qontinui.io,api.qontinui.io ref=<sha>,<sha> routes=<n> unextracted=<n> unmounted=<n> generated=<ISO time>`
 > — the line that parses under `CENSUS_TRAILER_RE` in
 > `scripts/detector_reach/__init__.py`. A 401, 404 or 405 on ONE spelling of

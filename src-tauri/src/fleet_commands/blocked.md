@@ -329,7 +329,7 @@ as "no such tool"). If the call fails as unknown / method-not-found:
 - Fall back to the HTTP route (Step 5: device-authed `POST /coord/work-units/upsert`
   then `POST /coord/work-units/<slug>/register-gate` for a plan-anchored agent
   session, else `POST /coord/gates/register` for a claim-anchored gate), OR —
-  only once `bash .claude/skills/coord-revive/coord-revive.sh --floor-claim` from the real cwd has
+  only once `bash <workspace-root>/qontinui-claude-config/.claude/skills/coord-revive/coord-revive.sh --floor-claim` from the real cwd has
   printed a `FLOOR-CLAIM:` block reading `verdict=FLOOR` — surface the blocker
   to the operator **with that block pasted verbatim**. The block carries the
   probe time, the runner build, this box's load and a per-door table; the bare
@@ -345,10 +345,14 @@ Enumerate before you conclude —
 <!-- detector-reach-fence:start -->
 > **A capability negative cites a CENSUS, never a probe.** Before recording
 > "no door", "agents cannot", "this route does not exist" or any other claim
-> that a capability is ABSENT, run `bash scripts/coord-route-census.sh
-> <fragment>` (qontinui-claude-config; reads `origin/main` of BOTH
-> `qontinui-coord` and `qontinui-web`, never a working tree and never a live
-> host) and paste its trailer verbatim beside the claim:
+> that a capability is ABSENT, run
+> `bash <workspace-root>/qontinui-claude-config/scripts/coord-route-census.sh <fragment>`
+> — spelled absolutely, because a bare `scripts/...` resolves only from a
+> checkout of `qontinui-claude-config`, and a session standing anywhere else
+> gets exit 127
+> (it reads `origin/main` of BOTH `qontinui-coord` and `qontinui-web`, never
+> a working tree and never a live host) — and paste its trailer verbatim
+> beside the claim:
 > `census: fragment=<f> hosts_read=coord.qontinui.io,api.qontinui.io ref=<sha>,<sha> routes=<n> unextracted=<n> unmounted=<n> generated=<ISO time>`
 > — the line that parses under `CENSUS_TRAILER_RE` in
 > `scripts/detector_reach/__init__.py`. A 401, 404 or 405 on ONE spelling of
@@ -454,7 +458,7 @@ In your session-close report, list for each blocker either:
 the `gate_id` it reported against and the `outcome_recorded` coord echoed back —
 or **"work outcome NOT reported"** plus the failure you actually saw (variables
 absent, a non-2xx, a mismatched echo — or coord unreachable, which is only ever
-the `FLOOR-CLAIM: verdict=FLOOR` block that `bash .claude/skills/coord-revive/coord-revive.sh --floor-claim`
+the `FLOOR-CLAIM: verdict=FLOOR` block that `bash <workspace-root>/qontinui-claude-config/.claude/skills/coord-revive/coord-revive.sh --floor-claim`
 printed, pasted verbatim, never the bare phrase). "Not a continuation" is
 also an outcome: when both variables were absent, say the step did not apply
 rather than leaving the reader to guess whether it was skipped or failed.
