@@ -503,6 +503,14 @@ match on it, qontinui-claude-config PR #49 sends it) fixed for phase claims.
   invoked this skill inside the same harness session. **A re-reserve by the same
   owner token is a renewal, not a conflict** — proceed, and do **not** release at
   the end of this run; the acquirer releases.
+  **`renewed` is only as narrow as the door's owner token.** Over
+  `coord_reserve_resource` (MCP) that token is the bare DEVICE, so a second
+  session on this same box re-reserving the plan ALSO reads `renewed`; only the
+  HTTP `/claims/acquire` fallback, which carries `agent_session_id`, makes it
+  session-scoped. So a `renewed` is YOUR hold only if something earlier in THIS
+  session reserved the plan (you are nested under `/vet-imp`, or this run
+  re-reserves its own key). If nothing did, treat it as `held` by a same-box
+  peer — the rule below.
 - **`held` by a DIFFERENT owner — STOP.** Do not edit the plan and do not stamp
   it. Report the holder and surface to the operator via `AskUserQuestion`
   (header `Plan reserved`, options **Abort** / **Wait** — poll every 30 s, then
