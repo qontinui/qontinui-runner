@@ -207,8 +207,14 @@ impl WatchdogConfig {
                 "QONTINUI_RUNNER_MEM_WATCHDOG_SLOW_SLOPE_MB_PER_MIN",
                 d.slow_slope_mb_per_min,
             ),
-            slow_window: env_mins("QONTINUI_RUNNER_MEM_WATCHDOG_SLOW_WINDOW_MIN", d.slow_window),
-            ceiling_bytes: env_u64("QONTINUI_RUNNER_MEM_WATCHDOG_CEILING_BYTES", d.ceiling_bytes),
+            slow_window: env_mins(
+                "QONTINUI_RUNNER_MEM_WATCHDOG_SLOW_WINDOW_MIN",
+                d.slow_window,
+            ),
+            ceiling_bytes: env_u64(
+                "QONTINUI_RUNNER_MEM_WATCHDOG_CEILING_BYTES",
+                d.ceiling_bytes,
+            ),
             renderer_ceiling_bytes: env_u64(
                 "QONTINUI_RUNNER_MEM_WATCHDOG_RENDERER_CEILING_BYTES",
                 d.renderer_ceiling_bytes,
@@ -1148,7 +1154,7 @@ fn sample_webview2_subtree() -> Snapshot {
             first_seen_unix_ms,
         });
     }
-    processes.sort_by(|a, b| b.working_set_bytes.cmp(&a.working_set_bytes));
+    processes.sort_by_key(|p| std::cmp::Reverse(p.working_set_bytes));
 
     Snapshot {
         total_bytes: total,
@@ -1370,10 +1376,16 @@ fn process_command_line(pid: u32) -> Option<String> {
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn type_token(command_line: &str) -> Option<&str> {
     let rest = command_line.split("--type=").nth(1)?;
-    let end = rest
-        .find(|c: char| c.is_whitespace() || c == '"' || c == '\'')
-        .unwrap_or(rest.len());
-    let token = &rest[..end];
+    // `split` on the delimiter set rather than `find` + `&rest[..end]`: a
+    // command line read out of another process's PEB is
+    // `String::from_utf16_lossy`'d, so a byte index derived from `find` is not
+    // guaranteed to land on a char boundary and the slice would PANIC inside
+    // the sampler. `clippy::string_slice` is denied in this crate for exactly
+    // this class. `split` always yields at least one item.
+    let token = rest
+        .split(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+        .next()
+        .unwrap_or_default();
     if token.is_empty() {
         None
     } else {
@@ -1750,7 +1762,10 @@ mod tests {
             type_token(r#""C:\x\msedgewebview2.exe" --type=renderer --lang=en-US"#),
             Some("renderer")
         );
-        assert_eq!(type_token("app.exe --type=gpu-process"), Some("gpu-process"));
+        assert_eq!(
+            type_token("app.exe --type=gpu-process"),
+            Some("gpu-process")
+        );
         assert_eq!(type_token(r#"app.exe --type=utility""#), Some("utility"));
         assert_eq!(type_token("app.exe --no-type-switch"), None);
     }
@@ -1758,8 +1773,14 @@ mod tests {
     #[test]
     fn command_lines_classify_into_the_kinds_the_breakdown_reports() {
         use WebViewProcessKind::*;
-        assert_eq!(classify_command_line(Some(r#""x.exe" --embedded"#)), Browser);
-        assert_eq!(classify_command_line(Some("x.exe --type=renderer")), Renderer);
+        assert_eq!(
+            classify_command_line(Some(r#""x.exe" --embedded"#)),
+            Browser
+        );
+        assert_eq!(
+            classify_command_line(Some("x.exe --type=renderer")),
+            Renderer
+        );
         assert_eq!(classify_command_line(Some("x.exe --type=gpu-process")), Gpu);
         assert_eq!(classify_command_line(Some("x.exe --type=utility")), Utility);
         assert_eq!(
@@ -1827,9 +1848,10 @@ mod tests {
     fn the_subtree_walk_follows_grandchildren() {
         // The whole point of §1.1: a `parent == own_pid` filter sums ONE
         // process. runner → browser → renderer must resolve as a descendant.
-        let parent_of: std::collections::HashMap<u32, u32> = [(100, 1), (200, 100), (300, 200), (400, 1)]
-            .into_iter()
-            .collect();
+        let parent_of: std::collections::HashMap<u32, u32> =
+            [(100, 1), (200, 100), (300, 200), (400, 1)]
+                .into_iter()
+                .collect();
         assert!(is_descendant_of(300, 100, &parent_of));
         assert!(is_descendant_of(200, 100, &parent_of));
         assert!(!is_descendant_of(400, 100, &parent_of));

@@ -234,6 +234,15 @@ windows-sys = { version = "0.59", features = [
     # now ci_node). Physical-available is the wrong number on Windows: builds
     # die at ~90% commit while free-physical still looks healthy.
     "Win32_System_SystemInformation",
+    # NtQueryInformationProcess(ProcessBasicInformation) → PEB →
+    # RTL_USER_PROCESS_PARAMETERS.CommandLine — the ONLY way Windows exposes
+    # another process's command line, which the renderer-memory watchdog
+    # (`renderer_watchdog::process_command_line`) reads to label a WebView2 pid
+    # `--type=renderer` / `gpu-process` / `utility`. Deliberately not a
+    # `Get-CimInstance Win32_Process` shell-out: that probe class accumulated
+    # 512 stuck processes on this fleet, and the watchdog runs on a 30s timer.
+    # Plan 2026-06-09-runner-renderer-memory-watchdog-and-twin-slo §1.1.
+    "Wdk_System_Threading",
     "Win32_UI_HiDpi",
     "Win32_UI_WindowsAndMessaging",
 ] }

@@ -1052,6 +1052,97 @@ fn capture_telemetry_snapshot() -> (u64, u64, Option<chrono::DateTime<chrono::Ut
 }
 
 // =============================================================================
+// Renderer-memory telemetry (plan
+// `2026-06-09-runner-renderer-memory-watchdog-and-twin-slo`, Phase 3.1).
+//
+// Exactly the `CAPTURE_TELEMETRY` shape above, and for exactly the same reason:
+// the producer (`crate::renderer_watchdog`, spawned from the Tauri `setup`
+// hook) and the publisher (`ApiState` construction inside
+// `mcp_api::start_server`, spawned from that same hook) appear in either order,
+// and the 30s device heartbeat runs on its own OS thread that predates both. So
+// the handles are `Arc`s the watchdog owns, cloned into a process-global
+// `OnceLock` here and read per-tick.
+// =============================================================================
+
+/// Process-global clones of the renderer-memory watchdog's telemetry handles,
+/// published by [`publish_renderer_memory_handles`] when `ApiState` is
+/// constructed. `None` until then (early boot, or a unit test that never builds
+/// the MCP state) — the heartbeat then reports an honest zero baseline, which
+/// coord's `NOT NULL DEFAULT 0` columns make observable as "nothing sampled
+/// yet", never as "the renderer shrank to zero".
+static RENDERER_MEMORY: std::sync::OnceLock<RendererMemoryHandles> = std::sync::OnceLock::new();
+
+/// Read-only clones of the renderer-memory watchdog's live handles. Shares the
+/// `Arc`s the watchdog stores each sample into, so the heartbeat always reports
+/// the most recent sample rather than a copy taken at publish time.
+///
+/// The field set is the watchdog's, not this module's — the value is built by
+/// [`crate::renderer_watchdog::heartbeat_handles`], which owns the underlying
+/// state.
+#[derive(Clone)]
+pub struct RendererMemoryHandles {
+    /// Total WebView2 working set (this process + the whole `msedgewebview2.exe`
+    /// descendant subtree) as of the watchdog's most recent sample.
+    pub latest_ws_bytes: Arc<std::sync::atomic::AtomicU64>,
+    /// Cumulative completed self-heals (a reload or recreate the recovery
+    /// ladder actually verified) since this process started.
+    pub reload_total: Arc<std::sync::atomic::AtomicU64>,
+    /// Latched when the reload budget is spent and memory is still breaching —
+    /// "a leak the reload can't outrun" (plan §6 Q3/Q7).
+    pub storming: Arc<std::sync::atomic::AtomicBool>,
+    /// The most recent per-process breakdown. Pids, a coarse process kind, byte
+    /// counts and a first-seen stamp — **no path, no command line, no window
+    /// title** (plan §6 Q6: no content on the wire).
+    pub processes: Arc<Mutex<Vec<crate::renderer_watchdog::ProcessSample>>>,
+}
+
+/// Publish the renderer-memory handles for the device heartbeat to read. Called
+/// once from `ApiState` construction (`mcp_api::start_server`), beside
+/// [`publish_capture_telemetry_handles`]. Idempotent: the first set of live
+/// handles wins, exactly as for the capture pair.
+pub fn publish_renderer_memory_handles(handles: RendererMemoryHandles) {
+    let _ = RENDERER_MEMORY.set(handles);
+}
+
+/// Snapshot the current renderer-memory telemetry for one heartbeat tick.
+///
+/// Returns `(total_ws_bytes, reload_total, storming, per_process_breakdown)`;
+/// all zero/false/empty before the handles are published, and equally before the
+/// watchdog's first sample lands. That zero is a BASELINE, not a measurement —
+/// the same posture as [`capture_telemetry_snapshot`], and the reason the
+/// watchdog itself treats an unreadable sample as UNKNOWN and skips it rather
+/// than pushing a zero into its detector ring.
+fn renderer_memory_snapshot() -> (u64, u64, bool, Vec<crate::renderer_watchdog::ProcessSample>) {
+    renderer_memory_snapshot_from(RENDERER_MEMORY.get())
+}
+
+/// Pure half of [`renderer_memory_snapshot`], so BOTH arms — published handles
+/// and the pre-publish baseline — are testable deterministically. A test that
+/// could observe only whichever arm the process happened to be in would start
+/// passing for the wrong reason the first time anything else published handles.
+fn renderer_memory_snapshot_from(
+    handles: Option<&RendererMemoryHandles>,
+) -> (u64, u64, bool, Vec<crate::renderer_watchdog::ProcessSample>) {
+    use std::sync::atomic::Ordering;
+    match handles {
+        Some(h) => {
+            let bytes = h.latest_ws_bytes.load(Ordering::Relaxed);
+            let reloads = h.reload_total.load(Ordering::Relaxed);
+            let storming = h.storming.load(Ordering::Relaxed);
+            // A poisoned lock must not cost the whole heartbeat: the three
+            // scalars above are the fields coord has columns for, and the
+            // breakdown is diagnostic JSON beside them.
+            let processes = match h.processes.lock() {
+                Ok(g) => g.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            };
+            (bytes, reloads, storming, processes)
+        }
+        None => (0, 0, false, Vec::new()),
+    }
+}
+
+// =============================================================================
 // CI-node label detection (plan 2026-07-15-runner-as-ci-node-migration,
 // Phase 0). Labels advertise warmth + platform so coord's Phase-3 selection
 // can prefer a device with the repo already checked out:
@@ -1734,6 +1825,90 @@ struct HeartbeatPayload {
     /// additive/backward-safe contract as `git_sha`.
     #[serde(skip_serializing_if = "Option::is_none")]
     commits_behind: Option<u64>,
+    /// Renderer-memory telemetry (plan
+    /// `2026-06-09-runner-renderer-memory-watchdog-and-twin-slo`, Phase 3.1) —
+    /// total WebView2 working set (this process plus the whole
+    /// `msedgewebview2.exe` descendant subtree) at the watchdog's most recent
+    /// sample. Coord-side `coord.devices.renderer_memory_bytes`, one of the
+    /// three columns qontinui-web #786 shipped (plan §3.3).
+    ///
+    /// **Always serialized, including 0**, like `capture_preview_count`: a
+    /// device that has not sampled yet reports an honest baseline rather than
+    /// an omitted field, and coord's COALESCE ingest tolerates absence so an
+    /// older coord simply ignores it. A 0 here means "nothing sampled" (the
+    /// kill-switch is set, or a non-Windows box with no WebView2 process
+    /// model), never "the renderer shrank to zero".
+    renderer_memory_bytes: u64,
+    /// Cumulative completed self-heals — a reload or recreate the recovery
+    /// ladder actually VERIFIED — since this process started. Coord-side
+    /// `coord.devices.renderer_reload_total` (plan §6 Q7). Monotonic within a
+    /// process lifetime and reset by a restart, which is why coord persists the
+    /// reported value rather than accumulating it.
+    renderer_reload_total: u64,
+    /// The watchdog's storm latch: the reload budget is spent and memory is
+    /// still breaching, i.e. a leak a reload cannot outrun (plan §6 Q3/Q7).
+    /// Coord-side `coord.devices.renderer_reload_storming`.
+    ///
+    /// **Always serialized, including `false`** — deliberately, and for the
+    /// same reason `capabilities` is: coord upserts with COALESCE, so an
+    /// omitted field PRESERVES the stored value. A storm flag that could only
+    /// ever be set and never cleared would leave a device alarming forever
+    /// after one bad hour.
+    renderer_reload_storming: bool,
+    /// The per-process breakdown behind `renderer_memory_bytes` (plan §1.1 and
+    /// §3.1's third bullet): `{pid, kind, workingSetBytes, firstSeenUnixMs}`
+    /// per WebView2 process, largest first.
+    ///
+    /// **Rides as JSON on a field coord has no column for**, on purpose — §3.1
+    /// leaves the carrier to implementation time and §3.2 adds no column for
+    /// it, so minting one here would fork the schema ahead of the migration
+    /// that owns it. Coord's `DeviceRegisterRequest` has no
+    /// `deny_unknown_fields`, so today's coord ignores this field. It is sent
+    /// because the split was the ENTIRE diagnostic value of the plan's §0b
+    /// measurement — one renderer grew to 382 MB while its sibling shrank — and
+    /// a single summed `u64` cannot express that.
+    ///
+    /// Content-free by construction (§6 Q6): pids, a coarse `--type=`-derived
+    /// kind, byte counts and a first-seen stamp. No path, no command line, no
+    /// window title, no URL. Omitted when empty, so a device with no sample
+    /// adds nothing to the wire.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    renderer_processes: Vec<crate::renderer_watchdog::ProcessSample>,
+}
+
+/// A test-only zero payload, so the pre-existing wire-shape tests can pin the
+/// ONE field each is about and fall through for the rest.
+///
+/// `#[cfg(test)]` on purpose, and not a `#[derive(Default)]`: a defaulted
+/// heartbeat carries `device_id`/`tenant_id` of `Uuid::nil()`, which coord
+/// answers with `400 tenant_id_required`. Making that constructible in
+/// production would turn a compile error — "you forgot a field" — into a
+/// runtime 400 nobody reads. In tests it is exactly right: each test states the
+/// field it is about and nothing else, so adding a wire field is a one-site
+/// change instead of a ten-site one.
+#[cfg(test)]
+impl Default for HeartbeatPayload {
+    fn default() -> Self {
+        Self {
+            device_id: uuid::Uuid::nil(),
+            hostname: String::new(),
+            claude_code_available: false,
+            tenant_id: uuid::Uuid::nil(),
+            tenant_ids: Vec::new(),
+            capture_preview_count: 0,
+            monitor_crop_count: 0,
+            last_capture_fallback_at: None,
+            capabilities: Vec::new(),
+            ci_runner_labels: Vec::new(),
+            git_sha: None,
+            main_sha: None,
+            commits_behind: None,
+            renderer_memory_bytes: 0,
+            renderer_reload_total: 0,
+            renderer_reload_storming: false,
+            renderer_processes: Vec::new(),
+        }
+    }
 }
 
 /// Suppress serializing the field when it's the default. Keeps the
@@ -1826,6 +2001,18 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
     let (capture_preview_count, monitor_crop_count, last_capture_fallback_at) =
         capture_telemetry_snapshot();
 
+    // Renderer-memory telemetry (plan
+    // 2026-06-09-runner-renderer-memory-watchdog-and-twin-slo, Phase 3.1).
+    // Three typed fields for the three columns §3.3 already shipped, plus the
+    // per-process breakdown as JSON — kept SEPARATE from the three so the
+    // columns stay scalar and the diagnostic split stays a diagnostic.
+    let (
+        renderer_memory_bytes,
+        renderer_reload_total,
+        renderer_reload_storming,
+        renderer_processes,
+    ) = renderer_memory_snapshot();
+
     // Capability advertisement. Settings are read per-tick the same way other
     // heartbeat inputs are resolved (fresh each tick, no restart needed to opt
     // in/out); the probes behind both sets are cached for `HOST_PROBE_TTL`
@@ -1886,6 +2073,10 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
         git_sha,
         main_sha,
         commits_behind,
+        renderer_memory_bytes,
+        renderer_reload_total,
+        renderer_reload_storming,
+        renderer_processes,
     };
     let url = format!("{base}/coord/devices/register");
 
@@ -6556,6 +6747,7 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            ..Default::default()
         };
         let body = serde_json::to_value(&p).unwrap();
         assert!(
@@ -6580,6 +6772,7 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            ..Default::default()
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -6610,6 +6803,7 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            ..Default::default()
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -6638,6 +6832,7 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            ..Default::default()
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -6672,6 +6867,7 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            ..Default::default()
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -6707,6 +6903,7 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            ..Default::default()
         };
         let body0 = serde_json::to_value(&p0).unwrap();
         assert!(
@@ -6781,6 +6978,7 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            ..Default::default()
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -6821,6 +7019,7 @@ mod tests {",
             git_sha: Some("dc7aa9c5aaaa"),
             main_sha: Some("dc7aa9c5aaaabbbbccccddddeeeeffff00001111".into()),
             commits_behind: Some(4),
+            ..Default::default()
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -6871,6 +7070,7 @@ mod tests {",
             git_sha,
             main_sha: None,
             commits_behind: None,
+            ..Default::default()
         };
         let body = serde_json::to_value(&p).unwrap();
         assert!(
@@ -7041,6 +7241,7 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            ..Default::default()
         }
     }
 
@@ -8409,5 +8610,138 @@ mod tests {",
             None,
             "no state dir and no ~/.qontinui is None, which the caller warns about"
         );
+    }
+
+    // ── renderer-memory heartbeat seam (plan
+    //    2026-06-09-runner-renderer-memory-watchdog-and-twin-slo, Phase 3.1) ──
+
+    use crate::renderer_watchdog::{ProcessSample, WebViewProcessKind};
+
+    fn renderer_handles(
+        bytes: u64,
+        reloads: u64,
+        storming: bool,
+        processes: Vec<ProcessSample>,
+    ) -> RendererMemoryHandles {
+        RendererMemoryHandles {
+            latest_ws_bytes: Arc::new(std::sync::atomic::AtomicU64::new(bytes)),
+            reload_total: Arc::new(std::sync::atomic::AtomicU64::new(reloads)),
+            storming: Arc::new(std::sync::atomic::AtomicBool::new(storming)),
+            processes: Arc::new(Mutex::new(processes)),
+        }
+    }
+
+    /// One heartbeat payload, serialized — because the wire is what both the
+    /// coord columns and the privacy posture are actually about.
+    fn renderer_payload(
+        bytes: u64,
+        reloads: u64,
+        storming: bool,
+        processes: Vec<ProcessSample>,
+    ) -> serde_json::Value {
+        let payload = HeartbeatPayload {
+            hostname: "test-box".to_string(),
+            renderer_memory_bytes: bytes,
+            renderer_reload_total: reloads,
+            renderer_reload_storming: storming,
+            renderer_processes: processes,
+            ..Default::default()
+        };
+        serde_json::to_value(&payload).expect("the heartbeat payload serializes")
+    }
+
+    #[test]
+    fn the_heartbeat_payload_carries_the_three_renderer_columns() {
+        // These three are the three columns qontinui-web #786 shipped on
+        // `coord.devices`. Two shipped columns with no writer is a worse end
+        // state than none, which is why the plan threads all three rather than
+        // the single memory field its §3 prose originally named.
+        let json = renderer_payload(788 * 1024 * 1024, 3, true, vec![]);
+        assert_eq!(json["renderer_memory_bytes"], 788u64 * 1024 * 1024);
+        assert_eq!(json["renderer_reload_total"], 3);
+        assert_eq!(json["renderer_reload_storming"], true);
+    }
+
+    #[test]
+    fn the_renderer_fields_are_sent_even_at_their_zero_baseline() {
+        // coord upserts these with COALESCE, so an OMITTED field PRESERVES the
+        // stored value. A storm flag that could only ever be set would leave a
+        // device alarming forever after one bad hour, and an omitted zero would
+        // freeze a stale byte count on a runner whose watchdog is off.
+        let json = renderer_payload(0, 0, false, vec![]);
+        let obj = json.as_object().expect("an object");
+        assert!(obj.contains_key("renderer_memory_bytes"));
+        assert!(obj.contains_key("renderer_reload_total"));
+        assert!(obj.contains_key("renderer_reload_storming"));
+        assert_eq!(json["renderer_memory_bytes"], 0);
+        assert_eq!(json["renderer_reload_storming"], false);
+        // The breakdown, by contrast, has no column and is omitted when empty.
+        assert!(!obj.contains_key("renderer_processes"));
+    }
+
+    #[test]
+    fn renderer_memory_reads_an_honest_zero_before_the_first_sample() {
+        // Before `ApiState` publishes the handles — and equally before the
+        // watchdog's first sample lands — the heartbeat reports a BASELINE, not
+        // a measurement. It must not invent a value and must not panic.
+        assert_eq!(
+            renderer_memory_snapshot_from(None),
+            (0, 0, false, Vec::new())
+        );
+    }
+
+    #[test]
+    fn renderer_memory_reads_through_the_published_handles() {
+        // The point of sharing `Arc`s rather than values: the snapshot sees
+        // what the watchdog stored AFTER publication, not a copy frozen at it.
+        let handles = renderer_handles(1_000, 2, true, vec![]);
+        let (bytes, reloads, storming, processes) = renderer_memory_snapshot_from(Some(&handles));
+        assert_eq!((bytes, reloads, storming), (1_000, 2, true));
+        assert!(processes.is_empty());
+
+        handles
+            .latest_ws_bytes
+            .store(2_000, std::sync::atomic::Ordering::Relaxed);
+        handles
+            .storming
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let (bytes, _, storming, _) = renderer_memory_snapshot_from(Some(&handles));
+        assert_eq!((bytes, storming), (2_000, false));
+    }
+
+    #[test]
+    fn the_renderer_breakdown_round_trips_without_content() {
+        // Plan §6 Q6: pids, a coarse kind, byte counts and a first-seen stamp
+        // ride the wire — no path, no command line, no window title, no URL.
+        // Pinned on the PAYLOAD and not only on `ProcessSample`, because the
+        // wire is what the privacy posture is about.
+        let sample = ProcessSample {
+            pid: 19492,
+            kind: WebViewProcessKind::Renderer,
+            working_set_bytes: 382 * 1024 * 1024,
+            first_seen_unix_ms: 1_758_000_000_000,
+        };
+        let handles = renderer_handles(788 * 1024 * 1024, 0, false, vec![sample.clone()]);
+        let (bytes, _, _, processes) = renderer_memory_snapshot_from(Some(&handles));
+        assert_eq!(processes, vec![sample.clone()]);
+
+        let json = renderer_payload(bytes, 0, false, processes);
+        let arr = json["renderer_processes"]
+            .as_array()
+            .expect("the breakdown is an array");
+        assert_eq!(arr.len(), 1);
+        let mut keys: Vec<&str> = arr[0]
+            .as_object()
+            .expect("each entry is an object")
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["firstSeenUnixMs", "kind", "pid", "workingSetBytes"]);
+        assert_eq!(arr[0]["kind"], "renderer");
+        assert_eq!(arr[0]["pid"], 19492);
+        // The total stays SEPARATE from the breakdown: three scalar columns,
+        // and the split as diagnostic JSON beside them.
+        assert_eq!(json["renderer_memory_bytes"], 788u64 * 1024 * 1024);
     }
 }

@@ -9289,6 +9289,16 @@ pub fn create_router(
         last_fallback: api_state.vision_last_fallback.clone(),
     });
 
+    // Same seam, same heartbeat, for the renderer-memory watchdog (plan
+    // 2026-06-09-runner-renderer-memory-watchdog-and-twin-slo, Phase 3.1).
+    // The handles come from the watchdog's own process-global state rather than
+    // from `api_state`, because the PRODUCER is the watchdog task — which is
+    // spawned from the same Tauri `setup` hook as this server and may win or
+    // lose that race. `heartbeat_handles()` is safe to call either way: the
+    // handles exist from first touch and read as an honest zero baseline until
+    // the first sample lands.
+    crate::fleet::publish_renderer_memory_handles(crate::renderer_watchdog::heartbeat_handles());
+
     // Register api_state as Tauri-managed so `#[tauri::command]` functions taking
     // `State<'_, Arc<ApiState>>` can resolve it.
     app_handle.manage(api_state.clone());
