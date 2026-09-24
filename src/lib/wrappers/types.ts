@@ -91,16 +91,24 @@ export interface ActionDescriptor {
   description?: string;
 }
 
-/** Installed wrapper as returned by `GET /wrappers` and `GET /wrappers/:id`. */
+/**
+ * Installed wrapper as returned by `GET /wrappers` and `GET /wrappers/:id` —
+ * mirror of Rust `wrappers::registry::Wrapper`, which has no
+ * `#[serde(rename_all)]` and so serializes its snake_case field names
+ * verbatim (pinned by `wrapper_wire_shape_matches_the_ts_mirror` in
+ * `registry.rs`). Reading `.packageName` here always yielded `undefined`, so
+ * every installed wrapper's package name rendered blank (plan
+ * 2026-08-23-single-source-derived-facts, post-#1696 follow-up).
+ */
 export interface InstalledWrapper {
   id: string;
-  packageName: string;
+  package_name: string;
   version: string;
   manifest: WrapperManifest;
   actions: ActionDescriptor[];
-  installPath?: string;
-  installedAt?: number;
-  updatedAt?: number;
+  install_path?: string;
+  installed_at?: number;
+  updated_at?: number;
 }
 
 /**

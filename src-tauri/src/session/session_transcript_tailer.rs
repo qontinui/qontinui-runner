@@ -330,7 +330,11 @@ mod tests {
     ) {
         let outbox = Arc::new(OutboxWriter::open(dir.join("outbox.jsonl")).unwrap());
         let machine_id = Uuid::new_v4();
-        let registrar = Arc::new(AiCoordRegistrar::new(outbox.clone(), machine_id));
+        let registrar = Arc::new(AiCoordRegistrar::with_tenant_resolver(
+            outbox.clone(),
+            machine_id,
+            || None,
+        ));
         let emitter = Arc::new(TranscriptEmitter::new(
             outbox.clone(),
             machine_id,

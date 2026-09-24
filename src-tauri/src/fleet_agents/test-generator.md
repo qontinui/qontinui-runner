@@ -370,7 +370,25 @@ def test_performance_large_dataset():
 
 ### Step 9: Generate Test Report
 
+**The coverage numbers below are about a TREE, and nothing in this file names
+one.** A "coverage after: 89%" measured in a checkout that is 200 commits
+behind, or one carrying a peer's uncommitted edits, reads identically to the
+same number measured on the intended commit. So measure the tree before
+generating the first test, and re-measure immediately before emitting:
+
+```bash
+bash <workspace-root>/qontinui-claude-config/scripts/lib/tree-identity.sh --root .
+```
+
+`tree-recheck` compares the second `head=` against the first: `moved=yes` when
+they differ, `moved=unknown` when either reads `unknown` — an unresolved
+measurement is a sentinel, not a value, and two of them are string-equal. Both
+lines lead the report, above its heading.
+
 ```markdown
+tree: root=<name> head=<sha> dirty=<digest|clean|unknown> dirty_files=<n|UNKNOWN> measured=<ISO-8601-UTC>
+tree-recheck: head=<sha> moved=<yes|no|unknown> measured=<ISO-8601-UTC>
+
 ## Test Generation Report
 
 ### Coverage Summary

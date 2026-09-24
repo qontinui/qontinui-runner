@@ -25,69 +25,15 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // ---------------------------------------------------------------------------
-// Minimal hooks harness
+// Minimal hooks harness (shared: `@/lib/__test-helpers__/hooks-harness`)
 // ---------------------------------------------------------------------------
 
-const harness = vi.hoisted(() => {
-  const slots: unknown[] = [];
-  let cursor = 0;
-  let dirty = false;
-  let pendingEffects: Array<() => void> = [];
-  const depsChanged = (prev: unknown[] | undefined, next: unknown[] | undefined) =>
-    !prev || !next || prev.length !== next.length || prev.some((d, k) => !Object.is(d, next[k]));
-  return {
-    reset() {
-      slots.length = 0;
-      cursor = 0;
-      dirty = false;
-      pendingEffects = [];
-    },
-    beginRender() {
-      cursor = 0;
-      dirty = false;
-      pendingEffects = [];
-    },
-    /** Run the effects queued by the last render; true if any state changed. */
-    flushEffects(): boolean {
-      const effects = pendingEffects;
-      pendingEffects = [];
-      for (const run of effects) run();
-      return dirty;
-    },
-    useState<T>(init: T | (() => T)) {
-      const slot = cursor++;
-      if (!(slot in slots)) {
-        slots[slot] = typeof init === "function" ? (init as () => T)() : init;
-      }
-      const set = (v: T | ((prev: T) => T)) => {
-        const next = typeof v === "function" ? (v as (p: T) => T)(slots[slot] as T) : v;
-        if (!Object.is(next, slots[slot])) dirty = true;
-        slots[slot] = next;
-      };
-      return [slots[slot] as T, set] as const;
-    },
-    useRef<T>(init: T) {
-      const slot = cursor++;
-      if (!(slot in slots)) slots[slot] = { current: init };
-      return slots[slot] as { current: T };
-    },
-    useEffect(effect: () => void, deps?: unknown[]) {
-      const slot = cursor++;
-      const prev = slots[slot] as unknown[] | undefined;
-      if (depsChanged(prev, deps)) {
-        slots[slot] = deps;
-        pendingEffects.push(effect);
-      }
-    },
-  };
+vi.mock("react", async () => {
+  const { hooksHarness } = await import("@/lib/__test-helpers__/hooks-harness");
+  return hooksHarness.reactMock;
 });
 
-vi.mock("react", () => ({
-  useState: harness.useState,
-  useCallback: <F>(fn: F) => fn,
-  useRef: harness.useRef,
-  useEffect: harness.useEffect,
-}));
+import { hooksHarness as harness } from "@/lib/__test-helpers__/hooks-harness";
 
 const persisted = vi.hoisted(() => ({ value: null as unknown }));
 vi.mock("@/lib/instance-storage", () => ({
@@ -211,13 +157,7 @@ function mountSparseQuad(
   }
   // One settled render: render, run the effects that render queued, and
   // re-render until state stops changing — what React does after a commit.
-  function renderSettled() {
-    for (let pass = 0; pass < 10; pass++) {
-      const result = ZoneLayoutHost();
-      if (!harness.flushEffects()) return result;
-    }
-    throw new Error("zone layout did not settle within 10 renders");
-  }
+  const renderSettled = () => harness.renderSettled(ZoneLayoutHost);
   // Settle once, then prove the effects left the fixture as mounted.
   const first = renderSettled();
   expect(first.assignments).toEqual(assignments);

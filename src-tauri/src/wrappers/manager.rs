@@ -194,12 +194,12 @@ impl WrapperManager {
         };
 
         // Wait for the wrapper's port to become reachable before we
-        // declare the spawn successful. If it never does, kill the child
-        // and surface a useful error.
+        // declare the spawn successful. If it never does, route the child
+        // through the same terminate_runtime used by stop()/claim_or_retire
+        // so it is waited on (and force-killed after STOP_GRACE) rather than
+        // just signalled and dropped.
         if let Err(e) = wait_for_port(port, SPAWN_READY_TIMEOUT).await {
-            if let Some(mut child) = runtime.child.take() {
-                let _ = child.start_kill();
-            }
+            terminate_runtime(wrapper_id, runtime).await;
             return Err(format!(
                 "wrapper '{}' did not become ready on port {} within {:?}: {}",
                 wrapper_id, port, SPAWN_READY_TIMEOUT, e
@@ -302,6 +302,43 @@ impl WrapperManager {
         }
     }
 
+    /// Apply one health-probe result to the runtime record it was taken
+    /// for. `id`/`port` are a snapshot from before the (awaited) probe ran;
+    /// `spawn` may have retired that record and inserted a new one (a fresh
+    /// port) while the probe was in flight, via `claim_or_retire`. Checking
+    /// `rt.port == port` refuses to charge a failed probe of the OLD port
+    /// against a process that was never asked, and refuses to reset the
+    /// NEW record's failure count on a stale success.
+    async fn apply_health_probe(self: &Arc<Self>, id: &str, port: u16, healthy: bool) {
+        let mut runtimes = self.runtimes.write().await;
+        let rt = match runtimes.get_mut(id) {
+            Some(r) => r,
+            None => return,
+        };
+        if rt.port != port {
+            return;
+        }
+        if healthy {
+            rt.consecutive_failures = 0;
+            if rt.state == WrapperState::Degraded {
+                rt.state = WrapperState::Running;
+            }
+        } else {
+            rt.consecutive_failures = rt.consecutive_failures.saturating_add(1);
+            if rt.consecutive_failures >= HEALTH_MAX_RETRIES && rt.state != WrapperState::Degraded {
+                warn!(
+                    "wrappers: '{}' health check failed {}x — marking degraded",
+                    id, rt.consecutive_failures
+                );
+                rt.state = WrapperState::Degraded;
+                // Drop the lock before respawn; it acquires its own write
+                // guard.
+                drop(runtimes);
+                let _ = self.restart_after_degraded(id).await;
+            }
+        }
+    }
+
     /// Background task: probe each running wrapper's port. After
     /// `HEALTH_MAX_RETRIES` consecutive failures the wrapper is marked
     /// `Degraded` and a single restart attempt is made.
@@ -320,32 +357,7 @@ impl WrapperManager {
                     .collect();
                 for (id, port) in ids {
                     let healthy = probe_port(port).await.is_ok();
-                    let mut runtimes = manager.runtimes.write().await;
-                    let rt = match runtimes.get_mut(&id) {
-                        Some(r) => r,
-                        None => continue,
-                    };
-                    if healthy {
-                        rt.consecutive_failures = 0;
-                        if rt.state == WrapperState::Degraded {
-                            rt.state = WrapperState::Running;
-                        }
-                    } else {
-                        rt.consecutive_failures = rt.consecutive_failures.saturating_add(1);
-                        if rt.consecutive_failures >= HEALTH_MAX_RETRIES
-                            && rt.state != WrapperState::Degraded
-                        {
-                            warn!(
-                                "wrappers: '{}' health check failed {}x — marking degraded",
-                                id, rt.consecutive_failures
-                            );
-                            rt.state = WrapperState::Degraded;
-                            // Drop the lock before respawn; it acquires
-                            // its own write guard.
-                            drop(runtimes);
-                            let _ = manager.restart_after_degraded(&id).await;
-                        }
-                    }
+                    manager.apply_health_probe(&id, port, healthy).await;
                 }
             }
         });
@@ -702,5 +714,41 @@ mod tests {
                 "state",
             ]
         );
+    }
+
+    /// A probe result whose `port` no longer matches the record's CURRENT
+    /// port (as if `spawn` had retired and replaced the record while the
+    /// probe was in flight) must be dropped rather than applied — the
+    /// pre-fix behaviour charged a failed probe of the OLD port to the NEW
+    /// record. `manager_with` seeds port 41234 and `consecutive_failures =
+    /// HEALTH_MAX_RETRIES`; probing a different port simulates the stale
+    /// snapshot and must leave both untouched.
+    #[tokio::test]
+    async fn stale_probe_port_is_ignored() {
+        let (manager, _tmp) = manager_with(WrapperState::Running).await;
+        manager.apply_health_probe("w", 9999, false).await;
+        let status = manager.status("w").await;
+        assert_eq!(status.consecutive_health_failures, HEALTH_MAX_RETRIES);
+        assert_eq!(status.state, WrapperState::Running);
+    }
+
+    /// Negative control: a probe result for the record's CURRENT port is
+    /// applied normally. Reset the seeded failure count to 0 first so the
+    /// failure path doesn't also cross HEALTH_MAX_RETRIES and trigger a
+    /// degrade/restart, which is a different behaviour covered elsewhere.
+    #[tokio::test]
+    async fn current_port_probe_is_applied() {
+        let (manager, _tmp) = manager_with(WrapperState::Running).await;
+        manager
+            .runtimes
+            .write()
+            .await
+            .get_mut("w")
+            .unwrap()
+            .consecutive_failures = 0;
+        manager.apply_health_probe("w", 41234, false).await;
+        assert_eq!(manager.status("w").await.consecutive_health_failures, 1);
+        manager.apply_health_probe("w", 41234, true).await;
+        assert_eq!(manager.status("w").await.consecutive_health_failures, 0);
     }
 }

@@ -523,7 +523,7 @@ fn plan_library_backfill(args: &[String]) -> ExitCode {
         .try_init();
 
     let conv = PlanConvention::operator_default();
-    let mut per_root: Vec<(String, usize)> = Vec::new();
+    let mut per_root: Vec<(String, bp::RootYield)> = Vec::new();
     let mut all: Vec<bp::ScannedArtifact> = Vec::new();
     let mut skipped: Vec<bp::SkippedFile> = Vec::new();
     // Through the RESOLVED source, exactly as the reconcile loop does — never
@@ -536,16 +536,28 @@ fn plan_library_backfill(args: &[String]) -> ExitCode {
     // behind its default branch — re-introducing the exact defect Phase 3
     // removes, and with two writers alternating so the corpus flaps. One byte
     // source for both writers is the whole point.
+    //
+    // One pin for the whole run, so roots sharing a repo share one fetch and
+    // one commit — the same guarantee the loop gives its two halves.
+    let pin = pwa::ref_scan::CycleRefPin::default();
     for root in &roots {
-        let (found, mut root_skipped) =
-            pwa::scan_roots_at_source(std::slice::from_ref(root), &conv, &pwa::trigger::ProcessGit);
+        let (found, mut root_skipped) = pwa::scan_roots_at_source(
+            std::slice::from_ref(root),
+            &conv,
+            &pwa::trigger::ProcessGit,
+            &pin,
+        );
+        // A root that could not be read reports UNKNOWN, and a partly read
+        // one a floor, never a bare count. The skip list alone left the
+        // by-root table claiming an empty or a whole root.
+        let yielded = bp::RootYield::of(&root.dir, found.len(), &root_skipped);
         skipped.append(&mut root_skipped);
         let label = format!(
             "{} [{}]",
             root.label,
             root.source_repo.as_deref().unwrap_or("no repo")
         );
-        per_root.push((label, found.len()));
+        per_root.push((label, yielded));
         all.extend(found);
     }
 

@@ -1134,6 +1134,44 @@ pub struct SharedBranchRepo {
     pub parent_sha_provenance: ParentShaProvenance,
 }
 
+/// The leading token of a session refused because it got no worktree of its
+/// own: a foreign-repo gate continuation (`agent_runtime`), coord's
+/// `shared_branch` refused by a caller that does not accept it, and an
+/// orchestration worker (`orchestration_loop::ai_session_executor`). Stable,
+/// like [`canonical_paths::WORKDIR_NOT_A_CHECKOUT`].
+pub const NO_ISOLATED_WORKTREE: &str = "no_isolated_worktree";
+
+/// Whether an allocate may honor coord's `shared_branch` directive, which
+/// checks the agent's branch out IN the canonical checkout instead of cutting
+/// a worktree.
+///
+/// An interactive terminal honors it: an operator's shell on a feature branch
+/// of the shared checkout is a supported mode. An autonomous orchestration
+/// worker refuses it, because for an editor that nobody watches the shared
+/// checkout IS the failure isolation exists to prevent (plan
+/// `2026-09-23-conductor-e2e-phase1-defects` Phase 1). The refusal happens
+/// BEFORE any lease or branch switch, so the operator's checkout is never
+/// parked on a branch that nothing will work on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedBranchPolicy {
+    Honor,
+    Refuse,
+}
+
+/// The refusal [`allocate_and_materialize_with_claim`] returns when coord
+/// chose `shared_branch` under [`SharedBranchPolicy::Refuse`]. Leads with the
+/// `no_isolated_worktree` token the continuation path already uses for the
+/// same condition, so a reader greps one token for both.
+pub(crate) fn shared_branch_policy_refusal(repos: &[RepoRequest]) -> String {
+    let names: Vec<&str> = repos.iter().map(|r| r.repo.as_str()).collect();
+    format!(
+        "{}: coord chose shared_branch for {}, and this caller does not accept the shared \
+         checkout; refused before any branch switch",
+        NO_ISOLATED_WORKTREE,
+        names.join(", ")
+    )
+}
+
 /// Result of an [`Isolation::Wait`] directive — nothing materialized.
 #[derive(Debug, Clone, Serialize)]
 pub struct WaitOutcome {
@@ -1220,6 +1258,13 @@ pub enum AllocateError {
     /// offending repo slug. The caller retries ONCE pinning the local
     /// `origin/<default>` SHA so the worktree still forks off a fresh base.
     RepoNotRegistered(String),
+    /// Coord answered `isolation: wait` — nothing was materialized and every
+    /// pre-acquired claim was already released. Typed rather than a `"wait:"`
+    /// string prefix because callers branch on it: an interactive terminal logs
+    /// it and falls back to its shared cwd, while an orchestration worker
+    /// treats it as "not yet" and stays queued (plan
+    /// `2026-09-23-conductor-e2e-phase1-defects` Phase 1).
+    Wait(WaitOutcome),
     /// Anything else — config errors, transport failures, coord 5xx,
     /// `git worktree add` failures, etc.
     Other(String),
@@ -1236,6 +1281,12 @@ impl std::fmt::Display for AllocateError {
             AllocateError::RepoNotRegistered(repo) => write!(
                 f,
                 "repo {repo} not registered in coord.canonical_repos and no parent_sha supplied"
+            ),
+            AllocateError::Wait(w) => write!(
+                f,
+                "wait: coord declined to materialize agent_id={} reason={:?} blocking={:?} \
+                 retry_when={:?}",
+                w.agent_id, w.reason, w.blocking, w.retry_when
             ),
             AllocateError::Other(s) => f.write_str(s),
         }
@@ -1533,6 +1584,10 @@ fn allocate_tenant_scope(
 /// [`release_claim_best_effort`]); [`AllocateResult::active_claims`] carries
 /// them all for that purpose.
 ///
+/// `shared_branch` decides whether coord's `shared_branch` directive is
+/// honored or refused before any lease or branch switch — see
+/// [`SharedBranchPolicy`].
+///
 /// On success returns `AllocateResult`. On any non-claim error,
 /// returns `Err(AllocateError::Other(String))`. Partial failure is
 /// handled at the boundary: if any `git worktree add` fails after coord
@@ -1550,6 +1605,7 @@ pub async fn allocate_and_materialize_with_claim(
     plan_id: Option<&str>,
     phase: Option<&str>,
     spawn_tenant: Option<uuid::Uuid>,
+    shared_branch: SharedBranchPolicy,
 ) -> Result<MaterializeOutcome, AllocateError> {
     if !worktree_mode_enabled() {
         return Err(AllocateError::Other(format!(
@@ -1709,6 +1765,13 @@ pub async fn allocate_and_materialize_with_claim(
         if let Some(refusal) = shared_branch_foreign_refusal(repos) {
             release_all_claims_best_effort(coord_http_base, machine_id, &active_claims).await;
             return Err(AllocateError::Other(refusal));
+        }
+        // A caller that does not accept the shared checkout at all (an
+        // orchestration worker) is refused at the same point, for the same
+        // reason: nothing has been leased or switched yet.
+        if shared_branch == SharedBranchPolicy::Refuse {
+            release_all_claims_best_effort(coord_http_base, machine_id, &active_claims).await;
+            return Err(AllocateError::Other(shared_branch_policy_refusal(repos)));
         }
         // Ξ_Worktree Phase 7.5b — BEFORE switching any canonical checkout's
         // branch, acquire an exclusive `canonical_checkout` lease per repo so
@@ -3101,6 +3164,41 @@ mod tests {
         assert!(refusal.starts_with("no_isolated_worktree: "), "{refusal}");
         assert!(refusal.contains("portofino-pizzeria/backend"), "{refusal}");
         assert!(!refusal.contains("qontinui/qontinui-runner"), "{refusal}");
+    }
+
+    /// Plan `2026-09-23-conductor-e2e-phase1-defects` Phase 1: the refusal a
+    /// `SharedBranchPolicy::Refuse` caller gets leads with the same token as
+    /// the foreign-repo refusal, and names every repo, managed ones included.
+    #[test]
+    fn a_shared_branch_policy_refusal_leads_with_the_no_isolated_worktree_token() {
+        let refusal = shared_branch_policy_refusal(&[RepoRequest {
+            repo: "qontinui-runner".to_string(),
+            parent_sha: None,
+        }]);
+        assert!(refusal.starts_with("no_isolated_worktree: "), "{refusal}");
+        assert!(refusal.contains("qontinui-runner"), "{refusal}");
+        assert!(refusal.contains("before any branch switch"), "{refusal}");
+    }
+
+    /// A `wait` is typed, and its text keeps the `wait:` line a terminal's
+    /// fallback warning has always logged.
+    #[test]
+    fn a_wait_allocate_error_displays_coords_directive() {
+        let e = AllocateError::Wait(WaitOutcome {
+            agent_id: "a1".to_string(),
+            reason: Some("upstream held".to_string()),
+            blocking: None,
+            retry_when: Some("after #12".to_string()),
+        });
+        let text = e.to_string();
+        assert!(
+            text.starts_with("wait: coord declined to materialize agent_id=a1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("upstream held") && text.contains("after #12"),
+            "{text}"
+        );
     }
 
     #[test]
