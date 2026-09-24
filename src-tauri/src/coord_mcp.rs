@@ -6162,7 +6162,11 @@ mod session_tenant_resolution_tests {
         );
 
         match decision.into_result() {
-            Err((status, body)) => {
+            Err(refusal) => {
+                // main's tests destructured the old `(u16, String)`; this branch
+                // made the error a `ProxyRefusal`. Same two values, same asserts.
+                let status = refusal.status;
+                let body = refusal.message;
                 assert_eq!(status, 403);
                 assert!(
                     body.contains("terminal:tenant_not_paired"),
@@ -6214,7 +6218,11 @@ mod session_tenant_resolution_tests {
             },
         );
         match decision.into_result() {
-            Err((status, body)) => {
+            Err(refusal) => {
+                // main's tests destructured the old `(u16, String)`; this branch
+                // made the error a `ProxyRefusal`. Same two values, same asserts.
+                let status = refusal.status;
+                let body = refusal.message;
                 assert_eq!(status, 403);
                 assert!(
                     body.contains("terminal:tenant_credential_store_unreadable"),
@@ -6247,7 +6255,11 @@ mod session_tenant_resolution_tests {
             other => panic!("expected DeclaredTenantUnusable, got {other:?}"),
         }
         match decision.into_result() {
-            Err((status, body)) => {
+            Err(refusal) => {
+                // main's tests destructured the old `(u16, String)`; this branch
+                // made the error a `ProxyRefusal`. Same two values, same asserts.
+                let status = refusal.status;
+                let body = refusal.message;
                 assert_eq!(status, 403);
                 assert!(
                     body.contains("terminal:tenant_declaration_unusable"),
@@ -6348,7 +6360,11 @@ mod session_tenant_resolution_tests {
             no_claim,
             |t| panic!("absence must never reach admission ({t})"),
         ) {
-            Err((status, body)) => {
+            Err(refusal) => {
+                // main's tests destructured the old `(u16, String)`; this branch
+                // made the error a `ProxyRefusal`. Same two values, same asserts.
+                let status = refusal.status;
+                let body = refusal.message;
                 assert_eq!(status, 503);
                 assert!(
                     body.contains("COORD_MCP_PROXY_TENANT_UNRESOLVABLE"),
