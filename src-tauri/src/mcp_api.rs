@@ -4275,61 +4275,201 @@ async fn coord_mcp_tool_policy_handler() -> Json<serde_json::Value> {
 /// the same reason every other credential read on this file's request paths
 /// does.
 ///
-/// # The optional workspace (Phase 5)
+/// # Which session (Phase 5, as revised by the runner#1703 review)
 ///
 /// Plan `2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin`
-/// D5. The three workspace declaration tiers are per-WORKSPACE and this door is
-/// process-level, so it can only report them when the caller says which
-/// workspace. Two ways, both optional:
+/// D5. The declaration tiers are per-WORKSPACE and this door is
+/// process-level, so it reports them only for a caller that says which
+/// session it means — at most ONE of:
 ///
-/// - `?workdir=<absolute path>` — ask for that path directly.
-/// - `?nonce=<session nonce>` — ask for whatever workspace that session was
-///   provisioned into, through the SAME [`crate::coord_mcp::workdir_for_nonce`]
-///   seam `session_tenant_or_refuse` uses. This is the honest one for "why was
-///   MY session refused", because it cannot disagree with the proxy about which
-///   workspace the session is in.
+/// - `?workdir=<absolute path>` — what a NEW session opened there resolves to.
+/// - the caller's own session nonce, in `Authorization: Bearer <nonce>` (or
+///   the legacy `X-Coord-Mcp-Proxy-Key`), read by the proxy's own
+///   [`crate::coord_mcp::proxy_nonce_from_request`] — what THAT session
+///   resolves to, binding pin (row 1) included, so it cannot disagree with the
+///   proxy.
 ///
-/// With **neither** supplied the tiers report `evaluated: false` /
-/// `not-evaluated` — UNKNOWN, never "this workspace declares no tenant". See
-/// [`crate::coord_mcp::doctor::WorkspaceDeclarationView`] for why those two
-/// answers must not collapse.
+/// A `?nonce=` query parameter is REFUSED (400), never read: a URL lands in
+/// shell history, process argv and the request-trace span, and the nonce is
+/// the session's proxy credential. Coord finding
+/// `e545aaf4-c569-4d77-8852-7e44a1bd459e` records that decision. Supplying
+/// both a workdir and a nonce is refused too, rather than silently letting one
+/// win.
 ///
-/// A `nonce` that resolves to no workdir leaves the tiers NOT EVALUATED rather
-/// than silently reporting for no workspace: an unknown nonce establishes
-/// nothing about a workspace. The route stays UNAUTHENTICATED, and the workdir
-/// echoed back is one the caller already supplied, so nothing new is disclosed.
+/// With neither, the per-workspace tiers report `not-evaluated` — UNKNOWN,
+/// never "this workspace declares no tenant".
+///
+/// Exposure, stated: `?workdir=` lets any local NON-browser process read the
+/// `tenant:` declaration of any path it names (browsers are kept off by the
+/// origin guard's credential-door class). That is bounded — the machine scope
+/// already lists every slot this box holds — and it is the price of letting a
+/// refused agent diagnose itself without a credential.
 async fn coord_mcp_doctor_handler(
+    headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Json<serde_json::Value> {
-    let report = tokio::task::spawn_blocking(move || {
-        let workspace = params
-            .get("workdir")
-            .map(|w| w.trim().to_string())
-            .filter(|w| !w.is_empty())
-            .or_else(|| {
-                params
-                    .get("nonce")
-                    .map(|n| n.trim())
-                    .filter(|n| !n.is_empty())
-                    .and_then(crate::coord_mcp::workdir_for_nonce)
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match doctor_scope_from_request(&headers, &params) {
+        Err(body) => (axum::http::StatusCode::BAD_REQUEST, Json(body)).into_response(),
+        Ok(scope) => {
+            let report = tokio::task::spawn_blocking(move || match &scope {
+                DoctorRequestScope::Machine => crate::coord_mcp::doctor::report_for(
+                    crate::coord_mcp::doctor::DoctorScope::Machine,
+                ),
+                DoctorRequestScope::Workdir(w) => crate::coord_mcp::doctor::report_for(
+                    crate::coord_mcp::doctor::DoctorScope::Workdir(w),
+                ),
+                DoctorRequestScope::Session(n) => crate::coord_mcp::doctor::report_for(
+                    crate::coord_mcp::doctor::DoctorScope::Session(n),
+                ),
+            })
+            .await
+            .unwrap_or_else(|e| {
+                // A join failure is UNKNOWN about the credential, not a verdict
+                // on it — say so rather than rendering a confident
+                // "no-credential".
+                serde_json::json!({
+                    "probed_at": chrono::Utc::now().to_rfc3339(),
+                    "verdict": "unknown",
+                    "layer": "none",
+                    "detail": format!(
+                        "the doctor probe could not be run on this runner ({e}) — this says \
+                         nothing about the credential"
+                    ),
+                })
             });
-        crate::coord_mcp::doctor::report_for_workspace(workspace.as_deref())
-    })
-    .await
-    .unwrap_or_else(|e| {
-        // A join failure is UNKNOWN about the credential, not a verdict on
-        // it — say so rather than rendering a confident "no-credential".
-        serde_json::json!({
-            "probed_at": chrono::Utc::now().to_rfc3339(),
-            "verdict": "unknown",
-            "layer": "none",
-            "detail": format!(
-                "the doctor probe could not be run on this runner ({e}) — this says \
-                 nothing about the credential"
-            ),
-        })
-    });
-    Json(report)
+            Json(report).into_response()
+        }
+    }
+}
+
+/// The doctor's request scope, owned so it can cross into the blocking pool.
+#[derive(Debug, PartialEq, Eq)]
+enum DoctorRequestScope {
+    Machine,
+    Workdir(String),
+    Session(String),
+}
+
+/// Pure: decide the doctor's scope from the request, or the 400 body. Never
+/// reads a nonce from the query string, and never echoes one back.
+fn doctor_scope_from_request(
+    headers: &axum::http::HeaderMap,
+    params: &std::collections::HashMap<String, String>,
+) -> Result<DoctorRequestScope, serde_json::Value> {
+    if params.contains_key("nonce") {
+        return Err(serde_json::json!({
+            "error": "nonce_in_query_refused",
+            "detail": "the session nonce is a credential and is never accepted in the URL \
+                       (shell history, argv and request logs keep URLs). Send it as \
+                       `Authorization: Bearer <nonce>` — and rotate it if this URL was logged \
+                       anywhere shared.",
+        }));
+    }
+    let workdir = params
+        .get("workdir")
+        .map(|w| w.trim().to_string())
+        .filter(|w| !w.is_empty());
+    // Byte-for-byte what the proxy reads — no trimming, so a key the proxy
+    // would reject is not recognised here either.
+    let nonce = crate::coord_mcp::proxy_nonce_from_request(headers).filter(|n| !n.is_empty());
+    // A credential header that yields no nonce (a JWT, an empty `Bearer `) is
+    // refused rather than silently answered as the machine-level question —
+    // the caller meant to ask about a session.
+    let credential_header_present = headers.contains_key(axum::http::header::AUTHORIZATION)
+        || headers.contains_key(crate::coord_mcp::COORD_MCP_PROXY_KEY_HEADER);
+    if credential_header_present && nonce.is_none() {
+        return Err(serde_json::json!({
+            "error": "unrecognised_credential_shape",
+            "detail": "a credential header was sent but carries no coord-mcp proxy nonce \
+                       (a JWT or an empty value) — send the session's proxy nonce as \
+                       `Authorization: Bearer <nonce>`, or omit the header for the \
+                       machine-level view",
+        }));
+    }
+    match (workdir, nonce) {
+        (Some(_), Some(_)) => Err(serde_json::json!({
+            "error": "ambiguous_doctor_scope",
+            "detail": "supply EITHER ?workdir=<path> OR a session nonce header, not both — \
+                       they can name different workspaces and this door will not pick one \
+                       silently",
+        })),
+        (Some(w), None) => Ok(DoctorRequestScope::Workdir(w)),
+        (None, Some(n)) => Ok(DoctorRequestScope::Session(n)),
+        (None, None) => Ok(DoctorRequestScope::Machine),
+    }
+}
+
+/// MAJOR-4 of the runner#1703 review: the session nonce travels only in the
+/// headers the proxy itself reads, and a URL-borne nonce is refused, not read.
+#[cfg(test)]
+mod coord_mcp_doctor_scope_tests {
+    use super::*;
+
+    fn params(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_nonce_in_the_query_is_refused_and_never_echoed() {
+        let secret = "0123456789abcdef0123456789abcdef";
+        let err =
+            doctor_scope_from_request(&axum::http::HeaderMap::new(), &params(&[("nonce", secret)]))
+                .expect_err("a URL-borne nonce is refused");
+        assert_eq!(err["error"], serde_json::json!("nonce_in_query_refused"));
+        assert!(
+            !err.to_string().contains(secret),
+            "the refusal never echoes the nonce"
+        );
+
+        // Even alongside a valid header nonce: the URL copy already leaked.
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("authorization", "Bearer n1".parse().unwrap());
+        assert!(doctor_scope_from_request(&h, &params(&[("nonce", secret)])).is_err());
+    }
+
+    #[test]
+    fn the_nonce_is_read_from_the_headers_the_proxy_reads() {
+        let mut bearer = axum::http::HeaderMap::new();
+        bearer.insert("authorization", "Bearer n1".parse().unwrap());
+        assert_eq!(
+            doctor_scope_from_request(&bearer, &params(&[])),
+            Ok(DoctorRequestScope::Session("n1".into()))
+        );
+        let mut legacy = axum::http::HeaderMap::new();
+        legacy.insert(
+            crate::coord_mcp::COORD_MCP_PROXY_KEY_HEADER,
+            "n2".parse().unwrap(),
+        );
+        assert_eq!(
+            doctor_scope_from_request(&legacy, &params(&[])),
+            Ok(DoctorRequestScope::Session("n2".into()))
+        );
+        assert_eq!(
+            doctor_scope_from_request(&axum::http::HeaderMap::new(), &params(&[("workdir", "/w")])),
+            Ok(DoctorRequestScope::Workdir("/w".into()))
+        );
+        assert_eq!(
+            doctor_scope_from_request(&axum::http::HeaderMap::new(), &params(&[])),
+            Ok(DoctorRequestScope::Machine)
+        );
+        // A credential header carrying no nonce is refused, not read as
+        // "no session".
+        let mut empty = axum::http::HeaderMap::new();
+        empty.insert("authorization", "Bearer ".parse().unwrap());
+        let err = doctor_scope_from_request(&empty, &params(&[])).expect_err("no nonce");
+        assert_eq!(
+            err["error"],
+            serde_json::json!("unrecognised_credential_shape")
+        );
+        // Both named: refused rather than silently picking one.
+        let err = doctor_scope_from_request(&bearer, &params(&[("workdir", "/w")]))
+            .expect_err("ambiguous");
+        assert_eq!(err["error"], serde_json::json!("ambiguous_doctor_scope"));
+    }
 }
 
 /// Is this request body a `tools/list` (single or anywhere in a batch)?
