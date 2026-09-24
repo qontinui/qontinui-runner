@@ -561,12 +561,24 @@ fn run_claude_session_inline(
             working_dir,
             &ai_settings.claude_cli,
             // Phase 8b (B2): thread the session's RECORDED tenant so the
-            // federated pool agrees with the coord record + JWT slot. The
-            // coord side is stamped by `AiCoordRegistrar` from this SAME
-            // resolver (the machine.json pin, else — on an unpinned device —
-            // the paired_user.json default binding). `None` on an
-            // unresolvable or unpaired machine.
-            crate::session::resolve_new_session_tenant(),
+            // federated pool agrees with the coord record + JWT slot: the
+            // tenant `AiCoordRegistrar` stamped them with, looked up by this
+            // spawn's own id, then by the owning task run's id (a workflow
+            // phase session's id is suffixed; the run is what registered).
+            // Neither registered yet, or no tenant recorded: the registrar's
+            // own resolver. `None` on an unresolvable or unpaired machine.
+            crate::claude_session::coord_register::federation_session_tenant(
+                tauri::Manager::try_state::<
+                    std::sync::Arc<crate::claude_session::coord_register::AiCoordRegistrar>,
+                >(app_handle)
+                .as_deref()
+                .map(|r| &**r),
+                &crate::claude_session::coord_register::federation_session_keys(
+                    session_id,
+                    task_run_id,
+                    session_ctx.as_ref(),
+                ),
+            ),
         ) {
             Ok(ctx) => Some(ctx),
             Err(reason) => {
