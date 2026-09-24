@@ -258,7 +258,7 @@ export function reduceRendererWatchdogEvent(
 
 /**
  * Retire a countdown whose reload attempt is over (see
- * {@link WARNING_LINGER_SECS}). PURE; returns the same object when there is
+ * {@link warningLingerSecs}). PURE; returns the same object when there is
  * nothing to retire, so the hook's 1 s tick is free on every other tick.
  */
 export function advanceRendererWatchdogClock(

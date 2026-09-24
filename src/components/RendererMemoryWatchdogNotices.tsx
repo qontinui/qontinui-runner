@@ -23,8 +23,10 @@
  *    other exit, and it is the action the banner recommends.
  *
  * Both are driven by {@link useRendererMemoryWatchdog}, which owns the
- * `renderer-memory-watchdog` subscription and the event→state mapping. The
- * fourth emitted kind, `reload_result`, goes to the app's ordinary toast queue
+ * `renderer-memory-watchdog` subscription and the event→state mapping. Of the
+ * four kinds Rust emits, three reach these two surfaces — `reload_warning`
+ * raises the countdown, `storming` raises the banner and `storm_cleared` retires
+ * it. The remaining one, `reload_result`, goes to the app's ordinary toast queue
  * via that hook's `showToast` — a completed heal is a report, not a state.
  *
  * Styling reuses the vocabulary already in `components/app/AppToasts.tsx` and
