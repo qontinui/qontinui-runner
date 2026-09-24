@@ -5468,7 +5468,7 @@ pub(crate) fn declared_tenant_unbound_error(
     tenant: Uuid,
     source: &crate::session::workspace_tenant::TenantDeclarationSource,
     refusal: &SpawnTenantRefusal,
-) -> (u16, String) {
+) -> ProxyRefusal {
     let code = refusal.code();
     let body = match refusal {
         SpawnTenantRefusal::CredentialStoreUnreadable { error, .. } => format!(
@@ -5485,7 +5485,14 @@ pub(crate) fn declared_tenant_unbound_error(
              holds. To fix: {SPAWN_TENANT_PAIRING_HINT}"
         ),
     };
-    (403, body)
+    // Terminal and an AUTHORIZATION answer, so not retryable — unlike
+    // `tenant_selection_failed_error`, whose 503 says "ask again".
+    ProxyRefusal {
+        status: 403,
+        code,
+        retryable: false,
+        message: body,
+    }
 }
 
 /// The refusal for a declaration that is present and cannot be read as a
@@ -5497,17 +5504,19 @@ pub(crate) fn declared_tenant_unbound_error(
 pub(crate) fn declared_tenant_unusable_error(
     source: &crate::session::workspace_tenant::TenantDeclarationSource,
     detail: &str,
-) -> (u16, String) {
-    (
-        403,
-        format!(
+) -> ProxyRefusal {
+    ProxyRefusal {
+        status: 403,
+        code: "terminal:tenant_declaration_unusable",
+        retryable: false,
+        message: format!(
             "terminal:tenant_declaration_unusable: {source} states a tenant this runner \
              cannot read ({detail}) — refusing this session's coord requests rather than \
              ignoring the statement, which would silently act as the device's default \
              tenant. Correct the declaration to a tenant uuid this device is paired for, or \
              remove it. If the tenant is right but unpaired: {SPAWN_TENANT_PAIRING_HINT}"
         ),
-    )
+    }
 }
 
 /// The authority order itself, pure and silent. See [`resolve_session_tenant`].
@@ -5709,7 +5718,7 @@ mod session_tenant_resolution_tests {
         binding_pin: TenantPin,
         live_pin: TenantPin,
         jwt_claim_tenant: impl FnOnce() -> Option<Uuid>,
-    ) -> Result<Option<Uuid>, (u16, String)> {
+    ) -> Result<Option<Uuid>, ProxyRefusal> {
         resolve_session_tenant(
             binding_pin,
             || WorkspaceDeclaration::Absent,
