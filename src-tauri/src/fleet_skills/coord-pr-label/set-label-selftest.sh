@@ -619,9 +619,208 @@ else
   ok
 fi
 
+# ----- the coord write lands only under a tenant PROVEN to own the repo --------
+# The multi-tenant-device defect (2026-09-23; same class as
+# qontinui-claude-config#1104): coord writes the row under QONTINUI_AGENT_ID's
+# worktree-row tenant, which on a device bound to several tenants is often the
+# wrong one. Step 2 probes that tenant with a no-op POST (`labels: []`), proves
+# it owns the repo through the author-session door under a token CLAIMING it,
+# and only then writes. These cases need a controllable coord, so a `curl` stub
+# is prepended to PATH -- after every case above, which rely on the real curl
+# failing against the dead COORD_URL port.
+#
+# The stub serves four calls by URL (and, for /pr-merge/labels, by whether the
+# payload is the empty probe), logs each as one line, writes the canned body to
+# the -o file, and prints the canned status for -w.
+STUBDIR3="$(mktemp -d)" || { echo "FAIL: mktemp -d failed for the curl stub" >&2; exit 1; }
+cleanup3() { rm -rf "$STUBDIR3"; }
+trap 'cleanup; cleanup2; cleanup3' EXIT
+{
+  echo '#!/usr/bin/env bash'
+  echo 'd="$(dirname "$0")"; out=""; data=""; url=""; hdr=""'
+  echo 'while [ $# -gt 0 ]; do case "$1" in'
+  echo '  -o) out="$2"; shift 2 ;; -d) data="$2"; shift 2 ;; -H) hdr="$hdr|$2"; shift 2 ;;'
+  echo '  -w|-X|-m|--connect-timeout) shift 2 ;; -*) shift ;; *) url="$1"; shift ;; esac; done'
+  echo 'case "$url" in'
+  echo '  */agents/credential) k=mint ;;'
+  echo '  */author-session) k=door ;;'
+  echo '  */pr-merge/labels) case "$data" in *"\"labels\": []"*) k=probe ;; *) k=post ;; esac ;;'
+  echo '  *) k=other ;; esac'
+  echo 'bearer=""; case "$hdr" in *"@"*) f="${hdr##*@}"; [ -r "$f" ] && bearer="$(cat "$f")" ;; esac'
+  echo 'printf "%s %s %s\n" "$k" "$url" "$data" >> "$d/calls"'
+  echo '[ -n "$bearer" ] && printf "%s\n" "$bearer" >> "$d/bearers"'
+  echo '[ -n "$out" ] && cat "$d/$k.body" > "$out" 2>/dev/null'
+  echo 'cat "$d/$k.code"'
+} > "$STUBDIR3/curl"
+chmod +x "$STUBDIR3/curl"
+PATH="$STUBDIR3:$PATH"
+export PATH
+if [[ "$(command -v curl)" != "$STUBDIR3/curl" ]]; then
+  echo "FAIL: curl stub did not shadow PATH; refusing to run the coord-reaching cases" >&2
+  exit 1
+fi
+ok
+
+T_OWN="c231d9da-0000-4000-8000-000000000001"
+T_WRONG="b3ecb579-0000-4000-8000-000000000002"
+# mkjwt <tenant> [exp-offset-seconds] -> an UNSIGNED header.payload.sig; the
+# script only ever reads the payload, and coord is the stub.
+mkjwt() {
+  H_T="$1" H_OFF="${2:-3600}" python3 -c 'import base64,json,os,time
+b=lambda o: base64.urlsafe_b64encode(json.dumps(o).encode()).decode().rstrip("=")
+print(b({"alg":"EdDSA"})+"."+b({"tenant_id":os.environ["H_T"],"exp":int(time.time())+int(os.environ["H_OFF"])})+".sig")'
+}
+# Isolate the credential cascade from this box: no env token, an empty HOME
+# (no file token, no machine.json), a pinned device id.
+FAKEHOME="$STUBDIR3/home"; mkdir -p "$FAKEHOME"
+unset COORD_DEVICE_JWT
+export QONTINUI_MACHINE_ID="11111111-2222-4333-8444-555555555555"
+printf '0\n' > "$GH_STUB_RC_FILE"; : > "$GH_STUB_MSG_FILE"
+
+# stub <kind> <code> [body]
+stub() { printf '%s\n' "$2" > "$STUBDIR3/$1.code"; printf '%s' "${3:-}" > "$STUBDIR3/$1.body"; }
+# run_coord <label> -> RC, OUT; resets the call log.
+run_coord() {
+  : > "$STUBDIR3/calls"; : > "$STUBDIR3/bearers"
+  OUT="$(HOME="$FAKEHOME" bash "$SCRIPT" --repo "$REPO" --pr 7 --label "$1" 2>&1)"; RC=$?
+}
+calls_of() { grep -c "^$1 " "$STUBDIR3/calls" 2>/dev/null || true; }
+expect_rc() { if [[ $RC -ne $1 ]]; then fail "$2: expected rc=$1, got rc=$RC :: $OUT"; else ok; fi; }
+expect_out() { if [[ "$OUT" != *"$1"* ]]; then fail "$2: output lacks \"$1\" :: $OUT"; else ok; fi; }
+expect_calls() { local n; n="$(calls_of "$1")"; if [[ "$n" != "$2" ]]; then fail "$3: expected $2 '$1' call(s), got $n :: $(cat "$STUBDIR3/calls")"; else ok; fi; }
+
+OK_POST="{\"tenant_id\":\"$T_OWN\",\"repo\":\"$REPO\",\"pr_number\":7,\"written\":1,\"deleted\":0,\"rejected\":[]}"
+
+# --- T1: PROVEN. The probe names T_OWN, the mint returns a T_OWN token, the
+# door answers 200 -> the real write goes out and the ok line names the tenant.
+stub probe 200 "{\"tenant_id\":\"$T_OWN\",\"written\":0,\"deleted\":0,\"rejected\":[]}"
+stub mint 200 "{\"token\":\"$(mkjwt "$T_OWN")\"}"
+stub door 200 '{"resolved":false}'
+stub post 200 "$OK_POST"
+run_coord "coord:stacked-on=#6"
+expect_rc 0 "T1 proven"
+expect_out "owner check: proven: tenant $T_OWN owns $REPO" "T1 proven"
+expect_out "coord recorded label" "T1 proven"
+expect_calls probe 1 "T1"; expect_calls door 1 "T1"; expect_calls post 1 "T1"
+# The mint NAMED the tenant: a tenant-less mint is the defect's own shape.
+if ! grep -q "^mint .*\"tenant_id\": \"$T_OWN\"" "$STUBDIR3/calls"; then fail "T1: the mint did not send tenant_id=$T_OWN :: $(cat "$STUBDIR3/calls")"; else ok; fi
+# The probe really was the empty, merge-mode, no-op write.
+if ! grep -q '^probe .*"labels": \[\], "mode": "merge"' "$STUBDIR3/calls"; then fail "T1: probe was not labels=[] mode=merge :: $(cat "$STUBDIR3/calls")"; else ok; fi
+
+# --- T2: REFUTED -- the defect itself. The agent row carries T_WRONG, whose
+# token the door answers 404: the row must be WITHHELD, rc 5, and the real
+# write must never go out.
+stub probe 200 "{\"tenant_id\":\"$T_WRONG\",\"written\":0,\"deleted\":0,\"rejected\":[]}"
+stub mint 200 "{\"token\":\"$(mkjwt "$T_WRONG")\"}"
+stub door 404 '{"error":"not found"}'
+run_coord "coord:upstream-of=qontinui-runner#1705"
+expect_rc 5 "T2 refuted"
+expect_out "WITHHELD" "T2 refuted"
+expect_out "does NOT own $REPO" "T2 refuted"
+expect_out "gh-side label add succeeded" "T2 refuted"
+expect_calls post 0 "T2 (no wrong-tenant row)"
+
+# --- T3: the mint ignores tenant_id and hands back ANOTHER tenant's token (a
+# coord predating the field). Using it would ask the door about the wrong
+# tenant, so it is rejected: UNKNOWN, rc 5, no door call, no write.
+stub probe 200 "{\"tenant_id\":\"$T_OWN\",\"written\":0,\"deleted\":0,\"rejected\":[]}"
+stub mint 200 "{\"token\":\"$(mkjwt "$T_WRONG")\"}"
+run_coord "coord:stacked-on=#6"
+expect_rc 5 "T3 wrong-claim mint"
+expect_out "UNKNOWN" "T3 wrong-claim mint"
+expect_out "claiming tenant $T_WRONG" "T3 wrong-claim mint"
+expect_calls door 0 "T3"; expect_calls post 0 "T3"
+
+# --- T4: the door fails (5xx) -- not a proof either way: UNKNOWN, withheld.
+stub mint 200 "{\"token\":\"$(mkjwt "$T_OWN")\"}"
+stub door 503 '{"error":"unavailable"}'
+run_coord "coord:stacked-on=#6"
+expect_rc 5 "T4 door 503"
+expect_out "UNKNOWN: the author-session door answered HTTP 503" "T4 door 503"
+expect_calls post 0 "T4"
+
+# --- T5: a static env token is used ONLY when it claims the write tenant. One
+# claiming another tenant is skipped for the mint; one claiming the write
+# tenant is used and no mint happens.
+stub door 200 '{"resolved":false}'
+COORD_DEVICE_JWT="$(mkjwt "$T_WRONG")" run_coord "coord:stacked-on=#6"
+expect_rc 0 "T5a env token for another tenant"
+expect_calls mint 1 "T5a (env token skipped, mint used)"
+COORD_DEVICE_JWT="$(mkjwt "$T_OWN")" run_coord "coord:stacked-on=#6"
+expect_rc 0 "T5b env token for the write tenant"
+expect_calls mint 0 "T5b (env token used)"
+expect_out "bearer=env" "T5b"
+# ...and an EXPIRED one for the right tenant is not used.
+COORD_DEVICE_JWT="$(mkjwt "$T_OWN" -30)" run_coord "coord:stacked-on=#6"
+expect_calls mint 1 "T5c (expired env token skipped)"
+
+# --- T6: coord's enforce arm re-tenanted the write itself -- the probe echoes
+# no tenant_id. coord made the ownership decision; no door call is needed.
+stub probe 200 '{"written":0,"deleted":0,"rejected":[]}'
+stub post 200 '{"written":1,"deleted":0,"rejected":[]}'
+run_coord "coord:stacked-on=#6"
+expect_rc 0 "T6 enforce re-tenanted"
+expect_out "coord derived the tenant from repo ownership itself" "T6"
+expect_calls door 0 "T6"; expect_calls post 1 "T6"
+
+# --- T7: coord's enforce arm refuses (422 repo_not_owned_by_tenant) at the
+# probe -> rc 5, no write attempted.
+stub probe 422 '{"error":"repo_not_owned_by_tenant","repo":"x","bound_owner_count":0}'
+run_coord "coord:stacked-on=#6"
+expect_rc 5 "T7 enforce refusal"
+expect_calls post 0 "T7"
+
+# --- T8: no device id and no usable token -> UNKNOWN, withheld (never a
+# bearerless request, whose 401 would say nothing about the tenant).
+stub probe 200 "{\"tenant_id\":\"$T_OWN\",\"written\":0,\"deleted\":0,\"rejected\":[]}"
+( unset QONTINUI_MACHINE_ID; run_coord "coord:stacked-on=#6"; printf '%s\n%s\n' "$RC" "$OUT" > "$STUBDIR3/t8" )
+RC="$(head -1 "$STUBDIR3/t8")"; OUT="$(tail -n +2 "$STUBDIR3/t8")"
+expect_rc 5 "T8 no device id"
+expect_out "no device_id" "T8"
+expect_calls door 0 "T8"; expect_calls mint 0 "T8"
+
+# --- T9: the write lands under a DIFFERENT tenant than the probe proved (the
+# agent row moved between the calls) -> not an unqualified ok.
+stub probe 200 "{\"tenant_id\":\"$T_OWN\",\"written\":0,\"deleted\":0,\"rejected\":[]}"
+stub post 200 "{\"tenant_id\":\"$T_WRONG\",\"written\":1,\"deleted\":0,\"rejected\":[]}"
+run_coord "coord:stacked-on=#6"
+expect_rc 4 "T9 tenant moved"
+expect_out "not the proven $T_OWN" "T9"
+
+# --- T10 (review r1, HIGH): a 2xx probe that is NOT a label-set response --
+# empty, non-JSON, or a null tenant_id -- is UNKNOWN, never "enforce
+# re-tenanted". Only a well-formed body with the key ABSENT is that (T6).
+for body in "" "<html>captive portal</html>" "{\"tenant_id\":null,\"written\":0,\"rejected\":[]}"; do
+  stub probe 200 "$body"
+  stub post 200 "$OK_POST"
+  run_coord "coord:stacked-on=#6"
+  expect_rc 5 "T10 malformed probe body [$body]"
+  expect_calls post 0 "T10 [$body]"; expect_calls door 0 "T10 [$body]"
+done
+
+# --- T11 (review r1): an expired MINTED token for the right tenant is not used.
+stub probe 200 "{\"tenant_id\":\"$T_OWN\",\"written\":0,\"deleted\":0,\"rejected\":[]}"
+stub mint 200 "{\"token\":\"$(mkjwt "$T_OWN" -30)\"}"
+stub door 200 '{"resolved":false}'
+run_coord "coord:stacked-on=#6"
+expect_rc 5 "T11 expired mint"
+expect_out "expired" "T11"
+expect_calls door 0 "T11"; expect_calls post 0 "T11"
+
+# --- T12 (review r1): no device credential is sent to a plain-http, non-loopback
+# COORD_URL -- the check withholds instead.
+stub mint 200 "{\"token\":\"$(mkjwt "$T_OWN")\"}"
+COORD_URL="http://coord.example.test" run_coord "coord:stacked-on=#6"
+expect_rc 5 "T12 non-https coord url"
+expect_out "neither https nor loopback" "T12"
+expect_calls mint 0 "T12"; expect_calls door 0 "T12"
+COORD_URL="http://localhost:x@coord.example.test/" run_coord "coord:stacked-on=#6"
+expect_rc 5 "T12b userinfo-retargeted loopback url"
+expect_calls mint 0 "T12b"
+
 # ----- report -----------------------------------------------------------------
 if [[ $FAILURES -ne 0 ]]; then
   echo "set-label self-test: $FAILURES failure(s) across $((CHECKS + FAILURES)) assertion(s)" >&2
   exit 1
 fi
-echo "set-label self-test: $CHECKS assertion(s) classified correctly (ceiling, short-form suggestion, grammar, no-send, dry-run existence caveat, gh success + failure diagnosis)"
+echo "set-label self-test: $CHECKS assertion(s) classified correctly (ceiling, short-form suggestion, grammar, no-send, dry-run existence caveat, gh success + failure diagnosis, owner-tenant proof before the coord write)"
