@@ -194,7 +194,7 @@ pub fn export_all_schemas() -> Value {
     add!("UiBridgeStepPhase", qws::UiBridgeStepPhase);
     add!("WorkflowStepPhase", qws::WorkflowStepPhase);
 
-    // ── qontinui-types: FullRunnerStep (all 16 handler-registered variants) ──
+    // ── qontinui-types: FullRunnerStep (all 20 handler-registered variants) ──
     add!("FullRunnerStep", qws::FullRunnerStep);
     add!("CodeExecutionStep", qws::CodeExecutionStep);
     add!("ExecutePlaybookStep", qws::ExecutePlaybookStep);
@@ -217,6 +217,9 @@ pub fn export_all_schemas() -> Value {
     add!("DagCancelStep", qws::DagCancelStep);
     add!("DagApprovalStep", qws::DagApprovalStep);
     add!("DagLoopStep", qws::DagLoopStep);
+    add!("SpecCheckStep", qws::SpecCheckStep);
+    add!("WrapperActionStep", qws::WrapperActionStep);
+    add!("EffectCheckStep", qws::EffectCheckStep);
 
     // ── qontinui-types: geometry ──
     add!("CoordinateSystem", qg::CoordinateSystem);
@@ -914,10 +917,14 @@ mod tests {
         // 2026-09-12-consolidate-local-orchestration-onto-conductor) = 548
         // + the 2 per-instance runner types (RunnerInstance, RunnerInstanceRole —
         // plan 2026-09-20-runner-selector-drives-a-transport-not-a-target
-        // Phase 6) = 550.
+        // Phase 6) = 550
+        // + the 3 step structs the typed dispatch gained (SpecCheckStep,
+        // WrapperActionStep, EffectCheckStep — plan
+        // 2026-09-24-typed-step-dispatch-covers-every-registered-handler
+        // Phase 2) = 553.
         // Independently corroborated by the codegen, which reports
-        // "Processing 550 top-level types" and emits 550 .d.ts files.
-        assert_eq!(obj.len(), 550, "Expected 550 schema entries");
+        // "Processing 553 top-level types" and emits 553 .d.ts files.
+        assert_eq!(obj.len(), 553, "Expected 553 schema entries");
         assert!(
             obj.contains_key("RunnerInstance") && obj.contains_key("RunnerInstanceRole"),
             "Missing RunnerInstance / RunnerInstanceRole schema"

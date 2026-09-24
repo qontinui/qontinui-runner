@@ -80,7 +80,10 @@ use super::executor_types::*;
 ///
 /// Add a new arm to the match below whenever a new step type is introduced
 /// that the JSON round-trip can't parse cleanly — don't paper over it with
-/// looser serde aliases on `ExecutionStepConfig`.
+/// looser serde aliases on `ExecutionStepConfig`. `spec_check`,
+/// `wrapper_action` and `effect_check` need no arm: their typed structs accept
+/// the `ExecutionStepConfig` field names as aliases, which
+/// `typed_dispatch_corpus_tests` proves on every live producer's shapes.
 fn to_full_runner_step(
     step: &ExecutionStepConfig,
 ) -> Result<qontinui_types::workflow_step::FullRunnerStep, String> {
@@ -235,6 +238,9 @@ fn handler_lookup_key(step: &qontinui_types::workflow_step::FullRunnerStep) -> &
         FullRunnerStep::DagApproval(_) => "dag_approval",
         FullRunnerStep::DagLoop(_) => "dag_loop",
         FullRunnerStep::VgaAutomate(_) => "vga_automate",
+        FullRunnerStep::SpecCheck(_) => "spec_check",
+        FullRunnerStep::WrapperAction(_) => "wrapper_action",
+        FullRunnerStep::EffectCheck(_) => "effect_check",
     }
 }
 
@@ -2034,9 +2040,12 @@ mod tests {
     // ========================================================================
 
     /// `handler_lookup_key` must return the right string for every one of the
-    /// 16 `FullRunnerStep` variants.  This test is the compile-time coverage
-    /// check: if someone adds a 17th variant without updating `handler_lookup_key`
-    /// the match in that function will fail to compile, not just fail at runtime.
+    /// 20 `FullRunnerStep` variants.
+    ///
+    /// This slice is a RUNTIME check of each arm's string. The compile-time
+    /// coverage check is the wildcard-free `match` in `handler_lookup_key`
+    /// itself: a new variant without an arm fails to compile there. The slice
+    /// has to be extended by hand, which is why the count is asserted.
     #[test]
     fn test_handler_lookup_key_all_variants() {
         use qontinui_types::workflow_step::*;
@@ -2100,14 +2109,40 @@ mod tests {
                 FullRunnerStep::DagApproval(DagApprovalStep::default()),
             ),
             ("dag_loop", FullRunnerStep::DagLoop(DagLoopStep::default())),
+            (
+                "vga_automate",
+                FullRunnerStep::VgaAutomate(VgaAutomateStep::default()),
+            ),
+            (
+                "spec_check",
+                FullRunnerStep::SpecCheck(SpecCheckStep::default()),
+            ),
+            (
+                "wrapper_action",
+                FullRunnerStep::WrapperAction(WrapperActionStep::default()),
+            ),
+            (
+                "effect_check",
+                FullRunnerStep::EffectCheck(EffectCheckStep::default()),
+            ),
         ];
 
-        // Exactly 16 variants — make sure we haven't accidentally skipped one.
+        // Exactly 20 variants — make sure we haven't accidentally skipped one.
         assert_eq!(
             cases.len(),
-            16,
-            "expected exactly 16 FullRunnerStep variants"
+            20,
+            "expected exactly 20 FullRunnerStep variants"
         );
+        // ...and every one of them is a distinct key the registry serves.
+        let registry = crate::step_executor::handlers::HandlerRegistry::with_standard_handlers();
+        let keys: std::collections::BTreeSet<&str> = cases.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys.len(), cases.len(), "duplicate lookup key in cases");
+        for key in &keys {
+            assert!(
+                registry.get(key).is_some(),
+                "handler_lookup_key yields {key:?}, which no registered handler serves"
+            );
+        }
 
         // Suppress unused-variable warning from the `base` helper when all
         // cases use Default::default().
@@ -2241,3 +2276,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "typed_dispatch_corpus_tests.rs"]
+mod typed_dispatch_corpus_tests;

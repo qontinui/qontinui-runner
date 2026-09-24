@@ -581,9 +581,10 @@ pub struct ExecutionStepConfig {
     /// VGA: UUID referencing `runner.vga_state_machines.id` — the persisted
     /// state machine defining the elements the step may click/type/wait for.
     ///
-    /// VGA state machine id. See `qontinui-schemas::workflow_step`
-    /// for the canonical spelling (`vgaStateMachineId`) — the aliases
-    /// here exist only for historical JSON compatibility.
+    /// Serializes as `vga_state_machine_id`, which
+    /// `qontinui_types::workflow_step::VgaAutomateStep` accepts as an alias
+    /// (it serializes `stateMachineId`). Also accepts `stateMachineId` and
+    /// `state_machine_id`.
     #[serde(alias = "stateMachineId", alias = "state_machine_id", default)]
     pub vga_state_machine_id: Option<String>,
 
@@ -626,7 +627,16 @@ pub struct ExecutionStepConfig {
     /// Wrapper Action: JSON object of params to pass to the action.
     /// Values may contain `{{ variable }}` template references that are
     /// resolved against the workflow's runtime context before dispatch.
-    #[serde(alias = "wrapperParams", alias = "wrapper_params", default)]
+    ///
+    /// `params` is the key the Builder writes (`AddStepDropdown.tsx`,
+    /// `WrapperActionStepConfig.tsx`); without the alias a Builder step's
+    /// params never reached the handler.
+    #[serde(
+        alias = "wrapperParams",
+        alias = "wrapper_params",
+        alias = "params",
+        default
+    )]
     pub wrapper_params: Option<serde_json::Value>,
 
     /// Wrapper Action: Optional name of a workflow variable to write the
