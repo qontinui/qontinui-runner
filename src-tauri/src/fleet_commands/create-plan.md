@@ -276,6 +276,25 @@ decision inline with one sentence naming the deciding priority (mirrors
 the fact). Leave a question genuinely **open** only when it's a
 product/scope/stakeholder call nobody but the operator can make.
 
+**Difficulty — decide whether to stamp, and default to NOT stamping.** Every
+captured plan is rated by a lexical rubric (qontinui-web
+`backend/app/services/plan_difficulty.py`) that routes it to a model tier. A
+`**Difficulty:** <level>` line in the plan's header overrides that rating — and
+it is a pin that is re-derived from the body on every re-rate, so it also stops
+the plan's level moving with any future rubric improvement. At authoring time
+the plan is not in the library yet, so you cannot see what the rubric will say.
+Write the line **only** when you have positive reason to expect the rubric to be
+wrong, under one of two named triggers:
+
+- **deceptively small** → `high`: little prose, subtle design — concurrency and
+  ordering, a migration's consistency window, a security or tenancy boundary.
+- **large but mechanical** → `low`: many phases and files, no design risk. The
+  rubric tops a mechanical plan out at `medium`, so this trigger is mainly what
+  buys `low`.
+
+Name which trigger applies in one clause on the same line. Neither applies →
+**write no Difficulty line at all**; the rubric rates the plan on capture.
+
 ### 5. Write the plan file
 
 **Filename:** `$QONTINUI_PLANS_DIR/<YYYY-MM-DD>-<slug>.md`. Get today's
@@ -300,6 +319,9 @@ the existing corpus in `plans/*.md`).
 > warning. Omit the line when no area applies.
 
 > **Repo(s):** <repo1>[, <repo2>...]
+
+<!-- OPTIONAL: write the Difficulty line only on a Step 4 difficulty trigger; otherwise omit it and this comment. -->
+**Difficulty:** <high|medium|low> — <deceptively small | large but mechanical>: <one clause>
 
 ## Why
 <the motivating problem, pulled from the prompt + your own research —
@@ -335,6 +357,16 @@ deciding priority>
 ## Related
 - `[[other-plan-stem]]` / memory names this plan builds on or supersedes.
 ```
+
+**Where the `**Difficulty:**` line goes, when Step 4 says to write one.** On
+its own line, below `> **Repo(s):**`, and **above the first `##`–`######`
+heading** — never inside a blockquote's body text and never under a section.
+The rubric reads a declared stamp only from the header region, which is
+everything before the first sub-H1 heading (`_declared`, qontinui-web
+`backend/app/services/plan_difficulty.py`); a stamp below `## Why` is dead text
+that silently loses to the computed rating. Put the level token
+directly after the colon — `**Difficulty:** high — deceptively small: …` — and
+delete the template's `<!-- OPTIONAL … -->` comment either way.
 
 **Do not add a `## Gates` section.** That block (`<!-- GATE-SWEEP:BEGIN -->`)
 is machine-managed by `/gate-sweep`, and the `unit_ready` coord gate itself

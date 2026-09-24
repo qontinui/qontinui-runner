@@ -349,6 +349,13 @@ For SUPERSEDED / OBSOLETE: cite the replacement or the reason.
 A plan must have **exactly one** `> **Status:` blockquote between the H1
 and the body. Before writing your stamp:
 
+0. The invariant governs `> **Status:` blockquotes only. A bare
+   `**Difficulty:** <level>` line is not a blockquote and not a status
+   declaration: leave it exactly where it is, together with the reason clause
+   it carries on the same line. (`/create-plan` and `/vet-plan` §5 write it
+   above the first sub-H1 heading, and the difficulty rubric reads it only
+   there — moving or deleting it silently reverts the plan to its computed
+   rating.)
 1. Read the top of the plan. Identify EVERY top-of-file blockquote that
    asserts a status, lifecycle state, or verification date — lines
    starting `> **Status:`, `> **Edit YYYY-MM-DD —`, or `> **Update:`

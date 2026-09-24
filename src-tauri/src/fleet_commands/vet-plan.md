@@ -1364,6 +1364,13 @@ manifest.
 A plan must have **exactly one** `> **Status:` blockquote between the H1
 and the body. Before writing your stamp:
 
+0. The invariant governs `> **Status:` blockquotes only. A bare
+   `**Difficulty:** <level>` line is not a blockquote and not a status
+   declaration: leave it exactly where it is, together with the reason clause
+   it carries on the same line. (`/create-plan` and `/vet-plan` §5 write it
+   above the first sub-H1 heading, and the difficulty rubric reads it only
+   there — moving or deleting it silently reverts the plan to its computed
+   rating.)
 1. Read the top of the plan. Identify EVERY top-of-file blockquote that
    asserts a status, lifecycle state, or verification date — lines
    starting with `> **Status:`, `> **Edit YYYY-MM-DD —`, or `> **Update:`
@@ -1530,6 +1537,54 @@ implementation wasted).
 This stamp is mandatory. A vetted plan without the stamp is
 indistinguishable from a draft, and `/implement-plan` will treat it as
 still-aspirational.
+
+#### Difficulty stamp — write one ONLY on disagreement
+
+After the Status blockquote is written, compare the plan's **computed**
+difficulty rating with your own judgement. You have just read the plan in full
+and verified its claims, which makes your judgement better evidence than the
+lexical rubric (qontinui-web `backend/app/services/plan_difficulty.py`) — but a
+`**Difficulty:** <level>` line is a pin that is re-derived from the body on
+every re-rate, so it also stops the plan's level moving with any future rubric
+improvement. Stamping on agreement buys nothing and costs that. So:
+
+1. **Read the rating.** The runner door, credential-free:
+   `GET http://127.0.0.1:9876/plan-library/search?kind=plan&slug=<stem>` →
+   `difficulty` and `difficulty_source` of **the item whose `slug` equals the
+   stem** — never whichever item comes first, because a backend predating the
+   `slug` filter ignores it and returns an unfiltered page. Fallback:
+   `GET https://api.qontinui.io/api/v1/plan-library?kind=plan&slug=<stem>` with a
+   device JWT staged off argv (the Plan-corpus preamble's door 3), read the same
+   way.
+2. **No answer is UNKNOWN, never `low`.** The read failed, no row matches the
+   stem (the plan is not captured yet), or `difficulty` is null (unrated): write
+   **no** stamp, and say so in the §6 report. This is the common case, not the
+   edge one — a vetter is usually looking at a plan the store has not captured
+   yet.
+3. **Compare.** When the FILE you are vetting already carries a
+   `**Difficulty:**` line in its header region (before the first `##`–`######`
+   heading), that line is the answer to compare against — whatever the library
+   row's `difficulty_source` says, since the row may predate the stamp. Only
+   when the file has no header-region stamp, compare against the library's
+   computed level (the rubric's, over the body as it was captured, before your
+   §4 edits). Agree → write nothing.
+4. **Disagree → stamp.** Write `**Difficulty:** <high|medium|low> — <one
+   clause naming why>`, the reason **on the same line** as the stamp (as
+   `/create-plan` writes it) — never as a following blockquote, which the
+   Single-stamp invariant would read as a status declaration and sweep.
+   - **Placement:** on its own line **above the first `##`–`######` heading**,
+     after the Status and `> **Repo(s):**` blockquotes — never inside the
+     Status blockquote, and never under a section heading. The rubric reads a
+     declared stamp only from that header region (everything before the first
+     sub-H1 heading); anywhere else it is dead text.
+   - **Idempotence:** an existing `**Difficulty:**` line in the header region
+     is **replaced in place** — never add a second. The rubric takes the first
+     match, so a duplicate below it would be dead text disagreeing with the
+     live one. An existing line **below** the first sub-H1 heading is already
+     dead: delete it, and write the new stamp in the header region.
+
+The Single-stamp invariant above does not touch this line — it governs
+`> **Status:` blockquotes only.
 
 After stamping, fire the clearing `POST /coord/status` documented in
 Step 0 with `current_task: null` so the dashboard tile stops showing
@@ -2958,6 +3013,10 @@ Brief — under 150 words. State:
   origin/main <short-sha>` — and **quote the sha**, not just the date. It is
   what lets the next reader tell a citation that has gone stale from one that
   was always wrong, without re-resolving every row
+- **The difficulty outcome** (§5 "Difficulty stamp"): `stamped <level>` with
+  the computed level it overrode and the one-clause reason, `agreed <level>`
+  (no write), or `UNKNOWN — <why>` (read failed, not captured, or unrated; no
+  write). Never report UNKNOWN as agreement
 - **The evidence manifest** (§2a): quote `stored` from the transition's `vet_evidence` receipt — the count coord **kept**, never the count you sent — and `admitted_on`, the arm that actually carried the transition (`identity` / `graduation` / `no_transition`). **Read both; do not infer either.** ⚠️ Where you sent an `independence` declaration, SAY SO explicitly: `admitted_on` reads `identity` on that path too, so it cannot be quoted as evidence of an actor difference. No receipt at all means the running coord has no manifest surface: say *built but not stored*. If you fell back to `vetted_unattested`, name the identity refusal that sent you there (`self_attestation_forbidden` / `owner_unresolved` / `attester_unresolved`) — never the manifest, which admits nothing
 - Open questions you **resolved using the Decision policy**, with the deciding priority in parentheses (e.g. "picked registry-backed lookup (scalability)")
 - Anything you flagged for the user that you did NOT auto-fix — limit this to product/scope/stakeholder calls the Decision policy can't decide; engineering trade-offs should already be resolved in the plan
