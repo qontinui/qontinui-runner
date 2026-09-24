@@ -513,7 +513,9 @@ coord_claim_acquire(kind="file_glob", resource_key="<glob>", ttl_seconds=900)   
   bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh add \
     --ledger "$CLAIM_LEDGER" --kind file_glob --key "<glob>" --ttl "<ttl_seconds>"
 
-  bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh start --ledger "$CLAIM_LEDGER"
+  # --max-runtime 21600 (6h): /preflight is a short pre-run check, not a
+  # long implementation chain, so it gets the smallest of the three ceilings.
+  bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh start --ledger "$CLAIM_LEDGER" --max-runtime 21600
   ```
 
   `start` detaches a background loop that re-heartbeats each row when THAT row
@@ -536,11 +538,15 @@ coord_claim_acquire(kind="file_glob", resource_key="<glob>", ttl_seconds=900)   
   out another holder; `LAPSED` (7) — a row's grant is gone (an expired answer,
   aged past its TTL, never confirmed, or a malformed TTL); `EMPTY` (8) — the
   loop lives but the ledger holds no rows, so nothing is renewed (an `add` was
-  refused or never ran). A row the loop records
-  as `stolen` or `lapsed` is terminal and never beaten again, while the loop
+  refused or never ran); `MAX_RUNTIME` (9) — the loop itself ended on its own
+  `--max-runtime` ceiling, not a coord verdict (these grants may still be live
+  at coord for up to their remaining ttl). A row the loop records
+  as `stolen`, `lapsed` or `max_runtime` is terminal and never beaten again,
+  while the loop
   keeps renewing the others; when no renewable row is left the loop ends, and
-  `status` reads `STOLEN` if any row was stolen, otherwise `DEAD`.
-  **Only `LIVE` means the claims are held.** The other five mean the claim is
+  `status` reads `STOLEN` if any row was stolen, `MAX_RUNTIME` if the ceiling
+  ended it, otherwise `DEAD`.
+  **Only `LIVE` means the claims are held.** The other six mean the claim is
   **UNKNOWN** (`STALE` usually self-heals on the next beat; re-acquiring
   anyway is harmless — a held claim answers `renewed`), which is a re-acquire and a line in the report, never a shrug — a
   dead loop and a healthy one look identical to anything that never asks. After
