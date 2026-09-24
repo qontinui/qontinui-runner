@@ -619,6 +619,14 @@ export function useZoneLayout(
   // left without a zone. Presets ignore the count.
   const layout = resolveLayout(layoutId, flowGridSlotCount(tabIds, assignments));
 
+  // The committed assignments, for `applyLayout`'s focus clamp, which sizes
+  // the flow-grid the same way outside a state updater. `applyLayout` runs
+  // from handlers and effects, after the commit this effect mirrors.
+  const assignmentsRef = useRef(assignments);
+  useEffect(() => {
+    assignmentsRef.current = assignments;
+  }, [assignments]);
+
   // Persist on changes.
   useEffect(() => {
     persistState(pageId, windowLabel, {
@@ -660,7 +668,15 @@ export function useZoneLayout(
       // `applyLayout` directly, so a plain `LAYOUT_PRESETS.find` returning
       // undefined would EAT the grow into flow mode). Unknown ids resolve to
       // `single` rather than no-op — `setLayoutId` already gates bad input.
-      const newLayout = resolveLayout(id, tabIds.length);
+      // Flow mode is sized by `flowGridSlotCount`, exactly as the rendered
+      // layout is. Sizing it by the bare tab count re-packed the survivors
+      // whenever flow-grid was re-applied after a close (`/layout flow-grid`,
+      // a profile load, a quick or AI launch): the highest tile counted as
+      // out of range and was compacted into the hole, wearing that zone's
+      // label, notes and pin.
+      const zoneCountFor = (current: ZoneAssignments) =>
+        resolveLayout(id, flowGridSlotCount(tabIds, current)).zones.length;
+      const zoneCount = zoneCountFor(assignmentsRef.current);
 
       setLayoutIdState(id);
       setMaximizedZone(null);
@@ -670,10 +686,10 @@ export function useZoneLayout(
       // `applyLayoutAssignments` (item 10 — recorded zones must survive
       // layout application; dead-tab cleanup belongs to
       // `reconcileAssignments`, which runs with fresh tabIds).
-      setAssignments((prev) => applyLayoutAssignments(prev, tabIds, newLayout.zones.length));
+      setAssignments((prev) => applyLayoutAssignments(prev, tabIds, zoneCountFor(prev)));
 
       // Clamp focused zone
-      setFocusedZone((prev) => (prev >= newLayout.zones.length ? 0 : prev));
+      setFocusedZone((prev) => (prev >= zoneCount ? 0 : prev));
     },
     [tabIds],
   );
