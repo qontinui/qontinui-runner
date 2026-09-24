@@ -133,6 +133,23 @@ struct Inner {
     /// [`Self::session_id_for`].
     forward: Mutex<HashMap<Uuid, String>>,
     reverse: Mutex<HashMap<String, Uuid>>,
+    /// The tenant each coord `session_id` registered since boot is OWNED by,
+    /// resolved once at registration through `tenant_resolver`. Stamped as a
+    /// top-level `tenant_id` on every session-scoped outbox row — the ones
+    /// this registrar writes and the transcript emitter's `output_chunk` rows
+    /// ([`AiCoordRegistrar::stamp_tenant`]) — because these sessions are not in `SessionRegistry`: without
+    /// it the drain's `record_session_tenant` answers `Unresolved` for every
+    /// row, and on a multi-bound device that sends the create and every
+    /// heartbeat / progress / finished / closed PATCH unauthenticated — the
+    /// wrong-tenant filing qontinui-runner#1702 fixed for registry sessions.
+    /// The thin rows' wire bodies are rebuilt from named fields, so the
+    /// stamp only picks the credential slot; it never reaches coord.
+    tenants: Mutex<HashMap<Uuid, Uuid>>,
+    /// Resolves a new session's tenant. [`crate::session::resolve_new_session_tenant`]
+    /// in production (the same source `SessionRegistry` stamps from); tests
+    /// that assert on tenants inject a fixed answer
+    /// ([`AiCoordRegistrar::with_tenant_resolver`]).
+    tenant_resolver: fn() -> Option<Uuid>,
     /// Session-identity fabric Phase 1 — lifecycle store the registrar
     /// persists the coord-minted `fsh_` session handle into (next to the
     /// record's `claude_session_id`). Attached once at startup
@@ -153,12 +170,27 @@ impl AiCoordRegistrar {
     /// Construct from the shared session outbox + this device's `machine_id`.
     /// The outbox MUST be the same `Arc` the `CoordSync` drain loop reads.
     pub fn new(outbox: Arc<OutboxWriter>, machine_id: Uuid) -> Self {
+        Self::with_tenant_resolver(
+            outbox,
+            machine_id,
+            crate::session::resolve_new_session_tenant,
+        )
+    }
+
+    /// [`Self::new`] with the new-session tenant resolver injected.
+    pub(crate) fn with_tenant_resolver(
+        outbox: Arc<OutboxWriter>,
+        machine_id: Uuid,
+        tenant_resolver: fn() -> Option<Uuid>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 outbox,
                 machine_id,
                 forward: Mutex::new(HashMap::new()),
                 reverse: Mutex::new(HashMap::new()),
+                tenants: Mutex::new(HashMap::new()),
+                tenant_resolver,
                 lifecycle_store: OnceLock::new(),
                 #[cfg(test)]
                 handle_hook_fires: std::sync::atomic::AtomicU64::new(0),
@@ -312,6 +344,7 @@ impl AiCoordRegistrar {
         }
 
         let session_id = crate::session::uuid_v7();
+        let tenant = (self.inner.tenant_resolver)();
 
         // R6 — check-AND-reserve atomically under ONE reverse-map lock
         // acquisition (review W1). `spawn_register_typed_resume` dispatches a
@@ -336,6 +369,13 @@ impl AiCoordRegistrar {
                 Some(existing) => Some(*existing),
                 None => {
                     rev.insert(claude_session_id.to_string(), session_id);
+                    // Record the tenant in the SAME critical section: the id
+                    // is resolvable through `session_id_for` from here on, so
+                    // a concurrent heartbeat / progress / transcript row must
+                    // already find its tenant.
+                    if let (Some(t), Ok(mut tenants)) = (tenant, self.inner.tenants.lock()) {
+                        tenants.insert(session_id, t);
+                    }
                     None
                 }
             }
@@ -394,9 +434,13 @@ impl AiCoordRegistrar {
         }
 
         // The `Started` payload is the create-body shape `rebuild_create_body`
-        // relabels for `POST /sessions`. `tenant_id` is omitted (nil) so coord
-        // resolves the real tenant from the device registration — the same path
-        // every runner-originated session uses. Kind: `agentic` for the pinned
+        // relabels for `POST /sessions`. Its top-level `tenant_id` is the
+        // session's owning tenant, resolved exactly as `SessionRegistry`
+        // stamps its own sessions (the machine pin, else — unpinned — the
+        // paired default binding); it names the create body's tenant AND the
+        // device-JWT slot the drain presents. `None` (an unresolvable or
+        // unpaired machine) omits it and falls back to the drain's pin-only
+        // default, as before. Kind: `agentic` for the pinned
         // plane, `terminal_claude` for sniffed interactive panes (see
         // `register_sniffed_session` — coord must never auto-continue an
         // operator's own terminal).
@@ -412,6 +456,9 @@ impl AiCoordRegistrar {
             "state": "active",
             "started_at": now,
         });
+        if let Some(t) = tenant {
+            payload["tenant_id"] = json!(t);
+        }
         if let Some(trid) = task_run_id {
             // Pinned plane: forward the SessionManager key so coord persists
             // `coord.sessions.task_run_id` for inject-target resolution.
@@ -455,6 +502,9 @@ impl AiCoordRegistrar {
                 if rev.get(claude_session_id) == Some(&session_id) {
                     rev.remove(claude_session_id);
                 }
+            }
+            if let Ok(mut tenants) = self.inner.tenants.lock() {
+                tenants.remove(&session_id);
             }
             return None;
         }
@@ -681,6 +731,29 @@ impl AiCoordRegistrar {
         }
     }
 
+    /// Stamp `session_id`'s owning tenant (see [`Inner::tenants`]) onto a thin
+    /// row's payload, so the drain presents that tenant's credential slot.
+    /// A session with no recorded tenant is left unstamped. Also used by the
+    /// transcript emitter, whose `output_chunk` rows belong to these sessions
+    /// but are not written here. Only for rows whose wire body is rebuilt
+    /// from named fields — never a row the drain forwards verbatim.
+    pub(crate) fn stamp_tenant(
+        &self,
+        session_id: Uuid,
+        mut payload: serde_json::Value,
+    ) -> serde_json::Value {
+        let tenant = self
+            .inner
+            .tenants
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&session_id).copied());
+        if let Some(t) = tenant {
+            payload["tenant_id"] = json!(t);
+        }
+        payload
+    }
+
     /// R3 — emit a coord heartbeat for the AI session backing `task_run_id`,
     /// driven by **operator interaction** (called from `send_user_message`).
     /// This is the ONLY heartbeat these sessions ever get, so an idle session
@@ -690,7 +763,10 @@ impl AiCoordRegistrar {
         let Some(session_id) = self.session_id_for(task_run_id) else {
             return;
         };
-        let payload = json!({ "id": session_id, "at": chrono::Utc::now() });
+        let payload = self.stamp_tenant(
+            session_id,
+            json!({ "id": session_id, "at": chrono::Utc::now() }),
+        );
         if let Err(e) = self.inner.outbox.record(
             self.inner.machine_id,
             session_id,
@@ -733,7 +809,10 @@ impl AiCoordRegistrar {
         // Minimal body: `session_status="working"`. Coord stamps
         // `last_progress_at=now()` on receipt (no explicit `last_progress_at`
         // or `progress_detail` sent — the interaction itself is the signal).
-        let payload = json!({ "id": session_id, "session_status": "working" });
+        let payload = self.stamp_tenant(
+            session_id,
+            json!({ "id": session_id, "session_status": "working" }),
+        );
         if let Err(e) = self.inner.outbox.record(
             self.inner.machine_id,
             session_id,
@@ -780,11 +859,14 @@ impl AiCoordRegistrar {
             );
             return false;
         };
-        let payload = json!({
-            "id": session_id,
-            "claude_session_id": claude_session_id,
-            "finished_at": finished_at,
-        });
+        let payload = self.stamp_tenant(
+            session_id,
+            json!({
+                "id": session_id,
+                "claude_session_id": claude_session_id,
+                "finished_at": finished_at,
+            }),
+        );
         match self.inner.outbox.record(
             self.inner.machine_id,
             session_id,
@@ -823,7 +905,10 @@ impl AiCoordRegistrar {
         let Some(session_id) = self.session_id_for(claude_session_id) else {
             return false;
         };
-        let payload = json!({ "id": session_id, "session_status": "working" });
+        let payload = self.stamp_tenant(
+            session_id,
+            json!({ "id": session_id, "session_status": "working" }),
+        );
         match self.inner.outbox.record(
             self.inner.machine_id,
             session_id,
@@ -881,6 +966,12 @@ impl AiCoordRegistrar {
             }
             id
         };
+        // Read the tenant for the `Closed` row, then evict it with the rest of
+        // the R4 index.
+        let payload = self.stamp_tenant(session_id, json!({ "id": session_id }));
+        if let Ok(mut tenants) = self.inner.tenants.lock() {
+            tenants.remove(&session_id);
+        }
 
         // A `Closed` row carries no body — the drain loop maps it to
         // `DELETE /sessions/:id`. Best-effort; a missing coord row DELETEs as
@@ -889,7 +980,7 @@ impl AiCoordRegistrar {
             self.inner.machine_id,
             session_id,
             SessionEventKind::Closed,
-            json!({ "id": session_id }),
+            payload,
         ) {
             warn!(
                 "ai_coord_register: outbox Closed write failed for {} (best-effort): {}",
@@ -1559,10 +1650,83 @@ mod tests {
     use crate::test_env::env_lock;
     use tempfile::tempdir;
 
+    /// Hermetic: no tenant resolves, so no test reads this machine's pin.
     fn registrar() -> (AiCoordRegistrar, tempfile::TempDir) {
+        registrar_with_tenant(|| None)
+    }
+
+    fn registrar_with_tenant(
+        resolver: fn() -> Option<Uuid>,
+    ) -> (AiCoordRegistrar, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let outbox = Arc::new(OutboxWriter::open(dir.path().join("outbox.jsonl")).unwrap());
-        (AiCoordRegistrar::new(outbox, Uuid::new_v4()), dir)
+        (
+            AiCoordRegistrar::with_tenant_resolver(outbox, Uuid::new_v4(), resolver),
+            dir,
+        )
+    }
+
+    const OWNING_TENANT: Uuid = Uuid::from_u128(0xc231d9da_0ca8_4fe4_bd81_0e3d6c20339a);
+
+    #[test]
+    fn every_row_of_a_session_carries_its_owning_tenant() {
+        // qontinui-runner#1702 follow-up: AI sessions live outside
+        // SessionRegistry, so without a stamped tenant the drain resolves every
+        // row to `TenantScope::Unresolved` — unauthenticated on a multi-bound
+        // device. The Started row must name the tenant (create body + JWT
+        // slot) and every thin row after it must carry the same one.
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar_with_tenant(|| Some(OWNING_TENANT));
+        let trid = Uuid::new_v4().to_string();
+        let coord_id = reg.register_session(&trid, "fix the thing", None).unwrap();
+
+        reg.heartbeat_on_interaction(&trid);
+        reg.progress_on_interaction(&trid);
+        assert!(reg.unfinish_session(&trid));
+        assert!(reg.finish_session(&trid, Some(1)));
+        reg.close_session(&trid);
+
+        let pending = reg.inner.outbox.pending().unwrap();
+        let kinds: Vec<&str> = pending.iter().map(|r| r.event_kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            [
+                SessionEventKind::Started.as_str(),
+                SessionEventKind::Heartbeat.as_str(),
+                SessionEventKind::Progress.as_str(),
+                SessionEventKind::Progress.as_str(),
+                SessionEventKind::Finished.as_str(),
+                SessionEventKind::Closed.as_str(),
+            ]
+        );
+        for r in &pending {
+            assert_eq!(r.session_id, coord_id);
+            assert_eq!(
+                r.payload["tenant_id"],
+                json!(OWNING_TENANT),
+                "{} row lost the owning tenant",
+                r.event_kind
+            );
+        }
+        // Closing evicts the tenant with the rest of the R4 index.
+        assert!(reg.inner.tenants.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_unresolved_tenant_stamps_nothing() {
+        // An unresolvable or unpaired machine keeps the pre-existing shape:
+        // no `tenant_id`, so the drain falls back exactly as it did before.
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let trid = Uuid::new_v4().to_string();
+        reg.register_session(&trid, "fix the thing", None).unwrap();
+        reg.heartbeat_on_interaction(&trid);
+        reg.close_session(&trid);
+        for r in reg.inner.outbox.pending().unwrap() {
+            assert!(r.payload.get("tenant_id").is_none(), "{}", r.event_kind);
+        }
     }
 
     #[test]

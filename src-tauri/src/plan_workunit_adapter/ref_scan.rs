@@ -31,6 +31,7 @@
 //! discovery. `/vet-imp` commits and pushes an authored plan before vetting, so
 //! the supported authoring path is unaffected.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use super::trigger::{GitRefReader, RefDirEntry};
@@ -57,31 +58,128 @@ pub enum ScanSource {
     Unavailable { reason: String },
 }
 
-/// Decide this cycle's scan source, fetching the default branch first.
+/// ONE ref state per reconcile cycle, shared by both halves of that cycle.
 ///
-/// Ordered so each failure is attributed to the probe that produced it rather
-/// than collapsing into one "could not scan": the work-tree question, the
-/// default-branch question and the fetch are three different answers.
-pub fn resolve_scan_source(git: &dyn GitRefReader, plans_dir: &Path) -> ScanSource {
-    let source = resolve_ref_listing_source(git, plans_dir);
-    // Fetch LAST, so a fetch failure is never reported for a repo whose ref
-    // could not have been named anyway.
-    if let ScanSource::Ref {
-        repo_root,
-        ref_name,
-        ..
-    } = &source
-    {
-        if let Err(e) = git.fetch_default(repo_root, ref_name) {
-            return ScanSource::Unavailable {
-                reason: format!("could not refresh {ref_name} before scanning: {e}"),
-            };
-        }
-    }
-    source
+/// Follow-up to `2026-09-10-the-plan-scanner-reads-a-parked-working-tree-not-a-ref`
+/// (#1662 named it and deliberately did not do it). The work-unit half and the
+/// document half each resolve a scan source, and the document half once per
+/// root. Before this, each of those resolutions fetched (through a 30 s
+/// process-global memo) and each LISTING called `rev_parse` on its own, so the
+/// two halves were two reads of a MOVING target. A cycle slower than the memo's
+/// TTL re-fetched mid-cycle — a cold first cycle runs minutes — and a peer's
+/// `git fetch` in the same shared checkout, routine here, could advance
+/// `origin/main` between the two `rev_parse` calls. The census the work-unit
+/// half reported and the bodies the document half published could then come
+/// from two different commits, with every field still looking well-formed.
+///
+/// A pin closes that by construction rather than by timing: the FIRST
+/// resolution of a `(repo_root, ref_name)` in a cycle fetches once and resolves
+/// the ref to an object id once, and every later resolution of that pair in the
+/// same cycle reuses the answer — the sha, or the failure. Listings are then
+/// addressed by that object id, and an object id names one tree forever, so
+/// both halves read byte-identical listings however long the cycle runs and
+/// whoever fetches meanwhile.
+///
+/// What it deliberately does NOT share is the listing itself. Holding the
+/// read bodies (~54 MB on the measured corpus) across the reconcile's network
+/// phase would buy nothing for coherence — the sha already fixes the bytes —
+/// and the byte-bounded blob cache already serves the second read.
+///
+/// Scope: one pin per cycle, dropped with it. A pin that outlived its cycle
+/// would freeze the corpus at one ref state, so nothing stores one —
+/// `a_pin_does_not_outlive_its_cycle` pins that.
+///
+/// What it does NOT cover: the scan-divergence probe. That runs earlier in the
+/// tick, fetches nothing, and resolves the ref for itself, so on a cycle whose
+/// fetch advances `origin/main` the scan-root report can carry the probe's
+/// `ref_sha` (pre-fetch) beside the census's (post-fetch). That predates this
+/// type and is not made worse by it; routing the probe through the pin would
+/// change what the probe measures, and is its own change.
+///
+/// A failed fetch is one answer for the whole repo for the whole cycle: every
+/// root in that repo is `Unavailable` together, and the next cycle retries.
+#[derive(Debug, Default)]
+pub struct CycleRefPin {
+    /// `(repo_root, ref_name)` -> this cycle's answer. `Ok(Some(sha))`: fetched
+    /// and resolved. `Ok(None)`: fetched, but the ref would not resolve to an
+    /// object id — listings fall back to the ref NAME and carry `ref_sha`
+    /// UNKNOWN, exactly as an unpinned listing does; that is the one arm in
+    /// which the halves are not pinned, and it is reported rather than hidden.
+    /// `Err`: the fetch failed, and every consumer of the pair this cycle sees
+    /// the SAME `Unavailable` rather than retrying into a different answer.
+    resolved: std::sync::Mutex<HashMap<(PathBuf, String), Result<Option<String>, String>>>,
 }
 
-/// [`resolve_scan_source`] WITHOUT the fetch: name the ref this clone already
+impl CycleRefPin {
+    /// Decide a scan source, fetching the default branch at most once per
+    /// `(repo_root, ref_name)` for the life of this pin.
+    ///
+    /// Ordered so each failure is attributed to the probe that produced it
+    /// rather than collapsing into one "could not scan": the work-tree
+    /// question, the default-branch question and the fetch are three different
+    /// answers.
+    pub fn resolve_source(&self, git: &dyn GitRefReader, plans_dir: &Path) -> ScanSource {
+        let source = resolve_ref_listing_source(git, plans_dir);
+        // Fetch LAST, so a fetch failure is never reported for a repo whose ref
+        // could not have been named anyway.
+        if let ScanSource::Ref {
+            repo_root,
+            ref_name,
+            ..
+        } = &source
+        {
+            if let Err(reason) = self.resolve_ref(git, repo_root, ref_name) {
+                return ScanSource::Unavailable { reason };
+            }
+        }
+        source
+    }
+
+    /// The object id this cycle pinned `ref_name` to, resolving it (fetch, then
+    /// `rev_parse`) on first use. `Ok(None)` is a fetched ref that would not
+    /// resolve — UNKNOWN, see [`Self::resolved`].
+    pub fn resolve_ref(
+        &self,
+        git: &dyn GitRefReader,
+        repo_root: &Path,
+        ref_name: &str,
+    ) -> Result<Option<String>, String> {
+        let key = (repo_root.to_path_buf(), ref_name.to_string());
+        // Held across the fetch on purpose: a second consumer of the same pair
+        // must WAIT for the first one's answer rather than race it with a
+        // fetch of its own, which is the incoherence this type removes. Only
+        // one cycle's consumers ever contend here.
+        let mut resolved = self.resolved.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(answer) = resolved.get(&key) {
+            return answer.clone();
+        }
+        let answer = match git.fetch_default(repo_root, ref_name) {
+            Err(e) => Err(format!("could not refresh {ref_name} before scanning: {e}")),
+            Ok(()) => Ok(resolve_ref_sha(git, repo_root, ref_name)),
+        };
+        resolved.insert(key, answer.clone());
+        answer
+    }
+}
+
+/// `rev_parse` with its failure demoted to UNKNOWN: the stems a listing takes
+/// are the reading, and the sha only qualifies it.
+fn resolve_ref_sha(git: &dyn GitRefReader, repo_root: &Path, ref_name: &str) -> Option<String> {
+    match git.rev_parse(repo_root, ref_name) {
+        Ok(sha) => Some(sha),
+        Err(e) => {
+            tracing::debug!(
+                ref_name = %ref_name,
+                error = %e,
+                "plan adapter: could not resolve the ref to an object id before listing it; the \
+                 slug census carries ref_sha UNKNOWN and the listing is taken at the ref name"
+            );
+            None
+        }
+    }
+}
+
+/// [`CycleRefPin::resolve_source`] WITHOUT the fetch: name the ref this clone already
 /// holds and ask nothing of the network.
 ///
 /// The split exists for the census-only read
@@ -214,13 +312,28 @@ pub fn read_ref_dir(
     ref_name: &str,
     rel_dir: &str,
 ) -> Result<RefListing, String> {
-    // Resolved and listed by [`list_ref_entries`] — which is also what the
-    // census-only door takes, so neither can drift on the predicate or on the
-    // object id the stems were listed at.
+    let ref_sha = resolve_ref_sha(git, repo_root, ref_name);
+    read_ref_dir_at(git, repo_root, ref_name, ref_sha, rel_dir)
+}
+
+/// [`read_ref_dir`] at an object id the CALLER already resolved — the door a
+/// [`CycleRefPin`] reads through, so every consumer of one cycle lists the
+/// same tree. `ref_sha: None` is a ref that would not resolve: the listing is
+/// taken at `ref_name` and carries the sha UNKNOWN.
+pub fn read_ref_dir_at(
+    git: &dyn GitRefReader,
+    repo_root: &Path,
+    ref_name: &str,
+    ref_sha: Option<String>,
+    rel_dir: &str,
+) -> Result<RefListing, String> {
+    // Listed by [`list_ref_entries`] — which is also what the census-only door
+    // takes, so neither can drift on the predicate or on the object id the
+    // stems were listed at.
     let RefEntryListing {
         entries: wanted,
         ref_sha,
-    } = list_ref_entries(git, repo_root, ref_name, rel_dir)?;
+    } = list_ref_entries(git, repo_root, ref_name, ref_sha, rel_dir)?;
     // The census is taken from the LISTING, before a single blob is read, so
     // it names what the ref side holds rather than what this cycle managed to
     // read out of it.
@@ -299,10 +412,11 @@ fn list_ref_entries(
     git: &dyn GitRefReader,
     repo_root: &Path,
     ref_name: &str,
+    ref_sha: Option<String>,
     rel_dir: &str,
 ) -> Result<RefEntryListing, String> {
-    // Resolved FIRST, then LISTED AT THE RESOLVED OBJECT ID — so the census
-    // carries the sha its stems were actually listed at.
+    // LISTED AT THE RESOLVED OBJECT ID, which the caller resolved FIRST — so
+    // the census carries the sha its stems were actually listed at.
     //
     // Naming `ref_name` twice would be two reads of a MOVING target: these are
     // separate `git` processes, and a concurrent `git fetch` in the same clone
@@ -312,21 +426,9 @@ fn list_ref_entries(
     // field would look well-formed. Addressing the listing by object id makes
     // the pair atomic by construction rather than by luck.
     //
-    // A rev that will not resolve leaves the sha UNKNOWN and falls back to the
-    // ref name for the listing, rather than failing it: the stems are the
-    // reading, the sha only qualifies it.
-    let ref_sha = match git.rev_parse(repo_root, ref_name) {
-        Ok(sha) => Some(sha),
-        Err(e) => {
-            tracing::debug!(
-                ref_name = %ref_name,
-                error = %e,
-                "plan adapter: could not resolve the ref to an object id before listing it; the \
-                 slug census carries ref_sha UNKNOWN and the listing is taken at the ref name"
-            );
-            None
-        }
-    };
+    // A rev that would not resolve (`None`) leaves the sha UNKNOWN and the
+    // listing is taken at the ref name, rather than failing it: the stems are
+    // the reading, the sha only qualifies it.
     let listed_at = ref_sha.as_deref().unwrap_or(ref_name);
     let mut entries: Vec<RefDirEntry> = git
         .list_ref_dir(repo_root, listed_at, rel_dir)?
@@ -361,7 +463,8 @@ pub fn list_ref_plan_names(
     ref_name: &str,
     rel_dir: &str,
 ) -> Result<RefNameListing, String> {
-    let listing = list_ref_entries(git, repo_root, ref_name, rel_dir)?;
+    let ref_sha = resolve_ref_sha(git, repo_root, ref_name);
+    let listing = list_ref_entries(git, repo_root, ref_name, ref_sha, rel_dir)?;
     Ok(RefNameListing {
         names: listing.entries.into_iter().map(|e| e.name).collect(),
         ref_sha: listing.ref_sha,

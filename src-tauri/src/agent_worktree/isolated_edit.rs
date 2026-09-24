@@ -24,7 +24,7 @@ use tracing::{info, warn};
 use super::{
     allocate_and_materialize_with_claim, release_claim_best_effort, spawn_heartbeat_task,
     worktree_mode_enabled, ActiveClaim, AllocateError, ClaimHeartbeatHandle, MaterializeOutcome,
-    MaterializedWorktree, RepoRequest,
+    MaterializedWorktree, RepoRequest, SharedBranchPolicy,
 };
 
 /// A held isolated edit context. While this value is live, the agent's
@@ -247,6 +247,7 @@ impl IsolatedEditContext {
             None,
             session_id,
             self.spawn_tenant,
+            SharedBranchPolicy::Honor,
         )
         .await?;
 
@@ -363,6 +364,9 @@ pub struct AcquireRequest<'a> {
     /// spawn allocates before its session exists (plan
     /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P5b).
     pub spawn_tenant: Option<uuid::Uuid>,
+    /// Whether coord's `shared_branch` directive is honored or refused before
+    /// any branch switch — see [`SharedBranchPolicy`].
+    pub shared_branch: SharedBranchPolicy,
 }
 
 /// Allocate isolated worktrees for the given repos.
@@ -373,6 +377,8 @@ pub struct AcquireRequest<'a> {
 ///   the legacy shared-checkout flow.
 /// - `Err(AllocateError::ClaimConflict)` — pre-flight claim was held by
 ///   another agent; the caller decides abort/wait/steal.
+/// - `Err(AllocateError::Wait(_))` — coord answered `wait`; nothing was
+///   materialized.
 /// - `Err(AllocateError::Other(_))` — anything else (resolution failure,
 ///   coord transport error, `git worktree add` failure, etc.).
 pub async fn acquire(
@@ -400,6 +406,7 @@ pub async fn acquire(
         req.phase,
         req.agent_session_id,
         req.spawn_tenant,
+        req.shared_branch,
     )
     .await?;
 
@@ -464,8 +471,9 @@ pub async fn acquire(
 ///   branch into a `MaterializedWorktree` whose `worktree_path` is the
 ///   canonical checkout so callers reading `worktrees[0].worktree_path` get
 ///   the right cwd (the shared checkout) transparently.
-/// - `Wait` → `Err(Other)` with a `wait:` prefix so the caller logs/retries
-///   (it does NOT spin). `acquire_for_terminal` degrades to the shared cwd.
+/// - `Wait` → `Err(AllocateError::Wait)` so the caller branches on the type
+///   (it does NOT spin). `acquire_for_terminal` logs it and degrades to the
+///   shared cwd; `acquire_for_worker` reports it for the conductor to retry.
 #[allow(clippy::too_many_arguments)]
 async fn materialize_repos(
     coord_http_base: &str,
@@ -477,6 +485,7 @@ async fn materialize_repos(
     phase: Option<&str>,
     agent_session_id: Option<uuid::Uuid>,
     spawn_tenant: Option<uuid::Uuid>,
+    shared_branch: SharedBranchPolicy,
 ) -> Result<super::AllocateResult, AllocateError> {
     let mut canonical_paths: HashMap<String, PathBuf> = HashMap::with_capacity(repos.len());
     for repo in repos {
@@ -526,6 +535,7 @@ async fn materialize_repos(
         plan_id,
         phase,
         spawn_tenant,
+        shared_branch,
     )
     .await
     {
@@ -568,6 +578,7 @@ async fn materialize_repos(
                 plan_id,
                 phase,
                 spawn_tenant,
+                shared_branch,
             )
             .await?
         }
@@ -595,10 +606,7 @@ async fn materialize_repos(
             token_exp: sb.token_exp,
             active_claims: sb.active_claims,
         }),
-        MaterializeOutcome::Wait(w) => Err(AllocateError::Other(format!(
-            "wait: coord declined to materialize agent_id={} reason={:?} blocking={:?} retry_when={:?}",
-            w.agent_id, w.reason, w.blocking, w.retry_when
-        ))),
+        MaterializeOutcome::Wait(w) => Err(AllocateError::Wait(w)),
     }
 }
 
@@ -818,7 +826,7 @@ pub async fn acquire_for_terminal(
         (None, None) => (working_dir, None),
         (None, Some(repo)) => {
             let repos = vec![repo.to_string()];
-            match acquire(AcquireRequest {
+            let acquired = acquire(AcquireRequest {
                 repos: &repos,
                 intent: Some(purpose),
                 declared_overlap_paths: None,
@@ -826,28 +834,126 @@ pub async fn acquire_for_terminal(
                 phase: None,
                 agent_session_id,
                 spawn_tenant,
+                shared_branch: SharedBranchPolicy::Honor,
             })
-            .await
-            {
-                Ok(Some(ctx)) => {
-                    let wt_path = ctx
-                        .worktrees
-                        .first()
-                        .map(|w| w.worktree_path.to_string_lossy().to_string());
-                    (wt_path.or(working_dir), Some(ctx))
-                }
-                Ok(None) => (working_dir, None),
-                Err(e) => {
-                    warn!(
-                        intent_repo = %repo,
-                        error = %e,
-                        "acquire_for_terminal: isolated worktree allocate failed — falling back to shared cwd"
-                    );
-                    (working_dir, None)
-                }
-            }
+            .await;
+            terminal_cwd_after_acquire(repo, acquired, working_dir, |ctx: &IsolatedEditContext| {
+                ctx.worktrees
+                    .first()
+                    .map(|w| w.worktree_path.to_string_lossy().to_string())
+            })
         }
     };
+    if let Some(wd) = &out.0 {
+        provision_session_cwd(wd, out.1.is_some(), spawn_tenant);
+    }
+    out
+}
+
+/// The terminal half of [`acquire_for_terminal`]'s allocate arm: an operator's
+/// shell FAILS OPEN. Every failure — coord's `wait` included — is logged and
+/// the pane falls back to its caller-supplied `working_dir`, as does worktree
+/// mode being off. Generic over the context so the fallback policy is testable
+/// without a live allocation; [`acquire_for_worker`] is the fail-closed sibling.
+fn terminal_cwd_after_acquire<C>(
+    repo: &str,
+    acquired: Result<Option<C>, AllocateError>,
+    working_dir: Option<String>,
+    cwd_of: impl FnOnce(&C) -> Option<String>,
+) -> (Option<String>, Option<C>) {
+    match acquired {
+        Ok(Some(ctx)) => (cwd_of(&ctx).or(working_dir), Some(ctx)),
+        Ok(None) => (working_dir, None),
+        Err(e) => {
+            warn!(
+                intent_repo = %repo,
+                error = %e,
+                "acquire_for_terminal: isolated worktree allocate failed — falling back to shared cwd"
+            );
+            (working_dir, None)
+        }
+    }
+}
+
+/// Why [`acquire_for_worker`] produced no isolated worktree.
+#[derive(Debug)]
+pub enum WorkerIsolationError {
+    /// Worktree mode is off on this runner ([`acquire`] → `Ok(None)`). A
+    /// standing configuration, not something a retry can change.
+    ModeOff,
+    /// The allocate failed or coord declined it. Carries the typed cause, so
+    /// the caller tells a `wait` from a claim conflict from a refusal.
+    Allocate(AllocateError),
+}
+
+/// The orchestration-worker sibling of [`acquire_for_terminal`]: allocate an
+/// isolated worktree for `repo` or say why not, and NEVER hand back the shared
+/// checkout.
+///
+/// An autonomous editor and an operator's shell have opposite failure
+/// policies. A terminal that cannot get a worktree still opens, in its own
+/// cwd; a worker that cannot get one must not start at all, because nobody is
+/// watching what it writes into the shared checkout. So this returns a typed
+/// outcome instead of a cwd, requests the allocate with
+/// [`SharedBranchPolicy::Refuse`] (coord's `shared_branch` would put the
+/// worker in the canonical checkout), and has no reuse arm — a worker is
+/// always a fresh dispatch with no recorded pane to reuse. Plan
+/// `2026-09-23-conductor-e2e-phase1-defects` Phase 1.
+///
+/// On success the worktree is provisioned exactly as a terminal's is (see
+/// [`provision_session_cwd`]) and returned with the context that holds its
+/// claims.
+pub async fn acquire_for_worker(
+    repo: &str,
+    purpose: &str,
+    agent_session_id: Option<uuid::Uuid>,
+    spawn_tenant: Option<uuid::Uuid>,
+) -> Result<(String, IsolatedEditContext), WorkerIsolationError> {
+    let repos = vec![repo.to_string()];
+    let ctx = match acquire(AcquireRequest {
+        repos: &repos,
+        intent: Some(purpose),
+        declared_overlap_paths: None,
+        plan_id: None,
+        phase: None,
+        agent_session_id,
+        spawn_tenant,
+        shared_branch: SharedBranchPolicy::Refuse,
+    })
+    .await
+    {
+        Ok(Some(ctx)) => ctx,
+        Ok(None) => return Err(WorkerIsolationError::ModeOff),
+        Err(e) => return Err(WorkerIsolationError::Allocate(e)),
+    };
+    let Some(wd) = ctx
+        .worktrees
+        .first()
+        .map(|w| w.worktree_path.to_string_lossy().to_string())
+    else {
+        // Dropping `ctx` releases whatever claims it holds.
+        return Err(WorkerIsolationError::Allocate(AllocateError::Other(
+            format!("allocate for {repo} returned no worktree"),
+        )));
+    };
+    provision_session_cwd(&wd, true, spawn_tenant);
+    Ok((wd, ctx))
+}
+
+/// Provision the per-session cwd artifacts — the coord-mcp `.mcp.json` and the
+/// fleet commands/skills — into a session's finalized working dir. Shared by
+/// [`acquire_for_terminal`], [`acquire_for_worker`], and the orchestration
+/// dispatch of a worker that declares no repo.
+///
+/// `allocated_here` is `true` when the caller's own allocate produced a context
+/// for this cwd; together with the allocation-root check below it decides
+/// whether the cwd may carry a tenant-pinned key (see
+/// [`in_cwd_credential_plan`]).
+pub(crate) fn provision_session_cwd(
+    wd: &str,
+    allocated_here: bool,
+    spawn_tenant: Option<uuid::Uuid>,
+) {
     // Provision coord-mcp into the finalized session cwd — the single chokepoint
     // for every device-JWT terminal path (operator tab, HTTP /terminals, tauri
     // proxy, backend relay, coordinator/worker sessions). Targets the POST-acquire
@@ -862,90 +968,89 @@ pub async fn acquire_for_terminal(
     // FAILS CLOSED inside provisioning (no dead-port config written + a degraded
     // breadcrumb) rather than silently substituting the bootstrap default — the
     // F1 root cause. We pass it through unchanged.
-    if let Some(wd) = &out.0 {
-        // A spawn that chose a tenant (plan
-        // 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential)
-        // must not get the machine pin's key in its cwd `.mcp.json`: that file
-        // IS the session's credential whenever it declares coord-mcp (the
-        // identity seam then delivers none of its own). But the file is also
-        // read by every OTHER session launched in that cwd, so it may carry the
-        // chosen tenant's key only when THIS call allocated the worktree — see
-        // [`in_cwd_credential_plan`].
-        let freshly_allocated = out.1.is_some()
-            && super::canonical_paths::allocated_worktree_for_path(std::path::Path::new(wd))
-                .is_some_and(|root| {
-                    super::canonical_paths::paths_equal(&root, std::path::Path::new(wd))
-                });
-        match in_cwd_credential_plan(
-            crate::coord_mcp::credential_spawn_tenant(spawn_tenant),
-            freshly_allocated,
-        ) {
-            InCwdCredentialPlan::LeaveShared(tenant) => info!(
-                workdir = %wd,
-                tenant = %tenant,
-                "acquire_for_terminal: cwd not allocated by this spawn — not writing a \
-                 tenant-pinned .mcp.json other sessions read; the identity seam issues this \
-                 session's credential or refuses"
-            ),
-            InCwdCredentialPlan::Provision(tenant) => {
-                crate::coord_mcp::provision_coord_mcp_for_session(
-                    wd,
-                    crate::coord_mcp::resolve_bound_api_port(),
-                    tenant,
-                );
-            }
-        }
-        // The fleet COMMANDS and SKILLS belong at this same chokepoint, for the
-        // same reason coord-mcp does: they are per-session cwd artifacts, and
-        // PROJECT-scoped skills and commands resolve only from the cwd `claude`
-        // was launched in (`<cwd>/.claude/commands/*.md`,
-        // `<cwd>/.claude/skills/<name>/SKILL.md`). A user-scoped `~/.claude`
-        // also resolves, but most fleet devices have none.
-        //
-        // They were wired into the AGENT spawn paths only (`agent_runtime`
-        // x2, `looping_agent_supervisor`). centralize-coord-mcp-provisioning
-        // ADDED this chokepoint for coord-mcp's terminal coverage (it did not
-        // replace those agent-path calls, which still stand) — and the
-        // commands/skills provisioning never followed. So an interactive session
-        // (operator tab, HTTP /terminals, tauri proxy, backend relay) got a
-        // working `.mcp.json` and NO skills. On a device with no
-        // `qontinui-claude-config` checkout that leaves the session with no
-        // `.claude/skills` at all, which is precisely the floor
-        // `fleet_skills` exists to provide: `/coord-revive` — the documented
-        // first step out of a stale coord-mcp proxy key, and the one named by
-        // `coord_mcp::PROXY_KEY_RECOVERY_HINT` — was unresolvable in exactly
-        // the sessions most likely to need it.
-        //
-        // Both are fail-soft, so neither can abort an otherwise-launchable
-        // spawn. Note "idempotent" in their docs means UNCONDITIONAL OVERWRITE,
-        // not "writes only when it would change something" — which is exactly
-        // why the guard below is needed.
-        //
-        // GUARDED, unlike the three agent-path call sites. Those target a fresh
-        // agent worktree or an agent-private home dir, where an unconditional
-        // overwrite is correct and wanted. THIS chokepoint can resolve to an
-        // arbitrary operator cwd — including `qontinui-claude-config`, which
-        // TRACKS 124 paths under `.claude/` and is the upstream these bundled
-        // bodies were copied from. Provisioning there would overwrite the
-        // canonical hand-authored sources with the binary's (older) snapshot,
-        // and `dirty.rs` counts a tracked ` M ` line as dirty — so the repo
-        // would also be dirty-from-birth and pinned out of every pull.
-        //
-        // `.claude/` cannot be handled the way `.mcp.json` is: `fleet.rs`'s
-        // MANAGED_REPO_EXCLUDES roster forbids adding it, because excluding it
-        // would hide an operator's intended new `.claude/commands/*.md` from
-        // `git status`. So the guard lives here instead.
-        if claude_tree_is_repo_authored(wd) {
-            info!(
-                workdir = %wd,
-                "fleet provisioning: skipped — this cwd's .claude/ is git-tracked, so the repo                  authors its own skills/commands and the bundle must not clobber them"
+    //
+    // A spawn that chose a tenant (plan
+    // 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential)
+    // must not get the machine pin's key in its cwd `.mcp.json`: that file
+    // IS the session's credential whenever it declares coord-mcp (the
+    // identity seam then delivers none of its own). But the file is also
+    // read by every OTHER session launched in that cwd, so it may carry the
+    // chosen tenant's key only when THIS call allocated the worktree — see
+    // [`in_cwd_credential_plan`].
+    let freshly_allocated = allocated_here
+        && super::canonical_paths::allocated_worktree_for_path(std::path::Path::new(wd))
+            .is_some_and(|root| {
+                super::canonical_paths::paths_equal(&root, std::path::Path::new(wd))
+            });
+    match in_cwd_credential_plan(
+        crate::coord_mcp::credential_spawn_tenant(spawn_tenant),
+        freshly_allocated,
+    ) {
+        InCwdCredentialPlan::LeaveShared(tenant) => info!(
+            workdir = %wd,
+            tenant = %tenant,
+            "provision_session_cwd: cwd not allocated by this spawn — not writing a \
+             tenant-pinned .mcp.json other sessions read; the identity seam issues this \
+             session's credential or refuses"
+        ),
+        InCwdCredentialPlan::Provision(tenant) => {
+            crate::coord_mcp::provision_coord_mcp_for_session(
+                wd,
+                crate::coord_mcp::resolve_bound_api_port(),
+                tenant,
             );
-        } else {
-            crate::fleet_commands::provision_fleet_commands_for_session(wd);
-            crate::fleet_skills::provision_fleet_skills_for_session(wd);
         }
     }
-    out
+    // The fleet COMMANDS and SKILLS belong at this same chokepoint, for the
+    // same reason coord-mcp does: they are per-session cwd artifacts, and
+    // PROJECT-scoped skills and commands resolve only from the cwd `claude`
+    // was launched in (`<cwd>/.claude/commands/*.md`,
+    // `<cwd>/.claude/skills/<name>/SKILL.md`). A user-scoped `~/.claude`
+    // also resolves, but most fleet devices have none.
+    //
+    // They were wired into the AGENT spawn paths only (`agent_runtime`
+    // x2, `looping_agent_supervisor`). centralize-coord-mcp-provisioning
+    // ADDED this chokepoint for coord-mcp's terminal coverage (it did not
+    // replace those agent-path calls, which still stand) — and the
+    // commands/skills provisioning never followed. So an interactive session
+    // (operator tab, HTTP /terminals, tauri proxy, backend relay) got a
+    // working `.mcp.json` and NO skills. On a device with no
+    // `qontinui-claude-config` checkout that leaves the session with no
+    // `.claude/skills` at all, which is precisely the floor
+    // `fleet_skills` exists to provide: `/coord-revive` — the documented
+    // first step out of a stale coord-mcp proxy key, and the one named by
+    // `coord_mcp::PROXY_KEY_RECOVERY_HINT` — was unresolvable in exactly
+    // the sessions most likely to need it.
+    //
+    // Both are fail-soft, so neither can abort an otherwise-launchable
+    // spawn. Note "idempotent" in their docs means UNCONDITIONAL OVERWRITE,
+    // not "writes only when it would change something" — which is exactly
+    // why the guard below is needed.
+    //
+    // GUARDED, unlike the three agent-path call sites. Those target a fresh
+    // agent worktree or an agent-private home dir, where an unconditional
+    // overwrite is correct and wanted. THIS chokepoint can resolve to an
+    // arbitrary operator cwd — including `qontinui-claude-config`, which
+    // TRACKS 124 paths under `.claude/` and is the upstream these bundled
+    // bodies were copied from. Provisioning there would overwrite the
+    // canonical hand-authored sources with the binary's (older) snapshot,
+    // and `dirty.rs` counts a tracked ` M ` line as dirty — so the repo
+    // would also be dirty-from-birth and pinned out of every pull.
+    //
+    // `.claude/` cannot be handled the way `.mcp.json` is: `fleet.rs`'s
+    // MANAGED_REPO_EXCLUDES roster forbids adding it, because excluding it
+    // would hide an operator's intended new `.claude/commands/*.md` from
+    // `git status`. So the guard lives here instead.
+    if claude_tree_is_repo_authored(wd) {
+        info!(
+            workdir = %wd,
+            "fleet provisioning: skipped — this cwd's .claude/ is git-tracked, so the repo \
+             authors its own skills/commands and the bundle must not clobber them"
+        );
+    } else {
+        crate::fleet_commands::provision_fleet_commands_for_session(wd);
+        crate::fleet_skills::provision_fleet_skills_for_session(wd);
+    }
 }
 
 /// What [`acquire_for_terminal`] does with the cwd `.mcp.json` for one spawn.
@@ -1124,6 +1229,41 @@ impl IsolatedEditContext {
 
 #[cfg(test)]
 mod tests {
+    /// Plan `2026-09-23-conductor-e2e-phase1-defects` Phase 1 regression: the
+    /// worker path's typed `wait` must not change the terminal policy. An
+    /// operator's shell still opens in its own cwd on `wait`, on any other
+    /// allocate error, and with worktree mode off.
+    #[test]
+    fn a_terminal_still_falls_back_to_its_cwd_when_coord_says_wait() {
+        use crate::agent_worktree::{AllocateError, WaitOutcome};
+        let wd = Some("/home/op/qontinui-runner".to_string());
+        let wait: Result<Option<u8>, AllocateError> = Err(AllocateError::Wait(WaitOutcome {
+            agent_id: "a1".to_string(),
+            reason: Some("held".to_string()),
+            blocking: None,
+            retry_when: None,
+        }));
+        assert_eq!(
+            terminal_cwd_after_acquire("qontinui-runner", wait, wd.clone(), |_| None),
+            (wd.clone(), None)
+        );
+        let other: Result<Option<u8>, AllocateError> = Err(AllocateError::Other("5xx".into()));
+        assert_eq!(
+            terminal_cwd_after_acquire("qontinui-runner", other, wd.clone(), |_| None),
+            (wd.clone(), None)
+        );
+        assert_eq!(
+            terminal_cwd_after_acquire::<u8>("qontinui-runner", Ok(None), wd.clone(), |_| None),
+            (wd.clone(), None)
+        );
+        assert_eq!(
+            terminal_cwd_after_acquire("qontinui-runner", Ok(Some(7u8)), wd, |_| {
+                Some("/wt/a1/qontinui-runner".to_string())
+            }),
+            (Some("/wt/a1/qontinui-runner".to_string()), Some(7))
+        );
+    }
+
     /// B1 (review of plan 2026-09-10 P5b). A path-shaped worktree the spawn
     /// did NOT allocate — another session's, reached through `working_dir` or
     /// the reuse arm — is shared: a tenant-B spawn there must write nothing, so
@@ -1548,6 +1688,7 @@ mod tests {
                 phase: None,
                 agent_session_id: None,
                 spawn_tenant: None,
+                shared_branch: SharedBranchPolicy::Honor,
             })
             .await
             .expect("flag-off should return Ok(None), not Err");

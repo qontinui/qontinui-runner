@@ -536,9 +536,17 @@ fn plan_library_backfill(args: &[String]) -> ExitCode {
     // behind its default branch — re-introducing the exact defect Phase 3
     // removes, and with two writers alternating so the corpus flaps. One byte
     // source for both writers is the whole point.
+    //
+    // One pin for the whole run, so roots sharing a repo share one fetch and
+    // one commit — the same guarantee the loop gives its two halves.
+    let pin = pwa::ref_scan::CycleRefPin::default();
     for root in &roots {
-        let (found, mut root_skipped) =
-            pwa::scan_roots_at_source(std::slice::from_ref(root), &conv, &pwa::trigger::ProcessGit);
+        let (found, mut root_skipped) = pwa::scan_roots_at_source(
+            std::slice::from_ref(root),
+            &conv,
+            &pwa::trigger::ProcessGit,
+            &pin,
+        );
         skipped.append(&mut root_skipped);
         let label = format!(
             "{} [{}]",

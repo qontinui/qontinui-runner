@@ -6757,6 +6757,7 @@ async fn acquire_continuation_workdir(
             // A gate continuation is coord-spawned: no spawn picker chose a
             // tenant, and its session id resolves its own.
             spawn_tenant: None,
+            shared_branch: crate::agent_worktree::SharedBranchPolicy::Honor,
         })
         .await;
         let ctx = match settle_continuation_acquire(acquired) {
@@ -6895,10 +6896,7 @@ fn settle_continuation_acquire<C>(
     }
 }
 
-/// The leading token of a foreign-repo continuation refused because it got no
-/// worktree of its own. Stable, like
-/// [`crate::agent_worktree::canonical_paths::WORKDIR_NOT_A_CHECKOUT`].
-const NO_ISOLATED_WORKTREE: &str = "no_isolated_worktree";
+use crate::agent_worktree::NO_ISOLATED_WORKTREE;
 
 /// Pure core of the continuation fallback cwd — reached only when no worktree
 /// was acquired.
