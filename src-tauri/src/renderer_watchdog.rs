@@ -104,8 +104,9 @@ use tracing::{debug, error, info, warn};
 use crate::fleet::RendererMemoryHandles;
 use crate::webview_recovery::{self, RecoveryOutcome, RecoveryReason};
 
-/// Tauri event the frontend listens on for both the countdown toast and the
-/// persistent storm banner. Payload is a [`WatchdogEvent`].
+/// Tauri event the frontend listens on for the countdown toast and for both
+/// edges of the persistent storm banner. Payload is a [`WatchdogEvent`];
+/// `src/hooks/useRendererMemoryWatchdog.ts` is the consumer.
 pub const WATCHDOG_EVENT: &str = "renderer-memory-watchdog";
 
 /// Fraction of a slope arm's window that must actually be spanned by samples
@@ -665,6 +666,7 @@ fn publish_sample(snapshot: &Snapshot) {
 pub struct WatchdogEvent {
     /// `"reload_warning"` — a countdown is running and the reload WILL proceed.
     /// `"storming"` — persistent banner; reloads have stopped.
+    /// `"storm_cleared"` — the storm ended; retire that banner.
     /// `"reload_result"` — the pre/post reclaim report for a completed heal.
     pub kind: &'static str,
     /// Which detector fired, as [`Breach::as_str`].
@@ -782,6 +784,10 @@ async fn run(app: AppHandle, cfg: WatchdogConfig) {
                     "renderer_watchdog: memory recovered and the reload window is clear — \
                      clearing the storm flag"
                 );
+                // The third of §6 Q3's surfaces does not clear itself: the
+                // in-app banner is React state, so without this edge it could
+                // only ever go up. See `emit_storm_cleared`.
+                emit_storm_cleared(&app, &snapshot);
             }
             continue;
         };
@@ -877,6 +883,42 @@ fn escalate_storm(
             message: format!(
                 "Renderer memory leak the reload can't outrun — restart recommended. ({reason})"
             ),
+        },
+    );
+}
+
+/// §6 Q3's escalation, RETRACTED: the storm ended, so retire its banner.
+///
+/// The counterpart to [`escalate_storm`], and the reason it exists is a defect
+/// this module had while all three of §6 Q3's surfaces were "shipped". Two of
+/// them are level-triggered and clear themselves — the loud log is a log, and
+/// `TELEMETRY.storming` goes back to `false` right here, so the heartbeat and
+/// the twin gauge fall back to 0 on their own. The third does not: the in-app
+/// banner is React state, and with no event on this edge it could only ever go
+/// up. A banner that can never come down is not an alarm, it is a permanent red
+/// light — the same class of defect an independent review found on this plan's
+/// coord half, where a device roll-up gauge could never return to 0.
+///
+/// Emitted from the ONE edge `HealGovernor::clear_if_recovered` reports, which
+/// is true only when the latch was actually set, so this is edge-triggered on
+/// the Rust side too: one event per storm, not one per healthy tick.
+fn emit_storm_cleared(app: &AppHandle, snapshot: &Snapshot) {
+    emit(
+        app,
+        WatchdogEvent {
+            kind: "storm_cleared",
+            // No detector is firing — that is the whole point of this arm. The
+            // field is `&'static str` and not optional, so it carries the
+            // absence explicitly rather than a stale breach that has stopped
+            // being true.
+            breach: "none",
+            total_ws_bytes: snapshot.total_bytes,
+            countdown_secs: 0,
+            reload_total: TELEMETRY.reload_total.load(Ordering::Relaxed),
+            // Nothing was reclaimed BY this event; the reclaim reports belong to
+            // `"reload_result"`.
+            reclaimed_bytes: None,
+            message: "Renderer memory recovered — the reload storm has cleared.".to_string(),
         },
     );
 }
@@ -1813,6 +1855,106 @@ mod tests {
         let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
         keys.sort_unstable();
         assert_eq!(keys, ["firstSeenUnixMs", "kind", "pid", "workingSetBytes"]);
+    }
+
+    // ── the UI event contract ───────────────────────────────────────────
+
+    #[test]
+    fn the_ui_event_serializes_the_camel_case_names_the_listener_reads() {
+        // `src/hooks/useRendererMemoryWatchdog.ts` mirrors these names by hand,
+        // so a rename here that is not made there silently drops a field on the
+        // floor — which is how the whole frontend half came to be missing in the
+        // first place. Pinned on the countdown arm, which carries every field.
+        let json = serde_json::to_value(WatchdogEvent {
+            kind: "reload_warning",
+            breach: Breach::FastSlope {
+                slope_mb_per_min: 84.0,
+            }
+            .as_str(),
+            total_ws_bytes: 1_600_000_000,
+            countdown_secs: 10,
+            reload_total: 0,
+            reclaimed_bytes: None,
+            message: "Reclaiming renderer memory".to_string(),
+        })
+        .unwrap();
+        let obj = json.as_object().unwrap();
+        let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "breach",
+                "countdownSecs",
+                "kind",
+                "message",
+                "reloadTotal",
+                "totalWsBytes"
+            ],
+            "reclaimedBytes must be ABSENT (not null) when it is None — the \
+             listener types it optional on that basis"
+        );
+        assert_eq!(obj["kind"], "reload_warning");
+        assert_eq!(obj["breach"], "fast_slope");
+    }
+
+    #[test]
+    fn the_reclaim_report_adds_the_signed_delta() {
+        let json = serde_json::to_value(WatchdogEvent {
+            kind: "reload_result",
+            breach: Breach::TotalCeiling { bytes: 1 }.as_str(),
+            total_ws_bytes: 1_700_000_000,
+            countdown_secs: 0,
+            reload_total: 1,
+            // A reload can leave the renderer BIGGER; the field is `i64` for
+            // exactly that, and the listener must not clamp it at zero.
+            reclaimed_bytes: Some(-4_000_000),
+            message: "Renderer reloaded".to_string(),
+        })
+        .unwrap();
+        assert_eq!(json["reclaimedBytes"], -4_000_000);
+    }
+
+    #[test]
+    fn the_storm_has_a_clearing_edge_and_it_names_no_detector() {
+        // §6 Q3's banner is the one surface of the three that cannot clear
+        // itself: the log is a log and `TELEMETRY.storming` is level-triggered,
+        // but React state only moves when an event moves it. So the clear arm
+        // exists, and it must not carry a breach that has stopped being true.
+        let json = serde_json::to_value(WatchdogEvent {
+            kind: "storm_cleared",
+            breach: "none",
+            total_ws_bytes: 400_000_000,
+            countdown_secs: 0,
+            reload_total: 2,
+            reclaimed_bytes: None,
+            message: "Renderer memory recovered — the reload storm has cleared.".to_string(),
+        })
+        .unwrap();
+        assert_eq!(json["kind"], "storm_cleared");
+        assert_eq!(json["breach"], "none");
+        assert!(json.get("reclaimedBytes").is_none());
+    }
+
+    #[test]
+    fn the_clear_edge_fires_once_per_storm_not_once_per_healthy_tick() {
+        // `emit_storm_cleared` is called from the ONE site
+        // `clear_if_recovered` reports true, so the governor's edge behaviour IS
+        // the event's idempotence. A healthy tick with no storm latched must
+        // report nothing at all, or the listener would see a clear per tick.
+        let c = cfg();
+        let mut g = HealGovernor::default();
+        let now = Instant::now();
+        assert!(
+            !g.clear_if_recovered(now, &c),
+            "no storm was latched, so there is no edge to report"
+        );
+        g.latch_storm();
+        assert!(g.clear_if_recovered(now, &c), "the storm ended: one edge");
+        assert!(
+            !g.clear_if_recovered(now, &c),
+            "already clear — a second clear is not an edge"
+        );
     }
 
     // ── env plumbing ────────────────────────────────────────────────────

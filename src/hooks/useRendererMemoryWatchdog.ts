@@ -21,18 +21,32 @@
  *
  * `renderer_watchdog::WatchdogEvent` is `#[serde(rename_all = "camelCase")]`,
  * so the wire names are the camelCase forms mirrored in
- * {@link RendererWatchdogEvent}. It emits exactly three `kind`s, from three
- * call sites:
+ * {@link RendererWatchdogEvent}. It emits exactly four `kind`s, from four call
+ * sites:
  *
  * | `kind`            | emitted by            | surface                     |
  * |-------------------|-----------------------|-----------------------------|
  * | `reload_warning`  | `heal()`, before the sleep | the countdown toast     |
  * | `reload_result`   | `heal()`, after a verified reload | a self-dismissing toast |
- * | `storming`        | `escalate_storm()`    | the persistent banner       |
+ * | `storming`        | `escalate_storm()`    | the persistent banner, UP   |
+ * | `storm_cleared`   | `emit_storm_cleared()`, on `clear_if_recovered` | that banner, DOWN |
  *
  * `reclaimedBytes` is `Option<i64>` behind `skip_serializing_if`, so it is
- * ABSENT on the two non-result kinds rather than null — and it can legitimately
+ * ABSENT on the three non-result kinds rather than null — and it can legitimately
  * be NEGATIVE (a reload that left the renderer bigger).
+ *
+ * # Why the banner needs an event for its DOWN edge
+ *
+ * §6 Q3 asks for three surfaces on the escalation, and two of them are
+ * level-triggered: the loud log is a log, and `TELEMETRY.storming` returns to
+ * `false` by itself, so the heartbeat and the twin gauge fall back to 0. The
+ * banner is React state, and state only moves when an event moves it — so
+ * without `storm_cleared` it could only ever go up, which is a permanent red
+ * light rather than an alarm. The Rust arm is edge-triggered
+ * (`HealGovernor::clear_if_recovered` reports `true` only when the latch was
+ * actually set), and {@link reduceRendererWatchdogEvent} is defensive about the
+ * rest: a clear with no storm live is a no-op, and a repeated clear returns the
+ * same state object.
  *
  * # Why the reducer is pure and exported
  *
@@ -51,19 +65,25 @@ import type { ShowToastFn } from "./useToast";
 export const RENDERER_MEMORY_WATCHDOG_EVENT = "renderer-memory-watchdog";
 
 /**
- * The three `kind` values `renderer_watchdog.rs` emits. Widened to `string` on
+ * The four `kind` values `renderer_watchdog.rs` emits. Widened to `string` on
  * the payload itself so a future Rust kind arrives as an unknown rather than a
  * type error at the boundary — {@link reduceRendererWatchdogEvent} ignores one
  * instead of guessing a surface for it.
  */
-export type RendererWatchdogEventKind = "reload_warning" | "reload_result" | "storming";
+export type RendererWatchdogEventKind =
+  | "reload_warning"
+  | "reload_result"
+  | "storming"
+  | "storm_cleared";
 
 /** Payload of {@link RENDERER_MEMORY_WATCHDOG_EVENT} — `WatchdogEvent` in Rust. */
 export interface RendererWatchdogEvent {
-  /** `"reload_warning"` | `"reload_result"` | `"storming"`. */
+  /** One of {@link RendererWatchdogEventKind}. */
   kind: RendererWatchdogEventKind | string;
   /** Which detector fired — `Breach::as_str`: `fast_slope` | `slow_slope` |
-   *  `total_ceiling` | `renderer_ceiling`. */
+   *  `total_ceiling` | `renderer_ceiling`. `"none"` on `storm_cleared`, where
+   *  nothing is firing: the Rust field is not optional, so the clear arm states
+   *  the absence rather than carrying a breach that stopped being true. */
   breach: string;
   /** Total WebView2 working set when the event was raised. */
   totalWsBytes: number;
@@ -113,7 +133,7 @@ export const INITIAL_RENDERER_WATCHDOG_UI_STATE: RendererWatchdogUiState = {
 };
 
 /**
- * How long a countdown stays on screen past its own zero.
+ * Bounds on how long a countdown stays on screen past its own zero.
  *
  * The countdown's own end is not the reload: the Rust side wakes from the sleep
  * and only then runs the recovery ladder, which can decline (`server_mode`,
@@ -122,8 +142,24 @@ export const INITIAL_RENDERER_WATCHDOG_UI_STATE: RendererWatchdogUiState = {
  * by remounting the whole renderer, so the only job of this linger is to retire
  * a countdown whose reload never happened. Without it the toast would sit at
  * "0s" forever on a runner whose ladder is unavailable.
+ *
+ * The window is BOUNDED AGAINST the Rust-side `warn_secs` rather than being a
+ * free-floating UI number, using the value the event already carries as
+ * `countdownSecs` — so no new plumbing, and the two cannot drift apart when
+ * `QONTINUI_RUNNER_MEM_WATCHDOG_WARN_SECS` is flipped. At the default
+ * `warn_secs=10` the floor governs and the linger is 20 s; a deliberately long
+ * warn interval gets a proportionally long window, capped so a misconfigured one
+ * cannot strand the toast for minutes.
  */
-export const WARNING_LINGER_SECS = 20;
+export const WARNING_LINGER_MIN_SECS = 20;
+/** @see WARNING_LINGER_MIN_SECS */
+export const WARNING_LINGER_MAX_SECS = 60;
+
+/** The linger for one warning, bounded against its own `countdownSecs`. */
+export function warningLingerSecs(warning: ReloadWarningState): number {
+  const wanted = Number.isFinite(warning.countdownSecs) ? warning.countdownSecs : 0;
+  return Math.min(WARNING_LINGER_MAX_SECS, Math.max(WARNING_LINGER_MIN_SECS, wanted));
+}
 
 /** Seconds left on a countdown, floored at zero. */
 export function warningSecondsRemaining(warning: ReloadWarningState, nowMs: number): number {
@@ -136,9 +172,9 @@ export function isWarningElapsed(warning: ReloadWarningState, nowMs: number): bo
   return warningSecondsRemaining(warning, nowMs) === 0;
 }
 
-/** True once a countdown has outlived its reload attempt (see {@link WARNING_LINGER_SECS}). */
+/** True once a countdown has outlived its reload attempt (see {@link warningLingerSecs}). */
 export function isWarningStale(warning: ReloadWarningState, nowMs: number): boolean {
-  return nowMs - warning.startedAtMs >= (warning.countdownSecs + WARNING_LINGER_SECS) * 1000;
+  return nowMs - warning.startedAtMs >= (warning.countdownSecs + warningLingerSecs(warning)) * 1000;
 }
 
 /**
@@ -156,6 +192,13 @@ export function isWarningStale(warning: ReloadWarningState, nowMs: number): bool
  *   refresh in place, and an event carrying nothing new returns the SAME state
  *   object so React does not even re-render. A storm also clears any live
  *   countdown — reloads have stopped, so nothing is counting down to anything.
+ * - `storm_cleared`  — retire the banner. This is the DOWN edge the banner would
+ *   otherwise never have: the condition ended, so the notice goes, and it is the
+ *   condition clearing it rather than a user dismissing it — which is the whole
+ *   reason §6 Q3 asks for a persistent banner and not a toast. Idempotent in the
+ *   same way as `storming`: a clear with no storm live returns the SAME state
+ *   object and cannot conjure one, so repeated clears are free. It leaves a live
+ *   countdown alone — a fresh heal starting is unrelated to a past storm ending.
  * - anything else    — unknown kind, state untouched.
  */
 export function reduceRendererWatchdogEvent(
@@ -200,6 +243,13 @@ export function reduceRendererWatchdogEvent(
       if (unchanged && state.warning === null) return state;
       return { warning: null, storm: unchanged ? prev : next };
     }
+
+    case "storm_cleared":
+      // No storm live: nothing to retire, and nothing to create. Returning the
+      // same object keeps a duplicate clear free, and means a clear that
+      // arrives first (a stale replay, an out-of-order emit) cannot invent a
+      // banner out of an event whose only job is to remove one.
+      return state.storm === null ? state : { ...state, storm: null };
 
     default:
       return state;

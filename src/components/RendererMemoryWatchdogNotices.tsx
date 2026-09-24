@@ -14,16 +14,17 @@
  *
  * 2. **§6 Q3 — the persistent storm banner.** Once the reload budget is spent
  *    with memory still climbing, "renderer memory leak the reload can't outrun —
- *    restart recommended", alongside the loud log and the heartbeat flag. Also
- *    not dismissible: the Rust side clears its storm latch only on
- *    `clear_if_recovered` and emits no event when it does, so the frontend has
- *    no honest signal that the condition ended. A reload *is* the exit — it
- *    remounts the renderer and wipes this state — which is exactly the action
- *    the banner recommends.
+ *    restart recommended", alongside the loud log and the heartbeat flag. Not
+ *    dismissible by the reader, and deliberately so: it comes down when the
+ *    CONDITION clears — the Rust side's `emit_storm_cleared`, on the one edge
+ *    `clear_if_recovered` reports — and a dismiss button would turn the one
+ *    surface §6 Q3 asked to be persistent back into a toast. That down edge is
+ *    what keeps it an alarm instead of a permanent red light; a reload is the
+ *    other exit, and it is the action the banner recommends.
  *
  * Both are driven by {@link useRendererMemoryWatchdog}, which owns the
  * `renderer-memory-watchdog` subscription and the event→state mapping. The
- * third emitted kind, `reload_result`, goes to the app's ordinary toast queue
+ * fourth emitted kind, `reload_result`, goes to the app's ordinary toast queue
  * via that hook's `showToast` — a completed heal is a report, not a state.
  *
  * Styling reuses the vocabulary already in `components/app/AppToasts.tsx` and

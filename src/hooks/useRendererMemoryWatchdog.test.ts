@@ -12,15 +12,21 @@
  * Covered:
  *   1. Every `kind` the Rust side emits maps to the right surface, and only
  *      that surface: `reload_warning` → countdown, `storming` → banner,
- *      `reload_result` → neither (it retires the countdown and reports via the
- *      ordinary toast queue).
+ *      `storm_cleared` → banner retired, `reload_result` → neither (it retires
+ *      the countdown and reports via the ordinary toast queue).
  *   2. A REPEATED storm event does not duplicate the banner — the escalation
  *      re-emits on every breaching tick while latching only its loud log, so
  *      the single slot, the preserved `sinceMs` and the identity bail-out are
  *      the load-bearing properties.
- *   3. The countdown counts DOWN and elapses on its own — §6 Q2's "proceed
- *      whether or not acknowledged".
- *   4. An unknown future `kind` is ignored rather than mapped to a guess.
+ *   3. The banner comes DOWN when the CONDITION clears, not when anyone
+ *      dismisses it: storm → clear leaves nothing, a clear with no storm live is
+ *      a no-op, repeated clears are idempotent, and a storm → clear → storm
+ *      cycle raises it again with a FRESH `sinceMs`. A banner that can only ever
+ *      go up is a permanent red light, not an alarm.
+ *   4. The countdown counts DOWN and elapses on its own — §6 Q2's "proceed
+ *      whether or not acknowledged" — and its linger is bounded against the
+ *      Rust-side `warn_secs` the event carries, so the two cannot drift.
+ *   5. An unknown future `kind` is ignored rather than mapped to a guess.
  */
 
 import { describe, it, expect } from "vitest";
@@ -28,10 +34,12 @@ import { describe, it, expect } from "vitest";
 import {
   INITIAL_RENDERER_WATCHDOG_UI_STATE,
   RENDERER_MEMORY_WATCHDOG_EVENT,
-  WARNING_LINGER_SECS,
+  WARNING_LINGER_MAX_SECS,
+  WARNING_LINGER_MIN_SECS,
   advanceRendererWatchdogClock,
   isWarningElapsed,
   isWarningStale,
+  warningLingerSecs,
   reduceRendererWatchdogEvent,
   reloadResultToastType,
   warningSecondsRemaining,
@@ -272,7 +280,7 @@ describe("the countdown elapses on its own (§6 Q2)", () => {
     // The ladder can decline, wedge, exhaust or fail, and emits nothing on any
     // of those arms — so the toast must retire itself rather than sit at 0s.
     expect(isWarningStale(warning, T0 + 10_000)).toBe(false);
-    expect(isWarningStale(warning, T0 + (10 + WARNING_LINGER_SECS) * 1000)).toBe(true);
+    expect(isWarningStale(warning, T0 + (10 + WARNING_LINGER_MIN_SECS) * 1000)).toBe(true);
     expect(advanceRendererWatchdogClock(armed, T0 + 10_000)).toBe(armed);
     expect(advanceRendererWatchdogClock(armed, T0 + 60_000).warning).toBeNull();
   });
@@ -312,5 +320,132 @@ describe("formatWorkingSet", () => {
   it("says unknown rather than 0 MB for an unreadable sample", () => {
     expect(formatWorkingSet(0)).toBe("unknown");
     expect(formatWorkingSet(Number.NaN)).toBe("unknown");
+  });
+});
+
+describe("the storm banner comes down when the CONDITION clears (§6 Q3)", () => {
+  /** A `storm_cleared` event exactly as `emit_storm_cleared()` emits it. */
+  function clearedEvent(overrides: Partial<RendererWatchdogEvent> = {}): RendererWatchdogEvent {
+    return {
+      kind: "storm_cleared",
+      // Nothing is firing on this arm, and the Rust field is not optional, so
+      // it states the absence rather than carrying a stale breach.
+      breach: "none",
+      totalWsBytes: 400_000_000,
+      countdownSecs: 0,
+      reloadTotal: 2,
+      message: "Renderer memory recovered — the reload storm has cleared.",
+      ...overrides,
+    };
+  }
+
+  it("a storm followed by a clear leaves no banner", () => {
+    const stormed = reduceRendererWatchdogEvent(
+      INITIAL_RENDERER_WATCHDOG_UI_STATE,
+      stormEvent(),
+      T0,
+    );
+    expect(stormed.storm).not.toBeNull();
+    const cleared = reduceRendererWatchdogEvent(stormed, clearedEvent(), T0 + 900_000);
+    expect(cleared.storm).toBeNull();
+    expect(cleared.warning).toBeNull();
+  });
+
+  it("a clear with no storm live is a no-op and cannot conjure one", () => {
+    const s = reduceRendererWatchdogEvent(INITIAL_RENDERER_WATCHDOG_UI_STATE, clearedEvent(), T0);
+    expect(s).toBe(INITIAL_RENDERER_WATCHDOG_UI_STATE);
+    expect(s.storm).toBeNull();
+  });
+
+  it("repeated clears are idempotent — the same state object every time", () => {
+    const stormed = reduceRendererWatchdogEvent(
+      INITIAL_RENDERER_WATCHDOG_UI_STATE,
+      stormEvent(),
+      T0,
+    );
+    let s = reduceRendererWatchdogEvent(stormed, clearedEvent(), T0 + 1_000);
+    const afterFirstClear = s;
+    for (let tick = 2; tick <= 10; tick += 1) {
+      s = reduceRendererWatchdogEvent(s, clearedEvent(), T0 + tick * 30_000);
+    }
+    expect(s).toBe(afterFirstClear);
+    expect(s.storm).toBeNull();
+  });
+
+  it("a storm → clear → storm cycle raises the banner again with a FRESH sinceMs", () => {
+    const first = reduceRendererWatchdogEvent(INITIAL_RENDERER_WATCHDOG_UI_STATE, stormEvent(), T0);
+    expect(first.storm?.sinceMs).toBe(T0);
+    const cleared = reduceRendererWatchdogEvent(first, clearedEvent(), T0 + 600_000);
+    expect(cleared.storm).toBeNull();
+    // A SECOND, genuinely new storm. It must not inherit the first one's age —
+    // "escalated 3h ago" on a storm that began a minute ago is a lie.
+    const second = reduceRendererWatchdogEvent(cleared, stormEvent(), T0 + 3_600_000);
+    expect(second.storm).not.toBeNull();
+    expect(second.storm?.sinceMs).toBe(T0 + 3_600_000);
+    expect(formatStormAge(second.storm!, T0 + 3_600_000)).toBe("0s");
+  });
+
+  it("a clear leaves a live countdown alone — a new heal is not a past storm", () => {
+    const stormed = reduceRendererWatchdogEvent(
+      INITIAL_RENDERER_WATCHDOG_UI_STATE,
+      stormEvent(),
+      T0,
+    );
+    const armed = reduceRendererWatchdogEvent(stormed, warningEvent(), T0 + 1_000);
+    const cleared = reduceRendererWatchdogEvent(armed, clearedEvent(), T0 + 2_000);
+    expect(cleared.storm).toBeNull();
+    expect(cleared.warning).not.toBeNull();
+    expect(cleared.warning?.startedAtMs).toBe(T0 + 1_000);
+  });
+
+  it("the clear is not a user dismissal — nothing in the reducer takes one", () => {
+    // There is deliberately no `dismiss` action: §6 Q3 asks for a banner that
+    // clears on the CONDITION, and an arm that let a click retire it would make
+    // the surface a toast with extra steps. The only route from storm to no
+    // storm is an event the Rust side emitted.
+    const keys = Object.keys(
+      reduceRendererWatchdogEvent(INITIAL_RENDERER_WATCHDOG_UI_STATE, stormEvent(), T0),
+    );
+    expect(keys.sort()).toEqual(["storm", "warning"]);
+  });
+});
+
+describe("the countdown linger is bounded against the Rust warn_secs", () => {
+  it("the floor governs at the default warn_secs=10", () => {
+    const armed = reduceRendererWatchdogEvent(
+      INITIAL_RENDERER_WATCHDOG_UI_STATE,
+      warningEvent({ countdownSecs: 10 }),
+      T0,
+    );
+    expect(warningLingerSecs(armed.warning!)).toBe(WARNING_LINGER_MIN_SECS);
+  });
+
+  it("a long warn interval gets a proportionally long window", () => {
+    const armed = reduceRendererWatchdogEvent(
+      INITIAL_RENDERER_WATCHDOG_UI_STATE,
+      warningEvent({ countdownSecs: 45 }),
+      T0,
+    );
+    expect(warningLingerSecs(armed.warning!)).toBe(45);
+    expect(isWarningStale(armed.warning!, T0 + (45 + 44) * 1000)).toBe(false);
+    expect(isWarningStale(armed.warning!, T0 + (45 + 45) * 1000)).toBe(true);
+  });
+
+  it("a misconfigured warn_secs cannot strand the toast for minutes", () => {
+    const armed = reduceRendererWatchdogEvent(
+      INITIAL_RENDERER_WATCHDOG_UI_STATE,
+      warningEvent({ countdownSecs: 6_000 }),
+      T0,
+    );
+    expect(warningLingerSecs(armed.warning!)).toBe(WARNING_LINGER_MAX_SECS);
+  });
+
+  it("a non-finite countdown falls back to the floor rather than NaN", () => {
+    const armed = reduceRendererWatchdogEvent(
+      INITIAL_RENDERER_WATCHDOG_UI_STATE,
+      warningEvent({ countdownSecs: Number.NaN }),
+      T0,
+    );
+    expect(warningLingerSecs(armed.warning!)).toBe(WARNING_LINGER_MIN_SECS);
   });
 });
