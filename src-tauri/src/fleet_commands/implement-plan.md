@@ -729,7 +729,9 @@ bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh ad
   --kind semantic_resource \
   --key "plan:<plan-stem>" \
   --ttl "<ttl_seconds>"
-bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh start --ledger "$CLAIM_LEDGER"
+# --max-runtime 86400 (24h): a single run can span many phases and hours —
+# the 12h default has already been outlived twice by one two-plan chain.
+bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh start --ledger "$CLAIM_LEDGER" --max-runtime 86400
 ```
 
 `start` detaches a background loop that re-heartbeats each row in the
@@ -755,7 +757,8 @@ discriminator above becomes the verdict word again, since #2206 also makes
 
 `status --ledger "$CLAIM_LEDGER"` prints one line per row and a
 verdict on its exit code: `LIVE` (0), `STALE` (3), `DEAD` (4), `STOLEN` (5),
-`LAPSED` (7), `EMPTY` (8).
+`LAPSED` (7), `EMPTY` (8), `MAX_RUNTIME` (9 — the loop ended on its own
+`--max-runtime` ceiling, not a coord verdict; re-`add` then `start`).
 Anything but `LIVE` means the claim is **UNKNOWN, not held**.
 
 #### Refresh the agent token — (b) before every phase launch, (c) before every closeout write
@@ -1594,14 +1597,16 @@ bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh st
 ```
 
 `LIVE` (exit 0) is the only verdict that means the claims are held. `STALE`
-(3), `DEAD` (4), `STOLEN` (5), `LAPSED` (7) and `EMPTY` (8) each mean the claim
-is **UNKNOWN, not held** (`STALE` usually self-heals on the next beat;
-re-acquiring anyway is harmless — a held claim answers `renewed`)
+(3), `DEAD` (4), `STOLEN` (5), `LAPSED` (7), `EMPTY` (8) and `MAX_RUNTIME` (9
+— the loop ended on its own `--max-runtime` ceiling, not a coord verdict) each
+mean the claim is **UNKNOWN, not held** (`STALE` usually self-heals on the next
+beat; re-acquiring anyway is harmless — a held claim answers `renewed`)
 — re-`acquire` the affected key, re-`add` it with `--ttl` set to the new
 response's `ttl_seconds` (a terminal row is renewed again only once `add`
 overwrites it), then run `start` (idempotent — `already-running` when the loop
-lives — and required whenever the loop has ended (`DEAD`, or `STOLEN` with no
-live pid), since a ledger with no renewable row ends the loop), then re-read
+lives — and required whenever the loop has ended (`DEAD`, `MAX_RUNTIME`, or
+`STOLEN` with no live pid), since a ledger with no renewable row ends the loop),
+then re-read
 `status` and require `LIVE` before launching, treat a foreign `held` on
 the re-acquire as the conflict flow above, and **say in the report which
 verdict you saw and what you re-acquired**. Silence here is the
@@ -2212,7 +2217,9 @@ bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh st
 
 `LIVE` (exit 0) is the only verdict under which the claims this run already
 holds — the Step 0.48 plan reserve included — are actually held. `STALE` (3),
-`DEAD` (4), `STOLEN` (5), `LAPSED` (7) and `EMPTY` (8) each mean those claims
+`DEAD` (4), `STOLEN` (5), `LAPSED` (7), `EMPTY` (8) and `MAX_RUNTIME` (9 — the
+loop ended on its own `--max-runtime` ceiling, not a coord verdict) each mean
+those claims
 are **UNKNOWN** (`STALE` usually self-heals on the next beat; re-acquiring
 anyway is harmless — a held claim answers `renewed`), so
 **re-`acquire` every key the ledger lists before launching this phase**
@@ -2222,7 +2229,7 @@ foreign `held` through the Step 0.6 conflict flow, **re-`add` each re-acquired
 key** with `--ttl` set to that response's `ttl_seconds` (a `stolen` or `lapsed`
 row stays terminal until `add` overwrites it — `start` alone does not),
 restart the loop with `start` (idempotent, and required whenever the loop has
-ended — `DEAD`, or `STOLEN` with no live pid), then re-read `status` and require
+ended — `DEAD`, `MAX_RUNTIME`, or `STOLEN` with no live pid), then re-read `status` and require
 `LIVE` before launching. **Say so
 in the report**: which verdict was read, which keys were re-acquired, and what
 the re-acquire answered. A re-acquire that is not reported

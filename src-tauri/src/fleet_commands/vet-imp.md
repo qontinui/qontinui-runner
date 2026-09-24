@@ -500,7 +500,10 @@ bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh ad
   --kind semantic_resource \
   --key "plan:<plan-stem>" \
   --ttl "<ttl_seconds>"
-bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh start --ledger "$CLAIM_LEDGER"
+# --max-runtime 604800 (7 days): this is the LONGEST lifecycle chain of the
+# three — session 93078f26 ran one vet-imp-style effort for twelve days and
+# lapsed five hand-raised ceilings (12h, 12h, 24h, 48h, 168h) before it gave up.
+bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh start --ledger "$CLAIM_LEDGER" --max-runtime 604800
 ```
 
 `start` detaches a background loop that re-heartbeats each row when THAT row
@@ -520,7 +523,8 @@ expired case its own `not_held` verdict here; `hb_row` already maps it.)
 
 Read the loop at any point with `status`, which prints one line per row plus a
 verdict on its **exit code**: `LIVE` (0), `STALE` (3), `DEAD` (4), `STOLEN` (5),
-`LAPSED` (7), `EMPTY` (8).
+`LAPSED` (7), `EMPTY` (8), `MAX_RUNTIME` (9 — the loop ended on its own
+`--max-runtime` ceiling, not a coord verdict; re-`add` then `start`).
 
 ```bash
 bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh status --ledger "$CLAIM_LEDGER"
