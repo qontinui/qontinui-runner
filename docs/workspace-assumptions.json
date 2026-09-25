@@ -1269,7 +1269,7 @@
       "class": "plans_dir",
       "file": "src/agent_worktree/session_env.rs",
       "symbol": "session_env",
-      "excerpt": "qontinui_runner_lib::plan_workunit_adapter::resolve_plans_dir(paths.plans_dir),",
+      "excerpt": "paths.plans_dir,",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -1396,6 +1396,14 @@
     {
       "class": "plans_dir",
       "file": "src/commands/path_settings.rs",
+      "symbol": "merge",
+      "excerpt": "plans_dir: patch.plans_dir.unwrap_or_else(|| stored.plans_dir.clone()),",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "plans_dir",
+      "file": "src/commands/path_settings.rs",
       "symbol": "normalize",
       "excerpt": "plans_dir: non_blank(settings.plans_dir),",
       "count": 1,
@@ -1405,7 +1413,15 @@
       "class": "plans_dir",
       "file": "src/commands/path_settings.rs",
       "symbol": "view_from",
-      "excerpt": "let plans_dir = resolve_plans_dir(configured.plans_dir.clone());",
+      "excerpt": "configured.plans_dir.clone(),",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "plans_dir",
+      "file": "src/commands/path_settings.rs",
+      "symbol": "view_from",
+      "excerpt": "let plans_dir = resolve_plans_dir(configured.plans_dir.clone(), &BTreeMap::new(), None);",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -1421,15 +1437,15 @@
       "class": "plans_dir",
       "file": "src/main.rs",
       "symbol": "runner_plans_dir_setting",
-      "excerpt": "qontinui_runner_lib::plan_workunit_adapter::resolve_plans_dir(paths.plans_dir)",
+      "excerpt": "paths.plans_dir,",
       "count": 1,
       "disposition": "unreviewed"
     },
     {
       "class": "plans_dir",
       "file": "src/mcp/plan_library.rs",
-      "symbol": "source_path_roots",
-      "excerpt": "paths.plans_dir.clone(),",
+      "symbol": "source_path_roots_from",
+      "excerpt": "resolve_plans_dir(paths.plans_dir.clone(), &paths.plans_dir_by_tenant, None),",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -1461,7 +1477,7 @@
       "class": "plans_dir",
       "file": "src/plan_workunit_adapter/trigger.rs",
       "symbol": "ResolvedDirs::resolve",
-      "excerpt": "plans: resolve_plans_dir(inputs.plans_dir),",
+      "excerpt": "plans: resolve_plans_dir(inputs.plans_dir, &no_tenant_overrides, None),",
       "count": 1,
       "disposition": "unreviewed"
     },
