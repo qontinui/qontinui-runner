@@ -161,17 +161,35 @@ reviewed = [
 # Second triage pass (plan 2026-06-09-runner-renderer-memory-watchdog-and-twin-slo):
 # the Windows-only helpers of the renderer memory watchdog. Each is reached ONLY
 # from the cfg(windows) arm of `sample_webview2_subtree`; the cfg(not(windows))
-# arm of that same fn (renderer_watchdog.rs:2098) returns `Snapshot::default()`,
-# which `publish_sample` refuses to publish (:1082) and the sample loop skips
-# (:1251) — so off Windows the watchdog reports UNKNOWN
-# (`sampled_at_unix_ms: None`, fleet.rs:1204), never a healthy zero.
+# arm of that same fn returns `Snapshot::default()`, which `publish_sample`
+# refuses to publish and the sample loop skips on the same empty-processes
+# predicate — so off Windows the DETECTOR sees UNKNOWN: no breach is evaluated,
+# no heal is attempted, no alarm is raised.
+#
+# WHAT THAT DOES NOT MEAN. An earlier draft of this comment claimed the watchdog
+# reports "never a healthy zero" off Windows. That is true of the STAMP and
+# false of the TOTAL, so it is struck here. `renderer_memory_bytes` on the
+# heartbeat is a bare u64 and is ALWAYS serialized, including 0, so off Windows
+# it reports an explicit 0. Its only discriminator is
+# `renderer_sampled_at_unix_ms`, which is absent rather than 0 on the wire — but
+# coord has no column for that stamp and DROPS it, so a coord-side reader of
+# `coord.devices.renderer_memory_bytes` cannot today separate "non-Windows",
+# "watchdog disabled" and "never sampled" from a measured zero. The failure
+# direction is a MISSED detection, never a false alarm. Ageing a device row by
+# that stamp is an unbuilt coord-side follow-up, carried as an edge on the plan
+# named above.
+#
+# SYMBOLS, NOT LINE NUMBERS, on purpose: this roster is keyed by
+# (class, file, symbol) precisely so line drift cannot orphan a row, and prose
+# that hard-codes line numbers reintroduces the rot the key exists to avoid.
+# Name the function, not the line.
 
 [[disposition]]
 class = "os_bound_tooling"
 file = "src/renderer_watchdog.rs"
 symbol = "process_facts"
 disposition = "fallback_correct"
-note = "Windows-only pid -> (first_seen_unix_ms, kind) cache behind PROCESS_FACTS, retained to the live pid list each tick so it cannot grow across a long uptime. There are no pids to remember off Windows: the non-Windows arm of its only caller returns an empty Snapshot that the loop skips as UNKNOWN (renderer_watchdog.rs:1251)."
+note = "Windows-only pid -> (first_seen_unix_ms, kind) cache behind PROCESS_FACTS, retained to the live pid list each tick so it cannot grow across a long uptime. There are no pids to remember off Windows: the non-Windows arm of its only caller returns an empty Snapshot that the sample loop skips as UNKNOWN on its empty-processes predicate."
 reviewed = [
     "cfg(windows)-only fn `process_facts` has no cfg(not(windows)) sibling in this file",
 ]
@@ -201,7 +219,7 @@ class = "os_bound_tooling"
 file = "src/renderer_watchdog.rs"
 symbol = "own_process_working_set"
 disposition = "fallback_correct"
-note = "GetProcessMemoryInfo on the current process, carried BESIDE the subtree total as Snapshot::own_process_bytes and never summed into it or checked against a ceiling — diagnostic only. Off Windows nothing publishes it, so the heartbeat serves sampled_at_unix_ms as an absence rather than 0 bytes (fleet.rs:1204)."
+note = "GetProcessMemoryInfo on the current process, carried BESIDE the subtree total as Snapshot::own_process_bytes and never summed into it or checked against a ceiling — diagnostic only. Off Windows nothing publishes it, and the heartbeat field it travels in (`renderer_own_process_bytes`) is omitted from the payload entirely at zero via skip_serializing_if = is_zero_u64 — the field's PRESENCE is the signal, so this value is a true absence on the wire rather than a 0. Not to be confused with `renderer_memory_bytes`, the subtree total, which is always serialized including 0."
 reviewed = [
     "cfg(windows)-only fn `own_process_working_set` has no cfg(not(windows)) sibling in this file",
 ]

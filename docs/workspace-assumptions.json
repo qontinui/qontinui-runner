@@ -1058,7 +1058,7 @@
       "excerpt": "cfg(windows)-only fn `own_process_working_set` has no cfg(not(windows)) sibling in this file",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "GetProcessMemoryInfo on the current process, carried BESIDE the subtree total as Snapshot::own_process_bytes and never summed into it or checked against a ceiling — diagnostic only. Off Windows nothing publishes it, so the heartbeat serves sampled_at_unix_ms as an absence rather than 0 bytes (fleet.rs:1204)."
+      "note": "GetProcessMemoryInfo on the current process, carried BESIDE the subtree total as Snapshot::own_process_bytes and never summed into it or checked against a ceiling — diagnostic only. Off Windows nothing publishes it, and the heartbeat field it travels in (`renderer_own_process_bytes`) is omitted from the payload entirely at zero via skip_serializing_if = is_zero_u64 — the field's PRESENCE is the signal, so this value is a true absence on the wire rather than a 0. Not to be confused with `renderer_memory_bytes`, the subtree total, which is always serialized including 0."
     },
     {
       "class": "os_bound_tooling",
@@ -1076,7 +1076,7 @@
       "excerpt": "cfg(windows)-only fn `process_facts` has no cfg(not(windows)) sibling in this file",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "Windows-only pid -> (first_seen_unix_ms, kind) cache behind PROCESS_FACTS, retained to the live pid list each tick so it cannot grow across a long uptime. There are no pids to remember off Windows: the non-Windows arm of its only caller returns an empty Snapshot that the loop skips as UNKNOWN (renderer_watchdog.rs:1251)."
+      "note": "Windows-only pid -> (first_seen_unix_ms, kind) cache behind PROCESS_FACTS, retained to the live pid list each tick so it cannot grow across a long uptime. There are no pids to remember off Windows: the non-Windows arm of its only caller returns an empty Snapshot that the sample loop skips as UNKNOWN on its empty-processes predicate."
     },
     {
       "class": "os_bound_tooling",
