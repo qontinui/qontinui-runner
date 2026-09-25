@@ -426,6 +426,13 @@ fn build_spec_workflow(out: &mut Vec<Shape>) {
         ),
     ));
     out.push(shape("buildSpecWorkflow wait", ui("wait", "500")));
+    out.push(shape(
+        "buildSpecWorkflow component_action",
+        ui(
+            "component_action",
+            r#"{"componentId":"grid","actionId":"setLayout","params":{"layoutId":"single"}}"#,
+        ),
+    ));
     out.push(shape("buildSpecWorkflow snapshot_assert", {
         let mut s = ui(
             "snapshot_assert",
@@ -987,6 +994,34 @@ fn action_less_ui_bridge_step_is_a_snapshot() {
     );
 }
 
+/// `buildSpecWorkflow`'s `component_action` step parses to the typed
+/// `ComponentAction`, its target decodes to the typed component target, and
+/// it routes to the ui_bridge handler (plan
+/// `2026-09-25-builder-ui-bridge-steps-lose-action-and-url`, Phase 3).
+#[test]
+fn build_spec_component_action_routes_to_the_new_arm() {
+    use qontinui_types::workflow_step::{FullRunnerStep, UiBridgeAction};
+    let step = json!({"id": "c", "type": "ui_bridge", "phase": "setup",
+        "name": "group: setLayout on grid", "ui_bridge_action": "component_action",
+        "ui_bridge_target": r#"{"componentId":"grid","actionId":"setLayout","params":{"layoutId":"single"}}"#,
+        "ui_bridge_snapshot_target": "sdk"});
+    let esc = converted(&step, "setup");
+    let FullRunnerStep::UiBridge(u) = to_full_runner_step(&esc).unwrap() else {
+        panic!("expected UiBridge")
+    };
+    assert_eq!(u.action, UiBridgeAction::ComponentAction);
+    let target = u.component_action_target().unwrap();
+    assert_eq!(target.component_id, "grid");
+    assert_eq!(target.action_id, "setLayout");
+    assert_eq!(target.params, Some(json!({"layoutId": "single"})));
+    assert_eq!(
+        resolve_dispatch(&esc, &HandlerRegistry::with_standard_handlers()),
+        DispatchRoute::Registry("ui_bridge")
+    );
+    // The handler arm keys on this string.
+    assert_eq!(esc.ui_bridge_action.as_deref(), Some("component_action"));
+}
+
 /// Field-level checks for every shape this change newly types or fixes:
 /// `Ok` plus the lookup key (the corpus test) does not prove the fields
 /// survived.
@@ -1075,6 +1110,7 @@ fn newly_typed_shapes_keep_their_fields() {
         ("wait_for_element", UiBridgeAction::WaitForElement),
         ("element_action", UiBridgeAction::ElementAction),
         ("wait", UiBridgeAction::Wait),
+        ("component_action", UiBridgeAction::ComponentAction),
     ] {
         let FullRunnerStep::UiBridge(u) =
             typed(json!({"type": "ui_bridge", "id": "a", "name": "b",

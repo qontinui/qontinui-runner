@@ -185,6 +185,10 @@ pub fn export_all_schemas() -> Value {
     add!("CheckType", qws::CheckType);
     add!("CommandMode", qws::CommandMode);
     add!("UiBridgeAction", qws::UiBridgeAction);
+    add!(
+        "UiBridgeComponentActionTarget",
+        qws::UiBridgeComponentActionTarget
+    );
     add!("UiBridgeAssertType", qws::UiBridgeAssertType);
     add!("UiBridgeComparisonMode", qws::UiBridgeComparisonMode);
     add!("UiBridgeSeverity", qws::UiBridgeSeverity);
@@ -921,10 +925,13 @@ mod tests {
         // + the 3 step structs the typed dispatch gained (SpecCheckStep,
         // WrapperActionStep, EffectCheckStep — plan
         // 2026-09-24-typed-step-dispatch-covers-every-registered-handler
-        // Phase 2) = 553.
+        // Phase 2) = 553
+        // + the 1 component_action target (UiBridgeComponentActionTarget —
+        // plan 2026-09-25-builder-ui-bridge-steps-lose-action-and-url
+        // Phase 3) = 554.
         // Independently corroborated by the codegen, which reports
-        // "Processing 553 top-level types" and emits 553 .d.ts files.
-        assert_eq!(obj.len(), 553, "Expected 553 schema entries");
+        // "Processing 554 top-level types" and emits 554 .d.ts files.
+        assert_eq!(obj.len(), 554, "Expected 554 schema entries");
         assert!(
             obj.contains_key("RunnerInstance") && obj.contains_key("RunnerInstanceRole"),
             "Missing RunnerInstance / RunnerInstanceRole schema"
