@@ -101,13 +101,33 @@ pub fn refetch_unified_workflow_steps(
                     serde_json::to_string(step).unwrap_or_else(|_| "ERROR".to_string())
                 );
 
-                // Try direct deserialization first
-                if let Ok(config) = serde_json::from_value::<ExecutionStepConfig>(step.clone()) {
-                    debug!(
-                        "refetch_unified_workflow_steps: serde succeeded, check_type={:?}",
-                        config.check_type
+                // Normalize canonical keys, then deserialize.
+                use crate::unified_workflow_executor::step_conversion::{
+                    fallback_refused, parse_step_value,
+                };
+                let err = match parse_step_value(step) {
+                    Ok(config) => {
+                        debug!(
+                            "refetch_unified_workflow_steps: serde succeeded, check_type={:?}",
+                            config.check_type
+                        );
+                        return Some(config);
+                    }
+                    Err(e) => e,
+                };
+                if fallback_refused(step) {
+                    error!(
+                        "refetch_unified_workflow_steps: refusing {:?} step {:?}: it does not \
+                         parse as ExecutionStepConfig ({err}) and the manual extraction would \
+                         run it without its action",
+                        step.get("type")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or_default(),
+                        step.get("name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or_default(),
                     );
-                    return Some(config);
+                    return None;
                 }
 
                 debug!("refetch_unified_workflow_steps: serde failed, using manual extraction");
@@ -164,39 +184,6 @@ pub fn refetch_unified_workflow_steps(
                         "shellCommandFailOnError",
                     ]),
                     prompt_content: get_str(&["content", "prompt_content", "promptContent"]),
-                    // UI Bridge fields
-                    ui_bridge_action: get_str(&["ui_bridge_action", "uiBridgeAction"]),
-                    ui_bridge_url: get_str(&["ui_bridge_url", "uiBridgeUrl"]),
-                    ui_bridge_instruction: get_str(&[
-                        "ui_bridge_instruction",
-                        "uiBridgeInstruction",
-                    ]),
-                    ui_bridge_target: get_str(&["ui_bridge_target", "uiBridgeTarget"]),
-                    ui_bridge_assert_type: get_str(&[
-                        "ui_bridge_assert_type",
-                        "uiBridgeAssertType",
-                    ]),
-                    ui_bridge_expected: get_str(&["ui_bridge_expected", "uiBridgeExpected"]),
-                    ui_bridge_timeout_ms: step
-                        .get("ui_bridge_timeout_ms")
-                        .or_else(|| step.get("uiBridgeTimeoutMs"))
-                        .and_then(|v| v.as_u64()),
-                    ui_bridge_compare_mode: get_str(&[
-                        "ui_bridge_compare_mode",
-                        "uiBridgeCompareMode",
-                    ]),
-                    ui_bridge_reference_snapshot: step
-                        .get("ui_bridge_reference_snapshot")
-                        .or_else(|| step.get("uiBridgeReferenceSnapshot"))
-                        .cloned(),
-                    ui_bridge_reference_snapshot_id: get_str(&[
-                        "ui_bridge_reference_snapshot_id",
-                        "uiBridgeReferenceSnapshotId",
-                    ]),
-                    ui_bridge_severity_threshold: get_str(&[
-                        "ui_bridge_severity_threshold",
-                        "uiBridgeSeverityThreshold",
-                    ]),
                     ..Default::default()
                 })
             };

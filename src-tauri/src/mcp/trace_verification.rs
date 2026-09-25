@@ -350,7 +350,9 @@ pub async fn run_workflow_verification_for_task(
         .and_then(|task| {
             task.execution_steps_json
                 .as_ref()
-                .and_then(|json| serde_json::from_str::<Vec<ExecutionStepConfig>>(json).ok())
+                .and_then(|json| {
+                    crate::unified_workflow_executor::step_conversion::parse_steps_json(json).ok()
+                })
                 .map(|steps| {
                     steps
                         .into_iter()

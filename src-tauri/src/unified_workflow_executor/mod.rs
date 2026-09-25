@@ -83,7 +83,7 @@ mod resume;
 pub mod review_subtask;
 pub(crate) mod startup_resume;
 pub mod states;
-mod step_conversion;
+pub(crate) mod step_conversion;
 mod task_lifecycle;
 mod task_state;
 pub(crate) mod types;
