@@ -5523,6 +5523,29 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
 
+            // Conductor restart-resume: relaunch every `running` orchestration
+            // run THIS instance owns, settling the workers that died with the
+            // previous process first. Runs on secondaries too — ownership is
+            // per instance, so a temp runner resumes its own runs and never
+            // the primary's (they share one embedded PG cluster). Plan
+            // `2026-09-23-conductor-e2e-phase1-defects`, Phase 2.
+            if crate::database::pg::pg_available() {
+                let resume_state: Arc<commands::AppState> =
+                    app.state::<Arc<commands::AppState>>().inner().clone();
+                let resume_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    // Same settle delay the scheduler takes: let the MCP API
+                    // bind before workers that report through it are spawned.
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    orchestration_loop::loop_engine::resume_owned_runs(
+                        resume_state.orchestration_loops.clone(),
+                        resume_handle,
+                        resume_state.pg_db.clone(),
+                    )
+                    .await;
+                });
+            }
+
             // Phase 1.5 — transcript-tail populator. Watches Claude CLI's
             // per-session JSONL transcripts and writes Edit/Write/MultiEdit
             // touches into `project.session_touched_files` so the per-terminal

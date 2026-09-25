@@ -1041,6 +1041,11 @@ impl PgDb {
         // `runs.status_reason` is why a run left `running` (fatal error, stall
         // pattern, DESIGN failure, stop request) — written by the conductor's
         // every terminal exit so the row never lies `running` for a dead run.
+        // `runs.config` is the serialized `OrchestrationRunConfig` and
+        // `runs.owner_instance` the runner instance that started the run; the
+        // boot sweep relaunches only its own `running` rows at their original
+        // knobs. `subtasks.restart_resets` counts the times the sweep put a
+        // lost worker's row back to `submitted` (bounded at 2).
         conn.batch_execute(
             "CREATE SCHEMA IF NOT EXISTS orchestration; \
              CREATE TABLE IF NOT EXISTS orchestration.runs ( \
@@ -1054,6 +1059,8 @@ impl PgDb {
                  updated_at TIMESTAMPTZ NOT NULL DEFAULT now() \
              ); \
              ALTER TABLE orchestration.runs ADD COLUMN IF NOT EXISTS status_reason TEXT; \
+             ALTER TABLE orchestration.runs ADD COLUMN IF NOT EXISTS config JSONB; \
+             ALTER TABLE orchestration.runs ADD COLUMN IF NOT EXISTS owner_instance TEXT; \
              CREATE TABLE IF NOT EXISTS orchestration.subtasks ( \
                  task_id         TEXT NOT NULL, \
                  run_id          UUID NOT NULL REFERENCES orchestration.runs(run_id) ON DELETE CASCADE, \
@@ -1077,6 +1084,7 @@ impl PgDb {
              ); \
              ALTER TABLE orchestration.subtasks ADD COLUMN IF NOT EXISTS gate_id TEXT; \
              ALTER TABLE orchestration.subtasks ADD COLUMN IF NOT EXISTS gate_status TEXT; \
+             ALTER TABLE orchestration.subtasks ADD COLUMN IF NOT EXISTS restart_resets INTEGER NOT NULL DEFAULT 0; \
              CREATE INDEX IF NOT EXISTS idx_orchestration_subtasks_run \
                  ON orchestration.subtasks (run_id, idx); \
              CREATE INDEX IF NOT EXISTS idx_orchestration_subtasks_produced_by \

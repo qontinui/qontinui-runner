@@ -529,6 +529,255 @@ pub struct OrchestrationRunStatus {
     pub tick: u32,
 }
 
+/// The status a live run's row carries; every other value is terminal.
+const RUN_STATUS_RUNNING: &str = "running";
+
+/// The owner this runner stamps on the runs it starts, and the only owner
+/// whose `running` rows its boot sweep relaunches: `QONTINUI_INSTANCE_NAME`,
+/// or `primary` when unset. A temp runner and the primary share one embedded
+/// PG cluster, so without it the first instance to boot would drive both.
+pub fn run_owner_instance() -> String {
+    owner_instance_from(crate::instance::instance_name())
+}
+
+fn owner_instance_from(instance_name: Option<String>) -> String {
+    instance_name.unwrap_or_else(|| "primary".to_string())
+}
+
+/// Why an existing run row refuses re-entry through
+/// [`start_orchestration_run`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunReentryRefused {
+    /// The run already left `running`. Its outcome is recorded; relaunching
+    /// it would overwrite that record with a second run under the same id.
+    Terminal { run_id: Uuid, status: String },
+    /// The run belongs to another runner instance sharing this PG cluster.
+    ForeignOwner { run_id: Uuid, owner: String },
+    /// The run predates `owner_instance`, so no instance can prove it is
+    /// its own. Left alone rather than adopted.
+    Unowned { run_id: Uuid },
+}
+
+impl std::fmt::Display for RunReentryRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Terminal { run_id, status } => write!(
+                f,
+                "run_reentry_refused: run {run_id} is already {status}; start a new run instead"
+            ),
+            Self::ForeignOwner { run_id, owner } => write!(
+                f,
+                "run_reentry_refused: run {run_id} belongs to runner instance {owner:?}"
+            ),
+            Self::Unowned { run_id } => write!(
+                f,
+                "run_reentry_refused: run {run_id} has no recorded owner instance \
+                 (it predates the column); it is not adopted"
+            ),
+        }
+    }
+}
+
+/// Whether `run` — the row [`PgDb::create_or_get_run`] returned — may be
+/// driven by this instance. `None` means go: a fresh row, or this instance's
+/// own `running` row re-entered after a restart.
+pub fn reentry_refusal(run: &Run, owner: &str) -> Option<RunReentryRefused> {
+    if run.status != RUN_STATUS_RUNNING {
+        return Some(RunReentryRefused::Terminal {
+            run_id: run.run_id,
+            status: run.status.clone(),
+        });
+    }
+    match run.owner_instance.as_deref() {
+        Some(o) if o == owner => None,
+        Some(o) => Some(RunReentryRefused::ForeignOwner {
+            run_id: run.run_id,
+            owner: o.to_string(),
+        }),
+        None => Some(RunReentryRefused::Unowned { run_id: run.run_id }),
+    }
+}
+
+/// What the boot sweep did to one run's `working` rows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LostWorkerCounts {
+    /// Rows whose report landed, left `working` for the relaunched
+    /// reconciler to complete through its normal path.
+    pub reported: usize,
+    pub resubmitted: usize,
+    pub failed: usize,
+    /// Rows whose worker IS live in this process, left for the reconciler.
+    pub live: usize,
+}
+
+/// Settle a run's `working` rows whose worker did not survive into this
+/// process, BEFORE its reconciler is relaunched.
+///
+/// Without this the relaunched reconciler would see each such row `Gone`,
+/// fail it after `gone_grace_secs`, and never re-dispatch it
+/// (`conductor::compute_tick`) — so a restart during in-flight work would
+/// fail the run. A row with no `task_run_id` at all is lost by definition.
+pub async fn settle_lost_workers(
+    pg: &PgDb,
+    run_id: Uuid,
+    is_live: impl Fn(Uuid) -> bool,
+) -> Result<LostWorkerCounts, String> {
+    use super::ledger::LostWorkerDisposition;
+
+    let mut counts = LostWorkerCounts::default();
+    for row in pg.list_working_rows_for_sweep(run_id).await? {
+        if row.task_run_id.is_some_and(&is_live) {
+            counts.live += 1;
+            continue;
+        }
+        let disposition = LostWorkerDisposition::decide(&row);
+        if disposition == LostWorkerDisposition::Reported {
+            // Left `working`: the relaunched reconciler completes it.
+            counts.reported += 1;
+            continue;
+        }
+        if !pg
+            .apply_lost_worker(run_id, &row.task_id, disposition)
+            .await?
+        {
+            // Something else moved the row between the read and the write.
+            continue;
+        }
+        if disposition == LostWorkerDisposition::Fail {
+            warn!(
+                "orchestration boot sweep: run {run_id} subtask {} failed: {}",
+                row.task_id,
+                LostWorkerDisposition::FAIL_REASON
+            );
+            counts.failed += 1;
+        } else {
+            counts.resubmitted += 1;
+        }
+    }
+    Ok(counts)
+}
+
+/// The run config a relaunch uses: the one stored at create, or the defaults
+/// for a row that predates `runs.config` or whose stored value no longer
+/// parses (logged — the run still resumes rather than being stranded).
+fn stored_run_config(run: &Run) -> OrchestrationRunConfig {
+    let Some(value) = run.config.clone() else {
+        return OrchestrationRunConfig::default();
+    };
+    serde_json::from_value(value).unwrap_or_else(|e| {
+        warn!(
+            "orchestration boot sweep: run {} stored config does not parse ({e}); \
+             relaunching at defaults",
+            run.run_id
+        );
+        OrchestrationRunConfig::default()
+    })
+}
+
+/// Boot sweep: relaunch every `running` run this instance owns and has no
+/// registered loop for, through the same [`start_orchestration_run`] path an
+/// operator start takes.
+///
+/// Before each relaunch its lost workers are settled
+/// ([`settle_lost_workers`]). `running` rows with no owner are logged and left
+/// alone; rows another instance owns are never read. Every failure is logged
+/// and the sweep moves on — a run that cannot resume must not stop the others.
+pub async fn resume_owned_runs(
+    states: SharedLoopStates,
+    app_handle: tauri::AppHandle,
+    pg: Arc<PgDb>,
+) {
+    let owner = run_owner_instance();
+
+    match pg.list_unowned_running_run_ids().await {
+        Ok(ids) if !ids.is_empty() => warn!(
+            "orchestration boot sweep: {} running run(s) have no owner instance and are \
+             left alone (they predate the column): {:?}",
+            ids.len(),
+            ids
+        ),
+        Ok(_) => {}
+        Err(e) => warn!("orchestration boot sweep: could not list unowned runs: {e}"),
+    }
+
+    let runs = match pg.list_running_runs_owned_by(&owner).await {
+        Ok(runs) => runs,
+        Err(e) => {
+            error!("orchestration boot sweep: could not list runs owned by {owner:?}: {e}");
+            return;
+        }
+    };
+    if runs.is_empty() {
+        info!("orchestration boot sweep: no running runs owned by {owner:?}");
+        return;
+    }
+
+    let session_mgr = {
+        use tauri::Manager;
+        app_handle
+            .try_state::<Arc<crate::claude_session::manager::SessionManager>>()
+            .map(|s| s.inner().clone())
+    };
+    let Some(session_mgr) = session_mgr else {
+        // Without the manager no worker's liveness can be judged, so settling
+        // would guess. Leave the rows for the next boot.
+        error!(
+            "orchestration boot sweep: SessionManager state not available; \
+             {} run(s) owned by {owner:?} not resumed",
+            runs.len()
+        );
+        return;
+    };
+
+    for run in runs {
+        let run_id = run.run_id;
+        let registered = {
+            let mgr = states.lock().await;
+            mgr.loops.contains_key(&run_id.to_string())
+        };
+        if registered {
+            debug!("orchestration boot sweep: run {run_id} already has a loop; skipped");
+            continue;
+        }
+
+        match settle_lost_workers(&pg, run_id, |trid| {
+            session_mgr.get(&trid.to_string()).is_some()
+        })
+        .await
+        {
+            Ok(c) => info!(
+                "orchestration boot sweep: run {run_id} lost workers settled: \
+                 {} reported, {} resubmitted, {} failed, {} live",
+                c.reported, c.resubmitted, c.failed, c.live
+            ),
+            Err(e) => {
+                error!(
+                    "orchestration boot sweep: run {run_id} lost workers not settled ({e}); \
+                     not relaunched"
+                );
+                continue;
+            }
+        }
+
+        let config = stored_run_config(&run);
+        match start_orchestration_run(
+            states.clone(),
+            app_handle.clone(),
+            pg.clone(),
+            run_id,
+            &run.goal,
+            run.recipe.as_deref(),
+            &run.phases,
+            config,
+        )
+        .await
+        {
+            Ok(_) => info!("orchestration boot sweep: run {run_id} relaunched"),
+            Err(e) => error!("orchestration boot sweep: run {run_id} not relaunched: {e}"),
+        }
+    }
+}
+
 /// Start a conductor run: create the run row, register a per-run [`LoopState`]
 /// in the [`MultiLoopManager`] keyed by `run_id`, and spawn the stateless
 /// reconciler background task ([`conductor::run_orchestration`]).
@@ -551,21 +800,93 @@ pub async fn start_orchestration_run(
 ) -> Result<Run, String> {
     let loop_id = run_id.to_string();
 
-    // Refuse to double-start the same run.
+    // Reserve this run's loop slot BEFORE anything slow happens, under the
+    // same lock as the double-start check. Re-entering an existing `running`
+    // row is legal now (the boot sweep does it), so the slot is the only thing
+    // that stops a second start of the same id — a retried POST, or an
+    // operator start racing the sweep — from running DESIGN again and
+    // spawning a second conductor whose registration would orphan the first
+    // one's `stop_tx`. Every return below that does not spawn the conductor
+    // releases the slot.
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let loop_state = Arc::new(Mutex::new(LoopState::new()));
     {
-        let mgr = states.lock().await;
+        let mut st = loop_state.lock().await;
+        st.running = true;
+        st.phase = LoopPhase::Planning;
+        st.started_at = Some(Utc::now());
+        st.stop_tx = Some(stop_tx);
+    }
+    {
+        let mut mgr = states.lock().await;
         if let Some(existing) = mgr.loops.get(&loop_id) {
             let st = existing.lock().await;
             if st.running {
                 return Err(format!("Orchestration run {run_id} is already running"));
             }
         }
+        mgr.loops.insert(loop_id.clone(), loop_state.clone());
+        mgr.metadata.insert(
+            loop_id.clone(),
+            LoopMetadata {
+                label: Some(format!("orchestration:{run_id}")),
+                stop_all_on_error: false,
+            },
+        );
     }
+    let release_slot = || {
+        let (states, loop_id) = (states.clone(), loop_id.clone());
+        async move {
+            let mut mgr = states.lock().await;
+            mgr.loops.remove(&loop_id);
+            mgr.metadata.remove(&loop_id);
+        }
+    };
 
-    // Create the run row (status=running).
-    let run = pg
-        .create_run(run_id, goal, recipe, phases, "running")
-        .await?;
+    // Create the run row (status=running), or read back the row this id
+    // already has: a restart relaunching its own run re-enters here. The
+    // stored row wins, so a re-entry is checked against IT, and DESIGN and the
+    // conductor below run on the stored goal, phases and config — not on the
+    // arguments, which a re-entry may have supplied differently.
+    let owner = run_owner_instance();
+    let config_json = match serde_json::to_value(&config) {
+        Ok(v) => v,
+        Err(e) => {
+            release_slot().await;
+            return Err(format!(
+                "start_orchestration_run: serialize run config: {e}"
+            ));
+        }
+    };
+    let (run, created) = match pg
+        .create_or_get_run(
+            run_id,
+            goal,
+            recipe,
+            phases,
+            RUN_STATUS_RUNNING,
+            Some(&owner),
+            Some(&config_json),
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            release_slot().await;
+            return Err(e);
+        }
+    };
+    if let Some(refusal) = reentry_refusal(&run, &owner) {
+        release_slot().await;
+        return Err(refusal.to_string());
+    }
+    let config = if created {
+        config
+    } else {
+        info!("start_orchestration_run: run {run_id} re-entered at its stored config");
+        stored_run_config(&run)
+    };
+    let (goal, phases) = (run.goal.as_str(), run.phases.as_slice());
 
     // DESIGN bootstrap (Phase 4): a run with no subtasks yet runs the Planning
     // phase's design pass to produce the initial org-chart, written via the
@@ -577,6 +898,7 @@ pub async fn start_orchestration_run(
     // the empty run ticked to `complete`, which told the operator the opposite
     // of what happened.)
     if let Err(e) = run_design_bootstrap(&app_handle, &pg, run_id, goal, phases).await {
+        release_slot().await;
         let exit = RunExit::design_failed(&e);
         error!(
             "start_orchestration_run: run {run_id} {}: {e}",
@@ -593,27 +915,7 @@ pub async fn start_orchestration_run(
         }
         return Err(format!("Orchestration run {run_id} failed: {e}"));
     }
-
-    let (stop_tx, stop_rx) = watch::channel(false);
-    let loop_state = Arc::new(Mutex::new(LoopState::new()));
-    {
-        let mut st = loop_state.lock().await;
-        st.running = true;
-        st.phase = LoopPhase::Reconciling;
-        st.started_at = Some(Utc::now());
-        st.stop_tx = Some(stop_tx);
-    }
-    {
-        let mut mgr = states.lock().await;
-        mgr.loops.insert(loop_id.clone(), loop_state.clone());
-        mgr.metadata.insert(
-            loop_id.clone(),
-            LoopMetadata {
-                label: Some(format!("orchestration:{run_id}")),
-                stop_all_on_error: false,
-            },
-        );
-    }
+    loop_state.lock().await.phase = LoopPhase::Reconciling;
 
     // Build live dispatcher + signal source and spawn the conductor.
     let session_mgr = {
@@ -624,11 +926,7 @@ pub async fn start_orchestration_run(
     };
     let Some(session_mgr) = session_mgr else {
         // Roll back the registration + run row marker.
-        {
-            let mut mgr = states.lock().await;
-            mgr.loops.remove(&loop_id);
-            mgr.metadata.remove(&loop_id);
-        }
+        release_slot().await;
         let reason = "start_orchestration_run: SessionManager state not available";
         let _ = pg
             .set_run_status(run_id, RunExit::STATUS_FAILED, Some(reason))
@@ -2345,4 +2643,141 @@ async fn set_error(loop_state: &SharedLoopState, msg: &str) {
     state.error = Some(msg.to_string());
     state.phase = LoopPhase::Error;
     state.running = false;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_row(status: &str, owner: Option<&str>, config: Option<serde_json::Value>) -> Run {
+        Run {
+            run_id: Uuid::new_v4(),
+            goal: "g".to_string(),
+            recipe: None,
+            phases: vec!["implement".to_string()],
+            status: status.to_string(),
+            status_reason: None,
+            owner_instance: owner.map(str::to_string),
+            config,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn the_owner_is_the_instance_name_or_primary() {
+        assert_eq!(owner_instance_from(None), "primary");
+        assert_eq!(owner_instance_from(Some("temp-1".to_string())), "temp-1");
+    }
+
+    #[test]
+    fn an_own_running_row_re_enters() {
+        assert_eq!(
+            reentry_refusal(&run_row("running", Some("primary"), None), "primary"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_terminal_row_refuses_re_entry_whoever_owns_it() {
+        for status in ["complete", "failed", "stalled", "stopped"] {
+            let run = run_row(status, Some("primary"), None);
+            assert_eq!(
+                reentry_refusal(&run, "primary"),
+                Some(RunReentryRefused::Terminal {
+                    run_id: run.run_id,
+                    status: status.to_string()
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn a_foreign_or_unowned_running_row_is_not_adopted() {
+        let foreign = run_row("running", Some("temp-1"), None);
+        assert_eq!(
+            reentry_refusal(&foreign, "primary"),
+            Some(RunReentryRefused::ForeignOwner {
+                run_id: foreign.run_id,
+                owner: "temp-1".to_string()
+            })
+        );
+        let legacy = run_row("running", None, None);
+        assert_eq!(
+            reentry_refusal(&legacy, "primary"),
+            Some(RunReentryRefused::Unowned {
+                run_id: legacy.run_id
+            })
+        );
+    }
+
+    #[test]
+    fn every_refusal_leads_with_its_token() {
+        let id = Uuid::nil();
+        for r in [
+            RunReentryRefused::Terminal {
+                run_id: id,
+                status: "complete".to_string(),
+            },
+            RunReentryRefused::ForeignOwner {
+                run_id: id,
+                owner: "x".to_string(),
+            },
+            RunReentryRefused::Unowned { run_id: id },
+        ] {
+            assert!(r.to_string().starts_with("run_reentry_refused: "), "{r}");
+        }
+    }
+
+    #[test]
+    fn the_run_config_round_trips_through_the_stored_row() {
+        let cfg = OrchestrationRunConfig {
+            concurrency_cap: 7,
+            tick_interval_secs: 11,
+            stall_after_secs: 999,
+            ..OrchestrationRunConfig::default()
+        };
+        let stored = serde_json::to_value(&cfg).expect("serialize");
+        let run = run_row("running", Some("primary"), Some(stored));
+        assert_eq!(stored_run_config(&run), cfg);
+    }
+
+    #[test]
+    fn the_fanout_cache_is_not_persisted() {
+        let cfg = OrchestrationRunConfig {
+            fanout_bound: Some(4),
+            ..OrchestrationRunConfig::default()
+        };
+        let stored = serde_json::to_value(&cfg).expect("serialize");
+        assert!(stored.get("fanout_bound").is_none(), "{stored}");
+        let run = run_row("running", Some("primary"), Some(stored));
+        assert_eq!(stored_run_config(&run).fanout_bound, None);
+    }
+
+    #[test]
+    fn a_stored_config_missing_a_knob_takes_that_knob_from_the_defaults() {
+        let run = run_row(
+            "running",
+            Some("primary"),
+            Some(serde_json::json!({ "concurrency_cap": 2 })),
+        );
+        let cfg = stored_run_config(&run);
+        assert_eq!(cfg.concurrency_cap, 2);
+        assert_eq!(
+            cfg.working_silence_secs,
+            OrchestrationRunConfig::default().working_silence_secs
+        );
+    }
+
+    #[test]
+    fn an_absent_or_unparseable_config_relaunches_at_defaults() {
+        let d = OrchestrationRunConfig::default();
+        assert_eq!(stored_run_config(&run_row("running", None, None)), d);
+        let bad = run_row(
+            "running",
+            None,
+            Some(serde_json::json!({ "concurrency_cap": "three" })),
+        );
+        assert_eq!(stored_run_config(&bad), d);
+    }
 }
