@@ -1992,8 +1992,8 @@ impl ContinuationConsumedBody {
 
 /// The runner's decision after POSTing the consume CLAIM, derived purely from
 /// the claim response (status + body). Factored out as a pure fn
-/// ([`decide_spawn`]) so the 200 / 409-cancelled / error branches are
-/// unit-testable without a live coord.
+/// ([`decide_spawn`]) so the 200 / 409-cancelled / 409-superseded /
+/// 409-rerouted / error branches are unit-testable without a live coord.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SpawnDecision {
     /// Claim accepted (HTTP 200) → proceed to spawn.
@@ -2014,6 +2014,22 @@ enum SpawnDecision {
     /// write after a spawn not landing; this is the CLAIM before a spawn
     /// being refused.
     SkipSuperseded { winner_gate_id: Option<uuid::Uuid> },
+    /// Claim refused (HTTP 409 `{"error":"rerouted","target_device_id",
+    /// "rerouted_from"}`) → coord re-targeted this continuation to ANOTHER
+    /// device after this one kept deferring its spawn (thread pressure), and
+    /// our claim is the stale retry of a frame we still held locally. The row
+    /// is no longer ours: SKIP the spawn, post NO outcome and NO deferral, and
+    /// RELEASE the local dispatch claim. Spawning here — which is what the old
+    /// "any other 409" arm did — is a double spawn, because the new target
+    /// spawns the same continuation. Carries the new target device when the
+    /// body names one as a UUID, for the INFO log only; the refusal itself is
+    /// authoritative either way.
+    ///
+    /// Plan `2026-09-23-a-continuation-is-not-dispatched-until-the-spawn-actually-occurs`,
+    /// Phase 3.
+    SkipRerouted {
+        target_device_id: Option<uuid::Uuid>,
+    },
     /// Network failure / timeout / any other non-2xx → PROCEED to spawn anyway
     /// (availability over consistency; the in-process dedupe still guards).
     /// Carries a human-readable cause for the WARN log.
@@ -2031,7 +2047,9 @@ enum SpawnDecision {
 
 /// PURE: fold the device drain into a claim decision. Only the "spawn anyway"
 /// arm changes; a clean `Spawn` (coord accepted the claim while the drain was
-/// clear enough to reach it) and a `SkipCancelled` are left alone.
+/// clear enough to reach it) and every coord refusal (`SkipCancelled`,
+/// `SkipSuperseded`, `SkipRerouted`) are left alone — a refusal spawns nothing,
+/// so there is nothing for the drain to pause.
 fn apply_drain_to_claim(
     decision: SpawnDecision,
     drain: &crate::coord_drain_state::CoordDrainState,
@@ -2098,7 +2116,11 @@ fn continuation_drain_admission_for(
 /// - 409 with a JSON body whose `error == "superseded"` →
 ///   [`SpawnDecision::SkipSuperseded`] (winner from `winner_gate_id`, when it
 ///   parses as a UUID).
-/// - any other status (incl. a 409 that is NEITHER of those shapes) →
+/// - 409 with a JSON body whose `error == "rerouted"` →
+///   [`SpawnDecision::SkipRerouted`] (new target from `target_device_id`, when
+///   it parses as a UUID). Without this arm the rerouted refusal fell into the
+///   "any other 409" spawn-anyway branch below and double-spawned.
+/// - any other status (incl. a 409 that is NONE of those shapes) →
 ///   [`SpawnDecision::SpawnDespiteClaimError`] (availability over consistency).
 ///
 /// `status` is the HTTP status code; `body` is the response body text (may be
@@ -2126,12 +2148,24 @@ fn decide_spawn(status: u16, body: &str) -> SpawnDecision {
                     .and_then(|s| uuid::Uuid::parse_str(s).ok());
                 return SpawnDecision::SkipSuperseded { winner_gate_id };
             }
+            // The reroute shape: `{"error":"rerouted","target_device_id":<uuid>,
+            // "rerouted_from":<uuid>}`. `rerouted_from` is this device and is
+            // not read — the claim was ours to begin with.
+            if v.get("error").and_then(|e| e.as_str()) == Some("rerouted") {
+                let target_device_id = v
+                    .get("target_device_id")
+                    .and_then(|t| t.as_str())
+                    .and_then(|s| uuid::Uuid::parse_str(s).ok());
+                return SpawnDecision::SkipRerouted { target_device_id };
+            }
         }
-        // A 409 that is NEITHER the cancelled nor the superseded contract (e.g.
-        // some other conflict): proceed rather than silently drop the
+        // A 409 that is none of the cancelled / superseded / rerouted contracts
+        // (e.g. some other conflict): proceed rather than silently drop the
         // continuation.
         return SpawnDecision::SpawnDespiteClaimError {
-            cause: format!("claim returned 409 without a cancelled or superseded body: {body}"),
+            cause: format!(
+                "claim returned 409 without a cancelled, superseded or rerouted body: {body}"
+            ),
         };
     }
     SpawnDecision::SpawnDespiteClaimError {
@@ -2258,7 +2292,7 @@ fn release_local_dispatch_claim(consume_target: ConsumeTarget) {
 
 /// Does coord leave the continuation row PENDING after this skip?
 ///
-/// The asymmetry between the two skip arms of the consume claim, as one pure
+/// The asymmetry between the skip arms of the consume claim, as one pure
 /// predicate, so the production match and its unit test cannot drift apart:
 ///
 /// * [`SpawnDecision::SkipCancelled`] → **false**. coord answered the claim
@@ -2271,15 +2305,35 @@ fn release_local_dispatch_claim(consume_target: ConsumeTarget) {
 ///   proceeds on a later claim if the winner is released (spawn_failed /
 ///   work_abandoned / work_unreported). Keeping the id claimed would strand it
 ///   for the process lifetime (see [`release_gate_dispatch`]).
+/// * [`SpawnDecision::SkipRerouted`] → **true**, a deliberate choice. The row
+///   IS still pending on coord, but targeted at another device — coord's
+///   reroute is one OF RECORD (`REROUTE_OF_RECORD_SQL` rewrites the persisted
+///   payload's `target_device_id`, not just the frame), and our poll filters on
+///   that stored target — so our poll will not re-list it and the release buys
+///   nothing in the common case. It
+///   is kept for the uncommon one: a later reroute (or the offline re-target)
+///   can pick THIS device again, and a kept claim would then drop that
+///   re-delivery at the dedupe check for the process lifetime — the exact
+///   stranding [`release_gate_dispatch`] exists to prevent. The cost of
+///   releasing is at most one more consume claim on a stale duplicate
+///   delivery, which coord refuses again with the same 409 — while coord is
+///   reachable. If that later claim instead FAILS (timeout, 5xx), it lands in
+///   [`SpawnDecision::SpawnDespiteClaimError`] and this device spawns beside
+///   the new target: the same availability-over-consistency trade every
+///   claim-error path already makes, and reachable only through an in-flight
+///   duplicate or a frame-only offline republish.
 ///
-/// The other two decisions spawn, so neither is a skip at all: `false`.
+/// The remaining decisions spawn or defer, so none is a skip: `false`.
 fn skip_leaves_row_pending(decision: &SpawnDecision) -> bool {
-    matches!(decision, SpawnDecision::SkipSuperseded { .. })
+    matches!(
+        decision,
+        SpawnDecision::SkipSuperseded { .. } | SpawnDecision::SkipRerouted { .. }
+    )
 }
 
 /// Settle the in-process dispatch claim after a consume-claim SKIP. This is the
-/// ONE release on that path — both skip arms of [`run_gate_continuation_inner`]
-/// step 2 call it and neither releases anything itself, so the policy lives
+/// ONE release on that path — every skip arm of [`run_gate_continuation_inner`]
+/// step 2 calls it and none releases anything itself, so the policy lives
 /// behind [`skip_leaves_row_pending`] in exactly one place and the unit test
 /// drives the production fn rather than a copy of it.
 fn settle_skipped_claim(decision: &SpawnDecision, consume_target: ConsumeTarget) {
@@ -2326,8 +2380,8 @@ enum ClaimOutcome {
 /// half. Here there is no such statement to delete: the log, the settle and
 /// the skip/spawn decision are one unit, and
 /// `superseded_skip_releases_local_dispatch_claim_so_relist_reclaims` asserts
-/// the [`ClaimOutcome`] **and** the resulting claim state for all four
-/// [`SpawnDecision`] variants.
+/// the [`ClaimOutcome`] **and** the resulting claim state for every
+/// [`SpawnDecision`] variant.
 ///
 /// The residual, stated rather than overstated: the gap is NARROWED to one
 /// statement, not removed. Deleting the whole wiring line in
@@ -2336,14 +2390,15 @@ enum ClaimOutcome {
 /// decision together, so there is no longer a partial deletion that leaves a
 /// plausible-looking arm behind.
 ///
-/// The asymmetry between the two skips is not restated here — it is
+/// The asymmetry between the skips is not restated here — it is
 /// [`skip_leaves_row_pending`], which [`settle_skipped_claim`] gates on, and
-/// both arms call it unconditionally so the policy stays in one place instead
+/// every skip arm calls it unconditionally so the policy stays in one place instead
 /// of being an absence in one arm.
 ///
-/// The two decisions that are not skips proceed and must NOT release: the
-/// claim they hold is the in-process dedupe covering the spawn they are about
-/// to make.
+/// The decisions that are not skips (spawn, spawn-despite-claim-error, and the
+/// drain deferral) must NOT release here: the claim they hold is the in-process
+/// dedupe covering the spawn they are about to make, or the drain path settles
+/// it itself.
 fn settle_claim_decision(
     decision: &SpawnDecision,
     consume_target: ConsumeTarget,
@@ -2400,6 +2455,23 @@ fn settle_claim_decision(
             // pending and re-listed — the asymmetry lives in
             // `skip_leaves_row_pending`. No deferred stamp is posted from
             // here: coord wrote it in the refusing transaction.
+            settle_skipped_claim(decision, consume_target);
+            ClaimOutcome::Skip
+        }
+        SpawnDecision::SkipRerouted { target_device_id } => {
+            info!(
+                "agent_runtime: continuation rerouted by coord to another device after this \
+                 one kept deferring its spawn — skipping spawn, the row is not ours \
+                 (gate_id={gate_id} target_device_id={})",
+                target_device_id
+                    .as_ref()
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "(not named)".to_string())
+            );
+            // RELEASES (see `skip_leaves_row_pending` for why that is chosen
+            // rather than incidental). No outcome and no deferred stamp: the
+            // row now belongs to the new target, and a deferral from us would
+            // write this device's pressure onto a row another device owns.
             settle_skipped_claim(decision, consume_target);
             ClaimOutcome::Skip
         }
@@ -4498,6 +4570,7 @@ async fn poll_pending_unit_dispatches(device_id: uuid::Uuid) {
 /// - 200 → [`SpawnDecision::Spawn`].
 /// - 409 `{"error":"cancelled", cancel_reason}` → [`SpawnDecision::SkipCancelled`].
 /// - 409 `{"error":"superseded", winner_gate_id, …}` → [`SpawnDecision::SkipSuperseded`].
+/// - 409 `{"error":"rerouted", target_device_id, …}` → [`SpawnDecision::SkipRerouted`].
 /// - 5s timeout / network failure / any other non-2xx →
 ///   [`SpawnDecision::SpawnDespiteClaimError`] (availability over consistency —
 ///   preserves the pre-restructure behavior; the in-process dedupe still guards).
@@ -12930,7 +13003,7 @@ mod tests {
         // …and the WIRING: `settle_claim_decision` is the whole of step 2's
         // decision handling, so this drives the fn `run_gate_continuation_inner`
         // actually calls rather than a copy of a match arm. Outcome AND claim
-        // state, for all FIVE variants — the superseded release is no longer a
+        // state, for all SIX variants — the superseded release is no longer a
         // deletable statement at an untested call site.
         let gate = uuid::Uuid::now_v7();
 
@@ -12960,6 +13033,43 @@ mod tests {
             "a cancelled skip KEEPS the claim through the funnel too — coord's row is terminal"
         );
         release_gate_dispatch(funnel_kept);
+
+        // The rerouted refusal (plan
+        // `2026-09-23-a-continuation-is-not-dispatched-until-the-spawn-actually-occurs`
+        // Phase 3): coord re-targeted the row to another device. It must SKIP —
+        // the old "any other 409" arm spawned here, a double spawn — and it
+        // RELEASES, so a later reroute back to this device is not dropped at
+        // the dedupe check.
+        let target = uuid::Uuid::now_v7();
+        let rerouted = decide_spawn(
+            409,
+            &format!(
+                r#"{{"error":"rerouted","target_device_id":"{target}","rerouted_from":"{}"}}"#,
+                uuid::Uuid::now_v7()
+            ),
+        );
+        assert_eq!(
+            rerouted,
+            SpawnDecision::SkipRerouted {
+                target_device_id: Some(target)
+            }
+        );
+        assert!(
+            skip_leaves_row_pending(&rerouted),
+            "a rerouted skip releases: the row may be rerouted back to this device"
+        );
+        let funnel_rerouted = uuid::Uuid::now_v7();
+        assert!(claim_gate_dispatch(funnel_rerouted));
+        assert_eq!(
+            settle_claim_decision(&rerouted, ConsumeTarget::Gate(funnel_rerouted), gate),
+            ClaimOutcome::Skip,
+            "a rerouted claim refusal must not spawn and must not defer"
+        );
+        assert!(
+            claim_gate_dispatch(funnel_rerouted),
+            "the rerouted id must be claimable again after the funnel settles it"
+        );
+        release_gate_dispatch(funnel_rerouted);
 
         // The two decisions that are not skips: both reach the spawn, and
         // neither releases — the claim they hold is the dedupe for the spawn
@@ -15101,6 +15211,46 @@ mod tests {
         );
     }
 
+    /// 409 with the rerouted contract → SkipRerouted, carrying the new target
+    /// device (plan `2026-09-23-a-continuation-is-not-dispatched-until-the-spawn-actually-occurs`,
+    /// Phase 3). Before this arm the shape fell through to
+    /// `SpawnDespiteClaimError` and SPAWNED alongside the new target.
+    #[test]
+    fn decide_spawn_on_409_rerouted_skips_with_target() {
+        let target = uuid::Uuid::now_v7();
+        let from = uuid::Uuid::now_v7();
+        let body = format!(
+            r#"{{"error":"rerouted","target_device_id":"{target}","rerouted_from":"{from}"}}"#
+        );
+        assert_eq!(
+            decide_spawn(409, &body),
+            SpawnDecision::SkipRerouted {
+                target_device_id: Some(target)
+            }
+        );
+    }
+
+    /// 409 rerouted whose `target_device_id` is absent, not a string, or not a
+    /// UUID → still SkipRerouted (the refusal is authoritative; the target is
+    /// only for the log), with `None` for the target.
+    #[test]
+    fn decide_spawn_on_409_rerouted_without_target_still_skips() {
+        for body in [
+            r#"{"error":"rerouted"}"#,
+            r#"{"error":"rerouted","target_device_id":"not-a-uuid"}"#,
+            r#"{"error":"rerouted","target_device_id":42}"#,
+            r#"{"error":"rerouted","target_device_id":null,"rerouted_from":"x"}"#,
+        ] {
+            assert_eq!(
+                decide_spawn(409, body),
+                SpawnDecision::SkipRerouted {
+                    target_device_id: None
+                },
+                "{body}"
+            );
+        }
+    }
+
     /// 409 cancelled with no `cancel_reason` → SkipCancelled with `None` reason
     /// (still skips — the cancel is authoritative even without a reason string).
     #[test]
@@ -15559,6 +15709,15 @@ mod drain_claim_tests {
                 ),
                 SpawnDecision::SkipCancelled {
                     reason: Some("x".into())
+                }
+            );
+            // A rerouted refusal spawns nothing, so the drain must not turn it
+            // into a deferral — that would post this device's stamp onto a row
+            // coord has handed to another device.
+            assert_eq!(
+                apply_drain_to_claim(decide_spawn(409, r#"{"error":"rerouted"}"#), &state),
+                SpawnDecision::SkipRerouted {
+                    target_device_id: None
                 }
             );
         }
