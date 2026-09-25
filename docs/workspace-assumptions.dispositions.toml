@@ -158,6 +158,74 @@ reviewed = [
     "\"outputPreview: \\\"# local overrides\\\\nHOME=/home/jq\\\\nPATH=/usr/local/bin:/usr/bin:/bin\\\\nLANG=en_US.UTF-8\\\\nSHELL=/bin/bash\\\\nrecent_fil...",
 ]
 
+# Second triage pass (plan 2026-06-09-runner-renderer-memory-watchdog-and-twin-slo):
+# the Windows-only helpers of the renderer memory watchdog. Each is reached ONLY
+# from the cfg(windows) arm of `sample_webview2_subtree`; the cfg(not(windows))
+# arm of that same fn (renderer_watchdog.rs:2098) returns `Snapshot::default()`,
+# which `publish_sample` refuses to publish (:1082) and the sample loop skips
+# (:1251) — so off Windows the watchdog reports UNKNOWN
+# (`sampled_at_unix_ms: None`, fleet.rs:1204), never a healthy zero.
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/renderer_watchdog.rs"
+symbol = "process_facts"
+disposition = "fallback_correct"
+note = "Windows-only pid -> (first_seen_unix_ms, kind) cache behind PROCESS_FACTS, retained to the live pid list each tick so it cannot grow across a long uptime. There are no pids to remember off Windows: the non-Windows arm of its only caller returns an empty Snapshot that the loop skips as UNKNOWN (renderer_watchdog.rs:1251)."
+reviewed = [
+    "cfg(windows)-only fn `process_facts` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/renderer_watchdog.rs"
+symbol = "is_descendant_of"
+disposition = "fallback_correct"
+note = "Pure parent-chain walk deciding whether a WebView2 pid is under this process, bounded at 1024 hops so pid reuse cannot spin it. It is cfg(windows) only because the `parent_of` map it walks comes from the Toolhelp snapshot; nothing off Windows builds that map, and the empty Snapshot returned there is UNKNOWN rather than a zero-descendant reading."
+reviewed = [
+    "cfg(windows)-only fn `is_descendant_of` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/renderer_watchdog.rs"
+symbol = "exe_name_is_webview2"
+disposition = "fallback_correct"
+note = "Case-insensitive match of a PROCESSENTRY32.szExeFile C array against msedgewebview2.exe, read as raw bytes so it works whether the element type is u8 or i8. A Win32 struct field and a Windows-only process name, so there is no non-Windows sibling to write; off Windows the WebView2 process model it names does not exist and the sample is UNKNOWN."
+reviewed = [
+    "cfg(windows)-only fn `exe_name_is_webview2` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/renderer_watchdog.rs"
+symbol = "own_process_working_set"
+disposition = "fallback_correct"
+note = "GetProcessMemoryInfo on the current process, carried BESIDE the subtree total as Snapshot::own_process_bytes and never summed into it or checked against a ceiling — diagnostic only. Off Windows nothing publishes it, so the heartbeat serves sampled_at_unix_ms as an absence rather than 0 bytes (fleet.rs:1204)."
+reviewed = [
+    "cfg(windows)-only fn `own_process_working_set` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/renderer_watchdog.rs"
+symbol = "process_working_set"
+disposition = "fallback_correct"
+note = "OpenProcess(WORKING_SET_ACCESS) + GetProcessMemoryInfo for one descendant pid, returning None when the process exited or the open was refused — a None is COUNTED into Snapshot::unreadable_processes rather than swallowed, because an understated total is a missed detection. The Win32 handle-and-rights model is the whole function, so a non-Windows sibling would have nothing to do: there is no subtree to enumerate there."
+reviewed = [
+    "cfg(windows)-only fn `process_working_set` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/renderer_watchdog.rs"
+symbol = "process_command_line"
+disposition = "fallback_correct"
+note = "NtQueryInformationProcess -> PEB -> RTL_USER_PROCESS_PARAMETERS.CommandLine read, used only for the --type= kind classification and cached once per pid; every failure is None, which classifies as WebViewProcessKind::Unknown and never touches the byte counts the detector runs on. Deliberately not a Get-CimInstance shell-out. There is no such chain to read off Windows, where the whole sample is UNKNOWN."
+reviewed = [
+    "cfg(windows)-only fn `process_command_line` has no cfg(not(windows)) sibling in this file",
+]
+
 [[disposition]]
 class = "supervisor_dependency"
 file = "src/ambient.rs"

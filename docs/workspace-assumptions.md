@@ -13,7 +13,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `supervisor_dependency` | 32 | 32 | 0 | 22 | 4 | 6 |
 | `plans_dir` | 32 | 33 | 32 | 0 | 0 | 0 |
 | `tenant_literal` | 1 | 1 | 0 | 1 | 0 | 0 |
-| `os_bound_tooling` | 105 | 106 | 105 | 0 | 0 | 0 |
+| `os_bound_tooling` | 111 | 112 | 105 | 6 | 0 | 0 |
 | `machine_path` | 22 | 22 | 0 | 20 | 2 | 0 |
 
 ## `repo_layout` (55 rows)
@@ -188,7 +188,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 |---|---|---|---:|---|
 | `src/ai_provider/oauth_refresh.rs` | `const CLIENT_ID` | `const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";` | 1 | fallback_correct — Not a tenant: the public OAuth client id of the Claude CLI app, identical on every install. |
 
-## `os_bound_tooling` (105 rows)
+## `os_bound_tooling` (111 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -269,6 +269,12 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/profile_cli.rs` | `read_path_scope` | `cfg(windows)-only fn 'read_path_scope' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/profile_cli.rs` | `read_user_path` | `cfg(windows)-only fn 'read_user_path' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/profile_cli.rs` | `write_user_path` | `cfg(windows)-only fn 'write_user_path' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
+| `src/renderer_watchdog.rs` | `exe_name_is_webview2` | `cfg(windows)-only fn 'exe_name_is_webview2' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — Case-insensitive match of a PROCESSENTRY32.szExeFile C array against msedgewebview2.exe, read as raw bytes so it works whether the element type is u8 or i8. A Win32 struct field and a Windows-only process name, so there is no non-Windows sibling to write; off Windows the WebView2 process model it names does not exist and the sample is UNKNOWN. |
+| `src/renderer_watchdog.rs` | `is_descendant_of` | `cfg(windows)-only fn 'is_descendant_of' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — Pure parent-chain walk deciding whether a WebView2 pid is under this process, bounded at 1024 hops so pid reuse cannot spin it. It is cfg(windows) only because the 'parent_of' map it walks comes from the Toolhelp snapshot; nothing off Windows builds that map, and the empty Snapshot returned there is UNKNOWN rather than a zero-descendant reading. |
+| `src/renderer_watchdog.rs` | `own_process_working_set` | `cfg(windows)-only fn 'own_process_working_set' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — GetProcessMemoryInfo on the current process, carried BESIDE the subtree total as Snapshot::own_process_bytes and never summed into it or checked against a ceiling — diagnostic only. Off Windows nothing publishes it, so the heartbeat serves sampled_at_unix_ms as an absence rather than 0 bytes (fleet.rs:1204). |
+| `src/renderer_watchdog.rs` | `process_command_line` | `cfg(windows)-only fn 'process_command_line' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — NtQueryInformationProcess -> PEB -> RTL_USER_PROCESS_PARAMETERS.CommandLine read, used only for the --type= kind classification and cached once per pid; every failure is None, which classifies as WebViewProcessKind::Unknown and never touches the byte counts the detector runs on. Deliberately not a Get-CimInstance shell-out. There is no such chain to read off Windows, where the whole sample is UNKNOWN. |
+| `src/renderer_watchdog.rs` | `process_facts` | `cfg(windows)-only fn 'process_facts' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — Windows-only pid -> (first_seen_unix_ms, kind) cache behind PROCESS_FACTS, retained to the live pid list each tick so it cannot grow across a long uptime. There are no pids to remember off Windows: the non-Windows arm of its only caller returns an empty Snapshot that the loop skips as UNKNOWN (renderer_watchdog.rs:1251). |
+| `src/renderer_watchdog.rs` | `process_working_set` | `cfg(windows)-only fn 'process_working_set' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — OpenProcess(WORKING_SET_ACCESS) + GetProcessMemoryInfo for one descendant pid, returning None when the process exited or the open was refused — a None is COUNTED into Snapshot::unreadable_processes rather than swallowed, because an understated total is a missed detection. The Win32 handle-and-rights model is the whole function, so a non-Windows sibling would have nothing to do: there is no subtree to enumerate there. |
 | `src/screen/dpi.rs` | `set_windows_dpi_awareness` | `cfg(windows)-only fn 'set_windows_dpi_awareness' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/step_executor/handlers/check.rs` | `CheckHandler::execute` | `let mut c = crate::process_helpers::tokio_no_window("powershell");` | 1 | unreviewed |
 | `src/step_executor/handlers/shell_command.rs` | `ShellCommandHandler::get_shell_type` | `"powershell"` | 1 | unreviewed |
