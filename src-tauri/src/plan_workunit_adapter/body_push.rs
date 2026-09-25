@@ -1231,40 +1231,57 @@ pub fn build_report(
 pub fn render_report(report: &BackfillReport) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
-    let _ = writeln!(s, "scanned: {}", report.scanned);
-    let _ = writeln!(s, "\nby root:");
-    for (label, n) in &report.per_root {
-        let _ = writeln!(s, "  {label:<16} {n}");
-    }
     let dark = report
         .per_root
         .iter()
         .filter(|(_, n)| matches!(n, RootYield::Dark(_)))
         .count();
+    let partial = report
+        .per_root
+        .iter()
+        .filter(|(_, n)| matches!(n, RootYield::Partial { .. }))
+        .count();
+    // The grand total is a total only when every root was read whole. With a
+    // dark or partly read root it is a floor, and must say so rather than
+    // keep the confidence the by-root table below withholds.
+    if dark + partial > 0 {
+        let _ = writeln!(
+            s,
+            "scanned: {}+ (a floor: {dark} root(s) unread, {partial} read in part)",
+            report.scanned
+        );
+    } else {
+        let _ = writeln!(s, "scanned: {}", report.scanned);
+    }
+    let _ = writeln!(s, "\nby root:");
+    for (label, n) in &report.per_root {
+        let _ = writeln!(s, "  {label:<16} {n}");
+    }
     if dark > 0 {
         let _ = writeln!(
             s,
             "  {dark} root(s) could not be read: their plans are UNKNOWN, not absent"
         );
     }
-    let partial = report
-        .per_root
-        .iter()
-        .filter(|(_, n)| matches!(n, RootYield::Partial { .. }))
-        .count();
     if partial > 0 {
         let _ = writeln!(
             s,
             "  {partial} root(s) read in part: their counts are floors, not totals"
         );
     }
-    let _ = writeln!(s, "\nby kind:");
+    // Every count below sums over the same incomplete set as `scanned`.
+    let floors = if dark + partial > 0 {
+        " (floors: not every root was read)"
+    } else {
+        ""
+    };
+    let _ = writeln!(s, "\nby kind:{floors}");
     for (kind, n) in &report.per_kind {
         let _ = writeln!(s, "  {:<22} {}", kind.as_str(), n);
     }
     let _ = writeln!(
         s,
-        "\nwith Repo(s): {}   with Depends-On: {}",
+        "\nwith Repo(s): {}   with Depends-On: {}{floors}",
         report.with_repos, report.with_depends_on
     );
     let _ = writeln!(
@@ -4251,6 +4268,20 @@ mod tests {
         assert!(text.contains("1 root(s) could not be read"), "{text}");
         assert!(text.contains("4+ (PARTIAL: 1 unreadable)"), "{text}");
         assert!(text.contains("1 root(s) read in part"), "{text}");
+        // The grand total counts `artifacts` (none here), not `per_root`; what
+        // is pinned is that it is marked a floor, as is every sum below it.
+        assert!(
+            text.starts_with("scanned: 0+ (a floor: 1 root(s) unread, 1 read in part)\n"),
+            "the grand total is a floor too: {text}"
+        );
+        assert!(
+            text.contains("by kind: (floors: not every root was read)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("with Depends-On: 0 (floors: not every root was read)"),
+            "{text}"
+        );
         // A PARTLY read root is a floor, not a total — including the case
         // `collect_listing`'s doc calls a fabricated zero (every entry lost).
         let root_path = root.to_string_lossy().to_string();
@@ -4291,6 +4322,8 @@ mod tests {
         let clean_text = render_report(&clean);
         assert!(!clean_text.contains("could not be read"), "{clean_text}");
         assert!(!clean_text.contains("read in part"), "{clean_text}");
+        assert!(clean_text.starts_with("scanned: 0\n"), "{clean_text}");
+        assert!(!clean_text.contains("floors"), "{clean_text}");
     }
 
     /// The marker match is case-insensitive without allocating a lowercase copy
