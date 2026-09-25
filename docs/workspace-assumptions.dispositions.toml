@@ -170,9 +170,11 @@ reviewed = [
 # reports "never a healthy zero" off Windows. That is true of the STAMP and
 # false of the TOTAL, so it is struck here. `renderer_memory_bytes` on the
 # heartbeat is a bare u64 and is ALWAYS serialized, including 0, so off Windows
-# it reports an explicit 0. Its only discriminator is
-# `renderer_sampled_at_unix_ms`, which is absent rather than 0 on the wire — but
-# coord has no column for that stamp and DROPS it, so a coord-side reader of
+# it reports an explicit 0. The only discriminator coord could have used is
+# `renderer_sampled_at_unix_ms`, which is absent rather than 0 on the wire (two
+# other fields also discriminate there — `renderer_processes` is omitted when
+# empty and `renderer_own_process_bytes` at zero — but coord stores neither) —
+# and coord has no column for that stamp either, so a coord-side reader of
 # `coord.devices.renderer_memory_bytes` cannot today separate "non-Windows",
 # "watchdog disabled" and "never sampled" from a measured zero. The failure
 # direction is a MISSED detection, never a false alarm. Ageing a device row by
