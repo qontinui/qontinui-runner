@@ -41,10 +41,13 @@ on:
     #      23:33:13Z. Every runner PR gets `coord:landed` on land. Over PRs
     #      1132–1161 there were 19 label events, 8 of them post-merge
     #      `coord:landed`. This workflow is the expensive one (a GREEN main
-    #      rebuild measured at 136–155 job-min, mean ~144), and it has no
-    #      `concurrency:` group, so those runs are additive and uncancelled:
-    #      ~1,150 job-min of pure post-merge waste in a 36 h window, to save the
-    #      ~330 job-min the race actually costs.
+    #      rebuild measured at 136–155 job-min, mean ~144), and at the time it
+    #      had no `concurrency:` group, so those runs were additive and
+    #      uncancelled: ~1,150 job-min of pure post-merge waste in a 36 h window,
+    #      to save the ~330 job-min the race actually costs. The per-PR group
+    #      added below (2026-09-25) does NOT remove this cost: a `labeled` run
+    #      on an already-merged PR is the newest run in its group, so nothing
+    #      supersedes it and it runs to completion.
     #
     #   2. CORRECTNESS — and this is the disqualifying one. The natural
     #      narrowing (a job-level `if:` on `github.event.label.name`) is WORSE
@@ -105,6 +108,32 @@ on:
 permissions:
   contents: read
   pull-requests: read
+
+# Cancel ONLY superseded `pull_request` runs, one group per PR number. A PR
+# amended mid-run otherwise pays the full ~144 job-min matrix for a head sha
+# nobody will ever land. Plan: 2026-09-25-fleet-bundle-sync-residual-gaps
+# (Phase 3 / Gap 3).
+#
+# `push` (main, develop, merge-candidate*/**) and `workflow_dispatch` runs are
+# NEVER grouped or cancelled: each keys on its own `github.run_id`, so it is
+# the sole member of its group, and `cancel-in-progress` is false for them
+# anyway. coord lands on those push refs and redispatches this file on the
+# default branch, so a cancelled run there would be a missing verdict.
+#
+# Why cancelling a PR run is safe for coord: coord reads check rows PER HEAD
+# SHA (`ci_rows_for` over `coord.pr_check_runs_latest WHERE repo=$1 AND
+# head_sha=$2`), so a run cancelled on a superseded sha cannot attach to the
+# new head. `classify_check_rows` would treat `cancelled` as a failure, but the
+# view ranks `cancelled` last per (repo, head_sha, name), and
+# cancel-in-progress only ever cancels runs for OLDER shas of the same PR.
+#
+# `github.workflow` is in the key so the group cannot collide with another
+# workflow's group (concurrency groups are repo-wide). Do NOT add a `paths:`
+# filter as a cheaper alternative: the fleet bundle is compiled into the binary
+# via `include_dir!` (fleet_skills.rs), and coord counts `skipped` as passing.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('{0}-run-{1}', github.workflow, github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always

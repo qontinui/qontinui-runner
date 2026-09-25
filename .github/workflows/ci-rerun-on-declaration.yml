@@ -41,8 +41,10 @@ name: ci-rerun-on-declaration
 #
 #   - `labeled` fires on every label add including on an already-MERGED PR
 #     (verified on schemas#143: merged 23:33:09Z, `coord:landed` 23:33:11Z, run
-#     32605532207 created 23:33:13Z). `ci.yml` costs ~144 job-min green and has
-#     no concurrency group, so that is ~1,150 job-min/36 h of post-merge waste.
+#     32605532207 created 23:33:13Z). `ci.yml` costs ~144 job-min green, and a
+#     post-merge run is the newest in its per-PR concurrency group so nothing
+#     cancels it: ~1,150 job-min/36 h of post-merge waste (measured before that
+#     group existed; the group does not reduce it).
 #
 #   - Narrowing it with a job-level `if:` is WORSE, not better: an `if:`-skipped
 #     job still publishes a check run with conclusion `skipped`, and coord's
@@ -168,8 +170,9 @@ name: ci-rerun-on-declaration
 # ---------------------------------------------------------------------------
 #
 # `edited` also fires on every title and body edit, which is far more traffic
-# than base changes. On `ci.yml` — ~144 job-min for a green run, no
-# `concurrency:` group — that is the same unbounded cost that disqualified
+# than base changes. On `ci.yml` — ~144 job-min for a green run, and a
+# title edit on an idle PR supersedes nothing its per-PR `concurrency:` group
+# could cancel — that is the same unbounded cost that disqualified
 # `labeled` there, and the job-level narrowing that would bound it is the
 # `skipped` hazard above. Here the entire job is a handful of API calls that
 # finishes in ~5 s, and on a title edit BOTH steps no-op: `github.event.label`
@@ -307,11 +310,14 @@ jobs:
           # An in-progress run cannot be re-run (the API rejects it), and this one
           # is precisely the run that raced the label: it resolved the sibling
           # before the declaration existed, so its verdict is already wrong. Cancel
-          # it, then re-run. This is the ONLY cancellation this change introduces —
-          # deliberately not a `concurrency: cancel-in-progress` group on `ci.yml`,
-          # which would also kill legitimate in-flight runs on `synchronize` and
-          # manufacture exactly the "unverified tip (cancelled/absent gating CI)"
-          # condition coord's ci_runs_watcher had to be built to repair.
+          # it, then re-run. `ci.yml` has since (2026-09-25) gained a per-PR
+          # `concurrency: cancel-in-progress` group, but it cancels only runs for a
+          # SUPERSEDED head sha of the same PR; this run is for the CURRENT head,
+          # so the group never reaches it and this explicit cancel is still
+          # needed. The group never touches push/workflow_dispatch runs, so it
+          # cannot manufacture the "unverified tip (cancelled/absent gating CI)"
+          # condition coord's ci_runs_watcher repairs. Plan:
+          # 2026-09-25-fleet-bundle-sync-residual-gaps (Phase 3).
           if [ "${run_status}" != "completed" ]; then
             note ""
             note "Run is \`${run_status}\` and raced the label — cancelling before re-run."
