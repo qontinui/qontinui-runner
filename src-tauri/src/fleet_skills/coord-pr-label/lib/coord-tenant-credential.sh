@@ -442,7 +442,7 @@ ctc_prove_tenant() { # <tenant> <owner/repo>
   case "$r" in ?*/?*) ;; *) CTC_NOTE="'$r' is not an owner/name slug"; return 0 ;; esac
   src="$(ctc_stage_for_tenant "$t")"
   case "$src" in
-    rejected*) CTC_BEARER_SRC="$src"; CTC_NOTE="no credential for tenant $t (${src#rejected})"; return 0 ;;
+    rejected*) CTC_BEARER_SRC="$src"; CTC_NOTE="no credential for tenant $t ${src#rejected}"; return 0 ;;
   esac
   CTC_BEARER_SRC="$src"
   CTC_DOOR_CODE="$(_ctc_probe "$r")"

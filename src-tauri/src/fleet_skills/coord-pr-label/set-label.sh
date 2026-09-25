@@ -562,10 +562,11 @@ echo "ok: gh added label \"$LABEL\" to $REPO#$PR"
 #   2b. a device credential FOR that tenant (a static token whose `tenant_id`
 #       claim is that tenant, else POST /agents/credential naming it; a minted
 #       token claiming any other tenant is rejected, never used) asks
-#       `GET /pr-merge/<owner%2Fname>/<pr>/author-session`, which answers 200
-#       only when the caller's tenant owns the repo and 404 otherwise (coord
-#       `pr_merge::get_author_session`). gh has just proven the PR exists, so a
-#       404 REFUTES ownership.
+#       `GET /pr-merge/<owner%2Fname>/0/author-session` (lib/coord-tenant-credential.sh
+#       `ctc_prove_tenant`), which answers 200 -- naming the repo -- only when
+#       the caller's tenant owns the repo, for ANY pr number, and 404 otherwise
+#       (coord `pr_merge::get_author_session` checks ownership before the PR).
+#       gh has just proven the repo exists, so a 404 REFUTES ownership.
 # Proven -> the real POST. Refuted, or anything that is not a proof (no device
 # id, no credential for that tenant, a 401/5xx/transport failure) -> the coord
 # row is WITHHELD and the script exits 5 saying which. That is the fail-closed
@@ -708,6 +709,7 @@ else
     proven:*) OWNER_NOTE="proven: tenant $WRITE_TENANT owns $REPO (author-session door answered 200, bearer=$BEARER_SRC)" ;;
     refuted:*) withhold "the write tenant $WRITE_TENANT does NOT own $REPO as coord knows it (author-session door answered 404 under a token claiming it, bearer=$BEARER_SRC; coord answers the same 404 for a repo it has not registered). Most likely QONTINUI_AGENT_ID's worktree row carries the wrong tenant -- the multi-tenant-device defect" ;;
     *:) withhold "ownership of $REPO by the write tenant $WRITE_TENANT is UNKNOWN: $CTC_NOTE" ;;
+    *:bad) withhold "ownership of $REPO by the write tenant $WRITE_TENANT is UNKNOWN: the author-session door answered 200 about a DIFFERENT repo (bearer=$BEARER_SRC), which proves nothing about $REPO" ;;
     *)  withhold "ownership of $REPO by the write tenant $WRITE_TENANT is UNKNOWN: the author-session door answered HTTP $CTC_DOOR_CODE (bearer=$BEARER_SRC)" ;;
   esac
 fi
