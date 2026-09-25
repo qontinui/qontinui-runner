@@ -348,12 +348,13 @@ mod tier_matrix_tests;
 // Plan `2026-08-25-runner-test-suite-env-isolation` Phase 2.
 #[cfg(test)]
 mod env_write_lock_guard;
-// Source-scan ratchet for the `tokio_postgres::Row::get` deny lint: the
-// fn-level `#[expect(clippy::disallowed_methods)]` count only falls, and the
-// gate (repo-root clippy.toml + the two deny levels in Cargo.toml) stays wired.
-// Plan 2026-09-03-coord-row-get-panic-class-closed-by-lint-and-supervisor.
+// Source-scan ratchets for the deny lints that grandfather sites with a
+// fn-level `#[expect]` (`clippy::disallowed_methods` for `Row::get`,
+// `clippy::string_slice`): each count only falls, and each gate stays wired.
+// Plans 2026-09-03-coord-row-get-panic-class-closed-by-lint-and-supervisor and
+// 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate.
 #[cfg(test)]
-mod row_get_ratchet;
+mod expect_ratchet;
 mod turn_ending_shadow;
 mod worktree;
 mod wrappers;
@@ -825,9 +826,21 @@ fn boot_embedded_pg(rt: &tokio::runtime::Runtime) -> Arc<crate::database::pg::Pg
 /// adapter's own `resolve_plans_dir`, so "blank counts as unset" holds here
 /// exactly as it does on the scan. A `fn` pointer rather than a closure
 /// because the door type is `fn() -> Option<String>`.
+///
+/// **It resolves the DEVICE DEFAULT, permanently and on purpose — never a
+/// `plans_dir_by_tenant` entry.** This feeds a device-wide telemetry capture,
+/// which has no acting tenant: keying it by one would make the published value
+/// depend on whichever tenant asked last, so the capture would report a
+/// directory no reader could attribute. The per-tenant rung belongs on the
+/// surfaces that DO have an acting tenant — the session launch and the settings
+/// view — and the confinement union belongs on the plan-library write door.
 fn runner_plans_dir_setting() -> Option<String> {
     let paths = crate::config_facade::get_setting::<crate::settings::PathSettings>();
-    qontinui_runner_lib::plan_workunit_adapter::resolve_plans_dir(paths.plans_dir)
+    qontinui_runner_lib::plan_workunit_adapter::resolve_plans_dir(
+        paths.plans_dir,
+        &paths.plans_dir_by_tenant,
+        None,
+    )
 }
 
 /// Parse a boolean env lever the way the rest of the boot path does.
@@ -6046,15 +6059,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // runners whose Settings/Terminal UI never polls usage. This
                 // loop ONLY refreshes the cache — re-picking is deferred to
                 // the next unit of AI work (so warm-provider prompt-cache
-                // locality within a unit is preserved). `refresh_*` is a
-                // no-op unless ≥2 accounts are configured.
+                // locality within a unit is preserved). The account half is a
+                // no-op unless ≥2 accounts are configured; the prepaid half
+                // (`refresh_fleet_usage_report`) reports regardless.
+                //
+                // The immediate first tick is NOT skipped: it is the first
+                // prepaid report, run here rather than in the startup call
+                // above so the provider round-trip never sits in front of
+                // `pick_best_account`. Its account half is served from the
+                // probe cache the startup refresh just filled.
                 tauri::async_runtime::spawn(async {
                     let mut tick =
                         tokio::time::interval(tokio::time::Duration::from_secs(10 * 60));
-                    tick.tick().await; // consume the immediate first tick (just refreshed)
                     loop {
                         tick.tick().await;
-                        commands::ai_settings::refresh_account_usage_snapshot().await;
+                        commands::ai_settings::refresh_fleet_usage_report().await;
                     }
                 });
             });

@@ -356,6 +356,10 @@ async fn build_workflow_metadata(
 ///
 /// # Returns
 /// Ok(SummaryResult) on success, Err on failure
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub async fn generate_task_summary(
     task_run_id: &str,
     doctor_handle: Option<&DoctorHandle>,
@@ -538,6 +542,10 @@ fn parse_summary_response(response: &str) -> Result<SummaryResult, String> {
 }
 
 /// Extract JSON from a response that might contain markdown or other text
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_json_from_response(response: &str) -> Result<String, String> {
     // Try to find JSON in code blocks first
     if let Some(start) = response.find("```json") {

@@ -218,6 +218,10 @@ struct RawExchange {
 }
 
 /// Extract the `rel="next"` URL from a GitHub `Link` header value.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn extract_next_url(link_header: &str) -> Option<String> {
     for part in link_header.split(',') {
         let trimmed = part.trim();
@@ -868,6 +872,10 @@ impl GitHubClient {
     /// spend the ETag store's byte budget on a possibly MB-scale body nothing
     /// will ask for twice. `fresh` is the honest label for that, and Phase A
     /// deliberately declines to judge a `fresh` row's hit rate.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     pub async fn get_check_run_log(
         &self,
         owner: &str,

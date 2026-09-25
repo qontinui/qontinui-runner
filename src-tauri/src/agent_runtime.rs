@@ -2868,7 +2868,7 @@ enum AnchorHolder {
     /// up) — the reservation [`evaluate_continuation_guard`] takes inside its
     /// P3 critical section — or a session mid-account-migration, whose lift
     /// holds the anchor across the respawn
-    /// ([`ContinuationRegistry::take_live_reserving_anchor`]). No terminal
+    /// ([`ContinuationRegistry::take_live_reserving_anchor`]).
     /// The variant carries no `terminal_id` either way, so there is nothing to
     /// focus — not because no terminal exists (during a migration the OLD pane
     /// is untouched and still running at its limit prompt; it is closed only
@@ -6161,6 +6161,10 @@ const CONDITION_REPORT_BEARER_MARKER: &str = "Authorization: Bearer ";
 /// moved, or a prompt whose only marker hits are operator text. That is
 /// fail-closed: the caller logs the unreported reason rather than POSTing a
 /// guess at a credential.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn condition_report_token(payload: &ConditionCheckPayload) -> Option<String> {
     if let Some(explicit) = payload.report_token.as_deref() {
         let explicit = explicit.trim();
@@ -6753,6 +6757,7 @@ async fn acquire_continuation_workdir(
             // A gate continuation is coord-spawned: no spawn picker chose a
             // tenant, and its session id resolves its own.
             spawn_tenant: None,
+            shared_branch: crate::agent_worktree::SharedBranchPolicy::Honor,
         })
         .await;
         let ctx = match settle_continuation_acquire(acquired) {
@@ -6891,10 +6896,7 @@ fn settle_continuation_acquire<C>(
     }
 }
 
-/// The leading token of a foreign-repo continuation refused because it got no
-/// worktree of its own. Stable, like
-/// [`crate::agent_worktree::canonical_paths::WORKDIR_NOT_A_CHECKOUT`].
-const NO_ISOLATED_WORKTREE: &str = "no_isolated_worktree";
+use crate::agent_worktree::NO_ISOLATED_WORKTREE;
 
 /// Pure core of the continuation fallback cwd — reached only when no worktree
 /// was acquired.
@@ -9284,7 +9286,15 @@ async fn post_spawn_failed(
         );
         return SpawnReportOutcome::Undelivered;
     };
-    // coord-tenant-scope(session-noop): agent_id is a parameter; spawn-failed only sets status=abandoned by agent_id and persists no tenant. Nothing to thread. Terminal. Credential: the runner sends attach_device_auth, i.e. the DEFAULT binding's device JWT — the agent token in LaunchPayload.jwt is not used on this path. Any 4xx (401/403, and coord's 404 for an unknown agent) is classed Rejected below and not retried. coord is moving to trust this report only from a matching device token, or an agent token whose agent_id matches; both pass today because the route never 401s, so a future credential change must keep one of the two.
+    // coord-tenant-scope(session-noop): agent_id is a parameter; spawn-failed persists no tenant. Nothing to thread. Terminal.
+    // Credential: the runner sends attach_device_auth, i.e. the DEFAULT binding's device JWT — the agent token in
+    // LaunchPayload.jwt is not used on this path. coord (agents_spawn.rs post_spawn_failed / spawn_failed_for_reporter)
+    // never 401s; it decides whether the reporter is VERIFIED (spawn_admission::reporter_owns_allocation: a PAIRED device
+    // token naming one of the allocation's devices, or the agent's own token). A verified report sets status=abandoned
+    // (and, for a `deferred_load:` reason, retires the dedup marker); an unverified one only abandons an allocation still
+    // `allocated`, never an `active` session, and still answers 200. So a credential change that stops this JWT being a
+    // paired token for the allocation's device silently downgrades the report. Any 4xx (e.g. coord's 404 for an unknown
+    // agent) is classed Rejected below and not retried.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)
@@ -11333,6 +11343,10 @@ mod tests {
     /// detail that carries it on the wire is bounded to 64 chars and to
     /// `[A-Za-z0-9_.-]`, everything else becoming `_`.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn credential_deferral_detail_is_bounded_and_sanitized() {
         // The sanitizer itself.
         assert_eq!(

@@ -59,8 +59,8 @@ const MAX_ALLOWLIST_ENTRY_LEN: usize = 200;
 /// Concurrency bounds. A directive asking for 0 is a mistake, not a request to
 /// idle — `admission` clamps 0 up to 1 anyway, so accepting it would persist a
 /// number that lies about what the device does.
-const MAX_CONCURRENT_BUILDS_MIN: u32 = 1;
-const MAX_CONCURRENT_BUILDS_MAX: u32 = 64;
+pub(crate) const MAX_CONCURRENT_BUILDS_MIN: u32 = 1;
+pub(crate) const MAX_CONCURRENT_BUILDS_MAX: u32 = 64;
 /// `min_free_disk_gb` bounds. **0 disables the guard** — see the module doc.
 const MIN_FREE_DISK_GB_MIN: u64 = 1;
 const MIN_FREE_DISK_GB_MAX: u64 = 100_000;
@@ -73,8 +73,12 @@ const MIN_FREE_DISK_GB_MAX: u64 = 100_000;
 pub(crate) struct CiSettingsDirective {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default = "default_max_concurrent_builds")]
-    pub max_concurrent_builds: u32,
+    /// Absent or `null` = `None` = "use the host suggestion"
+    /// (`ci_node::host_sizing::suggested_concurrent_builds`); `Some(n)` is an
+    /// explicit override, validated to `1..=64`. Carried through to
+    /// `CiNodeSettings` verbatim, so a directive can express either.
+    #[serde(default)]
+    pub max_concurrent_builds: Option<u32>,
     #[serde(default)]
     pub repo_allowlist: Vec<String>,
     #[serde(default = "default_min_free_disk_gb")]
@@ -94,10 +98,6 @@ pub(crate) struct CiSettingsDirective {
     /// dashboard, and grants nothing.
     #[serde(default)]
     pub machine_id: Option<String>,
-}
-
-fn default_max_concurrent_builds() -> u32 {
-    1
 }
 
 fn default_min_free_disk_gb() -> u64 {
@@ -190,12 +190,10 @@ fn entry_charset_ok(entry: &str) -> bool {
 pub(crate) fn validate(
     directive: &CiSettingsDirective,
 ) -> Result<CiNodeSettings, DirectiveRejection> {
-    if !(MAX_CONCURRENT_BUILDS_MIN..=MAX_CONCURRENT_BUILDS_MAX)
-        .contains(&directive.max_concurrent_builds)
-    {
-        return Err(DirectiveRejection::ConcurrencyOutOfRange(
-            directive.max_concurrent_builds,
-        ));
+    if let Some(n) = directive.max_concurrent_builds {
+        if !(MAX_CONCURRENT_BUILDS_MIN..=MAX_CONCURRENT_BUILDS_MAX).contains(&n) {
+            return Err(DirectiveRejection::ConcurrencyOutOfRange(n));
+        }
     }
     if directive.min_free_disk_gb == 0 {
         return Err(DirectiveRejection::DiskGuardDisabled);
@@ -235,6 +233,8 @@ pub(crate) fn validate(
 
     Ok(CiNodeSettings {
         enabled: directive.enabled,
+        // Verbatim: an explicit value is an operator override, and an absent
+        // one hands the choice to the host suggestion.
         max_concurrent_builds: directive.max_concurrent_builds,
         repo_allowlist: allowlist,
         min_free_disk_gb: directive.min_free_disk_gb,
@@ -270,7 +270,9 @@ pub(crate) fn apply(directive: CiSettingsDirective) {
         "enabled={} repos={} concurrency={} min_free_disk_gb={}",
         settings.enabled,
         settings.repo_allowlist.len(),
-        settings.max_concurrent_builds,
+        settings
+            .max_concurrent_builds
+            .map_or_else(|| "suggested".to_string(), |n| n.to_string()),
         settings.min_free_disk_gb,
     );
     match crate::settings::save_ci_node_settings(settings) {
@@ -292,7 +294,7 @@ mod tests {
     fn directive() -> CiSettingsDirective {
         CiSettingsDirective {
             enabled: true,
-            max_concurrent_builds: 2,
+            max_concurrent_builds: Some(2),
             repo_allowlist: vec!["qontinui/qontinui-runner".to_string()],
             min_free_disk_gb: 20,
             canonical_converge: false,
@@ -348,7 +350,8 @@ mod tests {
         }))
         .expect("coord's pinned payload must parse");
         assert!(d.enabled);
-        assert_eq!(d.max_concurrent_builds, 3);
+        assert_eq!(d.max_concurrent_builds, Some(3));
+        assert_eq!(validate(&d).unwrap().max_concurrent_builds, Some(3));
         assert_eq!(d.repo_allowlist.len(), 2);
         assert_eq!(d.min_free_disk_gb, 25);
         assert_eq!(
@@ -369,7 +372,10 @@ mod tests {
             d.repo_allowlist.is_empty(),
             "missing allowlist must allow nothing"
         );
-        assert_eq!(d.max_concurrent_builds, 1);
+        assert_eq!(
+            d.max_concurrent_builds, None,
+            "missing concurrency must mean 'use the host suggestion'"
+        );
         assert_eq!(d.min_free_disk_gb, 20);
 
         // And the resulting settings equal the shipped inert default exactly.
@@ -442,18 +448,43 @@ mod tests {
     #[test]
     fn concurrency_bounds_are_enforced() {
         let mut d = directive();
-        d.max_concurrent_builds = 0;
+        d.max_concurrent_builds = Some(0);
         assert_eq!(
             validate(&d).unwrap_err(),
             DirectiveRejection::ConcurrencyOutOfRange(0)
         );
-        d.max_concurrent_builds = MAX_CONCURRENT_BUILDS_MAX + 1;
+        d.max_concurrent_builds = Some(MAX_CONCURRENT_BUILDS_MAX + 1);
         assert_eq!(
             validate(&d).unwrap_err(),
             DirectiveRejection::ConcurrencyOutOfRange(MAX_CONCURRENT_BUILDS_MAX + 1)
         );
-        d.max_concurrent_builds = MAX_CONCURRENT_BUILDS_MAX;
+        d.max_concurrent_builds = Some(MAX_CONCURRENT_BUILDS_MAX);
         assert!(validate(&d).is_ok());
+        d.max_concurrent_builds = None;
+        assert_eq!(validate(&d).unwrap().max_concurrent_builds, None);
+    }
+
+    /// Plan 2026-09-22-ci-capacity-...: a directive can say "use the host
+    /// suggestion" (absent or `null`) as well as an explicit value, and
+    /// out-of-range explicit values are still refused.
+    #[test]
+    fn concurrency_wire_forms() {
+        let parse = |v: serde_json::Value| -> CiSettingsDirective {
+            serde_json::from_value(v).expect("must parse")
+        };
+        assert_eq!(parse(serde_json::json!({})).max_concurrent_builds, None);
+        let null = parse(serde_json::json!({"max_concurrent_builds": null}));
+        assert_eq!(null.max_concurrent_builds, None);
+        assert_eq!(validate(&null).unwrap().max_concurrent_builds, None);
+        let three = parse(serde_json::json!({"max_concurrent_builds": 3}));
+        assert_eq!(validate(&three).unwrap().max_concurrent_builds, Some(3));
+        for bad in [0u32, 65] {
+            let d = parse(serde_json::json!({"max_concurrent_builds": bad}));
+            assert_eq!(
+                validate(&d).unwrap_err(),
+                DirectiveRejection::ConcurrencyOutOfRange(bad)
+            );
+        }
     }
 
     #[test]

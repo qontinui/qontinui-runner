@@ -630,6 +630,10 @@ struct ComparisonResult {
 ///
 /// Given `http://localhost:9876/ui-bridge`, returns `http://localhost:9876`.
 /// Falls back to the default `http://localhost:9876` if parsing fails.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_origin(url: &str) -> String {
     // Find the start of the path after "scheme://host[:port]"
     if let Some(scheme_end) = url.find("://") {
@@ -740,6 +744,10 @@ impl StepHandler for UiBridgeHandler {
         "UI Bridge"
     }
 
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     async fn execute(
         &self,
         step: &ExecutionStepConfig,
@@ -1430,6 +1438,10 @@ impl UiBridgeHandler {
 
     /// Execute an "element_action" — find element by criteria and perform an action.
     /// Target JSON: { "action": "click"|"type", "criteria": {...}, "params": {...} }
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     async fn execute_element_action(
         &self,
         step: &ExecutionStepConfig,
@@ -1607,6 +1619,10 @@ impl UiBridgeHandler {
 
     /// Execute a "wait_for_element" — poll snapshot until an element matching criteria appears.
     /// Target JSON: { "criteria": {...}, "timeout": 5000 }
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     async fn execute_wait_for_element(
         &self,
         step: &ExecutionStepConfig,
@@ -1704,6 +1720,10 @@ impl UiBridgeHandler {
     /// 2. Parse the assertion specs from `ui_bridge_target` (JSON array)
     /// 3. For each assertion, search snapshot elements for matches
     /// 4. Return per-assertion pass/fail results — no AI tokens used
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     async fn execute_snapshot_assert(
         &self,
         step: &ExecutionStepConfig,

@@ -1458,6 +1458,17 @@ async fn health(
         // with a serving emitter used to be diagnosable only by log grep on
         // the emitting box.
         "transportRung": transport_rung_health_snapshot(),
+        // The coord session outbox drain (qontinui-runner manual-test-loop
+        // 2026-09-23): `pending` rows and the `oldestUnackedAt` among them as
+        // of the drain's last tick (`observedAt`; `pending: null` = no tick
+        // yet, UNKNOWN rather than empty), `lastAckAt` of anything coord
+        // accepted, and `lastFailure {kind, status, at}` — `kind` one of
+        // server_error / rate_limited / unauthorized / rejected / conflict /
+        // network / timeout. `retryingSessions` are on their own backoff;
+        // `quarantinedSessions` had their rows moved to the
+        // `<outbox>.quarantine.jsonl` sidecar after failing while coord served
+        // everything else. A stalled drain used to be invisible from here.
+        "sessionOutbox": crate::session::coord_sync::session_outbox_health_json(),
         // Session-message push evidence (plan
         // 2026-09-07-session-message-delivery-is-blind-and-park-collection-
         // resolves-on-a-guess, Phase 4): every tick the poller could not push
@@ -8358,6 +8369,15 @@ struct ProvisionSessionBody {
     /// serves THAT tenant's credential per request or refuses; it never falls
     /// back to another slot. Absent (`None`) keeps the machine pin, which is
     /// what every caller before this field got.
+    ///
+    /// **The P1 kill switch covers this field.** With
+    /// `QONTINUI_SPAWN_TENANT_CREDENTIAL=0` in the runner's environment the
+    /// handler runs `tenant` through
+    /// [`crate::coord_mcp::credential_spawn_tenant`] first, which answers `None`
+    /// — so a named tenant is neither admitted nor pinned and the caller gets
+    /// exactly the tenant-less document. That is the point of the switch: one
+    /// lever reverses "a chosen tenant reaches the credential" on every door,
+    /// rather than on the spawn paths while this one quietly keeps pinning.
     #[serde(default)]
     tenant: Option<uuid::Uuid>,
 }
@@ -8568,13 +8588,25 @@ fn provision_session_after_gate(body: &[u8]) -> axum::response::Response {
         );
     }
 
+    // The P1 kill switch covers THIS door too (plan
+    // `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`).
+    // `QONTINUI_SPAWN_TENANT_CREDENTIAL=0` reverses "a chosen tenant reaches the
+    // credential"; without this call it reversed the spawn paths only, so a
+    // launcher POSTing `{"cwd":…, "tenant":"<B>"}` here still got a nonce frozen
+    // to `Pinned(B)` while `credential_spawn_tenant` logged that the switch had
+    // taken effect. A reversal lever that reports success and works partially is
+    // worse than an absent one, because the operator stops looking. `None` from
+    // here is exactly a tenant-less request: no admission, no pin, the machine's
+    // pin — the same document a caller that named nothing gets.
+    let requested = crate::coord_mcp::credential_spawn_tenant(req.tenant);
+
     // A caller-named tenant is admitted BEFORE anything is minted (plan
     // `2026-09-17-findings-carry-a-triage-stamp-and-the-steward-reads-since-last-run`
     // Design decision 8): the same typed admission the spawn picker's
     // `--tenant` passes through. A refusal names the tenant and the heal and
     // mints NOTHING — never a nonce on the machine's default slot, which would
     // hand the caller a session that writes into a tenant it did not name.
-    if let Some(tenant) = req.tenant {
+    if let Some(tenant) = requested {
         use crate::coord_mcp::SpawnTenantRefusal;
         if let Err(refusal) = crate::coord_mcp::validate_spawn_tenant(tenant) {
             let (status, code) = match &refusal {
@@ -8631,11 +8663,11 @@ fn provision_session_after_gate(body: &[u8]) -> axum::response::Response {
     }
 
     // The shared mint core (§2) — fail-closed on an unresolvable bound port.
-    match crate::coord_mcp::provision_session_proxy_config(cwd, req.tenant) {
+    match crate::coord_mcp::provision_session_proxy_config(cwd, requested) {
         Some(config) => {
             info!(
                 cwd = %cwd,
-                tenant = ?req.tenant,
+                tenant = ?requested,
                 "coord-mcp provision-session: minted an ephemeral device session config"
             );
             (axum::http::StatusCode::OK, Json(config)).into_response()
@@ -12434,6 +12466,7 @@ mod self_id_chain_tests {
             finished_at: None,
             finish_reason: None,
             finish_synced: false,
+            spawn_device_default: None,
         }
     }
 
@@ -15603,6 +15636,10 @@ mod coord_claims_proxy_tests {
     /// technique `ui_error`'s writer guard uses. It fails against a
     /// `coord_mcp_proxy_handler` that does not make the call.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn the_coord_mcp_proxy_reports_its_upstream_verdict_to_the_posture() {
         // From CARGO_MANIFEST_DIR, never the CWD: a test binary can be run
         // from anywhere.
@@ -15647,6 +15684,10 @@ mod coord_claims_proxy_tests {
     /// `coord_mcp_url_with_source()` would still dial coord and still hand the
     /// caller `token_expired`, which is the whole incident.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn the_coord_mcp_proxy_refuses_locally_on_a_dead_runner_credential() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs");
         let text = std::fs::read_to_string(&src).expect("read mcp_api.rs");
@@ -16413,6 +16454,72 @@ mod coord_provision_session_gate_tests {
             "a refused tenant must mint NOTHING for the caller's cwd (registry had {before} \
              bindings before, {} after)",
             registry.len()
+        );
+    }
+
+    /// W1. The P1 kill switch reaches THIS door, not just the spawn paths.
+    ///
+    /// The observation is the admission FORK, because it is the only place a
+    /// unit test can see the decision: `resolve_bound_api_port()` is `None`
+    /// without a Tauri runtime, so the route can never reach a real mint here
+    /// (that is what `provision_session_proxy_config_fail_closed_without_bound_port`
+    /// pins). So:
+    ///
+    /// - switch ON (default): a `tenant` this runner is unpaired for is **403
+    ///   `_TENANT_NOT_PAIRED`** — the tenant was carried into admission.
+    /// - switch `=0`: the SAME body is **503 `_PORT_UNRESOLVABLE`** — it never
+    ///   reached admission at all, which is only possible if the tenant was
+    ///   dropped to `None` first. That is the same answer a body naming no
+    ///   tenant gets, asserted here beside it so "identical to tenant-less" is
+    ///   a measurement rather than a claim.
+    ///
+    /// Fail-before: with `req.tenant` used directly (the shape before W1), the
+    /// `=0` case still 403s, because admission still sees B.
+    #[tokio::test]
+    async fn the_kill_switch_stops_a_named_tenant_reaching_this_doors_admission() {
+        let amb = crate::test_env::isolated_ambient();
+        let b = uuid::Uuid::from_u128(0xB0B0_0000_0000_4000_8000_0000_0000_00B0);
+        let cwd = amb.dir().join("provision-killswitch-cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd_str = cwd.to_string_lossy().to_string();
+        let named = serde_json::json!({"cwd": cwd_str, "tenant": b.to_string()}).to_string();
+        let tenantless = serde_json::json!({"cwd": cwd_str}).to_string();
+
+        // Safe to mutate the process env: `isolated_ambient` holds the
+        // process-wide env lock for this whole test and
+        // `QONTINUI_SPAWN_TENANT_CREDENTIAL` is in `ambient::AMBIENT_ENV_KEYS`,
+        // so the fixture restores it on drop even if an assertion panics.
+        std::env::remove_var(crate::coord_mcp::SPAWN_TENANT_CREDENTIAL_ENV);
+        let resp = super::provision_session_after_gate(named.as_bytes());
+        assert_eq!(
+            resp.status(),
+            403,
+            "switch ON: a named unpaired tenant must reach admission"
+        );
+        assert_eq!(
+            body_json(resp).await["code"],
+            "COORD_MCP_PROVISION_TENANT_NOT_PAIRED"
+        );
+
+        std::env::set_var(crate::coord_mcp::SPAWN_TENANT_CREDENTIAL_ENV, "0");
+        let resp = super::provision_session_after_gate(named.as_bytes());
+        assert_eq!(
+            resp.status(),
+            503,
+            "switch OFF: the named tenant must be dropped BEFORE admission, so the route \
+             falls through to the port check exactly as a tenant-less body does"
+        );
+        assert_eq!(
+            body_json(resp).await["code"],
+            "COORD_MCP_PROVISION_PORT_UNRESOLVABLE"
+        );
+
+        let resp = super::provision_session_after_gate(tenantless.as_bytes());
+        assert_eq!(resp.status(), 503);
+        assert_eq!(
+            body_json(resp).await["code"],
+            "COORD_MCP_PROVISION_PORT_UNRESOLVABLE",
+            "the switched-off answer above is the tenant-less answer, not a coincidence"
         );
     }
 

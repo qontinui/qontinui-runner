@@ -1,6 +1,6 @@
 ---
 name: coord-pr-label
-description: Set coord:* labels on a pull request — declare intent (upstream-of/downstream-of/stacked-on dependency edges, requires-tag, merge-strategy, credibility-override/migrate-repair flags) so the PR Merge Orchestrator can schedule the auto-merge correctly. All three dep labels work cross-repo with the [<owner>/]<repo>#<n> grammar; no label holds a PR. Validates against the namespace and GitHub's 50-character label-name ceiling before sending (--dry-run checks a label without sending anything, and a failing label add is diagnosed rather than relayed; a missing dynamic-value label is created on demand); tenant resolved automatically from your agent's worktree.
+description: Set coord:* labels on a pull request — declare intent (upstream-of/downstream-of/stacked-on dependency edges, requires-tag, merge-strategy, credibility-override/migrate-repair flags) so the PR Merge Orchestrator can schedule the auto-merge correctly. All three dep labels work cross-repo with the [<owner>/]<repo>#<n> grammar; no label holds a PR. Validates against the namespace and GitHub's 50-character label-name ceiling before sending (--dry-run checks a label without sending anything, and a failing label add is diagnosed rather than relayed; a missing dynamic-value label is created on demand); the coord row is written only when the tenant your agent's worktree carries is PROVEN to own the repo (else withheld, exit 5).
 user-invocable: true
 ---
 
@@ -15,9 +15,24 @@ intent. Wraps:
    and exits 1 on gh 2.46.0 before touching the label (measured 2026-09-03).
    A missing dynamic-value label is created (`gh label create`) and the add
    retried once.
-2. `POST <coord>/pr-merge/labels` — coord-side ingest hook that records
-   the label in `coord.pr_labels` with `source='coord_skill'` + tenant
-   scoping resolved from your `agent_id`.
+2. `POST <coord>/pr-merge/labels` with `labels: []` — a probe (merge mode
+   writes and deletes no `pr_labels` row; it does re-run coord's idempotent
+   dependency-edge resync for the PR) that reads back the tenant coord
+   would write under: the tenant of your `agent_id`'s worktree row.
+3. An ownership proof for that tenant — `GET <coord>/pr-merge/<owner%2Fname>/<pr>/author-session`
+   under a device credential whose `tenant_id` claim IS that tenant (a static
+   `$COORD_DEVICE_JWT` / `~/.qontinui/coord-device-jwt` claiming it, else
+   `POST /agents/credential` naming it). 200 proves ownership; 404 refutes it.
+   Only on a proof does the real `POST <coord>/pr-merge/labels` go out,
+   recording the label in `coord.pr_labels` with `source='coord_skill'`.
+
+Why step 3 exists: on a device bound to several tenants the worktree row is
+often stamped with the wrong one, and coord's own ownership check
+(`COORD_LABEL_INGEST_OWNERSHIP_MODE`) defaults to `shadow`, which writes under
+it anyway. Measured 2026-09-23: `coord:stacked-on=` rows written under
+meryts-2-0 for `qontinui/*` PRs, and cross-repo `upstream-of`/`downstream-of`
+refused as "not registered to this tenant". Same class as
+qontinui-claude-config#1104 (`handoff-stuck-pr.sh`).
 
 The skill validates the label against the namespace before either call
 fires, so invalid labels never make it to GitHub or coord.
@@ -107,8 +122,12 @@ reference — the summary above is sufficient).
 - **Agent ID** (resolved automatically) — the skill reads
   `$QONTINUI_AGENT_ID` from the environment. This is set by the
   agent-spawn flow; if absent the skill exits with an explanation.
-- **Coord URL** — defaults to `http://localhost:9870`; override via
-  `$COORD_URL`.
+- **Coord URL** — defaults to `https://coord.qontinui.io`; override via
+  `$COORD_URL` (then `$COORD_HTTP_URL`).
+- **Device identity** (for the ownership proof) — `$QONTINUI_MACHINE_ID`, else
+  `~/.qontinui/machine.json`; a fresh `$COORD_DEVICE_JWT` or
+  `~/.qontinui/coord-device-jwt` is used only when its `tenant_id` claim is the
+  write tenant.
 - **`--dry-run`** (optional) — validate the label (namespace grammar +
   GitHub's 50-character ceiling) and exit without touching GitHub or coord.
   `$QONTINUI_AGENT_ID` is not required for a dry run. Because it sends nothing
@@ -364,6 +383,20 @@ key it is not.
 Neither form ever says the label *does not exist* — a dry run sent nothing and
 has no evidence either way, and reporting an already-created label as absent
 would be a fresh mis-signpost rather than a fix.
+
+When the write tenant is refuted, or its ownership cannot be proven (no device
+id, no credential claiming that tenant, a failed door, or coord's `enforce` arm
+answering 422 `repo_not_owned_by_tenant`), the coord row is **withheld** and the
+skill exits **5**:
+
+```
+WITHHELD: coord.pr_labels row NOT written -- the write tenant <uuid> does NOT own <repo> (...)
+```
+
+Nothing is lost: the GitHub label is already applied and is the canonical copy,
+and coord's merge ordering reads the dependency edge from it. To also record the
+`coord_skill` row, use a `QONTINUI_AGENT_ID` allocated under the tenant that
+owns the repo. Exit 5 never means UNKNOWN was treated as ownership.
 
 On a coord-side error, prints the coord response + exits non-zero. The
 GitHub-side label add still succeeds first — if you need to remove

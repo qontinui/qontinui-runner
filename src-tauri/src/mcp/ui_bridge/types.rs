@@ -270,8 +270,17 @@ pub struct DiscoverStatesRequest {
 
 /// Machine-readable error codes for UI Bridge operations.
 /// Enables AI agents to match on error type rather than parsing strings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// This is the ONLY declaration of the vocabulary. The GraphQL surface
+/// (`graphql::types::UiBridgeErrorCode`, published in `graphql/schema.graphql`)
+/// is a re-export of this very type via the `async_graphql::Enum` derive, so a
+/// variant added here reaches GraphQL clients with no second list to update.
+/// The GraphQL value names and the serde wire names are both
+/// SCREAMING_SNAKE_CASE; `ui_bridge_error_code_graphql_names_equal_serde_wire_names`
+/// (`graphql/schema.rs`) pins that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, async_graphql::Enum)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[graphql(rename_items = "SCREAMING_SNAKE_CASE")]
 pub enum UiBridgeErrorCode {
     // Transport errors
     Timeout,
@@ -669,6 +678,14 @@ impl UiBridgeError {
     }
 }
 
+/// The readiness gate's serialized diagnostics body, recognised STRUCTURALLY:
+/// `Some(body)` only when `error_msg` parses as a JSON object whose top-level
+/// `error` is exactly `"frontend_not_ready"`.
+fn readiness_diagnostics_body(error_msg: &str) -> Option<serde_json::Value> {
+    let body: serde_json::Value = serde_json::from_str(error_msg).ok()?;
+    (body.get("error").and_then(|v| v.as_str()) == Some("frontend_not_ready")).then_some(body)
+}
+
 /// Classify a transport-level error string into a structured error.
 /// Used by wrap_ipc_result and batch handler to convert legacy string errors.
 /// Checks both transport-level and assertion-level patterns so that frontend
@@ -682,12 +699,25 @@ pub fn classify_transport_error(error_msg: &str) -> UiBridgeError {
     if let Some(typed) = typed_frontend_code(error_msg) {
         return typed;
     }
-    // Transport-level errors
-    if error_msg.contains("did not become ready") {
-        // Try to parse the diagnostics JSON that gather_readiness_diagnostics produced
-        let diagnostics = serde_json::from_str::<serde_json::Value>(error_msg)
-            .unwrap_or_else(|_| serde_json::json!({"raw": error_msg}));
+    // Transport-level errors.
+    //
+    // The readiness gate (`request::ui_bridge_request_sync_in_window`) fails
+    // with the SERIALIZED `gather_readiness_diagnostics` body,
+    // `{"error":"frontend_not_ready","diagnostics":{…}}` — it never contains
+    // the prose "did not become ready" (only its serialization-failure
+    // fallback does), so matching the prose alone classified every real
+    // readiness timeout as `INTERNAL_ERROR` (HTTP 500) instead of
+    // `FRONTEND_NOT_READY` (503). The match is STRUCTURAL — the message must
+    // parse as a JSON object whose top-level `error` is exactly
+    // `"frontend_not_ready"` — because this classifier also runs over
+    // frontend refusal prose, and `page_evaluate` forwards user-thrown error
+    // strings verbatim: a substring test would turn
+    // `SyntaxError: "frontend_not_ready" is not valid JSON` into a readiness
+    // failure with a retry hint.
+    if let Some(diagnostics) = readiness_diagnostics_body(error_msg) {
         UiBridgeError::frontend_not_ready(diagnostics)
+    } else if error_msg.contains("did not become ready") {
+        UiBridgeError::frontend_not_ready(serde_json::json!({ "raw": error_msg }))
     } else if error_msg.contains("timed out") {
         UiBridgeError::timeout(0)
     } else if error_msg.contains("circuit breaker") {
@@ -818,7 +848,7 @@ pub fn typed_frontend_code_by_name(code_name: &str, message: &str) -> Option<UiB
         .iter()
         .find(|(name, _)| *name == code_name)
         .map(|(_, code)| UiBridgeError {
-            code: code.clone(),
+            code: *code,
             message: message.to_string(),
             recovery: Some(recovery_hint_for(code)),
             context: None,
@@ -839,7 +869,7 @@ pub fn typed_frontend_code(error_msg: &str) -> Option<UiBridgeError> {
         if let Some(rest) = error_msg.strip_prefix(prefix) {
             if rest.starts_with(": ") {
                 return Some(UiBridgeError {
-                    code: code.clone(),
+                    code: *code,
                     message: error_msg.to_string(),
                     recovery: Some(recovery_hint_for(code)),
                     context: None,
@@ -1174,5 +1204,48 @@ mod typed_frontend_code_tests {
         );
         assert_eq!(code_of("the request timed out"), "TIMEOUT");
         assert_eq!(code_of("circuit breaker is open"), "CIRCUIT_BREAKER_OPEN");
+    }
+}
+
+#[cfg(test)]
+mod readiness_classification_tests {
+    use super::*;
+
+    /// The real readiness-gate failure: the serialized diagnostics body.
+    #[test]
+    fn serialized_readiness_diagnostics_classify_as_frontend_not_ready() {
+        let body = serde_json::json!({
+            "error": "frontend_not_ready",
+            "diagnostics": { "sdk_connected": false, "hint": "x" }
+        });
+        let err = classify_transport_error(&serde_json::to_string(&body).unwrap());
+        assert!(matches!(err.code, UiBridgeErrorCode::FrontendNotReady));
+        assert_eq!(err.context, Some(body));
+    }
+
+    /// The serialization-failure fallback prose still classifies.
+    #[test]
+    fn readiness_fallback_prose_still_classifies() {
+        let err = classify_transport_error(
+            "UI Bridge: Frontend did not become ready within 10s (diagnostics serialization failed)",
+        );
+        assert!(matches!(err.code, UiBridgeErrorCode::FrontendNotReady));
+    }
+
+    /// Negative control: a user-thrown error that merely MENTIONS the token
+    /// (page_evaluate forwards these verbatim) is not a readiness failure.
+    #[test]
+    fn prose_mentioning_the_token_is_not_frontend_not_ready() {
+        for msg in [
+            r#"SyntaxError: "frontend_not_ready" is not valid JSON"#,
+            r#"{"error":"something_else","note":"frontend_not_ready"}"#,
+            r#"["frontend_not_ready"]"#,
+        ] {
+            let err = classify_transport_error(msg);
+            assert!(
+                !matches!(err.code, UiBridgeErrorCode::FrontendNotReady),
+                "{msg} must not classify as FRONTEND_NOT_READY"
+            );
+        }
     }
 }

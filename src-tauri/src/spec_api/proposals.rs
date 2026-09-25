@@ -1119,6 +1119,10 @@ fn mint_proposal_id() -> String {
 /// `pathname_to_spec_id` helper owned by `workflow_generation::spec_authoring`.
 /// If the sibling makes that helper `pub(crate)`, this should be deleted in
 /// favor of calling it directly.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn infer_target_spec_id(_app_id: &str, elem: &RegisteredElement) -> Option<String> {
     let file = elem.file.replace('\\', "/");
 

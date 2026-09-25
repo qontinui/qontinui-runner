@@ -26,6 +26,7 @@ import {
 } from "lucide-react";
 import { getWrapper, getWrapperStatus, startWrapper, stopWrapper } from "@/lib/wrappers/api";
 import type { InstalledWrapper, WrapperStatus } from "@/lib/wrappers/types";
+import { wrapperLifecycleControl, wrapperStatusFromInfo } from "@/lib/wrappers/status";
 import { StatusBadge } from "@/components/wrappers/StatusBadge";
 import { TransportBadge } from "@/components/wrappers/TransportBadge";
 import { ActionsTab } from "./ActionsTab";
@@ -75,7 +76,7 @@ export function WrapperDetailPage({
   const refreshStatus = useCallback(async () => {
     try {
       const s = await getWrapperStatus(wrapperId);
-      setStatus(s.status ?? "unknown");
+      setStatus(wrapperStatusFromInfo(s));
     } catch {
       setStatus("unknown");
     }
@@ -94,12 +95,14 @@ export function WrapperDetailPage({
     return () => window.clearInterval(id);
   }, [refreshStatus]);
 
-  const isRunning = status === "running" || status === "degraded";
+  // Stop for a live process (running OR degraded); routability is stated by
+  // the status badge, which reads "Degraded — not routable".
+  const offersStop = wrapperLifecycleControl(status) === "stop";
 
   const handleToggle = async () => {
     setBusy(true);
     try {
-      if (isRunning) {
+      if (offersStop) {
         await stopWrapper(wrapperId);
       } else {
         await startWrapper(wrapperId);
@@ -174,7 +177,7 @@ export function WrapperDetailPage({
                     {wrapper.manifest.displayName ?? wrapper.id}
                   </h1>
                   <p className="text-xs text-muted-foreground font-mono truncate">
-                    {wrapper.packageName}
+                    {wrapper.package_name}
                     <span className="ml-1 text-muted-foreground/70">v{wrapper.version}</span>
                   </p>
                 </div>
@@ -182,19 +185,19 @@ export function WrapperDetailPage({
                   onClick={handleToggle}
                   disabled={busy}
                   className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors disabled:opacity-50 ${
-                    isRunning
+                    offersStop
                       ? "border border-border bg-card text-foreground hover:bg-muted/30"
                       : "bg-gradient-to-r from-cyan-600 to-purple-600 text-white hover:from-cyan-500 hover:to-purple-500"
                   }`}
                 >
                   {busy ? (
                     <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                  ) : isRunning ? (
+                  ) : offersStop ? (
                     <Square className="w-3.5 h-3.5" />
                   ) : (
                     <Play className="w-3.5 h-3.5" />
                   )}
-                  {isRunning ? "Stop" : "Start"}
+                  {offersStop ? "Stop" : "Start"}
                 </button>
               </div>
               <div className="mt-3 flex items-center gap-2 flex-wrap">

@@ -111,6 +111,10 @@ const AUTO_COMPACT_MARKER: &str = "until auto-compact:";
 /// closed on relaunch — the every-K-cycles backstop in the lifecycle policy
 /// still bounds context growth, so a missed marker only delays the relaunch,
 /// it never wedges the loop).
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn snapshot_context_low(lines: &[String], threshold_pct: u32) -> bool {
     for line in lines {
         let lower = line.to_ascii_lowercase();
@@ -132,6 +136,10 @@ pub fn snapshot_context_low(lines: &[String], threshold_pct: u32) -> bool {
 
 /// Parse the first `N%` in `s` (skipping leading whitespace/noise up to the
 /// first digit run). `None` when no `digits + '%'` shape is present.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn parse_leading_percentage(s: &str) -> Option<u32> {
     let start = s.find(|c: char| c.is_ascii_digit())?;
     let rest = &s[start..];

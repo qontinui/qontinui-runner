@@ -975,6 +975,10 @@ fn extract_pyproject_deps(text: &str) -> HashSet<String> {
 
 /// Extract a package name from a PEP 508 requirement string (the part before any
 /// version specifier, extras, marker, or whitespace).
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn requirement_name(req: &str) -> String {
     let idx = req
         .find(|c: char| matches!(c, '>' | '<' | '=' | '!' | '~' | ';' | '[') || c.is_whitespace());

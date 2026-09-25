@@ -1563,20 +1563,124 @@ pub(crate) fn select_device_bearer(
     tenant: Option<&Uuid>,
     default_tenant: Option<Uuid>,
 ) -> Option<String> {
+    select_device_bearer_result(am, tenant, default_tenant).ok()
+}
+
+/// Whether a token found in the LEGACY `access_token` slot may be presented as
+/// tenant `t`'s credential, where `t` is the device's default binding (plan
+/// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`,
+/// re-review F2 then P2).
+///
+/// - A `tenant_id` claim decides outright: it must be `t`. A claim naming
+///   another tenant is never `t`'s credential.
+/// - A token with NO claim (a pairing that predates the claim) is accepted only
+///   where no other tenant could be its owner: the per-tenant slot store was
+///   READ and holds no slot for `t` (so the legacy slot is `t`'s only route),
+///   AND this device's binding count was MEASURED as exactly one. On a
+///   multi-binding device a claimless token's tenant is unknowable, and it is
+///   refused. Accepting one warns once that a re-pair is due.
+///
+/// `binding_count` is injected ([`measured_device_binding_count`] in
+/// production). This path FAILS CLOSED: unlike the D2 degrade rule, whose
+/// [`device_binding_count`] reads every unreadable state as one, an unreadable,
+/// unparseable or malformed `paired_user.json` is
+/// [`MeasuredBindingCount::Unknown`] here and the claimless token is refused.
+/// Presenting a token of unknown ownership as `t`'s is the cross-tenant write
+/// this plan exists to close; a re-pair (which writes a claim) is the recovery.
+pub(crate) fn legacy_token_serves_tenant(
+    am: &AuthManager,
+    token: &str,
+    t: &Uuid,
+    binding_count: MeasuredBindingCount,
+) -> bool {
+    match jwt_tenant_claim(token) {
+        Some(claim) => claim == *t,
+        None => {
+            let slot_free = matches!(
+                am.try_list_tenant_device_jwt_tenants(),
+                Ok(slots) if !slots.contains(t)
+            );
+            let accepted = slot_free && binding_count == MeasuredBindingCount::Measured(1);
+            if accepted {
+                CLAIMLESS_LEGACY_WARNED.call_once(|| {
+                    warn!(
+                        "coord data-plane: the default device-JWT slot holds a token with no \
+                         tenant_id claim; presenting it for the device's single binding {t}. \
+                         Re-pair this runner so its credential names its tenant — on a device \
+                         with more than one binding such a token is refused"
+                    );
+                });
+            }
+            accepted
+        }
+    }
+}
+
+/// Gate so the claimless-legacy-token warning is logged at most once per process.
+static CLAIMLESS_LEGACY_WARNED: std::sync::Once = std::sync::Once::new();
+
+/// [`select_device_bearer`] with the device's measured binding count injected.
+pub(crate) fn select_device_bearer_with(
+    am: &AuthManager,
+    tenant: Option<&Uuid>,
+    default_tenant: Option<Uuid>,
+    binding_count: MeasuredBindingCount,
+) -> Option<String> {
+    select_device_bearer_result_with(am, tenant, default_tenant, binding_count).ok()
+}
+
+/// [`select_device_bearer`], keeping the CAUSE of a miss instead of discarding
+/// it — ONE implementation, two shapes.
+///
+/// The request path takes the `.ok()` wrapper above because a request has
+/// nothing to do with a cause; a DIAGNOSTIC takes this one. That split is the
+/// point: the reads that decide the miss are the reads that name it, in the
+/// same call, so there is no second copy of the fall-through to drift from
+/// this one and no window between deciding and classifying for the refresher
+/// to land a slot in.
+///
+/// It replaced a pure mirror (`no_credential_cause`) that re-derived the cause
+/// from a SECOND set of slot reads taken a moment later. Two defects came with
+/// that shape and both dissolve here: the mirror could disagree with the
+/// selector with nothing to catch it, and the second read could observe a slot
+/// the refresher had since made `Usable` — rendering *"no credential (sent
+/// anonymously; slot usable)"*, a cause contradicting the line it sits on.
+/// Neither is expressible now: `Usable` returns `Ok`, so no `Err` this
+/// function builds can carry it.
+pub(crate) fn select_device_bearer_result(
+    am: &AuthManager,
+    tenant: Option<&Uuid>,
+    default_tenant: Option<Uuid>,
+) -> Result<String, NoCredential> {
+    select_device_bearer_result_with(am, tenant, default_tenant, measured_device_binding_count())
+}
+
+/// [`select_device_bearer_result`] with the device's MEASURED binding count
+/// injected — THE implementation every other shape and arity above delegates
+/// to, so the typed cause and the injected count can never be decided by two
+/// bodies.
+pub(crate) fn select_device_bearer_result_with(
+    am: &AuthManager,
+    tenant: Option<&Uuid>,
+    default_tenant: Option<Uuid>,
+    binding_count: MeasuredBindingCount,
+) -> Result<String, NoCredential> {
     let Some(t) = tenant else {
-        return legacy_slot_bearer(am);
+        return legacy_slot_bearer(am).map_err(NoCredential::Slot);
     };
     // Routed through [`read_tenant_slot`] so this selector and every REPORTER
     // of "can this device act in tenant T" apply one predicate. They did not:
     // `pair::reconcile_paired_bindings_with` tested non-empty PRESENCE, so a
     // bound tenant whose slot had EXPIRED was reported as workable while this
     // function had refused it since Phase 1a. See [`credential_state`].
-    match read_tenant_slot(am, t) {
+    let read = read_tenant_slot(am, t);
+    let own = read.state();
+    match read {
         // VALIDITY, not presence (Phase 1a). A slot that holds an expired or
         // opaque token is a MISS and falls through below exactly as an absent
         // slot does — never returned verbatim for the proxy to forward into a
         // 401 the caller sees only as "Command failed with no output".
-        SlotRead::Usable(jwt) => return Some(jwt),
+        SlotRead::Usable(jwt) => return Ok(jwt),
         SlotRead::PresentButDead => warn_once_per_tenant_dead_slot(t),
         SlotRead::Absent => {}
         SlotRead::Unreadable(e) => {
@@ -1585,29 +1689,50 @@ pub(crate) fn select_device_bearer(
     }
     // Slot miss. The default binding may legitimately live only in the
     // legacy slot (pre-8a install, or a pairing that predates per-tenant
-    // slots) — that slot IS this tenant's JWT, so fall back to it.
+    // slots), so fall back to it — but only to a token that is `t`'s by
+    // [`legacy_token_serves_tenant`]. The legacy slot holds whatever was last
+    // written there, and a binding file that says A beside a slot holding B's
+    // token would otherwise present B's credential as A's (plan
+    // 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential,
+    // re-review F2/P2).
     if default_tenant.as_ref() == Some(t) {
-        return legacy_slot_bearer(am);
+        return match legacy_slot_bearer(am) {
+            Ok(jwt) => {
+                if legacy_token_serves_tenant(am, &jwt, t, binding_count) {
+                    Ok(jwt)
+                } else {
+                    Err(NoCredential::DefaultBindingClaimMismatch {
+                        own,
+                        claimed: jwt_tenant_claim(&jwt),
+                    })
+                }
+            }
+            Err(legacy) => Err(NoCredential::DefaultBindingFallback { own, legacy }),
+        };
     }
     warn_once_per_tenant_slot_miss(t);
-    None
+    Err(NoCredential::Slot(own))
 }
 
 /// Read the legacy `access_token` slot (the DEFAULT binding's JWT) with the
 /// original never-fatal posture + once-per-process missing-token warning.
-fn legacy_slot_bearer(am: &AuthManager) -> Option<String> {
+///
+/// `Err` carries the [`SlotState`] that decided the miss, so a caller
+/// diagnosing a refusal names the read this function actually took rather
+/// than one of its own.
+fn legacy_slot_bearer(am: &AuthManager) -> Result<String, SlotState> {
     match read_legacy_slot(am) {
         // Same validity gate as the per-tenant slot (Phase 1a): a dead default
         // credential must degrade to "no bearer" — which the proxy answers with
         // a typed refreshing/refusal status — rather than being forwarded.
-        SlotRead::Usable(token) => Some(token),
+        SlotRead::Usable(token) => Ok(token),
         SlotRead::PresentButDead => {
             DEAD_LEGACY_SLOT_WARNED.call_once(|| {
                 warn!(
                     "coord data-plane: the default device-JWT slot holds an expired or                      opaque token — treating it as ABSENT and sending coord calls                      unauthenticated rather than forwarding a credential coord will                      reject; the refresher re-mints it, or re-pair this runner"
                 );
             });
-            None
+            Err(SlotState::PresentButDead)
         }
         SlotRead::Absent => {
             MISSING_TOKEN_WARNED.call_once(|| {
@@ -1616,7 +1741,7 @@ fn legacy_slot_bearer(am: &AuthManager) -> Option<String> {
                      sending coord calls unauthenticated; pair this runner to authenticate"
                 );
             });
-            None
+            Err(SlotState::Absent)
         }
         SlotRead::Unreadable(e) => {
             MISSING_TOKEN_WARNED.call_once(|| {
@@ -1625,7 +1750,7 @@ fn legacy_slot_bearer(am: &AuthManager) -> Option<String> {
                      sending coord calls unauthenticated; pair this runner to authenticate"
                 );
             });
-            None
+            Err(SlotState::Unreadable)
         }
     }
 }
@@ -1792,10 +1917,26 @@ impl TenantCredential {
 /// fallback that function applies when the requested tenant is the default
 /// binding. Omitting that arm is not a simplification — it would report a
 /// device unable to act in a tenant the selector serves happily.
+///
+/// `default_slot_serves` is the second half of that fallback arm, and it is an
+/// INPUT rather than a state because deciding it needs the token itself: the
+/// selector admits the legacy slot for the default binding only when that
+/// token is that binding's credential by [`legacy_token_serves_tenant`] — its
+/// `tenant_id` claim names the tenant, or it carries no claim on a device
+/// MEASURED to hold one binding with no slot of its own for that tenant (plan
+/// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`, P2).
+/// A `Usable` legacy slot is therefore NOT on its own enough to report "can
+/// act": callers compute this with [`legacy_slot_serves_default_tenant`], the
+/// one place that predicate lives, so the report and the selector cannot drift
+/// apart again. Reporting the looser answer would tell an operator a device can
+/// work a tenant whose write the selector refuses — the disagreement
+/// `credential_state_agrees_with_select_device_bearer_on_every_slot_state`
+/// exists to catch.
 pub fn credential_state(
     slot: SlotState,
     is_default: bool,
     default_slot: SlotState,
+    default_slot_serves: bool,
 ) -> TenantCredential {
     // A measured "cannot act" is only measurable when the tenant's own read
     // established something; an `Unreadable` slot with no usable fallback
@@ -1820,11 +1961,16 @@ pub fn credential_state(
         return no_fallback;
     }
     match default_slot {
-        SlotState::Usable => TenantCredential {
+        // Usable AND this tenant's: the selector hands it out. Usable but NOT
+        // this tenant's (a claim naming another tenant, or an unclaimed token
+        // on a device that cannot state one binding) is a measured refusal,
+        // exactly as the selector's `.filter(…)` makes it.
+        SlotState::Usable if default_slot_serves => TenantCredential {
             slot,
             selectable: Some(true),
             via_default_slot: true,
         },
+        SlotState::Usable => no_fallback,
         // Neither slot established anything.
         SlotState::Unreadable => TenantCredential {
             slot,
@@ -1857,8 +2003,24 @@ pub fn credential_state(
 /// exists beside the `unwrap_or_default` collapse.)
 ///
 /// The legacy `access_token` slot holds the DEFAULT binding's JWT (D4), so it
-/// is folded into the answer for the default tenant and for no other —
-/// exactly as [`select_device_bearer`] and [`credential_state`] do.
+/// is folded into the answer for the default tenant and for no other — the same
+/// SHAPE [`select_device_bearer`] and [`credential_state`] use.
+///
+/// **It deliberately stops short of their rule, and the divergence is the whole
+/// point of the split.** Those two now also require the legacy token to be the
+/// default binding's — its `tenant_id` claim must name it, or the claimless arm
+/// of [`legacy_token_serves_tenant`] must admit it — which is why
+/// `credential_state` grew a fourth input (`default_slot_serves`) and this
+/// function did not. This question is "is a `paired_user.json` `bindings` ENTRY
+/// warranted?", and that is warranted by the PAIRING RECORD, not by whichever
+/// token happens to be sitting in the slot: a binding whose token is rotted,
+/// claimless, or momentarily another tenant's is still a binding this device
+/// holds, and the refresher's job — not the reconciler's — is to heal it.
+/// Feeding `default_slot_serves` in here would make a claim-check drop binding
+/// rows, which is the destructive direction. So the two answers differ on
+/// purpose, in the same direction the `PresentButDead` divergence already goes
+/// (see the paragraph above), and `credential_state` remains the only one of
+/// the two that may promise a session can act.
 pub fn holds_credential_for(
     slot: SlotState,
     is_default: bool,
@@ -1882,6 +2044,27 @@ pub fn holds_credential_for(
             (_, SlotState::Absent) => Some(false),
             (_, SlotState::Unreadable) => None,
         },
+    }
+}
+
+/// Does the LEGACY slot's token serve the device's default binding — the
+/// `default_slot_serves` input [`credential_state`] takes.
+///
+/// One place, so a report and [`select_device_bearer`] cannot answer it
+/// differently: it applies [`legacy_token_serves_tenant`] with the device's
+/// MEASURED binding count, which is the same call the selector's legacy
+/// fallback makes. `false` whenever there is nothing to serve with (no usable
+/// token) or nobody to serve (no bound default tenant).
+pub(crate) fn legacy_slot_serves_default_tenant(
+    am: &AuthManager,
+    legacy: &SlotRead,
+    default_tenant: Option<&Uuid>,
+) -> bool {
+    match (legacy, default_tenant) {
+        (SlotRead::Usable(token), Some(t)) => {
+            legacy_token_serves_tenant(am, token, t, measured_device_binding_count())
+        }
+        _ => false,
     }
 }
 
@@ -1938,6 +2121,157 @@ pub(crate) enum BindingTenantRead {
     /// The read or the parse FAILED, or the file names something that is not a
     /// UUID. Nothing was established.
     Unknown,
+}
+
+/// Every tenant this runner holds a coord device credential for — ONE definition
+/// shared by the spawn/provision-session tenant admission (plan
+/// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P1/P2)
+/// and the device-token door's "is a tenant-less answer ambiguous?" refusal (P3),
+/// so the two can never disagree about what the runner holds.
+///
+/// A credential is held for a tenant through either route
+/// [`select_device_bearer`] can serve it from: the tenant's own `device_jwt:<t>`
+/// slot, or the legacy `access_token` slot — which belongs to the DEFAULT
+/// binding, so it counts for that tenant only when the slot actually holds a
+/// JWT-shaped value. Counting slots alone missed a default binding that lives
+/// only in the legacy slot: a runner holding that plus ONE other tenant slot
+/// read as single-tenant, and a tenant-less door call silently answered the
+/// default tenant's token.
+#[derive(Debug, Clone)]
+pub(crate) struct HeldDeviceTenants {
+    /// The per-tenant slot enumeration; `Err` = the store could not be read.
+    pub(crate) slots: std::result::Result<Vec<Uuid>, String>,
+    /// The default binding (`paired_user.json`).
+    pub(crate) default_binding: BindingTenantRead,
+    /// Whether the legacy slot holds a JWT that is the DEFAULT binding's
+    /// credential by [`legacy_token_serves_tenant`] — its claim names the
+    /// binding, or it carries no claim on a device MEASURED to hold one binding
+    /// and no slot for that tenant — not merely a JWT (re-review F2: a B token in the slot
+    /// beside an A binding is NOT A's credential). `Ok(false)` when there is no bound default to name. `Err` =
+    /// the slot could not be read.
+    pub(crate) legacy_slot: std::result::Result<bool, String>,
+}
+
+/// Why [`HeldDeviceTenants`] could not establish an answer. Each is UNKNOWN,
+/// never an empty set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HeldTenantsUnknown {
+    /// The per-tenant slot store could not be read.
+    SlotStore(String),
+    /// `paired_user.json` could not be read, so whose the legacy slot is — and
+    /// whether the default binding is one of the held tenants — is unknown.
+    DefaultBinding,
+    /// The legacy slot could not be read.
+    LegacySlot(String),
+}
+
+impl std::fmt::Display for HeldTenantsUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HeldTenantsUnknown::SlotStore(e) => {
+                write!(f, "the per-tenant credential slots could not be read ({e})")
+            }
+            HeldTenantsUnknown::DefaultBinding => {
+                write!(
+                    f,
+                    "the default-binding record (paired_user.json) could not be read"
+                )
+            }
+            HeldTenantsUnknown::LegacySlot(e) => {
+                write!(f, "the default credential slot could not be read ({e})")
+            }
+        }
+    }
+}
+
+impl HeldDeviceTenants {
+    /// Read all three inputs from `am` and the live default-binding probe.
+    pub(crate) fn read(am: &AuthManager) -> Self {
+        Self::read_with(am, default_binding_tenant_probe())
+    }
+
+    /// [`Self::read`] with the default binding injected (tests).
+    pub(crate) fn read_with(am: &AuthManager, default_binding: BindingTenantRead) -> Self {
+        Self::read_with_count(am, default_binding, measured_device_binding_count())
+    }
+
+    /// [`Self::read_with`] with the device's measured binding count injected
+    /// (tests).
+    pub(crate) fn read_with_count(
+        am: &AuthManager,
+        default_binding: BindingTenantRead,
+        binding_count: MeasuredBindingCount,
+    ) -> Self {
+        use crate::secure_storage::StoredTokenRead;
+        Self {
+            slots: am
+                .try_list_tenant_device_jwt_tenants()
+                .map_err(|e| format!("{e:#}")),
+            default_binding,
+            legacy_slot: match am.probe_access_token() {
+                StoredTokenRead::Present(token) => Ok(match default_binding {
+                    BindingTenantRead::Bound(d) => {
+                        looks_like_jwt(&token)
+                            && legacy_token_serves_tenant(am, &token, &d, binding_count)
+                    }
+                    BindingTenantRead::Unbound | BindingTenantRead::Unknown => false,
+                }),
+                StoredTokenRead::Absent => Ok(false),
+                StoredTokenRead::Unreadable(e) => Err(e),
+            },
+        }
+    }
+
+    /// The held set: the slot tenants ∪ {the default binding, when the legacy
+    /// slot holds a credential}. Any input that could not be read is `Err` —
+    /// an Unknown default binding included, because it is not a count.
+    pub(crate) fn set(
+        &self,
+    ) -> std::result::Result<std::collections::BTreeSet<Uuid>, HeldTenantsUnknown> {
+        let mut held: std::collections::BTreeSet<Uuid> = self
+            .slots
+            .clone()
+            .map_err(HeldTenantsUnknown::SlotStore)?
+            .into_iter()
+            .collect();
+        match self.default_binding {
+            BindingTenantRead::Unknown => return Err(HeldTenantsUnknown::DefaultBinding),
+            BindingTenantRead::Bound(d) => {
+                if self
+                    .legacy_slot
+                    .clone()
+                    .map_err(HeldTenantsUnknown::LegacySlot)?
+                {
+                    held.insert(d);
+                }
+            }
+            BindingTenantRead::Unbound => {}
+        }
+        Ok(held)
+    }
+
+    /// Does this runner hold a credential for `tenant`? A positive read on
+    /// either route answers `true` even when the other route is unreadable;
+    /// `false` requires every route that could hold it to have been read.
+    pub(crate) fn holds(&self, tenant: Uuid) -> std::result::Result<bool, HeldTenantsUnknown> {
+        if matches!(&self.slots, Ok(slots) if slots.contains(&tenant)) {
+            return Ok(true);
+        }
+        if self.default_binding == BindingTenantRead::Bound(tenant) {
+            match &self.legacy_slot {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(e) => return Err(HeldTenantsUnknown::LegacySlot(e.clone())),
+            }
+        }
+        if let Err(e) = &self.slots {
+            return Err(HeldTenantsUnknown::SlotStore(e.clone()));
+        }
+        if self.default_binding == BindingTenantRead::Unknown {
+            return Err(HeldTenantsUnknown::DefaultBinding);
+        }
+        Ok(false)
+    }
 }
 
 /// The device's DEFAULT binding tenant, read from `paired_user.json`
@@ -2019,22 +2353,94 @@ pub(crate) fn default_binding_tenant_in(base: &std::path::Path) -> BindingTenant
 /// Kept as a local minimal reader for the same reason [`default_binding_tenant`]
 /// is: `auth` compiles into BOTH the lib and bin crates while `pair` is
 /// lib-only.
+///
+/// It reads [`binding_count_from_value`], NOT the stricter
+/// [`measured_binding_count_from_value`]: the two parsers diverge on a
+/// `bindings` array holding an entry that is not an object with a string
+/// `tenant_id`, and moving this call site onto the strict one would turn a
+/// 2-binding device into a 1-binding device — the D2 degrade rule would then
+/// present the DEFAULT binding's credential where it used to send nothing, the
+/// silent wrong-tenant write this module refuses. The strict parser is the
+/// claimless-legacy-token input and nothing else.
 pub(crate) fn device_binding_count() -> usize {
-    let Some(base) = std::env::var("QONTINUI_SECURE_STORAGE_DIR")
+    match read_paired_user_value() {
+        Some(value) => binding_count_from_value(&value),
+        None => 1,
+    }
+}
+
+/// `paired_user.json` as JSON, or `None` when there is no storage dir, no file,
+/// or the file does not parse. The one file read both binding-count parsers
+/// share; each classifies the absence its own way.
+fn read_paired_user_value() -> Option<serde_json::Value> {
+    let base = std::env::var("QONTINUI_SECURE_STORAGE_DIR")
         .ok()
         .filter(|s| !s.is_empty())
         .map(std::path::PathBuf::from)
-        .or_else(|| dirs::data_local_dir().map(|d| d.join("com.qontinui.runner")))
-    else {
-        return 1;
-    };
-    let Ok(bytes) = std::fs::read(base.join("paired_user.json")) else {
-        return 1;
-    };
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return 1;
-    };
-    binding_count_from_value(&value)
+        .or_else(|| dirs::data_local_dir().map(|d| d.join("com.qontinui.runner")))?;
+    let bytes = std::fs::read(base.join("paired_user.json")).ok()?;
+    serde_json::from_slice::<serde_json::Value>(&bytes).ok()
+}
+
+/// The device's binding count as MEASURED from `paired_user.json`, with an
+/// unreadable state kept distinct from a count.
+///
+/// This is the claimless-legacy-token rule's input and nothing else
+/// ([`legacy_token_serves_tenant`]); the D2 degrade rule and the plan adapter's
+/// gate read [`device_binding_count`], which parses the same file LOOSELY and
+/// reads every unreadable state as one. That rule may not treat Unknown as one,
+/// because there "one" is permission to present a token of unstated ownership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MeasuredBindingCount {
+    /// A well-formed file stated this many bindings.
+    Measured(usize),
+    /// No storage dir, no file, an unparseable file, or a shape that states no
+    /// binding count (see [`measured_binding_count_from_value`]).
+    Unknown,
+}
+
+/// Read `paired_user.json` and measure its binding count; every failure to read
+/// or parse is [`MeasuredBindingCount::Unknown`].
+///
+/// Its ONE call site family is the claimless-legacy-token rule
+/// ([`legacy_token_serves_tenant`], through [`select_device_bearer`] and
+/// [`HeldDeviceTenants`]). The D2 degrade rule and the plan adapter's gate read
+/// [`device_binding_count`] instead.
+pub(crate) fn measured_device_binding_count() -> MeasuredBindingCount {
+    match read_paired_user_value() {
+        Some(value) => measured_binding_count_from_value(&value),
+        None => MeasuredBindingCount::Unknown,
+    }
+}
+
+/// The parse half of [`measured_device_binding_count`].
+///
+/// - A `bindings` key that is a NON-EMPTY array whose EVERY entry is a valid
+///   binding (an object with a string `tenant_id`): the number of entries.
+/// - A `bindings` key that is anything else (empty, a string, a number, or an
+///   array holding any entry that is not a valid binding — `[7]`, `[{}]`):
+///   `Unknown` — a half-written or malformed v2 file states no count.
+/// - No `bindings` key, and a legacy v1 `tenant_id` string: one (the v1 shape
+///   can only ever name one binding).
+/// - Otherwise `Unknown`.
+pub(crate) fn measured_binding_count_from_value(value: &serde_json::Value) -> MeasuredBindingCount {
+    match value.get("bindings") {
+        Some(b) => match b.as_array() {
+            Some(arr)
+                if !arr.is_empty()
+                    && arr
+                        .iter()
+                        .all(|e| e.get("tenant_id").and_then(|v| v.as_str()).is_some()) =>
+            {
+                MeasuredBindingCount::Measured(arr.len())
+            }
+            _ => MeasuredBindingCount::Unknown,
+        },
+        None if value.get("tenant_id").and_then(|v| v.as_str()).is_some() => {
+            MeasuredBindingCount::Measured(1)
+        }
+        None => MeasuredBindingCount::Unknown,
+    }
 }
 
 /// The parse half of [`device_binding_count`], split out so the v2/legacy
@@ -2043,16 +2449,18 @@ pub(crate) fn device_binding_count() -> usize {
 /// A `bindings` array that is present but EMPTY falls through to the legacy
 /// shape rather than reporting zero — `effective_bindings` does the same, and
 /// an empty array is an unpaired or half-written file, not a statement that the
-/// device holds no tenant.
+/// device holds no tenant. This count is deliberately LOOSER than
+/// [`measured_binding_count_from_value`], and it is what [`device_binding_count`]
+/// — the D2 degrade rule and the plan adapter's gate — actually calls: it counts
+/// array entries without validating them, and every other shape is one, which is
+/// the failure direction those two rules chose. A malformed 2-entry array
+/// therefore still counts as TWO here and degrades, while the strict parser
+/// calls it Unknown and refuses a claimless token.
 pub(crate) fn binding_count_from_value(value: &serde_json::Value) -> usize {
     if let Some(arr) = value.get("bindings").and_then(|v| v.as_array()) {
         if !arr.is_empty() {
             return arr.len();
         }
-    }
-    // Legacy single-entry shape: one binding iff it names a tenant at all.
-    if value.get("tenant_id").and_then(|v| v.as_str()).is_some() {
-        return 1;
     }
     1
 }
@@ -2205,16 +2613,31 @@ pub(crate) fn select_scoped_bearer_lazy(
     default_tenant: Option<Uuid>,
     binding_count: impl FnOnce() -> usize,
 ) -> Option<String> {
+    select_scoped_bearer_lazy_result(am, scope, default_tenant, binding_count).ok()
+}
+
+/// [`select_scoped_bearer_lazy`], keeping the CAUSE of a miss — the shape
+/// [`presented_tenant`] consumes. See [`select_device_bearer_result`] for why
+/// the cause is carried out of the decision rather than re-derived after it.
+pub(crate) fn select_scoped_bearer_lazy_result(
+    am: &AuthManager,
+    scope: TenantScope,
+    default_tenant: Option<Uuid>,
+    binding_count: impl FnOnce() -> usize,
+) -> Result<String, NoCredential> {
     match scope {
-        TenantScope::Owned(t) => select_device_bearer(am, Some(&t), default_tenant),
-        TenantScope::Device => select_device_bearer(am, None, default_tenant),
+        TenantScope::Owned(t) => select_device_bearer_result(am, Some(&t), default_tenant),
+        TenantScope::Device => select_device_bearer_result(am, None, default_tenant),
         TenantScope::Unresolved => {
             let count = binding_count();
             if count > 1 {
                 warn_once_unresolved_on_multi_bound(count);
-                return None;
+                // NOT an absence — a refusal, taken BEFORE any slot was read.
+                // The count is the one this arm actually branched on, so the
+                // diagnostic cannot name a different one.
+                return Err(NoCredential::UnresolvedOnMultiBound { bindings: count });
             }
-            select_device_bearer(am, None, default_tenant)
+            select_device_bearer_result(am, None, default_tenant)
         }
     }
 }
@@ -2228,6 +2651,171 @@ pub fn device_bearer_scoped(scope: TenantScope) -> Option<String> {
         default_binding_tenant(),
         device_binding_count,
     )
+}
+
+/// The one fact about a resolved credential that a diagnostic may say out
+/// loud: which tenant it claims, or that there is no credential at all.
+///
+/// Exists so a caller diagnosing a coord `401`/`403` can name the mismatch
+/// — *"asked about T, presented a credential for X"* — without ever touching
+/// the token itself. See [`presented_tenant`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentedTenant {
+    /// No usable credential resolved, so the request goes out
+    /// UNAUTHENTICATED. On a tenant-scoped read this is the fail-closed
+    /// slot MISS — never another tenant's credential.
+    ///
+    /// Carries WHY. [`select_device_bearer`] reaches `None` from four states
+    /// it ALREADY models as [`SlotState`], and they want four different
+    /// operator actions; a bare "no credential" forces the reader to pick
+    /// one, which is how a diagnostic ends up asserting a cause it never
+    /// measured. See [`NoCredential`].
+    Anonymous(NoCredential),
+    /// A credential resolved, but it carries no `tenant_id` claim — a JWT
+    /// coord minted without it.
+    ///
+    /// An opaque `qontinui_runner_*` bearer does NOT reach this arm, though
+    /// it is the first thing a reader expects to: this function only ever
+    /// sees tokens [`select_device_bearer`] returned, both slot readers gate
+    /// on [`slot_jwt_is_usable`], and that requires a decodable `exp`. An
+    /// opaque token is therefore [`SlotRead::PresentButDead`] — a miss —
+    /// and renders as [`PresentedTenant::Anonymous`], never as this.
+    Untenanted,
+    /// A credential claiming this tenant resolved.
+    Tenant(Uuid),
+}
+
+/// Why [`presented_tenant`] resolved NO credential — the operator-action
+/// axis, kept out of the one-line collapse it would otherwise vanish into.
+///
+/// The four `None` paths through [`select_device_bearer`] are not one
+/// condition: an `Absent` slot was never issued (bind/mint one), a
+/// `PresentButDead` slot lapsed and the refresher re-derives it with no
+/// operator action at all, an `Unreadable` store is UNKNOWN and wants
+/// repair, and an unresolved scope on a multi-bound device never read a slot
+/// in the first place. [`SlotState`] and its [`SlotState::label`] already
+/// exist for exactly this distinction and the coord doctor already prints
+/// them; this carries the same value to a log line.
+///
+/// **No PRODUCTION path builds one carrying [`SlotState::Usable`].** That is
+/// an invariant of the four construction sites, not of the type: this enum is
+/// `pub` with public variants and [`SlotState`] is public, so
+/// `NoCredential::Slot(SlotState::Usable)` is constructible by any caller, and
+/// the tests in `coord_sync` already build `Slot(..)` values by hand. What the
+/// four sites share is the reason — [`select_device_bearer_result`] (three) and
+/// [`select_scoped_bearer_lazy_result`] (one) build a cause only where a read
+/// did NOT yield a token, the `Usable` arm having already returned `Ok` — so
+/// the contradiction *"no credential (sent anonymously; slot usable)"* cannot
+/// be reported by the request path. It WAS reported while the cause came from
+/// a SECOND set of reads taken after the decision, which the refresher could
+/// land a slot in between; pinned by
+/// `the_reported_cause_is_the_selectors_own_reads`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoCredential {
+    /// The state of the slot whose read decided the miss — T's own slot for
+    /// [`TenantScope::Owned`], the legacy `access_token` slot otherwise.
+    Slot(SlotState),
+    /// The queried tenant IS this device's default binding, so
+    /// [`select_device_bearer`] read T's own slot, missed, and fell through
+    /// to the legacy `access_token` slot — which missed too. BOTH states are
+    /// carried because either can be the one to act on, and choosing between
+    /// them here would be the same unmeasured guess this type exists to stop.
+    DefaultBindingFallback { own: SlotState, legacy: SlotState },
+    /// The queried tenant IS this device's default binding and the legacy
+    /// `access_token` slot holds a USABLE token — but that token is not the
+    /// queried tenant's by [`legacy_token_serves_tenant`]: its `tenant_id`
+    /// claim names someone else, or it carries no claim on a device where the
+    /// claimless rule cannot admit it. Presenting it would forward another
+    /// tenant's token under this tenant's name: a silent cross-tenant write
+    /// rather than a refusal (plan
+    /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`,
+    /// re-review F2/P2). NOT a slot state — the slot is `Usable`; what missed
+    /// is the token's claim to be this tenant's. `claimed` is `None` for a
+    /// claimless token, which is UNKNOWN ownership, never "no owner".
+    DefaultBindingClaimMismatch {
+        own: SlotState,
+        claimed: Option<Uuid>,
+    },
+    /// [`TenantScope::Unresolved`] on a device holding more than one
+    /// binding: [`select_scoped_bearer_lazy`] refuses BEFORE reading any
+    /// slot, so no slot state was measured. Not an absence — a refusal.
+    UnresolvedOnMultiBound { bindings: usize },
+}
+
+impl std::fmt::Display for NoCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NoCredential::Slot(s) => write!(f, "slot {}", s.label()),
+            NoCredential::DefaultBindingFallback { own, legacy } => write!(
+                f,
+                "slot {}, and this device's DEFAULT binding, whose legacy slot is {}",
+                own.label(),
+                legacy.label()
+            ),
+            NoCredential::DefaultBindingClaimMismatch { own, claimed } => write!(
+                f,
+                "slot {}, and this device's DEFAULT binding, whose legacy slot holds a \
+                 usable token claiming {} — not this tenant, so it is not a credential \
+                 for it",
+                own.label(),
+                claimed.map_or_else(|| "no tenant".to_string(), |t| t.to_string())
+            ),
+            NoCredential::UnresolvedOnMultiBound { bindings } => write!(
+                f,
+                "no slot read at all — the scope named no tenant on a device holding \
+                 {bindings} bindings, so the resolver refused rather than guess"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for PresentedTenant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PresentedTenant::Anonymous(why) => {
+                write!(f, "no credential (sent anonymously; {why})")
+            }
+            PresentedTenant::Untenanted => f.write_str("a credential with no tenant_id claim"),
+            PresentedTenant::Tenant(t) => write!(f, "a credential for tenant {t}"),
+        }
+    }
+}
+
+/// What [`attach_device_auth_for`] WOULD present for `scope`, reduced to
+/// [`PresentedTenant`] — a diagnostic read, not a second credential path.
+///
+/// **The token never leaves this function.** It is resolved, its `tenant_id`
+/// claim is decoded (unverified — [`jwt_tenant_claim`]), and the token is
+/// dropped; only the claim is returned. That is the whole reason this lives
+/// here rather than at the call site that wants to log the mismatch.
+///
+/// **ONE resolution, not two.** It calls the SAME resolver the request path
+/// calls, in its cause-carrying shape ([`select_scoped_bearer_lazy_result`]),
+/// and matches its `Err` straight through. It does not re-read the slots to
+/// work out why: the reads that decided the miss are the ones reported, so
+/// there is no mirror to drift, no second set of reads to pay for, and no
+/// window in which the refresher can make a slot `Usable` between the
+/// decision and its explanation. An earlier revision did re-read, and could
+/// render *"no credential (sent anonymously; slot usable)"* — a cause
+/// implying a credential was presentable, on a line whose whole subject is
+/// that none was.
+///
+/// Costs local encrypted-file reads, so call it when reporting a refusal,
+/// not on every pass of a loop.
+pub fn presented_tenant(scope: TenantScope) -> PresentedTenant {
+    let am = AuthManager::new();
+    match select_scoped_bearer_lazy_result(
+        &am,
+        scope,
+        default_binding_tenant(),
+        device_binding_count,
+    ) {
+        Ok(token) => match jwt_tenant_claim(&token) {
+            Some(t) => PresentedTenant::Tenant(t),
+            None => PresentedTenant::Untenanted,
+        },
+        Err(why) => PresentedTenant::Anonymous(why),
+    }
 }
 
 /// Warn once per process that an unresolved-tenant write degraded to
@@ -3140,6 +3728,16 @@ mod bearer_selection_tests {
         format!("{header}.{payload}.sig")
     }
 
+    /// A live JWT naming `tenant`, stored ONLY in the legacy `access_token`
+    /// slot: the write mirrors into `device_jwt:<tenant>`, which is cleared so
+    /// the legacy fallback is what a lookup actually reaches.
+    fn store_legacy_only(mgr: &AuthManager, tenant: &Uuid) -> String {
+        let jwt = jwt_with_tenant(tenant, chrono::Utc::now().timestamp() + 3 * 60 * 60);
+        mgr.store_tokens(&jwt, "").unwrap();
+        mgr.clear_tenant_device_jwt(tenant).unwrap();
+        jwt
+    }
+
     fn jwt_for(tag: &str, exp: i64) -> String {
         use base64::Engine as _;
         let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -3161,8 +3759,17 @@ mod bearer_selection_tests {
     /// (`!jwt.trim().is_empty()`) while [`select_device_bearer`] had refused
     /// it since Phase 1a. Driving both over one real store is what stops a
     /// future edit re-opening that gap.
+    ///
+    /// HERMETIC by construction: the selector's legacy fallback consults the
+    /// device's binding count, which `measured_device_binding_count` reads from
+    /// `paired_user.json` — so without a fixture this test would answer
+    /// differently on a paired box and on CI, and pin neither. The isolated
+    /// ambient pins it to a device stating ONE binding, the shape where the
+    /// legacy fallback is admissible at all.
     #[test]
     fn credential_state_agrees_with_select_device_bearer_on_every_slot_state() {
+        let amb = crate::test_env::isolated_ambient();
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
         let expired = jwt_for("expired", chrono::Utc::now().timestamp() - 3600);
         let slot_cases: Vec<(&str, Option<String>)> = vec![
             ("usable", Some(live_jwt("slot"))),
@@ -3192,15 +3799,32 @@ mod bearer_selection_tests {
                         mgr.store_tokens(j, "").unwrap();
                     }
                     let default_tenant = Some(if is_default { t } else { stranger });
+                    // A device stating exactly ONE binding, the default one.
+                    // Written per cell because `default_tenant` moves with it.
+                    std::fs::write(
+                        amb.dir().join("paired_user.json"),
+                        serde_json::json!({
+                            "default_tenant_id": default_tenant.unwrap().to_string(),
+                            "bindings": [{"tenant_id": default_tenant.unwrap().to_string()}]
+                        })
+                        .to_string(),
+                    )
+                    .unwrap();
 
                     // What the SELECTOR does — the thing that actually stops a
                     // session working.
                     let selected = select_device_bearer(&mgr, Some(&t), default_tenant);
                     // What a REPORT would say, through the shared rule.
+                    let legacy_read = read_legacy_slot(&mgr);
                     let cred = credential_state(
                         read_tenant_slot(&mgr, &t).state(),
                         default_tenant == Some(t),
-                        read_legacy_slot(&mgr).state(),
+                        legacy_read.state(),
+                        legacy_slot_serves_default_tenant(
+                            &mgr,
+                            &legacy_read,
+                            default_tenant.as_ref(),
+                        ),
                     );
 
                     assert_eq!(
@@ -3265,7 +3889,7 @@ mod bearer_selection_tests {
     #[test]
     fn credential_state_keeps_an_unreadable_slot_unknown() {
         // Non-default tenant, nothing readable about it.
-        let c = credential_state(SlotState::Unreadable, false, SlotState::Usable);
+        let c = credential_state(SlotState::Unreadable, false, SlotState::Usable, true);
         assert_eq!(
             c.can_act(),
             None,
@@ -3273,21 +3897,48 @@ mod bearer_selection_tests {
         );
         // Default tenant whose own slot is unreadable but whose legacy slot
         // is usable: the selector WOULD serve it, so this is a measured yes.
-        let c = credential_state(SlotState::Unreadable, true, SlotState::Usable);
+        let c = credential_state(SlotState::Unreadable, true, SlotState::Usable, true);
+        assert_eq!(c.can_act(), Some(true));
+        assert!(c.via_default_slot);
+        // ...and the same cell where that token is NOT this binding's
+        // credential (a claim naming another tenant, or an unclaimed token on a
+        // device that cannot state one binding) loses the fallback: with the
+        // tenant's OWN slot unreadable, nothing is established either way, so
+        // this stays UNKNOWN rather than becoming a measured no.
+        let c = credential_state(SlotState::Unreadable, true, SlotState::Usable, false);
+        assert_eq!(
+            c.can_act(),
+            None,
+            "a legacy slot that does not serve this binding cannot rescue an unreadable slot"
+        );
+        assert!(!c.via_default_slot);
+        // With the own slot MEASURED absent, the same non-serving legacy token
+        // is a measured NO — which is exactly what the selector's filter does,
+        // and the cell that would report "can act" if the serves term were
+        // dropped.
+        let c = credential_state(SlotState::Absent, true, SlotState::Usable, false);
+        assert_eq!(
+            c.can_act(),
+            Some(false),
+            "a usable legacy slot that does not serve this binding is not a credential for it"
+        );
+        assert!(!c.via_default_slot);
+        // ...and serving it is what makes the same cell a yes.
+        let c = credential_state(SlotState::Absent, true, SlotState::Usable, true);
         assert_eq!(c.can_act(), Some(true));
         assert!(c.via_default_slot);
         // Default tenant, both unreadable: still nothing established.
         assert_eq!(
-            credential_state(SlotState::Unreadable, true, SlotState::Unreadable).can_act(),
+            credential_state(SlotState::Unreadable, true, SlotState::Unreadable, false).can_act(),
             None
         );
         // A measured absence on both is a measured no.
         assert_eq!(
-            credential_state(SlotState::Absent, true, SlotState::Absent).can_act(),
+            credential_state(SlotState::Absent, true, SlotState::Absent, false).can_act(),
             Some(false)
         );
         // A usable own slot never needs (or claims) the fallback.
-        let c = credential_state(SlotState::Usable, true, SlotState::Usable);
+        let c = credential_state(SlotState::Usable, true, SlotState::Usable, true);
         assert_eq!(c.can_act(), Some(true));
         assert!(!c.via_default_slot);
     }
@@ -3335,14 +3986,421 @@ mod bearer_selection_tests {
         );
     }
 
+    /// Re-review F2. The legacy slot is served for the default binding ONLY when
+    /// its token names that binding: a binding file saying A beside a legacy
+    /// slot holding B's token, or a token with no `tenant_id` claim, is no
+    /// bearer for A — never B's credential presented as A's.
+    #[test]
+    fn the_legacy_fallback_never_presents_another_tenants_token_as_the_default() {
+        let mgr = create_test_auth_manager("legacy_fallback_claim_mismatch");
+        let (a, b) = (tenant(0x41), tenant(0x42));
+        store_legacy_only(&mgr, &b);
+        assert_eq!(select_device_bearer(&mgr, Some(&a), Some(a)), None);
+        // A claimless legacy token is not A's either on a two-binding device
+        // (the single-binding case is the P2 test below).
+        mgr.store_tokens(&live_jwt("claimless"), "").unwrap();
+        assert_eq!(
+            select_device_bearer_with(&mgr, Some(&a), Some(a), MeasuredBindingCount::Measured(2)),
+            None
+        );
+        // The tenant-less caller still reads the legacy slot as before.
+        assert!(select_device_bearer(&mgr, None, Some(a)).is_some());
+    }
+
+    /// Re-review F2 on the admission side: the held set counts the legacy slot
+    /// for the default binding only when the token names it, and an unreadable
+    /// legacy slot is UNKNOWN for both `holds` and `set`.
+    #[test]
+    fn held_tenants_count_the_legacy_slot_only_for_the_tenant_it_names() {
+        let mgr = create_test_auth_manager("held_tenants_legacy_claim");
+        let (a, b) = (tenant(0x51), tenant(0x52));
+        store_legacy_only(&mgr, &b);
+        let held = HeldDeviceTenants::read_with(&mgr, BindingTenantRead::Bound(a));
+        assert_eq!(held.legacy_slot, Ok(false));
+        assert_eq!(held.holds(a), Ok(false));
+        assert!(held.set().unwrap().is_empty());
+        let named = HeldDeviceTenants::read_with(&mgr, BindingTenantRead::Bound(b));
+        assert_eq!(named.holds(b), Ok(true));
+
+        let unreadable = HeldDeviceTenants {
+            slots: Ok(vec![]),
+            default_binding: BindingTenantRead::Bound(a),
+            legacy_slot: Err("io".into()),
+        };
+        assert_eq!(
+            unreadable.holds(a),
+            Err(HeldTenantsUnknown::LegacySlot("io".into()))
+        );
+        assert_eq!(
+            unreadable.set(),
+            Err(HeldTenantsUnknown::LegacySlot("io".into()))
+        );
+        // ...but a slot for the tenant still answers `true` beside it.
+        let slotted = HeldDeviceTenants {
+            slots: Ok(vec![a]),
+            ..unreadable
+        };
+        assert_eq!(slotted.holds(a), Ok(true));
+    }
+
+    /// Re-review P2. A CLAIMLESS legacy token is served for the default binding
+    /// on a single-binding device whose slot store holds nothing for it, and
+    /// refused on a two-binding device; a claim naming another tenant is refused
+    /// whatever the binding count. The held set agrees in every case.
+    #[test]
+    fn a_claimless_legacy_token_is_served_only_on_a_single_binding_device() {
+        const ONE: MeasuredBindingCount = MeasuredBindingCount::Measured(1);
+        const TWO: MeasuredBindingCount = MeasuredBindingCount::Measured(2);
+        let mgr = create_test_auth_manager("claimless_legacy_single_binding");
+        let (a, b) = (tenant(0x61), tenant(0x62));
+        let claimless = live_jwt("claimless");
+        mgr.store_tokens(&claimless, "").unwrap();
+
+        assert_eq!(
+            select_device_bearer_with(&mgr, Some(&a), Some(a), ONE).as_deref(),
+            Some(claimless.as_str()),
+            "single binding, no slot for a: the claimless token is a's"
+        );
+        assert_eq!(
+            HeldDeviceTenants::read_with_count(&mgr, BindingTenantRead::Bound(a), ONE).holds(a),
+            Ok(true)
+        );
+        assert_eq!(
+            select_device_bearer_with(&mgr, Some(&a), Some(a), TWO),
+            None,
+            "two bindings: a claimless token's tenant is unknowable"
+        );
+        assert_eq!(
+            HeldDeviceTenants::read_with_count(&mgr, BindingTenantRead::Bound(a), TWO).holds(a),
+            Ok(false)
+        );
+
+        store_legacy_only(&mgr, &b);
+        assert_eq!(
+            select_device_bearer_with(&mgr, Some(&a), Some(a), ONE),
+            None,
+            "a claim naming b is never a's, even on a single binding"
+        );
+        assert_eq!(
+            HeldDeviceTenants::read_with_count(&mgr, BindingTenantRead::Bound(a), ONE).holds(a),
+            Ok(false)
+        );
+    }
+
+    /// Re-re-review should-fix: the claimless rule FAILS CLOSED. A binding count
+    /// that could not be measured — an unreadable file, or a v2 file whose
+    /// `bindings` is empty or not an array — is not "one", and a claimless
+    /// legacy token is refused, while the D2 degrade count still reads one.
+    #[test]
+    fn a_claimless_legacy_token_is_refused_when_the_binding_count_is_unknown() {
+        let mgr = create_test_auth_manager("claimless_legacy_unknown_count");
+        let a = tenant(0x71);
+        mgr.store_tokens(&live_jwt("claimless"), "").unwrap();
+        assert_eq!(
+            select_device_bearer_with(&mgr, Some(&a), Some(a), MeasuredBindingCount::Unknown),
+            None
+        );
+        assert_eq!(
+            HeldDeviceTenants::read_with_count(
+                &mgr,
+                BindingTenantRead::Bound(a),
+                MeasuredBindingCount::Unknown
+            )
+            .holds(a),
+            Ok(false)
+        );
+
+        for (v, what) in [
+            (
+                serde_json::json!({"bindings": "not-an-array"}),
+                "a string bindings",
+            ),
+            (
+                serde_json::json!({"bindings": []}),
+                "an empty bindings array",
+            ),
+            (
+                serde_json::json!({"bindings": [], "tenant_id": a.to_string()}),
+                "an empty bindings array beside a v1 tenant_id",
+            ),
+            (serde_json::json!({"bindings": 7}), "a numeric bindings"),
+            (serde_json::json!({"user_id": "u"}), "no binding at all"),
+            (
+                serde_json::json!({"tenant_id": 7}),
+                "a non-string v1 tenant_id",
+            ),
+        ] {
+            let measured = measured_binding_count_from_value(&v);
+            assert_eq!(measured, MeasuredBindingCount::Unknown, "{what}: {v}");
+            assert_eq!(
+                binding_count_from_value(&v),
+                1,
+                "D2's own parser - the one device_binding_count calls - still \
+                 reads one: {what}"
+            );
+            assert_eq!(
+                select_device_bearer_with(&mgr, Some(&a), Some(a), measured),
+                None,
+                "{what}: a claimless token must be refused"
+            );
+        }
+        // Nit (b): an array entry that is not a valid binding (an object with a
+        // string `tenant_id`) makes the STRICT count Unknown - and D2's own
+        // parser still counts the entries, which is where the two readings
+        // diverge. A malformed 2-entry array is TWO bindings to the degrade
+        // rule (so it degrades) and Unknown to the claimless rule (so it
+        // refuses); collapsing it to one would present the default binding's
+        // credential on a device that states two.
+        for (v, what, d2) in [
+            (
+                serde_json::json!({"bindings": [7]}),
+                "a non-object binding entry",
+                1usize,
+            ),
+            (
+                serde_json::json!({"bindings": [{}]}),
+                "a binding entry with no tenant_id",
+                1,
+            ),
+            (
+                serde_json::json!({"bindings": [{"tenant_id": a.to_string()}, {"tenant_id": 7}]}),
+                "one valid entry beside a numeric tenant_id",
+                2,
+            ),
+            (
+                serde_json::json!({"bindings": [7, 8]}),
+                "two non-object binding entries",
+                2,
+            ),
+        ] {
+            let measured = measured_binding_count_from_value(&v);
+            assert_eq!(measured, MeasuredBindingCount::Unknown, "{what}: {v}");
+            assert_eq!(
+                binding_count_from_value(&v),
+                d2,
+                "{what}: D2 counts the entries it was given"
+            );
+            assert_eq!(
+                select_device_bearer_with(&mgr, Some(&a), Some(a), measured),
+                None,
+                "{what}: a claimless token must be refused"
+            );
+        }
+        assert_eq!(
+            measured_binding_count_from_value(&serde_json::json!({"tenant_id": a.to_string()})),
+            MeasuredBindingCount::Measured(1),
+            "the legacy v1 shape states exactly one binding"
+        );
+        assert_eq!(
+            measured_binding_count_from_value(
+                &serde_json::json!({"bindings": [{"tenant_id": a.to_string()}]})
+            ),
+            MeasuredBindingCount::Measured(1)
+        );
+    }
+
+    /// The production reader: a missing, unreadable or unparseable
+    /// `paired_user.json` is `Unknown`; a well-formed single binding is one.
+    #[test]
+    fn the_measured_device_binding_count_reads_unreadable_files_as_unknown() {
+        let amb = crate::test_env::isolated_ambient();
+        let path = amb.dir().join("paired_user.json");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            measured_device_binding_count(),
+            MeasuredBindingCount::Unknown
+        );
+        assert_eq!(device_binding_count(), 1);
+        std::fs::write(&path, b"{not json").unwrap();
+        assert_eq!(
+            measured_device_binding_count(),
+            MeasuredBindingCount::Unknown
+        );
+        std::fs::write(&path, br#"{"bindings": "x"}"#).unwrap();
+        assert_eq!(
+            measured_device_binding_count(),
+            MeasuredBindingCount::Unknown
+        );
+        std::fs::write(&path, br#"{"bindings": []}"#).unwrap();
+        assert_eq!(
+            measured_device_binding_count(),
+            MeasuredBindingCount::Unknown
+        );
+        // A directory where the file should be: the read fails.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(
+            measured_device_binding_count(),
+            MeasuredBindingCount::Unknown
+        );
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(
+            &path,
+            br#"{"bindings": [{"tenant_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            measured_device_binding_count(),
+            MeasuredBindingCount::Measured(1)
+        );
+        assert_eq!(device_binding_count(), 1);
+    }
+
+    /// THE WIRING, pinned against the FILE: the two readers of `paired_user.json`
+    /// must stay on their own parsers. A malformed 2-entry array is TWO bindings
+    /// to [`device_binding_count`] (the D2 degrade rule and the plan adapter's
+    /// gate) and Unknown to the claimless-token rule. Reading D2 through the
+    /// strict parser makes this device single-bound and hands out the default
+    /// binding's credential — the silent wrong-tenant write. Its own test, so a
+    /// failure here names the wiring rather than the reader.
+    #[test]
+    fn the_two_binding_count_readers_stay_on_their_own_parsers() {
+        let amb = crate::test_env::isolated_ambient();
+        std::fs::write(
+            amb.dir().join("paired_user.json"),
+            br#"{"bindings": [{"tenant_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}, {"tenant_id": 7}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            device_binding_count(),
+            2,
+            "D2 counts the entries of a malformed array"
+        );
+        assert_eq!(
+            measured_device_binding_count(),
+            MeasuredBindingCount::Unknown,
+            "the claimless rule refuses to read a count from it"
+        );
+    }
+
+    /// W3, the symmetric twin of W1: [`select_device_bearer`] (and
+    /// [`HeldDeviceTenants::read_with`] beside it) call
+    /// [`measured_device_binding_count`], and every other test IN THIS MODULE
+    /// drives them through the injected-count doors or stores a token carrying
+    /// a claim, so `legacy_token_serves_tenant` settles on the claim and never
+    /// reaches the count. (`commands::auth`'s door test
+    /// `a_named_tenant_never_gets_a_legacy_token_that_names_another_tenant`
+    /// reaches the same wiring INDIRECTLY, through the door; this is the test
+    /// that names it.) [`HeldDeviceTenants::read_with`] is exercised elsewhere —
+    /// directly by `held_tenants_count_the_legacy_slot_only_for_the_tenant_it_names`
+    /// and indirectly by every door test through its `held()` helper — but this
+    /// is the only test where read_with's [`measured_device_binding_count`] term
+    /// DECIDES the answer: everywhere else the token carries a claim, so
+    /// `legacy_token_serves_tenant` settles before the count is consulted, and
+    /// the door test's named-tenant branch reads `held.slots` rather than
+    /// `held.legacy_slot`. A rewiring in the other direction —
+    /// `MeasuredBindingCount::Measured(device_binding_count())` — compiles, and
+    /// the malformed file then reads as ONE binding, which accepts a claimless
+    /// token whose owner is unknowable and presents it as `t`'s credential.
+    ///
+    /// The file here holds ONE malformed entry on purpose, and it is W1's exact
+    /// mirror: a shape the loose parser counts (1) and the strict one refuses to
+    /// count at all (`Unknown`), which is where admission diverges. A malformed
+    /// TWO-entry file is refused under BOTH readings — loose 2, strict
+    /// `Unknown`, neither of them `Measured(1)` — so it would not see the
+    /// rewiring at all.
+    #[test]
+    fn select_device_bearer_refuses_a_claimless_token_on_an_unmeasurable_binding_file() {
+        let amb = crate::test_env::isolated_ambient();
+        // See the note in the W1 test above: never the real OS keychain.
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        let a = tenant(0xC6);
+        let mgr = AuthManager::new();
+        let claimless = live_jwt("claimless");
+        mgr.store_tokens(&claimless, "").unwrap();
+        mgr.clear_tenant_device_jwt(&a).unwrap();
+        std::fs::write(
+            amb.dir().join("paired_user.json"),
+            serde_json::json!({
+                "default_tenant_id": a.to_string(),
+                "bindings": [{"tenant_id": 7}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(device_binding_count(), 1, "the LOOSE count reads one here");
+        assert_eq!(
+            measured_device_binding_count(),
+            MeasuredBindingCount::Unknown,
+            "...and the strict one refuses to state a count at all"
+        );
+        assert_eq!(
+            select_device_bearer(&mgr, Some(&a), Some(a)),
+            None,
+            "a claimless legacy token must not be served on a file whose binding \
+             count cannot be measured"
+        );
+        assert_eq!(
+            HeldDeviceTenants::read_with(&mgr, BindingTenantRead::Bound(a)).holds(a),
+            Ok(false),
+            "and the held set agrees through the same reader"
+        );
+        // The counterfactual: a WELL-FORMED single-binding file is what serves
+        // that same token, so the refusal above is the count and nothing else.
+        std::fs::write(
+            amb.dir().join("paired_user.json"),
+            serde_json::json!({
+                "default_tenant_id": a.to_string(),
+                "bindings": [{"tenant_id": a.to_string()}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            select_device_bearer(&mgr, Some(&a), Some(a)).as_deref(),
+            Some(claimless.as_str())
+        );
+    }
+
+    /// W1: [`device_bearer_scoped`] is the PRODUCTION site that hands
+    /// [`device_binding_count`] to [`select_scoped_bearer_lazy`], and nothing
+    /// else observes that connection — every other test injects its own
+    /// closure. The file states two bindings in the malformed shape where the
+    /// two parsers diverge — the strict one calls it Unknown, which a rewiring
+    /// would collapse to ONE — so an Unresolved-scope call must present
+    /// nothing, while a Device-scope call still presents the legacy slot.
+    #[test]
+    fn device_bearer_scoped_degrades_on_a_devices_own_two_binding_file() {
+        let amb = crate::test_env::isolated_ambient();
+        // NEVER the real OS credential store. AuthManager::new() keys the
+        // keychain on the fixed real SERVICE_NAME, and store_tokens writes it
+        // unless this is set; isolated_ambient captures the variable but does
+        // not set it, so on a paired Windows box this test would overwrite the
+        // runner's own keychain backup — the documented recovery when the .enc
+        // store will not decrypt. Safe here: the fixture holds env_lock and has
+        // already captured this key for restore.
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        let a = tenant(0xC5);
+        let am = AuthManager::new();
+        let jwt = live_jwt("default-binding");
+        am.store_tokens(&jwt, "").unwrap();
+        std::fs::write(
+            amb.dir().join("paired_user.json"),
+            serde_json::json!({
+                "default_tenant_id": a.to_string(),
+                "bindings": [{"tenant_id": a.to_string()}, {"tenant_id": 7}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            device_bearer_scoped(TenantScope::Unresolved),
+            None,
+            "an Unresolved write on a two-binding device must send no bearer"
+        );
+        assert!(
+            device_bearer_scoped(TenantScope::Device).is_some(),
+            "a Device-scoped call still presents the legacy slot"
+        );
+    }
+
     /// DEFAULT-tenant slot miss falls back to the legacy slot — the legacy
     /// slot holds the same binding's JWT (pre-8a installs have only it).
     #[test]
     fn default_tenant_slot_miss_falls_back_to_legacy_slot() {
         let mgr = create_test_auth_manager("default_miss_legacy_fallback");
-        let default_jwt = live_jwt("default.jwt");
-        mgr.store_tokens(&default_jwt, "").unwrap();
         let a = tenant(0xC3);
+        let default_jwt = store_legacy_only(&mgr, &a);
         // No per-tenant slot stored for `a`, but `a` IS the default binding.
         assert_eq!(
             select_device_bearer(&mgr, Some(&a), Some(a)).as_deref(),
@@ -3385,9 +4443,8 @@ mod bearer_selection_tests {
     #[test]
     fn a_slotless_non_default_tenant_gets_no_bearer_even_beside_a_live_legacy_slot() {
         let mgr = create_test_auth_manager("sweep_invariant_slotless_stranger");
-        let legacy = live_jwt("legacy.jwt");
-        mgr.store_tokens(&legacy, "").unwrap();
         let stranger = tenant(0xC7);
+        let legacy = store_legacy_only(&mgr, &stranger);
 
         assert_eq!(
             select_device_bearer(&mgr, Some(&stranger), None),
@@ -3411,9 +4468,8 @@ mod bearer_selection_tests {
     #[test]
     fn empty_slot_value_counts_as_miss() {
         let mgr = create_test_auth_manager("empty_slot_is_miss");
-        let default_jwt = live_jwt("default.jwt");
-        mgr.store_tokens(&default_jwt, "").unwrap();
         let a = tenant(0xF6);
+        let default_jwt = store_legacy_only(&mgr, &a);
         mgr.store_tenant_device_jwt(&a, "   ").unwrap();
 
         assert_eq!(
@@ -3621,6 +4677,442 @@ mod bearer_selection_tests {
         assert_eq!(TenantScope::Unresolved.declared_tenant(), None);
     }
 
+    /// THE TENANT-POLICY POLL'S SITUATION, as measured on the operator box on
+    /// 2026-09-17: a device bound to several tenants, whose legacy
+    /// `access_token` slot holds the DEFAULT binding's JWT, polling
+    /// `/tenant-policy?tenant_id=<a NON-default tenant>`.
+    ///
+    /// `Device` — what the defaulting `coord_get` wrapper asserts — hands back
+    /// the default binding's credential, so the request names one tenant and
+    /// carries another's. Coord's `sessions::get_tenant_policy` requires those
+    /// to be EQUAL, so it answers `403 auth_required` — the same body an
+    /// unauthenticated caller gets, which is why the runner read it for months
+    /// as "not paired yet" and advised a pairing flow it cannot reach.
+    ///
+    /// `Owned(queried)` is the fix, and this pins BOTH of its arms: the hit
+    /// presents the queried tenant's own slot, and the MISS presents NOTHING
+    /// rather than substituting the legacy one. That no-substitution rule is
+    /// the isolation guarantee, so a "fix" that fell back to the default slot
+    /// would be the original bug under a new name.
+    ///
+    /// Plan
+    /// `2026-09-17-device-holds-one-credential-slot-so-a-session-cannot-work-a-bound-tenant`
+    /// P3.
+    #[test]
+    fn the_tenant_policy_polls_scope_diverges_from_the_default_slot() {
+        let mgr = create_test_auth_manager("scope_tenant_policy_poll");
+        let default_tenant = tenant(0xD1);
+        let default_jwt = live_jwt("default.binding.jwt");
+        mgr.store_tokens(&default_jwt, "").unwrap();
+
+        // A non-default tenant this device DOES hold a slot for.
+        let held = tenant(0xD2);
+        let held_jwt = live_jwt("held.tenant.jwt");
+        mgr.store_tenant_device_jwt(&held, &held_jwt).unwrap();
+
+        // The defaulting wrapper's scope: the DEFAULT binding's credential,
+        // whatever tenant the query names. This is the defect.
+        assert_eq!(
+            select_scoped_bearer(&mgr, TenantScope::Device, Some(default_tenant), 3).as_deref(),
+            Some(default_jwt.as_str()),
+            "TenantScope::Device presents the legacy/default slot regardless of the query"
+        );
+
+        // The poll's scope: the credential for the tenant being asked about.
+        assert_eq!(
+            select_scoped_bearer(&mgr, TenantScope::Owned(held), Some(default_tenant), 3)
+                .as_deref(),
+            Some(held_jwt.as_str()),
+            "Owned(t) must present t's own slot — the equality coord checks"
+        );
+        assert_ne!(
+            select_scoped_bearer(&mgr, TenantScope::Owned(held), Some(default_tenant), 3),
+            select_scoped_bearer(&mgr, TenantScope::Device, Some(default_tenant), 3),
+            "the two scopes must diverge here, or the fix would be inert"
+        );
+
+        // A bound tenant with NO usable slot — the state the plan measured on
+        // this very box. Fail-closed: nothing, never the legacy slot.
+        let slotless = tenant(0xD3);
+        assert_eq!(
+            select_scoped_bearer(&mgr, TenantScope::Owned(slotless), Some(default_tenant), 3),
+            None,
+            "a slot MISS must stay a miss — substituting the default binding's credential is \
+             the cross-tenant presentation this scope exists to prevent"
+        );
+    }
+
+    /// The diagnostic the poll's refusal report is built on: it names the
+    /// tenant a credential CLAIMS, and it never yields the token.
+    #[test]
+    fn presented_tenant_reports_the_claim_and_the_absence() {
+        let t = tenant(0xD4);
+        let jwt = jwt_with_tenant(&t, chrono::Utc::now().timestamp() + 3 * 60 * 60);
+        assert_eq!(jwt_tenant_claim(&jwt), Some(t));
+
+        assert_eq!(
+            PresentedTenant::Tenant(t).to_string(),
+            format!("a credential for tenant {t}")
+        );
+        assert_eq!(
+            PresentedTenant::Anonymous(NoCredential::Slot(SlotState::Absent)).to_string(),
+            "no credential (sent anonymously; slot absent)"
+        );
+        assert_eq!(
+            PresentedTenant::Untenanted.to_string(),
+            "a credential with no tenant_id claim"
+        );
+        // Whatever it renders, it must never be the token.
+        for p in [
+            PresentedTenant::Anonymous(NoCredential::Slot(SlotState::Absent)),
+            PresentedTenant::Untenanted,
+            PresentedTenant::Tenant(t),
+        ] {
+            assert!(
+                !p.to_string().contains(&jwt),
+                "a credential diagnostic must never render the token itself"
+            );
+        }
+    }
+
+    /// MUTATION PROOF for the four-cause split: a credential MISS is four
+    /// conditions with four different operator actions, and the diagnostic
+    /// must not collapse them.
+    ///
+    /// Before this, `presented_tenant` reduced the selector to
+    /// `Option<String>` and mapped `None` to one `Anonymous` rendering "no
+    /// credential (sent anonymously)" — after which the tenant-policy
+    /// report asserted the FIRST of the four ("this device holds no slot
+    /// for T; mint one"). On an EXPIRED slot that is wrong twice over: the
+    /// device does hold T's slot, and the refresher heals it with no
+    /// operator action at all.
+    ///
+    /// Collapse any two of these renderings and this test goes red.
+    #[test]
+    fn a_credential_miss_names_which_of_the_four_causes_it_was() {
+        let rendered = |c: NoCredential| PresentedTenant::Anonymous(c).to_string();
+
+        let absent = rendered(NoCredential::Slot(SlotState::Absent));
+        let dead = rendered(NoCredential::Slot(SlotState::PresentButDead));
+        let unreadable = rendered(NoCredential::Slot(SlotState::Unreadable));
+        let unresolved = rendered(NoCredential::UnresolvedOnMultiBound { bindings: 3 });
+        let fallback = rendered(NoCredential::DefaultBindingFallback {
+            own: SlotState::Absent,
+            legacy: SlotState::PresentButDead,
+        });
+
+        for (a, b) in [
+            (&absent, &dead),
+            (&absent, &unreadable),
+            (&absent, &unresolved),
+            (&absent, &fallback),
+            (&dead, &unreadable),
+            (&dead, &unresolved),
+            (&dead, &fallback),
+            (&unreadable, &unresolved),
+            (&unreadable, &fallback),
+            (&unresolved, &fallback),
+        ] {
+            assert_ne!(a, b, "two distinct causes rendered identically");
+        }
+
+        // Each carries the operator-action word its own `SlotState::label`
+        // already publishes, so a log reader and the coord doctor agree.
+        assert!(dead.contains(SlotState::PresentButDead.label()), "{dead}");
+        assert!(
+            unreadable.contains(SlotState::Unreadable.label()),
+            "{unreadable}"
+        );
+        assert!(unresolved.contains('3'), "{unresolved}");
+        assert!(
+            fallback.contains(SlotState::PresentButDead.label())
+                && fallback.contains(SlotState::Absent.label()),
+            "the default-binding fallback must report BOTH reads: {fallback}"
+        );
+    }
+
+    /// The reported cause comes out of the SELECTOR's own reads, over a real
+    /// store, for every cell — the F2 replacement for a pure mirror that was
+    /// only ever driven against itself.
+    ///
+    /// Every assertion below is against something derived INDEPENDENTLY of the
+    /// function under test: the fixture this cell stored, or
+    /// [`credential_state`], the module's shared rule — a second derivation of
+    /// the same predicate over the same store. Comparing the selector's two
+    /// SHAPES to each other is not such a thing, and this test used to lead
+    /// with exactly that: [`select_device_bearer`] *is*
+    /// `select_device_bearer_result(..).ok()`, and `r.ok().is_some() ==
+    /// r.is_ok()` holds for every `Result` by definition, so the assertion
+    /// could not fail for any implementation of the selector while being
+    /// billed as the mutation-detecting one.
+    ///
+    /// Three properties, each a mutation this catches:
+    ///
+    /// 1. **Both shapes hand back the token this cell stored, or nothing.**
+    ///    A hit that starts serving a slot the selector never consulted — a
+    ///    non-default tenant handed the legacy JWT — is a substitution, and
+    ///    every `Ok` cell here used to assert nothing whatsoever.
+    /// 2. **Only the DEFAULT tenant's miss reports the legacy slot.** Telling
+    ///    an operator to fix a credential the selector never consulted is the
+    ///    same class of misdirection as the pairing advice this phase removed.
+    /// 3. **No cause ever names a `Usable` slot.** A usable slot yields a
+    ///    token, and a cause is only built where there is none — so *"sent
+    ///    anonymously; slot usable"* is reported by no production path (the
+    ///    type itself permits it; see [`NoCredential`]). That rendering WAS
+    ///    reachable while the classifier re-read the slots after the decision
+    ///    and the refresher landed one in between.
+    ///
+    /// **What the matrix covers, stated in states rather than fixtures.** The
+    /// cells are 4 own-slot fixtures × 3 legacy × 2 is-default, but `expired`
+    /// and `opaque` both classify [`SlotState::PresentButDead`], so the axes
+    /// drive 3 distinct [`SlotState`]s each: **18 of the 32** state-level
+    /// combinations (4 × 4 × 2). The 14 uncovered ones are exactly those
+    /// naming [`SlotState::Unreadable`], which is on neither axis because
+    /// reaching it needs a store that ERRORS and this module has no such
+    /// fixture. It is covered structurally instead — by
+    /// `credential_state_keeps_an_unreadable_slot_unknown` for the rule, and
+    /// by `a_credential_miss_names_which_of_the_four_causes_it_was` for the
+    /// rendering. Manufacturing an `Unreadable` cell here would assert against
+    /// the fabrication; an honest gap is worth more.
+    ///
+    /// Scopes: [`TenantScope::Owned`] and [`TenantScope::Device`] are both
+    /// driven on every cell. [`TenantScope::Unresolved`] is not — its own arm
+    /// refuses on a different axis (the binding count) before reading a slot
+    /// at all, and is pinned by
+    /// `the_unresolved_refusal_names_the_count_it_branched_on`,
+    /// `unresolved_scope_degrades_to_unauthenticated_on_multi_bound_device`
+    /// and `unresolved_and_device_diverge_exactly_when_multi_bound`.
+    #[test]
+    fn the_reported_cause_is_the_selectors_own_reads() {
+        // The legacy fallback is now gated on `legacy_token_serves_tenant`,
+        // whose claimless arm reads the device's MEASURED binding count out of
+        // `paired_user.json` — so without a fixture this test would answer
+        // differently on a paired box and on CI, and pin neither. The isolated
+        // ambient pins it to a device stating ONE binding, the shape where the
+        // legacy fallback is admissible at all.
+        let amb = crate::test_env::isolated_ambient();
+        // NEVER the real OS credential store: `store_tokens` writes the
+        // keychain unless this is set, and `isolated_ambient` captures the key
+        // for restore without setting it.
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        let expired = jwt_for("expired", chrono::Utc::now().timestamp() - 3600);
+        let slot_cases: Vec<(&str, Option<String>)> = vec![
+            ("usable", Some(live_jwt("slot"))),
+            ("expired", Some(expired.clone())),
+            ("opaque", Some("qontinui_runner_deadbeef".to_string())),
+            ("absent", None),
+        ];
+        let legacy_cases: Vec<(&str, Option<String>)> = vec![
+            ("usable", Some(live_jwt("legacy"))),
+            ("expired", Some(expired)),
+            ("absent", None),
+        ];
+
+        let t = tenant(0x31);
+        let stranger = tenant(0x32);
+        for (si, (slot_label, slot)) in slot_cases.iter().enumerate() {
+            for (li, (legacy_label, legacy)) in legacy_cases.iter().enumerate() {
+                for is_default in [false, true] {
+                    let mgr = create_test_auth_manager(&format!(
+                        "cause_{si}_{li}_{}",
+                        u8::from(is_default)
+                    ));
+                    if let Some(j) = slot {
+                        mgr.store_tenant_device_jwt(&t, j).unwrap();
+                    }
+                    if let Some(j) = legacy {
+                        mgr.store_tokens(j, "").unwrap();
+                    }
+                    let default_tenant = Some(if is_default { t } else { stranger });
+                    // A device stating exactly ONE binding, the default one.
+                    // Written per cell because `default_tenant` moves with it.
+                    std::fs::write(
+                        amb.dir().join("paired_user.json"),
+                        serde_json::json!({
+                            "default_tenant_id": default_tenant.unwrap().to_string(),
+                            "bindings": [{"tenant_id": default_tenant.unwrap().to_string()}]
+                        })
+                        .to_string(),
+                    )
+                    .unwrap();
+                    let where_ =
+                        format!("slot={slot_label} legacy={legacy_label} is_default={is_default}");
+                    let own_state = read_tenant_slot(&mgr, &t).state();
+                    let legacy_read = read_legacy_slot(&mgr);
+                    let legacy_state = legacy_read.state();
+                    let legacy_serves = legacy_slot_serves_default_tenant(
+                        &mgr,
+                        &legacy_read,
+                        default_tenant.as_ref(),
+                    );
+
+                    // The ONE token this cell may hand back for T, named from
+                    // the fixtures it stored rather than read back out of the
+                    // thing under test: T's own slot when that is usable, and
+                    // the legacy slot ONLY where T is the default binding AND
+                    // that token is T's. The fixtures' legacy JWT carries no
+                    // `tenant_id` claim, so it is T's only under the claimless
+                    // arm — one measured binding (above) AND no slot of T's
+                    // own, which the expired/opaque cells fail because they
+                    // DID store one.
+                    let expected: Option<&str> = if *slot_label == "usable" {
+                        slot.as_deref()
+                    } else if is_default && *legacy_label == "usable" && slot.is_none() {
+                        legacy.as_deref()
+                    } else {
+                        None
+                    };
+
+                    let result = select_device_bearer_result(&mgr, Some(&t), default_tenant);
+
+                    // Oracle: the module's shared credential rule, a SECOND
+                    // derivation of the same predicate over the same store —
+                    // not a second spelling of this call's own answer.
+                    assert_eq!(
+                        credential_state(own_state, is_default, legacy_state, legacy_serves)
+                            .can_act(),
+                        Some(result.is_ok()),
+                        "{where_}: the diagnostic and the shared credential rule must be ONE \
+                         decision"
+                    );
+                    // And the request path lands on the same fixture — which
+                    // is what makes "these two are one decision" a claim about
+                    // this code rather than about `Result`.
+                    assert_eq!(
+                        select_device_bearer(&mgr, Some(&t), default_tenant).as_deref(),
+                        expected,
+                        "{where_}: the request path must hand back this cell's own fixture"
+                    );
+
+                    match result {
+                        Ok(tok) => assert_eq!(
+                            Some(tok.as_str()),
+                            expected,
+                            "{where_}: a hit must be the fixture this cell stored — handing \
+                             back a slot the selector never consulted is a substitution"
+                        ),
+                        Err(NoCredential::Slot(own)) => {
+                            assert!(
+                                !is_default,
+                                "{where_}: the default tenant's miss falls through to the \
+                                 legacy slot, so it cannot be decided by one read"
+                            );
+                            assert_eq!(
+                                own, own_state,
+                                "{where_}: the cause must name the slot the selector read"
+                            );
+                            assert_ne!(own, SlotState::Usable, "{where_}");
+                        }
+                        Err(NoCredential::DefaultBindingFallback {
+                            own,
+                            legacy: legacy_seen,
+                        }) => {
+                            assert!(
+                                is_default,
+                                "{where_}: only the DEFAULT tenant consults the legacy slot, \
+                                 so only it may report one"
+                            );
+                            assert_eq!(own, own_state, "{where_}");
+                            assert_ne!(
+                                own,
+                                SlotState::Usable,
+                                "{where_}: a usable slot yields a token, never a cause"
+                            );
+                            assert_ne!(legacy_seen, SlotState::Usable, "{where_}");
+                            assert_eq!(legacy_seen, legacy_state, "{where_}");
+                        }
+                        // The cause the claim check adds: a USABLE legacy token
+                        // that is not this tenant's. Reachable only where the
+                        // legacy fallback was consulted at all (the default
+                        // tenant) and the token did not serve it — here, the
+                        // claimless token beside a slot T already owns.
+                        Err(NoCredential::DefaultBindingClaimMismatch { own, claimed }) => {
+                            assert!(
+                                is_default,
+                                "{where_}: only the DEFAULT tenant consults the legacy slot, \
+                                 so only it may report one"
+                            );
+                            assert_eq!(own, own_state, "{where_}");
+                            assert_ne!(
+                                own,
+                                SlotState::Usable,
+                                "{where_}: a usable slot yields a token, never a cause"
+                            );
+                            assert_eq!(
+                                legacy_state,
+                                SlotState::Usable,
+                                "{where_}: this cause is only reachable over a USABLE legacy \
+                                 token — an unusable one is a DefaultBindingFallback"
+                            );
+                            assert_eq!(
+                                claimed, None,
+                                "{where_}: the fixture's legacy JWT carries no tenant_id claim, \
+                                 so the cause must say so rather than name a tenant"
+                            );
+                        }
+                        Err(other) => {
+                            panic!("{where_}: an Owned scope cannot reach {other:?}")
+                        }
+                    }
+
+                    // The DEVICE scope over the same store: it reads the
+                    // legacy slot and nothing else, whichever tenant is the
+                    // default, and never T's own.
+                    let device = select_scoped_bearer_lazy_result(
+                        &mgr,
+                        TenantScope::Device,
+                        default_tenant,
+                        || panic!("{where_}: the Device scope must not read the binding count"),
+                    );
+                    let device_expected: Option<&str> = if *legacy_label == "usable" {
+                        legacy.as_deref()
+                    } else {
+                        None
+                    };
+                    assert_eq!(
+                        device.as_deref().ok(),
+                        device_expected,
+                        "{where_}: the Device scope presents the DEFAULT slot's own token, or \
+                         nothing"
+                    );
+                    if let Err(cause) = device {
+                        assert_eq!(
+                            cause,
+                            NoCredential::Slot(legacy_state),
+                            "{where_}: a Device-scope miss names the legacy read that decided \
+                             it"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The `Unresolved`-on-multi-bound refusal names the count it BRANCHED on
+    /// — the single read, not a second one taken afterwards.
+    #[test]
+    fn the_unresolved_refusal_names_the_count_it_branched_on() {
+        let mgr = create_test_auth_manager("cause_unresolved_multi_bound");
+        mgr.store_tokens(&live_jwt("legacy"), "").unwrap();
+
+        let mut reads = 0usize;
+        let cause = select_scoped_bearer_lazy_result(&mgr, TenantScope::Unresolved, None, || {
+            reads += 1;
+            4
+        })
+        .expect_err("a multi-bound device with no resolved tenant presents nothing");
+        assert_eq!(
+            cause,
+            NoCredential::UnresolvedOnMultiBound { bindings: 4 },
+            "the refusal must carry the count the arm branched on"
+        );
+        assert_eq!(
+            reads, 1,
+            "and it must be ONE read — re-reading it to explain the refusal is the \
+             mirror this phase removed"
+        );
+    }
+
     /// The lazy resolver must not read `paired_user.json` for a scope that
     /// never consults the count. Every outbound coord call goes through it, so
     /// an eager read would put a file parse on the hot path for a fact
@@ -3647,7 +5139,44 @@ mod bearer_selection_tests {
         assert_eq!(reads, 1, "Unresolved must consult the count exactly once");
     }
 
-    // ---- binding count: the input the degrade rule keys on ----------------
+    /// Re-re-review: the D2 degrade rule reads [`binding_count_from_value`], so
+    /// a MALFORMED two-entry `bindings` array is still two bindings and an
+    /// Unresolved-scope call still degrades to no bearer. Reading it through the
+    /// strict parser would make it one binding and present the DEFAULT binding's
+    /// device JWT - a silent wrong-tenant write where there used to be an
+    /// unauthenticated, warned request.
+    #[test]
+    fn a_malformed_two_entry_bindings_array_still_degrades_the_unresolved_arm() {
+        let mgr = create_test_auth_manager("scope_lazy_malformed_two_entries");
+        let a = tenant(0xC4);
+        let default_jwt = live_jwt("default");
+        mgr.store_tokens(&default_jwt, "").unwrap();
+        let v: serde_json::Value = serde_json::json!({
+            "default_tenant_id": a.to_string(),
+            "bindings": [{"tenant_id": a.to_string()}, {"tenant_id": 7}]
+        });
+        assert_eq!(binding_count_from_value(&v), 2);
+        assert_eq!(
+            measured_binding_count_from_value(&v),
+            MeasuredBindingCount::Unknown
+        );
+        assert_eq!(
+            select_scoped_bearer_lazy(&mgr, TenantScope::Unresolved, Some(a), || {
+                binding_count_from_value(&v)
+            }),
+            None,
+            "a device stating two bindings must not present the default one's token"
+        );
+        // ...and the single-binding reading is what WOULD have presented it.
+        assert_eq!(
+            select_scoped_bearer_lazy(&mgr, TenantScope::Unresolved, Some(a), || 1).as_deref(),
+            Some(default_jwt.as_str()),
+            "the strict parser's Unknown->one reading would hand out the default binding's token"
+        );
+    }
+
+    // ---- binding count: D2's own parser (binding_count_from_value), the
+    // one device_binding_count calls -------------------------------------
 
     /// The v2 `bindings` array is the count when present and non-empty.
     #[test]
@@ -3706,9 +5235,8 @@ mod bearer_selection_tests {
     #[test]
     fn expired_tenant_slot_is_a_miss_not_a_hit() {
         let mgr = create_test_auth_manager("expired_tenant_slot_miss");
-        let default_jwt = live_jwt("default.jwt");
-        mgr.store_tokens(&default_jwt, "").unwrap();
         let a = tenant(0x31);
+        let default_jwt = store_legacy_only(&mgr, &a);
         let rotted = dead_jwt("a.rotted");
         mgr.store_tenant_device_jwt(&a, &rotted).unwrap();
 
@@ -3731,9 +5259,8 @@ mod bearer_selection_tests {
     #[test]
     fn opaque_tenant_slot_is_a_miss_not_a_hit() {
         let mgr = create_test_auth_manager("opaque_tenant_slot_miss");
-        let default_jwt = live_jwt("default.jwt");
-        mgr.store_tokens(&default_jwt, "").unwrap();
         let a = tenant(0x32);
+        let default_jwt = store_legacy_only(&mgr, &a);
         mgr.store_tenant_device_jwt(&a, "qontinui_runner_abc123")
             .unwrap();
 

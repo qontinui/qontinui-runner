@@ -110,8 +110,9 @@ export function SetupWizard({ currentStep, onStepChange, onComplete }: SetupWiza
   // `registerOpenableView` call, because `useUIComponent` only registers while
   // its owner is mounted — so a registration here was absent in exactly the
   // state a driver needed it (a runner whose `check_setup_completed` returned
-  // true, e.g. any supervisor temp runner with `QONTINUI_TEST_AUTO_LOGIN_EMAIL`
-  // set, where the wizard never mounts). `scope: "global"` does not survive an
+  // true, e.g. any supervisor temp runner with `QONTINUI_SETUP_WIZARD_BYPASS=1`
+  // or a non-empty `QONTINUI_TEST_AUTO_LOGIN_EMAIL`, where the wizard never
+  // mounts). `scope: "global"` does not survive an
   // unmount. The step state and the completion callback the two actions mutate
   // are lifted for the same reason (see the props above).
 

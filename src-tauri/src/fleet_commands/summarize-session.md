@@ -30,18 +30,18 @@ session. Carry the verdict as `unknown`, emit no Outcome tag, and SAY in the
 summary that no review existed — do not emit a failure summary either, which
 would be the same mistake in the other direction.
 
-> This file is the CANONICAL copy for a spawned session: `fleet_commands.rs`
-> ships these `.md` bodies, and `provision_fleet_commands_into` writes this one
-> into a session's working directory unless the destination already exists AND
-> is git-tracked there — false in an allocated worktree of any repo EXCEPT
-> qontinui-claude-config, which tracks its own copy at `.claude/commands/`, so
-> there the tracked file is left in place and is what the session reads. The rule above
-> is deliberately worded to match `.claude/commands/summarize-session.md` in
-> qontinui-claude-config, which corrected the same clause; the two must not
-> drift. The Rust default that used to contradict both
-> (`productivity/summarize.rs`, `Ok(None) => "approved"`) is deleted by Phase 4
-> of `2026-09-12-consolidate-local-orchestration-onto-conductor`, so there is no
-> third copy.
+> **Why this rule is stated identically in two places.** The runner bundles a
+> copy of this file at `src-tauri/src/fleet_commands/summarize-session.md` and
+> `provision_fleet_commands_into` writes it into a spawned session's working
+> directory unless the destination already exists AND is tracked in the
+> enclosing repo (`provision_guard.rs`: `dst.exists() && contains(rel)`). That
+> is false in an allocated worktree of every repo EXCEPT this one, which tracks
+> its own copy at `.claude/commands/` — so THIS copy wins exactly where it is
+> tracked, and the bundled copy wins everywhere else, which is the majority
+> case. The two must therefore say the same thing: a session reading the
+> bundled copy is the normal case, not the exception. Edit this file, then
+> re-vendor into the runner; an edit made only in the runner is a fork
+> (`src-tauri/src/fleet_commands.rs`, module header).
 
 ### 2. Identify learnings
 
@@ -72,7 +72,7 @@ often the most valuable learning.
 
 Each learning has an `area`. Pick one of: `executor`, `claude_session`,
 `dispatcher`, `database`, `ui-bridge`, `frontend`, `migrations`, `tests`,
-`coordinator`, `testing-infra`, or `other`. Be willing to invent new areas
+`orchestration`, `testing-infra`, or `other`. Be willing to invent new areas
 sparingly — they're free-form text and grouped via FTS.
 
 ### 4. Tag failed-attempt outcomes (REQUIRED for verdict=needs_fix /

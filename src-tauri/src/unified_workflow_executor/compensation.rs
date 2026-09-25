@@ -311,6 +311,10 @@ impl CompensationManager {
     }
 
     /// Execute rollback based on policy. Returns the commit hash rolled back to, if any.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     pub async fn execute_rollback(
         &self,
         execution_id: &str,
@@ -372,6 +376,10 @@ impl CompensationManager {
     }
 
     /// Manually rollback to a specific iteration's commit.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     pub async fn rollback_to_iteration(
         &self,
         execution_id: &str,
@@ -400,6 +408,10 @@ impl CompensationManager {
 
     /// Reset git to a specific commit. Uses `git reset --hard` in worktree mode
     /// (safe since worktrees are isolated).
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     async fn git_reset(&self, working_dir: &Path, commit: &str) -> Result<(), String> {
         let output = crate::process_helpers::tokio_no_window("git")
             .args(["reset", "--hard", commit])

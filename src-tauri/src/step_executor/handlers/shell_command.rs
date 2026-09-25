@@ -367,6 +367,10 @@ impl ShellCommandHandler {
     /// Extract Unix-style KEY=VALUE env prefixes from a command string.
     /// cmd.exe doesn't support inline env vars like `SKIP_WEB_SERVER=1 npx ...`,
     /// so we parse them out and pass via Command::env() instead.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn extract_env_prefix_for_cmd(command: &str) -> (Vec<(String, String)>, String) {
         let mut envs = Vec::new();
         let mut remaining = command.trim();
@@ -566,6 +570,10 @@ impl ShellCommandHandler {
     /// This is used by the pre-flight probe to determine which runner port to query
     /// for `/state-machine/status` without having to thread the port through
     /// HandlerContext.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     pub(crate) fn extract_state_machine_navigate_port(command: &str) -> Option<u16> {
         // Look for either `localhost:PORT/state-machine/navigate` or
         // `127.0.0.1:PORT/state-machine/navigate`. We scan for the hosts and then
@@ -632,6 +640,10 @@ impl ShellCommandHandler {
         Self::replace_jq_with_python(cmd)
     }
 
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn replace_jq_with_python(cmd: &str) -> String {
         if let Some(pipe_idx) = cmd.find("| jq ") {
             let curl_part = cmd[..pipe_idx].trim();
@@ -695,6 +707,10 @@ impl ShellCommandHandler {
     }
 
     /// Extract a numeric threshold from an expression like "> 0" or "length > 2"
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn extract_threshold(s: &str) -> u32 {
         for (i, b) in s.bytes().enumerate() {
             if b == b'>' && i + 1 < s.len() {

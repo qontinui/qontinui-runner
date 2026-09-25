@@ -168,6 +168,10 @@ pub fn resolve_working_dir(command: &str, transcript_cwd: &str) -> String {
 }
 
 /// Strip one layer of matching single/double quotes.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn unquote(s: &str) -> String {
     let s = s.trim();
     let bytes = s.as_bytes();
@@ -251,6 +255,10 @@ pub struct ResolvedPush {
 /// SSH (`git@github.com:owner/repo.git`) and HTTPS
 /// (`https://github.com/owner/repo.git`) forms; strips a trailing `.git`.
 /// Returns `None` for shapes we don't recognise.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn parse_repo_full_name(remote_url: &str) -> Option<String> {
     let url = remote_url.trim();
     let tail = if let Some(idx) = url.find('@') {
@@ -1374,6 +1382,10 @@ fn classify_into(st: &mut ClassifyState, command: &str, cwd: &str, depth: u8) {
 /// The script of `bash -c '<script>'` — also `-lc`, `-ec`, and with
 /// value-taking options before it (`-o pipefail`, `+o`, `-O shopt`,
 /// `+O`, `--rcfile f`, `--init-file f`).
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn shell_c_script(args: &[String]) -> Option<&str> {
     let mut i = 0;
     while i < args.len() {
@@ -1543,6 +1555,10 @@ fn classify_git(args: &[String]) -> Option<SensitiveCommand> {
 
 /// Parse the arguments after `push`. Always an intent — a plain or dry-run
 /// push has `force`/`delete` unset or `dry_run` set; see [`is_sensitive`].
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn parse_git_push_args(args: &[&str]) -> GitPushIntent {
     let mut remote: Option<String> = None;
     let mut refspecs: Vec<String> = Vec::new();
@@ -1695,6 +1711,10 @@ fn intent_is_sensitive(i: &GitPushIntent) -> bool {
     !i.dry_run && (i.force.is_some() || i.delete.is_some())
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn classify_gh(args: &[String]) -> Option<SensitiveCommand> {
     let args = args_without_redirections(args);
     if args.first() != Some(&"release") {
@@ -1788,6 +1808,10 @@ fn classify_npm(args: &[String]) -> Option<SensitiveCommand> {
     Some(SensitiveCommand::NpmPublish { spec })
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn classify_cargo(args: &[String]) -> Option<SensitiveCommand> {
     let args = args_without_redirections(args);
     // `cargo +nightly publish` — skip a toolchain selector and global flags.
@@ -1830,6 +1854,10 @@ fn classify_cargo(args: &[String]) -> Option<SensitiveCommand> {
 /// `To <url>` line git echoes back. Everything that reaches an artifact, a
 /// repo parse or a log line passes through here first. The scp form
 /// (`git@github.com:o/r`) has a user but no secret and is left alone.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn strip_userinfo(url: &str) -> String {
     if let Some(pos) = url.find("://") {
         let (scheme, rest) = url.split_at(pos + 3);
@@ -2113,6 +2141,10 @@ struct PushBlock {
 }
 
 /// A `--porcelain` ref-table line: `<flag>\t<from>:<to>\t<summary>`.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn porcelain_fields(raw: &str) -> Option<(char, &str, &str)> {
     let mut chars = raw.chars();
     let flag = chars.next()?;

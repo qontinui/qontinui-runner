@@ -603,6 +603,10 @@ fn transcript_bytes_from_output_body(body: &serde_json::Value) -> Vec<u8> {
 /// issues no `UPDATE` against `coord.sessions` either. This function contains
 /// no delete of any kind, and [`tests::respawn_module_never_closes_the_source`]
 /// asserts it stays that way.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 async fn materialize(
     registry: &Arc<SessionRegistry>,
     lifecycle_store: &Arc<SessionLifecycleStore>,
@@ -844,6 +848,7 @@ mod tests {
             finished_at: None,
             finish_reason: None,
             finish_synced: false,
+            spawn_device_default: None,
         }
     }
 

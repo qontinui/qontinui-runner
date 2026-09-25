@@ -971,6 +971,10 @@ impl CompletionExecutor {
     /// This reads the accumulated output_log, verification results, and findings
     /// from the database and formats them as context that gets prepended to the
     /// completion prompt.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn build_prior_phase_context(&self, execution_id: &str, iterations_run: u32) -> String {
         let mut sections = Vec::new();
 

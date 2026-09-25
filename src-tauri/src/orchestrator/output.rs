@@ -713,6 +713,10 @@ pub fn emit_phase_transition(
 // ============================================================================
 
 /// Truncate a string to a maximum length, adding "..." if truncated.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn truncate(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()

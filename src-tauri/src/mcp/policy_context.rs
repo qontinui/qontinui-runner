@@ -72,6 +72,48 @@
 //! cache all get the full body, exactly as before. The confirmation says what
 //! the runner composed, never that it saw the copy in the model's prompt.
 //!
+//! ## The degrade is LOUD, not silent (plan
+//! `2026-09-21-policy-body-still-crosses-the-sessionstart-boundary`, Phase 2)
+//!
+//! The honesty gate above FAILS OPEN: anything it cannot confirm gets the full
+//! body. That is the right direction, and for its first five days in production
+//! it was also invisible — a marker that never arrived was indistinguishable,
+//! in every log and metric, from a marker deliberately withheld on a `resume`.
+//! Measured 2026-09-21 (coord finding `401c6d88`): 26 of 40 live transcripts
+//! carried the full body, zero carried the confirmation, and nothing anywhere
+//! said so. The feature had regressed to its pre-change behaviour on day one.
+//!
+//! So every render decision now names itself. [`render_for_session`] returns a
+//! [`PolicyRenderDecision`] — a typed [`PolicyRenderReason`], the four raw facts
+//! it was derived from, and BOTH SHAs — and [`policy_context`] carries all of it
+//! on the one per-injection `tracing::info!` that already existed
+//! (`policy-context: injecting fleet policy at SessionStart`), then folds the
+//! reason into a process-lifetime counter readable at
+//! `GET /sessions/policy-context-stats` ([`render_stats`]). It EXTENDS that
+//! event rather than adding a second one: two events per decision make a grep
+//! count answer twice. That counter's unit is an INJECTION, not a session —
+//! `compact` makes the two diverge, and [`PolicyRenderStats`] says how far.
+//!
+//! The reason is the FIRST unmet precondition, and the arms are deliberately
+//! not collapsed: a reason that lumps two causes together is the same blindness
+//! one level down. The raw facts ride the same event, so a session that failed
+//! two preconditions is fully readable even though its reason names one.
+//!
+//! The sharpest instance, and the one Phase 0 paid for: an ABSENT `source` and
+//! a `resume` are both "not confirmable", and [`normalize_source`] labels the
+//! first of them `startup`. The production defect was the first; the log said
+//! the second was indistinguishable from it. [`PolicyRenderReason::SourceAbsent`],
+//! [`PolicyRenderReason::SourceUnrecognized`] and
+//! [`PolicyRenderReason::SourceNotConfirmable`] are three arms for that reason.
+//!
+//! Both SHAs are logged (truncated to [`LOGGED_SHA_PREFIX`]) because Phase 0
+//! recorded their absence as the thing that made a past injection impossible to
+//! re-adjudicate from logs. They are digests of a public policy document.
+//!
+//! None of this changes what the route SERVES. The honesty property — confirm
+//! only on a matching SHA and a confirmable source — is load-bearing and
+//! untouched; only the reporting is new.
+//!
 //! ## Fires on every `source`
 //!
 //! `startup | resume | compact` all inject. A resumed session carries its old
@@ -129,9 +171,11 @@
 //! `continuation_verdict.rs` and `prompt_library.rs` do.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
@@ -534,7 +578,9 @@ pub fn render_confirmation(
     fetched_at: &str,
 ) -> String {
     let version = version_label(payload.protocol_version);
-    let short_sha: String = delivered_sha.chars().take(12).collect();
+    // The SAME prefix the render-decision log line carries, so an operator
+    // comparing a transcript against a log is comparing one string.
+    let short_sha: String = delivered_sha.chars().take(LOGGED_SHA_PREFIX).collect();
     let mut out = String::with_capacity(2 * 1024);
     out.push_str(&header(source, fetched_at));
     out.push_str("\n\n");
@@ -567,11 +613,483 @@ pub fn render_confirmation(
 /// source is not evidence of either, so it is treated like `resume`. Deliberately reads the raw value:
 /// [`normalize_source`] maps "absent" to `startup`, which is right for the
 /// header label and wrong for this decision.
+///
+/// **One gate, one implementation.** This DELEGATES to [`classify_source`],
+/// which is what the route actually calls. It used to carry its own `matches!`
+/// over the same accepted set, and after Phase 2 that copy had no production
+/// caller at all — the honesty property was enforced by `classify_source` while
+/// every doc in the module still named this function, and the only thing
+/// keeping the two agreeing was a hand-picked table in one test. A later change
+/// admitting, say, `resume` or a future `restart` to `classify_source`'s `Ok`
+/// arm would have killed the property here while this function went on
+/// "correctly" returning false and gating nothing. Delegation makes that
+/// impossible: there is now one accepted set, and widening it widens both.
+///
+/// ⚠️ **What delegation does NOT do is make the agreement testable — it makes
+/// the question vacuous.** In `classify_source_splits_the_three_non_confirmable_shapes`
+/// the `assert!(source_permits_confirmation(raw))` beside each
+/// `assert_eq!(classify_source(raw), …)` now calls the same code twice and
+/// cannot detect a disagreement, because there is no longer anything that could
+/// disagree. Harmless, and worth naming so nobody reads those lines as
+/// protection. The real pin on the ACCEPTED SET is the hand-written
+/// `expect_confirmed` column in
+/// `only_startup_and_compact_may_confirm_a_matching_marker`, which pairs this
+/// predicate against [`render_for_session`]'s actual verdict over nine rows —
+/// that is the test the round-2 mutation (`classify_source` admitting `resume`)
+/// was caught by.
 pub fn source_permits_confirmation(raw_source: Option<&str>) -> bool {
-    matches!(
-        raw_source.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("startup" | "compact")
-    )
+    classify_source(raw_source).is_ok()
+}
+
+// ===========================================================================
+// Why this session got the render it got (plan
+// `2026-09-21-policy-body-still-crosses-the-sessionstart-boundary`, Phase 2)
+// ===========================================================================
+
+/// Why one `SessionStart` got the render it got — one arm per distinguishable
+/// cause, and NEVER two causes folded into one arm.
+///
+/// Six of the eight mean the FULL body crossed the hook boundary
+/// ([`Self::served_full_body`]); [`Self::Confirmed`] is the short confirmation —
+/// the denominator, without which the full-body count is a number with nothing
+/// to divide by; [`Self::PullFailed`] is neither, because that session got the
+/// fail-open notice and no policy body at all.
+///
+/// **The three source arms are three different findings, not one.** Collapsing
+/// them is the exact blindness this phase exists to remove: Phase 0 of the plan
+/// found the production cause to be a MISSING `source` parameter (the
+/// materialized hook gated its payload parse on `command -v python`, which does
+/// not exist on a Linux box, so it built a URL with no `source=` at all), and
+/// [`normalize_source`] maps an absent source to the label `startup` — so 98
+/// injections on 2026-09-20 were logged as ordinary startups holding a valid
+/// marker, and the cause took a day to find. [`Self::SourceAbsent`] is that
+/// finding; [`Self::SourceNotConfirmable`] is a `resume`/`clear`, which is
+/// correct behaviour; [`Self::SourceUnrecognized`] is a value from a future
+/// Claude release, which is a third thing again. All three are labelled
+/// `startup` by `normalize_source` unless a `resume`/`clear` came through.
+///
+/// The reason is the FIRST unmet precondition, tested in the order the decision
+/// is actually made — the source gate, then a body to hash, then a marker to
+/// compare, then the comparison. A session can fail several at once; the facts
+/// on [`PolicyRenderDecision`] ride the same event, so the ones that did not win
+/// the precedence are still readable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyRenderReason {
+    /// The hook sent NO `source` at all (absent, or empty/whitespace). The
+    /// measured production cause, and the arm that exists because
+    /// [`normalize_source`] renders it indistinguishable from a real `startup`.
+    SourceAbsent,
+    /// A `source` arrived that this runner does not know (`resume`, `clear`,
+    /// `startup` and `compact` are the known set). A future Claude release, a
+    /// hook bug, or a typo — and, like [`Self::SourceAbsent`], labelled
+    /// `startup` by [`normalize_source`].
+    SourceUnrecognized,
+    /// A KNOWN source that legitimately cannot confirm: `resume` (the
+    /// conversation re-sends the system prompt recorded when it began) or
+    /// `clear` (an unverified snapshot reset). Correct behaviour, not a defect —
+    /// but counted, or the full-body total silently absorbs a population that
+    /// was never supposed to be confirmable.
+    SourceNotConfirmable,
+    /// Coord's payload carried no `session-protocol` body, so there was nothing
+    /// to hash and nothing to compare a marker against. The render is the
+    /// PARTIAL one, not the full body — see [`render_injection`].
+    BodyUnavailable,
+    /// A confirmable source and a body, but the session forwarded no
+    /// delivered-SHA marker: it was not given the file carrier (cold cache at
+    /// spawn, a write failure, a wrapper fall-back arm, a shim strip).
+    MarkerAbsent,
+    /// A marker arrived and hashes to a DIFFERENT body than the one coord
+    /// serves now — the spawn-time copy is stale.
+    MarkerMismatched,
+    /// The short confirmation was sent: confirmable source, body present,
+    /// marker present and equal to the current body's SHA.
+    Confirmed,
+    /// The coord pull failed outright, so the session got the fail-open notice
+    /// ([`render_failure_notice`]) rather than either render. Counted so that
+    /// [`PolicyRenderStats::injections`] equals every `SessionStart` this
+    /// route answered — a denominator with a hole in it is not a denominator.
+    PullFailed,
+}
+
+impl PolicyRenderReason {
+    /// How many arms there are — the counter array's width. Pinned to
+    /// [`Self::ALL`] by `the_arm_count_is_pinned_to_the_arm_list`, so the two
+    /// cannot drift.
+    pub const COUNT: usize = 8;
+
+    /// Every arm, in the precedence order documented on the enum. The single
+    /// source of truth for the counter's indexing and for exhaustive tests.
+    pub const ALL: [PolicyRenderReason; PolicyRenderReason::COUNT] = [
+        PolicyRenderReason::SourceAbsent,
+        PolicyRenderReason::SourceUnrecognized,
+        PolicyRenderReason::SourceNotConfirmable,
+        PolicyRenderReason::BodyUnavailable,
+        PolicyRenderReason::MarkerAbsent,
+        PolicyRenderReason::MarkerMismatched,
+        PolicyRenderReason::Confirmed,
+        PolicyRenderReason::PullFailed,
+    ];
+
+    /// The stable snake_case label this reason is logged and counted under.
+    /// Part of the grep contract — changing one of these breaks every saved
+    /// query, so change it only deliberately.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PolicyRenderReason::SourceAbsent => "source_absent",
+            PolicyRenderReason::SourceUnrecognized => "source_unrecognized",
+            PolicyRenderReason::SourceNotConfirmable => "source_not_confirmable",
+            PolicyRenderReason::BodyUnavailable => "body_unavailable",
+            PolicyRenderReason::MarkerAbsent => "marker_absent",
+            PolicyRenderReason::MarkerMismatched => "marker_mismatched",
+            PolicyRenderReason::Confirmed => "confirmed",
+            PolicyRenderReason::PullFailed => "pull_failed",
+        }
+    }
+
+    /// Did the FULL policy body cross the SessionStart hook boundary?
+    ///
+    /// False for [`Self::Confirmed`] (the short confirmation) and for
+    /// [`Self::PullFailed`] (the fail-open notice, which carries no body).
+    /// [`Self::BodyUnavailable`] is true: the render is the partial injection,
+    /// which still carries everything the payload had.
+    pub fn served_full_body(self) -> bool {
+        !matches!(
+            self,
+            PolicyRenderReason::Confirmed | PolicyRenderReason::PullFailed
+        )
+    }
+
+    /// Index into the counter array, DERIVED from [`Self::ALL`] rather than
+    /// hand-written beside it.
+    ///
+    /// The hand-written version claimed to be "pinned to `ALL`'s order by
+    /// construction" and was not — nothing derived it, and the compiler does
+    /// not force `ALL` to grow when an arm is added: `ALL: [Self; COUNT]` stays
+    /// well-typed as an 8-element literal, so a 9th arm compiles, passes every
+    /// test that iterates `ALL` (it never sees the new arm), and then indexes 8
+    /// into an 8-element array on the first session that hits it. A panic there
+    /// is a panic inside a FAIL-OPEN axum handler — the connection drops, the
+    /// hook gets no response, and the session lands in exactly the no-policy
+    /// state this module's header says it exists to end. Deriving the position
+    /// makes the doc claim true; [`record_render`] not indexing blindly makes
+    /// the remaining out-of-range case survivable.
+    ///
+    /// `None` means this arm is absent from `ALL` — unreachable while the two
+    /// agree, which `the_every_arm_is_listed_and_slots_are_in_range` asserts.
+    fn slot(self) -> Option<usize> {
+        Self::ALL.iter().position(|r| *r == self)
+    }
+}
+
+/// Classify the RAW hook `source` on its own — the first gate of
+/// [`render_for_session`], and the one whose three outcomes
+/// [`normalize_source`] cannot tell apart.
+///
+/// `Ok(())` means the source permits a confirmation (`startup`/`compact`);
+/// `Err(reason)` names which of the three non-confirmable shapes it was.
+///
+/// **This is the ONE implementation of the honesty gate** —
+/// [`source_permits_confirmation`] delegates here, so the accepted set cannot
+/// be widened in one place and left narrow in the other. Deliberately reads the
+/// RAW value: [`normalize_source`] maps an absent source to `startup`, which is
+/// right for the header label and wrong for this decision.
+pub fn classify_source(raw_source: Option<&str>) -> Result<(), PolicyRenderReason> {
+    match raw_source.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("startup" | "compact") => Ok(()),
+        Some("resume" | "clear") => Err(PolicyRenderReason::SourceNotConfirmable),
+        None | Some("") => Err(PolicyRenderReason::SourceAbsent),
+        Some(_) => Err(PolicyRenderReason::SourceUnrecognized),
+    }
+}
+
+/// How many leading hex characters of a SHA-256 reach the log.
+///
+/// 12, the same prefix [`render_confirmation`] shows a session, so an operator
+/// reading a transcript and an operator reading the log are comparing the same
+/// string. These are content digests of a PUBLIC policy document, not secrets —
+/// the truncation is for line width, not for hygiene.
+pub const LOGGED_SHA_PREFIX: usize = 12;
+
+/// Truncate a SHA for logging, or name its absence. Never an empty field: an
+/// empty string in a log line reads as "the field is broken", not "there was
+/// no marker".
+fn short_sha(sha: Option<&str>) -> String {
+    // The empty arm is the whole point of the contract: `Some("")` would
+    // otherwise render as a blank field, which reads as "this field is broken"
+    // rather than "there was no marker". A doc that states a property the
+    // function does not enforce is worth less than no doc.
+    match sha.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => s.chars().take(LOGGED_SHA_PREFIX).collect(),
+        None => ABSENT_FIELD.to_string(),
+    }
+}
+
+/// What an absent SHA renders as in the decision event. Never an empty field —
+/// see [`short_sha`].
+const ABSENT_FIELD: &str = "<none>";
+
+/// What an absent hook `source` renders as in the decision event. A separate
+/// sentinel from [`ABSENT_FIELD`] on purpose: "no marker" and "no source" are
+/// different findings, and a reader scanning the line should not have to check
+/// which field a `<none>` belongs to.
+const ABSENT_SOURCE: &str = "<absent>";
+
+/// The raw hook `source` as it reaches the log: what the hook actually sent, or
+/// [`ABSENT_SOURCE`] when it sent nothing or nothing but whitespace.
+///
+/// Distinct from [`normalize_source`]'s LABEL, which maps an absent source to
+/// `startup` and so cannot be used to tell the two apart — the exact ambiguity
+/// [`PolicyRenderReason::SourceAbsent`] exists to end. Empty is folded into
+/// absent for the same reason [`short_sha`] folds it: a blank field reads as a
+/// broken field rather than as an absent value.
+///
+/// **Deliberately logs the value UNTRIMMED**, where `short_sha` trims. The
+/// decision is made on the trimmed, lowercased value ([`classify_source`]), so
+/// the trimmed form is already implied by `reason`; what this field adds is
+/// what the hook literally put on the wire, and a `" startup "` whose padding
+/// were silently removed here would hide a hook bug rather than expose one.
+/// Only the emptiness TEST trims — a whitespace-only source is absent, not a
+/// value worth echoing.
+fn source_for_log(raw_source: Option<&str>) -> &str {
+    match raw_source {
+        Some(raw) if !raw.trim().is_empty() => raw,
+        _ => ABSENT_SOURCE,
+    }
+}
+
+/// One render decision: the typed [`PolicyRenderReason`], the raw facts it was
+/// derived from, and both SHAs.
+///
+/// The facts are carried separately on purpose. The reason names the first
+/// unmet precondition, which is what a counter can be keyed on; the facts say
+/// what ELSE was wrong with the same session, which is what a reason alone
+/// cannot. A `resume` that also carried no marker is one event here and two
+/// readable facts, rather than a `source_not_confirmable` that quietly hides a
+/// second defect.
+///
+/// **Both SHAs are kept in full.** Phase 0 recorded as UNKNOWN that "neither
+/// `delivered_sha` nor the computed `policy_body_sha` is logged, so no past
+/// injection can be re-adjudicated from logs". They are logged truncated to
+/// [`LOGGED_SHA_PREFIX`]; a programmatic consumer gets the whole value here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyRenderDecision {
+    /// The first unmet precondition — see [`PolicyRenderReason`].
+    pub reason: PolicyRenderReason,
+    /// Did the RAW hook source permit a confirmation at all?
+    pub source_confirmable: bool,
+    /// Did the session forward a well-formed delivered-SHA marker?
+    pub marker_present: bool,
+    /// Did coord's payload carry a `session-protocol` body?
+    pub body_present: bool,
+    /// Marker present, body present, and the two hashes equal.
+    pub marker_matches: bool,
+    /// The marker the session forwarded, in full.
+    pub delivered_sha: Option<String>,
+    /// SHA-256 of the body coord served on THIS call, in full.
+    pub body_sha: Option<String>,
+}
+
+impl PolicyRenderDecision {
+    /// The decision for a session whose coord pull failed outright. The source
+    /// and marker facts are still known and still worth recording; nothing
+    /// about the body is.
+    pub fn pull_failed(raw_source: Option<&str>, delivered_sha: Option<&str>) -> Self {
+        Self {
+            reason: PolicyRenderReason::PullFailed,
+            source_confirmable: classify_source(raw_source).is_ok(),
+            marker_present: delivered_sha.is_some(),
+            body_present: false,
+            marker_matches: false,
+            delivered_sha: delivered_sha.map(str::to_owned),
+            body_sha: None,
+        }
+    }
+
+    /// Was the short confirmation sent? The predicate the route used to return
+    /// as a bare `bool`.
+    pub fn confirmed(&self) -> bool {
+        self.reason == PolicyRenderReason::Confirmed
+    }
+
+    /// Did the full body cross the hook boundary? See
+    /// [`PolicyRenderReason::served_full_body`].
+    pub fn served_full_body(&self) -> bool {
+        self.reason.served_full_body()
+    }
+
+    /// The marker as it reaches the log — [`LOGGED_SHA_PREFIX`] chars, or
+    /// `<none>`.
+    pub fn delivered_sha_short(&self) -> String {
+        short_sha(self.delivered_sha.as_deref())
+    }
+
+    /// The served body's SHA as it reaches the log — [`LOGGED_SHA_PREFIX`]
+    /// chars, or `<none>`.
+    pub fn body_sha_short(&self) -> String {
+        short_sha(self.body_sha.as_deref())
+    }
+}
+
+/// Process-lifetime tally, one slot per [`PolicyRenderReason`].
+///
+/// Atomics rather than a lock, and a plain array rather than a metrics crate:
+/// `knowledge_acquisition::stats::ProviderCounters` is the shape this runner
+/// already counts things in, and the runner pulls in no metrics registry at
+/// all. Adding one for eight counters would be a second mechanism for the thing
+/// the first one already does.
+fn render_counts() -> &'static [AtomicU64; PolicyRenderReason::COUNT] {
+    static COUNTS: OnceLock<[AtomicU64; PolicyRenderReason::COUNT]> = OnceLock::new();
+    COUNTS.get_or_init(|| std::array::from_fn(|_| AtomicU64::new(0)))
+}
+
+/// Does a render made in this [`Mode`] belong in the tally?
+///
+/// ONLY [`Mode::On`]. `Off` never reaches a decision at all, and `Observe`
+/// renders the would-be payload and then injects NOTHING — counting it would
+/// make `full_body_total` a count of renders that were never delivered, so a
+/// runner soaked in `observe` would report thousands of full-body injections
+/// having made none.
+///
+/// A function rather than a sentence in a comment, because the rule is worth
+/// pinning: moving `record_render` above [`policy_context`]'s `observe`
+/// early-return compiles, passes every other test, and silently inverts the
+/// counter's meaning.
+///
+/// ⚠️ **Be precise about what this buys.** At its one call site the guard is
+/// unreachable-false — `Off` and `Observe` have both already returned, so
+/// `mode` there can only be `On` — and moving that call above the early return
+/// would still pass CI, because no TEST calls [`policy_context`]. (Production
+/// does: `mcp::sessions` calls it on every `SessionStart`. It is `pub async`
+/// and perfectly callable; what is hard is making it EXERCISABLE under test,
+/// since it reads env and talks to coord.) So position still decides behaviour
+/// at that site; what the predicate adds is that the rule is now testable
+/// (`the_tally_counts_only_the_mode_that_actually_injects`) and that a future
+/// caller inherits it by asking rather than by being placed correctly.
+pub fn should_count(mode: Mode) -> bool {
+    mode == Mode::On
+}
+
+/// Fold one decision into the process-lifetime tally. Called exactly once per
+/// injection, gated on [`should_count`].
+pub fn record_render(reason: PolicyRenderReason) {
+    // Belt and braces with the derived `slot()`: this runs inside a FAIL-OPEN
+    // route, so an out-of-range index would turn a missing counter slot into a
+    // panicking hook and a session with no policy at all. Losing a count is a
+    // reporting gap; panicking here recreates the incident the module exists to
+    // prevent. `debug_assert` still makes the drift loud in a test build.
+    debug_assert!(
+        reason.slot().is_some(),
+        "{} is missing from PolicyRenderReason::ALL",
+        reason.as_str()
+    );
+    if let Some(slot) = reason.slot().and_then(|i| render_counts().get(i)) {
+        slot.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A readable snapshot of the tally — the answer to "how many INJECTIONS got
+/// the full body since this runner started, and why", with no log grep.
+///
+/// ⚠️ **The unit is an INJECTION, not a session, and `compact` is what makes
+/// the two diverge.** This route fires on every `SessionStart` hook, and
+/// `compact` is a CONFIRMABLE source, so one long-lived session contributes one
+/// count per compaction. A session that starts with no marker and then compacts
+/// four times with a matching one tallies `marker_absent: 1, confirmed: 4,
+/// injections: 5` — and an operator reading that as "80% confirmed, the seam is
+/// healthy" would have it exactly backwards: the true population is ONE session
+/// that got no confirmation at the only moment that mattered, its start. The
+/// `confirmed` share is inflated by precisely the longest-running sessions.
+///
+/// So read a per-SOURCE split before drawing a per-session conclusion, and
+/// treat `source_absent` / `marker_absent` as counts of STARTS gone wrong
+/// rather than as a minority of a population. A metric built to end a
+/// measurement error must not ship with one; this doc is the guard, because
+/// nothing in the numbers themselves says which unit they are in.
+///
+/// Served at `GET /sessions/policy-context-stats`. Counts are since process
+/// start: the runner writes nothing durable here, because a per-session row
+/// belongs in `coord.session_policy_reads` (which already gets one) and a
+/// second durable store for the same event is a second thing to reconcile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PolicyRenderStats {
+    /// The hook sent no `source` at all — logged as `startup` by
+    /// [`normalize_source`], so invisible before this counter existed.
+    pub source_absent: u64,
+    /// A `source` this runner does not know.
+    pub source_unrecognized: u64,
+    /// `resume`/`clear` — full body BY DESIGN.
+    pub source_not_confirmable: u64,
+    /// Coord served no protocol body — the partial render.
+    pub body_unavailable: u64,
+    /// No delivered-SHA marker reached the route.
+    pub marker_absent: u64,
+    /// A marker arrived naming a different body.
+    pub marker_mismatched: u64,
+    /// The short confirmation — the denominator.
+    pub confirmed: u64,
+    /// The coord pull failed; the fail-open notice went out instead.
+    pub pull_failed: u64,
+    /// The six full-body arms summed.
+    pub full_body_total: u64,
+    /// Every arm summed — the number of INJECTIONS this route made, which is
+    /// the number of `SessionStart` hooks it answered in [`Mode::On`], NOT the
+    /// number of sessions: one session contributes one count per compaction.
+    /// See the type's own doc for why that distinction inverts a naive ratio.
+    pub injections: u64,
+}
+
+/// Snapshot [`record_render`]'s tally. Relaxed loads: the slots are counters,
+/// not a consistent cut, and a reader that sees one slot a beat ahead of
+/// another is reading a live runner, which is the honest thing to show.
+pub fn render_stats() -> PolicyRenderStats {
+    let c = render_counts();
+    // Same non-panicking read as `record_render`'s write: an arm absent from
+    // `ALL` reads as 0 rather than taking the stats route down with it.
+    let at = |r: PolicyRenderReason| {
+        r.slot()
+            .and_then(|i| c.get(i))
+            .map_or(0, |s| s.load(Ordering::Relaxed))
+    };
+    let source_absent = at(PolicyRenderReason::SourceAbsent);
+    let source_unrecognized = at(PolicyRenderReason::SourceUnrecognized);
+    let source_not_confirmable = at(PolicyRenderReason::SourceNotConfirmable);
+    let body_unavailable = at(PolicyRenderReason::BodyUnavailable);
+    let marker_absent = at(PolicyRenderReason::MarkerAbsent);
+    let marker_mismatched = at(PolicyRenderReason::MarkerMismatched);
+    let confirmed = at(PolicyRenderReason::Confirmed);
+    let pull_failed = at(PolicyRenderReason::PullFailed);
+    // DERIVED from `ALL`, not written out as a six-term sum: a ninth full-body
+    // arm added to the enum, to `ALL` and to the struct would compile against a
+    // hand-written sum and silently under-report — the same class the derived
+    // `slot()` closed one level down. `served_full_body` is the single source
+    // of truth for which arms belong here.
+    //
+    // NOTE for whoever adds that ninth arm: `served_full_body` is a NEGATIVE
+    // list (everything except `Confirmed` and `PullFailed`), so a new arm lands
+    // INSIDE this total by default. That is the conservative direction for a
+    // metric whose job is catching a leaking seam — an over-count is visible,
+    // an under-count is the silence this whole phase exists to end — but it is
+    // a default, not a decision: if the new arm carries no body, add it to
+    // `served_full_body`'s exclusion list as well as to `ALL`.
+    let full_body_total: u64 = PolicyRenderReason::ALL
+        .iter()
+        .filter(|r| r.served_full_body())
+        .map(|r| at(*r))
+        .sum();
+    PolicyRenderStats {
+        source_absent,
+        source_unrecognized,
+        source_not_confirmable,
+        body_unavailable,
+        marker_absent,
+        marker_mismatched,
+        confirmed,
+        pull_failed,
+        full_body_total,
+        // Likewise derived: every arm, so a new one cannot be left out of the
+        // denominator by forgetting to add a term here.
+        injections: PolicyRenderReason::ALL.iter().map(|r| at(*r)).sum(),
+    }
 }
 
 /// Choose the render for one session — the honesty decision, pure.
@@ -582,10 +1100,12 @@ pub fn source_permits_confirmation(raw_source: Option<&str>) -> bool {
 /// equals [`crate::session::spawn_prompt::policy_body_sha`] of the body this
 /// call just fetched. Every other case gets the full render:
 ///
-/// - **`resume`, `clear`, or no/unknown source** — a resumed conversation
-///   re-sends the system prompt recorded when it began, so a matching marker
-///   proves nothing about what the model holds, and a `/clear` snapshot reset
-///   is unverified;
+/// - **`resume`, `clear`, an absent source, or one this runner does not know** —
+///   a resumed conversation re-sends the system prompt recorded when it began,
+///   so a matching marker proves nothing about what the model holds; a `/clear`
+///   snapshot reset is unverified; and a source that never arrived is no
+///   evidence of anything. These are THREE reasons, not one — see
+///   [`PolicyRenderReason`];
 /// - **no marker** — the session was not given the file carrier (cold cache at
 ///   spawn, a write failure, a wrapper fall-back, a seam that has none), and the
 ///   presence of a cache file NOW says nothing about what it received THEN;
@@ -594,26 +1114,65 @@ pub fn source_permits_confirmation(raw_source: Option<&str>) -> bool {
 /// - **no body fetched** — nothing to compare, and the partial render says so.
 ///
 /// `raw_source` is the hook's value as received; the header label is its
-/// [`normalize_source`]. Returns the text and whether it was the confirmation.
+/// [`normalize_source`]. Returns the text and the [`PolicyRenderDecision`] —
+/// which render, why, the facts that decided it, and both SHAs.
+///
+/// **The decision is computed for every session, not only the confirmable
+/// ones.** The body is rendered and hashed even on a `resume`, which costs one
+/// ~8 KB render and one SHA-256 per SessionStart that would previously have
+/// skipped both. That is deliberate: the alternative leaves `body_present`,
+/// `marker_matches` and `body_sha` UNKNOWN on the commonest arm, and an
+/// observability change whose facts go dark exactly where the population is
+/// largest is not worth making. The cost sits next to a coord HTTP round trip
+/// on the same path.
 pub fn render_for_session(
     payload: &PolicyPayload,
     delivered_sha: Option<&str>,
     raw_source: Option<&str>,
     fetched_at: &str,
-) -> (String, bool) {
+) -> (String, PolicyRenderDecision) {
     let source = normalize_source(raw_source);
-    if source_permits_confirmation(raw_source) {
-        if let (Some(marker), Some(body)) = (delivered_sha, render_policy_body(payload)) {
-            let current = crate::session::spawn_prompt::policy_body_sha(&body);
-            if marker == current {
-                return (
-                    render_confirmation(payload, &current, source, fetched_at),
-                    true,
-                );
-            }
+    let source_verdict = classify_source(raw_source);
+    let body = render_policy_body(payload);
+    let current = body
+        .as_deref()
+        .map(crate::session::spawn_prompt::policy_body_sha);
+
+    let marker_present = delivered_sha.is_some();
+    let body_present = current.is_some();
+    let marker_matches = matches!(
+        (delivered_sha, current.as_deref()),
+        (Some(marker), Some(now)) if marker == now
+    );
+
+    // First unmet precondition wins, tested in the order the decision is
+    // actually made: the source gate, then a body to hash, then a marker to
+    // compare, then the comparison itself.
+    let reason = match source_verdict {
+        Err(why) => why,
+        Ok(()) if !body_present => PolicyRenderReason::BodyUnavailable,
+        Ok(()) if !marker_present => PolicyRenderReason::MarkerAbsent,
+        Ok(()) if !marker_matches => PolicyRenderReason::MarkerMismatched,
+        Ok(()) => PolicyRenderReason::Confirmed,
+    };
+
+    let decision = PolicyRenderDecision {
+        reason,
+        source_confirmable: source_verdict.is_ok(),
+        marker_present,
+        body_present,
+        marker_matches,
+        delivered_sha: delivered_sha.map(str::to_owned),
+        body_sha: current.clone(),
+    };
+
+    let text = match (reason, current.as_deref()) {
+        (PolicyRenderReason::Confirmed, Some(now)) => {
+            render_confirmation(payload, now, source, fetched_at)
         }
-    }
-    (render_injection(payload, source, fetched_at), false)
+        _ => render_injection(payload, source, fetched_at),
+    };
+    (text, decision)
 }
 
 /// The request header the bundled policy hook forwards the delivered-SHA marker
@@ -1111,26 +1670,28 @@ pub async fn policy_context(
     // `coord_client_parts` is the shared accessor `continuation_verdict` and
     // `session_compliance` both use — same credential, same coord base. Its
     // error is the honest "unpaired" reason, which the notice renders verbatim.
-    let mut confirmed = false;
-    let text = match crate::mcp::continuation_verdict::coord_client_parts() {
+    let (text, decision) = match crate::mcp::continuation_verdict::coord_client_parts() {
         Ok((base, jwt)) => match fetch_payload(&base, attribution).await {
             Ok(payload) => {
                 if mode == Mode::On {
                     persist_policy_body_cache(&jwt, &payload);
                 }
-                let (text, is_confirmation) =
-                    render_for_session(&payload, delivered_sha, raw_source, &fetched_at);
-                confirmed = is_confirmation;
-                text
+                render_for_session(&payload, delivered_sha, raw_source, &fetched_at)
             }
             Err(reason) => {
                 warn!(session = %session_key, source, reason = %reason, "policy-context: pull failed — injecting the fail-open notice");
-                render_failure_notice(&reason, source, &fetched_at)
+                (
+                    render_failure_notice(&reason, source, &fetched_at),
+                    PolicyRenderDecision::pull_failed(raw_source, delivered_sha),
+                )
             }
         },
         Err(reason) => {
             warn!(session = %session_key, source, reason = %reason, "policy-context: cannot consult coord — injecting the fail-open notice");
-            render_failure_notice(&reason, source, &fetched_at)
+            (
+                render_failure_notice(&reason, source, &fetched_at),
+                PolicyRenderDecision::pull_failed(raw_source, delivered_sha),
+            )
         }
     };
 
@@ -1150,13 +1711,50 @@ pub async fn policy_context(
         return None;
     }
 
+    // ONE event per injected session, never zero and never two. This is the
+    // event that already existed — message and `delivered_marker` /
+    // `confirmed_spawn_delivery` field names kept verbatim so saved greps still
+    // match — EXTENDED with the typed reason, the facts behind it, and both
+    // SHAs. A second event beside it would make a grep count answer twice.
+    //
+    // `source` is `normalize_source`'s LABEL and maps an absent source to
+    // `startup`; `source_raw` is what the hook actually sent, and `reason`
+    // separates the three non-confirmable shapes the label cannot.
+    //
+    // Gated on BOTH `should_count` and position, and the honest reading is that
+    // POSITION is still what decides behaviour here: `Off` returned above, and
+    // so did `Observe`, so by this line `mode` can only be `On` and
+    // `should_count(mode)` is a constant `true`. Moving this call above the
+    // `observe` early-return would still compile and still pass CI, because no
+    // TEST exercises this function. It is not dead — `mcp::sessions` calls it
+    // for every `SessionStart`, and the route is registered there — it is simply
+    // untested: it reads env and talks to coord, so making it EXERCISABLE under
+    // test is a bigger change than this phase.
+    //
+    // What the predicate buys is therefore NOT coverage of this call site. It
+    // is that the RULE — "only the mode that actually injects is counted" — now
+    // exists as a testable thing (`the_tally_counts_only_the_mode_that_actually
+    // _injects`) instead of only as a sentence in a comment, and that any FUTURE
+    // caller inherits it by calling `should_count` rather than by being placed
+    // correctly. The residual is real and is recorded, not closed.
+    if should_count(mode) {
+        record_render(decision.reason);
+    }
     info!(
         session = %session_key,
         source,
+        source_raw = source_for_log(raw_source),
         mode = mode.as_str(),
         bytes = text.len(),
-        delivered_marker = delivered_sha.is_some(),
-        confirmed_spawn_delivery = confirmed,
+        reason = decision.reason.as_str(),
+        served_full_body = decision.served_full_body(),
+        confirmed_spawn_delivery = decision.confirmed(),
+        source_confirmable = decision.source_confirmable,
+        delivered_marker = decision.marker_present,
+        body_present = decision.body_present,
+        marker_matches = decision.marker_matches,
+        delivered_sha = %decision.delivered_sha_short(),
+        policy_body_sha = %decision.body_sha_short(),
         "policy-context: injecting fleet policy at SessionStart"
     );
     Some(envelope(&text))
@@ -1233,6 +1831,27 @@ pub fn spawn_policy_body() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes every test that touches the process-global render counters.
+    ///
+    /// Module-level, not a `static` inside one test's body, because the counters
+    /// are shared by MORE THAN ONE test and `cargo test` runs a binary's tests on
+    /// parallel threads in one process (`.qontinui/ci.toml` runs `cargo test`,
+    /// not `nextest`, so there is no process-per-test isolation to fall back on).
+    /// A function-local lock cannot be taken by a sibling test, which is exactly
+    /// how the first version of this leaked: a second test recorded eight
+    /// increments unsynchronized, and when they landed between the counter test's
+    /// `before` and `after` every delta went off by one and failed as `2 != 1` —
+    /// reading as a SLOT-MAPPING BUG, the very defect this module was being fixed
+    /// for. An intermittent failure that accuses the wrong code is worse than no
+    /// test.
+    ///
+    /// Poison recovery per `CONTRIBUTING.md` ("Rust unit tests — env-var
+    /// hygiene"): a panicking holder must not cascade-fail its siblings. No
+    /// `Drop` guard is needed here — unlike an env var, a counter is never
+    /// "restored", and every assertion is on a DELTA precisely so that whatever a
+    /// previous holder left behind is irrelevant.
+    static COUNTER_LOCK: Mutex<()> = Mutex::new(());
 
     fn sample_payload() -> PolicyPayload {
         PolicyPayload {
@@ -1597,17 +2216,21 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn a_matching_marker_gets_the_short_confirmation_without_the_body() {
         let payload = sample_payload();
         let sha =
             crate::session::spawn_prompt::policy_body_sha(&render_policy_body(&payload).unwrap());
-        let (text, confirmed) = render_for_session(
+        let (text, decision) = render_for_session(
             &payload,
             Some(&sha),
             Some("compact"),
             "2026-08-19T12:00:00Z",
         );
-        assert!(confirmed);
+        assert!(decision.confirmed());
         // Still attributable, still versioned.
         assert!(text.starts_with("[qontinui-runner]"));
         assert!(text.contains("source: compact"));
@@ -1635,13 +2258,13 @@ mod tests {
         };
         let real_sha =
             crate::session::spawn_prompt::policy_body_sha(&render_policy_body(&real).unwrap());
-        let (short, confirmed) = render_for_session(
+        let (short, decision) = render_for_session(
             &real,
             Some(&real_sha),
             Some("startup"),
             "2026-08-19T12:00:00Z",
         );
-        assert!(confirmed);
+        assert!(decision.confirmed());
         let full = render_injection(&real, "startup", "2026-08-19T12:00:00Z");
         assert!(
             short.len() * 3 < full.len(),
@@ -1679,8 +2302,8 @@ mod tests {
                 expect_confirmed,
                 "{raw:?}"
             );
-            let (text, confirmed) = render_for_session(&payload, Some(&sha), raw, at);
-            assert_eq!(confirmed, expect_confirmed, "{raw:?}");
+            let (text, decision) = render_for_session(&payload, Some(&sha), raw, at);
+            assert_eq!(decision.confirmed(), expect_confirmed, "{raw:?}");
             assert!(text.contains(&format!("source: {label}")), "{raw:?}");
             if !expect_confirmed {
                 assert_eq!(text, render_injection(&payload, label, at), "{raw:?}");
@@ -1695,20 +2318,20 @@ mod tests {
         let full = render_injection(&payload, "startup", "2026-08-19T12:00:00Z");
 
         // No marker: the session was not given the file carrier.
-        let (text, confirmed) =
+        let (text, decision) =
             render_for_session(&payload, None, Some("startup"), "2026-08-19T12:00:00Z");
-        assert!(!confirmed);
+        assert!(!decision.confirmed());
         assert_eq!(text, full);
 
         // A marker for an OLDER body: the spawn-time copy is stale.
         let stale = crate::session::spawn_prompt::policy_body_sha("an older session-protocol");
-        let (text, confirmed) = render_for_session(
+        let (text, decision) = render_for_session(
             &payload,
             Some(&stale),
             Some("startup"),
             "2026-08-19T12:00:00Z",
         );
-        assert!(!confirmed);
+        assert!(!decision.confirmed());
         assert_eq!(text, full);
 
         // No body fetched: nothing to compare, the partial render stands.
@@ -1716,14 +2339,515 @@ mod tests {
             protocol_body: None,
             ..sample_payload()
         };
-        let (text, confirmed) = render_for_session(
+        let (text, decision) = render_for_session(
             &partial,
             Some(&stale),
             Some("startup"),
             "2026-08-19T12:00:00Z",
         );
-        assert!(!confirmed);
+        assert!(!decision.confirmed());
         assert!(text.contains("Step 0 is NOT satisfied"));
+    }
+
+    // =========================================================================
+    // Why the full body was served — the typed reason, the facts beside it, the
+    // two SHAs, and the counter.
+    //
+    // Plan `2026-09-21-policy-body-still-crosses-the-sessionstart-boundary`
+    // Phase 2. One test per arm of `PolicyRenderReason`: the arms exist so that
+    // no two causes share a label, and a test that covered several at once
+    // would be unable to tell them apart either.
+    // =========================================================================
+
+    /// The current body's SHA, the value a correctly-carried marker holds.
+    fn current_sha(payload: &PolicyPayload) -> String {
+        crate::session::spawn_prompt::policy_body_sha(&render_policy_body(payload).unwrap())
+    }
+
+    /// ARM: `confirmed`. Confirmable source, body present, marker present and
+    /// matching. This is the denominator — without it the full-body count has
+    /// nothing to divide by.
+    #[test]
+    fn a_matching_marker_on_a_confirmable_source_reasons_confirmed() {
+        let payload = sample_payload();
+        let sha = current_sha(&payload);
+        for source in ["startup", "compact", " COMPACT "] {
+            let (_, d) =
+                render_for_session(&payload, Some(&sha), Some(source), "2026-08-19T12:00:00Z");
+            assert_eq!(d.reason, PolicyRenderReason::Confirmed, "{source}");
+            assert_eq!(d.reason.as_str(), "confirmed");
+            assert!(d.confirmed(), "{source}");
+            assert!(
+                !d.served_full_body(),
+                "a confirmation must never be counted as a full body: {source}"
+            );
+            assert!(d.source_confirmable && d.marker_present && d.body_present && d.marker_matches);
+        }
+    }
+
+    /// ARM: `source_absent` — the cause Phase 0 measured in production, and the
+    /// single most valuable arm here.
+    ///
+    /// The materialized hook gated its payload parse on `command -v python`,
+    /// which does not exist on a Linux box, so it built a URL with NO `source=`
+    /// parameter and the route saw `None`. `normalize_source` labels that
+    /// `startup`, so 98 injections on 2026-09-20 looked like ordinary startups
+    /// holding a valid marker. This test is the assertion that an absent source
+    /// is never again filed under `resume`'s reason — or under `startup`'s.
+    ///
+    /// The marker here is CORRECT and matching, so nothing but the source can
+    /// have produced this reason.
+    #[test]
+    fn an_absent_source_reasons_source_absent_and_not_the_resume_arm() {
+        let payload = sample_payload();
+        let sha = current_sha(&payload);
+        for source in [None, Some(""), Some("   ")] {
+            let (text, d) =
+                render_for_session(&payload, Some(&sha), source, "2026-08-19T12:00:00Z");
+            assert_eq!(d.reason, PolicyRenderReason::SourceAbsent, "{source:?}");
+            assert_eq!(d.reason.as_str(), "source_absent");
+            assert!(d.served_full_body(), "{source:?}");
+            assert!(!d.source_confirmable, "{source:?}");
+            // Everything else about this session was fine — which is exactly
+            // what made the cause invisible.
+            assert!(
+                d.marker_present && d.body_present && d.marker_matches,
+                "{source:?}"
+            );
+            // And the label the event's `source` field would carry is the
+            // misleading one, which is why the typed reason has to exist.
+            assert_eq!(normalize_source(source), "startup", "{source:?}");
+            assert!(text.contains("source: startup"), "{source:?}");
+        }
+    }
+
+    /// ARM: `source_unrecognized`. A value this runner does not know — a future
+    /// Claude release or a hook bug. Also labelled `startup` by
+    /// `normalize_source`, and a third finding again: neither a defect in the
+    /// hook's shell nor correct behaviour.
+    #[test]
+    fn an_unknown_source_reasons_source_unrecognized() {
+        let payload = sample_payload();
+        let sha = current_sha(&payload);
+        for source in ["reload", "rewind", "startup2"] {
+            let (_, d) =
+                render_for_session(&payload, Some(&sha), Some(source), "2026-08-19T12:00:00Z");
+            assert_eq!(d.reason, PolicyRenderReason::SourceUnrecognized, "{source}");
+            assert_eq!(d.reason.as_str(), "source_unrecognized");
+            assert!(d.served_full_body(), "{source}");
+            assert!(!d.source_confirmable, "{source}");
+            assert!(
+                d.marker_present && d.body_present && d.marker_matches,
+                "{source}"
+            );
+            assert_eq!(normalize_source(Some(source)), "startup", "{source}");
+        }
+    }
+
+    /// ARM: `source_not_confirmable`. A KNOWN source that gets the full body BY
+    /// DESIGN. That population must be separable from the two above — conflating
+    /// them is how the plan's headline 524-vs-2 split overstated the defect.
+    #[test]
+    fn a_resume_or_clear_reasons_source_not_confirmable() {
+        let payload = sample_payload();
+        let sha = current_sha(&payload);
+        for source in ["resume", "clear", " CLEAR "] {
+            let (_, d) =
+                render_for_session(&payload, Some(&sha), Some(source), "2026-08-19T12:00:00Z");
+            assert_eq!(
+                d.reason,
+                PolicyRenderReason::SourceNotConfirmable,
+                "{source}"
+            );
+            assert_eq!(d.reason.as_str(), "source_not_confirmable");
+            assert!(d.served_full_body(), "{source}");
+            assert!(!d.source_confirmable, "{source}");
+            assert!(
+                d.marker_present && d.body_present && d.marker_matches,
+                "{source}"
+            );
+        }
+    }
+
+    /// ARM: `body_unavailable`. Coord served no protocol body, so there was
+    /// nothing to hash. It gets its OWN arm rather than folding into
+    /// `marker_absent`/`marker_mismatched`, because it names a coord-side
+    /// degradation and it changes the render itself (the partial notice).
+    #[test]
+    fn a_payload_with_no_body_reasons_body_unavailable() {
+        let bodyless = PolicyPayload {
+            protocol_body: None,
+            ..sample_payload()
+        };
+        // A marker IS present and a confirmable source IS given, so nothing but
+        // the missing body can explain this reason.
+        let marker = crate::session::spawn_prompt::policy_body_sha("anything at all");
+        let (text, d) = render_for_session(
+            &bodyless,
+            Some(&marker),
+            Some("startup"),
+            "2026-08-19T12:00:00Z",
+        );
+        assert_eq!(d.reason, PolicyRenderReason::BodyUnavailable);
+        assert_eq!(d.reason.as_str(), "body_unavailable");
+        assert!(d.source_confirmable && d.marker_present);
+        assert!(!d.body_present);
+        assert!(!d.marker_matches);
+        assert_eq!(d.body_sha, None);
+        assert_eq!(d.body_sha_short(), "<none>");
+        assert!(text.contains("Step 0 is NOT satisfied"));
+    }
+
+    /// ARM: `marker_absent`. A confirmable source and a body, but the session
+    /// forwarded no marker — the seam did not carry it.
+    #[test]
+    fn a_confirmable_source_with_no_marker_reasons_marker_absent() {
+        let payload = sample_payload();
+        for source in ["startup", "compact"] {
+            let (_, d) = render_for_session(&payload, None, Some(source), "2026-08-19T12:00:00Z");
+            assert_eq!(d.reason, PolicyRenderReason::MarkerAbsent, "{source}");
+            assert_eq!(d.reason.as_str(), "marker_absent");
+            assert!(d.served_full_body(), "{source}");
+            assert!(d.source_confirmable && d.body_present, "{source}");
+            assert!(!d.marker_present && !d.marker_matches, "{source}");
+            assert_eq!(d.delivered_sha_short(), "<none>", "{source}");
+        }
+    }
+
+    /// ARM: `marker_mismatched`. A marker arrived and names ANOTHER body — the
+    /// spawn-time copy is stale. Distinct from `marker_absent` because the
+    /// remedies are different: a stale copy means coord versioned the document
+    /// since the process started, not that a seam dropped the value.
+    #[test]
+    fn a_marker_for_another_body_reasons_marker_mismatched() {
+        let payload = sample_payload();
+        let stale = crate::session::spawn_prompt::policy_body_sha("an older session-protocol");
+        assert_ne!(stale, current_sha(&payload));
+        let (_, d) = render_for_session(
+            &payload,
+            Some(&stale),
+            Some("startup"),
+            "2026-08-19T12:00:00Z",
+        );
+        assert_eq!(d.reason, PolicyRenderReason::MarkerMismatched);
+        assert_eq!(d.reason.as_str(), "marker_mismatched");
+        assert!(d.served_full_body());
+        assert!(d.source_confirmable && d.marker_present && d.body_present);
+        assert!(!d.marker_matches);
+    }
+
+    /// ARM: `pull_failed`. The coord read failed, so the session got the
+    /// fail-open notice and NO policy body. Counted — otherwise `injections` is
+    /// not every `SessionStart` this route answered — but never counted as a
+    /// full body, which it is not.
+    #[test]
+    fn a_failed_pull_reasons_pull_failed_and_is_not_a_full_body() {
+        let sha = "ab".repeat(32);
+        let d = PolicyRenderDecision::pull_failed(Some("startup"), Some(&sha));
+        assert_eq!(d.reason, PolicyRenderReason::PullFailed);
+        assert_eq!(d.reason.as_str(), "pull_failed");
+        assert!(!d.served_full_body());
+        assert!(!d.confirmed());
+        // The facts it CAN still know are kept, and the one it cannot is false
+        // rather than invented.
+        assert!(d.source_confirmable && d.marker_present);
+        assert!(!d.body_present && !d.marker_matches);
+        assert_eq!(d.body_sha, None);
+
+        let d = PolicyRenderDecision::pull_failed(Some("resume"), None);
+        assert!(!d.source_confirmable && !d.marker_present);
+    }
+
+    /// `classify_source` is the whole source gate, and it agrees with
+    /// `source_permits_confirmation` on the confirmable/not split while adding
+    /// the three-way "why not".
+    #[test]
+    fn classify_source_splits_the_three_non_confirmable_shapes() {
+        // NOTE: the `source_permits_confirmation` assertions below are NOT a
+        // cross-check — that function delegates here, so they call the same code
+        // twice and nothing could disagree. They are kept as documentation that
+        // the two answers are one answer. The genuine pin on the accepted set is
+        // `only_startup_and_compact_may_confirm_a_matching_marker`.
+        for raw in [Some("startup"), Some("compact"), Some(" Startup ")] {
+            assert_eq!(classify_source(raw), Ok(()), "{raw:?}");
+            assert!(source_permits_confirmation(raw), "{raw:?}");
+            // A present, non-blank source is echoed to the log VERBATIM —
+            // untrimmed, so padding a hook accidentally sent stays visible.
+            assert_eq!(source_for_log(raw), raw.unwrap(), "{raw:?}");
+        }
+        for (raw, expect) in [
+            (None, PolicyRenderReason::SourceAbsent),
+            (Some(""), PolicyRenderReason::SourceAbsent),
+            (Some("  "), PolicyRenderReason::SourceAbsent),
+            (Some("resume"), PolicyRenderReason::SourceNotConfirmable),
+            (Some("clear"), PolicyRenderReason::SourceNotConfirmable),
+            (Some("reload"), PolicyRenderReason::SourceUnrecognized),
+        ] {
+            assert_eq!(classify_source(raw), Err(expect), "{raw:?}");
+            assert!(!source_permits_confirmation(raw), "{raw:?}");
+        }
+    }
+
+    /// The raw source reaches the log as itself, or as an explicit sentinel —
+    /// never as a BLANK field, which reads as a broken field rather than as an
+    /// absent value. That was a round-1 finding on `short_sha`'s sibling, and
+    /// the fix shipped untested, so both halves are pinned here.
+    #[test]
+    fn the_raw_source_logs_verbatim_or_says_it_was_absent() {
+        // Absent, empty and whitespace-only all render as the sentinel. The
+        // middle two are the round-1 defect: without the emptiness test they
+        // would log as an empty field.
+        for raw in [None, Some(""), Some("   "), Some("\t\n")] {
+            // The LITERAL, not the const: this field is a grep contract like
+            // `PolicyRenderReason::as_str`'s eight labels, and comparing a
+            // const against itself would let the spelling change under every
+            // saved query without a test objecting.
+            assert_eq!(source_for_log(raw), "<absent>", "{raw:?}");
+            assert!(!source_for_log(raw).is_empty(), "{raw:?}");
+        }
+        // Anything with content is echoed EXACTLY — the field's job is to say
+        // what the hook put on the wire, so neither case nor padding is
+        // normalized away.
+        for raw in ["startup", " startup ", "COMPACT", "reload", "x"] {
+            assert_eq!(source_for_log(Some(raw)), raw);
+        }
+        // And the two sentinels stay distinct, so a reader never has to work out
+        // which field a `<none>` belonged to.
+        assert_ne!(ABSENT_SOURCE, ABSENT_FIELD);
+    }
+
+    /// Both SHAs reach the decision, and the log form is the SAME 12-character
+    /// prefix the confirmation text shows a session — so a transcript and a log
+    /// line are comparable by eye. Phase 0 recorded the absence of these two
+    /// values as the reason no past injection could be re-adjudicated.
+    #[test]
+    fn the_decision_carries_both_shas_and_logs_the_same_prefix_the_text_shows() {
+        let payload = sample_payload();
+        let sha = current_sha(&payload);
+        let (text, d) = render_for_session(
+            &payload,
+            Some(&sha),
+            Some("startup"),
+            "2026-08-19T12:00:00Z",
+        );
+
+        assert_eq!(d.delivered_sha.as_deref(), Some(sha.as_str()));
+        assert_eq!(d.body_sha.as_deref(), Some(sha.as_str()));
+
+        let short: String = sha.chars().take(LOGGED_SHA_PREFIX).collect();
+        assert_eq!(LOGGED_SHA_PREFIX, 12);
+        assert_eq!(d.delivered_sha_short(), short);
+        assert_eq!(d.body_sha_short(), short);
+        assert!(
+            text.contains(&short),
+            "the confirmation shows the same prefix the log does"
+        );
+
+        // A stale marker is reported as ITSELF, not as the body's SHA — the
+        // point of logging both is that they can disagree.
+        let stale = crate::session::spawn_prompt::policy_body_sha("an older session-protocol");
+        let (_, d) = render_for_session(
+            &payload,
+            Some(&stale),
+            Some("startup"),
+            "2026-08-19T12:00:00Z",
+        );
+        assert_ne!(d.delivered_sha_short(), d.body_sha_short());
+        assert_eq!(d.delivered_sha.as_deref(), Some(stale.as_str()));
+        assert_eq!(d.body_sha.as_deref(), Some(sha.as_str()));
+    }
+
+    /// The precedence is the documented one, and a session that fails SEVERAL
+    /// preconditions still reports every fact.
+    ///
+    /// This is the anti-lumping guard: one reason per event is only honest if
+    /// the facts that did not win the precedence are still readable.
+    #[test]
+    fn the_reason_names_the_first_unmet_precondition_and_the_facts_all_survive() {
+        let bodyless = PolicyPayload {
+            protocol_body: None,
+            ..sample_payload()
+        };
+
+        // Source AND body AND marker all bad: the source gate is first.
+        let (_, d) = render_for_session(&bodyless, None, Some("resume"), "2026-08-19T12:00:00Z");
+        assert_eq!(d.reason, PolicyRenderReason::SourceNotConfirmable);
+        assert!(!d.source_confirmable && !d.body_present && !d.marker_present);
+
+        // Body AND marker both missing, source fine: a body must exist before a
+        // marker can be compared to anything, so the body wins.
+        let (_, d) = render_for_session(&bodyless, None, Some("startup"), "2026-08-19T12:00:00Z");
+        assert_eq!(d.reason, PolicyRenderReason::BodyUnavailable);
+        assert!(d.source_confirmable);
+        assert!(!d.body_present && !d.marker_present);
+    }
+
+    /// The label set is the grep contract — every saved query keys on these
+    /// strings — and exactly six of the eight arms mean a full body crossed the
+    /// hook boundary.
+    #[test]
+    fn every_reason_has_a_distinct_stable_label_and_six_mean_full_body() {
+        let labels: Vec<&str> = PolicyRenderReason::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "source_absent",
+                "source_unrecognized",
+                "source_not_confirmable",
+                "body_unavailable",
+                "marker_absent",
+                "marker_mismatched",
+                "confirmed",
+                "pull_failed",
+            ]
+        );
+        let full: Vec<&str> = PolicyRenderReason::ALL
+            .iter()
+            .filter(|r| r.served_full_body())
+            .map(|r| r.as_str())
+            .collect();
+        assert_eq!(
+            full,
+            vec![
+                "source_absent",
+                "source_unrecognized",
+                "source_not_confirmable",
+                "body_unavailable",
+                "marker_absent",
+                "marker_mismatched",
+            ],
+            "a confirmation and a failed pull carry no body and must not be counted as one"
+        );
+        // Slots are distinct, so no two reasons share a counter.
+        let mut slots: Vec<Option<usize>> =
+            PolicyRenderReason::ALL.iter().map(|r| r.slot()).collect();
+        assert!(
+            slots.iter().all(Option::is_some),
+            "every arm must resolve to a slot: {slots:?}"
+        );
+        slots.sort_unstable();
+        slots.dedup();
+        assert_eq!(slots.len(), PolicyRenderReason::ALL.len());
+    }
+
+    /// The counter array is sized by `COUNT`; the arms are listed in `ALL`.
+    /// They are two declarations of one number, so pin them together.
+    #[test]
+    fn the_arm_count_is_pinned_to_the_arm_list() {
+        assert_eq!(PolicyRenderReason::ALL.len(), PolicyRenderReason::COUNT);
+    }
+
+    /// `record_render` files each reason in its own slot, and the two derived
+    /// totals are the sums they claim to be.
+    ///
+    /// The counters are process-global, so this test serializes against itself
+    /// and asserts on DELTAS — an absolute assertion would be a race with any
+    /// future test that records.
+    #[test]
+    fn the_counter_files_each_reason_separately_and_the_totals_add_up() {
+        // Excludes every other counter-touching test in this binary — see
+        // `COUNTER_LOCK`. Assertions are still on DELTAS rather than absolutes,
+        // so an earlier holder's increments are irrelevant.
+        let _guard = COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let before = render_stats();
+        // A distinct, non-uniform number of hits per reason, so a slot that
+        // counts into a neighbour cannot pass by symmetry.
+        for (i, reason) in PolicyRenderReason::ALL.iter().enumerate() {
+            for _ in 0..=i {
+                record_render(*reason);
+            }
+        }
+        let after = render_stats();
+
+        assert_eq!(after.source_absent - before.source_absent, 1);
+        assert_eq!(after.source_unrecognized - before.source_unrecognized, 2);
+        assert_eq!(
+            after.source_not_confirmable - before.source_not_confirmable,
+            3
+        );
+        assert_eq!(after.body_unavailable - before.body_unavailable, 4);
+        assert_eq!(after.marker_absent - before.marker_absent, 5);
+        assert_eq!(after.marker_mismatched - before.marker_mismatched, 6);
+        assert_eq!(after.confirmed - before.confirmed, 7);
+        assert_eq!(after.pull_failed - before.pull_failed, 8);
+
+        // Hand-computed literals, NOT the same sum `render_stats` just made
+        // from the same locals: re-deriving `full_body_total` from the fields
+        // beside it passes on any implementation, including one that reads
+        // every slot as 0. 1+2+3+4+5+6 = 21 full-body; +7 confirmed +8 pull
+        // failed = 36 injections.
+        assert_eq!(after.full_body_total - before.full_body_total, 21);
+        assert_eq!(after.injections - before.injections, 36);
+    }
+
+    /// `should_count` is the rule that keeps the tally a count of INJECTIONS.
+    ///
+    /// Phase 2 originally expressed this as the POSITION of `record_render`
+    /// below `policy_context`'s `observe` early-return, guarded by five lines of
+    /// comment and nothing else. Moving that statement up compiled, passed every
+    /// test, and turned the counter into a tally of renders that were never
+    /// injected — a runner soaked in `observe` reporting a four-figure
+    /// `full_body_total` having delivered nothing. A predicate can be pinned.
+    #[test]
+    fn the_tally_counts_only_the_mode_that_actually_injects() {
+        assert!(should_count(Mode::On));
+        assert!(
+            !should_count(Mode::Observe),
+            "observe renders the payload and injects NOTHING — counting it makes \
+             full_body_total a count of renders that were never delivered"
+        );
+        assert!(!should_count(Mode::Off));
+    }
+
+    /// Every arm is reachable in the counter array, and none indexes past it.
+    ///
+    /// The slot is derived from `ALL`, so this is what makes the derivation's
+    /// promise real: a 9th arm left out of `ALL` compiles (`ALL: [Self; COUNT]`
+    /// stays a well-typed 8-element literal) and would otherwise be found only
+    /// by a panic inside the fail-open route.
+    #[test]
+    fn the_every_arm_is_listed_and_slots_are_in_range() {
+        for reason in PolicyRenderReason::ALL {
+            let slot = reason
+                .slot()
+                .unwrap_or_else(|| panic!("{} missing from ALL", reason.as_str()));
+            assert!(slot < PolicyRenderReason::COUNT, "{}", reason.as_str());
+        }
+        // Recording never panics, whatever the arm. This TOUCHES the shared
+        // counters, so it takes `COUNTER_LOCK` like every other test that does —
+        // without it these eight increments race the delta assertions in
+        // `the_counter_files_each_reason_separately_and_the_totals_add_up` and
+        // make it fail intermittently as though the slot mapping were wrong.
+        let _guard = COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for reason in PolicyRenderReason::ALL {
+            record_render(reason);
+        }
+    }
+
+    /// The snapshot serializes under the exact keys the stats route publishes —
+    /// they are the operator-facing half of the grep contract.
+    #[test]
+    fn the_stats_snapshot_publishes_one_key_per_reason_plus_the_two_totals() {
+        let json = serde_json::to_value(render_stats()).unwrap();
+        let obj = json.as_object().expect("stats serialize as an object");
+        for reason in PolicyRenderReason::ALL {
+            assert!(
+                obj.contains_key(reason.as_str()),
+                "stats must carry a key named for {}",
+                reason.as_str()
+            );
+        }
+        assert!(obj.contains_key("full_body_total"));
+        assert!(
+            obj.contains_key("injections"),
+            "the unit is an injection, not a session — the key says so"
+        );
+        assert!(
+            !obj.contains_key("total"),
+            "`total` was the per-SESSION lie; it must not come back"
+        );
+        assert_eq!(obj.len(), PolicyRenderReason::ALL.len() + 2);
     }
 
     #[test]

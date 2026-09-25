@@ -155,6 +155,10 @@ pub(super) fn strip_code_fences(s: &str) -> &str {
 /// scanned for escapes so a `{` inside a JSON string doesn't bump depth.
 ///
 /// Returns the input unchanged if no `{` is found or braces don't balance.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub(super) fn extract_first_json_object(s: &str) -> &str {
     let bytes = s.as_bytes();
     let Some(start) = bytes.iter().position(|&b| b == b'{') else {

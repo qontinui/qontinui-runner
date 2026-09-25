@@ -158,6 +158,10 @@ static RE_VERIFICATION_SUMMARY: Lazy<Regex> = Lazy::new(|| {
 ///   `output` set, but `generated_workflow_json` remains None.
 /// - Unrecognized sections → silently skipped.
 /// - A single malformed segment must never panic the whole parse.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn parse_structured_output(raw: &str) -> StructuredOutput {
     let raw_output_length = raw.len();
     if raw.is_empty() {
@@ -271,6 +275,10 @@ pub fn parse_structured_output(raw: &str) -> StructuredOutput {
 }
 
 /// Parse a single stage segment (text between two stage headers).
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn parse_stage_segment(name: String, segment: &str) -> StructuredStage {
     let mut steps: Vec<StructuredStep> = Vec::new();
     let mut success: Option<bool> = None;

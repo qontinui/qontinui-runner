@@ -21,6 +21,7 @@ import {
   uninstallWrapper,
 } from "@/lib/wrappers/api";
 import type { InstalledWrapper, WrapperStatus } from "@/lib/wrappers/types";
+import { wrapperStatusFromInfo } from "@/lib/wrappers/status";
 import { WrapperCard } from "@/components/wrappers/WrapperCard";
 
 export interface InstalledTabProps {
@@ -79,7 +80,7 @@ export function InstalledTab({
         wrappers.map(async (w) => {
           try {
             const info = await getWrapperStatus(w.id);
-            next[w.id] = info.status ?? "unknown";
+            next[w.id] = wrapperStatusFromInfo(info);
           } catch {
             next[w.id] = "unknown";
           }
@@ -110,7 +111,7 @@ export function InstalledTab({
     } finally {
       setBusyFor(id, false);
       const info = await getWrapperStatus(id).catch(() => null);
-      if (info) setStatuses((p) => ({ ...p, [id]: info.status ?? "unknown" }));
+      if (info) setStatuses((p) => ({ ...p, [id]: wrapperStatusFromInfo(info) }));
     }
   }, []);
 
@@ -123,7 +124,7 @@ export function InstalledTab({
     } finally {
       setBusyFor(id, false);
       const info = await getWrapperStatus(id).catch(() => null);
-      if (info) setStatuses((p) => ({ ...p, [id]: info.status ?? "unknown" }));
+      if (info) setStatuses((p) => ({ ...p, [id]: wrapperStatusFromInfo(info) }));
     }
   }, []);
 

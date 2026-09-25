@@ -116,7 +116,7 @@ const LOCK_FIXTURE_FN: &str = "isolated_ambient";
 const CROSS_FILE_WRITERS: [&str; 3] = ["isolate_coord_env", "EnvVarRestore", "isolated_ambient"];
 
 /// Floor for the walk, so a broken path or filter cannot pass vacuously.
-/// Sibling ratchet `row_get_ratchet.rs` declares its own floor the same way;
+/// Sibling ratchet `expect_ratchet.rs` declares its own floor the same way;
 /// 1559 files were walked when this was written.
 const MIN_FILES_WALKED: usize = 1000;
 /// Floor for the detected population, for the same reason: an empty offender

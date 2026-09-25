@@ -506,11 +506,17 @@ impl TranscriptEmitter {
                 self.machine_id,
                 session_id,
                 SessionEventKind::OutputChunk,
-                json!({
-                    "stream": TRANSCRIPT_STREAM,
-                    "chunk_offset": end_offset,
-                    "payload_b64": base64::engine::general_purpose::STANDARD.encode(chunk),
-                }),
+                // The owning tenant picks the push's credential slot; the
+                // wire body is rebuilt from the named fields, so it never
+                // reaches coord.
+                self.registrar.stamp_tenant(
+                    session_id,
+                    json!({
+                        "stream": TRANSCRIPT_STREAM,
+                        "chunk_offset": end_offset,
+                        "payload_b64": base64::engine::general_purpose::STANDARD.encode(chunk),
+                    }),
+                ),
             ));
             end_offset += chunk.len() as i64;
         }
@@ -575,9 +581,21 @@ mod tests {
     /// SECOND emitter over the same outbox file + offset sidecar — i.e.
     /// model a runner restart.
     fn emitter_in(dir: &Path) -> (TranscriptEmitter, Arc<AiCoordRegistrar>, Arc<OutboxWriter>) {
+        emitter_with_tenant(dir, || None)
+    }
+
+    /// [`emitter_in`] with the registrar's new-session tenant injected.
+    fn emitter_with_tenant(
+        dir: &Path,
+        tenant: fn() -> Option<Uuid>,
+    ) -> (TranscriptEmitter, Arc<AiCoordRegistrar>, Arc<OutboxWriter>) {
         let outbox = Arc::new(OutboxWriter::open(dir.join("outbox.jsonl")).unwrap());
         let machine_id = Uuid::new_v4();
-        let registrar = Arc::new(AiCoordRegistrar::new(outbox.clone(), machine_id));
+        let registrar = Arc::new(AiCoordRegistrar::with_tenant_resolver(
+            outbox.clone(),
+            machine_id,
+            tenant,
+        ));
         let em = TranscriptEmitter::new(outbox.clone(), machine_id, registrar.clone());
         (em, registrar, outbox)
     }
@@ -628,6 +646,24 @@ mod tests {
                 .unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn transcript_chunks_carry_the_sessions_owning_tenant() {
+        // qontinui-runner#1702 follow-up: an AI session is not in
+        // SessionRegistry, so a chunk with no top-level `tenant_id` resolves to
+        // `TenantScope::Unresolved` — unauthenticated on a multi-bound device.
+        const TENANT: Uuid = Uuid::from_u128(0xc231d9da_0ca8_4fe4_bd81_0e3d6c20339a);
+        let dir = tempdir().unwrap();
+        let (em, registrar, outbox) = emitter_with_tenant(dir.path(), || Some(TENANT));
+        let (trid, sid) = linked_run(&registrar, &outbox);
+
+        em.emit_inner(&trid, "a block");
+
+        let rows = transcript_rows(&outbox);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, sid);
+        assert_eq!(rows[0].payload["tenant_id"], json!(TENANT));
     }
 
     #[test]

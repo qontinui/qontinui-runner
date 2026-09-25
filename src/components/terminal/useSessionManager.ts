@@ -346,8 +346,10 @@ export interface UseSessionManagerReturn {
   activeCount: number;
   // Session-model counts for the Terminal-page StatusStrip (Claude
   // sessions, not PTY tabs). See `statusCounts` for the bucketing.
-  sessionCount: number;
+  claudeSessionCount: number;
   workingCount: number;
+  /** The `active-external` share of `workingCount` — see {@link StatusCounts}. */
+  externalWorkingCount: number;
   idleCount: number;
   completedCount: number;
   errorCount: number;
@@ -397,8 +399,16 @@ const STATUS_PRIORITY: Record<SessionLiveStatus, number> = {
 
 /** Counts surfaced to the Terminal-page StatusStrip pills. */
 export interface StatusCounts {
-  sessionCount: number;
+  claudeSessionCount: number;
+  /** Both running flavors: `active-in-zone` + `active-external`. */
   workingCount: number;
+  /**
+   * The `active-external` share of `workingCount` — running `claude`
+   * processes with no tab in this window. Carried separately so the strip can
+   * headline the page-scoped count and report the rest as `+M external`
+   * (see `splitWorking`).
+   */
+  externalWorkingCount: number;
   idleCount: number;
   completedCount: number;
   errorCount: number;
@@ -457,10 +467,12 @@ export function computeStatusCounts(sessions: readonly StatusCountsInput[]): Sta
   // Total = the live managed set: working + idle + needs-input + error +
   // completed. Equivalently the count of sessions that survived the
   // dormant/orphan filter above. Reconciles with the per-bucket pills.
-  const sessionCount = workingCount + idleCount + needsInputLive + errorCount + completedCount;
+  const claudeSessionCount =
+    workingCount + idleCount + needsInputLive + errorCount + completedCount;
   return {
-    sessionCount,
+    claudeSessionCount,
     workingCount,
+    externalWorkingCount: counts["active-external"],
     idleCount,
     completedCount,
     errorCount,
@@ -1201,8 +1213,9 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     needsInputCount,
     activeCount,
     // Session-model counts for the StatusStrip (excludes PTY-only tabs).
-    sessionCount: statusCounts.sessionCount,
+    claudeSessionCount: statusCounts.claudeSessionCount,
     workingCount: statusCounts.workingCount,
+    externalWorkingCount: statusCounts.externalWorkingCount,
     idleCount: statusCounts.idleCount,
     completedCount: statusCounts.completedCount,
     errorCount: statusCounts.errorCount,

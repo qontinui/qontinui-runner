@@ -203,6 +203,10 @@ pub fn parse_playbook_content(
 ///
 /// `pub(crate)`: also used by `crate::prompt_library` to parse coord-served
 /// prompt-template documents (same markdown-with-frontmatter format).
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub(crate) fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
     let content = content.trim_start();
 
@@ -269,6 +273,10 @@ pub fn load_playbooks_from_dir(dir: &Path) -> Vec<SkillDefinition> {
 }
 
 /// Find playbooks whose triggers match the given context.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn playbooks_for_context<'a>(
     playbooks: &'a [SkillDefinition],
     app_name: Option<&str>,

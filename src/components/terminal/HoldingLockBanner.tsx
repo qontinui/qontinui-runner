@@ -32,8 +32,10 @@
 
 import { useState } from "react";
 import { Hourglass, X } from "lucide-react";
+import { useUIElement } from "@qontinui/ui-bridge";
 import { getApiPort } from "@/lib/runner-api";
 import { createLogger } from "@/lib/logger";
+import { AdvisorySlot } from "./AdvisoryStack";
 import type { IncomingYieldRequest } from "./useFileLockTracking";
 import { useNow1Hz } from "./useNow1Hz";
 
@@ -298,6 +300,12 @@ export function HoldingLockBanner({
   // Mirrors the wait-side cooldown UX in {@link WaitingLockBanner}.
   const [signalCooldownUntilMs, setSignalCooldownUntilMs] = useState(0);
 
+  const { ref } = useUIElement({
+    id: "terminal-holding-lock-banner",
+    type: "generic",
+    label: "Holding lock banner",
+  });
+
   if (optimisticallyYielded) return null;
 
   const inSignalCooldown = nowMs < signalCooldownUntilMs;
@@ -361,19 +369,16 @@ export function HoldingLockBanner({
     setSignalCooldownUntilMs(Date.now() + SIGNAL_LONG_WAIT_COOLDOWN_MS);
     try {
       const f = fetchImpl ?? globalThis.fetch;
-      const resp = await f(
-        `http://127.0.0.1:${getApiPort()}/file-locks/signal-long-wait`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            file_path: filePath,
-            holder_task_run_id: taskRunId,
-            holder_name: taskRunName ?? taskRunId,
-            estimated_remaining_ms: null,
-          }),
-        },
-      );
+      const resp = await f(`http://127.0.0.1:${getApiPort()}/file-locks/signal-long-wait`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          file_path: filePath,
+          holder_task_run_id: taskRunId,
+          holder_name: taskRunName ?? taskRunId,
+          estimated_remaining_ms: null,
+        }),
+      });
       if (!resp.ok) {
         logger.warn(
           `signal-long-wait POST returned ${resp.status} for ${filePath} (holder=${taskRunId})`,
@@ -407,76 +412,79 @@ export function HoldingLockBanner({
   };
 
   return (
-    <div
-      data-ui-bridge-id="terminal.holding-lock-banner"
-      data-task-run-id={taskRunId}
-      data-file-path={filePath}
-      className="absolute top-2 right-2 z-30 w-[340px] p-2.5 rounded border bg-[#e0af68]/15 border-[#e0af68]/40 shadow-lg"
-    >
-      <div className="flex items-start gap-2">
-        <Hourglass className="w-3.5 h-3.5 shrink-0 text-[#e0af68] mt-0.5" />
-        <div className="text-[11px] text-[#c0caf5] leading-snug flex-1">
-          {message}
-          {autoYieldLabel && (
-            <span
-              data-ui-bridge-id="terminal.holding-lock-banner-auto-yield-countdown"
-              data-task-run-id={taskRunId}
-              data-file-path={filePath}
-              className="ml-1 text-[10px] text-muted-foreground"
-            >
-              ({autoYieldLabel})
-            </span>
-          )}
+    <AdvisorySlot>
+      <div
+        ref={ref}
+        data-ui-bridge-id="terminal.holding-lock-banner"
+        data-task-run-id={taskRunId}
+        data-file-path={filePath}
+        className="w-[340px] p-2.5 rounded border bg-[#e0af68]/15 border-[#e0af68]/40 shadow-lg"
+      >
+        <div className="flex items-start gap-2">
+          <Hourglass className="w-3.5 h-3.5 shrink-0 text-[#e0af68] mt-0.5" />
+          <div className="text-[11px] text-[#c0caf5] leading-snug flex-1">
+            {message}
+            {autoYieldLabel && (
+              <span
+                data-ui-bridge-id="terminal.holding-lock-banner-auto-yield-countdown"
+                data-task-run-id={taskRunId}
+                data-file-path={filePath}
+                className="ml-1 text-[10px] text-muted-foreground"
+              >
+                ({autoYieldLabel})
+              </span>
+            )}
+          </div>
+          <button
+            type="button"
+            aria-label="Dismiss banner"
+            onClick={onDismissLocal}
+            className="text-[#e0af68] hover:text-[#c0caf5] leading-none px-1"
+          >
+            <X className="w-3 h-3" />
+          </button>
         </div>
-        <button
-          type="button"
-          aria-label="Dismiss banner"
-          onClick={onDismissLocal}
-          className="text-[#e0af68] hover:text-[#c0caf5] leading-none px-1"
-        >
-          <X className="w-3 h-3" />
-        </button>
+        <div className="mt-2 flex items-center gap-1.5">
+          <button
+            type="button"
+            data-ui-bridge-id="terminal.holding-lock-banner-yield"
+            data-task-run-id={taskRunId}
+            data-file-path={filePath}
+            onClick={() => void handleYield()}
+            title="Release this lock so the waiting session can proceed"
+            className="px-2 py-0.5 rounded text-[10px] font-medium bg-[#7aa2f7] text-[#1a1b26] hover:bg-[#bb9af7] transition-colors"
+          >
+            Yield
+          </button>
+          <button
+            type="button"
+            data-ui-bridge-id="terminal.holding-lock-banner-hold"
+            data-task-run-id={taskRunId}
+            data-file-path={filePath}
+            onClick={onDismissLocal}
+            title="Keep the lock; banner re-appears on the next waiter event"
+            className="px-2 py-0.5 rounded text-[10px] font-medium border border-[#565f89] text-[#a9b1d6] hover:text-[#c0caf5] hover:border-[#a9b1d6] transition-colors"
+          >
+            Hold
+          </button>
+          <button
+            type="button"
+            data-ui-bridge-id="terminal.holding-lock-banner-signal-long-wait"
+            data-task-run-id={taskRunId}
+            data-file-path={filePath}
+            disabled={inSignalCooldown}
+            onClick={() => void handleSignalLongWait()}
+            title="Signal to the waiter that you'll be busy with this lock for a while."
+            className={
+              inSignalCooldown
+                ? "px-2 py-0.5 rounded text-[10px] font-medium border border-[#565f89]/30 text-[#565f89]/60 cursor-not-allowed"
+                : "px-2 py-0.5 rounded text-[10px] font-medium border border-[#565f89] text-[#a9b1d6] hover:text-[#c0caf5] hover:border-[#a9b1d6] transition-colors"
+            }
+          >
+            {inSignalCooldown ? `Cooldown ${signalCooldownLeft}s` : "I'll be a while"}
+          </button>
+        </div>
       </div>
-      <div className="mt-2 flex items-center gap-1.5">
-        <button
-          type="button"
-          data-ui-bridge-id="terminal.holding-lock-banner-yield"
-          data-task-run-id={taskRunId}
-          data-file-path={filePath}
-          onClick={() => void handleYield()}
-          title="Release this lock so the waiting session can proceed"
-          className="px-2 py-0.5 rounded text-[10px] font-medium bg-[#7aa2f7] text-[#1a1b26] hover:bg-[#bb9af7] transition-colors"
-        >
-          Yield
-        </button>
-        <button
-          type="button"
-          data-ui-bridge-id="terminal.holding-lock-banner-hold"
-          data-task-run-id={taskRunId}
-          data-file-path={filePath}
-          onClick={onDismissLocal}
-          title="Keep the lock; banner re-appears on the next waiter event"
-          className="px-2 py-0.5 rounded text-[10px] font-medium border border-[#565f89] text-[#a9b1d6] hover:text-[#c0caf5] hover:border-[#a9b1d6] transition-colors"
-        >
-          Hold
-        </button>
-        <button
-          type="button"
-          data-ui-bridge-id="terminal.holding-lock-banner-signal-long-wait"
-          data-task-run-id={taskRunId}
-          data-file-path={filePath}
-          disabled={inSignalCooldown}
-          onClick={() => void handleSignalLongWait()}
-          title="Signal to the waiter that you'll be busy with this lock for a while."
-          className={
-            inSignalCooldown
-              ? "px-2 py-0.5 rounded text-[10px] font-medium border border-[#565f89]/30 text-[#565f89]/60 cursor-not-allowed"
-              : "px-2 py-0.5 rounded text-[10px] font-medium border border-[#565f89] text-[#a9b1d6] hover:text-[#c0caf5] hover:border-[#a9b1d6] transition-colors"
-          }
-        >
-          {inSignalCooldown ? `Cooldown ${signalCooldownLeft}s` : "I'll be a while"}
-        </button>
-      </div>
-    </div>
+    </AdvisorySlot>
   );
 }

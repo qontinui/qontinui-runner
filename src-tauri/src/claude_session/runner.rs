@@ -358,6 +358,10 @@ pub(crate) fn build_inline_child_command(
 /// If `pid_tracker` is provided, the child process PID will be stored there so it can be
 /// killed by the stop_ai_analysis endpoint.
 #[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn run_claude_session_inline(
     working_dir: &str,
     prompt: &str,
@@ -557,15 +561,24 @@ fn run_claude_session_inline(
             working_dir,
             &ai_settings.claude_cli,
             // Phase 8b (B2): thread the session's RECORDED tenant so the
-            // federated pool agrees with the coord record + JWT slot by
-            // construction. `stamp_session_tenant` records the coord side
-            // from `machine.json::active_tenant_id` (spawn input else this
-            // pin); resolving the SAME source here — rather than letting
-            // `build_federation_ctx` fall back to
-            // `paired_user.json::default_tenant_id` — is what closes the
-            // split-brain. `None` on a single-tenant install (coord
-            // resolves the sole binding server-side).
-            crate::session::dual_write::resolve_active_tenant_id(),
+            // federated pool agrees with the coord record + JWT slot: the
+            // tenant `AiCoordRegistrar` stamped them with, looked up by this
+            // spawn's own id, then by the owning task run's id (a workflow
+            // phase session's id is suffixed; the run is what registered).
+            // Neither registered yet, or no tenant recorded: the registrar's
+            // own resolver. `None` on an unresolvable or unpaired machine.
+            crate::claude_session::coord_register::federation_session_tenant(
+                tauri::Manager::try_state::<
+                    std::sync::Arc<crate::claude_session::coord_register::AiCoordRegistrar>,
+                >(app_handle)
+                .as_deref()
+                .map(|r| &**r),
+                &crate::claude_session::coord_register::federation_session_keys(
+                    session_id,
+                    task_run_id,
+                    session_ctx.as_ref(),
+                ),
+            ),
         ) {
             Ok(ctx) => Some(ctx),
             Err(reason) => {

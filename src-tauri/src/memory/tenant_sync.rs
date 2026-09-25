@@ -865,6 +865,10 @@ fn redact_text(s: &str) -> String {
 }
 
 /// Truncate to at most `max_bytes` bytes on a char boundary.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;

@@ -1881,6 +1881,10 @@ fn preflight_node_bin_check(config: &ProcessConfig) -> Result<(), String> {
 /// duplicates state the dev_services.rs config already encodes. We instead
 /// pin those configs to `npx <name>` in dev_services.rs (see the Frontend
 /// service block) so the pre-flight has a single shape to recognize.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn expected_node_bin(config: &ProcessConfig) -> Option<String> {
     let cmd = config.command.trim();
     if cmd.eq_ignore_ascii_case("npx") {

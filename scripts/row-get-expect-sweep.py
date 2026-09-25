@@ -1,8 +1,24 @@
 #!/usr/bin/env python3
-"""Attribute every remaining `tokio_postgres::Row::get` site with a fn-level `#[expect]`.
+"""Attribute every remaining site of a denied clippy lint with a fn-level `#[expect]`.
 
 Plan `2026-09-03-coord-row-get-panic-class-closed-by-lint-and-supervisor`,
 Phase 3 step 2. Source: dossier:row-get-panic-kills-spawned-loop.
+
+The script is LINT-GENERIC (plan
+`2026-09-14-runner-str-byte-slice-class-has-no-lint-gate`, porting
+qontinui-coord#2164's `--lint` / `--reason`): `--lint` names the clippy lint
+whose diagnostics are attributed (default `clippy::disallowed_methods`, the
+`Row::get` gate it was written for) and `--reason` the `reason = "…"` text the
+attribute carries (default: the `Row::get` reason below). The attribute, its
+rustfmt block and the needle the idempotency check and the final count use are
+all derived from those two. The second use is `clippy::string_slice` —
+byte-slicing a `&str` by an offset that is not a char boundary panics — with
+the reason `legacy str byte slice — migrate to str::get / char_indices /
+str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate`.
+Both ceilings are pinned by `src-tauri/src/expect_ratchet.rs`.
+
+Everything below describes the `Row::get` default; substitute the `--lint` /
+`--reason` pair for any other lint.
 
 Provenance: adapted from qontinui-coord's `scripts/row-get-expect-sweep.py`
 (the same plan's Phase 1). The coord copy hard-codes coord's CI invocation
@@ -35,7 +51,7 @@ removal, the count); only the four-line one is ever written.
 
 `expect`, never `allow` (a migrated fn's stale attribute is itself a deny error
 via `unfulfilled_lint_expectations`), fn granularity, never file- or
-crate-level. `src-tauri/src/row_get_ratchet.rs` pins the attribute count as a
+crate-level. `src-tauri/src/expect_ratchet.rs` pins the attribute count as a
 ceiling that only falls.
 
 What this script does, per pass:
@@ -56,8 +72,10 @@ What this script does, per pass:
   4. Repeats until clippy exits 0 with zero `disallowed_methods` and zero
      `unfulfilled_lint_expectations` diagnostics.
 
-Unattributable sites TERMINATE the loop, they do not spin it: every pass asserts
-the diagnostic count strictly fell; on a no-progress pass the residual
+Unattributable sites TERMINATE the loop, they do not spin it: a pass that
+reports exactly the previous pass's site set, or that can attribute nothing,
+is no progress (a count comparison would misfire here, where each pass can
+lint a crate the previous one never reached); on a no-progress pass the residual
 `file:line` list is printed and the script exits 2. Those sites (a `Row::get`
 inside a module-level `static`/`const`/`Lazy` initializer or a `macro_rules!`
 body) are handled by hand -- an `#[expect]` on the enclosing non-fn item, or a
@@ -93,16 +111,51 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-LINT = "clippy::disallowed_methods"
+DEFAULT_LINT = "clippy::disallowed_methods"
+DEFAULT_REASON = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
 UNFULFILLED = "unfulfilled_lint_expectations"
-REASON = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
-# The single-line spelling (what the plan text shows; what a hand edit may type).
-ATTRIBUTE = f'#[expect(clippy::disallowed_methods, reason = "{REASON}")]'
-# The rustfmt spelling — the one this script writes. Inner lines are indented
-# one level (4 spaces) deeper than the `#[expect(` / `)]` lines.
-ATTRIBUTE_BLOCK = ("#[expect(", "clippy::disallowed_methods,", f'reason = "{REASON}"', ")]")
+
+
+def attribute_for(lint: str, reason: str) -> str:
+    """The single-line spelling (what a plan shows; what a hand edit may type)."""
+    return f'#[expect({lint}, reason = "{reason}")]'
+
+
+def block_for(lint: str, reason: str) -> tuple[str, str, str, str]:
+    """The rustfmt spelling — the one this script writes. Inner lines are
+    indented one level (4 spaces) deeper than the `#[expect(` / `)]` lines."""
+    return ("#[expect(", f"{lint},", f'reason = "{reason}"', ")]")
+
+
+def needle_for(lint: str) -> str:
+    """The attribute's prefix — what `count_attributes` and the ratchet match on
+    (against an attribute's whitespace-free form)."""
+    return f"#[expect({lint}"
+
+
+# The lint under attribution and its attribute. Module-level so every helper
+# reads one value; `configure` rebinds them for a `--lint` / `--reason` other
+# than the defaults.
+LINT = DEFAULT_LINT
+ATTRIBUTE = attribute_for(DEFAULT_LINT, DEFAULT_REASON)
+ATTRIBUTE_BLOCK = block_for(DEFAULT_LINT, DEFAULT_REASON)
 # Whitespace-free canonical form, equal for both spellings.
 ATTRIBUTE_COMPACT = re.sub(r"\s+", "", ATTRIBUTE)
+
+
+def configure(lint: str = DEFAULT_LINT, reason: str = DEFAULT_REASON) -> None:
+    """Select the lint the sweep attributes. Defaults reproduce the Row::get sweep."""
+    global LINT, ATTRIBUTE, ATTRIBUTE_BLOCK, ATTRIBUTE_COMPACT
+    if not lint.startswith("clippy::"):
+        raise ValueError(f"--lint must name a clippy lint (`clippy::…`), got {lint!r}")
+    if '"' in reason or "\\" in reason or "\n" in reason:
+        raise ValueError("--reason must be a single line with no double quote or backslash")
+    LINT = lint
+    ATTRIBUTE = attribute_for(lint, reason)
+    ATTRIBUTE_BLOCK = block_for(lint, reason)
+    ATTRIBUTE_COMPACT = re.sub(r"\s+", "", ATTRIBUTE)
+
+
 # The plan's fn-signature shape, widened only by `extern "…"` / `default` (both
 # legal item qualifiers). `fn(` (a fn-pointer type) deliberately does not match.
 FN_LINE = re.compile(
@@ -113,7 +166,13 @@ FN_LINE = re.compile(
 # attribute count is taken over the same set so the number printed here IS the
 # baseline. `src-tauri/clorinde` is generated ("Do not modify") and is not
 # under `src-tauri/src`, but the walk excludes any `clorinde` component anyway.
-RATCHET_DIRS = ("src-tauri/src",)
+# `src-tauri/tests` is walked because `cargo-guard.sh clippy` defaults to
+# `--all-targets`, which lints the integration tests too.
+RATCHET_DIRS = ("src-tauri/src", "src-tauri/tests")
+# Single files outside those directories that the lints reach: the build
+# script is linted by `[lints]` like any other target (and is compiled again as
+# a test module through `#[path = "../build.rs"]`).
+RATCHET_FILES = ("src-tauri/build.rs",)
 EXCLUDED_DIR_NAMES = ("clorinde",)
 
 
@@ -264,13 +323,84 @@ def attribute_block_from(lines: list[str], start: int) -> int | None:
     return None
 
 
+def fn_carries_attribute(lines: list[str], fn_idx: int) -> bool:
+    """Does the fn signature at `fn_idx` already carry THIS script's attribute?
+
+    Scans the whole outer-attribute / doc-comment stack directly above the
+    signature, not only the line above it: once two lints are grandfathered, a
+    fn can carry both expects, and the `--lint` being swept is not necessarily
+    the one nearest the signature. Other attributes (single- or multi-line) and
+    `//` / `///` comment lines are stepped over; anything else ends the stack.
+    """
+    j = fn_idx - 1
+    while j >= 0:
+        if attribute_block_at(lines, j) is not None:
+            return True
+        stripped = lines[j].strip()
+        if stripped.startswith("#[") or stripped.startswith("//"):
+            j -= 1
+            continue
+        if stripped.endswith("]"):
+            # The last line of some other multi-line attribute: step to its
+            # start, never past an item boundary (a blank line, or a line
+            # ending an item with `}` / `;`), so a statement that merely ends in
+            # `]` cannot borrow a neighbouring fn's attribute stack.
+            k = j - 1
+            while k >= 0:
+                inner = lines[k].strip()
+                if inner.startswith("#["):
+                    break
+                if not inner or inner.endswith("}") or inner.endswith(";"):
+                    return False
+                k -= 1
+            if k < 0:
+                return False
+            j = k - 1
+            continue
+        return False
+    return False
+
+
+def block_closed_before(lines: list[str], fn_idx: int, site_line: int) -> bool:
+    """Did the fn item at `fn_idx` already CLOSE before `site_line`?
+
+    Ported from qontinui-coord's copy of this script (coord finding
+    `a9760276`, the livelock fix). A fn's closing brace sits at the fn
+    signature's own indentation, so a line between the candidate and the site
+    that is a bare closing brace at EXACTLY that indentation means the
+    candidate does not enclose the site:
+
+        fn outer_test() {          // indent 4, the real enclosing fn
+            fn conn() -> Client {  // indent 8, closes before the site
+                …
+            }
+            let id: Uuid = row.get(0);   // indent 8, the site
+        }
+
+    Without it the nested helper wins the upward walk, takes the attribute,
+    holds no site, is stripped by `unfulfilled_lint_expectations`, and is
+    chosen again on the next pass. Indentation-based, so a heuristic; a false
+    negative falls back to the previous behaviour, which the no-progress guard
+    terminates. Exact-indent and brace-only on purpose — a false POSITIVE would
+    make a real enclosing fn look closed (a `}` inside a raw-string fixture).
+    """
+    fn_indent = indent_of(lines[fn_idx])
+    for j in range(fn_idx + 1, site_line - 1):
+        stripped = lines[j].strip()
+        if stripped in ("}", "};", "},", "})", "});", "}),") and indent_of(lines[j]) == fn_indent:
+            return True
+    return False
+
+
 def enclosing_fn_line(lines: list[str], site_line: int) -> int | None:
     """0-based index of the fn-signature line the attribute goes above, or None.
 
     Walks upward from the site. A candidate is a fn line at indentation <= the
-    site's. If that candidate already carries the attribute (the site was still
-    reported, so it is not the real enclosing item), the walk continues, now
-    requiring a STRICTLY smaller indentation than that candidate.
+    site's whose block has NOT already closed before the site
+    (`block_closed_before`). If that candidate already carries the attribute
+    (the site was still reported, so it is not the real enclosing item), the
+    walk continues, now requiring a STRICTLY smaller indentation than that
+    candidate.
     """
     if site_line < 1 or site_line > len(lines):
         return None
@@ -279,7 +409,11 @@ def enclosing_fn_line(lines: list[str], site_line: int) -> int | None:
     while i >= 0:
         line = lines[i]
         if FN_LINE.match(line) and indent_of(line) <= max_indent:
-            if attribute_block_at(lines, i - 1) is not None:
+            if block_closed_before(lines, i, site_line):
+                # Not an enclosing item at all — keep walking WITHOUT tightening
+                # max_indent: the real enclosing fn may share this indentation.
+                pass
+            elif fn_carries_attribute(lines, i):
                 max_indent = indent_of(line) - 1
                 if max_indent < 0:
                     return None
@@ -364,6 +498,11 @@ def remove_stale_attributes(
         lines = path.read_text(encoding="utf-8").splitlines()
         start = site[1] - 1
         end = attribute_block_from(lines, start)
+        if end is None:
+            # rustc points an unfulfilled expectation at the LINT NAME, which in
+            # the four-line spelling is the line below `#[expect(`.
+            start -= 1
+            end = attribute_block_from(lines, start)
         if end is not None:
             by_file[path].add((start, end))
         else:
@@ -387,7 +526,9 @@ def attribute_starts(text: str):
     following lines up to the one that is exactly `)]`. `compact` is the joined
     text with all whitespace removed, so `#[expect(clippy::disallowed_methods`
     matches either spelling and prose quoting the attribute inside a comment
-    does not. Mirrors `attribute_starts` in `row_get_ratchet.rs`.
+    does not. The Rust ratchet (`flatten_attributes` in `expect_ratchet.rs`)
+    joins until the brackets balance rather than until a `)]` line; the two
+    agree on both spellings this script reads and writes.
     """
     lines = text.splitlines()
     i = 0
@@ -406,33 +547,37 @@ def attribute_starts(text: str):
 
 
 def count_attributes(root: Path) -> tuple[int, int]:
-    """Count ATTRIBUTES the way `row_get_ratchet.rs` does.
+    """Count ATTRIBUTES the way `expect_ratchet.rs` does, for the selected lint.
 
     An attribute counts when its whitespace-free form STARTS with the needle
     (either spelling) -- prose in a doc comment that quotes the attribute does
     not. The ratchet file itself is skipped there too (it spells the needle as
     a literal).
     """
-    needle = "#[expect(clippy::disallowed_methods"
+    needle = needle_for(LINT)
     total = 0
     files = 0
+    paths: list[Path] = []
     for rel in RATCHET_DIRS:
         base = root / rel
         if not base.is_dir():
             continue
         for path in sorted(base.rglob("*.rs")):
-            if path.name == "row_get_ratchet.rs":
+            if path.name == "expect_ratchet.rs":
                 continue
             if any(part in EXCLUDED_DIR_NAMES for part in path.relative_to(base).parts):
                 continue
-            n = sum(
-                1
-                for _, compact in attribute_starts(path.read_text(encoding="utf-8"))
-                if compact.startswith(needle)
-            )
-            if n:
-                total += n
-                files += 1
+            paths.append(path)
+    paths.extend(root / rel for rel in RATCHET_FILES if (root / rel).is_file())
+    for path in paths:
+        n = sum(
+            1
+            for _, compact in attribute_starts(path.read_text(encoding="utf-8"))
+            if compact.startswith(needle)
+        )
+        if n:
+            total += n
+            files += 1
     return total, files
 
 
@@ -474,9 +619,24 @@ def main() -> int:
         default=None,
         help="feed pass 1 from this saved --message-format=json stream instead of running clippy",
     )
+    ap.add_argument(
+        "--lint",
+        default=DEFAULT_LINT,
+        help=f"the clippy lint to attribute (default {DEFAULT_LINT}; e.g. clippy::string_slice)",
+    )
+    ap.add_argument(
+        "--reason",
+        default=DEFAULT_REASON,
+        help="the `reason = \"…\"` text the inserted attribute carries (default: the Row::get reason)",
+    )
     ap.add_argument("--max-passes", type=int, default=12)
     ap.add_argument("--dry-run", action="store_true", help="plan insertions for one pass, write nothing")
     args = ap.parse_args()
+    try:
+        configure(args.lint, args.reason)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     root = Path(args.repo_root).resolve()
     if not (root / "Cargo.toml").is_file():
         print(f"no Cargo.toml under {root}", file=sys.stderr)
@@ -488,7 +648,12 @@ def main() -> int:
     roots = [root, cwd]
     cmd = clippy_command(args.cargo, args.target, args.clippy_arg)
 
-    previous: int | None = None
+    # The site SET of the previous pass. A pass is "no progress" only when it
+    # reports exactly the sites the previous pass already attributed — a COUNT
+    # comparison misfires on this crate graph, where a denied lint stops the
+    # build script, then the lib, before the bin is ever linted, so each pass
+    # legitimately surfaces MORE sites than the one before (7, then 53, …).
+    previous: set[tuple[str, int]] | None = None
     for pass_no in range(1, args.max_passes + 1):
         if pass_no == 1 and args.from_json:
             print(f"[pass {pass_no}] reading saved diagnostics from {args.from_json}", flush=True)
@@ -529,14 +694,14 @@ def main() -> int:
                 sys.stdout.write(msg.get("rendered") or (msg.get("message", "") + "\n"))
             print(f"[fail] clippy exit={status} with no {LINT} sites left to attribute — see above")
             return 1
-        if previous is not None and len(sites) >= previous and not removed:
-            print(f"[fail] no progress: pass {pass_no} reported {len(sites)} sites, previous pass {previous}")
+        if previous is not None and sites == previous and not removed:
+            print(f"[fail] no progress: pass {pass_no} reported the same {len(sites)} site(s) as the previous pass")
             _, residual = plan_insertions(roots, sites)
-            print("residual (handle by hand — #[expect] on the enclosing non-fn item, or migrate to try_get):")
+            print("residual (handle by hand — #[expect] on the enclosing non-fn item, or migrate the site):")
             for file_name, line_no in sorted(set(residual) | sites):
                 print(f"  {file_name}:{line_no}")
             return 2
-        previous = len(sites)
+        previous = set(sites)
         insertions, residual = plan_insertions(roots, sites)
         inserted = apply_insertions(insertions, args.dry_run)
         print(

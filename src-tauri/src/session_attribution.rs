@@ -214,6 +214,10 @@ pub(crate) fn map_path_to_repo_file(
 /// - Returns `None` when there's no `/<workspace_dir>/` segment, no remainder
 ///   after the repo, or `repo` doesn't start with `qontinui-` (e.g. a
 ///   `multistate` repo, or a path outside the monorepo).
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn map_normalized_under(normalized: &str, workspace_dir: &str) -> Option<(String, String)> {
     // Anchor on the `/<workspace_dir>/` segment; take everything after it. The
     // leading `/` ensures we match a path SEGMENT, not a substring inside a dir

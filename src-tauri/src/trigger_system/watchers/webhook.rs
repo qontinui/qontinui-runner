@@ -131,6 +131,10 @@ fn split_path_segments(path: &str) -> Vec<String> {
 }
 
 /// Parse array access notation: "field[0]" -> ("field", 0)
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn parse_array_access(segment: &str) -> Option<(String, usize)> {
     if let Some(bracket_start) = segment.find('[') {
         if let Some(bracket_end) = segment.find(']') {
