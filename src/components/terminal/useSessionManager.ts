@@ -288,6 +288,13 @@ export interface UseSessionManagerParams {
   onRefreshSessions: () => void;
   onResumeSession: (session: TranscriptSession) => void;
   onSelectSession: (sessionId: string) => void;
+  /**
+   * Bring a session's open terminal tab into view. Called by `openSession`
+   * instead of `onSelectSession` when the session is backed by a live tab in
+   * this window, so a card click takes the operator to the running session
+   * rather than to a read-only transcript of it.
+   */
+  onFocusSessionTab: (sessionId: string, tabId: string) => void;
 }
 
 export interface UseSessionManagerReturn {
@@ -315,6 +322,12 @@ export interface UseSessionManagerReturn {
   refresh: () => void;
   resumeSession: (session: UnifiedSession) => void;
   viewTranscript: (session: UnifiedSession) => void;
+  /**
+   * The card-body click: go to the session's open terminal tab when it has a
+   * live one in this window, else show its transcript. `viewTranscript` stays
+   * the explicit "show me the transcript" action.
+   */
+  openSession: (session: UnifiedSession) => void;
   copySessionId: (session: UnifiedSession) => void;
 
   // Multi-select & bulk actions
@@ -481,6 +494,24 @@ export function computeStatusCounts(sessions: readonly StatusCountsInput[]): Sta
 
 // ── Hook ─────────────────────────────────────────────────────────────────────
 
+/**
+ * The tab a card click should take the operator to, or null when the session
+ * has no LIVE tab in this window and its transcript is all there is to show.
+ *
+ * - `zoneTabId` is set for any tab carrying the session's id, exited ones
+ *   included; revealing an exited stub would push a live terminal out of its
+ *   zone to show a dead one, so only a live tab qualifies.
+ * - Injected fixtures point `zoneTabId` at a synthetic tab no zone can hold.
+ */
+export function liveTabIdForSession(
+  session: Pick<UnifiedSession, "zoneTabId" | "_transcript">,
+  tabs: readonly Pick<TerminalTab, "id" | "isAlive">[],
+): string | null {
+  const tabId = session.zoneTabId;
+  if (!tabId || isInjectedSession(session)) return null;
+  return tabs.some((t) => t.id === tabId && t.isAlive) ? tabId : null;
+}
+
 export function useSessionManager(params: UseSessionManagerParams): UseSessionManagerReturn {
   const {
     tabs,
@@ -492,6 +523,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     onRefreshSessions,
     onResumeSession,
     onSelectSession,
+    onFocusSessionTab,
   } = params;
 
   // Digest state
@@ -1127,6 +1159,18 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     [onSelectSession],
   );
 
+  const openSession = useCallback(
+    (session: UnifiedSession) => {
+      const tabId = liveTabIdForSession(session, tabs);
+      if (tabId) {
+        onFocusSessionTab(session.sessionId, tabId);
+        return;
+      }
+      onSelectSession(session.sessionId);
+    },
+    [tabs, onSelectSession, onFocusSessionTab],
+  );
+
   const copySessionId = useCallback((session: UnifiedSession) => {
     navigator.clipboard.writeText(session.sessionId).catch(() => {});
   }, []);
@@ -1197,6 +1241,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     refresh,
     resumeSession,
     viewTranscript,
+    openSession,
     copySessionId,
     selectedIds,
     toggleSelect,

@@ -89,6 +89,8 @@ export interface TerminalInstanceHandle {
   getScrollback: (maxLines?: number) => string;
   /** Scroll the terminal viewport to the very bottom. */
   scrollToBottom: () => void;
+  /** Give the terminal keyboard focus, so typing goes to this session. */
+  focus: () => void;
 }
 
 export type ShellIntegrationEvent =
@@ -491,6 +493,9 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
       },
       scrollToBottom: () => {
         backendRef.current?.scrollToBottom();
+      },
+      focus: () => {
+        backendRef.current?.focus();
       },
     }));
 

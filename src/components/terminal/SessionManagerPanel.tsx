@@ -127,6 +127,7 @@ export function SessionManagerPanel({
     setSortBy,
     refresh,
     resumeSession,
+    openSession,
     viewTranscript,
     copySessionId,
     selectedIds,
@@ -321,6 +322,7 @@ export function SessionManagerPanel({
                   fileConflictCount={sessionConflictCounts?.get(session.sessionId) ?? 0}
                   lockState={sessionLockStates?.get(session.sessionId)}
                   onResume={resumeSession}
+                  onOpen={openSession}
                   onViewTranscript={viewTranscript}
                   onCopyId={copySessionId}
                   onToggleSelect={toggleSelect}

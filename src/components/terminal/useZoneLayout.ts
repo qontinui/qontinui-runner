@@ -601,6 +601,25 @@ export function useZoneLayout(
   const [focusedZone, setFocusedZone] = useState<number>(persistedState?.focusedZone ?? 0);
   /** Zone index that is temporarily maximized (null = normal grid) */
   const [maximizedZone, setMaximizedZone] = useState<number | null>(null);
+  /**
+   * A one-shot "bring this tab into view and give it the keyboard" request
+   * (a Session Manager card click). `seq` makes a repeat click on the same tab
+   * a new request: focus moves alone cannot express it, because clicking the
+   * already-focused session changes no focus state at all.
+   */
+  const [revealRequest, setRevealRequest] = useState<{ tabId: string; seq: number } | null>(null);
+  const requestReveal = useCallback((tabId: string) => {
+    setRevealRequest((prev) => ({ tabId, seq: (prev?.seq ?? 0) + 1 }));
+  }, []);
+  /**
+   * Mark a reveal handled. The request is consumed rather than left standing
+   * because the page provider swaps which page's layout is exposed: a request
+   * left in place would replay — and steal keyboard focus — every time its
+   * page became active again. Keeps `seq` so the next click is still new.
+   */
+  const consumeReveal = useCallback((seq: number) => {
+    setRevealRequest((prev) => (prev && prev.seq === seq ? { ...prev, tabId: "" } : prev));
+  }, []);
 
   // Zones explicitly claimed by a durable session record during restore.
   // The creation-order auto-fill below MUST NOT steal these even while the
@@ -852,6 +871,9 @@ export function useZoneLayout(
     maximizedZone,
     setMaximizedZone,
     toggleMaximize,
+    revealRequest,
+    requestReveal,
+    consumeReveal,
     unassignedTabIds,
     exitedUnassignedTabIds,
     isMultiZone,

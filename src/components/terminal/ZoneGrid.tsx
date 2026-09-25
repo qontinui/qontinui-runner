@@ -381,6 +381,35 @@ function ZoneGridInner({
     scrollCellIntoView(cellFor(focusedTabId));
   }, [isFlowMode, focusedTabId, cellFor]);
 
+  // ── Explicit reveal (Session Manager card click) ─────────────────────────
+  //
+  // The effect above only scrolls when the focused tab CHANGES, so re-clicking
+  // the session that is already focused but scrolled away would do nothing.
+  // A reveal request always scrolls (flow mode) and hands the terminal the
+  // keyboard, so the operator can type into the session they just picked.
+  // Runs after the commit that applied the request's zone assignment + focus.
+  // A flow cell that was virtual has no mounted instance yet, so its focus is
+  // a no-op until the scroll mounts it; the zone is still focused and visible.
+  //
+  // Each request is handled once and then consumed (an emptied `tabId`), so
+  // switching back to this page, or remounting the grid, never replays it.
+  // The focus frame is deliberately not cancelled on cleanup: consuming the
+  // request re-runs this effect immediately, which would cancel it.
+  const revealRequest = zoneLayout.revealRequest;
+  const consumeReveal = zoneLayout.consumeReveal;
+  useEffect(() => {
+    if (!revealRequest?.tabId) return;
+    const { tabId, seq } = revealRequest;
+    if (isFlowMode) scrollCellIntoView(cellFor(tabId));
+    requestAnimationFrame(() => {
+      terminalRefs.get(tabId)?.current?.focus();
+    });
+    consumeReveal(seq);
+    // Keyed on the request object alone: each click mints a new one, and a
+    // layout change must not re-handle a click.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [revealRequest]);
+
   // ── Phase 4: focus + scroll a newly docked session (flow mode only) ──────
   //
   // A new session (gate-continuation dock / new-session dock via the

@@ -56,6 +56,8 @@ interface SessionCardProps {
    */
   lockState?: LockState;
   onResume: (session: UnifiedSession) => void;
+  /** Card-body click: go to the open session's terminal, else its transcript. */
+  onOpen: (session: UnifiedSession) => void;
   onViewTranscript: (session: UnifiedSession) => void;
   onCopyId: (session: UnifiedSession) => void;
   onToggleSelect: (sessionId: string) => void;
@@ -221,6 +223,7 @@ function SessionCardInner({
   fileConflictCount = 0,
   lockState,
   onResume,
+  onOpen,
   onViewTranscript,
   onCopyId,
   onToggleSelect,
@@ -414,7 +417,8 @@ function SessionCardInner({
 
   const cardName = sessionCardName(session);
   // Registered on the card's main BUTTON, not the wrapper `<div>`: the button
-  // is what actually opens the transcript (a click dispatched at the wrapper
+  // is what actually acts on a click — it focuses the session's open terminal
+  // tab when it has one, else opens the transcript (a click dispatched at the wrapper
   // would not reach the child handler), and it spans the whole visible card
   // row, so its rect is the card's rect.
   //
@@ -469,7 +473,7 @@ function SessionCardInner({
         // rich multi-line tooltip, which makes a poor name, so the headline is
         // stated separately here; the tooltip is unchanged visually.
         aria-label={cardName}
-        onClick={() => onViewTranscript(session)}
+        onClick={() => onOpen(session)}
         className="w-full text-left px-3 py-2 pr-20"
         title={sessionCardTooltip(session)}
       >

@@ -104,6 +104,7 @@ import { useFindingsActions } from "../useFindingsActions";
 import { useTranscriptSessions } from "../useTranscriptSessions";
 import { useSessionManager } from "../useSessionManager";
 import { deriveSyntheticTabs } from "../syntheticTabs";
+import { planTabReveal } from "../tabReveal";
 import { useZoneLabelsAndTags } from "../useZoneLabelsAndTags";
 import { TerminalOutputCoalescer, base64ToBytes } from "../terminalOutputTap";
 
@@ -741,6 +742,35 @@ const PageSessionScope = memo(function PageSessionScope({
     onSelectSession: (sessionId: string) => {
       selectedSessionSetterRef.current(sessionId);
       rightPanelModeSetterRef.current("transcript" as never);
+    },
+    onFocusSessionTab: (sessionId: string, tabId: string) => {
+      // Defensive: `zoneTabId` only ever names a tab this window owns, but a
+      // stale or synthetic id must fall back to the transcript, not a no-op.
+      const plan = tabs.some((t) => t.id === tabId)
+        ? planTabReveal(
+            zoneLayout.assignments,
+            zoneLayout.layout.zones.length,
+            zoneLayout.focusedZone,
+            tabId,
+          )
+        : null;
+      if (!plan) {
+        selectedSessionSetterRef.current(sessionId);
+        rightPanelModeSetterRef.current("transcript" as never);
+        return;
+      }
+      if (plan.assign) zoneLayout.assignTabToZone(plan.zone, tabId);
+      // A maximized pane would hide the zone we focus — carry the maximize
+      // over to it so the session actually comes into view.
+      if (zoneLayout.maximizedZone !== null && zoneLayout.maximizedZone !== plan.zone) {
+        zoneLayout.setMaximizedZone(plan.zone);
+      }
+      zoneLayout.setFocusedZone(plan.zone);
+      // Scroll it into view (flow mode) and hand it the keyboard — also when
+      // it was already the focused zone, where none of the above changes state.
+      zoneLayout.requestReveal(tabId);
+      // Keep the card highlighted as the current session.
+      selectedSessionSetterRef.current(sessionId);
     },
   });
 
