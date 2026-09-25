@@ -3964,11 +3964,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 let restore_record_outbox = registrar_outbox.clone();
 
                 // Transcript cloud sync (plan 2026-07-09-runner-session-
-                // history-cloud-sync, Phase 2) — durable, opt-in mirror of
-                // AI transcript blocks into the SAME session outbox the
-                // drain loop reads. Gated on Settings.cloud_sync_enabled
-                // inside `emit`; the AI-output persist sites reach it via
-                // Tauri state.
+                // history-cloud-sync, Phase 2) — durable mirror of AI
+                // transcript blocks into the SAME session outbox the drain
+                // loop reads. Gated on Settings.cloud_sync_enabled (default
+                // on since plan 2026-09-22-transcript-sync-default-on-with-
+                // tenant-and-user-controls) inside `emit`; the AI-output
+                // persist sites reach it via Tauri state.
                 let transcript_emitter =
                     std::sync::Arc::new(session::transcript_emitter::TranscriptEmitter::new(
                         registrar_outbox,
@@ -5987,9 +5988,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
             // Start the tenant memory-synthesis poller (plan
             // 2026-07-11-tenant-memory-v1-1). Consent-gated on
-            // `cloud_sync_enabled` — idles with zero network calls until the
-            // user opts in. Claims synthesis jobs from the web memory API,
-            // distills them via the warm Claude provider, and posts results.
+            // `cloud_sync_enabled` (default on) — idles with zero network
+            // calls while the user has it switched off. Claims synthesis
+            // jobs from the web memory API, distills them via the warm
+            // Claude provider, and posts results.
             info!("Starting tenant memory-synthesis poller");
             memory::memory_synthesis::start_memory_job_poller();
 

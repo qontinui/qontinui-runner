@@ -587,6 +587,34 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         probe_with_empty_args: false,
         observe_projection: None,
     },
+    // ---- Gate-2 sibling: session-metadata sync consent ----
+    //
+    // The consent model was split into two runner-global flags by plan
+    // `2026-07-10-split-cloud-sync-consent`, and both sit side by side in
+    // `WebIntegrationSettings.tsx`. Allowlisting only gate 1 above left a
+    // headless runner able to reach one half of that model and not the other;
+    // this pair is the same plain settings.json read/write, so it takes the
+    // same `Dispatch::InProcess` shape.
+    ProxyableCommand {
+        name: "get_session_metadata_sync_settings",
+        dispatch: Dispatch::InProcess,
+        description: "Return this runner's session-metadata sync consent flag (`session_metadata_sync_enabled`) -- the gate-2 sibling of `get_cloud_sync_settings` (already registered in Tauri; this entry only allowlists it over HTTP so a headless runner instance can read it without a desktop session). `Dispatch::InProcess`: a plain settings.json read, so it answers on a webview-less runner.",
+        args_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
+        response_schema: r#"{"type":"object","required":["success","data"],"properties":{"success":{"type":"boolean"},"message":{"type":["string","null"]},"data":{"type":"object","required":["session_metadata_sync_enabled"],"properties":{"session_metadata_sync_enabled":{"type":"boolean"}}}}}"#,
+        // Same boot-probe opt-out as `get_cloud_sync_settings` above.
+        probe_with_empty_args: false,
+        observe_projection: None,
+    },
+    ProxyableCommand {
+        name: "save_session_metadata_sync_settings",
+        dispatch: Dispatch::InProcess,
+        description: "Persist this runner's `session_metadata_sync_enabled` consent flag -- the gate-2 sibling of `save_cloud_sync_settings` (already registered in Tauri; this entry only allowlists it over HTTP so a headless runner instance can flip it without a desktop session). `Dispatch::InProcess`: a plain settings.json write. `sessionMetadataSyncEnabled` is required.",
+        args_schema: r#"{"type":"object","required":["sessionMetadataSyncEnabled"],"properties":{"sessionMetadataSyncEnabled":{"type":"boolean"}}}"#,
+        response_schema: r#"{"type":"object","required":["success"],"properties":{"success":{"type":"boolean"},"message":{"type":["string","null"]},"data":{"type":"null"}}}"#,
+        // Required arg + mutates settings.json, as `save_cloud_sync_settings`.
+        probe_with_empty_args: false,
+        observe_projection: None,
+    },
 ];
 
 /// Whether a command name is in the UI Bridge invoke allowlist.
@@ -810,26 +838,28 @@ mod tests {
     /// §3.5: gate 1's cloud-sync settings commands must be reachable over
     /// HTTP, in-process, so a headless runner can read/write them with no
     /// desktop session.
+    ///
+    /// The gate-2 session-metadata pair rides along, so a headless runner can
+    /// reach both halves of the split consent model.
     #[test]
     fn is_allowlisted_recognizes_cloud_sync_settings_commands() {
-        assert!(is_allowlisted("get_cloud_sync_settings"));
-        assert!(is_allowlisted("save_cloud_sync_settings"));
-        assert_eq!(
-            UI_BRIDGE_COMMANDS
-                .iter()
-                .find(|c| c.name == "get_cloud_sync_settings")
-                .unwrap()
-                .dispatch,
-            Dispatch::InProcess
-        );
-        assert_eq!(
-            UI_BRIDGE_COMMANDS
-                .iter()
-                .find(|c| c.name == "save_cloud_sync_settings")
-                .unwrap()
-                .dispatch,
-            Dispatch::InProcess
-        );
+        for name in [
+            "get_cloud_sync_settings",
+            "save_cloud_sync_settings",
+            "get_session_metadata_sync_settings",
+            "save_session_metadata_sync_settings",
+        ] {
+            assert!(is_allowlisted(name), "{name}");
+            assert_eq!(
+                UI_BRIDGE_COMMANDS
+                    .iter()
+                    .find(|c| c.name == name)
+                    .unwrap()
+                    .dispatch,
+                Dispatch::InProcess,
+                "{name}"
+            );
+        }
     }
 
     #[test]

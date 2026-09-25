@@ -257,6 +257,8 @@ in_process_dispatch_table! {
         "get_access_token_for_websocket" => in_process_get_access_token_for_websocket(args),
         "get_cloud_sync_settings" => in_process_get_cloud_sync_settings(args),
         "save_cloud_sync_settings" => in_process_save_cloud_sync_settings(args),
+        "get_session_metadata_sync_settings" => in_process_get_session_metadata_sync_settings(args),
+        "save_session_metadata_sync_settings" => in_process_save_session_metadata_sync_settings(args),
     }
 }
 
@@ -534,25 +536,11 @@ fn coord_device_token_tenant_arg(args: &Value) -> Result<Option<String>, String>
 async fn in_process_get_cloud_sync_settings(
     args: &Value,
 ) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
-    const COMMAND: &str = "get_cloud_sync_settings";
-
-    match args {
-        Value::Null => {}
-        Value::Object(o) if o.is_empty() => {}
-        _ => {
-            return Err(in_process_bad_args(
-                COMMAND,
-                "takes no arguments — send `{}`",
-            ))
-        }
-    }
-
-    let response = crate::commands::cloud_sync_settings::get_cloud_sync_settings()
-        .map_err(|e| in_process_command_failed(COMMAND, e))?;
-
-    serde_json::to_value(response).map_err(|e| {
-        in_process_command_failed(COMMAND, format!("could not serialize response: {}", e))
-    })
+    in_process_consent_flag_get(
+        "get_cloud_sync_settings",
+        args,
+        crate::commands::cloud_sync_settings::get_cloud_sync_settings,
+    )
 }
 
 /// In-process arm for `save_cloud_sync_settings`
@@ -568,30 +556,102 @@ async fn in_process_get_cloud_sync_settings(
 async fn in_process_save_cloud_sync_settings(
     args: &Value,
 ) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
-    const COMMAND: &str = "save_cloud_sync_settings";
+    in_process_consent_flag_save(
+        "save_cloud_sync_settings",
+        args,
+        "cloudSyncEnabled",
+        crate::commands::cloud_sync_settings::save_cloud_sync_settings,
+    )
+}
 
-    let cloud_sync_enabled = match args.get("cloudSyncEnabled") {
+/// In-process arm for `get_session_metadata_sync_settings`
+/// (`crate::commands::cloud_sync_settings::get_session_metadata_sync_settings`)
+/// — the gate-2 sibling of [`in_process_get_cloud_sync_settings`] (the two
+/// flags were split by plan `2026-07-10-split-cloud-sync-consent` and sit side
+/// by side in `WebIntegrationSettings.tsx`). Allowlisted alongside gate 1 so a
+/// headless runner can reach BOTH halves of the consent model rather than
+/// only the one plan
+/// `2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls`
+/// §3.5 named.
+async fn in_process_get_session_metadata_sync_settings(
+    args: &Value,
+) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
+    in_process_consent_flag_get(
+        "get_session_metadata_sync_settings",
+        args,
+        crate::commands::cloud_sync_settings::get_session_metadata_sync_settings,
+    )
+}
+
+/// In-process arm for `save_session_metadata_sync_settings` — see
+/// [`in_process_get_session_metadata_sync_settings`].
+/// `sessionMetadataSyncEnabled` is required (Tauri v2 camelCase).
+async fn in_process_save_session_metadata_sync_settings(
+    args: &Value,
+) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
+    in_process_consent_flag_save(
+        "save_session_metadata_sync_settings",
+        args,
+        "sessionMetadataSyncEnabled",
+        crate::commands::cloud_sync_settings::save_session_metadata_sync_settings,
+    )
+}
+
+/// Shared body of the in-process consent-flag READ arms: the command takes no
+/// arguments (a non-empty `args` object is a 400 rather than silently
+/// ignored) and is a plain `settings.json` read.
+fn in_process_consent_flag_get(
+    command: &'static str,
+    args: &Value,
+    read: fn() -> Result<crate::commands::CommandResponse, String>,
+) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
+    match args {
+        Value::Null => {}
+        Value::Object(o) if o.is_empty() => {}
+        _ => {
+            return Err(in_process_bad_args(
+                command,
+                "takes no arguments — send `{}`",
+            ))
+        }
+    }
+
+    let response = read().map_err(|e| in_process_command_failed(command, e))?;
+
+    serde_json::to_value(response).map_err(|e| {
+        in_process_command_failed(command, format!("could not serialize response: {}", e))
+    })
+}
+
+/// Shared body of the in-process consent-flag WRITE arms: `arg` names the one
+/// required boolean (camelCased on the wire), and the command is a plain
+/// `settings.json` write.
+fn in_process_consent_flag_save(
+    command: &'static str,
+    args: &Value,
+    arg: &str,
+    write: fn(bool) -> Result<crate::commands::CommandResponse, String>,
+) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
+    let value = match args.get(arg) {
         Some(Value::Bool(b)) => *b,
         Some(Value::Null) | None => {
             return Err(in_process_bad_args(
-                COMMAND,
-                "`cloudSyncEnabled` (boolean) is required",
+                command,
+                &format!("`{arg}` (boolean) is required"),
             ))
         }
         Some(_) => {
             return Err(in_process_bad_args(
-                COMMAND,
-                "`cloudSyncEnabled` must be a boolean",
+                command,
+                &format!("`{arg}` must be a boolean"),
             ))
         }
     };
 
-    let response =
-        crate::commands::cloud_sync_settings::save_cloud_sync_settings(cloud_sync_enabled)
-            .map_err(|e| in_process_command_failed(COMMAND, e))?;
+    let response = write(value).map_err(|e| in_process_command_failed(command, e))?;
 
     serde_json::to_value(response).map_err(|e| {
-        in_process_command_failed(COMMAND, format!("could not serialize response: {}", e))
+        in_process_command_failed(command, format!("could not serialize response: {}", e))
     })
 }
 
@@ -995,6 +1055,13 @@ mod in_process_dispatch_tests {
         // path on any windowed runner — the shrink-not-grow argument applies
         // just as directly, and this pair is what makes the setting reachable
         // on a HEADLESS runner in the first place.
+        //
+        // `get_session_metadata_sync_settings` /
+        // `save_session_metadata_sync_settings` joined as the gate-2 sibling of
+        // that pair (the consent model was split in two by plan
+        // `2026-07-10-split-cloud-sync-consent`): same shape, same argument —
+        // a local consent flag with no credential, already reachable via
+        // `page/evaluate` on a windowed runner.
         let mut in_process: Vec<&str> = all_entries()
             .filter(|c| c.dispatch == Dispatch::InProcess)
             .map(|c| c.name)
@@ -1007,8 +1074,10 @@ mod in_process_dispatch_tests {
                 "get_access_token_for_websocket",
                 "get_cloud_sync_settings",
                 "get_coord_device_token",
+                "get_session_metadata_sync_settings",
                 "redeem_pair_code",
                 "save_cloud_sync_settings",
+                "save_session_metadata_sync_settings",
             ]
         );
     }
@@ -1083,6 +1152,47 @@ mod in_process_dispatch_tests {
                 .contains("takes no arguments"),
             "the 400 names the contract: {:?}",
             body.0.error
+        );
+    }
+
+    /// The consent-flag arms share one argument parser, so a copy-paste slip
+    /// in the per-command `arg` name would otherwise pass every other test.
+    /// Every case below is refused before the settings.json read/write.
+    #[tokio::test]
+    async fn consent_flag_arms_refuse_bad_args_with_a_400() {
+        fn error_of(r: Result<Value, (StatusCode, Json<ApiResponse<()>>)>) -> String {
+            let (status, body) = r.expect_err("bad args must be refused");
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            body.0.error.unwrap_or_default()
+        }
+        use serde_json::json;
+
+        for err in [
+            error_of(in_process_get_cloud_sync_settings(&json!({"x": 1})).await),
+            error_of(in_process_get_session_metadata_sync_settings(&json!({"x": 1})).await),
+        ] {
+            assert!(err.contains("takes no arguments"), "{err}");
+        }
+
+        let err = error_of(in_process_save_cloud_sync_settings(&json!({})).await);
+        assert!(
+            err.contains("`cloudSyncEnabled` (boolean) is required"),
+            "{err}"
+        );
+        let err = error_of(in_process_save_session_metadata_sync_settings(&json!({})).await);
+        assert!(
+            err.contains("`sessionMetadataSyncEnabled` (boolean) is required"),
+            "{err}"
+        );
+        let err = error_of(
+            in_process_save_session_metadata_sync_settings(
+                &json!({"sessionMetadataSyncEnabled": "yes"}),
+            )
+            .await,
+        );
+        assert!(
+            err.contains("`sessionMetadataSyncEnabled` must be a boolean"),
+            "{err}"
         );
     }
 

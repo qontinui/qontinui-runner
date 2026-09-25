@@ -33,8 +33,13 @@
 //!    settings.json that already wrote an explicit `false` keeps it.
 //!    Checked before anything is written: with the toggle off, no outbox
 //!    entry is created and nothing leaves the machine.
-//! 2. **Per-tenant** — enforced coord-side (`session_coordination_enabled`
-//!    + warm/cold quotas); the drain simply forwards.
+//! 2. **Per-tenant** — coord-side, on ingest (warm/cold quotas, and the
+//!    per-tenant consent column `coord.tenant_policies.transcript_sync_enabled`
+//!    from plan
+//!    `2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls`
+//!    §3.1–§3.3 — NOT `session_coordination_enabled`, which is the unrelated
+//!    Phase 10 dual-write flag). Whether coord enforces it is coord's code;
+//!    the drain simply forwards and this module makes no tenant-policy check.
 //! 3. **Per-session** — redaction, which ALWAYS runs. Workflow runs have no
 //!    coord-native [`super::Intent`] carrying a per-session opt-out (the
 //!    registrar binding is a plain id ↔ id index), so every transcript byte
