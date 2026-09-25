@@ -610,3 +610,71 @@ fn the_memory_sampler_is_gated_to_the_windows_leg() {
          `matrix.platform == 'windows-latest'`, got `{cond}`"
     );
 }
+
+#[test]
+fn no_step_after_the_build_half_invokes_cargo_again() {
+    // The run half is not the only place a second cargo invocation pays the
+    // full rebuild. The package is an input to itself (see the `Run Rust tests`
+    // comment), so ANY later cargo invocation in this job finds it Dirty and
+    // recompiles the main crate. That covers `build`, `check` and `clippy` as
+    // well as `test`. This test sees only cargo invocations written in a
+    // step's `run:` body. `Build Tauri app (development)` runs
+    // `pnpm run tauri build`, which calls cargo internally, and no pattern on
+    // the step text can see that. So a pass here does not prove the job has
+    // no second compile. `Live AI extractor smoke` ran `cargo test` there until
+    // 2026-09-25, with no bound of its own and no compile throttle. It stayed
+    // dormant only because its secret is unset. Later steps run the binaries
+    // the build half produced, as the run half does.
+    //
+    // Unnamed steps are checked too. `step_name` returns `None` for them, and
+    // skipping them would let an anonymous `run: cargo test` through.
+    let doc = ci_workflow();
+    let steps = job_steps(&doc, "test");
+    let start = position(&steps, BUILD) + 1;
+    let mut offenders = Vec::new();
+    for (i, step) in steps.iter().enumerate().skip(start) {
+        let label = step_name(step)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("<unnamed step #{i}>"));
+        if step.get("run").is_none() {
+            continue;
+        }
+        let body = command_lines(step, &label);
+        for caps in CARGO_INVOCATION.captures_iter(&body) {
+            offenders.push(format!("`{label}`: `{}`", caps.get(0).unwrap().as_str().trim()));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these steps invoke cargo after `{BUILD}`, and each one pays a full \
+         recompile of the main crate: {offenders:?}. Recover the binary from \
+         `cargo-test-build.log` and run it directly, as `{RUN}` does."
+    );
+}
+
+#[test]
+fn the_memory_peak_reaches_the_job_log_not_only_the_summary() {
+    // The Phase 3 soak window is collected by reading many runs, and a step
+    // summary has no REST route, so a reading written only to it cannot be
+    // collected by anything. The one-line `windows-memory-peak:` record is what
+    // `gh api …/jobs/<id>/logs | grep` finds, and `tee -a` keeps the
+    // human-readable block in both places.
+    let doc = ci_workflow();
+    let steps = job_steps(&doc, "test");
+    let name = "Windows memory peak after the Rust test steps";
+    let body = command_lines(find_step(&steps, name), name);
+    assert!(
+        body.contains("echo \"windows-memory-peak:"),
+        "`{name}` must print a `windows-memory-peak:` line to the job log"
+    );
+    assert!(
+        body.contains("tee -a \"$GITHUB_STEP_SUMMARY\""),
+        "`{name}` must `tee -a` its block into the summary, so the block also \
+         reaches the log"
+    );
+    assert!(
+        !body.contains(">> \"$GITHUB_STEP_SUMMARY\""),
+        "`{name}` must not redirect into the summary alone. The log is the only \
+         copy anything can read back."
+    );
+}

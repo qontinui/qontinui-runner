@@ -1054,11 +1054,32 @@ jobs:
       # `matrix.platform == 'windows-latest'` rather than `runner.os` — every
       # other Windows gate in this file spells it that way (see `Configure
       # pagefile`), and one idiom is one grep.
+      #
+      # ⚠️ The reading goes to the job LOG as well as the summary (`tee -a`,
+      # plus one `windows-memory-peak:` line), and the log is the copy that
+      # matters. GitHub serves no REST route for `$GITHUB_STEP_SUMMARY`, so a
+      # reading written only there can be seen by a person clicking through
+      # the web UI and by nothing else. The soak window this step exists to
+      # feed is collected by reading many runs, and the first cut of this step
+      # wrote ONLY the summary, so the retune had no readable data. Checked
+      # 2026-09-25: `gh api …/actions/jobs/108010310573/logs` (main, run
+      # 36116051089) had the step's script echoed and not one reading. Collect
+      # the window with
+      # `gh api repos/<repo>/actions/jobs/<id>/logs | grep 'windows-memory-peak:'`.
+      # `UNKNOWN` on that line means the sampler could not read the value. It
+      # does not mean zero.
       - name: Windows memory peak after the Rust test steps
         if: always() && matrix.platform == 'windows-latest'
         continue-on-error: true
         shell: bash
         run: |
+          # `|| true` and a blank fallback: under `bash -e` a failing
+          # `powershell` would otherwise end the step before the line is
+          # printed, and a missing line would look like an old run, not an
+          # unreadable value.
+          PEAK=$(powershell -NoProfile -Command "(Get-CimInstance Win32_PageFileUsage | Measure-Object -Property PeakUsage -Sum).Sum" 2>/dev/null | tr -d '\r' || true)
+          ALLOC=$(powershell -NoProfile -Command "(Get-CimInstance Win32_PageFileUsage | Measure-Object -Property AllocatedBaseSize -Sum).Sum" 2>/dev/null | tr -d '\r' || true)
+          echo "windows-memory-peak: pagefile_peak_mb=${PEAK:-UNKNOWN} pagefile_allocated_mb=${ALLOC:-UNKNOWN} build_outcome=${{ steps.build_rust_tests.outcome }} run_outcome=${{ steps.run_rust_tests.outcome }}"
           {
             echo "### Windows memory after the Rust test steps"
             echo
@@ -1072,7 +1093,7 @@ jobs:
             echo
             echo "build step outcome: ${{ steps.build_rust_tests.outcome }} - run step outcome: ${{ steps.run_rust_tests.outcome }}"
             echo "PeakUsage is the pagefile high-water mark for this boot, so it covers the compile that just ran. Compare it against AllocatedBaseSize (the 32 GB the pagefile step configures) before changing CARGO_BUILD_JOBS."
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       # Best-effort, non-gating: pushes this job's per-test outcomes into
       # coord.test_results so coord's already-shipped `flakiness_priors` has a
@@ -1241,18 +1262,53 @@ jobs:
         # The secret presence check runs INSIDE the shell, not in `if:` — the
         # `secrets` context is not available to step-level `if:` (only job-level
         # `if:` and step `env:`/`run:`/`with:`). Setting an empty env var is
-        # safe; we early-exit before invoking cargo.
+        # safe; we early-exit before running anything.
+        #
+        # ⚠️ NO CARGO HERE, for the same reason as `Run Rust tests`: the package
+        # is an input to itself, so a second cargo invocation finds it Dirty and
+        # recompiles the main crate. On this leg that would be an unthrottled
+        # (no CARGO_BUILD_JOBS) recompile inside a step with no bound of its
+        # own. The step used to run `cargo test --bin qontinui-runner …`. The
+        # secret is unset today, so it exits above before any of this runs, and
+        # the rebuild would land on whoever sets it. It runs the bin's
+        # unit-test binary the build step already produced instead. That
+        # binary's `Executable` line in the build log names
+        # `deps/qontinui_runner-<16 hex>`. The lib is `qontinui_runner_lib-…`,
+        # which the pattern below does not match.
         if: matrix.platform == 'ubuntu-22.04'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        shell: bash
         run: |
           if [ -z "$ANTHROPIC_API_KEY" ]; then
             echo "ANTHROPIC_API_KEY secret not set — skipping live AI smoke test."
             exit 0
           fi
+          # KEEP THIS `cd` — cargo runs a test binary from the package manifest
+          # directory, and so must we (see `Run Rust tests`).
           cd src-tauri
-          cargo test --bin qontinui-runner -- --ignored --exact \
-            util::path_extraction::tests::test_extract_paths_via_ai_real_call
+          BUILD_LOG="$GITHUB_WORKSPACE/cargo-test-build.log"
+          BIN=""
+          if [ -f "$BUILD_LOG" ]; then
+            ESC=$(printf '\033')
+            BIN=$(sed -e "s/${ESC}\[[0-9;]*m//g" "$BUILD_LOG" \
+              | sed -n 's/^[[:space:]]*Executable `\(.*[/\\]qontinui_runner-[0-9a-f]\{16\}\(\.exe\)\{0,1\}\)`[[:space:]]*$/\1/p' \
+              | head -n 1)
+          fi
+          if [ -z "$BIN" ]; then
+            echo "::warning title=Live AI smoke not run::found no qontinui_runner bin test binary in $BUILD_LOG. This is UNKNOWN, not a pass."
+            exit 1
+          fi
+          # `--exact` on a renamed test matches nothing, and libtest exits 0 on
+          # `0 passed`. A smoke that ran nothing would read as green, so it has
+          # to show the one pass.
+          "${BIN//\\//}" --ignored --exact \
+            util::path_extraction::tests::test_extract_paths_via_ai_real_call \
+            2>&1 | tee "$RUNNER_TEMP/live-ai-smoke.log"
+          if ! grep -q 'test result: ok\. 1 passed' "$RUNNER_TEMP/live-ai-smoke.log"; then
+            echo "::warning title=Live AI smoke ran no test::the smoke binary did not report exactly one passing test. The test was probably renamed. This is UNKNOWN, not a pass."
+            exit 1
+          fi
         continue-on-error: true
 
       - name: Build Tauri app (development)
