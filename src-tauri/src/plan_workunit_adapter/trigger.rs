@@ -247,7 +247,7 @@ pub fn adapter_metrics() -> &'static AdapterMetrics {
 // Scan-source divergence — the DETECTOR half of plan
 // `2026-09-10-the-plan-scanner-reads-a-parked-working-tree-not-a-ref`.
 //
-// [`read_plan_dir`] scans a WORKING TREE. Nothing about that tree is pinned:
+// [`scan_plan_dir`] scans a WORKING TREE. Nothing about that tree is pinned:
 // the directory the operator points `paths.plans_dir` at is an ordinary
 // checkout, and a checkout can sit parked on a peer's branch for weeks.
 // Measured on the operator box 2026-09-10, the configured dir was 2153 commits
@@ -290,7 +290,7 @@ pub enum ScanDivergenceState {
     ///
     /// **Scoped to commits.** The comparison is `HEAD` against the ref, so
     /// `0/0` says the checked-out COMMIT is in step — it does NOT say the
-    /// bytes being scanned match the ref. [`read_plan_dir`] reads the working
+    /// bytes being scanned match the ref. [`scan_plan_dir`] reads the working
     /// tree, and a tree exactly on the default branch with uncommitted or
     /// untracked plan files still publishes content no ref carries. Comparing
     /// the tree itself belongs to the phase that moves the scan onto a ref.
@@ -601,7 +601,7 @@ pub trait GitRefReader: Send + Sync {
 
     /// The blob entries of `<ref>:<rel_dir>`, **depth 1 only**.
     ///
-    /// Non-recursive on purpose, matching [`read_plan_dir`]'s documented flat
+    /// Non-recursive on purpose, matching [`scan_plan_dir`]'s documented flat
     /// contract and coord's `walk_root`. A recursive walk here would silently
     /// add every subdirectory plan to the corpus as a side effect of a
     /// scan-SOURCE change — two behaviour changes in one phase, and the wider
@@ -2287,12 +2287,15 @@ pub fn scan_plan_dir(dir: &Path, conv: &PlanConvention) -> PlanDirScan {
     }
 }
 
-/// [`scan_plan_dir`], for a caller that only reasons about what was FOUND.
+/// [`scan_plan_dir`], for a test that only reasons about what was FOUND.
 ///
-/// **Never call this from a consumer that reasons about ABSENCE** — the
-/// discarded `complete` flag is the only thing separating "nothing is there"
-/// from "nothing could be read".
-pub fn read_plan_dir(dir: &Path, conv: &PlanConvention) -> Vec<ParsedWorkUnit> {
+/// Test-only: no production caller remains. For one that reasons about
+/// absence, the discarded `complete` flag is the only thing separating
+/// "nothing is there" from "nothing could be read". The last production
+/// caller, `qontinui-pr plan-workunit-backfill`, now reads through
+/// [`read_plans_for_cycle`].
+#[cfg(test)]
+pub(crate) fn read_plan_dir(dir: &Path, conv: &PlanConvention) -> Vec<ParsedWorkUnit> {
     scan_plan_dir(dir, conv).units
 }
 

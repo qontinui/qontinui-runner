@@ -20,7 +20,7 @@
 //! trustworthy [policy: `unknown-must-not-render-as-a-default`].
 //!
 //! **It does not widen the walk.** The listing is depth 1, matching
-//! [`super::trigger::read_plan_dir`]'s documented flat contract and coord's
+//! [`super::trigger::scan_plan_dir`]'s documented flat contract and coord's
 //! `walk_root`. Making the scan recursive here would add every subdirectory
 //! plan to the corpus as a silent side effect of a scan-SOURCE change.
 //!
@@ -477,7 +477,7 @@ pub fn list_ref_plan_names(
 
 /// The ref arm's `*.md` predicate.
 ///
-/// `extension() == Some("md")`, matching [`super::trigger::read_plan_dir`]
+/// `extension() == Some("md")`, matching [`super::trigger::scan_plan_dir`]
 /// rather than a bare `ends_with(".md")`: the two disagree on a file named
 /// exactly `.md`, where `extension()` is `None` and the stem is the whole
 /// name. A one-file difference, but the claim this phase makes is that the two
