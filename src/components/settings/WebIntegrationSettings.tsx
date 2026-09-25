@@ -41,6 +41,14 @@ import {
 import { SectionHeader } from "./SectionHeader";
 import type { LogFunction } from "./types";
 import type { SetRunnerTierResult } from "@/hooks/useRunnerTier";
+import {
+  usePerfCaps,
+  loadPerfCaps,
+  setPerfCaps,
+  normalizePerfCaps,
+  getPerfCapsLoadState,
+  type PerfCapsLoadState,
+} from "@/lib/perfCaps";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -469,6 +477,95 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
       setSessionMetadataSyncSaving(false);
     }
   }, [sessionMetadataSyncEnabled, onLog]);
+
+  // --- Session output sharing — gate 3 (plan
+  // 2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls
+  // §3.7) --------------------------------------------------------------
+  // `Intent.share_output` / `Intent.redact_secrets` are per-session fields
+  // with no direct settings surface; what IS persisted, and what this
+  // control edits, is the settings-level DEFAULT new sessions pick up —
+  // `PerformanceSettings.share_terminal_output` /
+  // `redact_terminal_secrets` (`@/lib/perfCaps`, the same backing store the
+  // "Performance & Caps" advanced panel exposes). Co-located here with
+  // gates 1/2 above rather than left only in that unrelated panel, per the
+  // plan's own "avoid scattering the consent story across two screens"
+  // reasoning — all three answer "what does this machine/session share,
+  // and with what protection". `usePerfCaps()` keeps both surfaces in
+  // sync: a save from either place is visible in the other without a
+  // reload.
+  const perfCaps = usePerfCaps();
+  const [perfCapsLoadState, setPerfCapsLoadState] = useState<PerfCapsLoadState>(() =>
+    getPerfCapsLoadState(),
+  );
+  const [shareOutputSaving, setShareOutputSaving] = useState(false);
+  const [redactSecretsSaving, setRedactSecretsSaving] = useState(false);
+  const [shareOutputError, setShareOutputError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void loadPerfCaps().then(() => {
+      if (cancelled) return;
+      setPerfCapsLoadState(getPerfCapsLoadState());
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handleToggleShareOutput = useCallback(async () => {
+    // Guard: never let a click before the read resolves write a guessed value.
+    if (perfCapsLoadState !== "loaded") return;
+    // Deliberately NOT optimistic (unlike handleToggleCloudSync /
+    // handleToggleSessionMetadataSync above, which flip local `useState`
+    // immediately and roll back on error): `perfCaps` is the SHARED
+    // `@/lib/perfCaps` store, read synchronously by other consumers
+    // (the WebGL pane LRU, the session-count advisory) outside this
+    // component's render — publishing an unconfirmed value there before the
+    // backend confirms it would leak a guess to code that has no way to
+    // know it might roll back.
+    const newValue = !perfCaps.share_terminal_output;
+    setShareOutputSaving(true);
+    setShareOutputError(null);
+    try {
+      // Round-trip the FULL PerfCaps object — `save_performance_settings`
+      // replaces the whole `performance` block in settings.json, so saving
+      // a partial object here would silently blank the number fields the
+      // Performance & Caps panel owns.
+      const stored = await invoke<unknown>("save_performance_settings", {
+        settings: { ...perfCaps, share_terminal_output: newValue },
+      });
+      setPerfCaps(normalizePerfCaps(stored));
+      onLog("success", `Terminal output sharing default ${newValue ? "enabled" : "disabled"}`);
+    } catch (err) {
+      console.error("Failed to save share_terminal_output:", err);
+      setShareOutputError(String(err));
+      onLog("error", `Failed to save terminal output sharing default: ${err}`);
+    } finally {
+      setShareOutputSaving(false);
+    }
+  }, [perfCaps, perfCapsLoadState, onLog]);
+
+  const handleSetRedactSecrets = useCallback(
+    async (value: boolean | null) => {
+      if (perfCapsLoadState !== "loaded") return;
+      setRedactSecretsSaving(true);
+      setShareOutputError(null);
+      try {
+        const stored = await invoke<unknown>("save_performance_settings", {
+          settings: { ...perfCaps, redact_terminal_secrets: value },
+        });
+        setPerfCaps(normalizePerfCaps(stored));
+        onLog("success", "Secret redaction default saved");
+      } catch (err) {
+        console.error("Failed to save redact_terminal_secrets:", err);
+        setShareOutputError(String(err));
+        onLog("error", `Failed to save secret redaction default: ${err}`);
+      } finally {
+        setRedactSecretsSaving(false);
+      }
+    },
+    [perfCaps, perfCapsLoadState, onLog],
+  );
 
   useEffect(() => {
     // React to save events fired from anywhere (including the web token flow).
@@ -1238,6 +1335,94 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
           <p className="text-[10px] text-destructive px-3">
             Could not read this setting ({truncate(cloudSyncError, 100)}). It has NOT been turned
             off — the runner is still using whatever you last saved.
+          </p>
+        )}
+      </div>
+
+      {/* Terminal output sharing — gate 3 (plan
+          2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls
+          §3.7). Governs whether a NEW session's raw terminal output stream is
+          shared at all, and whether it's redacted first — independent of AI
+          content sync above, which governs whether that shared content
+          actually leaves the machine. Saves immediately, same as the two
+          blocks above. */}
+      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-bridge-id="settings.share-terminal-output">
+        <label className="flex items-center justify-between cursor-pointer p-3 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors">
+          <div className="space-y-1 pr-4">
+            <div className="text-sm font-medium">Share terminal output</div>
+            <div className="text-xs text-muted-foreground">
+              Default for new sessions: stream this session&apos;s terminal output to your coord
+              tenant through the same warm/cold retention tiers as AI content sync above. Off: a
+              new session&apos;s output stays local, whether or not AI content sync is on.
+              Existing sessions keep whatever they started with — this sets the default for
+              sessions started after the change, not a live switch on open ones.
+            </div>
+          </div>
+          {perfCapsLoadState !== "loaded" ? (
+            <span
+              className="shrink-0 text-[10px] text-amber-500 flex items-center gap-1"
+              title={perfCapsLoadState === "failed" ? "load failed" : "loading"}
+            >
+              <AlertTriangle className="w-3 h-3" />
+              {perfCapsLoadState === "failed" ? "unknown" : "loading…"}
+            </span>
+          ) : (
+            <button
+              type="button"
+              id="button-toggle-share-terminal-output"
+              onClick={() => void handleToggleShareOutput()}
+              disabled={shareOutputSaving}
+              className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors disabled:opacity-50 ${
+                perfCaps.share_terminal_output ? "bg-primary" : "bg-muted"
+              }`}
+              aria-pressed={perfCaps.share_terminal_output}
+              aria-label="Toggle sharing terminal output"
+            >
+              <span
+                className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                  perfCaps.share_terminal_output ? "translate-x-4" : "translate-x-1"
+                }`}
+              />
+            </button>
+          )}
+        </label>
+
+        <div className="px-3 space-y-1.5" data-ui-bridge-id="settings.redact-terminal-secrets">
+          <div className="text-xs font-medium">Redact secrets in shared output</div>
+          <div className="text-[10px] text-muted-foreground">
+            Scrubs shared terminal output for common secret patterns before it leaves this
+            machine — defense-in-depth, not a security boundary. Left on &quot;Follow
+            sharing&quot;, redaction tracks the toggle above (on whenever sharing is on).
+          </div>
+          <div className="flex gap-2 pt-1">
+            {(
+              [
+                [null, "Follow sharing (default)"],
+                [true, "Always redact"],
+                [false, "Never redact"],
+              ] as const
+            ).map(([value, label]) => (
+              <button
+                key={String(value)}
+                type="button"
+                onClick={() => void handleSetRedactSecrets(value)}
+                disabled={perfCapsLoadState !== "loaded" || redactSecretsSaving}
+                className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors disabled:opacity-50 ${
+                  perfCaps.redact_terminal_secrets === value
+                    ? "bg-primary text-primary-foreground"
+                    : "bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {shareOutputError && (
+          <p className="text-[10px] text-destructive px-3">
+            Could not save this setting ({truncate(shareOutputError, 100)}). It has NOT been
+            changed — the runner is still using whatever you last saved.
           </p>
         )}
       </div>

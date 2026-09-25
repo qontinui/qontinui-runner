@@ -759,13 +759,18 @@ stage_bearer() { # [skip_env] -> prints source; writes $TMP/bearer.hdr (0600)
   [ -n "$jwt" ] && ( umask 077; printf 'Authorization: Bearer %s\n' "$jwt" > "$TMP/bearer.hdr" )
   printf '%s' "$src"
 }
+# Sets PY (an argv prefix: the interpreter, plus `-3` for the py launcher)
+# through the shared shim, lib/hook-json.sh. The shim never executes a
+# WindowsApps App Execution Alias except under `timeout`; the loop this replaced
+# ran `python3 -c` unbounded, and the Python Install Manager's alias HANGS
+# (plan 2026-09-13-heartbeat-stop-python3-stub-ide-cargo-quiesce, D1 re-vet).
+# LAND_EVIDENCE_PYTHON (else $PYTHON), when set, is the ONLY candidate. Sourced
+# here, not at the top: most runs never need Python, and the source probes.
 resolve_python() {
-  local c
-  for c in "${LAND_EVIDENCE_PYTHON:-}" python3 python; do
-    [ -n "$c" ] && command -v "$c" >/dev/null 2>&1 || continue
-    "$c" -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1 && { printf '%s' "$c"; return 0; }
-  done
-  return 1
+  local PYTHON="${LAND_EVIDENCE_PYTHON:-${PYTHON:-}}"
+  { [ -r "$LIB_DIR/hook-json.sh" ] && . "$LIB_DIR/hook-json.sh" && hook_shim_python3; } || return 1
+  PY=("$HOOK_PY3_EXE"); [ -n "${HOOK_PY3_ARG:-}" ] && PY+=("$HOOK_PY3_ARG")
+  return 0
 }
 COORD_FAILED=0
 if [ "$STRENGTH" = PROVEN_LANDED ]; then
@@ -774,7 +779,7 @@ elif [ -z "$BRANCH" ] || [ -z "$SLUG" ]; then
   probe coord skipped "no branch/repo to match a coord row against"
 elif [ "$GH_FAILED" = 0 ] && [ "$CLOSED_UNMERGED" = 0 ]; then
   probe coord skipped "GitHub listed no CLOSED-unmerged PR for $BRANCH, so there is no fast-forward land for coord to stamp"
-elif ! PY="$(resolve_python)"; then
+elif ! resolve_python; then
   COORD_FAILED=1; probe coord failed "no Python 3 interpreter to parse the coord listing"
 else
   if [ -n "$HOURS_OPT" ]; then hours="$HOURS_OPT"
@@ -806,7 +811,7 @@ else
       COORD_FAILED=1; probe coord failed "GET /pr-merge/prs?include_merged=$hours answered HTTP ${code:-000} (credential: $src) $(head -1 "$TMP/coord.err" 2>/dev/null | cut -c1-120)"
     else
       nums="${PR_NUM[*]+${PR_NUM[*]}}"
-      if "$PY" -c '
+      if "${PY[@]}" -c '
 import json, sys
 repo, branch, nums = sys.argv[1], sys.argv[2], set(sys.argv[3].split())
 d = json.load(sys.stdin)

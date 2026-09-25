@@ -92,14 +92,22 @@ pub struct Intent {
     /// list is persisted verbatim in the intent JSON.
     #[serde(default)]
     pub declared_paths: Vec<PathBuf>,
-    /// Plan §D10 — opt-in PTY output streaming. Off by default; sensitive
-    /// sessions stay local. Phase 8 consumes this when wiring PTY bytes
-    /// through JetStream.
-    #[serde(default)]
+    /// Plan §D10 — PTY output streaming consent. Default TRUE as of plan
+    /// `2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls`
+    /// §3.5 — `engineering-priorities` `capability-ships-enabled`: shipped
+    /// ON with a reachable off-switch, not off-by-default as a safety
+    /// measure. A missing key deserializes to `true` (see [`default_true`]);
+    /// an intent body that supplies an explicit `false` keeps it — this
+    /// only changes what an ABSENT key resolves to. Phase 8 consumes this
+    /// when wiring PTY bytes through JetStream.
+    #[serde(default = "default_true")]
     pub share_output: bool,
     /// Plan §D11 — when `Some(true)`, run a regex sweep against PTY output
     /// before fan-out. When `None`, defaults to the value of
-    /// [`Intent::share_output`] (see [`Intent::effective_redact_secrets`]).
+    /// [`Intent::share_output`] (see [`Intent::effective_redact_secrets`]) —
+    /// so this field needs no default flip of its own: as `share_output`
+    /// becomes on-by-default, redaction becomes on-by-default right along
+    /// with it (strictly safer, not a regression).
     #[serde(default)]
     pub redact_secrets: Option<bool>,
     /// Phase 8b (plan `2026-07-02-session-scoped-multi-tenant-device-binding`
@@ -179,6 +187,16 @@ impl Intent {
 
         Ok(())
     }
+}
+
+/// Serde default for [`Intent::share_output`] — see that field's doc comment.
+/// A field-level `#[serde(default)]` with no function name resolves to
+/// `bool::default()` (`false`); naming this fn is what makes an ABSENT key
+/// deserialize to `true` instead, while an intent body that supplies an
+/// explicit `false` is read as given (serde only calls a field's default fn
+/// when the key is missing, never as a fallback over a present value).
+fn default_true() -> bool {
+    true
 }
 
 /// Errors surfaced by [`Intent::validate`]. Stable enum — the Tauri command
@@ -278,6 +296,36 @@ mod tests {
         i.share_output = true;
         i.redact_secrets = Some(false);
         assert!(!i.effective_redact_secrets());
+    }
+
+    /// Consent contract as of plan
+    /// `2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls`
+    /// §3.5: a wire body that omits `share_output` entirely (e.g. an older
+    /// caller built against a pre-flip schema) must deserialize to `true` —
+    /// ship-on-by-default, per `engineering-priorities`
+    /// `capability-ships-enabled`. `redact_secrets` rides along via
+    /// [`Intent::effective_redact_secrets`], with no default of its own to
+    /// flip.
+    #[test]
+    fn share_output_defaults_true_on_missing_key() {
+        let parsed: Intent =
+            serde_json::from_str(r#"{"kind":"terminal_shell","purpose":"fix the thing"}"#)
+                .expect("must deserialize with every optional key omitted");
+        assert!(parsed.share_output);
+        assert!(parsed.effective_redact_secrets());
+    }
+
+    /// The default only applies to an ABSENT key — a body that supplies an
+    /// explicit `false` (e.g. a caller that deliberately opts a sensitive
+    /// session out of streaming) must keep it, not be silently upgraded by
+    /// the default flip.
+    #[test]
+    fn share_output_explicit_false_is_preserved() {
+        let parsed: Intent = serde_json::from_str(
+            r#"{"kind":"terminal_shell","purpose":"fix the thing","share_output":false}"#,
+        )
+        .expect("must deserialize");
+        assert!(!parsed.share_output);
     }
 
     #[test]

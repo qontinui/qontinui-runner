@@ -1864,15 +1864,23 @@ mod web_integration_default_tests {
 mod cloud_sync_tests {
     use super::*;
 
-    /// Consent contract (plan 2026-07-09-runner-session-history-cloud-sync
-    /// gate 1): a fresh install AND an upgrading settings.json missing the
-    /// key must both land on `cloud_sync_enabled = false` — nothing leaves
-    /// the machine without an explicit opt-in.
+    /// Consent contract as of plan
+    /// `2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls`
+    /// §3.5 (`engineering-priorities` `capability-ships-enabled`): a fresh
+    /// install AND an upgrading settings.json missing the key must both
+    /// land on `cloud_sync_enabled = true` — ship-on-by-default, with
+    /// privacy governed by the reachable off-switch (this setting's own
+    /// save door) and by redaction, not by defaulting off. This inverts the
+    /// prior `cloud_sync_defaults_off` contract; see
+    /// `cloud_sync_explicit_value_round_trips` immediately below for the
+    /// complementary "an existing settings.json that wrote an explicit
+    /// value keeps it" half — the default only applies to a key that is
+    /// ABSENT.
     #[test]
-    fn cloud_sync_defaults_off() {
-        assert!(!Settings::default().cloud_sync_enabled);
+    fn cloud_sync_defaults_on() {
+        assert!(Settings::default().cloud_sync_enabled);
         let parsed: Settings = serde_json::from_str("{}").expect("empty object must deserialize");
-        assert!(!parsed.cloud_sync_enabled);
+        assert!(parsed.cloud_sync_enabled);
     }
 
     /// An explicit opt-in round-trips through serialization.
@@ -1883,6 +1891,22 @@ mod cloud_sync_tests {
         assert!(parsed.cloud_sync_enabled);
         let json = serde_json::to_string(&parsed).unwrap();
         assert!(json.contains("\"cloud_sync_enabled\":true"));
+    }
+
+    /// The default-flip in plan
+    /// `2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls`
+    /// only changes what an ABSENT key resolves to. A runner that already
+    /// wrote an explicit `false` into its own settings.json (opted out under
+    /// the old default, or via the save door) must keep that value — a
+    /// settings file is explicit prior state, never silently overwritten by
+    /// a later default change.
+    #[test]
+    fn cloud_sync_explicit_false_is_preserved() {
+        let parsed: Settings =
+            serde_json::from_str(r#"{"cloud_sync_enabled": false}"#).expect("must deserialize");
+        assert!(!parsed.cloud_sync_enabled);
+        let json = serde_json::to_string(&parsed).unwrap();
+        assert!(json.contains("\"cloud_sync_enabled\":false"));
     }
 }
 
@@ -3394,10 +3418,21 @@ pub struct Settings {
     /// §3.1). When true, AI conversation transcript chunks and terminal
     /// session records are mirrored to the operator's coord tenant via the
     /// session outbox (warm tier ~7 days post-close, cold archive 90 days).
-    /// Default FALSE — with the toggle off the feature is inert: no outbox
-    /// entries, no network egress, nothing leaves this machine. A missing
-    /// key in an existing settings.json loads as false.
-    #[serde(default)]
+    /// Default TRUE as of plan
+    /// `2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls`
+    /// §3.5 — `engineering-priorities` `capability-ships-enabled`: this is a
+    /// user-preference axis, shipped ON with a reachable off-switch (this
+    /// setting's own save door, plus the desktop settings panel), not
+    /// off-by-default as a safety measure. Privacy is governed by that
+    /// reachable off-switch and by redaction (defense in depth,
+    /// `redact_secrets` / `effective_redact_secrets`), not by the default
+    /// being off. A missing key in an existing settings.json loads as true
+    /// (fresh install); an existing settings.json that already wrote an
+    /// EXPLICIT `false` keeps it — a settings file is explicit prior state
+    /// and is never silently overwritten by a default-flip (see
+    /// `default_true` below and the deserialize-vs-default distinction in
+    /// this struct's own `Default` impl doc comment).
+    #[serde(default = "default_true")]
     pub cloud_sync_enabled: bool,
     /// Session-metadata sync consent — gate 2 of the session-history
     /// cloud-sync consent model (split from `cloud_sync_enabled` per plan
