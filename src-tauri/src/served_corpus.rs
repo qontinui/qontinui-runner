@@ -304,6 +304,15 @@ pub(crate) fn probe(workdir: &Path) -> ServedCorpus {
     value
 }
 
+/// [`probe`] for an async seam: the bounded `git` spawns run on the blocking
+/// pool, never on a runtime worker.
+pub(crate) async fn probe_async(workdir: impl Into<PathBuf>) -> ServedCorpus {
+    let workdir = workdir.into();
+    qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || probe(&workdir))
+        .await
+        .unwrap_or_else(|_| ServedCorpus::unknown("probe task failed"))
+}
+
 /// [`probe`] without the memo, with the `git` program and the per-spawn
 /// timeout as parameters so a test can point them at nothing or at a hang.
 fn probe_with(workdir: &Path, git_program: &OsStr, timeout: Duration) -> ServedCorpus {

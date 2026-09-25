@@ -1283,6 +1283,10 @@ struct IdentitySeamOutcome {
     /// only place that knows, and the briefing rendered right after it gates the
     /// memory clause on exactly this value.
     coord_mcp: crate::coord_mcp::CoordMcpDelivery,
+    /// What `<cwd>/.claude/` served this session, measured once here by the
+    /// bounded [`crate::served_corpus::probe`] so the zero-I/O briefing render
+    /// right after the seam can carry its `[served-corpus: …]` header line.
+    served: crate::served_corpus::ServedCorpus,
 }
 
 /// A single PTY-backed terminal session.
@@ -1644,8 +1648,11 @@ impl TerminalSession {
         // purely additive + fail-open — an empty/unset value simply means no
         // briefing. It is still set BEFORE `finalize_child_env`, so the
         // credential scrub remains the last env mutation on this path.
-        let runner_context =
-            crate::terminal::runner_context(crate::terminal::spawn_seam_api_port(), seam.coord_mcp);
+        let runner_context = crate::terminal::runner_context(
+            crate::terminal::spawn_seam_api_port(),
+            seam.coord_mcp,
+            &seam.served,
+        );
         // The spawn-time policy carrier for a SHELL pane (plan
         // `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`):
         // compose the briefing + the tenant's cached policy body into ONE file
@@ -3262,9 +3269,20 @@ impl TerminalSession {
             );
         }
 
+        // The served-corpus measurement for the briefing's header line. Bounded
+        // (`served_corpus::PROBE_TIMEOUT` per git spawn, one timeout at most)
+        // and fail-soft: every failure is an `UNKNOWN (<reason>)` token.
+        let served = {
+            let _span =
+                tracing::debug_span!("terminal_spawn.served_corpus_probe", terminal_id = %terminal_id)
+                    .entered();
+            crate::served_corpus::probe(std::path::Path::new(cwd))
+        };
+
         Ok(IdentitySeamOutcome {
             pinned_session_id: pinned,
             coord_mcp,
+            served,
         })
     }
 
