@@ -173,6 +173,12 @@ pub(crate) struct TargetRunner {
     pub reason: Option<String>,
     #[serde(default)]
     pub required_sha: Option<String>,
+    /// The runner build coord observed the target serving. Always present on
+    /// `supports` and present on `unknown` whenever the target reported one;
+    /// absent from a coord that predates the field (plan
+    /// `2026-09-20-fleet-tab-attach-loses-the-grant-push-race`, item 3).
+    #[serde(default)]
+    pub served_sha: Option<String>,
 }
 
 /// Explain a relay timeout — the target never answered — with what is actually
@@ -192,14 +198,22 @@ pub(crate) fn explain_relay_timeout(
     let head = format!("no {what} from target device {target_device_id} within {timeout_secs}s");
     match target_runner {
         Some(tr) if tr.state == "supports" => format!(
-            "{head}. Coord observed that device serving a runner build that carries the handler, \
-             so the target runner is wedged or offline, or the relay lost the frame — its own \
-             runner log says which."
+            "{head}. Coord observed that device serving a runner build{} that carries the \
+             handler, so the target runner is wedged or offline, or the relay lost the frame — \
+             its own runner log says which.",
+            tr.served_sha
+                .as_deref()
+                .map(|sha| format!(" ({sha})"))
+                .unwrap_or_default(),
         ),
         Some(tr) if tr.state == "unknown" => format!(
-            "{head}. Coord could not establish the target's runner build ({}). A runner older \
+            "{head}. Coord could not establish the target's runner build ({}){}. A runner older \
              than {} ignores this request without answering, which looks exactly like this.",
             tr.reason.as_deref().unwrap_or("no reason given"),
+            tr.served_sha
+                .as_deref()
+                .map(|sha| format!("; it last reported serving {sha}"))
+                .unwrap_or_default(),
             tr.required_sha
                 .as_deref()
                 .unwrap_or("the remote-terminal handler"),
@@ -1120,6 +1134,7 @@ mod relay_timeout_tests {
             state: "unknown".into(),
             reason: Some("served-sha heartbeat is STALE".into()),
             required_sha: Some("f521e1012e1e".into()),
+            served_sha: None,
         };
         for tr in [None, Some(&supports), Some(&unknown)] {
             let m = explain_relay_timeout("remote_terminal_attached", DEV, tr, 20);
@@ -1135,10 +1150,34 @@ mod relay_timeout_tests {
             state: "unknown".into(),
             reason: Some("served-sha heartbeat is STALE".into()),
             required_sha: Some("f521e1012e1e".into()),
+            served_sha: None,
         };
         let m = explain_relay_timeout("remote_terminal_attached", DEV, Some(&tr), 20);
         assert!(m.contains("served-sha heartbeat is STALE"), "{m}");
         assert!(m.contains("f521e1012e1e"), "{m}");
+        assert!(!m.contains("last reported serving"), "{m}");
+    }
+
+    /// Coord's structured `served_sha` reaches the message on both arms, so
+    /// the operator can name the target's build without asking coord again.
+    #[test]
+    fn the_observed_served_sha_is_named_when_coord_carries_it() {
+        let unknown = TargetRunner {
+            state: "unknown".into(),
+            reason: Some("served-sha heartbeat is STALE".into()),
+            required_sha: Some("f521e1012e1e".into()),
+            served_sha: Some("3472fc6a1c58".into()),
+        };
+        let m = explain_relay_timeout("remote_terminal_attached", DEV, Some(&unknown), 20);
+        assert!(m.contains("last reported serving 3472fc6a1c58"), "{m}");
+        let supports = TargetRunner {
+            state: "supports".into(),
+            served_sha: Some("b74a09312aaa".into()),
+            ..Default::default()
+        };
+        let m = explain_relay_timeout("remote_terminal_created", DEV, Some(&supports), 45);
+        assert!(m.contains("build (b74a09312aaa) that carries"), "{m}");
+        assert!(m.contains("wedged or offline"), "{m}");
     }
 
     #[test]
@@ -1193,6 +1232,15 @@ mod relay_timeout_tests {
         let tr = new.target_runner.unwrap();
         assert_eq!(tr.state, "unknown");
         assert_eq!(tr.reason.as_deref(), Some("why"));
+        assert!(tr.served_sha.is_none());
+        let with_sha: AttachGrantResponse = serde_json::from_str(
+            r#"{"grant":"g","grant_jti":"j","target_runner":{"state":"supports","served_sha":"def","required_sha":"abc"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            with_sha.target_runner.unwrap().served_sha.as_deref(),
+            Some("def")
+        );
     }
 }
 
