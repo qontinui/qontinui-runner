@@ -85,7 +85,7 @@ struct Row {
     detail: String,
 }
 
-type Sources = BTreeMap<String, String>;
+pub(crate) type Sources = BTreeMap<String, String>;
 type Rows = BTreeMap<(String, String), Row>;
 
 fn src_root() -> PathBuf {
@@ -105,7 +105,7 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn load_sources() -> Sources {
+pub(crate) fn load_sources() -> Sources {
     let root = src_root();
     let mut files = Vec::new();
     collect_rs(&root, &mut files);
@@ -259,7 +259,7 @@ fn primitive_families() -> Vec<(&'static str, Vec<Regex>)> {
 
 /// A literal call token (`foo(`, `.start_inner(`) as a regex that tolerates
 /// whitespace before the paren.
-fn token_re(token: &str) -> Regex {
+pub(crate) fn token_re(token: &str) -> Regex {
     let (head, paren) = match token.strip_suffix('(') {
         Some(h) => (h, r"\s*\("),
         None => (token, ""),
@@ -277,7 +277,7 @@ fn token_re(token: &str) -> Regex {
     clippy::string_slice,
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
 )]
-fn scan_calls(sources: &Sources, patterns: &[Regex]) -> BTreeSet<(String, String)> {
+pub(crate) fn scan_calls(sources: &Sources, patterns: &[Regex]) -> BTreeSet<(String, String)> {
     let decl = fn_decl_re();
     let mut out = BTreeSet::new();
     for (file, src) in sources {
@@ -331,7 +331,7 @@ fn scan_sites(sources: &Sources, rows: &Rows) -> BTreeSet<(String, String)> {
 
 /// The text of `fn name` in `src`, comment lines dropped: its declaration line
 /// to the next fn declaration at the same or a shallower indentation.
-fn fn_body(src: &str, name: &str) -> Option<String> {
+pub(crate) fn fn_body(src: &str, name: &str) -> Option<String> {
     let decl = fn_decl_re();
     let lines: Vec<&str> = src.lines().collect();
     let (start, indent) = lines.iter().enumerate().find_map(|(i, l)| {
