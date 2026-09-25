@@ -124,8 +124,15 @@ permissions:
 # SHA (`ci_rows_for` over `coord.pr_check_runs_latest WHERE repo=$1 AND
 # head_sha=$2`), so a run cancelled on a superseded sha cannot attach to the
 # new head. `classify_check_rows` would treat `cancelled` as a failure, but the
-# view ranks `cancelled` last per (repo, head_sha, name), and
-# cancel-in-progress only ever cancels runs for OLDER shas of the same PR.
+# view ranks `cancelled` last per (repo, head_sha, name), so a cancelled row
+# only counts when it is the sole row for that check on that sha.
+#
+# ⚠️ The group is keyed on the PR, NOT the sha: the NEWEST entrant cancels
+# whatever else is in the group, whichever sha it is for. A re-run of an OLDER
+# sha's run (the UI "Re-run" button, or ci-rerun-on-declaration.yml) therefore
+# cancels the CURRENT head's run and leaves a lone `cancelled` on it — red, with
+# nothing re-firing CI. ci-rerun-on-declaration.yml re-checks the PR head before
+# re-running for exactly this reason; do not re-run a superseded run by hand.
 #
 # `github.workflow` is in the key so the group cannot collide with another
 # workflow's group (concurrency groups are repo-wide). Do NOT add a `paths:`
