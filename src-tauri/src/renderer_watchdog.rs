@@ -13,13 +13,59 @@
 //!
 //! # What it measures (§1.1)
 //!
-//! The **total WebView2 working set**: this process plus the whole DESCENDANT
-//! SUBTREE of `msedgewebview2.exe` processes. Chromium nests renderer, GPU,
-//! utility and crashpad processes under the *browser* process, which is itself
-//! the runner's child — so a `parent == GetCurrentProcessId()` filter sums ONE
-//! process, not the seven measured in the plan's §0b (788 MB total). The
-//! snapshot is walked transitively: one pid→parent map per sample, then the
+//! The **total WebView2 working set**: the whole DESCENDANT SUBTREE of
+//! `msedgewebview2.exe` processes, and NOTHING ELSE. Chromium nests renderer,
+//! GPU, utility and crashpad processes under the *browser* process, which is
+//! itself the runner's child — so a `parent == GetCurrentProcessId()` filter
+//! sums ONE process, not the seven measured in the plan's §0b (788 MB total).
+//! The snapshot is walked transitively: one pid→parent map per sample, then the
 //! closure.
+//!
+//! **The runner's OWN working set is deliberately NOT part of that total**, and
+//! that is a correction rather than a preference. It used to be added in, and
+//! every threshold in §6 Q1 was sized against §0b's *"788 MB across 7
+//! processes"* — 7 processes that are all `msedgewebview2.exe`, none of them the
+//! runner. Measured on the operator box on 2026-09-25: own working set 523 MiB,
+//! WebView2 subtree 1 488 MiB, so the old total read 2 012 MiB. Three things
+//! followed, none of which depended on the renderer being unhealthy:
+//!
+//! * The ceiling budget was silently eaten and floated with load — a third of
+//!   the 1.5 GB allowance went to a process a reload cannot touch.
+//! * A heal could not reclaim it, so once own-WS pushed the total over the
+//!   ceiling every heal under-reclaimed, [`escalate_storm`] latched and
+//!   [`HealGovernor::clear_if_recovered`] could never see a non-breaching tick:
+//!   `renderer_reload_storming` would have stuck `true` on a healthy device,
+//!   permanently.
+//! * Both slope arms regressed on a polluted series, attributing runner-side
+//!   growth to the renderer. Own WS reached 508 MiB in 3 h 52 m on that box —
+//!   ~1–2 MB/min, 20–40× the long arm's 0.05 MB/min threshold.
+//!
+//! Own WS is still SAMPLED and still REPORTED, as
+//! [`Snapshot::own_process_bytes`] and the heartbeat's
+//! `renderer_own_process_bytes` — it is a useful diagnostic. It just never
+//! enters [`Snapshot::total_bytes`], either ceiling, or the slope ring.
+//! [`Snapshot::total_bytes`] is exactly the sum of
+//! [`Snapshot::processes`], so the total and the breakdown reconcile: they used
+//! to differ by precisely own WS with nothing on the wire saying so, which
+//! reads to an operator diffing them as a missing process.
+//!
+//! # Shipped DISABLED by default (§1.4)
+//!
+//! `enabled` defaults to **`false`**; `QONTINUI_RUNNER_MEM_WATCHDOG_ENABLED=1`
+//! is the opt-in. Present but off, until a live calibration run sets defensible
+//! thresholds — because the only live baseline anyone has taken **fails** §6
+//! Q1's numbers even after the own-WS correction above: subtree 1.561e9 B
+//! against the 1.5e9 total ceiling, and a worst single renderer of 1.060e9 B
+//! against the 1.0e9 per-renderer ceiling (operator box, 2026-09-25). Ceilings
+//! are checked before any slope and carry no warm-ring requirement, so on such
+//! a box the FIRST tick breaches and the runner reloads itself. §1.4 asks for
+//! *"Phase 1 acceptance must validate them against a live baseline before
+//! customer rollout"*, and that run does not exist yet.
+//!
+//! Raising the ceilings to make today's box pass would be fitting a threshold
+//! to one unvalidated sample — the opposite of what §1.4 asks — so the numbers
+//! stay as resolved and the feature stays off until the calibration run
+//! replaces them with measured ones.
 //!
 //! It also keeps a **per-process breakdown** — `{pid, kind, working_set_bytes,
 //! first_seen}` — because that split is the cheapest diagnostic the plan can
@@ -102,7 +148,7 @@ use tauri::{AppHandle, Emitter};
 use tracing::{debug, error, info, warn};
 
 use crate::fleet::RendererMemoryHandles;
-use crate::webview_recovery::{self, RecoveryOutcome, RecoveryReason};
+use crate::webview_recovery::{self, LatchReport, RecoveryOutcome, RecoveryReason};
 
 /// Tauri event the frontend listens on for the countdown toast and for both
 /// edges of the persistent storm banner. Payload is a [`WatchdogEvent`];
@@ -126,8 +172,12 @@ const MIN_SAMPLES_FOR_SLOPE: usize = 3;
 /// fired before the 2026-09-18 crash).
 #[derive(Debug, Clone, PartialEq)]
 pub struct WatchdogConfig {
-    /// Master kill-switch (`..._ENABLED`). Mirrors the shape of
-    /// `QONTINUI_COORD_INFRA_HEALTH_OBSERVER_ENABLED`.
+    /// Master switch (`..._ENABLED`), mirroring the shape of
+    /// `QONTINUI_COORD_INFRA_HEALTH_OBSERVER_ENABLED` — but defaulting to
+    /// **`false`**, so this ships present-but-off and `=1` is the opt-in. See
+    /// the module doc's "Shipped DISABLED by default": the one live baseline
+    /// anyone has measured breaches both ceilings on its first tick, and §1.4
+    /// requires a calibration run before customer rollout.
     pub enabled: bool,
     /// Sampling period (`..._TICK_SECS`, default 30 s).
     pub tick: Duration,
@@ -174,7 +224,8 @@ pub struct WatchdogConfig {
 impl Default for WatchdogConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            // OFF until a live calibration run (§1.4). See `enabled`'s doc.
+            enabled: false,
             tick: Duration::from_secs(30),
             slope_mb_per_min: 30.0,
             window: Duration::from_secs(10 * 60),
@@ -212,24 +263,51 @@ impl WatchdogConfig {
                 "QONTINUI_RUNNER_MEM_WATCHDOG_SLOW_WINDOW_MIN",
                 d.slow_window,
             ),
-            ceiling_bytes: env_u64(
+            ceiling_bytes: env_u64_clamped(
                 "QONTINUI_RUNNER_MEM_WATCHDOG_CEILING_BYTES",
                 d.ceiling_bytes,
+                MIN_CEILING_BYTES,
+                u64::MAX,
             ),
-            renderer_ceiling_bytes: env_u64(
+            renderer_ceiling_bytes: env_u64_clamped(
                 "QONTINUI_RUNNER_MEM_WATCHDOG_RENDERER_CEILING_BYTES",
                 d.renderer_ceiling_bytes,
+                MIN_CEILING_BYTES,
+                u64::MAX,
             ),
-            warn_secs: env_u64("QONTINUI_RUNNER_MEM_WATCHDOG_WARN_SECS", d.warn_secs),
-            max_reloads: env_u64("QONTINUI_RUNNER_MEM_WATCHDOG_MAX_RELOADS", d.max_reloads),
+            // §6 Q2 asks for a countdown that is actually visible, so 1 s is the
+            // floor; the ceiling is a bound on a `tokio::sleep` inside a heal.
+            warn_secs: env_u64_clamped(
+                "QONTINUI_RUNNER_MEM_WATCHDOG_WARN_SECS",
+                d.warn_secs,
+                1,
+                MAX_SLEEP_SECS,
+            ),
+            // 1, not 0: `0` would make every breach a storm, which is a silent
+            // second kill switch rather than a reload budget.
+            max_reloads: env_u64_clamped(
+                "QONTINUI_RUNNER_MEM_WATCHDOG_MAX_RELOADS",
+                d.max_reloads,
+                1,
+                1_000,
+            ),
             reload_window: env_mins(
                 "QONTINUI_RUNNER_MEM_WATCHDOG_RELOAD_WINDOW_MIN",
                 d.reload_window,
             ),
-            settle_secs: env_u64("QONTINUI_RUNNER_MEM_WATCHDOG_SETTLE_SECS", d.settle_secs),
-            min_reclaim_bytes: env_u64(
+            settle_secs: env_u64_clamped(
+                "QONTINUI_RUNNER_MEM_WATCHDOG_SETTLE_SECS",
+                d.settle_secs,
+                0,
+                MAX_SLEEP_SECS,
+            ),
+            // Capped at `i64::MAX` because [`heal`] compares it as `i64`: above
+            // that the cast wraps negative and the no-reclaim check is off.
+            min_reclaim_bytes: env_u64_clamped(
                 "QONTINUI_RUNNER_MEM_WATCHDOG_MIN_RECLAIM_BYTES",
                 d.min_reclaim_bytes,
+                0,
+                i64::MAX as u64,
             ),
         }
     }
@@ -277,25 +355,83 @@ fn env_f64(key: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
-fn env_u64(key: &str, default: u64) -> u64 {
-    env_raw(key)
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(default)
+/// Longest window any duration knob may name, in minutes (30 days).
+///
+/// A bound, not a preference. `Duration::from_secs_f64` **panics** on a value
+/// that overflows a `Duration`, and [`WatchdogConfig::from_env`] runs on the
+/// Tauri `setup` thread — so a finite-but-absurd `..._WINDOW_MIN=1e300` would
+/// have killed startup rather than misconfiguring a watchdog.
+const MAX_WINDOW_MINS: f64 = 30.0 * 24.0 * 60.0;
+
+/// Longest a single sleep-bearing knob (`..._WARN_SECS`, `..._SETTLE_SECS`,
+/// `..._TICK_SECS`) may name. Both of the first two are `tokio::sleep`s inside
+/// a heal, so an hour is already far past useful.
+const MAX_SLEEP_SECS: u64 = 3_600;
+
+/// Smallest a byte ceiling may be. `0` is the value that mattered: it breaches
+/// on **every** tick, which is an unattended reload loop rather than a
+/// misconfiguration. 1 MiB is still low enough for a deliberate
+/// force-the-breach acceptance run.
+const MIN_CEILING_BYTES: u64 = 1024 * 1024;
+
+/// Read a `u64` knob, CLAMPED into `min..=max`.
+///
+/// Its siblings all validate (`env_f64` rejects non-finite and non-positive,
+/// `env_secs` rejects zero) and this one did not, which made three knobs into
+/// silent footguns: `MAX_RELOADS=0` turned [`HealGovernor::decide`] into an
+/// unconditional [`HealDecision::Storm`] — a second, undocumented kill switch;
+/// `CEILING_BYTES=0` breached every tick; and a `MIN_RECLAIM_BYTES` above
+/// `i64::MAX` wrapped NEGATIVE at the `as i64` in [`heal`], disabling the
+/// no-reclaim check entirely. Clamping rather than falling back to the default
+/// on purpose: the operator asked for an extreme, and the nearest legal extreme
+/// is closer to that intent than the default is.
+fn env_u64_clamped(key: &str, default: u64, min: u64, max: u64) -> u64 {
+    let Some(v) = env_raw(key).and_then(|v| v.parse::<u64>().ok()) else {
+        return default;
+    };
+    let clamped = clamp_u64(v, min, max);
+    if clamped != v {
+        warn!(
+            key,
+            requested = v,
+            applied = clamped,
+            "renderer_watchdog: {key} is outside {min}..={max} — clamped"
+        );
+    }
+    clamped
+}
+
+/// Pure half of [`env_u64_clamped`], so the bounds are assertable without
+/// mutating the process environment that every other test shares.
+fn clamp_u64(value: u64, min: u64, max: u64) -> u64 {
+    value.clamp(min, max)
+}
+
+/// Pure half of [`env_mins`]: minutes → a [`Duration`], BOUNDED.
+///
+/// The bound is the panic guard. `Duration::from_secs_f64` panics on a value
+/// that overflows a `Duration`, and `..._WINDOW_MIN=1e300` parses as a perfectly
+/// finite `f64` — so without the `min` this would have killed the Tauri `setup`
+/// thread rather than misconfiguring a window.
+fn mins_to_duration(minutes: f64) -> Duration {
+    Duration::from_secs_f64(minutes.min(MAX_WINDOW_MINS).max(0.0) * 60.0)
 }
 
 fn env_secs(key: &str, default: Duration) -> Duration {
     env_raw(key)
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|s| *s > 0)
-        .map(Duration::from_secs)
+        .map(|s| Duration::from_secs(s.min(MAX_SLEEP_SECS)))
         .unwrap_or(default)
 }
 
 fn env_mins(key: &str, default: Duration) -> Duration {
     env_raw(key)
         .and_then(|v| v.parse::<f64>().ok())
+        // The upper bound is what stops `Duration::from_secs_f64` PANICKING on
+        // a finite-but-absurd value — see [`MAX_WINDOW_MINS`].
         .filter(|m| m.is_finite() && *m > 0.0)
-        .map(|m| Duration::from_secs_f64(m * 60.0))
+        .map(mins_to_duration)
         .unwrap_or(default)
 }
 
@@ -370,13 +506,43 @@ pub struct ProcessSample {
 /// One complete sample of the WebView2 subtree.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Snapshot {
-    /// Own process + every `msedgewebview2.exe` descendant.
+    /// Every `msedgewebview2.exe` descendant, and **nothing else** — this is
+    /// exactly `processes.iter().map(working_set_bytes).sum()`, which
+    /// [`Snapshot::reconciles`] asserts. The runner's own working set is NOT in
+    /// here; it is [`Self::own_process_bytes`]. See the module doc's "What it
+    /// measures".
     pub total_bytes: u64,
     /// The per-process breakdown, largest first.
     pub processes: Vec<ProcessSample>,
+    /// The runner's OWN working set. **Diagnostic only**: never in
+    /// [`Self::total_bytes`], never checked against either ceiling, never
+    /// pushed into the slope ring. A reload cannot reclaim it, so letting it
+    /// drive a reload was a detector measuring the wrong quantity.
+    pub own_process_bytes: u64,
+    /// WebView2 descendants that were enumerated but whose working set could
+    /// not be read (exited between the snapshot and the open, or `OpenProcess`
+    /// refused). Counted rather than silently `continue`d: a partial sample
+    /// UNDERSTATES memory, and understating it is a MISSED detection, so the
+    /// number has to be visible next to the total it is missing from.
+    pub unreadable_processes: u32,
 }
 
 impl Snapshot {
+    /// Whether [`Self::total_bytes`] is the sum of [`Self::processes`].
+    ///
+    /// The invariant an operator relies on when diffing the total against the
+    /// breakdown. It used to be false by exactly [`Self::own_process_bytes`],
+    /// with nothing on the wire saying so — which reads as a process missing
+    /// from the breakdown rather than as a different quantity in the total.
+    pub fn reconciles(&self) -> bool {
+        self.total_bytes
+            == self
+                .processes
+                .iter()
+                .map(|p| p.working_set_bytes)
+                .fold(0u64, |a, b| a.saturating_add(b))
+    }
+
     /// The worst single renderer-candidate process, as `(pid, bytes)`.
     pub fn worst_renderer(&self) -> Option<(u32, u64)> {
         self.processes
@@ -386,13 +552,24 @@ impl Snapshot {
             .map(|p| (p.pid, p.working_set_bytes))
     }
 
-    /// Compact one-line rendering for logs: `pid/kind=bytes`, largest first.
+    /// Compact one-line rendering for logs: `pid/kind=bytes`, largest first,
+    /// then the two quantities that are NOT in the total — the runner's own
+    /// working set and the count of descendants that could not be read. Both
+    /// are named so the line reconciles by inspection: the `pid/kind=` terms
+    /// sum to `total_bytes`, and `own=`/`unreadable=` say what is deliberately
+    /// outside it and what is missing from it.
     fn summary(&self) -> String {
-        self.processes
+        let mut out = self
+            .processes
             .iter()
             .map(|p| format!("{}/{}={}", p.pid, p.kind.as_str(), p.working_set_bytes))
             .collect::<Vec<_>>()
-            .join(" ")
+            .join(" ");
+        out.push_str(&format!(
+            " (own={} excluded, unreadable={})",
+            self.own_process_bytes, self.unreadable_processes
+        ));
+        out
     }
 }
 
@@ -571,9 +748,24 @@ impl HealGovernor {
         }
     }
 
+    /// Whether a heal may run now.
+    ///
+    /// The `self.storming` term is load-bearing and was missing: the latch was
+    /// WRITTEN by [`Self::latch_storm`] and read by no decision at all. With the
+    /// default `max_reloads = 2`, a heal that reclaimed nothing logged *"escalating
+    /// now instead of spending the remaining reload budget"*, latched the storm —
+    /// and the very next breaching tick was told `Proceed`, because
+    /// `attempts.len() == 1 < 2`. So the log line, the module doc and §1.3's
+    /// "stop reloading and escalate" were all false as implemented, and the
+    /// remaining budget was spent anyway.
+    ///
+    /// The latch still comes off: [`Self::clear_if_recovered`] clears it on a
+    /// non-breaching tick once the attempt window has drained, which is the same
+    /// edge that emits `storm_cleared` to the UI. So this is a stop, not a
+    /// one-way door.
     fn decide(&mut self, now: Instant, cfg: &WatchdogConfig) -> HealDecision {
         self.prune(now, cfg.reload_window);
-        if self.attempts.len() as u64 >= cfg.max_reloads {
+        if self.storming || self.attempts.len() as u64 >= cfg.max_reloads {
             HealDecision::Storm
         } else {
             HealDecision::Proceed
@@ -627,6 +819,24 @@ struct TelemetryState {
     /// because it is a vector; read once per 30 s heartbeat and written once
     /// per 30 s sample, so contention is not a consideration.
     processes: Arc<Mutex<Vec<ProcessSample>>>,
+    /// Unix ms at which the values above were last published from a READABLE
+    /// sample; 0 before the first one.
+    ///
+    /// Without it the three scalars are bare numbers with no age, so a watchdog
+    /// that died an hour ago is indistinguishable from a live one reading a
+    /// healthy plateau — `capture_telemetry_snapshot` carries
+    /// `last_capture_fallback_at` for exactly this reason.
+    sampled_at_unix_ms: Arc<AtomicU64>,
+    /// The runner's own working set at that sample — diagnostic, and
+    /// deliberately NOT part of `latest_ws_bytes`. Reported so an operator can
+    /// see the quantity the detector excludes (module doc, "What it measures").
+    own_process_bytes: Arc<AtomicU64>,
+    /// WebView2 descendants that sample could not read. Reported because the
+    /// number it is missing from is `latest_ws_bytes`: a partial sample
+    /// UNDERSTATES memory, and a twin alarming on an understated total with
+    /// nothing beside it saying the sample was partial is the same
+    /// silent-failure shape this plan exists to remove.
+    unreadable_processes: Arc<AtomicU64>,
 }
 
 static TELEMETRY: LazyLock<TelemetryState> = LazyLock::new(|| TelemetryState {
@@ -634,6 +844,9 @@ static TELEMETRY: LazyLock<TelemetryState> = LazyLock::new(|| TelemetryState {
     reload_total: Arc::new(AtomicU64::new(0)),
     storming: Arc::new(AtomicBool::new(false)),
     processes: Arc::new(Mutex::new(Vec::new())),
+    sampled_at_unix_ms: Arc::new(AtomicU64::new(0)),
+    own_process_bytes: Arc::new(AtomicU64::new(0)),
+    unreadable_processes: Arc::new(AtomicU64::new(0)),
 });
 
 /// Clones of the watchdog's live telemetry handles, for
@@ -646,16 +859,50 @@ pub fn heartbeat_handles() -> RendererMemoryHandles {
         reload_total: TELEMETRY.reload_total.clone(),
         storming: TELEMETRY.storming.clone(),
         processes: TELEMETRY.processes.clone(),
+        sampled_at_unix_ms: TELEMETRY.sampled_at_unix_ms.clone(),
+        own_process_bytes: TELEMETRY.own_process_bytes.clone(),
+        unreadable_processes: TELEMETRY.unreadable_processes.clone(),
     }
 }
 
+/// Publish one sample for the heartbeat to read.
+///
+/// **An unreadable sample publishes NOTHING.** A snapshot with no processes in
+/// it is UNKNOWN, not a renderer that shrank to zero, and storing its zero would
+/// overwrite the last good reading with a manufactured measurement. Leaving the
+/// previous values in place with an AGEING `sampled_at_unix_ms` is the honest
+/// shape: a reader can see the number is stale. Before the first readable sample
+/// the stamp is 0 and the bytes are 0 — an explicit baseline, which is what the
+/// heartbeat field's doc already promises.
 fn publish_sample(snapshot: &Snapshot) {
+    if snapshot.processes.is_empty() {
+        return;
+    }
     TELEMETRY
         .latest_ws_bytes
         .store(snapshot.total_bytes, Ordering::Relaxed);
-    if let Ok(mut g) = TELEMETRY.processes.lock() {
-        g.clone_from(&snapshot.processes);
-    }
+    TELEMETRY
+        .own_process_bytes
+        .store(snapshot.own_process_bytes, Ordering::Relaxed);
+    TELEMETRY
+        .unreadable_processes
+        .store(snapshot.unreadable_processes as u64, Ordering::Relaxed);
+    // `poisoned.into_inner()`, like every READER of this mutex
+    // (`fleet::renderer_memory_snapshot_from`, `process_facts`). The writer used
+    // to give up on a poisoned lock (`if let Ok`), so one panic anywhere would
+    // freeze the per-process breakdown on the heartbeat forever — silently,
+    // while the readers went on serving the frozen vector as current.
+    let mut g = match TELEMETRY.processes.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    g.clone_from(&snapshot.processes);
+    drop(g);
+    // Stamped LAST, so the stamp never claims freshness for values that are not
+    // yet stored.
+    TELEMETRY
+        .sampled_at_unix_ms
+        .store(unix_ms(), Ordering::Relaxed);
 }
 
 // ─────────────────────────────── the UI event ────────────────────────────
@@ -706,8 +953,10 @@ pub fn start(app: AppHandle) {
 
     if !cfg.enabled {
         info!(
-            "renderer_watchdog: disabled via QONTINUI_RUNNER_MEM_WATCHDOG_ENABLED — \
-             the heartbeat will report a zeroed renderer-memory baseline"
+            "renderer_watchdog: OFF — this ships present-but-disabled until a live \
+             calibration run sets defensible thresholds (plan §1.4). Set \
+             QONTINUI_RUNNER_MEM_WATCHDOG_ENABLED=1 to opt in. The heartbeat will report a \
+             zeroed renderer-memory baseline, which is a BASELINE and not a measurement."
         );
         return;
     }
@@ -756,7 +1005,15 @@ async fn run(app: AppHandle, cfg: WatchdogConfig) {
         // Nothing to reason about: non-Windows builds, or a sample that could
         // not read a single process. Keep the loop alive, skip breach logic —
         // an unreadable sample is UNKNOWN, never a healthy zero.
-        if snapshot.total_bytes == 0 {
+        //
+        // The predicate is the BREAKDOWN, not the total. `total_bytes == 0` was
+        // the only UNKNOWN guard, and it was unreachable on Windows while the
+        // runner's own working set was part of the total — own WS is never zero
+        // on a live process, so a sample that read NOTHING still looked like a
+        // measurement of ~500 MB. Now that the total is the subtree alone, an
+        // empty `processes` is the one honest statement of "read nothing", and
+        // it is also exactly what `publish_sample` refuses to publish.
+        if snapshot.processes.is_empty() {
             continue;
         }
 
@@ -767,6 +1024,8 @@ async fn run(app: AppHandle, cfg: WatchdogConfig) {
 
         debug!(
             total_ws_bytes = snapshot.total_bytes,
+            own_process_bytes = snapshot.own_process_bytes,
+            unreadable_processes = snapshot.unreadable_processes,
             processes = snapshot.processes.len(),
             worst_renderer = ?snapshot.worst_renderer(),
             fast_slope = ?slope_mb_per_min(&ring, cfg.window),
@@ -923,6 +1182,40 @@ fn emit_storm_cleared(app: &AppHandle, snapshot: &Snapshot) {
     );
 }
 
+/// What a heal may do, given the state of the recovery ladder's own latch.
+///
+/// Read BEFORE the countdown, which is the whole point. `trigger_ui_recovery`
+/// answers `Skipped { why: "already_in_progress" }` while a peer recovery run
+/// holds the latch — but [`heal`] used to reach that answer only AFTER it had
+/// already `warn!`ed, emitted the `reload_warning` countdown and slept
+/// `warn_secs`. A peer run can hold the latch for up to
+/// [`webview_recovery::RECOVERY_WEDGE_AFTER_MS`] (~11 min) before degrading to
+/// `Wedged`, so on a 30 s tick the user got "reloading in 10s" roughly twenty
+/// times over, with no reload behind any of them and no guardrail engaged. A
+/// countdown that precedes a refusal is a lie to the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CountdownGate {
+    /// The latch is free: warn, count down, then run the ladder.
+    Announce,
+    /// The latch is WEDGED. Skip the countdown — nothing is going to reload —
+    /// but still call the ladder, so its own wedge reporting fires once per
+    /// incident and the attempt is counted against the budget.
+    StraightToLadder,
+    /// A peer recovery run holds the latch and is inside its legitimate time.
+    /// Say nothing, sleep nothing, count nothing: it is doing our work.
+    Skip,
+}
+
+/// Pure half of the gate, so the three arms are assertable without a latch or a
+/// webview.
+fn countdown_gate(latch: &LatchReport) -> CountdownGate {
+    match (latch.in_flight, latch.wedged) {
+        (false, _) => CountdownGate::Announce,
+        (true, true) => CountdownGate::StraightToLadder,
+        (true, false) => CountdownGate::Skip,
+    }
+}
+
 /// Warn, wait out the countdown, run the VERIFIED recovery ladder, then report
 /// the reclaim.
 ///
@@ -936,34 +1229,64 @@ async fn heal(
     breach: Breach,
     reason: &str,
 ) -> Option<&'static str> {
-    warn!(
-        breach = breach.as_str(),
-        total_ws_bytes = pre.total_bytes,
-        processes = %pre.summary(),
-        "renderer_watchdog: breach — {reason}. Recovering the webview in {} s.",
-        cfg.warn_secs
-    );
+    // Consult the ladder FIRST. Everything below — the loud line, the
+    // countdown event, the `warn_secs` sleep — is a promise that a reload is
+    // about to happen, and a peer recovery run holding the latch means it is
+    // not. See [`CountdownGate`].
+    let latch = webview_recovery::recovery_latch_report();
+    let gate = countdown_gate(&latch);
+    if gate == CountdownGate::Skip {
+        debug!(
+            in_flight_ms = ?latch.in_flight_ms,
+            breach = breach.as_str(),
+            total_ws_bytes = pre.total_bytes,
+            "renderer_watchdog: a recovery run already holds the latch — no countdown, no \
+             attempt; it is doing this work ({reason})"
+        );
+        return None;
+    }
 
-    // §6 Q2: always a visible countdown, and it elapses whether or not it is
-    // acknowledged. A backgrounded or headless window must not be able to
-    // defeat a load-bearing protection by inattention.
-    emit(
-        app,
-        WatchdogEvent {
-            kind: "reload_warning",
-            breach: breach.as_str(),
-            total_ws_bytes: pre.total_bytes,
-            countdown_secs: cfg.warn_secs,
-            reload_total: TELEMETRY.reload_total.load(Ordering::Relaxed),
-            reclaimed_bytes: None,
-            message: format!(
-                "Reclaiming renderer memory — reloading in {} s. Terminal sessions are \
-                 preserved. ({reason})",
-                cfg.warn_secs
-            ),
-        },
-    );
-    tokio::time::sleep(Duration::from_secs(cfg.warn_secs)).await;
+    if gate == CountdownGate::Announce {
+        warn!(
+            breach = breach.as_str(),
+            total_ws_bytes = pre.total_bytes,
+            processes = %pre.summary(),
+            "renderer_watchdog: breach — {reason}. Recovering the webview in {} s.",
+            cfg.warn_secs
+        );
+
+        // §6 Q2: always a visible countdown, and it elapses whether or not it
+        // is acknowledged. A backgrounded or headless window must not be able
+        // to defeat a load-bearing protection by inattention.
+        emit(
+            app,
+            WatchdogEvent {
+                kind: "reload_warning",
+                breach: breach.as_str(),
+                total_ws_bytes: pre.total_bytes,
+                countdown_secs: cfg.warn_secs,
+                reload_total: TELEMETRY.reload_total.load(Ordering::Relaxed),
+                reclaimed_bytes: None,
+                message: format!(
+                    "Reclaiming renderer memory — reloading in {} s. Terminal sessions are \
+                     preserved. ({reason})",
+                    cfg.warn_secs
+                ),
+            },
+        );
+        tokio::time::sleep(Duration::from_secs(cfg.warn_secs)).await;
+    } else {
+        // `StraightToLadder`: the latch is wedged, so no reload is coming and a
+        // countdown would be a lie. Fall through to the ladder anyway — it
+        // reports the wedge once per incident and returns `Wedged`, which the
+        // match below counts against the budget.
+        warn!(
+            in_flight_ms = ?latch.in_flight_ms,
+            breach = breach.as_str(),
+            "renderer_watchdog: recovery latch is WEDGED — skipping the countdown (nothing is \
+             going to reload) and letting the ladder report it ({reason})"
+        );
+    }
 
     let outcome =
         webview_recovery::trigger_ui_recovery(app, RecoveryReason::RendererMemoryPressure).await;
@@ -1099,7 +1422,8 @@ async fn heal(
 static PROCESS_FACTS: LazyLock<Mutex<std::collections::HashMap<u32, (u64, WebViewProcessKind)>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
-#[cfg(target_os = "windows")]
+/// Wall-clock milliseconds. Not `cfg`-gated: [`publish_sample`] stamps every
+/// published sample on every platform.
 fn unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1179,10 +1503,19 @@ fn sample_webview2_subtree() -> Snapshot {
         .collect();
     descendants.sort_unstable();
 
-    let mut total = own_ws;
+    // The total is the SUBTREE ONLY. `own_ws` is carried beside it as a
+    // diagnostic and never added in: a reload cannot reclaim the runner's own
+    // heap, so a total containing it ate the ceiling budget, latched a storm
+    // that could never clear, and polluted both slope series. Module doc,
+    // "What it measures".
+    let mut total = 0u64;
+    let mut unreadable_processes = 0u32;
     let mut processes = Vec::with_capacity(descendants.len());
     for &pid in &descendants {
         let Some(ws) = process_working_set(pid) else {
+            // COUNTED, not swallowed: an unread descendant makes the sample
+            // understate memory, and understating it is a missed detection.
+            unreadable_processes = unreadable_processes.saturating_add(1);
             continue;
         };
         total = total.saturating_add(ws);
@@ -1201,6 +1534,8 @@ fn sample_webview2_subtree() -> Snapshot {
     Snapshot {
         total_bytes: total,
         processes,
+        own_process_bytes: own_ws,
+        unreadable_processes,
     }
 }
 
@@ -1278,7 +1613,15 @@ fn own_process_working_set() -> u64 {
 }
 
 /// Working set of an arbitrary pid, or `None` when the process cannot be opened
-/// (already exited, or access denied).
+/// (already exited, or access denied) — which the caller COUNTS as
+/// [`Snapshot::unreadable_processes`].
+///
+/// Asks for `PROCESS_QUERY_LIMITED_INFORMATION` **only**. `GetProcessMemoryInfo`
+/// needs nothing more, and the `PROCESS_VM_READ` this used to request as well
+/// made the open fail on processes whose memory we are not permitted to read —
+/// each one silently understating the total, i.e. costing a detection.
+/// [`process_command_line`] keeps `PROCESS_VM_READ`, because it genuinely reads
+/// the remote PEB.
 #[cfg(target_os = "windows")]
 fn process_working_set(pid: u32) -> Option<u64> {
     use std::mem::MaybeUninit;
@@ -1286,14 +1629,12 @@ fn process_working_set(pid: u32) -> Option<u64> {
     use windows_sys::Win32::System::ProcessStatus::{
         GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
     };
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
-    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
     // SAFETY: the handle is checked for null, closed on both exit paths, and
     // the counters struct is read only after a non-zero return.
     unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, 0, pid);
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if handle.is_null() {
             return None;
         }
@@ -1387,9 +1728,13 @@ fn process_command_line(pid: u32) -> Option<String> {
                 return None;
             }
             let cmd = params.assume_init().CommandLine;
-            // Bound the copy: a Chromium renderer's command line is a few KB,
-            // and `Length` is attacker-adjacent memory we did not write.
-            let len_bytes = (cmd.Length as usize).min(64 * 1024);
+            // Bound the copy: `Length` is memory the runner did not write, and
+            // the ONE thing that has to be enforced about it is PARITY. See
+            // [`utf16_copy_len`] — the `.min(64 * 1024)` that used to stand here
+            // was dead code (`Length` is a `u16`, so it cannot exceed 65535)
+            // while the odd-length case it was meant to guard wrote one byte
+            // past the buffer.
+            let len_bytes = utf16_copy_len(cmd.Length);
             if len_bytes == 0 || cmd.Buffer.is_null() {
                 return None;
             }
@@ -1409,6 +1754,27 @@ fn process_command_line(pid: u32) -> Option<String> {
         CloseHandle(handle);
         result
     }
+}
+
+/// How many BYTES of a remote `UNICODE_STRING` may be copied into a
+/// `vec![0u16; n / 2]`, given its `Length`.
+///
+/// Rounded DOWN to an even number, and that is the whole point. `Length` counts
+/// bytes and is `u16`, so it is already bounded by 65535 — the `.min(64 * 1024)`
+/// clamp that used to stand in for this could never fire. What it never
+/// addressed is the case it was written for: for any ODD `Length`,
+/// `vec![0u16; len / 2]` rounds down and allocates `len - 1` bytes while
+/// `ReadProcessMemory` is asked to write `len`. RPM validates the REMOTE address
+/// and then memcpys locally unchecked, so that is a one-byte heap overflow.
+/// `Length == 1` is worse: `vec![0u16; 0]` allocates nothing and its
+/// `as_mut_ptr()` is a dangling non-null pointer RPM would write a byte to.
+///
+/// A `Length` of 1 therefore copies 0 bytes, which the caller reads as
+/// "unclassifiable" — [`WebViewProcessKind::Unknown`], the arm that already
+/// exists for an unreadable command line.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn utf16_copy_len(length: u16) -> usize {
+    (length as usize) & !1
 }
 
 /// The `--type=<token>` value from a Chromium command line, if present.
@@ -1510,6 +1876,11 @@ mod tests {
                 proc(3, WebViewProcessKind::Renderer, 184),
                 proc(4, WebViewProcessKind::Renderer, 382),
             ],
+            // A 500 MB runner beside a quiet renderer: the number that used to
+            // be summed into `total_bytes`, and the reason a healthy box
+            // breached. Never read by the detector.
+            own_process_bytes: 523 * 1024 * 1024,
+            unreadable_processes: 0,
         }
     }
 
@@ -1518,7 +1889,11 @@ mod tests {
     #[test]
     fn shipped_defaults_are_the_re_resolved_plan_numbers() {
         let c = WatchdogConfig::default();
-        assert!(c.enabled);
+        assert!(
+            !c.enabled,
+            "ships present-but-OFF until a live calibration run (§1.4): the only baseline \
+             anyone has measured breaches BOTH ceilings on its first tick"
+        );
         assert_eq!(c.tick, Duration::from_secs(30));
         assert_eq!(c.slope_mb_per_min, 30.0);
         assert_eq!(c.window, Duration::from_secs(600));
@@ -1652,6 +2027,7 @@ mod tests {
         let snap = Snapshot {
             total_bytes: 1_500_000_001,
             processes: vec![proc(3, WebViewProcessKind::Renderer, 200)],
+            ..Snapshot::default()
         };
         assert_eq!(
             evaluate(&ring, &snap, &c),
@@ -1679,6 +2055,7 @@ mod tests {
                     first_seen_unix_ms: 0,
                 },
             ],
+            ..Snapshot::default()
         };
         assert!(snap.total_bytes < c.ceiling_bytes);
         assert_eq!(
@@ -1702,6 +2079,7 @@ mod tests {
                 working_set_bytes: 1_200_000_000,
                 first_seen_unix_ms: 0,
             }],
+            ..Snapshot::default()
         };
         assert_eq!(evaluate(&ring, &snap, &c), None);
     }
@@ -1720,6 +2098,7 @@ mod tests {
                 working_set_bytes: 1_000_000_001,
                 first_seen_unix_ms: 0,
             }],
+            ..Snapshot::default()
         };
         assert!(matches!(
             evaluate(&ring, &snap, &c),
@@ -1957,6 +2336,179 @@ mod tests {
         );
     }
 
+    // ── what the detector measures (own WS is NOT in it) ────────────────
+
+    #[test]
+    fn the_total_is_the_subtree_alone_and_reconciles_with_the_breakdown() {
+        // The invariant an operator relies on when diffing the two. It used to
+        // be false by exactly the runner's own working set, with nothing on the
+        // wire saying so — which reads as a MISSING PROCESS rather than as a
+        // different quantity.
+        let snap = quiet_snapshot(91 + 70 + 184 + 382);
+        assert!(
+            snap.reconciles(),
+            "total {} != sum of the breakdown",
+            snap.total_bytes
+        );
+        assert!(
+            snap.own_process_bytes > 0,
+            "the fixture carries an own-WS figure, so this is a real exclusion"
+        );
+        assert_eq!(
+            snap.total_bytes,
+            727 * 1024 * 1024,
+            "the own-WS term must not have crept back into the total"
+        );
+    }
+
+    #[test]
+    fn own_working_set_can_never_breach_either_ceiling() {
+        // The measured shape on the operator box, 2026-09-25: own 523 MiB,
+        // subtree 1 488 MiB. Summed, the old total was 2 012 MiB against a
+        // 1.5 GB ceiling — so a HEALTHY renderer breached, every heal
+        // under-reclaimed (a reload cannot touch the runner's own heap),
+        // `escalate_storm` latched, and `clear_if_recovered` could never see a
+        // non-breaching tick: `renderer_reload_storming` stuck true forever.
+        let c = cfg();
+        let ring = ramp(&c, 21, 1_400.0, 0.0, 0.0);
+        let snap = Snapshot {
+            total_bytes: 1_400 * 1024 * 1024,
+            processes: vec![
+                proc(1, WebViewProcessKind::Browser, 140),
+                proc(2, WebViewProcessKind::Renderer, 900),
+                proc(3, WebViewProcessKind::Gpu, 107),
+                proc(4, WebViewProcessKind::Renderer, 253),
+            ],
+            own_process_bytes: 10_000_000_000,
+            unreadable_processes: 0,
+        };
+        assert!(snap.total_bytes < c.ceiling_bytes);
+        assert_eq!(
+            evaluate(&ring, &snap, &c),
+            None,
+            "a 10 GB own working set must not produce a breach of any kind"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_descendant_is_counted_rather_than_swallowed() {
+        // A partial sample UNDERSTATES memory, and understating it is a MISSED
+        // detection — the opposite of a false positive, and the one that costs
+        // an OOM. The count has to be visible beside the total it is missing
+        // from, which is what `summary()` prints.
+        let snap = Snapshot {
+            total_bytes: 200 * 1024 * 1024,
+            processes: vec![proc(3, WebViewProcessKind::Renderer, 200)],
+            own_process_bytes: 523 * 1024 * 1024,
+            unreadable_processes: 2,
+        };
+        assert!(snap.reconciles(), "the total still matches what WAS read");
+        let line = snap.summary();
+        assert!(line.contains("unreadable=2"), "summary was: {line}");
+        assert!(
+            line.contains(&format!("own={} excluded", 523 * 1024 * 1024)),
+            "summary was: {line}"
+        );
+    }
+
+    #[test]
+    fn an_empty_breakdown_is_the_unknown_predicate_not_a_zero_total() {
+        // `total_bytes == 0` was the only UNKNOWN guard and was UNREACHABLE on
+        // Windows while own WS was in the total — a live process never reads 0,
+        // so a sample that read NOTHING still looked like ~500 MB of
+        // measurement. With the subtree-only total the two agree again.
+        let unknown = Snapshot::default();
+        assert!(unknown.processes.is_empty());
+        assert_eq!(unknown.total_bytes, 0);
+        assert!(unknown.reconciles());
+    }
+
+    #[test]
+    fn a_latched_storm_refuses_a_further_heal_with_budget_remaining() {
+        // The latch was WRITTEN and read by no decision. With max_reloads = 2, a
+        // heal that reclaimed nothing escalated, latched — and the next
+        // breaching tick was told `Proceed` because `attempts.len() == 1 < 2`,
+        // spending the budget the log had just said it would not spend.
+        let c = cfg();
+        assert_eq!(c.max_reloads, 2, "the defect needs budget left over");
+        let mut g = HealGovernor::default();
+        let t0 = Instant::now();
+
+        assert_eq!(g.decide(t0, &c), HealDecision::Proceed);
+        g.record_attempt(t0);
+        // One attempt spent of two: the budget is NOT the reason to stop.
+        assert_eq!(
+            g.decide(t0 + Duration::from_secs(30), &c),
+            HealDecision::Proceed,
+            "without a storm, one attempt of two leaves the budget open"
+        );
+
+        g.latch_storm();
+        assert_eq!(
+            g.decide(t0 + Duration::from_secs(60), &c),
+            HealDecision::Storm,
+            "a latched storm stops further heals even with budget remaining"
+        );
+
+        // And it is a stop, not a one-way door: the quiet edge still clears it.
+        let after = t0 + c.reload_window + Duration::from_secs(1);
+        assert!(g.clear_if_recovered(after, &c));
+        assert_eq!(g.decide(after, &c), HealDecision::Proceed);
+    }
+
+    #[test]
+    fn the_countdown_is_gated_on_the_ladder_before_anything_is_promised() {
+        // A countdown that precedes a refusal is a lie to the user: a peer
+        // recovery run can hold the latch for up to RECOVERY_WEDGE_AFTER_MS
+        // (~11 min), which on a 30 s tick is ~20 "reloading in 10s" toasts with
+        // no reload behind any of them.
+        assert_eq!(
+            countdown_gate(&webview_recovery::classify_latch(None)),
+            CountdownGate::Announce,
+            "a free latch is the only state that may promise a reload"
+        );
+        assert_eq!(
+            countdown_gate(&webview_recovery::classify_latch(Some(1_000))),
+            CountdownGate::Skip,
+            "a peer run inside its time: say nothing, sleep nothing, count nothing"
+        );
+        assert_eq!(
+            countdown_gate(&webview_recovery::classify_latch(Some(
+                webview_recovery::RECOVERY_WEDGE_AFTER_MS
+            ))),
+            CountdownGate::StraightToLadder,
+            "wedged: no countdown, but the ladder still gets called so it reports"
+        );
+    }
+
+    #[test]
+    fn a_remote_command_line_length_is_masked_to_an_even_byte_count() {
+        // `UNICODE_STRING.Length` is a `u16` count of BYTES from memory the
+        // runner did not write. The `.min(64 * 1024)` that used to stand in for
+        // this could never fire (65536 > u16::MAX), while `vec![0u16; len / 2]`
+        // rounded DOWN — so an ODD length allocated `len - 1` bytes and asked
+        // `ReadProcessMemory` to write `len`: a one-byte heap overflow.
+        for even in [0u16, 2, 64, 4_096, u16::MAX - 1] {
+            assert_eq!(utf16_copy_len(even), even as usize);
+        }
+        // `Length == 1` is the worst case: `vec![0u16; 0]` allocates nothing and
+        // its `as_mut_ptr()` is a dangling non-null pointer. 0 bytes copied is
+        // read as "unclassifiable", an arm that already exists.
+        assert_eq!(utf16_copy_len(1), 0);
+        assert_eq!(utf16_copy_len(3), 2);
+        assert_eq!(utf16_copy_len(65_535), 65_534);
+        for len in 0u16..=4_096 {
+            let n = utf16_copy_len(len);
+            assert!(n % 2 == 0, "{len} → {n} is odd");
+            assert!(n <= len as usize, "{len} → {n} grew");
+            assert_eq!(
+                vec![0u16; n / 2].len() * 2,
+                n,
+                "the buffer must hold exactly the bytes RPM is asked to write"
+            );
+        }
+    }
+
     // ── env plumbing ────────────────────────────────────────────────────
 
     #[test]
@@ -1969,6 +2521,55 @@ mod tests {
         // Absent means "keep the default", in both directions.
         assert!(parse_bool(None, true));
         assert!(!parse_bool(None, false));
+        // And the default is now OFF, so `=1` is the opt-in rather than `=0`
+        // being the kill switch.
+        assert!(!parse_bool(None, WatchdogConfig::default().enabled));
+        assert!(parse_bool(Some("1"), WatchdogConfig::default().enabled));
+    }
+
+    #[test]
+    fn the_numeric_knobs_are_clamped_rather_than_taken_at_face_value() {
+        let d = WatchdogConfig::default();
+        // MAX_RELOADS=0 made `decide` return Storm unconditionally — a silent
+        // SECOND kill switch, undocumented and indistinguishable from a storm.
+        assert_eq!(clamp_u64(0, 1, 1_000), 1);
+        let mut g = HealGovernor::default();
+        assert_eq!(
+            g.decide(
+                Instant::now(),
+                &WatchdogConfig {
+                    max_reloads: clamp_u64(0, 1, 1_000),
+                    ..d.clone()
+                }
+            ),
+            HealDecision::Proceed,
+            "the clamped floor leaves one real reload rather than an instant storm"
+        );
+        // CEILING_BYTES=0 breached on every single tick — an unattended reload
+        // loop, not a misconfiguration.
+        assert_eq!(clamp_u64(0, MIN_CEILING_BYTES, u64::MAX), MIN_CEILING_BYTES);
+        // MIN_RECLAIM_BYTES above i64::MAX wrapped NEGATIVE at the `as i64` in
+        // `heal`, which disabled the no-reclaim check silently.
+        let huge = clamp_u64(u64::MAX, 0, i64::MAX as u64);
+        assert_eq!(huge, i64::MAX as u64);
+        assert!(huge as i64 > 0, "the cast must not wrap negative");
+        // A legal value passes through untouched.
+        assert_eq!(clamp_u64(64 * 1024 * 1024, 0, i64::MAX as u64), 67_108_864);
+    }
+
+    #[test]
+    fn an_absurd_but_finite_window_is_bounded_instead_of_panicking() {
+        // `from_env` runs on the Tauri SETUP thread, so a panic here does not
+        // misconfigure a watchdog — it kills startup. `1e300` is finite and
+        // positive, so every other filter passes it straight to
+        // `Duration::from_secs_f64`, which panics on overflow.
+        let capped = mins_to_duration(1e300);
+        assert_eq!(capped, Duration::from_secs_f64(MAX_WINDOW_MINS * 60.0));
+        assert_eq!(mins_to_duration(f64::MAX), capped);
+        // Ordinary values are untouched, including the shipped defaults.
+        assert_eq!(mins_to_duration(10.0), Duration::from_secs(600));
+        assert_eq!(mins_to_duration(360.0), Duration::from_secs(21_600));
+        assert_eq!(mins_to_duration(0.5), Duration::from_secs(30));
     }
 
     #[cfg(target_os = "windows")]

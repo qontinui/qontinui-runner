@@ -672,9 +672,15 @@ impl ProcessFailureKind {
 ///   self-watchdog (`crate::renderer_watchdog`), plan
 ///   `2026-06-09-runner-renderer-memory-watchdog-and-twin-slo` Phase 1. The
 ///   one reason raised **before** anything has failed: the renderer is alive
-///   and the browser process is healthy, so this starts on the cheap
+///   and the browser process is healthy, so the FIRST call takes the cheap
 ///   [`RecoveryAction::Reload`] rung, which is exactly the tear-down-the-
-///   document reclaim the watchdog wants.
+///   document reclaim the watchdog wants. Only the first, though — [`plan_action`]
+///   returns [`RecoveryAction::Recreate`] for `attempt >= 1`, and attempts are
+///   retained for [`RECOVERY_ATTEMPT_RESET_MS`] (10 min) while the watchdog's own
+///   budget is 2 reloads per 15 min, so a SECOND watchdog heal inside 10 minutes
+///   is a window recreate. That is the intended escalation, not a surprise — it
+///   is stated here because "starts on the cheap rung" reads as a property of the
+///   reason when it is a property of the first call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryReason {
@@ -787,6 +793,12 @@ pub fn plan_action(reason: RecoveryReason, attempt: u32) -> RecoveryAction {
         // a native `ICoreWebView2::Reload()` that tears the document down — is
         // precisely the reclaim the watchdog is asking for. A recreate would
         // work too but costs a window rebuild, so it stays the escalation.
+        //
+        // Note the arithmetic, because "the watchdog gets the cheap rung" is
+        // true of its FIRST heal only: `LOOP_GUARD` retains attempts for
+        // `RECOVERY_ATTEMPT_RESET_MS` (10 min) and the watchdog's budget is 2
+        // reloads per 15 min, so its second heal inside 10 minutes arrives with
+        // `attempt >= 1` and recreates the window. Intended; just not "cheap".
         _ => {
             if attempt == 0 {
                 RecoveryAction::Reload
