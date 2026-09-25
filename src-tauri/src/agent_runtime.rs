@@ -7127,7 +7127,8 @@ pub(crate) enum CredentialDoorAnswer {
         exp: i64,
         jti: Option<uuid::Uuid>,
     },
-    /// Any non-2xx, with the body so the `error` code can be named: coord's
+    /// Any non-2xx, with the body so the refusal's code can be named
+    /// (`coord_ws::refusal_error_code`: `code`, else `error`): coord's
     /// typed refusals are 409 `already_credentialed`, 403 `device_mismatch`,
     /// 404 `agent_not_found`, 503 `schema_migration_pending`, 401 on a bad
     /// bearer — and a coord that predates the door answers a bare 404 for the
@@ -7266,7 +7267,7 @@ fn sanitize_reason_detail(raw: &str) -> String {
 /// [`launch_deferral_reason`]: `deferred_load:credential_door:503_<code>` or
 /// `deferred_load:credential_door:unreachable`. The transport detail of an
 /// unreachable door is logged beside it, never put on the wire; the 503
-/// body's `error` code is server-controlled, so it passes through
+/// body's refusal code is server-controlled, so it passes through
 /// [`sanitize_reason_detail`] (bounded length, bounded alphabet) first.
 /// Only the two transient shapes reach here; every settled answer is a
 /// [`CredentialDecision::Refuse`] and never asks for a deferral reason.
@@ -7354,7 +7355,8 @@ async fn fetch_agent_credential(base: &str, agent_id: uuid::Uuid) -> CredentialD
 /// - Everything else (401/403/409, a typed 404, a 404 with an empty frame
 ///   `jwt`, a 2xx with an empty token) → refuse, terminally. A
 ///   credential-less agent is never launched; the reason names the status and
-///   coord's `error` code so the `spawn-failed` row is diagnosable.
+///   coord's refusal code (`code`, else `error`) so the `spawn-failed` row is
+///   diagnosable.
 pub(crate) fn decide_agent_credential(
     answer: CredentialDoorAnswer,
     frame_jwt: &str,
@@ -11159,6 +11161,23 @@ mod tests {
     fn credential_door_typed_404_agent_not_found_never_falls_back() {
         let reason = refuse_reason(decide_agent_credential(
             refused(404, r#"{"error":"agent_not_found"}"#),
+            "frame.tok.en",
+            1,
+        ));
+        assert!(reason.contains("agent_not_found"), "{reason}");
+    }
+
+    /// The same typed 404 in the `auth.rs` `Refusal` shape — machine code in
+    /// `code`, prose in `error` — must still be recognised as
+    /// `agent_not_found`, not read as an untyped 404 that falls back to the
+    /// frame jwt.
+    #[test]
+    fn credential_door_typed_404_in_code_field_never_falls_back() {
+        let reason = refuse_reason(decide_agent_credential(
+            refused(
+                404,
+                r#"{"error":"no such agent on this tenant","code":"agent_not_found"}"#,
+            ),
             "frame.tok.en",
             1,
         ));
