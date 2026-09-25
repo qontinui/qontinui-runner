@@ -53,6 +53,16 @@
 //! embedded tree is exempt because it is reviewed source in THIS repository
 //! rather than text a backend handed this device.
 //!
+//! ## Every written `SKILL.md` states its provenance
+//!
+//! Each skill's manifest is written with the same `qontinui-provenance:`
+//! frontmatter key a provisioned command body carries (one implementation,
+//! [`crate::provenance`]), naming
+//! `canonical=qontinui-claude-config:.claude/skills/<name>/SKILL.md` and the
+//! rung that supplied it. Only `SKILL.md` is stamped: a helper script has no
+//! frontmatter, and a key line in a `.sh` is a syntax error. See
+//! `write_provisioned_file`.
+//!
 //! ## The account-override layer — it exists now
 //!
 //! This paragraph used to say skills had no fetch layer because "the
@@ -413,7 +423,8 @@ pub(crate) fn provision_fleet_skills_into(
             // embedded floor first, so one unwritable file would cost a session
             // most of its corpus. The failure is recorded against the file that
             // caused it rather than against the destination directory.
-            if let Err(e) = write_provisioned_file(&dst, text, skill.source) {
+            if let Err(e) = write_provisioned_file(&dst, &skill.name, rel_path, text, skill.source)
+            {
                 warn!(
                     "fleet_skills: could not write {} ({e}) — continuing with the rest",
                     dst.display()
@@ -438,17 +449,39 @@ pub(crate) fn provision_fleet_skills_into(
 
 /// Create `path`'s parent, write `text`, and set the mode for `source`.
 ///
+/// The skill's manifest — `rel_path == SKILL.md`, and only that file — is
+/// written through [`crate::provenance::with_provenance`], so it carries the
+/// same `qontinui-provenance:` frontmatter key every provisioned command body
+/// carries, with `canonical=qontinui-claude-config:.claude/skills/<name>/SKILL.md`.
+/// Every other file is written byte-for-byte: a helper script or a nested
+/// reference file has no frontmatter to carry a key, and a key line in a `.sh`
+/// is a syntax error. Those files' provenance is the ledger row
+/// (`capability_manifest::ProvisionReport`) this pass records.
+///
 /// One fallible unit so the caller can turn any of the three failures into a
 /// single per-file skip.
 fn write_provisioned_file(
     path: &Path,
+    skill_name: &str,
+    rel_path: &str,
     text: &str,
     source: crate::agent_skills::AgentSkillSource,
 ) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, text)?;
+    if rel_path == SKILL_MANIFEST {
+        std::fs::write(
+            path,
+            crate::provenance::with_provenance(
+                &crate::provenance::skill_canonical(skill_name),
+                text,
+                source.as_str(),
+            ),
+        )?;
+    } else {
+        std::fs::write(path, text)?;
+    }
     apply_mode(path, source)
 }
 
@@ -508,22 +541,74 @@ mod tests {
         assert!(expected > 0, "the bundle should not be empty");
     }
 
+    /// Every embedded file landed at its relative path. A skill's top-level
+    /// `SKILL.md` carries the `qontinui-provenance:` key — stripping it with
+    /// the ONE shared strip rule gives the embedded bytes back, and the key
+    /// says `source=builtin` with the skill's canonical path. Every other file
+    /// is byte-identical, and on Unix an embedded `.sh` keeps `0o755`.
     fn check_dir(dir: &Dir<'_>, dst_root: &std::path::Path, count: &mut usize) {
         for file in dir.files() {
             let dst = dst_root.join(file.path());
             assert!(dst.exists(), "{} should exist", dst.display());
             let on_disk = std::fs::read(&dst).expect("read provisioned file");
-            assert_eq!(
-                on_disk,
-                file.contents(),
-                "{} should be byte-identical to the embedded copy",
-                dst.display()
-            );
+            let is_manifest = file.path().components().count() == 2
+                && file.path().file_name().and_then(|n| n.to_str()) == Some(SKILL_MANIFEST);
+            if is_manifest {
+                let skill = file
+                    .path()
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .expect("a manifest sits in a named skill dir");
+                let text = String::from_utf8(on_disk).expect("SKILL.md is UTF-8");
+                let (line, body) = crate::provenance::strip_provenance(&text)
+                    .unwrap_or_else(|| panic!("{} carries no provenance key", dst.display()));
+                assert_eq!(
+                    body.as_bytes(),
+                    file.contents(),
+                    "{} minus its provenance key must be the embedded copy",
+                    dst.display()
+                );
+                assert_eq!(line.source, "builtin");
+                assert_eq!(line.canonical, crate::provenance::skill_canonical(skill));
+                assert_eq!(line.runner_build, crate::provenance::RUNNER_BUILD);
+                assert!(
+                    crate::provenance::provenance_consistent(&text).is_ok(),
+                    "{} must be self-consistent",
+                    dst.display()
+                );
+            } else {
+                assert_eq!(
+                    on_disk,
+                    file.contents(),
+                    "{} should be byte-identical to the embedded copy",
+                    dst.display()
+                );
+                #[cfg(unix)]
+                if file.path().extension().and_then(|e| e.to_str()) == Some("sh") {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = std::fs::metadata(&dst).unwrap().permissions().mode();
+                    assert_eq!(
+                        mode & 0o777,
+                        0o755,
+                        "{} is an embedded script and must keep 0o755",
+                        dst.display()
+                    );
+                }
+            }
             *count += 1;
         }
         for sub in dir.dirs() {
             check_dir(sub, dst_root, count);
         }
+    }
+
+    /// A provisioned `SKILL.md`, read back with its provenance key removed.
+    fn manifest_body(path: &std::path::Path) -> String {
+        let text = std::fs::read_to_string(path).expect("read SKILL.md");
+        crate::provenance::strip_provenance(&text)
+            .unwrap_or_else(|| panic!("{} carries no provenance key", path.display()))
+            .1
     }
 
     #[test]
@@ -645,7 +730,7 @@ mod tests {
             .get_file(std::path::Path::new("coord-revive").join(SKILL_MANIFEST))
             .expect("coord-revive/SKILL.md is embedded");
         assert_eq!(
-            std::fs::read(&dst).unwrap(),
+            manifest_body(&dst).as_bytes(),
             embedded.contents(),
             "an untracked destination is overwritten exactly as before"
         );
@@ -1110,7 +1195,7 @@ mod tests {
 
         let dir = skills_dir.join("coord-revive");
         assert_eq!(
-            std::fs::read_to_string(dir.join(SKILL_MANIFEST)).unwrap(),
+            manifest_body(&dir.join(SKILL_MANIFEST)),
             "# my own coord-revive\n",
             "the served body must win over the embedded default"
         );
@@ -1158,7 +1243,7 @@ mod tests {
         provision_fleet_skills_into(&skills_dir, &registry).expect("pass 2");
 
         assert_eq!(
-            std::fs::read_to_string(skills_dir.join("coord-revive").join(SKILL_MANIFEST)).unwrap(),
+            manifest_body(&skills_dir.join("coord-revive").join(SKILL_MANIFEST)),
             "# my own coord-revive\n",
             "the override still replaces the file it names"
         );
@@ -1262,8 +1347,7 @@ mod tests {
         )]);
         provision_fleet_skills_into(&skills_dir, &registry).expect("provision");
         assert_eq!(
-            std::fs::read_to_string(skills_dir.join("account-only-skill").join(SKILL_MANIFEST))
-                .unwrap(),
+            manifest_body(&skills_dir.join("account-only-skill").join(SKILL_MANIFEST)),
             "# account only\n"
         );
     }
@@ -1287,6 +1371,35 @@ mod tests {
             .join("reference")
             .join("verdicts.md")
             .exists());
+    }
+
+    /// `source=` on a `SKILL.md` names the layer that supplied it, and helper
+    /// files beside it are never stamped.
+    #[test]
+    fn a_served_manifest_is_stamped_served_and_its_helpers_are_not() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let skills_dir = tmp.path().join(".claude").join("skills");
+        let registry = registry_with(vec![skill_unit(
+            "coord-revive",
+            bundle(&[
+                ("SKILL.md", "---\nname: coord-revive\n---\n# served\n"),
+                ("coord-revive.sh", "#!/usr/bin/env bash\necho hi\n"),
+            ]),
+        )]);
+        provision_fleet_skills_into(&skills_dir, &registry).expect("provision");
+        let dir = skills_dir.join("coord-revive");
+        let text = std::fs::read_to_string(dir.join(SKILL_MANIFEST)).unwrap();
+        let line = crate::provenance::provenance_consistent(&text).expect("self-consistent");
+        assert_eq!(line.source, "served");
+        assert_eq!(
+            line.canonical,
+            "qontinui-claude-config:.claude/skills/coord-revive/SKILL.md"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("coord-revive.sh")).unwrap(),
+            "#!/usr/bin/env bash\necho hi\n",
+            "a helper script is written byte-for-byte"
+        );
     }
 
     /// **A tracked file outranks a served override.** The account layer decides
