@@ -167,6 +167,13 @@ pub struct Subtask {
     /// is plain nullable `text` with no CHECK, so this doc and the matching
     /// comment in `atlas/schema.hcl` are the only enumeration there is.
     pub gate_status: Option<String>,
+    /// Why the row reached `failed` (or `canceled`), in one sentence: a failed
+    /// dependency (`dependency <id> failed`), a spawn-authorization or
+    /// isolation refusal, a lost or silent worker. `None` for a row that is not
+    /// terminal-unsuccessful, and for one that failed before the column
+    /// existed. A failed run's `status_reason` names its failed rows with
+    /// these.
+    pub state_reason: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

@@ -225,32 +225,38 @@ impl PgDb {
     ///   relaunched reconciler completes it through its normal path.
     /// - [`LostWorkerDisposition::Resubmit`] → `submitted`, `task_run_id`
     ///   cleared, `restart_resets + 1`.
-    /// - [`LostWorkerDisposition::Fail`] → `failed`.
+    /// - [`LostWorkerDisposition::Fail`] → `failed`, with
+    ///   [`LostWorkerDisposition::FAIL_REASON`] as its `state_reason`.
     pub async fn apply_lost_worker(
         &self,
         run_id: Uuid,
         task_id: &str,
         disposition: LostWorkerDisposition,
     ) -> Result<bool, String> {
-        let sql = match disposition {
+        // `$3` is the row's `state_reason`: the fail reason, or NULL when the
+        // row goes back to `submitted` (it is not failed any more).
+        let (sql, reason): (&str, Option<&str>) = match disposition {
             LostWorkerDisposition::Reported => return Ok(false),
-            LostWorkerDisposition::Resubmit => {
+            LostWorkerDisposition::Resubmit => (
                 r#"
                 UPDATE orchestration.subtasks
                 SET state = 'submitted',
                     task_run_id = NULL,
                     restart_resets = restart_resets + 1,
+                    state_reason = $3,
                     updated_at = now()
                 WHERE run_id = $1 AND task_id = $2 AND state = 'working'
-                "#
-            }
-            LostWorkerDisposition::Fail => {
+                "#,
+                None,
+            ),
+            LostWorkerDisposition::Fail => (
                 r#"
                 UPDATE orchestration.subtasks
-                SET state = 'failed', updated_at = now()
+                SET state = 'failed', state_reason = $3, updated_at = now()
                 WHERE run_id = $1 AND task_id = $2 AND state = 'working'
-                "#
-            }
+                "#,
+                Some(LostWorkerDisposition::FAIL_REASON),
+            ),
         };
         let conn = self
             .pool
@@ -258,7 +264,7 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
         let n = conn
-            .execute(sql, &[&run_id, &task_id])
+            .execute(sql, &[&run_id, &task_id, &reason])
             .await
             .map_err(|e| crate::database::pg::pg_err("apply_lost_worker", &e))?;
         Ok(n > 0)
@@ -426,9 +432,9 @@ impl PgDb {
             INSERT INTO orchestration.subtasks
                 (task_id, run_id, idx, title, brief, phase, repo, depends_on,
                  expected_output, emits_subtasks, state, task_run_id, artifact,
-                 produced_by, gate_id, gate_status)
+                 produced_by, gate_id, gate_status, state_reason)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                    $15, $16)
+                    $15, $16, $17)
             ON CONFLICT (run_id, task_id) DO UPDATE SET
                 idx             = EXCLUDED.idx,
                 title           = EXCLUDED.title,
@@ -444,6 +450,7 @@ impl PgDb {
                 produced_by     = EXCLUDED.produced_by,
                 gate_id         = EXCLUDED.gate_id,
                 gate_status     = EXCLUDED.gate_status,
+                state_reason    = EXCLUDED.state_reason,
                 updated_at      = now()
             "#,
             &[
@@ -463,6 +470,7 @@ impl PgDb {
                 &subtask.produced_by,
                 &subtask.gate_id,
                 &subtask.gate_status,
+                &subtask.state_reason,
             ],
         )
         .await
@@ -486,7 +494,7 @@ impl PgDb {
                 SELECT task_id, run_id, idx, title, brief, phase, repo,
                        depends_on, expected_output, emits_subtasks, state,
                        task_run_id, artifact, produced_by, gate_id, gate_status,
-                       created_at, updated_at
+                       created_at, updated_at, state_reason
                 FROM orchestration.subtasks
                 WHERE run_id = $1
                 ORDER BY idx ASC, task_id ASC
@@ -529,6 +537,46 @@ impl PgDb {
         if n == 0 {
             return Err(format!(
                 "set_subtask_state: no subtask {} in run {}",
+                task_id, run_id
+            ));
+        }
+        Ok(())
+    }
+
+    /// Move a subtask to `failed` and record WHY in `state_reason`. Every
+    /// terminal failure the runner decides goes through here, so a failed row
+    /// always says what failed it and a failed run can name its rows' causes
+    /// (plan `2026-09-23-conductor-e2e-phase1-defects`, Phase 3). Returns `Err`
+    /// if no row matched `(run_id, task_id)`.
+    pub async fn fail_subtask(
+        &self,
+        run_id: Uuid,
+        task_id: &str,
+        reason: &str,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let n = conn
+            .execute(
+                r#"
+                UPDATE orchestration.subtasks
+                SET state = 'failed',
+                    state_reason = $3,
+                    updated_at = now()
+                WHERE run_id = $1 AND task_id = $2
+                "#,
+                &[&run_id, &task_id, &reason],
+            )
+            .await
+            .map_err(|e| crate::database::pg::pg_err("fail_subtask", &e))?;
+
+        if n == 0 {
+            return Err(format!(
+                "fail_subtask: no subtask {} in run {}",
                 task_id, run_id
             ));
         }
@@ -742,6 +790,7 @@ impl PgDb {
             gate_status: row.get(15),
             created_at: row.get::<_, DateTime<Utc>>(16),
             updated_at: row.get::<_, DateTime<Utc>>(17),
+            state_reason: row.get(18),
         })
     }
 }
@@ -782,6 +831,7 @@ mod tests {
             produced_by: None,
             gate_id: None,
             gate_status: None,
+            state_reason: None,
             // Placeholders — the DB stamps real `now()` values on insert; the
             // in-memory struct never sends these (they're not in any INSERT
             // column list).
@@ -1132,6 +1182,46 @@ mod tests {
         for id in [mine, mine_done, foreign, unowned] {
             delete_run(&pg, id).await;
         }
+    }
+
+    /// Phase 3: `fail_subtask` writes `failed` with its reason, `list_subtasks`
+    /// reads the reason back, and a lost worker failed by the boot sweep
+    /// carries its own reason.
+    #[tokio::test]
+    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
+    async fn fail_subtask_records_its_reason() {
+        let pg = PgDb::new_for_test().await;
+        let run_id = Uuid::new_v4();
+        pg.create_or_get_run(run_id, "g", None, &[], "running", Some(&test_owner()), None)
+            .await
+            .expect("create");
+        pg.upsert_subtask(&mk_subtask(run_id, "A", 0, vec![], false))
+            .await
+            .expect("upsert");
+        pg.fail_subtask(run_id, "A", "dependency Z failed")
+            .await
+            .expect("fail");
+        let a = pg.list_subtasks(run_id).await.expect("list").remove(0);
+        assert_eq!(a.state, SubtaskState::Failed);
+        assert_eq!(a.state_reason.as_deref(), Some("dependency Z failed"));
+        assert!(pg.fail_subtask(run_id, "nope", "x").await.is_err());
+
+        let mut lost = mk_subtask(run_id, "L", 1, vec![], false);
+        lost.state = SubtaskState::Working;
+        lost.task_run_id = Some(Uuid::new_v4());
+        pg.upsert_subtask(&lost).await.expect("upsert");
+        assert!(pg
+            .apply_lost_worker(run_id, "L", LostWorkerDisposition::Fail)
+            .await
+            .expect("apply"));
+        let rows = pg.list_subtasks(run_id).await.expect("list");
+        let l = rows.iter().find(|s| s.task_id == "L").expect("L");
+        assert_eq!(
+            l.state_reason.as_deref(),
+            Some(LostWorkerDisposition::FAIL_REASON)
+        );
+
+        delete_run(&pg, run_id).await;
     }
 
     /// The lost-worker settle: a completed and a submitted row are untouched

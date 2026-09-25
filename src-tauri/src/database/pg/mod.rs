@@ -1046,6 +1046,8 @@ impl PgDb {
         // boot sweep relaunches only its own `running` rows at their original
         // knobs. `subtasks.restart_resets` counts the times the sweep put a
         // lost worker's row back to `submitted` (bounded at 2).
+        // `subtasks.state_reason` is why a row reached `failed` (a failed
+        // dependency, a refusal, a lost worker); a failed run names its rows'.
         conn.batch_execute(
             "CREATE SCHEMA IF NOT EXISTS orchestration; \
              CREATE TABLE IF NOT EXISTS orchestration.runs ( \
@@ -1085,6 +1087,7 @@ impl PgDb {
              ALTER TABLE orchestration.subtasks ADD COLUMN IF NOT EXISTS gate_id TEXT; \
              ALTER TABLE orchestration.subtasks ADD COLUMN IF NOT EXISTS gate_status TEXT; \
              ALTER TABLE orchestration.subtasks ADD COLUMN IF NOT EXISTS restart_resets INTEGER NOT NULL DEFAULT 0; \
+             ALTER TABLE orchestration.subtasks ADD COLUMN IF NOT EXISTS state_reason TEXT; \
              CREATE INDEX IF NOT EXISTS idx_orchestration_subtasks_run \
                  ON orchestration.subtasks (run_id, idx); \
              CREATE INDEX IF NOT EXISTS idx_orchestration_subtasks_produced_by \
