@@ -55,11 +55,13 @@
 //!    live status strip only.
 //!
 //!    That guarantee covers IN-PROCESS exits only. A runner killed or crashed
-//!    mid-run takes the reconciler with it and leaves its row reading `running`
-//!    with no writer left, and nothing sweeps orphaned rows at boot today — so
-//!    `running` means "running, or last seen running by a process that is
-//!    gone". A boot-time reconcile of `running` rows with no live reconciler is
-//!    the follow-up that would close it.
+//!    mid-run takes the reconciler with it and leaves its row reading
+//!    `running`. The next boot of the SAME instance picks it up:
+//!    [`crate::orchestration_loop::loop_engine::resume_owned_runs`] settles the
+//!    workers that died with the old process and relaunches the reconciler.
+//!    Until then — and for good, for a row with no `owner_instance` or one
+//!    owned by an instance that never boots again — `running` means "running,
+//!    or last seen running by a process that is gone".
 //!
 //! ## Testability
 //!
@@ -72,7 +74,7 @@
 //! §5 ("factor the tick logic so readiness/guard/resume decisions are
 //! unit-testable WITHOUT live spawns") requires.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -721,8 +723,10 @@ pub struct TickPlan {
     pub to_dispatch: Vec<String>,
     /// `task_id`s to flip `Working → Completed` (the §5 guard held).
     pub to_complete: Vec<String>,
-    /// `task_id`s to flip `Working → Failed` (errored / gone-past-budget /
-    /// no-artifact-past-recovery).
+    /// `task_id`s to flip to `Failed`: a `Working` row that errored, went
+    /// gone-past-budget, silent, or had no artifact past recovery, and a
+    /// `Submitted` row whose gate failed or whose dependency failed. Each has
+    /// its sentence in [`Self::fail_reasons`]; push through `TickPlan::fail`.
     pub to_fail: Vec<String>,
     /// `(task_id, task_run_id)` of workers to re-prompt once (step-5 recovery).
     pub to_reprompt: Vec<(String, Uuid)>,
@@ -757,6 +761,16 @@ pub struct TickPlan {
     /// [`Self::to_fail`], carried separately so the log and the tests can name
     /// the reason (the other `to_fail` arms are `Errored` / `Gone` / no-report).
     pub silent_workers: Vec<String>,
+    /// `task_id`s failed because a dependency ended `Failed`/`Canceled`
+    /// (plan `2026-09-23-conductor-e2e-phase1-defects`, Phase 3, P1-3) — a
+    /// subset of [`Self::to_fail`], transitive within ONE tick. Before this a
+    /// dependent waited out the whole stall window as a `B:` row and the run
+    /// ended `stalled`, naming the symptom rather than the failure.
+    pub dependency_failed: Vec<String>,
+    /// Why each row in [`Self::to_fail`] is being failed, one sentence each.
+    /// `apply_tick` writes it to `orchestration.subtasks.state_reason`, and a
+    /// failed run's `status_reason` quotes it.
+    pub fail_reasons: BTreeMap<String, String>,
     /// `task_id`s with a LIVE worker this tick is not ending: `Working` with a
     /// bound `task_run_id`, not decided `to_complete`/`to_fail`, and not itself
     /// blocked on coord. This is the run's "something is genuinely happening"
@@ -776,6 +790,14 @@ pub struct TickPlan {
     /// The fingerprint of "stuck-relevant" state for stall detection (excludes
     /// legitimately-blocked/elaborating rows; contract §3.5).
     pub stall_fingerprint: StallFingerprint,
+}
+
+impl TickPlan {
+    /// Decide to fail `task_id`, recording why.
+    fn fail(&mut self, task_id: &str, reason: impl Into<String>) {
+        self.to_fail.push(task_id.to_string());
+        self.fail_reasons.insert(task_id.to_string(), reason.into());
+    }
 }
 
 /// What one [`apply_tick`] actually LANDED — the durable outcome, not the
@@ -1001,7 +1023,11 @@ pub fn compute_tick<S: SignalSource>(
                     }
                     Some(reprompted) => {
                         if now - reprompted >= config.report_reprompt_grace_secs {
-                            plan.to_fail.push(st.task_id.clone());
+                            plan.fail(
+                                &st.task_id,
+                                "worker went idle without a completion report, \
+                                 and the one re-prompt did not produce one",
+                            );
                             still_inflight -= 1;
                         }
                     }
@@ -1024,7 +1050,13 @@ pub fn compute_tick<S: SignalSource>(
                 let silent_for =
                     timers.observe_working_silence(trid, signals.last_activity(trid), now);
                 if silent_for >= config.working_silence_secs {
-                    plan.to_fail.push(st.task_id.clone());
+                    plan.fail(
+                        &st.task_id,
+                        format!(
+                            "worker silent for {}s (working_silence_secs) with no FSM edge",
+                            config.working_silence_secs
+                        ),
+                    );
                     plan.silent_workers.push(st.task_id.clone());
                     timers.clear_working_silence(trid);
                     still_inflight -= 1;
@@ -1032,7 +1064,7 @@ pub fn compute_tick<S: SignalSource>(
             }
             WorkerSignal::Errored => {
                 timers.clear_working_silence(trid);
-                plan.to_fail.push(st.task_id.clone());
+                plan.fail(&st.task_id, "worker session errored");
                 still_inflight -= 1;
             }
             WorkerSignal::Gone => {
@@ -1040,7 +1072,13 @@ pub fn compute_tick<S: SignalSource>(
                 timers.clear_working_silence(trid);
                 let first = *timers.first_gone_at.entry(trid).or_insert(now);
                 if now - first >= config.gone_grace_secs {
-                    plan.to_fail.push(st.task_id.clone());
+                    plan.fail(
+                        &st.task_id,
+                        format!(
+                            "worker session gone for {}s (gone_grace_secs) without a report",
+                            config.gone_grace_secs
+                        ),
+                    );
                     still_inflight -= 1;
                 }
             }
@@ -1064,7 +1102,50 @@ pub fn compute_tick<S: SignalSource>(
         plan.to_register_gate.push(st.task_id.clone());
     }
     for st in gate_failed_subtasks(subtasks, &order) {
-        plan.to_fail.push(st.task_id.clone());
+        plan.fail(
+            &st.task_id,
+            format!(
+                "coord gate {} failed; its pre-condition can never be met",
+                st.gate_id.as_deref().unwrap_or("<none>")
+            ),
+        );
+    }
+    // Phase 3 (P1-3): a dependency that ended `Failed` or `Canceled` can never
+    // become `Completed`, so its `Submitted` dependents fail NOW rather than
+    // waiting out the stall window as `B:` rows. Transitive in ONE pass: `order`
+    // is topological, so a row is visited after every dependency it names, and
+    // a row failed here seeds its own dependents. Seeded from DURABLE terminal
+    // rows only — a worker this tick decided to fail cascades next tick, once
+    // its own write has landed. A dependency naming NO row stays on the `B:`
+    // stall path: a later splice can still add it.
+    //
+    // `Canceled` counts as unsatisfiable because nothing writes it today except
+    // as "will never complete". If a revision pipeline ever cancels a row to
+    // REPLACE it (`org_chart.rs` module docs), the replacement must re-point
+    // its dependents first, or this cascade fails them.
+    let mut doomed: HashMap<&str, &'static str> = subtasks
+        .iter()
+        .filter_map(|s| match s.state {
+            SubtaskState::Failed => Some((s.task_id.as_str(), "failed")),
+            SubtaskState::Canceled => Some((s.task_id.as_str(), "canceled")),
+            _ => None,
+        })
+        .collect();
+    for &i in &order {
+        let st = &subtasks[i];
+        if st.state != SubtaskState::Submitted || plan.to_fail.contains(&st.task_id) {
+            continue;
+        }
+        let Some((dep, how)) = st
+            .depends_on
+            .iter()
+            .find_map(|d| doomed.get(d.as_str()).map(|how| (d, *how)))
+        else {
+            continue;
+        };
+        plan.fail(&st.task_id, format!("dependency {dep} {how}"));
+        plan.dependency_failed.push(st.task_id.clone());
+        doomed.insert(st.task_id.as_str(), "failed");
     }
     for st in gate_blocked_subtasks(subtasks, &order) {
         plan.to_poll_gate.push(st.task_id.clone());
@@ -1533,10 +1614,12 @@ async fn apply_tick<D: Dispatcher, G: CoordGateClient>(
 
     // Failures.
     for tid in &plan.to_fail {
-        if let Err(e) = pg
-            .set_subtask_state(run_id, tid, SubtaskState::Failed)
-            .await
-        {
+        let reason = plan
+            .fail_reasons
+            .get(tid)
+            .map(String::as_str)
+            .unwrap_or("failed by the reconciler");
+        if let Err(e) = pg.fail_subtask(run_id, tid, reason).await {
             warn!("apply_tick: fail {tid}: {e}");
             outcome.apply_failures.push(format!("fail:{tid}"));
         } else if plan.silent_workers.contains(tid) {
@@ -1548,7 +1631,7 @@ async fn apply_tick<D: Dispatcher, G: CoordGateClient>(
             );
             outcome.failed.push(tid.clone());
         } else {
-            warn!("conductor: {tid} Working → Failed (run {run_id})");
+            warn!("conductor: {tid} → Failed (run {run_id}): {reason}");
             outcome.failed.push(tid.clone());
         }
     }
@@ -1924,10 +2007,11 @@ async fn clear_coord_block(
 /// whether a run is still running.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunExit {
-    /// All subtasks terminal and nothing un-harvested.
+    /// Every subtask `Completed` and nothing un-harvested.
     Complete,
-    /// A hard error: a DAG cycle, or the DESIGN bootstrap failing before a
-    /// single subtask existed. `reason` is the error text.
+    /// A hard error (a DAG cycle, or the DESIGN bootstrap failing before a
+    /// single subtask existed), or a finished run with a row that did not
+    /// complete ([`RunExit::for_finished`]). `reason` says which.
     Failed { reason: String },
     /// The stall detector fired over an unchanged actionable fingerprint.
     /// `reason` names the pattern and any subtasks blocked on coord.
@@ -1941,6 +2025,48 @@ impl RunExit {
     pub const STATUS_FAILED: &'static str = "failed";
     /// `orchestration.runs.status` token for a stalled run.
     pub const STATUS_STALLED: &'static str = "stalled";
+
+    /// The exit for a run whose rows are all terminal. `Complete` only when
+    /// every row `Completed`; any `Failed`/`Canceled` row makes the run
+    /// `failed`, with a reason naming each such row and why it ended. Writing
+    /// `complete` over failed rows was an honesty defect in the durable row,
+    /// and the dependency cascade (P1-3) makes that shape common (plan
+    /// `2026-09-23-conductor-e2e-phase1-defects`, Phase 3).
+    ///
+    /// ROOT failures are listed first — a row that failed for its own reason,
+    /// before the rows the dependency cascade failed after it — so the cause
+    /// leads the sentence however long the cascade was.
+    pub fn for_finished(subtasks: &[Subtask]) -> Self {
+        let mut unsuccessful: Vec<(bool, String)> = subtasks
+            .iter()
+            .filter(|s| matches!(s.state, SubtaskState::Failed | SubtaskState::Canceled))
+            .map(|s| {
+                let cascaded = s
+                    .state_reason
+                    .as_deref()
+                    .is_some_and(|r| r.starts_with("dependency "));
+                let line = match s.state_reason.as_deref() {
+                    Some(r) => format!("{} {}: {r}", s.task_id, s.state.as_str()),
+                    None => format!("{} {}", s.task_id, s.state.as_str()),
+                };
+                (cascaded, line)
+            })
+            .collect();
+        // Stable: within each group the rows keep their persisted order.
+        unsuccessful.sort_by_key(|(cascaded, _)| *cascaded);
+        let unsuccessful: Vec<String> = unsuccessful.into_iter().map(|(_, l)| l).collect();
+        if unsuccessful.is_empty() {
+            return RunExit::Complete;
+        }
+        RunExit::Failed {
+            reason: format!(
+                "{} of {} subtask(s) did not complete: {}",
+                unsuccessful.len(),
+                subtasks.len(),
+                unsuccessful.join("; ")
+            ),
+        }
+    }
 
     /// A fatal tick error (today: the DAG cycle `topo_order` surfaces).
     pub fn failed(reason: impl Into<String>) -> Self {
@@ -2221,8 +2347,9 @@ pub fn tick_exit(
 /// to close.
 ///
 /// It can only close it for an exit the reconciler REACHES: a killed or crashed
-/// runner never runs this, and no boot-time sweep reconciles the row it left
-/// behind (module docs, step 7).
+/// runner never runs this. The row it left behind reads `running` until the
+/// same instance boots again and its boot sweep relaunches the run (module
+/// docs, step 7).
 ///
 /// The write is CONDITIONAL on the row still reading `running`, the same guard
 /// `stop_orchestration_run` uses and for the mirror-image reason. The two
@@ -2232,7 +2359,7 @@ pub fn tick_exit(
 /// `running` first wins, and the loser says so instead of clobbering.
 async fn finish_run(pg: &Arc<PgDb>, loop_state: &SharedLoopState, run_id: Uuid, exit: RunExit) {
     match &exit {
-        RunExit::Complete => info!("conductor: run {run_id} complete — all subtasks terminal"),
+        RunExit::Complete => info!("conductor: run {run_id} complete — every subtask completed"),
         RunExit::Failed { reason } => error!("conductor: run {run_id} failed: {reason}"),
         RunExit::Stalled { reason } => warn!("conductor: run {run_id} stalled: {reason}"),
     }
@@ -2522,7 +2649,9 @@ pub async fn run_orchestration<D: Dispatcher, S: SignalSource, G: CoordGateClien
         }
 
         if outcome.done {
-            finish_run(&pg, &loop_state, run_id, RunExit::Complete).await;
+            // `done` read the persisted rows this tick started from, so they
+            // carry every row's final state and reason.
+            finish_run(&pg, &loop_state, run_id, RunExit::for_finished(&subtasks)).await;
             return;
         }
 
@@ -2583,6 +2712,7 @@ mod tests {
             produced_by: None,
             gate_id: None,
             gate_status: None,
+            state_reason: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -3241,6 +3371,113 @@ mod tests {
         let plan = compute_tick(&rows, &signals, &mut timers, &cfg(), 0);
         assert!(plan.done, "Completed+Failed are both terminal ⇒ done");
         assert!(plan.to_dispatch.is_empty());
+    }
+
+    // --- Phase 3 (2026-09-23-conductor-e2e-phase1-defects): failed deps ------
+
+    /// A failed dependency fails its dependents in ONE tick, transitively, each
+    /// with a reason naming its own direct dependency — not after the stall
+    /// window as a `B:` row.
+    #[test]
+    fn a_failed_dependency_fails_its_dependents_transitively_in_one_tick() {
+        let rows = vec![
+            mk("A", 0, &[], SubtaskState::Failed),
+            mk("B", 1, &["A"], SubtaskState::Submitted),
+            mk("C", 2, &["B"], SubtaskState::Submitted),
+            mk("D", 3, &[], SubtaskState::Submitted),
+        ];
+        let signals = FakeSignals(Map::new());
+        let mut timers = ReadyIdleTimers::default();
+        let plan = compute_tick(&rows, &signals, &mut timers, &cfg(), 0);
+        assert_eq!(plan.to_fail, vec!["B".to_string(), "C".to_string()]);
+        assert_eq!(plan.dependency_failed, plan.to_fail);
+        assert_eq!(plan.fail_reasons["B"], "dependency A failed");
+        assert_eq!(plan.fail_reasons["C"], "dependency B failed");
+        assert_eq!(
+            plan.to_dispatch,
+            vec!["D".to_string()],
+            "independent work still dispatches"
+        );
+    }
+
+    /// A canceled dependency is named as canceled; a dependency naming NO row
+    /// stays on the `B:` stall path, since a later splice can still add it.
+    #[test]
+    fn a_canceled_dep_cascades_and_a_missing_dep_still_stalls() {
+        let rows = vec![
+            mk("A", 0, &[], SubtaskState::Canceled),
+            mk("B", 1, &["A"], SubtaskState::Submitted),
+            mk("X", 2, &["nope"], SubtaskState::Submitted),
+        ];
+        let signals = FakeSignals(Map::new());
+        let mut timers = ReadyIdleTimers::default();
+        let plan = compute_tick(&rows, &signals, &mut timers, &cfg(), 0);
+        assert_eq!(plan.to_fail, vec!["B".to_string()]);
+        assert_eq!(plan.fail_reasons["B"], "dependency A canceled");
+        assert!(plan.stall_fingerprint.evidence().contains("B:X:nope"));
+    }
+
+    /// Every worker-side fail arm carries a reason too.
+    #[test]
+    fn an_errored_worker_is_failed_with_a_reason() {
+        let trid = Uuid::new_v4();
+        let mut w = mk("A", 0, &[], SubtaskState::Working);
+        w.task_run_id = Some(trid);
+        let mut sigs = Map::new();
+        sigs.insert(trid, WorkerSignal::Errored);
+        let signals = FakeSignals(sigs);
+        let mut timers = ReadyIdleTimers::default();
+        let plan = compute_tick(&[w], &signals, &mut timers, &cfg(), 0);
+        assert_eq!(plan.to_fail, vec!["A".to_string()]);
+        assert_eq!(plan.fail_reasons["A"], "worker session errored");
+        assert!(plan.dependency_failed.is_empty());
+    }
+
+    /// A finished run exits `complete` only when every row completed; a failed
+    /// or canceled row makes it `failed`, naming each such row and its reason.
+    #[test]
+    fn a_finished_run_with_a_failed_row_exits_failed() {
+        let all_ok = vec![
+            mk("A", 0, &[], SubtaskState::Completed),
+            mk("B", 1, &["A"], SubtaskState::Completed),
+        ];
+        assert_eq!(RunExit::for_finished(&all_ok), RunExit::Complete);
+
+        let mut a = mk("A", 0, &[], SubtaskState::Failed);
+        a.state_reason = Some("worker session errored".to_string());
+        let mut b = mk("B", 1, &["A"], SubtaskState::Failed);
+        b.state_reason = Some("dependency A failed".to_string());
+        let c = mk("C", 2, &[], SubtaskState::Completed);
+        let exit = RunExit::for_finished(&[a, b, c]);
+        assert_eq!(exit.status(), RunExit::STATUS_FAILED);
+        assert_eq!(
+            exit.reason(),
+            Some(
+                "2 of 3 subtask(s) did not complete: A failed: worker session errored; \
+                 B failed: dependency A failed"
+            )
+        );
+
+        // The root failure leads, whatever order the rows are stored in.
+        let mut cascaded = mk("B", 0, &["A"], SubtaskState::Failed);
+        cascaded.state_reason = Some("dependency A failed".to_string());
+        let mut root = mk("A", 1, &[], SubtaskState::Failed);
+        root.state_reason = Some("worker session errored".to_string());
+        assert_eq!(
+            RunExit::for_finished(&[cascaded, root]).reason(),
+            Some(
+                "2 of 2 subtask(s) did not complete: A failed: worker session errored; \
+                 B failed: dependency A failed"
+            )
+        );
+
+        // A row with no recorded reason (it failed before the column existed)
+        // is still named.
+        let legacy = vec![mk("A", 0, &[], SubtaskState::Canceled)];
+        assert_eq!(
+            RunExit::for_finished(&legacy).reason(),
+            Some("1 of 1 subtask(s) did not complete: A canceled")
+        );
     }
 
     // --- stall fingerprint excludes legitimately-blocked rows (§3.5) ------

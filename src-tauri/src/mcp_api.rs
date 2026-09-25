@@ -4462,6 +4462,185 @@ fn coord_mcp_filter_tools_list_response(
     }
 }
 
+// ===========================================================================
+// Runner-local tools on the `/coord-mcp` door (plan
+// `2026-09-23-conductor-e2e-phase1-defects`, Phase 3, P1-5).
+//
+// An orchestration worker is told to report through the MCP tool
+// `orchestration_report_subtask`, but until this no MCP server it had served
+// one: the tool existed only as the HTTP route `POST
+// /orchestration/report-subtask`, so every worker fell back to hand-rolling
+// that POST. Workers already reach THIS proxy through the `.mcp.json` their
+// worktree is provisioned with, and the proxy already rewrites `tools/list`
+// and gates `tools/call` — so it serves the tool here, answered IN-PROCESS
+// through `report_subtask_inner` and never forwarded to coord.
+//
+// AUTHORITY: none added. The call is answered only after the session's nonce
+// resolves to a principal (the same bar every forwarded call clears), and it
+// does exactly what the loopback HTTP route already lets any local caller do.
+// It is not a coord tool, so it is outside `COORD_MCP_ALLOWED_TOOLS` on
+// purpose: that list names what may be FORWARDED.
+// ===========================================================================
+
+/// The one runner-local tool this door serves.
+const RUNNER_LOCAL_REPORT_TOOL: &str = "orchestration_report_subtask";
+
+/// The `tools/list` entry for [`RUNNER_LOCAL_REPORT_TOOL`]. Its input schema is
+/// generated from `CompletionReport`, so it cannot drift from what the route
+/// accepts; the report schema's `$defs` are lifted to the top level, where its
+/// `#/$defs/...` references resolve.
+fn runner_local_report_tool_descriptor() -> serde_json::Value {
+    let mut report = crate::mcp::orchestration_report::completion_report_schema();
+    let defs = report.as_object_mut().and_then(|o| {
+        o.remove("$schema");
+        o.remove("$defs")
+    });
+    let mut input = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "run_id": {
+                "type": "string",
+                "format": "uuid",
+                "description": "The run uuid named in your brief's report contract."
+            },
+            "task_id": {
+                "type": "string",
+                "description": "Your subtask's task_id, named in your brief's report contract."
+            },
+            "completion_report": report,
+        },
+        "required": ["run_id", "task_id", "completion_report"],
+    });
+    if let Some(defs) = defs {
+        input["$defs"] = defs;
+    }
+    serde_json::json!({
+        "name": RUNNER_LOCAL_REPORT_TOOL,
+        "description": "Report a finished orchestration subtask to the runner that dispatched you: \
+            its run_id, task_id and a CompletionReport. Call it once, when the subtask is done \
+            (or blocked), before printing [TASK_COMPLETE]. A malformed report is refused with \
+            the expected schema and leaves the subtask unchanged, so correct it and call again.",
+        "inputSchema": input,
+    })
+}
+
+/// When `body` is a single (non-batch) JSON-RPC `tools/call` naming
+/// [`RUNNER_LOCAL_REPORT_TOOL`], its `id` and `arguments`. A batch containing
+/// one is NOT answered locally: it falls to the body gate, which refuses it
+/// like any tool this door does not forward.
+fn coord_mcp_runner_local_call(body: &[u8]) -> Option<(serde_json::Value, serde_json::Value)> {
+    // Cheap pre-check, as for `tools/list`: this runs on every proxied request.
+    let needle = RUNNER_LOCAL_REPORT_TOOL.as_bytes();
+    if !body.windows(needle.len()).any(|w| w == needle) {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+    if parsed.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    let params = parsed.get("params")?;
+    if params.get("name").and_then(|n| n.as_str()) != Some(RUNNER_LOCAL_REPORT_TOOL) {
+        return None;
+    }
+    let id = parsed.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    Some((id, arguments))
+}
+
+/// The MCP `tools/call` result for one text payload. A tool that ran and
+/// refused (bad arguments, a schema violation, an unknown subtask) is a
+/// RESULT with `isError: true`, per MCP, not a JSON-RPC protocol error.
+fn coord_mcp_tool_result(id: serde_json::Value, text: String, is_error: bool) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "content": [{ "type": "text", "text": text }],
+            "isError": is_error,
+        },
+    })
+}
+
+/// Answer [`RUNNER_LOCAL_REPORT_TOOL`] in-process through the same
+/// implementation as `POST /orchestration/report-subtask`.
+async fn coord_mcp_answer_runner_local_report(
+    state: &Arc<ApiState>,
+    id: serde_json::Value,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    let body: crate::mcp::orchestration_report::ReportSubtaskBody =
+        match serde_json::from_value(arguments) {
+            Ok(b) => b,
+            Err(e) => {
+                let text = serde_json::json!({
+                    "error": "invalid_arguments",
+                    "detail": e.to_string(),
+                    "retryable": true,
+                    "hint": "pass run_id (uuid), task_id and completion_report",
+                })
+                .to_string();
+                return coord_mcp_tool_result(id, text, true);
+            }
+        };
+    match crate::mcp::orchestration_report::report_subtask_inner(state, body).await {
+        Ok(resp) => {
+            let text = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string());
+            coord_mcp_tool_result(id, text, false)
+        }
+        Err((status, message)) => {
+            info!(
+                %status,
+                "coord-mcp proxy: runner-local {RUNNER_LOCAL_REPORT_TOOL} refused: {message}"
+            );
+            coord_mcp_tool_result(id, message, true)
+        }
+    }
+}
+
+/// Add the runner-local tool to a `tools/list` RESPONSE, after the allowlist
+/// filter has run. Returns the response unchanged when the request is not a
+/// `tools/list`, when the body is not JSON (an SSE frame, say), or when there
+/// is no `result.tools` array to add to — this never turns an answer into an
+/// error. Each element of a batch answer that carries `result.tools` gets the
+/// tool once.
+fn coord_mcp_append_runner_local_tools(request: &[u8], response: bytes::Bytes) -> bytes::Bytes {
+    if !coord_mcp_request_is_tools_list(request) {
+        return response;
+    }
+    let mut parsed: serde_json::Value = match serde_json::from_slice(&response) {
+        Ok(v) => v,
+        Err(_) => return response,
+    };
+    let add = |v: &mut serde_json::Value| -> bool {
+        let Some(tools) = v
+            .pointer_mut("/result/tools")
+            .and_then(|t| t.as_array_mut())
+        else {
+            return false;
+        };
+        let present = tools
+            .iter()
+            .any(|t| t.get("name").and_then(|n| n.as_str()) == Some(RUNNER_LOCAL_REPORT_TOOL));
+        if !present {
+            tools.push(runner_local_report_tool_descriptor());
+        }
+        !present
+    };
+    let changed = match &mut parsed {
+        serde_json::Value::Array(elems) => elems.iter_mut().fold(false, |c, e| add(e) | c),
+        other => add(other),
+    };
+    if !changed {
+        return response;
+    }
+    serde_json::to_vec(&parsed)
+        .map(bytes::Bytes::from)
+        .unwrap_or(response)
+}
+
 /// A gate rejection: the JSON-RPC `id` to echo (Null when unparseable) plus a
 /// human-actionable message, and — for a refused `tools/call` — the tool name,
 /// so the refusal can diagnose its own cause ([`coord_mcp_refusal_data`]).
@@ -5674,6 +5853,18 @@ async fn coord_mcp_proxy_handler(
         }
     };
 
+    // The runner-local tool is answered HERE: after the nonce has resolved to
+    // a principal, before the forwarding allowlist (it is not a coord tool and
+    // is never forwarded) and before any bearer I/O, so the CALL needs no coord
+    // credential. Its DISCOVERY still does: `initialize` and `tools/list` are
+    // forwarded, and a runner whose coord credential is dark answers those
+    // with an error before the tool is appended. A worker in that state is
+    // told the HTTP route in its brief (`build_report_instruction`).
+    if let Some((id, arguments)) = coord_mcp_runner_local_call(&body) {
+        let answer = coord_mcp_answer_runner_local_report(&state, id, arguments).await;
+        return (axum::http::StatusCode::OK, Json(answer)).into_response();
+    }
+
     // Credential-hygiene Task 4: allowlist the JSON-RPC method + tool BEFORE
     // any token I/O — a nonce authenticates a *session*, not an operator, so a
     // request outside the enumerated coordination surface is never forwarded
@@ -6580,16 +6771,14 @@ async fn coord_mcp_proxy_handler(
     // [`coord_mcp_filter_tools_list_response`]. Only the `Filtered` outcome
     // rewrites anything; the other three forward the upstream bytes untouched,
     // and they are kept distinct because one of them is a failure to check.
-    let out_body = match coord_mcp_filter_tools_list_response(&body, &bytes) {
-        CoordMcpToolsListFilter::NotApplicable | CoordMcpToolsListFilter::NoToolsArray => {
-            axum::body::Body::from(bytes)
-        }
+    let out_bytes: bytes::Bytes = match coord_mcp_filter_tools_list_response(&body, &bytes) {
+        CoordMcpToolsListFilter::NotApplicable | CoordMcpToolsListFilter::NoToolsArray => bytes,
         CoordMcpToolsListFilter::Unchanged => {
             // A `tools/list` that withheld nothing is an OBSERVED-CLEAN
             // answer, and recording it is what lets `/health`'s
             // `coordMcpDrift` distinguish "clean" from "never looked".
             record_observed_coord_mcp_drift(&[]);
-            axum::body::Body::from(bytes)
+            bytes
         }
         CoordMcpToolsListFilter::Filtered {
             body: filtered,
@@ -6653,7 +6842,7 @@ async fn coord_mcp_proxy_handler(
                     set,
                 ));
             }
-            axum::body::Body::from(filtered)
+            bytes::Bytes::from(filtered)
         }
         CoordMcpToolsListFilter::Uninspectable { reason, leaked } => {
             // The upstream bytes still go out — this filter never turns a
@@ -6665,9 +6854,12 @@ async fn coord_mcp_proxy_handler(
                 "coord-mcp proxy: could not filter a tools/list response — it is forwarded \
                  unfiltered and may advertise tools this door will refuse"
             );
-            axum::body::Body::from(bytes)
+            bytes
         }
     };
+    // ...then add the runner-local tools this door answers itself, so the list
+    // advertises exactly what it will serve (see `RUNNER_LOCAL_REPORT_TOOL`).
+    let out_body = axum::body::Body::from(coord_mcp_append_runner_local_tools(&body, out_bytes));
 
     let mut builder = axum::http::Response::builder().status(status_code);
     for (name, value) in upstream_headers.iter() {
@@ -14333,9 +14525,11 @@ mod memory_search_enrichment_tests {
 #[cfg(test)]
 mod coord_mcp_body_gate_tests {
     use super::{
-        coord_mcp_body_gate, coord_mcp_filter_tools_list_response, coord_mcp_tool_is_allowed,
-        coord_mcp_withholding_is_deliberate, CoordMcpToolsListFilter, COORD_MCP_ALLOWED_METHODS,
-        COORD_MCP_ALLOWED_TOOLS, COORD_MCP_DELIBERATE_EXCLUSIONS,
+        coord_mcp_append_runner_local_tools, coord_mcp_body_gate,
+        coord_mcp_filter_tools_list_response, coord_mcp_runner_local_call,
+        coord_mcp_tool_is_allowed, coord_mcp_withholding_is_deliberate, CoordMcpToolsListFilter,
+        COORD_MCP_ALLOWED_METHODS, COORD_MCP_ALLOWED_TOOLS, COORD_MCP_DELIBERATE_EXCLUSIONS,
+        RUNNER_LOCAL_REPORT_TOOL,
     };
 
     fn gate(v: serde_json::Value) -> Result<(), (serde_json::Value, String)> {
@@ -14485,6 +14679,75 @@ mod coord_mcp_body_gate_tests {
     }
 
     const TOOLS_LIST_REQ: &str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+
+    // --- runner-local `orchestration_report_subtask` (conductor Phase 3) ----
+
+    /// A `tools/list` answer gains the runner-local report tool exactly once,
+    /// with an input schema whose `$defs` references resolve at its top level;
+    /// anything that is not a `tools/list` answer passes through untouched.
+    #[test]
+    fn tools_list_advertises_the_runner_local_report_tool_once() {
+        let upstream = bytes::Bytes::from(tools_list_response(&["coord_inbox"]));
+        let out = coord_mcp_append_runner_local_tools(TOOLS_LIST_REQ.as_bytes(), upstream);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let tools = v["result"]["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["coord_inbox", RUNNER_LOCAL_REPORT_TOOL]);
+
+        let schema = &tools[1]["inputSchema"];
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["run_id", "task_id", "completion_report"])
+        );
+        let text = schema.to_string();
+        assert!(text.contains("followUps") && text.contains("blockingForDependents"));
+        for r in text.split("\"#/$defs/").skip(1) {
+            let name = r.split('"').next().unwrap_or_default();
+            assert!(
+                schema["$defs"].get(name).is_some(),
+                "reference to {name} must resolve at the input schema's top level"
+            );
+        }
+
+        // Idempotent: a list that already carries it is not given a second.
+        let again = coord_mcp_append_runner_local_tools(TOOLS_LIST_REQ.as_bytes(), out.clone());
+        assert_eq!(again, out);
+
+        // Not a tools/list request, or not JSON: untouched.
+        let call =
+            br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"coord_inbox"}}"#;
+        let resp = bytes::Bytes::from(tools_list_response(&["coord_inbox"]));
+        assert_eq!(
+            coord_mcp_append_runner_local_tools(call, resp.clone()),
+            resp
+        );
+        let sse = bytes::Bytes::from_static(b"event: message\ndata: {}\n\n");
+        assert_eq!(
+            coord_mcp_append_runner_local_tools(TOOLS_LIST_REQ.as_bytes(), sse.clone()),
+            sse
+        );
+    }
+
+    /// Only a single `tools/call` naming the runner-local tool is answered
+    /// in-process; every other request goes on to the gate and upstream.
+    #[test]
+    fn only_a_single_call_of_the_local_tool_is_answered_in_process() {
+        let call = br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"orchestration_report_subtask","arguments":{"task_id":"T1"}}}"#;
+        let (id, args) = coord_mcp_runner_local_call(call).expect("answered locally");
+        assert_eq!(id, serde_json::json!(7));
+        assert_eq!(args, serde_json::json!({"task_id": "T1"}));
+
+        let other = br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"coord_inbox","arguments":{"note":"orchestration_report_subtask"}}}"#;
+        assert!(coord_mcp_runner_local_call(other).is_none());
+        let batch = br#"[{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"orchestration_report_subtask"}}]"#;
+        assert!(
+            coord_mcp_runner_local_call(batch).is_none(),
+            "a batch falls to the gate"
+        );
+        assert!(coord_mcp_runner_local_call(TOOLS_LIST_REQ.as_bytes()).is_none());
+        // The forwarding allowlist is untouched: the tool is served, never forwarded.
+        assert!(!coord_mcp_tool_is_allowed(RUNNER_LOCAL_REPORT_TOOL));
+    }
 
     /// Names surviving the filter, plus the names it reported removing.
     /// `None` for any outcome that did not rewrite the body.

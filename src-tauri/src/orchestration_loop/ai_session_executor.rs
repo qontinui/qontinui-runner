@@ -144,18 +144,24 @@ pub fn build_report_instruction(run_id: Uuid, task_id: &str, report_url: &str) -
          [ORCHESTRATION REPORT CONTRACT — REQUIRED]\n\
          You are a worker subtask in an orchestrated run. When you have FINISHED \
          this subtask you MUST report a structured result before stopping:\n\n\
-         1. Call the runner MCP tool `orchestration_report_subtask` with EXACTLY:\n\
+         1. Call the runner MCP tool `orchestration_report_subtask` (served on \
+            the `coord-mcp` server, so it may be listed as \
+            `mcp__coord-mcp__orchestration_report_subtask`) with EXACTLY this \
+            shape. Every array element carries the fields shown; any array may \
+            be empty, and `blockingForDependents` defaults to false:\n\
             {{\n\
               \"run_id\": \"{run_id}\",\n\
               \"task_id\": \"{task_id}\",\n\
               \"completion_report\": {{\n\
                 \"summaryMd\": \"<markdown summary of what you did>\",\n\
                 \"deliverables\": [{{\"kind\": \"pr|commit|file|endpoint|schema-change|spec|other\", \"reference\": \"<ref>\", \"description\": \"<one line>\"}}],\n\
-                \"breakingChanges\": [],\n\
-                \"followUps\": []\n\
+                \"breakingChanges\": [{{\"area\": \"<subsystem>\", \"description\": \"<what broke and what dependents must do>\", \"migrationStepsMd\": \"<markdown steps, or empty>\"}}],\n\
+                \"followUps\": [{{\"description\": \"<the loose end>\", \"priority\": \"critical|important|nice-to-have\", \"blockingForDependents\": false}}]\n\
               }}\n\
             }}\n\
-            (If you have no runner MCP client, POST the same JSON to `{report_url}`.)\n\
+            (If you have no MCP client for it, POST the same JSON to `{report_url}`.) \
+            A malformed report is refused with the expected schema and your \
+            subtask is NOT failed: correct the report and call again.\n\
          2. Only AFTER the tool returns success, you MAY print `[TASK_COMPLETE]` \
             on its own line. The sentinel alone is NOT sufficient — the report \
             is what marks you done.\n\
@@ -174,7 +180,9 @@ fn report_endpoint_url(app_handle: &tauri::AppHandle) -> String {
         .map(|s| s.api_port.load(std::sync::atomic::Ordering::Relaxed))
         .filter(|p| *p != 0)
         .unwrap_or(crate::mcp::types::MCP_API_PORT);
-    format!("http://localhost:{port}/orchestration/report-subtask")
+    // The runner binds the IPv4 loopback only, and `localhost` resolves to
+    // `::1` first on Windows — a doomed connect before the one that answers.
+    format!("http://127.0.0.1:{port}/orchestration/report-subtask")
 }
 
 /// How long [`dispatch_subtask`] reuses a subtask's last isolation refusal
@@ -460,10 +468,7 @@ pub async fn dispatch_subtask(
                 );
             }
             warn!("dispatch_subtask: {} refused: {refusal}", subtask.task_id);
-            if let Err(e) = pg
-                .set_subtask_state(run_id, &subtask.task_id, SubtaskState::Failed)
-                .await
-            {
+            if let Err(e) = pg.fail_subtask(run_id, &subtask.task_id, &refusal).await {
                 warn!(
                     "dispatch_subtask: could not mark {} Failed after an authorization \
                      refusal: {e}",
@@ -546,7 +551,7 @@ pub async fn dispatch_subtask(
                         // above: mark the row Failed FIRST so the conductor stops
                         // re-deciding it every tick.
                         if let Err(pe) = pg
-                            .set_subtask_state(run_id, &subtask.task_id, SubtaskState::Failed)
+                            .fail_subtask(run_id, &subtask.task_id, &refusal.error.to_string())
                             .await
                         {
                             warn!(
@@ -872,6 +877,7 @@ mod tests {
             produced_by: None,
             gate_id: None,
             gate_status: None,
+            state_reason: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -1091,9 +1097,24 @@ mod tests {
         let block = build_report_instruction(
             run,
             "T42",
-            "http://localhost:9876/orchestration/report-subtask",
+            "http://127.0.0.1:9876/orchestration/report-subtask",
         );
         assert!(block.contains(&run.to_string()), "run_id must be inlined");
+        // Phase 3 (P1-4): the element shapes are spelled out, so a worker
+        // cannot guess a `followUps` entry wrong and be refused for it.
+        for field in [
+            "\"priority\"",
+            "\"blockingForDependents\"",
+            "critical|important|nice-to-have",
+            "\"area\"",
+            "\"migrationStepsMd\"",
+        ] {
+            assert!(block.contains(field), "instruction must name {field}");
+        }
+        assert!(
+            block.contains("http://127.0.0.1:9876/"),
+            "the fallback URL is the IPv4 loopback"
+        );
         assert!(
             block.contains("\"task_id\": \"T42\""),
             "task_id must be inlined"
