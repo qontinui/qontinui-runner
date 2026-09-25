@@ -413,6 +413,11 @@ fn clamp_u64(value: u64, min: u64, max: u64) -> u64 {
 /// that overflows a `Duration`, and `..._WINDOW_MIN=1e300` parses as a perfectly
 /// finite `f64` — so without the `min` this would have killed the Tauri `setup`
 /// thread rather than misconfiguring a window.
+// `min`/`max` rather than `clamp`, deliberately: `f64::clamp` PANICS on NaN
+// bounds and RETURNS NaN for a NaN input, which `Duration::from_secs_f64` then
+// panics on — the exact failure this function exists to prevent. `min` and `max`
+// return the non-NaN operand, so a NaN here becomes a bounded number.
+#[allow(clippy::manual_clamp)]
 fn mins_to_duration(minutes: f64) -> Duration {
     Duration::from_secs_f64(minutes.min(MAX_WINDOW_MINS).max(0.0) * 60.0)
 }
@@ -2499,7 +2504,7 @@ mod tests {
         assert_eq!(utf16_copy_len(65_535), 65_534);
         for len in 0u16..=4_096 {
             let n = utf16_copy_len(len);
-            assert!(n % 2 == 0, "{len} → {n} is odd");
+            assert!(n.is_multiple_of(2), "{len} → {n} is odd");
             assert!(n <= len as usize, "{len} → {n} grew");
             assert_eq!(
                 vec![0u16; n / 2].len() * 2,
