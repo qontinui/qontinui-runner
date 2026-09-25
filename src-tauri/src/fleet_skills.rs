@@ -477,6 +477,7 @@ fn write_provisioned_file(
                 &crate::provenance::skill_canonical(skill_name),
                 text,
                 source.as_str(),
+                None,
             ),
         )?;
     } else {

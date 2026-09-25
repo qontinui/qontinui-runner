@@ -479,6 +479,12 @@ impl Rung {
     /// - `Served` → [`Rung::Served`] (fetched over the network this run).
     /// - `DiskCache` → [`Rung::DiskCache`] (this device's own cache file).
     ///
+    /// - `Canonical` → [`Rung::Served`], WITH a caveat. It is a per-body rung
+    ///   (the runner's git mirror of `qontinui-claude-config`, fetched at run
+    ///   time) and never a registry arm, so a resolution-arm row never carries
+    ///   it; the caveat says so rather than letting it pass for the account's
+    ///   served arm.
+    ///
     /// Exhaustive with no `_` arm, deliberately: a variant added upstream must
     /// break this build rather than silently default.
     #[must_use]
@@ -487,6 +493,13 @@ impl Rung {
             CommandSource::Builtin => (Rung::Embedded, None),
             CommandSource::Served => (Rung::Served, None),
             CommandSource::DiskCache => (Rung::DiskCache, None),
+            CommandSource::Canonical => (
+                Rung::Served,
+                Some(
+                    "canonical: a per-body rung (the runner's git mirror of \
+                     qontinui-claude-config origin/main), not an account-layer arm",
+                ),
+            ),
         }
     }
 
@@ -2217,6 +2230,7 @@ mod tests {
                 CommandSource::Builtin => assert_eq!(rung, Rung::Embedded),
                 CommandSource::Served => assert_eq!(rung, Rung::Served),
                 CommandSource::DiskCache => assert_eq!(rung, Rung::DiskCache),
+                CommandSource::Canonical => unreachable!("not a registry arm"),
             }
             assert!(
                 note.is_none(),
@@ -2233,6 +2247,15 @@ mod tests {
             all.len(),
             "two arms sharing a rung is the collapse Phase 3 removed"
         );
+    }
+
+    /// The canonical per-body rung is not an account-layer arm, and its
+    /// mapping says so rather than passing for `served`.
+    #[test]
+    fn the_canonical_command_source_carries_its_caveat() {
+        let (rung, note) = Rung::from_command_source(CommandSource::Canonical);
+        assert_eq!(rung, Rung::Served);
+        assert!(note.is_some_and(|n| n.contains("per-body")), "{note:?}");
     }
 
     /// The observation builder states the upstream variant in `detail`, so the

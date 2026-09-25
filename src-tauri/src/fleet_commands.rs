@@ -534,6 +534,7 @@ fn classify_existing(dst: &Path) -> Option<Existing> {
                     canonical: String::new(),
                     blob: String::new(),
                     runner_build: String::new(),
+                    canonical_sha: None,
                 });
             Some(Existing::Edited(Box::new(EditedFile {
                 source: line.source,
@@ -707,6 +708,7 @@ pub(crate) fn provision_fleet_commands_into(
                 &command_canonical(&command.name),
                 &command.body,
                 command.source.as_str(),
+                command.canonical.as_ref().map(|c| c.short()),
             ),
         )?;
         out.record_written();
@@ -714,8 +716,9 @@ pub(crate) fn provision_fleet_commands_into(
     // Built after the loop rather than at construction so it can carry the
     // read-back count; a pass that clobbered nobody's edits reads as before.
     let mut detail = format!(
-        "{} embedded default(s), {} account override(s)",
+        "{} embedded default(s), {} canonical body(ies), {} account override(s)",
         registry.builtin_count(),
+        registry.canonical_count(),
         registry.override_count()
     );
     if edited > 0 {
@@ -1155,7 +1158,7 @@ mod tests {
                 CommandSource::Served,
                 CommandSource::DiskCache,
             ] {
-                let written = with_provenance(&command_canonical("x"), body, source.as_str());
+                let written = with_provenance(&command_canonical("x"), body, source.as_str(), None);
                 assert!(
                     written.starts_with("---"),
                     "frontmatter must start at line 1"
@@ -1168,7 +1171,12 @@ mod tests {
             }
         }
         // CRLF frontmatter keeps its own line endings on the inserted line.
-        let crlf = with_provenance(&command_canonical("x"), "---\r\na: 1\r\n---\r\n", "builtin");
+        let crlf = with_provenance(
+            &command_canonical("x"),
+            "---\r\na: 1\r\n---\r\n",
+            "builtin",
+            None,
+        );
         assert!(crlf
             .split_once("\r\n")
             .unwrap()
@@ -1210,6 +1218,39 @@ mod tests {
             provenance_consistent("# no provenance\n"),
             Err(ProvenanceError::Missing)
         );
+    }
+
+    /// A canonical body is written with `source=canonical` and the 12-hex
+    /// `canonical_sha` of the `qontinui-claude-config` commit it was read at,
+    /// and the file stays self-consistent.
+    #[test]
+    fn a_canonical_body_is_stamped_with_its_snapshot() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let (name, _) = FLEET_COMMANDS[0];
+        let path = format!(".claude/commands/{name}.md");
+        let url = crate::canonical_corpus::test_support::remote_with(
+            tmp.path(),
+            &[(&path, "# canonical body\n")],
+        );
+        let mirror = crate::canonical_corpus::test_support::mirror(tmp.path(), &url);
+        let snapshot = mirror.refresh().expect("refresh");
+        let canonical = mirror.load_commands(&snapshot, &[name]);
+        let (registry, _) = crate::agent_commands::resolve_with(
+            crate::agent_commands::FetchOutcome::NoAccount,
+            None,
+            Some(&canonical),
+        );
+        let on_disk = provision_one(&registry, name);
+        let line = provenance_consistent(&on_disk).expect("self-consistent");
+        assert_eq!(line.source, "canonical");
+        assert_eq!(line.canonical_sha.as_deref(), Some(snapshot.short()));
+        assert_eq!(line.canonical, command_canonical(name));
+        assert_eq!(strip_provenance(&on_disk).unwrap().1, "# canonical body\n");
+        // A command the canonical rung did not supply carries no canonical_sha.
+        let (other, _) = FLEET_COMMANDS[1];
+        let other_line = provenance_consistent(&provision_one(&registry, other)).unwrap();
+        assert_eq!(other_line.source, "builtin");
+        assert_eq!(other_line.canonical_sha, None);
     }
 
     /// `source=` names the layer that actually supplied the body.

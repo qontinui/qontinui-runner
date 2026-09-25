@@ -6,8 +6,14 @@
 //! line 2 of their YAML frontmatter:
 //!
 //! ```text
-//! qontinui-provenance: source=<builtin|served|disk_cache> canonical=qontinui-claude-config:<path> blob=<sha1> runner_build=<RUNNER_BUILD_ID>
+//! qontinui-provenance: source=<builtin|served|disk_cache|canonical> canonical=qontinui-claude-config:<path> blob=<sha1> runner_build=<RUNNER_BUILD_ID> [canonical_sha=<sha12>]
 //! ```
+//!
+//! `canonical_sha` is present exactly when `source=canonical`: the body was read
+//! out of the runner's mirror of `qontinui-claude-config` (`crate::canonical_corpus`)
+//! at that `origin/main` commit, so `git -C qontinui-claude-config show
+//! <canonical_sha>:<path> | git hash-object --stdin` equals `blob`. Every other
+//! source omits it, so a pre-canonical file and a builtin one read identically.
 //!
 //! `canonical` names the file in `qontinui-claude-config` the body is a copy
 //! of — `.claude/commands/<name>.md` for a command ([`command_canonical`]),
@@ -61,7 +67,8 @@ pub(crate) fn skill_canonical(name: &str) -> String {
 /// The parsed fields of one `qontinui-provenance:` line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProvenanceLine {
-    /// Which rung supplied the body: `builtin` / `served` / `disk_cache`.
+    /// Which rung supplied the body: `builtin` / `served` / `disk_cache` /
+    /// `canonical`.
     pub source: String,
     /// `qontinui-claude-config:<path>` — see [`command_canonical`] and
     /// [`skill_canonical`].
@@ -70,13 +77,18 @@ pub(crate) struct ProvenanceLine {
     pub blob: String,
     /// The `RUNNER_BUILD_ID` of the binary that wrote the file.
     pub runner_build: String,
+    /// The first 12 hex digits of the `qontinui-claude-config` commit a
+    /// `source=canonical` body was read at. Optional: absent for every other
+    /// source.
+    pub canonical_sha: Option<String>,
 }
 
 impl ProvenanceLine {
-    /// Parse the text after [`PROVENANCE_KEY`]. `None` unless all four fields
-    /// are present.
+    /// Parse the text after [`PROVENANCE_KEY`]. `None` unless all four
+    /// required fields are present; `canonical_sha` is optional.
     fn parse(value: &str) -> Option<Self> {
-        let (mut source, mut canonical, mut blob, mut runner_build) = (None, None, None, None);
+        let (mut source, mut canonical, mut blob, mut runner_build, mut canonical_sha) =
+            (None, None, None, None, None);
         for token in value.split_whitespace() {
             let (k, v) = token.split_once('=')?;
             let slot = match k {
@@ -84,6 +96,7 @@ impl ProvenanceLine {
                 "canonical" => &mut canonical,
                 "blob" => &mut blob,
                 "runner_build" => &mut runner_build,
+                "canonical_sha" => &mut canonical_sha,
                 _ => continue,
             };
             *slot = Some(v.to_string());
@@ -93,6 +106,7 @@ impl ProvenanceLine {
             canonical: canonical?,
             blob: blob?,
             runner_build: runner_build?,
+            canonical_sha,
         })
     }
 }
@@ -135,7 +149,8 @@ fn split_first_line(text: &str) -> (&str, &str) {
 /// `body` with ONE generated `qontinui-provenance:` key placed at line 2, in
 /// YAML frontmatter. `canonical` is the full `qontinui-claude-config:<path>`
 /// value ([`command_canonical`] / [`skill_canonical`]); `source` is the rung's
-/// wire string.
+/// wire string; `canonical_sha` is the 12-hex `qontinui-claude-config` commit a
+/// `source=canonical` body was read at, and `None` for every other source.
 ///
 /// Placement, because YAML frontmatter is recognised only when it starts at
 /// line 1 (the convention Claude Code's command and skill loaders follow) —
@@ -152,12 +167,21 @@ fn split_first_line(text: &str) -> (&str, &str) {
 /// `blob` is computed over `body` BEFORE the key is added, so it equals
 /// `git hash-object` of the vendored file for an unmodified builtin (and of the
 /// canonical file only while the two are in byte parity).
-pub(crate) fn with_provenance(canonical: &str, body: &str, source: &str) -> String {
-    let key = format!(
+pub(crate) fn with_provenance(
+    canonical: &str,
+    body: &str,
+    source: &str,
+    canonical_sha: Option<&str>,
+) -> String {
+    let mut key = format!(
         "{PROVENANCE_KEY} source={source} canonical={canonical} blob={} \
          runner_build={RUNNER_BUILD}",
         git_blob_id(body.as_bytes()),
     );
+    if let Some(sha) = canonical_sha {
+        key.push_str(" canonical_sha=");
+        key.push_str(sha);
+    }
     let (first, rest) = split_first_line(body);
     let opens_block = first == "---\n" || first == "---\r\n";
     let (second, _) = split_first_line(rest);
@@ -244,7 +268,7 @@ mod tests {
         for canonical in [command_canonical("x"), skill_canonical("x")] {
             for body in shapes {
                 for source in ["builtin", "served", "disk_cache"] {
-                    let written = with_provenance(&canonical, body, source);
+                    let written = with_provenance(&canonical, body, source, None);
                     assert!(
                         written.starts_with("---"),
                         "frontmatter must start at line 1"
@@ -260,7 +284,12 @@ mod tests {
             }
         }
         // CRLF frontmatter keeps its own line endings on the inserted line.
-        let crlf = with_provenance(&command_canonical("x"), "---\r\na: 1\r\n---\r\n", "builtin");
+        let crlf = with_provenance(
+            &command_canonical("x"),
+            "---\r\na: 1\r\n---\r\n",
+            "builtin",
+            None,
+        );
         assert!(crlf
             .split_once("\r\n")
             .unwrap()
@@ -270,6 +299,32 @@ mod tests {
         // A file with no provenance line is not mistaken for one.
         assert_eq!(strip_provenance("---\ndescription: x\n---\n"), None);
         assert_eq!(strip_provenance("# plain\n"), None);
+    }
+
+    /// `canonical_sha` is the ONE optional field: rendered last, parsed when
+    /// present, and absent from every non-canonical line.
+    #[test]
+    fn canonical_sha_is_rendered_and_parsed_only_for_canonical_bodies() {
+        let body = "---\nname: x\n---\n# x\n";
+        let written = with_provenance(
+            &command_canonical("x"),
+            body,
+            "canonical",
+            Some("0123456789ab"),
+        );
+        let key_line = written.lines().nth(1).unwrap();
+        assert!(
+            key_line.ends_with(" canonical_sha=0123456789ab"),
+            "{key_line}"
+        );
+        let line = provenance_consistent(&written).expect("consistent");
+        assert_eq!(line.source, "canonical");
+        assert_eq!(line.canonical_sha.as_deref(), Some("0123456789ab"));
+        assert_eq!(strip_provenance(&written).unwrap().1, body);
+
+        let builtin = with_provenance(&command_canonical("x"), body, "builtin", None);
+        assert!(!builtin.contains("canonical_sha"));
+        assert_eq!(provenance_consistent(&builtin).unwrap().canonical_sha, None);
     }
 
     #[test]
@@ -286,7 +341,12 @@ mod tests {
 
     #[test]
     fn a_tampered_body_is_a_blob_mismatch() {
-        let written = with_provenance(&skill_canonical("s"), "---\nname: s\n---\n# s\n", "builtin");
+        let written = with_provenance(
+            &skill_canonical("s"),
+            "---\nname: s\n---\n# s\n",
+            "builtin",
+            None,
+        );
         assert!(provenance_consistent(&written).is_ok());
         let tampered = written.replace("# s", "# t");
         assert!(matches!(
