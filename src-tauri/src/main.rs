@@ -113,6 +113,8 @@ mod dom_capture;
 mod drain;
 #[cfg(test)]
 mod runner_spawn_sites;
+#[cfg(test)]
+mod session_asset_sites;
 // `embedded_pg` lives in the LIB crate as of P4 (lib-side consumers need it).
 // Re-bound here as `pub(crate)` so every existing `crate::embedded_pg::...`
 // path in this binary - including mcp_api.rs's /health reporting - keeps
