@@ -101,7 +101,9 @@ OPTIONS (create):
   --draft               Open as a draft PR
 
 OPTIONS (plan-library-backfill):
-  --dry-run             Scan and report only — no network call whatsoever
+  --dry-run             Scan and report only — no backend is contacted
+                        (a scan root in a repo still fetches its default
+                        branch, which is where the scan reads from)
   --plans-dir <path>    Active plans dir      (default: $QONTINUI_PLANS_DIR)
   --archive-dir <path>  Plans archive dir     (default: $QONTINUI_PLANS_ARCHIVE_DIR)
   --prompts-dir <path>  Prompts dir           (default: $QONTINUI_PROMPTS_DIR)
@@ -111,7 +113,9 @@ OPTIONS (plan-library-backfill):
   --limit <n>           Push at most N artifacts (ordering is the scan order)
 
 OPTIONS (plan-workunit-backfill):
-  --dry-run             Scan and report only — no network call whatsoever
+  --dry-run             Scan and report only — no backend is contacted
+                        (a scan root in a repo still fetches its default
+                        branch, which is where the scan reads from)
   --plans-dir <path>    Active plans dir (default: $QONTINUI_PLANS_DIR).
                         The runner's `paths.plans_dir` setting is NEVER read.
                         The run prints which source won.
@@ -154,7 +158,8 @@ personal `gh auth login` required. On success prints the PR URL to stdout.
 `plan-library-backfill` walks the three scan roots, classifies each markdown
 file to an artifact kind, and upserts it into the qontinui-web plan & prompt
 library with the runner's own device JWT. `--dry-run` prints the per-kind counts
-and the duplicated/divergent stem list without contacting anything. Exit 1 means
+and the duplicated/divergent stem list without contacting the backend (a root in
+a repo still fetches its default branch, as the reconcile loop does). Exit 1 means
 an artifact push (or the runtime) failed; edge errors are reported but do not
 fail the run. Exit 3 means the run finished but a scan root was unread or read
 only in part, so its counts are floors and the catch-up is incomplete
@@ -166,8 +171,14 @@ runner's `paths.plans_dir` gate — that gate is exactly what it routes around, 
 a machine whose reconcile loop never armed can be caught up WITHOUT a runner
 restart. Idempotent: each unit's push is seeded from coord's current status, so
 an unchanged corpus emits no status write, and a changed one still goes through
-the agent-owner deferral. `--dry-run` contacts nothing, so it shows the FILE
-side only — it cannot tell you which units would transition.
+the agent-owner deferral. `--dry-run` contacts no coord, so it shows the FILE
+side only — it cannot tell you which units would transition. It reads the plans
+where the reconcile loop reads them — the default branch's ref when the dir is
+in a repo, the working tree only when it is not — and pushes NOTHING when that
+ref cannot be fetched or read, dry run included. Exit codes match
+`plan-library-backfill`: 1 a push failed, 2 a usage/config refusal, 3 the plans
+were not all read (the ref was unreadable, so nothing was pushed; or a plan in
+it was, so the push covered a subset) and the catch-up is incomplete.
 
 `session-archive-backfill` walks every discovered Claude Code account home and
 upserts a head row plus the BYTE-VERBATIM transcript into qontinui-web's session
@@ -570,23 +581,11 @@ fn plan_library_backfill(args: &[String]) -> ExitCode {
     // A run that left a root unread or partly read did its work, but on a
     // subset of the corpus. Exit 0 would tell a script the catch-up was whole,
     // which is the UNKNOWN-renders-as-a-default shape the report text avoids.
-    let note_incomplete = || {
-        eprintln!(
-            "qontinui-pr: not every scan root was read whole — the counts above are floors \
-             and the catch-up is incomplete."
-        );
-    };
-    let incomplete_exit = || {
-        note_incomplete();
-        ExitCode::from(BACKFILL_INCOMPLETE_EXIT)
-    };
+    let complete = report.is_complete();
 
     if parsed.dry_run {
         println!("dry run: nothing was pushed.");
-        if !report.is_complete() {
-            return incomplete_exit();
-        }
-        return ExitCode::SUCCESS;
+        return backfill_exit(false, complete);
     }
 
     // Flag-first: an explicit `--backend` OUTRANKS the ambient environment.
@@ -650,25 +649,41 @@ fn plan_library_backfill(args: &[String]) -> ExitCode {
             summary.ambiguous_kind
         );
     }
-    if summary.errors > 0 {
-        // A push error outranks an incomplete read, but the operator still
-        // needs to know the run covered only a subset.
-        if !report.is_complete() {
-            note_incomplete();
-        }
-        return ExitCode::from(1);
-    }
-    if !report.is_complete() {
-        return incomplete_exit();
-    }
-    ExitCode::SUCCESS
+    backfill_exit(summary.errors > 0, complete)
 }
 
-/// `plan-library-backfill`'s exit code when the run succeeded but at least one
-/// scan root was unread or read only in part. Distinct from `1` (a push error)
-/// and `2` (a usage/config refusal), so a script can tell "failed" from
-/// "succeeded over a subset".
+/// The two backfills' exit code when the corpus was not read whole — a scan
+/// root unread or read only in part, so the run covered a subset of it (for
+/// `plan-workunit-backfill` with a single unreadable ref, an EMPTY subset:
+/// nothing was pushed). Distinct from `1` (a push error) and `2` (a
+/// usage/config refusal), so a script can tell "failed" from "incomplete".
 const BACKFILL_INCOMPLETE_EXIT: u8 = 3;
+
+/// The exit code a backfill run ends with, from whether a push failed and
+/// whether the corpus was read whole. A push error outranks an incomplete read:
+/// `1` is the stronger claim. Pure, so the precedence is testable.
+fn backfill_exit_code(push_failed: bool, complete: bool) -> u8 {
+    match (push_failed, complete) {
+        (true, _) => 1,
+        (false, false) => BACKFILL_INCOMPLETE_EXIT,
+        (false, true) => 0,
+    }
+}
+
+/// [`backfill_exit_code`] as an [`ExitCode`], saying on stderr when the read
+/// was incomplete — also on the push-error path, where the code alone would
+/// hide that the run covered only a subset.
+fn backfill_exit(push_failed: bool, complete: bool) -> ExitCode {
+    // Exit 0 would tell a script the catch-up was whole, which is the
+    // UNKNOWN-renders-as-a-default shape the report text avoids.
+    if !complete {
+        eprintln!(
+            "qontinui-pr: the corpus was not read whole — the counts above are floors and the \
+             catch-up is incomplete."
+        );
+    }
+    ExitCode::from(backfill_exit_code(push_failed, complete))
+}
 
 // ===========================================================================
 // `qontinui-pr plan-workunit-backfill` — the WORK-UNIT half of the backfill
@@ -855,21 +870,63 @@ fn plan_workunit_backfill(args: &[String]) -> ExitCode {
         .try_init();
 
     let conv = pwa::PlanConvention::operator_default();
-    let all = pwa::read_plan_dir(Path::new(&plans_dir), &conv);
+    // Through the RESOLVED source — the default branch's ref where the plans
+    // dir is in a repo, the tree only where it is not — exactly as the
+    // reconcile loop reads it. A tree walk here pushed a PARKED checkout's
+    // statuses into the same `coord.work_units` rows the loop derives from the
+    // ref, so the two writers alternated and the status flapped. Same reason
+    // `plan-library-backfill` reads through `scan_roots_at_source`.
+    let scan = match pwa::trigger::read_plans_for_cycle(
+        Path::new(&plans_dir),
+        &conv,
+        &pwa::trigger::ProcessGit,
+        &pwa::ref_scan::CycleRefPin::default(),
+    ) {
+        Ok(scan) => scan,
+        Err(reason) => {
+            // The loop publishes nothing on this arm, and so does the backfill:
+            // substituting the working tree for an unreadable ref is the defect.
+            eprintln!(
+                "qontinui-pr: could not read the plans in {plans_dir} at their source: {reason}. \
+                 NOTHING was pushed — the working tree is not substituted for an unreadable ref."
+            );
+            return ExitCode::from(BACKFILL_INCOMPLETE_EXIT);
+        }
+    };
+    let complete = scan.complete;
+    let all = scan.units;
     // Name the SOURCE, not just the path: on a box exporting both variables the
     // corpus this ingests and the corpus the reconcile loop would have ingested
     // can differ, and "which dir won" is not derivable from the path alone.
+    let read_from = match &scan.ref_census {
+        Some(_) => "the default branch's ref",
+        None => "the working tree — not in a repo",
+    };
     println!(
-        "found {} plan file(s) in {plans_dir} (from {dir_source})",
-        all.len()
+        "found {} plan file(s) in {plans_dir} (from {dir_source}; read from {read_from}){}",
+        all.len(),
+        if complete {
+            ""
+        } else {
+            " — a FLOOR: some plans could not be read"
+        }
     );
     if all.is_empty() {
         // An empty scan is UNKNOWN, not "nothing to do": a mistyped path and an
         // already-ingested corpus look identical from here. Say which one this
-        // is not.
+        // is not. An empty scan that also lost reads is the incomplete case,
+        // not a config refusal.
+        if !complete {
+            eprintln!(
+                "qontinui-pr: no plan in {plans_dir} could be read (read from {read_from}; see the \
+                 warnings above). Nothing was pushed."
+            );
+            return ExitCode::from(BACKFILL_INCOMPLETE_EXIT);
+        }
         eprintln!(
-            "qontinui-pr: {plans_dir} yielded no *.md plan files — check the path (the scan is \
-             non-recursive, matching the reconcile loop). Nothing was pushed."
+            "qontinui-pr: {plans_dir} yielded no *.md plan files (read from {read_from}) — \
+             check the path (the scan is non-recursive, matching the reconcile loop). Nothing \
+             was pushed."
         );
         return ExitCode::from(2);
     }
@@ -883,16 +940,16 @@ fn plan_workunit_backfill(args: &[String]) -> ExitCode {
         for u in to_push {
             println!("  {} status={} title={:?}", u.slug, u.status, u.title);
         }
-        // Be explicit about what a dry run CANNOT tell you. It contacts nothing,
-        // so it shows the file side only — which unit would be created, which
+        // Be explicit about what a dry run CANNOT tell you. It contacts no
+        // coord, so it shows the file side only — which unit would be created, which
         // refreshed and which TRANSITIONED (the arm that overwrites coord)
         // depends entirely on each unit's current remote status.
         println!(
-            "dry run: nothing was pushed, and nothing was read — this lists the FILE side only. \
+            "dry run: nothing was pushed, and coord was not read — this lists the FILE side only. \
              Which of these would be created / refreshed / transitioned depends on each unit's \
              current status in coord, which a dry run does not fetch."
         );
-        return ExitCode::SUCCESS;
+        return backfill_exit(false, complete);
     }
 
     let Some((base, base_source)) = resolve_backfill_coord_base(parsed.coord) else {
@@ -1023,10 +1080,7 @@ fn plan_workunit_backfill(args: &[String]) -> ExitCode {
             println!("  {} owner={} file wanted={}", d.slug, d.owner, d.wanted);
         }
     }
-    if summary.failed > 0 {
-        return ExitCode::from(1);
-    }
-    ExitCode::SUCCESS
+    backfill_exit(summary.failed > 0, complete)
 }
 
 // ===========================================================================
@@ -1640,6 +1694,33 @@ mod backfill_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A push error outranks an incomplete read; an incomplete read alone is 3,
+    /// never 0 — a script must not read a subset as the whole catch-up.
+    #[test]
+    fn backfill_exit_code_precedence() {
+        assert_eq!(backfill_exit_code(false, true), 0);
+        assert_eq!(backfill_exit_code(false, false), BACKFILL_INCOMPLETE_EXIT);
+        assert_eq!(backfill_exit_code(true, true), 1);
+        assert_eq!(backfill_exit_code(true, false), 1);
+        assert_ne!(BACKFILL_INCOMPLETE_EXIT, 2, "2 is the usage/config refusal");
+    }
+
+    #[test]
+    fn usage_documents_the_workunit_backfill_exit_codes() {
+        let wu = USAGE
+            .split("`plan-workunit-backfill` is its WORK-UNIT half")
+            .nth(1)
+            .and_then(|rest| rest.split("\n\n").next())
+            .expect("the work-unit paragraph exists");
+        // Reflowing the help text must not break the pin, so compare words.
+        let wu = wu.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(wu.contains("3 the plans were not all read"), "{wu}");
+        assert!(
+            wu.contains("pushes NOTHING when that ref cannot be fetched or read, dry run included"),
+            "{wu}"
+        );
+    }
 
     #[test]
     fn parse_args_full_flag_set() {
