@@ -18,7 +18,9 @@
 
 use super::PgDb;
 use crate::database::pg::completion_reports::CompletionReport;
-use crate::orchestration_loop::ledger::{Run, Subtask, SubtaskState};
+use crate::orchestration_loop::ledger::{
+    LostWorkerDisposition, Run, Subtask, SubtaskState, WorkingRow,
+};
 use chrono::{DateTime, Utc};
 use tokio_postgres::Row;
 use uuid::Uuid;
@@ -28,9 +30,12 @@ impl PgDb {
     // orchestration.runs / orchestration.subtasks (Phase 1 ledger)
     // ========================================================================
 
-    /// Insert a new orchestration run and return the persisted [`Run`].
+    /// Insert a new orchestration run and return the persisted [`Run`], with no
+    /// owner and no stored config. Test fixtures only; the conductor start
+    /// goes through [`Self::create_or_get_run`].
     ///
-    /// `created_at` / `updated_at` are stamped by the DB defaults.
+    /// Idempotent like its sibling: an existing `run_id` is returned as stored.
+    #[cfg(test)]
     pub async fn create_run(
         &self,
         run_id: Uuid,
@@ -39,6 +44,33 @@ impl PgDb {
         phases: &[String],
         status: &str,
     ) -> Result<Run, String> {
+        self.create_or_get_run(run_id, goal, recipe, phases, status, None, None)
+            .await
+            .map(|(run, _created)| run)
+    }
+
+    /// Insert a run, or return the row that already has this `run_id`, with
+    /// `true` when this call created it.
+    ///
+    /// `INSERT … ON CONFLICT (run_id) DO NOTHING` then a read-back, so a
+    /// re-entry with an existing id (a restart relaunching its own run, or an
+    /// operator re-posting the same id) returns the stored row instead of a
+    /// 23505. The STORED row wins every field, the arguments included: the
+    /// caller decides from it whether re-entry is allowed
+    /// (`loop_engine::reentry_refusal`).
+    ///
+    /// `created_at` / `updated_at` are stamped by the DB defaults.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_or_get_run(
+        &self,
+        run_id: Uuid,
+        goal: &str,
+        recipe: Option<&str>,
+        phases: &[String],
+        status: &str,
+        owner_instance: Option<&str>,
+        config: Option<&serde_json::Value>,
+    ) -> Result<(Run, bool), String> {
         let conn = self
             .pool
             .get()
@@ -46,20 +78,190 @@ impl PgDb {
             .map_err(|e| format!("PG pool error: {}", e))?;
 
         let phases_owned: Vec<String> = phases.to_vec();
+        let inserted = conn
+            .execute(
+                r#"
+            INSERT INTO orchestration.runs
+                (run_id, goal, recipe, phases, status, owner_instance, config)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (run_id) DO NOTHING
+            "#,
+                &[
+                    &run_id,
+                    &goal,
+                    &recipe,
+                    &phases_owned,
+                    &status,
+                    &owner_instance,
+                    &config,
+                ],
+            )
+            .await
+            .map_err(|e| crate::database::pg::pg_err("create_or_get_run", &e))?;
+
         let row = conn
             .query_one(
                 r#"
-                INSERT INTO orchestration.runs
-                    (run_id, goal, recipe, phases, status)
-                VALUES ($1, $2, $3, $4, $5)
-                RETURNING run_id, goal, recipe, phases, status, status_reason, created_at, updated_at
+                SELECT run_id, goal, recipe, phases, status, status_reason, created_at, updated_at,
+                       owner_instance, config
+                FROM orchestration.runs
+                WHERE run_id = $1
                 "#,
-                &[&run_id, &goal, &recipe, &phases_owned, &status],
+                &[&run_id],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("create_run", &e))?;
+            .map_err(|e| crate::database::pg::pg_err("create_or_get_run read-back", &e))?;
 
-        Ok(Self::run_from_row(&row))
+        Ok((Self::run_from_row(&row), inserted == 1))
+    }
+
+    /// Every `running` run owned by `owner_instance`, oldest first — the boot
+    /// sweep's relaunch candidates. Rows owned by another instance, and rows
+    /// with a NULL owner (they predate the column), are never returned.
+    pub async fn list_running_runs_owned_by(
+        &self,
+        owner_instance: &str,
+    ) -> Result<Vec<Run>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let rows = conn
+            .query(
+                r#"
+                SELECT run_id, goal, recipe, phases, status, status_reason, created_at, updated_at,
+                       owner_instance, config
+                FROM orchestration.runs
+                WHERE status = 'running' AND owner_instance = $1
+                ORDER BY created_at ASC
+                "#,
+                &[&owner_instance],
+            )
+            .await
+            .map_err(|e| crate::database::pg::pg_err("list_running_runs_owned_by", &e))?;
+
+        Ok(rows.iter().map(Self::run_from_row).collect())
+    }
+
+    /// The ids of every `running` run with no recorded owner. The boot sweep
+    /// logs these and leaves them alone: an unattributable row must not be
+    /// driven by whichever instance boots first.
+    pub async fn list_unowned_running_run_ids(&self) -> Result<Vec<Uuid>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let rows = conn
+            .query(
+                r#"
+                SELECT run_id
+                FROM orchestration.runs
+                WHERE status = 'running' AND owner_instance IS NULL
+                ORDER BY created_at ASC
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| crate::database::pg::pg_err("list_unowned_running_run_ids", &e))?;
+
+        rows.iter()
+            .map(|r| {
+                r.try_get::<_, Uuid>(0)
+                    .map_err(|e| crate::database::pg::pg_err("list_unowned_running_run_ids", &e))
+            })
+            .collect()
+    }
+
+    /// The run's `working` rows with what the boot sweep needs to decide each
+    /// one: the worker id, whether a report already landed, and how many times
+    /// the row has been reset before.
+    pub async fn list_working_rows_for_sweep(
+        &self,
+        run_id: Uuid,
+    ) -> Result<Vec<WorkingRow>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let rows = conn
+            .query(
+                r#"
+                SELECT task_id, task_run_id, artifact IS NOT NULL, restart_resets
+                FROM orchestration.subtasks
+                WHERE run_id = $1 AND state = 'working'
+                ORDER BY idx ASC, task_id ASC
+                "#,
+                &[&run_id],
+            )
+            .await
+            .map_err(|e| crate::database::pg::pg_err("list_working_rows_for_sweep", &e))?;
+
+        rows.iter()
+            .map(|r| {
+                let err = |e: tokio_postgres::Error| {
+                    crate::database::pg::pg_err("list_working_rows_for_sweep", &e)
+                };
+                Ok(WorkingRow {
+                    task_id: r.try_get(0).map_err(err)?,
+                    task_run_id: r.try_get(1).map_err(err)?,
+                    has_artifact: r.try_get(2).map_err(err)?,
+                    restart_resets: r.try_get(3).map_err(err)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Apply the boot sweep's decision to one lost `working` row. Guarded on
+    /// `state = 'working'` so a row something else already moved is left
+    /// alone; returns whether the row moved.
+    ///
+    /// - [`LostWorkerDisposition::Reported`] → no write (`Ok(false)`): the
+    ///   relaunched reconciler completes it through its normal path.
+    /// - [`LostWorkerDisposition::Resubmit`] → `submitted`, `task_run_id`
+    ///   cleared, `restart_resets + 1`.
+    /// - [`LostWorkerDisposition::Fail`] → `failed`.
+    pub async fn apply_lost_worker(
+        &self,
+        run_id: Uuid,
+        task_id: &str,
+        disposition: LostWorkerDisposition,
+    ) -> Result<bool, String> {
+        let sql = match disposition {
+            LostWorkerDisposition::Reported => return Ok(false),
+            LostWorkerDisposition::Resubmit => {
+                r#"
+                UPDATE orchestration.subtasks
+                SET state = 'submitted',
+                    task_run_id = NULL,
+                    restart_resets = restart_resets + 1,
+                    updated_at = now()
+                WHERE run_id = $1 AND task_id = $2 AND state = 'working'
+                "#
+            }
+            LostWorkerDisposition::Fail => {
+                r#"
+                UPDATE orchestration.subtasks
+                SET state = 'failed', updated_at = now()
+                WHERE run_id = $1 AND task_id = $2 AND state = 'working'
+                "#
+            }
+        };
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let n = conn
+            .execute(sql, &[&run_id, &task_id])
+            .await
+            .map_err(|e| crate::database::pg::pg_err("apply_lost_worker", &e))?;
+        Ok(n > 0)
     }
 
     /// Fetch a single run row by id. Returns `Ok(None)` when no row matches.
@@ -73,7 +275,8 @@ impl PgDb {
         let row = conn
             .query_opt(
                 r#"
-                SELECT run_id, goal, recipe, phases, status, status_reason, created_at, updated_at
+                SELECT run_id, goal, recipe, phases, status, status_reason, created_at, updated_at,
+                       owner_instance, config
                 FROM orchestration.runs
                 WHERE run_id = $1
                 "#,
@@ -96,7 +299,8 @@ impl PgDb {
         let rows = conn
             .query(
                 r#"
-                SELECT run_id, goal, recipe, phases, status, status_reason, created_at, updated_at
+                SELECT run_id, goal, recipe, phases, status, status_reason, created_at, updated_at,
+                       owner_instance, config
                 FROM orchestration.runs
                 ORDER BY created_at DESC
                 "#,
@@ -496,6 +700,8 @@ impl PgDb {
             status_reason: row.get(5),
             created_at: row.get::<_, DateTime<Utc>>(6),
             updated_at: row.get::<_, DateTime<Utc>>(7),
+            owner_instance: row.get(8),
+            config: row.get(9),
         }
     }
 
@@ -802,5 +1008,221 @@ mod tests {
                 &[&run_id],
             )
             .await;
+    }
+
+    /// Delete a test run (FK CASCADE removes its subtasks).
+    async fn delete_run(pg: &PgDb, run_id: Uuid) {
+        let conn = pg.pool().get().await.expect("conn");
+        let _ = conn
+            .execute(
+                "DELETE FROM orchestration.runs WHERE run_id = $1",
+                &[&run_id],
+            )
+            .await;
+    }
+
+    /// A unique owner per test, so parallel tests and rows a live runner left
+    /// in the fixture never cross.
+    fn test_owner() -> String {
+        format!("test-owner-{}", Uuid::new_v4())
+    }
+
+    /// `subtasks.restart_resets` for one row — not on [`Subtask`], so read raw.
+    async fn restart_resets(pg: &PgDb, run_id: Uuid, task_id: &str) -> i32 {
+        let conn = pg.pool().get().await.expect("conn");
+        let row = conn
+            .query_one(
+                "SELECT restart_resets FROM orchestration.subtasks \
+                 WHERE run_id = $1 AND task_id = $2",
+                &[&run_id, &task_id],
+            )
+            .await
+            .expect("restart_resets");
+        row.try_get::<_, i32>(0).expect("int")
+    }
+
+    /// Phase 2 (`2026-09-23-conductor-e2e-phase1-defects`): re-entry with an
+    /// existing `run_id` returns the stored row instead of a 23505, and the
+    /// stored row wins every field; the config and owner round-trip.
+    #[tokio::test]
+    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
+    async fn create_or_get_run_is_idempotent_and_round_trips_owner_and_config() {
+        let pg = PgDb::new_for_test().await;
+        let run_id = Uuid::new_v4();
+        let owner = test_owner();
+        let cfg = serde_json::json!({ "concurrency_cap": 7, "tick_interval_secs": 11 });
+        let phases = vec!["implement".to_string()];
+
+        let (first, created) = pg
+            .create_or_get_run(
+                run_id,
+                "goal",
+                None,
+                &phases,
+                "running",
+                Some(&owner),
+                Some(&cfg),
+            )
+            .await
+            .expect("create");
+        assert!(created, "the first call creates the row");
+        assert_eq!(first.owner_instance.as_deref(), Some(owner.as_str()));
+        assert_eq!(first.config.as_ref(), Some(&cfg));
+
+        let (again, created) = pg
+            .create_or_get_run(
+                run_id,
+                "a different goal",
+                None,
+                &[],
+                "running",
+                Some("someone-else"),
+                None,
+            )
+            .await
+            .expect("re-entry returns the row, not 23505");
+        assert!(!created, "a re-entry does not create");
+        assert_eq!(again.goal, "goal", "the stored row wins");
+        assert_eq!(again.owner_instance.as_deref(), Some(owner.as_str()));
+        assert_eq!(again.config.as_ref(), Some(&cfg));
+        assert_eq!(again.created_at, first.created_at);
+
+        delete_run(&pg, run_id).await;
+    }
+
+    /// The sweep reads only its own `running` rows: a foreign-owned row, an
+    /// unowned row and a terminal own row are all excluded.
+    #[tokio::test]
+    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
+    async fn the_sweep_lists_only_its_own_running_runs() {
+        let pg = PgDb::new_for_test().await;
+        let me = test_owner();
+        let other = test_owner();
+        let mine = Uuid::new_v4();
+        let mine_done = Uuid::new_v4();
+        let foreign = Uuid::new_v4();
+        let unowned = Uuid::new_v4();
+        for (id, owner) in [
+            (mine, Some(me.as_str())),
+            (mine_done, Some(me.as_str())),
+            (foreign, Some(other.as_str())),
+            (unowned, None),
+        ] {
+            pg.create_or_get_run(id, "g", None, &[], "running", owner, None)
+                .await
+                .expect("create");
+        }
+        pg.set_run_status(mine_done, "complete", None)
+            .await
+            .expect("complete");
+
+        let listed: Vec<Uuid> = pg
+            .list_running_runs_owned_by(&me)
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|r| r.run_id)
+            .collect();
+        assert_eq!(listed, vec![mine]);
+
+        let unowned_ids = pg.list_unowned_running_run_ids().await.expect("unowned");
+        assert!(unowned_ids.contains(&unowned));
+        assert!(!unowned_ids.contains(&foreign));
+
+        for id in [mine, mine_done, foreign, unowned] {
+            delete_run(&pg, id).await;
+        }
+    }
+
+    /// The lost-worker settle: a completed and a submitted row are untouched
+    /// (nothing is re-run), a `working` row with a landed report is left for
+    /// the reconciler, a
+    /// `working` row without one returns to `submitted` with `task_run_id`
+    /// cleared and `restart_resets = 1`, and a live worker is left alone.
+    /// Two more losses of the same row fail it.
+    #[tokio::test]
+    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
+    async fn lost_workers_are_settled_before_relaunch() {
+        use crate::orchestration_loop::loop_engine::{settle_lost_workers, LostWorkerCounts};
+
+        let pg = PgDb::new_for_test().await;
+        let run_id = Uuid::new_v4();
+        pg.create_or_get_run(run_id, "g", None, &[], "running", Some(&test_owner()), None)
+            .await
+            .expect("create");
+
+        let live_worker = Uuid::new_v4();
+        let cases = [
+            (
+                "done",
+                SubtaskState::Completed,
+                Some(Uuid::new_v4()),
+                Some(sample_report()),
+            ),
+            ("queued", SubtaskState::Submitted, None, None),
+            (
+                "reported",
+                SubtaskState::Working,
+                Some(Uuid::new_v4()),
+                Some(sample_report()),
+            ),
+            ("lost", SubtaskState::Working, Some(Uuid::new_v4()), None),
+            ("alive", SubtaskState::Working, Some(live_worker), None),
+        ];
+        for (idx, (task_id, state, trid, artifact)) in cases.into_iter().enumerate() {
+            let mut st = mk_subtask(run_id, task_id, idx as i32, vec![], false);
+            st.state = state;
+            st.task_run_id = trid;
+            st.artifact = artifact;
+            pg.upsert_subtask(&st).await.expect("upsert");
+        }
+
+        let counts = settle_lost_workers(&pg, run_id, |t| t == live_worker)
+            .await
+            .expect("settle");
+        assert_eq!(
+            counts,
+            LostWorkerCounts {
+                reported: 1,
+                resubmitted: 1,
+                failed: 0,
+                live: 1
+            }
+        );
+
+        let after = pg.list_subtasks(run_id).await.expect("list");
+        let row = |id: &str| after.iter().find(|s| s.task_id == id).expect(id).clone();
+        assert_eq!(row("done").state, SubtaskState::Completed);
+        assert_eq!(row("queued").state, SubtaskState::Submitted);
+        // Left for the relaunched reconciler, which completes a `Gone` worker
+        // with an artifact through its normal path.
+        assert_eq!(row("reported").state, SubtaskState::Working);
+        assert_eq!(row("alive").state, SubtaskState::Working);
+        let lost = row("lost");
+        assert_eq!(lost.state, SubtaskState::Submitted);
+        assert_eq!(lost.task_run_id, None, "the dead worker id is cleared");
+        assert_eq!(restart_resets(&pg, run_id, "lost").await, 1);
+
+        // Lose the same row twice more: the second reset is allowed, the
+        // third loss fails it.
+        let mut again = lost;
+        for expected in [SubtaskState::Submitted, SubtaskState::Failed] {
+            again.state = SubtaskState::Working;
+            again.task_run_id = Some(Uuid::new_v4());
+            pg.upsert_subtask(&again).await.expect("re-dispatch");
+            settle_lost_workers(&pg, run_id, |t| t == live_worker)
+                .await
+                .expect("settle");
+            let now = pg.list_subtasks(run_id).await.expect("list");
+            let r = now.iter().find(|s| s.task_id == "lost").expect("lost");
+            assert_eq!(r.state, expected);
+        }
+        assert_eq!(
+            restart_resets(&pg, run_id, "lost").await,
+            2,
+            "a fail does not count as a reset"
+        );
+
+        delete_run(&pg, run_id).await;
     }
 }
