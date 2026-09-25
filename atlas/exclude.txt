@@ -562,6 +562,8 @@ coord.restack_signatures
 coord.restack_verifications
 coord.reviews
 coord.revoked_tokens
+coord.route_serving_host_passes
+coord.route_serving_host_passes_id_seq
 coord.route_serving_observations
 coord.route_serving_observations_id_seq
 coord.runner_instances
