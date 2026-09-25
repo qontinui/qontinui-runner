@@ -754,6 +754,19 @@ impl AiCoordRegistrar {
         payload
     }
 
+    /// The tenant `session_key`'s coord session was recorded under at
+    /// registration (see [`Inner::tenants`]), or `None` when this process has
+    /// not registered it or no tenant resolved. `session_key` is the R4 index
+    /// key — see [`Self::session_id_for`].
+    pub(crate) fn recorded_tenant(&self, session_key: &str) -> Option<Uuid> {
+        let session_id = self.session_id_for(session_key)?;
+        self.inner
+            .tenants
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&session_id).copied())
+    }
+
     /// R3 — emit a coord heartbeat for the AI session backing `task_run_id`,
     /// driven by **operator interaction** (called from `send_user_message`).
     /// This is the ONLY heartbeat these sessions ever get, so an idle session
@@ -993,6 +1006,65 @@ impl AiCoordRegistrar {
             );
         }
     }
+}
+
+/// The tenant a spawning AI session's federation context binds to (Phase 8b,
+/// B2). The tenant `AiCoordRegistrar` RECORDED for the session wins, so the
+/// federated pool follows the value the coord record and its JWT slot were
+/// stamped with even if the pin changes between registration and spawn.
+///
+/// `session_keys` are tried in order, because a spawn's own `session_id` is
+/// the registrar's key only for a session registered under it
+/// (`create_ai_session`, resume). A unified workflow registers its run once
+/// under the `task_run_id` and then spawns phase sessions with suffixed ids
+/// (`{task_run_id}-agentic-N`, …), so the spawn site passes the owning
+/// `task_run_id` after its own id.
+///
+/// Falls back to the registrar's own resolver
+/// ([`crate::session::resolve_new_session_tenant`]) when no key is registered
+/// yet (the orchestration worker registers after it spawns) or registration
+/// resolved no tenant — nothing is recorded then, so an unpaired device that
+/// pairs between the two can still disagree.
+pub(crate) fn federation_session_tenant(
+    registrar: Option<&AiCoordRegistrar>,
+    session_keys: &[&str],
+) -> Option<Uuid> {
+    federation_session_tenant_with(
+        registrar,
+        session_keys,
+        crate::session::resolve_new_session_tenant,
+    )
+}
+
+/// The registrar keys a spawn's federation looks its tenant up by, in order
+/// (see [`federation_session_tenant`]): the spawn's own `session_id`, then an
+/// explicit `task_run_id`, then the owning run's id from `session_ctx` — the
+/// entry that makes a workflow phase session (`{task_run_id}-agentic-N`)
+/// find the run the workflow registered.
+pub(crate) fn federation_session_keys<'a>(
+    session_id: &'a str,
+    task_run_id: Option<&'a str>,
+    session_ctx: Option<&'a crate::execution_context::AiSessionContext>,
+) -> Vec<&'a str> {
+    [
+        Some(session_id),
+        task_run_id,
+        session_ctx.map(|c| c.context.task_run_id.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// [`federation_session_tenant`] with the fallback resolver injected.
+fn federation_session_tenant_with(
+    registrar: Option<&AiCoordRegistrar>,
+    session_keys: &[&str],
+    fallback: fn() -> Option<Uuid>,
+) -> Option<Uuid> {
+    registrar
+        .and_then(|r| session_keys.iter().find_map(|k| r.recorded_tenant(k)))
+        .or_else(fallback)
 }
 
 use crate::session::SessionKind;
@@ -1714,6 +1786,70 @@ mod tests {
     }
 
     #[test]
+    fn federation_binds_the_tenant_the_registrar_recorded() {
+        // #1708 residual: the federation context re-resolved the tenant at
+        // spawn while the registrar resolved it at registration, so a pin
+        // change between the two split the coord record from the federated
+        // pool. The RECORDED tenant must win over a fallback that now answers
+        // a different tenant (the re-pinned device).
+        const REPINNED: Uuid = Uuid::from_u128(0x0b0b_0000_0000_4000_8000_000000000001);
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar_with_tenant(|| Some(OWNING_TENANT));
+        let trid = Uuid::new_v4().to_string();
+        reg.register_session(&trid, "fix the thing", None).unwrap();
+
+        assert_eq!(reg.recorded_tenant(&trid), Some(OWNING_TENANT));
+        assert_eq!(
+            federation_session_tenant_with(Some(&reg), &[&trid], || Some(REPINNED)),
+            Some(OWNING_TENANT)
+        );
+        // A unified-workflow phase session spawns under a suffixed id the
+        // registrar never saw; the owning task_run_id, tried next, still hits.
+        let phase_id = format!("{trid}-agentic-1");
+        assert_eq!(
+            federation_session_tenant_with(Some(&reg), &[&phase_id, &trid], || Some(REPINNED)),
+            Some(OWNING_TENANT)
+        );
+        // No key registered (or no registrar): the fallback answers.
+        assert_eq!(
+            federation_session_tenant_with(Some(&reg), &[&phase_id], || Some(REPINNED)),
+            Some(REPINNED)
+        );
+        assert_eq!(
+            federation_session_tenant_with(None, &[&trid], || Some(REPINNED)),
+            Some(REPINNED)
+        );
+
+        // Closing evicts it along with the rest of the R4 index.
+        reg.close_session(&trid);
+        assert_eq!(reg.recorded_tenant(&trid), None);
+    }
+
+    #[test]
+    fn federation_keys_reach_the_owning_run_of_a_phase_session() {
+        // A unified-workflow phase session spawns as `{trid}-agentic-N`; only
+        // the run id its `session_ctx` carries is registered. Dropping that
+        // entry silently sends every phase session back to the fallback.
+        let trid = Uuid::new_v4().to_string();
+        let ctx = crate::execution_context::AiSessionContext::new(
+            crate::execution_context::ExecutionContext::agentic(trid.clone(), 1),
+            "wf",
+        );
+        let phase_id = ctx.session_id.clone();
+        assert_ne!(phase_id, trid);
+        assert_eq!(
+            federation_session_keys(&phase_id, None, Some(&ctx)),
+            [phase_id.as_str(), trid.as_str()]
+        );
+        assert_eq!(
+            federation_session_keys(&phase_id, Some("explicit"), None),
+            [phase_id.as_str(), "explicit"]
+        );
+        assert_eq!(federation_session_keys(&trid, None, None), [trid.as_str()]);
+    }
+
+    #[test]
     fn an_unresolved_tenant_stamps_nothing() {
         // An unresolvable or unpaired machine keeps the pre-existing shape:
         // no `tenant_id`, so the drain falls back exactly as it did before.
@@ -2090,6 +2226,7 @@ mod tests {
                 finished_at: None,
                 finish_reason: None,
                 finish_synced: false,
+                spawn_device_default: None,
             },
         );
         let finished_at = store.set_finished(csid, true, None).unwrap().finished_at;
@@ -2183,6 +2320,7 @@ mod tests {
                 finished_at: None,
                 finish_reason: None,
                 finish_synced: false,
+                spawn_device_default: None,
             },
         );
         let coord_id = reg

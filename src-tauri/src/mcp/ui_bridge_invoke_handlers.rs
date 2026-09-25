@@ -253,8 +253,10 @@ in_process_dispatch_table! {
     (state, args) {
         "redeem_pair_code" => in_process_redeem_pair_code(args),
         "dismiss_recent_crash" => in_process_dismiss_recent_crash(state),
-        "get_coord_device_token" => in_process_get_coord_device_token(),
+        "get_coord_device_token" => in_process_get_coord_device_token(args),
         "get_access_token_for_websocket" => in_process_get_access_token_for_websocket(args),
+        "get_cloud_sync_settings" => in_process_get_cloud_sync_settings(args),
+        "save_cloud_sync_settings" => in_process_save_cloud_sync_settings(args),
     }
 }
 
@@ -269,7 +271,9 @@ in_process_dispatch_table! {
 /// structured error text — never an empty 200 a caller could read as a token.
 ///
 /// Wire shape: success is `{ "success": true, "data": "<token>" }`; the token
-/// is the operator's Cognito ACCESS token (not a coord device JWT). Takes no
+/// is the legacy `access_token` slot — the DEFAULT binding's coord device JWT
+/// (see `get_access_token_for_websocket_impl`'s doc for the Step 0 read that
+/// corrected "Cognito access token" here). Takes no
 /// arguments; a non-empty `args` object is a 400 rather than silently ignored.
 async fn in_process_get_access_token_for_websocket(
     args: &Value,
@@ -406,26 +410,189 @@ async fn in_process_dismiss_recent_crash(
 /// `crate::ui_bridge_invoke::UI_BRIDGE_COMMANDS` for why this command and not
 /// `get_access_token_for_websocket`, and why the entry exists at all.
 ///
-/// A plain `fn() -> Result<Option<String>, String>` that reads the credential
-/// store, so it needs neither `ApiState` nor `args` -- and, crucially, nothing
-/// from the webview. That is what lets it answer on a headless runner and on a
-/// CSP-enforcing build, the two shapes `page/evaluate` cannot serve.
+/// A plain fn that reads the credential store, so it needs no `ApiState` --
+/// and, crucially, nothing from the webview. That is what lets it answer on a
+/// headless runner and on a CSP-enforcing build, the two shapes `page/evaluate`
+/// cannot serve.
+///
+/// # Who may call this, and why a tenant argument does not widen it (security trigger 3)
+///
+/// With `tenantId` this door returns ANY tenant's device JWT this runner holds,
+/// not only the default binding's. That is deliberate (autonomy is the axis), and
+/// the argument is that the caller principal and the trust boundary are
+/// UNCHANGED — traced 2026-09-17 on the runner branch that carries this change:
+///
+/// - **The only gates in front of `POST /ui-bridge/invoke/{command}`** are
+///   (1) the API listener binding the IPv4 loopback only
+///   (`mcp_api::try_bind_port`, `127.0.0.1`), (2) the command-NAME allowlist
+///   ([`is_allowlisted`] — it gates which command, never who calls), and (3) the
+///   backend relay's closed path allowlist (`mcp::relay_path_policy`), which
+///   refuses this exact route to the remote `http_request` arm. There is NO
+///   caller authentication, handshake or nonce on this route: local-caller
+///   trust is the runner API's whole model. The router's CORS layer answers ANY
+///   origin, method and header (`mcp_api.rs`, `CorsLayer::new().allow_origin(Any)`);
+///   whether a browser's Private Network Access checks stop a web page from
+///   reading this route was NOT measured.
+/// - **Before the argument existed**, that same loopback caller already obtained
+///   the default binding's JWT here with `{}` — a device credential of this
+///   runner. After it, every token the door can return is still one this runner
+///   holds FOR THIS DEVICE; the argument only stops the caller having to take
+///   whichever tenant happens to be the default. No new principal gains a
+///   credential it could not already reach.
+///
+/// # Args (plan `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P3)
+///
+/// `{"tenantId": "<uuid>"}` names the tenant whose token the caller wants --
+/// the same key the Tauri command's `tenant_id` parameter takes over IPC.
+/// `tenant_id` is accepted as an alias (shell callers spell it that way); both
+/// present and disagreeing is a 400, as is a non-string value or any other key.
+/// `{}` / `null` names no tenant, which on a runner holding several tenant slots
+/// is REFUSED -- see `commands::auth::get_coord_device_token`. An older runner
+/// ignores the args entirely, so a caller may always send them.
 ///
 /// Mapping, deliberately three-valued so a caller can tell them apart:
 /// - `Ok(Some(jwt))` -> the JWT as a JSON string;
-/// - `Ok(None)`      -> JSON `null`: definitively unpaired. NOT an error.
-/// - `Err(e)`        -> 500: the credential store was unreadable, so the
-///   pairing state is UNKNOWN. Never collapsed into `null` -- that would render
-///   an unreadable store as "this runner is unpaired", the exact NO-DOWNGRADE
-///   flattening the command's own doc comment records having removed.
-async fn in_process_get_coord_device_token() -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
+/// - `Ok(None)`      -> JSON `null`: definitively no token (for that tenant). NOT an error.
+/// - `Err(e)`        -> 500: the credential store was unreadable, so the answer
+///   is UNKNOWN -- never collapsed into `null`;
+/// - refused         -> 409 `get_coord_device_token:tenant_required` (name a
+///   tenant) or 400 `get_coord_device_token:tenant_invalid`, typed text verbatim.
+async fn in_process_get_coord_device_token(
+    args: &Value,
+) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
     const COMMAND: &str = "get_coord_device_token";
 
-    match crate::commands::auth::get_coord_device_token() {
+    let tenant =
+        coord_device_token_tenant_arg(args).map_err(|d| in_process_bad_args(COMMAND, &d))?;
+    match crate::commands::auth::get_coord_device_token(tenant) {
         Ok(Some(token)) => Ok(Value::String(token)),
         Ok(None) => Ok(Value::Null),
-        Err(e) => Err(in_process_command_failed(COMMAND, e)),
+        Err(e) => Err(match coord_device_token_error_status(&e) {
+            StatusCode::BAD_REQUEST => in_process_bad_args(COMMAND, &e),
+            StatusCode::CONFLICT => (
+                StatusCode::CONFLICT,
+                Json(api_error(format!(
+                    "invoke proxy: in-process invoke of '{}' refused: {}",
+                    COMMAND, e
+                ))),
+            ),
+            _ => in_process_command_failed(COMMAND, e),
+        }),
     }
+}
+
+/// The HTTP status a `get_coord_device_token` error maps to. A refusal is the
+/// caller's to fix — 409 `tenant_required` (name a tenant), 400
+/// `tenant_invalid` (the tenant named is malformed) — while anything else is the
+/// runner failing to read its own store, a 500 the caller cannot fix by changing
+/// the request.
+fn coord_device_token_error_status(err: &str) -> StatusCode {
+    if err.starts_with(crate::commands::auth::DEVICE_TOKEN_TENANT_REQUIRED) {
+        StatusCode::CONFLICT
+    } else if err.starts_with(crate::commands::auth::DEVICE_TOKEN_TENANT_INVALID) {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+/// Parse `get_coord_device_token`'s args: `tenantId` (canonical) or its
+/// `tenant_id` alias, nothing else.
+fn coord_device_token_tenant_arg(args: &Value) -> Result<Option<String>, String> {
+    let obj = match args {
+        Value::Null => return Ok(None),
+        Value::Object(o) => o,
+        _ => return Err("args must be an object `{\"tenantId\": \"<uuid>\"}` or `{}`".to_string()),
+    };
+    if let Some(other) = obj.keys().find(|k| *k != "tenantId" && *k != "tenant_id") {
+        return Err(format!(
+            "unknown arg `{other}` -- the only arg is `tenantId`"
+        ));
+    }
+    let canonical = optional_string_arg(args, "tenantId")?;
+    let alias = optional_string_arg(args, "tenant_id")?;
+    match (canonical, alias) {
+        (Some(a), Some(b)) if a.trim() != b.trim() => {
+            Err("`tenantId` and `tenant_id` name different tenants -- send one".to_string())
+        }
+        (Some(a), _) => Ok(Some(a)),
+        (None, b) => Ok(b),
+    }
+}
+
+/// In-process arm for `get_cloud_sync_settings`
+/// (`crate::commands::cloud_sync_settings::get_cloud_sync_settings`) — plan
+/// `2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls`
+/// §3.5.
+///
+/// A plain `fn() -> Result<CommandResponse, String>` that reads
+/// `cloud_sync_enabled` off `settings.json` — needs neither `ApiState` nor
+/// the webview, which is what lets a headless (`QONTINUI_SERVER_MODE`)
+/// runner answer it, mirroring `get_coord_device_token` immediately above.
+/// Takes no arguments; a non-empty `args` object is a 400 rather than
+/// silently ignored.
+async fn in_process_get_cloud_sync_settings(
+    args: &Value,
+) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
+    const COMMAND: &str = "get_cloud_sync_settings";
+
+    match args {
+        Value::Null => {}
+        Value::Object(o) if o.is_empty() => {}
+        _ => {
+            return Err(in_process_bad_args(
+                COMMAND,
+                "takes no arguments — send `{}`",
+            ))
+        }
+    }
+
+    let response = crate::commands::cloud_sync_settings::get_cloud_sync_settings()
+        .map_err(|e| in_process_command_failed(COMMAND, e))?;
+
+    serde_json::to_value(response).map_err(|e| {
+        in_process_command_failed(COMMAND, format!("could not serialize response: {}", e))
+    })
+}
+
+/// In-process arm for `save_cloud_sync_settings`
+/// (`crate::commands::cloud_sync_settings::save_cloud_sync_settings`) — plan
+/// `2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls`
+/// §3.5.
+///
+/// A plain `fn(bool) -> Result<CommandResponse, String>` that writes
+/// `cloud_sync_enabled` to `settings.json` — needs neither `ApiState` nor the
+/// webview, so it answers headless. `cloudSyncEnabled` is required (Tauri v2
+/// camelCases the Rust snake_case `cloud_sync_enabled` parameter on the
+/// wire, matching every other boolean arg in this allowlist).
+async fn in_process_save_cloud_sync_settings(
+    args: &Value,
+) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
+    const COMMAND: &str = "save_cloud_sync_settings";
+
+    let cloud_sync_enabled = match args.get("cloudSyncEnabled") {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Null) | None => {
+            return Err(in_process_bad_args(
+                COMMAND,
+                "`cloudSyncEnabled` (boolean) is required",
+            ))
+        }
+        Some(_) => {
+            return Err(in_process_bad_args(
+                COMMAND,
+                "`cloudSyncEnabled` must be a boolean",
+            ))
+        }
+    };
+
+    let response =
+        crate::commands::cloud_sync_settings::save_cloud_sync_settings(cloud_sync_enabled)
+            .map_err(|e| in_process_command_failed(COMMAND, e))?;
+
+    serde_json::to_value(response).map_err(|e| {
+        in_process_command_failed(COMMAND, format!("could not serialize response: {}", e))
+    })
 }
 
 /// What [`perform_invoke_round_trip`] does with a request, decided before any
@@ -820,6 +987,14 @@ mod in_process_dispatch_tests {
         // Credential-returning, so content trigger 3 of `security-and-autonomy`;
         // the same shrink-not-grow argument applies: `page/evaluate` exposed this
         // token on the same unauthenticated loopback port.
+        //
+        // `get_cloud_sync_settings` / `save_cloud_sync_settings` joined for plan
+        // `2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls`
+        // §3.5: they carry no credential at all (a local consent flag, not a
+        // token), and are already reachable via the eval-based `page/evaluate`
+        // path on any windowed runner — the shrink-not-grow argument applies
+        // just as directly, and this pair is what makes the setting reachable
+        // on a HEADLESS runner in the first place.
         let mut in_process: Vec<&str> = all_entries()
             .filter(|c| c.dispatch == Dispatch::InProcess)
             .map(|c| c.name)
@@ -830,8 +1005,10 @@ mod in_process_dispatch_tests {
             vec![
                 "dismiss_recent_crash",
                 "get_access_token_for_websocket",
+                "get_cloud_sync_settings",
                 "get_coord_device_token",
-                "redeem_pair_code"
+                "redeem_pair_code",
+                "save_cloud_sync_settings",
             ]
         );
     }
@@ -1069,5 +1246,53 @@ mod in_process_dispatch_tests {
         let (status, Json(body)) = in_process_command_failed("x", "y".to_string());
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(body.error.unwrap().contains("in-process invoke of 'x'"));
+    }
+}
+
+/// Plan `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P3:
+/// the invoke door carries the tenant argument, and never silently drops a bad one.
+#[cfg(test)]
+mod coord_device_token_arg_tests {
+    use super::coord_device_token_tenant_arg as parse;
+    use serde_json::json;
+
+    /// R4 (review): the status table, pinned row by row.
+    #[test]
+    fn device_token_errors_map_to_their_statuses() {
+        use super::coord_device_token_error_status as status_for;
+        use crate::commands::auth::{DEVICE_TOKEN_TENANT_INVALID, DEVICE_TOKEN_TENANT_REQUIRED};
+        use axum::http::StatusCode;
+        for (err, want) in [
+            (
+                format!("{DEVICE_TOKEN_TENANT_REQUIRED}: holds 2 tenants"),
+                StatusCode::CONFLICT,
+            ),
+            (
+                format!("{DEVICE_TOKEN_TENANT_INVALID}: tenant_id \"x\" is not a tenant uuid"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "Could not read the credential store, so ... unknown".to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ] {
+            assert_eq!(status_for(&err), want, "{err}");
+        }
+    }
+
+    #[test]
+    fn the_tenant_arg_is_read_under_either_spelling_and_nothing_else() {
+        assert_eq!(parse(&json!(null)), Ok(None));
+        assert_eq!(parse(&json!({})), Ok(None));
+        assert_eq!(parse(&json!({"tenantId": "t1"})), Ok(Some("t1".into())));
+        assert_eq!(parse(&json!({"tenant_id": "t1"})), Ok(Some("t1".into())));
+        assert_eq!(
+            parse(&json!({"tenantId": "t1", "tenant_id": "t1"})),
+            Ok(Some("t1".into()))
+        );
+        assert!(parse(&json!({"tenantId": "t1", "tenant_id": "t2"})).is_err());
+        assert!(parse(&json!({"tenantId": 7})).is_err());
+        assert!(parse(&json!({"tenant": "t1"})).is_err());
+        assert!(parse(&json!("t1")).is_err());
     }
 }

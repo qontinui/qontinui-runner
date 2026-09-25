@@ -1508,12 +1508,12 @@ async fn refresh_usage(include_prepaid: bool) -> Vec<AccountUsageInfo> {
 ///
 /// Best-effort and strictly fire-and-forget, mirroring the discipline of
 /// `terminal::auto_response::report`: bounded timeout, no retries, any
-/// failure is a `debug!` and a return. A coord that predates the
+/// failure is a `warn!` and a return. A coord that predates the
 /// `/coord/claude-accounts/usage` route 404s — silently tolerated so the
 /// runner PR can land independently of the coord one.
 mod usage_twin_report {
     use serde::Serialize;
-    use tracing::debug;
+    use tracing::{debug, warn};
 
     /// Wire shape — SHARED CONTRACT with coord's
     /// `POST /coord/claude-accounts/usage` ingest. Account identity is the
@@ -1654,10 +1654,10 @@ mod usage_twin_report {
                 );
             }
             Ok(resp) => {
-                debug!(status = %resp.status(), "coord account-usage ingest non-2xx (older coord?) — skipped");
+                warn!(status = %resp.status(), "coord account-usage ingest non-2xx (older coord?) — skipped");
             }
             Err(e) => {
-                debug!(error = %e, "coord account-usage report failed — skipped");
+                warn!(error = %e, "coord account-usage report failed — skipped");
             }
         }
     }

@@ -56,9 +56,10 @@
 //!
 //!    The tick drives only the arms with no OTHER periodic owner — handoff
 //!    and respawn. The remote-attach and remote-create arms that share this
-//!    socket's on-connect replay each already have their own 60 s poll task
-//!    in `main.rs`, on the same period, so putting them on this tick as well
-//!    would double their GETs and deliver nothing sooner.
+//!    socket's on-connect replay each already have their own poll task in
+//!    `main.rs` (`attach::POLL_INTERVAL`, `create::POLL_INTERVAL`), each at
+//!    least as frequent as this tick, so putting them on this tick as well
+//!    would add GETs and deliver nothing sooner.
 //!    [`catchups_for`] is where that split lives.
 //!
 //! ## Receiver flow (one handoff)
@@ -1349,6 +1350,7 @@ fn registry_record_from_restore_payload(
         finished_at: None,
         finish_reason: None,
         finish_synced: false,
+        spawn_device_default: None,
     }
 }
 
@@ -1383,10 +1385,20 @@ pub(super) fn build_child_intent(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    // This reads the raw persisted JSON directly rather than going through
+    // `Intent`'s `Deserialize` impl, so `Intent::share_output`'s own
+    // `#[serde(default = "default_true")]` (plan
+    // `2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls`
+    // §3.5) has no effect here — this fallback is a SECOND, independent
+    // default-resolution point that must be kept in sync by hand. A sparse
+    // source intent (predating this field, or from any other reason the key
+    // is absent) must resolve the same way a missing key resolves everywhere
+    // else: `true`, ship-on-by-default per `engineering-priorities`
+    // `capability-ships-enabled`.
     let share_output = src
         .get("share_output")
         .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+        .unwrap_or(true);
     let redact_secrets = src.get("redact_secrets").and_then(|v| v.as_bool());
     // Dual-read: coord renamed the wire key `plan_slug` → `work_unit_slug`.
     // Read the new name first and fall back to the legacy one so a source
@@ -1706,7 +1718,13 @@ mod tests {
         assert_eq!(intent.kind, SessionKind::TerminalClaude);
         assert!(intent.purpose.contains("handoff session"));
         assert!(intent.declared_paths.is_empty());
-        assert!(!intent.share_output);
+        // Ship-on-by-default (plan
+        // 2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls
+        // §3.5): a source intent that omits `share_output` entirely must
+        // resolve to `true` here too, matching `Intent::share_output`'s own
+        // serde default — this call site reads the raw JSON directly and so
+        // needed its own fallback fixed in step with that one.
+        assert!(intent.share_output);
         intent.validate().unwrap();
     }
 

@@ -13,9 +13,11 @@
 //!
 //! 1. **Push** — a `create_request` directive on
 //!    `qontinui.sessions.<tenant>.<target-device>.create_request`, i.e. the
-//!    subject family [`super::handoff`] already PSUBSCRIBEs as
-//!    `qontinui.sessions.*`. No second socket:
-//!    [`super::handoff::connect_and_pump`] forwards every frame here and
+//!    subject family [`super::handoff`] already receives through the
+//!    `?subscribe=sessions` lane, which coord resolves from the upgrade
+//!    credential to `qontinui.sessions.<tenant>.<self-device>.*` (see
+//!    `qontinui_runner_lib::coord_ws::Subscription::Sessions`). No second
+//!    socket: [`super::handoff::connect_and_pump`] forwards every frame here and
 //!    [`parse_create_push`] claims only the `.create_request` suffix — the same
 //!    disambiguation-by-trailing-segment the handoff, respawn and attach arms
 //!    use.

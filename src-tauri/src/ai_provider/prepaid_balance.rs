@@ -6,6 +6,11 @@
 //! different shape. This module probes those balances so the mobile dashboard's
 //! "Credit Balance" card can show remaining funds instead of a usage bar.
 //!
+//! Two consumers: the local `/analytics/prepaid-balance` route (on demand), and
+//! the 10-minute fleet report (`commands::ai_settings::refresh_fleet_usage_report`),
+//! which mirrors the balances to coord's `coord.prepaid_balances` so the card
+//! still has a reading when this machine is down.
+//!
 //! Only DeepSeek is wired today (the default OpenAI-compatible endpoint), but
 //! the public surface returns a `Vec<PrepaidBalanceInfo>` so additional prepaid
 //! providers plug in without a schema change.
@@ -256,7 +261,9 @@ pub async fn get_prepaid_balances() -> Vec<PrepaidBalanceInfo> {
 ///    {"currency": "USD", "total_balance": "19.28",
 ///     "granted_balance": "0.00", "topped_up_balance": "19.28"}]}
 /// ```
-/// Balance values are JSON *strings*, so they are parsed to `f64`. When
+/// Balance values are JSON *strings*; each is parsed twice from the same text —
+/// to `f64` for display and to exact integer micros for the coord wire (see
+/// [`parse_deepseek_balance`]). When
 /// multiple currencies are present the first `balance_infos` entry is used
 /// (DeepSeek reports a single currency per account in practice).
 async fn probe_deepseek_balance(base_url: &str, api_key: &str) -> PrepaidBalanceInfo {

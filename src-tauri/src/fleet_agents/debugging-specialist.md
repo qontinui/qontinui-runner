@@ -416,7 +416,25 @@ Verify:
 
 **9.4 Construct Verification Report**
 
+**A timestamp is not a tree.** The log timestamps below say WHEN the evidence
+was produced; they say nothing about WHICH checkout produced it, so a verified
+fix and a fix verified against a stale sibling checkout print identically.
+Measure the tree at the START of Phase 9, before reading the first log line:
+
+```bash
+bash <workspace-root>/qontinui-claude-config/scripts/lib/tree-identity.sh --root .
+```
+
+Re-run it immediately before emitting the report and compare `head=`; the
+`tree-recheck` line carries `moved=yes` when the two differ, and
+`moved=unknown` when either reads `unknown` (two unresolved measurements
+compare equal, so a broken probe must never render as "unchanged"). Both lines
+lead the report, above its heading.
+
 ```markdown
+tree: root=<name> head=<sha> dirty=<digest|clean|unknown> dirty_files=<n|UNKNOWN> measured=<ISO-8601-UTC>
+tree-recheck: head=<sha> moved=<yes|no|unknown> measured=<ISO-8601-UTC>
+
 ## Fix Verification Report
 
 ### User Testing
@@ -462,7 +480,15 @@ The bug is resolved.
 
 If you don't see `[FIX_VERIFICATION]` markers or still see errors:
 
+The failure report carries the same two leading lines. A report saying the fix
+did NOT verify is the one a reader is most likely to act on by re-running
+something, so the tree it read is exactly what they need in order to know
+whether re-running would even be the same measurement.
+
 ```markdown
+tree: root=<name> head=<sha> dirty=<digest|clean|unknown> dirty_files=<n|UNKNOWN> measured=<ISO-8601-UTC>
+tree-recheck: head=<sha> moved=<yes|no|unknown> measured=<ISO-8601-UTC>
+
 ## Fix Verification Report
 
 ### Issues Found in Logs

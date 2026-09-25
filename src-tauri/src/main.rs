@@ -5062,7 +5062,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         loop_registry.clone(),
                         handoff_lifecycle_store,
                     );
-                    // Remote-attach grant catch-up on a 60 s timer (plan
+                    // Remote-attach grant catch-up on a timer of
+                    // `session::attach::POLL_INTERVAL` (plan
                     // `2026-08-31-remote-session-tabs-in-runner-terminal`,
                     // Phase 3c): the push arm rides the handoff receiver's
                     // socket above; this is the poll beside it.

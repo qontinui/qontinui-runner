@@ -31,12 +31,26 @@
 //! set instead of nothing. The change is strictly additive — no configuration
 //! that worked before resolves differently now.
 //!
-//! ## The `.md` files in `fleet_agents/` are the CANONICAL sources
+//! ## The `.md` files in `fleet_agents/` are a RENDER, not the source of truth
 //!
-//! As in the two sibling modules: ordinary files in this public repository,
-//! reviewed through a normal pull request, with git history as the tamper
-//! record. Because they ship to every fleet device they must stay free of any
-//! one operator's absolute paths — see
+//! They are ordinary files in this public repository, reviewed through a normal
+//! pull request, with git history as the tamper record. But the CONTENT
+//! originates in `qontinui-claude-config/.claude/agents/*.md` — the copy the
+//! checkout overlay above writes on top of these, and the one humans edit.
+//! Edit a definition THERE and copy it forward byte for byte; an edit made
+//! directly here is drift the moment it lands. Same direction as
+//! [`crate::fleet_skills`], whose header was corrected the same way.
+//!
+//! This header used to call these files "the CANONICAL sources", and nothing
+//! carried config edits across: from the bundle's creation (`0245c2e96`,
+//! 2026-08-28) to its first full re-sync, `merge-specialist.md` drifted ~700
+//! lines and kept telling runner-provisioned specialists about a coord executor
+//! that no longer acts on their decision (coord finding `491c906f`). Unlike the
+//! skills bundle, no publish-cycle or CI parity check covers this directory
+//! yet, so a re-sync is still a hand carry.
+//!
+//! Because they ship to every fleet device they must stay free of any one
+//! operator's absolute paths — see
 //! [`tests::bundled_agent_defs_have_no_operator_local_paths`].
 
 use std::path::Path;

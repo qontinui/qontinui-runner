@@ -189,10 +189,10 @@ pub fn log_bridge_report(category: &str, ctx: &SessionContext, report: Result<Re
 /// The tenant a spawned session's federation binds to — the value
 /// that populates [`SessionContext::tenant_id`] (B2). The session's
 /// RECORDED tenant wins (`session_tenant`, threaded by the spawn site from
-/// `session::resolve_new_session_tenant` — the machine.json pin, else on an
-/// unpinned device the paired default binding — the SAME source
-/// `AiCoordRegistrar` stamps the coord record and JWT slot from), so the
-/// coord record + JWT slot + federated pool agree. Only when no tenant
+/// `coord_register::federation_session_tenant` — the tenant `AiCoordRegistrar`
+/// stamped the coord record and JWT slot with, else the registrar's own
+/// resolver `session::resolve_new_session_tenant`), so the coord record + JWT
+/// slot + federated pool agree. Only when no tenant
 /// resolved (an unresolvable or unpaired machine) does this fall back to
 /// [`resolve_tenant_id`] (paired file, then the OAuth claim). Split out so the B2 precedence is
 /// hermetically testable without the file/home-dir reads the rest of
@@ -296,8 +296,8 @@ mod tests {
         // B2 REGRESSION: a session's federation `SessionContext.tenant_id`
         // is populated by `resolve_session_context_tenant`. A session that
         // RECORDED tenant B (threaded by the spawn site from
-        // `resolve_new_session_tenant` — the same source `AiCoordRegistrar`
-        // stamps the coord record + JWT slot from) MUST
+        // `federation_session_tenant` — the tenant `AiCoordRegistrar`
+        // stamped the coord record + JWT slot with) MUST
         // federate B's pool. The recorded value has to WIN over the
         // `paired_user.json::default_tenant_id` fallback (`resolve_tenant_id`);
         // that fallback following a DIFFERENT source is the exact coord/observable
