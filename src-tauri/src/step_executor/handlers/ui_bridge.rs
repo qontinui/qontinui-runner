@@ -724,6 +724,12 @@ impl Default for UiBridgeFailureTracker {
 // UiBridgeHandler
 // ---------------------------------------------------------------------------
 
+/// The action an action-less ui_bridge step runs. Both step editors display
+/// an action-less step as `snapshot`, and the typed view
+/// (`to_full_runner_step`, qontinui-schemas `UiBridgeAction`'s `#[default]`)
+/// agrees, so what the user was shown is what runs.
+pub(crate) const DEFAULT_UI_BRIDGE_ACTION: &str = "snapshot";
+
 /// Handler for UI Bridge steps.
 ///
 /// Performs UI Bridge SDK operations:
@@ -753,7 +759,10 @@ impl StepHandler for UiBridgeHandler {
         step: &ExecutionStepConfig,
         context: &HandlerContext,
     ) -> StepHandlerResult {
-        let action = step.ui_bridge_action.as_deref().unwrap_or("snapshot");
+        let action = step
+            .ui_bridge_action
+            .as_deref()
+            .unwrap_or(DEFAULT_UI_BRIDGE_ACTION);
         let self_base = crate::mcp::types::get_self_base_url(&context.app_state);
         let default_ui_bridge = format!("{}/ui-bridge", self_base);
         let raw_url = step.ui_bridge_url.as_deref().unwrap_or(&default_ui_bridge);

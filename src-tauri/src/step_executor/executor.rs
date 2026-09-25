@@ -95,7 +95,9 @@ fn to_full_runner_step(
             let action = match step.ui_bridge_action.as_deref() {
                 Some(s) => parse_snake_enum::<UiBridgeAction>(s)
                     .map_err(|e| format!("ui_bridge.action: {e}"))?,
-                None => UiBridgeAction::default(),
+                // What the handler runs for an action-less step
+                // (`DEFAULT_UI_BRIDGE_ACTION`), and what both editors show.
+                None => UiBridgeAction::Snapshot,
             };
             let assert_type = step
                 .ui_bridge_assert_type

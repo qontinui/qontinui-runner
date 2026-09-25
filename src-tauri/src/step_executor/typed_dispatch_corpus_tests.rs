@@ -590,12 +590,6 @@ const BUILDER_UI_BRIDGE_TEMPLATES: &[(&str, &str, &str)] = &[
 fn known_refusals() -> Vec<(&'static str, Value, &'static str)> {
     vec![
         (
-            "buildSpecWorkflow component_action",
-            json!({"type": "ui_bridge", "id": "a", "name": "b", "phase": "setup",
-                   "ui_bridge_action": "component_action", "ui_bridge_target": "{}"}),
-            "UiBridgeHandler has no component_action arm (\"Unknown UI Bridge action\")",
-        ),
-        (
             "probe command agentic",
             json!({"type": "command", "id": "a", "name": "b", "phase": "agentic", "command": "ls"}),
             "no producer puts a command step in the agentic phase; only prompt steps are agentic",
@@ -961,6 +955,36 @@ fn unparseable_ui_bridge_step_is_refused_not_rebuilt() {
     let steps = convert_json_steps_with_phase(std::slice::from_ref(&cmd), 0, Some("setup"));
     assert_eq!(steps.len(), 1);
     assert_eq!(steps[0].shell_command.as_deref(), Some("ls"));
+}
+
+/// An action-less ui_bridge step is a `snapshot` on every side: the typed
+/// view, the schemas default, and the action the handler runs (plan
+/// `2026-09-25-builder-ui-bridge-steps-lose-action-and-url`, Phase 2).
+#[test]
+fn action_less_ui_bridge_step_is_a_snapshot() {
+    use crate::step_executor::handlers::ui_bridge::DEFAULT_UI_BRIDGE_ACTION;
+    use qontinui_types::workflow_step::{FullRunnerStep, UiBridgeAction};
+    let esc = converted(
+        &json!({"id": "a", "type": "ui_bridge", "name": "look"}),
+        "verification",
+    );
+    assert_eq!(esc.ui_bridge_action, None);
+    let FullRunnerStep::UiBridge(u) = to_full_runner_step(&esc).unwrap() else {
+        panic!("expected UiBridge")
+    };
+    assert_eq!(u.action, UiBridgeAction::Snapshot, "typed default");
+    let handler_default: UiBridgeAction =
+        serde_json::from_value(json!(DEFAULT_UI_BRIDGE_ACTION)).unwrap();
+    assert_eq!(u.action, handler_default, "typed view vs handler default");
+    assert_eq!(
+        UiBridgeAction::default(),
+        UiBridgeAction::Snapshot,
+        "schemas #[default]"
+    );
+    assert_eq!(
+        resolve_dispatch(&esc, &HandlerRegistry::with_standard_handlers()),
+        DispatchRoute::Registry("ui_bridge")
+    );
 }
 
 /// Field-level checks for every shape this change newly types or fixes:
