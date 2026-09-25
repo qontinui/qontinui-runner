@@ -562,9 +562,20 @@ fn tenant_for_new_session(pin: tenant_pin::TenantPin) -> Option<Uuid> {
     }
 }
 
+/// The tenant a NEW session with no spawn-input tenant is recorded under,
+/// read from the live pin. The single source [`stamp_session_tenant`] fills
+/// from, shared with the sessions that live OUTSIDE the registry — the
+/// Claude AI sessions `AiCoordRegistrar` records and their federation context
+/// — so every session's recorded tenant resolves the same way. `machine.json`
+/// alone would answer `None` on an unpinned device, where the recorded tenant
+/// is the paired default binding.
+pub(crate) fn resolve_new_session_tenant() -> Option<Uuid> {
+    tenant_for_new_session(tenant_pin::resolve_tenant_pin())
+}
+
 fn stamp_session_tenant(mut intent: Intent) -> Intent {
     if intent.tenant_id.is_none() {
-        intent.tenant_id = tenant_for_new_session(tenant_pin::resolve_tenant_pin());
+        intent.tenant_id = resolve_new_session_tenant();
     }
     intent
 }

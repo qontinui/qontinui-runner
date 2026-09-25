@@ -29,20 +29,49 @@ const CLONE_SCRUB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 // Setup Status
 // ============================================================================
 
+/// Explicit opt-out of the first-run SetupWizard. Its writer is the
+/// supervisor, which sets it to `1` on Temp runner spawns
+/// (qontinui-supervisor `env_forwarders.rs`, `SETUP_WIZARD_BYPASS_ENV`,
+/// qontinui-supervisor#197). A supervisor built before that sets nothing, and
+/// only the auto-login trigger below applies.
+pub(crate) const SETUP_WIZARD_BYPASS_ENV: &str = "QONTINUI_SETUP_WIZARD_BYPASS";
+
+/// The supervisor's test auto-login variable — the older, implicit bypass.
+pub(crate) const TEST_AUTO_LOGIN_EMAIL_ENV: &str = "QONTINUI_TEST_AUTO_LOGIN_EMAIL";
+
+/// Whether the process environment says to skip the first-run wizard.
+///
+/// Two independent triggers, either is enough:
+///
+/// - `QONTINUI_SETUP_WIZARD_BYPASS=1` — the EXPLICIT flag. It exists because
+///   the implicit one below did not reach every temp runner: a supervisor spawn
+///   on the paired-profile path sets no auto-login email, so its runner opened
+///   the wizard, a full-viewport cover hiding the ConductorStatusStrip and
+///   everything else (plan `2026-09-23-conductor-e2e-phase1-defects`, UI-5).
+///   Only the exact value `1` (surrounding whitespace ignored) bypasses, so
+///   `0`, `false` or an empty value leave the wizard reachable.
+/// - a non-empty `QONTINUI_TEST_AUTO_LOGIN_EMAIL` — the original trigger,
+///   inferred from the credential variable that drives the test auto-login.
+///   Its value is an email, not a flag, so it is deliberately NOT trimmed or
+///   matched: any non-empty value bypasses, exactly as before this flag.
+///
+/// Takes the lookup as a parameter so it is testable without mutating the
+/// process environment, which parallel tests would race.
+fn setup_bypassed_by_env(lookup: impl Fn(&str) -> Option<String>) -> bool {
+    let explicit = lookup(SETUP_WIZARD_BYPASS_ENV).is_some_and(|v| v.trim() == "1");
+    let auto_login = lookup(TEST_AUTO_LOGIN_EMAIL_ENV).is_some_and(|v| !v.is_empty());
+    explicit || auto_login
+}
+
 /// Check if the first-launch setup wizard has been completed.
 ///
-/// Auto-bypass for test runners: when the supervisor forwards
-/// `QONTINUI_TEST_AUTO_LOGIN_EMAIL` (the same env var that drives the
-/// existing test auto-login), report setup as complete regardless of
-/// the persisted settings value. Temp runners always start with a
-/// fresh profile (setup_completed=false) which previously blocked any
-/// route-scoped UI Bridge testing behind the 7-step wizard. Reusing
-/// the supervisor's existing auto-login env var means zero new
-/// configuration on the spawn side — the same plumbing that auto-logs
-/// also auto-skips.
+/// Auto-bypass for test runners: when [`setup_bypassed_by_env`] says so, report
+/// setup as complete regardless of the persisted settings value. Temp runners
+/// always start with a fresh profile (setup_completed=false), which otherwise
+/// blocks any route-scoped UI Bridge testing behind the 7-step wizard.
 ///
-/// Operators running the runner directly never set this env var, so
-/// their wizard behaviour is unchanged.
+/// Operators running the runner directly set neither variable, so their
+/// wizard behaviour is unchanged.
 ///
 /// **Reaching the wizard on a runner this bypassed** — the previous version of
 /// this comment offered the `setup-wizard` UI Bridge component's `complete`
@@ -57,17 +86,13 @@ const CLONE_SCRUB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 ///    and is therefore live regardless of mount state, and `go-to-step` OPENS
 ///    the wizard. Non-destructive: it flips in-memory view state only, leaving
 ///    the persisted `setup_completed` alone.
-/// 2. Spawn the runner with the var cleared —
-///    `extra_env: { "QONTINUI_TEST_AUTO_LOGIN_EMAIL": "" }` — which is why the
-///    `.filter(|v| !v.is_empty())` below matters: an empty value does NOT
-///    bypass.
+/// 2. Spawn the runner with BOTH triggers off —
+///    `extra_env: { "QONTINUI_SETUP_WIZARD_BYPASS": "", "QONTINUI_TEST_AUTO_LOGIN_EMAIL": "" }`.
+///    For the flag, `""` and `"0"` both work (anything but `1` does); for the
+///    email only `""` does.
 #[tauri::command]
 pub fn check_setup_completed() -> Result<bool, String> {
-    if std::env::var("QONTINUI_TEST_AUTO_LOGIN_EMAIL")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .is_some()
-    {
+    if setup_bypassed_by_env(|name| std::env::var(name).ok()) {
         return Ok(true);
     }
     Ok(settings::get_setup_completed())
@@ -1687,6 +1712,62 @@ pub fn save_dev_services_from_setup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lookup over a fixed table — never the real process env.
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |name| {
+            owned
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        }
+    }
+
+    #[test]
+    fn setup_wizard_bypass_flag_marks_setup_complete() {
+        // UI-5: the paired-profile temp spawn carries the explicit flag and no
+        // auto-login email — it must still skip the wizard.
+        assert!(setup_bypassed_by_env(env_of(&[(
+            SETUP_WIZARD_BYPASS_ENV,
+            "1"
+        )])));
+        assert!(setup_bypassed_by_env(env_of(&[(
+            SETUP_WIZARD_BYPASS_ENV,
+            " 1\n"
+        )])));
+    }
+
+    #[test]
+    fn setup_wizard_bypass_flag_other_values_do_not_bypass() {
+        for value in ["", "0", "false", "true", "yes"] {
+            assert!(
+                !setup_bypassed_by_env(env_of(&[(SETUP_WIZARD_BYPASS_ENV, value)])),
+                "{SETUP_WIZARD_BYPASS_ENV}={value:?} must not bypass"
+            );
+        }
+    }
+
+    #[test]
+    fn setup_wizard_auto_login_email_still_bypasses() {
+        assert!(setup_bypassed_by_env(env_of(&[(
+            TEST_AUTO_LOGIN_EMAIL_ENV,
+            "operator@example.com"
+        )])));
+        // The documented escape hatch: an empty value does not bypass.
+        assert!(!setup_bypassed_by_env(env_of(&[(
+            TEST_AUTO_LOGIN_EMAIL_ENV,
+            ""
+        )])));
+    }
+
+    #[test]
+    fn setup_wizard_not_bypassed_on_a_plain_operator_env() {
+        assert!(!setup_bypassed_by_env(env_of(&[])));
+    }
 
     /// Whole nonce lifecycle in ONE test fn: the pending-flow slot is a global,
     /// so parallel test fns would race it (see the fleet note on global-state

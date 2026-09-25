@@ -45,6 +45,18 @@ describe("computeStatusCounts", () => {
     expect(counts.claudeSessionCount).toBe(2);
   });
 
+  it("carries the active-external share of working separately", () => {
+    // The strip headlines the page-scoped working count, so the external share
+    // must be recoverable from the counts rather than folded in (UI-4).
+    const counts = computeStatusCounts([
+      s("active-in-zone"),
+      s("active-external"),
+      s("active-external"),
+    ]);
+    expect(counts.workingCount).toBe(3);
+    expect(counts.externalWorkingCount).toBe(2);
+  });
+
   it("counts needs-input toward need-input and the total", () => {
     const counts = computeStatusCounts([s("needs-input")]);
     // needs-input survives the dormant/orphan filter → contributes to the total
@@ -91,6 +103,7 @@ describe("computeStatusCounts", () => {
     expect(counts).toEqual({
       claudeSessionCount: 0,
       workingCount: 0,
+      externalWorkingCount: 0,
       idleCount: 0,
       completedCount: 0,
       errorCount: 0,

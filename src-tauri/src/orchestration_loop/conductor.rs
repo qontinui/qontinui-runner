@@ -20,8 +20,10 @@
 //!    [`crate::orchestration_loop::ai_session_executor::dispatch_subtask`].
 //! 4. **reconcile** — poll each in-flight worker's FSM signal (Phase-2
 //!    `worker_terminal_state`); flip `Working → Completed` ONLY when the §5
-//!    guard [`can_complete`] holds (`ReadyIdle` AND `artifact.is_some()`); flip
-//!    `Working → Failed` on `Errored`/`Gone`-past-budget/stall-past-budget.
+//!    guard [`can_complete`] holds (`ReadyIdle` AND `artifact.is_some()`), or
+//!    when a `Gone` worker's report already landed (a restart between the
+//!    report and the idle signal); flip `Working → Failed` on
+//!    `Errored`/`Gone`-past-budget/stall-past-budget.
 //! 5. **post-Ready-without-artifact recovery** — a worker that is `ReadyIdle`
 //!    but has no artifact after a per-subtask timeout is re-prompted ONCE (the
 //!    only place a live session is re-prompted); still no artifact after a
@@ -98,7 +100,13 @@ use crate::database::pg::PgDb;
 
 /// Runtime knobs for a conductor run. Runner-local (not a wire DTO); sensible
 /// conservative defaults so a bare `/orchestrate` works without tuning.
-#[derive(Debug, Clone)]
+///
+/// Serialized into `orchestration.runs.config` at create so the boot sweep
+/// relaunches a run at the knobs it was started with. `#[serde(default)]`
+/// fills any field a stored config lacks (a knob added after the row was
+/// written) from [`Default`] rather than refusing the row.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct OrchestrationRunConfig {
     /// Seconds between reconciler ticks.
     pub tick_interval_secs: u64,
@@ -188,6 +196,10 @@ pub struct OrchestrationRunConfig {
     /// value, deliberately re-read each tick rather than carried, so a user
     /// changing the bound in the web settings page takes effect within about a
     /// registry TTL without restarting the run.
+    ///
+    /// Never persisted (`#[serde(skip)]`): it is a per-tick cache of a coord
+    /// value, and a relaunch re-reads it like the first tick of any run.
+    #[serde(skip)]
     pub fanout_bound: Option<u32>,
 }
 
@@ -945,8 +957,15 @@ pub fn compute_tick<S: SignalSource>(
         };
         let sig = signals.signal(trid);
 
-        // §5 guard — complete ONLY when ReadyIdle AND artifact present.
-        if can_complete(st, sig) {
+        // §5 guard — complete ONLY when ReadyIdle AND artifact present. A
+        // `Gone` worker whose report already landed completes the same way:
+        // the report IS the completion, and the only thing lost with the
+        // process is the idle signal. This is how a restart settles a worker
+        // that reported just before the runner died — the boot sweep leaves
+        // such rows `working` so they come through here, where a drift-verify
+        // row still has its verdict read and an elaborator still harvests
+        // before it completes.
+        if can_complete(st, sig) || (sig == WorkerSignal::Gone && st.artifact.is_some()) {
             // Phase 6: a DriftVerdict VERIFY subtask does not complete blindly —
             // its job is to surface the Digital-Twin verdict. Route it to the
             // verify path (`apply_tick` reads the verdict and either completes it
@@ -2406,6 +2425,19 @@ pub async fn run_orchestration<D: Dispatcher, S: SignalSource, G: CoordGateClien
     loop {
         if *stop_rx.borrow() {
             info!("conductor: run {run_id} stopped by signal");
+            // Record the stop HERE, not only at the door that sent it:
+            // `stop_all_loops` and `stop_loop_by_id` signal this loop and write
+            // nothing, and a row left `running` is one the boot sweep
+            // relaunches on the next start (Phase 2 of
+            // `2026-09-23-conductor-e2e-phase1-defects`). Conditional, so a
+            // terminal verdict already written — or `stop_orchestration_run`'s
+            // own identical write — is never overwritten.
+            if let Err(e) = pg
+                .set_run_status_if_running(run_id, "stopped", Some("stop requested"))
+                .await
+            {
+                warn!("conductor: run {run_id} could not record its stop: {e}");
+            }
             let mut st = loop_state.lock().await;
             st.phase = LoopPhase::Stopped;
             st.running = false;
@@ -2944,6 +2976,41 @@ mod tests {
         assert!(p0.to_fail.is_empty(), "gone tolerated within grace");
         let p1 = compute_tick(&rows, &signals, &mut timers, &c, c.gone_grace_secs);
         assert_eq!(p1.to_fail, vec!["A".to_string()], "gone-past-grace fails");
+    }
+
+    /// A worker that reported and then vanished (the runner restarted between
+    /// the report and the idle signal) completes on the FIRST tick, through
+    /// the same path as `ReadyIdle` + artifact — never failed after grace.
+    #[test]
+    fn a_gone_worker_whose_report_landed_completes_at_once() {
+        let trid = Uuid::new_v4();
+        let mut w = mk("A", 0, &[], SubtaskState::Working);
+        w.task_run_id = Some(trid);
+        w.artifact = Some(report());
+        let rows = vec![w];
+        let signals = FakeSignals(Map::new()); // unknown ⇒ Gone
+        let mut timers = ReadyIdleTimers::default();
+        let plan = compute_tick(&rows, &signals, &mut timers, &cfg(), 0);
+        assert_eq!(plan.to_complete, vec!["A".to_string()]);
+        assert!(plan.to_fail.is_empty());
+    }
+
+    /// ...and a drift-verify row in that state still has its verdict read
+    /// before it may complete.
+    #[test]
+    fn a_gone_drift_verify_with_a_report_is_still_diverted() {
+        let trid = Uuid::new_v4();
+        let mut v = mk("verify", 0, &[], SubtaskState::Working);
+        v.expected_output = "DriftVerdict shows no drift".to_string();
+        v.task_run_id = Some(trid);
+        v.artifact = Some(report());
+        let rows = vec![v];
+        let signals = FakeSignals(Map::new()); // unknown ⇒ Gone
+        let mut timers = ReadyIdleTimers::default();
+        let plan = compute_tick(&rows, &signals, &mut timers, &cfg(), 0);
+        assert_eq!(plan.to_verify_drift, vec!["verify".to_string()]);
+        assert!(plan.to_complete.is_empty());
+        assert!(plan.to_fail.is_empty());
     }
 
     // --- KILL + RESTART RESUME (statelessness proof) ----------------------

@@ -91,9 +91,11 @@ export function tenantBadgeLabel(
       `TENANT MISMATCH — this session does not act as one tenant.`,
       `Spawned for: ${
         stamped ??
-        (tenancy.row.spawnDeviceDefaultTenantId
-          ? `no choice (device default at spawn: ${tenancy.row.spawnDeviceDefaultTenantId})`
-          : "not recorded")
+        (tenancy.row.spawnDeviceDefaultStatus === "recorded"
+          ? `no choice (device default at spawn: ${tenancy.row.spawnDeviceDefaultTenantId ?? "none"})`
+          : `no choice (device default at spawn not recorded: ${
+              tenancy.row.spawnDeviceDefaultReason ?? "no reason given"
+            })`)
       }`,
       `Runner writes: ${tenancy.dataPlane.tenantId ?? tenancy.dataPlane.status}`,
       `coord-mcp writes (memory, prompt documents, gates): ${
@@ -116,9 +118,15 @@ export function tenantBadgeLabel(
       credentialUnknown: true,
     };
   }
+  // `diverged: false` alone is not agreement: a comparison with an unknown
+  // half says so rather than lending the plain label a confirmation.
+  const unconfirmed =
+    tenancy && tenancy.divergence === "unknown"
+      ? ` Whether its coord-mcp writes go to the same tenant could not be compared.`
+      : "";
   return {
     text: stem(acting),
-    title: `This session is acting as tenant ${acting}. ${fixed}`,
+    title: `This session is acting as tenant ${acting}.${unconfirmed} ${fixed}`,
     diverged: false,
     credentialUnknown: false,
   };

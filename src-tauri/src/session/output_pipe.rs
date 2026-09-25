@@ -5,9 +5,14 @@
 //!
 //! ## When it runs
 //!
-//! Only when the session's [`Intent::share_output`] is `true`. Off by
-//! default: a session that didn't opt in pays **zero overhead** — no task
-//! is spawned, no receiver is subscribed, no bytes leave the machine.
+//! Only when the session's [`Intent::share_output`] is `true`. Default
+//! `true` as of plan
+//! `2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls`
+//! §3.5 (ship-on with a reachable off-switch, per `engineering-priorities`
+//! `capability-ships-enabled`) — a session that explicitly opts out (or an
+//! Intent body that carried an explicit `false` before the flip) still pays
+//! **zero overhead**: no task is spawned, no receiver is subscribed, no
+//! bytes leave the machine.
 //!
 //! ## What it does
 //!

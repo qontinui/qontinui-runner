@@ -63,7 +63,9 @@ import { MinimapToggle } from "./MinimapToggle";
 import {
   countLiveTabs,
   countTabsInState,
+  formatWorking,
   splitNeedsInput,
+  splitWorking,
   unionErrorCount,
   unionSessionCount,
 } from "./sessionCounts";
@@ -185,10 +187,16 @@ export function StatusStrip() {
     claudeSessionCount,
     needsInputCount: claudeNeedsInputCount,
     errorCount: sessionErrorCount,
-    workingCount,
+    workingCount: totalWorkingCount,
+    externalWorkingCount,
     completedCount,
     idleCount,
   } = sessionManager;
+
+  // See {@link splitWorking} — the strip is the Terminal PAGE's status, so the
+  // headline working count is page-scoped and running `active-external`
+  // sessions (other `claude` processes, no tab here) read as `+M external`.
+  const workingText = formatWorking(splitWorking(totalWorkingCount, externalWorkingCount));
 
   // See {@link unionErrorCount} — the pill must not read 0 while the page is
   // painting a dead PTY tab red and `focusNextError` can cycle to it.
@@ -258,7 +266,7 @@ export function StatusStrip() {
   // context ZSB used to. The attention-pills above keep their bright
   // colors; these new pills render in muted shades so they don't
   // compete visually with "needs attention" signals.
-  const hasBreakdown = workingCount > 0 || completedCount > 0 || idleCount > 0;
+  const hasBreakdown = workingText !== null || completedCount > 0 || idleCount > 0;
 
   // Auto-hide gate — when nothing requires attention AND nothing
   // informational is worth showing either, the strip disappears
@@ -486,14 +494,14 @@ export function StatusStrip() {
           className="flex items-center gap-2 px-1.5 py-0.5 text-[10px] leading-none whitespace-nowrap text-[#565f89]"
           title="Session state breakdown"
         >
-          {workingCount > 0 && (
+          {workingText !== null && (
             <span className="flex items-center gap-1" style={{ color: STATE_COLORS.working }}>
               <span
                 className="w-1.5 h-1.5 rounded-full"
                 style={{ backgroundColor: STATE_COLORS.working }}
                 aria-hidden
               />
-              {workingCount} working
+              {workingText}
             </span>
           )}
           {completedCount > 0 && (

@@ -637,6 +637,84 @@ pub struct SkippedFile {
     pub reason: &'static str,
 }
 
+/// Skip reasons that mean a WHOLE root contributed nothing because it could
+/// not be read — as opposed to a root that was read and held no plans.
+///
+/// `unreadable_dir` is the work-tree walk's; `unreadable_ref` and
+/// `scan_source_unavailable` are the ref arm's
+/// (`super::trigger::scan_roots_at_source`). Each is recorded at the root's own
+/// path, which is how [`root_dark_reason`] tells it from a per-file skip.
+pub const DARK_ROOT_REASONS: [&str; 3] = [
+    "unreadable_dir",
+    "unreadable_ref",
+    "scan_source_unavailable",
+];
+
+/// The reason `root_dir` contributed nothing, if a root-level dark skip was
+/// recorded for it; `None` when the root was read (even if it held nothing).
+pub fn root_dark_reason(root_dir: &Path, skipped: &[SkippedFile]) -> Option<&'static str> {
+    let at = root_dir.to_string_lossy();
+    skipped
+        .iter()
+        .find(|s| s.path == at && DARK_ROOT_REASONS.contains(&s.reason))
+        .map(|s| s.reason)
+}
+
+/// Skip reasons that mean SOME of a root could not be read: an entry the
+/// listing lost (`unreadable_entry`, recorded at the root) or a file whose
+/// bytes would not read (`unreadable_file`). Both arms record both.
+pub const PARTIAL_ROOT_REASONS: [&str; 2] = ["unreadable_entry", "unreadable_file"];
+
+/// How many artifacts one root yielded — or that it could not be read at all.
+///
+/// A dark root is NOT a root with zero plans, and a partly read root's count
+/// is a floor, not a total; the dry-run table must render neither as a plain
+/// number [policy: `unknown-must-not-render-as-a-default`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootYield {
+    /// Read whole: the count is the root's total.
+    Read(usize),
+    /// Read in part: `read` were published and `unreadable` skips were
+    /// recorded (an `unreadable_entry` counts once — it cannot say how many
+    /// entries it lost).
+    Partial { read: usize, unreadable: usize },
+    /// Not read at all, for this reason.
+    Dark(&'static str),
+}
+
+impl RootYield {
+    /// Classify one root from what its scan produced. `skipped` must hold
+    /// only this root's skips, as `scan_roots_at_source` over one root does.
+    pub fn of(root_dir: &Path, found: usize, skipped: &[SkippedFile]) -> Self {
+        if let Some(reason) = root_dark_reason(root_dir, skipped) {
+            return RootYield::Dark(reason);
+        }
+        match skipped
+            .iter()
+            .filter(|s| PARTIAL_ROOT_REASONS.contains(&s.reason))
+            .count()
+        {
+            0 => RootYield::Read(found),
+            unreadable => RootYield::Partial {
+                read: found,
+                unreadable,
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for RootYield {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RootYield::Read(n) => write!(f, "{n}"),
+            RootYield::Partial { read, unreadable } => {
+                write!(f, "{read}+ (PARTIAL: {unreadable} unreadable)")
+            }
+            RootYield::Dark(reason) => write!(f, "UNKNOWN ({reason})"),
+        }
+    }
+}
+
 /// One root's depth-1 entries, split the way [`scan_one_root`] splits them.
 ///
 /// Every list is sorted: `read_dir` order is filesystem-dependent, and a
@@ -872,8 +950,11 @@ where
 }
 
 /// Read + classify every `*.md` in one root (non-recursive, matching the flat
-/// layout [`super::trigger::read_plan_dir`] already assumes). A missing dir
-/// yields nothing; per-file IO errors are collected, never fatal.
+/// layout [`super::trigger::read_plan_dir`] already assumes). A dir that will
+/// not read — a missing one included, since roots come only from explicit
+/// configuration — yields nothing and records `unreadable_dir`, which the
+/// dry-run table renders as UNKNOWN; per-file IO errors are collected, never
+/// fatal.
 pub fn scan_one_root(
     root: &ScanRoot,
     conv: &PlanConvention,
@@ -1070,7 +1151,7 @@ pub struct DivergentStem {
 pub struct BackfillReport {
     pub scanned: usize,
     pub per_kind: Vec<(ArtifactKind, usize)>,
-    pub per_root: Vec<(String, usize)>,
+    pub per_root: Vec<(String, RootYield)>,
     pub skipped: Vec<SkippedFile>,
     /// Stems present in more than one root, divergent copies first.
     pub duplicate_stems: Vec<DivergentStem>,
@@ -1082,13 +1163,35 @@ impl BackfillReport {
     pub fn divergent_count(&self) -> usize {
         self.duplicate_stems.iter().filter(|d| d.differs).count()
     }
+
+    /// `(dark, partial)`: roots not read at all, and roots read only in part.
+    /// Either being non-zero makes every corpus-wide count in the report a
+    /// floor rather than a total.
+    pub fn incomplete_roots(&self) -> (usize, usize) {
+        let dark = self
+            .per_root
+            .iter()
+            .filter(|(_, n)| matches!(n, RootYield::Dark(_)))
+            .count();
+        let partial = self
+            .per_root
+            .iter()
+            .filter(|(_, n)| matches!(n, RootYield::Partial { .. }))
+            .count();
+        (dark, partial)
+    }
+
+    /// `true` when every root was read whole, so the report's counts are totals.
+    pub fn is_complete(&self) -> bool {
+        self.incomplete_roots() == (0, 0)
+    }
 }
 
 /// Build the dry-run report from a scan. Pure — no HTTP, no clock.
 pub fn build_report(
     artifacts: &[ScannedArtifact],
     skipped: Vec<SkippedFile>,
-    per_root: Vec<(String, usize)>,
+    per_root: Vec<(String, RootYield)>,
 ) -> BackfillReport {
     let mut per_kind: Vec<(ArtifactKind, usize)> = ArtifactKind::ALL
         .iter()
@@ -1150,23 +1253,53 @@ pub fn build_report(
 pub fn render_report(report: &BackfillReport) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
-    let _ = writeln!(s, "scanned: {}", report.scanned);
+    let (dark, partial) = report.incomplete_roots();
+    // The grand total is a total only when every root was read whole. With a
+    // dark or partly read root it is a floor, and must say so rather than
+    // keep the confidence the by-root table below withholds.
+    if dark + partial > 0 {
+        let _ = writeln!(
+            s,
+            "scanned: {}+ (a floor: {dark} root(s) unread, {partial} read in part)",
+            report.scanned
+        );
+    } else {
+        let _ = writeln!(s, "scanned: {}", report.scanned);
+    }
     let _ = writeln!(s, "\nby root:");
     for (label, n) in &report.per_root {
         let _ = writeln!(s, "  {label:<16} {n}");
     }
-    let _ = writeln!(s, "\nby kind:");
+    if dark > 0 {
+        let _ = writeln!(
+            s,
+            "  {dark} root(s) could not be read: their plans are UNKNOWN, not absent"
+        );
+    }
+    if partial > 0 {
+        let _ = writeln!(
+            s,
+            "  {partial} root(s) read in part: their counts are floors, not totals"
+        );
+    }
+    // Every count below sums over the same incomplete set as `scanned`.
+    let floors = if dark + partial > 0 {
+        " (floors: not every root was read)"
+    } else {
+        ""
+    };
+    let _ = writeln!(s, "\nby kind:{floors}");
     for (kind, n) in &report.per_kind {
         let _ = writeln!(s, "  {:<22} {}", kind.as_str(), n);
     }
     let _ = writeln!(
         s,
-        "\nwith Repo(s): {}   with Depends-On: {}",
+        "\nwith Repo(s): {}   with Depends-On: {}{floors}",
         report.with_repos, report.with_depends_on
     );
     let _ = writeln!(
         s,
-        "\nduplicate stems: {} ({} DIVERGENT by content)",
+        "\nduplicate stems: {} ({} DIVERGENT by content){floors}",
         report.duplicate_stems.len(),
         report.divergent_count()
     );
@@ -1892,7 +2025,7 @@ fn cap_chars(value: Option<String>, max: usize) -> Option<String> {
 // ----------------------------------------------------------------------------
 
 /// The `ref` side: the stems the adapter's WORK-UNIT half lists at the fetched
-/// default branch ([`super::ref_scan::read_ref_dir`]).
+/// default branch ([`super::ref_scan::read_ref_dir_at`]).
 pub const SLUG_CENSUS_SOURCE_REF: &str = "ref";
 
 /// The `work_tree` side: the stems the BODY SYNC's own walk sees on disk
@@ -4084,8 +4217,135 @@ mod tests {
         assert!(subdir[0].path.ends_with("2026-q3"));
 
         // And it reaches the operator-facing report.
-        let report = build_report(&found, skipped, vec![("plans".into(), 1)]);
+        let report = build_report(&found, skipped, vec![("plans".into(), RootYield::Read(1))]);
         assert!(render_report(&report).contains("subdirectory_not_scanned"));
+    }
+
+    /// A root that could not be read renders as UNKNOWN in the by-root table,
+    /// never as `0` — and only a ROOT-LEVEL dark skip makes it so. A per-file
+    /// `unreadable_file`, or a root-level `unreadable_entry`, is a PARTIAL
+    /// read, and its count renders as a floor.
+    ///
+    /// Neuter check: make `root_dark_reason` return `None` and the first
+    /// assertion fails; drop the path equality and the per-file case fails.
+    #[test]
+    fn a_dark_root_renders_unknown_not_zero() {
+        let root = Path::new("/plans");
+        let sk = |path: &str, reason: &'static str| SkippedFile {
+            path: path.to_string(),
+            reason,
+        };
+        for reason in DARK_ROOT_REASONS {
+            let root_path = root.to_string_lossy().to_string();
+            assert_eq!(
+                root_dark_reason(root, &[sk(&root_path, reason)]),
+                Some(reason)
+            );
+        }
+        let file = root.join("2026-01-01-x.md").to_string_lossy().to_string();
+        assert_eq!(
+            root_dark_reason(root, &[sk(&file, "unreadable_file")]),
+            None
+        );
+        assert_eq!(
+            root_dark_reason(root, &[sk(&root.to_string_lossy(), "unreadable_entry")]),
+            None,
+            "a partial read is still a reading"
+        );
+        assert_eq!(
+            root_dark_reason(
+                Path::new("/other"),
+                &[sk(&root.to_string_lossy(), "unreadable_ref")]
+            ),
+            None,
+            "another root's darkness is not this one's"
+        );
+
+        let report = build_report(
+            &[],
+            vec![sk(&root.to_string_lossy(), "unreadable_ref")],
+            vec![
+                ("plans".into(), RootYield::Dark("unreadable_ref")),
+                ("prompts".into(), RootYield::Read(0)),
+                (
+                    "archive".into(),
+                    RootYield::Partial {
+                        read: 4,
+                        unreadable: 1,
+                    },
+                ),
+            ],
+        );
+        let text = render_report(&report);
+        assert!(text.contains("UNKNOWN (unreadable_ref)"), "{text}");
+        assert!(text.contains("1 root(s) could not be read"), "{text}");
+        assert!(text.contains("4+ (PARTIAL: 1 unreadable)"), "{text}");
+        assert!(text.contains("1 root(s) read in part"), "{text}");
+        // The grand total counts `artifacts` (none here), not `per_root`; what
+        // is pinned is that it is marked a floor, as is every sum below it.
+        assert!(
+            text.starts_with("scanned: 0+ (a floor: 1 root(s) unread, 1 read in part)\n"),
+            "the grand total is a floor too: {text}"
+        );
+        assert!(
+            text.contains("by kind: (floors: not every root was read)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("with Depends-On: 0 (floors: not every root was read)"),
+            "{text}"
+        );
+        // A copy of a stem in an unread root is invisible, so the duplicate
+        // and divergent counts are floors too.
+        assert!(
+            text.contains("DIVERGENT by content) (floors: not every root was read)"),
+            "{text}"
+        );
+        assert!(!report.is_complete());
+        assert_eq!(report.incomplete_roots(), (1, 1));
+        // A PARTLY read root is a floor, not a total — including the case
+        // `collect_listing`'s doc calls a fabricated zero (every entry lost).
+        let root_path = root.to_string_lossy().to_string();
+        assert_eq!(
+            RootYield::of(root, 0, &[sk(&root_path, "unreadable_entry")]),
+            RootYield::Partial {
+                read: 0,
+                unreadable: 1
+            }
+        );
+        assert_eq!(
+            RootYield::of(root, 2, &[sk(&file, "unreadable_file")]),
+            RootYield::Partial {
+                read: 2,
+                unreadable: 1
+            }
+        );
+        assert_eq!(
+            RootYield::of(root, 0, &[sk(&root_path, "unreadable_ref")]),
+            RootYield::Dark("unreadable_ref"),
+            "dark outranks partial"
+        );
+        assert_eq!(
+            RootYield::of(root, 3, &[sk(&file, "subdirectory_not_scanned")]),
+            RootYield::Read(3),
+            "a skip that is not a read failure leaves the count a total"
+        );
+        assert_eq!(
+            RootYield::Partial {
+                read: 0,
+                unreadable: 1
+            }
+            .to_string(),
+            "0+ (PARTIAL: 1 unreadable)"
+        );
+
+        let clean = build_report(&[], vec![], vec![("plans".into(), RootYield::Read(0))]);
+        let clean_text = render_report(&clean);
+        assert!(!clean_text.contains("could not be read"), "{clean_text}");
+        assert!(!clean_text.contains("read in part"), "{clean_text}");
+        assert!(clean_text.starts_with("scanned: 0\n"), "{clean_text}");
+        assert!(!clean_text.contains("floors"), "{clean_text}");
+        assert!(clean.is_complete());
     }
 
     /// The marker match is case-insensitive without allocating a lowercase copy
@@ -4133,7 +4393,14 @@ mod tests {
             ScanRoot::new(&b_dir, ScanRootKind::Plans, "b"),
         ];
         let (artifacts, skipped) = scan_all_roots(&roots, &PlanConvention::operator_default());
-        let report = build_report(&artifacts, skipped, vec![("a".into(), 2), ("b".into(), 2)]);
+        let report = build_report(
+            &artifacts,
+            skipped,
+            vec![
+                ("a".into(), RootYield::Read(2)),
+                ("b".into(), RootYield::Read(2)),
+            ],
+        );
 
         assert_eq!(report.scanned, 4);
         assert_eq!(report.duplicate_stems.len(), 2);

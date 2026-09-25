@@ -324,9 +324,10 @@ function ZoneGridInner({
   const prevLayoutIdRef = useRef(layout.id);
 
   // Flow-grid mode (past-9 synthesized scrolling grid): uniform tiles, no
-  // resize handles, no per-layout ratio persistence — the row count changes on
-  // every tab open/close, which would otherwise thrash the `zone-*-ratios-*`
-  // storage keyed on `layout.id`. All ratio machinery below is skipped here.
+  // resize handles, no per-layout ratio persistence — the row count follows
+  // `flowGridSlotCount` as tabs open and close, which would otherwise thrash
+  // the `zone-*-ratios-*` storage keyed on `layout.id`. All ratio machinery
+  // below is skipped here.
   const isFlowMode = layout.id === FLOW_GRID_ID;
 
   // Flow-grid virtualization (Phase 3): observe each zone cell against the

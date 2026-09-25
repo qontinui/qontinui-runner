@@ -14,7 +14,9 @@ import { describe, expect, it } from "vitest";
 import {
   countLiveTabs,
   countTabsInState,
+  formatWorking,
   splitNeedsInput,
+  splitWorking,
   unionErrorCount,
   unionSessionCount,
   windowTitleCounts,
@@ -142,5 +144,26 @@ describe("windowTitleCounts", () => {
 
   it("returns zeros for absent inputs", () => {
     expect(windowTitleCounts(undefined, undefined)).toEqual({ needsInputCount: 0, errorCount: 0 });
+  });
+});
+
+describe("splitWorking / formatWorking", () => {
+  it("scopes the headline to this page and reports external apart — THE DEFECT", () => {
+    const split = splitWorking(5, 4);
+    expect(split).toEqual({ page: 1, external: 4 });
+    expect(formatWorking(split)).toBe("1 working +4 external");
+  });
+
+  it("omits the suffix when nothing runs externally", () => {
+    expect(formatWorking(splitWorking(2, 0))).toBe("2 working");
+  });
+
+  it("is null when nothing is working anywhere", () => {
+    expect(formatWorking(splitWorking(0, 0))).toBeNull();
+  });
+
+  it("never renders a negative page count from an inconsistent pair", () => {
+    expect(splitWorking(1, 3)).toEqual({ page: 0, external: 1 });
+    expect(splitWorking(2, -1)).toEqual({ page: 2, external: 0 });
   });
 });

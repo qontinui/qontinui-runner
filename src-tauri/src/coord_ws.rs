@@ -8,10 +8,17 @@
 //! normalization and connect with a bare `?pattern=<redis glob>` and no
 //! credential. Plan
 //! `2026-09-13-coord-publishes-agent-jwts-on-a-redis-channel-fronted-by-an-unauthenticated-ws-firehose`
-//! Phase 2 closed that: coord now requires a device JWT at the upgrade and
-//! replaced the caller-supplied glob with a CLOSED set of named
-//! subscriptions, each mapped server-side to the pattern the TOKEN's
-//! principal is entitled to. `?pattern=` is refused 400 by that coord.
+//! Phase 2 closed that: every lane presents a device JWT and names one of
+//! coord's CLOSED set of subscriptions (`?subscribe=<name>`), which coord maps
+//! server-side to the pattern the TOKEN's principal is entitled to
+//! (qontinui-coord `crates/coord/src/ws.rs`, `resolve_subscription`). A
+//! `?subscribe=` upgrade with NO token is refused 403
+//! `subscription_scope_required`; a token that is present but bad is refused
+//! as a credential failure, never downgraded to anonymous. `?pattern=` is no
+//! longer how the scope is chosen: alongside a token it only narrows the
+//! principal's entitlement, and WITHOUT one it is admitted only inside a
+//! legacy allowlist (`anonymous_entitlement`) and refused 403
+//! `pattern_out_of_scope` outside it. This module never sends `?pattern=`.
 //!
 //! This module is the single place that knows both halves:
 //!
@@ -346,7 +353,8 @@ pub(crate) fn build_upgrade_request(
         warn!(
             "{lane}: no device JWT available for the coord /ws upgrade (unpaired runner, \
              empty credential slot, or unreadable secure storage) — connecting WITHOUT a \
-             credential; a coord that requires one will refuse the upgrade 401"
+             credential; coord refuses a tokenless `?subscribe=` upgrade 403 \
+             subscription_scope_required"
         );
     }
     upgrade_request_with(ws_url, token.as_deref())
@@ -376,9 +384,11 @@ fn upgrade_request_with(
 }
 
 /// Name an upgrade refusal so a 401/403 flap is diagnosable from the log: the
-/// HTTP status plus the `error` field of coord's JSON refusal body (coord's
-/// refusals are `{"error": "<code>", …}`). Only the code is logged, never the
-/// request — the URL carries the token.
+/// HTTP status plus both halves of coord's JSON refusal body. Coord's refusals
+/// are `{"error": "<message>", "code": "<code>", …}`: `code=` is the machine
+/// code the hints below name (`subscription_scope_required`, …) and `error=` is
+/// the human-readable message that says which case of a hint applies. Never
+/// the request — the URL carries the token.
 ///
 /// `pub(crate)`, not `pub`: [`connect`] is the only caller and the only way a
 /// lane obtains one of these errors, so a `pub` spelling advertised an entry
@@ -394,35 +404,51 @@ pub(crate) fn log_upgrade_failure(lane: &str, e: &tungstenite::Error) {
                 .unwrap_or_default();
             let hint = match status {
                 400 => {
-                    " — coord refused the request shape; a `?pattern=` query is no longer \
-                        accepted (this build sends `?subscribe=`, so check for a proxy rewrite)"
+                    " — the upgrade request itself was rejected before coord's /ws handler \
+                        answered (coord's scope refusals are 403, not 400); check for a proxy \
+                        rewrite of the URL"
                 }
                 401 => {
-                    " — coord requires a device JWT on the upgrade and none was accepted \
-                        (unpaired runner, expired credential, or revoked device)"
+                    " — a device JWT was presented and rejected (expired, from another coord, \
+                        bad signature or otherwise invalid, revoked, or coord holding no keys; \
+                        the error message says which); a MISSING JWT is refused 403 instead"
                 }
                 403 => {
-                    " — the credential was accepted but this subscription is not admitted \
-                        for its principal"
+                    " — not admitted: no credential was sent (coord code \
+                        subscription_scope_required), the credential verified but is a \
+                        capability grant rather than a principal, or the principal cannot \
+                        resolve this subscription"
                 }
                 _ => "",
             };
             warn!(
-                "{lane}: coord /ws upgrade refused status={status} error={}{hint}",
+                "{lane}: coord /ws upgrade refused status={status} code={} error={}{hint}",
                 refusal_error_code(&body).as_deref().unwrap_or("<none>"),
+                refusal_field(&body, "error").as_deref().unwrap_or("<none>"),
             );
         }
         other => warn!("{lane}: coord /ws upgrade failed before any response: {other}"),
     }
 }
 
-/// The `error` field of a coord refusal body, when the body is a JSON object
-/// carrying one. `None` for an empty body, a non-JSON body (an ALB or proxy
-/// page), or a JSON body with no string `error`.
+/// The machine code of a coord refusal body. Coord's credential refusals
+/// (`auth.rs` `Refusal`) carry it as `"code"` beside a human-readable
+/// `"error"` message; older refusals carry the code AS `"error"` and send no
+/// `"code"`. So `"code"` wins and `"error"` is the fallback — a caller that
+/// branches on the result (`agent_not_found`, …) matches either shape, and
+/// never compares a code against a sentence. `None` for an empty body, a
+/// non-JSON body (an ALB or proxy page), or a JSON body with neither string
+/// field.
 pub fn refusal_error_code(body: &str) -> Option<String> {
+    refusal_field(body, "code").or_else(|| refusal_field(body, "error"))
+}
+
+/// One string field of a JSON refusal body; `None` when the body is not a
+/// JSON object or the field is absent or not a string.
+fn refusal_field(body: &str, key: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()?
-        .get("error")?
+        .get(key)?
         .as_str()
         .map(str::to_owned)
 }
@@ -662,7 +688,22 @@ mod tests {
     }
 
     #[test]
-    fn refusal_error_code_reads_only_a_string_error_field() {
+    fn refusal_error_code_prefers_code_over_the_error_message() {
+        let body = r#"{"error":"missing ?token= query param","code":"missing_token"}"#;
+        assert_eq!(refusal_error_code(body).as_deref(), Some("missing_token"));
+        assert_eq!(
+            refusal_field(body, "error").as_deref(),
+            Some("missing ?token= query param")
+        );
+        // A non-string `code` is not a code; the `error` fallback still applies.
+        assert_eq!(
+            refusal_error_code(r#"{"error":"agent_not_found","code":7}"#).as_deref(),
+            Some("agent_not_found")
+        );
+    }
+
+    #[test]
+    fn refusal_error_code_falls_back_to_a_string_error_field() {
         assert_eq!(
             refusal_error_code(r#"{"error":"pattern_removed","hint":"use ?subscribe="}"#)
                 .as_deref(),

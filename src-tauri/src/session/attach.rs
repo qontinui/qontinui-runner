@@ -6,9 +6,12 @@
 //!
 //! 1. **Push** — an `attach_request` directive on
 //!    `qontinui.sessions.<tenant>.<target-device>.attach_request`, i.e. the
-//!    subject family [`super::handoff`] already PSUBSCRIBEs as
-//!    `qontinui.sessions.*`. This module adds no second socket:
-//!    [`super::handoff::connect_and_pump`] forwards every frame here and
+//!    subject family [`super::handoff`] already receives through the
+//!    `?subscribe=sessions` lane, which coord resolves from the upgrade
+//!    credential to `qontinui.sessions.<tenant>.<self-device>.*` (see
+//!    `qontinui_runner_lib::coord_ws::Subscription::Sessions`). This module
+//!    adds no second socket: [`super::handoff::connect_and_pump`] forwards
+//!    every frame here and
 //!    [`parse_attach_push`] claims only the `.attach_request` suffix — the
 //!    same disambiguation-by-trailing-segment the handoff and respawn arms use.
 //! 2. **Catch-up** — `GET /sessions/attach-requests?device_id=<me>`, device-

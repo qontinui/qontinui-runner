@@ -166,8 +166,9 @@ export const MIN_TILE_HEIGHT_PX = 300;
  * strings match the shape of the static `LAYOUT_PRESETS` zones (single-track
  * `"N"` values), so `ZoneGrid`/`ZoneCell` render them identically.
  *
- * Rows shrink naturally as tabs close: the id stays {@link FLOW_GRID_ID} and the
- * row count is derived from the CURRENT tab count, so this is NOT a grow-only
+ * The caller passes {@link flowGridSlotCount}, not the bare tab count, so the
+ * grid always reaches the highest assigned zone. Rows shrink as the highest
+ * tiles close: the id stays {@link FLOW_GRID_ID}, so this is NOT a grow-only
  * violation — it's the same layout id re-sized, not a shrink to a smaller preset.
  */
 export function synthesizeFlowGrid(tabCount: number): LayoutPreset {
@@ -187,6 +188,37 @@ export function synthesizeFlowGrid(tabCount: number): LayoutPreset {
     rows,
     zones,
   };
+}
+
+/**
+ * How many zones the flow-grid must synthesize: one per live tab, and never
+ * fewer than it takes to reach the highest zone a live tab is assigned to.
+ *
+ * Sizing by tab count alone made any assignment at or past `tabIds.length`
+ * point at a zone that was never rendered — and `classifyTabs` still counts
+ * such a tab as assigned, so it got neither a zone nor the hidden mount: alive,
+ * holding its PTY, and drawn nowhere. Closing any tile but the last one did
+ * exactly that to the last tile. A restore that skips a record (so the tabs
+ * that did come back hold zones past the new count) did it too. Covering the
+ * highest assigned zone makes that state unrepresentable.
+ *
+ * A closed tile therefore leaves an empty tile, exactly as a close leaves an
+ * empty zone in the preset layouts, and the next new tab fills the lowest one
+ * (`reconcileAssignments`). Nothing re-packs the survivors. Zone labels,
+ * notes, pins and output filters are keyed by zone index, so a tile moved by
+ * anything but the operator would silently wear another tile's metadata. The
+ * grid still shrinks whenever the highest tiles close.
+ *
+ * Dead assignments (a tab already gone from `tabIds`, not yet dropped by the
+ * reconcile effect) are ignored, so a closing tab cannot hold the grid open.
+ */
+export function flowGridSlotCount(tabIds: readonly string[], assignments: ZoneAssignments): number {
+  const live = new Set(tabIds);
+  let highest = -1;
+  for (const [zone, tabId] of Object.entries(assignments)) {
+    if (tabId && live.has(tabId)) highest = Math.max(highest, Number(zone));
+  }
+  return Math.max(tabIds.length, highest + 1);
 }
 
 /**
@@ -239,10 +271,10 @@ export function pickLayout(totalTabs: number): string {
  *   - **capacity-driven**: only grows when `tabCount` exceeds the current
  *     layout's zone capacity.
  *   - **grows INTO `flow-grid` at tab 10** (via `pickLayout`): the flow-grid
- *     synthesizes exactly `tabCount` zones, so it "always fits". Once IN
- *     flow-grid it returns null — the layout re-sizes itself to the live tab
- *     count by construction (zones == tabCount), so there is nothing to grow to
- *     and no thrash.
+ *     synthesizes at least `tabCount` zones, so it "always fits". Once IN
+ *     flow-grid it returns null — the layout re-sizes itself to the live tabs
+ *     by construction (zones >= tabCount, see `flowGridSlotCount`), so there
+ *     is nothing to grow to and no thrash.
  *
  * There is deliberately NO operator-pinned escape hatch: every live session
  * must render in a zone. A pin latch used to suppress growth here, which let
@@ -250,8 +282,8 @@ export function pickLayout(totalTabs: number): string {
  * layout — operators ran blind to mid-implementation work for an hour.
  */
 export function computeAutoGrowLayoutId(currentLayoutId: string, tabCount: number): string | null {
-  // Already in flow-grid: `synthesizeFlowGrid(tabCount)` gives one zone per tab,
-  // so the layout is always full-capacity — no grow target, no render loop.
+  // Already in flow-grid: it synthesizes at least one zone per tab, so the
+  // layout is always full-capacity — no grow target, no render loop.
   if (currentLayoutId === FLOW_GRID_ID) return null;
   const current = resolveLayout(currentLayoutId, tabCount);
   // Only act when live tabs overflow the current capacity.
@@ -580,10 +612,12 @@ export function useZoneLayout(
   const reservedZonesRef = useRef<Set<number>>(new Set());
 
   // Resolve through `resolveLayout` so a persisted/auto-grown `flow-grid` id
-  // materializes a synthesized preset sized to the CURRENT live tab count
-  // (zones == tabIds.length in flow mode), instead of silently falling back to
-  // `single` and re-hiding every session past the 9th.
-  const layout = resolveLayout(layoutId, tabIds.length);
+  // materializes a synthesized preset sized to the CURRENT live tabs, instead
+  // of silently falling back to `single` and re-hiding every session past the
+  // 9th. In flow mode that is one zone per live tab, stretched to reach the
+  // highest assigned zone (`flowGridSlotCount`) so no assigned tab is ever
+  // left without a zone. Presets ignore the count.
+  const layout = resolveLayout(layoutId, flowGridSlotCount(tabIds, assignments));
 
   // Persist on changes.
   useEffect(() => {
@@ -600,6 +634,22 @@ export function useZoneLayout(
       reconcileAssignments(prev, tabIds, layout.zones.length, reservedZonesRef.current),
     );
   }, [tabIds, layout.zones.length]);
+
+  // Closing the maximized terminal returns to the grid. Otherwise the
+  // maximized view keeps pointing at the zone the close emptied: a blank page
+  // with no header. Only a CLOSE un-maximizes (the tab that was shown is gone
+  // from `tabIds`). A tab dragged out, or an empty zone maximized on purpose
+  // (the UI Bridge `maximize-zone` action allows it and reports the result),
+  // is left alone.
+  const maximizedTabRef = useRef<string | null>(null);
+  useEffect(() => {
+    const shown = maximizedZone === null ? null : (assignments[maximizedZone] ?? null);
+    const previous = maximizedTabRef.current;
+    maximizedTabRef.current = shown;
+    if (shown === null && previous !== null && !tabIds.includes(previous)) {
+      setMaximizedZone(null);
+    }
+  }, [assignments, maximizedZone, tabIds]);
 
   // Shared layout-application logic: switch the preset and redistribute
   // assignments. Used by BOTH the operator-facing `setLayoutId` and the

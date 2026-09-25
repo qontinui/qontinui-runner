@@ -6757,6 +6757,7 @@ async fn acquire_continuation_workdir(
             // A gate continuation is coord-spawned: no spawn picker chose a
             // tenant, and its session id resolves its own.
             spawn_tenant: None,
+            shared_branch: crate::agent_worktree::SharedBranchPolicy::Honor,
         })
         .await;
         let ctx = match settle_continuation_acquire(acquired) {
@@ -6895,10 +6896,7 @@ fn settle_continuation_acquire<C>(
     }
 }
 
-/// The leading token of a foreign-repo continuation refused because it got no
-/// worktree of its own. Stable, like
-/// [`crate::agent_worktree::canonical_paths::WORKDIR_NOT_A_CHECKOUT`].
-const NO_ISOLATED_WORKTREE: &str = "no_isolated_worktree";
+use crate::agent_worktree::NO_ISOLATED_WORKTREE;
 
 /// Pure core of the continuation fallback cwd — reached only when no worktree
 /// was acquired.
@@ -7129,7 +7127,8 @@ pub(crate) enum CredentialDoorAnswer {
         exp: i64,
         jti: Option<uuid::Uuid>,
     },
-    /// Any non-2xx, with the body so the `error` code can be named: coord's
+    /// Any non-2xx, with the body so the refusal's code can be named
+    /// (`coord_ws::refusal_error_code`: `code`, else `error`): coord's
     /// typed refusals are 409 `already_credentialed`, 403 `device_mismatch`,
     /// 404 `agent_not_found`, 503 `schema_migration_pending`, 401 on a bad
     /// bearer — and a coord that predates the door answers a bare 404 for the
@@ -7268,7 +7267,7 @@ fn sanitize_reason_detail(raw: &str) -> String {
 /// [`launch_deferral_reason`]: `deferred_load:credential_door:503_<code>` or
 /// `deferred_load:credential_door:unreachable`. The transport detail of an
 /// unreachable door is logged beside it, never put on the wire; the 503
-/// body's `error` code is server-controlled, so it passes through
+/// body's refusal code is server-controlled, so it passes through
 /// [`sanitize_reason_detail`] (bounded length, bounded alphabet) first.
 /// Only the two transient shapes reach here; every settled answer is a
 /// [`CredentialDecision::Refuse`] and never asks for a deferral reason.
@@ -7356,7 +7355,8 @@ async fn fetch_agent_credential(base: &str, agent_id: uuid::Uuid) -> CredentialD
 /// - Everything else (401/403/409, a typed 404, a 404 with an empty frame
 ///   `jwt`, a 2xx with an empty token) → refuse, terminally. A
 ///   credential-less agent is never launched; the reason names the status and
-///   coord's `error` code so the `spawn-failed` row is diagnosable.
+///   coord's refusal code (`code`, else `error`) so the `spawn-failed` row is
+///   diagnosable.
 pub(crate) fn decide_agent_credential(
     answer: CredentialDoorAnswer,
     frame_jwt: &str,
@@ -9288,7 +9288,15 @@ async fn post_spawn_failed(
         );
         return SpawnReportOutcome::Undelivered;
     };
-    // coord-tenant-scope(session-noop): agent_id is a parameter; spawn-failed only sets status=abandoned by agent_id and persists no tenant. Nothing to thread. Terminal. Credential: the runner sends attach_device_auth, i.e. the DEFAULT binding's device JWT — the agent token in LaunchPayload.jwt is not used on this path. Any 4xx (401/403, and coord's 404 for an unknown agent) is classed Rejected below and not retried. coord is moving to trust this report only from a matching device token, or an agent token whose agent_id matches; both pass today because the route never 401s, so a future credential change must keep one of the two.
+    // coord-tenant-scope(session-noop): agent_id is a parameter; spawn-failed persists no tenant. Nothing to thread. Terminal.
+    // Credential: the runner sends attach_device_auth, i.e. the DEFAULT binding's device JWT — the agent token in
+    // LaunchPayload.jwt is not used on this path. coord (agents_spawn.rs post_spawn_failed / spawn_failed_for_reporter)
+    // never 401s; it decides whether the reporter is VERIFIED (spawn_admission::reporter_owns_allocation: a PAIRED device
+    // token naming one of the allocation's devices, or the agent's own token). A verified report sets status=abandoned
+    // (and, for a `deferred_load:` reason, retires the dedup marker); an unverified one only abandons an allocation still
+    // `allocated`, never an `active` session, and still answers 200. So a credential change that stops this JWT being a
+    // paired token for the allocation's device silently downgrades the report. Any 4xx (e.g. coord's 404 for an unknown
+    // agent) is classed Rejected below and not retried.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)
@@ -11153,6 +11161,23 @@ mod tests {
     fn credential_door_typed_404_agent_not_found_never_falls_back() {
         let reason = refuse_reason(decide_agent_credential(
             refused(404, r#"{"error":"agent_not_found"}"#),
+            "frame.tok.en",
+            1,
+        ));
+        assert!(reason.contains("agent_not_found"), "{reason}");
+    }
+
+    /// The same typed 404 in the `auth.rs` `Refusal` shape — machine code in
+    /// `code`, prose in `error` — must still be recognised as
+    /// `agent_not_found`, not read as an untyped 404 that falls back to the
+    /// frame jwt.
+    #[test]
+    fn credential_door_typed_404_in_code_field_never_falls_back() {
+        let reason = refuse_reason(decide_agent_credential(
+            refused(
+                404,
+                r#"{"error":"no such agent on this tenant","code":"agent_not_found"}"#,
+            ),
             "frame.tok.en",
             1,
         ));
