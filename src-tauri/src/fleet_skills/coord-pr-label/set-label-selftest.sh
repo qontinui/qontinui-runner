@@ -1,826 +1,366 @@
 #!/usr/bin/env bash
-# Self-test for set-label.sh's pre-send validation.
+# Self-test for set-label.sh — the thin client of coord's ONE label door.
 #
-# Runs the REAL script rather than a copy of it. Most cases go through
-# `--dry-run`, which stops before gh and coord; one later section deliberately
-# does NOT, in order to cover the gh-failure diagnosis. No network and no real
-# gh in either: a PATH-shadowing stub serves both phases -- as a pure tripwire
-# for the dry-run corpus (which must never reach even that), and as a
-# controllable fixture for the section that does.
+# Runs the REAL script. Hermetic: `curl` is PATH-shadowed by a stub that records
+# every request (method, URL, header, body) and answers from a per-case fixture;
+# `gh` is PATH-shadowed by a stub that FAILS LOUDLY, because this client must
+# never call gh at all — the two-step gh-then-coord shape is the half-write the
+# door exists to remove. No network, no credential, no runner.
 #
-# Covers both directions, because a guard proven only against known-bad input
-# is indistinguishable from a guard that rejects everything:
-#   - known-BAD: over-ceiling labels are rejected AND the error names the
-#     owner-dropped short form that would fit;
-#   - known-GOOD: the short form, a full form that fits, flag labels and the
-#     same-repo `#<n>` arm all still pass;
-#   - the 50/51-character BOUNDARY is asserted by length, not by eyeball, so a
-#     repo rename cannot silently slide the corpus off the edge it is testing;
-#   - `--dry-run` sends NOTHING: a PATH-shadowed `gh` stub records any call, and
-#     the run is asserted to have left no such record;
-#   - and, because it sends nothing, an ACCEPTED dry run states the one thing it
-#     could not check -- whether the label exists -- rather than letting "is
-#     valid" imply it did. Three classes, because the boundary is the KEY and
-#     not the presence of a value: an open-valued key names the
-#     `gh label create` that would be needed, while a flag label and the
-#     closed-enum `merge-strategy` get the caveat without that command -- and
-#     none of them ever asserts an absence a dry run has no evidence for;
-#   - and, in the one section that deliberately DOES reach gh: that a FAILING
-#     `gh pr edit` is diagnosed rather than merely relayed -- the
-#     label-not-found shape names `gh label create`, while an unrelated failure
-#     and a bare "not found" that never named the label do not (both directions
-#     again: an arm proven only on the shape it recognises is indistinguishable
-#     from one that appends the same advice to everything); that gh's own
-#     stderr survives being answered on EVERY path, success included, since
-#     capturing it to answer one failure must not eat it the rest of the time;
-#     and that gh's STDOUT still reaches the terminal, which is what makes the
-#     `2>&1 1>&3` ordering a tested property instead of a comment.
+# What is pinned, and why each matters:
+#   - the request SHAPE: POST for declare, DELETE for --unset, `mode: replace`
+#     under --replace, `dry_run: true` under --dry-run, the labels array
+#     verbatim (no local validation — a rejected label must reach coord and
+#     come back in `rejected[]`, or the client is re-growing the mirror that
+#     drifted five times);
+#   - the CASCADE: a proxy-shaped .mcp.json beside $PWD is rung 1 and its nonce
+#     header is sent; a 401 there falls through to rung 2 with $COORD_AGENT_JWT;
+#     a runner-shaped 404 (old runner, no forwarder route) falls through too,
+#     while coord's typed repo-not-in-tenant 404 is an answer; with neither rung
+#     the exit is 4 and the message says nothing was written;
+#   - the VERDICT: `rejected[]` non-empty ⇒ exit 1 with a `rejected:` line per
+#     label; a clean declare ⇒ exit 0 with one `ok:` line per GitHub add;
+#   - and that gh is NEVER invoked on any path.
 #
-# The PR coordinates below are deliberately unresolvable (`--pr 0` on a repo
-# that does not exist). If a future edit ever moves the dry-run short-circuit
-# BELOW the `gh pr edit` call, this test fails closed instead of adding real
-# labels to a live PR on a developer box with an authed gh. The owner is still
-# `qontinui`, because the short-form suggestion is owner-scoped.
-#
-# Usage: bash set-label-selftest.sh    (exit 0 = all cases classified correctly)
+# The PR coordinates are deliberately unresolvable (`--pr 0` on a repo that does
+# not exist) so that if the stubs were ever bypassed the real call could not
+# succeed either.
 
-set -uo pipefail
+set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$HERE/set-label.sh"
 
-REPO="qontinui/does-not-exist-selftest"
-PRNUM="0"
-
 FAILURES=0
-CHECKS=0
+CASES=0
+pass() { CASES=$((CASES + 1)); echo "ok: $*"; }
+fail() { CASES=$((CASES + 1)); FAILURES=$((FAILURES + 1)); echo "FAIL: $*" >&2; }
 
-fail() { echo "FAIL: $*" >&2; FAILURES=$((FAILURES + 1)); }
-ok()   { CHECKS=$((CHECKS + 1)); }
+[[ -f "$SCRIPT" ]] || { echo "FAIL: $SCRIPT not found" >&2; exit 1; }
+bash -n "$SCRIPT" || { echo "FAIL: set-label.sh does not parse" >&2; exit 1; }
 
-# ----- gh tripwire ------------------------------------------------------------
-# A stub `gh` earlier on PATH than the real one, recording every invocation.
-# `--dry-run` must never reach it.
-#
-# QONTINUI_AGENT_ID is exported deliberately. Without it the agent-id check
-# (set-label.sh, just below the dry-run exit) would halt a regressed script
-# BEFORE gh -- so on CI, which has no such variable, the no-send property would
-# be enforced by that check rather than by the dry-run exit this test claims to
-# pin, and the tripwire would be green by construction through the very
-# regression it names. Exporting a dummy makes the dry-run exit the only thing
-# between the corpus and `gh pr edit`.
-#
-# The stub exits NON-zero so a regressed script stops at
-# `error: gh pr edit failed` instead of continuing into the coord POST -- which,
-# on a box with a live local coord, would fire one real request per corpus
-# entry. COORD_URL is pinned at a dead port for the same reason.
-STUBDIR="$(mktemp -d)" || { echo "FAIL: mktemp -d failed; refusing to run with an unshadowed PATH" >&2; exit 1; }
-SENTINEL="$STUBDIR/gh-was-called"
-{
-  echo '#!/usr/bin/env bash'
-  echo 'echo "gh $*" >> "$(dirname "$0")/gh-was-called"'
-  echo 'exit 1'
-} > "$STUBDIR/gh"
-chmod +x "$STUBDIR/gh"
-PATH="$STUBDIR:$PATH"
-export PATH
-export QONTINUI_AGENT_ID="selftest-dummy"
-export COORD_URL="http://127.0.0.1:1"
-cleanup() { rm -rf "$STUBDIR"; }
-trap cleanup EXIT
+WORK="$(mktemp -d)" || { echo "FAIL: mktemp -d failed" >&2; exit 1; }
+trap 'rm -rf "$WORK"' EXIT
+STUBS="$WORK/stubs"; mkdir -p "$STUBS" "$WORK/cwd" "$WORK/home"
+LOG="$WORK/requests.log"
+: > "$LOG"
 
-# run <label> -> sets RC and OUT (stdout+stderr combined)
-run() {
-  OUT="$(bash "$SCRIPT" --repo "$REPO" --pr "$PRNUM" --label "$1" --dry-run 2>&1)"
-  RC=$?
-}
-
-expect_accept() {
-  local label="$1"
-  run "$label"
-  if [[ $RC -ne 0 ]]; then
-    fail "expected accept, got rc=$RC for \"$label\" :: $OUT"
-  else
-    ok
-  fi
-}
-
-# expect_reject <label> <substring the error must contain>
-expect_reject() {
-  local label="$1" needle="$2"
-  run "$label"
-  if [[ $RC -eq 0 ]]; then
-    fail "expected reject, got rc=0 for \"$label\""
-  elif [[ "$OUT" != *"$needle"* ]]; then
-    fail "reject message for \"$label\" lacks \"$needle\" :: $OUT"
-  else
-    ok
-  fi
-}
-
-# expect_absent <label> <substring the error must NOT contain>
-expect_absent() {
-  local label="$1" needle="$2"
-  run "$label"
-  if [[ $RC -eq 0 ]]; then
-    fail "expected reject, got rc=0 for \"$label\""
-  elif [[ "$OUT" == *"$needle"* ]]; then
-    fail "reject message for \"$label\" should not contain \"$needle\" :: $OUT"
-  else
-    ok
-  fi
-}
-
-# expect_dry_contains <label> <substring the dry-run report must contain>
-# The label must be ACCEPTED: these assert what a PASSING dry run says about
-# itself, which is a different property from what a rejection says.
-expect_dry_contains() {
-  local label="$1" needle="$2"
-  run "$label"
-  if [[ $RC -ne 0 ]]; then
-    fail "expected accept, got rc=$RC for \"$label\" :: $OUT"
-  elif [[ "$OUT" != *"$needle"* ]]; then
-    fail "dry-run report for \"$label\" lacks \"$needle\" :: $OUT"
-  else
-    ok
-  fi
-}
-
-# expect_dry_absent <label> <substring the dry-run report must NOT contain>
-expect_dry_absent() {
-  local label="$1" needle="$2"
-  run "$label"
-  if [[ $RC -ne 0 ]]; then
-    fail "expected accept, got rc=$RC for \"$label\" :: $OUT"
-  elif [[ "$OUT" == *"$needle"* ]]; then
-    fail "dry-run report for \"$label\" should not contain \"$needle\" :: $OUT"
-  else
-    ok
-  fi
-}
-
-# expect_len <label> <expected length> -- anchors the boundary corpus.
-expect_len() {
-  local label="$1" want="$2"
-  if [[ ${#label} -ne $want ]]; then
-    fail "corpus drift: \"$label\" is ${#label} chars, expected $want"
-  else
-    ok
-  fi
-}
-
-# ----- boundary anchors -------------------------------------------------------
-# Exactly at the ceiling (must pass) and exactly one over (must fail). If a repo
-# is ever renamed these two assertions fail loudly rather than quietly testing
-# some other length.
-AT_CEILING="coord:stacked-on=qontinui/qontinui-supervisor#1234"
-ONE_OVER="coord:upstream-of=qontinui/qontinui-supervisor#1234"
-expect_len "$AT_CEILING" 50
-expect_len "$ONE_OVER" 51
-
-expect_accept "$AT_CEILING"
-expect_reject "$ONE_OVER" "51 characters"
-# ...and the suggestion must be the owner-dropped form of that same label.
-expect_reject "$ONE_OVER" 'coord:upstream-of=qontinui-supervisor#1234'
-
-# ----- known-BAD: over the ceiling --------------------------------------------
-# The case that first hit, 2026-08-19 (claude-config#296 -> dev-notes#167).
-expect_reject "coord:downstream-of=qontinui/qontinui-claude-config#296" \
-  'coord:downstream-of=qontinui-claude-config#296'
-expect_reject "coord:downstream-of=qontinui/qontinui-dev-notes#1234" \
-  'coord:downstream-of=qontinui-dev-notes#1234'
-# The mis-signpost warning is the point of the guard, so assert it is present.
-expect_reject "coord:downstream-of=qontinui/qontinui-claude-config#296" \
-  "not found"
-# A non-dep key has no short form: report the overflow, suggest nothing bogus.
-expect_reject "coord:requires-tag=ts-v0.0.0-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
-  "shorten the value"
-
-# ----- the suggestion must never be a label the script itself rejects ---------
-# A FOREIGN owner is not ours to drop: coord canonicalizes a bare name to the
-# TENANT's owner, so the "short form" would silently retarget the edge at a
-# different repo. Suggest nothing.
-expect_absent "coord:downstream-of=some-other-org/qontinui-dev-notes#1234" \
-  "drop the owner"
-expect_reject "coord:downstream-of=some-other-org/qontinui-dev-notes#1234" \
-  "shorten the value"
-# An owner with an EMPTY repo part would shorten to `coord:upstream-of=#<n>`,
-# which validate_label rejects ("missing repo"). Suggest nothing.
-#
-# The PR number is sized so the FULL form is 51 (over the ceiling, so the guard
-# runs) while the short form is 42 (under it). An earlier 32-digit version of
-# this case was vacuous: the short form was 51 too, so the call site's own
-# `${#SHORT} -le $GH_LABEL_MAX` rejected it and the assertion passed whether or
-# not short_form's guards existed at all.
-EMPTY_BARE="coord:upstream-of=qontinui/#12345678901234567890123"
-expect_len "$EMPTY_BARE" 51
-expect_absent "$EMPTY_BARE" "drop the owner"
-# `stacked-on` is what makes the empty-`bare` guard load-bearing on its own:
-# validate_label ACCEPTS `coord:stacked-on=#<n>` (that is the same-repo arm), so
-# without the guard the suggestion would be well-formed and WRONG -- a
-# cross-repo edge silently rewritten as a same-repo one.
-EMPTY_BARE_STACKED="coord:stacked-on=qontinui/#123456789012345678901234"
-expect_len "$EMPTY_BARE_STACKED" 51
-expect_absent "$EMPTY_BARE_STACKED" "drop the owner"
-# Likewise the not-a-path guard: `qontinui/a/qontinui-devtools#1234` would
-# shorten to `a/qontinui-devtools#1234`, which validate_label accepts (the repo
-# part is non-empty AND both `/`-segments are) and which names a different repo.
-NESTED_PATH="coord:upstream-of=qontinui/a/qontinui-devtools#1234"
-expect_len "$NESTED_PATH" 51
-expect_absent "$NESTED_PATH" "drop the owner"
-
-# ----- known-GOOD: must still pass --------------------------------------------
-expect_accept "coord:downstream-of=qontinui-claude-config#296"   # the short form
-expect_accept "coord:upstream-of=qontinui/qontinui-schemas#42"   # full form, fits
-expect_accept "coord:stacked-on=#42"                             # same-repo arm
-expect_accept "coord:stacked-on=qontinui-web#748"
-expect_reject "coord:blocked"                 "retired hold label"
-expect_reject "coord:experimental"            "retired hold label"
-expect_accept "coord:credibility-override"
-expect_accept "coord:migrate-repair"
-expect_accept "coord:merge-strategy=squash"
-expect_accept "coord:requires-tag=ts-v*"
-
-# ----- an accepted dry run states what it did NOT check -----------------------
-# `--dry-run` clears the grammar and the ceiling, which closes cause 2 of
-# `'<label>' not found` (over 50 characters, therefore uncreatable). It cannot
-# close cause 1 -- that needs a send -- and a bare "is valid" invites the caller
-# to assume it did, which is the reassurance the real run then contradicts.
-#
-# Three classes, because an arm proven only where it fires is indistinguishable
-# from one that fires everywhere, and because the boundary is NOT "carries a
-# value": an OPEN-valued key gets the `gh label create` line, while a FLAG label
-# and a CLOSED-enum one get the caveat without it (pointing at a repo-wide
-# mutation for a label somebody creates once is advice nobody needs -- the same
-# over-broad-signposting the post-gh arm narrows its match to avoid).
-DYN_LABEL="coord:downstream-of=qontinui-dev-notes#167"
-expect_dry_contains "$DYN_LABEL" "NOT checked"
-expect_dry_contains "$DYN_LABEL" "gh label create \"$DYN_LABEL\" --repo $REPO"
-# ...and it must never assert an absence it has no evidence for. A dry run sent
-# nothing, so "does not exist" would be a fresh mis-signpost rather than a fix --
-# the label may well have been created already. (The needle is spaced; $REPO's
-# own `does-not-exist-selftest` is hyphenated and cannot match it by accident.)
-expect_dry_absent "$DYN_LABEL" "does not exist"
-# A flag label: caveat yes, create-the-label command no.
-expect_dry_contains "coord:credibility-override" "NOT checked"
-expect_dry_absent   "coord:credibility-override" "gh label create"
-# `merge-strategy` is the case that makes the arm KEYED rather than a `*=*`
-# test, and it is the only one that can catch that regression: it CARRIES A
-# VALUE, so the loose form sweeps it in with the dep labels -- and then justifies
-# the advice with "unique to the PR pair", a claim about a key this label is not.
-# Its value is one of exactly three strings, so it is a repo-wide label somebody
-# creates once, exactly the class `coord:credibility-override` is excluded for.
-expect_dry_contains "coord:merge-strategy=squash" "NOT checked"
-expect_dry_absent   "coord:merge-strategy=squash" "gh label create"
-# ...and `requires-tag` IS open-valued, so it keeps the command. Without this the
-# arm could shrink to the three dep keys and nothing here would notice.
-expect_dry_contains "coord:requires-tag=ts-v*" "gh label create"
-# The pre-existing success line must survive beside the note -- it is what a
-# caller greps for, and burying it would trade one silent surprise for another.
-expect_dry_contains "coord:credibility-override" "is valid"
-
-# ----- grammar rejections must be unchanged by the length guard ---------------
-# Needles are exact: a loose "missing" would also match the length guard's own
-# "missing-label problem" line.
-expect_reject "coord:stacked-on=nohash"       'stacked-on: missing "#<pr_number>"'
-expect_reject "coord:state=open"              "coord-set label"
-expect_reject "coord:blocked-by=x"            "coord-set label"
-expect_reject "coord:operator-review"         "retired label"
-expect_reject "coord:version-bump=1"          "retired label"
-expect_reject "coord:bogus=1"                 "unknown coord:* label key"
-expect_reject "not-a-coord-label"             "must start with"
-expect_reject "coord:downstream-of=repo#abc"  "must be int"
-
-# pr_number is `parse::<i32>()` in coord, NOT `^[0-9]+$`. `abc` is the one
-# input where those two agree, so it was the whole integer corpus and pinned
-# nothing at the boundary. These cases pin the DOMAIN in both directions --
-# overflow is rejected (the green-light-then-server-refuses class) and the
-# signed forms coord accepts are not "improved on" here.
-expect_accept "coord:upstream-of=repo#2147483647"      # i32::MAX
-expect_reject "coord:upstream-of=repo#2147483648"      "must be int"
-expect_reject "coord:upstream-of=repo#99999999999999999999" "must be int"
-expect_accept "coord:upstream-of=repo#-2147483648"     # i32::MIN
-expect_reject "coord:upstream-of=repo#-2147483649"     "must be int"
-expect_accept "coord:upstream-of=repo#-1"              # coord accepts; mirror must too
-expect_accept "coord:upstream-of=repo#+1"
-expect_accept "coord:upstream-of=repo#007"             # leading zeros: 10# not octal
-# `007` alone does NOT pin the `10#`: without it bash reads octal 7, which is
-# still <= i32::MAX, so the verdict is unchanged. `008`/`09` are the
-# discriminating cases -- an invalid octal digit makes bare `(( ))` a hard
-# error, so dropping `10#` flips these to reject. Rust parses all of them.
-expect_accept "coord:upstream-of=repo#008"
-expect_accept "coord:upstream-of=repo#09"
-expect_accept "coord:upstream-of=repo#0000000008"      # exactly 10 chars
-# 11 zero-padded chars: pins that the strip loop runs BEFORE the `<= 10`
-# length guard. `#0000000008` above is exactly 10 and squeaks under the
-# guard even with the strip removed, so it does NOT pin the ordering.
-expect_accept "coord:upstream-of=repo#00000000008"
-# 2^64+5 wraps to 5 in bash 64-bit arithmetic, so without the length guard
-# this would be ACCEPTED while coord rejects it. Pins the guard as covered
-# behaviour rather than an unfalsifiable backstop.
-expect_reject "coord:upstream-of=repo#18446744073709551621" "must be int"
-expect_reject "coord:stacked-on=#2147483648"           "must be int"
-expect_accept "coord:stacked-on=#2147483647"
-expect_reject "coord:merge-strategy=bogus"    "must be one of squash|rebase|merge"
-expect_reject "coord:requires-tag="           'value after "=" cannot be empty'
-# `coord:priority` USED to fall through to the generic parameterised-label arm.
-# coord has since grown a bespoke `PRIORITY_LABEL_ERR` that names the working
-# alternative, and catches the parameterised form too -- so both spellings must
-# now produce the bespoke message, not the generic one. The needle is the part
-# that carries the fix, so a reworded preamble does not silently un-pin it.
-expect_reject "coord:priority"                "must be set on the PR itself"
-expect_reject "coord:priority=1"              "must be set on the PR itself"
-
-# `coord:red-main-fix` is rejected by coord with the GENERIC message -- coord
-# has no bespoke arm for it, so this mirror must not invent one. This case pins
-# the ABSENCE of a bespoke arm: if someone adds one here without adding it to
-# `labels_routes.rs` first, the mirror has drifted and this fails. The doctrine
-# (why the label buys nothing, and to set it with `gh pr edit`) lives in
-# SKILL.md, not in the validator.
-expect_reject "coord:red-main-fix"            'parameterised labels need "=value"'
-
-# `repo_segments_well_formed` -- an owner/repo value needs BOTH segments. These
-# three were ACCEPTED by the mirror while coord refused them at the write
-# surface: a pre-flight that green-lights a label the server rejects is worse
-# than none. Covers both dep-label arms and stacked-on's non-empty repo form.
-expect_reject "coord:upstream-of=/repo#1"     'empty owner or repo segment'
-expect_reject "coord:downstream-of=qontinui/#1" 'empty owner or repo segment'
-expect_reject "coord:stacked-on=/repo#1"      'empty owner or repo segment'
-
-# ----- a bare flag must say which flag, not exit 1 silently -------------------
-OUT="$(bash "$SCRIPT" --repo "$REPO" --pr "$PRNUM" --label 2>&1)"; RC=$?
-if [[ $RC -eq 0 || "$OUT" != *"--label needs a value"* ]]; then
-  fail "bare --label should report the flag by name; got rc=$RC :: $OUT"
-else
-  ok
-fi
-
-# ----- --dry-run needs no agent id -------------------------------------------
-# SKILL.md and usage() both promise this. The export above (needed to make the
-# tripwire reachable) stopped demonstrating it implicitly, and it pins exactly
-# the ordering this change moved: the agent-id check must stay BELOW the
-# dry-run exit. Asserted explicitly, with the variable unset for this call only.
-OUT="$(env -u QONTINUI_AGENT_ID bash "$SCRIPT" --repo "$REPO" --pr "$PRNUM" \
-        --label coord:credibility-override --dry-run 2>&1)"; RC=$?
-if [[ $RC -ne 0 ]]; then
-  fail "--dry-run must not require QONTINUI_AGENT_ID; got rc=$RC :: $OUT"
-else
-  ok
-fi
-
-# ----- the tripwire: --dry-run sent nothing -----------------------------------
-# Assert the shadow actually works first, or "no record" would prove nothing.
-if [[ "$(command -v gh)" != "$STUBDIR/gh" ]]; then
-  fail "gh stub did not shadow PATH (resolved to $(command -v gh)); the no-send assertion below is vacuous"
-else
-  ok
-fi
-if [[ -e "$SENTINEL" ]]; then
-  fail "--dry-run invoked gh: $(cat "$SENTINEL")"
-else
-  ok
-fi
-
-# ----- a failing gh pr edit is answered, not merely relayed --------------------
-# These are the only cases that REACH gh, so they deliberately come after the
-# tripwire above: they DO invoke it, and running them earlier would make the
-# "--dry-run sent nothing" sentinel fire on their traffic rather than on a
-# regression. (Two earlier cases also omit `--dry-run` -- the bare-`--label`
-# one, and this line's own ancestor -- but they exit at arg parse, long before
-# gh; "reach gh" is the property the ordering argument actually needs.)
-#
-# A second stub shadows the first (prepended, so it wins) and writes to its own
-# sentinel, leaving `$SENTINEL` untouched as the record of the dry-run phase.
-# It reads its exit code and its stderr from files, so one stub covers the
-# success path as well as the failure ones, and it writes a distinguishable
-# line to STDOUT -- which is what pins the `2>&1 1>&3` ordering as tested
-# behaviour rather than as a claim in a comment.
-#
-# `--label coord:credibility-override` throughout: it clears validation and the ceiling, so
-# the only thing between the corpus and gh is the code under test.
-STUBDIR2="$(mktemp -d)" || { echo "FAIL: mktemp -d failed for the gh stub" >&2; exit 1; }
-SENTINEL2="$STUBDIR2/gh-was-called"
-GH_STUB_MSG_FILE="$STUBDIR2/message"
-GH_STUB_RC_FILE="$STUBDIR2/rc"
-GH_STUB_STDOUT="STDOUT-MARKER https://github.com/o/r/pull/1"
-{
-  echo '#!/usr/bin/env bash'
-  echo 'echo "gh $*" >> "$(dirname "$0")/gh-was-called"'
-  echo 'echo "STDOUT-MARKER https://github.com/o/r/pull/1"'
-  echo 'cat "$(dirname "$0")/message" >&2'
-  echo 'exit "$(cat "$(dirname "$0")/rc")"'
-} > "$STUBDIR2/gh"
-chmod +x "$STUBDIR2/gh"
-PATH="$STUBDIR2:$PATH"
-export PATH
-cleanup2() { rm -rf "$STUBDIR2"; }
-trap 'cleanup; cleanup2' EXIT
-
-# The shadow has to be proven again -- this is a DIFFERENT stub from the one
-# asserted above. And unlike there, a broken shadow here is not merely vacuous:
-# the cases below run without `--dry-run`, so an unshadowed `gh` would make
-# three live calls. `exit 1` rather than `fail`, matching the mktemp guards --
-# `fail` only counts and returns, and execution would walk straight into them.
-if [[ "$(command -v gh)" != "$STUBDIR2/gh" ]]; then
-  echo "FAIL: gh stub did not shadow PATH (resolved to $(command -v gh)); refusing to run the live-call cases" >&2
-  exit 1
-fi
-ok
-
-# run_gh <exit code> <stderr line> -- sets RC and OUT.
-run_gh() {
-  printf '%s\n' "$2" > "$GH_STUB_MSG_FILE"
-  printf '%s\n' "$1" > "$GH_STUB_RC_FILE"
-  : > "$SENTINEL2"
-  OUT="$(bash "$SCRIPT" --repo "$REPO" --pr "$PRNUM" --label coord:credibility-override 2>&1)"; RC=$?
-}
-
-# Every case asserts this. Without it a regression that exits BEFORE gh leaves
-# the negative assertions ("no create-the-label advice") trivially true, and a
-# green tick would mean only that a code path was never entered.
-expect_gh_reached() {
-  if [[ ! -s "$SENTINEL2" ]]; then
-    fail "gh stub was never invoked ($1); the assertions for this case are vacuous"
-  else
-    ok
-  fi
-}
-
-# --- Case 0: SUCCESS. Pins the properties the failure cases cannot see.
-#
-# This case captures the script's stdout and stderr SEPARATELY, and that is
-# load-bearing rather than tidiness. Every other case merges them with `2>&1`,
-# and a merged capture cannot see the `2>&1 1>&3` ordering at all: under the
-# reversed spelling gh's stderr leaks straight to the real stdout instead of
-# being captured, so the merged text is byte-identical either way. What
-# separates them is WHICH stream each line lands on -- gh's stdout on the
-# script's stdout, gh's stderr re-emitted on the script's stderr. The reversal
-# puts gh's notice on stdout and leaves stderr empty, which is what the third
-# assertion below catches.
-printf '%s
-' "A new release of gh is available: 2.0.0 -> 2.1.0" > "$GH_STUB_MSG_FILE"
-printf '%s
-' 0 > "$GH_STUB_RC_FILE"
-: > "$SENTINEL2"
-SPLIT_OUT="$STUBDIR2/stdout"; SPLIT_ERR="$STUBDIR2/stderr"
-bash "$SCRIPT" --repo "$REPO" --pr "$PRNUM" --label coord:credibility-override   > "$SPLIT_OUT" 2> "$SPLIT_ERR"; RC=$?
-OUT="$(cat "$SPLIT_OUT" "$SPLIT_ERR")"
-expect_gh_reached "success case"
-# gh's STDOUT reached the script's stdout, not the capture.
-if [[ "$(cat "$SPLIT_OUT")" != *"$GH_STUB_STDOUT"* ]]; then
-  fail "gh's stdout did not reach the terminal :: $(cat "$SPLIT_OUT")"
-else
-  ok
-fi
-# ...and gh's stderr did NOT come out on stdout. This is the assertion that
-# fails under the reversed fd ordering, and nothing else here does.
-if [[ "$(cat "$SPLIT_OUT")" == *"A new release of gh is available"* ]]; then
-  fail "gh's stderr leaked onto stdout (fd ordering reversed) :: $(cat "$SPLIT_OUT")"
-else
-  ok
-fi
-# gh's STDERR survives on the SUCCESS path too. gh really does write here when
-# nothing is wrong -- update notices, deprecation and auth-scope warnings -- and
-# capturing stderr to answer one failure must not eat those the rest of the time.
-if [[ "$(cat "$SPLIT_ERR")" != *"A new release of gh is available"* ]]; then
-  fail "gh's stderr was swallowed on the SUCCESS path :: $(cat "$SPLIT_ERR")"
-else
-  ok
-fi
-if [[ "$OUT" != *"ok: gh added label"* ]]; then
-  fail "success path did not report the label add :: $OUT"
-else
-  ok
-fi
-# rc 4 = it got past gh and died at the coord POST (COORD_URL is a dead port),
-# which anchors that the run really did take the success branch.
-if [[ $RC -ne 4 ]]; then
-  fail "expected rc=4 (past gh, coord unreachable), got rc=$RC :: $OUT"
-else
-  ok
-fi
-
-# --- Case 1: the label-not-found shape. The REST route (`gh api -X POST
-# .../issues/<n>/labels`) reports this as `Label does not exist` (HTTP 404),
-# NOT the old `gh pr edit`-era `'<label>' not found` -- and unlike that old
-# shape, set-label.sh no longer just prints the `gh label create` command as
-# advice: it CREATES the label and retries the add once
-# [policy: do-reversible-mechanical-work]. That is three real `gh` calls (POST
-# labels, label create, retry POST labels), so this needs a stub whose
-# response can differ by call number -- the single fixed-response stub2 above
-# cannot exercise the retry-succeeds path. Only the first call looks like the
-# 404; label create and the retry both succeed, which is what proves the
-# label actually got created and re-sent rather than merely diagnosed.
-STUBDIR3="$(mktemp -d)" || { echo "FAIL: mktemp -d failed for the auto-create stub" >&2; exit 1; }
-CALL_LOG="$STUBDIR3/gh-was-called"
-CALL_COUNT="$STUBDIR3/call-count"
-echo 0 > "$CALL_COUNT"
-{
-  echo '#!/usr/bin/env bash'
-  echo 'DIR="$(dirname "$0")"'
-  echo 'N=$(($(cat "$DIR/call-count") + 1)); echo "$N" > "$DIR/call-count"'
-  echo 'echo "gh $*" >> "$DIR/gh-was-called"'
-  echo 'if [[ "$N" == "1" ]]; then echo "Label does not exist" >&2; exit 1; fi'
-  echo 'echo "STDOUT-MARKER https://github.com/o/r/pull/1"'
-  echo 'exit 0'
-} > "$STUBDIR3/gh"
-chmod +x "$STUBDIR3/gh"
-PATH="$STUBDIR3:$PATH"
-export PATH
-cleanup3() { rm -rf "$STUBDIR3"; }
-trap 'cleanup; cleanup2; cleanup3' EXIT
-if [[ "$(command -v gh)" != "$STUBDIR3/gh" ]]; then
-  echo "FAIL: gh stub (auto-create) did not shadow PATH (resolved to $(command -v gh)); refusing to run this case" >&2
-  exit 1
-fi
-ok
-OUT="$(bash "$SCRIPT" --repo "$REPO" --pr "$PRNUM" --label coord:credibility-override 2>&1)"; RC=$?
-if [[ ! -s "$CALL_LOG" ]]; then
-  fail "gh stub (auto-create) was never invoked; the assertions for this case are vacuous"
-else
-  ok
-fi
-if [[ "$OUT" != *"Label does not exist"* ]]; then
-  fail "label-not-found: gh's own stderr on the first call was swallowed :: $OUT"
-else
-  ok
-fi
-if [[ "$OUT" != *"\"coord:credibility-override\" does not exist in $REPO yet -- creating it"* ]]; then
-  fail "label-not-found did not report the auto-create attempt :: $OUT"
-else
-  ok
-fi
-if [[ "$(cat "$CALL_LOG")" != *"gh label create coord:credibility-override --repo $REPO"* ]]; then
-  fail "label-not-found did not invoke gh label create with the right label/repo :: $(cat "$CALL_LOG")"
-else
-  ok
-fi
-if [[ $RC -ne 4 ]]; then
-  fail "label-not-found: expected rc=4 after a successful create+retry (past gh, coord unreachable), got rc=$RC :: $OUT"
-else
-  ok
-fi
-if [[ "$OUT" != *"ok: gh added label \"coord:credibility-override\" to $REPO#$PRNUM"* ]]; then
-  fail "label-not-found: the retried add did not report success :: $OUT"
-else
-  ok
-fi
-# Restore the fixed-response stub for the remaining cases -- they each expect
-# ONE gh call to fail and stay failed, which stub3's call-numbered script does
-# not model.
-PATH="$STUBDIR2:${PATH#"$STUBDIR3:"}"
-export PATH
-if [[ "$(command -v gh)" != "$STUBDIR2/gh" ]]; then
-  echo "FAIL: could not restore the fixed-response gh stub after the auto-create case (resolved to $(command -v gh))" >&2
-  exit 1
-fi
-ok
-
-# --- Case 2: an unrelated failure must NOT collect the create-the-label advice.
-# Without this, "recognises the shape" is indistinguishable from "appends the
-# advice to every failure", which is a fresh mis-signpost of its own.
-run_gh 1 "gh: authentication required"
-expect_gh_reached "auth case"
-if [[ $RC -eq 0 ]]; then
-  fail "a failing gh pr edit must not exit 0 (auth case)"
-else
-  ok
-fi
-if [[ "$OUT" != *"gh: authentication required"* ]]; then
-  fail "gh's auth error was swallowed :: $OUT"
-else
-  ok
-fi
-if [[ "$OUT" == *"gh label create"* ]]; then
-  fail "create-the-label advice attached to an unrelated gh failure :: $OUT"
-else
-  ok
-fi
-
-# --- Case 3: "not found" WITHOUT the label named. An unresolvable repo or PR
-# reads exactly like this; it is the near-miss the match is narrowed against,
-# and it pins that the needle is the LABEL, not the two words.
-run_gh 1 "could not resolve to a Repository: not found"
-expect_gh_reached "unresolvable-repo case"
-if [[ $RC -eq 0 ]]; then
-  fail "a failing gh pr edit must not exit 0 (unresolvable repo case)"
-else
-  ok
-fi
-# Positive half, so this case cannot pass by never reaching the code at all.
-if [[ "$OUT" != *"could not resolve to a Repository: not found"* ]]; then
-  fail "gh's stderr was swallowed (unresolvable repo case) :: $OUT"
-else
-  ok
-fi
-if [[ "$OUT" == *"gh label create"* ]]; then
-  fail "create-the-label advice attached to a bare \"not found\" that never named the label :: $OUT"
-else
-  ok
-fi
-
-# ----- the coord write lands only under a tenant PROVEN to own the repo --------
-# The multi-tenant-device defect (2026-09-23; same class as
-# qontinui-claude-config#1104): coord writes the row under QONTINUI_AGENT_ID's
-# worktree-row tenant, which on a device bound to several tenants is often the
-# wrong one. Step 2 probes that tenant with a no-op POST (`labels: []`), proves
-# it owns the repo through the author-session door under a token CLAIMING it,
-# and only then writes. These cases need a controllable coord, so a `curl` stub
-# is prepended to PATH -- after every case above, which rely on the real curl
-# failing against the dead COORD_URL port.
-#
-# The stub serves four calls by URL (and, for /pr-merge/labels, by whether the
-# payload is the empty probe), logs each as one line, writes the canned body to
-# the -o file, and prints the canned status for -w.
-STUBDIR3="$(mktemp -d)" || { echo "FAIL: mktemp -d failed for the curl stub" >&2; exit 1; }
-cleanup3() { rm -rf "$STUBDIR3"; }
-trap 'cleanup; cleanup2; cleanup3' EXIT
-{
-  echo '#!/usr/bin/env bash'
-  echo 'd="$(dirname "$0")"; out=""; data=""; url=""; hdr=""'
-  echo 'while [ $# -gt 0 ]; do case "$1" in'
-  echo '  -o) out="$2"; shift 2 ;; -d) data="$2"; shift 2 ;; -H) hdr="$hdr|$2"; shift 2 ;;'
-  echo '  -w|-X|-m|--connect-timeout) shift 2 ;; -*) shift ;; *) url="$1"; shift ;; esac; done'
-  echo 'case "$url" in'
-  echo '  */agents/credential) k=mint ;;'
-  echo '  */author-session) k=door ;;'
-  echo '  */pr-merge/labels) case "$data" in *"\"labels\": []"*) k=probe ;; *) k=post ;; esac ;;'
-  echo '  *) k=other ;; esac'
-  echo 'bearer=""; case "$hdr" in *"@"*) f="${hdr##*@}"; [ -r "$f" ] && bearer="$(cat "$f")" ;; esac'
-  echo 'printf "%s %s %s\n" "$k" "$url" "$data" >> "$d/calls"'
-  echo '[ -n "$bearer" ] && printf "%s\n" "$bearer" >> "$d/bearers"'
-  echo '[ -n "$out" ] && cat "$d/$k.body" > "$out" 2>/dev/null'
-  echo 'cat "$d/$k.code"'
-} > "$STUBDIR3/curl"
-chmod +x "$STUBDIR3/curl"
-PATH="$STUBDIR3:$PATH"
-export PATH
-if [[ "$(command -v curl)" != "$STUBDIR3/curl" ]]; then
-  echo "FAIL: curl stub did not shadow PATH; refusing to run the coord-reaching cases" >&2
-  exit 1
-fi
-ok
-
-T_OWN="c231d9da-0000-4000-8000-000000000001"
-T_WRONG="b3ecb579-0000-4000-8000-000000000002"
-# mkjwt <tenant> [exp-offset-seconds] -> an UNSIGNED header.payload.sig; the
-# script only ever reads the payload, and coord is the stub.
-mkjwt() {
-  H_T="$1" H_OFF="${2:-3600}" python3 -c 'import base64,json,os,time
-b=lambda o: base64.urlsafe_b64encode(json.dumps(o).encode()).decode().rstrip("=")
-print(b({"alg":"EdDSA"})+"."+b({"tenant_id":os.environ["H_T"],"exp":int(time.time())+int(os.environ["H_OFF"])})+".sig")'
-}
-# Isolate the credential cascade from this box: no env token, an empty HOME
-# (no file token, no machine.json), a pinned device id.
-FAKEHOME="$STUBDIR3/home"; mkdir -p "$FAKEHOME"
-unset COORD_DEVICE_JWT
-export QONTINUI_MACHINE_ID="11111111-2222-4333-8444-555555555555"
-printf '0\n' > "$GH_STUB_RC_FILE"; : > "$GH_STUB_MSG_FILE"
-
-# stub <kind> <code> [body]
-stub() { printf '%s\n' "$2" > "$STUBDIR3/$1.code"; printf '%s' "${3:-}" > "$STUBDIR3/$1.body"; }
-# run_coord <label> -> RC, OUT; resets the call log.
-run_coord() {
-  : > "$STUBDIR3/calls"; : > "$STUBDIR3/bearers"
-  OUT="$(HOME="$FAKEHOME" bash "$SCRIPT" --repo "$REPO" --pr 7 --label "$1" 2>&1)"; RC=$?
-}
-calls_of() { grep -c "^$1 " "$STUBDIR3/calls" 2>/dev/null || true; }
-expect_rc() { if [[ $RC -ne $1 ]]; then fail "$2: expected rc=$1, got rc=$RC :: $OUT"; else ok; fi; }
-expect_out() { if [[ "$OUT" != *"$1"* ]]; then fail "$2: output lacks \"$1\" :: $OUT"; else ok; fi; }
-expect_calls() { local n; n="$(calls_of "$1")"; if [[ "$n" != "$2" ]]; then fail "$3: expected $2 '$1' call(s), got $n :: $(cat "$STUBDIR3/calls")"; else ok; fi; }
-
-OK_POST="{\"tenant_id\":\"$T_OWN\",\"repo\":\"$REPO\",\"pr_number\":7,\"written\":1,\"deleted\":0,\"rejected\":[]}"
-
-# --- T1: PROVEN. The probe names T_OWN, the mint returns a T_OWN token, the
-# door answers 200 -> the real write goes out and the ok line names the tenant.
-stub probe 200 "{\"tenant_id\":\"$T_OWN\",\"written\":0,\"deleted\":0,\"rejected\":[]}"
-stub mint 200 "{\"token\":\"$(mkjwt "$T_OWN")\"}"
-stub door 200 '{"resolved":false}'
-stub post 200 "$OK_POST"
-run_coord "coord:stacked-on=#6"
-expect_rc 0 "T1 proven"
-expect_out "owner check: proven: tenant $T_OWN owns $REPO" "T1 proven"
-expect_out "coord recorded label" "T1 proven"
-expect_calls probe 1 "T1"; expect_calls door 1 "T1"; expect_calls post 1 "T1"
-# The mint NAMED the tenant: a tenant-less mint is the defect's own shape.
-if ! grep -q "^mint .*\"tenant_id\": \"$T_OWN\"" "$STUBDIR3/calls"; then fail "T1: the mint did not send tenant_id=$T_OWN :: $(cat "$STUBDIR3/calls")"; else ok; fi
-# The probe really was the empty, merge-mode, no-op write.
-if ! grep -q '^probe .*"labels": \[\], "mode": "merge"' "$STUBDIR3/calls"; then fail "T1: probe was not labels=[] mode=merge :: $(cat "$STUBDIR3/calls")"; else ok; fi
-
-# --- T2: REFUTED -- the defect itself. The agent row carries T_WRONG, whose
-# token the door answers 404: the row must be WITHHELD, rc 5, and the real
-# write must never go out.
-stub probe 200 "{\"tenant_id\":\"$T_WRONG\",\"written\":0,\"deleted\":0,\"rejected\":[]}"
-stub mint 200 "{\"token\":\"$(mkjwt "$T_WRONG")\"}"
-stub door 404 '{"error":"not found"}'
-run_coord "coord:upstream-of=qontinui-runner#1705"
-expect_rc 5 "T2 refuted"
-expect_out "WITHHELD" "T2 refuted"
-expect_out "does NOT own $REPO" "T2 refuted"
-expect_out "gh-side label add succeeded" "T2 refuted"
-expect_calls post 0 "T2 (no wrong-tenant row)"
-
-# --- T3: the mint ignores tenant_id and hands back ANOTHER tenant's token (a
-# coord predating the field). Using it would ask the door about the wrong
-# tenant, so it is rejected: UNKNOWN, rc 5, no door call, no write.
-stub probe 200 "{\"tenant_id\":\"$T_OWN\",\"written\":0,\"deleted\":0,\"rejected\":[]}"
-stub mint 200 "{\"token\":\"$(mkjwt "$T_WRONG")\"}"
-run_coord "coord:stacked-on=#6"
-expect_rc 5 "T3 wrong-claim mint"
-expect_out "UNKNOWN" "T3 wrong-claim mint"
-expect_out "claiming tenant $T_WRONG" "T3 wrong-claim mint"
-expect_calls door 0 "T3"; expect_calls post 0 "T3"
-
-# --- T4: the door fails (5xx) -- not a proof either way: UNKNOWN, withheld.
-stub mint 200 "{\"token\":\"$(mkjwt "$T_OWN")\"}"
-stub door 503 '{"error":"unavailable"}'
-run_coord "coord:stacked-on=#6"
-expect_rc 5 "T4 door 503"
-expect_out "UNKNOWN: the author-session door answered HTTP 503" "T4 door 503"
-expect_calls post 0 "T4"
-
-# --- T5: a static env token is used ONLY when it claims the write tenant. One
-# claiming another tenant is skipped for the mint; one claiming the write
-# tenant is used and no mint happens.
-stub door 200 '{"resolved":false}'
-COORD_DEVICE_JWT="$(mkjwt "$T_WRONG")" run_coord "coord:stacked-on=#6"
-expect_rc 0 "T5a env token for another tenant"
-expect_calls mint 1 "T5a (env token skipped, mint used)"
-COORD_DEVICE_JWT="$(mkjwt "$T_OWN")" run_coord "coord:stacked-on=#6"
-expect_rc 0 "T5b env token for the write tenant"
-expect_calls mint 0 "T5b (env token used)"
-expect_out "bearer=env" "T5b"
-# ...and an EXPIRED one for the right tenant is not used.
-COORD_DEVICE_JWT="$(mkjwt "$T_OWN" -30)" run_coord "coord:stacked-on=#6"
-expect_calls mint 1 "T5c (expired env token skipped)"
-
-# --- T6: coord's enforce arm re-tenanted the write itself -- the probe echoes
-# no tenant_id. coord made the ownership decision; no door call is needed.
-stub probe 200 '{"written":0,"deleted":0,"rejected":[]}'
-stub post 200 '{"written":1,"deleted":0,"rejected":[]}'
-run_coord "coord:stacked-on=#6"
-expect_rc 0 "T6 enforce re-tenanted"
-expect_out "coord derived the tenant from repo ownership itself" "T6"
-expect_calls door 0 "T6"; expect_calls post 1 "T6"
-
-# --- T7: coord's enforce arm refuses (422 repo_not_owned_by_tenant) at the
-# probe -> rc 5, no write attempted.
-stub probe 422 '{"error":"repo_not_owned_by_tenant","repo":"x","bound_owner_count":0}'
-run_coord "coord:stacked-on=#6"
-expect_rc 5 "T7 enforce refusal"
-expect_calls post 0 "T7"
-
-# --- T8: no device id and no usable token -> UNKNOWN, withheld (never a
-# bearerless request, whose 401 would say nothing about the tenant).
-stub probe 200 "{\"tenant_id\":\"$T_OWN\",\"written\":0,\"deleted\":0,\"rejected\":[]}"
-( unset QONTINUI_MACHINE_ID; run_coord "coord:stacked-on=#6"; printf '%s\n%s\n' "$RC" "$OUT" > "$STUBDIR3/t8" )
-RC="$(head -1 "$STUBDIR3/t8")"; OUT="$(tail -n +2 "$STUBDIR3/t8")"
-expect_rc 5 "T8 no device id"
-expect_out "no device_id" "T8"
-expect_calls door 0 "T8"; expect_calls mint 0 "T8"
-
-# --- T9: the write lands under a DIFFERENT tenant than the probe proved (the
-# agent row moved between the calls) -> not an unqualified ok.
-stub probe 200 "{\"tenant_id\":\"$T_OWN\",\"written\":0,\"deleted\":0,\"rejected\":[]}"
-stub post 200 "{\"tenant_id\":\"$T_WRONG\",\"written\":1,\"deleted\":0,\"rejected\":[]}"
-run_coord "coord:stacked-on=#6"
-expect_rc 4 "T9 tenant moved"
-expect_out "not the proven $T_OWN" "T9"
-
-# --- T10 (review r1, HIGH): a 2xx probe that is NOT a label-set response --
-# empty, non-JSON, or a null tenant_id -- is UNKNOWN, never "enforce
-# re-tenanted". Only a well-formed body with the key ABSENT is that (T6).
-for body in "" "<html>captive portal</html>" "{\"tenant_id\":null,\"written\":0,\"rejected\":[]}"; do
-  stub probe 200 "$body"
-  stub post 200 "$OK_POST"
-  run_coord "coord:stacked-on=#6"
-  expect_rc 5 "T10 malformed probe body [$body]"
-  expect_calls post 0 "T10 [$body]"; expect_calls door 0 "T10 [$body]"
+# --- curl stub: records the request, answers from $STUB_CASE ------------------
+cat > "$STUBS/curl" <<'EOF'
+#!/usr/bin/env bash
+# Records: METHOD URL HEADER BODY ARGV (one line, tab-separated), then answers
+# from the fixture directory named by $STUB_FIXTURES, keyed on the URL's host.
+# A `-H @<file>` header is RESOLVED to its contents for the HEADER field, so the
+# request-shape assertions read the same either way -- while the verbatim ARGV
+# field stays unresolved, which is what lets a test assert the credential never
+# appeared on the command line.
+method="GET"; url=""; hdr=""; body=""
+# One request is one LOG LINE, and curl's own `-w $'\n%{http_code}'` carries a
+# literal newline -- flatten tabs and newlines so the record cannot split.
+argv_all="$*"; argv_all="${argv_all//$'\n'/ }"; argv_all="${argv_all//$'\t'/ }"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -X) method="$2"; shift 2 ;;
+    -H) case "$2" in
+          Content-Type:*) : ;;
+          @*) f="${2#@}"; [[ -r "$f" ]] && hdr="$(tr -d '\r\n' < "$f")" ;;
+          *) hdr="$2" ;;
+        esac; shift 2 ;;
+    -d) body="$2"; shift 2 ;;
+    -w|-m) shift 2 ;;
+    -sS|-s|-S) shift ;;
+    http://*|https://*) url="$1"; shift ;;
+    *) shift ;;
+  esac
 done
+printf '%s\t%s\t%s\t%s\t%s\n' "$method" "$url" "$hdr" "$body" "$argv_all" >> "$STUB_LOG"
+case "$url" in
+  http://127.0.0.1:9876/coord-mcp/pr-labels)  fx="$STUB_FIXTURES/forwarder" ;;
+  https://coord.example.test/coord/pr-labels) fx="$STUB_FIXTURES/direct" ;;
+  http://127.0.0.1:9877/coord/pr-labels)      fx="$STUB_FIXTURES/loopback" ;;
+  *) fx="" ;;
+esac
+if [[ -z "$fx" || ! -f "$fx.code" ]]; then
+  echo "curl: (7) Failed to connect" >&2
+  exit 7
+fi
+cat "$fx.body"; printf '\n%s' "$(cat "$fx.code")"
+exit 0
+EOF
+chmod +x "$STUBS/curl"
 
-# --- T11 (review r1): an expired MINTED token for the right tenant is not used.
-stub probe 200 "{\"tenant_id\":\"$T_OWN\",\"written\":0,\"deleted\":0,\"rejected\":[]}"
-stub mint 200 "{\"token\":\"$(mkjwt "$T_OWN" -30)\"}"
-stub door 200 '{"resolved":false}'
-run_coord "coord:stacked-on=#6"
-expect_rc 5 "T11 expired mint"
-expect_out "expired" "T11"
-expect_calls door 0 "T11"; expect_calls post 0 "T11"
+# --- gh stub: must never run -------------------------------------------------
+cat > "$STUBS/gh" <<'EOF'
+#!/usr/bin/env bash
+echo "gh-stub: set-label.sh must not call gh (args: $*)" >> "$STUB_LOG"
+echo "FAIL: gh was invoked" >&2
+exit 99
+EOF
+chmod +x "$STUBS/gh"
 
-# --- T12 (review r1): no device credential is sent to a plain-http, non-loopback
-# COORD_URL -- the check withholds instead.
-stub mint 200 "{\"token\":\"$(mkjwt "$T_OWN")\"}"
-COORD_URL="http://coord.example.test" run_coord "coord:stacked-on=#6"
-expect_rc 5 "T12 non-https coord url"
-expect_out "neither https nor loopback" "T12"
-expect_calls mint 0 "T12"; expect_calls door 0 "T12"
-COORD_URL="http://localhost:x@coord.example.test/" run_coord "coord:stacked-on=#6"
-expect_rc 5 "T12b userinfo-retargeted loopback url"
-expect_calls mint 0 "T12b"
+# A proxy-shaped .mcp.json beside the cwd — rung 1.
+cat > "$WORK/cwd/.mcp.json" <<'EOF'
+{"mcpServers":{"coord-mcp":{"url":"http://127.0.0.1:9876/coord-mcp","headers":{"Authorization":"Bearer test-nonce-123"}}}}
+EOF
 
-# ----- report -----------------------------------------------------------------
-if [[ $FAILURES -ne 0 ]]; then
-  echo "set-label self-test: $FAILURES failure(s) across $((CHECKS + FAILURES)) assertion(s)" >&2
+FIX="$WORK/fx"; mkdir -p "$FIX"
+set_fixture() { # $1 rung (forwarder|direct) $2 code $3 body
+  printf '%s' "$2" > "$FIX/$1.code"; printf '%s' "$3" > "$FIX/$1.body"
+}
+clear_fixtures() { rm -f "$FIX"/*.code "$FIX"/*.body; : > "$LOG"; }
+
+run_client() { # args → stdout/stderr captured to files; echoes rc
+  (
+    cd "$WORK/cwd" && \
+    HOME="$WORK/home" PATH="$STUBS:$PATH" STUB_LOG="$LOG" STUB_FIXTURES="$FIX" \
+    COORD_HTTP_URL="https://coord.example.test" \
+    bash "$SCRIPT" "$@" >"$WORK/out" 2>"$WORK/err"
+  )
+  echo $?
+}
+out() { cat "$WORK/out"; }
+err() { cat "$WORK/err"; }
+last_req() { tail -n 1 "$LOG"; }
+req_count() { wc -l < "$LOG" | tr -d ' '; }
+gh_invoked() { grep -q '^gh-stub' "$LOG"; }
+
+ok_body='{"tenant_id":"t","repo":"qontinui/does-not-exist","pr_number":0,"mode":"merge","dry_run":false,"valid":["coord:downstream-of=qontinui/x#1"],"written":1,"deleted":0,"rejected":[],"github":{"added":["coord:downstream-of=qontinui/x#1"],"removed":[]}}'
+
+# ---- 1. a clean declare goes to rung 1 with the nonce, as POST, labels verbatim
+clear_fixtures; set_fixture forwarder 200 "$ok_body"
+rc=$(run_client --repo qontinui/does-not-exist --pr 0 --label 'coord:downstream-of=x#1')
+req=$(last_req)
+[[ "$rc" == 0 ]] && pass "clean declare exits 0" || fail "clean declare rc=$rc; err: $(err)"
+[[ "$req" == $'POST\thttp://127.0.0.1:9876/coord-mcp/pr-labels\tAuthorization: Bearer test-nonce-123\t'* ]] \
+  && pass "rung 1 is the forwarder with the .mcp.json nonce, method POST" || fail "unexpected request: $req"
+[[ "$req" == *'"labels": ["coord:downstream-of=x#1"]'* || "$req" == *'"labels":["coord:downstream-of=x#1"]'* ]] \
+  && pass "labels travel verbatim (no local validation)" || fail "labels not verbatim: $req"
+[[ "$req" == *'"mode": "merge"'* || "$req" == *'"mode":"merge"'* ]] && pass "default mode is merge" || fail "mode missing: $req"
+out | grep -q 'ok: declared "coord:downstream-of=qontinui/x#1"' && pass "renders one ok: line per GitHub add" || fail "render: $(out)"
+[[ "$(req_count)" == 1 ]] && pass "exactly one request" || fail "expected 1 request, got $(req_count)"
+gh_invoked && fail "gh was invoked" || pass "gh never invoked (declare)"
+
+# ---- 2. --replace + --dry-run flags reach the body
+clear_fixtures; set_fixture forwarder 200 '{"repo":"r","pr_number":0,"dry_run":true,"valid":["coord:blocked"],"written":0,"deleted":0,"rejected":[],"github":{"added":[],"removed":[]}}'
+rc=$(run_client --repo qontinui/does-not-exist --pr 0 --label coord:blocked --replace --dry-run)
+req=$(last_req)
+[[ "$rc" == 0 ]] && pass "dry run exits 0" || fail "dry run rc=$rc"
+[[ "$req" == *'"mode": "replace"'* || "$req" == *'"mode":"replace"'* ]] && pass "--replace sends mode=replace" || fail "mode: $req"
+[[ "$req" == *'"dry_run": true'* || "$req" == *'"dry_run":true'* ]] && pass "--dry-run sends dry_run=true" || fail "dry_run: $req"
+out | grep -q 'dry run' && pass "dry run says so" || fail "dry-run render: $(out)"
+
+# ---- 3. --replace with no labels is a legal total retraction (empty array)
+clear_fixtures; set_fixture forwarder 200 '{"repo":"r","pr_number":0,"dry_run":false,"valid":[],"written":0,"deleted":2,"rejected":[],"github":{"added":[],"removed":["coord:blocked","coord:experimental"]}}'
+rc=$(run_client --repo qontinui/does-not-exist --pr 0 --replace)
+req=$(last_req)
+[[ "$rc" == 0 ]] && pass "total retraction exits 0" || fail "total retraction rc=$rc; $(err)"
+[[ "$req" == *'"labels": []'* || "$req" == *'"labels":[]'* ]] && pass "empty labels array posted under replace" || fail "labels: $req"
+out | grep -c 'ok: retracted' | grep -q '^2$' && pass "renders one line per retraction" || fail "retraction render: $(out)"
+
+# ---- 4. --unset is a DELETE with {repo, pr_number, label}
+clear_fixtures; set_fixture forwarder 200 '{"repo":"qontinui/does-not-exist","pr_number":0,"label":"coord:blocked","deleted":true}'
+rc=$(run_client --repo qontinui/does-not-exist --pr 0 --unset coord:blocked)
+req=$(last_req)
+[[ "$rc" == 0 ]] && pass "unset exits 0" || fail "unset rc=$rc"
+[[ "$req" == $'DELETE\t'* && ( "$req" == *'"label": "coord:blocked"'* || "$req" == *'"label":"coord:blocked"'* ) ]] \
+  && pass "--unset sends DELETE with the label" || fail "unset request: $req"
+gh_invoked && fail "gh was invoked (unset)" || pass "gh never invoked (unset)"
+
+# ---- 5. rejected[] ⇒ exit 1, a rejected: line per label, nothing else claimed
+clear_fixtures; set_fixture forwarder 422 '{"repo":"r","pr_number":0,"dry_run":false,"valid":[],"written":0,"deleted":0,"rejected":[{"label":"coord:nope","reason":"unknown coord:* label key"}],"github":{"added":[],"removed":[]}}'
+rc=$(run_client --repo qontinui/does-not-exist --pr 0 --label coord:nope)
+[[ "$rc" == 1 ]] && pass "all-rejected exits 1" || fail "rejected rc=$rc"
+err | grep -q 'rejected: "coord:nope" — unknown coord:\* label key' && pass "rejected line names the label and coord's reason" || fail "rejected render: $(err)"
+out | grep -q 'ok: declared' && fail "claimed a declare that did not happen" || pass "no false ok: line"
+
+# ---- 6. a 401 from the forwarder falls through to the direct rung with the agent JWT
+clear_fixtures; set_fixture forwarder 401 '{"error":"dead nonce"}'; set_fixture direct 200 "$ok_body"
+rc=$( cd "$WORK/cwd" && HOME="$WORK/home" PATH="$STUBS:$PATH" STUB_LOG="$LOG" STUB_FIXTURES="$FIX" COORD_HTTP_URL="https://coord.example.test" COORD_AGENT_JWT="agent.jwt.here" bash "$SCRIPT" --repo qontinui/does-not-exist --pr 0 --label coord:blocked >"$WORK/out" 2>"$WORK/err"; echo $? )
+[[ "$rc" == 0 ]] && pass "401 on rung 1 falls through and rung 2 answers" || fail "fallthrough rc=$rc; $(err)"
+[[ "$(req_count)" == 2 ]] && pass "two requests: forwarder then direct" || fail "expected 2 requests, got $(req_count): $(cat "$LOG")"
+last_req | grep -q $'^POST\thttps://coord.example.test/coord/pr-labels\tAuthorization: Bearer agent.jwt.here' && pass "direct rung uses \$COORD_AGENT_JWT against \$COORD_HTTP_URL/coord/pr-labels" || fail "direct request: $(last_req)"
+
+# ---- 7. a runner-shaped 404 (no forwarder route on an old runner) falls through; coord's typed 404 is an answer
+clear_fixtures; set_fixture forwarder 404 '{"success":false,"error":"not found"}'; set_fixture direct 200 "$ok_body"
+rc=$( cd "$WORK/cwd" && HOME="$WORK/home" PATH="$STUBS:$PATH" STUB_LOG="$LOG" STUB_FIXTURES="$FIX" COORD_HTTP_URL="https://coord.example.test" COORD_DEVICE_JWT="device.jwt" bash "$SCRIPT" --repo qontinui/does-not-exist --pr 0 --label coord:blocked >"$WORK/out" 2>"$WORK/err"; echo $? )
+[[ "$rc" == 0 && "$(req_count)" == 2 ]] && pass "runner-shaped 404 falls through to the direct rung" || fail "old-runner 404: rc=$rc reqs=$(req_count)"
+clear_fixtures; set_fixture forwarder 404 '{"error":"repo_not_found_in_tenant_scope","repo":"qontinui/does-not-exist"}'
+rc=$(run_client --repo qontinui/does-not-exist --pr 0 --label coord:blocked)
+[[ "$rc" == 1 && "$(req_count)" == 1 ]] && pass "coord's typed 404 is an answer (no fallthrough), exit 1" || fail "typed 404: rc=$rc reqs=$(req_count) err=$(err)"
+err | grep -q 'repo_not_found_in_tenant_scope' && pass "typed 404 body is shown" || fail "typed 404 render: $(err)"
+
+# ---- 8. no rung answers ⇒ exit 4 and 'NOTHING was written'
+clear_fixtures   # no fixtures: the stub curl fails to connect everywhere
+rc=$(run_client --repo qontinui/does-not-exist --pr 0 --label coord:blocked)
+[[ "$rc" == 4 ]] && pass "no door ⇒ exit 4" || fail "no-door rc=$rc"
+err | grep -q 'NOTHING was written' && pass "no-door message says nothing was written" || fail "no-door render: $(err)"
+err | grep -q 'coord_pr_label_set' && pass "no-door message points at the MCP tool" || fail "no MCP pointer: $(err)"
+
+# ---- 8b. AN ANSWERED-BUT-FAILED CALL IS NOT "nothing was written" (exit 5)
+#
+# The regression this pins: the status test used to be `startswith(("2","4"))`
+# minus 401/403/404, so 400, 409, 413 and 429 fell into the SUCCESS renderer.
+# A POST printed nothing and exited 0; a DELETE printed
+# `ok: retracted "None" from None#None`. The 400 is not hypothetical -- it is
+# the door's own `tenant_from_auth` refusal for a bearer with no tenant claim.
+clear_fixtures; set_fixture forwarder 400 '{"error":"this route requires a tenant-scoped JWT (the token has no tenant_id claim)"}'
+rc=$(run_client --repo qontinui/does-not-exist --pr 0 --label coord:merge-strategy=squash)
+[[ "$rc" == 5 ]] && pass "a 400 is exit 5, not a silent success" || fail "400 rc=$rc out=$(out)"
+out | grep -q 'ok:' && fail "a 400 printed an ok: line" || pass "a 400 claims nothing"
+err | grep -q 'tenant-scoped JWT' && pass "the 400 body reaches the caller" || fail "400 render: $(err)"
+
+clear_fixtures; set_fixture forwarder 400 '{"error":"this route requires a tenant-scoped JWT (the token has no tenant_id claim)"}'
+rc=$(run_client --repo qontinui/does-not-exist --pr 0 --unset coord:migrate-repair)
+[[ "$rc" == 5 ]] && pass "a 400 on DELETE is exit 5" || fail "400 delete rc=$rc"
+out | grep -q 'ok: retracted' && fail 'DELETE asserted a retraction that did not happen' || pass "a failed DELETE asserts no retraction"
+
+# A 5xx from COORD ITSELF is an answer, and the POST arm must say so: the door
+# writes GitHub FIRST, so a 500 from the row INSERT lands with the label
+# already on the PR. Exit 4 would promise the opposite.
+clear_fixtures; set_fixture forwarder 500 '{"error":"INSERT coord.pr_labels: connection closed"}'
+rc=$(run_client --repo qontinui/does-not-exist --pr 0 --label coord:merge-strategy=squash)
+[[ "$rc" == 5 ]] && pass "a coord 500 is exit 5, never 4" || fail "500 rc=$rc"
+err | grep -q 'writes GitHub FIRST' && pass "the 500 message refuses to claim nothing happened" || fail "500 render: $(err)"
+
+clear_fixtures; set_fixture forwarder 429 '{"error":"rate limited"}'
+rc=$(run_client --repo qontinui/does-not-exist --pr 0 --label coord:merge-strategy=squash)
+[[ "$rc" == 5 ]] && pass "a 429 is exit 5" || fail "429 rc=$rc"
+
+# A non-JSON body is also an ANSWER of unknown effect -- 5, not 4.
+clear_fixtures; set_fixture forwarder 502 '<html>gateway</html>'
+rc=$(run_client --repo qontinui/does-not-exist --pr 0 --label coord:merge-strategy=squash)
+[[ "$rc" == 5 ]] && pass "a non-JSON body is exit 5" || fail "non-JSON rc=$rc"
+
+# ---- 8c. a RUNNER-originated 5xx is not an answer: fall through to rung 2
+# `COORD_MCP_PROXY_TENANT_UNRESOLVABLE` is a 503 from a missing or malformed
+# ~/.qontinui/machine.json -- the runner failing, not coord answering. Rung 2
+# exists for exactly that runner.
+clear_fixtures
+set_fixture forwarder 503 '{"success":false,"error":"tenant unresolvable","code":"COORD_MCP_PROXY_TENANT_UNRESOLVABLE"}'
+set_fixture direct 200 "$ok_body"
+rc=$( cd "$WORK/cwd" && HOME="$WORK/home" PATH="$STUBS:$PATH" STUB_LOG="$LOG" STUB_FIXTURES="$FIX" COORD_HTTP_URL="https://coord.example.test" COORD_DEVICE_JWT="device.jwt" bash "$SCRIPT" --repo qontinui/does-not-exist --pr 0 --label coord:merge-strategy=squash >"$WORK/out" 2>"$WORK/err"; echo $? )
+[[ "$rc" == 0 && "$(req_count)" == 2 ]] && pass "a runner-originated 503 falls through to the direct rung" || fail "proxy 503: rc=$rc reqs=$(req_count) err=$(err)"
+# ...but a 5xx carrying no runner code IS coord answering, and stops the cascade.
+clear_fixtures
+set_fixture forwarder 500 '{"error":"coord exploded"}'; set_fixture direct 200 "$ok_body"
+rc=$( cd "$WORK/cwd" && HOME="$WORK/home" PATH="$STUBS:$PATH" STUB_LOG="$LOG" STUB_FIXTURES="$FIX" COORD_HTTP_URL="https://coord.example.test" COORD_DEVICE_JWT="device.jwt" bash "$SCRIPT" --repo qontinui/does-not-exist --pr 0 --label coord:merge-strategy=squash >"$WORK/out" 2>"$WORK/err"; echo $? )
+[[ "$rc" == 5 && "$(req_count)" == 1 ]] && pass "a coord 5xx stops the cascade (it is an answer)" || fail "coord 500 cascade: rc=$rc reqs=$(req_count)"
+
+# ---- 9. usage errors exit 2 before any request
+clear_fixtures
+rc=$(run_client --repo qontinui/does-not-exist --pr 0)
+[[ "$rc" == 2 && "$(req_count)" == 0 ]] && pass "nothing to do ⇒ exit 2, no request" || fail "usage rc=$rc reqs=$(req_count)"
+rc=$(run_client --repo qontinui/does-not-exist --pr abc --label coord:blocked)
+[[ "$rc" == 2 ]] && pass "non-integer --pr ⇒ exit 2" || fail "bad pr rc=$rc"
+rc=$(run_client --repo qontinui/does-not-exist --pr 0 --label coord:blocked --unset coord:blocked)
+[[ "$rc" == 2 ]] && pass "--label and --unset together ⇒ exit 2" || fail "exclusive rc=$rc"
+# The door has no dry run on its retract verb, so silently ignoring the flag
+# would RETRACT the label the caller asked to rehearse.
+rc=$(run_client --repo qontinui/does-not-exist --pr 0 --unset coord:migrate-repair --dry-run)
+[[ "$rc" == 2 && "$(req_count)" == 0 ]] && pass "--dry-run with --unset ⇒ exit 2, no request" || fail "dry-run unset rc=$rc reqs=$(req_count)"
+
+# ---- 10. the script itself carries no localhost:9870 default and no gh call
+grep -q 'localhost:9870\|127\.0\.0\.1:9870' "$SCRIPT" && fail "set-label.sh still names the dead :9870 default" || pass "no :9870 default in set-label.sh"
+grep -Eq '^[^#]*\bgh (api|pr|label)\b' "$SCRIPT" && fail "set-label.sh still calls gh" || pass "set-label.sh has no gh call"
+
+# ---- 11. credential hygiene: never on argv, never to an arbitrary host
+# Both guards came from qontinui-claude-config#1121 and are re-applied here
+# after the rebase onto main: that PR added them alongside a bearer rung this
+# branch had independently written without them, so the conflict resolution
+# would otherwise have dropped a protection with nothing replacing it.
+
+# The credential rides a header FILE. The stub resolves `-H @file` for the
+# HEADER field (so every request-shape assertion above still reads it), and
+# records argv verbatim, which is where a leak would show.
+clear_fixtures
+set_fixture direct 200 '{"declared":[],"rejected":[]}'
+rc=$( cd "$WORK/cwd" && HOME="$WORK/home" PATH="$STUBS:$PATH" STUB_LOG="$LOG" STUB_FIXTURES="$FIX" \
+  COORD_HTTP_URL="https://coord.example.test" COORD_AGENT_JWT="s3cret.jwt.value" \
+  bash "$SCRIPT" --repo qontinui/does-not-exist --pr 0 --label coord:blocked >"$WORK/out" 2>"$WORK/err"; echo $? )
+argv_field=$(last_req | cut -f5)
+hdr_field=$(last_req | cut -f3)
+[[ "$hdr_field" == "Authorization: Bearer s3cret.jwt.value" ]] \
+  && pass "the bearer still reaches curl as an Authorization header" \
+  || fail "header field lost the bearer: '$hdr_field'"
+case "$argv_field" in
+  *s3cret.jwt.value*) fail "the bearer appears on curl's argv: $argv_field" ;;
+  *) pass "the bearer is staged in a header file, never on argv" ;;
+esac
+case "$argv_field" in
+  *-H\ @*) pass "curl is invoked with -H @<file>" ;;
+  *) fail "no -H @<file> on argv: $argv_field" ;;
+esac
+# Rung 1's nonce takes the same path.
+clear_fixtures
+set_fixture forwarder 200 '{"declared":[],"rejected":[]}'
+rc=$(run_client --repo qontinui/does-not-exist --pr 0 --label coord:blocked)
+case "$(last_req | cut -f5)" in
+  *test-nonce-123*) fail "the runner nonce appears on curl's argv" ;;
+  *) pass "the runner nonce is staged in a header file, never on argv" ;;
+esac
+
+# A device JWT is never sent in clear text to an arbitrary host. No fall-through:
+# there is no next rung, and sending it anyway is the harm.
+clear_fixtures
+rc=$( cd "$WORK/cwd" && HOME="$WORK/home" PATH="$STUBS:$PATH" STUB_LOG="$LOG" STUB_FIXTURES="$FIX" \
+  COORD_HTTP_URL="http://coord.example.test" COORD_DEVICE_JWT="device.jwt" \
+  bash "$SCRIPT" --repo qontinui/does-not-exist --pr 0 --label coord:blocked >"$WORK/out" 2>"$WORK/err"; echo $? )
+# Rung 1's loopback nonce probe still runs and is not the hazard; what must not
+# happen is a request carrying the bearer to the plain-http host. The grep is
+# the discriminating half -- the stub records the request BEFORE it resolves a
+# fixture, so a bearer that went out would appear in the log even unanswered.
+! grep -q 'coord\.example\.test' "$LOG" \
+  && pass "plain-http coord base ⇒ bearer never sent" \
+  || fail "plain-http base: rc=$rc log=$(cat "$LOG")"
+[[ "$rc" == 4 ]] && pass "plain-http coord base ⇒ exit 4 (nothing written)" \
+  || fail "plain-http base rc=$rc, expected 4"
+grep -q 'neither https nor loopback' "$WORK/err" \
+  && pass "the refusal names the cause" || fail "refusal message: $(cat "$WORK/err")"
+# Userinfo would retarget the host: `http://localhost:1@evil.test/` is evil.test.
+# The PORT MUST BE NUMERIC for this case to mean anything. With a non-numeric
+# port (`localhost:x@...`) the ordinary `http://localhost:[0-9]*` glob fails to
+# match and refuses the URL by itself — so deleting the userinfo arm entirely
+# left the suite green. Both fixtures below are refused ONLY by that arm.
+for base in "http://localhost:1@coord.example.test" "http://127.0.0.1:9@coord.example.test"; do
+  clear_fixtures
+  rc=$( cd "$WORK/cwd" && HOME="$WORK/home" PATH="$STUBS:$PATH" STUB_LOG="$LOG" STUB_FIXTURES="$FIX" \
+    COORD_HTTP_URL="$base" COORD_DEVICE_JWT="device.jwt" \
+    bash "$SCRIPT" --repo qontinui/does-not-exist --pr 0 --label coord:blocked >"$WORK/out" 2>"$WORK/err"; echo $? )
+  [[ "$rc" == 4 ]] && ! grep -q 'coord\.example\.test' "$LOG" \
+    && pass "userinfo-retargeted base ($base) ⇒ exit 4, bearer never sent" \
+    || fail "userinfo base $base: rc=$rc log=$(cat "$LOG")"
+done
+# Loopback http stays allowed — a local runner is the ordinary dev door. Assert
+# the rung-2 REQUEST actually went out: a bare `req_count >= 1` is satisfied by
+# rung 1's forwarder probe alone, so it passes even when the guard refuses
+# everything.
+clear_fixtures
+set_fixture loopback 200 '{"declared":[],"rejected":[]}'
+rc=$( cd "$WORK/cwd" && HOME="$WORK/home" PATH="$STUBS:$PATH" STUB_LOG="$LOG" STUB_FIXTURES="$FIX" \
+  COORD_HTTP_URL="http://127.0.0.1:9877" COORD_DEVICE_JWT="device.jwt" \
+  bash "$SCRIPT" --repo qontinui/does-not-exist --pr 0 --label coord:blocked >"$WORK/out" 2>"$WORK/err"; echo $? )
+[[ "$rc" == 0 ]] && grep -q '127\.0\.0\.1:9877/coord/pr-labels' "$LOG" \
+  && pass "loopback http is still allowed to carry a bearer" \
+  || fail "loopback http was refused: rc=$rc log=$(cat "$LOG")"
+
+# A credential carrying a newline would become a SECOND header, because curl
+# reads `-H @file` line by line. The candidate is skipped at its source.
+clear_fixtures
+set_fixture direct 200 '{"declared":[],"rejected":[]}'
+rc=$( cd "$WORK/cwd" && HOME="$WORK/home" PATH="$STUBS:$PATH" STUB_LOG="$LOG" STUB_FIXTURES="$FIX" \
+  COORD_HTTP_URL="https://coord.example.test" \
+  COORD_AGENT_JWT=$'good.jwt\nX-Injected: pwned' COORD_DEVICE_JWT="clean.jwt" \
+  bash "$SCRIPT" --repo qontinui/does-not-exist --pr 0 --label coord:blocked >"$WORK/out" 2>"$WORK/err"; echo $? )
+grep -q 'X-Injected' "$LOG" \
+  && fail "a newline in \$COORD_AGENT_JWT injected a second header: $(last_req)" \
+  || pass "a whitespace-bearing credential cannot inject a second header"
+[[ "$(last_req | cut -f3)" == "Authorization: Bearer clean.jwt" ]] \
+  && pass "the malformed candidate is skipped and the next one is used" \
+  || fail "expected the clean token to be used: $(last_req | cut -f3)"
+
+echo
+if [[ "$FAILURES" -gt 0 ]]; then
+  echo "set-label-selftest: $FAILURES of $CASES assertion(s) FAILED" >&2
   exit 1
 fi
-echo "set-label self-test: $CHECKS assertion(s) classified correctly (ceiling, short-form suggestion, grammar, no-send, dry-run existence caveat, gh success + failure diagnosis, owner-tenant proof before the coord write)"
+echo "set-label-selftest: PASS $CASES assertions, 0 failures"

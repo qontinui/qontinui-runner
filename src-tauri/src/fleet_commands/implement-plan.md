@@ -2722,8 +2722,50 @@ attribution). Editing a PR body to ADD a scope works — coord attaches it to th
 existing citation on the `edited` webhook — but it never REPLACES a scope already
 recorded.
 
+**A citation whose scope stays NULL is filled by the delivery-scope backfill,
+and an agent runs it — this is not an operator step.** *(Plan
+`2026-09-23-delivery-scope-backfill-write-is-operator-only-so-a-mechanical-reconcile-needs-a-human`,
+Phase 3.)* This covers a PR that merged before it carried a scope, and a body
+edit that coord never attached. The backfill re-parses PR bodies and titles
+and writes ONLY `delivery_scope IS NULL` rows, so it is idempotent. It then
+re-derives every unit it touched. A live pass can therefore DEMOTE `shipped`
+units whose coverage now reads partial, which makes them dispatchable and
+spends quota; that cost is why a dial gates it. Read `report.demoted`. The first door is the
+agent-authed `POST /coord/citations/backfill-delivery-scope` (qontinui-coord#2449).
+It takes your device or agent JWT and your own tenant only, and the tenant's
+`citation_scope_backfill_write` fleet dial (`off | dry_run | live`, default
+`dry_run`) decides whether it writes. **Read the dial before you rely on a
+write, and quote it.** Make one `?dry_run=true&limit=1` call; that writes
+nothing and returns `dial`, and an `off` dial answers `403
+backfill_write_dial_off`. An UNREADABLE dial also resolves `off`, so that 403
+does not prove the operator chose `off`; say so in any gate you register. A
+live write can also answer `409` while another pass is running.
+- **At `live`:** page `?limit=80&after=<report.next_cursor>` until
+  `report.truncated: false`. Loop on `truncated`, never on whether a cursor is
+  present. A page reading `report.paced: 1` is re-issued with the
+  `next_cursor` it RETURNED, not the one you sent, once the pacer refills. A
+  paced page's cursor points at the last unit it finished. If none finished,
+  it echoes the cursor you sent, and `null` there means "resume at the head",
+  not "done".
+- **Read `writes_performed`, not `would_write`.** These and `dial`,
+  `dry_run` and `write_requested` are top-level; the pass's own counters sit
+  under `report`. `write_requested: true` beside `dry_run: true` means the dial
+  downgraded your write to a plan, so a loop that ends at
+  `report.truncated: false` has reconciled nothing.
+- **At `dry_run` or `off`, no agent write is possible.** Register an
+  `operator_approval` gate recommending the dial be set, a decision made once,
+  rather than asking the operator to press the SSO door
+  (`POST /admin/coord/citations/backfill-delivery-scope`) for this pass. The
+  SSO door stays the operator's lever, and it is the only door that can run
+  fleet-wide, from the system tenant.
+
+The backfill cannot correct a scope that is already recorded but wrong. That
+is plan
+`2026-09-20-a-recorded-delivery-scope-is-permanent-so-a-mis-declared-phase-is-uncorrectable`.
+
 **If a PR is already open without the marker**, do not force-push a body edit —
-backfill the citation instead, which is the door built for exactly this case:
+add the citation instead (`coord_work_unit_add_citation`, not the delivery-scope
+backfill above), which is the door built for exactly this case:
 
 ```
 coord_work_unit_add_citation(slug=<plan-stem>, repo=<owner/repo>, pr_number=<n>)
@@ -3431,7 +3473,8 @@ supersedes unit_ready for the dependency-gated case".)
   it does not erase the `plan_slug` / `intent` `/preflight` Step 5 wrote, and it
   exits 0 on every path.
 - **Register:** prefer MCP `coord_register_gate` (kinds: `pr_merged`,
-  `deploy_healthy`, `claim_terminal`, `operator_approval`, `ci_green`,
+  `deploy_healthy`, `claim_terminal`, `operator_approval`, `ci_green`, `pr_ci_green`,
+  `release_in_sync`, `branch_reapable`,
   `ref_exists`, `metric_threshold`, `time_elapsed`, `unit_ready`,
   `migration_at_head`, `infra_drift_clear`, `file_exists`, `sql_count`,
   `unit_status`, `gate_cleared`, `commit_live`, `runner_served_sha`,

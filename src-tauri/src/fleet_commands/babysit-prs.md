@@ -928,6 +928,12 @@ Then:
    `gh pr merge <n> --rebase`. Strict rulesets (qontinui-web) need
    the up-to-date head; non-strict ones (qontinui-coord) merge as soon as the
    required checks are green on the current head.
+   **A peer's coord PROPOSAL is not its branch.** A proposal holding a merge
+   slot past the repo's own `stall_window_secs` can be cancelled by any session,
+   but only through the class A/B/C table and the per-target probe in
+   `/merge-train-steward` (the `self_blocking` arm) — `unblock: true` only, a
+   Stop-mode cancel is class C, and a 409 from the door is a successful guard,
+   never something to retry.
    **Adopting a foreign branch (route-around) — the only shape it may take.**
    The clause's bound is the original branch: never rebase it, never
    force-push it, never push to it at all. Take its content onto a fresh

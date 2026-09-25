@@ -360,6 +360,25 @@ A commit or PR in that range already addressing the diagnosed gap → the work i
 **done**; stop. This is the SAME check as the plan-path grep above, adapted for a
 dispatch with no plan file to cite — not a different, weaker substitute.
 
+### 4a. Read the merge train's in-flight candidates for the repo
+
+*(Plan `2026-09-02-touching-another-sessions-work-needs-a-policy-not-a-taboo`,
+Phase 4.)* `declare_intent` sees only sessions currently DECLARING, and its
+`prior_plan_realizations` is empty (UNKNOWN, not absent) whenever
+`prior_realizations_status != "ok"` — a prose `work_unit_id` returns
+`not_slug_shaped` and the lookup never runs. Neither sees an OPEN PR from a
+finished session. `coord_query_train_health` does: read its
+`candidates_in_flight[].branch` for each repo the work touches and scan the
+branch names against your intent. A branch such as
+`fix/untimed-subprocess-isolated-edit` beside an intent to fix that very
+function means the work is already in flight — stop and coordinate. On
+2026-09-02 a session wrote a duplicate fix to `claude_tree_is_repo_authored`
+while two PRs on that function sat queued for 10.4h and 7.2h, both named in
+plain text by exactly this read. Then list the repo's open PRs and filter by
+your files CLIENT-SIDE (`gh pr list --json number,headRefName,files`); never
+`gh pr list --search`, which is tokenised full text and has returned `[]` for a
+PR a plain listing finds. An unanswered read is UNKNOWN, never clear.
+
 ### 4b. Cover the uncommitted-WIP blind spot on disk
 
 Step 4 covers work that is already **merged**. This step covers the other end of
