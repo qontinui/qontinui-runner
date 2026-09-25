@@ -878,6 +878,25 @@ const ALLOWLIST: &[AllowlistEntry] = &[
          (BlockingSlot::enter), tracked_blocking_in_flight and tracked_blocking_by_thread; none \
          of the seven calls any of them",
     },
+    AllowlistEntry {
+        file: "session/spawn_prompt.rs",
+        module: "script_tests",
+        serializer: "EXE_LOCK",
+        outside_the_lock: &["every_bundled_hook_resolves_python3_and_a_parser_free_rung"],
+        reason: "EXE_LOCK serialises \"write an executable, then spawn\" — its own doc names the \
+         hazard: Command forks, and the child inherits another thread's still-open write handle \
+         on the script it is about to run, which then fails with ETXTBSY. The one test outside \
+         it, every_bundled_hook_resolves_python3_and_a_parser_free_rung, is the STATIC twin of \
+         the behavioural tests around it (its own doc comment says so): it iterates the four \
+         include_str! hook constants (POLICY_HOOK, SESSION_HOOK, STOP_HOOK, PRECOMPACT_HOOK), \
+         strips comment lines, and asserts on substrings (python3 / qh_parser / BASH_REMATCH). \
+         Those constants are embedded at compile time, so it writes no file, spawns no process \
+         and touches no filesystem at all — it calls none of write_exe, run_policy_hook, \
+         run_stop_hook or Command, and creates no tempdir. There is no fd for a sibling fork to \
+         inherit, so it cannot reach the resource the lock guards. Arrived with the 2026-09-24 \
+         rebase onto main, which added it; taking the lock in it is the trivial alternative and \
+         lives in that file, not this one",
+    },
 ];
 
 /// How a serialiser was recognised.
