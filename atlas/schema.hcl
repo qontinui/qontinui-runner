@@ -636,6 +636,14 @@ table "subtasks" {
     type    = integer
     default = 0
   }
+  // Why the row reached `failed`: `dependency <id> failed`, a spawn or
+  // isolation refusal, a lost or silent worker. Null for a row that did not
+  // fail, and for one that failed before the column existed. A failed run's
+  // `status_reason` names its failed rows with these.
+  column "state_reason" {
+    null = true
+    type = text
+  }
   column "created_at" {
     null    = false
     type    = timestamptz
