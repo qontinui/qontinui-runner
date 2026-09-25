@@ -903,6 +903,32 @@ async fn capability_manifest() -> impl axum::response::IntoResponse {
     )
 }
 
+/// Query for `GET /capability-manifest/sessions`.
+#[derive(Debug, serde::Deserialize)]
+struct SessionLedgerQuery {
+    /// Narrow the answer to this one provisioned workdir.
+    workdir: Option<String>,
+}
+
+/// `GET /capability-manifest/sessions[?workdir=<path>]` — what each recently
+/// spawned session was actually provisioned with (subagent definitions, fleet
+/// commands, fleet skills), one ledger per workdir.
+///
+/// A separate route rather than a field on `/capability-manifest`: that
+/// document is a BUILD-level report the parity comparator diffs, and per-session
+/// churn would make every comparison noisy. The store is bounded and
+/// process-local, so a workdir missing from the answer is UNKNOWN — the body
+/// says so ([`crate::capability_manifest::session_ledgers_document`]) instead of
+/// a 404 that would read as "got nothing".
+async fn capability_manifest_sessions(
+    axum::extract::Query(query): axum::extract::Query<SessionLedgerQuery>,
+) -> Json<serde_json::Value> {
+    Json(crate::capability_manifest::session_ledgers_document(
+        &crate::capability_manifest::session_provision_ledgers(),
+        query.workdir.as_deref(),
+    ))
+}
+
 /// The `/health` fields that state this runner's DEFAULT tenant — the tenant a
 /// session that names none is minted into (plan
 /// `2026-09-17-findings-carry-a-triage-stamp-and-the-steward-reads-since-last-run`,
@@ -11007,6 +11033,11 @@ pub fn create_router(
         // answered for each capability it delivers, so a development build's
         // report and a published build's report can be diffed.
         .route("/capability-manifest", get(capability_manifest))
+        // ...and what each recently spawned session was provisioned with.
+        .route(
+            "/capability-manifest/sessions",
+            get(capability_manifest_sessions),
+        )
         .route("/ui-bridge/health", get(health))
         .route("/ui-bridge/status", get(health))
         // The capture that used to run inline inside `/health` (Phase 1.2).

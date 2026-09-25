@@ -1189,7 +1189,7 @@ impl SessionProvisionLedger {
 /// How many sessions' ledgers are retained. A long-lived runner spawns
 /// thousands of sessions; this store is a diagnostic, not a record, so it is
 /// bounded and drops the oldest rather than growing without limit.
-const LEDGER_CAPACITY: usize = 64;
+pub(crate) const LEDGER_CAPACITY: usize = 64;
 
 /// The process-wide store. Two indexes over the same writes: per-session
 /// ledgers (bounded, ordered) and the latest observation per capability (which
@@ -1270,6 +1270,56 @@ pub fn session_provision_ledger(workdir: &str) -> Option<SessionProvisionLedger>
 #[must_use]
 pub fn session_provision_ledgers() -> Vec<SessionProvisionLedger> {
     with_store(|s| s.sessions.iter().cloned().collect())
+}
+
+/// The `GET /capability-manifest/sessions` body: every retained ledger (or only
+/// `workdir`'s when a filter is given), each with its capability-id set and its
+/// degraded rows, plus the store's bounds.
+///
+/// `retained` and `capacity` are always present because this store is bounded
+/// and process-local: a workdir that is not listed may have aged out, or been
+/// provisioned by another runner process, so its absence is UNKNOWN — never
+/// "that session got nothing". A filtered miss says so in `workdir_status`
+/// rather than answering with a bare empty list or a 404. PURE over its inputs.
+#[must_use]
+pub(crate) fn session_ledgers_document(
+    ledgers: &[SessionProvisionLedger],
+    workdir: Option<&str>,
+) -> serde_json::Value {
+    let sessions: Vec<serde_json::Value> = ledgers
+        .iter()
+        .filter(|l| workdir.is_none_or(|w| l.workdir == w))
+        .map(|l| {
+            serde_json::json!({
+                "workdir": l.workdir,
+                "capability_ids": l.reports.iter().map(|r| r.capability).collect::<Vec<_>>(),
+                "degraded": l.degraded().iter().map(|r| serde_json::json!({
+                    "capability": r.capability,
+                    "summary": r.summary(),
+                })).collect::<Vec<_>>(),
+                "reports": l.reports,
+            })
+        })
+        .collect();
+    let mut doc = serde_json::json!({
+        "retained": ledgers.len(),
+        "capacity": LEDGER_CAPACITY,
+        "absence": format!(
+            "unknown — this store is process-local and keeps only the {LEDGER_CAPACITY} most \
+             recently provisioned sessions, so a workdir missing here may have aged out or \
+             been provisioned by another runner process"
+        ),
+    });
+    if let Some(w) = workdir {
+        doc["workdir"] = serde_json::Value::from(w);
+        doc["workdir_status"] = serde_json::Value::from(if sessions.is_empty() {
+            "unknown"
+        } else {
+            "retained"
+        });
+    }
+    doc["sessions"] = serde_json::Value::Array(sessions);
+    doc
 }
 
 /// The most recent observation recorded for `capability`, if any.
@@ -2344,6 +2394,61 @@ mod tests {
             .is_some_and(|n| n.contains("bundled_resources::resolve_with_rung")));
 
         reset_provision_store();
+    }
+
+    /// The served document names each session's capability ids and degraded
+    /// rows, and a filtered miss reads UNKNOWN with the store's bounds beside it
+    /// — never a bare empty answer.
+    #[test]
+    fn the_session_ledgers_document_states_its_bounds_and_filters() {
+        let mut commands = ProvisionReport::new("fleet_commands", 2, Rung::Embedded);
+        commands.record_written();
+        commands.skip("vet-plan.md", SkipReason::GitTracked);
+        let mut skills = ProvisionReport::new("fleet_skills", 1, Rung::Embedded);
+        skills.record_written();
+        let ledgers = vec![
+            SessionProvisionLedger {
+                workdir: "/wt/a".to_string(),
+                reports: vec![commands, skills],
+            },
+            SessionProvisionLedger {
+                workdir: "/wt/b".to_string(),
+                reports: vec![],
+            },
+        ];
+
+        let all = session_ledgers_document(&ledgers, None);
+        assert_eq!(all["retained"], 2);
+        assert_eq!(all["capacity"], LEDGER_CAPACITY);
+        assert!(all.get("workdir_status").is_none());
+        assert_eq!(all["sessions"].as_array().unwrap().len(), 2);
+        let a = &all["sessions"][0];
+        assert_eq!(a["workdir"], "/wt/a");
+        assert_eq!(
+            a["capability_ids"],
+            serde_json::json!(["fleet_commands", "fleet_skills"])
+        );
+        assert_eq!(a["degraded"].as_array().unwrap().len(), 1);
+        assert_eq!(a["degraded"][0]["capability"], "fleet_commands");
+        assert!(a["degraded"][0]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("vet-plan.md"));
+        assert_eq!(a["reports"][0]["skipped"][0]["reason"], "git_tracked");
+
+        let hit = session_ledgers_document(&ledgers, Some("/wt/b"));
+        assert_eq!(hit["workdir_status"], "retained");
+        assert_eq!(hit["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            hit["retained"], 2,
+            "bounds describe the store, not the filter"
+        );
+
+        let miss = session_ledgers_document(&ledgers, Some("/wt/never"));
+        assert_eq!(miss["workdir_status"], "unknown");
+        assert_eq!(miss["workdir"], "/wt/never");
+        assert!(miss["sessions"].as_array().unwrap().is_empty());
+        assert!(miss["absence"].as_str().unwrap().starts_with("unknown"));
     }
 
     /// The ledger is bounded: a long-lived runner spawns thousands of sessions,
