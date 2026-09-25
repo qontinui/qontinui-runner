@@ -3982,6 +3982,22 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// run. coord's own grant (`mcp/agent_tool_access.rs`) is the authority on who
 /// may call it; this list only forwards.
 ///
+/// `coord_land_provenance_backfill` is IN for `coord_citations_reenrich`'s reason,
+/// one repair pass later (qontinui-coord#2264, plan
+/// `2026-09-15-two-admin-only-repair-passes-have-no-agent-door` Phase 1). It is
+/// the agent door onto coord's one-shot widened land-provenance backfill, which
+/// re-derives land records for PRs coord fast-forward-landed — the provenance
+/// that stops a legitimately-landed PR (GitHub `CLOSED`, `mergedAt: null`) from
+/// reading as unlanded. The pass is idempotent and precedence-aware, its tenant
+/// comes from the verified identity (the tool takes only `apply` and `limit`,
+/// dry run by default), and coord bounds it with a 200-row cap, a wall-clock
+/// budget, an in-flight guard shared with the operator route, and per-tenant
+/// cooldowns. coord grants it on the device floor; withheld here it would be a
+/// FOURTH instance of the silent capability subtraction pinned in
+/// `allows_handshake_and_coordination_tools` — visible in `tools/list`,
+/// `-32601` on use — and the door would stay as closed to runner sessions as
+/// the operator-only route it replaced.
+///
 /// **Landed is not delivered** (plan `2026-09-03-coord-mcp-403-names-its-own-cause`
 /// Phase 3). This list is compiled into the binary, so a PR that edits it is
 /// NOT in effect on any box until that box rebuilds from a sha containing the
@@ -4045,6 +4061,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_inbox",
     "coord_is_commit_live",
     "coord_is_merge_safe",
+    "coord_land_provenance_backfill",
     "coord_layering_triage",
     "coord_list_prompt_documents",
     "coord_list_worktrees",
@@ -14412,6 +14429,9 @@ mod coord_mcp_body_gate_tests {
             // A shipped repair route (citation re-enrich); withheld, no agent
             // could run the pass.
             "coord_citations_reenrich",
+            // Its sibling repair door (land-provenance backfill), added WITH
+            // coord's tool rather than after a session hit -32601.
+            "coord_land_provenance_backfill",
             "coord_post_finding",
             "coord_send_message",
             "coord_query_health", // prefix family
