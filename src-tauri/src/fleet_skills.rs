@@ -309,7 +309,7 @@ fn embedded_skill_file_count() -> usize {
 /// skipped write must never become an aborted spawn, and a failed or slow probe
 /// must never become one either. The probe runs ONCE for the whole tree, not
 /// once per file, so this costs one process spawn rather than ~15.
-fn provision_fleet_skills_into(
+pub(crate) fn provision_fleet_skills_into(
     skills_dir: &Path,
     registry: &AgentSkillRegistry,
 ) -> std::io::Result<ProvisionReport> {

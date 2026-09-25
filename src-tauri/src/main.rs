@@ -243,6 +243,9 @@ mod sdk_features;
 mod secure_storage;
 mod security;
 mod semantic_conventions;
+/// Which `.claude/` tree a spawned session is served, measured at the seam
+/// for the `[served-corpus: …]` header line of `QONTINUI_RUNNER_CONTEXT`.
+mod served_corpus;
 mod server_mode;
 mod session; // Plan 2026-05-22-coord-native-session-coordination Phase 2 — unified Session primitive
 mod session_pr_reconciler; // Runner-local per-session PR attribution → project.session_prs (Terminal dropdown)
