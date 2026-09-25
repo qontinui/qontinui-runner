@@ -441,11 +441,36 @@ fn env_bool_opt_in(key: &str, default: bool) -> bool {
     on
 }
 
+/// Read an `f64` knob, ANNOUNCING the fallback.
+///
+/// The last silent reader of the family. It rejected non-finite and
+/// non-positive values without a word while [`env_secs`], [`env_mins`] and
+/// [`env_u64_clamped`] all say so — so an operator who set
+/// `..._SLOPE_MB_PER_MIN=-5` (or `=fast`) was left holding a threshold the
+/// watchdog was not using, with no line anywhere naming the one it used
+/// instead. Same rule as its siblings: a knob that did not take your value says
+/// so.
+///
+/// No upper bound, unlike [`env_mins`]: an absurd slope is a detector that
+/// never fires, not a panic.
 fn env_f64(key: &str, default: f64) -> f64 {
-    env_raw(key)
-        .and_then(|v| v.parse::<f64>().ok())
+    let Some(raw) = env_raw(key) else {
+        return default;
+    };
+    let Some(v) = raw
+        .parse::<f64>()
+        .ok()
         .filter(|v| v.is_finite() && *v > 0.0)
-        .unwrap_or(default)
+    else {
+        warn!(
+            key,
+            requested = %raw,
+            applied = default,
+            "renderer_watchdog: {key} is not a positive finite number — using the default"
+        );
+        return default;
+    };
+    v
 }
 
 /// Longest window any duration knob may name, in minutes (30 days).
@@ -521,10 +546,11 @@ fn clamp_u64(value: u64, min: u64, max: u64) -> u64 {
 /// that overflows a `Duration`, and `..._WINDOW_MIN=1e300` parses as a perfectly
 /// finite `f64` — so without the `min` this would have killed the Tauri `setup`
 /// thread rather than misconfiguring a window.
-// `min`/`max` rather than `clamp`, deliberately: `f64::clamp` PANICS on NaN
-// bounds and RETURNS NaN for a NaN input, which `Duration::from_secs_f64` then
-// panics on — the exact failure this function exists to prevent. `min` and `max`
-// return the non-NaN operand, so a NaN here becomes a bounded number.
+// `min`/`max` rather than `clamp`, deliberately: `f64::clamp` RETURNS NaN for a
+// NaN INPUT, which `Duration::from_secs_f64` then panics on — the exact failure
+// this function exists to prevent. `min` and `max` each return the non-NaN
+// operand, so a NaN here becomes a bounded number instead. The bounds are
+// constants, so the input is the whole hazard; do not tidy this into a `clamp`.
 #[allow(clippy::manual_clamp)]
 fn mins_to_duration(minutes: f64) -> Duration {
     Duration::from_secs_f64(minutes.min(MAX_WINDOW_MINS).max(0.0) * 60.0)
@@ -1100,13 +1126,40 @@ pub struct WatchdogEvent {
     pub kind: &'static str,
     /// Which detector fired, as [`Breach::as_str`].
     pub breach: &'static str,
-    /// Total WebView2 working set when the event was raised.
+    /// Total WebView2 working set when the event was raised — **except on a
+    /// `"reload_result"` whose reclaim is UNKNOWN, where it is a PRE-heal
+    /// figure**: the last total that was actually measured. An unreadable
+    /// post-heal sample totals `0`, and shipping that here would tell the user
+    /// the renderer is now using nothing, so [`reported_total`] leaves the last
+    /// good reading standing — [`publish_sample`]'s own convention.
+    ///
+    /// A human reads that caveat off [`Self::message`], which says the figure
+    /// was taken before the reload. A machine reads it off an ABSENT
+    /// [`Self::reclaimed_bytes`] in the field beside this one; there is no other
+    /// discriminator on the wire.
     pub total_ws_bytes: u64,
     /// Seconds remaining before the reload proceeds; 0 for non-countdown kinds.
     pub countdown_secs: u64,
     /// Cumulative completed heals this session.
     pub reload_total: u64,
-    /// Bytes reclaimed by the heal, for `"reload_result"`.
+    /// Bytes reclaimed by the heal, for `"reload_result"` — signed, because a
+    /// heal can leave the subtree BIGGER than it found it.
+    ///
+    /// **An absent value on a `"reload_result"` means UNKNOWN, not zero.** It is
+    /// absent on the three other kinds because no heal has completed, and absent
+    /// on a `"reload_result"` whose post-heal sample could not be compared with
+    /// the pre-heal one ([`ReclaimVerdict::Unknown`]) because no honest number
+    /// exists: a `0` there would assert a MEASURED no-reclaim, which is §1.3's
+    /// storm signal, out of a failed measurement. That is the whole reason this
+    /// field is an `Option` rather than an `i64`, and the reason a consumer must
+    /// distinguish absent from `0` rather than coalescing them — as
+    /// `reloadResultToastType` in `useRendererMemoryWatchdog.ts` does when it
+    /// reads `(event.reclaimedBytes ?? 0) > 0`, which is correct for severity
+    /// (an unmeasured heal is `"info"`, not `"success"`) and would be wrong for
+    /// anything that reported the number.
+    ///
+    /// Its absence is also the only machine-readable flag that
+    /// [`Self::total_ws_bytes`] beside it is a pre-heal figure.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reclaimed_bytes: Option<i64>,
     /// Human-readable line for the toast or banner.
@@ -1130,7 +1183,7 @@ fn emit(app: &AppHandle, event: WatchdogEvent) {
 /// long-lived background tasks.
 pub fn start(app: AppHandle) {
     let cfg = WatchdogConfig::from_env();
-    // Touch the telemetry so the handles exist regardless of the kill-switch.
+    // Touch the telemetry so the handles exist regardless of the opt-in gate.
     LazyLock::force(&TELEMETRY);
 
     if !cfg.enabled {
@@ -1246,7 +1299,15 @@ async fn run(app: AppHandle, cfg: WatchdogConfig) {
 
         match governor.decide(now, &cfg) {
             HealDecision::Storm => {
-                escalate_storm(&app, &cfg, &mut governor, &snapshot, breach, &reason);
+                escalate_storm(
+                    &app,
+                    &cfg,
+                    &mut governor,
+                    &snapshot,
+                    breach,
+                    &reason,
+                    StormCause::BudgetSpent,
+                );
             }
             HealDecision::Proceed => {
                 if let Some(why) = heal(&app, &cfg, &mut governor, &snapshot, breach, &reason).await
@@ -1281,6 +1342,64 @@ fn push_sample(ring: &mut VecDeque<Sample>, cfg: &WatchdogConfig, now: Instant, 
     }
 }
 
+/// Why [`escalate_storm`] was called — a parameter because only the CALLER knows
+/// how many heal attempts have been charged.
+///
+/// The loud log used to assert *"{max_reloads} heal attempts within
+/// {reload_window} min did not outrun the leak"* at all three call sites. That is
+/// true of exactly one of them, [`HealDecision::Storm`], where the governor has
+/// actually spent the budget. The other two fire after a SINGLE charged attempt,
+/// so the line stated a number its caller could not know — in an operator-facing
+/// message that also recommends a runner restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StormCause {
+    /// [`run`]'s [`HealDecision::Storm`]: the governor's budget is spent, so
+    /// `max_reloads` attempts inside `reload_window` did not outrun the leak.
+    /// This is the only arm that knows that count.
+    BudgetSpent,
+    /// [`heal`]'s [`RecoveryOutcome::Exhausted`]: the recovery LADDER's own
+    /// per-incident rung budget is spent. One heal attempt has been charged
+    /// against `max_reloads`, not all of them.
+    LadderExhausted { attempts: u32 },
+    /// §1.3, in [`heal`]: ONE completed and verified heal reclaimed less than
+    /// `min_reclaim_bytes`. Escalating on the first such heal is the point — "one
+    /// cycle earlier and with evidence" — so a count here would always be 1.
+    NoReclaim { reclaimed_bytes: i64 },
+}
+
+impl StormCause {
+    /// Stable token for the structured log field, so the three arms are
+    /// greppable apart.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::BudgetSpent => "budget_spent",
+            Self::LadderExhausted { .. } => "ladder_exhausted",
+            Self::NoReclaim { .. } => "no_reclaim",
+        }
+    }
+
+    /// The clause the loud log states. Pure, so every arm is assertable without
+    /// an `AppHandle`.
+    fn describe(self, cfg: &WatchdogConfig) -> String {
+        match self {
+            Self::BudgetSpent => format!(
+                "{} heal attempts within {:.0} min did not outrun the leak",
+                cfg.max_reloads,
+                cfg.reload_window.as_secs_f64() / 60.0
+            ),
+            Self::LadderExhausted { attempts } => format!(
+                "the recovery ladder spent its own budget for this incident after {attempts} \
+                 attempts, on the one heal this watchdog had charged"
+            ),
+            Self::NoReclaim { reclaimed_bytes } => format!(
+                "one completed heal reclaimed {reclaimed_bytes} bytes, under the \
+                 {}-byte floor — not a leak a reload can reclaim",
+                cfg.min_reclaim_bytes
+            ),
+        }
+    }
+}
+
 /// §6 Q3's escalation: all three surfaces, not one.
 fn escalate_storm(
     app: &AppHandle,
@@ -1289,24 +1408,28 @@ fn escalate_storm(
     snapshot: &Snapshot,
     breach: Breach,
     reason: &str,
+    cause: StormCause,
 ) {
     let first = governor.latch_storm();
     // (b) the persistent flag the device heartbeat reports.
     TELEMETRY.storming.store(true, Ordering::Relaxed);
     if first {
-        // (a) the loud log.
+        // (a) the loud log. The clause comes from the CALLER: two of the three
+        // call sites have charged exactly one heal attempt, so neither may state
+        // the budget figure. See [`StormCause`].
         error!(
             breach = breach.as_str(),
+            cause = cause.as_str(),
             total_ws_bytes = snapshot.total_bytes,
             processes = %snapshot.summary(),
-            "renderer_watchdog: STORM — {} heal attempts within {:.0} min did not outrun the \
-             leak ({reason}); stopping reloads. A runner restart is recommended.",
-            cfg.max_reloads,
-            cfg.reload_window.as_secs_f64() / 60.0
+            "renderer_watchdog: STORM — {} ({reason}); stopping reloads. A runner restart is \
+             recommended.",
+            cause.describe(cfg)
         );
     } else {
         warn!(
             breach = breach.as_str(),
+            cause = cause.as_str(),
             total_ws_bytes = snapshot.total_bytes,
             "renderer_watchdog: still breaching while storming ({reason})"
         );
@@ -1504,25 +1627,79 @@ impl ReclaimVerdict {
 /// Compare a post-heal sample with the pre-heal one. Pure, so both UNKNOWN arms
 /// are assertable without a webview.
 ///
-/// The second arm is the subtler one: a post sample that read FEWER of the same
-/// subtree than the pre sample did understates the post total by whatever those
-/// processes hold, so its delta OVERSTATES the reclaim — the same direction of
-/// error as the empty case, just smaller. [`Snapshot::unreadable_processes`] is
-/// what makes it visible, and a partial sample is exactly what a recreate
-/// produces as processes come and go under it.
+/// The second arm is the subtler one, and it is **SYMMETRIC**: any difference in
+/// how much of the subtree the two samples read makes the delta an artifact,
+/// whichever side is the partial one. It used to guard one direction only
+/// (`post > pre`), which admitted the other into the escalation.
+///
+/// * **Post read fewer** than pre: the POST total is understated by whatever
+///   those processes hold, so the delta OVERSTATES the reclaim — the same
+///   direction of error as the empty case, just smaller. It credits a success
+///   that did not happen.
+/// * **Pre read fewer** than post: the PRE total is understated, so the delta
+///   UNDERSTATES the reclaim — and that is the harmful direction. One ~200 MB pid
+///   missing from a 7-process pre sample, because `OpenProcess` was refused for a
+///   pid that exited between the Toolhelp walk and the open (the routine race
+///   [`sample_webview2_subtree`] counts rather than hides), turns a genuine
+///   ~250 MB reclaim into a measured ~50 MB one. That is under
+///   `min_reclaim_bytes`, so a `Measured` verdict there reaches
+///   [`escalate_storm`]: the latched storm, `TELEMETRY.storming`, the
+///   restart-recommended banner, and NO further heals until a non-breaching tick
+///   AND a drained `reload_window` let [`HealGovernor::clear_if_recovered`]
+///   release it. A measurement artifact buying ~15 minutes of disabled
+///   protection is exactly what the UNKNOWN verdict exists to refuse — and the
+///   §1.4 calibration run that sets `ENABLED=1` is when it would fire.
+///
+/// [`Snapshot::unreadable_processes`] is what makes either side visible, and a
+/// partial sample is exactly what a recreate produces as processes come and go
+/// under it.
+///
+/// # What the count comparison does NOT catch, and why it is still the predicate
+///
+/// Pre and post each missing ONE process, but a DIFFERENT one: the counts match,
+/// so the samples pass as comparable while both totals are understated by
+/// unrelated amounts. Comparing the readable pid SETS would catch that, and is
+/// refused on purpose — a reload or recreate is expected to replace renderer pids
+/// outright, so a set comparison would answer UNKNOWN on essentially every
+/// SUCCESSFUL heal and disable §1.3's no-reclaim escalation altogether. That
+/// trades a rare partial cancellation for the permanent loss of the signal.
+/// Counts are the strongest predicate that survives a recreate.
 fn classify_reclaim(pre: &Snapshot, post: &Snapshot) -> ReclaimVerdict {
     if post.processes.is_empty() {
         return ReclaimVerdict::Unknown {
             why: "post_sample_read_nothing",
         };
     }
-    if post.unreadable_processes > pre.unreadable_processes {
+    if post.unreadable_processes != pre.unreadable_processes {
         return ReclaimVerdict::Unknown {
-            why: "post_sample_less_readable_than_pre",
+            why: "samples_not_equally_readable",
         };
     }
     ReclaimVerdict::Measured {
         bytes: pre.total_bytes as i64 - post.total_bytes as i64,
+    }
+}
+
+/// Which total the `"reload_result"` event reports: the last one that was
+/// actually MEASURED.
+///
+/// On [`ReclaimVerdict::Unknown`] that is the PRE-heal total. An unreadable post
+/// sample is [`Snapshot::default`], so `post.total_bytes` is `0`, and putting
+/// that on the wire tells the user the renderer is now using nothing — the same
+/// manufactured measurement [`ReclaimVerdict`] refuses to carry in
+/// `reclaimed_bytes`, in the field beside it. Leaving the last good reading
+/// standing is [`publish_sample`]'s own convention for an unreadable sample.
+///
+/// Extracted, and pure, for the same reason as
+/// [`ReclaimVerdict::measured_bytes`]: it is the ONE place the choice is made,
+/// so a test can OBSERVE it. The test that covered this rebuilt the `match`
+/// locally instead, which made reverting [`heal`]'s emit to a bare
+/// `post.total_bytes` — the regression `98f293ed9`'s predecessor had already
+/// shipped once — invisible to it.
+fn reported_total(verdict: ReclaimVerdict, pre: &Snapshot, post: &Snapshot) -> u64 {
+    match verdict {
+        ReclaimVerdict::Measured { .. } => post.total_bytes,
+        ReclaimVerdict::Unknown { .. } => pre.total_bytes,
     }
 }
 
@@ -1646,7 +1823,15 @@ async fn heal(
                  escalating rather than retrying ({reason})"
             );
             governor.record_attempt(Instant::now());
-            escalate_storm(app, cfg, governor, pre, breach, reason);
+            escalate_storm(
+                app,
+                cfg,
+                governor,
+                pre,
+                breach,
+                reason,
+                StormCause::LadderExhausted { attempts },
+            );
             return None;
         }
         RecoveryOutcome::Failed { ref detail, .. } => {
@@ -1706,18 +1891,11 @@ async fn heal(
         WatchdogEvent {
             kind: "reload_result",
             breach: breach.as_str(),
-            // The last total that was actually MEASURED — which on an UNKNOWN
-            // verdict is the pre-heal one, not `post.total_bytes`. An unreadable
-            // post sample has `total_bytes == 0`, and putting that on the wire
-            // would tell the user the renderer is now using nothing: the same
-            // manufactured measurement `reclaimed_bytes` refuses to carry, in the
-            // field beside it. This is exactly [`publish_sample`]'s convention —
-            // an unreadable sample leaves the previous reading standing rather
-            // than overwriting it with a zero.
-            total_ws_bytes: match verdict {
-                ReclaimVerdict::Measured { .. } => post.total_bytes,
-                ReclaimVerdict::Unknown { .. } => pre.total_bytes,
-            },
+            // The last total that was actually MEASURED — the pre-heal one on an
+            // UNKNOWN verdict, not `post.total_bytes`. The choice lives in
+            // `reported_total` rather than here so a test can observe it instead
+            // of restating it; that function's doc argues it.
+            total_ws_bytes: reported_total(verdict, pre, &post),
             countdown_secs: 0,
             reload_total,
             reclaimed_bytes: verdict.measured_bytes(),
@@ -1756,7 +1934,17 @@ async fn heal(
                  a reload can reclaim (native/GPU allocation or fragmentation). Escalating now \
                  instead of spending the remaining reload budget."
             );
-            escalate_storm(app, cfg, governor, &post, breach, reason);
+            escalate_storm(
+                app,
+                cfg,
+                governor,
+                &post,
+                breach,
+                reason,
+                StormCause::NoReclaim {
+                    reclaimed_bytes: bytes,
+                },
+            );
         }
     }
 
@@ -2905,10 +3093,15 @@ mod tests {
         assert_eq!(
             classify_reclaim(&pre, &post),
             ReclaimVerdict::Unknown {
-                why: "post_sample_less_readable_than_pre"
+                why: "samples_not_equally_readable"
             }
         );
         // Equally readable is comparable, even when neither sample is complete.
+        // This is the documented limit of a COUNT comparison — two samples each
+        // missing a different process still pass — and it is pinned here so a
+        // future move to comparing pid SETS has to re-read why that was refused
+        // (`classify_reclaim`'s doc: a recreate replaces renderer pids, so a set
+        // comparison answers UNKNOWN on every successful heal).
         let both_partial_pre = Snapshot {
             unreadable_processes: 3,
             ..quiet_snapshot()
@@ -2921,6 +3114,74 @@ mod tests {
             classify_reclaim(&both_partial_pre, &both_partial_post),
             ReclaimVerdict::Measured { .. }
         ));
+    }
+
+    #[test]
+    fn a_pre_partial_sample_is_unknown_rather_than_a_false_no_reclaim() {
+        // The direction the guard used to ADMIT — `post > pre` caught only the
+        // overstating half — and it is the harmful one.
+        //
+        // `pre` read 4 of 5 processes: one ~200 MiB pid was missed because
+        // `OpenProcess` was refused for a pid that exited between the Toolhelp
+        // walk and the open, the routine race `sample_webview2_subtree` counts.
+        // Its total is understated by that much. `post` read the whole subtree
+        // after a genuine ~250 MiB reclaim. The raw delta is then ~50 MiB — under
+        // the 64 MiB `min_reclaim_bytes` floor — so a `Measured` verdict here
+        // reaches `escalate_storm`: latched storm, `TELEMETRY.storming`, the
+        // restart-recommended banner, and NO further heals until a non-breaching
+        // tick AND a drained `reload_window`. A measurement artifact disabling the
+        // protection for ~15 minutes is exactly what UNKNOWN exists to refuse.
+        const MIB: u64 = 1024 * 1024;
+        let c = cfg();
+        let pre = Snapshot {
+            unreadable_processes: 1,
+            ..snapshot_of(vec![
+                proc(1, WebViewProcessKind::Browser, 100),
+                proc(2, WebViewProcessKind::Gpu, 100),
+                proc(3, WebViewProcessKind::Renderer, 600),
+                proc(4, WebViewProcessKind::Renderer, 700),
+            ])
+        };
+        let post = snapshot_of(vec![
+            proc(1, WebViewProcessKind::Browser, 100),
+            proc(2, WebViewProcessKind::Gpu, 100),
+            proc(3, WebViewProcessKind::Renderer, 600),
+            proc(4, WebViewProcessKind::Renderer, 450),
+            proc(5, WebViewProcessKind::Renderer, 200),
+        ]);
+        assert_eq!(pre.total_bytes, 1500 * MIB);
+        assert_eq!(post.total_bytes, 1450 * MIB);
+
+        // The guard is load-bearing rather than decorative: the arithmetic it
+        // refuses IS a no-reclaim escalation on these two samples.
+        let naive = pre.total_bytes as i64 - post.total_bytes as i64;
+        assert!(
+            naive < c.min_reclaim_bytes as i64,
+            "50 MiB is under the floor — this is the false escalation the guard stops"
+        );
+        // Counting the pid `pre` could not read, the heal reclaimed ~4x the floor.
+        let truth = (pre.total_bytes + 200 * MIB) as i64 - post.total_bytes as i64;
+        assert!(
+            truth >= c.min_reclaim_bytes as i64,
+            "the reclaim that actually happened is well above the floor"
+        );
+
+        // So the verdict credits nothing and decides nothing.
+        let verdict = classify_reclaim(&pre, &post);
+        assert_eq!(
+            verdict,
+            ReclaimVerdict::Unknown {
+                why: "samples_not_equally_readable"
+            },
+            "a pre-partial sample is not comparable either"
+        );
+        assert_eq!(
+            verdict.measured_bytes(),
+            None,
+            "no number for §1.3's `if let Measured` to answer, so no escalation"
+        );
+        // And the event still reports a total that was measured.
+        assert_eq!(reported_total(verdict, &pre, &post), pre.total_bytes);
     }
 
     #[test]
@@ -2981,28 +3242,46 @@ mod tests {
         // event therefore reports the PRE-heal total on an UNKNOWN verdict, which
         // is `publish_sample`'s own convention: an unreadable sample leaves the
         // last good reading standing.
+        //
+        // This asserts on `reported_total` — the function `heal` actually calls —
+        // rather than on a local copy of its `match`. An earlier version of this
+        // test rebuilt that expression inline, so reverting the emit to a bare
+        // `post.total_bytes` left it passing: it restated the behaviour instead of
+        // observing it.
         let pre = quiet_snapshot();
         let post = Snapshot::default();
         let verdict = classify_reclaim(&pre, &post);
-        let reported = match verdict {
-            ReclaimVerdict::Measured { .. } => post.total_bytes,
-            ReclaimVerdict::Unknown { .. } => pre.total_bytes,
-        };
+        let reported = reported_total(verdict, &pre, &post);
         assert_eq!(
             reported, pre.total_bytes,
             "an unreadable post sample must not be reported as a total of 0"
         );
         assert_ne!(reported, post.total_bytes);
 
+        // The pre-partial direction of the same defect reaches this the same way:
+        // UNKNOWN, so the last MEASURED total stands.
+        let pre_partial = Snapshot {
+            unreadable_processes: 1,
+            ..quiet_snapshot()
+        };
+        let complete_post = snapshot_of(vec![proc(1, WebViewProcessKind::Browser, 91)]);
+        let verdict = classify_reclaim(&pre_partial, &complete_post);
+        assert!(matches!(verdict, ReclaimVerdict::Unknown { .. }));
+        assert_eq!(
+            reported_total(verdict, &pre_partial, &complete_post),
+            pre_partial.total_bytes
+        );
+
         // And a MEASURED verdict still reports the post-heal total, which is the
         // whole point of taking a second sample.
         let smaller = snapshot_of(vec![proc(1, WebViewProcessKind::Browser, 91)]);
         let verdict = classify_reclaim(&pre, &smaller);
-        let reported = match verdict {
-            ReclaimVerdict::Measured { .. } => smaller.total_bytes,
-            ReclaimVerdict::Unknown { .. } => pre.total_bytes,
-        };
-        assert_eq!(reported, smaller.total_bytes);
+        assert_eq!(
+            reported_total(verdict, &pre, &smaller),
+            smaller.total_bytes,
+            "a measured heal reports the total it measured after it"
+        );
+        assert_ne!(reported_total(verdict, &pre, &smaller), pre.total_bytes);
     }
 
     #[cfg(target_os = "windows")]
@@ -3075,6 +3354,69 @@ mod tests {
         let after = t0 + c.reload_window + Duration::from_secs(1);
         assert!(g.clear_if_recovered(after, &c));
         assert_eq!(g.decide(after, &c), HealDecision::Proceed);
+    }
+
+    #[test]
+    fn the_storm_log_states_only_the_attempt_count_its_caller_can_know() {
+        // The loud log asserted "{max_reloads} heal attempts within
+        // {reload_window} min did not outrun the leak" at all three call sites. It
+        // is true from `HealDecision::Storm`, where the governor really has spent
+        // the budget; it is FALSE from `heal`'s `Exhausted` arm and from §1.3's
+        // measured-no-reclaim arm, each of which has charged exactly one attempt —
+        // a false number in a message that also tells the operator to restart.
+        let c = cfg();
+        assert_eq!(c.max_reloads, 2);
+
+        let budget = StormCause::BudgetSpent.describe(&c);
+        assert!(
+            budget.contains("2 heal attempts") && budget.contains("15 min"),
+            "the one arm that knows the budget still states it: {budget}"
+        );
+
+        // Neither single-attempt arm may borrow that claim.
+        for cause in [
+            StormCause::LadderExhausted { attempts: 3 },
+            StormCause::NoReclaim {
+                reclaimed_bytes: 1024,
+            },
+        ] {
+            let line = cause.describe(&c);
+            assert!(
+                !line.contains(&format!("{} heal attempts", c.max_reloads)),
+                "{} must not claim the budget count: {line}",
+                cause.as_str()
+            );
+            assert!(
+                !line.contains("did not outrun the leak"),
+                "{} must not claim a run of attempts: {line}",
+                cause.as_str()
+            );
+        }
+
+        // Each arm says what its own caller does know.
+        assert!(StormCause::LadderExhausted { attempts: 3 }
+            .describe(&c)
+            .contains("3 attempts"));
+        assert!(StormCause::NoReclaim {
+            reclaimed_bytes: 1024
+        }
+        .describe(&c)
+        .contains("1024 bytes"));
+
+        // And the three are greppable apart in the structured field.
+        let tokens = [
+            StormCause::BudgetSpent.as_str(),
+            StormCause::LadderExhausted { attempts: 1 }.as_str(),
+            StormCause::NoReclaim { reclaimed_bytes: 0 }.as_str(),
+        ];
+        assert_eq!(
+            tokens
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3,
+            "one token per cause"
+        );
     }
 
     #[test]

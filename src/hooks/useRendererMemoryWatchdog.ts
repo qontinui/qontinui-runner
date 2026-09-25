@@ -35,6 +35,17 @@
  * ABSENT on the three non-result kinds rather than null — and it can legitimately
  * be NEGATIVE (a reload that left the renderer bigger).
  *
+ * It is also absent on a `reload_result` whose reclaim could not be MEASURED (the
+ * post-heal sample was unreadable, or read a different amount of the subtree than
+ * the pre-heal one). **Absent means UNKNOWN there, never zero** — Rust refuses to
+ * put a `0` on the wire because that would assert a measured no-reclaim. Two
+ * consequences for this file: that absence is the only machine-readable flag that
+ * `totalWsBytes` beside it is a PRE-heal figure, and a consumer must not present
+ * an absent value as a number. {@link reloadResultToastType} coalescing it with
+ * `?? 0` is correct for SEVERITY only (an unmeasured heal is `"info"`, not
+ * `"success"`); the figure itself is never re-derived here, because `message`
+ * already says the total was taken before the reload.
+ *
  * # Why the banner needs an event for its DOWN edge
  *
  * §6 Q3 asks for three surfaces on the escalation, and two of them are
@@ -85,14 +96,19 @@ export interface RendererWatchdogEvent {
    *  nothing is firing: the Rust field is not optional, so the clear arm states
    *  the absence rather than carrying a breach that stopped being true. */
   breach: string;
-  /** Total WebView2 working set when the event was raised. */
+  /** Total WebView2 working set when the event was raised — except on a
+   *  `reload_result` carrying no {@link RendererWatchdogEvent.reclaimedBytes},
+   *  where it is the last total that was MEASURED, i.e. a PRE-heal figure. See
+   *  the contract note in this module's header. */
   totalWsBytes: number;
   /** Seconds left before the reload proceeds. `0` on the non-countdown kinds. */
   countdownSecs: number;
   /** Cumulative completed heals this session. */
   reloadTotal: number;
   /** `"reload_result"` only, and signed — a heal that reclaimed nothing can
-   *  report a negative delta. Absent (not null) on the other two kinds. */
+   *  report a negative delta. Absent (not null) on the other kinds, and absent on
+   *  a `reload_result` whose reclaim could not be measured: **absent is UNKNOWN,
+   *  never 0.** */
   reclaimedBytes?: number;
   /** Operator-facing line, already composed Rust-side. Render it; do not
    *  re-derive it from the numbers — the Rust side owns the phrasing, the same
