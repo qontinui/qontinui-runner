@@ -89,7 +89,8 @@ _ctc_url_ok() {
 
 _ctc_shaped() {
   case "$1" in "" | *[!A-Za-z0-9._-]*) return 1 ;; esac
-  [ "$(printf '%s' "$1" | tr -cd '.' | wc -c | tr -d '[:space:]')" = 2 ]
+  local dots="${1//[!.]/}"   # pure bash: callers may run under a minimal PATH
+  [ "${#dots}" = 2 ]
 }
 
 # jwt-cascade-selection: a static token is selected on VALIDITY, never presence
