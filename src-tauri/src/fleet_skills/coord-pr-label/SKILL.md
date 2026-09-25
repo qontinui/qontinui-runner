@@ -1,6 +1,6 @@
 ---
 name: coord-pr-label
-description: Set coord:* labels on a pull request — declare intent (upstream-of/downstream-of/stacked-on dependency edges, requires-tag, merge-strategy, credibility-override/migrate-repair flags) so the PR Merge Orchestrator can schedule the auto-merge correctly. All three dep labels work cross-repo with the [<owner>/]<repo>#<n> grammar; no label holds a PR. Validates against the namespace and GitHub's 50-character label-name ceiling before sending (--dry-run checks a label without sending anything, and a failing label add is diagnosed rather than relayed; a missing dynamic-value label is created on demand); the coord row is written only when the tenant your agent's worktree carries is PROVEN to own the repo (else withheld, exit 5).
+description: Set coord:* labels on a pull request — declare intent (upstream-of/downstream-of/stacked-on dependency edges, requires-tag, merge-strategy, credibility-override/migrate-repair flags) so the PR Merge Orchestrator can schedule the auto-merge correctly. All three dep labels work cross-repo with the [<owner>/]<repo>#<n> grammar; no label holds a PR. Validates against the namespace and GitHub's 50-character label-name ceiling before sending (--dry-run checks a label without sending anything, and a failing label add is diagnosed rather than relayed; a missing dynamic-value label is created on demand); the coord row is written only when the tenant your agent's worktree carries is PROVEN to own the repo (else withheld, exit 5), and is then READ BACK through coord's GET /coord/agent-pr-labels — ok only when the row is listed; a 200 without it is a contradiction (exit 4), a read that could not be made is written-but-UNKNOWN (exit 6), never ok.
 user-invocable: true
 ---
 
@@ -25,6 +25,11 @@ intent. Wraps:
    `POST /agents/credential` naming it). 200 proves ownership; 404 refutes it.
    Only on a proof does the real `POST <coord>/pr-merge/labels` go out,
    recording the label in `coord.pr_labels` with `source='coord_skill'`.
+4. A read-back — `GET <coord>/coord/agent-pr-labels?repo=<owner/name>&pr_number=<n>`
+   under a credential for the same tenant (a token minted in step 3 is reused,
+   not minted again). The write's `written=1` is coord's claim about itself;
+   `ok:` is printed only when the read door LISTS the label. Plan
+   `2026-09-10-coord-pr-labels-have-no-agent-read-door` Phase 3.
 
 Why step 3 exists: on a device bound to several tenants the worktree row is
 often stamped with the wrong one, and coord's own ownership check
@@ -339,8 +344,38 @@ On success, prints:
 
 ```
 ok: gh added label "<label>" to <repo>#<pr>
-ok: coord recorded label "<label>" in pr_labels (tenant_id=<uuid>, written=1)
+ok: coord recorded label "<label>" in pr_labels (tenant_id=<uuid>, written=1) (read back: present, source=coord_skill)
 ```
+
+A bare-repo dep label (`coord:downstream-of=qontinui-web#9`) is stored by coord
+in its canonical owner-qualified form, so the read-back accepts that spelling
+too and names it: `(read back: present, source=coord_skill, stored as
+"coord:downstream-of=qontinui/qontinui-web#9")`.
+
+### Exit codes
+
+| Exit | Means | What to do |
+|------|-------|------------|
+| 0 | GitHub label applied, coord row written **and read back present** | nothing |
+| 2 | usage error or invalid label — nothing sent | fix the label |
+| 3 | the GitHub-side label add failed | read gh's relayed error |
+| 4 | coord refused or failed the write — **or contradicted it**: the read door answered 200 without the label coord said it wrote | report it; both bodies are printed |
+| 5 | coord row **withheld** — the write tenant was not proven to own the repo | see below |
+| 6 | **written but read-back UNKNOWN** — the read door could not be asked | re-ask later; never treat as ok |
+
+4 and 6 are deliberately distinct: "coord contradicted itself" is a coord defect
+to report, while "coord could not be asked" is a question to ask again — the
+remedies are opposite, and folding 6 into 4 would file a coord bug every time
+the door was merely unreachable. Exit 6 covers an unreachable coord, a 401, a
+5xx, an unparseable or malformed body (including one answering a different
+`pr_number`), no credential that could be staged, and **404**. A 404 is most
+likely a running coord that **predates the read door** — the route does not
+exist there and 404s for everyone — since the door's other 404 (a repo the
+caller's tenant does not own) is the one the owner check has just ruled out.
+It is also 6 when coord's `enforce` arm chose the write tenant itself and echoed
+none on the probe or the write: no credential can then be scoped to the read,
+and the skill will not guess one. The withheld path (5) writes no row and makes
+no read-back; `--dry-run` sends nothing at all.
 
 On validation failure, prints the reason to stderr + exits non-zero:
 
@@ -446,12 +481,16 @@ it, run `gh pr edit <pr> --remove-label "<label>"`.
 - **Coord unreachable** — gh-side label add succeeds (GitHub is the
   canonical state), but `coord.pr_labels` will be out of sync until
   the reconciler watcher (Phase 1 D1.5) catches up on its next tick.
+  Unreachable only AFTER the write — at the read-back — is exit 6, not 4:
+  the row may well be there, and re-sending cannot tell you (the write is an
+  upsert). Re-read it later through `GET /coord/agent-pr-labels` or the
+  `labels` field of `coord_pr_status`.
 
 ## Files
 
 - `SKILL.md` — this file.
 - `set-label.sh` — the bash wrapper. Validates, calls `gh api` (issues/labels),
-  POSTs to coord.
+  POSTs to coord, reads the row back.
 - `set-label-selftest.sh` — runs the shipped validator over a known-bad /
   known-good corpus via `--dry-run`: no network, and no real `gh` — a stub
   shadows it on `PATH` as a tripwire, and the run asserts `--dry-run` never
@@ -476,7 +515,12 @@ it, run `gh pr edit <pr> --remove-label "<label>"`.
   captured, and the merged text is identical either way. Every case also asserts
   that the stub was actually invoked, so a regression that exits before `gh` is
   reached fails loudly instead of satisfying the negative assertions by never
-  running.
+  running. The coord-reaching section serves a stub `curl` and pins the owner
+  proof and the read-back: present → 0 (with the minted token reused, not
+  re-minted), a 200 without the row → 4, a 404 / 000 / 401 / 5xx / unparseable
+  or wrong-PR body → 6 and never `ok:`, the canonical owner-qualified spelling of
+  a bare-repo dep label counted as present, and no read-back on the withheld or
+  dry-run paths.
 
 ## See Also
 

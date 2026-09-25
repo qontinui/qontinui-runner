@@ -11,7 +11,14 @@
 # touching the label on gh 2.46.0, measured 2026-09-03), then POSTs the same label to
 # coord's `POST /pr-merge/labels` so the row in `coord.pr_labels`
 # carries `source='coord_skill'` + tenant resolved from the caller's
-# agent_id (= the agent_worktrees row's tenant_id).
+# agent_id (= the agent_worktrees row's tenant_id) -- written only once that
+# tenant is PROVEN to own the repo -- and finally READS the row back through
+# coord's `GET /coord/agent-pr-labels` rather than trusting the write's 200.
+#
+# Exit codes: 0 ok (written AND read back) | 2 usage / invalid label |
+# 3 gh failed | 4 coord refused, failed, or CONTRADICTED its own write |
+# 5 coord row withheld (write tenant not proven to own the repo) |
+# 6 written but read-back UNKNOWN (the read door could not be asked).
 
 set -euo pipefail
 
@@ -40,6 +47,17 @@ Required env:
 Optional env:
   COORD_URL          — coord base URL (then COORD_HTTP_URL). Default
                        https://coord.qontinui.io.
+
+Exit codes:
+  0  ok -- GitHub label applied, coord row written AND read back present
+  2  usage error or invalid label (nothing sent)
+  3  the GitHub-side label add failed
+  4  coord refused or failed the write, or its read door CONTRADICTED it
+     (answered 200 without the label coord said it wrote)
+  5  coord row WITHHELD -- the write tenant was not proven to own the repo
+  6  written but read-back UNKNOWN -- the read door (GET /coord/agent-pr-labels)
+     could not be asked: unreachable, 401, 404 (a coord predating the door
+     404s for everyone), 5xx, an unparseable body, or no credential. Never ok.
 
 Examples:
   set-label.sh --repo qontinui/qontinui-coord --pr 75 \
@@ -613,10 +631,11 @@ jwt_shaped() {
 }
 
 # jwt-cascade-selection: each source ($COORD_DEVICE_JWT, then the file, then a
-# coord mint from `POST $COORD_URL/agents/credential` -- not the runner) is gated
-# on VALIDITY by jwt_usable_for -- shape, exp >= 60 s away and the wanted tenant --
-# and a source that fails falls through to the next, so a stale static token
-# never shadows the one behind it (#366).
+# mint cached in shell memory by an earlier step, then a fresh coord mint from
+# `POST $COORD_URL/agents/credential` -- not the runner) is gated on VALIDITY by
+# jwt_usable_for -- shape, exp >= 60 s away and the wanted tenant -- and a source
+# that fails falls through to the next, so a stale static token never shadows
+# the one behind it (#366).
 # jwt_usable_for <jwt> <tenant> -> 0 iff JWT-shaped, exp >= 60 s away, and its
 # `tenant_id` claim IS <tenant> (case-folded: coord's claims are lowercase).
 jwt_usable_for() {
@@ -646,13 +665,23 @@ print(v if isinstance(v,str) else "")' < "$mf" 2>/dev/null | tr -d '[:space:]' |
 }
 
 # stage_bearer_for <tenant> -> writes `Authorization: Bearer <jwt>` to
-# $TMPD/bearer.hdr (0600, never on argv) and prints its source (env|file|mint),
-# or prints `rejected(<why>)` and writes nothing. Only a token whose `tenant_id`
-# claim IS <tenant> is ever staged: a token for another tenant would answer the
-# ownership door about the WRONG tenant, which is the defect this guards.
+# $TMPD/bearer.hdr (0600, never on argv) and sets BEARER_SRC to its source
+# (env|file|mint), or sets BEARER_SRC to `rejected(<why>)` and writes nothing.
+# Only a token whose `tenant_id` claim IS <tenant> is ever staged: a token for
+# another tenant would answer the ownership door about the WRONG tenant, which
+# is the defect this guards.
+#
+# It sets a global rather than printing, and so must be called directly, never
+# inside `$( )`: the token it MINTS is kept in STAGED_MINT_JWT (shell memory,
+# never a file) so the read-back after the write re-stages the same credential
+# instead of spending a second anonymous POST /agents/credential. A subshell
+# would drop that cache on the floor.
+STAGED_MINT_JWT=""
+BEARER_SRC=""
 stage_bearer_for() {
   local want="$1" home_dir="${HOME:-${USERPROFILE:-}}" jwt="" src="" why="" f dev code c
   rm -f "$TMPD/bearer.hdr"
+  BEARER_SRC=""
   f="$(printf '%s' "${COORD_DEVICE_JWT:-}" | tr -d '[:space:]')"
   if [ -n "$f" ]; then
     if jwt_usable_for "$f" "$want"; then jwt="$f"; src=env
@@ -662,6 +691,9 @@ stage_bearer_for() {
     f="$(tr -d '[:space:]' < "$home_dir/.qontinui/coord-device-jwt" 2>/dev/null || true)"
     if jwt_usable_for "$f" "$want"; then jwt="$f"; src=file
     else why="${why:+$why; }~/.qontinui/coord-device-jwt is stale or claims another tenant"; fi
+  fi
+  if [ -z "$jwt" ] && [ -n "$STAGED_MINT_JWT" ] && jwt_usable_for "$STAGED_MINT_JWT" "$want"; then
+    jwt="$STAGED_MINT_JWT"; src=mint
   fi
   if [ -z "$jwt" ]; then
     dev="$(device_id)"
@@ -683,7 +715,7 @@ if isinstance(d, dict):
         v=d.get(k)
         if isinstance(v,str) and v: print(v); break' < "$TMPD/mint.json" 2>/dev/null | tr -d '[:space:]' || true)"
         c="$(jwt_claim "$f" tenant_id)"
-        if jwt_usable_for "$f" "$want"; then jwt="$f"; src=mint
+        if jwt_usable_for "$f" "$want"; then jwt="$f"; src=mint; STAGED_MINT_JWT="$f"
         elif jwt_shaped "$f" && [ "${c,,}" = "${want,,}" ]; then why="${why:+$why; }POST /agents/credential for tenant $want returned a token that is expired or carries no exp -- not used"
         else why="${why:+$why; }POST /agents/credential for tenant $want returned a token claiming tenant ${c:-<none>} (a coord predating the tenant_id field mints for the device's legacy pointer) -- not used"; fi
       else
@@ -694,9 +726,9 @@ if isinstance(d, dict):
   fi
   if [ -n "$jwt" ]; then
     ( umask 077; printf 'Authorization: Bearer %s\n' "$jwt" > "$TMPD/bearer.hdr" )
-    printf '%s' "$src"
+    BEARER_SRC="$src"
   else
-    printf 'rejected(%s)' "${why:-no credential}"
+    BEARER_SRC="rejected(${why:-no credential})"
   fi
 }
 
@@ -806,7 +838,7 @@ elif ! is_uuid "$WRITE_TENANT"; then
 elif ! bearer_url_ok; then
   withhold "ownership of $REPO by the write tenant $WRITE_TENANT is UNKNOWN: COORD_URL=$COORD_URL is neither https nor loopback, so no device credential is sent to it"
 else
-  BEARER_SRC="$(stage_bearer_for "$WRITE_TENANT")"
+  stage_bearer_for "$WRITE_TENANT"
   case "$BEARER_SRC" in
     rejected*)
       withhold "ownership of $REPO by the write tenant $WRITE_TENANT is UNKNOWN: no credential for that tenant (${BEARER_SRC#rejected})" ;;
@@ -860,4 +892,155 @@ if [[ -n "$WRITE_TENANT" && "$TENANT_ID" != "?" && "${TENANT_ID,,}" != "$WRITE_T
   exit 4
 fi
 
-echo "ok: coord recorded label \"$LABEL\" in pr_labels (tenant_id=$TENANT_ID, written=$WRITTEN)"
+# ----- read-back: coord.pr_labels is READ, not inferred from the 200 ---------
+#
+# Plan 2026-09-10-coord-pr-labels-have-no-agent-read-door, Phase 3. A 2xx with
+# `written >= 1` is coord's claim about its own write; served policy makes the
+# read-back mandatory (coordination's lost-write doctrine), and until coord grew
+# `GET /coord/agent-pr-labels` this write had no door to read it through at all.
+# Three answers, and they are deliberately THREE exits, not two:
+#
+#   * 200 listing the label           -> the `ok:` line, naming the read-back. exit 0
+#   * 200 NOT listing it              -> a CONTRADICTION: coord said written=N
+#                                        and its own read door disagrees.      exit 4
+#   * anything else -- 000, 401, 404, 5xx, an unparseable body, no credential
+#     that could be staged            -> written but read-back UNKNOWN.        exit 6
+#
+# 4 and 6 are kept apart because their remedies are opposite: a contradiction
+# is a coord defect to report with the body in hand, while an UNKNOWN is a
+# question to ask again later -- and folding it into 4 would file a coord bug
+# every time the door was merely unreachable. 6 NEVER prints `ok:`.
+#
+# 404 is UNKNOWN, not "absent", for two reasons. The door answers 404 for a
+# repo the caller's tenant does not own, the same 404 as an unregistered repo
+# (it cannot leak cross-tenant existence) -- and the owner check above has just
+# PROVEN this tenant owns it, so that arm is unlikely. The likelier arm is a
+# running coord that PREDATES the read door, where the route does not exist and
+# 404s for everyone. Neither is evidence about the row.
+#
+# The read is keyed on the tenant the write was proven under, with the same
+# credential cascade (and, for a minted token, the same token) as the owner
+# check. When the probe echoed no tenant (coord's `enforce` arm chose the tenant
+# itself) the POST's own `tenant_id` is used if it names one; if neither does,
+# no credential can be scoped to the read and the answer is UNKNOWN, not a
+# guess. The door itself does not filter rows by tenant -- ownership is its
+# gate -- so any owner's credential reads the whole set for the PR.
+#
+# A bare-repo dep label (`coord:downstream-of=qontinui-web#9`) is STORED in its
+# canonical owner-qualified form (coord `labels_routes::canonicalize_dep_label`),
+# so for that shape a row `coord:<key>=<owner>/<repo>#<n>` also counts as the
+# label, and the ok line names the stored spelling. Matching only the raw input
+# would report every such write as a contradiction.
+RC_READBACK_UNKNOWN=6
+
+readback_unknown() { # <reason>
+  echo "error: written but read-back UNKNOWN: $1" >&2
+  echo "       coord answered written=$WRITTEN (tenant_id=$TENANT_ID) for \"$LABEL\" on $REPO#$PR, but" >&2
+  echo "       whether coord.pr_labels now carries it could not be READ, so this is not an ok." >&2
+  echo "       The gh-side label is applied (canonical). Re-ask later rather than re-send: the" >&2
+  echo "       write is an upsert, so a re-send is harmless but cannot answer the question --" >&2
+  echo "       GET $COORD_URL/coord/agent-pr-labels?repo=$REPO&pr_number=$PR under a device JWT" >&2
+  echo "       for the owning tenant, or the \`labels\` field of coord_pr_status." >&2
+  exit "$RC_READBACK_UNKNOWN"
+}
+
+# readback_verdict -> reads $RB_BODY; prints one line:
+#   `present <source> <stored-name>`  the label (or its canonical form) is listed
+#   `absent <count>`                  a well-formed answer that does not list it
+#   `bad <why>`                       anything that is not a well-formed answer
+readback_verdict() {
+  printf '%s' "$RB_BODY" | H_LABEL="$LABEL" H_PR="$PR" python3 -c '
+import json, os, re, sys
+try:
+    d = json.load(sys.stdin)  # envelope-ok: the GET /coord/agent-pr-labels body, validated field by field below
+except Exception:
+    print("bad body is not JSON"); sys.exit(0)
+if not isinstance(d, dict):
+    print("bad body is not a JSON object"); sys.exit(0)
+rows = d.get("labels")  # envelope-ok: the agent-pr-labels body; a missing or non-list value is reported as bad, never as absent
+if not isinstance(rows, list):
+    print("bad body carries no labels list"); sys.exit(0)
+pr = d.get("pr_number")  # envelope-ok: the agent-pr-labels body echo, checked against the PR asked about
+if pr is not None and str(pr) != str(int(os.environ["H_PR"])):
+    print("bad body answers pr_number %s, not the PR asked about" % pr); sys.exit(0)
+want = os.environ["H_LABEL"]
+alt = None
+m = re.fullmatch(r"coord:(upstream-of|downstream-of|stacked-on)=([^/#]+)#(.+)", want)
+if m:
+    alt = re.compile(r"coord:%s=[^/#]+/%s#%s" % (re.escape(m.group(1)), re.escape(m.group(2)), re.escape(m.group(3))))
+names = []
+for r in rows:
+    if not isinstance(r, dict) or not isinstance(r.get("name"), str):  # envelope-ok: one agent-pr-labels row
+        print("bad a labels entry has no string name"); sys.exit(0)
+    names.append((r["name"], r.get("source")))  # envelope-ok: one agent-pr-labels row
+hit = [x for x in names if x[0] == want] or ([x for x in names if alt.fullmatch(x[0])] if alt else [])
+if hit:
+    src = hit[0][1] if isinstance(hit[0][1], str) and hit[0][1] else "?"
+    print("present %s %s" % (src, hit[0][0]))
+else:
+    print("absent %d" % len(names))
+' 2>/dev/null || echo "bad the body could not be parsed"
+}
+
+READ_TENANT="$WRITE_TENANT"
+if [[ -z "$READ_TENANT" && "$TENANT_ID" != "?" ]] && is_uuid "$TENANT_ID"; then
+  READ_TENANT="${TENANT_ID,,}"
+fi
+echo "read-back: GET $COORD_URL/coord/agent-pr-labels?repo=$REPO&pr_number=$PR"
+if [[ -z "$READ_TENANT" ]]; then
+  readback_unknown "coord chose the write tenant itself (enforce) and echoed none on the probe or the write, so no credential can be scoped to the read"
+fi
+if ! bearer_url_ok; then
+  readback_unknown "COORD_URL=$COORD_URL is neither https nor loopback, so no device credential is sent to it"
+fi
+stage_bearer_for "$READ_TENANT"
+case "$BEARER_SRC" in
+  rejected*) readback_unknown "no credential for tenant $READ_TENANT could be staged (${BEARER_SRC#rejected})" ;;
+esac
+: > "$TMPD/readback.json"
+RB_CODE="$(curl -sS -G -o "$(curl_path "$TMPD/readback.json")" -w '%{http_code}' \
+  --connect-timeout "$HTTP_CONNECT_TIMEOUT" -m "$HTTP_TIMEOUT" \
+  -H "@$(curl_path "$TMPD/bearer.hdr")" \
+  --data-urlencode "repo=$REPO" --data-urlencode "pr_number=$PR" \
+  "$COORD_URL/coord/agent-pr-labels" 2>/dev/null)" || RB_CODE="000"
+rm -f "$TMPD/bearer.hdr"
+RB_CODE="${RB_CODE:-000}"
+RB_BODY="$(cat "$TMPD/readback.json" 2>/dev/null || true)"
+RB_SNIP="$(printf '%s' "$RB_BODY" | head -c 300)"
+
+case "$RB_CODE" in
+  200) : ;;
+  000) readback_unknown "the read door did not answer (coord unreachable, bearer=$BEARER_SRC)" ;;
+  401) readback_unknown "the read door answered HTTP 401 to a token claiming tenant $READ_TENANT (bearer=$BEARER_SRC) -- body: $RB_SNIP" ;;
+  404)
+    if [[ "$OWNER_NOTE" == proven:* ]]; then
+      readback_unknown "the read door answered HTTP 404 (bearer=$BEARER_SRC). Most likely the running coord PREDATES GET /coord/agent-pr-labels, whose route then does not exist; the door's own 404 for a repo this tenant does not own is the other arm, and the owner check above proved the opposite -- body: $RB_SNIP"
+    else
+      readback_unknown "the read door answered HTTP 404 (bearer=$BEARER_SRC). Either the running coord PREDATES GET /coord/agent-pr-labels, or tenant $READ_TENANT does not own $REPO -- ownership was NOT proven on this path (the tenant came from coord's write response, not the owner check), so the two are indistinguishable here -- body: $RB_SNIP"
+    fi ;;
+  *)   readback_unknown "the read door answered HTTP $RB_CODE (bearer=$BEARER_SRC) -- body: $RB_SNIP" ;;
+esac
+
+RB_VERDICT="$(readback_verdict)"
+case "$RB_VERDICT" in
+  present\ *)
+    RB_REST="${RB_VERDICT#present }"
+    RB_SOURCE="${RB_REST%% *}"
+    RB_NAME="${RB_REST#* }"
+    RB_AS=""
+    if [[ "$RB_NAME" != "$LABEL" ]]; then RB_AS=", stored as \"$RB_NAME\""; fi
+    echo "ok: coord recorded label \"$LABEL\" in pr_labels (tenant_id=$TENANT_ID, written=$WRITTEN) (read back: present, source=$RB_SOURCE$RB_AS)"
+    ;;
+  absent\ *)
+    echo "error: CONTRADICTION -- coord said written=$WRITTEN for \"$LABEL\" on $REPO#$PR, but its read door" >&2
+    echo "       (GET /coord/agent-pr-labels, HTTP 200, ${RB_VERDICT#absent } label(s) listed) does not list it." >&2
+    echo "       This is a coord defect, not a transient: report it with both bodies." >&2
+    echo "       write body: $POST_BODY" >&2
+    echo "       read body:  $RB_BODY" >&2
+    echo "       gh-side label add succeeded (canonical)." >&2
+    exit 4
+    ;;
+  *)
+    readback_unknown "the read door answered HTTP 200 with a body that is not a label list (${RB_VERDICT#bad }) -- body: $RB_SNIP"
+    ;;
+esac
