@@ -3977,7 +3977,7 @@ impl ConfigDirSource {
 pub(crate) fn resolve_config_dir() -> Result<(PathBuf, ConfigDirSource), String> {
     resolve_config_dir_from(
         std::env::var("QONTINUI_CONFIG_DIR").ok(),
-        dirs::config_dir(),
+        qontinui_runner_lib::ambient::platform_config_dir(),
     )
 }
 
@@ -6693,13 +6693,10 @@ mod load_persist_tests {
         "QONTINUI_RESTATE_INGRESS_PORT",
         "QONTINUI_DISABLE_KEYCHAIN",
         // `claude_accounts` resolves the machine-global roster from
-        // `dirs::config_dir()`, deliberately ignoring `QONTINUI_CONFIG_DIR`.
-        // On Linux that honours `XDG_CONFIG_HOME`, which is what makes the
-        // roster half of this test hermetic there. (On Windows `dirs` asks the
-        // known-folder API instead, so the roster read falls back to the real
-        // machine — the assertion below still holds, it just observes the real
-        // roster rather than the fixture's.)
-        "XDG_CONFIG_HOME",
+        // `ambient::platform_config_dir()`, deliberately ignoring
+        // `QONTINUI_CONFIG_DIR`. In a test process that resolver answers this
+        // override (never the real config dir), on every platform.
+        "QONTINUI_TEST_PLATFORM_CONFIG_DIR",
     ];
 
     /// A load-time persist must be built from the RAW ON-DISK document, so
@@ -6750,8 +6747,7 @@ mod load_persist_tests {
         });
         std::fs::write(&path, serde_json::to_vec_pretty(&on_disk_json).unwrap()).expect("write");
 
-        // A machine-global Claude roster that the overlay WILL apply in memory
-        // (on the platforms where `dirs::config_dir()` follows the env).
+        // A machine-global Claude roster that the overlay WILL apply in memory.
         let roster_dir = xdg_dir.path().join("com.qontinui.runner");
         std::fs::create_dir_all(&roster_dir).expect("mkdir");
         std::fs::write(
@@ -6764,7 +6760,7 @@ mod load_persist_tests {
         // Empty dir ⇒ no `paired_user.json` ⇒ not paired, so pairing cannot
         // supply the durable signal this test is about the ABSENCE of.
         std::env::set_var("QONTINUI_SECURE_STORAGE_DIR", config_dir.path());
-        std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
+        std::env::set_var("QONTINUI_TEST_PLATFORM_CONFIG_DIR", xdg_dir.path());
         // Primary, not a supervisor-launched secondary: the persist guard must
         // be OPEN, or this test would pass for the wrong reason.
         std::env::remove_var("QONTINUI_INSTANCE_NAME");

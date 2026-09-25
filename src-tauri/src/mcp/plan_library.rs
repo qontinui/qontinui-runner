@@ -3363,8 +3363,7 @@ mod tests {
     // `the_handler_dials_upstream_with_only_the_allowlisted_param` drives a
     // READ route and does dial — but at a stub listener this module binds
     // itself, with `QONTINUI_WEB_BACKEND_URL`, `QONTINUI_CONFIG_DIR` and
-    // `XDG_CONFIG_HOME` redirected under `EnvVarRestore` — hermetic on
-    // Linux/macOS; see that test's own caveat for the Windows roster path.
+    // `QONTINUI_TEST_PLATFORM_CONFIG_DIR` redirected under `EnvVarRestore`.
     // Driving a read route WITHOUT that redirection would reach
     // whatever backend the machine is configured for — and would also let
     // `load_settings()` rewrite the operator's real config.
@@ -3500,7 +3499,7 @@ mod tests {
             PLAN_LIBRARY_WRITE_FLAG,
             WEB_BACKEND_URL_ENV_FOR_TEST,
             "QONTINUI_CONFIG_DIR",
-            "XDG_CONFIG_HOME",
+            "QONTINUI_TEST_PLATFORM_CONFIG_DIR",
         ]);
         std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
         // `web_base()` -> `api_config::get_api_base_url()` -> `settings::load_settings()`,
@@ -3514,7 +3513,7 @@ mod tests {
         //     `QONTINUI_CONFIG_DIR` (measured: an 8 KB write into an empty
         //     config dir before this redirect existed).
         //   * `claude-accounts.json` — `claude_accounts::claude_accounts_file_path()`
-        //     is ALWAYS rooted at `dirs::config_dir()` and its own doc says
+        //     is ALWAYS rooted at `ambient::platform_config_dir()` and its own doc says
         //     `QONTINUI_CONFIG_DIR` is "deliberately ignored". Redirecting only
         //     the first leaves a machine-GLOBAL roster write, measured on a box
         //     in the pre-migration state (no `claude-accounts.json` + a
@@ -3522,15 +3521,12 @@ mod tests {
         //     exactly the state `migrate_seed` exists to serve. It short-circuits
         //     on `accounts_path.exists()`, so a box that has already migrated
         //     shows nothing, which is why the first measurement missed it.
-        //     `XDG_CONFIG_HOME` is what moves `dirs::config_dir()`.
-        //
-        // CAVEAT, stated rather than implied: `XDG_CONFIG_HOME` closes this on
-        // Linux/macOS only. On Windows `dirs::config_dir()` resolves through the
-        // known-folder API and no environment variable redirects it, so this
-        // test is NOT hermetic for the roster there.
+        //     `QONTINUI_TEST_PLATFORM_CONFIG_DIR` is what moves that resolver
+        //     in a test process — on every platform; it never answers the real
+        //     config dir to a test anyway.
         let cfg = tempfile::tempdir().expect("temp config dir");
         std::env::set_var("QONTINUI_CONFIG_DIR", cfg.path());
-        std::env::set_var("XDG_CONFIG_HOME", cfg.path());
+        std::env::set_var("QONTINUI_TEST_PLATFORM_CONFIG_DIR", cfg.path());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -3617,17 +3613,17 @@ mod tests {
             PLAN_LIBRARY_SYNC_ENV,
             WEB_BACKEND_URL_ENV_FOR_TEST,
             "QONTINUI_CONFIG_DIR",
-            "XDG_CONFIG_HOME",
+            "QONTINUI_TEST_PLATFORM_CONFIG_DIR",
         ]);
         std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
         std::env::remove_var(PLAN_LIBRARY_SYNC_ENV);
         // `web_base()` reaches a settings WRITER with two roots, only one of
         // which obeys `QONTINUI_CONFIG_DIR` — see
         // `the_handler_dials_upstream_with_only_the_allowlisted_param` for why
-        // both are redirected and why the roster half is Linux/macOS-only.
+        // why both are redirected.
         let cfg = tempfile::tempdir().expect("temp config dir");
         std::env::set_var("QONTINUI_CONFIG_DIR", cfg.path());
-        std::env::set_var("XDG_CONFIG_HOME", cfg.path());
+        std::env::set_var("QONTINUI_TEST_PLATFORM_CONFIG_DIR", cfg.path());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();

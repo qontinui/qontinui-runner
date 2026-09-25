@@ -107,7 +107,7 @@ impl ConfigStorage {
     /// Scoped per-runner for secondary instances so themed runners don't
     /// share their config library with the primary.
     pub fn new() -> Result<Self, ConfigStorageError> {
-        let base = dirs::config_dir()
+        let base = qontinui_runner_lib::ambient::platform_config_dir()
             .ok_or_else(|| {
                 ConfigStorageError::InvalidPath("Could not determine config directory".to_string())
             })?

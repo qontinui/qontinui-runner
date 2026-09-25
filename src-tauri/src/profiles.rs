@@ -609,7 +609,7 @@ pub fn settings_json_path() -> (Option<PathBuf>, SettingsJsonPathSource) {
             SettingsJsonPathSource::EnvConfigDir,
         );
     }
-    match dirs::config_dir() {
+    match crate::ambient::platform_config_dir() {
         Some(d) => (
             Some(d.join("com.qontinui.runner").join("settings.json")),
             SettingsJsonPathSource::PlatformConfigDir,

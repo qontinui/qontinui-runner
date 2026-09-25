@@ -140,7 +140,7 @@ fn default_version() -> String {
 /// Scoped per-runner for secondary instances so themed/test runners don't
 /// share a prompt library with the primary.
 fn get_prompts_path() -> Result<PathBuf, String> {
-    let base = dirs::config_dir()
+    let base = qontinui_runner_lib::ambient::platform_config_dir()
         .ok_or("Failed to get config directory")?
         .join("com.qontinui.runner");
     let app_data_dir = crate::instance::scope_path(&base);

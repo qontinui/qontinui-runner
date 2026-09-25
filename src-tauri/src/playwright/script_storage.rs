@@ -170,7 +170,7 @@ impl Default for PlaywrightLibrary {
 /// between `com.qontinui.runner` and `playwright`, so concurrent runners
 /// don't share playwright tests or results.
 fn get_playwright_dir() -> Result<PathBuf, String> {
-    let base = dirs::config_dir()
+    let base = qontinui_runner_lib::ambient::platform_config_dir()
         .ok_or("Failed to get config directory")?
         .join("com.qontinui.runner");
     let app_data_dir = crate::instance::scope_path(&base).join("playwright");

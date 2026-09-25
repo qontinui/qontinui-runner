@@ -569,7 +569,7 @@ struct CachedSkills {
 /// Absolute path of the skill cache for this runner instance, or `None` when
 /// the platform has no config dir.
 fn cache_path() -> Option<PathBuf> {
-    let base = dirs::config_dir()?.join("com.qontinui.runner");
+    let base = qontinui_runner_lib::ambient::platform_config_dir()?.join("com.qontinui.runner");
     Some(crate::instance::scope_path(&base).join(CACHE_FILE))
 }
 

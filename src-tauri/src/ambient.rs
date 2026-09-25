@@ -295,6 +295,7 @@ pub const AMBIENT_ENV_KEYS: &[&str] = &[
     "QONTINUI_TERMINAL_ID",
     "QONTINUI_TERMINAL_SANITIZE",
     "QONTINUI_TEST_AUTO_LOGIN_EMAIL",
+    "QONTINUI_TEST_PLATFORM_CONFIG_DIR",
     "QONTINUI_TRUST_GATE_TIER",
     "QONTINUI_UI_BRIDGE_LLM_RECOVERY",
     "QONTINUI_UI_BRIDGE_MULTI_WINDOW",
@@ -518,6 +519,48 @@ pub fn runner_dir() -> Option<PathBuf> {
 /// [`runner_dir`] with the `./.qontinui/runner` fallback of [`qontinui_dir_or_cwd`].
 pub fn runner_dir_or_cwd() -> PathBuf {
     qontinui_dir_or_cwd().join("runner")
+}
+
+/// Test-only override for [`platform_config_dir`]. Read ONLY in a test
+/// process, so a production runner can never be pointed anywhere by it.
+pub const TEST_PLATFORM_CONFIG_DIR_ENV: &str = "QONTINUI_TEST_PLATFORM_CONFIG_DIR";
+
+/// The platform config dir (`dirs::config_dir()`) — the ONE spelling of it in
+/// the crate; a source-scan test enforces that.
+///
+/// In a test process this NEVER returns the operator's real config dir, with
+/// no exception for a live [`test_support::IsolatedAmbient`]: it answers
+/// `$QONTINUI_TEST_PLATFORM_CONFIG_DIR` when set, else a per-process directory
+/// under the deflected home.
+///
+/// # Why unconditional, unlike [`canary`]
+///
+/// The settings loader resolves its path twice — once to read, once to
+/// persist. A test that pointed `QONTINUI_CONFIG_DIR` (or `XDG_CONFIG_HOME`) at
+/// a temp dir let a PARALLEL test read an absent file there, build defaults and
+/// mint a fresh `local_user_id`, then persist after the variable was restored
+/// — straight into the real `settings.json`, blanking `paths.plans_dir` and
+/// turning the markdown-plan tier OFF. Measured on merytshost 2026-09-23/24:
+/// every settings reset the settings watcher recorded (11, from 7 processes)
+/// was written by a `deps/qontinui_runner-*` test binary. Making the platform
+/// fallback unreachable from a test process removes that destination.
+///
+/// It does NOT cover an explicit `QONTINUI_CONFIG_DIR` inherited from the
+/// shell: a test process that is HANDED the real dir is told to use it, and
+/// [`test_support::EnvVarRestore`] will restore it after a fixture.
+pub fn platform_config_dir() -> Option<PathBuf> {
+    #[cfg(any(test, debug_assertions))]
+    if test_support::canary_armed() {
+        if let Some(dir) = std::env::var_os(TEST_PLATFORM_CONFIG_DIR_ENV)
+            .filter(|v| !v.to_string_lossy().trim().is_empty())
+        {
+            return Some(PathBuf::from(dir));
+        }
+        let dir = deflected_dir().join("platform-config");
+        let _ = std::fs::create_dir_all(&dir);
+        return Some(dir);
+    }
+    dirs::config_dir()
 }
 
 /// The path of [`MACHINE_JSON`] under [`qontinui_dir`].
@@ -1078,6 +1121,13 @@ pub mod test_support {
             for key in KEYS_SET_TO_DIR {
                 std::env::set_var(key, dir.path());
             }
+            // Each fixture gets its OWN platform config dir, so a
+            // `settings.json` / `claude-accounts.json` one test writes is not
+            // read by the next (the shared deflected dir is per process).
+            let platform_config = dir.path().join("platform-config");
+            std::fs::create_dir_all(&platform_config)
+                .expect("isolated ambient fixture needs <dir>/platform-config");
+            std::env::set_var(super::TEST_PLATFORM_CONFIG_DIR_ENV, &platform_config);
             std::env::set_var("QONTINUI_ROOT", &root);
             for key in KEYS_REMOVED {
                 std::env::remove_var(key);
@@ -1374,6 +1424,47 @@ mod tests {
         let dir = qontinui_dir().expect("a home directory must resolve");
         assert_eq!(dir.file_name().and_then(|s| s.to_str()), Some(".qontinui"));
         assert!(dir.parent().is_some_and(|p| !p.as_os_str().is_empty()));
+    }
+
+    /// A test process never resolves the operator's real platform config dir —
+    /// not unguarded, not inside a fixture — and the override steers it.
+    #[test]
+    fn platform_config_dir_never_answers_the_real_config_dir_in_a_test() {
+        let _lock = env_lock();
+        let _restore = EnvVarRestore::capture(&[TEST_PLATFORM_CONFIG_DIR_ENV]);
+        std::env::remove_var(TEST_PLATFORM_CONFIG_DIR_ENV);
+        let real = dirs::config_dir();
+
+        let unguarded = platform_config_dir().expect("a test always gets a config dir");
+        assert_ne!(
+            Some(&unguarded),
+            real.as_ref(),
+            "unguarded test got the real config dir"
+        );
+        assert!(
+            unguarded.is_dir(),
+            "the deflected config dir must exist so writes land in it"
+        );
+
+        {
+            let _amb = isolated_ambient();
+            let guarded = platform_config_dir().expect("a test always gets a config dir");
+            assert_ne!(
+                Some(&guarded),
+                real.as_ref(),
+                "a fixture must not re-open the real dir"
+            );
+        }
+
+        let pinned = tempfile::tempdir().expect("tempdir");
+        std::env::set_var(TEST_PLATFORM_CONFIG_DIR_ENV, pinned.path());
+        assert_eq!(platform_config_dir().as_deref(), Some(pinned.path()));
+        std::env::set_var(TEST_PLATFORM_CONFIG_DIR_ENV, "  ");
+        assert_eq!(
+            platform_config_dir(),
+            Some(unguarded),
+            "a blank override is not an override"
+        );
     }
 
     /// The generalisation of the bin's old `isolate_coord_env_pins_every_declared_key`:
@@ -1991,6 +2082,36 @@ mod tests {
             violations.is_empty(),
             "env keys read but not declared in ambient::AMBIENT_ENV_KEYS (add them, sorted):\n  {}",
             violations.into_iter().collect::<Vec<_>>().join("\n  ")
+        );
+    }
+
+    /// Drift guard (c): outside this module nobody names `dirs::config_dir`.
+    /// [`platform_config_dir`] is what keeps a test process off the operator's
+    /// real config dir; a direct call is a new door around it.
+    #[test]
+    fn no_platform_config_dir_is_resolved_outside_the_seam() {
+        let mut violations = Vec::new();
+        for (rel, leaves) in production_sources() {
+            if rel == "ambient.rs" {
+                continue;
+            }
+            for (i, leaf) in leaves.iter().enumerate() {
+                // Any `dirs::config_dir` path — a call, a `use` import, or the
+                // function passed by name (`.or_else(dirs::config_dir)`).
+                let names_config_dir = leaf.is_ident("config_dir")
+                    && i >= 3
+                    && leaves[i - 3].is_ident("dirs")
+                    && leaves[i - 2].is_punct(':')
+                    && leaves[i - 1].is_punct(':');
+                if names_config_dir {
+                    violations.push(format!("{rel}:{}", leaf.line));
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "`dirs::config_dir` named outside ambient.rs — use ambient::platform_config_dir():\n  {}",
+            violations.join("\n  ")
         );
     }
 }

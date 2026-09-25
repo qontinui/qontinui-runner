@@ -94,7 +94,7 @@ fn accounts_path_under(config_root: &Path) -> PathBuf {
 /// instance on the machine resolves the SAME file. Mirrors the unscoped
 /// `session_file_path` resolver for `active_instances.json`.
 pub fn claude_accounts_file_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| accounts_path_under(&d))
+    qontinui_runner_lib::ambient::platform_config_dir().map(|d| accounts_path_under(&d))
 }
 
 /// Unscoped canonical `settings.json` (the PRIMARY runner's file) — the
@@ -102,7 +102,8 @@ pub fn claude_accounts_file_path() -> Option<PathBuf> {
 /// running the migration has to probe the primary's file, not its own
 /// instance-scoped copy.
 fn unscoped_settings_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("com.qontinui.runner").join("settings.json"))
+    qontinui_runner_lib::ambient::platform_config_dir()
+        .map(|d| d.join("com.qontinui.runner").join("settings.json"))
 }
 
 /// Load the roster from `path`. Fail-open: missing or corrupt file → `None`
@@ -325,20 +326,23 @@ mod tests {
         );
     }
 
-    /// The canonical path must come straight from `dirs::config_dir()` —
-    /// `QONTINUI_CONFIG_DIR` plays no part. The resolver never reads env, so
-    /// this asserts equality with the dirs-derived path without mutating
-    /// process env (env-mutation would race other tests' `load_settings`).
+    /// The canonical path is machine-global: `QONTINUI_CONFIG_DIR` (the
+    /// per-instance override) plays no part in it, and it never resolves under
+    /// an instance scope.
     #[test]
     fn canonical_path_ignores_qontinui_config_dir() {
-        let expected = dirs::config_dir().map(|d| accounts_path_under(&d));
-        assert_eq!(claude_accounts_file_path(), expected);
-        if let Some(p) = claude_accounts_file_path() {
-            assert!(
-                !p.to_string_lossy().contains("instances"),
-                "claude-accounts.json must never resolve under an instance scope"
-            );
-        }
+        let _lock = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_CONFIG_DIR"]);
+        std::env::remove_var("QONTINUI_CONFIG_DIR");
+        let unset = claude_accounts_file_path();
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("QONTINUI_CONFIG_DIR", elsewhere.path());
+        assert_eq!(claude_accounts_file_path(), unset);
+        let p = unset.expect("a test process always resolves a config dir");
+        assert!(
+            !p.to_string_lossy().contains("instances"),
+            "claude-accounts.json must never resolve under an instance scope"
+        );
     }
 
     #[test]

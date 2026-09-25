@@ -280,7 +280,8 @@ fn config_path_for(id: AiClientId) -> Option<PathBuf> {
 
 fn claude_desktop_path() -> Option<PathBuf> {
     if cfg!(windows) {
-        dirs::config_dir().map(|d| d.join("Claude").join("claude_desktop_config.json"))
+        qontinui_runner_lib::ambient::platform_config_dir()
+            .map(|d| d.join("Claude").join("claude_desktop_config.json"))
     } else if cfg!(target_os = "macos") {
         dirs::home_dir().map(|h| {
             h.join("Library")
@@ -289,14 +290,15 @@ fn claude_desktop_path() -> Option<PathBuf> {
                 .join("claude_desktop_config.json")
         })
     } else {
-        dirs::config_dir().map(|d| d.join("Claude").join("claude_desktop_config.json"))
+        qontinui_runner_lib::ambient::platform_config_dir()
+            .map(|d| d.join("Claude").join("claude_desktop_config.json"))
     }
 }
 
 fn cline_path() -> Option<PathBuf> {
     let cline_dir = ["saoudrizwan.claude-dev", "settings"];
     if cfg!(windows) {
-        let base = dirs::config_dir()?;
+        let base = qontinui_runner_lib::ambient::platform_config_dir()?;
         Some(
             base.join("Code")
                 .join("User")
