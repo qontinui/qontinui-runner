@@ -106,7 +106,10 @@ fn an_inline_provision_on_a_new_spawn_path_is_caught() {
     );
     assert_eq!(
         provisioning_calls_outside_the_entry_point(&sources),
-        BTreeSet::from([("new_spawn_path.rs".to_string(), "spawn_new_kind".to_string())]),
+        BTreeSet::from([(
+            "new_spawn_path.rs".to_string(),
+            "spawn_new_kind".to_string()
+        )]),
     );
     assert!(provisioners_missing_from_the_entry_point(&sources).is_empty());
 
