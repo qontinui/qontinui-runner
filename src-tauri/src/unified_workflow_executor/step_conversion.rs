@@ -110,72 +110,12 @@ pub fn convert_json_steps_with_phase(
         .iter()
         // Filter out prompt steps - they're handled separately to avoid duplicate logging
         .filter(|step| {
-            let step_type = step
-                .get("type")
-                .or_else(|| step.get("step_type"))
-                .and_then(|t| t.as_str())
-                .unwrap_or("");
             !matches!(
-                step_type,
-                "prompt" | "ai_session" | "ai_prompt" | "run_prompt_sequence"
+                value_step_type(step),
+                Some("prompt" | "ai_session" | "ai_prompt" | "run_prompt_sequence")
             )
         })
-        .filter_map(|step| {
-            let mut config =
-                if let Ok(config) = serde_json::from_value::<ExecutionStepConfig>(step.clone()) {
-                    config
-                } else {
-                    // Fall back to manual field extraction — preserve command, working directory,
-                    // and other key fields so that check/test steps with inline commands still work
-                    let step_type = step
-                        .get("type")
-                        .or_else(|| step.get("step_type"))
-                        .and_then(|t| t.as_str())?;
-                    ExecutionStepConfig {
-                        step_type: step_type.to_string(),
-                        name: step
-                            .get("name")
-                            .and_then(|n| n.as_str())
-                            .map(|s| s.to_string()),
-                        id: step
-                            .get("id")
-                            .and_then(|i| i.as_str())
-                            .map(|s| s.to_string()),
-                        shell_command: step
-                            .get("command")
-                            .and_then(|c| c.as_str())
-                            .map(|s| s.to_string()),
-                        shell_command_working_directory: step
-                            .get("working_directory")
-                            .and_then(|w| w.as_str())
-                            .map(|s| s.to_string()),
-                        check_type: step
-                            .get("check_type")
-                            .and_then(|c| c.as_str())
-                            .map(|s| s.to_string()),
-                        test_type: step
-                            .get("test_type")
-                            .and_then(|t| t.as_str())
-                            .map(|s| s.to_string()),
-                        test_id: step
-                            .get("test_id")
-                            .and_then(|t| t.as_str())
-                            .map(|s| s.to_string()),
-                        ..Default::default()
-                    }
-                };
-
-            // Set explicit phase if not already set
-            if config.phase.is_none() {
-                if let Some(phase_str) = explicit_phase {
-                    if let Some(phase) = StepPhase::from_str_opt(phase_str) {
-                        config.set_phase(phase);
-                    }
-                }
-            }
-
-            Some(config)
-        })
+        .filter_map(|step| convert_step_value(step, explicit_phase))
         .collect()
 }
 
@@ -192,63 +132,203 @@ pub fn convert_all_json_steps_with_phase(
 ) -> Vec<ExecutionStepConfig> {
     steps
         .iter()
-        .filter_map(|step| {
-            let mut config =
-                if let Ok(config) = serde_json::from_value::<ExecutionStepConfig>(step.clone()) {
-                    config
-                } else {
-                    // Fall back to manual field extraction — preserve command, working directory,
-                    // and other key fields so that check/test steps with inline commands still work
-                    let step_type = step
-                        .get("type")
-                        .or_else(|| step.get("step_type"))
-                        .and_then(|t| t.as_str())?;
-                    ExecutionStepConfig {
-                        step_type: step_type.to_string(),
-                        name: step
-                            .get("name")
-                            .and_then(|n| n.as_str())
-                            .map(|s| s.to_string()),
-                        id: step
-                            .get("id")
-                            .and_then(|i| i.as_str())
-                            .map(|s| s.to_string()),
-                        shell_command: step
-                            .get("command")
-                            .and_then(|c| c.as_str())
-                            .map(|s| s.to_string()),
-                        shell_command_working_directory: step
-                            .get("working_directory")
-                            .and_then(|w| w.as_str())
-                            .map(|s| s.to_string()),
-                        check_type: step
-                            .get("check_type")
-                            .and_then(|c| c.as_str())
-                            .map(|s| s.to_string()),
-                        test_type: step
-                            .get("test_type")
-                            .and_then(|t| t.as_str())
-                            .map(|s| s.to_string()),
-                        test_id: step
-                            .get("test_id")
-                            .and_then(|t| t.as_str())
-                            .map(|s| s.to_string()),
-                        ..Default::default()
-                    }
-                };
+        .filter_map(|step| convert_step_value(step, explicit_phase))
+        .collect()
+}
 
-            // Set explicit phase if not already set
-            if config.phase.is_none() {
-                if let Some(phase_str) = explicit_phase {
-                    if let Some(phase) = StepPhase::from_str_opt(phase_str) {
-                        config.set_phase(phase);
-                    }
+/// One step of [`convert_json_steps_with_phase`] /
+/// [`convert_all_json_steps_with_phase`]: normalize, parse, and on a parse
+/// failure fall back to a hand-built step — except for `ui_bridge`, see
+/// [`fallback_refused`].
+fn convert_step_value(
+    step: &serde_json::Value,
+    explicit_phase: Option<&str>,
+) -> Option<ExecutionStepConfig> {
+    let mut config =
+        match parse_step_value(step) {
+            Ok(config) => config,
+            Err(e) if fallback_refused(step) => {
+                tracing::error!(
+                "refusing {:?} step {:?}: it does not parse as ExecutionStepConfig ({e}) and the \
+                 hand-built fallback would run it without its action",
+                value_step_type(step).unwrap_or_default(),
+                step.get("name").and_then(|n| n.as_str()).unwrap_or_default(),
+            );
+                return None;
+            }
+            Err(_) => {
+                // Fall back to manual field extraction — preserve command, working directory,
+                // and other key fields so that check/test steps with inline commands still work
+                let step_type = value_step_type(step)?;
+                let get = |key: &str| step.get(key).and_then(|v| v.as_str()).map(str::to_string);
+                ExecutionStepConfig {
+                    step_type: step_type.to_string(),
+                    name: get("name"),
+                    id: get("id"),
+                    shell_command: get("command"),
+                    shell_command_working_directory: get("working_directory"),
+                    check_type: get("check_type"),
+                    test_type: get("test_type"),
+                    test_id: get("test_id"),
+                    ..Default::default()
                 }
             }
+        };
 
-            Some(config)
-        })
-        .collect()
+    // Set explicit phase if not already set
+    if config.phase.is_none() {
+        if let Some(phase_str) = explicit_phase {
+            if let Some(phase) = StepPhase::from_str_opt(phase_str) {
+                config.set_phase(phase);
+            }
+        }
+    }
+
+    Some(config)
+}
+
+// ============================================================================
+// Canonical-key normalization
+// ============================================================================
+
+/// The step type a JSON step declares (`type`, or the generator's `step_type`).
+pub(crate) fn value_step_type(step: &serde_json::Value) -> Option<&str> {
+    step.get("type")
+        .or_else(|| step.get("step_type"))
+        .and_then(|t| t.as_str())
+}
+
+/// Canonical `UiBridgeStep` keys (qontinui-schemas `workflow_step.rs`), in
+/// every spelling a producer writes, and the `ExecutionStepConfig` field each
+/// one feeds. `(canonical spellings, field, prefixed spellings that win)`.
+///
+/// The bare keys are the shared contract: both step editors, the Builder
+/// skill templates and the typed `UiBridgeStep` use them. `ExecutionStepConfig`
+/// reads `ui_bridge_*` instead, and aliases bare `action` / `target` to the
+/// `native_accessibility` fields and `timeoutMs` to `vga_timeout_ms`, so an
+/// un-normalized Builder step reaches the handler with no action at all.
+const UI_BRIDGE_CANONICAL_KEYS: &[(&[&str], &str, &[&str])] = &[
+    (&["action"], "ui_bridge_action", &["uiBridgeAction"]),
+    (&["url"], "ui_bridge_url", &["uiBridgeUrl"]),
+    (&["target"], "ui_bridge_target", &["uiBridgeTarget"]),
+    (
+        &["instruction"],
+        "ui_bridge_instruction",
+        &["uiBridgeInstruction"],
+    ),
+    (
+        &["assert_type", "assertType"],
+        "ui_bridge_assert_type",
+        &["uiBridgeAssertType"],
+    ),
+    (&["expected"], "ui_bridge_expected", &["uiBridgeExpected"]),
+    (
+        &["comparison_mode", "comparisonMode"],
+        "ui_bridge_compare_mode",
+        &["uiBridgeCompareMode"],
+    ),
+    (
+        &["reference_snapshot_id", "referenceSnapshotId"],
+        "ui_bridge_reference_snapshot_id",
+        &["uiBridgeReferenceSnapshotId"],
+    ),
+    (
+        &["severity_threshold", "severityThreshold"],
+        "ui_bridge_severity_threshold",
+        &["uiBridgeSeverityThreshold"],
+    ),
+    (
+        &["timeout_ms", "timeoutMs"],
+        "ui_bridge_timeout_ms",
+        &["uiBridgeTimeoutMs"],
+    ),
+];
+
+/// `ExecutionStepConfig` fields typed `Option<String>` whose canonical value
+/// may arrive as structured JSON (a criteria object in `target`, a number in
+/// `expected`); those are carried as their JSON text, which is what the
+/// handler parses back.
+const UI_BRIDGE_STRING_FIELDS: &[&str] = &[
+    "ui_bridge_action",
+    "ui_bridge_url",
+    "ui_bridge_target",
+    "ui_bridge_instruction",
+    "ui_bridge_assert_type",
+    "ui_bridge_expected",
+    "ui_bridge_compare_mode",
+    "ui_bridge_reference_snapshot_id",
+    "ui_bridge_severity_threshold",
+];
+
+/// Rewrite a step's canonical keys onto the `ExecutionStepConfig` field names,
+/// in place. Runs before EVERY `from_value::<ExecutionStepConfig>` — use
+/// [`parse_step_value`] / [`parse_steps_json`] rather than calling serde
+/// directly.
+///
+/// Only `ui_bridge` steps are rewritten. Each canonical key (snake or camel)
+/// is moved onto its `ui_bridge_*` field when that field is absent or `null`
+/// in both its snake and camel spellings — a prefixed key already present
+/// wins — and the canonical key is REMOVED either way, so bare `action` /
+/// `target` cannot also populate `a11y_*` and `timeoutMs` cannot populate
+/// `vga_timeout_ms`. Idempotent: a serialized `ExecutionStepConfig` carries no
+/// canonical keys, so it passes through unchanged.
+pub fn normalize_step_value(step: &mut serde_json::Value) {
+    if value_step_type(step) != Some("ui_bridge") {
+        return;
+    }
+    let Some(obj) = step.as_object_mut() else {
+        return;
+    };
+    let present = |obj: &serde_json::Map<String, serde_json::Value>, k: &str| {
+        obj.get(k).is_some_and(|v| !v.is_null())
+    };
+    for (canonical, field, prefixed) in UI_BRIDGE_CANONICAL_KEYS {
+        // First non-null canonical spelling wins; every spelling is removed.
+        let mut value = None;
+        for key in *canonical {
+            if let Some(v) = obj.remove(*key) {
+                if value.is_none() && !v.is_null() {
+                    value = Some(v);
+                }
+            }
+        }
+        let Some(value) = value else { continue };
+        let already = present(obj, field) || prefixed.iter().any(|k| present(obj, k));
+        if !already {
+            obj.insert((*field).to_string(), value);
+        }
+    }
+    for field in UI_BRIDGE_STRING_FIELDS {
+        if let Some(v) = obj.get_mut(*field) {
+            if !(v.is_string() || v.is_null()) {
+                *v = serde_json::Value::String(v.to_string());
+            }
+        }
+    }
+}
+
+/// Normalize a copy of `step` ([`normalize_step_value`]) and parse it.
+pub fn parse_step_value(
+    step: &serde_json::Value,
+) -> Result<ExecutionStepConfig, serde_json::Error> {
+    let mut step = step.clone();
+    normalize_step_value(&mut step);
+    serde_json::from_value(step)
+}
+
+/// Parse a JSON array of steps (`execution_steps_json`, a durable batch),
+/// normalizing each ([`normalize_step_value`]).
+pub fn parse_steps_json(json: &str) -> Result<Vec<ExecutionStepConfig>, serde_json::Error> {
+    let steps: Vec<serde_json::Value> = serde_json::from_str(json)?;
+    steps.iter().map(parse_step_value).collect()
+}
+
+/// A step that failed [`parse_step_value`] must not be rebuilt by a
+/// hand-built fallback extractor when that would drop what the step does.
+/// For `ui_bridge` the fallback cannot carry the action faithfully (and an
+/// action-less step silently runs `snapshot`), so it is refused instead.
+pub fn fallback_refused(step: &serde_json::Value) -> bool {
+    value_step_type(step) == Some("ui_bridge")
 }
 
 /// Extract prompt steps from JSON Value array
@@ -274,7 +354,7 @@ pub fn extract_prompt_steps_with_phase(
                 .unwrap_or(false)
         })
         .filter_map(|step| {
-            let mut config = serde_json::from_value::<ExecutionStepConfig>(step.clone()).ok()?;
+            let mut config = parse_step_value(step).ok()?;
 
             // Set explicit phase if not already set
             if config.phase.is_none() {

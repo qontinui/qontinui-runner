@@ -6,7 +6,8 @@
 //! `warn!` (Phase 3), so the parse must be total for every live shape for that
 //! warning to mean a genuine schema/handler disagreement. This corpus feeds every step
 //! shape a LIVE producer emits through the same path the executor takes —
-//! `serde_json::from_value::<ExecutionStepConfig>` → `to_full_runner_step` →
+//! `parse_step_value` (canonical-key normalization, then
+//! `serde_json::from_value::<ExecutionStepConfig>`) → `to_full_runner_step` →
 //! [`handler_lookup_key`] — and asserts:
 //!
 //! - every step whose type the handler registry serves parses `Ok`, and
@@ -36,6 +37,9 @@ use super::{
 };
 use crate::step_executor::handlers::HandlerRegistry;
 use crate::step_executor::ExecutionStepConfig;
+use crate::unified_workflow_executor::step_conversion::{
+    convert_json_steps_with_phase, parse_step_value,
+};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
@@ -289,9 +293,10 @@ fn builder_step(skill: &str, phase: &str, template: Value) -> Shape {
 
 /// One step per `AddStepDropdown` entry: the built-in skills
 /// (qontinui-workflow-utils `src/skills/builtin-skills.ts`) plus the Wrapper
-/// Action button (`AddStepDropdown.tsx`). The five ui_bridge skills are NOT
-/// here: they are in [`KNOWN_LOSSY_BUILDER_UI_BRIDGE`], because they parse
-/// only by losing their action and url.
+/// Action button (`AddStepDropdown.tsx`). The five ui_bridge skills are
+/// [`BUILDER_UI_BRIDGE_TEMPLATES`], shared with
+/// `builder_ui_bridge_steps_carry_action_and_url`, which checks their fields
+/// arrive.
 ///
 /// HAND-COPIED SNAPSHOT of those TypeScript producers, not live-loaded: a
 /// change to the templates does not reach this test. Only
@@ -372,6 +377,13 @@ fn add_step_dropdown(out: &mut Vec<Shape>) {
     ];
     for (skill, phase, template) in skills {
         out.push(builder_step(skill, phase, template));
+    }
+    for (skill, phase, template) in BUILDER_UI_BRIDGE_TEMPLATES {
+        out.push(builder_step(
+            skill,
+            phase,
+            serde_json::from_str(template).unwrap(),
+        ));
     }
     // The Wrapper Action button, as constructed, and after the pickers are
     // filled in.
@@ -539,19 +551,12 @@ fn probe(out: &mut Vec<Shape>) {
     }
 }
 
-// known live defect: Builder ui_bridge steps lose action/url — follow-up plan 2026-09-25-builder-ui-bridge-steps-lose-action-and-url; flip this assertion when fixed
-///
 /// The five ui_bridge skill templates in qontinui-workflow-utils
-/// `builtin-skills.ts` (HAND-COPIED SNAPSHOT) write bare `action` / `target` /
-/// `url`. `ExecutionStepConfig` maps `action` and `target` to `a11y_action` /
-/// `a11y_target` (executor_types.rs) and has no alias for `url`, so
-/// `ui_bridge_action` and `ui_bridge_url` stay `None`: the typed parse
-/// succeeds only with the DEFAULT action, and the handler falls back to
-/// `snapshot`. They are kept out of the passing corpus and their loss is
-/// pinned by `builder_ui_bridge_steps_lose_action_and_url`. Not fixed here:
-/// `action` / `target` already alias the a11y fields, so it needs a design
-/// decision. `(skill, phase, template JSON)`.
-const KNOWN_LOSSY_BUILDER_UI_BRIDGE: &[(&str, &str, &str)] = &[
+/// `builtin-skills.ts` (HAND-COPIED SNAPSHOT, checked against `origin/master`
+/// on 2026-09-26). They write the canonical bare keys (`action`, `url`,
+/// `target`, `assert_type`, ...), which `normalize_step_value` maps onto the
+/// `ui_bridge_*` fields. `(skill, phase, template JSON)`.
+const BUILDER_UI_BRIDGE_TEMPLATES: &[(&str, &str, &str)] = &[
     (
         "navigate-to-url",
         "setup",
@@ -641,7 +646,7 @@ fn every_live_producer_shape_parses_to_its_registered_handler() {
         } else {
             ty
         };
-        let esc: ExecutionStepConfig = match serde_json::from_value(step.clone()) {
+        let esc: ExecutionStepConfig = match parse_step_value(&step) {
             Ok(e) => e,
             Err(e) => {
                 failures.push(format!("{source}: ExecutionStepConfig refused it: {e}"));
@@ -706,7 +711,7 @@ fn legacy_string_types_are_not_typed() {
 #[test]
 fn known_refusals_stay_refused() {
     for (source, step, why) in known_refusals() {
-        let esc: ExecutionStepConfig = serde_json::from_value(step).unwrap();
+        let esc = parse_step_value(&step).unwrap();
         assert!(
             to_full_runner_step(&esc).is_err(),
             "{source}: expected a typed-parse refusal ({why})"
@@ -788,41 +793,174 @@ fn builder_wrapper_params_reach_the_handler_field() {
     assert_eq!(esc.wrapper_params, Some(json!({"path": "x"})));
 }
 
-// known live defect: Builder ui_bridge steps lose action/url — follow-up plan 2026-09-25-builder-ui-bridge-steps-lose-action-and-url; flip this assertion when fixed
+/// The step the executor receives for `step`, through the unified-workflow
+/// conversion seam (`convert_json_steps_with_phase`), in `phase`.
+fn converted(step: &Value, phase: &str) -> ExecutionStepConfig {
+    let mut steps = convert_json_steps_with_phase(std::slice::from_ref(step), 0, Some(phase));
+    assert_eq!(steps.len(), 1, "conversion dropped {step}");
+    steps.remove(0)
+}
+
+/// Builder ui_bridge steps carry their configured action, URL, target and
+/// the rest to the handler — flipped from the pinned defect
+/// `builder_ui_bridge_steps_lose_action_and_url` (plan
+/// `2026-09-25-builder-ui-bridge-steps-lose-action-and-url`, Phase 1).
 #[test]
-fn builder_ui_bridge_steps_lose_action_and_url() {
+fn builder_ui_bridge_steps_carry_action_and_url() {
     use qontinui_types::workflow_step::{FullRunnerStep, UiBridgeAction};
-    assert_eq!(KNOWN_LOSSY_BUILDER_UI_BRIDGE.len(), 5);
-    for (skill, phase, template) in KNOWN_LOSSY_BUILDER_UI_BRIDGE {
-        let Shape { step, .. } =
-            builder_step(skill, phase, serde_json::from_str(template).unwrap());
-        let written_action = step["action"].as_str().unwrap().to_string();
-        let esc: ExecutionStepConfig = serde_json::from_value(step.clone()).unwrap();
-        // The action the Builder wrote never reaches the ui_bridge field...
-        assert_eq!(esc.ui_bridge_action, None, "{skill}: ui_bridge_action");
+    assert_eq!(BUILDER_UI_BRIDGE_TEMPLATES.len(), 5);
+    let registry = HandlerRegistry::with_standard_handlers();
+    for (skill, phase, template) in BUILDER_UI_BRIDGE_TEMPLATES {
+        let template: Value = serde_json::from_str(template).unwrap();
+        let Shape { step, .. } = builder_step(skill, phase, template.clone());
+        let esc = converted(&step, phase);
+        let written = |k: &str| template.get(k).and_then(Value::as_str).map(str::to_string);
+
+        assert_eq!(esc.ui_bridge_action, written("action"), "{skill}: action");
+        assert_eq!(esc.ui_bridge_url, written("url"), "{skill}: url");
+        assert_eq!(esc.ui_bridge_target, written("target"), "{skill}: target");
         assert_eq!(
-            esc.a11y_action.as_deref(),
-            Some(written_action.as_str()),
-            "{skill}: action lands in a11y_action"
+            esc.ui_bridge_instruction,
+            written("instruction"),
+            "{skill}: instruction"
         );
-        // ...and neither does the url.
-        assert_eq!(esc.ui_bridge_url, None, "{skill}: url is dropped");
+        assert_eq!(
+            esc.ui_bridge_assert_type,
+            written("assert_type"),
+            "{skill}: assert_type"
+        );
+        assert_eq!(
+            esc.ui_bridge_expected,
+            written("expected"),
+            "{skill}: expected"
+        );
+        assert_eq!(
+            esc.ui_bridge_compare_mode,
+            written("comparison_mode"),
+            "{skill}: comparison_mode"
+        );
+        assert_eq!(
+            esc.ui_bridge_reference_snapshot_id,
+            written("reference_snapshot_id"),
+            "{skill}: reference_snapshot_id"
+        );
+        // The bare keys no longer leak into the native_accessibility fields.
+        assert_eq!(esc.a11y_action, None, "{skill}: a11y_action");
+        assert_eq!(esc.a11y_target, None, "{skill}: a11y_target");
+
         let FullRunnerStep::UiBridge(u) = to_full_runner_step(&esc).unwrap() else {
             panic!("{skill}: expected UiBridge")
         };
+        let action: UiBridgeAction = serde_json::from_value(template["action"].clone()).unwrap();
+        assert_eq!(u.action, action, "{skill}: typed action");
+        assert_eq!(u.url, written("url"), "{skill}: typed url");
+        assert_eq!(u.target, written("target"), "{skill}: typed target");
         assert_eq!(
-            u.action,
-            UiBridgeAction::default(),
-            "{skill}: parses to the DEFAULT action"
-        );
-        assert_eq!(u.url, None, "{skill}: typed url");
-        // Lossy, but the parse is Ok: the typed route, not the fallback.
-        assert_eq!(
-            resolve_dispatch(&esc, &HandlerRegistry::with_standard_handlers()),
+            resolve_dispatch(&esc, &registry),
             DispatchRoute::Registry("ui_bridge"),
-            "{skill}: lossy builder ui_bridge step must still dispatch"
+            "{skill}: dispatch"
         );
     }
+}
+
+/// Editor-shaped ui_bridge steps (runner `UiBridgeConfig.tsx`, qontinui-web
+/// `UiBridgeStepConfig.tsx`): bare `action` / `url` / `target`, camelCase
+/// `assertType` / `comparisonMode` / `referenceSnapshotId` /
+/// `severityThreshold` / `timeoutMs`. `timeoutMs` must reach
+/// `ui_bridge_timeout_ms`, not the VGA field it also aliases.
+#[test]
+fn editor_ui_bridge_steps_carry_camel_case_fields() {
+    let assert = converted(
+        &json!({"id": "e1", "type": "ui_bridge", "name": "check save", "phase": "verification",
+                "action": "assert", "target": "#save", "assertType": "text_equals",
+                "expected": "Saved", "timeoutMs": 7000, "uiBridgeSnapshotTarget": "sdk"}),
+        "verification",
+    );
+    assert_eq!(assert.ui_bridge_action.as_deref(), Some("assert"));
+    assert_eq!(assert.ui_bridge_target.as_deref(), Some("#save"));
+    assert_eq!(assert.ui_bridge_assert_type.as_deref(), Some("text_equals"));
+    assert_eq!(assert.ui_bridge_expected.as_deref(), Some("Saved"));
+    assert_eq!(assert.ui_bridge_timeout_ms, Some(7000));
+    assert_eq!(assert.vga_timeout_ms, None, "timeoutMs leaked into VGA");
+    assert_eq!(assert.ui_bridge_snapshot_target.as_deref(), Some("sdk"));
+    assert_eq!(assert.a11y_action, None);
+
+    let compare = converted(
+        &json!({"id": "e2", "type": "ui_bridge", "name": "compare", "action": "compare",
+                "comparisonMode": "visual", "referenceSnapshotId": "snap-9",
+                "severityThreshold": "minor"}),
+        "completion",
+    );
+    assert_eq!(compare.ui_bridge_action.as_deref(), Some("compare"));
+    assert_eq!(compare.ui_bridge_compare_mode.as_deref(), Some("visual"));
+    assert_eq!(
+        compare.ui_bridge_reference_snapshot_id.as_deref(),
+        Some("snap-9")
+    );
+    assert_eq!(
+        compare.ui_bridge_severity_threshold.as_deref(),
+        Some("minor")
+    );
+    assert_eq!(compare.phase.as_deref(), Some("completion"));
+
+    let navigate = converted(
+        &json!({"id": "e3", "type": "ui_bridge", "name": "go", "action": "navigate",
+                "url": "http://localhost:3001/runs"}),
+        "setup",
+    );
+    assert_eq!(navigate.ui_bridge_action.as_deref(), Some("navigate"));
+    assert_eq!(
+        navigate.ui_bridge_url.as_deref(),
+        Some("http://localhost:3001/runs")
+    );
+}
+
+/// A prefixed key already on the step wins over its canonical spelling, and
+/// a serialized `ExecutionStepConfig` passes through unchanged.
+#[test]
+fn prefixed_ui_bridge_keys_win_and_normalization_is_idempotent() {
+    let esc = parse_step_value(&json!({"type": "ui_bridge", "action": "snapshot",
+        "ui_bridge_action": "navigate", "url": "http://a", "uiBridgeUrl": "http://b"}))
+    .unwrap();
+    assert_eq!(esc.ui_bridge_action.as_deref(), Some("navigate"));
+    assert_eq!(esc.ui_bridge_url.as_deref(), Some("http://b"));
+    assert_eq!(esc.a11y_action, None);
+
+    let round = parse_step_value(&serde_json::to_value(&esc).unwrap()).unwrap();
+    assert_eq!(
+        serde_json::to_value(&round).unwrap(),
+        serde_json::to_value(&esc).unwrap()
+    );
+
+    // Not a ui_bridge step: bare `action` keeps its native_accessibility meaning.
+    let a11y =
+        parse_step_value(&json!({"type": "native_accessibility", "action": "capture"})).unwrap();
+    assert_eq!(a11y.a11y_action.as_deref(), Some("capture"));
+    assert_eq!(a11y.ui_bridge_action, None);
+
+    // A structured canonical target is carried as its JSON text.
+    let esc = parse_step_value(&json!({"type": "ui_bridge", "action": "click",
+        "target": {"role": "button"}}))
+    .unwrap();
+    assert_eq!(
+        esc.ui_bridge_target.as_deref(),
+        Some(r#"{"role":"button"}"#)
+    );
+}
+
+/// A ui_bridge step that still fails the parse is refused by the conversion
+/// seam rather than rebuilt without its action.
+#[test]
+fn unparseable_ui_bridge_step_is_refused_not_rebuilt() {
+    let bad = json!({"type": "ui_bridge", "name": "bad", "action": "navigate",
+                     "timeoutMs": "not-a-number"});
+    assert!(parse_step_value(&bad).is_err());
+    assert!(convert_json_steps_with_phase(std::slice::from_ref(&bad), 0, Some("setup")).is_empty());
+    // Other types keep the command-field fallback.
+    let cmd = json!({"type": "command", "name": "c", "command": "ls", "timeoutMs": "x"});
+    let steps = convert_json_steps_with_phase(std::slice::from_ref(&cmd), 0, Some("setup"));
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].shell_command.as_deref(), Some("ls"));
 }
 
 /// Field-level checks for every shape this change newly types or fixes:
@@ -834,7 +972,7 @@ fn newly_typed_shapes_keep_their_fields() {
         CommandStepPhase, FullRunnerStep, PromptStepPhase, UiBridgeAction, VgaAction,
     };
     let typed = |v: Value| -> FullRunnerStep {
-        let esc: ExecutionStepConfig = serde_json::from_value(v.clone()).unwrap();
+        let esc = parse_step_value(&v).unwrap();
         to_full_runner_step(&esc).unwrap_or_else(|e| panic!("{v}: {e}"))
     };
 
