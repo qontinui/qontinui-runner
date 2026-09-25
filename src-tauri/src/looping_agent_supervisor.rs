@@ -1058,7 +1058,8 @@ async fn spawn_looping_agent_terminal(
         .map_err(|e| format!("failed to create agent home {}: {e}", home.display()))?;
     let workdir = home.to_string_lossy().to_string();
 
-    // Coord MCP + fleet slash commands, same as gate continuations. The
+    // Coord MCP + the session assets (subagent definitions, fleet commands,
+    // fleet skills), same as gate continuations. The
     // actually-bound API port comes from AppState (fail-closed `None` writes
     // a degraded breadcrumb instead of a dead proxy config — the F1 lesson).
     let bound_port = app
@@ -1070,8 +1071,7 @@ async fn spawn_looping_agent_terminal(
     // `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`).
     // Provisioning runs before the render here, so the honest value is available.
     let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(&workdir, bound_port, None);
-    crate::fleet_commands::provision_fleet_commands_for_session(&workdir);
-    crate::fleet_skills::provision_fleet_skills_for_session(&workdir);
+    crate::session_assets::provision_session_assets(&workdir);
 
     // Interactive `claude` argv with the prompt as the trailing positional
     // arg (the proven continuation recipe — flags before prompt, `--`

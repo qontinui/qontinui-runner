@@ -1,7 +1,10 @@
-//! The one tracked-file guard both fleet provisioners consult before writing.
+//! The one tracked-file guard every session-asset provisioner consults before
+//! writing.
 //!
-//! [`crate::fleet_commands`] and [`crate::fleet_skills`] each write a bundled
-//! tree into a spawned session's `<cwd>/.claude/…`, unconditionally. That is
+//! [`crate::fleet_commands`], [`crate::fleet_skills`] and the subagent
+//! definitions ([`crate::fleet_agents`] plus the checkout overlay in
+//! `agent_runtime`) each write a bundled tree into a spawned session's
+//! `<cwd>/.claude/…`, unconditionally. That is
 //! correct for the case they were built for — a fresh agent worktree, where
 //! nothing tracks those paths and the alternative is a session with no fleet
 //! commands or skills at all.

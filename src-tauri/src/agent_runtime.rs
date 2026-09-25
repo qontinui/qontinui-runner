@@ -5965,12 +5965,11 @@ async fn run_continuation_terminal(
         crate::session::spawn_prompt::delivery_unless_replacement(policy_delivery, &argv);
     let command = Some(argv);
 
-    // Bundle /vet-plan and /implement-plan into the session cwd so they resolve
-    // as project slash commands regardless of the device's ~/.claude.
-    crate::fleet_commands::provision_fleet_commands_for_session(workdir);
-    // Same for the fleet SKILLS (.claude/skills/<name>/SKILL.md) — a device with
-    // no qontinui-claude-config checkout has no skills dir at all.
-    crate::fleet_skills::provision_fleet_skills_for_session(workdir);
+    // Subagent definitions, fleet slash commands and fleet skills, so they
+    // resolve from the session cwd regardless of the device's ~/.claude — the
+    // same set every spawn path gets. Fail-soft: the ledger read-back is only
+    // diagnostic.
+    crate::session_assets::provision_session_assets(workdir);
 
     // The PTY seam derives workspace trust for the pinned account through the
     // trust gate's SYNC door, which can only read the dial cache. Warm it here,
@@ -7016,6 +7015,10 @@ async fn run_continuation_headless(
     // the honest value is available (plan
     // `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`).
     let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port, None);
+    // Subagent definitions, fleet commands and fleet skills — parity with the
+    // terminal arm. This arm used to provision none of them, so a headless
+    // continuation could not spawn `code-reviewer` or resolve `/vet-plan`.
+    crate::session_assets::provision_session_assets(workdir);
     // No per-spawn pin here: a gate continuation carries no account field —
     // the `pick_best_account` call above is the whole selection.
     match spawn_claude_child(workdir, initial_prompt, None, coord_mcp, &[], false).await {
@@ -7853,36 +7856,12 @@ async fn run_agent_subprocess(
         }
     }
 
-    // Provision the named-subagent defs into the spawned worktree's cwd so the
-    // headless `claude` can resolve subagents the spawn prompt references
-    // (merge-specialist, repo-auditor, ...). Fail-soft: a copy error here must
-    // not abort an otherwise-launchable spawn — the agent just lacks subagents.
-    match provision_agent_definitions(&primary_wt) {
-        Ok(report) => capability_manifest::record_provision(&primary_wt, report),
-        Err(e) => {
-            warn!("agent_runtime: agent-def provisioning errored (continuing spawn): {e:#}");
-            // Still a ROW: an errored pass that leaves no record is exactly the
-            // invisible degradation this ledger exists to end.
-            let mut report = ProvisionReport::new(
-                "agent_definitions",
-                0,
-                capability_manifest::Rung::Unresolved,
-            )
-            .with_destination(primary_wt.clone());
-            report.skip(
-                primary_wt.clone(),
-                capability_manifest::SkipReason::WriteFailed(format!("{e:#}")),
-            );
-            capability_manifest::record_provision(&primary_wt, report);
-        }
-    }
-    // Bundle /vet-plan and /implement-plan into the spawned worktree cwd so they
-    // resolve as project slash commands regardless of the device's ~/.claude.
-    crate::fleet_commands::provision_fleet_commands_for_session(&primary_wt);
-    // Same for the fleet SKILLS. Note provision_agent_definitions above still
-    // COPIES .claude/agents from a claude-config checkout, so agents remain
-    // absent on a device without one; skills no longer do.
-    crate::fleet_skills::provision_fleet_skills_for_session(&primary_wt);
+    // Provision the named-subagent defs (embedded floor + checkout overlay),
+    // fleet slash commands and fleet skills into the spawned worktree's cwd, so
+    // the headless `claude` resolves the subagents its spawn prompt references
+    // (merge-specialist, repo-auditor, ...) on any device. Fail-soft: a write
+    // error degrades into a ledger row and never aborts the spawn.
+    crate::session_assets::provision_session_assets(&primary_wt);
 
     let log_path = agent_log_path(payload.agent_id);
 
@@ -8162,8 +8141,8 @@ async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
 }
 
 /// Provision the named-subagent definitions (`.claude/agents/*.md`) into a
-/// freshly-materialized agent worktree so headless `claude` (cwd = the
-/// worktree) can resolve the subagents an auto-spawned review prompt references
+/// session cwd — an agent worktree, a continuation or looping-agent workdir, a
+/// terminal cwd — so `claude` can resolve the subagents a prompt references
 /// (e.g. "Invoke the `merge-specialist` subagent").
 ///
 /// Without this, a spawned agent worktree is a bare `git worktree add` with no
@@ -8177,12 +8156,13 @@ async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
 /// `*.md` defs, NOT the whole `.claude` tree (avoid pulling in settings/hooks/
 /// mcp that could alter spawn behavior).
 ///
-/// Fail-soft: if the source dir is missing we `warn` and return Ok — the agent
-/// then simply lacks subagents (same as before this fix; no regression). The
-/// fleet-portability follow-up is to BUNDLE these defs into the runner binary
-/// (`include_str!`) so non-operator devices without a `qontinui-claude-config`
-/// checkout still get them; this copy-from-checkout path unblocks the current
-/// operator fleet.
+/// Fail-soft: if the source dir is missing we `warn` and return Ok — the
+/// embedded floor ([`crate::fleet_agents`]) written first stands in, so a device
+/// without a `qontinui-claude-config` checkout still gets the bundled set.
+///
+/// Called only through [`crate::session_assets::provision_session_assets`],
+/// which records the returned report and turns an `Err` into an
+/// `Unresolved` ledger row.
 ///
 /// Returns a [`ProvisionReport`] for the CHECKOUT layer (`agent_definitions`).
 /// The no-root arm below used to be a bare `warn!` and an `Ok(())` — an
@@ -8190,7 +8170,7 @@ async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
 /// [`capability_manifest::Rung::Unresolved`] row naming what was skipped and
 /// why. The control flow is unchanged: it still returns `Ok` and the spawn
 /// still proceeds.
-fn provision_agent_definitions(worktree_cwd: &str) -> anyhow::Result<ProvisionReport> {
+pub(crate) fn provision_agent_definitions(worktree_cwd: &str) -> anyhow::Result<ProvisionReport> {
     let Some(root) = qontinui_root_dir() else {
         warn!(
             "agent_runtime: no qontinui-root resolved; skipping .claude/agents \
@@ -8294,6 +8274,12 @@ fn provision_agent_definitions_from_root(
         capability_manifest::Rung::OperatorCheckout,
     )
     .with_destination(dst_dir.display().to_string());
+    // Same "existing + tracked => skip" rule the floor and the command and skill
+    // provisioners apply: a cwd that is a checkout tracking its own
+    // `.claude/agents/*.md` (qontinui-claude-config tracks all of them) keeps
+    // its content and a clean tree. One probe per pass; every failure probes to
+    // "nothing tracked", i.e. to copying as before.
+    let tracked = crate::provision_guard::TrackedPaths::probe(&dst_dir);
     let mut copied = 0usize;
     for entry in std::fs::read_dir(&src_dir)
         .map_err(|e| anyhow::anyhow!("read agents dir {}: {e}", src_dir.display()))?
@@ -8320,7 +8306,20 @@ fn provision_agent_definitions_from_root(
         };
         let dst = dst_dir.join(name);
         report.expected += 1;
-        // Idempotent: overwrite is fine (std::fs::copy truncates the target).
+        if tracked.should_skip(&dst, Path::new(name)) {
+            info!(
+                "agent_runtime: skipping {} — it is tracked by the enclosing git \
+                 repository, and overwriting it would replace that repo's own content",
+                dst.display()
+            );
+            report.skip(
+                name.to_string_lossy().into_owned(),
+                capability_manifest::SkipReason::GitTracked,
+            );
+            continue;
+        }
+        // Idempotent: an untracked destination is overwritten (std::fs::copy
+        // truncates the target).
         if let Err(e) = std::fs::copy(&path, &dst) {
             warn!(
                 "agent_runtime: failed to copy agent def {} -> {}: {e}",
@@ -11967,6 +11966,54 @@ mod tests {
         // Idempotent: a second run over the same dst overwrites cleanly.
         provision_agent_definitions_from_root(root.path(), &wt_cwd).unwrap();
         assert!(dst.join("merge-specialist.md").is_file());
+    }
+
+    /// The checkout overlay honours the tracked-file guard too: a cwd that is a
+    /// repo tracking `.claude/agents/code-reviewer.md` keeps those bytes through
+    /// BOTH layers (the embedded floor writes first, so surviving bytes prove it
+    /// skipped too), while an untracked sibling is still overlaid.
+    #[test]
+    fn provision_agent_defs_skips_a_tracked_destination_in_both_layers() {
+        use crate::provision_guard::test_support::{git_add, git_init};
+
+        let root = tempfile::tempdir().unwrap();
+        let src = root
+            .path()
+            .join("qontinui-claude-config")
+            .join(".claude")
+            .join("agents");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("code-reviewer.md"), "# checkout reviewer").unwrap();
+        std::fs::write(src.join("repo-auditor.md"), "# checkout auditor").unwrap();
+
+        let wt = tempfile::tempdir().unwrap();
+        let wt_cwd = wt.path().to_string_lossy().into_owned();
+        let dst = wt.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&dst).unwrap();
+        git_init(wt.path());
+        let tracked = dst.join("code-reviewer.md");
+        std::fs::write(&tracked, "# the repo's own reviewer").unwrap();
+        git_add(wt.path(), &tracked);
+
+        let report = provision_agent_definitions_from_root(root.path(), &wt_cwd).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&tracked).unwrap(),
+            "# the repo's own reviewer",
+            "a tracked definition must survive both the floor and the overlay"
+        );
+        assert_eq!(report.expected, 2);
+        assert_eq!(report.written, 1, "the untracked sibling is still overlaid");
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].unit, "code-reviewer.md");
+        assert_eq!(
+            report.skipped[0].reason,
+            crate::capability_manifest::SkipReason::GitTracked
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join("repo-auditor.md")).unwrap(),
+            "# checkout auditor"
+        );
     }
 
     #[test]

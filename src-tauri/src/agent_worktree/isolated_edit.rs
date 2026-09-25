@@ -1027,9 +1027,9 @@ pub(crate) fn provision_session_cwd(
     // not "writes only when it would change something" — which is exactly
     // why the guard below is needed.
     //
-    // GUARDED, unlike the three agent-path call sites. Those target a fresh
-    // agent worktree or an agent-private home dir, where an unconditional
-    // overwrite is correct and wanted. THIS chokepoint can resolve to an
+    // GUARDED at the tree level, unlike the other spawn paths. Those target a
+    // fresh agent worktree or an agent-private home dir and rely on the
+    // per-file tracked-file guard alone. THIS chokepoint can resolve to an
     // arbitrary operator cwd — including `qontinui-claude-config`, which
     // TRACKS 124 paths under `.claude/` and is the upstream these bundled
     // bodies were copied from. Provisioning there would overwrite the
@@ -1045,11 +1045,10 @@ pub(crate) fn provision_session_cwd(
         info!(
             workdir = %wd,
             "fleet provisioning: skipped — this cwd's .claude/ is git-tracked, so the repo \
-             authors its own skills/commands and the bundle must not clobber them"
+             authors its own agents/skills/commands and the bundle must not clobber them"
         );
     } else {
-        crate::fleet_commands::provision_fleet_commands_for_session(wd);
-        crate::fleet_skills::provision_fleet_skills_for_session(wd);
+        crate::session_assets::provision_session_assets(wd);
     }
 }
 
