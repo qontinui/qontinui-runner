@@ -4037,9 +4037,9 @@ impl ConfigDirSource {
 pub(crate) fn resolve_config_dir() -> Result<(PathBuf, ConfigDirSource), String> {
     let env_config_dir = std::env::var("QONTINUI_CONFIG_DIR").ok();
     if env_config_dir.as_deref().is_none_or(str::is_empty) {
-        if let Some(dir) = qontinui_runner_lib::ambient::test_config_dir_override(
-            "settings::resolve_config_dir",
-        ) {
+        if let Some(dir) =
+            qontinui_runner_lib::ambient::test_config_dir_override("settings::resolve_config_dir")
+        {
             return Ok((dir, ConfigDirSource::TestDeflected));
         }
     }
@@ -7493,7 +7493,8 @@ mod config_dir_race_tests {
 
         let after = std::fs::read_to_string(&operators_file).expect("B must still exist");
         assert_eq!(
-            after, OPERATORS_FILE,
+            after,
+            OPERATORS_FILE,
             "a FreshInstall read in {} was persisted OVER the file in {} — the path \
              was resolved again at persist time instead of reusing the one that was \
              read",
@@ -7518,7 +7519,10 @@ mod config_dir_race_tests {
         point_env_at(dir);
         let loaded = read_settings_from_disk();
         assert_eq!(loaded.provenance, SettingsProvenance::FreshInstall);
-        assert_eq!(loaded.path.as_deref(), Some(dir.join(SETTINGS_FILE).as_path()));
+        assert_eq!(
+            loaded.path.as_deref(),
+            Some(dir.join(SETTINGS_FILE).as_path())
+        );
         loaded
     }
 
@@ -7546,7 +7550,9 @@ mod config_dir_race_tests {
             SettingsProvenance::Unreadable,
             "defaults built from a NotFound that is no longer true are not the user's state"
         );
-        let why = completed.error.expect("the refusal is carried as the error");
+        let why = completed
+            .error
+            .expect("the refusal is carried as the error");
         assert!(why.contains("appeared since the read"), "{why}");
     }
 
