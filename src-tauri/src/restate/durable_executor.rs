@@ -46,27 +46,28 @@ pub async fn execute_steps_batch(
     let mut variables_set = Vec::new();
 
     // Deserialize steps
-    let steps: Vec<ExecutionStepConfig> = match serde_json::from_str(steps_json) {
-        Ok(s) => s,
-        Err(e) => {
-            error!(
-                "Failed to deserialize {} steps for {}: {}",
-                phase_name, execution_id, e
-            );
-            return PhaseResult {
-                phase: phase_name.to_string(),
-                iteration,
-                stage_index: None,
-                success: false,
-                all_passed: false,
-                step_results: vec![],
-                failure_context: Some(format!("Step deserialization failed: {}", e)),
-                duration_ms: start.elapsed().as_millis() as u64,
-                variables_set: Some(vec![]),
-                commit_hash: None,
-            };
-        }
-    };
+    let steps: Vec<ExecutionStepConfig> =
+        match crate::unified_workflow_executor::step_conversion::parse_steps_json(steps_json) {
+            Ok(s) => s,
+            Err(e) => {
+                error!(
+                    "Failed to deserialize {} steps for {}: {}",
+                    phase_name, execution_id, e
+                );
+                return PhaseResult {
+                    phase: phase_name.to_string(),
+                    iteration,
+                    stage_index: None,
+                    success: false,
+                    all_passed: false,
+                    step_results: vec![],
+                    failure_context: Some(format!("Step deserialization failed: {}", e)),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    variables_set: Some(vec![]),
+                    commit_hash: None,
+                };
+            }
+        };
 
     if steps.is_empty() {
         debug!("No {} steps to execute for {}", phase_name, execution_id);
