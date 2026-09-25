@@ -1705,6 +1705,7 @@ async fn heal(
         app,
         WatchdogEvent {
             kind: "reload_result",
+            breach: breach.as_str(),
             // The last total that was actually MEASURED — which on an UNKNOWN
             // verdict is the pre-heal one, not `post.total_bytes`. An unreadable
             // post sample has `total_bytes == 0`, and putting that on the wire
