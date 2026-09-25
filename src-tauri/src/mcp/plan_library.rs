@@ -527,9 +527,9 @@ not have to trigger a 422 to learn the set. A recorded edge is CORRECTABLE, not 
 appendable: `POST /plan-library/links` re-posting an identical (from_id, to_id, relation) \
 triple is idempotent, but a DIFFERENT one off the same (from_id, relation) pair APPENDS a \
 second edge rather than replacing the first. `DELETE /plan-library/links/{id}` \
-(body: {\"reason\": \"...\"}) soft-deletes a wrongly-recorded edge — the row survives, \
+(body: {\"reason\", \"session_id\"?}) soft-deletes a wrongly-recorded edge — the row survives, \
 retracted_at/retracted_by/retracted_reason are stamped, and it drops out of ordinary reads. \
-`PUT /plan-library/links/{id}` (body: {\"relation\", \"to_id\", \"note\", \"reason\"}) \
+`PUT /plan-library/links/{id}` (body: {\"relation\", \"to_id\", \"note\", \"reason\", \"session_id\"?}) \
 replaces relation/to_id/note IN PLACE and stamps source: \"corrected\" plus \
 corrected_by/corrected_at/corrected_reason, so a correction is distinguishable from an \
 original recording. Both require a non-empty `reason`: an unexplained retraction or \
@@ -741,6 +741,11 @@ pub struct LinkRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct LinkRetractRequest {
     pub reason: String,
+    /// Same caller-chosen label as [`LinkRequest::session_id`]: folded into
+    /// the forwarded reason by [`retraction_payload`], so a retraction is as
+    /// attributable as the create it retracts.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// `PUT /plan-library/links/{id}` body — replace a recorded edge's
@@ -1561,7 +1566,7 @@ pub async fn retract_link_handler(
     Path(edge_id): Path<String>,
     body: Bytes,
 ) -> ApiResult {
-    authorize_write(&headers)?;
+    let principal = authorize_write(&headers)?;
     let req: LinkRetractRequest = parse_write_body(&body)?;
     if req.reason.trim().is_empty() {
         return Err((
@@ -1574,8 +1579,40 @@ pub async fn retract_link_handler(
     }
     let path = edge_upstream_path(&edge_id)
         .map_err(|msg| (StatusCode::BAD_REQUEST, Json(api_error(msg))))?;
-    let upstream = upstream_delete(&path, &serde_json::json!({"reason": req.reason})).await?;
+    let payload = retraction_payload(&req, &principal);
+    let folded_len = payload["reason"].as_str().map_or(0, |r| r.chars().count());
+    if folded_len > EDGE_REASON_MAX_CHARS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!(
+                "`reason` is {folded_len} characters once this door appends its attribution                  (the calling principal and session) — upstream accepts at most                  {EDGE_REASON_MAX_CHARS}; shorten the reason or the `session_id` label"
+            ))),
+        ));
+    }
+    let upstream = upstream_delete(&path, &payload).await?;
     Ok(Json(ApiResponse::success(upstream)))
+}
+
+/// Upstream's `max_length` on an edge retraction/correction `reason`
+/// (`WorkArtifactEdgeRetract` in qontinui-web). Checked here AFTER the
+/// attribution fold, because the fold lengthens a reason the caller sent
+/// within bounds — an upstream 422 on text the caller never wrote would be
+/// undiagnosable from the caller's side.
+const EDGE_REASON_MAX_CHARS: usize = 2000;
+
+/// The upstream body for a retraction: the caller's `reason` with the
+/// nonce's principal folded in by [`provenance_note`].
+///
+/// A soft-deleted edge has no `note` to carry attribution the way a create or
+/// a correction does, and upstream stamps `retracted_by` from the AUDIT ACTOR
+/// — which, through this door, is the runner's own device user for every
+/// session on the box. Without this fold every agent retraction would read as
+/// the same device, and "who retracted this, and why" — the point of a soft
+/// retract over a hard delete — would have only half an answer.
+pub fn retraction_payload(req: &LinkRetractRequest, principal: &WritePrincipal) -> Value {
+    serde_json::json!({
+        "reason": provenance_note(Some(&req.reason), principal, req.session_id.as_deref()),
+    })
 }
 
 /// `PUT /plan-library/links/{id}` — replace a recorded edge's `relation` /
@@ -2279,6 +2316,39 @@ mod tests {
         assert_eq!(
             payload.change_description.as_deref(),
             Some(format!("agent write by {actor}, session db54260f").as_str())
+        );
+    }
+
+    /// A retraction forwards the caller's reason WITH the principal folded
+    /// in: upstream's `retracted_by` is the runner's device user for every
+    /// session, so the reason is the only place the retracting session is
+    /// recorded at all.
+    #[test]
+    fn a_retraction_forwards_its_reason_attributed_to_the_principal() {
+        let p = principal();
+        let actor = "agent:0d2f2a6e-7c1b-4f38-9a3e-1b2c3d4e5f60";
+        let labelled = LinkRetractRequest {
+            reason: "false supersedes claim".to_string(),
+            session_id: Some("db54260f".to_string()),
+        };
+        assert_eq!(
+            retraction_payload(&labelled, &p),
+            serde_json::json!({
+                "reason": format!(
+                    "false supersedes claim (agent write by {actor}, session db54260f)"
+                ),
+            })
+        );
+        // No caller label: what the runner knows about the session stands in.
+        let unlabelled = LinkRetractRequest {
+            reason: "false supersedes claim".to_string(),
+            session_id: None,
+        };
+        assert_eq!(
+            retraction_payload(&unlabelled, &p)["reason"],
+            serde_json::json!(format!(
+                "false supersedes claim (agent write by {actor}, session workdir D:/wt)"
+            ))
         );
     }
 
@@ -3974,6 +4044,30 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST, "correct reason={reason:?}");
             assert!(body["error"].as_str().unwrap().contains("`reason`"));
         }
+    }
+
+    /// A retraction reason that fits upstream's limit on its own but not once
+    /// the attribution is appended is a local 400 naming the limit — never an
+    /// upstream 422 about text the caller did not write.
+    #[tokio::test]
+    async fn a_retraction_reason_overflowed_by_the_attribution_is_a_local_400() {
+        let _pin = pin("record");
+        let _guard = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_WRITE_FLAG]);
+        std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
+        let nonce = registered_nonce();
+
+        let reason = "x".repeat(EDGE_REASON_MAX_CHARS - 5);
+        let (status, body) = delete_json(
+            EDGE_ID_URI,
+            Some(&nonce),
+            serde_json::json!({"reason": reason}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let err = body["error"].as_str().unwrap();
+        assert!(err.contains("at most 2000"), "{err}");
+        assert!(err.contains("attribution"), "{err}");
     }
 
     /// A non-UUID edge id is refused locally, the same `edge_upstream_path`
