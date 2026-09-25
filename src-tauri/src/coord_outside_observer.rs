@@ -1785,7 +1785,10 @@ fn finding_title(summary: &str, device_id: &str) -> String {
     while !summary.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}{CUT}{suffix}", &summary[..end])
+    let cut = summary
+        .get(..end)
+        .expect("`end` was walked back to a char boundary above");
+    format!("{cut}{CUT}{suffix}")
 }
 
 /// The finding's body: the class title, the FULL summary (the title may have
@@ -1840,7 +1843,11 @@ fn finding_body(report: &Report, door_url: &str) -> String {
         while !report.raw.is_char_boundary(end) {
             end -= 1;
         }
-        std::borrow::Cow::Owned(format!("{}{FINDING_EVIDENCE_CUT}", &report.raw[..end]))
+        let cut = report
+            .raw
+            .get(..end)
+            .expect("`end` was walked back to a char boundary above");
+        std::borrow::Cow::Owned(format!("{cut}{FINDING_EVIDENCE_CUT}"))
     };
     let mut body = format!("{head}{evidence}{tail}");
     // Last resort: a summary long enough to eat the evidence budget on its
