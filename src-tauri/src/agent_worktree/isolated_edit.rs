@@ -1041,16 +1041,66 @@ pub(crate) fn provision_session_cwd(
     // MANAGED_REPO_EXCLUDES roster forbids adding it, because excluding it
     // would hide an operator's intended new `.claude/commands/*.md` from
     // `git status`. So the guard lives here instead.
+    provision_fleet_for_cwd(wd);
+}
+
+/// The guarded fleet commands + skills provisioning for one session cwd.
+///
+/// Where the cwd's `.claude/` is repo-authored the skip is RECORDED, not only
+/// logged: one [`crate::capability_manifest::ProvisionReport`] per provisioner
+/// with every bundled unit skipped as [`SkipReason::RepoAuthored`], so the
+/// ledger — and the `[provisioned: …]` token of the session's served-corpus
+/// header line — say the session got none of them and why.
+///
+/// [`SkipReason::RepoAuthored`]: crate::capability_manifest::SkipReason::RepoAuthored
+fn provision_fleet_for_cwd(wd: &str) {
     if claude_tree_is_repo_authored(wd) {
         info!(
             workdir = %wd,
             "fleet provisioning: skipped — this cwd's .claude/ is git-tracked, so the repo \
              authors its own skills/commands and the bundle must not clobber them"
         );
+        record_repo_authored_skip(wd);
     } else {
         crate::fleet_commands::provision_fleet_commands_for_session(wd);
         crate::fleet_skills::provision_fleet_skills_for_session(wd);
     }
+}
+
+/// Record the repo-authored skip against `wd` for both provisioners.
+///
+/// The roster is the EMBEDDED bundle — every `FLEET_COMMANDS` entry and every
+/// embedded skill file — not the account-resolved registry: resolving that
+/// would fetch overrides for a pass that writes nothing.
+fn record_repo_authored_skip(wd: &str) {
+    use crate::capability_manifest::{record_provision, ProvisionReport, Rung, SkipReason};
+
+    let commands_dir = Path::new(wd).join(".claude").join("commands");
+    let mut commands = ProvisionReport::new(
+        "fleet_commands",
+        crate::fleet_commands::FLEET_COMMANDS.len(),
+        Rung::Unresolved,
+    )
+    .with_destination(commands_dir.display().to_string());
+    for (name, _) in crate::fleet_commands::FLEET_COMMANDS {
+        commands.skip(format!("{name}.md"), SkipReason::RepoAuthored);
+    }
+    record_provision(wd, commands);
+
+    let skills_dir = Path::new(wd).join(".claude").join("skills");
+    let embedded = crate::fleet_skills::embedded_skills();
+    let mut skills = ProvisionReport::new(
+        "fleet_skills",
+        embedded.iter().map(|s| s.files.len()).sum(),
+        Rung::Unresolved,
+    )
+    .with_destination(skills_dir.display().to_string());
+    for skill in &embedded {
+        for rel in skill.files.keys() {
+            skills.skip(format!("{}/{rel}", skill.name), SkipReason::RepoAuthored);
+        }
+    }
+    record_provision(wd, skills);
 }
 
 /// What [`acquire_for_terminal`] does with the cwd `.mcp.json` for one spawn.
@@ -1322,6 +1372,61 @@ mod tests {
         assert!(
             claude_tree_is_repo_authored(root.to_str().unwrap()),
             "a repo that tracks .claude/ must be left alone"
+        );
+    }
+
+    /// The repo-authored skip is recorded in the ledger — every bundled unit,
+    /// with its own reason — and reaches the served-corpus header line.
+    #[test]
+    fn a_repo_authored_skip_is_recorded_not_only_logged() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path();
+        git(root, &["init", "-q"]);
+        git(root, &["config", "user.email", "t@t"]);
+        git(root, &["config", "user.name", "t"]);
+        git(root, &["config", "commit.gpgsign", "false"]);
+        git(root, &["config", "core.hooksPath", "/dev/null"]);
+        std::fs::create_dir_all(root.join(".claude/commands")).unwrap();
+        std::fs::write(root.join(".claude/commands/policy.md"), b"canonical").unwrap();
+        git(root, &["add", ".claude"]);
+        git(root, &["commit", "-qm", "track .claude"]);
+        let wd = root.to_str().unwrap();
+
+        provision_fleet_for_cwd(wd);
+
+        assert_eq!(
+            std::fs::read(root.join(".claude/commands/policy.md")).unwrap(),
+            b"canonical",
+            "the repo's own file is untouched"
+        );
+        let ledger = crate::capability_manifest::session_provision_ledger(wd)
+            .expect("the skip is recorded against this workdir");
+        let commands = ledger
+            .reports
+            .iter()
+            .find(|r| r.capability == "fleet_commands")
+            .expect("a commands report");
+        let m_commands = crate::fleet_commands::FLEET_COMMANDS.len();
+        assert_eq!(commands.written, 0);
+        assert_eq!(commands.skipped.len(), m_commands);
+        assert!(commands
+            .skipped
+            .iter()
+            .all(|u| u.reason == crate::capability_manifest::SkipReason::RepoAuthored));
+        let skills = ledger
+            .reports
+            .iter()
+            .find(|r| r.capability == "fleet_skills")
+            .expect("a skills report");
+        assert_eq!(skills.written, 0);
+        assert_eq!(skills.skipped.len(), skills.expected);
+
+        let line = crate::served_corpus::probe(root).render_line();
+        assert!(
+            line.contains(&format!(
+                "[provisioned: commands written=0/{m_commands} skipped-repo-authored={m_commands} as-of="
+            )),
+            "{line}"
         );
     }
 

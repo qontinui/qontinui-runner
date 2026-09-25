@@ -133,13 +133,98 @@ pub(crate) struct BundleIdentity {
     stamped: usize,
 }
 
+/// One provisioner's latest pass for a workdir, from the ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PassSummary {
+    written: usize,
+    expected: usize,
+    /// Skipped-unit counts by `SkipReason::wire()`, zero counts omitted.
+    skipped: std::collections::BTreeMap<&'static str, usize>,
+    /// When the pass ran, RFC 3339 UTC.
+    at: String,
+}
+
+/// What the provisioners did for this workdir, per capability, read from
+/// `capability_manifest::session_provision_ledger` — the writer's own record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Provisioned {
+    commands: Probe<PassSummary>,
+    skills: Probe<PassSummary>,
+}
+
+impl Provisioned {
+    /// `commands written=<w>/<e> skipped-<reason>=<n>… as-of=<ts>; skills …`.
+    fn render(&self) -> String {
+        let one = |label: &str, p: &Probe<PassSummary>| match p {
+            Probe::Measured(s) => {
+                let mut out = format!("{label} written={}/{}", s.written, s.expected);
+                for (reason, n) in &s.skipped {
+                    out.push_str(&format!(" skipped-{}={n}", reason.replace('_', "-")));
+                }
+                out.push_str(&format!(" as-of={}", s.at));
+                out
+            }
+            Probe::Unknown(r) => format!("{label} {}", unknown_text(r)),
+        };
+        format!(
+            "{}; {}",
+            one("commands", &self.commands),
+            one("skills", &self.skills)
+        )
+    }
+}
+
+/// The `provisioned` token for `workdir`: the LATEST pass per provisioner.
+///
+/// The argv copy of the briefing is rendered BEFORE the seam provisions, so
+/// the report read there can be a previous spawn's — which is why every pass
+/// carries its own `as-of`. No ledger entry is UNKNOWN, never "nothing was
+/// provisioned": the ledger is bounded and process-local.
+fn provisioned_for(workdir: &Path) -> Probe<Provisioned> {
+    let raw = workdir.to_string_lossy();
+    let ledger = crate::capability_manifest::session_provision_ledger(&raw).or_else(|| {
+        std::fs::canonicalize(workdir).ok().and_then(|c| {
+            crate::capability_manifest::session_provision_ledger(&c.to_string_lossy())
+        })
+    });
+    let Some(ledger) = ledger else {
+        return Probe::Unknown("no provision recorded for this workdir".to_string());
+    };
+    let latest = |capability: &str| -> Probe<PassSummary> {
+        match ledger
+            .reports
+            .iter()
+            .rev()
+            .find(|r| r.capability == capability)
+        {
+            None => Probe::Unknown("no pass recorded".to_string()),
+            Some(r) => {
+                let mut skipped = std::collections::BTreeMap::new();
+                for unit in &r.skipped {
+                    *skipped.entry(unit.reason.wire()).or_insert(0) += 1;
+                }
+                Probe::Measured(PassSummary {
+                    written: r.written,
+                    expected: r.expected,
+                    skipped,
+                    at: r.at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                })
+            }
+        }
+    };
+    Probe::Measured(Provisioned {
+        commands: latest("fleet_commands"),
+        skills: latest("fleet_skills"),
+    })
+}
+
 /// What a spawn was served, measured once at the seam.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ServedCorpus {
     corpus: Probe<PathBuf>,
     checkout: Probe<Checkout>,
     bundle: Probe<BundleIdentity>,
-    provisioned: Probe<String>,
+    provisioned: Probe<Provisioned>,
     cwd: Probe<CwdCheckout>,
 }
 
@@ -191,7 +276,7 @@ impl ServedCorpus {
             Probe::Unknown(r) => unknown_text(r),
         };
         let provisioned = match &self.provisioned {
-            Probe::Measured(p) => clean(p),
+            Probe::Measured(p) => p.render(),
             Probe::Unknown(r) => unknown_text(r),
         };
         let cwd = match &self.cwd {
@@ -347,7 +432,7 @@ fn probe_with(workdir: &Path, git_program: &OsStr, timeout: Duration) -> ServedC
         corpus,
         checkout,
         bundle,
-        provisioned: Probe::Unknown("ledger read lands in Phase 5".to_string()),
+        provisioned: provisioned_for(workdir),
         cwd,
     }
 }
@@ -841,6 +926,72 @@ mod tests {
             "a stamped clobber is still this build's bundle, and says so: {line}"
         );
         assert!(line.contains("dirty-claude=1]"), "{line}");
+    }
+
+    /// The complete clobber signature, computed by the WRITER: every unit
+    /// skipped as git-tracked, beside a bundle that is all this build's bytes,
+    /// at the checkout's HEAD.
+    #[test]
+    fn the_ledger_names_the_tracked_skips_beside_the_bundle() {
+        let tmp = checkout_with_bundle();
+        let claude = tmp.path().join(".claude");
+        let wd = tmp.path().to_string_lossy().into_owned();
+        let commands = crate::fleet_commands::provision_fleet_commands_into(
+            &claude.join("commands"),
+            &AgentCommandRegistry::new(),
+        )
+        .expect("provision commands");
+        let skills = crate::fleet_skills::provision_fleet_skills_into(
+            &claude.join("skills"),
+            &AgentSkillRegistry::new(),
+        )
+        .expect("provision skills");
+        let (c_n, s_n) = (commands.expected, skills.expected);
+        crate::capability_manifest::record_provision(&wd, commands);
+        crate::capability_manifest::record_provision(&wd, skills);
+
+        let m = total();
+        let sha12 = git(tmp.path(), &["rev-parse", "HEAD"])
+            .trim()
+            .get(..12)
+            .unwrap()
+            .to_string();
+        let line = line_for(tmp.path());
+        assert!(
+            line.contains(&format!(
+                "[provisioned: commands written=0/{c_n} skipped-git-tracked={c_n} as-of="
+            )),
+            "{line}"
+        );
+        assert!(
+            line.contains(&format!(
+                "; skills written=0/{s_n} skipped-git-tracked={s_n} as-of="
+            )),
+            "{line}"
+        );
+        assert_eq!(
+            c_n + s_n,
+            m,
+            "the ledger's roster and the bundle count the same files"
+        );
+        assert!(
+            line.contains(&format!(
+                "[bundle: {m}/{m} identical-to-build {BUILD_SHA} stamped=0]"
+            )),
+            "{line}"
+        );
+        assert!(line.contains(&format!("@{sha12} ")), "{line}");
+    }
+
+    #[test]
+    fn no_ledger_entry_is_unknown_not_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+        let line = line_for(tmp.path());
+        assert!(
+            line.contains("[provisioned: UNKNOWN (no provision recorded for this workdir)]"),
+            "{line}"
+        );
     }
 
     #[test]
