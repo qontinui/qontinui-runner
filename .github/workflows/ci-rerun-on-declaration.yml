@@ -228,8 +228,10 @@ jobs:
     runs-on: ubuntu-latest
     # A cancel can take a short while to settle before a re-run is accepted;
     # everything else here is a handful of API calls. Nothing in this job
-    # compiles.
-    timeout-minutes: 15
+    # compiles. 20, not 15: the cancel poll alone is up to 10 min, plus the
+    # retried head reads — a job killed mid-poll would leave a cancelled run
+    # with no re-run and no instruction.
+    timeout-minutes: 20
 
     steps:
       # The guard is a STEP-level `if:`, not a job-level one, and that is
@@ -322,10 +324,11 @@ jobs:
           # "moved" — an unreadable head is not evidence of a push).
           pr_head() {
             local h=""
-            for _ in 1 2 3; do
+            local i
+            for i in 1 2 3; do
               h="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" -q .head.sha 2>/dev/null || true)"
               [ -n "${h}" ] && break
-              sleep 5
+              if [ "${i}" -lt 3 ]; then sleep 5; fi
             done
             printf '%s' "${h}"
           }
@@ -347,13 +350,13 @@ jobs:
             note "Run is \`${run_status}\` and raced the label — cancelling before re-run."
             gh api -X POST "repos/${REPO}/actions/runs/${run_id}/cancel" >/dev/null || true
             for _ in $(seq 1 60); do
-              run_status="$(gh api "repos/${REPO}/actions/runs/${run_id}" -q .status)"
+              run_status="$(gh api "repos/${REPO}/actions/runs/${run_id}" -q .status 2>/dev/null || echo unknown)"
               [ "${run_status}" = "completed" ] && break
               sleep 10
             done
             if [ "${run_status}" != "completed" ]; then
               note ""
-              note "⚠️ Run did not reach \`completed\` within 10 min; leaving it alone."
+              note "⚠️ Cancel requested but not settled within 10 min; not re-running it."
               note "Re-run \`ci.yml\` by hand on this PR to act on \`${LABEL_NAME}\`."
               exit 0
             fi
@@ -382,8 +385,9 @@ jobs:
               note "CURRENT-head \`ci.yml\` run by hand to act on \`${LABEL_NAME}\`."
               exit 0
             fi
-            note "This job cancelled run \`${run_id}\`, so it re-runs it anyway rather than"
-            note "leave the head it cancelled red."
+            note "This job requested a cancel of run \`${run_id}\`, so it re-runs it anyway"
+            note "rather than leave that head red. If the head DID move, this re-run may cancel"
+            note "the new head's \`ci.yml\` run — check the PR's latest run after this job."
           fi
 
           note ""
@@ -400,6 +404,10 @@ jobs:
               note "⚠️ PR head moved to \`${after_head}\` while re-running — this re-run may have"
               note "cancelled that head's \`ci.yml\` run via the per-PR concurrency group."
               note "Re-run the current head's \`ci.yml\` run by hand."
+            elif [ -z "${after_head}" ]; then
+              note ""
+              note "⚠️ PR head could not be confirmed after the re-run. If it moved, this re-run"
+              note "may have cancelled that head's \`ci.yml\` run — check the PR's latest run."
             fi
           else
             # Never fail the PR on this. This workflow is not a required check and
