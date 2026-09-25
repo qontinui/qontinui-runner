@@ -1165,17 +1165,35 @@ fn renderer_memory_snapshot_from(handles: Option<&RendererMemoryHandles>) -> Ren
     use std::sync::atomic::Ordering;
     match handles {
         Some(h) => {
-            let bytes = h.latest_ws_bytes.load(Ordering::Relaxed);
+            // Owned by the heal path rather than by a sample, so they are read
+            // outside the group below: a fresh reload count beside the sample
+            // before it is correct, not torn.
             let reloads = h.reload_total.load(Ordering::Relaxed);
             let storming = h.storming.load(Ordering::Relaxed);
-            // A poisoned lock must not cost the whole heartbeat: the three
-            // scalars above are the fields coord has columns for, and the
-            // breakdown is diagnostic JSON beside them.
-            let processes = match h.processes.lock() {
-                Ok(g) => g.clone(),
-                Err(poisoned) => poisoned.into_inner().clone(),
+            // The five SAMPLE fields are read as a GROUP, under the same lock
+            // `renderer_watchdog::publish_sample` writes them under, so the
+            // total, the breakdown, the own-WS figure, the unreadable count and
+            // the stamp all come from ONE sample or none. Read as bare atomics
+            // beside a separately-locked vector, a heartbeat landing mid-publish
+            // could pair a new total with the PREVIOUS breakdown — a
+            // `renderer_memory_bytes` that does not reconcile with
+            // `renderer_processes`, which is an invariant this payload promises.
+            //
+            // A poisoned lock must not cost the whole heartbeat: `into_inner`,
+            // exactly as the writer does.
+            let (processes, bytes, own_process_bytes, unreadable_processes, stamp) = {
+                let g = match h.processes.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                (
+                    g.clone(),
+                    h.latest_ws_bytes.load(Ordering::Relaxed),
+                    h.own_process_bytes.load(Ordering::Relaxed),
+                    h.unreadable_processes.load(Ordering::Relaxed),
+                    h.sampled_at_unix_ms.load(Ordering::Relaxed),
+                )
             };
-            let stamp = h.sampled_at_unix_ms.load(Ordering::Relaxed);
             RendererMemorySample {
                 total_ws_bytes: bytes,
                 reload_total: reloads,
@@ -1184,8 +1202,8 @@ fn renderer_memory_snapshot_from(handles: Option<&RendererMemoryHandles>) -> Ren
                 // 0 is "never sampled", and it is reported as an absence rather
                 // than as 1970.
                 sampled_at_unix_ms: (stamp > 0).then_some(stamp),
-                own_process_bytes: h.own_process_bytes.load(Ordering::Relaxed),
-                unreadable_processes: h.unreadable_processes.load(Ordering::Relaxed),
+                own_process_bytes,
+                unreadable_processes,
             }
         }
         None => RendererMemorySample {
@@ -1942,9 +1960,18 @@ struct HeartbeatPayload {
     /// ago is indistinguishable from a live one reading a healthy plateau — and
     /// since coord ingests those columns with COALESCE, the last reported value
     /// persists indefinitely on the device row. Same rationale as
-    /// `last_capture_fallback_at`. Coord has no column for this yet (§3.2 adds
-    /// none), so it rides as diagnostic JSON like `renderer_processes`; ageing
-    /// it server-side is a coord-side follow-up, not this field's job.
+    /// `last_capture_fallback_at`.
+    ///
+    /// **Wire side only — nothing ages it, and nothing stores it.** This is a
+    /// TOP-LEVEL field of this payload, not nested under `capabilities`, and
+    /// coord today has neither a field nor a column for it (§3.2 adds none).
+    /// Coord's heartbeat schema carries no `deny_unknown_fields`, so the key is
+    /// accepted and silently DROPPED: no wire hazard, and no persistence either.
+    /// This doc used to say it "rides as diagnostic JSON like
+    /// `renderer_processes`", which reads as "is kept somewhere" — it is not.
+    /// Ageing a device row by this stamp is an unbuilt coord-side follow-up. The
+    /// same is true of `renderer_processes`, `renderer_own_process_bytes` and
+    /// `renderer_unreadable_processes`.
     #[serde(skip_serializing_if = "Option::is_none")]
     renderer_sampled_at_unix_ms: Option<u64>,
     /// The runner's OWN process working set at that sample.
