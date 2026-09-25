@@ -1,8 +1,10 @@
 //! Totality corpus for the typed step dispatch.
 //!
 //! `execute_single_step` parses every `ExecutionStepConfig` into
-//! `FullRunnerStep` via [`to_full_runner_step`] and only falls back to
-//! string-key dispatch when that parse fails. This corpus feeds every step
+//! `FullRunnerStep` via [`to_full_runner_step`]; a registry-served type that
+//! fails that parse still reaches its handler by the raw step type, but with a
+//! `warn!` (Phase 3), so the parse must be total for every live shape for that
+//! warning to mean a genuine schema/handler disagreement. This corpus feeds every step
 //! shape a LIVE producer emits through the same path the executor takes —
 //! `serde_json::from_value::<ExecutionStepConfig>` → `to_full_runner_step` →
 //! [`handler_lookup_key`] — and asserts:
@@ -25,25 +27,17 @@
 //! `buildSpecWorkflow.ts` step shapes; and the vet probe's shapes.
 //!
 //! Plan `2026-09-24-typed-step-dispatch-covers-every-registered-handler`,
-//! Phase 2 — this test is the gate for Phase 3 turning a typed-parse failure
-//! of a registry-served type into a real error.
+//! Phase 2 — this test is what keeps Phase 3's fallback warning a signal
+//! rather than noise.
 
-use super::{handler_lookup_key, to_full_runner_step};
+use super::{
+    handler_lookup_key, resolve_dispatch, to_full_runner_step, DispatchRoute,
+    LEGACY_STRING_DISPATCH,
+};
 use crate::step_executor::handlers::HandlerRegistry;
 use crate::step_executor::ExecutionStepConfig;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
-
-/// Types the legacy `match` in `execute_single_step` serves after the
-/// registry lookup misses. None has a `FullRunnerStep` variant.
-const LEGACY_STRING_TYPES: &[&str] = &[
-    "shell_command",
-    "check",
-    "check_group",
-    "shell",
-    "log_watch",
-    "gate",
-];
 
 /// One corpus entry: where it came from, and the step as JSON.
 struct Shape {
@@ -586,7 +580,7 @@ const KNOWN_LOSSY_BUILDER_UI_BRIDGE: &[(&str, &str, &str)] = &[
 ];
 
 /// Shapes a producer can emit that the typed parse refuses ON PURPOSE: the
-/// handler fails each of them too, so the refusal is the same verdict earlier.
+/// handler fails each of them too, so the fallback reaches the same verdict.
 /// `(source, step, why)`.
 fn known_refusals() -> Vec<(&'static str, Value, &'static str)> {
     vec![
@@ -654,7 +648,7 @@ fn every_live_producer_shape_parses_to_its_registered_handler() {
                 continue;
             }
         };
-        if LEGACY_STRING_TYPES.contains(&ty.as_str()) {
+        if LEGACY_STRING_DISPATCH.contains(&ty.as_str()) {
             legacy_seen.push(format!("{source} ({ty})"));
             continue;
         }
@@ -695,7 +689,7 @@ fn every_live_producer_shape_parses_to_its_registered_handler() {
 
 #[test]
 fn legacy_string_types_are_not_typed() {
-    for ty in LEGACY_STRING_TYPES {
+    for ty in LEGACY_STRING_DISPATCH {
         let esc: ExecutionStepConfig =
             serde_json::from_value(json!({"type": ty, "id": "a", "name": "b"})).unwrap();
         assert!(
@@ -704,7 +698,7 @@ fn legacy_string_types_are_not_typed() {
         );
         assert!(
             HandlerRegistry::with_standard_handlers().get(ty).is_none(),
-            "{ty:?} is registered; it should not also be in LEGACY_STRING_TYPES"
+            "{ty:?} is registered; it should not also be in LEGACY_STRING_DISPATCH"
         );
     }
 }
@@ -724,7 +718,7 @@ fn known_refusals_stay_refused() {
 /// `ui_bridge` and `workflow` do (their typed fields are bare `action` /
 /// `target` / `workflowId`, while `ExecutionStepConfig` serializes
 /// `ui_bridge_*` / `ref_workflow_id`); the three new variants do not. Proven by
-/// the plain JSON round-trip the fallback path uses.
+/// the plain JSON round-trip `to_full_runner_step` uses for every other type.
 #[test]
 fn which_types_need_a_direct_constructor() {
     use qontinui_types::workflow_step::FullRunnerStep;
@@ -822,6 +816,12 @@ fn builder_ui_bridge_steps_lose_action_and_url() {
             "{skill}: parses to the DEFAULT action"
         );
         assert_eq!(u.url, None, "{skill}: typed url");
+        // Lossy, but the parse is Ok: the typed route, not the fallback.
+        assert_eq!(
+            resolve_dispatch(&esc, &HandlerRegistry::with_standard_handlers()),
+            DispatchRoute::Registry("ui_bridge"),
+            "{skill}: lossy builder ui_bridge step must still dispatch"
+        );
     }
 }
 
