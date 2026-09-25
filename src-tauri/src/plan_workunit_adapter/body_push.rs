@@ -1163,6 +1163,28 @@ impl BackfillReport {
     pub fn divergent_count(&self) -> usize {
         self.duplicate_stems.iter().filter(|d| d.differs).count()
     }
+
+    /// `(dark, partial)`: roots not read at all, and roots read only in part.
+    /// Either being non-zero makes every corpus-wide count in the report a
+    /// floor rather than a total.
+    pub fn incomplete_roots(&self) -> (usize, usize) {
+        let dark = self
+            .per_root
+            .iter()
+            .filter(|(_, n)| matches!(n, RootYield::Dark(_)))
+            .count();
+        let partial = self
+            .per_root
+            .iter()
+            .filter(|(_, n)| matches!(n, RootYield::Partial { .. }))
+            .count();
+        (dark, partial)
+    }
+
+    /// `true` when every root was read whole, so the report's counts are totals.
+    pub fn is_complete(&self) -> bool {
+        self.incomplete_roots() == (0, 0)
+    }
 }
 
 /// Build the dry-run report from a scan. Pure — no HTTP, no clock.
@@ -1231,16 +1253,7 @@ pub fn build_report(
 pub fn render_report(report: &BackfillReport) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
-    let dark = report
-        .per_root
-        .iter()
-        .filter(|(_, n)| matches!(n, RootYield::Dark(_)))
-        .count();
-    let partial = report
-        .per_root
-        .iter()
-        .filter(|(_, n)| matches!(n, RootYield::Partial { .. }))
-        .count();
+    let (dark, partial) = report.incomplete_roots();
     // The grand total is a total only when every root was read whole. With a
     // dark or partly read root it is a floor, and must say so rather than
     // keep the confidence the by-root table below withholds.
@@ -1286,7 +1299,7 @@ pub fn render_report(report: &BackfillReport) -> String {
     );
     let _ = writeln!(
         s,
-        "\nduplicate stems: {} ({} DIVERGENT by content)",
+        "\nduplicate stems: {} ({} DIVERGENT by content){floors}",
         report.duplicate_stems.len(),
         report.divergent_count()
     );
@@ -4282,6 +4295,14 @@ mod tests {
             text.contains("with Depends-On: 0 (floors: not every root was read)"),
             "{text}"
         );
+        // A copy of a stem in an unread root is invisible, so the duplicate
+        // and divergent counts are floors too.
+        assert!(
+            text.contains("DIVERGENT by content) (floors: not every root was read)"),
+            "{text}"
+        );
+        assert!(!report.is_complete());
+        assert_eq!(report.incomplete_roots(), (1, 1));
         // A PARTLY read root is a floor, not a total — including the case
         // `collect_listing`'s doc calls a fabricated zero (every entry lost).
         let root_path = root.to_string_lossy().to_string();
@@ -4324,6 +4345,7 @@ mod tests {
         assert!(!clean_text.contains("read in part"), "{clean_text}");
         assert!(clean_text.starts_with("scanned: 0\n"), "{clean_text}");
         assert!(!clean_text.contains("floors"), "{clean_text}");
+        assert!(clean.is_complete());
     }
 
     /// The marker match is case-insensitive without allocating a lowercase copy

@@ -154,7 +154,11 @@ personal `gh auth login` required. On success prints the PR URL to stdout.
 `plan-library-backfill` walks the three scan roots, classifies each markdown
 file to an artifact kind, and upserts it into the qontinui-web plan & prompt
 library with the runner's own device JWT. `--dry-run` prints the per-kind counts
-and the duplicated/divergent stem list without contacting anything.
+and the duplicated/divergent stem list without contacting anything. Exit 1 means
+an artifact push (or the runtime) failed; edge errors are reported but do not
+fail the run. Exit 3 means the run finished but a scan root was unread or read
+only in part, so its counts are floors and the catch-up is incomplete
+(`--limit` truncation is asked for, so it is not counted).
 
 `plan-workunit-backfill` is its WORK-UNIT half: it parses the active plans dir
 and upserts each plan into `coord.work_units`. It deliberately bypasses the
@@ -563,9 +567,25 @@ fn plan_library_backfill(args: &[String]) -> ExitCode {
 
     let report = bp::build_report(&all, skipped, per_root);
     println!("{}", bp::render_report(&report));
+    // A run that left a root unread or partly read did its work, but on a
+    // subset of the corpus. Exit 0 would tell a script the catch-up was whole,
+    // which is the UNKNOWN-renders-as-a-default shape the report text avoids.
+    let note_incomplete = || {
+        eprintln!(
+            "qontinui-pr: not every scan root was read whole — the counts above are floors \
+             and the catch-up is incomplete."
+        );
+    };
+    let incomplete_exit = || {
+        note_incomplete();
+        ExitCode::from(BACKFILL_INCOMPLETE_EXIT)
+    };
 
     if parsed.dry_run {
         println!("dry run: nothing was pushed.");
+        if !report.is_complete() {
+            return incomplete_exit();
+        }
         return ExitCode::SUCCESS;
     }
 
@@ -631,10 +651,24 @@ fn plan_library_backfill(args: &[String]) -> ExitCode {
         );
     }
     if summary.errors > 0 {
+        // A push error outranks an incomplete read, but the operator still
+        // needs to know the run covered only a subset.
+        if !report.is_complete() {
+            note_incomplete();
+        }
         return ExitCode::from(1);
+    }
+    if !report.is_complete() {
+        return incomplete_exit();
     }
     ExitCode::SUCCESS
 }
+
+/// `plan-library-backfill`'s exit code when the run succeeded but at least one
+/// scan root was unread or read only in part. Distinct from `1` (a push error)
+/// and `2` (a usage/config refusal), so a script can tell "failed" from
+/// "succeeded over a subset".
+const BACKFILL_INCOMPLETE_EXIT: u8 = 3;
 
 // ===========================================================================
 // `qontinui-pr plan-workunit-backfill` — the WORK-UNIT half of the backfill
