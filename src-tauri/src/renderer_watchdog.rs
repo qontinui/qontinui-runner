@@ -1705,8 +1705,18 @@ async fn heal(
         app,
         WatchdogEvent {
             kind: "reload_result",
-            breach: breach.as_str(),
-            total_ws_bytes: post.total_bytes,
+            // The last total that was actually MEASURED — which on an UNKNOWN
+            // verdict is the pre-heal one, not `post.total_bytes`. An unreadable
+            // post sample has `total_bytes == 0`, and putting that on the wire
+            // would tell the user the renderer is now using nothing: the same
+            // manufactured measurement `reclaimed_bytes` refuses to carry, in the
+            // field beside it. This is exactly [`publish_sample`]'s convention —
+            // an unreadable sample leaves the previous reading standing rather
+            // than overwriting it with a zero.
+            total_ws_bytes: match verdict {
+                ReclaimVerdict::Measured { .. } => post.total_bytes,
+                ReclaimVerdict::Unknown { .. } => pre.total_bytes,
+            },
             countdown_secs: 0,
             reload_total,
             reclaimed_bytes: verdict.measured_bytes(),
@@ -1715,11 +1725,12 @@ async fn heal(
                     "Renderer reloaded — reclaimed {bytes} bytes ({} B → {} B).",
                     pre.total_bytes, post.total_bytes
                 ),
-                ReclaimVerdict::Unknown { .. } => {
+                ReclaimVerdict::Unknown { .. } => format!(
                     "Renderer reloaded — how much memory that reclaimed could not be \
-                     measured: the post-reload sample could not be read."
-                        .to_string()
-                }
+                     measured, because the post-reload sample could not be read. The last \
+                     measured total is {} B, taken before the reload.",
+                    pre.total_bytes
+                ),
             },
         },
     );
@@ -2958,6 +2969,39 @@ mod tests {
                 "UNKNOWN credits nothing, and carries no number for the escalation to test"
             );
         }
+    }
+
+    #[test]
+    fn an_unknown_reclaim_reports_the_last_measured_total_not_a_zero() {
+        // The sibling half of the same defect: on an unreadable post sample
+        // `post.total_bytes` is 0, so putting it in the event's `totalWsBytes`
+        // tells the user the renderer is now using nothing — a manufactured
+        // measurement in the field beside the one that refuses to carry any. The
+        // event therefore reports the PRE-heal total on an UNKNOWN verdict, which
+        // is `publish_sample`'s own convention: an unreadable sample leaves the
+        // last good reading standing.
+        let pre = quiet_snapshot();
+        let post = Snapshot::default();
+        let verdict = classify_reclaim(&pre, &post);
+        let reported = match verdict {
+            ReclaimVerdict::Measured { .. } => post.total_bytes,
+            ReclaimVerdict::Unknown { .. } => pre.total_bytes,
+        };
+        assert_eq!(
+            reported, pre.total_bytes,
+            "an unreadable post sample must not be reported as a total of 0"
+        );
+        assert_ne!(reported, post.total_bytes);
+
+        // And a MEASURED verdict still reports the post-heal total, which is the
+        // whole point of taking a second sample.
+        let smaller = snapshot_of(vec![proc(1, WebViewProcessKind::Browser, 91)]);
+        let verdict = classify_reclaim(&pre, &smaller);
+        let reported = match verdict {
+            ReclaimVerdict::Measured { .. } => smaller.total_bytes,
+            ReclaimVerdict::Unknown { .. } => pre.total_bytes,
+        };
+        assert_eq!(reported, smaller.total_bytes);
     }
 
     #[cfg(target_os = "windows")]
