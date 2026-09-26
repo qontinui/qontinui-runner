@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use tauri::Emitter;
 use tokio::sync::{watch, Mutex};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::mcp::types::ApiState;
 use crate::settings::{self, RunnerTier};
@@ -1619,9 +1619,18 @@ impl CoordCredentialPosture {
     pub fn cta(self) -> Option<&'static str> {
         match self {
             CoordCredentialPosture::Live | CoordCredentialPosture::Expiring => None,
-            // A held-but-expired credential is exactly what the (shipped)
-            // clear + re-derive exit heals; kicking the refresher retries it
-            // now rather than up to 5 minutes from now.
+            // A held-but-expired credential whose recovery rungs have NOT all
+            // been tried and refused yet: the tenant-slot pass's clear +
+            // re-derive, or the legacy path's self-refresh / pair-cli / dmk
+            // exchange, may still heal it, and kicking the refresher retries
+            // now rather than up to 5 minutes from now. Once every rung has
+            // been tried and refused the ladder says `Unrefreshable` instead
+            // — on the legacy no-slot path too, via
+            // [`conclude_legacy_recovery_failure`] (plan
+            // 2026-09-24-runner-coord-credential-stranded-after-outage). This
+            // arm used to claim "clear + re-derive heals it" unconditionally,
+            // which was false on that path: it has no slot to clear and, with
+            // no machine key, nothing to re-derive from.
             CoordCredentialPosture::Expired => Some("retry_refresh"),
             // These three have already exhausted the automatic rungs.
             CoordCredentialPosture::Absent
@@ -2947,6 +2956,7 @@ pub(crate) fn reset_coord_credential_posture_for_test() {
         .unwrap_or_else(|e| e.into_inner()) = None;
     with_upstream_signals(|m| m.clear());
     with_orphan_warned(|s| s.clear());
+    reset_legacy_conclusion_for_test();
     POSTURE_TRANSITIONS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -3094,6 +3104,25 @@ pub(crate) fn derive_and_publish_posture(
     pins: PosturePinInputs,
     now: i64,
 ) -> Option<PostureTransition> {
+    derive_and_publish_posture_labelled(observations, pins, now, None)
+}
+
+/// [`derive_and_publish_posture`] with an explicit `lastRefreshOutcome` label
+/// for the winning slot's outcome, replacing the generic
+/// [`tenant_slot_outcome_token`] spelling.
+///
+/// Exists for ONE caller: the legacy (no-tenant-slot) path's conclusion
+/// ([`conclude_legacy_recovery_failure`]), whose synthetic `Cleared` outcome
+/// would otherwise read `cleared` — a slot that was never cleared, naming no
+/// route. The label names the routes that actually failed. It only applies
+/// when the winning candidate carries an outcome, so it can never be pinned
+/// onto the unserved-pin or orphan arms (both carry none).
+pub(crate) fn derive_and_publish_posture_labelled(
+    observations: &[SlotObservation],
+    pins: PosturePinInputs,
+    now: i64,
+    outcome_label: Option<&str>,
+) -> Option<PostureTransition> {
     /// One entry in the `worst` fold, carrying everything the publish needs.
     struct Candidate {
         posture: CoordCredentialPosture,
@@ -3221,7 +3250,11 @@ pub(crate) fn derive_and_publish_posture(
         worst.posture,
         worst.tenant_id,
         worst.exp,
-        worst.outcome.map(tenant_slot_outcome_token),
+        worst.outcome.map(|o| {
+            outcome_label
+                .map(str::to_string)
+                .unwrap_or_else(|| tenant_slot_outcome_token(o))
+        }),
         worst.signal,
         // ATTRIBUTABLE: `worst` is a real slot candidate (or the unserved
         // pin), so `tenant_id` names the slot this posture is about —
@@ -3242,6 +3275,592 @@ pub(crate) fn tenant_slot_outcome_token(outcome: TenantSlotOutcome) -> String {
         TenantSlotOutcome::KeptExisting => "kept-existing",
     }
     .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Legacy (no-tenant-slot) path: reaching `Unrefreshable` honestly.
+//
+// Plan `2026-09-24-runner-coord-credential-stranded-after-outage` Phase 2. A
+// runner with no `device_jwt:<tenant>` slot takes the LEGACY branch, whose
+// posture was published from a bare observation (no outcome) BEFORE any
+// recovery ran — so a credential every rung had already refused read
+// `expired` / `retry_refresh` / `lastRefreshOutcome: null` forever, and the
+// coord-mcp proxy told every session to retry. The ladder already has the
+// right answer (`Unrefreshable` → `re_pair`); this path never handed it the
+// evidence.
+// ---------------------------------------------------------------------------
+
+/// Does this runner hold a device machine key (`dmk_`) — the one credential
+/// that re-mints a device JWT after BOTH the JWT and any user session expired?
+///
+/// Tri-state plus a warning band, because the answer feeds a posture: an
+/// unreadable store is `Unknown`, never `Absent` (absence-is-not-zero — an
+/// undecryptable `.enc` says nothing about whether a key is in it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineKeyState {
+    /// A key is stored and not known to be near its expiry.
+    Present,
+    /// A key is stored and its recorded `expires_at` is within
+    /// [`MACHINE_KEY_ROTATE_WITHIN_SECS`] (or already past).
+    Expiring,
+    /// The store was READ and holds no key.
+    Absent,
+    /// The store could not be read. Says nothing about the key.
+    Unknown,
+}
+
+impl MachineKeyState {
+    /// Stable wire token — `/health.coordCredential.machineKey`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MachineKeyState::Present => "present",
+            MachineKeyState::Expiring => "expiring",
+            MachineKeyState::Absent => "absent",
+            MachineKeyState::Unknown => "unknown",
+        }
+    }
+}
+
+/// Rotate (re-enrol) a machine key this close to its recorded expiry. Web's
+/// `DEVICE_MACHINE_KEY_TTL_DAYS` is 60 and `expires_at` slides only on a
+/// successful exchange, so a key minted and never used dies at exactly the
+/// moment it is first needed; re-enrolling a week ahead keeps it alive.
+pub(crate) const MACHINE_KEY_ROTATE_WITHIN_SECS: i64 = 7 * 24 * 60 * 60;
+
+/// Read [`MachineKeyState`] from the credential store.
+pub(crate) fn machine_key_state(
+    auth_manager: &crate::auth::AuthManager,
+    now: i64,
+) -> MachineKeyState {
+    match auth_manager.get_device_machine_key() {
+        Ok(Some(k)) if !k.trim().is_empty() => {
+            match auth_manager.get_device_machine_key_expires_at() {
+                Some(exp) if exp - now <= MACHINE_KEY_ROTATE_WITHIN_SECS => {
+                    MachineKeyState::Expiring
+                }
+                _ => MachineKeyState::Present,
+            }
+        }
+        Ok(_) => MachineKeyState::Absent,
+        Err(_) => MachineKeyState::Unknown,
+    }
+}
+
+/// `lastRefreshOutcome` for a legacy credential every automatic rung refused:
+/// device self-refresh needs an unexpired JWT, pair-cli needs a user session,
+/// and the machine-key exchange needs a key. Names the routes, not a slot
+/// action — the legacy slot is never cleared (REPLACE-not-REVOKE).
+pub(crate) const LEGACY_EXHAUSTED_NO_MACHINE_KEY: &str =
+    "legacy-exhausted:pair-cli-no-user-session,dmk-no-machine-key";
+
+/// Has the legacy path provably run out of automatic rungs?
+///
+/// Pure. `Some(label)` ONLY when every input is a measured negative:
+///
+/// * no tenant slot exists (with slots, the per-slot pass owns the posture and
+///   a legacy verdict would overwrite a multi-tenant answer);
+/// * the legacy credential is dead (expired, opaque or absent) — a live one
+///   cannot be self-refreshed only because coord was unreachable, which is
+///   transient;
+/// * there is no USABLE user session (none stored, or its refresh token is
+///   dead) — with one, pair-cli can still re-mint once the network returns;
+/// * the store was read and holds NO machine key. A key that is present but
+///   whose exchange failed stays `expired` / `retry_refresh`: a 503 from a web
+///   backend without `COORD_ADMIN_SECRET`, or a transport error, is not proof
+///   the key cannot recover, and calling it `re_pair` would be the opposite
+///   lie. An `Unknown` store abstains for the same reason.
+pub(crate) fn legacy_exhausted_outcome_label(
+    has_tenant_slots: bool,
+    legacy_credential_dead: bool,
+    user_session_usable: bool,
+    machine_key: MachineKeyState,
+) -> Option<&'static str> {
+    if has_tenant_slots || !legacy_credential_dead || user_session_usable {
+        return None;
+    }
+    match machine_key {
+        MachineKeyState::Absent => Some(LEGACY_EXHAUSTED_NO_MACHINE_KEY),
+        MachineKeyState::Present | MachineKeyState::Expiring | MachineKeyState::Unknown => None,
+    }
+}
+
+/// The legacy observation that carries the "every rung failed" conclusion.
+///
+/// A synthetic `Cleared { rederived: false }` is the legacy equivalent of the
+/// slot pass's failed re-derive: rung 2 of the ladder turns it into
+/// `Unrefreshable`. The slot is NOT actually cleared.
+fn legacy_exhausted_observation(held: Option<&str>) -> SlotObservation {
+    let mut obs = SlotObservation::observed(None, held);
+    obs.outcome = Some(TenantSlotOutcome::Cleared {
+        cause: SlotClearCause::DecodedExpiry,
+        rederived: false,
+    });
+    obs
+}
+
+/// The concluded legacy verdict, remembered so the NEXT pass's top-of-loop
+/// observation (published before recovery runs) does not flip the posture
+/// back to `expired` and fire a second banner every tick. Keyed on the dead
+/// credential itself: `(present, exp)` of what the legacy slot held when the
+/// conclusion was drawn. Any change to that credential — a re-pair, a
+/// successful mint — no longer matches and the memory is dropped.
+static LEGACY_EXHAUSTED: std::sync::Mutex<Option<(bool, Option<i64>, &'static str)>> =
+    std::sync::Mutex::new(None);
+
+/// Carry a previous legacy conclusion onto this pass's pre-recovery
+/// observation, if it describes the SAME dead credential. Returns the
+/// observation to publish and the outcome label to publish it with.
+pub(crate) fn carry_legacy_conclusion(
+    obs: SlotObservation,
+) -> (SlotObservation, Option<&'static str>) {
+    let mut memory = LEGACY_EXHAUSTED.lock().unwrap_or_else(|e| e.into_inner());
+    match *memory {
+        Some((present, exp, label))
+            if !obs.unknown
+                && obs.outcome.is_none()
+                && obs.present == present
+                && obs.exp == exp =>
+        {
+            let mut carried = obs;
+            carried.outcome = Some(TenantSlotOutcome::Cleared {
+                cause: SlotClearCause::DecodedExpiry,
+                rederived: false,
+            });
+            (carried, Some(label))
+        }
+        // An unreadable store says nothing; keep the memory for the next read.
+        Some(_) if obs.unknown => (obs, None),
+        Some(_) => {
+            *memory = None;
+            (obs, None)
+        }
+        None => (obs, None),
+    }
+}
+
+/// Conclude a legacy-path pass whose recovery rungs all failed.
+///
+/// Called from the `refresher_loop` legacy failure tail (progress
+/// `BailRefreshFailedExpired` / `BailNoTenant`, the machine-key exchange
+/// already tried). Publishes `Unrefreshable` with a named
+/// `lastRefreshOutcome` when [`legacy_exhausted_outcome_label`] proves the
+/// runner is stranded; otherwise publishes nothing and the pre-recovery
+/// `expired` posture stands.
+pub(crate) fn conclude_legacy_recovery_failure(
+    auth_manager: &crate::auth::AuthManager,
+    has_tenant_slots: bool,
+    user_session_usable: bool,
+    pins: PosturePinInputs,
+    now: i64,
+) -> Option<PostureTransition> {
+    let held = match auth_manager.probe_access_token() {
+        crate::secure_storage::StoredTokenRead::Present(t) => Some(t),
+        crate::secure_storage::StoredTokenRead::Absent => None,
+        // UNKNOWN: nothing to conclude from.
+        crate::secure_storage::StoredTokenRead::Unreadable(_) => return None,
+    };
+    let dead = match held.as_deref().and_then(crate::auth::decode_jwt_exp) {
+        Some(exp) => now >= exp,
+        None => true, // absent or opaque — can never be presented
+    };
+    let label = legacy_exhausted_outcome_label(
+        has_tenant_slots,
+        dead,
+        user_session_usable,
+        machine_key_state(auth_manager, now),
+    )?;
+    let obs = legacy_exhausted_observation(held.as_deref());
+    *LEGACY_EXHAUSTED.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((obs.present, obs.exp, label));
+    warn_legacy_exhausted_once(label);
+    derive_and_publish_posture_labelled(&[obs], pins, now, Some(label))
+}
+
+/// One `warn!` per conclusion label per process, not one per 5-minute tick.
+fn warn_legacy_exhausted_once(label: &'static str) {
+    static WARNED: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
+    let mut last = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+    if *last != Some(label) {
+        *last = Some(label);
+        warn!(
+            "device_jwt_refresher: coord credential is UNREFRESHABLE ({label}) — the legacy \
+             device JWT is expired, there is no usable user session for pair-cli, and no \
+             device machine key is stored for the exchange. No automatic rung remains: \
+             re-pair this runner (Cognito sign-in, a pair code, or `qontinui_profile device \
+             pair`)."
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Machine-key enrolment + a LOUD dmk-absent (plan
+// `2026-09-24-runner-coord-credential-stranded-after-outage` Phase 3).
+//
+// The machine-key exchange is the one rung that recovers a device JWT after
+// BOTH the JWT and every user session expired — but it returned `None`
+// silently when no key was stored, and only the pair-cli response ever
+// delivered one. A device paired by code or by browser was keyless forever,
+// and nobody could tell. Now: every pass with a live device JWT and no (or a
+// nearly-expired) key enrols one through web's self-mint route, and the key's
+// state is published on `/health.coordCredential.machineKey`.
+// ---------------------------------------------------------------------------
+
+/// Backoff after web says the route does not exist (a web build that predates
+/// it). Long: a deploy fixes it, not a retry.
+const MACHINE_KEY_ENROL_UNAVAILABLE_BACKOFF_SECS: i64 = 6 * 60 * 60;
+/// Backoff after a transport error, a 5xx (web's `503
+/// coord_device_lookup_unavailable`, `502 coord_device_state_malformed`) or a
+/// bad body: the refresher's own cadence — retried, never in a tight loop.
+const MACHINE_KEY_ENROL_TRANSIENT_BACKOFF_SECS: i64 = REFRESH_CHECK_INTERVAL.as_secs() as i64;
+
+/// Per-process enrolment gate.
+///
+/// Web's self-mint contract (qontinui-web, 2026-09-25) decides the fields:
+///
+/// * a 403 (`not_a_device_principal`, `device_token_provenance_refused`,
+///   `device_mismatch`, `device_not_owned`, `coord_refused_device_token`,
+///   `device_machine_key_revoked`) is terminal **for the bearer that got it**
+///   — [`Self::refused_bearers`] holds a fingerprint, and that bearer is never
+///   presented again; a NEW token (a refresh, a re-pair) is asked afresh;
+/// * a 409 `machine_key_still_usable` is terminal for the process
+///   ([`Self::terminal`]): web will not rotate a key it considers usable;
+/// * everything transient backs off via [`Self::next_attempt_at`].
+#[derive(Debug, Default)]
+pub(crate) struct MachineKeyEnrolGate {
+    next_attempt_at: Option<i64>,
+    terminal: Option<qontinui_runner_lib::pair::MachineKeyEnrolError>,
+    refused_bearers: std::collections::HashSet<u64>,
+    /// The last terminal-for-this-token refusal, for `/health`.
+    last_refusal: Option<qontinui_runner_lib::pair::MachineKeyEnrolError>,
+}
+
+/// A non-reversible, in-memory-only fingerprint of a bearer, so the gate can
+/// recognise a refused token without holding a copy of it.
+fn bearer_fingerprint(bearer: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bearer.trim().hash(&mut h);
+    h.finish()
+}
+
+/// What one [`maybe_enrol_device_machine_key`] call did. Tests assert on it;
+/// the loop only logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MachineKeyEnrolAttempt {
+    /// The key is present and not near expiry, or the store is unreadable
+    /// (UNKNOWN — never enrol over a store we cannot read).
+    NotNeeded(MachineKeyState),
+    /// Inside a backoff window, or the key was declared revoked.
+    Deferred,
+    /// No unexpired device JWT and no usable user bearer to authenticate with.
+    NoBearer,
+    /// A key was minted and stored.
+    Enrolled {
+        route: qontinui_runner_lib::pair::MachineKeyMintRoute,
+    },
+    /// Web refused or could not be reached; backoff set accordingly.
+    Failed(qontinui_runner_lib::pair::MachineKeyEnrolError),
+}
+
+fn machine_key_enrol_gate() -> &'static std::sync::Mutex<MachineKeyEnrolGate> {
+    static GATE: std::sync::OnceLock<std::sync::Mutex<MachineKeyEnrolGate>> =
+        std::sync::OnceLock::new();
+    GATE.get_or_init(|| std::sync::Mutex::new(MachineKeyEnrolGate::default()))
+}
+
+/// The machine-key state the last refresher pass observed, for `/health`.
+/// `None` = no pass has read it yet in this process (UNKNOWN).
+static MACHINE_KEY_STATE: std::sync::Mutex<Option<MachineKeyState>> = std::sync::Mutex::new(None);
+
+/// `/health.coordCredential.machineKey`: the last observed state, or
+/// `unknown` before any pass has read the store. Never defaults to `absent`.
+pub fn machine_key_health_token() -> &'static str {
+    MACHINE_KEY_STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .map(MachineKeyState::as_str)
+        .unwrap_or("unknown")
+}
+
+/// Why enrolment stopped for good in this process, for
+/// `/health.coordCredential.machineKeyReason`. `None` while enrolment is
+/// still possible (or never needed).
+pub fn machine_key_enrol_blocked_reason() -> Option<String> {
+    let g = machine_key_enrol_gate()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    g.terminal
+        .as_ref()
+        .or(g.last_refusal.as_ref())
+        .map(|e| e.to_string())
+}
+
+/// Record the observed state and log ONCE per state change (not per tick):
+/// `absent` / `expiring` / `unknown` at WARN, because each means the one
+/// unattended recovery rung is missing or at risk.
+fn observe_machine_key_state(state: MachineKeyState) {
+    let mut cell = MACHINE_KEY_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if *cell == Some(state) {
+        return;
+    }
+    let previous = cell.replace(state);
+    drop(cell);
+    match state {
+        MachineKeyState::Present => {
+            if previous.is_some() {
+                info!("device_jwt_refresher: device machine key is present");
+            }
+        }
+        MachineKeyState::Absent => warn!(
+            "device_jwt_refresher: NO device machine key is stored — if the device JWT \
+             expires while coord is unreachable, this runner cannot recover without an \
+             operator re-pair. Enrolling one while a live device JWT is held."
+        ),
+        MachineKeyState::Expiring => warn!(
+            "device_jwt_refresher: the device machine key is within {} days of its expiry — \
+             rotating it while a live device JWT is held.",
+            MACHINE_KEY_ROTATE_WITHIN_SECS / 86_400
+        ),
+        MachineKeyState::Unknown => warn!(
+            "device_jwt_refresher: the credential store could not be read, so whether a \
+             device machine key is held is UNKNOWN (not assumed absent)"
+        ),
+    }
+}
+
+/// An unexpired device JWT to present to self-mint: the legacy slot first,
+/// else any tenant slot (every slot's JWT names this same device). Needs at
+/// least a minute of life so web does not see it expire mid-request.
+fn live_device_jwt_for_enrol(auth_manager: &crate::auth::AuthManager, now: i64) -> Option<String> {
+    let live = |t: &str| crate::auth::decode_jwt_exp(t).is_some_and(|exp| exp > now + 60);
+    if let Ok(t) = auth_manager.get_access_token() {
+        if live(&t) {
+            return Some(t);
+        }
+    }
+    auth_manager
+        .list_tenant_device_jwt_tenants()
+        .into_iter()
+        .filter_map(|tenant| auth_manager.get_tenant_device_jwt(&tenant).ok().flatten())
+        .find(|t| live(t))
+}
+
+/// A Cognito user bearer usable WITHOUT a network refresh, for web's
+/// user-bearer `/mint` door. `None` when absent or stale — this path never
+/// triggers a Cognito refresh of its own.
+fn usable_user_bearer(auth_manager: &crate::auth::AuthManager) -> Option<String> {
+    if auth_manager.cognito_token_needs_refresh() {
+        return None;
+    }
+    auth_manager
+        .get_oauth_access_token()
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+}
+
+/// Enrol (or rotate) the device machine key when this pass holds a way to
+/// authenticate and the key is absent or within
+/// [`MACHINE_KEY_ROTATE_WITHIN_SECS`] of expiry.
+///
+/// Every successful mint ROTATES the key server-side (the old plaintext dies
+/// at once), so this is called only in those two states and the new key is
+/// persisted before anything else happens. A key with no recorded expiry
+/// (stored from a pair-cli response) is left alone.
+///
+/// Door order: web's device-JWT `self-mint` (the headless door), then the
+/// user-bearer `mint` when a fresh Cognito session exists and self-mint was
+/// unavailable or there is no live device JWT. Backoff is per outcome so a
+/// web build without the route (404) costs one request per six hours, never a
+/// retry storm; a 403 retires the bearer that got it (a new token is asked
+/// afresh), a 409 `machine_key_still_usable` stops enrolment for the process,
+/// and a 5xx retries on the refresher's cadence. See [`MachineKeyEnrolGate`].
+pub(crate) async fn maybe_enrol_device_machine_key(
+    gate: &std::sync::Mutex<MachineKeyEnrolGate>,
+    auth_manager: &crate::auth::AuthManager,
+    web_base: &str,
+    device_id: &str,
+    now: i64,
+) -> MachineKeyEnrolAttempt {
+    use qontinui_runner_lib::pair::{MachineKeyEnrolError as E, MachineKeyMintRoute as R};
+
+    let state = machine_key_state(auth_manager, now);
+    observe_machine_key_state(state);
+    if !matches!(state, MachineKeyState::Absent | MachineKeyState::Expiring) {
+        return MachineKeyEnrolAttempt::NotNeeded(state);
+    }
+    if web_base.trim().is_empty() {
+        return MachineKeyEnrolAttempt::Deferred;
+    }
+    {
+        let g = gate.lock().unwrap_or_else(|e| e.into_inner());
+        if g.terminal.is_some() || g.next_attempt_at.is_some_and(|t| now < t) {
+            return MachineKeyEnrolAttempt::Deferred;
+        }
+    }
+
+    let mut attempts: Vec<(R, String)> = Vec::with_capacity(2);
+    if let Some(jwt) = live_device_jwt_for_enrol(auth_manager, now) {
+        attempts.push((R::SelfMint, jwt));
+    }
+    if let Some(user) = usable_user_bearer(auth_manager) {
+        attempts.push((R::UserMint, user));
+    }
+    if attempts.is_empty() {
+        return MachineKeyEnrolAttempt::NoBearer;
+    }
+    // A bearer web already refused with a 403 is never presented again; only
+    // a changed token is worth asking with.
+    {
+        let g = gate.lock().unwrap_or_else(|e| e.into_inner());
+        attempts.retain(|(_, b)| !g.refused_bearers.contains(&bearer_fingerprint(b)));
+    }
+    if attempts.is_empty() {
+        return MachineKeyEnrolAttempt::Deferred;
+    }
+
+    let mut last_err = E::RouteUnavailable;
+    for (route, bearer) in attempts {
+        let fingerprint = bearer_fingerprint(&bearer);
+        let (base, did) = (web_base.to_string(), device_id.to_string());
+        let minted = match spawn_blocking_tracked(move || {
+            qontinui_runner_lib::pair::mint_device_machine_key(&base, &did, &bearer, route)
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => Err(E::Transport(format!("mint task join failed: {e}"))),
+        };
+        match minted {
+            Ok(mint) => {
+                let exp = mint.expires_at_unix();
+                // The old key is already dead server-side: persisting this one
+                // is the whole point, so a failure here is loud.
+                if let Err(e) =
+                    auth_manager.store_device_machine_key_with_expiry(&mint.device_machine_key, exp)
+                {
+                    error!(
+                        "device_jwt_refresher: device machine key MINTED (prefix {}) but could \
+                         not be stored ({e}) — the previous key is now revoked; enrolment \
+                         retries next pass",
+                        mint.prefix.as_deref().unwrap_or("?")
+                    );
+                    let mut g = gate.lock().unwrap_or_else(|e| e.into_inner());
+                    g.next_attempt_at = Some(now + MACHINE_KEY_ENROL_TRANSIENT_BACKOFF_SECS);
+                    return MachineKeyEnrolAttempt::Failed(E::Persist(e.to_string()));
+                }
+                info!(
+                    "device_jwt_refresher: device machine key enrolled via {route:?} \
+                     (prefix {}, expires_at {:?})",
+                    mint.prefix.as_deref().unwrap_or("?"),
+                    mint.expires_at
+                );
+                {
+                    let mut g = gate.lock().unwrap_or_else(|e| e.into_inner());
+                    g.next_attempt_at = None;
+                    g.last_refusal = None;
+                }
+                observe_machine_key_state(machine_key_state(auth_manager, now));
+                return MachineKeyEnrolAttempt::Enrolled { route };
+            }
+            // Terminal FOR THIS TOKEN: remember it, log once per new refusal,
+            // and try the next door (if any).
+            Err(e @ (E::Revoked | E::Refused { status: 403, .. })) => {
+                let mut g = gate.lock().unwrap_or_else(|e| e.into_inner());
+                if g.refused_bearers.insert(fingerprint) && g.last_refusal.as_ref() != Some(&e) {
+                    warn!(
+                        "device_jwt_refresher: machine-key enrolment via {route:?} refused \
+                         ({e}) — not retrying with this token; a refreshed token or a re-pair \
+                         is asked afresh"
+                    );
+                }
+                g.last_refusal = Some(e.clone());
+                last_err = e;
+            }
+            // 401: the token web saw is not live. Enrolment only runs with a
+            // live one, so this is a race with expiry — skip quietly.
+            Err(e @ E::Refused { status: 401, .. }) => {
+                debug!("device_jwt_refresher: machine-key enrolment skipped ({e})");
+                return MachineKeyEnrolAttempt::Failed(e);
+            }
+            // Try the next door (if any) on everything else.
+            Err(e) => last_err = e,
+        }
+    }
+
+    // Every door that answered refused THIS token terminally: nothing to back
+    // off — the bearer filter above already stops the retry.
+    if matches!(last_err, E::Revoked | E::Refused { status: 403, .. }) {
+        return MachineKeyEnrolAttempt::Failed(last_err);
+    }
+
+    if matches!(last_err, E::ServerKeyStillUsable) {
+        // Terminal for self-mint: web will not rotate a key it considers
+        // usable, and this runner has no copy of it. Only the owner's `/mint`
+        // (or a re-pair) replaces it. Logged once — the gate stops retries.
+        warn!(
+            "device_jwt_refresher: web holds a still-usable device machine key this runner \
+             does NOT have (409 machine_key_still_usable) — self-mint will not replace it. \
+             Sign in (the owner's /mint rotates it) or re-pair to restore unattended \
+             recovery."
+        );
+        gate.lock().unwrap_or_else(|e| e.into_inner()).terminal = Some(E::ServerKeyStillUsable);
+        return MachineKeyEnrolAttempt::Failed(E::ServerKeyStillUsable);
+    }
+    let backoff = match &last_err {
+        E::RouteUnavailable => MACHINE_KEY_ENROL_UNAVAILABLE_BACKOFF_SECS,
+        _ => MACHINE_KEY_ENROL_TRANSIENT_BACKOFF_SECS,
+    };
+    let first_miss = {
+        let mut g = gate.lock().unwrap_or_else(|e| e.into_inner());
+        let first = g.next_attempt_at.is_none();
+        g.next_attempt_at = Some(now + backoff);
+        first
+    };
+    if matches!(last_err, E::RouteUnavailable) {
+        // Quiet: an older web build is not an error.
+        if first_miss {
+            info!(
+                "device_jwt_refresher: machine-key enrolment unavailable on {web_base} (web \
+                 predates the self-mint route) — retrying in {}h",
+                backoff / 3600
+            );
+        }
+    } else {
+        warn!(
+            "device_jwt_refresher: machine-key enrolment did not complete ({last_err}) — \
+             retrying in {}s",
+            backoff
+        );
+    }
+    MachineKeyEnrolAttempt::Failed(last_err)
+}
+
+/// The loop's entry point: resolve the device id and use the process gate.
+async fn enrol_device_machine_key_if_needed(
+    auth_manager: &crate::auth::AuthManager,
+    web_base: &str,
+) {
+    let Some(did) = std::env::var("QONTINUI_MACHINE_ID")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string())
+        .or_else(|| qontinui_runner_lib::pair::read_device_id_from_disk().ok())
+    else {
+        return;
+    };
+    let _ = maybe_enrol_device_machine_key(
+        machine_key_enrol_gate(),
+        auth_manager,
+        web_base,
+        &did,
+        chrono::Utc::now().timestamp(),
+    )
+    .await;
+}
+
+#[cfg(test)]
+pub(crate) fn reset_legacy_conclusion_for_test() {
+    *LEGACY_EXHAUSTED.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// Clear one dead per-tenant slot and try to re-derive a working credential
@@ -4157,13 +4776,32 @@ async fn refresher_loop(
                     SlotObservation::unreadable(None)
                 }
             };
-            if let Some(transition) = derive_and_publish_posture(
+            // A previous pass may already have PROVED this same dead credential
+            // unrefreshable (see `conclude_legacy_recovery_failure`); republishing
+            // the bare pre-recovery observation would flip the posture back to
+            // `expired` and re-fire the banner every tick.
+            let (obs, outcome_label) = carry_legacy_conclusion(obs);
+            if let Some(transition) = derive_and_publish_posture_labelled(
                 &[obs],
                 sweep_inputs.posture_pin_inputs(),
                 chrono::Utc::now().timestamp(),
+                outcome_label,
             ) {
                 notify_posture_transition(Some(&api_state.app_handle), transition);
             }
+        }
+
+        // Plan 2026-09-24-runner-coord-credential-stranded-after-outage Phase 3:
+        // while a live device JWT is held, make sure a device machine key is
+        // too — it is the only rung that recovers after the JWT expires during
+        // an outage. Gated + backed off inside; a no-op once a key is present.
+        // Not on a wrong-tier runner: it is not allowed to talk to the cloud.
+        if !matches!(decision, Decision::IdleWrongTier) {
+            enrol_device_machine_key_if_needed(
+                &auth_manager,
+                &resolve_pair_base(&settings_snapshot),
+            )
+            .await;
         }
 
         match decision {
@@ -4277,6 +4915,14 @@ async fn refresher_loop(
                 // stalling. `refresh_class` drives the wait + notification at
                 // each exit below.
                 let (cognito_bearer, refresh_class) = refresh_cognito_bearer(&auth_manager).await;
+                // Phase 2 (plan 2026-09-24-runner-coord-credential-stranded-after-
+                // outage): a user session pair-cli can still re-mint with. A dead
+                // refresh token (`Hard`) hands back the stale stored token, which
+                // is no session at all for this purpose.
+                let user_session_usable = cognito_bearer
+                    .as_deref()
+                    .is_some_and(|t| !t.trim().is_empty())
+                    && refresh_class != RefreshClass::Hard;
                 let bearer_token = match cognito_bearer {
                     Some(t) if !t.trim().is_empty() => t.trim().to_string(),
                     _ => match auth_manager.get_access_token() {
@@ -4507,6 +5153,27 @@ async fn refresher_loop(
                             }
                             continue;
                         }
+                    }
+                }
+
+                // Phase 2 (plan 2026-09-24-runner-coord-credential-stranded-after-
+                // outage): every rung above has now been tried. If the runner is
+                // provably stranded — dead legacy credential, no usable user
+                // session, no machine key — say `unrefreshable` / `re_pair` with
+                // the failed routes named, instead of leaving the pre-recovery
+                // `expired` / `retry_refresh` standing forever.
+                if matches!(
+                    progress,
+                    PairProgress::BailNoTenant | PairProgress::BailRefreshFailedExpired
+                ) {
+                    if let Some(transition) = conclude_legacy_recovery_failure(
+                        &auth_manager,
+                        has_tenant_slots,
+                        user_session_usable,
+                        sweep_inputs.posture_pin_inputs(),
+                        chrono::Utc::now().timestamp(),
+                    ) {
+                        notify_posture_transition(Some(&api_state.app_handle), transition);
                     }
                 }
 
@@ -9671,5 +10338,706 @@ mod device_machine_key_exchange_tests {
             None,
             "the foreign tenant's slot must not be seeded either"
         );
+    }
+}
+
+#[cfg(test)]
+mod legacy_unrefreshable_tests {
+    //! Plan `2026-09-24-runner-coord-credential-stranded-after-outage`
+    //! Phase 2 — the legacy (no-tenant-slot) path must REACH the existing
+    //! `Unrefreshable` posture when every automatic rung has been tried and
+    //! refused, instead of publishing `expired` / `retry_refresh` /
+    //! `lastRefreshOutcome: null` forever.
+    //!
+    //! The pass is composed from the SAME leaf functions `refresher_loop`'s
+    //! `Pair` arm calls, in the same order: the Cognito bearer derivation, the
+    //! pair-cli re-mint against a mock web that refuses it, the machine-key
+    //! exchange, then the legacy failure-tail conclusion. The loop itself
+    //! needs a Tauri `ApiState` and is not hermetically constructible.
+
+    use super::*;
+    use axum::{extract::State, http::StatusCode, routing::post, Router};
+    use std::sync::{Arc, Mutex};
+
+    fn b64url(b: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+    }
+
+    fn synth_jwt(exp: i64) -> String {
+        let header = b64url(b"{\"alg\":\"EdDSA\",\"typ\":\"JWT\"}");
+        let payload = b64url(
+            format!("{{\"exp\":{exp},\"tenant_id\":\"{TENANT}\",\"sub\":\"legacy\"}}").as_bytes(),
+        );
+        format!("{header}.{payload}.{}", b64url(b"fake-sig"))
+    }
+
+    const TENANT: &str = "7ac125b6-0000-4000-8000-000000000001";
+    const DID: &str = "eb2155ed-0000-4000-8000-000000000002";
+
+    fn auth_manager(name: &str, legacy_jwt: Option<&str>) -> crate::auth::AuthManager {
+        let dir = std::env::temp_dir().join("qontinui_test_legacy_unrefreshable");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("{name}.enc"));
+        let _ = std::fs::remove_file(&path);
+        let seed = crate::secure_storage::SecureStorage::with_path(path.clone()).expect("seed");
+        if let Some(j) = legacy_jwt {
+            seed.store_tokens(j, "").expect("seed legacy jwt");
+        }
+        crate::auth::AuthManager::with_storage(
+            crate::secure_storage::SecureStorage::with_path(path).expect("storage"),
+        )
+    }
+
+    #[derive(Clone, Default)]
+    struct Hits {
+        pair_cli: Arc<Mutex<u32>>,
+        exchange: Arc<Mutex<u32>>,
+    }
+
+    /// Mock web: pair-cli REFUSES the expired device-JWT bearer (401, as
+    /// production did 855 times on 2026-09-24), and the exchange door is a
+    /// tripwire — with no key stored it must never be dialed.
+    fn spawn_web() -> (String, Hits, tokio::sync::oneshot::Sender<()>) {
+        let hits = Hits::default();
+        let h = hits.clone();
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = std_listener.local_addr().expect("addr").port();
+        std_listener.set_nonblocking(true).expect("nb");
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("rt");
+            rt.block_on(async move {
+                let app: Router = Router::new()
+                    .route(
+                        "/api/v1/devices/pair-cli",
+                        post(|State(h): State<Hits>| async move {
+                            *h.pair_cli.lock().unwrap() += 1;
+                            (StatusCode::UNAUTHORIZED, r#"{"detail":"token expired"}"#)
+                        }),
+                    )
+                    .route(
+                        "/api/v1/devices/{device_id}/machine-credential/exchange",
+                        post(|State(h): State<Hits>| async move {
+                            *h.exchange.lock().unwrap() += 1;
+                            (StatusCode::SERVICE_UNAVAILABLE, "tripwire")
+                        }),
+                    )
+                    .with_state(h);
+                let listener = tokio::net::TcpListener::from_std(std_listener).expect("listener");
+                let _ = axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = rx.await;
+                    })
+                    .await;
+            });
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        (format!("http://127.0.0.1:{port}"), hits, tx)
+    }
+
+    /// THE plan's hermetic pass: no tenant slots, an expired legacy token, no
+    /// machine key, no Cognito session, pair-cli refused.
+    #[tokio::test]
+    async fn a_stranded_legacy_runner_publishes_unrefreshable_with_a_named_outcome() {
+        let _serialised = posture_test_lock();
+        reset_coord_credential_posture_for_test();
+
+        let now = chrono::Utc::now().timestamp();
+        let expired = synth_jwt(now - 104_426);
+        let mgr = auth_manager("stranded", Some(&expired));
+        let (base, hits, _shutdown) = spawn_web();
+
+        // Top of the pass: the pre-recovery observation says `expired`.
+        let (obs, label) =
+            carry_legacy_conclusion(SlotObservation::observed(None, Some(expired.as_str())));
+        assert!(label.is_none(), "nothing concluded yet");
+        derive_and_publish_posture_labelled(&[obs], PosturePinInputs::UNPINNED, now, label);
+        assert_eq!(
+            coord_credential_posture().unwrap().posture,
+            CoordCredentialPosture::Expired
+        );
+
+        // The `Pair` arm, rung by rung.
+        let (cognito, class) = refresh_cognito_bearer(&mgr).await;
+        assert!(cognito.is_none() && class == RefreshClass::NoSession);
+        let outcome = try_refresh_once(&mgr, &base, &expired, DID, "user", None).await;
+        assert_eq!(outcome, RefreshOutcome::KeptExisting);
+        assert_eq!(
+            *hits.pair_cli.lock().unwrap(),
+            1,
+            "pair-cli was actually tried"
+        );
+        assert!(slot_jwt_is_expired_or_absent(&mgr));
+        assert!(try_device_machine_key_exchange(&mgr, &base, DID, None)
+            .await
+            .is_none());
+        assert_eq!(
+            *hits.exchange.lock().unwrap(),
+            0,
+            "no key → the exchange returns before any HTTP"
+        );
+
+        // The failure tail.
+        let transition =
+            conclude_legacy_recovery_failure(&mgr, false, false, PosturePinInputs::UNPINNED, now)
+                .expect("a stranded runner is a posture CHANGE");
+        assert_eq!(transition.to, CoordCredentialPosture::Unrefreshable);
+
+        let status = coord_credential_posture().expect("published");
+        assert_eq!(status.posture, CoordCredentialPosture::Unrefreshable);
+        assert_eq!(status.posture.cta(), Some("re_pair"));
+        let json = status.to_json();
+        assert_eq!(json["cta"], "re_pair");
+        assert_eq!(json["posture"], "unrefreshable");
+        assert_eq!(
+            json["lastRefreshOutcome"], LEGACY_EXHAUSTED_NO_MACHINE_KEY,
+            "lastRefreshOutcome must be non-null and name the routes that failed"
+        );
+        assert!(status.attributable && status.tenant_id.is_none());
+
+        // The NEXT pass's pre-recovery publish must not flip it back to
+        // `expired` (and fire a second banner) while the same dead credential
+        // is held.
+        let (obs, label) =
+            carry_legacy_conclusion(SlotObservation::observed(None, Some(expired.as_str())));
+        assert_eq!(label, Some(LEGACY_EXHAUSTED_NO_MACHINE_KEY));
+        assert!(
+            derive_and_publish_posture_labelled(&[obs], PosturePinInputs::UNPINNED, now, label)
+                .is_none(),
+            "no transition on the next tick"
+        );
+        assert_eq!(
+            coord_credential_posture().unwrap().posture,
+            CoordCredentialPosture::Unrefreshable
+        );
+
+        // A re-pair puts a DIFFERENT credential in the slot: the memory drops.
+        let fresh = synth_jwt(now + 4 * 3600);
+        let (obs, label) =
+            carry_legacy_conclusion(SlotObservation::observed(None, Some(fresh.as_str())));
+        assert!(label.is_none() && obs.outcome.is_none());
+        derive_and_publish_posture_labelled(&[obs], PosturePinInputs::UNPINNED, now, label);
+        assert_eq!(
+            coord_credential_posture().unwrap().posture,
+            CoordCredentialPosture::Live
+        );
+
+        reset_coord_credential_posture_for_test();
+    }
+
+    /// Every input that is not a measured negative abstains — the verdict is
+    /// `re_pair`, so a false positive would tell an operator to re-pair a
+    /// runner that heals itself when the network returns.
+    #[test]
+    fn the_exhausted_verdict_abstains_on_anything_recoverable_or_unknown() {
+        use MachineKeyState as K;
+        assert_eq!(
+            legacy_exhausted_outcome_label(false, true, false, K::Absent),
+            Some(LEGACY_EXHAUSTED_NO_MACHINE_KEY)
+        );
+        // Tenant slots exist → the slot pass owns the posture.
+        assert_eq!(
+            legacy_exhausted_outcome_label(true, true, false, K::Absent),
+            None
+        );
+        // A live credential can still self-refresh once coord is reachable.
+        assert_eq!(
+            legacy_exhausted_outcome_label(false, false, false, K::Absent),
+            None
+        );
+        // A usable user session can still pair-cli.
+        assert_eq!(
+            legacy_exhausted_outcome_label(false, true, true, K::Absent),
+            None
+        );
+        // A key is present (its exchange may have hit a transient 503).
+        for k in [K::Present, K::Expiring, K::Unknown] {
+            assert_eq!(
+                legacy_exhausted_outcome_label(false, true, false, k),
+                None,
+                "{k:?}"
+            );
+        }
+    }
+
+    /// A stored machine key means the conclusion is NOT drawn, even with the
+    /// legacy JWT expired and no session: the exchange may still recover.
+    #[test]
+    fn a_stored_machine_key_keeps_the_posture_expired() {
+        let _serialised = posture_test_lock();
+        reset_coord_credential_posture_for_test();
+        let now = chrono::Utc::now().timestamp();
+        let expired = synth_jwt(now - 60);
+        let mgr = auth_manager("with_key", Some(&expired));
+        mgr.store_device_machine_key_with_expiry("dmk_fixture", Some(now + 30 * 86_400))
+            .expect("seed key");
+        assert_eq!(machine_key_state(&mgr, now), MachineKeyState::Present);
+        assert!(conclude_legacy_recovery_failure(
+            &mgr,
+            false,
+            false,
+            PosturePinInputs::UNPINNED,
+            now
+        )
+        .is_none());
+        assert!(coord_credential_posture().is_none(), "nothing published");
+        reset_coord_credential_posture_for_test();
+    }
+}
+
+#[cfg(test)]
+mod machine_key_enrol_tests {
+    //! Plan `2026-09-24-runner-coord-credential-stranded-after-outage`
+    //! Phase 3 — a device machine key makes an outage-length expiry
+    //! recoverable, and the runner now enrols one instead of silently holding
+    //! none.
+
+    use super::*;
+    use axum::{
+        extract::{Path, State},
+        http::{HeaderMap, StatusCode},
+        routing::post,
+        Router,
+    };
+    use qontinui_runner_lib::pair::{MachineKeyEnrolError, MachineKeyMintRoute};
+    use std::sync::{Arc, Mutex};
+
+    fn b64url(b: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+    }
+
+    fn synth_jwt(exp: i64, tenant: &uuid::Uuid) -> String {
+        let header = b64url(b"{\"alg\":\"EdDSA\",\"typ\":\"JWT\"}");
+        let payload = b64url(
+            format!("{{\"exp\":{exp},\"tenant_id\":\"{tenant}\",\"sub\":\"d\"}}").as_bytes(),
+        );
+        format!("{header}.{payload}.{}", b64url(b"fake-sig"))
+    }
+
+    const DID: &str = "eb2155ed-0000-4000-8000-00000000000a";
+
+    fn auth_manager(name: &str) -> crate::auth::AuthManager {
+        let dir = std::env::temp_dir().join("qontinui_test_machine_key_enrol");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("{name}.enc"));
+        let _ = std::fs::remove_file(&path);
+        crate::auth::AuthManager::with_storage(
+            crate::secure_storage::SecureStorage::with_path(path).expect("storage"),
+        )
+    }
+
+    #[derive(Clone)]
+    struct Web {
+        /// Status + body the self-mint door answers.
+        self_mint: (u16, String),
+        /// JWT the exchange door answers with (`None` → 503).
+        exchange_jwt: Option<String>,
+        self_mint_hits: Arc<Mutex<Vec<String>>>,
+        exchange_hits: Arc<Mutex<Vec<String>>>,
+        refresh_hits: Arc<Mutex<u32>>,
+    }
+
+    fn spawn_web(self_mint: (u16, String), exchange_jwt: Option<String>) -> (String, Web) {
+        let web = Web {
+            self_mint,
+            exchange_jwt,
+            self_mint_hits: Arc::default(),
+            exchange_hits: Arc::default(),
+            refresh_hits: Arc::default(),
+        };
+        let state = web.clone();
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = std_listener.local_addr().expect("addr").port();
+        std_listener.set_nonblocking(true).expect("nb");
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("rt");
+            rt.block_on(async move {
+                let app: Router = Router::new()
+                    .route(
+                        "/api/v1/devices/{device_id}/machine-credential/self-mint",
+                        post(
+                            |State(w): State<Web>, Path(_d): Path<String>, h: HeaderMap| async move {
+                                let bearer = h
+                                    .get("authorization")
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or("")
+                                    .to_string();
+                                w.self_mint_hits.lock().unwrap().push(bearer);
+                                (
+                                    StatusCode::from_u16(w.self_mint.0).unwrap(),
+                                    w.self_mint.1.clone(),
+                                )
+                            },
+                        ),
+                    )
+                    .route(
+                        "/api/v1/devices/{device_id}/machine-credential/exchange",
+                        post(
+                            |State(w): State<Web>, Path(_d): Path<String>, h: HeaderMap| async move {
+                                let key = h
+                                    .get("x-device-machine-key")
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or("")
+                                    .to_string();
+                                w.exchange_hits.lock().unwrap().push(key);
+                                match w.exchange_jwt.clone() {
+                                    Some(t) => (
+                                        StatusCode::OK,
+                                        serde_json::json!({ "token": t }).to_string(),
+                                    ),
+                                    None => (StatusCode::SERVICE_UNAVAILABLE, "{}".to_string()),
+                                }
+                            },
+                        ),
+                    )
+                    .route(
+                        "/devices/{device_id}/refresh-token",
+                        post(|State(w): State<Web>| async move {
+                            *w.refresh_hits.lock().unwrap() += 1;
+                            (StatusCode::UNAUTHORIZED, "{}")
+                        }),
+                    )
+                    .with_state(state);
+                let listener = tokio::net::TcpListener::from_std(std_listener).expect("listener");
+                let _ = axum::serve(listener, app).await;
+            });
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        (format!("http://127.0.0.1:{port}"), web)
+    }
+
+    fn mint_body(key: &str, expires_at: &str) -> String {
+        serde_json::json!({
+            "device_id": DID,
+            "device_machine_key": key,
+            "prefix": key.chars().take(14).collect::<String>(),
+            "expires_at": expires_at,
+        })
+        .to_string()
+    }
+
+    /// Phase 3 step 6: an EXPIRED tenant slot plus a stored machine key — the
+    /// pass clears the slot on its decoded expiry, re-derives it through the
+    /// dmk exchange, and the posture is healthy again. No operator.
+    #[tokio::test]
+    async fn an_expired_slot_with_a_stored_machine_key_recovers_via_the_exchange() {
+        let _serialised = posture_test_lock();
+        reset_coord_credential_posture_for_test();
+        let now = chrono::Utc::now().timestamp();
+        let tenant = uuid::Uuid::from_bytes([0x7a; 16]);
+        let mgr = auth_manager("expired_slot_with_key");
+        mgr.store_tenant_device_jwt(&tenant, &synth_jwt(now - 104_426, &tenant))
+            .expect("seed dead slot");
+        mgr.store_device_machine_key_with_expiry("dmk_stored_key", Some(now + 50 * 86_400))
+            .expect("seed key");
+        let reminted = synth_jwt(now + 4 * 3600, &tenant);
+        let (base, web) = spawn_web((404, "{}".into()), Some(reminted.clone()));
+
+        let outcomes =
+            refresh_tenant_slots(&mgr, &base, &base, DID, None, PosturePinInputs::UNPINNED).await;
+
+        assert_eq!(
+            outcomes,
+            vec![(
+                tenant,
+                TenantSlotOutcome::Cleared {
+                    cause: SlotClearCause::DecodedExpiry,
+                    rederived: true,
+                }
+            )]
+        );
+        assert_eq!(*web.exchange_hits.lock().unwrap(), vec!["dmk_stored_key"]);
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&tenant).unwrap().as_deref(),
+            Some(reminted.as_str())
+        );
+        let status = coord_credential_posture().expect("the pass published");
+        assert_eq!(status.posture, CoordCredentialPosture::Live);
+        assert!(status.posture.can_answer());
+        reset_coord_credential_posture_for_test();
+    }
+
+    /// The enrolment trigger: no key + a live device JWT → self-mint is
+    /// called WITH that JWT, the key is stored with its expiry, and the state
+    /// reads `present`.
+    #[tokio::test]
+    async fn a_keyless_runner_with_a_live_jwt_self_mints_and_stores_the_key() {
+        let now = chrono::Utc::now().timestamp();
+        let tenant = uuid::Uuid::from_bytes([0x11; 16]);
+        let mgr = auth_manager("keyless_live_jwt");
+        let live = synth_jwt(now + 3 * 3600, &tenant);
+        mgr.store_tokens(&live, "").expect("seed live jwt");
+        assert_eq!(machine_key_state(&mgr, now), MachineKeyState::Absent);
+
+        let expires = chrono::DateTime::from_timestamp(now + 60 * 86_400, 0)
+            .unwrap()
+            .to_rfc3339();
+        let (base, web) = spawn_web((201, mint_body("dmk_new_key_plaintext", &expires)), None);
+        let gate = std::sync::Mutex::new(MachineKeyEnrolGate::default());
+
+        let got = maybe_enrol_device_machine_key(&gate, &mgr, &base, DID, now).await;
+        assert_eq!(
+            got,
+            MachineKeyEnrolAttempt::Enrolled {
+                route: MachineKeyMintRoute::SelfMint
+            }
+        );
+        assert_eq!(
+            *web.self_mint_hits.lock().unwrap(),
+            vec![format!("Bearer {live}")],
+            "self-mint is authenticated by the device's own live JWT"
+        );
+        assert_eq!(
+            mgr.get_device_machine_key().unwrap().as_deref(),
+            Some("dmk_new_key_plaintext")
+        );
+        assert_eq!(
+            mgr.get_device_machine_key_expires_at(),
+            Some(now + 60 * 86_400)
+        );
+        assert_eq!(machine_key_state(&mgr, now), MachineKeyState::Present);
+
+        // Present → nothing more to do; no second request.
+        assert_eq!(
+            maybe_enrol_device_machine_key(&gate, &mgr, &base, DID, now).await,
+            MachineKeyEnrolAttempt::NotNeeded(MachineKeyState::Present)
+        );
+        assert_eq!(web.self_mint_hits.lock().unwrap().len(), 1);
+    }
+
+    /// A web build that predates the route answers 404: one request, then a
+    /// long quiet backoff — never a retry storm.
+    #[tokio::test]
+    async fn a_web_without_the_route_is_asked_once_not_every_tick() {
+        let now = chrono::Utc::now().timestamp();
+        let tenant = uuid::Uuid::from_bytes([0x22; 16]);
+        let mgr = auth_manager("route_404");
+        mgr.store_tokens(&synth_jwt(now + 12 * 3600, &tenant), "")
+            .expect("seed live jwt");
+        let (base, web) = spawn_web((404, r#"{"detail":"Not Found"}"#.into()), None);
+        let gate = std::sync::Mutex::new(MachineKeyEnrolGate::default());
+
+        assert_eq!(
+            maybe_enrol_device_machine_key(&gate, &mgr, &base, DID, now).await,
+            MachineKeyEnrolAttempt::Failed(MachineKeyEnrolError::RouteUnavailable)
+        );
+        // Every 5-minute tick for the next few hours: deferred, no request.
+        for tick in 1..=60 {
+            assert_eq!(
+                maybe_enrol_device_machine_key(&gate, &mgr, &base, DID, now + tick * 300).await,
+                MachineKeyEnrolAttempt::Deferred,
+                "tick {tick}"
+            );
+        }
+        assert_eq!(
+            web.self_mint_hits.lock().unwrap().len(),
+            1,
+            "exactly one request"
+        );
+        assert_eq!(mgr.get_device_machine_key().unwrap(), None);
+        // After the backoff it asks again (a deploy may have landed).
+        let later = now + MACHINE_KEY_ENROL_UNAVAILABLE_BACKOFF_SECS + 1;
+        let _ = maybe_enrol_device_machine_key(&gate, &mgr, &base, DID, later).await;
+        assert_eq!(web.self_mint_hits.lock().unwrap().len(), 2);
+    }
+
+    /// `403 device_machine_key_revoked` is terminal for the token that got it.
+    #[tokio::test]
+    async fn a_revoked_key_stops_enrolment() {
+        let now = chrono::Utc::now().timestamp();
+        let tenant = uuid::Uuid::from_bytes([0x33; 16]);
+        let mgr = auth_manager("revoked");
+        mgr.store_tokens(&synth_jwt(now + 3 * 3600, &tenant), "")
+            .expect("seed live jwt");
+        let (base, web) = spawn_web(
+            (
+                403,
+                r#"{"detail":{"code":"device_machine_key_revoked","message":"revoked"}}"#.into(),
+            ),
+            None,
+        );
+        let gate = std::sync::Mutex::new(MachineKeyEnrolGate::default());
+        assert_eq!(
+            maybe_enrol_device_machine_key(&gate, &mgr, &base, DID, now).await,
+            MachineKeyEnrolAttempt::Failed(MachineKeyEnrolError::Revoked)
+        );
+        // The SAME token is never presented again...
+        assert_eq!(
+            maybe_enrol_device_machine_key(&gate, &mgr, &base, DID, now + 3600).await,
+            MachineKeyEnrolAttempt::Deferred
+        );
+        assert_eq!(web.self_mint_hits.lock().unwrap().len(), 1);
+        // ...but a refreshed token is asked afresh.
+        mgr.store_tokens(&synth_jwt(now + 4 * 3600, &tenant), "")
+            .expect("refreshed jwt");
+        let _ = maybe_enrol_device_machine_key(&gate, &mgr, &base, DID, now + 3600).await;
+        assert_eq!(web.self_mint_hits.lock().unwrap().len(), 2);
+    }
+
+    /// Every other 403 in web's contract is terminal for the token too, and
+    /// 503 `coord_device_lookup_unavailable` is transient: retried on the
+    /// refresher's cadence, not in a tight loop.
+    #[tokio::test]
+    async fn a_503_retries_on_the_refresher_cadence() {
+        let now = chrono::Utc::now().timestamp();
+        let tenant = uuid::Uuid::from_bytes([0x77; 16]);
+        let mgr = auth_manager("lookup_503");
+        mgr.store_tokens(&synth_jwt(now + 3 * 3600, &tenant), "")
+            .expect("seed live jwt");
+        let (base, web) = spawn_web(
+            (
+                503,
+                r#"{"detail":{"code":"coord_device_lookup_unavailable"}}"#.into(),
+            ),
+            None,
+        );
+        let gate = std::sync::Mutex::new(MachineKeyEnrolGate::default());
+        assert_eq!(
+            maybe_enrol_device_machine_key(&gate, &mgr, &base, DID, now).await,
+            MachineKeyEnrolAttempt::Failed(MachineKeyEnrolError::Upstream(503))
+        );
+        assert_eq!(
+            maybe_enrol_device_machine_key(&gate, &mgr, &base, DID, now + 10).await,
+            MachineKeyEnrolAttempt::Deferred,
+            "not a tight loop"
+        );
+        let _ = maybe_enrol_device_machine_key(
+            &gate,
+            &mgr,
+            &base,
+            DID,
+            now + MACHINE_KEY_ENROL_TRANSIENT_BACKOFF_SECS,
+        )
+        .await;
+        assert_eq!(web.self_mint_hits.lock().unwrap().len(), 2);
+    }
+
+    /// A key within 7 days of its recorded expiry is `expiring` and rotated;
+    /// one with no recorded expiry (a pair-cli key) is left alone, because
+    /// every mint revokes the previous key.
+    #[tokio::test]
+    async fn an_expiring_key_is_rotated_and_an_unknown_expiry_is_not() {
+        let now = chrono::Utc::now().timestamp();
+        let tenant = uuid::Uuid::from_bytes([0x44; 16]);
+        let mgr = auth_manager("expiring");
+        mgr.store_tokens(&synth_jwt(now + 3 * 3600, &tenant), "")
+            .expect("seed live jwt");
+        mgr.store_device_machine_key_with_expiry("dmk_old", Some(now + 3 * 86_400))
+            .expect("seed key");
+        assert_eq!(machine_key_state(&mgr, now), MachineKeyState::Expiring);
+        let (base, web) = spawn_web((201, mint_body("dmk_rotated", "2099-01-01T00:00:00")), None);
+        let gate = std::sync::Mutex::new(MachineKeyEnrolGate::default());
+        assert!(matches!(
+            maybe_enrol_device_machine_key(&gate, &mgr, &base, DID, now).await,
+            MachineKeyEnrolAttempt::Enrolled { .. }
+        ));
+        assert_eq!(
+            mgr.get_device_machine_key().unwrap().as_deref(),
+            Some("dmk_rotated")
+        );
+        assert_eq!(machine_key_state(&mgr, now), MachineKeyState::Present);
+
+        let other = auth_manager("unknown_expiry");
+        other
+            .store_tokens(&synth_jwt(now + 3 * 3600, &tenant), "")
+            .expect("seed live jwt");
+        other
+            .store_device_machine_key_with_expiry("dmk_from_pair_cli", None)
+            .expect("seed key");
+        assert_eq!(
+            maybe_enrol_device_machine_key(&gate, &other, &base, DID, now).await,
+            MachineKeyEnrolAttempt::NotNeeded(MachineKeyState::Present)
+        );
+        assert_eq!(web.self_mint_hits.lock().unwrap().len(), 1);
+    }
+
+    /// No live device JWT and no user session: nothing to authenticate with,
+    /// so no request is made at all.
+    #[tokio::test]
+    async fn no_live_bearer_means_no_request() {
+        let now = chrono::Utc::now().timestamp();
+        let tenant = uuid::Uuid::from_bytes([0x55; 16]);
+        let mgr = auth_manager("no_bearer");
+        mgr.store_tokens(&synth_jwt(now - 10, &tenant), "")
+            .expect("seed dead jwt");
+        let (base, web) = spawn_web((201, mint_body("dmk_x", "2099-01-01T00:00:00Z")), None);
+        let gate = std::sync::Mutex::new(MachineKeyEnrolGate::default());
+        assert_eq!(
+            maybe_enrol_device_machine_key(&gate, &mgr, &base, DID, now).await,
+            MachineKeyEnrolAttempt::NoBearer
+        );
+        assert!(web.self_mint_hits.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn mint_refusals_classify_into_distinct_retry_postures() {
+        use qontinui_runner_lib::pair::classify_machine_key_mint_refusal as c;
+        assert_eq!(c(404, ""), MachineKeyEnrolError::RouteUnavailable);
+        assert_eq!(c(405, ""), MachineKeyEnrolError::RouteUnavailable);
+        assert_eq!(
+            c(403, r#"{"detail":{"code":"device_machine_key_revoked"}}"#),
+            MachineKeyEnrolError::Revoked
+        );
+        assert_eq!(
+            c(
+                403,
+                r#"{"detail":{"code":"device_token_provenance_refused"}}"#
+            ),
+            MachineKeyEnrolError::Refused {
+                status: 403,
+                code: Some("device_token_provenance_refused".into())
+            }
+        );
+        assert_eq!(
+            c(401, "not json"),
+            MachineKeyEnrolError::Refused {
+                status: 401,
+                code: None
+            }
+        );
+        assert_eq!(c(503, ""), MachineKeyEnrolError::Upstream(503));
+        assert_eq!(
+            c(409, r#"{"detail":{"code":"machine_key_still_usable"}}"#),
+            MachineKeyEnrolError::ServerKeyStillUsable
+        );
+        assert_eq!(c(409, "{}"), MachineKeyEnrolError::Upstream(409));
+    }
+
+    /// 409 `machine_key_still_usable`: web will not rotate a key it considers
+    /// usable and this runner has none. Terminal — asked once, never again —
+    /// and the local state stays `absent` (it IS absent here).
+    #[tokio::test]
+    async fn a_server_side_usable_key_is_terminal_not_retried() {
+        let now = chrono::Utc::now().timestamp();
+        let tenant = uuid::Uuid::from_bytes([0x66; 16]);
+        let mgr = auth_manager("still_usable");
+        mgr.store_tokens(&synth_jwt(now + 3 * 3600, &tenant), "")
+            .expect("seed live jwt");
+        let (base, web) = spawn_web(
+            (
+                409,
+                r#"{"detail":{"code":"machine_key_still_usable"}}"#.into(),
+            ),
+            None,
+        );
+        let gate = std::sync::Mutex::new(MachineKeyEnrolGate::default());
+        assert_eq!(
+            maybe_enrol_device_machine_key(&gate, &mgr, &base, DID, now).await,
+            MachineKeyEnrolAttempt::Failed(MachineKeyEnrolError::ServerKeyStillUsable)
+        );
+        assert_eq!(
+            maybe_enrol_device_machine_key(&gate, &mgr, &base, DID, now + 30 * 86_400).await,
+            MachineKeyEnrolAttempt::Deferred
+        );
+        assert_eq!(web.self_mint_hits.lock().unwrap().len(), 1);
+        assert_eq!(machine_key_state(&mgr, now), MachineKeyState::Absent);
     }
 }
