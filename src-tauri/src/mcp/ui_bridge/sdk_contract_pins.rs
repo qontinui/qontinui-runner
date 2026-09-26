@@ -645,7 +645,10 @@ fn visibility_handler_pins_its_status_and_default_commitments() {
         .expect("the modal-context result must be matched explicitly");
     let modal_arm = body
         .get(modal_match_at..)
-        .and_then(|rest| rest.find("let discover_data").and_then(|end| rest.get(..end)))
+        .and_then(|rest| {
+            rest.find("let discover_data")
+                .and_then(|end| rest.get(..end))
+        })
         .expect("the modal match precedes the discover match");
     assert!(
         !modal_arm.contains("return") && modal_arm.contains("None"),
