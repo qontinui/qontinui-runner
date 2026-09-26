@@ -13990,12 +13990,24 @@ Body.
         // Cycle 2: the file moves out of the plans dir.
         std::fs::remove_file(&gone_path).unwrap();
         state.tick(&sink, &metrics).await;
+        // Prove cycle 2 actually reconciled (KEPT re-pushed) — every later
+        // assertion is negative, and would pass vacuously on an early return.
+        assert_eq!(
+            *sink.upsert_calls.lock().unwrap(),
+            3,
+            "cycle 2 reconciled the surviving plan"
+        );
 
         // Cycle 3: a process restart — a fresh state with no memory at all.
         drop(state);
         let mut restarted = tick_state(reader);
         assert!(restarted.last_applied.is_empty(), "a restart starts cold");
         restarted.tick(&sink, &metrics).await;
+        assert_eq!(
+            *sink.upsert_calls.lock().unwrap(),
+            4,
+            "the post-restart cycle reconciled the surviving plan"
+        );
 
         assert_eq!(
             *sink.status_upsert_calls.lock().unwrap(),
@@ -14036,8 +14048,9 @@ Body.
     /// **A stale DRAFT view cannot demote an attested unit on a cold start.**
     /// This is the arm-1 shape from the plan's Why: a runner start (empty
     /// `last_applied`) scanning a file whose stamp predates the attestation.
-    /// On a build predating `8e3a3cf75`, `decide_push(None)` answered
-    /// `UpsertWithStatus`, which bypasses the agent-owner deferral, and coord's
+    /// A build predating `8e3a3cf75` reached `decide_push(None)` on a cold
+    /// start, which answers `UpsertWithStatus` — that bypasses the agent-owner
+    /// deferral, and coord's
     /// `COALESCE($3, status)` overwrote `superseded` with `draft`.
     ///
     /// With the seed-from-coord block in `reconcile_once`, the unit seeds to
@@ -14120,14 +14133,21 @@ Body.
 
         let first = r.cycle(&sink, &[unit("s", "draft")]).await;
         assert_eq!(first.retired_permanent, 1, "the denial retires the pair");
-        assert_eq!(first.errors, 0, "a permanent denial is not a retryable error");
+        assert_eq!(
+            first.errors, 0,
+            "a permanent denial is not a retryable error"
+        );
         assert_eq!(first.forbidden, 0, "...nor a principal-wide verdict");
         assert_eq!(*sink.transition_attempts.lock().unwrap(), 1);
         assert_eq!(
             r.forb.retirement_for("s", "draft"),
             Some(RetirementReason::PermanentForStatus)
         );
-        assert_eq!(r.forb.retirement_for("s", "superseded"), None, "pair, not slug");
+        assert_eq!(
+            r.forb.retirement_for("s", "superseded"),
+            None,
+            "pair, not slug"
+        );
 
         let upserts_before = *sink.upsert_calls.lock().unwrap();
         let second = r.cycle(&sink, &[unit("s", "draft")]).await;
