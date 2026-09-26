@@ -559,9 +559,17 @@ fn component_action_endpoint(
         None | Some("control") => Ok(format!("{base}/control/{path}")),
         Some("sdk") => Ok(format!("{base}/sdk/{path}")),
         Some(t) => match t.strip_prefix("proxy:") {
-            Some(port) => Ok(format!(
-                "http://127.0.0.1:{port}/__ui-bridge/control/{path}"
-            )),
+            // Parse the port: raw text here would let `proxy:80@host` turn
+            // `127.0.0.1:80` into userinfo and send this state-changing POST
+            // to `host`, past the network policy (which checks only raw_url).
+            Some(port) => {
+                let port: u16 = port.parse().map_err(|_| {
+                    format!("Invalid proxy port in snapshot target '{t}': expected proxy:PORT")
+                })?;
+                Ok(format!(
+                    "http://127.0.0.1:{port}/__ui-bridge/control/{path}"
+                ))
+            }
             None => Err(format!(
                 "Unknown snapshot target: '{t}'. Use 'control', 'sdk', or 'proxy:PORT'"
             )),
@@ -2388,6 +2396,8 @@ mod tests {
             "http://127.0.0.1:4000/__ui-bridge/control/component/a%20b/action/go"
         );
         assert!(component_action_endpoint(base, Some("elsewhere"), &t).is_err());
+        assert!(component_action_endpoint(base, Some("proxy:80@evil.example"), &t).is_err());
+        assert!(component_action_endpoint(base, Some("proxy:"), &t).is_err());
     }
 
     #[test]

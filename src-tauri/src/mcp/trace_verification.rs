@@ -360,7 +360,7 @@ pub async fn run_workflow_verification_for_task(
     db_task_id: &str,
     workspace_root: &str,
 ) -> DeterministicVerificationResult {
-    use crate::step_executor::{ExecutionStepConfig, StepExecutor};
+    use crate::step_executor::StepExecutor;
 
     // Get the task run to extract verification steps, config_id, and session count
     let task_run = app_state
