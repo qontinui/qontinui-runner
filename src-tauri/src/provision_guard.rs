@@ -227,6 +227,70 @@ pub(crate) fn destination_is_source(dst: &Path, src: &Path) -> Option<String> {
     })
 }
 
+/// `Some(why)` when `cwd` sits inside a git work tree of the repository whose
+/// primary checkout is `checkout` — the same repository, not merely the same
+/// path: `cwd`'s git COMMON dir canonicalizes to `<checkout>/.git`.
+///
+/// Why identity and not only [`destination_is_source`]: a linked worktree OF the
+/// canonical checkout (`agent-worktrees/<id>/qontinui-claude-config`) has a real
+/// `.claude/` directory at a path that is not the canonical one, so the path
+/// compare misses and no symlink stands it down. The only protection left would
+/// be [`TrackedPaths`], which is fail-soft by design — a probe that errors or
+/// exceeds [`PROBE_TIMEOUT`] reads "nothing tracked" and WRITES, replacing the
+/// canonical sources in that worktree with the binary's embedded copies, a diff
+/// an agent working there can commit. Every worktree of a repository shares its
+/// common dir, so this catches the whole family with nothing to fail soft.
+///
+/// Plain file I/O, no `git` process: see [`git_common_dir`]. `None` when either
+/// side cannot be resolved — `cwd` in no repository, or no `.git` at
+/// `checkout` — which leaves the decision to the other guards.
+pub(crate) fn same_repository(cwd: &Path, checkout: &Path) -> Option<String> {
+    let common = std::fs::canonicalize(git_common_dir(cwd)?).ok()?;
+    let canonical = std::fs::canonicalize(checkout.join(".git")).ok()?;
+    (common == canonical).then(|| {
+        format!(
+            "{} is a work tree of the repository at {} (git common dir {}), \
+             which is the source its assets would be copied from",
+            cwd.display(),
+            checkout.display(),
+            common.display()
+        )
+    })
+}
+
+/// The git common dir of the nearest enclosing repository of `start`, found by
+/// walking up to the first `.git`:
+///
+/// - a `.git` DIRECTORY is the common dir itself (a primary checkout);
+/// - a `.git` FILE reads `gitdir: <path>` (relative paths resolve against the
+///   directory holding the file). For a linked worktree that path is
+///   `<common>/worktrees/<name>`, whose `commondir` file names the common dir
+///   (relative to the gitdir); when it has none, the parent of a `worktrees`
+///   directory is taken. Any other gitdir (a submodule's `modules/<name>`, a
+///   `--separate-git-dir`) is its own common dir — taking its grandparent would
+///   misattribute a submodule to its superproject.
+///
+/// `None` when no `.git` is found or a `.git` file is unreadable or malformed.
+fn git_common_dir(start: &Path) -> Option<PathBuf> {
+    let (holder, dot_git) = start
+        .ancestors()
+        .map(|dir| (dir, dir.join(".git")))
+        .find(|(_, dot_git)| dot_git.exists())?;
+    if dot_git.is_dir() {
+        return Some(dot_git);
+    }
+    let contents = std::fs::read_to_string(&dot_git).ok()?;
+    let gitdir = holder.join(contents.lines().next()?.strip_prefix("gitdir:")?.trim());
+    if let Ok(commondir) = std::fs::read_to_string(gitdir.join("commondir")) {
+        return Some(gitdir.join(commondir.trim()));
+    }
+    let parent = gitdir.parent()?;
+    if parent.file_name().is_some_and(|n| n == "worktrees") {
+        return parent.parent().map(Path::to_path_buf);
+    }
+    Some(gitdir)
+}
+
 /// `std::fs::canonicalize` for a path that may not exist yet: canonicalize its
 /// nearest existing ancestor and re-append the missing tail. `None` when no
 /// ancestor resolves, or the tail holds a component with no file name (`..`).
