@@ -139,6 +139,49 @@ impl AppDispatcher {
                     "[app-dispatch] {} via websocket → app='{}' conn_id={:?}",
                     action, app_id, entry.websocket_conn_id
                 );
+                // Refresh liveness at ENQUEUE, before a command that may sit
+                // in flight for the whole command timeout.
+                //
+                // The window this closes, stated exactly — an earlier version
+                // of this comment claimed both of the socket's refresh points
+                // share one `select!`, and that is WRONG. There are two
+                // tasks: `drive_connection` spawns `send_task`
+                // (`ws_relay.rs`), which owns the 20 s ping tick and its
+                // refresh, while the per-frame refresh runs in the RECV loop
+                // awaited in `drive_connection`'s own task. A parked
+                // `sink.send().await` therefore starves the ping tick ONLY;
+                // inbound frames keep refreshing normally. Anyone reading the
+                // old claim would conclude this touch is redundant whenever
+                // any frame arrives, and delete it.
+                //
+                // The real case is narrower and still sufficient: a wrapper
+                // that sends nothing INBOUND has the ping tick as its only
+                // refresh. Park the send and that refresh stops, while the
+                // recv side's own `HEARTBEAT_TIMEOUT` (45 s) is longer than
+                // `REGISTRATION_TTL_MS` (30 s) — so the connection is not yet
+                // torn down and there is a real window in which the row is
+                // dead and the socket is open. Past round 4 that is no longer
+                // cosmetic, because routing reads `get_live`: the row ages
+                // out, and a connection main would have dispatched to becomes
+                // undispatchable. Touching here is outside `send_task`, so it
+                // cannot be starved by the send it is about to cause.
+                //
+                // The trade, because it is a real cost and not a free win:
+                // this touch is UNCONDITIONAL and happens BEFORE the send, so
+                // a wrapper that is hung but still connected keeps a live row
+                // for as long as traffic keeps arriving. That widens the
+                // window in which callers get a hard 400 from ~30 s (the TTL)
+                // to ~45 s (the heartbeat timeout, which does eventually tear
+                // the connection down). Bounded, and the right way round —
+                // failing to route to a live socket is worse than routing to
+                // a hung one — but it is a widening, not a narrowing.
+                //
+                // Conn-guarded like every other refresh (R2): a displaced or
+                // foreign connection must not keep the holder's row alive.
+                let _ = self
+                    .registry
+                    .touch(app_id, entry.websocket_conn_id, &entry.principal)
+                    .await;
                 let response = self.command_relay.dispatch(app_id, action, payload).await?;
                 Ok(response.result.unwrap_or(serde_json::Value::Null))
             }

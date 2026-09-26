@@ -150,8 +150,11 @@ impl Refusal {
         }
     }
 
-    /// The registry is at [`MAX_ROWS`] and the claimant holds no row of its
-    /// own to give up.
+    /// The registry is at THIS claimant's row ceiling and it holds no row of
+    /// its own to give up. A browser principal's ceiling is
+    /// `MAX_ROWS - OPERATOR_HEADROOM`; operator trust gets all of
+    /// [`MAX_ROWS`], so no quantity of browser principals can reach the
+    /// reserved slice.
     ///
     /// This is the SAFE saturated arm, and the choice is the whole point.
     /// Every rule that ranks OTHER principals' rows for eviction has been
@@ -162,9 +165,15 @@ impl Refusal {
     /// the bucket count reaches the ceiling, so ties fall to whichever origin
     /// a comparison happens to rank last — which an attacker simply picks.
     /// So no principal's row is ever removed to make room for another
-    /// principal's write. A claimant may only give up its OWN; otherwise it
-    /// is refused, and the cost falls on whoever arrives next with no
-    /// attacker control over who that is.
+    /// principal's write, and capacity for agents is RESERVED rather than
+    /// taken back by eviction.
+    ///
+    /// What an attacker does and does not control, stated exactly: it DOES
+    /// control whether saturation exists, and can sustain it by re-POSTing
+    /// inside the TTL, so browser registrations of BRAND NEW ids can be
+    /// denied for as long as it keeps that up. It does NOT control which
+    /// existing row pays — none does — and it cannot reach the operator
+    /// headroom.
     ///
     /// A saturated registry therefore cannot be used to TAKE an id: claiming
     /// an id that already has a row never reaches the ceiling (the row is
@@ -634,6 +643,13 @@ impl RelayBinding {
             // there is no side map.
             "reservationMs": BINDING_TOMBSTONE_MS,
             "maxRows": crate::mcp::app_registry::MAX_ROWS,
+            // The ceiling that actually REFUSES a browser principal. Without
+            // it an operator watching `registryFullRefusals` climb beside
+            // `maxRows: 4096` cannot see that the bound being hit is 3840 —
+            // and Phase 4's graduation is decided from this surface.
+            "operatorHeadroom": crate::mcp::app_registry::OPERATOR_HEADROOM,
+            "browserMaxRows":
+                crate::mcp::app_registry::MAX_ROWS - crate::mcp::app_registry::OPERATOR_HEADROOM,
             // An operational CAPACITY event, deliberately NOT under `rules`:
             // it fires in every mode (an unbounded in-process map is a
             // memory-exhaustion defect the kill switch must not re-open), so

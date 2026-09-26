@@ -19081,7 +19081,34 @@ mod ui_bridge_binding_health_tests {
             v["recent"].is_array(),
             "the (rule, class, route) tuples: {v}"
         );
-        assert!(v["tombstoneMs"].is_i64(), "{v}");
+        // Round 4 renamed `tombstoneMs` -> `reservationMs` (the reservation
+        // lives on the registry ROW; there is no side map) and added `maxRows`.
+        // Pinned by VALUE, not by `is_i64`: a missing key reads as
+        // `Value::Null`, whose `is_i64()` is `false`, so the shape assertion
+        // this replaces went red on the rename instead of reporting it — and a
+        // future rename of either key must fail here rather than silently serve
+        // an operator a block with the field gone.
+        assert_eq!(
+            v["reservationMs"],
+            crate::mcp::relay_binding::BINDING_TOMBSTONE_MS,
+            "{v}"
+        );
+        assert_eq!(v["maxRows"], crate::mcp::app_registry::MAX_ROWS, "{v}");
+        // m-1: the ceiling that actually refuses a browser principal. An
+        // operator reading `registryFullRefusals` beside `maxRows` alone
+        // would be looking at the wrong number, and Phase 4 graduates from
+        // this block.
+        assert_eq!(
+            v["operatorHeadroom"],
+            crate::mcp::app_registry::OPERATOR_HEADROOM,
+            "{v}"
+        );
+        assert_eq!(
+            v["browserMaxRows"],
+            crate::mcp::app_registry::MAX_ROWS - crate::mcp::app_registry::OPERATOR_HEADROOM,
+            "{v}"
+        );
+        assert_eq!(v["registryFullRefusals"], 0, "{v}");
     }
 
     #[test]
