@@ -123,7 +123,8 @@ reference — the summary above is sufficient).
   `$QONTINUI_AGENT_ID` from the environment. This is set by the
   agent-spawn flow; if absent the skill exits with an explanation.
 - **Coord URL** — defaults to `https://coord.qontinui.io`; override via
-  `$COORD_URL` (then `$COORD_HTTP_URL`).
+  `$COORD_URL` (then `$COORD_HTTP_URL`). A `ws://` / `wss://` `$COORD_URL` —
+  the runner exports coord's websocket door under that name — is ignored.
 - **Device identity** (for the ownership proof) — `$QONTINUI_MACHINE_ID`, else
   `~/.qontinui/machine.json`; a fresh `$COORD_DEVICE_JWT` or
   `~/.qontinui/coord-device-jwt` is used only when its `tenant_id` claim is the

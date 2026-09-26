@@ -818,6 +818,28 @@ COORD_URL="http://localhost:x@coord.example.test/" run_coord "coord:stacked-on=#
 expect_rc 5 "T12b userinfo-retargeted loopback url"
 expect_calls mint 0 "T12b"
 
+# --- T13: a ws:// / wss:// COORD_URL is coord's WEBSOCKET door (the runner
+# exports COORD_URL=wss://coord.qontinui.io/ws into every session it spawns). It
+# is skipped, COORD_HTTP_URL is used, and no call is aimed at the websocket URL.
+stub probe 200 "{\"tenant_id\":\"$T_OWN\",\"written\":0,\"deleted\":0,\"rejected\":[]}"
+stub mint 200 "{\"token\":\"$(mkjwt "$T_OWN")\"}"
+stub door 200 '{"resolved":false}'
+stub post 200 "$OK_POST"
+COORD_URL="wss://coord.example.test/ws" COORD_HTTP_URL="https://coord.example.test" run_coord "coord:stacked-on=#6"
+expect_rc 0 "T13 websocket COORD_URL falls through to COORD_HTTP_URL"
+expect_out "coord recorded label" "T13"
+expect_calls post 1 "T13"
+if grep -q "wss://" "$STUBDIR3/calls"; then fail "T13: a call went to the websocket URL :: $(cat "$STUBDIR3/calls")"; else ok; fi
+if [[ "$(grep -c " https://coord.example.test/" "$STUBDIR3/calls")" -ne "$(wc -l < "$STUBDIR3/calls" | tr -d ' ')" ]]; then
+  fail "T13: not every call used COORD_HTTP_URL :: $(cat "$STUBDIR3/calls")"; else ok; fi
+# T13b: an upper-case scheme is still the websocket door, and with no
+# COORD_HTTP_URL the precedence ends at the hosted base.
+( unset COORD_HTTP_URL; COORD_URL="WSS://coord.example.test/ws" run_coord "coord:stacked-on=#6"
+  printf '%s\n' "$RC" > "$STUBDIR3/t13b.rc" )
+if [[ "$(cat "$STUBDIR3/t13b.rc")" != 0 ]]; then fail "T13b: expected rc=0, got $(cat "$STUBDIR3/t13b.rc") :: $(cat "$STUBDIR3/calls")"; else ok; fi
+if [[ "$(grep -c " https://coord.qontinui.io/" "$STUBDIR3/calls")" -ne "$(wc -l < "$STUBDIR3/calls" | tr -d ' ')" ]]; then
+  fail "T13b: not every call used the hosted base :: $(cat "$STUBDIR3/calls")"; else ok; fi
+
 # ----- report -----------------------------------------------------------------
 if [[ $FAILURES -ne 0 ]]; then
   echo "set-label self-test: $FAILURES failure(s) across $((CHECKS + FAILURES)) assertion(s)" >&2

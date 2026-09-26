@@ -39,7 +39,8 @@ Required env:
 
 Optional env:
   COORD_URL          — coord base URL (then COORD_HTTP_URL). Default
-                       https://coord.qontinui.io.
+                       https://coord.qontinui.io. A ws:// or wss:// value is
+                       coord's websocket door and is ignored.
 
 Examples:
   set-label.sh --repo qontinui/qontinui-coord --pr 75 \
@@ -82,8 +83,16 @@ fi
 
 # Coord is the hosted service; a localhost default silently posted every
 # label ingest at a port nothing listens on and reported it as "coord
-# unreachable" (measured 2026-09-02). Same precedence every other coord
-# caller uses: COORD_URL, then COORD_HTTP_URL, then the hosted base.
+# unreachable" (measured 2026-09-02). Precedence here: COORD_URL, then
+# COORD_HTTP_URL, then the hosted base (other callers differ -- some read
+# COORD_HTTP_URL only).
+# A ws:// or wss:// COORD_URL is coord's WEBSOCKET door, not an HTTP base: the
+# runner exports COORD_URL=wss://coord.qontinui.io/ws beside COORD_HTTP_URL into
+# every session it spawns, so honouring it posted every label ingest at the
+# websocket path and reported "coord unreachable" (measured 2026-09-26). Skip it
+# and fall through to COORD_HTTP_URL, then the hosted base.
+_coord_url_lc="${COORD_URL:-}"; _coord_url_lc="${_coord_url_lc,,}"  # scheme match is case-insensitive
+case "$_coord_url_lc" in ws://*|wss://*) COORD_URL="" ;; esac
 COORD_URL="${COORD_URL:-${COORD_HTTP_URL:-https://coord.qontinui.io}}"
 
 # ----- validate against the coord:* namespace --------------------------------
