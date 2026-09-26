@@ -313,8 +313,11 @@ impl NativeAccessibilityHandler {
     ///
     /// Pure (no manager / context access) so the filter mapping is unit-testable.
     /// Returns the user-facing failure message for an unknown role name.
-    /// Automation ID and class name filters are skipped when blank, so an empty
-    /// field left behind by a step editor does not filter every node out.
+    /// Label, automation ID and class name filters are skipped when blank
+    /// (empty or whitespace-only), so an empty field left behind by a step
+    /// editor does not filter every node out. A non-blank value is matched
+    /// exactly as given — never trimmed — so a selector generated from a node
+    /// whose native value carries whitespace still matches that node.
     fn build_query(
         step: &ExecutionStepConfig,
         mut builder: QueryBuilder,
@@ -336,8 +339,8 @@ impl NativeAccessibilityHandler {
             }
         }
 
-        if let Some(ref label) = step.a11y_query_label {
-            builder = builder.by_label(label.as_str());
+        if let Some(label) = non_blank(step.a11y_query_label.as_deref()) {
+            builder = builder.by_label(label);
         }
 
         if let Some(id) = non_blank(step.a11y_query_automation_id.as_deref()) {
@@ -439,9 +442,10 @@ impl NativeAccessibilityHandler {
     }
 }
 
-/// Trimmed value of an optional string field, or `None` when absent or blank.
+/// An optional string field as given, or `None` when absent or blank
+/// (empty or whitespace-only). Deliberately not trimmed: see `build_query`.
 fn non_blank(value: Option<&str>) -> Option<&str> {
-    value.map(str::trim).filter(|v| !v.is_empty())
+    value.filter(|v| !v.trim().is_empty())
 }
 
 #[cfg(test)]
@@ -602,12 +606,39 @@ mod tests {
     }
 
     #[test]
-    fn test_build_query_trims_automation_id() {
+    fn test_build_query_does_not_trim_automation_id() {
+        // Non-blank values are matched exactly as given: padding is part of
+        // the value, so it does not match the unpadded id.
         let step = ExecutionStepConfig {
             a11y_query_automation_id: Some("  txt_name ".to_string()),
             ..Default::default()
         };
+        assert!(query_refs(&step).is_empty());
+
+        let step = ExecutionStepConfig {
+            a11y_query_automation_id: Some("txt_name".to_string()),
+            ..Default::default()
+        };
         assert_eq!(query_refs(&step), vec!["@e3"]);
+    }
+
+    #[test]
+    fn test_build_query_blank_label_is_ignored() {
+        let step = ExecutionStepConfig {
+            a11y_query_role: Some("button".to_string()),
+            a11y_query_label: Some("  ".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(query_refs(&step), vec!["@e1", "@e2"]);
+    }
+
+    #[test]
+    fn test_build_query_non_blank_label_is_matched() {
+        let step = ExecutionStepConfig {
+            a11y_query_label: Some("Cancel".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(query_refs(&step), vec!["@e2"]);
     }
 
     #[test]
