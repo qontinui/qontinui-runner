@@ -83,8 +83,7 @@ fi
 > or edits git) so coord's predict-verify loop records a Failure-with-reason
 > instead of a reasonless settle-timeout. Not a substitute for fixing the
 > rejection; never `--no-verify`. On machines with the commit-abort wrapper
-> installed (operator-local installer `qontinui-dev-notes/scripts/install-commit-abort-hook.sh`, plan
-> `2026-06-06-commit-abort-wrapper`) the hook auto-reports when gated on; this
+> installed (plan `2026-06-06-commit-abort-wrapper`) the hook auto-reports when gated on; this
 > explicit call is the universal fallback and a harmless double-report there.
 
 ### Phase 4: Push (if requested)
