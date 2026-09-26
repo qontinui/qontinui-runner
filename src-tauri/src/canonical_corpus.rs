@@ -1,7 +1,7 @@
 //! The canonical-generation rung: a runner-owned BARE mirror of
 //! `qontinui-claude-config`, fetched off the spawn path, from which the fleet
-//! command bodies are served at `origin/main` rather than at whatever this
-//! binary happened to embed.
+//! command bodies AND skill directories are served at `origin/main` rather than
+//! at whatever this binary happened to embed.
 //!
 //! ## Why a rung above the embedded bundle
 //!
@@ -13,7 +13,17 @@
 //! canonical repo itself, so a copy that is fresh BY CONSTRUCTION outranks one
 //! that is merely labelled stale. The bundle stays the offline floor.
 //!
-//! Plan `2026-09-03-served-corpus-provenance-at-spawn`, Phase 6.
+//! Plan `2026-09-03-served-corpus-provenance-at-spawn`, Phases 6 (commands) and
+//! 7 (skills).
+//!
+//! ## Skills carry git's mode bits
+//!
+//! A skill is a directory, listed with [`Mirror::list_tree`] (`git ls-tree -r
+//! -z`), which also yields the MODE git recorded for each file. The embedded
+//! floor has to guess executability from a `.sh` extension (`include_dir`
+//! carries no permissions); a canonical skill does not guess: a helper is
+//! executable exactly when `qontinui-claude-config` committed it `100755`, so an
+//! extension-less script or a `.py` helper lands correctly.
 //!
 //! ## Where it lives, and what it never touches
 //!
@@ -114,11 +124,55 @@ pub struct CanonicalCommands {
     pub bodies: BTreeMap<String, String>,
 }
 
+/// Git's mode for a regular file.
+pub(crate) const MODE_FILE: u32 = 0o100644;
+/// Git's mode for an executable file.
+pub(crate) const MODE_EXECUTABLE: u32 = 0o100755;
+
+/// One file of a `git ls-tree -r` listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeEntry {
+    /// Path RELATIVE to the listed directory, `/`-separated.
+    pub path: String,
+    /// The mode git recorded (`0o100644`, `0o100755`, `0o120000`, …).
+    pub mode: u32,
+}
+
+/// One bundled skill as `qontinui-claude-config` holds it at one snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalSkill {
+    /// Relative path → text: the same key space an account unit's `files` map
+    /// and the embedded tree use.
+    pub files: qontinui_types::agent_text_units::AgentTextUnitFiles,
+    /// Relative path → git mode, for every key of [`files`](Self::files).
+    /// Only [`MODE_FILE`] and [`MODE_EXECUTABLE`] are ever loaded.
+    pub modes: BTreeMap<String, u32>,
+}
+
+impl CanonicalSkill {
+    /// Whether git recorded `rel_path` as executable.
+    pub fn is_executable(&self, rel_path: &str) -> bool {
+        self.modes.get(rel_path) == Some(&MODE_EXECUTABLE)
+    }
+}
+
+/// The bundled skills as `qontinui-claude-config` holds them at one snapshot.
+/// A skill absent from `skills` was absent, unreadable or invalid at that sha
+/// and falls to the next rung.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalSkills {
+    pub snapshot: CanonicalSnapshot,
+    /// Skill name → its files, already through the account layer's
+    /// validation (`agent_skills::validate_override`).
+    pub skills: BTreeMap<String, CanonicalSkill>,
+}
+
 /// Everything one refresh loaded, published as a unit so a reader never sees
 /// the commands of one generation beside the skills of another.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalCorpus {
     pub commands: CanonicalCommands,
+    pub skills: CanonicalSkills,
 }
 
 impl CanonicalCorpus {
@@ -242,6 +296,134 @@ impl Mirror {
         cmd.args(["cat-file", "blob"])
             .arg(format!("{}:{rel_path}", snapshot.sha));
         run(cmd, self.local_timeout, "git cat-file")
+    }
+
+    /// Every file under `path` at `snapshot` with the mode git recorded —
+    /// `git ls-tree -r -z <sha> -- <path>`, blobs only, paths made relative to
+    /// `path`. A path absent at that sha lists nothing and is an error.
+    pub(crate) fn list_tree(
+        &self,
+        snapshot: &CanonicalSnapshot,
+        path: &str,
+    ) -> Result<Vec<TreeEntry>, String> {
+        let mut cmd = self.in_mirror();
+        cmd.args(["ls-tree", "-r", "-z", "--full-tree"])
+            .arg(&snapshot.sha)
+            .arg("--")
+            .arg(path);
+        let out = run(cmd, self.local_timeout, "git ls-tree")?;
+        let prefix = format!("{}/", path.trim_end_matches('/'));
+        let mut entries = Vec::new();
+        for record in out.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+            let record = String::from_utf8_lossy(record);
+            // `<mode> SP <type> SP <object> TAB <path>`
+            let (meta, full_path) = record
+                .split_once('\t')
+                .ok_or_else(|| format!("git ls-tree: malformed record {record:?}"))?;
+            let mut fields = meta.split(' ');
+            let (Some(mode), Some(kind)) = (fields.next(), fields.next()) else {
+                return Err(format!("git ls-tree: malformed record {record:?}"));
+            };
+            if kind != "blob" {
+                continue;
+            }
+            let mode = u32::from_str_radix(mode, 8)
+                .map_err(|_| format!("git ls-tree: malformed mode {mode:?}"))?;
+            let Some(rel) = full_path.strip_prefix(&prefix) else {
+                continue;
+            };
+            entries.push(TreeEntry {
+                path: rel.to_string(),
+                mode,
+            });
+        }
+        if entries.is_empty() {
+            return Err(format!("{path} is absent at {}", snapshot.short()));
+        }
+        Ok(entries)
+    }
+
+    /// Load one skill directory, `.claude/skills/<name>/`, at `snapshot`, and
+    /// run it through the same validation an account skill passes. Any file
+    /// that is not a regular or executable blob (a symlink, a submodule), any
+    /// unreadable or non-UTF-8 file, and any validation failure refuses the
+    /// WHOLE skill — a half-canonical skill is a `SKILL.md` citing files that
+    /// are not there.
+    fn load_skill(
+        &self,
+        snapshot: &CanonicalSnapshot,
+        name: &str,
+    ) -> Result<CanonicalSkill, String> {
+        let dir = format!(".claude/skills/{name}");
+        let mut files = qontinui_types::agent_text_units::AgentTextUnitFiles::new();
+        let mut modes = BTreeMap::new();
+        for entry in self.list_tree(snapshot, &dir)? {
+            if entry.mode != MODE_FILE && entry.mode != MODE_EXECUTABLE {
+                return Err(format!("{} has git mode {:o}", entry.path, entry.mode));
+            }
+            let bytes = self.read(snapshot, &format!("{dir}/{}", entry.path))?;
+            let text =
+                String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8", entry.path))?;
+            modes.insert(entry.path.clone(), entry.mode);
+            files.insert(entry.path, text);
+        }
+        let unit = qontinui_types::agent_text_units::AgentTextUnit {
+            id: format!("canonical:{name}"),
+            kind: qontinui_types::agent_text_units::AgentTextUnitKind::skill(),
+            name: name.to_string(),
+            organization_id: None,
+            created_by_user_id: None,
+            entrypoint: "SKILL.md".to_string(),
+            files: files.clone(),
+            checksum: None,
+            is_shared: false,
+            is_invocable: true,
+            current_version: 1,
+            source: "canonical".to_string(),
+            source_path: Some(dir),
+            source_commit: Some(snapshot.sha.clone()),
+            created_at: snapshot.fetched_at.clone(),
+            updated_at: snapshot.fetched_at.clone(),
+        };
+        crate::agent_skills::validate_override(
+            &unit,
+            crate::agent_skills::AgentSkillSource::Builtin,
+        )?;
+        Ok(CanonicalSkill { files, modes })
+    }
+
+    /// Load every skill in `names` at `snapshot`. A skill that is absent or
+    /// refused is left out — it falls to the next rung — and the misses are
+    /// logged as ONE line.
+    pub(crate) fn load_skills(
+        &self,
+        snapshot: &CanonicalSnapshot,
+        names: &[&str],
+    ) -> CanonicalSkills {
+        let mut skills = BTreeMap::new();
+        let mut missed: Vec<String> = Vec::new();
+        for name in names {
+            match self.load_skill(snapshot, name) {
+                Ok(skill) => {
+                    skills.insert((*name).to_string(), skill);
+                }
+                Err(why) => missed.push(format!("{name} ({why})")),
+            }
+        }
+        if !missed.is_empty() {
+            warn!(
+                "canonical_corpus: {} of {} bundled skill(s) unusable at {} — they fall to \
+                 the embedded default: {}",
+                missed.len(),
+                names.len(),
+                snapshot.short(),
+                missed.join("; ")
+            );
+        }
+        CanonicalSkills {
+            snapshot: snapshot.clone(),
+            skills,
+        }
     }
 
     /// Load every name in `names` from `.claude/commands/<name>.md` at
@@ -379,6 +561,14 @@ fn bundled_command_names() -> Vec<&'static str> {
         .collect()
 }
 
+/// Every bundled skill name — the set the canonical rung may replace.
+fn bundled_skill_names() -> Vec<String> {
+    crate::fleet_skills::embedded_skills()
+        .into_iter()
+        .map(|s| s.name)
+        .collect()
+}
+
 /// Refresh `mirror` and, when the fetched sha differs from what is loaded,
 /// load the bundled bodies at it and publish them. Returns the snapshot the
 /// process now serves (`None` when nothing has ever loaded).
@@ -401,15 +591,20 @@ pub(crate) fn refresh_into_latest(mirror: &Mirror) -> Option<CanonicalSnapshot> 
                     return Some(current.snapshot().clone());
                 }
             }
+            let skill_names = bundled_skill_names();
+            let skill_refs: Vec<&str> = skill_names.iter().map(String::as_str).collect();
             let corpus = CanonicalCorpus {
                 commands: mirror.load_commands(&snapshot, &bundled_command_names()),
+                skills: mirror.load_skills(&snapshot, &skill_refs),
             };
             info!(
                 "canonical_corpus: serving qontinui-claude-config@{} ({} of {} bundled \
-                 command(s) present)",
+                 command(s), {} of {} bundled skill(s) present)",
                 snapshot.short(),
                 corpus.commands.bodies.len(),
                 crate::fleet_commands::FLEET_COMMANDS.len(),
+                corpus.skills.skills.len(),
+                skill_names.len(),
             );
             *LATEST
                 .write()
@@ -503,6 +698,14 @@ pub(crate) mod test_support {
         git(&remote, &["add", "--all"]);
         git(&remote, &["commit", "--quiet", "-m", "fixture"]);
         remote.to_string_lossy().into_owned()
+    }
+
+    /// Mark `path` executable in the remote's index and commit it, so git
+    /// records mode `100755` regardless of the filesystem's own bits.
+    pub(crate) fn chmod_x(root: &Path, path: &str) {
+        let remote = root.join("remote");
+        git(&remote, &["update-index", "--chmod=+x", "--", path]);
+        git(&remote, &["commit", "--quiet", "-m", "chmod"]);
     }
 
     /// A mirror under `root` fetching `url`.
@@ -704,6 +907,71 @@ mod tests {
         assert!(unreachable.refresh().is_err());
         let (registry, _) = resolve_with(FetchOutcome::NoAccount, None, None);
         assert_all_embedded(&registry);
+    }
+
+    // -- skills --------------------------------------------------------------
+
+    /// `list_tree` yields every file under the directory, relative to it, with
+    /// git's recorded mode — including an extension-less executable.
+    #[test]
+    fn list_tree_yields_relative_paths_and_git_modes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = remote_with(
+            tmp.path(),
+            &[
+                (
+                    ".claude/skills/demo/SKILL.md",
+                    "---\nname: demo\n---\n# demo\n",
+                ),
+                (".claude/skills/demo/helper", "#!/bin/sh\necho hi\n"),
+                (".claude/skills/demo/ref/notes.md", "# notes\n"),
+                (".claude/skills/other/SKILL.md", "# other\n"),
+            ],
+        );
+        test_support::chmod_x(tmp.path(), ".claude/skills/demo/helper");
+        let m = mirror(tmp.path(), &url);
+        let snap = m.refresh().unwrap();
+        let mut entries = m.list_tree(&snap, ".claude/skills/demo").unwrap();
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(
+            entries,
+            vec![
+                TreeEntry {
+                    path: "SKILL.md".into(),
+                    mode: MODE_FILE
+                },
+                TreeEntry {
+                    path: "helper".into(),
+                    mode: MODE_EXECUTABLE
+                },
+                TreeEntry {
+                    path: "ref/notes.md".into(),
+                    mode: MODE_FILE
+                },
+            ]
+        );
+        assert!(m.list_tree(&snap, ".claude/skills/absent").is_err());
+
+        let loaded = m.load_skills(&snap, &["demo", "absent"]);
+        assert_eq!(loaded.skills.len(), 1);
+        let demo = &loaded.skills["demo"];
+        assert!(demo.is_executable("helper"));
+        assert!(!demo.is_executable("SKILL.md"));
+        assert_eq!(demo.files["ref/notes.md"], "# notes\n");
+    }
+
+    /// A skill whose files fail the account layer's validation (here: no
+    /// `SKILL.md`) is refused whole.
+    #[test]
+    fn an_invalid_canonical_skill_is_refused_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = remote_with(
+            tmp.path(),
+            &[(".claude/skills/demo/README.md", "# no manifest\n")],
+        );
+        let m = mirror(tmp.path(), &url);
+        let snap = m.refresh().unwrap();
+        assert!(m.load_skills(&snap, &["demo"]).skills.is_empty());
     }
 
     /// A git that hangs is killed at the budget, and the whole refresh returns
