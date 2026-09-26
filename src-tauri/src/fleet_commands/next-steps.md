@@ -54,7 +54,8 @@ gate; just list it.
   phase_name). The `unit_ready`/`unit_status` predicates carry this UUID, not the
   slug.
 - **Register:** prefer MCP `coord_register_gate` (kinds: `pr_merged`,
-  `deploy_healthy`, `claim_terminal`, `operator_approval`, `ci_green`,
+  `deploy_healthy`, `claim_terminal`, `operator_approval`, `ci_green`, `pr_ci_green`,
+  `release_in_sync`, `branch_reapable`,
   `ref_exists`, `metric_threshold`, `time_elapsed`, `unit_ready`,
   `migration_at_head`, `infra_drift_clear`, `file_exists`, `sql_count`,
   `unit_status`, `gate_cleared`, `commit_live`, `runner_served_sha`,

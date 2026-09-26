@@ -3473,7 +3473,8 @@ supersedes unit_ready for the dependency-gated case".)
   it does not erase the `plan_slug` / `intent` `/preflight` Step 5 wrote, and it
   exits 0 on every path.
 - **Register:** prefer MCP `coord_register_gate` (kinds: `pr_merged`,
-  `deploy_healthy`, `claim_terminal`, `operator_approval`, `ci_green`,
+  `deploy_healthy`, `claim_terminal`, `operator_approval`, `ci_green`, `pr_ci_green`,
+  `release_in_sync`, `branch_reapable`,
   `ref_exists`, `metric_threshold`, `time_elapsed`, `unit_ready`,
   `migration_at_head`, `infra_drift_clear`, `file_exists`, `sql_count`,
   `unit_status`, `gate_cleared`, `commit_live`, `runner_served_sha`,

@@ -4784,6 +4784,28 @@ state; keep watching the rest of the fleet.
      `do-reversible-mechanical-work` governs, over
      `planning-and-scope` `finish-to-zero-includes-the-defect-underneath`'s "that deadlock
      is the escalation", per `escalation-bar` `clause-precedence`.)
+     **Before ANY cancel of a proposal another session owns — the per-target probe.**
+     (Plan `2026-09-02-touching-another-sessions-work-needs-a-policy-not-a-taboo`,
+     Phase 3.) Age in a state is not evidence; age with the state's work ABSENT is.
+     Classify the action first, and read the evidence per TARGET, never per class:
+
+     | Class | Action | Licence |
+     |---|---|---|
+     | A | `coord_cancel_merge` with `unblock: true` on a NON-hardcap `queued` proposal (coord stamps `orchestrator-transient:` and re-enqueues it fresh); `coord_reevaluate` | any session, on fresh evidence |
+     | B | the same `unblock: true` cancel on an `awaiting-ci` proposal whose candidate CI is in flight (costs one CI cycle) | only past the repo's own coord-computed window: `coord_query_train_health` `stall_window_secs` (`= max(45m, 2 x p90 candidate CI)`, or 6h when p90 is unknown), not a hand-picked duration |
+     | C | a Stop-mode cancel (`unblock` false: stamps a Content error that BLOCKS re-enqueue until a new push), a reap-hardcap unblock (operator-only, refused `HardcapOperatorOnly`), force-push, closing a PR, removing a worktree, touching an unpushed tree | owner or operator only — never route around a refusal |
+
+     Per-target probe for class B — does THIS candidate have CI and is it moving?
+     `gh api "repos/<owner>/<repo>/actions/runs?branch=merge-candidate/<proposal_id>" --jq '"runs=\(.total_count)", (.workflow_runs[]|"\(.created_at) \(.status)")'`
+     (take the ref from `coord_query_train_health` `candidates_in_flight[]`). Zero runs
+     AFTER the stall window means genuinely starved. A run created inside the repo's
+     p90 (`candidate_ci_p90_secs`) means healthy: leave it alone. A failed `gh` call is
+     UNKNOWN, never "starved". Read the proposal LIVE just before the write — the door
+     re-validates under `FOR UPDATE` (`merge.rs` `cancel_disposition`) and a 409
+     (`already in terminal status`, `landing`, batch member) is a SUCCESSFUL guard, not
+     something to retry, force, or reconstruct over a lower door. Stamp a reason naming
+     the evidence, the threshold it exceeded and this session. More than 3 cross-session
+     remediations in one session is a symptom: stop and report the underlying defect.
   6. **Escalate only on the fleet's closed list** (Step 4). A stalled train is not itself
      on it.
   7. **Post a finding** under topic `coord-merge-train` naming the alert id, whatever the
