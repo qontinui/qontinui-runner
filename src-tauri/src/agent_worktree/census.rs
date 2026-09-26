@@ -1158,6 +1158,19 @@ pub struct WorktreeCensus {
     /// snapshotted; `probe_failed` is deliberately NOT `clean`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custody_wip_state: Option<String>,
+    /// EVERY per-session custody slot in `$GIT_DIR/qontinui-custody.d/`,
+    /// newest first — one entry per session that has taken a turn here.
+    ///
+    /// The ten scalar `custody_*` fields above come from the MIRROR
+    /// (`qontinui-custody.json`), which is a copy of whichever slot was
+    /// written last, so sessions cohabiting a shared checkout collapse to one
+    /// there. This list is the "who ELSE is here?" answer (plan
+    /// `2026-09-07-shared-checkout-occupancy-is-invisible-to-coord`,
+    /// Phase 1c). Slots are never pruned by the hook and the runner does NO
+    /// liveness filtering: the consumer ages each entry by its own
+    /// `last_seen`. `None` when the tree has no slot at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custody_occupants: Option<Vec<CustodyOccupant>>,
 
     /// `Session-Id:` trailer on HEAD's commit message. The WEAK attribution
     /// source: it names whoever last COMMITTED, and 35 of 37 uncommitted-only
@@ -1171,6 +1184,46 @@ pub struct WorktreeCensus {
     /// `Session-Name:` trailer on HEAD, same provenance and same weakness.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub head_session_name: Option<String>,
+}
+
+/// One session's custody slot, as carried in
+/// [`WorktreeCensus::custody_occupants`]. Every field is verbatim from the
+/// slot and optional: the slot is written by a shell script in another repo.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CustodyOccupant {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<String>,
+    /// Unix seconds of `last_seen` — the liveness signal the consumer ages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen_epoch: Option<i64>,
+    /// Verbatim hook state; `captured` is the only value meaning snapshotted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wip_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wip_ref: Option<String>,
+}
+
+impl From<&super::custody::CustodyRecord> for CustodyOccupant {
+    fn from(r: &super::custody::CustodyRecord) -> Self {
+        Self {
+            session_id: r.session_id.clone(),
+            session_name: r.session_name.clone(),
+            last_seen: r.last_seen.clone(),
+            last_seen_epoch: r.last_seen_epoch,
+            wip_state: r.wip_state.clone(),
+            wip_ref: r.wip_ref.clone(),
+        }
+    }
+}
+
+/// Map the slot records to occupants; `None` when there are none, so the
+/// field is omitted from the POST body rather than sent as `[]`.
+fn occupants_from_slots(slots: &[super::custody::CustodyRecord]) -> Option<Vec<CustodyOccupant>> {
+    (!slots.is_empty()).then(|| slots.iter().map(CustodyOccupant::from).collect())
 }
 
 /// Full census body POSTed to coord.
@@ -2366,6 +2419,10 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
     // `git rev-parse` spawn and never reconstructed from the worktree path
     // (git disambiguates admin-dir collisions, so it is not derivable).
     let custody = super::custody::read_custody(worktree);
+    // Every per-session slot, not just the newest-wins mirror above — the
+    // mirror collapses cohabiting sessions to one. Same bounded, spawn-free
+    // reads (one directory listing plus one read per slot).
+    let custody_occupants = occupants_from_slots(&super::custody::read_custody_slots(worktree));
 
     let last_access_mtime = std::fs::metadata(worktree)
         .ok()
@@ -2430,6 +2487,7 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
         custody_wip_ref: custody.as_ref().and_then(|c| c.wip_ref.clone()),
         custody_wip_commit: custody.as_ref().and_then(|c| c.wip_commit.clone()),
         custody_wip_state: custody.as_ref().and_then(|c| c.wip_state.clone()),
+        custody_occupants,
         head_session_id,
         head_session_name,
     }
@@ -2993,6 +3051,44 @@ pub fn spawn_census() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custody_occupants_are_none_without_slots_and_omit_absent_fields() {
+        assert_eq!(occupants_from_slots(&[]), None);
+
+        let slots = vec![
+            super::super::custody::CustodyRecord {
+                session_id: Some("newer".into()),
+                session_name: Some("amber-otter".into()),
+                last_seen_epoch: Some(2_000),
+                wip_state: Some("captured".into()),
+                wip_ref: Some("refs/wip/newer".into()),
+                // Fields outside the occupant shape must not leak into it.
+                intent: Some("not an occupant field".into()),
+                ..Default::default()
+            },
+            super::super::custody::CustodyRecord {
+                session_id: Some("older".into()),
+                ..Default::default()
+            },
+        ];
+        let occ = occupants_from_slots(&slots).expect("two slots");
+        assert_eq!(occ.len(), 2, "one occupant per slot, order preserved");
+        let json = serde_json::to_value(&occ).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!([
+                {
+                    "session_id": "newer",
+                    "session_name": "amber-otter",
+                    "last_seen_epoch": 2000,
+                    "wip_state": "captured",
+                    "wip_ref": "refs/wip/newer"
+                },
+                { "session_id": "older" }
+            ])
+        );
+    }
 
     /// [`remove_link`] must handle every Windows link SHAPE, not only a
     /// directory junction — `is_junction` reports all three, so all three
@@ -4695,6 +4791,7 @@ mod tests {",
             custody_wip_ref: None,
             custody_wip_commit: None,
             custody_wip_state: None,
+            custody_occupants: None,
             head_session_id: None,
             head_session_name: None,
         }
