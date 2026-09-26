@@ -490,7 +490,8 @@ impl HandlerRegistry {
     /// Create a registry pre-populated with all standard handlers.
     ///
     /// This is the recommended way to create a registry for production use.
-    /// 14+ active handlers: command, execute_playbook, ui_bridge, prompt, restart_process, save_workflow_artifact, workflow_fixup, workflow, workflow_ref, wrapper_action, dag_cancel, dag_approval, dag_loop, vga_automate
+    /// 20 handlers, one per `FullRunnerStep` variant (`handler_lookup_key` in
+    /// `executor.rs` is the exhaustive map from variant to registry key).
     pub fn with_standard_handlers() -> Self {
         let mut registry = Self::new();
 

@@ -410,7 +410,7 @@ rewritten_prompt: |
         .replace("{{thinking_style}}", thinking_style)
 }
 
-fn build_api_step(
+pub(crate) fn build_api_step(
     name: &str,
     method: &str,
     url: &str,
