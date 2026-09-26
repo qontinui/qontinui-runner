@@ -1403,23 +1403,36 @@ pub(crate) fn wrap_ipc_result_keeping_failure_data(
 /// The payload an inner-failure envelope carried, as it arrives after
 /// [`extract_response_data`]'s flattening — see
 /// [`wrap_ipc_result_keeping_failure_data`]. `None` when there is none: the
-/// verdict fields and the envelope's bookkeeping fields are never payload.
+/// verdict fields are never payload, and neither is an envelope that carries
+/// nothing BUT bookkeeping fields.
+///
+/// `timestamp` is ambiguous: it is envelope bookkeeping on a failure that
+/// carried no `data`, but it is also a field of the SDK's own result
+/// (`ActionDiffResult.timestamp`), which the flattening keeps. So the
+/// bookkeeping fields decide only WHETHER there is a payload; when there is
+/// one, `timestamp` travels with it and only the pure routing fields are
+/// dropped.
 fn inner_failure_payload(data: &serde_json::Value) -> Option<serde_json::Value> {
     if let Some(explicit) = data.get("data") {
         return Some(explicit.clone());
     }
     let obj = data.as_object()?;
-    let rest: serde_json::Map<String, serde_json::Value> = obj
+    let mut rest: serde_json::Map<String, serde_json::Value> = obj
         .iter()
         .filter(|(k, _)| {
             let k = k.as_str();
-            k != "success"
-                && !FAILURE_VERDICT_FIELDS.contains(&k)
-                && !ENVELOPE_BOOKKEEPING_FIELDS.contains(&k)
+            k != "success" && !FAILURE_VERDICT_FIELDS.contains(&k)
         })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    (!rest.is_empty()).then_some(serde_json::Value::Object(rest))
+    if rest
+        .keys()
+        .all(|k| ENVELOPE_BOOKKEEPING_FIELDS.contains(&k.as_str()))
+    {
+        return None;
+    }
+    rest.retain(|k, _| k == "timestamp" || !ENVELOPE_BOOKKEEPING_FIELDS.contains(&k.as_str()));
+    Some(serde_json::Value::Object(rest))
 }
 
 // ============================================================================
@@ -2883,9 +2896,11 @@ mod keeping_failure_data_tests {
             "diff": { "appeared": ["a"] }
         });
         let (_, body) = wrap_ipc_result_keeping_failure_data(Ok(flattened)).unwrap_err();
+        // The routing fields go; `timestamp` stays, because alongside a real
+        // payload it is the SDK result's own `ActionDiffResult.timestamp`.
         assert_eq!(
             body.deref().data,
-            Some(json!({ "actionSuccess": false, "diff": { "appeared": ["a"] } }))
+            Some(json!({ "actionSuccess": false, "diff": { "appeared": ["a"] }, "timestamp": 1 }))
         );
     }
 
