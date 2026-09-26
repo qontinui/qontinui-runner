@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{error, info};
 
 use crate::ai_router::RoutingConfig;
@@ -4720,14 +4720,27 @@ pub fn load_settings_full() -> LoadedSettings {
         }
     }
     if should_persist_migration(needs_persist, is_secondary, provenance) {
-        let to_persist = document_to_persist(&on_disk, &settings, tier_migration);
-        if let Err(e) = save_settings(&to_persist) {
-            error!("Failed to persist tier/local_user_id migration: {}", e);
-        } else {
-            info!(
-                "Persisted tier/local_user_id migration (tier={:?}, local_user_id set)",
-                to_persist.tier
-            );
+        // The target is resolved ONCE, by the gate, and the write goes through
+        // that same path — never through `save_settings`'s own re-resolution of
+        // `QONTINUI_CONFIG_DIR`, which could name a different directory by the
+        // time it ran (see `persist_target_for_this_thread`).
+        match persist_target_for_this_thread() {
+            Ok(Some(target)) => {
+                let to_persist = document_to_persist(&on_disk, &settings, tier_migration);
+                if let Err(e) = save_settings_at(&target, &to_persist) {
+                    error!("Failed to persist tier/local_user_id migration: {}", e);
+                } else {
+                    info!(
+                        "Persisted tier/local_user_id migration (tier={:?}, local_user_id set)",
+                        to_persist.tier
+                    );
+                }
+            }
+            // Deflected (test builds only): the settings stay in memory.
+            Ok(None) => {}
+            Err(e) => {
+                error!("Failed to persist tier/local_user_id migration: {}", e);
+            }
         }
     }
 
@@ -5249,6 +5262,165 @@ pub(crate) fn should_persist_migration(
     needs_persist && !is_secondary && provenance.is_authoritative()
 }
 
+/// The settings write canary — may the load-time persist that
+/// [`should_persist_migration`] just approved actually be issued from THIS
+/// thread?
+///
+/// In a non-test build this is `true` and compiles away: a runner persists its
+/// own migration, full stop. `settings` is a bin-crate module (`main.rs`), so
+/// `cfg(test)` reaches it — unlike the lib, whose canary needs a runtime arm.
+///
+/// # The defect this closes
+///
+/// `cargo test` runs every test of this binary as a thread in ONE process, and
+/// `QONTINUI_CONFIG_DIR` — the key [`resolve_config_dir`] reads — is
+/// process-global. A test that holds `isolated_ambient()` points that key at
+/// its own tempdir. Meanwhile ANY sibling test on another thread that calls
+/// [`load_settings`] with no fixture of its own (a bare `get_setting()` test,
+/// say) reaches this persist: the fixture dir has no `settings.json`, so the
+/// provenance is `FreshInstall`, `local_user_id` is minted, `needs_persist`
+/// goes true, and [`save_settings`] atomic-writes a `settings.json` into
+/// whatever directory the key names AT THAT INSTANT — the live fixture's. The
+/// fixture's owner then reds on a file it never wrote, with nothing naming
+/// the writer. The victim in the record is
+/// `config_report_cmd::tests::config_report_live_command_writes_nothing_it_reports_on`;
+/// the resource is the persisting READ path, not the env key as such (the
+/// ambient canary already covers what a READER sees, and deflecting `HOME`
+/// changes nothing about a WRITE).
+///
+/// # The rule
+///
+/// Allowed when:
+///
+/// 1. this thread owns a live `IsolatedAmbient`
+///    (`crate::test_env::thread_is_guarded()`) — the persist lands in the
+///    caller's own fixture, which is the whole point of holding one; or
+/// 2. no fixture is live anywhere in the process
+///    (`crate::test_env::live_guard_count() == 0`) — the write lands in the
+///    real config dir the test process already runs against, as before this
+///    gate existed.
+///
+/// The gate resolves the target path ONCE and hands it back, and the caller
+/// writes through [`save_settings_at`] with that path — not through
+/// [`save_settings`], whose own `get_settings_path()` re-resolves
+/// `QONTINUI_CONFIG_DIR` and would decide the directory a second time. So the
+/// decision and the write see the same key value. **The window that remains,
+/// stated so it is scheduled rather than discovered:** arm 2 is a check
+/// against `live_guard_count()`, and a sibling can construct its
+/// `IsolatedAmbient` between that read and the `atomic_write`. The path was
+/// resolved before the fixture rewrote the key, so the bytes land in the
+/// directory arm 2 decided on (the real config dir, or whatever the key named
+/// then) — not in the new fixture — but that persist is neither counted in
+/// `PERSIST_DEFLECTIONS` nor logged. Narrowed by resolving once, not closed:
+/// closing it means holding `env_lock()` across check-and-write, and the
+/// caller may be the armed test's own thread already holding it (the
+/// re-entrant lock is fine) or a worker thread that would then block on the
+/// armed test — the D2 cost, made into a deadlock. Deflect stays the design.
+///
+/// Otherwise — a sibling's fixture is live and this thread is unarmed — the
+/// persist is **deflected**: `None` is returned, the in-memory settings are
+/// returned unchanged (still correct for this process's lifetime), one line
+/// per process is printed to stderr naming the target path, and
+/// `PERSIST_DEFLECTIONS` bumped so a test can assert on state rather than
+/// scrape stderr. Under `crate::test_env::strict_canary()` the deflection is a
+/// `panic!` carrying the same sentence — the "fails deterministically naming
+/// the resource" arm.
+///
+/// This is deliberately the INVERSE of the ambient READ canary's soft arm 3
+/// (`ambient::canary`: "else any live guard anywhere in the process →
+/// proceed"). That arm is soft because a reader on a helper thread still reads
+/// through the isolated env; a WRITER on an unarmed thread while a sibling's
+/// guard is live is precisely the case this canary exists for, so it cannot
+/// be the allow arm here.
+///
+/// # What the mechanism does and does not do — honestly
+///
+/// * The victim (a test holding `isolated_ambient()`) no longer reds, because
+///   the sibling's persist is deflected before it reaches the fixture dir. The
+///   printed line names the writer's TARGET, which is the diagnosis.
+/// * The writer is named at the SIBLING (a panic on the writer's own thread)
+///   only when that sibling itself runs under `strict_canary()`. `THREAD_STRICT`
+///   is thread-local by design, so the victim's `strict_canary()` cannot reach
+///   a sibling's thread — the panic would have to fire on the writer's thread,
+///   which is unarmed and non-strict by definition.
+/// * Deflect rather than panic by default: a process-wide hard panic under
+///   every parallel sibling is a flake generator (the same measured reason the
+///   ambient plan chose deflection); `strict_canary()` is the opt-in.
+/// * Known cost (plan D2): an ARMED test that issues this persist from a
+///   spawned worker thread (`std::thread::spawn`, `tokio::spawn`,
+///   `spawn_blocking` — their bodies are unarmed because `THREAD_ARMED` is
+///   thread-local) is deflected while any fixture is live. A `#[tokio::test]`
+///   body itself runs on the test thread and is unaffected. A test that needs
+///   its persist from a worker issues it on its own thread; the rule is not
+///   softened.
+///
+/// Plan `2026-09-17-runner-tests-share-in-process-mutable-state`, Phase 3.
+///
+/// Returns `Ok(Some(path))` — the settings path to write through — when the
+/// persist may proceed, `Ok(None)` when it is deflected, and `Err` when the
+/// path itself does not resolve (the same error [`save_settings`] would have
+/// returned).
+#[cfg(not(test))]
+#[inline(always)]
+fn persist_target_for_this_thread() -> Result<Option<PathBuf>, String> {
+    resolve_settings_path().map(Some)
+}
+
+/// How many load-time persists this test process has deflected. See
+/// [`persist_target_for_this_thread`]; read with [`persist_deflections`].
+#[cfg(test)]
+static PERSIST_DEFLECTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`PERSIST_DEFLECTIONS`]. Process-wide, so a test compares before/after
+/// rather than asserting an absolute count — parallel siblings bump it too.
+#[cfg(test)]
+pub(crate) fn persist_deflections() -> u64 {
+    PERSIST_DEFLECTIONS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The one sentence the deflection prints and the strict arm panics with. A
+/// function rather than a `const` so the target path is part of it.
+#[cfg(test)]
+fn persist_deflected_sentence(target: &str) -> String {
+    format!(
+        "settings persist from a test with no isolated_ambient() guard while another \
+         test's fixture is live — QONTINUI_CONFIG_DIR is process-global; target: {target}"
+    )
+}
+
+/// See the `#[cfg(not(test))]` twin above for the rule and the argument.
+#[cfg(test)]
+fn persist_target_for_this_thread() -> Result<Option<PathBuf>, String> {
+    // Resolved ONCE, before the decision, and returned to the caller: the
+    // directory the gate judged is the directory the bytes go to.
+    let resolved = resolve_settings_path();
+    if crate::test_env::thread_is_guarded() || crate::test_env::live_guard_count() == 0 {
+        return resolved.map(Some);
+    }
+
+    let target = match &resolved {
+        Ok(p) => p.display().to_string(),
+        Err(e) => format!("<unresolved: {e}>"),
+    };
+    PERSIST_DEFLECTIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+    if crate::test_env::thread_is_strict() {
+        panic!("{}", persist_deflected_sentence(&target));
+    }
+
+    // ONE line per process. `ambient::test_support::warn_once` cannot carry
+    // it — its sentence is hard-coded to the ambient-READ deflection and would
+    // name the wrong defect.
+    static PERSIST_DEFLECT_SEEN: std::sync::Once = std::sync::Once::new();
+    PERSIST_DEFLECT_SEEN.call_once(|| {
+        eprintln!(
+            "[settings] {} — plan 2026-09-17-runner-tests-share-in-process-mutable-state",
+            persist_deflected_sentence(&target)
+        );
+    });
+    Ok(None)
+}
+
 /// Back-fill [`Settings::tier_chosen_explicitly`] on a document written before
 /// that field existed.
 ///
@@ -5309,13 +5481,31 @@ fn migrate_metadata_sync_flag(raw: &serde_json::Value, settings: &mut Settings) 
     }
 }
 
-/// Save settings to file (atomic write to prevent corruption on crash)
+/// Save settings to file (atomic write to prevent corruption on crash).
+///
+/// Resolves the path itself, through [`get_settings_path`]. A caller that has
+/// ALREADY decided which directory the write belongs in — the load-time
+/// migration persist behind [`persist_target_for_this_thread`] — writes
+/// through [`save_settings_at`] with that path instead, so its decision and
+/// its write cannot see two different values of `QONTINUI_CONFIG_DIR`.
 pub fn save_settings(settings: &Settings) -> Result<(), String> {
-    let path = get_settings_path()?;
+    save_settings_at(&get_settings_path()?, settings)
+}
+
+/// [`save_settings`] to an explicit path: the parent directory is created if
+/// absent (what [`get_settings_path`] does for the path-less caller), the
+/// document is atomically written, and the parse cache dropped.
+pub(crate) fn save_settings_at(path: &Path, settings: &Settings) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create app data directory: {}", e))?;
+        }
+    }
     let contents = serde_json::to_string_pretty(settings)
         .map_err(|e| format!("Failed to serialize settings: {}", e))?;
 
-    crate::fs_atomic::atomic_write(&path, contents.as_bytes())
+    crate::fs_atomic::atomic_write(path, contents.as_bytes())
         .map_err(|e| format!("Failed to write settings: {}", e))?;
 
     // Drop the parse cache AFTER the write, so a concurrent reader either sees
@@ -6880,5 +7070,133 @@ mod load_persist_tests {
             "no env-supplied web-integration value may appear anywhere in the \
              file: {text}"
         );
+    }
+
+    /// The write canary's fixture: THIS thread holds `isolated_ambient()`
+    /// (so `QONTINUI_CONFIG_DIR` names an empty tempdir and a fixture is live
+    /// in the process) and the persist is driven from a spawned thread that
+    /// holds nothing — the shape of a bare `get_setting()` sibling test running
+    /// beside `config_report_live_command_writes_nothing_it_reports_on`.
+    ///
+    /// Returns the fixture and the env restore, in an order that drops the
+    /// restore first. The instance name is removed under the fixture's own
+    /// `env_lock()` because `is_secondary()` would otherwise close
+    /// `should_persist_migration` FIRST and the canary would never be reached
+    /// — a pass for the wrong reason.
+    fn unguarded_writer_fixture() -> (
+        crate::test_env::IsolatedAmbient,
+        crate::test_env::EnvVarRestore,
+    ) {
+        let amb = crate::test_env::isolated_ambient();
+        let restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_INSTANCE_NAME"]);
+        std::env::remove_var("QONTINUI_INSTANCE_NAME");
+        assert!(
+            !amb.dir().join(SETTINGS_FILE).exists(),
+            "the fixture starts with no settings.json, so the load is a FreshInstall \
+             whose local_user_id mint requests the persist"
+        );
+        (amb, restore)
+    }
+
+    /// `persist_target_for_this_thread`, deflect arm: a `load_settings()`
+    /// issued from a thread with no guard while this test's fixture is live
+    /// writes NOTHING into the fixture dir and bumps the deflection counter.
+    ///
+    /// The counter is process-wide (parallel siblings can bump it too), so the
+    /// assertion is `after > before`, never `== 1`. The load itself still
+    /// returns a usable in-memory document — deflection is not an error.
+    #[test]
+    fn persist_from_an_unguarded_thread_while_a_fixture_is_live_is_deflected_and_named() {
+        let (amb, _restore) = unguarded_writer_fixture();
+        let settings_path = amb.dir().join(SETTINGS_FILE);
+
+        let before = persist_deflections();
+        let loaded = std::thread::spawn(|| {
+            assert!(
+                !crate::test_env::thread_is_guarded(),
+                "the spawned thread must be unarmed — THREAD_ARMED is thread-local"
+            );
+            load_settings_full()
+        })
+        .join()
+        .expect("the unguarded load must not panic on the default (deflect) arm");
+        let after = persist_deflections();
+
+        assert_eq!(
+            loaded.provenance,
+            SettingsProvenance::FreshInstall,
+            "the fixture must have driven the fresh-install persist path, or the \
+             gate was never reached"
+        );
+        assert!(
+            !loaded.settings.local_user_id.trim().is_empty(),
+            "the in-memory migration still applies — only the WRITE is deflected"
+        );
+        assert!(
+            !settings_path.exists(),
+            "the sibling's persist reached the live fixture dir: {}",
+            settings_path.display()
+        );
+        assert!(
+            after > before,
+            "the persist must have been DEFLECTED (counter {before} -> {after}), not \
+             merely absent — otherwise this test passes because nothing tried to write"
+        );
+    }
+
+    /// `persist_target_for_this_thread`, strict arm: the same unguarded
+    /// writer, run under `strict_canary()` on ITS OWN thread, panics with the
+    /// sentence that names the resource and the target path. Thread-local on
+    /// purpose — see the gate's doc comment for why the victim's
+    /// `strict_canary()` cannot reach a sibling.
+    #[test]
+    fn persist_from_an_unguarded_strict_thread_while_a_fixture_is_live_panics_naming_the_resource()
+    {
+        let (amb, _restore) = unguarded_writer_fixture();
+        let settings_path = amb.dir().join(SETTINGS_FILE);
+        let expected_target = settings_path.display().to_string();
+
+        let before = persist_deflections();
+        let joined = std::thread::spawn(|| {
+            let _strict = crate::test_env::strict_canary();
+            load_settings_full()
+        })
+        .join();
+        let after = persist_deflections();
+
+        let payload = match joined {
+            Err(payload) => payload,
+            Ok(_) => panic!(
+                "a strict unguarded persist must panic naming the resource; it returned \
+                 (deflections {before} -> {after}, settings.json exists: {})",
+                settings_path.exists()
+            ),
+        };
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .expect("panic payload must be a string");
+        assert!(
+            message.contains(
+                "settings persist from a test with no isolated_ambient() guard while \
+                 another test's fixture is live"
+            ),
+            "panic must carry the canary sentence: {message}"
+        );
+        assert!(
+            message.contains("QONTINUI_CONFIG_DIR is process-global"),
+            "panic must name the shared resource: {message}"
+        );
+        assert!(
+            message.contains(&expected_target),
+            "panic must name the target path {expected_target}: {message}"
+        );
+        assert!(
+            !settings_path.exists(),
+            "the strict arm must still not write: {}",
+            settings_path.display()
+        );
+        assert!(after > before, "the strict arm counts as a deflection");
     }
 }

@@ -252,8 +252,8 @@ jobs:
       # directory — `coverage-diff.test.mjs` and `perf-harness-lib.test.mjs`
       # predate this step and have not been verified against this job's exact
       # environment; wiring them in is a separate, separately-verified change.
-      - name: Run CI-tooling unit tests (ci-flake-analyze, ci-test-results-ingest, ci-expiry-phase-summary)
-        run: node --test scripts/__tests__/ci-flake-analyze.test.mjs scripts/__tests__/ci-test-results-ingest.test.mjs scripts/__tests__/ci-expiry-phase-summary.test.mjs
+      - name: Run CI-tooling unit tests (ci-flake-analyze, ci-test-results-ingest, ci-expiry-phase-summary, test-interleave-census)
+        run: node --test scripts/__tests__/ci-flake-analyze.test.mjs scripts/__tests__/ci-test-results-ingest.test.mjs scripts/__tests__/ci-expiry-phase-summary.test.mjs scripts/__tests__/test-interleave-census.test.mjs
 
       # Pin matches rust-toolchain.toml (channel = "1.95.0"). The toolchain
       # file overrides any other channel for every cargo invocation, so the
@@ -990,6 +990,98 @@ jobs:
           }
           run_all 2>&1 | tee "$GITHUB_WORKSPACE/cargo-test-output.log"
 
+      # Post-failure DIAGNOSTIC, not a gate: on a red suite, re-run each failed
+      # test ALONE against the test binaries the BUILD half produced and label
+      # the arm — `SUITE-ONLY` (green alone, red in the suite: the test shares
+      # process state with a concurrent sibling), `SOLO-RED` (a real defect or
+      # an ambient read), `BOTH-FLAKY` (timing). The label lands as a Checks
+      # annotation (`::error title=SUITE-ONLY::…`) and as
+      # `test-classification.json`, which the ingest step below reads. Plan
+      # 2026-09-17-runner-tests-share-in-process-mutable-state, Phase 1;
+      # dossier `runner-tests-share-in-process-mutable-state`.
+      #
+      # THIS STEP CHANGES NO VERDICT. It runs only under `if: failure()` — the
+      # run half above has already reported red — and `continue-on-error`
+      # keeps its own outcome out of the job's; the script additionally exits
+      # 0 by contract in `--classify-from-log` mode, even on a crash.
+      #
+      # ⚠️ THIS STEP DOES NOT INVOKE CARGO EITHER — the run half's rule applies
+      # here with the same force. The classifier's own default resolves
+      # executables through `cargo test --no-run --message-format=json`, which
+      # on this crate is a REBUILD, not a cache hit (tauri-codegen and the
+      # sidecar stub make the package an input to itself; see the run half).
+      # So the executables are recovered from `cargo-test-build.log` exactly
+      # the way the run half recovers them — ANSI stripped, one `Executable
+      # \`<path>\`` line per test target — written one per line to an exe list
+      # and handed over with `--exe-list`. The same set the suite ran; the
+      # script's `--cargo` path is never reached. Paths are kept as cargo
+      # printed them (backslashes on windows): node's `spawn` execs them
+      # directly, no bash word-splitting is involved, and the id normaliser
+      # splits on either separator.
+      #
+      # Deliberately NO `timeout-minutes`: pairing one with `continue-on-error`
+      # cancels the whole JOB on trip, not the step (the mechanism that broke
+      # the reverted nextest shadow — see the ingest step's comment below). The
+      # bound is the script's own `--budget-seconds 600`: after it, remaining
+      # re-runs are labelled `UNRESOLVED (budget)` — a non-answer, never a
+      # verdict — and the step still ends 0.
+      #
+      # Ordering is load-bearing. It sits directly after `Run Rust tests`,
+      # BEFORE `Report test results to coord` so the ingest can read the
+      # classification json, and BEFORE `Unpoison ambient state` so the solo
+      # re-runs see the SAME poisoned env the suite ran under — a re-run that
+      # passed only because the poison was gone would be a false SUITE-ONLY.
+      # The step-level env mirrors the run half's `QONTINUI_DISABLE_KEYCHAIN`
+      # for the same reason (and so the keyring-touching auth tests cannot hang
+      # a re-run on a headless runner). No `CARGO_BUILD_JOBS`: nothing here
+      # compiles.
+      #
+      # `--workspace-root "$GITHUB_WORKSPACE/src-tauri"` reproduces cargo's
+      # contract that a test binary runs with cwd = the package manifest dir —
+      # the same `cd src-tauri` the run half keeps for the same reason — and is
+      # where the tree sha is read from.
+      #
+      # `if: failure()` also fires when the BUILD half (or any earlier step)
+      # redded and the run half never ran: the run log is then absent, and
+      # there is nothing to classify — so the shell checks for both logs first
+      # and says so instead.
+      - name: Classify failed tests (solo re-run)
+        if: failure()
+        continue-on-error: true
+        shell: bash
+        env:
+          QONTINUI_DISABLE_KEYCHAIN: "1"
+        run: |
+          LOG="$GITHUB_WORKSPACE/cargo-test-output.log"
+          BUILD_LOG="$GITHUB_WORKSPACE/cargo-test-build.log"
+          if [ ! -s "$LOG" ]; then
+            echo "::notice title=classify-skipped::no cargo-test-output.log — the run half did not run (the build half or an earlier step redded); nothing to classify"
+            exit 0
+          fi
+          if [ ! -s "$BUILD_LOG" ]; then
+            echo "::notice title=classify-skipped::no cargo-test-build.log — cannot recover the test executables without invoking cargo, which this step must never do; nothing to classify"
+            exit 0
+          fi
+          # The run half's recovery, verbatim: strip ANSI (CARGO_TERM_COLOR is
+          # `always`), then take the path out of each `Executable \`<path>\``.
+          EXE_LIST="$GITHUB_WORKSPACE/test-executables.txt"
+          ESC=$(printf '\033')
+          sed -e "s/${ESC}\[[0-9;]*m//g" "$BUILD_LOG" \
+            | sed -n 's/^[[:space:]]*Executable `\(.*\)`[[:space:]]*$/\1/p' > "$EXE_LIST"
+          if [ ! -s "$EXE_LIST" ]; then
+            echo "::notice title=classify-skipped::found no \`Executable\` lines in $BUILD_LOG; nothing to re-run"
+            exit 0
+          fi
+          echo "recovered $(wc -l < "$EXE_LIST") test binaries from the build half"
+          node scripts/test-interleave-census.mjs \
+            --classify-from-log "$LOG" \
+            --exe-list "$EXE_LIST" \
+            --workspace-root "$GITHUB_WORKSPACE/src-tauri" \
+            --solo-runs 3 \
+            --budget-seconds 600 \
+            --format json \
+            --out "$GITHUB_WORKSPACE/test-classification.json"
+
       # Phase 2 of the same plan: make an expiry name its own phase.
       #
       # `The action 'Run Rust tests' has timed out after 90 minutes` was
@@ -1168,6 +1260,17 @@ jobs:
       # produces no run-phase lines at all, so `parseTestOutcomes` returns
       # `unparsed` and this step correctly sends nothing. What survives is
       # exactly #1545's tail — the RUN step expiring mid-suite.
+      #
+      # `--classification` = the json the `Classify failed tests` step above
+      # wrote (absent on a green run, or when that step was skipped or ran out
+      # of budget): each pre-parsed row then carries `classification:
+      # suite_only | solo_red | both_flaky | null`, tallied in this step's log.
+      # An absent or unreadable file is null on every row, never a failure.
+      # Like `--gating-outcome`, it does NOT change the payload: coord's
+      # `ResultItem` has no such field and no `deny_unknown_fields`, so the
+      # key is stripped before the POST rather than written into a void
+      # (plan 2026-09-17-runner-tests-share-in-process-mutable-state, Phase 1
+      # — the recorded coord gap).
       - name: Report test results to coord (best-effort)
         if: always()
         continue-on-error: true
@@ -1200,7 +1303,8 @@ jobs:
             --repo "${{ github.repository }}" \
             --head-sha "${{ github.event.pull_request.head.sha || github.sha }}" \
             --shard "${{ matrix.platform }}" \
-            --gating-outcome "${{ steps.run_rust_tests.outcome }}"
+            --gating-outcome "${{ steps.run_rust_tests.outcome }}" \
+            --classification "$GITHUB_WORKSPACE/test-classification.json"
 
       # Undo `Poison ambient state` so the poison covers the test step and
       # nothing after it. `$GITHUB_ENV` cannot unset, only assign — but every

@@ -61,6 +61,27 @@ name: Flake escalation
 # read, never a change to this workflow.
 # `history_read: thin` (no test has 20 samples yet) is a notice and exits 0.
 #
+# THE `census` JOB (Phase 5 of plan
+# 2026-09-17-runner-tests-share-in-process-mutable-state, dossier
+# runner-tests-share-in-process-mutable-state) is the standing guard against
+# the class NEITHER arm above can see: a test that passes alone and reds only
+# in the full suite because it shares process state with a concurrent
+# sibling. The rate arm counts finished runs and cannot compute the one
+# distinguishing signal (solo-pass + suite-fail); the main-red arm re-runs
+# nothing. On the same nightly schedule and on dispatch, the census job
+# builds the test executables once and runs `scripts/test-interleave-census.mjs`
+# in census mode — every executable 5 times, every red re-run alone 3 times,
+# the arm labelled — then hands the SUITE-ONLY set to the escalator's
+# `--census` arm, which files one `suite-only test: <id>` issue per test
+# (label `suite-only` beside `flake`, one issue per id across both prefixes).
+# The json is uploaded as an artifact either way. A red census job means the
+# class is PRESENT on main (the script's own exit 1) or the census could not
+# measure (exit 2, an unparsed run) — never "the rail is dark"; that verdict
+# is the escalate job's. Green-and-empty is the honest clean bill of health
+# here, because the census ran the binaries and found nothing, which is what
+# the plan's exit criterion asks for. PR runs never pay for it: the job is
+# gated on `schedule` / `workflow_dispatch`, not on `pull_request`.
+#
 # The plan's second escalation arm — "any occurrence on a push to
 # refs/heads/main" — is the `workflow_run` trigger above. It does not need
 # per-run outcomes from the flakiness endpoint at all: the failing tests are
@@ -83,6 +104,14 @@ on:
         description: "Disagreeing runs in coord's window needed to escalate (plan default 3)"
         type: string
         default: "3"
+      census_runs:
+        description: "Interleave census: full-suite runs per test executable (plan default 5)"
+        type: string
+        default: "5"
+      skip_census:
+        description: "Skip the interleave census job on this dispatch"
+        type: boolean
+        default: false
   workflow_run:
     workflows: [CI]
     types: [completed]
@@ -91,9 +120,14 @@ on:
     branches: [main]
     paths:
       - scripts/ci-flake-escalate.mjs
-      # The parser the main-red arm imports; a change to it must run these
-      # tests too, not only ci-flake-analyze's own.
+      # Every module the escalator imports; a change to any of them must run
+      # these tests too, not only that module's own. ci-flake-analyze.mjs is
+      # the parser (main-red arm) and the shared redaction; the ingest module
+      # lends `readClassification`; the census module lends `DOSSIER_SLUG`
+      # and the json shape the census arm reads.
       - scripts/ci-flake-analyze.mjs
+      - scripts/ci-test-results-ingest.mjs
+      - scripts/test-interleave-census.mjs
       - scripts/__tests__/ci-flake-escalate.test.mjs
       - .github/workflows/flake-escalation.yml
 
@@ -186,3 +220,266 @@ jobs:
           if [ "${DRY_RUN:-false}" = "true" ]; then args+=(--dry-run); fi
           if [ -n "${MIN_OCCURRENCES:-}" ]; then args+=(--min-occurrences "${MIN_OCCURRENCES}"); fi
           node scripts/ci-flake-escalate.mjs "${args[@]}"
+
+  census:
+    name: Nightly interleave census (SUITE-ONLY inventory)
+    # Step-level `if:` elsewhere in this file is deliberate (a job-level skip
+    # publishes a `skipped` check coord reads as passing); here a job-level
+    # gate is correct because this job is never a check on any PR or push —
+    # it runs only off `schedule` and `workflow_dispatch`, where no verdict
+    # is read. `workflow_run` and `pull_request` never reach it.
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.skip_census != 'true')
+    runs-on: ubuntu-22.04
+    # Cold build. A scheduled run restores no PR cache, and this job
+    # deliberately does not save a rust-cache entry of its own (a ~2.6 GB
+    # consumer of the repo's 10 GB cache cap is how main's cache got evicted
+    # once already — see ci.yml's `Cache Rust dependencies`), so every run
+    # compiles the workspace's test executables from cold at JOBS=1: ci.yml's
+    # `test` job measures that at ~43 min p50 on this leg. On top of it, 5
+    # census runs × ~76 s of libtest ≈ 7 min plus the solo re-runs (bounded
+    # by --budget-seconds below). JOB-level timeout only: the `:745-747` trap
+    # in ci.yml is a STEP timeout beside `continue-on-error`, and no step
+    # here carries either.
+    timeout-minutes: 150
+    concurrency:
+      group: flake-census-nightly
+      cancel-in-progress: false
+    # Identical to the `escalate` job's grant, and nothing more: the census
+    # needs `issues: write` for the same reason (creating/editing issues and
+    # the `suite-only` label), and `actions: read` is what `escalate` carries
+    # for its main-red arm — kept equal so the two jobs' surfaces stay one
+    # reviewable shape. Workflow default is `contents: read`.
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    env:
+      # The gating step's own knobs, so the census measures the suite CI
+      # measures: keyring calls short-circuit (`keychain_enabled()` in
+      # src-tauri/src/auth.rs), and the compile is single-threaded because
+      # the hosted 16 GB runner OOM-kills the agent at JOBS=2 even with swap
+      # (ci.yml documents both).
+      QONTINUI_DISABLE_KEYCHAIN: "1"
+      CARGO_BUILD_JOBS: "1"
+    steps:
+      - uses: actions/checkout@v5
+
+      # The same three sibling checkouts ci.yml's `test` job makes, through
+      # the same action: qontinui-schemas is a path dependency of
+      # src-tauri/Cargo.toml (the build does not resolve without it), and
+      # ui-bridge feeds the SDK↔runner manifest test, which silently passes
+      # when its file is absent — the census must run the same test the
+      # gate runs. Off a `pull_request` event the action resolves the
+      # commit pinned in .github/sibling-pins.conf, no API call.
+      - name: Check out sibling qontinui-schemas
+        uses: ./.github/actions/checkout-sibling
+      - name: Check out sibling qontinui-web
+        uses: ./.github/actions/checkout-sibling
+        with:
+          repo: qontinui/qontinui-web
+      - name: Check out sibling ui-bridge
+        uses: ./.github/actions/checkout-sibling
+        with:
+          repo: qontinui/ui-bridge
+
+      # Pin matches rust-toolchain.toml, as in ci.yml's `Setup Rust`. No
+      # rustfmt/clippy components: nothing here formats or lints.
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+
+      # The apt set ci.yml's ubuntu leg installs before its first cargo
+      # build (webkit2gtk, appindicator, rsvg, dbus, atspi) — the runner's
+      # crates link against them. Bounded for the reason ci.yml gives: an
+      # unbounded apt hang here would pin a runner for hours.
+      - name: Install dependencies (Ubuntu)
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            libatspi2.0-dev \
+            at-spi2-core
+
+      # Same two mitigations as ci.yml's ubuntu leg, for the same measured
+      # reasons: ~14 GB free on / is not enough for this dep tree plus a
+      # swapfile (rmeta write died with ENOSPC, PR #572), and the test-binary
+      # link OOM-kills the runner agent without swap.
+      - name: Free disk space (Ubuntu)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+      - name: Add swapfile (Ubuntu — guard against link-time OOM)
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+          df -h
+
+      # Build ONCE, from `src-tauri` — the directory ci.yml's build half
+      # `cd`s into before `cargo test --no-run --verbose`, so the census
+      # resolves the same package set and the same executables. No frontend
+      # build: src-tauri/build.rs provisions a `../dist/index.html`
+      # placeholder when none exists (touch-if-absent), and no Rust test reads
+      # the built bundle.
+      #
+      # ⚠️ THIS IS THE ONLY CARGO INVOCATION IN THIS JOB. An earlier cut let
+      # the census script resolve executables itself with `cargo test --no-run
+      # --message-format=json` "as a cache hit against this build" — and on
+      # this crate a second cargo invocation is NEVER a cache hit: tauri-codegen
+      # writes into OUT_DIR after the fingerprint, and the sidecar stub is
+      # touch-if-absent inside the fingerprint window, so the package is an
+      # input to itself and every subsequent invocation sees it Dirty and
+      # recompiles (ci.yml's run half documents both, measured on run
+      # 35477464051). That would have been a second ~45-min cold build inside
+      # a job whose bound was sized for one. So `--verbose` here (cargo then
+      # prints one ``Executable `<path>` `` line per test target, the same
+      # form ci.yml's build half relies on), teed to a log the next step
+      # recovers the paths from.
+      - name: Build the test executables (cargo test --no-run --verbose)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd src-tauri
+          cargo test --no-run --verbose 2>&1 | tee "$GITHUB_WORKSPACE/cargo-test-build.log" | tail -n 20
+
+      # The census proper. `--exe-list` carries the executables recovered
+      # from the build log with the SAME recipe as ci.yml's run half and its
+      # `Classify failed tests` step (ANSI stripped — CARGO_TERM_COLOR may be
+      # set — then the path out of each ``Executable `<path>` ``), so the
+      # script's own cargo resolution is never reached and cargo is never
+      # invoked twice. Zero recovered executables is refused loudly rather
+      # than measured vacuously, matching the run half. `--workspace-root
+      # src-tauri` mirrors the gating step's cwd (and the classify step's).
+      # Runs: the plan's 5 (dispatch may override). Solo re-runs: 3. The
+      # bound is the script's own `--budget-seconds` (a solo re-run past it
+      # is `UNRESOLVED (budget)`; a SUITE run not started by then is recorded
+      # `unparsed` "budget passed before this run" — both non-answers, both
+      # exit 2), never a step timeout. The deadline is anchored at census
+      # START and is checked before every suite run as well as every solo
+      # re-run, so a hung executable cannot carry the job past its own bound
+      # before the json exists. Sizing: a COMPLETE pass of every executable
+      # is ~5-6 min on this leg (ci.yml's run half: "20 minutes is 3.7x a
+      # complete run", measured 5m26s on run 35043646051 attempt 2), so 5
+      # runs ≈ 30 min plus the solo phase fits in 60 min with the ~45-60 min
+      # cold build under the 150-min job cap. `--run-timeout-seconds 900`
+      # bounds ONE executable at 15 min — 3x the whole suite — so five hung
+      # binaries cost 75 min at most, not the script default's 5 × 30. The
+      # script's exit code is RECORDED here and applied by the last step, so
+      # the artifact upload and the escalation below run whatever it was:
+      # 0 clean, 1 ≥ 1 SUITE-ONLY, 2 any non-answer (fail-closed: unparsed,
+      # budget passed, or an executable that could not be resolved).
+      #
+      # NOT run under ci.yml's `Poison ambient state`. The poison exists to
+      # make an ambient READER fail on the PR that adds it — a different
+      # class with its own guard (the cfg(test) canary in ambient.rs). The
+      # census's signal is a DIFF between two arms it runs under one and the
+      # same environment, so the label is the same poisoned or not; and the
+      # poison rewrites `COORD_HTTP_URL` through `$GITHUB_ENV` for every later
+      # step, which is exactly the redirect the escalation step below pins
+      # against. The step is ~100 lines with a Windows arm; the day the
+      # census should see it, factor it into a composite action rather than
+      # copying it here.
+      - name: Run the interleave census
+        id: census
+        shell: bash
+        env:
+          CENSUS_RUNS: ${{ github.event.inputs.census_runs }}
+        run: |
+          set -uo pipefail
+          runs="${CENSUS_RUNS:-5}"
+          case "$runs" in ''|*[!0-9]*) runs=5 ;; esac
+          BUILD_LOG="$GITHUB_WORKSPACE/cargo-test-build.log"
+          EXE_LIST="$GITHUB_WORKSPACE/test-executables.txt"
+          ESC=$(printf '\033')
+          sed -e "s/${ESC}\[[0-9;]*m//g" "$BUILD_LOG" \
+            | sed -n 's/^[[:space:]]*Executable `\(.*\)`[[:space:]]*$/\1/p' > "$EXE_LIST"
+          if [ ! -s "$EXE_LIST" ]; then
+            echo "::error title=No test binaries::found no \`Executable\` lines in $BUILD_LOG. Either the build step produced no test targets, or cargo's output format changed. Refusing to run a census over zero binaries (exit 2: UNKNOWN, not clean)."
+            echo "exit_code=2" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "recovered $(wc -l < "$EXE_LIST") test binaries from the build step"
+          node scripts/test-interleave-census.mjs \
+            --runs "$runs" \
+            --solo-runs 3 \
+            --exe-list "$EXE_LIST" \
+            --workspace-root "$GITHUB_WORKSPACE/src-tauri" \
+            --budget-seconds 3600 \
+            --run-timeout-seconds 900 \
+            --format pretty \
+            --out "$GITHUB_WORKSPACE/census.json"
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          echo "census exit code: $code (0 clean, 1 SUITE-ONLY present, 2 unparsed)"
+          exit 0
+
+      - name: Upload the census inventory
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interleave-census-${{ github.run_id }}
+          path: census.json
+          if-no-files-found: warn
+          retention-days: 90
+
+      # The escalator's census arm: one `suite-only test: <id>` issue per
+      # SUITE-ONLY test, on the census's own evidence. `--no-rate` because the
+      # `escalate` job reads coord's rate at the same hour — repeating that
+      # read here would double it and make this job red whenever that rail is
+      # dark, which is the other job's verdict to give. The label/title
+      # invariants (one issue per id across `flaky test:` / `suite-only test:`)
+      # are the escalator's. Env routed the same way as the `escalate` job.
+      - name: Escalate the SUITE-ONLY set
+        if: hashFiles('census.json') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COORD_HTTP_URL: https://coord.qontinui.io
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--repo "$REPO" --run-url "$RUN_URL" --no-rate --census "$GITHUB_WORKSPACE/census.json")
+          if [ "${DRY_RUN:-false}" = "true" ]; then args+=(--dry-run); fi
+          node scripts/ci-flake-escalate.mjs "${args[@]}"
+
+      # The job's verdict is the census's own exit code, applied last so the
+      # inventory was uploaded and the issues filed first. Red = the class is
+      # present on main (1) or the census could not measure (2, an unparsed
+      # run, or the step itself did not produce a code). Missing code reads
+      # as 2, never as clean.
+      - name: Census verdict
+        if: always()
+        shell: bash
+        env:
+          CENSUS_EXIT: ${{ steps.census.outputs.exit_code }}
+        run: |
+          code="${CENSUS_EXIT:-2}"
+          case "$code" in
+            0) echo "::notice title=interleave-census::clean — every executable parsed, no test was SUITE-ONLY, and no non-answers (no budget cut, nothing unresolved)" ;;
+            1) echo "::error title=interleave-census::SUITE-ONLY tests are present on main — see the census artifact and the suite-only issues (dossier runner-tests-share-in-process-mutable-state)" ;;
+            *) echo "::error title=interleave-census::the census could not measure (exit ${code}: an unparsed run, the budget passing before a run or re-run, an executable that could not be resolved, or the census step did not finish) — UNKNOWN, not clean" ;;
+          esac
+          exit "$code"

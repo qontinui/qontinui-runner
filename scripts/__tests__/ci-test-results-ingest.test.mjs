@@ -16,7 +16,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-import { buildIngestBody, chunkResults } from "../ci-test-results-ingest.mjs";
+import { buildIngestBody, chunkResults, readClassification, toWireRow } from "../ci-test-results-ingest.mjs";
 
 const TS = "2026-09-02T07:26:07.5955615Z ";
 
@@ -53,8 +53,8 @@ test("a green log builds a results body with pass outcomes", () => {
     head_sha: "abc123",
     source: "ci",
     results: [
-      { test_id: "foo::bar", outcome: "pass" },
-      { test_id: "foo::baz", outcome: "pass" },
+      { test_id: "foo::bar", outcome: "pass", classification: null },
+      { test_id: "foo::baz", outcome: "pass", classification: null },
     ],
   });
 });
@@ -67,8 +67,8 @@ test("a red log carries the failing test's outcome through, not a suppressed pas
   });
   assert.equal(warning, null);
   assert.deepEqual(body.results, [
-    { test_id: "foo::bar", outcome: "fail" },
-    { test_id: "foo::baz", outcome: "pass" },
+    { test_id: "foo::bar", outcome: "fail", classification: null },
+    { test_id: "foo::baz", outcome: "pass", classification: null },
   ]);
 });
 
@@ -80,8 +80,8 @@ test("shard is attached to every row when supplied", () => {
     shard: "windows-latest",
   });
   assert.deepEqual(body.results, [
-    { test_id: "foo::bar", outcome: "pass", shard: "windows-latest" },
-    { test_id: "foo::baz", outcome: "pass", shard: "windows-latest" },
+    { test_id: "foo::bar", outcome: "pass", shard: "windows-latest", classification: null },
+    { test_id: "foo::baz", outcome: "pass", shard: "windows-latest", classification: null },
   ]);
 });
 
@@ -547,3 +547,161 @@ test("MUTATION: dropping the gating plumbing is caught by this suite's own asser
   }
   assert.equal(mutantThrew, true, "and the mutant must be caught by that same assertion");
 });
+
+// ---------------------------------------------------------------------------
+// --classification (Phase 1 of plan
+// 2026-09-17-runner-tests-share-in-process-mutable-state): the classifier's
+// json rides onto the pre-parsed rows; its absence is null everywhere, never
+// a failure; and NOTHING of it reaches the wire — coord has no column, and a
+// dropped key would read as a successful write of nothing (the rule the
+// `--gating-outcome` section above establishes).
+// ---------------------------------------------------------------------------
+
+/** A `test-interleave-census.mjs` report (either mode carries `tests[id].label`). */
+const CLASSIFICATION_REPORT = JSON.stringify({
+  header: { mode: "classify-from-log", solo_runs: 3 },
+  tests: {
+    "foo::bar": { label: "SUITE-ONLY", solo_runs: 3, solo_failures: 0 },
+    "foo::other": { label: "SOLO-RED", solo_runs: 3, solo_failures: 3 },
+    "foo::timing": { label: "BOTH-FLAKY", solo_runs: 3, solo_failures: 1 },
+    "foo::doc - x (line 1)": { label: "UNRESOLVED", reason: "doctest" },
+    "foo::late": { label: "UNRESOLVED (budget)" },
+    "foo::garbled": { label: "UNPARSED" },
+  },
+  summary: {},
+  exit_code: 0,
+});
+
+const fakeFs = (files) => ({
+  read: (p) => {
+    if (!Object.hasOwn(files, p)) {
+      const err = new Error(`ENOENT: no such file or directory, open '${p}'`);
+      err.code = "ENOENT";
+      throw err;
+    }
+    return files[p];
+  },
+});
+
+test("classification present: the three verdicts map to tokens by test id; every non-answer is null", () => {
+  const { byId, note } = readClassification(
+    "/w/test-classification.json",
+    fakeFs({ "/w/test-classification.json": CLASSIFICATION_REPORT }),
+  );
+  assert.equal(note, null);
+  assert.deepEqual(
+    [...byId.entries()].sort(),
+    [
+      ["foo::bar", "suite_only"],
+      ["foo::other", "solo_red"],
+      ["foo::timing", "both_flaky"],
+    ],
+    "UNRESOLVED / UNRESOLVED (budget) / UNPARSED never become a class",
+  );
+  const { body } = buildIngestBody({
+    logText: RED_LOG,
+    repo: "qontinui/qontinui-runner",
+    headSha: "def456",
+    shard: "ubuntu-22.04",
+    classification: byId,
+  });
+  assert.deepEqual(body.results, [
+    { test_id: "foo::bar", outcome: "fail", shard: "ubuntu-22.04", classification: "suite_only" },
+    { test_id: "foo::baz", outcome: "pass", shard: "ubuntu-22.04", classification: null },
+  ]);
+});
+
+test("classification file absent (the green-run case): null on every row and a note, never a throw", () => {
+  const { byId, note } = readClassification("/w/test-classification.json", fakeFs({}));
+  assert.equal(byId, null);
+  assert.match(note, /not readable \(ENOENT\)/);
+  assert.match(note, /classification=null on every row/);
+  const { body, warning } = buildIngestBody({
+    logText: RED_LOG,
+    repo: "qontinui/qontinui-runner",
+    headSha: "def456",
+    classification: byId,
+  });
+  assert.equal(warning, null, "an absent classification never blocks the ingest");
+  for (const r of body.results) assert.equal(r.classification, null);
+});
+
+test("no --classification flag at all: no note, null on every row", () => {
+  const { byId, note } = readClassification(undefined, fakeFs({}));
+  assert.equal(byId, null);
+  assert.equal(note, null);
+  const { body } = buildIngestBody({ logText: GREEN_LOG, repo: "o/r", headSha: "x" });
+  for (const r of body.results) {
+    assert.equal(Object.hasOwn(r, "classification"), true, "the key is always present on the pre-parsed row");
+    assert.equal(r.classification, null);
+  }
+});
+
+test("classification file unparseable or the wrong shape: null on every row and a note naming the file", () => {
+  for (const [content, expect] of [
+    ["{not json", /is not JSON/],
+    ['"a string"', /carries no `tests` object/],
+    ["[1,2,3]", /carries no `tests` object/],
+    ['{"header":{}}', /carries no `tests` object/],
+    ['{"tests":"nope"}', /carries no `tests` object/],
+  ]) {
+    const { byId, note } = readClassification("/w/c.json", fakeFs({ "/w/c.json": content }));
+    assert.equal(byId, null, `content ${content}`);
+    assert.match(note, expect, `content ${content}`);
+    assert.match(note, /\/w\/c\.json/);
+  }
+});
+
+test("classification report with malformed records: tolerated per record, never a throw", () => {
+  const { byId, note } = readClassification(
+    "/w/c.json",
+    fakeFs({
+      "/w/c.json": JSON.stringify({
+        tests: {
+          "a::ok": { label: "SUITE-ONLY" },
+          "a::nolabel": {},
+          "a::null": null,
+          "a::weird": { label: "SOMETHING-NEW" },
+          "a::num": 7,
+        },
+      }),
+    }),
+  );
+  assert.equal(note, null);
+  assert.deepEqual([...byId.entries()], [["a::ok", "suite_only"]]);
+});
+
+test("toWireRow strips exactly the local classification key and nothing else", () => {
+  assert.deepEqual(
+    toWireRow({ test_id: "a::b", outcome: "fail", shard: "x", classification: "suite_only" }),
+    { test_id: "a::b", outcome: "fail", shard: "x" },
+  );
+  assert.deepEqual(toWireRow({ test_id: "a::b", outcome: "pass", classification: null }), {
+    test_id: "a::b",
+    outcome: "pass",
+  });
+  assert.deepEqual(toWireRow({ test_id: "a::b", outcome: "pass" }), { test_id: "a::b", outcome: "pass" });
+});
+
+test("the POST body is BYTE-IDENTICAL with and without --classification (coord has no column; a dropped key is a void)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ingest-classification-"));
+  const cls = join(dir, "test-classification.json");
+  writeFileSync(cls, CLASSIFICATION_REPORT, "utf8");
+
+  const plain = await runIngest([], RED_LOG);
+  const flagged = await runIngest(["--classification", cls], RED_LOG);
+  const absent = await runIngest(["--classification", join(dir, "does-not-exist.json")], RED_LOG);
+
+  assert.equal(plain.bodies.length, 1);
+  assert.equal(flagged.bodies.length, 1);
+  assert.equal(absent.bodies.length, 1);
+  assert.equal(flagged.bodies[0], plain.bodies[0], "--classification must not change one byte of the payload");
+  assert.equal(absent.bodies[0], plain.bodies[0], "an absent file changes nothing either");
+  assert.doesNotMatch(plain.bodies[0], /classification/);
+
+  // …while the classification IS visible where it is meant to be: the log.
+  assert.match(flagged.stdout, /classification from .*test-classification\.json: 3 classified id\(s\) in the file, suite_only=1 on this leg's rows/);
+  assert.match(absent.stdout, /::notice title=test-results-ingest::classification file .*does-not-exist\.json not readable \(ENOENT\); classification=null on every row/);
+  assert.doesNotMatch(absent.stdout, /::error/, "an absent classification is routine, never an error");
+});
+

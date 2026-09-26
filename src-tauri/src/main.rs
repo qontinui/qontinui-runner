@@ -348,6 +348,13 @@ mod tier_matrix_tests;
 // Plan `2026-08-25-runner-test-suite-env-isolation` Phase 2.
 #[cfg(test)]
 mod env_write_lock_guard;
+// Source invariant: a module-local test serialiser (`fn series_lock()` over a
+// `static … Mutex<()>`, or the static taken directly) is taken by EVERY test of
+// the module that defines it, or the module is allowlisted with a reason — a
+// lock only opt-ins take excludes nothing. Reuses the walker above.
+// Plan `2026-09-17-runner-tests-share-in-process-mutable-state` Phase 5.
+#[cfg(test)]
+mod opt_in_serializer_guard;
 // Source-scan ratchets for the deny lints that grandfather sites with a
 // fn-level `#[expect]` (`clippy::disallowed_methods` for `Row::get`,
 // `clippy::string_slice`): each count only falls, and each gate stays wired.

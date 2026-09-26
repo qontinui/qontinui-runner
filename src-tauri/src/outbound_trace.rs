@@ -34,10 +34,28 @@
 //! trace to the round-trip that caused it. This is best-effort: a concurrent
 //! invocation of the *same* command could interleave, so the result is a list,
 //! not a single trace.
+//!
+//! # One static, private handles in tests
+//!
+//! The ring and its sequence counter have an identity — [`TraceRing`] — so a
+//! test can own a PRIVATE one. Production keeps exactly one instance, the
+//! [`RING`] static, and the three public entry points are pure delegations to
+//! it. Before the handle existed the ring was a process-global `VecDeque` that
+//! every unit test of this binary shared: `ring_is_bounded` pushes
+//! `RING_CAPACITY + 10` entries, and a sibling asserting an exact drain was
+//! recorded red when the two interleaved under `cargo test`'s parallel threads
+//! (finding 2026-09-16) — a red that passed alone and passed under
+//! `--test-threads=1`. The window is microseconds wide, so the interleave is
+//! rare: measured 2026-09-21 by running this module's tests alone at 8 threads,
+//! 0 reds in 100 runs and 2 in 1000 (one per victim — both `drain_since_*`
+//! tests, each evicted by the sibling's 74 pushes). A private ring per test
+//! cannot interleave with anything, so there is nothing left to serialise and
+//! nothing for a future test to forget to lock (plan
+//! 2026-09-17-runner-tests-share-in-process-mutable-state, Phase 2).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use serde::Serialize;
 use serde_json::Value;
@@ -69,7 +87,7 @@ pub struct OutboundTrace {
     pub response_shape: Option<Value>,
 }
 
-/// The trace ring, paired with the command that produced each entry and the
+/// One entry of the trace ring: the command that produced the trace and the
 /// sequence number that orders it.
 struct Entry {
     seq: u64,
@@ -77,20 +95,43 @@ struct Entry {
     trace: OutboundTrace,
 }
 
-fn ring() -> &'static Mutex<VecDeque<Entry>> {
-    static RING: OnceLock<Mutex<VecDeque<Entry>>> = OnceLock::new();
-    RING.get_or_init(|| Mutex::new(VecDeque::with_capacity(RING_CAPACITY)))
+/// The trace ring paired with the sequence counter that stamps its entries.
+///
+/// Giving the pair an identity is what lets a test own a private instance
+/// (see the module docs). Production never constructs one: it charges every
+/// call to the single [`RING`] static through the `pub fn` delegations below,
+/// and the `_in` functions that do the work are module-private so no call
+/// site can choose a ring.
+///
+/// `const fn new()` so the static needs no `OnceLock`: `Mutex::new` and
+/// `VecDeque::new` are both const. `VecDeque::with_capacity` is not, so the
+/// former 64-slot pre-allocation is gone — the ring grows to capacity once,
+/// on its first 64 records, and never again.
+struct TraceRing {
+    ring: Mutex<VecDeque<Entry>>,
+    seq: AtomicU64,
 }
 
-fn seq_counter() -> &'static AtomicU64 {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    &SEQ
+impl TraceRing {
+    const fn new() -> Self {
+        Self {
+            ring: Mutex::new(VecDeque::new()),
+            seq: AtomicU64::new(0),
+        }
+    }
 }
+
+/// The process-global trace ring — the one every production call is charged to.
+static RING: TraceRing = TraceRing::new();
 
 /// The current sequence value. Snapshot this *before* triggering a command, then
 /// pass it to [`drain_since`] to collect only the traces that command produced.
 pub fn current_seq() -> u64 {
-    seq_counter().load(Ordering::SeqCst)
+    // A PURE DELEGATION, and load-bearing as such: the logic lives in the `_in`
+    // function, which the tests exercise against a private ring, so the code
+    // production calls is the code the tests cover. `the_public_ring_api_only_delegates`
+    // pins the shape so a second global cannot creep back into this wrapper.
+    current_seq_in(&RING)
 }
 
 /// Record one outbound call made by `command`.
@@ -98,20 +139,8 @@ pub fn current_seq() -> u64 {
 /// `command` is `&'static str` so only in-tree call sites can register — a
 /// trace can never be attributed to a caller-supplied name.
 pub fn record(command: &'static str, trace: OutboundTrace) {
-    let seq = seq_counter().fetch_add(1, Ordering::SeqCst) + 1;
-    let Ok(mut ring) = ring().lock() else {
-        // A poisoned ring must never take down a command's real work — the
-        // trace is a debugging aid, not a correctness dependency.
-        return;
-    };
-    if ring.len() == RING_CAPACITY {
-        ring.pop_front();
-    }
-    ring.push_back(Entry {
-        seq,
-        command,
-        trace,
-    });
+    // Pure delegation — see `current_seq`.
+    record_in(&RING, command, trace)
 }
 
 /// Traces recorded for `command` with a sequence greater than `since_seq`,
@@ -119,10 +148,43 @@ pub fn record(command: &'static str, trace: OutboundTrace) {
 /// age out rather than being consumed) — the name mirrors the caller's intent
 /// of "everything since I started".
 pub fn drain_since(command: &str, since_seq: u64) -> Vec<OutboundTrace> {
-    let Ok(ring) = ring().lock() else {
+    // Pure delegation — see `current_seq`.
+    drain_since_in(&RING, command, since_seq)
+}
+
+/// [`current_seq`] against an explicit ring.
+fn current_seq_in(ring: &TraceRing) -> u64 {
+    ring.seq.load(Ordering::SeqCst)
+}
+
+/// [`record`] against an explicit ring. Module-private on purpose — the
+/// parameter exists so the tests can cover THIS function, the one that does
+/// the work, against a ring no sibling test can fill.
+fn record_in(ring: &TraceRing, command: &'static str, trace: OutboundTrace) {
+    let seq = ring.seq.fetch_add(1, Ordering::SeqCst) + 1;
+    let Ok(mut entries) = ring.ring.lock() else {
+        // A poisoned ring must never take down a command's real work — the
+        // trace is a debugging aid, not a correctness dependency.
+        return;
+    };
+    if entries.len() == RING_CAPACITY {
+        entries.pop_front();
+    }
+    entries.push_back(Entry {
+        seq,
+        command,
+        trace,
+    });
+}
+
+/// [`drain_since`] against an explicit ring. Module-private for the same reason
+/// as [`record_in`].
+fn drain_since_in(ring: &TraceRing, command: &str, since_seq: u64) -> Vec<OutboundTrace> {
+    let Ok(entries) = ring.ring.lock() else {
         return Vec::new();
     };
-    ring.iter()
+    entries
+        .iter()
         .filter(|e| e.command == command && e.seq > since_seq)
         .map(|e| e.trace.clone())
         .collect()
@@ -191,12 +253,16 @@ mod tests {
 
     #[test]
     fn drain_since_returns_only_traces_after_the_snapshot() {
-        record("cmd_a", trace(200));
-        let start = current_seq();
-        record("cmd_a", trace(201));
-        record("cmd_a", trace(202));
+        // A private ring: no sibling test can push entries into it, so the
+        // exact assertion below cannot be reddened by `ring_is_bounded`'s 74
+        // records landing in the same window.
+        let ring = TraceRing::new();
+        record_in(&ring, "cmd_a", trace(200));
+        let start = current_seq_in(&ring);
+        record_in(&ring, "cmd_a", trace(201));
+        record_in(&ring, "cmd_a", trace(202));
 
-        let got = drain_since("cmd_a", start);
+        let got = drain_since_in(&ring, "cmd_a", start);
         let statuses: Vec<u16> = got.iter().map(|t| t.status).collect();
         // The pre-snapshot 200 is excluded; both post-snapshot traces are in order.
         assert_eq!(statuses, vec![201, 202]);
@@ -204,15 +270,29 @@ mod tests {
 
     #[test]
     fn drain_since_filters_by_command() {
-        let start = current_seq();
-        record("cmd_b", trace(200));
-        record("cmd_c", trace(500));
+        let ring = TraceRing::new();
+        let start = current_seq_in(&ring);
+        record_in(&ring, "cmd_b", trace(200));
+        record_in(&ring, "cmd_c", trace(500));
 
-        let got = drain_since("cmd_b", start);
+        let got = drain_since_in(&ring, "cmd_b", start);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].status, 200);
         // A different command's trace never bleeds across.
-        assert!(drain_since("cmd_b", start).iter().all(|t| t.status != 500));
+        assert!(drain_since_in(&ring, "cmd_b", start)
+            .iter()
+            .all(|t| t.status != 500));
+    }
+
+    /// Two rings share nothing — the property every other ring test relies on.
+    #[test]
+    fn rings_are_independent() {
+        let a = TraceRing::new();
+        let b = TraceRing::new();
+        record_in(&a, "cmd_a", trace(200));
+        assert_eq!(current_seq_in(&a), 1);
+        assert_eq!(current_seq_in(&b), 0);
+        assert!(drain_since_in(&b, "cmd_a", 0).is_empty());
     }
 
     #[test]
@@ -260,11 +340,190 @@ mod tests {
 
     #[test]
     fn ring_is_bounded() {
-        let start = current_seq();
+        let ring = TraceRing::new();
+        let start = current_seq_in(&ring);
         for _ in 0..(RING_CAPACITY + 10) {
-            record("cmd_ring", trace(200));
+            record_in(&ring, "cmd_ring", trace(200));
         }
-        // Never grows past capacity, even though more were recorded.
-        assert!(drain_since("cmd_ring", start).len() <= RING_CAPACITY);
+        // Never grows past capacity, even though more were recorded. Exact,
+        // not `<=`: on a private ring the only writer is this loop.
+        assert_eq!(
+            drain_since_in(&ring, "cmd_ring", start).len(),
+            RING_CAPACITY
+        );
+    }
+
+    // ---- the public API stays a pure delegation to the one static ----
+
+    /// The production half of this file, with the test module cut off — the
+    /// same rule as `wedge_diagnostics.rs`'s pins: a pin must never scan
+    /// `#[cfg(test)]` code, or its negative assertions match their own string
+    /// literals.
+    fn prod_part(src: &str) -> &str {
+        src.split_once("\n#[cfg(test)]\nmod ")
+            .map_or(src, |(before, _)| before)
+    }
+
+    /// Strip whole-line comments, then all whitespace, so the pin matches
+    /// regardless of how `rustfmt` wrapped a line and never trips on the body
+    /// comment that explains the delegation.
+    fn squeezed_code(src: &str) -> String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(|l| l.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    /// Every `static` declaration in `src`, as its line with the leading
+    /// visibility stripped — `pub static`, `pub(crate) static`,
+    /// `pub(super) static`, `pub(in path) static` all read as `static …`, so a
+    /// second global reintroduced with a visibility does not slip past a
+    /// `starts_with("static ")` check (a pre-PR review found exactly that
+    /// hole). Whole-line comments are skipped, since the docs here name
+    /// `static` in prose.
+    fn declared_statics(src: &str) -> Vec<&str> {
+        src.lines()
+            .map(str::trim_start)
+            .filter(|l| !l.starts_with("//"))
+            .filter_map(|l| {
+                let rest = if let Some(after) = l.strip_prefix("pub") {
+                    // `pub`, `pub(crate)`, `pub(super)`, `pub(in a::b)`.
+                    let after = after.trim_start();
+                    let after = match after.strip_prefix('(') {
+                        Some(inner) => inner.split_once(')').map(|(_, r)| r)?,
+                        None => after,
+                    };
+                    after.trim_start()
+                } else {
+                    l
+                };
+                rest.starts_with("static ").then_some(rest)
+            })
+            .collect()
+    }
+
+    /// The mutant the visibility-stripping exists for: a second global
+    /// reintroduced as `pub static` / `pub(crate) static` / `pub(in …) static`
+    /// is SEEN, so the one-static assertion above goes red on it. A doc line
+    /// naming `static` in prose is not.
+    #[test]
+    fn a_static_behind_a_visibility_is_still_a_static() {
+        const MUTANT: &str = "\
+/// a doc that says static in prose
+static ONE: T = T::new();
+pub static SEQ: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static TWO: T = T::new();
+pub(super) static THREE: T = T::new();
+pub(in crate::x) static FOUR: T = T::new();
+fn not_a_static() {}
+// static in a comment
+";
+        assert_eq!(
+            declared_statics(MUTANT),
+            vec![
+                "static ONE: T = T::new();",
+                "static SEQ: AtomicU64 = AtomicU64::new(0);",
+                "static TWO: T = T::new();",
+                "static THREE: T = T::new();",
+                "static FOUR: T = T::new();",
+            ]
+        );
+    }
+
+    /// The raw and squeezed body of the production fn whose signature line
+    /// starts with `signature`. Panics — rather than returning an empty slice
+    /// that would pass every negative assertion — when the signature is absent.
+    fn wrapper_body<'a>(prod: &'a str, signature: &str) -> (&'a str, String) {
+        let start = prod.find(signature).unwrap_or_else(|| {
+            panic!(
+                "this pin could not find `{signature}` in the production half of \
+                 this module. If the wrapper was renamed or its signature \
+                 reformatted, update this pin in the same change — otherwise it \
+                 silently stops guarding anything."
+            )
+        });
+        let body_start = start
+            + prod[start..]
+                .find('{')
+                .expect("the wrapper must have a body");
+        let body_end = body_start
+            + prod[body_start..]
+                .find("\n}\n")
+                .expect("the wrapper's body must be closed at column 0");
+        let raw = &prod[body_start..body_end];
+        let squeezed = squeezed_code(raw);
+        // Both bounds, loose on top: a collapsed slice asserts nothing, and a
+        // slice that ran away past several fns is a parse failure rather than
+        // an edit. A wrapper that merely grew a body of its own lands well
+        // inside the bound, so it is named by the delegation assertion in the
+        // caller, not mis-reported as a parse error here (a 3-line own body
+        // squeezes to ~140 chars; a real delegation to ~20–40).
+        assert!(
+            (10..1000).contains(&squeezed.len()),
+            "the pin sliced a {}-char body out of `{signature}` — it is \
+             mis-parsing, and in one direction or the other that leaves it \
+             vacuous. Raw slice:\n{raw}",
+            squeezed.len()
+        );
+        (raw, squeezed)
+    }
+
+    /// **The public API is three one-line delegations to `&RING`, and the
+    /// production half declares exactly one static.** Population-independent,
+    /// which no runtime assertion against the global ring can be: the `_in`
+    /// functions are what the ring tests cover, so a wrapper that grows its own
+    /// `lock()`/`fetch_add` body — or a second `static` beside `RING` — is code
+    /// nothing covers and the shared-state class this handle removed.
+    ///
+    /// `include_str!` rather than a directory walk: the compiler resolves it,
+    /// so this pin cannot scan the wrong tree and pass vacuously.
+    #[test]
+    fn the_public_ring_api_only_delegates() {
+        const SRC: &str = include_str!("outbound_trace.rs");
+        let prod = prod_part(SRC);
+
+        for (signature, expected) in [
+            ("pub fn current_seq() -> u64", "current_seq_in(&RING)"),
+            (
+                "pub fn record(command: &'static str, trace: OutboundTrace)",
+                "record_in(&RING,command,trace)",
+            ),
+            (
+                "pub fn drain_since(command: &str, since_seq: u64) -> Vec<OutboundTrace>",
+                "drain_since_in(&RING,command,since_seq)",
+            ),
+        ] {
+            let (raw, body) = wrapper_body(prod, signature);
+            assert_eq!(
+                body,
+                format!("{{{expected}"),
+                "`{signature}` is no longer a pure delegation to `{expected}`. If \
+                 this is a deliberate signature change and the wrapper is STILL a \
+                 one-line delegation, update this pin's expected spelling in the \
+                 same change. Body is now:\n{raw}"
+            );
+        }
+
+        // ONE static. A `static SEQ` (or a `pub static SEQ` — the visibility is
+        // stripped by `declared_statics`) or an `OnceLock` ring reintroduced
+        // anywhere in the production half — inside a fn body included — is the
+        // second global this handle exists to prevent.
+        let statics = declared_statics(prod);
+        assert_eq!(
+            statics,
+            vec!["static RING: TraceRing = TraceRing::new();"],
+            "the production half must declare exactly one static, `RING`. A \
+             second one is shared mutable state that every test of this binary \
+             would see again; give it a field on `TraceRing` instead. Found:\n{}",
+            statics.join("\n")
+        );
+        // Comments stripped first: `TraceRing`'s own doc names `OnceLock` in
+        // prose to explain why there is none.
+        assert!(
+            !squeezed_code(prod).contains("OnceLock"),
+            "`OnceLock` is back in the production half — `TraceRing::new` is \
+             `const`, so the static needs no lazy init"
+        );
     }
 }
