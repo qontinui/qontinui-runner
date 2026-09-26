@@ -155,8 +155,14 @@ pub(crate) fn comment_mask(lines: &[&str]) -> Vec<bool> {
 }
 
 /// Line spans covered by a `#[cfg(test)] mod … { … }`.
+///
+/// The module's end is found by counting braces in CODE only
+/// ([`code_brace_counts`]): a `{` inside a string, char literal or comment does
+/// not open anything. Counting raw `{`/`}` characters left a module whose tests
+/// contain an unbalanced literal (`"{not json"`) open to end of file — no span
+/// at all, so every test call in it read as production code.
 pub(crate) fn test_spans(lines: &[&str]) -> Vec<(usize, usize)> {
-    let comments = comment_mask(lines);
+    let braces = code_brace_counts(lines);
     let mut spans = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         if !line.trim_start().starts_with("#[cfg(test)]") {
@@ -168,12 +174,9 @@ pub(crate) fn test_spans(lines: &[&str]) -> Vec<(usize, usize)> {
             continue;
         };
         let mut depth = 0usize;
-        for (j, l) in lines.iter().enumerate().skip(open) {
-            if comments[j] {
-                continue;
-            }
-            depth += l.matches('{').count();
-            depth = depth.saturating_sub(l.matches('}').count());
+        for (j, (opens, closes)) in braces.iter().enumerate().skip(open) {
+            depth += opens;
+            depth = depth.saturating_sub(*closes);
             if depth == 0 {
                 spans.push((open, j + 1));
                 break;
@@ -183,9 +186,113 @@ pub(crate) fn test_spans(lines: &[&str]) -> Vec<(usize, usize)> {
     spans
 }
 
+/// Per line, `(opening, closing)` braces that are CODE — not inside a string
+/// (`"…"`, `b"…"`), raw string (`r"…"`, `r#"…"#`, `br"…"`), char literal
+/// (`'{'`, `'\u{7b}'`), line comment or (nested) block comment. Literal and
+/// comment state carries across lines. A lifetime or label (`'a`) is code.
+pub(crate) fn code_brace_counts(lines: &[&str]) -> Vec<(usize, usize)> {
+    #[derive(Clone, Copy)]
+    enum State {
+        Code,
+        Block(usize),
+        Str,
+        Raw(usize),
+    }
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut state = State::Code;
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        let chars: Vec<char> = line.chars().collect();
+        let (mut opens, mut closes) = (0usize, 0usize);
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            let next = chars.get(i + 1).copied();
+            match state {
+                State::Block(depth) => {
+                    if c == '*' && next == Some('/') {
+                        state = if depth == 1 {
+                            State::Code
+                        } else {
+                            State::Block(depth - 1)
+                        };
+                        i += 1;
+                    } else if c == '/' && next == Some('*') {
+                        state = State::Block(depth + 1);
+                        i += 1;
+                    }
+                }
+                State::Str => {
+                    if c == '\\' {
+                        i += 1;
+                    } else if c == '"' {
+                        state = State::Code;
+                    }
+                }
+                State::Raw(hashes) => {
+                    if c == '"'
+                        && chars[i + 1..]
+                            .iter()
+                            .take(hashes)
+                            .filter(|h| **h == '#')
+                            .count()
+                            == hashes
+                    {
+                        state = State::Code;
+                        i += hashes;
+                    }
+                }
+                State::Code => {
+                    let prev_ident = i > 0 && is_ident(chars[i - 1]);
+                    if c == '/' && next == Some('/') {
+                        break;
+                    } else if c == '/' && next == Some('*') {
+                        state = State::Block(1);
+                        i += 1;
+                    } else if c == '"' {
+                        state = State::Str;
+                    } else if c == 'r'
+                        && (!prev_ident
+                            || (i == 1 && chars[0] == 'b')
+                            || (i >= 2 && chars[i - 1] == 'b' && !is_ident(chars[i - 2])))
+                    {
+                        let hashes = chars[i + 1..].iter().take_while(|h| **h == '#').count();
+                        if chars.get(i + 1 + hashes) == Some(&'"') {
+                            state = State::Raw(hashes);
+                            i += hashes + 1;
+                        }
+                    } else if c == '\'' {
+                        // A char literal is `'x'` or `'\…'`; anything else is a
+                        // lifetime or label.
+                        if next == Some('\\') {
+                            let close = chars[i + 2..].iter().position(|ch| *ch == '\'');
+                            i = close.map_or(chars.len(), |p| i + 2 + p);
+                        } else if chars.get(i + 2) == Some(&'\'') {
+                            i += 2;
+                        }
+                    } else if c == '{' {
+                        opens += 1;
+                    } else if c == '}' {
+                        closes += 1;
+                    }
+                }
+            }
+            i += 1;
+        }
+        out.push((opens, closes));
+    }
+    out
+}
+
 pub(crate) fn fn_decl_re() -> Regex {
-    Regex::new(r"^(\s*)(?:pub(?:\([a-z]+\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)")
-        .expect("fn decl regex")
+    // Visibility (`pub`, `pub(crate)`, `pub(in path)`) then any qualifiers —
+    // `const`, `async`, `unsafe`, `extern` with or without an ABI string — so a
+    // qualified fn is its own enclosing fn rather than being attributed to
+    // whatever plain `fn` precedes it.
+    Regex::new(
+        r#"^(\s*)(?:pub(?:\([^)]*\))?\s+)?(?:(?:const|async|unsafe|extern(?:\s+"[^"]*")?)\s+)*fn\s+([A-Za-z_][A-Za-z0-9_]*)"#,
+    )
+    .expect("fn decl regex")
 }
 
 /// The spawn primitives. Multi-line: a receiver on one line and `.create(` on
@@ -937,5 +1044,23 @@ fn a_star_led_code_line_is_code_and_a_block_comment_is_not() {
     assert_eq!(
         comment_mask(&lines),
         vec![false, false, true, true, true, true, true, false]
+    );
+}
+
+/// Braces are counted in CODE only: literals and comments of every shape are
+/// skipped, lifetimes are not mistaken for char literals, and literal/comment
+/// state carries across lines.
+#[test]
+fn code_brace_counts_skip_literals_and_comments() {
+    let lines = [
+        r#"fn f<'a>(x: &'a str) -> char { let s = "{"; let b = b"}}"; '{' }"#,
+        r##"    let r = r#"{ "}" {"#; let br = br"{"; let e = '\u{7b}';"##,
+        "    /* { /* nested } */ { */ // }",
+        r#"    let multi = "line one {"#,
+        r#"    line two }"; }"#,
+    ];
+    assert_eq!(
+        code_brace_counts(&lines),
+        vec![(1, 1), (0, 0), (0, 0), (0, 0), (0, 1)]
     );
 }

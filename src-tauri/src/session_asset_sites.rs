@@ -118,8 +118,9 @@ fn site(file: &str, func: &str) -> Site {
 }
 
 /// Every `(file, enclosing fn)` making a non-test call of `token` (`name(`).
-/// Comment lines and `#[cfg(test)] mod` spans are blanked first, and a call in
-/// a test fn ([`is_test_fn`]) is dropped. A match on a fn-declaration line is
+/// Comment lines and `#[cfg(test)] mod` spans are blanked first (the span's end
+/// is found by counting only CODE braces, so a `"{"` literal in a test cannot
+/// hold the module open). A match on a fn-declaration line is
 /// a call unless that line declares `name` itself.
 fn calls_of(sources: &Sources, token: &str) -> BTreeSet<Site> {
     let re = token_re(token);
@@ -153,40 +154,14 @@ fn calls_of(sources: &Sources, token: &str) -> BTreeSet<Site> {
             if decl.captures(code[line]).is_some_and(|c| &c[2] == name) {
                 continue;
             }
-            let Some((at, enclosing)) = (0..=line)
+            let enclosing = (0..=line)
                 .rev()
-                .find_map(|j| decl.captures(lines[j]).map(|c| (j, c[2].to_string())))
-            else {
-                out.insert((file.clone(), "<file scope>".to_string()));
-                continue;
-            };
-            // A test FN is not a caller either. `test_spans` finds a test module
-            // by brace-counting, which an unbalanced brace in a string literal
-            // can end early; the attribute block directly above the enclosing
-            // declaration is the second, independent signal.
-            if is_test_fn(&lines, at) {
-                continue;
-            }
+                .find_map(|j| decl.captures(lines[j]).map(|c| c[2].to_string()))
+                .unwrap_or_else(|| "<file scope>".to_string());
             out.insert((file.clone(), enclosing));
         }
     }
     out
-}
-
-/// Whether the fn declared at `lines[at]` carries a `#[test]`,
-/// `#[tokio::test…]` or `#[cfg(test)]` attribute in the attribute/doc block
-/// directly above it.
-fn is_test_fn(lines: &[&str], at: usize) -> bool {
-    lines[..at]
-        .iter()
-        .rev()
-        .map(|l| l.trim_start())
-        .take_while(|t| t.starts_with("#[") || t.starts_with("//"))
-        .any(|t| {
-            t.starts_with("#[test]")
-                || t.starts_with("#[tokio::test")
-                || t.starts_with("#[cfg(test)]")
-        })
 }
 
 /// `token -> callers` that are not the token's allowed caller. PURE.
@@ -393,7 +368,6 @@ fn an_inline_provision_on_a_new_spawn_path_is_caught() {
          // provision_fleet_skills_for_session(workdir) — a comment is not a call\n    \
          crate::fleet_commands::provision_fleet_commands_for_session(\n        workdir,\n    );\n}\n\
          fn one_liner(d: &Path) { crate::fleet_agents::provision_fleet_agents_into(d, &t); }\n\
-         #[test]\n#[cfg(unix)]\nfn stray_test() { provision_fleet_skills_for_session(\"x\"); }\n\
          #[cfg(test)]\nmod tests {\n    fn t() { super::provision_agent_definitions_from_root(None, \"x\"); }\n}\n"
             .to_string(),
     );
@@ -423,5 +397,49 @@ fn an_inline_provision_on_a_new_spawn_path_is_caught() {
             "provision_fleet_commands_for_session(",
             "provision_fleet_skills_for_session(",
         ]
+    );
+}
+
+/// A test module whose body holds an unbalanced `"{"` literal is still masked
+/// to its real closing brace: the call inside it is not a caller, and the
+/// production fn after it is. Before the scanner was literal-aware the module
+/// never closed, so the production call below it was silently masked too.
+#[test]
+fn a_brace_in_a_test_string_does_not_hold_the_test_module_open() {
+    let mut sources = Sources::new();
+    sources.insert(
+        "fixture.rs".to_string(),
+        "#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n        \
+         let bad = \"{not json\";\n        let c = '{';\n        \
+         let r = r#\"{{\"#;\n        provision_fleet_skills_for_session(bad);\n    }\n}\n\
+         fn prod_after(w: &str) {\n    provision_fleet_skills_for_session(w);\n}\n"
+            .to_string(),
+    );
+    assert_eq!(
+        calls_of(&sources, "provision_fleet_skills_for_session("),
+        BTreeSet::from([site("fixture.rs", "prod_after")])
+    );
+}
+
+/// A qualified production fn (`pub(in …) unsafe fn`, `const fn`, `extern "C"
+/// fn`) is its own enclosing fn — not attributed to the plain `fn` above it.
+#[test]
+fn a_qualified_fn_is_its_own_caller() {
+    let mut sources = Sources::new();
+    sources.insert(
+        "fixture.rs".to_string(),
+        "#[test]\nfn bar() {}\n\
+         pub(in crate::x) unsafe fn prod(w: &str) {\n    provision_fleet_skills_for_session(w);\n}\n\
+         const fn c() {}\n\
+         pub extern \"C\" fn ffi(w: &str) {\n    provision_fleet_commands_for_session(w);\n}\n"
+            .to_string(),
+    );
+    assert_eq!(
+        calls_of(&sources, "provision_fleet_skills_for_session("),
+        BTreeSet::from([site("fixture.rs", "prod")])
+    );
+    assert_eq!(
+        calls_of(&sources, "provision_fleet_commands_for_session("),
+        BTreeSet::from([site("fixture.rs", "ffi")])
     );
 }
