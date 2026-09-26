@@ -1463,6 +1463,7 @@ mod tests {
             observed_at_unix: 0,
             attributable: true,
             composed_reason: None,
+            pinned_tenant: false,
         }
     }
 
