@@ -1316,6 +1316,10 @@ pub struct TerminalSession {
     is_alive: Arc<AtomicBool>,
     /// Exit code (set when process exits).
     exit_code: Arc<Mutex<Option<i32>>>,
+    /// Set by the waiter the moment the pane's `wait()` returns — Ok OR Err —
+    /// i.e. the child has been reaped and its pid may be reused. Distinct from
+    /// [`Self::exit_code`], which stays `None` when the wait itself failed.
+    child_reaped: Arc<AtomicBool>,
     /// Handle to the reader thread (for join on cleanup).
     reader_join: Mutex<Option<thread::JoinHandle<()>>>,
     /// Handle to the waiter thread (for join on cleanup).
@@ -2162,6 +2166,8 @@ impl TerminalSession {
         let waiter_title = title.clone();
         let waiter_alive = is_alive.clone();
         let waiter_exit = exit_code.clone();
+        let child_reaped = Arc::new(AtomicBool::new(false));
+        let waiter_reaped = child_reaped.clone();
         // Retain a clone for the session struct (input-line warn hook)
         // before the original handle is moved into the waiter thread.
         let session_app_handle = app_handle.clone();
@@ -2180,6 +2186,9 @@ impl TerminalSession {
                         None
                     }
                 };
+                // Reaped whether or not the wait produced a code: the close
+                // path must not signal this pid again.
+                waiter_reaped.store(true, Ordering::SeqCst);
 
                 // Record the exit code BEFORE clearing `is_alive`. The other
                 // order left a window in which a refused write reported
@@ -2265,6 +2274,7 @@ impl TerminalSession {
             rows: AtomicU16::new(rows),
             is_alive,
             exit_code,
+            child_reaped,
             reader_join: Mutex::new(Some(reader_handle)),
             waiter_join: Mutex::new(Some(waiter_handle)),
             bytes_sent,
@@ -4351,11 +4361,13 @@ impl TerminalSession {
     /// ([`Self::close_after_graceful_exit`]); every other teardown step runs.
     fn close_inner(&self, deadline: Option<std::time::Instant>, kill_child: bool) {
         info!(terminal_id = %self.id, "Closing terminal session");
-        // Read BEFORE `is_alive` flips: the waiter thread records the child's
-        // exit here when it reaps it, so `Some` means the pane's process was
-        // already gone before this close began — whatever the kill below
-        // reports (a `taskkill` of a dead pid exits non-zero).
-        let exited_before_close = self.exit_code().is_some();
+        // Read BEFORE `is_alive` flips: the waiter sets `child_reaped` the
+        // moment its wait returns (Ok or Err — a failed wait records no exit
+        // code but is still a reap), so `true` means the pane's process was
+        // already gone before this close began. A reap that lands AFTER this
+        // read is covered by the pane itself: `LocalPty::kill` refuses to signal
+        // a reaped child.
+        let exited_before_close = self.child_reaped.load(Ordering::SeqCst);
         self.is_alive.store(false, Ordering::Relaxed);
 
         // Phase 2 — drop the isolated edit context first so the
@@ -5058,6 +5070,7 @@ mod tests {
             // join nonexistent reader/waiter threads.
             is_alive: Arc::new(AtomicBool::new(false)),
             exit_code: Arc::new(Mutex::new(None)),
+            child_reaped: Arc::new(AtomicBool::new(false)),
             reader_join: Mutex::new(None),
             waiter_join: Mutex::new(None),
             bytes_sent: Arc::new(AtomicU64::new(0)),
@@ -5216,7 +5229,9 @@ mod tests {
         session.id = id;
         let pane: Arc<dyn crate::terminal::pane_io::PaneIo> = io.clone();
         session.io = pane;
-        *session.exit_code.lock().unwrap() = Some(0);
+        // Reaped with a FAILED wait: no exit code, still reaped (round 6).
+        session.child_reaped.store(true, Ordering::SeqCst);
+        assert!(session.exit_code().is_none());
         session.close();
         assert_eq!(io.kills(), 0, "a reaped pid must never be signalled");
         assert!(

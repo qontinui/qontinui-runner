@@ -172,6 +172,7 @@ impl OpenedPty {
             pid,
             master: Mutex::new(Some(pair.master)),
             child: Mutex::new(Some(child)),
+            reap_gate: ReapGate::default(),
         })
     }
 }
@@ -183,8 +184,47 @@ pub struct LocalPty {
     pid: Option<u32>,
     /// `None` once [`PaneIo::release`] has dropped the OS handle.
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
-    /// `None` once the waiter thread has taken it via [`PaneIo::wait`].
+    /// `None` once the waiter thread has taken it via [`PaneIo::wait`] — which
+    /// happens BEFORE it blocks, so `None` means "being waited on", not
+    /// "reaped". [`LocalPty::reap_gate`] is the reaped state.
     child: Mutex<Option<Box<dyn Child + Send + Sync>>>,
+    /// Marked the moment [`PaneIo::wait`] returns (Ok or Err): the child has
+    /// been reaped and its pid may be reused. [`PaneIo::kill`] signals only
+    /// while holding this gate and only if it is not marked.
+    reap_gate: ReapGate,
+}
+
+/// The reaped state of a pane's child, shared by the waiter (which marks it)
+/// and `kill` (which must never signal a reaped pid — the pid may already
+/// belong to an unrelated process, e.g. a live Claude Code session).
+///
+/// `kill` holds the gate for the whole signal, and `wait` marks it under the
+/// same lock as soon as the blocking wait returns, so a kill either signals
+/// before the waiter records the reap or sees the reap and does nothing.
+/// Residual, stated: the kernel reaps inside the blocking `waitpid`, a few
+/// instructions before the mark — a kill landing in exactly that window would
+/// still signal the just-freed pid, and only matters if the OS reused it that
+/// fast.
+#[derive(Default)]
+struct ReapGate(Mutex<bool>);
+
+impl ReapGate {
+    fn mark_reaped(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    }
+
+    /// Run `signal` unless the child is already reaped — then `Ok(())`, since
+    /// the tree is gone.
+    fn signal_unless_reaped(
+        &self,
+        signal: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let reaped = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if *reaped {
+            return Ok(());
+        }
+        signal()
+    }
 }
 
 impl LocalPty {
@@ -223,6 +263,43 @@ fn kill_result(pid: u32, rc: i32, err: std::io::Error) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("kill(SIGTERM) of pid {pid} failed: {err}"))
+    }
+}
+
+/// Signal the pane's process tree: `taskkill /F /T` on Windows, `SIGTERM` to
+/// the direct child elsewhere. Called only through [`ReapGate`].
+fn signal_pane_tree(pid: u32, budget: Duration) -> Result<(), String> {
+    // `/T` is CORRECT here: this is the terminal's OWN shell and whatever
+    // it spawned, and leaving that tree behind is precisely the process
+    // leak this call exists to prevent. It is categorically different from
+    // `/T` on the runner's own PID.
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = crate::process_helpers::no_window("taskkill");
+        cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
+        match crate::drain::output_with_timeout(cmd, budget) {
+            // Exit 128 is "process not found": the shell already exited —
+            // the Windows analogue of `ESRCH`, so the tree IS gone.
+            Ok(Some(out)) if taskkill_tree_gone(out.status.code()) => Ok(()),
+            // A non-zero taskkill exit is a failed kill, not a success:
+            // callers (the terminal-key revoke at close) key on it.
+            Ok(Some(out)) => Err(format!(
+                "taskkill of pid {pid} exited {} — the tree may still be alive: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+            Ok(None) => Err(format!(
+                "taskkill of pid {pid} exceeded its {budget:?} budget — abandoned"
+            )),
+            Err(e) => Err(format!("taskkill of pid {pid} could not be spawned: {e}")),
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = budget;
+        // SAFETY: `kill(2)` with a plain pid and signal; no memory is touched.
+        let rc = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        kill_result(pid, rc, std::io::Error::last_os_error())
     }
 }
 
@@ -284,7 +361,11 @@ impl PaneIo for LocalPty {
         let Some(mut child) = child else {
             return Err("child already waited on".to_string());
         };
-        let status = child.wait().map_err(|e| e.to_string())?;
+        let waited = child.wait();
+        // Reaped (or the wait failed, which leaves no state we could safely
+        // signal either): `kill` must not touch this pid again.
+        self.reap_gate.mark_reaped();
+        let status = waited.map_err(|e| e.to_string())?;
         // ExitStatus doesn't expose the code directly on all platforms via
         // portable-pty. Use success() check; non-zero falls back to 1.
         Ok(if status.success() { 0 } else { 1 })
@@ -294,38 +375,9 @@ impl PaneIo for LocalPty {
         let Some(pid) = self.pid else {
             return Ok(());
         };
-        // `/T` is CORRECT here: this is the terminal's OWN shell and whatever
-        // it spawned, and leaving that tree behind is precisely the process
-        // leak this call exists to prevent. It is categorically different from
-        // `/T` on the runner's own PID.
-        #[cfg(target_os = "windows")]
-        {
-            let mut cmd = crate::process_helpers::no_window("taskkill");
-            cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
-            match crate::drain::output_with_timeout(cmd, budget) {
-                // Exit 128 is "process not found": the shell already exited —
-                // the Windows analogue of `ESRCH`, so the tree IS gone.
-                Ok(Some(out)) if taskkill_tree_gone(out.status.code()) => Ok(()),
-                // A non-zero taskkill exit is a failed kill, not a success:
-                // callers (the terminal-key revoke at close) key on it.
-                Ok(Some(out)) => Err(format!(
-                    "taskkill of pid {pid} exited {} — the tree may still be alive: {}",
-                    out.status,
-                    String::from_utf8_lossy(&out.stderr).trim()
-                )),
-                Ok(None) => Err(format!(
-                    "taskkill of pid {pid} exceeded its {budget:?} budget — abandoned"
-                )),
-                Err(e) => Err(format!("taskkill of pid {pid} could not be spawned: {e}")),
-            }
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = budget;
-            // SAFETY: `kill(2)` with a plain pid and signal; no memory is touched.
-            let rc = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-            kill_result(pid, rc, std::io::Error::last_os_error())
-        }
+        // Never signal a reaped pid (see [`ReapGate`]).
+        self.reap_gate
+            .signal_unless_reaped(|| signal_pane_tree(pid, budget))
     }
 
     fn set_paused(&self, _paused: bool) -> Result<(), String> {
@@ -400,6 +452,28 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    /// Round 6: once the child is reaped, `kill` never signals — the pid may
+    /// be reused — and reports the tree gone; before, it signals.
+    #[test]
+    fn the_reap_gate_never_signals_a_reaped_child() {
+        let gate = ReapGate::default();
+        let mut calls = 0;
+        assert!(gate
+            .signal_unless_reaped(|| {
+                calls += 1;
+                Ok(())
+            })
+            .is_ok());
+        assert_eq!(calls, 1, "a live child is signalled");
+        gate.mark_reaped();
+        let got = gate.signal_unless_reaped(|| {
+            calls += 1;
+            Err("must not be called".to_string())
+        });
+        assert_eq!(got, Ok(()), "a reaped child's tree is gone");
+        assert_eq!(calls, 1, "a reaped pid is never signalled");
+    }
 
     #[test]
     fn taskkill_exit_128_means_the_tree_is_already_gone() {

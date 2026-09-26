@@ -4171,8 +4171,15 @@ fn queue_nonce_snapshot(
             return None;
         }
     };
+    let matches_in_flight = q.in_flight.as_ref() == Some(&snapshot);
     let newest_durable = q.in_flight.as_ref().or(q.last_written.as_ref());
     if newest_durable == Some(&snapshot) && q.pending.is_none() {
+        if matches_in_flight {
+            // The in-flight write IS this state: it has not landed yet, and if
+            // it fails it is re-queued — give it a full retry budget, as an
+            // enqueue of a new snapshot always did.
+            q.failed_attempts = 0;
+        }
         return Some(QueueOutcome::Skipped);
     }
     q.pending = Some(snapshot);
@@ -24332,5 +24339,37 @@ mod terminal_env_reference_tests {
             queue_nonce_snapshot(&queue, s1),
             Some(QueueOutcome::Skipped)
         );
+    }
+
+    /// Round 6 / item 3: an enqueue deduped against the IN-FLIGHT snapshot
+    /// resets the retry budget, so a failure of that write retries in full.
+    #[test]
+    fn a_skip_against_the_in_flight_write_resets_the_retry_budget() {
+        let s = NoncePersistSnapshot {
+            bindings: HashMap::from([(
+                "k".to_string(),
+                crate::secure_storage::StoredNonceBinding::default(),
+            )]),
+            graced: HashMap::new(),
+        };
+        let queue = Mutex::new(NoncePersistQueue {
+            in_flight: Some(s.clone()),
+            failed_attempts: 2,
+            ..Default::default()
+        });
+        assert_eq!(
+            queue_nonce_snapshot(&queue, s.clone()),
+            Some(QueueOutcome::Skipped)
+        );
+        assert_eq!(queue.lock().unwrap().failed_attempts, 0);
+
+        // A skip against LAST_WRITTEN (nothing in flight) leaves it alone.
+        let queue = Mutex::new(NoncePersistQueue {
+            last_written: Some(s.clone()),
+            failed_attempts: 2,
+            ..Default::default()
+        });
+        assert_eq!(queue_nonce_snapshot(&queue, s), Some(QueueOutcome::Skipped));
+        assert_eq!(queue.lock().unwrap().failed_attempts, 2);
     }
 }
