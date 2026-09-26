@@ -10,6 +10,7 @@ import { useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { workflowGeneratorService, type GeneratorConfig, type GeneratorOptions } from "../services";
 import type { UnifiedWorkflow } from "../types/unified-workflow";
+import { describeThrown } from "@/lib/utils";
 
 // =============================================================================
 // Types
@@ -250,7 +251,7 @@ export function useWorkflowGenerator(): UseWorkflowGeneratorReturn {
         setHasConfig(true);
         return { success: true, workflow };
       } catch (err) {
-        const errorMsg = err instanceof Error ? err.message : "Failed to generate workflow";
+        const errorMsg = describeThrown(err, "Failed to generate workflow");
         setError(errorMsg);
         return { success: false, error: errorMsg };
       } finally {

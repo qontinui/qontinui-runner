@@ -3,6 +3,7 @@ import type { UnifiedWorkflow } from "../../types";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { createLogger } from "@/lib/logger";
 import { invokeOperatorDoor } from "@/lib/operatorDoors";
+import { describeThrown } from "@/lib/utils";
 
 const log = createLogger("WorkflowBuilder");
 
@@ -157,7 +158,7 @@ export function useWorkflowExecution({
         }
         setTimeout(() => execDispatch({ type: "SET_SUCCESS", message: null }), 5000);
       } catch (error) {
-        const errorMsg = error instanceof Error ? error.message : "Failed to start workflow";
+        const errorMsg = describeThrown(error, "Failed to start workflow");
         execDispatch({ type: "SET_ERROR", error: errorMsg });
       } finally {
         execDispatch({ type: "STOP_EXECUTING" });
@@ -266,7 +267,7 @@ export function useWorkflowExecution({
         setWorkflow(savedWorkflow);
         await executeWorkflowRun(savedWorkflow.id);
       } catch (err) {
-        const msg = err instanceof Error ? err.message : "Failed to save and run spec workflow";
+        const msg = describeThrown(err, "Failed to save and run spec workflow");
         execDispatch({ type: "SET_ERROR", error: msg });
       }
     },

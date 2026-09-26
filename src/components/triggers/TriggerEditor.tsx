@@ -7,6 +7,7 @@ import type {
   UpdateTriggerRequest,
 } from "../../types/triggers";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 interface WorkflowOption {
   id: string;
@@ -49,7 +50,7 @@ function validateRegex(pattern: string): string | undefined {
     new RegExp(pattern);
     return undefined;
   } catch (e) {
-    return `Invalid regex: ${e instanceof Error ? e.message : "syntax error"}`;
+    return `Invalid regex: ${describeThrown(e, "syntax error")}`;
   }
 }
 
@@ -60,7 +61,7 @@ function validateJson(text: string): string | undefined {
     JSON.parse(text);
     return undefined;
   } catch (e) {
-    return `Invalid JSON: ${e instanceof Error ? e.message : "syntax error"}`;
+    return `Invalid JSON: ${describeThrown(e, "syntax error")}`;
   }
 }
 

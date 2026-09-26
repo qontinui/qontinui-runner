@@ -9,6 +9,7 @@
 
 import { useCallback, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { describeThrown } from "@/lib/utils";
 
 /**
  * Information about a bridge instance.
@@ -157,7 +158,7 @@ export function useBridgeExecution(): UseBridgeExecutionResult {
           return { success: false, error: errorMsg };
         }
       } catch (err) {
-        const errorMsg = err instanceof Error ? err.message : String(err);
+        const errorMsg = describeThrown(err, "Failed to run workflow on bridge");
         setError(errorMsg);
         return { success: false, error: errorMsg };
       } finally {
@@ -192,7 +193,7 @@ export function useBridgeExecution(): UseBridgeExecutionResult {
           return { success: false, error: errorMsg };
         }
       } catch (err) {
-        const errorMsg = err instanceof Error ? err.message : String(err);
+        const errorMsg = describeThrown(err, "Failed to transfer GUI lock");
         setError(errorMsg);
         return { success: false, error: errorMsg };
       } finally {
@@ -218,7 +219,7 @@ export function useBridgeExecution(): UseBridgeExecutionResult {
       }
       return [];
     } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
+      const errorMsg = describeThrown(err, "Failed to list bridges");
       setError(errorMsg);
       return [];
     } finally {
@@ -243,7 +244,7 @@ export function useBridgeExecution(): UseBridgeExecutionResult {
       }
       return null;
     } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
+      const errorMsg = describeThrown(err, "Failed to get bridge info");
       setError(errorMsg);
       return null;
     } finally {

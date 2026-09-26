@@ -55,7 +55,7 @@ import type { RegistryLike, QueryableElement } from "@qontinui/ui-bridge-auto/ru
 // invisible to the projection.
 import { getGlobalRegistry } from "@qontinui/ui-bridge";
 import { createLogger } from "@/lib/logger";
-import { getErrorMessage } from "@/lib/utils";
+import { describeThrown } from "@/lib/utils";
 
 const log = createLogger("ScenarioProjectionHandler");
 
@@ -176,7 +176,7 @@ export function useScenarioProjectionHandler(): void {
               result,
             };
           } catch (err) {
-            const message = getErrorMessage(err);
+            const message = describeThrown(err, "projectCurrentScenario failed");
             log.debug(`projectCurrentScenario threw: ${message}`);
             response = {
               request_id,
