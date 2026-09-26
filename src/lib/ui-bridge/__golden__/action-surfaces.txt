@@ -12,8 +12,8 @@
 #   builtin: 15
 #   fixture: 33
 
-src/App.tsx:216	literal	component	complete	schema=no	arity=0	effect=write
-src/App.tsx:232	guarded	component	go-to-step	schema=yes	arity=-	effect=read
+src/App.tsx:217	literal	component	complete	schema=no	arity=0	effect=write
+src/App.tsx:233	guarded	component	go-to-step	schema=yes	arity=-	effect=read
 src/components/active-dashboard/ActiveDashboardPage.tsx:89	literal	component	start-run	schema=no	arity=0	effect=read
 src/components/active-dashboard/ActiveDashboardPage.tsx:109	literal	component	stop-run	schema=no	arity=0	effect=destructive
 src/components/active-dashboard/ActiveDashboardPage.tsx:120	literal	component	refresh	schema=no	arity=0	effect=read
