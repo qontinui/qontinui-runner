@@ -7142,7 +7142,8 @@ pub(crate) fn device_jwt_refreshing_error() -> (u16, String) {
 /// while a re-mint can still land. This arm used to return it unconditionally,
 /// BEFORE [`runner_credential_local_refusal`] ever ran, so a runner whose
 /// credential every automatic rung had already refused told every session to
-/// retry, indefinitely — and sessions spun on it for 18+ hours.
+/// retry, indefinitely — merytshost's posture read `expired` from 2026-09-24
+/// 05:03 CEST onward while sessions spun on the retryable 503.
 ///
 /// So the posture is consulted first. A refusal for THIS session's slot whose
 /// code is anything but `runner_credential_expired` (an expired credential is
@@ -20940,7 +20941,7 @@ mod runner_credential_tests {
     /// Phase 2. An EMPTY device bearer after the bounded re-mint wait used to
     /// answer the retryable 503 unconditionally, before the posture was ever
     /// consulted — so a runner every rung had refused told sessions "retry"
-    /// for 18+ hours. With the posture `unrefreshable` for this session's
+    /// from 2026-09-24 05:03 CEST onward. With the posture `unrefreshable` for this session's
     /// slot the answer is the non-retryable 401 naming the re-pair remedy.
     #[test]
     fn an_empty_bearer_on_an_unrefreshable_runner_is_a_401_not_a_503() {

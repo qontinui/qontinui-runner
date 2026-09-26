@@ -3438,7 +3438,35 @@ pub(crate) fn carry_legacy_conclusion(
     }
 }
 
+/// The no-tenant-slot branch's PRE-RECOVERY publish, factored out of
+/// `refresher_loop` so it is testable without a Tauri `ApiState`.
+///
+/// Reads the legacy slot through the tri-state probe (an unreadable store is
+/// UNKNOWN, never `absent`) and — when a previous pass PROVED this same dead
+/// credential unrefreshable ([`conclude_legacy_recovery_failure`]) — carries
+/// that conclusion, so the posture does not flip back to `expired` and
+/// re-fire the banner every tick.
+pub(crate) fn publish_legacy_slot_observation(
+    auth_manager: &crate::auth::AuthManager,
+    pins: PosturePinInputs,
+    now: i64,
+) -> Option<PostureTransition> {
+    let obs = match auth_manager.probe_access_token() {
+        crate::secure_storage::StoredTokenRead::Present(t) => {
+            SlotObservation::observed(None, Some(t.as_str()))
+        }
+        crate::secure_storage::StoredTokenRead::Absent => SlotObservation::observed(None, None),
+        crate::secure_storage::StoredTokenRead::Unreadable(_) => SlotObservation::unreadable(None),
+    };
+    let (obs, outcome_label) = carry_legacy_conclusion(obs);
+    derive_and_publish_posture_labelled(&[obs], pins, now, outcome_label)
+}
+
 /// Conclude a legacy-path pass whose recovery rungs all failed.
+///
+/// It also RETRACTS: when a previous pass concluded `Unrefreshable` and this
+/// one can no longer prove it, the carried conclusion is dropped and the
+/// plain observation republished (review W2).
 ///
 /// Called from the `refresher_loop` legacy failure tail (progress
 /// `BailRefreshFailedExpired` / `BailNoTenant`, the machine-key exchange
@@ -3463,12 +3491,33 @@ pub(crate) fn conclude_legacy_recovery_failure(
         Some(exp) => now >= exp,
         None => true, // absent or opaque — can never be presented
     };
-    let label = legacy_exhausted_outcome_label(
+    let Some(label) = legacy_exhausted_outcome_label(
         has_tenant_slots,
         dead,
         user_session_usable,
         machine_key_state(auth_manager, now),
-    )?;
+    ) else {
+        // The verdict can no longer be PROVED — a user session became usable,
+        // a machine key is now held, slots appeared, or the credential is
+        // live. A carried `Unrefreshable` from an earlier pass would then be
+        // a lie that outlives its evidence: drop it, and (on the legacy path)
+        // republish the plain pre-recovery observation so the posture says
+        // `expired` / `retry_refresh` again.
+        let carried = LEGACY_EXHAUSTED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .is_some();
+        if carried && !has_tenant_slots {
+            return derive_and_publish_posture_labelled(
+                &[SlotObservation::observed(None, held.as_deref())],
+                pins,
+                now,
+                None,
+            );
+        }
+        return None;
+    };
     let obs = legacy_exhausted_observation(held.as_deref());
     *LEGACY_EXHAUSTED.lock().unwrap_or_else(|e| e.into_inner()) =
         Some((obs.present, obs.exp, label));
@@ -3522,13 +3571,21 @@ const MACHINE_KEY_ENROL_TRANSIENT_BACKOFF_SECS: i64 = REFRESH_CHECK_INTERVAL.as_
 ///   `device_machine_key_revoked`) is terminal **for the bearer that got it**
 ///   — [`Self::refused_bearers`] holds a fingerprint, and that bearer is never
 ///   presented again; a NEW token (a refresh, a re-pair) is asked afresh;
-/// * a 409 `machine_key_still_usable` is terminal for the process
-///   ([`Self::terminal`]): web will not rotate a key it considers usable;
-/// * everything transient backs off via [`Self::next_attempt_at`].
+/// * a 409 `machine_key_still_usable` backs off SELF-MINT only, for
+///   [`MACHINE_KEY_ENROL_UNAVAILABLE_BACKOFF_SECS`]
+///   ([`Self::self_mint_not_before`]). It is not a verdict: web slides a
+///   key's `expires_at` on every successful exchange and the exchange does not
+///   report the new value, so a runner's local expiry can go stale and read
+///   "expiring" while web still considers the key good. The owner's `/mint`
+///   door stays attemptable throughout;
+/// * everything transient backs off both doors via [`Self::next_attempt_at`]
+///   (a 401 included: the token raced its own expiry).
 #[derive(Debug, Default)]
 pub(crate) struct MachineKeyEnrolGate {
     next_attempt_at: Option<i64>,
-    terminal: Option<qontinui_runner_lib::pair::MachineKeyEnrolError>,
+    self_mint_not_before: Option<i64>,
+    /// Did the most recent self-mint answer 409 `machine_key_still_usable`?
+    still_usable_server_side: bool,
     refused_bearers: std::collections::HashSet<u64>,
     /// The last terminal-for-this-token refusal, for `/health`.
     last_refusal: Option<qontinui_runner_lib::pair::MachineKeyEnrolError>,
@@ -3582,17 +3639,31 @@ pub fn machine_key_health_token() -> &'static str {
         .unwrap_or("unknown")
 }
 
-/// Why enrolment stopped for good in this process, for
-/// `/health.coordCredential.machineKeyReason`. `None` while enrolment is
-/// still possible (or never needed).
+/// Why enrolment is not currently producing a key, for
+/// `/health.coordCredential.machineKeyReason`. `None` while nothing is in the
+/// way. A 409 is worded by the LOCAL key state, because the same answer means
+/// two different things: with a local key, web simply has not rotated it yet;
+/// without one, web holds a key this runner lacks.
 pub fn machine_key_enrol_blocked_reason() -> Option<String> {
     let g = machine_key_enrol_gate()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    g.terminal
-        .as_ref()
-        .or(g.last_refusal.as_ref())
-        .map(|e| e.to_string())
+    if g.still_usable_server_side {
+        let local = *MACHINE_KEY_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        return Some(still_usable_reason(local).to_string());
+    }
+    g.last_refusal.as_ref().map(|e| e.to_string())
+}
+
+/// The 409 wording by local key state (see
+/// [`machine_key_enrol_blocked_reason`]).
+pub(crate) fn still_usable_reason(local: Option<MachineKeyState>) -> &'static str {
+    match local {
+        Some(MachineKeyState::Present | MachineKeyState::Expiring) => {
+            "web did not rotate yet (still usable server-side)"
+        }
+        _ => "web holds a usable key this runner lacks; owner /mint replaces it",
+    }
 }
 
 /// Record the observed state and log ONCE per state change (not per tick):
@@ -3693,7 +3764,7 @@ pub(crate) async fn maybe_enrol_device_machine_key(
     }
     {
         let g = gate.lock().unwrap_or_else(|e| e.into_inner());
-        if g.terminal.is_some() || g.next_attempt_at.is_some_and(|t| now < t) {
+        if g.next_attempt_at.is_some_and(|t| now < t) {
             return MachineKeyEnrolAttempt::Deferred;
         }
     }
@@ -3709,10 +3780,15 @@ pub(crate) async fn maybe_enrol_device_machine_key(
         return MachineKeyEnrolAttempt::NoBearer;
     }
     // A bearer web already refused with a 403 is never presented again; only
-    // a changed token is worth asking with.
+    // a changed token is worth asking with. Self-mint also sits out its own
+    // 409 backoff, while the owner's `/mint` stays attemptable.
     {
         let g = gate.lock().unwrap_or_else(|e| e.into_inner());
-        attempts.retain(|(_, b)| !g.refused_bearers.contains(&bearer_fingerprint(b)));
+        let self_mint_waiting = g.self_mint_not_before.is_some_and(|t| now < t);
+        attempts.retain(|(route, b)| {
+            !g.refused_bearers.contains(&bearer_fingerprint(b))
+                && (*route != R::SelfMint || !self_mint_waiting)
+        });
     }
     if attempts.is_empty() {
         return MachineKeyEnrolAttempt::Deferred;
@@ -3757,6 +3833,8 @@ pub(crate) async fn maybe_enrol_device_machine_key(
                 {
                     let mut g = gate.lock().unwrap_or_else(|e| e.into_inner());
                     g.next_attempt_at = None;
+                    g.self_mint_not_before = None;
+                    g.still_usable_server_side = false;
                     g.last_refusal = None;
                 }
                 observe_machine_key_state(machine_key_state(auth_manager, now));
@@ -3777,10 +3855,27 @@ pub(crate) async fn maybe_enrol_device_machine_key(
                 last_err = e;
             }
             // 401: the token web saw is not live. Enrolment only runs with a
-            // live one, so this is a race with expiry — skip quietly.
+            // live one, so this is a race with expiry — quiet, and backed off
+            // on the transient cadence below like any other miss.
             Err(e @ E::Refused { status: 401, .. }) => {
                 debug!("device_jwt_refresher: machine-key enrolment skipped ({e})");
-                return MachineKeyEnrolAttempt::Failed(e);
+                last_err = e;
+            }
+            // 409: self-mint only, long backoff; the next door (if any) still
+            // runs. Logged once per episode.
+            Err(E::ServerKeyStillUsable) => {
+                let mut g = gate.lock().unwrap_or_else(|e| e.into_inner());
+                if !g.still_usable_server_side {
+                    info!(
+                        "device_jwt_refresher: web still considers this device's machine key \
+                         usable (409 machine_key_still_usable) — not self-minting for {}h; the \
+                         owner's /mint (a signed-in session) can still rotate it",
+                        MACHINE_KEY_ENROL_UNAVAILABLE_BACKOFF_SECS / 3600
+                    );
+                }
+                g.still_usable_server_side = true;
+                g.self_mint_not_before = Some(now + MACHINE_KEY_ENROL_UNAVAILABLE_BACKOFF_SECS);
+                last_err = E::ServerKeyStillUsable;
             }
             // Try the next door (if any) on everything else.
             Err(e) => last_err = e,
@@ -3793,18 +3888,10 @@ pub(crate) async fn maybe_enrol_device_machine_key(
         return MachineKeyEnrolAttempt::Failed(last_err);
     }
 
+    // The 409's own backoff is already set on self-mint alone; a general
+    // backoff here would also block the owner's `/mint` door.
     if matches!(last_err, E::ServerKeyStillUsable) {
-        // Terminal for self-mint: web will not rotate a key it considers
-        // usable, and this runner has no copy of it. Only the owner's `/mint`
-        // (or a re-pair) replaces it. Logged once — the gate stops retries.
-        warn!(
-            "device_jwt_refresher: web holds a still-usable device machine key this runner \
-             does NOT have (409 machine_key_still_usable) — self-mint will not replace it. \
-             Sign in (the owner's /mint rotates it) or re-pair to restore unattended \
-             recovery."
-        );
-        gate.lock().unwrap_or_else(|e| e.into_inner()).terminal = Some(E::ServerKeyStillUsable);
-        return MachineKeyEnrolAttempt::Failed(E::ServerKeyStillUsable);
+        return MachineKeyEnrolAttempt::Failed(last_err);
     }
     let backoff = match &last_err {
         E::RouteUnavailable => MACHINE_KEY_ENROL_UNAVAILABLE_BACKOFF_SECS,
@@ -4765,27 +4852,10 @@ async fn refresher_loop(
             // present-but-undecryptable store, and collapsing the two would
             // fire a "you have no coord credential" banner at a paired runner
             // whose store merely failed to decrypt this tick.
-            let obs = match auth_manager.probe_access_token() {
-                crate::secure_storage::StoredTokenRead::Present(t) => {
-                    SlotObservation::observed(None, Some(t.as_str()))
-                }
-                crate::secure_storage::StoredTokenRead::Absent => {
-                    SlotObservation::observed(None, None)
-                }
-                crate::secure_storage::StoredTokenRead::Unreadable(_) => {
-                    SlotObservation::unreadable(None)
-                }
-            };
-            // A previous pass may already have PROVED this same dead credential
-            // unrefreshable (see `conclude_legacy_recovery_failure`); republishing
-            // the bare pre-recovery observation would flip the posture back to
-            // `expired` and re-fire the banner every tick.
-            let (obs, outcome_label) = carry_legacy_conclusion(obs);
-            if let Some(transition) = derive_and_publish_posture_labelled(
-                &[obs],
+            if let Some(transition) = publish_legacy_slot_observation(
+                &auth_manager,
                 sweep_inputs.posture_pin_inputs(),
                 chrono::Utc::now().timestamp(),
-                outcome_label,
             ) {
                 notify_posture_transition(Some(&api_state.app_handle), transition);
             }
@@ -5846,6 +5916,10 @@ mod try_refresh_once_tests {
 
     #[tokio::test]
     async fn refresher_handles_coord_200_replaces_jwt() {
+        // A successful legacy mint retires the DEFAULT upstream bucket
+        // (`retire_rejection_streaks_after_legacy_mint`) — process-global
+        // state the tenant-slot posture tests assert on — so take their lock.
+        let _serialised = super::posture_test_lock();
         // Setup: AuthManager holds the OLD JWT.
         // Run: mock web backend returns canonical 200 with a NEW JWT.
         // Assert: outcome is Replaced with the NEW JWT, and the
@@ -5961,6 +6035,10 @@ mod try_refresh_once_tests {
 
     #[tokio::test]
     async fn refresher_uses_outgoing_jwt_tenant_when_oauth_claim_absent() {
+        // A successful legacy mint retires the DEFAULT upstream bucket
+        // (`retire_rejection_streaks_after_legacy_mint`) — process-global
+        // state the tenant-slot posture tests assert on — so take their lock.
+        let _serialised = super::posture_test_lock();
         // PROD BUG REGRESSION: the OAuth/runner bearer carries NO tenant_id
         // (the operator's Cognito token) but the OUTGOING device-JWT — the one
         // we're about to replace — still carries its own tenant_id claim. The
@@ -6057,6 +6135,10 @@ mod try_refresh_once_tests {
 
     #[tokio::test]
     async fn refresher_uses_machine_tenant_when_no_jwt_claims() {
+        // A successful legacy mint retires the DEFAULT upstream bucket
+        // (`retire_rejection_streaks_after_legacy_mint`) — process-global
+        // state the tenant-slot posture tests assert on — so take their lock.
+        let _serialised = super::posture_test_lock();
         // Fallback 3: OAuth bearer + persisted device-JWT both lack a tenant
         // claim, but the caller-injected `machine_tenant`
         // (machine.json::active_tenant_id in prod) supplies one → the refresh
@@ -6226,6 +6308,10 @@ mod device_self_refresh_tests {
 
     #[tokio::test]
     async fn self_refresh_preferred_when_valid_device_jwt_held() {
+        // A successful legacy mint retires the DEFAULT upstream bucket
+        // (`retire_rejection_streaks_after_legacy_mint`) — process-global
+        // state the tenant-slot posture tests assert on — so take their lock.
+        let _serialised = super::posture_test_lock();
         // A currently-valid (future-exp) device-JWT is held → self-refresh
         // re-mints from it (presenting it as the bearer), stores the new token,
         // and returns Some. The caller uses this to SKIP the Cognito path
@@ -10199,6 +10285,10 @@ mod device_machine_key_exchange_tests {
 
     #[tokio::test]
     async fn exchange_recovers_device_jwt_from_stored_dmk() {
+        // A successful exchange retires the DEFAULT bucket's rejection streak
+        // (`retire_rejection_streaks_after_legacy_mint`), a process-global the
+        // tenant-slot posture tests assert on — so it takes their lock.
+        let _serialised = posture_test_lock();
         // The >30-day cold-start: the slot holds an EXPIRED device JWT (4a +
         // Cognito already failed), but a dmk_ is stored → the exchange mints a
         // fresh device JWT, stores it, and returns it. The dmk_ must ride the
@@ -10396,7 +10486,7 @@ mod legacy_unrefreshable_tests {
     }
 
     /// Mock web: pair-cli REFUSES the expired device-JWT bearer (401, as
-    /// production did 855 times on 2026-09-24), and the exchange door is a
+    /// production did hundreds of times on 2026-09-24), and the exchange door is a
     /// tripwire — with no key stored it must never be dialed.
     fn spawn_web() -> (String, Hits, tokio::sync::oneshot::Sender<()>) {
         let hits = Hits::default();
@@ -10529,6 +10619,106 @@ mod legacy_unrefreshable_tests {
         reset_coord_credential_posture_for_test();
     }
 
+    /// W2 — a carried `Unrefreshable` is RETRACTED when the tail can no
+    /// longer prove it: (a) a user session became usable (pair-cli then
+    /// failed transiently), (b) a machine key was enrolled.
+    #[test]
+    fn a_carried_unrefreshable_is_retracted_when_its_evidence_goes() {
+        let _serialised = posture_test_lock();
+        reset_coord_credential_posture_for_test();
+        let now = chrono::Utc::now().timestamp();
+        let expired = synth_jwt(now - 3600);
+        let mgr = auth_manager("retract", Some(&expired));
+        let pins = PosturePinInputs::UNPINNED;
+
+        // (a) session becomes usable.
+        conclude_legacy_recovery_failure(&mgr, false, false, pins, now).expect("concluded");
+        assert_eq!(
+            coord_credential_posture().unwrap().posture,
+            CoordCredentialPosture::Unrefreshable
+        );
+        let t = conclude_legacy_recovery_failure(&mgr, false, true, pins, now)
+            .expect("retracting is a posture change");
+        assert_eq!(t.to, CoordCredentialPosture::Expired);
+        let status = coord_credential_posture().unwrap();
+        assert_eq!(status.posture.cta(), Some("retry_refresh"));
+        assert!(status.last_refresh_outcome.is_none());
+        // ...and the next top-of-loop observation carries nothing.
+        let (_, label) =
+            carry_legacy_conclusion(SlotObservation::observed(None, Some(expired.as_str())));
+        assert!(label.is_none(), "the carried memory was cleared");
+
+        // (b) a machine key is enrolled.
+        conclude_legacy_recovery_failure(&mgr, false, false, pins, now).expect("concluded");
+        assert_eq!(
+            coord_credential_posture().unwrap().posture,
+            CoordCredentialPosture::Unrefreshable
+        );
+        mgr.store_device_machine_key_with_expiry("dmk_enrolled", Some(now + 50 * 86_400))
+            .expect("enrol");
+        conclude_legacy_recovery_failure(&mgr, false, false, pins, now).expect("retracted");
+        assert_eq!(
+            coord_credential_posture().unwrap().posture,
+            CoordCredentialPosture::Expired
+        );
+        reset_coord_credential_posture_for_test();
+    }
+
+    /// L8 — the no-slot branch's real entry point
+    /// ([`publish_legacy_slot_observation`], what `refresher_loop` calls):
+    /// boot says `expired`; after the tail concludes, the next pass's
+    /// pre-recovery publish keeps `unrefreshable` (no transition, no second
+    /// banner); a re-pair makes it `live`.
+    #[test]
+    fn the_no_slot_branch_publish_carries_the_conclusion() {
+        let _serialised = posture_test_lock();
+        reset_coord_credential_posture_for_test();
+        let now = chrono::Utc::now().timestamp();
+        let expired = synth_jwt(now - 3600);
+        let mgr = auth_manager("no_slot_branch", Some(&expired));
+        let pins = PosturePinInputs::UNPINNED;
+
+        let boot = publish_legacy_slot_observation(&mgr, pins, now).expect("boot publish");
+        assert_eq!(boot.to, CoordCredentialPosture::Expired);
+        conclude_legacy_recovery_failure(&mgr, false, false, pins, now).expect("concluded");
+        assert!(
+            publish_legacy_slot_observation(&mgr, pins, now).is_none(),
+            "next pass: no flip back to expired"
+        );
+        assert_eq!(
+            coord_credential_posture().unwrap().posture,
+            CoordCredentialPosture::Unrefreshable
+        );
+        mgr.store_tokens(&synth_jwt(now + 4 * 3600), "")
+            .expect("re-pair");
+        assert_eq!(
+            publish_legacy_slot_observation(&mgr, pins, now).map(|t| t.to),
+            Some(CoordCredentialPosture::Live)
+        );
+        reset_coord_credential_posture_for_test();
+    }
+
+    /// L8 wiring: `refresher_loop`'s no-slot branch goes through the tested
+    /// function rather than an inline copy.
+    #[test]
+    fn the_refresher_loop_no_slot_branch_calls_the_tested_publish() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/mcp/device_jwt_refresher.rs");
+        let text = std::fs::read_to_string(&src).expect("read refresher");
+        let start = text.find("async fn refresher_loop(").expect("loop exists");
+        let body = text.get(start..).expect("slice");
+        let end = body.find("\n}\n").expect("loop ends");
+        let code: String = body
+            .get(..end)
+            .expect("slice")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(code.contains("publish_legacy_slot_observation("));
+        assert!(code.contains("conclude_legacy_recovery_failure("));
+    }
+
     /// Every input that is not a measured negative abstains — the verdict is
     /// `re_pair`, so a false positive would tell an operator to re-pair a
     /// runner that heals itself when the network returns.
@@ -10640,15 +10830,28 @@ mod machine_key_enrol_tests {
         self_mint_hits: Arc<Mutex<Vec<String>>>,
         exchange_hits: Arc<Mutex<Vec<String>>>,
         refresh_hits: Arc<Mutex<u32>>,
+        /// Status + body the owner's user-bearer `/mint` door answers.
+        user_mint: (u16, String),
+        user_mint_hits: Arc<Mutex<Vec<String>>>,
     }
 
     fn spawn_web(self_mint: (u16, String), exchange_jwt: Option<String>) -> (String, Web) {
+        spawn_web_with(self_mint, exchange_jwt, (404, "{}".into()))
+    }
+
+    fn spawn_web_with(
+        self_mint: (u16, String),
+        exchange_jwt: Option<String>,
+        user_mint: (u16, String),
+    ) -> (String, Web) {
         let web = Web {
             self_mint,
             exchange_jwt,
             self_mint_hits: Arc::default(),
             exchange_hits: Arc::default(),
             refresh_hits: Arc::default(),
+            user_mint,
+            user_mint_hits: Arc::default(),
         };
         let state = web.clone();
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -10674,6 +10877,23 @@ mod machine_key_enrol_tests {
                                 (
                                     StatusCode::from_u16(w.self_mint.0).unwrap(),
                                     w.self_mint.1.clone(),
+                                )
+                            },
+                        ),
+                    )
+                    .route(
+                        "/api/v1/devices/{device_id}/machine-credential/mint",
+                        post(
+                            |State(w): State<Web>, Path(_d): Path<String>, h: HeaderMap| async move {
+                                let bearer = h
+                                    .get("authorization")
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or("")
+                                    .to_string();
+                                w.user_mint_hits.lock().unwrap().push(bearer);
+                                (
+                                    StatusCode::from_u16(w.user_mint.0).unwrap(),
+                                    w.user_mint.1.clone(),
                                 )
                             },
                         ),
@@ -11011,15 +11231,16 @@ mod machine_key_enrol_tests {
         assert_eq!(c(409, "{}"), MachineKeyEnrolError::Upstream(409));
     }
 
-    /// 409 `machine_key_still_usable`: web will not rotate a key it considers
-    /// usable and this runner has none. Terminal — asked once, never again —
-    /// and the local state stays `absent` (it IS absent here).
+    /// W1 — 409 `machine_key_still_usable` is a long SELF-MINT backoff, not
+    /// a process-permanent verdict: asked once, deferred for the backoff,
+    /// asked again after it. The local state stays `absent` (it IS absent
+    /// here), and the reason says web holds a key this runner lacks.
     #[tokio::test]
-    async fn a_server_side_usable_key_is_terminal_not_retried() {
+    async fn a_409_backs_off_self_mint_and_asks_again_later() {
         let now = chrono::Utc::now().timestamp();
         let tenant = uuid::Uuid::from_bytes([0x66; 16]);
         let mgr = auth_manager("still_usable");
-        mgr.store_tokens(&synth_jwt(now + 3 * 3600, &tenant), "")
+        mgr.store_tokens(&synth_jwt(now + 12 * 3600, &tenant), "")
             .expect("seed live jwt");
         let (base, web) = spawn_web(
             (
@@ -11033,11 +11254,142 @@ mod machine_key_enrol_tests {
             maybe_enrol_device_machine_key(&gate, &mgr, &base, DID, now).await,
             MachineKeyEnrolAttempt::Failed(MachineKeyEnrolError::ServerKeyStillUsable)
         );
+        assert!(gate.lock().unwrap().still_usable_server_side);
+        for tick in 1..=60 {
+            assert_eq!(
+                maybe_enrol_device_machine_key(&gate, &mgr, &base, DID, now + tick * 300).await,
+                MachineKeyEnrolAttempt::Deferred,
+                "tick {tick}"
+            );
+        }
+        assert_eq!(web.self_mint_hits.lock().unwrap().len(), 1);
+        let later = now + MACHINE_KEY_ENROL_UNAVAILABLE_BACKOFF_SECS + 1;
+        let _ = maybe_enrol_device_machine_key(&gate, &mgr, &base, DID, later).await;
         assert_eq!(
-            maybe_enrol_device_machine_key(&gate, &mgr, &base, DID, now + 30 * 86_400).await,
-            MachineKeyEnrolAttempt::Deferred
+            web.self_mint_hits.lock().unwrap().len(),
+            2,
+            "a 409 is not process-permanent"
+        );
+        assert_eq!(machine_key_state(&mgr, now), MachineKeyState::Absent);
+    }
+
+    /// W1 — while self-mint sits out its 409 backoff, the owner's `/mint`
+    /// (a fresh Cognito session) is still attempted, and succeeds.
+    #[tokio::test]
+    async fn a_409_does_not_block_the_owner_mint_door() {
+        let now = chrono::Utc::now().timestamp();
+        let tenant = uuid::Uuid::from_bytes([0x67; 16]);
+        let mgr = auth_manager("still_usable_owner_mint");
+        mgr.store_tokens(&synth_jwt(now + 12 * 3600, &tenant), "")
+            .expect("seed live jwt");
+        let (base, web) = spawn_web_with(
+            (
+                409,
+                r#"{"detail":{"code":"machine_key_still_usable"}}"#.into(),
+            ),
+            None,
+            (503, "{}".into()),
+        );
+        let gate = std::sync::Mutex::new(MachineKeyEnrolGate::default());
+        // No user session yet: self-mint 409s.
+        assert_eq!(
+            maybe_enrol_device_machine_key(&gate, &mgr, &base, DID, now).await,
+            MachineKeyEnrolAttempt::Failed(MachineKeyEnrolError::ServerKeyStillUsable)
+        );
+        assert!(web.user_mint_hits.lock().unwrap().is_empty());
+        // The operator signs in; the very next pass (inside self-mint's 409
+        // backoff) knocks on /mint with the user bearer.
+        mgr.store_oauth_tokens("cognito-access", "id", "refresh", now + 2 * 3600)
+            .expect("seed cognito session");
+        let _ = maybe_enrol_device_machine_key(&gate, &mgr, &base, DID, now + 300).await;
+        assert_eq!(
+            *web.user_mint_hits.lock().unwrap(),
+            vec!["Bearer cognito-access".to_string()],
+            "the owner's /mint stays attemptable during the self-mint backoff"
         );
         assert_eq!(web.self_mint_hits.lock().unwrap().len(), 1);
-        assert_eq!(machine_key_state(&mgr, now), MachineKeyState::Absent);
+    }
+
+    /// W3 — web's 2xx naming OUR device in another format (upper-case) is
+    /// our key: it is stored, never dropped (web already rotated the old one).
+    #[tokio::test]
+    async fn a_differently_formatted_device_id_still_stores_the_rotated_key() {
+        use qontinui_runner_lib::pair::same_device_id;
+        assert!(same_device_id(DID, &DID.to_uppercase()));
+        assert!(same_device_id(&format!(" {DID} "), DID));
+        assert!(!same_device_id(DID, "eb2155ed-0000-4000-8000-00000000000b"));
+
+        let now = chrono::Utc::now().timestamp();
+        let tenant = uuid::Uuid::from_bytes([0x69; 16]);
+        let mgr = auth_manager("upper_case_device_id");
+        mgr.store_tokens(&synth_jwt(now + 12 * 3600, &tenant), "")
+            .expect("seed live jwt");
+        let body = serde_json::json!({
+            "device_id": DID.to_uppercase(),
+            "device_machine_key": "dmk_formatted",
+            "prefix": "dmk_formatted",
+            "expires_at": null,
+        })
+        .to_string();
+        let (base, _web) = spawn_web((201, body), None);
+        let gate = std::sync::Mutex::new(MachineKeyEnrolGate::default());
+        assert!(matches!(
+            maybe_enrol_device_machine_key(&gate, &mgr, &base, DID, now).await,
+            MachineKeyEnrolAttempt::Enrolled { .. }
+        ));
+        assert_eq!(
+            mgr.get_device_machine_key().unwrap().as_deref(),
+            Some("dmk_formatted")
+        );
+    }
+
+    /// W1 — the 409 reason is worded by LOCAL key state.
+    #[test]
+    fn the_409_reason_is_worded_by_local_key_state() {
+        assert_eq!(
+            still_usable_reason(Some(MachineKeyState::Present)),
+            "web did not rotate yet (still usable server-side)"
+        );
+        assert_eq!(
+            still_usable_reason(Some(MachineKeyState::Expiring)),
+            "web did not rotate yet (still usable server-side)"
+        );
+        for local in [
+            Some(MachineKeyState::Absent),
+            Some(MachineKeyState::Unknown),
+            None,
+        ] {
+            assert_eq!(
+                still_usable_reason(local),
+                "web holds a usable key this runner lacks; owner /mint replaces it"
+            );
+        }
+    }
+
+    /// L4 — a 401 from self-mint backs off on the transient cadence rather
+    /// than being asked again on the very next tick.
+    #[tokio::test]
+    async fn a_401_backs_off_on_the_transient_cadence() {
+        let now = chrono::Utc::now().timestamp();
+        let tenant = uuid::Uuid::from_bytes([0x68; 16]);
+        let mgr = auth_manager("self_mint_401");
+        mgr.store_tokens(&synth_jwt(now + 12 * 3600, &tenant), "")
+            .expect("seed live jwt");
+        let (base, web) = spawn_web((401, r#"{"detail":"expired"}"#.into()), None);
+        let gate = std::sync::Mutex::new(MachineKeyEnrolGate::default());
+        let _ = maybe_enrol_device_machine_key(&gate, &mgr, &base, DID, now).await;
+        assert_eq!(
+            maybe_enrol_device_machine_key(&gate, &mgr, &base, DID, now + 10).await,
+            MachineKeyEnrolAttempt::Deferred
+        );
+        let _ = maybe_enrol_device_machine_key(
+            &gate,
+            &mgr,
+            &base,
+            DID,
+            now + MACHINE_KEY_ENROL_TRANSIENT_BACKOFF_SECS,
+        )
+        .await;
+        assert_eq!(web.self_mint_hits.lock().unwrap().len(), 2);
     }
 }
