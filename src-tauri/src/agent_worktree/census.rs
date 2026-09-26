@@ -1360,7 +1360,7 @@ fn measure_dir(dir: &Path) -> (bool, bool, u64) {
 /// `src-tauri/target`; everything else uses `target`. We prefer
 /// `src-tauri/target` when `src-tauri/` exists, else fall back to the
 /// top-level `target`.
-fn target_dir_for(worktree: &Path) -> PathBuf {
+pub(super) fn target_dir_for(worktree: &Path) -> PathBuf {
     let src_tauri = worktree.join("src-tauri");
     if src_tauri.is_dir() {
         let st_target = src_tauri.join("target");
@@ -2658,7 +2658,7 @@ fn publish_volume_sample(volumes: Vec<VolumeReport>) -> VolumeSample {
 /// sentinel makes the first emission at `now == 0` stamp a value that reads
 /// back as "never" — and the throttle then lets every subsequent call through.
 /// `u64::MAX` is unreachable as a stamp (it is year 584-billion).
-const THROTTLE_NEVER: u64 = u64::MAX;
+pub(super) const THROTTLE_NEVER: u64 = u64::MAX;
 
 /// Epoch-seconds of the last low-disk log emission from the publisher.
 static LAST_LOW_DISK_LOG_EPOCH: AtomicU64 = AtomicU64::new(THROTTLE_NEVER);
@@ -2680,7 +2680,7 @@ const _: () = assert!(
     "both log throttles must exceed the publisher's minimum cadence"
 );
 
-fn now_epoch_secs() -> u64 {
+pub(super) fn now_epoch_secs() -> u64 {
     chrono::Utc::now().timestamp().max(0) as u64
 }
 
@@ -2696,7 +2696,7 @@ fn now_epoch_secs() -> u64 {
 /// the moment it mattered most. A silent (healthy) tick must cost nothing.
 ///
 /// Returns whether the emission happened, for the tests to pin.
-fn emit_throttled(
+pub(super) fn emit_throttled(
     cell: &AtomicU64,
     now: u64,
     throttle_secs: u64,
