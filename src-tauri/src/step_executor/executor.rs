@@ -315,9 +315,13 @@ pub(super) enum DispatchRoute {
     /// the handler registered under the raw step type: handlers tolerate
     /// shapes the schema rejects (e.g. a command step stamped
     /// `phase: "agentic"` by `refetch_unified_workflow_steps`), and a step
-    /// that worked must not start failing. Logged at `warn!` — after the
-    /// typed parse was made total for live shapes, this fires only on a
-    /// genuine schema/handler disagreement.
+    /// that worked must not start failing. Logged at `warn!`. This is NOT
+    /// only a schema/handler disagreement: known tolerated live shapes take
+    /// this route too — every `agentic`-phase command step from
+    /// `refetch_unified_workflow_steps`, and a content-less prompt step (see
+    /// `refetch_agentic_stamped_command_step_falls_back_to_the_command_handler`
+    /// and `contentless_prompt_step_falls_back_to_the_prompt_handler`) — so a
+    /// warning here is a lead, not proof of a defect.
     RegistryFallback { key: String, parse_error: String },
     /// A [`LEGACY_STRING_DISPATCH`] type; served by the legacy `match`.
     Legacy(LegacyStep),
@@ -2291,12 +2295,15 @@ mod tests {
     }
 
     /// The phase stamping `refetch_unified_workflow_steps` applies
-    /// (mcp/unified_workflows.rs:204-231): every step is converted with
-    /// `serde_json::from_value::<ExecutionStepConfig>` (:105) and then gets
+    /// (mcp/unified_workflows.rs): every step is converted by
+    /// `convert_refetched_step` (which calls `parse_step_value`) and then gets
     /// `phase` set from the array it sits in, so a command step placed in
-    /// `agentic_steps` is stamped `"agentic"` (:219-223). The function itself
-    /// is not callable here (it reads the workflow from Postgres), so this
-    /// replicates the loop over the real `normalize_to_stages`.
+    /// `agentic_steps` is stamped `"agentic"`. The function itself is not
+    /// callable here (it reads the workflow from Postgres), so this replicates
+    /// the loop over the real `normalize_to_stages`. It converts with plain
+    /// `serde_json::from_value`, which is equivalent for the non-`ui_bridge`
+    /// steps these tests use — `parse_step_value`'s normalization only
+    /// touches `ui_bridge` steps.
     fn refetch_stamped_steps(
         workflow: &crate::unified_workflows::UnifiedWorkflow,
     ) -> Vec<ExecutionStepConfig> {
