@@ -16,54 +16,11 @@ use tracing::{debug, error, info, warn};
 // Hook Triggers
 // ============================================================================
 
-/// Events that can trigger hook execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HookTrigger {
-    /// Before task execution starts
-    PreExecution,
-    /// After task execution completes (success or failure)
-    PostExecution,
-    /// When an error occurs during execution
-    OnError,
-    /// When verification fails
-    OnVerificationFail,
-    /// When task completes successfully
-    OnComplete,
-    /// Before each iteration
-    PreIteration,
-    /// After each iteration
-    PostIteration,
-}
-
-impl HookTrigger {
-    /// Get a human-readable name for this trigger.
-    pub fn display_name(&self) -> &'static str {
-        match self {
-            Self::PreExecution => "Pre-Execution",
-            Self::PostExecution => "Post-Execution",
-            Self::OnError => "On Error",
-            Self::OnVerificationFail => "On Verification Fail",
-            Self::OnComplete => "On Complete",
-            Self::PreIteration => "Pre-Iteration",
-            Self::PostIteration => "Post-Iteration",
-        }
-    }
-
-    /// Parse from string.
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "pre_execution" | "preexecution" => Some(Self::PreExecution),
-            "post_execution" | "postexecution" => Some(Self::PostExecution),
-            "on_error" | "onerror" => Some(Self::OnError),
-            "on_verification_fail" | "onverificationfail" => Some(Self::OnVerificationFail),
-            "on_complete" | "oncomplete" => Some(Self::OnComplete),
-            "pre_iteration" | "preiteration" => Some(Self::PreIteration),
-            "post_iteration" | "postiteration" => Some(Self::PostIteration),
-            _ => None,
-        }
-    }
-}
+/// Events that can trigger hook execution. The canonical definition lives in
+/// the lib crate so the schema-export pipeline can see it (it is carried on the
+/// `execution-status` Tauri channel) — see
+/// `qontinui_runner_lib::tauri_event_payloads`.
+pub use qontinui_runner_lib::tauri_event_payloads::HookTrigger;
 
 // ============================================================================
 // Hook Actions

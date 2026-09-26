@@ -67,10 +67,13 @@ pub mod profiles;
 // users-path-and-the-passage-of-time): registered by `schema_export`, built by
 // the bin's `journey::routes`.
 pub mod journey_wire;
+pub mod known_issue_types;
 pub mod relay_envelopes;
 pub mod runner_breadcrumb;
 pub mod schema_export;
+pub mod skill_types;
 pub mod tauri_event_payloads;
+pub mod ui_bridge_action_plan;
 
 // Temp-file-then-rename writer. Owned by the lib and imported by the runner
 // bin, so its `TEMP_SEQ` counter is one static per process — the uniqueness
