@@ -261,7 +261,10 @@ JWT all work), first reachable transport wins:
    clearance_audience?, gate_class?}`. Reach it over the held device JWT; the runner's
    proxy-nonce write forwarder (`POST {runner}/coord-mcp/work-units/…`, header
    `X-Coord-Mcp-Proxy-Key` — or `Authorization: Bearer <nonce>` on newer configs —
-   read from a live `.mcp.json`; the forwarder injects a
+   read from a live `.mcp.json`, and expanded from your own environment when it
+   is an env reference like `${QONTINUI_COORD_MCP_NONCE_<K>:-<nonce>}` (the variable
+   when set and non-empty, else the default; allowlisted names only: `mcp_expand_env_ref`,
+   `scripts/lib/mcp-env-ref.sh` - never sent literally); the forwarder injects a
    fresh device JWT per request); or the acting-user-service token
    (`bash …/scripts/coord-acting-bearer.sh` — sourced from **`$COORD_AGENT_JWT`
    ONLY**: no `.mcp.json` carries a bearer anymore, every config is

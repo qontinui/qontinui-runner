@@ -1488,7 +1488,9 @@ Handle the selection:
     `2026-08-20-coord-mcp-reconnect-dcr-and-restart-orphaning` and the legacy
     name stays accepted): `curl GET <proxy_base>/claims/by-resource?kind=phase&key=<rk>`
     with whichever of those two headers the config carries (the runner injects a
-    live device JWT).
+    live device JWT). A value written as `${QONTINUI_COORD_MCP_NONCE_<K>:-<nonce>}` is
+    an env reference: expand it from your own environment first
+    (`mcp_expand_env_ref`, `scripts/lib/mcp-env-ref.sh`), never send it literally.
 
     **Static-bearer detection:** an `Authorization` header alone no longer
     proves the static-bearer shape — a proxy nonce now travels there too. The

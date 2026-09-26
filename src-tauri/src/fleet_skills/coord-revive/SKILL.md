@@ -1085,7 +1085,9 @@ always did: a door works. Then
 re-issue your lost call as a raw JSON-RPC `tools/call` against that door (for a
 loopback door, the proxy nonce from that file — carried as
 `X-Coord-Mcp-Proxy-Key: <nonce>` on older configs and as
-`Authorization: Bearer <nonce>` on ones written after the header move; the
+`Authorization: Bearer <nonce>` on ones written after the header move, and
+expanded from your own environment when written as
+`${QONTINUI_COORD_MCP_NONCE_<K>:-<nonce>}` — the script does that itself; the
 script reports which header name it used. The minted bearer for L3), then
 verify by read. On total failure it prints `VERDICT: DEAD` naming
 every exhausted door and its typed reason; run `coord doctor` next.
@@ -1421,12 +1423,17 @@ this one — in its own words — *"usually cannot"*.
 # http://127.0.0.1:<port>/coord-mcp. Post-Phase-2 configs carry it under
 # `Authorization: Bearer <nonce>`; older ones under X-Coord-Mcp-Proxy-Key.
 LOG=~/.local/share/qontinui-runner/dev-logs/coord-mcp-rotations.jsonl   # resolve yours -- see the warning above
+# A value written as `${QONTINUI_COORD_MCP_NONCE_<K>:-<nonce>}` is an env
+# reference: expand it from this shell's environment (what Claude Code sent),
+# never take the prefix of the literal reference text.
 PREFIX=$(python3 -c "
-import json
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from mcp_env_ref import expand_env_ref
 h = json.load(open('.mcp.json'))['mcpServers']['coord-mcp'].get('headers', {})
-tok = h.get('Authorization', h.get('X-Coord-Mcp-Proxy-Key', ''))
+tok = expand_env_ref(h.get('Authorization', h.get('X-Coord-Mcp-Proxy-Key', '')))
 print(tok.split()[-1][:8] if tok else '')
-")
+" "<workspace-root>/qontinui-claude-config/scripts/lib")
 [ -n "$PREFIX" ] || echo "no nonce in .mcp.json headers -- resolve it by hand"
 grep -F "\"key_prefix\":\"$PREFIX\"" "$LOG" | jq -c '{ts,event,workdir,cause,pid}'
 ```

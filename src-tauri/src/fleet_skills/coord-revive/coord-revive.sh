@@ -1034,6 +1034,34 @@ fi
 # shellcheck source=../../../scripts/lib/envelope.sh
 . "$ENVELOPE_LIB"
 
+# `${NAME:-default}` expansion for every nonce read out of a .mcp.json (read_cfg
+# below): the runner writes the coord-mcp entry as
+# `Bearer ${QONTINUI_COORD_MCP_NONCE_<K>:-<workdir nonce>}`, and this script must
+# expand it from ITS OWN environment exactly as Claude Code does, or it would
+# replay the literal reference as a bearer and read the 401 as a stale nonce.
+# Plan 2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages.
+# NOT fatal when unresolvable (a bundle that predates the render): a literal
+# nonce needs no expansion, so only a value that actually carries a reference is
+# refused - typed, and never sent.
+__resolve_fleet_script "lib/mcp-env-ref.sh"; MCP_ENV_REF_LIB="$__RFS_PATH"
+if [ -n "$MCP_ENV_REF_LIB" ]; then
+  # shellcheck source=../../../scripts/lib/mcp-env-ref.sh
+  . "$MCP_ENV_REF_LIB"
+else
+  mcp_expand_env_ref_to() {
+    case "$2" in
+      *'${'*'}'*)
+        echo "UNEXPANDED_ENV_REF (helper absent): the .mcp.json value carries a \${...} reference and scripts/lib/mcp-env-ref.sh was not found - $(__fleet_script_searched "lib/mcp-env-ref.sh"). Refusing to send it literally (LOCAL fault, not a coord verdict)." >&2
+        printf -v "$1" '%s' ""; return 4 ;;
+    esac
+    printf -v "$1" '%s' "$2"
+  }
+  mcp_env_ref_default_to() { mcp_expand_env_ref_to "$@"; }
+  # No helper, no loopback predicate: refusing every reference is the safe
+  # reading for any URL, so the URL is ignored here.
+  mcp_expand_env_ref_for_url() { mcp_expand_env_ref_to "$1" "$3"; }
+fi
+
 # Named loudly: every probe stages its auth header here, so a silent failure
 # would surface later as AUTH_HEADER_STAGING_FAILED with an empty path — the
 # symptom without the cause.
@@ -1595,6 +1623,21 @@ print("Authorization" if authz else "X-Coord-Mcp-Proxy-Key")' < "$1" 2>/dev/null
   fi
   case "$CFG_URL" in *"/coord-mcp"*) ;; *) return 1 ;; esac
   [ -n "$CFG_KEY" ] || return 1
+  # Expand `${NAME:-default}` from THIS process's environment (see the
+  # mcp-env-ref.sh sourcing above), so a runner env-ref config and its literal
+  # twin carry the same key into probe_door AND into seen_endpoint's (url, key)
+  # dedup. An unset no-default reference is refused with its typed reason in
+  # $CFG_ENVREF_ERR - cfg_shape reports it - and nothing is sent.
+  # The URL gate lives in the helper (mcp_expand_env_ref_for_url): only a
+  # strictly-loopback CFG_URL reads the environment; any other URL resolves on
+  # the reference's DEFAULT arm, so no environment value is sent off-box.
+  CFG_ENVREF_ERR=""
+  if ! mcp_expand_env_ref_for_url CFG_KEY "$CFG_URL" "$CFG_KEY" 2>"$TMPD/envref.err"; then
+    CFG_ENVREF_ERR="$(head -n 1 "$TMPD/envref.err" 2>/dev/null)"
+    CFG_ENVREF_FILE="$1"
+    return 1
+  fi
+  [ -n "$CFG_KEY" ] || return 1
 }
 
 # cfg_shape <file> -> a precise one-line reason this file is not a probeable door.
@@ -1654,6 +1697,12 @@ else:
 }
 
 cfg_shape() {
+  # read_cfg refused this file's key as an unexpandable env reference: that is
+  # the precise reason, and the shape probe below would call it "complete".
+  if [ -n "${CFG_ENVREF_ERR:-}" ] && [ "${CFG_ENVREF_FILE:-}" = "$1" ]; then
+    echo "$CFG_ENVREF_ERR"
+    return 0
+  fi
   local tok
   [ -r "$1" ] || { echo "missing or unreadable"; return; }
   tok="$(cfg_shape_token "$1")"
@@ -3413,7 +3462,13 @@ for f in "$ROOT/.mcp.json" "$ROOT"/*/.mcp.json; do
   [ -r "$f" ] || continue
   L2_SEEN=$((L2_SEEN + 1))
   seen_door "$f" && continue # canonical-path dedup: L1 (or an earlier glob hit) already probed it
-  read_cfg "$f" || continue
+  if ! read_cfg "$f"; then
+    # Only an unexpandable env reference is worth a line: every other miss is a
+    # file that simply is not a proxy-shaped door, which the sweep skips quietly.
+    [ -n "${CFG_ENVREF_ERR:-}" ] && [ "${CFG_ENVREF_FILE:-}" = "$f" ] \
+      && echo "L2: $f -> $CFG_ENVREF_ERR" >&2
+    continue
+  fi
   # (url, auth) dedup — a DIFFERENT file naming a door already probed is not a
   # second door. Must follow read_cfg (it sets CFG_*) and precede probe_door.
   if seen_endpoint "$CFG_URL" "$CFG_KEY_HEADER" "$CFG_KEY"; then

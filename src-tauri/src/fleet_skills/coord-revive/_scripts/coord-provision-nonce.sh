@@ -162,6 +162,31 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# The mint's answer is a .mcp.json-shaped config, and the runner writes its nonce
+# as `${QONTINUI_COORD_MCP_NONCE_<K>:-<minted nonce>}` (plan
+# 2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages). This
+# helper's contract is the nonce it MINTED, so the reference resolves to its
+# DEFAULT arm - never to the terminal nonce this process may carry in its
+# environment, which is not what the caller asked for. Resolved from beside this
+# script: `lib/` sits next to it in `scripts/` and in the skill's `_scripts/`
+# render alike. Absent (a bundle predating the render), a literal nonce still
+# passes and only a reference is refused - typed, and never printed.
+__cpn_envref_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/lib/mcp-env-ref.sh"
+if [ -r "$__cpn_envref_lib" ]; then
+  # shellcheck source=lib/mcp-env-ref.sh
+  . "$__cpn_envref_lib"
+else
+  mcp_env_ref_default_to() {
+    case "$2" in
+      *'${'*'}'*)
+        echo "UNEXPANDED_ENV_REF (helper absent): lib/mcp-env-ref.sh not found beside this script - refusing to print a \${...} reference as a nonce (LOCAL fault)" >&2
+        printf -v "$1" '%s' ""; return 4 ;;
+    esac
+    printf -v "$1" '%s' "$2"
+  }
+fi
+unset __cpn_envref_lib
+
 command -v curl >/dev/null 2>&1 || {
   echo "coord-provision-nonce: ERROR: curl is required (LOCAL fault, not a runner verdict)." >&2
   exit 127
@@ -596,6 +621,13 @@ for origin in $ORIGINS; do
         # Authorization. It is a nonce either way - never a bearer.
         AUTHV="$(printf '%s' "$BODY" | json_get '.mcpServers["coord-mcp"].headers.Authorization')"
         NONCE="$(printf '%s' "$AUTHV" | sed -E 's/^[[:space:]]*[Bb]earer[[:space:]]+//')"
+      fi
+      # Resolve a `${NAME:-<minted>}` reference to the minted literal (see the
+      # mcp-env-ref.sh sourcing above). A reference with no default carries no
+      # minted value at all: typed, and nothing is printed as a nonce.
+      if [ -n "$NONCE" ] && ! mcp_env_ref_default_to NONCE "$NONCE"; then
+        echo "coord-provision-nonce: PROVISION_SHAPE_UNRECOGNISED ($origin answered $CODE with a nonce that is an env reference carrying no minted default - UNKNOWN, not a refusal)" >&2
+        unknown_rc; continue
       fi
       if [ -n "$URL" ] && [ -n "$NONCE" ]; then
         echo "coord-provision-nonce: minted a proxy nonce from $origin (cwd=$CWD_ARG)" >&2
