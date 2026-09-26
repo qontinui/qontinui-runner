@@ -302,11 +302,7 @@ pub(crate) fn parse_set_tab_readback(result_str: &str) -> SetTabReadback {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(result_str) else {
         return SetTabReadback::default();
     };
-    let str_field = |key: &str| {
-        v.get(key)
-            .and_then(|p| p.as_str())
-            .map(|s| s.to_string())
-    };
+    let str_field = |key: &str| v.get(key).and_then(|p| p.as_str()).map(|s| s.to_string());
     let page_id_chain = v
         .get("pageIdChain")
         .and_then(|c| c.as_array())
@@ -4106,7 +4102,13 @@ mod set_tab_readback_tests {
         assert_eq!(r.active_page_id, None);
         assert_eq!(r.page_id_chain, vec!["a", "b"]);
 
-        assert_eq!(parse_set_tab_readback("not json"), SetTabReadback::default());
-        assert_eq!(parse_set_tab_readback(r#"{"pageIdChain":"x"}"#), SetTabReadback::default());
+        assert_eq!(
+            parse_set_tab_readback("not json"),
+            SetTabReadback::default()
+        );
+        assert_eq!(
+            parse_set_tab_readback(r#"{"pageIdChain":"x"}"#),
+            SetTabReadback::default()
+        );
     }
 }
