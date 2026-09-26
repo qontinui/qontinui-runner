@@ -15,12 +15,20 @@
 //! and renders ONE key-addressed header line of `QONTINUI_RUNNER_CONTEXT`:
 //!
 //! ```text
-//! [served-corpus: <canonical .claude>] [checkout: <repo> <branch>@<sha12> upstream=<ref> behind=<n> ahead=<m> as-of=<fetch-ts> dirty-claude=<k>] [bundle: <N>/<M> identical-to-build <gitSha> stamped=<k> served: canonical@<sha12> <c> fetched <ts>, builtin <b>, account <a>, unstamped <u>; identical-to-source <i>/<v> unverifiable=<x>] [provisioned: …] [cwd: …]
+//! [served-corpus: <canonical .claude>] [checkout: <repo> <branch>@<sha12> upstream=<ref> behind=<n> ahead=<m> as-of=<fetch-ts> dirty-claude=<k>] [bundle: <N>/<M> identical-to-build <gitSha> stamped=<k> stamped-tracked=<t> dirty-bundle=<d> served: canonical@<sha12> <c> fetched <ts>, builtin <b>, account <a>, unstamped <u>; identical-to-source <i>/<v> unverifiable=<x>] [provisioned: …] [cwd: …]
 //! ```
 //!
-//! The `bundle` token has two halves. The first, `<N>/<M> identical-to-build`,
+//! The `bundle` token has three parts. The first, `<N>/<M> identical-to-build`,
 //! compares all M files the binary carries against THIS build's bytes — the
-//! provisioner-overwrite signature. The second is source-aware: each present
+//! provisioner-overwrite signature. The second is scoped to the same M paths
+//! and read from the served checkout's git: `stamped-tracked` counts files that
+//! carry their OWN `qontinui-provenance:` stamp AND are tracked (a stamped
+//! tracked file is a clobber proven by the file itself; a stamped untracked
+//! file is an ordinary provision), and `dirty-bundle` counts roster paths git
+//! reports with tracked changes. Unlike `dirty-claude`, which counts every
+//! change under `.claude/`, it never joins an unrelated edit to the bundle. Both
+//! read `n/a` outside a git work tree and `UNKNOWN` when git could not answer —
+//! never `0`. The third is source-aware: each present
 //! file is sorted by the `source=` of its `qontinui-provenance:` stamp
 //! ([`crate::provenance`]) and compared against the copy of that source the
 //! process holds in memory — a `canonical` file against the loaded
@@ -40,13 +48,16 @@
 //!
 //! [`crate::terminal::runner_context`] is a zero-I/O renderer by contract. The
 //! SEAM that spawns a session calls [`probe`] and hands the result in, the same
-//! way it hands in the per-session `CoordMcpDelivery`. [`probe`] is bounded:
-//! each `git` spawn runs under [`PROBE_TIMEOUT`] through
+//! way it hands in the per-session `CoordMcpDelivery`. [`probe`] is bounded by
+//! ONE deadline, [`PROBE_BUDGET`], for the whole measurement: each `git` spawn
+//! runs under whatever is left of it through
 //! [`crate::process_helpers::run_with_timeout_detailed`], which kills the whole
-//! process tree on expiry. The first timeout or missing binary short-circuits
-//! every later `git` call in the same probe, so a hung `git` costs one timeout,
-//! not one per question. It never fetches, never writes, and runs `git status`
-//! with `GIT_OPTIONAL_LOCKS=0` so not even the index is refreshed.
+//! process tree on expiry. Once the budget is spent — by one hung `git` or by
+//! several slow ones — every later `git` question answers `UNKNOWN (deadline:
+//! …)` at once, so a probe never outlives its budget however many questions it
+//! has left. It never fetches, never writes, and runs `git status` with
+//! `GIT_OPTIONAL_LOCKS=0` (so not even the index is refreshed), without
+//! untracked files, renames or submodules.
 //!
 //! ## Why the answer is memoised
 //!
@@ -61,10 +72,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
-/// Wall-clock bound on each `git` spawn a probe runs. The same class as
-/// `provision_guard::PROBE_TIMEOUT`: generous for a local read, tight for a
-/// spawn an operator is waiting on.
-pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Wall-clock bound on ALL the `git` spawns one probe runs, together. The
+/// same 5 s class as `provision_guard::PROBE_BUDGET`: generous for a few local
+/// reads, tight for a spawn an operator is waiting on.
+pub(crate) const PROBE_BUDGET: Duration = Duration::from_secs(5);
 
 /// How long a probe result is reused for the same workdir and build.
 const MEMO_TTL: Duration = Duration::from_secs(30);
@@ -116,6 +127,8 @@ pub(crate) struct RepoState {
     as_of: Probe<String>,
     /// Tracked entries `git status` reports as changed, in the probed scope.
     dirty: Probe<usize>,
+    /// Those entries' paths, relative to [`toplevel`](Self::toplevel).
+    changed: Probe<Vec<String>>,
 }
 
 /// Whether a path is inside a git work tree.
@@ -145,9 +158,52 @@ pub(crate) struct BundleIdentity {
     /// never stamped, so a stamped file inside a tracked tree is a clobber
     /// proven by the file itself.
     stamped: usize,
+    /// The `.claude/`-relative paths of those stamped files.
+    stamped_rels: Vec<String>,
+    /// The roster measured against the served checkout's git.
+    in_checkout: Probe<BundleInCheckout>,
     /// Which rung each present file says it came from, and whether it is still
     /// that rung's bytes.
     sources: SourceIdentity,
+}
+
+/// The bundle roster (the same M paths) as the served checkout's git sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BundleInCheckout {
+    /// The served corpus is not inside a git work tree: `n/a`, not zero.
+    NotAWorkTree,
+    Repo {
+        /// Stamped files git tracks.
+        stamped_tracked: Probe<usize>,
+        /// Roster paths with tracked changes.
+        dirty_bundle: Probe<usize>,
+    },
+}
+
+impl BundleInCheckout {
+    /// `stamped-tracked=<t> dirty-bundle=<d>`, with `n/a` outside a work tree
+    /// and a bare `UNKNOWN` (the checkout token carries the reason) when git
+    /// could not answer.
+    fn render(p: &Probe<BundleInCheckout>) -> String {
+        let n = |v: &Probe<usize>| match v {
+            Probe::Measured(n) => n.to_string(),
+            Probe::Unknown(_) => "UNKNOWN".to_string(),
+        };
+        match p {
+            Probe::Unknown(_) => "stamped-tracked=UNKNOWN dirty-bundle=UNKNOWN".to_string(),
+            Probe::Measured(BundleInCheckout::NotAWorkTree) => {
+                "stamped-tracked=n/a dirty-bundle=n/a".to_string()
+            }
+            Probe::Measured(BundleInCheckout::Repo {
+                stamped_tracked,
+                dirty_bundle,
+            }) => format!(
+                "stamped-tracked={} dirty-bundle={}",
+                n(stamped_tracked),
+                n(dirty_bundle)
+            ),
+        }
+    }
 }
 
 /// The source-aware half of the `bundle` token: each PRESENT bundled file is
@@ -347,10 +403,11 @@ impl ServedCorpus {
         };
         let bundle = match &self.bundle {
             Probe::Measured(b) => format!(
-                "{}/{} identical-to-build {BUILD_SHA} stamped={} {}",
+                "{}/{} identical-to-build {BUILD_SHA} stamped={} {} {}",
                 b.identical,
                 b.total,
                 b.stamped,
+                BundleInCheckout::render(&b.in_checkout),
                 b.sources.render()
             ),
             Probe::Unknown(r) => unknown_text(r),
@@ -406,24 +463,29 @@ fn render_checkout(c: &Checkout, dirty_key: &str, with_ahead: bool) -> String {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| repo.toplevel.display().to_string());
+    // Every git-derived value goes through `clean`: a branch may legally be
+    // named `feat]x`, and one `]` would end the token early.
     let head = match &repo.head {
         Probe::Measured(h) => format!(
             "{}@{}",
-            h.branch.as_deref().unwrap_or("(detached)"),
-            h.sha.get(..12).unwrap_or(&h.sha)
+            clean(h.branch.as_deref().unwrap_or("(detached)")),
+            clean(h.sha.get(..12).unwrap_or(&h.sha))
         ),
         Probe::Unknown(r) => format!("HEAD={}", unknown_text(r)),
     };
     let upstream = match &repo.upstream {
-        Probe::Measured(u) if with_ahead => {
-            format!("upstream={} behind={} ahead={}", u.name, u.behind, u.ahead)
-        }
+        Probe::Measured(u) if with_ahead => format!(
+            "upstream={} behind={} ahead={}",
+            clean(&u.name),
+            u.behind,
+            u.ahead
+        ),
         Probe::Measured(u) => format!("behind={}", u.behind),
         Probe::Unknown(r) if with_ahead => format!("upstream={}", unknown_text(r)),
         Probe::Unknown(r) => format!("behind={}", unknown_text(r)),
     };
     let as_of = match &repo.as_of {
-        Probe::Measured(ts) => ts.clone(),
+        Probe::Measured(ts) => clean(ts),
         Probe::Unknown(r) => unknown_text(r),
     };
     let dirty = match &repo.dirty {
@@ -452,26 +514,38 @@ fn memo() -> &'static Mutex<HashMap<MemoKey, (Instant, ServedCorpus)>> {
 /// an `UNKNOWN (<reason>)` token.
 pub(crate) fn probe(workdir: &Path) -> ServedCorpus {
     let key_dir = std::fs::canonicalize(workdir).unwrap_or_else(|_| workdir.to_path_buf());
-    let key = (key_dir, RUNNER_BUILD);
-    let now = Instant::now();
+    memoised((key_dir, RUNNER_BUILD), MEMO_TTL, || {
+        let canonical = crate::canonical_corpus::latest();
+        probe_with(
+            workdir,
+            OsStr::new("git"),
+            PROBE_BUDGET,
+            canonical.as_deref(),
+        )
+    })
+}
+
+/// The memo behind [`probe`]: `key`'s value when one was STORED within `ttl`,
+/// else `measure()`'s, stored.
+///
+/// The entry is stamped when the measurement COMPLETES, not when it began: a
+/// probe that took most of `ttl` must still be reused for `ttl` after it, or
+/// the second render of the same spawn re-measures and the two copies can
+/// disagree — the one thing the memo exists to prevent.
+fn memoised(key: MemoKey, ttl: Duration, measure: impl FnOnce() -> ServedCorpus) -> ServedCorpus {
     {
         let guard = memo().lock().unwrap_or_else(|p| p.into_inner());
         if let Some((at, value)) = guard.get(&key) {
-            if now.duration_since(*at) < MEMO_TTL {
+            if at.elapsed() < ttl {
                 return value.clone();
             }
         }
     }
-    let canonical = crate::canonical_corpus::latest();
-    let value = probe_with(
-        workdir,
-        OsStr::new("git"),
-        PROBE_TIMEOUT,
-        canonical.as_deref(),
-    );
+    let value = measure();
+    let done = Instant::now();
     let mut guard = memo().lock().unwrap_or_else(|p| p.into_inner());
-    guard.retain(|_, (at, _)| now.duration_since(*at) < MEMO_TTL);
-    guard.insert(key, (now, value.clone()));
+    guard.retain(|_, (at, _)| done.duration_since(*at) < ttl);
+    guard.insert(key, (done, value.clone()));
     value
 }
 
@@ -484,16 +558,16 @@ pub(crate) async fn probe_async(workdir: impl Into<PathBuf>) -> ServedCorpus {
         .unwrap_or_else(|_| ServedCorpus::unknown("probe task failed"))
 }
 
-/// [`probe`] without the memo, with the `git` program, the per-spawn timeout
-/// and the loaded canonical snapshot as parameters, so a test can point them
-/// at nothing, at a hang, or at a corpus of its own.
+/// [`probe`] without the memo, with the `git` program, the probe's overall
+/// budget and the loaded canonical snapshot as parameters, so a test can point
+/// them at nothing, at a hang, or at a corpus of its own.
 fn probe_with(
     workdir: &Path,
     git_program: &OsStr,
-    timeout: Duration,
+    budget: Duration,
     canonical: Option<&crate::canonical_corpus::CanonicalCorpus>,
 ) -> ServedCorpus {
-    let git = Git::new(git_program, timeout);
+    let git = Git::new(git_program, budget);
     let claude = workdir.join(".claude");
     let corpus = match std::fs::canonicalize(&claude) {
         Ok(p) if p.is_dir() => Probe::Measured(p),
@@ -508,18 +582,25 @@ fn probe_with(
         Err(e) => Probe::Unknown(format!("unreadable: {e}")),
     };
 
-    let bundle = Probe::Measured(bundle_identity(
+    let mut identity = bundle_identity(
         match &corpus {
             Probe::Measured(p) => Some(p.as_path()),
             Probe::Unknown(_) => None,
         },
         canonical,
-    ));
+    );
 
     let checkout = match &corpus {
         Probe::Measured(dir) => probe_checkout(&git, dir, DirtyScope::Subtree),
         Probe::Unknown(_) => Probe::Unknown("no served corpus".to_string()),
     };
+    identity.in_checkout = match (&corpus, &checkout) {
+        (Probe::Measured(dir), Probe::Measured(c)) => {
+            Probe::Measured(bundle_in_checkout(&git, dir, c, &identity.stamped_rels))
+        }
+        (_, Probe::Unknown(r)) | (Probe::Unknown(r), _) => Probe::Unknown(r.clone()),
+    };
+    let bundle = Probe::Measured(identity);
 
     let cwd = probe_cwd(&git, workdir, &checkout);
 
@@ -576,6 +657,80 @@ fn probe_checkout(git: &Git<'_>, dir: &Path, scope: DirtyScope) -> Probe<Checkou
         Ok(None) => Probe::Measured(Checkout::NotAWorkTree),
         Ok(Some(located)) => Probe::Measured(Checkout::Repo(measure(git, dir, located, scope))),
         Err(reason) => Probe::Unknown(reason),
+    }
+}
+
+/// The bundle roster against the served checkout's git: which stamped files
+/// it tracks (one `git ls-files`, run only when a stamped file exists) and
+/// which roster paths the checkout's `git status` already reported changed.
+fn bundle_in_checkout(
+    git: &Git<'_>,
+    corpus: &Path,
+    checkout: &Checkout,
+    stamped_rels: &[String],
+) -> BundleInCheckout {
+    let repo = match checkout {
+        Checkout::NotAWorkTree => return BundleInCheckout::NotAWorkTree,
+        Checkout::Repo(r) => r,
+    };
+    // Roster paths are `.claude/`-relative; git's are toplevel-relative.
+    let Some(prefix) = corpus
+        .strip_prefix(&repo.toplevel)
+        .ok()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+    else {
+        let reason = "the served corpus is outside its own work tree".to_string();
+        return BundleInCheckout::Repo {
+            stamped_tracked: Probe::Unknown(reason.clone()),
+            dirty_bundle: Probe::Unknown(reason),
+        };
+    };
+    let in_repo = |rel: &str| {
+        if prefix.is_empty() {
+            rel.to_string()
+        } else {
+            format!("{prefix}/{rel}")
+        }
+    };
+
+    let dirty_bundle = match &repo.changed {
+        Probe::Measured(changed) => {
+            let changed: std::collections::HashSet<&str> =
+                changed.iter().map(String::as_str).collect();
+            Probe::Measured(
+                bundled_files()
+                    .iter()
+                    .filter(|f| changed.contains(in_repo(&f.rel).as_str()))
+                    .count(),
+            )
+        }
+        Probe::Unknown(r) => Probe::Unknown(r.clone()),
+    };
+
+    let stamped_tracked = if stamped_rels.is_empty() {
+        Probe::Measured(0)
+    } else {
+        match git.run(corpus, &["ls-files", "-z", "--full-name", "--", "."]) {
+            Err(reason) => Probe::Unknown(reason),
+            Ok(out) if !out.success => {
+                Probe::Unknown(format!("git ls-files failed: {}", first_line(&out.stderr)))
+            }
+            Ok(out) => {
+                let tracked: std::collections::HashSet<&str> =
+                    out.stdout.split('\0').filter(|p| !p.is_empty()).collect();
+                Probe::Measured(
+                    stamped_rels
+                        .iter()
+                        .filter(|rel| tracked.contains(in_repo(rel).as_str()))
+                        .count(),
+                )
+            }
+        }
+    };
+
+    BundleInCheckout::Repo {
+        stamped_tracked,
+        dirty_bundle,
     }
 }
 
@@ -679,16 +834,39 @@ fn measure(git: &Git<'_>, dir: &Path, located: Located, scope: DirtyScope) -> Re
 
     let as_of = fetch_age(&located, &upstream_ref);
 
-    let status_args: &[&str] = match scope {
-        DirtyScope::Subtree => &["status", "--porcelain", "--untracked-files=no", "--", "."],
-        DirtyScope::WholeTree => &["status", "--porcelain", "--untracked-files=no"],
-    };
-    let dirty = match git.run(dir, status_args) {
+    // Tracked changes only, the cheapest status git offers: no untracked
+    // walk, no rename detection, no descent into submodules. `-z` porcelain
+    // paths are toplevel-relative and unquoted.
+    const STATUS: &[&str] = &[
+        "status",
+        "--porcelain",
+        "-z",
+        "--untracked-files=no",
+        "--no-renames",
+        "--ignore-submodules=all",
+    ];
+    let mut status_args: Vec<&str> = STATUS.to_vec();
+    if let DirtyScope::Subtree = scope {
+        status_args.extend(["--", "."]);
+    }
+    let changed: Probe<Vec<String>> = match git.run(dir, &status_args) {
         Err(reason) => Probe::Unknown(reason),
         Ok(out) if !out.success => {
             Probe::Unknown(format!("git status failed: {}", first_line(&out.stderr)))
         }
-        Ok(out) => Probe::Measured(out.stdout.lines().filter(|l| !l.is_empty()).count()),
+        // Each record is `XY <path>`.
+        Ok(out) => Probe::Measured(
+            out.stdout
+                .split('\0')
+                .filter_map(|r| r.get(3..))
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+                .collect(),
+        ),
+    };
+    let dirty = match &changed {
+        Probe::Measured(paths) => Probe::Measured(paths.len()),
+        Probe::Unknown(r) => Probe::Unknown(r.clone()),
     };
 
     RepoState {
@@ -697,6 +875,7 @@ fn measure(git: &Git<'_>, dir: &Path, located: Located, scope: DirtyScope) -> Re
         upstream,
         as_of,
         dirty,
+        changed,
     }
 }
 
@@ -850,6 +1029,8 @@ fn bundle_identity(
     let total = files.len();
     let mut identical = 0;
     let mut stamped = 0;
+    let mut stamped_rels = Vec::new();
+    let unmeasured = || Probe::Unknown("not measured".to_string());
     let mut sources = SourceIdentity {
         canonical_snapshot: canonical.map(|c| c.snapshot().clone()),
         ..SourceIdentity::default()
@@ -859,6 +1040,8 @@ fn bundle_identity(
             identical,
             total,
             stamped,
+            stamped_rels,
+            in_checkout: unmeasured(),
             sources,
         };
     };
@@ -893,6 +1076,7 @@ fn bundle_identity(
     for (file, own, body) in &present {
         if own.is_some() {
             stamped += 1;
+            stamped_rels.push(file.rel.clone());
         }
         let body = normalize_eol(body);
         let same_as_build = body == normalize_eol(&file.body);
@@ -945,6 +1129,8 @@ fn bundle_identity(
         identical,
         total,
         stamped,
+        stamped_rels,
+        in_checkout: unmeasured(),
         sources,
     }
 }
@@ -958,22 +1144,31 @@ struct GitOut {
     stderr: String,
 }
 
-/// A `git` runner for ONE probe. The first spawn failure or timeout is sticky:
-/// every later call returns the same reason at once, so a hung or missing `git`
-/// costs the probe one timeout rather than one per question.
+/// A `git` runner for ONE probe, under ONE deadline. Each spawn gets what is
+/// left of the budget, never a fresh allowance, so however many questions the
+/// probe asks it returns within the budget. A spawn failure, and a spent
+/// budget, are sticky: every later call returns the same reason at once.
 struct Git<'a> {
     program: &'a OsStr,
-    timeout: Duration,
+    budget: Duration,
+    deadline: Instant,
     dead: std::cell::RefCell<Option<String>>,
 }
 
 impl<'a> Git<'a> {
-    fn new(program: &'a OsStr, timeout: Duration) -> Self {
+    /// A runner whose deadline is `budget` from now.
+    fn new(program: &'a OsStr, budget: Duration) -> Self {
         Git {
             program,
-            timeout,
+            budget,
+            deadline: Instant::now() + budget,
             dead: std::cell::RefCell::new(None),
         }
+    }
+
+    /// The reason every question left unasked once the budget is spent.
+    fn deadline_reason(&self) -> String {
+        format!("deadline: git probe budget {:?} spent", self.budget)
     }
 
     /// `git -C <dir> --literal-pathspecs <args…>`, bounded, read-only.
@@ -982,6 +1177,12 @@ impl<'a> Git<'a> {
     fn run(&self, dir: &Path, args: &[&str]) -> Result<GitOut, String> {
         if let Some(reason) = self.dead.borrow().as_ref() {
             return Err(reason.clone());
+        }
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let reason = self.deadline_reason();
+            *self.dead.borrow_mut() = Some(reason.clone());
+            return Err(reason);
         }
         let mut cmd = crate::process_helpers::no_window(self.program);
         cmd.arg("-C")
@@ -994,11 +1195,14 @@ impl<'a> Git<'a> {
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE")
+            // The stderr matches below are git's untranslated messages.
+            .env("LC_ALL", "C")
+            .env("LANGUAGE", "C")
             // `git status` otherwise refreshes and rewrites the index: this
             // probe never writes.
             .env("GIT_OPTIONAL_LOCKS", "0");
         use crate::process_helpers::TimedOutput;
-        match crate::process_helpers::run_with_timeout_detailed(cmd, self.timeout) {
+        match crate::process_helpers::run_with_timeout_detailed(cmd, remaining) {
             Err(e) => {
                 let reason = if e.kind() == std::io::ErrorKind::NotFound {
                     "git unavailable".to_string()
@@ -1010,7 +1214,7 @@ impl<'a> Git<'a> {
             }
             Ok(run) => match run.outcome {
                 TimedOutput::TimedOut { .. } => {
-                    let reason = format!("git timed out after {:?}", self.timeout);
+                    let reason = self.deadline_reason();
                     *self.dead.borrow_mut() = Some(reason.clone());
                     Err(reason)
                 }
@@ -1088,7 +1292,7 @@ mod tests {
     }
 
     fn line_for(dir: &Path) -> String {
-        probe_with(dir, OsStr::new("git"), PROBE_TIMEOUT, None).render_line()
+        probe_with(dir, OsStr::new("git"), PROBE_BUDGET, None).render_line()
     }
 
     fn provision_both(claude: &Path) {
@@ -1119,7 +1323,8 @@ mod tests {
         let line = line_for(tmp.path());
         assert!(
             line.contains(&format!(
-                "[bundle: {m}/{m} identical-to-build {BUILD_SHA} stamped=0 served:"
+                "[bundle: {m}/{m} identical-to-build {BUILD_SHA} stamped=0 stamped-tracked=0 \
+                 dirty-bundle=0 served:"
             )),
             "{line}"
         );
@@ -1140,6 +1345,10 @@ mod tests {
         let line = line_for(tmp.path());
         assert!(line.contains(&format!("[bundle: {}/{m} ", m - 1)), "{line}");
         assert!(line.contains("dirty-claude=1]"), "{line}");
+        assert!(
+            line.contains("stamped=0 stamped-tracked=0 dirty-bundle=1 served:"),
+            "an edit to a bundled file is a bundle change: {line}"
+        );
 
         // Revert it, and clobber a DIFFERENT file the way a pre-guard
         // provisioner would: the build's body plus its provenance key.
@@ -1158,9 +1367,10 @@ mod tests {
         let line = line_for(tmp.path());
         assert!(
             line.contains(&format!(
-                "[bundle: {m}/{m} identical-to-build {BUILD_SHA} stamped=1 served:"
+                "[bundle: {m}/{m} identical-to-build {BUILD_SHA} stamped=1 stamped-tracked=1 \
+                 dirty-bundle=1 served:"
             )),
-            "a stamped clobber is still this build's bundle, and says so: {line}"
+            "a stamped TRACKED file is a clobber proven by the file itself: {line}"
         );
         assert!(line.contains("dirty-claude=1]"), "{line}");
     }
@@ -1214,7 +1424,8 @@ mod tests {
         );
         assert!(
             line.contains(&format!(
-                "[bundle: {m}/{m} identical-to-build {BUILD_SHA} stamped=0 served:"
+                "[bundle: {m}/{m} identical-to-build {BUILD_SHA} stamped=0 stamped-tracked=0 \
+                 dirty-bundle=0 served:"
             )),
             "{line}"
         );
@@ -1245,8 +1456,9 @@ mod tests {
         let line = line_for(tmp.path());
         assert!(
             line.contains(&format!(
-                "[bundle: 0/{} identical-to-build {BUILD_SHA} stamped=0 served:",
-                total()
+                "[bundle: 0/{m} identical-to-build {BUILD_SHA} stamped=0 stamped-tracked=0 \
+                 dirty-bundle={m} served:",
+                m = total()
             )),
             "{line}"
         );
@@ -1270,7 +1482,7 @@ mod tests {
         assert!(
             line.contains(&format!(
                 "[bundle: {m}/{m} identical-to-build {BUILD_SHA} stamped={stamped} \
-                 served: canonical@unloaded 0, builtin {m}, account 0, unstamped 0; \
+                 stamped-tracked=n/a dirty-bundle=n/a served: canonical@unloaded 0, builtin {m}, account 0, unstamped 0; \
                  identical-to-source {m}/{m} unverifiable=0]"
             )),
             "{line}"
@@ -1302,7 +1514,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
         let nowhere = tmp.path().join("no-such-git");
-        let line = probe_with(tmp.path(), nowhere.as_os_str(), PROBE_TIMEOUT, None).render_line();
+        let line = probe_with(tmp.path(), nowhere.as_os_str(), PROBE_BUDGET, None).render_line();
         assert!(
             line.contains("[checkout: UNKNOWN (git unavailable)]"),
             "{line}"
@@ -1314,43 +1526,62 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_hung_git_times_out_once_and_bounds_the_whole_probe() {
-        use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
         let script = tmp.path().join("slow-git");
-        std::fs::write(&script, "#!/bin/sh\nexec sleep 5\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // A concurrently forking test thread can briefly hold the script's
-        // write descriptor (ETXTBSY). Wait that window out before timing.
-        for _ in 0..100 {
-            match Command::new(&script).stdout(Stdio::null()).spawn() {
-                Ok(mut c) => {
-                    let _ = c.kill();
-                    let _ = c.wait();
-                    break;
-                }
-                Err(e) if e.raw_os_error() == Some(26) => {
-                    std::thread::sleep(Duration::from_millis(10))
-                }
-                Err(e) => panic!("cannot exec the test script: {e}"),
-            }
-        }
+        crate::canonical_corpus::test_support::executable_script(
+            &script,
+            "#!/bin/sh\nexec sleep 5\n",
+        );
 
-        let timeout = Duration::from_millis(200);
+        let budget = Duration::from_millis(200);
         let started = Instant::now();
-        let line = probe_with(tmp.path(), script.as_os_str(), timeout, None).render_line();
+        let line = probe_with(tmp.path(), script.as_os_str(), budget, None).render_line();
         let elapsed = started.elapsed();
         assert!(
-            line.contains("[checkout: UNKNOWN (git timed out after 200ms)]"),
+            line.contains("[checkout: UNKNOWN (deadline: git probe budget 200ms spent)]"),
             "{line}"
         );
         assert!(
-            line.contains("[cwd: UNKNOWN (git timed out after 200ms)]"),
+            line.contains("[cwd: UNKNOWN (deadline: git probe budget 200ms spent)]"),
             "{line}"
         );
         assert!(
-            elapsed < timeout * 2,
-            "a hung git must cost one timeout, not one per question: took {elapsed:?}"
+            line.contains("stamped-tracked=UNKNOWN dirty-bundle=UNKNOWN"),
+            "git data that could not be read is UNKNOWN, never 0: {line}"
+        );
+        assert!(
+            elapsed < budget * 2,
+            "a hung git must cost one budget, not one per question: took {elapsed:?}"
+        );
+    }
+
+    /// Several git calls that are each slow but individually fast enough
+    /// still share ONE deadline: the probe returns within its budget and the
+    /// questions it had no time left for read UNKNOWN (deadline).
+    #[cfg(unix)]
+    #[test]
+    fn slow_git_calls_share_one_deadline() {
+        let tmp = checkout_with_bundle();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("slow-git");
+        crate::canonical_corpus::test_support::executable_script(
+            &script,
+            "#!/bin/sh\nsleep 0.15\nexec git \"$@\"\n",
+        );
+        // Four spawns (locate, rev-list, status, cwd locate) at 150 ms each
+        // need 600 ms; the budget is 400 ms.
+        let budget = Duration::from_millis(400);
+        let started = Instant::now();
+        let line = probe_with(tmp.path(), script.as_os_str(), budget, None).render_line();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < budget + Duration::from_millis(300),
+            "the probe must end near its budget, not at the sum of its calls: {elapsed:?}"
+        );
+        assert!(
+            line.contains("UNKNOWN (deadline: git probe budget 400ms spent)"),
+            "{line}"
         );
     }
 
@@ -1501,11 +1732,11 @@ mod tests {
         let corpus = canonical_corpus_with(name, body, CANON_SHA);
         let tmp = served_one("canonical", Some(CANON_SHA.get(..12).unwrap()), body);
         let line =
-            probe_with(tmp.path(), OsStr::new("git"), PROBE_TIMEOUT, Some(&corpus)).render_line();
+            probe_with(tmp.path(), OsStr::new("git"), PROBE_BUDGET, Some(&corpus)).render_line();
         assert!(
             line.contains(&format!(
-                "[bundle: 0/{} identical-to-build {BUILD_SHA} stamped=1 served: \
-                 canonical@{} 1 fetched 2026-09-26T00:00:00Z, builtin 0, account 0, \
+                "[bundle: 0/{} identical-to-build {BUILD_SHA} stamped=1 stamped-tracked=n/a \
+                 dirty-bundle=n/a served: canonical@{} 1 fetched 2026-09-26T00:00:00Z, builtin 0, account 0, \
                  unstamped 0; identical-to-source 1/1 unverifiable=0]",
                 total(),
                 CANON_SHA.get(..12).unwrap()
@@ -1518,7 +1749,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         std::fs::write(&path, format!("{text}edited\n")).unwrap();
         let line =
-            probe_with(tmp.path(), OsStr::new("git"), PROBE_TIMEOUT, Some(&corpus)).render_line();
+            probe_with(tmp.path(), OsStr::new("git"), PROBE_BUDGET, Some(&corpus)).render_line();
         assert!(
             line.contains("identical-to-source 0/1 unverifiable=0]"),
             "{line}"
@@ -1534,7 +1765,7 @@ mod tests {
         let corpus = canonical_corpus_with(name, body, CANON_SHA);
         let tmp = served_one("canonical", Some("0123456789ab"), body);
         let line =
-            probe_with(tmp.path(), OsStr::new("git"), PROBE_TIMEOUT, Some(&corpus)).render_line();
+            probe_with(tmp.path(), OsStr::new("git"), PROBE_BUDGET, Some(&corpus)).render_line();
         assert!(line.contains("canonical@abcdef012345 1 fetched"), "{line}");
         assert!(
             line.contains("identical-to-source 0/0 unverifiable=1]"),
@@ -1542,7 +1773,7 @@ mod tests {
         );
 
         // With no snapshot loaded at all, the same file is unverifiable too.
-        let line = probe_with(tmp.path(), OsStr::new("git"), PROBE_TIMEOUT, None).render_line();
+        let line = probe_with(tmp.path(), OsStr::new("git"), PROBE_BUDGET, None).render_line();
         assert!(
             line.contains("served: canonical@unloaded 1, builtin 0"),
             "{line}"
@@ -1583,6 +1814,85 @@ mod tests {
                  identical-to-source {skill_files}/{skill_files} unverifiable=0]"
             )),
             "{line}"
+        );
+    }
+
+    /// A repo whose `.claude/` is NOT tracked gets an ordinary stamped
+    /// provision: stamped files, none of them tracked.
+    #[test]
+    fn an_untracked_stamped_provision_is_not_a_clobber() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        git(tmp.path(), &["init", "--quiet"]);
+        std::fs::write(tmp.path().join("README.md"), "x").unwrap();
+        git(tmp.path(), &["add", "--", "README.md"]);
+        git(tmp.path(), &["commit", "--quiet", "--no-verify", "-m", "r"]);
+        provision_both(&tmp.path().join(".claude"));
+        let line = line_for(tmp.path());
+        let stamped = crate::fleet_commands::FLEET_COMMANDS.len()
+            + crate::fleet_skills::embedded_skills().len();
+        assert!(
+            line.contains(&format!(
+                "stamped={stamped} stamped-tracked=0 dirty-bundle=0 served:"
+            )),
+            "{line}"
+        );
+    }
+
+    /// An edit under `.claude/` to a file the bundle does not carry moves
+    /// `dirty-claude`, never `dirty-bundle`.
+    #[test]
+    fn an_unrelated_tracked_edit_is_not_a_bundle_change() {
+        let tmp = checkout_with_bundle();
+        let settings = tmp.path().join(".claude/settings.json");
+        std::fs::write(&settings, "{}\n").unwrap();
+        git(tmp.path(), &["add", "--", ".claude/settings.json"]);
+        git(tmp.path(), &["commit", "--quiet", "--no-verify", "-m", "s"]);
+        std::fs::write(&settings, "{\"x\": 1}\n").unwrap();
+        let line = line_for(tmp.path());
+        assert!(line.contains("dirty-claude=1]"), "{line}");
+        assert!(line.contains("dirty-bundle=0 served:"), "{line}");
+    }
+
+    /// A branch may be named `feat]x`; the rendered value must not close the
+    /// `checkout` token early.
+    #[test]
+    fn a_bracket_in_a_branch_name_cannot_close_the_token() {
+        let tmp = checkout_with_bundle();
+        git(tmp.path(), &["checkout", "--quiet", "-b", "feat]x"]);
+        let line = line_for(tmp.path());
+        assert!(line.contains("[checkout: "), "{line}");
+        assert!(line.contains(" feat)x@"), "{line}");
+        assert!(!line.contains("feat]x"), "{line}");
+        let checkout = line
+            .split_once("[checkout: ")
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .map(|(value, _)| value)
+            .unwrap();
+        assert!(checkout.ends_with("dirty-claude=0"), "{checkout}");
+    }
+
+    /// A memo entry is stamped when its measurement COMPLETES: a measurement
+    /// slower than the TTL is still reused right after it.
+    #[test]
+    fn the_memo_is_stamped_after_the_probe() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let key: MemoKey = (tmp.path().to_path_buf(), "memo-stamp-test");
+        let ttl = Duration::from_millis(300);
+        let calls = std::cell::Cell::new(0);
+        let slow = || {
+            calls.set(calls.get() + 1);
+            std::thread::sleep(ttl + Duration::from_millis(100));
+            ServedCorpus::unknown("slow")
+        };
+        memoised(key.clone(), ttl, slow);
+        memoised(key.clone(), ttl, || {
+            calls.set(calls.get() + 1);
+            ServedCorpus::unknown("second")
+        });
+        assert_eq!(
+            calls.get(),
+            1,
+            "the second render within the TTL of the first's COMPLETION reuses it"
         );
     }
 

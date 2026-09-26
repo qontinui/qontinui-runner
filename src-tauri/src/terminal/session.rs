@@ -3270,7 +3270,7 @@ impl TerminalSession {
         }
 
         // The served-corpus measurement for the briefing's header line. Bounded
-        // (`served_corpus::PROBE_TIMEOUT` per git spawn, one timeout at most)
+        // (`served_corpus::PROBE_BUDGET` for the whole probe, however many git spawns)
         // and fail-soft: every failure is an `UNKNOWN (<reason>)` token.
         let served = {
             let _span =
