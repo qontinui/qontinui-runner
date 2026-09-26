@@ -7,6 +7,7 @@
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import {
+  buildChangeTrackingResponse,
   changeTrackingVerdict,
   handleChangeTrackingCommand,
   type ChangeTrackerLike,
@@ -513,11 +514,10 @@ describe("changeTrackingVerdict", () => {
       { elementAction: { elementId: "btn", action: "click" } },
       createMockDeps(),
     );
-    const verdict = changeTrackingVerdict("execute_with_diff", result);
-    expect(verdict.success).toBe(false);
-    expect(verdict.error).toBe("ACTION_FAILED: Element btn not found");
-    // What the runner sends: the verdict plus the untouched result as `data`.
-    const envelope = { ...verdict, data: result };
+    // Exactly what `useChangeTrackingEvents` sends (plus requestId/type/timestamp).
+    const envelope = buildChangeTrackingResponse("execute_with_diff", result);
+    expect(envelope.success).toBe(false);
+    expect(envelope.error).toBe("ACTION_FAILED: Element btn not found");
     expect(envelope.data).toBe(ctResult);
     expect((envelope.data as typeof ctResult).diff).toBe(diff);
   });
@@ -559,10 +559,25 @@ describe("changeTrackingVerdict", () => {
     );
     const v = changeTrackingVerdict("execute_batch_with_diff", result);
     expect(v.success).toBe(false);
-    expect(v.error).toBe("ACTION_FAILED: 1 of 2 operations failed (first: operation 1: disabled)");
+    expect(v.error).toBe("ACTION_FAILED: 1 of 2 operations failed (first: operation 2: disabled)");
     expect(
       changeTrackingVerdict("execute_batch_with_diff", { results: [ops[0], ops[0]] }).success,
     ).toBe(true);
+  });
+
+  it("an empty batch is vacuously successful", () => {
+    expect(changeTrackingVerdict("execute_batch_with_diff", { results: [] })).toEqual({
+      success: true,
+    });
+  });
+
+  it("a successful response also carries the result as data", () => {
+    const r = { actionSuccess: true, diff };
+    expect(buildChangeTrackingResponse("execute_with_diff", r)).toEqual({ success: true, data: r });
+    expect(buildChangeTrackingResponse("list_bookmarks", ["a"])).toEqual({
+      success: true,
+      data: ["a"],
+    });
   });
 
   it("other change-tracking commands keep success:true", () => {

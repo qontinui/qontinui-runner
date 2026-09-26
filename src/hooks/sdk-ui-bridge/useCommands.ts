@@ -15,11 +15,14 @@ import type {
 import { extractFingerprintHashes } from "../../lib/ui-bridge/fingerprintGenerator";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { createLogger } from "@/lib/logger";
-import { relayVerdict } from "./actionOutcome";
+import { readVerdict, relayVerdict } from "./actionOutcome";
 
 const log = createLogger("useCommands");
 
 const MAX_COMMAND_HISTORY = 50;
+
+/** `sendCommand` actions whose reply is an ACTION result (read strictly). */
+const ACTION_COMMANDS: ReadonlySet<string> = new Set(["executeAction", "aiExecute"]);
 
 export interface UseCommandsReturn {
   lastCommandResult: CommandResult | null;
@@ -227,10 +230,19 @@ export function useCommands(
 
         const json = await resp.json();
         const duration = Date.now() - startTime;
-        // Strict: a reply with no boolean `success` is NOT a success. The raw
-        // body is still returned as `data` for inspection.
+        // Two definitions of success, by what the route returns:
+        // - ACTION routes (`executeAction`, `aiExecute` — both answer an
+        //   envelope with an explicit `success`) are read STRICTLY: no boolean
+        //   `success` is an INDETERMINATE failure, never a pass.
+        // - READ routes (snapshot, elements, health, metrics, …) legitimately
+        //   forward raw app JSON with no `success` key (`handle_snapshot`), so
+        //   a read succeeds when the transport is OK and the body is not an
+        //   explicit failure. Strictness there would fail every good read.
+        const verdict = ACTION_COMMANDS.has(action)
+          ? relayVerdict(json, resp)
+          : readVerdict(json, resp);
         const result: CommandResult<T> = {
-          ...relayVerdict(json, resp),
+          ...verdict,
           data: (json?.data ?? json) as T,
           duration,
         };

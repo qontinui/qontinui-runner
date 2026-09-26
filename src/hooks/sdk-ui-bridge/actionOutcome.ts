@@ -86,3 +86,22 @@ export function relayVerdict(body: unknown, resp: { ok: boolean; status: number 
     outcome: outcome.kind,
   };
 }
+
+/**
+ * Verdict for a runner HTTP relay reply to a plain DATA READ (snapshot,
+ * elements, health…). Those routes may forward raw app JSON with no `success`
+ * key, so a read succeeds on a 2xx whose body is not an explicit
+ * `success: false`. Use {@link relayVerdict} for action results instead.
+ */
+export function readVerdict(body: unknown, resp: { ok: boolean; status: number }): RelayVerdict {
+  const bodyError =
+    body !== null &&
+    typeof body === "object" &&
+    typeof (body as { error?: unknown }).error === "string"
+      ? (body as { error: string }).error
+      : undefined;
+  const explicitFailure =
+    body !== null && typeof body === "object" && (body as { success?: unknown }).success === false;
+  if (resp.ok && !explicitFailure) return { success: true, error: bodyError, outcome: "succeeded" };
+  return { success: false, error: bodyError ?? `HTTP ${resp.status}`, outcome: "failed" };
+}

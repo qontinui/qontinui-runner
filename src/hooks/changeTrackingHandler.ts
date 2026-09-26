@@ -304,6 +304,9 @@ export function changeTrackingVerdict(type: string, result: unknown): ChangeTrac
       result !== null && typeof result === "object"
         ? (result as { results?: unknown }).results
         : undefined;
+    // An empty batch is vacuously successful (`[].every(...)` semantics):
+    // nothing was asked to run, so nothing failed. The runner, not the SDK,
+    // owns this loop, so there is no SDK verdict to defer to.
     if (!Array.isArray(results)) {
       return { success: false, error: "ACTION_FAILED: batch returned no per-operation results" };
     }
@@ -311,10 +314,27 @@ export function changeTrackingVerdict(type: string, result: unknown): ChangeTrac
     if (failed.length === 0) return { success: true };
     const first = failed[0];
     const firstError = innerActionError(first.r) ?? "actionSuccess is not true";
+    // 1-based operation number, matching "N of M".
     return {
       success: false,
-      error: `ACTION_FAILED: ${failed.length} of ${results.length} operations failed (first: operation ${first.i}: ${firstError})`,
+      error: `ACTION_FAILED: ${failed.length} of ${results.length} operations failed (first: operation ${first.i + 1}: ${firstError})`,
     };
   }
   return { success: true };
+}
+
+/** The response fields the runner sends for a change-tracking request. */
+export interface ChangeTrackingResponse extends ChangeTrackingVerdict {
+  data: unknown;
+}
+
+/**
+ * Build the change-tracking response the runner sends back over IPC: the
+ * outer verdict from {@link changeTrackingVerdict}, with the command result
+ * ALWAYS kept as `data` — on a failure too, so the diff observed around a
+ * failed action still reaches the HTTP caller. `useChangeTrackingEvents`
+ * sends exactly this (plus requestId/type/timestamp).
+ */
+export function buildChangeTrackingResponse(type: string, result: unknown): ChangeTrackingResponse {
+  return { ...changeTrackingVerdict(type, result), data: result };
 }

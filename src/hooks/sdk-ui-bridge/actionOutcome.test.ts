@@ -8,6 +8,7 @@ import {
   actionOutcome,
   actionOutcomeError,
   actionSucceeded,
+  readVerdict,
   relayVerdict,
   INDETERMINATE_ACTION_ERROR,
 } from "./actionOutcome";
@@ -78,5 +79,20 @@ describe("relayVerdict", () => {
       error: "HTTP 404",
       outcome: "failed",
     });
+  });
+});
+
+describe("readVerdict", () => {
+  it("a 2xx read with no success key succeeds (raw app JSON)", () => {
+    expect(readVerdict({ elements: [] }, { ok: true, status: 200 }).success).toBe(true);
+  });
+
+  it("an explicit success:false or a non-2xx fails", () => {
+    expect(readVerdict({ success: false, error: "x" }, { ok: true, status: 200 })).toEqual({
+      success: false,
+      error: "x",
+      outcome: "failed",
+    });
+    expect(readVerdict({ elements: [] }, { ok: false, status: 500 }).error).toBe("HTTP 500");
   });
 });

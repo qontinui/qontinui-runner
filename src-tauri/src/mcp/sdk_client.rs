@@ -1303,9 +1303,7 @@ fn append_tab_id_query(path: &str, tab_id: Option<&str>) -> String {
 /// (a relay frame whose `result` was absent arrives as `null`) is rewritten to
 /// an explicit `success: false` + `INDETERMINATE:` error instead of reading as
 /// success here and at every permissive consumer downstream.
-fn ws_element_action_result(
-    data: serde_json::Value,
-) -> (serde_json::Value, bool, Option<String>) {
+fn ws_element_action_result(data: serde_json::Value) -> (serde_json::Value, bool, Option<String>) {
     let (data, outcome) = super::ui_bridge::request::normalize_action_result(data);
     let err = outcome.error_message();
     (data, outcome.succeeded(), err)
@@ -1314,12 +1312,14 @@ fn ws_element_action_result(
 /// `(body, success, error)` for the IPC fallback arm of
 /// [`handle_element_action`]. Strict: only an explicit `success: true` is
 /// wrapped as a success — an absent key used to be re-minted as `true` here.
-fn ipc_element_action_result(
-    data: serde_json::Value,
-) -> (serde_json::Value, bool, Option<String>) {
+fn ipc_element_action_result(data: serde_json::Value) -> (serde_json::Value, bool, Option<String>) {
     let (data, outcome) = super::ui_bridge::request::normalize_action_result(data);
     if outcome.succeeded() {
-        (serde_json::json!({ "success": true, "data": data }), true, None)
+        (
+            serde_json::json!({ "success": true, "data": data }),
+            true,
+            None,
+        )
     } else {
         let err = outcome.error_message();
         (data, false, err)
@@ -7217,7 +7217,11 @@ mod element_action_result_tests {
         let (body, ok, err) = ws_element_action_result(json!({ "elementId": "x" }));
         assert!(!ok, "a success-less WS body must not read as success");
         assert_eq!(err.as_deref(), Some(INDETERMINATE_ACTION_ERROR));
-        assert_eq!(body["success"], json!(false), "caller must see an explicit false");
+        assert_eq!(
+            body["success"],
+            json!(false),
+            "caller must see an explicit false"
+        );
         assert_eq!(body["elementId"], json!("x"), "other fields are kept");
     }
 
@@ -7256,7 +7260,10 @@ mod element_action_result_tests {
     fn ipc_arm_explicit_true_is_wrapped_and_false_passes_through() {
         let (body, ok, _) = ipc_element_action_result(json!({ "success": true }));
         assert!(ok);
-        assert_eq!(body, json!({ "success": true, "data": { "success": true } }));
+        assert_eq!(
+            body,
+            json!({ "success": true, "data": { "success": true } })
+        );
 
         let (body, ok, err) =
             ipc_element_action_result(json!({ "success": false, "error": "nope" }));

@@ -58,12 +58,34 @@ describe("useCommands.executeAction", () => {
 });
 
 describe("useCommands.sendCommand", () => {
-  it("a reply with NO success key is a failure, raw body kept as data", async () => {
-    tracedFetch.mockResolvedValue(reply({ elements: [] }));
-    const r = await useHookUnderTest().sendCommand("getElements");
+  it("executeAction: a reply with NO success key is a failure, body kept as data", async () => {
+    tracedFetch.mockResolvedValue(reply({}));
+    const r = await useHookUnderTest().sendCommand("executeAction", { elementId: "b" });
     expect(r.success).toBe(false);
     expect(r.outcome).toBe("indeterminate");
+    expect(r.data).toEqual({});
+  });
+
+  it("aiExecute is an action route too: no success key is a failure", async () => {
+    tracedFetch.mockResolvedValue(reply({ executedAction: "click" }));
+    const r = await useHookUnderTest().sendCommand("aiExecute", { instruction: "x" });
+    expect(r.success).toBe(false);
+  });
+
+  it("a READ (getSnapshot) with raw app JSON and no success key succeeds", async () => {
+    tracedFetch.mockResolvedValue(reply({ elements: [] }));
+    const r = await useHookUnderTest().sendCommand("getSnapshot");
+    expect(r.success).toBe(true);
     expect(r.data).toEqual({ elements: [] });
+  });
+
+  it("a READ fails on an explicit success:false or a non-2xx", async () => {
+    tracedFetch.mockResolvedValue(reply({ success: false, error: "no app" }));
+    const bad = await useHookUnderTest().sendCommand("getSnapshot");
+    expect(bad.success).toBe(false);
+    expect(bad.error).toBe("no app");
+    tracedFetch.mockResolvedValue(reply({ elements: [] }, 503));
+    expect((await useHookUnderTest().sendCommand("getElements")).success).toBe(false);
   });
 
   it("explicit success:true succeeds", async () => {
