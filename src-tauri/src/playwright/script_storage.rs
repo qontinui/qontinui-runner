@@ -170,9 +170,11 @@ impl Default for PlaywrightLibrary {
 /// between `com.qontinui.runner` and `playwright`, so concurrent runners
 /// don't share playwright tests or results.
 fn get_playwright_dir() -> Result<PathBuf, String> {
-    let base = dirs::config_dir()
-        .ok_or("Failed to get config directory")?
-        .join("com.qontinui.runner");
+    let base = qontinui_runner_lib::ambient::runner_platform_config_root(
+        "playwright::script_storage::get_playwright_dir",
+    )
+    .ok_or("Failed to get config directory")?
+    .join("com.qontinui.runner");
     let app_data_dir = crate::instance::scope_path(&base).join("playwright");
 
     // Create directory if it doesn't exist
@@ -559,5 +561,28 @@ mod tests {
         let library = PlaywrightLibrary::default();
         assert!(library.scripts.is_empty());
         assert_eq!(library.version, "1.0.0");
+    }
+}
+
+/// A test process never resolves the operator's real
+/// `<config>/com.qontinui.runner`: this path roots at
+/// `ambient::runner_platform_config_root`, which in a test harness is the
+/// hermetic deflected root. Plan
+/// `2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json`,
+/// Phase 4.
+#[cfg(test)]
+mod config_root_deflection_tests {
+    use super::*;
+
+    #[test]
+    fn playwright_dir_is_deflected_in_a_test_process() {
+        let root = qontinui_runner_lib::ambient::deflected_config_root();
+        let path = get_playwright_dir().expect("resolves");
+        assert!(
+            path.starts_with(&root),
+            "{} must resolve under the deflected root {} in a test process",
+            path.display(),
+            root.display()
+        );
     }
 }

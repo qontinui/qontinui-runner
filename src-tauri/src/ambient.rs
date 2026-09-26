@@ -898,6 +898,31 @@ pub fn test_config_root_override(_source: &str) -> Option<PathBuf> {
     None
 }
 
+/// The platform config ROOT (`dirs::config_dir()`, the directory
+/// `com.qontinui.runner/` hangs under) for every runner path that roots there
+/// DIRECTLY rather than through `QONTINUI_CONFIG_DIR` — the prompt library,
+/// prompt snippets, the context library, playwright storage, the config
+/// library, the active-instance ledger, the agent command/skill caches, the
+/// backup set, and the machine-global account roster and its readers.
+///
+/// Identical to `dirs::config_dir()` in every non-test process. In a test
+/// harness it is [`test_config_root_override`]'s hermetic root, so a test that
+/// reaches one of those writers lands in the void instead of in the operator's
+/// real `~/.config/com.qontinui.runner` (`%APPDATA%` on Windows, which no env
+/// override can redirect).
+///
+/// `source` names the caller, for the one-line announcement.
+///
+/// This is the ONE place a runner-config path may call `dirs::config_dir()`
+/// besides the two `settings.json` resolvers; `config_dir_scan_guard` (in the
+/// runner bin) fails by name on any other call site that is not allowlisted
+/// as a foreign app's directory. Plan
+/// `2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json`,
+/// Phase 4.
+pub fn runner_platform_config_root(source: &str) -> Option<PathBuf> {
+    test_config_root_override(source).or_else(dirs::config_dir)
+}
+
 // ============================================================================
 // The fixture
 // ============================================================================
@@ -1505,6 +1530,32 @@ mod tests {
         .expect("no panic on the deflect arm");
         assert_eq!(verdict, Verdict::Proceed, "precondition: canary arm 3");
         assert_eq!(override_dir, Some(deflected_config_dir()));
+    }
+
+    /// The platform-root door every raw runner-config path now goes through
+    /// answers the deflected ROOT in a test process — on an unguarded thread,
+    /// on a guarded one, and under `strict_canary()` (it never panics: the
+    /// hermetic answer is the whole fix, see [`test_config_root_override`]).
+    #[test]
+    fn runner_platform_config_root_is_the_deflected_root_in_a_test_process() {
+        assert_eq!(
+            runner_platform_config_root("ambient::tests unguarded probe"),
+            Some(deflected_config_root())
+        );
+        {
+            let _amb = IsolatedAmbient::new();
+            assert_eq!(
+                runner_platform_config_root("ambient::tests guarded probe"),
+                Some(deflected_config_root())
+            );
+        }
+        let strict = std::thread::spawn(|| {
+            let _strict = strict_canary();
+            runner_platform_config_root("ambient::tests strict probe")
+        })
+        .join()
+        .expect("the platform-root door never panics");
+        assert_eq!(strict, Some(deflected_config_root()));
     }
 
     // ---- the canary ----
