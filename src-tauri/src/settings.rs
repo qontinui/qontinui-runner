@@ -4844,7 +4844,8 @@ fn complete_settings_load(loaded: LoadedSettings) -> LoadedSettings {
                 let reread = read_settings_from_path(&target);
                 if reread.provenance == SettingsProvenance::Loaded {
                     warn!(
-                        "refusing FreshInstall persist: {refusal} — answering the file                          now at {} instead",
+                        "refusing FreshInstall persist: {refusal} — answering the file \
+                         now at {} instead",
                         target.display()
                     );
                     // A `Loaded` document is never refused, so this recursion
@@ -7720,6 +7721,34 @@ mod config_dir_race_tests {
             ),
             None,
             "a stale temp file is a crash leftover, not a write in flight"
+        );
+    }
+
+    /// A refused persist whose re-read finds an UNREADABLE file is the one
+    /// case the load cannot answer: it reports `Unreadable`, names the refusal
+    /// AND the re-read's own error, and writes nothing over the file.
+    #[test]
+    fn a_refused_persist_whose_reread_finds_a_corrupt_file_reports_both_errors() {
+        let _g = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(RACE_ENV_KEYS);
+        let dir_a = tempfile::tempdir().expect("tempdir A");
+        let loaded = fresh_install_in(dir_a.path());
+
+        // A file appears between the read and the persist, but it is not JSON.
+        let path = dir_a.path().join(SETTINGS_FILE);
+        std::fs::write(&path, b"{ not json").expect("corrupt file");
+        let completed = complete_settings_load(loaded);
+
+        assert_eq!(completed.provenance, SettingsProvenance::Unreadable);
+        let error = completed.error.unwrap_or_default();
+        assert!(
+            error.contains("refused FreshInstall persist") && error.contains("; re-read: "),
+            "the error must name the refusal and the re-read's failure, got: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read back"),
+            b"{ not json",
+            "a refused persist must leave the file it found untouched"
         );
     }
 
