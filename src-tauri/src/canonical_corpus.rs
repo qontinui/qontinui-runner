@@ -91,7 +91,7 @@ use std::time::Duration;
 
 use tracing::{info, warn};
 
-use crate::process_helpers::{TimedOutput, TimedRun};
+use crate::process_helpers::{scrubbed_git, TimedOutput, TimedRun};
 
 /// Budget for an incremental `git fetch` into a mirror that already holds the
 /// tracking ref. The same 20 s class `git_trunk::TRUNK_GIT_TIMEOUT` uses for a
@@ -131,6 +131,20 @@ const TRACKING_REF: &str = "refs/remotes/origin/main";
 
 /// The mirror's path under the per-instance runner config dir.
 const MIRROR_DIR: &str = "canonical/qontinui-claude-config.git";
+
+/// The file inside the mirror whose OS advisory lock marks its one writer.
+/// Git ignores a file it does not know in a git dir, and nothing here ever
+/// deletes it: the lock is the kernel's, released when its holder closes the
+/// file or dies, so a crashed writer can never leave the mirror locked.
+const WRITER_LOCK: &str = "qontinui-writer.lock";
+
+/// How long a refused [`WRITER_LOCK`] is re-tried before this tick reads as
+/// contended. A lock is per open file description, and a child some OTHER
+/// thread of this process forks shares every descriptor until its `exec`
+/// closes the close-on-exec ones — so a lock this process just released can
+/// read as held for that instant. A peer's real refresh holds it for a whole
+/// fetch, seconds at the least, so this grace never outwaits one.
+const WRITER_LOCK_GRACE: Duration = Duration::from_millis(500);
 
 /// The two trees a load reads.
 const COMMANDS_DIR: &str = ".claude/commands";
@@ -241,27 +255,19 @@ impl CanonicalCorpus {
     }
 }
 
-/// A git command that can only ever address the repository its caller names
-/// and whose messages are the untranslated C-locale text: the caller's
-/// repository environment (`GIT_DIR`, `GIT_WORK_TREE`, …) is removed, so an
-/// inherited value can never redirect a read or a fetch at some other
-/// repository, and `LC_ALL` / `LANGUAGE` are `C`, so a stderr match is never
-/// defeated by a translation. `no_window` also applies the prompt-proof git
-/// posture, so a credential prompt fails instead of blocking.
-fn scrubbed_git(program: &OsStr) -> std::process::Command {
-    let mut cmd = crate::process_helpers::no_window(program);
-    for var in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_COMMON_DIR",
-    ] {
-        cmd.env_remove(var);
-    }
-    cmd.env("LC_ALL", "C").env("LANGUAGE", "C");
-    cmd
+/// Proof that this process is the mirror's writer: an exclusive OS advisory
+/// lock on [`WRITER_LOCK`], held from before the leftover-clearing through the
+/// last read of a load, and released on drop.
+///
+/// One refresh loop per process ([`start_refresh_loop`]) does not make one
+/// writer per mirror: the mirror lives in the per-instance scope, and two
+/// processes can resolve the same scope — a bare-launched runner beside the
+/// primary. Without this lock each would read the other's in-flight
+/// `tmp_pack_*` and ref locks as the leftovers of a killed fetch and delete
+/// them.
+#[derive(Debug)]
+pub(crate) struct WriterLock {
+    _file: std::fs::File,
 }
 
 /// A handle on one bare mirror: where it lives, what it fetches, and how git
@@ -340,15 +346,49 @@ impl Mirror {
         })
     }
 
+    /// Take the mirror's [`WriterLock`] without waiting on a holder — only
+    /// the short [`WRITER_LOCK_GRACE`] — creating the mirror dir if need be.
+    /// `Ok(None)` when another process holds it — that
+    /// process is mid-refresh, so this one must not touch the mirror now.
+    /// `Err` when the lock cannot be taken or refused at all (the file cannot
+    /// be opened, or the filesystem has no advisory locks).
+    pub(crate) fn try_lock_writer(&self) -> Result<Option<WriterLock>, String> {
+        std::fs::create_dir_all(&self.git_dir)
+            .map_err(|e| format!("could not create the mirror dir: {e}"))?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(self.git_dir.join(WRITER_LOCK))
+            .map_err(|e| format!("could not open the mirror's writer lock: {e}"))?;
+        let give_up = std::time::Instant::now() + WRITER_LOCK_GRACE;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Some(WriterLock { _file: file })),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= give_up {
+                        return Ok(None);
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(format!("could not take the mirror's writer lock: {e}"))
+                }
+            }
+        }
+    }
+
     /// Remove what a fetch killed at its budget leaves behind: the partial
     /// pack `index-pack` was writing (`objects/pack/tmp_*`, which otherwise
     /// stays forever), and the lock files a later fetch would refuse to take.
     ///
-    /// Safe because the mirror has exactly one writer — this process's
-    /// refresh loop, which never runs two refreshes at once — so nothing is
-    /// ever mid-write here when a refresh begins. Returns how many entries
-    /// were removed.
-    fn clear_interrupted_fetch(&self) -> usize {
+    /// Safe only under the [`WriterLock`] the caller must hold: the lock is
+    /// what makes this process the mirror's one writer, so nothing — in this
+    /// process or another — is mid-write here when a refresh begins. The
+    /// fetch it precedes runs with automatic gc and maintenance off, so no
+    /// detached `git gc` from an earlier refresh outlives its lock either.
+    /// Returns how many entries were removed.
+    fn clear_interrupted_fetch(&self, _held: &WriterLock) -> usize {
         let mut removed = 0;
         if let Ok(dir) = std::fs::read_dir(self.git_dir.join("objects").join("pack")) {
             for entry in dir.flatten() {
@@ -372,12 +412,26 @@ impl Mirror {
         removed
     }
 
+    /// [`Self::fetch`] under a freshly taken [`WriterLock`]; an `Err` when
+    /// another process holds it.
+    pub(crate) fn refresh(&self) -> Result<CanonicalSnapshot, String> {
+        match self.try_lock_writer()? {
+            Some(held) => self.fetch(&held),
+            None => Err("another process is refreshing the mirror".to_string()),
+        }
+    }
+
     /// Fetch `main`'s tip from the URL into [`TRACKING_REF`] and resolve it to
     /// a full sha. One network operation: [`FIRST_FETCH_TIMEOUT`] into an
     /// empty mirror, the fetch budget after.
-    pub(crate) fn refresh(&self) -> Result<CanonicalSnapshot, String> {
+    ///
+    /// `gc.auto=0` and `maintenance.auto=false` keep the fetch from starting a
+    /// detached `git gc` / `git maintenance`: one would outlive both the
+    /// [`WriterLock`] and the child-tree guard, and rewrite packs while the
+    /// next writer clears what it takes for leftovers.
+    fn fetch(&self, held: &WriterLock) -> Result<CanonicalSnapshot, String> {
         self.ensure_init()?;
-        let cleared = self.clear_interrupted_fetch();
+        let cleared = self.clear_interrupted_fetch(held);
         if cleared > 0 {
             info!(
                 "canonical_corpus: removed {cleared} leftover(s) of an interrupted fetch from \
@@ -392,6 +446,10 @@ impl Mirror {
         let mut fetch = self.in_mirror();
         fetch
             .args([
+                "-c",
+                "gc.auto=0",
+                "-c",
+                "maintenance.auto=false",
                 "fetch",
                 "--quiet",
                 "--no-tags",
@@ -771,6 +829,9 @@ pub(crate) struct Published {
     /// So a failure repeating on every timer tick is logged once rather than
     /// every fifteen minutes forever.
     last_failure: Mutex<Option<String>>,
+    /// So a tick skipped because another process holds the mirror is logged
+    /// once per run of such ticks, not on every one.
+    contention_logged: std::sync::atomic::AtomicBool,
 }
 
 impl Published {
@@ -778,6 +839,7 @@ impl Published {
         Self {
             corpus: RwLock::new(None),
             last_failure: Mutex::new(None),
+            contention_logged: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -800,12 +862,29 @@ impl Published {
     }
 
     fn recovered(&self) {
+        self.contention_logged
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let mut last = self
             .last_failure
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(prev) = last.take() {
             info!("canonical_corpus: refresh recovered (previously: {prev})");
+        }
+    }
+
+    /// A tick skipped because another process holds the mirror's
+    /// [`WriterLock`]. Not a failure: that process is refreshing the same
+    /// mirror, and the next tick here loads whatever it fetched.
+    fn contended(&self) {
+        if !self
+            .contention_logged
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            info!(
+                "canonical_corpus: another process is refreshing this instance's mirror; \
+                 skipping this refresh (logged once until a refresh here succeeds)"
+            );
         }
     }
 
@@ -901,13 +980,28 @@ fn bundled_skill_names() -> Vec<String> {
 ///   next tick sees a sha that still differs and retries it.
 /// - A failed fetch keeps the previous generation: a stale canonical copy is
 ///   still the newest one this device can read.
+/// - A mirror whose [`WriterLock`] another process holds is not touched at
+///   all this tick — no clear, no fetch, no load — and the previous
+///   generation keeps serving; that is contention, not a failure.
 pub(crate) fn refresh_into(
     mirror: &Mirror,
     published: &Published,
     command_names: &[&str],
     skill_names: &[&str],
 ) -> Option<CanonicalSnapshot> {
-    let snapshot = match mirror.refresh() {
+    // Held to the end of this function: the clear, the fetch AND the load.
+    let held = match mirror.try_lock_writer() {
+        Ok(Some(held)) => held,
+        Ok(None) => {
+            published.contended();
+            return published.snapshot();
+        }
+        Err(why) => {
+            published.failed(why);
+            return published.snapshot();
+        }
+    };
+    let snapshot = match mirror.fetch(&held) {
         Ok(snapshot) => snapshot,
         Err(why) => {
             published.failed(why);
@@ -961,9 +1055,10 @@ static LOOP_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// Start the background refresher: a short boot grace, then a refresh every
 /// [`REFRESH_INTERVAL`], each on the blocking pool. Hung beside the embedded
 /// defaults publisher in `mcp_api::create_router`, never on a spawn path. Once
-/// per process: a second call (a second router) is a no-op, so the mirror is
-/// never fetched by two loops at once — which is what makes
-/// [`Mirror::clear_interrupted_fetch`] safe.
+/// per process: a second call (a second router) is a no-op. That keeps one
+/// loop per PROCESS; one writer per MIRROR — what makes
+/// [`Mirror::clear_interrupted_fetch`] safe — is the [`WriterLock`] each
+/// refresh takes, since two processes can share a mirror.
 pub(crate) fn start_refresh_loop() {
     if LOOP_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return;
@@ -1227,6 +1322,8 @@ mod tests {
             "GIT_DIR",
             "GIT_WORK_TREE",
             "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
             "GIT_COMMON_DIR",
         ] {
             assert_eq!(envs.get(OsStr::new(var)), Some(&None), "{var} is removed");
@@ -1437,6 +1534,73 @@ mod tests {
         let published = Published::new();
         assert_eq!(refresh_into(&m, &published, &["vet-plan"], &[]), None);
         assert!(published.get().is_none());
+    }
+
+    /// Another process mid-refresh holds the writer lock: this tick leaves
+    /// the mirror alone — its in-flight pack is NOT cleared as a leftover —
+    /// and records no failure. Once the lock is free the refresh proceeds.
+    #[test]
+    fn a_mirror_another_process_is_writing_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = remote_with(tmp.path(), &[(".claude/commands/vet-plan.md", "# canon\n")]);
+        let m = mirror(tmp.path(), &url);
+        let published = Published::new();
+        refresh_into(&m, &published, &["vet-plan"], &[]).expect("first load");
+        let first = published.snapshot().unwrap();
+
+        // A second handle on the same mirror dir stands in for the other
+        // process: the advisory lock is per open file, so it conflicts here.
+        let peer = mirror(tmp.path(), &url);
+        let held = peer.try_lock_writer().unwrap().expect("the peer takes it");
+        let in_flight = tmp.path().join("mirror.git/objects/pack/tmp_pack_Peer01");
+        std::fs::write(&in_flight, b"being written").unwrap();
+        commit_files(tmp.path(), &[(".claude/commands/vet-plan.md", "# next\n")]);
+
+        assert!(m.try_lock_writer().unwrap().is_none(), "held elsewhere");
+        assert!(m.refresh().is_err(), "a bare refresh refuses too");
+        let served = refresh_into(&m, &published, &["vet-plan"], &[]);
+        assert_eq!(served, Some(first.clone()), "the previous generation stays");
+        assert!(in_flight.exists(), "the peer's in-flight pack is untouched");
+        assert!(
+            published.last_failure.lock().unwrap().is_none(),
+            "contention is not a failure"
+        );
+
+        drop(held);
+        let next = refresh_into(&m, &published, &["vet-plan"], &[]).expect("refreshed");
+        assert_ne!(next.sha, first.sha);
+        assert!(!in_flight.exists(), "now a leftover, and cleared");
+        assert_eq!(
+            published.get().unwrap().commands.bodies["vet-plan"],
+            "# next\n"
+        );
+    }
+
+    /// The fetch never starts a detached gc or maintenance run that would
+    /// outlive the writer lock.
+    #[cfg(unix)]
+    #[test]
+    fn the_fetch_turns_off_automatic_gc_and_maintenance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = remote_with(tmp.path(), &[(".claude/commands/vet-plan.md", "# canon\n")]);
+        let log = tmp.path().join("argv.log");
+        let wrapper = tmp.path().join("logging-git");
+        test_support::executable_script(
+            &wrapper,
+            &format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\nexec git \"$@\"\n",
+                log.display()
+            ),
+        );
+        let m = mirror(tmp.path(), &url).with_program(&wrapper);
+        m.refresh().expect("refresh");
+        let argv = std::fs::read_to_string(&log).unwrap();
+        let fetch = argv
+            .lines()
+            .find(|l| l.contains(" fetch "))
+            .expect("a fetch ran");
+        assert!(fetch.contains("-c gc.auto=0"), "{fetch}");
+        assert!(fetch.contains("-c maintenance.auto=false"), "{fetch}");
     }
 
     // -- the rung inside registry resolution ---------------------------------

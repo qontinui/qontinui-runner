@@ -1171,6 +1171,23 @@ impl<'a> Git<'a> {
         format!("deadline: git probe budget {:?} spent", self.budget)
     }
 
+    /// The command [`Self::run`] spawns. Built on the one scrubbed builder the
+    /// canonical mirror uses too: an inherited repository environment
+    /// (`GIT_DIR`, `GIT_OBJECT_DIRECTORY`, …) would make `-C` consult the
+    /// WRONG repository or object store, and the stderr matches in the probe
+    /// are git's untranslated C-locale messages.
+    fn command(&self, dir: &Path, args: &[&str]) -> std::process::Command {
+        let mut cmd = crate::process_helpers::scrubbed_git(self.program);
+        cmd.arg("-C")
+            .arg(dir)
+            .arg("--literal-pathspecs")
+            .args(args)
+            // `git status` otherwise refreshes and rewrites the index: this
+            // probe never writes.
+            .env("GIT_OPTIONAL_LOCKS", "0");
+        cmd
+    }
+
     /// `git -C <dir> --literal-pathspecs <args…>`, bounded, read-only.
     ///
     /// `Err` is a reason fit for an `UNKNOWN (…)` token.
@@ -1184,23 +1201,7 @@ impl<'a> Git<'a> {
             *self.dead.borrow_mut() = Some(reason.clone());
             return Err(reason);
         }
-        let mut cmd = crate::process_helpers::no_window(self.program);
-        cmd.arg("-C")
-            .arg(dir)
-            .arg("--literal-pathspecs")
-            .args(args)
-            // An inherited GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE would make
-            // `-C` consult the WRONG repository — the same discipline as
-            // `provision_guard`'s probe.
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            // The stderr matches below are git's untranslated messages.
-            .env("LC_ALL", "C")
-            .env("LANGUAGE", "C")
-            // `git status` otherwise refreshes and rewrites the index: this
-            // probe never writes.
-            .env("GIT_OPTIONAL_LOCKS", "0");
+        let cmd = self.command(dir, args);
         use crate::process_helpers::TimedOutput;
         match crate::process_helpers::run_with_timeout_detailed(cmd, remaining) {
             Err(e) => {
@@ -1272,6 +1273,36 @@ mod tests {
 
     fn total() -> usize {
         bundled_files().len()
+    }
+
+    /// The probe's git cannot be redirected at another repository or object
+    /// store, speaks the C locale, and takes no optional lock.
+    #[test]
+    fn the_probe_git_is_scrubbed_and_lock_free() {
+        let git = Git::new(OsStr::new("git"), Duration::from_secs(1));
+        let cmd = git.command(Path::new("."), &["status"]);
+        let envs: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        for var in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_COMMON_DIR",
+        ] {
+            assert_eq!(envs.get(OsStr::new(var)), Some(&None), "{var} is removed");
+        }
+        for (var, value) in [
+            ("LC_ALL", "C"),
+            ("LANGUAGE", "C"),
+            ("GIT_OPTIONAL_LOCKS", "0"),
+        ] {
+            assert_eq!(
+                envs.get(OsStr::new(var)),
+                Some(&Some(OsStr::new(value))),
+                "{var}={value}"
+            );
+        }
     }
 
     /// A committed checkout whose `.claude/` holds every bundled file verbatim.
