@@ -119,6 +119,10 @@ impl AccessibilityManager {
         target: ConnectionTarget,
         timeout_ms: u64,
     ) -> anyhow::Result<()> {
+        // Drop the previous connection's forwarder first: if this reconnect
+        // fails, no stale forwarder may keep `has_native_events` true.
+        self.stop_event_forwarding();
+
         // On Windows, detect Java Swing/AWT windows (SunAwtFrame, SWT_Window0,
         // …) and route to the JAB adapter instead of UIA — UIA sees those
         // windows as opaque HWNDs with zero child elements.
@@ -133,7 +137,12 @@ impl AccessibilityManager {
                     let mut jab = Box::new(JabAdapter::new()) as Box<dyn PlatformAdapter>;
                     match jab.connect(target.clone(), timeout_ms).await {
                         Ok(()) => {
-                            self.native_adapter = jab;
+                            // Release the outgoing adapter's connection and
+                            // event registration before replacing it.
+                            let mut previous = std::mem::replace(&mut self.native_adapter, jab);
+                            if let Err(e) = previous.disconnect().await {
+                                debug!("Disconnecting the replaced adapter failed: {}", e);
+                            }
                             let _ = self.event_tx.send(A11yEvent::ConnectionChanged {
                                 connected: true,
                                 backend: self.native_adapter.backend_name().to_string(),

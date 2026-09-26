@@ -1,7 +1,8 @@
 //! Tests for `AccessibilityManager` forwarding the native adapter's own event
 //! stream (`PlatformAdapter::subscribe_events`) into `subscribe()`.
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::{broadcast, mpsc};
@@ -16,11 +17,25 @@ use super::AccessibilityManager;
 struct FakeAdapter {
     connected: bool,
     streams: Mutex<Vec<mpsc::Receiver<A11yEvent>>>,
+    /// While set, `connect` fails (the test keeps a clone to flip it).
+    fail_connect: Arc<AtomicBool>,
 }
 
 impl FakeAdapter {
     /// An adapter plus the senders feeding its successive event streams.
     fn with_streams(count: usize) -> (Box<dyn PlatformAdapter>, Vec<mpsc::Sender<A11yEvent>>) {
+        let (adapter, senders, _) = Self::with_failing_connect(count);
+        (adapter, senders)
+    }
+
+    /// Like `with_streams`, plus a switch that makes `connect` fail.
+    fn with_failing_connect(
+        count: usize,
+    ) -> (
+        Box<dyn PlatformAdapter>,
+        Vec<mpsc::Sender<A11yEvent>>,
+        Arc<AtomicBool>,
+    ) {
         let mut senders = Vec::new();
         let mut receivers = Vec::new();
         for _ in 0..count {
@@ -30,11 +45,13 @@ impl FakeAdapter {
         }
         // Handed out by `pop`, so reverse to give them out in creation order.
         receivers.reverse();
+        let fail = Arc::new(AtomicBool::new(false));
         let adapter = FakeAdapter {
             connected: false,
             streams: Mutex::new(receivers),
+            fail_connect: fail.clone(),
         };
-        (Box::new(adapter), senders)
+        (Box::new(adapter), senders, fail)
     }
 }
 
@@ -45,6 +62,10 @@ impl PlatformAdapter for FakeAdapter {
     }
 
     async fn connect(&mut self, _target: ConnectionTarget, _timeout_ms: u64) -> anyhow::Result<()> {
+        if self.fail_connect.load(Ordering::SeqCst) {
+            self.connected = false;
+            anyhow::bail!("fake connect failure");
+        }
         self.connected = true;
         Ok(())
     }
@@ -188,5 +209,26 @@ async fn reconnect_replaces_the_forwarder() {
     senders[1].send(focus("second")).await.unwrap();
     assert_eq!(next_focus(&mut rx, WAIT).await.as_deref(), Some("second"));
     // Exactly one forwarder: the event is not delivered twice.
+    assert_eq!(next_focus(&mut rx, QUIET).await, None);
+}
+
+#[tokio::test]
+async fn failed_reconnect_leaves_no_stale_forwarder() {
+    let (adapter, senders, fail) = FakeAdapter::with_failing_connect(1);
+    let mut mgr = AccessibilityManager::with_adapter(adapter);
+    let mut rx = mgr.subscribe();
+
+    mgr.connect(ConnectionTarget::Desktop, 1000).await.unwrap();
+    assert!(mgr.has_native_events());
+
+    fail.store(true, Ordering::SeqCst);
+    assert!(mgr.connect(ConnectionTarget::Desktop, 1000).await.is_err());
+    assert!(
+        !mgr.has_native_events(),
+        "a failed reconnect must not leave the old forwarder reporting a live stream"
+    );
+    tokio::time::timeout(WAIT, senders[0].closed())
+        .await
+        .expect("the old forwarder should be aborted before reconnecting");
     assert_eq!(next_focus(&mut rx, QUIET).await, None);
 }

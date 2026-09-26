@@ -20,7 +20,7 @@
 //! `tokio::task::spawn_blocking` since COM calls are blocking.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -113,6 +113,38 @@ pub struct UiaAdapter {
     state: Option<Arc<UiaState>>,
     connected: Arc<AtomicBool>,
     backend: Box<dyn UiaBackend>,
+    /// The focus-changed handler registered by `subscribe_events`, with the
+    /// exact `IUIAutomation` it was registered on (every connect builds a
+    /// fresh one, so the handler must be removed from the instance that owns
+    /// it). At most one exists: it is removed before every re-subscribe, on
+    /// `disconnect`/`connect`, and on drop. A `std` mutex because
+    /// `subscribe_events` takes `&self`; it is never held across an `.await`.
+    focus_subscription: Mutex<Option<FocusSubscription>>,
+}
+
+/// A live `AddFocusChangedEventHandler` registration.
+struct FocusSubscription {
+    automation: IUIAutomation,
+    handler: IUIAutomationFocusChangedEventHandler,
+}
+
+// SAFETY: both are COM pointers, thread-safe under COINIT_MULTITHREADED — the
+// same argument as `UiaState`'s `unsafe impl Send`.
+unsafe impl Send for FocusSubscription {}
+
+impl FocusSubscription {
+    /// Unregister the handler. Blocking COM call — run it off the async
+    /// runtime. Once removed, UIA drops its reference to the handler, which
+    /// drops the channel sender and ends the receiver's stream.
+    fn remove(self) {
+        // SAFETY: `handler` was registered on this `automation` instance.
+        if let Err(e) = unsafe {
+            self.automation
+                .RemoveFocusChangedEventHandler(&self.handler)
+        } {
+            warn!("Failed to remove UIA focus event handler: {}", e);
+        }
+    }
 }
 
 impl Default for UiaAdapter {
@@ -137,6 +169,25 @@ impl UiaAdapter {
             state: None,
             connected: Arc::new(AtomicBool::new(false)),
             backend: select_backend(choice),
+            focus_subscription: Mutex::new(None),
+        }
+    }
+
+    /// Take the current focus subscription out of its slot, if any.
+    fn take_focus_subscription(&self) -> Option<FocusSubscription> {
+        self.focus_subscription
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    /// Remove the registered focus handler (if any) and wait for UIA to
+    /// confirm, so no second registration can coexist with it.
+    async fn release_focus_subscription(&self) {
+        if let Some(sub) = self.take_focus_subscription() {
+            if let Err(e) = spawn_blocking_tracked(move || sub.remove()).await {
+                warn!("UIA focus handler removal task failed: {}", e);
+            }
         }
     }
 
@@ -174,6 +225,8 @@ impl PlatformAdapter for UiaAdapter {
         if self.connected.load(Ordering::Relaxed) {
             self.disconnect().await?;
         }
+        // A subscription can outlive a failed connect; never carry one over.
+        self.release_focus_subscription().await;
 
         let state = self.init_uia().await?;
 
@@ -193,6 +246,7 @@ impl PlatformAdapter for UiaAdapter {
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
+        self.release_focus_subscription().await;
         if let Some(state) = self.state.take() {
             state.handles.clear();
         }
@@ -219,21 +273,41 @@ impl PlatformAdapter for UiaAdapter {
         spawn_blocking_tracked(move || state.capture_tree(max_depth, include_hidden)).await?
     }
 
+    /// Idempotent per connection: any handler a previous call registered is
+    /// removed first, and the registration is awaited — a failure is returned
+    /// as `Err`, never a receiver for a stream that will stay silent.
     async fn subscribe_events(&self) -> anyhow::Result<Option<mpsc::Receiver<A11yEvent>>> {
         let state = match self.state.as_ref() {
             Some(s) => s.clone(),
             None => return Ok(None),
         };
 
+        self.release_focus_subscription().await;
+
         let (tx, rx) = mpsc::channel::<A11yEvent>(256);
 
-        spawn_blocking_tracked(move || unsafe {
-            let handler = FocusChangedHandler { tx };
-            let handler: IUIAutomationFocusChangedEventHandler = handler.into();
-            if let Err(e) = state.automation.AddFocusChangedEventHandler(None, &handler) {
-                warn!("Failed to register UIA focus event handler: {}", e);
-            }
-        });
+        let subscription = spawn_blocking_tracked(move || -> anyhow::Result<FocusSubscription> {
+            let handler: IUIAutomationFocusChangedEventHandler = FocusChangedHandler { tx }.into();
+            // SAFETY: COM call on an MTA-initialized `IUIAutomation`.
+            unsafe { state.automation.AddFocusChangedEventHandler(None, &handler) }
+                .map_err(|e| anyhow!("Failed to register UIA focus event handler: {}", e))?;
+            Ok(FocusSubscription {
+                automation: state.automation.clone(),
+                handler,
+            })
+        })
+        .await??;
+
+        // Should a concurrent subscribe have filled the slot meanwhile, keep
+        // the newest registration and remove the one it displaced.
+        let displaced = self
+            .focus_subscription
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(subscription);
+        if let Some(old) = displaced {
+            let _ = spawn_blocking_tracked(move || old.remove()).await;
+        }
 
         Ok(Some(rx))
     }
@@ -273,5 +347,16 @@ impl PlatformAdapter for UiaAdapter {
         })
         .await
         .unwrap_or_default()
+    }
+}
+
+impl Drop for UiaAdapter {
+    /// Backstop for an adapter dropped without `disconnect` (e.g. when the
+    /// manager swaps in the JAB adapter): remove the handler on a plain OS
+    /// thread, since `drop` cannot await and must not block the runtime.
+    fn drop(&mut self) {
+        if let Some(sub) = self.take_focus_subscription() {
+            std::thread::spawn(move || sub.remove());
+        }
     }
 }
