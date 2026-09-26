@@ -816,6 +816,48 @@ pub fn coord_bound_tenants() -> CoordBoundTenantsRead {
 }
 
 pub fn coord_bound_tenants_at(path: &std::path::Path, now_unix: i64) -> CoordBoundTenantsRead {
+    coord_bound_tenants_at_within(path, now_unix, COORD_BOUND_TENANTS_MAX_AGE_SECS)
+}
+
+/// How fresh the recorded set must be before a runner may ACT on a gap it
+/// implies — ask the operator to pair a tenant — as opposed to merely
+/// REPORTING it.
+///
+/// The heartbeat rewrites the sidecar the moment coord's echoed set changes
+/// and restamps an unchanged one every [`COORD_BOUND_TENANTS_RESTAMP_SECS`],
+/// so a live heartbeat keeps it inside two restamp intervals. The 24 h
+/// [`COORD_BOUND_TENANTS_MAX_AGE_SECS`] window is right for a report (it says
+/// how old it is) and wrong for an action: a coord-side unbind that happened
+/// while the heartbeat was down would otherwise still read as "bound", and the
+/// runner would ask a human to re-create a binding coord just removed. Plan
+/// `2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin`,
+/// "Review findings from the route-around", Phase 4 MAJOR 2.
+pub const BINDING_GAP_ASK_MAX_AGE_SECS: i64 = 2 * COORD_BOUND_TENANTS_RESTAMP_SECS;
+
+/// Coord's bound-tenant set, fresh enough to ACT on — see
+/// [`BINDING_GAP_ASK_MAX_AGE_SECS`]. Older than that is UNKNOWN for an actor
+/// even while [`coord_bound_tenants`] still reports it.
+pub fn coord_bound_tenants_for_ask() -> CoordBoundTenantsRead {
+    let Some(path) = coord_bound_tenants_path() else {
+        return CoordBoundTenantsRead::Unknown(
+            "the secure-storage dir could not be resolved, so coord_bound_tenants.json \
+             has no path on this box",
+        );
+    };
+    coord_bound_tenants_at_within(
+        &path,
+        chrono::Utc::now().timestamp(),
+        BINDING_GAP_ASK_MAX_AGE_SECS,
+    )
+}
+
+/// [`coord_bound_tenants_at`] with an explicit freshness bound, so a reader
+/// that ACTS can demand a fresher record than one that only reports.
+pub fn coord_bound_tenants_at_within(
+    path: &std::path::Path,
+    now_unix: i64,
+    max_age_secs: i64,
+) -> CoordBoundTenantsRead {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -837,7 +879,18 @@ pub fn coord_bound_tenants_at(path: &std::path::Path, now_unix: i64) -> CoordBou
         );
     };
     let age = now_unix - file.observed_at;
-    if age > COORD_BOUND_TENANTS_MAX_AGE_SECS {
+    // A reader that ACTS demands a tighter window than the 24 h report; say
+    // which window refused it.
+    let is_act_window = max_age_secs < COORD_BOUND_TENANTS_MAX_AGE_SECS;
+    if age > max_age_secs && is_act_window {
+        return CoordBoundTenantsRead::Unknown(
+            "coord_bound_tenants.json is older than the window this reader may ACT on \
+             (BINDING_GAP_ASK_MAX_AGE_SECS) — a live heartbeat restamps it hourly, so the \
+             heartbeat is down or coord stopped echoing tenant_ids, and an unbind since \
+             then would be invisible",
+        );
+    }
+    if age > max_age_secs {
         // The heartbeat restamps hourly, so a live runner never reaches this.
         // Getting here means the heartbeat is down or coord stopped echoing
         // `tenant_ids` — an unpair seen by neither would otherwise be counted
