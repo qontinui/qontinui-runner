@@ -41,8 +41,10 @@ name: ci-rerun-on-declaration
 #
 #   - `labeled` fires on every label add including on an already-MERGED PR
 #     (verified on schemas#143: merged 23:33:09Z, `coord:landed` 23:33:11Z, run
-#     32605532207 created 23:33:13Z). `ci.yml` costs ~144 job-min green and has
-#     no concurrency group, so that is ~1,150 job-min/36 h of post-merge waste.
+#     32605532207 created 23:33:13Z). `ci.yml` costs ~144 job-min green, and a
+#     post-merge run is the newest in its per-PR concurrency group so nothing
+#     cancels it: ~1,150 job-min/36 h of post-merge waste (measured before that
+#     group existed; the group does not reduce it).
 #
 #   - Narrowing it with a job-level `if:` is WORSE, not better: an `if:`-skipped
 #     job still publishes a check run with conclusion `skipped`, and coord's
@@ -168,8 +170,9 @@ name: ci-rerun-on-declaration
 # ---------------------------------------------------------------------------
 #
 # `edited` also fires on every title and body edit, which is far more traffic
-# than base changes. On `ci.yml` — ~144 job-min for a green run, no
-# `concurrency:` group — that is the same unbounded cost that disqualified
+# than base changes. On `ci.yml` — ~144 job-min for a green run, and a
+# title edit on an idle PR supersedes nothing its per-PR `concurrency:` group
+# could cancel — that is the same unbounded cost that disqualified
 # `labeled` there, and the job-level narrowing that would bound it is the
 # `skipped` hazard above. Here the entire job is a handful of API calls that
 # finishes in ~5 s, and on a title edit BOTH steps no-op: `github.event.label`
@@ -225,8 +228,10 @@ jobs:
     runs-on: ubuntu-latest
     # A cancel can take a short while to settle before a re-run is accepted;
     # everything else here is a handful of API calls. Nothing in this job
-    # compiles.
-    timeout-minutes: 15
+    # compiles. 20, not 15: the cancel poll alone is up to 10 min, plus the
+    # retried head reads — a job killed mid-poll would leave a cancelled run
+    # with no re-run and no instruction.
+    timeout-minutes: 20
 
     steps:
       # The guard is a STEP-level `if:`, not a job-level one, and that is
@@ -307,32 +312,103 @@ jobs:
           # An in-progress run cannot be re-run (the API rejects it), and this one
           # is precisely the run that raced the label: it resolved the sibling
           # before the declaration existed, so its verdict is already wrong. Cancel
-          # it, then re-run. This is the ONLY cancellation this change introduces —
-          # deliberately not a `concurrency: cancel-in-progress` group on `ci.yml`,
-          # which would also kill legitimate in-flight runs on `synchronize` and
-          # manufacture exactly the "unverified tip (cancelled/absent gating CI)"
-          # condition coord's ci_runs_watcher had to be built to repair.
+          # it, then re-run. `ci.yml` has since (2026-09-25) gained a per-PR
+          # `concurrency: cancel-in-progress` group. The group cancels this run
+          # only when a newer push enters it, so this explicit cancel is still
+          # needed. It is keyed on the
+          # PR, not the sha, so a re-run ENTERS it and cancels whatever else is
+          # there — which is why the head re-check below runs before the re-run.
+          # The group never touches push/workflow_dispatch runs. Plan:
+          # 2026-09-25-fleet-bundle-sync-residual-gaps (Phase 3).
+          # pr_head: the PR's current head sha, retried; empty = UNKNOWN (never
+          # "moved" — an unreadable head is not evidence of a push).
+          pr_head() {
+            local h=""
+            local i
+            for i in 1 2 3; do
+              h="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" -q .head.sha 2>/dev/null || true)"
+              [ -n "${h}" ] && break
+              if [ "${i}" -lt 3 ]; then sleep 5; fi
+            done
+            printf '%s' "${h}"
+          }
+
+          # Early exit: a head that already moved has its own run, which reads
+          # the label set live — do not cancel or re-run a superseded run.
+          early_head="$(pr_head)"
+          if [ -n "${early_head}" ] && [ "${early_head}" != "${HEAD_SHA}" ]; then
+            note ""
+            note "PR head already moved (\`${HEAD_SHA}\` -> \`${early_head}\`) — the current head's"
+            note "run reads labels live. Nothing to cancel or re-run."
+            exit 0
+          fi
+
+          cancelled_by_us=0
           if [ "${run_status}" != "completed" ]; then
+            cancelled_by_us=1
             note ""
             note "Run is \`${run_status}\` and raced the label — cancelling before re-run."
             gh api -X POST "repos/${REPO}/actions/runs/${run_id}/cancel" >/dev/null || true
             for _ in $(seq 1 60); do
-              run_status="$(gh api "repos/${REPO}/actions/runs/${run_id}" -q .status)"
+              run_status="$(gh api "repos/${REPO}/actions/runs/${run_id}" -q .status 2>/dev/null || echo unknown)"
               [ "${run_status}" = "completed" ] && break
               sleep 10
             done
             if [ "${run_status}" != "completed" ]; then
               note ""
-              note "⚠️ Run did not reach \`completed\` within 10 min; leaving it alone."
+              note "⚠️ Cancel requested but not settled within 10 min; not re-running it."
               note "Re-run \`ci.yml\` by hand on this PR to act on \`${LABEL_NAME}\`."
               exit 0
             fi
+          fi
+
+          # Re-check the PR head AFTER the (up to 10 min) cancel poll. ci.yml's
+          # per-PR concurrency group means a re-run of a SUPERSEDED sha's run
+          # enters the group last and cancels the CURRENT head's CI, leaving it
+          # red with nothing to re-fire it. The new head's own run already reads
+          # the label set live, so skipping is correct, not a lost re-resolution.
+          # An UNREADABLE head is not "moved": if this job cancelled the run it
+          # must still re-run it, or the head it cancelled is left red.
+          current_head="$(pr_head)"
+          if [ -n "${current_head}" ] && [ "${current_head}" != "${HEAD_SHA}" ]; then
+            note ""
+            note "PR head moved (\`${HEAD_SHA}\` -> \`${current_head}\`) — not re-running a"
+            note "superseded run, which would cancel the current head's CI via ci.yml's"
+            note "per-PR concurrency group. The current head's run reads labels live."
+            exit 0
+          fi
+          if [ -z "${current_head}" ]; then
+            note ""
+            note "⚠️ PR head UNKNOWN (\`pulls/${PR_NUMBER}\` unreadable after retries)."
+            if [ "${cancelled_by_us}" != "1" ]; then
+              note "This job cancelled nothing, so it re-runs nothing. Re-run the PR's"
+              note "CURRENT-head \`ci.yml\` run by hand to act on \`${LABEL_NAME}\`."
+              exit 0
+            fi
+            note "This job requested a cancel of run \`${run_id}\`, so it re-runs it anyway"
+            note "rather than leave that head red. If the head DID move, this re-run may cancel"
+            note "the new head's \`ci.yml\` run — check the PR's latest run after this job."
           fi
 
           note ""
           if gh api -X POST "repos/${REPO}/actions/runs/${run_id}/rerun" >/dev/null; then
             note "✅ Re-ran \`ci.yml\` run \`${run_id}\`. \`checkout-sibling\` reads labels live,"
             note "so the new attempt resolves the sibling against \`${LABEL_NAME}\`."
+            # Residual window: a push landing between the head re-check and the
+            # POST puts the new head's run in the group FIRST, and this re-run
+            # then cancels it. Detect it and say so; the fix is re-running the
+            # new head's run, which this job does not own.
+            after_head="$(pr_head)"
+            if [ -n "${after_head}" ] && [ "${after_head}" != "${HEAD_SHA}" ]; then
+              note ""
+              note "⚠️ PR head moved to \`${after_head}\` while re-running — this re-run may have"
+              note "cancelled that head's \`ci.yml\` run via the per-PR concurrency group."
+              note "Re-run the current head's \`ci.yml\` run by hand."
+            elif [ -z "${after_head}" ]; then
+              note ""
+              note "⚠️ PR head could not be confirmed after the re-run. If it moved, this re-run"
+              note "may have cancelled that head's \`ci.yml\` run — check the PR's latest run."
+            fi
           else
             # Never fail the PR on this. This workflow is not a required check and
             # must not become one: a declaration that fails to re-trigger CI is a
