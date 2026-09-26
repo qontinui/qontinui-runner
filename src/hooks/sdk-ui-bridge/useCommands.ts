@@ -233,7 +233,10 @@ export function useCommands(
         // Two definitions of success, by what the route returns:
         // - ACTION routes (`executeAction`, `aiExecute` — both answer an
         //   envelope with an explicit `success`) are read STRICTLY: no boolean
-        //   `success` is an INDETERMINATE failure, never a pass.
+        //   `success` is an INDETERMINATE failure, never a pass. When `data`
+        //   nests an action result (`aiExecute` on the in-process/HTTP
+        //   transport answers `success(nlActionResponse)`), its own
+        //   `success` must be `true` as well — `relayVerdict` reads both.
         // - READ routes (snapshot, elements, health, metrics, …) legitimately
         //   forward raw app JSON with no `success` key (`handle_snapshot`), so
         //   a read succeeds when the transport is OK and the body is not an

@@ -72,6 +72,38 @@ describe("useCommands.sendCommand", () => {
     expect(r.success).toBe(false);
   });
 
+  it("aiExecute: outer success with a refused NL action (inner success:false) is a failure", async () => {
+    // SDK in-process/HTTP handler: `success(nlActionResponse)` (plan
+    // 2026-09-27-ui-bridge-action-failures-still-masked-after-the-strict-success-readers, Case 3).
+    tracedFetch.mockResolvedValue(
+      reply({ success: true, data: { success: false, error: "no element matched" } }),
+    );
+    const r = await useHookUnderTest().sendCommand("aiExecute", { instruction: "x" });
+    expect(r.success).toBe(false);
+    expect(r.outcome).toBe("failed");
+    expect(r.error).toBe("no element matched");
+    expect(r.data).toEqual({ success: false, error: "no element matched" });
+
+    tracedFetch.mockResolvedValue(reply({ success: true, data: { success: true } }));
+    expect((await useHookUnderTest().sendCommand("aiExecute", { instruction: "x" })).success).toBe(
+      true,
+    );
+    // Relay path: the bare, lifted NL response — the outer flag governs.
+    tracedFetch.mockResolvedValue(reply({ success: true, executedAction: "click" }));
+    expect((await useHookUnderTest().sendCommand("aiExecute", { instruction: "x" })).success).toBe(
+      true,
+    );
+  });
+
+  it("executeAction: outer success with a nested success:false (older SDK) is a failure", async () => {
+    tracedFetch.mockResolvedValue(
+      reply({ success: true, data: { success: false, error: "gone" } }),
+    );
+    const r = await useHookUnderTest().executeAction("btn", "click");
+    expect(r.success).toBe(false);
+    expect(r.error).toBe("gone");
+  });
+
   it("a READ (getSnapshot) with raw app JSON and no success key succeeds", async () => {
     tracedFetch.mockResolvedValue(reply({ elements: [] }));
     const r = await useHookUnderTest().sendCommand("getSnapshot");
