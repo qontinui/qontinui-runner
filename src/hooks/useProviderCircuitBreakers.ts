@@ -10,6 +10,7 @@ import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { ProviderCircuitState } from "@/components/settings/ai-settings/types";
+import { describeThrown } from "@/lib/utils";
 
 interface UseProviderCircuitBreakersResult {
   states: ProviderCircuitState[];
@@ -30,7 +31,7 @@ export function useProviderCircuitBreakers(): UseProviderCircuitBreakersResult {
       setStates(result);
       setError(null);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(describeThrown(e, "Failed to load provider circuit states"));
     } finally {
       setLoading(false);
     }

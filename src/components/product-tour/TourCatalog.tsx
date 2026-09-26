@@ -26,6 +26,7 @@ import { exportTour } from "@/lib/product-tour/tour-exporter";
 import { instanceStorage } from "@/lib/instance-storage";
 import { TourCard } from "./TourCard";
 import { TourPlayer } from "./TourPlayer";
+import { describeThrown } from "@/lib/utils";
 
 // =============================================================================
 // Tour Persistence
@@ -110,7 +111,7 @@ export function TourCatalog() {
 
       setGenState({ phase: "previewing", tours, error: null });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "Failed to generate tours");
       setGenState({ phase: "error", tours: [], error: msg });
     }
   }, [specs, selectedSpecIds, audience]);

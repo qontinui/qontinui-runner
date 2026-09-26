@@ -27,6 +27,7 @@ import { createLogger } from "@/lib/logger";
 import type { SavedProject } from "@/hooks/useSavedProjects";
 import type { ProjectSnapshot } from "./types";
 import { describeStartFailure, planOpen, stderrTailOf, type OpenPhase } from "./openProject";
+import { describeThrown } from "@/lib/utils";
 
 const log = createLogger("useProjectOpen");
 
@@ -146,7 +147,7 @@ export function useProjectOpen(): UseProjectOpen {
             title: project.name,
           });
         } catch (err) {
-          const raw = err instanceof Error ? err.message : String(err);
+          const raw = describeThrown(err, "");
           log.error("open_project_preview failed", raw);
           setPhase(project.id, {
             kind: "failed",

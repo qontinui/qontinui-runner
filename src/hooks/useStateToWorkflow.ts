@@ -22,6 +22,7 @@ import type {
   WorkflowPhase,
   UnifiedStep,
 } from "../types/unified-workflow";
+import { describeThrown } from "@/lib/utils";
 
 // =============================================================================
 // Types
@@ -200,7 +201,7 @@ export function useStateToWorkflow(): UseStateToWorkflowReturn {
       }
     } catch (err) {
       console.error("[useStateToWorkflow] Failed to fetch config:", err);
-      setError(err instanceof Error ? err.message : "Failed to load configuration");
+      setError(describeThrown(err, "Failed to load configuration"));
       setStates([]);
       setHasConfig(false);
     } finally {

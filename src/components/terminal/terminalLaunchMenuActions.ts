@@ -44,6 +44,7 @@
 import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
 import { textArg } from "./commands/parse";
 import { buildAiSessionSpawnEnvelope, type AiSessionSpawnEnvelope } from "./aiSessionSpawnEnvelope";
+import { describeThrown } from "@/lib/utils";
 
 /**
  * `paramSchema`s hoisted so the registration and the guard read ONE
@@ -193,7 +194,7 @@ export function buildTerminalLaunchMenuActions(effects: LaunchMenuEffects): Laun
             context,
           });
         } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
+          const msg = describeThrown(err, "Failed to spawn AI terminal");
           if (msg.includes("no-account") || msg.toLowerCase().includes("no matching")) {
             throw new Error("No AI accounts available", { cause: err });
           }
