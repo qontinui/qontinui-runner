@@ -845,7 +845,7 @@ pub async fn acquire_for_terminal(
         }
     };
     if let Some(wd) = &out.0 {
-        provision_session_cwd(wd, out.1.is_some(), spawn_tenant);
+        provision_session_cwd_off_runtime(wd, out.1.is_some(), spawn_tenant).await;
     }
     out
 }
@@ -936,12 +936,14 @@ pub async fn acquire_for_worker(
             format!("allocate for {repo} returned no worktree"),
         )));
     };
-    provision_session_cwd(&wd, true, spawn_tenant);
+    provision_session_cwd_off_runtime(&wd, true, spawn_tenant).await;
     Ok((wd, ctx))
 }
 
 /// Provision the per-session cwd artifacts — the coord-mcp `.mcp.json` and the
-/// fleet commands/skills — into a session's finalized working dir. Shared by
+/// session assets (subagent definitions, fleet commands, fleet skills) — into a
+/// session's finalized working dir. BLOCKING (file writes and bounded `git`
+/// probes): async callers use [`provision_session_cwd_off_runtime`]. Shared by
 /// [`acquire_for_terminal`], [`acquire_for_worker`], and the orchestration
 /// dispatch of a worker that declares no repo.
 ///
@@ -1049,6 +1051,29 @@ pub(crate) fn provision_session_cwd(
         );
     } else {
         crate::session_assets::provision_session_assets(wd);
+    }
+}
+
+/// [`provision_session_cwd`] on the blocking pool, awaited — for the async
+/// spawn paths, so its file writes and `git` probes never occupy a tokio
+/// worker. A `JoinError` (a panic on the pool) is logged and swallowed:
+/// provisioning never aborts a spawn.
+pub(crate) async fn provision_session_cwd_off_runtime(
+    wd: &str,
+    allocated_here: bool,
+    spawn_tenant: Option<uuid::Uuid>,
+) {
+    let owned = wd.to_string();
+    if let Err(e) = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+        provision_session_cwd(&owned, allocated_here, spawn_tenant)
+    })
+    .await
+    {
+        warn!(
+            workdir = %wd,
+            "provision_session_cwd: provisioning task did not complete (continuing \
+             spawn without some session cwd artifacts): {e}"
+        );
     }
 }
 

@@ -8203,14 +8203,17 @@ fn provision_agent_definitions_from_root(
     // the source files — so both layers stand down and say why.
     if let Some(why) = src_dir
         .as_deref()
-        .and_then(|src| destination_is_source(&dst_dir, src))
+        .and_then(|src| crate::provision_guard::destination_is_source(&dst_dir, src))
     {
         info!("agent_runtime: not provisioning .claude/agents for {worktree_cwd} — {why}");
         let dst = dst_dir.display().to_string();
+        // `OperatorCheckout`: the definitions are present — as the checkout's
+        // own files. `record_provision` keeps a canonical-source row out of the
+        // device-level manifest reading either way.
         let mut floor = ProvisionReport::new(
             "fleet_agents",
             crate::fleet_agents::embedded_agent_count(),
-            capability_manifest::Rung::Unresolved,
+            capability_manifest::Rung::OperatorCheckout,
         )
         .with_destination(dst.clone());
         floor.skip(
@@ -8356,6 +8359,19 @@ fn provision_agent_definitions_from_root(
             );
             continue;
         }
+        // A per-file symlink back to its own source: `std::fs::copy` onto
+        // itself truncates it. Leave the source as it is.
+        if dst.exists() && std::fs::canonicalize(&dst).ok() == std::fs::canonicalize(&path).ok() {
+            report.skip(
+                name.to_string_lossy().into_owned(),
+                capability_manifest::SkipReason::CanonicalSource(format!(
+                    "{} resolves to its own source {}",
+                    dst.display(),
+                    path.display()
+                )),
+            );
+            continue;
+        }
         // Idempotent: an untracked destination is overwritten (std::fs::copy
         // truncates the target).
         if let Err(e) = std::fs::copy(&path, &dst) {
@@ -8387,40 +8403,6 @@ fn provision_agent_definitions_from_root(
         report.set_rung(capability_manifest::Rung::Unresolved);
     }
     Ok(report)
-}
-
-/// `Some(why)` when `dst` resolves to `src` or to a path inside it, following
-/// symlinks. Either side may not exist yet, so each is resolved through its
-/// nearest existing ancestor ([`canonicalize_through_ancestors`]). `None` —
-/// "not the same tree" — also when either side cannot be resolved at all,
-/// which on a real filesystem means neither exists and there is nothing of the
-/// source's to overwrite.
-fn destination_is_source(dst: &Path, src: &Path) -> Option<String> {
-    let dst_real = canonicalize_through_ancestors(dst)?;
-    let src_real = canonicalize_through_ancestors(src)?;
-    dst_real.starts_with(&src_real).then(|| {
-        format!(
-            "{} resolves to {}, which is the source {} it would be copied from",
-            dst.display(),
-            dst_real.display(),
-            src_real.display()
-        )
-    })
-}
-
-/// `std::fs::canonicalize` for a path that may not exist yet: canonicalize its
-/// nearest existing ancestor and re-append the missing tail. `None` when no
-/// ancestor resolves, or the tail holds a component with no file name (`..`).
-fn canonicalize_through_ancestors(path: &Path) -> Option<PathBuf> {
-    let mut tail = Vec::new();
-    let mut current = path;
-    loop {
-        if let Ok(real) = std::fs::canonicalize(current) {
-            return Some(tail.iter().rev().fold(real, |acc, part| acc.join(part)));
-        }
-        tail.push(current.file_name()?.to_os_string());
-        current = current.parent()?;
-    }
 }
 
 /// The workspace root holding the runner's canonical checkouts.
@@ -12752,6 +12734,9 @@ mod tests {
     #[tokio::test]
     async fn gate_continuation_headless_spawns_child() {
         let _env_lock = env_lock();
+        // The spawn provisions session assets, which record into the
+        // process-wide ledger store.
+        let _store = crate::capability_manifest::store_lock();
         if std::env::var("QONTINUI_AGENT_RUNTIME_E2E").ok().as_deref() != Some("1") {
             return;
         }

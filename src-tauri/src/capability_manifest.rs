@@ -1267,8 +1267,19 @@ pub fn record_provision(workdir: &str, report: ProvisionReport) {
     } else {
         tracing::info!("provisioned — {}", report.summary());
     }
+    // A pass that stood down because its destination IS the canonical source
+    // wrote nothing and needed to: the assets are present as the source files.
+    // It is a fact about this SESSION's cwd, not about what the device can
+    // deliver, so it must not become the capability's device-level reading.
+    let stood_down_on_source = !report.skipped.is_empty()
+        && report
+            .skipped
+            .iter()
+            .all(|u| matches!(u.reason, SkipReason::CanonicalSource(_)));
     with_store(|s| {
-        s.latest.insert(report.capability, report.observation());
+        if !stood_down_on_source {
+            s.latest.insert(report.capability, report.observation());
+        }
         let mut ledger = match s.sessions.iter().position(|l| l.workdir == workdir) {
             Some(at) => s.sessions.remove(at).expect("position is in bounds"),
             None => {
@@ -2511,6 +2522,37 @@ mod tests {
         assert_eq!(miss["workdir"], "/wt/never");
         assert!(miss["sessions"].as_array().unwrap().is_empty());
         assert!(miss["absence"].as_str().unwrap().starts_with("unknown"));
+    }
+
+    /// A canonical-source row (the cwd's `.claude` IS the checkout source) lands
+    /// in the session ledger but never becomes the capability's device-level
+    /// `latest` reading, which would flip the manifest row to a rung that says
+    /// nothing about what the device can deliver.
+    #[test]
+    fn a_canonical_source_row_does_not_replace_the_device_reading() {
+        let _guard = store_lock();
+        reset_provision_store();
+        let mut embedded = ProvisionReport::new("fleet_agents", 1, Rung::Embedded);
+        embedded.record_written();
+        record_provision("/tmp/ordinary-session", embedded);
+        let mut canonical = ProvisionReport::new("fleet_agents", 1, Rung::OperatorCheckout);
+        canonical.skip(
+            "/root/.claude/agents",
+            SkipReason::CanonicalSource("resolves to the source".to_string()),
+        );
+        record_provision("/root", canonical);
+
+        assert_eq!(
+            latest_observation("fleet_agents").expect("recorded").rung,
+            Rung::Embedded,
+            "the device-level reading must stay the ordinary session's"
+        );
+        let ledger = session_provision_ledger("/root").expect("the session row is kept");
+        assert_eq!(
+            ledger.reports[0].skipped[0].reason.wire(),
+            "canonical_source"
+        );
+        reset_provision_store();
     }
 
     /// A reused workdir keeps ONE report per capability (the latest pass), and

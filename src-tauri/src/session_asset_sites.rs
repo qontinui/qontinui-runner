@@ -13,8 +13,9 @@
 //! answer, from both ends:
 //!
 //! * every NON-TEST call to a per-asset provisioner sits in its one allowed
-//!   caller ([`ALLOWED_CALLERS`]) — `provision_session_assets` for the three
-//!   session-level provisioners — and that fn calls all three;
+//!   caller ([`ALLOWED_CALLERS`]) — `provision_session_assets_from_root` (the
+//!   core behind `provision_session_assets`) for the three session-level
+//!   provisioners — and that fn calls all three;
 //! * every spawn path in [`REQUIRED_CALLERS`] calls the entry point, and no
 //!   unlisted fn does, so a site that silently drops the call, or a new site
 //!   that nobody registered, goes red.
@@ -55,16 +56,22 @@ const ALLOWED_CALLERS: &[(&str, (&str, &str))] = &[
 
 /// The entry point, as `(file, fn)`.
 const ENTRY_FILE: &str = "session_assets.rs";
-const ENTRY_FN: &str = "provision_session_assets";
+const ENTRY_FN: &str = "provision_session_assets_from_root";
 
-/// The entry point's call tokens: the sync fn and its async twin.
+/// The entry point's call tokens: the sync wrapper, its async twin, and the
+/// root-taking core.
 const ENTRY_TOKENS: &[&str] = &[
     "provision_session_assets(",
     "provision_session_assets_off_runtime(",
+    "provision_session_assets_from_root(",
 ];
 
-/// The async twin, which calls the sync entry point and is a caller by design.
-const ENTRY_TWIN: (&str, &str) = (ENTRY_FILE, "provision_session_assets_off_runtime");
+/// The entry point's own callers inside its module: the sync wrapper that
+/// resolves the workspace root, and its async twin.
+const ENTRY_WRAPPERS: &[(&str, &str)] = &[
+    (ENTRY_FILE, "provision_session_assets"),
+    (ENTRY_FILE, "provision_session_assets_off_runtime"),
+];
 
 /// Every spawn path that provisions session assets. Adding a spawn path that
 /// should provision them is adding a row here AND the call; removing a call is
@@ -174,7 +181,7 @@ fn entry_point_callers_vs_roster(sources: &Sources) -> (Vec<Site>, Vec<Site>) {
         .map(|(f, func)| site(f, func))
         .collect();
     let missing = listed.difference(&found).cloned().collect();
-    listed.insert(site(ENTRY_TWIN.0, ENTRY_TWIN.1));
+    listed.extend(ENTRY_WRAPPERS.iter().map(|(f, func)| site(f, func)));
     let unlisted = found.difference(&listed).cloned().collect();
     (missing, unlisted)
 }
@@ -185,7 +192,7 @@ fn every_session_asset_provision_goes_through_one_entry_point() {
     assert!(
         stray.is_empty(),
         "per-asset provisioners called outside their one allowed caller — route the \
-         spawn path through `crate::session_assets::{ENTRY_FN}` so every session gets \
+         spawn path through `crate::session_assets::provision_session_assets` so every session gets \
          the same asset set: {stray:#?}"
     );
 }
