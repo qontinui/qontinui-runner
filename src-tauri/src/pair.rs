@@ -3127,6 +3127,49 @@ mod tests {
         assert!(json.contains("\"tenant_id\""));
     }
 
+    /// Plan `2026-09-14-credential-posture-third-residuals` D5 — sign-in does
+    /// NOT re-pin. `machine.json` pins T; a sign-in lands in tenant B, the
+    /// tenant coord stamped on the minted JWT. The two local-disk steps of
+    /// `commands::auth::finalize_signed_in` — `ensure_device_initialized` and
+    /// the pairing persist (`persist_pairing` → this core) — leave
+    /// `machine.json` byte-for-byte as it was, so its `active_tenant_id` is
+    /// still T. Re-pointing FUTURE sessions for the whole machine is
+    /// `set_active_tenant`'s job, an explicit operator act; doing it as a side
+    /// effect of a sign-in whose tenant coord chooses would be a silent
+    /// machine-wide change. The posture half — the next pass still publishes
+    /// the pinned arm naming T — is
+    /// `a_sign_in_to_another_tenant_leaves_the_pinned_arm_naming_the_pin` in
+    /// the refresher.
+    #[test]
+    fn a_pairing_for_another_tenant_never_rewrites_the_machine_pin() {
+        let amb = crate::test_env::isolated_ambient();
+        let pinned = tc();
+        let machine_json = amb.write_active_tenant_id(pinned);
+        let before = std::fs::read(&machine_json).expect("read machine.json");
+        let mgr = test_mgr(amb.dir());
+        let path = amb.dir().join("paired_user.json");
+
+        ensure_device_initialized();
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("b")), tb()).expect("persist B");
+
+        assert_eq!(
+            read_file(&path).default_tenant_id.as_deref(),
+            Some(T_B),
+            "precondition: the pairing landed, in B"
+        );
+        assert_eq!(
+            std::fs::read(&machine_json).expect("re-read machine.json"),
+            before,
+            "machine.json is untouched by a sign-in"
+        );
+        let v: serde_json::Value = serde_json::from_slice(&before).expect("machine.json parses");
+        assert_eq!(
+            v["active_tenant_id"].as_str(),
+            Some(T_C),
+            "the pin is still T"
+        );
+    }
+
     /// First pair: binding appended, becomes default, JWT written to BOTH
     /// the tenant slot and the legacy access_token slot, mirrors set.
     #[test]
