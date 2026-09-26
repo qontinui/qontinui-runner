@@ -422,7 +422,7 @@ const ALLOWLIST: &[AllowlistEntry] = &[
         ],
         reason: "guards the continuation registry + admitted-launch cap (clear_continuation_registry); \
          the 164 tests outside it never call evaluate_continuation_guard* or the registry \
-         accessors (grep-verified 2026-09-21) — command builders, payload shapes, env scrubs",
+         accessors (grep-verified 2026-09-21, re-derived 2026-09-26) — command builders, payload shapes, env scrubs",
     },
     AllowlistEntry {
         file: "ai_provider/oauth_refresh.rs",
