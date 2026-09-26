@@ -4,6 +4,7 @@ import type { SpecExecutionOptions } from "@qontinui/ui-bridge";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 import { closestElementIds, getUIBridgeGlobal } from "./utils";
 import { loadDiscoveredSpecs } from "../../lib/ui-bridge/use-discovered-specs";
+import { actionOutcome, actionOutcomeError, actionSucceeded } from "../sdk-ui-bridge/actionOutcome";
 
 // ---------------------------------------------------------------------------
 // Browser / Console capture type interfaces
@@ -686,15 +687,17 @@ export function useDebugInspectEvents(
 
             try {
               const r = await currentBridge.executeAction(fieldId, { action, params });
-              const ok = !r || (r as { success?: boolean }).success !== false;
-              if (ok) {
+              // Strict: a null result, or one with no boolean `success`, is
+              // not a filled field.
+              const outcome = actionOutcome(r);
+              if (actionSucceeded(outcome)) {
                 perField[fieldId] = { success: true, action };
                 filledCount++;
               } else {
                 perField[fieldId] = {
                   success: false,
                   action,
-                  error: (r as { error?: string }).error ?? "action returned non-success",
+                  error: actionOutcomeError(outcome, "action returned non-success"),
                 };
                 errorCount++;
               }
