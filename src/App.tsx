@@ -791,8 +791,9 @@ function AppContent() {
                   `position: fixed` stack that `SessionRecoveryBanner` below
                   and the terminal-page banners (`MidSessionToast`,
                   `HoldingLockBanner`, `WaitingLockBanner`,
-                  `ResumeFailedBanner`) portal into via `AdvisorySlot`, so
-                  none of them can render superimposed on another.
+                  `ResumeFailedBanner`, and — as of the #1683 follow-up —
+                  `DeconflictAdvisoryBanner`) portal into via `AdvisorySlot`,
+                  so none of them can render superimposed on another.
                 */}
                 <AdvisoryStackProvider>
                   <TabContent
