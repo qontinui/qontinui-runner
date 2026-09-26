@@ -47,8 +47,8 @@ import {
   credentialDarkPresentation,
   effectiveCredentialDark,
   GET_COORD_CREDENTIAL_POSTURE_CMD,
-  KICK_DEVICE_JWT_REFRESHER_CMD,
   makeRePairClickHandler,
+  makeSwitchTenantHandler,
   normalizeCredentialDarkSignal,
   RE_PAIR_CTA_GRACE_MS,
   shouldShowAuthBanner,
@@ -390,15 +390,24 @@ export function WebIntegrationAuthBanner() {
   // The operator picked `tenantId` in the switcher. Re-pin (machine.json,
   // future sessions only — running sessions keep their tenant), then kick the
   // refresher so the posture is re-derived against the new pin now rather than
-  // at the next cadence.
+  // at the next cadence, and re-read the posture.
   const handleSwitchTenant = useCallback(
     async (tenantId: string) => {
       setSwitchingTenant(true);
       setSwitchTenantError(null);
       try {
-        await setDefaultTenantForNewSessions(tenantId);
+        const switchTo = makeSwitchTenantHandler({
+          setDefaultTenant: setDefaultTenantForNewSessions,
+          invoker: (cmd, args) => invoke<unknown>(cmd, args),
+        });
+        const signal = await switchTo(tenantId);
         setTenantSwitcherOpen(false);
-        await invoke<void>(KICK_DEVICE_JWT_REFRESHER_CMD, {});
+        // Re-read, so the banner stops naming the old tenant now. A later
+        // detail-change event (same posture, new tenant) updates it again once
+        // the kicked pass concludes.
+        if (signal !== null) {
+          setCredentialDarkBySource((prev) => applyCredentialDarkSignal(prev, signal));
+        }
       } catch (err) {
         setSwitchTenantError(String(err));
       } finally {

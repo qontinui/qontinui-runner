@@ -23648,6 +23648,7 @@ mod spawn_tenant_credential_tests {
             observed_at_unix: 0,
             attributable: true,
             composed_reason: None,
+            pinned_tenant: false,
         };
 
         let b_path =

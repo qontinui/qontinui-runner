@@ -14,6 +14,7 @@ import {
   credentialDarkPresentation,
   effectiveCredentialDark,
   makeRePairClickHandler,
+  makeSwitchTenantHandler,
   normalizeCredentialDarkSignal,
   RE_PAIR_CTA_GRACE_MS,
   shouldShowAuthBanner,
@@ -208,6 +209,7 @@ const darkExpired: CredentialDarkSignal = {
   cta: "retry_refresh",
   since: 1_757_649_240, // 2026-09-12T03:54:00Z
   tenantId: null,
+  pinnedTenant: false,
 };
 
 const stubTime = () => "03:54";
@@ -243,6 +245,7 @@ describe("credential-dark banner visibility", () => {
       cta: null,
       since: null,
       tenantId: null,
+      pinnedTenant: false,
     };
     // Recovered + paired + nothing else wrong → nothing to show.
     expect(shouldShowAuthBanner(baseFreshInstall, true, null, recovered)).toBe(false);
@@ -404,6 +407,7 @@ describe("normalizeCredentialDarkSignal", () => {
       cta: "sign_in",
       since: null,
       tenantId: null,
+      pinnedTenant: false,
     });
     expect(shouldShowAuthBanner(baseFreshInstall, true, null, legacy)).toBe(true);
   });
@@ -430,6 +434,7 @@ describe("per-source credential-dark signals", () => {
     cta: "sign_in",
     since: null,
     tenantId: null,
+    pinnedTenant: false,
   };
   const cognitoRecovered: CredentialDarkSignal = {
     source: "cognito",
@@ -439,6 +444,7 @@ describe("per-source credential-dark signals", () => {
     cta: null,
     since: null,
     tenantId: null,
+    pinnedTenant: false,
   };
   const postureUnrefreshable: CredentialDarkSignal = {
     source: "posture",
@@ -449,6 +455,7 @@ describe("per-source credential-dark signals", () => {
     cta: "re_pair",
     since: 1_757_649_240,
     tenantId: null,
+    pinnedTenant: false,
   };
 
   it("THE bug: Cognito recovering must not clear a posture that is still dark", () => {
@@ -519,6 +526,7 @@ describe("credentialDarkFromPostureSnapshot", () => {
       cta: "re_pair",
       since: 1_757_649_240,
       tenantId: null,
+      pinnedTenant: false,
     });
     expect(signal).toEqual({
       source: "posture",
@@ -529,6 +537,7 @@ describe("credentialDarkFromPostureSnapshot", () => {
       cta: "re_pair",
       since: 1_757_649_240,
       tenantId: null,
+      pinnedTenant: false,
     });
     // And it is enough on its own: this is the BOOT case, before
     // `get_web_integration_status` has resolved.
@@ -543,6 +552,7 @@ describe("credentialDarkFromPostureSnapshot", () => {
       cta: "re_pair",
       since: null,
       tenantId: null,
+      pinnedTenant: false,
     });
     expect(signal?.dark).toBe(true);
     expect(signal?.cause).toBe("unrefreshable");
@@ -557,6 +567,7 @@ describe("credentialDarkFromPostureSnapshot", () => {
       cta: null,
       since: 1_757_649_240,
       tenantId: null,
+      pinnedTenant: false,
     });
     expect(signal?.dark).toBe(false);
     expect(signal?.source).toBe("posture");
@@ -571,6 +582,7 @@ describe("credentialDarkFromPostureSnapshot", () => {
           cta: "sign_in",
           since: null,
           tenantId: null,
+          pinnedTenant: false,
         },
       },
       signal!,
@@ -631,6 +643,7 @@ describe("pinned-tenant credential banner (absent/dark with a tenant)", () => {
     cta: "re_pair",
     since: null,
     tenantId: T,
+    pinnedTenant: true,
   };
   const darkT: CredentialDarkSignal = {
     ...absentT,
@@ -699,5 +712,77 @@ describe("pinned-tenant credential banner (absent/dark with a tenant)", () => {
     const p = credentialDarkPresentation(expiredT, stubTime, true);
     expect(p.showSwitchTenant).toBe(false);
     expect(p.body).toBe(`Since 03:54 — ${darkExpired.message}`);
+  });
+
+  it("reads the pinned-tenant marker off both wires", () => {
+    expect(
+      normalizeCredentialDarkSignal({ ...absentT, tenant_id: T, pinned_tenant: true })
+        ?.pinnedTenant,
+    ).toBe(true);
+    expect(
+      credentialDarkFromPostureSnapshot({
+        posture: "absent",
+        canAnswer: false,
+        reason: pinnedReason,
+        cta: "re_pair",
+        since: null,
+        tenantId: T,
+        pinnedTenant: true,
+      })?.pinnedTenant,
+    ).toBe(true);
+    expect(normalizeCredentialDarkSignal({ dark: true, message: "x" })?.pinnedTenant).toBe(false);
+  });
+
+  it("a measured sibling slot's dark names its tenant but offers no switch", () => {
+    // Re-pinning cannot heal a slot coord keeps rejecting: the switch is gated
+    // on the runner's pinned-tenant marker, not on tenantId presence.
+    const siblingDark: CredentialDarkSignal = { ...darkT, pinnedTenant: false };
+    const p = credentialDarkPresentation(siblingDark, stubTime, true);
+    expect(p.showSwitchTenant).toBe(false);
+    expect(p.body).toContain(T);
+  });
+});
+
+describe("makeSwitchTenantHandler", () => {
+  it("re-pins, kicks the refresher, then RE-READS the posture", async () => {
+    const calls: string[] = [];
+    const setDefaultTenant = vi.fn(async (t: string) => {
+      calls.push(`set:${t}`);
+    });
+    const invoker = vi.fn(async (cmd: string) => {
+      calls.push(cmd);
+      if (cmd === "get_coord_credential_posture") {
+        return {
+          posture: "absent",
+          canAnswer: false,
+          reason: "r",
+          cta: "re_pair",
+          since: null,
+          tenantId: "t2",
+          pinnedTenant: true,
+        };
+      }
+      return undefined;
+    });
+    const signal = await makeSwitchTenantHandler({ setDefaultTenant, invoker })("t2");
+    expect(calls).toEqual([
+      "set:t2",
+      "kick_device_jwt_refresher_cmd",
+      "get_coord_credential_posture",
+    ]);
+    expect(signal?.tenantId).toBe("t2");
+    expect(signal?.dark).toBe(true);
+  });
+
+  it("does not kick or re-read when the re-pin fails", async () => {
+    const invoker = vi.fn(async () => undefined);
+    const failing = makeSwitchTenantHandler({
+      setDefaultTenant: async () => {
+        throw new Error("no device_id");
+      },
+      invoker,
+    });
+    await expect(failing("t2")).rejects.toThrow("no device_id");
+    expect(invoker).not.toHaveBeenCalled();
   });
 });

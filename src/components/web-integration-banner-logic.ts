@@ -62,6 +62,14 @@ export interface CredentialDarkSignal {
    * for, so the banner names it and offers the tenant switch.
    */
   tenantId: string | null;
+  /**
+   * `true` only when the runner marked this posture as the UNSERVED-PIN arm:
+   * the tenant `machine.json` pins holds no credential the forwarder would
+   * present (event `pinned_tenant`, snapshot `pinnedTenant`). The tenant
+   * switch is gated on THIS, never on `tenantId` alone — a measured sibling
+   * slot's `dark` names a tenant too, and re-pinning cannot help it.
+   */
+  pinnedTenant: boolean;
 }
 
 /** The two authorities the runner binary publishes under. */
@@ -219,7 +227,8 @@ export interface CredentialDarkPresentation {
    * Render the "Switch active tenant" action, which opens the tenant switcher
    * (the operator PICKS; nothing is re-pinned with a guessed tenant).
    *
-   * True only for a tenant-naming `absent`/`dark` signal AND when the switcher
+   * True only for the runner-marked PINNED-TENANT arm (`pinnedTenant`) on an
+   * `absent`/`dark` signal with a tenant, AND when the switcher
    * can act (`useTenant().showSwitcher`, i.e. more than one bound tenant). A
    * sign-in lands in whichever tenant coord stamps and never re-pins, so on a
    * box pinned to T that holds no credential for T, "Sign in to re-pair" can
@@ -308,6 +317,7 @@ export function normalizeCredentialDarkSignal(raw: unknown): CredentialDarkSigna
     cta: cta ?? (r.dark && r.cta === undefined ? "sign_in" : null),
     since: typeof r.since === "number" && Number.isFinite(r.since) ? r.since : null,
     tenantId: nonEmptyString(r.tenant_id),
+    pinnedTenant: r.pinned_tenant === true,
   };
 }
 
@@ -360,6 +370,7 @@ export function credentialDarkFromPostureSnapshot(raw: unknown): CredentialDarkS
       cta: null,
       since: typeof r.since === "number" && Number.isFinite(r.since) ? r.since : null,
       tenantId: nonEmptyString(r.tenantId),
+      pinnedTenant: false,
     };
   }
   const cta =
@@ -372,6 +383,7 @@ export function credentialDarkFromPostureSnapshot(raw: unknown): CredentialDarkS
     cta,
     since: typeof r.since === "number" && Number.isFinite(r.since) ? r.since : null,
     tenantId: nonEmptyString(r.tenantId),
+    pinnedTenant: r.pinnedTenant === true,
   };
 }
 
@@ -414,7 +426,7 @@ export function credentialDarkPresentation(
     body,
     ctaLabel: signal.cta === null ? null : CREDENTIAL_DARK_CTA_LABELS[signal.cta],
     ctaAction,
-    showSwitchTenant: namesTenant && showSwitcher,
+    showSwitchTenant: namesTenant && signal.pinnedTenant && showSwitcher,
   };
 }
 
@@ -490,5 +502,25 @@ export function makeRePairClickHandler(
 ): () => Promise<void> {
   return async () => {
     await invoker(KICK_DEVICE_JWT_REFRESHER_CMD, {});
+  };
+}
+
+/**
+ * Build the banner's "switch to this tenant" handler: re-pin through the
+ * EXISTING setter (TenantContext -> `set_active_tenant`, an explicit operator
+ * pick), kick the refresher so the posture is re-derived against the new pin,
+ * then RE-READ the posture so the banner does not keep showing the old tenant
+ * until an event happens to arrive. Resolves to the re-read signal (`null` =
+ * UNKNOWN, contribute nothing). Extracted so the order is unit-testable in node.
+ */
+export function makeSwitchTenantHandler(deps: {
+  setDefaultTenant: (tenantId: string) => Promise<void>;
+  invoker: (cmd: string, args: Record<string, unknown>) => Promise<unknown>;
+}): (tenantId: string) => Promise<CredentialDarkSignal | null> {
+  return async (tenantId: string) => {
+    await deps.setDefaultTenant(tenantId);
+    await deps.invoker(KICK_DEVICE_JWT_REFRESHER_CMD, {});
+    const raw = await deps.invoker(GET_COORD_CREDENTIAL_POSTURE_CMD, {});
+    return credentialDarkFromPostureSnapshot(raw);
   };
 }

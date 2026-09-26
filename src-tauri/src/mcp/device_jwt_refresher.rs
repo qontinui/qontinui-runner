@@ -304,8 +304,18 @@ fn emit_credential_dark_event(
     cta: Option<&str>,
     since: Option<i64>,
     tenant_id: Option<&str>,
+    pinned_tenant: bool,
 ) {
-    let payload = credential_dark_payload(source, dark, cause, message, cta, since, tenant_id);
+    let payload = credential_dark_payload(
+        source,
+        dark,
+        cause,
+        message,
+        cta,
+        since,
+        tenant_id,
+        pinned_tenant,
+    );
     if let Err(e) = app.emit(AUTONOMY_CREDENTIAL_DARK_EVENT, &payload) {
         warn!("device_jwt_refresher: failed to emit {AUTONOMY_CREDENTIAL_DARK_EVENT}: {e}");
     }
@@ -316,7 +326,10 @@ fn emit_credential_dark_event(
 /// `tenant_id` is the tenant the posture is about — the same value `/health`
 /// serves as `coordCredential.tenantId` — so the banner can name it and offer
 /// the tenant switch for a pinned tenant without a second read. `null` for the
-/// Cognito arm and for a posture that names no tenant.
+/// Cognito arm and for a posture that names no tenant. `pinned_tenant` is
+/// [`CoordCredentialStatus::pinned_tenant`]: the banner offers the tenant
+/// switch on it, never on `tenant_id` alone.
+#[allow(clippy::too_many_arguments)]
 fn credential_dark_payload(
     source: &str,
     dark: bool,
@@ -325,6 +338,7 @@ fn credential_dark_payload(
     cta: Option<&str>,
     since: Option<i64>,
     tenant_id: Option<&str>,
+    pinned_tenant: bool,
 ) -> serde_json::Value {
     serde_json::json!({
         "source": source,
@@ -334,6 +348,7 @@ fn credential_dark_payload(
         "cta": cta,
         "since": since,
         "tenant_id": tenant_id,
+        "pinned_tenant": pinned_tenant,
     })
 }
 
@@ -352,6 +367,7 @@ fn emit_credential_dark(app: &tauri::AppHandle, dark: bool) {
             Some("sign_in"),
             None,
             None,
+            false,
         );
     } else {
         emit_credential_dark_event(
@@ -363,6 +379,7 @@ fn emit_credential_dark(app: &tauri::AppHandle, dark: bool) {
             None,
             None,
             None,
+            false,
         );
     }
 }
@@ -377,7 +394,7 @@ fn emit_credential_dark(app: &tauri::AppHandle, dark: bool) {
 /// `app: None` (hermetic tests, headless callers) derives and publishes the
 /// posture but shows nothing — the state is still readable on `/health`.
 fn notify_posture_transition(app: Option<&tauri::AppHandle>, transition: PostureTransition) {
-    if !should_notify_posture(transition.from, transition.to) {
+    if !transition_notifies(transition) {
         return;
     }
     // The status the publisher just wrote: its `since`, and the sentence and
@@ -390,6 +407,7 @@ fn notify_posture_transition(app: Option<&tauri::AppHandle>, transition: Posture
         .map(CoordCredentialStatus::reason)
         .unwrap_or_else(|| transition.to.message().to_string());
     let tenant_id = status.as_ref().and_then(|s| s.tenant_id.clone());
+    let pinned_tenant = status.as_ref().is_some_and(|s| s.pinned_tenant);
     let from = transition
         .from
         .map(|p| p.as_str().to_string())
@@ -409,6 +427,7 @@ fn notify_posture_transition(app: Option<&tauri::AppHandle>, transition: Posture
             None,
             since,
             None,
+            false,
         );
     } else {
         emit_credential_dark_event(
@@ -423,6 +442,7 @@ fn notify_posture_transition(app: Option<&tauri::AppHandle>, transition: Posture
             transition.to.cta(),
             since,
             tenant_id.as_deref(),
+            pinned_tenant,
         );
     }
 }
@@ -616,6 +636,9 @@ pub(crate) struct CoordCredentialBag {
     /// ISO-8601 UTC instant the runner ENTERED this posture.
     pub since: String,
     pub tenant_id: Option<String>,
+    /// `true` only for the unserved-pin arm — see
+    /// [`CoordCredentialStatus::pinned_tenant`].
+    pub pinned_tenant: bool,
     /// Decoded `exp` of the credential the posture is about, unix seconds.
     pub exp: Option<i64>,
     /// How old this report may get before a reader must stop trusting it:
@@ -665,6 +688,7 @@ pub(crate) fn coord_credential_bag(
             posture: p.posture.as_str().to_string(),
             since: iso8601(p.since),
             tenant_id: p.tenant_id.clone(),
+            pinned_tenant: p.pinned_tenant,
             exp: p.exp,
             stale_after_secs: coord_credential_stale_after_secs(),
         },
@@ -674,6 +698,7 @@ pub(crate) fn coord_credential_bag(
             posture: "unknown".to_string(),
             since: iso8601(chrono::Utc::now().timestamp()),
             tenant_id: None,
+            pinned_tenant: false,
             exp: None,
             stale_after_secs: coord_credential_stale_after_secs(),
         },
@@ -3485,6 +3510,21 @@ pub struct CoordCredentialStatus {
     /// cause (see [`pinned_tenant_reason`]). `None` = the posture's generic
     /// [`CoordCredentialPosture::message`]. Read it through [`Self::reason`].
     pub composed_reason: Option<String>,
+    /// Is this the UNSERVED-PIN arm — a posture about the tenant `machine.json`
+    /// pins, which the credential selector refuses? Set ONLY by that arm's
+    /// candidate ([`PinArm`]). It is what lets the banner offer "Switch active
+    /// tenant": re-pinning can resolve a pinned tenant with no credential, and
+    /// cannot help a measured sibling slot that happens to name a tenant.
+    pub pinned_tenant: bool,
+}
+
+/// The unserved-pin arm's extra publish payload. Only
+/// [`derive_and_publish_posture`]'s unserved-pin candidate builds one, so
+/// [`CoordCredentialStatus::pinned_tenant`] cannot be set by any other arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PinArm {
+    /// [`pinned_tenant_reason`] for this pin and cause.
+    pub reason: String,
 }
 
 impl CoordCredentialStatus {
@@ -3523,16 +3563,38 @@ impl CoordCredentialStatus {
             // `false` = "we could not say WHICH slot", not "no tenant". A
             // reader joining `tenantId` to a slot must check this first.
             "attributable": self.attributable,
+            // `true` only for the unserved-pin arm — the banner's gate for the
+            // tenant switch.
+            "pinnedTenant": self.pinned_tenant,
         })
     }
 }
 
 /// A posture CHANGE, as seen by the publisher. `from: None` is the boot
 /// publish — the first observation this process made.
+///
+/// `detail_changed` is the second kind of change the banner must hear about:
+/// the posture VALUE stayed the same non-answering one, but WHAT it is about
+/// moved — its tenant, its composed reason (the selector's cause), or whether
+/// it is the pinned-tenant arm. `absent(T)` → `absent(T2)` after the operator
+/// switches the pin, or `absent(T, slot unreadable)` → `absent(T, slot
+/// absent)`, would otherwise leave the banner naming the old tenant and cause.
+/// It is never set on an answering posture, so it can never read as a
+/// recovery; `from == Some(to)` whenever it is set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PostureTransition {
     pub from: Option<CoordCredentialPosture>,
     pub to: CoordCredentialPosture,
+    pub detail_changed: bool,
+}
+
+/// Does a reported transition reach the banner? A same-posture DETAIL change
+/// always does — it is a dark re-announcement naming the new tenant or cause
+/// (see [`PostureTransition::detail_changed`]); a value change follows
+/// [`should_notify_posture`]'s dedup rule, which is the only path that can
+/// announce a recovery.
+pub(crate) fn transition_notifies(transition: PostureTransition) -> bool {
+    transition.detail_changed || should_notify_posture(transition.from, transition.to)
 }
 
 /// Should this transition fire the credential banner?
@@ -3672,8 +3734,9 @@ pub(crate) fn publish_coord_credential_posture(
 /// re-read of the tenant bucket alone would publish a null `last401At` beside
 /// a `dark` posture.
 ///
-/// `composed_reason` is [`CoordCredentialStatus::composed_reason`]: `None`
-/// everywhere but the unserved-pin arm.
+/// `pin_arm` is `Some` ONLY from the unserved-pin arm; it sets
+/// [`CoordCredentialStatus::composed_reason`] and
+/// [`CoordCredentialStatus::pinned_tenant`].
 fn publish_coord_credential_posture_with(
     posture: CoordCredentialPosture,
     tenant_id: Option<String>,
@@ -3681,7 +3744,7 @@ fn publish_coord_credential_posture_with(
     last_refresh_outcome: Option<String>,
     signal: UpstreamSignal,
     attributable: bool,
-    composed_reason: Option<String>,
+    pin_arm: Option<PinArm>,
 ) -> Option<PostureTransition> {
     let now = chrono::Utc::now().timestamp();
     // L1: a poisoned mutex must not turn `/health` — the endpoint whose job is
@@ -3691,6 +3754,17 @@ fn publish_coord_credential_posture_with(
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let previous = cell.as_ref().map(|s| s.posture);
+    let pinned_tenant = pin_arm.is_some();
+    let composed_reason = pin_arm.map(|a| a.reason);
+    // Same non-answering posture, different subject: tenant, cause sentence, or
+    // arm. See [`PostureTransition::detail_changed`].
+    let detail_changed = cell.as_ref().is_some_and(|prev| {
+        prev.posture == posture
+            && !posture.can_answer()
+            && (prev.tenant_id != tenant_id
+                || prev.composed_reason != composed_reason
+                || prev.pinned_tenant != pinned_tenant)
+    });
     let since = match previous {
         Some(p) if p == posture => cell.as_ref().map(|s| s.since).unwrap_or(now),
         _ => now,
@@ -3706,13 +3780,17 @@ fn publish_coord_credential_posture_with(
         observed_at_unix: now,
         attributable,
         composed_reason,
+        pinned_tenant,
     });
-    let transition = (previous != Some(posture)).then_some(PostureTransition {
+    let transition = (previous != Some(posture) || detail_changed).then_some(PostureTransition {
         from: previous,
         to: posture,
+        detail_changed,
     });
+    // The test record keeps meaning "posture VALUE changes", which is what
+    // every reader of it asserts on.
     #[cfg(test)]
-    if let Some(t) = transition {
+    if let Some(t) = transition.filter(|t| !t.detail_changed) {
         POSTURE_TRANSITIONS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -3803,8 +3881,8 @@ pub(crate) fn derive_and_publish_posture(
         exp: Option<i64>,
         outcome: Option<TenantSlotOutcome>,
         signal: UpstreamSignal,
-        /// [`CoordCredentialStatus::composed_reason`] — the unserved pin only.
-        composed_reason: Option<String>,
+        /// The unserved pin only — see [`PinArm`].
+        pin_arm: Option<PinArm>,
     }
 
     // One usable slot means the default-slot bucket describes the same
@@ -3828,7 +3906,9 @@ pub(crate) fn derive_and_publish_posture(
             exp: None,
             outcome: None,
             signal,
-            composed_reason: Some(pinned_tenant_reason(&pinned, &cause)),
+            pin_arm: Some(PinArm {
+                reason: pinned_tenant_reason(&pinned, &cause),
+            }),
         }
     });
     // The unserved pin goes FIRST: `max_by_key` keeps the last of equal
@@ -3844,7 +3924,7 @@ pub(crate) fn derive_and_publish_posture(
                 exp: o.exp,
                 outcome: o.outcome,
                 signal,
-                composed_reason: None,
+                pin_arm: None,
             }
         }))
         .max_by_key(|c| c.posture.severity());
@@ -3937,7 +4017,7 @@ pub(crate) fn derive_and_publish_posture(
         // including when it is `None`, which is the LEGACY default slot and
         // is exactly the credential an unpinned session presents.
         true,
-        worst.composed_reason,
+        worst.pin_arm,
     )
 }
 
@@ -7201,6 +7281,7 @@ mod tenant_slot_refresh_tests {
             PostureTransition {
                 from: None,
                 to: CoordCredentialPosture::Expired,
+                detail_changed: false,
             },
             "the FIRST thing a runner holding a dead restored credential says \
              must be `expired`, not silence: {transitions:?}"
@@ -7391,6 +7472,7 @@ mod tenant_slot_refresh_tests {
             vec![PostureTransition {
                 from: None,
                 to: CoordCredentialPosture::Expiring,
+                detail_changed: false,
             }],
             "a timeout may not produce a SECOND transition — the posture the \
              boot observation established still stands: {transitions:?}"
@@ -7605,6 +7687,7 @@ mod tenant_slot_refresh_tests {
             observed_at_unix: 9,
             attributable: true,
             composed_reason: None,
+            pinned_tenant: false,
         };
         let v = status.to_json();
         assert_eq!(v["state"], "dark");
@@ -8709,10 +8792,16 @@ mod tenant_slot_refresh_tests {
             machine_pin: TenantPin::Pinned(pinned),
             pin_served: slot_absent(),
         };
+        // Still dark, so never a recovery — but the banner's subject moved from
+        // "no tenant" to T, which is a DETAIL transition that re-announces it.
         assert_eq!(
             derive_and_publish_posture(&slots, pins, now),
-            None,
-            "still dark, so no transition — and never a recovery"
+            Some(PostureTransition {
+                from: Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected)),
+                to: CoordCredentialPosture::Dark(DarkCause::UpstreamRejected),
+                detail_changed: true,
+            }),
+            "still dark — never a recovery — and now naming T"
         );
         let published = coord_credential_posture().expect("published");
         assert_eq!(
@@ -8812,6 +8901,15 @@ mod tenant_slot_refresh_tests {
             Some(pinned.to_string().as_str()),
             "{label}: the posture names the pinned tenant"
         );
+        assert!(
+            published.pinned_tenant,
+            "{label}: marked as the pinned-tenant arm"
+        );
+        assert_eq!(
+            published.to_json()["pinnedTenant"].as_bool(),
+            Some(true),
+            "{label}: /health carries the pinned-tenant marker"
+        );
         let expected = pinned_tenant_reason(&pinned, &cause);
         assert_eq!(published.reason(), expected, "{label}: the composed reason");
         assert!(
@@ -8829,6 +8927,7 @@ mod tenant_slot_refresh_tests {
             Some(expected.as_str()),
             "{label}: the heartbeat bag carries it too"
         );
+        assert!(bag.pinned_tenant, "{label}: and the marker");
     }
 
     /// Plan 2026-09-14-credential-posture-third-residuals, Phase 1 exit (d) —
@@ -8942,6 +9041,10 @@ mod tenant_slot_refresh_tests {
         assert_eq!(
             published.composed_reason, None,
             "a measured slot's posture keeps the generic sentence"
+        );
+        assert!(
+            !published.pinned_tenant,
+            "a measured slot is not the pinned-tenant arm, even when it IS T's"
         );
         reset_posture();
     }
@@ -9464,8 +9567,10 @@ mod tenant_slot_refresh_tests {
             Some("re_pair"),
             Some(1),
             Some(&t),
+            true,
         );
         assert_eq!(with["tenant_id"].as_str(), Some(t.as_str()));
+        assert_eq!(with["pinned_tenant"].as_bool(), Some(true));
         let without = credential_dark_payload(
             DARK_SOURCE_COGNITO,
             true,
@@ -9474,8 +9579,10 @@ mod tenant_slot_refresh_tests {
             None,
             None,
             None,
+            false,
         );
         assert!(without["tenant_id"].is_null());
+        assert_eq!(without["pinned_tenant"].as_bool(), Some(false));
         assert!(
             without
                 .as_object()
@@ -9483,6 +9590,119 @@ mod tenant_slot_refresh_tests {
                 .contains_key("tenant_id"),
             "the key is always present"
         );
+    }
+
+    /// Review of the third-residuals PR, item 1. A transition used to be
+    /// reported only when the posture VALUE changed, so `absent(T)` →
+    /// `absent(T2)` (the operator used "Switch active tenant" and T2 is
+    /// unserved too) or `absent(T, slot unreadable)` → `absent(T, slot absent)`
+    /// fired nothing, and the banner kept the old tenant and cause. Each is now
+    /// a DETAIL transition that notifies; an identical republish is none; and
+    /// an ANSWERING posture whose tenant moves is none too — a detail change can
+    /// never be dressed up as a recovery.
+    #[test]
+    fn a_same_posture_change_of_tenant_or_cause_notifies_and_an_identical_republish_does_not() {
+        use crate::auth::{NoCredential, SlotState};
+        use crate::session::tenant_pin::TenantPin;
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let (t, t2, y) = (tenant(3), tenant(5), tenant(4));
+        let pins = |p: uuid::Uuid, c: SlotState| PosturePinInputs {
+            machine_pin: TenantPin::Pinned(p),
+            pin_served: Some(Err(NoCredential::Slot(c))),
+        };
+        let slots = [live_slot(y, now)];
+
+        let first = derive_and_publish_posture(&slots, pins(t, SlotState::Absent), now)
+            .expect("the first publish is a transition");
+        assert!(!first.detail_changed);
+        assert_eq!(
+            derive_and_publish_posture(&slots, pins(t, SlotState::Absent), now),
+            None,
+            "an identical republish reports nothing"
+        );
+
+        let switched = derive_and_publish_posture(&slots, pins(t2, SlotState::Absent), now);
+        assert_eq!(
+            switched,
+            Some(PostureTransition {
+                from: Some(CoordCredentialPosture::Absent),
+                to: CoordCredentialPosture::Absent,
+                detail_changed: true,
+            }),
+            "same posture, new tenant"
+        );
+        assert!(transition_notifies(switched.unwrap()));
+        assert_pin_arm_published(
+            t2,
+            NoCredential::Slot(SlotState::Absent),
+            "after the switch",
+        );
+
+        let recaused = derive_and_publish_posture(&slots, pins(t2, SlotState::Unreadable), now);
+        assert!(
+            recaused.is_some_and(|x| x.detail_changed && transition_notifies(x)),
+            "same posture and tenant, new cause: {recaused:?}"
+        );
+        assert_pin_arm_published(
+            t2,
+            NoCredential::Slot(SlotState::Unreadable),
+            "after the cause moved",
+        );
+        assert_eq!(
+            derive_and_publish_posture(&slots, pins(t2, SlotState::Unreadable), now),
+            None,
+            "identical again: nothing"
+        );
+        assert_eq!(
+            recorded_posture_transitions().len(),
+            1,
+            "the value-change record is unaffected by detail changes"
+        );
+
+        // Answering → answering with a different tenant is not a transition:
+        // there is no banner to update, and a report here could only read as
+        // a recovery.
+        reset_posture();
+        let _ = derive_and_publish_posture(&[live_slot(y, now)], PosturePinInputs::UNPINNED, now);
+        assert_eq!(
+            derive_and_publish_posture(&[live_slot(t, now)], PosturePinInputs::UNPINNED, now),
+            None
+        );
+        reset_posture();
+    }
+
+    /// Review item 2. A MEASURED sibling slot that coord keeps rejecting
+    /// publishes `dark` naming ITS tenant — but it is not the pinned-tenant
+    /// arm, and re-pinning cannot help it, so it carries no marker and the
+    /// banner offers no switch. The pinned arm's marker is asserted by
+    /// `assert_pin_arm_published` in every pin test.
+    #[test]
+    fn a_sibling_slot_dark_with_a_tenant_is_not_the_pinned_tenant_arm() {
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let (y, z) = (tenant(4), tenant(2));
+        for _ in 0..UPSTREAM_DARK_THRESHOLD {
+            note_coord_upstream_verdict(Some(y), true, 401, br#"{"code":"token_revoked"}"#);
+        }
+        assert_eq!(
+            derive_and_publish_posture(
+                &[live_slot(y, now), live_slot(z, now)],
+                PosturePinInputs::UNPINNED,
+                now
+            )
+            .map(|x| x.to),
+            Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected))
+        );
+        let published = coord_credential_posture().expect("published");
+        assert_eq!(published.tenant_id.as_deref(), Some(y.to_string().as_str()));
+        assert!(!published.pinned_tenant);
+        assert_eq!(published.to_json()["pinnedTenant"].as_bool(), Some(false));
+        let bag = coord_credential_bag(&CoordCredentialHealth::ok(), Some(&published));
+        assert!(!bag.pinned_tenant);
+        reset_posture();
     }
 
     /// Phase 3 counterfactual: a posture no arm composed a sentence for keeps
@@ -10195,6 +10415,7 @@ mod tenant_slot_refresh_tests {
                 observed_at_unix: 1_700_000_050,
                 attributable: true,
                 composed_reason: None,
+                pinned_tenant: false,
             };
             let bag = coord_credential_bag(&fallback, Some(&status));
             assert_eq!(
