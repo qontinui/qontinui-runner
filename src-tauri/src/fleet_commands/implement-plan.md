@@ -894,7 +894,7 @@ the roster's guard applies before the edit:
 
 <!-- status-guard:start -->
 > **`IN PROGRESS` is a GUARDED STATE — it is never freely overwritable.**
-> *(Roster and gate: `.claude/commands/_status-writers.md`, check #64. The full
+> *(Roster and gate: `.claude/commands/_status-writers.md`, check #66. The full
 > arm table and its evaluation order: `/vet-plan`, "`IN PROGRESS` is
 > CONDITIONALLY overwritable".)* Before this command writes, replaces,
 > downgrades or re-dates a plan's lifecycle stamp, read the stamp already there
