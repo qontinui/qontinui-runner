@@ -317,6 +317,21 @@ fn provision_fleet_skills_into(
         validate_agent_text_unit_file_path, validate_agent_text_unit_name,
     };
 
+    // Never through a symlink: a linked `.claude` or `.claude/skills` would put
+    // every write — `create_dir_all` included — inside the link's target.
+    if let Some(why) = crate::provision_guard::redirected_asset_dir(skills_dir) {
+        info!(
+            "fleet_skills: not provisioning {} — {why}",
+            skills_dir.display()
+        );
+        return Ok(ProvisionReport::stood_down(
+            "fleet_skills",
+            registry.resolved_file_count(),
+            capability_manifest::Rung::Unresolved,
+            skills_dir.display().to_string(),
+            capability_manifest::SkipReason::Symlinked(why),
+        ));
+    }
     std::fs::create_dir_all(skills_dir)?;
     let tracked = crate::provision_guard::TrackedPaths::probe(skills_dir);
     let resolved = registry.all();
@@ -393,6 +408,15 @@ fn provision_fleet_skills_into(
             // the skills dir — which is exactly what `TrackedPaths` reports.
             let relative = Path::new(skill.dir_name()).join(rel_path);
             let dst = skills_dir.join(&relative);
+            // Never through a symlink — the skill's directory, any nested one,
+            // or the file itself.
+            if let Some(why) = crate::provision_guard::symlink_below(skills_dir, &dst) {
+                out.skip(
+                    relative.display().to_string(),
+                    capability_manifest::SkipReason::Symlinked(why),
+                );
+                continue;
+            }
             // Before `create_dir_all`: a skill whose every file is tracked must
             // not leave a new empty directory in the repository's working tree.
             if tracked.should_skip(&dst, &relative) {
@@ -649,6 +673,35 @@ mod tests {
             embedded.contents(),
             "an untracked destination is overwritten exactly as before"
         );
+    }
+
+    /// Never through a symlink: a skill DIRECTORY linking elsewhere (into a
+    /// canonical checkout, say) keeps its target byte-identical, and every
+    /// other skill is still written.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_skill_directory_is_never_written_through() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let elsewhere = tmp.path().join("canonical-coord-revive");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join(SKILL_MANIFEST), b"# canonical\n").unwrap();
+        let skills_dir = tmp.path().join(".claude").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, skills_dir.join("coord-revive")).unwrap();
+
+        let out = provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new())
+            .expect("provision");
+
+        assert_eq!(
+            std::fs::read(elsewhere.join(SKILL_MANIFEST)).unwrap(),
+            b"# canonical\n"
+        );
+        assert!(out
+            .skipped
+            .iter()
+            .all(|s| s.unit.starts_with("coord-revive") && s.reason.wire() == "symlinked"));
+        assert!(!out.skipped.is_empty());
+        assert_eq!(out.written + out.skipped.len(), out.expected);
     }
 
     #[test]

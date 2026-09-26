@@ -37,7 +37,10 @@ type Site = (String, String);
 /// Each per-asset provisioner and the ONE non-test `(file, fn)` allowed to call
 /// it.
 const ALLOWED_CALLERS: &[(&str, (&str, &str))] = &[
-    ("provision_agent_definitions(", (ENTRY_FILE, ENTRY_FN)),
+    (
+        "provision_agent_definitions_from_root(",
+        (ENTRY_FILE, ENTRY_FN),
+    ),
     (
         "provision_fleet_commands_for_session(",
         (ENTRY_FILE, ENTRY_FN),
@@ -88,6 +91,25 @@ const REQUIRED_CALLERS: &[(&str, &str)] = &[
     ("agent_worktree/isolated_edit.rs", "provision_session_cwd"),
 ];
 
+/// The terminal chokepoint `provision_session_cwd` is BLOCKING (file writes and
+/// bounded `git` probes). Its only direct caller is its off-runtime wrapper;
+/// every async spawn path calls the wrapper, and is listed here so a path that
+/// goes back to the inline sync call — or stops provisioning — goes red.
+const CWD_SYNC: (&str, &str, &str) = (
+    "provision_session_cwd(",
+    "agent_worktree/isolated_edit.rs",
+    "provision_session_cwd_off_runtime",
+);
+const CWD_OFF_RUNTIME_TOKEN: &str = "provision_session_cwd_off_runtime(";
+const CWD_OFF_RUNTIME_CALLERS: &[(&str, &str)] = &[
+    ("agent_worktree/isolated_edit.rs", "acquire_for_terminal"),
+    ("agent_worktree/isolated_edit.rs", "acquire_for_worker"),
+    (
+        "orchestration_loop/ai_session_executor.rs",
+        "dispatch_subtask",
+    ),
+];
+
 /// This file names every token in string literals; it is not a caller.
 const SELF_FILE: &str = "session_asset_sites.rs";
 
@@ -96,8 +118,9 @@ fn site(file: &str, func: &str) -> Site {
 }
 
 /// Every `(file, enclosing fn)` making a non-test call of `token` (`name(`).
-/// Comment lines and `#[cfg(test)] mod` spans are blanked first. A match on a
-/// fn-declaration line is a call unless that line declares `name` itself.
+/// Comment lines and `#[cfg(test)] mod` spans are blanked first, and a call in
+/// a test fn ([`is_test_fn`]) is dropped. A match on a fn-declaration line is
+/// a call unless that line declares `name` itself.
 fn calls_of(sources: &Sources, token: &str) -> BTreeSet<Site> {
     let re = token_re(token);
     let decl = fn_decl_re();
@@ -130,14 +153,40 @@ fn calls_of(sources: &Sources, token: &str) -> BTreeSet<Site> {
             if decl.captures(code[line]).is_some_and(|c| &c[2] == name) {
                 continue;
             }
-            let enclosing = (0..=line)
+            let Some((at, enclosing)) = (0..=line)
                 .rev()
-                .find_map(|j| decl.captures(lines[j]).map(|c| c[2].to_string()))
-                .unwrap_or_else(|| "<file scope>".to_string());
+                .find_map(|j| decl.captures(lines[j]).map(|c| (j, c[2].to_string())))
+            else {
+                out.insert((file.clone(), "<file scope>".to_string()));
+                continue;
+            };
+            // A test FN is not a caller either. `test_spans` finds a test module
+            // by brace-counting, which an unbalanced brace in a string literal
+            // can end early; the attribute block directly above the enclosing
+            // declaration is the second, independent signal.
+            if is_test_fn(&lines, at) {
+                continue;
+            }
             out.insert((file.clone(), enclosing));
         }
     }
     out
+}
+
+/// Whether the fn declared at `lines[at]` carries a `#[test]`,
+/// `#[tokio::test…]` or `#[cfg(test)]` attribute in the attribute/doc block
+/// directly above it.
+fn is_test_fn(lines: &[&str], at: usize) -> bool {
+    lines[..at]
+        .iter()
+        .rev()
+        .map(|l| l.trim_start())
+        .take_while(|t| t.starts_with("#[") || t.starts_with("//"))
+        .any(|t| {
+            t.starts_with("#[test]")
+                || t.starts_with("#[tokio::test")
+                || t.starts_with("#[cfg(test)]")
+        })
 }
 
 /// `token -> callers` that are not the token's allowed caller. PURE.
@@ -184,6 +233,73 @@ fn entry_point_callers_vs_roster(sources: &Sources) -> (Vec<Site>, Vec<Site>) {
     listed.extend(ENTRY_WRAPPERS.iter().map(|(f, func)| site(f, func)));
     let unlisted = found.difference(&listed).cloned().collect();
     (missing, unlisted)
+}
+
+/// `(inline, missing, unlisted)` for the terminal chokepoint: callers of the
+/// blocking `provision_session_cwd` other than its wrapper, rostered async
+/// paths that no longer call the wrapper, and wrapper callers with no row. PURE.
+fn session_cwd_callers_vs_roster(sources: &Sources) -> (Vec<Site>, Vec<Site>, Vec<Site>) {
+    let (token, wrapper_file, wrapper_fn) = CWD_SYNC;
+    let wrapper = site(wrapper_file, wrapper_fn);
+    let inline = calls_of(sources, token)
+        .into_iter()
+        .filter(|s| *s != wrapper)
+        .collect();
+    let found = calls_of(sources, CWD_OFF_RUNTIME_TOKEN);
+    let listed: BTreeSet<Site> = CWD_OFF_RUNTIME_CALLERS
+        .iter()
+        .map(|(f, func)| site(f, func))
+        .collect();
+    (
+        inline,
+        listed.difference(&found).cloned().collect(),
+        found.difference(&listed).cloned().collect(),
+    )
+}
+
+#[test]
+fn async_spawn_paths_provision_the_session_cwd_off_the_runtime() {
+    let (inline, missing, unlisted) = session_cwd_callers_vs_roster(&load_sources());
+    assert!(
+        inline.is_empty(),
+        "blocking `provision_session_cwd` called inline — async spawn paths must await \
+         `provision_session_cwd_off_runtime` so its git probes stay off tokio workers: \
+         {inline:#?}"
+    );
+    assert!(
+        missing.is_empty(),
+        "rostered async spawn paths that no longer provision the session cwd: {missing:#?}"
+    );
+    assert!(
+        unlisted.is_empty(),
+        "callers of `provision_session_cwd_off_runtime` with no CWD_OFF_RUNTIME_CALLERS \
+         row: {unlisted:#?}"
+    );
+}
+
+/// Mutation twin: put one async path back on the inline sync call and the
+/// guard must name it, both as an inline caller and as a missing wrapper call.
+#[test]
+fn an_inline_sync_session_cwd_provision_is_caught() {
+    let mut sources = load_sources();
+    let file = "orchestration_loop/ai_session_executor.rs".to_string();
+    let src = sources.get(&file).expect("ai_session_executor.rs").clone();
+    assert!(
+        src.contains(CWD_OFF_RUNTIME_TOKEN),
+        "fixture: dispatch_subtask must call the off-runtime wrapper today"
+    );
+    sources.insert(
+        file,
+        src.replace(CWD_OFF_RUNTIME_TOKEN, "provision_session_cwd("),
+    );
+    let (inline, missing, unlisted) = session_cwd_callers_vs_roster(&sources);
+    let executor = site(
+        "orchestration_loop/ai_session_executor.rs",
+        "dispatch_subtask",
+    );
+    assert_eq!(inline, vec![executor.clone()]);
+    assert_eq!(missing, vec![executor]);
+    assert!(unlisted.is_empty());
 }
 
 #[test]
@@ -260,7 +376,7 @@ fn an_inline_provision_on_a_new_spawn_path_is_caught() {
         ENTRY_FILE.to_string(),
         format!(
             "pub(crate) fn {ENTRY_FN}(workdir: &str) {{\n    \
-             crate::agent_runtime::provision_agent_definitions(workdir);\n    \
+             crate::agent_runtime::provision_agent_definitions_from_root(root, workdir);\n    \
              crate::fleet_commands::provision_fleet_commands_for_session(workdir);\n    \
              crate::fleet_skills::provision_fleet_skills_for_session(workdir);\n}}\n"
         ),
@@ -277,7 +393,8 @@ fn an_inline_provision_on_a_new_spawn_path_is_caught() {
          // provision_fleet_skills_for_session(workdir) — a comment is not a call\n    \
          crate::fleet_commands::provision_fleet_commands_for_session(\n        workdir,\n    );\n}\n\
          fn one_liner(d: &Path) { crate::fleet_agents::provision_fleet_agents_into(d, &t); }\n\
-         #[cfg(test)]\nmod tests {\n    fn t() { super::provision_agent_definitions(\"x\"); }\n}\n"
+         #[test]\n#[cfg(unix)]\nfn stray_test() { provision_fleet_skills_for_session(\"x\"); }\n\
+         #[cfg(test)]\nmod tests {\n    fn t() { super::provision_agent_definitions_from_root(None, \"x\"); }\n}\n"
             .to_string(),
     );
     assert_eq!(
@@ -302,7 +419,7 @@ fn an_inline_provision_on_a_new_spawn_path_is_caught() {
     assert_eq!(
         provisioners_missing_from_the_entry_point(&sources),
         vec![
-            "provision_agent_definitions(",
+            "provision_agent_definitions_from_root(",
             "provision_fleet_commands_for_session(",
             "provision_fleet_skills_for_session(",
         ]

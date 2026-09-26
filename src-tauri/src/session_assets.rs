@@ -6,7 +6,7 @@
 //!
 //! | Kind | Destination | Provisioner |
 //! |---|---|---|
-//! | subagent definitions | `.claude/agents/*.md` | [`crate::agent_runtime::provision_agent_definitions`] (embedded floor + checkout overlay) |
+//! | subagent definitions | `.claude/agents/*.md` | [`crate::agent_runtime::provision_agent_definitions_from_root`] (embedded floor + checkout overlay) |
 //! | fleet slash commands | `.claude/commands/*.md` | [`crate::fleet_commands::provision_fleet_commands_for_session`] |
 //! | fleet skills | `.claude/skills/<name>/` | [`crate::fleet_skills::provision_fleet_skills_for_session`] |
 //!
@@ -23,8 +23,8 @@
 //! an error or panics: a provision that cannot write degrades into a ledger row
 //! ([`crate::capability_manifest::record_provision`]) and a log line, and the
 //! spawn proceeds. All three skip a destination the enclosing git repository
-//! tracks ([`crate::provision_guard`]), so a cwd whose `.claude/` is a checkout
-//! keeps its own content.
+//! tracks, and never write through a symlink ([`crate::provision_guard`]), so a
+//! cwd whose `.claude/` is a checkout — or links into one — keeps its content.
 
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use std::path::Path;
@@ -48,8 +48,9 @@ pub(crate) fn provision_session_assets(workdir: &str) {
     );
 }
 
-/// Core of [`provision_session_assets`] with the workspace root passed in, so a
-/// test can drive the canonical-source arm without mutating process env.
+/// Core of [`provision_session_assets`] with the workspace root passed in —
+/// resolved ONCE per spawn by the wrapper and handed to the agent-definition
+/// path — so a test can drive every arm without mutating process env.
 ///
 /// **The canonical-source arm.** A cwd at the workspace root sees
 /// `<root>/.claude` as a symlink into `qontinui-claude-config/.claude` — the
@@ -81,7 +82,7 @@ fn provision_session_assets_from_root(root: Option<&Path>, workdir: &str) {
         }
         return;
     }
-    match crate::agent_runtime::provision_agent_definitions(workdir) {
+    match crate::agent_runtime::provision_agent_definitions_from_root(root, workdir) {
         Ok(report) => capability_manifest::record_provision(workdir, report),
         Err(e) => {
             warn!("session_assets: agent-def provisioning into {workdir} errored (continuing spawn): {e:#}");
@@ -193,6 +194,53 @@ mod tests {
                 .iter()
                 .map(|c| (*c, "canonical_source"))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// No workspace root resolved (a published install), and the cwd's
+    /// `.claude` is a symlink: the root-based check cannot run, so the
+    /// never-through-a-symlink rule alone must stand every kind down and leave
+    /// the target tree byte-identical.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_claude_tree_with_no_root_is_left_untouched() {
+        let _store = capability_manifest::store_lock();
+        let target = tempfile::tempdir().unwrap();
+        for (rel, body) in [
+            ("agents/code-reviewer.md", "# someone's reviewer"),
+            ("commands/vet-plan.md", "# someone's vet-plan"),
+        ] {
+            let path = target.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        let before = listing(target.path());
+
+        let cwd = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(target.path(), cwd.path().join(".claude")).unwrap();
+        let cwd_s = cwd.path().to_string_lossy().into_owned();
+
+        provision_session_assets_from_root(None, &cwd_s);
+
+        assert_eq!(
+            listing(target.path()),
+            before,
+            "nothing written through the link"
+        );
+        let ledger = capability_manifest::session_provision_ledger(&cwd_s).expect("recorded");
+        let rows: Vec<(&str, &str)> = ledger
+            .reports
+            .iter()
+            .map(|r| (r.capability, r.skipped[0].reason.wire()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("fleet_agents", "symlinked"),
+                ("agent_definitions", "symlinked"),
+                ("fleet_commands", "symlinked"),
+                ("fleet_skills", "symlinked"),
+            ]
         );
     }
 }
