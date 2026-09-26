@@ -26,6 +26,11 @@
 //!   written inside such a comment can read as a call. Finding a test module's
 //!   END is different: [`code_brace_counts`] tracks `/*` anywhere, nested, as
 //!   well as every string, raw/byte/C-string and char literal.
+//! * [`comment_mask`] is whole-line: a line that STARTS with `/*` is blanked
+//!   entirely, and so is the comment's last line even when code follows the
+//!   closing `*/`. So `/* x */ tm.create(a);` is dropped. It is also not
+//!   literal-aware, so a line inside a multi-line string that starts with `/*`
+//!   blanks every line until the next `*/`.
 //! * The scan sees a spawn PRIMITIVE, so a path that reaches `claude` by some
 //!   other construction is invisible until its shape is added to
 //!   `primitive_res`. `Command::new("claude")` was exactly that until review
@@ -1083,6 +1088,11 @@ fn code_brace_counts_skip_literals_and_comments() {
         r#"    line two }"; }"#,
         // Escaped char literals close at their REAL closing quote.
         r#"    f('\'', '}'); g('\\', '{'); h('\n', '}');"#,
+        // Adjacent to the next literal: the old search (from `i + 2`) closed
+        // `'\''` at the ESCAPED quote, read `','` as a char literal and counted
+        // the brace — (0, 1) and (1, 0) respectively.
+        r#"    f('\'','}');"#,
+        r#"    x(b'\'','{');"#,
         // Escaped quote inside a string; a string ending in an escaped backslash.
         r#"    let q = "\"}"; let bs = "\\"; {"#,
         // C strings, raw C strings and a byte char; a lifetime, `'static` and a
@@ -1101,6 +1111,8 @@ fn code_brace_counts_skip_literals_and_comments() {
             (0, 0),
             (0, 1),
             (0, 0),
+            (0, 0),
+            (0, 0),
             (1, 0),
             (0, 1),
             (1, 1),
@@ -1109,8 +1121,8 @@ fn code_brace_counts_skip_literals_and_comments() {
     );
 }
 
-/// A test module holding a `cr#"…"#` with an unbalanced quote still closes, so
-/// the production call after it is found and the test-module call is not.
+/// A test module holding a `cr#"…"#` with an unbalanced quote still closes at
+/// its own `}`: the span ends there instead of running on over `fn prod`.
 #[test]
 fn a_raw_c_string_in_a_test_module_does_not_hold_it_open() {
     let lines = [

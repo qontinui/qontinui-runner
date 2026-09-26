@@ -105,7 +105,7 @@ mod tests {
         Ratchet {
             lint: "clippy::string_slice",
             expect_needle: "#[expect(clippy::string_slice",
-            baseline: 435,
+            baseline: 434,
             gate_wiring: &[
                 ("src-tauri/Cargo.toml", "string_slice = { level = \"deny\""),
                 (
