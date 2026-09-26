@@ -77,9 +77,35 @@ pub struct RegisteredApp {
 }
 
 /// Registry ceiling. Rows now outlive their TTL (they carry the reservation),
-/// so residency is longer and needs a bound of its own. Reservation-only rows
-/// are evicted before live ones.
+/// so residency is longer and needs a bound of its own. A claimant may only
+/// ever give up a row of its OWN to fit under it.
 pub const MAX_ROWS: usize = 4096;
+
+/// Rows at the top of [`MAX_ROWS`] that only operator trust may occupy.
+///
+/// Browser principals are held to `MAX_ROWS - OPERATOR_HEADROOM`, so no
+/// quantity of them can consume the last slice. Without it the ceiling was an
+/// autonomy defect, not just a capacity one: a page that registered
+/// `MAX_ROWS` fresh ids and re-POSTed each inside the 30 s TTL (~137 req/s on
+/// loopback, one tab) left every row LIVE, so nothing was reservation-only,
+/// nothing was self-evictable, and an AGENT registering a synthetic app got
+/// `UIB_REGISTRY_FULL` indefinitely — `agent_flow_unchanged`'s first step
+/// denied by a web page.
+///
+/// A reservation rather than a wider eviction right on purpose: letting an
+/// agent take a browser's row would put back a RANKING over other principals'
+/// rows, and every ranking tried has been measured attacker-steerable.
+/// Reserving capacity picks no victim, so there is nothing to steer.
+pub const OPERATOR_HEADROOM: usize = 256;
+
+/// The browser ceiling is `MAX_ROWS - OPERATOR_HEADROOM`, an unsigned
+/// subtraction. Raise the headroom to or past `MAX_ROWS` and it UNDERFLOWS to
+/// `usize::MAX` in release, so the browser ceiling becomes unbounded and M2 is
+/// silently reinstated — while every test stays green, because they all
+/// compute the bound from this same expression. A zero headroom is the other
+/// end of the same mistake: it removes the reservation without removing any
+/// code that claims to rely on it. Both are compile errors now.
+const _: () = assert!(OPERATOR_HEADROOM > 0 && OPERATOR_HEADROOM < MAX_ROWS);
 
 /// Longest accepted `appId`. The ceilings bound the COUNT of rows, not their
 /// BYTES: without this, one origin could hold its quota of rows keyed on
@@ -273,47 +299,87 @@ impl AppRegistry {
             }
         }
 
-        // Row ceiling — SELF-EVICTION ONLY.
+        // Row ceiling — RESERVED HEADROOM plus SELF-EVICTION.
         //
-        // A claimant at the ceiling may give up a row of ITS OWN (its
-        // soonest-to-lapse reservation-only row; operator trust may take any,
-        // since `may_displace` is what "its own" means here). It may never
-        // cause another principal's row to be dropped, so no ranking over
-        // other principals' rows exists to be steered. That is the lesson the
-        // deleted tombstone map paid for three times over: "evict the soonest
-        // to expire" is "evict the oldest", which is always the victim's
-        // because an attacker's rows are newer by construction; "evict the
-        // largest bucket" is attacker-chosen because bucket size is; and
-        // `share = MAX / buckets` divides to ZERO once the bucket count
-        // reaches the ceiling, at which point every bucket is "over its
-        // share" and the tie falls to whichever origin the comparison ranks
-        // last — an origin an attacker simply picks.
+        // Two separate jobs, and conflating them was the defect here:
         //
-        // Consequences of refusing instead, stated so they are chosen rather
-        // than discovered:
+        // 1. A browser principal's ceiling is `MAX_ROWS - OPERATOR_HEADROOM`.
+        //    Operator trust gets the full `MAX_ROWS`, so the last
+        //    `OPERATOR_HEADROOM` rows are unreachable to every browser
+        //    principal no matter how many of them there are. This is what
+        //    keeps `agent_flow_unchanged`'s very first step working while a
+        //    page floods: an agent registering a synthetic app must never be
+        //    refused because a web page filled the map.
+        //
+        //    A quota is the only shape that survives here. Widening eviction
+        //    so an agent could take a browser row would reintroduce a RANKING
+        //    over other principals' rows, and every such ranking has been
+        //    measured steerable (below). Reserving capacity selects no victim
+        //    at all, so there is nothing to steer.
+        //
+        // 2. Under its own ceiling a claimant may still give up a row of ITS
+        //    OWN — its soonest-to-lapse reservation-only row — so a
+        //    legitimately churning app is not throttled by its own history.
+        //    It may NEVER cause another principal's row to be dropped.
+        //
+        //    One kind is excluded from that relief, deliberately: an
+        //    `Opaque` principal can never self-evict, because
+        //    `Principal::same` is false for it even against another
+        //    `Opaque` — two principal-less requests are not the same
+        //    principal, which is the whole point of R-opaque. So an opaque
+        //    claimant at the ceiling is always refused rather than recycling
+        //    "its own" rows. That is correct (it has no identity to own a row
+        //    WITH), but it means the sentence above does not cover it.
+        //
+        // The rankings this refuses to re-invent, from the deleted tombstone
+        // map: "evict the soonest to expire" is "evict the oldest", which is
+        // always the victim's because an attacker's rows are newer by
+        // construction; "evict the largest bucket" is attacker-chosen because
+        // bucket size is; and `share = MAX / buckets` divides to ZERO once the
+        // bucket count reaches the ceiling, at which point every bucket is
+        // "over its share" and the tie falls to whichever origin the comparison
+        // ranks last — an origin an attacker simply picks. Note that an
+        // operator-trust claimant would hit the same trap: `may_displace` is
+        // true for it against everyone, so "its own" would have degenerated
+        // into exactly that global soonest-to-lapse ranking. The headroom
+        // removes any need for an agent to evict anyone.
+        //
+        // Consequences, stated so they are chosen rather than discovered:
         //
         // - A full registry cannot be used to TAKE an id. Claiming an id that
         //   already has a row replaces it rather than growing the map, so the
         //   ceiling is not even consulted — a holder reclaiming its own live
         //   or reserved id is admitted at a full map.
-        // - The cost of saturation is that a BRAND NEW id cannot be
-        //   registered until a reservation lapses (≤ 60 s past a TTL). That
-        //   falls on whoever arrives next, with no attacker control over who.
+        // - The cost of saturation is that a BRAND NEW browser id cannot be
+        //   registered until capacity frees up. An attacker DOES control
+        //   whether saturation exists and can sustain it by re-POSTing inside
+        //   the TTL; what it cannot do is pick WHICH existing row pays, or
+        //   reach the operator's headroom.
         // - It applies in EVERY mode, `off` included, because an unbounded
         //   in-process map is a memory-exhaustion defect rather than a
         //   routing rule, and the kill switch must not re-open it. It is
         //   counted on `/health` as `registryFullRefusals`, never under
         //   `rules`.
-        if !w.contains_key(&app.app_id) && w.len() >= MAX_ROWS {
-            // The claimant's own soonest-to-lapse reservation-only row, tie-broken
-            // by key so the choice never depends on `HashMap` iteration order.
-            // Written as a fold rather than `min_by_key` so the tie-break costs
-            // no allocation: `min_by_key` would clone every key it compares,
-            // and this runs under the registry's write lock.
+        let ceiling = if principal.is_operator_trust() {
+            MAX_ROWS
+        } else {
+            MAX_ROWS - OPERATOR_HEADROOM
+        };
+        if !w.contains_key(&app.app_id) && w.len() >= ceiling {
+            // The claimant's own soonest-to-lapse reservation-only row,
+            // tie-broken by key so the choice never depends on `HashMap`
+            // iteration order. `Principal::same`, never `may_displace`: this
+            // must mean "mine" literally, or an operator-trust claimant would
+            // rank every row in the map and take the oldest — the very
+            // ranking the paragraph above refuses.
+            //
+            // Written as a fold rather than `min_by_key` so the tie-break
+            // costs no allocation: `min_by_key` would clone every key it
+            // compares, and this runs under the registry's write lock.
             let mine = {
                 let mut best: Option<(&String, i64)> = None;
                 for (k, e) in w.iter() {
-                    if e.is_live(now) || !principal.may_displace(&e.principal) {
+                    if e.is_live(now) || !principal.same(&e.principal) {
                         continue;
                     }
                     let until = e.reserved_until();
@@ -335,9 +401,10 @@ impl AppRegistry {
                     binding.count_registry_full();
                     tracing::warn!(
                         class = principal.class_str(),
+                        ceiling = ceiling,
                         max_rows = MAX_ROWS,
                         route = route,
-                        "ui-bridge binding: the app registry is at its row ceiling and this principal holds no row of its own to give up; the claim is refused rather than displacing another principal's row (counted on /health uiBridgeBinding.registryFullRefusals)"
+                        "ui-bridge binding: the app registry is at this principal's row ceiling and it holds no row of its own to give up; the claim is refused rather than displacing another principal's row (counted on /health uiBridgeBinding.registryFullRefusals)"
                     );
                     return Err(Refusal::registry_full());
                 }
@@ -462,10 +529,20 @@ impl AppRegistry {
         }
     }
 
-    /// Look up an entry by app_id REGARDLESS of freshness. Since `sweep`
-    /// retains a row through its reservation window, this can return a row
-    /// whose TTL has passed — use [`Self::get_live`] for anything that routes.
-    pub async fn get(&self, app_id: &str) -> Option<RegisteredApp> {
+    /// Look up an entry by app_id REGARDLESS of freshness, reservation-only
+    /// rows included.
+    ///
+    /// **Named the long way on purpose.** Round 4 converted every production
+    /// reader to [`Self::get_live`], and there is now no production caller at
+    /// all — the short name `get` was exactly what four routing readers
+    /// reached for by reflex while a row could still be a dead reservation,
+    /// which is how a crashed wrapper turned into 90 s of hard 400s. Phase 2
+    /// adds tab-side readers with the same choice in front of them, so the
+    /// name has to state which one this is.
+    ///
+    /// If you are routing, dispatching, listing or answering "is this app
+    /// there?", you want [`Self::get_live`].
+    pub async fn get_including_reservations(&self, app_id: &str) -> Option<RegisteredApp> {
         let r = self.inner.read().await;
         r.get(app_id).cloned()
     }
@@ -667,7 +744,7 @@ mod tests {
         let reg = AppRegistry::new();
         reg.upsert(sample_app("a1"), None, AppTransport::Http, None, None)
             .await;
-        let entry = reg.get("a1").await.unwrap();
+        let entry = reg.get_including_reservations("a1").await.unwrap();
         assert_eq!(entry.transport, AppTransport::Http);
         assert_eq!(entry.websocket_conn_id, None);
 
@@ -679,7 +756,7 @@ mod tests {
             None,
         )
         .await;
-        let entry = reg.get("a1").await.unwrap();
+        let entry = reg.get_including_reservations("a1").await.unwrap();
         assert_eq!(entry.transport, AppTransport::Websocket);
         assert_eq!(entry.websocket_conn_id, Some(42));
     }
@@ -801,7 +878,7 @@ mod tests {
         // Sweep must NOT evict the entry either.
         let evicted = reg.sweep().await;
         assert_eq!(evicted, 0, "sweep must respect per-entry keep_alive_ms");
-        assert!(reg.get("long-lived").await.is_some());
+        assert!(reg.get_including_reservations("long-lived").await.is_some());
     }
 
     #[tokio::test]
@@ -840,7 +917,7 @@ mod tests {
             "a row inside its reservation window is retained, not swept"
         );
         assert!(
-            reg.get("brief").await.is_some(),
+            reg.get_including_reservations("brief").await.is_some(),
             "…and it is still there to answer `who holds this id`"
         );
 
@@ -854,7 +931,7 @@ mod tests {
             1,
             "sweep must evict once the reservation has lapsed too"
         );
-        assert!(reg.get("brief").await.is_none());
+        assert!(reg.get_including_reservations("brief").await.is_none());
     }
 
     #[tokio::test]
@@ -978,8 +1055,25 @@ mod tests {
                 .await;
         }
 
+        // m5: the flood must actually have EXERCISED self-eviction rather than
+        // stalling on the capacity refusal after one row apiece — otherwise a
+        // change that simply refused every post-ceiling claim would leave this
+        // test green while testing nothing. Each attacker origin holds
+        // hundreds of rows here, so every one of them has a row of its own to
+        // give up and none is ever refused.
+        assert_eq!(
+            binding.health_json()["registryFullRefusals"],
+            0,
+            "no attacker was refused, so every post-ceiling claim self-evicted: {}",
+            binding.health_json()
+        );
+        assert_eq!(
+            reg.inner.read().await.len(),
+            MAX_ROWS - OPERATOR_HEADROOM,
+            "the browser ceiling bounds the map"
+        );
         assert!(
-            reg.get("victim-app").await.is_some(),
+            reg.get_including_reservations("victim-app").await.is_some(),
             "the victim's reservation row was evicted by a flood of other principals"
         );
         let evil = browser("https://evil.example");
@@ -1019,6 +1113,18 @@ mod tests {
             .await;
         }
 
+        // m5: the mirror assertion. Nothing here is ever reservation-only, so
+        // no attacker has a row of its own to give up and every post-ceiling
+        // claim must be REFUSED. A zero here would mean the flood never
+        // reached the ceiling and the test proved nothing.
+        assert!(
+            binding.health_json()["registryFullRefusals"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0,
+            "the flood never reached the ceiling: {}",
+            binding.health_json()
+        );
         assert!(
             reg.get_live("victim-app").await.is_some(),
             "a live holder was evicted to make room for another principal's row"
@@ -1033,6 +1139,159 @@ mod tests {
         );
     }
 
+    /// M2: the autonomy invariant. A browser flood of LIVE rows must never
+    /// deny an AGENT a registration.
+    ///
+    /// This is the case self-eviction alone could not carry, and it is not
+    /// hypothetical: an attacker page registers `MAX_ROWS` fresh ids and
+    /// re-POSTs each inside the 30 s TTL — roughly 137 req/s on loopback from
+    /// one tab — so every row stays LIVE, nothing is reservation-only, and
+    /// nothing is self-evictable by anyone. Under the ceiling this replaces,
+    /// an agent's claim then got `UIB_REGISTRY_FULL` indefinitely, which is
+    /// `agent_flow_unchanged`'s very first step denied by a web page.
+    ///
+    /// The headroom fixes it by RESERVING capacity rather than widening who
+    /// may evict whom — the latter would put back a ranking over other
+    /// principals' rows, and every such ranking has been measured steerable.
+    #[tokio::test]
+    async fn at_the_row_ceiling_operator_trust_is_not_starved_by_a_live_browser_flood() {
+        let reg = AppRegistry::new();
+        let binding = default_binding();
+
+        // Fill the browser ceiling with rows that are all LIVE and never
+        // released, from origins on both sides of any victim's.
+        for i in 0..(MAX_ROWS - OPERATOR_HEADROOM) {
+            claim_as(
+                &reg,
+                &binding,
+                &browser(attacker_origin(i)),
+                &format!("live-{i}"),
+            )
+            .await
+            .expect("filling below the browser ceiling is admitted");
+        }
+
+        // A browser is now refused — that is the ceiling doing its job.
+        let refusal = claim_as(&reg, &binding, &browser("https://evil.example"), "fresh")
+            .await
+            .expect_err("a browser principal is held to MAX_ROWS - OPERATOR_HEADROOM");
+        assert_eq!(refusal.code, crate::mcp::relay_binding::CODE_REGISTRY_FULL);
+
+        // …and the agent is NOT. This is the assertion the whole headroom
+        // exists for.
+        let agent = Principal::OperatorTrust {
+            class: crate::mcp::origin_guard::OriginClass::NonBrowser,
+        };
+        for i in 0..OPERATOR_HEADROOM {
+            claim_as(&reg, &binding, &agent, &format!("agent-{i}"))
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("a live browser flood starved operator trust at row {i}: {e:?}")
+                });
+        }
+        assert_eq!(
+            reg.inner.read().await.len(),
+            MAX_ROWS,
+            "the headroom is exactly the slice between the two ceilings"
+        );
+
+        // An agent past the FULL ceiling is refused too — the headroom is a
+        // reservation, not an exemption, and it still evicts nobody.
+        let refusal = claim_as(&reg, &binding, &agent, "agent-overflow")
+            .await
+            .expect_err("MAX_ROWS bounds operator trust as well");
+        assert_eq!(refusal.code, crate::mcp::relay_binding::CODE_REGISTRY_FULL);
+        assert!(
+            reg.get_live("live-0").await.is_some(),
+            "no browser row was evicted to serve operator trust"
+        );
+    }
+
+    /// M3: at the FULL ceiling, operator trust is REFUSED rather than ranking
+    /// other principals' rows.
+    ///
+    /// This is the case that discriminates `Principal::same` from
+    /// `may_displace` in the self-eviction scan, and it exists because a
+    /// mutant proved nothing else did: flipping `same` back to `may_displace`
+    /// left every other test in this module green. `may_displace` is true for
+    /// operator trust against EVERYONE, so "give up a row of its own"
+    /// silently becomes "take the globally soonest-to-lapse row" — which is
+    /// the oldest, which is the victim's, which is exactly the steerable rule
+    /// this round deleted from the tombstone map. The headroom keeps an agent
+    /// from ever needing that, and this test keeps the scan honest when the
+    /// headroom is itself exhausted.
+    ///
+    /// Reaching the state takes both principals: browsers cannot pass
+    /// `MAX_ROWS - OPERATOR_HEADROOM`, so the last rows must be the agent's
+    /// own, and they are LIVE, so the agent has nothing of its own to give up
+    /// either.
+    #[tokio::test]
+    async fn at_the_full_ceiling_operator_trust_is_refused_rather_than_ranking_other_rows() {
+        let reg = AppRegistry::new();
+        let binding = default_binding();
+        let filler = browser("https://filler.example");
+        let agent = Principal::OperatorTrust {
+            class: crate::mcp::origin_guard::OriginClass::NonBrowser,
+        };
+
+        // Browser rows, all RELEASED, so every one is reservation-only and
+        // would be a lawful victim for any rule that ranked other principals.
+        for i in 0..(MAX_ROWS - OPERATOR_HEADROOM) {
+            claim_as(&reg, &binding, &filler, &format!("f-{i}"))
+                .await
+                .expect("filling the browser ceiling is admitted");
+            assert!(reg
+                .release(&binding, &format!("f-{i}"), &filler, None, "test")
+                .await
+                .unwrap());
+        }
+        // The agent fills its own headroom with LIVE rows, so it has nothing
+        // reservation-only of its own.
+        for i in 0..OPERATOR_HEADROOM {
+            claim_as(&reg, &binding, &agent, &format!("a-{i}"))
+                .await
+                .expect("the headroom is the agent's to use");
+        }
+        assert_eq!(
+            reg.inner.read().await.len(),
+            MAX_ROWS,
+            "precondition: the map is exactly full"
+        );
+        let refusals_before = binding.health_json()["registryFullRefusals"]
+            .as_u64()
+            .expect("the counter must be served");
+
+        // The agent asks for one more. `same` refuses; `may_displace` would
+        // quietly evict the oldest BROWSER reservation and admit it.
+        let refusal = claim_as(&reg, &binding, &agent, "a-overflow")
+            .await
+            .expect_err("operator trust ranked another principal's rows instead of being refused");
+        assert_eq!(refusal.code, crate::mcp::relay_binding::CODE_REGISTRY_FULL);
+        assert_eq!(
+            binding.health_json()["registryFullRefusals"]
+                .as_u64()
+                .unwrap_or(0),
+            refusals_before + 1,
+            "the refusal was not counted: {}",
+            binding.health_json()
+        );
+        assert_eq!(
+            reg.inner.read().await.len(),
+            MAX_ROWS,
+            "a row was evicted to serve the refused claim"
+        );
+        // Every browser reservation is still there — none was ranked, let
+        // alone taken.
+        for i in 0..(MAX_ROWS - OPERATOR_HEADROOM) {
+            assert!(
+                reg.get_including_reservations(&format!("f-{i}"))
+                    .await
+                    .is_some(),
+                "operator trust took browser reservation f-{i}"
+            );
+        }
+    }
+
     /// The saturated arm, stated exactly: a principal with nothing of its own
     /// to give up is REFUSED (`UIB_REGISTRY_FULL`, 503) rather than taking
     /// someone else's row — while a principal that does hold a lapsing row of
@@ -1044,10 +1303,10 @@ mod tests {
         let binding = default_binding();
         let filler = browser("https://filler.example");
 
-        for i in 0..MAX_ROWS {
+        for i in 0..(MAX_ROWS - OPERATOR_HEADROOM) {
             claim_as(&reg, &binding, &filler, &format!("f-{i}"))
                 .await
-                .expect("filling below the ceiling is admitted");
+                .expect("filling below the browser ceiling is admitted");
             assert!(reg
                 .release(&binding, &format!("f-{i}"), &filler, None, "test")
                 .await
@@ -1065,10 +1324,32 @@ mod tests {
             axum::http::StatusCode::SERVICE_UNAVAILABLE
         );
         assert_eq!(binding.health_json()["registryFullRefusals"], 1);
+        // This one asserts an ABSENCE, so it is the shape that can pass while
+        // observing nothing: `["rules"]["capacity"]` is `Null` both when the
+        // key is correctly absent AND when `rules` itself has gone. Pin the
+        // container first, so the assertion can only be satisfied by a `rules`
+        // object that really is there and really lacks `capacity`.
+        let health = binding.health_json();
         assert!(
-            binding.health_json()["rules"]["capacity"].is_null(),
-            "a capacity refusal is an operational event, not a rule verdict: {}",
-            binding.health_json()
+            health["rules"].is_object(),
+            "the rules block itself is missing, so the absence below proves nothing: {health}"
+        );
+        // …and make the absence MEANINGFUL rather than vacuous: record a real
+        // rule verdict on this same binding, so `rules` demonstrably carries
+        // rule entries while still carrying no `capacity` one. Without this,
+        // an empty `rules` would satisfy the assertion below while proving
+        // only that nothing at all had been counted.
+        binding
+            .counters
+            .record(crate::mcp::relay_binding::RULE_R1, true);
+        let health = binding.health_json();
+        assert_eq!(
+            health["rules"]["R1"]["refused"], 1,
+            "the control entry did not land, so the absence below is vacuous: {health}"
+        );
+        assert!(
+            health["rules"]["capacity"].is_null(),
+            "a capacity refusal is an operational event, not a rule verdict: {health}"
         );
 
         // …while the principal that owns the lapsing rows keeps going, paying
@@ -1078,16 +1359,34 @@ mod tests {
             .expect("self-eviction must keep a churning holder admitted");
         assert_eq!(
             reg.inner.read().await.len(),
-            MAX_ROWS,
-            "the ceiling still bounds the map"
+            MAX_ROWS - OPERATOR_HEADROOM,
+            "the browser ceiling still bounds the map"
         );
 
-        // And an operator-trust claim is never starved by a browser flood.
+        // And an operator-trust claim is never starved — here against a map
+        // of RESERVATION-only browser rows. The live-row case, which
+        // self-eviction alone could not carry, is
+        // `at_the_row_ceiling_operator_trust_is_not_starved_by_a_live_browser_flood`.
         let agent = Principal::OperatorTrust {
             class: crate::mcp::origin_guard::OriginClass::NonBrowser,
         };
+        // M3: the agent must be admitted into its HEADROOM, evicting NOBODY —
+        // `mine` compares `Principal::same`, not `may_displace`, so operator
+        // trust ranks nobody else's rows.
+        //
+        // Measured by the row COUNT, not by naming a survivor: the filler's
+        // own `f-new` claim above legitimately self-evicted its oldest row, so
+        // an assertion that `f-0` survives blames the agent for what the
+        // filler did — that is exactly how this assertion first went red, and
+        // it was the assertion that was wrong, not the code.
+        let before = reg.inner.read().await.len();
         claim_as(&reg, &binding, &agent, "agent-app")
             .await
             .expect("operator trust must not be locked out by a browser flood");
+        assert_eq!(
+            reg.inner.read().await.len(),
+            before + 1,
+            "the agent displaced a row instead of taking its headroom"
+        );
     }
 }

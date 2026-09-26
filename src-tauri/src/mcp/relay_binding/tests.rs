@@ -781,7 +781,12 @@ async fn http_register_cannot_redirect_or_flip_transport() {
         status, 409,
         "an HTTP register overwrote a live WS holder: {body}"
     );
-    let entry = s.relay.app_registry.get("app").await.expect("holder entry");
+    let entry = s
+        .relay
+        .app_registry
+        .get_including_reservations("app")
+        .await
+        .expect("holder entry");
     assert_eq!(
         entry.transport,
         crate::mcp::app_registry::AppTransport::Websocket
@@ -802,19 +807,62 @@ async fn http_register_cannot_redirect_or_flip_transport() {
     assert_eq!(code(&body), Some("UIB_ORIGIN_MISMATCH"), "{body}");
 }
 
-/// R2.
+/// R2, in BOTH of the halves its name promises.
+///
+/// m7: the FOREIGN half alone stopped covering the displaced case once R1
+/// went to enforce. A foreign register for a held id is now refused before it
+/// ever registers, so `evil` below is not a displaced connection at all — it
+/// is a connection that never took the slot, and its teardown proves only
+/// that a non-holder cannot delete. The DISPLACED case needs a connection
+/// that really did take the slot and then lost it, which under R1 only a
+/// SAME-ORIGIN second registration can be (`same_origin_last_tab_wins`).
+/// Without that arm, `release`'s `conn_guard` — the thing that stops a
+/// displaced socket's teardown deleting the connection that displaced it —
+/// had no test at all on this path.
 #[tokio::test]
 async fn displaced_or_foreign_teardown_cannot_delete_holder() {
     let s = spawn(BindingConfig::default()).await;
     let (_holder, ack) = s.ws_register(Some(GOOD), "app").await;
     assert_eq!(ack["type"], "registered");
 
-    // A foreign connection for the same id that closes must take nothing with it.
+    // THE DISPLACED HALF. A second SAME-ORIGIN connection legitimately takes
+    // the slot (today's semantics, pinned by `same_origin_last_tab_wins`);
+    // the first is now displaced. When the DISPLACED one closes, its teardown
+    // must not delete the row the displacer owns.
+    let (displaced_winner, ack) = s.ws_register(Some(GOOD), "app").await;
+    assert_eq!(ack["type"], "registered", "the same-origin retake: {ack}");
+    let winner_conn = ack["connId"].as_u64();
+    assert!(winner_conn.is_some(), "no connId in the ack: {ack}");
+    // `_holder` is the displaced socket now; close it and let its teardown run.
+    drop(_holder);
+    tokio::time::sleep(QUIET).await;
+    assert!(
+        s.relay.app_registry.get_live("app").await.is_some(),
+        "a DISPLACED connection's teardown deleted the displacer's live entry"
+    );
+    assert_eq!(
+        conn_for(&s, "app").await,
+        winner_conn,
+        "the displaced socket's teardown stole the routing slot back"
+    );
+    // The displacer is still the one that can use it.
+    drop(displaced_winner);
+
+    // THE FOREIGN HALF. A foreign connection for the same id that closes must
+    // take nothing with it. (Under R1 enforce it never registers in the first
+    // place, which is itself the point — its teardown has nothing to unwind.)
+    let s = spawn(BindingConfig::default()).await;
+    let (_holder, ack) = s.ws_register(Some(GOOD), "app").await;
+    assert_eq!(ack["type"], "registered");
     let (evil, _) = s.ws_register(Some(EVIL), "app").await;
     evil.close().await;
     tokio::time::sleep(QUIET).await;
     assert!(
-        s.relay.app_registry.get("app").await.is_some(),
+        s.relay
+            .app_registry
+            .get_including_reservations("app")
+            .await
+            .is_some(),
         "a foreign connection's teardown deleted the holder's entry"
     );
 
@@ -822,7 +870,11 @@ async fn displaced_or_foreign_teardown_cannot_delete_holder() {
         .delete("/ui-bridge/apps/register/app", browser(EVIL))
         .await;
     assert!(
-        s.relay.app_registry.get("app").await.is_some(),
+        s.relay
+            .app_registry
+            .get_including_reservations("app")
+            .await
+            .is_some(),
         "a foreign DELETE removed the holder's entry: {body}"
     );
 }
@@ -900,7 +952,11 @@ async fn an_expired_registration_stays_reserved_for_its_holder() {
             .await
     );
     assert!(
-        s.relay.app_registry.get("app").await.is_some(),
+        s.relay
+            .app_registry
+            .get_including_reservations("app")
+            .await
+            .is_some(),
         "precondition: the row is expired but NOT yet swept — the real window"
     );
     assert!(
@@ -970,7 +1026,11 @@ async fn a_live_ws_holder_is_not_displaceable_once_its_registry_row_is_gone() {
     // slot is the ONLY thing left that knows who holds this id.
     assert!(s.relay.app_registry.test_drop_row("app").await);
     assert!(
-        s.relay.app_registry.get("app").await.is_none(),
+        s.relay
+            .app_registry
+            .get_including_reservations("app")
+            .await
+            .is_none(),
         "precondition: no registry row"
     );
 
@@ -1008,7 +1068,12 @@ async fn ws_touch_keeps_refreshing_a_row_an_http_phone_home_took_over() {
         .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(
-        s.relay.app_registry.get("shared").await.unwrap().transport,
+        s.relay
+            .app_registry
+            .get_including_reservations("shared")
+            .await
+            .unwrap()
+            .transport,
         crate::mcp::app_registry::AppTransport::Http
     );
 
@@ -1052,7 +1117,12 @@ async fn an_http_register_cannot_displace_a_live_ws_holder_the_registry_forgot()
     // The row is gone and no reservation survives it, so the live routing
     // slot is the only thing that still knows who holds this id.
     assert!(s.relay.app_registry.test_drop_row("app").await);
-    assert!(s.relay.app_registry.get("app").await.is_none());
+    assert!(s
+        .relay
+        .app_registry
+        .get_including_reservations("app")
+        .await
+        .is_none());
 
     let (status, body) = s
         .post(
@@ -1068,7 +1138,11 @@ async fn an_http_register_cannot_displace_a_live_ws_holder_the_registry_forgot()
     );
     assert_eq!(code(&body), Some("UIB_REGISTRATION_HELD"), "{body}");
     assert!(
-        s.relay.app_registry.get("app").await.is_none(),
+        s.relay
+            .app_registry
+            .get_including_reservations("app")
+            .await
+            .is_none(),
         "the refused claim must have written nothing"
     );
     assert_eq!(conn_for(&s, "app").await, Some(holder_conn));
@@ -1145,7 +1219,11 @@ async fn an_expired_operator_trust_row_does_not_reserve_the_id() {
             .await
     );
     assert!(
-        s.relay.app_registry.get("app").await.is_some(),
+        s.relay
+            .app_registry
+            .get_including_reservations("app")
+            .await
+            .is_some(),
         "precondition: the row is retained, which is what makes it a reservation"
     );
 
@@ -1258,11 +1336,19 @@ async fn a_sweep_inside_the_reservation_window_leaves_the_id_held() {
         "a row inside its reservation window must be retained"
     );
     assert!(
-        s.relay.app_registry.get("app").await.is_some(),
+        s.relay
+            .app_registry
+            .get_including_reservations("app")
+            .await
+            .is_some(),
         "the row IS the reservation"
     );
     assert!(
-        s.relay.app_registry.get("app").await.is_some(),
+        s.relay
+            .app_registry
+            .get_including_reservations("app")
+            .await
+            .is_some(),
         "the row IS the reservation — nothing is written anywhere else"
     );
 
@@ -1314,7 +1400,11 @@ async fn a_reserved_but_expired_row_is_not_dispatchable() {
             .await
     );
     assert!(
-        s.relay.app_registry.get("stub").await.is_some(),
+        s.relay
+            .app_registry
+            .get_including_reservations("stub")
+            .await
+            .is_some(),
         "the row is retained as a reservation"
     );
     let (status, body) = s.app_dispatch("stub").await.unwrap();
@@ -1514,7 +1604,11 @@ async fn an_operator_trust_release_frees_the_id_at_once() {
     let (status, _) = s.delete("/ui-bridge/apps/register/app", agent()).await;
     assert_eq!(status, 200);
     assert!(
-        s.relay.app_registry.get("app").await.is_none(),
+        s.relay
+            .app_registry
+            .get_including_reservations("app")
+            .await
+            .is_none(),
         "an agent's released row must not linger as a reservation"
     );
     let (status, body) = s
@@ -1627,13 +1721,25 @@ async fn displaced_conn_touch_does_not_refresh_holder() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     assert!(s.relay.app_registry.test_age_entry("app", 20_000).await);
-    let aged = s.relay.app_registry.get("app").await.unwrap().last_seen_ms;
+    let aged = s
+        .relay
+        .app_registry
+        .get_including_reservations("app")
+        .await
+        .unwrap()
+        .last_seen_ms;
 
     displaced
         .send(json!({ "type": "changeEvent", "event": {} }))
         .await;
     tokio::time::sleep(QUIET).await;
-    let after = s.relay.app_registry.get("app").await.unwrap().last_seen_ms;
+    let after = s
+        .relay
+        .app_registry
+        .get_including_reservations("app")
+        .await
+        .unwrap()
+        .last_seen_ms;
     assert_eq!(
         after, aged,
         "a displaced socket's frame refreshed the holder's entry"
@@ -1926,7 +2032,12 @@ async fn agent_flow_unchanged() {
         .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(
-        s.relay.app_registry.get("shared").await.unwrap().transport,
+        s.relay
+            .app_registry
+            .get_including_reservations("shared")
+            .await
+            .unwrap()
+            .transport,
         crate::mcp::app_registry::AppTransport::Http
     );
 
@@ -2148,7 +2259,12 @@ async fn kill_switch_off_restores_today() {
     let (_, _) = s
         .delete("/ui-bridge/apps/register/other", browser(EVIL))
         .await;
-    assert!(s.relay.app_registry.get("other").await.is_none());
+    assert!(s
+        .relay
+        .app_registry
+        .get_including_reservations("other")
+        .await
+        .is_none());
 }
 
 #[test]

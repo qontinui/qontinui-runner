@@ -5358,6 +5358,84 @@ mod ws_dispatch_selection_tests {
     use serde_json::json;
     use std::time::Duration;
 
+    /// m8: a dispatch REFRESHES the row it dispatches to.
+    ///
+    /// The window, stated exactly. `drive_connection` runs TWO tasks: the
+    /// spawned `send_task` owns the 20 s ping tick and its refresh, while the
+    /// per-frame refresh runs in the RECV loop of `drive_connection`'s own
+    /// task. So a parked `sink.send().await` starves the ping tick ONLY —
+    /// inbound frames keep refreshing. (An earlier version of this doc said
+    /// both share one `select!`; that was wrong, and it would tell a reader
+    /// this touch is redundant whenever any frame arrives.)
+    ///
+    /// The real case: a wrapper that sends nothing INBOUND has the ping tick
+    /// as its only refresh, a parked send stops it, and the recv side's
+    /// `HEARTBEAT_TIMEOUT` (45 s) outlives `REGISTRATION_TTL_MS` (30 s) — so
+    /// the socket is still up while the row is already dead. Before the
+    /// reservation change that was cosmetic, because the routing readers used
+    /// `get`; now they use `get_live`, so the row ages out and a connection
+    /// main would have dispatched to becomes undispatchable.
+    /// `AppDispatcher::dispatch` therefore touches at ENQUEUE, outside
+    /// `send_task`. See that call site for the cost this trades against.
+    ///
+    /// The ageing here is what makes the assertion discriminating: without
+    /// the refresh the row is TTL-1s old, the second ageing carries it past
+    /// the TTL, and `get_live` answers `None`.
+    #[tokio::test]
+    async fn a_dispatch_refreshes_the_row_so_a_parked_send_cannot_age_it_out() {
+        let registry = AppRegistry::new();
+        let ws = WsConnectionManager::new();
+        let (conn_id, _rx) = ws.test_register("wapp").await;
+        registry
+            .upsert(
+                sample_app("wapp"),
+                None,
+                AppTransport::Websocket,
+                Some(conn_id),
+                None,
+            )
+            .await;
+        // A short command timeout: the dispatch is expected to time out (no
+        // wrapper answers), and the TOUCH happens before the send either way.
+        let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_millis(50));
+        let dispatcher = AppDispatcher::new(registry.clone(), relay.clone());
+
+        // The socket is alive but nothing has refreshed the row for almost a
+        // whole TTL — the parked-send shape.
+        assert!(
+            registry
+                .test_age_entry(
+                    "wapp",
+                    crate::mcp::app_registry::REGISTRATION_TTL_MS - 1_000
+                )
+                .await
+        );
+        assert!(
+            registry.get_live("wapp").await.is_some(),
+            "precondition: the row is still (barely) live"
+        );
+
+        let _ = try_ws_dispatch_for_app(
+            &registry,
+            &dispatcher,
+            "wapp",
+            "noop",
+            Method::POST,
+            "/x",
+            json!({}),
+        )
+        .await;
+
+        // Two more seconds pass. Without the enqueue-time refresh the row is
+        // now TTL+1s old and gone; with it, it is 2s old and still routable.
+        assert!(registry.test_age_entry("wapp", 2_000).await);
+        assert!(
+            registry.get_live("wapp").await.is_some(),
+            "the dispatch did not refresh the row, so a parked send ages out a \
+             connection that is still open"
+        );
+    }
+
     /// Critical 2: `try_ws_dispatch_for_app` is a ROUTING reader — `None`
     /// means "fall through to IPC", `Some(Err)` means "surface this error".
     ///
@@ -5410,7 +5488,7 @@ mod ws_dispatch_selection_tests {
                 .await
         );
         assert!(
-            registry.get("wapp").await.is_some(),
+            registry.get_including_reservations("wapp").await.is_some(),
             "precondition: the row is retained as a reservation"
         );
 
