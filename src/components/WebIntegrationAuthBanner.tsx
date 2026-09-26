@@ -397,14 +397,24 @@ export function WebIntegrationAuthBanner() {
     async (tenantId: string) => {
       setSwitchingTenant(true);
       setSwitchTenantError(null);
+      let pinned = false;
       try {
         await makeSwitchTenantHandler({
           setDefaultTenant: setDefaultTenantForNewSessions,
           invoker: (cmd, args) => invoke<unknown>(cmd, args),
-          onPinned: () => setTenantSwitcherOpen(false),
+          onPinned: () => {
+            pinned = true;
+            setTenantSwitcherOpen(false);
+          },
         })(tenantId);
       } catch (err) {
-        setSwitchTenantError(String(err));
+        // After a successful re-pin only the refresher kick can have failed:
+        // say the switch landed, so the error never reads as a failed switch.
+        setSwitchTenantError(
+          pinned
+            ? `Switched to tenant ${tenantId}; the credential refresh kick failed (${String(err)}). The banner updates at the next refresh.`
+            : String(err),
+        );
       } finally {
         setSwitchingTenant(false);
       }
