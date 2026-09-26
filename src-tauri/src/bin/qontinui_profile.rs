@@ -1252,11 +1252,37 @@ fn cmd_device_pair(
                 .map(|dt| dt.to_rfc3339())
                 .or_else(|| decode_jwt_exp_display(&resp.token))
                 .unwrap_or_else(|| "<unknown>".to_string());
-            let dmk_stored = resp
-                .device_machine_key
-                .as_deref()
-                .map(|k| !k.trim().is_empty())
-                .unwrap_or(false);
+            // Plan 2026-09-24-runner-coord-credential-stranded-after-outage
+            // Phase 3: a pairing whose response carried no dmk_ (pair-code,
+            // browser) enrols one NOW with the just-minted device JWT, so this
+            // device can recover unattended if its JWT ever expires during an
+            // outage. Best-effort: a failure never fails the pairing, and the
+            // runner's refresher retries enrolment on its own cadence.
+            let enrol_base = match &mode {
+                PairMode::PairCode(_) => {
+                    resolve_pair_code_base(std::env::var("QONTINUI_WEB_BASE").ok().as_deref()).0
+                }
+                _ => qontinui_runner_lib::pair::default_web_base(),
+            };
+            let dmk_enrolled = match qontinui_runner_lib::pair::enrol_machine_key_after_pairing(
+                &enrol_base,
+                &resp,
+            ) {
+                Ok(enrolled) => enrolled,
+                Err(e) => {
+                    eprintln!(
+                        "warning: device machine key enrolment against {enrol_base} did not \
+                             complete ({e}); the runner retries it automatically"
+                    );
+                    false
+                }
+            };
+            let dmk_stored = dmk_enrolled
+                || resp
+                    .device_machine_key
+                    .as_deref()
+                    .map(|k| !k.trim().is_empty())
+                    .unwrap_or(false);
             let success_line = format!(
                 "device paired: user_id={} device_id={} tenant_id={} token_expires={} \
                  dmk_stored={} (device-token JWT saved to auth_tokens.enc)",

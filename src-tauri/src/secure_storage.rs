@@ -377,6 +377,14 @@ struct StoredTokens {
     /// per-tenant slots are refreshed independently by the per-slot pass.
     #[serde(default)]
     device_machine_key: Option<String>,
+    /// Unix-seconds expiry web reported when it minted [`Self::device_machine_key`]
+    /// (`expires_at` on the mint response). `None` = unknown: a key stored from
+    /// the pair-cli response, which carries no expiry, or a pre-field `.enc`.
+    /// Drives the refresher's re-enrolment of a key near its expiry (plan
+    /// 2026-09-24-runner-coord-credential-stranded-after-outage Phase 3).
+    /// Wiped wherever the key is.
+    #[serde(default)]
+    device_machine_key_expires_at: Option<i64>,
     /// Whether the operator has explicitly logged out of the INTERACTIVE
     /// session while leaving the autonomy credentials in place.
     ///
@@ -805,6 +813,7 @@ impl SecureStorage {
         // machine key). `clear_interactive_session` below deliberately does
         // NOT touch these, so autonomy survives a default logout.
         tokens.device_machine_key = None;
+        tokens.device_machine_key_expires_at = None;
         tokens.agent_machine_key = None;
         // Belt-and-braces: with every credential gone the presence check
         // already reports signed-out, but keep the flag consistent so a
@@ -1337,8 +1346,30 @@ impl SecureStorage {
     }
 
     fn store_device_machine_key_mode(&self, key: &str, mode: WriteMode) -> Result<()> {
+        self.store_device_machine_key_with_expiry_mode(key, None, mode)
+    }
+
+    /// Store a machine key together with the `expires_at` web minted it with
+    /// (unix seconds; `None` = web did not say). Replaces any prior key AND its
+    /// recorded expiry — a key stored without one must not inherit the old
+    /// key's.
+    pub fn store_device_machine_key_with_expiry(
+        &self,
+        key: &str,
+        expires_at: Option<i64>,
+    ) -> Result<()> {
+        self.store_device_machine_key_with_expiry_mode(key, expires_at, WriteMode::Merge)
+    }
+
+    fn store_device_machine_key_with_expiry_mode(
+        &self,
+        key: &str,
+        expires_at: Option<i64>,
+        mode: WriteMode,
+    ) -> Result<()> {
         let mut tokens = self.load_tokens_for_write_mode(mode)?;
         tokens.device_machine_key = Some(key.to_string());
+        tokens.device_machine_key_expires_at = expires_at;
         self.save_tokens(&tokens)?;
         info!("device machine key stored in secure file storage");
         Ok(())
@@ -1353,12 +1384,25 @@ impl SecureStorage {
         Ok(tokens.device_machine_key)
     }
 
+    /// The recorded expiry of the stored machine key (unix seconds), or `None`
+    /// when no key is stored, web never reported one, or the store is
+    /// unreadable. Callers that must tell those apart read
+    /// [`Self::get_device_machine_key`] first.
+    pub fn get_device_machine_key_expires_at(&self) -> Option<i64> {
+        self.load_tokens().ok().and_then(|t| {
+            t.device_machine_key
+                .as_ref()
+                .and(t.device_machine_key_expires_at)
+        })
+    }
+
     /// Clear the device-bound machine key, leaving all other slots intact.
     /// Used on revocation / re-issue. Mirror of
     /// [`Self::clear_agent_machine_key`].
     pub fn clear_device_machine_key(&self) -> Result<()> {
         let mut tokens = self.load_tokens_for_write()?;
         tokens.device_machine_key = None;
+        tokens.device_machine_key_expires_at = None;
         self.save_tokens(&tokens)?;
         info!("device machine key cleared from secure file storage");
         Ok(())
