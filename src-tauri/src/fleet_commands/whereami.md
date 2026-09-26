@@ -88,7 +88,7 @@ when the credential line above is present. Header lines after line 2 are
 addressed by their `[key: ` prefix; a positional `sed -n '3p'` would read the
 credential line as this one, or this one as the credential line. It says which
 `.claude/` tree this session was served, how far that tree's checkout was
-behind its LOCAL `origin/main` ref as of that ref's last fetch, and whether the
+behind its LOCAL upstream ref (`origin/main` on this fleet) as of that ref's last fetch, and whether the
 files on disk are the spawning build's own bundle — which is how a provisioner
 overwrite of tracked source is told apart from a peer's WIP without a git call
 of your own. Step 1b renders it; the token contract is in
@@ -279,9 +279,10 @@ Tokens, in the runner's order (full contract in `runner-development.md` →
 | Token | Says |
 |---|---|
 | `served-corpus` | canonical path of `<workdir>/.claude` (symlinks resolved) |
-| `checkout` | the git checkout holding it: branch@sha, `behind`/`ahead` of the LOCAL `origin/main` ref, that ref's `as-of`, and `dirty-claude` (tracked entries only); `none (not a git work tree)` is a stated non-checkout |
-| `bundle` | `<N>/<M> identical-to-build <gitSha> stamped=<k>`: how many of the M files the spawning binary carries match the disk copy, and how many disk copies carry a `qontinui-provenance:` stamp |
-| `provisioned` | what this spawn's provisioning wrote or skipped for this workdir |
+| `checkout` | the git checkout holding it: branch@sha, `upstream=` (the LOCAL remote-tracking ref measured against), `behind`/`ahead` of it, `as-of` (the newer of that ref's last `FETCH_HEAD` and its newest reflog entry), and `dirty-claude` (tracked entries only); `none (not a git work tree)` is a stated non-checkout |
+| `bundle` | `<N>/<M> identical-to-build <gitSha> stamped=<k> stamped-tracked=<t> dirty-bundle=<d> served: canonical@<sha12> <c> fetched <rfc3339>, builtin <b>, account <a>, unstamped <u>; identical-to-source <i>/<v> unverifiable=<x>`: how many of the M files the spawning binary carries match the disk copy; how many disk copies carry a `qontinui-provenance:` stamp; how many of those stamped files git tracks (`stamped-tracked`); how many bundle-roster paths have tracked changes (`dirty-bundle`); then the `served:` breakdown below. `stamped-tracked` and `dirty-bundle` read `n/a` outside a git work tree and `UNKNOWN (<why>)` when git could not answer — never 0 |
+| `bundle` → `served:` | The stamped files split by the rung their stamp names, and how many of them still match their SOURCE. `canonical@<sha12> <c>` files are verified only against the canonical snapshot the runner has loaded (`canonical@unloaded <c>`, with no `fetched`, when none is loaded); `builtin <b>` files against this build's bundle; `account <a>` (`served`/`disk_cache`) are never compared; `unstamped <u>` carry no key. `identical-to-source <i>/<v>` is how many of the `<v>` verifiable files match that source, and `unverifiable=<x>` counts files stamped by a different snapshot or build, which this spawn cannot check. A reader cuts the value at `identical-to-build`, ` stamped=` and ` served: `, never by position |
+| `provisioned` | `commands written=<w>/<e> skipped-<reason>=<n>… as-of=<ts>; skills written=<w>/<e> skipped-<reason>=<n>… as-of=<ts>`: each provisioner's latest pass for this workdir, units written of units expected and one `skipped-<reason>=<n>` per reason (`git-tracked`, `write-failed`, `unresolved`, `rejected`, `repo-authored`); `UNKNOWN (no provision recorded for this workdir)` when the runner's ledger holds no pass |
 | `cwd` | the same checkout probe on the workdir itself, or `same checkout` |
 
 The line is found by KEY in the header run after line 2, never by position (see
@@ -329,65 +330,85 @@ else
   done
 fi
 
-# `${VAR#pattern}` returns the string UNCHANGED on no match, so every number
-# pulled out below is shape-guarded before it is compared. NAMED inputs, not
-# positionals: a dollar-digit inside an injected body is a harness argument
-# placeholder (lint check #18), so the helper reads FIELD_SRC / FIELD_NAME and
-# writes FIELD_OUT - the value after ` <name>=`, to the next space, or empty
-# when it is absent or not a plain count.
-num_field() {
-  FIELD_OUT=""
+# NAMED inputs, not positionals: a dollar-digit inside an injected body is a
+# harness argument placeholder (lint check #18). The helper reads FIELD_SRC /
+# FIELD_NAME and writes FIELD_RAW - the value after ` <name>=` verbatim, an
+# `UNKNOWN (<why>)` kept whole - and FIELD_OUT, that value when it is a plain
+# count and empty otherwise. `${VAR#pattern}` returns the string UNCHANGED on no
+# match, which is why presence is tested first and every count shape-guarded.
+field() {
+  FIELD_RAW=""; FIELD_OUT=""
   case " $FIELD_SRC" in
-    *" $FIELD_NAME="*) FIELD_OUT="${FIELD_SRC#*"$FIELD_NAME"=}"; FIELD_OUT="${FIELD_OUT%% *}" ;;
+    *" $FIELD_NAME="*)
+      FIELD_RAW=" $FIELD_SRC"; FIELD_RAW="${FIELD_RAW#*" $FIELD_NAME="}"
+      case "$FIELD_RAW" in
+        "UNKNOWN ("*) FIELD_RAW="${FIELD_RAW%%)*})" ;;
+        *) FIELD_RAW="${FIELD_RAW%% *}" ;;
+      esac ;;
   esac
-  case "$FIELD_OUT" in ''|*[!0-9]*) FIELD_OUT="" ;; esac
+  case "$FIELD_RAW" in ''|*[!0-9]*) ;; *) FIELD_OUT="$FIELD_RAW" ;; esac
+}
+# Why a `stamped-tracked` / `dirty-bundle` value is not a count. Both read `n/a`
+# outside a git work tree and `UNKNOWN (<why>)` when git could not answer -
+# never 0 - and are absent on a build predating them.
+why_not_counted() {
+  case "$FIELD_RAW" in
+    '')     WHY="the bundle token carries no $FIELD_NAME field - the spawning build predates it" ;;
+    n/a)    WHY="$FIELD_NAME=n/a - the served .claude is not in a git work tree, so nothing in it is tracked source" ;;
+    *)      WHY="$FIELD_NAME=$FIELD_RAW - git could not say which files are tracked" ;;
+  esac
 }
 
-# A checkout token is MEASURED when it is neither the stated non-checkout
-# (`none (not a git work tree)`) nor an UNKNOWN.
-TRACKED=""
-case "$CHECKOUT" in ''|"none "*|"none"|"UNKNOWN"*) ;; *) TRACKED=1 ;; esac
-FIELD_SRC="$CHECKOUT"; FIELD_NAME=dirty-claude; num_field; DIRTY_CLAUDE="$FIELD_OUT"
+FIELD_SRC="$CHECKOUT"; FIELD_NAME=dirty-claude; field; DIRTY_CLAUDE="$FIELD_OUT"
 
-B_N=""; B_M=""; B_SHA=""; STAMPED=""
+B_N=""; B_M=""; B_SHA=""
 case "$BUNDLE" in
   [0-9]*/[0-9]*" identical-to-build "*)
     B_N="${BUNDLE%%/*}"
     B_M="${BUNDLE#*/}"; B_M="${B_M%% *}"
     case "$B_N$B_M" in *[!0-9]*) B_N=""; B_M="" ;; esac
     B_SHA="${BUNDLE#* identical-to-build }"; B_SHA="${B_SHA%% *}"
-    FIELD_SRC="$BUNDLE"; FIELD_NAME=stamped; num_field; STAMPED="$FIELD_OUT"
     ;;
 esac
 
-# 1. A stamp is written at PROVISION time and canonical sources never carry one,
-#    so a stamped file that is TRACKED source is a clobber proven by the file
-#    itself. `dirty-claude` counts tracked entries only, and a stamped tracked
-#    file is necessarily modified, so the proof needs both counts positive; a
-#    stamped tree with `dirty-claude=0` is a provision into untracked paths.
-if [ -n "$TRACKED" ] && [ -n "$STAMPED" ] && [ "$STAMPED" -gt 0 ]; then
-  if [ -n "$DIRTY_CLAUDE" ] && [ "$DIRTY_CLAUDE" -gt 0 ]; then
-    echo "PROVISIONER OVERWRITE PROVEN BY STAMP - these files were written by the runner, not edited by a peer (stamped=$STAMPED, dirty-claude=$DIRTY_CLAUDE)"
-  elif [ -n "$DIRTY_CLAUDE" ]; then
-    echo "stamped=$STAMPED with dirty-claude=0 - the stamped files are untracked here, so this is a provision, not a clobber of source"
+# The two overwrite verdicts need a MEASURED bundle token; an UNKNOWN one has
+# already printed its reason in the row above and supports no verdict at all.
+if [ -n "$B_M" ]; then
+  FIELD_SRC="$BUNDLE"; FIELD_NAME=stamped; field; STAMPED="$FIELD_OUT"
+  # 1. A stamp is written at PROVISION time and canonical sources never carry
+  #    one, so a stamped file that git TRACKS is a clobber proven by the file
+  #    itself. `stamped-tracked` is exactly that count; nothing else is joined.
+  FIELD_NAME=stamped-tracked; field
+  if [ -z "$FIELD_OUT" ]; then
+    why_not_counted; echo "stamp verdict: none - $WHY"
+  elif [ "$FIELD_OUT" -gt 0 ]; then
+    echo "PROVISIONER OVERWRITE PROVEN BY STAMP - $FIELD_OUT tracked file(s) carry a provisioner stamp: written by the runner, not edited by a peer"
+  elif [ -n "$STAMPED" ] && [ "$STAMPED" -gt 0 ]; then
+    echo "stamped=$STAMPED, stamped-tracked=0 - the stamped files are untracked provisions (normal), not a clobber of source"
+  fi
+  # 2. `dirty-bundle` counts bundle-roster paths with TRACKED changes. When
+  #    every bundled file is byte-identical to this build's copy, those changes
+  #    ARE the bundle. Dirt outside the roster is not provisioner output at all.
+  FIELD_SRC="$BUNDLE"; FIELD_NAME=dirty-bundle; field
+  if [ -z "$FIELD_OUT" ]; then
+    why_not_counted; echo "overwrite verdict: none - $WHY"
+  elif [ "$FIELD_OUT" -gt 0 ] && [ "$B_N" = "$B_M" ]; then
+    echo "PROVISIONER OVERWRITE SIGNATURE - the $FIELD_OUT dirty bundled file(s) are byte-identical to build $B_SHA's bundle - a provisioner write, not peer WIP"
+  elif [ "$FIELD_OUT" -eq 0 ] && [ -n "$DIRTY_CLAUDE" ] && [ "$DIRTY_CLAUDE" -gt 0 ]; then
+    echo "dirty-claude=$DIRTY_CLAUDE, dirty-bundle=0 - the tracked changes under .claude are OUTSIDE the bundle (a settings render, peer WIP, ...), not provisioner output"
   fi
 fi
-# 2. Every bundled file matches this build's bytes AND tracked `.claude` entries
-#    are dirty: the dirt is the bundle, not a peer's edit.
-if [ -n "$TRACKED" ] && [ -n "$B_N" ] && [ -n "$B_M" ] && [ "$B_N" = "$B_M" ] \
-   && [ -n "$DIRTY_CLAUDE" ] && [ "$DIRTY_CLAUDE" -gt 0 ]; then
-  echo "PROVISIONER OVERWRITE SIGNATURE - these files are build $B_SHA's bundle, not peer WIP ($B_N/$B_M identical, dirty-claude=$DIRTY_CLAUDE)"
-fi
-# 3. `behind` is counted against the LOCAL remote-tracking ref, which the spawn
-#    path never fetches. Print that ref's age beside the count, so a stale ref is
-#    never read as current drift (it may be further behind now, or not at all).
+# 3. `behind` is counted against the LOCAL remote-tracking ref the token names
+#    as `upstream=`, which the spawn path never fetches. Print that ref's age
+#    beside the count, so a stale ref is never read as current drift (it may be
+#    further behind now, or not at all).
 for PAIR in "checkout|$CHECKOUT" "cwd|$CWD_TOK"; do
   WHICH="${PAIR%%|*}"; T="${PAIR#*|}"
-  FIELD_SRC="$T"; FIELD_NAME=behind; num_field; BEHIND="$FIELD_OUT"
+  FIELD_SRC="$T"; FIELD_NAME=behind; field; BEHIND="$FIELD_OUT"
   if [ -n "$BEHIND" ] && [ "$BEHIND" -gt 0 ]; then
-    ASOF=""
-    case " $T" in *" as-of="*) ASOF="${T#*as-of=}"; ASOF="${ASOF%% dirty*}" ;; esac
-    echo "$WHICH is $BEHIND commit(s) behind origin/main AS OF ${ASOF:-<no as-of>} - the local ref's age, not a live count"
+    FIELD_NAME=upstream; field; UPSTREAM="${FIELD_RAW:-its upstream}"
+    FIELD_NAME=as-of; field; ASOF="${FIELD_RAW:-<no as-of>}"
+    echo "$WHICH is $BEHIND commit(s) behind $UPSTREAM AS OF $ASOF - the local ref's age, not a live count"
   fi
 done
 ```
@@ -1027,27 +1048,48 @@ else {
     elseif ($key -ceq 'cwd') { $cwdTok = $val }
   }
 }
-# The three cross-checks of Step 1b, with the same predicates.
+# The three cross-checks of Step 1b, with the same predicates. Get-ServedRaw is
+# the bash `field` helper: the value after ` <name>=` verbatim, an
+# `UNKNOWN (<why>)` kept whole, or '' when the field is absent.
+function Get-ServedRaw([string]$t, [string]$name) {
+  if (" $t" -cmatch (' ' + [regex]::Escape($name) + '=(UNKNOWN \([^)]*\)|\S*)')) { $Matches[1] } else { '' }
+}
 function Get-ServedNum([string]$t, [string]$name) {
-  if (" $t" -cmatch (' ' + [regex]::Escape($name) + '=([0-9]+)(\s|$)')) { [int]$Matches[1] } else { $null }
+  $raw = Get-ServedRaw $t $name
+  if ($raw -cmatch '^[0-9]+$') { [int]$raw } else { $null }
 }
-$tracked = $checkoutTok -and -not ($checkoutTok -cmatch '^(none|UNKNOWN)')
+function Get-NotCountedWhy([string]$name, [string]$raw) {
+  if (-not $raw)         { "the bundle token carries no $name field - the spawning build predates it" }
+  elseif ($raw -ceq 'n/a') { "$name=n/a - the served .claude is not in a git work tree, so nothing in it is tracked source" }
+  else                   { "$name=$raw - git could not say which files are tracked" }
+}
 $dirtyClaude = Get-ServedNum $checkoutTok 'dirty-claude'
-$stamped = Get-ServedNum $bundleTok 'stamped'
-if ($tracked -and $null -ne $stamped -and $stamped -gt 0 -and $null -ne $dirtyClaude) {
-  if ($dirtyClaude -gt 0) { "PROVISIONER OVERWRITE PROVEN BY STAMP - these files were written by the runner, not edited by a peer (stamped=$stamped, dirty-claude=$dirtyClaude)" }
-  else { "stamped=$stamped with dirty-claude=0 - the stamped files are untracked here, so this is a provision, not a clobber of source" }
-}
-if ($tracked -and $null -ne $dirtyClaude -and $dirtyClaude -gt 0 -and
-    $bundleTok -cmatch '^([0-9]+)/([0-9]+) identical-to-build (\S+)' -and $Matches[1] -ceq $Matches[2]) {
-  "PROVISIONER OVERWRITE SIGNATURE - these files are build $($Matches[3])'s bundle, not peer WIP ($($Matches[1])/$($Matches[2]) identical, dirty-claude=$dirtyClaude)"
+if ($bundleTok -cmatch '^([0-9]+)/([0-9]+) identical-to-build (\S+)') {
+  $bN = $Matches[1]; $bM = $Matches[2]; $bSha = $Matches[3]
+  $stamped = Get-ServedNum $bundleTok 'stamped'
+  $stampedTracked = Get-ServedNum $bundleTok 'stamped-tracked'
+  if ($null -eq $stampedTracked) {
+    "stamp verdict: none - $(Get-NotCountedWhy 'stamped-tracked' (Get-ServedRaw $bundleTok 'stamped-tracked'))"
+  } elseif ($stampedTracked -gt 0) {
+    "PROVISIONER OVERWRITE PROVEN BY STAMP - $stampedTracked tracked file(s) carry a provisioner stamp: written by the runner, not edited by a peer"
+  } elseif ($null -ne $stamped -and $stamped -gt 0) {
+    "stamped=$stamped, stamped-tracked=0 - the stamped files are untracked provisions (normal), not a clobber of source"
+  }
+  $dirtyBundle = Get-ServedNum $bundleTok 'dirty-bundle'
+  if ($null -eq $dirtyBundle) {
+    "overwrite verdict: none - $(Get-NotCountedWhy 'dirty-bundle' (Get-ServedRaw $bundleTok 'dirty-bundle'))"
+  } elseif ($dirtyBundle -gt 0 -and $bN -ceq $bM) {
+    "PROVISIONER OVERWRITE SIGNATURE - the $dirtyBundle dirty bundled file(s) are byte-identical to build $bSha's bundle - a provisioner write, not peer WIP"
+  } elseif ($dirtyBundle -eq 0 -and $null -ne $dirtyClaude -and $dirtyClaude -gt 0) {
+    "dirty-claude=$dirtyClaude, dirty-bundle=0 - the tracked changes under .claude are OUTSIDE the bundle (a settings render, peer WIP, ...), not provisioner output"
+  }
 }
 foreach ($pair in @(@('checkout', $checkoutTok), @('cwd', $cwdTok))) {
   $behind = Get-ServedNum $pair[1] 'behind'
   if ($null -ne $behind -and $behind -gt 0) {
-    $asOf = '<no as-of>'
-    if (" $($pair[1])" -cmatch ' as-of=(.*?)( dirty|$)') { $asOf = $Matches[1] }
-    "$($pair[0]) is $behind commit(s) behind origin/main AS OF $asOf - the local ref's age, not a live count"
+    $upstream = Get-ServedRaw $pair[1] 'upstream'; if (-not $upstream) { $upstream = 'its upstream' }
+    $asOf = Get-ServedRaw $pair[1] 'as-of'; if (-not $asOf) { $asOf = '<no as-of>' }
+    "$($pair[0]) is $behind commit(s) behind $upstream AS OF $asOf - the local ref's age, not a live count"
   }
 }
 
@@ -1186,10 +1228,12 @@ cwd           : <path>
 === SERVED CORPUS (fixed at spawn) ===
 served-corpus : <canonical .claude path> | UNKNOWN (<reason>)
 checkout      : <repo> <branch>@<sha12> upstream=<ref> behind=<n> ahead=<m> as-of=<ts> dirty-claude=<k> | none (not a git work tree) | UNKNOWN (<reason>)
-bundle        : <N>/<M> identical-to-build <gitSha> stamped=<k> | UNKNOWN (<reason>)
-provisioned   : written=<w> skipped-git-tracked=<s> as-of=<ts> | UNKNOWN (<reason>)
+bundle        : <N>/<M> identical-to-build <gitSha> stamped=<k> stamped-tracked=<t|n/a|UNKNOWN (..)> dirty-bundle=<d|n/a|UNKNOWN (..)> served: canonical@<sha12|unloaded> <c>[ fetched <ts>], builtin <b>, account <a>, unstamped <u>; identical-to-source <i>/<v> unverifiable=<x> | UNKNOWN (<reason>)
+provisioned   : commands written=<w>/<e> [skipped-<reason>=<n> ...] as-of=<ts>; skills written=<w>/<e> [skipped-<reason>=<n> ...] as-of=<ts> | UNKNOWN (no provision recorded for this workdir)
 cwd           : <repo> <branch>@<sha12> behind=<n> as-of=<ts> dirty=<m> | same checkout | UNKNOWN (<reason>)
-[PROVISIONER OVERWRITE PROVEN BY STAMP - ... | PROVISIONER OVERWRITE SIGNATURE - ... | <which> is <n> commit(s) behind origin/main AS OF <ts> - ...]
+[PROVISIONER OVERWRITE PROVEN BY STAMP - ... | stamped=<k>, stamped-tracked=0 - ... | stamp verdict: none - <why>]
+[PROVISIONER OVERWRITE SIGNATURE - ... | dirty-claude=<k>, dirty-bundle=0 - ... | overwrite verdict: none - <why>]
+[<which> is <n> commit(s) behind <upstream> AS OF <ts> - ...]
 (or the single row `served corpus : <none - runner predates served-corpus provenance> | <n/a - no runner context>`)
 
 === REACHABILITY (now, <timestamp>) ===
