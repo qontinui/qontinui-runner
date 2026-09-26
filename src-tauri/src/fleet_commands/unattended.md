@@ -71,8 +71,11 @@ Enumerate what this session actually did. Sources, in order of trustworthiness:
 
    Classify it by the SAME `origin/main` content check the table demands below,
    after a `fetch`: the stamped file's content hash must equal `origin/main`'s
-   blob at its path (`/implement-plan` Step 6 item 3's read-back, with its
-   non-empty guard). An existence check is not enough, because after a stranded
+   blob at its path. That read-back now lives in `scripts/land-plan-stamp.sh`,
+   which `/implement-plan` Step 6 item 3 calls: after a fresh fetch it hashes
+   the blob at the ref and exits 3 on a missing path or a different blob, so a
+   `LANDED` verdict line from it has passed the check — and a `PROPOSED` one has
+   NOT landed, it is on a fresh branch awaiting its PR. An existence check is not enough, because after a stranded
    stamp push an earlier, unstamped version is already at that path. **A plan that is committed and pushed is not thereby LANDED**: a bare
    `git push` lands it on whatever branch the plans checkout was on, and nothing
    opens a PR for that branch or merges it. Measured 2026-09-02 on

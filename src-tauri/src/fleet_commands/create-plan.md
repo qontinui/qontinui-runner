@@ -352,30 +352,36 @@ status; the order is write → commit → vet. (If the plans directory is not a 
 repo — see [Plan directories](#plan-directories) — the file on disk is the whole
 ritual.)
 
-**The push is not the publication — assert a PR carries the branch's push.**
-`qontinui-dev-notes` is a coord-merge-authority repo, so a branch pushed with no
-pull request never reaches `main`: the plan is published to `origin` and
-permanently invisible to every `origin/main` reader, which is the population a
-peer vetter, `/preflight` and the plan registry all read. Measured 2026-09-02, **9** plan
+**A push is not the publication — land the plan with the helper.** A branch
+pushed with no pull request, onto a repo that needs one, never reaches `main`:
+the plan is published to `origin` and permanently invisible to every
+`origin/main` reader, which is the population a peer vetter, `/preflight` and
+the plan registry all read. Measured 2026-09-02, **9** plan
 stems were pushed to `origin` and never proposed at all — no PR in any state, on
 any branch carrying the stem — one of them a plan authored the day before by this
-very step. So after the push:
+very step. So publish the new plan with:
 
 ```bash
-gh pr list --repo <owner/repo> --head "$(git rev-parse --abbrev-ref HEAD)" \
-  --state all --json number,state,headRefOid,url \
-  --jq '.[] | "\(.number) \(.state) \(.headRefOid) \(.url)"'
+bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh \
+  "<plans-repo-root>" "<repo-relative plan path>" "<local plan file>" \
+  "docs: add <plan-stem> (DRAFT)"
 ```
 
-Use `--state all`, not `--state open`: an empty open-only answer cannot tell
-"never proposed" from "closed under you". A CLOSED or MERGED PR HAS been
-proposed, but it carries nothing pushed after its close. So apply
-`knowledge-base/qontinui-specific/coord-ff-lands.md` → "Pushing to a branch
-whose PR may already have landed". When it says no PR carries the push and
-commits remain unlanded, take its fresh-branch path and open the new PR:
-**`coord_create_pr` first, then `gh pr create`**, with a line-anchored
-`Plan: <stem>` marker in the body. **Never `gh pr merge`, never `--admin`** —
-coord is the sole merge authority. Runbook:
+Whether the plans repo needs a PR is decided by the helper's ruleset probe of
+its default branch, not asserted here. With no PR-requiring rule it lands the
+blob directly and prints `LANDED <commit|unchanged> <blob>`; with one, or when
+the probe cannot tell, it cuts a fresh branch, opens a new PR with
+**`gh pr create`** — the only opener it runs — with a line-anchored
+`Plan: <stem>` marker in the body, and prints `PROPOSED <pr-url|branch> <branch>`.
+To open it with `coord_create_pr` instead, set `LAND_PLAN_STAMP_NO_PR=1`: the
+helper pushes and reads back the branch, prints it, and opens nothing; then open
+the PR with `coord_create_pr`, falling back to `gh pr create`.
+It never pushes to an existing branch. A non-zero exit means the plan is NOT
+published; report it. On `PROPOSED`, read the PR back with
+`gh pr list --repo <owner/repo> --head <branch> --state all --json number,state,headRefOid,url`
+— `--state all`, not `--state open`: an empty open-only answer cannot tell
+"never proposed" from "closed under you". **Never `gh pr merge`, never
+`--admin`** — coord is the sole merge authority. Runbook:
 `knowledge-base/qontinui-specific/bodyless-work-units-and-stranded-plans.md`.
 
 Note what publishing the plan does **not** by itself buy you: it does not make the

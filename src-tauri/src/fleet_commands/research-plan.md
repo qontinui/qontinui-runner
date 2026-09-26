@@ -384,19 +384,23 @@ waste yours.
   (`git -C <dir> rev-parse --show-toplevel`) rather than assuming it, since pointing
   `$QONTINUI_PLANS_DIR` at `qontinui-dev-notes`'s `plans/` directory is a supported
   configuration.
-- **Then assert a PR carries that branch's push — the push is not the
-  publication.** On a coord-merge-authority repo a pushed branch with no pull
-  request never reaches `main`, so the prompt is on `origin` and invisible to
-  every `origin/main` reader (9 plan stems were pushed and never proposed on
-  2026-09-02). Read `gh pr list --repo <owner/repo> --head <branch> --state all
-  --json number,state,headRefOid` and apply
-  `knowledge-base/qontinui-specific/coord-ff-lands.md` → "Pushing to a branch
-  whose PR may already have landed". Use `--state all` because an empty
-  open-only answer cannot tell never-proposed from closed-under-you, and a
-  CLOSED or MERGED PR carries nothing pushed after its close. When commits
-  remain unlanded, take its fresh-branch path and open the new PR,
-  `coord_create_pr` first, then `gh pr create`; **never `gh pr merge`, never
-  `--admin`**. Runbook:
+- **Then land it with the helper — the push is not the publication.** A
+  branch pushed with no pull request, onto a repo that needs one, never reaches
+  `main`, so the prompt is on `origin` and invisible to every `origin/main`
+  reader (9 plan stems were pushed and never proposed on 2026-09-02). Publish
+  the file with
+  `bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh "<plans-repo-root>" "<repo-relative path>" "<local file>" "<commit subject>"`;
+  its ruleset probe of the default branch decides whether a PR is needed — no
+  command asserts that in prose. It prints `LANDED <commit|unchanged> <blob>`
+  on the direct arm, or cuts a fresh branch, opens a new PR with `gh pr create`
+  (the only opener it runs; **never `gh pr merge`, never `--admin`**) and
+  prints `PROPOSED <pr-url|branch> <branch>`. A caller holding coord's MCP door
+  that wants `coord_create_pr` sets `LAND_PLAN_STAMP_NO_PR=1` — the helper then
+  pushes and reads back the branch, prints it, and opens nothing — and opens the
+  PR itself with `coord_create_pr`, falling back to `gh pr create`. It never pushes to an existing
+  branch. A non-zero exit means the prompt is NOT published — report it. On
+  `PROPOSED`, read `gh pr list --repo <owner/repo> --head <branch> --state all
+  --json number,state,headRefOid` for the branch the line names. Runbook:
   `knowledge-base/qontinui-specific/bodyless-work-units-and-stranded-plans.md`.
 - Also print the full prompt content in your response, so the operator can
   copy-paste it without opening the file.
