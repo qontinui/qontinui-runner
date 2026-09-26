@@ -27,8 +27,10 @@
 //! file is an ordinary provision), and `dirty-bundle` counts roster paths git
 //! reports with tracked changes. Unlike `dirty-claude`, which counts every
 //! change under `.claude/`, it never joins an unrelated edit to the bundle. Both
-//! read `n/a` outside a git work tree and `UNKNOWN` when git could not answer —
-//! never `0`. The third is source-aware: each present
+//! read `n/a` outside a git work tree and `UNKNOWN(<code>)` when git could not
+//! answer — never `0`. The code is one kebab-case word with no space, so the
+//! count stays one whitespace-free field; [`CountUnknown`] lists every code and
+//! the one cause each names. The third is source-aware: each present
 //! file is sorted by the `source=` of its `qontinui-provenance:` stamp
 //! ([`crate::provenance`]) and compared against the copy of that source the
 //! process holds in memory — a `canonical` file against the loaded
@@ -40,7 +42,8 @@
 //! snapshot yet. Reading the snapshot is a lock and an `Arc` clone: the probe
 //! never fetches.
 //!
-//! Every value is a measurement or `UNKNOWN (<reason>)`, never a default. The
+//! Every value is a measurement, `UNKNOWN (<reason>)`, or — for the two roster
+//! counts — `UNKNOWN(<code>)`, never a default. The
 //! tokens are cut at their own first `]`, the line-2 grammar, so no rendered
 //! value ever carries a `]`.
 //!
@@ -161,43 +164,86 @@ pub(crate) struct BundleIdentity {
     /// The `.claude/`-relative paths of those stamped files.
     stamped_rels: Vec<String>,
     /// The roster measured against the served checkout's git.
-    in_checkout: Probe<BundleInCheckout>,
+    in_checkout: BundleInCheckout,
     /// Which rung each present file says it came from, and whether it is still
     /// that rung's bytes.
     sources: SourceIdentity,
 }
+
+/// Why a roster count (`stamped-tracked`, `dirty-bundle`) is UNKNOWN, rendered
+/// `UNKNOWN(<code>)`. One code per distinct cause, so a reader can tell every
+/// UNKNOWN apart from the bundle token alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CountUnknown {
+    /// `no-served-corpus`: there is no `.claude/` to measure; the
+    /// `served-corpus` token says why.
+    NoServedCorpus,
+    /// `checkout-unknown`: git could not say whether the corpus is in a work
+    /// tree at all; the `checkout` token carries the reason.
+    CheckoutUnknown,
+    /// `outside-work-tree`: the corpus resolves outside the toplevel git
+    /// reported for it, so no roster path maps to a git path.
+    OutsideWorkTree,
+    /// `status-unknown`: the checkout's `git status` could not be read, so
+    /// the changed set `dirty-bundle` filters does not exist; the `checkout`
+    /// token's `dirty-claude` carries the reason.
+    StatusUnknown,
+    /// `ls-files-failed`: `git ls-files` ran and exited non-zero.
+    LsFilesFailed,
+    /// A `git` run that could not answer — see [`GitError`].
+    Git(GitErrorCode),
+}
+
+impl CountUnknown {
+    fn code(self) -> &'static str {
+        match self {
+            CountUnknown::NoServedCorpus => "no-served-corpus",
+            CountUnknown::CheckoutUnknown => "checkout-unknown",
+            CountUnknown::OutsideWorkTree => "outside-work-tree",
+            CountUnknown::StatusUnknown => "status-unknown",
+            CountUnknown::LsFilesFailed => "ls-files-failed",
+            CountUnknown::Git(g) => g.code(),
+        }
+    }
+}
+
+/// One roster count: a measurement, or why there is none.
+pub(crate) type Count = Result<usize, CountUnknown>;
 
 /// The bundle roster (the same M paths) as the served checkout's git sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BundleInCheckout {
     /// The served corpus is not inside a git work tree: `n/a`, not zero.
     NotAWorkTree,
+    /// Neither count could be asked for — the same cause for both.
+    Unknown(CountUnknown),
     Repo {
         /// Stamped files git tracks.
-        stamped_tracked: Probe<usize>,
+        stamped_tracked: Count,
         /// Roster paths with tracked changes.
-        dirty_bundle: Probe<usize>,
+        dirty_bundle: Count,
     },
 }
 
 impl BundleInCheckout {
-    /// `stamped-tracked=<t> dirty-bundle=<d>`, with `n/a` outside a work tree
-    /// and a bare `UNKNOWN` (the checkout token carries the reason) when git
-    /// could not answer.
-    fn render(p: &Probe<BundleInCheckout>) -> String {
-        let n = |v: &Probe<usize>| match v {
-            Probe::Measured(n) => n.to_string(),
-            Probe::Unknown(_) => "UNKNOWN".to_string(),
+    /// `stamped-tracked=<t> dirty-bundle=<d>`: a count, `n/a` outside a work
+    /// tree, or `UNKNOWN(<code>)` naming the [`CountUnknown`] cause — which is
+    /// in this token itself, so no UNKNOWN here is left without a reason.
+    fn render(&self) -> String {
+        let n = |v: &Count| match v {
+            Ok(n) => n.to_string(),
+            Err(why) => format!("UNKNOWN({})", clean(why.code())),
         };
-        match p {
-            Probe::Unknown(_) => "stamped-tracked=UNKNOWN dirty-bundle=UNKNOWN".to_string(),
-            Probe::Measured(BundleInCheckout::NotAWorkTree) => {
-                "stamped-tracked=n/a dirty-bundle=n/a".to_string()
+        match self {
+            BundleInCheckout::NotAWorkTree => "stamped-tracked=n/a dirty-bundle=n/a".to_string(),
+            BundleInCheckout::Unknown(why) => {
+                let v = n(&Err(*why));
+                format!("stamped-tracked={v} dirty-bundle={v}")
             }
-            Probe::Measured(BundleInCheckout::Repo {
+            BundleInCheckout::Repo {
                 stamped_tracked,
                 dirty_bundle,
-            }) => format!(
+            } => format!(
                 "stamped-tracked={} dirty-bundle={}",
                 n(stamped_tracked),
                 n(dirty_bundle)
@@ -407,7 +453,7 @@ impl ServedCorpus {
                 b.identical,
                 b.total,
                 b.stamped,
-                BundleInCheckout::render(&b.in_checkout),
+                b.in_checkout.render(),
                 b.sources.render()
             ),
             Probe::Unknown(r) => unknown_text(r),
@@ -596,9 +642,12 @@ fn probe_with(
     };
     identity.in_checkout = match (&corpus, &checkout) {
         (Probe::Measured(dir), Probe::Measured(c)) => {
-            Probe::Measured(bundle_in_checkout(&git, dir, c, &identity.stamped_rels))
+            bundle_in_checkout(&git, dir, c, &identity.stamped_rels)
         }
-        (_, Probe::Unknown(r)) | (Probe::Unknown(r), _) => Probe::Unknown(r.clone()),
+        (Probe::Unknown(_), _) => BundleInCheckout::Unknown(CountUnknown::NoServedCorpus),
+        (Probe::Measured(_), Probe::Unknown(_)) => {
+            BundleInCheckout::Unknown(CountUnknown::CheckoutUnknown)
+        }
     };
     let bundle = Probe::Measured(identity);
 
@@ -679,11 +728,7 @@ fn bundle_in_checkout(
         .ok()
         .map(|p| p.to_string_lossy().replace('\\', "/"))
     else {
-        let reason = "the served corpus is outside its own work tree".to_string();
-        return BundleInCheckout::Repo {
-            stamped_tracked: Probe::Unknown(reason.clone()),
-            dirty_bundle: Probe::Unknown(reason),
-        };
+        return BundleInCheckout::Unknown(CountUnknown::OutsideWorkTree);
     };
     let in_repo = |rel: &str| {
         if prefix.is_empty() {
@@ -697,33 +742,27 @@ fn bundle_in_checkout(
         Probe::Measured(changed) => {
             let changed: std::collections::HashSet<&str> =
                 changed.iter().map(String::as_str).collect();
-            Probe::Measured(
-                bundled_files()
-                    .iter()
-                    .filter(|f| changed.contains(in_repo(&f.rel).as_str()))
-                    .count(),
-            )
+            Ok(bundled_files()
+                .iter()
+                .filter(|f| changed.contains(in_repo(&f.rel).as_str()))
+                .count())
         }
-        Probe::Unknown(r) => Probe::Unknown(r.clone()),
+        Probe::Unknown(_) => Err(CountUnknown::StatusUnknown),
     };
 
     let stamped_tracked = if stamped_rels.is_empty() {
-        Probe::Measured(0)
+        Ok(0)
     } else {
         match git.run(corpus, &["ls-files", "-z", "--full-name", "--", "."]) {
-            Err(reason) => Probe::Unknown(reason),
-            Ok(out) if !out.success => {
-                Probe::Unknown(format!("git ls-files failed: {}", first_line(&out.stderr)))
-            }
+            Err(e) => Err(CountUnknown::Git(e.code)),
+            Ok(out) if !out.success => Err(CountUnknown::LsFilesFailed),
             Ok(out) => {
                 let tracked: std::collections::HashSet<&str> =
                     out.stdout.split('\0').filter(|p| !p.is_empty()).collect();
-                Probe::Measured(
-                    stamped_rels
-                        .iter()
-                        .filter(|rel| tracked.contains(in_repo(rel).as_str()))
-                        .count(),
-                )
+                Ok(stamped_rels
+                    .iter()
+                    .filter(|rel| tracked.contains(in_repo(rel).as_str()))
+                    .count())
             }
         }
     };
@@ -807,7 +846,7 @@ fn measure(git: &Git<'_>, dir: &Path, located: Located, scope: DirtyScope) -> Re
         Probe::Measured(_) => {
             let range = format!("{upstream_ref}...HEAD");
             match git.run(dir, &["rev-list", "--count", "--left-right", &range]) {
-                Err(reason) => Probe::Unknown(reason),
+                Err(e) => Probe::Unknown(e.reason),
                 Ok(out) if !out.success => {
                     if out.stderr.contains("unknown revision")
                         || out.stderr.contains("bad revision")
@@ -850,7 +889,7 @@ fn measure(git: &Git<'_>, dir: &Path, located: Located, scope: DirtyScope) -> Re
         status_args.extend(["--", "."]);
     }
     let changed: Probe<Vec<String>> = match git.run(dir, &status_args) {
-        Err(reason) => Probe::Unknown(reason),
+        Err(e) => Probe::Unknown(e.reason),
         Ok(out) if !out.success => {
             Probe::Unknown(format!("git status failed: {}", first_line(&out.stderr)))
         }
@@ -1030,7 +1069,6 @@ fn bundle_identity(
     let mut identical = 0;
     let mut stamped = 0;
     let mut stamped_rels = Vec::new();
-    let unmeasured = || Probe::Unknown("not measured".to_string());
     let mut sources = SourceIdentity {
         canonical_snapshot: canonical.map(|c| c.snapshot().clone()),
         ..SourceIdentity::default()
@@ -1041,7 +1079,7 @@ fn bundle_identity(
             total,
             stamped,
             stamped_rels,
-            in_checkout: unmeasured(),
+            in_checkout: BundleInCheckout::Unknown(CountUnknown::NoServedCorpus),
             sources,
         };
     };
@@ -1130,12 +1168,51 @@ fn bundle_identity(
         total,
         stamped,
         stamped_rels,
-        in_checkout: unmeasured(),
+        // Set by the caller, which alone holds the checkout to measure it in.
+        in_checkout: BundleInCheckout::Unknown(CountUnknown::CheckoutUnknown),
         sources,
     }
 }
 
 // ── Bounded git ─────────────────────────────────────────────────────────────
+
+/// Why one [`Git::run`] could not answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GitErrorCode {
+    /// `deadline`: the probe's budget was already spent, so git was not run.
+    Deadline,
+    /// `timed-out`: THIS git run was killed at the budget's end.
+    TimedOut,
+    /// `git-unavailable`: git could not be spawned.
+    GitUnavailable,
+    /// `output-incomplete`: git exited but its output could not be read whole.
+    OutputIncomplete,
+}
+
+impl GitErrorCode {
+    fn code(self) -> &'static str {
+        match self {
+            GitErrorCode::Deadline => "deadline",
+            GitErrorCode::TimedOut => "timed-out",
+            GitErrorCode::GitUnavailable => "git-unavailable",
+            GitErrorCode::OutputIncomplete => "output-incomplete",
+        }
+    }
+}
+
+/// A [`Git::run`] failure: the code a roster count renders, and the reason an
+/// `UNKNOWN (<reason>)` token renders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitError {
+    code: GitErrorCode,
+    reason: String,
+}
+
+impl From<GitError> for String {
+    fn from(e: GitError) -> String {
+        e.reason
+    }
+}
 
 /// The captured result of one completed `git` run.
 struct GitOut {
@@ -1147,12 +1224,13 @@ struct GitOut {
 /// A `git` runner for ONE probe, under ONE deadline. Each spawn gets what is
 /// left of the budget, never a fresh allowance, so however many questions the
 /// probe asks it returns within the budget. A spawn failure, and a spent
-/// budget, are sticky: every later call returns the same reason at once.
+/// budget, are sticky: every later call fails at once — a spawn failure with
+/// the same error, a spent budget as [`GitErrorCode::Deadline`].
 struct Git<'a> {
     program: &'a OsStr,
     budget: Duration,
     deadline: Instant,
-    dead: std::cell::RefCell<Option<String>>,
+    dead: std::cell::RefCell<Option<GitError>>,
 }
 
 impl<'a> Git<'a> {
@@ -1166,9 +1244,13 @@ impl<'a> Git<'a> {
         }
     }
 
-    /// The reason every question left unasked once the budget is spent.
-    fn deadline_reason(&self) -> String {
-        format!("deadline: git probe budget {:?} spent", self.budget)
+    /// The error for a question the spent budget cut short: `code` says
+    /// whether git was killed mid-run or never started.
+    fn deadline_error(&self, code: GitErrorCode) -> GitError {
+        GitError {
+            code,
+            reason: format!("deadline: git probe budget {:?} spent", self.budget),
+        }
     }
 
     /// The command [`Self::run`] spawns. Built on the one scrubbed builder the
@@ -1190,16 +1272,17 @@ impl<'a> Git<'a> {
 
     /// `git -C <dir> --literal-pathspecs <args…>`, bounded, read-only.
     ///
-    /// `Err` is a reason fit for an `UNKNOWN (…)` token.
-    fn run(&self, dir: &Path, args: &[&str]) -> Result<GitOut, String> {
-        if let Some(reason) = self.dead.borrow().as_ref() {
-            return Err(reason.clone());
+    /// `Err` carries a code for a roster count and a reason fit for an
+    /// `UNKNOWN (…)` token.
+    fn run(&self, dir: &Path, args: &[&str]) -> Result<GitOut, GitError> {
+        if let Some(e) = self.dead.borrow().as_ref() {
+            return Err(e.clone());
         }
         let remaining = self.deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            let reason = self.deadline_reason();
-            *self.dead.borrow_mut() = Some(reason.clone());
-            return Err(reason);
+            let e = self.deadline_error(GitErrorCode::Deadline);
+            *self.dead.borrow_mut() = Some(e.clone());
+            return Err(e);
         }
         let cmd = self.command(dir, args);
         use crate::process_helpers::TimedOutput;
@@ -1210,18 +1293,23 @@ impl<'a> Git<'a> {
                 } else {
                     format!("git unavailable: {e}")
                 };
-                *self.dead.borrow_mut() = Some(reason.clone());
-                Err(reason)
+                let e = GitError {
+                    code: GitErrorCode::GitUnavailable,
+                    reason,
+                };
+                *self.dead.borrow_mut() = Some(e.clone());
+                Err(e)
             }
             Ok(run) => match run.outcome {
                 TimedOutput::TimedOut { .. } => {
-                    let reason = self.deadline_reason();
-                    *self.dead.borrow_mut() = Some(reason.clone());
-                    Err(reason)
+                    // This run was killed; every later one is never started.
+                    *self.dead.borrow_mut() = Some(self.deadline_error(GitErrorCode::Deadline));
+                    Err(self.deadline_error(GitErrorCode::TimedOut))
                 }
-                TimedOutput::Completed(_) if run.truncation.is_some() => {
-                    Err("git output incomplete".to_string())
-                }
+                TimedOutput::Completed(_) if run.truncation.is_some() => Err(GitError {
+                    code: GitErrorCode::OutputIncomplete,
+                    reason: "git output incomplete".to_string(),
+                }),
                 TimedOutput::Completed(out) => Ok(GitOut {
                     success: out.status.success(),
                     stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -1525,6 +1613,124 @@ mod tests {
         assert!(line.contains("[cwd: same checkout]"), "{line}");
     }
 
+    // -- the roster counts' UNKNOWN codes --------------------------------------
+
+    /// A checkout at `toplevel` whose `git status` read `changed`.
+    fn repo_at(toplevel: &Path, changed: Probe<Vec<String>>) -> Checkout {
+        Checkout::Repo(RepoState {
+            toplevel: toplevel.to_path_buf(),
+            head: Probe::Unknown("test".to_string()),
+            upstream: Probe::Unknown("test".to_string()),
+            as_of: Probe::Unknown("test".to_string()),
+            dirty: Probe::Unknown("test".to_string()),
+            changed,
+        })
+    }
+
+    /// `bundle_in_checkout` for one stamped file, rendered.
+    fn counts(git: &Git<'_>, corpus: &Path, checkout: &Checkout) -> String {
+        bundle_in_checkout(git, corpus, checkout, &["commands/x.md".to_string()]).render()
+    }
+
+    #[test]
+    fn every_count_unknown_renders_as_one_spaceless_code() {
+        let cases = [
+            (CountUnknown::NoServedCorpus, "no-served-corpus"),
+            (CountUnknown::CheckoutUnknown, "checkout-unknown"),
+            (CountUnknown::OutsideWorkTree, "outside-work-tree"),
+            (CountUnknown::StatusUnknown, "status-unknown"),
+            (CountUnknown::LsFilesFailed, "ls-files-failed"),
+            (CountUnknown::Git(GitErrorCode::Deadline), "deadline"),
+            (CountUnknown::Git(GitErrorCode::TimedOut), "timed-out"),
+            (
+                CountUnknown::Git(GitErrorCode::GitUnavailable),
+                "git-unavailable",
+            ),
+            (
+                CountUnknown::Git(GitErrorCode::OutputIncomplete),
+                "output-incomplete",
+            ),
+        ];
+        for (why, code) in cases {
+            assert_eq!(
+                BundleInCheckout::Unknown(why).render(),
+                format!("stamped-tracked=UNKNOWN({code}) dirty-bundle=UNKNOWN({code})")
+            );
+            assert!(code.chars().all(|c| c.is_ascii_lowercase() || c == '-'));
+        }
+    }
+
+    #[test]
+    fn a_corpus_outside_its_toplevel_is_outside_work_tree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let git = Git::new(OsStr::new("git"), PROBE_BUDGET);
+        let checkout = repo_at(elsewhere.path(), Probe::Measured(vec![]));
+        assert_eq!(
+            counts(&git, tmp.path(), &checkout),
+            "stamped-tracked=UNKNOWN(outside-work-tree) dirty-bundle=UNKNOWN(outside-work-tree)"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_status_is_status_unknown_and_a_failed_ls_files_is_ls_files_failed() {
+        // Not a repository, so `git ls-files` exits non-zero.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert_not_in_any_repo(tmp.path());
+        let git = Git::new(OsStr::new("git"), PROBE_BUDGET);
+        let checkout = repo_at(tmp.path(), Probe::Unknown("git status failed".to_string()));
+        std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+        assert_eq!(
+            counts(&git, &tmp.path().join(".claude"), &checkout),
+            "stamped-tracked=UNKNOWN(ls-files-failed) dirty-bundle=UNKNOWN(status-unknown)"
+        );
+    }
+
+    #[test]
+    fn a_git_that_cannot_answer_ls_files_names_why() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let checkout = repo_at(tmp.path(), Probe::Measured(vec![]));
+        let corpus = tmp.path().join(".claude");
+
+        let nowhere = tmp.path().join("no-such-git");
+        let git = Git::new(nowhere.as_os_str(), PROBE_BUDGET);
+        assert_eq!(
+            counts(&git, &corpus, &checkout),
+            "stamped-tracked=UNKNOWN(git-unavailable) dirty-bundle=0"
+        );
+
+        let spent = Git::new(OsStr::new("git"), Duration::ZERO);
+        assert_eq!(
+            counts(&spent, &corpus, &checkout),
+            "stamped-tracked=UNKNOWN(deadline) dirty-bundle=0"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_ls_files_killed_at_the_budget_is_timed_out() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let script = tmp.path().join("slow-git");
+        crate::canonical_corpus::test_support::executable_script(
+            &script,
+            "#!/bin/sh\nexec sleep 5\n",
+        );
+        let git = Git::new(script.as_os_str(), Duration::from_millis(200));
+        let checkout = repo_at(tmp.path(), Probe::Measured(vec![]));
+        assert_eq!(
+            counts(&git, &tmp.path().join(".claude"), &checkout),
+            "stamped-tracked=UNKNOWN(timed-out) dirty-bundle=0"
+        );
+        // The run after it was never started: that is the deadline.
+        assert!(matches!(
+            git.run(tmp.path(), &["status"]),
+            Err(GitError {
+                code: GitErrorCode::Deadline,
+                ..
+            })
+        ));
+    }
+
     #[test]
     fn a_missing_claude_dir_is_unknown_absent() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1538,6 +1744,12 @@ mod tests {
             "{line}"
         );
         assert!(line.contains(&format!("[bundle: 0/{} ", total())), "{line}");
+        assert!(
+            line.contains(
+                "stamped-tracked=UNKNOWN(no-served-corpus) dirty-bundle=UNKNOWN(no-served-corpus)"
+            ),
+            "{line}"
+        );
     }
 
     #[test]
@@ -1578,7 +1790,9 @@ mod tests {
             "{line}"
         );
         assert!(
-            line.contains("stamped-tracked=UNKNOWN dirty-bundle=UNKNOWN"),
+            line.contains(
+                "stamped-tracked=UNKNOWN(checkout-unknown) dirty-bundle=UNKNOWN(checkout-unknown)"
+            ),
             "git data that could not be read is UNKNOWN, never 0: {line}"
         );
         assert!(
