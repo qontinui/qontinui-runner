@@ -4374,16 +4374,26 @@ impl TerminalSession {
         // walks EVERY live terminal on shutdown (138 were live during the
         // 2026-08-30 wedge), so an unbounded taskkill is a per-terminal
         // blocked thread at exactly the moment the process is trying to exit.
-        let process_tree_gone = if kill_child {
+        //
+        // A child the waiter has ALREADY reaped is not killed at all: its pid
+        // may have been REUSED by an unrelated process, and a `taskkill /T` (or
+        // `kill`) of that pid could take down someone else's tree — a live
+        // Claude Code session included. Treated like the graceful-exit branch.
+        let process_tree_gone = if kill_child && exited_before_close {
+            info!(
+                terminal_id = %self.id,
+                pid = ?self.child_pid,
+                "pane process was already reaped — skipping the kill (its pid may be reused)"
+            );
+            true
+        } else if kill_child {
             let kill_budget =
                 std::cmp::max(clamp_to_deadline(TASKKILL_TIMEOUT, deadline), KILL_FLOOR);
             match self.io.kill(kill_budget) {
                 Ok(()) => true,
                 Err(e) => {
                     warn!(terminal_id = %self.id, pid = ?self.child_pid, "{e}");
-                    // A failed kill of a child the waiter had ALREADY reaped is
-                    // not a live tree.
-                    exited_before_close
+                    false
                 }
             }
         } else {
@@ -5191,23 +5201,27 @@ mod tests {
         }
     }
 
-    /// Round 4: a kill that FAILS for a child the waiter had already reaped
-    /// (the Windows `taskkill` of a dead pid) still revokes the key — the exit
-    /// recorded before the close is the proof the tree is gone.
+    /// Rounds 4-5: a child the waiter had ALREADY reaped is not killed at all
+    /// (its pid may be reused by an unrelated process), and its terminal key is
+    /// still revoked — the exit recorded before the close is the proof the tree
+    /// is gone.
     #[test]
-    fn close_revokes_the_terminal_key_when_the_child_was_already_reaped() {
+    fn close_skips_the_kill_and_revokes_when_the_child_was_already_reaped() {
         let amb = crate::test_env::isolated_ambient();
         let wd = amb.dir().to_string_lossy().to_string();
         let id = format!("term-{}", uuid::Uuid::new_v4());
         let nonce = crate::coord_mcp::track_terminal_bound_key_for_test(&id, &wd);
+        let io = Arc::new(KillCountingPaneIo::default());
         let mut session = make_test_session(Arc::new(Mutex::new(Vec::new())));
         session.id = id;
-        session.io = Arc::new(FailingKillPaneIo);
+        let pane: Arc<dyn crate::terminal::pane_io::PaneIo> = io.clone();
+        session.io = pane;
         *session.exit_code.lock().unwrap() = Some(0);
         session.close();
+        assert_eq!(io.kills(), 0, "a reaped pid must never be signalled");
         assert!(
             !crate::coord_mcp::nonce_is_live_for_test(&nonce),
-            "a reaped child's key is revoked even though the kill reported an error"
+            "a reaped child's key is revoked"
         );
     }
 

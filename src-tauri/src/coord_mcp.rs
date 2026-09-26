@@ -3162,6 +3162,33 @@ pub(crate) fn spawn_log_proxy_upstream_unreachable(
 fn device_nonce_snapshot(
     map: &HashMap<String, NonceBinding>,
 ) -> HashMap<String, crate::secure_storage::StoredNonceBinding> {
+    let (snapshot, dropped) = device_nonce_snapshot_counted(map);
+    warn_device_nonce_cap(dropped);
+    snapshot
+}
+
+/// The over-cap warning [`device_nonce_snapshot`] emits, split out so the
+/// registry-locked persist path ([`persist_live_nonce_state_in`]) can log it
+/// AFTER releasing the lock.
+fn warn_device_nonce_cap(dropped: usize) {
+    if dropped > 0 {
+        warn!(
+            "coord_mcp: persisted device nonce set capped at {MAX_PERSISTED_DEVICE_NONCES} \
+             — dropped the {dropped} oldest binding(s) from the encrypted store. They stay \
+             VALID in this process; they will simply not be restored after the next restart."
+        );
+    }
+}
+
+/// [`device_nonce_snapshot`] without the log: the snapshot plus how many
+/// bindings the cap dropped. Pure — safe to call under the registry lock.
+fn device_nonce_snapshot_counted(
+    map: &HashMap<String, NonceBinding>,
+) -> (
+    HashMap<String, crate::secure_storage::StoredNonceBinding>,
+    usize,
+) {
+    let mut dropped = 0;
     let mut eligible: Vec<(&String, &NonceBinding)> = map
         .iter()
         .filter(|(_, b)| b.principal == ProxyPrincipal::Device && !b.lifetime.is_ephemeral())
@@ -3175,15 +3202,10 @@ fn device_nonce_snapshot(
         // restores at `UNIX_EPOCH` (which tie at the OLDEST end, so they are
         // cut before any dated binding).
         eligible.sort_by(|(na, a), (nb, b)| b.minted_at.cmp(&a.minted_at).then_with(|| na.cmp(nb)));
-        let dropped = eligible.len() - MAX_PERSISTED_DEVICE_NONCES;
+        dropped = eligible.len() - MAX_PERSISTED_DEVICE_NONCES;
         eligible.truncate(MAX_PERSISTED_DEVICE_NONCES);
-        warn!(
-            "coord_mcp: persisted device nonce set capped at {MAX_PERSISTED_DEVICE_NONCES} \
-             — dropped the {dropped} oldest binding(s) from the encrypted store. They stay \
-             VALID in this process; they will simply not be restored after the next restart."
-        );
     }
-    eligible
+    let snapshot = eligible
         .into_iter()
         .map(|(n, b)| {
             (
@@ -3209,7 +3231,8 @@ fn device_nonce_snapshot(
                 },
             )
         })
-        .collect()
+        .collect();
+    (snapshot, dropped)
 }
 
 /// How many device bindings [`device_nonce_snapshot`] will persist. See that
@@ -3996,34 +4019,63 @@ fn persist_proxy_nonces(map: &HashMap<String, NonceBinding>) {
     // through, and every caller passes an OWNED snapshot, so no registry lock
     // is held across the file I/O.
     note_agent_binding_census(map);
-    persist_live_nonce_state(nonce_persistence_enabled(), enqueue_nonce_persist);
+    persist_live_nonce_state(nonce_persistence_enabled());
 }
 
-/// Enqueue the persist snapshot from the LIVE registry, computed and handed to
-/// `enqueue` while the registry lock is HELD (round-4 review of plan
+/// Enqueue the persist snapshot from the LIVE registry, computed and queued
+/// while the registry lock is HELD (round-4 review of plan
 /// `2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages`).
 ///
 /// Why not the caller's snapshot: every mint and revoke clones the map under
 /// the lock and persists AFTER releasing it, so two of them could enqueue out of
 /// order — a mint's clone still holding key K enqueued after a revoke's clone
-/// without K, and written last, resurrecting K at the next boot. Taking the
-/// snapshot under the registry lock and enqueueing before releasing it puts
-/// every enqueue in the registry's own total order: a later enqueue always
-/// carries a later state. The queue keeps only the newest pending snapshot, and
+/// without K, and written last, resurrecting K at the next boot. Building the
+/// snapshot under the registry lock and queueing it before releasing puts every
+/// enqueue in the registry's own total order: a later enqueue always carries a
+/// later state. The queue keeps only the newest pending snapshot, dedupes only
+/// against the newest in-flight-or-written one ([`queue_nonce_snapshot`]), and
 /// [`NONCE_WRITE`] makes a later-taken-from-the-queue snapshot the later write.
 ///
-/// Lock order is registry -> grace ([`graced_nonce_snapshot`], the order the
-/// mint path already uses) -> `NONCE_PERSIST`. Nothing holding `NONCE_PERSIST`
-/// or the grace lock ever takes the registry lock.
-fn persist_live_nonce_state(
+/// Only the in-memory steps run under the registry lock. The over-cap warning,
+/// a thread spawn fallback's INLINE flush (encrypted-store I/O) and everything
+/// else with side effects run after the guard drops.
+///
+/// **Complete lock order:** registry (`proxy_nonces`) -> grace
+/// (`graced_nonces`, via [`graced_nonce_snapshot`]; the mint path already nests
+/// it the same way) -> `NONCE_PERSIST` (the queue). Separately, `NONCE_WRITE`
+/// -> `NONCE_PERSIST` inside [`flush_nonce_persist_once_with`], which never
+/// takes the registry or grace lock. Nothing holding `NONCE_PERSIST`, the grace
+/// lock or `NONCE_WRITE` ever takes the registry lock, and no caller of
+/// [`persist_proxy_nonces`] holds it.
+fn persist_live_nonce_state(enabled: bool) {
+    persist_live_nonce_state_in(proxy_nonces(), enabled, enqueue_nonce_persist);
+}
+
+/// [`persist_live_nonce_state`] over an explicit registry and queue action — the
+/// seam a test drives with its own small registry. `enqueue` runs with the
+/// registry lock held and returns whether an inline flush is needed, which is
+/// then performed after the lock is released.
+fn persist_live_nonce_state_in(
+    registry: &Mutex<HashMap<String, NonceBinding>>,
     enabled: bool,
-    enqueue: impl FnOnce(HashMap<String, crate::secure_storage::StoredNonceBinding>),
+    enqueue: impl FnOnce(NoncePersistSnapshot) -> bool,
 ) {
     if !enabled {
         return;
     }
-    let map = proxy_nonces().lock().expect("proxy nonce map poisoned");
-    enqueue(device_nonce_snapshot(&map));
+    let (dropped, inline_flush) = {
+        let map = registry.lock().expect("proxy nonce map poisoned");
+        let (bindings, dropped) = device_nonce_snapshot_counted(&map);
+        let snapshot = NoncePersistSnapshot {
+            bindings,
+            graced: graced_nonce_snapshot(),
+        };
+        (dropped, enqueue(snapshot))
+    };
+    warn_device_nonce_cap(dropped);
+    if inline_flush {
+        flush_nonce_persist_once();
+    }
 }
 
 /// Debounce window for the encrypted whole-store nonce write.
@@ -4052,6 +4104,15 @@ struct NoncePersistQueue {
     flushing: bool,
     /// The last snapshot actually written, so an unchanged map costs nothing.
     last_written: Option<NoncePersistSnapshot>,
+    /// The snapshot TAKEN for the write currently in progress, if any. Set when
+    /// [`flush_nonce_persist_once_with`] takes `pending`, cleared when that write
+    /// finishes (success moves it to `last_written`; failure just clears it).
+    /// Dedupe compares against this before `last_written`: while a write is in
+    /// flight, `last_written` is the state BEFORE it, and a new snapshot equal to
+    /// that older state is a real change that must be queued (round-5 review —
+    /// otherwise a revoke back to the prior state is dropped and the in-flight
+    /// write lands last, resurrecting the revoked key).
+    in_flight: Option<NoncePersistSnapshot>,
     /// Consecutive failed write attempts for the CURRENT pending snapshot.
     /// Bounds the failure re-queue (see [`flush_nonce_persist_once`]) so a
     /// permanently broken store retries a few times instead of spinning the
@@ -4076,47 +4137,75 @@ static NONCE_PERSIST: once_cell::sync::Lazy<std::sync::Mutex<NoncePersistQueue>>
 /// re-mints (see [`crate::secure_storage::SecureStorage::load_coord_mcp_nonces`]).
 /// The in-memory registry stays authoritative for this process either way, so
 /// nothing a live session depends on rides the debounce.
-fn enqueue_nonce_persist(bindings: HashMap<String, crate::secure_storage::StoredNonceBinding>) {
-    // The grace set rides every binding write (Phase 1a): a re-mint is exactly
-    // the event that adds a grace entry, so the two are never out of step.
-    let snapshot = NoncePersistSnapshot {
-        bindings,
-        graced: graced_nonce_snapshot(),
-    };
-    let start_thread = {
-        let mut q = match NONCE_PERSIST.lock() {
-            Ok(q) => q,
-            Err(e) => {
-                warn!("coord_mcp: nonce persist queue poisoned ({e}) — nonces not persisted");
-                return;
-            }
-        };
-        if q.last_written.as_ref() == Some(&snapshot) && q.pending.is_none() {
-            return; // already durable and nothing newer queued
+///
+/// The snapshot always carries the grace set beside the bindings (Phase 1a): a
+/// re-mint is exactly the event that adds a grace entry, so the two are never
+/// out of step. The only producer is [`persist_live_nonce_state_in`], which
+/// builds both under the registry lock.
+fn enqueue_nonce_persist(snapshot: NoncePersistSnapshot) -> bool {
+    queue_nonce_snapshot_and_spawn(snapshot)
+}
+
+/// What [`queue_nonce_snapshot`] did with a snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueOutcome {
+    /// Equal to the newest in-flight-or-written snapshot, nothing pending: no-op.
+    Skipped,
+    /// Queued; `start_thread` when no flush thread is running yet.
+    Queued { start_thread: bool },
+}
+
+/// Put `snapshot` on `queue`: the pure, lock-scoped half of the enqueue.
+///
+/// Dedupes only against the NEWEST state that is in flight or written — the
+/// in-flight snapshot when a write is running, else `last_written` — and only
+/// when nothing newer is pending.
+fn queue_nonce_snapshot(
+    queue: &std::sync::Mutex<NoncePersistQueue>,
+    snapshot: NoncePersistSnapshot,
+) -> Option<QueueOutcome> {
+    let mut q = match queue.lock() {
+        Ok(q) => q,
+        Err(e) => {
+            warn!("coord_mcp: nonce persist queue poisoned ({e}) — nonces not persisted");
+            return None;
         }
-        q.pending = Some(snapshot);
-        // A newer snapshot supersedes whatever was failing — give it a full
-        // retry budget of its own.
-        q.failed_attempts = 0;
-        if q.flushing {
-            false
-        } else {
-            q.flushing = true;
-            true
-        }
     };
-    if !start_thread {
-        return; // an existing flush thread will pick the newer snapshot up
+    let newest_durable = q.in_flight.as_ref().or(q.last_written.as_ref());
+    if newest_durable == Some(&snapshot) && q.pending.is_none() {
+        return Some(QueueOutcome::Skipped);
+    }
+    q.pending = Some(snapshot);
+    // A newer snapshot supersedes whatever was failing — give it a full retry
+    // budget of its own.
+    q.failed_attempts = 0;
+    let start_thread = !q.flushing;
+    q.flushing = true;
+    Some(QueueOutcome::Queued { start_thread })
+}
+
+/// Queue `snapshot` on the global queue and start the flush thread if needed.
+/// Returns `true` when the thread could not be started and the caller must
+/// flush INLINE — deliberately returned rather than done here, because the
+/// registry-locked path ([`persist_live_nonce_state`]) must do that I/O after
+/// releasing its lock.
+fn queue_nonce_snapshot_and_spawn(snapshot: NoncePersistSnapshot) -> bool {
+    match queue_nonce_snapshot(&NONCE_PERSIST, snapshot) {
+        Some(QueueOutcome::Queued { start_thread: true }) => {}
+        _ => return false, // skipped, poisoned, or a running thread picks it up
     }
     let spawned = std::thread::Builder::new()
         .name("coord-mcp-nonce-persist".to_string())
         .spawn(flush_nonce_persist_loop);
-    if let Err(e) = spawned {
-        warn!("coord_mcp: could not start nonce persist thread ({e}) — persisting inline");
-        if let Ok(mut q) = NONCE_PERSIST.lock() {
-            q.flushing = false;
+    match spawned {
+        Ok(_) => false,
+        Err(e) => {
+            warn!("coord_mcp: could not start nonce persist thread ({e}) — persisting inline");
+            if let Ok(mut q) = NONCE_PERSIST.lock() {
+                q.flushing = false;
+            }
+            true
         }
-        flush_nonce_persist_once();
     }
 }
 
@@ -4271,7 +4360,10 @@ fn flush_nonce_persist_once_with(
     let _write_guard = write_lock.lock().unwrap_or_else(|e| e.into_inner());
     let snapshot = match queue.lock() {
         Ok(mut q) => match q.pending.take() {
-            Some(s) => s,
+            Some(s) => {
+                q.in_flight = Some(s.clone());
+                s
+            }
             None => return,
         },
         Err(_) => return,
@@ -4283,6 +4375,9 @@ fn flush_nonce_persist_once_with(
         let Ok(mut q) = queue.lock() else {
             return;
         };
+        // The failed write is no longer in flight; dedupe falls back to the
+        // last snapshot that actually landed.
+        q.in_flight = None;
         if q.pending.is_some() {
             return; // a newer snapshot already supersedes this one
         }
@@ -4299,6 +4394,7 @@ fn flush_nonce_persist_once_with(
     match write(&snapshot) {
         Ok(()) => {
             if let Ok(mut q) = queue.lock() {
+                q.in_flight = None;
                 q.last_written = Some(snapshot);
                 q.failed_attempts = 0;
             }
@@ -6684,6 +6780,11 @@ pub(crate) fn revoke_proxy_nonce(nonce: &str) {
     }
     if let Some(snapshot) = snapshot {
         persist_proxy_nonces(&snapshot);
+    } else if graced_removed {
+        // A grace-only revoke changed the persisted grace set too; without this
+        // the revoked grace entry would be restored at the next boot. The live
+        // registry is unchanged, so there is no agent census to take.
+        persist_live_nonce_state(nonce_persistence_enabled());
     }
 }
 
@@ -24116,20 +24217,31 @@ mod terminal_env_reference_tests {
     fn a_stale_clone_is_never_what_gets_enqueued() {
         let amb = crate::test_env::isolated_ambient();
         let wd = workdir(&amb, "stale-snapshot");
+        // Two real bindings, copied into a SMALL registry of this test's own —
+        // independent of how many bindings parallel tests hold in the global
+        // one (which the 256 cap would otherwise make order-sensitive).
         let revoked = register_proxy_nonce(&wd, None, None);
-        let stale: HashMap<String, NonceBinding> = proxy_nonces().lock().unwrap().clone();
-        assert!(stale.contains_key(&revoked));
-        revoke_proxy_nonce(&revoked);
         let kept = register_proxy_nonce(&wd, Some(&terminal()), None);
+        let binding = |n: &str| proxy_nonces().lock().unwrap().get(n).cloned().unwrap();
+        let registry = Mutex::new(HashMap::from([
+            (revoked.clone(), binding(&revoked)),
+            (kept.clone(), binding(&kept)),
+        ]));
+        revoke_proxy_nonce(&revoked);
+        revoke_proxy_nonce(&kept);
+
+        // A mint's clone taken BEFORE the revoke...
+        let stale = registry.lock().unwrap().clone();
+        assert!(stale.contains_key(&revoked));
+        // ...then the revoke lands in the registry.
+        registry.lock().unwrap().remove(&revoked);
 
         let mut captured = None;
         let mut lock_held = false;
-        // The production entry point takes the stale clone for the census; the
-        // enqueued content must come from the live registry.
-        note_agent_binding_census(&stale);
-        persist_live_nonce_state(true, |bindings| {
-            lock_held = proxy_nonces().try_lock().is_err();
-            captured = Some(bindings);
+        persist_live_nonce_state_in(&registry, true, |snapshot| {
+            lock_held = registry.try_lock().is_err();
+            captured = Some(snapshot);
+            false
         });
         let captured = captured.expect("enqueued");
         assert!(
@@ -24137,13 +24249,88 @@ mod terminal_env_reference_tests {
             "the enqueue runs while the registry lock is held"
         );
         assert!(
-            !captured.contains_key(&revoked),
+            !captured.bindings.contains_key(&revoked),
             "the revoked key is not resurrected"
         );
-        assert!(captured.contains_key(&kept));
+        assert!(captured.bindings.contains_key(&kept));
 
         let mut called = false;
-        persist_live_nonce_state(false, |_| called = true);
+        persist_live_nonce_state_in(&registry, false, |_| {
+            called = true;
+            false
+        });
         assert!(!called, "persistence off enqueues nothing");
+    }
+
+    /// Round 5 / item 1: a revoke back to the last WRITTEN state while a
+    /// write is in flight is not deduped away — the in-flight snapshot is the
+    /// dedupe reference — so the final written state excludes the revoked key.
+    #[test]
+    fn a_revoke_during_an_in_flight_write_is_not_deduped_away() {
+        let snap = |keys: &[&str]| NoncePersistSnapshot {
+            bindings: keys
+                .iter()
+                .map(|k| {
+                    (
+                        k.to_string(),
+                        crate::secure_storage::StoredNonceBinding::default(),
+                    )
+                })
+                .collect(),
+            graced: HashMap::new(),
+        };
+        let s1 = snap(&["a"]);
+        let queue = std::sync::Arc::new(Mutex::new(NoncePersistQueue {
+            last_written: Some(s1.clone()),
+            ..Default::default()
+        }));
+        let write_lock = std::sync::Arc::new(Mutex::new(()));
+        let written = std::sync::Arc::new(Mutex::new(Vec::<NoncePersistSnapshot>::new()));
+
+        // Mint b: S2 = {a, b} queued.
+        assert_eq!(
+            queue_nonce_snapshot(&queue, snap(&["a", "b"])),
+            Some(QueueOutcome::Queued { start_thread: true })
+        );
+        // Take S2 and stall inside its write.
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (q, l, w) = (queue.clone(), write_lock.clone(), written.clone());
+        let writer = std::thread::spawn(move || {
+            flush_nonce_persist_once_with(&q, &l, |s| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                w.lock().unwrap().push(s.clone());
+                Ok(())
+            });
+        });
+        started_rx.recv().unwrap();
+        // Revoke b: S3 = {a} == last_written S1. Must be QUEUED, not skipped.
+        assert_eq!(
+            queue_nonce_snapshot(&queue, snap(&["a"])),
+            Some(QueueOutcome::Queued {
+                start_thread: false
+            })
+        );
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        // The flush thread would now take S3.
+        let w = written.clone();
+        flush_nonce_persist_once_with(&queue, &write_lock, |s| {
+            w.lock().unwrap().push(s.clone());
+            Ok(())
+        });
+
+        let written = written.lock().unwrap();
+        assert_eq!(written.len(), 2);
+        let last = written.last().unwrap();
+        assert!(!last.bindings.contains_key("b"), "b must not resurrect");
+        assert_eq!(queue.lock().unwrap().last_written.as_ref(), Some(&s1));
+        assert!(queue.lock().unwrap().in_flight.is_none());
+        // With nothing in flight, an unchanged snapshot is still deduped.
+        assert_eq!(
+            queue_nonce_snapshot(&queue, s1),
+            Some(QueueOutcome::Skipped)
+        );
     }
 }
