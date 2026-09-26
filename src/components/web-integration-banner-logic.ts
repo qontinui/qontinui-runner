@@ -513,10 +513,10 @@ export function makeRePairClickHandler(
  * rather than at the next cadence.
  *
  * It deliberately does NOT re-read the posture: the kick is fire-and-forget,
- * so an immediate read returns the PRE-switch status, and because IPC replies
- * are not ordered against events it can land after — and overwrite — the
- * kicked pass's own event. The banner is updated by that event instead (a
- * same-posture tenant change is re-announced as a detail transition).
+ * so an immediate read returns the PRE-switch status, and applying it could
+ * overwrite the kicked pass's own event if that event arrived first. The
+ * banner is updated by that event instead (a same-posture tenant change is
+ * re-announced as a detail transition).
  * `onPinned` runs before the kick so a kick failure is never shown as a
  * failed switch. Extracted so the order is unit-testable in node.
  */
