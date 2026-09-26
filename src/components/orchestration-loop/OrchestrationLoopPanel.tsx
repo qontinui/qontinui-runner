@@ -15,6 +15,15 @@ import {
   ChevronRight,
 } from "lucide-react";
 import { MultiLoopPanel } from "./MultiLoopPanel";
+import {
+  GatedStartButton,
+  RestartCapabilityNotice,
+  betweenToWire,
+  defaultBetween,
+  restoreBetween,
+  startBlockedReason,
+  useRestartCapability,
+} from "./restartCapability";
 
 // --- Types matching the Rust backend ---
 
@@ -60,9 +69,10 @@ interface RunnerInstance {
    * Instances), `"discovered"` for runners that exist only in the DB
    * registry (e.g. supervisor-spawned children that registered themselves
    * but were never saved as a slot). Optional for backward compatibility
-   * with older runner builds.
+   * with older runner builds. `"supervisor"` is set by the picker itself for
+   * a row only the dev supervisor's `/runners` reported.
    */
-  source?: "configured" | "discovered";
+  source?: "configured" | "discovered" | "supervisor";
 }
 
 /** Subset of supervisor `/runners` rows the picker actually consumes. */
@@ -229,7 +239,9 @@ export function OrchestrationLoopPanel() {
   // null = unlimited; loop exits on success/stop, not iteration count.
   const [maxIter, setMaxIter] = useState<number | null>(null);
   const [exitStrategy, setExitStrategy] = useState("reflection");
-  const [between, setBetween] = useState("restart_on_signal");
+  // The default target is this runner, which no restart mode can restart
+  // (it would end the loop) — so a fresh form starts on Wait Healthy.
+  const [between, setBetween] = useState(() => defaultBetween(true));
   const [buildDesc, setBuildDesc] = useState("");
   const [buildContext, setBuildContext] = useState("");
   const [enableFixes, setEnableFixes] = useState(true);
@@ -289,7 +301,9 @@ export function OrchestrationLoopPanel() {
     setSupervisorPort(s.supervisorPort || "9875");
     setMaxIter(s.maxIter ?? null);
     setExitStrategy(s.exitStrategy || "reflection");
-    setBetween(s.between || "restart_on_signal");
+    // A saved value is restored verbatim — if the capability check refuses
+    // it, the reason is shown under the select rather than rewriting it.
+    setBetween(restoreBetween(s.between, !s.targetPort));
     setBuildDesc(s.buildDesc || "");
     setBuildContext(s.buildContext || "");
     setEnableFixes(s.enableFixes ?? true);
@@ -350,43 +364,45 @@ export function OrchestrationLoopPanel() {
   }, []);
 
   const loadRunnerInstances = useCallback(async () => {
-    // Source of truth is the supervisor's /runners endpoint — it lists
-    // every actually-running instance (primary + supervised children +
-    // self-registered with a live heartbeat) by their canonical names,
-    // and matches the supervisor dashboard exactly. Stale settings slots
-    // and dead DB rows aren't represented, which is what we want for a
-    // target picker.
-    try {
-      const portStr = supervisorPort.trim() || "9875";
-      const resp = await fetch(`http://localhost:${portStr}/runners`);
-      if (!resp.ok) throw new Error(`supervisor /runners: HTTP ${resp.status}`);
-      const all: SupervisorRunner[] = await resp.json();
-      const ownPort = ownPortRef.current;
-      const active: RunnerInstance[] = all
-        .filter((r) => r.running && r.port !== ownPort)
-        .map((r) => ({
-          id: r.id,
-          name: r.name,
-          port: r.port,
-          running: r.running,
-          pid: r.pid,
-          api_ready: r.api_responding,
-        }));
-      setRunnerInstances(active);
-      return;
-    } catch {
-      // Supervisor unreachable — fall through to the Tauri command. The
-      // fallback is less accurate (it merges settings.json with the DB
-      // registry), but better than rendering an empty picker when the
-      // user is running the runner standalone (no supervisor).
-    }
-
+    // Runner-owned truth FIRST: `get_runner_instances` is this runner's own
+    // view (settings slots + DB registry, each probed live), and it is the
+    // only source a published install has. The dev supervisor's `/runners`
+    // is merged AFTER as a supplement — it can add rows a dev box's
+    // supervisor spawned, but never replaces or renames a runner-owned row
+    // (supervisor ids and settings-slot ids are different namespaces).
+    const ownPort = ownPortRef.current;
+    let owned: RunnerInstance[] = [];
     try {
       const instances = await invoke<RunnerInstance[]>("get_runner_instances");
-      setRunnerInstances(instances.filter((i) => i.running));
+      owned = instances.filter((i) => i.running && i.port !== ownPort);
     } catch {
-      /* both sources down — leave list empty */
+      /* runner-owned list unavailable — the supplement may still answer */
     }
+
+    let supplement: RunnerInstance[] = [];
+    try {
+      const portStr = supervisorPort.trim() || "9875";
+      const resp = await fetch(`http://127.0.0.1:${portStr}/runners`);
+      if (resp.ok) {
+        const all: SupervisorRunner[] = await resp.json();
+        const ownedPorts = new Set(owned.map((r) => r.port));
+        supplement = all
+          .filter((r) => r.running && r.port !== ownPort && !ownedPorts.has(r.port))
+          .map((r) => ({
+            id: r.id,
+            name: r.name,
+            port: r.port,
+            running: r.running,
+            pid: r.pid,
+            api_ready: r.api_responding,
+            source: "supervisor" as const,
+          }));
+      }
+    } catch {
+      /* no dev supervisor — the normal case for a published install */
+    }
+
+    setRunnerInstances([...owned, ...supplement]);
   }, [supervisorPort]);
 
   useEffect(() => {
@@ -474,15 +490,17 @@ export function OrchestrationLoopPanel() {
 
   // --- Start/Stop/Signal ---
 
-  const buildBetween = (): { type: string; rebuild?: boolean } => {
-    if (between === "restart_on_signal") return { type: "restart_on_signal", rebuild: true };
-    if (between === "restart_on_signal_no_rebuild")
-      return { type: "restart_on_signal", rebuild: false };
-    if (between === "restart_runner") return { type: "restart_runner", rebuild: true };
-    if (between === "restart_runner_no_rebuild") return { type: "restart_runner", rebuild: false };
-    if (between === "wait_healthy") return { type: "wait_healthy" };
-    return { type: "none" };
-  };
+  const buildBetween = () => betweenToWire(between);
+
+  // Pre-start restart capability: re-asked (debounced) whenever the target,
+  // the between mode or the supervisor port changes.
+  const restartCapability = useRestartCapability({
+    target_runner_port: targetPort ? parseInt(targetPort) : null,
+    target_runner_id: targetRunnerId || null,
+    supervisor_port: parseInt(supervisorPort) || 9875,
+    between_iterations: betweenToWire(between),
+  });
+  const startBlocked = startBlockedReason(restartCapability);
 
   const handleStart = async () => {
     setError(null);
@@ -678,13 +696,12 @@ export function OrchestrationLoopPanel() {
               Stop
             </button>
           ) : (
-            <button
+            <GatedStartButton
               onClick={handleStart}
-              className="px-2.5 py-1 text-xs font-medium rounded bg-primary/15 text-primary hover:bg-primary/25"
-            >
-              <Play className="w-3 h-3 inline mr-1" />
-              Run Loop
-            </button>
+              blockedReason={startBlocked}
+              label="Run Loop"
+              icon={<Play className="w-3 h-3 inline mr-1" />}
+            />
           )}
         </div>
       </div>
@@ -871,22 +888,29 @@ export function OrchestrationLoopPanel() {
                       Pipeline
                     </label>
                   </div>
-                  <div className="flex items-center gap-1.5">
-                    <span className={labelCls}>Between</span>
-                    <select
-                      aria-label="Between iterations"
-                      value={between}
-                      onChange={(e) => setBetween(e.target.value)}
-                      className={cn(inputCls, "w-auto [&>option]:text-black [&>option]:bg-white")}
-                      style={{ colorScheme: "dark" }}
-                    >
-                      <option value="restart_on_signal">Signal (rebuild)</option>
-                      <option value="restart_on_signal_no_rebuild">Signal (no rebuild)</option>
-                      <option value="restart_runner">Always (rebuild)</option>
-                      <option value="restart_runner_no_rebuild">Always (no rebuild)</option>
-                      <option value="wait_healthy">Wait Healthy</option>
-                      <option value="none">None</option>
-                    </select>
+                  <div className="flex flex-col gap-0.5">
+                    <div className="flex items-center gap-1.5">
+                      <span className={labelCls}>Between</span>
+                      <select
+                        aria-label="Between iterations"
+                        value={between}
+                        onChange={(e) => setBetween(e.target.value)}
+                        className={cn(inputCls, "w-auto [&>option]:text-black [&>option]:bg-white")}
+                        style={{ colorScheme: "dark" }}
+                      >
+                        <option value="restart_on_signal">Signal (rebuild)</option>
+                        <option value="restart_on_signal_no_rebuild">Signal (no rebuild)</option>
+                        <option value="restart_runner">Always (rebuild)</option>
+                        <option value="restart_runner_no_rebuild">Always (no rebuild)</option>
+                        <option value="wait_healthy">Wait Healthy</option>
+                        <option value="none">None</option>
+                      </select>
+                    </div>
+                    <RestartCapabilityNotice
+                      state={restartCapability}
+                      className="max-w-[420px]"
+                      testId="ol-restart-capability"
+                    />
                   </div>
                   <div className="flex items-center gap-1.5">
                     <span className={labelCls}>Max</span>
@@ -924,6 +948,7 @@ export function OrchestrationLoopPanel() {
                         <option key={inst.id} value={inst.id}>
                           {inst.name} (:{inst.port}){inst.running ? "" : " [stopped]"}
                           {inst.source === "discovered" ? " (discovered)" : ""}
+                          {inst.source === "supervisor" ? " (dev supervisor)" : ""}
                         </option>
                       ))}
                     </select>
@@ -971,6 +996,26 @@ export function OrchestrationLoopPanel() {
                     </span>
                   </label>
                 </div>
+
+                <details className="text-xs" data-tutorial-id="ol-advanced-dev">
+                  <summary className="cursor-pointer text-muted-foreground select-none">
+                    Advanced (dev)
+                  </summary>
+                  <div className="mt-2 flex items-center gap-1.5 flex-wrap">
+                    <span className={labelCls}>Supervisor port</span>
+                    <input
+                      type="text"
+                      aria-label="Supervisor port"
+                      value={supervisorPort}
+                      onChange={(e) => setSupervisorPort(e.target.value)}
+                      className={cn(inputCls, "w-20 text-center")}
+                    />
+                    <span className="text-muted-foreground/60 text-[0.7rem]">
+                      — Only matters for the rebuild modes, which need a dev supervisor with a
+                      source checkout. Plain restarts of runner-managed instances never use it.
+                    </span>
+                  </div>
+                </details>
 
                 {mode === "simple" ? (
                   <div className="flex items-center gap-4 flex-wrap">

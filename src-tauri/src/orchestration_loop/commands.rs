@@ -2,13 +2,29 @@
 
 use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tauri::State;
 
 use crate::commands::AppState;
+use crate::instance_manager::InstanceManager;
 
 use super::loop_engine;
+use super::restart_path::{self, LoopHost};
 use super::types::*;
+
+/// The restart host for a loop started from the UI: this runner's instance
+/// manager (its own managed state, not a field of `AppState`), the AppHandle so
+/// a relaunched slot keeps its `spawn_placement`, and the bound API port.
+fn loop_host(
+    state: &AppState,
+    instance_manager: &Arc<InstanceManager>,
+    app_handle: tauri::AppHandle,
+) -> LoopHost {
+    LoopHost::new(
+        instance_manager.clone(),
+        Some(app_handle),
+        state.api_port.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
 
 // --- Backwards-compatible single-loop commands (use default loop ID) ---
 
@@ -17,8 +33,27 @@ use super::types::*;
 pub async fn start_orchestration_loop(
     config: OrchestrationLoopConfig,
     state: State<'_, Arc<AppState>>,
+    instance_manager: State<'_, Arc<InstanceManager>>,
+    app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
-    loop_engine::start_loop_compat(state.orchestration_loops.clone(), config).await
+    let host = loop_host(&state, &instance_manager, app_handle);
+    loop_engine::start_loop_compat(state.orchestration_loops.clone(), config, &host)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Read-only: can `config`'s between-iterations mode restart its target
+/// here, and by which path? Starts nothing. The UI calls this whenever the
+/// target or mode changes and gates Start on `supported`.
+#[tauri::command]
+pub async fn orchestration_loop_restart_capability(
+    config: OrchestrationLoopConfig,
+    state: State<'_, Arc<AppState>>,
+    instance_manager: State<'_, Arc<InstanceManager>>,
+    app_handle: tauri::AppHandle,
+) -> Result<RestartCapability, String> {
+    let host = loop_host(&state, &instance_manager, app_handle);
+    Ok(restart_path::restart_capability(&config, &host).await)
 }
 
 /// Stop the orchestration loop (single-loop, backwards-compatible).
@@ -48,8 +83,13 @@ pub async fn signal_orchestration_restart(state: State<'_, Arc<AppState>>) -> Re
 pub async fn start_multi_orchestration_loop(
     config: MultiLoopConfig,
     state: State<'_, Arc<AppState>>,
+    instance_manager: State<'_, Arc<InstanceManager>>,
+    app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
-    loop_engine::start_multi_loop(state.orchestration_loops.clone(), config).await
+    let host = loop_host(&state, &instance_manager, app_handle);
+    loop_engine::start_multi_loop(state.orchestration_loops.clone(), config, &host)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Stop a specific orchestration loop by ID.
@@ -179,7 +219,10 @@ pub async fn list_orchestration_runs(
 }
 
 /// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+///
+/// Concrete over `tauri::Wry` because the loop-start commands take a
+/// `tauri::AppHandle` (the default runtime) to pass to instance relaunches.
+pub fn plugin() -> TauriPlugin<tauri::Wry> {
     PluginBuilder::new("qontinui_orchestration_loop_commands")
         .invoke_handler(tauri::generate_handler![
             start_orchestration_loop,
@@ -191,6 +234,7 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             stop_all_orchestration_loops,
             get_multi_orchestration_loop_status,
             signal_orchestration_restart_by_id,
+            orchestration_loop_restart_capability,
         ])
         .build()
 }

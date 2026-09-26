@@ -1,4 +1,4 @@
-//! Tauri commands for managing runner instances (dev feature).
+//! Tauri commands for managing runner instances.
 
 use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};

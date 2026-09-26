@@ -10,7 +10,37 @@ use axum::{
 use std::sync::Arc;
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use crate::orchestration_loop::loop_engine::LoopStartError;
+use crate::orchestration_loop::restart_path::{self, LoopHost};
 use crate::orchestration_loop::{loop_engine, types::*};
+
+/// The restart host for a loop started over HTTP: the runner's instance
+/// manager, its AppHandle (so a relaunched slot keeps its `spawn_placement`)
+/// and the bound API port.
+fn loop_host(state: &ApiState) -> LoopHost {
+    LoopHost::new(
+        state.instance_manager.clone(),
+        Some(state.app_handle.clone()),
+        state
+            .app_state
+            .api_port
+            .load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// The 409 for a refused start. An unsupported restart mode carries its typed
+/// code in `code` (the `RestartUnsupportedCode` wire token, e.g.
+/// `target_is_orchestrator`) and its message begins `unsupported here: `.
+fn start_refusal(context: &str, e: LoopStartError) -> (StatusCode, Json<ApiResponse<()>>) {
+    let mut body = match &e {
+        LoopStartError::Unsupported { .. } => api_error(e.to_string()),
+        LoopStartError::Refused(_) => api_error(format!("{context}: {e}")),
+    };
+    body.code = e
+        .code()
+        .map(|code| restart_path::code_token(code).to_string());
+    (StatusCode::CONFLICT, Json(body))
+}
 
 // --- Backwards-compatible single-loop endpoints (use default loop ID) ---
 
@@ -20,15 +50,11 @@ async fn start(
     Json(config): Json<OrchestrationLoopConfig>,
 ) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<()>>)> {
     let states = state.app_state.orchestration_loops.clone();
+    let host = loop_host(&state);
 
-    loop_engine::start_loop_compat(states, config)
+    loop_engine::start_loop_compat(states, config, &host)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::CONFLICT,
-                Json(api_error(format!("Failed to start loop: {}", e))),
-            )
-        })?;
+        .map_err(|e| start_refusal("Failed to start loop", e))?;
 
     Ok(Json(ApiResponse::success("started".to_string())))
 }
@@ -74,6 +100,22 @@ async fn signal_restart(
     Ok(Json(ApiResponse::success("restart signaled".to_string())))
 }
 
+/// POST /orchestration-loop/restart-capability
+///
+/// Read-only preflight: resolves how the posted config's between-iterations
+/// mode would restart its target, without starting anything. Always 200 — an
+/// unsupported mode is a verdict (`supported: false` + `code` + `reason`), not
+/// an error.
+async fn restart_capability(
+    State(state): State<Arc<ApiState>>,
+    Json(config): Json<OrchestrationLoopConfig>,
+) -> Json<ApiResponse<RestartCapability>> {
+    let host = loop_host(&state);
+    Json(ApiResponse::success(
+        restart_path::restart_capability(&config, &host).await,
+    ))
+}
+
 // --- Multi-loop endpoints ---
 
 /// POST /orchestration-loop/start-multi
@@ -82,15 +124,11 @@ async fn start_multi(
     Json(config): Json<MultiLoopConfig>,
 ) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<()>>)> {
     let states = state.app_state.orchestration_loops.clone();
+    let host = loop_host(&state);
 
-    loop_engine::start_multi_loop(states, config)
+    loop_engine::start_multi_loop(states, config, &host)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::CONFLICT,
-                Json(api_error(format!("Failed to start multi-loop: {}", e))),
-            )
-        })?;
+        .map_err(|e| start_refusal("Failed to start multi-loop", e))?;
 
     Ok(Json(ApiResponse::success("multi-loop started".to_string())))
 }
@@ -175,6 +213,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/orchestration-loop/stop", post(stop))
         .route("/orchestration-loop/status", get(status))
         .route("/orchestration-loop/signal-restart", post(signal_restart))
+        .route(
+            "/orchestration-loop/restart-capability",
+            post(restart_capability),
+        )
         // Multi-loop routes
         .route("/orchestration-loop/start-multi", post(start_multi))
         .route("/orchestration-loop/stop-all", post(stop_all))
@@ -184,4 +226,42 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/orchestration-loop/{loop_id}/signal-restart",
             post(signal_restart_by_id),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::orchestration_loop::restart_path::RestartUnsupported;
+
+    #[test]
+    fn an_unsupported_start_is_a_409_carrying_the_typed_code() {
+        let (status, Json(body)) = start_refusal(
+            "Failed to start loop",
+            LoopStartError::Unsupported {
+                loop_id: None,
+                unsupported: RestartUnsupported {
+                    code: RestartUnsupportedCode::TargetIsOrchestrator,
+                    reason: "restarting it would end the loop".into(),
+                },
+            },
+        );
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.code.as_deref(), Some("target_is_orchestrator"));
+        let msg = body.error.unwrap();
+        assert!(msg.starts_with("unsupported here: target_is_orchestrator: "), "{msg}");
+    }
+
+    #[test]
+    fn any_other_refusal_keeps_its_context_and_carries_no_code() {
+        let (status, Json(body)) = start_refusal(
+            "Failed to start multi-loop",
+            LoopStartError::Refused("No loops configured".into()),
+        );
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.code, None);
+        assert_eq!(
+            body.error.as_deref(),
+            Some("Failed to start multi-loop: No loops configured")
+        );
+    }
 }
