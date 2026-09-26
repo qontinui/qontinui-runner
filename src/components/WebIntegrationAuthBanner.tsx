@@ -39,6 +39,7 @@ import { useUIElement } from "@qontinui/ui-bridge";
 import { AlertCircle, X } from "lucide-react";
 
 import { useRunnerTier } from "@/hooks/useRunnerTier";
+import { useTenant } from "@/contexts/TenantContext";
 
 import {
   applyCredentialDarkSignal,
@@ -46,12 +47,14 @@ import {
   credentialDarkPresentation,
   effectiveCredentialDark,
   GET_COORD_CREDENTIAL_POSTURE_CMD,
+  KICK_DEVICE_JWT_REFRESHER_CMD,
   makeRePairClickHandler,
   normalizeCredentialDarkSignal,
   RE_PAIR_CTA_GRACE_MS,
   shouldShowAuthBanner,
   shouldShowRePairCta,
   statusSignature,
+  SWITCH_TENANT_LABEL,
   type AuthBannerStatus,
   type CredentialDarkSignal,
 } from "./web-integration-banner-logic";
@@ -141,6 +144,22 @@ export function WebIntegrationAuthBanner() {
   >({});
   const credentialDark = effectiveCredentialDark(credentialDarkBySource);
 
+  // Plan 2026-09-14-credential-posture-third-residuals Phase 3: the tenant
+  // switch for a pinned tenant this runner holds no credential for. It is the
+  // EXISTING re-pin (`set_active_tenant`, via TenantContext) behind an explicit
+  // operator pick from this device's bound tenants — never a guessed tenant.
+  // Offered only when `showSwitcher` (more than one binding), so a
+  // single-tenant box never sees a second button that could not act.
+  const {
+    showSwitcher,
+    candidates: tenantCandidates,
+    defaultTenantIdForNewSessions,
+    setDefaultTenantForNewSessions,
+  } = useTenant();
+  const [tenantSwitcherOpen, setTenantSwitcherOpen] = useState(false);
+  const [switchingTenant, setSwitchingTenant] = useState(false);
+  const [switchTenantError, setSwitchTenantError] = useState<string | null>(null);
+
   const { ref: rootRef } = useUIElement({
     id: "web-integration-banner",
     label: "Web integration authorization banner",
@@ -159,6 +178,11 @@ export function WebIntegrationAuthBanner() {
   const { ref: rePairButtonRef } = useUIElement({
     id: "web-integration-banner-re-pair",
     label: "Retry device re-pair manually",
+    type: "button",
+  });
+  const { ref: switchTenantButtonRef } = useUIElement({
+    id: "web-integration-banner-switch-tenant",
+    label: "Switch this runner's active tenant",
     type: "button",
   });
 
@@ -363,6 +387,27 @@ export function WebIntegrationAuthBanner() {
     }
   }, [backendUrl]);
 
+  // The operator picked `tenantId` in the switcher. Re-pin (machine.json,
+  // future sessions only — running sessions keep their tenant), then kick the
+  // refresher so the posture is re-derived against the new pin now rather than
+  // at the next cadence.
+  const handleSwitchTenant = useCallback(
+    async (tenantId: string) => {
+      setSwitchingTenant(true);
+      setSwitchTenantError(null);
+      try {
+        await setDefaultTenantForNewSessions(tenantId);
+        setTenantSwitcherOpen(false);
+        await invoke<void>(KICK_DEVICE_JWT_REFRESHER_CMD, {});
+      } catch (err) {
+        setSwitchTenantError(String(err));
+      } finally {
+        setSwitchingTenant(false);
+      }
+    },
+    [setDefaultTenantForNewSessions],
+  );
+
   const handleDismiss = useCallback(() => {
     // `deviceJwtPresent !== false` treats the not-yet-loaded (null) state as
     // paired so a paired runner never flashes the banner while the
@@ -395,9 +440,11 @@ export function WebIntegrationAuthBanner() {
   // defect this banner closes, so it is not dismissable and it renders the
   // CAUSE rather than one generic sentence.
   if (credentialDark?.dark) {
-    const presentation = credentialDarkPresentation(credentialDark);
+    const presentation = credentialDarkPresentation(credentialDark, undefined, showSwitcher);
     const busy = presentation.ctaAction === "cognito_sign_in" ? authorizing : reKicking;
-    const ctaError = presentation.ctaAction === "cognito_sign_in" ? authorizeError : reKickError;
+    const ctaError =
+      (presentation.ctaAction === "cognito_sign_in" ? authorizeError : reKickError) ??
+      (presentation.showSwitchTenant ? switchTenantError : null);
     return (
       <div
         ref={rootRef}
@@ -438,6 +485,41 @@ export function WebIntegrationAuthBanner() {
               </>
             ) : null}
           </div>
+          {presentation.showSwitchTenant && tenantSwitcherOpen ? (
+            <div
+              role="group"
+              aria-label="Choose this runner's active tenant"
+              style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 6 }}
+            >
+              {tenantCandidates.map((candidate) => {
+                const current = candidate === defaultTenantIdForNewSessions;
+                return (
+                  <button
+                    key={candidate}
+                    type="button"
+                    title={candidate}
+                    disabled={switchingTenant || current}
+                    onClick={() => {
+                      void handleSwitchTenant(candidate);
+                    }}
+                    style={{
+                      background: "transparent",
+                      color: "inherit",
+                      border: "1px solid var(--border, #3f3f46)",
+                      borderRadius: 4,
+                      padding: "2px 8px",
+                      fontSize: "0.75rem",
+                      fontFamily: "monospace",
+                      cursor: switchingTenant || current ? "default" : "pointer",
+                      opacity: current ? 0.6 : 1,
+                    }}
+                  >
+                    {current ? `${candidate} (current)` : candidate}
+                  </button>
+                );
+              })}
+            </div>
+          ) : null}
         </div>
         {presentation.ctaAction ? (
           <button
@@ -463,6 +545,28 @@ export function WebIntegrationAuthBanner() {
             }}
           >
             {busy ? "Working…" : presentation.ctaLabel}
+          </button>
+        ) : null}
+        {presentation.showSwitchTenant ? (
+          <button
+            ref={switchTenantButtonRef}
+            type="button"
+            aria-expanded={tenantSwitcherOpen}
+            onClick={() => setTenantSwitcherOpen((open) => !open)}
+            disabled={switchingTenant}
+            style={{
+              background: "transparent",
+              color: "inherit",
+              border: "1px solid var(--accent, #6366f1)",
+              borderRadius: 4,
+              padding: "4px 10px",
+              fontSize: "0.8125rem",
+              fontWeight: 600,
+              cursor: switchingTenant ? "wait" : "pointer",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {switchingTenant ? "Switching…" : SWITCH_TENANT_LABEL}
           </button>
         ) : null}
       </div>
