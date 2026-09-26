@@ -298,6 +298,8 @@ fn common_dir_at(holder: &Path) -> Option<PathBuf> {
     if let Ok(commondir) = std::fs::read_to_string(gitdir.join("commondir")) {
         return Some(gitdir.join(commondir.trim()));
     }
+    // A heuristic, only for a gitdir with no `commondir` file: git itself
+    // writes one for every linked worktree, so this arm is a fallback.
     let parent = gitdir.parent()?;
     if parent.file_name().is_some_and(|n| n == "worktrees") {
         return parent.parent().map(Path::to_path_buf);
@@ -366,6 +368,29 @@ pub(crate) mod test_support {
     use std::path::Path;
     use std::process::{Command, Stdio};
 
+    /// A `git -C <dir>` command isolated from the environment the test runs in,
+    /// mirroring the production probe: the repo-selecting variables are
+    /// removed, so a `cargo test` run under a git hook or `git rebase -x` (which
+    /// export `GIT_DIR`) cannot make a fixture's `add`/`commit` land in the
+    /// OUTER repository; and no hook or commit signing configured for the user
+    /// runs against a tempdir fixture.
+    pub(crate) fn git(dir: &Path) -> Command {
+        let mut cmd = Command::new("git");
+        cmd.env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .arg("-C")
+            .arg(dir);
+        cmd
+    }
+
     /// Initialise a real repo in `dir` (quiet, no global config dependence).
     pub(crate) fn git_init(dir: &Path) {
         for args in [
@@ -373,9 +398,7 @@ pub(crate) mod test_support {
             vec!["config", "user.email", "t@example.com"],
             vec!["config", "user.name", "t"],
         ] {
-            let ok = Command::new("git")
-                .arg("-C")
-                .arg(dir)
+            let ok = git(dir)
                 .args(&args)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -387,9 +410,7 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn git_add(dir: &Path, path: &Path) {
-        let ok = Command::new("git")
-            .arg("-C")
-            .arg(dir)
+        let ok = git(dir)
             .arg("add")
             .arg("--")
             .arg(path)
@@ -408,9 +429,7 @@ pub(crate) mod test_support {
     /// decay into a duplicate of the untracked-file test and still pass, leaving
     /// the arm it names unverified.
     pub(crate) fn assert_not_in_any_repo(dir: &Path) {
-        let inside = Command::new("git")
-            .arg("-C")
-            .arg(dir)
+        let inside = git(dir)
             .arg("rev-parse")
             .arg("--is-inside-work-tree")
             .stdout(Stdio::null())

@@ -265,9 +265,7 @@ mod tests {
     }
 
     fn git(dir: &Path, args: &[&str]) {
-        let ok = std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
+        let ok = crate::provision_guard::test_support::git(dir)
             .args(args)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -285,19 +283,7 @@ mod tests {
         crate::provision_guard::test_support::git_init(repo);
         std::fs::write(agents.join("code-reviewer.md"), "# committed reviewer").unwrap();
         git(repo, &["add", "--", ".claude"]);
-        git(
-            repo,
-            &[
-                "-c",
-                "commit.gpgsign=false",
-                "-c",
-                "core.hooksPath=/dev/null",
-                "commit",
-                "--quiet",
-                "-m",
-                "seed",
-            ],
-        );
+        git(repo, &["commit", "--quiet", "-m", "seed"]);
         git(
             repo,
             &[
