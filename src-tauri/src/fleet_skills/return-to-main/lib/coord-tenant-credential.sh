@@ -181,11 +181,13 @@ print(json.dumps(b))' | tr -d '\r')"
 _ctc_mark() { [ "$1" = 000 ] && : > "$CTC_TMP/ctc.transport"; return 0; }
 
 _ctc_token_facts() { # <mint-body-file> -> "<token> <exp> <tenant_id>" (any may be empty)
-  "${CTC_PY:-python3}" - "$1" <<'PY' 2>/dev/null | tr -d '\r' || true
-import base64, json, sys
+  # The BODY rides the environment, never a path: a native Windows Python
+  # cannot open an MSYS /tmp/... path, which read every mint as "no token".
+  H_BODY="$(cat "$1" 2>/dev/null)" "${CTC_PY:-python3}" - <<'PY' 2>/dev/null | tr -d '\r' || true
+import base64, json, os, sys
 tok, e, t = "", "", ""
 try:
-    d = json.load(open(sys.argv[1]))
+    d = json.loads(os.environ.get("H_BODY") or "")
     if isinstance(d, dict):
         for k in ("token", "agent_jwt", "jwt", "access_token"):  # envelope-ok: the spellings coord-revive L5 reads
             v = d.get(k)
@@ -203,10 +205,10 @@ PY
 }
 
 _ctc_token_of() { # <mint-body-file> -> the token, or nothing
-  "${CTC_PY:-python3}" - "$1" <<'PY' 2>/dev/null | tr -d '\r[:space:]' || true
-import json, sys
+  H_BODY="$(cat "$1" 2>/dev/null)" "${CTC_PY:-python3}" - <<'PY' 2>/dev/null | tr -d '\r[:space:]' || true
+import json, os, sys
 try:
-    d = json.load(open(sys.argv[1]))
+    d = json.loads(os.environ.get("H_BODY") or "")
 except Exception:
     sys.exit(0)
 if isinstance(d, dict):
@@ -304,10 +306,10 @@ ctc_bindings() {
   _ctc_mark "${code:-000}"
   [ "${code:-000}" = 000 ] && _CTC_BINDINGS_TRANSPORT=1
   if [ "$code" != 200 ]; then CTC_BINDINGS_NOTE="POST /mcp coord_query_identity answered HTTP ${code:-000}"; return 0; fi
-  out="$("${CTC_PY:-python3}" - "$CTC_TMP/ctc.ident.json" <<'PY' 2>/dev/null | tr -d '\r'
-import json, sys
+  out="$(H_BODY="$(cat "$CTC_TMP/ctc.ident.json" 2>/dev/null)" "${CTC_PY:-python3}" - <<'PY' 2>/dev/null | tr -d '\r'
+import json, os, sys
 try:
-    d = json.load(open(sys.argv[1]))
+    d = json.loads(os.environ.get("H_BODY") or "")
     r = d["result"]  # envelope-ok: JSON-RPC result of POST /mcp tools/call
     s = r.get("structuredContent")
     if not isinstance(s, dict):
