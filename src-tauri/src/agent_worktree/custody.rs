@@ -209,8 +209,89 @@ fn read_bounded(path: &Path, max: u64) -> Option<String> {
 /// path. No subprocess, ever.
 pub fn read_custody(worktree: &Path) -> Option<CustodyRecord> {
     let git_dir = git_dir_for(worktree)?;
-    let raw = read_bounded(&git_dir.join(CUSTODY_FILE), 64 * 1024)?;
+    let raw = read_bounded(&git_dir.join(CUSTODY_FILE), CUSTODY_MAX_BYTES)?;
     serde_json::from_str::<CustodyRecord>(&raw).ok()
+}
+
+/// Upper bound on one custody record, mirror or slot alike.
+const CUSTODY_MAX_BYTES: u64 = 64 * 1024;
+
+/// Directory inside `$GIT_DIR` holding ONE custody record per session
+/// (`<safe-session-id>.json`), written by the `Stop` hook since 2026-09-04.
+/// [`CUSTODY_FILE`] is only a byte-identical copy of the NEWEST slot.
+pub const CUSTODY_SLOT_DIR: &str = "qontinui-custody.d";
+
+/// At most this many slots are reported per worktree. Slots are never pruned
+/// by the hook, so an old shared checkout accumulates one per session that
+/// ever touched it; the newest are the ones a "who else is here?" consumer
+/// needs, and the census body must not grow without bound.
+pub const CUSTODY_MAX_SLOTS: usize = 64;
+
+/// At most this many slot files are PARSED per worktree, pre-selected by file
+/// mtime (the hook rewrites a slot every turn, so mtime tracks `last_seen`).
+/// Keeps a directory holding thousands of dead slots from turning the census
+/// walk into thousands of reads per worktree.
+const CUSTODY_MAX_SLOT_SCAN: usize = 4 * CUSTODY_MAX_SLOTS;
+
+/// Read EVERY per-session custody slot for `worktree`, newest first.
+///
+/// ## Why the mirror is not enough
+///
+/// [`read_custody`] reads `$GIT_DIR/qontinui-custody.json`, which the hook
+/// keeps as a copy of whichever slot was written LAST. Two sessions cohabiting
+/// a shared checkout therefore collapse on the mirror to whoever took the
+/// latest turn — and "who ELSE is here?" is exactly the question shared-
+/// checkout occupancy needs answered (plan
+/// `2026-09-07-shared-checkout-occupancy-is-invisible-to-coord`, Phase 1c).
+/// The slots under [`CUSTODY_SLOT_DIR`] are the authoritative per-session
+/// store, so this reads them all.
+///
+/// ## What it does NOT do
+///
+/// No liveness filtering: the hook never prunes slots, so a consumer must age
+/// each one by its own `last_seen`. No subprocess: `$GIT_DIR` comes from
+/// [`git_dir_for`]. Every slot goes through the same bounded read as the
+/// mirror; a non-file, an oversize file, or an unparseable one is skipped,
+/// never fatal. Only `*.json` is considered, so the hook's in-flight
+/// `*.json.tmp.<pid>` files are never read half-written.
+///
+/// Ordering: `last_seen_epoch` descending (a slot with no epoch sorts after
+/// every slot with one), then `last_seen` descending, then `session_id`, so
+/// the output is deterministic. Truncated to [`CUSTODY_MAX_SLOTS`].
+pub fn read_custody_slots(worktree: &Path) -> Vec<CustodyRecord> {
+    let Some(git_dir) = git_dir_for(worktree) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(git_dir.join(CUSTODY_SLOT_DIR)) else {
+        return Vec::new();
+    };
+
+    let mut candidates: Vec<(Option<std::time::SystemTime>, PathBuf)> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+        .map(|p| {
+            let mtime = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
+            (mtime, p)
+        })
+        .collect();
+    // Newest mtime first; `None` (unreadable metadata) sorts last.
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.0));
+    candidates.truncate(CUSTODY_MAX_SLOT_SCAN);
+
+    let mut slots: Vec<CustodyRecord> = candidates
+        .iter()
+        .filter_map(|(_, p)| read_bounded(p, CUSTODY_MAX_BYTES))
+        .filter_map(|raw| serde_json::from_str::<CustodyRecord>(&raw).ok())
+        .collect();
+    slots.sort_by(|a, b| {
+        b.last_seen_epoch
+            .cmp(&a.last_seen_epoch)
+            .then_with(|| b.last_seen.cmp(&a.last_seen))
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+    slots.truncate(CUSTODY_MAX_SLOTS);
+    slots
 }
 
 // ---------------------------------------------------------------------------
@@ -1884,5 +1965,160 @@ mod tests {
         assert!(repo_matches("qontinui-runner", "qontinui-runner"));
         assert!(!repo_matches("qontinui/qontinui-web", "qontinui-runner"));
         assert!(!repo_matches("qontinui/qontinui-runner", ""));
+    }
+
+    // ---- per-session custody slots (plan 2026-09-07 Phase 1c) --------------
+
+    /// A primary-checkout-shaped worktree: `.git` is a directory.
+    fn primary_with_slots(slots: &[(&str, &str)]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let slot_dir = tmp.path().join(".git").join(CUSTODY_SLOT_DIR);
+        std::fs::create_dir_all(&slot_dir).unwrap();
+        for (name, body) in slots {
+            std::fs::write(slot_dir.join(name), body).unwrap();
+        }
+        tmp
+    }
+
+    fn slot(id: &str, epoch: i64) -> String {
+        serde_json::json!({
+            "record_version": 2,
+            "session_id": id,
+            "session_name": format!("name-{id}"),
+            "last_seen": format!("2026-09-26T00:00:{:02}Z", epoch % 60),
+            "last_seen_epoch": epoch,
+            "wip_state": "clean",
+            "wip_ref": format!("refs/wip/{id}"),
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn two_slots_yield_two_occupants_newest_first() {
+        let tmp = primary_with_slots(&[
+            ("older.json", &slot("older", 1_000)),
+            ("newer.json", &slot("newer", 2_000)),
+        ]);
+        let got = read_custody_slots(tmp.path());
+        let ids: Vec<_> = got.iter().map(|r| r.session_id.as_deref()).collect();
+        assert_eq!(ids, vec![Some("newer"), Some("older")]);
+        assert_eq!(got[0].wip_ref.as_deref(), Some("refs/wip/newer"));
+        assert_eq!(got[0].last_seen_epoch, Some(2_000));
+    }
+
+    #[test]
+    fn a_malformed_slot_is_skipped_not_fatal() {
+        let tmp = primary_with_slots(&[
+            ("good.json", &slot("good", 5)),
+            ("bad.json", "{ not json"),
+            // The hook's in-flight temp file must never be read.
+            ("good.json.tmp.123", &slot("tmp", 9)),
+        ]);
+        std::fs::create_dir(
+            tmp.path()
+                .join(".git")
+                .join(CUSTODY_SLOT_DIR)
+                .join("dir.json"),
+        )
+        .unwrap();
+        let got = read_custody_slots(tmp.path());
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].session_id.as_deref(), Some("good"));
+    }
+
+    #[test]
+    fn no_slot_dir_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        assert!(read_custody_slots(tmp.path()).is_empty());
+        // No `.git` at all is empty too, not a panic.
+        let bare = tempfile::tempdir().unwrap();
+        assert!(read_custody_slots(bare.path()).is_empty());
+    }
+
+    #[test]
+    fn an_oversize_slot_is_skipped() {
+        let mut big = slot("big", 7);
+        big.pop(); // drop the closing brace, pad, restore it: still valid JSON
+        big.push_str(&format!(",\"pad\":\"{}\"}}", "x".repeat(70 * 1024)));
+        assert!(serde_json::from_str::<CustodyRecord>(&big).is_ok());
+        let tmp = primary_with_slots(&[("big.json", &big), ("small.json", &slot("small", 1))]);
+        let got = read_custody_slots(tmp.path());
+        let ids: Vec<_> = got.iter().map(|r| r.session_id.as_deref()).collect();
+        assert_eq!(ids, vec![Some("small")]);
+    }
+
+    #[test]
+    fn a_linked_worktree_resolves_its_git_dir_through_the_git_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let admin = tmp.path().join("main/.git/worktrees/wt-a");
+        std::fs::create_dir_all(admin.join(CUSTODY_SLOT_DIR)).unwrap();
+        std::fs::write(
+            admin.join(CUSTODY_SLOT_DIR).join("s.json"),
+            slot("linked", 3),
+        )
+        .unwrap();
+        let wt = tmp.path().join("wt-a");
+        std::fs::create_dir(&wt).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+        let got = read_custody_slots(&wt);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].session_id.as_deref(), Some("linked"));
+    }
+
+    #[test]
+    fn the_mtime_preselection_keeps_the_newest_files_not_the_oldest() {
+        // More files than are ever parsed, so the pre-selection truncate
+        // actually drops some. File `i` has BOTH mtime and epoch rising with
+        // `i`, so a reversed mtime sort (or truncating the wrong end) parses
+        // the oldest `CUSTODY_MAX_SLOT_SCAN` files and returns a top occupant
+        // that is not the newest.
+        let total = CUSTODY_MAX_SLOT_SCAN + 40;
+        let tmp = primary_with_slots(&[]);
+        let slot_dir = tmp.path().join(".git").join(CUSTODY_SLOT_DIR);
+        let base = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        for i in 0..total {
+            let path = slot_dir.join(format!("s{i}.json"));
+            std::fs::write(&path, slot(&format!("s{i:04}"), 10_000 + i as i64)).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(base + std::time::Duration::from_secs(i as u64))
+                .unwrap();
+        }
+        let got = read_custody_slots(tmp.path());
+        assert_eq!(got.len(), CUSTODY_MAX_SLOTS);
+        let expected: Vec<String> = (0..CUSTODY_MAX_SLOTS)
+            .map(|k| format!("s{:04}", total - 1 - k))
+            .collect();
+        let ids: Vec<String> = got.iter().filter_map(|r| r.session_id.clone()).collect();
+        assert_eq!(ids, expected);
+    }
+
+    #[test]
+    fn slots_without_an_epoch_sort_after_slots_with_one_and_are_capped() {
+        let mut files: Vec<(String, String)> = (0..(CUSTODY_MAX_SLOTS as i64 + 5))
+            .map(|i| (format!("s{i}.json"), slot(&format!("s{i:03}"), 100 + i)))
+            .collect();
+        files.push((
+            "noepoch.json".into(),
+            serde_json::json!({"session_id": "noepoch"}).to_string(),
+        ));
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let tmp = primary_with_slots(&refs);
+        let got = read_custody_slots(tmp.path());
+        assert_eq!(got.len(), CUSTODY_MAX_SLOTS);
+        let top = CUSTODY_MAX_SLOTS as i64 + 4;
+        assert_eq!(
+            got[0].session_id.as_deref(),
+            Some(format!("s{top:03}").as_str())
+        );
+        assert!(got
+            .iter()
+            .all(|r| r.session_id.as_deref() != Some("noepoch")));
     }
 }
