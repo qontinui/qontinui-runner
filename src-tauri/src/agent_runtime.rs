@@ -8157,33 +8157,24 @@ async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
 /// mcp that could alter spawn behavior).
 ///
 /// Fail-soft throughout: the embedded floor ([`crate::fleet_agents`]) is
-/// attempted whether or not a root resolves, so a device with no workspace root
-/// (a published install) or no `qontinui-claude-config` checkout still gets the
-/// bundled set; only the checkout overlay depends on a resolved root, and a
-/// missing root or source dir is an `Unresolved` row rather than an error. The
-/// one case that writes nothing is a destination that resolves to the checkout
-/// source itself (a cwd whose `.claude` links into it) — see the core below.
+/// attempted whether or not a root resolves (`root` is `None` on a published
+/// install), so a device with no `qontinui-claude-config` checkout still gets
+/// the bundled set; only the checkout overlay depends on a resolved root, and a
+/// missing root or source dir is an `Unresolved` row rather than an error.
+/// Nothing is ever written through a symlink
+/// ([`crate::provision_guard::symlink_below`]).
 ///
-/// Called only through [`crate::session_assets::provision_session_assets`],
-/// which records the returned report and turns an `Err` into an
-/// `Unresolved` ledger row.
-///
-/// Returns a [`ProvisionReport`] for the CHECKOUT layer (`agent_definitions`);
-/// the floor's own report (`fleet_agents`) is recorded from the core below.
-pub(crate) fn provision_agent_definitions(worktree_cwd: &str) -> anyhow::Result<ProvisionReport> {
-    provision_agent_definitions_from_root(qontinui_root_dir().as_deref(), worktree_cwd)
-}
-
-/// Core of [`provision_agent_definitions`] with the qontinui-root passed in
-/// explicitly (so tests can drive it deterministically without mutating the
-/// process-global `QONTINUI_ROOT` env). `None` is "no root resolved". See that
-/// wrapper for full rationale.
+/// Called only from [`crate::session_assets`], which resolves `root` once per
+/// spawn, stands the whole `.claude` tree down first when the cwd IS the
+/// checkout source, records the returned report, and turns an `Err` into an
+/// `Unresolved` ledger row. Tests pass `root` explicitly rather than mutating
+/// the process-global `QONTINUI_ROOT` env.
 ///
 /// Reports BOTH layers: the returned [`ProvisionReport`] is the checkout overlay
 /// (`agent_definitions`), and the embedded floor's own report (`fleet_agents`)
 /// is recorded into the session ledger from here, because this is the only
 /// caller that can see it.
-fn provision_agent_definitions_from_root(
+pub(crate) fn provision_agent_definitions_from_root(
     root: Option<&Path>,
     worktree_cwd: &str,
 ) -> anyhow::Result<ProvisionReport> {
@@ -8194,42 +8185,31 @@ fn provision_agent_definitions_from_root(
             .join("agents")
     });
 
-    // SAME-DIRECTORY GUARD, before anything writes. A session cwd at the
-    // workspace root sees `<root>/.claude` as a symlink into
-    // `qontinui-claude-config/.claude`, so `dst_dir` IS `src_dir`: the overlay's
-    // `std::fs::copy(p, p)` truncates every definition to zero bytes (untracked
-    // drafts included), and the floor would overwrite the canonical sources with
-    // this binary's snapshot. The session already has the definitions — they are
-    // the source files — so both layers stand down and say why.
-    if let Some(why) = src_dir
-        .as_deref()
-        .and_then(|src| crate::provision_guard::destination_is_source(&dst_dir, src))
-    {
+    // NEVER THROUGH A SYMLINK, before anything writes: a `.claude` or
+    // `.claude/agents` that links elsewhere (at the workspace root it links into
+    // `qontinui-claude-config/.claude`) would land the floor on the canonical
+    // sources and the overlay's `std::fs::copy(p, p)` would truncate them. Both
+    // layers stand down and say why.
+    if let Some(why) = crate::provision_guard::redirected_asset_dir(&dst_dir) {
         info!("agent_runtime: not provisioning .claude/agents for {worktree_cwd} — {why}");
         let dst = dst_dir.display().to_string();
-        // `OperatorCheckout`: the definitions are present — as the checkout's
-        // own files. `record_provision` keeps a canonical-source row out of the
-        // device-level manifest reading either way.
-        let mut floor = ProvisionReport::new(
-            "fleet_agents",
-            crate::fleet_agents::embedded_agent_count(),
-            capability_manifest::Rung::OperatorCheckout,
-        )
-        .with_destination(dst.clone());
-        floor.skip(
-            dst.clone(),
-            capability_manifest::SkipReason::CanonicalSource(why.clone()),
+        capability_manifest::record_provision(
+            worktree_cwd,
+            ProvisionReport::stood_down(
+                "fleet_agents",
+                crate::fleet_agents::embedded_agent_count(),
+                capability_manifest::Rung::Unresolved,
+                dst.clone(),
+                capability_manifest::SkipReason::Symlinked(why.clone()),
+            ),
         );
-        capability_manifest::record_provision(worktree_cwd, floor);
-        let mut overlay = ProvisionReport::new(
+        return Ok(ProvisionReport::stood_down(
             "agent_definitions",
             0,
-            capability_manifest::Rung::OperatorCheckout,
-        )
-        .with_destination(dst.clone())
-        .with_detail("the destination is the checkout source itself");
-        overlay.skip(dst, capability_manifest::SkipReason::CanonicalSource(why));
-        return Ok(overlay);
+            capability_manifest::Rung::Unresolved,
+            dst,
+            capability_manifest::SkipReason::Symlinked(why),
+        ));
     }
 
     // ONE tracked-file probe for both layers — they write the same directory.
@@ -8359,16 +8339,13 @@ fn provision_agent_definitions_from_root(
             );
             continue;
         }
-        // A per-file symlink back to its own source: `std::fs::copy` onto
-        // itself truncates it. Leave the source as it is.
-        if dst.exists() && std::fs::canonicalize(&dst).ok() == std::fs::canonicalize(&path).ok() {
+        // Never through a per-file symlink: a `dst` linking back to its own
+        // source would be truncated by `std::fs::copy` onto itself, and one
+        // linking anywhere else would be overwritten out of this session's tree.
+        if let Some(why) = crate::provision_guard::symlink_below(&dst_dir, &dst) {
             report.skip(
                 name.to_string_lossy().into_owned(),
-                capability_manifest::SkipReason::CanonicalSource(format!(
-                    "{} resolves to its own source {}",
-                    dst.display(),
-                    path.display()
-                )),
+                capability_manifest::SkipReason::Symlinked(why),
             );
             continue;
         }
@@ -12116,7 +12093,51 @@ mod tests {
         );
         assert_eq!(report.written, 0);
         assert_eq!(report.skipped.len(), 1);
-        assert_eq!(report.skipped[0].reason.wire(), "canonical_source");
+        assert_eq!(report.skipped[0].reason.wire(), "symlinked");
+    }
+
+    /// A PER-FILE symlink from the session's `.claude/agents/<name>.md` back to
+    /// its own checkout source. The tracked probe asks the session repo (which
+    /// does not track it), so only the never-through-a-symlink rule protects the
+    /// source: remove it from the floor and the embedded body overwrites the
+    /// source; remove it from the overlay and `std::fs::copy` onto the file's
+    /// own target truncates it to zero bytes. Either removal fails this test.
+    #[cfg(unix)]
+    #[test]
+    fn provision_agent_defs_never_write_through_a_per_file_symlink() {
+        let _store = crate::capability_manifest::store_lock();
+        let root = tempfile::tempdir().unwrap();
+        let src = root
+            .path()
+            .join("qontinui-claude-config")
+            .join(".claude")
+            .join("agents");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("code-reviewer.md"), "# canonical reviewer").unwrap();
+        std::fs::write(src.join("repo-auditor.md"), "# canonical auditor").unwrap();
+
+        let wt = tempfile::tempdir().unwrap();
+        let wt_cwd = wt.path().to_string_lossy().into_owned();
+        let dst = wt.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&dst).unwrap();
+        std::os::unix::fs::symlink(src.join("code-reviewer.md"), dst.join("code-reviewer.md"))
+            .unwrap();
+
+        let report = provision_agent_definitions_from_root(Some(root.path()), &wt_cwd).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(src.join("code-reviewer.md")).unwrap(),
+            "# canonical reviewer",
+            "the linked source must be byte-identical"
+        );
+        assert_eq!(report.written, 1, "the unlinked sibling is still overlaid");
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].unit, "code-reviewer.md");
+        assert_eq!(report.skipped[0].reason.wire(), "symlinked");
+        assert_eq!(
+            std::fs::read_to_string(dst.join("repo-auditor.md")).unwrap(),
+            "# canonical auditor"
+        );
     }
 
     /// No workspace root (a published install): the checkout overlay cannot run,

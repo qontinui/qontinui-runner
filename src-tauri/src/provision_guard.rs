@@ -242,6 +242,43 @@ fn canonicalize_through_ancestors(path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// `Some(why)` when writing `path` would pass through a symlink below `base`:
+/// some EXISTING component of `path` strictly below `base` — `path` itself
+/// included — is a symlink, so the write would land somewhere other than its
+/// lexical destination. `base` itself is not examined. A component that does
+/// not exist ends the walk: nothing below it can be a symlink yet.
+///
+/// The rule every session-asset provisioner applies, independent of any
+/// workspace root: never write through a symlink. A per-file symlink into a
+/// canonical checkout is invisible to [`TrackedPaths`], which asks the SESSION
+/// repo, and `std::fs::copy` onto a file's own target truncates it.
+pub(crate) fn symlink_below(base: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(base).ok()?;
+    let mut current = base.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let target = std::fs::read_link(&current)
+                    .map(|t| format!(" -> {}", t.display()))
+                    .unwrap_or_default();
+                return Some(format!("{}{target} is a symlink", current.display()));
+            }
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// [`symlink_below`] for a whole asset kind: `dir` is `<cwd>/.claude/<kind>`,
+/// and both `.claude` and `<kind>` are examined. `Some(why)` means the kind
+/// stands down — even `create_dir_all` would build inside the link's target.
+pub(crate) fn redirected_asset_dir(dir: &Path) -> Option<String> {
+    let cwd = dir.parent()?.parent()?;
+    symlink_below(cwd, dir)
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     //! Tempdir git helpers shared by this module's tests and by the two

@@ -944,6 +944,11 @@ pub enum SkipReason {
     /// canonical sources, so the whole pass is skipped. The session still has
     /// the definitions: they are the source files themselves.
     CanonicalSource(String),
+    /// A component of the destination path at or below `<cwd>/.claude` — the
+    /// file itself, or a directory above it — is a symlink, so the write would
+    /// land somewhere other than the session cwd (possibly a canonical source a
+    /// tracked-file probe of THIS repo cannot see). Never written through.
+    Symlinked(String),
 }
 
 impl SkipReason {
@@ -956,6 +961,7 @@ impl SkipReason {
             SkipReason::Unresolved(_) => "unresolved",
             SkipReason::Rejected(_) => "rejected",
             SkipReason::CanonicalSource(_) => "canonical_source",
+            SkipReason::Symlinked(_) => "symlinked",
         }
     }
 
@@ -971,6 +977,9 @@ impl SkipReason {
             SkipReason::Rejected(why) => format!("refused by validation: {why}"),
             SkipReason::CanonicalSource(why) => {
                 format!("destination is the canonical source — left alone: {why}")
+            }
+            SkipReason::Symlinked(why) => {
+                format!("destination is reached through a symlink — never written through: {why}")
             }
         }
     }
@@ -1052,6 +1061,25 @@ impl ProvisionReport {
     ) -> Self {
         let mut report = ProvisionReport::new(capability, expected, Rung::Unresolved);
         report.skip(unit, SkipReason::Unresolved(why.into()));
+        report
+    }
+
+    /// A pass that STOOD DOWN before writing anything, for a deliberate reason
+    /// that covers the whole destination ([`SkipReason::CanonicalSource`],
+    /// [`SkipReason::Symlinked`]): nothing written, one skipped unit naming
+    /// `destination`.
+    #[must_use]
+    pub fn stood_down(
+        capability: &'static str,
+        expected: usize,
+        rung: Rung,
+        destination: impl Into<String>,
+        reason: SkipReason,
+    ) -> Self {
+        let destination = destination.into();
+        let mut report =
+            ProvisionReport::new(capability, expected, rung).with_destination(destination.clone());
+        report.skip(destination, reason);
         report
     }
 
@@ -1242,7 +1270,8 @@ fn with_store<T>(f: impl FnOnce(&mut ProvisionStore) -> T) -> T {
 /// **Never fails and never panics**, because it is called from spawn paths whose
 /// contract is that provisioning cannot abort a launch. It logs the report at
 /// `info!` when the pass was complete — or when every skip is a deliberate one
-/// ([`SkipReason::GitTracked`], [`SkipReason::CanonicalSource`]), the intended
+/// ([`SkipReason::GitTracked`], [`SkipReason::CanonicalSource`],
+/// [`SkipReason::Symlinked`]), the intended
 /// outcome in a checkout cwd that would otherwise `warn!` on every spawn
 /// there — and at `warn!` when it
 /// degraded for any other reason. [`ProvisionReport::is_degraded`] itself is
@@ -1259,7 +1288,7 @@ pub fn record_provision(workdir: &str, report: ProvisionReport) {
         && report.skipped.iter().all(|u| {
             matches!(
                 u.reason,
-                SkipReason::GitTracked | SkipReason::CanonicalSource(_)
+                SkipReason::GitTracked | SkipReason::CanonicalSource(_) | SkipReason::Symlinked(_)
             )
         });
     if report.is_degraded() && !only_deliberate_skips {
@@ -1267,17 +1296,20 @@ pub fn record_provision(workdir: &str, report: ProvisionReport) {
     } else {
         tracing::info!("provisioned — {}", report.summary());
     }
-    // A pass that stood down because its destination IS the canonical source
-    // wrote nothing and needed to: the assets are present as the source files.
-    // It is a fact about this SESSION's cwd, not about what the device can
-    // deliver, so it must not become the capability's device-level reading.
-    let stood_down_on_source = !report.skipped.is_empty()
-        && report
-            .skipped
-            .iter()
-            .all(|u| matches!(u.reason, SkipReason::CanonicalSource(_)));
+    // A pass that STOOD DOWN — wrote nothing because its destination is the
+    // canonical source, or is reached through a symlink — is a fact about this
+    // SESSION's cwd, not about what the device can deliver, so it must not
+    // become the capability's device-level reading.
+    let stood_down = report.written == 0
+        && !report.skipped.is_empty()
+        && report.skipped.iter().all(|u| {
+            matches!(
+                u.reason,
+                SkipReason::CanonicalSource(_) | SkipReason::Symlinked(_)
+            )
+        });
     with_store(|s| {
-        if !stood_down_on_source {
+        if !stood_down {
             s.latest.insert(report.capability, report.observation());
         }
         let mut ledger = match s.sessions.iter().position(|l| l.workdir == workdir) {

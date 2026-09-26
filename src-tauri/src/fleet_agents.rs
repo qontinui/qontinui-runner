@@ -115,6 +115,12 @@ pub(crate) fn provision_fleet_agents_into(
         };
         let unit = name.to_string_lossy().into_owned();
         let dst = dst_dir.join(name);
+        // Never through a symlink: a per-file link into a canonical checkout is
+        // invisible to `tracked`, which asks the SESSION repo.
+        if let Some(why) = crate::provision_guard::symlink_below(dst_dir, &dst) {
+            out.skip(unit, SkipReason::Symlinked(why));
+            continue;
+        }
         if tracked.should_skip(&dst, Path::new(name)) {
             tracing::info!(
                 "fleet_agents: skipping {} — it is tracked by the enclosing git \
