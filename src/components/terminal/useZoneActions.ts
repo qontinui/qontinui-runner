@@ -6,6 +6,7 @@ import type { UIAction } from "./useUIState";
 import type { TerminalTab } from "./useTerminalManager";
 import type { Metrics } from "./useEventHistory";
 import { getTerminalHotStore } from "./terminalHotStore";
+import { describeThrown } from "@/lib/utils";
 
 interface UseZoneActionsParams {
   /** Terminal page whose hot store the export/sort actions read output from. */
@@ -249,7 +250,7 @@ export function useZoneActions({
       setNotification({ message: `Exported to ${filePath}`, type: "success" });
       return { exported, cancelled: false };
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = describeThrown(err, "unknown error");
       setNotification({ message: `Export failed: ${message}`, type: "error" });
       return { exported: 0, cancelled: false, error: message };
     }

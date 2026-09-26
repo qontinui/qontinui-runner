@@ -40,6 +40,7 @@ import type { TaskRunStatus } from "../../types/aiData";
 import { useQueryClient } from "@tanstack/react-query";
 import { aiDataKeys } from "../../hooks/useAiData";
 import { getSeverityColors, getStatusColors, getAccentColors } from "@/design-system";
+import { describeThrown } from "@/lib/utils";
 
 // Categories to include in the summary (code-focused)
 const CODE_FOCUSED_CATEGORIES = [
@@ -141,7 +142,7 @@ export function ExecutionSummaryTab() {
         setSummaryError(result.error || "Failed to generate summary");
       }
     } catch (error) {
-      setSummaryError(error instanceof Error ? error.message : "Failed to generate summary");
+      setSummaryError(describeThrown(error, "Failed to generate summary"));
     } finally {
       setIsGeneratingSummary(false);
     }

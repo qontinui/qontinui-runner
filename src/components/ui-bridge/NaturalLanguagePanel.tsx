@@ -66,6 +66,7 @@ import {
   type LLMMatchResult,
 } from "../../lib/ui-bridge/llmElementMatcher";
 import { createLogger } from "@/lib/logger";
+import { describeThrown } from "@/lib/utils";
 
 const logger = createLogger("NaturalLanguagePanel");
 
@@ -734,7 +735,7 @@ export function NaturalLanguagePanel({
           success: false,
           command: suggestion.text,
           elementId: suggestion.elementId,
-          error: err instanceof Error ? err.message : "Execution failed",
+          error: describeThrown(err, "Execution failed"),
           timestamp: Date.now(),
         });
       } finally {
@@ -838,7 +839,7 @@ export function NaturalLanguagePanel({
             setInterpretation({
               ...regexResult,
               llmStatus: "error",
-              llmError: err instanceof Error ? err.message : "AI matching failed",
+              llmError: describeThrown(err, "AI matching failed"),
             });
           }
         } finally {
@@ -890,7 +891,7 @@ export function NaturalLanguagePanel({
         success: false,
         command: input,
         elementId: bestMatch.element.id,
-        error: err instanceof Error ? err.message : "Execution failed",
+        error: describeThrown(err, "Execution failed"),
         timestamp: Date.now(),
       });
       addToHistory(input, intent.action, bestMatch.element.id, false);
@@ -931,7 +932,7 @@ export function NaturalLanguagePanel({
           success: false,
           command: input,
           elementId: match.element.id,
-          error: err instanceof Error ? err.message : "Execution failed",
+          error: describeThrown(err, "Execution failed"),
           timestamp: Date.now(),
         });
         addToHistory(input, intent.action, match.element.id, false);

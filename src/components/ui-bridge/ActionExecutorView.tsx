@@ -28,6 +28,7 @@ import {
   ChevronRight,
 } from "lucide-react";
 import type { UIBridgeElement } from "./inspector-types";
+import { describeThrown } from "@/lib/utils";
 
 interface ActionExecutorViewProps {
   element?: UIBridgeElement;
@@ -202,7 +203,7 @@ export function ActionExecutorView({
         setLastResult({
           success: false,
           action: action.label,
-          error: err instanceof Error ? err.message : String(err),
+          error: describeThrown(err, "Action failed"),
         });
       } finally {
         setExecuting(false);

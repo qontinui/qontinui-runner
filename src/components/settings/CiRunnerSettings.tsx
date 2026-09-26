@@ -14,6 +14,7 @@ import { getAccentColors, type AccentColor } from "@/design-system";
 import type { LogFunction } from "./types";
 import { useTenant } from "@/contexts/TenantContext";
 import { UnpairedError, bearerFromDeviceToken, deviceTokenArgs } from "./ciRunnerDeviceToken";
+import { describeThrown } from "@/lib/utils";
 
 // --- Types ---
 
@@ -249,7 +250,7 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
       if (err instanceof DOMException && err.name === "AbortError") {
         setChecking(true);
       } else {
-        setError(`Failed to reach supervisor: ${err instanceof Error ? err.message : String(err)}`);
+        setError(`Failed to reach supervisor: ${describeThrown(err, "unknown error")}`);
         setChecking(false);
       }
     } finally {
@@ -297,7 +298,7 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
         onLog("error", `Cannot enable CI runner: ${err.message}`);
         return;
       }
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "unknown error");
       setError(`Failed to enable CI runner: ${msg}`);
       onLog("error", `Failed to enable CI runner: ${msg}`);
     } finally {
@@ -329,7 +330,7 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
         onLog("error", `Cannot disable CI runner: ${err.message}`);
         return;
       }
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "unknown error");
       setError(`Failed to disable CI runner: ${msg}`);
       onLog("error", `Failed to disable CI runner: ${msg}`);
     } finally {
@@ -354,7 +355,7 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
       await fetchStatus();
       setTimeout(() => setActionSuccess(null), 3000);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "unknown error");
       setError(`Failed to start CI runner: ${msg}`);
       onLog("error", `Failed to start CI runner: ${msg}`);
     } finally {
@@ -379,7 +380,7 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
       await fetchStatus();
       setTimeout(() => setActionSuccess(null), 3000);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "unknown error");
       setError(`Failed to stop CI runner: ${msg}`);
       onLog("error", `Failed to stop CI runner: ${msg}`);
     } finally {

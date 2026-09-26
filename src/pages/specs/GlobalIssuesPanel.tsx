@@ -39,6 +39,7 @@ import {
   type IssueStatusFilter,
   type LoadedIssueFilters,
 } from "./issueHeaderStats";
+import { describeThrown } from "@/lib/utils";
 
 type StatusFilter = IssueStatusFilter;
 
@@ -492,7 +493,7 @@ export function GlobalIssuesPanel() {
       setLoadedFilters(requested);
     } catch (err) {
       if (seq !== loadSeqRef.current) return;
-      setError(err instanceof Error ? err.message : String(err));
+      setError(describeThrown(err, "Failed to load known issues"));
     } finally {
       if (seq === loadSeqRef.current) setIsLoading(false);
     }
@@ -559,7 +560,7 @@ export function GlobalIssuesPanel() {
         setShowForm(false);
         await loadIssues();
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
+        setError(describeThrown(err, "Failed to create known issue"));
       }
     },
     [loadIssues],
@@ -571,7 +572,7 @@ export function GlobalIssuesPanel() {
         await invoke("resolve_known_issue", { id, resolution: "Resolved from Specs page" });
         await loadIssues();
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
+        setError(describeThrown(err, "Failed to resolve known issue"));
       }
     },
     [loadIssues],
@@ -588,7 +589,7 @@ export function GlobalIssuesPanel() {
         });
         await loadIssues();
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
+        setError(describeThrown(err, "Failed to delete known issue"));
       }
     },
     [loadIssues],
@@ -649,7 +650,7 @@ export function GlobalIssuesPanel() {
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(describeThrown(err, "Failed to export known issues"));
     }
   }, [statusFilter, categoryFilter]);
 
@@ -669,7 +670,7 @@ export function GlobalIssuesPanel() {
         setTimeout(() => setSuccessMessage(null), 5000);
         await loadIssues();
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
+        setError(describeThrown(err, "Failed to import known issues"));
       } finally {
         if (fileInputRef.current) {
           fileInputRef.current.value = "";

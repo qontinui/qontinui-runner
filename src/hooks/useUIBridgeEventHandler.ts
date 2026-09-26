@@ -31,7 +31,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useUIBridge } from "@qontinui/ui-bridge";
 import type { StyleGuideConfig } from "@qontinui/ui-bridge";
 import { createLogger } from "@/lib/logger";
-import { getErrorMessage } from "@/lib/utils";
+import { describeThrown } from "@/lib/utils";
 
 const log = createLogger("UIBridgeEventHandler");
 
@@ -208,7 +208,7 @@ export function useUIBridgeEventHandler(): void {
           requestId,
           type,
           success: false,
-          error: getErrorMessage(error),
+          error: describeThrown(error, `Failed to handle ${type}`),
           timestamp: Date.now(),
         });
       }

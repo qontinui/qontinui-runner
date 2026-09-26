@@ -14,6 +14,7 @@ import type {
   ScreenshotsResult,
 } from "@/components/active-dashboard/types";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 const POLL_INTERVAL_MS = 2000;
 
@@ -95,7 +96,7 @@ export function useGuiAutomationData(): GuiAutomationData {
     try {
       await Promise.all([fetchActionLog(), fetchScreenshots()]);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to fetch GUI automation data");
+      setError(describeThrown(e, "Failed to fetch GUI automation data"));
     } finally {
       setIsLoading(false);
     }

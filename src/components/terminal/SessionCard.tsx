@@ -22,6 +22,7 @@ import type { LockState } from "./useFileLockTracking";
 import type { CommandResponse } from "./types";
 import { isInjectedSession } from "./syntheticTabs";
 import { DURABLE_TOOLTIP } from "./sessionDurability";
+import { describeThrown } from "@/lib/utils";
 
 interface PromoteToWorktreeData {
   worktree_id: string;
@@ -315,7 +316,7 @@ function SessionCardInner({
           }, 8000);
         }
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = describeThrown(err, "Failed to promote session to worktree");
         setPromoteState({
           kind: "error",
           message: msg,
@@ -383,7 +384,7 @@ function SessionCardInner({
           }, 8000);
         }
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = describeThrown(err, "Failed to commit session progress");
         setCommitState({ kind: "error", message: msg });
         setTimeout(() => {
           setCommitState((prev) => (prev.kind === "error" ? { kind: "idle" } : prev));

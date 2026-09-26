@@ -44,6 +44,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { describeThrown } from "@/lib/utils";
 
 export type RunnerTier = "local" | "local_provider" | "qontinui_account";
 
@@ -154,7 +155,7 @@ export function useRunnerTier(): UseRunnerTierResult {
     // and let the caller decide how loudly to say so. Any previously-read
     // tier is deliberately left in place (a later failure must not demote a
     // tier we already established).
-    setError(lastErr instanceof Error ? lastErr.message : String(lastErr ?? "unknown error"));
+    setError(describeThrown(lastErr, "unknown error"));
     // Clear BOTH flags on every exit path — whichever one this call raised.
     // A failed re-read must not demote an already-known tier (`tierKnownRef`
     // and `tierKnown` are deliberately left alone here).

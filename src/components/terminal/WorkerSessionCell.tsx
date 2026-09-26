@@ -44,7 +44,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { RefreshCw, Send, Square } from "lucide-react";
 import type { AiMessage, AiSessionState } from "@qontinui/shared-types";
-import { cn } from "@/lib/utils";
+import { cn, describeThrown } from "@/lib/utils";
 import {
   useAiSession,
   type SendMessageOutcome,
@@ -518,7 +518,8 @@ export function FileChangesPanel({
 }) {
   // During an ordinary refresh the previous list stays up unlabelled (the
   // header already says "reading…"); only a FAILED read marks it stale.
-  const shown = read.status === "ok" ? read.response : read.status === "loading" ? read.previous : null;
+  const shown =
+    read.status === "ok" ? read.response : read.status === "loading" ? read.previous : null;
   const stale = read.status === "error" ? read.previous : null;
   return (
     <div className="flex h-full min-h-0 flex-col" data-file-changes-status={read.status}>
@@ -691,11 +692,7 @@ export function shouldFetchChanges(args: {
   return args.stale;
 }
 
-function useWorkerFileChanges(
-  taskRunId: string,
-  sessionState: AiSessionState,
-  visible: boolean,
-) {
+function useWorkerFileChanges(taskRunId: string, sessionState: AiSessionState, visible: boolean) {
   const [read, setRead] = useState<FileChangesRead>({ status: "loading", previous: null });
   const latestRef = useRef<SessionFileChangesResponse | null>(null);
   const inFlightRef = useRef<AbortController | null>(null);
@@ -733,7 +730,7 @@ function useWorkerFileChanges(
         staleRef.current = true;
         setRead({
           status: "error",
-          error: err instanceof Error ? err.message : String(err),
+          error: describeThrown(err, "Failed to load session file changes"),
           atMs: Date.now(),
           previous: latestRef.current,
         });
@@ -914,9 +911,7 @@ export function WorkerSessionCell({ tab, taskRunId, visible }: WorkerSessionCell
     // ENDED while this send was in flight, and the effect cannot fix that row
     // afterwards because it was still `sending` when the end edge went past.
     const settled = deliveryForSendOutcome(outcome, sessionStateRef.current);
-    setLedger((entries) =>
-      entries.map((e) => (e.id !== id ? e : { ...e, ...settled })),
-    );
+    setLedger((entries) => entries.map((e) => (e.id !== id ? e : { ...e, ...settled })));
     setSending(false);
     inputRef.current?.focus();
   }, [draft, sending, session]);

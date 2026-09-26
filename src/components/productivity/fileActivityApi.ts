@@ -20,6 +20,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { resolvePort } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 /** Live entry from the in-process `FileRegistryManager.info()` snapshot. */
 export interface FileRegistryInfoEntry {
@@ -150,9 +151,7 @@ export async function fetchHeatmap(
  * port resolution. Errors are surfaced to the caller (the hook degrades
  * to "show no yield buttons" rather than failing the whole panel).
  */
-export async function fetchLockInfo(
-  signal?: AbortSignal,
-): Promise<FileLockInfoEntry[]> {
+export async function fetchLockInfo(signal?: AbortSignal): Promise<FileLockInfoEntry[]> {
   const url = `http://127.0.0.1:${resolvePort()}/file-locks/info`;
   const resp = await fetch(url, { signal });
   if (!resp.ok) {
@@ -202,9 +201,7 @@ export interface LiveDirtyHeatmapResponse {
   error?: string;
 }
 
-export async function fetchLiveHeatmap(
-  signal?: AbortSignal,
-): Promise<LiveDirtyHeatmapResponse> {
+export async function fetchLiveHeatmap(signal?: AbortSignal): Promise<LiveDirtyHeatmapResponse> {
   const url = `http://127.0.0.1:${resolvePort()}/file-activity/heatmap-live`;
   const resp = await fetch(url, { signal });
   if (!resp.ok) {
@@ -269,7 +266,7 @@ export function useLiveDirtyHeatmap(
         setIsStale(v.degraded === true || elapsed > SLOW_FETCH_THRESHOLD_MS);
       } catch (e) {
         if (cancelled || ac.signal.aborted) return;
-        setError(e instanceof Error ? e.message : String(e));
+        setError(describeThrown(e, "Failed to load file activity"));
         setIsStale(true); // keep prior `data` — Phase 3 contract
       }
     };
@@ -283,10 +280,7 @@ export function useLiveDirtyHeatmap(
   }, [enabled, visible, pollIntervalMs, tick]);
 
   const refresh = useCallback(() => setTick((t) => t + 1), []);
-  return useMemo(
-    () => ({ data, error, isStale, refresh }),
-    [data, error, isStale, refresh],
-  );
+  return useMemo(() => ({ data, error, isStale, refresh }), [data, error, isStale, refresh]);
 }
 
 export interface UseFileActivityResult {
@@ -384,10 +378,7 @@ export function useFileActivity({
       } else {
         // Network errors and abort errors look the same shape in fetch;
         // we already skipped abort above. Treat anything else as stale.
-        const msg =
-          heatmapResult.reason instanceof Error
-            ? heatmapResult.reason.message
-            : String(heatmapResult.reason);
+        const msg = describeThrown(heatmapResult.reason, "Failed to load file activity heatmap");
         setError(msg);
         setIsStale(true);
         // NB: keep `data` populated — see plan §Phase 3.

@@ -9,6 +9,7 @@ import { getKnownPages, type KnownPage } from "@/lib/page-catalog";
 import { useSpecFileLoader } from "./useSpecFileLoader";
 import type { LoadedSpec, SpecSelection, SpecTreeNode, ConnectionState } from "./types";
 import type { SpecConfig, SpecGroup, SpecAssertion, SetupAction } from "@qontinui/ui-bridge";
+import { describeThrown } from "@/lib/utils";
 
 function buildNodeFromSpec(spec: LoadedSpec): SpecTreeNode {
   if (spec.kind === "page-spec") {
@@ -322,7 +323,7 @@ export function useSpecsState() {
       setConnection({
         status: "error",
         url,
-        error: err instanceof Error ? err.message : "Connection failed",
+        error: describeThrown(err, "Connection failed"),
       });
     } finally {
       setIsLoading(false);

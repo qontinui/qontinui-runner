@@ -92,7 +92,8 @@ describe("attachErrorMessage (typed runner errors, shown inline)", () => {
     );
     expect(attachErrorMessage(new Error("remote_attach:timeout: no reply within 20s"))).toBe(
       "timeout — no reply within 20s",
-    );
+    ); // A padded Error message still parses: describeThrown trims every shape.
+    expect(attachErrorMessage(new Error("  remote_attach:timeout: x\n"))).toBe("timeout — x");
   });
 
   it("renders coord's target-runner refusal with its hint as the detail", () => {

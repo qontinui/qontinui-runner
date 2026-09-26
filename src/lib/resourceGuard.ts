@@ -21,6 +21,7 @@
  */
 
 import { useSyncExternalStore } from "react";
+import { describeThrown } from "./utils";
 
 /**
  * Prefix the Rust side stamps on an overridable CRITICAL refusal. Must match
@@ -40,8 +41,7 @@ export const CRITICAL_REFUSAL_PREFIX = "resource_guard:critical:";
  * arbitrary value, so this normalises before matching rather than assuming.
  */
 export function parseResourceGuardRefusal(err: unknown): string | null {
-  const text =
-    typeof err === "string" ? err : err instanceof Error ? err.message : String(err ?? "");
+  const text = describeThrown(err, "");
   if (!text.startsWith(CRITICAL_REFUSAL_PREFIX)) return null;
   return text.slice(CRITICAL_REFUSAL_PREFIX.length).trim();
 }

@@ -25,6 +25,7 @@ import {
 import type { CreateScheduledTaskRequest } from "../../types/scheduler";
 import type { UnifiedWorkflow } from "../../types/unified-workflow";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 // ============================================================================
 // Types
@@ -296,7 +297,7 @@ Only output the JSON array, nothing else.`;
 
       setGeneratedTasks(tasks);
     } catch (err) {
-      setAiError(err instanceof Error ? err.message : String(err));
+      setAiError(describeThrown(err, "Failed to generate schedule"));
     } finally {
       setIsGenerating(false);
     }

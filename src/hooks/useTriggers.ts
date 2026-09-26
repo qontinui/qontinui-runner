@@ -9,6 +9,7 @@ import type {
   UpdateTriggerRequest,
 } from "../types/triggers";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 /**
  * Narrow `AppEvent` to a single variant by `event_type` discriminator.
@@ -18,10 +19,7 @@ import { getApiBase, tracedFetch } from "@/lib/runner-api";
  * `{ event_type: "<Name>", data: {...} }`. This helper picks the variant
  * by name so `event.payload.data.<field>` is type-safe at the call site.
  */
-type AppEventOf<T extends AppEvent["event_type"]> = Extract<
-  AppEvent,
-  { event_type: T }
->;
+type AppEventOf<T extends AppEvent["event_type"]> = Extract<AppEvent, { event_type: T }>;
 
 interface ApiResponse<T> {
   success: boolean;
@@ -53,7 +51,7 @@ async function apiRequest<T>(
     console.error(`API error: ${errorMsg}`);
     return { data: null, error: errorMsg };
   } catch (err) {
-    const errorMsg = err instanceof Error ? err.message : "Network error";
+    const errorMsg = describeThrown(err, "Network error");
     console.error(`API request failed: ${path}`, err);
     return { data: null, error: errorMsg };
   }

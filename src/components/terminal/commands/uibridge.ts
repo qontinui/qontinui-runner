@@ -37,6 +37,7 @@
 import { bindDirect } from "./bind";
 import { getById } from "./registry";
 import type { CommandResult, ResolverContext } from "./types";
+import { describeThrown } from "@/lib/utils";
 
 const NOT_FOUND = (actionId: string): string =>
   `Registry action "${actionId}" not found. ` +
@@ -75,7 +76,7 @@ export async function runRegistryAction<T = unknown>(
     return {
       ok: false,
       code: "handler-threw",
-      message: err instanceof Error ? err.message : String(err),
+      message: describeThrown(err, "UI Bridge handler threw"),
     };
   }
 }

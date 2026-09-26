@@ -1,6 +1,7 @@
 import { useCallback } from "react";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 import { getUIBridgeGlobal } from "./utils";
+import { describeThrown } from "@/lib/utils";
 
 /**
  * Handles: get_network_requests, get_network_requests_in_flight,
@@ -169,8 +170,7 @@ export function useNetworkIdleEvents(
               results[outcome.value.target] = outcome.value.status;
             } else if (outcome.status === "rejected") {
               // Record the error for this target
-              const errMsg =
-                outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason);
+              const errMsg = describeThrown(outcome.reason, "Network idle check failed");
               results["_error"] = errMsg;
             }
           }

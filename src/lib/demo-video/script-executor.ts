@@ -15,6 +15,7 @@ import type {
 } from "./types";
 import { DEFAULT_RECORDING_CONFIG, DEMO_VISUAL_OVERLAY_EVENT } from "./types";
 import { getApiBase } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 // =============================================================================
 // Helpers
@@ -176,7 +177,7 @@ export async function executeScript(
         try {
           await executeAction(action);
         } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
+          const msg = describeThrown(err, "unknown error");
           callbacks?.onError?.(`Step ${step.id} action failed: ${msg}`, i);
           // Continue to next action — demo should be resilient
         }

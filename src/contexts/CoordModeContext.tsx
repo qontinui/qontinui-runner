@@ -51,6 +51,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import { createLogger } from "@/lib/logger";
+import { describeThrown } from "@/lib/utils";
 
 const logger = createLogger("CoordModeContext");
 
@@ -268,7 +269,7 @@ export function CoordModeProvider({ children }: { children: ReactNode }) {
       // The command does not exist on runner builds that predate the
       // backend half of §6.4. That is UNKNOWN, not isolated — the gate
       // stays open and the surfaces keep working exactly as before.
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "get_coord_mode failed");
       if (mine !== generation.current) return;
       setData(null);
       setError(msg);

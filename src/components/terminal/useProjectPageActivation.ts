@@ -27,6 +27,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { createLogger } from "@/lib/logger";
 import { subscribeActiveProject, type ActiveProjectHint } from "./activeProject";
 import { cancelZoneProfileRestore, requestZoneProfileRestore } from "./useZoneProfileRestore";
+import { describeThrown } from "@/lib/utils";
 
 const log = createLogger("useProjectPageActivation");
 
@@ -161,7 +162,7 @@ export function useProjectPageActivation({
       void invoke("set_project_terminal_page", { id: plan.projectId, pageId }).catch((err) => {
         log.warn(
           "Could not persist the project → terminal page binding",
-          `${plan.projectId}: ${err instanceof Error ? err.message : String(err)}`,
+          `${plan.projectId}: ${describeThrown(err, "activation failed")}`,
         );
       });
     }

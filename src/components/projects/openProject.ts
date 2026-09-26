@@ -13,6 +13,7 @@
 
 import type { ProjectSnapshot } from "./types";
 import { isLiveProcessState } from "./types";
+import { describeThrown } from "@/lib/utils";
 
 /** Where an `Open` run currently is. */
 export type OpenPhase =
@@ -171,7 +172,9 @@ export function isOpenBusy(phase: OpenPhase): boolean {
  * for the disclosure.
  */
 export function describeStartFailure(processName: string, error: unknown): OpenPhase {
-  const raw = error instanceof Error ? error.message : String(error);
+  // An empty fallback, so a blank cause still drops `detail` below rather than
+  // rendering a placeholder in the disclosure.
+  const raw = describeThrown(error, "");
   return {
     kind: "failed",
     message: `${processName} didn't start. The details below say why.`,

@@ -5,6 +5,7 @@ import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { FileText, Search, X, FolderOpen, Brain, Loader2 } from "lucide-react";
 import { pathSeparatorFor, normalizeRoot, joinPath, relativeToRoot } from "./docFinderPaths";
 import { fuzzyScore } from "./commands/fuzzy";
+import { describeThrown } from "@/lib/utils";
 
 /* ── Types ────────────────────────────────────────────────────────────── */
 
@@ -220,7 +221,7 @@ export function DocFinderModal({ onSelect, onClose, defaultRoot }: DocFinderModa
       }
     } catch (err) {
       setScannedFiles([]);
-      setScanError(`Scan failed: ${err instanceof Error ? err.message : String(err)}`);
+      setScanError(`Scan failed: ${describeThrown(err, "unknown error")}`);
     } finally {
       setIsScanning(false);
     }

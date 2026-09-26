@@ -11,6 +11,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { Project } from "../types/auth";
 import { instanceStorage } from "@/lib/instance-storage";
 import { createLogger } from "@/lib/logger";
+import { describeThrown } from "@/lib/utils";
 
 const log = createLogger("useProjectSelection");
 
@@ -231,7 +232,7 @@ export function useProjectSelection(): UseProjectSelectionReturn {
       try {
         return await invoke<Project[]>("get_user_projects");
       } catch (err) {
-        const errorMsg = err instanceof Error ? err.message : String(err);
+        const errorMsg = describeThrown(err, "Failed to load projects");
         // Retry up to 3 times on the credential-store read race. 500ms was
         // insufficient when the temp runner's auto-login HTTP roundtrip is
         // still in flight when App.tsx's auth-gated effect fires (iter 4
@@ -279,7 +280,7 @@ export function useProjectSelection(): UseProjectSelectionReturn {
         setSelectedProject(projectList[0].id);
       }
     } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
+      const errorMsg = describeThrown(err, "Failed to load projects");
 
       // A Tier 0/1 (Local / LocalProvider) runner has no Qontinui account, so
       // `get_user_projects` is gated off by design: the backend's

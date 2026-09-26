@@ -4,6 +4,7 @@ import type { CanvasPanel } from "@qontinui/shared-types";
 import { type AnalysisType } from "./TerminalAnalysisPanel";
 import type { CommandHistoryEntry } from "./useShellIntegration";
 import type { CommandResponse } from "./types";
+import { describeThrown } from "@/lib/utils";
 
 /**
  * What an analysis run actually produced.
@@ -16,9 +17,7 @@ import type { CommandResponse } from "./types";
  * right-hand panel renders); this envelope is for the callers that need a
  * verdict rather than a render.
  */
-export type AnalysisOutcome =
-  | { ok: true; panels: number }
-  | { ok: false; message: string };
+export type AnalysisOutcome = { ok: true; panels: number } | { ok: false; message: string };
 
 interface UseAnalysisParams {
   activeId: string | null;
@@ -28,7 +27,9 @@ interface UseAnalysisParams {
   getActiveSelection: () => string;
   latestPlanContent: string;
   setRightPanelMode: React.Dispatch<
-    React.SetStateAction<"transcript" | "workflow" | "analysis" | "findings" | "file-ownership" | null>
+    React.SetStateAction<
+      "transcript" | "workflow" | "analysis" | "findings" | "file-ownership" | null
+    >
   >;
 }
 
@@ -135,7 +136,7 @@ export function useAnalysis({
         setAnalysisError(message);
         return { ok: false, message };
       } catch (err) {
-        const message = err instanceof Error ? err.message : "Analysis failed";
+        const message = describeThrown(err, "Analysis failed");
         setAnalysisError(message);
         return { ok: false, message };
       } finally {

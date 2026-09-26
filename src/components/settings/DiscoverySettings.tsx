@@ -12,6 +12,7 @@ import { Radar, Plus, Trash2 } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
 import type { LogFunction } from "./types";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 interface DiscoverySettingsProps {
   onLog: LogFunction;
@@ -59,7 +60,7 @@ export function DiscoverySettings({ onLog }: DiscoverySettingsProps) {
       setPorts(list);
       setInitialPorts(list);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
+      const msg = describeThrown(e, "unknown error");
       setError(msg);
       onLog("error", `Failed to load discovery ports: ${msg}`);
     } finally {
@@ -120,7 +121,7 @@ export function DiscoverySettings({ onLog }: DiscoverySettingsProps) {
       setInitialPorts(normalized);
       onLog("success", `Saved ${normalized.length} custom discovery port(s)`);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
+      const msg = describeThrown(e, "unknown error");
       setError(msg);
       onLog("error", `Failed to save discovery ports: ${msg}`);
     } finally {

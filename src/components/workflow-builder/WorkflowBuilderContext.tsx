@@ -58,6 +58,7 @@ import {
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { instanceStorage } from "@/lib/instance-storage";
 import { createLogger } from "@/lib/logger";
+import { describeThrown } from "@/lib/utils";
 
 const logger = createLogger("WorkflowBuilderContext");
 
@@ -987,7 +988,7 @@ function RunnerWorkflowBuilderInner({
         return null;
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Failed to save workflow";
+      const message = describeThrown(error, "Failed to save workflow");
       dispatch({ type: "SET_ERROR", payload: message });
       dispatch({ type: "SET_SAVING", payload: false });
       return null;
@@ -1013,7 +1014,7 @@ function RunnerWorkflowBuilderInner({
         return false;
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Failed to load workflow";
+      const message = describeThrown(error, "Failed to load workflow");
       dispatch({ type: "SET_ERROR", payload: message });
       dispatch({ type: "SET_LOADING", payload: false });
       return false;
@@ -1038,7 +1039,7 @@ function RunnerWorkflowBuilderInner({
         return null;
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Failed to export workflow";
+      const message = describeThrown(error, "Failed to export workflow");
       dispatch({ type: "SET_ERROR", payload: message });
       dispatch({ type: "SET_LOADING", payload: false });
       return null;
@@ -1075,7 +1076,7 @@ function RunnerWorkflowBuilderInner({
           return null;
         }
       } catch (error) {
-        const message = error instanceof Error ? error.message : "Failed to import workflow";
+        const message = describeThrown(error, "Failed to import workflow");
         dispatch({ type: "SET_ERROR", payload: message });
         dispatch({ type: "SET_LOADING", payload: false });
         return null;

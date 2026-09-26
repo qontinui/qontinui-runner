@@ -10,6 +10,7 @@ import {
 } from "recharts";
 import { RefreshCw } from "lucide-react";
 import { fetchApi, type DashboardMetrics, type TimeSeriesPoint } from "./types";
+import { describeThrown } from "@/lib/utils";
 
 function MetricCard({
   label,
@@ -52,7 +53,7 @@ export function DashboardTab() {
       setMetrics(m);
       setTrends(t);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to load");
+      setError(describeThrown(e, "Failed to load"));
     } finally {
       if (!silent) {
         setLoading(false);

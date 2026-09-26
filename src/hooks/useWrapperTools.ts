@@ -34,6 +34,7 @@ import {
   type WrapperToolRouteTable,
 } from "@/lib/wrappers/tools";
 import type { DispatchResult, InstalledWrapper } from "@/lib/wrappers/types";
+import { describeThrown } from "@/lib/utils";
 
 export interface UseWrapperToolsResult {
   /** Tool definitions ready to merge into an agent's tool list. */
@@ -81,7 +82,7 @@ export function useWrapperTools(enabled: boolean = true): UseWrapperToolsResult 
       // item 10) — including transports whose every dispatch fails.
       setWrappers((await listWrappers()).filter(isWrapperToolEligible));
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(describeThrown(e, "Failed to list wrappers"));
       setWrappers([]);
     } finally {
       setLoading(false);

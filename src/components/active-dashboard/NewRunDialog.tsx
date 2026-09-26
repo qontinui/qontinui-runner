@@ -13,6 +13,7 @@ import { Button } from "../ui";
 import { getAccentColors } from "@/design-system";
 import { useActiveRuns } from "../../contexts/ActiveRunsContext";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 type RunMode = "gui" | "headless";
 
@@ -113,7 +114,7 @@ export function NewRunDialog({ open, onClose, onSuccess }: NewRunDialogProps) {
 
       onClose();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to create bridge");
+      setError(describeThrown(err, "Failed to create bridge"));
     } finally {
       setIsLoading(false);
     }

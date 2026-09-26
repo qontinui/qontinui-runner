@@ -22,6 +22,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { getStatusColors, getAccentColors } from "@/design-system";
 import { aiDataService } from "@/services";
 import { aiDataKeys } from "@/hooks/useAiData";
+import { describeThrown } from "@/lib/utils";
 
 // ============================================================================
 // User Message Parsing
@@ -214,7 +215,7 @@ export function AISummarySection({
         setError(result.error || "Failed to generate summary");
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to generate summary");
+      setError(describeThrown(err, "Failed to generate summary"));
     } finally {
       setIsGenerating(false);
     }

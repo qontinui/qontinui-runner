@@ -11,6 +11,7 @@ import { useCallback, useState } from "react";
 import { useUIElement } from "@qontinui/ui-bridge";
 import { invoke } from "@tauri-apps/api/core";
 import { AlertTriangle, CheckCircle2, Loader2, Search, X, Copy } from "lucide-react";
+import { describeThrown } from "@/lib/utils";
 
 interface RegisteredElement {
   id: string;
@@ -64,7 +65,7 @@ export function SpecDriftButton() {
       setReport(result);
       setOpen(true);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(describeThrown(e, "Failed to scan spec drift"));
       setOpen(true);
     } finally {
       setScanning(false);

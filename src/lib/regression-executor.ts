@@ -54,6 +54,7 @@ import type { GitCommitRef, DriftReport } from "@qontinui/ui-bridge-auto/drift";
 import type { DriftContext } from "@qontinui/ui-bridge-auto/drift";
 
 import { createPgMemorySink } from "./regression-memory-sink";
+import { describeThrown } from "./utils";
 
 // `RecordingSession` and `FragilityScore` flow through `DriftContext`. We
 // derive their types from `DriftContext` itself rather than importing them
@@ -344,7 +345,7 @@ async function evaluateVisualGate(
     return {
       status: "fail",
       failureKind: "visual-gate-error",
-      message: `Visual gate threw: ${err instanceof Error ? err.message : String(err)}`,
+      message: `Visual gate threw: ${describeThrown(err, "unknown error")}`,
       observed: { error: String(err) },
     };
   }
@@ -393,9 +394,7 @@ async function evaluateOverlay(
       }
       const state = ir.states.find((s) => s.id === stateId);
       const irAssertion = state?.assertions[idx];
-      const criteria = irAssertion
-        ? (irAssertion.target.criteria as IRElementCriteria)
-        : undefined;
+      const criteria = irAssertion ? (irAssertion.target.criteria as IRElementCriteria) : undefined;
       if (!criteria) {
         return {
           status: "fail",
@@ -512,8 +511,7 @@ async function evaluateOverlay(
             observed: { transitionId, actionIndex, elementId: result.match.id },
           };
         }
-        const tolerance =
-          typeof payload.tolerance === "number" ? payload.tolerance : undefined;
+        const tolerance = typeof payload.tolerance === "number" ? payload.tolerance : undefined;
         const ccResult = await crossCheckText(live, {
           ocr: ocrProvider,
           tolerance,
@@ -590,8 +588,7 @@ function buildPersistedDriftReport(
   const pushAll = (report: DriftReport | undefined): void => {
     if (!report) return;
     for (const e of report.states ?? []) entries.push({ ...e, bucket: "state" });
-    for (const e of report.transitions ?? [])
-      entries.push({ ...e, bucket: "transition" });
+    for (const e of report.transitions ?? []) entries.push({ ...e, bucket: "transition" });
   };
   pushAll(specDrift);
   pushAll(visualDrift);
@@ -668,20 +665,14 @@ export async function runRegressionSuite(
             outcome = await evaluateVisualGate(assertion, ir, registry, manager);
             break;
           case "overlay":
-            outcome = await evaluateOverlay(
-              assertion,
-              ir,
-              registry,
-              tokenRegistry,
-              ocrProvider,
-            );
+            outcome = await evaluateOverlay(assertion, ir, registry, tokenRegistry, ocrProvider);
             break;
         }
       } catch (err) {
         outcome = {
           status: "fail",
           failureKind: "executor-threw",
-          message: `Executor threw: ${err instanceof Error ? err.message : String(err)}`,
+          message: `Executor threw: ${describeThrown(err, "unknown error")}`,
           observed: { error: String(err) },
         };
       }

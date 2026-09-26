@@ -50,6 +50,7 @@ import {
   type AppListResponse,
   type RegisteredApp,
 } from "./appFreshnessHelpers";
+import { describeThrown } from "@/lib/utils";
 
 /** Cap on a quoted error body, matching `DevLoopSettings`. */
 const ERROR_BODY_CHARS = 200;
@@ -96,7 +97,7 @@ export function AppFreshnessSettings({ onLog }: AppFreshnessSettingsProps) {
       setForms(Object.fromEntries(list.map((a) => [a.appId, formOf(a)])));
       setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(describeThrown(err, "Failed to load apps"));
     } finally {
       setLoading(false);
     }
@@ -162,7 +163,7 @@ export function AppFreshnessSettings({ onLog }: AppFreshnessSettingsProps) {
         onLog("success", `Updated auto-fresh config for app "${app.appId}"`);
         setError(null);
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
+        const message = describeThrown(err, "Failed to update auto-fresh config");
         setError(message);
         onLog("error", `Failed to update app "${app.appId}": ${message}`);
       } finally {

@@ -5,6 +5,7 @@ import { getUIBridgeGlobal, toFindRequest } from "./utils";
 import { createLogger } from "@/lib/logger";
 import { ACTIVE_TAB_STORAGE_KEY, DEFAULT_TAB_ID } from "@/components/app/tab-types";
 import { instanceStorage } from "@/lib/instance-storage";
+import { describeThrown } from "@/lib/utils";
 
 const logger = createLogger("UIBridgeDiscoveryEvents");
 
@@ -352,7 +353,7 @@ export function useDiscoveryEvents(
               requestId,
               type,
               success: false,
-              error: err instanceof Error ? err.message : String(err),
+              error: describeThrown(err, "Discovery request failed"),
               timestamp: Date.now(),
             });
           }
@@ -386,7 +387,7 @@ export function useDiscoveryEvents(
               requestId,
               type,
               success: false,
-              error: err instanceof Error ? err.message : String(err),
+              error: describeThrown(err, "Discovery request failed"),
               timestamp: Date.now(),
             });
           }
@@ -433,7 +434,7 @@ export function useDiscoveryEvents(
               requestId,
               type,
               success: false,
-              error: err instanceof Error ? err.message : String(err),
+              error: describeThrown(err, "Discovery request failed"),
               timestamp: Date.now(),
             });
           }
@@ -467,7 +468,7 @@ export function useDiscoveryEvents(
               requestId,
               type,
               success: false,
-              error: err instanceof Error ? err.message : String(err),
+              error: describeThrown(err, "Discovery request failed"),
               timestamp: Date.now(),
             });
           }
@@ -538,7 +539,7 @@ export function useDiscoveryEvents(
               requestId,
               type,
               success: false,
-              error: err instanceof Error ? err.message : String(err),
+              error: describeThrown(err, "Discovery request failed"),
               timestamp: Date.now(),
             });
           }
@@ -609,7 +610,7 @@ export function useDiscoveryEvents(
               requestId,
               type,
               success: false,
-              error: err instanceof Error ? err.message : String(err),
+              error: describeThrown(err, "Discovery request failed"),
               timestamp: Date.now(),
             });
           }

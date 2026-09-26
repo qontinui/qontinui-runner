@@ -42,6 +42,7 @@ import { persistQuarantinedCompilation } from "@/lib/persist-quarantined-compila
 import type { SpecConfig } from "@/lib/spec-prompt-builder";
 import { useSpecSync } from "@/hooks/useSpecSync";
 import { useGitSupervision } from "@/hooks/useGitSupervision";
+import { describeThrown } from "@/lib/utils";
 
 // ============================================================================
 // AI spec-generation flag — persisted via instanceStorage
@@ -593,7 +594,7 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
     } catch (err) {
       console.error(
         "[Specs] State machine compilation failed — engine not updated:",
-        err instanceof Error ? err.message : err,
+        describeThrown(err, "unknown error"),
       );
       return;
     }
@@ -813,7 +814,11 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
                 selectedGroup={state.selectedGroup}
                 selectionType={state.selection.type}
                 editMode={state.editMode}
-                appId={state.selectedSpec?.appName === "qontinui-runner" ? "qontinui-runner" : "qontinui-runner"}
+                appId={
+                  state.selectedSpec?.appName === "qontinui-runner"
+                    ? "qontinui-runner"
+                    : "qontinui-runner"
+                }
                 unspeccedPageInfo={
                   state.selection.type === "unspecced-page"
                     ? {
