@@ -22,7 +22,9 @@ use tracing::info;
 
 use crate::mcp::types::{ApiResponse, ApiState};
 
-use super::request::{ui_bridge_request_sync, wrap_ipc_result, wrap_ipc_result_keeping_failure_data};
+use super::request::{
+    ui_bridge_request_sync, wrap_ipc_result, wrap_ipc_result_keeping_failure_data,
+};
 
 /// Save a bookmark (snapshot) by name.
 pub async fn ui_bridge_save_bookmark_handler(

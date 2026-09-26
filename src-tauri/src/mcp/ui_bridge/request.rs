@@ -302,8 +302,11 @@ pub(crate) const INDETERMINATE_ACTION_ERROR: &str =
 ///
 /// Three states, not two, because "absent" is not "true": a body with no
 /// boolean `success` key (a malformed reply, a relay frame with no `result`,
-/// a proxy's own JSON) used to read as success at ten call sites through an
-/// `.unwrap_or(true)` or a `!== false` default. See
+/// a proxy's own JSON) used to read as success at nine call sites — five
+/// `.unwrap_or(true)` reads (R1, R3-R6), one `== Some(false)` test that
+/// re-minted an absent key as `true` (R2) and three `!== false` reads in the
+/// frontend (T1-T3) — besides the change-tracking handler's hardcoded outer
+/// `success: true` (T4). See
 /// `plans/2026-09-10-two-runner-call-sites-still-report-success-for-an-action-that-did-not-happen.md`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ActionOutcome {
@@ -1159,6 +1162,13 @@ pub async fn handle_ui_bridge_response(
 /// `ai_analyze::as_recovery_failure` reads `code`.
 const FAILURE_VERDICT_FIELDS: [&str; 3] = ["error", "code", "hint"];
 
+/// The frontend response envelope's own routing/bookkeeping fields
+/// (`UIBridgeResponsePayload`). A failure envelope with NO `data` reaches
+/// [`wrap_ipc_result_keeping_failure_data`] whole (see
+/// [`extract_response_data`]'s no-`data` arm), so these are on it — and they
+/// are transport metadata, never a failure payload to forward as `data`.
+const ENVELOPE_BOOKKEEPING_FIELDS: [&str; 4] = ["requestId", "type", "timestamp", "windowLabel"];
+
 /// Extract the payload the waiting HTTP handler should see from a frontend
 /// response envelope, **preserving the envelope's failure verdict**.
 ///
@@ -1323,10 +1333,8 @@ pub(crate) fn wrap_ipc_result(
 /// arms are identical to [`wrap_ipc_result`].
 pub(crate) fn wrap_ipc_result_keeping_failure_data(
     result: Result<serde_json::Value, String>,
-) -> Result<
-    Json<ApiResponse<serde_json::Value>>,
-    (StatusCode, Json<ApiResponse<serde_json::Value>>),
-> {
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<serde_json::Value>>)>
+{
     match result {
         Ok(data) => {
             if data.get("success").and_then(|v| v.as_bool()) == Some(false) {
@@ -1394,7 +1402,8 @@ pub(crate) fn wrap_ipc_result_keeping_failure_data(
 
 /// The payload an inner-failure envelope carried, as it arrives after
 /// [`extract_response_data`]'s flattening — see
-/// [`wrap_ipc_result_keeping_failure_data`]. `None` when there is none.
+/// [`wrap_ipc_result_keeping_failure_data`]. `None` when there is none: the
+/// verdict fields and the envelope's bookkeeping fields are never payload.
 fn inner_failure_payload(data: &serde_json::Value) -> Option<serde_json::Value> {
     if let Some(explicit) = data.get("data") {
         return Some(explicit.clone());
@@ -1402,7 +1411,12 @@ fn inner_failure_payload(data: &serde_json::Value) -> Option<serde_json::Value> 
     let obj = data.as_object()?;
     let rest: serde_json::Map<String, serde_json::Value> = obj
         .iter()
-        .filter(|(k, _)| k.as_str() != "success" && !FAILURE_VERDICT_FIELDS.contains(&k.as_str()))
+        .filter(|(k, _)| {
+            let k = k.as_str();
+            k != "success"
+                && !FAILURE_VERDICT_FIELDS.contains(&k)
+                && !ENVELOPE_BOOKKEEPING_FIELDS.contains(&k)
+        })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     (!rest.is_empty()).then_some(serde_json::Value::Object(rest))
@@ -2716,7 +2730,7 @@ mod action_outcome_tests {
     //! The one strict Rust reader of an action result's `success` (plan
     //! `2026-09-10-two-runner-call-sites-still-report-success-for-an-action-that-did-not-happen`,
     //! Phase 2). The absent-key case is the exact input that read as success
-    //! at ten call sites before it.
+    //! at nine call sites before it (plus the hardcoded change-tracking T4).
     use super::{
         action_outcome, normalize_action_result, ActionOutcome, INDETERMINATE_ACTION_ERROR,
     };
@@ -2822,13 +2836,57 @@ mod keeping_failure_data_tests {
         assert!(status.is_client_error(), "got {status}");
         let body = body.deref();
         assert!(!body.success);
-        assert_eq!(body.error.as_deref(), Some("ACTION_FAILED: Element btn not found"));
-        let data = body.data.as_ref().expect("the diff must be kept on failure");
+        assert_eq!(
+            body.error.as_deref(),
+            Some("ACTION_FAILED: Element btn not found")
+        );
+        let data = body
+            .data
+            .as_ref()
+            .expect("the diff must be kept on failure");
         assert_eq!(data["actionSuccess"], json!(false));
         assert_eq!(data["diff"]["appeared"], json!([]));
         assert!(data.get("success").is_none() && data.get("error").is_none());
         let wire = serde_json::to_value(body).unwrap();
         assert_eq!(wire["data"]["durationMs"], json!(12));
+    }
+
+    #[test]
+    fn realistic_envelope_without_data_forwards_no_data() {
+        // `execute_with_diff` with an `instruction` and no executeNLAction
+        // wired, or "UI Bridge is not available": the frontend answers with
+        // no `data`, so extraction returns the WHOLE envelope. Its bookkeeping
+        // fields must not come back as a fake payload.
+        let envelope = json!({
+            "requestId": "r9",
+            "type": "execute_with_diff",
+            "success": false,
+            "error": "UI Bridge is not available",
+            "timestamp": 1_790_000_000_000_u64,
+            "windowLabel": "main"
+        });
+        let (_, body) =
+            wrap_ipc_result_keeping_failure_data(Ok(extract_response_data(&envelope))).unwrap_err();
+        assert_eq!(body.deref().data, None);
+    }
+
+    #[test]
+    fn bookkeeping_fields_are_stripped_from_a_flattened_payload() {
+        let flattened = json!({
+            "requestId": "r9",
+            "type": "execute_with_diff",
+            "success": false,
+            "error": "ACTION_FAILED: x",
+            "timestamp": 1,
+            "windowLabel": "main",
+            "actionSuccess": false,
+            "diff": { "appeared": ["a"] }
+        });
+        let (_, body) = wrap_ipc_result_keeping_failure_data(Ok(flattened)).unwrap_err();
+        assert_eq!(
+            body.deref().data,
+            Some(json!({ "actionSuccess": false, "diff": { "appeared": ["a"] } }))
+        );
     }
 
     #[test]
