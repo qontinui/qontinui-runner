@@ -121,9 +121,7 @@ function canonicalBag(schema: Record<string, unknown> | undefined): Record<strin
 }
 
 /** The alternate bag, or `null` when no field of this schema has one. */
-function alternateBag(
-  schema: Record<string, unknown> | undefined,
-): Record<string, unknown> | null {
+function alternateBag(schema: Record<string, unknown> | undefined): Record<string, unknown> | null {
   const keys = Object.keys(schema ?? {}).filter((k) => !k.startsWith("--"));
   if (!keys.some((k) => k in ALTERNATE_FIELD_VALUE)) return null;
   return bagFor(schema, ALTERNATE_FIELD_VALUE);
@@ -342,8 +340,9 @@ describe("handlers — the no-ops that used to render as effects", () => {
    * which also clears the maximized zone, re-flows unassigned tabs into empty
    * zones and clamps the focused zone — so re-applying the current preset is a
    * real operation, and skipping it "because nothing changed" silently deletes
-   * the operator's re-pack (and `ZoneLayoutPicker`'s, which routes through
-   * this same handler). What was dishonest was the `✓`, never the call.
+   * the operator's un-maximize and placement of unassigned tabs (and
+   * `ZoneLayoutPicker`'s, which routes through this same handler). A tab in one
+   * of the layout's zones never moves. What was dishonest was the `✓`, never the call.
    */
   it("`/layout quad` reports ZERO but STILL re-applies, when already quad", async () => {
     h.reset();
@@ -530,8 +529,7 @@ describe("handlers — the shapes that recurred across nine rounds", () => {
  * when an arm changes nothing anywhere — which is what a dead arm, a
  * mis-shaped stub, or a handler that stopped reading its effect looks like.
  */
-const armSignature = (r: HandlerRow): string =>
-  `${r.verdict}\t${r.status}\t${r.report}`;
+const armSignature = (r: HandlerRow): string => `${r.verdict}\t${r.status}\t${r.report}`;
 
 async function characterizeArms(): Promise<string[]> {
   const key = (r: HandlerRow) => `${r.id}/${r.bag}`;

@@ -513,7 +513,7 @@
 /layout full-grid --tenant	literal	terminal.layout	[["preset","full-grid --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
 /layout fullgrid	pattern	terminal.layout	[["preset","fullgrid"]]	ok	ok /layout ✓ changed 1 layout — full-grid
 /layout fullgrid --tenant	literal	terminal.layout	[["preset","fullgrid --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
-/layout quad	pattern	terminal.layout	[["preset","quad"]]	ok	noop /layout · no layouts changed — already quad; grid re-packed
+/layout quad	pattern	terminal.layout	[["preset","quad"]]	ok	noop /layout · no layouts changed — already quad; re-applied
 /layout quad --tenant	literal	terminal.layout	[["preset","quad --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
 /layout single	pattern	terminal.layout	[["preset","single"]]	ok	ok /layout ✓ changed 1 layout — grew to split — 2 sessions do not fit single
 /layout single --tenant	literal	terminal.layout	[["preset","single --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
@@ -663,7 +663,7 @@
 /prompts 1 gmail fix the bug --tenant	literal	terminal.prompt	[]	unbound	-
 /prompts 3 best	literal	terminal.prompt	[]	unbound	-
 /prompts 3 best --tenant	literal	terminal.prompt	[]	unbound	-
-/quad layout	pattern	terminal.layout	[["preset","quad"]]	ok	noop /layout · no layouts changed — already quad; grid re-packed
+/quad layout	pattern	terminal.layout	[["preset","quad"]]	ok	noop /layout · no layouts changed — already quad; re-applied
 /quad layout --tenant	none	-	null	none	-
 /refresh plan	pattern	terminal.plan-refresh	[]	ok	noop /plan-refresh · no plan files reloaded — no PLAN*.md / TODO*.md in the workspace
 /refresh plan "1 gmail fix the bug"	none	-	null	none	-
@@ -1701,7 +1701,7 @@ layout full-grid	pattern	terminal.layout	[["preset","full-grid"]]	ok	ok /layout 
 layout full-grid --tenant	literal	terminal.layout	[["preset","full-grid --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
 layout fullgrid	pattern	terminal.layout	[["preset","fullgrid"]]	ok	ok /layout ✓ changed 1 layout — full-grid
 layout fullgrid --tenant	literal	terminal.layout	[["preset","fullgrid --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
-layout quad	pattern	terminal.layout	[["preset","quad"]]	ok	noop /layout · no layouts changed — already quad; grid re-packed
+layout quad	pattern	terminal.layout	[["preset","quad"]]	ok	noop /layout · no layouts changed — already quad; re-applied
 layout quad --tenant	literal	terminal.layout	[["preset","quad --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
 layout single	pattern	terminal.layout	[["preset","single"]]	ok	ok /layout ✓ changed 1 layout — grew to split — 2 sessions do not fit single
 layout single --tenant	literal	terminal.layout	[["preset","single --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
@@ -1851,7 +1851,7 @@ prompts 1 gmail fix the bug	literal	terminal.prompt	[]	unbound	-
 prompts 1 gmail fix the bug --tenant	literal	terminal.prompt	[]	unbound	-
 prompts 3 best	literal	terminal.prompt	[]	unbound	-
 prompts 3 best --tenant	literal	terminal.prompt	[]	unbound	-
-quad layout	pattern	terminal.layout	[["preset","quad"]]	ok	noop /layout · no layouts changed — already quad; grid re-packed
+quad layout	pattern	terminal.layout	[["preset","quad"]]	ok	noop /layout · no layouts changed — already quad; re-applied
 quad layout --tenant	none	-	null	none	-
 refresh plan	pattern	terminal.plan-refresh	[]	ok	noop /plan-refresh · no plan files reloaded — no PLAN*.md / TODO*.md in the workspace
 refresh plan "1 gmail fix the bug"	none	-	null	none	-
