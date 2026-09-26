@@ -2352,6 +2352,14 @@ impl TerminalSession {
         // depth — the supervisor strips it at the runner spawn, this covers a
         // runner started by any other means.
         cmd.env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV);
+        // The per-terminal coord-mcp key names the in-cwd `.mcp.json` references
+        // (`${QONTINUI_COORD_MCP_NONCE:-…}`). A value inherited from whatever
+        // launched the RUNNER (a runner started from inside another runner's
+        // pane) names a key THIS runner never minted and would silently shadow
+        // the workdir default with a 401. Only the identity seam, downstream,
+        // sets them — for this terminal's own key.
+        cmd.env_remove(crate::coord_mcp::QONTINUI_COORD_MCP_NONCE_ENV);
+        cmd.env_remove(crate::coord_mcp::QONTINUI_COORD_MCP_CREDENTIAL_ENV);
 
         // Set TERM for proper color/capability support.
         // xterm.js is a full xterm-compatible terminal, so use xterm-256color on all
@@ -3184,6 +3192,27 @@ impl TerminalSession {
                     terminal_id = %terminal_id,
                     path = %cfg_path.display(),
                     "coord-mcp: QONTINUI_MCP_CONFIG injected for universal --mcp-config delivery"
+                );
+            }
+            // A cwd whose `.mcp.json` is the runner's own env-referenced device
+            // document: hand THIS terminal its own key under the names that
+            // document references, so the proxy's caller self-id resolves this
+            // terminal deterministically (plan
+            // `2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages`).
+            // The nonce value is never logged — only its short prefix, the same
+            // one the rotation log carries.
+            if let Some(key) = &delivered.terminal_key {
+                cmd.env(crate::coord_mcp::QONTINUI_COORD_MCP_NONCE_ENV, &key.nonce);
+                if let Some(credential) = &key.credential {
+                    cmd.env(
+                        crate::coord_mcp::QONTINUI_COORD_MCP_CREDENTIAL_ENV,
+                        credential.to_string_lossy().as_ref(),
+                    );
+                }
+                info!(
+                    terminal_id = %terminal_id,
+                    key = ?key,
+                    "coord-mcp: terminal-bound key exported for the cwd's env-referenced .mcp.json"
                 );
             }
             delivered.delivery

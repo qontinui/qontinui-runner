@@ -837,7 +837,8 @@ pub(crate) use crate::coord_mcp_config::{
     proxy_nonce_from_header_object, proxy_nonce_from_request, COORD_MCP_PRINCIPAL_AGENT,
     COORD_MCP_PRINCIPAL_HEADER_JSON, COORD_MCP_PROXY_KEY_HEADER, COORD_MCP_PROXY_KEY_HEADER_JSON,
     COORD_MCP_STDIO_SHIM_CREDENTIAL_FLAG, COORD_MCP_STDIO_SHIM_FILE,
-    PROXY_AUTHORIZATION_HEADER_JSON, PROXY_BEARER_PREFIX,
+    PROXY_AUTHORIZATION_HEADER_JSON, PROXY_BEARER_PREFIX, QONTINUI_COORD_MCP_CREDENTIAL_ENV,
+    QONTINUI_COORD_MCP_NONCE_ENV,
 };
 
 /// The lead clause of every loopback-proxy "your key is dead" 401.
@@ -7322,7 +7323,11 @@ struct ReusableInCwdNonce {
     /// The file carries only the legacy `X-Coord-Mcp-Proxy-Key` header, so the
     /// next client launched against it would escalate a 401 into OAuth/DCR;
     /// the caller rewrites it through [`rewrite_config_preserving_nonce`].
-    /// Same repair as [`RootReconcileAction::UpgradeHeaders`].
+    /// Same repair as [`RootReconcileAction::UpgradeHeaders`]. Also set when the
+    /// file spells its credential LITERALLY rather than as the terminal env
+    /// reference ([`CredentialSpelling::TerminalEnvReference`]): the same
+    /// nonce-preserving rewrite moves it to the shape that lets a runner-spawned
+    /// terminal present its own key.
     needs_header_upgrade: bool,
 }
 
@@ -7391,8 +7396,24 @@ fn reusable_in_cwd_device_nonce(
     Some(ReusableInCwdNonce {
         nonce,
         terminal_id: binding.terminal_id,
-        needs_header_upgrade: !read_static_authorization_presence(&path),
+        needs_header_upgrade: !read_static_authorization_presence(&path)
+            || !read_terminal_env_reference(&path),
     })
+}
+
+/// Whether the `.mcp.json` at `config_path` spells its credential as the
+/// terminal env reference ([`CredentialSpelling::TerminalEnvReference`]). An
+/// unreadable file is `false`. The in-cwd reuse rewrites a LITERAL live device
+/// config into that shape with the SAME nonce (no mint, no eviction — the
+/// default arm is the very key the file carried), so a pre-existing shared cwd
+/// starts giving runner-spawned terminals their own key at its next spawn
+/// rather than never.
+fn read_terminal_env_reference(config_path: &Path) -> bool {
+    std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .map(|v| crate::coord_mcp_config::config_doc_references_terminal_env(&v))
+        .unwrap_or(false)
 }
 
 /// The key in `<workdir>/.mcp.json`, IF it is one a session in that cwd can
@@ -7519,11 +7540,7 @@ fn write_coord_mcp_proxy_config_with(primary_wt: &str, bound_port: u16, pin: Min
     let nonce = register_proxy_nonce_with(primary_wt, None, pin);
     write_mcp_json(
         primary_wt,
-        &coord_mcp_proxy_config_json(
-            bound_port,
-            &nonce,
-            ProxyConfigIdentity::device(primary_wt, None),
-        ),
+        &coord_mcp_in_cwd_device_config_json(bound_port, &nonce, primary_wt),
     );
 }
 
@@ -7553,11 +7570,7 @@ fn write_coord_mcp_proxy_config_with(primary_wt: &str, bound_port: u16, pin: Min
 fn rewrite_config_preserving_nonce(workdir: &str, bound_port: u16, nonce: &str) -> bool {
     write_mcp_json(
         workdir,
-        &coord_mcp_proxy_config_json(
-            bound_port,
-            nonce,
-            ProxyConfigIdentity::device(workdir, None),
-        ),
+        &coord_mcp_in_cwd_device_config_json(bound_port, nonce, workdir),
     )
 }
 
@@ -8092,7 +8105,65 @@ fn coord_mcp_proxy_config_json(
     nonce: &str,
     identity: ProxyConfigIdentity<'_>,
 ) -> serde_json::Value {
-    proxy_config_json_for(bound_port, nonce, identity, false)
+    proxy_config_json_for(
+        bound_port,
+        nonce,
+        identity,
+        false,
+        CredentialSpelling::Literal,
+    )
+}
+
+/// How a proxy document SPELLS its credential — an explicit builder input,
+/// never inferred (plan
+/// `2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages`,
+/// Phase 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialSpelling {
+    /// The nonce (http) or credential-file path (stdio) written verbatim. Every
+    /// emitter except the in-cwd device document: the AGENT writer (a
+    /// terminal's DEVICE nonce substituting for an agent nonce would be a
+    /// principal crossing), the per-terminal app-data `--mcp-config` (already
+    /// one file per terminal), and the `provision-session` route (its consumers
+    /// are scripts that replay the header value themselves).
+    Literal,
+    /// `${QONTINUI_COORD_MCP_NONCE:-<nonce>}` in both http header values and
+    /// `${QONTINUI_COORD_MCP_CREDENTIAL:-<file>}` as the stdio `--credential`
+    /// argument — ONLY for the in-cwd, terminal-less DEVICE document, which
+    /// every session in the cwd reads. A runner-spawned terminal exports its own
+    /// terminal-bound key under those names; every other session falls back to
+    /// the default arm, i.e. to exactly the workdir key it read before. See
+    /// [`crate::coord_mcp_config::QONTINUI_COORD_MCP_NONCE_ENV`] for why the
+    /// default is never omitted.
+    TerminalEnvReference,
+}
+
+/// `value` as `${NAME:-value}` under [`CredentialSpelling::TerminalEnvReference`],
+/// verbatim otherwise.
+fn spell_credential(spelling: CredentialSpelling, env_name: &str, value: &str) -> String {
+    match spelling {
+        CredentialSpelling::Literal => value.to_string(),
+        CredentialSpelling::TerminalEnvReference => format!("${{{env_name}:-{value}}}"),
+    }
+}
+
+/// THE in-cwd, terminal-less DEVICE `<workdir>/.mcp.json` document — the one
+/// document that spells its credential as an environment reference with a
+/// default ([`CredentialSpelling::TerminalEnvReference`]). Emitted by
+/// [`write_coord_mcp_proxy_config`] and [`rewrite_config_preserving_nonce`]
+/// only. Under the stdio arm the credential FILE it names stays literal.
+fn coord_mcp_in_cwd_device_config_json(
+    bound_port: u16,
+    nonce: &str,
+    workdir: &str,
+) -> serde_json::Value {
+    proxy_config_json_for(
+        bound_port,
+        nonce,
+        ProxyConfigIdentity::device(workdir, None),
+        false,
+        CredentialSpelling::TerminalEnvReference,
+    )
 }
 
 /// The http-transport document — today's shape, byte-for-byte — with the
@@ -8100,14 +8171,25 @@ fn coord_mcp_proxy_config_json(
 /// `{url, headers}` contract; the stdio arm carries exactly this object into
 /// the credential file rather than inline.
 fn http_proxy_config_json(bound_port: u16, nonce: &str, agent_marked: bool) -> serde_json::Value {
+    http_proxy_config_json_spelled(bound_port, nonce, agent_marked, CredentialSpelling::Literal)
+}
+
+/// [`http_proxy_config_json`] with the credential spelling explicit.
+fn http_proxy_config_json_spelled(
+    bound_port: u16,
+    nonce: &str,
+    agent_marked: bool,
+    spelling: CredentialSpelling,
+) -> serde_json::Value {
+    let spelled = spell_credential(spelling, QONTINUI_COORD_MCP_NONCE_ENV, nonce);
     let mut doc = serde_json::json!({
         "mcpServers": {
             "coord-mcp": {
                 "type": "http",
                 "url": format!("http://127.0.0.1:{bound_port}/coord-mcp"),
                 "headers": {
-                    (PROXY_AUTHORIZATION_HEADER_JSON): format!("{PROXY_BEARER_PREFIX}{nonce}"),
-                    (COORD_MCP_PROXY_KEY_HEADER_JSON): nonce,
+                    (PROXY_AUTHORIZATION_HEADER_JSON): format!("{PROXY_BEARER_PREFIX}{spelled}"),
+                    (COORD_MCP_PROXY_KEY_HEADER_JSON): spelled,
                 }
             }
         }
@@ -8133,8 +8215,21 @@ fn proxy_config_json_for(
     nonce: &str,
     identity: ProxyConfigIdentity<'_>,
     agent_marked: bool,
+    spelling: CredentialSpelling,
 ) -> serde_json::Value {
-    let http = http_proxy_config_json(bound_port, nonce, agent_marked);
+    // An agent document is NEVER env-referenced: a terminal's DEVICE nonce
+    // substituting for an agent nonce would be a principal crossing. Both agent
+    // callers pass `Literal`; this is the structural backstop.
+    debug_assert!(
+        !(agent_marked && spelling == CredentialSpelling::TerminalEnvReference),
+        "an agent-principal document must never spell its credential as an env reference"
+    );
+    let spelling = if agent_marked {
+        CredentialSpelling::Literal
+    } else {
+        spelling
+    };
+    let http = http_proxy_config_json_spelled(bound_port, nonce, agent_marked, spelling);
     let (interpreter, shim) = match stdio_shim_gate() {
         StdioShimGate::Open { interpreter, shim } => (interpreter, shim),
         StdioShimGate::TestDefault => return http,
@@ -8151,7 +8246,10 @@ fn proxy_config_json_for(
             return http;
         }
     };
-    let entry = &http["mcpServers"]["coord-mcp"];
+    // The credential FILE always carries the literal headers: the shim reads
+    // it verbatim, and only the document's `--credential` argument is spelled.
+    let literal = http_proxy_config_json(bound_port, nonce, agent_marked);
+    let entry = &literal["mcpServers"]["coord-mcp"];
     match write_stdio_shim_credential(identity, &entry["url"], &entry["headers"]) {
         Ok(credential) => serde_json::json!({
             "mcpServers": {
@@ -8161,7 +8259,11 @@ fn proxy_config_json_for(
                     "args": [
                         shim.to_string_lossy(),
                         COORD_MCP_STDIO_SHIM_CREDENTIAL_FLAG,
-                        credential.to_string_lossy(),
+                        spell_credential(
+                            spelling,
+                            QONTINUI_COORD_MCP_CREDENTIAL_ENV,
+                            &credential.to_string_lossy(),
+                        ),
                     ],
                 }
             }
@@ -8261,7 +8363,13 @@ fn coord_mcp_agent_proxy_config_json(
     nonce: &str,
     identity: ProxyConfigIdentity<'_>,
 ) -> serde_json::Value {
-    proxy_config_json_for(bound_port, nonce, identity, true)
+    proxy_config_json_for(
+        bound_port,
+        nonce,
+        identity,
+        true,
+        CredentialSpelling::Literal,
+    )
 }
 
 /// Filename of the breadcrumb dropped into a session workdir when coord-mcp is
@@ -9614,13 +9722,19 @@ fn existing_config_write_verdict(workdir: &str, intended: IntendedWrite) -> Exis
                 // nonce-is-never-JWT-shaped fact [`looks_like_jwt`] rests on —
                 // but it is load-bearing enough to be pinned by a test
                 // (`coord_mcp_safe_to_write_*` below) rather than left implicit.
-                let existing_is_static_bearer_agent = parsed
-                    .pointer("/mcpServers/coord-mcp/headers/Authorization")
-                    .and_then(|v| v.as_str())
-                    .and_then(|h| h.strip_prefix(PROXY_BEARER_PREFIX))
-                    .and_then(|tok| jwt_unverified_claim(tok, "sub_type"))
-                    .map(|st| st == "agent")
-                    .unwrap_or(false);
+                // Through the effective entry, like every other config reader,
+                // so an env-referenced value is judged by its default arm.
+                let existing_is_static_bearer_agent =
+                    crate::coord_mcp_config::effective_coord_mcp_entry(&parsed)
+                        .and_then(|entry| {
+                            entry
+                                .pointer("/headers/Authorization")
+                                .and_then(|v| v.as_str())
+                                .and_then(|h| h.strip_prefix(PROXY_BEARER_PREFIX))
+                                .and_then(|tok| jwt_unverified_claim(tok, "sub_type"))
+                        })
+                        .map(|st| st == "agent")
+                        .unwrap_or(false);
                 // The SECOND agent shape, and the one the JWT decode above is
                 // structurally unable to see. An agent PROXY config carries a
                 // 64-hex nonce in `Authorization`, not a JWT — `looks_like_jwt`
@@ -10617,6 +10731,121 @@ pub(crate) struct TerminalCoordMcp {
     /// The app-data `--mcp-config` file to export as [`MCP_CONFIG_ENV`], when
     /// one was provisioned.
     pub(crate) config_path: Option<std::path::PathBuf>,
+    /// The terminal-bound key minted for a cwd whose `.mcp.json` is the
+    /// runner's own env-referenced device document
+    /// ([`CredentialSpelling::TerminalEnvReference`]) — exported into the PTY as
+    /// [`QONTINUI_COORD_MCP_NONCE_ENV`] / [`QONTINUI_COORD_MCP_CREDENTIAL_ENV`].
+    /// `None` on every other arm, and on a declared cwd whose document does not
+    /// reference those variables (hand-written, foreign, agent, or the older
+    /// literal shape), where today's behaviour holds exactly.
+    pub(crate) terminal_key: Option<TerminalBoundKey>,
+}
+
+/// A terminal-bound coord-mcp key for a declared cwd (plan
+/// `2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages`,
+/// Phase 2). `Debug` prints a nonce PREFIX only — this struct rides inside
+/// [`TerminalCoordMcp`], which is `Debug`, and a nonce is a credential.
+pub(crate) struct TerminalBoundKey {
+    /// The nonce, bound to this terminal ([`terminal_id_for_nonce`] resolves
+    /// it back), exported as [`QONTINUI_COORD_MCP_NONCE_ENV`].
+    pub(crate) nonce: String,
+    /// This terminal's shim credential file, exported as
+    /// [`QONTINUI_COORD_MCP_CREDENTIAL_ENV`] — present only when the declared
+    /// document is the stdio shape (it references that variable).
+    pub(crate) credential: Option<std::path::PathBuf>,
+}
+
+impl std::fmt::Debug for TerminalBoundKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminalBoundKey")
+            .field("key_prefix", &rotation_key_prefix(&self.nonce))
+            .field("credential", &self.credential)
+            .finish()
+    }
+}
+
+/// Mint a terminal-bound key for a cwd that already declares coord-mcp, IFF
+/// the declared document is the runner's own env-referenced device document.
+///
+/// This is what makes the deterministic caller self-id leg (`nonce →
+/// terminal_id → open lifecycle record → claude_session_id`) engage in a cwd
+/// that declares coord-mcp: the in-cwd file's nonce names no terminal (one file,
+/// many sessions), but its credential is spelled
+/// `${QONTINUI_COORD_MCP_NONCE:-<workdir nonce>}`, so the terminal this seam is
+/// spawning presents the key minted here while every other session in the cwd
+/// keeps the workdir key.
+///
+/// Everything below returns `None` — today's behaviour, no mint — unless every
+/// condition holds:
+/// - the bound port is known;
+/// - the document references our variables
+///   ([`crate::coord_mcp_config::config_doc_references_terminal_env`]) and
+///   carries no agent marker (an agent document is never env-referenced; a
+///   hand-edited one must not become a device key's carrier);
+/// - its workdir key is a LIVE usable cwd key ([`live_cwd_device_binding`], the
+///   definition [`declared_workdir_key`] and the tenant admission share).
+///
+/// **Tenancy does not move.** The new key carries the workdir key's pin and
+/// origin verbatim ([`carried_pin_for_rewrite`]) — the session presents exactly
+/// the tenant it would have presented through the workdir key. Minting with a
+/// terminal id evicts only that terminal's prior key, never the workdir's
+/// terminal-less one ([`register_proxy_nonce_with`]).
+///
+/// A stdio document additionally gets this terminal's own credential file
+/// ([`write_stdio_shim_credential`], literal headers); if that write fails the
+/// key is revoked and `None` returned, so a failure is exactly today's
+/// behaviour rather than a half-delivered key.
+fn mint_terminal_key_for_declared_cwd(
+    cwd: &str,
+    terminal_id: &str,
+    bound_port: Option<u16>,
+) -> Option<TerminalBoundKey> {
+    let port = bound_port?;
+    let doc: serde_json::Value = std::fs::read_to_string(Path::new(cwd).join(".mcp.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())?;
+    if !crate::coord_mcp_config::config_doc_references_terminal_env(&doc)
+        || config_doc_is_agent_marked(&doc)
+    {
+        return None;
+    }
+    let Some((workdir_nonce, _)) = live_cwd_device_binding(cwd, port) else {
+        info!(
+            "coord-mcp: terminal {terminal_id}: {cwd}/.mcp.json is env-referenced but its              workdir key is not a live cwd key on :{port} — no terminal-bound key minted"
+        );
+        return None;
+    };
+    let pin = carried_pin_for_rewrite(Some(&workdir_nonce));
+    let nonce = register_proxy_nonce_with(cwd, Some(terminal_id), pin);
+    let wants_credential_file = crate::coord_mcp_config::config_doc_is_stdio_shim(&doc);
+    let credential = if wants_credential_file {
+        let http = http_proxy_config_json(port, &nonce, false);
+        let entry = &http["mcpServers"]["coord-mcp"];
+        match write_stdio_shim_credential(
+            ProxyConfigIdentity::device(cwd, Some(terminal_id)),
+            &entry["url"],
+            &entry["headers"],
+        ) {
+            Ok(path) => Some(path),
+            Err(e) => {
+                warn!(
+                    "coord-mcp: terminal {terminal_id}: could not write its shim credential                      file ({e}) — revoking the terminal-bound key; the session keeps the                      workdir key"
+                );
+                revoke_proxy_nonce(&nonce);
+                return None;
+            }
+        }
+    } else {
+        None
+    };
+    log_rotation_event_with(
+        "write",
+        cwd,
+        &nonce,
+        "terminal-bound key for an env-referenced declared cwd (exported into the PTY env)",
+        &[("terminal_id", serde_json::Value::from(terminal_id))],
+    );
+    Some(TerminalBoundKey { nonce, credential })
 }
 
 /// The identity seam's coord-mcp delivery for one terminal
@@ -10630,6 +10859,13 @@ pub(crate) struct TerminalCoordMcp {
 /// `.mcp.json` was written before this spawn). Re-injecting there would give the
 /// session two coord-mcp entries racing the per-workdir nonce, and the loser
 /// 401s / shows FAILED — so the existing file owns it.
+///
+/// When that existing file is the runner's OWN in-cwd device document, it
+/// spells its credential as `${QONTINUI_COORD_MCP_NONCE:-<workdir nonce>}`, so
+/// the seam still gives THIS terminal its own key without a second entry:
+/// [`mint_terminal_key_for_declared_cwd`] mints a terminal-bound nonce (and, for
+/// the stdio document, a terminal credential file) that the PTY exports under
+/// the referenced names ([`TerminalCoordMcp::terminal_key`]).
 ///
 /// `spawn_tenant` is the caller's choice BEFORE the kill switch
 /// ([`credential_spawn_tenant`] is applied here). With a tenant:
@@ -10691,13 +10927,21 @@ fn deliver_terminal_coord_mcp_unrecorded(
             "coord-mcp: terminal {terminal_id}: cwd already declares coord-mcp — skipping \
              --mcp-config injection"
         );
+        // The tenant check above has admitted the cwd's key, so a terminal key
+        // carrying that key's pin changes no tenancy. Only the runner's own
+        // env-referenced document gets one; every other declared file keeps
+        // today's behaviour exactly.
+        let terminal_key = mint_terminal_key_for_declared_cwd(cwd, terminal_id, bound_port);
         // UNPROBED, not unreachable: the runner neither wrote that file nor
         // asked it anything, so its bearer may be stale, foreign, or bound to a
         // port nothing serves. This is the arm the 2026-08-21 measurement landed
-        // on.
+        // on. It stays `WorkdirDeclared` with a terminal key too: the key is live,
+        // but whether the session's client expands the reference is the client's
+        // behaviour, which this runner does not observe.
         return Ok(TerminalCoordMcp {
             delivery: CoordMcpDelivery::WorkdirDeclared,
             config_path: None,
+            terminal_key,
         });
     }
     match provision_coord_mcp_config_file(cwd, Some(terminal_id), credential_tenant, bound_port)? {
@@ -10708,6 +10952,7 @@ fn deliver_terminal_coord_mcp_unrecorded(
             Ok(TerminalCoordMcp {
                 delivery: CoordMcpDelivery::Provisioned,
                 config_path: Some(config_path),
+                terminal_key: None,
             })
         }
         None => {
@@ -10729,6 +10974,7 @@ fn deliver_terminal_coord_mcp_unrecorded(
             Ok(TerminalCoordMcp {
                 delivery: CoordMcpDelivery::Unprovisioned,
                 config_path: None,
+                terminal_key: None,
             })
         }
     }
@@ -13075,14 +13321,23 @@ mod tests {
             "URL must target the loopback proxy on the PASSED bound port"
         );
 
-        // The nonce header is present, non-empty, and live in the registry.
-        let nonce = server["headers"]["X-Coord-Mcp-Proxy-Key"]
-            .as_str()
-            .expect("proxy config must carry the per-session nonce header");
+        // The nonce is present, non-empty, and live in the registry. The in-cwd
+        // DEVICE document spells it as a terminal env reference WITH the
+        // workdir nonce as its default (plan 2026-09-22 one-nonce-per-terminal)
+        // — read back through the chokepoint, which resolves the default arm.
+        let nonce_owned = read_proxy_nonce(&tmp.join(".mcp.json"))
+            .expect("proxy config must carry the per-session nonce");
+        let nonce = nonce_owned.as_str();
         assert!(!nonce.is_empty());
         assert!(
             proxy_nonce_is_valid(nonce),
             "the written nonce must be registered for the proxy gate"
+        );
+        let spelled = format!("${{QONTINUI_COORD_MCP_NONCE:-{nonce}}}");
+        assert_eq!(
+            server["headers"]["X-Coord-Mcp-Proxy-Key"],
+            serde_json::Value::from(spelled.clone()),
+            "the legacy header carries the env reference with the workdir default: {written}"
         );
 
         // NO baked bearer TOKEN — the whole point is the proxy injects a live
@@ -13091,13 +13346,16 @@ mod tests {
         // never appear there is a JWT.
         assert_eq!(
             server["headers"]["Authorization"],
-            serde_json::Value::from(format!("Bearer {nonce}")),
+            serde_json::Value::from(format!("Bearer {spelled}")),
             "proxy shape must carry the nonce as a bearer: {written}"
         );
         assert!(
             !crate::coord_mcp_config::looks_like_jwt(nonce),
             "proxy shape must NOT bake a static Authorization TOKEN: {written}"
         );
+        assert!(crate::coord_mcp_config::config_doc_references_terminal_env(
+            &v
+        ));
 
         // Re-provisioning the same workdir mints a FRESH nonce and moves the
         // prior one onto the grace TTL (plan 2026-07-07 Change 3): the old nonce
@@ -13108,9 +13366,9 @@ mod tests {
         write_coord_mcp_proxy_config(&primary_wt, 23456, None);
         let reprovisioned = std::fs::read_to_string(tmp.join(".mcp.json")).unwrap();
         let v2: serde_json::Value = serde_json::from_str(&reprovisioned).unwrap();
-        let new_nonce = v2["mcpServers"]["coord-mcp"]["headers"]["X-Coord-Mcp-Proxy-Key"]
-            .as_str()
-            .expect("re-provision must carry a nonce header");
+        let new_nonce_owned =
+            proxy_nonce_from_config_doc(&v2).expect("re-provision must carry a nonce header");
+        let new_nonce = new_nonce_owned.as_str();
         assert_ne!(new_nonce, nonce, "a re-provision must mint a fresh nonce");
         assert!(
             proxy_nonce_is_valid(new_nonce),
@@ -13568,7 +13826,14 @@ mod tests {
         assert_eq!(args.len(), 3, "{written}");
         assert_eq!(args[0], shim.to_string_lossy().as_ref());
         assert_eq!(args[1], COORD_MCP_STDIO_SHIM_CREDENTIAL_FLAG);
-        let credential = std::path::PathBuf::from(args[2].as_str().unwrap());
+        // The in-cwd document references the per-terminal credential variable,
+        // defaulting to the WORKDIR credential file.
+        let arg2 = args[2].as_str().unwrap();
+        let credential = std::path::PathBuf::from(
+            arg2.strip_prefix("${QONTINUI_COORD_MCP_CREDENTIAL:-")
+                .and_then(|r| r.strip_suffix('}'))
+                .unwrap_or_else(|| panic!("--credential must be env-referenced: {arg2}")),
+        );
         assert!(credential.is_absolute(), "{}", credential.display());
         assert!(
             server.get("url").is_none() && server.get("headers").is_none(),
@@ -13622,7 +13887,10 @@ mod tests {
         let v2 = read_json(&mcp_path);
         assert_eq!(
             v2["mcpServers"]["coord-mcp"]["args"][2],
-            credential.to_string_lossy().as_ref(),
+            format!(
+                "${{QONTINUI_COORD_MCP_CREDENTIAL:-{}}}",
+                credential.display()
+            ),
             "rotation must rewrite the path the live shim is already reading"
         );
         let rotated = read_json(&credential)["headers"]["X-Coord-Mcp-Proxy-Key"]
@@ -13904,9 +14172,9 @@ mod tests {
         assert_eq!(read_proxy_nonce(&mcp_path).as_deref(), Some(nonce.as_str()));
         assert_eq!(read_proxy_port(&wd), Some(23461));
 
-        // Same identity ⇒ same file as the spawn writer would use.
-        let credential =
-            std::path::PathBuf::from(v["mcpServers"]["coord-mcp"]["args"][2].as_str().unwrap());
+        // Same identity ⇒ same file as the spawn writer would use. The argument
+        // is env-referenced; the chokepoint resolves its default arm.
+        let credential = crate::coord_mcp_config::stdio_shim_credential_path(&v).unwrap();
         assert_eq!(
             credential.file_name().unwrap().to_string_lossy(),
             ProxyConfigIdentity::device(&wd, None).credential_file_name()
@@ -14573,14 +14841,21 @@ mod tests {
             server["url"], "http://127.0.0.1:19876/coord-mcp",
             "device path must emit the loopback proxy URL on the passed port"
         );
+        // The in-cwd device document is env-referenced (plan 2026-09-22
+        // one-nonce-per-terminal); its values are read at their DEFAULT arm,
+        // through the same chokepoint every runner reader uses.
+        let effective = crate::coord_mcp_config::effective_coord_mcp_entry(&v).unwrap();
         assert!(
-            server["headers"]["X-Coord-Mcp-Proxy-Key"]
+            effective["headers"]["X-Coord-Mcp-Proxy-Key"]
                 .as_str()
-                .is_some_and(|n| proxy_nonce_is_valid(n)),
+                .is_some_and(proxy_nonce_is_valid),
             "device path must carry a registered per-session nonce"
         );
+        assert!(crate::coord_mcp_config::config_doc_references_terminal_env(
+            &v
+        ));
         assert!(
-            server["headers"]["Authorization"]
+            effective["headers"]["Authorization"]
                 .as_str()
                 .and_then(crate::coord_mcp_config::proxy_nonce_from_authorization)
                 .is_some_and(proxy_nonce_is_valid),
@@ -16705,11 +16980,14 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(stale.join(".mcp.json")).unwrap())
                 .unwrap();
-        let new_nonce = v["mcpServers"]["coord-mcp"]["headers"]["X-Coord-Mcp-Proxy-Key"]
-            .as_str()
-            .unwrap();
+        // Rewritten through the in-cwd device writer, so env-referenced: read
+        // at the default arm.
+        let new_nonce = proxy_nonce_from_config_doc(&v).unwrap();
+        assert!(crate::coord_mcp_config::config_doc_references_terminal_env(
+            &v
+        ));
         assert!(
-            proxy_nonce_is_valid(new_nonce),
+            proxy_nonce_is_valid(&new_nonce),
             "the rewritten config must carry a freshly-registered nonce"
         );
 
@@ -16721,7 +16999,13 @@ mod tests {
         let up: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(legacy.join(".mcp.json")).unwrap())
                 .unwrap();
-        let up_headers = &up["mcpServers"]["coord-mcp"]["headers"];
+        // The upgrade writes the env-referenced in-cwd shape; its values are
+        // judged at the default arm, through the readers' own chokepoint.
+        assert!(crate::coord_mcp_config::config_doc_references_terminal_env(
+            &up
+        ));
+        let up_entry = crate::coord_mcp_config::effective_coord_mcp_entry(&up).unwrap();
+        let up_headers = &up_entry["headers"];
         assert_eq!(
             up_headers[PROXY_AUTHORIZATION_HEADER_JSON],
             serde_json::Value::from(format!("{PROXY_BEARER_PREFIX}{n_keep}")),
@@ -16770,7 +17054,7 @@ mod tests {
             for n in [&n_keep, &n_keepauth, &n_adopt] {
                 m.remove(n);
             }
-            m.remove(new_nonce);
+            m.remove(&new_nonce);
         }
 
         let _ = std::fs::remove_dir_all(&base);
@@ -17205,7 +17489,8 @@ mod tests {
                 .unwrap();
         assert_eq!(
             v["mcpServers"]["coord-mcp"]["headers"]["Authorization"],
-            serde_json::Value::from(format!("Bearer {new_nonce}"))
+            serde_json::Value::from(format!("Bearer ${{QONTINUI_COORD_MCP_NONCE:-{new_nonce}}}")),
+            "the rewritten root config is the env-referenced in-cwd device shape"
         );
 
         // --- Case 2: matching port + LIVE nonce → Leave (no rewrite). ---
@@ -17728,9 +18013,13 @@ mod tests {
 
         let after: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // The upgrade writes the in-cwd device shape, which spells the SAME
+        // nonce as the terminal env reference with it as the default.
         assert_eq!(
             after["mcpServers"]["coord-mcp"]["headers"][PROXY_AUTHORIZATION_HEADER_JSON],
-            serde_json::Value::from(format!("{PROXY_BEARER_PREFIX}{live}")),
+            serde_json::Value::from(format!(
+                "{PROXY_BEARER_PREFIX}${{{QONTINUI_COORD_MCP_NONCE_ENV}:-{live}}}"
+            )),
             "the upgraded file must carry the static Authorization key"
         );
         assert_eq!(
@@ -21987,7 +22276,8 @@ mod spawn_tenant_credential_tests {
             deliver_terminal_coord_mcp(&wd, &term, None, Some(PORT)),
             Ok(TerminalCoordMcp {
                 delivery: CoordMcpDelivery::WorkdirDeclared,
-                config_path: None
+                config_path: None,
+                ..
             })
         ));
 
@@ -22696,5 +22986,391 @@ mod spawn_tenant_credential_tests {
         assert!(spawn_tenant_credential_enabled_from(Some("")));
         assert!(!spawn_tenant_credential_enabled_from(Some("0")));
         assert!(!spawn_tenant_credential_enabled_from(Some(" 0 ")));
+    }
+}
+
+/// Plan `2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages`,
+/// Phase 2: the in-cwd device `.mcp.json` spells its credential as a terminal
+/// env reference with the workdir key as its default, every runner reader
+/// resolves the default arm, and the identity seam mints a terminal-bound key
+/// for a runner-spawned terminal in such a cwd.
+#[cfg(test)]
+mod terminal_env_reference_tests {
+    use super::*;
+    use crate::session::tenant_pin::TenantPin;
+
+    const PORT: u16 = 23_917;
+
+    fn tenant_b() -> Uuid {
+        Uuid::from_u128(0xB2B2_0000_0000_4000_8000_0000_0000_00B2)
+    }
+
+    fn workdir(amb: &crate::test_env::IsolatedAmbient, tag: &str) -> String {
+        let wd = amb
+            .dir()
+            .join(format!("wd-{tag}-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&wd).unwrap();
+        wd.to_string_lossy().to_string()
+    }
+
+    fn terminal() -> String {
+        format!("term-{}", Uuid::new_v4())
+    }
+
+    fn terminal_has_nonce(terminal_id: &str) -> bool {
+        proxy_nonces()
+            .lock()
+            .unwrap()
+            .values()
+            .any(|b| b.terminal_id.as_deref() == Some(terminal_id))
+    }
+
+    fn read_doc(path: &Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn open_gate(amb: &crate::test_env::IsolatedAmbient) -> StdioShimGateGuard {
+        StdioShimGateGuard::install(StdioShimGateOverride::Fixed(StdioShimGate::Open {
+            interpreter: amb.dir().join("fake-python"),
+            shim: amb
+                .dir()
+                .join("fake-scripts")
+                .join(COORD_MCP_STDIO_SHIM_FILE),
+        }))
+    }
+
+    /// Write the OLDER literal in-cwd shape (what every file written before
+    /// this phase carries) around a freshly registered workdir nonce.
+    fn write_literal_device_doc(wd: &str) -> String {
+        let nonce = register_proxy_nonce(wd, None, None);
+        assert!(write_mcp_json(
+            wd,
+            &coord_mcp_proxy_config_json(PORT, &nonce, ProxyConfigIdentity::device(wd, None)),
+        ));
+        nonce
+    }
+
+    fn header_values(doc: &serde_json::Value) -> Vec<String> {
+        doc["mcpServers"]["coord-mcp"]["headers"]
+            .as_object()
+            .map(|h| {
+                h.values()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Writer: ONLY the in-cwd device document is env-referenced. The agent
+    /// document, the per-terminal `--mcp-config` and the provision-session route
+    /// stay literal — a terminal's device key must never stand in for an agent
+    /// nonce, and the other two are not shared-cwd files.
+    #[test]
+    fn only_the_in_cwd_device_document_is_env_referenced_http() {
+        let amb = crate::test_env::isolated_ambient();
+        let wd = workdir(&amb, "writer");
+
+        write_coord_mcp_proxy_config(&wd, PORT, None);
+        let device = read_doc(&Path::new(&wd).join(".mcp.json"));
+        let nonce = proxy_nonce_from_config_doc(&device).unwrap();
+        assert_eq!(
+            header_values(&device).len(),
+            2,
+            "Authorization + legacy header: {device}"
+        );
+        for v in header_values(&device) {
+            assert!(
+                v.contains(&format!("${{{QONTINUI_COORD_MCP_NONCE_ENV}:-{nonce}}}")),
+                "every header value carries the reference WITH the default: {v}"
+            );
+        }
+
+        // The agent document: literal, marked, and never env-referenced.
+        let agent_wd = workdir(&amb, "agent");
+        write_coord_mcp_agent_proxy_config(&agent_wd, PORT, Uuid::new_v4());
+        let agent = read_doc(&Path::new(&agent_wd).join(".mcp.json"));
+        assert!(!crate::coord_mcp_config::config_doc_references_terminal_env(&agent));
+        assert!(
+            header_values(&agent).iter().all(|v| !v.contains("${")),
+            "{agent}"
+        );
+        assert!(config_doc_is_agent_marked(&agent));
+
+        // The per-terminal app-data --mcp-config: literal.
+        let term = terminal();
+        let path = provision_coord_mcp_config_file(&wd, Some(&term), None, Some(PORT))
+            .unwrap()
+            .unwrap();
+        let per_terminal = read_doc(&path);
+        assert!(!crate::coord_mcp_config::config_doc_references_terminal_env(&per_terminal));
+        assert!(header_values(&per_terminal)
+            .iter()
+            .all(|v| !v.contains("${")));
+
+        // The provision-session mint route: literal.
+        let minted = provision_session_proxy_config_at(&wd, PORT, None);
+        assert!(!crate::coord_mcp_config::config_doc_references_terminal_env(&minted));
+        assert!(header_values(&minted).iter().all(|v| !v.contains("${")));
+    }
+
+    /// Writer, stdio arm: the in-cwd document's `--credential` argument is the
+    /// env reference (default = the workdir credential file) while the FILE
+    /// stays literal; the agent document's argument stays a literal path.
+    #[test]
+    fn only_the_in_cwd_device_document_is_env_referenced_stdio() {
+        let amb = crate::test_env::isolated_ambient();
+        let _gate = open_gate(&amb);
+        let wd = workdir(&amb, "stdio");
+
+        write_coord_mcp_proxy_config(&wd, PORT, None);
+        let mcp = Path::new(&wd).join(".mcp.json");
+        let doc = read_doc(&mcp);
+        let arg = doc["mcpServers"]["coord-mcp"]["args"][2]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let file = crate::coord_mcp_config::stdio_shim_credential_path(&doc).unwrap();
+        assert_eq!(
+            arg,
+            format!(
+                "${{{QONTINUI_COORD_MCP_CREDENTIAL_ENV}:-{}}}",
+                file.display()
+            )
+        );
+        let cred = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            !cred.contains("${"),
+            "the credential FILE stays literal: {cred}"
+        );
+        let nonce = read_proxy_nonce(&mcp).expect("the reader resolves through the default");
+        assert!(proxy_nonce_is_valid(&nonce));
+
+        let agent_wd = workdir(&amb, "stdio-agent");
+        write_coord_mcp_agent_proxy_config(&agent_wd, PORT, Uuid::new_v4());
+        let agent = read_doc(&Path::new(&agent_wd).join(".mcp.json"));
+        let agent_arg = agent["mcpServers"]["coord-mcp"]["args"][2]
+            .as_str()
+            .unwrap();
+        assert!(!agent_arg.contains("${"), "{agent_arg}");
+        assert!(!crate::coord_mcp_config::config_doc_references_terminal_env(&agent));
+        assert!(config_doc_is_agent_marked(&agent));
+    }
+
+    /// Readers: the env-referenced document reads back as the workdir key
+    /// everywhere, is HEALTHY to the boot reconcile (no rewrite, no upgrade,
+    /// no adopt — byte-identical across a boot), and its tenant pin is carried.
+    #[test]
+    fn readers_resolve_the_default_and_the_boot_reconcile_leaves_it_alone() {
+        let amb = crate::test_env::isolated_ambient();
+        let wd = workdir(&amb, "readers");
+        write_coord_mcp_proxy_config(&wd, PORT, Some(tenant_b()));
+        let mcp = Path::new(&wd).join(".mcp.json");
+        let before = std::fs::read_to_string(&mcp).unwrap();
+        let nonce = read_proxy_nonce(&mcp).expect("read_proxy_nonce resolves the default");
+        assert!(live_binding(&nonce).is_some());
+        assert_eq!(read_proxy_port(&wd), Some(PORT));
+        assert!(read_static_authorization_presence(&mcp));
+        assert!(read_terminal_env_reference(&mcp));
+        assert_eq!(
+            declared_workdir_key(&wd, Some(PORT)),
+            DeclaredWorkdirKey::Pinned(tenant_b())
+        );
+        assert_eq!(
+            carried_pin_for_rewrite(Some(&nonce)),
+            MintPin::Carried(tenant_b(), PinOrigin::Explicit)
+        );
+        assert_eq!(
+            classify_mcp_json_doc(&read_doc(&mcp)),
+            McpJsonShape::OursProxy
+        );
+        assert_eq!(
+            existing_config_write_verdict(&wd, IntendedWrite::Device),
+            ExistingConfigVerdict::Allowed
+        );
+
+        let counts = reconcile_session_configs(vec![wd.clone()], PORT);
+        assert_eq!(
+            (counts.rewritten, counts.upgraded, counts.adopted),
+            (0, 0, 0),
+            "a healthy env-referenced config is left alone"
+        );
+        assert_eq!(std::fs::read_to_string(&mcp).unwrap(), before);
+
+        // The in-cwd reuse finds nothing to upgrade either.
+        let reuse = reusable_in_cwd_device_nonce(&wd, PORT, Some(tenant_b())).unwrap();
+        assert_eq!(reuse.nonce, nonce);
+        assert!(!reuse.needs_header_upgrade);
+    }
+
+    /// The in-cwd reuse moves an OLDER literal live config to the
+    /// env-referenced shape with the SAME nonce — no mint, no eviction.
+    #[test]
+    fn the_in_cwd_reuse_upgrades_a_literal_config_preserving_its_nonce() {
+        let amb = crate::test_env::isolated_ambient();
+        let wd = workdir(&amb, "reuse");
+        let nonce = write_literal_device_doc(&wd);
+        let mcp = Path::new(&wd).join(".mcp.json");
+        assert!(!read_terminal_env_reference(&mcp));
+
+        let reuse = reusable_in_cwd_device_nonce(&wd, PORT, None).unwrap();
+        assert_eq!(reuse.nonce, nonce);
+        assert!(reuse.needs_header_upgrade, "a literal config is upgraded");
+        assert!(rewrite_config_preserving_nonce(&wd, PORT, &reuse.nonce));
+        assert!(read_terminal_env_reference(&mcp));
+        assert_eq!(read_proxy_nonce(&mcp), Some(nonce.clone()));
+        assert!(live_binding(&nonce).is_some(), "no eviction");
+    }
+
+    /// Seam, http: a runner-spawned terminal in an env-referenced declared cwd
+    /// gets a key bound to ITSELF, pinned to the declared key's tenant, while
+    /// the workdir key and the file are untouched.
+    #[test]
+    fn the_seam_mints_a_terminal_bound_key_in_an_env_referenced_declared_cwd() {
+        let amb = crate::test_env::isolated_ambient();
+        let wd = workdir(&amb, "seam");
+        write_coord_mcp_proxy_config(&wd, PORT, Some(tenant_b()));
+        let mcp = Path::new(&wd).join(".mcp.json");
+        let before = std::fs::read_to_string(&mcp).unwrap();
+        let workdir_nonce = read_proxy_nonce(&mcp).unwrap();
+        let term = terminal();
+
+        let delivered = deliver_terminal_coord_mcp(&wd, &term, None, Some(PORT)).unwrap();
+        assert_eq!(delivered.delivery, CoordMcpDelivery::WorkdirDeclared);
+        assert_eq!(delivered.config_path, None);
+        let key = delivered
+            .terminal_key
+            .expect("an env-referenced declared cwd gets a terminal-bound key");
+        assert_ne!(key.nonce, workdir_nonce);
+        assert_eq!(
+            key.credential, None,
+            "the http shape needs no credential file"
+        );
+        assert_eq!(
+            terminal_id_for_nonce(&key.nonce).as_deref(),
+            Some(term.as_str())
+        );
+        assert_eq!(
+            proxy_session_pin_for_nonce(&key.nonce),
+            TenantPin::Pinned(tenant_b()),
+            "the terminal key carries the DECLARED key's tenant"
+        );
+        assert!(
+            live_binding(&workdir_nonce).is_some(),
+            "the workdir key is never evicted by a terminal-bound mint"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&mcp).unwrap(),
+            before,
+            "file untouched"
+        );
+        assert_eq!(
+            session_credential_tenant(&term, Some(&wd)),
+            CredentialTenantRead::Resolved(Some(tenant_b()))
+        );
+        // The Debug form never carries the nonce.
+        let dbg = format!("{key:?}");
+        assert!(!dbg.contains(&key.nonce), "{dbg}");
+
+        // A spawn that CHOSE the declared tenant is admitted and minted too.
+        crate::auth::AuthManager::new()
+            .store_tenant_device_jwt(&tenant_b(), "header.payload.signature")
+            .unwrap();
+        let term2 = terminal();
+        let chosen = deliver_terminal_coord_mcp(&wd, &term2, Some(tenant_b()), Some(PORT)).unwrap();
+        let key2 = chosen
+            .terminal_key
+            .expect("chosen-tenant spawn is minted too");
+        assert_eq!(
+            terminal_id_for_nonce(&key2.nonce).as_deref(),
+            Some(term2.as_str())
+        );
+        assert!(
+            live_binding(&key.nonce).is_some(),
+            "sibling terminals keep their keys"
+        );
+        assert!(live_binding(&workdir_nonce).is_some());
+    }
+
+    /// Seam, stdio: the terminal additionally gets its OWN credential file —
+    /// literal, carrying its own nonce — keyed by the terminal identity.
+    #[test]
+    fn the_seam_writes_a_terminal_credential_file_for_the_stdio_document() {
+        let amb = crate::test_env::isolated_ambient();
+        let _gate = open_gate(&amb);
+        let wd = workdir(&amb, "seam-stdio");
+        write_coord_mcp_proxy_config(&wd, PORT, None);
+        let term = terminal();
+
+        let delivered = deliver_terminal_coord_mcp(&wd, &term, None, Some(PORT)).unwrap();
+        let key = delivered
+            .terminal_key
+            .expect("stdio env-ref cwd gets a key");
+        let file = key
+            .credential
+            .clone()
+            .expect("stdio document gets a credential file");
+        assert_eq!(
+            file.file_name().unwrap().to_string_lossy(),
+            ProxyConfigIdentity::device(&wd, Some(&term)).credential_file_name()
+        );
+        let cred = read_doc(&file);
+        assert_eq!(cred["url"], format!("http://127.0.0.1:{PORT}/coord-mcp"));
+        assert_eq!(
+            crate::coord_mcp_config::proxy_nonce_from_header_object(&cred["headers"]),
+            Some(key.nonce.clone())
+        );
+        assert_eq!(
+            terminal_id_for_nonce(&key.nonce).as_deref(),
+            Some(term.as_str())
+        );
+        // The workdir file is a different file and still names the workdir key.
+        let workdir_doc = read_doc(&Path::new(&wd).join(".mcp.json"));
+        let workdir_file =
+            crate::coord_mcp_config::stdio_shim_credential_path(&workdir_doc).unwrap();
+        assert_ne!(workdir_file, file);
+        let workdir_nonce = proxy_nonce_from_config_doc(&workdir_doc).unwrap();
+        assert!(live_binding(&workdir_nonce).is_some());
+    }
+
+    /// Seam: a declared cwd whose document does NOT reference our variables —
+    /// the older literal shape, a hand-written/foreign file, an agent document —
+    /// keeps today's behaviour exactly: nothing minted.
+    #[test]
+    fn the_seam_mints_nothing_for_a_literal_foreign_or_agent_declared_cwd() {
+        let amb = crate::test_env::isolated_ambient();
+
+        let literal = workdir(&amb, "literal");
+        write_literal_device_doc(&literal);
+        let term = terminal();
+        let d = deliver_terminal_coord_mcp(&literal, &term, None, Some(PORT)).unwrap();
+        assert_eq!(d.delivery, CoordMcpDelivery::WorkdirDeclared);
+        assert!(d.terminal_key.is_none());
+        assert!(!terminal_has_nonce(&term));
+
+        let foreign = workdir(&amb, "foreign");
+        std::fs::write(
+            Path::new(&foreign).join(".mcp.json"),
+            r#"{"mcpServers":{"coord-mcp":{"type":"http","url":"https://coord.example.test/mcp","headers":{"Authorization":"Bearer ${SOMEONE_ELSES_TOKEN:-x}"}}}}"#,
+        )
+        .unwrap();
+        let term = terminal();
+        let d = deliver_terminal_coord_mcp(&foreign, &term, None, Some(PORT)).unwrap();
+        assert!(d.terminal_key.is_none());
+        assert!(!terminal_has_nonce(&term));
+
+        let agent = workdir(&amb, "agent");
+        write_coord_mcp_agent_proxy_config(&agent, PORT, Uuid::new_v4());
+        let term = terminal();
+        let d = deliver_terminal_coord_mcp(&agent, &term, None, Some(PORT)).unwrap();
+        assert!(d.terminal_key.is_none());
+        assert!(!terminal_has_nonce(&term));
+
+        // No bound port: nothing can be established, nothing minted.
+        let env_ref = workdir(&amb, "noport");
+        write_coord_mcp_proxy_config(&env_ref, PORT, None);
+        let term = terminal();
+        let d = deliver_terminal_coord_mcp(&env_ref, &term, None, None).unwrap();
+        assert!(d.terminal_key.is_none());
+        assert!(!terminal_has_nonce(&term));
     }
 }

@@ -59,7 +59,8 @@ use std::time::Duration;
 /// sync by shape, not by import" is the five-silent-readers failure mode that
 /// module was created to eliminate.
 use qontinui_runner_lib::coord_mcp_config::{
-    effective_coord_mcp_entry, proxy_nonce_from_header_object, COORD_MCP_PROXY_KEY_HEADER_JSON,
+    effective_coord_mcp_entry, entry_with_env_defaults, proxy_nonce_from_header_object,
+    COORD_MCP_PROXY_KEY_HEADER_JSON,
 };
 
 const RUNNER_PORT_ENV: &str = "QONTINUI_RUNNER_API_PORT";
@@ -1394,15 +1395,20 @@ fn parse_mcp_json(text: &str) -> Option<SessionMcpConfig> {
         // stdio-shaped entry keeps its `url` and `headers` in the credential
         // file it names, and a walk-up that read the entry raw would go dark in
         // every workdir the runner wrote that shape into.
-        let resolved: Option<std::borrow::Cow<'_, serde_json::Value>> = if name == "coord-mcp" {
+        //
+        // Either way an env-referenced header value
+        // (`${QONTINUI_COORD_MCP_NONCE:-<workdir nonce>}`) is read as its
+        // DEFAULT arm — the workdir key, which is live for every session in the
+        // cwd — never from this process's environment.
+        let resolved: std::borrow::Cow<'_, serde_json::Value> = if name == "coord-mcp" {
             match effective_coord_mcp_entry(&v) {
-                Some(entry) => Some(entry),
+                Some(entry) => entry,
                 None => continue,
             }
         } else {
-            None
+            entry_with_env_defaults(server)
         };
-        let server: &serde_json::Value = resolved.as_deref().unwrap_or(server);
+        let server: &serde_json::Value = resolved.as_ref();
         let url = server.get("url").and_then(|u| u.as_str()).unwrap_or("");
         if !url.contains("/coord-mcp") {
             continue;
@@ -1803,6 +1809,25 @@ mod tests {
         let cfg = parse_mcp_json(text).unwrap();
         assert_eq!(cfg.nonce, "later-valid");
         assert_eq!(cfg.port, Some(9877));
+    }
+
+    /// The runner's in-cwd device document spells its credential as an env
+    /// reference with a default; the walk-up reads the DEFAULT arm (the
+    /// workdir key), in both header positions.
+    #[test]
+    fn parse_mcp_json_reads_the_default_arm_of_an_env_referenced_credential() {
+        let cfg = parse_mcp_json(
+            r#"{"mcpServers":{"coord-mcp":{"type":"http","url":"http://127.0.0.1:9878/coord-mcp","headers":{"Authorization":"Bearer ${QONTINUI_COORD_MCP_NONCE:-wdnonce}","X-Coord-Mcp-Proxy-Key":"${QONTINUI_COORD_MCP_NONCE:-wdnonce}"}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.nonce, "wdnonce");
+        assert_eq!(cfg.port, Some(9878));
+        // Legacy-header-only env-ref shape resolves too.
+        let cfg = parse_mcp_json(
+            r#"{"mcpServers":{"coord-mcp":{"url":"http://127.0.0.1:9878/coord-mcp","headers":{"X-Coord-Mcp-Proxy-Key":"${QONTINUI_COORD_MCP_NONCE:-legacy}"}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.nonce, "legacy");
     }
 
     #[test]

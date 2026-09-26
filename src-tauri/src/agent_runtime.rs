@@ -8543,6 +8543,11 @@ pub(crate) fn finalize_headless_child_env(
     // same reason the rest of this function was extracted in the first place.
     // The PTY seam has always resolved its own; now neither can drift.
     let runner_api_port = crate::terminal::spawn_seam_api_port();
+    // A headless child is never handed a terminal-bound coord-mcp key, so an
+    // in-cwd env-referenced `.mcp.json` must resolve to its workdir default —
+    // not to a key inherited from whatever launched the runner.
+    cmd.env_remove(crate::coord_mcp::QONTINUI_COORD_MCP_NONCE_ENV);
+    cmd.env_remove(crate::coord_mcp::QONTINUI_COORD_MCP_CREDENTIAL_ENV);
     cmd.env(
         "QONTINUI_RUNNER_CONTEXT",
         crate::terminal::runner_context(runner_api_port, coord_mcp),
