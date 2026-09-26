@@ -239,10 +239,13 @@ pub struct RoutingDecisionPayload {
     /// The model selected
     pub selected_model: String,
     /// Task prompt preview (truncated)
+    #[schemars(with = "crate::schema_export::Nullable<String>")]
     pub prompt_preview: Option<String>,
     /// File count if analyzed
+    #[schemars(with = "crate::schema_export::Nullable<usize>")]
     pub file_count: Option<usize>,
     /// Criteria count if analyzed
+    #[schemars(with = "crate::schema_export::Nullable<usize>")]
     pub criteria_count: Option<usize>,
 }
 
@@ -262,7 +265,9 @@ pub struct RetryAttemptPayload {
 #[schemars(title = "RawRetryStatePayload")]
 pub struct RetryStatePayload {
     pub attempt: u32,
+    #[schemars(with = "crate::schema_export::Nullable<String>")]
     pub last_error: Option<String>,
+    #[schemars(with = "crate::schema_export::Nullable<String>")]
     pub last_attempt_at: Option<String>,
     pub total_delay_ms: u64,
     pub error_history: Vec<RetryAttemptPayload>,
@@ -301,7 +306,9 @@ pub struct HookExecutionPayload {
     pub hook_name: String,
     pub trigger: HookTrigger,
     pub success: bool,
+    #[schemars(with = "crate::schema_export::Nullable<String>")]
     pub output: Option<String>,
+    #[schemars(with = "crate::schema_export::Nullable<String>")]
     pub error: Option<String>,
     pub duration_ms: u64,
     pub timestamp: String,
@@ -325,6 +332,7 @@ pub struct RetryAttemptEvent {
     pub attempt: RetryAttemptPayload,
     pub state: RetryStatePayload,
     pub exhausted: bool,
+    #[schemars(with = "crate::schema_export::Nullable<u64>")]
     pub next_retry_delay_ms: Option<u64>,
 }
 
@@ -377,6 +385,7 @@ pub struct StatusChangeEvent {
     pub timestamp: i64,
     pub status: String,
     pub iteration: u32,
+    #[schemars(with = "crate::schema_export::Nullable<String>")]
     pub task_name: Option<String>,
 }
 

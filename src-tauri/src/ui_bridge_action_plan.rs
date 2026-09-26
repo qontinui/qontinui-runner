@@ -13,6 +13,12 @@
 //! codegen promotes a defaulted field to REQUIRED, which is right for a value
 //! the runner produces and wrong for one a caller writes, so those stay
 //! hand-authored on the TypeScript side.
+//!
+//! The `Option<String>` fields skipped when `None` also carry
+//! `#[serde(default)]` + `#[schemars(with = "String")]`: serde ignores
+//! `default` on a serialize-only struct, but it tells the schema the key may be
+//! ABSENT, so the binding reads `?: string` — what the wire does — rather than
+//! `?: string | null`.
 
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -24,9 +30,11 @@ pub struct PlannedActionResult {
     pub index: usize,
     pub success: bool,
     pub action: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
     pub resolved_element_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
     pub error: Option<String>,
     #[serde(default)]
     pub skipped_low_confidence: bool,
@@ -41,7 +49,8 @@ pub struct PlannedActionResult {
 #[schemars(title = "ActionPlanResult")]
 pub struct ActionPlanResponse {
     pub success: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
     pub goal: Option<String>,
     pub results: Vec<PlannedActionResult>,
     pub executed_count: usize,
