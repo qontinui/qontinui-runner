@@ -6,10 +6,10 @@ Run the linting pipeline for the current repository. Fix all errors iteratively 
 
 ## Instructions
 
-**IMPORTANT: Skip qontinui-claude-config.** This is a configuration repository with markdown files - no linting needed.
+**IMPORTANT: This command handles Python and JS/TS projects only.** A repository of markdown and config files, or one in another language, is out of scope.
 
-1. **Detect project type** by checking for `pyproject.toml` (Python) or `package.json` (JS/TS)
-   - If the current directory is `qontinui-claude-config`, exit immediately with "No linting needed for config repo"
+1. **Detect project type** by checking for `pyproject.toml` (Python) or `package.json` (JS/TS) in the current directory and in its immediate subdirectories (a monorepo often keeps them in e.g. `backend/` and `frontend/`), and run the matching pipeline from each directory that has one
+   - If neither is found, exit immediately with "No Python or JS/TS project found here; /clean does not handle other languages"
 
 2. **For Python projects**, run in order:
    - `poetry run ruff check . --fix` - Lint with auto-fix
