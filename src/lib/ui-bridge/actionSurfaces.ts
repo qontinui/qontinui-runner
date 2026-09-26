@@ -1052,7 +1052,37 @@ function classifyCallSite(call: ts.CallExpression, sf: ts.SourceFile): HandlerCa
   return null;
 }
 
-/** A stable, reviewable rendering of the whole inventory. */
+/**
+ * A stable, reviewable rendering of the whole inventory.
+ *
+ * **Deliberately carries NO line number.** The row is keyed on the surface's
+ * IDENTITY — file, form, position, id, schema, arity, effect — because a line
+ * coordinate is not a property of the surface, it is a property of everything
+ * above it. Keyed on `file:LINE` this golden went red on three unrelated PRs
+ * in one week (qontinui-runner #1693, #1738, #1742), each of which had merely
+ * inserted lines ABOVE a surface it never touched, and each of which then had
+ * to regenerate the golden without reading it — the one thing the assertion
+ * below asks a reader not to do. It also made every concurrent UI PR conflict
+ * with every other on this file, and guaranteed a re-break on merge order.
+ * The three sibling goldens in `commands/__golden__/` (2,696 rows between
+ * them) already key on stable identifiers; this was the only line-keyed one.
+ *
+ * Duplicate rows are KEPT, never deduped: three (file, form, position, id)
+ * tuples legitimately occur twice in the tree (two `click` builtins in one
+ * panel, and so on), so folding them would lose the count and a second
+ * identical surface would land silently. Because the comparison is over the
+ * whole rendered document, N identical rows and N-1 identical rows are
+ * different documents — which is exactly the property that makes an added
+ * surface visible without a line number or an occurrence ordinal.
+ *
+ * Rows stay in discovery order (walk order, then source order within a file),
+ * so an insertion above a surface moves nothing: the surfaces' order relative
+ * to each other is what is recorded, and that does not change.
+ *
+ * To find a surface the inventory names, grep its id — `actionSurfaces.ts`
+ * still carries `line` on every `ActionSurface` at runtime for callers that
+ * want a coordinate.
+ */
 export function renderInventory(surfaces: ActionSurface[]): string {
   const lines: string[] = [];
   const counts = new Map<SurfaceForm, number>();
@@ -1076,8 +1106,10 @@ export function renderInventory(surfaces: ActionSurface[]): string {
   }
   lines.push("");
   for (const s of surfaces) {
+    // No `:${s.line}` — see this function's doc comment. Reintroducing it is
+    // pinned red by `the golden carries no line coordinate`.
     lines.push(
-      `${s.file}:${s.line}\t${s.form}\t${s.position}\t${s.id ?? "-"}\t` +
+      `${s.file}\t${s.form}\t${s.position}\t${s.id ?? "-"}\t` +
         `schema=${s.hasParamSchema ? "yes" : "no"}\tarity=${s.handlerArity ?? "-"}\t` +
         `effect=${s.effect ?? "-"}`,
     );
