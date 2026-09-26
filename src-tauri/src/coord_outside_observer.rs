@@ -211,6 +211,21 @@ const WORKERS_TOOL: &str = "coord_query_workers";
 /// Topic every finding this module posts is filed under (plan Phase 3b.2).
 const FINDING_TOPIC: &str = "coord-merge-train";
 
+/// coord's `FINDING_TITLE_MAX_BYTES` (`qontinui-coord` `findings.rs`): a
+/// longer title is a 400, never truncated server-side — and this observer
+/// posts once per episode, so a refused title is a lost finding.
+const FINDING_TITLE_MAX_BYTES: usize = 500;
+
+/// coord's `FINDING_BODY_MAX_BYTES` for `kind: "investigation"`
+/// (`qontinui-coord` `findings.rs`): refused, never truncated, over it.
+const FINDING_BODY_MAX_BYTES: usize = 8 * 1024;
+
+/// Appended where [`finding_body`] cut the evidence. [`post_finding`] logs the
+/// full read whenever the body does not carry it whole, which is what makes
+/// the marker's promise true.
+const FINDING_EVIDENCE_CUT: &str = "\n… [evidence cut to fit coord's finding-body cap; the full \
+                                    read is in the posting runner's log]";
+
 /// The honest-unknown subclass coord returns for a ledger it cannot read
 /// (pre-migration, or a replica that has never observed a row). Never a clean
 /// fleet — see the module doc.
@@ -315,11 +330,17 @@ impl FaultClass {
                  failure. Coord's own recovery is ECS's, not this runner's."
             }
             FaultClass::WorkerDead => {
-                "A coord background singleton has stopped ticking, so whatever it \
-                 drives (merge dispatch, gate sweeps, alert page-out) is stalled. \
+                "A coord background singleton has stopped doing its work, so whatever \
+                 it drives (merge dispatch, gate sweeps, alert page-out) is stalled. \
+                 `last_tick_secs_ago` may be a FOLLOWER writing `follower_skip` — a \
+                 replica saying \"not me\", not the work running — so a fresh value \
+                 there does not refute this; read `last_work_tick_secs_ago`, the \
+                 freshest write that WAS the work running (null is UNKNOWN, never \
+                 fresh). `leader_body_in_flight_secs` is a number when the lease \
+                 holder is stuck inside its work; null means nothing positively says a \
+                 body is running, which is NOT evidence that none is. \
                  Read `coord_query_workers` with {\"name\": \"<worker>\"} for the \
-                 per-replica rows, and check `live_status` beside `status` before \
-                 treating it as a real outage."
+                 per-replica rows, lease holder first."
             }
             FaultClass::NoLeader => {
                 "No coord replica is running the leader-gated plane, so every \
@@ -364,6 +385,135 @@ pub struct WorkerVerdict {
     pub worst_replica_age_secs: Option<f64>,
     pub verdict_from_rolled_off_replica: Option<bool>,
     pub last_decision_code: Option<String>,
+    /// The freshest write of ANY kind — INCLUDING a follower's
+    /// `follower_skip`, which says "not me", not "the work ran". On
+    /// 2026-09-19 this read 3 s on a worker whose lease holder had not
+    /// returned for 857 s, and a real train freeze was dismissed off it
+    /// (coord finding `4a987e27`). Carried so the card can say so beside the
+    /// field that answers the question readers thought this one did.
+    pub last_tick_secs_ago: Served<f64>,
+    /// The freshest write that WAS the work running (outcome ok / error /
+    /// stream_end). `Null` is coord's UNKNOWN — no live replica's MOST RECENT
+    /// write was a body execution (rows keep only the last outcome, so coord
+    /// cannot say whether the body ran earlier) — and is never rendered as 0
+    /// or as fresh.
+    pub last_work_tick_secs_ago: Served<f64>,
+    /// A LOWER bound on how long the lease holder's body has been in flight,
+    /// measured from its row's stale bound (coord `worker_ledger.rs`). A
+    /// number beside an old `worst_replica_age_secs` is a loop alive and stuck
+    /// inside its work; `Null` is "nothing positively says a body is
+    /// running", which is NOT evidence none is — it also reads null before
+    /// the stale bound, on an unreadable lease, and on a coord whose
+    /// `body_started_at` migration has not applied.
+    pub leader_body_in_flight_secs: Served<f64>,
+}
+
+/// A field coord may or may not serve, read WITHOUT collapsing its states.
+///
+/// `Option` cannot carry this: coord's `null` on `last_work_tick_secs_ago`
+/// is its own UNKNOWN, and an ABSENT key is an older coord that predates the
+/// field — two different facts, and neither is `0` or "not in flight"
+/// (served policy `verification-and-evidence`
+/// `unknown-must-not-render-as-a-default`). A value of the wrong JSON type is
+/// a fourth fact — a shape this build cannot read — and gets its own arm
+/// rather than borrowing "absent", which would blame the coord version.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum Served<T> {
+    /// The key is not in the response: a coord that predates the field.
+    #[default]
+    Absent,
+    /// The key is present and `null`.
+    Null,
+    /// The key is present with a JSON type this build cannot read.
+    Unreadable(&'static str),
+    Value(T),
+}
+
+impl<T> Served<T> {
+    /// Read `key` off `obj` with `parse`, keeping absent, null and
+    /// wrong-typed apart.
+    fn read(obj: &JsonValue, key: &str, parse: impl Fn(&JsonValue) -> Option<T>) -> Self {
+        match obj.get(key) {
+            None => Served::Absent,
+            Some(JsonValue::Null) => Served::Null,
+            Some(v) => parse(v).map_or_else(|| Served::Unreadable(kind_of(v)), Served::Value),
+        }
+    }
+
+    /// The UNKNOWN wording for every arm but `Value`, `null_means` naming
+    /// what coord's own `null` means for this field.
+    fn unknown_text(&self, null_means: &str) -> Option<String> {
+        match self {
+            Served::Value(_) => None,
+            Served::Null => Some(format!("UNKNOWN (null: {null_means})")),
+            Served::Absent => Some("UNKNOWN (absent: this coord predates the field)".to_string()),
+            Served::Unreadable(kind) => Some(format!(
+                "UNKNOWN (coord served a {kind} this runner build cannot read)"
+            )),
+        }
+    }
+}
+
+impl Served<f64> {
+    /// For the raw evidence block: a number, `null`, or a string naming why
+    /// there is no number — never a silently dropped key.
+    fn to_json(&self) -> JsonValue {
+        match self {
+            Served::Value(v) => json!(v),
+            Served::Null => JsonValue::Null,
+            Served::Absent => json!("UNKNOWN: absent — this coord predates the field"),
+            Served::Unreadable(kind) => json!(format!("UNKNOWN: unreadable {kind}")),
+        }
+    }
+}
+
+impl Served<String> {
+    fn to_json(&self) -> JsonValue {
+        match self {
+            Served::Value(v) => json!(v),
+            Served::Null => JsonValue::Null,
+            Served::Absent => json!("UNKNOWN: absent — this coord predates the field"),
+            Served::Unreadable(kind) => json!(format!("UNKNOWN: unreadable {kind}")),
+        }
+    }
+}
+
+/// The lease holder, for the `WorkerDead` card. coord holds ONE leader lease
+/// for the whole leader-gated plane. The value is the replica LAST RECORDED
+/// in that lease — coord does not check it for expiry, and a crashed leader
+/// stays recorded until a follower takes over, which is exactly when this
+/// card fires — so it is labelled as such rather than as a live holder.
+fn render_lease_holder(holder: &Served<String>) -> String {
+    match holder {
+        Served::Value(id) => format!("replica `{}` (last recorded)", truncate(id, 64)),
+        other => other
+            .unknown_text("coord could not read a leader lease row")
+            .unwrap_or_default(),
+    }
+}
+
+/// Whether the lease holder's body is in flight. An absent field is
+/// UNKNOWN, never "not in flight".
+fn render_body_in_flight(in_flight: &Served<f64>) -> String {
+    match in_flight {
+        // coord's value is a LOWER bound measured from the row's stale bound
+        // (`worker_ledger.rs`), so the true duration is longer.
+        Served::Value(secs) => format!("in flight at least {secs:.0}s past its stale bound"),
+        Served::Null => "not observed in flight (null: nothing positively says a body is \
+                         running — not proof the loop is gone)"
+            .to_string(),
+        other => format!(
+            "{} — NOT \"not in flight\"",
+            other.unknown_text("").unwrap_or_default()
+        ),
+    }
+}
+
+fn render_age(age: &Served<f64>, null_means: &str) -> String {
+    match age {
+        Served::Value(secs) => format!("{secs:.0}s ago"),
+        other => other.unknown_text(null_means).unwrap_or_default(),
+    }
 }
 
 /// A successful read of coord's worker ledger.
@@ -507,6 +657,10 @@ pub struct LedgerRead {
     /// of it is cited here. Predicate (iii) no longer depends on the answer —
     /// it reads [`Self::counts_not_leader_here`], which the cap never touches.
     pub list_truncated: bool,
+    /// `components.lease_holder_replica_id` — the replica last recorded in
+    /// coord's ONE leader lease (not checked for expiry by coord). Three-valued:
+    /// an older coord does not serve it on the summary.
+    pub lease_holder_replica_id: Served<String>,
 }
 
 impl LedgerRead {
@@ -879,6 +1033,11 @@ pub fn classify_ledger(tool: &JsonValue) -> ProbeOutcome {
         counts_non_nominal,
         list_truncated,
         listed_rows: listed.len() as u64,
+        lease_holder_replica_id: tool.get("components").map_or(Served::Absent, |c| {
+            Served::read(c, "lease_holder_replica_id", |v| {
+                v.as_str().map(str::to_string)
+            })
+        }),
         ..LedgerRead::default()
     };
     for row in &listed {
@@ -1026,6 +1185,13 @@ fn worker_verdict(row: &JsonValue) -> WorkerVerdict {
             .get("last_decision_code")
             .and_then(JsonValue::as_str)
             .map(str::to_string),
+        last_tick_secs_ago: Served::read(row, "last_tick_secs_ago", JsonValue::as_f64),
+        last_work_tick_secs_ago: Served::read(row, "last_work_tick_secs_ago", JsonValue::as_f64),
+        leader_body_in_flight_secs: Served::read(
+            row,
+            "leader_body_in_flight_secs",
+            JsonValue::as_f64,
+        ),
     }
 }
 
@@ -1280,7 +1446,9 @@ impl ObserverState {
                 class: FaultClass::WorkerDead,
                 summary: format!(
                     "coord's leader-gated worker `{}` rolls up `{}` (live_status {}, worst \
-                     replica age {}, last decision code {}). counts.dead = {}.",
+                     replica age {}, last decision code {}). Lease holder: {}; its body: {}. \
+                     Last WORK tick: {}. Last write of any kind: {} — may be a follower's \
+                     `follower_skip`, which is not the work running. counts.dead = {}.",
                     worker.name,
                     worker.status,
                     worker.live_status.as_deref().unwrap_or("unknown"),
@@ -1289,6 +1457,14 @@ impl ObserverState {
                         .map(|a| format!("{a:.0}s"))
                         .unwrap_or_else(|| "unknown".into()),
                     worker.last_decision_code.as_deref().unwrap_or("none"),
+                    render_lease_holder(&read.lease_holder_replica_id),
+                    render_body_in_flight(&worker.leader_body_in_flight_secs),
+                    render_age(
+                        &worker.last_work_tick_secs_ago,
+                        "no live replica's most recent write was the work running — never 0, \
+                         never fresh",
+                    ),
+                    render_age(&worker.last_tick_secs_ago, "no live replica has written"),
                     read.counts_dead,
                 ),
                 raw: render_read(read),
@@ -1400,6 +1576,7 @@ fn render_read(read: &LedgerRead) -> String {
     serde_json::to_string_pretty(&json!({
         "counts_dead": read.counts_dead,
         "counts_not_leader_here": read.counts_not_leader_here,
+        "lease_holder_replica_id": read.lease_holder_replica_id.to_json(),
         "dead_leader_gated": read.dead_leader_gated.iter().map(worker_json).collect::<Vec<_>>(),
         "leaderless": read.leaderless.iter().map(worker_json).collect::<Vec<_>>(),
         "excluded_as_rolled_off_replica": read.rolled_off_excluded,
@@ -1424,6 +1601,9 @@ fn worker_json(w: &WorkerVerdict) -> JsonValue {
         "worst_replica_age_secs": w.worst_replica_age_secs,
         "verdict_from_rolled_off_replica": w.verdict_from_rolled_off_replica,
         "last_decision_code": w.last_decision_code,
+        "last_tick_secs_ago": w.last_tick_secs_ago.to_json(),
+        "last_work_tick_secs_ago": w.last_work_tick_secs_ago.to_json(),
+        "leader_body_in_flight_secs": w.leader_body_in_flight_secs.to_json(),
     })
 }
 
@@ -1585,6 +1765,103 @@ fn surface(app: Option<&tauri::AppHandle>, report: &Report) {
     let _ = crate::error::emit_user_facing_error(app, &err);
 }
 
+/// The finding's title: the report's one-line claim, bounded to coord's
+/// [`FINDING_TITLE_MAX_BYTES`] with the attribution suffix kept whole.
+///
+/// The CLAIM is what gets cut, never the suffix, and a cut says so and points
+/// at the body, which carries the summary in full ([`finding_body`]).
+fn finding_title(summary: &str, device_id: &str) -> String {
+    let suffix = format!(
+        " (observed from OUTSIDE coord by runner device {})",
+        truncate(device_id, 64)
+    );
+    const CUT: &str = "… [cut to fit; full text in the body]";
+    let whole = format!("{summary}{suffix}");
+    if whole.len() <= FINDING_TITLE_MAX_BYTES {
+        return whole;
+    }
+    let budget = FINDING_TITLE_MAX_BYTES.saturating_sub(suffix.len() + CUT.len());
+    let mut end = budget.min(summary.len());
+    while !summary.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = summary
+        .get(..end)
+        .expect("`end` was walked back to a char boundary above");
+    format!("{cut}{CUT}{suffix}")
+}
+
+/// The finding's body: the class title, the FULL summary (the title may have
+/// been cut to fit), then the evidence, method and advice — bounded to coord's
+/// [`FINDING_BODY_MAX_BYTES`].
+///
+/// Only the EVIDENCE is ever cut. It is the pretty-printed read of every
+/// dead or leaderless worker, so it grows with exactly the event this
+/// observer exists for — a leader dying takes every leader-gated worker with
+/// it — and an over-cap body is a 400 on a once-per-episode post, i.e. a lost
+/// finding. The full read still travels on this runner's notification
+/// (`UserFacingError::details`) when the runner has a UI, and [`post_finding`]
+/// logs it in full whenever a cut happens — so a headless runner keeps it too.
+fn finding_body(report: &Report, door_url: &str) -> String {
+    let advice = match report.class {
+        FaultClass::WorkerDead => {
+            "Read `coord_query_workers` with the worker's name for the per-replica rows. \
+             `last_tick_secs_ago` may be a follower's `follower_skip`, so a fresh value there \
+             does not refute a dead verdict; read `last_work_tick_secs_ago` (null is UNKNOWN, \
+             never fresh) and `leader_body_in_flight_secs` instead."
+        }
+        _ => {
+            "Read `coord_query_workers` with each worker name listed in the evidence for the \
+             per-replica rows, and check coord's leader lease and replica presence."
+        }
+    };
+    let head = format!(
+        "{}\n\n{}\n\nEVIDENCE — the `{WORKERS_TOOL}` read this verdict was computed from:\n\n",
+        report.class.title(),
+        report.summary,
+    );
+    let tail = format!(
+        "\n\nMETHOD: one JSON-RPC `tools/call` for `{WORKERS_TOOL}` against {door_url} from \
+         inside a runner process, on the ~{PROBE_PERIOD_SECS}s cadence of \
+         `session::coord_sync`'s heartbeat loop. The predicate is \
+         `coord_outside_observer::classify_ledger` + `ObserverState::observe` (plan \
+         2026-09-12-merge-train-alerts-page-a-reader-and-act-on-nothing Phase 3b): a \
+         leader-gated worker rolling up `dead` after the `verdict_from_rolled_off_replica` \
+         discrimination, or `no_leader_tick` held for {CADENCES_TO_FIRE} consecutive \
+         probes.\n\n\
+         WHAT A PEER SHOULD DO DIFFERENTLY: this is an OUTSIDE observation — coord's own \
+         leader-gated pager cannot report it, which is the whole reason it exists. {advice} \
+         The runner that posted this has no lever on coord and did not attempt one."
+    );
+    let budget = FINDING_BODY_MAX_BYTES.saturating_sub(head.len() + tail.len());
+    let evidence = if report.raw.len() <= budget {
+        std::borrow::Cow::Borrowed(report.raw.as_str())
+    } else {
+        let mut end = budget
+            .saturating_sub(FINDING_EVIDENCE_CUT.len())
+            .min(report.raw.len());
+        while !report.raw.is_char_boundary(end) {
+            end -= 1;
+        }
+        let cut = report
+            .raw
+            .get(..end)
+            .expect("`end` was walked back to a char boundary above");
+        std::borrow::Cow::Owned(format!("{cut}{FINDING_EVIDENCE_CUT}"))
+    };
+    let mut body = format!("{head}{evidence}{tail}");
+    // Last resort: a summary long enough to eat the evidence budget on its
+    // own. Cut the whole body on a char boundary rather than send a 400.
+    if body.len() > FINDING_BODY_MAX_BYTES {
+        let mut end = FINDING_BODY_MAX_BYTES;
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        body.truncate(end);
+    }
+    body
+}
+
 /// Carry the observation to coord as a finding, so a session arriving later
 /// finds it (plan Phase 3b.2).
 ///
@@ -1601,34 +1878,23 @@ async fn post_finding(
     // Body shape pinned to `qontinui-coord` `findings.rs` `PostFindingBody`
     // (`deny_unknown_fields`; identity fields are a 400, so none are sent) —
     // the same shape `mcp_api::post_coord_mcp_drift_finding` posts.
+    let device_id = qontinui_runner_lib::machine_identity::read_device_id()
+        .unwrap_or_else(|_| "unknown".to_string());
+    let finding = finding_body(report, &door.url);
+    // Keyed on the read being ABSENT from the body, not on the cut marker:
+    // the last-resort whole-body cut in `finding_body` can drop the marker.
+    if !finding.contains(report.raw.as_str()) {
+        // The finding's evidence was cut to fit coord's cap; this line is
+        // where the cut part survives, on a headless runner as on any other.
+        warn!(
+            class = report.class.breadcrumb_reason(),
+            raw = %report.raw,
+            "coord outside observer: finding evidence cut to fit coord's body cap; full read follows"
+        );
+    }
     let body = json!({
-        "title": format!(
-            "{} (observed from OUTSIDE coord by runner device {})",
-            report.summary,
-            qontinui_runner_lib::machine_identity::read_device_id()
-                .unwrap_or_else(|_| "unknown".to_string())
-        ),
-        "body": format!(
-            "{}\n\nEVIDENCE — the `{WORKERS_TOOL}` read this verdict was computed from:\n\n{}\n\n\
-             METHOD: one JSON-RPC `tools/call` for `{WORKERS_TOOL}` against {} from inside a \
-             runner process, on the ~{}s cadence of `session::coord_sync`'s heartbeat loop. \
-             The predicate is `coord_outside_observer::classify_ledger` + \
-             `ObserverState::observe` (plan \
-             2026-09-12-merge-train-alerts-page-a-reader-and-act-on-nothing Phase 3b): a \
-             leader-gated worker rolling up `dead` after the \
-             `verdict_from_rolled_off_replica` discrimination, or `no_leader_tick` held for \
-             {} consecutive probes.\n\n\
-             WHAT A PEER SHOULD DO DIFFERENTLY: this is an OUTSIDE observation — coord's own \
-             leader-gated pager cannot report it, which is the whole reason it exists. Read \
-             `coord_query_workers` with the worker's name for the per-replica rows, and read \
-             `live_status` beside `status` before treating it as a real outage. The runner \
-             that posted this has no lever on coord and did not attempt one.",
-            report.class.title(),
-            report.raw,
-            door.url,
-            PROBE_PERIOD_SECS,
-            CADENCES_TO_FIRE,
-        ),
+        "title": finding_title(&report.summary, &device_id),
+        "body": finding,
         "kind": "investigation",
         "topic": FINDING_TOPIC,
         "resource_keys": [
@@ -2042,6 +2308,335 @@ mod tests {
     }
 
     // ── predicate (ii): a dead leader-gated worker ──────────────────────
+
+    /// The 2026-09-19 shape, as a coord serving plan
+    /// `2026-09-19-leader-gated-worker-liveness-reads-a-follower-skip-as-the-work-running`
+    /// Phases 1-2 renders it: the lease holder's row frozen at 857 s with its
+    /// body in flight, a follower writing `follower_skip` 3 s ago, and no
+    /// live replica having run the body in the window.
+    fn tonight_row() -> JsonValue {
+        let mut row = dead_row("merge_scheduler.dispatch", true, false);
+        row["reason"] = json!("body_in_flight");
+        row["last_tick_secs_ago"] = json!(3.0);
+        row["worst_replica_age_secs"] = json!(857.0);
+        row["last_work_tick_secs_ago"] = JsonValue::Null;
+        row["leader_body_in_flight_secs"] = json!(790.0);
+        row
+    }
+
+    fn tonight_body() -> JsonValue {
+        let mut body = ledger_body(1, json!([tonight_row()]));
+        body["components"]["lease_holder_replica_id"] =
+            json!("7c1e2a4b-0000-4000-8000-00000000beef");
+        body
+    }
+
+    fn only_worker_dead_report(body: &JsonValue) -> Report {
+        let outcome = classify_ledger(body);
+        let mut state = ObserverState::default();
+        let mut reports = state.observe(&outcome);
+        assert_eq!(
+            reports.len(),
+            1,
+            "dead still fires on the first observation"
+        );
+        let report = reports.remove(0);
+        assert_eq!(report.class, FaultClass::WorkerDead);
+        report
+    }
+
+    #[test]
+    fn the_tonight_shaped_body_names_the_lease_holder_its_body_and_the_work_tick() {
+        let report = only_worker_dead_report(&tonight_body());
+        let s = &report.summary;
+        assert!(s.contains("merge_scheduler.dispatch"), "{s}");
+        assert!(
+            s.contains(
+                "Lease holder: replica `7c1e2a4b-0000-4000-8000-00000000beef` (last recorded)"
+            ),
+            "{s}"
+        );
+        assert!(
+            s.contains("its body: in flight at least 790s past its stale bound"),
+            "{s}"
+        );
+        // coord's null is UNKNOWN — never rendered as 0 or as fresh.
+        assert!(
+            s.contains("Last WORK tick: UNKNOWN (null: no live replica's most recent write"),
+            "{s}"
+        );
+        assert!(!s.contains("Last WORK tick: 0"), "{s}");
+        // The follower's 3 s write is shown, and labelled for what it is.
+        assert!(
+            s.contains("Last write of any kind: 3s ago — may be a follower's"),
+            "{s}"
+        );
+
+        let raw: JsonValue = serde_json::from_str(&report.raw).expect("raw is JSON");
+        assert_eq!(
+            raw["lease_holder_replica_id"],
+            json!("7c1e2a4b-0000-4000-8000-00000000beef")
+        );
+        let w = &raw["dead_leader_gated"][0];
+        assert_eq!(w["last_work_tick_secs_ago"], JsonValue::Null);
+        assert_eq!(w["leader_body_in_flight_secs"], json!(790.0));
+        assert_eq!(w["last_tick_secs_ago"], json!(3.0));
+    }
+
+    #[test]
+    fn an_older_coord_body_classifies_the_same_and_marks_every_new_field_unknown() {
+        // `dead_row` is the pre-Phase-2 shape: no work tick, no in-flight
+        // field, and no lease holder on the summary.
+        let body = ledger_body(1, json!([dead_row("work_unit_derive.sweep", true, false)]));
+        let ProbeOutcome::Read(read) = classify_ledger(&body) else {
+            panic!("expected a Read");
+        };
+        assert_eq!(read.dead_leader_gated.len(), 1);
+        assert_eq!(read.lease_holder_replica_id, Served::Absent);
+        let w = &read.dead_leader_gated[0];
+        assert_eq!(w.last_work_tick_secs_ago, Served::Absent);
+        assert_eq!(w.leader_body_in_flight_secs, Served::Absent);
+        assert_eq!(w.last_tick_secs_ago, Served::Value(1499.0));
+
+        let report = only_worker_dead_report(&body);
+        let s = &report.summary;
+        assert!(
+            s.contains("Lease holder: UNKNOWN (absent: this coord predates the field)"),
+            "{s}"
+        );
+        // Absent is UNKNOWN, never "not in flight".
+        assert!(
+            s.contains(
+                "its body: UNKNOWN (absent: this coord predates the field) — NOT \"not in flight\""
+            ),
+            "{s}"
+        );
+        assert!(!s.contains("not observed in flight"), "{s}");
+        assert!(
+            s.contains("Last WORK tick: UNKNOWN (absent: this coord predates the field)"),
+            "{s}"
+        );
+
+        let raw: JsonValue = serde_json::from_str(&report.raw).expect("raw is JSON");
+        let unknown = json!("UNKNOWN: absent — this coord predates the field");
+        assert_eq!(raw["lease_holder_replica_id"], unknown);
+        assert_eq!(
+            raw["dead_leader_gated"][0]["last_work_tick_secs_ago"],
+            unknown
+        );
+        assert_eq!(
+            raw["dead_leader_gated"][0]["leader_body_in_flight_secs"],
+            unknown
+        );
+    }
+
+    #[test]
+    fn a_null_in_flight_reads_as_not_observed_and_never_as_a_dead_loop() {
+        let mut row = tonight_row();
+        row["leader_body_in_flight_secs"] = JsonValue::Null;
+        row["last_work_tick_secs_ago"] = json!(12.0);
+        let mut body = ledger_body(1, json!([row]));
+        body["components"]["lease_holder_replica_id"] = JsonValue::Null;
+
+        let s = only_worker_dead_report(&body).summary;
+        assert!(s.contains("its body: not observed in flight (null"), "{s}");
+        assert!(s.contains("not proof the loop is gone"), "{s}");
+        assert!(s.contains("Last WORK tick: 12s ago"), "{s}");
+        assert!(
+            s.contains("Lease holder: UNKNOWN (null: coord could not read"),
+            "{s}"
+        );
+
+        // coord's null stays JSON null in the evidence block — distinct from
+        // the string an ABSENT field renders as.
+        let raw: JsonValue =
+            serde_json::from_str(&only_worker_dead_report(&body).raw).expect("raw is JSON");
+        assert_eq!(raw["lease_holder_replica_id"], JsonValue::Null);
+        assert_eq!(
+            raw["dead_leader_gated"][0]["leader_body_in_flight_secs"],
+            JsonValue::Null
+        );
+    }
+
+    #[test]
+    fn a_wrong_typed_field_is_unreadable_not_absent() {
+        let mut row = tonight_row();
+        row["last_work_tick_secs_ago"] = json!("12");
+        let body = ledger_body(1, json!([row]));
+        let ProbeOutcome::Read(read) = classify_ledger(&body) else {
+            panic!("a retyped OPTIONAL field must not cost the whole read");
+        };
+        assert_eq!(
+            read.dead_leader_gated[0].last_work_tick_secs_ago,
+            Served::Unreadable("string")
+        );
+        let s = only_worker_dead_report(&body).summary;
+        assert!(
+            s.contains("Last WORK tick: UNKNOWN (coord served a string this runner build"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn a_wrong_typed_in_flight_or_lease_holder_is_unreadable_never_not_in_flight() {
+        let mut row = tonight_row();
+        row["leader_body_in_flight_secs"] = json!("790");
+        let mut body = ledger_body(1, json!([row]));
+        body["components"]["lease_holder_replica_id"] = json!(42);
+
+        let report = only_worker_dead_report(&body);
+        let s = &report.summary;
+        assert!(
+            s.contains("its body: UNKNOWN (coord served a string this runner build"),
+            "{s}"
+        );
+        assert!(!s.contains("not observed in flight"), "{s}");
+        assert!(
+            s.contains("Lease holder: UNKNOWN (coord served a number"),
+            "{s}"
+        );
+
+        let raw: JsonValue = serde_json::from_str(&report.raw).expect("raw is JSON");
+        assert_eq!(
+            raw["lease_holder_replica_id"],
+            json!("UNKNOWN: unreadable number")
+        );
+        assert_eq!(
+            raw["dead_leader_gated"][0]["leader_body_in_flight_secs"],
+            json!("UNKNOWN: unreadable string")
+        );
+    }
+
+    /// coord refuses a finding title over `FINDING_TITLE_MAX_BYTES` with a
+    /// 400 and this observer posts once per episode — so an over-long title
+    /// is a LOST finding, not a truncated one. Built at the worst case: every
+    /// new field UNKNOWN, an 80-char worker name, a 36-char device id.
+    #[test]
+    fn the_worker_dead_finding_title_fits_coords_bound_and_the_body_keeps_it_all() {
+        let name = "w".repeat(80);
+        let body = ledger_body(1, json!([dead_row(&name, true, false)]));
+        let report = only_worker_dead_report(&body);
+        let device = "eb2155ed-4152-4a91-be82-5d4346f717fc";
+
+        let title = finding_title(&report.summary, device);
+        assert!(
+            title.len() <= FINDING_TITLE_MAX_BYTES,
+            "{} bytes: {title}",
+            title.len()
+        );
+        assert!(
+            title.contains(&name),
+            "the claim's subject survives the cut: {title}"
+        );
+        assert!(
+            title.ends_with(&format!("by runner device {device})")),
+            "the attribution suffix is never the part cut: {title}"
+        );
+        assert!(
+            title.contains("full text in the body"),
+            "a cut says so: {title}"
+        );
+
+        let finding = finding_body(&report, "https://coord.example/mcp");
+        assert!(
+            finding.contains(&report.summary),
+            "the body carries the whole summary"
+        );
+        assert!(finding.contains("last_work_tick_secs_ago"), "{finding}");
+        assert!(!finding.contains("`live_status` beside"), "{finding}");
+    }
+
+    /// A leader dying takes every leader-gated worker `dead` at once, and each
+    /// report's `raw` carries ALL of them — so the body grows with exactly the
+    /// event it reports. At coord's 40-row list cap, all-absent, 80-char
+    /// names, it must still fit coord's 8 KiB cap, cutting only the evidence.
+    #[test]
+    fn a_leader_death_sized_finding_body_fits_coords_cap_and_keeps_its_advice() {
+        let rows: Vec<JsonValue> = (0..40)
+            .map(|i| dead_row(&format!("{i:02}{}", "w".repeat(78)), true, false))
+            .collect();
+        let body = ledger_body(40, JsonValue::Array(rows));
+        let ProbeOutcome::Read(read) = classify_ledger(&body) else {
+            panic!("expected a Read");
+        };
+        let mut state = ObserverState::default();
+        let reports = state.observe(&ProbeOutcome::Read(read));
+        assert_eq!(reports.len(), 40, "every dead worker still fires");
+        let report = &reports[0];
+        assert!(
+            report.raw.len() > FINDING_BODY_MAX_BYTES,
+            "the fixture must force a cut"
+        );
+
+        let finding = finding_body(report, "https://coord.example/mcp");
+        assert!(
+            finding.len() <= FINDING_BODY_MAX_BYTES,
+            "{} bytes",
+            finding.len()
+        );
+        assert!(finding.contains("evidence cut to fit"), "a cut says so");
+        assert!(
+            finding.contains(&report.summary),
+            "the summary is never the part cut"
+        );
+        assert!(
+            finding.ends_with("did not attempt one."),
+            "the method and advice are never the part cut"
+        );
+        assert!(finding.contains("last_work_tick_secs_ago"));
+    }
+
+    #[test]
+    fn a_no_leader_finding_gets_advice_for_its_own_class() {
+        let report = Report {
+            class: FaultClass::NoLeader,
+            summary: "coord reports 12 leader-gated workers with no leader.".to_string(),
+            raw: "x".repeat(20_000),
+            post_finding: true,
+        };
+        let finding = finding_body(&report, "https://coord.example/mcp");
+        assert!(
+            finding.len() <= FINDING_BODY_MAX_BYTES,
+            "{} bytes",
+            finding.len()
+        );
+        assert!(finding.contains("leader lease"), "{finding}");
+        assert!(
+            !finding.contains("does not refute a dead verdict"),
+            "dead-worker advice does not belong on a no-leader finding"
+        );
+    }
+
+    #[test]
+    fn a_short_summary_title_is_left_whole() {
+        let title = finding_title("coord has no leader.", "dev-1");
+        assert_eq!(
+            title,
+            "coord has no leader. (observed from OUTSIDE coord by runner device dev-1)"
+        );
+    }
+
+    #[test]
+    fn a_title_cut_lands_on_a_char_boundary() {
+        let summary = "é".repeat(400);
+        let title = finding_title(&summary, "dev-1");
+        assert!(title.len() <= FINDING_TITLE_MAX_BYTES);
+        // Building it at all proves the slice was on a boundary; the content
+        // check proves the cut kept a prefix of the claim.
+        assert!(title.starts_with("éé"), "{title}");
+    }
+
+    #[test]
+    fn worker_dead_advice_points_at_the_work_tick_not_live_status() {
+        let action = FaultClass::WorkerDead.suggested_action();
+        assert!(action.contains("last_work_tick_secs_ago"), "{action}");
+        assert!(action.contains("follower_skip"), "{action}");
+        assert!(action.contains("leader_body_in_flight_secs"), "{action}");
+        assert!(
+            !action.contains("check `live_status` beside `status`"),
+            "the advice that let a follower's skip read as liveness is gone: {action}"
+        );
+    }
 
     #[test]
     fn dead_leader_gated_worker_is_read_and_reported_on_the_first_observation() {
