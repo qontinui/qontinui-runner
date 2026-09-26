@@ -937,6 +937,13 @@ pub enum SkipReason {
     /// bucket. Nothing here is an error value: the pass continues and the spawn
     /// proceeds, the session simply lacks that skill.
     Rejected(String),
+    /// The destination resolves to (or inside) the very directory the unit
+    /// would be copied FROM — e.g. a session cwd at the workspace root, whose
+    /// `.claude` is a symlink into `qontinui-claude-config/.claude`. Writing
+    /// there would overwrite (and, for a copy onto itself, truncate) the
+    /// canonical sources, so the whole pass is skipped. The session still has
+    /// the definitions: they are the source files themselves.
+    CanonicalSource(String),
 }
 
 impl SkipReason {
@@ -948,6 +955,7 @@ impl SkipReason {
             SkipReason::WriteFailed(_) => "write_failed",
             SkipReason::Unresolved(_) => "unresolved",
             SkipReason::Rejected(_) => "rejected",
+            SkipReason::CanonicalSource(_) => "canonical_source",
         }
     }
 
@@ -961,6 +969,9 @@ impl SkipReason {
             SkipReason::WriteFailed(why) => format!("write failed: {why}"),
             SkipReason::Unresolved(why) => format!("source rung did not resolve: {why}"),
             SkipReason::Rejected(why) => format!("refused by validation: {why}"),
+            SkipReason::CanonicalSource(why) => {
+                format!("destination is the canonical source — left alone: {why}")
+            }
         }
     }
 }
@@ -1230,29 +1241,55 @@ fn with_store<T>(f: impl FnOnce(&mut ProvisionStore) -> T) -> T {
 ///
 /// **Never fails and never panics**, because it is called from spawn paths whose
 /// contract is that provisioning cannot abort a launch. It logs the report at
-/// `info!` when the pass was complete and at `warn!` when it degraded — the same
-/// two levels the provisioners used before, now carrying counts and reasons
-/// instead of a bare sentence.
+/// `info!` when the pass was complete — or when every skip is a deliberate one
+/// ([`SkipReason::GitTracked`], [`SkipReason::CanonicalSource`]), the intended
+/// outcome in a checkout cwd that would otherwise `warn!` on every spawn
+/// there — and at `warn!` when it
+/// degraded for any other reason. [`ProvisionReport::is_degraded`] itself is
+/// unchanged: the manifest still reads a tracked skip as a shortfall.
+///
+/// A workdir holds ONE report per capability — the latest pass replaces the
+/// previous one in place — so a reused workdir (a looping agent's home, the
+/// scheduler's workspace root, an operator terminal cwd) describes what its
+/// most recent spawn got rather than accumulating every spawn's rows. Recording
+/// into an existing ledger also moves it to the back of the store, so eviction
+/// drops the least recently provisioned workdir.
 pub fn record_provision(workdir: &str, report: ProvisionReport) {
-    if report.is_degraded() {
+    let only_deliberate_skips = !report.skipped.is_empty()
+        && report.skipped.iter().all(|u| {
+            matches!(
+                u.reason,
+                SkipReason::GitTracked | SkipReason::CanonicalSource(_)
+            )
+        });
+    if report.is_degraded() && !only_deliberate_skips {
         tracing::warn!("provisioning degraded — {}", report.summary());
     } else {
         tracing::info!("provisioned — {}", report.summary());
     }
     with_store(|s| {
         s.latest.insert(report.capability, report.observation());
-        match s.sessions.iter_mut().find(|l| l.workdir == workdir) {
-            Some(ledger) => ledger.reports.push(report),
+        let mut ledger = match s.sessions.iter().position(|l| l.workdir == workdir) {
+            Some(at) => s.sessions.remove(at).expect("position is in bounds"),
             None => {
                 if s.sessions.len() >= LEDGER_CAPACITY {
                     s.sessions.pop_front();
                 }
-                s.sessions.push_back(SessionProvisionLedger {
+                SessionProvisionLedger {
                     workdir: workdir.to_string(),
-                    reports: vec![report],
-                });
+                    reports: Vec::new(),
+                }
             }
+        };
+        match ledger
+            .reports
+            .iter_mut()
+            .find(|r| r.capability == report.capability)
+        {
+            Some(previous) => *previous = report,
+            None => ledger.reports.push(report),
         }
+        s.sessions.push_back(ledger);
     });
 }
 
@@ -1288,7 +1325,7 @@ pub(crate) fn session_ledgers_document(
 ) -> serde_json::Value {
     let sessions: Vec<serde_json::Value> = ledgers
         .iter()
-        .filter(|l| workdir.is_none_or(|w| l.workdir == w))
+        .filter(|l| workdir.is_none_or(|w| same_workdir(&l.workdir, w)))
         .map(|l| {
             serde_json::json!({
                 "workdir": l.workdir,
@@ -1306,7 +1343,7 @@ pub(crate) fn session_ledgers_document(
         "capacity": LEDGER_CAPACITY,
         "absence": format!(
             "unknown — this store is process-local and keeps only the {LEDGER_CAPACITY} most \
-             recently provisioned sessions, so a workdir missing here may have aged out or \
+             recently provisioned workdirs, so a workdir missing here may have aged out or \
              been provisioned by another runner process"
         ),
     });
@@ -1322,6 +1359,23 @@ pub(crate) fn session_ledgers_document(
     doc
 }
 
+/// Whether two workdir strings name the same directory for the purpose of a
+/// `?workdir=` filter: equal once trailing separators are stripped (a bare `/`
+/// stays `/`). Nothing else is normalised — no case folding, no symlink or `..`
+/// resolution — because the ledger is keyed by the exact string a spawn path
+/// provisioned.
+fn same_workdir(a: &str, b: &str) -> bool {
+    fn trim(p: &str) -> &str {
+        let t = p.trim_end_matches(['/', '\\']);
+        if t.is_empty() {
+            p
+        } else {
+            t
+        }
+    }
+    trim(a) == trim(b)
+}
+
 /// The most recent observation recorded for `capability`, if any.
 #[must_use]
 pub fn latest_observation(capability: &str) -> Option<CapabilityObservation> {
@@ -1334,6 +1388,17 @@ pub fn record_observation(capability: &'static str, observation: CapabilityObser
     with_store(|s| {
         s.latest.insert(capability, observation);
     });
+}
+
+/// Serializes every test that WRITES the process-wide provisioning store —
+/// directly, or through a provisioner that records into it. `cargo test` runs a
+/// binary's tests in parallel threads, so a test that resets the store, or
+/// fills it to [`LEDGER_CAPACITY`], would otherwise see another test's writes
+/// land mid-assertion — a flake, not a finding.
+#[cfg(test)]
+pub(crate) fn store_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Discard everything recorded so far. Test support only: the store is
@@ -2184,15 +2249,6 @@ mod tests {
     // The provisioning ledger (Phase 3).
     // ------------------------------------------------------------------
 
-    /// Serializes the two tests that mutate the PROCESS-WIDE provisioning
-    /// store. `cargo test` runs a binary's tests in parallel threads, so two
-    /// tests each calling `reset_provision_store` would otherwise erase each
-    /// other's writes intermittently — a flake, not a finding.
-    fn store_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
     /// **The Phase 3 gate.** A degraded provisioning pass reports its skipped
     /// units WITH reasons instead of silently succeeding.
     ///
@@ -2444,11 +2500,68 @@ mod tests {
             "bounds describe the store, not the filter"
         );
 
+        let slashed = session_ledgers_document(&ledgers, Some("/wt/b/"));
+        assert_eq!(
+            slashed["workdir_status"], "retained",
+            "a trailing separator on the query must not turn a hit into UNKNOWN"
+        );
+
         let miss = session_ledgers_document(&ledgers, Some("/wt/never"));
         assert_eq!(miss["workdir_status"], "unknown");
         assert_eq!(miss["workdir"], "/wt/never");
         assert!(miss["sessions"].as_array().unwrap().is_empty());
         assert!(miss["absence"].as_str().unwrap().starts_with("unknown"));
+    }
+
+    /// A reused workdir keeps ONE report per capability (the latest pass), and
+    /// re-provisioning it moves its ledger to the back so eviction drops the
+    /// least recently provisioned workdir, not the first-seen one.
+    #[test]
+    fn a_reused_workdir_keeps_the_latest_pass_and_survives_eviction() {
+        let _guard = store_lock();
+        reset_provision_store();
+        let reused = "/tmp/reused-workdir";
+        let mut first = ProvisionReport::new("fleet_skills", 2, Rung::Embedded);
+        first.skip("a", SkipReason::WriteFailed("disk full".to_string()));
+        record_provision(reused, first);
+        record_provision(
+            reused,
+            ProvisionReport::new("fleet_commands", 0, Rung::Embedded),
+        );
+        for i in 0..(LEDGER_CAPACITY - 1) {
+            record_provision(
+                &format!("/tmp/filler-{i}"),
+                ProvisionReport::new("fleet_skills", 0, Rung::Embedded),
+            );
+        }
+        // Re-provision the oldest workdir: its skills row is replaced in place,
+        // and the ledger becomes the most recently used.
+        record_provision(
+            reused,
+            ProvisionReport::new("fleet_skills", 0, Rung::Embedded),
+        );
+        let ledger = session_provision_ledger(reused).expect("retained");
+        assert_eq!(
+            ledger
+                .reports
+                .iter()
+                .map(|r| r.capability)
+                .collect::<Vec<_>>(),
+            vec!["fleet_skills", "fleet_commands"],
+            "one row per capability, in first-recorded order"
+        );
+        assert!(
+            ledger.degraded().is_empty(),
+            "the stale degraded pass must have been replaced"
+        );
+        // One more workdir evicts the least recently used — filler-0, not `reused`.
+        record_provision(
+            "/tmp/one-more",
+            ProvisionReport::new("fleet_skills", 0, Rung::Embedded),
+        );
+        assert!(session_provision_ledger(reused).is_some());
+        assert!(session_provision_ledger("/tmp/filler-0").is_none());
+        reset_provision_store();
     }
 
     /// The ledger is bounded: a long-lived runner spawns thousands of sessions,

@@ -14,28 +14,32 @@
 //! the agent-spawn path wrote agent definitions, so a gate-continuation session
 //! could not spawn `code-reviewer`, and the headless continuation arm wrote no
 //! fleet asset at all. Routing every site through [`provision_session_assets`]
-//! makes "which assets does a session get?" a question with one answer, and
+//! (or its async twin [`provision_session_assets_off_runtime`]) makes "which
+//! assets does a session get?" a question with one answer, and
 //! `session_asset_sites` (test-only) fails on any provisioner call made anywhere
-//! else.
+//! else, and on any spawn path that stops calling this module.
 //!
 //! **Fail-soft, exactly as each provisioner already is.** Nothing here returns
 //! an error or panics: a provision that cannot write degrades into a ledger row
-//! and a `warn!`, and the spawn proceeds. All three skip a destination the
-//! enclosing git repository tracks ([`crate::provision_guard`]), so a cwd whose
-//! `.claude/` is a checkout keeps its own content.
+//! ([`crate::capability_manifest::record_provision`]) and a log line, and the
+//! spawn proceeds. All three skip a destination the enclosing git repository
+//! tracks ([`crate::provision_guard`]), so a cwd whose `.claude/` is a checkout
+//! keeps its own content.
 
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use tracing::warn;
 
-use crate::capability_manifest::{self, ProvisionReport, SessionProvisionLedger};
+use crate::capability_manifest::{self, ProvisionReport};
 
-/// Provision agent definitions, fleet commands and fleet skills into `workdir`,
-/// then return what the capability ledger recorded for it.
+/// Provision agent definitions, fleet commands and fleet skills into `workdir`.
 ///
-/// The return is the read-back of [`capability_manifest::session_provision_ledger`],
-/// so `None` keeps that function's meaning — UNKNOWN (the bounded ledger evicted
-/// it, or a concurrent spawn raced it), never "nothing was provisioned". Callers
-/// that only need the side effect ignore it.
-pub(crate) fn provision_session_assets(workdir: &str) -> Option<SessionProvisionLedger> {
+/// Synchronous and BLOCKING: each provisioner writes files and runs one bounded
+/// `git ls-files` probe. From an async spawn path call
+/// [`provision_session_assets_off_runtime`] instead, so the probes never occupy
+/// a tokio worker. What was written is read back through
+/// [`capability_manifest::session_provision_ledger`] or
+/// `GET /capability-manifest/sessions`.
+pub(crate) fn provision_session_assets(workdir: &str) {
     match crate::agent_runtime::provision_agent_definitions(workdir) {
         Ok(report) => capability_manifest::record_provision(workdir, report),
         Err(e) => {
@@ -57,5 +61,18 @@ pub(crate) fn provision_session_assets(workdir: &str) -> Option<SessionProvision
     }
     crate::fleet_commands::provision_fleet_commands_for_session(workdir);
     crate::fleet_skills::provision_fleet_skills_for_session(workdir);
-    capability_manifest::session_provision_ledger(workdir)
+}
+
+/// [`provision_session_assets`] on the blocking pool, awaited — for async spawn
+/// paths. A panic or cancellation on the pool (a `JoinError`) is logged and
+/// swallowed: provisioning never aborts a spawn, and a session missing some
+/// assets is the same state a failed write already produces.
+pub(crate) async fn provision_session_assets_off_runtime(workdir: &str) {
+    let owned = workdir.to_string();
+    if let Err(e) = spawn_blocking_tracked(move || provision_session_assets(&owned)).await {
+        warn!(
+            "session_assets: provisioning task for {workdir} did not complete \
+             (continuing spawn without some session assets): {e}"
+        );
+    }
 }

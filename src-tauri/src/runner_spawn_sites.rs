@@ -130,7 +130,7 @@ pub(crate) fn load_sources() -> Sources {
 /// Per line: is it a comment? `//` lines, and every line of a `/* … */` block
 /// that opens a line. A `*`-led CODE line (`*slot = tm.create(..)`) is code —
 /// only inside a block comment does a leading `*` mean a comment.
-fn comment_mask(lines: &[&str]) -> Vec<bool> {
+pub(crate) fn comment_mask(lines: &[&str]) -> Vec<bool> {
     let mut in_block = false;
     lines
         .iter()
@@ -155,7 +155,7 @@ fn comment_mask(lines: &[&str]) -> Vec<bool> {
 }
 
 /// Line spans covered by a `#[cfg(test)] mod … { … }`.
-fn test_spans(lines: &[&str]) -> Vec<(usize, usize)> {
+pub(crate) fn test_spans(lines: &[&str]) -> Vec<(usize, usize)> {
     let comments = comment_mask(lines);
     let mut spans = Vec::new();
     for (i, line) in lines.iter().enumerate() {
@@ -183,7 +183,7 @@ fn test_spans(lines: &[&str]) -> Vec<(usize, usize)> {
     spans
 }
 
-fn fn_decl_re() -> Regex {
+pub(crate) fn fn_decl_re() -> Regex {
     Regex::new(r"^(\s*)(?:pub(?:\([a-z]+\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)")
         .expect("fn decl regex")
 }
@@ -277,7 +277,7 @@ pub(crate) fn token_re(token: &str) -> Regex {
     clippy::string_slice,
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
 )]
-pub(crate) fn scan_calls(sources: &Sources, patterns: &[Regex]) -> BTreeSet<(String, String)> {
+fn scan_calls(sources: &Sources, patterns: &[Regex]) -> BTreeSet<(String, String)> {
     let decl = fn_decl_re();
     let mut out = BTreeSet::new();
     for (file, src) in sources {

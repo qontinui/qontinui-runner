@@ -58,6 +58,7 @@ use std::path::Path;
 use include_dir::{include_dir, Dir};
 
 use crate::capability_manifest::{self, ProvisionReport, SkipReason};
+use crate::provision_guard::TrackedPaths;
 
 /// The embedded subagent definitions. A flat directory of `*.md`, matching what
 /// `claude` expects under `.claude/agents/`.
@@ -72,8 +73,10 @@ static FLEET_AGENTS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/fleet_agent
 /// Write every embedded subagent definition into `dst_dir`, returning a
 /// [`ProvisionReport`] describing what landed. Creates `dst_dir` if absent;
 /// overwrites existing files (idempotent) — EXCEPT a destination that already
-/// exists and is tracked by the enclosing git repository, which is skipped and
-/// reported as [`SkipReason::GitTracked`] (see [`crate::provision_guard`]).
+/// exists and that `tracked` says the enclosing git repository tracks, which is
+/// skipped and reported as [`SkipReason::GitTracked`] (see
+/// [`crate::provision_guard`]). The caller probes `tracked` once for `dst_dir`
+/// and shares it with the checkout overlay, which writes the same directory.
 ///
 /// The guard matters because every session spawn path provisions agent
 /// definitions now, including cwds that are checkouts: `qontinui-claude-config`
@@ -92,11 +95,11 @@ static FLEET_AGENTS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/fleet_agent
 /// remove — `claude` cannot resolve the named subagent, the review never runs,
 /// and coord ages the PR out as `specialist_timeout` with no error at the point
 /// of cause — so "how many" was never the interesting half.
-pub(crate) fn provision_fleet_agents_into(dst_dir: &Path) -> std::io::Result<ProvisionReport> {
+pub(crate) fn provision_fleet_agents_into(
+    dst_dir: &Path,
+    tracked: &TrackedPaths,
+) -> std::io::Result<ProvisionReport> {
     std::fs::create_dir_all(dst_dir)?;
-    // One probe per pass; every probe failure reads as "nothing tracked", i.e.
-    // writing exactly as before.
-    let tracked = crate::provision_guard::TrackedPaths::probe(dst_dir);
     let mut out = ProvisionReport::new(
         "fleet_agents",
         embedded_agent_count(),
@@ -153,7 +156,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let dst = tmp.path().join(".claude").join("agents");
 
-        let report = provision_fleet_agents_into(&dst).expect("provision");
+        let report =
+            provision_fleet_agents_into(&dst, &TrackedPaths::probe(&dst)).expect("provision");
         assert_eq!(
             report.written,
             embedded_agent_count(),
@@ -187,11 +191,11 @@ mod tests {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let dst = tmp.path().join(".claude").join("agents");
 
-        let first = provision_fleet_agents_into(&dst).expect("first");
+        let first = provision_fleet_agents_into(&dst, &TrackedPaths::probe(&dst)).expect("first");
         let victim = dst.join("code-reviewer.md");
         std::fs::write(&victim, b"CLOBBERED").expect("clobber");
 
-        let second = provision_fleet_agents_into(&dst).expect("second");
+        let second = provision_fleet_agents_into(&dst, &TrackedPaths::probe(&dst)).expect("second");
         assert_eq!(
             (first.written, first.skipped.len()),
             (second.written, second.skipped.len()),
@@ -225,7 +229,8 @@ mod tests {
         let untracked = dst.join("repo-auditor.md");
         std::fs::write(&untracked, b"stale, untracked\n").unwrap();
 
-        let report = provision_fleet_agents_into(&dst).expect("provision");
+        let report =
+            provision_fleet_agents_into(&dst, &TrackedPaths::probe(&dst)).expect("provision");
 
         assert_eq!(
             std::fs::read(&tracked).unwrap(),
