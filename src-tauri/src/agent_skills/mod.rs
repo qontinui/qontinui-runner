@@ -883,9 +883,10 @@ pub(crate) fn resolve_over(
 /// floor is the embedded bundle.
 ///
 /// **Which of the three arms answered is a value**, not just a log line: read it
-/// off the returned registry with [`AgentSkillRegistry::resolution_arm`]. The
-/// caller (`fleet_skills::provision_fleet_skills_for_session`) turns it into the
-/// capability manifest's `agent_skills_registry` row.
+/// off the returned registry with [`AgentSkillRegistry::resolution_arm`].
+/// `fleet_skills::observe_skills_registry` turns it into the capability
+/// manifest's `agent_skills_registry` row; the caller is `session_assets`,
+/// which resolves once per spawn.
 pub fn resolve_registry() -> AgentSkillRegistry {
     let base_url = crate::api_config::get_api_base_url();
     let path = cache_path();

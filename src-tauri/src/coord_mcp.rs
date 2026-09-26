@@ -9021,6 +9021,12 @@ pub(crate) fn provision_coord_mcp_for_session(
 /// [`CoordMcpDelivery::Unprovisioned`] — the same outcome as a provision that
 /// found no credential. The session was given nothing the runner knows of, and
 /// provisioning never aborts a spawn.
+///
+/// Two limits of that answer, stated rather than implied: a `JoinError` reports
+/// `Unprovisioned` even when the blocking task had already written `.mcp.json`
+/// before it panicked; and dropping the awaiting future does NOT stop the
+/// blocking provision — it runs to completion and may still write (and mint a
+/// nonce) for a session that never spawns.
 pub(crate) async fn provision_coord_mcp_for_session_off_runtime(
     workdir: &str,
     bound_port: Option<u16>,

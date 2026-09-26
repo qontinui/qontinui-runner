@@ -173,8 +173,10 @@ fn collect_text_files(
 /// PROJECT-scoped skills — even on a device with no `qontinui-claude-config`
 /// checkout.
 ///
-/// The set written is [`crate::agent_skills::resolve_registry`]'s output: the
-/// account's skills where it has any, the embedded defaults otherwise.
+/// The set written is `registry` — in production
+/// [`crate::agent_skills::resolve_registry`]'s output, resolved once per spawn by
+/// `session_assets`: the account's skills where it has any, the embedded
+/// defaults otherwise.
 ///
 /// Fail-soft, mirroring
 /// [`crate::fleet_commands::provision_fleet_commands_for_session`]: any IO error
@@ -191,15 +193,17 @@ fn collect_text_files(
 /// [`crate::provision_guard`]). **A tracked file outranks a served override**:
 /// the account layer decides what this binary would write, not whether it may
 /// replace a repository's committed content.
-pub(crate) fn provision_fleet_skills_for_session(workdir: &str) {
-    let registry = crate::agent_skills::resolve_registry();
+pub(crate) fn provision_fleet_skills_for_session(
+    workdir: &str,
+    registry: &crate::agent_skills::AgentSkillRegistry,
+) {
     let skills_dir = Path::new(workdir).join(".claude").join("skills");
 
     // Recorded before the write, because it is a fact about resolution rather
     // than about provisioning and holds even if every write below is skipped.
-    observe_skills_registry(&registry);
+    observe_skills_registry(registry);
 
-    match provision_fleet_skills_into(&skills_dir, &registry) {
+    match provision_fleet_skills_into(&skills_dir, registry) {
         Ok(report) => crate::capability_manifest::record_provision(workdir, report),
         Err(e) => {
             // The destination directory itself could not be created, so no file
@@ -255,7 +259,7 @@ fn embedded_skill_file_count() -> usize {
 /// [`crate::agent_skills::resolve_registry`]'s three arms answered. Takes the
 /// already-resolved registry so a provisioning pass resolves it once. Also
 /// called by `session_assets`' canonical-source arm, which writes no skill but
-/// still resolves the registry.
+/// has still resolved the registry.
 pub(crate) fn observe_skills_registry(registry: &crate::agent_skills::AgentSkillRegistry) {
     let arm = registry.resolution_arm();
     crate::capability_manifest::record_observation(
