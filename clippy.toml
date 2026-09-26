@@ -6,3 +6,13 @@
 disallowed-methods = [
   { path = "tokio_postgres::Row::get", reason = "Row::get PANICS on NULL/type/index mismatch and kills the enclosing task silently — use try_get and handle the Err arm. Dossier row-get-panic-kills-spawned-loop." },
 ]
+
+# An owned `tokio::runtime::Runtime` dropped from inside an async context panics
+# ("Cannot drop a runtime in a context where blocking is not allowed") — the
+# `CloseRequested` panic plan runner-arc-runtime-root-cause removed by taking
+# every `Arc<Runtime>` field out. This entry is that plan's missing regression
+# guard (plan 2026-09-12-residual-work-from-the-april-2026-plan-audit, Phase 1).
+# Level `deny` is in `src-tauri/Cargo.toml`; `expect_ratchet.rs` pins it.
+disallowed-types = [
+  { path = "tokio::runtime::Runtime", reason = "dropping an owned Runtime from an async context panics (`Cannot drop a runtime in a context where blocking is not allowed`) — hold a tokio::runtime::Handle or use tauri::async_runtime. Plan runner-arc-runtime-root-cause." },
+]
