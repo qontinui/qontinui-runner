@@ -206,6 +206,42 @@ fn run_bounded_git_ls_files(root: &Path) -> Option<Vec<u8>> {
     std::fs::read(out_file.path()).ok()
 }
 
+/// `Some(why)` when `dst` resolves to `src` or to a path inside it, following
+/// symlinks — the destination IS the canonical source a provisioner would copy
+/// from (a workspace-root cwd whose `.claude` links into
+/// `qontinui-claude-config/.claude`), so writing there overwrites the source. Either side may not exist yet, so each is resolved through its
+/// nearest existing ancestor ([`canonicalize_through_ancestors`]). `None` —
+/// "not the same tree" — also when either side cannot be resolved at all,
+/// which on a real filesystem means neither exists and there is nothing of the
+/// source's to overwrite.
+pub(crate) fn destination_is_source(dst: &Path, src: &Path) -> Option<String> {
+    let dst_real = canonicalize_through_ancestors(dst)?;
+    let src_real = canonicalize_through_ancestors(src)?;
+    dst_real.starts_with(&src_real).then(|| {
+        format!(
+            "{} resolves to {}, which is the source {} it would be copied from",
+            dst.display(),
+            dst_real.display(),
+            src_real.display()
+        )
+    })
+}
+
+/// `std::fs::canonicalize` for a path that may not exist yet: canonicalize its
+/// nearest existing ancestor and re-append the missing tail. `None` when no
+/// ancestor resolves, or the tail holds a component with no file name (`..`).
+fn canonicalize_through_ancestors(path: &Path) -> Option<PathBuf> {
+    let mut tail = Vec::new();
+    let mut current = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(current) {
+            return Some(tail.iter().rev().fold(real, |acc, part| acc.join(part)));
+        }
+        tail.push(current.file_name()?.to_os_string());
+        current = current.parent()?;
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     //! Tempdir git helpers shared by this module's tests and by the two
