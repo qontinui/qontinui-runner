@@ -7778,3 +7778,55 @@ mod config_dir_deflection_tests {
         assert_eq!(dir, deflected_config_dir());
     }
 }
+
+/// The CI sentinel's liveness probe (plan
+/// `2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json`,
+/// Phase 5).
+///
+/// `.github/workflows/ci.yml` plants a sentinel `settings.json` at the RAW
+/// platform config dir before the Rust tests run and fails the job when its
+/// hash changed afterwards. Reverting a fix cannot prove that step live: the
+/// test-harness deflection absorbs the write, and the recorded race is
+/// nondeterministic anyway. This probe is the deterministic writer. It skips
+/// the guarded resolver entirely — `resolve_config_dir_from(None,
+/// dirs::config_dir())`, which is exactly what `resolve_config_dir` answered
+/// before the deflection existed — and writes a defaults document there, the
+/// shape the recorded resets left behind.
+///
+/// Doubly gated so it can never fire by accident: `#[ignore]` keeps it out of
+/// every ordinary run, and even `--ignored` does nothing unless
+/// `QONTINUI_CI_SENTINEL_PROBE=1` is exported. To prove the sentinel live, on a
+/// throwaway branch (never committed to a PR that lands) set that variable on
+/// the `Run Rust tests` step and append
+/// `-- --ignored --exact ci_sentinel_probe::ci_sentinel_liveness_probe` to the
+/// runner binary's invocation; the `Settings sentinel is untouched` step must
+/// go red. Its allowlist row is `config_dir_scan_guard`'s one
+/// `CiSentinelProbe` entry.
+#[cfg(test)]
+mod ci_sentinel_probe {
+    use super::*;
+
+    /// The variable that arms [`ci_sentinel_liveness_probe`].
+    const PROBE_ENV: &str = "QONTINUI_CI_SENTINEL_PROBE";
+
+    #[test]
+    #[ignore = "writes the REAL platform settings.json; run only to prove CI's sentinel step \
+                live, with QONTINUI_CI_SENTINEL_PROBE=1"]
+    fn ci_sentinel_liveness_probe() {
+        if std::env::var(PROBE_ENV).as_deref() != Ok("1") {
+            eprintln!("{PROBE_ENV} is not 1 — the probe writes nothing");
+            return;
+        }
+        let (dir, source) = resolve_config_dir_from(None, dirs::config_dir())
+            .expect("the platform has a config dir");
+        assert_eq!(source, ConfigDirSource::PlatformConfigDir);
+        std::fs::create_dir_all(&dir).expect("create the raw platform config dir");
+        let doc = serde_json::to_vec_pretty(&Settings::default()).expect("serialize defaults");
+        let path = dir.join(SETTINGS_FILE);
+        std::fs::write(&path, doc).expect("write the defaults document");
+        eprintln!(
+            "{PROBE_ENV}: wrote a defaults document to {} — the CI sentinel step must now fail",
+            path.display()
+        );
+    }
+}

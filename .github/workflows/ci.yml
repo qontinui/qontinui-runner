@@ -635,6 +635,55 @@ jobs:
             cat "$q/machine.json" "$q/profiles.json"
           done
 
+          # The SETTINGS SENTINEL (plan 2026-09-23-runner-unit-tests-overwrite-
+          # the-operators-live-settings-json, Phase 5). A runner test binary
+          # wrote a defaults document over an operator's live settings.json —
+          # five times in one afternoon, then again from a second, unfiltered
+          # `cargo test` — and nothing on CI could have seen it, because a
+          # clean runner has no file there to lose. So plant one at the RAW
+          # platform config dir, exactly where `dirs::config_dir()` resolves
+          # (`$XDG_CONFIG_HOME` or `~/.config` on Linux; the known-folder
+          # `%APPDATA%` on Windows, which no env var can move), and record its
+          # hash. `Settings sentinel is untouched` re-hashes it after the tests
+          # and fails on any change. The fields are the ones the recorded
+          # resets destroyed: a known `local_user_id` and a non-empty
+          # `paths.plans_dir`.
+          #
+          # A pre-existing file (a runner that is not the clean one this step
+          # assumes) is MOVED aside, not overwritten, and `Unpoison ambient
+          # state` moves it back.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            SENTINEL_DIR="$(cygpath -u "$APPDATA")/com.qontinui.runner"
+          else
+            SENTINEL_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/com.qontinui.runner"
+          fi
+          SENTINEL="$SENTINEL_DIR/settings.json"
+          SENTINEL_BACKUP=""
+          mkdir -p "$SENTINEL_DIR"
+          if [ -e "$SENTINEL" ]; then
+            SENTINEL_BACKUP="$RUNNER_TEMP/settings.json.pre-sentinel"
+            echo "::warning::$SENTINEL already exists before the sentinel was planted — moved to $SENTINEL_BACKUP; Unpoison restores it"
+            mv "$SENTINEL" "$SENTINEL_BACKUP"
+          fi
+          cat > "$SENTINEL" <<EOF
+          {
+            "qontinui_ci_sentinel": "planted by ci.yml 'Poison ambient state'; a test process changed this file if its hash moved",
+            "local_user_id": "ci-sentinel-local-user-id-${GITHUB_RUN_ID:-local}",
+            "tier": "local",
+            "tier_initialized": true,
+            "paths": { "plans_dir": "/ci-sentinel/plans-dir-must-survive" }
+          }
+          EOF
+          SENTINEL_SHA="$(sha256sum "$SENTINEL" | cut -d' ' -f1)"
+          cp "$SENTINEL" "$RUNNER_TEMP/settings-sentinel.expected.json"
+          {
+            echo "QONTINUI_SETTINGS_SENTINEL=$SENTINEL"
+            echo "QONTINUI_SETTINGS_SENTINEL_SHA256=$SENTINEL_SHA"
+            echo "QONTINUI_SETTINGS_SENTINEL_BACKUP=$SENTINEL_BACKUP"
+          } >> "$GITHUB_ENV"
+          echo "=== settings sentinel planted at $SENTINEL (sha256 $SENTINEL_SHA) ==="
+          cat "$SENTINEL"
+
           # A workspace root that does not exist: `default_canonical_path` must
           # fail closed naming `$QONTINUI_ROOT`, never resolve.
           POISON_ROOT="$RUNNER_TEMP/qontinui-root-poison-does-not-exist"
@@ -1129,6 +1178,70 @@ jobs:
             --build-outcome "${{ steps.build_rust_tests.outcome }}" \
             --run-outcome "${{ steps.run_rust_tests.outcome }}"
 
+      # The GATE half of the settings sentinel `Poison ambient state` planted
+      # (plan 2026-09-23-runner-unit-tests-overwrite-the-operators-live-
+      # settings-json, Phase 5): re-hash the sentinel settings.json at the raw
+      # platform config dir and fail, with the diff, when a test process
+      # changed or removed it. That is the operator's live file on a dev box.
+      #
+      # Placement is load-bearing. AFTER `Run Rust tests` (the run half of the
+      # build/run split — the build half executes no test) and after the two
+      # `if: failure()` diagnostics, so the classifier's solo re-runs are
+      # inside the window too. And after `Explain which Rust test phase…`, so
+      # that step's `failure()` reading is about the suite, never about this
+      # gate. `if: always()`: a red suite is exactly the run most likely to
+      # have written the file.
+      #
+      # No `continue-on-error` (it gates), and so no reason to avoid
+      # `timeout-minutes` — but the step is two hashes, so it carries none,
+      # like `Poison ambient state` itself.
+      #
+      # PROVING IT LIVE, deterministically — never by a red committed state.
+      # Reverting the fix would not go red: the test-harness deflection absorbs
+      # the write, and the recorded race is nondeterministic. The writer is
+      # `settings::ci_sentinel_probe::ci_sentinel_liveness_probe`, `#[ignore]`d
+      # and inert unless `QONTINUI_CI_SENTINEL_PROBE=1`: it writes a defaults
+      # document straight to `resolve_config_dir_from(None, dirs::config_dir())`,
+      # bypassing the guard. On a THROWAWAY branch, add
+      # `QONTINUI_CI_SENTINEL_PROBE: "1"` to `Run Rust tests`' `env:` and run
+      # the runner bin's test binary once more with
+      # `--ignored --exact ci_sentinel_probe::ci_sentinel_liveness_probe`; this
+      # step must fail naming the diff. Record that run's URL on the PR and
+      # drop the branch.
+      #
+      # If `Poison ambient state` never ran (an earlier step redded) there is
+      # no sentinel to check and the step says so rather than failing.
+      - name: Settings sentinel is untouched
+        if: always()
+        shell: bash
+        run: |
+          set -u
+          if [ -z "${QONTINUI_SETTINGS_SENTINEL:-}" ]; then
+            echo "::notice title=sentinel-skipped::no settings sentinel was planted (Poison ambient state did not run); nothing to check"
+            exit 0
+          fi
+          EXPECTED="$RUNNER_TEMP/settings-sentinel.expected.json"
+          if [ ! -e "$QONTINUI_SETTINGS_SENTINEL" ]; then
+            echo "::error title=Settings sentinel removed::$QONTINUI_SETTINGS_SENTINEL was DELETED during the Rust tests. A test process reached the real platform config dir — on a dev box that is the operator's live settings.json. See plan 2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json."
+            exit 1
+          fi
+          ACTUAL_SHA="$(sha256sum "$QONTINUI_SETTINGS_SENTINEL" | cut -d' ' -f1)"
+          if [ "$ACTUAL_SHA" != "$QONTINUI_SETTINGS_SENTINEL_SHA256" ]; then
+            echo "::error title=Settings sentinel changed::$QONTINUI_SETTINGS_SENTINEL changed during the Rust tests (sha256 $QONTINUI_SETTINGS_SENTINEL_SHA256 -> $ACTUAL_SHA). A test process wrote the real platform settings.json — on a dev box, the operator's live file. See plan 2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json."
+            echo "=== diff (planted -> found) ==="
+            diff -u "$EXPECTED" "$QONTINUI_SETTINGS_SENTINEL" || true
+            ls -la "$(dirname "$QONTINUI_SETTINGS_SENTINEL")"
+            exit 1
+          fi
+          # A sibling the sentinel's hash cannot see: a stray atomic-write temp
+          # means a writer got as far as the rename's first half.
+          stray="$(ls -1 "$(dirname "$QONTINUI_SETTINGS_SENTINEL")" 2>/dev/null | grep -E '^settings\.json\.tmp' || true)"
+          if [ -n "$stray" ]; then
+            echo "::error title=Settings sentinel temp file::a settings.json.tmp.* appeared beside the sentinel during the Rust tests: $stray"
+            exit 1
+          fi
+          echo "settings sentinel untouched: $QONTINUI_SETTINGS_SENTINEL (sha256 $ACTUAL_SHA)"
+
       # Phase 3 step 1 of the same plan: MEASURE the quantity
       # `CARGO_BUILD_JOBS` is tuned against, before retuning it.
       #
@@ -1327,13 +1440,29 @@ jobs:
             done
             rmdir "$h/.qontinui" 2>/dev/null || true
           done
+          # The settings sentinel: removed by name, and a file that was there
+          # before it was planted is moved back. (This step has no
+          # `if: always()`, so on a red suite neither happens — harmless on an
+          # ephemeral hosted runner, which is the only kind this job uses.)
+          if [ -n "${QONTINUI_SETTINGS_SENTINEL:-}" ]; then
+            rm -f "$QONTINUI_SETTINGS_SENTINEL"
+            if [ -n "${QONTINUI_SETTINGS_SENTINEL_BACKUP:-}" ] && [ -e "$QONTINUI_SETTINGS_SENTINEL_BACKUP" ]; then
+              mv "$QONTINUI_SETTINGS_SENTINEL_BACKUP" "$QONTINUI_SETTINGS_SENTINEL"
+              echo "restored the pre-existing $QONTINUI_SETTINGS_SENTINEL"
+            else
+              rmdir "$(dirname "$QONTINUI_SETTINGS_SENTINEL")" 2>/dev/null || true
+            fi
+          fi
           {
             echo "COORD_HTTP_URL="
             echo "QONTINUI_ROOT="
             echo "QONTINUI_SERVER_MODE="
             echo "QONTINUI_RUNNER_TIER="
+            echo "QONTINUI_SETTINGS_SENTINEL="
+            echo "QONTINUI_SETTINGS_SENTINEL_SHA256="
+            echo "QONTINUI_SETTINGS_SENTINEL_BACKUP="
           } >> "$GITHUB_ENV"
-          echo "poison removed; COORD_HTTP_URL / QONTINUI_ROOT / QONTINUI_SERVER_MODE / QONTINUI_RUNNER_TIER blanked"
+          echo "poison removed; COORD_HTTP_URL / QONTINUI_ROOT / QONTINUI_SERVER_MODE / QONTINUI_RUNNER_TIER / settings sentinel blanked"
         shell: bash
 
       - name: Live AI extractor smoke

@@ -151,6 +151,13 @@ const ALLOWLIST: &[(&str, &str, Class, &str)] = &[
         Class::TestAssertion,
         "reads the real dir only to assert the roster path is NOT under it",
     ),
+    (
+        "settings.rs",
+        "ci_sentinel_liveness_probe",
+        Class::CiSentinelProbe,
+        "#[ignore]d and gated on QONTINUI_CI_SENTINEL_PROBE=1: writes a defaults \
+         document to the RAW platform dir so CI's sentinel step can be seen to go red",
+    ),
 ];
 
 /// Floor for the walk, so a broken path or filter cannot pass vacuously. The
