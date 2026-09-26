@@ -358,4 +358,124 @@ mod tests {
             Err(ProvenanceError::Missing)
         );
     }
+
+    /// One case of `qontinui-claude-config`'s shared known-answer fixture,
+    /// `scripts/lib/provenance_stamp_kat.json` (added in its commit
+    /// `c0cca9ef`), copied here as literal bytes: the runner cannot read a
+    /// sibling checkout at test time, and the point is that BOTH
+    /// implementations answer the same literal bytes.
+    struct Kat {
+        name: &'static str,
+        /// `None`: a derived file, not `with_provenance` output.
+        body: Option<&'static str>,
+        source: &'static str,
+        canonical: &'static str,
+        runner_build: &'static str,
+        canonical_sha: Option<&'static str>,
+        blob: &'static str,
+        stamped: &'static str,
+        self_identifies: bool,
+        stripped: &'static str,
+    }
+
+    const KAT: &[Kat] = &[
+        Kat {
+            name: "a-frontmatter-insert",
+            body: Some("---\ndescription: x\n---\n# body\n"),
+            source: "builtin",
+            canonical: "qontinui-claude-config:.claude/commands/kat-a.md",
+            runner_build: "kat-build-1",
+            canonical_sha: None,
+            blob: "0a4a3c1294e0123af099d760dd21e33e8c2c967e",
+            stamped: "---\nqontinui-provenance: source=builtin canonical=qontinui-claude-config:.claude/commands/kat-a.md blob=0a4a3c1294e0123af099d760dd21e33e8c2c967e runner_build=kat-build-1\ndescription: x\n---\n# body\n",
+            self_identifies: true,
+            stripped: "---\ndescription: x\n---\n# body\n",
+        },
+        Kat {
+            name: "b-no-frontmatter-prepend",
+            body: Some("# body\nline two\n"),
+            source: "served",
+            canonical: "qontinui-claude-config:.claude/commands/kat-b.md",
+            runner_build: "kat-build-1",
+            canonical_sha: None,
+            blob: "2b152925f556a5c31ba1b230f20ed4cac50ece1e",
+            stamped: "---\nqontinui-provenance: source=served canonical=qontinui-claude-config:.claude/commands/kat-b.md blob=2b152925f556a5c31ba1b230f20ed4cac50ece1e runner_build=kat-build-1\n---\n# body\nline two\n",
+            self_identifies: true,
+            stripped: "# body\nline two\n",
+        },
+        Kat {
+            name: "c-skill-md-crlf-insert",
+            body: Some("---\r\nname: kat-c\r\ndescription: y\r\n---\r\n# skill\r\n"),
+            source: "builtin",
+            canonical: "qontinui-claude-config:.claude/skills/kat-c/SKILL.md",
+            runner_build: "kat-build-1",
+            canonical_sha: None,
+            blob: "20ae160aadba27c0431efaf4751df9073849f851",
+            stamped: "---\r\nqontinui-provenance: source=builtin canonical=qontinui-claude-config:.claude/skills/kat-c/SKILL.md blob=20ae160aadba27c0431efaf4751df9073849f851 runner_build=kat-build-1\r\nname: kat-c\r\ndescription: y\r\n---\r\n# skill\r\n",
+            self_identifies: true,
+            stripped: "---\r\nname: kat-c\r\ndescription: y\r\n---\r\n# skill\r\n",
+        },
+        Kat {
+            name: "d-canonical-sha-empty-block-prepend",
+            body: Some("---\n---\n# empty block\n"),
+            source: "canonical",
+            canonical: "qontinui-claude-config:.claude/commands/kat-d.md",
+            runner_build: "kat-build-1",
+            canonical_sha: Some("0123456789ab"),
+            blob: "8899feed45cb914271ab8f44968e9043d7cce033",
+            stamped: "---\nqontinui-provenance: source=canonical canonical=qontinui-claude-config:.claude/commands/kat-d.md blob=8899feed45cb914271ab8f44968e9043d7cce033 runner_build=kat-build-1 canonical_sha=0123456789ab\n---\n---\n---\n# empty block\n",
+            self_identifies: true,
+            stripped: "---\n---\n# empty block\n",
+        },
+        Kat {
+            name: "e-crlf-converted-prepend",
+            body: None,
+            source: "served",
+            canonical: "qontinui-claude-config:.claude/commands/kat-b.md",
+            runner_build: "kat-build-1",
+            canonical_sha: None,
+            blob: "2b152925f556a5c31ba1b230f20ed4cac50ece1e",
+            stamped: "---\r\nqontinui-provenance: source=served canonical=qontinui-claude-config:.claude/commands/kat-b.md blob=2b152925f556a5c31ba1b230f20ed4cac50ece1e runner_build=kat-build-1\r\n---\r\n# body\r\nline two\r\n",
+            self_identifies: false,
+            stripped: "# body\r\nline two\r\n",
+        },
+    ];
+
+    /// The Rust stamp, strip, parse and verify answer the shared fixture's
+    /// literal bytes. `with_provenance` always writes THIS build's id, so its
+    /// output is compared with the fixture's `runner_build` substituted in.
+    #[test]
+    fn the_shared_known_answer_fixture_holds() {
+        for kat in KAT {
+            let name = kat.name;
+            if let Some(body) = kat.body {
+                assert_eq!(git_blob_id(body.as_bytes()), kat.blob, "{name}: blob");
+                let written = with_provenance(kat.canonical, body, kat.source, kat.canonical_sha)
+                    .replacen(
+                        &format!("runner_build={RUNNER_BUILD}"),
+                        &format!("runner_build={}", kat.runner_build),
+                        1,
+                    );
+                assert_eq!(written, kat.stamped, "{name}: stamped bytes");
+            }
+            let (line, stripped) = strip_provenance(kat.stamped).expect(name);
+            assert_eq!(stripped, kat.stripped, "{name}: stripped bytes");
+            assert_eq!(
+                line,
+                ProvenanceLine {
+                    source: kat.source.to_string(),
+                    canonical: kat.canonical.to_string(),
+                    blob: kat.blob.to_string(),
+                    runner_build: kat.runner_build.to_string(),
+                    canonical_sha: kat.canonical_sha.map(str::to_string),
+                },
+                "{name}: parsed line"
+            );
+            assert_eq!(
+                provenance_consistent(kat.stamped).is_ok(),
+                kat.self_identifies,
+                "{name}: self-identification"
+            );
+        }
+    }
 }
