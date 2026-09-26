@@ -415,9 +415,11 @@ pub fn plan_reclaim(
         ReclaimAction::Remove => {
             let mut steps: Vec<ReclaimStep> = Vec::new();
             // INV-W4: unlink EVERY junction first, in the order coord
-            // listed them, BEFORE the recursive worktree removal.
+            // listed them, BEFORE the recursive worktree removal. Each sink
+            // kind resolves via [`sink_path`] so the unlink hits the junction
+            // the census measured (`src-tauri/target` on a Tauri worktree).
             for rel in &instr.junctioned_paths {
-                steps.push(ReclaimStep::UnlinkJunction(worktree.join(rel)));
+                steps.push(ReclaimStep::UnlinkJunction(sink_path(&worktree, rel)));
             }
             // Only now the worktree removal.
             steps.push(ReclaimStep::RemoveWorktree(worktree));
@@ -3071,6 +3073,27 @@ mod tests {
         assert_eq!(
             sink_path(&canonical, "node_modules"),
             canonical.join("node_modules")
+        );
+    }
+
+    /// INV-W4 on a Tauri worktree: the junction-first unlink must hit
+    /// `src-tauri/target` (what the census measured), not the absent
+    /// `<wt>/target`, and still precede the removal.
+    #[test]
+    fn remove_unlinks_tauri_target_junction_before_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir_all(wt.join("src-tauri/target")).unwrap();
+        let mut i = instr(ReclaimAction::Remove, &["target", "node_modules"], false);
+        i.worktree_path = wt.to_string_lossy().into_owned();
+        let steps = plan_reclaim(&i, false, true, None, true);
+        assert_eq!(
+            steps,
+            vec![
+                ReclaimStep::UnlinkJunction(wt.join("src-tauri").join("target")),
+                ReclaimStep::UnlinkJunction(wt.join("node_modules")),
+                ReclaimStep::RemoveWorktree(wt.clone()),
+            ]
         );
     }
 
