@@ -377,6 +377,14 @@ struct StoredTokens {
     /// per-tenant slots are refreshed independently by the per-slot pass.
     #[serde(default)]
     device_machine_key: Option<String>,
+    /// Unix-seconds expiry web reported when it minted [`Self::device_machine_key`]
+    /// (`expires_at` on the mint response). `None` = unknown: a key stored from
+    /// the pair-cli response, which carries no expiry, or a pre-field `.enc`.
+    /// Drives the refresher's re-enrolment of a key near its expiry (plan
+    /// 2026-09-24-runner-coord-credential-stranded-after-outage Phase 3).
+    /// Wiped wherever the key is.
+    #[serde(default)]
+    device_machine_key_expires_at: Option<i64>,
     /// Whether the operator has explicitly logged out of the INTERACTIVE
     /// session while leaving the autonomy credentials in place.
     ///
@@ -463,6 +471,72 @@ pub enum StoredTokenRead {
     Present(String),
     Absent,
     Unreadable(String),
+}
+
+/// A store loaded for a read-modify-write, holding the store's WRITE LOCK
+/// until it is dropped — i.e. until the writer's function returns, after its
+/// `save_tokens`.
+///
+/// Every writer here loads the whole struct, changes one slot and saves it
+/// back. Without a lock spanning that sequence, two writers (the refresher's
+/// machine-key enrolment and a pairing, or two runner processes sharing one
+/// data dir) interleave and the later save silently reverts the earlier
+/// one's slot — for a machine key web has already ROTATED, that loses the
+/// only live copy (plan 2026-09-24-runner-coord-credential-stranded-after-
+/// outage). `Deref`/`DerefMut` keep every call site unchanged:
+/// `tokens.slot = …` and `self.save_tokens(&tokens)` coerce through it.
+struct LockedTokens {
+    tokens: StoredTokens,
+    _lock: StoreWriteLock,
+}
+
+impl std::ops::Deref for LockedTokens {
+    type Target = StoredTokens;
+    fn deref(&self) -> &StoredTokens {
+        &self.tokens
+    }
+}
+
+impl std::ops::DerefMut for LockedTokens {
+    fn deref_mut(&mut self) -> &mut StoredTokens {
+        &mut self.tokens
+    }
+}
+
+/// Exclusive advisory lock on `<store>.lock`, released on drop (closing the
+/// handle releases it; the explicit unlock is belt-and-braces).
+///
+/// `std::fs::File::lock` is `flock(2)` on Unix and `LockFileEx` on Windows.
+/// Both lock per OPEN FILE, so it serialises threads of this process (each
+/// acquisition opens its own handle) as well as other processes. It is NOT
+/// re-entrant: a writer must never call another writer while holding one.
+///
+/// It serialises LOCAL read-modify-writes only. Two machine-key mints that
+/// are both in flight to web can still land server-side in one order and be
+/// persisted here in the other; the lock does not order network calls.
+struct StoreWriteLock {
+    file: fs::File,
+}
+
+impl Drop for StoreWriteLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+impl StoreWriteLock {
+    fn acquire(storage_path: &std::path::Path) -> Result<Self> {
+        let mut name = storage_path.as_os_str().to_owned();
+        name.push(".lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(std::path::PathBuf::from(name))
+            .context("Failed to open secure storage lock file")?;
+        file.lock().context("Failed to lock secure storage")?;
+        Ok(Self { file })
+    }
 }
 
 /// Encrypted file-based storage manager.
@@ -687,7 +761,7 @@ impl SecureStorage {
     /// The EXPLICIT credential-acquisition writers instead call
     /// [`Self::load_tokens_for_write_mode`] with [`WriteMode::Fresh`], which
     /// starts from blank rather than refusing — see that method and `WriteMode`.
-    fn load_tokens_for_write(&self) -> Result<StoredTokens> {
+    fn load_tokens_for_write(&self) -> Result<LockedTokens> {
         self.load_tokens_for_write_mode(WriteMode::Merge)
     }
 
@@ -697,7 +771,20 @@ impl SecureStorage {
     /// and [`WriteMode::Fresh`] returns a blank [`StoredTokens`] so the explicit
     /// caller can rewrite the (cryptographically-dead) store from scratch. On a
     /// readable or genuinely-absent store the two are identical.
-    fn load_tokens_for_write_mode(&self, mode: WriteMode) -> Result<StoredTokens> {
+    ///
+    /// Takes the store's write lock FIRST and hands it back inside the
+    /// [`LockedTokens`], so the whole read-modify-write is serialised across
+    /// threads and processes (see [`LockedTokens`]).
+    fn load_tokens_for_write_mode(&self, mode: WriteMode) -> Result<LockedTokens> {
+        let lock = StoreWriteLock::acquire(&self.storage_path)?;
+        let tokens = self.load_tokens_for_write_mode_unlocked(mode)?;
+        Ok(LockedTokens {
+            tokens,
+            _lock: lock,
+        })
+    }
+
+    fn load_tokens_for_write_mode_unlocked(&self, mode: WriteMode) -> Result<StoredTokens> {
         match self.load_tokens() {
             Ok(tokens) => Ok(tokens),
             Err(e) if self.store_file_exists() => match mode {
@@ -788,6 +875,7 @@ impl SecureStorage {
     /// identifier, not a credential. (Every other writer refuses, because for
     /// them a blank rewrite is silent credential loss, not the point.)
     pub fn clear_tokens(&self) -> Result<()> {
+        let _lock = StoreWriteLock::acquire(&self.storage_path)?;
         let mut tokens = self.load_tokens().unwrap_or_default();
         tokens.access_token = None;
         tokens.refresh_token = None;
@@ -805,6 +893,7 @@ impl SecureStorage {
         // machine key). `clear_interactive_session` below deliberately does
         // NOT touch these, so autonomy survives a default logout.
         tokens.device_machine_key = None;
+        tokens.device_machine_key_expires_at = None;
         tokens.agent_machine_key = None;
         // Belt-and-braces: with every credential gone the presence check
         // already reports signed-out, but keep the flag consistent so a
@@ -1337,8 +1426,30 @@ impl SecureStorage {
     }
 
     fn store_device_machine_key_mode(&self, key: &str, mode: WriteMode) -> Result<()> {
+        self.store_device_machine_key_with_expiry_mode(key, None, mode)
+    }
+
+    /// Store a machine key together with the `expires_at` web minted it with
+    /// (unix seconds; `None` = web did not say). Replaces any prior key AND its
+    /// recorded expiry — a key stored without one must not inherit the old
+    /// key's.
+    pub fn store_device_machine_key_with_expiry(
+        &self,
+        key: &str,
+        expires_at: Option<i64>,
+    ) -> Result<()> {
+        self.store_device_machine_key_with_expiry_mode(key, expires_at, WriteMode::Merge)
+    }
+
+    fn store_device_machine_key_with_expiry_mode(
+        &self,
+        key: &str,
+        expires_at: Option<i64>,
+        mode: WriteMode,
+    ) -> Result<()> {
         let mut tokens = self.load_tokens_for_write_mode(mode)?;
         tokens.device_machine_key = Some(key.to_string());
+        tokens.device_machine_key_expires_at = expires_at;
         self.save_tokens(&tokens)?;
         info!("device machine key stored in secure file storage");
         Ok(())
@@ -1353,12 +1464,25 @@ impl SecureStorage {
         Ok(tokens.device_machine_key)
     }
 
+    /// The recorded expiry of the stored machine key (unix seconds), or `None`
+    /// when no key is stored, web never reported one, or the store is
+    /// unreadable. Callers that must tell those apart read
+    /// [`Self::get_device_machine_key`] first.
+    pub fn get_device_machine_key_expires_at(&self) -> Option<i64> {
+        self.load_tokens().ok().and_then(|t| {
+            t.device_machine_key
+                .as_ref()
+                .and(t.device_machine_key_expires_at)
+        })
+    }
+
     /// Clear the device-bound machine key, leaving all other slots intact.
     /// Used on revocation / re-issue. Mirror of
     /// [`Self::clear_agent_machine_key`].
     pub fn clear_device_machine_key(&self) -> Result<()> {
         let mut tokens = self.load_tokens_for_write()?;
         tokens.device_machine_key = None;
+        tokens.device_machine_key_expires_at = None;
         self.save_tokens(&tokens)?;
         info!("device machine key cleared from secure file storage");
         Ok(())
@@ -1372,6 +1496,9 @@ impl SecureStorage {
     /// clean first-run (absent store ⇒ no interactive-sign-out marker, sign-in
     /// writes succeed) so the operator can sign in again from the LoginScreen.
     pub fn delete_storage(&self) -> Result<()> {
+        // Same write lock as every read-modify-write, so a delete can never
+        // land between a writer's load and its save.
+        let _lock = StoreWriteLock::acquire(&self.storage_path)?;
         if self.storage_path.exists() {
             fs::remove_file(&self.storage_path).context("Failed to delete storage file")?;
             info!("Secure storage file deleted");
@@ -1448,6 +1575,49 @@ mod tests {
         // Clean up any existing file from previous test runs
         let _ = fs::remove_file(&storage_path);
         SecureStorage::with_path(storage_path).unwrap()
+    }
+
+    /// W3 — concurrent read-modify-writes of DIFFERENT slots must not
+    /// revert each other. Two writers (each its own `SecureStorage`, as two
+    /// processes would be) hammer the same file; with the write lock spanning
+    /// load→save, both final values survive every run. Without it the later
+    /// save silently rolls back the other slot — for a machine key web had
+    /// already rotated, that loses the only live copy.
+    #[test]
+    fn concurrent_writers_of_different_slots_never_lose_an_update() {
+        let path = env::temp_dir()
+            .join("qontinui_test_storage")
+            .join("concurrent_writers.enc");
+        let _ = fs::remove_file(&path);
+        let tenant = uuid::Uuid::from_bytes([0x5a; 16]);
+        const N: usize = 40;
+        let (p1, p2) = (path.clone(), path.clone());
+        let a = std::thread::spawn(move || {
+            let s = SecureStorage::with_path(p1).unwrap();
+            for i in 0..N {
+                s.store_device_machine_key_with_expiry(&format!("dmk_{i}"), Some(i as i64))
+                    .unwrap();
+            }
+        });
+        let b = std::thread::spawn(move || {
+            let s = SecureStorage::with_path(p2).unwrap();
+            for i in 0..N {
+                s.store_tenant_device_jwt(&tenant, &format!("jwt_{i}"))
+                    .unwrap();
+            }
+        });
+        a.join().unwrap();
+        b.join().unwrap();
+        let s = SecureStorage::with_path(path).unwrap();
+        assert_eq!(
+            s.get_device_machine_key().unwrap().as_deref(),
+            Some(format!("dmk_{}", N - 1).as_str())
+        );
+        assert_eq!(s.get_device_machine_key_expires_at(), Some((N - 1) as i64));
+        assert_eq!(
+            s.get_tenant_device_jwt(&tenant).unwrap().as_deref(),
+            Some(format!("jwt_{}", N - 1).as_str())
+        );
     }
 
     #[test]

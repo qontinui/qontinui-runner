@@ -7134,6 +7134,50 @@ pub(crate) fn device_jwt_refreshing_error() -> (u16, String) {
     )
 }
 
+/// What the DEVICE-path proxy answers when the bearer is STILL empty after the
+/// bounded [`DEVICE_JWT_REMINT_WAIT`]: `(http status, JSON body)`.
+///
+/// Plan `2026-09-24-runner-coord-credential-stranded-after-outage` Phase 2.
+/// The retryable `503 COORD_MCP_PROXY_CREDENTIAL_REFRESHING` is only honest
+/// while a re-mint can still land. This arm used to return it unconditionally,
+/// BEFORE [`runner_credential_local_refusal`] ever ran, so a runner whose
+/// credential every automatic rung had already refused told every session to
+/// retry, indefinitely — merytshost's posture read `expired` from 2026-09-24
+/// 05:03 CEST onward (measured from `/health.coordCredential.since` =
+/// 1790219022 on merytshost, recorded in coord finding
+/// 7056c7a7-8466-4f77-9dcb-d5defefb779a) while sessions spun on the retryable
+/// 503.
+///
+/// So the posture is consulted first. A refusal for THIS session's slot whose
+/// code is anything but `runner_credential_expired` (an expired credential is
+/// exactly the case a re-mint may still heal) returns that non-retryable 401
+/// body, naming the re-pair remedy. Everything else — no posture yet
+/// (UNKNOWN), a posture about another slot, an agent principal, `expired` —
+/// keeps the 503.
+pub(crate) fn empty_device_bearer_response(
+    principal: &ProxyPrincipal,
+    session_tenant: Option<Uuid>,
+    posture: Option<&crate::mcp::device_jwt_refresher::CoordCredentialStatus>,
+) -> (u16, serde_json::Value) {
+    if let Some((code, body, _heal)) =
+        runner_credential_local_refusal(principal, session_tenant, posture)
+    {
+        if code != "runner_credential_expired" {
+            return (401, body);
+        }
+    }
+    let (status, msg) = device_jwt_refreshing_error();
+    (
+        status,
+        serde_json::json!({
+            "success": false,
+            "error": msg,
+            "code": "COORD_MCP_PROXY_CREDENTIAL_REFRESHING",
+            "retryable": true,
+        }),
+    )
+}
+
 /// Bounded poll for a usable token: returns as soon as `read_usable` yields a
 /// non-empty token, or `None` once `total` elapses. Generic over the reader so
 /// the bound/termination behavior is unit-testable without a live AuthManager
@@ -20894,6 +20938,124 @@ mod runner_credential_tests {
             );
             djr::reset_coord_credential_posture_for_test();
         }
+    }
+
+    /// Plan `2026-09-24-runner-coord-credential-stranded-after-outage`
+    /// Phase 2. An EMPTY device bearer after the bounded re-mint wait used to
+    /// answer the retryable 503 unconditionally, before the posture was ever
+    /// consulted — so a runner every rung had refused told sessions "retry"
+    /// from 2026-09-24 05:03 CEST onward (`/health.coordCredential.since` =
+    /// 1790219022 on merytshost; coord finding
+    /// 7056c7a7-8466-4f77-9dcb-d5defefb779a). With the posture `unrefreshable` for this session's
+    /// slot the answer is the non-retryable 401 naming the re-pair remedy.
+    #[test]
+    fn an_empty_bearer_on_an_unrefreshable_runner_is_a_401_not_a_503() {
+        let _serialised = djr::posture_test_lock();
+        djr::reset_coord_credential_posture_for_test();
+
+        let status = publish(P::Unrefreshable);
+        let (http, body) = empty_device_bearer_response(
+            &ProxyPrincipal::Device,
+            Some(posture_tenant()),
+            Some(&status),
+        );
+        assert_eq!(http, 401, "{body}");
+        assert_eq!(body["code"], "runner_credential_unrefreshable");
+        assert_eq!(body["retryable"], false);
+        assert_ne!(body["code"], "COORD_MCP_PROXY_CREDENTIAL_REFRESHING");
+        djr::reset_coord_credential_posture_for_test();
+
+        // `absent` and `dark` likewise prove no re-mint is coming.
+        for p in [P::Absent, P::Dark(DarkCause::UpstreamRejected)] {
+            let status = publish(p);
+            let (http, body) = empty_device_bearer_response(
+                &ProxyPrincipal::Device,
+                Some(posture_tenant()),
+                Some(&status),
+            );
+            assert_eq!(http, 401, "{p:?}: {body}");
+            assert_eq!(body["code"], runner_credential_refusal_code(p).unwrap());
+            djr::reset_coord_credential_posture_for_test();
+        }
+    }
+
+    /// The 503 stays where a re-mint may still land: `expired` (the heal is
+    /// in flight), UNKNOWN (no pass yet), a posture about ANOTHER slot, and
+    /// an agent principal.
+    #[test]
+    fn an_empty_bearer_keeps_the_retryable_503_where_a_remint_can_still_land() {
+        let _serialised = djr::posture_test_lock();
+        djr::reset_coord_credential_posture_for_test();
+
+        let refreshing = |(http, body): (u16, serde_json::Value)| {
+            assert_eq!(http, 503, "{body}");
+            assert_eq!(body["code"], "COORD_MCP_PROXY_CREDENTIAL_REFRESHING");
+            assert_eq!(body["retryable"], true);
+        };
+
+        let expired = publish(P::Expired);
+        refreshing(empty_device_bearer_response(
+            &ProxyPrincipal::Device,
+            Some(posture_tenant()),
+            Some(&expired),
+        ));
+        djr::reset_coord_credential_posture_for_test();
+
+        refreshing(empty_device_bearer_response(
+            &ProxyPrincipal::Device,
+            Some(posture_tenant()),
+            None,
+        ));
+
+        let unrefreshable = publish(P::Unrefreshable);
+        refreshing(empty_device_bearer_response(
+            &ProxyPrincipal::Device,
+            Some(uuid::Uuid::from_bytes([0x77; 16])),
+            Some(&unrefreshable),
+        ));
+        refreshing(empty_device_bearer_response(
+            &ProxyPrincipal::Agent {
+                agent_id: uuid::Uuid::from_bytes([0x88; 16]),
+            },
+            Some(posture_tenant()),
+            Some(&unrefreshable),
+        ));
+        djr::reset_coord_credential_posture_for_test();
+    }
+
+    /// Wiring: the handler's empty-bearer arm must go through
+    /// [`empty_device_bearer_response`], not straight to the 503. A
+    /// behavioural handler test needs a registered nonce and a seeded
+    /// encrypted store, so this pins the call at the source (the technique
+    /// `the_coord_mcp_proxy_reports_its_upstream_verdict_to_the_posture` uses).
+    #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
+    fn the_empty_bearer_arm_consults_the_posture_before_degrading() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs");
+        let text = std::fs::read_to_string(&src).expect("read mcp_api.rs");
+        let start = text
+            .find("async fn coord_mcp_proxy_handler(")
+            .expect("coord_mcp_proxy_handler exists");
+        let end = text[start..]
+            .find("\n/// ")
+            .map(|i| start + i)
+            .unwrap_or(text.len());
+        let code: String = text[start..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("empty_device_bearer_response("),
+            "the empty-bearer arm must ask the posture before answering 503"
+        );
+        assert!(
+            !code.contains("device_jwt_refreshing_error()"),
+            "the handler must not build the 503 directly any more"
+        );
     }
 
     /// **UNKNOWN is not a fault.** No refresher pass has concluded yet (the

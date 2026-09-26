@@ -1283,6 +1283,40 @@ async fn health(
     // awaited here, so the executor is never blocked; the token itself never
     // leaves the helper.
     let device_jwt_health = crate::coord_mcp::device_jwt_health_json().await;
+    let coord_credential_json = {
+        let mut cc = crate::mcp::device_jwt_refresher::coord_credential_posture()
+            .map(|s| s.to_json())
+            .unwrap_or_else(|| {
+                serde_json::json!({
+                    "posture": "unknown",
+                    "state": "unknown",
+                    "reason": "no device-JWT refresher pass has completed in this process yet \
+                               — UNKNOWN, never 'healthy'",
+                })
+            });
+        // `present | absent | expiring | unknown` — whether this runner holds
+        // the device machine key, the one rung that recovers a device JWT
+        // after it expired during an outage (plan 2026-09-24-runner-coord-
+        // credential-stranded-after-outage Phase 3). `unknown` until a pass
+        // has read the store, and whenever the store is unreadable — never
+        // defaulted to `absent`.
+        if let Some(o) = cc.as_object_mut() {
+            o.insert(
+                "machineKey".to_string(),
+                serde_json::json!(crate::mcp::device_jwt_refresher::machine_key_health_token()),
+            );
+            // Set only while enrolment is held up by web's answer (a 403 that
+            // retired this token, or a 409 whose self-mint pause is running),
+            // worded by the local key state — next to the `machineKey` it
+            // explains. Cleared once a key is held again.
+            if let Some(reason) =
+                crate::mcp::device_jwt_refresher::machine_key_enrol_blocked_reason()
+            {
+                o.insert("machineKeyReason".to_string(), serde_json::json!(reason));
+            }
+        }
+        cc
+    };
 
     let mut data = serde_json::json!({
         "status": status,
@@ -1509,14 +1543,7 @@ async fn health(
         // not any more: `can_answer() == false` feeds `derived_status` as a
         // `degraded` input (M7, `HealthInputs::coord_credential_can_answer`),
         // so the top-level verdict moves with this block.
-        "coordCredential": crate::mcp::device_jwt_refresher::coord_credential_posture()
-            .map(|s| s.to_json())
-            .unwrap_or_else(|| serde_json::json!({
-                "posture": "unknown",
-                "state": "unknown",
-                "reason": "no device-JWT refresher pass has completed in this process yet \
-                           — UNKNOWN, never 'healthy'",
-            })),
+        "coordCredential": coord_credential_json,
         // Semantic recall (plan 2026-07-30, Phase 3): how each proxied
         // `coord_memory_search` ended — did it get a query vector or not.
         // Non-search traffic is neither touched nor counted, so `enriched`
@@ -5963,23 +5990,28 @@ async fn coord_mcp_proxy_handler(
             match tok {
                 Some(t) if !t.trim().is_empty() => Some(t),
                 _ => {
-                    // STILL no JWT after the bounded wait: degrade to an
-                    // actionable, retry-shaped error (NOT the bare 401, NOT a
-                    // hang) so the autonomous caller knows to retry shortly.
-                    let (status, msg) = crate::coord_mcp::device_jwt_refreshing_error();
+                    // STILL no JWT after the bounded wait. Degrade to the
+                    // actionable, retry-shaped 503 (NOT the bare 401, NOT a
+                    // hang) — UNLESS the posture already proves no re-mint is
+                    // coming for this session's slot (`unrefreshable`,
+                    // `absent`, `dark`), in which case "retry" is a lie and the
+                    // non-retryable 401 naming the re-pair remedy is returned
+                    // instead. Plan 2026-09-24-runner-coord-credential-
+                    // stranded-after-outage Phase 2.
+                    let (status, body) = crate::coord_mcp::empty_device_bearer_response(
+                        &principal,
+                        session_tenant,
+                        crate::mcp::device_jwt_refresher::coord_credential_posture().as_ref(),
+                    );
                     warn!(
                         "coord-mcp proxy: device JWT still missing after bounded \
-                         re-mint wait — degrading to retry ({status})"
+                         re-mint wait — answering {status} ({})",
+                        body.get("code").and_then(|c| c.as_str()).unwrap_or("?")
                     );
                     return (
                         axum::http::StatusCode::from_u16(status)
                             .unwrap_or(axum::http::StatusCode::SERVICE_UNAVAILABLE),
-                        Json(serde_json::json!({
-                            "success": false,
-                            "error": msg,
-                            "code": "COORD_MCP_PROXY_CREDENTIAL_REFRESHING",
-                            "retryable": true,
-                        })),
+                        Json(body),
                     )
                         .into_response();
                 }
@@ -6058,10 +6090,14 @@ async fn coord_mcp_proxy_handler(
     //    only refusals left are the ones a live read could not contradict.
     //
     // Sitting after the bearer arm also KEEPS the pre-existing graceful
-    // degrade: an empty slot still reaches `await_device_jwt_remint_for` and
-    // still answers the RETRYABLE `503 COORD_MCP_PROXY_CREDENTIAL_REFRESHING`,
-    // which is a strictly better answer than a non-retryable 401. The earlier
-    // placement returned before it and removed that heal outright.
+    // degrade: an empty slot still reaches `await_device_jwt_remint_for`, and
+    // while a re-mint can still land it answers the RETRYABLE
+    // `503 COORD_MCP_PROXY_CREDENTIAL_REFRESHING`. That arm now asks this same
+    // refusal first (`empty_device_bearer_response`), so a posture that proves
+    // no re-mint is coming — `unrefreshable`, `absent`, `dark` — gets the
+    // non-retryable 401 there too (plan 2026-09-24-runner-coord-credential-
+    // stranded-after-outage Phase 2). The earlier placement returned before
+    // the bearer arm and removed the heal outright.
     //
     // A bad nonce and a non-allowlisted method are still refused ABOVE this and
     // keep their own, more specific answers.
