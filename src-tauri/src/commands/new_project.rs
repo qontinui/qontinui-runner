@@ -41,6 +41,7 @@ use tracing::{info, warn};
 
 use crate::commands::compartments::StorageCompartment;
 use crate::commands::new_project_templates as templates;
+use crate::commands::workflow_events::{emit_new_project_stage, WorkflowEventType};
 use crate::settings::SavedProject;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
@@ -625,14 +626,167 @@ pub async fn github_oauth_status(owner: String) -> Result<GithubOauthStatusResul
     })
 }
 
-fn emit_progress(app: &AppHandle, step: &str, status: &str, detail: impl Into<String>) {
+// ============================================================================
+// Create funnel telemetry (plan 2026-09-22 PR-F, §4.0)
+// ============================================================================
+
+/// A stage of the new-project create funnel that the runner emits as a
+/// durable workflow event. `live` is deliberately absent: it is a doctor read
+/// emitted by the UI (Phase 3), not by this command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FunnelStage {
+    Started,
+    NameOk,
+    RepoCreated,
+    Pushed,
+    Enrolled,
+    Finished,
+}
+
+impl FunnelStage {
+    /// Stage name as reported in `skipped_stages[]` and summaries.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::NameOk => "name_ok",
+            Self::RepoCreated => "repo_created",
+            Self::Pushed => "pushed",
+            Self::Enrolled => "enrolled",
+            Self::Finished => "finished",
+        }
+    }
+
+    fn event_type(self) -> WorkflowEventType {
+        match self {
+            Self::Started => WorkflowEventType::NewProjectStarted,
+            Self::NameOk => WorkflowEventType::NewProjectNameOk,
+            Self::RepoCreated => WorkflowEventType::NewProjectRepoCreated,
+            Self::Pushed => WorkflowEventType::NewProjectPushed,
+            Self::Enrolled => WorkflowEventType::NewProjectEnrolled,
+            Self::Finished => WorkflowEventType::NewProjectFinished,
+        }
+    }
+}
+
+/// The §4.0 step→stage map: only an `ok` of `validate`, `create_remote`,
+/// `push` or `enroll` is a funnel stage. Every other (step, status) — the
+/// progress-only steps, and any `running` / `failed` / `skipped` — is `None`
+/// (a failure is the absence of the next stage; its reason and every skip
+/// ride `new_project_finished`).
+pub(crate) fn funnel_stage_for(step: &str, status: &str) -> Option<FunnelStage> {
+    if status != "ok" {
+        return None;
+    }
+    match step {
+        "validate" => Some(FunnelStage::NameOk),
+        "create_remote" => Some(FunnelStage::RepoCreated),
+        "push" => Some(FunnelStage::Pushed),
+        "enroll" => Some(FunnelStage::Enrolled),
+        _ => None,
+    }
+}
+
+/// Per-attempt dimensions carried in every funnel event's JSONB `payload`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FunnelDims {
+    pub template: String,
+    pub owner_present: bool,
+    pub enroll_requested: bool,
+    /// The invocation carried a `resumeFrom` token (a retry of an attempt).
+    pub resumed: bool,
+}
+
+impl FunnelDims {
+    fn to_json(&self) -> serde_json::Map<String, Value> {
+        let mut m = serde_json::Map::new();
+        m.insert("template".into(), Value::String(self.template.clone()));
+        m.insert("owner_present".into(), Value::Bool(self.owner_present));
+        m.insert(
+            "enroll_requested".into(),
+            Value::Bool(self.enroll_requested),
+        );
+        m.insert("resumed".into(), Value::Bool(self.resumed));
+        m
+    }
+}
+
+/// Payload of a non-terminal stage event: the dimensions alone.
+pub(crate) fn stage_payload(dims: &FunnelDims) -> Value {
+    Value::Object(dims.to_json())
+}
+
+/// Payload of `new_project_finished`, read from the RESULT struct (never the
+/// command's `Result` arm, which is `Ok` on step failures too).
+pub(crate) fn finished_payload(
+    dims: &FunnelDims,
+    result: &CreateNewProjectResult,
+    skipped: &[String],
+) -> Value {
+    let mut m = dims.to_json();
+    m.insert("ok".into(), Value::Bool(result.ok));
+    m.insert(
+        "failed_step".into(),
+        result
+            .failed_step
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    m.insert(
+        "error_code".into(),
+        result
+            .error
+            .as_ref()
+            .map(|e| Value::String(e.code.clone()))
+            .unwrap_or(Value::Null),
+    );
+    m.insert(
+        "skipped_stages".into(),
+        Value::Array(skipped.iter().cloned().map(Value::String).collect()),
+    );
+    Value::Object(m)
+}
+
+/// Per-invocation context: the one emission point for both the Tauri
+/// progress event and the durable funnel event.
+struct FlowCtx<'a> {
+    app: &'a AppHandle,
+    flow_id: String,
+    dims: FunnelDims,
+}
+
+impl FlowCtx<'_> {
+    /// Fire-and-forget durable funnel event; never fails the caller.
+    fn emit_stage(&self, stage: FunnelStage, payload: Value) {
+        emit_new_project_stage(
+            &self.flow_id,
+            stage.event_type(),
+            format!("New project: {}", stage.as_str()),
+            payload,
+        );
+    }
+
+    /// Emit `new_project_finished` for a constructed result and hand it back.
+    fn finish(&self, result: CreateNewProjectResult, skipped: &[String]) -> CreateNewProjectResult {
+        self.emit_stage(
+            FunnelStage::Finished,
+            finished_payload(&self.dims, &result, skipped),
+        );
+        result
+    }
+}
+
+fn emit_progress(ctx: &FlowCtx<'_>, step: &str, status: &str, detail: impl Into<String>) {
     let payload = ProgressEvent {
         step: step.to_string(),
         status: status.to_string(),
         detail: detail.into(),
     };
-    if let Err(e) = app.emit(NEW_PROJECT_PROGRESS_EVENT, &payload) {
+    if let Err(e) = ctx.app.emit(NEW_PROJECT_PROGRESS_EVENT, &payload) {
         warn!("new_project: failed to emit progress event: {}", e);
+    }
+    if let Some(stage) = funnel_stage_for(step, status) {
+        ctx.emit_stage(stage, stage_payload(&ctx.dims));
     }
 }
 
@@ -654,23 +808,45 @@ pub async fn create_new_project(
     let target = Path::new(req.location.trim()).join(&name);
     let target_str = target.to_string_lossy().to_string();
 
+    // One flow id per invocation, stamped as `run_id` on every funnel event so
+    // the stages of this attempt join (plan 2026-09-22 PR-F §4.0).
+    let ctx = FlowCtx {
+        app: &app,
+        flow_id: uuid::Uuid::new_v4().to_string(),
+        dims: FunnelDims {
+            template: req.template.clone(),
+            owner_present: owner.is_some(),
+            enroll_requested: req.enroll,
+            resumed: req.resume_from.is_some(),
+        },
+    };
+    ctx.emit_stage(FunnelStage::Started, stage_payload(&ctx.dims));
+
     let mut completed: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
+    // Funnel stages skipped by construction (local-only, already enrolled,
+    // enrollment not requested). Cannot be derived from `completed`, which a
+    // skipped step also joins.
+    let mut skipped: Vec<String> = Vec::new();
     let mut remote: Option<RemoteRepoInfo> = None;
 
     let fail = |step: &str,
                 completed: Vec<String>,
                 warnings: Vec<String>,
+                skipped: &[String],
                 repo: Option<RemoteRepoInfo>,
-                error: NewProjectError| CreateNewProjectResult {
-        ok: false,
-        project_path: target_str.clone(),
-        repo,
-        completed_steps: completed,
-        failed_step: Some(step.to_string()),
-        error: Some(error),
-        resume_token: Some(step.to_string()),
-        warnings,
+                error: NewProjectError| {
+        let result = CreateNewProjectResult {
+            ok: false,
+            project_path: target_str.clone(),
+            repo,
+            completed_steps: completed,
+            failed_step: Some(step.to_string()),
+            error: Some(error),
+            resume_token: Some(step.to_string()),
+            warnings,
+        };
+        ctx.finish(result, skipped)
     };
 
     // Resolve the resume point up front so a bad token fails fast.
@@ -683,8 +859,8 @@ pub async fn create_new_project(
                     "invalid_resume_token",
                     format!("Unknown resume step '{}'", s),
                 );
-                emit_progress(&app, "validate", "failed", e.message.clone());
-                return Ok(fail("validate", completed, warnings, None, e));
+                emit_progress(&ctx, "validate", "failed", e.message.clone());
+                return Ok(fail("validate", completed, warnings, &skipped, None, e));
             }
         },
     };
@@ -716,7 +892,7 @@ pub async fn create_new_project(
     // ---- Step 1: validate -------------------------------------------------
     {
         let step = "validate";
-        emit_progress(&app, step, "running", "Validating name and location");
+        emit_progress(&ctx, step, "running", "Validating name and location");
         let outcome: Result<(), NewProjectError> = async {
             if req.template != templates::TEMPLATE_EMPTY
                 && req.template != templates::TEMPLATE_REACT_UI_BRIDGE
@@ -781,12 +957,12 @@ pub async fn create_new_project(
         .await;
         match outcome {
             Ok(()) => {
-                emit_progress(&app, step, "ok", "Validated");
+                emit_progress(&ctx, step, "ok", "Validated");
                 completed.push(step.to_string());
             }
             Err(e) => {
-                emit_progress(&app, step, "failed", e.message.clone());
-                return Ok(fail(step, completed, warnings, None, e));
+                emit_progress(&ctx, step, "failed", e.message.clone());
+                return Ok(fail(step, completed, warnings, &skipped, None, e));
             }
         }
     }
@@ -796,7 +972,7 @@ pub async fn create_new_project(
         let step = "create_remote";
         if let Some(owner) = &owner {
             emit_progress(
-                &app,
+                &ctx,
                 step,
                 "running",
                 format!("Creating GitHub repository {}/{}", owner, name),
@@ -816,25 +992,26 @@ pub async fn create_new_project(
             .await;
             match outcome {
                 Ok(info) => {
-                    emit_progress(&app, step, "ok", format!("Repository {}", info.full_name));
+                    emit_progress(&ctx, step, "ok", format!("Repository {}", info.full_name));
                     completed.push(step.to_string());
                     remote = Some(info);
                 }
                 Err(e) => {
-                    emit_progress(&app, step, "failed", e.message.clone());
-                    return Ok(fail(step, completed, warnings, None, e));
+                    emit_progress(&ctx, step, "failed", e.message.clone());
+                    return Ok(fail(step, completed, warnings, &skipped, None, e));
                 }
             }
         } else {
-            emit_progress(&app, step, "skipped", "Local-only project");
+            emit_progress(&ctx, step, "skipped", "Local-only project");
             completed.push(step.to_string());
+            skipped.push(FunnelStage::RepoCreated.as_str().to_string());
         }
     }
 
     // ---- Step 3: init_local -----------------------------------------------
     {
         let step = "init_local";
-        emit_progress(&app, step, "running", "Initializing git repository");
+        emit_progress(&ctx, step, "running", "Initializing git repository");
         let outcome: Result<(), NewProjectError> = async {
             std::fs::create_dir_all(&target).map_err(|e| {
                 NewProjectError::new(
@@ -855,12 +1032,12 @@ pub async fn create_new_project(
         .await;
         match outcome {
             Ok(()) => {
-                emit_progress(&app, step, "ok", "git init -b main");
+                emit_progress(&ctx, step, "ok", "git init -b main");
                 completed.push(step.to_string());
             }
             Err(e) => {
-                emit_progress(&app, step, "failed", e.message.clone());
-                return Ok(fail(step, completed, warnings, remote, e));
+                emit_progress(&ctx, step, "failed", e.message.clone());
+                return Ok(fail(step, completed, warnings, &skipped, remote, e));
             }
         }
     }
@@ -871,7 +1048,7 @@ pub async fn create_new_project(
     {
         let step = "scaffold";
         emit_progress(
-            &app,
+            &ctx,
             step,
             "running",
             format!("Writing '{}' template", req.template),
@@ -905,12 +1082,12 @@ pub async fn create_new_project(
         .await;
         match outcome {
             Ok(count) => {
-                emit_progress(&app, step, "ok", format!("Wrote {} files", count));
+                emit_progress(&ctx, step, "ok", format!("Wrote {} files", count));
                 completed.push(step.to_string());
             }
             Err(e) => {
-                emit_progress(&app, step, "failed", e.message.clone());
-                return Ok(fail(step, completed, warnings, remote, e));
+                emit_progress(&ctx, step, "failed", e.message.clone());
+                return Ok(fail(step, completed, warnings, &skipped, remote, e));
             }
         }
     }
@@ -918,7 +1095,7 @@ pub async fn create_new_project(
     // ---- Step 5: commit -----------------------------------------------------
     {
         let step = "commit";
-        emit_progress(&app, step, "running", "Creating initial commit");
+        emit_progress(&ctx, step, "running", "Creating initial commit");
         let outcome: Result<(), NewProjectError> = async {
             if step_index(step).unwrap_or(0) < resume_idx
                 && git_probe(&["rev-parse", "--verify", "HEAD"], Some(&target)).await?
@@ -943,12 +1120,12 @@ pub async fn create_new_project(
         .await;
         match outcome {
             Ok(()) => {
-                emit_progress(&app, step, "ok", "Initial commit created");
+                emit_progress(&ctx, step, "ok", "Initial commit created");
                 completed.push(step.to_string());
             }
             Err(e) => {
-                emit_progress(&app, step, "failed", e.message.clone());
-                return Ok(fail(step, completed, warnings, remote, e));
+                emit_progress(&ctx, step, "failed", e.message.clone());
+                return Ok(fail(step, completed, warnings, &skipped, remote, e));
             }
         }
     }
@@ -957,7 +1134,7 @@ pub async fn create_new_project(
     {
         let step = "push";
         if let Some(owner) = &owner {
-            emit_progress(&app, step, "running", "Pushing to GitHub");
+            emit_progress(&ctx, step, "running", "Pushing to GitHub");
             let info = remote
                 .clone()
                 .unwrap_or_else(|| reconstructed_remote(owner, &name));
@@ -1045,7 +1222,7 @@ pub async fn create_new_project(
             match outcome {
                 Ok(()) => {
                     emit_progress(
-                        &app,
+                        &ctx,
                         step,
                         "ok",
                         format!("Pushed main to {}", info.full_name),
@@ -1054,13 +1231,14 @@ pub async fn create_new_project(
                     remote = Some(info);
                 }
                 Err(e) => {
-                    emit_progress(&app, step, "failed", e.message.clone());
-                    return Ok(fail(step, completed, warnings, Some(info), e));
+                    emit_progress(&ctx, step, "failed", e.message.clone());
+                    return Ok(fail(step, completed, warnings, &skipped, Some(info), e));
                 }
             }
         } else {
-            emit_progress(&app, step, "skipped", "Local-only project");
+            emit_progress(&ctx, step, "skipped", "Local-only project");
             completed.push(step.to_string());
+            skipped.push(FunnelStage::Pushed.as_str().to_string());
         }
     }
 
@@ -1072,10 +1250,11 @@ pub async fn create_new_project(
                 if step_index(step).unwrap_or(0) < resume_idx {
                     // Enrollment completed in a previous run (resume_from is
                     // past it); the server-side path is idempotent anyway.
-                    emit_progress(&app, step, "skipped", "Already enrolled");
+                    emit_progress(&ctx, step, "skipped", "Already enrolled");
                     completed.push(step.to_string());
+                    skipped.push(FunnelStage::Enrolled.as_str().to_string());
                 } else {
-                    emit_progress(&app, step, "running", "Enrolling with Qontinui");
+                    emit_progress(&ctx, step, "running", "Enrolling with Qontinui");
                     let outcome: Result<(), NewProjectError> = async {
                         let bearer = need_bearer(step)?;
                         let (status, body) = proxy_post(
@@ -1094,19 +1273,20 @@ pub async fn create_new_project(
                     .await;
                     match outcome {
                         Ok(()) => {
-                            emit_progress(&app, step, "ok", "Enrolled with Qontinui");
+                            emit_progress(&ctx, step, "ok", "Enrolled with Qontinui");
                             completed.push(step.to_string());
                         }
                         Err(e) => {
-                            emit_progress(&app, step, "failed", e.message.clone());
-                            return Ok(fail(step, completed, warnings, remote, e));
+                            emit_progress(&ctx, step, "failed", e.message.clone());
+                            return Ok(fail(step, completed, warnings, &skipped, remote, e));
                         }
                     }
                 }
             }
             _ => {
-                emit_progress(&app, step, "skipped", "Enrollment not requested");
+                emit_progress(&ctx, step, "skipped", "Enrollment not requested");
                 completed.push(step.to_string());
+                skipped.push(FunnelStage::Enrolled.as_str().to_string());
             }
         }
     }
@@ -1114,7 +1294,7 @@ pub async fn create_new_project(
     // ---- Step 8: register ---------------------------------------------------
     {
         let step = "register";
-        emit_progress(&app, step, "running", "Registering project");
+        emit_progress(&ctx, step, "running", "Registering project");
         let project = SavedProject {
             // `id` is left defaulted (empty): `add_saved_project` mints the
             // UUID so there is exactly one place that assigns project ids.
@@ -1129,8 +1309,8 @@ pub async fn create_new_project(
         };
         if let Err(msg) = crate::commands::saved_projects::add_saved_project(project) {
             let e = NewProjectError::new("io", format!("Failed to save project: {}", msg));
-            emit_progress(&app, step, "failed", e.message.clone());
-            return Ok(fail(step, completed, warnings, remote, e));
+            emit_progress(&ctx, step, "failed", e.message.clone());
+            return Ok(fail(step, completed, warnings, &skipped, remote, e));
         }
 
         // UI-Bridge templates additionally join the multi-app registry so the
@@ -1163,12 +1343,12 @@ pub async fn create_new_project(
             }
         }
 
-        emit_progress(&app, step, "ok", "Project registered");
+        emit_progress(&ctx, step, "ok", "Project registered");
         completed.push(step.to_string());
     }
 
     info!("new_project: '{}' created at {}", name, target_str);
-    Ok(CreateNewProjectResult {
+    let result = CreateNewProjectResult {
         ok: true,
         project_path: target_str,
         repo: remote,
@@ -1177,7 +1357,8 @@ pub async fn create_new_project(
         error: None,
         resume_token: None,
         warnings,
-    })
+    };
+    Ok(ctx.finish(result, &skipped))
 }
 
 // ============================================================================
@@ -1246,6 +1427,133 @@ mod tests {
                 n
             );
         }
+    }
+
+    #[test]
+    fn funnel_map_only_ok_of_the_four_funnel_steps_is_a_stage() {
+        assert_eq!(
+            funnel_stage_for("validate", "ok"),
+            Some(FunnelStage::NameOk)
+        );
+        assert_eq!(
+            funnel_stage_for("create_remote", "ok"),
+            Some(FunnelStage::RepoCreated)
+        );
+        assert_eq!(funnel_stage_for("push", "ok"), Some(FunnelStage::Pushed));
+        assert_eq!(
+            funnel_stage_for("enroll", "ok"),
+            Some(FunnelStage::Enrolled)
+        );
+        // Progress-only steps never produce a durable event.
+        for step in ["init_local", "scaffold", "commit", "register"] {
+            assert_eq!(funnel_stage_for(step, "ok"), None, "{step}");
+        }
+        // Non-ok statuses never produce one, for any step.
+        for step in STEP_ORDER {
+            for status in ["running", "failed", "skipped"] {
+                assert_eq!(funnel_stage_for(step, status), None, "{step}/{status}");
+            }
+        }
+        assert_eq!(funnel_stage_for("nonsense", "ok"), None);
+    }
+
+    #[test]
+    fn funnel_stage_names_match_workflow_event_suffixes() {
+        let stages = [
+            FunnelStage::Started,
+            FunnelStage::NameOk,
+            FunnelStage::RepoCreated,
+            FunnelStage::Pushed,
+            FunnelStage::Enrolled,
+            FunnelStage::Finished,
+        ];
+        for stage in stages {
+            let wire = serde_json::to_value(stage.event_type()).expect("serialize");
+            assert_eq!(
+                wire,
+                Value::String(format!("new_project_{}", stage.as_str()))
+            );
+        }
+    }
+
+    fn dims() -> FunnelDims {
+        FunnelDims {
+            template: "empty".into(),
+            owner_present: false,
+            enroll_requested: false,
+            resumed: false,
+        }
+    }
+
+    fn result(ok: bool, failed_step: Option<&str>, code: Option<&str>) -> CreateNewProjectResult {
+        CreateNewProjectResult {
+            ok,
+            project_path: "/tmp/x".into(),
+            repo: None,
+            completed_steps: vec![],
+            failed_step: failed_step.map(str::to_string),
+            error: code.map(|c| NewProjectError::new(c, "m")),
+            resume_token: failed_step.map(str::to_string),
+            warnings: vec![],
+        }
+    }
+
+    #[test]
+    fn finished_payload_local_only_success_reports_three_skipped_stages() {
+        let skipped: Vec<String> = [
+            FunnelStage::RepoCreated,
+            FunnelStage::Pushed,
+            FunnelStage::Enrolled,
+        ]
+        .iter()
+        .map(|s| s.as_str().to_string())
+        .collect();
+        let p = finished_payload(&dims(), &result(true, None, None), &skipped);
+        assert_eq!(
+            p,
+            serde_json::json!({
+                "template": "empty",
+                "owner_present": false,
+                "enroll_requested": false,
+                "resumed": false,
+                "ok": true,
+                "failed_step": null,
+                "error_code": null,
+                "skipped_stages": ["repo_created", "pushed", "enrolled"],
+            })
+        );
+    }
+
+    #[test]
+    fn finished_payload_failure_carries_step_and_typed_code() {
+        let d = FunnelDims {
+            template: "react-ui-bridge".into(),
+            owner_present: true,
+            enroll_requested: true,
+            resumed: true,
+        };
+        let p = finished_payload(&d, &result(false, Some("push"), Some("git")), &[]);
+        assert_eq!(p["ok"], Value::Bool(false));
+        assert_eq!(p["failed_step"], "push");
+        assert_eq!(p["error_code"], "git");
+        assert_eq!(p["skipped_stages"], serde_json::json!([]));
+        assert_eq!(p["template"], "react-ui-bridge");
+        assert_eq!(p["owner_present"], true);
+        assert_eq!(p["enroll_requested"], true);
+        assert_eq!(p["resumed"], true);
+    }
+
+    #[test]
+    fn stage_payload_is_the_dimensions() {
+        assert_eq!(
+            stage_payload(&dims()),
+            serde_json::json!({
+                "template": "empty",
+                "owner_present": false,
+                "enroll_requested": false,
+                "resumed": false,
+            })
+        );
     }
 
     #[test]
