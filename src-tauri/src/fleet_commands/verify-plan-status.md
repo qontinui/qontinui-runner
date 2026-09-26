@@ -556,20 +556,31 @@ there is no archive directory to move anything into.
 > ```
 > For a suite-dir plan, swap the path for `../<plan-dir>/NN-<name>.md`.
 
-Commit the status edits — one batch commit, **only if the plan directory is inside a
-git repo**:
+Publish the status edits — **only if the plan directory is inside a git repo** —
+through `scripts/land-plan-stamp.sh`, once per stamped path. The helper lands each
+stamp directly on the default branch by plumbing when the plans repo's ruleset
+requires no PR, and otherwise cuts a NEW branch and opens a PR; it never pushes to
+an existing branch and never touches the shared checkout's tree or index. This step
+used to `commit` in the shared checkout and run a bare `git push`, which sends the
+commit to whatever branch that checkout is on: a branch whose PR coord may already
+have landed, where the stamp goes `DIRTY` and the first PR is left unobserved
+(dossier `ff-landed-branch-poisoned-for-further-prs`).
 
 ```bash
 if git -C "$QONTINUI_PLANS_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  # Name the stamped paths explicitly — a shared checkout's index may hold a peer's
-  # staged files, and a bare `git add -A` would publish them.
-  git -C "$QONTINUI_PLANS_DIR" commit \
-    -m "docs(plans): status-stamp <N> verified plans" \
-    -m "Verified against source <date>. SHIPPED: <list of plan names>. PARTIAL: <list>. NOT STARTED: <list>." \
-    -- <stamped paths>
-  git -C "$QONTINUI_PLANS_DIR" push
+  TOP="$(git -C "$QONTINUI_PLANS_DIR" rev-parse --show-toplevel)"
+  for P in <stamped paths>; do          # absolute paths of the stamped .md files
+    bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh \
+      "$TOP" "${P#"$TOP"/}" "$P" \
+      "docs(plans): status-stamp $(basename "$P" .md) — verified against source <date>"
+  done
 fi
 ```
+
+Each call prints exactly one verdict line — `LANDED <commit|unchanged> <blob>` or
+`PROPOSED <pr-url|branch> <branch>` — and that line is the evidence the stamp is
+published. A non-zero exit means that stamp is **not** published: report it by
+path rather than counting it in the final report's totals.
 
 If the check fails, the plan directory is a plain folder: the stamped files on disk
 are the record, there is nothing to commit or push, and you must not create a repo to

@@ -160,28 +160,40 @@ The plans directory does not have to be inside a git repo. Where this skill comm
 first checks `git -C "<dir>" rev-parse --is-inside-work-tree`; if that fails, the edit
 on disk is the whole ritual.
 
-**Precondition — if the plan you are about to vet is untracked, commit and push it
-first**, stamped `DRAFT`, from a worktree (never the primary/shared checkout); then
-vet. This is mechanical, not hygiene: an untracked plan is invisible to coord's
+**Precondition — if the plan you are about to vet is untracked, publish it
+first**, stamped `DRAFT`, with the helper below (it builds the commit on a separate
+index, so it never touches the primary/shared checkout); then vet. This is mechanical, not hygiene: an untracked plan is invisible to coord's
 `conflict_check`, unreadable by any peer, and outside the durable record. Plans are
 supposed to be authored at `DRAFT` and committed at creation; committing one here is
 repairing that, not replacing it.
 
-**And the push is not the publication — assert a PR carries that branch's push.** On a
-coord-merge-authority repo (`qontinui-dev-notes` is one) a branch pushed with no
-pull request never reaches `main`, so the plan is on `origin` and still unreadable
+**And a push is not the publication — land the DRAFT with the helper.** Publish
+the committed plan with
+`bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh "<plans-repo-root>" "<repo-relative plan path>" "<local plan file>" "docs: add <plan-stem> (DRAFT)"`
+— the same helper §5 uses — rather than pushing a branch by hand. Whether the
+plans repo needs a pull request is decided by the helper's ruleset probe of that
+repo's default branch, never by a sentence in a command: with no PR-requiring
+rule it lands the blob directly and prints `LANDED …`; with one, or when the
+probe cannot tell, it cuts a fresh branch, opens a new PR with `gh pr create`
+(the only opener it runs; a line-anchored `Plan: <stem>` marker ends the body)
+and prints `PROPOSED …`. A caller holding coord's MCP door that wants
+`coord_create_pr` sets `LAND_PLAN_STAMP_NO_PR=1` — the helper then pushes and
+reads back the branch, prints it, and opens nothing — and opens the PR itself
+with `coord_create_pr`, falling back to `gh pr create`. A non-zero exit means the plan is NOT published. The failure this
+guards is real: a branch pushed with no pull request, onto a repo that needs one,
+never reaches the default branch, so the plan is on `origin` and still unreadable
 to every peer who reads `origin/main` — which defeats the same attestation this
 precondition exists to enable. Measured 2026-09-02, **9** plan stems were pushed to `origin`
 and never proposed at all — no PR in any state, on any branch carrying the stem.
-After the push, and again after any later push to the same branch, read
-`gh pr list --repo <owner/repo> --head <branch> --state all --json number,state,headRefOid`.
-Then apply `knowledge-base/qontinui-specific/coord-ff-lands.md` → "Pushing to a
-branch whose PR may already have landed". `--state all` matters for two reasons:
+**On the `PROPOSED` arm**, read
+`gh pr list --repo <owner/repo> --head <branch> --state all --json number,state,headRefOid`
+for the branch the line names. `--state all` matters for two reasons:
 an empty open-only answer cannot tell never-proposed from closed-under-you, and
-a CLOSED or MERGED PR carries nothing pushed after its close. When the section
-says no PR carries the push and commits remain unlanded, take its fresh-branch
-path and open the new PR — **`coord_create_pr` first, then `gh pr create`** —
-with a line-anchored `Plan: <stem>` marker in the body. **Never `gh pr merge`, never `--admin`.**
+a CLOSED or MERGED PR carries nothing pushed after its close. Any later stamp
+goes through the helper again, which cuts its own fresh branch; a NON-stamp push
+to an existing branch stays governed by
+`knowledge-base/qontinui-specific/coord-ff-lands.md` → "Pushing to a
+branch whose PR may already have landed". **Never `gh pr merge`, never `--admin`.**
 That marker is an **indexability** claim, not a delivery one: once plan
 `2026-09-04-docs-only-plan-marker-prs-derive-shipped` Phase 1 is deployed
 (authored 2026-09-04, not deployed as of that date), coord classifies a citation
@@ -1530,6 +1542,27 @@ implementation wasted).
 This stamp is mandatory. A vetted plan without the stamp is
 indistinguishable from a draft, and `/implement-plan` will treat it as
 still-aspirational.
+
+**Land the stamped plan with the helper — a stamp on disk is not a published
+stamp.** When the plans directory is inside a git repo, publish the stamped file
+with:
+
+```bash
+bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh \
+  "<plans-repo-root>" "<repo-relative plan path>" "<local plan file>" \
+  "docs: stamp <plan-stem> VETTED"
+```
+
+It lands the one blob directly on the plans repo's default branch when that
+branch's ruleset requires no PR, and otherwise cuts a FRESH branch and opens a
+NEW PR — it never pushes to an existing branch, so a stamp cannot ride a branch
+whose PR coord already landed (plan
+`2026-09-10-stamp-pushes-reuse-a-landed-branch-and-strand-the-first-pr-unobserved`).
+Its single stdout line — `LANDED <commit|unchanged> <blob>` or
+`PROPOSED <pr-url|branch> <branch>` — is the evidence the stamp is published;
+quote it in the §6 report. **A non-zero exit means the stamp is NOT published**:
+report the exit and the failure it names, and do not describe the plan as
+VETTED-on-`origin` until a later run prints the line.
 
 After stamping, fire the clearing `POST /coord/status` documented in
 Step 0 with `current_task: null` so the dashboard tile stops showing

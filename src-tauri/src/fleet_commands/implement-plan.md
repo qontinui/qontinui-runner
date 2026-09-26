@@ -938,6 +938,19 @@ Rules:
 - If the existing block is already `IN PROGRESS`, do NOT simply refresh the date and append your session marker. Apply the disposition in `/vet-plan`'s "`IN PROGRESS` is CONDITIONALLY overwritable" section (keep the two in sync) — including its **unidentified default**: a stamp carrying no session marker, or one you cannot positively attribute to your own current session, is a STOP, not an overwrite. A run that positively identifies the marker as its OWN current session id (a resume, or a Step 0.5 re-run) refreshes rather than takes over. Consult `coord_work_unit_list_citations(<plan-stem>).delivery` FIRST, applying that section's **full arm table in its stated order (4, 3, 2, 1, 5, then 6)**. The capture step here is Step 0.45 check 1, and unlike `/vet-plan` the stamp is still intact at this point — so read it and run the arms inline. In particular: arm 1 — `shipped: true` ∧ `evidence_complete: true` ∧ the three phase-corroboration conjuncts `/vet-plan` §0.25 arm 1 states (`phases_remaining` the LITERAL `[]`, never `null`; that `[]` corroborated by a non-empty `phases_declared_indices` wholly inside `phases_delivered`; no `NO PHASE ATTRIBUTION` gap) — means the work has landed, so **STOP and route to closeout** rather than re-running phase agents against `main`. **Do not stop on `shipped` ∧ `evidence_complete` alone**: that pair is reachable on a unit with phases outstanding (plan `2026-09-18-coord-fabricates-a-phase-declaration-and-silences-its-own-gap`), and a response short of the phase conjuncts falls to arm 6 — fall through to the stamp arms; **the two UNKNOWN arms that a degraded read makes look clean are 2 and 3, and neither is an error shape** — `evidence_complete: false` is **arm 2 regardless of `shipped`** (the two derive independently — `shipped` from the landed citations and the phase-coverage gate, `evidence_complete = evidence_gaps.is_empty()` computed before the phase gaps are appended — so `shipped: true` ∧ `evidence_complete: false` is reachable, and keying arm 2 on `shipped: false` lets it fall through to the permissive arm), and a top-level `merged_degraded_reason` sitting BESIDE `delivery` is **arm 3**, evaluated ahead of every arm but 4 and **UNKNOWN whatever `delivery` says** — while it is set, every citation's `merged: false` is UNKNOWN rather than an observation. Both answer `200` with a parseable `delivery` and no `citations_error`, so neither is caught by arm 6; and **arm 6 is the DEFAULT** — any error other than `no work-unit with that slug`, any unparseable or non-2xx body, a `citations_error` / `delivery_error` key, an absent `delivery`, or the tool masked / absent / on a dead transport is **UNKNOWN, never "not delivered"**. On UNKNOWN do not treat the delivery read as evidence in either direction: run **`/coord-revive`** if the transport is dead, re-issue over the live door, and otherwise fall through to the stamp arms saying the read was inconclusive. Otherwise, an `IN PROGRESS` stamp carrying a session marker ≠ yours is a **live peer** unless you can positively verify the stamping session is dead with zero work products (transcript tail shows death; worktrees clean and 0 ahead of `origin/main`; no PRs and no branches for the plan). Verified-dead → adopt and append your marker, keeping the trail. Not verified → **STOP**; refreshing the date over a live peer is how PR #479 was built against work PR #468 had already merged.
 - If the existing block is `SHIPPED` / `SUPERSEDED` / `OBSOLETE`, STOP — implementing a shipped plan is almost certainly a mistake. Confirm with the user before proceeding.
 
+**Land the IN PROGRESS stamp with the helper — never by pushing "the branch".**
+When the plans directory is inside a git repo, publish the stamped file with
+`bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh "<plans-repo-root>" "<repo-relative plan path>" "<local plan file>" "docs: stamp <plan-stem> IN PROGRESS"`.
+It lands the one blob directly on the plans repo's default branch when that
+branch's ruleset requires no PR, and otherwise cuts a FRESH branch and opens a
+NEW PR; it never pushes to an existing branch, so the stamp cannot ride a branch
+whose first PR coord already landed (plan
+`2026-09-10-stamp-pushes-reuse-a-landed-branch-and-strand-the-first-pr-unobserved`).
+Its single stdout line — `LANDED <commit|unchanged> <blob>` or
+`PROPOSED <pr-url|branch> <branch>` — is the evidence the stamp is published.
+**A non-zero exit means the stamp is NOT published**: say so, with the failure
+the helper names, rather than reporting the plan IN PROGRESS on `origin`.
+
 > **Why the delivery read and not just the token list.** The stamp is an
 > authoring-surface artifact that lags by construction: a session that correctly
 > stops with a gate watching (coord is the sole merge authority, so it cannot land
@@ -3184,49 +3197,41 @@ established — a clean `gh pr checks` read is not proof of the latter.
    from unlanded remote branches, the oldest ~4 months stale, plus 383 more whose
    newest version sits on a branch while `origin/main` carries an older one.**
 
+   Land it with the shared helper — one implementation, not a recipe each
+   command re-types:
+
    ```bash
    PLAN_PATH="<plan path>"               # absolute path to the stamped .md
    PLAN_DIR="$(dirname "$PLAN_PATH")"
    if git -C "$PLAN_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
      TOP="$(git -C "$PLAN_DIR" rev-parse --show-toplevel)"
-     REL="${PLAN_PATH#"$TOP"/}"          # repo-relative; repeat per path
-     MSG="docs(plans): mark <plan> SHIPPED — <summary>"
-
-     # Land on main from a THROWAWAY worktree: never commit onto, rebase, or push
-     # the branch this checkout is on — it is routinely a peer's
-     # [policy: shared-checkout-route-around].
-     git -C "$PLAN_DIR" fetch origin
-     LAND="$(mktemp -d)"
-     git -C "$PLAN_DIR" worktree add --detach "$LAND" origin/main
-     mkdir -p "$LAND/$(dirname "$REL")"
-     cp "$TOP/$REL" "$LAND/$REL"         # repeat per path (add the 00-index.md flip)
-     git -C "$LAND" add -- "$REL"
-     # An identical file already on main stages nothing — that is SUCCESS
-     # (the read-back below will pass), not a failure to abort on.
-     git -C "$LAND" diff --cached --quiet || git -C "$LAND" commit -m "$MSG"
-     # Plain push, never --force. On non-fast-forward a peer landed first:
-     # re-fetch, recreate the worktree off the new origin/main, re-apply, retry.
-     git -C "$LAND" push origin HEAD:main
-     git -C "$PLAN_DIR" worktree remove --force "$LAND"
-
-     # MANDATORY read-back — the ONLY thing that establishes durability. Compare
-     # CONTENT, not existence: after a stranded push an earlier, unstamped version
-     # of the plan is already at this path, and an existence check passes on it.
-     git -C "$PLAN_DIR" fetch origin
-     # Guard the empty case: a missing path AND an unreadable local file would
-     # otherwise compare "" = "" and read as LANDED.
-     LANDED_BLOB="$(git -C "$PLAN_DIR" rev-parse -q --verify "origin/main:$REL")"
-     [ -n "$LANDED_BLOB" ] && \
-       [ "$LANDED_BLOB" = "$(git -C "$PLAN_DIR" hash-object "$TOP/$REL")" ] \
-       && echo "LANDED: $REL on origin/main matches the stamped file" \
-       || echo "NOT LANDED: $REL on origin/main is absent or not the stamped version — do not report SHIPPED"
+     REL="${PLAN_PATH#"$TOP"/}"          # repo-relative
+     bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh \
+       "$TOP" "$REL" "$PLAN_PATH" "docs(plans): mark <plan> SHIPPED — <summary>"
+     # Suite dir: run it again for the flipped 00-index.md — one blob per call.
    fi
    ```
 
+   What the helper does, so its verdict can be read rather than trusted blind:
+   it fetches the plans repo's default branch with an explicit refspec, probes
+   that branch's ruleset, and — when no rule requires a PR — builds the commit
+   by plumbing on a separate index against a base resolved ONCE, so it never
+   commits onto, rebases, or pushes the branch this checkout is on (routinely a
+   peer's [policy: shared-checkout-route-around]). It pushes that commit to the
+   default branch without force, rebuilding on a non-fast-forward. Then it reads
+   the path back off the freshly fetched default branch and compares CONTENT,
+   not existence — after a stranded push an earlier, unstamped version of the
+   plan is already at this path, and an existence check passes on it. An
+   identical blob already there is success, not an error. It prints exactly one
+   line: `LANDED <commit|unchanged> <blob>` on the direct arm, or
+   `PROPOSED <pr-url|branch> <branch>` on the PR arm. Any non-zero exit
+   (3 read-back failed, 4 push failed after retries, 5 refused, 6 fetch failed,
+   2 usage) means the stamp is **not** published.
+
    **The read-back is not optional and its failure is not cosmetic.** Until
-   the read-back matches on `origin/main`, the plan is in exactly the state
+   the helper prints its verdict line, the plan is in exactly the state
    this step exists to prevent, and the run has not shipped its record. Report
-   the failure rather than the stamp
+   the failure rather than the stamp, and do not report SHIPPED
    [policy: unknown-must-not-render-as-a-default].
 
    This is standing authority, not an escalation: `git-operations`
@@ -3234,52 +3239,33 @@ established — a clean `gh pr checks` read is not proof of the latter.
    `qontinui-dev-notes` or a `plans/` dir for a session-owned closeout, and its
    *"verify branch == origin after"* bound is what the read-back discharges.
    `merge-authority` is not in tension — coord is sole merge authority for
-   `qontinui/*` **application** repos, and a notes/plans repo is neither. If the
-   plans repo IS one coord lands, open a PR for the plan branch instead
-   ([policy: pr-create-preference-order]) and let coord land it; the read-back
-   above is still what closes the step.
+   `qontinui/*` **application** repos. Whether a given plans repo needs a PR is
+   not asserted here: the helper's ruleset probe decides it per repo, and an
+   unreadable probe takes the PR arm.
 
    If the `rev-parse --is-inside-work-tree` check fails, the plan directory is a plain folder: the
    stamped file on disk **is** the record, there is nothing to commit, push or
    read back, and you must not create a repo to hold it.
 
-   **FALLBACK ARM — when the direct land above is not available, a pushed branch
-   is NOT the closeout: assert a PR carries the push (`coord-ff-lands.md`), re-checked before and after EACH push.** The
-   land-on-`main` recipe is the primary route and `git-operations` `closeout-push`
-   is its authority for a notes/plans repo. Where the plan repo IS one coord
-   lands, that route is closed to you and a pull request is the only way the stamp
-   reaches `main` — and a branch pushed with no PR never gets there: the stamped
-   plan is published and permanently invisible to every `origin/main` reader.
-   Measured 2026-09-02, **9** plan stems were pushed to `origin` and never
-   proposed at all — no PR in any state, on any branch carrying the stem —
-   including one this very closeout had pushed the day before. (A further 23 were
-   on a pushed branch and on no `origin/main` while HAVING a PR: merge-train
-   business while those PRs are OPEN.) **Once per chain is not enough.** coord
-   can land the plan PR mid-chain and leave it CLOSED, MERGED or even OPEN, and
-   every later push to that same branch is then stranded again. So before each
-   push, and again after it, apply
-   `knowledge-base/qontinui-specific/coord-ff-lands.md` → "Pushing to a branch
-   whose PR may already have landed" to the branch you are about to push:
-   ```bash
-   BRANCH="<the branch you are about to push; after a fresh-branch cut, the NEW branch>"
-   gh pr list --repo <owner/repo> --head "$BRANCH" --state all \
-     --json number,state,headRefOid,url \
-     --jq '.[] | "\(.number) \(.state) \(.headRefOid) \(.url)"'
-   ```
-   `--state all`, not `--state open`: an empty open-only answer cannot tell
-   "never proposed" from "closed under you". A CLOSED or MERGED PR HAS been
-   proposed, so it is not Step 0's pushed-but-unproposed class, but it carries
-   nothing pushed after its close.
-
-   When the section says no PR carries the push and commits remain unlanded,
-   take its fresh-branch path. Open the new PR with **`coord_create_pr` first,
-   then `gh pr create`**, carrying the line-anchored `Plan: <stem>` marker Step
-   4.5 specifies. **Never `gh pr merge`, never `--admin`**: coord is the sole
-   merge authority and that spelling is denied to agents fleet-wide. If the plan
-   branch is the same branch as the implementation PR, that PR satisfies the
-   assertion only while the same section says it carries the push; say so rather
-   than opening a second one. The content read-back above also catches a
-   stranded stamp push directly, whatever state the PR reads. Runbook:
+   **FALLBACK ARM — the helper's PR arm handles it.** When the plans repo's
+   default branch requires a PR, or the probe cannot tell, the helper cuts a
+   FRESH branch from the current default branch, pushes only this stamp's delta,
+   and opens a NEW PR with `gh pr create` (the only opener it runs), with the
+   line-anchored `Plan: <stem>` marker Step 4.5 specifies. A caller holding
+   coord's MCP door that wants `coord_create_pr` runs the helper with
+   `LAND_PLAN_STAMP_NO_PR=1` — it then pushes and reads back the branch, prints
+   it, and opens nothing — and opens the PR itself with `coord_create_pr`,
+   falling back to `gh pr create`. It never pushes to
+   an existing branch, so a stamp cannot ride a branch whose PR coord already
+   landed and strand there (plan
+   `2026-09-10-stamp-pushes-reuse-a-landed-branch-and-strand-the-first-pr-unobserved`).
+   On `PROPOSED`, confirm the PR the line names with
+   `gh pr list --repo <owner/repo> --head <branch> --state all --json number,state,headRefOid,url`.
+   **Never `gh pr merge`, never `--admin`**: coord is the sole merge authority
+   and that spelling is denied to agents fleet-wide. Any NON-stamp push to an
+   existing branch — the implementation PR's own branch included — is still
+   governed by `knowledge-base/qontinui-specific/coord-ff-lands.md` → "Pushing
+   to a branch whose PR may already have landed". Runbook:
    `knowledge-base/qontinui-specific/bodyless-work-units-and-stranded-plans.md`.
 
    **Do NOT POST a `shipped` work-unit transition:**

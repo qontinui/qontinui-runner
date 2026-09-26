@@ -190,42 +190,59 @@ the most-recently-modified fallback above, confirmed with the user). Hold this
 resolved absolute path; both downstream skills receive the **same** path so the
 vet stamp and the implement run can never drift onto different files.
 
-If that file is still untracked in git, commit and push it — stamped `DRAFT`,
-from a worktree, never the primary/shared checkout — before Step 2. `/vet-plan`
+If that file is still untracked in git, publish it — stamped `DRAFT` — before
+Step 2, with the shared helper (below), never by committing in the
+primary/shared checkout. `/vet-plan`
 documents the same precondition: `VETTED` is an attested status a non-owner
 session must be able to read, so vetting a file no peer can see defeats the
-attestation. **That commit-and-push is a mutation, so it happens AFTER Step 1.1's
+attestation. **That publication is a mutation, so it happens AFTER Step 1.1's
 reserve, not here** — resolve the path in this step, reserve in Step 1.1, then
-push.
+publish.
 
-⚠️ **"From a worktree" decides WHERE YOU COMMIT; it does not decide where the
-plan LANDS, and only the second one satisfies the reason above.** A worktree
-sits on its own branch, so a bare `git push` there puts the plan on that branch
-and nowhere else — still a file no peer can see, which is precisely the failure
-this precondition exists to prevent. Land it on `origin/main` and **read it
-back** before treating the precondition as met. The read-back is a content
-comparison: the file's hash must equal `origin/main`'s blob at its path, as in
-`/implement-plan` Step 6 item 3's read-back with its non-empty guard. Existence
-alone passes on an earlier version already at that path. Use the same
-throwaway-worktree recipe
-`/implement-plan` Step 6 item 3 spells out, which also carries the
-`closeout-push` authority and the non-fast-forward retry. A plan that fails the
-read-back is not vettable yet — say so rather than proceeding to Step 2.
+⚠️ **Where you commit does not decide where the plan LANDS, and only the second
+one satisfies the reason above.** A worktree sits on its own branch, so a bare
+`git push` there puts the plan on that branch and nowhere else — still a file
+no peer can see, which is precisely the failure this precondition exists to
+prevent. Publish it with:
 
-**Where the plan repo is itself coord-merge-authority, the direct land is not
-available and a PR is the only route — then the assertion is that a PR
-carries each push, re-checked before and after it** (per the
-`coord-ff-lands.md` section named below). A pushed branch with no pull request
-never reaches `main`, so the plan is on `origin` and still invisible to every
-`origin/main` reader. Measured 2026-09-02, **9** plan stems were pushed to
-`origin` and never proposed at all — no PR in any state, on any branch carrying
-the stem. A PR that existed at Step 1 is not enough either: coord can land it
-mid-chain and leave it CLOSED, MERGED or even OPEN, stranding every later push
-to the same branch. So before each push, and again after it, apply
-`knowledge-base/qontinui-specific/coord-ff-lands.md` → "Pushing to a branch
-whose PR may already have landed", reading the PR with
+```bash
+bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh \
+  "<plans-repo-root>" "<repo-relative plan path>" "<local plan file>" \
+  "docs: add <plan-stem> (DRAFT)"
+```
+
+The helper is the one implementation of what this step used to spell out by
+hand: it fetches the default branch with an explicit refspec, builds the commit
+by plumbing on a separate index against a base resolved once (so the shared
+tree, index and worktree list are never touched), pushes without force with a
+non-fast-forward retry, and **reads the file back** — a content comparison of
+the file's hash against the default branch's blob at its path, with the
+non-empty guard, because existence alone passes on an earlier version already
+at that path. Its single stdout line — `LANDED <commit|unchanged> <blob>` or
+`PROPOSED <pr-url|branch> <branch>` — is the evidence the plan is published.
+`/implement-plan` Step 6 item 3 carries the `closeout-push` authority for it. A
+non-zero exit means the plan is NOT published and not vettable yet — say so
+rather than proceeding to Step 2.
+
+**Whether the plans repo needs a PR is decided by the helper's ruleset probe,
+not by this command.** With no PR-requiring rule on the default branch it lands
+directly; with one, or when the probe cannot tell, it cuts a FRESH branch, opens
+a NEW PR with `gh pr create` (the only opener it runs; a line-anchored
+`Plan: <stem>` marker ends the body) and prints `PROPOSED`. To open it with
+`coord_create_pr` instead, run the helper with `LAND_PLAN_STAMP_NO_PR=1` — it
+pushes and reads back the branch, prints it, and opens nothing — then open the
+PR with `coord_create_pr`, falling back to `gh pr create`. It never pushes to an existing
+branch, so a later stamp cannot ride a branch whose PR coord already landed
+(plan `2026-09-10-stamp-pushes-reuse-a-landed-branch-and-strand-the-first-pr-unobserved`).
+A pushed branch with no pull request never reaches `main`: measured
+2026-09-02, **9** plan stems were pushed to `origin` and never proposed at all —
+no PR in any state, on any branch carrying the stem. So on the `PROPOSED` arm,
+read the PR back with
 `gh pr list --repo <owner/repo> --head <branch> --state all --json number,state,headRefOid`.
-When it says no PR carries the push and commits remain unlanded, take its
+Every NON-stamp push to an existing branch — the implementation PRs this chain
+opens — stays governed by `knowledge-base/qontinui-specific/coord-ff-lands.md` →
+"Pushing to a branch whose PR may already have landed": before each such push,
+and again after it, and when it says no PR carries the push, take its
 fresh-branch path and open the new PR — **`coord_create_pr` first, then
 `gh pr create`** — with a line-anchored `Plan: <stem>` marker in the body,
 carrying the DELIVERY SCOPE for the phases this PR actually implements
