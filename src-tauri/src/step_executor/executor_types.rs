@@ -92,6 +92,15 @@ pub struct ExecutionStepConfig {
     #[serde(rename = "type", alias = "step_type")]
     pub step_type: String,
 
+    /// Set by a step-conversion seam (`unified_workflow_executor::step_conversion`)
+    /// when the step could not be parsed and no faithful fallback exists
+    /// (today: a `ui_bridge` step). A step carrying it FAILS at execution with
+    /// this message (`DispatchRoute::ConversionFailed`) — it is never run as a
+    /// snapshot or skipped, so a workflow cannot pass without it. Serialized,
+    /// so it survives `execution_steps_json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversion_error: Option<String>,
+
     /// Explicit command mode: "shell", "check", "check_group", or "test".
     /// When set, the command handler uses this directly instead of inferring
     /// from which optional fields are populated.

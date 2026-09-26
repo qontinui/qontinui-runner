@@ -318,6 +318,35 @@ pub struct DeterministicVerificationResult {
     pub raw_output: String,
 }
 
+/// The verification-phase steps of a task's `execution_steps_json`.
+///
+/// A step with no faithful fallback that does not parse (a `ui_bridge` step,
+/// `StepsJsonError::UnparseableStep`) FAILS verification with a message naming
+/// it — it is never silently dropped by falling back to the basic build
+/// checks. Absent or otherwise malformed JSON yields no steps, as before.
+fn load_verification_steps(
+    execution_steps_json: Option<&str>,
+) -> Result<Vec<crate::step_executor::ExecutionStepConfig>, DeterministicVerificationResult> {
+    use crate::unified_workflow_executor::step_conversion::{parse_steps_json, StepsJsonError};
+    let Some(json) = execution_steps_json else {
+        return Ok(Vec::new());
+    };
+    match parse_steps_json(json) {
+        Ok(steps) => Ok(steps
+            .into_iter()
+            .filter(|s| s.phase.as_deref() == Some("verification"))
+            .collect()),
+        Err(StepsJsonError::UnparseableStep(e)) => Err(DeterministicVerificationResult {
+            all_passed: false,
+            checks_run: vec!["workflow verification steps".to_string()],
+            critical_failures: vec![e.to_string()],
+            non_critical_failures: Vec::new(),
+            raw_output: String::new(),
+        }),
+        Err(StepsJsonError::Malformed(_)) => Ok(Vec::new()),
+    }
+}
+
 /// Run the workflow's actual verification steps (if defined) instead of just build checks
 ///
 /// This function:
@@ -345,22 +374,20 @@ pub async fn run_workflow_verification_for_task(
     let session_num = task_run.as_ref().map(|t| t.sessions_count as i32);
 
     // Try to get verification steps from the task's execution_steps_json
-    let verification_steps: Vec<ExecutionStepConfig> = task_run
-        .as_ref()
-        .and_then(|task| {
-            task.execution_steps_json
-                .as_ref()
-                .and_then(|json| {
-                    crate::unified_workflow_executor::step_conversion::parse_steps_json(json).ok()
-                })
-                .map(|steps| {
-                    steps
-                        .into_iter()
-                        .filter(|s| s.phase.as_deref() == Some("verification"))
-                        .collect()
-                })
-        })
-        .unwrap_or_default();
+    let verification_steps = match load_verification_steps(
+        task_run
+            .as_ref()
+            .and_then(|task| task.execution_steps_json.as_deref()),
+    ) {
+        Ok(steps) => steps,
+        Err(failure) => {
+            warn!(
+                "WORKFLOW-VERIFICATION: task {}: {}",
+                db_task_id, failure.critical_failures[0]
+            );
+            return failure;
+        }
+    };
 
     // If no verification steps defined, fall back to basic deterministic verification
     if verification_steps.is_empty() {
@@ -607,4 +634,37 @@ pub fn generate_verification_feedback(result: &DeterministicVerificationResult) 
     }
 
     feedback
+}
+
+#[cfg(test)]
+mod load_verification_steps_tests {
+    use super::load_verification_steps;
+
+    #[test]
+    fn unparseable_ui_bridge_step_fails_verification_naming_it() {
+        let json = r##"[{"type":"ui_bridge","id":"v1","name":"check save","phase":"verification",
+                        "action":"assert","target":"#save","timeoutMs":"soon"}]"##;
+        let failure = load_verification_steps(Some(json)).unwrap_err();
+        assert!(!failure.all_passed);
+        assert_eq!(failure.critical_failures.len(), 1);
+        let msg = &failure.critical_failures[0];
+        assert!(
+            msg.starts_with("ui_bridge step 'check save' (id v1) could not be parsed"),
+            "{msg}"
+        );
+        assert!(msg.contains("invalid type: string \"soon\""), "{msg}");
+    }
+
+    #[test]
+    fn parseable_and_absent_steps_load_as_before() {
+        let json = r#"[{"type":"ui_bridge","name":"a","phase":"verification","action":"snapshot"},
+                       {"type":"ui_bridge","name":"b","phase":"setup","action":"snapshot"}]"#;
+        let steps = load_verification_steps(Some(json)).unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].ui_bridge_action.as_deref(), Some("snapshot"));
+        assert!(load_verification_steps(None).unwrap().is_empty());
+        assert!(load_verification_steps(Some("not json"))
+            .unwrap()
+            .is_empty());
+    }
 }
