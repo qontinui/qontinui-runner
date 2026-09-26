@@ -4994,10 +4994,15 @@ pub async fn publish_tree_state() -> Result<(), String> {
                 false
             }
             Err(e) => {
-                warn!(
-                    "fleet::tree_publisher: POST {url} for {repo} failed: {}",
-                    error_chain(&e),
-                    repo = payload.repo
+                // Once per (host, error kind) per window, with a suppressed
+                // count: this site logs per repo per cycle and wrote ~205k
+                // identical DNS lines on 2026-09-24 (plan
+                // 2026-09-24-runner-coord-credential-stranded-after-outage).
+                crate::util::transport_log_dedupe::warn_transport_error(
+                    "fleet::tree_publisher",
+                    &url,
+                    &format!("fleet::tree_publisher: POST {url} for {}", payload.repo),
+                    &e,
                 );
                 false
             }
