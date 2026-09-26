@@ -68,7 +68,7 @@ impl Registries {
     /// Fresh fetch → disk cache → embedded defaults, for each registry. Not
     /// free (a network fetch with a disk-cache fallback): call it only from a
     /// blocking context.
-    fn resolve() -> Self {
+    pub(crate) fn resolve() -> Self {
         Self {
             commands: crate::agent_commands::resolve_registry(),
             skills: crate::agent_skills::resolve_registry(),
@@ -127,11 +127,7 @@ fn provision_session_assets_from_root(root: Option<&Path>, workdir: &str, regist
             );
             capability_manifest::record_provision(workdir, report);
         }
-        // Which arm of each registry answered is a fact about resolution, not
-        // provisioning, so it is recorded even though nothing is written; the
-        // two provisioners are its only other recorders.
-        crate::fleet_commands::observe_commands_registry(&registries.commands);
-        crate::fleet_skills::observe_skills_registry(&registries.skills);
+        observe_registries(registries);
         return;
     }
     match crate::agent_runtime::provision_agent_definitions_from_root(root, workdir) {
@@ -155,6 +151,19 @@ fn provision_session_assets_from_root(root: Option<&Path>, workdir: &str, regist
     }
     crate::fleet_commands::provision_fleet_commands_for_session(workdir, &registries.commands);
     crate::fleet_skills::provision_fleet_skills_for_session(workdir, &registries.skills);
+}
+
+/// Record which resolution arm answered for each registry, writing nothing.
+///
+/// The one observation path for every arm that skips provisioning — this
+/// module's canonical-source arm and `isolated_edit`'s repo-authored `.claude/`
+/// arm. Which arm answered is a fact about resolution, not provisioning, so a
+/// session that is given nothing still records it; otherwise a box whose
+/// sessions all land on such a cwd reads both capability rows as unknown. The
+/// two provisioners are its only other recorders.
+pub(crate) fn observe_registries(registries: &Registries) {
+    crate::fleet_commands::observe_commands_registry(&registries.commands);
+    crate::fleet_skills::observe_skills_registry(&registries.skills);
 }
 
 /// The ledger rows the canonical-source arm records — one per capability the

@@ -1044,14 +1044,25 @@ pub(crate) fn provision_session_cwd(
     // would hide an operator's intended new `.claude/commands/*.md` from
     // `git status`. So the guard lives here instead.
     if claude_tree_is_repo_authored(wd) {
-        info!(
-            workdir = %wd,
-            "fleet provisioning: skipped — this cwd's .claude/ is git-tracked, so the repo \
-             authors its own agents/skills/commands and the bundle must not clobber them"
-        );
+        // Resolving is a fetch with a disk-cache fallback; safe here because
+        // this fn runs on the blocking pool (`provision_session_cwd_off_runtime`).
+        skip_repo_authored_claude_tree(wd, &crate::session_assets::Registries::resolve());
     } else {
         crate::session_assets::provision_session_assets(wd);
     }
+}
+
+/// The repo-authored arm of [`provision_session_cwd`]: nothing is written into
+/// `wd`, whose `.claude/` the repository tracks, but which arm resolved each
+/// registry is still recorded ([`crate::session_assets::observe_registries`]).
+/// Takes the registries so a test can inject them instead of resolving live.
+fn skip_repo_authored_claude_tree(wd: &str, registries: &crate::session_assets::Registries) {
+    info!(
+        workdir = %wd,
+        "fleet provisioning: skipped — this cwd's .claude/ is git-tracked, so the repo \
+         authors its own agents/skills/commands and the bundle must not clobber them"
+    );
+    crate::session_assets::observe_registries(registries);
 }
 
 /// [`provision_session_cwd`] on the blocking pool, awaited — for the async
@@ -1316,6 +1327,33 @@ mod tests {
     }
 
     use super::*;
+
+    /// A repo-authored `.claude/` skips provisioning, but not the facts about
+    /// resolution: which arm of each registry answered is still recorded, so a
+    /// box whose sessions all open in such a repo does not read the
+    /// `agent_commands_registry` / `agent_skills_registry` rows as unknown.
+    /// Nothing is written into the cwd. The registries are injected, so no
+    /// credential read, fetch or cache write happens here.
+    #[test]
+    fn a_repo_authored_claude_tree_still_observes_the_registries() {
+        let _store = crate::capability_manifest::store_lock();
+        crate::capability_manifest::reset_provision_store();
+        let cwd = tempfile::tempdir().unwrap();
+        let wd = cwd.path().to_string_lossy().into_owned();
+
+        skip_repo_authored_claude_tree(&wd, &crate::session_assets::Registries::embedded());
+
+        for capability in ["agent_commands_registry", "agent_skills_registry"] {
+            assert!(
+                crate::capability_manifest::latest_observation(capability).is_some(),
+                "{capability} must be observed on the repo-authored arm"
+            );
+        }
+        assert!(
+            std::fs::read_dir(cwd.path()).unwrap().next().is_none(),
+            "nothing is written into a repo-authored cwd"
+        );
+    }
 
     fn git(dir: &Path, args: &[&str]) {
         let out = std::process::Command::new("git")
