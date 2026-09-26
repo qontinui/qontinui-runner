@@ -13936,6 +13936,227 @@ Body.
         );
     }
 
+    // ---- plan 2026-09-26-plan-adapter-stale-view-demotes-attested-work-units ----
+    //
+    // Four attested units (`superseded` / `obsolete`) were found back at
+    // `draft` after their plan files moved out of the plans dir. The dossier's
+    // candidate cause was "a vanished `source_path` reconciles as draft". The
+    // three tests below pin why that is NOT the mechanism on this build, and
+    // how the adapter consumes the coord-side guard that closes the real one
+    // (an old build's cold-start `UpsertWithStatus` from a stale view).
+
+    /// **A plan file that vanishes writes no status: not in the cycle it
+    /// vanishes, and not after a process restart either.** A file that is not
+    /// scanned yields no `ParsedWorkUnit`, and `reconcile_once` iterates parsed
+    /// units only, so there is nothing that could send a `draft` for it. This
+    /// pins the refutation, so a later "fix" cannot add a vanished-means-draft
+    /// write.
+    ///
+    /// The unit is ATTESTED in coord (`superseded`), which is the shape that was
+    /// found demoted. The restart is modelled by dropping the [`LoopState`] and
+    /// building a fresh one: empty `last_applied`, empty warned-set, exactly
+    /// what `run_loop` starts from.
+    #[tokio::test]
+    async fn a_vanished_plan_writes_no_status_across_a_process_restart() {
+        const GONE: &str = "2026-09-12-moved-away";
+        const KEPT: &str = "2026-09-12-still-here";
+        let dir = tempfile::tempdir().unwrap();
+        let gone_path = dir.path().join(format!("{GONE}.md"));
+        std::fs::write(&gone_path, "# Moved\n\n> **Status: SUPERSEDED**\n").unwrap();
+        // A second plan keeps the post-removal scan non-empty and COMPLETE, so
+        // the vanish is observed by a healthy scan rather than an empty one.
+        std::fs::write(
+            dir.path().join(format!("{KEPT}.md")),
+            "# Kept\n\n> **Status: SUPERSEDED**\n",
+        )
+        .unwrap();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        let sink = FakeSink::default();
+        {
+            let mut st = sink.statuses.lock().unwrap();
+            st.insert(GONE.to_string(), "superseded".to_string());
+            st.insert(KEPT.to_string(), "superseded".to_string());
+        }
+        let metrics = AdapterMetrics::default();
+
+        // Cycle 1: both present. coord already agrees, so both are
+        // metadata-only refreshes — no status on the wire at all.
+        let mut state = tick_state(reader.clone());
+        state.tick(&sink, &metrics).await;
+        assert_eq!(*sink.upsert_calls.lock().unwrap(), 2, "both plans pushed");
+        assert_eq!(*sink.status_upsert_calls.lock().unwrap(), 0);
+
+        // Cycle 2: the file moves out of the plans dir.
+        std::fs::remove_file(&gone_path).unwrap();
+        state.tick(&sink, &metrics).await;
+
+        // Cycle 3: a process restart — a fresh state with no memory at all.
+        drop(state);
+        let mut restarted = tick_state(reader);
+        assert!(restarted.last_applied.is_empty(), "a restart starts cold");
+        restarted.tick(&sink, &metrics).await;
+
+        assert_eq!(
+            *sink.status_upsert_calls.lock().unwrap(),
+            0,
+            "no upsert carrying a status was sent for any slug, the vanished one included"
+        );
+        assert_eq!(
+            *sink.transition_attempts.lock().unwrap(),
+            0,
+            "no transition was even ATTEMPTED"
+        );
+        assert!(
+            sink.upserts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|b| b.slug == GONE)
+                .all(|b| b.status.is_none()),
+            "every upsert naming the vanished slug is status-less"
+        );
+        assert_eq!(
+            sink.upserts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|b| b.slug == GONE)
+                .count(),
+            1,
+            "the vanished slug is pushed only while its file exists (cycle 1)"
+        );
+        assert_eq!(
+            sink.statuses.lock().unwrap().get(GONE).map(String::as_str),
+            Some("superseded"),
+            "coord's attested status is untouched"
+        );
+    }
+
+    /// **A stale DRAFT view cannot demote an attested unit on a cold start.**
+    /// This is the arm-1 shape from the plan's Why: a runner start (empty
+    /// `last_applied`) scanning a file whose stamp predates the attestation.
+    /// On a build predating `8e3a3cf75`, `decide_push(None)` answered
+    /// `UpsertWithStatus`, which bypasses the agent-owner deferral, and coord's
+    /// `COALESCE($3, status)` overwrote `superseded` with `draft`.
+    ///
+    /// With the seed-from-coord block in `reconcile_once`, the unit seeds to
+    /// `superseded`, the push becomes a `Transition`, and the deferral sees the
+    /// attesting actor (`device:x`) and defers: a status-less metadata upsert,
+    /// no transition.
+    ///
+    /// Neuter check (run 2026-09-26): replace the seed condition
+    /// `prev.is_none() && status_write == StatusWrite::Allowed` with `false`
+    /// and this test fails: the outcome is no longer `Deferred` and one upsert
+    /// carries `status: draft`.
+    #[tokio::test]
+    async fn a_stale_draft_view_cannot_demote_an_attested_unit_on_a_cold_start() {
+        let sink = FakeSink {
+            last_actor: Some("device:x".to_string()),
+            ..Default::default()
+        };
+        sink.statuses
+            .lock()
+            .unwrap()
+            .insert("s".to_string(), "superseded".to_string());
+        let mut r = Reconciler::new();
+        assert!(r.mem.is_empty(), "cold start: no last-applied memory");
+
+        let summary = r.cycle(&sink, &[unit("s", "draft")]).await;
+
+        assert_eq!(summary.seeded, 1, "the cold start seeds from coord");
+        assert_eq!(summary.deferred, 1, "the attester owns the unit: DEFER");
+        assert_eq!(summary.transitions, 0);
+        assert_eq!(summary.errors, 0);
+        assert_eq!(
+            *sink.status_upsert_calls.lock().unwrap(),
+            0,
+            "no upsert carried a status"
+        );
+        assert_eq!(*sink.transition_attempts.lock().unwrap(), 0);
+        assert_eq!(
+            *sink.upsert_calls.lock().unwrap(),
+            1,
+            "the provenance refresh still ran"
+        );
+        assert_eq!(
+            sink.statuses.lock().unwrap().get("s").map(String::as_str),
+            Some("superseded"),
+            "the attested status stands"
+        );
+        assert!(
+            !r.mem.contains_key("s"),
+            "a deferral applied nothing, so nothing is remembered as applied"
+        );
+    }
+
+    /// The body coord's scanner-demotion guard answers with (plan Phase 4).
+    const ATTESTED_NOT_DEMOTABLE: &str = r#"{"error":"attested_not_demotable_by_scanner","message":"work unit `s` is attested `superseded`; a plan-file scan cannot move it out of the Attested class. Re-open it with a coord transition instead.","terminality":"permanent"}"#;
+
+    /// **coord's `attested_not_demotable_by_scanner` denial is consumed with no
+    /// runner change**: a `422` carrying `terminality: "permanent"` retires the
+    /// `(s, draft)` pair, and every later cycle takes
+    /// [`StatusWrite::RetiredPermanently`], which withholds the status write
+    /// but keeps the metadata-only upsert flowing.
+    ///
+    /// The status code is load-bearing. A `409` maps to `TerminalConflict`,
+    /// whose `terminality` is never read, so the pair would be re-tried every
+    /// cycle. That is why coord must answer `422`; see
+    /// `http_disposition::tests::an_attested_not_demotable_denial_must_be_a_422_to_retire`.
+    #[tokio::test]
+    async fn an_attested_not_demotable_denial_retires_the_pair_and_keeps_metadata_flowing() {
+        // The adapter last drove the unit, so no deferral: the Transition
+        // superseded -> draft reaches coord, and coord refuses it.
+        let sink = FakeSink {
+            last_actor: Some(ADAPTER_ACTOR.to_string()),
+            deny_status: Some(("draft".to_string(), 422, ATTESTED_NOT_DEMOTABLE.to_string())),
+            ..Default::default()
+        };
+        sink.statuses
+            .lock()
+            .unwrap()
+            .insert("s".to_string(), "superseded".to_string());
+        let mut r = Reconciler::new();
+
+        let first = r.cycle(&sink, &[unit("s", "draft")]).await;
+        assert_eq!(first.retired_permanent, 1, "the denial retires the pair");
+        assert_eq!(first.errors, 0, "a permanent denial is not a retryable error");
+        assert_eq!(first.forbidden, 0, "...nor a principal-wide verdict");
+        assert_eq!(*sink.transition_attempts.lock().unwrap(), 1);
+        assert_eq!(
+            r.forb.retirement_for("s", "draft"),
+            Some(RetirementReason::PermanentForStatus)
+        );
+        assert_eq!(r.forb.retirement_for("s", "superseded"), None, "pair, not slug");
+
+        let upserts_before = *sink.upsert_calls.lock().unwrap();
+        let second = r.cycle(&sink, &[unit("s", "draft")]).await;
+        assert_eq!(
+            second.retired_permanent, 1,
+            "cycle 2 takes StatusWrite::RetiredPermanently"
+        );
+        assert_eq!(second.errors, 0);
+        assert_eq!(
+            *sink.transition_attempts.lock().unwrap(),
+            1,
+            "the refused transition is NOT re-issued"
+        );
+        assert_eq!(*sink.status_upsert_calls.lock().unwrap(), 0);
+        assert_eq!(
+            *sink.upsert_calls.lock().unwrap(),
+            upserts_before + 1,
+            "the metadata-only upsert is still sent"
+        );
+        let last = sink.upserts.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(last.slug, "s");
+        assert_eq!(last.status, None, "metadata-only: no status on the wire");
+        assert!(last.metadata.is_some(), "provenance keeps reaching coord");
+        assert_eq!(
+            sink.statuses.lock().unwrap().get("s").map(String::as_str),
+            Some("superseded")
+        );
+    }
+
     /// **A scan must say whether it was COMPLETE — an empty or short vector
     /// cannot.** The partial case is the one a cheap `units.is_empty()` guard
     /// would miss entirely.
