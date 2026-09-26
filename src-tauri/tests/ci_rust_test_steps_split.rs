@@ -610,3 +610,111 @@ fn the_memory_sampler_is_gated_to_the_windows_leg() {
          `matrix.platform == 'windows-latest'`, got `{cond}`"
     );
 }
+
+const POISON: &str = "Poison ambient state";
+const SENTINEL_CHECK: &str = "Settings sentinel is untouched";
+const UNPOISON: &str = "Unpoison ambient state";
+
+/// The settings sentinel of plan
+/// `2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json`,
+/// Phase 5: planted at the RAW platform config dir before the tests, re-hashed
+/// after the RUN half (and the classifier's solo re-runs) under `if: always()`,
+/// removed by Unpoison — and the deterministic writer that proves it live
+/// still exists in source.
+#[test]
+fn the_settings_sentinel_is_planted_checked_after_the_run_half_and_removed() {
+    let doc = ci_workflow();
+    let steps = job_steps(&doc, "test");
+
+    let poison = command_lines(find_step(&steps, POISON), POISON);
+    for needle in [
+        "${XDG_CONFIG_HOME:-$HOME/.config}/com.qontinui.runner",
+        "cygpath -u \"$APPDATA\")/com.qontinui.runner",
+        "SENTINEL=\"$SENTINEL_DIR/settings.json\"",
+        "\"local_user_id\":",
+        "\"plans_dir\":",
+        "\"qontinui_ci_sentinel\":",
+        "QONTINUI_SETTINGS_SENTINEL_SHA256=$SENTINEL_SHA",
+    ] {
+        assert!(
+            poison.contains(needle),
+            "`{POISON}` must plant the settings sentinel ({needle:?} missing)"
+        );
+    }
+
+    let check_step = find_step(&steps, SENTINEL_CHECK);
+    assert_eq!(
+        check_step.get("if").and_then(|v| v.as_str()),
+        Some("always()"),
+        "`{SENTINEL_CHECK}` must run on a red suite too — that is the run most \
+         likely to have written the file"
+    );
+    assert_eq!(
+        check_step.get("shell").and_then(|v| v.as_str()),
+        Some("bash"),
+        "`{SENTINEL_CHECK}` is bash on the windows leg too"
+    );
+    assert!(
+        check_step.get("continue-on-error").is_none(),
+        "`{SENTINEL_CHECK}` is a gate; continue-on-error would make it decoration"
+    );
+    let check = command_lines(check_step, SENTINEL_CHECK);
+    assert!(check.contains("QONTINUI_SETTINGS_SENTINEL_SHA256"));
+    assert!(check.contains("exit 1"));
+    assert!(
+        !CARGO_INVOCATION.is_match(&check),
+        "`{SENTINEL_CHECK}` must not invoke cargo"
+    );
+
+    let at = position(&steps, SENTINEL_CHECK);
+    for earlier in [
+        POISON,
+        RUN,
+        "Classify failed tests (solo re-run)",
+        "Explain which Rust test phase the bound expired in",
+    ] {
+        assert!(
+            position(&steps, earlier) < at,
+            "`{SENTINEL_CHECK}` must come after `{earlier}`"
+        );
+    }
+    assert!(
+        at < position(&steps, UNPOISON),
+        "`{SENTINEL_CHECK}` must come before `{UNPOISON}` removes the sentinel"
+    );
+
+    let unpoison_step = find_step(&steps, UNPOISON);
+    assert_eq!(
+        unpoison_step.get("if").and_then(|v| v.as_str()),
+        Some("always()"),
+        "`{UNPOISON}` must run on a red suite too — it is what moves a pre-existing \
+         settings.json the poison moved aside back into place"
+    );
+    let unpoison = command_lines(unpoison_step, UNPOISON);
+    assert!(unpoison.contains("rm -f \"$QONTINUI_SETTINGS_SENTINEL\""));
+    assert!(unpoison.contains("QONTINUI_SETTINGS_SENTINEL_BACKUP"));
+    assert!(unpoison.contains("QONTINUI_SETTINGS_SENTINEL_BACKUP_OF"));
+
+    // The backup's record reaches $GITHUB_ENV BEFORE the `mv`, so a failure
+    // between the two cannot lose where the operator's file went.
+    let record = poison
+        .find("echo \"QONTINUI_SETTINGS_SENTINEL_BACKUP_OF=$SENTINEL\"")
+        .expect("`Poison ambient state` must record the backup's origin in $GITHUB_ENV");
+    let mv = poison
+        .find("mv \"$SENTINEL\" \"$SENTINEL_BACKUP\"")
+        .expect("`Poison ambient state` moves a pre-existing settings.json aside");
+    assert!(
+        record < mv,
+        "`{POISON}` must record the backup path in $GITHUB_ENV before the `mv`"
+    );
+
+    let settings = std::fs::read_to_string(repo_root().join("src-tauri/src/settings.rs"))
+        .expect("read settings.rs");
+    assert!(
+        settings.contains("fn ci_sentinel_liveness_probe()")
+            && settings.contains("QONTINUI_CI_SENTINEL_PROBE"),
+        "the sentinel's deterministic liveness writer \
+         (`settings::ci_sentinel_probe::ci_sentinel_liveness_probe`) is gone — the \
+         step's comment names it as the way to prove the gate live"
+    );
+}

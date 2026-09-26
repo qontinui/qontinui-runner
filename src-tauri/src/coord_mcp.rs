@@ -9532,14 +9532,16 @@ fn coord_mcp_write_verdict(workdir: &str, intended: IntendedWrite) -> McpWriteVe
 
 /// [`coord_mcp_write_verdict`] over a root the caller already resolved.
 ///
-/// [`qontinui_root_dir`] is `workspace_paths::workspace_root()`, which reads
-/// `paths.workspace_root` through `config_facade::get_setting` →
+/// [`qontinui_root_dir`] USED TO be `workspace_paths::workspace_root()`, which
+/// reads `paths.workspace_root` through `config_facade::get_setting` →
 /// `settings::load_settings_full` — a WRITER (see
 /// `workspace_paths::runner_workspace_root_from`). `config_report`'s layer 14
 /// resolved it twice per report, once here and once in [`mcp_json_report`], so
 /// opening the diagnostic could mint a `local_user_id` into the operator's
 /// `settings.json`. Taking the root as an argument lets the report resolve it
-/// ONCE, off the non-mutating door, and hand the same value to both.
+/// ONCE, off the non-mutating door, and hand the same value to both — which
+/// still matters now that [`qontinui_root_dir`] is itself non-mutating: one
+/// resolution means the report cannot describe two different roots.
 fn coord_mcp_write_verdict_at(
     workdir: &str,
     root_dir: Option<&Path>,
@@ -9901,10 +9903,11 @@ fn shape_from_read(read: std::io::Result<String>) -> (bool, McpJsonShape, Option
 ///
 /// # The umbrella root is INJECTED, not resolved here
 ///
-/// [`qontinui_root_dir`] is `workspace_paths::workspace_root()`, which reads
+/// [`qontinui_root_dir`] was `workspace_paths::workspace_root()`, which reads
 /// `paths.workspace_root` through `config_facade::get_setting` →
 /// `settings::load_settings_full` — the runner's one settings
-/// writer-by-side-effect. This function needed the root TWICE (its own path, and
+/// writer-by-side-effect (it now takes the read-only door; the injection below
+/// is kept so a report resolves the root exactly once). This function needed the root TWICE (its own path, and
 /// the write guard's), so a single config report entered that writer twice: on a
 /// machine whose `local_user_id` is empty, opening the diagnostic minted a UUID
 /// into `settings.json` and rewrote it, then reported on the file it had just
@@ -11129,8 +11132,19 @@ pub(crate) fn root_reconcile_action(
 /// **without** reintroducing that cycle: [`crate::workspace_paths`] is itself a
 /// leaf, depending only on the settings store and the shared
 /// `qontinui_types::paths` — never on `agent_runtime`.
+///
+/// Through the READ-ONLY door, `workspace_paths::workspace_root_readonly`. The
+/// value is identical (no overlay or migration touches `paths.workspace_root`),
+/// but `workspace_root()` reaches `load_settings_full`, a writer by side
+/// effect, and this was the observed route by which the runner's own
+/// `coord_mcp` unit tests wrote a defaults `settings.json` over the operator's
+/// real one: a test here resolving the root while a sibling's fixture had
+/// `QONTINUI_CONFIG_DIR` pointed at an empty dir read a `FreshInstall` and
+/// persisted it after the fixture dropped. Plan
+/// `2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json`,
+/// Phase 2.
 fn qontinui_root_dir() -> Option<std::path::PathBuf> {
-    crate::workspace_paths::workspace_root()
+    crate::workspace_paths::workspace_root_readonly()
 }
 
 /// Re-register an EXISTING on-disk proxy nonce string into the live registry as
@@ -12130,7 +12144,9 @@ where
     O: IntoIterator<Item = &'a str>,
     A: IntoIterator<Item = &'a str>,
 {
-    let root = crate::workspace_paths::workspace_root()?;
+    // The read-only door: a census of files on disk has no business minting a
+    // `local_user_id` into settings.json — see [`qontinui_root_dir`].
+    let root = crate::workspace_paths::workspace_root_readonly()?;
     Some(census_on_disk_mcp_configs_at(
         &root,
         open_workdirs,

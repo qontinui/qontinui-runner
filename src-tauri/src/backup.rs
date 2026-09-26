@@ -61,7 +61,8 @@ pub struct RestoreResult {
 /// `settings.json` is intentionally shared across all runners on the machine,
 /// so this path is NOT scoped to the current instance.
 fn get_settings_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("com.qontinui.runner").join("settings.json"))
+    qontinui_runner_lib::ambient::runner_platform_config_root("backup::get_settings_path")
+        .map(|d| d.join("com.qontinui.runner").join("settings.json"))
 }
 
 /// Get the path to prompts.json.
@@ -71,17 +72,18 @@ fn get_settings_path() -> Option<PathBuf> {
 /// backup would always miss the real prompts file). Scoped per-runner for
 /// secondary instances.
 fn get_prompts_path() -> Option<PathBuf> {
-    dirs::config_dir()
+    qontinui_runner_lib::ambient::runner_platform_config_root("backup::get_prompts_path")
         .map(|d| crate::instance::scope_path(&d.join("com.qontinui.runner")).join("prompts.json"))
 }
 
 /// Get the path to playwright-tests.json (per-runner for secondary instances).
 fn get_playwright_tests_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| {
-        crate::instance::scope_path(&d.join("com.qontinui.runner"))
-            .join("playwright")
-            .join("playwright-tests.json")
-    })
+    qontinui_runner_lib::ambient::runner_platform_config_root("backup::get_playwright_tests_path")
+        .map(|d| {
+            crate::instance::scope_path(&d.join("com.qontinui.runner"))
+                .join("playwright")
+                .join("playwright-tests.json")
+        })
 }
 
 /// Files to backup with their archive names
@@ -238,12 +240,16 @@ pub fn restore_backup(data: &[u8]) -> Result<RestoreResult, String> {
             Ok(mut file) => match dest_path_opt {
                 Some(dest_path) => {
                     // Validate the destination path stays within expected directories
-                    let allowed_bases: Vec<PathBuf> =
-                        vec![dirs::config_dir(), dirs::data_local_dir()]
-                            .into_iter()
-                            .flatten()
-                            .map(|d| d.join("com.qontinui.runner"))
-                            .collect();
+                    let allowed_bases: Vec<PathBuf> = vec![
+                        qontinui_runner_lib::ambient::runner_platform_config_root(
+                            "backup::restore_backup",
+                        ),
+                        dirs::data_local_dir(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .map(|d| d.join("com.qontinui.runner"))
+                    .collect();
 
                     if let Some(parent) = dest_path.parent() {
                         if let Err(e) = fs::create_dir_all(parent) {
@@ -389,5 +395,29 @@ mod tests {
         assert!(get_settings_path().is_some());
         assert!(get_prompts_path().is_some());
         assert!(get_playwright_tests_path().is_some());
+    }
+}
+
+/// Every file in the backup set — which `restore_backup` WRITES — roots at
+/// `ambient::runner_platform_config_root`, the hermetic deflected root in a
+/// test process, never the operator's real config dir. Plan
+/// `2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json`,
+/// Phase 4.
+#[cfg(test)]
+mod config_root_deflection_tests {
+    use super::*;
+
+    #[test]
+    fn every_backup_destination_is_deflected_in_a_test_process() {
+        let root = qontinui_runner_lib::ambient::deflected_config_root();
+        for (name, path) in get_backup_files() {
+            let path = path.unwrap_or_else(|| panic!("{name} resolves"));
+            assert!(
+                path.starts_with(&root),
+                "{name} -> {} must resolve under the deflected root {} in a test process",
+                path.display(),
+                root.display()
+            );
+        }
     }
 }

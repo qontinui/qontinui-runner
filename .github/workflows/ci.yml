@@ -252,8 +252,8 @@ jobs:
       # directory — `coverage-diff.test.mjs` and `perf-harness-lib.test.mjs`
       # predate this step and have not been verified against this job's exact
       # environment; wiring them in is a separate, separately-verified change.
-      - name: Run CI-tooling unit tests (ci-flake-analyze, ci-test-results-ingest, ci-expiry-phase-summary)
-        run: node --test scripts/__tests__/ci-flake-analyze.test.mjs scripts/__tests__/ci-test-results-ingest.test.mjs scripts/__tests__/ci-expiry-phase-summary.test.mjs
+      - name: Run CI-tooling unit tests (ci-flake-analyze, ci-test-results-ingest, ci-expiry-phase-summary, test-interleave-census)
+        run: node --test scripts/__tests__/ci-flake-analyze.test.mjs scripts/__tests__/ci-test-results-ingest.test.mjs scripts/__tests__/ci-expiry-phase-summary.test.mjs scripts/__tests__/test-interleave-census.test.mjs
 
       # Pin matches rust-toolchain.toml (channel = "1.95.0"). The toolchain
       # file overrides any other channel for every cargo invocation, so the
@@ -635,6 +635,61 @@ jobs:
             cat "$q/machine.json" "$q/profiles.json"
           done
 
+          # The SETTINGS SENTINEL (plan 2026-09-23-runner-unit-tests-overwrite-
+          # the-operators-live-settings-json, Phase 5). A runner test binary
+          # wrote a defaults document over an operator's live settings.json —
+          # five times in one afternoon, then again from a second, unfiltered
+          # `cargo test` — and nothing on CI could have seen it, because a
+          # clean runner has no file there to lose. So plant one at the RAW
+          # platform config dir, exactly where `dirs::config_dir()` resolves
+          # (`$XDG_CONFIG_HOME` or `~/.config` on Linux; the known-folder
+          # `%APPDATA%` on Windows, which no env var can move), and record its
+          # hash. `Settings sentinel is untouched` re-hashes it after the tests
+          # and fails on any change. The fields are the ones the recorded
+          # resets destroyed: a known `local_user_id` and a non-empty
+          # `paths.plans_dir`.
+          #
+          # A pre-existing file (a runner that is not the clean one this step
+          # assumes) is MOVED aside, not overwritten, and `Unpoison ambient
+          # state` (which runs `if: always()`) moves it back. The backup path
+          # and its origin reach $GITHUB_ENV BEFORE the `mv`: a failure between
+          # the two must not leave a moved file with no record of where it went.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            SENTINEL_DIR="$(cygpath -u "$APPDATA")/com.qontinui.runner"
+          else
+            SENTINEL_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/com.qontinui.runner"
+          fi
+          SENTINEL="$SENTINEL_DIR/settings.json"
+          SENTINEL_BACKUP=""
+          mkdir -p "$SENTINEL_DIR"
+          if [ -e "$SENTINEL" ]; then
+            SENTINEL_BACKUP="$RUNNER_TEMP/settings.json.pre-sentinel"
+            {
+              echo "QONTINUI_SETTINGS_SENTINEL_BACKUP=$SENTINEL_BACKUP"
+              echo "QONTINUI_SETTINGS_SENTINEL_BACKUP_OF=$SENTINEL"
+            } >> "$GITHUB_ENV"
+            echo "::warning::$SENTINEL already exists before the sentinel was planted — moved to $SENTINEL_BACKUP; Unpoison restores it"
+            mv "$SENTINEL" "$SENTINEL_BACKUP"
+          fi
+          cat > "$SENTINEL" <<EOF
+          {
+            "qontinui_ci_sentinel": "planted by ci.yml 'Poison ambient state'; a test process changed this file if its hash moved",
+            "local_user_id": "ci-sentinel-local-user-id-${GITHUB_RUN_ID:-local}",
+            "tier": "local",
+            "tier_initialized": true,
+            "paths": { "plans_dir": "/ci-sentinel/plans-dir-must-survive" }
+          }
+          EOF
+          SENTINEL_SHA="$(sha256sum "$SENTINEL" | cut -d' ' -f1)"
+          cp "$SENTINEL" "$RUNNER_TEMP/settings-sentinel.expected.json"
+          {
+            echo "QONTINUI_SETTINGS_SENTINEL=$SENTINEL"
+            echo "QONTINUI_SETTINGS_SENTINEL_SHA256=$SENTINEL_SHA"
+            echo "QONTINUI_SETTINGS_SENTINEL_BACKUP=$SENTINEL_BACKUP"
+          } >> "$GITHUB_ENV"
+          echo "=== settings sentinel planted at $SENTINEL (sha256 $SENTINEL_SHA) ==="
+          cat "$SENTINEL"
+
           # A workspace root that does not exist: `default_canonical_path` must
           # fail closed naming `$QONTINUI_ROOT`, never resolve.
           POISON_ROOT="$RUNNER_TEMP/qontinui-root-poison-does-not-exist"
@@ -990,6 +1045,98 @@ jobs:
           }
           run_all 2>&1 | tee "$GITHUB_WORKSPACE/cargo-test-output.log"
 
+      # Post-failure DIAGNOSTIC, not a gate: on a red suite, re-run each failed
+      # test ALONE against the test binaries the BUILD half produced and label
+      # the arm — `SUITE-ONLY` (green alone, red in the suite: the test shares
+      # process state with a concurrent sibling), `SOLO-RED` (a real defect or
+      # an ambient read), `BOTH-FLAKY` (timing). The label lands as a Checks
+      # annotation (`::error title=SUITE-ONLY::…`) and as
+      # `test-classification.json`, which the ingest step below reads. Plan
+      # 2026-09-17-runner-tests-share-in-process-mutable-state, Phase 1;
+      # dossier `runner-tests-share-in-process-mutable-state`.
+      #
+      # THIS STEP CHANGES NO VERDICT. It runs only under `if: failure()` — the
+      # run half above has already reported red — and `continue-on-error`
+      # keeps its own outcome out of the job's; the script additionally exits
+      # 0 by contract in `--classify-from-log` mode, even on a crash.
+      #
+      # ⚠️ THIS STEP DOES NOT INVOKE CARGO EITHER — the run half's rule applies
+      # here with the same force. The classifier's own default resolves
+      # executables through `cargo test --no-run --message-format=json`, which
+      # on this crate is a REBUILD, not a cache hit (tauri-codegen and the
+      # sidecar stub make the package an input to itself; see the run half).
+      # So the executables are recovered from `cargo-test-build.log` exactly
+      # the way the run half recovers them — ANSI stripped, one `Executable
+      # \`<path>\`` line per test target — written one per line to an exe list
+      # and handed over with `--exe-list`. The same set the suite ran; the
+      # script's `--cargo` path is never reached. Paths are kept as cargo
+      # printed them (backslashes on windows): node's `spawn` execs them
+      # directly, no bash word-splitting is involved, and the id normaliser
+      # splits on either separator.
+      #
+      # Deliberately NO `timeout-minutes`: pairing one with `continue-on-error`
+      # cancels the whole JOB on trip, not the step (the mechanism that broke
+      # the reverted nextest shadow — see the ingest step's comment below). The
+      # bound is the script's own `--budget-seconds 600`: after it, remaining
+      # re-runs are labelled `UNRESOLVED (budget)` — a non-answer, never a
+      # verdict — and the step still ends 0.
+      #
+      # Ordering is load-bearing. It sits directly after `Run Rust tests`,
+      # BEFORE `Report test results to coord` so the ingest can read the
+      # classification json, and BEFORE `Unpoison ambient state` so the solo
+      # re-runs see the SAME poisoned env the suite ran under — a re-run that
+      # passed only because the poison was gone would be a false SUITE-ONLY.
+      # The step-level env mirrors the run half's `QONTINUI_DISABLE_KEYCHAIN`
+      # for the same reason (and so the keyring-touching auth tests cannot hang
+      # a re-run on a headless runner). No `CARGO_BUILD_JOBS`: nothing here
+      # compiles.
+      #
+      # `--workspace-root "$GITHUB_WORKSPACE/src-tauri"` reproduces cargo's
+      # contract that a test binary runs with cwd = the package manifest dir —
+      # the same `cd src-tauri` the run half keeps for the same reason — and is
+      # where the tree sha is read from.
+      #
+      # `if: failure()` also fires when the BUILD half (or any earlier step)
+      # redded and the run half never ran: the run log is then absent, and
+      # there is nothing to classify — so the shell checks for both logs first
+      # and says so instead.
+      - name: Classify failed tests (solo re-run)
+        if: failure()
+        continue-on-error: true
+        shell: bash
+        env:
+          QONTINUI_DISABLE_KEYCHAIN: "1"
+        run: |
+          LOG="$GITHUB_WORKSPACE/cargo-test-output.log"
+          BUILD_LOG="$GITHUB_WORKSPACE/cargo-test-build.log"
+          if [ ! -s "$LOG" ]; then
+            echo "::notice title=classify-skipped::no cargo-test-output.log — the run half did not run (the build half or an earlier step redded); nothing to classify"
+            exit 0
+          fi
+          if [ ! -s "$BUILD_LOG" ]; then
+            echo "::notice title=classify-skipped::no cargo-test-build.log — cannot recover the test executables without invoking cargo, which this step must never do; nothing to classify"
+            exit 0
+          fi
+          # The run half's recovery, verbatim: strip ANSI (CARGO_TERM_COLOR is
+          # `always`), then take the path out of each `Executable \`<path>\``.
+          EXE_LIST="$GITHUB_WORKSPACE/test-executables.txt"
+          ESC=$(printf '\033')
+          sed -e "s/${ESC}\[[0-9;]*m//g" "$BUILD_LOG" \
+            | sed -n 's/^[[:space:]]*Executable `\(.*\)`[[:space:]]*$/\1/p' > "$EXE_LIST"
+          if [ ! -s "$EXE_LIST" ]; then
+            echo "::notice title=classify-skipped::found no \`Executable\` lines in $BUILD_LOG; nothing to re-run"
+            exit 0
+          fi
+          echo "recovered $(wc -l < "$EXE_LIST") test binaries from the build half"
+          node scripts/test-interleave-census.mjs \
+            --classify-from-log "$LOG" \
+            --exe-list "$EXE_LIST" \
+            --workspace-root "$GITHUB_WORKSPACE/src-tauri" \
+            --solo-runs 3 \
+            --budget-seconds 600 \
+            --format json \
+            --out "$GITHUB_WORKSPACE/test-classification.json"
+
       # Phase 2 of the same plan: make an expiry name its own phase.
       #
       # `The action 'Run Rust tests' has timed out after 90 minutes` was
@@ -1036,6 +1183,70 @@ jobs:
             --run-log "$GITHUB_WORKSPACE/cargo-test-output.log" \
             --build-outcome "${{ steps.build_rust_tests.outcome }}" \
             --run-outcome "${{ steps.run_rust_tests.outcome }}"
+
+      # The GATE half of the settings sentinel `Poison ambient state` planted
+      # (plan 2026-09-23-runner-unit-tests-overwrite-the-operators-live-
+      # settings-json, Phase 5): re-hash the sentinel settings.json at the raw
+      # platform config dir and fail, with the diff, when a test process
+      # changed or removed it. That is the operator's live file on a dev box.
+      #
+      # Placement is load-bearing. AFTER `Run Rust tests` (the run half of the
+      # build/run split — the build half executes no test) and after the two
+      # `if: failure()` diagnostics, so the classifier's solo re-runs are
+      # inside the window too. And after `Explain which Rust test phase…`, so
+      # that step's `failure()` reading is about the suite, never about this
+      # gate. `if: always()`: a red suite is exactly the run most likely to
+      # have written the file.
+      #
+      # No `continue-on-error` (it gates), and so no reason to avoid
+      # `timeout-minutes` — but the step is two hashes, so it carries none,
+      # like `Poison ambient state` itself.
+      #
+      # PROVING IT LIVE, deterministically — never by a red committed state.
+      # Reverting the fix would not go red: the test-harness deflection absorbs
+      # the write, and the recorded race is nondeterministic. The writer is
+      # `settings::ci_sentinel_probe::ci_sentinel_liveness_probe`, `#[ignore]`d
+      # and inert unless `QONTINUI_CI_SENTINEL_PROBE=1`: it writes a defaults
+      # document straight to `resolve_config_dir_from(None, dirs::config_dir())`,
+      # bypassing the guard. On a THROWAWAY branch, add
+      # `QONTINUI_CI_SENTINEL_PROBE: "1"` to `Run Rust tests`' `env:` and run
+      # the runner bin's test binary once more with
+      # `--ignored --exact ci_sentinel_probe::ci_sentinel_liveness_probe`; this
+      # step must fail naming the diff. Record that run's URL on the PR and
+      # drop the branch.
+      #
+      # If `Poison ambient state` never ran (an earlier step redded) there is
+      # no sentinel to check and the step says so rather than failing.
+      - name: Settings sentinel is untouched
+        if: always()
+        shell: bash
+        run: |
+          set -u
+          if [ -z "${QONTINUI_SETTINGS_SENTINEL:-}" ]; then
+            echo "::notice title=sentinel-skipped::no settings sentinel was planted (Poison ambient state did not run); nothing to check"
+            exit 0
+          fi
+          EXPECTED="$RUNNER_TEMP/settings-sentinel.expected.json"
+          if [ ! -e "$QONTINUI_SETTINGS_SENTINEL" ]; then
+            echo "::error title=Settings sentinel removed::$QONTINUI_SETTINGS_SENTINEL was DELETED during the Rust tests. A test process reached the real platform config dir — on a dev box that is the operator's live settings.json. See plan 2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json."
+            exit 1
+          fi
+          ACTUAL_SHA="$(sha256sum "$QONTINUI_SETTINGS_SENTINEL" | cut -d' ' -f1)"
+          if [ "$ACTUAL_SHA" != "$QONTINUI_SETTINGS_SENTINEL_SHA256" ]; then
+            echo "::error title=Settings sentinel changed::$QONTINUI_SETTINGS_SENTINEL changed during the Rust tests (sha256 $QONTINUI_SETTINGS_SENTINEL_SHA256 -> $ACTUAL_SHA). A test process wrote the real platform settings.json — on a dev box, the operator's live file. See plan 2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json."
+            echo "=== diff (planted -> found) ==="
+            diff -u "$EXPECTED" "$QONTINUI_SETTINGS_SENTINEL" || true
+            ls -la "$(dirname "$QONTINUI_SETTINGS_SENTINEL")"
+            exit 1
+          fi
+          # A sibling the sentinel's hash cannot see: a stray atomic-write temp
+          # means a writer got as far as the rename's first half.
+          stray="$(ls -1 "$(dirname "$QONTINUI_SETTINGS_SENTINEL")" 2>/dev/null | grep -E '^settings\.json\.tmp' || true)"
+          if [ -n "$stray" ]; then
+            echo "::error title=Settings sentinel temp file::a settings.json.tmp.* appeared beside the sentinel during the Rust tests: $stray"
+            exit 1
+          fi
+          echo "settings sentinel untouched: $QONTINUI_SETTINGS_SENTINEL (sha256 $ACTUAL_SHA)"
 
       # Phase 3 step 1 of the same plan: MEASURE the quantity
       # `CARGO_BUILD_JOBS` is tuned against, before retuning it.
@@ -1168,6 +1379,17 @@ jobs:
       # produces no run-phase lines at all, so `parseTestOutcomes` returns
       # `unparsed` and this step correctly sends nothing. What survives is
       # exactly #1545's tail — the RUN step expiring mid-suite.
+      #
+      # `--classification` = the json the `Classify failed tests` step above
+      # wrote (absent on a green run, or when that step was skipped or ran out
+      # of budget): each pre-parsed row then carries `classification:
+      # suite_only | solo_red | both_flaky | null`, tallied in this step's log.
+      # An absent or unreadable file is null on every row, never a failure.
+      # Like `--gating-outcome`, it does NOT change the payload: coord's
+      # `ResultItem` has no such field and no `deny_unknown_fields`, so the
+      # key is stripped before the POST rather than written into a void
+      # (plan 2026-09-17-runner-tests-share-in-process-mutable-state, Phase 1
+      # — the recorded coord gap).
       - name: Report test results to coord (best-effort)
         if: always()
         continue-on-error: true
@@ -1182,11 +1404,12 @@ jobs:
           # chunk FAILED, while the step still reported green because it is
           # `continue-on-error`.
           #
-          # Reordering does NOT fix it: `Unpoison` carries no `if: always()`, so
-          # a red suite skips it entirely — and a red suite is exactly the case
-          # this ingest exists to record. A step-level `env:` beats $GITHUB_ENV
-          # for this step only, so it is correct on both the green and red paths
-          # and independent of where the unpoison sits.
+          # Reordering was not the fix: `Unpoison` then carried no `if:
+          # always()`, so a red suite skipped it entirely — and a red suite is
+          # exactly the case this ingest exists to record. It runs `if: always()`
+          # now, but a step-level `env:` beats $GITHUB_ENV for this step only, so
+          # the pin stays correct on both the green and red paths and
+          # independent of where the unpoison sits.
           #
           # Empty, not a literal host: the script reads
           # `process.env.COORD_HTTP_URL || DEFAULT_COORD_URL`
@@ -1200,7 +1423,8 @@ jobs:
             --repo "${{ github.repository }}" \
             --head-sha "${{ github.event.pull_request.head.sha || github.sha }}" \
             --shard "${{ matrix.platform }}" \
-            --gating-outcome "${{ steps.run_rust_tests.outcome }}"
+            --gating-outcome "${{ steps.run_rust_tests.outcome }}" \
+            --classification "$GITHUB_WORKSPACE/test-classification.json"
 
       # Undo `Poison ambient state` so the poison covers the test step and
       # nothing after it. `$GITHUB_ENV` cannot unset, only assign — but every
@@ -1210,7 +1434,14 @@ jobs:
       # root resolver trims and skips). The three files are removed by name, not
       # `rm -rf ~/.qontinui`, so a home that was NOT clean (the poison step warns
       # when it sees one) keeps whatever else it held.
+      #
+      # `if: always()`: on a red suite (or a red `Poison ambient state`) a
+      # pre-existing settings.json the poison moved aside must still be moved
+      # back — on a self-hosted box that file is the operator's. Every action
+      # here is idempotent and safe when the poison never ran: `rm -f` by name,
+      # restores gated on a recorded, existing backup, and blanking env vars.
       - name: Unpoison ambient state
+        if: always()
         run: |
           set -u
           homes=("$HOME")
@@ -1223,13 +1454,32 @@ jobs:
             done
             rmdir "$h/.qontinui" 2>/dev/null || true
           done
+          # The settings sentinel: removed by name, and a file that was there
+          # before it was planted is moved back — keyed on the backup's own
+          # record (`_BACKUP` + `_BACKUP_OF`, written before the poison's `mv`),
+          # so a poison that failed after moving the file but before planting
+          # the sentinel is still undone.
+          if [ -n "${QONTINUI_SETTINGS_SENTINEL:-}" ]; then
+            rm -f "$QONTINUI_SETTINGS_SENTINEL"
+          fi
+          if [ -n "${QONTINUI_SETTINGS_SENTINEL_BACKUP:-}" ] && [ -n "${QONTINUI_SETTINGS_SENTINEL_BACKUP_OF:-}" ] && [ -e "$QONTINUI_SETTINGS_SENTINEL_BACKUP" ]; then
+            rm -f "$QONTINUI_SETTINGS_SENTINEL_BACKUP_OF"
+            mv "$QONTINUI_SETTINGS_SENTINEL_BACKUP" "$QONTINUI_SETTINGS_SENTINEL_BACKUP_OF"
+            echo "restored the pre-existing $QONTINUI_SETTINGS_SENTINEL_BACKUP_OF"
+          elif [ -n "${QONTINUI_SETTINGS_SENTINEL:-}" ]; then
+            rmdir "$(dirname "$QONTINUI_SETTINGS_SENTINEL")" 2>/dev/null || true
+          fi
           {
             echo "COORD_HTTP_URL="
             echo "QONTINUI_ROOT="
             echo "QONTINUI_SERVER_MODE="
             echo "QONTINUI_RUNNER_TIER="
+            echo "QONTINUI_SETTINGS_SENTINEL="
+            echo "QONTINUI_SETTINGS_SENTINEL_SHA256="
+            echo "QONTINUI_SETTINGS_SENTINEL_BACKUP="
+            echo "QONTINUI_SETTINGS_SENTINEL_BACKUP_OF="
           } >> "$GITHUB_ENV"
-          echo "poison removed; COORD_HTTP_URL / QONTINUI_ROOT / QONTINUI_SERVER_MODE / QONTINUI_RUNNER_TIER blanked"
+          echo "poison removed; COORD_HTTP_URL / QONTINUI_ROOT / QONTINUI_SERVER_MODE / QONTINUI_RUNNER_TIER / settings sentinel blanked"
         shell: bash
 
       - name: Live AI extractor smoke

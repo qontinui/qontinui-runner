@@ -946,6 +946,47 @@ fn newest_mtime(dir: &Path, dir_meta: Option<&std::fs::Metadata>) -> Option<std:
 mod tests {
     use super::*;
 
+    /// Test-only RAII guard over [`LAST_SWEEP`] — the sweep rate limiter's
+    /// timestamp, a process-global that a test forcing the limiter open
+    /// otherwise resets for every sibling in the binary and leaves reset when
+    /// it ends. The `intercept::BoundPortRestore` shape: capture the
+    /// previous value, restore it on drop (including the panic path).
+    ///
+    /// Restore-on-drop ONLY. It deliberately holds neither `env_lock()`
+    /// (`LAST_SWEEP` is not env; the lock would couple this test to every
+    /// env-touching site for nothing) nor [`IDENTITY_MATERIALIZE_LOCK`] (that
+    /// one is non-reentrant and `materialize_identity` takes it — the test
+    /// calls that under this guard, so holding it here would deadlock). Plan
+    /// `2026-09-17-runner-tests-share-in-process-mutable-state`, Phase 3.
+    struct RestoreLastSweep(Option<std::time::Instant>);
+
+    impl RestoreLastSweep {
+        fn capture() -> Self {
+            let prev = match LAST_SWEEP.lock() {
+                Ok(last) => *last,
+                Err(poisoned) => *poisoned.into_inner(),
+            };
+            Self(prev)
+        }
+
+        /// Reset the limiter so the next `maybe_sweep_stale` really sweeps.
+        fn force_open() {
+            match LAST_SWEEP.lock() {
+                Ok(mut last) => *last = None,
+                Err(poisoned) => *poisoned.into_inner() = None,
+            }
+        }
+    }
+
+    impl Drop for RestoreLastSweep {
+        fn drop(&mut self) {
+            match LAST_SWEEP.lock() {
+                Ok(mut last) => *last = self.0,
+                Err(poisoned) => *poisoned.into_inner() = self.0,
+            }
+        }
+    }
+
     #[test]
     fn enable_flag_truthiness() {
         for v in ["1", "true", "TRUE", "Yes", "on", " on "] {
@@ -1285,15 +1326,15 @@ mod tests {
     fn materialize_identity_never_returns_a_dir_it_just_swept() {
         let tmp = tempfile::tempdir().unwrap();
         // Force the rate limiter open so the sweep really runs in this call.
-        if let Ok(mut last) = LAST_SWEEP.lock() {
-            *last = None;
-        }
+        // The reset is a write to a process-global; the guard puts the previous
+        // value back on drop (including the panic path) so no sibling test —
+        // nor the next run of this one — inherits a limiter this test opened.
+        let _restore = RestoreLastSweep::capture();
+        RestoreLastSweep::force_open();
         let dir = materialize_identity(tmp.path()).expect("first materialize");
         assert!(dir.join(IDENTITY_MARKER).exists());
 
-        if let Ok(mut last) = LAST_SWEEP.lock() {
-            *last = None;
-        }
+        RestoreLastSweep::force_open();
         let again = materialize_identity(tmp.path()).expect("cached materialize");
         assert_eq!(dir, again);
         assert!(

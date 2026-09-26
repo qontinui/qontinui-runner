@@ -732,6 +732,200 @@ pub fn deflected_workspace_root() -> PathBuf {
     root
 }
 
+/// The empty platform CONFIG ROOT a test process is served instead of
+/// `dirs::config_dir()` — the directory `com.qontinui.runner/` hangs under.
+/// Created, for the same reason [`deflected_dir`] is: a writer that lands here
+/// must succeed into the void rather than fail, and a writer that fails is how
+/// a test goes looking for a real path.
+///
+/// `pub` for the resolver that roots at the platform config dir DIRECTLY and
+/// ignores `QONTINUI_CONFIG_DIR` by design (`claude_accounts`, in the bin
+/// crate); see [`test_config_root_override`].
+pub fn deflected_config_root() -> PathBuf {
+    let root = deflected_dir().join("config");
+    let _ = std::fs::create_dir_all(&root);
+    root
+}
+
+/// The empty RUNNER CONFIG DIRECTORY (`<deflected config root>/com.qontinui.runner`)
+/// a test process is served when nothing pointed `QONTINUI_CONFIG_DIR` at a
+/// fixture — the twin of [`deflected_workspace_root`] for the directory
+/// `settings.json` lives in. Created.
+///
+/// `pub` because `settings` (the BIN crate's resolver of `settings.json`) cannot
+/// reach the private [`deflected_dir`]; it gets here through
+/// [`test_config_dir_override`], never by joining a path of its own.
+pub fn deflected_config_dir() -> PathBuf {
+    let dir = deflected_config_root().join("com.qontinui.runner");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// What the runner's config-dir resolvers must do when `QONTINUI_CONFIG_DIR`
+/// is unset or empty. See [`config_dir_override_decision`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigDirOverride {
+    /// Not a test harness: resolve the platform config dir, exactly as before
+    /// this decision existed. The only arm a shipped or dev runner ever takes.
+    UsePlatform,
+    /// A test harness: resolve [`deflected_config_dir`] instead. `announce` is
+    /// `false` for a thread that holds its own fixture — it removed the
+    /// variable deliberately, and the deflection is not news to it.
+    Deflect { announce: bool },
+    /// A test harness, an unguarded thread, and [`test_support::strict_canary`]
+    /// asked for the hard failure.
+    Panic,
+}
+
+/// The ONE decision behind both `settings.json` resolvers
+/// (`settings::resolve_config_dir` in the bin and
+/// [`crate::profiles::settings_json_path`] here), as a PURE function of the
+/// three facts it depends on — so every arm, including the non-test one, is
+/// testable from inside a test process.
+///
+/// # Why this is not [`canary`]
+///
+/// [`canary`]'s arm 3 lets ANY thread proceed while ANY fixture is live in the
+/// process: *"the machine is not reached either way"*. That holds for a READ
+/// through the fixture's env. It does not hold for the config dir, because the
+/// runner's settings load is a read FOLLOWED BY A WRITE (a `FreshInstall`
+/// mints a `local_user_id` and persists it), and on 2026-09-23 exactly that
+/// shape — an unguarded test reading while a sibling's fixture was live, then
+/// persisting after it dropped — wrote a defaults document over the operator's
+/// real `settings.json` five times in one afternoon (plan
+/// `2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json`).
+/// So this decision is THREAD-SCOPED: a live guard on another thread buys this
+/// thread nothing.
+///
+/// # Why even a guarded thread is deflected
+///
+/// A fixture always sets `QONTINUI_CONFIG_DIR`, so a guarded thread reaches
+/// this only by removing the variable itself. In a test harness
+/// `dirs::config_dir()` is never a correct answer — on Linux it is the
+/// operator's `~/.config`, on Windows the known-folder API that no env
+/// override can redirect — so that thread is deflected too, just silently.
+///
+/// Arms, in order:
+///
+/// 1. `!armed` (not a test harness) → [`ConfigDirOverride::UsePlatform`];
+/// 2. `guarded` (this thread holds an `IsolatedAmbient`) → deflect, silently;
+/// 3. `strict` → [`ConfigDirOverride::Panic`];
+/// 4. otherwise → deflect, announced once per source.
+pub fn config_dir_override_decision(armed: bool, guarded: bool, strict: bool) -> ConfigDirOverride {
+    if !armed {
+        ConfigDirOverride::UsePlatform
+    } else if guarded {
+        ConfigDirOverride::Deflect { announce: false }
+    } else if strict {
+        ConfigDirOverride::Panic
+    } else {
+        ConfigDirOverride::Deflect { announce: true }
+    }
+}
+
+/// The directory a runner config-dir resolver must use INSTEAD of
+/// `dirs::config_dir()/com.qontinui.runner` — `None` meaning "no override,
+/// resolve the platform dir as always".
+///
+/// Callers consult this ONLY when `QONTINUI_CONFIG_DIR` is unset or empty; a
+/// non-empty value is honoured as today, because in a test process it is a
+/// fixture's directory (the operator's box does not export it — which is how
+/// the settings watcher recorded the env of every attributed write).
+///
+/// `source` names the resolver, and is what the strict panic and the one-line
+/// announcement carry. See [`config_dir_override_decision`] for the rule.
+#[cfg(any(test, debug_assertions))]
+pub fn test_config_dir_override(source: &str) -> Option<PathBuf> {
+    match config_dir_override_decision(
+        test_support::canary_armed(),
+        test_support::thread_is_guarded(),
+        test_support::thread_is_strict(),
+    ) {
+        ConfigDirOverride::UsePlatform => None,
+        ConfigDirOverride::Panic => panic!(
+            "runner config dir resolved by {source} with QONTINUI_CONFIG_DIR unset, from a \
+             test with no isolated_ambient() guard — that is the operator's real \
+             settings.json. See plan \
+             2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json"
+        ),
+        ConfigDirOverride::Deflect { announce } => {
+            let dir = deflected_config_dir();
+            if announce {
+                test_support::announce_config_deflection_once(source, &dir);
+            }
+            Some(dir)
+        }
+    }
+}
+
+/// Release builds never deflect: `debug_assertions` is off and `test_support`
+/// is not compiled.
+#[cfg(not(any(test, debug_assertions)))]
+#[inline(always)]
+pub fn test_config_dir_override(_source: &str) -> Option<PathBuf> {
+    None
+}
+
+/// [`test_config_dir_override`] for a resolver that roots at the platform
+/// config dir DIRECTLY and ignores `QONTINUI_CONFIG_DIR` by design —
+/// `claude_accounts`, whose machine-global `claude-accounts.json` every
+/// instance must share, and whose `load_with_migration` WRITES that file (and
+/// reads the primary's unscoped `settings.json`) on the first settings load of
+/// a process. Returns the config ROOT ([`deflected_config_root`]), the level
+/// that resolver joins `com.qontinui.runner` onto.
+///
+/// Deflects on EVERY armed thread, guarded or not: there is no env value to
+/// honour, and in a test harness `dirs::config_dir()` is never correct.
+///
+/// Never panics, even under [`test_support::strict_canary`]. This resolver is
+/// reached incidentally by every `load_settings_full` — including the strict
+/// tests that pin the settings persist canary, which would then fail on this
+/// resolver instead of on the thing they exist to name. The hermetic answer is
+/// the whole fix here; the announcement still names the source once.
+#[cfg(any(test, debug_assertions))]
+pub fn test_config_root_override(source: &str) -> Option<PathBuf> {
+    if !test_support::canary_armed() {
+        return None;
+    }
+    let root = deflected_config_root();
+    if !test_support::thread_is_guarded() {
+        test_support::announce_config_deflection_once(source, &root);
+    }
+    Some(root)
+}
+
+/// Release builds never deflect.
+#[cfg(not(any(test, debug_assertions)))]
+#[inline(always)]
+pub fn test_config_root_override(_source: &str) -> Option<PathBuf> {
+    None
+}
+
+/// The platform config ROOT (`dirs::config_dir()`, the directory
+/// `com.qontinui.runner/` hangs under) for every runner path that roots there
+/// DIRECTLY rather than through `QONTINUI_CONFIG_DIR` — the prompt library,
+/// prompt snippets, the context library, playwright storage, the config
+/// library, the active-instance ledger, the agent command/skill caches, the
+/// backup set, and the machine-global account roster and its readers.
+///
+/// Identical to `dirs::config_dir()` in every non-test process. In a test
+/// harness it is [`test_config_root_override`]'s hermetic root, so a test that
+/// reaches one of those writers lands in the void instead of in the operator's
+/// real `~/.config/com.qontinui.runner` (`%APPDATA%` on Windows, which no env
+/// override can redirect).
+///
+/// `source` names the caller, for the one-line announcement.
+///
+/// This is the ONE place a runner-config path may call `dirs::config_dir()`
+/// besides the two `settings.json` resolvers; `config_dir_scan_guard` (in the
+/// runner bin) fails by name on any other call site that is not allowlisted
+/// as a foreign app's directory. Plan
+/// `2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json`,
+/// Phase 4.
+pub fn runner_platform_config_root(source: &str) -> Option<PathBuf> {
+    test_config_root_override(source).or_else(dirs::config_dir)
+}
+
 // ============================================================================
 // The fixture
 // ============================================================================
@@ -1016,6 +1210,31 @@ pub mod test_support {
         );
     }
 
+    /// Print ONE line per distinct config-dir resolver that gets deflected —
+    /// the config-dir twin of [`warn_once`], whose sentence is about the
+    /// ambient HOME and would name the wrong thing.
+    pub fn announce_config_deflection_once(source: &str, dir: &Path) {
+        use std::sync::Mutex;
+        static SEEN: Mutex<Option<Vec<String>>> = Mutex::new(None);
+        let mut guard = match SEEN.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let seen = guard.get_or_insert_with(Vec::new);
+        if seen.iter().any(|s| s == source) {
+            return;
+        }
+        seen.push(source.to_string());
+        eprintln!(
+            "[ambient] deflected an unguarded test resolution of the runner config dir by \
+             {source} to {} — QONTINUI_CONFIG_DIR was unset, which in a test process names the \
+             operator's real settings.json. Hold `ambient::test_support::isolated_ambient()` \
+             and write the settings the test needs. Plan \
+             2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json.",
+            dir.display()
+        );
+    }
+
     /// An RAII fixture that makes every ambient read in its scope land inside a
     /// throwaway directory, and arms the canary for reads taken outside one.
     ///
@@ -1223,6 +1442,123 @@ mod tests {
     fn nothing_resolves_to_none() {
         assert_eq!(qontinui_dir_from(None, None), None);
         assert_eq!(qontinui_dir_from(Some(OsString::from("")), None), None);
+    }
+
+    // ---- the config-dir decision (plan 2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json, D1) ----
+
+    /// (d) A non-test process resolves the platform dir EXACTLY as before —
+    /// whatever the thread's guard or strictness says, which in a non-test
+    /// process are never set anyway. Pinned on the pure decision because no
+    /// test can run inside a non-test process.
+    #[test]
+    fn config_dir_decision_is_platform_outside_a_test_harness() {
+        for guarded in [false, true] {
+            for strict in [false, true] {
+                assert_eq!(
+                    config_dir_override_decision(false, guarded, strict),
+                    ConfigDirOverride::UsePlatform,
+                    "guarded={guarded} strict={strict}"
+                );
+            }
+        }
+    }
+
+    /// Inside a test harness the decision never answers the platform dir: a
+    /// guarded thread deflects silently, an unguarded one deflects announced,
+    /// or panics when it asked to be strict. A guard held on this thread wins
+    /// over strictness — it removed the variable on purpose.
+    #[test]
+    fn config_dir_decision_never_answers_the_platform_inside_a_test_harness() {
+        assert_eq!(
+            config_dir_override_decision(true, true, false),
+            ConfigDirOverride::Deflect { announce: false }
+        );
+        assert_eq!(
+            config_dir_override_decision(true, true, true),
+            ConfigDirOverride::Deflect { announce: false }
+        );
+        assert_eq!(
+            config_dir_override_decision(true, false, false),
+            ConfigDirOverride::Deflect { announce: true }
+        );
+        assert_eq!(
+            config_dir_override_decision(true, false, true),
+            ConfigDirOverride::Panic
+        );
+    }
+
+    /// The wired override, in the lib's own test binary (`cfg!(test)` arms it):
+    /// an unguarded thread gets the created deflected dir, a strict one panics
+    /// naming the source.
+    #[test]
+    fn test_config_dir_override_deflects_and_names_its_source_when_strict() {
+        let _lock = env_lock();
+        let dir = test_config_dir_override("ambient::tests probe").expect("armed ⇒ deflected");
+        assert_eq!(dir, deflected_config_dir());
+        assert!(dir.is_dir(), "the deflected config dir must exist");
+        assert!(dir.ends_with("com.qontinui.runner"));
+        assert_eq!(
+            test_config_root_override("ambient::tests probe"),
+            Some(deflected_config_root())
+        );
+
+        let strict = std::thread::spawn(|| {
+            let _strict = strict_canary();
+            test_config_dir_override("ambient::tests strict probe")
+        })
+        .join();
+        let payload = strict.expect_err("a strict unguarded resolution must panic");
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            message.contains("ambient::tests strict probe"),
+            "the panic must name the resolver: {message}"
+        );
+    }
+
+    /// (c), lib side: with a fixture live on THIS thread, a spawned unguarded
+    /// thread is still deflected — where [`canary`] would let it proceed.
+    #[test]
+    fn test_config_dir_override_ignores_a_sibling_threads_guard() {
+        let _amb = IsolatedAmbient::new();
+        let (override_dir, verdict) = std::thread::spawn(|| {
+            (
+                test_config_dir_override("ambient::tests sibling probe"),
+                canary("ambient::tests sibling probe"),
+            )
+        })
+        .join()
+        .expect("no panic on the deflect arm");
+        assert_eq!(verdict, Verdict::Proceed, "precondition: canary arm 3");
+        assert_eq!(override_dir, Some(deflected_config_dir()));
+    }
+
+    /// The platform-root door every raw runner-config path now goes through
+    /// answers the deflected ROOT in a test process — on an unguarded thread,
+    /// on a guarded one, and under `strict_canary()` (it never panics: the
+    /// hermetic answer is the whole fix, see [`test_config_root_override`]).
+    #[test]
+    fn runner_platform_config_root_is_the_deflected_root_in_a_test_process() {
+        assert_eq!(
+            runner_platform_config_root("ambient::tests unguarded probe"),
+            Some(deflected_config_root())
+        );
+        {
+            let _amb = IsolatedAmbient::new();
+            assert_eq!(
+                runner_platform_config_root("ambient::tests guarded probe"),
+                Some(deflected_config_root())
+            );
+        }
+        let strict = std::thread::spawn(|| {
+            let _strict = strict_canary();
+            runner_platform_config_root("ambient::tests strict probe")
+        })
+        .join()
+        .expect("the platform-root door never panics");
+        assert_eq!(strict, Some(deflected_config_root()));
     }
 
     // ---- the canary ----

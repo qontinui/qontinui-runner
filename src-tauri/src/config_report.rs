@@ -1498,7 +1498,7 @@ absence of a reading, NOT a finding that the generations agree.
     }
 
     /// Layer 3 resolves against this machine's real state and names one of the
-    /// three documented arms. The arm list is a LITERAL — the wire strings are
+    /// documented arms. The arm list is a LITERAL — the wire strings are
     /// a contract that a reader compares across machines, so asserting them
     /// against `SettingsJsonPathSource::as_str()` would pin nothing.
     ///
@@ -1515,7 +1515,14 @@ absence of a reading, NOT a finding that the generations agree.
         match &row.reading {
             LayerReading::Known { value, source, .. } => {
                 assert!(
-                    ["env:QONTINUI_CONFIG_DIR", "platform_config_dir"].contains(&source.as_str()),
+                    [
+                        "env:QONTINUI_CONFIG_DIR",
+                        "platform_config_dir",
+                        // What a test process reports with no fixture: the
+                        // hermetic dir the platform arm is deflected to.
+                        "test_deflected",
+                    ]
+                    .contains(&source.as_str()),
                     "unexpected settings.json path arm: {source}"
                 );
                 assert!(

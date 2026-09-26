@@ -58,4 +58,21 @@ regexes = [
   # them), so the fixture cannot be respelled here without forking the bundle.
   # Exact literal, as above: any other token value in that tree stays scanned.
   '''eyJhbGciOiJub25lIn0\.eyJleHAiOjk5OTk5OTk5OTl9\.c2ln''',
+  # Synthetic REDACTION fixtures in scripts/__tests__/ci-flake-analyze.test.mjs
+  # and scripts/__tests__/test-interleave-census.test.mjs. The code under test
+  # (`redactSecrets`, and the panic extractor that calls it) has to be shown
+  # to scrub a JWT-shaped value and a `runner_token: "..."` Debug field before
+  # a CI log or a flake issue carries them, so the fixtures must BE those
+  # shapes -- a JWT that does not begin `eyJ` never reaches the `eyJ` arm.
+  # Neither is a credential: the JWT is jwt.io's example header, a payload of
+  # just `{"sub":"1234567890"}`, and jwt.io's example SIGNATURE carried over
+  # from its own, different payload -- so it verifies under no key at all --
+  # and `qr_live_abcdef123456` is keyboard filler in a made-up `qr_live_`
+  # prefix nothing in this fleet mints.
+  #
+  # Exact literals, not a path exemption, for the reason every entry above
+  # gives: the same test files exercise real log-parsing code, which stays
+  # scanned. Widening either literal by one character re-arms the rule.
+  '''eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.eyJzdWIiOiIxMjM0NTY3ODkwIn0\.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c''',
+  '''qr_live_abcdef123456''',
 ]

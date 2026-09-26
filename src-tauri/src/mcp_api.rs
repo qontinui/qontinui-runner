@@ -3212,21 +3212,41 @@ const _: () = {
     }
 };
 
-/// Per-reason lane-miss counters, indexed by [`EventLaneMiss::index`] (the
-/// declaration order of [`EventLaneMiss::ALL`]) — the [`self_id_counters`]
-/// shape, one instance per counter family.
-fn transport_rung_lane_miss_counters() -> &'static [std::sync::atomic::AtomicU64; LANE_MISS_SLOTS] {
-    static COUNTERS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; LANE_MISS_SLOTS]> =
-        std::sync::OnceLock::new();
-    COUNTERS.get_or_init(Default::default)
+/// The transport-rung counter family: per-reason lane-miss counters indexed
+/// by [`EventLaneMiss::index`] (the declaration order of
+/// [`EventLaneMiss::ALL`]), and the observations HANDED to the rung emitter by
+/// [`record_coord_transport_rung`] since boot — the numerator every drop
+/// counter is read against.
+///
+/// A struct rather than two `OnceLock` accessors so the family has an
+/// IDENTITY: a test owns a private `TransportRungCounters::new()` and drives
+/// the `_in` functions against it, while production charges every call to the
+/// single [`TRANSPORT_RUNG`] static through the one-line delegations — the
+/// same per-test handle as [`MemoryEnrichCounters`], applied here because the
+/// module's tests used to serialise on an opt-in `series_lock()` that three of
+/// them did not take (the `opt_in_serializer_guard` finding). The `_in`
+/// functions are module-private; `the_public_transport_rung_api_only_delegates`
+/// pins the delegation.
+struct TransportRungCounters {
+    lane_miss: [std::sync::atomic::AtomicU64; LANE_MISS_SLOTS],
+    emitted: std::sync::atomic::AtomicU64,
 }
 
-/// Observations HANDED to the rung emitter by [`record_coord_transport_rung`]
-/// since boot — the numerator every drop counter is read against.
-fn transport_rung_emitted_counter() -> &'static std::sync::atomic::AtomicU64 {
-    static COUNTER: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
-    COUNTER.get_or_init(Default::default)
+impl TransportRungCounters {
+    /// `const` so the static needs no `OnceLock` (`[AtomicU64; N]` has no
+    /// const `Default`; an inline-`const` element repeated is the spelling —
+    /// `LaneTable::new` in `wedge_diagnostics.rs` does the same).
+    const fn new() -> Self {
+        Self {
+            lane_miss: [const { std::sync::atomic::AtomicU64::new(0) }; LANE_MISS_SLOTS],
+            emitted: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
 }
+
+/// The process-global transport-rung counters — the ones every production
+/// call is charged to.
+static TRANSPORT_RUNG: TransportRungCounters = TransportRungCounters::new();
 
 /// Count one dropped observation under its reason, and say so — ONCE per
 /// reason at `warn!`, then every 1000th with the running total, which is the
@@ -3244,8 +3264,20 @@ fn transport_rung_emitted_counter() -> &'static std::sync::atomic::AtomicU64 {
 /// through the miss, because misses are the rare path and a stale read only
 /// affects a log field.
 fn record_event_lane_miss(miss: EventLaneMiss, door: &str, nonce: Option<&str>) {
+    // Pure delegation — see `MemoryEnrichCounters` for why. Pinned by
+    // `the_public_transport_rung_api_only_delegates`.
+    record_event_lane_miss_in(&TRANSPORT_RUNG, miss, door, nonce)
+}
+
+/// [`record_event_lane_miss`] against an explicit counter set.
+fn record_event_lane_miss_in(
+    counters: &TransportRungCounters,
+    miss: EventLaneMiss,
+    door: &str,
+    nonce: Option<&str>,
+) {
     debug_assert!(miss.index() < LANE_MISS_SLOTS);
-    let n = transport_rung_lane_miss_counters()[miss.index()].fetch_add(1, Ordering::Relaxed) + 1;
+    let n = counters.lane_miss[miss.index()].fetch_add(1, Ordering::Relaxed) + 1;
     if n == 1 || n % 1000 == 0 {
         tracing::warn!(
             dropped_total = n,
@@ -3276,10 +3308,19 @@ fn record_event_lane_miss(miss: EventLaneMiss, door: &str, nonce: Option<&str>) 
 /// counters. The shape is [`transport_rung_snapshot_from`]'s; this only reads
 /// the process-wide sources.
 pub(crate) fn transport_rung_health_snapshot() -> serde_json::Value {
+    // Pure delegation — see `record_event_lane_miss`.
+    transport_rung_health_snapshot_in(&TRANSPORT_RUNG)
+}
+
+/// [`transport_rung_health_snapshot`] against an explicit counter set. The
+/// drain-dropped, outbox and emitter fields are still read from their own
+/// process-wide homes — this handle owns the two counter families declared
+/// on [`TransportRungCounters`], nothing else.
+fn transport_rung_health_snapshot_in(counters: &TransportRungCounters) -> serde_json::Value {
     let emitter = crate::session::coord_transport_rung::global();
     transport_rung_snapshot_from(
-        transport_rung_lane_miss_counters(),
-        transport_rung_emitted_counter().load(Ordering::Relaxed),
+        &counters.lane_miss,
+        counters.emitted.load(Ordering::Relaxed),
         crate::session::coord_sync::transport_rung_drain_dropped(),
         crate::session::coord_transport_rung::outbox_write_failed_total(),
         emitter.as_ref().map(|e| e.outbox_cap_evicted()),
@@ -3444,6 +3485,28 @@ fn hand_off_transport_rung(
     door: &str,
     caller_session_id: Option<uuid::Uuid>,
 ) {
+    // Pure delegation — see `record_event_lane_miss`.
+    hand_off_transport_rung_in(
+        &TRANSPORT_RUNG,
+        emitter,
+        lane,
+        headers,
+        body,
+        door,
+        caller_session_id,
+    )
+}
+
+/// [`hand_off_transport_rung`] against an explicit counter set.
+fn hand_off_transport_rung_in(
+    counters: &TransportRungCounters,
+    emitter: Arc<crate::session::coord_transport_rung::RungEmitter>,
+    lane: uuid::Uuid,
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+    door: &str,
+    caller_session_id: Option<uuid::Uuid>,
+) {
     use crate::session::coord_transport_rung as rung;
 
     let hdr = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
@@ -3474,7 +3537,7 @@ fn hand_off_transport_rung(
     // snapshot can never read `outboxWriteFailed > emitted`. An append that
     // then fails is arm (c), counted by the emitter itself as
     // `outboxWriteFailed`.
-    transport_rung_emitted_counter().fetch_add(1, Ordering::Relaxed);
+    counters.emitted.fetch_add(1, Ordering::Relaxed);
     tokio::task::spawn_blocking(move || emitter.emit(lane, &obs));
 }
 
@@ -5239,25 +5302,61 @@ impl MemoryEnrichOutcome {
 /// Sized from `ALL` rather than a repeated literal. Adding a variant already
 /// fails to compile twice over (the exhaustive `idx()` match, the `[Self; N]`
 /// literal), but a hand-written length here would still compile at the OLD
-/// size and then panic on `counters()[idx()]` — index-out-of-bounds, inside the
+/// size and then panic on `counters[idx()]` — index-out-of-bounds, inside the
 /// proxy's request path, i.e. a 500 on a memory search. That is the one failure
 /// this whole arm is built to make impossible. Deriving the length turns it
 /// back into a compile error.
-fn memory_enrich_counters() -> &'static [std::sync::atomic::AtomicU64; MEMORY_ENRICH_SERIES] {
-    static COUNTERS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; MEMORY_ENRICH_SERIES]> =
-        std::sync::OnceLock::new();
-    COUNTERS.get_or_init(Default::default)
+///
+/// A struct rather than a bare array so the counters have an IDENTITY: a test
+/// owns a private `MemoryEnrichCounters::new()` and drives
+/// [`enrich_memory_search_body_with`] against it, while production charges
+/// every call to the single [`MEMORY_ENRICH`] static through the one-line
+/// delegations below — the `LaneTable` shape in `wedge_diagnostics.rs` and the
+/// `TraceRing` shape in `outbound_trace.rs`. Before this the array was a
+/// process-global `OnceLock` that every test of the binary bumped, and the
+/// module's counter-delta tests raced each other (measured red 7/20 in the
+/// suite, 0/6 alone: plan `2026-09-17-runner-tests-share-in-process-mutable-state`).
+/// The `_in` functions that do the work are module-private, so no production
+/// call site can choose a counter set; `the_public_enrich_api_only_delegates`
+/// pins the delegation.
+struct MemoryEnrichCounters([std::sync::atomic::AtomicU64; MEMORY_ENRICH_SERIES]);
+
+impl MemoryEnrichCounters {
+    /// `const` so the static needs no `OnceLock`. `[AtomicU64; N]` has no
+    /// const `Default`, which is the only reason the lazy init ever existed;
+    /// an inline-`const` element repeated is the spelling that works (a named
+    /// `const ZERO: AtomicU64` trips `declare_interior_mutable_const`, which
+    /// this crate denies) — `LaneTable::new` in `wedge_diagnostics.rs` does
+    /// the same.
+    const fn new() -> Self {
+        Self([const { std::sync::atomic::AtomicU64::new(0) }; MEMORY_ENRICH_SERIES])
+    }
 }
+
+/// The process-global enrichment counters — the ones every production call
+/// is charged to.
+static MEMORY_ENRICH: MemoryEnrichCounters = MemoryEnrichCounters::new();
 
 /// Number of enrichment counter slots — one per [`MemoryEnrichOutcome`].
 const MEMORY_ENRICH_SERIES: usize = MemoryEnrichOutcome::ALL.len();
 
-fn record_memory_enrich_outcome(outcome: MemoryEnrichOutcome) {
-    memory_enrich_counters()[outcome.idx()].fetch_add(1, Ordering::Relaxed);
+/// Count one outcome into `counters`.
+fn record_memory_enrich_outcome_in(counters: &MemoryEnrichCounters, outcome: MemoryEnrichOutcome) {
+    counters.0[outcome.idx()].fetch_add(1, Ordering::Relaxed);
 }
 
 /// Snapshot of the enrichment counters for `GET /health`.
 pub(crate) fn memory_enrich_health_snapshot() -> serde_json::Value {
+    // A PURE DELEGATION, and load-bearing as such: the logic lives in the `_in`
+    // function, which the tests exercise against a private counter set, so the
+    // code production calls is the code the tests cover.
+    // `the_public_enrich_api_only_delegates` pins the shape so a second global
+    // cannot creep back into this wrapper.
+    memory_enrich_health_snapshot_in(&MEMORY_ENRICH)
+}
+
+/// [`memory_enrich_health_snapshot`] against an explicit counter set.
+fn memory_enrich_health_snapshot_in(counters: &MemoryEnrichCounters) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     for outcome in MemoryEnrichOutcome::ALL {
         // Keyed on `idx()`, NOT on position in `ALL`. Writes go through
@@ -5267,7 +5366,7 @@ pub(crate) fn memory_enrich_health_snapshot() -> serde_json::Value {
         // via the same function; `all_labels_read_back_their_own_slot` pins it.
         obj.insert(
             outcome.label().to_string(),
-            serde_json::json!(memory_enrich_counters()[outcome.idx()].load(Ordering::Relaxed)),
+            serde_json::json!(counters.0[outcome.idx()].load(Ordering::Relaxed)),
         );
     }
     serde_json::Value::Object(obj)
@@ -5408,11 +5507,12 @@ fn strip_query_embedding_pair(parsed: &mut serde_json::Value) -> bool {
 /// when the caller left a half-pair behind that coord would refuse — the whole
 /// point of the degrade path is that the search still returns FTS hits.
 fn degraded_body(
+    counters: &MemoryEnrichCounters,
     parsed: &mut serde_json::Value,
     needs_cleanup: bool,
     outcome: MemoryEnrichOutcome,
 ) -> Option<Vec<u8>> {
-    record_memory_enrich_outcome(outcome);
+    record_memory_enrich_outcome_in(counters, outcome);
     if !needs_cleanup || !strip_query_embedding_pair(parsed) {
         return None;
     }
@@ -5459,7 +5559,9 @@ fn inject_query_embedding(parsed: &mut serde_json::Value, embedding: Vec<f32>) -
 /// wrong move for a body carrying a lone/`null` half-pair: coord refuses those,
 /// so degrading correctly means stripping them rather than preserving bytes.
 async fn enrich_memory_search_body(body: &[u8]) -> Option<Vec<u8>> {
-    enrich_memory_search_body_with(body, None, None).await
+    // Pure delegation — see `memory_enrich_health_snapshot`. The counters are
+    // the process-global set; a test passes its own.
+    enrich_memory_search_body_with(&MEMORY_ENRICH, body, None, None).await
 }
 
 /// The process-wide embedding client.
@@ -5481,12 +5583,18 @@ fn shared_embed_client() -> &'static crate::database::embedding_client::Embeddin
 /// this machine happens to be running the real one. Same shape as the sibling
 /// `retrieve_tenant_memory_at`.
 ///
+/// `counters` is the set every outcome of this call is counted into — all
+/// three recorder sites (the two below and [`degraded_body`]) charge it, so a
+/// test owning a private [`MemoryEnrichCounters`] reads exact deltas with no
+/// sibling test in the picture.
+///
 /// `budget` overrides [`MEMORY_EMBED_TIMEOUT`]. Production always passes
 /// `None`; a test that drives a REAL local service needs a generous one,
 /// because asserting the injected vector under a 150 ms ceiling would be
 /// asserting the machine's load, not the code — the same latency-flake class
 /// that made the earlier counter-delta test unreliable.
 async fn enrich_memory_search_body_with(
+    counters: &MemoryEnrichCounters,
     body: &[u8],
     client: Option<&crate::database::embedding_client::EmbeddingClient>,
     budget: Option<std::time::Duration>,
@@ -5497,7 +5605,7 @@ async fn enrich_memory_search_body_with(
         MemorySearchShape::Skip {
             outcome,
             needs_cleanup,
-        } => return degraded_body(&mut parsed, needs_cleanup, outcome),
+        } => return degraded_body(counters, &mut parsed, needs_cleanup, outcome),
         MemorySearchShape::Enrichable {
             query_text,
             needs_cleanup,
@@ -5538,6 +5646,7 @@ async fn enrich_memory_search_body_with(
                  forwarding search FTS-only"
             );
             return degraded_body(
+                counters,
                 &mut parsed,
                 needs_cleanup,
                 MemoryEnrichOutcome::SkippedDimension,
@@ -5549,6 +5658,7 @@ async fn enrich_memory_search_body_with(
                 "coord-mcp proxy: query embed failed — forwarding search FTS-only"
             );
             return degraded_body(
+                counters,
                 &mut parsed,
                 needs_cleanup,
                 MemoryEnrichOutcome::SkippedUnavailable,
@@ -5560,6 +5670,7 @@ async fn enrich_memory_search_body_with(
                 "coord-mcp proxy: query embed timed out — forwarding search FTS-only"
             );
             return degraded_body(
+                counters,
                 &mut parsed,
                 needs_cleanup,
                 MemoryEnrichOutcome::SkippedTimeout,
@@ -5569,6 +5680,7 @@ async fn enrich_memory_search_body_with(
 
     if !inject_query_embedding(&mut parsed, embedding) {
         return degraded_body(
+            counters,
             &mut parsed,
             needs_cleanup,
             MemoryEnrichOutcome::SkippedParse,
@@ -5576,7 +5688,7 @@ async fn enrich_memory_search_body_with(
     }
     match serde_json::to_vec(&parsed) {
         Ok(bytes) => {
-            record_memory_enrich_outcome(MemoryEnrichOutcome::Enriched);
+            record_memory_enrich_outcome_in(counters, MemoryEnrichOutcome::Enriched);
             Some(bytes)
         }
         Err(e) => {
@@ -5584,7 +5696,7 @@ async fn enrich_memory_search_body_with(
                 error = %e,
                 "coord-mcp proxy: enriched body failed to serialize — forwarding original"
             );
-            record_memory_enrich_outcome(MemoryEnrichOutcome::SkippedParse);
+            record_memory_enrich_outcome_in(counters, MemoryEnrichOutcome::SkippedParse);
             None
         }
     }
@@ -12273,25 +12385,18 @@ mod window_getter_single_flight_tests {
 #[cfg(test)]
 mod transport_rung_counter_tests {
     use super::{
-        hand_off_transport_rung, record_event_lane_miss, transport_rung_emitted_counter,
-        transport_rung_health_snapshot, transport_rung_lane_miss_counters,
-        transport_rung_snapshot_from, EventLaneMiss, LANE_MISS_SLOTS,
+        hand_off_transport_rung_in, record_event_lane_miss_in, transport_rung_health_snapshot,
+        transport_rung_health_snapshot_in, transport_rung_snapshot_from, EventLaneMiss,
+        TransportRungCounters, LANE_MISS_SLOTS,
     };
     use std::sync::atomic::Ordering;
 
-    /// The lane-miss counters are process-wide and the per-variant tests each
-    /// assert that NO OTHER series moved, so they serialise on one lock —
-    /// same defect class and same remedy as `series_lock` in the memory-search
-    /// tests below.
-    fn series_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn lane_miss_series() -> Vec<(&'static str, u64)> {
-        let snap = transport_rung_health_snapshot();
+    /// The lane-miss series of a PRIVATE counter set, read through the same
+    /// renderer `GET /health` uses. Each test owns its counters, so the
+    /// per-variant tests below assert "NO OTHER series moved" against a set no
+    /// sibling test can touch — there is no module lock left to forget.
+    fn lane_miss_series(counters: &TransportRungCounters) -> Vec<(&'static str, u64)> {
+        let snap = transport_rung_health_snapshot_in(counters);
         let obj = snap["laneMiss"]
             .as_object()
             .expect("laneMiss must be an object");
@@ -12303,14 +12408,15 @@ mod transport_rung_counter_tests {
 
     /// One miss of `miss` moves exactly its own `/health` series by one.
     fn assert_only_this_series_moves(miss: EventLaneMiss) {
-        let _guard = series_lock();
-        let before = lane_miss_series();
-        record_event_lane_miss(
+        let counters = TransportRungCounters::new();
+        let before = lane_miss_series(&counters);
+        record_event_lane_miss_in(
+            &counters,
             miss,
             "https://coord.qontinui.io/mcp",
             Some("nonce-abcdef-1234"),
         );
-        let after = lane_miss_series();
+        let after = lane_miss_series(&counters);
         for ((label, b), (_, a)) in before.iter().zip(after.iter()) {
             let expected = if *label == miss.as_str() { b + 1 } else { *b };
             assert_eq!(
@@ -12384,7 +12490,7 @@ mod transport_rung_counter_tests {
             "duplicate lane-miss label"
         );
         assert_eq!(
-            transport_rung_lane_miss_counters().len(),
+            TransportRungCounters::new().lane_miss.len(),
             EventLaneMiss::ALL.len()
         );
     }
@@ -12471,8 +12577,10 @@ mod transport_rung_counter_tests {
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(TRANSPORT_HEADER, "loopback_proxy".parse().unwrap());
 
-        let before = transport_rung_emitted_counter().load(Ordering::Relaxed);
-        hand_off_transport_rung(
+        let counters = TransportRungCounters::new();
+        let before = counters.emitted.load(Ordering::Relaxed);
+        hand_off_transport_rung_in(
+            &counters,
             emitter,
             lane,
             &headers,
@@ -12481,12 +12589,12 @@ mod transport_rung_counter_tests {
             None,
         );
         assert_eq!(
-            transport_rung_emitted_counter().load(Ordering::Relaxed),
+            counters.emitted.load(Ordering::Relaxed),
             before + 1,
             "one hand-off moves `emitted` by one"
         );
         assert_eq!(
-            transport_rung_health_snapshot()["emitted"].as_u64(),
+            transport_rung_health_snapshot_in(&counters)["emitted"].as_u64(),
             Some(before + 1),
             "GET /health transportRung.emitted reads the same counter"
         );
@@ -13874,8 +13982,8 @@ mod self_id_chain_tests {
 #[cfg(test)]
 mod memory_search_enrichment_tests {
     use super::{
-        classify_memory_search, inject_query_embedding, memory_enrich_health_snapshot,
-        MemoryEnrichOutcome, MemorySearchShape, MEMORY_EMBED_TIMEOUT,
+        classify_memory_search, inject_query_embedding, memory_enrich_health_snapshot_in,
+        MemoryEnrichCounters, MemoryEnrichOutcome, MemorySearchShape, MEMORY_EMBED_TIMEOUT,
     };
     use serde_json::json;
 
@@ -14027,7 +14135,9 @@ mod memory_search_enrichment_tests {
         let client =
             crate::database::embedding_client::EmbeddingClient::with_url("http://127.0.0.1:1/none");
         let body = serde_json::to_vec(&search_call(json!({"query_text": "login"}))).unwrap();
-        let out = super::enrich_memory_search_body_with(&body, Some(&client), None).await;
+        let counters = MemoryEnrichCounters::new();
+        let out =
+            super::enrich_memory_search_body_with(&counters, &body, Some(&client), None).await;
         assert!(
             out.is_none(),
             "a dead embedder must forward the original bytes, not fail the search"
@@ -14036,22 +14146,15 @@ mod memory_search_enrichment_tests {
 
     /// The outcome→series mapping itself, which nothing else covers: a wrong
     /// `idx()` would silently inflate `enriched` — the one series meant to be
-    /// positive proof the arm is firing. Counters are process-global, so this
-    /// asserts a DELTA rather than an absolute.
+    /// positive proof the arm is firing. The counters are this test's own
+    /// instance, so the deltas are EXACT: no sibling test can touch them.
+    /// (This test was the census's `SUITE-ONLY` red — 7/20 in the suite, 0/6
+    /// alone — when the counters were one process-global array and the
+    /// module's `series_lock()` was taken only by the tests that opted in.)
     #[tokio::test(flavor = "multi_thread")]
     async fn a_skip_lands_in_its_own_series_and_not_in_enriched() {
-        // Same serialisation as the other two counter-delta tests in this
-        // module: these assertions are a BEFORE/AFTER read of process-global
-        // atomics, so a sibling test incrementing `enriched` between the two
-        // reads fails this one. Without it the suite carries a latent race —
-        // observed failing here with left: 1, right: 0.
-        let _serialised = series_lock();
-        let read = |k: &str| {
-            memory_enrich_health_snapshot()
-                .get(k)
-                .and_then(|v| v.as_u64())
-                .expect("series must exist")
-        };
+        let counters = MemoryEnrichCounters::new();
+        let read = |k: &str| read_series(&counters, k);
         let before_present = read("skipped_present");
         let before_enriched = read("enriched");
 
@@ -14068,12 +14171,14 @@ mod memory_search_enrichment_tests {
             "query_embedding": [0.1, 0.2],
         })))
         .unwrap();
-        let out = super::enrich_memory_search_body_with(&body, Some(&client), None).await;
+        let out =
+            super::enrich_memory_search_body_with(&counters, &body, Some(&client), None).await;
 
         assert!(out.is_none(), "a caller-supplied vector is left alone");
-        assert!(
-            read("skipped_present") >= before_present + 1,
-            "the skip must land in its OWN series"
+        assert_eq!(
+            read("skipped_present"),
+            before_present + 1,
+            "the skip must land in its OWN series, exactly once"
         );
         assert_eq!(
             read("enriched"),
@@ -14151,6 +14256,7 @@ mod memory_search_enrichment_tests {
     /// degrade path must hand back a CLEANED body, not the original.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_degrade_strips_a_half_pair_so_coord_still_accepts_the_search() {
+        let counters = MemoryEnrichCounters::new();
         let client =
             crate::database::embedding_client::EmbeddingClient::with_url("http://127.0.0.1:1/none");
 
@@ -14162,7 +14268,7 @@ mod memory_search_enrichment_tests {
                    "query_embedding_model": serde_json::Value::Null}),
         ] {
             let body = serde_json::to_vec(&search_call(args.clone())).unwrap();
-            let out = super::enrich_memory_search_body_with(&body, Some(&client), None)
+            let out = super::enrich_memory_search_body_with(&counters, &body, Some(&client), None)
                 .await
                 .unwrap_or_else(|| {
                     panic!("a half-pair body must be CLEANED on degrade, not forwarded: {args}")
@@ -14186,11 +14292,12 @@ mod memory_search_enrichment_tests {
     /// nothing to strip, so nothing may be rewritten.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_degrade_on_a_clean_body_forwards_the_original_bytes() {
+        let counters = MemoryEnrichCounters::new();
         let client =
             crate::database::embedding_client::EmbeddingClient::with_url("http://127.0.0.1:1/none");
         let body = serde_json::to_vec(&search_call(json!({"query_text": "login"}))).unwrap();
         assert!(
-            super::enrich_memory_search_body_with(&body, Some(&client), None)
+            super::enrich_memory_search_body_with(&counters, &body, Some(&client), None)
                 .await
                 .is_none(),
             "nothing to clean ⇒ forward the original bytes"
@@ -14206,6 +14313,7 @@ mod memory_search_enrichment_tests {
     /// makes the leftover fatal, and this path never enriches.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_classifier_skip_also_strips_a_half_pair() {
+        let counters = MemoryEnrichCounters::new();
         // Never reached: the skip is decided before any embed.
         let client =
             crate::database::embedding_client::EmbeddingClient::with_url("http://127.0.0.1:1/none");
@@ -14217,7 +14325,7 @@ mod memory_search_enrichment_tests {
             json!({"query_embedding": serde_json::Value::Null}),
         ] {
             let body = serde_json::to_vec(&search_call(args.clone())).unwrap();
-            let out = super::enrich_memory_search_body_with(&body, Some(&client), None)
+            let out = super::enrich_memory_search_body_with(&counters, &body, Some(&client), None)
                 .await
                 .unwrap_or_else(|| {
                     panic!("an unenrichable body must still be CLEANED, not forwarded: {args}")
@@ -14238,6 +14346,7 @@ mod memory_search_enrichment_tests {
     /// silently downgrade a semantic search they explicitly asked for.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_caller_supplied_vector_survives_the_skip() {
+        let counters = MemoryEnrichCounters::new();
         let client =
             crate::database::embedding_client::EmbeddingClient::with_url("http://127.0.0.1:1/none");
         let body = serde_json::to_vec(&search_call(json!({
@@ -14247,7 +14356,7 @@ mod memory_search_enrichment_tests {
         })))
         .unwrap();
         assert!(
-            super::enrich_memory_search_body_with(&body, Some(&client), None)
+            super::enrich_memory_search_body_with(&counters, &body, Some(&client), None)
                 .await
                 .is_none(),
             "the caller's own pair is theirs — forward the original bytes"
@@ -14258,12 +14367,13 @@ mod memory_search_enrichment_tests {
     /// byte-identical: the cleanup is keyed on the half-pair, not on the skip.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_classifier_skip_with_nothing_to_strip_forwards_the_original() {
+        let counters = MemoryEnrichCounters::new();
         let client =
             crate::database::embedding_client::EmbeddingClient::with_url("http://127.0.0.1:1/none");
         for args in [json!({"limit": 5}), json!({"query_text": "   "})] {
             let body = serde_json::to_vec(&search_call(args.clone())).unwrap();
             assert!(
-                super::enrich_memory_search_body_with(&body, Some(&client), None)
+                super::enrich_memory_search_body_with(&counters, &body, Some(&client), None)
                     .await
                     .is_none(),
                 "nothing to clean ⇒ forward the original bytes: {args}"
@@ -14277,14 +14387,18 @@ mod memory_search_enrichment_tests {
     /// one outcome this arm exists to rule out.
     #[test]
     fn every_outcome_has_a_counter_slot() {
+        let counters = MemoryEnrichCounters::new();
         assert_eq!(
-            super::memory_enrich_counters().len(),
+            counters.0.len(),
             MemoryEnrichOutcome::ALL.len(),
             "one counter per outcome"
         );
         for outcome in MemoryEnrichOutcome::ALL {
-            let _ = super::memory_enrich_counters()[outcome.idx()]
-                .load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                counters.0[outcome.idx()].load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "a fresh counter set starts every slot at zero"
+            );
         }
     }
 
@@ -14334,35 +14448,16 @@ mod memory_search_enrichment_tests {
     /// `the_embed_budget_is_far_below_the_clients_own_timeout`.
     const LIVE_BUDGET: Option<std::time::Duration> = Some(std::time::Duration::from_secs(5));
 
-    fn read_series(k: &str) -> u64 {
-        memory_enrich_health_snapshot()
+    /// One series of a PRIVATE counter set, read through the same renderer
+    /// `GET /health` uses. There is no module lock here any more: each test
+    /// owns its counters, so there is nothing shared left to serialise — the
+    /// former `series_lock()` was taken only by the tests that opted in, and
+    /// the one that did not was the census's `SUITE-ONLY` red.
+    fn read_series(counters: &MemoryEnrichCounters, k: &str) -> u64 {
+        memory_enrich_health_snapshot_in(counters)
             .get(k)
             .and_then(|v| v.as_u64())
             .expect("series must exist")
-    }
-
-    /// Serialise the tests that assert on the PROCESS-GLOBAL enrichment series.
-    ///
-    /// `memory_enrich_health_snapshot()` is cumulative and process-wide, so
-    /// `a_wrong_width_answer_degrades_instead_of_being_injected` — which asserts
-    /// `enriched` did NOT move — races
-    /// `an_answering_embedder_injects_the_pair_and_counts_it_enriched`, which
-    /// moves exactly that counter. The failure is ORDER-DEPENDENT: both pass in
-    /// isolation and under `--test-threads=1`, and fail only when the two land
-    /// in the same parallel window, which is why it reads as a flake rather
-    /// than as the shared-state bug it is.
-    ///
-    /// Same defect and same remedy as `device_jwt_refresher`'s `health_lock`
-    /// (commit `4ea9a9e61`) — a second instance of the class in a second
-    /// module, so the lock is copied rather than re-derived.
-    fn series_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            // A sibling test panicking inside the guard must not cascade into
-            // every other test in the module; the counters it protects are
-            // read-and-compare, so a poisoned guard is still usable.
-            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// (d) The success path end-to-end: an answering embedder produces a body
@@ -14371,15 +14466,16 @@ mod memory_search_enrichment_tests {
     /// asserted on `inject_query_embedding` in isolation.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_answering_embedder_injects_the_pair_and_counts_it_enriched() {
-        let _serialised = series_lock();
+        let counters = MemoryEnrichCounters::new();
         let url = spawn_embedder(crate::database::embeddings::EMBEDDING_DIM).await;
         let client = crate::database::embedding_client::EmbeddingClient::with_url(&url);
         let body = serde_json::to_vec(&search_call(json!({"query_text": "login"}))).unwrap();
-        let before = read_series("enriched");
+        let before = read_series(&counters, "enriched");
 
-        let out = super::enrich_memory_search_body_with(&body, Some(&client), LIVE_BUDGET)
-            .await
-            .expect("an answering embedder must rewrite the body");
+        let out =
+            super::enrich_memory_search_body_with(&counters, &body, Some(&client), LIVE_BUDGET)
+                .await
+                .expect("an answering embedder must rewrite the body");
 
         let sent: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let args = &sent["params"]["arguments"];
@@ -14392,9 +14488,10 @@ mod memory_search_enrichment_tests {
             crate::database::embedding_client::EMBEDDING_MODEL_TAG
         );
         assert_eq!(args["query_text"], "login", "the query itself survives");
-        assert!(
-            read_series("enriched") >= before + 1,
-            "the one series that is positive proof the arm fired must move"
+        assert_eq!(
+            read_series(&counters, "enriched"),
+            before + 1,
+            "the one series that is positive proof the arm fired must move, exactly once"
         );
     }
 
@@ -14404,26 +14501,27 @@ mod memory_search_enrichment_tests {
     /// healthy. It must degrade, and land in its OWN series.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_wrong_width_answer_degrades_instead_of_being_injected() {
-        let _serialised = series_lock();
+        let counters = MemoryEnrichCounters::new();
         let url = spawn_embedder(crate::database::embeddings::EMBEDDING_DIM / 2).await;
         let client = crate::database::embedding_client::EmbeddingClient::with_url(&url);
         let body = serde_json::to_vec(&search_call(json!({"query_text": "login"}))).unwrap();
-        let before_dim = read_series("skipped_dimension");
-        let before_enriched = read_series("enriched");
+        let before_dim = read_series(&counters, "skipped_dimension");
+        let before_enriched = read_series(&counters, "enriched");
 
         assert!(
-            super::enrich_memory_search_body_with(&body, Some(&client), LIVE_BUDGET)
+            super::enrich_memory_search_body_with(&counters, &body, Some(&client), LIVE_BUDGET)
                 .await
                 .is_none(),
             "a foreign-width vector must NOT be injected; a clean body degrades \
              by forwarding its original bytes"
         );
-        assert!(
-            read_series("skipped_dimension") >= before_dim + 1,
-            "the width refusal must be visible as its own series"
+        assert_eq!(
+            read_series(&counters, "skipped_dimension"),
+            before_dim + 1,
+            "the width refusal must be visible as its own series, exactly once"
         );
         assert_eq!(
-            read_series("enriched"),
+            read_series(&counters, "enriched"),
             before_enriched,
             "counting a width refusal as `enriched` is the exact lie this \
              series exists to prevent"
@@ -14443,9 +14541,11 @@ mod memory_search_enrichment_tests {
         })))
         .unwrap();
 
-        let out = super::enrich_memory_search_body_with(&body, Some(&client), LIVE_BUDGET)
-            .await
-            .expect("a half-pair body must be cleaned on the dimension degrade too");
+        let counters = MemoryEnrichCounters::new();
+        let out =
+            super::enrich_memory_search_body_with(&counters, &body, Some(&client), LIVE_BUDGET)
+                .await
+                .expect("a half-pair body must be cleaned on the dimension degrade too");
         let sent: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let args = &sent["params"]["arguments"];
         assert!(
@@ -14459,6 +14559,7 @@ mod memory_search_enrichment_tests {
     /// the embedder at all.
     #[tokio::test(flavor = "multi_thread")]
     async fn non_search_traffic_is_returned_untouched() {
+        let counters = MemoryEnrichCounters::new();
         let client =
             crate::database::embedding_client::EmbeddingClient::with_url("http://127.0.0.1:1/none");
         let body = serde_json::to_vec(&json!({
@@ -14466,7 +14567,7 @@ mod memory_search_enrichment_tests {
         }))
         .unwrap();
         assert!(
-            super::enrich_memory_search_body_with(&body, Some(&client), None)
+            super::enrich_memory_search_body_with(&counters, &body, Some(&client), None)
                 .await
                 .is_none()
         );
@@ -14488,12 +14589,13 @@ mod memory_search_enrichment_tests {
     /// ambiguity the counters exist to remove.
     #[test]
     fn health_snapshot_renders_every_series() {
-        let snap = memory_enrich_health_snapshot();
+        let snap = memory_enrich_health_snapshot_in(&MemoryEnrichCounters::new());
         let obj = snap.as_object().expect("snapshot must be an object");
         for outcome in MemoryEnrichOutcome::ALL {
-            assert!(
-                obj.contains_key(outcome.label()),
-                "missing series: {}",
+            assert_eq!(
+                obj.get(outcome.label()).and_then(|v| v.as_u64()),
+                Some(0),
+                "missing or non-zero series on a fresh counter set: {}",
                 outcome.label()
             );
         }
@@ -14519,6 +14621,262 @@ mod memory_search_enrichment_tests {
             v["params"]["name"] = serde_json::Value::String(name.to_string());
             v
         }
+    }
+}
+
+/// Source pins for the per-test counter handles in this file.
+///
+/// The same pin `outbound_trace::the_public_ring_api_only_delegates` carries
+/// for the trace ring (Phase 2 of plan
+/// `2026-09-17-runner-tests-share-in-process-mutable-state`). A counter family
+/// became a per-test handle because its process-global array raced its own
+/// tests; the pin is what stops the global from creeping back in behind a
+/// wrapper that still reads as a one-liner.
+#[cfg(test)]
+mod counter_handle_pins {
+    fn prod_part(src: &str) -> &str {
+        src.split_once("\n#[cfg(test)]\nmod ")
+            .map_or(src, |(before, _)| before)
+    }
+    fn squeezed_code(src: &str) -> String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(|l| l.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+    /// Every `static` declaration in `src`, as its line with the leading
+    /// visibility stripped — `pub static`, `pub(crate) static`,
+    /// `pub(super) static`, `pub(in path) static` all read as `static …`, so a
+    /// second global reintroduced with a visibility does not slip past a
+    /// `starts_with("static ")` check (a pre-PR review found exactly that
+    /// hole). Whole-line comments are skipped, since the docs here name
+    /// `static` in prose.
+    fn declared_statics(src: &str) -> Vec<&str> {
+        src.lines()
+            .map(str::trim_start)
+            .filter(|l| !l.starts_with("//"))
+            .filter_map(|l| {
+                let rest = if let Some(after) = l.strip_prefix("pub") {
+                    // `pub`, `pub(crate)`, `pub(super)`, `pub(in a::b)`.
+                    let after = after.trim_start();
+                    let after = match after.strip_prefix('(') {
+                        Some(inner) => inner.split_once(')').map(|(_, r)| r)?,
+                        None => after,
+                    };
+                    after.trim_start()
+                } else {
+                    l
+                };
+                rest.starts_with("static ").then_some(rest)
+            })
+            .collect()
+    }
+
+    /// The mutant the visibility-stripping exists for: a second global
+    /// reintroduced as `pub static` / `pub(crate) static` / `pub(in …) static`
+    /// is SEEN, so the one-static assertion above goes red on it. A doc line
+    /// naming `static` in prose is not.
+    #[test]
+    fn a_static_behind_a_visibility_is_still_a_static() {
+        const MUTANT: &str = "\
+/// a doc that says static in prose
+static ONE: T = T::new();
+pub static SEQ: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static TWO: T = T::new();
+pub(super) static THREE: T = T::new();
+pub(in crate::x) static FOUR: T = T::new();
+fn not_a_static() {}
+// static in a comment
+";
+        assert_eq!(
+            declared_statics(MUTANT),
+            vec![
+                "static ONE: T = T::new();",
+                "static SEQ: AtomicU64 = AtomicU64::new(0);",
+                "static TWO: T = T::new();",
+                "static THREE: T = T::new();",
+                "static FOUR: T = T::new();",
+            ]
+        );
+    }
+
+    fn wrapper_body<'a>(prod: &'a str, signature: &str) -> (&'a str, String) {
+        let start = prod.find(signature).unwrap_or_else(|| {
+            panic!(
+                "this pin could not find `{signature}` in the production half of \
+                 this module. If the wrapper was renamed or its signature \
+                 reformatted, update this pin in the same change — otherwise it \
+                 silently stops guarding anything."
+            )
+        });
+        let body_start = start
+            + prod[start..]
+                .find('{')
+                .expect("the wrapper must have a body");
+        let body_end = body_start
+            + prod[body_start..]
+                .find("\n}\n")
+                .expect("the wrapper's body must be closed at column 0");
+        let raw = &prod[body_start..body_end];
+        let squeezed = squeezed_code(raw);
+        // Both bounds, loose on top: a collapsed slice asserts nothing, and a
+        // slice that ran away past several fns is a parse failure rather than
+        // an edit (a 3-line own body squeezes to ~140 chars; a real delegation
+        // to ~40–80).
+        assert!(
+            (10..1000).contains(&squeezed.len()),
+            "the pin sliced a {}-char body out of `{signature}` — it is \
+             mis-parsing, and in one direction or the other that leaves it \
+             vacuous. Raw slice:\n{raw}",
+            squeezed.len()
+        );
+        (raw, squeezed)
+    }
+
+    /// The two production entry points are pure delegations to the `_in`
+    /// functions against the ONE `MEMORY_ENRICH` static; the counter block
+    /// declares no other static and no `OnceLock`; and nothing else in the
+    /// production half names the static — every recorder site takes the
+    /// counters as a parameter, which is what lets a test own a private set.
+    #[test]
+    fn the_public_enrich_api_only_delegates() {
+        const SRC: &str = include_str!("mcp_api.rs");
+        let prod = prod_part(SRC);
+        assert!(
+            prod.len() < SRC.len(),
+            "the production half must be a strict prefix: this file has test modules"
+        );
+
+        for (signature, expected) in [
+            (
+                "pub(crate) fn memory_enrich_health_snapshot() -> serde_json::Value",
+                "memory_enrich_health_snapshot_in(&MEMORY_ENRICH)",
+            ),
+            (
+                "async fn enrich_memory_search_body(body: &[u8]) -> Option<Vec<u8>>",
+                "enrich_memory_search_body_with(&MEMORY_ENRICH,body,None,None).await",
+            ),
+        ] {
+            let (raw, body) = wrapper_body(prod, signature);
+            assert_eq!(
+                body,
+                format!("{{{expected}"),
+                "`{signature}` is no longer a pure delegation to `{expected}`. If \
+                 this is a deliberate signature change and the wrapper is STILL a \
+                 one-line delegation, update this pin's expected spelling in the \
+                 same change. Body is now:\n{raw}"
+            );
+        }
+
+        // The counter block — from the struct to the first fn that consumes
+        // it — declares exactly ONE static. A second one, or an `OnceLock`
+        // anywhere in it, is the shared global this handle exists to prevent.
+        let block_start = prod
+            .find("struct MemoryEnrichCounters(")
+            .expect("the counter struct must be in the production half");
+        let block_end = block_start
+            + prod[block_start..]
+                .find("\nfn degraded_body(")
+                .expect("`degraded_body` must follow the counter block");
+        let block = &prod[block_start..block_end];
+        let statics = declared_statics(block);
+        assert_eq!(
+            statics,
+            vec!["static MEMORY_ENRICH: MemoryEnrichCounters = MemoryEnrichCounters::new();"],
+            "the counter block must declare exactly one static, `MEMORY_ENRICH`. A \
+             second one is shared mutable state that every test of this binary \
+             would see again; give it a slot on `MemoryEnrichCounters` instead. \
+             Found:\n{}",
+            statics.join("\n")
+        );
+        // Comments stripped first: the struct's own doc names `OnceLock` in
+        // prose to explain why there is none.
+        assert!(
+            !squeezed_code(block).contains("OnceLock"),
+            "`OnceLock` is back in the counter block — `MemoryEnrichCounters::new` \
+             is `const`, so the static needs no lazy init"
+        );
+
+        // Only the two wrappers may name the static. A recorder that reaches
+        // `MEMORY_ENRICH` directly is one a private counter set cannot see,
+        // and the exact-delta tests above go back to racing it.
+        let mentions = squeezed_code(prod).matches("&MEMORY_ENRICH").count();
+        assert_eq!(
+            mentions, 2,
+            "`&MEMORY_ENRICH` is named {mentions} times in the production half; \
+             exactly 2 are allowed (the two delegating wrappers). Every other \
+             site takes `counters: &MemoryEnrichCounters` as a parameter."
+        );
+        assert!(
+            !squeezed_code(prod).contains("fnrecord_memory_enrich_outcome("),
+            "a global-bound `record_memory_enrich_outcome()` is back; the only \
+             recorder is `record_memory_enrich_outcome_in(counters, …)`"
+        );
+    }
+
+    /// The transport-rung family, same contract: three delegating wrappers,
+    /// one static, no `OnceLock`, and nothing else in the production half
+    /// names the static.
+    #[test]
+    fn the_public_transport_rung_api_only_delegates() {
+        const SRC: &str = include_str!("mcp_api.rs");
+        let prod = prod_part(SRC);
+
+        for (signature, expected) in [
+            (
+                "fn record_event_lane_miss(miss: EventLaneMiss, door: &str, nonce: Option<&str>)",
+                "record_event_lane_miss_in(&TRANSPORT_RUNG,miss,door,nonce)",
+            ),
+            (
+                "pub(crate) fn transport_rung_health_snapshot() -> serde_json::Value",
+                "transport_rung_health_snapshot_in(&TRANSPORT_RUNG)",
+            ),
+            (
+                "fn hand_off_transport_rung(\n    emitter:",
+                "hand_off_transport_rung_in(&TRANSPORT_RUNG,emitter,lane,headers,body,door,caller_session_id,)",
+            ),
+        ] {
+            let (raw, body) = wrapper_body(prod, signature);
+            assert_eq!(
+                body,
+                format!("{{{expected}"),
+                "`{signature}` is no longer a pure delegation to `{expected}`. If \
+                 this is a deliberate signature change and the wrapper is STILL a \
+                 one-line delegation, update this pin's expected spelling in the \
+                 same change. Body is now:\n{raw}"
+            );
+        }
+
+        let block_start = prod
+            .find("struct TransportRungCounters {")
+            .expect("the counter struct must be in the production half");
+        let block_end = block_start
+            + prod[block_start..]
+                .find("\nfn record_event_lane_miss(")
+                .expect("`record_event_lane_miss` must follow the counter block");
+        let block = &prod[block_start..block_end];
+        let statics = declared_statics(block);
+        assert_eq!(
+            statics,
+            vec!["static TRANSPORT_RUNG: TransportRungCounters = TransportRungCounters::new();"],
+            "the counter block must declare exactly one static, `TRANSPORT_RUNG`. \
+             Found:\n{}",
+            statics.join("\n")
+        );
+        assert!(
+            !squeezed_code(block).contains("OnceLock"),
+            "`OnceLock` is back in the transport-rung counter block — \
+             `TransportRungCounters::new` is `const`, so the static needs no lazy init"
+        );
+
+        let mentions = squeezed_code(prod).matches("&TRANSPORT_RUNG").count();
+        assert_eq!(
+            mentions, 3,
+            "`&TRANSPORT_RUNG` is named {mentions} times in the production half; \
+             exactly 3 are allowed (the three delegating wrappers). Every other \
+             site takes `counters: &TransportRungCounters` as a parameter."
+        );
     }
 }
 

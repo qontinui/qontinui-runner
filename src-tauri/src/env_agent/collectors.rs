@@ -3277,7 +3277,8 @@ fn read_shell_profiles() -> Option<String> {
 /// injectable core. Returns `None` when neither the accounts file nor any
 /// config dir is found (so the isolation driver omits the section).
 pub fn collect_claude_accounts() -> Option<Section> {
-    let config_root = dirs::config_dir()?;
+    let config_root =
+        crate::ambient::runner_platform_config_root("env_agent::collect_claude_accounts")?;
     let profiles = read_shell_profiles();
     collect_claude_accounts_from(&config_root, profiles.as_deref())
 }
@@ -4060,7 +4061,7 @@ pub fn collect_harness() -> Option<Section> {
         Some(door) => PlansDirReading::Read(door()),
         None => PlansDirReading::Unread,
     };
-    let config_root = dirs::config_dir();
+    let config_root = crate::ambient::runner_platform_config_root("env_agent::collect_harness");
     let home = dirs::home_dir();
     Some(collect_harness_under(
         &root,
