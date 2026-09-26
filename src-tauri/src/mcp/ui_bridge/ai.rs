@@ -347,40 +347,9 @@ fn default_stop_on_failure() -> bool {
     true
 }
 
-/// Result of a single planned action execution.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PlannedActionResult {
-    pub index: usize,
-    pub success: bool,
-    pub action: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resolved_element_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    #[serde(default)]
-    pub skipped_low_confidence: bool,
-    pub duration_ms: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub element_state: Option<serde_json::Value>,
-}
-
-/// Aggregated result of executing a full action plan.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ActionPlanResponse {
-    pub success: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub goal: Option<String>,
-    pub results: Vec<PlannedActionResult>,
-    pub executed_count: usize,
-    pub skipped_count: usize,
-    pub failed_count: usize,
-    pub total_duration_ms: u64,
-    /// Whether this plan was stored in the cache for future reuse
-    #[serde(default)]
-    pub cached: bool,
-}
+// The response wire types live in the lib crate so the schema-export pipeline
+// can see them — see `qontinui_runner_lib::ui_bridge_action_plan`.
+pub use qontinui_runner_lib::ui_bridge_action_plan::{ActionPlanResponse, PlannedActionResult};
 
 /// Execute a structured action plan: an ordered sequence of typed UI actions.
 pub async fn ui_bridge_execute_action_plan_handler(
