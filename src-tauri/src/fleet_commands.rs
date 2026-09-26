@@ -770,8 +770,9 @@ pub(crate) fn provision_fleet_commands_for_session(
 /// Record the registry's own capability row, `agent_commands_registry`: WHICH of
 /// [`crate::agent_commands::resolve_registry`]'s three arms answered. Takes the
 /// already-resolved registry so a provisioning pass resolves it once. Also
-/// called by `session_assets`' canonical-source arm, which writes no command
-/// but has still resolved the registry.
+/// reached through `session_assets::observe_registries` from the two arms that
+/// write no command but have still resolved the registry: `session_assets`'
+/// canonical-source arm and `isolated_edit::skip_repo_authored_claude_tree`.
 pub(crate) fn observe_commands_registry(registry: &crate::agent_commands::AgentCommandRegistry) {
     let arm = registry.resolution_arm();
     crate::capability_manifest::record_observation(
