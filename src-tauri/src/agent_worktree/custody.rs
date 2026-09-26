@@ -2067,6 +2067,36 @@ mod tests {
     }
 
     #[test]
+    fn the_mtime_preselection_keeps_the_newest_files_not_the_oldest() {
+        // More files than are ever parsed, so the pre-selection truncate
+        // actually drops some. File `i` has BOTH mtime and epoch rising with
+        // `i`, so a reversed mtime sort (or truncating the wrong end) parses
+        // the oldest `CUSTODY_MAX_SLOT_SCAN` files and returns a top occupant
+        // that is not the newest.
+        let total = CUSTODY_MAX_SLOT_SCAN + 40;
+        let tmp = primary_with_slots(&[]);
+        let slot_dir = tmp.path().join(".git").join(CUSTODY_SLOT_DIR);
+        let base = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        for i in 0..total {
+            let path = slot_dir.join(format!("s{i}.json"));
+            std::fs::write(&path, slot(&format!("s{i:04}"), 10_000 + i as i64)).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(base + std::time::Duration::from_secs(i as u64))
+                .unwrap();
+        }
+        let got = read_custody_slots(tmp.path());
+        assert_eq!(got.len(), CUSTODY_MAX_SLOTS);
+        let expected: Vec<String> = (0..CUSTODY_MAX_SLOTS)
+            .map(|k| format!("s{:04}", total - 1 - k))
+            .collect();
+        let ids: Vec<String> = got.iter().filter_map(|r| r.session_id.clone()).collect();
+        assert_eq!(ids, expected);
+    }
+
+    #[test]
     fn slots_without_an_epoch_sort_after_slots_with_one_and_are_capped() {
         let mut files: Vec<(String, String)> = (0..(CUSTODY_MAX_SLOTS as i64 + 5))
             .map(|i| (format!("s{i}.json"), slot(&format!("s{i:03}"), 100 + i)))
