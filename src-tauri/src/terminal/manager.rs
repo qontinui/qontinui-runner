@@ -756,6 +756,8 @@ impl TerminalManager {
                 Ok(mut s) => s.drain().map(|(_, v)| v).collect(),
                 Err(e) => {
                     error!("Sessions lock poisoned during close_all: {}", e);
+                    // Still revoke: the runner is exiting either way.
+                    crate::coord_mcp::release_all_terminal_bound_keys();
                     return;
                 }
             }
@@ -768,6 +770,9 @@ impl TerminalManager {
         }
 
         if sessions.is_empty() {
+            // A key can outlive the map entry of the terminal it was minted for;
+            // the runner is exiting, so revoke whatever is still tracked.
+            crate::coord_mcp::release_all_terminal_bound_keys();
             return;
         }
 
@@ -789,6 +794,11 @@ impl TerminalManager {
                 sessions.len()
             );
         }
+        // Every terminal-bound coord-mcp key the identity seam minted, revoked in
+        // ONE synchronous store write AFTER the kills above (the per-session
+        // close skips it under a deadline). Outside the per-pane kill budget:
+        // it runs once, after the loop, whatever the loop's deadline left.
+        crate::coord_mcp::release_all_terminal_bound_keys();
         info!("All terminal sessions closed");
     }
 

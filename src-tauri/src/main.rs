@@ -1589,6 +1589,21 @@ fn main() {
     // Enable backtraces in crash dumps for better diagnostics
     std::env::set_var("RUST_BACKTRACE", "1");
 
+    // Strip any inherited terminal-bound coord-mcp key variables
+    // (`QONTINUI_COORD_MCP_NONCE_<K>` / `QONTINUI_COORD_MCP_CREDENTIAL_<K>`, and
+    // the legacy bare `QONTINUI_COORD_MCP_NONCE` / `QONTINUI_COORD_MCP_CREDENTIAL`) from
+    // this process ONCE, beside the other startup env mutation and before any
+    // thread is spawned (plan
+    // `2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages`).
+    // A runner launched from inside another runner's pane would otherwise hand
+    // every child it spawns — at every spawn site, not only the two that strip
+    // per-site — a key THIS runner never minted.
+    for name in coord_mcp_config::terminal_key_env_names(
+        std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()),
+    ) {
+        std::env::remove_var(name);
+    }
+
     // Install the startup-panic hook FIRST, before any other setup. Panics
     // during early init (database connection, Tauri builder, axum router
     // construction) would otherwise vanish — the process exits with code 1

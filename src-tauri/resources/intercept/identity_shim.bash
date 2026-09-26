@@ -75,7 +75,21 @@ exec_real() {
 }
 
 # Recursion guard: a nested invocation is a pure passthrough — never re-pin.
+# It also drops the parent terminal's coord-mcp key variables
+# (QONTINUI_COORD_MCP_NONCE_<K> / QONTINUI_COORD_MCP_CREDENTIAL_<K>, and the
+# legacy bare QONTINUI_COORD_MCP_NONCE / QONTINUI_COORD_MCP_CREDENTIAL, plan
+# 2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages): a
+# nested `claude` is a different session and must fall to the in-cwd document's
+# default (the workdir key), not present the parent's. Residual: a `claude`
+# run by absolute path bypasses this shim and still inherits them.
 if [ "${QONTINUI_INSTALL_INTERCEPT_GUARD:-}" = "1" ]; then
+  for __qv in $(compgen -e); do
+    case "$__qv" in
+      QONTINUI_COORD_MCP_NONCE|QONTINUI_COORD_MCP_CREDENTIAL) unset "$__qv" ;;
+      QONTINUI_COORD_MCP_NONCE_*|QONTINUI_COORD_MCP_CREDENTIAL_*) unset "$__qv" ;;
+    esac
+  done
+  unset __qv
   exec_real "$@"
 fi
 

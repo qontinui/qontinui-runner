@@ -996,6 +996,29 @@ if [[ -z "$ROOT" ]]; then
 fi
 if [[ -z "$ROOT" || "$ROOT" == "." ]]; then ROOT="$PWD"; fi
 
+# `${NAME:-default}` expansion for the nonce each .mcp.json carries: the runner
+# writes `Bearer ${QONTINUI_COORD_MCP_NONCE_<K>:-<workdir nonce>}`, and this sweep
+# must expand it from ITS OWN environment exactly as Claude Code does, never
+# replay the literal reference. Same resolution and the same fail-closed stub as
+# coord-revive.sh: a literal nonce needs no helper, a reference without one is
+# refused, typed, and never sent. Plan
+# 2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages.
+__resolve_fleet_script "lib/mcp-env-ref.sh"; MCP_ENV_REF_LIB="$__RFS_PATH"
+if [[ -n "$MCP_ENV_REF_LIB" ]]; then
+  # shellcheck source=../../../scripts/lib/mcp-env-ref.sh
+  . "$MCP_ENV_REF_LIB"
+else
+  mcp_expand_env_ref_to() {
+    case "$2" in
+      *'${'*'}'*)
+        echo "UNEXPANDED_ENV_REF (helper absent): scripts/lib/mcp-env-ref.sh not found - refusing to send a \${...} reference literally (LOCAL fault)" >&2
+        printf -v "$1" '%s' ""; return 4 ;;
+    esac
+    printf -v "$1" '%s' "$2"
+  }
+  mcp_expand_env_ref_for_url() { mcp_expand_env_ref_to "$1" "$3"; }
+fi
+
 MAX_DOORS=10
 SEEN=""
 DOORS=0
@@ -1052,6 +1075,15 @@ print("Authorization" if authz else "X-Coord-Mcp-Proxy-Key")' < "$CFG" 2>/dev/nu
     [[ -n "$KEYHDR" ]] || KEYHDR="X-Coord-Mcp-Proxy-Key"
   fi
   case "$URL" in *"/coord-mcp"*) ;; *) continue ;; esac
+  [[ -n "$KEY" ]] || continue
+  # Expand BEFORE the (url, key) dedup below, so an env-ref config and its
+  # literal twin naming the same nonce are one door, not two. The _for_url form
+  # reads the environment only for a strictly-loopback $URL (else the default),
+  # so no environment value is sent off-box even ahead of the loopback check.
+  if ! mcp_expand_env_ref_for_url KEY "$URL" "$KEY" 2>"$CURLERR"; then
+    note_fail "$CFG: $(head -n 1 "$CURLERR" 2>/dev/null)"
+    continue
+  fi
   [[ -n "$KEY" ]] || continue
   # LOOPBACK ONLY. Before this sweep, door 1 was a hard-coded 127.0.0.1 URL;
   # honouring an arbitrary `url` from any .mcp.json under the workspace would

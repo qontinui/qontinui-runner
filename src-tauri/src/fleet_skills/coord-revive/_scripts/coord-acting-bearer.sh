@@ -116,6 +116,12 @@ fi
 # the token and only treats it as an agent bearer if the JWT parse succeeds).
 # The legacy header still counts, unconditionally — both shapes live on disk
 # indefinitely, because configs are rewritten only on session spawn.
+#
+# An ENV-REFERENCE value (`Bearer ${QONTINUI_COORD_MCP_NONCE_<K>:-<nonce>}`, plan
+# 2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages) is
+# deliberately NOT expanded here: this census only classifies and sends nothing,
+# `$`, `{` and `:` already fail the JWT charset, and the runner writes a
+# reference only for a proxy nonce - so it counts as proxy-shaped, correctly.
 is_proxy_shaped() {
   if [ "$JSON_READER" = jq ]; then
     jq -e '(.mcpServers["coord-mcp"].headers // {}) as $h

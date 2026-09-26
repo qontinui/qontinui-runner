@@ -228,6 +228,10 @@ http_fetch() {
   if [ -n "${QMQC_FIXTURE_DIR:-}" ]; then
     local f="$QMQC_FIXTURE_DIR/http/$name"
     printf '%s %s\n' "$method" "$url" >>"$QMQC_FIXTURE_DIR/requests.log"
+    # The header set this request WOULD have sent, kept beside the log so a
+    # suite can assert what a credential resolved to (fixture mode only; the
+    # values there are synthetic).
+    if [ -n "$hdr" ] && [ -f "$hdr" ]; then mkdir -p "$QMQC_FIXTURE_DIR/hdr" && cp "$hdr" "$QMQC_FIXTURE_DIR/hdr/$name"; fi
     if [ ! -f "$f.status" ]; then echo "error fixture-missing:$name" >"$st"; return 0; fi
     code="$(tr -d ' \r\n' <"$f.status")"
     case "$code" in
@@ -319,6 +323,28 @@ def cmd_device_id(home):
         print(v)
 
 
+def expand_env_ref_for_url(value, url):
+    """`${NAME:-default}` -> this process's NAME when set and non-empty, else the
+    default - reading the environment ONLY for a strictly-loopback `url` (any
+    other URL resolves on the default arm, so no environment value leaves this
+    box); a no-default reference raises ValueError (UNEXPANDED_ENV_REF). The one
+    python implementation is lib/mcp_env_ref.py (plan
+    2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages);
+    without it a value that carries a reference is refused, never sent."""
+    lib = os.environ.get("QMQC_PY_LIB") or ""
+    try:
+        if lib and lib not in sys.path:
+            sys.path.insert(0, lib)
+        from mcp_env_ref import expand_env_ref_for_url as _expand
+    except ImportError:
+        start = value.find("${")
+        if start != -1 and value.find("}", start + 2) != -1:
+            raise ValueError("UNEXPANDED_ENV_REF (helper absent): lib/mcp_env_ref.py not found - "
+                             "refusing to send a ${...} reference literally (LOCAL fault)")
+        return value
+    return _expand(value, url)
+
+
 def cmd_proxy(mcp_json, hdr_out):
     """Write the coord-mcp proxy's headers to hdr_out; print its URL base."""
     doc = load(mcp_json)
@@ -326,10 +352,20 @@ def cmd_proxy(mcp_json, hdr_out):
     if not isinstance(srv, dict) or not srv.get("url"):
         return
     hdrs = srv.get("headers") or {}
+    lines = []
+    for k, v in hdrs.items():
+        if k in ("Authorization", "X-Coord-Mcp-Proxy-Key") and isinstance(v, str) and "\n" not in v:
+            try:
+                v = expand_env_ref_for_url(v, str(srv["url"]))
+            except ValueError as e:
+                # Not sent: an empty header file makes the caller fall through
+                # to the bootstrap credential, and the reason is named.
+                sys.stderr.write("machine-quiesce-check: coord-mcp proxy skipped: %s\n" % e)
+                lines = []
+                break
+            lines.append("%s: %s\n" % (k, v))
     with open(hdr_out, "w") as fh:
-        for k, v in hdrs.items():
-            if k in ("Authorization", "X-Coord-Mcp-Proxy-Key") and isinstance(v, str) and "\n" not in v:
-                fh.write("%s: %s\n" % (k, v))
+        fh.write("".join(lines))
     print(str(srv["url"]).rstrip("/"))
 
 
@@ -814,7 +850,7 @@ fetch_fleet_pages() { # <prefix> <base> <header-file>
 if [ -n "$DEVICE_ID" ]; then
   PROXY_OK=0
   if [ -f "$ROOT/.mcp.json" ]; then
-    PROXY_BASE="$(qpy proxy "$(native "$ROOT/.mcp.json")" "$(native "$WORK/proxy.hdr")")"
+    PROXY_BASE="$(QMQC_PY_LIB="$(native "$LIB_DIR")" qpy proxy "$(native "$ROOT/.mcp.json")" "$(native "$WORK/proxy.hdr")")"
     if [ -n "$PROXY_BASE" ] && [ -s "$WORK/proxy.hdr" ]; then
       fetch_fleet_pages coord_proxy_fleet_ "$PROXY_BASE" "$WORK/proxy.hdr" && PROXY_OK=1
     fi

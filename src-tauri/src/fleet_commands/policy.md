@@ -238,6 +238,17 @@ else
   exit 1
 fi
 
+# ENV REFERENCES: the runner writes the nonce as
+# `Bearer ${QONTINUI_COORD_MCP_NONCE_<K>:-<workdir nonce>}` (plan
+# 2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages). Expand
+# it from THIS shell's environment exactly as Claude Code does, through the one
+# bash owner - never stage the literal reference as a bearer. The _for_url form
+# reads the environment only for a strictly-loopback $url (else the default), so
+# a sibling .mcp.json naming another host never receives an environment value.
+# Without the helper a key carrying a reference is skipped; a literal key still works.
+MCP_ENV_REF_LIB="$ROOT/qontinui-claude-config/scripts/lib/mcp-env-ref.sh"
+if [ -r "$MCP_ENV_REF_LIB" ]; then . "$MCP_ENV_REF_LIB"; else MCP_ENV_REF_LIB=""; fi
+
 LIVE_URL=""; LIVE_KEY=""; LIVE_HDR="X-Coord-Mcp-Proxy-Key"
 for f in "${CANDIDATES[@]}"; do
   [ -r "$f" ] || continue
@@ -257,6 +268,11 @@ for f in "${CANDIDATES[@]}"; do
   key=$(mcp_key)
   case "$url" in *"/coord-mcp"*) ;; *) continue ;; esac
   [ -n "$key" ] || continue
+  if [ -n "$MCP_ENV_REF_LIB" ]; then
+    mcp_expand_env_ref_for_url key "$url" "$key" || continue   # names UNEXPANDED_ENV_REF <NAME>
+  else
+    case "$key" in *'${'*'}'*) echo "skip: $f -> its nonce is a \${...} reference and mcp-env-ref.sh is not reachable" >&2; continue ;; esac
+  fi
   # Verify the staging: `curl -H @<empty file>` does NOT error, it sends the
   # probe with NO credential — every door then 401s and the sweep concludes
   # "no live proxy" while every door is fine.

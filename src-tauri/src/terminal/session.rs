@@ -1316,6 +1316,10 @@ pub struct TerminalSession {
     is_alive: Arc<AtomicBool>,
     /// Exit code (set when process exits).
     exit_code: Arc<Mutex<Option<i32>>>,
+    /// Set by the waiter the moment the pane's `wait()` returns — Ok OR Err —
+    /// i.e. the child has been reaped and its pid may be reused. Distinct from
+    /// [`Self::exit_code`], which stays `None` when the wait itself failed.
+    child_reaped: Arc<AtomicBool>,
     /// Handle to the reader thread (for join on cleanup).
     reader_join: Mutex<Option<thread::JoinHandle<()>>>,
     /// Handle to the waiter thread (for join on cleanup).
@@ -2162,6 +2166,8 @@ impl TerminalSession {
         let waiter_title = title.clone();
         let waiter_alive = is_alive.clone();
         let waiter_exit = exit_code.clone();
+        let child_reaped = Arc::new(AtomicBool::new(false));
+        let waiter_reaped = child_reaped.clone();
         // Retain a clone for the session struct (input-line warn hook)
         // before the original handle is moved into the waiter thread.
         let session_app_handle = app_handle.clone();
@@ -2180,6 +2186,9 @@ impl TerminalSession {
                         None
                     }
                 };
+                // Reaped whether or not the wait produced a code: the close
+                // path must not signal this pid again.
+                waiter_reaped.store(true, Ordering::SeqCst);
 
                 // Record the exit code BEFORE clearing `is_alive`. The other
                 // order left a window in which a refused write reported
@@ -2265,6 +2274,7 @@ impl TerminalSession {
             rows: AtomicU16::new(rows),
             is_alive,
             exit_code,
+            child_reaped,
             reader_join: Mutex::new(Some(reader_handle)),
             waiter_join: Mutex::new(Some(waiter_handle)),
             bytes_sent,
@@ -2352,6 +2362,20 @@ impl TerminalSession {
         // depth — the supervisor strips it at the runner spawn, this covers a
         // runner started by any other means.
         cmd.env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV);
+        // The per-terminal coord-mcp key names the in-cwd `.mcp.json` references
+        // (`${QONTINUI_COORD_MCP_NONCE_<K>:-…}` / `${QONTINUI_COORD_MCP_CREDENTIAL_<K>:-…}`).
+        // A value inherited from whatever launched the RUNNER (a runner started
+        // from inside another runner's pane) names a key THIS runner never
+        // minted and would silently shadow the workdir default with a 401. Only
+        // the identity seam, downstream, sets them — for this terminal's own key.
+        // Every keyed name, and the legacy bare `QONTINUI_COORD_MCP_NONCE` /
+        // `QONTINUI_COORD_MCP_CREDENTIAL`, is matched by shape.
+        let inherited = crate::coord_mcp_config::terminal_key_env_names(
+            cmd.iter_full_env_as_str().map(|(k, _)| k),
+        );
+        for name in inherited {
+            cmd.env_remove(name);
+        }
 
         // Set TERM for proper color/capability support.
         // xterm.js is a full xterm-compatible terminal, so use xterm-256color on all
@@ -3184,6 +3208,26 @@ impl TerminalSession {
                     terminal_id = %terminal_id,
                     path = %cfg_path.display(),
                     "coord-mcp: QONTINUI_MCP_CONFIG injected for universal --mcp-config delivery"
+                );
+            }
+            // A cwd whose `.mcp.json` is the runner's own env-referenced device
+            // document: hand THIS terminal its own key under the names that
+            // document references, so the proxy's caller self-id resolves this
+            // terminal deterministically (plan
+            // `2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages`).
+            // The nonce value is never logged — only its short prefix, the same
+            // one the rotation log carries.
+            // The names are keyed to THIS spawn cwd, so a `claude` launched after
+            // a `cd` into another worktree reads that worktree's own default.
+            if let Some(key) = &delivered.terminal_key {
+                cmd.env(&key.nonce_env, &key.nonce);
+                if let Some(credential) = &key.credential {
+                    cmd.env(&key.credential_env, credential.to_string_lossy().as_ref());
+                }
+                info!(
+                    terminal_id = %terminal_id,
+                    key = ?key,
+                    "coord-mcp: terminal-bound key exported for the cwd's env-referenced .mcp.json"
                 );
             }
             delivered.delivery
@@ -4317,6 +4361,13 @@ impl TerminalSession {
     /// ([`Self::close_after_graceful_exit`]); every other teardown step runs.
     fn close_inner(&self, deadline: Option<std::time::Instant>, kill_child: bool) {
         info!(terminal_id = %self.id, "Closing terminal session");
+        // Read BEFORE `is_alive` flips: the waiter sets `child_reaped` the
+        // moment its wait returns (Ok or Err — a failed wait records no exit
+        // code but is still a reap), so `true` means the pane's process was
+        // already gone before this close began. A reap that lands AFTER this
+        // read is covered by the pane itself: `LocalPty::kill` refuses to signal
+        // a reaped child.
+        let exited_before_close = self.child_reaped.load(Ordering::SeqCst);
         self.is_alive.store(false, Ordering::Relaxed);
 
         // Phase 2 — drop the isolated edit context first so the
@@ -4335,18 +4386,35 @@ impl TerminalSession {
         // walks EVERY live terminal on shutdown (138 were live during the
         // 2026-08-30 wedge), so an unbounded taskkill is a per-terminal
         // blocked thread at exactly the moment the process is trying to exit.
-        if kill_child {
+        //
+        // A child the waiter has ALREADY reaped is not killed at all: its pid
+        // may have been REUSED by an unrelated process, and a `taskkill /T` (or
+        // `kill`) of that pid could take down someone else's tree — a live
+        // Claude Code session included. Treated like the graceful-exit branch.
+        let process_tree_gone = if kill_child && exited_before_close {
+            info!(
+                terminal_id = %self.id,
+                pid = ?self.child_pid,
+                "pane process was already reaped — skipping the kill (its pid may be reused)"
+            );
+            true
+        } else if kill_child {
             let kill_budget =
                 std::cmp::max(clamp_to_deadline(TASKKILL_TIMEOUT, deadline), KILL_FLOOR);
-            if let Err(e) = self.io.kill(kill_budget) {
-                warn!(terminal_id = %self.id, pid = ?self.child_pid, "{e}");
+            match self.io.kill(kill_budget) {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!(terminal_id = %self.id, pid = ?self.child_pid, "{e}");
+                    false
+                }
             }
         } else {
             info!(
                 terminal_id = %self.id,
                 "pane process already exited — closing without a kill"
             );
-        }
+            true
+        };
 
         // Drop the writer to signal EOF on stdin.
         //
@@ -4400,6 +4468,36 @@ impl TerminalSession {
                     "waiter",
                     &self.id,
                     clamp_to_deadline(JOIN_TIMEOUT, deadline),
+                );
+            }
+        }
+
+        // Revoke the terminal-bound coord-mcp key the identity seam minted for
+        // an env-referenced declared cwd, and delete its credential file (plan
+        // `2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages`).
+        //
+        // Placed as LATE as the teardown allows: after the kill, after the
+        // writer/PTY handles are dropped (the SIGHUP point for the pane's
+        // session), and after the waiter join (the reap). A kill that returned
+        // an error keeps the key (logged). Interactive close only: one revoke
+        // re-encrypts the whole nonce store, so the deadline-bound shutdown path
+        // (`TerminalManager::close_all`) releases every tracked key in ONE
+        // synchronous write instead.
+        //
+        // **On Unix this ordering is best-effort, NOT a liveness proof.** The kill
+        // signals only the pane's direct child (SIGTERM, no process-group kill —
+        // deliberately unchanged here), and the PTY close delivers SIGHUP to the
+        // session. A descendant that survives both — a tmux server, a
+        // `nohup`/`setsid`-detached process — keeps running with the key in its
+        // environment and will 401 on it after this revoke. Recorded residual.
+        if deadline.is_none() {
+            if process_tree_gone {
+                crate::coord_mcp::release_terminal_bound_key(&self.id);
+            } else {
+                warn!(
+                    terminal_id = %self.id,
+                    "pane kill failed — its terminal-bound coord-mcp key (if any) is KEPT, \
+                     since a process in the tree may still be presenting it"
                 );
             }
         }
@@ -4972,6 +5070,7 @@ mod tests {
             // join nonexistent reader/waiter threads.
             is_alive: Arc::new(AtomicBool::new(false)),
             exit_code: Arc::new(Mutex::new(None)),
+            child_reaped: Arc::new(AtomicBool::new(false)),
             reader_join: Mutex::new(None),
             waiter_join: Mutex::new(None),
             bytes_sent: Arc::new(AtomicU64::new(0)),
@@ -5079,6 +5178,103 @@ mod tests {
         fn release(&self, _budget: Duration) -> Result<(), String> {
             Ok(())
         }
+    }
+
+    /// A pane whose kill FAILS — the close path must then keep the terminal's
+    /// coord-mcp key.
+    struct FailingKillPaneIo;
+
+    impl crate::terminal::pane_io::PaneIo for FailingKillPaneIo {
+        fn reader(&self) -> Result<Box<dyn Read + Send>, String> {
+            Ok(Box::new(std::io::empty()))
+        }
+        fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
+            Ok(Box::new(std::io::sink()))
+        }
+        fn resize(&self, _cols: u16, _rows: u16) -> Result<(), String> {
+            Ok(())
+        }
+        fn wait(&self) -> Result<i32, String> {
+            Ok(0)
+        }
+        fn kill(&self, _budget: Duration) -> Result<(), String> {
+            Err("injected kill failure".to_string())
+        }
+        fn set_paused(&self, _paused: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn pid(&self) -> Option<u32> {
+            None
+        }
+        fn credential_scrub(&self) -> crate::terminal::pane_io::CredentialScrub {
+            crate::terminal::pane_io::CredentialScrub::NoChildEnv
+        }
+        fn release(&self, _budget: Duration) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// Rounds 4-5: a child the waiter had ALREADY reaped is not killed at all
+    /// (its pid may be reused by an unrelated process), and its terminal key is
+    /// still revoked — the exit recorded before the close is the proof the tree
+    /// is gone.
+    #[test]
+    fn close_skips_the_kill_and_revokes_when_the_child_was_already_reaped() {
+        let amb = crate::test_env::isolated_ambient();
+        let wd = amb.dir().to_string_lossy().to_string();
+        let id = format!("term-{}", uuid::Uuid::new_v4());
+        let nonce = crate::coord_mcp::track_terminal_bound_key_for_test(&id, &wd);
+        let io = Arc::new(KillCountingPaneIo::default());
+        let mut session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        session.id = id;
+        let pane: Arc<dyn crate::terminal::pane_io::PaneIo> = io.clone();
+        session.io = pane;
+        // Reaped with a FAILED wait: no exit code, still reaped (round 6).
+        session.child_reaped.store(true, Ordering::SeqCst);
+        assert!(session.exit_code().is_none());
+        session.close();
+        assert_eq!(io.kills(), 0, "a reaped pid must never be signalled");
+        assert!(
+            !crate::coord_mcp::nonce_is_live_for_test(&nonce),
+            "a reaped child's key is revoked"
+        );
+    }
+
+    /// W4 (plan `2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages`):
+    /// an interactive close revokes the terminal-bound coord-mcp key AFTER a
+    /// successful kill, and KEEPS it when the kill failed.
+    #[test]
+    fn close_revokes_the_terminal_key_only_after_a_successful_kill() {
+        let amb = crate::test_env::isolated_ambient();
+        let wd = amb.dir().to_string_lossy().to_string();
+
+        // Kill fails: key kept.
+        let failing_id = format!("term-{}", uuid::Uuid::new_v4());
+        let kept = crate::coord_mcp::track_terminal_bound_key_for_test(&failing_id, &wd);
+        let mut session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        session.id = failing_id.clone();
+        session.io = Arc::new(FailingKillPaneIo);
+        session.close();
+        assert!(
+            crate::coord_mcp::nonce_is_live_for_test(&kept),
+            "a failed kill must keep the key"
+        );
+
+        // Kill succeeds: key revoked.
+        let ok_id = format!("term-{}", uuid::Uuid::new_v4());
+        let revoked = crate::coord_mcp::track_terminal_bound_key_for_test(&ok_id, &wd);
+        let io = Arc::new(KillCountingPaneIo::default());
+        let mut session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        session.id = ok_id.clone();
+        let pane: Arc<dyn crate::terminal::pane_io::PaneIo> = io.clone();
+        session.io = pane;
+        session.close();
+        assert_eq!(io.kills(), 1);
+        assert!(
+            !crate::coord_mcp::nonce_is_live_for_test(&revoked),
+            "a successful close revokes the key"
+        );
+        crate::coord_mcp::release_terminal_bound_key(&failing_id);
     }
 
     /// A writer that records what was typed and, like a TUI input line, echoes

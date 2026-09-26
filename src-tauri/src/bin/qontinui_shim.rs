@@ -534,6 +534,20 @@ pub fn identity_argv(
     out
 }
 
+/// The variables a nested (recursion-guarded) `claude` must NOT inherit: every
+/// terminal-bound coord-mcp key variable, matched by shape
+/// ([`qontinui_runner_lib::coord_mcp_config::is_any_terminal_env_name`] — the
+/// keyed names and the legacy bare ones). Pure
+/// over the names so it is unit-testable; non-UTF-8 names are never ours.
+pub fn nested_session_env_strip<I>(names: I) -> Vec<String>
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    qontinui_runner_lib::coord_mcp_config::terminal_key_env_names(
+        names.into_iter().filter_map(|n| n.into_string().ok()),
+    )
+}
+
 /// The identity straddle, fail-open at every step. Returns the exit code to
 /// propagate. Mirrors `identity_shim.cmd`:
 /// resolve real → guard passthrough → settings/user-chose scan → best-effort
@@ -543,8 +557,19 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
     let real = resolve_real(tool.program(), &own_dirs);
 
     // Recursion guard: a nested invocation never re-pins — pure passthrough.
+    //
+    // It also drops the parent terminal's coord-mcp key (plan
+    // `2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages`):
+    // a nested `claude` is a DIFFERENT session, and presenting the parent
+    // terminal's key would make the runner's caller self-id resolve it as the
+    // parent. With every `QONTINUI_COORD_MCP_NONCE_<K>` /
+    // `QONTINUI_COORD_MCP_CREDENTIAL_<K>` removed it falls to the in-cwd
+    // document's default arm — the workdir key. Residual, stated: a `claude`
+    // launched by ABSOLUTE path bypasses this shim and still inherits the key.
     if env::var(GUARD_ENV).ok().as_deref() == Some("1") {
-        return exec_real(&real, tool.program(), args);
+        let strip = nested_session_env_strip(env::vars_os().map(|(k, _)| k));
+        let strip: Vec<&str> = strip.iter().map(String::as_str).collect();
+        return exec_real_child_env(&real, tool.program(), args, &strip);
     }
 
     let pinned = env::var(PINNED_SESSION_ENV)
@@ -1094,6 +1119,21 @@ fn exec_real_child_env(
     args: &[String],
     env_remove: &[&str],
 ) -> Option<i32> {
+    let mut cmd = real_tool_command(real, name, args, env_remove);
+    match cmd.status() {
+        Ok(st) => st.code(),
+        Err(_) => Some(127), // command-not-found surrogate; never panic
+    }
+}
+
+/// The guarded real-tool [`Command`] [`exec_real_child_env`] runs — split out
+/// so which variables it strips is assertable without spawning anything.
+fn real_tool_command(
+    real: &Option<PathBuf>,
+    name: &str,
+    args: &[String],
+    env_remove: &[&str],
+) -> Command {
     let mut cmd = match real {
         Some(p) => Command::new(p),
         // No resolved real tool: dispatch by name and let the OS PATH find it.
@@ -1109,10 +1149,7 @@ fn exec_real_child_env(
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    match cmd.status() {
-        Ok(st) => st.code(),
-        Err(_) => Some(127), // command-not-found surrogate; never panic
-    }
+    cmd
 }
 
 // ===========================================================================
@@ -1766,6 +1803,50 @@ mod tests {
         assert!(
             PROVISION_RW_TIMEOUT <= CONNECT_TIMEOUT,
             "a tiny local mint needs no more than the connect budget"
+        );
+    }
+
+    /// A nested (recursion-guarded) `claude` must not present the parent
+    /// terminal's coord-mcp key: every workdir-keyed key variable is selected
+    /// for stripping, nothing else is, and the guarded real-tool command
+    /// actually removes them (plan
+    /// `2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages`).
+    #[test]
+    fn a_nested_claude_drops_the_parent_terminals_coord_mcp_key() {
+        let nonce = qontinui_runner_lib::coord_mcp_config::terminal_nonce_env_name("/w/a");
+        let cred = qontinui_runner_lib::coord_mcp_config::terminal_credential_env_name("/w/a");
+        let names = [
+            "PATH",
+            nonce.as_str(),
+            "QONTINUI_MCP_CONFIG",
+            cred.as_str(),
+            "QONTINUI_COORD_MCP_NONCE",
+        ]
+        .map(std::ffi::OsString::from);
+        let strip = nested_session_env_strip(names);
+        assert_eq!(
+            strip,
+            vec![
+                nonce.clone(),
+                cred.clone(),
+                "QONTINUI_COORD_MCP_NONCE".to_string()
+            ],
+            "the keyed names and the legacy bare name, nothing else"
+        );
+
+        let strip_refs: Vec<&str> = strip.iter().map(String::as_str).collect();
+        let cmd = real_tool_command(&None, "claude", &[], &strip_refs);
+        let removed: Vec<String> = cmd
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        assert!(removed.contains(&nonce), "{removed:?}");
+        assert!(removed.contains(&cred), "{removed:?}");
+        assert!(
+            cmd.get_envs()
+                .any(|(k, v)| k == GUARD_ENV && v == Some(std::ffi::OsStr::new("1"))),
+            "the guard is still set on the child"
         );
     }
 
