@@ -16,6 +16,7 @@ import type {
 } from "../types/scheduler";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { invoke } from "@tauri-apps/api/core";
+import { describeThrown } from "@/lib/utils";
 
 interface ApiResponse<T> {
   success: boolean;
@@ -90,7 +91,7 @@ export function useScheduler(autoRefresh = true, refreshInterval = 30000): UseSc
 
       return result.data ?? null;
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = describeThrown(err, "API request failed");
       console.error(`[SCHEDULER] API error: ${message}`);
       throw err;
     }
@@ -104,7 +105,7 @@ export function useScheduler(autoRefresh = true, refreshInterval = 30000): UseSc
       const result = await apiRequest<ScheduledTask[]>("GET", "/scheduler/tasks");
       setTasks(result || []);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load tasks");
+      setError(describeThrown(err, "Failed to load tasks"));
     }
   }, []);
 
@@ -116,7 +117,7 @@ export function useScheduler(autoRefresh = true, refreshInterval = 30000): UseSc
       const result = await apiRequest<SchedulerSettings>("GET", "/scheduler/settings");
       setSettings(result);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load settings");
+      setError(describeThrown(err, "Failed to load settings"));
     }
   }, []);
 
@@ -147,7 +148,7 @@ export function useScheduler(autoRefresh = true, refreshInterval = 30000): UseSc
         }
         return result;
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to create task");
+        setError(describeThrown(err, "Failed to create task"));
         return null;
       } finally {
         setLoading(false);
@@ -173,7 +174,7 @@ export function useScheduler(autoRefresh = true, refreshInterval = 30000): UseSc
         }
         return result;
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to update task");
+        setError(describeThrown(err, "Failed to update task"));
         return null;
       } finally {
         setLoading(false);
@@ -198,7 +199,7 @@ export function useScheduler(autoRefresh = true, refreshInterval = 30000): UseSc
         }
         return true;
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to delete task");
+        setError(describeThrown(err, "Failed to delete task"));
         return false;
       } finally {
         setLoading(false);
@@ -222,9 +223,7 @@ export function useScheduler(autoRefresh = true, refreshInterval = 30000): UseSc
         await loadTasks();
         return true;
       } catch (err) {
-        setError(
-          typeof err === "string" ? err : err instanceof Error ? err.message : "Failed to run task",
-        );
+        setError(describeThrown(err, "Failed to run task"));
         return false;
       } finally {
         setLoading(false);
@@ -275,7 +274,7 @@ export function useScheduler(autoRefresh = true, refreshInterval = 30000): UseSc
       setSettings(newSettings);
       return true;
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to update settings");
+      setError(describeThrown(err, "Failed to update settings"));
       return false;
     } finally {
       setLoading(false);
@@ -292,7 +291,7 @@ export function useScheduler(autoRefresh = true, refreshInterval = 30000): UseSc
       await apiRequest("POST", "/scheduler/trigger-auto-fix");
       return true;
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to trigger auto-fix");
+      setError(describeThrown(err, "Failed to trigger auto-fix"));
       return false;
     } finally {
       setLoading(false);
@@ -308,7 +307,7 @@ export function useScheduler(autoRefresh = true, refreshInterval = 30000): UseSc
     try {
       await Promise.all([loadTasks(), loadSettings(), loadStatus()]);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to refresh");
+      setError(describeThrown(err, "Failed to refresh"));
     } finally {
       setLoading(false);
     }

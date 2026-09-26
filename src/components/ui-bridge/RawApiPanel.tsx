@@ -20,6 +20,7 @@ import {
   Terminal,
 } from "lucide-react";
 import type { CommandResult } from "../../types/ui-bridge-types";
+import { describeThrown } from "@/lib/utils";
 
 interface RawApiPanelProps {
   onSendCommand: <T = unknown>(
@@ -72,7 +73,7 @@ export function RawApiPanel({
   try {
     parsedParams = JSON.parse(paramsJson) as Record<string, unknown>;
   } catch (err) {
-    paramsError = err instanceof Error ? err.message : "Invalid JSON";
+    paramsError = describeThrown(err, "Invalid JSON");
   }
 
   // Execute command

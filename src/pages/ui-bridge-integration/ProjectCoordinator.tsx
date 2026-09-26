@@ -55,6 +55,7 @@ import type {
   PageComponent,
   PageGenerationOptions,
 } from "./types";
+import { describeThrown } from "@/lib/utils";
 
 // Manual-entry sentinel. Using Symbol-like sentinel strings in <option value>
 // so we can distinguish from a real path. Real paths never start with "::".
@@ -452,7 +453,7 @@ export function ProjectCoordinator({
         // CustomEvents we subscribed to in the useEffect above.
       } catch (err) {
         if (runIdRef.current !== myRun) return;
-        setErrorMessage(err instanceof Error ? err.message : "Integration failed");
+        setErrorMessage(describeThrown(err, "Integration failed"));
         setPhase("failed");
       }
     },

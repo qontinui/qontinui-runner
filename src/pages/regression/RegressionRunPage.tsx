@@ -21,6 +21,7 @@ import type { RegistryLike } from "@qontinui/ui-bridge-auto/runtime";
 import type { IRDocument } from "@qontinui/shared-types/ui-bridge-ir";
 
 import { runRegressionSuite, type RunRegressionSuiteResult } from "@/lib/regression-executor";
+import { describeThrown } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
 // Demo IR — minimal hardcoded fixture for the smoke surface
@@ -148,7 +149,7 @@ export function RegressionRunPage(): React.JSX.Element {
       });
       setResult(out);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(describeThrown(e, "Regression run failed"));
     } finally {
       setRunning(false);
     }

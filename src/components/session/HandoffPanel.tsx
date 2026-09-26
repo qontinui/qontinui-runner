@@ -26,6 +26,7 @@ import { useCallback, useMemo, useState } from "react";
 import { ArrowRightLeft, Loader2, AlertCircle } from "lucide-react";
 import { useSession, type SessionDescriptor } from "@/contexts/SessionContext";
 import { getStatusColors } from "@/design-system";
+import { describeThrown } from "@/lib/utils";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -83,7 +84,7 @@ export function HandoffPanel({ onLog }: HandoffPanelProps) {
           return next;
         });
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
+        const message = describeThrown(err, "Handoff failed");
         setRowState((prev) => ({
           ...prev,
           [session.id]: { kind: "error", message },
@@ -114,9 +115,9 @@ export function HandoffPanel({ onLog }: HandoffPanelProps) {
       </header>
 
       <p className="text-xs text-muted-foreground">
-        Move an active session to another runner. The target machine materializes
-        a child session (cwd, held claims, recent PTY scrollback follow); this
-        device's source session closes. Plan §Phase 7.
+        Move an active session to another runner. The target machine materializes a child session
+        (cwd, held claims, recent PTY scrollback follow); this device's source session closes. Plan
+        §Phase 7.
       </p>
 
       {eligibleSessions.length === 0 ? (
@@ -124,10 +125,7 @@ export function HandoffPanel({ onLog }: HandoffPanelProps) {
           No transferable sessions on this device.
         </div>
       ) : (
-        <ul
-          data-page-element="handoff-session-list"
-          className="space-y-2"
-        >
+        <ul data-page-element="handoff-session-list" className="space-y-2">
           {eligibleSessions.map((session) => {
             const state = rowState[session.id] ?? { kind: "idle" as const };
             const isSubmitting = state.kind === "submitting";
@@ -198,12 +196,9 @@ export function HandoffPanel({ onLog }: HandoffPanelProps) {
                   </div>
                 )}
                 {state.kind === "submitted" && (
-                  <div
-                    className={`text-xs ${getStatusColors("success").text}`}
-                    role="status"
-                  >
-                    Handoff requested → {state.targetDeviceId}. Source will close once
-                    the target materializes the child session.
+                  <div className={`text-xs ${getStatusColors("success").text}`} role="status">
+                    Handoff requested → {state.targetDeviceId}. Source will close once the target
+                    materializes the child session.
                   </div>
                 )}
               </li>

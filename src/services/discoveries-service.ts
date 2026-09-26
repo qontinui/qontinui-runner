@@ -11,6 +11,7 @@ import type {
   SyncResult,
   PendingDiscovery,
 } from "../types/discoveries";
+import { describeThrown } from "@/lib/utils";
 
 /**
  * Service for managing discovery sync.
@@ -25,7 +26,7 @@ export const discoveriesService = {
     } catch (error) {
       return {
         success: false,
-        error: error instanceof Error ? error.message : "Failed to get discovery summary",
+        error: describeThrown(error, "Failed to get discovery summary"),
       };
     }
   },
@@ -39,7 +40,7 @@ export const discoveriesService = {
     } catch (error) {
       return {
         success: false,
-        error: error instanceof Error ? error.message : "Failed to get sync status",
+        error: describeThrown(error, "Failed to get sync status"),
       };
     }
   },
@@ -53,7 +54,7 @@ export const discoveriesService = {
     } catch (error) {
       return {
         success: false,
-        error: error instanceof Error ? error.message : "Failed to get pending discoveries",
+        error: describeThrown(error, "Failed to get pending discoveries"),
       };
     }
   },
@@ -67,7 +68,7 @@ export const discoveriesService = {
     } catch (error) {
       return {
         success: false,
-        error: error instanceof Error ? error.message : "Failed to sync discoveries",
+        error: describeThrown(error, "Failed to sync discoveries"),
       };
     }
   },
@@ -81,7 +82,7 @@ export const discoveriesService = {
     } catch (error) {
       return {
         success: false,
-        error: error instanceof Error ? error.message : "Failed to clear discovery",
+        error: describeThrown(error, "Failed to clear discovery"),
       };
     }
   },
@@ -95,7 +96,7 @@ export const discoveriesService = {
     } catch (error) {
       return {
         success: false,
-        error: error instanceof Error ? error.message : "Failed to clear failed discoveries",
+        error: describeThrown(error, "Failed to clear failed discoveries"),
       };
     }
   },

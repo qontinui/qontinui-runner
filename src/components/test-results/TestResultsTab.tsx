@@ -24,6 +24,7 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { useRunSelectionOptional } from "../../contexts/RunSelectionContext";
 import type { TestResult, TestStatus, TestType, VerificationTest } from "../../types/test-builder";
+import { describeThrown } from "@/lib/utils";
 
 // Status badge configuration
 const statusConfig: Record<
@@ -155,7 +156,7 @@ export function TestResultsTab() {
         setError(response.message || "Failed to fetch test results");
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to fetch test results");
+      setError(describeThrown(err, "Failed to fetch test results"));
     } finally {
       setIsLoading(false);
     }

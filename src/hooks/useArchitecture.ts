@@ -14,6 +14,7 @@ import type {
   SdkArchitectureEdge,
 } from "@/types/architecture";
 import type { TimeRange } from "@/types/performance-metrics";
+import { describeThrown } from "@/lib/utils";
 
 interface ApiResponse<T> {
   success: boolean;
@@ -41,7 +42,7 @@ export function useArchitectureGraph(workflowName: string) {
         setError(json.error ?? "Failed to load architecture graph");
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Network error");
+      setError(describeThrown(e, "Network error"));
     } finally {
       setLoading(false);
     }
@@ -66,7 +67,7 @@ export function useArchitectureGraph(workflowName: string) {
         return null;
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Network error");
+      setError(describeThrown(e, "Network error"));
       return null;
     } finally {
       setLoading(false);
@@ -204,7 +205,7 @@ export function useWorkflowTrends(workflowName: string, timeRange: TimeRange) {
           setFetched({
             key: currentKey,
             data: null,
-            error: e instanceof Error ? e.message : "Network error",
+            error: describeThrown(e, "Network error"),
           });
         }
       } finally {
@@ -436,7 +437,7 @@ export function useSdkArchitecture() {
         setError(json.error ?? "Failed to load SDK specs");
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Network error");
+      setError(describeThrown(e, "Network error"));
     } finally {
       setLoading(false);
     }

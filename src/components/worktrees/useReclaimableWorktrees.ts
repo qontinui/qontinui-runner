@@ -13,6 +13,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { apiFetch } from "@/hooks/useApiHelpers";
+import { describeThrown } from "@/lib/utils";
 
 /** Why a worktree may not be reclaimed. Mirrors Rust `SkipReason::as_str()`. */
 export type SkipReason =
@@ -207,7 +208,7 @@ export function useReclaimableWorktrees(enabled: boolean): UseReclaimableWorktre
       if (!res.success || !res.data) throw new Error(res.error ?? "survey failed");
       setSurvey(res.data);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(describeThrown(e, "Worktree survey failed"));
     } finally {
       setLoading(false);
     }
@@ -225,7 +226,7 @@ export function useReclaimableWorktrees(enabled: boolean): UseReclaimableWorktre
         if (!res.success || !res.data) throw new Error(res.error ?? "reclaim failed");
         setLastOutcome(res.data);
       } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
+        setError(describeThrown(e, "Worktree reclaim failed"));
       } finally {
         setReclaiming(false);
         // Always re-survey: a partial failure still changed disk.

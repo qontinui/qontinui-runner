@@ -11,6 +11,7 @@ import { Badge } from "../ui";
 import { PanelCard } from "../widgets/canvas/components/PanelCard";
 import type { CanvasPanel } from "@qontinui/shared-types";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 interface CanvasRecapTabProps {
   taskRunId: string;
@@ -41,7 +42,7 @@ export function CanvasRecapTab({ taskRunId }: CanvasRecapTabProps) {
         }
       } catch (e) {
         if (!cancelled) {
-          setError(e instanceof Error ? e.message : "Failed to load panels");
+          setError(describeThrown(e, "Failed to load panels"));
         }
       } finally {
         if (!cancelled) {

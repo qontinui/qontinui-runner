@@ -21,6 +21,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Loader2, RefreshCw } from "lucide-react";
 import { getApiBase } from "@/lib/runner-api";
 import type { ShowToastFn } from "@/hooks/useToast";
+import { describeThrown } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
 // Types matching the runner backend response shapes
@@ -210,7 +211,7 @@ export function ObservationsPanel({ specId, showToast }: ObservationsPanelProps)
       // anyway in case one just landed.
       await loadDrift();
     } catch (err) {
-      showToast(`Re-derive failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+      showToast(`Re-derive failed: ${describeThrown(err, "unknown error")}`, "error");
     } finally {
       setDeriving(false);
     }
@@ -247,10 +248,7 @@ export function ObservationsPanel({ specId, showToast }: ObservationsPanelProps)
       );
       await loadInvalidations();
     } catch (err) {
-      showToast(
-        `Invalidation failed: ${err instanceof Error ? err.message : String(err)}`,
-        "error",
-      );
+      showToast(`Invalidation failed: ${describeThrown(err, "unknown error")}`, "error");
     } finally {
       setInvalidatingAll(false);
     }
@@ -270,7 +268,7 @@ export function ObservationsPanel({ specId, showToast }: ObservationsPanelProps)
         showToast(`Restored ${result.count} observation(s)`, "success");
         await loadInvalidations();
       } catch (err) {
-        showToast(`Undo failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+        showToast(`Undo failed: ${describeThrown(err, "unknown error")}`, "error");
       }
     },
     [showToast, loadInvalidations],

@@ -6,6 +6,7 @@
 
 import { useCallback } from "react";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 export interface UseAIOperationsReturn {
   aiSearch: (query: string) => Promise<unknown>;
@@ -22,7 +23,7 @@ export function useAIOperations(): UseAIOperationsReturn {
       });
       return await resp.json();
     } catch (e) {
-      return { success: false, error: e instanceof Error ? e.message : "AI search failed" };
+      return { success: false, error: describeThrown(e, "AI search failed") };
     }
   }, []);
 
@@ -35,7 +36,7 @@ export function useAIOperations(): UseAIOperationsReturn {
       });
       return await resp.json();
     } catch (e) {
-      return { success: false, error: e instanceof Error ? e.message : "AI execute failed" };
+      return { success: false, error: describeThrown(e, "AI execute failed") };
     }
   }, []);
 

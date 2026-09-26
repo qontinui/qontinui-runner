@@ -8,6 +8,7 @@
 
 import { useState, useCallback } from "react";
 import { getApiBase } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 interface AuthorError {
   error: string;
@@ -25,16 +26,13 @@ export function useSpecAuthor(appId: string) {
       setError(null);
 
       try {
-        const response = await fetch(
-          `${getApiBase()}/apps/${appId}/spec/author`,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify(spec),
-          }
-        );
+        const response = await fetch(`${getApiBase()}/apps/${appId}/spec/author`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(spec),
+        });
 
         if (!response.ok) {
           const body = (await response.json()) as AuthorError;
@@ -58,17 +56,14 @@ export function useSpecAuthor(appId: string) {
 
         // Success — cache will auto-invalidate via SSE event
       } catch (err) {
-        const msg =
-          err instanceof Error
-            ? err.message
-            : "Unknown error saving spec";
+        const msg = describeThrown(err, "Unknown error saving spec");
         setError(msg);
         throw err;
       } finally {
         setIsLoading(false);
       }
     },
-    [appId]
+    [appId],
   );
 
   return {

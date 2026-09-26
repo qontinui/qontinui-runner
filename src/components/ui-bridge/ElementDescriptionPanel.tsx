@@ -68,6 +68,7 @@ import {
   type AutomationAction,
 } from "../../lib/ui-bridge/selectorGenerator";
 import { createLogger } from "@/lib/logger";
+import { describeThrown } from "@/lib/utils";
 
 const logger = createLogger("ElementDescriptionPanel");
 
@@ -635,7 +636,7 @@ export function ElementDescriptionPanel({
         });
       }
     } catch (err) {
-      setAiError(err instanceof Error ? err.message : "Failed to generate AI description");
+      setAiError(describeThrown(err, "Failed to generate AI description"));
     } finally {
       setIsGeneratingAi(false);
     }
@@ -826,7 +827,7 @@ export function ElementDescriptionPanel({
           aiDescriptions: stats.aiDescriptions,
         });
       } catch (err) {
-        setAiError(err instanceof Error ? err.message : "Failed to import descriptions");
+        setAiError(describeThrown(err, "Failed to import descriptions"));
       }
     };
     input.click();

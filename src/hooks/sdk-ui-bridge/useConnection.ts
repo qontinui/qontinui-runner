@@ -9,6 +9,7 @@ import { useState, useCallback, useEffect } from "react";
 import type { ConnectionStatus } from "./types";
 import type { SdkAppInfo } from "./types";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 export interface UseConnectionReturn {
   connectionStatus: ConnectionStatus;
@@ -83,7 +84,7 @@ export function useConnection(
 
         return true;
       } catch (e) {
-        setError(e instanceof Error ? e.message : "Connection failed");
+        setError(describeThrown(e, "Connection failed"));
         setConnectionStatus("error");
         return false;
       }
@@ -191,7 +192,7 @@ export function useConnection(
 
         return true;
       } catch (e) {
-        setError(e instanceof Error ? e.message : "Switch failed");
+        setError(describeThrown(e, "Switch failed"));
         return false;
       }
     },

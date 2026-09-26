@@ -8,6 +8,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 interface ApiResponse<T> {
   success: boolean;
@@ -73,7 +74,7 @@ export function useRunnerCrud<T extends { id: string }>(
       const result = await apiRequest<T[]>("GET", resourcePath);
       setItems(result || []);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load items");
+      setError(describeThrown(err, "Failed to load items"));
     } finally {
       setLoading(false);
     }
@@ -90,7 +91,7 @@ export function useRunnerCrud<T extends { id: string }>(
         }
         return result;
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to create item");
+        setError(describeThrown(err, "Failed to create item"));
         return null;
       } finally {
         setLoading(false);
@@ -110,7 +111,7 @@ export function useRunnerCrud<T extends { id: string }>(
         }
         return result;
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to update item");
+        setError(describeThrown(err, "Failed to update item"));
         return null;
       } finally {
         setLoading(false);
@@ -128,7 +129,7 @@ export function useRunnerCrud<T extends { id: string }>(
         setItems((prev) => prev.filter((item) => item.id !== id));
         return true;
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to delete item");
+        setError(describeThrown(err, "Failed to delete item"));
         return false;
       } finally {
         setLoading(false);
@@ -145,7 +146,7 @@ export function useRunnerCrud<T extends { id: string }>(
         const result = await apiRequest<unknown>("POST", `${resourcePath}/${id}/${action}`);
         return result;
       } catch (err) {
-        setError(err instanceof Error ? err.message : `Failed to run ${action}`);
+        setError(describeThrown(err, `Failed to run ${action}`));
         return null;
       } finally {
         setLoading(false);

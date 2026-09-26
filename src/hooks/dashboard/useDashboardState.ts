@@ -23,6 +23,7 @@ import {
   detectCurrentOrchestratorAgent,
 } from "../../components/shared/AiMessageDisplay";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 // Polling is now fallback only - real-time events provide instant updates
 const ACTIVITY_POLL_INTERVAL_MS = 5000;
@@ -252,7 +253,7 @@ export function useDashboardState(): UseDashboardStateResult {
     try {
       await refreshTask();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to refresh");
+      setError(describeThrown(e, "Failed to refresh"));
     }
   }, [refreshTask]);
 

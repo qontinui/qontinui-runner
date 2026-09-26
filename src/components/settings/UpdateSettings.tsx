@@ -4,6 +4,7 @@ import { Download, RefreshCw, CheckCircle, AlertCircle, Info } from "lucide-reac
 import { SectionHeader } from "./SectionHeader";
 import { getStatusColors } from "@/design-system";
 import type { LogFunction, UpdateInfo, UpdateStatus } from "./types";
+import { describeThrown } from "@/lib/utils";
 
 interface UpdateSettingsProps {
   onLog: LogFunction;
@@ -40,7 +41,7 @@ export function UpdateSettings({ onLog }: UpdateSettingsProps) {
       }
       setStatus("idle");
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : String(err);
+      const errorMessage = describeThrown(err, "Failed to check for updates");
       setError(errorMessage);
       setStatus("error");
       onLog("error", `Failed to check for updates: ${errorMessage}`);
@@ -83,7 +84,7 @@ export function UpdateSettings({ onLog }: UpdateSettingsProps) {
         onLog("error", result.message || "Failed to install update");
       }
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : String(err);
+      const errorMessage = describeThrown(err, "Failed to install update");
       setError(errorMessage);
       setStatus("error");
       onLog("error", `Failed to install update: ${errorMessage}`);

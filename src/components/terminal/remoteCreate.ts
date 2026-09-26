@@ -21,6 +21,8 @@
  * it is NOT the create dial that refused.
  */
 
+import { describeThrown } from "@/lib/utils";
+
 /** The object `terminal_create_remote` rejects with (Rust `RemoteCreateError`). */
 export interface RemoteCreateErrorWire {
   stage?: string;
@@ -121,12 +123,11 @@ function preferenceOffRemedy(
  */
 export function describeRemoteCreateFailure(err: unknown): RemoteCreateRefusal {
   if (err === null || typeof err !== "object") {
-    const raw = err instanceof Error ? err.message : typeof err === "string" ? err : String(err);
     return {
       code: "",
       stage: "unknown",
       headline: "Remote create failed",
-      explanation: raw.trim() || "the runner gave no reason",
+      explanation: describeThrown(err, "the runner gave no reason"),
       remedy: [],
       strandedTerminalId: null,
     };

@@ -23,6 +23,7 @@ import {
 import { listRegistry, installWrapper } from "@/lib/wrappers/api";
 import type { RegistryWrapperEntry, InstalledWrapper } from "@/lib/wrappers/types";
 import { TransportBadge } from "@/components/wrappers/TransportBadge";
+import { describeThrown } from "@/lib/utils";
 
 export interface BrowseTabProps {
   installedIds: Set<string>;
@@ -44,7 +45,7 @@ export function BrowseTab({ installedIds, onInstalled }: BrowseTabProps) {
       setEntries(list);
       setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(describeThrown(err, "Failed to load wrapper registry"));
     } finally {
       setLoading(false);
     }
@@ -85,7 +86,7 @@ export function BrowseTab({ installedIds, onInstalled }: BrowseTabProps) {
     } catch (err) {
       setInstallError((p) => ({
         ...p,
-        [entry.id]: err instanceof Error ? err.message : String(err),
+        [entry.id]: describeThrown(err, "Failed to install wrapper"),
       }));
     } finally {
       setInstalling((p) => {

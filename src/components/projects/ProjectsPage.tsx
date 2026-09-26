@@ -27,6 +27,7 @@ import { sortProjects } from "./cardExtras";
 import { ProjectCard } from "./ProjectCard";
 import { ProjectDetail } from "./ProjectDetail";
 import { ProjectEmptyState } from "./ProjectEmptyState";
+import { describeThrown } from "@/lib/utils";
 
 const log = createLogger("ProjectsPage");
 
@@ -88,7 +89,7 @@ export function ProjectsPage({ onNavigateToTerminal }: ProjectsPageProps) {
       await saveAll([...projects, ...found]);
       setScanMessage(found.length === 1 ? "Added 1 project." : `Added ${found.length} projects.`);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "unknown error");
       log.error("discover_projects failed", msg);
       setScanMessage(`Could not scan that folder: ${msg}`);
     } finally {
@@ -140,7 +141,7 @@ export function ProjectsPage({ onNavigateToTerminal }: ProjectsPageProps) {
         });
         await refresh();
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = describeThrown(err, "unknown error");
         log.error("set_project_pinned failed", msg);
         setScanMessage(`Could not pin that project: ${msg}`);
       }

@@ -15,6 +15,7 @@ import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { Button } from "../ui/Button";
 import type { WizardApi } from "./ConnectionWizard";
 import type { WizardElementPreview } from "./types";
+import { describeThrown } from "@/lib/utils";
 
 type StageState = "pending" | "running" | "ok" | "fail";
 
@@ -114,7 +115,7 @@ export function VerificationStep({
       if (!proxyUrl) throw new Error("No proxy URL available");
       update("transport", { state: "ok", detail: proxyUrl });
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
+      const msg = describeThrown(e, "Transport check failed");
       update("transport", { state: "fail", detail: msg });
       api.setError(msg);
       return;
@@ -133,7 +134,7 @@ export function VerificationStep({
         detail: `${body.uiBridge.appName ?? "unknown app"} · ${caps} capabilities`,
       });
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
+      const msg = describeThrown(e, "Health check failed");
       update("health", { state: "fail", detail: msg });
       api.setError(msg);
       return;
@@ -171,7 +172,7 @@ export function VerificationStep({
       onConnected();
       setTimeout(() => api.next(), 400);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
+      const msg = describeThrown(e, "Element check failed");
       update("elements", { state: "fail", detail: msg });
       api.setError(msg);
     }

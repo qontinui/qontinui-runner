@@ -20,6 +20,7 @@ import type { UnifiedWorkflow } from "../../types";
 import { getTotalStepCount } from "../../types/unified-workflow";
 import { getAccentColors } from "@/design-system";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 const AI_PROVIDERS = [
   { value: "", label: "Default (from settings)" },
@@ -186,7 +187,7 @@ export function AiGenerateWorkflowModal({
         setError(data.error || "Failed to generate workflow. Please try again.");
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to generate workflow");
+      setError(describeThrown(err, "Failed to generate workflow"));
     } finally {
       setIsGenerating(false);
     }

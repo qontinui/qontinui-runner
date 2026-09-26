@@ -22,6 +22,7 @@ import {
 } from "lucide-react";
 import { listCredentials, setCredential, clearCredential } from "@/lib/wrappers/api";
 import type { CredentialEntry, WrapperManifest } from "@/lib/wrappers/types";
+import { describeThrown } from "@/lib/utils";
 
 export interface SettingsTabProps {
   wrapperId: string;
@@ -46,7 +47,7 @@ export function SettingsTab({ wrapperId, manifest }: SettingsTabProps) {
       setCredentials(list);
       setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(describeThrown(err, "Failed to load credentials"));
     } finally {
       setLoading(false);
     }
@@ -90,7 +91,7 @@ export function SettingsTab({ wrapperId, manifest }: SettingsTabProps) {
       await clearCredential(wrapperId, name);
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(describeThrown(err, "Failed to clear credential"));
     }
   };
 
@@ -100,7 +101,7 @@ export function SettingsTab({ wrapperId, manifest }: SettingsTabProps) {
       setEditing(null);
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(describeThrown(err, "Failed to save credential"));
     }
   };
 

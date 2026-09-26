@@ -31,6 +31,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { createLogger } from "@/lib/logger";
+import { describeThrown } from "@/lib/utils";
 
 const logger = createLogger("FileOwnershipHeatmap");
 
@@ -125,9 +126,7 @@ export function computeHeatmapRows(
 
   const out: HeatmapRow[] = [];
   for (const g of groups.values()) {
-    const sessionEntries = [...g.perSession.entries()].sort(
-      (a, b) => b[1] - a[1],
-    );
+    const sessionEntries = [...g.perSession.entries()].sort((a, b) => b[1] - a[1]);
     const taskRunIds = sessionEntries.map(([id]) => id);
     out.push({
       filePath: g.filePath,
@@ -183,14 +182,13 @@ export function FileOwnershipHeatmap({
   const fetchRows = useMemo(() => {
     return async () => {
       try {
-        const result = await invoke<TouchedFileRow[]>(
-          "recent_session_touched_files",
-          { windowSecs: windowSecsRef.current },
-        );
+        const result = await invoke<TouchedFileRow[]>("recent_session_touched_files", {
+          windowSecs: windowSecsRef.current,
+        });
         setRawRows(Array.isArray(result) ? result : []);
         setError(null);
       } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
+        const msg = describeThrown(e, "Failed to load recent file ownership");
         logger.warn("recent_session_touched_files failed:", msg);
         setError(msg);
       } finally {
@@ -240,10 +238,7 @@ export function FileOwnershipHeatmap({
     };
   }, [fetchRows]);
 
-  const rows = useMemo(
-    () => computeHeatmapRows(rawRows, tickMs),
-    [rawRows, tickMs],
-  );
+  const rows = useMemo(() => computeHeatmapRows(rawRows, tickMs), [rawRows, tickMs]);
 
   return (
     <div className="w-[420px] h-full shrink-0 flex flex-col bg-[#1a1b26] border-l border-[#2a2d3d]">
@@ -271,9 +266,7 @@ export function FileOwnershipHeatmap({
         )}
 
         {!loading && error && (
-          <div className="p-3 text-xs text-[#f7768e]">
-            Failed to load file activity: {error}
-          </div>
+          <div className="p-3 text-xs text-[#f7768e]">Failed to load file activity: {error}</div>
         )}
 
         {!loading && !error && rows.length === 0 && (

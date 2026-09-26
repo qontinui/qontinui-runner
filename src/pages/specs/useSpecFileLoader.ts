@@ -14,6 +14,7 @@ import { useState, useCallback } from "react";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
 import type { LoadedSpec } from "./types";
+import { describeThrown } from "@/lib/utils";
 
 /** Spec kinds that can be loaded from file (excludes style-guide) */
 type FileSpecKind = "page-spec" | "architecture" | "api" | "data" | "dependency" | "constraint";
@@ -120,7 +121,7 @@ export function useSpecFileLoader(): UseSpecFileLoaderReturn {
       setIsLoading(false);
       return spec;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Failed to load spec file";
+      const msg = describeThrown(err, "Failed to load spec file");
       setError(msg);
       setIsLoading(false);
       return null;
@@ -150,7 +151,7 @@ export function useSpecFileLoader(): UseSpecFileLoaderReturn {
       await writeTextFile(selected, json);
       return true;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Failed to save spec file";
+      const msg = describeThrown(err, "Failed to save spec file");
       setError(msg);
       return false;
     }

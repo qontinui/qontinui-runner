@@ -67,6 +67,7 @@ import {
   type ExplainerSpecSummary,
   type ExplainerCluster,
 } from "@/lib/page-analysis-prompt-builder";
+import { describeThrown } from "@/lib/utils";
 
 // =============================================================================
 // File extraction from AI output
@@ -1967,7 +1968,7 @@ export function HookGenerationPanel({
         setPhase("preview");
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to write files");
+      setError(describeThrown(err, "Failed to write files"));
       setPhase("preview");
     }
   }, [generatedFiles, projectPath, isRegenHooks, isRegenSpec, onRefreshAnalysis]);

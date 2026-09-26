@@ -19,6 +19,7 @@ import type {
   BrowserErrorReport,
   FingerprintedEvent,
 } from "../types/browserErrors";
+import { describeThrown } from "@/lib/utils";
 
 // =============================================================================
 // Types
@@ -116,9 +117,11 @@ export function useBrowserErrors(options: UseBrowserErrorsOptions = {}): UseBrow
 
       setReport(compositeReport);
     } catch (err) {
-      const message = err instanceof Error ? err.message : "Failed to fetch browser errors";
+      const message = describeThrown(err, "Browser-errors read failed");
 
-      // Network errors likely mean SDK is not connected
+      // Network errors likely mean SDK is not connected. The fallback above
+      // deliberately avoids the "Failed to fetch" phrase so a non-Error
+      // rejection is never misread as a lost connection.
       if (
         message.includes("Failed to fetch") ||
         message.includes("NetworkError") ||

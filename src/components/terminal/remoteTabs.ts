@@ -1,4 +1,5 @@
 import type { FleetSession } from "./useFleetSessions";
+import { describeThrown } from "@/lib/utils";
 
 /**
  * Remote session tabs — the frontend half of plan
@@ -109,9 +110,11 @@ export function attachButtonState(
  * needs first, the detail is kept because it names the machine or grant.
  */
 export function attachErrorMessage(err: unknown): string {
-  const raw = err instanceof Error ? err.message : typeof err === "string" ? err : String(err);
-  const m = /^remote_attach:([a-z_]+)(?::([a-z_]+))?:\s*(.*)$/s.exec(raw.trim());
-  if (!m) return raw.trim() || "attach failed (no reason given)";
+  // describeThrown trims every shape and falls back on a blank cause, so `raw`
+  // is never empty and never carries leading whitespace.
+  const raw = describeThrown(err, "attach failed (no reason given)");
+  const m = /^remote_attach:([a-z_]+)(?::([a-z_]+))?:\s*(.*)$/s.exec(raw);
+  if (!m) return raw;
   const code = m[2] ? `${m[1]} (${m[2]})` : m[1];
   const detail = m[3]?.trim();
   return detail ? `${code} — ${detail}` : code;

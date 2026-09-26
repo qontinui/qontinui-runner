@@ -28,6 +28,7 @@ import {
 import { buildSpecDrivenWorkflow } from "../../lib/workflow-builder/buildSpecDrivenWorkflow";
 import { buildSpecBrief } from "../../lib/workflow-builder/buildSpecBrief";
 import { generateFromBrief } from "../../lib/workflow-builder/generateFromBrief";
+import { describeThrown } from "@/lib/utils";
 
 type Step = "load" | "select" | "configure" | "preview";
 type WorkflowMode = "verify" | "implement" | "update";
@@ -196,7 +197,7 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
         setAiError(response.message ?? "Generation failed");
       }
     } catch (err) {
-      setAiError(err instanceof Error ? err.message : "Generation failed");
+      setAiError(describeThrown(err, "Generation failed"));
     } finally {
       setIsGeneratingAi(false);
     }

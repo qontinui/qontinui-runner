@@ -32,6 +32,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 import { createLogger } from "@/lib/logger";
 import type { SavedProject } from "@/hooks/useSavedProjects";
+import { describeThrown } from "@/lib/utils";
 
 const log = createLogger("FrontPageSetup");
 
@@ -69,7 +70,7 @@ export function FrontPageSetup({ project, onConfigured }: FrontPageSetupProps) {
       // user did something wrong — and leave the manual field as the way out.
       setAutoFailed(true);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "Front-page auto-detection failed");
       log.error("autoconfigure_project failed", msg);
       setError(msg);
     } finally {
@@ -86,7 +87,7 @@ export function FrontPageSetup({ project, onConfigured }: FrontPageSetupProps) {
       await invoke("set_project_front_page", { id: project.id, url: trimmed });
       onConfigured(trimmed);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "Failed to set front page");
       log.error("set_project_front_page failed", msg);
       setError(msg);
     } finally {

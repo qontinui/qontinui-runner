@@ -4,6 +4,7 @@ import { tracedFetch } from "@/lib/traced-fetch";
 import { getApiBase } from "@/lib/runner-api";
 import { isValidTabId, type MainTabId } from "@/components/app/tab-types";
 import { buildPageCatalog } from "./pageCatalog";
+import { describeThrown } from "@/lib/utils";
 
 export interface PlanStep {
   type: "navigate" | "action";
@@ -284,7 +285,7 @@ export function usePromptExecution(): UsePromptExecutionReturn {
         setPhase("done");
       } catch (err) {
         if (abortRef.current) return;
-        const msg = err instanceof Error ? err.message : "An error occurred";
+        const msg = describeThrown(err, "An error occurred");
         setError(msg);
         setErrorKind(err instanceof AuthRequiredError ? "auth-required" : "generic");
         setPhase("error");

@@ -9,7 +9,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
-import { getErrorMessage } from "@/lib/utils";
+import { describeThrown } from "@/lib/utils";
 
 // ============================================================================
 // Type Definitions
@@ -292,7 +292,7 @@ export async function executeTransition(transitionId: string): Promise<Transitio
       success: false,
       transition_id: transitionId,
       active_states: [],
-      error: getErrorMessage(error),
+      error: describeThrown(error, "Failed to execute transition"),
     };
   }
 }
@@ -329,7 +329,7 @@ export async function navigateToState(stateId: string): Promise<NavigationResult
       path: [],
       active_states: [],
       target_state: stateId,
-      error: getErrorMessage(error),
+      error: describeThrown(error, "Failed to navigate to state"),
     };
   }
 }
@@ -365,7 +365,7 @@ export async function navigateToMultipleStates(stateIds: string[]): Promise<Navi
       success: false,
       path: [],
       active_states: [],
-      error: getErrorMessage(error),
+      error: describeThrown(error, "Failed to navigate to states"),
     };
   }
 }
@@ -396,7 +396,7 @@ export async function getActiveStates(): Promise<ActiveStatesResult> {
     return {
       success: false,
       active_states: [],
-      error: getErrorMessage(error),
+      error: describeThrown(error, "Failed to get active states"),
     };
   }
 }
@@ -428,7 +428,7 @@ export async function getAvailableTransitions(): Promise<AvailableTransitionsRes
     return {
       success: false,
       transitions: [],
-      error: getErrorMessage(error),
+      error: describeThrown(error, "Failed to get available transitions"),
     };
   }
 }
@@ -497,7 +497,7 @@ export async function getResolvedInitialStates(
       source: "defaults",
       states: [],
       workflowId,
-      error: getErrorMessage(error),
+      error: describeThrown(error, "Failed to get initial states"),
     };
   }
 }

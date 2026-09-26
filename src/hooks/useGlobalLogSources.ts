@@ -7,6 +7,7 @@
 
 import { useState, useCallback, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { describeThrown } from "@/lib/utils";
 
 // Types matching Rust backend
 interface GlobalLogSource {
@@ -111,7 +112,7 @@ export function useGlobalLogSources(): UseGlobalLogSourcesReturn {
       }
     } catch (err) {
       console.error("Failed to load global log source settings:", err);
-      setError(err instanceof Error ? err.message : String(err));
+      setError(describeThrown(err, "Failed to load settings"));
     } finally {
       setLoading(false);
     }
@@ -187,7 +188,7 @@ export function useGlobalLogSources(): UseGlobalLogSourcesReturn {
       setLogsState((prev) => ({
         ...prev,
         loading: false,
-        error: err instanceof Error ? err.message : String(err),
+        error: describeThrown(err, "Failed to read logs"),
       }));
     }
   }, [settings, getEnabledSources]);
