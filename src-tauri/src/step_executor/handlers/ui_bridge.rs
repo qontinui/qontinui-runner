@@ -528,7 +528,6 @@ fn parse_ui_bridge_target_as_criteria(raw: Option<&str>) -> Result<serde_json::V
         .map_err(|e| format!("ui_bridge_target is not valid JSON: {} (raw: {:?})", e, s))
 }
 
-/// Create a human-readable summary of search criteria for error messages.
 /// Decode a `component_action` step's `ui_bridge_target` into its typed
 /// target (qontinui-schemas `UiBridgeComponentActionTarget`).
 fn parse_component_action_target(
@@ -570,6 +569,34 @@ fn component_action_endpoint(
     }
 }
 
+/// The step result for a component-action response. Fails on a non-2xx
+/// status, on a top-level `success: false` (the SDK route answers a refused
+/// action with HTTP 200), and on a nested `data.success: false` (the control
+/// route's WS dispatch wraps the app's own reply in
+/// `ApiResponse::success(value)`).
+fn component_action_result(
+    target: &qontinui_types::workflow_step::UiBridgeComponentActionTarget,
+    status: reqwest::StatusCode,
+    body: serde_json::Value,
+) -> StepHandlerResult {
+    let refused = |v: &serde_json::Value| v.get("success").and_then(|s| s.as_bool()) == Some(false);
+    let nested_refused = body.get("data").is_some_and(refused);
+    if status.is_success() && !refused(&body) && !nested_refused {
+        StepHandlerResult::success_with_data(serde_json::json!({
+            "action": "component_action",
+            "componentId": target.component_id,
+            "actionId": target.action_id,
+            "result": body,
+        }))
+    } else {
+        StepHandlerResult::failure(format!(
+            "component_action {} on '{}' failed: {} - {}",
+            target.action_id, target.component_id, status, body
+        ))
+    }
+}
+
+/// Create a human-readable summary of search criteria for error messages.
 fn criteria_summary(criteria: &serde_json::Map<String, serde_json::Value>) -> String {
     criteria
         .iter()
@@ -1719,22 +1746,7 @@ impl UiBridgeHandler {
         };
         let status = resp.status();
         let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::json!({}));
-        // Both routes answer a refused action with `success: false` (the SDK
-        // route with HTTP 200), so the body decides as well as the status.
-        let refused = body.get("success").and_then(|v| v.as_bool()) == Some(false);
-        if status.is_success() && !refused {
-            StepHandlerResult::success_with_data(serde_json::json!({
-                "action": "component_action",
-                "componentId": target.component_id,
-                "actionId": target.action_id,
-                "result": body,
-            }))
-        } else {
-            StepHandlerResult::failure(format!(
-                "component_action {} on '{}' failed: {} - {}",
-                target.action_id, target.component_id, status, body
-            ))
-        }
+        component_action_result(&target, status, body)
     }
 
     /// Execute a "wait_for_element" — poll snapshot until an element matching criteria appears.
@@ -2315,6 +2327,47 @@ mod tests {
         assert_eq!(t.params, Some(serde_json::json!({"layoutId": "single"})));
         assert!(parse_component_action_target(None).is_err());
         assert!(parse_component_action_target(Some("{}")).is_err());
+    }
+
+    #[test]
+    fn component_action_result_fails_on_every_refusal_shape() {
+        use reqwest::StatusCode;
+        use serde_json::json;
+        let t =
+            parse_component_action_target(Some(r#"{"componentId":"c","actionId":"a"}"#)).unwrap();
+        let ok = component_action_result(
+            &t,
+            StatusCode::OK,
+            json!({"success": true, "data": {"success": true}}),
+        );
+        assert!(ok.success, "{:?}", ok.error);
+        assert_eq!(ok.output_data.unwrap()["componentId"], "c");
+        for (status, body, why) in [
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"success": true}),
+                "non-2xx",
+            ),
+            (
+                StatusCode::OK,
+                json!({"success": false, "error": "no such action"}),
+                "top-level success:false",
+            ),
+            (
+                StatusCode::OK,
+                json!({"success": true, "data": {"success": false, "error": "refused"}}),
+                "nested data.success:false",
+            ),
+        ] {
+            let r = component_action_result(&t, status, body);
+            assert!(!r.success, "{why} must fail");
+            assert!(
+                r.error
+                    .unwrap()
+                    .starts_with("component_action a on 'c' failed"),
+                "{why}"
+            );
+        }
     }
 
     #[test]

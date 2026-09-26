@@ -329,6 +329,21 @@ pub(super) enum DispatchRoute {
     ConversionFailed(String),
 }
 
+/// What `execute_single_step` returns for [`DispatchRoute::ConversionFailed`]:
+/// a failed step carrying the conversion seam's message, and nothing run.
+/// Split out so the outcome is testable without a `StepExecutor`.
+pub(super) fn conversion_failure_outcome(
+    error: String,
+) -> (
+    bool,
+    Option<String>,
+    Option<String>,
+    Option<serde_json::Value>,
+) {
+    warn!("Step failed at conversion: {}", error);
+    (false, Some(error), None, None)
+}
+
 /// Decide where a step goes. Pure, so the routing is testable without a
 /// `StepExecutor` (which needs a live `AppState`).
 pub(super) fn resolve_dispatch(
@@ -1620,10 +1635,7 @@ impl StepExecutor {
                     None,
                 );
             }
-            DispatchRoute::ConversionFailed(error) => {
-                warn!("Step failed at conversion: {}", error);
-                return (false, Some(error), None, None);
-            }
+            DispatchRoute::ConversionFailed(error) => return conversion_failure_outcome(error),
             DispatchRoute::Legacy(legacy) => legacy,
         };
 
