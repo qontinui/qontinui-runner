@@ -7,6 +7,7 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { describeThrown } from "@/lib/utils";
 
 export interface PromptCanaryMetrics {
   success_count: number;
@@ -65,7 +66,7 @@ export function usePromptCanaryList(): UsePromptCanaryListReturn {
       const data = await invoke<PromptCanaryStatus[]>("get_prompt_canary_status");
       setCanaries(data);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(describeThrown(e, "Failed to load prompt canaries"));
     } finally {
       setLoading(false);
     }
@@ -89,7 +90,7 @@ export function usePromptCanaryList(): UsePromptCanaryListReturn {
         await invoke("promote_prompt_canary", { canaryId });
         await refresh();
       } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
+        setError(describeThrown(e, "Failed to promote prompt canary"));
       }
     },
     [refresh],
@@ -101,7 +102,7 @@ export function usePromptCanaryList(): UsePromptCanaryListReturn {
         await invoke("rollback_prompt_canary", { canaryId });
         await refresh();
       } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
+        setError(describeThrown(e, "Failed to roll back prompt canary"));
       }
     },
     [refresh],
@@ -139,7 +140,7 @@ export function useCreatePromptCanary(): UseCreatePromptCanaryReturn {
         });
         setSuccess(true);
       } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
+        setError(describeThrown(e, "Failed to create prompt canary"));
       } finally {
         setCreating(false);
       }

@@ -9,6 +9,7 @@ import { useState, useEffect, useCallback } from "react";
 import type { PlaywrightData, TestSpec, TestStatus } from "./types";
 import { DEFAULT_PLAYWRIGHT_DATA } from "./types";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 /**
  * Response shape from the playwright log API.
@@ -247,7 +248,7 @@ export function usePlaywrightDataWithStatus(): {
       setData(parsed);
       setError(null);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to fetch Playwright data");
+      setError(describeThrown(e, "Failed to fetch Playwright data"));
       setData(DEFAULT_PLAYWRIGHT_DATA);
     } finally {
       setIsLoading(false);

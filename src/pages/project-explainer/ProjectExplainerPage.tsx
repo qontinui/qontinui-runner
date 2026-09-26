@@ -19,6 +19,7 @@ import { getApiBase } from "@/lib/runner-api";
 import { useAiSession } from "@/hooks/useAiSession";
 import { StreamingMessageView } from "@/components/shared";
 import { useUIElement } from "@qontinui/ui-bridge";
+import { describeThrown } from "@/lib/utils";
 
 const EXPLAINER_ROOT = "src/specs/explainer";
 
@@ -51,7 +52,7 @@ function MermaidDiagram({ chart }: { chart: string }) {
       })
       .catch((e) => {
         if (cancelled) return;
-        setError(e instanceof Error ? e.message : String(e));
+        setError(describeThrown(e, "Failed to render diagram"));
       });
     return () => {
       cancelled = true;
@@ -135,7 +136,7 @@ export function ProjectExplainerPage() {
         setCurrentFile(relPath);
         setMarkdown(stripped);
       } catch (e) {
-        setLoadError(e instanceof Error ? e.message : String(e));
+        setLoadError(describeThrown(e, "Failed to load file"));
       } finally {
         setLoading(false);
       }

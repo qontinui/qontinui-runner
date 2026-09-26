@@ -8,7 +8,7 @@
 import type { Finding, ExecutionReport, PhaseInfo, UserInputRequest } from "../types/findings";
 import { calculateSummary, createEmptySummary } from "./FindingsExport";
 import { createLogger } from "@/lib/logger";
-import { getErrorMessage } from "@/lib/utils";
+import { describeThrown } from "@/lib/utils";
 
 const log = createLogger("FindingsSync");
 
@@ -189,7 +189,7 @@ export async function syncFindingsToBackend(
     result.syncedCount = data.syncedCount || findings.length;
     log.debug(`Synced ${result.syncedCount} findings to backend`);
   } catch (error) {
-    const errorMessage = getErrorMessage(error);
+    const errorMessage = describeThrown(error, "unknown error");
     result.errors.push(`Sync failed: ${errorMessage}`);
     console.error("[FindingsSync] Backend sync error:", error);
   }
@@ -239,7 +239,7 @@ export async function syncReportToBackend(
     result.syncedCount = 1;
     log.debug(`Synced report ${report.id} to backend`);
   } catch (error) {
-    const errorMessage = getErrorMessage(error);
+    const errorMessage = describeThrown(error, "unknown error");
     result.errors.push(`Sync failed: ${errorMessage}`);
     console.error("[FindingsSync] Report sync error:", error);
   }

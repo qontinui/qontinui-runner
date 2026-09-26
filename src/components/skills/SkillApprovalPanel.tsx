@@ -17,6 +17,7 @@ import {
   ChevronRight,
 } from "lucide-react";
 import { getApiBase } from "../../lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 // =============================================================================
 // Types
@@ -72,7 +73,7 @@ export function SkillApprovalPanel() {
       const autoSkills = all.filter((s) => s.source === "auto");
       setSkills(autoSkills);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to fetch skills");
+      setError(describeThrown(e, "Failed to fetch skills"));
     } finally {
       setLoading(false);
     }

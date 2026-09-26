@@ -7,6 +7,7 @@ import {
   type EvaluationDimension,
   type CoverageEntry,
 } from "./types";
+import { describeThrown } from "@/lib/utils";
 
 // ============================================================================
 // Dimension Heatmap Cell
@@ -201,7 +202,7 @@ export function StepEvaluationTab() {
       });
       setEvaluation(result);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Evaluation failed");
+      setError(describeThrown(e, "Evaluation failed"));
     } finally {
       setLoading(false);
     }

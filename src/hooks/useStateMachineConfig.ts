@@ -20,6 +20,7 @@ import type {
   StateMachineTransitionUpdate,
   StateMachineExportFormat,
 } from "@qontinui/shared-types";
+import { describeThrown } from "@/lib/utils";
 
 export interface UseStateMachineConfigReturn {
   // Config list
@@ -91,7 +92,7 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
       const result = await invoke<StateMachineConfig[]>("sm_list_configs");
       setConfigs(result);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(describeThrown(err, "Failed to load state machine configs"));
     } finally {
       setIsLoading(false);
     }
@@ -112,7 +113,7 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
         }
         setActiveConfig(result);
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
+        setError(describeThrown(err, "Failed to load state machine config"));
       } finally {
         setIsLoading(false);
       }
@@ -131,7 +132,7 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
         setActiveConfig({ ...result, states: [], transitions: [] });
         return result;
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = describeThrown(err, "Failed to create config");
         setError(msg);
         throw new Error(msg, { cause: err });
       }
@@ -146,7 +147,7 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
       setActiveConfigRaw((prev) => (prev && prev.id === id ? { ...prev, ...result } : prev));
       return result;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "Failed to update config");
       setError(msg);
       throw new Error(msg, { cause: err });
     }
@@ -168,7 +169,7 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
         return prev;
       });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "Failed to delete config");
       setError(msg);
       throw new Error(msg, { cause: err });
     }
@@ -187,7 +188,7 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
         setActiveConfigRaw((prev) => (prev ? { ...prev, states: [...prev.states, result] } : prev));
         return result;
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = describeThrown(err, "Failed to create state");
         setError(msg);
         throw new Error(msg, { cause: err });
       }
@@ -203,7 +204,7 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
       );
       return result;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "Failed to update state");
       setError(msg);
       throw new Error(msg, { cause: err });
     }
@@ -216,7 +217,7 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
         prev ? { ...prev, states: prev.states.filter((s) => s.id !== id) } : prev,
       );
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "Failed to delete state");
       setError(msg);
       throw new Error(msg, { cause: err });
     }
@@ -237,7 +238,7 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
         );
         return result;
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = describeThrown(err, "Failed to create transition");
         setError(msg);
         throw new Error(msg, { cause: err });
       }
@@ -261,7 +262,7 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
       );
       return result;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "Failed to update transition");
       setError(msg);
       throw new Error(msg, { cause: err });
     }
@@ -274,7 +275,7 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
         prev ? { ...prev, transitions: prev.transitions.filter((t) => t.id !== id) } : prev,
       );
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "Failed to delete transition");
       setError(msg);
       throw new Error(msg, { cause: err });
     }
@@ -293,7 +294,7 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
         await loadConfig(result.id);
         return result;
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = describeThrown(err, "Failed to import config");
         setError(msg);
         throw new Error(msg, { cause: err });
       }

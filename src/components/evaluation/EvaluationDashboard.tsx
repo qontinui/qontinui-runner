@@ -16,6 +16,7 @@ import { DatasetList } from "./DatasetList";
 import { DatasetDetail } from "./DatasetDetail";
 import { ExperimentList } from "./ExperimentList";
 import { ExperimentResults } from "./ExperimentResults";
+import { describeThrown } from "@/lib/utils";
 
 const LiveEvaluationPanel = lazy(() => import("./LiveEvaluationPanel"));
 
@@ -88,9 +89,7 @@ export default function EvaluationDashboard() {
         }
       },
       onError: (err) => {
-        window.alert(
-          `Failed to delete dataset: ${err instanceof Error ? err.message : String(err)}`,
-        );
+        window.alert(`Failed to delete dataset: ${describeThrown(err, "unknown error")}`);
       },
     });
   };
@@ -98,7 +97,7 @@ export default function EvaluationDashboard() {
   const handleDeleteItem = (itemId: string) => {
     deleteItem.mutate(itemId, {
       onError: (err) => {
-        window.alert(`Failed to delete item: ${err instanceof Error ? err.message : String(err)}`);
+        window.alert(`Failed to delete item: ${describeThrown(err, "unknown error")}`);
       },
     });
   };
@@ -132,8 +131,8 @@ export default function EvaluationDashboard() {
             <FlaskConical className="w-12 h-12 mx-auto mb-4 opacity-50" />
             <p className="font-medium">Evaluation Dashboard</p>
             <p className="text-sm mt-2">
-              The evaluation backend is not yet enabled in this runner build.
-              Datasets and experiments will appear here once the
+              The evaluation backend is not yet enabled in this runner build. Datasets and
+              experiments will appear here once the
               <code className="mx-1 px-1 py-0.5 rounded bg-muted text-xs">
                 /api/v1/evaluation/datasets
               </code>

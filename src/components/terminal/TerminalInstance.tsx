@@ -68,6 +68,7 @@ import {
 import { declarePaneTier } from "./terminalVisibilityTiers";
 import { PaneVisibilityService, routeOutputChunk } from "./paneVisibilityService";
 import { setWebglSlotVisible } from "./backends/webglContextLru";
+import { describeThrown } from "@/lib/utils";
 
 export type { TerminalWriteResult } from "./terminalWriteResult";
 
@@ -2009,11 +2010,9 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
             reason: "instance-ladder",
             elapsedMs: Math.round(elapsedMs),
             detail:
-              lastError instanceof Error
-                ? lastError.message
-                : lastError === undefined
-                  ? null
-                  : String(lastError),
+              lastError === undefined
+                ? null
+                : describeThrown(lastError, "bridge registration failed"),
           }).catch(() => {});
         },
       });

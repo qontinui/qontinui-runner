@@ -16,6 +16,7 @@ import { buildExportConfig } from "@qontinui/workflow-utils";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import type { StateMachineConfigFull } from "@qontinui/shared-types";
 import type { ShowToastFn } from "@/hooks/useToast";
+import { describeThrown } from "@/lib/utils";
 
 interface ExportPanelProps {
   config: StateMachineConfigFull | null;
@@ -44,7 +45,7 @@ export function ExportPanel({ config, showToast }: ExportPanelProps) {
         log.debug(`Exported to ${filePath}`);
       }
     } catch (err) {
-      const errMsg = `Export failed: ${err instanceof Error ? err.message : "Unknown error"}`;
+      const errMsg = `Export failed: ${describeThrown(err, "Unknown error")}`;
       showToast?.(errMsg, "error");
       console.warn(errMsg);
     } finally {
@@ -71,7 +72,7 @@ export function ExportPanel({ config, showToast }: ExportPanelProps) {
       showToast?.("State machine loaded into runtime", "success");
       log.debug("State machine loaded into runtime");
     } catch (err) {
-      const loadErrMsg = `Load failed: ${err instanceof Error ? err.message : "Unknown error"}`;
+      const loadErrMsg = `Load failed: ${describeThrown(err, "Unknown error")}`;
       showToast?.(loadErrMsg, "error");
       console.warn(loadErrMsg);
     } finally {
