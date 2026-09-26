@@ -918,8 +918,18 @@ pub const FD_STARVED_FLOOR: u64 = 32;
 /// costs one suppressed recreate (the verdict and the `errored` status are
 /// both still published, and the moment headroom recovers the next tick
 /// recovers), while a false `Ample` costs the 240-ladder, 7-dialog incident.
+///
+/// Capped at a QUARTER of the limit (and never below 1). Without the cap a
+/// small soft limit turns the floor into a permanent verdict: at a limit of
+/// 32 or less headroom can never reach 32, so every measured state would read
+/// `Starved`, and unlike the stamp arm the headroom arm has no window to lapse
+/// — a genuinely dead webview would never recover. With the cap, a process
+/// must hold three quarters of a small limit before its headroom is evidence.
 pub fn fd_starvation_threshold(soft_limit: u64) -> u64 {
-    FD_STARVED_FLOOR.max(soft_limit / 20)
+    FD_STARVED_FLOOR
+        .max(soft_limit / 20)
+        .min(soft_limit / 4)
+        .max(1)
 }
 
 /// Whether the runner's RECEIVE path was starved of descriptors.
@@ -2926,11 +2936,33 @@ mod tests {
     const OUT_OF_WINDOW: u64 = NOW - (UI_DEAD_AFTER_MS + 1);
 
     #[test]
-    fn threshold_is_the_floor_or_five_percent_whichever_is_larger() {
-        assert_eq!(fd_starvation_threshold(0), FD_STARVED_FLOOR);
+    fn threshold_is_the_floor_or_five_percent_capped_at_a_quarter_of_the_limit() {
+        assert_eq!(fd_starvation_threshold(0), 1);
+        assert_eq!(fd_starvation_threshold(16), 4);
+        assert_eq!(fd_starvation_threshold(64), 16);
+        assert_eq!(fd_starvation_threshold(128), FD_STARVED_FLOOR);
         assert_eq!(fd_starvation_threshold(256), FD_STARVED_FLOOR);
         assert_eq!(fd_starvation_threshold(1_024), 51);
         assert_eq!(fd_starvation_threshold(65_536), 3_276);
+    }
+
+    /// A small soft limit must not make the headroom arm a permanent
+    /// suppression: a process using well under its limit reads `Ample`, so a
+    /// dead webview there still recovers.
+    #[test]
+    fn a_small_soft_limit_is_not_permanent_starvation() {
+        for (open, limit) in [(8, 16), (20, 32), (33, 64), (60, 128)] {
+            assert_eq!(
+                classify_fd_pressure(fd(Some(open), Some(limit), 0), NOW),
+                FdPressure::Ample,
+                "open={open} limit={limit}"
+            );
+        }
+        // …while a small limit that is genuinely nearly full still starves.
+        assert_eq!(
+            classify_fd_pressure(fd(Some(62), Some(64), 0), NOW),
+            FdPressure::Starved
+        );
     }
 
     /// The whole fd-pressure matrix, every UNKNOWN row included. Columns:

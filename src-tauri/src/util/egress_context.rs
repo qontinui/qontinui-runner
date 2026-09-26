@@ -395,11 +395,13 @@ pub(crate) fn open_descriptor_count() -> Measured {
 
     #[cfg(not(target_os = "linux"))]
     {
-        // Windows' `GetProcessHandleCount` counts every kernel handle, and
-        // Windows has no per-process ceiling to hold it against (see
-        // [`fd_soft_limit`]), so a count there could never become a headroom.
-        // Reuse the census for the number rather than duplicating the FFI.
-        handle_census().open
+        // Windows' `GetProcessHandleCount` counts every kernel handle —
+        // threads, events, mutexes — not descriptors, and there is no
+        // per-process ceiling to hold it against (see [`fd_soft_limit`]).
+        // Publishing it as `fd_open` would label a handle count a descriptor
+        // count, so off Linux this read is honestly UNKNOWN. The handle count
+        // is still reported by `handle_census` under its own name.
+        Measured::Unavailable("descriptor count is measured on Linux only")
     }
 }
 
@@ -564,24 +566,26 @@ pub(crate) fn log_baseline() {
         Measured::Counted(n) => n.to_string(),
         Measured::Unavailable(why) => format!("unavailable({why})"),
     };
-    // Headroom against the soft limit, appended AFTER the existing fields so a
-    // reader matching the established prefix is undisturbed. The count is the
-    // census's own, so the headroom and `open_handles` on one line agree.
+    // Headroom against the soft limit. The two fields sit BEFORE the
+    // variable-length `in_flight/failures` tail, not after it: a reader that
+    // treats everything after `in_flight/failures` as per-client pairs would
+    // otherwise swallow them. The count is the census's own, so the headroom
+    // and `open_handles` on one line agree.
     let headroom = FdHeadroom {
         open: census.open.clone(),
         soft_limit: fd_soft_limit(),
     };
     info!(
-        "egress_baseline: uptime_ms={} open_handles={} socket_handles={} in_flight/failures {} \
-         fd_soft_limit={} fd_headroom={}",
+        "egress_baseline: uptime_ms={} open_handles={} socket_handles={} fd_soft_limit={} \
+         fd_headroom={} in_flight/failures {}",
         process_uptime_ms()
             .map(|v| v.to_string())
             .unwrap_or_else(|| "unknown".to_string()),
         m(&census.open),
         m(&census.sockets),
-        per_client.join(" "),
         m(&headroom.soft_limit),
         m(&headroom.headroom()),
+        per_client.join(" "),
     );
 }
 
