@@ -1764,10 +1764,11 @@ pub enum MachineKeyEnrolError {
     /// 403 `device_machine_key_revoked`: the operator revoked this device's
     /// key. Terminal — do not retry.
     Revoked,
-    /// 409 `machine_key_still_usable`: web already holds an unrevoked key for
-    /// this device with more than 7 days left, and self-mint will not rotate
-    /// it. The runner has lost its local copy; only the owner's user-bearer
-    /// `/mint` can replace it. Terminal for self-mint — do not retry.
+    /// 409 `machine_key_still_usable`: web holds an unrevoked key for this
+    /// device with more than 7 days left, and self-mint will not rotate it.
+    /// Either the local expiry is stale (web slides `expires_at` on every
+    /// exchange and does not report it) or the runner lost its copy. A long
+    /// self-mint backoff, not a verdict; the owner's `/mint` can still rotate.
     ServerKeyStillUsable,
     /// Any other 401 / 403 (expired or foreign bearer, provenance refused,
     /// device not owned). Carries web's `detail.code` when it sent one.
@@ -1790,11 +1791,9 @@ impl std::fmt::Display for MachineKeyEnrolError {
                 write!(f, "enrolment unavailable (web predates the route)")
             }
             MachineKeyEnrolError::Revoked => write!(f, "device machine key revoked"),
-            MachineKeyEnrolError::ServerKeyStillUsable => write!(
-                f,
-                "web holds a still-usable key this runner does not have; only the owner's \
-                 /mint can replace it"
-            ),
+            MachineKeyEnrolError::ServerKeyStillUsable => {
+                write!(f, "web still considers this device's key usable (409)")
+            }
             MachineKeyEnrolError::Refused { status, code } => {
                 write!(
                     f,
@@ -1880,14 +1879,45 @@ pub fn mint_device_machine_key(
             "empty device_machine_key".to_string(),
         ));
     }
+    // A 2xx means web has ALREADY rotated the key: the previous plaintext is
+    // dead. Refusing this one over a formatting difference would leave the
+    // device with no key at all, so compare by parsed UUID and only refuse a
+    // body that names a genuinely DIFFERENT device.
     if let Some(returned) = mint.device_id.as_deref() {
-        if !returned.trim().eq_ignore_ascii_case(device_id.trim()) {
-            return Err(MachineKeyEnrolError::Decode(format!(
-                "minted for device {returned}, asked for {device_id}"
-            )));
+        if !same_device_id(returned, device_id) {
+            let parsed = (
+                uuid::Uuid::parse_str(returned.trim()),
+                uuid::Uuid::parse_str(device_id.trim()),
+            );
+            if let (Ok(a), Ok(b)) = parsed {
+                if a != b {
+                    return Err(MachineKeyEnrolError::Decode(format!(
+                        "minted for device {returned}, asked for {device_id}"
+                    )));
+                }
+            }
+            // Unparseable on one side: web answered 2xx for OUR route, so the
+            // key is ours. Keep it — dropping it would lose a rotated key.
+            tracing::warn!(
+                "machine-key mint named device {returned:?} for requested {device_id:?} \
+                 (unparseable); storing the key anyway — web already rotated it"
+            );
         }
     }
     Ok(mint)
+}
+
+/// Do two device ids name the same device? By parsed UUID when both parse
+/// (case, braces and hyphenation differences are formatting), else by
+/// case-insensitive trimmed text.
+pub fn same_device_id(a: &str, b: &str) -> bool {
+    match (
+        uuid::Uuid::parse_str(a.trim()),
+        uuid::Uuid::parse_str(b.trim()),
+    ) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a.trim().eq_ignore_ascii_case(b.trim()),
+    }
 }
 
 /// Enrol a machine key right after an EXPLICIT pairing (pair-code redeem, the
