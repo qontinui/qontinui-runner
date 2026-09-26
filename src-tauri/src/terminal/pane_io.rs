@@ -206,6 +206,13 @@ impl LocalPty {
     }
 }
 
+/// Whether a `taskkill /F /T` exit code means the tree is gone: `0` (killed)
+/// or `128` ("process not found" — it had already exited, the Windows analogue
+/// of `ESRCH`). Pure so it is testable on every platform.
+fn taskkill_tree_gone(code: Option<i32>) -> bool {
+    matches!(code, Some(0) | Some(128))
+}
+
 /// Map a `kill(2)` return to the pane contract: `0` is success, `ESRCH` (the
 /// process is already gone) is success, anything else is an error the close
 /// path keys on — it keeps the terminal's coord-mcp key rather than revoking
@@ -296,7 +303,9 @@ impl PaneIo for LocalPty {
             let mut cmd = crate::process_helpers::no_window("taskkill");
             cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
             match crate::drain::output_with_timeout(cmd, budget) {
-                Ok(Some(out)) if out.status.success() => Ok(()),
+                // Exit 128 is "process not found": the shell already exited —
+                // the Windows analogue of `ESRCH`, so the tree IS gone.
+                Ok(Some(out)) if taskkill_tree_gone(out.status.code()) => Ok(()),
                 // A non-zero taskkill exit is a failed kill, not a success:
                 // callers (the terminal-key revoke at close) key on it.
                 Ok(Some(out)) => Err(format!(
@@ -391,6 +400,14 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn taskkill_exit_128_means_the_tree_is_already_gone() {
+        assert!(taskkill_tree_gone(Some(0)));
+        assert!(taskkill_tree_gone(Some(128)));
+        assert!(!taskkill_tree_gone(Some(1)));
+        assert!(!taskkill_tree_gone(None));
+    }
 
     /// `LocalPty::kill` no longer reports a failed `kill(2)` as success: `0`
     /// and `ESRCH` (already gone) are `Ok`, any other errno is `Err` — the

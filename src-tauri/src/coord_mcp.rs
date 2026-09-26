@@ -3996,10 +3996,34 @@ fn persist_proxy_nonces(map: &HashMap<String, NonceBinding>) {
     // through, and every caller passes an OWNED snapshot, so no registry lock
     // is held across the file I/O.
     note_agent_binding_census(map);
-    if !nonce_persistence_enabled() {
+    persist_live_nonce_state(nonce_persistence_enabled(), enqueue_nonce_persist);
+}
+
+/// Enqueue the persist snapshot from the LIVE registry, computed and handed to
+/// `enqueue` while the registry lock is HELD (round-4 review of plan
+/// `2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages`).
+///
+/// Why not the caller's snapshot: every mint and revoke clones the map under
+/// the lock and persists AFTER releasing it, so two of them could enqueue out of
+/// order — a mint's clone still holding key K enqueued after a revoke's clone
+/// without K, and written last, resurrecting K at the next boot. Taking the
+/// snapshot under the registry lock and enqueueing before releasing it puts
+/// every enqueue in the registry's own total order: a later enqueue always
+/// carries a later state. The queue keeps only the newest pending snapshot, and
+/// [`NONCE_WRITE`] makes a later-taken-from-the-queue snapshot the later write.
+///
+/// Lock order is registry -> grace ([`graced_nonce_snapshot`], the order the
+/// mint path already uses) -> `NONCE_PERSIST`. Nothing holding `NONCE_PERSIST`
+/// or the grace lock ever takes the registry lock.
+fn persist_live_nonce_state(
+    enabled: bool,
+    enqueue: impl FnOnce(HashMap<String, crate::secure_storage::StoredNonceBinding>),
+) {
+    if !enabled {
         return;
     }
-    enqueue_nonce_persist(device_nonce_snapshot(map));
+    let map = proxy_nonces().lock().expect("proxy nonce map poisoned");
+    enqueue(device_nonce_snapshot(&map));
 }
 
 /// Debounce window for the encrypted whole-store nonce write.
@@ -4210,7 +4234,9 @@ fn flush_nonce_persist_loop() {
 /// shutdown path's synchronous flush ([`release_all_terminal_bound_keys`]) — and
 /// without this an OLDER snapshot taken by one could have its atomic rename land
 /// after a NEWER one taken by the other, resurrecting revoked keys at the next
-/// boot. With it, a later-taken snapshot is always the later write.
+/// boot. With it, a snapshot later-taken FROM THE QUEUE is always the later
+/// write; that queue order is state order because every enqueue happens under
+/// the registry lock ([`persist_live_nonce_state`]).
 static NONCE_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Write whatever snapshot is pending (if any) to the encrypted store.
@@ -24081,5 +24107,43 @@ mod terminal_env_reference_tests {
             "the newest snapshot is durable"
         );
         assert!(q.pending.is_none());
+    }
+
+    /// Round 4 / W2: the persisted snapshot is the LIVE registry taken under
+    /// the registry lock, never a caller's earlier clone — so a stale clone that
+    /// still holds a revoked key cannot be enqueued after the revoke.
+    #[test]
+    fn a_stale_clone_is_never_what_gets_enqueued() {
+        let amb = crate::test_env::isolated_ambient();
+        let wd = workdir(&amb, "stale-snapshot");
+        let revoked = register_proxy_nonce(&wd, None, None);
+        let stale: HashMap<String, NonceBinding> = proxy_nonces().lock().unwrap().clone();
+        assert!(stale.contains_key(&revoked));
+        revoke_proxy_nonce(&revoked);
+        let kept = register_proxy_nonce(&wd, Some(&terminal()), None);
+
+        let mut captured = None;
+        let mut lock_held = false;
+        // The production entry point takes the stale clone for the census; the
+        // enqueued content must come from the live registry.
+        note_agent_binding_census(&stale);
+        persist_live_nonce_state(true, |bindings| {
+            lock_held = proxy_nonces().try_lock().is_err();
+            captured = Some(bindings);
+        });
+        let captured = captured.expect("enqueued");
+        assert!(
+            lock_held,
+            "the enqueue runs while the registry lock is held"
+        );
+        assert!(
+            !captured.contains_key(&revoked),
+            "the revoked key is not resurrected"
+        );
+        assert!(captured.contains_key(&kept));
+
+        let mut called = false;
+        persist_live_nonce_state(false, |_| called = true);
+        assert!(!called, "persistence off enqueues nothing");
     }
 }

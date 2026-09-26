@@ -4351,6 +4351,11 @@ impl TerminalSession {
     /// ([`Self::close_after_graceful_exit`]); every other teardown step runs.
     fn close_inner(&self, deadline: Option<std::time::Instant>, kill_child: bool) {
         info!(terminal_id = %self.id, "Closing terminal session");
+        // Read BEFORE `is_alive` flips: the waiter thread records the child's
+        // exit here when it reaps it, so `Some` means the pane's process was
+        // already gone before this close began — whatever the kill below
+        // reports (a `taskkill` of a dead pid exits non-zero).
+        let exited_before_close = self.exit_code().is_some();
         self.is_alive.store(false, Ordering::Relaxed);
 
         // Phase 2 — drop the isolated edit context first so the
@@ -4376,7 +4381,9 @@ impl TerminalSession {
                 Ok(()) => true,
                 Err(e) => {
                     warn!(terminal_id = %self.id, pid = ?self.child_pid, "{e}");
-                    false
+                    // A failed kill of a child the waiter had ALREADY reaped is
+                    // not a live tree.
+                    exited_before_close
                 }
             }
         } else {
@@ -5182,6 +5189,26 @@ mod tests {
         fn release(&self, _budget: Duration) -> Result<(), String> {
             Ok(())
         }
+    }
+
+    /// Round 4: a kill that FAILS for a child the waiter had already reaped
+    /// (the Windows `taskkill` of a dead pid) still revokes the key — the exit
+    /// recorded before the close is the proof the tree is gone.
+    #[test]
+    fn close_revokes_the_terminal_key_when_the_child_was_already_reaped() {
+        let amb = crate::test_env::isolated_ambient();
+        let wd = amb.dir().to_string_lossy().to_string();
+        let id = format!("term-{}", uuid::Uuid::new_v4());
+        let nonce = crate::coord_mcp::track_terminal_bound_key_for_test(&id, &wd);
+        let mut session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        session.id = id;
+        session.io = Arc::new(FailingKillPaneIo);
+        *session.exit_code.lock().unwrap() = Some(0);
+        session.close();
+        assert!(
+            !crate::coord_mcp::nonce_is_live_for_test(&nonce),
+            "a reaped child's key is revoked even though the kill reported an error"
+        );
     }
 
     /// W4 (plan `2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages`):
