@@ -15,8 +15,22 @@
 //! and renders ONE key-addressed header line of `QONTINUI_RUNNER_CONTEXT`:
 //!
 //! ```text
-//! [served-corpus: <canonical .claude>] [checkout: <repo> <branch>@<sha12> upstream=<ref> behind=<n> ahead=<m> as-of=<fetch-ts> dirty-claude=<k>] [bundle: <N>/<M> identical-to-build <gitSha> stamped=<k>] [provisioned: …] [cwd: …]
+//! [served-corpus: <canonical .claude>] [checkout: <repo> <branch>@<sha12> upstream=<ref> behind=<n> ahead=<m> as-of=<fetch-ts> dirty-claude=<k>] [bundle: <N>/<M> identical-to-build <gitSha> stamped=<k> served: canonical@<sha12> <c> fetched <ts>, builtin <b>, account <a>, unstamped <u>; identical-to-source <i>/<v> unverifiable=<x>] [provisioned: …] [cwd: …]
 //! ```
+//!
+//! The `bundle` token has two halves. The first, `<N>/<M> identical-to-build`,
+//! compares all M files the binary carries against THIS build's bytes — the
+//! provisioner-overwrite signature. The second is source-aware: each present
+//! file is sorted by the `source=` of its `qontinui-provenance:` stamp
+//! ([`crate::provenance`]) and compared against the copy of that source the
+//! process holds in memory — a `canonical` file against the loaded
+//! `canonical_corpus` snapshot when its stamp names that snapshot, a `builtin`
+//! file against this build's bundle, an unstamped file against this build's
+//! bundle too. An account file (`served` / `disk_cache`) is counted, never
+//! compared, and a file whose source copy is not in memory is `unverifiable`,
+//! never identical. `canonical@unloaded` means this process has loaded no
+//! snapshot yet. Reading the snapshot is a lock and an `Arc` clone: the probe
+//! never fetches.
 //!
 //! Every value is a measurement or `UNKNOWN (<reason>)`, never a default. The
 //! tokens are cut at their own first `]`, the line-2 grammar, so no rendered
@@ -131,6 +145,69 @@ pub(crate) struct BundleIdentity {
     /// never stamped, so a stamped file inside a tracked tree is a clobber
     /// proven by the file itself.
     stamped: usize,
+    /// Which rung each present file says it came from, and whether it is still
+    /// that rung's bytes.
+    sources: SourceIdentity,
+}
+
+/// The source-aware half of the `bundle` token: each PRESENT bundled file is
+/// sorted by the `source=` of its `qontinui-provenance:` stamp and checked
+/// against the copy of THAT source this process holds in memory.
+///
+/// A skill's helper files carry no stamp of their own (D4); they inherit the
+/// stamp of their skill's `SKILL.md`, because a skill directory is provisioned
+/// from one source as a unit.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct SourceIdentity {
+    /// The canonical snapshot this process has loaded, when any — the only
+    /// canonical generation a `source=canonical` file can be verified against.
+    canonical_snapshot: Option<crate::canonical_corpus::CanonicalSnapshot>,
+    /// Files stamped `source=canonical`.
+    canonical: usize,
+    /// Files stamped `source=builtin`.
+    builtin: usize,
+    /// Files stamped `source=served` or `source=disk_cache`: the account
+    /// layer's bodies. The runner holds no copy of them without a network
+    /// read, so they are counted and never compared.
+    account: usize,
+    /// Files with no stamp: repo-authored or checkout source. Compared against
+    /// this build's bundle, as before the canonical rung existed.
+    unstamped: usize,
+    /// Files whose source copy is not in memory: a `source=canonical` stamp
+    /// naming a snapshot other than the loaded one (or none loaded), a
+    /// `source=builtin` stamp from another build whose bytes differ from this
+    /// build's, or an unrecognised `source=`. Never counted as identical.
+    unverifiable: usize,
+    /// Files compared against their own source's in-memory copy.
+    verified: usize,
+    /// Of [`verified`](Self::verified), those whose bytes match that copy.
+    identical_to_source: usize,
+}
+
+impl SourceIdentity {
+    /// `served: canonical@<sha12> <c> fetched <ts>, builtin <b>, account <a>,
+    /// unstamped <u>; identical-to-source <i>/<v> unverifiable=<x>`.
+    fn render(&self) -> String {
+        let canonical = match &self.canonical_snapshot {
+            Some(s) => format!(
+                "canonical@{} {} fetched {}",
+                clean(s.short()),
+                self.canonical,
+                clean(&s.fetched_at)
+            ),
+            None => format!("canonical@unloaded {}", self.canonical),
+        };
+        format!(
+            "served: {canonical}, builtin {}, account {}, unstamped {}; \
+             identical-to-source {}/{} unverifiable={}",
+            self.builtin,
+            self.account,
+            self.unstamped,
+            self.identical_to_source,
+            self.verified,
+            self.unverifiable
+        )
+    }
 }
 
 /// One provisioner's latest pass for a workdir, from the ledger.
@@ -270,8 +347,11 @@ impl ServedCorpus {
         };
         let bundle = match &self.bundle {
             Probe::Measured(b) => format!(
-                "{}/{} identical-to-build {BUILD_SHA} stamped={}",
-                b.identical, b.total, b.stamped
+                "{}/{} identical-to-build {BUILD_SHA} stamped={} {}",
+                b.identical,
+                b.total,
+                b.stamped,
+                b.sources.render()
             ),
             Probe::Unknown(r) => unknown_text(r),
         };
@@ -382,7 +462,13 @@ pub(crate) fn probe(workdir: &Path) -> ServedCorpus {
             }
         }
     }
-    let value = probe_with(workdir, OsStr::new("git"), PROBE_TIMEOUT);
+    let canonical = crate::canonical_corpus::latest();
+    let value = probe_with(
+        workdir,
+        OsStr::new("git"),
+        PROBE_TIMEOUT,
+        canonical.as_deref(),
+    );
     let mut guard = memo().lock().unwrap_or_else(|p| p.into_inner());
     guard.retain(|_, (at, _)| now.duration_since(*at) < MEMO_TTL);
     guard.insert(key, (now, value.clone()));
@@ -398,9 +484,15 @@ pub(crate) async fn probe_async(workdir: impl Into<PathBuf>) -> ServedCorpus {
         .unwrap_or_else(|_| ServedCorpus::unknown("probe task failed"))
 }
 
-/// [`probe`] without the memo, with the `git` program and the per-spawn
-/// timeout as parameters so a test can point them at nothing or at a hang.
-fn probe_with(workdir: &Path, git_program: &OsStr, timeout: Duration) -> ServedCorpus {
+/// [`probe`] without the memo, with the `git` program, the per-spawn timeout
+/// and the loaded canonical snapshot as parameters, so a test can point them
+/// at nothing, at a hang, or at a corpus of its own.
+fn probe_with(
+    workdir: &Path,
+    git_program: &OsStr,
+    timeout: Duration,
+    canonical: Option<&crate::canonical_corpus::CanonicalCorpus>,
+) -> ServedCorpus {
     let git = Git::new(git_program, timeout);
     let claude = workdir.join(".claude");
     let corpus = match std::fs::canonicalize(&claude) {
@@ -416,10 +508,13 @@ fn probe_with(workdir: &Path, git_program: &OsStr, timeout: Duration) -> ServedC
         Err(e) => Probe::Unknown(format!("unreadable: {e}")),
     };
 
-    let bundle = Probe::Measured(bundle_identity(match &corpus {
-        Probe::Measured(p) => Some(p.as_path()),
-        Probe::Unknown(_) => None,
-    }));
+    let bundle = Probe::Measured(bundle_identity(
+        match &corpus {
+            Probe::Measured(p) => Some(p.as_path()),
+            Probe::Unknown(_) => None,
+        },
+        canonical,
+    ));
 
     let checkout = match &corpus {
         Probe::Measured(dir) => probe_checkout(&git, dir, DirtyScope::Subtree),
@@ -671,18 +766,47 @@ fn first_line(s: &str) -> &str {
 
 // ── Bundle identity ─────────────────────────────────────────────────────────
 
-/// Every file this binary carries, as `(path relative to .claude/, bytes)`:
-/// each `FLEET_COMMANDS` entry as `commands/<name>.md`, each embedded skill
-/// file as `skills/<name>/<rel>`. Counted from the registries, never
-/// hard-coded.
-fn bundled_files() -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = crate::fleet_commands::FLEET_COMMANDS
+/// Which bundled unit a file belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Unit {
+    /// `commands/<name>.md`.
+    Command(&'static str),
+    /// `skills/<name>/<rel>`.
+    Skill { name: String, rel: String },
+}
+
+/// One file this binary carries.
+#[derive(Debug, Clone)]
+struct BundledFile {
+    /// Path relative to `.claude/`.
+    rel: String,
+    /// This build's bytes.
+    body: String,
+    unit: Unit,
+}
+
+/// Every file this binary carries: each `FLEET_COMMANDS` entry as
+/// `commands/<name>.md`, each embedded skill file as `skills/<name>/<rel>`.
+/// Counted from the registries, never hard-coded.
+fn bundled_files() -> Vec<BundledFile> {
+    let mut out: Vec<BundledFile> = crate::fleet_commands::FLEET_COMMANDS
         .iter()
-        .map(|(name, body)| (format!("commands/{name}.md"), (*body).to_string()))
+        .map(|(name, body)| BundledFile {
+            rel: format!("commands/{name}.md"),
+            body: (*body).to_string(),
+            unit: Unit::Command(name),
+        })
         .collect();
     for skill in crate::fleet_skills::embedded_skills() {
         for (rel, body) in skill.files {
-            out.push((format!("skills/{}/{rel}", skill.name), body));
+            out.push(BundledFile {
+                rel: format!("skills/{}/{rel}", skill.name),
+                body,
+                unit: Unit::Skill {
+                    name: skill.name.clone(),
+                    rel,
+                },
+            });
         }
     }
     out
@@ -693,34 +817,135 @@ fn normalize_eol(s: &str) -> String {
     s.replace("\r\n", "\n")
 }
 
-/// Compare the served tree against the bundle. `None` (no served tree) counts
-/// every file as missing, which is a measurement: `0/M`.
-fn bundle_identity(corpus: Option<&Path>) -> BundleIdentity {
+/// The skill manifest whose stamp a skill's other files inherit.
+const SKILL_MANIFEST: &str = "SKILL.md";
+
+/// The canonical body of `unit` at `corpus`'s snapshot, when it was loaded.
+fn canonical_body<'c>(
+    corpus: &'c crate::canonical_corpus::CanonicalCorpus,
+    unit: &Unit,
+) -> Option<&'c str> {
+    match unit {
+        Unit::Command(name) => corpus.commands.bodies.get(*name).map(String::as_str),
+        Unit::Skill { name, rel } => corpus
+            .skills
+            .skills
+            .get(name)
+            .and_then(|s| s.files.get(rel))
+            .map(String::as_str),
+    }
+}
+
+/// Compare the served tree against the bundle and, per file, against the
+/// source its stamp names. `None` (no served tree) counts every file as
+/// missing, which is a measurement: `0/M`.
+///
+/// Zero network: `canonical` is the snapshot already in memory
+/// (`canonical_corpus::latest`), never a fetch.
+fn bundle_identity(
+    corpus: Option<&Path>,
+    canonical: Option<&crate::canonical_corpus::CanonicalCorpus>,
+) -> BundleIdentity {
     let files = bundled_files();
     let total = files.len();
     let mut identical = 0;
     let mut stamped = 0;
-    if let Some(corpus) = corpus {
-        for (rel, embedded) in &files {
-            let Ok(on_disk) = std::fs::read_to_string(corpus.join(rel)) else {
-                continue;
-            };
-            let body = match crate::fleet_commands::strip_provenance(&on_disk) {
-                Some((_, body)) => {
-                    stamped += 1;
-                    body
-                }
-                None => on_disk,
-            };
-            if normalize_eol(&body) == normalize_eol(embedded) {
-                identical += 1;
+    let mut sources = SourceIdentity {
+        canonical_snapshot: canonical.map(|c| c.snapshot().clone()),
+        ..SourceIdentity::default()
+    };
+    let Some(corpus) = corpus else {
+        return BundleIdentity {
+            identical,
+            total,
+            stamped,
+            sources,
+        };
+    };
+
+    // Read every file once: (file, own stamp, body with the stamp removed).
+    let present: Vec<(
+        &BundledFile,
+        Option<crate::provenance::ProvenanceLine>,
+        String,
+    )> = files
+        .iter()
+        .filter_map(|f| {
+            let on_disk = std::fs::read_to_string(corpus.join(&f.rel)).ok()?;
+            Some(match crate::provenance::strip_provenance(&on_disk) {
+                Some((line, body)) => (f, Some(line), body),
+                None => (f, None, on_disk),
+            })
+        })
+        .collect();
+
+    // A skill's helpers inherit its manifest's stamp.
+    let skill_stamps: HashMap<&str, &crate::provenance::ProvenanceLine> = present
+        .iter()
+        .filter_map(|(f, line, _)| match (&f.unit, line) {
+            (Unit::Skill { name, rel }, Some(line)) if rel == SKILL_MANIFEST => {
+                Some((name.as_str(), line))
             }
+            _ => None,
+        })
+        .collect();
+
+    for (file, own, body) in &present {
+        if own.is_some() {
+            stamped += 1;
+        }
+        let body = normalize_eol(body);
+        let same_as_build = body == normalize_eol(&file.body);
+        if same_as_build {
+            identical += 1;
+        }
+        let stamp = own.as_ref().or_else(|| match &file.unit {
+            Unit::Skill { name, .. } => skill_stamps.get(name.as_str()).copied(),
+            Unit::Command(_) => None,
+        });
+        // `Some(matches)` when the file's own source is in memory to compare
+        // against; `None` when it is not.
+        let verdict: Option<bool> = match stamp.map(|l| l.source.as_str()) {
+            None => {
+                sources.unstamped += 1;
+                Some(same_as_build)
+            }
+            Some("canonical") => {
+                sources.canonical += 1;
+                let stamp_sha = stamp.and_then(|l| l.canonical_sha.as_deref());
+                canonical
+                    .filter(|c| stamp_sha == Some(c.snapshot().short()))
+                    .and_then(|c| canonical_body(c, &file.unit))
+                    .map(|source| body == normalize_eol(source))
+            }
+            Some("builtin") => {
+                sources.builtin += 1;
+                // Another build's bundle is not in memory: its bytes can be
+                // confirmed equal to this build's, never proven different.
+                let this_build = stamp.is_some_and(|l| l.runner_build == RUNNER_BUILD);
+                (same_as_build || this_build).then_some(same_as_build)
+            }
+            Some("served" | "disk_cache") => {
+                sources.account += 1;
+                continue;
+            }
+            Some(_) => None,
+        };
+        match verdict {
+            Some(matches) => {
+                sources.verified += 1;
+                if matches {
+                    sources.identical_to_source += 1;
+                }
+            }
+            None => sources.unverifiable += 1,
         }
     }
     BundleIdentity {
         identical,
         total,
         stamped,
+        sources,
     }
 }
 
@@ -849,10 +1074,10 @@ mod tests {
     fn checkout_with_bundle() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().expect("tempdir");
         git(tmp.path(), &["init", "--quiet"]);
-        for (rel, body) in bundled_files() {
-            let p = tmp.path().join(".claude").join(&rel);
+        for f in bundled_files() {
+            let p = tmp.path().join(".claude").join(&f.rel);
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(&p, body).unwrap();
+            std::fs::write(&p, f.body).unwrap();
         }
         git(tmp.path(), &["add", "--", ".claude"]);
         git(
@@ -863,7 +1088,7 @@ mod tests {
     }
 
     fn line_for(dir: &Path) -> String {
-        probe_with(dir, OsStr::new("git"), PROBE_TIMEOUT).render_line()
+        probe_with(dir, OsStr::new("git"), PROBE_TIMEOUT, None).render_line()
     }
 
     fn provision_both(claude: &Path) {
@@ -875,6 +1100,7 @@ mod tests {
         crate::fleet_skills::provision_fleet_skills_into(
             &claude.join("skills"),
             &AgentSkillRegistry::new(),
+            None,
         )
         .expect("provision skills");
     }
@@ -893,35 +1119,46 @@ mod tests {
         let line = line_for(tmp.path());
         assert!(
             line.contains(&format!(
-                "[bundle: {m}/{m} identical-to-build {BUILD_SHA} stamped=0]"
+                "[bundle: {m}/{m} identical-to-build {BUILD_SHA} stamped=0 served:"
             )),
             "{line}"
         );
         assert!(line.contains(&format!("@{sha12} ")), "{line}");
         assert!(line.contains("dirty-claude=0]"), "{line}");
         assert!(line.contains("[cwd: same checkout]"), "{line}");
+        assert!(
+            line.contains(&format!(
+                "builtin 0, account 0, unstamped {m}; identical-to-source {m}/{m} unverifiable=0]"
+            )),
+            "checkout source is unstamped and compared against the build: {line}"
+        );
 
         // A peer edits one file.
-        let (edited_rel, edited_body) = bundled_files().into_iter().next().unwrap();
-        let edited = claude.join(&edited_rel);
-        std::fs::write(&edited, format!("{edited_body}\npeer edit\n")).unwrap();
+        let first = bundled_files().into_iter().next().unwrap();
+        let edited = claude.join(&first.rel);
+        std::fs::write(&edited, format!("{}\npeer edit\n", first.body)).unwrap();
         let line = line_for(tmp.path());
         assert!(line.contains(&format!("[bundle: {}/{m} ", m - 1)), "{line}");
         assert!(line.contains("dirty-claude=1]"), "{line}");
 
         // Revert it, and clobber a DIFFERENT file the way a pre-guard
         // provisioner would: the build's body plus its provenance key.
-        std::fs::write(&edited, &edited_body).unwrap();
+        std::fs::write(&edited, &first.body).unwrap();
         let (name, body) = crate::fleet_commands::FLEET_COMMANDS[1];
         std::fs::write(
             claude.join(format!("commands/{name}.md")),
-            crate::fleet_commands::with_provenance(name, body, CommandSource::Builtin),
+            crate::provenance::with_provenance(
+                &crate::provenance::command_canonical(name),
+                body,
+                CommandSource::Builtin.as_str(),
+                None,
+            ),
         )
         .unwrap();
         let line = line_for(tmp.path());
         assert!(
             line.contains(&format!(
-                "[bundle: {m}/{m} identical-to-build {BUILD_SHA} stamped=1]"
+                "[bundle: {m}/{m} identical-to-build {BUILD_SHA} stamped=1 served:"
             )),
             "a stamped clobber is still this build's bundle, and says so: {line}"
         );
@@ -944,6 +1181,7 @@ mod tests {
         let skills = crate::fleet_skills::provision_fleet_skills_into(
             &claude.join("skills"),
             &AgentSkillRegistry::new(),
+            None,
         )
         .expect("provision skills");
         let (c_n, s_n) = (commands.expected, skills.expected);
@@ -976,7 +1214,7 @@ mod tests {
         );
         assert!(
             line.contains(&format!(
-                "[bundle: {m}/{m} identical-to-build {BUILD_SHA} stamped=0]"
+                "[bundle: {m}/{m} identical-to-build {BUILD_SHA} stamped=0 served:"
             )),
             "{line}"
         );
@@ -997,17 +1235,17 @@ mod tests {
     #[test]
     fn peer_wip_is_not_a_clobber() {
         let tmp = checkout_with_bundle();
-        for (rel, body) in bundled_files() {
+        for f in bundled_files() {
             std::fs::write(
-                tmp.path().join(".claude").join(rel),
-                format!("{body}\npeer\n"),
+                tmp.path().join(".claude").join(f.rel),
+                format!("{}\npeer\n", f.body),
             )
             .unwrap();
         }
         let line = line_for(tmp.path());
         assert!(
             line.contains(&format!(
-                "[bundle: 0/{} identical-to-build {BUILD_SHA} stamped=0]",
+                "[bundle: 0/{} identical-to-build {BUILD_SHA} stamped=0 served:",
                 total()
             )),
             "{line}"
@@ -1024,11 +1262,16 @@ mod tests {
         assert_not_in_any_repo(tmp.path());
         provision_both(&tmp.path().join(".claude"));
         let m = total();
-        let commands = crate::fleet_commands::FLEET_COMMANDS.len();
+        // Every command body and every SKILL.md carries the key; a skill's
+        // other files do not, and inherit their manifest's `source=`.
+        let stamped = crate::fleet_commands::FLEET_COMMANDS.len()
+            + crate::fleet_skills::embedded_skills().len();
         let line = line_for(tmp.path());
         assert!(
             line.contains(&format!(
-                "[bundle: {m}/{m} identical-to-build {BUILD_SHA} stamped={commands}]"
+                "[bundle: {m}/{m} identical-to-build {BUILD_SHA} stamped={stamped} \
+                 served: canonical@unloaded 0, builtin {m}, account 0, unstamped 0; \
+                 identical-to-source {m}/{m} unverifiable=0]"
             )),
             "{line}"
         );
@@ -1059,7 +1302,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
         let nowhere = tmp.path().join("no-such-git");
-        let line = probe_with(tmp.path(), nowhere.as_os_str(), PROBE_TIMEOUT).render_line();
+        let line = probe_with(tmp.path(), nowhere.as_os_str(), PROBE_TIMEOUT, None).render_line();
         assert!(
             line.contains("[checkout: UNKNOWN (git unavailable)]"),
             "{line}"
@@ -1095,7 +1338,7 @@ mod tests {
 
         let timeout = Duration::from_millis(200);
         let started = Instant::now();
-        let line = probe_with(tmp.path(), script.as_os_str(), timeout).render_line();
+        let line = probe_with(tmp.path(), script.as_os_str(), timeout, None).render_line();
         let elapsed = started.elapsed();
         assert!(
             line.contains("[checkout: UNKNOWN (git timed out after 200ms)]"),
@@ -1204,13 +1447,152 @@ mod tests {
         assert!(!line.contains("[cwd: same checkout]"), "{line}");
     }
 
+    /// A loaded canonical snapshot whose `.claude/commands/<name>.md` body is
+    /// `body` for the first bundled command, and no skills.
+    fn canonical_corpus_with(
+        name: &str,
+        body: &str,
+        sha: &str,
+    ) -> crate::canonical_corpus::CanonicalCorpus {
+        use crate::canonical_corpus::{
+            CanonicalCommands, CanonicalCorpus, CanonicalSkills, CanonicalSnapshot,
+        };
+        let snapshot = CanonicalSnapshot {
+            sha: sha.to_string(),
+            fetched_at: "2026-09-26T00:00:00Z".to_string(),
+        };
+        CanonicalCorpus {
+            commands: CanonicalCommands {
+                snapshot: snapshot.clone(),
+                bodies: [(name.to_string(), body.to_string())].into_iter().collect(),
+            },
+            skills: CanonicalSkills {
+                snapshot,
+                skills: Default::default(),
+            },
+        }
+    }
+
+    /// Write ONE command into an otherwise empty `.claude/`, stamped as `source`.
+    fn served_one(source: &str, canonical_sha: Option<&str>, body: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (name, _) = crate::fleet_commands::FLEET_COMMANDS[0];
+        let dir = tmp.path().join(".claude/commands");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{name}.md")),
+            crate::provenance::with_provenance(
+                &crate::provenance::command_canonical(name),
+                body,
+                source,
+                canonical_sha,
+            ),
+        )
+        .unwrap();
+        tmp
+    }
+
+    const CANON_SHA: &str = "abcdef0123456789abcdef0123456789abcdef01";
+
+    #[test]
+    fn a_canonical_stamped_file_is_verified_against_the_loaded_snapshot() {
+        let (name, _) = crate::fleet_commands::FLEET_COMMANDS[0];
+        let body = "---\ndescription: canonical moved ahead of the build\n---\n# body\n";
+        let corpus = canonical_corpus_with(name, body, CANON_SHA);
+        let tmp = served_one("canonical", Some(CANON_SHA.get(..12).unwrap()), body);
+        let line =
+            probe_with(tmp.path(), OsStr::new("git"), PROBE_TIMEOUT, Some(&corpus)).render_line();
+        assert!(
+            line.contains(&format!(
+                "[bundle: 0/{} identical-to-build {BUILD_SHA} stamped=1 served: \
+                 canonical@{} 1 fetched 2026-09-26T00:00:00Z, builtin 0, account 0, \
+                 unstamped 0; identical-to-source 1/1 unverifiable=0]",
+                total(),
+                CANON_SHA.get(..12).unwrap()
+            )),
+            "not the build's bytes, but exactly the canonical snapshot's: {line}"
+        );
+
+        // An edit after provisioning is a verified mismatch, not unverifiable.
+        let path = tmp.path().join(format!(".claude/commands/{name}.md"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("{text}edited\n")).unwrap();
+        let line =
+            probe_with(tmp.path(), OsStr::new("git"), PROBE_TIMEOUT, Some(&corpus)).render_line();
+        assert!(
+            line.contains("identical-to-source 0/1 unverifiable=0]"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn a_canonical_stamp_from_another_snapshot_is_unverifiable_not_identical() {
+        let (name, _) = crate::fleet_commands::FLEET_COMMANDS[0];
+        let body = "---\ndescription: x\n---\n# body\n";
+        // The loaded snapshot holds the SAME bytes, but the stamp names a
+        // different generation: identity is never inferred across snapshots.
+        let corpus = canonical_corpus_with(name, body, CANON_SHA);
+        let tmp = served_one("canonical", Some("0123456789ab"), body);
+        let line =
+            probe_with(tmp.path(), OsStr::new("git"), PROBE_TIMEOUT, Some(&corpus)).render_line();
+        assert!(line.contains("canonical@abcdef012345 1 fetched"), "{line}");
+        assert!(
+            line.contains("identical-to-source 0/0 unverifiable=1]"),
+            "{line}"
+        );
+
+        // With no snapshot loaded at all, the same file is unverifiable too.
+        let line = probe_with(tmp.path(), OsStr::new("git"), PROBE_TIMEOUT, None).render_line();
+        assert!(
+            line.contains("served: canonical@unloaded 1, builtin 0"),
+            "{line}"
+        );
+        assert!(
+            line.contains("identical-to-source 0/0 unverifiable=1]"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn an_account_file_is_counted_as_account_and_never_compared() {
+        let tmp = served_one("served", None, "# an account override\n");
+        let line = line_for(tmp.path());
+        assert!(
+            line.contains(
+                "served: canonical@unloaded 0, builtin 0, account 1, unstamped 0; \
+                 identical-to-source 0/0 unverifiable=0]"
+            ),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn a_skills_helpers_inherit_its_manifests_source() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skills = tmp.path().join(".claude/skills");
+        crate::fleet_skills::provision_fleet_skills_into(&skills, &AgentSkillRegistry::new(), None)
+            .expect("provision skills");
+        let skill_files = crate::fleet_skills::embedded_skills()
+            .iter()
+            .map(|s| s.files.len())
+            .sum::<usize>();
+        let line = line_for(tmp.path());
+        assert!(
+            line.contains(&format!(
+                "builtin {skill_files}, account 0, unstamped 0; \
+                 identical-to-source {skill_files}/{skill_files} unverifiable=0]"
+            )),
+            "{line}"
+        );
+    }
+
     #[test]
     fn memo_agrees_within_window() {
         let tmp = checkout_with_bundle();
         let first = probe(tmp.path()).render_line();
         // A change inside the window is not seen: the argv copy rendered before
         // provisioning and the env copy rendered after must agree.
-        let (rel, _) = bundled_files().into_iter().next().unwrap();
+        let rel = bundled_files().into_iter().next().unwrap().rel;
         std::fs::write(tmp.path().join(".claude").join(rel), "changed").unwrap();
         assert_eq!(probe(tmp.path()).render_line(), first);
     }
