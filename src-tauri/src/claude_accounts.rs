@@ -123,7 +123,7 @@ fn unscoped_settings_path() -> Option<PathBuf> {
 /// `2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json`,
 /// Phase 2.
 fn platform_config_root(source: &str) -> Option<PathBuf> {
-    qontinui_runner_lib::ambient::test_config_root_override(source).or_else(dirs::config_dir)
+    qontinui_runner_lib::ambient::runner_platform_config_root(source)
 }
 
 /// Load the roster from `path`. Fail-open: missing or corrupt file → `None`

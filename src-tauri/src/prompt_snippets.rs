@@ -105,9 +105,11 @@ impl PromptSnippetLibrary {
 ///
 /// Scoped per-runner for secondary instances.
 fn get_prompt_snippets_dir() -> Result<PathBuf, String> {
-    let raw_base = dirs::config_dir()
-        .ok_or("Failed to get config directory")?
-        .join("com.qontinui.runner");
+    let raw_base = qontinui_runner_lib::ambient::runner_platform_config_root(
+        "prompt_snippets::get_prompt_snippets_dir",
+    )
+    .ok_or("Failed to get config directory")?
+    .join("com.qontinui.runner");
     let base_dir = crate::instance::scope_path(&raw_base);
 
     let new_dir = base_dir.join("prompt-snippets");
@@ -335,4 +337,27 @@ pub fn search_prompt_snippets(query: &str) -> Vec<PromptSnippet> {
                     .any(|t| t.to_lowercase().contains(&query_lower))
         })
         .collect()
+}
+
+/// A test process never resolves the operator's real
+/// `<config>/com.qontinui.runner`: this path roots at
+/// `ambient::runner_platform_config_root`, which in a test harness is the
+/// hermetic deflected root. Plan
+/// `2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json`,
+/// Phase 4.
+#[cfg(test)]
+mod config_root_deflection_tests {
+    use super::*;
+
+    #[test]
+    fn prompt_snippets_path_is_deflected_in_a_test_process() {
+        let root = qontinui_runner_lib::ambient::deflected_config_root();
+        let path = get_prompt_snippets_path().expect("resolves");
+        assert!(
+            path.starts_with(&root),
+            "{} must resolve under the deflected root {} in a test process",
+            path.display(),
+            root.display()
+        );
+    }
 }
