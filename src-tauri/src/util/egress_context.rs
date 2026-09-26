@@ -246,8 +246,9 @@ impl Measured {
         }
     }
 
-    #[cfg(test)]
-    fn counted(&self) -> Option<u64> {
+    /// The count, or `None` when it was not taken — the only lossless way to
+    /// hand a [`Measured`] to code that models UNKNOWN as `Option`.
+    pub(crate) fn counted(&self) -> Option<u64> {
         match self {
             Measured::Counted(n) => Some(*n),
             Measured::Unavailable(_) => None,
@@ -346,6 +347,144 @@ pub(crate) fn handle_census() -> HandleCensus {
 }
 
 // ---------------------------------------------------------------------------
+// Descriptor HEADROOM (plan 2026-09-09-the-pong-receive-path-has-no-liveness-
+// signal-so-fd-exhaustion-still-reads-as-ui-death)
+// ---------------------------------------------------------------------------
+//
+// [`handle_census`] measures a COUNT, and a count alone answers nothing about
+// starvation: 900 open descriptors is idle under a 65,536 soft limit and fatal
+// under 1,024. The question the UI-death verdict needs answered is "could this
+// process have accepted the socket a `/ui-bridge/pong` arrives on?", and that
+// is HEADROOM — the soft `RLIMIT_NOFILE` minus the open count.
+//
+// Two independent authorities for the same fact, per `verification-and-
+// evidence` `a-control-must-test-the-property-it-names`:
+//
+// 1. the headroom read below — a direct measurement, taken on demand;
+// 2. the EMFILE/ENFILE stamp (`util::fd_exhaustion::note_fd_exhaustion`, in
+//    the LIB crate so the bin and lib copies of `process_helpers` stamp ONE
+//    static) — a POSITIVE event
+//    recorded by any site that actually hit the ceiling with the `io::Error`
+//    in hand. It matters most exactly where (1) goes blind: a process with no
+//    descriptor left cannot `read_dir("/proc/self/fd")` either, so at total
+//    exhaustion the census is `Unavailable` — and its own failure is then
+//    stamped through (2) rather than lost.
+
+/// Count open descriptors WITHOUT classifying them. [`handle_census`] spends one
+/// `read_link` per descriptor to find sockets; a headroom read needs only the
+/// total and is taken on every heartbeat tick and every `/health`, so it does
+/// not pay for the split.
+pub(crate) fn open_descriptor_count() -> Measured {
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_dir("/proc/self/fd") {
+            Ok(rd) => Measured::Counted(rd.count() as u64),
+            Err(e) => {
+                // A census that could not open a directory because the
+                // process is AT its descriptor ceiling is itself the positive
+                // evidence — record it through the second authority instead
+                // of letting it collapse into a bare "unreadable".
+                if qontinui_runner_lib::util::fd_exhaustion::note_fd_exhaustion(&e) {
+                    Measured::Unavailable("/proc/self/fd unreadable: descriptor ceiling reached")
+                } else {
+                    Measured::Unavailable("/proc/self/fd unreadable")
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Windows' `GetProcessHandleCount` counts every kernel handle, and
+        // Windows has no per-process ceiling to hold it against (see
+        // [`fd_soft_limit`]), so a count there could never become a headroom.
+        // Reuse the census for the number rather than duplicating the FFI.
+        handle_census().open
+    }
+}
+
+/// The soft `RLIMIT_NOFILE` — the ceiling `open`/`accept`/`pipe` fail against
+/// with `EMFILE`.
+///
+/// `Unavailable` — never `0` — when it cannot be read: `getrlimit` failed, the
+/// limit is `RLIM_INFINITY` (no finite ceiling, so no headroom to measure), or
+/// the platform has no such limit. A real soft limit of `0` is reported as
+/// `Counted(0)`, because it is a measurement.
+pub(crate) fn fd_soft_limit() -> Measured {
+    #[cfg(unix)]
+    {
+        let mut rl = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `getrlimit` writes one `rlimit` through a valid pointer to a
+        // stack local and has no other side effects.
+        let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) };
+        if rc != 0 {
+            return Measured::Unavailable("getrlimit(RLIMIT_NOFILE) failed");
+        }
+        #[allow(clippy::unnecessary_cast)] // `rlim_t` is u64 on Linux, not everywhere.
+        soft_limit_measurement(rl.rlim_cur as u64, libc::RLIM_INFINITY as u64)
+    }
+
+    #[cfg(windows)]
+    {
+        Measured::Unavailable(
+            "windows: no per-process descriptor ceiling comparable to RLIMIT_NOFILE",
+        )
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        Measured::Unavailable("no descriptor limit on this platform")
+    }
+}
+
+/// Map a raw soft limit onto a [`Measured`]. Split out so the
+/// infinity-is-not-a-number rule is testable without a real `getrlimit`.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn soft_limit_measurement(rlim_cur: u64, rlim_infinity: u64) -> Measured {
+    if rlim_cur == rlim_infinity {
+        Measured::Unavailable("RLIMIT_NOFILE is unlimited: no finite ceiling to measure against")
+    } else {
+        Measured::Counted(rlim_cur)
+    }
+}
+
+/// Open-descriptor count held against the soft limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FdHeadroom {
+    pub(crate) open: Measured,
+    pub(crate) soft_limit: Measured,
+}
+
+impl FdHeadroom {
+    /// `limit - open`, saturating (a limit lowered below the current count is
+    /// zero headroom, not a wrap). `Unavailable` when EITHER side was not
+    /// measured — a missing side is UNKNOWN, never a headroom of 0 or of the
+    /// whole limit.
+    pub(crate) fn headroom(&self) -> Measured {
+        match (&self.open, &self.soft_limit) {
+            (Measured::Counted(open), Measured::Counted(limit)) => {
+                Measured::Counted(limit.saturating_sub(*open))
+            }
+            (Measured::Unavailable(why), _) | (_, Measured::Unavailable(why)) => {
+                Measured::Unavailable(why)
+            }
+        }
+    }
+}
+
+/// Read the current descriptor headroom. Best-effort; every failure is a typed
+/// `Unavailable`.
+pub(crate) fn fd_headroom() -> FdHeadroom {
+    FdHeadroom {
+        open: open_descriptor_count(),
+        soft_limit: fd_soft_limit(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The snapshot
 // ---------------------------------------------------------------------------
 
@@ -425,14 +564,24 @@ pub(crate) fn log_baseline() {
         Measured::Counted(n) => n.to_string(),
         Measured::Unavailable(why) => format!("unavailable({why})"),
     };
+    // Headroom against the soft limit, appended AFTER the existing fields so a
+    // reader matching the established prefix is undisturbed. The count is the
+    // census's own, so the headroom and `open_handles` on one line agree.
+    let headroom = FdHeadroom {
+        open: census.open.clone(),
+        soft_limit: fd_soft_limit(),
+    };
     info!(
-        "egress_baseline: uptime_ms={} open_handles={} socket_handles={} in_flight/failures {}",
+        "egress_baseline: uptime_ms={} open_handles={} socket_handles={} in_flight/failures {} \
+         fd_soft_limit={} fd_headroom={}",
         process_uptime_ms()
             .map(|v| v.to_string())
             .unwrap_or_else(|| "unknown".to_string()),
         m(&census.open),
         m(&census.sockets),
         per_client.join(" "),
+        m(&headroom.soft_limit),
+        m(&headroom.headroom()),
     );
 }
 
@@ -558,6 +707,77 @@ mod tests {
         if let Some(s) = census.sockets.counted() {
             assert!(s <= open, "sockets {s} > open {open}");
         }
+    }
+
+    // ── descriptor headroom (plan 2026-09-09 pong receive path) ────────────
+
+    /// An unlimited soft limit has no finite ceiling to measure headroom
+    /// against, and must say so rather than becoming a number.
+    #[test]
+    fn unlimited_soft_limit_is_unavailable_not_a_number() {
+        const INF: u64 = u64::MAX;
+        assert!(matches!(
+            soft_limit_measurement(INF, INF),
+            Measured::Unavailable(_)
+        ));
+        assert_eq!(soft_limit_measurement(1024, INF), Measured::Counted(1024));
+        // A real limit of 0 is a measurement, not an absence.
+        assert_eq!(soft_limit_measurement(0, INF), Measured::Counted(0));
+    }
+
+    /// Headroom is UNKNOWN — never 0, never the whole limit — when either side
+    /// could not be read.
+    #[test]
+    fn headroom_is_unavailable_rather_than_zero_when_either_side_is_unread() {
+        let no_count = FdHeadroom {
+            open: Measured::Unavailable("census failed"),
+            soft_limit: Measured::Counted(1024),
+        };
+        assert_eq!(no_count.headroom(), Measured::Unavailable("census failed"));
+        assert!(!no_count.headroom().to_json().is_number());
+
+        let no_limit = FdHeadroom {
+            open: Measured::Counted(900),
+            soft_limit: Measured::Unavailable("no limit here"),
+        };
+        assert_eq!(no_limit.headroom(), Measured::Unavailable("no limit here"));
+        assert_eq!(no_limit.headroom().counted(), None);
+
+        let measured = FdHeadroom {
+            open: Measured::Counted(1000),
+            soft_limit: Measured::Counted(1024),
+        };
+        assert_eq!(measured.headroom(), Measured::Counted(24));
+
+        // A limit lowered below the live count saturates to zero headroom.
+        let over = FdHeadroom {
+            open: Measured::Counted(2000),
+            soft_limit: Measured::Counted(1024),
+        };
+        assert_eq!(over.headroom(), Measured::Counted(0));
+    }
+
+    /// Where the platform CAN answer, it must: on Linux the soft limit is
+    /// always finite in practice for a test process, and the count is real.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_headroom_is_measured() {
+        let h = fd_headroom();
+        let open = h.open.counted().expect("Linux counts /proc/self/fd");
+        assert!(open >= 3, "stdin/stdout/stderr at minimum, got {open}");
+        if let Some(limit) = h.soft_limit.counted() {
+            assert!(limit > 0, "a running test process has a positive limit");
+            assert!(h.headroom().counted().is_some());
+        }
+    }
+
+    /// Windows has no RLIMIT_NOFILE; the limit (and so the headroom) is typed
+    /// UNKNOWN there, never 0.
+    #[cfg(windows)]
+    #[test]
+    fn windows_soft_limit_is_unavailable() {
+        assert!(matches!(fd_soft_limit(), Measured::Unavailable(_)));
+        assert!(matches!(fd_headroom().headroom(), Measured::Unavailable(_)));
     }
 
     /// Uptime is `null`, not `0`, until something anchors the clock.

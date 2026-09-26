@@ -1161,13 +1161,21 @@ async fn health(
     // heartbeat's own snapshot comment names.
     let (ping_emit_failures, last_ping_emit_ok, last_ping_emit_fail) =
         crate::ui_error::ping_emit_report();
+    // The RECEIVE side (plan 2026-09-09 pong receive path), from ONE read of
+    // the headroom census and the EMFILE stamp — the same inputs the verdict
+    // beside it is classified from, so the two cannot disagree.
+    let (fd_inputs, fd_exhausted_errors) = crate::ui_error::fd_pressure_snapshot_now();
+    let ping_now_ms = crate::ui_error::now_ms_epoch_pub();
     let ping_delivery =
         crate::ui_error::classify_ping_delivery(crate::ui_error::PingDeliveryInputs {
             last_emit_ok_ms: last_ping_emit_ok,
             last_emit_fail_ms: last_ping_emit_fail,
-            now_ms: crate::ui_error::now_ms_epoch_pub(),
+            now_ms: ping_now_ms,
+            fd: fd_inputs,
         });
+    let fd_pressure = crate::ui_error::classify_fd_pressure(fd_inputs, ping_now_ms);
     let false_death_suppressed = crate::ui_error::false_death_suppressed_count();
+    let fd_starved_suppressed = crate::ui_error::fd_starved_suppressed_count();
     let native_ui = crate::ui_error::classify_native_ui(crate::ui_error::NativeUiInputs {
         probe_wedged: crate::ui_error::native_ui_probe_verdict(),
         window_getter_unresponsive: window_visible_probe == "event_loop_unresponsive",
@@ -1400,7 +1408,7 @@ async fn health(
             // failing emit makes a live UI look dead. `pingEmitFailures` is the
             // instrument the 119,012-failure storm had none of;
             // `pingDelivery` is the verdict the recovery trigger now consults:
-            // "ping_delivered" | "ping_undeliverable" | "unknown".
+            // "ping_delivered" | "ping_undeliverable" | "fd_starved" | "unknown".
             // `falseDeathSuppressed` counts the recreates NOT performed
             // because the ping could not be delivered — published so the
             // suppression is as visible as the recovery would have been.
@@ -1409,6 +1417,20 @@ async fn health(
             "lastPingEmitFail": last_ping_emit_fail,
             "pingDelivery": ping_delivery.as_str(),
             "falseDeathSuppressed": false_death_suppressed,
+            // Descriptor pressure — the RECEIVE side (plan 2026-09-09 pong
+            // receive path). A pong lands on an accepted socket, so a runner
+            // out of descriptors cannot receive one however alive the UI is;
+            // `pingDelivery: "fd_starved"` is that verdict, and
+            // `fdStarvedSuppressed` counts the recreates it declined.
+            // `fdPressure`: "starved" | "ample" | "unknown". Every
+            // measurement is `null` when it was not taken — never 0.
+            "fdPressure": fd_pressure.as_str(),
+            "fdOpen": fd_inputs.open,
+            "fdSoftLimit": fd_inputs.soft_limit,
+            "fdHeadroom": fd_inputs.headroom(),
+            "fdExhaustedErrors": fd_exhausted_errors,
+            "lastFdExhausted": (fd_inputs.last_exhausted_ms > 0).then_some(fd_inputs.last_exhausted_ms),
+            "fdStarvedSuppressed": fd_starved_suppressed,
         },
         // PR-credential surface (plan qontinui-pr-credential-provisioning,
         // Phase 0): cached `gh auth status` verdict. `state: "pending"` +
