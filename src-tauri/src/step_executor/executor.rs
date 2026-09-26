@@ -36,13 +36,10 @@ use crate::action_service::UnifiedActionService;
 use crate::commands::AppState;
 use crate::config_storage::ConfigStorage;
 use crate::database::CreateTaskRunEventInput;
-use crate::display::RawEvent;
-use crate::executor::file_logger::FileLogger;
 use crate::iteration_bundle::{
     parse_action_events, parse_image_recognition_events, RelevantLogSources,
 };
 use crate::orchestrator::context_propagation::{RuntimeContext, SharedVariableStore};
-use crate::str_utils::truncate_str;
 use crate::unified_workflow_executor::get_parent_task_id;
 
 // Handler system imports
@@ -80,7 +77,10 @@ use super::executor_types::*;
 ///
 /// Add a new arm to the match below whenever a new step type is introduced
 /// that the JSON round-trip can't parse cleanly — don't paper over it with
-/// looser serde aliases on `ExecutionStepConfig`.
+/// looser serde aliases on `ExecutionStepConfig`. `spec_check`,
+/// `wrapper_action` and `effect_check` need no arm: their typed structs accept
+/// the `ExecutionStepConfig` field names as aliases, which
+/// `typed_dispatch_corpus_tests` proves on every live producer's shapes.
 fn to_full_runner_step(
     step: &ExecutionStepConfig,
 ) -> Result<qontinui_types::workflow_step::FullRunnerStep, String> {
@@ -235,6 +235,123 @@ fn handler_lookup_key(step: &qontinui_types::workflow_step::FullRunnerStep) -> &
         FullRunnerStep::DagApproval(_) => "dag_approval",
         FullRunnerStep::DagLoop(_) => "dag_loop",
         FullRunnerStep::VgaAutomate(_) => "vga_automate",
+        FullRunnerStep::SpecCheck(_) => "spec_check",
+        FullRunnerStep::WrapperAction(_) => "wrapper_action",
+        FullRunnerStep::EffectCheck(_) => "effect_check",
+    }
+}
+
+/// One arm of the legacy string `match` in `execute_single_step`, which serves
+/// the step types that have no registered handler. None has a
+/// `FullRunnerStep` variant, so their typed parse always fails; being listed
+/// here is what routes that failure to the legacy `match` silently.
+///
+/// The `match` is exhaustive over this enum, so every listed type has an arm
+/// by construction. The unregistered handler modules `check.rs`,
+/// `check_group.rs` and `shell_command.rs` declare the same step types, but
+/// they are internal to `CommandHandler` — the registry never serves them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LegacyStep {
+    ShellCommand,
+    Check,
+    CheckGroup,
+    Shell,
+    LogWatch,
+    Gate,
+}
+
+impl LegacyStep {
+    /// Every legacy arm — the ONE authoritative list; `LEGACY_STRING_DISPATCH`
+    /// and [`LegacyStep::from_type`] are derived from it.
+    pub(super) const ALL: [LegacyStep; 6] = [
+        Self::ShellCommand,
+        Self::Check,
+        Self::CheckGroup,
+        Self::Shell,
+        Self::LogWatch,
+        Self::Gate,
+    ];
+
+    /// The step type string this arm serves.
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ShellCommand => "shell_command",
+            Self::Check => "check",
+            Self::CheckGroup => "check_group",
+            Self::Shell => "shell",
+            Self::LogWatch => "log_watch",
+            Self::Gate => "gate",
+        }
+    }
+
+    /// The legacy arm serving `step_type`, if any.
+    pub(super) fn from_type(step_type: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|l| l.as_str() == step_type)
+    }
+}
+
+const LEGACY_STRING_DISPATCH_ARRAY: [&str; LegacyStep::ALL.len()] = {
+    let mut out = [""; LegacyStep::ALL.len()];
+    let mut i = 0;
+    while i < out.len() {
+        out[i] = LegacyStep::ALL[i].as_str();
+        i += 1;
+    }
+    out
+};
+
+/// Step types served by the legacy string `match` rather than a registered
+/// handler, derived from [`LegacyStep::ALL`] so the two cannot disagree.
+pub(super) const LEGACY_STRING_DISPATCH: &[&str] = &LEGACY_STRING_DISPATCH_ARRAY;
+
+/// Where `execute_single_step` sends a step.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum DispatchRoute {
+    /// The typed parse succeeded; dispatch to the handler under this key.
+    Registry(&'static str),
+    /// A type the registry serves whose typed parse FAILED. It still runs, on
+    /// the handler registered under the raw step type: handlers tolerate
+    /// shapes the schema rejects (e.g. a command step stamped
+    /// `phase: "agentic"` by `refetch_unified_workflow_steps`), and a step
+    /// that worked must not start failing. Logged at `warn!` — after the
+    /// typed parse was made total for live shapes, this fires only on a
+    /// genuine schema/handler disagreement.
+    RegistryFallback { key: String, parse_error: String },
+    /// A [`LEGACY_STRING_DISPATCH`] type; served by the legacy `match`.
+    Legacy(LegacyStep),
+    /// Neither typed, registered, nor legacy.
+    Unknown,
+}
+
+/// Decide where a step goes. Pure, so the routing is testable without a
+/// `StepExecutor` (which needs a live `AppState`).
+pub(super) fn resolve_dispatch(
+    step: &ExecutionStepConfig,
+    registry: &HandlerRegistry,
+) -> DispatchRoute {
+    // "test" is a backward-compat alias with no `FullRunnerStep` variant; it
+    // is served by the command handler.
+    if step.step_type == "test" {
+        return DispatchRoute::Registry("command");
+    }
+    match to_full_runner_step(step) {
+        Ok(typed) => DispatchRoute::Registry(handler_lookup_key(&typed)),
+        Err(parse_error) => {
+            if let Some(legacy) = LegacyStep::from_type(&step.step_type) {
+                tracing::debug!(
+                    step_type = %step.step_type,
+                    "legacy string-dispatched step type"
+                );
+                DispatchRoute::Legacy(legacy)
+            } else if registry.has_handler(&step.step_type) {
+                DispatchRoute::RegistryFallback {
+                    key: step.step_type.clone(),
+                    parse_error,
+                }
+            } else {
+                DispatchRoute::Unknown
+            }
+        }
     }
 }
 
@@ -1404,6 +1521,40 @@ impl StepExecutor {
         }
     }
 
+    /// Run the handler registered under `key`.
+    async fn run_registered_handler(
+        &self,
+        key: &str,
+        step: &ExecutionStepConfig,
+    ) -> (
+        bool,
+        Option<String>,
+        Option<String>,
+        Option<serde_json::Value>,
+    ) {
+        let Some(handler) = self.handler_registry.get(key) else {
+            // Unreachable while the parity test holds: every route to here
+            // carries a key the registry serves.
+            return (
+                false,
+                Some(format!(
+                    "No handler registered for step type {key:?} (from {:?})",
+                    step.step_type
+                )),
+                None,
+                None,
+            );
+        };
+        let context = self.create_handler_context().await;
+        let result = handler.execute(step, &context).await;
+        (
+            result.success,
+            result.error,
+            result.screenshot_path,
+            result.output_data,
+        )
+    }
+
     /// Execute a single step and return (success, error, screenshot_path, output_data)
     pub(crate) async fn execute_single_step(
         &self,
@@ -1436,345 +1587,57 @@ impl StepExecutor {
             step.id
         );
 
-        // Typed dispatch boundary (Session 2a).
-        //
-        // "test" is a backward-compat alias that predates the typed enum; it
-        // maps to the command handler at the string layer because there is no
-        // `FullRunnerStep::Test` variant.  All other types go through the
-        // exhaustive `handler_lookup_key` match so the compiler catches any
-        // new variant that hasn't been wired up.
-        let lookup_type: String = if step.step_type == "test" {
-            "command".to_string()
-        } else {
-            match to_full_runner_step(step) {
-                Ok(typed) => handler_lookup_key(&typed).to_string(),
-                Err(e) => {
-                    // Unknown or non-canonical step type (e.g. a custom type
-                    // added without updating FullRunnerStep, or a legacy saved
-                    // workflow).  Log a warning and fall through to the legacy
-                    // string-key dispatch path.  Session 2b will decide whether
-                    // to harden this into a hard error.
-                    warn!(
-                        "Step type {:?} did not match any FullRunnerStep variant \
-                         ({}); falling back to string-key dispatch",
-                        step.step_type, e
-                    );
-                    step.step_type.clone()
-                }
+        // Typed dispatch boundary. `resolve_dispatch` decides the route: the
+        // registry for a typed step (or, with a warning, for a registered
+        // type whose typed parse failed), the legacy `match` below for a
+        // `LEGACY_STRING_DISPATCH` type, and a step failure for a type nothing
+        // serves.
+        let legacy = match resolve_dispatch(step, &self.handler_registry) {
+            DispatchRoute::Registry(key) => return self.run_registered_handler(key, step).await,
+            DispatchRoute::RegistryFallback { key, parse_error } => {
+                warn!(
+                    "Step type {:?} is registry-served but failed the typed parse ({}); \
+                     dispatching to its handler by the raw step type",
+                    key, parse_error
+                );
+                return self.run_registered_handler(&key, step).await;
             }
+            DispatchRoute::Unknown => {
+                warn!("Unknown step type: {}", step.step_type);
+                return (
+                    false,
+                    Some(format!("Unknown step type: {}", step.step_type)),
+                    None,
+                    None,
+                );
+            }
+            DispatchRoute::Legacy(legacy) => legacy,
         };
-        if let Some(handler) = self.handler_registry.get(lookup_type.as_str()) {
-            let context = self.create_handler_context().await;
-            let result = handler.execute(step, &context).await;
-            return (
-                result.success,
-                result.error,
-                result.screenshot_path,
-                result.output_data,
-            );
-        }
 
-        // Fallback match statement for step types without registered handlers.
-        // Most step types are handled by the handler registry dispatch above.
+        // Legacy string-dispatched step types (no registered handler).
 
         // Timeouts are disabled by default - only apply if explicitly specified
         let timeout = step.timeout_seconds;
 
-        match step.step_type.as_str() {
-            // NOTE: "test" is no longer a separate step type — it's dispatched through CommandHandler
-            // via the lookup_type normalization above. This legacy arm is kept only as a safety net.
-            "test" => {
-                // Execute verification test with tree event emission
-                use std::sync::atomic::{AtomicU32, Ordering};
-                static TEST_SEQUENCE: AtomicU32 = AtomicU32::new(1);
-                let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::SeqCst);
-                let timestamp = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
-                let action_id = format!("test-{}", sequence);
-                let step_name = step
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| "Verification Test".to_string());
-                let test_id_display = step
-                    .test_id
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string());
-                let is_critical = step.test_is_critical.unwrap_or(false);
-
-                // Build action node for tree events
-                let action_node = json!({
-                    "id": &action_id,
-                    "node_type": "action",
-                    "name": format!("TEST: {}", step_name),
-                    "timestamp": timestamp,
-                    "status": "pending",
-                    "metadata": {
-                        "test_id": &test_id_display,
-                        "is_critical": is_critical,
-                    }
-                });
-
-                // Emit action_started tree event to file log
-                FileLogger::log_tree_event(
-                    "action_started",
-                    &action_node,
-                    &[],
-                    timestamp,
-                    sequence,
-                );
-
-                // Also add to DisplayProcessor for Session/Actions page
-                {
-                    let raw_event = RawEvent {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        event_type: "action_started".to_string(),
-                        timestamp,
-                        data: json!({ "node": action_node.clone() }),
-                        sequence: sequence as u64,
-                    };
-                    let mut processor = self.app_state.display_processor.lock().await;
-                    processor.event_log_mut().add_event(raw_event);
-                }
-
-                // Emit to Tauri frontend for action log refresh
-                self.emit_tree_event("action_started", &action_node, timestamp, sequence);
-
-                // Execute the test
-                let result = if let Some(ref test_id) = step.test_id {
-                    // Execute stored verification test by ID
-                    match self.execute_verification_test(test_id, is_critical).await {
-                        Ok((success, error)) => (success, error, None, None),
-                        Err(e) => (
-                            false,
-                            Some(format!("Test execution error: {}", e)),
-                            None,
-                            None,
-                        ),
-                    }
-                } else if step.test_type.as_deref() == Some("repository") {
-                    // Repository test: run a command in the working directory
-                    let command = step
-                        .check_command
-                        .clone()
-                        .or_else(|| step.shell_command.clone())
-                        .unwrap_or_else(|| "pytest".to_string());
-                    let working_dir = step
-                        .check_working_directory
-                        .clone()
-                        .or_else(|| step.shell_command_working_directory.clone())
-                        .unwrap_or_else(|| {
-                            std::env::current_dir()
-                                .map(|p| p.to_string_lossy().to_string())
-                                .unwrap_or_else(|_| ".".to_string())
-                        });
-                    // Resolve relative paths to absolute
-                    let working_dir = {
-                        let p = std::path::Path::new(&working_dir);
-                        if p.is_relative() {
-                            std::env::current_dir()
-                                .ok()
-                                .map(|cwd| {
-                                    let resolved = cwd.join(p);
-                                    resolved
-                                        .canonicalize()
-                                        .unwrap_or(resolved)
-                                        .to_string_lossy()
-                                        .to_string()
-                                })
-                                .unwrap_or(working_dir)
-                        } else {
-                            working_dir
-                        }
-                    };
-
-                    info!("Executing repository test: {} in {}", command, working_dir);
-
-                    // Create a temporary step config for the shell command execution
-                    let temp_step = ExecutionStepConfig {
-                        shell_command: Some(command.clone()),
-                        shell_command_working_directory: Some(working_dir),
-                        ..Default::default()
-                    };
-                    // Timeouts are disabled by default
-                    let timeout = step.timeout_seconds;
-                    let (s, e, p) = self.execute_shell_command_step(&temp_step, timeout).await;
-                    (s, e, p, None)
-                } else {
-                    (
-                        false,
-                        Some("No test ID specified and test_type is not 'repository'".to_string()),
-                        None,
-                        None,
-                    )
-                };
-
-                let end_timestamp = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
-                let duration = end_timestamp - timestamp;
-                let (success, ref error_opt, _, _) = result;
-
-                // Build completed/failed node
-                let completed_node = json!({
-                    "id": &action_id,
-                    "node_type": "action",
-                    "name": format!("TEST: {}", step_name),
-                    "timestamp": end_timestamp,
-                    "status": if success { "success" } else { "failed" },
-                    "duration": duration,
-                    "error": error_opt.clone(),
-                    "metadata": {
-                        "test_id": &test_id_display,
-                        "is_critical": is_critical,
-                    }
-                });
-
-                let event_type = if success {
-                    "action_completed"
-                } else {
-                    "action_failed"
-                };
-
-                // Emit tree event to file log
-                FileLogger::log_tree_event(
-                    event_type,
-                    &completed_node,
-                    &[],
-                    end_timestamp,
-                    sequence,
-                );
-
-                // Also add to DisplayProcessor for Session/Actions page
-                {
-                    let raw_event = RawEvent {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        event_type: event_type.to_string(),
-                        timestamp: end_timestamp,
-                        data: json!({ "node": completed_node.clone() }),
-                        sequence: sequence as u64,
-                    };
-                    let mut processor = self.app_state.display_processor.lock().await;
-                    processor.event_log_mut().add_event(raw_event);
-                }
-
-                // Emit to Tauri frontend for action log refresh
-                self.emit_tree_event(event_type, &completed_node, end_timestamp, sequence);
-
-                result
-            }
-            "prompt" => {
-                // Prompt steps are text for the AI, not executed here - emit tree events for UI visibility
-                use std::sync::atomic::{AtomicU32, Ordering};
-                static PROMPT_SEQUENCE: AtomicU32 = AtomicU32::new(1);
-                let sequence = PROMPT_SEQUENCE.fetch_add(1, Ordering::SeqCst);
-                let timestamp = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
-                let action_id = format!("prompt-{}", sequence);
-                let step_name = step.name.clone().unwrap_or_else(|| "AI Prompt".to_string());
-                let prompt_text = step.prompt_content.clone().unwrap_or_default();
-                let prompt_preview = if prompt_text.len() > 100 {
-                    format!("{}...", truncate_str(&prompt_text, 100))
-                } else {
-                    prompt_text.clone()
-                };
-
-                // Build action node for tree events
-                let action_node = json!({
-                    "id": &action_id,
-                    "node_type": "action",
-                    "name": format!("PROMPT: {}", step_name),
-                    "timestamp": timestamp,
-                    "status": "pending",
-                    "metadata": {
-                        "prompt_preview": prompt_preview,
-                        "type": "ai_prompt",
-                    }
-                });
-
-                // Emit action_started tree event to file log
-                FileLogger::log_tree_event(
-                    "action_started",
-                    &action_node,
-                    &[],
-                    timestamp,
-                    sequence,
-                );
-
-                // Also add to DisplayProcessor for Session/Actions page
-                {
-                    let raw_event = RawEvent {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        event_type: "action_started".to_string(),
-                        timestamp,
-                        data: json!({ "node": action_node.clone() }),
-                        sequence: sequence as u64,
-                    };
-                    let mut processor = self.app_state.display_processor.lock().await;
-                    processor.event_log_mut().add_event(raw_event);
-                }
-
-                // Emit to Tauri frontend for action log refresh
-                self.emit_tree_event("action_started", &action_node, timestamp, sequence);
-
-                // Prompt steps complete immediately (text is passed to AI, not executed here)
-                let end_timestamp = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
-
-                // Build completed node
-                let completed_node = json!({
-                    "id": &action_id,
-                    "node_type": "action",
-                    "name": format!("PROMPT: {}", step_name),
-                    "timestamp": end_timestamp,
-                    "status": "success",
-                    "duration": end_timestamp - timestamp,
-                    "metadata": {
-                        "prompt_preview": prompt_preview,
-                        "type": "ai_prompt",
-                        "note": "Prompt text passed to AI for processing",
-                    }
-                });
-
-                // Emit action_completed tree event to file log
-                FileLogger::log_tree_event(
-                    "action_completed",
-                    &completed_node,
-                    &[],
-                    end_timestamp,
-                    sequence,
-                );
-
-                // Also add to DisplayProcessor for Session/Actions page
-                {
-                    let raw_event = RawEvent {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        event_type: "action_completed".to_string(),
-                        timestamp: end_timestamp,
-                        data: json!({ "node": completed_node.clone() }),
-                        sequence: sequence as u64,
-                    };
-                    let mut processor = self.app_state.display_processor.lock().await;
-                    processor.event_log_mut().add_event(raw_event);
-                }
-
-                // Emit to Tauri frontend for action log refresh
-                self.emit_tree_event("action_completed", &completed_node, end_timestamp, sequence);
-
-                (true, None, None, None)
-            }
+        match legacy {
             // ================================================================
             // Shell Command Step Type
             // ================================================================
-            "shell_command" => {
+            LegacyStep::ShellCommand => {
                 let (s, e, p) = self.execute_shell_command_step(step, timeout).await;
                 (s, e, p, None)
             }
             // ================================================================
             // Check Step Type (code quality checks)
             // ================================================================
-            "check" => {
+            LegacyStep::Check => {
                 let (s, e, p) = self.execute_check_step(step, timeout).await;
                 (s, e, p, None)
             }
             // ================================================================
             // Check Group Step Type (run all checks in a group)
             // ================================================================
-            "check_group" => {
+            LegacyStep::CheckGroup => {
                 let (success, error, summary, _check_results) =
                     self.execute_check_group_step(step, timeout).await;
                 (success, error, summary, None)
@@ -1782,7 +1645,7 @@ impl StepExecutor {
             // ================================================================
             // Shell Step Type (execute shell command)
             // ================================================================
-            "shell" => {
+            LegacyStep::Shell => {
                 // Timeouts are disabled by default
                 let timeout = step.timeout_seconds;
                 let (success, error, output) = self.execute_shell_command_step(step, timeout).await;
@@ -1792,14 +1655,14 @@ impl StepExecutor {
             // ================================================================
             // Log Watch Step Type (scan dev logs for errors)
             // ================================================================
-            "log_watch" => {
+            LegacyStep::LogWatch => {
                 let (success, error, output) = self.execute_log_watch_step(step).await;
                 (success, error, output, None)
             }
             // ================================================================
             // Gate Step Type (aggregate verification results)
             // ================================================================
-            "gate" => {
+            LegacyStep::Gate => {
                 // The gate step is a semantic aggregation marker used by workflow
                 // generation. Actual pass/fail aggregation is handled by
                 // execute_verification_steps_with_events which checks all required
@@ -1809,16 +1672,6 @@ impl StepExecutor {
                     step.name.as_deref().unwrap_or("unnamed")
                 );
                 (true, None, None, None)
-            }
-            _ => {
-                // Delegate to handler registry for any unrecognized step type
-                warn!("Unknown step type: {}", step.step_type);
-                (
-                    false,
-                    Some(format!("Unknown step type: {}", step.step_type)),
-                    None,
-                    None,
-                )
             }
         }
     }
@@ -2033,18 +1886,11 @@ mod tests {
     // Session 2a: typed dispatch boundary tests
     // ========================================================================
 
-    /// `handler_lookup_key` must return the right string for every one of the
-    /// 16 `FullRunnerStep` variants.  This test is the compile-time coverage
-    /// check: if someone adds a 17th variant without updating `handler_lookup_key`
-    /// the match in that function will fail to compile, not just fail at runtime.
-    #[test]
-    fn test_handler_lookup_key_all_variants() {
+    /// One default instance of every `FullRunnerStep` variant, with the
+    /// handler-registry key it must map to.
+    fn all_variant_cases() -> Vec<(&'static str, qontinui_types::workflow_step::FullRunnerStep)> {
         use qontinui_types::workflow_step::*;
-
-        // Helper to build a minimal BaseStepFields
-        let base = || BaseStepFields::default();
-
-        let cases: &[(&str, qontinui_types::workflow_step::FullRunnerStep)] = &[
+        vec![
             ("command", FullRunnerStep::Command(CommandStep::default())),
             ("prompt", FullRunnerStep::Prompt(PromptStep::default())),
             (
@@ -2100,20 +1946,54 @@ mod tests {
                 FullRunnerStep::DagApproval(DagApprovalStep::default()),
             ),
             ("dag_loop", FullRunnerStep::DagLoop(DagLoopStep::default())),
-        ];
+            (
+                "vga_automate",
+                FullRunnerStep::VgaAutomate(VgaAutomateStep::default()),
+            ),
+            (
+                "spec_check",
+                FullRunnerStep::SpecCheck(SpecCheckStep::default()),
+            ),
+            (
+                "wrapper_action",
+                FullRunnerStep::WrapperAction(WrapperActionStep::default()),
+            ),
+            (
+                "effect_check",
+                FullRunnerStep::EffectCheck(EffectCheckStep::default()),
+            ),
+        ]
+    }
 
-        // Exactly 16 variants — make sure we haven't accidentally skipped one.
+    /// `handler_lookup_key` must return the right string for every one of the
+    /// 20 `FullRunnerStep` variants.
+    ///
+    /// This slice is a RUNTIME check of each arm's string. The compile-time
+    /// coverage check is the wildcard-free `match` in `handler_lookup_key`
+    /// itself: a new variant without an arm fails to compile there. The slice
+    /// has to be extended by hand, which is why the count is asserted.
+    #[test]
+    fn test_handler_lookup_key_all_variants() {
+        let cases = all_variant_cases();
+
+        // Exactly 20 variants — make sure we haven't accidentally skipped one.
         assert_eq!(
             cases.len(),
-            16,
-            "expected exactly 16 FullRunnerStep variants"
+            20,
+            "expected exactly 20 FullRunnerStep variants"
         );
+        // ...and every one of them is a distinct key the registry serves.
+        let registry = crate::step_executor::handlers::HandlerRegistry::with_standard_handlers();
+        let keys: std::collections::BTreeSet<&str> = cases.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys.len(), cases.len(), "duplicate lookup key in cases");
+        for key in &keys {
+            assert!(
+                registry.get(key).is_some(),
+                "handler_lookup_key yields {key:?}, which no registered handler serves"
+            );
+        }
 
-        // Suppress unused-variable warning from the `base` helper when all
-        // cases use Default::default().
-        let _ = base();
-
-        for (expected_key, variant) in cases {
+        for (expected_key, variant) in &cases {
             let actual = handler_lookup_key(variant);
             assert_eq!(
                 actual, *expected_key,
@@ -2209,8 +2089,9 @@ mod tests {
         }
     }
 
-    /// Unknown step types must return an `Err` from `to_full_runner_step` so
-    /// the dispatch path can fall through to string-key dispatch.
+    /// Unknown step types must return an `Err` from `to_full_runner_step`;
+    /// `resolve_dispatch` then decides between the legacy match, a refusal and
+    /// `Unknown step type`.
     #[test]
     fn test_to_full_runner_step_unknown_returns_err() {
         let step = ExecutionStepConfig {
@@ -2240,4 +2121,243 @@ mod tests {
             "\"test\" should not be a FullRunnerStep variant; it is handled at the string layer"
         );
     }
+
+    // ========================================================================
+    // Phase 3: explicit routes and registry <-> enum parity
+    // ========================================================================
+
+    use crate::step_executor::handlers::HandlerRegistry;
+
+    fn minimal_step(step_type: &str) -> ExecutionStepConfig {
+        ExecutionStepConfig {
+            step_type: step_type.to_string(),
+            id: Some("a".to_string()),
+            name: Some("b".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Every type the handler registry serves is produced by
+    /// `handler_lookup_key` for some `FullRunnerStep` variant, and vice versa.
+    /// A handler registered without a variant can only be reached through the
+    /// untyped fallback — exactly the gap this pins shut.
+    ///
+    /// Explicitly excluded: the handler modules `check.rs`, `check_group.rs`,
+    /// `shell_command.rs` and `test.rs`. They implement `StepHandler` and
+    /// declare a `step_type()`, but `with_standard_handlers` does NOT register
+    /// them — they are internal to `CommandHandler`, and their step types are
+    /// served by the legacy `match` (or, for `test`, normalised to `command`).
+    /// So they have no variant on purpose; the assertion below keeps them out
+    /// of the registry, where they would need one.
+    #[test]
+    fn registry_and_full_runner_step_are_in_parity() {
+        const UNREGISTERED_INTERNAL_HANDLERS: &[&str] =
+            &["check", "check_group", "shell_command", "test"];
+
+        let registry = HandlerRegistry::with_standard_handlers();
+        let variant_keys: std::collections::BTreeSet<&str> = all_variant_cases()
+            .iter()
+            .map(|(_, v)| handler_lookup_key(v))
+            .collect();
+        let registered: std::collections::BTreeSet<&str> =
+            registry.step_types().into_iter().collect();
+
+        let without_variant: Vec<_> = registered.difference(&variant_keys).collect();
+        assert!(
+            without_variant.is_empty(),
+            "registered handler(s) with no FullRunnerStep variant: {without_variant:?}"
+        );
+        let without_handler: Vec<_> = variant_keys.difference(&registered).collect();
+        assert!(
+            without_handler.is_empty(),
+            "FullRunnerStep variant key(s) with no registered handler: {without_handler:?}"
+        );
+        for ty in UNREGISTERED_INTERNAL_HANDLERS {
+            assert!(
+                registry.get(ty).is_none(),
+                "{ty:?} is an internal CommandHandler module; registering it needs a variant"
+            );
+        }
+    }
+
+    /// Every `LEGACY_STRING_DISPATCH` entry has an arm in the legacy match: a
+    /// minimal step of each routes to `Legacy`, never to the `Unknown step
+    /// type` failure. (`StepExecutor` needs a live `AppState`, so this drives
+    /// `resolve_dispatch`, whose `Legacy` payload the legacy match is
+    /// exhaustive over.)
+    #[test]
+    fn every_legacy_dispatch_entry_has_a_legacy_arm() {
+        let registry = HandlerRegistry::with_standard_handlers();
+        for ty in LEGACY_STRING_DISPATCH {
+            let route = resolve_dispatch(&minimal_step(ty), &registry);
+            assert_ne!(route, DispatchRoute::Unknown, "{ty:?}: Unknown step type");
+            assert_eq!(
+                route,
+                DispatchRoute::Legacy(LegacyStep::from_type(ty).unwrap()),
+                "{ty:?}"
+            );
+            assert!(
+                registry.get(ty).is_none(),
+                "{ty:?} is registered; it should not also be legacy"
+            );
+        }
+    }
+
+    /// The legacy types, spelled independently of `LEGACY_STRING_DISPATCH` so
+    /// that dropping an entry from the const fails here rather than silently
+    /// shrinking the check.
+    #[test]
+    fn legacy_types_route_to_the_legacy_match() {
+        const EXPECTED: &[&str] = &[
+            "shell_command",
+            "check",
+            "check_group",
+            "shell",
+            "log_watch",
+            "gate",
+        ];
+        let registry = HandlerRegistry::with_standard_handlers();
+        for ty in EXPECTED {
+            assert!(
+                matches!(
+                    resolve_dispatch(&minimal_step(ty), &registry),
+                    DispatchRoute::Legacy(_)
+                ),
+                "{ty:?} must route to the legacy match"
+            );
+        }
+        assert_eq!(LEGACY_STRING_DISPATCH.len(), EXPECTED.len());
+    }
+
+    /// Assert `step` takes the registry fallback to `key`, and return the
+    /// carried parse error.
+    fn assert_fallback(step: &ExecutionStepConfig, key: &str) -> String {
+        let registry = HandlerRegistry::with_standard_handlers();
+        match resolve_dispatch(step, &registry) {
+            DispatchRoute::RegistryFallback {
+                key: got,
+                parse_error,
+            } => {
+                assert_eq!(got, key);
+                assert!(
+                    parse_error.contains("failed to parse step as FullRunnerStep"),
+                    "{parse_error}"
+                );
+                parse_error
+            }
+            other => panic!("expected RegistryFallback to {key:?}, got {other:?}"),
+        }
+    }
+
+    /// A type the registry serves whose typed parse fails still runs on its
+    /// handler (by the raw step type), carrying the serde message for the
+    /// warning — never the legacy match, never `Unknown`.
+    #[test]
+    fn registered_type_failing_the_parse_falls_back_to_its_handler_with_the_serde_message() {
+        let step: ExecutionStepConfig = serde_json::from_value(json!({
+            "type": "workflow_fixup", "id": "a", "name": "b", "fixupMode": "zzz"
+        }))
+        .unwrap();
+        let msg = assert_fallback(&step, "workflow_fixup");
+        assert!(
+            msg.contains("zzz"),
+            "serde message names the bad value: {msg}"
+        );
+    }
+
+    /// The phase stamping `refetch_unified_workflow_steps` applies
+    /// (mcp/unified_workflows.rs:204-231): every step is converted with
+    /// `serde_json::from_value::<ExecutionStepConfig>` (:105) and then gets
+    /// `phase` set from the array it sits in, so a command step placed in
+    /// `agentic_steps` is stamped `"agentic"` (:219-223). The function itself
+    /// is not callable here (it reads the workflow from Postgres), so this
+    /// replicates the loop over the real `normalize_to_stages`.
+    fn refetch_stamped_steps(
+        workflow: &crate::unified_workflows::UnifiedWorkflow,
+    ) -> Vec<ExecutionStepConfig> {
+        use crate::unified_workflows::UnifiedWorkflowExt;
+        let mut out = Vec::new();
+        for stage in &workflow.normalize_to_stages() {
+            for (phase, steps) in [
+                ("setup", &stage.setup_steps),
+                ("verification", &stage.verification_steps),
+                ("agentic", &stage.agentic_steps),
+                ("completion", &stage.completion_steps),
+            ] {
+                for step in steps {
+                    let mut config: ExecutionStepConfig =
+                        serde_json::from_value(step.clone()).unwrap();
+                    config.phase = Some(phase.to_string());
+                    out.push(config);
+                }
+            }
+        }
+        out
+    }
+
+    /// A command step in `agentic_steps` is stamped `phase: "agentic"`, which
+    /// `CommandStepPhase` has no variant for. The verification path executes
+    /// agentic-phase steps (`execute_verification_steps_with_events` keeps
+    /// `verification` and `agentic`), and `CommandHandler` ran them before the
+    /// typed dispatch existed — so the route must be the command handler.
+    #[test]
+    fn refetch_agentic_stamped_command_step_falls_back_to_the_command_handler() {
+        let workflow: crate::unified_workflows::UnifiedWorkflow = serde_json::from_value(json!({
+            "id": "w",
+            "name": "w",
+            "agenticSteps": [
+                {"type": "command", "id": "c1", "name": "run tests", "command": "cargo test"}
+            ]
+        }))
+        .unwrap();
+        let steps = refetch_stamped_steps(&workflow);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].phase.as_deref(), Some("agentic"));
+        let msg = assert_fallback(&steps[0], "command");
+        assert!(msg.contains("agentic"), "{msg}");
+    }
+
+    /// An out-of-enum `check_type` on a command step fails the typed parse
+    /// (`CheckType` is closed) but `CommandHandler` reads the raw string.
+    #[test]
+    fn command_step_with_out_of_enum_check_type_falls_back_to_the_command_handler() {
+        let step: ExecutionStepConfig = serde_json::from_value(json!({
+            "type": "command", "id": "a", "name": "b", "phase": "verification",
+            "check_type": "not_a_real_check_type", "command": "true"
+        }))
+        .unwrap();
+        let msg = assert_fallback(&step, "command");
+        assert!(msg.contains("not_a_real_check_type"), "{msg}");
+    }
+
+    #[test]
+    fn unknown_type_routes_to_unknown_and_test_to_command() {
+        let registry = HandlerRegistry::with_standard_handlers();
+        assert_eq!(
+            resolve_dispatch(&minimal_step("totally_unknown_custom_type"), &registry),
+            DispatchRoute::Unknown
+        );
+        assert_eq!(
+            resolve_dispatch(&minimal_step("test"), &registry),
+            DispatchRoute::Registry("command")
+        );
+        let mut prompt = minimal_step("prompt");
+        prompt.prompt_content = Some(String::new());
+        assert_eq!(
+            resolve_dispatch(&prompt, &registry),
+            DispatchRoute::Registry("prompt")
+        );
+    }
+
+    /// A prompt step with NO content (not even `""`) fails the typed parse —
+    /// `PromptStep.content` is a required `String` — but `PromptStepHandler`
+    /// passes an absent body through as success, so the step still runs.
+    #[test]
+    fn contentless_prompt_step_falls_back_to_the_prompt_handler() {
+        assert_fallback(&minimal_step("prompt"), "prompt");
+    }
 }
+
+#[cfg(test)]
+#[path = "typed_dispatch_corpus_tests.rs"]
+mod typed_dispatch_corpus_tests;

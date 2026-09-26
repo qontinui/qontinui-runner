@@ -1470,7 +1470,7 @@ Only emit genuinely new insights — do NOT re-emit existing knowledge."#,
 ///
 /// Constructs a `command` step with a curl shell command.
 /// The `output_variable` is extracted from the step output by the runtime.
-fn build_api_step(
+pub(crate) fn build_api_step(
     name: &str,
     method: &str,
     url: &str,
@@ -2104,7 +2104,7 @@ Do NOT re-emit existing fixes."#,
 }
 
 /// Helper: Build a prompt step.
-fn build_prompt_step(name: &str, content: &str) -> ExecutionStepConfig {
+pub(crate) fn build_prompt_step(name: &str, content: &str) -> ExecutionStepConfig {
     ExecutionStepConfig {
         step_type: "prompt".to_string(),
         name: Some(name.to_string()),
@@ -2114,7 +2114,7 @@ fn build_prompt_step(name: &str, content: &str) -> ExecutionStepConfig {
 }
 
 /// Helper: Build a verification prompt step.
-fn build_verification_prompt_step(name: &str, content: &str) -> ExecutionStepConfig {
+pub(crate) fn build_verification_prompt_step(name: &str, content: &str) -> ExecutionStepConfig {
     let mut step = build_prompt_step(name, content);
     step.phase = Some("verification".to_string());
     step
