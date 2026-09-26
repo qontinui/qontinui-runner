@@ -19,6 +19,38 @@ use schemars::schema_for;
 use serde_json::{Map, Value};
 
 // ============================================================================
+// Schema-only field helper
+// ============================================================================
+
+/// Schema-only stand-in for an `Option<T>` field that is ALWAYS serialized —
+/// no `skip_serializing_if`, so `None` goes out as `null`, never as a missing
+/// key.
+///
+/// Used as `#[schemars(with = "crate::schema_export::Nullable<T>")]`. The
+/// schemas are exported under schemars' default *deserialize* contract, in
+/// which a plain `Option<T>` field is OPTIONAL (`x?: T | null`), because serde
+/// accepts it missing on the way in. For a payload the runner EMITS that
+/// overstates the uncertainty: the key is always there. This wrapper keeps the
+/// nullable schema but is not itself an `Option`, so schemars marks the field
+/// required (`x: T | null`) — the shape a consumer actually receives. Serde is
+/// untouched; the field stays `Option<T>`.
+pub struct Nullable<T>(std::marker::PhantomData<T>);
+
+impl<T: schemars::JsonSchema> schemars::JsonSchema for Nullable<T> {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        <Option<T> as schemars::JsonSchema>::schema_name()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        <Option<T> as schemars::JsonSchema>::json_schema(generator)
+    }
+}
+
+// ============================================================================
 // Export function
 // ============================================================================
 
