@@ -1169,6 +1169,10 @@ pub struct WorktreeCensus {
     /// Phase 1c). Slots are never pruned by the hook and the runner does NO
     /// liveness filtering: the consumer ages each entry by its own
     /// `last_seen`. `None` when the tree has no slot at all.
+    ///
+    /// A session whose only record is a pre-`custody.d` mirror (the upgrade
+    /// case) appears in the scalar `custody_session_id` but NOT here, so a
+    /// consumer must not assume the scalar session is in this list.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custody_occupants: Option<Vec<CustodyOccupant>>,
 
