@@ -67,12 +67,16 @@ pub mod profiles;
 // users-path-and-the-passage-of-time): registered by `schema_export`, built by
 // the bin's `journey::routes`.
 pub mod journey_wire;
-pub mod known_issue_types;
 pub mod relay_envelopes;
 pub mod runner_breadcrumb;
 pub mod schema_export;
-pub mod skill_types;
 pub mod tauri_event_payloads;
+
+// Wire types whose only producers live in the runner BIN, hoisted here so the
+// schema-export pipeline (`schema_export`) can see them; the bin re-exports
+// each. Session 4e (plan 2026-09-12-residual-work-from-the-april-2026-plan-audit).
+pub mod known_issue_types;
+pub mod skill_types;
 pub mod ui_bridge_action_plan;
 
 // Temp-file-then-rename writer. Owned by the lib and imported by the runner
