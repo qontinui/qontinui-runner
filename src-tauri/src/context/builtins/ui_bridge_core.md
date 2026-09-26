@@ -190,7 +190,7 @@ Prefer these primitives over `sleep N && re-discover`; they all already exist. E
 **Tab navigation** — pick the simplest that works:
 
 - `POST /ui-bridge/control/activate-tab/{tab_id}` — fire-and-forget Tauri event; fastest path when you just need the tab switched and don't need a signal back.
-- `POST /ui-bridge/control/page/set-tab` — body `{ tab }`. Dispatches a `CustomEvent("ui-bridge-set-tab", …)` and reads back `[data-page-id]` so you get a verification signal in the response. Works even when the SDK is unresponsive.
+- `POST /ui-bridge/control/page/set-tab` — body `{ tab }`. Dispatches a `CustomEvent("ui-bridge-set-tab", …)` and reads back page ids so you get a verification signal in the response. Works even when the SDK is unresponsive. `pageId` is the FIRST `[data-page-id]` in the document — always the outer page wrapper, never a sub-view. `activePageId` is the deepest VISIBLE `[data-page-id]` (non-zero rect, so hidden tabs are skipped) — the sub-view you actually landed on — and `pageIdChain` lists the page ids along its ancestor path, outer → inner. Assert on `activePageId` when you need the sub-view.
 - `window.__UI_BRIDGE__.stateMachine.navigateTo("page-<slug>")` via `POST /ui-bridge/control/page/evaluate` — runs the compiled sidebar transition. Use when you need the state-machine side effects (active-state updates, etc.).
 - Avoid clicking sidebar buttons via `POST /ui-bridge/control/element/<id>/action` for navigation — the click handler fires but may not route through the state-machine transition. Use one of the three above instead.
 
