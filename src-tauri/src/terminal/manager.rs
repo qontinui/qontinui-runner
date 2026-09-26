@@ -854,6 +854,9 @@ impl TerminalManager {
                 sessions.len()
             );
         }
+        // Every terminal-bound coord-mcp key the identity seam minted, revoked in
+        // ONE store write (the per-session close skips it under a deadline).
+        crate::coord_mcp::release_all_terminal_bound_keys();
         info!("All terminal sessions closed");
     }
 

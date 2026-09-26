@@ -1399,6 +1399,61 @@ mod script_tests {
         std::fs::read_to_string(out).expect("the real claude ran")
     }
 
+    /// A NESTED `claude` (recursion guard set) must not inherit the parent
+    /// terminal's coord-mcp key variables — the bash identity shim unsets every
+    /// `QONTINUI_COORD_MCP_NONCE_<K>` / `QONTINUI_COORD_MCP_CREDENTIAL_<K>` in
+    /// its pass-through, and nothing else (plan
+    /// `2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages`).
+    #[test]
+    fn bash_identity_shim_nested_passthrough_drops_the_terminal_key_vars() {
+        let _serial = exe_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        let shim_dir = tmp.path().join("shim");
+        let real_dir = tmp.path().join("real");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let out = real_dir.join("env.txt");
+        write_exe(
+            &real_dir.join("claude"),
+            &format!(
+                "#!/usr/bin/env bash
+env | grep -E '^(QONTINUI_COORD_MCP_|KEEP_ME)' | sort > '{}'
+",
+                out.display()
+            ),
+        );
+        let rendered = IDENTITY_SHIM_BASH
+            .replace("@@TOOL@@", "claude")
+            .replace("@@SHIM_DIR@@", &shim_dir.to_string_lossy());
+        write_exe(&shim_dir.join("claude"), &rendered);
+        let nonce_var = crate::coord_mcp_config::terminal_nonce_env_name("/w/a");
+        let cred_var = crate::coord_mcp_config::terminal_credential_env_name("/w/a");
+        let mut cmd = Command::new("bash");
+        cmd.arg(shim_dir.join("claude"))
+            .env_clear()
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}:/usr/bin:/bin",
+                    shim_dir.display(),
+                    real_dir.display()
+                ),
+            )
+            .env("QONTINUI_INSTALL_INTERCEPT_GUARD", "1")
+            .env(&nonce_var, "parent-terminal-nonce")
+            .env(&cred_var, "/parent/cred.json")
+            .env("KEEP_ME", "1");
+        let shim_out = crate::process_helpers::output_with_timeout(cmd, SCRIPT_BUDGET)
+            .expect("the shim runs inside its budget");
+        assert!(
+            shim_out.status.success(),
+            "identity shim failed: {}",
+            String::from_utf8_lossy(&shim_out.stderr)
+        );
+        let got = std::fs::read_to_string(out).expect("the real claude ran");
+        assert_eq!(got, "KEEP_ME=1\n", "only the unrelated var survives: {got}");
+    }
+
     /// The bash identity shim keeps the marker pair ONLY for a launch that
     /// passes the composed file itself (either spelling). A nested `claude`
     /// with its own prompt file, a bare one, or an inline one loses both.

@@ -2883,8 +2883,8 @@ mod tests {
             &path,
             r#"{"mcpServers":{"coord-mcp":{"type":"http",
                "url":"http://127.0.0.1:9877/coord-mcp",
-               "headers":{"Authorization":"Bearer ${QONTINUI_COORD_MCP_NONCE:-wdnonce}",
-                          "X-Coord-Mcp-Proxy-Key":"${QONTINUI_COORD_MCP_NONCE:-wdnonce}"}}}}"#,
+               "headers":{"Authorization":"Bearer ${QONTINUI_COORD_MCP_NONCE_0123456789ABCDEF:-wdnonce}",
+                          "X-Coord-Mcp-Proxy-Key":"${QONTINUI_COORD_MCP_NONCE_0123456789ABCDEF:-wdnonce}"}}}}"#,
         )
         .unwrap();
         let facts = parse_mcp_json_proxy(&path).expect("parses the env-referenced shape");
