@@ -418,9 +418,10 @@ const ALLOWLIST: &[AllowlistEntry] = &[
             "allocated_worktree_explicit_nulls_read_unmeasured",
             "allocated_worktree_unrecognised_freshness_reads_unknown",
             "payload_to_allocate_result_carries_freshness_onto_the_result",
+            "credential_door_typed_404_in_code_field_never_falls_back",
         ],
         reason: "guards the continuation registry + admitted-launch cap (clear_continuation_registry); \
-         the 163 tests outside it never call evaluate_continuation_guard* or the registry \
+         the 164 tests outside it never call evaluate_continuation_guard* or the registry \
          accessors (grep-verified 2026-09-21) — command builders, payload shapes, env scrubs",
     },
     AllowlistEntry {
