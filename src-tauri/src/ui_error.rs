@@ -773,6 +773,51 @@ pub fn false_death_suppressed_count() -> u64 {
     FALSE_DEATH_SUPPRESSED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// How many stale-pong death verdicts were SUPPRESSED because the runner was
+/// out of file descriptors ([`PingDelivery::Starved`]). Kept apart from
+/// [`FALSE_DEATH_SUPPRESSED`] so that counter keeps the undeliverable-only
+/// meaning fleet consumers already read it with.
+static FD_STARVED_SUPPRESSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Count one death verdict suppressed as fd starvation.
+pub fn record_fd_starved_suppressed() {
+    FD_STARVED_SUPPRESSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many death verdicts have been suppressed as fd starvation.
+pub fn fd_starved_suppressed_count() -> u64 {
+    FD_STARVED_SUPPRESSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Count one suppression against the counter for the arm that caused it.
+/// A no-op for a verdict that does not suppress.
+pub fn record_suppression(delivery: PingDelivery) {
+    match delivery {
+        PingDelivery::Undeliverable => record_false_death_suppressed(),
+        PingDelivery::Starved => record_fd_starved_suppressed(),
+        PingDelivery::Corroborated | PingDelivery::Unknown => {}
+    }
+}
+
+/// Read the live descriptor-pressure inputs — headroom from the census plus
+/// the exhaustion stamp — together with the exhaustion COUNT, from ONE read of
+/// the stamp atomics so the published count and the stamp the verdict was
+/// decided from cannot disagree. Every unreadable side stays `None` —
+/// UNKNOWN, never 0.
+pub fn fd_pressure_snapshot_now() -> (FdPressureInputs, u64) {
+    let headroom = crate::util::egress_context::fd_headroom();
+    let (fd_exhausted_errors, last_exhausted_ms) =
+        qontinui_runner_lib::util::fd_exhaustion::fd_exhaustion_report();
+    (
+        FdPressureInputs {
+            open: headroom.open.counted(),
+            soft_limit: headroom.soft_limit.counted(),
+            last_exhausted_ms,
+        },
+        fd_exhausted_errors,
+    )
+}
+
 /// [`now_ms_epoch`] for callers outside this module that must pin the SAME
 /// instant across several derived values (the `/health` handler does).
 pub fn now_ms_epoch_pub() -> u64 {
@@ -795,6 +840,141 @@ pub struct PingDeliveryInputs {
     pub last_emit_fail_ms: u64,
     /// Wall clock, passed in so the classifier stays pure.
     pub now_ms: u64,
+    /// The RECEIVE side (plan 2026-09-09 pong receive path). A delivered ping
+    /// whose pong cannot be received — because the runner has no descriptor
+    /// to accept the `/ui-bridge/pong` socket on — is as silent as a dead UI.
+    /// See [`classify_fd_pressure`].
+    pub fd: FdPressureInputs,
+}
+
+// ───────────── descriptor pressure (plan 2026-09-09 pong receive path) ─────────────
+//
+// #1384 closed the SEND side: a ping that could not be emitted is not evidence
+// about the UI. The RECEIVE side had no equivalent, because a pong that never
+// arrives produces nothing — and nothing is also what a quiet healthy second
+// looks like. Measured 2026-09-02 on `merytshost` (Linux): 0 failed emits,
+// 8,267 `Too many open files (os error 24)`, 240 recovery ladders run to
+// EXHAUSTED and 7 native dialogs raised at a user, with `could not spawn: Too
+// many open files` 11 s before `UI recovery starting reason="heartbeat_stale"`.
+// Recreating a webview returns no descriptors, so every one of those recreates
+// was futile.
+//
+// The property tested is "could this runner have RECEIVED a pong during the
+// window it is calling the UI dead for?" — answered from two independent
+// authorities: measured headroom (soft RLIMIT_NOFILE − open count) and the
+// EMFILE/ENFILE stamp (`qontinui_runner_lib::util::fd_exhaustion`).
+
+/// Everything [`classify_fd_pressure`] decides from. Every field is either a
+/// measurement or an explicit absence — never a `0` standing in for "did not
+/// look".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FdPressureInputs {
+    /// Open descriptors. `None` = the census could not run (non-Linux, or
+    /// `/proc/self/fd` unreadable — which at total exhaustion it is).
+    pub open: Option<u64>,
+    /// Soft `RLIMIT_NOFILE`. `None` = unreadable, unlimited, or no such limit
+    /// on this platform (Windows).
+    pub soft_limit: Option<u64>,
+    /// Wall-clock ms of the last EMFILE/ENFILE any wired site observed.
+    /// 0 = none ever.
+    pub last_exhausted_ms: u64,
+}
+
+impl FdPressureInputs {
+    /// Nothing measured and nothing observed. Classifies [`FdPressure::Unknown`].
+    pub const UNMEASURED: FdPressureInputs = FdPressureInputs {
+        open: None,
+        soft_limit: None,
+        last_exhausted_ms: 0,
+    };
+
+    /// `soft_limit - open`, saturating; `None` unless BOTH were measured.
+    pub fn headroom(&self) -> Option<u64> {
+        match (self.open, self.soft_limit) {
+            (Some(open), Some(limit)) => Some(limit.saturating_sub(open)),
+            _ => None,
+        }
+    }
+}
+
+/// Absolute floor of the starvation threshold, in descriptors.
+///
+/// Why 32: a single pong needs ONE descriptor, but it competes with everything
+/// else the process opens concurrently — the 3 s ping loop, the 30 s heartbeat,
+/// git spawns (each spawn transiently costs 3 pipe pairs = 6 descriptors plus
+/// the exec), coord egress and every live session's pipes. At the `merytshost`
+/// incident rate (8,267 EMFILEs in hours) the pool was being drained to zero
+/// repeatedly, so "a handful left" at the instant of the read is not evidence
+/// that an accept 3 s earlier succeeded. 32 is a few spawns' worth of slack.
+pub const FD_STARVED_FLOOR: u64 = 32;
+
+/// The headroom below which the receive path is treated as starved:
+/// `max(FD_STARVED_FLOOR, soft_limit / 20)`.
+///
+/// Why 5 %: the floor alone is meaningless against a 1,048,576 limit (a
+/// process that has leaked a million descriptors has 32 left for a
+/// nanosecond), and against a 1,024 limit 5 % is 51 — the same order as the
+/// floor. Deliberately generous in ONE direction only: a false `Starved`
+/// costs one suppressed recreate (the verdict and the `errored` status are
+/// both still published, and the moment headroom recovers the next tick
+/// recovers), while a false `Ample` costs the 240-ladder, 7-dialog incident.
+pub fn fd_starvation_threshold(soft_limit: u64) -> u64 {
+    FD_STARVED_FLOOR.max(soft_limit / 20)
+}
+
+/// Whether the runner's RECEIVE path was starved of descriptors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FdPressure {
+    /// Positive evidence: an EMFILE/ENFILE inside the death window, or
+    /// measured headroom below [`fd_starvation_threshold`].
+    Starved,
+    /// Headroom was measured and is comfortably above the threshold, and no
+    /// exhaustion error landed inside the window.
+    Ample,
+    /// Nothing established: headroom unmeasured AND no recent exhaustion
+    /// stamp. UNKNOWN is not "ample" and not "starved"; it must never
+    /// suppress a recovery.
+    Unknown,
+}
+
+impl FdPressure {
+    /// Stable machine-readable form for `/health` and the heartbeat. Fleet
+    /// consumers match on these; do not reword them.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FdPressure::Starved => "starved",
+            FdPressure::Ample => "ample",
+            FdPressure::Unknown => "unknown",
+        }
+    }
+}
+
+/// Classify descriptor pressure. Pure — no clock, no atomics, no syscalls.
+///
+/// Precedence:
+/// 1. An exhaustion stamp inside [`UI_DEAD_AFTER_MS`] is `Starved` whatever the
+///    headroom reads NOW. The window is the death verdict's own span, so this
+///    asks exactly "did the receive path fail during the period we are calling
+///    the UI dead for?" — and under intermittent exhaustion the count hovers at
+///    the limit, so an instantaneous read that happens to land on a freed
+///    descriptor does not refute an EMFILE seconds earlier. The suppression
+///    this produces is self-limiting: it lapses `UI_DEAD_AFTER_MS` after the
+///    last stamp.
+/// 2. Measured headroom below the threshold is `Starved`; at or above it is
+///    `Ample`.
+/// 3. Otherwise `Unknown`. A stamp OLDER than the window is history and does
+///    not make an unmeasured headroom starved.
+pub fn classify_fd_pressure(fd: FdPressureInputs, now_ms: u64) -> FdPressure {
+    if fd.last_exhausted_ms > 0 && now_ms.saturating_sub(fd.last_exhausted_ms) <= UI_DEAD_AFTER_MS {
+        return FdPressure::Starved;
+    }
+    match (fd.headroom(), fd.soft_limit) {
+        (Some(headroom), Some(limit)) if headroom < fd_starvation_threshold(limit) => {
+            FdPressure::Starved
+        }
+        (Some(_), Some(_)) => FdPressure::Ample,
+        _ => FdPressure::Unknown,
+    }
 }
 
 /// Whether a stale pong is CORROBORATED as evidence the UI is dead.
@@ -807,6 +987,12 @@ pub enum PingDelivery {
     /// pong staleness is evidence about the TRANSPORT — do NOT recreate the
     /// webview on top of a live UI.
     Undeliverable,
+    /// The ping may well have been delivered, but the PONG could not have been
+    /// received: the runner was out of file descriptors (see [`FdPressure`]),
+    /// and the `/ui-bridge/pong` it arrives on needs an accepted socket. The
+    /// staleness is evidence about the runner's own receive path — do NOT
+    /// recreate the webview, which returns no descriptors.
+    Starved,
     /// Nobody has established anything: no emit, success or failure, has ever
     /// been recorded. UNKNOWN is NOT "deliverable" and NOT "undeliverable" —
     /// the caller preserves its pre-existing behaviour on this arm, so a
@@ -822,7 +1008,19 @@ impl PingDelivery {
         match self {
             PingDelivery::Corroborated => "ping_delivered",
             PingDelivery::Undeliverable => "ping_undeliverable",
+            PingDelivery::Starved => "fd_starved",
             PingDelivery::Unknown => "unknown",
+        }
+    }
+
+    /// Whether this verdict suppresses the webview recreate. TRUE only for the
+    /// two arms that carry POSITIVE evidence the stale pong is about the
+    /// runner rather than the UI. An exhaustive match, so a future variant has
+    /// to decide here instead of silently inheriting either behaviour.
+    pub fn suppresses_recovery(self) -> bool {
+        match self {
+            PingDelivery::Undeliverable | PingDelivery::Starved => true,
+            PingDelivery::Corroborated | PingDelivery::Unknown => false,
         }
     }
 }
@@ -834,16 +1032,28 @@ impl PingDelivery {
 /// verdict itself measures, so "the ping was failing during the period we are
 /// calling the UI dead for" is exactly the question being asked. A failure
 /// older than that window is history and does not excuse a current silence.
+///
+/// Precedence: `Undeliverable` (the send side failed) first, unchanged from
+/// #1384; then `Starved` (the receive side had no descriptor) on positive fd
+/// evidence only; then the emit record decides `Corroborated` vs `Unknown`
+/// exactly as before. `Starved` outranks an emit record of `Unknown` because
+/// the fd evidence stands on its own: with no descriptor to accept a pong on,
+/// no pong could have landed whether or not a ping was ever sent.
 pub fn classify_ping_delivery(i: PingDeliveryInputs) -> PingDelivery {
-    if i.last_emit_ok_ms == 0 && i.last_emit_fail_ms == 0 {
-        return PingDelivery::Unknown;
-    }
     // A failure that is both MORE RECENT than the last success and still
     // inside the death window means the transport is down right now.
+    // (`last_emit_fail_ms > last_emit_ok_ms` already implies a non-zero
+    // failure stamp, so the both-zero record never reaches this arm.)
     if i.last_emit_fail_ms > i.last_emit_ok_ms
         && i.now_ms.saturating_sub(i.last_emit_fail_ms) <= UI_DEAD_AFTER_MS
     {
         return PingDelivery::Undeliverable;
+    }
+    if classify_fd_pressure(i.fd, i.now_ms) == FdPressure::Starved {
+        return PingDelivery::Starved;
+    }
+    if i.last_emit_ok_ms == 0 && i.last_emit_fail_ms == 0 {
+        return PingDelivery::Unknown;
     }
     // `Corroborated` is a POSITIVE claim — "the ping was delivered and went
     // unanswered" — so it may not be made from a record containing no
@@ -859,7 +1069,8 @@ pub fn classify_ping_delivery(i: PingDeliveryInputs) -> PingDelivery {
     // nobody established.
     //
     // This does NOT change the recovery decision: the gate suppresses only on
-    // `Undeliverable`, and `Unknown` recovers exactly as `Corroborated` does.
+    // `Undeliverable` / `Starved` (see `PingDelivery::suppresses_recovery`),
+    // and `Unknown` recovers exactly as `Corroborated` does.
     // It changes only what the runner SAYS.
     if i.last_emit_ok_ms == 0 {
         return PingDelivery::Unknown;
@@ -874,6 +1085,7 @@ pub fn ping_delivery_now() -> PingDelivery {
         last_emit_ok_ms,
         last_emit_fail_ms,
         now_ms: now_ms_epoch(),
+        fd: fd_pressure_snapshot_now().0,
     })
 }
 
@@ -908,6 +1120,31 @@ pub struct PingDeliveryReport {
     /// undeliverable. Monotonic, and the number that makes an hours-long
     /// suppression legible instead of silent.
     pub false_death_suppressed: u64,
+    /// The receive-side verdict [`PingDelivery::Starved`] was decided from.
+    pub fd_pressure: FdPressure,
+    /// Open descriptors; `None` = not measured (UNKNOWN, never 0).
+    pub fd_open: Option<u64>,
+    /// Soft `RLIMIT_NOFILE`; `None` = unreadable / unlimited / no such limit.
+    pub fd_soft_limit: Option<u64>,
+    /// `fd_soft_limit - fd_open`; `None` unless both were measured.
+    pub fd_headroom: Option<u64>,
+    /// Monotonic count of EMFILE/ENFILE errors any wired site observed.
+    pub fd_exhausted_errors: u64,
+    /// Age of the last EMFILE/ENFILE; `None` = none ever observed.
+    pub last_fd_exhausted_age_ms: Option<u64>,
+    /// Recreates NOT performed because the runner was out of descriptors —
+    /// the receive-side twin of `false_death_suppressed`.
+    pub fd_starved_suppressed: u64,
+}
+
+/// The monotonic counters a [`PingDeliveryReport`] carries. A struct rather
+/// than four positional `u64`s, which could be transposed silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PingCounters {
+    pub emit_failures: u64,
+    pub false_death_suppressed: u64,
+    pub fd_exhausted_errors: u64,
+    pub fd_starved_suppressed: u64,
 }
 
 /// Build a [`PingDeliveryReport`]. Pure — no clock, no atomics — the same
@@ -915,19 +1152,26 @@ pub struct PingDeliveryReport {
 /// age arithmetic and the 0-means-never guard are testable without a runtime.
 pub fn classify_ping_delivery_report(
     i: PingDeliveryInputs,
-    emit_failures: u64,
-    false_death_suppressed: u64,
+    counters: PingCounters,
 ) -> PingDeliveryReport {
     PingDeliveryReport {
         delivery: classify_ping_delivery(i),
-        emit_failures,
+        emit_failures: counters.emit_failures,
         // `0` is the "never recorded" sentinel of the atomics these come from,
         // so it must publish as UNKNOWN rather than as an age of `now`.
         last_emit_ok_age_ms: (i.last_emit_ok_ms > 0)
             .then(|| i.now_ms.saturating_sub(i.last_emit_ok_ms)),
         last_emit_fail_age_ms: (i.last_emit_fail_ms > 0)
             .then(|| i.now_ms.saturating_sub(i.last_emit_fail_ms)),
-        false_death_suppressed,
+        false_death_suppressed: counters.false_death_suppressed,
+        fd_pressure: classify_fd_pressure(i.fd, i.now_ms),
+        fd_open: i.fd.open,
+        fd_soft_limit: i.fd.soft_limit,
+        fd_headroom: i.fd.headroom(),
+        fd_exhausted_errors: counters.fd_exhausted_errors,
+        last_fd_exhausted_age_ms: (i.fd.last_exhausted_ms > 0)
+            .then(|| i.now_ms.saturating_sub(i.fd.last_exhausted_ms)),
+        fd_starved_suppressed: counters.fd_starved_suppressed,
     }
 }
 
@@ -935,14 +1179,20 @@ pub fn classify_ping_delivery_report(
 /// clock.
 pub fn ping_delivery_report_now() -> PingDeliveryReport {
     let (emit_failures, last_emit_ok_ms, last_emit_fail_ms) = ping_emit_report();
+    let (fd, fd_exhausted_errors) = fd_pressure_snapshot_now();
     classify_ping_delivery_report(
         PingDeliveryInputs {
             last_emit_ok_ms,
             last_emit_fail_ms,
             now_ms: now_ms_epoch(),
+            fd,
         },
-        emit_failures,
-        false_death_suppressed_count(),
+        PingCounters {
+            emit_failures,
+            false_death_suppressed: false_death_suppressed_count(),
+            fd_exhausted_errors,
+            fd_starved_suppressed: fd_starved_suppressed_count(),
+        },
     )
 }
 
@@ -2399,15 +2649,23 @@ mod tests {
 
     // ── ping deliverability (plan 2026-09-01) ───────────────────────────────
 
-    use super::{classify_ping_delivery, PingDelivery, PingDeliveryInputs};
+    use super::{
+        classify_fd_pressure, classify_ping_delivery, fd_starvation_threshold, FdPressure,
+        FdPressureInputs, PingCounters, PingDelivery, PingDeliveryInputs, FD_STARVED_FLOOR,
+    };
 
     const NOW: u64 = 1_800_000_000_000;
 
     fn pd(ok: u64, fail: u64) -> PingDelivery {
+        pd_fd(ok, fail, FdPressureInputs::UNMEASURED)
+    }
+
+    fn pd_fd(ok: u64, fail: u64, fd: FdPressureInputs) -> PingDelivery {
         classify_ping_delivery(PingDeliveryInputs {
             last_emit_ok_ms: ok,
             last_emit_fail_ms: fail,
             now_ms: NOW,
+            fd,
         })
     }
 
@@ -2490,7 +2748,11 @@ mod tests {
         // Fleet consumers match on these.
         assert_eq!(PingDelivery::Corroborated.as_str(), "ping_delivered");
         assert_eq!(PingDelivery::Undeliverable.as_str(), "ping_undeliverable");
+        assert_eq!(PingDelivery::Starved.as_str(), "fd_starved");
         assert_eq!(PingDelivery::Unknown.as_str(), "unknown");
+        assert_eq!(FdPressure::Starved.as_str(), "starved");
+        assert_eq!(FdPressure::Ample.as_str(), "ample");
+        assert_eq!(FdPressure::Unknown.as_str(), "unknown");
     }
 
     #[test]
@@ -2503,9 +2765,9 @@ mod tests {
                 last_emit_ok_ms: NOW - 3_000,
                 last_emit_fail_ms: 0,
                 now_ms: NOW,
+                fd: FdPressureInputs::UNMEASURED,
             },
-            0,
-            0,
+            PingCounters::default(),
         );
         assert_eq!(r.delivery, PingDelivery::Corroborated);
         assert_eq!(r.last_emit_ok_age_ms, Some(3_000));
@@ -2516,13 +2778,19 @@ mod tests {
                 last_emit_ok_ms: 0,
                 last_emit_fail_ms: 0,
                 now_ms: NOW,
+                fd: FdPressureInputs::UNMEASURED,
             },
-            0,
-            0,
+            PingCounters::default(),
         );
         assert_eq!(never.delivery, PingDelivery::Unknown);
         assert_eq!(never.last_emit_ok_age_ms, None);
         assert_eq!(never.last_emit_fail_age_ms, None);
+        // The fd half follows the same rule: unmeasured is `None`, never 0.
+        assert_eq!(never.fd_pressure, FdPressure::Unknown);
+        assert_eq!(never.fd_open, None);
+        assert_eq!(never.fd_soft_limit, None);
+        assert_eq!(never.fd_headroom, None);
+        assert_eq!(never.last_fd_exhausted_age_ms, None);
     }
 
     #[test]
@@ -2532,13 +2800,43 @@ mod tests {
                 last_emit_ok_ms: NOW - 60_000,
                 last_emit_fail_ms: NOW - 1_000,
                 now_ms: NOW,
+                fd: FdPressureInputs::UNMEASURED,
             },
-            119_012,
-            49,
+            PingCounters {
+                emit_failures: 119_012,
+                false_death_suppressed: 49,
+                fd_exhausted_errors: 8_267,
+                fd_starved_suppressed: 42,
+            },
         );
         assert_eq!(r.delivery, PingDelivery::Undeliverable);
         assert_eq!(r.emit_failures, 119_012);
         assert_eq!(r.false_death_suppressed, 49);
+        assert_eq!(r.fd_exhausted_errors, 8_267);
+        assert_eq!(r.fd_starved_suppressed, 42);
+    }
+
+    #[test]
+    fn the_report_publishes_the_fd_half_it_was_classified_from() {
+        let r = super::classify_ping_delivery_report(
+            PingDeliveryInputs {
+                last_emit_ok_ms: NOW - 3_000,
+                last_emit_fail_ms: 0,
+                now_ms: NOW,
+                fd: FdPressureInputs {
+                    open: Some(1_000),
+                    soft_limit: Some(1_024),
+                    last_exhausted_ms: NOW - 11_000,
+                },
+            },
+            PingCounters::default(),
+        );
+        assert_eq!(r.delivery, PingDelivery::Starved);
+        assert_eq!(r.fd_pressure, FdPressure::Starved);
+        assert_eq!(r.fd_open, Some(1_000));
+        assert_eq!(r.fd_soft_limit, Some(1_024));
+        assert_eq!(r.fd_headroom, Some(24));
+        assert_eq!(r.last_fd_exhausted_age_ms, Some(11_000));
     }
 
     #[test]
@@ -2589,13 +2887,252 @@ mod tests {
     }
 
     #[test]
-    fn only_undeliverable_suppresses_recovery() {
-        // The heartbeat's gate is `!= Undeliverable`. Pin that both non-
-        // suppressing arms really do recover, so a future edit cannot quietly
-        // add a third silent arm.
-        for v in [PingDelivery::Corroborated, PingDelivery::Unknown] {
-            assert_ne!(v, PingDelivery::Undeliverable, "{v:?} must still recover");
+    fn only_positive_evidence_suppresses_recovery() {
+        // The heartbeat's gate is `!suppresses_recovery()`. Pin EVERY arm:
+        // exactly the two that carry positive evidence the stale pong is about
+        // the runner (send side failed / receive side starved) suppress, and
+        // both evidence-free arms recover — so a future edit cannot quietly
+        // add a silent arm. The array is checked for exhaustiveness by the
+        // match below.
+        for v in [
+            PingDelivery::Corroborated,
+            PingDelivery::Undeliverable,
+            PingDelivery::Starved,
+            PingDelivery::Unknown,
+        ] {
+            let expected = match v {
+                PingDelivery::Undeliverable | PingDelivery::Starved => true,
+                PingDelivery::Corroborated | PingDelivery::Unknown => false,
+            };
+            assert_eq!(
+                v.suppresses_recovery(),
+                expected,
+                "{v:?} suppression must be {expected}"
+            );
         }
+    }
+
+    // ── descriptor pressure (plan 2026-09-09 pong receive path) ────────────
+
+    fn fd(open: Option<u64>, soft_limit: Option<u64>, last_exhausted_ms: u64) -> FdPressureInputs {
+        FdPressureInputs {
+            open,
+            soft_limit,
+            last_exhausted_ms,
+        }
+    }
+
+    const IN_WINDOW: u64 = NOW - 11_000; // the merytshost 11 s spawn→recovery gap
+    const OUT_OF_WINDOW: u64 = NOW - (UI_DEAD_AFTER_MS + 1);
+
+    #[test]
+    fn threshold_is_the_floor_or_five_percent_whichever_is_larger() {
+        assert_eq!(fd_starvation_threshold(0), FD_STARVED_FLOOR);
+        assert_eq!(fd_starvation_threshold(256), FD_STARVED_FLOOR);
+        assert_eq!(fd_starvation_threshold(1_024), 51);
+        assert_eq!(fd_starvation_threshold(65_536), 3_276);
+    }
+
+    /// The whole fd-pressure matrix, every UNKNOWN row included. Columns:
+    /// open, soft_limit, last_exhausted_ms → expected.
+    #[test]
+    fn fd_pressure_classification_matrix() {
+        let rows: &[(FdPressureInputs, FdPressure, &str)] = &[
+            // Nothing measured, nothing observed.
+            (
+                FdPressureInputs::UNMEASURED,
+                FdPressure::Unknown,
+                "all unknown",
+            ),
+            // Only one side of the headroom measured → UNKNOWN, never Starved.
+            (
+                fd(Some(1_020), None, 0),
+                FdPressure::Unknown,
+                "limit unread",
+            ),
+            (
+                fd(None, Some(1_024), 0),
+                FdPressure::Unknown,
+                "census unread",
+            ),
+            // An aged-out stamp is history; with no headroom it proves nothing.
+            (
+                fd(None, None, OUT_OF_WINDOW),
+                FdPressure::Unknown,
+                "stale stamp only",
+            ),
+            (
+                fd(Some(1_020), None, OUT_OF_WINDOW),
+                FdPressure::Unknown,
+                "stale stamp + limit unread",
+            ),
+            // Measured headroom decides when no recent stamp.
+            (
+                fd(Some(100), Some(1_024), 0),
+                FdPressure::Ample,
+                "ample headroom",
+            ),
+            (
+                fd(Some(100), Some(1_024), OUT_OF_WINDOW),
+                FdPressure::Ample,
+                "ample + stale stamp",
+            ),
+            (
+                fd(Some(1_024 - 51), Some(1_024), 0),
+                FdPressure::Ample,
+                "exactly at threshold",
+            ),
+            (
+                fd(Some(1_024 - 50), Some(1_024), 0),
+                FdPressure::Starved,
+                "one under threshold",
+            ),
+            (
+                fd(Some(1_024), Some(1_024), 0),
+                FdPressure::Starved,
+                "at the limit",
+            ),
+            (
+                fd(Some(2_000), Some(1_024), 0),
+                FdPressure::Starved,
+                "over a lowered limit",
+            ),
+            // A recent stamp is positive evidence on its own — including at
+            // TOTAL exhaustion, where the census itself cannot run.
+            (
+                fd(None, None, IN_WINDOW),
+                FdPressure::Starved,
+                "stamp, census blind",
+            ),
+            (
+                fd(Some(100), Some(1_024), IN_WINDOW),
+                FdPressure::Starved,
+                "stamp beats an instantaneous ample read",
+            ),
+            (
+                fd(None, None, NOW - UI_DEAD_AFTER_MS),
+                FdPressure::Starved,
+                "stamp at the window edge",
+            ),
+            (
+                fd(None, None, NOW),
+                FdPressure::Starved,
+                "stamp this instant",
+            ),
+        ];
+        for (inputs, expected, label) in rows {
+            assert_eq!(
+                classify_fd_pressure(*inputs, NOW),
+                *expected,
+                "row `{label}`: {inputs:?}"
+            );
+        }
+    }
+
+    /// The composed verdict, every fd row crossed with every emit-record row.
+    /// Asserts the property (does it suppress?) AND the label.
+    #[test]
+    fn ping_delivery_matrix_with_fd_pressure() {
+        let starved = fd(None, None, IN_WINDOW);
+        let ample = fd(Some(100), Some(1_024), 0);
+        let unknown = FdPressureInputs::UNMEASURED;
+        // (ok, fail) emit records: never / delivered / undeliverable now /
+        // aged-out failure with no success.
+        let never = (0, 0);
+        let delivered = (NOW - 500, 0);
+        let undeliverable = (NOW - 60_000, NOW - 1_000);
+        let aged_no_success = (0, OUT_OF_WINDOW);
+
+        let rows: &[((u64, u64), FdPressureInputs, PingDelivery)] = &[
+            // Send side failed: Undeliverable keeps its meaning AND its
+            // precedence, whatever the receive side reads.
+            (undeliverable, starved, PingDelivery::Undeliverable),
+            (undeliverable, ample, PingDelivery::Undeliverable),
+            (undeliverable, unknown, PingDelivery::Undeliverable),
+            // Ping delivered: the receive side decides.
+            (delivered, starved, PingDelivery::Starved),
+            (delivered, ample, PingDelivery::Corroborated),
+            (delivered, unknown, PingDelivery::Corroborated),
+            // No emit ever: positive fd evidence still stands on its own.
+            (never, starved, PingDelivery::Starved),
+            (never, ample, PingDelivery::Unknown),
+            (never, unknown, PingDelivery::Unknown),
+            // Aged-out failure with no success: unchanged from #1384 unless
+            // the receive side is positively starved.
+            (aged_no_success, starved, PingDelivery::Starved),
+            (aged_no_success, ample, PingDelivery::Unknown),
+            (aged_no_success, unknown, PingDelivery::Unknown),
+        ];
+        for ((ok, fail), fd_in, expected) in rows {
+            let got = pd_fd(*ok, *fail, *fd_in);
+            assert_eq!(got, *expected, "ok={ok} fail={fail} fd={fd_in:?}");
+        }
+    }
+
+    #[test]
+    fn unknown_fd_pressure_never_suppresses() {
+        // `an-unknown-input-must-not-fire-a-detector`: every row in which the
+        // fd side establishes nothing must behave exactly as it did before
+        // this plan — suppress only if the SEND side is undeliverable.
+        let unknown_rows = [
+            FdPressureInputs::UNMEASURED,
+            fd(Some(1_020), None, 0),
+            fd(None, Some(1_024), 0),
+            fd(None, None, OUT_OF_WINDOW),
+        ];
+        for fd_in in unknown_rows {
+            assert_eq!(classify_fd_pressure(fd_in, NOW), FdPressure::Unknown);
+            for (ok, fail) in [(0, 0), (NOW - 500, 0), (0, OUT_OF_WINDOW)] {
+                let v = pd_fd(ok, fail, fd_in);
+                assert!(
+                    !v.suppresses_recovery(),
+                    "UNKNOWN fd pressure suppressed recovery: ok={ok} fail={fail} fd={fd_in:?} → {v:?}"
+                );
+                // And the verdict is exactly the pre-plan one.
+                assert_eq!(v, pd(ok, fail));
+            }
+        }
+    }
+
+    #[test]
+    fn a_dead_webview_with_no_fd_pressure_still_recovers() {
+        // THE 2026-08-01 NON-REGRESSION for the receive side, asserted
+        // directly: a genuinely dead webview (ping emitted fine, no pong)
+        // must recover whenever the fd side is AMPLE or UNKNOWN. Only
+        // positive starvation evidence may withhold the recreate.
+        for fd_in in [
+            fd(Some(100), Some(1_024), 0),             // ample
+            fd(Some(100), Some(1_024), OUT_OF_WINDOW), // ample, old stamp
+            FdPressureInputs::UNMEASURED,              // Windows / no census
+            fd(Some(1_020), None, 0),                  // unlimited / unread limit
+            fd(None, None, OUT_OF_WINDOW),             // old stamp, census blind
+        ] {
+            let v = pd_fd(NOW - 500, 0, fd_in);
+            assert_eq!(v, PingDelivery::Corroborated, "fd={fd_in:?}");
+            assert!(!v.suppresses_recovery(), "fd={fd_in:?} must still recover");
+        }
+    }
+
+    #[test]
+    fn fd_starvation_suppresses_the_merytshost_shape() {
+        // 2026-09-02, merytshost: zero failed emits (so #1384 read
+        // `ping_delivered`), `Too many open files` 11 s before the recovery.
+        let v = pd_fd(NOW - 3_000, 0, fd(None, None, IN_WINDOW));
+        assert_eq!(v, PingDelivery::Starved);
+        assert!(v.suppresses_recovery());
+        // And by headroom alone, with no stamp at all.
+        let v = pd_fd(NOW - 3_000, 0, fd(Some(1_020), Some(1_024), 0));
+        assert_eq!(v, PingDelivery::Starved);
+        assert!(v.suppresses_recovery());
+    }
+
+    #[test]
+    fn fd_starvation_suppression_lapses_with_the_window() {
+        // Self-limiting: once the last EMFILE ages out of the death window and
+        // headroom is not measured low, the dead-UI verdict recovers again.
+        let v = pd_fd(NOW - 500, 0, fd(None, None, OUT_OF_WINDOW));
+        assert_eq!(v, PingDelivery::Corroborated);
+        assert!(!v.suppresses_recovery());
     }
 
     // ── Phase 1 of plan 2026-09-19-runner-render-process-crash-recovery-is-a-
