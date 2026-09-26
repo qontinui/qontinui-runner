@@ -199,7 +199,7 @@ export function useDiscoveryEvents(
           // A throwing tracker degrades to the same `null` rather than failing
           // the request, per the SDK's rule that a misbehaving tracker degrades
           // the field, never the caller (ui-bridge `core/registry.ts`).
-          let modalContext: unknown = null;
+          let modalContext: unknown;
           try {
             const registry = (
               currentBridge as { registry?: { getModalContext?: () => unknown } }
