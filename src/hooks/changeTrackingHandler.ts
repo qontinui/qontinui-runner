@@ -251,3 +251,70 @@ export async function handleChangeTrackingCommand(
       return undefined;
   }
 }
+
+/** The outer verdict the runner answers a change-tracking request with. */
+export interface ChangeTrackingVerdict {
+  success: boolean;
+  error?: string;
+}
+
+/** The inner action's own error message off an `ActionDiffResult`, if any. */
+function innerActionError(opResult: unknown): string | null {
+  if (opResult === null || typeof opResult !== "object") return null;
+  const inner = (opResult as { actionResult?: unknown }).actionResult;
+  if (inner === null || typeof inner !== "object") return null;
+  const err = (inner as { error?: unknown }).error;
+  return typeof err === "string" && err.length > 0 ? err : null;
+}
+
+/** `true` only for an op the SDK reported `actionSuccess: true` for. */
+function opActionSucceeded(opResult: unknown): boolean {
+  return (
+    opResult !== null &&
+    typeof opResult === "object" &&
+    (opResult as { actionSuccess?: unknown }).actionSuccess === true
+  );
+}
+
+/**
+ * The outer `success` for a change-tracking response.
+ *
+ * `execute_with_diff` / `execute_batch_with_diff` report the SDK's OWN verdict:
+ * `ChangeTracker.executeWithDiff` already reads the action result strictly into
+ * `actionSuccess`, so the outer envelope is `success: actionSuccess === true`
+ * (every op, for the batch) — an inner action failure must not surface as an
+ * outer success. `actionResult.success` is deliberately NOT re-read here: the
+ * SDK's `actionSuccess` is the one definition. The caller keeps the result as
+ * `data` either way, so the diff around a failed action still reaches the HTTP
+ * caller. Every other command answers `success: true`.
+ *
+ * Plan: 2026-09-10-two-runner-call-sites-still-report-success-for-an-action-that-did-not-happen (Phase 3)
+ */
+export function changeTrackingVerdict(type: string, result: unknown): ChangeTrackingVerdict {
+  if (type === "execute_with_diff") {
+    if (opActionSucceeded(result)) return { success: true };
+    const inner = innerActionError(result);
+    return {
+      success: false,
+      error: `ACTION_FAILED: ${inner ?? "the action did not report success (actionSuccess is not true)"}`,
+    };
+  }
+  if (type === "execute_batch_with_diff") {
+    const results =
+      result !== null && typeof result === "object"
+        ? (result as { results?: unknown }).results
+        : undefined;
+    if (!Array.isArray(results)) {
+      return { success: false, error: "ACTION_FAILED: batch returned no per-operation results" };
+    }
+    const failed = results.map((r, i) => ({ r, i })).filter(({ r }) => !opActionSucceeded(r));
+    if (failed.length === 0) return { success: true };
+    const first = failed[0];
+    const firstError = innerActionError(first.r) ?? "actionSuccess is not true";
+    return {
+      success: false,
+      error: `ACTION_FAILED: ${failed.length} of ${results.length} operations failed (first: operation ${first.i}: ${firstError})`,
+    };
+  }
+  return { success: true };
+}
