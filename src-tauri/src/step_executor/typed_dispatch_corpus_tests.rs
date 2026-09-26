@@ -32,13 +32,13 @@
 //! rather than noise.
 
 use super::{
-    handler_lookup_key, resolve_dispatch, to_full_runner_step, DispatchRoute,
-    LEGACY_STRING_DISPATCH,
+    conversion_failure_outcome, handler_lookup_key, resolve_dispatch, to_full_runner_step,
+    DispatchRoute, LEGACY_STRING_DISPATCH,
 };
 use crate::step_executor::handlers::HandlerRegistry;
 use crate::step_executor::ExecutionStepConfig;
 use crate::unified_workflow_executor::step_conversion::{
-    convert_json_steps_with_phase, parse_step_value,
+    convert_json_steps_with_phase, parse_step_value, parse_steps_json, StepsJsonError,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -1051,6 +1051,97 @@ fn build_spec_component_action_routes_to_the_new_arm() {
     );
     // The handler arm keys on this string.
     assert_eq!(esc.ui_bridge_action.as_deref(), Some("component_action"));
+}
+
+/// A `conversion_error` step through the real path as far as it is
+/// constructible without an `AppState` (a `StepExecutor` needs a live one):
+/// raw workflow JSON → `convert_json_steps_with_phase` → serialized into
+/// `execution_steps_json` → `parse_steps_json` (what the durable and
+/// verification seams read) → `resolve_dispatch` → the outcome
+/// `execute_single_step` returns for that route. Nothing past that point runs.
+#[test]
+fn conversion_error_step_fails_through_dispatch() {
+    let bad = json!({"type": "ui_bridge", "id": "u9", "name": "go", "phase": "setup",
+                     "action": "navigate", "url": "http://x", "timeoutMs": "soon"});
+    let steps = convert_json_steps_with_phase(std::slice::from_ref(&bad), 0, Some("setup"));
+    let json = serde_json::to_string(&steps).unwrap();
+    let reloaded = parse_steps_json(&json).expect("a failing step reloads as itself");
+    assert_eq!(reloaded.len(), 1);
+    let route = resolve_dispatch(&reloaded[0], &HandlerRegistry::with_standard_handlers());
+    let DispatchRoute::ConversionFailed(error) = route else {
+        panic!("expected ConversionFailed, got {route:?}")
+    };
+    let (success, err, screenshot, output) = conversion_failure_outcome(error);
+    assert!(!success);
+    let err = err.unwrap();
+    assert!(
+        err.starts_with("ui_bridge step 'go' (id u9) could not be parsed"),
+        "{err}"
+    );
+    assert!(err.contains("invalid type: string \"soon\""), "{err}");
+    assert_eq!((screenshot, output), (None, None));
+}
+
+/// `parse_steps_json` scans the whole array: an unparseable ui_bridge step
+/// outranks a malformed step placed BEFORE it, so callers that fall back on
+/// `Malformed` cannot hide it.
+#[test]
+fn unparseable_ui_bridge_outranks_an_earlier_malformed_step() {
+    let json = r#"[{"type":"command","name":"c","command":"ls","timeoutMs":"x"},
+                   {"type":"ui_bridge","id":"u2","name":"late","action":"snapshot","timeoutMs":"soon"}]"#;
+    match parse_steps_json(json) {
+        Err(StepsJsonError::UnparseableStep(e)) => {
+            assert_eq!(e.name.as_deref(), Some("late"));
+            assert_eq!(e.id.as_deref(), Some("u2"));
+        }
+        other => panic!("expected UnparseableStep, got {other:?}"),
+    }
+    // Malformed alone is still Malformed.
+    assert!(matches!(
+        parse_steps_json(r#"[{"type":"command","command":"ls","timeoutMs":"x"}]"#),
+        Err(StepsJsonError::Malformed(_))
+    ));
+}
+
+/// A `null` prefixed alias beside a canonical key is dropped, not left to
+/// collide with the inserted field; `actionPlan` / `action_plan` reach
+/// `ui_bridge_action_plan`; a structured camelCase prefixed value is carried
+/// as JSON text like the snake one.
+#[test]
+fn normalizer_edge_shapes() {
+    for (null_key, canonical) in [
+        ("uiBridgeAction", json!({"action": "navigate"})),
+        ("ui_bridge_action", json!({"action": "navigate"})),
+    ] {
+        let mut v = canonical;
+        v["type"] = json!("ui_bridge");
+        v[null_key] = Value::Null;
+        let esc = parse_step_value(&v).unwrap_or_else(|e| panic!("{null_key}: {e}"));
+        assert_eq!(
+            esc.ui_bridge_action.as_deref(),
+            Some("navigate"),
+            "{null_key}"
+        );
+    }
+
+    for key in ["actionPlan", "action_plan"] {
+        let mut v = json!({"type": "ui_bridge", "action": "action_plan"});
+        v[key] = json!([{"kind": "click", "target": "#a"}]);
+        let esc = parse_step_value(&v).unwrap();
+        assert_eq!(
+            esc.ui_bridge_action_plan,
+            Some(json!([{"kind": "click", "target": "#a"}])),
+            "{key}"
+        );
+    }
+
+    let esc = parse_step_value(&json!({"type": "ui_bridge", "action": "click",
+        "uiBridgeTarget": {"role": "button"}}))
+    .unwrap();
+    assert_eq!(
+        esc.ui_bridge_target.as_deref(),
+        Some(r#"{"role":"button"}"#)
+    );
 }
 
 /// Field-level checks for every shape this change newly types or fixes:

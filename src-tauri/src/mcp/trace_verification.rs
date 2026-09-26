@@ -656,6 +656,21 @@ mod load_verification_steps_tests {
     }
 
     #[test]
+    fn earlier_malformed_step_does_not_hide_an_unparseable_ui_bridge_step() {
+        // A malformed non-ui_bridge step FIRST used to make the whole array
+        // `Malformed`, which falls back to the basic build checks silently.
+        let json = r#"[{"type":"command","name":"c","phase":"verification","command":"ls","timeoutMs":"x"},
+                       {"type":"ui_bridge","id":"v2","name":"late","phase":"verification","action":"snapshot","timeoutMs":"soon"}]"#;
+        let failure = load_verification_steps(Some(json)).unwrap_err();
+        assert!(!failure.all_passed);
+        assert!(
+            failure.critical_failures[0].starts_with("ui_bridge step 'late' (id v2)"),
+            "{:?}",
+            failure.critical_failures
+        );
+    }
+
+    #[test]
     fn parseable_and_absent_steps_load_as_before() {
         let json = r#"[{"type":"ui_bridge","name":"a","phase":"verification","action":"snapshot"},
                        {"type":"ui_bridge","name":"b","phase":"setup","action":"snapshot"}]"#;

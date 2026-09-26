@@ -238,22 +238,39 @@ const UI_BRIDGE_CANONICAL_KEYS: &[(&[&str], &str, &[&str])] = &[
         "ui_bridge_timeout_ms",
         &["uiBridgeTimeoutMs"],
     ),
+    (
+        &["action_plan", "actionPlan"],
+        "ui_bridge_action_plan",
+        &["uiBridgeActionPlan"],
+    ),
 ];
 
-/// `ExecutionStepConfig` fields typed `Option<String>` whose canonical value
+/// `ExecutionStepConfig` fields typed `Option<String>`, in both prefixed
+/// spellings (snake field name and camelCase alias), whose value
 /// may arrive as structured JSON (a criteria object in `target`, a number in
 /// `expected`); those are carried as their JSON text, which is what the
 /// handler parses back.
 const UI_BRIDGE_STRING_FIELDS: &[&str] = &[
     "ui_bridge_action",
+    "uiBridgeAction",
     "ui_bridge_url",
+    "uiBridgeUrl",
     "ui_bridge_target",
+    "uiBridgeTarget",
     "ui_bridge_instruction",
+    "uiBridgeInstruction",
     "ui_bridge_assert_type",
+    "uiBridgeAssertType",
     "ui_bridge_expected",
+    "uiBridgeExpected",
     "ui_bridge_compare_mode",
+    "uiBridgeCompareMode",
     "ui_bridge_reference_snapshot_id",
+    "uiBridgeReferenceSnapshotId",
     "ui_bridge_severity_threshold",
+    "uiBridgeSeverityThreshold",
+    "ui_bridge_snapshot_target",
+    "uiBridgeSnapshotTarget",
 ];
 
 /// Rewrite a step's canonical keys onto the `ExecutionStepConfig` field names,
@@ -291,6 +308,12 @@ pub fn normalize_step_value(step: &mut serde_json::Value) {
         let Some(value) = value else { continue };
         let already = present(obj, field) || prefixed.iter().any(|k| present(obj, k));
         if !already {
+            // A `null` prefixed spelling would otherwise sit beside the
+            // inserted field and serde would refuse the pair as a duplicate.
+            obj.remove(*field);
+            for k in *prefixed {
+                obj.remove(*k);
+            }
             obj.insert((*field).to_string(), value);
         }
     }
@@ -337,21 +360,33 @@ impl std::error::Error for StepsJsonError {}
 /// Parse a JSON array of steps (`execution_steps_json`, a durable batch),
 /// normalizing each ([`normalize_step_value`]). A `ui_bridge` step that
 /// still fails is reported as [`StepsJsonError::UnparseableStep`], naming it.
+///
+/// The whole array is scanned: an unparseable `ui_bridge` step OUTRANKS a
+/// [`StepsJsonError::Malformed`] step anywhere in it, so a malformed step
+/// earlier in the array (which callers may treat as "fall back") cannot hide
+/// it.
 pub fn parse_steps_json(json: &str) -> Result<Vec<ExecutionStepConfig>, StepsJsonError> {
     let steps: Vec<serde_json::Value> =
         serde_json::from_str(json).map_err(StepsJsonError::Malformed)?;
-    steps
-        .iter()
-        .map(|step| {
-            parse_step_value(step).map_err(|e| {
-                if fallback_refused(step) {
-                    StepsJsonError::UnparseableStep(StepConversionError::new(step, &e))
-                } else {
-                    StepsJsonError::Malformed(e)
-                }
-            })
-        })
-        .collect()
+    let mut parsed = Vec::with_capacity(steps.len());
+    let mut malformed = None;
+    for step in &steps {
+        match parse_step_value(step) {
+            Ok(config) => parsed.push(config),
+            Err(e) if fallback_refused(step) => {
+                return Err(StepsJsonError::UnparseableStep(StepConversionError::new(
+                    step, &e,
+                )));
+            }
+            Err(e) => {
+                malformed.get_or_insert(e);
+            }
+        }
+    }
+    match malformed {
+        Some(e) => Err(StepsJsonError::Malformed(e)),
+        None => Ok(parsed),
+    }
 }
 
 /// A step that failed [`parse_step_value`] must not be rebuilt by a
