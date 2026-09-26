@@ -416,10 +416,13 @@ pub fn plan_reclaim(
             let mut steps: Vec<ReclaimStep> = Vec::new();
             // INV-W4: unlink EVERY junction first, in the order coord
             // listed them, BEFORE the recursive worktree removal. Each sink
-            // kind resolves via [`sink_path`] so the unlink hits the junction
-            // the census measured (`src-tauri/target` on a Tauri worktree).
+            // kind expands to every path it may live at (see
+            // [`remove_unlink_paths`]), so the unlink cannot miss the junction
+            // the census measured.
             for rel in &instr.junctioned_paths {
-                steps.push(ReclaimStep::UnlinkJunction(sink_path(&worktree, rel)));
+                for p in remove_unlink_paths(&worktree, rel) {
+                    steps.push(ReclaimStep::UnlinkJunction(p));
+                }
             }
             // Only now the worktree removal.
             steps.push(ReclaimStep::RemoveWorktree(worktree));
@@ -438,14 +441,27 @@ pub fn plan_reclaim(
                     instr.worktree_path
                 ))];
             }
-            // `rel` is a sink KIND, resolved per checkout — both ends, so the
-            // link and its target agree on the layout (see [`sink_path`]).
+            // `rel` is a sink KIND, resolved per checkout — both ends (see
+            // [`sink_path`]). The two resolutions must land at the same
+            // relative location; a worktree and canonical that disagree on
+            // layout are skipped rather than cross-joined.
             instr
                 .junctioned_paths
                 .iter()
-                .map(|rel| ReclaimStep::CreateJunction {
-                    link: sink_path(&worktree, rel),
-                    target: sink_path(canonical, rel),
+                .map(|rel| {
+                    let link = sink_path(&worktree, rel);
+                    let target = sink_path(canonical, rel);
+                    let link_suffix = link.strip_prefix(&worktree).unwrap_or(&link);
+                    let target_suffix = target.strip_prefix(canonical).unwrap_or(&target);
+                    if link_suffix != target_suffix {
+                        return ReclaimStep::Skip(format!(
+                            "rejunction {} — layout mismatch: link {} vs canonical {}",
+                            instr.worktree_path,
+                            link_suffix.display(),
+                            target_suffix.display()
+                        ));
+                    }
+                    ReclaimStep::CreateJunction { link, target }
                 })
                 .collect()
         }
@@ -476,6 +492,25 @@ fn sink_path(root: &Path, rel: &str) -> PathBuf {
         super::census::target_dir_for(root)
     } else {
         root.join(rel)
+    }
+}
+
+/// Every path a Remove must unlink for sink kind `rel`, BEFORE the removal.
+///
+/// `"target"` yields BOTH `src-tauri/target` and `target`, as the backstop
+/// sweep does, instead of the one [`sink_path`] picks: that choice rests on
+/// `exists()` at execution time, and a dangling junction can flip it away
+/// from the path the census saw. The extra step is free —
+/// [`unlink_junction`] is a no-op on an absent path or a real directory —
+/// and cannot widen what is deleted. Other kinds are a literal join.
+fn remove_unlink_paths(worktree: &Path, rel: &str) -> Vec<PathBuf> {
+    if rel == "target" {
+        vec![
+            worktree.join("src-tauri").join("target"),
+            worktree.join("target"),
+        ]
+    } else {
+        vec![worktree.join(rel)]
     }
 }
 
@@ -700,7 +735,8 @@ fn is_session_uuid_dir(path: &Path) -> bool {
 /// Worktree paths arrive from coord with forward slashes and get sink names
 /// joined on with the platform separator, so `mklink` was handed
 /// `D:/qontinui-root/…/qontinui-runner\target` — and `cmd` parses a
-/// `/`-led token as a switch (1 158 logged `Invalid switch` failures).
+/// `/`-led token as a switch (`Invalid switch`; pre-state counts in the
+/// plan's §5).
 /// Normalised HERE, at the `cmd` boundary only: `on_demand::norm_path` keys
 /// comparisons on forward slashes, so rewriting paths on ingest would
 /// silently re-key the cleared-set map. Pure and compiled on every platform
@@ -1069,8 +1105,9 @@ fn execute_pull(pull: &ReclaimPull) {
 // (same plan as [`sink_path`], Phase 2b).
 //
 // Coord re-sends every refused Rejunction each tick, so the per-step `warn!`
-// wrote 30 830 "refusing to clobber" and 1 158 `mklink` lines: a volume that
-// buried the rate it was meant to show. The two known classes are counted
+// wrote "refusing to clobber" and `mklink` lines in a volume that buried the
+// rate it was meant to show (2026-08-26 pre-state counts: plan
+// `2026-08-26-disk-reclaim-is-disabled-three-independent-ways` §5). The two known classes are counted
 // every time and surfaced as ONE aggregate WARN per class per window — count
 // since the last emit plus one example. Anything else keeps its per-instance
 // WARN: an unknown failure is exactly what must not be hidden. A log line,
@@ -1156,17 +1193,23 @@ impl StepFailureAggregate {
 static CLOBBER_FAILURES: StepFailureAggregate = StepFailureAggregate::new();
 static MKLINK_FAILURES: StepFailureAggregate = StepFailureAggregate::new();
 
+/// The aggregate a class reports through, or `None` for a class that must
+/// keep its per-instance WARN.
+fn aggregate_for(class: StepFailureClass) -> Option<&'static StepFailureAggregate> {
+    match class {
+        StepFailureClass::RefusingToClobber => Some(&CLOBBER_FAILURES),
+        StepFailureClass::MklinkFailed => Some(&MKLINK_FAILURES),
+        StepFailureClass::Other => None,
+    }
+}
+
 /// Log one failed step: per-instance for [`StepFailureClass::Other`],
 /// aggregated per window for the two high-volume classes.
 fn report_step_failure(step: &ReclaimStep, err: &str) {
     let class = StepFailureClass::classify(err);
-    let agg = match class {
-        StepFailureClass::RefusingToClobber => &CLOBBER_FAILURES,
-        StepFailureClass::MklinkFailed => &MKLINK_FAILURES,
-        StepFailureClass::Other => {
-            warn!("worktree_reclaim: step {step:?} failed: {err}");
-            return;
-        }
+    let Some(agg) = aggregate_for(class) else {
+        warn!("worktree_reclaim: step {step:?} failed: {err}");
+        return;
     };
     let example = format!("step {step:?} failed: {err}");
     if let Some((count, example)) = agg.note(
@@ -2297,11 +2340,16 @@ mod tests {
         // remove_armed=true.
         let steps = plan_reclaim(&i, false, true, None, true);
 
-        // Exactly: UnlinkJunction(target), UnlinkJunction(node_modules),
-        // RemoveWorktree(path) — junctions first, in order.
+        // Exactly: both `target` candidates, then node_modules, then
+        // RemoveWorktree(path) — junctions first, in coord's order.
         assert_eq!(
             steps,
             vec![
+                ReclaimStep::UnlinkJunction(
+                    PathBuf::from("D:/qontinui-root/qontinui-runner-wt-foo")
+                        .join("src-tauri")
+                        .join("target")
+                ),
                 ReclaimStep::UnlinkJunction(PathBuf::from(
                     "D:/qontinui-root/qontinui-runner-wt-foo/target"
                 )),
@@ -3076,9 +3124,9 @@ mod tests {
         );
     }
 
-    /// INV-W4 on a Tauri worktree: the junction-first unlink must hit
-    /// `src-tauri/target` (what the census measured), not the absent
-    /// `<wt>/target`, and still precede the removal.
+    /// INV-W4 on a Tauri worktree: `"target"` unlinks BOTH candidate paths
+    /// (so an `exists()` flip between census and execution cannot miss the
+    /// junction), all before the removal.
     #[test]
     fn remove_unlinks_tauri_target_junction_before_removal() {
         let dir = tempfile::tempdir().unwrap();
@@ -3086,14 +3134,47 @@ mod tests {
         std::fs::create_dir_all(wt.join("src-tauri/target")).unwrap();
         let mut i = instr(ReclaimAction::Remove, &["target", "node_modules"], false);
         i.worktree_path = wt.to_string_lossy().into_owned();
-        let steps = plan_reclaim(&i, false, true, None, true);
+        let expected = vec![
+            ReclaimStep::UnlinkJunction(wt.join("src-tauri").join("target")),
+            ReclaimStep::UnlinkJunction(wt.join("target")),
+            ReclaimStep::UnlinkJunction(wt.join("node_modules")),
+            ReclaimStep::RemoveWorktree(wt.clone()),
+        ];
+        assert_eq!(plan_reclaim(&i, false, true, None, true), expected);
+
+        // Both paths present: the plan is identical — it does not depend on
+        // which one `target_dir_for` would pick.
+        std::fs::create_dir_all(wt.join("target")).unwrap();
+        assert_eq!(plan_reclaim(&i, false, true, None, true), expected);
+    }
+
+    /// The worktree resolves `src-tauri/target` (Tauri, no build yet) while
+    /// the canonical, holding a top-level `target` and no `src-tauri/target`,
+    /// resolves `target`. Joining them would cross layouts: skip instead.
+    #[test]
+    fn rejunction_layout_mismatch_is_a_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("wt");
+        let canonical = dir.path().join("canonical");
+        std::fs::create_dir_all(wt.join("src-tauri")).unwrap();
+        std::fs::create_dir_all(canonical.join("src-tauri")).unwrap();
+        std::fs::create_dir_all(canonical.join("target")).unwrap();
+        let steps = rejunction_steps_for(&wt, &canonical, &["target", "node_modules"]);
+        assert_eq!(steps.len(), 2);
+        match &steps[0] {
+            ReclaimStep::Skip(msg) => assert!(
+                msg.contains("layout mismatch"),
+                "unexpected skip reason: {msg}"
+            ),
+            other => panic!("expected a layout-mismatch Skip, got {other:?}"),
+        }
+        // The other sink is unaffected.
         assert_eq!(
-            steps,
-            vec![
-                ReclaimStep::UnlinkJunction(wt.join("src-tauri").join("target")),
-                ReclaimStep::UnlinkJunction(wt.join("node_modules")),
-                ReclaimStep::RemoveWorktree(wt.clone()),
-            ]
+            steps[1],
+            ReclaimStep::CreateJunction {
+                link: wt.join("node_modules"),
+                target: canonical.join("node_modules"),
+            }
         );
     }
 
@@ -3136,6 +3217,47 @@ mod tests {
             StepFailureClass::classify("remove worktree dir D:/wt: access denied"),
             StepFailureClass::Other
         );
+    }
+
+    /// Classification against the exact messages `create_junction` builds
+    /// (its `format!` literals, copied — that fn compiles only on Windows).
+    #[test]
+    fn step_failure_classes_match_create_junction_messages() {
+        let link = Path::new("D:/wt/src-tauri/target");
+        let target = Path::new("D:/canonical/src-tauri/target");
+        let clobber = format!(
+            "rejunction: {} exists and is not a junction — refusing to clobber",
+            link.display()
+        );
+        let mklink = format!(
+            "rejunction: mklink /J {} {} failed: {}",
+            link.display(),
+            target.display(),
+            "Invalid switch - \"wt\"."
+        );
+        assert_eq!(
+            StepFailureClass::classify(&clobber),
+            StepFailureClass::RefusingToClobber
+        );
+        assert_eq!(
+            StepFailureClass::classify(&mklink),
+            StepFailureClass::MklinkFailed
+        );
+    }
+
+    /// Routing: each high-volume class has its OWN aggregate, and `Other`
+    /// is never aggregated (an unknown failure keeps its per-instance WARN).
+    #[test]
+    fn step_failure_routing_picks_the_class_aggregate() {
+        assert!(std::ptr::eq(
+            aggregate_for(StepFailureClass::RefusingToClobber).unwrap(),
+            &CLOBBER_FAILURES
+        ));
+        assert!(std::ptr::eq(
+            aggregate_for(StepFailureClass::MklinkFailed).unwrap(),
+            &MKLINK_FAILURES
+        ));
+        assert!(aggregate_for(StepFailureClass::Other).is_none());
     }
 
     /// 1 000 refusals at one logical instant emit exactly one aggregate; once
