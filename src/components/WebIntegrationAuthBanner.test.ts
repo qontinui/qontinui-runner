@@ -744,45 +744,48 @@ describe("pinned-tenant credential banner (absent/dark with a tenant)", () => {
 });
 
 describe("makeSwitchTenantHandler", () => {
-  it("re-pins, kicks the refresher, then RE-READS the posture", async () => {
+  it("re-pins, reports the pin, then kicks — and never re-reads the posture", async () => {
     const calls: string[] = [];
     const setDefaultTenant = vi.fn(async (t: string) => {
       calls.push(`set:${t}`);
     });
     const invoker = vi.fn(async (cmd: string) => {
       calls.push(cmd);
-      if (cmd === "get_coord_credential_posture") {
-        return {
-          posture: "absent",
-          canAnswer: false,
-          reason: "r",
-          cta: "re_pair",
-          since: null,
-          tenantId: "t2",
-          pinnedTenant: true,
-        };
-      }
       return undefined;
     });
-    const signal = await makeSwitchTenantHandler({ setDefaultTenant, invoker })("t2");
-    expect(calls).toEqual([
-      "set:t2",
-      "kick_device_jwt_refresher_cmd",
-      "get_coord_credential_posture",
-    ]);
-    expect(signal?.tenantId).toBe("t2");
-    expect(signal?.dark).toBe(true);
+    const onPinned = vi.fn(() => {
+      calls.push("pinned");
+    });
+    await makeSwitchTenantHandler({ setDefaultTenant, invoker, onPinned })("t2");
+    expect(calls).toEqual(["set:t2", "pinned", "kick_device_jwt_refresher_cmd"]);
+    expect(invoker).not.toHaveBeenCalledWith("get_coord_credential_posture", expect.anything());
   });
 
-  it("does not kick or re-read when the re-pin fails", async () => {
+  it("a failed kick still reports the re-pin as done", async () => {
+    const onPinned = vi.fn();
+    const handler = makeSwitchTenantHandler({
+      setDefaultTenant: async () => undefined,
+      invoker: async () => {
+        throw new Error("kick failed");
+      },
+      onPinned,
+    });
+    await expect(handler("t2")).rejects.toThrow("kick failed");
+    expect(onPinned).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not report the pin or kick when the re-pin fails", async () => {
     const invoker = vi.fn(async () => undefined);
+    const onPinned = vi.fn();
     const failing = makeSwitchTenantHandler({
       setDefaultTenant: async () => {
         throw new Error("no device_id");
       },
       invoker,
+      onPinned,
     });
     await expect(failing("t2")).rejects.toThrow("no device_id");
     expect(invoker).not.toHaveBeenCalled();
+    expect(onPinned).not.toHaveBeenCalled();
   });
 });

@@ -388,26 +388,21 @@ export function WebIntegrationAuthBanner() {
   }, [backendUrl]);
 
   // The operator picked `tenantId` in the switcher. Re-pin (machine.json,
-  // future sessions only — running sessions keep their tenant), then kick the
-  // refresher so the posture is re-derived against the new pin now rather than
-  // at the next cadence, and re-read the posture.
+  // future sessions only — running sessions keep their tenant), close the
+  // switcher as soon as the re-pin lands, then kick the refresher so the
+  // posture is re-derived against the new pin now. The banner updates from the
+  // kicked pass's own event, never from an immediate re-read (see
+  // `makeSwitchTenantHandler`).
   const handleSwitchTenant = useCallback(
     async (tenantId: string) => {
       setSwitchingTenant(true);
       setSwitchTenantError(null);
       try {
-        const switchTo = makeSwitchTenantHandler({
+        await makeSwitchTenantHandler({
           setDefaultTenant: setDefaultTenantForNewSessions,
           invoker: (cmd, args) => invoke<unknown>(cmd, args),
-        });
-        const signal = await switchTo(tenantId);
-        setTenantSwitcherOpen(false);
-        // Re-read, so the banner stops naming the old tenant now. A later
-        // detail-change event (same posture, new tenant) updates it again once
-        // the kicked pass concludes.
-        if (signal !== null) {
-          setCredentialDarkBySource((prev) => applyCredentialDarkSignal(prev, signal));
-        }
+          onPinned: () => setTenantSwitcherOpen(false),
+        })(tenantId);
       } catch (err) {
         setSwitchTenantError(String(err));
       } finally {

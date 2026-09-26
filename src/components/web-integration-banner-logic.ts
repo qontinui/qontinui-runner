@@ -508,19 +508,26 @@ export function makeRePairClickHandler(
 /**
  * Build the banner's "switch to this tenant" handler: re-pin through the
  * EXISTING setter (TenantContext -> `set_active_tenant`, an explicit operator
- * pick), kick the refresher so the posture is re-derived against the new pin,
- * then RE-READ the posture so the banner does not keep showing the old tenant
- * until an event happens to arrive. Resolves to the re-read signal (`null` =
- * UNKNOWN, contribute nothing). Extracted so the order is unit-testable in node.
+ * pick), report the re-pin as done (`onPinned`) the moment it resolves, then
+ * kick the refresher so the posture is re-derived against the new pin now
+ * rather than at the next cadence.
+ *
+ * It deliberately does NOT re-read the posture: the kick is fire-and-forget,
+ * so an immediate read returns the PRE-switch status, and because IPC replies
+ * are not ordered against events it can land after — and overwrite — the
+ * kicked pass's own event. The banner is updated by that event instead (a
+ * same-posture tenant change is re-announced as a detail transition).
+ * `onPinned` runs before the kick so a kick failure is never shown as a
+ * failed switch. Extracted so the order is unit-testable in node.
  */
 export function makeSwitchTenantHandler(deps: {
   setDefaultTenant: (tenantId: string) => Promise<void>;
   invoker: (cmd: string, args: Record<string, unknown>) => Promise<unknown>;
-}): (tenantId: string) => Promise<CredentialDarkSignal | null> {
+  onPinned: () => void;
+}): (tenantId: string) => Promise<void> {
   return async (tenantId: string) => {
     await deps.setDefaultTenant(tenantId);
+    deps.onPinned();
     await deps.invoker(KICK_DEVICE_JWT_REFRESHER_CMD, {});
-    const raw = await deps.invoker(GET_COORD_CREDENTIAL_POSTURE_CMD, {});
-    return credentialDarkFromPostureSnapshot(raw);
   };
 }
