@@ -683,9 +683,30 @@ fn the_settings_sentinel_is_planted_checked_after_the_run_half_and_removed() {
         "`{SENTINEL_CHECK}` must come before `{UNPOISON}` removes the sentinel"
     );
 
-    let unpoison = command_lines(find_step(&steps, UNPOISON), UNPOISON);
+    let unpoison_step = find_step(&steps, UNPOISON);
+    assert_eq!(
+        unpoison_step.get("if").and_then(|v| v.as_str()),
+        Some("always()"),
+        "`{UNPOISON}` must run on a red suite too — it is what moves a pre-existing \
+         settings.json the poison moved aside back into place"
+    );
+    let unpoison = command_lines(unpoison_step, UNPOISON);
     assert!(unpoison.contains("rm -f \"$QONTINUI_SETTINGS_SENTINEL\""));
     assert!(unpoison.contains("QONTINUI_SETTINGS_SENTINEL_BACKUP"));
+    assert!(unpoison.contains("QONTINUI_SETTINGS_SENTINEL_BACKUP_OF"));
+
+    // The backup's record reaches $GITHUB_ENV BEFORE the `mv`, so a failure
+    // between the two cannot lose where the operator's file went.
+    let record = poison
+        .find("echo \"QONTINUI_SETTINGS_SENTINEL_BACKUP_OF=$SENTINEL\"")
+        .expect("`Poison ambient state` must record the backup's origin in $GITHUB_ENV");
+    let mv = poison
+        .find("mv \"$SENTINEL\" \"$SENTINEL_BACKUP\"")
+        .expect("`Poison ambient state` moves a pre-existing settings.json aside");
+    assert!(
+        record < mv,
+        "`{POISON}` must record the backup path in $GITHUB_ENV before the `mv`"
+    );
 
     let settings = std::fs::read_to_string(repo_root().join("src-tauri/src/settings.rs"))
         .expect("read settings.rs");

@@ -651,7 +651,9 @@ jobs:
           #
           # A pre-existing file (a runner that is not the clean one this step
           # assumes) is MOVED aside, not overwritten, and `Unpoison ambient
-          # state` moves it back.
+          # state` (which runs `if: always()`) moves it back. The backup path
+          # and its origin reach $GITHUB_ENV BEFORE the `mv`: a failure between
+          # the two must not leave a moved file with no record of where it went.
           if [ "$RUNNER_OS" = "Windows" ]; then
             SENTINEL_DIR="$(cygpath -u "$APPDATA")/com.qontinui.runner"
           else
@@ -662,6 +664,10 @@ jobs:
           mkdir -p "$SENTINEL_DIR"
           if [ -e "$SENTINEL" ]; then
             SENTINEL_BACKUP="$RUNNER_TEMP/settings.json.pre-sentinel"
+            {
+              echo "QONTINUI_SETTINGS_SENTINEL_BACKUP=$SENTINEL_BACKUP"
+              echo "QONTINUI_SETTINGS_SENTINEL_BACKUP_OF=$SENTINEL"
+            } >> "$GITHUB_ENV"
             echo "::warning::$SENTINEL already exists before the sentinel was planted — moved to $SENTINEL_BACKUP; Unpoison restores it"
             mv "$SENTINEL" "$SENTINEL_BACKUP"
           fi
@@ -1398,11 +1404,12 @@ jobs:
           # chunk FAILED, while the step still reported green because it is
           # `continue-on-error`.
           #
-          # Reordering does NOT fix it: `Unpoison` carries no `if: always()`, so
-          # a red suite skips it entirely — and a red suite is exactly the case
-          # this ingest exists to record. A step-level `env:` beats $GITHUB_ENV
-          # for this step only, so it is correct on both the green and red paths
-          # and independent of where the unpoison sits.
+          # Reordering was not the fix: `Unpoison` then carried no `if:
+          # always()`, so a red suite skipped it entirely — and a red suite is
+          # exactly the case this ingest exists to record. It runs `if: always()`
+          # now, but a step-level `env:` beats $GITHUB_ENV for this step only, so
+          # the pin stays correct on both the green and red paths and
+          # independent of where the unpoison sits.
           #
           # Empty, not a literal host: the script reads
           # `process.env.COORD_HTTP_URL || DEFAULT_COORD_URL`
@@ -1427,7 +1434,14 @@ jobs:
       # root resolver trims and skips). The three files are removed by name, not
       # `rm -rf ~/.qontinui`, so a home that was NOT clean (the poison step warns
       # when it sees one) keeps whatever else it held.
+      #
+      # `if: always()`: on a red suite (or a red `Poison ambient state`) a
+      # pre-existing settings.json the poison moved aside must still be moved
+      # back — on a self-hosted box that file is the operator's. Every action
+      # here is idempotent and safe when the poison never ran: `rm -f` by name,
+      # restores gated on a recorded, existing backup, and blanking env vars.
       - name: Unpoison ambient state
+        if: always()
         run: |
           set -u
           homes=("$HOME")
@@ -1441,17 +1455,19 @@ jobs:
             rmdir "$h/.qontinui" 2>/dev/null || true
           done
           # The settings sentinel: removed by name, and a file that was there
-          # before it was planted is moved back. (This step has no
-          # `if: always()`, so on a red suite neither happens — harmless on an
-          # ephemeral hosted runner, which is the only kind this job uses.)
+          # before it was planted is moved back — keyed on the backup's own
+          # record (`_BACKUP` + `_BACKUP_OF`, written before the poison's `mv`),
+          # so a poison that failed after moving the file but before planting
+          # the sentinel is still undone.
           if [ -n "${QONTINUI_SETTINGS_SENTINEL:-}" ]; then
             rm -f "$QONTINUI_SETTINGS_SENTINEL"
-            if [ -n "${QONTINUI_SETTINGS_SENTINEL_BACKUP:-}" ] && [ -e "$QONTINUI_SETTINGS_SENTINEL_BACKUP" ]; then
-              mv "$QONTINUI_SETTINGS_SENTINEL_BACKUP" "$QONTINUI_SETTINGS_SENTINEL"
-              echo "restored the pre-existing $QONTINUI_SETTINGS_SENTINEL"
-            else
-              rmdir "$(dirname "$QONTINUI_SETTINGS_SENTINEL")" 2>/dev/null || true
-            fi
+          fi
+          if [ -n "${QONTINUI_SETTINGS_SENTINEL_BACKUP:-}" ] && [ -n "${QONTINUI_SETTINGS_SENTINEL_BACKUP_OF:-}" ] && [ -e "$QONTINUI_SETTINGS_SENTINEL_BACKUP" ]; then
+            rm -f "$QONTINUI_SETTINGS_SENTINEL_BACKUP_OF"
+            mv "$QONTINUI_SETTINGS_SENTINEL_BACKUP" "$QONTINUI_SETTINGS_SENTINEL_BACKUP_OF"
+            echo "restored the pre-existing $QONTINUI_SETTINGS_SENTINEL_BACKUP_OF"
+          elif [ -n "${QONTINUI_SETTINGS_SENTINEL:-}" ]; then
+            rmdir "$(dirname "$QONTINUI_SETTINGS_SENTINEL")" 2>/dev/null || true
           fi
           {
             echo "COORD_HTTP_URL="
@@ -1461,6 +1477,7 @@ jobs:
             echo "QONTINUI_SETTINGS_SENTINEL="
             echo "QONTINUI_SETTINGS_SENTINEL_SHA256="
             echo "QONTINUI_SETTINGS_SENTINEL_BACKUP="
+            echo "QONTINUI_SETTINGS_SENTINEL_BACKUP_OF="
           } >> "$GITHUB_ENV"
           echo "poison removed; COORD_HTTP_URL / QONTINUI_ROOT / QONTINUI_SERVER_MODE / QONTINUI_RUNNER_TIER / settings sentinel blanked"
         shell: bash

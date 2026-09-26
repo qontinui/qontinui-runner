@@ -199,10 +199,11 @@ test("a non-positive size degrades to one chunk, never an infinite loop", () => 
 // 102391645194) while still reporting green, because the step is
 // `continue-on-error`.
 //
-// Reordering is not the fix: `Unpoison` has no `if: always()`, so a red suite
-// skips it, and a red suite is precisely what this ingest exists to record. The
-// step therefore carries its own `COORD_HTTP_URL`, which beats $GITHUB_ENV for
-// that step alone.
+// Reordering was not the fix: `Unpoison` then had no `if: always()`, so a red
+// suite skipped it, and a red suite is precisely what this ingest exists to
+// record. It runs `if: always()` now, but the step still carries its own
+// `COORD_HTTP_URL`, which beats $GITHUB_ENV for that step alone and keeps it
+// independent of where the unpoison sits.
 //
 // ===========================================================================
 // WHAT THIS GUARD DOES NOT DO -- read before adding to it
