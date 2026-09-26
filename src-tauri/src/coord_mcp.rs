@@ -5417,13 +5417,7 @@ pub(crate) fn tenant_selection_failed_error(e: &tokio::task::JoinError) -> Proxy
 /// meaning "the default slot"), or a typed [`ProxyRefusal`] whose body the
 /// caller returns via [`ProxyRefusal::json_body`].
 pub(crate) fn session_tenant_or_refuse(nonce: Option<&str>) -> Result<Option<Uuid>, ProxyRefusal> {
-    use crate::session::tenant_pin::TenantPin;
-    let binding_pin = nonce
-        .map(proxy_session_pin_for_nonce)
-        .unwrap_or(TenantPin::Unpinned);
-    // The workspace the session was provisioned into. `None` (a binding with
-    // no recorded workdir) is "no workspace to ask" — absence, not a fault.
-    let workdir = nonce.and_then(workdir_for_nonce);
+    let (binding_pin, workdir) = session_decision_inputs(nonce);
     // THE Phase-1b read: the machine's tenant is sampled NOW, per request, not
     // recovered from whatever the binding froze at mint time.
     let live_pin = crate::session::tenant_pin::resolve_tenant_pin();
@@ -5618,16 +5612,22 @@ pub(crate) fn declared_tenant_unbound_error(
 /// A new code in the SAME `terminal:tenant_*` family — there is no existing
 /// code for "the declaration itself is garbage", and a parallel vocabulary is
 /// what makes two refusals teach two different things about one machine.
+///
+/// It has a name because Phase 5's `/coord-mcp/doctor` reports the code
+/// alongside the body, and a second literal spelling of a *stable
+/// machine-readable* token is how the door and the refusal start disagreeing.
+pub(crate) const DECLARATION_UNUSABLE_CODE: &str = "terminal:tenant_declaration_unusable";
+
 pub(crate) fn declared_tenant_unusable_error(
     source: &crate::session::workspace_tenant::TenantDeclarationSource,
     detail: &str,
 ) -> ProxyRefusal {
     ProxyRefusal {
         status: 403,
-        code: "terminal:tenant_declaration_unusable",
+        code: DECLARATION_UNUSABLE_CODE,
         retryable: false,
         message: format!(
-            "terminal:tenant_declaration_unusable: {source} states a tenant this runner \
+            "{DECLARATION_UNUSABLE_CODE}: {source} states a tenant this runner \
              cannot read ({detail}) — refusing this session's coord requests rather than \
              ignoring the statement, which would silently act as the device's default \
              tenant. Correct the declaration to a tenant uuid this device is paired for, or \
@@ -5713,13 +5713,24 @@ pub(crate) fn decide_session_tenant(
     }
 }
 
-/// [`session_tenant_or_refuse`] without its logging — for read-only reporters.
-pub(crate) fn session_tenant_decision(nonce: Option<&str>) -> SessionTenantDecision {
-    use crate::session::tenant_pin::TenantPin;
+/// The per-SESSION inputs to the authority order: the binding's frozen pin
+/// (row 1) and the workspace the session was provisioned into (`None`, a
+/// binding with no recorded workdir, is "no workspace to ask" — absence, not a
+/// fault). ONE function, called by the proxy ([`session_tenant_or_refuse`]),
+/// the read-only reporters ([`session_tenant_decision`]) and the doctor, so the
+/// three cannot drift into asking different questions.
+pub(crate) fn session_decision_inputs(
+    nonce: Option<&str>,
+) -> (crate::session::tenant_pin::TenantPin, Option<String>) {
     let binding_pin = nonce
         .map(proxy_session_pin_for_nonce)
-        .unwrap_or(TenantPin::Unpinned);
-    let workdir = nonce.and_then(workdir_for_nonce);
+        .unwrap_or(crate::session::tenant_pin::TenantPin::Unpinned);
+    (binding_pin, nonce.and_then(workdir_for_nonce))
+}
+
+/// [`session_tenant_or_refuse`] without its logging — for read-only reporters.
+pub(crate) fn session_tenant_decision(nonce: Option<&str>) -> SessionTenantDecision {
+    let (binding_pin, workdir) = session_decision_inputs(nonce);
     decide_session_tenant(
         binding_pin,
         || crate::session::workspace_tenant::read_workspace_declaration(workdir.as_deref()),
@@ -6531,6 +6542,97 @@ mod session_tenant_resolution_tests {
             !read.get(),
             "row 1 must not even READ the workspace declaration — it is terminal"
         );
+    }
+
+    /// **Phase 5's gate on the refusal vocabulary.** Every refusal a workspace
+    /// declaration can produce must answer with a code from the EXISTING
+    /// `SpawnTenantRefusal` family and must carry
+    /// [`SPAWN_TENANT_PAIRING_HINT`] — no parallel vocabulary, no second heal.
+    ///
+    /// The point is not aesthetic. An agent refused at spawn and an agent
+    /// refused at the proxy are the same agent with the same problem; two
+    /// vocabularies would teach it two different things about one machine, and
+    /// it would act on whichever it saw first.
+    ///
+    /// This covers ALL THREE `SpawnTenantRefusal` variants — including
+    /// `WorkdirDeclaresOtherTenant`, which the per-rule Phase-1 tests do not
+    /// reach — plus the one new code.
+    #[test]
+    fn every_declaration_refusal_uses_the_spawn_code_family_and_the_pairing_hint() {
+        let declared = tenant(0xD5);
+        let source = map_source("D:/portofino-pizzeria");
+
+        let refusals = [
+            (
+                SpawnTenantRefusal::NotPaired { tenant: declared },
+                "terminal:tenant_not_paired",
+            ),
+            (
+                SpawnTenantRefusal::CredentialStoreUnreadable {
+                    tenant: declared,
+                    error: "keyring locked".to_string(),
+                },
+                "terminal:tenant_credential_store_unreadable",
+            ),
+            (
+                SpawnTenantRefusal::WorkdirDeclaresOtherTenant {
+                    tenant: declared,
+                    declared_file: std::path::PathBuf::from("D:/portofino-pizzeria/.mcp.json"),
+                    declared: DeclaredWorkdirKey::NotPinned,
+                },
+                "terminal:tenant_workdir_declares_other_tenant",
+            ),
+        ];
+
+        for (refusal, want_code) in refusals {
+            assert_eq!(refusal.code(), want_code, "the code is the STABLE one");
+            let decision = SessionTenantDecision::DeclaredTenantUnbound {
+                tenant: declared,
+                source: source.clone(),
+                refusal: refusal.clone(),
+            };
+            let refused = decision
+                .into_result()
+                .expect_err("an unbound declaration refuses");
+            let (status, body) = (refused.status, refused.message);
+            assert_eq!(status, 403, "an authorization answer, not a health answer");
+            assert!(
+                body.starts_with(want_code),
+                "the refusal must LEAD with the stable code: {body}"
+            );
+            assert!(
+                body.contains(SPAWN_TENANT_PAIRING_HINT),
+                "the refusal must carry the heal: {body}"
+            );
+            assert!(
+                body.contains("qontinui_profile device pair --tenant-id"),
+                "and the heal is the pairing CLI: {body}"
+            );
+            assert!(
+                body.contains(&declared.to_string()),
+                "and names the tenant that was refused: {body}"
+            );
+            assert!(
+                body.contains("tenant-map.json"),
+                "and names the door that declared it: {body}"
+            );
+        }
+
+        // The one NEW code. It is new because no existing code means "the
+        // declaration itself is garbage" — but it lives in the same family and
+        // carries the same heal.
+        let refused = SessionTenantDecision::DeclaredTenantUnusable {
+            source: source.clone(),
+            detail: "`pizzeria` is not a tenant uuid".to_string(),
+        }
+        .into_result()
+        .expect_err("an unusable declaration refuses");
+        assert_eq!(refused.code, DECLARATION_UNUSABLE_CODE);
+        let (status, body) = (refused.status, refused.message);
+        assert_eq!(status, 403);
+        assert!(body.starts_with(DECLARATION_UNUSABLE_CODE), "{body}");
+        assert!(body.starts_with("terminal:tenant_"), "{body}");
+        assert!(body.contains(SPAWN_TENANT_PAIRING_HINT), "{body}");
     }
 }
 
@@ -20290,10 +20392,20 @@ pub(crate) mod doctor {
         /// Which tenant the selection was made for, as the proxy resolves it.
         pub tenant: Option<String>,
         /// How that tenant was decided: `pinned` | `unpinned-default` |
-        /// `unresolvable`. This is the field the whole incident turned on — a
-        /// session's transport worked or not according to how its tenant
-        /// resolved, and nothing reported it.
-        pub tenant_source: &'static str,
+        /// `unresolvable`, or — when a workspace was supplied and one of the
+        /// workspace tiers answered — `workspace-declaration:<tier>` /
+        /// `workspace-declaration-refused:<tier>`. This is the field the whole
+        /// incident turned on — a session's transport worked or not according
+        /// to how its tenant resolved, and nothing reported it.
+        ///
+        /// A `String` rather than a `&'static str` since Phase 5: the
+        /// workspace spellings name which of the three tiers matched, and
+        /// flattening them back to one token would put the doctor a rung below
+        /// what the proxy actually decided.
+        pub tenant_source: String,
+        /// What the workspace tiers said — or, when no workspace was supplied,
+        /// that they were NOT EVALUATED. See [`WorkspaceDeclarationView`].
+        pub workspace_declaration: WorkspaceDeclarationView,
         /// The slot selection actually returned, described.
         /// `None` means selection MISSED — no bearer would be sent at all,
         /// which is a different failure from sending a dead one.
@@ -20317,21 +20429,379 @@ pub(crate) mod doctor {
         pub descriptor: crate::auth::SlotDescriptor,
     }
 
+    /// What the three workspace declaration tiers
+    /// ([`crate::session::workspace_tenant`]) say for one workspace — **or
+    /// that they were not asked.**
+    ///
+    /// Plan `2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin`
+    /// D5 / Phase 5. Before this, `tenant_source` could only say `pinned` /
+    /// `unpinned-default` / `unresolvable`: the doctor could not see the
+    /// workspace tiers at all, so a session refused by a repo's `tenant:` key
+    /// read here as a healthy machine pin.
+    ///
+    /// # The asymmetry this type exists to hold
+    ///
+    /// The declaration is per-WORKSPACE and this door is process-level, so the
+    /// doctor only has a workspace when the caller supplies one
+    /// (`?workdir=<path>`, or its session nonce in `Authorization: Bearer`).
+    /// With none supplied the tiers are **NOT EVALUATED**, which is UNKNOWN — and UNKNOWN must never
+    /// render as "no declaration". Those two answers have opposite repairs: the
+    /// first means *ask again with a workspace*, the second means *this
+    /// workspace genuinely states nothing and the machine pin decides*. Calling
+    /// the first the second is `verification-and-evidence`
+    /// `silent-empty-is-unknown` with a credential behind it — an agent would
+    /// read "no declaration" and go hunt a machine pin that was never what
+    /// refused it.
+    ///
+    /// `evaluated` is the bit a machine reads; `status` is the same answer as a
+    /// stable token; `detail` is the sentence a human reads.
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub(crate) struct WorkspaceDeclarationView {
+        /// `false` = the tiers were NOT ASKED. Not "they said nothing".
+        pub evaluated: bool,
+        /// `not-evaluated` | `absent` | `declared` | `refused-unbound` |
+        /// `refused-unusable`.
+        pub status: &'static str,
+        /// The workspace the tiers were read for, when one was supplied.
+        pub workspace: Option<String>,
+        /// Which rule matched: `env` | `config-yml` | `tenant-map`.
+        pub tier: Option<&'static str>,
+        /// **The path it matched on** — the `tenant:` key's file, the
+        /// `tenant-map.json` prefix that won, or `$QONTINUI_TENANT_ID` for the
+        /// process tier, which has no path. This is the half a reader needs to
+        /// go edit the thing that decided.
+        pub matched_on: Option<String>,
+        /// The tenant the declaration named, whether or not it was admitted.
+        pub declared_tenant: Option<String>,
+        /// Did [`spawn_tenant_admission`] admit it? `None` = admission was
+        /// never reached (nothing declared, or the declaration was unreadable).
+        pub admitted: Option<bool>,
+        /// The refusal's stable code, from the SAME `terminal:tenant_*` family
+        /// the spawn path answers with — so an agent reading this door and an
+        /// agent reading a spawn refusal learn the same thing.
+        pub refusal_code: Option<&'static str>,
+        /// The sentence. For a refusal this is the proxy's own refusal body,
+        /// verbatim, carrying [`SPAWN_TENANT_PAIRING_HINT`].
+        pub detail: String,
+        /// True when the diagnosed SESSION carries a frozen binding pin (row
+        /// 1), which outranks every workspace tier: the declaration shown is
+        /// what a NEW session here would get, not what this one uses.
+        pub outranked_by_binding_pin: bool,
+    }
+
+    /// The pure core of the workspace half of the report, so both the
+    /// NOT-EVALUATED asymmetry and every tier's rendering are testable without
+    /// `$HOME`, a nonce registry or a credential store.
+    ///
+    /// `declaration` is `None` when **no workspace was supplied** — that is the
+    /// NOT-EVALUATED arm, and it is the one arm that must not be confused with
+    /// [`crate::session::workspace_tenant::WorkspaceDeclaration::Absent`].
+    ///
+    /// `admit` is [`validate_spawn_tenant`] in production — the SAME admission
+    /// rule the proxy and the spawn path use. The doctor deriving its own
+    /// "would this be admitted?" is precisely the divergence this whole door
+    /// exists to expose, so it must not be the shape of the door itself.
+    pub(crate) fn workspace_declaration_view(
+        workspace: Option<&str>,
+        declaration: Option<crate::session::workspace_tenant::WorkspaceDeclaration>,
+        admit: impl FnOnce(Uuid) -> Result<(), SpawnTenantRefusal>,
+    ) -> WorkspaceDeclarationView {
+        use crate::session::workspace_tenant::WorkspaceDeclaration;
+
+        let base = WorkspaceDeclarationView {
+            evaluated: true,
+            status: "absent",
+            workspace: workspace.map(str::to_string),
+            tier: None,
+            matched_on: None,
+            declared_tenant: None,
+            admitted: None,
+            refusal_code: None,
+            detail: String::new(),
+            outranked_by_binding_pin: false,
+        };
+
+        let Some(declaration) = declaration else {
+            return WorkspaceDeclarationView {
+                evaluated: false,
+                status: "not-evaluated",
+                detail: "NOT EVALUATED — no workspace was supplied, so the per-workspace \
+                         declaration tiers (<workspace>/.qontinui/config.yml `tenant:`, \
+                         ~/.qontinui/tenant-map.json) were not read ($QONTINUI_TENANT_ID, the \
+                         process tier, was read and states nothing). This is UNKNOWN, NOT \
+                         \"this workspace declares no tenant\" — re-ask with \
+                         `?workdir=<absolute path>`, or present your session nonce in the \
+                         `Authorization: Bearer` header, to get a real answer. `tenant_source` \
+                         below therefore reports only the MACHINE pin, which is not \
+                         necessarily what a session in some workspace would resolve to."
+                    .to_string(),
+                ..base
+            };
+        };
+
+        match declaration {
+            WorkspaceDeclaration::Absent => WorkspaceDeclarationView {
+                status: "absent",
+                detail: format!(
+                    "no tier declared a tenant for {} — none of $QONTINUI_TENANT_ID, its \
+                     .qontinui/config.yml `tenant:` key, or a ~/.qontinui/tenant-map.json \
+                     prefix states one. Absence is not a fault: the authority order falls \
+                     through to this machine's pin, reported as `tenant_source` below.",
+                    workspace.unwrap_or("(no workspace)")
+                ),
+                ..base
+            },
+            WorkspaceDeclaration::Declared { tenant, source } => {
+                let (admitted, refusal) = match admit(tenant) {
+                    Ok(()) => (true, None),
+                    Err(r) => (false, Some(r)),
+                };
+                match refusal {
+                    None => WorkspaceDeclarationView {
+                        status: "declared",
+                        tier: Some(source.tier()),
+                        matched_on: Some(source.to_string()),
+                        declared_tenant: Some(tenant.to_string()),
+                        admitted: Some(admitted),
+                        detail: format!(
+                            "{source} declares tenant {tenant}, and this runner is admitted to \
+                             act as it — a session in this workspace selects that tenant's \
+                             slot, overriding this machine's pin."
+                        ),
+                        ..base
+                    },
+                    Some(refusal) => {
+                        let body = declared_tenant_unbound_error(tenant, &source, &refusal).message;
+                        WorkspaceDeclarationView {
+                            status: "refused-unbound",
+                            tier: Some(source.tier()),
+                            matched_on: Some(source.to_string()),
+                            declared_tenant: Some(tenant.to_string()),
+                            admitted: Some(admitted),
+                            refusal_code: Some(refusal.code()),
+                            detail: body,
+                            ..base
+                        }
+                    }
+                }
+            }
+            WorkspaceDeclaration::Unusable { source, detail } => {
+                let body = declared_tenant_unusable_error(&source, &detail).message;
+                WorkspaceDeclarationView {
+                    status: "refused-unusable",
+                    tier: Some(source.tier()),
+                    matched_on: Some(source.to_string()),
+                    refusal_code: Some(DECLARATION_UNUSABLE_CODE),
+                    detail: body,
+                    ..base
+                }
+            }
+        }
+    }
+
+    /// Which session the doctor is diagnosing — the three scopes the door
+    /// accepts. Review of runner#1703 (plan
+    /// `2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin`,
+    /// "Review findings from the route-around").
+    pub(crate) enum DoctorScope<'a> {
+        /// No workspace and no session: the machine-level view. Only the
+        /// process tier (`$QONTINUI_TENANT_ID`) can be read; the repo and
+        /// path-map tiers are NOT EVALUATED.
+        Machine,
+        /// "What would a session opened in this directory resolve to?" — a
+        /// fresh session there carries no binding pin.
+        Workdir(&'a str),
+        /// "What does MY session resolve to?" — the nonce the caller presented
+        /// in `Authorization: Bearer` / `X-Coord-Mcp-Proxy-Key`, run through
+        /// the proxy's own [`session_tenant_decision`] inputs, binding pin
+        /// (row 1) included. Never a URL query parameter: see
+        /// `coord_mcp_doctor_handler`.
+        Session(&'a str),
+    }
+
+    /// How the proxy's authority order answered, flattened for the report.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct TenantResolutionView {
+        /// The tenant whose slot the proxy selects; `None` = the default slot,
+        /// or nothing at all when `refusal` is set.
+        pub tenant: Option<Uuid>,
+        /// `session-binding-pin` | `workspace-declaration:<tier>` |
+        /// `workspace-declaration-refused:<tier>` | `pinned` |
+        /// `unpinned-default` | `unresolvable-pin:jwt-claim` | `unresolvable`.
+        pub source: String,
+        /// Set iff the proxy REFUSES before selecting any credential: the
+        /// proxy's own refusal body, verbatim.
+        pub refusal: Option<String>,
+        /// True iff that refusal came from a workspace declaration — whose
+        /// repair is editing or pairing, not a new session.
+        pub declaration_refusal: bool,
+    }
+
+    /// Pure: flatten the proxy's [`SessionTenantDecision`] into what the
+    /// doctor reports. The doctor reports THE decision, not a re-derivation of
+    /// it — every earlier divergence between this door and the data plane
+    /// (the binding pin ignored, a raw machine pin fed to the verdict, the
+    /// machine pin reported for a refused declaration) came from re-deriving.
+    pub(crate) fn resolution_view(decision: &SessionTenantDecision) -> TenantResolutionView {
+        let ok = |tenant: Option<Uuid>, source: String| TenantResolutionView {
+            tenant,
+            source,
+            refusal: None,
+            declaration_refusal: false,
+        };
+        match decision {
+            SessionTenantDecision::BindingPin { tenant, .. } => {
+                ok(Some(*tenant), "session-binding-pin".to_string())
+            }
+            SessionTenantDecision::Declared { tenant, source } => ok(
+                Some(*tenant),
+                format!("workspace-declaration:{}", source.tier()),
+            ),
+            SessionTenantDecision::DeclaredTenantUnbound {
+                tenant,
+                source,
+                refusal,
+            } => TenantResolutionView {
+                tenant: None,
+                source: format!("workspace-declaration-refused:{}", source.tier()),
+                refusal: Some(declared_tenant_unbound_error(*tenant, source, refusal).message),
+                declaration_refusal: true,
+            },
+            SessionTenantDecision::DeclaredTenantUnusable { source, detail } => {
+                TenantResolutionView {
+                    tenant: None,
+                    source: format!("workspace-declaration-refused:{}", source.tier()),
+                    refusal: Some(declared_tenant_unusable_error(source, detail).message),
+                    declaration_refusal: true,
+                }
+            }
+            SessionTenantDecision::LivePin(t) => ok(Some(*t), "pinned".to_string()),
+            SessionTenantDecision::DefaultSlot => ok(None, "unpinned-default".to_string()),
+            SessionTenantDecision::JwtClaim(t) => {
+                ok(Some(*t), "unresolvable-pin:jwt-claim".to_string())
+            }
+            SessionTenantDecision::Unresolvable => TenantResolutionView {
+                tenant: None,
+                source: "unresolvable".to_string(),
+                refusal: Some(
+                    "this machine's tenant pin is UNRESOLVABLE and the device JWT carries no \
+                     tenant claim, so the proxy refuses fail-closed before selecting any \
+                     credential — repair machine.json"
+                        .to_string(),
+                ),
+                declaration_refusal: false,
+            },
+        }
+    }
+
     /// Build the report. Pure over the credential store and the machine pin —
     /// no network, so it answers even when coord is unreachable, which is
     /// precisely when it is asked.
     ///
     /// Deliberately NOT a coord probe: a door that needs coord to answer
     /// "why can't I reach coord" is useless in the case it exists for. The
-    /// live-reachability half belongs to `coord_doctor`'s check 8, which
-    /// Phase 5a fixes separately.
+    /// live-reachability half belongs to `coord_doctor`'s check 8.
     pub(crate) fn report() -> serde_json::Value {
-        let pin = crate::session::tenant_pin::resolve_tenant_pin();
-        let (tenant, tenant_source) = match &pin {
-            crate::session::tenant_pin::TenantPin::Pinned(t) => (Some(*t), "pinned"),
-            crate::session::tenant_pin::TenantPin::Unpinned => (None, "unpinned-default"),
-            crate::session::tenant_pin::TenantPin::Unresolvable => (None, "unresolvable"),
+        report_for(DoctorScope::Machine)
+    }
+
+    /// [`report`] for a workspace path — what a session opened there would
+    /// resolve to.
+    pub(crate) fn report_for_workspace(workspace: Option<&str>) -> serde_json::Value {
+        report_for(workspace.map_or(DoctorScope::Machine, DoctorScope::Workdir))
+    }
+
+    /// The report for one [`DoctorScope`]. Every input to the tenant decision
+    /// is the proxy's own: [`proxy_session_pin_for_nonce`],
+    /// [`workdir_for_nonce`], `read_workspace_declaration`,
+    /// `resolve_tenant_pin`, [`device_jwt_claim_tenant`] and
+    /// [`validate_spawn_tenant`], composed by the same
+    /// [`decide_session_tenant`] — so this door cannot disagree with the data
+    /// plane about which tenant, and a refusal short-circuits the credential
+    /// half exactly as it does there.
+    pub(crate) fn report_for(scope: DoctorScope<'_>) -> serde_json::Value {
+        use crate::session::tenant_pin::TenantPin;
+        use crate::session::workspace_tenant::{read_workspace_declaration, WorkspaceDeclaration};
+
+        let (binding_pin, workspace, nonce_resolved): (TenantPin, Option<String>, Option<bool>) =
+            match scope {
+                DoctorScope::Machine => (TenantPin::Unpinned, None, None),
+                DoctorScope::Workdir(w) => (TenantPin::Unpinned, Some(w.to_string()), None),
+                DoctorScope::Session(nonce) => {
+                    // The proxy answers an unrecognised nonce with a 401 BEFORE
+                    // any tenant decision, so the doctor must too — reporting
+                    // the machine-level decision for a dead key would read as
+                    // "your session is fine" to the one caller asking why it
+                    // is not. Only a caller already holding the nonce learns
+                    // anything here.
+                    if !proxy_nonce_is_valid(nonce) {
+                        return unrecognised_nonce_report();
+                    }
+                    // An AGENT nonce never reaches the tenant decision: the
+                    // proxy injects that agent's own JWT (or 401s when its slot
+                    // is gone). Describing the device credential here would be
+                    // a verdict about a bearer this session never presents.
+                    if let Some(ProxyPrincipal::Agent { agent_id }) =
+                        proxy_principal_for_nonce(nonce)
+                    {
+                        // `report_for` runs on the blocking pool, so the slot's async
+                        // lock is read with `blocking_read`.
+                        let state = lookup_agent_token(agent_id).map(|slot| {
+                            slot.blocking_read()
+                                .health_report(agent_id, chrono::Utc::now().timestamp())
+                                .state
+                        });
+                        return agent_nonce_report(state);
+                    }
+                    let (pin, wd) = session_decision_inputs(Some(nonce));
+                    let resolved = wd.is_some();
+                    (pin, wd, Some(resolved))
+                }
+            };
+
+        // ONE read of the tiers, shared by the decision and the view, so the
+        // two cannot describe different reads.
+        let declaration = read_workspace_declaration(workspace.as_deref());
+        let decision = decide_session_tenant(
+            binding_pin,
+            || declaration.clone(),
+            crate::session::tenant_pin::resolve_tenant_pin(),
+            device_jwt_claim_tenant,
+            validate_spawn_tenant,
+        );
+        let resolution = resolution_view(&decision);
+
+        // The view: NOT EVALUATED only when the repo/path-map tiers were never
+        // read AND the process tier said nothing — with no workspace, an
+        // `Absent` is not "this workspace declares nothing".
+        let view_input = match (&workspace, &declaration) {
+            (None, WorkspaceDeclaration::Absent) => None,
+            _ => Some(declaration.clone()),
         };
+        let mut workspace_declaration =
+            workspace_declaration_view(workspace.as_deref(), view_input, validate_spawn_tenant);
+        if nonce_resolved == Some(false) {
+            workspace_declaration.detail = format!(
+                "the presented session nonce is valid but carries no recorded workspace (a \
+                 graced, restored or adopted key), so — exactly as on the proxy path — only \
+                 the process tier could be read. {}",
+                workspace_declaration.detail
+            );
+        }
+        // Row 1 outranks every workspace tier: when the session's frozen
+        // binding pin decided, a declaration is reported but it is NOT what
+        // the proxy uses — and a refusing one does not refuse this session.
+        if matches!(decision, SessionTenantDecision::BindingPin { .. })
+            && workspace_declaration.evaluated
+            && workspace_declaration.status != "absent"
+        {
+            workspace_declaration.outranked_by_binding_pin = true;
+            workspace_declaration.detail = format!(
+                "OUTRANKED — this session's frozen binding pin decides its tenant and the \
+                 proxy does not consult the workspace tiers for it. For a NEW session here: {}",
+                workspace_declaration.detail
+            );
+        }
 
         let am = crate::auth::AuthManager::new();
         let legacy = crate::auth::SlotDescriptor::describe(am.get_access_token().ok().as_deref());
@@ -20347,51 +20817,49 @@ pub(crate) mod doctor {
             })
             .collect();
 
-        // The SAME selector the proxy calls. Re-implementing the choice here
-        // would let the doctor and the data plane disagree — which is exactly
-        // the class of bug this door exists to expose, so it must not be the
-        // shape of the door itself.
-        let selected = crate::auth::device_bearer_for(tenant.as_ref());
-        let selected = selected
-            .as_deref()
-            .map(|t| crate::auth::SlotDescriptor::describe(Some(t)));
+        // A refused session never reaches selection. Describing a bearer here
+        // would describe one that is never sent — and the DEFAULT slot's at
+        // that, the cross-tenant misread this plan exists to prevent.
+        let selected = if resolution.refusal.is_some() {
+            None
+        } else {
+            // The SAME selector the proxy calls.
+            crate::auth::device_bearer_for(resolution.tenant.as_ref())
+                .as_deref()
+                .map(|t| crate::auth::SlotDescriptor::describe(Some(t)))
+        };
 
         // `all_tenant_slots` is `.unwrap_or_default()` deep down, so an
-        // UNDECRYPTABLE store reads as an empty list. Absence is not zero
-        // (`verification-and-evidence` `silent-empty-is-unknown`), and the
-        // refresher already learned this lesson the hard way — so an empty
-        // list beside a present legacy slot is reported as UNKNOWN rather
-        // than as "this box has no tenant slots".
+        // UNDECRYPTABLE store reads as an empty list — UNKNOWN, not zero.
         let slots_are_unknown = all_tenant_slots.is_empty();
 
-        // D4 (plan 2026-09-20): is the BINDING STORE split-brained? Four
-        // `paired_user.json` copies were found on the operator box and which
-        // one a process reads decides which tenants it believes exist. This
-        // compares only the copies this process would itself compute, FAILS
-        // on a binding-set / `default_tenant_id` disagreement, and merely
-        // REPORTS a `paired_at`-only difference — the only way the copies
-        // differ on a healthy box today, and a check that cries wolf gets
-        // disabled. An unreadable copy reads as UNKNOWN, never as agreement.
-        // `qontinui_runner_lib::` rather than `crate::`: this module is
-        // compiled into BOTH the lib and the bin, and only the lib has a
-        // `mod pair` in its crate root (the lib aliases itself with
-        // `extern crate self as qontinui_runner_lib`, so this one spelling
-        // resolves in both) — same idiom as `tenant_id_from_oauth_claim`
-        // above.
+        // D4 (plan 2026-09-20): is the BINDING STORE split-brained? See
+        // `binding_store_check`. `qontinui_runner_lib::` because this module
+        // is compiled into both the lib and the bin.
         let binding_store = qontinui_runner_lib::pair::binding_store_check();
         let binding_store_unknown = binding_store.is_unknown();
         let binding_store_failed = binding_store.failed();
 
-        let (verdict, layer, detail) = verdict_for(&selected, &legacy, slots_are_unknown, &pin);
+        let (verdict, layer, detail) = verdict_for(
+            &selected,
+            &legacy,
+            slots_are_unknown,
+            resolution.refusal.as_deref(),
+        );
 
         serde_json::json!({
             "probed_at": chrono::Utc::now().to_rfc3339(),
             "verdict": verdict,
             "layer": layer,
             "detail": detail,
+            // Present only for the session scope: did the presented nonce
+            // resolve to a provisioned workspace? Never echoes the nonce.
+            "session": nonce_resolved
+                .map(|r| serde_json::json!({"nonce_recognised": true, "workspace_resolved": r})),
             "credential": SelectedSlot {
-                tenant: tenant.map(|t| t.to_string()),
-                tenant_source,
+                tenant: resolution.tenant.map(|t| t.to_string()),
+                tenant_source: resolution.source.clone(),
+                workspace_declaration,
                 selected,
                 all_tenant_slots,
                 legacy_slot: legacy,
@@ -20408,10 +20876,8 @@ pub(crate) mod doctor {
                     "cleared_on_rejection_total": h.cleared_on_rejection_total,
                     // Beside `slots` on purpose: `slots` is what this box
                     // HOLDS, `binding_gaps` is what coord says it is BOUND to
-                    // and holds nothing for. A reader who sees only the first
-                    // concludes "two healthy slots, nothing is missing" — the
-                    // exact reading this field exists to prevent. Its
-                    // `{"unknown": "<why>"}` arm is NOT "no gaps".
+                    // and holds nothing for. Its `{"unknown": "<why>"}` arm is
+                    // NOT "no gaps".
                     "binding_gaps": h.binding_gaps,
                     "slots": h.slots.iter().map(|s| serde_json::json!({
                         "tenant_id": s.tenant_id,
@@ -20421,9 +20887,102 @@ pub(crate) mod doctor {
                         "detail": s.detail,
                     })).collect::<Vec<_>>(),
                 })),
-            "next_door": next_door_for(layer),
+            // A declaration refusal's repair is NOT the runner-nonce layer's
+            // usual one: a new session in the same workspace reads the same
+            // declaration and is refused identically.
+            "next_door": if resolution.declaration_refusal {
+                DECLARATION_REFUSAL_NEXT_DOOR
+            } else {
+                next_door_for(layer)
+            },
         })
     }
+
+    /// The doctor's answer for a presented nonce the proxy does not recognise:
+    /// the proxy's own 401 cause, and nothing about any tenant or credential.
+    pub(crate) fn unrecognised_nonce_report() -> serde_json::Value {
+        serde_json::json!({
+            "probed_at": chrono::Utc::now().to_rfc3339(),
+            "verdict": "refuses",
+            "layer": ProxyFailureLayer::RunnerNonce.as_str(),
+            "detail": stale_proxy_key_error(STALE_PROXY_KEY_CAUSE),
+            "session": {"nonce_recognised": false},
+            "next_door": ProxyFailureLayer::RunnerNonce.next_door(),
+        })
+    }
+
+    /// The doctor's answer for an AGENT session's nonce: the proxy serves it
+    /// with the agent's own token slot, so the only question is whether that
+    /// slot is live. No device tenant, slot or declaration is described.
+    ///
+    /// `state` is the agent's token-refresh health (`None` = no live slot): a
+    /// slot the proxy would still refresh-and-present is not the same as a
+    /// healthy one, so `Degraded` / `Rejected` are reported as such.
+    pub(crate) fn agent_nonce_report(
+        state: Option<crate::agent_token::TokenState>,
+    ) -> serde_json::Value {
+        use crate::agent_token::TokenState;
+        const AGENT_NOTE: &str = "this is an AGENT session: the proxy presents the agent's \
+             own token, not a device credential, so no device tenant or workspace \
+             declaration applies";
+        let (verdict, detail) = match state {
+            Some(TokenState::Healthy) => ("ok", AGENT_NOTE.to_string()),
+            Some(TokenState::Degraded) => (
+                "degraded",
+                format!(
+                    "{AGENT_NOTE}. The agent token's refreshes are failing transiently — \
+                     the proxy still presents it, but it may be near expiry"
+                ),
+            ),
+            Some(TokenState::Rejected) => (
+                "refuses",
+                format!(
+                    "{AGENT_NOTE}. Coord REJECTED the agent's token and its refresh has \
+                     stopped — re-allocate the agent"
+                ),
+            ),
+            None => ("refuses", stale_proxy_key_error(AGENT_GONE_PROXY_CAUSE)),
+        };
+        serde_json::json!({
+            "probed_at": chrono::Utc::now().to_rfc3339(),
+            "verdict": verdict,
+            "layer": match state {
+                Some(TokenState::Healthy) => "none",
+                Some(_) => ProxyFailureLayer::CoordUpstream.as_str(),
+                None => ProxyFailureLayer::RunnerNonce.as_str(),
+            },
+            "detail": detail,
+            "session": {
+                "nonce_recognised": true,
+                "principal": "agent",
+                // Live = the proxy can still present it; a REJECTED slot exists
+                // but is dead.
+                "agent_token_live": matches!(
+                    state,
+                    Some(TokenState::Healthy | TokenState::Degraded)
+                ),
+                "agent_token_state": state,
+            },
+            "next_door": match state {
+                Some(TokenState::Healthy) => "No credential fault is visible from here.",
+                Some(_) => ProxyFailureLayer::CoordUpstream.next_door(),
+                None => ProxyFailureLayer::RunnerNonce.next_door(),
+            },
+        })
+    }
+
+    /// What to actually do about a refused workspace declaration. Names both
+    /// halves, because the two refusals have different repairs: a declaration
+    /// naming the WRONG tenant is edited, a declaration naming the RIGHT but
+    /// unpaired tenant is paired.
+    pub(crate) const DECLARATION_REFUSAL_NEXT_DOOR: &str =
+        "Starting a new session will NOT help — a new session in this workspace reads the \
+         same declaration and is refused identically. Read `credential.workspace_declaration` \
+         above: `tier` says which rule matched and `matched_on` says the exact file (or \
+         $QONTINUI_TENANT_ID) that decided. Either correct that declaration to a tenant this \
+         device is paired for, or — if the tenant is right and simply unpaired — run \
+         `qontinui_profile device pair --tenant-id <uuid>`. A declaration may only SELECT a \
+         binding this machine already holds; it never creates one.";
 
     /// The pure core, so the verdict logic is testable without a credential
     /// store, a machine pin, or a runtime.
@@ -20431,18 +20990,19 @@ pub(crate) mod doctor {
         selected: &Option<crate::auth::SlotDescriptor>,
         legacy: &crate::auth::SlotDescriptor,
         slots_are_unknown: bool,
-        pin: &crate::session::tenant_pin::TenantPin,
+        refusal: Option<&str>,
     ) -> (&'static str, &'static str, String) {
-        // A machine whose pin cannot be resolved refuses fail-closed at the
-        // proxy, so no credential question is even reached. Reporting a
-        // credential verdict here would answer a question that was never asked.
-        if matches!(pin, crate::session::tenant_pin::TenantPin::Unresolvable) {
+        // The proxy refused before selecting any credential — an unresolvable
+        // machine with no JWT claim, or a refusing workspace declaration.
+        // Reporting a credential verdict would answer a question the proxy
+        // never reaches. `refusal` comes from [`resolution_view`] over the
+        // proxy's own decision, never from the raw machine pin: an ADMITTED
+        // declaration beside an unresolvable pin is served, not refused.
+        if let Some(detail) = refusal {
             return (
                 "refuses",
                 ProxyFailureLayer::RunnerNonce.as_str(),
-                "this machine's tenant pin is UNRESOLVABLE, so the proxy refuses \
-                 fail-closed before selecting any credential — repair machine.json"
-                    .to_string(),
+                detail.to_string(),
             );
         }
         match selected {
@@ -20618,7 +21178,9 @@ mod coord_mcp_doctor_tests {
             &Some(SlotDescriptor::describe(Some(&live_jwt()))),
             &SlotDescriptor::describe(Some(&live_jwt())),
             false,
-            &TenantPin::Unresolvable,
+            resolution_view(&SessionTenantDecision::Unresolvable)
+                .refusal
+                .as_deref(),
         );
         assert_eq!(verdict, "refuses");
         assert_eq!(layer, ProxyFailureLayer::RunnerNonce.as_str());
@@ -20634,7 +21196,7 @@ mod coord_mcp_doctor_tests {
             &None,
             &SlotDescriptor::describe(Some(&live_jwt())),
             /* slots_are_unknown */ true,
-            &TenantPin::Unpinned,
+            None,
         );
         assert_eq!(verdict, "unknown");
         assert!(detail.contains("UNKNOWN"));
@@ -20648,7 +21210,7 @@ mod coord_mcp_doctor_tests {
             &None,
             &SlotDescriptor::describe(Some(&expired_jwt())),
             false,
-            &TenantPin::Unpinned,
+            None,
         );
         assert_eq!(verdict, "no-credential");
         assert_eq!(layer, ProxyFailureLayer::CoordUpstream.as_str());
@@ -20662,7 +21224,7 @@ mod coord_mcp_doctor_tests {
             &Some(SlotDescriptor::describe(Some(&expired_jwt()))),
             &SlotDescriptor::describe(None),
             false,
-            &TenantPin::Unpinned,
+            None,
         );
         assert_eq!(verdict, "degraded");
         assert!(detail.contains("diverged"));
@@ -20695,6 +21257,17 @@ mod coord_mcp_doctor_tests {
             chrono::DateTime::parse_from_rfc3339(r["probed_at"].as_str().expect("string")).is_ok(),
             "probed_at must be RFC3339"
         );
+        // Phase 5: the workspace half is ALWAYS present, even (especially)
+        // when it has nothing to report — an absent key would be read as "no
+        // declaration" by exactly the reader this field exists for.
+        for field in ["evaluated", "status", "detail"] {
+            assert!(
+                r["credential"]["workspace_declaration"]
+                    .get(field)
+                    .is_some(),
+                "workspace_declaration is missing `{field}`"
+            );
+        }
 
         // Whatever this box's store holds, no value in the payload may be
         // JWT-SHAPED. A `kid` and an `exp` are fine; three dot-separated
@@ -20738,12 +21311,680 @@ mod coord_mcp_doctor_tests {
             &Some(SlotDescriptor::describe(Some(&live_jwt()))),
             &SlotDescriptor::describe(Some(&live_jwt())),
             false,
-            &TenantPin::Pinned(uuid::Uuid::new_v4()),
+            None,
         );
         assert_eq!(verdict, "ok");
         assert_eq!(layer, "none");
         assert!(detail.contains("coord-ed25519-abc123"));
         assert!(detail.contains("until exp"));
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase 5 (plan
+    // `2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin`,
+    // D5) — the doctor can see the workspace declaration tiers.
+    // ---------------------------------------------------------------------
+
+    use crate::session::workspace_tenant::{TenantDeclarationSource, WorkspaceDeclaration};
+
+    fn tenant() -> uuid::Uuid {
+        uuid::Uuid::parse_str("7ac125b6-391b-4d64-8493-27305b25c5b9").expect("uuid")
+    }
+
+    /// Every declared tier must print BOTH halves: which rule matched
+    /// (`tier`) and **the path it matched on** (`matched_on`). One without the
+    /// other is not a diagnosis — "a repo file decided" with no file named
+    /// leaves the reader hunting, and a path with no tier leaves them unsure
+    /// which of three rules to edit.
+    #[test]
+    fn the_doctor_names_the_matched_tier_and_the_path_it_matched_on() {
+        let cases: Vec<(TenantDeclarationSource, &str, &str)> = vec![
+            (TenantDeclarationSource::Env, "env", "$QONTINUI_TENANT_ID"),
+            (
+                TenantDeclarationSource::ConfigYml {
+                    path: std::path::PathBuf::from("D:/portofino-pizzeria/.qontinui/config.yml"),
+                },
+                "config-yml",
+                "D:/portofino-pizzeria/.qontinui/config.yml",
+            ),
+            (
+                TenantDeclarationSource::TenantMap {
+                    path: std::path::PathBuf::from("C:/Users/x/.qontinui/tenant-map.json"),
+                    prefix: Some("D:/portofino-pizzeria".to_string()),
+                },
+                "tenant-map",
+                "tenant-map.json",
+            ),
+        ];
+
+        for (source, want_tier, want_path_fragment) in cases {
+            let v = workspace_declaration_view(
+                Some("D:/portofino-pizzeria"),
+                Some(WorkspaceDeclaration::Declared {
+                    tenant: tenant(),
+                    source,
+                }),
+                |_| Ok(()),
+            );
+            assert!(v.evaluated, "a supplied workspace IS evaluated");
+            assert_eq!(v.status, "declared");
+            assert_eq!(v.tier, Some(want_tier), "the matched rule must be named");
+            let matched = v.matched_on.as_deref().expect("the path it matched on");
+            assert!(
+                matched.contains(want_path_fragment),
+                "`matched_on` must name what it matched on — wanted {want_path_fragment} in \
+                 {matched}"
+            );
+            assert_eq!(v.declared_tenant, Some(tenant().to_string()));
+            assert_eq!(v.admitted, Some(true));
+            assert_eq!(v.refusal_code, None);
+            assert_eq!(v.workspace.as_deref(), Some("D:/portofino-pizzeria"));
+        }
+
+        // The tier-3 rendering additionally names WHICH prefix won, because a
+        // `tenant-map.json` with five entries and no named prefix tells the
+        // reader nothing about which line to edit.
+        let v = workspace_declaration_view(
+            Some("D:/portofino-pizzeria/mobile"),
+            Some(WorkspaceDeclaration::Declared {
+                tenant: tenant(),
+                source: TenantDeclarationSource::TenantMap {
+                    path: std::path::PathBuf::from("C:/Users/x/.qontinui/tenant-map.json"),
+                    prefix: Some("D:/portofino-pizzeria".to_string()),
+                },
+            }),
+            |_| Ok(()),
+        );
+        assert!(
+            v.matched_on
+                .as_deref()
+                .expect("matched_on")
+                .contains("D:/portofino-pizzeria"),
+            "the winning prefix is named: {:?}",
+            v.matched_on
+        );
+    }
+
+    /// **THE asymmetry.** With no workspace supplied the tiers were NOT
+    /// EVALUATED — UNKNOWN — and that must never render as "this workspace
+    /// declares no tenant". The two answers have opposite repairs, and
+    /// collapsing them sends an agent to hunt a machine pin that was never
+    /// what refused it.
+    #[test]
+    fn with_no_workspace_the_tiers_are_not_evaluated_never_no_declaration() {
+        // No workspace → the tiers are not read, and `admit` is never called.
+        let v = workspace_declaration_view(None, None, |_| {
+            panic!("admission must not be reached when no workspace was supplied")
+        });
+        assert!(!v.evaluated, "not evaluated is the whole point");
+        assert_eq!(v.status, "not-evaluated");
+        assert_eq!(v.workspace, None);
+        assert_eq!(v.tier, None);
+        assert_eq!(v.declared_tenant, None);
+        assert_eq!(v.admitted, None, "admission was never reached");
+        assert!(
+            v.detail.contains("NOT EVALUATED") && v.detail.contains("UNKNOWN"),
+            "the detail must SAY unknown: {}",
+            v.detail
+        );
+        assert!(
+            v.detail.contains("workdir") && v.detail.contains("nonce"),
+            "and must say how to get a real answer: {}",
+            v.detail
+        );
+        // The failure this test exists to prevent, spelled out: the
+        // NOT-EVALUATED detail must not contain the sentence the ABSENT arm
+        // uses.
+        assert!(
+            !v.detail.contains("no tier declared a tenant"),
+            "UNKNOWN must not borrow the ABSENT wording: {}",
+            v.detail
+        );
+
+        // A workspace that genuinely declares nothing is a DIFFERENT answer.
+        let absent = workspace_declaration_view(
+            Some("D:/portofino-pizzeria"),
+            Some(WorkspaceDeclaration::Absent),
+            |_| panic!("admission must not be reached when nothing is declared"),
+        );
+        assert!(absent.evaluated);
+        assert_eq!(absent.status, "absent");
+        assert_ne!(
+            absent.status, v.status,
+            "\"not asked\" and \"asked, said nothing\" must be distinguishable tokens"
+        );
+        assert!(absent.detail.contains("Absence is not a fault"));
+
+        // And the process-level door, end to end over the real store on this
+        // box: no workspace in, NOT EVALUATED out.
+        let _amb = crate::test_env::isolated_ambient();
+        let r = report();
+        let wd = &r["credential"]["workspace_declaration"];
+        assert_eq!(wd["evaluated"], serde_json::json!(false));
+        assert_eq!(wd["status"], serde_json::json!("not-evaluated"));
+        assert!(
+            wd["detail"]
+                .as_str()
+                .expect("detail")
+                .contains("NOT EVALUATED"),
+            "the live door must say it did not evaluate: {wd}"
+        );
+    }
+
+    /// A refused declaration reports the SAME stable code the spawn path
+    /// answers with, and carries the SAME heal. An agent reading this door and
+    /// an agent reading a spawn refusal must learn the same thing — that is the
+    /// whole reason D5 forbade inventing a parallel vocabulary.
+    #[test]
+    fn a_refused_declaration_uses_the_spawn_code_family_and_carries_the_hint() {
+        let source = TenantDeclarationSource::ConfigYml {
+            path: std::path::PathBuf::from("D:/portofino-pizzeria/.qontinui/config.yml"),
+        };
+
+        // Unbound — the tenant is simply not paired on this box.
+        let v = workspace_declaration_view(
+            Some("D:/portofino-pizzeria"),
+            Some(WorkspaceDeclaration::Declared {
+                tenant: tenant(),
+                source: source.clone(),
+            }),
+            |t| Err(SpawnTenantRefusal::NotPaired { tenant: t }),
+        );
+        assert_eq!(v.status, "refused-unbound");
+        assert_eq!(v.admitted, Some(false));
+        assert_eq!(v.refusal_code, Some("terminal:tenant_not_paired"));
+        assert!(
+            v.detail.contains("terminal:tenant_not_paired"),
+            "the body carries the code too: {}",
+            v.detail
+        );
+        assert!(
+            v.detail.contains(SPAWN_TENANT_PAIRING_HINT),
+            "the body carries the heal verbatim: {}",
+            v.detail
+        );
+        assert!(
+            v.detail
+                .contains("qontinui_profile device pair --tenant-id"),
+            "and the heal is the pairing CLI: {}",
+            v.detail
+        );
+        assert!(
+            v.detail.contains(&tenant().to_string()),
+            "and names the tenant that was refused: {}",
+            v.detail
+        );
+
+        // Store unreadable — a DIFFERENT code, because it has a different
+        // heal: an operator sent to pair an already-paired tenant is sent
+        // wrong.
+        let v = workspace_declaration_view(
+            Some("D:/portofino-pizzeria"),
+            Some(WorkspaceDeclaration::Declared {
+                tenant: tenant(),
+                source: source.clone(),
+            }),
+            |t| {
+                Err(SpawnTenantRefusal::CredentialStoreUnreadable {
+                    tenant: t,
+                    error: "keyring locked".to_string(),
+                })
+            },
+        );
+        assert_eq!(
+            v.refusal_code,
+            Some("terminal:tenant_credential_store_unreadable")
+        );
+        assert!(v
+            .detail
+            .contains("terminal:tenant_credential_store_unreadable"));
+        assert!(v.detail.contains(SPAWN_TENANT_PAIRING_HINT), "{}", v.detail);
+        assert!(v.detail.contains("UNKNOWN"), "{}", v.detail);
+
+        // A declaration that is present and unreadable as a tenant — the one
+        // NEW code, and it is in the same `terminal:tenant_*` family.
+        let v = workspace_declaration_view(
+            Some("D:/portofino-pizzeria"),
+            Some(WorkspaceDeclaration::Unusable {
+                source: source.clone(),
+                detail: "`pizzeria` is not a tenant uuid".to_string(),
+            }),
+            |_| panic!("admission must not be reached for an unreadable declaration"),
+        );
+        assert_eq!(v.status, "refused-unusable");
+        assert_eq!(v.refusal_code, Some("terminal:tenant_declaration_unusable"));
+        assert_eq!(v.refusal_code, Some(DECLARATION_UNUSABLE_CODE));
+        assert!(v.detail.contains(SPAWN_TENANT_PAIRING_HINT), "{}", v.detail);
+        assert_eq!(
+            v.declared_tenant, None,
+            "there was no readable tenant to name"
+        );
+
+        // Every code this door can print is in the spawn path's family — no
+        // parallel vocabulary.
+        for code in [
+            SpawnTenantRefusal::NotPaired { tenant: tenant() }.code(),
+            SpawnTenantRefusal::CredentialStoreUnreadable {
+                tenant: tenant(),
+                error: String::new(),
+            }
+            .code(),
+            DECLARATION_UNUSABLE_CODE,
+        ] {
+            assert!(
+                code.starts_with("terminal:tenant_"),
+                "{code} is outside the stable family"
+            );
+        }
+    }
+
+    // =======================================================================
+    // Route-around review of runner#1703 (plan
+    // `2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin`,
+    // "Review findings from the route-around"): one regression test per MAJOR.
+    // =======================================================================
+
+    fn config_yml_source() -> crate::session::workspace_tenant::TenantDeclarationSource {
+        crate::session::workspace_tenant::TenantDeclarationSource::ConfigYml {
+            path: std::path::PathBuf::from("/repo/.qontinui/config.yml"),
+        }
+    }
+
+    /// MAJOR-1 — a SESSION report applies the session's frozen binding pin
+    /// (row 1), exactly as the proxy does. The workspace below would refuse a
+    /// NEW session, but this session was minted pinned to `t`, so the proxy
+    /// serves it — and the doctor must say so rather than report `refuses`.
+    #[test]
+    fn a_session_report_applies_the_binding_pin_the_proxy_applies() {
+        let _amb = crate::test_env::isolated_ambient();
+        std::env::remove_var(crate::session::workspace_tenant::SESSION_TENANT_ENV);
+        let dir = std::env::temp_dir().join(format!("p5-doctor-pin-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(dir.join(".qontinui")).expect("mkdir");
+        std::fs::write(
+            dir.join(".qontinui").join("config.yml"),
+            "version: 1\ntenant: not-a-uuid\n",
+        )
+        .expect("write");
+        let wd = dir.to_string_lossy().to_string();
+        let t = uuid::Uuid::new_v4();
+        // Persistent, like a runner-spawned session's key: an EPHEMERAL one is
+        // live only beside a session-identity marker this fixture lacks.
+        let nonce = register_proxy_nonce(&wd, None, Some(t));
+
+        // The data plane: row 1 wins, the declaration is never consulted.
+        assert_eq!(
+            session_tenant_decision(Some(&nonce)).into_result(),
+            Ok(Some(t))
+        );
+
+        let r = report_for(DoctorScope::Session(&nonce));
+        assert_ne!(r["verdict"], serde_json::json!("refuses"), "{r}");
+        assert_eq!(
+            r["credential"]["tenant_source"],
+            serde_json::json!("session-binding-pin")
+        );
+        assert_eq!(r["credential"]["tenant"], serde_json::json!(t.to_string()));
+        assert_eq!(
+            r["credential"]["workspace_declaration"]["outranked_by_binding_pin"],
+            serde_json::json!(true)
+        );
+        assert_eq!(r["session"]["workspace_resolved"], serde_json::json!(true));
+        assert!(
+            !r.to_string().contains(&nonce),
+            "the report never echoes the nonce"
+        );
+
+        // A NEW session opened in the same directory has no pin and IS refused.
+        let fresh = report_for(DoctorScope::Workdir(&wd));
+        assert_eq!(fresh["verdict"], serde_json::json!("refuses"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Round-3 review — an AGENT nonce is answered about the agent's own token,
+    /// never with a device-credential verdict the proxy would not use for it.
+    #[test]
+    fn an_agent_session_nonce_is_answered_about_its_own_token() {
+        let _amb = crate::test_env::isolated_ambient();
+        let wd = std::env::temp_dir().join(format!("p5-doctor-agent-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&wd).expect("mkdir");
+        let nonce = register_agent_proxy_nonce(&wd.to_string_lossy(), uuid::Uuid::new_v4());
+        assert!(matches!(
+            proxy_principal_for_nonce(&nonce),
+            Some(ProxyPrincipal::Agent { .. })
+        ));
+        // No token slot registered: the proxy 401s this session as AGENT_GONE.
+        let r = report_for(DoctorScope::Session(&nonce));
+        assert_eq!(r["verdict"], serde_json::json!("refuses"));
+        assert_eq!(r["session"]["principal"], serde_json::json!("agent"));
+        assert_eq!(r["session"]["agent_token_live"], serde_json::json!(false));
+        assert!(
+            r.get("credential").is_none(),
+            "no device credential described: {r}"
+        );
+        assert!(!r.to_string().contains(&nonce));
+        let _ = std::fs::remove_dir_all(&wd);
+
+        // A live slot: its refresh health decides, not its mere presence.
+        use crate::agent_token::TokenState;
+        assert_eq!(
+            agent_nonce_report(Some(TokenState::Healthy))["verdict"],
+            serde_json::json!("ok")
+        );
+        assert_eq!(
+            agent_nonce_report(Some(TokenState::Degraded))["verdict"],
+            serde_json::json!("degraded")
+        );
+        assert_eq!(
+            agent_nonce_report(Some(TokenState::Rejected))["verdict"],
+            serde_json::json!("refuses")
+        );
+    }
+
+    /// Round-3 review — the other half of the binding-pin test: a session with
+    /// NO binding pin, in a workspace whose declaration refuses, is refused by
+    /// the proxy, and the doctor says so.
+    #[test]
+    fn an_unpinned_session_in_a_refusing_workspace_is_refused_like_the_proxy() {
+        let _amb = crate::test_env::isolated_ambient();
+        std::env::remove_var(crate::session::workspace_tenant::SESSION_TENANT_ENV);
+        let dir = std::env::temp_dir().join(format!("p5-doctor-unpinned-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(dir.join(".qontinui")).expect("mkdir");
+        std::fs::write(
+            dir.join(".qontinui").join("config.yml"),
+            "version: 1\ntenant: not-a-uuid\n",
+        )
+        .expect("write");
+        let nonce = register_proxy_nonce(&dir.to_string_lossy(), None, None);
+        assert!(!matches!(
+            proxy_session_pin_for_nonce(&nonce),
+            crate::session::tenant_pin::TenantPin::Pinned(_)
+        ));
+        assert!(session_tenant_or_refuse(Some(&nonce)).is_err());
+        let r = report_for(DoctorScope::Session(&nonce));
+        assert_eq!(r["verdict"], serde_json::json!("refuses"));
+        assert_eq!(
+            r["credential"]["tenant_source"],
+            serde_json::json!("workspace-declaration-refused:config-yml")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Round-2 review — a presented nonce the proxy does not recognise is
+    /// answered as the proxy answers it (a runner-nonce refusal), never with
+    /// the machine-level decision a dead key would otherwise inherit.
+    #[test]
+    fn an_unrecognised_session_nonce_is_refused_like_the_proxy_refuses_it() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dead = "00000000000000000000000000000000deadbeefdeadbeefdeadbeefdeadbeef";
+        assert!(!proxy_nonce_is_valid(dead));
+        let r = report_for(DoctorScope::Session(dead));
+        assert_eq!(r["verdict"], serde_json::json!("refuses"));
+        assert_eq!(
+            r["layer"],
+            serde_json::json!(ProxyFailureLayer::RunnerNonce.as_str())
+        );
+        assert_eq!(r["session"]["nonce_recognised"], serde_json::json!(false));
+        assert!(
+            r.get("credential").is_none(),
+            "no tenant or slot is described: {r}"
+        );
+        assert!(!r.to_string().contains(dead));
+    }
+
+    /// MAJOR-2 — the verdict is computed from the tenant the decision SELECTED,
+    /// never from the raw machine pin. An admitted declaration beside an
+    /// UNRESOLVABLE machine pin is served by the proxy (rows 1a-1c outrank row
+    /// 2), so the doctor must not answer `refuses … repair machine.json`.
+    #[test]
+    fn an_admitted_declaration_beside_an_unresolvable_machine_pin_is_served() {
+        let t = uuid::Uuid::new_v4();
+        let decision = decide_session_tenant(
+            TenantPin::Unpinned,
+            || crate::session::workspace_tenant::WorkspaceDeclaration::Declared {
+                tenant: t,
+                source: config_yml_source(),
+            },
+            TenantPin::Unresolvable,
+            || panic!("row 4 must never be reached when a declaration was admitted"),
+            |_| Ok(()),
+        );
+        let rv = resolution_view(&decision);
+        assert_eq!(rv.tenant, Some(t));
+        assert_eq!(rv.source, "workspace-declaration:config-yml");
+        assert_eq!(rv.refusal, None);
+        let (verdict, _, detail) = verdict_for(
+            &Some(SlotDescriptor::describe(Some(&live_jwt()))),
+            &SlotDescriptor::describe(None),
+            false,
+            rv.refusal.as_deref(),
+        );
+        assert_eq!(verdict, "ok", "{detail}");
+        assert!(!detail.contains("machine.json"));
+
+        // And an unresolvable pin that coord's JWT claim resolves is served
+        // too — the proxy's row 4 — not reported as a refusal.
+        let claimed = resolution_view(&SessionTenantDecision::JwtClaim(t));
+        assert_eq!(claimed.refusal, None);
+        assert_eq!(claimed.tenant, Some(t));
+    }
+
+    /// MAJOR-3 — a refused declaration reports ITS source, not the machine
+    /// pin's, and names no tenant (none is selected).
+    #[test]
+    fn a_refused_declaration_reports_its_own_tenant_source() {
+        let t = uuid::Uuid::new_v4();
+        let unbound = resolution_view(&SessionTenantDecision::DeclaredTenantUnbound {
+            tenant: t,
+            source: config_yml_source(),
+            refusal: SpawnTenantRefusal::NotPaired { tenant: t },
+        });
+        assert_eq!(unbound.tenant, None);
+        assert_eq!(unbound.source, "workspace-declaration-refused:config-yml");
+        assert!(unbound.declaration_refusal);
+        assert!(unbound
+            .refusal
+            .as_deref()
+            .expect("a refusal body")
+            .starts_with("terminal:tenant_not_paired"));
+
+        let unusable = resolution_view(&SessionTenantDecision::DeclaredTenantUnusable {
+            source: crate::session::workspace_tenant::TenantDeclarationSource::Env,
+            detail: "not a uuid".into(),
+        });
+        assert_eq!(unusable.source, "workspace-declaration-refused:env");
+        assert!(unusable
+            .refusal
+            .as_deref()
+            .expect("a refusal body")
+            .starts_with(DECLARATION_UNUSABLE_CODE));
+    }
+
+    /// A refused declaration is TERMINAL on the proxy path, so the door must
+    /// not describe a bearer that will never be sent — least of all the
+    /// DEFAULT slot's, which is the cross-tenant misread this plan exists to
+    /// prevent. And its `next_door` must not be the generic runner-nonce
+    /// advice: a new session reads the same declaration and is refused again.
+    #[test]
+    fn a_refused_declaration_reports_no_credential_and_its_own_next_door() {
+        let _amb = crate::test_env::isolated_ambient();
+        // Tier 1 outranks tier 2, and `QONTINUI_TENANT_ID` is an
+        // `AMBIENT_ENV_KEYS` member the fixture RESTORES but does not clear —
+        // so a developer box that exports it would make this test assert about
+        // the env instead of about the `config.yml` under test. The fixture
+        // holds the env lock and captured the old value, so removing it here
+        // is scoped to this test and restored on drop.
+        std::env::remove_var(crate::session::workspace_tenant::SESSION_TENANT_ENV);
+        let dir = std::env::temp_dir().join(format!("p5-doctor-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(dir.join(".qontinui")).expect("mkdir");
+        // A `tenant:` key that is present and is not a uuid — `Unusable`,
+        // which refuses without needing any credential store at all.
+        std::fs::write(
+            dir.join(".qontinui").join("config.yml"),
+            "version: 1\ntenant: not-a-uuid\nmerge:\n  strategy: squash\n",
+        )
+        .expect("write");
+
+        let r = report_for_workspace(Some(&dir.to_string_lossy()));
+        let wd = &r["credential"]["workspace_declaration"];
+        assert_eq!(wd["evaluated"], serde_json::json!(true));
+        assert_eq!(wd["status"], serde_json::json!("refused-unusable"));
+        assert_eq!(wd["tier"], serde_json::json!("config-yml"));
+        assert!(
+            wd["matched_on"]
+                .as_str()
+                .expect("matched_on")
+                .contains("config.yml"),
+            "the file that decided is named: {wd}"
+        );
+        assert_eq!(
+            wd["refusal_code"],
+            serde_json::json!("terminal:tenant_declaration_unusable")
+        );
+        assert_eq!(r["verdict"], serde_json::json!("refuses"));
+        assert_eq!(
+            r["credential"]["tenant_source"],
+            serde_json::json!("workspace-declaration-refused:config-yml"),
+            "a refused session reports the declaration that refused it, not the machine pin"
+        );
+        assert_eq!(r["credential"]["tenant"], serde_json::Value::Null);
+        assert!(
+            r["detail"]
+                .as_str()
+                .expect("detail")
+                .contains(SPAWN_TENANT_PAIRING_HINT),
+            "the top-level detail carries the heal: {}",
+            r["detail"]
+        );
+        assert_eq!(
+            r["credential"]["selected"],
+            serde_json::Value::Null,
+            "a refused session gets NO bearer — describing one would describe the default \
+             slot's, which is the wrong-tenant reading this plan exists to prevent"
+        );
+        assert_eq!(
+            r["next_door"],
+            serde_json::json!(DECLARATION_REFUSAL_NEXT_DOOR)
+        );
+        assert!(
+            r["next_door"]
+                .as_str()
+                .expect("next_door")
+                .contains("will NOT help"),
+            "a new session is explicitly ruled out: {}",
+            r["next_door"]
+        );
+
+        // A workspace that declares nothing leaves the pre-Phase-5 behaviour
+        // exactly as it was: no declaration refusal, and the verdict comes
+        // from the machine pin / credential ladder as before. (The fixture's
+        // pin and store decide WHICH verdict that is, so this asserts the
+        // declaration arm did not fire rather than pinning a verdict the
+        // fixture owns.)
+        let quiet = std::env::temp_dir().join(format!("p5-doctor-quiet-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&quiet).expect("mkdir");
+        let r = report_for_workspace(Some(&quiet.to_string_lossy()));
+        assert_eq!(
+            r["credential"]["workspace_declaration"]["status"],
+            serde_json::json!("absent")
+        );
+        assert_eq!(
+            r["credential"]["workspace_declaration"]["refusal_code"],
+            serde_json::Value::Null,
+            "an absent declaration is not a refusal"
+        );
+        assert_ne!(
+            r["next_door"],
+            serde_json::json!(DECLARATION_REFUSAL_NEXT_DOOR),
+            "an absent declaration must not borrow the declaration-refusal door"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&quiet);
+    }
+
+    /// **The runbook half of Phase 5's gate.** A refused agent's first move is
+    /// to read the README; a README that does not name the three tiers and the
+    /// doctor door sends it to ask a human instead, which is the cost this
+    /// plan exists to remove.
+    ///
+    /// Asserted rather than trusted for the same reason the `next_door`
+    /// pointer is asserted above: an advertised recovery lever that the docs
+    /// do not actually describe is the `planning-and-scope`
+    /// `finish-to-zero-includes-the-defect-underneath` defect class.
+    ///
+    /// Keyed on the exact SPELLINGS an operator has to type — the env var, the
+    /// two filenames, the route, and the pairing CLI — because a section that
+    /// paraphrases them is a section that cannot be followed.
+    #[test]
+    fn the_readme_documents_the_three_tiers_and_the_doctor_door() {
+        let readme = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("src-tauri's parent is the repo root")
+            .join("README.md");
+        let text = std::fs::read_to_string(&readme)
+            .unwrap_or_else(|e| panic!("README.md must be readable at {readme:?}: {e}"));
+
+        for needle in [
+            // The three tiers, in their exact spellings.
+            "$QONTINUI_TENANT_ID",
+            ".qontinui/config.yml",
+            "tenant:",
+            "~/.qontinui/tenant-map.json",
+            "longest-matching path prefix",
+            // The door, with the exact curl an operator can paste.
+            "/coord-mcp/doctor",
+            "curl -s http://127.0.0.1:9876/coord-mcp/doctor",
+            // The session form carries the nonce in a HEADER read from the
+            // session's own .mcp.json, never in the URL or on argv.
+            "Authorization",
+            ".mcp.json",
+            "-H @-",
+            // The UNKNOWN/absent asymmetry, said in the docs and not only in
+            // the payload.
+            "not-evaluated",
+            "UNKNOWN",
+            // The two fail-closed rules.
+            "may only SELECT",
+            "never creates one",
+            // The heal.
+            "qontinui_profile device pair --tenant-id",
+            // Row 1 outranks the env var — the thing most likely to be
+            // assumed the other way round.
+            "included",
+            // Tier 1's real blast radius.
+            "serves *every*",
+        ] {
+            assert!(
+                text.contains(needle),
+                "README.md must document `{needle}` — a refused agent reads this before it \
+                 reads any code"
+            );
+        }
+
+        // MAJOR-4: the nonce is a credential; no recipe may put it in a URL,
+        // and the recipe must not name a key file nothing writes.
+        assert!(
+            !text.contains("?nonce="),
+            "README.md must never show a session nonce in a URL query"
+        );
+        assert!(
+            !text.contains("live-proxy-key"),
+            "README.md must not name ~/.qontinui/live-proxy-key, which nothing writes"
+        );
+
+        // Every stable refusal code is documented, so an agent that greps its
+        // error string lands in the runbook.
+        for code in [
+            "terminal:tenant_not_paired",
+            "terminal:tenant_credential_store_unreadable",
+            "terminal:tenant_workdir_declares_other_tenant",
+            DECLARATION_UNUSABLE_CODE,
+        ] {
+            assert!(
+                text.contains(code),
+                "README.md must name the refusal code `{code}`"
+            );
+        }
     }
 }
 
