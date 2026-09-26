@@ -712,7 +712,9 @@ pub(crate) enum CacheAction {
     Keep,
 }
 
-/// Resolve the command set to provision: fresh fetch → disk cache → embedded
+/// Resolve the command set to provision: fresh fetch → disk cache for the
+/// account layer, then the canonical rung's last loaded snapshot
+/// ([`crate::canonical_corpus::latest`], a memory read), then the embedded
 /// defaults.
 ///
 /// Never fails and never panics. Every layer degrades to the next one; the

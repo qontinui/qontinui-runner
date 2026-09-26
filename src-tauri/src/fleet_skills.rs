@@ -87,7 +87,9 @@
 //! reason no such layer existed before.
 //!
 //! So skills now resolve the same three rungs the commands do —
-//! `fresh fetch → disk cache → embedded default`, in [`crate::agent_skills`] —
+//! `fresh fetch → disk cache → embedded default`, in [`crate::agent_skills`]
+//! (with the canonical rung slotted in above the embedded default at
+//! provisioning time — see "The canonical rung" above) —
 //! and this embedded tree is the **offline floor** rather than the only copy a
 //! session can read. That is what ends the re-vendor treadmill: a drifted
 //! bundle degrades a served device to stale-by-one-fetch instead of being the

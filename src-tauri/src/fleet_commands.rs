@@ -45,7 +45,9 @@
 //!
 //! What is embedded here is the **default**. A signed-in account may override
 //! any command by name, and `crate::agent_commands` resolves
-//! `fresh fetch → disk cache → embedded default` before anything is written.
+//! `account override (fresh fetch, else disk cache) → canonical
+//! qontinui-claude-config@origin/main (crate::canonical_corpus) → embedded
+//! default` before anything is written.
 //! Because the default is compiled in, an unauthenticated, offline, or
 //! first-run device still gets a working command set and the network is never
 //! on the critical path.
