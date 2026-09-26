@@ -2358,8 +2358,14 @@ impl TerminalSession {
         // pane) names a key THIS runner never minted and would silently shadow
         // the workdir default with a 401. Only the identity seam, downstream,
         // sets them — for this terminal's own key.
-        cmd.env_remove(crate::coord_mcp::QONTINUI_COORD_MCP_NONCE_ENV);
-        cmd.env_remove(crate::coord_mcp::QONTINUI_COORD_MCP_CREDENTIAL_ENV);
+        // Every workdir-keyed name (`QONTINUI_COORD_MCP_NONCE_<K>` /
+        // `QONTINUI_COORD_MCP_CREDENTIAL_<K>`) is matched by shape.
+        let inherited = crate::coord_mcp_config::terminal_key_env_names(
+            cmd.iter_full_env_as_str().map(|(k, _)| k),
+        );
+        for name in inherited {
+            cmd.env_remove(name);
+        }
 
         // Set TERM for proper color/capability support.
         // xterm.js is a full xterm-compatible terminal, so use xterm-256color on all
@@ -3201,13 +3207,12 @@ impl TerminalSession {
             // `2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages`).
             // The nonce value is never logged — only its short prefix, the same
             // one the rotation log carries.
+            // The names are keyed to THIS spawn cwd, so a `claude` launched after
+            // a `cd` into another worktree reads that worktree's own default.
             if let Some(key) = &delivered.terminal_key {
-                cmd.env(crate::coord_mcp::QONTINUI_COORD_MCP_NONCE_ENV, &key.nonce);
+                cmd.env(&key.nonce_env, &key.nonce);
                 if let Some(credential) = &key.credential {
-                    cmd.env(
-                        crate::coord_mcp::QONTINUI_COORD_MCP_CREDENTIAL_ENV,
-                        credential.to_string_lossy().as_ref(),
-                    );
+                    cmd.env(&key.credential_env, credential.to_string_lossy().as_ref());
                 }
                 info!(
                     terminal_id = %terminal_id,
@@ -4347,6 +4352,16 @@ impl TerminalSession {
     fn close_inner(&self, deadline: Option<std::time::Instant>, kill_child: bool) {
         info!(terminal_id = %self.id, "Closing terminal session");
         self.is_alive.store(false, Ordering::Relaxed);
+
+        // Revoke the terminal-bound coord-mcp key the identity seam minted for
+        // an env-referenced declared cwd, and delete its credential file (plan
+        // `2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages`).
+        // Interactive close only: one revoke re-encrypts the whole nonce store,
+        // so the deadline-bound shutdown path (`TerminalManager::close_all`)
+        // releases every tracked key in ONE write after its loop instead.
+        if deadline.is_none() {
+            crate::coord_mcp::release_terminal_bound_key(&self.id);
+        }
 
         // Phase 2 — drop the isolated edit context first so the
         // claim-release fire-and-forget posts ahead of the PTY teardown

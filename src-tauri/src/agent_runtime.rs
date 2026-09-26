@@ -8546,8 +8546,16 @@ pub(crate) fn finalize_headless_child_env(
     // A headless child is never handed a terminal-bound coord-mcp key, so an
     // in-cwd env-referenced `.mcp.json` must resolve to its workdir default —
     // not to a key inherited from whatever launched the runner.
-    cmd.env_remove(crate::coord_mcp::QONTINUI_COORD_MCP_NONCE_ENV);
-    cmd.env_remove(crate::coord_mcp::QONTINUI_COORD_MCP_CREDENTIAL_ENV);
+    // Matched by shape against the RUNNER's own environment (what a
+    // `tokio::process::Command` inherits); the boot strip in `main` already
+    // cleared it, so this is the per-site backstop.
+    for (name, _) in std::env::vars_os() {
+        if let Some(name) = name.to_str() {
+            if crate::coord_mcp_config::is_terminal_key_env_name(name) {
+                cmd.env_remove(name);
+            }
+        }
+    }
     cmd.env(
         "QONTINUI_RUNNER_CONTEXT",
         crate::terminal::runner_context(runner_api_port, coord_mcp),

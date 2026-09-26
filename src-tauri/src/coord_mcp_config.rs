@@ -143,10 +143,11 @@ pub fn proxy_nonce_from_header_object(headers: &serde_json::Value) -> Option<Str
         .map(str::to_owned)
 }
 
-/// The per-PROCESS environment variable a terminal's session reads its OWN
-/// coord-mcp proxy nonce from (plan
+/// PREFIX of the per-process environment variable a terminal's session reads
+/// its OWN coord-mcp proxy nonce from (plan
 /// `2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages`,
-/// Phase 2).
+/// Phase 2). The full name is workdir-keyed —
+/// `QONTINUI_COORD_MCP_NONCE_<K>`, see [`terminal_nonce_env_name`].
 ///
 /// ## Why an environment reference, and why it ALWAYS carries a default
 ///
@@ -154,25 +155,121 @@ pub fn proxy_nonce_from_header_object(headers: &serde_json::Value) -> Option<Str
 /// cwd, so the nonce written into it cannot name a terminal — and the runner's
 /// deterministic caller self-id leg (`nonce → terminal_id → lifecycle record →
 /// claude_session_id`) needs one. The in-cwd DEVICE document therefore spells
-/// its credential as `${QONTINUI_COORD_MCP_NONCE:-<workdir nonce>}`: the MCP
-/// client (measured on Claude Code 2.1.283, for both `--mcp-config` and a
-/// project `.mcp.json`) expands `${VAR}` and `${VAR:-default}` in http `headers`
-/// values and in stdio `args`, so a terminal the runner spawned — which exports
-/// a terminal-bound nonce under this name into its PTY — presents THAT, while
-/// every other session in the cwd (a hand-launched `claude`, a peer's shell)
-/// falls back to the workdir nonce exactly as before.
+/// its credential as `${QONTINUI_COORD_MCP_NONCE_<K>:-<workdir nonce>}`, so a
+/// terminal the runner spawned — which exports a terminal-bound nonce under
+/// that name into its PTY — presents THAT, while every other session in the cwd
+/// (a hand-launched `claude`, a peer's shell) falls back to the workdir nonce
+/// exactly as before.
 ///
-/// The default is load-bearing, not decorative: with the variable unset and
-/// NO default the client sends the literal text `${VAR}` rather than failing,
-/// which would 401 every session the runner did not spawn. Every reference the
-/// runner writes carries `:-<default>`.
+/// **The client behaviour this rests on was measured, not assumed:** measured
+/// 2026-09-26 on Claude Code 2.1.283 (plan
+/// `2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages`
+/// Phase 1): `${VAR:-d}` expands in http headers and stdio args via both
+/// `--mcp-config` and a project `.mcp.json`; an unset `${VAR}` with no default
+/// is sent literally.
+///
+/// The default is therefore load-bearing, not decorative: with the variable
+/// unset and NO default the client sends the literal text `${VAR}` rather than
+/// failing, which would 401 every session the runner did not spawn. Every
+/// reference the runner writes carries `:-<default>`.
+///
+/// ## Why the name is workdir-keyed
+///
+/// Environment is inherited. A session that `cd`s into ANOTHER worktree (a
+/// different tenant's, or one served by another runner's port) and launches
+/// `claude` there would otherwise present its spawn terminal's key to a
+/// document that names a different workdir — a tenant crossing, or a 401 on a
+/// foreign port. With `<K>` derived from the workdir the reference names, that
+/// other document references a variable this terminal never set, and falls to
+/// its own default.
 pub const QONTINUI_COORD_MCP_NONCE_ENV: &str = "QONTINUI_COORD_MCP_NONCE";
 
-/// The stdio twin of [`QONTINUI_COORD_MCP_NONCE_ENV`]: the per-process path of
-/// the runner-owned credential file the fleet shim should read, referenced from
-/// the in-cwd stdio document's `--credential` argument as
-/// `${QONTINUI_COORD_MCP_CREDENTIAL:-<workdir credential file>}`.
+/// The stdio twin PREFIX of [`QONTINUI_COORD_MCP_NONCE_ENV`]: the per-process
+/// path of the runner-owned credential file the fleet shim should read,
+/// referenced from the in-cwd stdio document's `--credential` argument as
+/// `${QONTINUI_COORD_MCP_CREDENTIAL_<K>:-<workdir credential file>}`.
 pub const QONTINUI_COORD_MCP_CREDENTIAL_ENV: &str = "QONTINUI_COORD_MCP_CREDENTIAL";
+
+/// Hex digits of the workdir key in a terminal env name.
+const TERMINAL_ENV_KEY_LEN: usize = 16;
+
+/// The workdir as hashed into credential file names AND terminal env names.
+/// Spelling-insensitive: separators unified, trailing separators dropped (a
+/// bare root keeps its one), and case-folded on the case-insensitive
+/// filesystem — so the writer (called with `primary_wt`) and the identity seam
+/// (called with the terminal's `cwd`) derive the same key for one directory.
+pub fn credential_workdir_key(workdir: &str) -> String {
+    let mut k = workdir.trim().replace('\\', "/");
+    while k.len() > 1 && k.ends_with('/') && !k.ends_with(":/") {
+        k.pop();
+    }
+    if cfg!(windows) {
+        k = k.to_lowercase();
+    }
+    k
+}
+
+/// `<K>`: the first 16 hex digits, UPPERCASE, of
+/// `sha256(credential_workdir_key(workdir))`. Uppercase so the full name is a
+/// conventional shell identifier.
+fn terminal_env_key(workdir: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    let digest = hex::encode_upper(Sha256::digest(credential_workdir_key(workdir).as_bytes()));
+    digest.chars().take(TERMINAL_ENV_KEY_LEN).collect()
+}
+
+/// The workdir-keyed nonce variable name, `QONTINUI_COORD_MCP_NONCE_<K>` —
+/// THE one derivation both the in-cwd writer and the identity seam use.
+pub fn terminal_nonce_env_name(workdir: &str) -> String {
+    format!(
+        "{QONTINUI_COORD_MCP_NONCE_ENV}_{}",
+        terminal_env_key(workdir)
+    )
+}
+
+/// The workdir-keyed credential-file variable name,
+/// `QONTINUI_COORD_MCP_CREDENTIAL_<K>`.
+pub fn terminal_credential_env_name(workdir: &str) -> String {
+    format!(
+        "{QONTINUI_COORD_MCP_CREDENTIAL_ENV}_{}",
+        terminal_env_key(workdir)
+    )
+}
+
+/// True iff `name` is a terminal key variable of EITHER kind for ANY workdir:
+/// one of the two prefixes, `_`, then exactly 16 uppercase hex digits. The
+/// shape every strip (the runner's own env at boot, the PTY and headless child
+/// seams, the shim's nested-`claude` pass-through) matches on.
+pub fn is_terminal_key_env_name(name: &str) -> bool {
+    [
+        QONTINUI_COORD_MCP_NONCE_ENV,
+        QONTINUI_COORD_MCP_CREDENTIAL_ENV,
+    ]
+    .iter()
+    .any(|prefix| {
+        name.strip_prefix(prefix)
+            .and_then(|rest| rest.strip_prefix('_'))
+            .is_some_and(|k| {
+                k.len() == TERMINAL_ENV_KEY_LEN
+                    && k.bytes()
+                        .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b))
+            })
+    })
+}
+
+/// Every terminal key variable name among `names` — for a caller that strips
+/// them from an environment it enumerates.
+pub fn terminal_key_env_names<I, S>(names: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    names
+        .into_iter()
+        .filter(|n| is_terminal_key_env_name(n.as_ref()))
+        .map(|n| n.as_ref().to_owned())
+        .collect()
+}
 
 /// The result of resolving every `${NAME:-default}` reference in a string to
 /// its DEFAULT arm — what the MCP client sends when `NAME` is unset.
@@ -198,7 +295,9 @@ struct EnvRef<'a> {
 ///
 /// Grammar, matching the client's expansion: `NAME` is a non-empty run of
 /// ASCII alphanumerics and `_`; the default runs to the first `}` and may be
-/// empty. Anything else — an unterminated `${`, an empty or invalid name, a
+/// empty. **Limit:** a default that itself contains `}` ends early at that
+/// brace — the runner never writes one (a hex nonce, an absolute file path under
+/// `~/.qontinui`), so this is a stated boundary rather than a live case. Anything else — an unterminated `${`, an empty or invalid name, a
 /// `:` not followed by `-` — is not a reference and stays literal text.
 fn parse_env_refs(s: &str) -> Vec<EnvRef<'_>> {
     let mut out = Vec::new();
@@ -277,22 +376,39 @@ pub fn env_ref_names(s: &str) -> Vec<&str> {
 }
 
 /// True iff the RAW `coord-mcp` entry (not the effective one — the credential
-/// file stays literal) references [`QONTINUI_COORD_MCP_NONCE_ENV`] in a
-/// `headers` value or [`QONTINUI_COORD_MCP_CREDENTIAL_ENV`] in `args`.
+/// file stays literal) references a terminal key variable
+/// ([`is_terminal_key_env_name`]) for ANY workdir, in a `headers` value or in
+/// `args`.
 ///
 /// That is the runner's own in-cwd DEVICE document and nothing else: the agent
 /// writer, the per-terminal `--mcp-config` and the `provision-session` route all
 /// emit literal credentials, and a hand-written or foreign document does not
-/// name these variables. The identity seam keys the terminal-bound mint on it.
+/// name these variables.
 pub fn config_doc_references_terminal_env(doc: &serde_json::Value) -> bool {
+    config_doc_references_terminal_env_matching(doc, is_terminal_key_env_name)
+}
+
+/// [`config_doc_references_terminal_env`] narrowed to THIS workdir's two names
+/// ([`terminal_nonce_env_name`], [`terminal_credential_env_name`]). The identity
+/// seam keys its terminal-bound mint on this: exporting `workdir`'s names into a
+/// PTY only helps a document that references those exact names, so a document
+/// copied in from another workdir (a different `<K>`) does not qualify.
+pub fn config_doc_references_terminal_env_for(doc: &serde_json::Value, workdir: &str) -> bool {
+    let (nonce, credential) = (
+        terminal_nonce_env_name(workdir),
+        terminal_credential_env_name(workdir),
+    );
+    config_doc_references_terminal_env_matching(doc, |n| n == nonce || n == credential)
+}
+
+fn config_doc_references_terminal_env_matching(
+    doc: &serde_json::Value,
+    matches: impl Fn(&str) -> bool,
+) -> bool {
     let Some(entry) = coord_mcp_entry(doc) else {
         return false;
     };
-    let names_ours = |s: &str| {
-        env_ref_names(s)
-            .into_iter()
-            .any(|n| n == QONTINUI_COORD_MCP_NONCE_ENV || n == QONTINUI_COORD_MCP_CREDENTIAL_ENV)
-    };
+    let names_ours = |s: &str| env_ref_names(s).into_iter().any(&matches);
     let in_headers = entry
         .get("headers")
         .and_then(serde_json::Value::as_object)
@@ -362,7 +478,7 @@ pub fn stdio_shim_credential_path(doc: &serde_json::Value) -> Option<std::path::
     while let Some(arg) = it.next() {
         if arg == COORD_MCP_STDIO_SHIM_CREDENTIAL_FLAG {
             // The in-cwd device document spells this argument as
-            // `${QONTINUI_COORD_MCP_CREDENTIAL:-<workdir file>}`; the runner
+            // `${QONTINUI_COORD_MCP_CREDENTIAL_<K>:-<workdir file>}`; the runner
             // reads the WORKDIR file (the default arm), never its own env.
             return it
                 .next()
@@ -395,8 +511,8 @@ pub fn stdio_shim_credential_path(doc: &serde_json::Value) -> Option<std::path::
 /// **Environment references resolve to their DEFAULT arm here** (plan
 /// `2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages`).
 /// The in-cwd device document spells its credential as
-/// `${QONTINUI_COORD_MCP_NONCE:-<workdir nonce>}` (http `headers` values) or
-/// `${QONTINUI_COORD_MCP_CREDENTIAL:-<workdir file>}` (the stdio `--credential`
+/// `${QONTINUI_COORD_MCP_NONCE_<K>:-<workdir nonce>}` (http `headers` values) or
+/// `${QONTINUI_COORD_MCP_CREDENTIAL_<K>:-<workdir file>}` (the stdio `--credential`
 /// argument). Every runner reader reasons about the WORKDIR key, so both are
 /// read as their defaults — the runner process has no terminal's variable and
 /// this function never consults its own environment. A `${NAME}` with no default
@@ -921,7 +1037,7 @@ mod tests {
     fn config_readers_resolve_env_refs_to_the_default_and_ignore_the_process_env() {
         let n = nonce();
         let doc: serde_json::Value = serde_json::from_str(&format!(
-            r#"{{"mcpServers":{{"coord-mcp":{{"type":"http","url":"http://127.0.0.1:9876/coord-mcp","headers":{{"Authorization":"Bearer ${{QONTINUI_COORD_MCP_NONCE:-{n}}}","X-Coord-Mcp-Proxy-Key":"${{QONTINUI_COORD_MCP_NONCE:-{n}}}"}}}}}}}}"#
+            r#"{{"mcpServers":{{"coord-mcp":{{"type":"http","url":"http://127.0.0.1:9876/coord-mcp","headers":{{"Authorization":"Bearer ${{QONTINUI_COORD_MCP_NONCE_0123456789ABCDEF:-{n}}}","X-Coord-Mcp-Proxy-Key":"${{QONTINUI_COORD_MCP_NONCE_0123456789ABCDEF:-{n}}}"}}}}}}}}"#
         ))
         .unwrap();
         assert!(config_doc_references_terminal_env(&doc));
@@ -967,7 +1083,10 @@ mod tests {
             ),
         )
         .unwrap();
-        let arg = format!("${{QONTINUI_COORD_MCP_CREDENTIAL:-{}}}", cred.display());
+        let arg = format!(
+            "${{QONTINUI_COORD_MCP_CREDENTIAL_0123456789ABCDEF:-{}}}",
+            cred.display()
+        );
         let doc = serde_json::json!({
             "mcpServers": {"coord-mcp": {
                 "type": "stdio",
@@ -991,5 +1110,64 @@ mod tests {
             }}
         });
         assert!(effective_coord_mcp_entry(&bare).is_none());
+    }
+
+    /// The workdir-keyed names: one derivation, spelling-insensitive, distinct
+    /// across workdirs, and recognised by the shape matcher every strip uses.
+    #[test]
+    fn terminal_env_names_are_workdir_keyed_and_spelling_insensitive() {
+        let a = terminal_nonce_env_name("/w/repo-a");
+        assert!(a.starts_with("QONTINUI_COORD_MCP_NONCE_"), "{a}");
+        assert_eq!(a.len(), "QONTINUI_COORD_MCP_NONCE_".len() + 16);
+        assert!(is_terminal_key_env_name(&a));
+        // Trailing separator and backslash spellings of ONE dir: one name.
+        assert_eq!(a, terminal_nonce_env_name("/w/repo-a/"));
+        assert_eq!(
+            terminal_nonce_env_name("C:\\w\\repo-a"),
+            terminal_nonce_env_name("C:/w/repo-a")
+        );
+        // A different workdir: a different name.
+        assert_ne!(a, terminal_nonce_env_name("/w/repo-b"));
+        let c = terminal_credential_env_name("/w/repo-a");
+        assert!(c.starts_with("QONTINUI_COORD_MCP_CREDENTIAL_"), "{c}");
+        assert!(is_terminal_key_env_name(&c));
+        assert_eq!(a.rsplit('_').next(), c.rsplit('_').next(), "same <K>");
+        // The shape matcher: prefixes alone, lowercase hex, wrong length, and
+        // unrelated names are NOT terminal key variables.
+        for not in [
+            "QONTINUI_COORD_MCP_NONCE",
+            "QONTINUI_COORD_MCP_CREDENTIAL",
+            "QONTINUI_COORD_MCP_NONCE_0123456789abcdef",
+            "QONTINUI_COORD_MCP_NONCE_0123",
+            "QONTINUI_COORD_MCP_NONCE_0123456789ABCDEFG",
+            "QONTINUI_MCP_CONFIG",
+            "PATH",
+        ] {
+            assert!(!is_terminal_key_env_name(not), "{not}");
+        }
+        assert_eq!(
+            terminal_key_env_names(["PATH", a.as_str(), c.as_str(), "HOME"]),
+            vec![a.clone(), c.clone()]
+        );
+
+        // Detection: the generic form matches any <K>; the per-workdir form
+        // matches only that workdir's names.
+        let doc = serde_json::json!({"mcpServers":{"coord-mcp":{"headers":{
+            "Authorization": format!("Bearer ${{{a}:-n}}")
+        }}}});
+        assert!(config_doc_references_terminal_env(&doc));
+        assert!(config_doc_references_terminal_env_for(&doc, "/w/repo-a"));
+        assert!(!config_doc_references_terminal_env_for(&doc, "/w/repo-b"));
+        // The bare prefix (the pre-workdir-key spelling) is not ours.
+        let bare = serde_json::json!({"mcpServers":{"coord-mcp":{"headers":{
+            "Authorization": "Bearer ${QONTINUI_COORD_MCP_NONCE:-n}"
+        }}}});
+        assert!(!config_doc_references_terminal_env(&bare));
+    }
+
+    /// Stated limit of the resolver: a default containing `}` ends early.
+    #[test]
+    fn a_default_containing_a_closing_brace_ends_early() {
+        assert_eq!(env_ref_client_default("${X:-a}b}"), "ab}");
     }
 }

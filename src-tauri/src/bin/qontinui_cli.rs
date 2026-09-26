@@ -1397,7 +1397,7 @@ fn parse_mcp_json(text: &str) -> Option<SessionMcpConfig> {
         // every workdir the runner wrote that shape into.
         //
         // Either way an env-referenced header value
-        // (`${QONTINUI_COORD_MCP_NONCE:-<workdir nonce>}`) is read as its
+        // (`${QONTINUI_COORD_MCP_NONCE_<K>:-<workdir nonce>}`) is read as its
         // DEFAULT arm — the workdir key, which is live for every session in the
         // cwd — never from this process's environment.
         let resolved: std::borrow::Cow<'_, serde_json::Value> = if name == "coord-mcp" {
@@ -1817,14 +1817,14 @@ mod tests {
     #[test]
     fn parse_mcp_json_reads_the_default_arm_of_an_env_referenced_credential() {
         let cfg = parse_mcp_json(
-            r#"{"mcpServers":{"coord-mcp":{"type":"http","url":"http://127.0.0.1:9878/coord-mcp","headers":{"Authorization":"Bearer ${QONTINUI_COORD_MCP_NONCE:-wdnonce}","X-Coord-Mcp-Proxy-Key":"${QONTINUI_COORD_MCP_NONCE:-wdnonce}"}}}}"#,
+            r#"{"mcpServers":{"coord-mcp":{"type":"http","url":"http://127.0.0.1:9878/coord-mcp","headers":{"Authorization":"Bearer ${QONTINUI_COORD_MCP_NONCE_0123456789ABCDEF:-wdnonce}","X-Coord-Mcp-Proxy-Key":"${QONTINUI_COORD_MCP_NONCE_0123456789ABCDEF:-wdnonce}"}}}}"#,
         )
         .unwrap();
         assert_eq!(cfg.nonce, "wdnonce");
         assert_eq!(cfg.port, Some(9878));
         // Legacy-header-only env-ref shape resolves too.
         let cfg = parse_mcp_json(
-            r#"{"mcpServers":{"coord-mcp":{"url":"http://127.0.0.1:9878/coord-mcp","headers":{"X-Coord-Mcp-Proxy-Key":"${QONTINUI_COORD_MCP_NONCE:-legacy}"}}}}"#,
+            r#"{"mcpServers":{"coord-mcp":{"url":"http://127.0.0.1:9878/coord-mcp","headers":{"X-Coord-Mcp-Proxy-Key":"${QONTINUI_COORD_MCP_NONCE_0123456789ABCDEF:-legacy}"}}}}"#,
         )
         .unwrap();
         assert_eq!(cfg.nonce, "legacy");
