@@ -27,6 +27,8 @@
 
 pub mod adapters;
 pub mod cache;
+#[cfg(test)]
+mod event_forwarding_test;
 pub mod events;
 #[cfg(test)]
 mod flaui_conformance_test;
@@ -73,25 +75,41 @@ pub struct AccessibilityManager {
 
     /// Event sender for broadcasting accessibility events.
     event_tx: events::EventSender,
+
+    /// Task forwarding the native adapter's own event stream
+    /// (`PlatformAdapter::subscribe_events`) into `event_tx`. `None` when
+    /// disconnected or when the adapter offers no stream. At most one exists:
+    /// it is aborted on disconnect, before every re-subscribe, and on drop.
+    event_forwarder: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl AccessibilityManager {
     /// Create a new AccessibilityManager with default configuration.
     pub fn new() -> Self {
+        let mut manager = Self::with_adapter(create_platform_adapter());
+        if let Some(qontinui_dir) = crate::ambient::qontinui_dir() {
+            manager
+                .ref_manager
+                .set_persistence_dir(qontinui_dir.join("a11y_refs"));
+        }
+        manager
+    }
+
+    /// Create a manager around an explicit adapter, with no ref persistence.
+    ///
+    /// `new()` is this plus the platform adapter and the persistence dir; this
+    /// form exists so tests (and embedders) can supply their own adapter.
+    pub fn with_adapter(native_adapter: Box<dyn PlatformAdapter>) -> Self {
         let (event_tx, _) = events::create_event_channel(256);
         let cache = TreeCache::new(event_tx.clone());
 
-        let mut ref_manager = RefManager::new();
-        if let Some(qontinui_dir) = crate::ambient::qontinui_dir() {
-            ref_manager.set_persistence_dir(qontinui_dir.join("a11y_refs"));
-        }
-
         Self {
-            native_adapter: create_platform_adapter(),
+            native_adapter,
             cache,
-            ref_manager,
+            ref_manager: RefManager::new(),
             fusion_engine: FusionEngine::new(FusionConfig::default()),
             event_tx,
+            event_forwarder: None,
         }
     }
 
@@ -120,6 +138,7 @@ impl AccessibilityManager {
                                 connected: true,
                                 backend: self.native_adapter.backend_name().to_string(),
                             });
+                            self.start_event_forwarding().await;
                             return Ok(());
                         }
                         Err(e) => {
@@ -145,12 +164,67 @@ impl AccessibilityManager {
             connected: true,
             backend: self.native_adapter.backend_name().to_string(),
         });
+        self.start_event_forwarding().await;
 
         Ok(())
     }
 
+    /// Subscribe to the active native adapter's event stream and forward every
+    /// event into `event_tx`, replacing any previous forwarder.
+    ///
+    /// Without this, `subscribe()` only ever carried what the manager itself
+    /// sends (`ConnectionChanged`, `TreeReplaced`): the adapters'
+    /// `FocusChanged` / `StructureChanged` / `PropertyChanged` were dropped.
+    /// A subscription failure is logged, not propagated — the connection is
+    /// still usable, just without live events (see `has_native_events`).
+    async fn start_event_forwarding(&mut self) {
+        self.stop_event_forwarding();
+        let backend = self.native_adapter.backend_name();
+        match self.native_adapter.subscribe_events().await {
+            Ok(Some(mut rx)) => {
+                let tx = self.event_tx.clone();
+                self.event_forwarder = Some(tokio::spawn(async move {
+                    while let Some(event) = rx.recv().await {
+                        // A send error only means nobody is subscribed now.
+                        let _ = tx.send(event);
+                    }
+                    debug!("{} native event stream ended", backend);
+                }));
+                debug!("Forwarding {} native accessibility events", backend);
+            }
+            Ok(None) => {
+                debug!("{} adapter offers no native event stream", backend);
+            }
+            Err(e) => {
+                warn!("{} native event subscription failed: {}", backend, e);
+            }
+        }
+    }
+
+    /// Abort the native-event forwarder, if any.
+    fn stop_event_forwarding(&mut self) {
+        if let Some(handle) = self.event_forwarder.take() {
+            handle.abort();
+        }
+    }
+
+    /// Whether the native adapter is currently delivering a live event stream
+    /// through `subscribe()`.
+    ///
+    /// `false` when disconnected, when the adapter returned no stream (e.g.
+    /// macOS AX, JAB), when subscribing failed, or once the stream has ended.
+    /// Callers that need focus/structure changes should poll when this is
+    /// `false`.
+    pub fn has_native_events(&self) -> bool {
+        self.event_forwarder
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+    }
+
     /// Disconnect from all sources.
     pub async fn disconnect(&mut self) -> anyhow::Result<()> {
+        self.stop_event_forwarding();
+
         // Save refs before disconnecting
         if self.ref_manager.count() > 0 {
             let backend = self.native_adapter.backend_name();
@@ -419,6 +493,12 @@ impl AccessibilityManager {
 impl Default for AccessibilityManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for AccessibilityManager {
+    fn drop(&mut self) {
+        self.stop_event_forwarding();
     }
 }
 
