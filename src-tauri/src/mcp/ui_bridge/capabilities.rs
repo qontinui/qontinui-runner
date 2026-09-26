@@ -509,11 +509,17 @@ pub async fn ui_bridge_control_batch_execute_handler(
 
                 match ui_bridge_request_sync(&state, "execute_action", payload).await {
                     Ok(data) => {
-                        let ok = data
-                            .get("success")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(true);
-                        serde_json::json!({ "index": i, "success": ok, "data": data })
+                        // Strict: an absent `success` is INDETERMINATE → failure.
+                        let (data, outcome) = super::request::normalize_action_result(data);
+                        let mut step = serde_json::json!({
+                            "index": i,
+                            "success": outcome.succeeded(),
+                            "data": data,
+                        });
+                        if let Some(err) = outcome.error_message() {
+                            step["error"] = serde_json::Value::String(err);
+                        }
+                        step
                     }
                     Err(e) => {
                         serde_json::json!({ "index": i, "success": false, "error": e })
@@ -1444,11 +1450,9 @@ pub async fn ui_bridge_control_batch_handler(
 
         let (ok, response_value) = match res {
             Ok(data) => {
-                let success = data
-                    .get("success")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
-                (success, data)
+                // Strict, normalised: an absent `success` is INDETERMINATE.
+                let (data, outcome) = super::request::normalize_action_result(data);
+                (outcome.succeeded(), data)
             }
             Err(e) => (false, serde_json::json!({"success": false, "error": e})),
         };
