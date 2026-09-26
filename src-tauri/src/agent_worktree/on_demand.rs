@@ -2288,6 +2288,7 @@ mod tests {
             custody_wip_ref: None,
             custody_wip_commit: None,
             custody_wip_state: None,
+            custody_occupants: None,
             head_session_id: None,
             head_session_name: None,
         }
