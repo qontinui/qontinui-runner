@@ -542,6 +542,28 @@ mod tests {
         assert!(!v.is_retryable());
     }
 
+    /// coord's scanner-demotion guard (`attested_not_demotable_by_scanner`,
+    /// plan `2026-09-26-plan-adapter-stale-view-demotes-attested-work-units`)
+    /// must answer **422, not 409**. Only a `GiveUp` status has its
+    /// `terminality` read, so only the 422 lets the plan adapter retire the
+    /// `(slug, status)` pair. The same body on a 409 is `TerminalConflict` and
+    /// carries no hint, so the adapter would re-send the refused write on
+    /// every cycle.
+    #[test]
+    fn an_attested_not_demotable_denial_must_be_a_422_to_retire() {
+        let body = r#"{"error":"attested_not_demotable_by_scanner","message":"re-open it with a coord transition","terminality":"permanent"}"#;
+        let v = classify(Some(422), body);
+        assert_eq!(v.disposition, PostDisposition::GiveUp);
+        assert!(v.is_permanently_denied(), "422 + permanent retires");
+
+        let as_409 = classify(Some(409), body);
+        assert_eq!(as_409.disposition, PostDisposition::TerminalConflict);
+        assert!(
+            !as_409.is_permanently_denied(),
+            "a 409 drops the terminality hint, which is why coord must not send one"
+        );
+    }
+
     /// coord's `terminality` hint, verbatim from the measured 422 body — and
     /// the discrimination that makes it worth reading: only `permanent`
     /// licenses a retirement.
