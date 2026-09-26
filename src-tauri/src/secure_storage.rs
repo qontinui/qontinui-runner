@@ -510,6 +510,10 @@ impl std::ops::DerefMut for LockedTokens {
 /// Both lock per OPEN FILE, so it serialises threads of this process (each
 /// acquisition opens its own handle) as well as other processes. It is NOT
 /// re-entrant: a writer must never call another writer while holding one.
+///
+/// It serialises LOCAL read-modify-writes only. Two machine-key mints that
+/// are both in flight to web can still land server-side in one order and be
+/// persisted here in the other; the lock does not order network calls.
 struct StoreWriteLock {
     file: fs::File,
 }
@@ -1492,6 +1496,9 @@ impl SecureStorage {
     /// clean first-run (absent store ⇒ no interactive-sign-out marker, sign-in
     /// writes succeed) so the operator can sign in again from the LoginScreen.
     pub fn delete_storage(&self) -> Result<()> {
+        // Same write lock as every read-modify-write, so a delete can never
+        // land between a writer's load and its save.
+        let _lock = StoreWriteLock::acquire(&self.storage_path)?;
         if self.storage_path.exists() {
             fs::remove_file(&self.storage_path).context("Failed to delete storage file")?;
             info!("Secure storage file deleted");

@@ -3487,16 +3487,43 @@ pub(crate) fn conclude_legacy_recovery_failure(
         // UNKNOWN: nothing to conclude from.
         crate::secure_storage::StoredTokenRead::Unreadable(_) => return None,
     };
+    conclude_legacy_recovery_from(
+        held.as_deref(),
+        machine_key_state(auth_manager, now),
+        has_tenant_slots,
+        user_session_usable,
+        pins,
+        now,
+    )
+}
+
+/// The decision half of [`conclude_legacy_recovery_failure`], over already-
+/// read inputs, so the UNKNOWN arms are testable (one store cannot be made
+/// readable for the legacy token and unreadable for the key at once).
+pub(crate) fn conclude_legacy_recovery_from(
+    held: Option<&str>,
+    key_state: MachineKeyState,
+    has_tenant_slots: bool,
+    user_session_usable: bool,
+    pins: PosturePinInputs,
+    now: i64,
+) -> Option<PostureTransition> {
+    let held: Option<String> = held.map(str::to_string);
     let dead = match held.as_deref().and_then(crate::auth::decode_jwt_exp) {
         Some(exp) => now >= exp,
+        // An ABSENT legacy JWT counts as dead ON PURPOSE: a Tier-2 runner with
+        // a wiped store and no session reads `unrefreshable` / `re_pair` rather
+        // than `absent`, because no autonomous route can mint for it.
         None => true, // absent or opaque — can never be presented
     };
-    let Some(label) = legacy_exhausted_outcome_label(
-        has_tenant_slots,
-        dead,
-        user_session_usable,
-        machine_key_state(auth_manager, now),
-    ) else {
+    let Some(label) =
+        legacy_exhausted_outcome_label(has_tenant_slots, dead, user_session_usable, key_state)
+    else {
+        // An UNREADABLE store is not evidence either way: keep any carried
+        // conclusion rather than retracting it off a failed read.
+        if key_state == MachineKeyState::Unknown {
+            return None;
+        }
         // The verdict can no longer be PROVED — a user session became usable,
         // a machine key is now held, slots appeared, or the credential is
         // live. A carried `Unrefreshable` from an earlier pass would then be
@@ -3743,8 +3770,9 @@ fn usable_user_bearer(auth_manager: &crate::auth::AuthManager) -> Option<String>
 /// unavailable or there is no live device JWT. Backoff is per outcome so a
 /// web build without the route (404) costs one request per six hours, never a
 /// retry storm; a 403 retires the bearer that got it (a new token is asked
-/// afresh), a 409 `machine_key_still_usable` stops enrolment for the process,
-/// and a 5xx retries on the refresher's cadence. See [`MachineKeyEnrolGate`].
+/// afresh), a 409 `machine_key_still_usable` pauses SELF-MINT for six hours
+/// (the owner's `/mint` stays attemptable), a 401 waits the refresher's
+/// cadence, and a 5xx retries on the refresher's cadence. See [`MachineKeyEnrolGate`].
 pub(crate) async fn maybe_enrol_device_machine_key(
     gate: &std::sync::Mutex<MachineKeyEnrolGate>,
     auth_manager: &crate::auth::AuthManager,
@@ -3757,6 +3785,13 @@ pub(crate) async fn maybe_enrol_device_machine_key(
     let state = machine_key_state(auth_manager, now);
     observe_machine_key_state(state);
     if !matches!(state, MachineKeyState::Absent | MachineKeyState::Expiring) {
+        if state == MachineKeyState::Present {
+            // A key is held again (enrolled, or restored by a re-pair): any
+            // 409 episode is over, so `/health` must not keep its reason.
+            let mut g = gate.lock().unwrap_or_else(|e| e.into_inner());
+            g.still_usable_server_side = false;
+            g.self_mint_not_before = None;
+        }
         return MachineKeyEnrolAttempt::NotNeeded(state);
     }
     if web_base.trim().is_empty() {
@@ -3912,6 +3947,12 @@ pub(crate) async fn maybe_enrol_device_machine_key(
                 backoff / 3600
             );
         }
+    } else if matches!(last_err, E::Refused { status: 401, .. }) {
+        // A token racing its own expiry: backed off, never a recurring warn.
+        debug!(
+            "device_jwt_refresher: machine-key enrolment skipped ({last_err}) — retrying in \
+             {backoff}s"
+        );
     } else {
         warn!(
             "device_jwt_refresher: machine-key enrolment did not complete ({last_err}) — \
@@ -10664,6 +10705,45 @@ mod legacy_unrefreshable_tests {
         reset_coord_credential_posture_for_test();
     }
 
+    /// Low-1 — an UNREADABLE store is not evidence: the tail must not retract
+    /// a carried `Unrefreshable` off a failed read of the machine key.
+    #[test]
+    fn an_unreadable_store_does_not_retract_a_carried_unrefreshable() {
+        let _serialised = posture_test_lock();
+        reset_coord_credential_posture_for_test();
+        let now = chrono::Utc::now().timestamp();
+        let expired = synth_jwt(now - 3600);
+        let pins = PosturePinInputs::UNPINNED;
+        conclude_legacy_recovery_from(
+            Some(&expired),
+            MachineKeyState::Absent,
+            false,
+            false,
+            pins,
+            now,
+        )
+        .expect("concluded");
+        // A usable session would retract — but the key read FAILED, and
+        // UNKNOWN is never evidence: nothing is republished, memory kept.
+        assert!(conclude_legacy_recovery_from(
+            Some(&expired),
+            MachineKeyState::Unknown,
+            false,
+            true,
+            pins,
+            now
+        )
+        .is_none());
+        assert_eq!(
+            coord_credential_posture().unwrap().posture,
+            CoordCredentialPosture::Unrefreshable
+        );
+        let (_, label) =
+            carry_legacy_conclusion(SlotObservation::observed(None, Some(expired.as_str())));
+        assert_eq!(label, Some(LEGACY_EXHAUSTED_NO_MACHINE_KEY), "memory kept");
+        reset_coord_credential_posture_for_test();
+    }
+
     /// L8 — the no-slot branch's real entry point
     /// ([`publish_legacy_slot_observation`], what `refresher_loop` calls):
     /// boot says `expired`; after the tail concludes, the next pass's
@@ -11288,7 +11368,10 @@ mod machine_key_enrol_tests {
                 r#"{"detail":{"code":"machine_key_still_usable"}}"#.into(),
             ),
             None,
-            (503, "{}".into()),
+            (
+                201,
+                mint_body("dmk_from_owner_mint", "2099-01-01T00:00:00Z"),
+            ),
         );
         let gate = std::sync::Mutex::new(MachineKeyEnrolGate::default());
         // No user session yet: self-mint 409s.
@@ -11301,7 +11384,23 @@ mod machine_key_enrol_tests {
         // backoff) knocks on /mint with the user bearer.
         mgr.store_oauth_tokens("cognito-access", "id", "refresh", now + 2 * 3600)
             .expect("seed cognito session");
-        let _ = maybe_enrol_device_machine_key(&gate, &mgr, &base, DID, now + 300).await;
+        assert_eq!(
+            maybe_enrol_device_machine_key(&gate, &mgr, &base, DID, now + 300).await,
+            MachineKeyEnrolAttempt::Enrolled {
+                route: MachineKeyMintRoute::UserMint
+            }
+        );
+        assert_eq!(
+            mgr.get_device_machine_key().unwrap().as_deref(),
+            Some("dmk_from_owner_mint")
+        );
+        // Nit-2: a held key clears the 409 episode, so /health drops the reason.
+        assert_eq!(
+            maybe_enrol_device_machine_key(&gate, &mgr, &base, DID, now + 600).await,
+            MachineKeyEnrolAttempt::NotNeeded(MachineKeyState::Present)
+        );
+        assert!(!gate.lock().unwrap().still_usable_server_side);
+        assert!(gate.lock().unwrap().self_mint_not_before.is_none());
         assert_eq!(
             *web.user_mint_hits.lock().unwrap(),
             vec!["Bearer cognito-access".to_string()],
@@ -11341,6 +11440,55 @@ mod machine_key_enrol_tests {
             mgr.get_device_machine_key().unwrap().as_deref(),
             Some("dmk_formatted")
         );
+    }
+
+    /// Nit-5 — web's 2xx names the device in a form that does not parse as a
+    /// UUID: the key is ours (web answered OUR route and already rotated the
+    /// old one), so it is kept, never dropped. A different parseable device
+    /// is still refused.
+    // A plain #[test]: `mint_device_machine_key` is blocking reqwest, which
+    // may not run on a tokio worker (the mock serves from its own thread).
+    #[test]
+    fn an_unparseable_device_id_on_one_side_keeps_the_key() {
+        let now = chrono::Utc::now().timestamp();
+        let tenant = uuid::Uuid::from_bytes([0x6a; 16]);
+        let mgr = auth_manager("unparseable_device_id");
+        mgr.store_tokens(&synth_jwt(now + 12 * 3600, &tenant), "")
+            .expect("seed live jwt");
+        let body = serde_json::json!({
+            "device_id": "device-eb2155ed",
+            "device_machine_key": "dmk_unparseable_side",
+            "prefix": "dmk_unparseabl",
+            "expires_at": null,
+        })
+        .to_string();
+        let (base, _web) = spawn_web((201, body), None);
+        let got = qontinui_runner_lib::pair::mint_device_machine_key(
+            &base,
+            DID,
+            "bearer",
+            MachineKeyMintRoute::SelfMint,
+        );
+        assert_eq!(
+            got.expect("kept").device_machine_key,
+            "dmk_unparseable_side"
+        );
+
+        let other = serde_json::json!({
+            "device_id": "eb2155ed-0000-4000-8000-00000000000b",
+            "device_machine_key": "dmk_other_device",
+        })
+        .to_string();
+        let (base, _web) = spawn_web((201, other), None);
+        assert!(matches!(
+            qontinui_runner_lib::pair::mint_device_machine_key(
+                &base,
+                DID,
+                "bearer",
+                MachineKeyMintRoute::SelfMint
+            ),
+            Err(MachineKeyEnrolError::Decode(_))
+        ));
     }
 
     /// W1 — the 409 reason is worded by LOCAL key state.

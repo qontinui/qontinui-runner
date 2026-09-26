@@ -1305,9 +1305,10 @@ async fn health(
                 "machineKey".to_string(),
                 serde_json::json!(crate::mcp::device_jwt_refresher::machine_key_health_token()),
             );
-            // Set only when enrolment hit a TERMINAL answer (key revoked,
-            // or web holds a still-usable key this runner lost) — the
-            // operator action it needs, next to the `absent` it explains.
+            // Set only while enrolment is held up by web's answer (a 403 that
+            // retired this token, or a 409 whose self-mint pause is running),
+            // worded by the local key state — next to the `machineKey` it
+            // explains. Cleared once a key is held again.
             if let Some(reason) =
                 crate::mcp::device_jwt_refresher::machine_key_enrol_blocked_reason()
             {
