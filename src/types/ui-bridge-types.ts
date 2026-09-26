@@ -189,10 +189,18 @@ export interface PageContext {
 export type ConnectionStatus = "disconnected" | "connecting" | "connected" | "error";
 
 export interface CommandResult<T = unknown> {
+  /** `true` only for a 2xx reply carrying an explicit `success: true`. */
   success: boolean;
   data?: T;
   error?: string;
   duration?: number;
+  /**
+   * How `success` was decided (see `hooks/sdk-ui-bridge/actionOutcome.ts`):
+   * `indeterminate` means the reply carried no boolean `success` — reported
+   * as a failure, but distinguishable from one the action itself reported.
+   * Absent on results built without reading a reply (a thrown fetch).
+   */
+  outcome?: "succeeded" | "failed" | "indeterminate";
 }
 
 // =============================================================================

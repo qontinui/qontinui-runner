@@ -547,18 +547,11 @@ pub async fn ui_bridge_execute_action_plan_handler(
 
         match result {
             Ok(data) => {
-                let action_success = data
-                    .get("success")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
+                // Strict: an absent `success` is INDETERMINATE, never a success.
+                let outcome = super::request::action_outcome(&data);
+                let action_success = outcome.succeeded();
                 let element_state = data.get("elementState").cloned();
-                let action_error = if action_success {
-                    None
-                } else {
-                    data.get("error")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                };
+                let action_error = outcome.error_message();
 
                 if !action_success {
                     all_success = false;
