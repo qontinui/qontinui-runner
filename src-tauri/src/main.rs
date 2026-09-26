@@ -3816,7 +3816,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // copy as `.superseded-<date>` rather than deleting it.
                 // Best-effort and fail-open: with no env override the
                 // candidate set is one path and this is a no-op.
-                let _ = qontinui_runner_lib::pair::converge_binding_store();
+                // A secondary (named or not) never touches the primary's
+                // store: `owns_shared_root_state` is the fail-closed verdict
+                // (plan 2026-09-25-instance-runner-deletes-the-primary-binding-store-…).
+                let _ = qontinui_runner_lib::pair::converge_binding_store(
+                    !instance::owns_shared_root_state(),
+                );
 
                 let app_handle = app.handle().clone();
                 let term_state: tauri::State<'_, std::sync::Arc<terminal::TerminalManager>> =
