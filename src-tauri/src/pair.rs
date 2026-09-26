@@ -87,6 +87,12 @@ pub struct PairCompleteResponse {
     /// pre-dmk web builds that don't return it.
     #[serde(default)]
     pub device_machine_key: Option<String>,
+    /// Expiry (unix seconds) of [`Self::device_machine_key`] when the runner
+    /// knows it — set only by [`enrol_machine_key_into`], whose self-mint
+    /// answer reports `expires_at`. The pair-cli wire carries no expiry, so
+    /// this stays `None` there. Runner-side only; never on any request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_machine_key_expires_at: Option<i64>,
 }
 
 /// Wire shape for `POST /coord/devices/pair-start` response. Coord returns
@@ -1328,8 +1334,10 @@ impl PairCodeRedeemResponse {
             jti: None,
             exp: None,
             tenant_id: Some(self.tenant_id),
-            // The pair-code redeem path does not carry a dmk_ in this phase.
+            // The pair-code redeem response carries no dmk_;
+            // `pair_with_pair_code` enrols one through self-mint afterwards.
             device_machine_key: None,
+            device_machine_key_expires_at: None,
         }
     }
 }
@@ -1400,7 +1408,74 @@ pub fn pair_with_pair_code(
     let redeem: PairCodeRedeemResponse = resp
         .json()
         .map_err(|e| format!("decode redeem response failed: {}", e))?;
-    Ok(redeem.into_pair_complete())
+    let mut pair = redeem.into_pair_complete();
+    // The redeem response carries no machine key, so a device paired by code
+    // used to start keyless and stay that way. Enrol one now with the JWT the
+    // redeem just returned — best-effort, never failing the pairing.
+    enrol_machine_key_into(&mut pair, base);
+    Ok(pair)
+}
+
+/// Best-effort: when a completed pairing carries no device machine key, ask
+/// web's self-mint route for one using the pairing's fresh device JWT, and put
+/// the key (and its expiry) into `resp` so [`persist_pairing`] stores it.
+///
+/// Plan `2026-09-24-runner-coord-credential-stranded-after-outage` Phase 3:
+/// pair-code redeem and the browser callback never carried a `dmk_`, so a
+/// device paired either way could not recover an expired device JWT without an
+/// operator re-pair. `web_base` is the qontinui-web base URL (NOT coord).
+/// Blocking — callers already run on a blocking thread. Every failure is
+/// logged and leaves `resp` unchanged; the device-JWT refresher retries after
+/// its next successful refresh.
+pub fn enrol_machine_key_into(resp: &mut PairCompleteResponse, web_base: &str) {
+    use crate::machine_key_enrol::{self_mint_blocking, SelfMintHttp};
+    if resp
+        .device_machine_key
+        .as_deref()
+        .is_some_and(|k| !k.trim().is_empty())
+    {
+        return;
+    }
+    let Some(device_id) = resp.device_id.clone().filter(|d| !d.trim().is_empty()) else {
+        tracing::warn!("pairing: no device_id in the pairing response — machine key not enrolled");
+        return;
+    };
+    if web_base.trim().is_empty() || resp.token.trim().is_empty() {
+        tracing::warn!("pairing: no web base or device JWT — machine key not enrolled");
+        return;
+    }
+    match self_mint_blocking(web_base, &device_id, &resp.token) {
+        SelfMintHttp::Minted { key, expires_at } => {
+            tracing::info!("pairing: device machine key enrolled via web self-mint");
+            resp.device_machine_key = Some(key);
+            resp.device_machine_key_expires_at = expires_at;
+        }
+        SelfMintHttp::StillUsable => {
+            let held = crate::secure_storage::SecureStorage::new()
+                .and_then(|st| st.get_device_machine_key())
+                .map(|k| k.is_some_and(|k| !k.trim().is_empty()));
+            match held {
+                Ok(true) => tracing::info!(
+                    "pairing: web reports this device's machine key usable for > 7 days \
+                     (self-mint 409) and this runner holds one — nothing to enrol"
+                ),
+                Ok(false) => tracing::warn!(
+                    "pairing: web already holds a machine key for this device that this \
+                     runner does not have (self-mint 409) — the owner must re-mint it to \
+                     restore unattended recovery"
+                ),
+                Err(e) => tracing::warn!(
+                    "pairing: self-mint 409 (web holds a key usable for > 7 days) and the \
+                     local store could not be read ({e}) — whether this runner holds it is \
+                     UNKNOWN"
+                ),
+            }
+        }
+        other => tracing::warn!(
+            "pairing: machine key not enrolled ({other:?}); the device-JWT refresher \
+             retries after its next successful refresh"
+        ),
+    }
 }
 
 // ============================================================================
@@ -1674,9 +1749,11 @@ pub fn pair_via_browser(
         jti: None,
         exp: None,
         tenant_id: Some(tenant_id.to_string()),
-        // The browser callback delivers only the device JWT; a dmk_ (if any)
-        // is minted server-side and arrives via the pair-cli response path.
+        // The browser callback delivers only the device JWT. It holds no web
+        // base, so the caller enrols a dmk_ afterwards
+        // (`enrol_machine_key_into`, from `qontinui_profile device pair`).
         device_machine_key: None,
+        device_machine_key_expires_at: None,
     })
 }
 
@@ -1741,8 +1818,17 @@ pub fn persist_pairing(resp: &PairCompleteResponse, tenant_id: uuid::Uuid) -> Re
         .filter(|k| !k.trim().is_empty())
     {
         if let Ok(storage) = crate::secure_storage::SecureStorage::new() {
-            if let Err(e) = storage.store_device_machine_key_fresh(dmk) {
-                tracing::debug!("store_device_machine_key non-fatal: {e}");
+            if let Err(e) = storage
+                .store_device_machine_key_fresh_with_expiry(dmk, resp.device_machine_key_expires_at)
+            {
+                // Not debug: web minted this key and returned its plaintext
+                // ONCE, so a failed store leaves web holding a key this runner
+                // can never present.
+                tracing::warn!(
+                    "persist_pairing: storing the device machine key failed ({e}) — the \
+                     key web just issued is lost; the refresher re-enrols after its next \
+                     successful refresh"
+                );
             }
         }
     }
@@ -2644,6 +2730,7 @@ mod tests {
             exp: None,
             tenant_id: None,
             device_machine_key: None,
+            device_machine_key_expires_at: None,
         }
     }
 
@@ -5096,6 +5183,168 @@ mod one_binding_store_tests {
             holds_credential_for(SlotState::Absent, true, SlotState::Unreadable),
             None,
             "an unreadable default slot is UNKNOWN, never a measured no"
+        );
+    }
+}
+
+/// Plan `2026-09-24-runner-coord-credential-stranded-after-outage` Phase 3:
+/// pair-code redeem enrols a device machine key through web's self-mint right
+/// after the redeem, and a failed enrolment never fails the pairing.
+#[cfg(test)]
+mod pair_machine_key_enrol_tests {
+    use super::*;
+    use axum::{http::StatusCode, routing::post, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    const DID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const JWT: &str = "header-segment.payload-segment.signature-segment";
+
+    /// A web mock serving the redeem route and the self-mint route, the
+    /// latter answering `mint_status` / `mint_body`. Returns the base URL, the
+    /// self-mint hit counter, and the shutdown handle.
+    fn spawn_web(mint_status: u16, mint_body: &'static str) -> WebMock {
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = std_listener.local_addr().expect("addr").port();
+        std_listener.set_nonblocking(true).expect("nonblocking");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_h = hits.clone();
+        let bearer: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
+        let bearer_h = bearer.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("rt");
+            rt.block_on(async move {
+                let redeem = serde_json::json!({
+                    "user_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                    "tenant_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                    "device_id": DID,
+                    "device_token_jwt": JWT,
+                })
+                .to_string();
+                let app =
+                    Router::new()
+                        .route(
+                            "/api/v1/devices/pair-codes/{code}/redeem",
+                            post(move || {
+                                let body = redeem.clone();
+                                async move {
+                                    (StatusCode::OK, [("content-type", "application/json")], body)
+                                }
+                            }),
+                        )
+                        .route(
+                            "/api/v1/devices/{device_id}/machine-credential/self-mint",
+                            post(move |headers: axum::http::HeaderMap| {
+                                let (hits, bearer) = (hits_h.clone(), bearer_h.clone());
+                                async move {
+                                    hits.fetch_add(1, Ordering::SeqCst);
+                                    *bearer.lock().unwrap() = headers
+                                        .get("authorization")
+                                        .and_then(|v| v.to_str().ok())
+                                        .map(str::to_string);
+                                    (
+                                        StatusCode::from_u16(mint_status).unwrap(),
+                                        [("content-type", "application/json")],
+                                        mint_body,
+                                    )
+                                }
+                            }),
+                        );
+                let listener = tokio::net::TcpListener::from_std(std_listener).expect("listener");
+                let _ = axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = rx.await;
+                    })
+                    .await;
+            });
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        WebMock {
+            base: format!("http://127.0.0.1:{port}"),
+            hits,
+            bearer,
+            _stop: tx,
+        }
+    }
+
+    struct WebMock {
+        base: String,
+        hits: Arc<AtomicUsize>,
+        /// The `Authorization` header the self-mint call carried — recorded,
+        /// then asserted in the test body (a panic inside the handler would
+        /// only surface as a transport error).
+        bearer: Arc<std::sync::Mutex<Option<String>>>,
+        _stop: tokio::sync::oneshot::Sender<()>,
+    }
+
+    fn assert_presented_the_redeemed_jwt(web: &WebMock) {
+        assert_eq!(
+            web.bearer.lock().unwrap().as_deref(),
+            Some(format!("Bearer {JWT}").as_str()),
+            "self-mint presents the JWT the redeem just returned"
+        );
+    }
+
+    #[test]
+    fn pair_code_redeem_enrols_a_machine_key() {
+        let web = spawn_web(
+            201,
+            r#"{"device_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","device_machine_key":"dmk_enrolled_fixture","prefix":"dmk_enrolled_f","expires_at":"2026-11-25T10:00:00Z"}"#,
+        );
+        let resp = pair_with_pair_code(&web.base, "ABC123", DID).expect("pairing succeeds");
+        assert_eq!(web.hits.load(Ordering::SeqCst), 1);
+        assert_presented_the_redeemed_jwt(&web);
+        assert_eq!(
+            resp.device_machine_key.as_deref(),
+            Some("dmk_enrolled_fixture")
+        );
+        assert_eq!(
+            resp.device_machine_key_expires_at,
+            crate::machine_key_enrol::parse_expires_at("2026-11-25T10:00:00Z")
+        );
+    }
+
+    #[test]
+    fn a_failed_enrolment_never_fails_the_pairing() {
+        for (status, body) in [
+            (
+                503u16,
+                r#"{"detail":{"code":"coord_device_lookup_unavailable"}}"#,
+            ),
+            (409, r#"{"detail":{"code":"machine_key_still_usable"}}"#),
+            (403, r#"{"detail":{"code":"coord_refused_device_token"}}"#),
+        ] {
+            let web = spawn_web(status, body);
+            let resp = pair_with_pair_code(&web.base, "ABC123", DID)
+                .unwrap_or_else(|e| panic!("{status}: pairing must still succeed: {e}"));
+            assert_eq!(web.hits.load(Ordering::SeqCst), 1, "{status}");
+            assert_presented_the_redeemed_jwt(&web);
+            assert_eq!(resp.token, JWT, "{status}");
+            assert!(resp.device_machine_key.is_none(), "{status}: no key stored");
+        }
+    }
+
+    #[test]
+    fn a_response_that_already_carries_a_key_is_not_re_enrolled() {
+        let mut resp = PairCompleteResponse {
+            token: JWT.to_string(),
+            user_id: "u".into(),
+            device_id: Some(DID.into()),
+            jti: None,
+            exp: None,
+            tenant_id: None,
+            device_machine_key: Some("dmk_from_pair_cli".into()),
+            device_machine_key_expires_at: None,
+        };
+        // An unroutable base: any call would fail — and must not be made.
+        enrol_machine_key_into(&mut resp, "http://127.0.0.1:9");
+        assert_eq!(
+            resp.device_machine_key.as_deref(),
+            Some("dmk_from_pair_cli")
         );
     }
 }

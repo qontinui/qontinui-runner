@@ -1372,6 +1372,25 @@ impl AuthManager {
         self.secure_storage.get_device_machine_key()
     }
 
+    /// The stored machine key's reported expiry (unix seconds), `Ok(None)`
+    /// when unknown or absent. Pass-through to
+    /// [`SecureStorage::get_device_machine_key_expires_at`].
+    pub fn get_device_machine_key_expires_at(&self) -> Result<Option<i64>> {
+        self.secure_storage.get_device_machine_key_expires_at()
+    }
+
+    /// Store a machine key (and its reported expiry) enrolled in the
+    /// background — [`crate::secure_storage`]'s refuse-on-unreadable write
+    /// mode, so a background enrolment can never blank an unreadable store.
+    pub fn store_device_machine_key_with_expiry(
+        &self,
+        key: &str,
+        expires_at: Option<i64>,
+    ) -> Result<()> {
+        self.secure_storage
+            .store_device_machine_key_with_expiry(key, expires_at)
+    }
+
     /// `true` iff the Cognito access token is missing OR within
     /// [`COGNITO_REFRESH_BEFORE_EXPIRY_SECS`] of expiry. Used by the device-JWT
     /// refresher to refresh the Cognito token *first* when it's stale (so the
@@ -3024,6 +3043,29 @@ pub(crate) fn looks_like_jwt(s: &str) -> bool {
             && p.chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     })
+}
+
+/// The self-mint enrolment (`machine_key_enrol`) reads and writes the device
+/// machine key through the same (test-injectable) storage as every other
+/// credential. `qontinui_runner_lib::` resolves in BOTH crates this file
+/// compiles into (the lib aliases itself with `extern crate self`), so the bin
+/// crate's own `AuthManager` gets the impl too.
+impl qontinui_runner_lib::machine_key_enrol::MachineKeyStore for AuthManager {
+    fn machine_key(&self) -> Result<Option<String>> {
+        self.get_device_machine_key()
+    }
+
+    fn machine_key_expires_at(&self) -> Result<Option<i64>> {
+        self.get_device_machine_key_expires_at()
+    }
+
+    fn store_machine_key(&self, key: &str, expires_at: Option<i64>) -> Result<()> {
+        self.store_device_machine_key_with_expiry(key, expires_at)
+    }
+
+    fn forget_machine_key_expiry(&self) -> Result<()> {
+        self.secure_storage.clear_device_machine_key_expiry()
+    }
 }
 
 #[cfg(test)]

@@ -130,6 +130,13 @@ pub mod util {
 // share one code path. See `pair.rs` for the canonical wire shapes.
 pub mod pair;
 
+// Device machine key (`dmk_`) enrolment through web's self-mint route, and the
+// machine-key state `/health.coordCredential.machineKey` reports. In the lib so
+// the pairing paths (`pair`) and the bin's device-JWT refresher share one
+// implementation and one process-wide rate limit (plan
+// `2026-09-24-runner-coord-credential-stranded-after-outage` Phase 3).
+pub mod machine_key_enrol;
+
 // Cognito Hosted-UI sign-in (RFC 8252 PKCE). Phase 5 of the
 // unified-Cognito-identity plan. Tauri-free (loopback + system browser); the
 // `cognito_sign_in` Tauri command in `commands::auth` drives it.

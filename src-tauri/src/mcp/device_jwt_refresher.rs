@@ -1012,6 +1012,26 @@ pub(crate) async fn try_refresh_once(
         }
     };
 
+    // Web's pair-cli ROTATES the device machine key on every call and
+    // returns the new plaintext once; the old key stops working. Drop
+    // it here and the runner holds a dead key while reporting one
+    // present. Stored with expiry unknown (pair-cli reports none),
+    // background-safe Merge mode, and BEFORE the JWT is stored so the post-refresh
+    // enrolment sees it. Stored whatever becomes of the JWT: the rotation
+    // already happened web-side, so even a tenant-mismatched or unpersisted
+    // JWT leaves the NEW key as the only live one (plan 2026-09-24 Phase 3).
+    if let Some(dmk) = resp
+        .device_machine_key
+        .as_deref()
+        .filter(|k| !k.trim().is_empty())
+    {
+        if let Err(e) = auth_manager.store_device_machine_key_with_expiry(dmk, None) {
+            warn!(
+                "device_jwt_refresher: pair-cli rotated the device machine key but \
+                     storing the new one failed ({e}) — the stored key is now dead"
+            );
+        }
+    }
     // Coord returned 2xx → persist the new JWT into the access_token
     // slot. The refresh-token slot stays empty (device-JWT lifecycle is
     // owned by coord, not by an OAuth refresh chain). Guarded by the
@@ -3742,10 +3762,20 @@ pub(crate) async fn try_device_machine_key_exchange(
     device_id: &str,
     expected_tenant: Option<uuid::Uuid>,
 ) -> Option<String> {
-    // No dmk_ stored → this recovery path is unavailable for this device.
+    // No dmk_ stored → this recovery path is unavailable for this device. Not
+    // silent any more (plan 2026-09-24 Phase 3 step 4): the state feeds
+    // `/health.coordCredential.machineKey` and logs once per change.
     let dmk = match auth_manager.get_device_machine_key() {
         Ok(Some(k)) if !k.trim().is_empty() => k,
-        _ => return None,
+        read => {
+            use qontinui_runner_lib::machine_key_enrol as mke;
+            mke::observe_machine_key_state(if read.is_err() {
+                mke::MachineKeyState::Unknown
+            } else {
+                mke::MachineKeyState::Absent
+            });
+            return None;
+        }
     };
 
     let url = format!(
@@ -3831,6 +3861,72 @@ pub(crate) async fn try_device_machine_key_exchange(
             None
         }
     }
+}
+
+/// Which device JWT the post-refresh machine-key enrolment presents.
+enum EnrolJwt {
+    /// The JWT the refresh just returned.
+    Fresh(String),
+    /// A tenant slot the slot pass just refreshed — read on the blocking pool
+    /// inside the spawned task, never inline in the refresher loop.
+    TenantSlot(uuid::Uuid),
+}
+
+/// Post-refresh hook (plan `2026-09-24-runner-coord-credential-stranded-after-outage`
+/// Phase 3): after a SUCCESSFUL device-JWT refresh, enrol or renew the device
+/// machine key through web's self-mint, presenting a JWT just minted. Runs on
+/// its own task — the refresh pass never waits on web or the store — and is
+/// gated and rate-limited in `qontinui_runner_lib::machine_key_enrol`.
+/// Deliberately NOT the user-bearer `/machine-credential/mint`, and NOT the
+/// `/exchange` door the slot pass is pinned never to knock on.
+fn enrol_machine_key_after_refresh(
+    auth_manager: &std::sync::Arc<crate::auth::AuthManager>,
+    web_base: &str,
+    device_id: &str,
+    jwt: EnrolJwt,
+) {
+    let (am, web_base, device_id) = (
+        std::sync::Arc::clone(auth_manager),
+        web_base.to_string(),
+        device_id.to_string(),
+    );
+    tokio::spawn(async move {
+        let jwt = match jwt {
+            EnrolJwt::Fresh(t) => Some(t),
+            EnrolJwt::TenantSlot(tenant) => {
+                let slot_am = std::sync::Arc::clone(&am);
+                spawn_blocking_tracked(move || slot_am.get_tenant_device_jwt(&tenant))
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok().flatten())
+            }
+        };
+        if let Some(jwt) = jwt.filter(|t| !t.trim().is_empty()) {
+            let _ = qontinui_runner_lib::machine_key_enrol::ensure_after_refresh(
+                am, web_base, device_id, jwt,
+            )
+            .await;
+        }
+    });
+}
+
+/// Record the stored machine key's state for `/health` (one log line per
+/// change), reading the store on the blocking pool. `force` for the refresher's
+/// start; otherwise throttled, for idle ticks.
+async fn observe_machine_key_state(
+    auth_manager: &std::sync::Arc<crate::auth::AuthManager>,
+    force: bool,
+) {
+    use qontinui_runner_lib::machine_key_enrol as mke;
+    let am = std::sync::Arc::clone(auth_manager);
+    let _ = spawn_blocking_tracked(move || {
+        if force {
+            mke::observe_stored_key(am.as_ref());
+        } else {
+            mke::observe_stored_key_if_due(am.as_ref());
+        }
+    })
+    .await;
 }
 
 /// Ensure the Cognito (oauth) access token is fresh before it's used as the
@@ -3989,6 +4085,7 @@ async fn refresher_loop(
     // blocking pool; every `&auth_manager` below deref-coerces unchanged.
     let auth_manager = std::sync::Arc::new(crate::auth::AuthManager::new());
     info!("Device-JWT refresher started (check interval = 5m, threshold = 80m)");
+    observe_machine_key_state(&auth_manager, true).await;
 
     // Phase 2: carries the transient-failure backoff + the credential-dark
     // notify-once dedup across iterations.
@@ -4114,6 +4211,17 @@ async fn refresher_loop(
                         sweep_inputs.posture_pin_inputs(),
                     )
                     .await;
+                    if let Some((tenant, _)) = outcomes
+                        .iter()
+                        .find(|(_, o)| *o == TenantSlotOutcome::Refreshed)
+                    {
+                        enrol_machine_key_after_refresh(
+                            &auth_manager,
+                            &slot_web_base,
+                            &did,
+                            EnrolJwt::TenantSlot(*tenant),
+                        );
+                    }
                     if !outcomes.is_empty() {
                         let refreshed = outcomes
                             .iter()
@@ -4200,6 +4308,9 @@ async fn refresher_loop(
                 }
             }
             Decision::Idle => {
+                // Keeps `/health.coordCredential.machineKey` moving with the
+                // clock between refreshes (throttled to one store read / 30m).
+                observe_machine_key_state(&auth_manager, false).await;
                 // Phase 1b: a fresh JWT → publish ok so any stale alert self-
                 // clears on coord's next firing-set reconcile.
                 publish_coord_credential_status(
@@ -4240,6 +4351,12 @@ async fn refresher_loop(
                             "device_jwt_refresher: device-JWT self-refreshed (len={}) \
                              — Cognito path skipped this tick",
                             new_jwt.len()
+                        );
+                        enrol_machine_key_after_refresh(
+                            &auth_manager,
+                            &resolve_pair_base(&settings_snapshot),
+                            &did,
+                            EnrolJwt::Fresh(new_jwt.clone()),
                         );
                         // Same downstream handling as a successful Cognito re-mint:
                         // wake the relay so it reconnects with the new JWT, publish
@@ -4414,6 +4531,12 @@ async fn refresher_loop(
                         info!(
                             "device_jwt_refresher: device-JWT refreshed (len={})",
                             new_jwt.len()
+                        );
+                        enrol_machine_key_after_refresh(
+                            &auth_manager,
+                            &pair_base,
+                            &device_id,
+                            EnrolJwt::Fresh(new_jwt.clone()),
                         );
                         // Wake the relay so it reconnects with the new JWT.
                         crate::mcp::backend_relay::commands::kick_cloud_relay().await;
@@ -5214,6 +5337,59 @@ mod try_refresh_once_tests {
         assert_ne!(
             stored, old_jwt,
             "access_token slot must NOT still hold the old JWT"
+        );
+    }
+
+    /// Plan 2026-09-24 Phase 3 (review finding 1): web's pair-cli ROTATES the
+    /// device machine key on every call — the old key stops working — and
+    /// returns the new plaintext once. A pair-cli re-mint must store it, with
+    /// expiry unknown, or the runner holds a dead key while `/health` says
+    /// `present`. A response WITHOUT a key must leave the stored one alone.
+    #[tokio::test]
+    async fn pair_cli_remint_stores_the_rotated_machine_key() {
+        let mgr = test_auth_manager("pair_cli_rotates_dmk");
+        mgr.store_tokens(&synth_jwt(chrono::Utc::now().timestamp() + 30 * 60), "")
+            .expect("store");
+        mgr.store_device_machine_key_with_expiry("dmk_old_now_dead", Some(1_900_000_000))
+            .expect("seed dmk");
+        let new_jwt = synth_jwt(chrono::Utc::now().timestamp() + 4 * 60 * 60);
+        let body = serde_json::json!({
+            "token": new_jwt,
+            "device_id": "11111111-1111-4111-8111-111111111111",
+            "user_id":   "22222222-2222-4222-8222-222222222222",
+            "device_machine_key": "dmk_rotated_by_pair_cli",
+        })
+        .to_string();
+        let (base, _cap, _shutdown) = spawn_mock(StatusCode::OK, body);
+
+        let outcome = try_refresh_once(&mgr, &base, &tok(), DID, UID, None).await;
+        assert!(
+            matches!(outcome, RefreshOutcome::Replaced { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            mgr.get_device_machine_key().unwrap().as_deref(),
+            Some("dmk_rotated_by_pair_cli"),
+            "the rotated key replaces the dead one"
+        );
+        assert_eq!(
+            mgr.get_device_machine_key_expires_at().unwrap(),
+            None,
+            "pair-cli reports no expiry, and the old key's must not be inherited"
+        );
+
+        // No key in the response → the stored key is untouched.
+        let body = serde_json::json!({
+            "token": synth_jwt(chrono::Utc::now().timestamp() + 4 * 60 * 60),
+            "device_id": "11111111-1111-4111-8111-111111111111",
+            "user_id":   "22222222-2222-4222-8222-222222222222",
+        })
+        .to_string();
+        let (base, _cap, _shutdown2) = spawn_mock(StatusCode::OK, body);
+        let _ = try_refresh_once(&mgr, &base, &tok(), DID, UID, None).await;
+        assert_eq!(
+            mgr.get_device_machine_key().unwrap().as_deref(),
+            Some("dmk_rotated_by_pair_cli")
         );
     }
 
@@ -9671,5 +9847,46 @@ mod device_machine_key_exchange_tests {
             None,
             "the foreign tenant's slot must not be seeded either"
         );
+    }
+}
+
+#[cfg(test)]
+mod machine_key_enrol_hook_tests {
+    //! Plan `2026-09-24-runner-coord-credential-stranded-after-outage` Phase 3:
+    //! the machine-key enrolment runs after EVERY successful device-JWT
+    //! refresh. The loop needs a live `ApiState`, so this is a source-scan
+    //! tripwire: delete a hook call and it fails, naming the site.
+
+    #[test]
+    fn every_successful_refresh_site_enrols_the_machine_key() {
+        let src = include_str!("device_jwt_refresher.rs");
+        let start = src
+            .find(concat!("async fn ", "refresher_loop("))
+            .expect("refresher_loop exists");
+        let rest = src.get(start..).expect("char boundary");
+        let end = rest
+            .find(concat!("\nasync fn ", "wait_with_signals("))
+            .expect("refresher_loop is followed by wait_with_signals");
+        let body = rest.get(..end).expect("char boundary");
+        let hook = concat!("enrol_machine_key_", "after_refresh(");
+        for (anchor, site) in [
+            ("refresh_tenant_slots(", "per-tenant slot pass"),
+            ("device-JWT self-refreshed", "4a device self-refresh"),
+            (
+                "RefreshOutcome::Replaced { new_jwt } =>",
+                "pair-cli re-mint",
+            ),
+        ] {
+            let at = body
+                .find(anchor)
+                .unwrap_or_else(|| panic!("{site}: anchor `{anchor}` not found"));
+            let after = body.get(at..).expect("char boundary");
+            let distance = after.find(hook);
+            assert!(
+                distance.is_some_and(|d| d < 900),
+                "{site}: a successful refresh must be followed by `{hook}` \
+                 (found at {distance:?} bytes past the anchor)"
+            );
+        }
     }
 }
