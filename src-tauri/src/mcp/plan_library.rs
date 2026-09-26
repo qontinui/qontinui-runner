@@ -1585,7 +1585,10 @@ pub async fn retract_link_handler(
         return Err((
             StatusCode::BAD_REQUEST,
             Json(api_error(format!(
-                "`reason` is {folded_len} characters once this door appends its attribution                  (the calling principal and session) — upstream accepts at most                  {EDGE_REASON_MAX_CHARS}; shorten the reason or the `session_id` label"
+                "`reason` is {folded_len} characters once this door appends its \
+                 attribution (the calling principal and session) — upstream \
+                 accepts at most {EDGE_REASON_MAX_CHARS}; shorten the reason or \
+                 the `session_id` label"
             ))),
         ));
     }
