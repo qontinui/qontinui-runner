@@ -1172,7 +1172,20 @@ fn cmd_device_pair(
         PairMode::AuthToken(token) => {
             pair_with_auth_token(&base, token, preflight_tenant_id.expect("set above"))
         }
-        PairMode::Browser => pair_via_browser(&base, preflight_tenant_id.expect("set above")),
+        PairMode::Browser => {
+            pair_via_browser(&base, preflight_tenant_id.expect("set above")).map(|mut resp| {
+                // The browser callback carries only the device JWT, never a
+                // machine key, so enrol one through web's self-mint now —
+                // best-effort; a failure never fails the pairing (plan
+                // 2026-09-24-runner-coord-credential-stranded-after-outage
+                // Phase 3). Pair-code redeem does this inside
+                // `pair_with_pair_code`; pair-cli's response already carries one.
+                let (web_base, _) =
+                    resolve_pair_code_base(std::env::var("QONTINUI_WEB_BASE").ok().as_deref());
+                qontinui_runner_lib::pair::enrol_machine_key_into(&mut resp, &web_base);
+                resp
+            })
+        }
     };
 
     match result {

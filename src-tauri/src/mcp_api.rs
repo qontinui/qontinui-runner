@@ -1283,6 +1283,30 @@ async fn health(
     // awaited here, so the executor is never blocked; the token itself never
     // leaves the helper.
     let device_jwt_health = crate::coord_mcp::device_jwt_health_json().await;
+    // `/health.coordCredential`, plus `machineKey` (plan
+    // 2026-09-24-runner-coord-credential-stranded-after-outage Phase 3):
+    // `present | absent | expiring | unknown` — whether the runner holds the
+    // device machine key that recovers an EXPIRED device JWT unattended.
+    // `absent` means an outage longer than the JWT's life needs an operator
+    // re-pair; `unknown` means nothing in this process has read the store yet.
+    let mut coord_credential_json = crate::mcp::device_jwt_refresher::coord_credential_posture()
+        .map(|s| s.to_json())
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "posture": "unknown",
+                "state": "unknown",
+                "reason": "no device-JWT refresher pass has completed in this process yet \
+                           — UNKNOWN, never 'healthy'",
+            })
+        });
+    if let Some(obj) = coord_credential_json.as_object_mut() {
+        obj.insert(
+            "machineKey".to_string(),
+            serde_json::json!(
+                qontinui_runner_lib::machine_key_enrol::machine_key_health_state().as_str()
+            ),
+        );
+    }
 
     let mut data = serde_json::json!({
         "status": status,
@@ -1509,14 +1533,10 @@ async fn health(
         // not any more: `can_answer() == false` feeds `derived_status` as a
         // `degraded` input (M7, `HealthInputs::coord_credential_can_answer`),
         // so the top-level verdict moves with this block.
-        "coordCredential": crate::mcp::device_jwt_refresher::coord_credential_posture()
-            .map(|s| s.to_json())
-            .unwrap_or_else(|| serde_json::json!({
-                "posture": "unknown",
-                "state": "unknown",
-                "reason": "no device-JWT refresher pass has completed in this process yet \
-                           — UNKNOWN, never 'healthy'",
-            })),
+        //
+        // `machineKey` (plan 2026-09-24-runner-coord-credential-stranded-after-outage
+        // Phase 3) rides inside this block — see `coord_credential_json` above.
+        "coordCredential": coord_credential_json,
         // Semantic recall (plan 2026-07-30, Phase 3): how each proxied
         // `coord_memory_search` ended — did it get a query vector or not.
         // Non-search traffic is neither touched nor counted, so `enriched`

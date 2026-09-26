@@ -377,6 +377,17 @@ struct StoredTokens {
     /// per-tenant slots are refreshed independently by the per-slot pass.
     #[serde(default)]
     device_machine_key: Option<String>,
+    /// Unix seconds at which [`Self::device_machine_key`] lapses, as web
+    /// reported it when the key was minted (`expires_at` on the `/mint` and
+    /// `/self-mint` responses). `None` = UNKNOWN — a key delivered by the
+    /// pair-cli response carries no expiry, and a pre-Phase-3 `.enc` has none.
+    /// Written together with the key and cleared together with it: a new key
+    /// with no reported expiry clears the old key's value rather than
+    /// inheriting it (plan `2026-09-24-runner-coord-credential-stranded-after-outage`
+    /// Phase 3). A lower bound, not the truth: web slides the real expiry on
+    /// each successful exchange, which the runner does not learn.
+    #[serde(default)]
+    device_machine_key_expires_at: Option<i64>,
     /// Whether the operator has explicitly logged out of the INTERACTIVE
     /// session while leaving the autonomy credentials in place.
     ///
@@ -805,6 +816,7 @@ impl SecureStorage {
         // machine key). `clear_interactive_session` below deliberately does
         // NOT touch these, so autonomy survives a default logout.
         tokens.device_machine_key = None;
+        tokens.device_machine_key_expires_at = None;
         tokens.agent_machine_key = None;
         // Belt-and-braces: with every credential gone the presence check
         // already reports signed-out, but keep the flag consistent so a
@@ -1325,7 +1337,25 @@ impl SecureStorage {
     /// any prior key. Leaves all other slots untouched. Mirror of
     /// [`Self::store_agent_machine_key`].
     pub fn store_device_machine_key(&self, key: &str) -> Result<()> {
-        self.store_device_machine_key_mode(key, WriteMode::Merge)
+        self.store_device_machine_key_mode(key, None, WriteMode::Merge)
+    }
+
+    /// [`Self::store_device_machine_key`] plus the key's reported expiry
+    /// (unix seconds; `None` = unknown, which CLEARS any previous key's
+    /// value). Background-safe ([`WriteMode::Merge`]): the device-JWT
+    /// refresher's self-mint enrolment writes through here.
+    pub fn store_device_machine_key_with_expiry(
+        &self,
+        key: &str,
+        expires_at: Option<i64>,
+    ) -> Result<()> {
+        self.store_device_machine_key_mode(key, expires_at, WriteMode::Merge)
+    }
+
+    /// The stored machine key's expiry (unix seconds), or `Ok(None)` when it
+    /// is unknown or no key is stored. `Err` only on an unreadable store.
+    pub fn get_device_machine_key_expires_at(&self) -> Result<Option<i64>> {
+        Ok(self.load_tokens()?.device_machine_key_expires_at)
     }
 
     /// Explicit-acquisition variant of [`Self::store_device_machine_key`]:
@@ -1333,12 +1363,29 @@ impl SecureStorage {
     /// refusing. Called (best-effort) on the explicit pairing path
     /// (`pair::persist_pairing`) when the web response auto-minted a `dmk_`.
     pub fn store_device_machine_key_fresh(&self, key: &str) -> Result<()> {
-        self.store_device_machine_key_mode(key, WriteMode::Fresh)
+        self.store_device_machine_key_mode(key, None, WriteMode::Fresh)
     }
 
-    fn store_device_machine_key_mode(&self, key: &str, mode: WriteMode) -> Result<()> {
+    /// [`Self::store_device_machine_key_fresh`] plus the key's reported
+    /// expiry — the explicit-pairing path when the pairing step enrolled a
+    /// key through web's self-mint (which reports `expires_at`).
+    pub fn store_device_machine_key_fresh_with_expiry(
+        &self,
+        key: &str,
+        expires_at: Option<i64>,
+    ) -> Result<()> {
+        self.store_device_machine_key_mode(key, expires_at, WriteMode::Fresh)
+    }
+
+    fn store_device_machine_key_mode(
+        &self,
+        key: &str,
+        expires_at: Option<i64>,
+        mode: WriteMode,
+    ) -> Result<()> {
         let mut tokens = self.load_tokens_for_write_mode(mode)?;
         tokens.device_machine_key = Some(key.to_string());
+        tokens.device_machine_key_expires_at = expires_at;
         self.save_tokens(&tokens)?;
         info!("device machine key stored in secure file storage");
         Ok(())
@@ -1359,6 +1406,7 @@ impl SecureStorage {
     pub fn clear_device_machine_key(&self) -> Result<()> {
         let mut tokens = self.load_tokens_for_write()?;
         tokens.device_machine_key = None;
+        tokens.device_machine_key_expires_at = None;
         self.save_tokens(&tokens)?;
         info!("device machine key cleared from secure file storage");
         Ok(())
@@ -2060,6 +2108,34 @@ mod tests {
         let raw = r#"{"access_token":"a","refresh_token":"r","device_id":"d"}"#;
         let parsed: StoredTokens = serde_json::from_str(raw).expect("legacy shape must decode");
         assert!(parsed.tenant_device_jwts.is_empty());
+    }
+
+    /// Plan 2026-09-24 Phase 3: the machine key's expiry is stored with the
+    /// key, a new key with no reported expiry CLEARS the old value (it must
+    /// not inherit the previous key's lifetime), and clearing the key clears it.
+    #[test]
+    fn test_device_machine_key_expiry_travels_with_the_key() {
+        let storage = create_test_storage("test_device_machine_key_expiry");
+        assert_eq!(storage.get_device_machine_key_expires_at().unwrap(), None);
+        storage
+            .store_device_machine_key_with_expiry("dmk_a", Some(1_900_000_000))
+            .unwrap();
+        assert_eq!(
+            storage.get_device_machine_key_expires_at().unwrap(),
+            Some(1_900_000_000)
+        );
+        storage.store_device_machine_key("dmk_b").unwrap();
+        assert_eq!(
+            storage.get_device_machine_key_expires_at().unwrap(),
+            None,
+            "a key with no reported expiry must not inherit the old key's"
+        );
+        storage
+            .store_device_machine_key_fresh_with_expiry("dmk_c", Some(1_950_000_000))
+            .unwrap();
+        storage.clear_device_machine_key().unwrap();
+        assert!(storage.get_device_machine_key().unwrap().is_none());
+        assert_eq!(storage.get_device_machine_key_expires_at().unwrap(), None);
     }
 
     #[test]
