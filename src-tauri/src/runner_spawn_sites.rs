@@ -273,6 +273,10 @@ fn token_re(token: &str) -> Regex {
 }
 
 /// `(file, fn)` for every production call of any pattern in `patterns`.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn scan_calls(sources: &Sources, patterns: &[Regex]) -> BTreeSet<(String, String)> {
     let decl = fn_decl_re();
     let mut out = BTreeSet::new();
@@ -362,6 +366,10 @@ fn resolve_hop<'a>(hop: &'a str, site_file: &'a str) -> (&'a str, &'a str) {
 /// The gate calls in `body` whose result is DISCARDED: the statement is
 /// nothing but the (path-qualified) call, optionally `.await`-ed, ending in
 /// `;` — or `let _ = …;`. Returns the offending call tokens.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn bare_gate_calls(body: &str) -> Vec<&'static str> {
     let path_only =
         Regex::new(r"^(?:let\s+_\s*=\s*)?(?:[A-Za-z_][A-Za-z0-9_]*::)*$").expect("path-only regex");
@@ -731,6 +739,10 @@ fn an_allowlisted_operator_row_is_caught() {
 /// Mutation check: delete the gate call from the steward start path and the
 /// guard must go red on exactly that row.
 #[test]
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn removing_the_drain_gate_from_start_steward_fails_the_guard() {
     let mut sources = load_sources();
     let rows = load_rows();

@@ -847,6 +847,10 @@ fn tool_error(tool: &str, msg: String) -> Value {
 /// than through `str_utils`: that helper lives in the runner bin's module
 /// tree, which this second bin cannot import (the same crate boundary that put
 /// `mcp_spill` in the lib).
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn stderr_echo(msg: &str) -> std::borrow::Cow<'_, str> {
     if msg.len() <= TOOL_ERROR_STDERR_BYTES {
         return std::borrow::Cow::Borrowed(msg);
@@ -959,6 +963,10 @@ fn text_result_with(
 /// byte length, and carries the locator plus the exact call that fetches the
 /// rest. A model must never have to infer from length alone that it is holding
 /// a fragment.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn spill_preview(record: &SpillRecord, text: &str) -> String {
     let total = record.byte_len;
     let mut out = String::with_capacity(PREVIEW_HEAD_BYTES + PREVIEW_TAIL_BYTES + 1024);

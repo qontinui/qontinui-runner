@@ -550,6 +550,10 @@ impl IterationBundle {
     }
 
     /// Add previous output summary
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     pub fn add_previous_output(&mut self, output: String, max_chars: usize) {
         if output.len() > max_chars {
             self.previous_output_summary = Some(output[output.len() - max_chars..].to_string());

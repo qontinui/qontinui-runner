@@ -603,6 +603,10 @@ fn parse_pyproject_toml(content: &str) -> Result<Vec<(String, OsvEcosystem, Stri
 }
 
 /// Parse a PEP 508 dependency spec like "requests>=2.28.0" into (name, version)
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn parse_pep508_spec(spec: &str) -> Option<(String, String)> {
     // Split on first version operator
     let operators = [">=", "<=", "==", "~=", "!=", ">", "<"];

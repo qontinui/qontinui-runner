@@ -176,6 +176,10 @@ fn self_path_hit(line: &str) -> Option<String> {
 
 /// The path token `line[..start]` ends with — everything back to the nearest
 /// [`TOKEN_BREAK_CHARS`] character.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn token_prefix(line: &str, start: usize) -> String {
     let head = &line[..start];
     let mut taken: Vec<char> = head

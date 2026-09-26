@@ -370,7 +370,25 @@ def test_performance_large_dataset():
 
 ### Step 9: Generate Test Report
 
+**The coverage numbers below are about a TREE, and nothing in this file names
+one.** A "coverage after: 89%" measured in a checkout that is 200 commits
+behind, or one carrying a peer's uncommitted edits, reads identically to the
+same number measured on the intended commit. So measure the tree before
+generating the first test, and re-measure immediately before emitting:
+
+```bash
+bash <workspace-root>/qontinui-claude-config/scripts/lib/tree-identity.sh --root .
+```
+
+`tree-recheck` compares the second `head=` against the first: `moved=yes` when
+they differ, `moved=unknown` when either reads `unknown` — an unresolved
+measurement is a sentinel, not a value, and two of them are string-equal. Both
+lines lead the report, above its heading.
+
 ```markdown
+tree: root=<name> head=<sha> dirty=<digest|clean|unknown> dirty_files=<n|UNKNOWN> measured=<ISO-8601-UTC>
+tree-recheck: head=<sha> moved=<yes|no|unknown> measured=<ISO-8601-UTC>
+
 ## Test Generation Report
 
 ### Coverage Summary
@@ -428,6 +446,46 @@ pytest tests/test_module.py::TestFunctionName::test_happy_path_basic
 4. Add missing tests for uncovered scenarios
 5. Integrate into CI/CD pipeline
 ```
+
+## Pinned citations (contract)
+<!-- pinned-citation-contract: v1 -->
+
+Every fact this report cites — a line number, a symbol's location, a count, an
+"X does not exist" — is read through the fleet's one pinned read, against the
+ref you are about to name, never off a working tree:
+
+```bash
+bash <workspace-root>/qontinui-claude-config/scripts/lib/pinned-read.sh --root <checkout> grep <ref> <pathspec> <pattern> -n
+bash <workspace-root>/qontinui-claude-config/scripts/lib/pinned-read.sh --root <checkout> cat <ref> <path>
+bash <workspace-root>/qontinui-claude-config/scripts/lib/pinned-read.sh --root <checkout> exists <ref> <path>
+```
+
+1. **Cite as `<repo>@<sha12>:<path>:<line>`**, transcribed from that output:
+   the `grep` verb prints `<sha>:<path>:<n>:<text>`, and the `pin:` line on
+   stderr carries the `sha=` the ref resolved to. The sha is the pin, not the
+   branch name. `grep -n`, `rg -n` and the Grep tool may LOCATE a candidate;
+   they never CITE one — a shared checkout is almost never on `origin/main`.
+2. **Read the exit code before the output — each one says something
+   different.** Per `scripts/lib/pinned-read.sh`'s own exit table:
+   - `grep` exit `1` is a VERIFIED no-match: the helper checked the pathspec
+     is non-empty at that ref first, so this IS a statement about the code —
+     cite it under rule 3 with its `pin:` line.
+   - `cat`/`exists` exit `1` is MISSING_AT_REF — read the `pin:` line's
+     `type=`. `type=none` means the path is not in that ref (moved, renamed or
+     deleted): say exactly that, never "does not exist" in the code without a
+     further search. `type=tree` means the path is a directory, not a file.
+   - exit `2` is UNKNOWN — the ref did not resolve, the path was rejected, the
+     probe failed, or the call was a usage error. It is never a verdict.
+   - `grep` exit `3` is PATHSPEC_EMPTY — the pathspec matched no file at that
+     ref, which is not "no match".
+3. **A negative claim carries its `pin:` line.** "No consumer", "never called",
+   "does not exist" is written beside the verbatim `pin: ref=… sha=… state=…`
+   line it was read under. Without one it is UNKNOWN, not a finding.
+
+In the Test Generation Report, "X is untested" or "no test covers Y" is a
+negative claim under rule 3, and a source location a test targets is cited in
+this grammar. Enforced by check #51's agent-body arm
+(`scripts/lint-agent-report-tree-identity.py`).
 
 ## Best Practices
 

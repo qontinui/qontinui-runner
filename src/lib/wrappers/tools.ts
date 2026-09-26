@@ -118,6 +118,17 @@ export function buildWrapperTools(wrappers: InstalledWrapper[]): {
   return { tools, routes };
 }
 
+/**
+ * Whether a wrapper can be exposed as an agent tool. Mirrors Rust
+ * `WrapperManager::spawn`, which refuses any manifest transport other than
+ * `api` — exposing such a wrapper would hand the agent a tool whose every
+ * dispatch fails. Runtime state is deliberately NOT a criterion: dispatch
+ * lazy-spawns a stopped wrapper, and `GET /wrappers` carries no state.
+ */
+export function isWrapperToolEligible(wrapper: InstalledWrapper): boolean {
+  return wrapper.manifest?.transport === "api";
+}
+
 function buildDescription(wrapper: InstalledWrapper, action: ActionDescriptor): string {
   // Prefer the action's own description if set; fall back to a synthetic
   // "<wrapperDisplayName>: <actionId>" so the agent always has *something*.
@@ -126,16 +137,4 @@ function buildDescription(wrapper: InstalledWrapper, action: ActionDescriptor): 
   }
   const display = wrapper.manifest?.displayName ?? wrapper.id;
   return `${display}: ${action.id}`;
-}
-
-/**
- * Filter wrappers to those whose `status` is acceptable for tool injection.
- * Treats unknown / undefined status as acceptable — the runner may not
- * surface status on the list endpoint, and we'd rather expose a tool whose
- * dispatch lazy-spawns the wrapper than hide it because of a stale field.
- */
-export function isWrapperEligibleForTools(wrapper: InstalledWrapper): boolean {
-  const status = wrapper.status;
-  if (!status) return true;
-  return status === "running" || status === "idle" || status === "unknown";
 }

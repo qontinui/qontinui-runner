@@ -10,6 +10,8 @@
  * GiB) is the value a naive integer conversion silently destroys.
  */
 
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, it, expect } from "vitest";
 
 import {
@@ -17,6 +19,10 @@ import {
   bytesToGib,
   clampGib,
   clampInt,
+  concurrencyAboveSuggestionWarning,
+  MAX_CONCURRENT_BUILDS_MAX,
+  MAX_CONCURRENT_BUILDS_MIN,
+  parseConcurrencyInput,
   effectiveSessionFloorsGib,
   gibToBytes,
   parseRepoAllowlist,
@@ -222,5 +228,47 @@ describe("thread ceilings — every rule the mirror of the floors'", () => {
         expect(eff.criticalThreads).toBeLessThanOrEqual(THREAD_CEILING_DEFAULT_CRITICAL);
       }
     }
+  });
+});
+
+describe("max concurrent builds bound", () => {
+  /** Read a `const NAME: u32 = N;` out of the Rust validator's source. */
+  function rustConst(name: string): number {
+    const src = readFileSync(
+      fileURLToPath(
+        new URL("../../../src-tauri/src/ci_node/settings_directive.rs", import.meta.url),
+      ),
+      "utf8",
+    );
+    const m = src.match(new RegExp(`const\\s+${name}\\s*:\\s*u32\\s*=\\s*(\\d+)\\s*;`));
+    if (!m) throw new Error(`${name} not found in settings_directive.rs`);
+    return Number(m[1]);
+  }
+
+  it("equals the Rust validator's bounds, read from source", () => {
+    expect(MAX_CONCURRENT_BUILDS_MAX).toBe(rustConst("MAX_CONCURRENT_BUILDS_MAX"));
+    expect(MAX_CONCURRENT_BUILDS_MIN).toBe(rustConst("MAX_CONCURRENT_BUILDS_MIN"));
+  });
+
+  it("commits clamped explicit values and reverts empty/invalid drafts, never to null", () => {
+    expect(parseConcurrencyInput("17", null)).toBe(17);
+    expect(parseConcurrencyInput("0", 4)).toBe(1);
+    expect(parseConcurrencyInput("999", 4)).toBe(64);
+    // Empty or garbage on blur reverts to what was there — an explicit value
+    // stays explicit, and an unset one stays unset. Only the "Use suggested"
+    // button writes null.
+    expect(parseConcurrencyInput("", 4)).toBe(4);
+    expect(parseConcurrencyInput("abc", 4)).toBe(4);
+    expect(parseConcurrencyInput("", null)).toBeNull();
+  });
+
+  it("warns above the suggestion, naming the limiting term, and never otherwise", () => {
+    const big = { suggested: 12, cpus: 48, mem_gib: 368, limiting_term: "cores" as const };
+    const msi = { suggested: 2, cpus: 16, mem_gib: 31, limiting_term: "memory" as const };
+    expect(concurrencyAboveSuggestionWarning(null, big)).toBeNull();
+    expect(concurrencyAboveSuggestionWarning(12, big)).toBeNull();
+    expect(concurrencyAboveSuggestionWarning(4, null)).toBeNull();
+    expect(concurrencyAboveSuggestionWarning(13, big)).toMatch(/cores/);
+    expect(concurrencyAboveSuggestionWarning(3, msi)).toMatch(/memory/);
   });
 });

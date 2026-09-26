@@ -3131,6 +3131,10 @@ mod tests {
     /// placeholder), and the opening brace is located by the first ` {\n` after
     /// the signature, which a reformatted signature or a `where` clause could
     /// move. This is a source scan, not a parser.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn run_unified_workflow_body() -> &'static str {
         let start = THIS_SOURCE
             .find("pub async fn run_unified_workflow(")
@@ -3156,6 +3160,10 @@ mod tests {
     }
 
     /// Every identifier read as `overrides.get("<ident>")` in `source`.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn applied_override_keys(source: &str) -> Vec<String> {
         let needle = "overrides.get(\"";
         let mut cursor = 0usize;
@@ -3257,6 +3265,10 @@ mod tests {
     /// the matching closing brace, so nothing that FOLLOWS the function can
     /// satisfy the two scans above.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn the_scanned_body_is_exactly_one_function() {
         let body = run_unified_workflow_body();
         assert!(

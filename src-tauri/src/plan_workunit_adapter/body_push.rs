@@ -293,6 +293,10 @@ const REPO_STOPWORDS: [&str; 10] = [
 /// on `,` `+` `;`, and keep the first bare token of each chunk. Order-preserving
 /// and deduped. Returns empty when the line is absent — most of the corpus has
 /// no `Repo(s):` line at all, which is a real empty, not a parse failure.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn extract_repos(body: &str) -> Vec<String> {
     const MARKER: &str = "**Repo(s):**";
     let mut lines = body.lines();
@@ -633,9 +637,87 @@ pub struct SkippedFile {
     pub reason: &'static str,
 }
 
+/// Skip reasons that mean a WHOLE root contributed nothing because it could
+/// not be read — as opposed to a root that was read and held no plans.
+///
+/// `unreadable_dir` is the work-tree walk's; `unreadable_ref` and
+/// `scan_source_unavailable` are the ref arm's
+/// (`super::trigger::scan_roots_at_source`). Each is recorded at the root's own
+/// path, which is how [`root_dark_reason`] tells it from a per-file skip.
+pub const DARK_ROOT_REASONS: [&str; 3] = [
+    "unreadable_dir",
+    "unreadable_ref",
+    "scan_source_unavailable",
+];
+
+/// The reason `root_dir` contributed nothing, if a root-level dark skip was
+/// recorded for it; `None` when the root was read (even if it held nothing).
+pub fn root_dark_reason(root_dir: &Path, skipped: &[SkippedFile]) -> Option<&'static str> {
+    let at = root_dir.to_string_lossy();
+    skipped
+        .iter()
+        .find(|s| s.path == at && DARK_ROOT_REASONS.contains(&s.reason))
+        .map(|s| s.reason)
+}
+
+/// Skip reasons that mean SOME of a root could not be read: an entry the
+/// listing lost (`unreadable_entry`, recorded at the root) or a file whose
+/// bytes would not read (`unreadable_file`). Both arms record both.
+pub const PARTIAL_ROOT_REASONS: [&str; 2] = ["unreadable_entry", "unreadable_file"];
+
+/// How many artifacts one root yielded — or that it could not be read at all.
+///
+/// A dark root is NOT a root with zero plans, and a partly read root's count
+/// is a floor, not a total; the dry-run table must render neither as a plain
+/// number [policy: `unknown-must-not-render-as-a-default`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootYield {
+    /// Read whole: the count is the root's total.
+    Read(usize),
+    /// Read in part: `read` were published and `unreadable` skips were
+    /// recorded (an `unreadable_entry` counts once — it cannot say how many
+    /// entries it lost).
+    Partial { read: usize, unreadable: usize },
+    /// Not read at all, for this reason.
+    Dark(&'static str),
+}
+
+impl RootYield {
+    /// Classify one root from what its scan produced. `skipped` must hold
+    /// only this root's skips, as `scan_roots_at_source` over one root does.
+    pub fn of(root_dir: &Path, found: usize, skipped: &[SkippedFile]) -> Self {
+        if let Some(reason) = root_dark_reason(root_dir, skipped) {
+            return RootYield::Dark(reason);
+        }
+        match skipped
+            .iter()
+            .filter(|s| PARTIAL_ROOT_REASONS.contains(&s.reason))
+            .count()
+        {
+            0 => RootYield::Read(found),
+            unreadable => RootYield::Partial {
+                read: found,
+                unreadable,
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for RootYield {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RootYield::Read(n) => write!(f, "{n}"),
+            RootYield::Partial { read, unreadable } => {
+                write!(f, "{read}+ (PARTIAL: {unreadable} unreadable)")
+            }
+            RootYield::Dark(reason) => write!(f, "UNKNOWN ({reason})"),
+        }
+    }
+}
+
 /// One root's depth-1 entries, split the way [`scan_one_root`] splits them.
 ///
-/// Both lists are sorted: `read_dir` order is filesystem-dependent, and a
+/// Every list is sorted: `read_dir` order is filesystem-dependent, and a
 /// dry-run report has to be reproducible across runs and machines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RootListing {
@@ -647,16 +729,22 @@ struct RootListing {
     /// there" when the truth is "this was never looked at". Absence of a
     /// report is not a report of absence.
     subdirs: Vec<PathBuf>,
+    /// `*.md` entries that are DANGLING SYMLINKS — resolved as not-a-plan (see
+    /// [`super::trigger::is_dangling_symlink`]), so they are in neither list
+    /// above and taint nothing. RECORDED for the same reason `subdirs` is: the
+    /// dry-run report names them instead of letting them vanish unexplained.
+    dangling_links: Vec<PathBuf>,
     /// At least one entry of this directory that COULD have been a plan was
     /// not read or classified — a `read_dir` iteration error (where the name
     /// itself is unknown, so nothing can be ruled out), or metadata that would
     /// not load for a `*.md` name.
     ///
     /// Scoped to entries that could be stems because the flag's only job is to
-    /// say whether the `*.md` set is a floor. A dangling symlink named
-    /// `notes.txt` is a PERMANENT metadata failure that could never have
-    /// changed that set, and letting it raise this flag put the census ABSENT
-    /// forever with no way back.
+    /// say whether the `*.md` set is a floor. A permanently unreadable
+    /// `notes.txt` could never have changed that set, and letting it raise
+    /// this flag put the census ABSENT forever with no way back. (A dangling
+    /// symlink of either name no longer reaches this flag at all — it is
+    /// resolved into `dangling_links` or ignored.)
     ///
     /// Both lists above are then FLOORS rather than the whole directory, and
     /// the two consumers part company on that: the scan publishes what it
@@ -676,6 +764,9 @@ enum EntryKind {
     /// Neither — a socket, a fifo, a device node. An ANSWER rather than a
     /// failure, so it belongs in no list and taints nothing.
     Other,
+    /// A symlink with nothing behind it. Also an ANSWER — see
+    /// [`super::trigger::is_dangling_symlink`] — so it taints nothing either.
+    DanglingLink,
 }
 
 /// Whether a path's NAME could carry a plan stem — `extension() == "md"`,
@@ -692,8 +783,18 @@ fn could_be_a_stem(path: &Path) -> bool {
 /// Classify one entry the way `Path::is_dir` / `Path::is_file` do — FOLLOWING
 /// links — but returning the metadata error instead of swallowing it into a
 /// `false` that would land the entry in neither list, unreported.
+///
+/// The one failure resolved rather than returned is a DANGLING symlink, the
+/// same rule [`super::trigger::scan_plan_dir`] applies, through the same
+/// predicate — so the census and the work-unit scan cannot disagree on it.
 fn classify_entry(path: &Path) -> std::io::Result<EntryKind> {
-    let meta = std::fs::metadata(path)?;
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if super::trigger::is_dangling_symlink(&e, || std::fs::symlink_metadata(path)) => {
+            return Ok(EntryKind::DanglingLink);
+        }
+        Err(e) => return Err(e),
+    };
     Ok(if meta.is_dir() {
         EntryKind::Dir
     } else if meta.is_file() {
@@ -755,6 +856,7 @@ where
 {
     let mut files: Vec<PathBuf> = Vec::new();
     let mut subdirs: Vec<PathBuf> = Vec::new();
+    let mut dangling_links: Vec<PathBuf> = Vec::new();
     let mut entries_errored = false;
     for entry in entries {
         let path = match entry {
@@ -778,16 +880,19 @@ where
                 }
             }
             Ok(EntryKind::Other) => {}
+            Ok(EntryKind::DanglingLink) => {
+                if could_be_a_stem(&path) {
+                    dangling_links.push(path);
+                }
+            }
             // NARROWED on purpose: only an entry that could be a stem may
             // poison the listing.
             //
-            // `classify` FOLLOWS links, so a dangling symlink — and any
-            // permanently unreadable entry — answers `Err(NotFound)` every
-            // cycle. That is a knowable, standing answer, not a blip. Letting
-            // `notes.txt` or a broken link taint the listing sent this side
-            // ABSENT forever, with no recovery short of operator action, over
-            // an entry that could never have joined the `*.md` stem set the
-            // census is about.
+            // A permanently unreadable entry answers `Err` every cycle. That
+            // is a standing answer, not a blip. Letting an unreadable
+            // `notes.txt` taint the listing sent this side ABSENT forever,
+            // with no recovery short of operator action, over an entry that
+            // could never have joined the `*.md` stem set the census is about.
             //
             // The test is on the NAME, which `read_dir` already handed us and
             // which no failing syscall can take away. An entry whose name
@@ -811,22 +916,17 @@ where
                      is NOT a floor"
                 );
             }
-            // ACCEPTED LIMIT, stated so an operator who hits it can find the
-            // sentence: an entry whose name COULD be a stem still taints the
-            // listing even when its failure is a DECIDED one. A dangling
-            // symlink named `<stem>.md` answers `NotFound` every cycle —
-            // `classify` follows links — so this side reports ABSENT for as
-            // long as the link stays broken, with only a per-cycle WARN to say
-            // so. That is the safe direction (never a false zero) but it is
-            // permanent darkness from a knowable cause, which is the shape
-            // this plan family exists to remove.
+            // An entry whose name COULD be a stem and whose kind could not be
+            // established taints the listing. The one DECIDED failure — a
+            // dangling symlink — never reaches here: `classify_entry` resolves
+            // it to `DanglingLink` above, which is what stopped a broken
+            // `<stem>.md` link from holding this side ABSENT forever.
             //
-            // It is NOT narrowed to the uncertain kinds (`PermissionDenied`,
-            // `Busy`) here on purpose: doing so would stop a file deleted
-            // mid-scan from tainting, and deciding whether that race should
-            // shrink the denominator is a separate judgement with its own
-            // tests — not a rider on this one. Tracked as a follow-up on
-            // 2026-09-15-captured-vs-authored-coverage-is-a-set-difference.
+            // Everything that does reach here is UNCERTAIN, including a name
+            // that vanished between `read_dir` and `stat`: that may be an
+            // unlink-then-create in flight (a `git checkout`), so shrinking
+            // the stem set on it would under-report a plan that exists. One
+            // ABSENT cycle, recovering by itself, is the honest cost.
             Err(e) => {
                 tracing::warn!(
                     path = %path.display(),
@@ -840,16 +940,21 @@ where
     }
     files.sort();
     subdirs.sort();
+    dangling_links.sort();
     RootListing {
         files,
         subdirs,
+        dangling_links,
         entries_errored,
     }
 }
 
 /// Read + classify every `*.md` in one root (non-recursive, matching the flat
-/// layout [`super::trigger::read_plan_dir`] already assumes). A missing dir
-/// yields nothing; per-file IO errors are collected, never fatal.
+/// layout [`super::trigger::read_plan_dir`] already assumes). A dir that will
+/// not read — a missing one included, since roots come only from explicit
+/// configuration — yields nothing and records `unreadable_dir`, which the
+/// dry-run table renders as UNKNOWN; per-file IO errors are collected, never
+/// fatal.
 pub fn scan_one_root(
     root: &ScanRoot,
     conv: &PlanConvention,
@@ -889,6 +994,7 @@ fn scan_listing(
     let RootListing {
         files,
         subdirs,
+        dangling_links,
         entries_errored,
     } = listing;
     if entries_errored {
@@ -898,6 +1004,12 @@ fn scan_listing(
         });
     }
     let mut out = Vec::new();
+    for link in dangling_links {
+        skipped.push(SkippedFile {
+            path: link.to_string_lossy().to_string(),
+            reason: "dangling_symlink",
+        });
+    }
     for dir in subdirs {
         skipped.push(SkippedFile {
             path: dir.to_string_lossy().to_string(),
@@ -1039,7 +1151,7 @@ pub struct DivergentStem {
 pub struct BackfillReport {
     pub scanned: usize,
     pub per_kind: Vec<(ArtifactKind, usize)>,
-    pub per_root: Vec<(String, usize)>,
+    pub per_root: Vec<(String, RootYield)>,
     pub skipped: Vec<SkippedFile>,
     /// Stems present in more than one root, divergent copies first.
     pub duplicate_stems: Vec<DivergentStem>,
@@ -1051,13 +1163,35 @@ impl BackfillReport {
     pub fn divergent_count(&self) -> usize {
         self.duplicate_stems.iter().filter(|d| d.differs).count()
     }
+
+    /// `(dark, partial)`: roots not read at all, and roots read only in part.
+    /// Either being non-zero makes every corpus-wide count in the report a
+    /// floor rather than a total.
+    pub fn incomplete_roots(&self) -> (usize, usize) {
+        let dark = self
+            .per_root
+            .iter()
+            .filter(|(_, n)| matches!(n, RootYield::Dark(_)))
+            .count();
+        let partial = self
+            .per_root
+            .iter()
+            .filter(|(_, n)| matches!(n, RootYield::Partial { .. }))
+            .count();
+        (dark, partial)
+    }
+
+    /// `true` when every root was read whole, so the report's counts are totals.
+    pub fn is_complete(&self) -> bool {
+        self.incomplete_roots() == (0, 0)
+    }
 }
 
 /// Build the dry-run report from a scan. Pure — no HTTP, no clock.
 pub fn build_report(
     artifacts: &[ScannedArtifact],
     skipped: Vec<SkippedFile>,
-    per_root: Vec<(String, usize)>,
+    per_root: Vec<(String, RootYield)>,
 ) -> BackfillReport {
     let mut per_kind: Vec<(ArtifactKind, usize)> = ArtifactKind::ALL
         .iter()
@@ -1112,26 +1246,60 @@ pub fn build_report(
 }
 
 /// Render the report as the operator-facing text the backfill subcommand prints.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn render_report(report: &BackfillReport) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
-    let _ = writeln!(s, "scanned: {}", report.scanned);
+    let (dark, partial) = report.incomplete_roots();
+    // The grand total is a total only when every root was read whole. With a
+    // dark or partly read root it is a floor, and must say so rather than
+    // keep the confidence the by-root table below withholds.
+    if dark + partial > 0 {
+        let _ = writeln!(
+            s,
+            "scanned: {}+ (a floor: {dark} root(s) unread, {partial} read in part)",
+            report.scanned
+        );
+    } else {
+        let _ = writeln!(s, "scanned: {}", report.scanned);
+    }
     let _ = writeln!(s, "\nby root:");
     for (label, n) in &report.per_root {
         let _ = writeln!(s, "  {label:<16} {n}");
     }
-    let _ = writeln!(s, "\nby kind:");
+    if dark > 0 {
+        let _ = writeln!(
+            s,
+            "  {dark} root(s) could not be read: their plans are UNKNOWN, not absent"
+        );
+    }
+    if partial > 0 {
+        let _ = writeln!(
+            s,
+            "  {partial} root(s) read in part: their counts are floors, not totals"
+        );
+    }
+    // Every count below sums over the same incomplete set as `scanned`.
+    let floors = if dark + partial > 0 {
+        " (floors: not every root was read)"
+    } else {
+        ""
+    };
+    let _ = writeln!(s, "\nby kind:{floors}");
     for (kind, n) in &report.per_kind {
         let _ = writeln!(s, "  {:<22} {}", kind.as_str(), n);
     }
     let _ = writeln!(
         s,
-        "\nwith Repo(s): {}   with Depends-On: {}",
+        "\nwith Repo(s): {}   with Depends-On: {}{floors}",
         report.with_repos, report.with_depends_on
     );
     let _ = writeln!(
         s,
-        "\nduplicate stems: {} ({} DIVERGENT by content)",
+        "\nduplicate stems: {} ({} DIVERGENT by content){floors}",
         report.duplicate_stems.len(),
         report.divergent_count()
     );
@@ -1857,7 +2025,7 @@ fn cap_chars(value: Option<String>, max: usize) -> Option<String> {
 // ----------------------------------------------------------------------------
 
 /// The `ref` side: the stems the adapter's WORK-UNIT half lists at the fetched
-/// default branch ([`super::ref_scan::read_ref_dir`]).
+/// default branch ([`super::ref_scan::read_ref_dir_at`]).
 pub const SLUG_CENSUS_SOURCE_REF: &str = "ref";
 
 /// The `work_tree` side: the stems the BODY SYNC's own walk sees on disk
@@ -2813,10 +2981,7 @@ mod tests {
             dir,
             [
                 Ok(good.clone()),
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "readdir failed mid-iteration",
-                )),
+                Err(std::io::Error::other("readdir failed mid-iteration")),
             ],
             &classify_entry,
         );
@@ -2829,8 +2994,7 @@ mod tests {
         // ABSENT rather than small.
         let all_failed = collect_listing(
             dir,
-            [Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            [Err(std::io::Error::other(
                 "readdir failed at the first entry",
             ))],
             &classify_entry,
@@ -2853,10 +3017,9 @@ mod tests {
     /// **An entry that could never have been a plan must not send the census
     /// ABSENT.**
     ///
-    /// `classify_entry` FOLLOWS links, so a dangling symlink — and any
-    /// permanently unreadable entry — answers `Err` on every cycle. That is a
-    /// knowable, standing answer. Tainting on it made a `notes.txt` in that
-    /// state report this side ABSENT *forever*, with no recovery short of
+    /// A permanently unreadable entry answers `Err` on every cycle. That is a
+    /// standing answer. Tainting on it made a `notes.txt` in that state report
+    /// this side ABSENT *forever*, with no recovery short of
     /// operator action, over an entry that could not have changed the `*.md`
     /// stem set the census is an assertion about.
     ///
@@ -2873,15 +3036,14 @@ mod tests {
         let good = dir.join("2026-01-01-good.md");
         std::fs::write(&good, "# A plan\n\nBody.\n").unwrap();
 
-        // The dangling-symlink shape, spelled as the metadata failure it
-        // produces: `classify_entry` on a path whose target is not there.
-        // Written this way rather than with a real symlink because creating
-        // one needs a privilege Windows does not grant by default, and the
-        // syscall answer is identical.
-        let dangling = dir.join("notes.txt");
-        assert!(classify_entry(&dangling).is_err(), "the premise");
+        // A listed name whose metadata will not load: here, one with nothing
+        // on disk behind it at all, which `classify_entry` cannot resolve
+        // (no link either — see
+        // `a_dangling_symlink_is_resolved_not_a_floor` for that shape).
+        let unreadable = dir.join("notes.txt");
+        assert!(classify_entry(&unreadable).is_err(), "the premise");
 
-        let listing = collect_listing(dir, [Ok(good.clone()), Ok(dangling)], &classify_entry);
+        let listing = collect_listing(dir, [Ok(good.clone()), Ok(unreadable)], &classify_entry);
         assert!(
             !listing.entries_errored,
             "a non-`*.md` name could not have joined the stem set, so the listing is not a floor"
@@ -2890,7 +3052,9 @@ mod tests {
         assert_eq!(census.slugs, Some(vec!["2026-01-01-good".to_string()]));
         assert_eq!((census.count, census.truncated), (1, false));
 
-        // The same failure on a name that COULD be a stem still taints.
+        // The same failure on a name that COULD be a stem still taints —
+        // this is also the vanished-mid-scan shape, which is UNCERTAIN (an
+        // unlink-then-create may be in flight).
         let missing_md = dir.join("2026-01-02-missing.md");
         assert!(classify_entry(&missing_md).is_err(), "the premise");
         let tainted = collect_listing(dir, [Ok(good), Ok(missing_md)], &classify_entry);
@@ -2899,6 +3063,67 @@ mod tests {
             census_from_listing(dir, &tainted),
             None,
             "in doubt about an entry that could be a stem: ABSENT"
+        );
+    }
+
+    /// **A DANGLING `*.md` symlink is a decided not-a-plan: the census stays
+    /// a reading, and the dry-run report names the link.**
+    ///
+    /// `classify_entry` FOLLOWS links, so a broken `<stem>.md` link answers
+    /// `NotFound` on every cycle. Read as a gap, that held the work-tree
+    /// census ABSENT for as long as the link stayed broken — permanent
+    /// darkness from a knowable cause. `lstat` finds the link, which DECIDES
+    /// the entry: not a plan, exactly as the ref side (which skips every
+    /// mode-`120000` entry) already says.
+    ///
+    /// Neuter check: drop the `is_dangling_symlink` arm from `classify_entry`
+    /// and the census below goes ABSENT.
+    #[test]
+    fn a_dangling_symlink_is_resolved_not_a_floor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let good = dir.join("2026-01-01-good.md");
+        std::fs::write(&good, "# A plan\n\nBody.\n").unwrap();
+        let link = dir.join("2026-01-02-linked.md");
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(dir.join("no-such-target.md"), &link);
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(dir.join("no-such-target.md"), &link);
+        if let Err(e) = made {
+            // Not a pass: an explicit, printed inability to run this case.
+            eprintln!("SKIPPED: this platform refused to create a symlink ({e})");
+            return;
+        }
+        assert!(std::fs::metadata(&link).is_err(), "the premise: it dangles");
+        assert_eq!(classify_entry(&link).unwrap(), EntryKind::DanglingLink);
+
+        let listing = enumerate_root(dir).unwrap();
+        assert!(!listing.entries_errored, "a decided entry is not a floor");
+        assert_eq!(listing.files, vec![good]);
+        assert_eq!(listing.dangling_links, vec![link.clone()]);
+
+        let census = census_from_listing(dir, &listing).expect("the census is a READING");
+        assert_eq!(census.slugs, Some(vec!["2026-01-01-good".to_string()]));
+        assert_eq!((census.count, census.truncated), (1, false));
+
+        let root = ScanRoot::new(dir, ScanRootKind::Plans, PLANS_ROOT_LABEL);
+        let mut skipped = Vec::new();
+        let scanned = scan_listing(
+            &root,
+            listing,
+            &PlanConvention::operator_default(),
+            &mut skipped,
+        );
+        assert_eq!(scanned.len(), 1);
+        assert!(
+            skipped
+                .iter()
+                .any(|s| s.reason == "dangling_symlink" && s.path == link.to_string_lossy()),
+            "the dry-run report names the link rather than dropping it: {skipped:?}"
+        );
+        assert!(
+            !skipped.iter().any(|s| s.reason == "unreadable_entry"),
+            "and does not report it as a lost entry: {skipped:?}"
         );
     }
 
@@ -3992,8 +4217,135 @@ mod tests {
         assert!(subdir[0].path.ends_with("2026-q3"));
 
         // And it reaches the operator-facing report.
-        let report = build_report(&found, skipped, vec![("plans".into(), 1)]);
+        let report = build_report(&found, skipped, vec![("plans".into(), RootYield::Read(1))]);
         assert!(render_report(&report).contains("subdirectory_not_scanned"));
+    }
+
+    /// A root that could not be read renders as UNKNOWN in the by-root table,
+    /// never as `0` — and only a ROOT-LEVEL dark skip makes it so. A per-file
+    /// `unreadable_file`, or a root-level `unreadable_entry`, is a PARTIAL
+    /// read, and its count renders as a floor.
+    ///
+    /// Neuter check: make `root_dark_reason` return `None` and the first
+    /// assertion fails; drop the path equality and the per-file case fails.
+    #[test]
+    fn a_dark_root_renders_unknown_not_zero() {
+        let root = Path::new("/plans");
+        let sk = |path: &str, reason: &'static str| SkippedFile {
+            path: path.to_string(),
+            reason,
+        };
+        for reason in DARK_ROOT_REASONS {
+            let root_path = root.to_string_lossy().to_string();
+            assert_eq!(
+                root_dark_reason(root, &[sk(&root_path, reason)]),
+                Some(reason)
+            );
+        }
+        let file = root.join("2026-01-01-x.md").to_string_lossy().to_string();
+        assert_eq!(
+            root_dark_reason(root, &[sk(&file, "unreadable_file")]),
+            None
+        );
+        assert_eq!(
+            root_dark_reason(root, &[sk(&root.to_string_lossy(), "unreadable_entry")]),
+            None,
+            "a partial read is still a reading"
+        );
+        assert_eq!(
+            root_dark_reason(
+                Path::new("/other"),
+                &[sk(&root.to_string_lossy(), "unreadable_ref")]
+            ),
+            None,
+            "another root's darkness is not this one's"
+        );
+
+        let report = build_report(
+            &[],
+            vec![sk(&root.to_string_lossy(), "unreadable_ref")],
+            vec![
+                ("plans".into(), RootYield::Dark("unreadable_ref")),
+                ("prompts".into(), RootYield::Read(0)),
+                (
+                    "archive".into(),
+                    RootYield::Partial {
+                        read: 4,
+                        unreadable: 1,
+                    },
+                ),
+            ],
+        );
+        let text = render_report(&report);
+        assert!(text.contains("UNKNOWN (unreadable_ref)"), "{text}");
+        assert!(text.contains("1 root(s) could not be read"), "{text}");
+        assert!(text.contains("4+ (PARTIAL: 1 unreadable)"), "{text}");
+        assert!(text.contains("1 root(s) read in part"), "{text}");
+        // The grand total counts `artifacts` (none here), not `per_root`; what
+        // is pinned is that it is marked a floor, as is every sum below it.
+        assert!(
+            text.starts_with("scanned: 0+ (a floor: 1 root(s) unread, 1 read in part)\n"),
+            "the grand total is a floor too: {text}"
+        );
+        assert!(
+            text.contains("by kind: (floors: not every root was read)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("with Depends-On: 0 (floors: not every root was read)"),
+            "{text}"
+        );
+        // A copy of a stem in an unread root is invisible, so the duplicate
+        // and divergent counts are floors too.
+        assert!(
+            text.contains("DIVERGENT by content) (floors: not every root was read)"),
+            "{text}"
+        );
+        assert!(!report.is_complete());
+        assert_eq!(report.incomplete_roots(), (1, 1));
+        // A PARTLY read root is a floor, not a total — including the case
+        // `collect_listing`'s doc calls a fabricated zero (every entry lost).
+        let root_path = root.to_string_lossy().to_string();
+        assert_eq!(
+            RootYield::of(root, 0, &[sk(&root_path, "unreadable_entry")]),
+            RootYield::Partial {
+                read: 0,
+                unreadable: 1
+            }
+        );
+        assert_eq!(
+            RootYield::of(root, 2, &[sk(&file, "unreadable_file")]),
+            RootYield::Partial {
+                read: 2,
+                unreadable: 1
+            }
+        );
+        assert_eq!(
+            RootYield::of(root, 0, &[sk(&root_path, "unreadable_ref")]),
+            RootYield::Dark("unreadable_ref"),
+            "dark outranks partial"
+        );
+        assert_eq!(
+            RootYield::of(root, 3, &[sk(&file, "subdirectory_not_scanned")]),
+            RootYield::Read(3),
+            "a skip that is not a read failure leaves the count a total"
+        );
+        assert_eq!(
+            RootYield::Partial {
+                read: 0,
+                unreadable: 1
+            }
+            .to_string(),
+            "0+ (PARTIAL: 1 unreadable)"
+        );
+
+        let clean = build_report(&[], vec![], vec![("plans".into(), RootYield::Read(0))]);
+        let clean_text = render_report(&clean);
+        assert!(!clean_text.contains("could not be read"), "{clean_text}");
+        assert!(!clean_text.contains("read in part"), "{clean_text}");
+        assert!(clean_text.starts_with("scanned: 0\n"), "{clean_text}");
+        assert!(!clean_text.contains("floors"), "{clean_text}");
+        assert!(clean.is_complete());
     }
 
     /// The marker match is case-insensitive without allocating a lowercase copy
@@ -4041,7 +4393,14 @@ mod tests {
             ScanRoot::new(&b_dir, ScanRootKind::Plans, "b"),
         ];
         let (artifacts, skipped) = scan_all_roots(&roots, &PlanConvention::operator_default());
-        let report = build_report(&artifacts, skipped, vec![("a".into(), 2), ("b".into(), 2)]);
+        let report = build_report(
+            &artifacts,
+            skipped,
+            vec![
+                ("a".into(), RootYield::Read(2)),
+                ("b".into(), RootYield::Read(2)),
+            ],
+        );
 
         assert_eq!(report.scanned, 4);
         assert_eq!(report.duplicate_stems.len(), 2);

@@ -118,14 +118,21 @@ fn recovery_error_detail(
     }
 }
 
+/// The frontend's scoped-attempt verdict key in `ai_recovery_attempt`'s `data`
+/// (`RecoveryVerdict.attemptSucceeded` in
+/// `src/hooks/ui-bridge-events/recoveryScope.ts`). Distinct from the runner's
+/// outer `RecoveryOutcome.recovered` on purpose — see [`as_recovery_failure`].
+pub(crate) const ATTEMPT_SUCCEEDED: &str = "attemptSucceeded";
+
 /// Stop `/ai/recovery/attempt` from laundering a typed refusal into a success.
 ///
 /// THE DEFECT: the frontend answered `RECOVERY_UNSCOPED` /
 /// `RECOVERY_TARGET_MISSING` with `{success: false, error: "<CODE>: …",
-/// data: {recovered: false}}`, but the response dispatcher
-/// (`request::handle_ui_bridge_response`) forwarded ONLY `response.data` when
-/// the handler supplied one — so `wrap_ipc_result` received a bare
-/// `{recovered: false}` with no `success: false` to flatten and answered
+/// data: {recovered: false}}` (the field is `attemptSucceeded` today), but the
+/// response dispatcher (`request::handle_ui_bridge_response`) forwarded ONLY
+/// `response.data` when the handler supplied one — so `wrap_ipc_result`
+/// received a bare `{recovered: false}` with no `success: false` to flatten and
+/// answered
 /// **HTTP 200 `{"success":true,"recovered":false}`**. A caller that refused to
 /// guess a target was indistinguishable from one that recovered.
 ///
@@ -136,17 +143,30 @@ fn recovery_error_detail(
 /// `data` by hand and no longer takes a `message` to mirror.
 ///
 /// This function is still load-bearing, for a case the seam cannot see: a
-/// frontend that answers `{success: true, data: {recovered: false}}` — an
-/// HONEST envelope reporting that recovery ran and did not recover. Turning
-/// that verdict into an HTTP 400 is this boundary's own job, exactly as
-/// [`super::elements::as_action_failure`] does for `execute_action`:
+/// frontend that answers `{success: true, data: {attemptSucceeded: false}}` —
+/// an HONEST envelope reporting that the scoped attempt ran and did not act on
+/// the addressed element. Turning that verdict into an HTTP 400 is this
+/// boundary's own job, exactly as [`super::elements::as_action_failure`] does
+/// for `execute_action`:
 ///
-/// - a 200 whose payload says `recovered: false` becomes an HTTP 400 carrying
-///   the payload's own `error` text and a machine-readable `code`;
+/// - a 200 whose payload says `attemptSucceeded: false` becomes an HTTP 400
+///   carrying the payload's own `error` text and a machine-readable `code`;
 /// - a 400 that arrived without a `code` gets one derived from its message.
 ///
-/// `recovered: true` and transport-level failures (500 / 503 — the frontend
-/// never answered) pass through untouched: those are not recovery verdicts.
+/// `attemptSucceeded: true` and transport-level failures (500 / 503 — the
+/// frontend never answered) pass through untouched: those are not attempt
+/// verdicts.
+///
+/// **The HTTP status of `/ai/recovery/attempt` therefore reflects the SCOPED
+/// ATTEMPT, not the ORIGINAL action.** A 200 means the scoped executor acted on
+/// the addressed element; it does NOT mean the action that originally failed
+/// now succeeds. That stricter question is
+/// [`super::recovery_executor::RecoveryOutcome::recovered`], answered by an
+/// independent retry of the original action — and the two legitimately
+/// disagree (the right element was clicked, the original action is still
+/// broken: 200 here, `recovered: false` there). The frontend's field was named
+/// `recovered` until plan `2026-08-23-single-source-derived-facts` item 8,
+/// which is exactly how one word came to answer two questions.
 ///
 /// Both refusal arms also build a TYPED `error_detail` ([`recovery_error_code`]).
 /// Stamping only the top-level `code` left the token laundered one layer down:
@@ -172,13 +192,13 @@ pub(crate) fn as_recovery_failure(result: BridgeResult) -> BridgeResult {
 
     match result {
         Ok(Json(resp)) => {
-            let recovered_false = resp
+            let attempt_failed = resp
                 .data
                 .as_ref()
-                .and_then(|d| d.get("recovered"))
+                .and_then(|d| d.get(ATTEMPT_SUCCEEDED))
                 .and_then(|v| v.as_bool())
                 == Some(false);
-            if !recovered_false {
+            if !attempt_failed {
                 return Ok(Json(resp));
             }
             let payload = resp.data.clone().unwrap_or(serde_json::Value::Null);
@@ -360,7 +380,7 @@ mod recovery_failure_tests {
             "success": false,
             "error": message,
             "code": "RECOVERY_UNSCOPED",
-            "recovered": false,
+            "attemptSucceeded": false,
         })));
         let (status, Json(body)) = out.unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -375,7 +395,7 @@ mod recovery_failure_tests {
             "success": false,
             "error": "RECOVERY_TARGET_MISSING: element 'ghost' is not in the current tree; nothing to recover.",
             "code": "RECOVERY_TARGET_MISSING",
-            "recovered": false,
+            "attemptSucceeded": false,
             "elementId": "ghost",
         })));
         let (status, Json(body)) = out.unwrap_err();
@@ -391,17 +411,17 @@ mod recovery_failure_tests {
         let out = as_recovery_failure(ok(json!({
             "success": false,
             "error": "RECOVERY_UNSCOPED: no elementId",
-            "recovered": false,
+            "attemptSucceeded": false,
         })));
         let (_, Json(body)) = out.unwrap_err();
         assert_eq!(body.code.as_deref(), Some("RECOVERY_UNSCOPED"));
     }
 
-    /// And the pre-fix payload shape itself — a bare `{recovered:false}` with
+    /// And the pre-fix payload shape itself — a bare failed verdict with
     /// nothing else — must still not read as a success.
     #[test]
     fn the_bare_laundered_payload_is_no_longer_a_success() {
-        let out = as_recovery_failure(ok(json!({ "recovered": false })));
+        let out = as_recovery_failure(ok(json!({ "attemptSucceeded": false })));
         let (status, Json(body)) = out.unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body.code.as_deref(), Some("RECOVERY_FAILED"));
@@ -411,7 +431,7 @@ mod recovery_failure_tests {
     /// different bug. A genuine recovery stays HTTP 200.
     #[test]
     fn a_genuine_recovery_still_answers_200() {
-        let payload = json!({ "recovered": true, "elementId": "btn-1" });
+        let payload = json!({ "attemptSucceeded": true, "elementId": "btn-1" });
         let out = as_recovery_failure(ok(payload.clone()));
         let Json(body) = out.unwrap();
         assert!(body.success);
@@ -464,7 +484,7 @@ mod recovery_failure_tests {
             .to_string()
     }
 
-    /// All three mapped codes, on the 200-with-`recovered:false` arm.
+    /// All three mapped codes, on the 200-with-`attemptSucceeded:false` arm.
     #[test]
     fn each_recovery_token_gets_its_own_typed_inner_code() {
         for (token, expected) in [
@@ -476,7 +496,7 @@ mod recovery_failure_tests {
                 "success": false,
                 "error": format!("{token}: refused"),
                 "code": token,
-                "recovered": false,
+                "attemptSucceeded": false,
             })));
             let (status, Json(body)) = out.unwrap_err();
             assert_eq!(status, StatusCode::BAD_REQUEST, "{token}");
@@ -536,7 +556,7 @@ mod recovery_failure_tests {
     /// 200 and carries no `error_detail` at all.
     #[test]
     fn a_genuine_recovery_carries_no_error_detail() {
-        let Json(body) = as_recovery_failure(ok(json!({ "recovered": true }))).unwrap();
+        let Json(body) = as_recovery_failure(ok(json!({ "attemptSucceeded": true }))).unwrap();
         assert!(body.success);
         assert!(body.error_detail.is_none());
     }

@@ -1,0 +1,9 @@
+// Planted fixture for class `os_bound_tooling` — both halves.
+fn planted_os_bound_tooling() {
+    let _ = std::process::Command::new("powershell").arg("-File").arg("x.ps1").status();
+}
+
+#[cfg(windows)]
+fn planted_windows_only() -> u32 {
+    1
+}

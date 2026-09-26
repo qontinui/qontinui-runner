@@ -47,6 +47,10 @@ pub async fn save_page_spec<R: Runtime>(
 /// Returns a list of `{ specId, specJson }` objects for all specs that were
 /// previously saved with `save_page_spec`.
 #[tauri::command]
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub async fn load_user_specs<R: Runtime>(
     app: AppHandle<R>,
 ) -> Result<Vec<serde_json::Value>, String> {

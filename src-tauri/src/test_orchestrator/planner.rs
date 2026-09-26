@@ -15,6 +15,10 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 /// Safely truncate a string at a character boundary
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn safe_truncate(s: &str, max_len: usize) -> &str {
     if s.len() <= max_len {
         return s;
@@ -28,6 +32,10 @@ fn safe_truncate(s: &str, max_len: usize) -> &str {
 }
 
 /// Safely truncate from the end of a string
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn safe_truncate_end(s: &str, max_len: usize) -> &str {
     if s.len() <= max_len {
         return s;
@@ -425,6 +433,10 @@ fn parse_plan_response(
 }
 
 /// Extract JSON from AI response (handles markdown code blocks and truncation)
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_json_from_response(response: &str) -> Result<String> {
     let trimmed = response.trim();
 
@@ -498,6 +510,10 @@ fn extract_json_from_response(response: &str) -> Result<String> {
 }
 
 /// Attempt to repair truncated JSON by closing open structures
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn repair_truncated_json(json: &str) -> String {
     let mut result = json.trim_end().to_string();
 

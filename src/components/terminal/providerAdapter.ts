@@ -34,6 +34,14 @@ export type RestoreTier = "full" | "terminal-only";
  *   cannot express (the Claude TUI's rounded input-box frame, `/[╭╰]─{3,}/`,
  *   is the motivating one — it is a shape, not a phrase).
  *
+ * A given provider declares each marker in EXACTLY ONE of the two kinds. The
+ * Claude descriptor used to carry every phrase marker twice — once as a
+ * substring, once as a regex — so adding a marker to one list silently
+ * under-matched the other (plan 2026-08-23-single-source-derived-facts item 9).
+ * Claude now declares its markers only as regexes (the superset:
+ * `/Welcome (?:back )?to Claude/i` covers two substrings, and the box frame
+ * has no substring form), and its substring lists are empty.
+ *
  * THE DEFECT this closes: boot-restore ALWAYS passes a descriptor's
  * `HandshakePatterns`, and the detectors used to treat that as an EITHER/OR —
  * `if (patterns) return matchSubstrings(...)`. The regex sets in
@@ -66,7 +74,7 @@ export interface HandshakePatterns {
  * landed; answering the picker is a separate concern).
  */
 export const CLAUDE_HANDSHAKE_REGEXES: RegExp[] = [
-  /\? for shortcuts/, // persistent status-line hint under the input box
+  /\? for shortcuts/i, // persistent status-line hint under the input box
   /esc to interrupt/i, // shown while Claude is actively working
   /bypass permissions/i, // permission-mode indicator in the status line
   /Welcome (?:back )?to Claude/i, // launch banner
@@ -100,7 +108,7 @@ export interface SessionProviderDescriptor {
    * Phase 2 fills the Claude shape (`["claude", "--resume", sessionId]`).
    */
   resumeCommand(sessionId: string): string[];
-  /** Resume success/failure handshake patterns (Phase 2 ports the real sets). */
+  /** Resume success/failure handshake patterns. */
   handshakePatterns(): HandshakePatterns;
   /** Declared restore capability for the honest-UX surface. */
   restoreTier(): RestoreTier;
@@ -111,32 +119,21 @@ export interface SessionProviderDescriptor {
  * `claude --resume <id>`. `restoreTier` is `"full"` — Claude resumes the FULL
  * conversation by id.
  *
- * The handshake set carries BOTH halves and both are live: the plain
- * substrings, plus {@link CLAUDE_HANDSHAKE_REGEXES} /
- * {@link CLAUDE_RESUME_FAILURE_REGEXES}, which `resumeVerification` unions into
- * the same probe. Before that union the regexes were dead on the boot-restore
- * path (which always supplies this descriptor), so the box-frame marker never
- * ran in production — see {@link HandshakePatterns} for the full defect note.
- * Failure is still checked FIRST, since a failure dialog is itself Claude UI.
+ * Every Claude marker lives in exactly one place:
+ * {@link CLAUDE_HANDSHAKE_REGEXES} / {@link CLAUDE_RESUME_FAILURE_REGEXES}. The
+ * substring lists are deliberately EMPTY — the regexes are a strict superset of
+ * the substrings they replaced, and a second list is a second place for a new
+ * marker to be forgotten. `resumeVerification` unions both kinds, so the regexes
+ * are live on the boot-restore path (which always supplies this descriptor) —
+ * see {@link HandshakePatterns} for the defect note. Failure is still checked
+ * FIRST, since a failure dialog is itself Claude UI.
  */
 export const claudeDescriptor: SessionProviderDescriptor = {
   provider: "claude",
   resumeCommand: (sessionId: string) => ["claude", "--resume", sessionId],
   handshakePatterns: () => ({
-    success: [
-      "? for shortcuts", // status-line hint under the input box
-      "esc to interrupt", // shown while Claude is working
-      "bypass permissions", // permission-mode indicator
-      "Welcome to Claude", // launch banner
-      "Welcome back to Claude", // resumed-banner variant
-    ],
-    failure: [
-      "No conversation found", // `--resume <unknown-id>` error
-      "No conversations found", // empty-history variant
-      "No conversations to resume",
-      "Select a session to resume", // interactive session-picker frame
-      "Select a conversation to resume",
-    ],
+    success: [],
+    failure: [],
     successPatterns: CLAUDE_HANDSHAKE_REGEXES,
     failurePatterns: CLAUDE_RESUME_FAILURE_REGEXES,
   }),

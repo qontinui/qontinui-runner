@@ -1093,7 +1093,7 @@ const FAILURE_VERDICT_FIELDS: [&str; 3] = ["error", "code", "hint"];
 ///   authority on the verdict, and the collision is not hypothetical: several
 ///   handlers put a machine code in `data.error` (`"unknown_tab"`,
 ///   `"invalid_stub"`, `"not_found"`) while the envelope's `error` holds the
-///   prose a caller should read. Data-only fields (`recovered`, `knownTabs`,
+///   prose a caller should read. Data-only fields (`attemptSucceeded`, `knownTabs`,
 ///   `elementId`, …) are untouched. An overwritten value is not recoverable, so
 ///   a handler with a machine code to carry should put it in `code` (which the
 ///   envelope carries natively) or in a field of its own — not in `data.error`.
@@ -1817,7 +1817,7 @@ mod wrap_ipc_result_tests {
             "data": {
                 "error": "unscoped",
                 "code": "STALE",
-                "recovered": false,
+                "attemptSucceeded": false,
                 "elementId": "btn-1",
             },
         });
@@ -1831,7 +1831,7 @@ mod wrap_ipc_result_tests {
         );
         assert_eq!(data.get("code"), Some(&json!("RECOVERY_UNSCOPED")));
         // Data-only fields are untouched.
-        assert_eq!(data.get("recovered"), Some(&json!(false)));
+        assert_eq!(data.get("attemptSucceeded"), Some(&json!(false)));
         assert_eq!(data.get("elementId"), Some(&json!("btn-1")));
     }
 

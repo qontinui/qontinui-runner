@@ -130,7 +130,7 @@
     "test:watch": "vitest",
     "graphql:codegen": "graphql-codegen",
     "graphql:check": "graphql-codegen && git diff --exit-code src/generated/graphql.ts || (echo 'GraphQL codegen output is stale â€” run npm run graphql:codegen' && exit 1)",
-    "graphql:schema": "cd src-tauri && cargo test --bin qontinui-runner schema_exports_valid_sdl -- --nocapture",
+    "graphql:schema": "cd src-tauri && QONTINUI_UPDATE_GRAPHQL_SDL=1 cargo test --bin qontinui-runner schema_exports_valid_sdl -- --nocapture",
     "typecheck": "tsc --noEmit"
   },
   "type": "module",

@@ -122,6 +122,10 @@ exit 0
 }
 
 #[cfg(not(windows))]
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub async fn kill_descendant_tree(root_pid: u32) -> usize {
     if root_pid == 0 {
         return 0;
@@ -284,6 +288,10 @@ pub fn port_owner_pid(port: u16) -> Option<u32> {
 }
 
 #[cfg(not(windows))]
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn port_owner_pid(port: u16) -> Option<u32> {
     // Try `ss -ltnp` first. Output example:
     //   State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process

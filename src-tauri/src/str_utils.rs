@@ -1,5 +1,9 @@
 /// Safely truncate a string to at most `max_bytes` bytes, splitting on a UTF-8
 /// character boundary.  Returns the full string unchanged when it already fits.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn truncate_str(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;

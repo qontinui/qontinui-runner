@@ -31,6 +31,7 @@
 import { getApiBase } from "@/lib/runner-api";
 import type {
   InstalledWrapper,
+  WrapperStartedInfo,
   WrapperStatusInfo,
   CredentialEntry,
   DispatchResult,
@@ -127,21 +128,21 @@ export async function uninstallWrapper(id: string): Promise<void> {
 }
 
 /** Start the wrapper subprocess. */
-export async function startWrapper(id: string): Promise<WrapperStatusInfo> {
+export async function startWrapper(id: string): Promise<WrapperStartedInfo> {
   const res = await fetch(`${getApiBase()}/wrappers/${encodeURIComponent(id)}/start`, {
     method: "POST",
   });
   await ensureOk(res, `POST /wrappers/${id}/start`);
-  return unwrapEnvelope<WrapperStatusInfo>(res, `POST /wrappers/${id}/start`);
+  return unwrapEnvelope<WrapperStartedInfo>(res, `POST /wrappers/${id}/start`);
 }
 
 /** Stop the wrapper subprocess. */
-export async function stopWrapper(id: string): Promise<WrapperStatusInfo> {
+export async function stopWrapper(id: string): Promise<void> {
   const res = await fetch(`${getApiBase()}/wrappers/${encodeURIComponent(id)}/stop`, {
     method: "POST",
   });
   await ensureOk(res, `POST /wrappers/${id}/stop`);
-  return unwrapEnvelope<WrapperStatusInfo>(res, `POST /wrappers/${id}/stop`);
+  await unwrapEnvelope<string>(res, `POST /wrappers/${id}/stop`);
 }
 
 /** Fetch live wrapper status. */

@@ -630,6 +630,10 @@ mod bridge_error_classification_tests {
 #[cfg(test)]
 mod stop_uses_the_shared_classifier_tests {
     /// The body of `stop_ui_bridge_exploration`, production source only.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn stop_handler_body() -> &'static str {
         let src = include_str!("exploration.rs");
         let start = src

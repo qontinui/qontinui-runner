@@ -276,6 +276,10 @@ pub fn extract_output_summary(output_log: &str) -> Option<String> {
 ///
 /// Looks for headings like "## Summary", "## summary", "### Summary", etc.
 /// Returns the content between the summary heading and the next heading (or end of text).
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_markdown_summary_section(text: &str) -> Option<String> {
     // Find the last occurrence of a summary heading (AI typically writes it at the end)
     let text_lower = text.to_lowercase();
@@ -344,6 +348,10 @@ fn extract_markdown_summary_section(text: &str) -> Option<String> {
 }
 
 /// Extract work_summary from AI session output for a specific iteration.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn extract_work_summary_for_iteration(output_log: &str, iteration: u32) -> Option<String> {
     let marker = format!("[SESSION_START:{}]", iteration);
     let start = output_log.find(&marker)?;

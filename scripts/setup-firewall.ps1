@@ -11,9 +11,13 @@
 # 127.0.0.1.
 #
 # The supervisor's exe-naming scheme (src/config.rs::runner_exe_copy_path):
-#   Temp:    target/debug/qontinui-runner-test-<port>.exe
-#   Named:   target/debug/qontinui-runner-named-<port>.exe
+#   Temp:    target/debug/runners/qontinui-runner-test-<port>/qontinui-runner.exe
+#   Named:   target/debug/runners/qontinui-runner-named-<port>/qontinui-runner.exe
 #   Primary: target/debug/qontinui-runner-<id>.exe  (id = "primary" by default)
+#   Legacy flat Temp/Named copies, still produced by a supervisor older than
+#   qontinui-supervisor#197 (the per-runner-directory layout):
+#            target/debug/qontinui-runner-test-<port>.exe
+#            target/debug/qontinui-runner-named-<port>.exe
 #   Plus:    target-pool/slot-{0,1,2}/debug/qontinui-runner.exe
 #            target-pool/lkg/qontinui-runner.exe
 #            target/debug/qontinui-runner.exe                  (legacy)
@@ -121,7 +125,21 @@ $paths.Add((Join-Path $RunnerRoot "target\debug\qontinui-runner.exe"))
 $paths.Add((Join-Path $RunnerRoot "target\debug\qontinui-runner-primary.exe"))
 
 # Temp + named runner exes for every port in the supervisor's pool.
+#
+# Current layout (qontinui-supervisor#197): each runner gets its own directory
+# under target\debug\runners\<pool-name>\, and the exe inside keeps the
+# plain `qontinui-runner.exe` name. The rule DisplayName below is built from
+# the basename plus the parent dir, so these come out as
+# `qontinui-multi-app-qontinui-runner-qontinui-runner-test-<port>` -- one
+# distinct name per pool slot. dev-start.ps1 (Confirm-QontinuiFirewallRules)
+# probes for the port-9877 test rule of exactly that shape to decide whether
+# this script must re-run; keep the two in step if the naming changes.
+#
+# Legacy flat layout: kept because a supervisor built before #197 still
+# copies runners to these paths. Delete once no such supervisor can remain.
 for ($port = $TempPortMin; $port -le $TempPortMax; $port++) {
+    $paths.Add((Join-Path $RunnerRoot "target\debug\runners\qontinui-runner-test-$port\qontinui-runner.exe"))
+    $paths.Add((Join-Path $RunnerRoot "target\debug\runners\qontinui-runner-named-$port\qontinui-runner.exe"))
     $paths.Add((Join-Path $RunnerRoot "target\debug\qontinui-runner-test-$port.exe"))
     $paths.Add((Join-Path $RunnerRoot "target\debug\qontinui-runner-named-$port.exe"))
 }
@@ -165,7 +183,7 @@ Write-Host "  - $(3) slot-pool exes (slot-0..2)"
 Write-Host "  - 1 LKG exe"
 Write-Host "  - 1 legacy target/debug exe"
 Write-Host "  - 1 primary runner exe"
-Write-Host "  - $(($TempPortMax - $TempPortMin + 1) * 2) temp+named runner exes (ports $TempPortMin-$TempPortMax)"
+Write-Host "  - $(($TempPortMax - $TempPortMin + 1) * 4) temp+named runner exes (ports $TempPortMin-$TempPortMax; per-runner-dir + legacy flat layouts)"
 Write-Host "  - 2 supervisor exes (direct + copies/)"
 Write-Host ""
 Write-Host "All rules are inbound TCP on 127.0.0.1 only -- no external network exposure."

@@ -10,11 +10,14 @@
 //!
 //! Coord dual-publishes the request on
 //! `qontinui.sessions.<tenant>.<target-device>.respawn_request`, i.e. the
-//! subject family [`super::handoff`] already PSUBSCRIBEs as
-//! `qontinui.sessions.*`. So this module adds **no second socket, no second
-//! poll loop and no new pattern** — [`super::handoff::connect_and_pump`]
-//! forwards every frame here as well, and [`super::handoff::run_catchup`]
-//! runs the respawn catch-up alongside the handoff one.
+//! subject family [`super::handoff`] already receives through the
+//! `?subscribe=sessions` lane, which coord resolves from the upgrade credential
+//! to `qontinui.sessions.<tenant>.<self-device>.*` (see
+//! `qontinui_runner_lib::coord_ws::Subscription::Sessions`). So this module
+//! adds **no second socket, no second poll loop and no new pattern** —
+//! [`super::handoff::connect_and_pump`] forwards every frame here as well, and
+//! [`super::handoff::run_catchup`] runs the respawn catch-up alongside the
+//! handoff one.
 //!
 //! ⚠️ The two arms are disambiguated ONLY by the channel's trailing segment.
 //! The shipped [`super::handoff::parse_handoff_push`] filters on
@@ -603,6 +606,10 @@ fn transcript_bytes_from_output_body(body: &serde_json::Value) -> Vec<u8> {
 /// issues no `UPDATE` against `coord.sessions` either. This function contains
 /// no delete of any kind, and [`tests::respawn_module_never_closes_the_source`]
 /// asserts it stays that way.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 async fn materialize(
     registry: &Arc<SessionRegistry>,
     lifecycle_store: &Arc<SessionLifecycleStore>,
@@ -844,6 +851,7 @@ mod tests {
             finished_at: None,
             finish_reason: None,
             finish_synced: false,
+            spawn_device_default: None,
         }
     }
 

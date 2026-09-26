@@ -797,6 +797,10 @@ impl KnowledgeBase {
 /// where type is one of: bug, root_cause, observation, hypothesis, solution
 ///
 /// Returns a list of findings found in the output.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn parse_findings_from_output(output: &str) -> Vec<Finding> {
     let mut findings = Vec::new();
 
@@ -841,6 +845,10 @@ pub fn parse_findings_from_output(output: &str) -> Vec<Finding> {
 }
 
 /// Extract the description text after a finding marker.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_finding_description(text: &str) -> String {
     // Take content until next marker or reasonable end
     let trimmed = text.trim_start();
@@ -1533,6 +1541,10 @@ pub async fn build_iteration_context_with_compression(
 /// Uses hybrid search: SQL filter by category + vector re-rank by content_embedding.
 /// Enables questions like "Has this root cause been identified before?"
 /// Format cross-task knowledge results for injection into AI context.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn format_cross_task_knowledge(
     results: &[crate::database::hybrid_search::SearchResult<
         crate::database::hybrid_search::KnowledgeResult,

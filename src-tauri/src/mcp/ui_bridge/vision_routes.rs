@@ -914,6 +914,10 @@ async fn vision_annotate_handler(
     Ok(Json(ApiResponse::success(VisionCaptureResp::Single(resp))))
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 async fn do_capture(
     state: &Arc<ApiState>,
     req: CaptureRequest,
@@ -1294,6 +1298,10 @@ async fn do_multi_capture(
 }
 
 /// `POST /ui-bridge/vision/diff` — capture twice + naive pixel diff.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 async fn vision_diff_handler(
     State(state): State<Arc<ApiState>>,
     UiBridgeJson(req): UiBridgeJson<DiffRequest>,
@@ -1694,6 +1702,10 @@ async fn vision_raw_handler(
 /// `POST /ui-bridge/vision/extract` (plan §3.2, Phase 4) — capture +
 /// PaddleOCR-via-llama-swap → text blocks with bbox. **No pixels in
 /// the response.** Cache-keyed by (mutation_id, request shape).
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 async fn vision_extract_handler(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<ExtractRequest>>,
@@ -1788,6 +1800,10 @@ async fn vision_extract_handler(
 /// `POST /ui-bridge/vision/describe` (plan §3.2, Phase 4) — capture +
 /// VLM caption. **No pixels in the response.** Cache-keyed by
 /// (mutation_id, request shape, max_tokens, prompt).
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 async fn vision_describe_handler(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<DescribeRequest>>,
@@ -2742,6 +2758,10 @@ async fn vision_assert_handler(
 /// the snapshot's bboxes under `name`. Subsequent
 /// `Assertion::NoLayoutShiftSince { baseline: name }` checks compare
 /// against the recorded bboxes.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 async fn vision_baseline_handler(
     State(state): State<Arc<ApiState>>,
     UiBridgeJson(req): UiBridgeJson<BaselineRequest>,

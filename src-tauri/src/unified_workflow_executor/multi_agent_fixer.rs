@@ -476,6 +476,10 @@ pub fn extract_group_failure_context(
 // =============================================================================
 
 /// Extract JSON from a response that may have markdown fences or surrounding text.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_json_from_response(response: &str) -> String {
     let trimmed = response.trim();
 

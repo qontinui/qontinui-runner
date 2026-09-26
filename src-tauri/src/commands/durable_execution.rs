@@ -113,6 +113,10 @@ pub async fn replay_workflow(
 /// Only safe in worktree-isolated executions.
 /// `working_dir` is optional — if omitted, resolved from the task's worktree.
 #[tauri::command]
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub async fn rollback_workflow_to_iteration(
     storage: State<'_, StorageCompartment>,
     execution_id: String,

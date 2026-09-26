@@ -88,6 +88,10 @@ pub struct IterationDiffSummary {
 
 /// Truncate a string to approximately max_chars, appending "..." if truncated.
 /// Uses char boundaries to avoid panicking on multi-byte UTF-8.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn truncate(s: &str, max_chars: usize) -> String {
     if s.len() <= max_chars {
         s.to_string()

@@ -340,6 +340,10 @@ impl WorkflowEventBus {
 /// - Exact match: `"workflow.completed"` matches `"workflow.completed"`
 /// - Wildcard suffix: `"workflow.*"` matches `"workflow.completed"`, `"workflow.failed"`
 /// - Global wildcard: `"*"` matches everything
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn event_matches(event_name: &str, pattern: &str) -> bool {
     if pattern == "*" {
         return true;

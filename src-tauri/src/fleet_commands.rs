@@ -1664,6 +1664,10 @@ mod tests {
     /// [`tests::no_bundled_command_revives_the_retired_warnings_emptiness_test`],
     /// which is file-scoped over the whole bundle.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn every_registration_honesty_block_carries_the_warnings_rule() {
         const HONESTY: &str = "**Masked-tool honesty";
         let mut checked = 0usize;

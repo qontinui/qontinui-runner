@@ -101,6 +101,10 @@ fn count_spec_stats(spec_json: &str) -> (i64, i64) {
 
 /// Snapshot a spec's current state into the version history.
 /// Skips if content_hash matches the latest version (no changes).
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub async fn snapshot_spec_version(
     pg: &PgDb,
     spec_id: &str,

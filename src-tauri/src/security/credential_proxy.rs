@@ -114,6 +114,10 @@ impl CredentialProxy {
     ///
     /// Returns the real credential value if a placeholder is found.
     /// Only replaces in the configured header names (authorization, x-api-key, etc.).
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     pub fn resolve_placeholder(&self, header_value: &str) -> Option<(String, String)> {
         for (placeholder, source) in &self.placeholder_map {
             if header_value.contains(placeholder.as_str()) {

@@ -1326,6 +1326,10 @@ mod tests {
     /// The credential layer is Withheld, appears as a ROW (so a reader can see
     /// it was considered), and carries no value anywhere in the render.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn config_report_withheld_layer_is_present_and_valueless() {
         let report = build_report(&headless_inputs());
         let row = report

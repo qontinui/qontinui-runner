@@ -47,6 +47,10 @@ impl HardenRule for ReplacePythonFstring {
 
 /// Rewrite a curl|python command containing f-strings to a cleaner
 /// non-f-string equivalent. Returns `None` if no pattern matches.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn replace_python_fstring_with_clean(cmd: &str) -> Option<String> {
     let pipe_idx = cmd.find("| python")?;
     let curl_part = cmd[..pipe_idx].trim();

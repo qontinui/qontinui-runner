@@ -154,7 +154,11 @@ personal `gh auth login` required. On success prints the PR URL to stdout.
 `plan-library-backfill` walks the three scan roots, classifies each markdown
 file to an artifact kind, and upserts it into the qontinui-web plan & prompt
 library with the runner's own device JWT. `--dry-run` prints the per-kind counts
-and the duplicated/divergent stem list without contacting anything.
+and the duplicated/divergent stem list without contacting anything. Exit 1 means
+an artifact push (or the runtime) failed; edge errors are reported but do not
+fail the run. Exit 3 means the run finished but a scan root was unread or read
+only in part, so its counts are floors and the catch-up is incomplete
+(`--limit` truncation is asked for, so it is not counted).
 
 `plan-workunit-backfill` is its WORK-UNIT half: it parses the active plans dir
 and upserts each plan into `coord.work_units`. It deliberately bypasses the
@@ -523,7 +527,7 @@ fn plan_library_backfill(args: &[String]) -> ExitCode {
         .try_init();
 
     let conv = PlanConvention::operator_default();
-    let mut per_root: Vec<(String, usize)> = Vec::new();
+    let mut per_root: Vec<(String, bp::RootYield)> = Vec::new();
     let mut all: Vec<bp::ScannedArtifact> = Vec::new();
     let mut skipped: Vec<bp::SkippedFile> = Vec::new();
     // Through the RESOLVED source, exactly as the reconcile loop does — never
@@ -536,24 +540,52 @@ fn plan_library_backfill(args: &[String]) -> ExitCode {
     // behind its default branch — re-introducing the exact defect Phase 3
     // removes, and with two writers alternating so the corpus flaps. One byte
     // source for both writers is the whole point.
+    //
+    // One pin for the whole run, so roots sharing a repo share one fetch and
+    // one commit — the same guarantee the loop gives its two halves.
+    let pin = pwa::ref_scan::CycleRefPin::default();
     for root in &roots {
-        let (found, mut root_skipped) =
-            pwa::scan_roots_at_source(std::slice::from_ref(root), &conv, &pwa::trigger::ProcessGit);
+        let (found, mut root_skipped) = pwa::scan_roots_at_source(
+            std::slice::from_ref(root),
+            &conv,
+            &pwa::trigger::ProcessGit,
+            &pin,
+        );
+        // A root that could not be read reports UNKNOWN, and a partly read
+        // one a floor, never a bare count. The skip list alone left the
+        // by-root table claiming an empty or a whole root.
+        let yielded = bp::RootYield::of(&root.dir, found.len(), &root_skipped);
         skipped.append(&mut root_skipped);
         let label = format!(
             "{} [{}]",
             root.label,
             root.source_repo.as_deref().unwrap_or("no repo")
         );
-        per_root.push((label, found.len()));
+        per_root.push((label, yielded));
         all.extend(found);
     }
 
     let report = bp::build_report(&all, skipped, per_root);
     println!("{}", bp::render_report(&report));
+    // A run that left a root unread or partly read did its work, but on a
+    // subset of the corpus. Exit 0 would tell a script the catch-up was whole,
+    // which is the UNKNOWN-renders-as-a-default shape the report text avoids.
+    let note_incomplete = || {
+        eprintln!(
+            "qontinui-pr: not every scan root was read whole — the counts above are floors \
+             and the catch-up is incomplete."
+        );
+    };
+    let incomplete_exit = || {
+        note_incomplete();
+        ExitCode::from(BACKFILL_INCOMPLETE_EXIT)
+    };
 
     if parsed.dry_run {
         println!("dry run: nothing was pushed.");
+        if !report.is_complete() {
+            return incomplete_exit();
+        }
         return ExitCode::SUCCESS;
     }
 
@@ -619,10 +651,24 @@ fn plan_library_backfill(args: &[String]) -> ExitCode {
         );
     }
     if summary.errors > 0 {
+        // A push error outranks an incomplete read, but the operator still
+        // needs to know the run covered only a subset.
+        if !report.is_complete() {
+            note_incomplete();
+        }
         return ExitCode::from(1);
+    }
+    if !report.is_complete() {
+        return incomplete_exit();
     }
     ExitCode::SUCCESS
 }
+
+/// `plan-library-backfill`'s exit code when the run succeeded but at least one
+/// scan root was unread or read only in part. Distinct from `1` (a push error)
+/// and `2` (a usage/config refusal), so a script can tell "failed" from
+/// "succeeded over a subset".
+const BACKFILL_INCOMPLETE_EXIT: u8 = 3;
 
 // ===========================================================================
 // `qontinui-pr plan-workunit-backfill` — the WORK-UNIT half of the backfill

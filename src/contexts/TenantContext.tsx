@@ -15,8 +15,20 @@
  * D12 is explicit that the single-tenant case shows no UI. When the
  * operator belongs to multiple tenants, the runner header (and other
  * consumers) read `useTenant().showSwitcher` and render the switcher
- * accordingly. The `candidates` list ships empty in Phase 4 — Phase 5
- * dashboard populates it from a coord round-trip.
+ * accordingly.
+ *
+ * The `candidates` list is POPULATED, and needs no coord round-trip:
+ * `commands/tenant.rs:193` fills it from `pair::read_paired_binding_tenant_ids()`
+ * (`pair.rs:551`), a read of this machine's own `paired_user.json` — which
+ * `commands/tenant.rs:174-175` states outright, "a local file read, NO coord
+ * round-trip, so the switcher renders offline". This doc used to claim the list
+ * "ships empty in Phase 4 — Phase 5 dashboard populates it from a coord
+ * round-trip"; that outlived the code, and a comment understating a shipped
+ * capability made per-tenant UI work look blocked on an unshipped dependency
+ * (corrected by plan
+ * `2026-09-22-plans-dir-is-a-single-path-so-a-multi-bound-device-cannot-author-per-tenant`,
+ * P4). An EMPTY list is UNKNOWN about this device's bindings and never evidence
+ * of a single tenant — see the field's own doc below.
  *
  * Plan §D12 verbatim: "every session is stamped with its tenant at
  * start and keeps it for life — switching active tenant doesn't migrate
@@ -87,8 +99,26 @@ export interface TenantContextValue {
   /** Where the default tenant was resolved from. Diagnostic surface for
    * the settings panel. */
   source: "machine.json" | "paired_user.json" | null;
-  /** Tenants the operator belongs to. Phase 4 ships empty; Phase 5
-   * dashboard populates this via a coord round-trip. */
+  /**
+   * Tenants this device is bound to, as raw UUID strings — there is no display
+   * name on this wire, by design (resolving one needs a coord round-trip and a
+   * widened type; `shortTenantId` in `SpawnTenantPicker` is the labelling
+   * affordance consumers use).
+   *
+   * Populated from a LOCAL file, with no coord round-trip:
+   * `commands/tenant.rs:193` → `pair::read_paired_binding_tenant_ids()`
+   * (`pair.rs:551`) reads this machine's `paired_user.json`, so the list — and
+   * every consumer gated on it — works offline. (This doc previously said
+   * "Phase 4 ships empty; Phase 5 dashboard populates this via a coord
+   * round-trip", which had not been true since that read landed.)
+   *
+   * An EMPTY list is UNKNOWN about the device's bindings, never evidence that it
+   * is bound to exactly one tenant: `read_paired_binding_tenant_ids` returns an
+   * empty vec for an absent or unreadable file and never an error, so the two
+   * cases are indistinguishable from here. {@link showSwitcher} collapses them
+   * because rendering no switcher is the right ACTION for both; a surface that
+   * states something about the bindings must say unknown instead.
+   */
   candidates: string[];
   /** True iff the runner UI should render a tenant switcher. Per D12,
    * single-tenant operators see no UI. */
@@ -101,13 +131,16 @@ export interface TenantContextValue {
   /** Re-pull from Rust. */
   refresh: () => Promise<void>;
   /**
-   * F2 — the tenant the NEXT spawn will bind to. `null` means "nothing has
-   * been resolved yet; fall back to `defaultTenantIdForNewSessions`".
+   * F2 — the tenant the operator EXPLICITLY picked for the next spawn. `null`
+   * means no pick: the spawn sends no tenant and Rust stamps the device default.
+   * The picker still DISPLAYS its inferred / default tenant; only a pick is
+   * published here (plan
+   * 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential re-review
+   * F1 — a sent tenant is admitted fail-closed, so an unpicked one must not be sent).
    *
    * This is deliberately SEPARATE from `defaultTenantIdForNewSessions`: that
    * is the persisted device default (written to machine.json), whereas this is a
-   * transient, un-persisted, per-spawn selection driven by repo→tenant
-   * inference and the operator's picker. Setting it never writes machine.json
+   * transient, un-persisted, per-spawn choice made in the operator's picker. Setting it never writes machine.json
    * and — per D12 — never migrates a RUNNING session; a session's tenant is
    * stamped at spawn and immortal.
    *

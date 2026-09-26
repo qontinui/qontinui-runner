@@ -433,6 +433,10 @@ fn calculate_duration(created_at: &str, completed_at: Option<&str>) -> Option<i6
 }
 
 /// Generate a summary from the output log (truncate if too long)
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn summarize_output(output_log: &str, max_chars: usize) -> String {
     if output_log.len() <= max_chars {
         output_log.to_string()

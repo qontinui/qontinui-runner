@@ -6694,6 +6694,10 @@ struct SseStreamQuery {
 /// GET /ui-bridge/sdk/events/stream — SSE proxy to the SDK app's event stream
 ///
 /// Connects to the SDK app's SSE endpoint and forwards events to the caller.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 async fn handle_sse_event_stream(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<SseStreamQuery>,
@@ -6885,6 +6889,10 @@ mod tests {
     /// which exercise the same `CommandRelay::dispatch` code path both
     /// helpers ultimately delegate to.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn ws_dispatch_action_names_are_well_formed() {
         let src = include_str!("sdk_client.rs");
         let patterns = [

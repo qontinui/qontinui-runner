@@ -127,6 +127,7 @@
 #                       coord_proxy_fleet_<page>, coord_credential,
 #                       coord_fleet_<page>
 #   QMQC_CENSUS_BIN     the census to run (default: beside this script)
+#   QMQC_LIB_DIR        where hook-json.sh is (default: lib/ beside this script)
 #   QMQC_NOW            epoch seconds used as "now"
 #   QMQC_COORD_URL      coord base (default $COORD_HTTP_URL, then
 #                       https://coord.qontinui.io)
@@ -159,15 +160,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CENSUS="${QMQC_CENSUS_BIN:-$SCRIPT_DIR/session-census.sh}"
 COORD="${QMQC_COORD_URL:-${COORD_HTTP_URL:-https://coord.qontinui.io}}"; COORD="${COORD%/}"
 
+LIB_DIR="${QMQC_LIB_DIR:-$SCRIPT_DIR/lib}"
+
+# Sets PY (an argv prefix: the interpreter, plus `-3` for the py launcher)
+# through the shared shim, lib/hook-json.sh. The shim never executes a
+# WindowsApps App Execution Alias except under `timeout`; the loop this replaced
+# ran `python3 -c` unbounded, and the Python Install Manager's alias HANGS, so
+# this nightly gate hung before reading a single signal (plan
+# 2026-09-13-heartbeat-stop-python3-stub-ide-cargo-quiesce, D1 re-vet).
+# $PYTHON, when set, is the ONLY candidate.
 resolve_python() {
-  local c
-  for c in "${PYTHON:-}" python3 python; do
-    [ -n "$c" ] || continue
-    command -v "$c" >/dev/null 2>&1 || continue
-    "$c" -c 'import json, sys; sys.exit(0 if sys.version_info >= (3, 6) else 1)' >/dev/null 2>&1 \
-      && { printf '%s' "$c"; return 0; }
-  done
-  return 1
+  { [ -r "$LIB_DIR/hook-json.sh" ] && . "$LIB_DIR/hook-json.sh" && hook_shim_python3 --require 'assert sys.version_info >= (3, 6); import json'; } || return 1
+  PY=("$HOOK_PY3_EXE"); [ -n "${HOOK_PY3_ARG:-}" ] && PY+=("$HOOK_PY3_ARG")
+  return 0
 }
 native() {
   if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else printf '%s' "$1"; fi
@@ -179,7 +184,7 @@ curl_path() {
   if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else printf '%s' "$1"; fi
 }
 
-PY="$(resolve_python)" || {
+resolve_python || {
   # Nothing below can be read without an interpreter; say so in the contract's
   # own shape rather than as prose a consumer would have to parse.
   printf '{"verdict":"UNKNOWN","override_eligible":false,"blocking":[],"overridable":[],"per_repo":{},"self":{"pids":[]},"probes":[{"name":"python","status":"unknown","detail":"no working python3/python interpreter"}]}\n'
@@ -769,10 +774,20 @@ if __name__ == "__main__":
         sys.exit(4)
 PYEOF
 QPY="$(native "$WORK/qmqc.py")"
-qpy() { "$PY" "$QPY" "$@"; }
+qpy() { "${PY[@]}" "$QPY" "$@"; }
 
 # ---- 1. census -------------------------------------------------------------
-bash "$CENSUS" --json >"$WORK/census.json" 2>"$WORK/census.err"; CENSUS_RC=$?
+# The census resolves its own interpreter with the unbounded loop this script
+# used to run, so hand it the one proven above. Only a PATH crosses a process
+# boundary, never the shim's python3 function. `$PYTHON` carries one word, so a
+# launcher that needs its `-3` gets a one-line wrapper that supplies it.
+CENSUS_PY="$HOOK_PY3_EXE"
+if [ -n "${HOOK_PY3_ARG:-}" ]; then
+  CENSUS_PY="$WORK/census-python"
+  printf '#!/bin/sh\nexec %s %s "$@"\n' "$(printf '%q' "$HOOK_PY3_EXE")" "$(printf '%q' "$HOOK_PY3_ARG")" > "$CENSUS_PY"
+  chmod +x "$CENSUS_PY"
+fi
+PYTHON="$CENSUS_PY" bash "$CENSUS" --json >"$WORK/census.json" 2>"$WORK/census.err"; CENSUS_RC=$?
 
 # ---- 2. runner instances + readiness ----------------------------------------
 http_fetch sup_runners GET "http://127.0.0.1:9875/runners" "" "" 10

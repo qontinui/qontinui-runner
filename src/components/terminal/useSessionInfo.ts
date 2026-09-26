@@ -162,8 +162,16 @@ export interface SessionTenancy {
     tenantId: string | null;
     /** The machine's default tenant as read when this session was SPAWNED —
      * the expected tenant of a spawn that chose none, compared only when nothing
-     * else names one. `null` when the runner did not record the spawn. */
+     * else names one. Persisted with the session's lifecycle record, so a
+     * restart keeps the spawn's value. `null` is ambiguous on its own — read
+     * {@link spawnDeviceDefaultStatus}. */
     spawnDeviceDefaultTenantId: string | null;
+    /** `"recorded"` (the value above is the spawn's, `null` = no default then) |
+     * `"unknown"` (NOT recorded — never compared, never read as "no default"). */
+    spawnDeviceDefaultStatus: string;
+    /** Why the status is unknown: `not_recorded` | `unparseable`, or
+     * `runner_predates_status` for a runner that serves no status field. */
+    spawnDeviceDefaultReason: string | null;
     /** The machine's CURRENT default tenant — context only, never compared (a
      * switch re-points future sessions only). */
     currentDeviceDefaultTenantId: string | null;
@@ -189,8 +197,12 @@ export interface SessionTenancy {
       reason: string | null;
     };
   };
-  /** The tenants that ARE known name more than one tenant. */
+  /** The tenants that ARE known name more than one tenant. `false` is NOT
+   * agreement — read {@link divergence}. */
   diverged: boolean;
+  /** `"diverged"` | `"agree"` (credential AND an expected tenant known, and
+   * equal) | `"unknown"` (a half of the comparison is unknown). */
+  divergence: "diverged" | "agree" | "unknown";
 }
 
 export interface SessionInfoBody {
@@ -527,8 +539,7 @@ export function prRowChip(
   // thing. (The strong claim used to read "closed, not landed", and it was
   // printed on every coord rebase-fast-forward land: those rewrite the shas,
   // so the ancestry probe backing it could never have passed.)
-  if (pr.prState === "closed")
-    return { text: "closed — land unverified", tone: "unknown" };
+  if (pr.prState === "closed") return { text: "closed — land unverified", tone: "unknown" };
   return { text: pr.prState ?? "open", tone: "open" };
 }
 
@@ -829,6 +840,8 @@ export function normalizeTenancy(raw: unknown): SessionTenancy | null {
     row?: {
       tenantId?: unknown;
       spawnDeviceDefaultTenantId?: unknown;
+      spawnDeviceDefaultStatus?: unknown;
+      spawnDeviceDefaultReason?: unknown;
       currentDeviceDefaultTenantId?: unknown;
     };
     dataPlane?: { status?: unknown; tenantId?: unknown; reason?: unknown };
@@ -840,6 +853,7 @@ export function normalizeTenancy(raw: unknown): SessionTenancy | null {
       posture?: { status?: unknown; value?: unknown; canAnswer?: unknown; reason?: unknown };
     };
     diverged?: unknown;
+    divergence?: unknown;
   };
   const credentialStatus = str(v.credential?.status);
   const dataPlaneStatus = str(v.dataPlane?.status);
@@ -847,10 +861,30 @@ export function normalizeTenancy(raw: unknown): SessionTenancy | null {
     return null;
   }
   const posture = v.credential?.posture;
+  // A runner that predates the status field flattened "not recorded" into a
+  // null tenant, so a null there is UNKNOWN; a named tenant was recorded.
+  const spawnDefaultTenant = str(v.row.spawnDeviceDefaultTenantId);
+  const spawnDefaultStatus =
+    str(v.row.spawnDeviceDefaultStatus) ?? (spawnDefaultTenant ? "recorded" : UNKNOWN_TEXT);
+  const spawnDefaultReason =
+    str(v.row.spawnDeviceDefaultReason) ??
+    (str(v.row.spawnDeviceDefaultStatus) === null && spawnDefaultStatus === UNKNOWN_TEXT
+      ? "runner_predates_status"
+      : null);
+  // A runner that predates `divergence` can only say `diverged`; its `false`
+  // also covered "could not compare", so it reads UNKNOWN, never agreement.
+  const divergence: SessionTenancy["divergence"] =
+    v.divergence === "diverged" || v.divergence === "agree" || v.divergence === "unknown"
+      ? v.divergence
+      : v.diverged
+        ? "diverged"
+        : "unknown";
   return {
     row: {
       tenantId: str(v.row.tenantId),
-      spawnDeviceDefaultTenantId: str(v.row.spawnDeviceDefaultTenantId),
+      spawnDeviceDefaultTenantId: spawnDefaultTenant,
+      spawnDeviceDefaultStatus: spawnDefaultStatus,
+      spawnDeviceDefaultReason: spawnDefaultReason,
       currentDeviceDefaultTenantId: str(v.row.currentDeviceDefaultTenantId),
     },
     dataPlane: {
@@ -871,6 +905,7 @@ export function normalizeTenancy(raw: unknown): SessionTenancy | null {
       },
     },
     diverged: v.diverged,
+    divergence,
   };
 }
 

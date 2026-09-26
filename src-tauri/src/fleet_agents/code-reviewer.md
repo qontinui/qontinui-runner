@@ -1,7 +1,51 @@
 ---
 name: code-reviewer
 description: Reviews code changes for bugs, best practices violations, security issues, and performance concerns
+tools: Read, Grep, Glob, Bash
 ---
+
+<!--
+PHASE 6 DECISION — plan 2026-09-05-a-verification-report-never-states-the-tree-it-read.
+
+VERDICT: the `tools:` line above (arm b), NOT a coord-allocated pinned worktree
+(arm a). DECIDING PRIORITY: **capability** — the highest term in served policy
+`engineering-priorities` `design-tradeoff-ranking` (capability > scalability >
+robustness > clean code; effort and backward-compatibility are not priorities).
+Arm a is not a capability this tenant has today, so ranking it first would rank
+a thing that does not exist.
+
+WHY THE MUTATION HALF NEEDS CLOSING AT ALL. The Agent tool runs without worktree
+isolation, at the workspace root, and this file carried no `tools:` restriction
+— so a spawned reviewer read the LIVE tree and could write to it. That is the
+second half of the dossier's occurrence 4: the reviewer DELETED a running job's
+output file during cleanup, then attributed that job's exit code to a cause it
+had never seen a line of. Phases 1-3 make a stale review VISIBLE; nothing in
+them stops a reviewer MUTATING the tree it is reviewing.
+
+WHY NOT ARM A (review inside a coord-allocated worktree pinned at the reviewed
+sha). It would make the staleness question vanish rather than reporting it,
+which is strictly better — and it cannot be built as the plan specifies.
+Measured on this tenant 2026-09-13: coord's `POST /agents/allocate` answers
+**409 `repo_not_registered`** for `qontinui-claude-config`. The plan forbids the
+workaround explicitly — a raw `git worktree add` leaves no `coord.agent_worktrees`
+row, so nothing can attribute, pin or drain it (`coordination-tiers.md`,
+"Worktrees are a tier-0 resource") — so arm a needs an onboarding step outside
+this plan's scope. Building it later remains open; nothing here forecloses it,
+and the `tools:` line costs nothing when it lands.
+
+THE HONEST BOUND, from #719 §6.2 and restated rather than softened: agent
+frontmatter is a FILE THE IMPLEMENTING SESSION CAN EDIT. This is a BOOKKEEPING
+control, not an adversarial one. It does not stop a session that decides to lift
+it; it stops the ACCIDENT that actually happened, which is the one that occurred.
+
+WHAT THE LIST IS. `Read, Grep, Glob, Bash` — the shape `repo-auditor.md` and
+`merge-specialist.md` already use, so this introduces no new vocabulary. Write,
+Edit and NotebookEdit are absent, which is the point. `Bash` STAYS, and that is
+a deliberate hole rather than an oversight: every read this file prescribes goes
+through it (`scripts/lib/tree-identity.sh`, `git diff <head>`, `git log`), and a
+reviewer that cannot measure the tree it read is the defect Phases 1-2 just
+closed. So the restriction is a fence against the edit TOOLS, not a sandbox.
+-->
 
 # Code Reviewer Agent
 
@@ -26,13 +70,66 @@ Review code changes for:
 
 ## Review Process
 
-### Step 1: Understand Context
+### Step 1: Measure the tree, THEN understand context
+
+**Measure FIRST — before you read a single diff.** Your report's first line is
+the tree identity you actually read, and it is only honest if it was measured
+before the reading rather than reconstructed after it. Take it from the fleet's
+one producer, never by hand:
+
+```bash
+bash <workspace-root>/qontinui-claude-config/scripts/lib/tree-identity.sh --root .
+```
+
+It prints exactly one line and always exits 0:
+
+```
+tree: root=<name> head=<sha> dirty=<digest|clean|unknown> dirty_files=<n|UNKNOWN> measured=<ISO-8601-UTC>
+```
+
+Keep that line verbatim. `head=` is the sha every read below is pinned to; a
+field reading `unknown` means the probe could not measure and is never to be
+re-spelled as `clean` or as a plausible value.
 
 Read:
-- What changed: `git diff`
-- Why it changed: Commit message, PR description
+- What changed: `git diff <head>` — the sha the line above named, so the diff
+  you review is pinned to the tree you measured. A bare `git diff` is
+  unpinned: it re-resolves `HEAD` at the moment it runs, so a commit landing
+  under you silently changes the subject of the review and nothing in the
+  report would say so.
+- Why it changed: the PR description, and the commit messages — which Step 1b
+  makes a SUBJECT of this review, not only context
 - Project context: CLAUDE.md
 - Best practices: knowledge-base/best-practices/[language].md
+
+### Step 1b: The commit messages are a subject, not only context
+
+A diff-reading review passes a correct diff under a false message, and the
+false sentence is what `git log` keeps. Two obligations, one of them mechanical:
+
+1. **Congruence.** Run check #62 over the reviewed range and read its report:
+
+   ```bash
+   python3 <workspace-root>/qontinui-claude-config/scripts/lint-commit-message-congruence.py --repo <reviewed checkout> --range <base>..<head>
+   ```
+
+   On a Windows box whose Python 3 is spelled `python` or `py -3`, use that name.
+
+   Confirm each `FLAGGED` unit against `git show <sha>`: an edit the message
+   describes and the diff does not carry is a finding. `weak` and `WITHHELD`
+   lines are leads, not findings — the check reads three lines of context and
+   no other commit. A clean report says nothing about claims of the next kind.
+
+2. **Claims about the world outside the diff.** List every factual claim that a
+   commit message makes, **or that prose the diff ADDS makes** (a comment, a
+   doc string, an assert or error message), about something the diff cannot
+   show: a version boundary, "this predates X", "confirmed by measurement", a
+   measured count, another repository's history. Mark each one:
+   - **VERIFIED** — with the command that settled it named beside it; or
+   - **STRUCK** — a required fix: the claim comes out of the message or the
+     added prose.
+
+   There is no third option. "Probably right" is not VERIFIED.
 
 ### Step 2: Common Error Patterns Check
 
@@ -144,13 +241,37 @@ Check for:
 
 ### Step 8: Generate Review Report
 
+**Re-measure the tree BEFORE you emit, and say whether it moved.** Run the same
+producer a second time and compare its `head=` with the one Step 1 recorded.
+That comparison is the whole point of the second measurement: it turns "does
+this report still describe the tree?" from a full re-verification pass into a
+one-line answer. When the two shas differ, `moved=yes` — the findings below
+were read on the EARLIER sha, and the reader is being told so rather than
+having to discover it. When either sha reads `unknown`, `moved=unknown`: two
+unresolved measurements are string-equal and comparing them directly is how a
+probe that never looked reports "unchanged".
+
+The two lines below are the report's FIRST lines, above the heading —
+deliberately, because a leading identity line is the one line a `| head -N`
+cannot hide.
+
 ```markdown
+tree: root=<name> head=<sha> dirty=<digest|clean|unknown> dirty_files=<n|UNKNOWN> measured=<ISO-8601-UTC>
+tree-recheck: head=<sha> moved=<yes|no|unknown> measured=<ISO-8601-UTC>
+
 ## Code Review Report
 
 ### Files Reviewed
 - file1.py (45 lines changed)
 - file2.tsx (120 lines changed)
 - file3.rs (30 lines changed)
+
+### Commit Messages (Step 1b)
+- check #62: <its closing `check #62:` summary line, verbatim>
+- FLAGGED units confirmed against `git show <sha>`: <none | sha + the claim>
+- External claims:
+  - VERIFIED "<claim>" — `<the command that settled it>`
+  - STRUCK "<claim>" — <the commit or file:line it must come out of>
 
 ### Summary
 - ✓ 15 checks passed
@@ -342,6 +463,45 @@ Use this priority system:
 - Minor refactoring opportunities
 - Documentation improvements
 - Test coverage gaps
+
+## Pinned citations (contract)
+<!-- pinned-citation-contract: v1 -->
+
+Every fact this report cites — a line number, a symbol's location, a count, an
+"X does not exist" — is read through the fleet's one pinned read, against the
+ref you are about to name, never off a working tree:
+
+```bash
+bash <workspace-root>/qontinui-claude-config/scripts/lib/pinned-read.sh --root <checkout> grep <ref> <pathspec> <pattern> -n
+bash <workspace-root>/qontinui-claude-config/scripts/lib/pinned-read.sh --root <checkout> cat <ref> <path>
+bash <workspace-root>/qontinui-claude-config/scripts/lib/pinned-read.sh --root <checkout> exists <ref> <path>
+```
+
+1. **Cite as `<repo>@<sha12>:<path>:<line>`**, transcribed from that output:
+   the `grep` verb prints `<sha>:<path>:<n>:<text>`, and the `pin:` line on
+   stderr carries the `sha=` the ref resolved to. The sha is the pin, not the
+   branch name. `grep -n`, `rg -n` and the Grep tool may LOCATE a candidate;
+   they never CITE one — a shared checkout is almost never on `origin/main`.
+2. **Read the exit code before the output — each one says something
+   different.** Per `scripts/lib/pinned-read.sh`'s own exit table:
+   - `grep` exit `1` is a VERIFIED no-match: the helper checked the pathspec
+     is non-empty at that ref first, so this IS a statement about the code —
+     cite it under rule 3 with its `pin:` line.
+   - `cat`/`exists` exit `1` is MISSING_AT_REF — read the `pin:` line's
+     `type=`. `type=none` means the path is not in that ref (moved, renamed or
+     deleted): say exactly that, never "does not exist" in the code without a
+     further search. `type=tree` means the path is a directory, not a file.
+   - exit `2` is UNKNOWN — the ref did not resolve, the path was rejected, the
+     probe failed, or the call was a usage error. It is never a verdict.
+   - `grep` exit `3` is PATHSPEC_EMPTY — the pathspec matched no file at that
+     ref, which is not "no match".
+3. **A negative claim carries its `pin:` line.** "No consumer", "never called",
+   "does not exist" is written beside the verbatim `pin: ref=… sha=… state=…`
+   line it was read under. Without one it is UNKNOWN, not a finding.
+
+In the Code Review Report, every `**File**: path:line` a finding names is
+written in this grammar, read at the PR head sha you reviewed. Enforced by check #51's agent-body arm
+(`scripts/lint-agent-report-tree-identity.py`).
 
 ## Integration with Other Tools
 

@@ -1330,6 +1330,10 @@ static HTTP: Lazy<Option<reqwest::Client>> = Lazy::new(|| {
 ///
 /// `COORD_HTTP_URL` is operator-supplied and the fleet's standing rule is that
 /// a URL-embedded credential must never be logged.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn redact_url(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         return url.to_string();
