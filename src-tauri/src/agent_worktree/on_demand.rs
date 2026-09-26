@@ -371,7 +371,10 @@ pub struct SurveyItem {
     /// **Always populated, NEVER blank.** One of `"<name> (session <short>)"`,
     /// `"session <id>"`, `"session <id> (unresolvable)"` (a ghost — id
     /// stamped, but no name-file and no transcript in any of the five
-    /// `C:/claude/.claude-*` account roots), or the literal `"unattributed"`.
+    /// `C:/claude/.claude-*` account roots), the literal `"unattributed"`, or
+    /// `"unattributed-partial-coord-index"` — no source spoke, but the coord
+    /// ownership index was a PREFIX of the ledger (the cursor walk stopped
+    /// early), so the absence of an owner is NOT established for this row.
     /// Matches coord's shipped precedent, `GET
     /// /coord/trees/wip-owners/:device_id` ("ownership join (honest
     /// `unattributed`)").
@@ -381,7 +384,8 @@ pub struct SurveyItem {
     /// The resolved human-readable name, when one could be resolved.
     pub session_name: Option<String>,
     /// `custody_record` | `coord_allocation` | `coord_branch_author` |
-    /// `commit_trailer` | `none` — WHICH source spoke. Rendered so a weak
+    /// `commit_trailer` | `none` | `none_partial_coord_index` — WHICH source
+    /// spoke (the last: none did, over a PARTIAL coord index). Rendered so a weak
     /// answer can never be mistaken for a strong one.
     pub attribution_source: &'static str,
     /// `strong` | `evidential` | `weak` | `none`.
@@ -468,8 +472,19 @@ pub struct SurveySummary {
     pub surveyed: usize,
     /// Surveyed worktrees for which SOME source named an owning session.
     pub attributed: usize,
-    /// Surveyed worktrees rendering the literal `unattributed`.
+    /// Surveyed worktrees rendering the literal `unattributed` — no source
+    /// named an owner AND the coord ownership index covered the whole ledger
+    /// (or coord was unreachable, which [`Self::coord_ownership_reachable`]
+    /// states). Rows with no owner over a PARTIAL index are NOT counted here;
+    /// see [`Self::unattributed_partial_coord_index`].
     pub unattributed: usize,
+    /// Surveyed worktrees with no owner from any source while the coord
+    /// ownership index was PARTIAL ([`Self::coord_ownership_partial`]) —
+    /// rendered `unattributed-partial-coord-index`. Their allocation row may
+    /// sit on a page the cursor walk never read, so they are a coverage gap,
+    /// not a confident "nobody owns this".
+    /// `unattributed + unattributed_partial_coord_index == surveyed - attributed`.
+    pub unattributed_partial_coord_index: usize,
     /// `attributed / surveyed`. `None` — never `0.0` — when nothing was
     /// surveyed, because an empty census says nothing about coverage.
     pub attribution_rate: Option<f64>,
@@ -518,8 +533,9 @@ pub struct SurveySummary {
     pub coord_ownership_error: Option<String>,
     /// Present when coord answered but the cursor walk over
     /// `GET /coord/sessions/worktrees` stopped before its last page. The index
-    /// is then a PREFIX of the ledger: `unattributed` rows are partly a
-    /// coverage gap, not an absence of owners.
+    /// is then a PREFIX of the ledger, and every ownerless row is labelled
+    /// `unattributed-partial-coord-index` (counted in
+    /// [`Self::unattributed_partial_coord_index`]) rather than `unattributed`.
     pub coord_ownership_partial: Option<String>,
 
     // --- Volume headroom (disk-monitoring Phase 1, step 3) ---
@@ -1316,7 +1332,7 @@ fn attribute_row(
     });
     let coord_owner: Option<CoordOwner> =
         ownership.and_then(|o| o.owner_for(&w.path, &w.repo, w.branch.as_deref()));
-    custody::resolve_attribution(
+    let attribution = custody::resolve_attribution(
         &AttributionInput {
             custody: custody.as_ref(),
             coord: coord_owner.as_ref(),
@@ -1325,7 +1341,27 @@ fn attribute_row(
             now_epoch,
         },
         directory,
-    )
+    );
+    relabel_for_partial_index(attribution, ownership.is_some_and(|o| o.partial.is_some()))
+}
+
+/// When NO source named an owner and the coord ownership index was PARTIAL,
+/// say so on the row: `unattributed-partial-coord-index` /
+/// `none_partial_coord_index`, never the confident `unattributed` / `none`.
+/// Any row a source DID attribute is returned unchanged — a partial index
+/// weakens only the negative claim. Pure.
+fn relabel_for_partial_index(attribution: Attribution, ownership_partial: bool) -> Attribution {
+    if ownership_partial && attribution.session_id.is_none() {
+        Attribution {
+            // Keep everything the resolver did find (custody fields with no
+            // id are still evidence); only the label and source change.
+            session_label: Attribution::unattributed_in_partial_coord_index().session_label,
+            source: custody::AttributionSource::NonePartialCoordIndex.as_str(),
+            ..attribution
+        }
+    } else {
+        attribution
+    }
 }
 
 /// Roll the per-item attributions up into the summary counters.
@@ -1338,7 +1374,19 @@ fn attribute_row(
 fn summarize_attribution(items: &[SurveyItem], summary: &mut SurveySummary) {
     summary.surveyed = items.len();
     summary.attributed = items.iter().filter(|i| i.session_id.is_some()).count();
-    summary.unattributed = summary.surveyed - summary.attributed;
+    // Split the ownerless rows by whether the negative claim is established:
+    // an ownerless row over a PARTIAL coord index is a coverage gap, counted
+    // apart so the headline `unattributed` never includes it.
+    summary.unattributed_partial_coord_index = items
+        .iter()
+        .filter(|i| {
+            i.session_id.is_none()
+                && i.attribution_source
+                    == custody::AttributionSource::NonePartialCoordIndex.as_str()
+        })
+        .count();
+    summary.unattributed =
+        summary.surveyed - summary.attributed - summary.unattributed_partial_coord_index;
     // `None`, never `0.0`, on an empty population: an empty census says
     // nothing about coverage (served policy `silent-empty-is-unknown`).
     summary.attribution_rate =
@@ -1611,8 +1659,9 @@ pub struct WipOrphan {
     pub repo: String,
     pub branch: Option<String>,
 
-    /// **Never blank.** `unattributed` when no source spoke; `session <id>
-    /// (unresolvable)` for a ghost.
+    /// **Never blank.** `unattributed` when no source spoke;
+    /// `unattributed-partial-coord-index` when none spoke over a PARTIAL coord
+    /// index; `session <id> (unresolvable)` for a ghost.
     pub session_label: String,
     pub session_id: Option<String>,
     pub session_name: Option<String>,
@@ -3114,6 +3163,52 @@ mod tests {
         assert_eq!(summary.wip_attribution_rate, Some(0.5));
     }
 
+    /// Over a PARTIAL coord ownership index, an ownerless row must SAY so on
+    /// the row (label + source) and be counted apart from the confident
+    /// `unattributed`; an attributed row is untouched. Over a complete index
+    /// the same rows render the literal `unattributed`.
+    #[test]
+    fn a_partial_ownership_index_relabels_ownerless_rows_and_counts_them_apart() {
+        let _amb = crate::test_env::isolated_ambient();
+        let a = attributed_row("D:/qontinui-root/wt-a", OWNER, 1_000);
+        let b = census_row("D:/qontinui-root/wt-b", true, Some(false));
+        let c = census_row("D:/qontinui-root/wt-c", false, Some(false));
+        let rows = [a, b, c];
+        let whole = CoordOwnership::default();
+        let partial = whole
+            .clone()
+            .with_partial(Some("stopped at the 100-page bound".to_string()));
+
+        let (items, _) = build_survey_items(&rows, None, &directory(), Some(&partial), 1_060);
+        let mut summary = SurveySummary::default();
+        summarize_attribution(&items, &mut summary);
+        for i in &items {
+            if i.session_id.is_some() {
+                assert_eq!(i.attribution_source, "custody_record");
+            } else {
+                assert_eq!(i.session_label, "unattributed-partial-coord-index");
+                assert_eq!(i.attribution_source, "none_partial_coord_index");
+            }
+        }
+        assert_eq!(summary.surveyed, 3);
+        assert_eq!(summary.attributed, 1);
+        assert_eq!(
+            summary.unattributed, 0,
+            "no row over a partial index may be counted as confidently unattributed"
+        );
+        assert_eq!(summary.unattributed_partial_coord_index, 2);
+
+        let (items, _) = build_survey_items(&rows, None, &directory(), Some(&whole), 1_060);
+        let mut summary = SurveySummary::default();
+        summarize_attribution(&items, &mut summary);
+        assert!(items
+            .iter()
+            .filter(|i| i.session_id.is_none())
+            .all(|i| i.session_label == "unattributed" && i.attribution_source == "none"));
+        assert_eq!(summary.unattributed, 2);
+        assert_eq!(summary.unattributed_partial_coord_index, 0);
+    }
+
     /// An empty population is UNKNOWN coverage, not 0%.
     #[test]
     fn an_empty_population_reports_rate_none_never_zero() {
@@ -3189,9 +3284,25 @@ mod tests {
         let _amb = crate::test_env::isolated_ambient();
         let wt = "D:/qontinui-root/wt-anon";
         let mut s = survey_of(vec![census_row(wt, true, Some(false))], &directory(), 1_000);
+        let partial = CoordOwnership::default()
+            .with_partial(Some("stopped at the 100-page bound".to_string()));
+        let (items, _) = build_survey_items(
+            &[census_row(wt, true, Some(false))],
+            None,
+            &directory(),
+            Some(&partial),
+            1_000,
+        );
+        s.items = items;
         s.summary.coord_ownership_reachable = true;
-        s.summary.coord_ownership_partial = Some("stopped at the 100-page bound".to_string());
+        s.summary.coord_ownership_partial = partial.partial.clone();
+        summarize_attribution(&s.items, &mut s.summary);
         let report = build_wip_orphans(&s, chrono::Utc::now());
+        assert_eq!(
+            report.orphans[0].session_label, "unattributed-partial-coord-index",
+            "the row itself must not claim a confident 'unattributed'"
+        );
+        assert_eq!(report.orphans[0].attribution_source, "none_partial_coord_index");
         assert_eq!(
             report.coord_ownership_partial.as_deref(),
             Some("stopped at the 100-page bound")
