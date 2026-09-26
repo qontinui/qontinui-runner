@@ -284,6 +284,71 @@ does not serve this route yet all mean the same thing — skip the step and star
 work. The `--connect-timeout 5 -m 15` above is what keeps a black-holed host
 from stalling the checklist. Nothing this step reads may delay or block step 1.
 
+### 0c. Phase-aware reserve (only for a phase-claimable plan)
+
+*(Plan `2026-09-06-multi-phase-plans-have-no-per-phase-lifecycle-in-vet-plan-preflight-and-coord`
+Phase 1 — canonical spec; `/vet-plan` §0.2 and `/vet-imp` Step 1.1 cite this
+section rather than re-deriving it.)*
+
+A plan is **phase-claimable** iff its body carries a `How to take a phase` /
+`independently claimable` declaration, or a `Phase-Claimable: yes` line in its
+status block — **parse it, do not infer it** from the mere presence of multiple
+phases. Most plans are not phase-claimable; step 0 above is the whole story for
+them.
+
+On a phase-claimable plan, and only then, reserve the SPECIFIC phase you are
+about to take, in addition to step 0's whole-plan reserve — never instead of it:
+
+1. **The key is `plan:<plan-slug>:phase:<n>`** — the identical spelling and
+   `kind: "phase"` claim primitive `/implement-plan` Step 0.6 has used since
+   before this section existed (`.claude/commands/implement-plan.md:1258-1260`).
+   This is not a new mechanism; it is reusing the one that already exists, at
+   vet time and at preflight time as well as at implement time — so a vetter
+   taking Phase 3 and an implementer taking Phase 3 collide on the SAME row,
+   and a vetter taking Phase 2 and an implementer taking Phase 5 do not.
+2. **Reserve it with the SAME call shape as step 0**, `kind: "phase"` in place
+   of `kind: "semantic_resource"`, `plan:<plan-slug>:phase:<n>` in place of
+   `plan:<plan-slug>`, same owner token (`machine_id:agent_session_id`):
+   ```bash
+   . <workspace-root>/qontinui-claude-config/scripts/lib/envelope.sh
+   R=$(mktemp)
+   curl -s --max-time 120 -X POST "$COORD_HTTP_URL/claims/acquire" \
+     -H "Content-Type: application/json" \
+     -d "{\"kind\":\"phase\",\"resource_key\":\"plan:<plan-slug>:phase:<n>\",\
+          \"machine_id\":\"$MACHINE_ID\",\"agent_session_id\":\"$AGENT_SESSION_ID\"}" > "$R"
+   # claimed | renewed | held; topic_conflict / topic_unknown / invalid_topic /
+   # tenant_not_bound are surfaced verbatim (forking_sibling is retired and never sent).
+   # An absent `result` is UNKNOWN (exit 3), never "free".
+   RES=$(envelope_require claims_acquire result "$R"); rc=$?
+   echo "result=$RES"
+   case "$RES" in
+     '"claimed"'|'"renewed"') echo "ttl_seconds=$(envelope_require claims_acquire ttl_seconds "$R")" ;;  # step 4's --ttl
+     '"held"') # coord omits current_holder_session for a bare-machine (legacy) holder
+               echo "holder_session=$(envelope_require claims_acquire current_holder_session "$R" 2>/dev/null || echo '<absent: bare-machine holder>')"
+               echo "holder_machine=$(envelope_require claims_acquire current_holder "$R")" ;;
+     *) [ "$rc" -eq 0 ] && { cat "$R"; echo; } ;;
+   esac
+   rm -f "$R"; [ "$rc" -eq 0 ] || echo "UNKNOWN: phase reserve unanswered (rc=$rc)"
+   ```
+3. **Treat a foreign `held` on step 0's PLAN key as advisory only** — name the
+   holder, do not stop — and **STOP only on a foreign `held` of the SAME phase
+   key**. A different session vetting or implementing a DIFFERENT phase of the
+   same plan is expected and correct concurrency, not a collision; the plan key
+   is shared by design on a phase-claimable plan, so its `held` carries no
+   information about whether YOUR phase is free.
+4. Add the phase key to the same heartbeat ledger step 0 uses
+   (`scripts/coord-claim-heartbeat.sh add --kind phase --key
+   "plan:<plan-slug>:phase:<n>" --ttl <ttl_seconds>`), and release it the same
+   way, on the same try/finally, when this session's work on that phase ends.
+
+**Never invent a different spelling** (`#phase-N`, `:phase-N`, or any other
+suffix) — a spelling that differs from `/implement-plan` Step 0.6's shares no
+row with it, and two sessions on the SAME phase then fail to collide either.
+That was the exact defect this section closes (`2026-09-04` five-session
+incident on `2026-09-04-plan-status-drift-reconciliation-and-sweep-selection-repair`,
+which used both `#phase-3` and `:phase-2` and neither collided with the other
+or with an implementer's `kind:phase` claim).
+
 ### 1. Durable cross-time check (catches already-merged work)
 
 The reserve claim in step 0 is **TTL'd** — it expires and is released on
