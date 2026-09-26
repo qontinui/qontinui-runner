@@ -1296,6 +1296,36 @@ fn append_tab_id_query(path: &str, tab_id: Option<&str>) -> String {
     }
 }
 
+/// `(body, success, error)` for the WS/HTTP arm of [`handle_element_action`].
+///
+/// Normalised at THIS boundary: the app's JSON is forwarded to the caller and
+/// persisted as an `action_executed` event, so a body with no boolean `success`
+/// (a relay frame whose `result` was absent arrives as `null`) is rewritten to
+/// an explicit `success: false` + `INDETERMINATE:` error instead of reading as
+/// success here and at every permissive consumer downstream.
+fn ws_element_action_result(
+    data: serde_json::Value,
+) -> (serde_json::Value, bool, Option<String>) {
+    let (data, outcome) = super::ui_bridge::request::normalize_action_result(data);
+    let err = outcome.error_message();
+    (data, outcome.succeeded(), err)
+}
+
+/// `(body, success, error)` for the IPC fallback arm of
+/// [`handle_element_action`]. Strict: only an explicit `success: true` is
+/// wrapped as a success — an absent key used to be re-minted as `true` here.
+fn ipc_element_action_result(
+    data: serde_json::Value,
+) -> (serde_json::Value, bool, Option<String>) {
+    let (data, outcome) = super::ui_bridge::request::normalize_action_result(data);
+    if outcome.succeeded() {
+        (serde_json::json!({ "success": true, "data": data }), true, None)
+    } else {
+        let err = outcome.error_message();
+        (data, false, err)
+    }
+}
+
 /// POST /ui-bridge/sdk/element/:id/action — Execute an action on an element
 async fn handle_element_action(
     State(state): State<Arc<ApiState>>,
@@ -1339,11 +1369,14 @@ async fn handle_element_action(
     .await
     {
         Ok(data) => {
-            let success = data
-                .get("success")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-            (Json(data), success, None)
+            // Normalised at THIS boundary: the app's JSON is forwarded to the
+            // caller and logged below, so a body with no boolean `success` (a
+            // relay frame whose `result` was absent arrives as `null`) is
+            // rewritten to an explicit `success: false` + `INDETERMINATE:`
+            // error instead of reading as success here and at every
+            // permissive consumer downstream.
+            let (data, success, err) = ws_element_action_result(data);
+            (Json(data), success, err)
         }
         Err(_) => {
             // Fall back to IPC — wrap action in an object to match the format
@@ -1375,16 +1408,8 @@ async fn handle_element_action(
             });
             match ui_bridge_request_sync(&state, "execute_action", payload).await {
                 Ok(data) => {
-                    if data.get("success") == Some(&serde_json::json!(false)) {
-                        let err = data.get("error").and_then(|v| v.as_str()).map(String::from);
-                        (Json(data), false, err)
-                    } else {
-                        (
-                            Json(serde_json::json!({ "success": true, "data": data })),
-                            true,
-                            None,
-                        )
-                    }
+                    let (data, success, err) = ipc_element_action_result(data);
+                    (Json(data), success, err)
                 }
                 Err(e) => (
                     Json(serde_json::json!({ "success": false, "error": e })),
@@ -7174,5 +7199,69 @@ mod tests {
             !manager_has_active(&mgr),
             "no active_url must report not-active even if a connection lingers"
         );
+    }
+}
+
+#[cfg(test)]
+mod element_action_result_tests {
+    //! R1 / R2 of plan
+    //! `2026-09-10-two-runner-call-sites-still-report-success-for-an-action-that-did-not-happen`:
+    //! both arms of `handle_element_action` read `success` through the strict
+    //! shared reader, so a body with NO `success` key is a failure.
+    use super::{ipc_element_action_result, ws_element_action_result};
+    use crate::mcp::ui_bridge::request::INDETERMINATE_ACTION_ERROR;
+    use serde_json::json;
+
+    #[test]
+    fn ws_arm_absent_success_is_failure_and_body_says_so() {
+        let (body, ok, err) = ws_element_action_result(json!({ "elementId": "x" }));
+        assert!(!ok, "a success-less WS body must not read as success");
+        assert_eq!(err.as_deref(), Some(INDETERMINATE_ACTION_ERROR));
+        assert_eq!(body["success"], json!(false), "caller must see an explicit false");
+        assert_eq!(body["elementId"], json!("x"), "other fields are kept");
+    }
+
+    #[test]
+    fn ws_arm_null_result_is_failure() {
+        // A relay frame with no `result` arrives as `null`.
+        let (body, ok, _) = ws_element_action_result(serde_json::Value::Null);
+        assert!(!ok);
+        assert_eq!(body["success"], json!(false));
+    }
+
+    #[test]
+    fn ws_arm_explicit_verdicts_pass_through_untouched() {
+        let good = json!({ "success": true, "action": "click" });
+        let (body, ok, err) = ws_element_action_result(good.clone());
+        assert!(ok);
+        assert_eq!(err, None);
+        assert_eq!(body, good);
+
+        let bad = json!({ "success": false, "error": "Element x not found" });
+        let (body, ok, err) = ws_element_action_result(bad.clone());
+        assert!(!ok);
+        assert_eq!(err.as_deref(), Some("Element x not found"));
+        assert_eq!(body, bad);
+    }
+
+    #[test]
+    fn ipc_arm_absent_success_is_not_reminted_as_true() {
+        let (body, ok, err) = ipc_element_action_result(json!({ "elementId": "x" }));
+        assert!(!ok, "an absent key used to be wrapped as {{success:true}}");
+        assert_eq!(err.as_deref(), Some(INDETERMINATE_ACTION_ERROR));
+        assert_eq!(body["success"], json!(false));
+    }
+
+    #[test]
+    fn ipc_arm_explicit_true_is_wrapped_and_false_passes_through() {
+        let (body, ok, _) = ipc_element_action_result(json!({ "success": true }));
+        assert!(ok);
+        assert_eq!(body, json!({ "success": true, "data": { "success": true } }));
+
+        let (body, ok, err) =
+            ipc_element_action_result(json!({ "success": false, "error": "nope" }));
+        assert!(!ok);
+        assert_eq!(err.as_deref(), Some("nope"));
+        assert_eq!(body["success"], json!(false));
     }
 }

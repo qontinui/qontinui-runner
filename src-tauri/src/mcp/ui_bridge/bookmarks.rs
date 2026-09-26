@@ -22,7 +22,7 @@ use tracing::info;
 
 use crate::mcp::types::{ApiResponse, ApiState};
 
-use super::request::{ui_bridge_request_sync, wrap_ipc_result};
+use super::request::{ui_bridge_request_sync, wrap_ipc_result, wrap_ipc_result_keeping_failure_data};
 
 /// Save a bookmark (snapshot) by name.
 pub async fn ui_bridge_save_bookmark_handler(
@@ -79,13 +79,24 @@ pub async fn ui_bridge_diff_from_bookmark_handler(
     )
 }
 
+/// Error half of the two execute-with-diff handlers: unlike the flat
+/// `ApiResponse<()>` most handlers answer with, it carries the diff observed
+/// around a FAILED action as `data` (see `wrap_ipc_result_keeping_failure_data`).
+type DiffFailure = (StatusCode, Json<ApiResponse<serde_json::Value>>);
+
 /// Execute an action and return the diff.
+///
+/// An action the SDK's `ChangeTracker` reported `actionSuccess: false` for is a
+/// 4xx here — the frontend answers it `success: false` — with the diff kept
+/// under `data`.
 pub async fn ui_bridge_execute_with_diff_handler(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<Json<ApiResponse<serde_json::Value>>, DiffFailure> {
     info!("UI Bridge API: Execute with diff");
-    wrap_ipc_result(ui_bridge_request_sync(&state, "execute_with_diff", body).await)
+    wrap_ipc_result_keeping_failure_data(
+        ui_bridge_request_sync(&state, "execute_with_diff", body).await,
+    )
 }
 
 /// Composite endpoint: execute one or more actions with atomic change-buffer tracking.
@@ -96,15 +107,19 @@ pub async fn ui_bridge_execute_with_diff_handler(
 pub async fn ui_bridge_with_diff_handler(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<Json<ApiResponse<serde_json::Value>>, DiffFailure> {
     // Detect batch vs single based on presence of "operations" array
     if body.get("operations").is_some() {
         info!("UI Bridge API: Batch execute with diff");
-        wrap_ipc_result(ui_bridge_request_sync(&state, "execute_batch_with_diff", body).await)
+        wrap_ipc_result_keeping_failure_data(
+            ui_bridge_request_sync(&state, "execute_batch_with_diff", body).await,
+        )
     } else {
         info!("UI Bridge API: Single execute with diff");
         let payload = with_diff_single_payload(body);
-        wrap_ipc_result(ui_bridge_request_sync(&state, "execute_with_diff", payload).await)
+        wrap_ipc_result_keeping_failure_data(
+            ui_bridge_request_sync(&state, "execute_with_diff", payload).await,
+        )
     }
 }
 

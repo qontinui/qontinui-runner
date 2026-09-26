@@ -582,12 +582,12 @@ pub async fn ui_bridge_batch_actions_handler(
         let result = ui_bridge_request_sync(&state, "execute_action", payload).await;
 
         let (success, response) = match result {
-            Ok(data) => (
-                data.get("success")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true),
-                data,
-            ),
+            Ok(data) => {
+                // Strict, and normalised so `response` always carries an
+                // explicit `success` — an absent one is INDETERMINATE.
+                let (data, outcome) = super::request::normalize_action_result(data);
+                (outcome.succeeded(), data)
+            }
             Err(e) => (false, serde_json::json!({"success": false, "error": e})),
         };
 

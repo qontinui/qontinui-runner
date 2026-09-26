@@ -15,6 +15,7 @@ import type {
 import { extractFingerprintHashes } from "../../lib/ui-bridge/fingerprintGenerator";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { createLogger } from "@/lib/logger";
+import { relayVerdict } from "./actionOutcome";
 
 const log = createLogger("useCommands");
 
@@ -73,10 +74,10 @@ export function useCommands(
         );
 
         const json = await resp.json();
+        // Strict: a reply with no boolean `success` is NOT a success.
         const result: CommandResult = {
-          success: json.success !== false,
-          data: json.data,
-          error: json.error,
+          ...relayVerdict(json, resp),
+          data: json?.data,
           duration: Date.now() - startTime,
         };
 
@@ -226,10 +227,11 @@ export function useCommands(
 
         const json = await resp.json();
         const duration = Date.now() - startTime;
+        // Strict: a reply with no boolean `success` is NOT a success. The raw
+        // body is still returned as `data` for inspection.
         const result: CommandResult<T> = {
-          success: json.success !== false,
-          data: (json.data ?? json) as T,
-          error: json.error,
+          ...relayVerdict(json, resp),
+          data: (json?.data ?? json) as T,
           duration,
         };
 
