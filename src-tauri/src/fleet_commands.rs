@@ -787,19 +787,9 @@ pub(crate) fn provision_fleet_commands_for_session(workdir: &str) {
     let registry = crate::agent_commands::resolve_registry();
     let commands_dir = Path::new(workdir).join(".claude").join("commands");
 
-    // The registry's own row: WHICH of `resolve_registry`'s three arms answered.
     // Recorded before the write, because it is a fact about resolution rather
     // than about provisioning and holds even if every write below is skipped.
-    let arm = registry.resolution_arm();
-    crate::capability_manifest::record_observation(
-        "agent_commands_registry",
-        CapabilityObservation::from_command_source(arm).with_detail(format!(
-            "CommandSource::{} — {} override(s) over {} embedded default(s)",
-            arm.as_str(),
-            registry.override_count(),
-            registry.builtin_count(),
-        )),
-    );
+    observe_commands_registry(&registry);
 
     match provision_fleet_commands_into(&commands_dir, &registry) {
         Ok(report) => crate::capability_manifest::record_provision(workdir, report),
@@ -825,6 +815,24 @@ pub(crate) fn provision_fleet_commands_for_session(workdir: &str) {
             crate::capability_manifest::record_provision(workdir, report);
         }
     }
+}
+
+/// Record the registry's own capability row, `agent_commands_registry`: WHICH of
+/// [`crate::agent_commands::resolve_registry`]'s three arms answered. Takes the
+/// already-resolved registry so a provisioning pass resolves it once. Also
+/// called by `session_assets`' canonical-source arm, which writes no command
+/// but still resolved — or can resolve — the registry.
+pub(crate) fn observe_commands_registry(registry: &crate::agent_commands::AgentCommandRegistry) {
+    let arm = registry.resolution_arm();
+    crate::capability_manifest::record_observation(
+        "agent_commands_registry",
+        CapabilityObservation::from_command_source(arm).with_detail(format!(
+            "CommandSource::{} — {} override(s) over {} embedded default(s)",
+            arm.as_str(),
+            registry.override_count(),
+            registry.builtin_count(),
+        )),
+    );
 }
 
 /// Core of [`provision_fleet_commands_for_session`]: create `commands_dir` and

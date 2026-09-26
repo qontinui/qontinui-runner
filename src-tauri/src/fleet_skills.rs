@@ -195,19 +195,9 @@ pub(crate) fn provision_fleet_skills_for_session(workdir: &str) {
     let registry = crate::agent_skills::resolve_registry();
     let skills_dir = Path::new(workdir).join(".claude").join("skills");
 
-    // The registry's own row: WHICH of `resolve_registry`'s three arms answered.
     // Recorded before the write, because it is a fact about resolution rather
     // than about provisioning and holds even if every write below is skipped.
-    let arm = registry.resolution_arm();
-    crate::capability_manifest::record_observation(
-        "agent_skills_registry",
-        CapabilityObservation::new(capability_manifest::Rung::from(arm)).with_detail(format!(
-            "AgentSkillSource::{} — {} account skill(s) over {} embedded default(s)",
-            arm.as_str(),
-            registry.override_count(),
-            registry.builtin_count(),
-        )),
-    );
+    observe_skills_registry(&registry);
 
     match provision_fleet_skills_into(&skills_dir, &registry) {
         Ok(report) => crate::capability_manifest::record_provision(workdir, report),
@@ -259,6 +249,24 @@ fn embedded_skill_file_count() -> usize {
         dir.files().count() + dir.dirs().map(count).sum::<usize>()
     }
     count(&FLEET_SKILLS)
+}
+
+/// Record the registry's own capability row, `agent_skills_registry`: WHICH of
+/// [`crate::agent_skills::resolve_registry`]'s three arms answered. Takes the
+/// already-resolved registry so a provisioning pass resolves it once. Also
+/// called by `session_assets`' canonical-source arm, which writes no skill but
+/// still resolves the registry.
+pub(crate) fn observe_skills_registry(registry: &crate::agent_skills::AgentSkillRegistry) {
+    let arm = registry.resolution_arm();
+    crate::capability_manifest::record_observation(
+        "agent_skills_registry",
+        CapabilityObservation::new(capability_manifest::Rung::from(arm)).with_detail(format!(
+            "AgentSkillSource::{} — {} account skill(s) over {} embedded default(s)",
+            arm.as_str(),
+            registry.override_count(),
+            registry.builtin_count(),
+        )),
+    );
 }
 
 /// Core of [`provision_fleet_skills_for_session`]: create `skills_dir` and write
