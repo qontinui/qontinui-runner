@@ -1639,6 +1639,13 @@ async fn health(
         // Foreign requester, since they name the other sites that reached this
         // runner.
         "originGuard": crate::mcp::origin_guard::health_json(requester.map(|e| e.0.class)),
+        // UI Bridge relay principal binding (plan 2026-09-17-ui-bridge-relay-
+        // registration-is-unauthenticated): both kill-switch modes, the
+        // per-rule wouldRefuse/refused counts and the last 20 (rule, class,
+        // route) tuples. Phase 4 decides the graduation of R6, R8 and
+        // R9-unkeyed from exactly these counters, so they are served here
+        // rather than only to the test harness. The tuples carry no origin.
+        "uiBridgeBinding": state.relay_binding.health_json(),
         "storage": {
             "apiPort": api_port,
             "namespaceSuffix": storage_namespace_suffix,
@@ -9676,7 +9683,7 @@ pub fn create_router(
     // registrations share the same ring.
     app_handle.manage(api_state.supervision_state.clone());
 
-    // Spawn the background sweeper that evicts stale phone-home registrations.
+    // Spawn the background sweeper that drops rows whose reservation lapsed.
     crate::mcp::app_registry::spawn_sweeper(api_state.app_registry.clone());
 
     // Set up UI Bridge response listener
@@ -19714,6 +19721,186 @@ mod supervised_workers_health_tests {
         assert!(
             src.contains(".route(\"/health\", get(health))"),
             "`/health` must still be served by `health`"
+        );
+    }
+}
+
+/// `/health` `uiBridgeBinding` (plan
+/// `2026-09-17-ui-bridge-relay-registration-is-unauthenticated`, Phase 1).
+///
+/// Phase 4 graduates R6, R8 and R9-unkeyed from exactly these counters, so an
+/// OPERATOR has to be able to read them — `relay_binding/tests.rs` serves its
+/// own `/test-health` stub, which proves nothing about the real handler.
+/// `ApiState` owns a `tauri::AppHandle` no test can build, so the RENDER is
+/// asserted through `RelayBinding::health_json` and the WIRING against the
+/// handler's own source, the same split the `supervised_workers` block above
+/// uses for the same reason.
+#[cfg(test)]
+mod ui_bridge_binding_health_tests {
+    use crate::mcp::relay_binding::{BindingConfig, BindingMode, RelayBinding};
+
+    #[test]
+    fn the_block_renders_both_modes_the_env_names_and_per_rule_counts() {
+        let binding = RelayBinding::new(BindingConfig {
+            binding: BindingMode::Enforce,
+            active_binding: BindingMode::Shadow,
+        });
+        binding.counters.record("R1", true);
+        binding.counters.record("R6", false);
+
+        let v = binding.health_json();
+        assert_eq!(v["binding"], "enforce");
+        assert_eq!(v["activeBinding"], "shadow");
+        assert_eq!(v["bindingEnv"], "QONTINUI_RUNNER_UIBRIDGE_BINDING");
+        assert_eq!(
+            v["activeBindingEnv"],
+            "QONTINUI_RUNNER_UIBRIDGE_ACTIVE_BINDING"
+        );
+        assert_eq!(v["rules"]["R1"]["refused"], 1, "{v}");
+        assert_eq!(v["rules"]["R6"]["wouldRefuse"], 1, "{v}");
+        assert!(
+            v["recent"].is_array(),
+            "the (rule, class, route) tuples: {v}"
+        );
+        // Round 4 renamed `tombstoneMs` -> `reservationMs` (the reservation
+        // lives on the registry ROW; there is no side map) and added `maxRows`.
+        // Pinned by VALUE, not by `is_i64`: a missing key reads as
+        // `Value::Null`, whose `is_i64()` is `false`, so the shape assertion
+        // this replaces went red on the rename instead of reporting it — and a
+        // future rename of either key must fail here rather than silently serve
+        // an operator a block with the field gone.
+        assert_eq!(
+            v["reservationMs"],
+            crate::mcp::relay_binding::BINDING_TOMBSTONE_MS,
+            "{v}"
+        );
+        assert_eq!(v["maxRows"], crate::mcp::app_registry::MAX_ROWS, "{v}");
+        // m-1: the ceiling that actually refuses a browser principal. An
+        // operator reading `registryFullRefusals` beside `maxRows` alone
+        // would be looking at the wrong number, and Phase 4 graduates from
+        // this block.
+        assert_eq!(
+            v["operatorHeadroom"],
+            crate::mcp::app_registry::OPERATOR_HEADROOM,
+            "{v}"
+        );
+        assert_eq!(
+            v["browserMaxRows"],
+            crate::mcp::app_registry::MAX_ROWS - crate::mcp::app_registry::OPERATOR_HEADROOM,
+            "{v}"
+        );
+        assert_eq!(v["registryFullRefusals"], 0, "{v}");
+    }
+
+    #[test]
+    fn the_health_handler_emits_the_ui_bridge_binding_block() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs"),
+        )
+        .expect("read mcp_api.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with("async fn health("))
+            .expect("the /health handler is `async fn health(`");
+        let end = lines[start..]
+            .iter()
+            .position(|l| *l == "}")
+            .map(|i| start + i)
+            .expect("the handler closes at column 0");
+        let region = lines[start..=end]
+            .iter()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            region.contains("\"uiBridgeBinding\": state.relay_binding.health_json()"),
+            "async fn health must emit `uiBridgeBinding` from the ONE shared \
+             RelayBinding on ApiState — the relay_binding test harness's \
+             /test-health stub is not this surface"
+        );
+        assert!(
+            src.contains(".route(\"/health\", get(health))"),
+            "`/health` must still be served by `health`"
+        );
+    }
+
+    /// The wiring assertion above proves the LINE is present. It does not
+    /// prove `state.relay_binding` is the SAME instance the relays mutate — a
+    /// refactor that constructed a second `RelayBinding` would leave both
+    /// tests green while `/health` reported zeros forever, which is exactly
+    /// the surface Phase 4 graduates R6, R8 and R9-unkeyed from.
+    ///
+    /// `ApiState` owns a `tauri::AppHandle` no test can build, so this is
+    /// pinned where it is decided: production constructs the binding EXACTLY
+    /// once, and `RelayState`'s `FromRef` only ever clones that `Arc`.
+    #[test]
+    fn production_constructs_exactly_one_relay_binding() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs"),
+        )
+        .expect("read mcp_api.rs");
+        // Strip the test modules: their fixtures legitimately build their own.
+        //
+        // `split("#[cfg(test)]").next()` was WRONG here — it stops at the
+        // FIRST occurrence, which in this file is about 62% of the way in, so
+        // a second construction added after that line was invisible and the
+        // test passed by placement luck.
+        //
+        // Skip only a column-0 `#[cfg(test)]` that gates a `mod` — that is the
+        // shape whose body closes with a column-0 `}`. A `#[cfg(test)]` on a
+        // bare `fn` or `use` would otherwise make this swallow production code
+        // up to the next column-0 brace, so it is asserted, not assumed.
+        let lines: Vec<&str> = src.lines().collect();
+        let mut production = String::new();
+        let mut i = 0usize;
+        while i < lines.len() {
+            if lines[i] == "#[cfg(test)]" {
+                let next = lines.get(i + 1).copied().unwrap_or("");
+                assert!(
+                    next.starts_with("mod "),
+                    "column-0 #[cfg(test)] at line {} gates `{next}`, not a `mod` — \
+                     this scan would swallow production code up to the next \
+                     column-0 brace",
+                    i + 1
+                );
+                i += 1;
+                while i < lines.len() && lines[i] != "}" {
+                    i += 1;
+                }
+                i += 1;
+                continue;
+            }
+            production.push_str(lines[i]);
+            production.push('\n');
+            i += 1;
+        }
+        // Anchor on known production symbols rather than a line-count ratio:
+        // the ratio flips to a spurious failure the day the test modules
+        // exceed half the file, which is a property of test volume, not of
+        // what this is guarding.
+        for anchor in [
+            "async fn health(",
+            ".route(\"/health\", get(health))",
+            "let api_state = Arc::new(ApiState {",
+        ] {
+            assert!(
+                production.contains(anchor),
+                "the test-span skip removed production code: `{anchor}` is gone"
+            );
+        }
+        let built = production.matches("RelayBinding::new(").count();
+        assert_eq!(
+            built, 1,
+            "production must construct ONE RelayBinding (found {built}); every \
+             reader — the relays through RelayState's FromRef, and /health — \
+             has to share that one Arc, or the counters an operator reads are \
+             not the counters the rules increment"
+        );
+        assert!(
+            production.contains("relay_binding: crate::mcp::relay_binding::RelayBinding::new("),
+            "the one instance must be the field on ApiState"
         );
     }
 }

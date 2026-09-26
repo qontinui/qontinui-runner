@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{oneshot, Mutex};
 use uuid::Uuid;
 
+use super::relay_binding::BindingMode;
 use super::ws_relay::{WsConnectionManager, WsOutboundError};
 
 /// Default per-command timeout — long enough to cover a slow snapshot, short
@@ -122,6 +123,19 @@ struct CommandFrame<'a> {
     action: &'a str,
     payload: &'a serde_json::Value,
     timestamp: i64,
+}
+
+/// What [`CommandRelay::resolve`] did with an inbound `response` frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ResolveOutcome {
+    /// A pending command matched the id and its awaiter was handed the
+    /// response.
+    pub matched: bool,
+    /// R3: the command WAS pending, but routed to a different connection.
+    /// Under `enforce` it was left in place (`matched: false`); under `shadow`
+    /// it was resolved anyway (`matched: true`) and this flag is what the
+    /// `/health` counter reads.
+    pub not_yours: bool,
 }
 
 /// Per-pending-command bookkeeping.
@@ -237,15 +251,39 @@ impl CommandRelay {
     }
 
     /// Called by the WS receive loop when a `{type:"response"}` frame arrives.
-    /// Returns `true` if a pending command matched the `command_id`.
-    pub async fn resolve(&self, response: CommandResponse) -> bool {
-        let entry = {
+    ///
+    /// R3 (plan `2026-09-17-ui-bridge-relay-registration-is-unauthenticated`):
+    /// `answering_conn` is the socket the frame arrived on, compared against
+    /// the connection the command was routed to. `Enforce` leaves the pending
+    /// entry exactly where it was on a mismatch — the genuine answer still
+    /// wins — `Shadow` resolves it as today and only reports, and `Off` does
+    /// not compare at all (the `QONTINUI_RUNNER_UIBRIDGE_BINDING=off`
+    /// behaviour).
+    pub async fn resolve(
+        &self,
+        answering_conn: u64,
+        mode: BindingMode,
+        response: CommandResponse,
+    ) -> ResolveOutcome {
+        let (entry, not_yours) = {
             let mut pending = self.pending.lock().await;
-            pending.remove(&response.command_id)
+            let not_yours = match pending.get(&response.command_id) {
+                Some(e) if mode != BindingMode::Off => e.conn_id != answering_conn,
+                _ => false,
+            };
+            let entry = if not_yours && mode == BindingMode::Enforce {
+                None
+            } else {
+                pending.remove(&response.command_id)
+            };
+            (entry, not_yours)
         };
-        match entry {
-            Some(entry) => entry.sender.send(response).is_ok(),
-            None => false,
+        ResolveOutcome {
+            matched: match entry {
+                Some(entry) => entry.sender.send(response).is_ok(),
+                None => false,
+            },
+            not_yours,
         }
     }
 
@@ -337,14 +375,19 @@ mod tests {
 
         // Simulate the wrapper's success response.
         let accepted = relay
-            .resolve(CommandResponse {
-                command_id: command_id.clone(),
-                success: true,
-                result: Some(json!({"elements": []})),
-                error: None,
-            })
+            .resolve(
+                conn_id,
+                BindingMode::Enforce,
+                CommandResponse {
+                    command_id: command_id.clone(),
+                    success: true,
+                    result: Some(json!({"elements": []})),
+                    error: None,
+                },
+            )
             .await;
-        assert!(accepted, "resolve must match a pending command");
+        assert!(accepted.matched, "resolve must match a pending command");
+        assert!(!accepted.not_yours, "the answering conn IS the routed conn");
 
         let response = dispatch_handle.await.unwrap().expect("dispatch ok");
         assert!(response.success);
@@ -352,10 +395,79 @@ mod tests {
         assert_eq!(conn_id, 1); // first registration in a fresh manager
     }
 
+    /// R3's WebSocket arm at the unit level: a `response` frame from a socket
+    /// the command was NOT routed to must leave the pending entry in place
+    /// under `enforce`, and must resolve it as today under `shadow` while
+    /// still reporting `not_yours` for the counter. (The end-to-end case is
+    /// `relay_binding/tests.rs::forged_command_completion_refused::ws_other_connection`.)
+    #[tokio::test]
+    async fn resolve_from_another_conn_is_refused_under_enforce_and_reported_under_shadow() {
+        for mode in [BindingMode::Enforce, BindingMode::Shadow, BindingMode::Off] {
+            let enforce = mode == BindingMode::Enforce;
+            let ws = WsConnectionManager::new();
+            let (holder, mut holder_rx) = ws.test_register("app").await;
+            let (other, _other_rx) = ws.test_register("other").await;
+            assert_ne!(holder, other);
+            let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(2));
+
+            let relay_task = relay.clone();
+            let dispatch =
+                tokio::spawn(async move { relay_task.dispatch("app", "snap", json!({})).await });
+            let frame = holder_rx.recv().await.expect("outbound frame");
+            let command_id = serde_json::from_str::<serde_json::Value>(&frame).unwrap()
+                ["commandId"]
+                .as_str()
+                .unwrap()
+                .to_string();
+
+            let forged = relay
+                .resolve(
+                    other,
+                    mode,
+                    CommandResponse {
+                        command_id: command_id.clone(),
+                        success: true,
+                        result: Some(json!({ "from": "attacker" })),
+                        error: None,
+                    },
+                )
+                .await;
+            assert_eq!(
+                forged.not_yours,
+                mode != BindingMode::Off,
+                "{mode:?}: enforce and shadow report it; off does not compare at all"
+            );
+            assert_eq!(
+                forged.matched, !enforce,
+                "{mode:?}: enforce leaves the command pending; shadow and off resolve it"
+            );
+
+            if enforce {
+                // The genuine answer still wins, from the routed conn.
+                let genuine = relay
+                    .resolve(
+                        holder,
+                        BindingMode::Enforce,
+                        CommandResponse {
+                            command_id,
+                            success: true,
+                            result: Some(json!({ "from": "holder" })),
+                            error: None,
+                        },
+                    )
+                    .await;
+                assert!(genuine.matched && !genuine.not_yours);
+            }
+            let got = dispatch.await.unwrap().expect("dispatch ok");
+            let who = if enforce { "holder" } else { "attacker" };
+            assert_eq!(got.result.unwrap()["from"], who, "{mode:?}");
+        }
+    }
+
     #[tokio::test]
     async fn dispatch_returns_wrapper_error() {
         let ws = WsConnectionManager::new();
-        let (_conn_id, mut outbound_rx) = ws.test_register("app-2").await;
+        let (conn_id, mut outbound_rx) = ws.test_register("app-2").await;
         let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(2));
 
         let relay_task = relay.clone();
@@ -370,12 +482,16 @@ mod tests {
             .to_string();
 
         relay
-            .resolve(CommandResponse {
-                command_id,
-                success: false,
-                result: None,
-                error: Some("element not found".into()),
-            })
+            .resolve(
+                conn_id,
+                BindingMode::Enforce,
+                CommandResponse {
+                    command_id,
+                    success: false,
+                    result: None,
+                    error: Some("element not found".into()),
+                },
+            )
             .await;
 
         let err = dispatch_handle.await.unwrap().unwrap_err();
@@ -484,12 +600,16 @@ mod tests {
                 .expect("app-b should still have a pending command")
         };
         relay
-            .resolve(CommandResponse {
-                command_id: frame_b_id_extracted,
-                success: true,
-                result: Some(json!({"ok": true})),
-                error: None,
-            })
+            .resolve(
+                conn_b,
+                BindingMode::Enforce,
+                CommandResponse {
+                    command_id: frame_b_id_extracted,
+                    success: true,
+                    result: Some(json!({"ok": true})),
+                    error: None,
+                },
+            )
             .await;
         let result_b = dispatch_b.await.unwrap();
         assert!(result_b.is_ok(), "app-b dispatch must succeed");

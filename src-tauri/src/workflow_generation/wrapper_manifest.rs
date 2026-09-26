@@ -354,7 +354,13 @@ mod tests {
     fn registered(app_id: &str, app_name: &str, transport: AppTransport) -> RegisteredApp {
         RegisteredApp {
             app: sample_app(app_id, app_name),
-            origin: None,
+            declared_origin: None,
+            // An agent / script registrant: operator trust, the principal
+            // every binding rule admits (plan 2026-09-17-ui-bridge-relay-
+            // registration-is-unauthenticated).
+            principal: crate::mcp::relay_binding::Principal::OperatorTrust {
+                class: crate::mcp::origin_guard::OriginClass::NonBrowser,
+            },
             last_seen_ms: chrono::Utc::now().timestamp_millis(),
             transport,
             websocket_conn_id: if transport == AppTransport::Websocket {
@@ -363,6 +369,7 @@ mod tests {
                 None
             },
             keep_alive_ms: None,
+            released_at_ms: None,
         }
     }
 
@@ -430,7 +437,7 @@ mod tests {
     async fn http_transport_app_is_skipped() {
         let registry = AppRegistry::new();
         let ws = WsConnectionManager::new();
-        let (_conn_id, mut outbound_rx) = ws.test_register("ws-app").await;
+        let (conn_id, mut outbound_rx) = ws.test_register("ws-app").await;
         // One WS app — should appear.
         registry
             .upsert(
@@ -475,12 +482,16 @@ mod tests {
         let v: Value = serde_json::from_str(&frame).unwrap();
         let cmd_id = v["commandId"].as_str().unwrap().to_string();
         relay
-            .resolve(CommandResponse {
-                command_id: cmd_id,
-                success: true,
-                result: Some(json!([{ "id": "ws-app", "actions": [{"id": "noop"}] }])),
-                error: None,
-            })
+            .resolve(
+                conn_id,
+                crate::mcp::relay_binding::BindingMode::Enforce,
+                CommandResponse {
+                    command_id: cmd_id,
+                    success: true,
+                    result: Some(json!([{ "id": "ws-app", "actions": [{"id": "noop"}] }])),
+                    error: None,
+                },
+            )
             .await;
 
         let entries = build_fut.await.unwrap();

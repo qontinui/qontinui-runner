@@ -2209,7 +2209,14 @@ pub(crate) async fn try_ws_dispatch_for_app(
     http_path: &str,
     payload: serde_json::Value,
 ) -> Option<Result<serde_json::Value, String>> {
-    let entry = registry.get(app_id).await?;
+    // `get_live`, not `get`. This is a ROUTING reader by its own contract:
+    // `None` means "fall through to IPC", `Some(Err)` means "surface this".
+    // A row now outlives its TTL as a reservation, so `get` would answer
+    // `Some` for a dead WS app, `dispatch` would then read `get_live` and
+    // return `NotRegistered`, and the caller would turn that into a 400 —
+    // converting a crashed wrapper's 15 s outage with working fallthrough
+    // into 90 s of hard 400s for an app the runner also serves over IPC.
+    let entry = registry.get_live(app_id).await?;
     if entry.transport != AppTransport::Websocket {
         return None;
     }
@@ -5351,6 +5358,157 @@ mod ws_dispatch_selection_tests {
     use serde_json::json;
     use std::time::Duration;
 
+    /// m8: a dispatch REFRESHES the row it dispatches to.
+    ///
+    /// The window, stated exactly. `drive_connection` runs TWO tasks: the
+    /// spawned `send_task` owns the 20 s ping tick and its refresh, while the
+    /// per-frame refresh runs in the RECV loop of `drive_connection`'s own
+    /// task. So a parked `sink.send().await` starves the ping tick ONLY —
+    /// inbound frames keep refreshing. (An earlier version of this doc said
+    /// both share one `select!`; that was wrong, and it would tell a reader
+    /// this touch is redundant whenever any frame arrives.)
+    ///
+    /// The real case: a wrapper that sends nothing INBOUND has the ping tick
+    /// as its only refresh, a parked send stops it, and the recv side's
+    /// `HEARTBEAT_TIMEOUT` (45 s) outlives `REGISTRATION_TTL_MS` (30 s) — so
+    /// the socket is still up while the row is already dead. Before the
+    /// reservation change that was cosmetic, because the routing readers used
+    /// `get`; now they use `get_live`, so the row ages out and a connection
+    /// main would have dispatched to becomes undispatchable.
+    /// `AppDispatcher::dispatch` therefore touches at ENQUEUE, outside
+    /// `send_task`. See that call site for the cost this trades against.
+    ///
+    /// The ageing here is what makes the assertion discriminating: without
+    /// the refresh the row is TTL-1s old, the second ageing carries it past
+    /// the TTL, and `get_live` answers `None`.
+    #[tokio::test]
+    async fn a_dispatch_refreshes_the_row_so_a_parked_send_cannot_age_it_out() {
+        let registry = AppRegistry::new();
+        let ws = WsConnectionManager::new();
+        let (conn_id, _rx) = ws.test_register("wapp").await;
+        registry
+            .upsert(
+                sample_app("wapp"),
+                None,
+                AppTransport::Websocket,
+                Some(conn_id),
+                None,
+            )
+            .await;
+        // A short command timeout: the dispatch is expected to time out (no
+        // wrapper answers), and the TOUCH happens before the send either way.
+        let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_millis(50));
+        let dispatcher = AppDispatcher::new(registry.clone(), relay.clone());
+
+        // The socket is alive but nothing has refreshed the row for almost a
+        // whole TTL — the parked-send shape.
+        assert!(
+            registry
+                .test_age_entry(
+                    "wapp",
+                    crate::mcp::app_registry::REGISTRATION_TTL_MS - 1_000
+                )
+                .await
+        );
+        assert!(
+            registry.get_live("wapp").await.is_some(),
+            "precondition: the row is still (barely) live"
+        );
+
+        let _ = try_ws_dispatch_for_app(
+            &registry,
+            &dispatcher,
+            "wapp",
+            "noop",
+            Method::POST,
+            "/x",
+            json!({}),
+        )
+        .await;
+
+        // Two more seconds pass. Without the enqueue-time refresh the row is
+        // now TTL+1s old and gone; with it, it is 2s old and still routable.
+        assert!(registry.test_age_entry("wapp", 2_000).await);
+        assert!(
+            registry.get_live("wapp").await.is_some(),
+            "the dispatch did not refresh the row, so a parked send ages out a \
+             connection that is still open"
+        );
+    }
+
+    /// Critical 2: `try_ws_dispatch_for_app` is a ROUTING reader — `None`
+    /// means "fall through to IPC", `Some(Err)` means "surface this error".
+    ///
+    /// A registry row now outlives its TTL as an R5 reservation, so reading
+    /// `get` here would answer `Some` for a dead WS app; `dispatch` reads
+    /// `get_live` and returns `NotRegistered`, and callers turn that into a
+    /// 400. A crashed wrapper for an app the runner also serves over IPC
+    /// would go from a 15 s outage with working fallthrough to 90 s of hard
+    /// 400s. It must answer `None` instead.
+    #[tokio::test]
+    async fn a_reservation_only_row_falls_through_to_ipc_rather_than_erroring() {
+        let registry = AppRegistry::new();
+        let ws = WsConnectionManager::new();
+        let (_conn, _rx) = ws.test_register("wapp").await;
+        registry
+            .upsert(
+                sample_app("wapp"),
+                None,
+                AppTransport::Websocket,
+                Some(1),
+                None,
+            )
+            .await;
+        let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(2));
+        let dispatcher = AppDispatcher::new(registry.clone(), relay.clone());
+
+        // Live: it takes the WS path (Some).
+        let live = try_ws_dispatch_for_app(
+            &registry,
+            &dispatcher,
+            "wapp",
+            "noop",
+            Method::POST,
+            "/x",
+            json!({}),
+        )
+        .await;
+        assert!(
+            live.is_some(),
+            "precondition: a live WS row is dispatched over WS"
+        );
+
+        // The wrapper crashes; the row lingers only as a reservation.
+        assert!(
+            registry
+                .test_age_entry(
+                    "wapp",
+                    crate::mcp::app_registry::REGISTRATION_TTL_MS + 1_000
+                )
+                .await
+        );
+        assert!(
+            registry.get_including_reservations("wapp").await.is_some(),
+            "precondition: the row is retained as a reservation"
+        );
+
+        let out = try_ws_dispatch_for_app(
+            &registry,
+            &dispatcher,
+            "wapp",
+            "noop",
+            Method::POST,
+            "/x",
+            json!({}),
+        )
+        .await;
+        assert!(
+            out.is_none(),
+            "a reservation-only row must fall through to IPC, not surface an \
+             error the caller turns into a 400: {out:?}"
+        );
+    }
+
     fn sample_app(app_id: &str) -> DiscoveredApp {
         DiscoveredApp {
             app_id: app_id.to_string(),
@@ -5376,7 +5534,7 @@ mod ws_dispatch_selection_tests {
     async fn ws_dispatch_for_app_routes_websocket_traffic() {
         let registry = AppRegistry::new();
         let ws = WsConnectionManager::new();
-        let (_conn_id, mut outbound_rx) = ws.test_register("test-wrapper").await;
+        let (conn_id, mut outbound_rx) = ws.test_register("test-wrapper").await;
         registry
             .upsert(
                 sample_app("test-wrapper"),
@@ -5419,12 +5577,16 @@ mod ws_dispatch_selection_tests {
 
         // Resolve as the wrapper would.
         relay
-            .resolve(CommandResponse {
-                command_id,
-                success: true,
-                result: Some(json!({ "output": "hi" })),
-                error: None,
-            })
+            .resolve(
+                conn_id,
+                crate::mcp::relay_binding::BindingMode::Enforce,
+                CommandResponse {
+                    command_id,
+                    success: true,
+                    result: Some(json!({ "output": "hi" })),
+                    error: None,
+                },
+            )
             .await;
 
         let outcome = dispatch_fut.await.unwrap();
@@ -5445,7 +5607,7 @@ mod ws_dispatch_selection_tests {
     async fn id_collision_ws_wins_for_action_endpoint_only() {
         let registry = AppRegistry::new();
         let ws = WsConnectionManager::new();
-        let (_conn_id, mut outbound_rx) = ws.test_register("terminal").await;
+        let (conn_id, mut outbound_rx) = ws.test_register("terminal").await;
         registry
             .upsert(
                 sample_app("terminal"),
@@ -5477,12 +5639,16 @@ mod ws_dispatch_selection_tests {
         let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
         let command_id = v["commandId"].as_str().unwrap().to_string();
         relay
-            .resolve(CommandResponse {
-                command_id,
-                success: true,
-                result: Some(json!({ "ran": true })),
-                error: None,
-            })
+            .resolve(
+                conn_id,
+                crate::mcp::relay_binding::BindingMode::Enforce,
+                CommandResponse {
+                    command_id,
+                    success: true,
+                    result: Some(json!({ "ran": true })),
+                    error: None,
+                },
+            )
             .await;
         match action_fut.await.unwrap() {
             Some(Ok(value)) => assert_eq!(value, json!({ "ran": true })),
@@ -5564,8 +5730,8 @@ mod ws_dispatch_selection_tests {
     async fn ws_collect_components_merges_live_wrappers() {
         let registry = AppRegistry::new();
         let ws = WsConnectionManager::new();
-        let (_a_conn, mut a_rx) = ws.test_register("alpha").await;
-        let (_b_conn, mut b_rx) = ws.test_register("beta").await;
+        let (a_conn, mut a_rx) = ws.test_register("alpha").await;
+        let (b_conn, mut b_rx) = ws.test_register("beta").await;
         registry
             .upsert(
                 sample_app("alpha"),
@@ -5614,6 +5780,7 @@ mod ws_dispatch_selection_tests {
         let resolve_one = |frame: String, app_id: &str| {
             let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
             let cmd = v["commandId"].as_str().unwrap().to_string();
+            let conn = if app_id == "alpha" { a_conn } else { b_conn };
             let result = if app_id == "alpha" {
                 // Bare array shape from the frame's payload context.
                 json!([{ "id": "alpha-1" }, { "id": "alpha-2" }])
@@ -5624,12 +5791,16 @@ mod ws_dispatch_selection_tests {
             let relay_h = relay_for_resolve.clone();
             async move {
                 relay_h
-                    .resolve(CommandResponse {
-                        command_id: cmd,
-                        success: true,
-                        result: Some(result),
-                        error: None,
-                    })
+                    .resolve(
+                        conn,
+                        crate::mcp::relay_binding::BindingMode::Enforce,
+                        CommandResponse {
+                            command_id: cmd,
+                            success: true,
+                            result: Some(result),
+                            error: None,
+                        },
+                    )
                     .await;
             }
         };
