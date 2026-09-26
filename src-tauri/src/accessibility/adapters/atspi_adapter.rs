@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context};
 use async_trait::async_trait;
@@ -17,7 +17,7 @@ use atspi::proxy::editable_text::EditableTextProxy;
 use atspi::proxy::value::ValueProxy;
 use atspi::{AccessibilityConnection, CoordType, Interface, InterfaceSet, Role, State};
 use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, trace, warn};
 use zbus::proxy::CacheProperties;
 
 use crate::accessibility::events::{A11yEvent, StructureChangeType};
@@ -47,6 +47,18 @@ pub struct AtspiAdapter {
     /// Monotonic ref counter for node ref IDs.
     next_ref: AtomicU64,
     connected: AtomicBool,
+    /// The D-Bus event listener spawned by `subscribe_events`. It owns the
+    /// match-rule streams, so aborting it drops them and zbus deregisters the
+    /// rules. At most one exists: stopped before every re-subscribe, on
+    /// `connect`/`disconnect`, and on drop. A `std` mutex because
+    /// `subscribe_events` takes `&self`; never held across an `.await`.
+    event_listener: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl Drop for AtspiAdapter {
+    fn drop(&mut self) {
+        self.stop_event_listener();
+    }
 }
 
 impl Default for AtspiAdapter {
@@ -64,6 +76,20 @@ impl AtspiAdapter {
             next_handle: AtomicU64::new(1),
             next_ref: AtomicU64::new(1),
             connected: AtomicBool::new(false),
+            event_listener: Mutex::new(None),
+        }
+    }
+
+    /// Abort the event listener task, if any. Dropping its match-rule streams
+    /// queues their removal from the bus.
+    fn stop_event_listener(&self) {
+        let listener = self
+            .event_listener
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(handle) = listener {
+            handle.abort();
         }
     }
 
@@ -407,6 +433,9 @@ impl PlatformAdapter for AtspiAdapter {
     async fn connect(&mut self, target: ConnectionTarget, timeout_ms: u64) -> anyhow::Result<()> {
         let timeout = std::time::Duration::from_millis(timeout_ms);
 
+        // A listener from a previous connection must not outlive it.
+        self.stop_event_listener();
+
         // Connect to the AT-SPI accessibility bus with a timeout.
         let conn = tokio::time::timeout(timeout, AccessibilityConnection::new())
             .await
@@ -451,6 +480,7 @@ impl PlatformAdapter for AtspiAdapter {
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
+        self.stop_event_listener();
         self.connected.store(false, Ordering::Release);
         self.root_address = None;
         self.handle_table.write().await.clear();
@@ -482,61 +512,40 @@ impl PlatformAdapter for AtspiAdapter {
         Ok(node)
     }
 
+    /// Idempotent per connection: the previous listener (and its match rules)
+    /// is stopped first. The match rules are registered before this returns,
+    /// so a bus refusal is an `Err`, not a silently empty stream.
     async fn subscribe_events(&self) -> anyhow::Result<Option<mpsc::Receiver<A11yEvent>>> {
+        use futures::StreamExt;
+
         let conn = self
             .connection
             .as_ref()
             .context("Not connected to AT-SPI bus")?;
-
-        let (tx, rx) = mpsc::channel::<A11yEvent>(256);
         let zconn = conn.connection().clone();
 
-        // Spawn a task that listens to D-Bus signals for focus changes and
-        // structural mutations. We use a raw match rule for AT-SPI event signals.
-        tokio::spawn(async move {
-            use futures::StreamExt;
+        self.stop_event_listener();
 
-            // Subscribe to the AT-SPI event signals on D-Bus.
-            // The primary signal interface is org.a11y.atspi.Event.Focus
-            // and org.a11y.atspi.Event.Object for state/structure changes.
-            let proxy = match zbus::fdo::DBusProxy::builder(&zconn)
-                .destination("org.freedesktop.DBus")
-                .expect("valid destination")
-                .path("/org/freedesktop/DBus")
-                .expect("valid path")
-                .build()
+        // One stream per AT-SPI event match rule: focus changes, state changes
+        // and structural (children) mutations. `for_match_rule` registers the
+        // rule with the bus now, and removes it when the stream is dropped.
+        const RULES: [&str; 3] = [
+            "type='signal',interface='org.a11y.atspi.Event.Focus'",
+            "type='signal',interface='org.a11y.atspi.Event.Object',member='StateChanged'",
+            "type='signal',interface='org.a11y.atspi.Event.Object',member='ChildrenChanged'",
+        ];
+        let mut streams = Vec::with_capacity(RULES.len());
+        for rule in RULES {
+            let stream = zbus::MessageStream::for_match_rule(rule, &zconn, None)
                 .await
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    error!("Failed to build DBus proxy for event subscription: {e}");
-                    return;
-                }
-            };
+                .with_context(|| format!("Failed to add AT-SPI match rule {rule}"))?;
+            streams.push(stream);
+        }
+        let mut stream = futures::stream::select_all(streams);
 
-            // Add match rules for AT-SPI events.
-            let focus_rule = "type='signal',interface='org.a11y.atspi.Event.Focus'";
-            let object_rule =
-                "type='signal',interface='org.a11y.atspi.Event.Object',member='StateChanged'";
-            let children_rule =
-                "type='signal',interface='org.a11y.atspi.Event.Object',member='ChildrenChanged'";
+        let (tx, rx) = mpsc::channel::<A11yEvent>(256);
 
-            for rule in &[focus_rule, object_rule, children_rule] {
-                match zbus::MatchRule::try_from(*rule) {
-                    Ok(match_rule) => {
-                        if let Err(e) = proxy.add_match_rule(match_rule).await {
-                            warn!("Failed to add match rule {rule}: {e}");
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to parse match rule {rule}: {e}");
-                    }
-                }
-            }
-
-            // Listen to all messages matching our rules via the message stream.
-            let mut stream = zbus::MessageStream::from(&zconn);
-
+        let listener = tokio::spawn(async move {
             while let Some(msg) = stream.next().await {
                 // zbus 4 yields `Result<Message, Error>` from MessageStream rather
                 // than the bare `Arc<Message>` of zbus 3. Drop transient errors and
@@ -597,6 +606,15 @@ impl PlatformAdapter for AtspiAdapter {
                 }
             }
         });
+
+        let displaced = self
+            .event_listener
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(listener);
+        if let Some(old) = displaced {
+            old.abort();
+        }
 
         Ok(Some(rx))
     }
