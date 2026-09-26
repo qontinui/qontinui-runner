@@ -11865,6 +11865,10 @@ const API_RUNTIME_WORKER_THREADS: usize = 4;
 /// It MUST outlive [`serve_on_dedicated_runtime`]'s stack frame: dropping a
 /// `Runtime` shuts its workers down, which would stop the server we just
 /// started — and dropping one from inside an async context panics outright.
+#[expect(
+    clippy::disallowed_types,
+    reason = "process-lived OnceLock static, never dropped, so outside the drop-from-async panic class; plan 2026-09-12-residual-work-from-the-april-2026-plan-audit"
+)]
 static API_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
 
 /// Serve the local API (`:9876`) on a tokio runtime of its **own**.

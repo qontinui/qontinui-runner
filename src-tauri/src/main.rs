@@ -758,6 +758,10 @@ const DEGRADED_PLACEHOLDER_DSN: &str = "postgresql://qontinui@127.0.0.1:1/qontin
 /// `QONTINUI_FORCE_EMBEDDED_PG` is set. The hardcoded `localhost:5432` default
 /// that used to stand behind the other arm stays deleted — an unconfigured box
 /// boots the bundled cluster rather than guessing at a port.
+#[expect(
+    clippy::disallowed_types,
+    reason = "borrows the process-lived APP_RUNTIME during synchronous boot, predates the disallowed_types gate — migrate to a tokio::runtime::Handle; plan 2026-09-12-residual-work-from-the-april-2026-plan-audit"
+)]
 fn boot_embedded_pg(rt: &tokio::runtime::Runtime) -> Arc<crate::database::pg::PgDb> {
     // Honours `QONTINUI_EMBEDDED_PG_DIR` (blank ⇒ unset), falling back to the
     // machine-shared default. A temp/test runner sets it and gets a cluster of
@@ -886,6 +890,10 @@ fn env_flag(name: &str) -> bool {
 /// Setting both is a contradiction and panics: silently picking a winner would
 /// leave the operator debugging the wrong database, which is the exact class of
 /// undiagnosable failure this module exists to stop.
+#[expect(
+    clippy::disallowed_types,
+    reason = "borrows the process-lived APP_RUNTIME during synchronous boot, predates the disallowed_types gate — migrate to a tokio::runtime::Handle; plan 2026-09-12-residual-work-from-the-april-2026-plan-audit"
+)]
 fn select_db_arm(
     rt: &tokio::runtime::Runtime,
     profile: &qontinui_runner_lib::profiles::ResolvedProfile,
@@ -1264,6 +1272,10 @@ mod headless_manifest_tests {
 /// `'static` transmute. It is filled ONLY after `set` has succeeded, so a
 /// runtime we could not install is dropped rather than left running
 /// [`app_runtime_worker_threads`] idle workers nobody can reach.
+#[expect(
+    clippy::disallowed_types,
+    reason = "process-lived OnceLock static, never dropped, so outside the drop-from-async panic class; plan 2026-09-12-residual-work-from-the-april-2026-plan-audit"
+)]
 static APP_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
 
 /// The cap on the application runtime's worker count.

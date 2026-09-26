@@ -69,7 +69,7 @@ mod tests {
         gate_wiring: &'static [(&'static str, &'static str)],
     }
 
-    const RATCHETS: [Ratchet; 2] = [
+    const RATCHETS: [Ratchet; 3] = [
         // Plan 2026-09-03-coord-row-get-panic-class-closed-by-lint-and-supervisor,
         // Phase 3: carried over from `row_get_ratchet.rs`, whose BASELINE had
         // stayed at 562 while migrations took the real count down to 537 —
@@ -108,6 +108,34 @@ mod tests {
             baseline: 435,
             gate_wiring: &[
                 ("src-tauri/Cargo.toml", "string_slice = { level = \"deny\""),
+                (
+                    "src-tauri/Cargo.toml",
+                    "unfulfilled_lint_expectations = \"deny\"",
+                ),
+            ],
+        },
+        // Plan 2026-09-12-residual-work-from-the-april-2026-plan-audit, Phase 1:
+        // the regression guard plan runner-arc-runtime-root-cause (deliverable
+        // #5) never landed. An owned `tokio::runtime::Runtime` dropped from an
+        // async context panics (`Cannot drop a runtime in a context where
+        // blocking is not allowed`), so naming the type is denied via the
+        // repo-root `clippy.toml` `disallowed-types`. Grandfathered: the
+        // `&Runtime` params in `main.rs`, the two process-lived `OnceLock`
+        // statics (`APP_RUNTIME`, `API_RUNTIME` — item-level expects), and the
+        // `#[cfg(test)]` runtimes that test a sync path outside any runtime.
+        // Measured on the ubuntu `--all-targets` leg only; the windows leg
+        // cannot run on the authoring box.
+        Ratchet {
+            lint: "clippy::disallowed_types",
+            expect_needle: "#[expect(clippy::disallowed_types",
+            baseline: 10,
+            gate_wiring: &[
+                ("clippy.toml", "disallowed-types"),
+                ("clippy.toml", "tokio::runtime::Runtime"),
+                (
+                    "src-tauri/Cargo.toml",
+                    "disallowed_types = { level = \"deny\"",
+                ),
                 (
                     "src-tauri/Cargo.toml",
                     "unfulfilled_lint_expectations = \"deny\"",

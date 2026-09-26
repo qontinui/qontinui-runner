@@ -609,6 +609,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "owned tokio Runtime predates the disallowed_types gate — dropping one from an async context panics; hold a Handle or use tauri::async_runtime; plan 2026-09-12-residual-work-from-the-april-2026-plan-audit"
+    )]
     fn test_release_all_sync() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let mgr = UrlLockManager::new();

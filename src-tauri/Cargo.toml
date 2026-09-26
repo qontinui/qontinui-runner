@@ -429,6 +429,14 @@ suspicious = { level = "deny", priority = 1 }
 # `clippy::lint_groups_priority`, and the specific level must outrank the group.
 # Plan 2026-09-03-coord-row-get-panic-class-closed-by-lint-and-supervisor.
 disallowed_methods = { level = "deny", priority = 2 }
+# Naming `tokio::runtime::Runtime` (repo-root `clippy.toml` `disallowed-types`)
+# is denied: an owned Runtime dropped from an async context PANICS, the
+# `CloseRequested` class plan runner-arc-runtime-root-cause removed. Sites that
+# PREDATE this gate carry an item-level `#[expect(clippy::disallowed_types)]`,
+# pinned as a falling ceiling by `src-tauri/src/expect_ratchet.rs`. Priority 2
+# for the same `lint_groups_priority` reason as `disallowed_methods` above.
+# Plan 2026-09-12-residual-work-from-the-april-2026-plan-audit, Phase 1.
+disallowed_types = { level = "deny", priority = 2 }
 # `&s[..n]` on a `&str` PANICS when `n` is not a char boundary — a multibyte
 # character straddling the cut kills the handler or task that sliced (the class
 # `e99e64491` swept by hand, and that regressed twice in qontinui-coord). Every

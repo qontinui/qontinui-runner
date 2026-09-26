@@ -1305,6 +1305,10 @@ impl PgDb {
     /// "Cannot start a runtime from within a runtime" — use
     /// [`new_for_test`](Self::new_for_test) there.
     #[cfg(test)]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "owned tokio Runtime predates the disallowed_types gate — dropping one from an async context panics; hold a Handle or use tauri::async_runtime; plan 2026-09-12-residual-work-from-the-april-2026-plan-audit"
+    )]
     pub fn new_blocking_for_test() -> std::sync::Arc<Self> {
         let url = Self::test_database_url();
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime for test");

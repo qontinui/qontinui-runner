@@ -635,15 +635,14 @@ mod tests {
         assert!(providers.contains(&SearchProvider::OsvDev));
     }
 
-    #[test]
-    fn test_disabled_config() {
+    #[tokio::test]
+    async fn test_disabled_config() {
         let config = KnowledgeAcquisitionConfig {
             enabled: false,
             ..Default::default()
         };
         let ka = KnowledgeAcquisition::with_config(config);
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let results = rt.block_on(ka.search("test", KnowledgeDomain::General, 5));
+        let results = ka.search("test", KnowledgeDomain::General, 5).await;
         assert!(results.unwrap().is_empty());
     }
 
