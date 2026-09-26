@@ -605,6 +605,19 @@ coord_post_finding(
   dossier_slug  = "<slug>",
   title = "<the one-sentence CLAIM a reader sees when bodies are projected away>",
   body  = "<evidence, then method, then what a peer should do differently — in that order>")
+
+# The same write from bash, and the read it owes (the 201/200 is not the answer):
+W=<workspace-root>/qontinui-claude-config; . "$W/scripts/lib/envelope.sh"; R=$(mktemp -d)
+bash "$W/.claude/skills/coord-revive/coord-revive.sh" call coord_post_finding \
+  '{"kind":"status","scope":"tenant","topic":"plan-corpus","dossier_slug":"<slug>","resource_keys":["<key>"],"title":"<claim>","body":"<evidence>"}' > "$R/p"
+envelope_mcp_body coord_post_finding "$R/p" > "$R/b"
+P=$(envelope_require coord_post_finding posted "$R/b")          # FIRST - enforced, not printed
+if [ "$P" = true ]; then
+  envelope_require coord_post_finding finding.finding_id "$R/b"   # nested - never `finding_id` off the envelope
+else  # false = nothing stored (the reason says why); empty = UNKNOWN, the write is presumed LOST
+  echo "NOT STORED (posted=${P:-UNKNOWN})"; envelope_require coord_post_finding reason "$R/b"
+fi
+rm -rf "$R"
 ```
 
 Those are the argument names on both doors — the HTTP twin under **Transport**
@@ -964,6 +977,41 @@ coord_recent_findings(topic="dossier:<slug>", kind="dossier")   # the live head 
 coord_memory_search(query_text="DOSSIER <slug>", kinds=["mental_model"])   # the literal KEY — fallback
 coord_memory_search(query_text="<the condition in its own words>")
 coord_memory_search(query_text="<the condition, phrased a second way>")
+
+# The same lookup from bash, with every read it owes. Copy THIS, not a hand-rolled
+# `.get(...)`: coord_memory_search has NO `count` and its rows are `hits`.
+W=<workspace-root>/qontinui-claude-config; . "$W/scripts/lib/envelope.sh"
+REVIVE="$W/.claude/skills/coord-revive/coord-revive.sh"; R=$(mktemp -d)
+bash "$REVIVE" call coord_recent_findings '{"topic":"dossier:<slug>","kind":"dossier","limit":5}' > "$R/f"
+envelope_mcp_body coord_recent_findings "$R/f" > "$R/fb"
+if [ "$(envelope_require coord_recent_findings available "$R/fb")" = true ]; then
+  envelope_collection coord_recent_findings findings "$R/fb"   # the head(s); `count` must equal the rows
+else echo "UNKNOWN: findings store unavailable or unread - never \"no head\""; fi
+# Three probes, each ending HIT / MISS / UNKNOWN - never a bare zero.
+for Q in '{"query_text":"DOSSIER <slug>","kinds":["mental_model"],"limit":50}' \
+         '{"query_text":"<the condition in its own words>","limit":50}' \
+         '{"query_text":"<the condition, phrased a second way>","limit":50}'; do
+  bash "$REVIVE" call coord_memory_search "$Q" > "$R/m" || { echo "UNKNOWN (door): $Q"; continue; }
+  H=$(envelope_mcp_body coord_memory_search "$R/m" | envelope_require coord_memory_search hits -) \
+    || { echo "UNKNOWN (envelope): $Q"; continue; }
+  [ "$H" != "[]" ] && { echo "HIT: $Q"; printf '%s\n' "$H"; continue; }
+  # An empty `hits` is a hypothesis. It is a MISS only beside a populated store
+  # (this response's own `live_row_count`) AND a common-word control query that
+  # returns rows through the same door; anything else is UNKNOWN.
+  # `vector_arm` says which retrieval ran: `skipped_no_embedding` (the normal
+  # case) means full-text only, so a rephrasing may still hit.
+  L=$(envelope_mcp_body coord_memory_search "$R/m" | envelope_require coord_memory_search live_row_count -)
+  V=$(envelope_mcp_body coord_memory_search "$R/m" | envelope_require coord_memory_search vector_arm -)
+  # Control word: pick one that is common in the corpus yet selective
+  # (`dossier`). A stopword such as `the` is dropped by full-text search and
+  # always returns 0; a control that errors or times out leaves `C` unread,
+  # which is UNKNOWN - never a MISS.
+  bash "$REVIVE" call coord_memory_search '{"query_text":"dossier","limit":1}' > "$R/c"
+  C=$(envelope_mcp_body coord_memory_search "$R/c" | envelope_require coord_memory_search hits -)
+  if [ "${L:-0}" -gt 0 ] 2>/dev/null && [ -n "$C" ] && [ "$C" != "[]" ]; then echo "MISS (vector_arm=${V:-unread}): $Q"
+  else echo "UNKNOWN (live_row_count=${L:-unread}, vector_arm=${V:-unread}, control=${C:-unread}): $Q"; fi
+done
+rm -rf "$R"
 ```
 
 **The finding is the primary store; memory is the fallback.** When the first
@@ -1008,10 +1056,8 @@ prefix rule is what makes the head the only row whose title starts with
 **Interim lookup rule (until `title_prefix` lands).** `coord_memory_search` is
 **full-text only** unless the call carries a query vector — read its
 `vector_arm` (`skipped_no_embedding` is the normal case) — so run **at least
-three differently-phrased probes, one of them the literal key above**, and
-treat **every empty answer as UNKNOWN, never as "no dossier"**. Read every coord/web/runner response through `scripts/lib/envelope.py` / `envelope.sh`; assert `count`-vs-rows agreement before acting on any zero; an `UNKNOWN:` line is UNKNOWN, not a negative.
-The discriminating keys (`live_row_count` from `coord_memory_overview`,
-`vector_arm`) are named in the helper's docstring, not here — the dossier
+three differently-phrased probes, one of them the literal key above** — the
+recipe's loop does, and only its `MISS` line is "no dossier"; the dossier
 `0585cd3f` records why one probe is never enough.
 
 **Resolution path once it lands.** Plan
@@ -1476,10 +1522,15 @@ session that repeats a stale one forecloses the reader's search.
 server-side; the caller presents nothing.
 
 ```bash
-curl -sS -w '\nHTTP %{http_code}\n' \
-  'http://127.0.0.1:9876/plan-library/search?kind=plan&slug=<stem>'
+W=<workspace-root>/qontinui-claude-config; . "$W/scripts/lib/envelope.sh"; R=$(mktemp -d)
+curl -sS -w '%{stderr}HTTP %{http_code}\n' \
+  'http://127.0.0.1:9876/plan-library/search?kind=plan&slug=<stem>' > "$R/s"
+envelope_collection 'runner /plan-library/search' data.items "$R/s"   # rows; data.count must agree
+envelope_require    'runner /plan-library/search' data.corpus_health "$R/s"
 # the body, on a runner build that carries the by-id forward (READ-PLAN Phase 2):
-curl -sS 'http://127.0.0.1:9876/plan-library/artifacts/<id>'
+curl -sS -w '%{stderr}HTTP %{http_code}\n' 'http://127.0.0.1:9876/plan-library/artifacts/<id>' > "$R/a"
+envelope_require 'runner /plan-library/artifacts' data "$R/a"
+rm -rf "$R"
 ```
 
 A non-2xx names the host the runner dialled — its configured web base. Record
@@ -1519,10 +1570,26 @@ mint one from the runner (it holds no secret at rest):
 # `data: null` from get_coord_device_token is "this device is unpaired" - a
 # verdict, not a reason to try the next name. Only an HTTP 400 "not in UI Bridge
 # allowlist" (or 404) moves on to the older name for the same slot.
-curl -sS -X POST http://127.0.0.1:9876/ui-bridge/invoke/get_coord_device_token \
-  -H 'Content-Type: application/json' -d '{}'      # -> .data (source: runner-invoke)
-curl -sS -X POST http://127.0.0.1:9876/ui-bridge/invoke/get_access_token_for_websocket \
-  -H 'Content-Type: application/json' -d '{}'      # only after the 400/404 above
+# $R holds a LIVE bearer in $AUTHFILE: `rm -rf "$R"` at the end is not optional.
+W=<workspace-root>/qontinui-claude-config; . "$W/scripts/lib/envelope.sh"
+R=$(mktemp -d); AUTHFILE="$R/auth"
+S1=$(curl -sS -w '%{stderr}%{http_code}\n' -X POST \
+  http://127.0.0.1:9876/ui-bridge/invoke/get_coord_device_token \
+  -H 'Content-Type: application/json' -d '{}' 2>&1 >"$R/mint1" | tail -n 1)   # (source: runner-invoke)
+# The token never reaches the terminal or argv: it is read (exit 3 on
+# `data: null` = unpaired, or any other shape) straight into the header file.
+S2=""
+if [ "$S1" = 400 ] || [ "$S1" = 404 ]; then   # the older name, ONLY on 400/404
+  S2=$(curl -sS -w '%{stderr}%{http_code}\n' -X POST \
+    http://127.0.0.1:9876/ui-bridge/invoke/get_access_token_for_websocket \
+    -H 'Content-Type: application/json' -d '{}' 2>&1 >"$R/mint2" | tail -n 1)
+  echo "HTTP $S1 then $S2" >&2
+  T=$(envelope_first_present runner-mint data.value,data.result.value,data "$R/mint2")
+else
+  echo "HTTP $S1" >&2
+  T=$(envelope_first_present runner-mint data.value,data.result.value,data "$R/mint1")
+fi
+[ -n "$T" ] && printf 'Authorization: Bearer %s\n' "$T" > "$AUTHFILE"; unset T
 
 # DOOR 3b, ONLY when 3a answered HTTP 400 "not in UI Bridge allowlist" (or 404
 # for the route) for BOTH names - a runner build that predates both entries; a
@@ -1542,15 +1609,25 @@ curl -sS -X POST http://127.0.0.1:9876/ui-bridge/invoke/get_access_token_for_web
 # runner unwraps the frontend's `result` envelope before it reaches HTTP.
 # Plans 2026-08-24-headless-box-has-no-working-coord-credential-door,
 # 2026-09-02-steering-layers-unreadable-without-a-credential (1f).
-curl -sS http://127.0.0.1:9876/health   # -> .data.frontendReady
+# The gate is CODE, not the comment above: no bearer from 3a, and BOTH names
+# refused with 400/404.
+case "$S1:$S2" in 400:400|400:404|404:400|404:404) B3=1 ;; *) B3= ;; esac
+if [ ! -s "$AUTHFILE" ] && [ -n "$B3" ]; then
+  curl -sS -w '%{stderr}HTTP %{http_code}\n' http://127.0.0.1:9876/health > "$R/h"
+  if [ "$(envelope_require 'runner /health' data.frontendReady "$R/h")" = true ]; then
+    curl -sS -w '%{stderr}HTTP %{http_code}\n' -X POST http://127.0.0.1:9876/ui-bridge/control/page/evaluate \
+      -H 'Content-Type: application/json' \
+      -d '{"expression":"window.__TAURI__ ? window.__TAURI__.core.invoke(\"get_access_token_for_websocket\") : invoke(\"get_access_token_for_websocket\")","await_promise":true}' > "$R/mint3"   # (source: runner-eval)
+    T=$(envelope_first_present runner-mint data.value,data.result.value,data "$R/mint3") \
+      && printf 'Authorization: Bearer %s\n' "$T" > "$AUTHFILE"; unset T
+  else echo "eval door DEAD (frontendReady false or unread) - NOT signed out" >&2; fi
+fi
 
-curl -sS -X POST http://127.0.0.1:9876/ui-bridge/control/page/evaluate \
-  -H 'Content-Type: application/json' \
-  -d '{"expression":"window.__TAURI__ ? window.__TAURI__.core.invoke(\"get_access_token_for_websocket\") : invoke(\"get_access_token_for_websocket\")","await_promise":true}'   # (source: runner-eval)
-
-# Then read the corpus, staging the bearer OFF argv into $AUTHFILE:
-curl -sS --get 'https://api.qontinui.io/api/v1/plan-library' \
-  --data-urlencode 'kind=plan' --data-urlencode 'slug=<stem>' -H @"$AUTHFILE"
+# Then read the corpus, the bearer staged OFF argv in $AUTHFILE:
+curl -sS -w '%{stderr}HTTP %{http_code}\n' --get 'https://api.qontinui.io/api/v1/plan-library' \
+  --data-urlencode 'kind=plan' --data-urlencode 'slug=<stem>' -H @"$AUTHFILE" > "$R/p"
+envelope_collection 'web /api/v1/plan-library' items "$R/p"   # `total` is the UNPAGED total
+rm -rf "$R"                                                    # the bearer goes with it
 ```
 
 Two independent sessions on 2026-08-25 both reported PLAN-STATUS UNKNOWN off a
@@ -1781,17 +1858,22 @@ escalation.
 (`$COORD_HTTP_URL` defaults to `https://coord.qontinui.io`):
 
 ```bash
+W=<workspace-root>/qontinui-claude-config; . "$W/scripts/lib/envelope.sh"; R=$(mktemp -d)
+: "${COORD_HTTP_URL:=https://coord.qontinui.io}"
 # every unit LANDED / WATCHED / RECORDED
-curl -sS -X POST \
+curl -sS -w '%{stderr}HTTP %{http_code}\n' -X POST \
   "$COORD_HTTP_URL/coord/gates/$GATE_ID/continuation-consumed" \
   -H 'Content-Type: application/json' \
-  -d "{\"device_id\":\"$GATE_DEVICE_ID\",\"outcome\":\"work_completed\"}"
+  -d "{\"device_id\":\"$GATE_DEVICE_ID\",\"outcome\":\"work_completed\"}" > "$R/o"
+envelope_require 'POST /coord/gates/<id>/continuation-consumed' outcome_recorded "$R/o"   # what coord PERSISTED
 
 # any unit IMPEDED or DROPPED - detail is ONE line, naming the items
-curl -sS -X POST \
+curl -sS -w '%{stderr}HTTP %{http_code}\n' -X POST \
   "$COORD_HTTP_URL/coord/gates/$GATE_ID/continuation-consumed" \
   -H 'Content-Type: application/json' \
-  -d "{\"device_id\":\"$GATE_DEVICE_ID\",\"outcome\":\"work_abandoned\",\"detail\":\"<the IMPEDED/DROPPED items and why>\"}"
+  -d "{\"device_id\":\"$GATE_DEVICE_ID\",\"outcome\":\"work_abandoned\",\"detail\":\"<the IMPEDED/DROPPED items and why>\"}" > "$R/o"
+envelope_require 'POST /coord/gates/<id>/continuation-consumed' outcome_recorded "$R/o"   # compare by PREFIX
+rm -rf "$R"
 ```
 
 `work_completed` is persisted **bare** — coord carries no detail on it, so the
