@@ -2387,8 +2387,7 @@ reason to coord before fixing + retrying:
 — best-effort, fail-open; it never edits git or blocks. `/clean-commit` Phase 4
 does this automatically; do the same on a manual commit. On machines with the
 commit-abort wrapper installed
-(operator-local installer `qontinui-dev-notes/scripts/install-commit-abort-hook.sh`, plan
-`2026-06-06-commit-abort-wrapper`) the rejected hook auto-reports when gated
+(plan `2026-06-06-commit-abort-wrapper`) the rejected hook auto-reports when gated
 on — the manual call is the fallback for unwrapped machines and stays harmless
 everywhere (same match keys, best-effort oplog). Never `--no-verify` to bypass
 the hook — that defeats both the hook and the supervision signal.
@@ -3039,6 +3038,8 @@ the second stage.
 bash <workspace-root>/qontinui-claude-config/scripts/review-arm-corroborate.sh --tree-root <the worktree you reviewed>
 ```
 
+**Run it in the background.** Door calls and tree re-measures are serial, each bounded by `REVIEW_ARM_CORROBORATE_TIMEOUT` (default 600 s), so a run can take up to (N+1+T) × that budget (N PRs, the coverage call, T checkouts re-measured). Start it with the Bash tool's `run_in_background` (or watch it with Monitor) and read the verdict line when it exits — a foreground call under the tool's 120 s / 600 s timeout is killed with no verdict.
+
 **Run the peer-land probe here too, and before every rebase** *(plan
 `2026-09-05-a-verification-report-never-states-the-tree-it-read` Phase 5)*:
 
@@ -3080,8 +3081,9 @@ touched), and exits on the **worst** verdict:
 |---|---|---|---|
 | `0` | **CORROBORATED** | every PR's coord `head_sha` equals the artifact's `reviewed_head_sha`, the re-measured tree equals the artifact's `reviewed_tree`, and the coverage read found no PR coord holds for this session that `prs[]` omits | proceed — but read the `coverage=` half of the verdict line too, below |
 | `2` | **CONTRADICTION** | `contradiction_head_drift` — the PR carries code the review did not see; `contradiction_tree_moved` — the **working tree** moved since the review measured it, committed or not; or `contradiction_uncovered_pr` — coord attributes a PR to this session that the artifact omits | **this is a failure of the review gate, not a note.** Re-review the head that is actually on the PR and the tree that is actually on disk (Step 4.4 items 3–6 again, which re-measures `reviewed_head_sha` and `reviewed_tree`), or cover the omitted PR; then add the new head's `Coord-Reviewed-Head:` line to the PR body (`gh pr edit <n> --body-file <file>`, Step 4.5 — coord harvests it on `edited`) so the trailer coord's `require_review` gate reads and the artifact agree; then re-run this step. Do not proceed to Step 6 with a contradiction standing, and never edit the `corroboration[]` row by hand |
-| `3` | **UNKNOWN** | the card door did not answer, the card reads `confidence: unknown` or carries no `head_sha`, the artifact predates `reviewed_head_sha` (`unknown_no_reviewed_head`) or `reviewed_tree` (`unknown_no_reviewed_tree`), or the tree could not be compared — the producer refused, a field is the unresolved sentinel, or the two lines name different checkouts (`unknown_tree`) | UNKNOWN is never a pass and never a contradiction. Say so in the Step 6 report — *"corroboration UNKNOWN: <the detail the row carries>"* — and never report the review as corroborated |
+| `3` | **UNKNOWN** | the card door did not answer — `unknown_door` (it refused or answered garbage), `unknown_door_timeout` (the door's curl gave up with exit 28 — its connect bound or its `COORD_REVIVE_CALL_TIMEOUT` total bound; the line cannot say which) or `unknown_budget_expired` (this script's `REVIEW_ARM_CORROBORATE_TIMEOUT`, default 600 s, expired before the door exited; *most likely* local starvation only when the inner budget sits below it), each detail naming the budgets involved and the elapsed wall time — the card reads `confidence: unknown` or carries no `head_sha`, the artifact predates `reviewed_head_sha` (`unknown_no_reviewed_head`) or `reviewed_tree` (`unknown_no_reviewed_tree`), or the tree could not be compared — the producer refused, a field is the unresolved sentinel, or the two lines name different checkouts (`unknown_tree`) | UNKNOWN is never a pass and never a contradiction. Say so in the Step 6 report — *"corroboration UNKNOWN: <the detail the row carries>"* — and never report the review as corroborated |
 | `4` | **USAGE** | no artifact, no session id | the same finding Step 6 item 6 names: the review gate never wrote its record |
+| any other | **UNKNOWN** | any other exit (1, 129/130/143, …): the run did not complete — a crash, or a HUP / INT / TERM, e.g. a foreground Bash-tool timeout — and the artifact may or may not have been rewritten | report *"corroboration UNKNOWN: the run did not complete (exit <n>)"*; never corroborated |
 
 **The verdict line carries TWO halves — `heads=<n>/<m>` and `coverage=<…>` —
 and only the first decides the exit code.** The coverage read
@@ -3091,7 +3093,9 @@ door answers `mine=true requires a session-scoped identity (no
 caller_session_id)`. Folding that structural refusal into the exit code would
 render every real run UNKNOWN and bury the head verdict, so a coverage UNKNOWN
 is instead printed on the verdict line and stored as the artifact's `coverage`
-row (`verdict: unknown_door`, with the door's own words), while a coverage
+row (`verdict: unknown_door`, with the door's own words — or
+`unknown_door_timeout` / `unknown_budget_expired` when a budget expired, as on
+the card rows), while a coverage
 **contradiction** still exits `2`. Read `CORROBORATED heads=2/2
 coverage=UNKNOWN` as exactly that — heads proven, coverage not established — and
 carry both halves into the Step 6 report. Never write it up as "coverage
