@@ -843,7 +843,10 @@ pub fn test_config_dir_override(source: &str) -> Option<PathBuf> {
     ) {
         ConfigDirOverride::UsePlatform => None,
         ConfigDirOverride::Panic => panic!(
-            "runner config dir resolved by {source} with QONTINUI_CONFIG_DIR unset, from a              test with no isolated_ambient() guard — that is the operator's real              settings.json. See plan              2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json"
+            "runner config dir resolved by {source} with QONTINUI_CONFIG_DIR unset, from a \
+             test with no isolated_ambient() guard — that is the operator's real \
+             settings.json. See plan \
+             2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json"
         ),
         ConfigDirOverride::Deflect { announce } => {
             let dir = deflected_config_dir();

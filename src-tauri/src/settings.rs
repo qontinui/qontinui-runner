@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::ai_router::RoutingConfig;
 use crate::orchestrator::{CompressionConfig, RetryConfig};
@@ -4034,6 +4034,18 @@ impl ConfigDirSource {
 /// gets `None` from the override and resolves exactly as before. Plan
 /// `2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json`,
 /// D1.
+///
+/// # …even when the lib's override is compiled out
+///
+/// The lib's override is `cfg(any(test, debug_assertions))`: in a build with
+/// neither (`cargo test --release`, where the lib is a plain dependency) it is
+/// a stub answering `None`. `cfg(test)` still holds HERE, in the bin's own test
+/// binary, so under it an unset `QONTINUI_CONFIG_DIR` the lib did not deflect
+/// is deflected by [`bin_test_config_dir_fallback`] — never resolved to
+/// `dirs::config_dir()`. Unconditional on the thread's fixture state, like the
+/// lib's own rule (a guarded thread that removed the variable is deflected
+/// too), and because the fixture helpers are not compiled in that build either.
+/// Production (`cfg(not(test))`) is unchanged.
 pub(crate) fn resolve_config_dir() -> Result<(PathBuf, ConfigDirSource), String> {
     let env_config_dir = std::env::var("QONTINUI_CONFIG_DIR").ok();
     if env_config_dir.as_deref().is_none_or(str::is_empty) {
@@ -4042,8 +4054,29 @@ pub(crate) fn resolve_config_dir() -> Result<(PathBuf, ConfigDirSource), String>
         {
             return Ok((dir, ConfigDirSource::TestDeflected));
         }
+        #[cfg(test)]
+        return Ok((
+            bin_test_config_dir_fallback(),
+            ConfigDirSource::TestDeflected,
+        ));
     }
     resolve_config_dir_from(env_config_dir, dirs::config_dir())
+}
+
+/// The bin test binary's own hermetic runner config dir, for a build in which
+/// the lib's `ambient::test_config_dir_override` is compiled to a stub (see
+/// [`resolve_config_dir`]). Per process, under the temp dir, created.
+#[cfg(test)]
+pub(crate) fn bin_test_config_dir_fallback() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir()
+            .join(format!("qontinui-bin-test-config-{}", std::process::id()))
+            .join("com.qontinui.runner");
+        let _ = fs::create_dir_all(&dir);
+        dir
+    })
+    .clone()
 }
 
 /// [`resolve_config_dir`] as a PURE function of its two inputs, so the
@@ -4791,18 +4824,39 @@ fn complete_settings_load(loaded: LoadedSettings) -> LoadedSettings {
         let target = persist_target_for_this_thread(read_path.as_deref());
         // D3: a `FreshInstall` is one `NotFound`, observed once. If the file is
         // there now (or an atomic write into it is in flight), the defaults
-        // this load built are NOT the user's state — refuse, and stop calling
-        // this load authoritative.
+        // this load built are NOT the user's state — refuse, then answer the
+        // file that is there now or, failing that, stop calling this load
+        // authoritative.
         let refusal = match &target {
             Ok(Some(path)) => fresh_install_persist_refusal(provenance, path),
             _ => None,
         };
         match target {
-            Ok(Some(_)) if refusal.is_some() => {
+            Ok(Some(target)) if refusal.is_some() => {
                 let refusal = refusal.unwrap_or_default();
+                // The benign case is the first-boot race: two threads both read
+                // `FreshInstall` and the other one persisted first. Re-read the
+                // target ONCE and answer what is on disk now, with its real
+                // provenance, so this caller's `local_user_id` matches the
+                // file. Only when the re-read does not produce a document
+                // (still no file — e.g. a write still in flight — or the file
+                // is unreadable) is this load non-authoritative.
+                let reread = read_settings_from_path(&target);
+                if reread.provenance == SettingsProvenance::Loaded {
+                    warn!(
+                        "refusing FreshInstall persist: {refusal} — answering the file                          now at {} instead",
+                        target.display()
+                    );
+                    // A `Loaded` document is never refused, so this recursion
+                    // is at most one level deep.
+                    return complete_settings_load(reread);
+                }
                 error!("refusing FreshInstall persist: {refusal}");
                 provenance = SettingsProvenance::Unreadable;
-                error = Some(format!("refused FreshInstall persist: {refusal}"));
+                error = Some(match reread.error {
+                    Some(e) => format!("refused FreshInstall persist: {refusal}; re-read: {e}"),
+                    None => format!("refused FreshInstall persist: {refusal}"),
+                });
             }
             Ok(Some(target)) => {
                 let to_persist = document_to_persist(&on_disk, &settings, tier_migration);
@@ -5516,7 +5570,13 @@ fn fresh_install_persist_refusal(provenance: SettingsProvenance, path: &Path) ->
     if provenance != SettingsProvenance::FreshInstall {
         return None;
     }
-    if fs::symlink_metadata(path).is_ok() {
+    // The SAME stat the read took (`fs::metadata`, which follows symlinks):
+    // a dangling `settings.json` symlink read as `NotFound`, so it must not
+    // count as "appeared" here either. With `symlink_metadata` it did, and
+    // every persist was refused forever — tier Unknown, `update_settings`
+    // always failing — where before `atomic_write`'s rename replaced the
+    // dangling link.
+    if fs::metadata(path).is_ok() {
         return Some(format!("{} appeared since the read", path.display()));
     }
     let prefix = format!("{}.tmp.", path.file_name()?.to_string_lossy());
@@ -7527,10 +7587,12 @@ mod config_dir_race_tests {
     }
 
     /// D3, load path: a `FreshInstall` read, then the file APPEARS at the read
-    /// path before the persist. The persist is refused, the file is untouched,
-    /// and the load stops calling itself authoritative.
+    /// path before the persist — the benign first-boot race, where a sibling
+    /// thread that also read `FreshInstall` persisted first. The persist is
+    /// refused, the file is untouched, and the load answers THAT file with its
+    /// real provenance, so this caller's `local_user_id` matches the disk.
     #[test]
-    fn a_fresh_install_persist_is_refused_when_the_file_appeared_since_the_read() {
+    fn a_fresh_install_persist_refused_because_the_file_appeared_answers_that_file() {
         let _g = crate::test_env::env_lock();
         let _restore = crate::test_env::EnvVarRestore::capture(RACE_ENV_KEYS);
         let dir_a = tempfile::tempdir().expect("tempdir A");
@@ -7547,13 +7609,80 @@ mod config_dir_race_tests {
         );
         assert_eq!(
             completed.provenance,
-            SettingsProvenance::Unreadable,
-            "defaults built from a NotFound that is no longer true are not the user's state"
+            SettingsProvenance::Loaded,
+            "the refusal must re-read the file that appeared, not report it unreadable"
         );
-        let why = completed
-            .error
-            .expect("the refusal is carried as the error");
-        assert!(why.contains("appeared since the read"), "{why}");
+        assert_eq!(completed.error, None);
+        assert_eq!(
+            completed.settings.local_user_id, "operator-local-user-id-must-survive",
+            "the loser of the race must hold the id that is on disk, not the one it minted"
+        );
+        assert_eq!(completed.path.as_deref(), Some(appeared.as_path()));
+    }
+
+    /// The bin-side backstop for a build in which the lib's
+    /// `test_config_dir_override` is a stub (`cargo test --release`): a
+    /// per-process hermetic dir under the temp dir, and `resolve_config_dir`
+    /// reaches it BEFORE its platform arm. In a debug test build the lib's
+    /// override answers first, so the fallback is pinned here directly and by
+    /// source rather than through a resolve.
+    #[test]
+    fn resolve_config_dir_has_a_bin_side_fallback_that_never_reaches_the_platform_dir() {
+        let dir = bin_test_config_dir_fallback();
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "the fallback must be hermetic, got {}",
+            dir.display()
+        );
+        assert!(dir.ends_with("com.qontinui.runner"));
+        assert!(dir.is_dir(), "the fallback dir is created, like the lib's");
+        assert_eq!(dir, bin_test_config_dir_fallback(), "stable per process");
+
+        let src = include_str!("settings.rs");
+        let body_start = src
+            .find("pub(crate) fn resolve_config_dir() ->")
+            .expect("resolve_config_dir exists");
+        let body = &src[body_start..];
+        let body = &body[..body.find("\n}\n").expect("fn end")];
+        let fallback = body
+            .find("#[cfg(test)]\n        return Ok((\n            bin_test_config_dir_fallback(),")
+            .expect("resolve_config_dir must return the bin-side fallback under cfg(test)");
+        let platform = body.find("dirs::config_dir()").expect("the platform arm");
+        assert!(
+            fallback < platform,
+            "the bin-side fallback must be taken before the platform arm"
+        );
+    }
+
+    /// D3 must stat the way the READ did. A dangling `settings.json` symlink
+    /// reads as `NotFound` (`fs::metadata` follows the link), so the load is a
+    /// `FreshInstall` — and its persist must go ahead, replacing the dangling
+    /// link through `atomic_write`'s rename as it always did. Counting the link
+    /// as "appeared" refused every persist forever.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_settings_symlink_does_not_refuse_the_fresh_install_persist() {
+        let _g = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(RACE_ENV_KEYS);
+        let dir_a = tempfile::tempdir().expect("tempdir A");
+        let link = dir_a.path().join(SETTINGS_FILE);
+        std::os::unix::fs::symlink(dir_a.path().join("no-such-target.json"), &link)
+            .expect("dangling symlink");
+
+        let loaded = fresh_install_in(dir_a.path());
+        assert_eq!(
+            fresh_install_persist_refusal(SettingsProvenance::FreshInstall, &link),
+            None,
+            "a dangling symlink is what the read saw as NotFound, not a file that appeared"
+        );
+
+        let completed = complete_settings_load(loaded);
+        assert_eq!(completed.provenance, SettingsProvenance::FreshInstall);
+        let written = std::fs::read_to_string(&link).expect("the persist replaced the link");
+        assert!(
+            written.contains(&completed.settings.local_user_id),
+            "the minted local_user_id must have been persisted, got: {written:?}"
+        );
     }
 
     /// D3, load path: a recent `settings.json.tmp.*` sibling is an atomic write

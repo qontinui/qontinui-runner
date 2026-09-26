@@ -613,6 +613,16 @@ impl std::fmt::Display for SettingsJsonPathSource {
 /// replaced by [`crate::ambient::test_config_dir_override`]'s hermetic dir
 /// ([`SettingsJsonPathSource::TestDeflected`]) — the one decision
 /// `settings::resolve_config_dir` consults too.
+///
+/// **Residual: a build with neither `cfg(test)` nor `debug_assertions` in THIS
+/// crate.** The override is compiled to a stub answering `None` there, and
+/// this crate cannot tell a test harness from production without it, so the
+/// platform arm is taken. That is `cargo test --release` for any binary that
+/// links this lib as a plain dependency — the integration tests under
+/// `tests/`. (The lib's own unit tests have `cfg(test)`; the runner bin's test
+/// binary does not compile in that build at all, since its `test_env` imports
+/// `ambient::test_support`, and `settings::resolve_config_dir` carries its own
+/// `cfg(test)` fallback regardless.) No CI job runs tests in release.
 pub fn settings_json_path() -> (Option<PathBuf>, SettingsJsonPathSource) {
     if let Some(dir) = std::env::var("QONTINUI_CONFIG_DIR")
         .ok()

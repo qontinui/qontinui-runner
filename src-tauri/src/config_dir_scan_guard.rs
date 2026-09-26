@@ -67,6 +67,14 @@
 //!
 //! # Known limits
 //!
+//! * The deflection this guard relies on is `cfg(any(test, debug_assertions))`
+//!   in the lib. Under `cargo test --release` the lib's resolvers
+//!   (`profiles::settings_json_path`, `ambient::runner_platform_config_root`)
+//!   fall through to the platform dir for any binary linking the lib without
+//!   `cfg(test)` — the integration tests under `tests/`. The bin's test binary
+//!   does not compile in that build (its `test_env` imports
+//!   `ambient::test_support`), and `settings::resolve_config_dir` carries a
+//!   `cfg(test)` fallback of its own besides. No CI job runs tests in release.
 //! * An alias (`use dirs as d; d::config_dir()`) or a re-export under another
 //!   name is missed. The crate has none today.
 //! * Other platform dirs (`dirs::data_dir`, `dirs::data_local_dir`) are out of
