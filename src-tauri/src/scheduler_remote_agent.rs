@@ -278,7 +278,9 @@ pub(crate) async fn launch(
     // commands and fleet skills (`/return-to-main` among them). Every one of
     // these skips a destination the enclosing repo tracks, so a workspace root
     // whose `.claude/` is a checkout is left alone.
-    let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(&workdir_s, bound_port, None);
+    let coord_mcp =
+        crate::coord_mcp::provision_coord_mcp_for_session_off_runtime(&workdir_s, bound_port, None)
+            .await;
     crate::session_assets::provision_session_assets_off_runtime(&workdir_s).await;
 
     // Most-available account, so the child does not spawn under a

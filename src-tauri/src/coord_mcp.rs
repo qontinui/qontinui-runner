@@ -9310,6 +9310,42 @@ pub(crate) fn provision_coord_mcp_for_session(
     provision_coord_mcp_with_jwt(workdir, &jwt, bound_port, session_tenant)
 }
 
+/// [`provision_coord_mcp_for_session`] on the blocking pool, awaited — the only
+/// form an ASYNC spawn path may call.
+///
+/// The sync fn is not "light file I/O": `AuthManager::get_access_token` reads
+/// and decrypts the secure store and, when that fails, falls back to a bounded
+/// OS-keychain call (a D-Bus round trip on Linux) before any `.mcp.json` is
+/// written. Run inline, that occupies a tokio worker for the whole spawn. This
+/// mirrors `session_assets::provision_session_assets_off_runtime`; the
+/// `session_asset_sites` census fails on an inline call from anywhere else.
+///
+/// A panic or cancellation on the pool (a `JoinError`) is logged and answers
+/// [`CoordMcpDelivery::Unprovisioned`] — the same outcome as a provision that
+/// found no credential. The session was given nothing the runner knows of, and
+/// provisioning never aborts a spawn.
+pub(crate) async fn provision_coord_mcp_for_session_off_runtime(
+    workdir: &str,
+    bound_port: Option<u16>,
+    session_tenant: Option<Uuid>,
+) -> CoordMcpDelivery {
+    let owned = workdir.to_string();
+    match spawn_blocking_tracked(move || {
+        provision_coord_mcp_for_session(&owned, bound_port, session_tenant)
+    })
+    .await
+    {
+        Ok(delivery) => delivery,
+        Err(e) => {
+            warn!(
+                "coord_mcp: provisioning task for {workdir} did not complete \
+                 (continuing spawn without a runner-written coord-mcp): {e}"
+            );
+            CoordMcpDelivery::Unprovisioned
+        }
+    }
+}
+
 /// Apply an already-resolved bearer to `workdir`'s `.mcp.json`, enforcing the two
 /// guards: the bearer must decode `sub_type ∈ {device, agent}` (never write a
 /// non-coord-verifying token), and the non-clobber / no-downgrade guard

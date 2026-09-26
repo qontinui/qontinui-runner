@@ -110,6 +110,34 @@ const CWD_OFF_RUNTIME_CALLERS: &[(&str, &str)] = &[
     ),
 ];
 
+/// coord-mcp provisioning is BLOCKING too: `provision_coord_mcp_for_session`
+/// reads and decrypts the secure store and can fall back to a bounded
+/// OS-keychain call before it writes `.mcp.json`. Its non-test callers are its
+/// off-runtime wrapper and `provision_session_cwd` (itself already run on the
+/// blocking pool by `provision_session_cwd_off_runtime`, above); every async
+/// spawn path awaits the wrapper and is listed here, so a path that goes back to
+/// the inline sync call — or stops provisioning coord-mcp — goes red.
+const COORD_MCP_SYNC_TOKEN: &str = "provision_coord_mcp_for_session(";
+const COORD_MCP_SYNC_CALLERS: &[(&str, &str)] = &[
+    (
+        "coord_mcp.rs",
+        "provision_coord_mcp_for_session_off_runtime",
+    ),
+    ("agent_worktree/isolated_edit.rs", "provision_session_cwd"),
+];
+const COORD_MCP_OFF_RUNTIME_TOKEN: &str = "provision_coord_mcp_for_session_off_runtime(";
+const COORD_MCP_OFF_RUNTIME_CALLERS: &[(&str, &str)] = &[
+    ("agent_runtime.rs", "run_continuation_terminal"),
+    ("agent_runtime.rs", "run_continuation_headless"),
+    (
+        "looping_agent_supervisor.rs",
+        "spawn_looping_agent_terminal",
+    ),
+    ("scheduler_remote_agent.rs", "launch"),
+    ("commands/ai_session.rs", "resume_ai_sessions"),
+    ("mcp/backend_relay.rs", "handle_chat_create"),
+];
+
 /// This file names every token in string literals; it is not a caller.
 const SELF_FILE: &str = "session_asset_sites.rs";
 
@@ -230,6 +258,76 @@ fn session_cwd_callers_vs_roster(sources: &Sources) -> (Vec<Site>, Vec<Site>, Ve
         listed.difference(&found).cloned().collect(),
         found.difference(&listed).cloned().collect(),
     )
+}
+
+/// `(inline, missing, unlisted)` for coord-mcp provisioning: callers of the
+/// blocking `provision_coord_mcp_for_session` outside
+/// [`COORD_MCP_SYNC_CALLERS`], rostered async paths that no longer await the
+/// off-runtime wrapper, and wrapper callers with no row. PURE.
+fn coord_mcp_callers_vs_roster(sources: &Sources) -> (Vec<Site>, Vec<Site>, Vec<Site>) {
+    let allowed: BTreeSet<Site> = COORD_MCP_SYNC_CALLERS
+        .iter()
+        .map(|(f, func)| site(f, func))
+        .collect();
+    let inline = calls_of(sources, COORD_MCP_SYNC_TOKEN)
+        .difference(&allowed)
+        .cloned()
+        .collect();
+    let found = calls_of(sources, COORD_MCP_OFF_RUNTIME_TOKEN);
+    let listed: BTreeSet<Site> = COORD_MCP_OFF_RUNTIME_CALLERS
+        .iter()
+        .map(|(f, func)| site(f, func))
+        .collect();
+    (
+        inline,
+        listed.difference(&found).cloned().collect(),
+        found.difference(&listed).cloned().collect(),
+    )
+}
+
+#[test]
+fn async_spawn_paths_provision_coord_mcp_off_the_runtime() {
+    let (inline, missing, unlisted) = coord_mcp_callers_vs_roster(&load_sources());
+    assert!(
+        inline.is_empty(),
+        "blocking `provision_coord_mcp_for_session` called outside its allowed callers — \
+         async spawn paths must await `provision_coord_mcp_for_session_off_runtime` so the \
+         secure-store read and keychain fallback stay off tokio workers: {inline:#?}"
+    );
+    assert!(
+        missing.is_empty(),
+        "rostered async spawn paths that no longer provision coord-mcp: {missing:#?}"
+    );
+    assert!(
+        unlisted.is_empty(),
+        "callers of `provision_coord_mcp_for_session_off_runtime` with no \
+         COORD_MCP_OFF_RUNTIME_CALLERS row: {unlisted:#?}"
+    );
+}
+
+/// Mutation twin: put one async path back on the inline sync call and the
+/// guard must name it, both as an inline caller and as a missing wrapper call.
+#[test]
+fn an_inline_sync_coord_mcp_provision_is_caught() {
+    let mut sources = load_sources();
+    let file = "scheduler_remote_agent.rs".to_string();
+    let src = sources
+        .get(&file)
+        .expect("scheduler_remote_agent.rs")
+        .clone();
+    assert!(
+        src.contains(COORD_MCP_OFF_RUNTIME_TOKEN),
+        "fixture: the scheduler launch path must await the off-runtime wrapper today"
+    );
+    sources.insert(
+        file,
+        src.replace(COORD_MCP_OFF_RUNTIME_TOKEN, COORD_MCP_SYNC_TOKEN),
+    );
+    let (inline, missing, unlisted) = coord_mcp_callers_vs_roster(&sources);
+    let launch = site("scheduler_remote_agent.rs", "launch");
+    assert_eq!(inline, vec![launch.clone()]);
+    assert_eq!(missing, vec![launch]);
+    assert!(unlisted.is_empty());
 }
 
 #[test]
