@@ -73,7 +73,13 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $files = Get-ChildItem -Path . -Recurse -File |
+          # -Force: on Linux, pwsh treats a dot-prefixed entry as HIDDEN and
+          # skips it without this flag, so a script under `.github/`, `.claude/`
+          # or any other dot-directory would never be parsed. qontinui-claude-config
+          # found this in its own log (53 parsed of 55 tracked) and fixed it in
+          # #902; this copy predated that fix. The `.git` exclusion below is what
+          # -Force would otherwise let in.
+          $files = Get-ChildItem -Path . -Recurse -File -Force |
                    Where-Object { $_.Extension -in '.ps1', '.psm1' } |
                    Where-Object { $_.FullName -notmatch '[\\/](node_modules|\.git)[\\/]' }
           if ($files.Count -eq 0) {
