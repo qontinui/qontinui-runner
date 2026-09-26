@@ -949,19 +949,50 @@ fn prefixed_ui_bridge_keys_win_and_normalization_is_idempotent() {
     );
 }
 
-/// A ui_bridge step that still fails the parse is refused by the conversion
-/// seam rather than rebuilt without its action.
+/// A ui_bridge step that still fails the parse becomes, at the conversion
+/// seam, a step that FAILS at execution naming it and the serde error — not
+/// a dropped step, not a hand-rebuilt one, not a snapshot.
 #[test]
-fn unparseable_ui_bridge_step_is_refused_not_rebuilt() {
-    let bad = json!({"type": "ui_bridge", "name": "bad", "action": "navigate",
+fn unparseable_ui_bridge_step_fails_visibly() {
+    let bad = json!({"type": "ui_bridge", "id": "u1", "name": "bad", "action": "navigate",
                      "timeoutMs": "not-a-number"});
     assert!(parse_step_value(&bad).is_err());
-    assert!(convert_json_steps_with_phase(std::slice::from_ref(&bad), 0, Some("setup")).is_empty());
+    for steps in [
+        convert_json_steps_with_phase(std::slice::from_ref(&bad), 0, Some("setup")),
+        crate::unified_workflow_executor::step_conversion::convert_all_json_steps_with_phase(
+            std::slice::from_ref(&bad),
+            0,
+            Some("setup"),
+        ),
+    ] {
+        assert_eq!(steps.len(), 1, "the step must not vanish");
+        let esc = &steps[0];
+        assert_eq!(esc.step_type, "ui_bridge");
+        assert_eq!(esc.phase.as_deref(), Some("setup"));
+        let msg = esc
+            .conversion_error
+            .as_deref()
+            .expect("carries the failure");
+        assert!(
+            msg.starts_with("ui_bridge step 'bad' (id u1) could not be parsed"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("invalid type: string \"not-a-number\""),
+            "{msg}"
+        );
+        // Execution fails it with that message instead of dispatching it.
+        assert_eq!(
+            resolve_dispatch(esc, &HandlerRegistry::with_standard_handlers()),
+            DispatchRoute::ConversionFailed(msg.to_string())
+        );
+    }
     // Other types keep the command-field fallback.
     let cmd = json!({"type": "command", "name": "c", "command": "ls", "timeoutMs": "x"});
     let steps = convert_json_steps_with_phase(std::slice::from_ref(&cmd), 0, Some("setup"));
     assert_eq!(steps.len(), 1);
     assert_eq!(steps[0].shell_command.as_deref(), Some("ls"));
+    assert_eq!(steps[0].conversion_error, None);
 }
 
 /// An action-less ui_bridge step is a `snapshot` on every side: the typed
