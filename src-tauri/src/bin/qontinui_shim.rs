@@ -536,7 +536,8 @@ pub fn identity_argv(
 
 /// The variables a nested (recursion-guarded) `claude` must NOT inherit: every
 /// terminal-bound coord-mcp key variable, matched by shape
-/// ([`qontinui_runner_lib::coord_mcp_config::is_terminal_key_env_name`]). Pure
+/// ([`qontinui_runner_lib::coord_mcp_config::is_any_terminal_env_name`] — the
+/// keyed names and the legacy bare ones). Pure
 /// over the names so it is unit-testable; non-UTF-8 names are never ours.
 pub fn nested_session_env_strip<I>(names: I) -> Vec<String>
 where
@@ -1823,7 +1824,15 @@ mod tests {
         ]
         .map(std::ffi::OsString::from);
         let strip = nested_session_env_strip(names);
-        assert_eq!(strip, vec![nonce.clone(), cred.clone()]);
+        assert_eq!(
+            strip,
+            vec![
+                nonce.clone(),
+                cred.clone(),
+                "QONTINUI_COORD_MCP_NONCE".to_string()
+            ],
+            "the keyed names and the legacy bare name, nothing else"
+        );
 
         let strip_refs: Vec<&str> = strip.iter().map(String::as_str).collect();
         let cmd = real_tool_command(&None, "claude", &[], &strip_refs);

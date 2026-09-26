@@ -1442,6 +1442,8 @@ env | grep -E '^(QONTINUI_COORD_MCP_|KEEP_ME)' | sort > '{}'
             .env("QONTINUI_INSTALL_INTERCEPT_GUARD", "1")
             .env(&nonce_var, "parent-terminal-nonce")
             .env(&cred_var, "/parent/cred.json")
+            .env("QONTINUI_COORD_MCP_NONCE", "legacy-parent-nonce")
+            .env("QONTINUI_COORD_MCP_CREDENTIAL", "/legacy/cred.json")
             .env("KEEP_ME", "1");
         let shim_out = crate::process_helpers::output_with_timeout(cmd, SCRIPT_BUDGET)
             .expect("the shim runs inside its budget");

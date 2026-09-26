@@ -210,12 +210,53 @@ pub fn credential_workdir_key(workdir: &str) -> String {
 }
 
 /// `<K>`: the first 16 hex digits, UPPERCASE, of
-/// `sha256(credential_workdir_key(workdir))`. Uppercase so the full name is a
-/// conventional shell identifier.
-fn terminal_env_key(workdir: &str) -> String {
+/// `sha256(credential_workdir_key(canonical workdir))`. Uppercase so the full
+/// name is a conventional shell identifier.
+///
+/// **Canonicalized for `<K>` only** ([`canonical_workdir_for_env_key`]): the
+/// writer is handed `primary_wt` and the seam the terminal's `cwd`, and a
+/// symlinked or `..`-spelled path for one directory would otherwise give the
+/// seam a name the document does not reference. Credential FILE names keep the
+/// plain [`credential_workdir_key`], so no existing file moves.
+pub fn terminal_env_key(workdir: &str) -> String {
     use sha2::{Digest as _, Sha256};
-    let digest = hex::encode_upper(Sha256::digest(credential_workdir_key(workdir).as_bytes()));
+    let canonical = canonical_workdir_for_env_key(workdir);
+    let digest = hex::encode_upper(Sha256::digest(
+        credential_workdir_key(&canonical).as_bytes(),
+    ));
     digest.chars().take(TERMINAL_ENV_KEY_LEN).collect()
+}
+
+/// `std::fs::canonicalize(workdir)` with a Windows verbatim prefix removed
+/// (`\\?\C:\x` -> `C:\x`, `\\?\UNC\h\s` -> `\\h\s`), or `workdir` unchanged
+/// when it cannot be canonicalized (absent, unreadable) — the plain
+/// normalization in [`credential_workdir_key`] then applies as before.
+fn canonical_workdir_for_env_key(workdir: &str) -> String {
+    match std::fs::canonicalize(workdir) {
+        Ok(p) => strip_verbatim_prefix(&p.to_string_lossy()),
+        Err(_) => workdir.to_string(),
+    }
+}
+
+/// Drop a Windows verbatim path prefix (`\\?\`, `\\?\UNC\`) that
+/// `canonicalize` adds there; any other string is returned unchanged.
+fn strip_verbatim_prefix(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// The `<K>` suffix of a keyed terminal variable name, or `None` for any other
+/// name (a legacy bare name included). For logs that must name keys, never
+/// nonces.
+pub fn terminal_env_name_key(name: &str) -> Option<&str> {
+    is_terminal_key_env_name(name)
+        .then(|| name.rsplit('_').next())
+        .flatten()
 }
 
 /// The workdir-keyed nonce variable name, `QONTINUI_COORD_MCP_NONCE_<K>` —
@@ -257,8 +298,25 @@ pub fn is_terminal_key_env_name(name: &str) -> bool {
     })
 }
 
-/// Every terminal key variable name among `names` — for a caller that strips
-/// them from an environment it enumerates.
+/// True iff `name` is the bare, pre-workdir-key spelling
+/// ([`QONTINUI_COORD_MCP_NONCE_ENV`] / [`QONTINUI_COORD_MCP_CREDENTIAL_ENV`]
+/// exactly) that the first cut of this change wrote. Nothing exports it now; it
+/// is still stripped and still recognised, so a document written by that cut
+/// can never be fed a key through it and is rolled forward (or back) like any
+/// other env-referenced document.
+pub fn is_legacy_terminal_env_name(name: &str) -> bool {
+    name == QONTINUI_COORD_MCP_NONCE_ENV || name == QONTINUI_COORD_MCP_CREDENTIAL_ENV
+}
+
+/// Any generation of terminal key variable: keyed ([`is_terminal_key_env_name`])
+/// or legacy bare ([`is_legacy_terminal_env_name`]). What every strip matches
+/// and what "this document is env-referenced at all" means.
+pub fn is_any_terminal_env_name(name: &str) -> bool {
+    is_terminal_key_env_name(name) || is_legacy_terminal_env_name(name)
+}
+
+/// Every terminal key variable name among `names`, keyed or legacy — for a
+/// caller that strips them from an environment it enumerates.
 pub fn terminal_key_env_names<I, S>(names: I) -> Vec<String>
 where
     I: IntoIterator<Item = S>,
@@ -266,7 +324,7 @@ where
 {
     names
         .into_iter()
-        .filter(|n| is_terminal_key_env_name(n.as_ref()))
+        .filter(|n| is_any_terminal_env_name(n.as_ref()))
         .map(|n| n.as_ref().to_owned())
         .collect()
 }
@@ -385,7 +443,38 @@ pub fn env_ref_names(s: &str) -> Vec<&str> {
 /// emit literal credentials, and a hand-written or foreign document does not
 /// name these variables.
 pub fn config_doc_references_terminal_env(doc: &serde_json::Value) -> bool {
-    config_doc_references_terminal_env_matching(doc, is_terminal_key_env_name)
+    config_doc_references_terminal_env_matching(doc, is_any_terminal_env_name)
+}
+
+/// Every terminal variable name (any generation) the RAW `coord-mcp` entry
+/// references, deduplicated, in first-seen order — so a caller can name the
+/// `<K>` a document carries when it is not the one expected.
+pub fn config_doc_terminal_env_names(doc: &serde_json::Value) -> Vec<String> {
+    let Some(entry) = coord_mcp_entry(doc) else {
+        return Vec::new();
+    };
+    let header_values = entry
+        .get("headers")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flat_map(|h| h.values());
+    let args = entry
+        .get("args")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flat_map(|a| a.iter());
+    let mut out: Vec<String> = Vec::new();
+    for s in header_values
+        .chain(args)
+        .filter_map(serde_json::Value::as_str)
+    {
+        for n in env_ref_names(s) {
+            if is_any_terminal_env_name(n) && !out.iter().any(|o| o == n) {
+                out.push(n.to_owned());
+            }
+        }
+    }
+    out
 }
 
 /// [`config_doc_references_terminal_env`] narrowed to THIS workdir's two names
@@ -1158,16 +1247,71 @@ mod tests {
         assert!(config_doc_references_terminal_env(&doc));
         assert!(config_doc_references_terminal_env_for(&doc, "/w/repo-a"));
         assert!(!config_doc_references_terminal_env_for(&doc, "/w/repo-b"));
-        // The bare prefix (the pre-workdir-key spelling) is not ours.
+        // The bare legacy spelling (the first cut) is recognised as
+        // env-referenced — so it is rolled forward or back — and stripped, but
+        // it is never this workdir's name, so the seam never mints for it.
         let bare = serde_json::json!({"mcpServers":{"coord-mcp":{"headers":{
             "Authorization": "Bearer ${QONTINUI_COORD_MCP_NONCE:-n}"
         }}}});
-        assert!(!config_doc_references_terminal_env(&bare));
+        assert!(config_doc_references_terminal_env(&bare));
+        assert!(!config_doc_references_terminal_env_for(&bare, "/w/repo-a"));
+        assert!(is_legacy_terminal_env_name("QONTINUI_COORD_MCP_CREDENTIAL"));
+        assert!(!is_terminal_key_env_name("QONTINUI_COORD_MCP_NONCE"));
+        assert_eq!(
+            terminal_key_env_names(["QONTINUI_COORD_MCP_NONCE", "QONTINUI_COORD_MCP_CREDENTIAL"]),
+            vec!["QONTINUI_COORD_MCP_NONCE", "QONTINUI_COORD_MCP_CREDENTIAL"]
+        );
+        assert_eq!(
+            config_doc_terminal_env_names(&doc),
+            vec![a.clone()],
+            "names the <K> a document carries"
+        );
+        assert_eq!(terminal_env_name_key(&a).map(str::len), Some(16));
+        assert_eq!(terminal_env_name_key("QONTINUI_COORD_MCP_NONCE"), None);
     }
 
     /// Stated limit of the resolver: a default containing `}` ends early.
     #[test]
     fn a_default_containing_a_closing_brace_ends_early() {
         assert_eq!(env_ref_client_default("${X:-a}b}"), "ab}");
+    }
+
+    /// W3: `<K>` is derived from the CANONICAL workdir, so a symlinked spelling
+    /// of one directory yields the same names as its target.
+    #[cfg(unix)]
+    #[test]
+    fn terminal_env_names_follow_a_symlink_to_the_same_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real-wt");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("link-wt");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let (r, l) = (real.to_string_lossy(), link.to_string_lossy());
+        assert_eq!(terminal_nonce_env_name(&r), terminal_nonce_env_name(&l));
+        assert_eq!(
+            terminal_credential_env_name(&r),
+            terminal_credential_env_name(&l)
+        );
+        // A `..` spelling too.
+        let dotted = format!("{}/../real-wt", real.display());
+        assert_eq!(
+            terminal_nonce_env_name(&r),
+            terminal_nonce_env_name(&dotted)
+        );
+        // A path that does not exist falls back to the plain normalization.
+        assert_eq!(
+            terminal_nonce_env_name("/no/such/dir/x"),
+            terminal_nonce_env_name("/no/such/dir/x/")
+        );
+    }
+
+    #[test]
+    fn a_windows_verbatim_prefix_is_stripped_for_the_env_key() {
+        assert_eq!(strip_verbatim_prefix(r"\\?\C:\w\repo"), r"C:\w\repo");
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\UNC\host\share\w"),
+            r"\\host\share\w"
+        );
+        assert_eq!(strip_verbatim_prefix("/w/repo"), "/w/repo");
     }
 }
