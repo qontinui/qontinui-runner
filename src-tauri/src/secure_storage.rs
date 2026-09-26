@@ -1508,6 +1508,9 @@ impl SecureStorage {
     /// clean first-run (absent store ⇒ no interactive-sign-out marker, sign-in
     /// writes succeed) so the operator can sign in again from the LoginScreen.
     pub fn delete_storage(&self) -> Result<()> {
+        // Hold the store write lock so a concurrent read-modify-write cannot
+        // recreate the file from its pre-delete snapshot right after we unlink it.
+        let _lock = token_store_write_lock();
         if self.storage_path.exists() {
             fs::remove_file(&self.storage_path).context("Failed to delete storage file")?;
             info!("Secure storage file deleted");

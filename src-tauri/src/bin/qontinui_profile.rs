@@ -1033,6 +1033,21 @@ impl PairCodeBaseSource {
 ///
 /// The [`PairCodeBaseSource`] half is returned rather than logged here so the
 /// function stays pure and the caller owns the output surface.
+fn resolve_pair_code_base(web_base_env: Option<&str>) -> (String, PairCodeBaseSource) {
+    if let Some(explicit) = web_base_env.filter(|s| !s.trim().is_empty()) {
+        // Trailing slash would build `<base>//api/v1/...`; trim it here so the
+        // one operator-supplied rung cannot produce a malformed URL.
+        return (
+            explicit.trim().trim_end_matches('/').to_string(),
+            PairCodeBaseSource::EnvOverride,
+        );
+    }
+    (
+        PROD_API_BASE_URL.to_string(),
+        PairCodeBaseSource::ProdDefault,
+    )
+}
+
 /// The web base the browser pair flow may send its fresh device JWT to for the
 /// machine-key self-mint, or `None` when this binary cannot know it.
 ///
@@ -1050,21 +1065,6 @@ fn browser_pair_enrol_web_base(coord_base: &str, web_base_env: Option<&str>) -> 
     let is_prod_coord =
         coord_base.trim().trim_end_matches('/') == qontinui_runner_lib::profiles::PROD_COORD_BASE;
     is_prod_coord.then(|| PROD_API_BASE_URL.to_string())
-}
-
-fn resolve_pair_code_base(web_base_env: Option<&str>) -> (String, PairCodeBaseSource) {
-    if let Some(explicit) = web_base_env.filter(|s| !s.trim().is_empty()) {
-        // Trailing slash would build `<base>//api/v1/...`; trim it here so the
-        // one operator-supplied rung cannot produce a malformed URL.
-        return (
-            explicit.trim().trim_end_matches('/').to_string(),
-            PairCodeBaseSource::EnvOverride,
-        );
-    }
-    (
-        PROD_API_BASE_URL.to_string(),
-        PairCodeBaseSource::ProdDefault,
-    )
 }
 
 /// Decode the `exp` (unix seconds) claim from a JWT's middle segment,
