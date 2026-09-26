@@ -9,172 +9,28 @@
 
 #![allow(dead_code)]
 
-use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 use tracing::{debug, info};
 
 use super::compression::{CompressionResult, TokenCount};
 use super::hooks::{HookResult, HookTrigger};
 use super::retry::RetryState;
-use crate::ai_router::{ComplexityAssessment, TaskComplexity};
+use crate::ai_router::ComplexityAssessment;
 use crate::str_utils::truncate_str_ellipsis;
 
 // ============================================================================
 // Event Types
 // ============================================================================
-
-/// Base event fields
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EventBase {
-    /// Event type identifier
-    #[serde(rename = "type")]
-    pub event_type: String,
-    /// Task run ID
-    pub task_run_id: String,
-    /// Unix timestamp in milliseconds
-    pub timestamp: i64,
-}
-
-/// Routing decision event payload
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RoutingDecisionPayload {
-    /// The assessed complexity level
-    pub complexity: String,
-    /// Confidence in the assessment (0-1)
-    pub confidence: f32,
-    /// Factors that contributed to this assessment
-    pub factors: Vec<String>,
-    /// The model selected
-    pub selected_model: String,
-    /// Task prompt preview (truncated)
-    pub prompt_preview: Option<String>,
-    /// File count if analyzed
-    pub file_count: Option<usize>,
-    /// Criteria count if analyzed
-    pub criteria_count: Option<usize>,
-}
-
-/// Routing decision event
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RoutingDecisionEvent {
-    #[serde(flatten)]
-    pub base: EventBase,
-    pub decision: RoutingDecisionPayload,
-}
-
-/// Retry attempt payload (matches frontend RawRetryAttemptPayload)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RetryAttemptPayload {
-    pub attempt_number: u32,
-    pub error: String,
-    pub attempt_timestamp: String,
-    pub delay_ms: u64,
-    pub feedback_injected: bool,
-}
-
-/// Retry state payload (matches frontend RawRetryStatePayload)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RetryStatePayload {
-    pub attempt: u32,
-    pub last_error: Option<String>,
-    pub last_attempt_at: Option<String>,
-    pub total_delay_ms: u64,
-    pub error_history: Vec<RetryAttemptPayload>,
-}
-
-/// Retry attempt event
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RetryAttemptEvent {
-    #[serde(flatten)]
-    pub base: EventBase,
-    pub attempt: RetryAttemptPayload,
-    pub state: RetryStatePayload,
-    pub exhausted: bool,
-    pub next_retry_delay_ms: Option<u64>,
-}
-
-/// Token count payload
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TokenCountPayload {
-    pub total: usize,
-    pub findings: usize,
-    pub observations: usize,
-    pub feedback: usize,
-    pub solutions: usize,
-    pub other: usize,
-    pub entry_count: usize,
-}
-
-/// Compression result payload
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompressionResultPayload {
-    pub original_tokens: usize,
-    pub compressed_tokens: usize,
-    pub items_summarized: usize,
-    pub summary_entries_created: usize,
-    pub compressed_categories: Vec<String>,
-    pub timestamp: String,
-}
-
-/// Compression event
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompressionEvent {
-    #[serde(flatten)]
-    pub base: EventBase,
-    pub result: CompressionResultPayload,
-    pub current_token_count: TokenCountPayload,
-}
-
-/// Token count update event
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TokenCountUpdateEvent {
-    #[serde(flatten)]
-    pub base: EventBase,
-    pub token_count: TokenCountPayload,
-    pub threshold_percentage: f32,
-    pub compression_imminent: bool,
-}
-
-/// Hook execution result payload
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HookExecutionPayload {
-    pub hook_id: String,
-    pub hook_name: String,
-    pub trigger: String,
-    pub success: bool,
-    pub output: Option<String>,
-    pub error: Option<String>,
-    pub duration_ms: u64,
-    pub timestamp: String,
-}
-
-/// Hook execution event
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HookExecutionEvent {
-    #[serde(flatten)]
-    pub base: EventBase,
-    pub result: HookExecutionPayload,
-}
-
-/// Hook started event
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HookStartedEvent {
-    #[serde(flatten)]
-    pub base: EventBase,
-    pub hook_id: String,
-    pub hook_name: String,
-    pub trigger: String,
-}
-
-/// Status change event
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StatusChangeEvent {
-    #[serde(flatten)]
-    pub base: EventBase,
-    pub status: String,
-    pub iteration: u32,
-    pub task_name: Option<String>,
-}
+//
+// The wire types live in the lib crate so the schema-export pipeline can see
+// them; see `qontinui_runner_lib::tauri_event_payloads` ("execution-status
+// channel"). They are generated into `qontinui-schemas` as the `Raw*` types.
+pub use qontinui_runner_lib::tauri_event_payloads::{
+    CompressionEvent, CompressionResultPayload, ExecutionStatusEvent, HookExecutionEvent,
+    HookExecutionPayload, HookStartedEvent, RetryAttemptEvent, RetryAttemptPayload,
+    RetryStatePayload, RoutingDecisionEvent, RoutingDecisionPayload, StatusChangeEvent,
+    TokenCountPayload, TokenCountUpdateEvent,
+};
 
 // ============================================================================
 // Event Emitter
@@ -191,12 +47,10 @@ impl StatusEventEmitter {
         chrono::Utc::now().timestamp_millis()
     }
 
-    /// Create base event fields
-    fn create_base(event_type: &str, task_run_id: &str) -> EventBase {
-        EventBase {
-            event_type: event_type.to_string(),
-            task_run_id: task_run_id.to_string(),
-            timestamp: Self::now_ms(),
+    /// Emit one event on the channel, logging (not propagating) a failure.
+    fn emit(app_handle: &tauri::AppHandle, event: &ExecutionStatusEvent) {
+        if let Err(e) = app_handle.emit(Self::EVENT_CHANNEL, event) {
+            debug!("Failed to emit {} event: {}", event.type_tag(), e);
         }
     }
 
@@ -209,16 +63,11 @@ impl StatusEventEmitter {
         file_count: Option<usize>,
         criteria_count: Option<usize>,
     ) {
-        let complexity_str = match assessment.complexity {
-            TaskComplexity::Simple => "simple",
-            TaskComplexity::Medium => "medium",
-            TaskComplexity::Complex => "complex",
-        };
-
         let event = RoutingDecisionEvent {
-            base: Self::create_base("routing_decision", task_run_id),
+            task_run_id: task_run_id.to_string(),
+            timestamp: Self::now_ms(),
             decision: RoutingDecisionPayload {
-                complexity: complexity_str.to_string(),
+                complexity: assessment.complexity,
                 confidence: assessment.confidence,
                 factors: assessment.factors.clone(),
                 selected_model: assessment.selected_model.clone(),
@@ -230,12 +79,12 @@ impl StatusEventEmitter {
 
         info!(
             "Emitting routing decision: {} -> {} (confidence: {:.2})",
-            complexity_str, assessment.selected_model, assessment.confidence
+            assessment.complexity.display_name(),
+            assessment.selected_model,
+            assessment.confidence
         );
 
-        if let Err(e) = app_handle.emit(Self::EVENT_CHANNEL, &event) {
-            debug!("Failed to emit routing decision event: {}", e);
-        }
+        Self::emit(app_handle, &ExecutionStatusEvent::RoutingDecision(event));
     }
 
     /// Emit a retry attempt event
@@ -295,7 +144,8 @@ impl StatusEventEmitter {
         });
 
         let event = RetryAttemptEvent {
-            base: Self::create_base("retry_attempt", task_run_id),
+            task_run_id: task_run_id.to_string(),
+            timestamp: Self::now_ms(),
             attempt: attempt_payload,
             state: state_payload,
             exhausted,
@@ -307,9 +157,7 @@ impl StatusEventEmitter {
             state.attempt, max_retries, exhausted
         );
 
-        if let Err(e) = app_handle.emit(Self::EVENT_CHANNEL, &event) {
-            debug!("Failed to emit retry attempt event: {}", e);
-        }
+        Self::emit(app_handle, &ExecutionStatusEvent::RetryAttempt(event));
     }
 
     /// Emit a compression event
@@ -320,7 +168,8 @@ impl StatusEventEmitter {
         current_tokens: &TokenCount,
     ) {
         let event = CompressionEvent {
-            base: Self::create_base("compression", task_run_id),
+            task_run_id: task_run_id.to_string(),
+            timestamp: Self::now_ms(),
             result: CompressionResultPayload {
                 original_tokens: result.original_tokens,
                 compressed_tokens: result.compressed_tokens,
@@ -345,9 +194,7 @@ impl StatusEventEmitter {
             result.original_tokens, result.compressed_tokens, result.items_summarized
         );
 
-        if let Err(e) = app_handle.emit(Self::EVENT_CHANNEL, &event) {
-            debug!("Failed to emit compression event: {}", e);
-        }
+        Self::emit(app_handle, &ExecutionStatusEvent::Compression(event));
     }
 
     /// Emit a token count update event
@@ -365,7 +212,8 @@ impl StatusEventEmitter {
         let compression_imminent = threshold_percentage >= 80.0;
 
         let event = TokenCountUpdateEvent {
-            base: Self::create_base("token_count_update", task_run_id),
+            task_run_id: task_run_id.to_string(),
+            timestamp: Self::now_ms(),
             token_count: TokenCountPayload {
                 total: tokens.total,
                 findings: tokens.findings,
@@ -384,9 +232,7 @@ impl StatusEventEmitter {
             tokens.total, threshold_percentage
         );
 
-        if let Err(e) = app_handle.emit(Self::EVENT_CHANNEL, &event) {
-            debug!("Failed to emit token count update event: {}", e);
-        }
+        Self::emit(app_handle, &ExecutionStatusEvent::TokenCountUpdate(event));
     }
 
     /// Emit a hook execution event
@@ -399,11 +245,12 @@ impl StatusEventEmitter {
         let trigger_str = trigger_to_string(trigger);
 
         let event = HookExecutionEvent {
-            base: Self::create_base("hook_execution", task_run_id),
+            task_run_id: task_run_id.to_string(),
+            timestamp: Self::now_ms(),
             result: HookExecutionPayload {
                 hook_id: result.hook_id.clone(),
                 hook_name: result.hook_name.clone(),
-                trigger: trigger_str.clone(),
+                trigger,
                 success: result.success,
                 output: result
                     .output
@@ -420,9 +267,7 @@ impl StatusEventEmitter {
             result.hook_name, trigger_str, result.success
         );
 
-        if let Err(e) = app_handle.emit(Self::EVENT_CHANNEL, &event) {
-            debug!("Failed to emit hook execution event: {}", e);
-        }
+        Self::emit(app_handle, &ExecutionStatusEvent::HookExecution(event));
     }
 
     /// Emit a hook started event
@@ -436,17 +281,16 @@ impl StatusEventEmitter {
         let trigger_str = trigger_to_string(trigger);
 
         let event = HookStartedEvent {
-            base: Self::create_base("hook_started", task_run_id),
+            task_run_id: task_run_id.to_string(),
+            timestamp: Self::now_ms(),
             hook_id: hook_id.to_string(),
             hook_name: hook_name.to_string(),
-            trigger: trigger_str.clone(),
+            trigger,
         };
 
         debug!("Emitting hook started: {} ({})", hook_name, trigger_str);
 
-        if let Err(e) = app_handle.emit(Self::EVENT_CHANNEL, &event) {
-            debug!("Failed to emit hook started event: {}", e);
-        }
+        Self::emit(app_handle, &ExecutionStatusEvent::HookStarted(event));
     }
 
     /// Emit a status change event
@@ -458,7 +302,8 @@ impl StatusEventEmitter {
         task_name: Option<&str>,
     ) {
         let event = StatusChangeEvent {
-            base: Self::create_base("status_change", task_run_id),
+            task_run_id: task_run_id.to_string(),
+            timestamp: Self::now_ms(),
             status: status.to_string(),
             iteration,
             task_name: task_name.map(|s| s.to_string()),
@@ -469,9 +314,7 @@ impl StatusEventEmitter {
             status, iteration, task_name
         );
 
-        if let Err(e) = app_handle.emit(Self::EVENT_CHANNEL, &event) {
-            debug!("Failed to emit status change event: {}", e);
-        }
+        Self::emit(app_handle, &ExecutionStatusEvent::StatusChange(event));
     }
 }
 

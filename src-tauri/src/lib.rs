@@ -41,10 +41,13 @@ pub mod profile_cli;
 // a second bin cannot import from the runner bin's module tree. One module ⇒
 // one schema ⇒ writer and reader cannot drift. See the module doc.
 pub mod profiles;
+pub mod known_issue_types;
 pub mod relay_envelopes;
 pub mod runner_breadcrumb;
 pub mod schema_export;
+pub mod skill_types;
 pub mod tauri_event_payloads;
+pub mod ui_bridge_action_plan;
 
 // Temp-file-then-rename writer. Declared in BOTH the lib and the runner bin
 // (same file, like `process_helpers` / `coord_doctor`) because

@@ -857,6 +857,72 @@ pub fn export_all_schemas() -> Value {
     add!("HelperAnswerSchema", qht::HelperAnswerSchema);
     add!("HelperTaskSource", qht::HelperTaskSource);
 
+    // ── runner-local: execution-status channel (`orchestrator::status_events`)
+    // — session 4e (plan 2026-09-12-residual-work-from-the-april-2026-plan-audit
+    // Phase 3). The snake_case wire events the frontend's `useExecutionStatus`
+    // folds into its display state; published under the `Raw*` names the
+    // hand-authored mirror in `ts/src/execution/_api.ts` Tier 3 always used. ──
+    add!("TaskComplexity", tep::TaskComplexity);
+    add!("HookTrigger", tep::HookTrigger);
+    add!("RawRoutingDecisionPayload", tep::RoutingDecisionPayload);
+    add!("RawRetryAttemptPayload", tep::RetryAttemptPayload);
+    add!("RawRetryStatePayload", tep::RetryStatePayload);
+    add!("RawTokenCountPayload", tep::TokenCountPayload);
+    add!("RawCompressionResultPayload", tep::CompressionResultPayload);
+    add!("RawHookExecutionPayload", tep::HookExecutionPayload);
+    add!("RawExecutionStatusEvent", tep::ExecutionStatusEvent);
+
+    // ── runner-local: known issues (`crate::known_issue_types`, the wire of the
+    // `known_issues` Tauri commands) — session 4e. Generic names carry a
+    // `KnownIssue*` title so they cannot collide in this flat registry. ──
+    use crate::known_issue_types as kit;
+    add!("KnownIssueCategory", kit::IssueCategory);
+    add!("KnownIssueScopeType", kit::ScopeType);
+    add!("KnownIssueDetectionMethod", kit::DetectionMethod);
+    add!("KnownIssueSeverity", kit::IssueSeverity);
+    add!("KnownIssueStatus", kit::IssueStatus);
+    add!("KnownIssueProvenance", kit::IssueProvenance);
+    add!("KnownIssue", kit::KnownIssue);
+    add!("CreateKnownIssueRequest", kit::CreateKnownIssueRequest);
+    add!("UpdateKnownIssueRequest", kit::UpdateKnownIssueRequest);
+    add!("ListKnownIssuesQuery", kit::ListKnownIssuesQuery);
+    add!("IssuePatternTemplate", kit::IssuePatternTemplate);
+    add!(
+        "CreatePatternTemplateRequest",
+        kit::CreatePatternTemplateRequest
+    );
+    add!("IssuePatternTemplateParameter", kit::TemplateParameter);
+
+    // ── runner-local: skills (`crate::skill_types`, the skill registry's wire)
+    // — session 4e. The first six are schema-only vocabularies for fields that
+    // stay free `String`s in serde; see that module's doc. ──
+    use crate::skill_types as sk;
+    add!("SkillCategory", sk::SkillCategory);
+    add!("SkillParameterType", sk::SkillParameterType);
+    add!("SkillAllowedPhase", sk::SkillAllowedPhase);
+    add!("SkillApprovalStatus", sk::SkillApprovalStatus);
+    add!("SkillExportContentType", sk::SkillExportContentType);
+    add!("SkillSource", sk::SkillSourceSchema);
+    add!("SkillParameterOption", sk::SkillParameterOption);
+    add!("SkillAuthor", sk::SkillAuthor);
+    add!("SkillParameter", sk::SkillParameter);
+    add!("SkillParameterDependency", sk::ParameterDependency);
+    add!("SkillRef", sk::SkillRef);
+    add!("SkillTemplate", sk::SkillTemplate);
+    add!("SkillPlaybookTrigger", sk::PlaybookTrigger);
+    add!("SkillDefinition", sk::SkillDefinition);
+    add!("SkillOrigin", sk::SkillOrigin);
+    add!("SkillExportManifest", sk::SkillExportManifest);
+    add!("SkillExport", sk::SkillExport);
+    add!("SkillImportResult", sk::SkillImportResult);
+
+    // ── runner-local: UI Bridge structured action plan — the RESPONSE side of
+    // `/ui-bridge/.../action-plan` (`crate::ui_bridge_action_plan`) — session
+    // 4e. `ActionPlanResponse` publishes as `ActionPlanResult`, the TS name. ──
+    use crate::ui_bridge_action_plan as uap;
+    add!("PlannedActionResult", uap::PlannedActionResult);
+    add!("ActionPlanResult", uap::ActionPlanResponse);
+
     Value::Object(m)
 }
 
@@ -914,10 +980,21 @@ mod tests {
         // 2026-09-12-consolidate-local-orchestration-onto-conductor) = 548
         // + the 2 per-instance runner types (RunnerInstance, RunnerInstanceRole —
         // plan 2026-09-20-runner-selector-drives-a-transport-not-a-target
-        // Phase 6) = 550.
+        // Phase 6) = 550
+        // + the 42 session-4e runner-local types (9 execution-status, 13 known
+        // issues, 18 skills, 2 action-plan responses — plan
+        // 2026-09-12-residual-work-from-the-april-2026-plan-audit Phase 3) = 592.
         // Independently corroborated by the codegen, which reports
-        // "Processing 550 top-level types" and emits 550 .d.ts files.
-        assert_eq!(obj.len(), 550, "Expected 550 schema entries");
+        // "Processing 592 top-level types" and emits 592 .d.ts files.
+        assert_eq!(obj.len(), 592, "Expected 592 schema entries");
+        for name in [
+            "RawExecutionStatusEvent",
+            "KnownIssue",
+            "SkillDefinition",
+            "ActionPlanResult",
+        ] {
+            assert!(obj.contains_key(name), "Missing {name} schema (session 4e)");
+        }
         assert!(
             obj.contains_key("RunnerInstance") && obj.contains_key("RunnerInstanceRole"),
             "Missing RunnerInstance / RunnerInstanceRole schema"
