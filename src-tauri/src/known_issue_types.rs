@@ -13,6 +13,12 @@
 //! definition and the generated TypeScript (`qontinui-schemas`
 //! `ts/src/known-issues/`) cannot drift from it. Names that are generic in a
 //! flat cross-repo registry carry a `KnownIssue*` schema title.
+//!
+//! The RESPONSE types (`KnownIssue`, `IssuePatternTemplate`,
+//! `TemplateParameter`) always serialize their `Option` fields, so those are
+//! schema'd through `schema_export::Nullable` (`x: T | null`, key always
+//! present); the request types keep schemars' default `x?: T | null`, which is
+//! what serde accepts on the way in.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -260,12 +266,15 @@ pub struct KnownIssue {
     pub description: String,
     pub category: IssueCategory,
     pub scope_type: ScopeType,
+    #[schemars(with = "crate::schema_export::Nullable<String>")]
     pub scope_value: Option<String>,
     pub scope_tags: Vec<String>,
     pub detection_method: DetectionMethod,
     #[schemars(with = "JsonObject")]
     pub detection_config: serde_json::Value,
+    #[schemars(with = "crate::schema_export::Nullable<String>")]
     pub pattern_template_id: Option<String>,
+    #[schemars(with = "crate::schema_export::Nullable<String>")]
     pub reproduction_context: Option<String>,
     pub trigger_conditions: Vec<String>,
     pub severity: IssueSeverity,
@@ -273,14 +282,19 @@ pub struct KnownIssue {
     pub confidence: f64,
     pub provenance: IssueProvenance,
     pub source_finding_ids: Vec<String>,
+    #[schemars(with = "crate::schema_export::Nullable<String>")]
     pub source_task_run_id: Option<String>,
+    #[schemars(with = "crate::schema_export::Nullable<String>")]
     pub verification_hint: Option<String>,
-    #[schemars(with = "Option<JsonObject>")]
+    #[schemars(with = "crate::schema_export::Nullable<JsonObject>")]
     pub verification_step_template: Option<serde_json::Value>,
     pub times_detected: u32,
     pub times_checked: u32,
+    #[schemars(with = "crate::schema_export::Nullable<String>")]
     pub last_detected_at: Option<String>,
+    #[schemars(with = "crate::schema_export::Nullable<String>")]
     pub last_checked_at: Option<String>,
+    #[schemars(with = "crate::schema_export::Nullable<String>")]
     pub resolved_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -353,8 +367,9 @@ pub struct IssuePatternTemplate {
     pub description: String,
     pub category: String,
     pub detection_type: String,
-    #[schemars(with = "Option<JsonObject>")]
+    #[schemars(with = "crate::schema_export::Nullable<JsonObject>")]
     pub step_template: Option<serde_json::Value>,
+    #[schemars(with = "crate::schema_export::Nullable<String>")]
     pub ai_prompt_template: Option<String>,
     pub parameters: Vec<TemplateParameter>,
     pub built_in: bool,
@@ -381,5 +396,6 @@ pub struct TemplateParameter {
     #[serde(rename = "type")]
     pub param_type: String,
     pub description: String,
+    #[schemars(with = "crate::schema_export::Nullable<serde_json::Value>")]
     pub default: Option<serde_json::Value>,
 }

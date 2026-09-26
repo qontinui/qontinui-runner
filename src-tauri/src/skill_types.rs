@@ -22,6 +22,10 @@
 //! with `#[schemars(with = ...)]`, so the generated bindings carry the literal
 //! union without the serde behaviour changing. These enums are never
 //! constructed; they exist for `JsonSchema` alone.
+//!
+//! Likewise every `Option` field that is skipped when `None` is schema'd as its
+//! inner type, so the binding reads `?: T` (absent, never `null` — what the
+//! wire does) rather than schemars' default `?: T | null`.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -106,8 +110,10 @@ pub struct SkillParameterOption {
 pub struct SkillAuthor {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
     pub email: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
     pub url: Option<String>,
 }
 
@@ -153,18 +159,25 @@ pub struct SkillParameter {
     pub description: String,
     pub required: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Value")]
     pub default: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Vec<SkillParameterOption>")]
     pub options: Option<Vec<SkillParameterOption>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
     pub placeholder: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "f64")]
     pub min: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "f64")]
     pub max: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
     pub pattern: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "ParameterDependency")]
     pub depends_on: Option<ParameterDependency>,
 }
 
@@ -241,6 +254,7 @@ pub struct ParameterDependency {
 pub struct SkillRef {
     pub skill_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "HashMap<String, Value>")]
     pub parameter_overrides: Option<HashMap<String, Value>>,
 }
 
@@ -395,19 +409,25 @@ pub struct SkillDefinition {
     #[schemars(with = "SkillSourceSchema")]
     pub source: SkillSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
     pub version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "SkillAuthor")]
     pub author: Option<SkillAuthor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
     pub checksum: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Vec<String>")]
     pub depends_on: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "u64")]
     pub usage_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "Option<SkillApprovalStatus>")]
+    #[schemars(with = "SkillApprovalStatus")]
     pub approval_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
     pub forked_from: Option<String>,
 }
 
@@ -432,6 +452,7 @@ pub struct SkillExportManifest {
     pub content_type: String,
     pub skill_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
     pub checksum: Option<String>,
 }
 
