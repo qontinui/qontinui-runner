@@ -402,8 +402,9 @@ fn an_inline_provision_on_a_new_spawn_path_is_caught() {
 
 /// A test module whose body holds an unbalanced `"{"` literal is still masked
 /// to its real closing brace: the call inside it is not a caller, and the
-/// production fn after it is. Before the scanner was literal-aware the module
-/// never closed, so the production call below it was silently masked too.
+/// production fn after it is. Before the lexer was literal-aware such a module
+/// never closed and so recorded NO span: nothing was masked, and the test's own
+/// call was reported as a production caller (a spurious red).
 #[test]
 fn a_brace_in_a_test_string_does_not_hold_the_test_module_open() {
     let mut sources = Sources::new();
