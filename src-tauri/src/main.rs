@@ -348,6 +348,14 @@ mod tier_matrix_tests;
 // Plan `2026-08-25-runner-test-suite-env-isolation` Phase 2.
 #[cfg(test)]
 mod env_write_lock_guard;
+// Source invariant: every raw `dirs::config_dir` reference under `src/` is
+// classified (a guarded resolver, a foreign app's dir, a test assertion, or
+// the CI sentinel probe) — a runner-config path goes through
+// `ambient::runner_platform_config_root` — and every test that writes
+// `QONTINUI_CONFIG_DIR` restores it. Reuses the walker above.
+// Plan `2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json` Phase 4.
+#[cfg(test)]
+mod config_dir_scan_guard;
 // Source invariant: a module-local test serialiser (`fn series_lock()` over a
 // `static … Mutex<()>`, or the static taken directly) is taken by EVERY test of
 // the module that defines it, or the module is allowlisted with a reason — a

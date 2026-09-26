@@ -2531,4 +2531,33 @@ mod tests {
             other => panic!("expected Env::Pull {{json}}, got {:?}", other),
         }
     }
+
+    /// `tier --set` / `--clear-choice` WRITE the runner's `settings.json`
+    /// through `profiles::settings_json_path`. This binary links the lib
+    /// without `cfg(test)`, so the only thing that makes that resolver
+    /// hermetic here is `canary_armed()`'s `deps/` detection — pinned in the
+    /// runner bin's `test_env` live-canary style: armed, and with
+    /// `QONTINUI_CONFIG_DIR` unset the path is the deflected one, never the
+    /// operator's. Plan
+    /// `2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json`,
+    /// Phase 4.
+    #[test]
+    fn settings_json_path_is_hermetic_in_this_test_binary() {
+        use qontinui_runner_lib::ambient::test_support::{canary_armed, env_lock, EnvVarRestore};
+        assert!(
+            canary_armed(),
+            "the ambient canary must arm itself in the qontinui_profile test binary; if this \
+             fails, `canary_armed()`'s deps/ detection no longer recognises it, and every \
+             `tier` write test here would reach the operator's real settings.json"
+        );
+        let _g = env_lock();
+        let _restore = EnvVarRestore::capture(&["QONTINUI_CONFIG_DIR"]);
+        std::env::remove_var("QONTINUI_CONFIG_DIR");
+        let (path, source) = qontinui_runner_lib::profiles::settings_json_path();
+        assert_eq!(source.as_str(), "test_deflected");
+        assert_eq!(
+            path,
+            Some(qontinui_runner_lib::ambient::deflected_config_dir().join("settings.json"))
+        );
+    }
 }
