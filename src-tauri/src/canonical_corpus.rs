@@ -35,15 +35,38 @@
 //!
 //! ## Off the spawn path
 //!
-//! [`refresh`] is ONE bounded `git fetch <url> +refs/heads/main:refs/remotes/origin/main`
-//! ([`FETCH_TIMEOUT`], the 20 s class `git_trunk` uses for its periodic reads),
-//! followed by local plumbing reads that load every bundled command's body at
-//! the fetched sha into memory. It runs on a background timer
-//! ([`start_refresh_loop`], [`REFRESH_INTERVAL`]), never on a spawn. Registry
-//! resolution then reads the last loaded snapshot synchronously through
-//! [`latest`] — a lock and an `Arc` clone, no I/O — so the first spawn after
-//! boot may see no snapshot and fall to the embedded default, which its
-//! provenance key labels `source=builtin`.
+//! [`refresh`] is ONE bounded `git fetch --depth=1 <url>
+//! +refs/heads/main:refs/remotes/origin/main` followed by local plumbing reads.
+//! Only the tip is ever read, so the mirror is SHALLOW: its first fetch
+//! transfers one tree rather than the repo's whole history, under
+//! [`FIRST_FETCH_TIMEOUT`]; every later fetch is an incremental one under
+//! [`FETCH_TIMEOUT`], the 20 s class `git_trunk` uses for its periodic reads.
+//! Before each fetch the leftovers of a fetch that was killed at its budget
+//! (`objects/pack/tmp_*`, stale `*.lock` files) are removed, so an interrupted
+//! fetch neither accumulates on disk nor wedges the next one.
+//!
+//! The load after it is also bounded in SPAWNS, not only in time: ONE `git
+//! ls-tree` lists both `.claude/commands` and `.claude/skills` with their modes
+//! and object ids, and the blobs are read through `git cat-file --batch`, one
+//! spawn per [`BATCH_BYTES`] of content — not one spawn per file.
+//!
+//! It runs on a background timer ([`start_refresh_loop`], [`REFRESH_INTERVAL`]),
+//! never on a spawn. Registry resolution then reads the last published
+//! snapshot synchronously through [`latest`] — a lock and an `Arc` clone, no
+//! I/O — so the first spawn after boot may see no snapshot and fall to the
+//! embedded default, which its provenance key labels `source=builtin`.
+//!
+//! ## Only a COMPLETE load is published
+//!
+//! A load separates two kinds of miss. A CONTENT outcome — a path absent at
+//! that sha, a symlink or submodule where a file belongs, a body that is not
+//! UTF-8, a skill that fails validation — is an answer about the canonical
+//! repo, and the load that met it is complete: that unit falls to the next
+//! rung. An I/O failure — a timeout, a truncated read, an object the mirror
+//! does not hold — says nothing about the repo, so the whole load is refused,
+//! the previously published generation stays, and the next tick retries. A
+//! degraded corpus is therefore never published, and so can never stick behind
+//! the same-sha shortcut.
 //!
 //! ## Every failure is a fall-through
 //!
@@ -56,12 +79,12 @@
 //! than the build's own. Nothing here can abort a spawn, because nothing here
 //! runs on one.
 //!
-//! Every body read is addressed by the FULL sha (`<sha>:<path>`), never by a
+//! Every object is addressed by the FULL sha or object id, never by a
 //! slash-ref: finding `89257638` records MSYS silently mangling
 //! `origin/main:.claude/...`.
 
-use std::collections::BTreeMap;
-use std::ffi::OsString;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -70,14 +93,27 @@ use tracing::{info, warn};
 
 use crate::process_helpers::{TimedOutput, TimedRun};
 
-/// Budget for the one network operation, `git fetch`. The same 20 s class
-/// `git_trunk::TRUNK_GIT_TIMEOUT` uses for a periodic, off-spawn-path read.
+/// Budget for an incremental `git fetch` into a mirror that already holds the
+/// tracking ref. The same 20 s class `git_trunk::TRUNK_GIT_TIMEOUT` uses for a
+/// periodic, off-spawn-path read.
 pub(crate) const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Budget for the FIRST fetch into an empty mirror. Even shallow, it transfers
+/// the whole tip tree (tens of MiB uncompressed), which a slow link cannot do
+/// in the incremental budget — and a fetch that is killed every tick never
+/// completes at all.
+pub(crate) const FIRST_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Budget for each LOCAL plumbing read against the mirror (`init`,
-/// `rev-parse`, `cat-file`). Milliseconds when healthy; the only realistic hang
-/// is a lock or a stalled filesystem.
+/// `rev-parse`, `ls-tree`, one `cat-file --batch`). Milliseconds when healthy;
+/// the only realistic hang is a lock or a stalled filesystem.
 const LOCAL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The most blob content one `git cat-file --batch` is asked for. Half of
+/// `process_helpers::MAX_CAPTURED_BYTES`, so a batch's output can never hit the
+/// capture cap and read as truncated. The bundled corpus is larger than the
+/// cap, which is why the reads are batched rather than issued as one.
+const BATCH_BYTES: u64 = (crate::process_helpers::MAX_CAPTURED_BYTES / 2) as u64;
 
 /// How often [`start_refresh_loop`] fetches.
 pub(crate) const REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
@@ -96,12 +132,17 @@ const TRACKING_REF: &str = "refs/remotes/origin/main";
 /// The mirror's path under the per-instance runner config dir.
 const MIRROR_DIR: &str = "canonical/qontinui-claude-config.git";
 
+/// The two trees a load reads.
+const COMMANDS_DIR: &str = ".claude/commands";
+const SKILLS_DIR: &str = ".claude/skills";
+
 /// Which `origin/main` generation a body was read at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalSnapshot {
     /// The FULL 40-hex commit sha `refs/remotes/origin/main` resolved to.
     pub sha: String,
-    /// RFC 3339 time of the fetch that produced it.
+    /// RFC 3339 time of the last SUCCESSFUL fetch that resolved to this sha —
+    /// advanced by every such fetch, not only the one that first loaded it.
     pub fetched_at: String,
 }
 
@@ -113,8 +154,8 @@ impl CanonicalSnapshot {
 }
 
 /// The bundled commands' bodies as `qontinui-claude-config` holds them at one
-/// snapshot. A name absent from `bodies` was absent (or unreadable) at that
-/// sha and falls to the next rung.
+/// snapshot. A name absent from `bodies` was absent (or not a regular file)
+/// at that sha and falls to the next rung.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalCommands {
     pub snapshot: CanonicalSnapshot,
@@ -129,13 +170,24 @@ pub(crate) const MODE_FILE: u32 = 0o100644;
 /// Git's mode for an executable file.
 pub(crate) const MODE_EXECUTABLE: u32 = 0o100755;
 
-/// One file of a `git ls-tree -r` listing.
+/// Whether git's `mode` is a file this rung will serve. A symlink (`120000`)
+/// or a submodule (`160000`) never is.
+fn servable_mode(mode: u32) -> bool {
+    mode == MODE_FILE || mode == MODE_EXECUTABLE
+}
+
+/// One entry of a `git ls-tree -r -l` listing: a blob, or a submodule's
+/// gitlink (the only non-blob a recursive listing yields).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeEntry {
-    /// Path RELATIVE to the listed directory, `/`-separated.
+    /// Full path from the repository root, `/`-separated.
     pub path: String,
     /// The mode git recorded (`0o100644`, `0o100755`, `0o120000`, …).
     pub mode: u32,
+    /// The object id.
+    pub oid: String,
+    /// The blob's size; `None` for a gitlink.
+    pub size: Option<u64>,
 }
 
 /// One bundled skill as `qontinui-claude-config` holds it at one snapshot.
@@ -179,6 +231,37 @@ impl CanonicalCorpus {
     pub fn snapshot(&self) -> &CanonicalSnapshot {
         &self.commands.snapshot
     }
+
+    /// The same bodies, re-stamped with a later fetch of the same sha.
+    fn refetched(&self, snapshot: &CanonicalSnapshot) -> CanonicalCorpus {
+        let mut next = self.clone();
+        next.commands.snapshot = snapshot.clone();
+        next.skills.snapshot = snapshot.clone();
+        next
+    }
+}
+
+/// A git command that can only ever address the repository its caller names
+/// and whose messages are the untranslated C-locale text: the caller's
+/// repository environment (`GIT_DIR`, `GIT_WORK_TREE`, …) is removed, so an
+/// inherited value can never redirect a read or a fetch at some other
+/// repository, and `LC_ALL` / `LANGUAGE` are `C`, so a stderr match is never
+/// defeated by a translation. `no_window` also applies the prompt-proof git
+/// posture, so a credential prompt fails instead of blocking.
+fn scrubbed_git(program: &OsStr) -> std::process::Command {
+    let mut cmd = crate::process_helpers::no_window(program);
+    for var in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd.env("LC_ALL", "C").env("LANGUAGE", "C");
+    cmd
 }
 
 /// A handle on one bare mirror: where it lives, what it fetches, and how git
@@ -190,6 +273,7 @@ pub(crate) struct Mirror {
     url: String,
     program: OsString,
     fetch_timeout: Duration,
+    first_fetch_timeout: Duration,
     local_timeout: Duration,
 }
 
@@ -200,6 +284,7 @@ impl Mirror {
             url,
             program: OsString::from("git"),
             fetch_timeout: FETCH_TIMEOUT,
+            first_fetch_timeout: FIRST_FETCH_TIMEOUT,
             local_timeout: LOCAL_TIMEOUT,
         }
     }
@@ -211,36 +296,18 @@ impl Mirror {
         self
     }
 
+    /// Set every budget: `fetch` bounds the first fetch and later ones alike.
     #[cfg(test)]
     pub(crate) fn with_timeouts(mut self, fetch: Duration, local: Duration) -> Self {
         self.fetch_timeout = fetch;
+        self.first_fetch_timeout = fetch;
         self.local_timeout = local;
         self
     }
 
-    /// A git command with the caller's repository environment scrubbed, so an
-    /// inherited `GIT_DIR` / `GIT_WORK_TREE` can never redirect a read or a
-    /// fetch at some other repository. `no_window` also applies the
-    /// prompt-proof git posture, so a credential prompt fails instead of
-    /// blocking.
-    fn command(&self) -> std::process::Command {
-        let mut cmd = crate::process_helpers::no_window(&self.program);
-        for var in [
-            "GIT_DIR",
-            "GIT_WORK_TREE",
-            "GIT_INDEX_FILE",
-            "GIT_OBJECT_DIRECTORY",
-            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-            "GIT_COMMON_DIR",
-        ] {
-            cmd.env_remove(var);
-        }
-        cmd
-    }
-
     /// A git command addressed at the mirror.
     fn in_mirror(&self) -> std::process::Command {
-        let mut cmd = self.command();
+        let mut cmd = scrubbed_git(&self.program);
         cmd.arg("--git-dir").arg(&self.git_dir);
         cmd
     }
@@ -254,21 +321,87 @@ impl Mirror {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("could not create the mirror's parent dir: {e}"))?;
         }
-        let mut cmd = self.command();
-        cmd.args(["init", "--bare", "--quiet"]).arg(&self.git_dir);
+        let mut cmd = scrubbed_git(&self.program);
+        cmd.args(["init", "--bare", "--quiet", "--end-of-options"])
+            .arg(&self.git_dir);
         run(cmd, self.local_timeout, "git init --bare").map(|_| ())
     }
 
-    /// Fetch `main` from the URL into [`TRACKING_REF`] and resolve it to a
-    /// full sha. One network operation, bounded by the fetch budget.
+    /// Whether the mirror already holds [`TRACKING_REF`] — loose, or packed.
+    /// A file read, not a spawn: it only picks the fetch budget.
+    fn has_tracking_ref(&self) -> bool {
+        if self.git_dir.join(TRACKING_REF).is_file() {
+            return true;
+        }
+        std::fs::read_to_string(self.git_dir.join("packed-refs")).is_ok_and(|packed| {
+            packed
+                .lines()
+                .any(|l| l.split_whitespace().nth(1) == Some(TRACKING_REF))
+        })
+    }
+
+    /// Remove what a fetch killed at its budget leaves behind: the partial
+    /// pack `index-pack` was writing (`objects/pack/tmp_*`, which otherwise
+    /// stays forever), and the lock files a later fetch would refuse to take.
+    ///
+    /// Safe because the mirror has exactly one writer — this process's
+    /// refresh loop, which never runs two refreshes at once — so nothing is
+    /// ever mid-write here when a refresh begins. Returns how many entries
+    /// were removed.
+    fn clear_interrupted_fetch(&self) -> usize {
+        let mut removed = 0;
+        if let Ok(dir) = std::fs::read_dir(self.git_dir.join("objects").join("pack")) {
+            for entry in dir.flatten() {
+                if entry.file_name().to_string_lossy().starts_with("tmp_")
+                    && std::fs::remove_file(entry.path()).is_ok()
+                {
+                    removed += 1;
+                }
+            }
+        }
+        for lock in [
+            "shallow.lock".to_string(),
+            "packed-refs.lock".to_string(),
+            "config.lock".to_string(),
+            format!("{TRACKING_REF}.lock"),
+        ] {
+            if std::fs::remove_file(self.git_dir.join(lock)).is_ok() {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// Fetch `main`'s tip from the URL into [`TRACKING_REF`] and resolve it to
+    /// a full sha. One network operation: [`FIRST_FETCH_TIMEOUT`] into an
+    /// empty mirror, the fetch budget after.
     pub(crate) fn refresh(&self) -> Result<CanonicalSnapshot, String> {
         self.ensure_init()?;
+        let cleared = self.clear_interrupted_fetch();
+        if cleared > 0 {
+            info!(
+                "canonical_corpus: removed {cleared} leftover(s) of an interrupted fetch from \
+                 the mirror"
+            );
+        }
+        let budget = if self.has_tracking_ref() {
+            self.fetch_timeout
+        } else {
+            self.first_fetch_timeout
+        };
         let mut fetch = self.in_mirror();
         fetch
-            .args(["fetch", "--quiet", "--no-tags", "--no-write-fetch-head"])
+            .args([
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--depth=1",
+                "--end-of-options",
+            ])
             .arg(&self.url)
             .arg(format!("+refs/heads/main:{TRACKING_REF}"));
-        run(fetch, self.fetch_timeout, "git fetch")?;
+        run(fetch, budget, "git fetch")?;
 
         let mut rev = self.in_mirror();
         rev.args(["rev-parse", "--verify", "--quiet"])
@@ -284,186 +417,291 @@ impl Mirror {
         })
     }
 
-    /// The bytes of `rel_path` at `snapshot` — `git cat-file blob <sha>:<path>`,
-    /// addressed by the FULL sha. A path absent at that sha, or one naming a
-    /// tree rather than a file, is an error.
-    pub(crate) fn read(
-        &self,
-        snapshot: &CanonicalSnapshot,
-        rel_path: &str,
-    ) -> Result<Vec<u8>, String> {
-        let mut cmd = self.in_mirror();
-        cmd.args(["cat-file", "blob"])
-            .arg(format!("{}:{rel_path}", snapshot.sha));
-        run(cmd, self.local_timeout, "git cat-file")
-    }
-
-    /// Every file under `path` at `snapshot` with the mode git recorded —
-    /// `git ls-tree -r -z <sha> -- <path>`, blobs only, paths made relative to
-    /// `path`. A path absent at that sha lists nothing and is an error.
+    /// Every entry under `paths` at `snapshot` — ONE `git ls-tree -r -z -l
+    /// --full-tree <sha> -- <paths…>`. A path absent at that sha contributes
+    /// nothing; that is a content answer, not an error.
     pub(crate) fn list_tree(
         &self,
         snapshot: &CanonicalSnapshot,
-        path: &str,
+        paths: &[&str],
     ) -> Result<Vec<TreeEntry>, String> {
         let mut cmd = self.in_mirror();
-        cmd.args(["ls-tree", "-r", "-z", "--full-tree"])
+        cmd.args(["ls-tree", "-r", "-z", "-l", "--full-tree"])
             .arg(&snapshot.sha)
             .arg("--")
-            .arg(path);
+            .args(paths);
         let out = run(cmd, self.local_timeout, "git ls-tree")?;
-        let prefix = format!("{}/", path.trim_end_matches('/'));
         let mut entries = Vec::new();
         for record in out.split(|b| *b == 0).filter(|r| !r.is_empty()) {
             let record = String::from_utf8_lossy(record);
-            // `<mode> SP <type> SP <object> TAB <path>`
-            let (meta, full_path) = record
+            // `<mode> SP <type> SP <object> SP+ <size> TAB <path>`
+            let (meta, path) = record
                 .split_once('\t')
                 .ok_or_else(|| format!("git ls-tree: malformed record {record:?}"))?;
-            let mut fields = meta.split(' ');
-            let (Some(mode), Some(kind)) = (fields.next(), fields.next()) else {
+            let mut fields = meta.split_whitespace();
+            let (Some(mode), Some(_kind), Some(oid), Some(size)) =
+                (fields.next(), fields.next(), fields.next(), fields.next())
+            else {
                 return Err(format!("git ls-tree: malformed record {record:?}"));
             };
-            if kind != "blob" {
-                continue;
-            }
             let mode = u32::from_str_radix(mode, 8)
                 .map_err(|_| format!("git ls-tree: malformed mode {mode:?}"))?;
-            let Some(rel) = full_path.strip_prefix(&prefix) else {
-                continue;
-            };
             entries.push(TreeEntry {
-                path: rel.to_string(),
+                path: path.to_string(),
                 mode,
+                oid: oid.to_string(),
+                size: size.parse().ok(),
             });
-        }
-        if entries.is_empty() {
-            return Err(format!("{path} is absent at {}", snapshot.short()));
         }
         Ok(entries)
     }
 
-    /// Load one skill directory, `.claude/skills/<name>/`, at `snapshot`, and
-    /// run it through the same validation an account skill passes. Any file
-    /// that is not a regular or executable blob (a symlink, a submodule), any
-    /// unreadable or non-UTF-8 file, and any validation failure refuses the
-    /// WHOLE skill — a half-canonical skill is a `SKILL.md` citing files that
-    /// are not there.
-    fn load_skill(
+    /// The contents of every blob in `wanted` (object id → size), read through
+    /// `git cat-file --batch` in batches of at most [`BATCH_BYTES`]. Every
+    /// requested object must come back whole: a missing object, a malformed
+    /// record or a short read is an error, never a partial map.
+    pub(crate) fn read_blobs(
         &self,
-        snapshot: &CanonicalSnapshot,
-        name: &str,
-    ) -> Result<CanonicalSkill, String> {
-        let dir = format!(".claude/skills/{name}");
-        let mut files = qontinui_types::agent_text_units::AgentTextUnitFiles::new();
-        let mut modes = BTreeMap::new();
-        for entry in self.list_tree(snapshot, &dir)? {
-            if entry.mode != MODE_FILE && entry.mode != MODE_EXECUTABLE {
-                return Err(format!("{} has git mode {:o}", entry.path, entry.mode));
+        wanted: &BTreeMap<String, u64>,
+    ) -> Result<HashMap<String, Vec<u8>>, String> {
+        let mut out = HashMap::with_capacity(wanted.len());
+        let mut batch: Vec<&str> = Vec::new();
+        let mut batch_bytes = 0u64;
+        for (oid, size) in wanted {
+            if !batch.is_empty() && batch_bytes.saturating_add(*size) > BATCH_BYTES {
+                self.read_batch(&batch, &mut out)?;
+                batch.clear();
+                batch_bytes = 0;
             }
-            let bytes = self.read(snapshot, &format!("{dir}/{}", entry.path))?;
-            let text =
-                String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8", entry.path))?;
-            modes.insert(entry.path.clone(), entry.mode);
-            files.insert(entry.path, text);
+            batch.push(oid);
+            batch_bytes = batch_bytes.saturating_add(*size);
         }
-        let unit = qontinui_types::agent_text_units::AgentTextUnit {
-            id: format!("canonical:{name}"),
-            kind: qontinui_types::agent_text_units::AgentTextUnitKind::skill(),
-            name: name.to_string(),
-            organization_id: None,
-            created_by_user_id: None,
-            entrypoint: "SKILL.md".to_string(),
-            files: files.clone(),
-            checksum: None,
-            is_shared: false,
-            is_invocable: true,
-            current_version: 1,
-            source: "canonical".to_string(),
-            source_path: Some(dir),
-            source_commit: Some(snapshot.sha.clone()),
-            created_at: snapshot.fetched_at.clone(),
-            updated_at: snapshot.fetched_at.clone(),
-        };
-        crate::agent_skills::validate_override(
-            &unit,
-            crate::agent_skills::AgentSkillSource::Builtin,
-        )?;
-        Ok(CanonicalSkill { files, modes })
+        if !batch.is_empty() {
+            self.read_batch(&batch, &mut out)?;
+        }
+        Ok(out)
     }
 
-    /// Load every skill in `names` at `snapshot`. A skill that is absent or
-    /// refused is left out — it falls to the next rung — and the misses are
-    /// logged as ONE line.
-    pub(crate) fn load_skills(
+    fn read_batch(&self, oids: &[&str], out: &mut HashMap<String, Vec<u8>>) -> Result<(), String> {
+        let mut cmd = self.in_mirror();
+        cmd.args(["cat-file", "--batch"]);
+        let mut input = Vec::new();
+        for oid in oids {
+            input.extend_from_slice(oid.as_bytes());
+            input.push(b'\n');
+        }
+        let stdout = run_input(cmd, self.local_timeout, input, "git cat-file --batch")?;
+        let objects = parse_batch(&stdout)?;
+        for oid in oids {
+            if !objects.contains_key(*oid) {
+                return Err(format!("git cat-file --batch: {oid} not returned"));
+            }
+        }
+        out.extend(objects);
+        Ok(())
+    }
+
+    /// Load every bundled command (`.claude/commands/<name>.md`) and skill
+    /// (`.claude/skills/<name>/`) at `snapshot`: one `ls-tree`, then the
+    /// batched blob reads.
+    ///
+    /// `Err` means the load could not be COMPLETED (see the module doc) and
+    /// nothing from it may be published. A content miss is not an error: that
+    /// unit is left out, and the misses are logged as one line per kind.
+    pub(crate) fn load(
         &self,
         snapshot: &CanonicalSnapshot,
-        names: &[&str],
-    ) -> CanonicalSkills {
-        let mut skills = BTreeMap::new();
-        let mut missed: Vec<String> = Vec::new();
-        for name in names {
-            match self.load_skill(snapshot, name) {
-                Ok(skill) => {
-                    skills.insert((*name).to_string(), skill);
+        command_names: &[&str],
+        skill_names: &[&str],
+    ) -> Result<CanonicalCorpus, String> {
+        let entries = self.list_tree(snapshot, &[COMMANDS_DIR, SKILLS_DIR])?;
+        let by_path: HashMap<&str, &TreeEntry> =
+            entries.iter().map(|e| (e.path.as_str(), e)).collect();
+
+        let mut missed_commands: Vec<String> = Vec::new();
+        let mut command_oids: Vec<(&str, &TreeEntry)> = Vec::new();
+        for name in command_names {
+            match by_path.get(format!("{COMMANDS_DIR}/{name}.md").as_str()) {
+                None => missed_commands.push(format!("{name} (absent)")),
+                Some(e) if !servable_mode(e.mode) => {
+                    missed_commands.push(format!("{name} (git mode {:o})", e.mode))
                 }
-                Err(why) => missed.push(format!("{name} ({why})")),
+                Some(e) => command_oids.push((*name, *e)),
             }
         }
-        if !missed.is_empty() {
-            warn!(
-                "canonical_corpus: {} of {} bundled skill(s) unusable at {} — they fall to \
-                 the embedded default: {}",
-                missed.len(),
-                names.len(),
-                snapshot.short(),
-                missed.join("; ")
-            );
-        }
-        CanonicalSkills {
-            snapshot: snapshot.clone(),
-            skills,
-        }
-    }
 
-    /// Load every name in `names` from `.claude/commands/<name>.md` at
-    /// `snapshot`. A body that is absent, unreadable, or not UTF-8 is left
-    /// out — that command falls to the next rung — and the misses are logged
-    /// as ONE line, not one per command.
-    pub(crate) fn load_commands(
-        &self,
-        snapshot: &CanonicalSnapshot,
-        names: &[&str],
-    ) -> CanonicalCommands {
-        let mut bodies = BTreeMap::new();
-        let mut missed: Vec<String> = Vec::new();
-        for name in names {
-            let path = format!(".claude/commands/{name}.md");
-            match self.read(snapshot, &path) {
-                Ok(bytes) => match String::from_utf8(bytes) {
-                    Ok(body) => {
-                        bodies.insert((*name).to_string(), body);
-                    }
-                    Err(_) => missed.push(format!("{name} (not UTF-8)")),
-                },
-                Err(why) => missed.push(format!("{name} ({why})")),
+        let mut missed_skills: Vec<String> = Vec::new();
+        let mut skill_entries: Vec<(&str, Vec<(String, &TreeEntry)>)> = Vec::new();
+        for name in skill_names {
+            let prefix = format!("{SKILLS_DIR}/{name}/");
+            let files: Vec<(String, &TreeEntry)> = entries
+                .iter()
+                .filter_map(|e| e.path.strip_prefix(&prefix).map(|rel| (rel.to_string(), e)))
+                .collect();
+            if files.is_empty() {
+                missed_skills.push(format!("{name} (absent)"));
+            } else if let Some((rel, e)) = files.iter().find(|(_, e)| !servable_mode(e.mode)) {
+                // A half-canonical skill is a `SKILL.md` citing files that are
+                // not there: refuse the whole skill.
+                missed_skills.push(format!("{name} ({rel} has git mode {:o})", e.mode));
+            } else {
+                skill_entries.push((*name, files));
             }
         }
-        if !missed.is_empty() {
-            warn!(
-                "canonical_corpus: {} of {} bundled command(s) unreadable at {} — they fall \
-                 to the embedded default: {}",
-                missed.len(),
-                names.len(),
-                snapshot.short(),
-                missed.join("; ")
-            );
+
+        let mut wanted: BTreeMap<String, u64> = BTreeMap::new();
+        for e in command_oids.iter().map(|(_, e)| *e).chain(
+            skill_entries
+                .iter()
+                .flat_map(|(_, f)| f.iter().map(|(_, e)| *e)),
+        ) {
+            wanted.insert(e.oid.clone(), e.size.unwrap_or(0));
         }
-        CanonicalCommands {
-            snapshot: snapshot.clone(),
-            bodies,
+        let blobs = self.read_blobs(&wanted)?;
+        let blob = |oid: &str| -> Result<&Vec<u8>, String> {
+            blobs
+                .get(oid)
+                .ok_or_else(|| format!("object {oid} was not read"))
+        };
+
+        let mut bodies = BTreeMap::new();
+        for (name, e) in command_oids {
+            match String::from_utf8(blob(&e.oid)?.clone()) {
+                Ok(body) => {
+                    bodies.insert(name.to_string(), body);
+                }
+                Err(_) => missed_commands.push(format!("{name} (not UTF-8)")),
+            }
         }
+
+        let mut skills = BTreeMap::new();
+        for (name, files) in skill_entries {
+            let mut texts = qontinui_types::agent_text_units::AgentTextUnitFiles::new();
+            let mut modes = BTreeMap::new();
+            let mut refused = None;
+            for (rel, e) in files {
+                match String::from_utf8(blob(&e.oid)?.clone()) {
+                    Ok(text) => {
+                        modes.insert(rel.clone(), e.mode);
+                        texts.insert(rel, text);
+                    }
+                    Err(_) => {
+                        refused = Some(format!("{rel} is not UTF-8"));
+                        break;
+                    }
+                }
+            }
+            let verdict = match refused {
+                Some(why) => Err(why),
+                None => validate_skill(snapshot, name, &texts),
+            };
+            match verdict {
+                Ok(()) => {
+                    skills.insert(
+                        name.to_string(),
+                        CanonicalSkill {
+                            files: texts,
+                            modes,
+                        },
+                    );
+                }
+                Err(why) => missed_skills.push(format!("{name} ({why})")),
+            }
+        }
+
+        for (kind, missed, of) in [
+            ("command", &missed_commands, command_names.len()),
+            ("skill", &missed_skills, skill_names.len()),
+        ] {
+            if !missed.is_empty() {
+                warn!(
+                    "canonical_corpus: {} of {of} bundled {kind}(s) unusable at {} — they fall \
+                     to the embedded default: {}",
+                    missed.len(),
+                    snapshot.short(),
+                    missed.join("; ")
+                );
+            }
+        }
+        Ok(CanonicalCorpus {
+            commands: CanonicalCommands {
+                snapshot: snapshot.clone(),
+                bodies,
+            },
+            skills: CanonicalSkills {
+                snapshot: snapshot.clone(),
+                skills,
+            },
+        })
     }
+}
+
+/// Run a canonical skill's files through the same validation an account
+/// skill passes.
+fn validate_skill(
+    snapshot: &CanonicalSnapshot,
+    name: &str,
+    files: &qontinui_types::agent_text_units::AgentTextUnitFiles,
+) -> Result<(), String> {
+    let unit = qontinui_types::agent_text_units::AgentTextUnit {
+        id: format!("canonical:{name}"),
+        kind: qontinui_types::agent_text_units::AgentTextUnitKind::skill(),
+        name: name.to_string(),
+        organization_id: None,
+        created_by_user_id: None,
+        entrypoint: "SKILL.md".to_string(),
+        files: files.clone(),
+        checksum: None,
+        is_shared: false,
+        is_invocable: true,
+        current_version: 1,
+        source: "canonical".to_string(),
+        source_path: Some(format!("{SKILLS_DIR}/{name}")),
+        source_commit: Some(snapshot.sha.clone()),
+        created_at: snapshot.fetched_at.clone(),
+        updated_at: snapshot.fetched_at.clone(),
+    };
+    crate::agent_skills::validate_override(&unit, crate::agent_skills::AgentSkillSource::Builtin)
+        .map(|_| ())
+}
+
+/// Parse `git cat-file --batch` output: per object, `<oid> <type> <size>\n`,
+/// `<size>` bytes, `\n` — or `<name> missing\n`, which is an error here,
+/// because every name asked for came from an `ls-tree` of the same mirror.
+fn parse_batch(mut rest: &[u8]) -> Result<HashMap<String, Vec<u8>>, String> {
+    let mut objects = HashMap::new();
+    while !rest.is_empty() {
+        let nl = rest
+            .iter()
+            .position(|b| *b == b'\n')
+            .ok_or("git cat-file --batch: unterminated header")?;
+        let header = String::from_utf8_lossy(rest.get(..nl).unwrap_or_default()).into_owned();
+        let mut fields = header.split(' ');
+        let (Some(oid), Some(kind), Some(size), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(format!("git cat-file --batch: {header:?}"));
+        };
+        let size: usize = size
+            .parse()
+            .map_err(|_| format!("git cat-file --batch: malformed size in {header:?}"))?;
+        let body_start = nl + 1;
+        let body_end = body_start
+            .checked_add(size)
+            .ok_or("git cat-file --batch: size overflow")?;
+        let body = rest
+            .get(body_start..body_end)
+            .ok_or_else(|| format!("git cat-file --batch: {oid} is short"))?;
+        if rest.get(body_end) != Some(&b'\n') {
+            return Err(format!("git cat-file --batch: {oid} is not terminated"));
+        }
+        if kind != "blob" {
+            return Err(format!("git cat-file --batch: {oid} is a {kind}"));
+        }
+        objects.insert(oid.to_string(), body.to_vec());
+        rest = rest.get(body_end + 1..).unwrap_or_default();
+    }
+    Ok(objects)
 }
 
 /// Run `cmd` under `timeout` through the crate's bounded runner, returning its
@@ -471,7 +709,33 @@ impl Mirror {
 /// fixed, caller-authored label — never the argv, which may carry a URL with
 /// a credential in it.
 fn run(cmd: std::process::Command, timeout: Duration, what: &str) -> Result<Vec<u8>, String> {
-    match crate::process_helpers::run_with_timeout_detailed(cmd, timeout) {
+    finish(
+        crate::process_helpers::run_with_timeout_detailed(cmd, timeout),
+        timeout,
+        what,
+    )
+}
+
+/// [`run`] for a command that reads `input` on stdin.
+fn run_input(
+    cmd: std::process::Command,
+    timeout: Duration,
+    input: Vec<u8>,
+    what: &str,
+) -> Result<Vec<u8>, String> {
+    finish(
+        crate::process_helpers::run_with_timeout_input(cmd, timeout, input),
+        timeout,
+        what,
+    )
+}
+
+fn finish(
+    result: std::io::Result<TimedRun>,
+    timeout: Duration,
+    what: &str,
+) -> Result<Vec<u8>, String> {
+    match result {
         Err(e) => Err(format!("{what}: git unavailable ({e})")),
         Ok(TimedRun {
             outcome: TimedOutput::TimedOut { .. },
@@ -500,19 +764,76 @@ fn run(cmd: std::process::Command, timeout: Duration, what: &str) -> Result<Vec<
 // The process-wide snapshot
 // ---------------------------------------------------------------------------
 
-/// The last successfully loaded corpus. `None` until the first refresh lands.
-static LATEST: RwLock<Option<Arc<CanonicalCorpus>>> = RwLock::new(None);
+/// A published corpus plus the last refresh failure reason. The process has
+/// one ([`LATEST`]); a test builds its own, so it never races the global.
+pub(crate) struct Published {
+    corpus: RwLock<Option<Arc<CanonicalCorpus>>>,
+    /// So a failure repeating on every timer tick is logged once rather than
+    /// every fifteen minutes forever.
+    last_failure: Mutex<Option<String>>,
+}
 
-/// The last refresh failure reason, so a failure repeating on every timer tick
-/// is logged once rather than every fifteen minutes forever.
-static LAST_FAILURE: Mutex<Option<String>> = Mutex::new(None);
+impl Published {
+    pub(crate) const fn new() -> Self {
+        Self {
+            corpus: RwLock::new(None),
+            last_failure: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn get(&self) -> Option<Arc<CanonicalCorpus>> {
+        self.corpus
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn set(&self, corpus: CanonicalCorpus) {
+        *self
+            .corpus
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(corpus));
+    }
+
+    fn snapshot(&self) -> Option<CanonicalSnapshot> {
+        self.get().map(|c| c.snapshot().clone())
+    }
+
+    fn recovered(&self) {
+        let mut last = self
+            .last_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(prev) = last.take() {
+            info!("canonical_corpus: refresh recovered (previously: {prev})");
+        }
+    }
+
+    fn failed(&self, why: String) {
+        let mut last = self
+            .last_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if last.as_deref() != Some(why.as_str()) {
+            warn!(
+                "canonical_corpus: refresh failed ({why}) — sessions keep the {} and fall back \
+                 to the embedded defaults for anything it lacks",
+                match self.snapshot() {
+                    Some(s) => format!("previously loaded snapshot {}", s.short()),
+                    None => "embedded defaults".to_string(),
+                }
+            );
+            *last = Some(why);
+        }
+    }
+}
+
+/// The process's published corpus. `None` until the first complete load.
+static LATEST: Published = Published::new();
 
 /// The last loaded corpus, for synchronous registry resolution. No I/O.
 pub(crate) fn latest() -> Option<Arc<CanonicalCorpus>> {
-    LATEST
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
+    LATEST.get()
 }
 
 /// The production mirror: under the per-instance runner config dir, fetching
@@ -539,7 +860,7 @@ fn resolve_url() -> String {
         .map(|root| root.join("qontinui-claude-config"))
         .filter(|dir| dir.join(".git").exists())
     {
-        let mut cmd = crate::process_helpers::no_window("git");
+        let mut cmd = scrubbed_git(OsStr::new("git"));
         cmd.arg("-C")
             .arg(&checkout)
             .args(["config", "--get", "remote.origin.url"]);
@@ -569,73 +890,69 @@ fn bundled_skill_names() -> Vec<String> {
         .collect()
 }
 
-/// Refresh `mirror` and, when the fetched sha differs from what is loaded,
-/// load the bundled bodies at it and publish them. Returns the snapshot the
-/// process now serves (`None` when nothing has ever loaded).
+/// Refresh `mirror` into `published`, loading `command_names` and
+/// `skill_names`. Returns the snapshot `published` now serves (`None` when
+/// nothing has ever loaded).
 ///
-/// A failure keeps the previously published corpus: a stale canonical copy is
-/// still the newest one this device can read.
-pub(crate) fn refresh_into_latest(mirror: &Mirror) -> Option<CanonicalSnapshot> {
-    match mirror.refresh() {
-        Ok(snapshot) => {
-            {
-                let mut last = LAST_FAILURE
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if let Some(prev) = last.take() {
-                    info!("canonical_corpus: refresh recovered (previously: {prev})");
-                }
-            }
-            if let Some(current) = latest() {
-                if current.snapshot().sha == snapshot.sha {
-                    return Some(current.snapshot().clone());
-                }
-            }
-            let skill_names = bundled_skill_names();
-            let skill_refs: Vec<&str> = skill_names.iter().map(String::as_str).collect();
-            let corpus = CanonicalCorpus {
-                commands: mirror.load_commands(&snapshot, &bundled_command_names()),
-                skills: mirror.load_skills(&snapshot, &skill_refs),
-            };
+/// - A fetch that resolves to the published sha keeps the published bodies
+///   and advances their `fetched_at`: it is the last SUCCESSFUL fetch.
+/// - A new sha is published only when its load COMPLETED. An incomplete load
+///   keeps the previous generation, and because it was never published, the
+///   next tick sees a sha that still differs and retries it.
+/// - A failed fetch keeps the previous generation: a stale canonical copy is
+///   still the newest one this device can read.
+pub(crate) fn refresh_into(
+    mirror: &Mirror,
+    published: &Published,
+    command_names: &[&str],
+    skill_names: &[&str],
+) -> Option<CanonicalSnapshot> {
+    let snapshot = match mirror.refresh() {
+        Ok(snapshot) => snapshot,
+        Err(why) => {
+            published.failed(why);
+            return published.snapshot();
+        }
+    };
+    if let Some(current) = published.get() {
+        if current.snapshot().sha == snapshot.sha {
+            published.set(current.refetched(&snapshot));
+            published.recovered();
+            return Some(snapshot);
+        }
+    }
+    match mirror.load(&snapshot, command_names, skill_names) {
+        Ok(corpus) => {
             info!(
                 "canonical_corpus: serving qontinui-claude-config@{} ({} of {} bundled \
                  command(s), {} of {} bundled skill(s) present)",
                 snapshot.short(),
                 corpus.commands.bodies.len(),
-                crate::fleet_commands::FLEET_COMMANDS.len(),
+                command_names.len(),
                 corpus.skills.skills.len(),
                 skill_names.len(),
             );
-            *LATEST
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(corpus));
+            published.set(corpus);
+            published.recovered();
             Some(snapshot)
         }
         Err(why) => {
-            let mut last = LAST_FAILURE
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if last.as_deref() != Some(why.as_str()) {
-                warn!(
-                    "canonical_corpus: refresh failed ({why}) — sessions keep the {} and fall \
-                     back to the embedded defaults for anything it lacks",
-                    match latest() {
-                        Some(c) => format!("previously loaded snapshot {}", c.snapshot().short()),
-                        None => "embedded defaults".to_string(),
-                    }
-                );
-                *last = Some(why);
-            }
-            latest().map(|c| c.snapshot().clone())
+            published.failed(format!(
+                "the load at {} did not complete, so it was not published: {why}",
+                snapshot.short()
+            ));
+            published.snapshot()
         }
     }
 }
 
-/// One refresh of the production mirror. Blocking — call it off the async
-/// runtime's worker threads.
+/// One refresh of the production mirror into the process's [`LATEST`].
+/// Blocking — call it off the async runtime's worker threads.
 pub(crate) fn refresh() -> Option<CanonicalSnapshot> {
     let mirror = default_mirror()?;
-    refresh_into_latest(&mirror)
+    let skill_names = bundled_skill_names();
+    let skill_refs: Vec<&str> = skill_names.iter().map(String::as_str).collect();
+    refresh_into(&mirror, &LATEST, &bundled_command_names(), &skill_refs)
 }
 
 /// Whether [`start_refresh_loop`] has already started this process's loop.
@@ -645,7 +962,8 @@ static LOOP_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// [`REFRESH_INTERVAL`], each on the blocking pool. Hung beside the embedded
 /// defaults publisher in `mcp_api::create_router`, never on a spawn path. Once
 /// per process: a second call (a second router) is a no-op, so the mirror is
-/// never fetched by two loops at once.
+/// never fetched by two loops at once — which is what makes
+/// [`Mirror::clear_interrupted_fetch`] safe.
 pub(crate) fn start_refresh_loop() {
     if LOOP_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return;
@@ -664,46 +982,78 @@ pub(crate) fn start_refresh_loop() {
 /// Test fixtures shared with the resolvers' tests.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
 
     use super::*;
 
-    fn git(dir: &Path, args: &[&str]) {
-        let ok = Command::new("git")
+    /// Run git in `dir` with no dependence on the user's global hooks,
+    /// signing config or locale, and with the caller's repository
+    /// environment removed.
+    pub(crate) fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
             .arg("-C")
             .arg(dir)
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+            ])
             .args(args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .expect("run git")
-            .success();
-        assert!(ok, "git {args:?} should succeed");
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env("LC_ALL", "C")
+            .stdin(Stdio::null())
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// The local "remote" under `root`.
+    pub(crate) fn remote_dir(root: &Path) -> PathBuf {
+        root.join("remote")
     }
 
     /// A local "remote": a non-bare repo on branch `main` holding `files`
     /// (relative path → contents), one commit. Returns its path as the URL.
     pub(crate) fn remote_with(root: &Path, files: &[(&str, &str)]) -> String {
-        let remote = root.join("remote");
+        let remote = remote_dir(root);
         std::fs::create_dir_all(&remote).unwrap();
         git(&remote, &["init", "--quiet", "--initial-branch=main"]);
-        git(&remote, &["config", "user.email", "t@example.com"]);
-        git(&remote, &["config", "user.name", "t"]);
+        commit_files(root, files);
+        remote.to_string_lossy().into_owned()
+    }
+
+    /// Write `files` into the remote and commit them — a new `main` tip.
+    pub(crate) fn commit_files(root: &Path, files: &[(&str, &str)]) {
+        let remote = remote_dir(root);
         for (path, text) in files {
             let dst = remote.join(path);
             std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
             std::fs::write(&dst, text).unwrap();
         }
         git(&remote, &["add", "--all"]);
-        git(&remote, &["commit", "--quiet", "-m", "fixture"]);
-        remote.to_string_lossy().into_owned()
+        git(
+            &remote,
+            &["commit", "--quiet", "--allow-empty", "-m", "fixture"],
+        );
     }
 
     /// Mark `path` executable in the remote's index and commit it, so git
     /// records mode `100755` regardless of the filesystem's own bits.
     pub(crate) fn chmod_x(root: &Path, path: &str) {
-        let remote = root.join("remote");
+        let remote = remote_dir(root);
         git(&remote, &["update-index", "--chmod=+x", "--", path]);
         git(&remote, &["commit", "--quiet", "-m", "chmod"]);
     }
@@ -712,14 +1062,50 @@ pub(crate) mod test_support {
     pub(crate) fn mirror(root: &Path, url: &str) -> Mirror {
         Mirror::new(root.join("mirror.git"), url.to_string())
     }
+
+    /// Write an executable shell script at `path` and return only once it can
+    /// be exec'd. A concurrently forking test thread can briefly inherit the
+    /// script's write descriptor, and an exec in that window fails with
+    /// ETXTBSY — which would read as "git unavailable" rather than as the
+    /// behaviour under test.
+    #[cfg(unix)]
+    pub(crate) fn executable_script(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for _ in 0..200 {
+            match Command::new(path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(mut c) => {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                    return;
+                }
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(e) => panic!("cannot exec the test script: {e}"),
+            }
+        }
+        panic!("the test script stayed ETXTBSY for 2 s");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
-    use super::test_support::{mirror, remote_with};
+    use super::test_support::{commit_files, git, mirror, remote_dir, remote_with};
     use super::*;
+
+    /// Load `commands` (and no skills) at `snap`.
+    fn commands_at(m: &Mirror, snap: &CanonicalSnapshot, commands: &[&str]) -> CanonicalCommands {
+        m.load(snap, commands, &[]).expect("load").commands
+    }
 
     #[test]
     fn refresh_resolves_the_full_sha_and_reads_by_it() {
@@ -730,8 +1116,8 @@ mod tests {
         assert_eq!(snap.sha.len(), 40);
         assert_eq!(snap.short().len(), 12);
         assert_eq!(
-            m.read(&snap, ".claude/commands/vet-plan.md").unwrap(),
-            b"# canon\n"
+            commands_at(&m, &snap, &["vet-plan"]).bodies["vet-plan"],
+            "# canon\n"
         );
         // A second refresh over the initialised mirror is idempotent.
         assert_eq!(m.refresh().unwrap().sha, snap.sha);
@@ -740,19 +1126,218 @@ mod tests {
         assert!(!tmp.path().join("mirror.git").join(".claude").exists());
     }
 
+    /// Only the tip is fetched: the mirror is shallow, holds no ancestor, and a
+    /// later shallow fetch follows `main` and reads the new tip by full sha.
     #[test]
-    fn a_path_absent_at_the_sha_is_an_error_and_is_left_out() {
+    fn the_mirror_is_shallow_and_follows_the_tip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = remote_with(tmp.path(), &[(".claude/commands/vet-plan.md", "# one\n")]);
+        commit_files(tmp.path(), &[(".claude/commands/vet-plan.md", "# two\n")]);
+        let parent = git(&remote_dir(tmp.path()), &["rev-parse", "HEAD~1"]);
+        let m = mirror(tmp.path(), &url);
+        assert!(
+            !m.has_tracking_ref(),
+            "an empty mirror takes the first-fetch budget"
+        );
+        let first = m.refresh().expect("first fetch");
+        assert!(m.has_tracking_ref());
+        let git_dir = tmp.path().join("mirror.git");
+        assert!(
+            git_dir.join("shallow").is_file(),
+            "the mirror must be shallow"
+        );
+        let count = git(&git_dir, &["rev-list", "--count", &first.sha]);
+        assert_eq!(count.trim(), "1", "only the tip commit is held");
+        let has_parent = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["cat-file", "-e", parent.trim()])
+            .status()
+            .unwrap();
+        assert!(!has_parent.success(), "no history was fetched");
+        assert_eq!(
+            commands_at(&m, &first, &["vet-plan"]).bodies["vet-plan"],
+            "# two\n"
+        );
+
+        commit_files(tmp.path(), &[(".claude/commands/vet-plan.md", "# three\n")]);
+        let second = m.refresh().expect("incremental shallow fetch");
+        assert_ne!(second.sha, first.sha);
+        assert_eq!(
+            commands_at(&m, &second, &["vet-plan"]).bodies["vet-plan"],
+            "# three\n"
+        );
+    }
+
+    /// A fetch killed at its budget leaves a partial pack and locks; the next
+    /// refresh removes them and succeeds.
+    #[test]
+    fn leftovers_of_an_interrupted_fetch_are_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = remote_with(tmp.path(), &[(".claude/commands/vet-plan.md", "# canon\n")]);
+        let m = mirror(tmp.path(), &url);
+        m.refresh().expect("refresh");
+        let git_dir = tmp.path().join("mirror.git");
+        let leftovers = [
+            git_dir.join("objects/pack/tmp_pack_Ab12Cd"),
+            git_dir.join("objects/pack/tmp_idx_Ab12Cd"),
+            git_dir.join("shallow.lock"),
+            git_dir.join(format!("{TRACKING_REF}.lock")),
+        ];
+        for path in &leftovers {
+            std::fs::write(path, b"partial").unwrap();
+        }
+        commit_files(tmp.path(), &[(".claude/commands/vet-plan.md", "# next\n")]);
+        let snap = m.refresh().expect("a refresh past the leftovers");
+        for path in &leftovers {
+            assert!(!path.exists(), "{} must be removed", path.display());
+        }
+        assert_eq!(
+            commands_at(&m, &snap, &["vet-plan"]).bodies["vet-plan"],
+            "# next\n"
+        );
+    }
+
+    /// A URL is a positional, never an option: `--end-of-options` stops a
+    /// `-`-leading URL from being read as `--upload-pack=<command>`.
+    #[test]
+    fn a_dash_leading_url_is_never_an_option() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("executed");
+        let m = mirror(
+            tmp.path(),
+            &format!("--upload-pack=touch {}", marker.display()),
+        );
+        assert!(m.refresh().is_err());
+        assert!(!marker.exists(), "the URL must not have run as a command");
+    }
+
+    /// Every git this module runs speaks the C locale and cannot be
+    /// redirected at another repository.
+    #[test]
+    fn the_git_builder_scrubs_the_repository_env_and_pins_the_locale() {
+        let cmd = scrubbed_git(OsStr::new("git"));
+        let envs: HashMap<_, _> = cmd.get_envs().collect();
+        assert_eq!(envs.get(OsStr::new("LC_ALL")), Some(&Some(OsStr::new("C"))));
+        assert_eq!(
+            envs.get(OsStr::new("LANGUAGE")),
+            Some(&Some(OsStr::new("C")))
+        );
+        for var in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+        ] {
+            assert_eq!(envs.get(OsStr::new(var)), Some(&None), "{var} is removed");
+        }
+    }
+
+    #[test]
+    fn a_path_absent_at_the_sha_is_left_out() {
         let tmp = tempfile::tempdir().unwrap();
         let url = remote_with(tmp.path(), &[(".claude/commands/vet-plan.md", "# canon\n")]);
         let m = mirror(tmp.path(), &url);
         let snap = m.refresh().unwrap();
-        assert!(m.read(&snap, ".claude/commands/absent.md").is_err());
-        // A directory is not a file.
-        assert!(m.read(&snap, ".claude/commands").is_err());
-        let loaded = m.load_commands(&snap, &["vet-plan", "absent"]);
+        let loaded = commands_at(&m, &snap, &["vet-plan", "absent"]);
         assert_eq!(loaded.bodies.len(), 1);
         assert_eq!(loaded.bodies["vet-plan"], "# canon\n");
         assert_eq!(loaded.snapshot, snap);
+    }
+
+    /// A command committed as a symlink or a submodule is refused — the same
+    /// mode filter skills pass — and so is a skill holding either.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_or_submodule_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = remote_with(
+            tmp.path(),
+            &[
+                (".claude/commands/target.md", "# target\n"),
+                (".claude/commands/plain.md", "# plain\n"),
+                (
+                    ".claude/skills/demo/SKILL.md",
+                    "---\nname: demo\n---\n# demo\n",
+                ),
+                (
+                    ".claude/skills/linked/SKILL.md",
+                    "---\nname: linked\n---\n# linked\n",
+                ),
+            ],
+        );
+        let remote = remote_dir(tmp.path());
+        std::os::unix::fs::symlink("target.md", remote.join(".claude/commands/linky.md")).unwrap();
+        let head = git(&remote, &["rev-parse", "HEAD"]);
+        git(
+            &remote,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{},.claude/commands/sub.md", head.trim()),
+            ],
+        );
+        git(
+            &remote,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{},.claude/skills/linked/vendored", head.trim()),
+            ],
+        );
+        git(&remote, &["add", "--", ".claude/commands/linky.md"]);
+        git(&remote, &["commit", "--quiet", "-m", "links"]);
+
+        let m = mirror(tmp.path(), &url);
+        let snap = m.refresh().unwrap();
+        let corpus = m
+            .load(&snap, &["plain", "linky", "sub"], &["demo", "linked"])
+            .expect("a refused unit is a content answer, not a failed load");
+        assert_eq!(
+            corpus.commands.bodies.keys().collect::<Vec<_>>(),
+            vec!["plain"]
+        );
+        assert_eq!(
+            corpus.skills.skills.keys().collect::<Vec<_>>(),
+            vec!["demo"]
+        );
+    }
+
+    /// The bundled corpus is larger than one capture can hold; the batched
+    /// read loads content past that cap in full.
+    #[test]
+    fn a_corpus_larger_than_one_capture_loads_in_full() {
+        let tmp = tempfile::tempdir().unwrap();
+        let size = crate::process_helpers::MAX_CAPTURED_BYTES * 3 / 8;
+        let bodies: Vec<String> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|n| format!("# {n}\n{}\n", n.repeat(size)))
+            .collect();
+        let paths: Vec<String> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|n| format!(".claude/commands/{n}.md"))
+            .collect();
+        let files: Vec<(&str, &str)> = paths
+            .iter()
+            .map(String::as_str)
+            .zip(bodies.iter().map(String::as_str))
+            .collect();
+        let m = mirror(tmp.path(), &remote_with(tmp.path(), &files));
+        let snap = m.refresh().unwrap();
+        let loaded = commands_at(&m, &snap, &["a", "b", "c", "d"]);
+        assert_eq!(loaded.bodies.len(), 4);
+        assert_eq!(loaded.bodies["d"], bodies[3]);
+    }
+
+    #[test]
+    fn a_malformed_batch_is_an_error_not_a_partial_map() {
+        assert!(parse_batch(b"abc blob 3\nxyz\n").is_ok());
+        assert!(parse_batch(b"abc missing\n").is_err());
+        assert!(parse_batch(b"abc blob 9\nxyz\n").is_err(), "short read");
+        assert!(parse_batch(b"abc blob 3\nxyzq").is_err(), "unterminated");
+        assert!(parse_batch(b"abc tree 3\nxyz\n").is_err());
     }
 
     #[test]
@@ -772,6 +1357,86 @@ mod tests {
         let m = mirror(tmp.path(), "unused").with_program(tmp.path().join("no-such-git"));
         let err = m.refresh().expect_err("no git");
         assert!(err.contains("git unavailable"), "{err}");
+    }
+
+    // -- publication ---------------------------------------------------------
+
+    /// A same-sha fetch is still the last successful fetch: `fetched_at`
+    /// advances and the loaded bodies are kept.
+    #[test]
+    fn a_same_sha_fetch_advances_fetched_at_and_keeps_the_bodies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = remote_with(tmp.path(), &[(".claude/commands/vet-plan.md", "# canon\n")]);
+        let m = mirror(tmp.path(), &url);
+        let published = Published::new();
+        let first = refresh_into(&m, &published, &["vet-plan"], &[]).expect("published");
+        let before = published.get().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let second = refresh_into(&m, &published, &["vet-plan"], &[]).expect("published");
+        assert_eq!(second.sha, first.sha);
+        assert!(
+            second.fetched_at > first.fetched_at,
+            "{} must advance past {}",
+            second.fetched_at,
+            first.fetched_at
+        );
+        let after = published.get().unwrap();
+        assert_eq!(after.snapshot(), &second);
+        assert_eq!(after.skills.snapshot, second);
+        assert_eq!(after.commands.bodies, before.commands.bodies);
+    }
+
+    /// A load that cannot complete is never published: the previous
+    /// generation keeps serving, and the next tick retries the new sha.
+    #[cfg(unix)]
+    #[test]
+    fn a_load_that_cannot_complete_keeps_the_previous_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = remote_with(tmp.path(), &[(".claude/commands/vet-plan.md", "# one\n")]);
+        let flag = tmp.path().join("fail-reads");
+        let wrapper = tmp.path().join("flaky-git");
+        test_support::executable_script(
+            &wrapper,
+            &format!(
+                "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = cat-file ] && [ -e '{}' ]; then \
+                 exit 1; fi\ndone\nexec git \"$@\"\n",
+                flag.display()
+            ),
+        );
+        let m = mirror(tmp.path(), &url).with_program(&wrapper);
+        let published = Published::new();
+        let one = refresh_into(&m, &published, &["vet-plan"], &[]).expect("first load");
+
+        commit_files(tmp.path(), &[(".claude/commands/vet-plan.md", "# two\n")]);
+        std::fs::write(&flag, b"").unwrap();
+        let served = refresh_into(&m, &published, &["vet-plan"], &[]);
+        assert_eq!(
+            served.map(|s| s.sha),
+            Some(one.sha.clone()),
+            "the fetch succeeded, the load did not: the previous generation stays"
+        );
+        assert_eq!(
+            published.get().unwrap().commands.bodies["vet-plan"],
+            "# one\n"
+        );
+
+        std::fs::remove_file(&flag).unwrap();
+        let two = refresh_into(&m, &published, &["vet-plan"], &[]).expect("retried");
+        assert_ne!(two.sha, one.sha, "the next tick retried the new sha");
+        assert_eq!(
+            published.get().unwrap().commands.bodies["vet-plan"],
+            "# two\n"
+        );
+    }
+
+    /// A refresh that fails before any load publishes nothing.
+    #[test]
+    fn a_failed_first_refresh_publishes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = mirror(tmp.path(), &tmp.path().join("gone").to_string_lossy());
+        let published = Published::new();
+        assert_eq!(refresh_into(&m, &published, &["vet-plan"], &[]), None);
+        assert!(published.get().is_none());
     }
 
     // -- the rung inside registry resolution ---------------------------------
@@ -801,7 +1466,7 @@ mod tests {
     fn loaded(root: &Path, files: &[(&str, &str)]) -> CanonicalCommands {
         let m = mirror(root, &remote_with(root, files));
         let snap = m.refresh().expect("refresh");
-        m.load_commands(&snap, &bundled_command_names())
+        commands_at(&m, &snap, &bundled_command_names())
     }
 
     /// The embedded floor, byte-identically — what every failure arm must
@@ -911,10 +1576,11 @@ mod tests {
 
     // -- skills --------------------------------------------------------------
 
-    /// `list_tree` yields every file under the directory, relative to it, with
-    /// git's recorded mode — including an extension-less executable.
+    /// `list_tree` yields every file under the directory with git's recorded
+    /// mode — including an extension-less executable — and a skill loads
+    /// with those modes.
     #[test]
-    fn list_tree_yields_relative_paths_and_git_modes() {
+    fn list_tree_yields_paths_and_git_modes() {
         let tmp = tempfile::tempdir().unwrap();
         let url = remote_with(
             tmp.path(),
@@ -931,28 +1597,27 @@ mod tests {
         test_support::chmod_x(tmp.path(), ".claude/skills/demo/helper");
         let m = mirror(tmp.path(), &url);
         let snap = m.refresh().unwrap();
-        let mut entries = m.list_tree(&snap, ".claude/skills/demo").unwrap();
-        entries.sort_by(|a, b| a.path.cmp(&b.path));
+        let mut entries: Vec<(String, u32)> = m
+            .list_tree(&snap, &[".claude/skills/demo"])
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.path, e.mode))
+            .collect();
+        entries.sort();
         assert_eq!(
             entries,
             vec![
-                TreeEntry {
-                    path: "SKILL.md".into(),
-                    mode: MODE_FILE
-                },
-                TreeEntry {
-                    path: "helper".into(),
-                    mode: MODE_EXECUTABLE
-                },
-                TreeEntry {
-                    path: "ref/notes.md".into(),
-                    mode: MODE_FILE
-                },
+                (".claude/skills/demo/SKILL.md".to_string(), MODE_FILE),
+                (".claude/skills/demo/helper".to_string(), MODE_EXECUTABLE),
+                (".claude/skills/demo/ref/notes.md".to_string(), MODE_FILE),
             ]
         );
-        assert!(m.list_tree(&snap, ".claude/skills/absent").is_err());
+        assert!(m
+            .list_tree(&snap, &[".claude/skills/absent"])
+            .unwrap()
+            .is_empty());
 
-        let loaded = m.load_skills(&snap, &["demo", "absent"]);
+        let loaded = m.load(&snap, &[], &["demo", "absent"]).unwrap().skills;
         assert_eq!(loaded.skills.len(), 1);
         let demo = &loaded.skills["demo"];
         assert!(demo.is_executable("helper"));
@@ -971,7 +1636,12 @@ mod tests {
         );
         let m = mirror(tmp.path(), &url);
         let snap = m.refresh().unwrap();
-        assert!(m.load_skills(&snap, &["demo"]).skills.is_empty());
+        assert!(m
+            .load(&snap, &[], &["demo"])
+            .unwrap()
+            .skills
+            .skills
+            .is_empty());
     }
 
     /// A git that hangs is killed at the budget, and the whole refresh returns
@@ -979,11 +1649,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_hanging_git_times_out() {
-        use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let script = tmp.path().join("sleepy-git");
-        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        test_support::executable_script(&script, "#!/bin/sh\nexec sleep 30\n");
         let budget = Duration::from_millis(200);
         let m = mirror(tmp.path(), "unused")
             .with_program(&script)

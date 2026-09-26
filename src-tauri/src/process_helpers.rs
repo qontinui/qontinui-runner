@@ -1040,8 +1040,36 @@ pub fn run_with_timeout(
 /// INCOMPLETE. That is reported in [`TimedRun::truncation`] rather than
 /// silently folded into a successful `Output` — see [`Truncation`].
 pub fn run_with_timeout_detailed(
+    cmd: std::process::Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<TimedRun> {
+    run_bounded(cmd, timeout, None)
+}
+
+/// [`run_with_timeout_detailed`] for a child that reads a FIXED input on stdin
+/// — `git cat-file --batch`, which takes its object list there and nowhere
+/// else.
+///
+/// Every guarantee of [`run_with_timeout_detailed`] holds, with one change:
+/// stdin is a pipe that a detached writer thread fills with `input` and then
+/// CLOSES, so the child sees EOF exactly where a `/dev/null` stdin would have
+/// given it one, and can no more block waiting for input than before. The
+/// writer is never joined. It ends when the write completes or fails, and a
+/// child that exits or is killed closes the read end, which fails the write
+/// with `EPIPE` (Rust ignores `SIGPIPE`). So its life is bounded by the
+/// child's.
+pub fn run_with_timeout_input(
+    cmd: std::process::Command,
+    timeout: std::time::Duration,
+    input: Vec<u8>,
+) -> std::io::Result<TimedRun> {
+    run_bounded(cmd, timeout, Some(input))
+}
+
+fn run_bounded(
     mut cmd: std::process::Command,
     timeout: std::time::Duration,
+    input: Option<Vec<u8>>,
 ) -> std::io::Result<TimedRun> {
     use std::process::Stdio;
     use std::time::{Duration, Instant};
@@ -1050,9 +1078,13 @@ pub fn run_with_timeout_detailed(
     // sweep that keeps [`start_detached`] thread-free.
     reap_detached_children();
 
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.stdin(if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
 
     // Pre-spawn half of the tree reaper (Unix process group; no-op on Windows).
     ChildTreeGuard::arm(&mut cmd);
@@ -1066,6 +1098,15 @@ pub fn run_with_timeout_detailed(
     })?;
     let pid = child.id();
     let tree = ChildTreeGuard::attach_armed(&child);
+
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        // Detached, never joined — see `run_with_timeout_input`. Dropping
+        // `stdin` at the end of the closure is the EOF the child waits for.
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(&input);
+        });
+    }
 
     let stdout_reader = PipeDrain::spawn(child.stdout.take());
     let stderr_reader = PipeDrain::spawn(child.stderr.take());
@@ -1406,6 +1447,44 @@ fn run_probe_inner(
 mod timeout_tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    /// The input reaches the child's stdin in full and is followed by EOF.
+    #[cfg(unix)]
+    #[test]
+    fn run_with_timeout_input_feeds_stdin_then_closes_it() {
+        let input: Vec<u8> = (0..300_000u32).flat_map(|i| i.to_le_bytes()).collect();
+        let run = run_with_timeout_input(
+            std::process::Command::new("cat"),
+            Duration::from_secs(10),
+            input.clone(),
+        )
+        .expect("spawn cat");
+        assert!(run.truncation.is_none());
+        match run.outcome {
+            TimedOutput::Completed(out) => {
+                assert!(out.status.success());
+                assert_eq!(out.stdout, input, "every byte, then EOF");
+            }
+            TimedOutput::TimedOut { .. } => panic!("cat must see EOF and exit"),
+        }
+    }
+
+    /// A child that never reads its stdin neither blocks the call nor is
+    /// blocked by it: the writer's pipe fills, the child exits, the write
+    /// fails, and the call returns promptly.
+    #[cfg(unix)]
+    #[test]
+    fn run_with_timeout_input_survives_a_child_that_ignores_stdin() {
+        let started = Instant::now();
+        let run = run_with_timeout_input(
+            std::process::Command::new("true"),
+            Duration::from_secs(10),
+            vec![b'x'; 1024 * 1024],
+        )
+        .expect("spawn true");
+        assert!(matches!(run.outcome, TimedOutput::Completed(ref o) if o.status.success()));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
 
     /// A command that blocks for far longer than any budget we hand it.
     fn sleeper() -> std::process::Command {

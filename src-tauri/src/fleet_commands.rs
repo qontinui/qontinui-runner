@@ -1236,7 +1236,7 @@ mod tests {
         );
         let mirror = crate::canonical_corpus::test_support::mirror(tmp.path(), &url);
         let snapshot = mirror.refresh().expect("refresh");
-        let canonical = mirror.load_commands(&snapshot, &[name]);
+        let canonical = mirror.load(&snapshot, &[name], &[]).expect("load").commands;
         let (registry, _) = crate::agent_commands::resolve_with(
             crate::agent_commands::FetchOutcome::NoAccount,
             None,
