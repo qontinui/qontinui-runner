@@ -629,25 +629,29 @@ fi
 # is prepended to PATH -- after every case above, which rely on the real curl
 # failing against the dead COORD_URL port.
 #
-# The stub serves four calls by URL (and, for /pr-merge/labels, by whether the
+# The stub serves five calls by URL (and, for /pr-merge/labels, by whether the
 # payload is the empty probe), logs each as one line, writes the canned body to
-# the -o file, and prints the canned status for -w.
+# the -o file, and prints the canned status for -w. The fifth is the read-back
+# (`GET /coord/agent-pr-labels`), whose query arrives as `-G --data-urlencode`
+# pairs; they are logged after the URL so a case can assert what was asked.
 STUBDIR3="$(mktemp -d)" || { echo "FAIL: mktemp -d failed for the curl stub" >&2; exit 1; }
 cleanup3() { rm -rf "$STUBDIR3"; }
 trap 'cleanup; cleanup2; cleanup3' EXIT
 {
   echo '#!/usr/bin/env bash'
-  echo 'd="$(dirname "$0")"; out=""; data=""; url=""; hdr=""'
+  echo 'd="$(dirname "$0")"; out=""; data=""; url=""; hdr=""; q=""; getflag=""'
   echo 'while [ $# -gt 0 ]; do case "$1" in'
   echo '  -o) out="$2"; shift 2 ;; -d) data="$2"; shift 2 ;; -H) hdr="$hdr|$2"; shift 2 ;;'
+  echo '  --data-urlencode) q="$q&$2"; shift 2 ;; -G) getflag=1; shift ;;'
   echo '  -w|-X|-m|--connect-timeout) shift 2 ;; -*) shift ;; *) url="$1"; shift ;; esac; done'
   echo 'case "$url" in'
   echo '  */agents/credential) k=mint ;;'
   echo '  */author-session) k=door ;;'
+  echo '  */coord/agent-pr-labels) if [ -n "$getflag" ]; then k=read; else k=read_not_get; fi ;;'
   echo '  */pr-merge/labels) case "$data" in *"\"labels\": []"*) k=probe ;; *) k=post ;; esac ;;'
   echo '  *) k=other ;; esac'
   echo 'bearer=""; case "$hdr" in *"@"*) f="${hdr##*@}"; [ -r "$f" ] && bearer="$(cat "$f")" ;; esac'
-  echo 'printf "%s %s %s\n" "$k" "$url" "$data" >> "$d/calls"'
+  echo 'printf "%s %s%s %s\n" "$k" "$url" "$q" "$data" >> "$d/calls"'
   echo '[ -n "$bearer" ] && printf "%s\n" "$bearer" >> "$d/bearers"'
   echo '[ -n "$out" ] && cat "$d/$k.body" > "$out" 2>/dev/null'
   echo 'cat "$d/$k.code"'
@@ -690,6 +694,14 @@ expect_out() { if [[ "$OUT" != *"$1"* ]]; then fail "$2: output lacks \"$1\" :: 
 expect_calls() { local n; n="$(calls_of "$1")"; if [[ "$n" != "$2" ]]; then fail "$3: expected $2 '$1' call(s), got $n :: $(cat "$STUBDIR3/calls")"; else ok; fi; }
 
 OK_POST="{\"tenant_id\":\"$T_OWN\",\"repo\":\"$REPO\",\"pr_number\":7,\"written\":1,\"deleted\":0,\"rejected\":[]}"
+# rb_body <name>... -> a GET /coord/agent-pr-labels 200 body listing those labels.
+rb_body() {
+  H_REPO="$REPO" python3 -c 'import json,os,sys
+rows=[{"name":n,"source":"coord_skill","added_at":"2026-09-23T00:00:00Z"} for n in sys.argv[1:]]
+print(json.dumps({"repo":os.environ["H_REPO"],"pr_number":7,"labels":rows,"count":len(rows)}))' "$@"
+}
+# The read-back answers "present" unless a case says otherwise.
+stub read 200 "$(rb_body "coord:stacked-on=#6")"
 
 # --- T1: PROVEN. The probe names T_OWN, the mint returns a T_OWN token, the
 # door answers 200 -> the real write goes out and the ok line names the tenant.
@@ -701,7 +713,17 @@ run_coord "coord:stacked-on=#6"
 expect_rc 0 "T1 proven"
 expect_out "owner check: proven: tenant $T_OWN owns $REPO" "T1 proven"
 expect_out "coord recorded label" "T1 proven"
+expect_out "(read back: present, source=coord_skill)" "T1 proven"
 expect_calls probe 1 "T1"; expect_calls door 1 "T1"; expect_calls post 1 "T1"
+expect_calls read 1 "T1 (read-back)"
+# The read asked about THIS PR as a GET (`-G`: without it curl would POST the
+# query as a body and coord would answer 405 -- the stub files that call as
+# `read_not_get`, so this assertion fails), url-encoded, under a bearer (two staged bearers:
+# the owner check's and the read-back's).
+if ! grep -q "^read http://127.0.0.1:1/coord/agent-pr-labels&repo=$REPO&pr_number=7 " "$STUBDIR3/calls"; then fail "T1: read-back did not ask repo=$REPO pr_number=7 :: $(cat "$STUBDIR3/calls")"; else ok; fi
+if [[ "$(grep -c '^Authorization: Bearer ' "$STUBDIR3/bearers")" != 2 ]]; then fail "T1: expected 2 bearer-carrying calls (door + read) :: $(cat "$STUBDIR3/bearers")"; else ok; fi
+# The minted token is REUSED for the read-back, not minted twice.
+expect_calls mint 1 "T1 (read-back reuses the minted token)"
 # The mint NAMED the tenant: a tenant-less mint is the defect's own shape.
 if ! grep -q "^mint .*\"tenant_id\": \"$T_OWN\"" "$STUBDIR3/calls"; then fail "T1: the mint did not send tenant_id=$T_OWN :: $(cat "$STUBDIR3/calls")"; else ok; fi
 # The probe really was the empty, merge-mode, no-op write.
@@ -719,6 +741,7 @@ expect_out "WITHHELD" "T2 refuted"
 expect_out "does NOT own $REPO" "T2 refuted"
 expect_out "gh-side label add succeeded" "T2 refuted"
 expect_calls post 0 "T2 (no wrong-tenant row)"
+expect_calls read 0 "T2 (withheld: nothing written, nothing to read back)"
 
 # --- T3: the mint ignores tenant_id and hands back ANOTHER tenant's token (a
 # coord predating the field). Using it would ask the door about the wrong
@@ -756,12 +779,21 @@ expect_calls mint 1 "T5c (expired env token skipped)"
 
 # --- T6: coord's enforce arm re-tenanted the write itself -- the probe echoes
 # no tenant_id. coord made the ownership decision; no door call is needed.
+# With the WRITE echoing no tenant either, no credential can be scoped to the
+# read-back, so the answer is UNKNOWN (rc 6) -- never a guessed tenant, never ok.
 stub probe 200 '{"written":0,"deleted":0,"rejected":[]}'
 stub post 200 '{"written":1,"deleted":0,"rejected":[]}'
 run_coord "coord:stacked-on=#6"
-expect_rc 0 "T6 enforce re-tenanted"
+expect_rc 6 "T6 enforce re-tenanted, no tenant echoed"
 expect_out "coord derived the tenant from repo ownership itself" "T6"
-expect_calls door 0 "T6"; expect_calls post 1 "T6"
+expect_out "written but read-back UNKNOWN" "T6"
+expect_calls door 0 "T6"; expect_calls post 1 "T6"; expect_calls read 0 "T6"
+if [[ "$OUT" == *"ok: coord recorded"* ]]; then fail "T6: UNKNOWN read-back printed ok :: $OUT"; else ok; fi
+# ...and when the WRITE does echo its tenant, the read-back is keyed on it.
+stub post 200 "$OK_POST"
+run_coord "coord:stacked-on=#6"
+expect_rc 0 "T6b enforce re-tenanted, write echoes tenant"
+expect_calls read 1 "T6b"
 
 # --- T7: coord's enforce arm refuses (422 repo_not_owned_by_tenant) at the
 # probe -> rc 5, no write attempted.
@@ -786,6 +818,7 @@ stub post 200 "{\"tenant_id\":\"$T_WRONG\",\"written\":1,\"deleted\":0,\"rejecte
 run_coord "coord:stacked-on=#6"
 expect_rc 4 "T9 tenant moved"
 expect_out "not the proven $T_OWN" "T9"
+expect_calls read 0 "T9 (no read-back after a tenant mismatch)"
 
 # --- T10 (review r1, HIGH): a 2xx probe that is NOT a label-set response --
 # empty, non-JSON, or a null tenant_id -- is UNKNOWN, never "enforce
@@ -818,9 +851,68 @@ COORD_URL="http://localhost:x@coord.example.test/" run_coord "coord:stacked-on=#
 expect_rc 5 "T12b userinfo-retargeted loopback url"
 expect_calls mint 0 "T12b"
 
+# ----- the write is READ BACK, and only a present row is ok -------------------
+# Plan 2026-09-10-coord-pr-labels-have-no-agent-read-door, Phase 3. Three
+# outcomes, three exits: present -> 0, a 200 WITHOUT the row -> 4 (coord
+# contradicted itself), anything that is not an answer -> 6 (UNKNOWN). The
+# absent and unknown arms are asserted to never print `ok: coord recorded`,
+# which is the line a caller greps for.
+stub probe 200 "{\"tenant_id\":\"$T_OWN\",\"written\":0,\"deleted\":0,\"rejected\":[]}"
+stub mint 200 "{\"token\":\"$(mkjwt "$T_OWN")\"}"
+stub door 200 '{"resolved":false}'
+stub post 200 "$OK_POST"
+no_ok() { if [[ "$OUT" == *"ok: coord recorded"* ]]; then fail "$1: printed ok without a present read-back :: $OUT"; else ok; fi; }
+
+# --- R1: 200 listing OTHER labels only -> a contradiction, rc 4, both bodies shown.
+stub read 200 "$(rb_body "coord:merge-strategy=squash")"
+run_coord "coord:stacked-on=#6"
+expect_rc 4 "R1 read-back absent"
+expect_out "CONTRADICTION" "R1"
+expect_out "coord said written=1" "R1"
+expect_out "coord:merge-strategy=squash" "R1 (read body shown)"
+expect_calls read 1 "R1"; no_ok "R1"
+# An EMPTY list is the same contradiction, not an UNKNOWN.
+stub read 200 "$(rb_body)"
+run_coord "coord:stacked-on=#6"
+expect_rc 4 "R1b read-back empty list"
+
+# --- R2: 404 -- including a coord that predates the door -> UNKNOWN, rc 6.
+stub read 404 '{"error":"not found"}'
+run_coord "coord:stacked-on=#6"
+expect_rc 6 "R2 read door 404"
+expect_out "written but read-back UNKNOWN" "R2"
+expect_out "PREDATES GET /coord/agent-pr-labels" "R2"
+no_ok "R2"
+
+# --- R3: unreachable (000), 401, 5xx and an unparseable 200 are all UNKNOWN.
+for spec in "000|" "401|{\"error\":\"unauthorized\"}" "503|{\"error\":\"unavailable\"}" "200|<html>captive portal</html>" "200|{\"repo\":\"x\",\"pr_number\":7}" "200|{\"repo\":\"x\",\"pr_number\":8,\"labels\":[{\"name\":\"coord:stacked-on=#6\"}]}"; do
+  stub read "${spec%%|*}" "${spec#*|}"
+  run_coord "coord:stacked-on=#6"
+  expect_rc 6 "R3 read-back [$spec]"
+  expect_out "written but read-back UNKNOWN" "R3 [$spec]"
+  no_ok "R3 [$spec]"
+done
+
+# --- R4: a bare-repo dep label is STORED canonicalized (owner/repo), so that
+# row counts as the label -- and the ok line names the stored spelling. A row
+# for a different PR number is not it (rc 4), so the match is not "any prefix".
+stub read 200 "$(rb_body "coord:downstream-of=qontinui/qontinui-web#9")"
+run_coord "coord:downstream-of=qontinui-web#9"
+expect_rc 0 "R4 canonical form"
+expect_out 'stored as "coord:downstream-of=qontinui/qontinui-web#9"' "R4"
+stub read 200 "$(rb_body "coord:downstream-of=qontinui/qontinui-web#90")"
+run_coord "coord:downstream-of=qontinui-web#9"
+expect_rc 4 "R4b near-miss PR number"
+
+# --- R5: the dry run is unchanged -- no read-back, no coord call at all.
+: > "$STUBDIR3/calls"
+OUT="$(HOME="$FAKEHOME" bash "$SCRIPT" --repo "$REPO" --pr 7 --label "coord:stacked-on=#6" --dry-run 2>&1)"; RC=$?
+expect_rc 0 "R5 dry run"
+if [[ -s "$STUBDIR3/calls" ]]; then fail "R5: --dry-run reached coord :: $(cat "$STUBDIR3/calls")"; else ok; fi
+
 # ----- report -----------------------------------------------------------------
 if [[ $FAILURES -ne 0 ]]; then
   echo "set-label self-test: $FAILURES failure(s) across $((CHECKS + FAILURES)) assertion(s)" >&2
   exit 1
 fi
-echo "set-label self-test: $CHECKS assertion(s) classified correctly (ceiling, short-form suggestion, grammar, no-send, dry-run existence caveat, gh success + failure diagnosis, owner-tenant proof before the coord write)"
+echo "set-label self-test: $CHECKS assertion(s) classified correctly (ceiling, short-form suggestion, grammar, no-send, dry-run existence caveat, gh success + failure diagnosis, owner-tenant proof before the coord write, read-back after it)"
