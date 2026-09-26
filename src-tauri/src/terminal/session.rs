@@ -4387,28 +4387,6 @@ impl TerminalSession {
             true
         };
 
-        // Revoke the terminal-bound coord-mcp key the identity seam minted for
-        // an env-referenced declared cwd, and delete its credential file (plan
-        // `2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages`).
-        // AFTER the kill, and only when the pane's process tree is known gone: the
-        // key lives in that tree's environment, and revoking it while a `claude`
-        // in the tree may still be running would 401 a live session. A failed
-        // kill keeps the key (logged). Interactive close only: one revoke
-        // re-encrypts the whole nonce store, so the deadline-bound shutdown path
-        // (`TerminalManager::close_all`) releases every tracked key in ONE
-        // synchronous write instead.
-        if deadline.is_none() {
-            if process_tree_gone {
-                crate::coord_mcp::release_terminal_bound_key(&self.id);
-            } else {
-                warn!(
-                    terminal_id = %self.id,
-                    "pane kill failed — its terminal-bound coord-mcp key (if any) is KEPT, \
-                     since a process in the tree may still be presenting it"
-                );
-            }
-        }
-
         // Drop the writer to signal EOF on stdin.
         //
         // BOUNDED + poison-recovering (Phase 2 step 5). `self.writer.lock()`
@@ -4461,6 +4439,36 @@ impl TerminalSession {
                     "waiter",
                     &self.id,
                     clamp_to_deadline(JOIN_TIMEOUT, deadline),
+                );
+            }
+        }
+
+        // Revoke the terminal-bound coord-mcp key the identity seam minted for
+        // an env-referenced declared cwd, and delete its credential file (plan
+        // `2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages`).
+        //
+        // Placed as LATE as the teardown allows: after the kill, after the
+        // writer/PTY handles are dropped (the SIGHUP point for the pane's
+        // session), and after the waiter join (the reap). A kill that returned
+        // an error keeps the key (logged). Interactive close only: one revoke
+        // re-encrypts the whole nonce store, so the deadline-bound shutdown path
+        // (`TerminalManager::close_all`) releases every tracked key in ONE
+        // synchronous write instead.
+        //
+        // **On Unix this ordering is best-effort, NOT a liveness proof.** The kill
+        // signals only the pane's direct child (SIGTERM, no process-group kill —
+        // deliberately unchanged here), and the PTY close delivers SIGHUP to the
+        // session. A descendant that survives both — a tmux server, a
+        // `nohup`/`setsid`-detached process — keeps running with the key in its
+        // environment and will 401 on it after this revoke. Recorded residual.
+        if deadline.is_none() {
+            if process_tree_gone {
+                crate::coord_mcp::release_terminal_bound_key(&self.id);
+            } else {
+                warn!(
+                    terminal_id = %self.id,
+                    "pane kill failed — its terminal-bound coord-mcp key (if any) is KEPT, \
+                     since a process in the tree may still be presenting it"
                 );
             }
         }

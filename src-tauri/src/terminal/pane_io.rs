@@ -206,6 +206,19 @@ impl LocalPty {
     }
 }
 
+/// Map a `kill(2)` return to the pane contract: `0` is success, `ESRCH` (the
+/// process is already gone) is success, anything else is an error the close
+/// path keys on — it keeps the terminal's coord-mcp key rather than revoking
+/// it under a process that may still be alive.
+#[cfg(not(target_os = "windows"))]
+fn kill_result(pid: u32, rc: i32, err: std::io::Error) -> Result<(), String> {
+    if rc == 0 || err.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(format!("kill(SIGTERM) of pid {pid} failed: {err}"))
+    }
+}
+
 impl PaneIo for LocalPty {
     fn reader(&self) -> Result<Box<dyn Read + Send>, String> {
         let master = self
@@ -283,7 +296,14 @@ impl PaneIo for LocalPty {
             let mut cmd = crate::process_helpers::no_window("taskkill");
             cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
             match crate::drain::output_with_timeout(cmd, budget) {
-                Ok(Some(_)) => Ok(()),
+                Ok(Some(out)) if out.status.success() => Ok(()),
+                // A non-zero taskkill exit is a failed kill, not a success:
+                // callers (the terminal-key revoke at close) key on it.
+                Ok(Some(out)) => Err(format!(
+                    "taskkill of pid {pid} exited {} — the tree may still be alive: {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )),
                 Ok(None) => Err(format!(
                     "taskkill of pid {pid} exceeded its {budget:?} budget — abandoned"
                 )),
@@ -293,10 +313,9 @@ impl PaneIo for LocalPty {
         #[cfg(not(target_os = "windows"))]
         {
             let _ = budget;
-            unsafe {
-                libc::kill(pid as i32, libc::SIGTERM);
-            }
-            Ok(())
+            // SAFETY: `kill(2)` with a plain pid and signal; no memory is touched.
+            let rc = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+            kill_result(pid, rc, std::io::Error::last_os_error())
         }
     }
 
@@ -372,6 +391,25 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    /// `LocalPty::kill` no longer reports a failed `kill(2)` as success: `0`
+    /// and `ESRCH` (already gone) are `Ok`, any other errno is `Err` — the
+    /// close path keeps the terminal's coord-mcp key on `Err`.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn a_failed_kill_syscall_is_an_error_not_a_success() {
+        let errno = |e| std::io::Error::from_raw_os_error(e);
+        assert!(kill_result(7, 0, errno(0)).is_ok());
+        assert!(kill_result(7, -1, errno(libc::ESRCH)).is_ok());
+        let err = kill_result(7, -1, errno(libc::EPERM)).unwrap_err();
+        assert!(err.contains("pid 7"), "{err}");
+        // And for real: signalling pid 1 as an unprivileged test process is
+        // EPERM (skipped when the suite runs as root, where it would succeed).
+        if unsafe { libc::geteuid() } != 0 {
+            let rc = unsafe { libc::kill(1, 0) };
+            assert!(kill_result(1, rc, std::io::Error::last_os_error()).is_err());
+        }
+    }
 
     /// A scripted, in-memory [`PaneIo`]: output is a fixed byte script, input
     /// lands in a shared buffer, and every control call is recorded. Proves

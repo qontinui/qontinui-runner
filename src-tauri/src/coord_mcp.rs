@@ -4204,6 +4204,15 @@ fn flush_nonce_persist_loop() {
     }
 }
 
+/// Serialises nonce-store WRITES end to end: held by
+/// [`flush_nonce_persist_once`] from `pending.take()` through the
+/// `last_written` update. Two writers exist — the debounce thread and the
+/// shutdown path's synchronous flush ([`release_all_terminal_bound_keys`]) — and
+/// without this an OLDER snapshot taken by one could have its atomic rename land
+/// after a NEWER one taken by the other, resurrecting revoked keys at the next
+/// boot. With it, a later-taken snapshot is always the later write.
+static NONCE_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Write whatever snapshot is pending (if any) to the encrypted store.
 ///
 /// On a write failure the snapshot is put BACK on the queue rather than
@@ -4212,7 +4221,29 @@ fn flush_nonce_persist_loop() {
 /// nonce registration happening to land — a transient store error would
 /// otherwise silently lose the newest bindings until the next spawn.
 fn flush_nonce_persist_once() {
-    let snapshot = match NONCE_PERSIST.lock() {
+    flush_nonce_persist_once_with(&NONCE_PERSIST, &NONCE_WRITE, |snapshot| {
+        let store = crate::secure_storage::SecureStorage::new()
+            .map_err(|e| format!("secure storage unavailable, proxy nonces not persisted: {e}"))?;
+        let to_write = snapshot_for_store(
+            &store,
+            snapshot.bindings.clone(),
+            PROXY_NONCES_RESTORED.get().is_some(),
+        );
+        store
+            .store_coord_mcp_nonce_sets(&to_write, &snapshot.graced)
+            .map_err(|e| format!("failed to persist proxy nonces: {e}"))
+    });
+}
+
+/// [`flush_nonce_persist_once`] over an explicit queue, write lock and writer —
+/// the seam that makes the take-to-write ordering unit-testable.
+fn flush_nonce_persist_once_with(
+    queue: &std::sync::Mutex<NoncePersistQueue>,
+    write_lock: &std::sync::Mutex<()>,
+    write: impl FnOnce(&NoncePersistSnapshot) -> Result<(), String>,
+) {
+    let _write_guard = write_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let snapshot = match queue.lock() {
         Ok(mut q) => match q.pending.take() {
             Some(s) => s,
             None => return,
@@ -4222,8 +4253,8 @@ fn flush_nonce_persist_once() {
     // Re-queue `snapshot` for another attempt, but never over a NEWER one a
     // concurrent `enqueue_nonce_persist` has already parked, and only while the
     // retry budget lasts.
-    fn requeue(snapshot: NoncePersistSnapshot) {
-        let Ok(mut q) = NONCE_PERSIST.lock() else {
+    let requeue = |snapshot: NoncePersistSnapshot| {
+        let Ok(mut q) = queue.lock() else {
             return;
         };
         if q.pending.is_some() {
@@ -4238,26 +4269,16 @@ fn flush_nonce_persist_once() {
             return;
         }
         q.pending = Some(snapshot);
-    }
-    match crate::secure_storage::SecureStorage::new() {
-        Ok(store) => {
-            let to_write = snapshot_for_store(
-                &store,
-                snapshot.bindings.clone(),
-                PROXY_NONCES_RESTORED.get().is_some(),
-            );
-            if let Err(e) = store.store_coord_mcp_nonce_sets(&to_write, &snapshot.graced) {
-                warn!("coord_mcp: failed to persist proxy nonces: {e}");
-                requeue(snapshot);
-                return;
-            }
-            if let Ok(mut q) = NONCE_PERSIST.lock() {
+    };
+    match write(&snapshot) {
+        Ok(()) => {
+            if let Ok(mut q) = queue.lock() {
                 q.last_written = Some(snapshot);
                 q.failed_attempts = 0;
             }
         }
         Err(e) => {
-            warn!("coord_mcp: secure storage unavailable, proxy nonces not persisted: {e}");
+            warn!("coord_mcp: {e}");
             requeue(snapshot);
         }
     }
@@ -10995,6 +11016,20 @@ fn revoke_nonce_set(nonces: &[String], cause: &str, flush_now: bool) -> usize {
     }
     for (n, g) in &graced_removed {
         if !removed.iter().any(|(r, _)| r == n) {
+            // The binding is long gone; the grace entry still knows the
+            // workdir — the same tombstone `revoke_proxy_nonce` writes.
+            record_nonce_tombstone(
+                n,
+                NonceTombstone {
+                    workdir: g.workdir.clone(),
+                    terminal_id: g.terminal_id.clone(),
+                    principal: "device",
+                    kind: TombstoneKind::Revoked,
+                    evicted_at: std::time::SystemTime::now(),
+                    grace_until: None,
+                    cause: "explicit revoke (grace registry only)".to_string(),
+                },
+            );
             log_rotation_event("revoke", &g.workdir, n, cause);
         }
     }
@@ -11078,7 +11113,9 @@ fn mint_terminal_key_for_declared_cwd(
                 .map(|n| crate::coord_mcp_config::terminal_env_name_key(n).unwrap_or("<legacy>"))
                 .collect();
             warn!(
-                "coord-mcp: terminal {terminal_id}: {cwd}/.mcp.json references terminal key                  variable(s) with key(s) {doc_keys:?}, but this cwd's key is {} — no                  terminal-bound key minted; the session presents the document's default",
+                "coord-mcp: terminal {terminal_id}: {cwd}/.mcp.json references terminal key \
+                 variable(s) with key(s) {doc_keys:?}, but this cwd's key is {} — no \
+                 terminal-bound key minted; the session presents the document's default",
                 crate::coord_mcp_config::terminal_env_key(cwd)
             );
         }
@@ -23992,5 +24029,57 @@ mod terminal_env_reference_tests {
             assert_eq!(&read_proxy_nonce(&mcp).unwrap(), n, "{wd}: same nonce");
             assert!(live_binding(n).is_some());
         }
+    }
+
+    /// Round 3 / W2: the take-to-write window is serialised, so a snapshot
+    /// taken LATER is always written LATER — even when a second flush starts
+    /// while the first is still inside its (slow) write.
+    #[test]
+    fn a_later_taken_nonce_snapshot_is_always_the_later_write() {
+        let snap = |tag: &str| NoncePersistSnapshot {
+            bindings: HashMap::from([(
+                tag.to_string(),
+                crate::secure_storage::StoredNonceBinding::default(),
+            )]),
+            graced: HashMap::new(),
+        };
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(NoncePersistQueue {
+            pending: Some(snap("first")),
+            ..Default::default()
+        }));
+        let write_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+
+        let (q, l, o) = (queue.clone(), write_lock.clone(), order.clone());
+        let first = std::thread::spawn(move || {
+            flush_nonce_persist_once_with(&q, &l, |s| {
+                started_tx.send(()).unwrap();
+                // Slow write: the second flush is started while we are here.
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                o.lock().unwrap().extend(s.bindings.keys().cloned());
+                Ok(())
+            });
+        });
+        started_rx.recv().unwrap();
+        queue.lock().unwrap().pending = Some(snap("second"));
+        let (q, l, o) = (queue.clone(), write_lock.clone(), order.clone());
+        let second = std::thread::spawn(move || {
+            flush_nonce_persist_once_with(&q, &l, |s| {
+                o.lock().unwrap().extend(s.bindings.keys().cloned());
+                Ok(())
+            });
+        });
+        first.join().unwrap();
+        second.join().unwrap();
+
+        assert_eq!(*order.lock().unwrap(), vec!["first", "second"]);
+        let q = queue.lock().unwrap();
+        assert_eq!(
+            q.last_written,
+            Some(snap("second")),
+            "the newest snapshot is durable"
+        );
+        assert!(q.pending.is_none());
     }
 }
