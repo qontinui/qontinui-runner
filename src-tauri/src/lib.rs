@@ -123,6 +123,13 @@ pub mod env_agent;
 // declaring the whole `util` directory here would not compile.
 pub mod util {
     pub mod error_chain;
+    // The EMFILE/ENFILE stamp. LIB-only on purpose: `process_helpers` is
+    // compiled into both crates, and both copies must stamp the SAME static
+    // the bin's heartbeat reads — so every caller spells it
+    // `qontinui_runner_lib::util::fd_exhaustion`, and the bin's own
+    // `util/mod.rs` must NOT declare it (a second declaration is a second,
+    // half-blind static).
+    pub mod fd_exhaustion;
 }
 
 // Device-pairing flow (headless + browser-mediated). Lifted out of
