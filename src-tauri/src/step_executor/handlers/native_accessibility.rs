@@ -12,6 +12,7 @@ use tracing::{debug, info};
 use super::{HandlerContext, StepHandler, StepHandlerResult};
 use crate::step_executor::ExecutionStepConfig;
 use qontinui_runner_lib::accessibility::model::UnifiedRole;
+use qontinui_runner_lib::accessibility::query::QueryBuilder;
 use qontinui_runner_lib::accessibility::traits::ConnectionTarget;
 use qontinui_runner_lib::accessibility::AccessibilityManager;
 
@@ -308,6 +309,52 @@ impl NativeAccessibilityHandler {
         }
     }
 
+    /// Apply the step's `a11y_query_*` filters to `builder`.
+    ///
+    /// Pure (no manager / context access) so the filter mapping is unit-testable.
+    /// Returns the user-facing failure message for an unknown role name.
+    /// Automation ID and class name filters are skipped when blank, so an empty
+    /// field left behind by a step editor does not filter every node out.
+    fn build_query(
+        step: &ExecutionStepConfig,
+        mut builder: QueryBuilder,
+    ) -> Result<QueryBuilder, String> {
+        if let Some(ref role_str) = step.a11y_query_role {
+            // Deserialize the role string via serde (uses rename_all = "snake_case").
+            match serde_json::from_value::<UnifiedRole>(serde_json::Value::String(role_str.clone()))
+            {
+                Ok(role) => {
+                    builder = builder.by_role(role);
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "Unknown accessibility role: '{}'. \
+                         Use snake_case role names (e.g. 'button', 'textbox').",
+                        role_str
+                    ));
+                }
+            }
+        }
+
+        if let Some(ref label) = step.a11y_query_label {
+            builder = builder.by_label(label.as_str());
+        }
+
+        if let Some(id) = non_blank(step.a11y_query_automation_id.as_deref()) {
+            builder = builder.by_automation_id(id);
+        }
+
+        if let Some(class_name) = non_blank(step.a11y_query_class_name.as_deref()) {
+            builder = builder.by_class_name(class_name);
+        }
+
+        if step.a11y_interactive_only.unwrap_or(false) {
+            builder = builder.interactive();
+        }
+
+        Ok(builder)
+    }
+
     async fn action_query(
         &self,
         step: &ExecutionStepConfig,
@@ -330,32 +377,10 @@ impl NativeAccessibilityHandler {
         };
 
         // Build query from step fields.
-        let mut builder = mgr.query();
-
-        if let Some(ref role_str) = step.a11y_query_role {
-            // Deserialize the role string via serde (uses rename_all = "snake_case").
-            match serde_json::from_value::<UnifiedRole>(serde_json::Value::String(role_str.clone()))
-            {
-                Ok(role) => {
-                    builder = builder.by_role(role);
-                }
-                Err(_) => {
-                    return StepHandlerResult::failure(format!(
-                        "Unknown accessibility role: '{}'. \
-                         Use snake_case role names (e.g. 'button', 'textbox').",
-                        role_str
-                    ));
-                }
-            }
-        }
-
-        if let Some(ref label) = step.a11y_query_label {
-            builder = builder.by_label(label.as_str());
-        }
-
-        if step.a11y_interactive_only.unwrap_or(false) {
-            builder = builder.interactive();
-        }
+        let builder = match Self::build_query(step, mgr.query()) {
+            Ok(b) => b,
+            Err(e) => return StepHandlerResult::failure(e),
+        };
 
         let results = builder.find_all(&snapshot.root);
 
@@ -414,6 +439,11 @@ impl NativeAccessibilityHandler {
     }
 }
 
+/// Trimmed value of an optional string field, or `None` when absent or blank.
+fn non_blank(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|v| !v.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,5 +493,137 @@ mod tests {
             ConnectionTarget::WindowTitle(title) => assert_eq!(title, "pid:notanumber"),
             other => panic!("Expected WindowTitle fallback, got {:?}", other),
         }
+    }
+
+    /// Hand-built tree: two buttons sharing a class, one with a distinct
+    /// automation ID, plus a textbox. Built via serde because
+    /// `UnifiedNode::default()` is test-only inside the lib crate.
+    fn query_tree() -> qontinui_runner_lib::accessibility::model::UnifiedNode {
+        serde_json::from_value(json!({
+            "ref": "@e0",
+            "role": "window",
+            "name": "App",
+            "children": [
+                {
+                    "ref": "@e1",
+                    "role": "button",
+                    "name": "Save",
+                    "is_interactive": true,
+                    "automation_id": "btn_save",
+                    "class_name": "PushButton"
+                },
+                {
+                    "ref": "@e2",
+                    "role": "button",
+                    "name": "Cancel",
+                    "is_interactive": true,
+                    "automation_id": "btn_cancel",
+                    "class_name": "PushButton"
+                },
+                {
+                    "ref": "@e3",
+                    "role": "textbox",
+                    "name": "Filename",
+                    "is_interactive": true,
+                    "automation_id": "txt_name",
+                    "class_name": "Edit"
+                }
+            ]
+        }))
+        .expect("test tree deserializes")
+    }
+
+    fn query_refs(step: &ExecutionStepConfig) -> Vec<String> {
+        let tree = query_tree();
+        let builder = NativeAccessibilityHandler::build_query(step, QueryBuilder::new())
+            .expect("query builds");
+        builder
+            .find_all(&tree)
+            .into_iter()
+            .map(|n| n.ref_id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn test_build_query_by_automation_id_narrows() {
+        let step = ExecutionStepConfig {
+            a11y_query_automation_id: Some("btn_cancel".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(query_refs(&step), vec!["@e2"]);
+    }
+
+    #[test]
+    fn test_build_query_by_class_name_narrows() {
+        let step = ExecutionStepConfig {
+            a11y_query_class_name: Some("PushButton".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(query_refs(&step), vec!["@e1", "@e2"]);
+    }
+
+    #[test]
+    fn test_build_query_automation_id_and_class_name_combine() {
+        let step = ExecutionStepConfig {
+            a11y_query_class_name: Some("PushButton".to_string()),
+            a11y_query_automation_id: Some("btn_save".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(query_refs(&step), vec!["@e1"]);
+
+        // Mismatched pair → no results (filters are ANDed).
+        let step = ExecutionStepConfig {
+            a11y_query_class_name: Some("Edit".to_string()),
+            a11y_query_automation_id: Some("btn_save".to_string()),
+            ..Default::default()
+        };
+        assert!(query_refs(&step).is_empty());
+    }
+
+    #[test]
+    fn test_build_query_combines_with_role() {
+        let step = ExecutionStepConfig {
+            a11y_query_role: Some("textbox".to_string()),
+            a11y_query_class_name: Some("PushButton".to_string()),
+            ..Default::default()
+        };
+        assert!(query_refs(&step).is_empty());
+    }
+
+    #[test]
+    fn test_build_query_blank_filters_are_ignored() {
+        let step = ExecutionStepConfig {
+            a11y_query_role: Some("button".to_string()),
+            a11y_query_automation_id: Some("   ".to_string()),
+            a11y_query_class_name: Some(String::new()),
+            ..Default::default()
+        };
+        assert_eq!(query_refs(&step), vec!["@e1", "@e2"]);
+    }
+
+    #[test]
+    fn test_build_query_trims_automation_id() {
+        let step = ExecutionStepConfig {
+            a11y_query_automation_id: Some("  txt_name ".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(query_refs(&step), vec!["@e3"]);
+    }
+
+    #[test]
+    fn test_build_query_unknown_role_errors() {
+        let step = ExecutionStepConfig {
+            a11y_query_role: Some("not_a_role".to_string()),
+            a11y_query_automation_id: Some("btn_save".to_string()),
+            ..Default::default()
+        };
+        let err = NativeAccessibilityHandler::build_query(&step, QueryBuilder::new())
+            .err()
+            .expect("unknown role must fail");
+        assert_eq!(
+            err,
+            "Unknown accessibility role: 'not_a_role'. \
+             Use snake_case role names (e.g. 'button', 'textbox')."
+        );
     }
 }
