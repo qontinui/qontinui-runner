@@ -323,6 +323,10 @@ pub(super) enum DispatchRoute {
     Legacy(LegacyStep),
     /// Neither typed, registered, nor legacy.
     Unknown,
+    /// A conversion seam could not parse the step
+    /// ([`ExecutionStepConfig::conversion_error`]); the step fails with this
+    /// message.
+    ConversionFailed(String),
 }
 
 /// Decide where a step goes. Pure, so the routing is testable without a
@@ -331,6 +335,9 @@ pub(super) fn resolve_dispatch(
     step: &ExecutionStepConfig,
     registry: &HandlerRegistry,
 ) -> DispatchRoute {
+    if let Some(error) = &step.conversion_error {
+        return DispatchRoute::ConversionFailed(error.clone());
+    }
     // "test" is a backward-compat alias with no `FullRunnerStep` variant; it
     // is served by the command handler.
     if step.step_type == "test" {
@@ -1612,6 +1619,10 @@ impl StepExecutor {
                     None,
                     None,
                 );
+            }
+            DispatchRoute::ConversionFailed(error) => {
+                warn!("Step failed at conversion: {}", error);
+                return (false, Some(error), None, None);
             }
             DispatchRoute::Legacy(legacy) => legacy,
         };
