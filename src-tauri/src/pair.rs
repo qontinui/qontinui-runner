@@ -4067,6 +4067,13 @@ pub struct BindingStoreMergeReport {
     /// Non-canonical copies absorbed, each with the `.superseded-<date>`
     /// name it now carries.
     pub superseded: Vec<(PathBuf, PathBuf)>,
+    /// Copies that were read and folded in but deliberately LEFT IN PLACE
+    /// rather than renamed: the bare default (which belongs to this box's
+    /// ordinarily configured runner, not to an override-carrying process),
+    /// or a copy the canonical does not provably account for. Absorbing is
+    /// non-destructive; renaming is the only destructive act here, and it is
+    /// withheld whenever it could be pure loss.
+    pub retained: Vec<PathBuf>,
     /// Copies that exist but could NOT be read or parsed. UNKNOWN: they are
     /// neither merged nor renamed, because absorbing a file whose contents
     /// were never established is not a merge, and renaming it would hide the
@@ -4102,9 +4109,15 @@ pub fn converge_binding_store() -> BindingStoreMergeReport {
     };
     let mgr = crate::auth::AuthManager::new();
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    // The bare `data_local_dir()` default, passed EXPLICITLY rather than
+    // re-read inside the core: it is the one path that must never be renamed
+    // by an override-carrying process, and a core that resolved it from
+    // ambient env would leave that rule unexercised by every temp-home test.
+    let bare_default = paired_user_path_with(None);
     let report = converge_binding_store_with(
         canonical,
         others,
+        bare_default.as_deref(),
         &|t: &uuid::Uuid, is_default: bool| {
             crate::auth::holds_credential_for(
                 crate::auth::read_tenant_slot(&mgr, t).state(),
@@ -4114,10 +4127,15 @@ pub fn converge_binding_store() -> BindingStoreMergeReport {
         },
         &today,
     );
-    if report.wrote_canonical || !report.superseded.is_empty() || !report.unreadable.is_empty() {
+    if report.wrote_canonical
+        || !report.superseded.is_empty()
+        || !report.unreadable.is_empty()
+        || !report.retained.is_empty()
+    {
         tracing::info!(
             "converge_binding_store: canonical={} merged={:?} refreshed={:?} \
-             migrated_legacy={} superseded={:?} withheld_no_credential={:?} unreadable={:?}",
+             migrated_legacy={} superseded={:?} retained={:?} \
+             withheld_no_credential={:?} unreadable={:?}",
             canonical.display(),
             report.merged,
             report.refreshed,
@@ -4126,6 +4144,11 @@ pub fn converge_binding_store() -> BindingStoreMergeReport {
                 .superseded
                 .iter()
                 .map(|(a, b)| format!("{} -> {}", a.display(), b.display()))
+                .collect::<Vec<_>>(),
+            report
+                .retained
+                .iter()
+                .map(|p| p.display().to_string())
                 .collect::<Vec<_>>(),
             report.withheld_no_credential,
             report.unreadable,
@@ -4140,9 +4163,17 @@ pub fn converge_binding_store() -> BindingStoreMergeReport {
 ///
 /// `holds_credential(tenant, is_default)` is [`crate::auth::holds_credential_for`]
 /// in production; `None` is UNKNOWN and is treated as "do not widen".
+/// `bare_default` is the `data_local_dir()` path — the store this box's
+/// ORDINARILY CONFIGURED runner reads. It is a parameter rather than an
+/// ambient `paired_user_path_with(None)` read precisely so a temp-home test
+/// can exercise the rule that protects it; resolving it inside this fn would
+/// make it resolve to the developer's real home in every test and leave the
+/// one guard that matters permanently unreached. `None` means "no bare
+/// default applies here", which is what every hermetic test passes.
 pub(crate) fn converge_binding_store_with(
     canonical: &std::path::Path,
     others: &[PathBuf],
+    bare_default: Option<&std::path::Path>,
     holds_credential: &dyn Fn(&uuid::Uuid, bool) -> Option<bool>,
     today: &str,
 ) -> BindingStoreMergeReport {
@@ -4155,6 +4186,22 @@ pub(crate) fn converge_binding_store_with(
     let Some(base) = read_paired_user_file_at(canonical) else {
         if canonical.exists() {
             report.unreadable.push(canonical.to_path_buf());
+        } else {
+            // Say so. This branch used to return an all-empty report, whose
+            // caller's log guard then emitted NOTHING — so a runner starting
+            // with no binding store at all, which is the exact state a lost
+            // `paired_user.json` leaves behind, logged not one line from this
+            // path. Three days of forensics on merytshost turned on that
+            // silence. `siblings` names any `.superseded-*` left by an earlier
+            // pass, which is where the recovery evidence lives.
+            let siblings = superseded_siblings(canonical);
+            tracing::warn!(
+                "converge_binding_store: canonical {} is ABSENT — this runner has no binding \
+                 store, so it will report itself unpaired (tier, device_is_paired, the \
+                 device-JWT refresher). Nothing was merged or renamed. Superseded siblings \
+                 on disk: {siblings:?}",
+                canonical.display()
+            );
         }
         return report;
     };
@@ -4163,6 +4210,10 @@ pub(crate) fn converge_binding_store_with(
     let mut bindings: Vec<PairedBinding> = base.effective_bindings();
     let default_tenant = base.effective_default_tenant_id();
     let mut changed = false;
+    // Copies whose contents were read and folded in, with the bindings each
+    // one carried. Renaming is deferred until after the canonical write so a
+    // supersede can never be pure loss — see `supersede_verdict`.
+    let mut absorbed: Vec<(PathBuf, Vec<PairedBinding>)> = Vec::new();
 
     for other in others {
         if !other.exists() {
@@ -4179,7 +4230,11 @@ pub(crate) fn converge_binding_store_with(
             continue;
         };
 
-        for cand in pf.effective_bindings() {
+        // Captured once: the fold consumes it, and the deferred supersede pass
+        // needs the same set to decide whether this copy is accounted for.
+        let other_bindings = pf.effective_bindings();
+
+        for cand in other_bindings.iter().cloned() {
             let key = cand.tenant_id.trim().to_string();
             match bindings
                 .iter_mut()
@@ -4235,14 +4290,9 @@ pub(crate) fn converge_binding_store_with(
         }
 
         // Absorbed: the copy's contents were read and folded in (even when
-        // that folded in nothing). Supersede it so no future reader picks it.
-        match supersede_copy(other, today) {
-            Ok(to) => report.superseded.push((other.clone(), to)),
-            Err(e) => tracing::warn!(
-                "converge_binding_store: could not supersede {}: {e}",
-                other.display()
-            ),
-        }
+        // that folded in nothing). Whether it may also be RENAMED is decided
+        // after the canonical write, not here — see `absorbed` below.
+        absorbed.push((other.clone(), other_bindings));
     }
 
     // The legacy shape is migrated IN PLACE by the existing
@@ -4253,6 +4303,11 @@ pub(crate) fn converge_binding_store_with(
         report.migrated_legacy = true;
         changed = true;
     }
+
+    // The merged set, captured before `bindings` is moved into the written
+    // file. This is what the canonical holds once this pass is done — whether
+    // it was just written, or already carried everything (`!changed`).
+    let canonical_bindings = bindings.clone();
 
     if changed {
         // Mirrors track the DEFAULT binding (D4), exactly as
@@ -4277,7 +4332,242 @@ pub(crate) fn converge_binding_store_with(
         }
     }
 
+    // ---- Deferred supersede -------------------------------------------
+    //
+    // A rename here used to run inside the fold loop, unconditionally for
+    // every readable copy. That made a supersede able to be PURE LOSS: when
+    // the fold changed nothing the canonical was never written, yet the copy
+    // was still renamed away — and because the only copy this function can
+    // ever see is the bare default (see `binding_store_candidate_paths_with`),
+    // the file destroyed was another, live installation's binding store.
+    //
+    // Measured on merytshost 2026-09-23: a temporary instance runner
+    // (`$QONTINUI_SECURE_STORAGE_DIR` under `com.qontinui.runner/instances/`)
+    // logged `merged=[] refreshed=[] migrated_legacy=false` and superseded
+    // `~/.local/share/com.qontinui.runner/paired_user.json` — the PRIMARY
+    // runner's store. The primary's `device_jwt_refresher` then read the
+    // missing file as "runner not paired yet" and idled for 41 h without ever
+    // attempting a mint, while the relay was 1008-rejected for an expired
+    // device JWT. Plan
+    // `2026-09-25-instance-runner-deletes-the-primary-binding-store-and-the-refresher-calls-the-device-unpaired`.
+    //
+    // Two rules now hold, and they are independent:
+    //
+    // 1. NEVER rename the bare default while running under an override. The
+    //    bare default is not a stray copy — it is the path the ordinarily
+    //    configured installation on this box reads. Absorbing it is
+    //    non-destructive and still happens; retiring it is not this process's
+    //    call to make. (This is the rule that would have prevented the
+    //    incident on its own.)
+    // 2. Never rename a copy the canonical does not provably now account for:
+    //    the canonical must reflect the merged set — either because we just
+    //    wrote it, or because nothing needed writing — and every binding the
+    //    copy carried must be present in that set or explicitly recorded in
+    //    `withheld_no_credential`.
+    for (other, other_bindings) in absorbed {
+        match supersede_verdict(
+            &other,
+            &other_bindings,
+            canonical,
+            bare_default,
+            &canonical_bindings,
+            changed,
+            report.wrote_canonical,
+        ) {
+            SupersedeVerdict::Rename => match supersede_copy(&other, today) {
+                Ok(to) => report.superseded.push((other.clone(), to)),
+                Err(e) => tracing::warn!(
+                    "converge_binding_store: could not supersede {}: {e}",
+                    other.display()
+                ),
+            },
+            SupersedeVerdict::RetainCanonical => {
+                tracing::warn!(
+                    "converge_binding_store: refusing to supersede {} — it IS the canonical; \
+                     renaming it would leave this runner with no binding store at all.",
+                    other.display()
+                );
+                report.retained.push(other);
+            }
+            SupersedeVerdict::RetainBareDefault => {
+                tracing::info!(
+                    "converge_binding_store: absorbed {} but LEFT IT IN PLACE — it is the bare \
+                     default path, which belongs to this box's ordinarily configured runner, \
+                     not to this override-carrying process. Its bindings were merged here; \
+                     retiring its file is not this process's call to make.",
+                    other.display()
+                );
+                report.retained.push(other);
+            }
+            SupersedeVerdict::RetainWriteFailed => {
+                tracing::warn!(
+                    "converge_binding_store: absorbed {} but LEFT IT IN PLACE — the canonical \
+                     write that was owed for this merge FAILED, so renaming this copy would \
+                     lose every binding it carries.",
+                    other.display()
+                );
+                report.retained.push(other);
+            }
+            SupersedeVerdict::RetainUnaccounted(tenants) => {
+                tracing::warn!(
+                    "converge_binding_store: absorbed {} but LEFT IT IN PLACE — tenant(s) \
+                     {tenants:?} it carries are NOT in the canonical's merged set (withheld for \
+                     lack of a credential, or dropped). Renaming it would destroy the only \
+                     local record that this device was ever paired to them.",
+                    other.display()
+                );
+                report.retained.push(other);
+            }
+        }
+    }
+
     report
+}
+
+/// Whether an absorbed copy may also be RENAMED, and if not, why not.
+///
+/// Absorbing a copy (reading it and folding its bindings into the canonical) is
+/// non-destructive. The rename is the only destructive act in
+/// [`converge_binding_store_with`], so it is decided here, as a pure function,
+/// AFTER the canonical write — never inside the fold loop, which is where it
+/// used to live and where it could be pure loss.
+///
+/// The three refusals are independent, and each has a measured incident or a
+/// concrete loss behind it:
+///
+/// - [`SupersedeVerdict::RetainBareDefault`] — the copy is the bare
+///   `data_local_dir()` default while THIS process runs under a
+///   `$QONTINUI_SECURE_STORAGE_DIR` override. That file is not a stray copy: it
+///   is the store the ordinarily configured runner on this box reads. On
+///   merytshost, 2026-09-23T16:03:33, a temporary instance runner whose override
+///   pointed at `com.qontinui.runner/instances/test-1a0ce93cab6-2/` renamed the
+///   PRIMARY runner's `paired_user.json` away and — because its fold changed
+///   nothing — wrote no canonical either. The primary then read itself as
+///   unpaired for 41 h: its device-JWT refresher bailed at
+///   `read_paired_user_id_from_disk() == None` on every tick without attempting a
+///   mint, its device JWT expired, and the relay was 1008-rejected
+///   ("Device token has expired") until an operator re-paired it. The bare
+///   default's own owner converges it when IT starts, where `others` is empty by
+///   construction and this function is never reached.
+/// - [`SupersedeVerdict::RetainWriteFailed`] — a write was owed and failed.
+/// - [`SupersedeVerdict::RetainUnaccounted`] — the canonical does not hold every
+///   binding the copy did. Being recorded in `withheld_no_credential` does NOT
+///   qualify: a withheld tenant was deliberately not merged, so renaming its only
+///   local record away destroys the sole evidence this device was ever paired to
+///   it.
+///
+/// Note the `changed == false` case is a legitimate RENAME, not a refusal: a fold
+/// that changed nothing left a canonical that already held everything, which is
+/// just as current as one that was rewritten. Gating on `wrote_canonical`
+/// unconditionally would make two copies on a legitimately override-configured
+/// box converge never.
+pub(crate) fn supersede_verdict(
+    other: &std::path::Path,
+    other_bindings: &[PairedBinding],
+    canonical: &std::path::Path,
+    bare_default: Option<&std::path::Path>,
+    canonical_bindings: &[PairedBinding],
+    changed: bool,
+    wrote_canonical: bool,
+) -> SupersedeVerdict {
+    // The canonical is never a supersede candidate: renaming it away is the
+    // incident state itself (a runner left with no binding store). Production
+    // cannot reach this — `binding_store_candidate_paths_with` dedupes — but a
+    // guard whose only protection is a caller's dedupe is not a guard.
+    if other == canonical {
+        return SupersedeVerdict::RetainCanonical;
+    }
+    if bare_default == Some(other) {
+        return SupersedeVerdict::RetainBareDefault;
+    }
+    if changed && !wrote_canonical {
+        return SupersedeVerdict::RetainWriteFailed;
+    }
+    // A copy carrying NO bindings is never provably accounted for: an empty
+    // `unaccounted` would otherwise wave through a legacy file whose `user_id`
+    // is the only thing on it — and `read_paired_user_id_from_disk` reading
+    // exactly that value is what the 41 h outage turned on.
+    if other_bindings.is_empty() {
+        return SupersedeVerdict::RetainUnaccounted(Vec::new());
+    }
+    // Account by the WHOLE binding, not by tenant id. A copy recording that
+    // tenant T was paired by user A is not accounted for by a canonical that
+    // records T paired by user B, nor by one whose `paired_at` is older — in
+    // both cases the rename would destroy a record nothing else holds.
+    let unaccounted: Vec<String> = other_bindings
+        .iter()
+        .filter(|b| {
+            !canonical_bindings.iter().any(|c| {
+                c.tenant_id.trim() == b.tenant_id.trim()
+                    && c.user_id == b.user_id
+                    && c.paired_at >= b.paired_at
+            })
+        })
+        .map(|b| b.tenant_id.trim().to_string())
+        .collect();
+    if !unaccounted.is_empty() {
+        return SupersedeVerdict::RetainUnaccounted(unaccounted);
+    }
+    SupersedeVerdict::Rename
+}
+
+/// Outcome of [`supersede_verdict`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SupersedeVerdict {
+    /// Safe to rename to `.superseded-<date>`.
+    Rename,
+    /// The "copy" IS the canonical. Renaming it leaves no binding store at all.
+    RetainCanonical,
+    /// The copy is another installation's live store. Absorbed, left in place.
+    RetainBareDefault,
+    /// A canonical write was owed for this merge and failed.
+    RetainWriteFailed,
+    /// The named tenants are not in the canonical's merged set.
+    RetainUnaccounted(Vec<String>),
+}
+
+/// The `paired_user.json.superseded-*` names sitting beside `canonical`, newest
+/// mtime first. Reported in the absent-canonical warning so the one line an
+/// operator greps also names where the lost bindings still are. Best-effort: an
+/// unreadable directory yields an empty list, which is UNKNOWN and is logged as
+/// such by the caller's wording ("siblings on disk"), never as "none exist".
+fn superseded_siblings(canonical: &std::path::Path) -> Vec<String> {
+    let Some(dir) = canonical.parent() else {
+        return Vec::new();
+    };
+    let Some(stem) = canonical.file_name().and_then(|s| s.to_str()) else {
+        return Vec::new();
+    };
+    let prefix = format!("{stem}.superseded-");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(String, u64)> = entries
+        .flatten()
+        .filter_map(|e| {
+            // `to_string_lossy` rather than `to_str()?`: this fn's whole job is
+            // to name where the lost bindings are, and a silently skipped entry
+            // is the absence-vs-UNKNOWN confusion the rest of this file avoids.
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !name.starts_with(&prefix) {
+                return None;
+            }
+            let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+            Some((name, size))
+        })
+        .collect();
+    // Order by the embedded supersede DATE (the name), newest first — NOT by
+    // mtime: `fs::rename` preserves mtime, so a superseded file's mtime is when
+    // its CONTENT was last written, not when it was set aside. On merytshost
+    // the two 379-byte copies share an mtime to the nanosecond while the
+    // 751-byte one (both bindings, the rich copy) is the OLDEST by mtime and
+    // would sort last. Size is carried so the rich copy is identifiable from
+    // the single warning line.
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found
+        .into_iter()
+        .map(|(n, size)| format!("{n} ({size}B)"))
+        .collect()
 }
 
 /// Rename an absorbed copy to `paired_user.json.superseded-<date>`. Never
@@ -4655,6 +4945,7 @@ mod one_binding_store_tests {
         let report = converge_binding_store_with(
             &b.roaming_legacy,
             &[b.local.clone()],
+            None,
             &credentialed,
             "2026-09-20",
         );
@@ -4738,7 +5029,8 @@ mod one_binding_store_tests {
         );
         write(&other, &v2("2026-09-17T15:42:00Z", "2026-06-01T00:00:00Z"));
 
-        let report = converge_binding_store_with(&canonical, &[other], &credentialed, "2026-09-20");
+        let report =
+            converge_binding_store_with(&canonical, &[other], None, &credentialed, "2026-09-20");
         assert_eq!(report.refreshed, vec![DEFAULT_TENANT.to_string()]);
 
         let merged = read_back(&canonical);
@@ -4791,7 +5083,8 @@ mod one_binding_store_tests {
             ),
         );
 
-        let report = converge_binding_store_with(&canonical, &[other], &credentialed, "2026-09-20");
+        let report =
+            converge_binding_store_with(&canonical, &[other], None, &credentialed, "2026-09-20");
 
         assert!(
             report.merged.is_empty(),
@@ -4844,7 +5137,8 @@ mod one_binding_store_tests {
             "an unreadable store must read as UNKNOWN, not as false"
         );
 
-        let report = converge_binding_store_with(&canonical, &[other], &unknown, "2026-09-20");
+        let report =
+            converge_binding_store_with(&canonical, &[other], None, &unknown, "2026-09-20");
         assert!(report.merged.is_empty());
         assert_eq!(
             report.withheld_no_credential,
@@ -4871,8 +5165,13 @@ mod one_binding_store_tests {
         );
         write(&other, "{ this is not json");
 
-        let report =
-            converge_binding_store_with(&canonical, &[other.clone()], &credentialed, "2026-09-20");
+        let report = converge_binding_store_with(
+            &canonical,
+            &[other.clone()],
+            None,
+            &credentialed,
+            "2026-09-20",
+        );
         assert_eq!(report.unreadable, vec![other.clone()]);
         assert!(
             report.superseded.is_empty(),
@@ -5017,8 +5316,13 @@ mod one_binding_store_tests {
         let other = tmp.path().join("other/paired_user.json");
         write(&other, &v2("2026-07-21T09:00:00Z", "2026-07-21T09:00:00Z"));
 
-        let report =
-            converge_binding_store_with(&canonical, &[other.clone()], &credentialed, "2026-09-20");
+        let report = converge_binding_store_with(
+            &canonical,
+            &[other.clone()],
+            None,
+            &credentialed,
+            "2026-09-20",
+        );
         assert_eq!(report, BindingStoreMergeReport::default());
         assert!(!canonical.exists());
         assert!(other.exists(), "and the other copy is left alone");
@@ -5036,10 +5340,16 @@ mod one_binding_store_tests {
 
         let other = tmp.path().join("other/paired_user.json");
         write(&other, &v2("2026-07-21T09:00:00Z", "2026-07-21T09:00:00Z"));
-        let r1 =
-            converge_binding_store_with(&canonical, &[other.clone()], &credentialed, "2026-09-20");
+        let r1 = converge_binding_store_with(
+            &canonical,
+            &[other.clone()],
+            None,
+            &credentialed,
+            "2026-09-20",
+        );
         write(&other, &v2("2026-07-22T09:00:00Z", "2026-07-22T09:00:00Z"));
-        let r2 = converge_binding_store_with(&canonical, &[other], &credentialed, "2026-09-20");
+        let r2 =
+            converge_binding_store_with(&canonical, &[other], None, &credentialed, "2026-09-20");
 
         let n1 = &r1.superseded[0].1;
         let n2 = &r2.superseded[0].1;
@@ -5097,5 +5407,310 @@ mod one_binding_store_tests {
             None,
             "an unreadable default slot is UNKNOWN, never a measured no"
         );
+    }
+}
+
+#[cfg(test)]
+mod supersede_is_never_pure_loss_tests {
+    use super::*;
+    use std::path::Path;
+
+    const T_DEFAULT: &str = "c231d9da-1111-4111-8111-111111111111";
+    const T_SECOND: &str = "7ac125b6-2222-4222-8222-222222222222";
+    const USER: &str = "11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+    fn binding(tenant: &str) -> PairedBinding {
+        PairedBinding {
+            tenant_id: tenant.to_string(),
+            user_id: USER.to_string(),
+            paired_at: Some("2026-09-23T19:53:19Z".to_string()),
+        }
+    }
+
+    /// THE RECORDED INCIDENT, reduced to its predicate.
+    ///
+    /// merytshost, 2026-09-23T16:03:33: a temporary instance runner whose
+    /// `$QONTINUI_SECURE_STORAGE_DIR` pointed at
+    /// `com.qontinui.runner/instances/test-1a0ce93cab6-2/` folded the PRIMARY
+    /// runner's `~/.local/share/com.qontinui.runner/paired_user.json` into its
+    /// own throwaway canonical, changed nothing (`merged=[] refreshed=[]
+    /// migrated_legacy=false`), wrote no canonical — and renamed the primary's
+    /// file to `.superseded-2026-09-23` anyway. The primary was left with no
+    /// binding store at all and reported itself unpaired for 41 h.
+    ///
+    /// The bare default is never this process's to retire.
+    #[test]
+    fn an_instance_runner_never_renames_the_primarys_binding_store() {
+        let primary = Path::new("/home/u/.local/share/com.qontinui.runner/paired_user.json");
+        let instance_canonical = Path::new(
+            "/home/u/.config/com.qontinui.runner/instances/test-1a0ce93cab6-2/paired_user.json",
+        );
+        let carried = vec![binding(T_DEFAULT)];
+
+        let verdict = supersede_verdict(
+            primary,
+            &carried,
+            instance_canonical,
+            Some(primary),
+            // The instance's canonical already carried the same tenant, which
+            // is exactly why nothing merged and nothing was written.
+            &carried,
+            /* changed */ false,
+            /* wrote_canonical */ false,
+        );
+
+        assert_eq!(
+            verdict,
+            SupersedeVerdict::RetainBareDefault,
+            "an override-carrying process must never rename the bare default — that file \
+             belongs to this box's ordinarily configured runner"
+        );
+    }
+
+    /// The canonical is never a supersede candidate. Production cannot reach
+    /// this (`binding_store_candidate_paths_with` dedupes textually), but a
+    /// guard whose only protection is a caller's dedupe is not a guard:
+    /// renaming the canonical leaves the runner with no binding store at all,
+    /// which IS the incident state.
+    #[test]
+    fn the_canonical_is_never_superseded_against_itself() {
+        let default = Path::new("/home/u/.local/share/com.qontinui.runner/paired_user.json");
+        let carried = vec![binding(T_DEFAULT)];
+        let verdict = supersede_verdict(
+            default,
+            &carried,
+            default,
+            Some(default),
+            &carried,
+            false,
+            false,
+        );
+        assert_eq!(verdict, SupersedeVerdict::RetainCanonical);
+    }
+
+    /// A copy carrying no bindings at all — a legacy file whose `user_id` is
+    /// the only thing on it. An emptiness that produced an empty `unaccounted`
+    /// would wave the rename through and destroy exactly the value
+    /// `read_paired_user_id_from_disk` reads, which is what the 41 h outage
+    /// turned on.
+    #[test]
+    fn a_copy_carrying_no_bindings_is_never_provably_accounted_for() {
+        let other = Path::new("/srv/old-profile/paired_user.json");
+        let canonical = Path::new("/srv/new-profile/paired_user.json");
+        let verdict = supersede_verdict(
+            other,
+            &[],
+            canonical,
+            None,
+            &[binding(T_DEFAULT)],
+            false,
+            false,
+        );
+        assert_eq!(verdict, SupersedeVerdict::RetainUnaccounted(Vec::new()));
+    }
+
+    /// Accounting is by the WHOLE binding, not the tenant id: a canonical that
+    /// records tenant T paired by a DIFFERENT user does not account for this
+    /// copy's record, and renaming it would destroy the only evidence of that
+    /// pairing. Tenant-key-only accounting called this `Rename`.
+    #[test]
+    fn a_same_tenant_different_user_binding_is_not_accounted_for() {
+        let other = Path::new("/srv/old-profile/paired_user.json");
+        let canonical = Path::new("/srv/new-profile/paired_user.json");
+        let mine = binding(T_DEFAULT);
+        let mut theirs = binding(T_DEFAULT);
+        theirs.user_id = "22222222-bbbb-4bbb-8bbb-bbbbbbbbbbbb".to_string();
+        let verdict = supersede_verdict(other, &[mine], canonical, None, &[theirs], false, false);
+        assert_eq!(
+            verdict,
+            SupersedeVerdict::RetainUnaccounted(vec![T_DEFAULT.to_string()])
+        );
+    }
+
+    /// A fold that changed nothing is still a SUCCESSFUL absorb: the canonical
+    /// already held everything the copy did. Refusing here would make two
+    /// copies on a legitimately override-configured box converge never — the
+    /// incoherence of gating a supersede on `wrote_canonical` unconditionally.
+    #[test]
+    fn a_fold_that_changed_nothing_still_converges_a_non_default_copy() {
+        let other = Path::new("/srv/old-profile/paired_user.json");
+        let canonical = Path::new("/srv/new-profile/paired_user.json");
+        let carried = vec![binding(T_DEFAULT)];
+        let verdict = supersede_verdict(
+            other,
+            &carried,
+            canonical,
+            Some(Path::new(
+                "/home/u/.local/share/com.qontinui.runner/paired_user.json",
+            )),
+            &carried,
+            /* changed */ false,
+            /* wrote_canonical */ false,
+        );
+        assert_eq!(
+            verdict,
+            SupersedeVerdict::Rename,
+            "nothing was owed, so nothing failed; the canonical already holds it all"
+        );
+    }
+
+    /// A write that WAS owed and failed leaves the canonical stale. Renaming
+    /// the copy then loses every binding it carried.
+    #[test]
+    fn a_failed_canonical_write_supersedes_nothing() {
+        let other = Path::new("/srv/old-profile/paired_user.json");
+        let canonical = Path::new("/srv/new-profile/paired_user.json");
+        let carried = vec![binding(T_DEFAULT), binding(T_SECOND)];
+        let verdict = supersede_verdict(
+            other, &carried, canonical, None, &carried, /* changed */ true,
+            /* wrote_canonical */ false,
+        );
+        assert_eq!(verdict, SupersedeVerdict::RetainWriteFailed);
+    }
+
+    /// A tenant withheld for lack of a credential is NOT merged into the
+    /// canonical (`converge_binding_store_with` is fail-closed about widening
+    /// `bindings`). Renaming its only local record away would destroy the sole
+    /// evidence this device was ever paired to it — the same pure loss, reached
+    /// from the other end. Being in `withheld_no_credential` is not a licence.
+    #[test]
+    fn a_withheld_tenant_blocks_that_copys_supersede() {
+        let other = Path::new("/srv/old-profile/paired_user.json");
+        let canonical = Path::new("/srv/new-profile/paired_user.json");
+        let carried = vec![binding(T_DEFAULT), binding(T_SECOND)];
+        // T_SECOND was withheld, so it is absent from the merged set.
+        let merged = vec![binding(T_DEFAULT)];
+        let verdict = supersede_verdict(
+            other, &carried, canonical, None, &merged, /* changed */ true,
+            /* wrote_canonical */ true,
+        );
+        assert_eq!(
+            verdict,
+            SupersedeVerdict::RetainUnaccounted(vec![T_SECOND.to_string()])
+        );
+    }
+
+    /// THE WIRING, end to end — the test that would have caught the original
+    /// defect. `supersede_verdict` being correct proves nothing if
+    /// `converge_binding_store_with` does not consult it with the real bare
+    /// default, which is why that path is a PARAMETER rather than an ambient
+    /// `paired_user_path_with(None)` read: resolved inside, it would point at
+    /// the developer's real home in every test and leave this rule unreached.
+    ///
+    /// Reproduces 2026-09-23T16:03:33Z on merytshost: an instance runner whose
+    /// canonical already carries the tenant folds the primary's store, changes
+    /// nothing, writes nothing — and must leave the primary's file ON DISK.
+    #[test]
+    fn converge_leaves_the_primarys_store_on_disk_when_it_is_the_bare_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("primary/paired_user.json");
+        let instance = tmp
+            .path()
+            .join("instances/test-1a0ce93cab6-2/paired_user.json");
+        let body = format!(
+            r#"{{"user_id": "{USER}", "tenant_id": "{T_DEFAULT}", "bindings": [{{"tenant_id": "{T_DEFAULT}", "user_id": "{USER}", "paired_at": "2026-09-23T19:53:19Z"}}], "default_tenant_id": "{T_DEFAULT}"}}"#
+        );
+        for p in [&primary, &instance] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, &body).unwrap();
+        }
+
+        let report = converge_binding_store_with(
+            &instance,
+            &[primary.clone()],
+            Some(primary.as_path()),
+            &|_t: &uuid::Uuid, _d: bool| Some(true),
+            "2026-09-23",
+        );
+
+        assert!(
+            primary.exists(),
+            "the PRIMARY's binding store must still be on disk — renaming it is the 41 h outage"
+        );
+        assert!(
+            report.superseded.is_empty(),
+            "nothing may be superseded here: {:?}",
+            report.superseded
+        );
+        assert_eq!(
+            report.retained,
+            vec![primary],
+            "the refusal must be reported"
+        );
+    }
+
+    /// The same convergence with NO bare default declared is the ordinary
+    /// two-profile case and still converges, so the guard above is a targeted
+    /// refusal rather than a blanket one.
+    #[test]
+    fn converge_still_supersedes_an_ordinary_non_default_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = tmp.path().join("old/paired_user.json");
+        let canonical = tmp.path().join("new/paired_user.json");
+        let body = format!(
+            r#"{{"user_id": "{USER}", "tenant_id": "{T_DEFAULT}", "bindings": [{{"tenant_id": "{T_DEFAULT}", "user_id": "{USER}", "paired_at": "2026-09-23T19:53:19Z"}}], "default_tenant_id": "{T_DEFAULT}"}}"#
+        );
+        for p in [&old, &canonical] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, &body).unwrap();
+        }
+
+        let report = converge_binding_store_with(
+            &canonical,
+            &[old.clone()],
+            None,
+            &|_t: &uuid::Uuid, _d: bool| Some(true),
+            "2026-09-23",
+        );
+
+        assert!(!old.exists(), "an ordinary copy must still converge");
+        assert_eq!(report.superseded.len(), 1);
+        assert!(report.retained.is_empty());
+    }
+
+    /// The absent-canonical branch used to return an all-empty report whose
+    /// caller logged nothing at all. `superseded_siblings` is what gives that
+    /// warning its evidence, newest first.
+    #[test]
+    fn superseded_siblings_are_listed_newest_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical = tmp.path().join("paired_user.json");
+        for name in [
+            "paired_user.json.superseded-2026-09-23",
+            "paired_user.json.superseded-2026-09-24",
+        ] {
+            std::fs::write(tmp.path().join(name), b"{}").unwrap();
+        }
+        // An unrelated neighbour must not be picked up.
+        std::fs::write(tmp.path().join("auth_tokens.enc"), b"x").unwrap();
+
+        let found = superseded_siblings(&canonical);
+        assert_eq!(found.len(), 2, "only the superseded siblings: {found:?}");
+        assert!(found
+            .iter()
+            .all(|n| n.starts_with("paired_user.json.superseded-")));
+        // Ordered by the embedded supersede DATE, newest first — not by mtime,
+        // which `fs::rename` preserves and which therefore ties or inverts on
+        // the real incident box.
+        assert!(
+            found[0].starts_with("paired_user.json.superseded-2026-09-24"),
+            "newest supersede date must sort first: {found:?}"
+        );
+        // Size is carried so the rich copy is identifiable from the one line.
+        assert!(
+            found.iter().all(|n| n.ends_with("B)")),
+            "each entry must carry its size: {found:?}"
+        );
+    }
+
+    /// No siblings, and an unreadable directory, are both empty lists. The
+    /// caller's wording ("siblings on disk: []") must therefore not be read as
+    /// "none were ever written" — it is UNKNOWN. Pinned so the distinction is
+    /// not lost to a later refactor that tries to make this fn conclusive.
+    #[test]
+    fn superseded_siblings_is_empty_rather_than_failing() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(superseded_siblings(&tmp.path().join("paired_user.json")).is_empty());
+        assert!(superseded_siblings(Path::new("/nonexistent/dir/paired_user.json")).is_empty());
     }
 }
