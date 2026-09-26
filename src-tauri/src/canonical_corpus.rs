@@ -118,6 +118,13 @@ const BATCH_BYTES: u64 = (crate::process_helpers::MAX_CAPTURED_BYTES / 2) as u64
 /// How often [`start_refresh_loop`] fetches.
 pub(crate) const REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
+/// The next attempt after a tick skipped for contention while this process has
+/// published NOTHING yet: the peer holding the lock is about to leave a fresh
+/// tracking ref, and waiting a whole [`REFRESH_INTERVAL`] would serve the
+/// embedded defaults for fifteen minutes for no reason. A contended tick costs
+/// one lock probe, so retrying this often is cheap.
+pub(crate) const CONTENDED_RETRY: Duration = Duration::from_secs(30);
+
 /// Environment override for the clone URL — a test or a device whose
 /// `qontinui-claude-config` lives somewhere else sets it.
 pub(crate) const URL_ENV: &str = "QONTINUI_CANONICAL_CORPUS_URL";
@@ -832,6 +839,9 @@ pub(crate) struct Published {
     /// So a tick skipped because another process holds the mirror is logged
     /// once per run of such ticks, not on every one.
     contention_logged: std::sync::atomic::AtomicBool,
+    /// Whether the LAST tick was skipped for contention — what
+    /// [`Self::next_delay`] reads.
+    last_tick_contended: std::sync::atomic::AtomicBool,
 }
 
 impl Published {
@@ -840,6 +850,7 @@ impl Published {
             corpus: RwLock::new(None),
             last_failure: Mutex::new(None),
             contention_logged: std::sync::atomic::AtomicBool::new(false),
+            last_tick_contended: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -885,6 +896,23 @@ impl Published {
                 "canonical_corpus: another process is refreshing this instance's mirror; \
                  skipping this refresh (logged once until a refresh here succeeds)"
             );
+        }
+    }
+
+    /// How long the refresh loop waits before its next tick:
+    /// [`CONTENDED_RETRY`] when the last tick was skipped for contention AND
+    /// nothing has been published yet, else [`REFRESH_INTERVAL`]. A process
+    /// that already serves a generation loses nothing by waiting the full
+    /// interval; one on the embedded defaults would.
+    pub(crate) fn next_delay(&self) -> Duration {
+        if self
+            .last_tick_contended
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && self.get().is_none()
+        {
+            CONTENDED_RETRY
+        } else {
+            REFRESH_INTERVAL
         }
     }
 
@@ -982,15 +1010,24 @@ fn bundled_skill_names() -> Vec<String> {
 ///   still the newest one this device can read.
 /// - A mirror whose [`WriterLock`] another process holds is not touched at
 ///   all this tick — no clear, no fetch, no load — and the previous
-///   generation keeps serving; that is contention, not a failure.
+///   generation keeps serving; that is contention, not a failure. Its cost is
+///   staleness until the next tick: a full [`REFRESH_INTERVAL`] when a
+///   generation is already published, but only [`CONTENDED_RETRY`] when
+///   nothing is (see [`Published::next_delay`]), so a process that loses the
+///   race at boot serves the embedded defaults for seconds, not minutes.
 pub(crate) fn refresh_into(
     mirror: &Mirror,
     published: &Published,
     command_names: &[&str],
     skill_names: &[&str],
 ) -> Option<CanonicalSnapshot> {
+    let lock = mirror.try_lock_writer();
+    published.last_tick_contended.store(
+        matches!(lock, Ok(None)),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     // Held to the end of this function: the clear, the fetch AND the load.
-    let held = match mirror.try_lock_writer() {
+    let held = match lock {
         Ok(Some(held)) => held,
         Ok(None) => {
             published.contended();
@@ -1053,7 +1090,9 @@ pub(crate) fn refresh() -> Option<CanonicalSnapshot> {
 static LOOP_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Start the background refresher: a short boot grace, then a refresh every
-/// [`REFRESH_INTERVAL`], each on the blocking pool. Hung beside the embedded
+/// [`Published::next_delay`] — [`REFRESH_INTERVAL`], or [`CONTENDED_RETRY`]
+/// while a peer holds the mirror and nothing is published — each on the
+/// blocking pool. Hung beside the embedded
 /// defaults publisher in `mcp_api::create_router`, never on a spawn path. Once
 /// per process: a second call (a second router) is a no-op. That keeps one
 /// loop per PROCESS; one writer per MIRROR — what makes
@@ -1069,7 +1108,7 @@ pub(crate) fn start_refresh_loop() {
             if let Err(e) = tokio::task::spawn_blocking(refresh).await {
                 warn!("canonical_corpus: refresh task panicked ({e})");
             }
-            tokio::time::sleep(REFRESH_INTERVAL).await;
+            tokio::time::sleep(LATEST.next_delay()).await;
         }
     });
 }
@@ -1566,6 +1605,12 @@ mod tests {
             "contention is not a failure"
         );
 
+        assert_eq!(
+            published.next_delay(),
+            REFRESH_INTERVAL,
+            "a process already serving a generation waits the full interval"
+        );
+
         drop(held);
         let next = refresh_into(&m, &published, &["vet-plan"], &[]).expect("refreshed");
         assert_ne!(next.sha, first.sha);
@@ -1573,6 +1618,38 @@ mod tests {
         assert_eq!(
             published.get().unwrap().commands.bodies["vet-plan"],
             "# next\n"
+        );
+    }
+
+    /// Losing the race at boot — contended with nothing published — retries
+    /// soon; any other tick, including a plain failure, waits the interval.
+    #[test]
+    fn a_contended_tick_with_nothing_published_retries_soon() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = remote_with(tmp.path(), &[(".claude/commands/vet-plan.md", "# canon\n")]);
+        let m = mirror(tmp.path(), &url);
+        let published = Published::new();
+        assert_eq!(published.next_delay(), REFRESH_INTERVAL, "no tick yet");
+
+        let held = mirror(tmp.path(), &url)
+            .try_lock_writer()
+            .unwrap()
+            .expect("the peer takes it");
+        assert_eq!(refresh_into(&m, &published, &["vet-plan"], &[]), None);
+        assert_eq!(published.next_delay(), CONTENDED_RETRY);
+        drop(held);
+
+        refresh_into(&m, &published, &["vet-plan"], &[]).expect("loaded");
+        assert_eq!(published.next_delay(), REFRESH_INTERVAL);
+
+        let failed = Published::new();
+        let other = tempfile::tempdir().unwrap();
+        let gone = mirror(other.path(), &other.path().join("gone").to_string_lossy());
+        assert_eq!(refresh_into(&gone, &failed, &["vet-plan"], &[]), None);
+        assert_eq!(
+            failed.next_delay(),
+            REFRESH_INTERVAL,
+            "a failure is not contention: no fast retry against a dead URL"
         );
     }
 
