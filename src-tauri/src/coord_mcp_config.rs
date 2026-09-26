@@ -143,6 +143,175 @@ pub fn proxy_nonce_from_header_object(headers: &serde_json::Value) -> Option<Str
         .map(str::to_owned)
 }
 
+/// The per-PROCESS environment variable a terminal's session reads its OWN
+/// coord-mcp proxy nonce from (plan
+/// `2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages`,
+/// Phase 2).
+///
+/// ## Why an environment reference, and why it ALWAYS carries a default
+///
+/// `<workdir>/.mcp.json` is ONE file read by every session launched in that
+/// cwd, so the nonce written into it cannot name a terminal — and the runner's
+/// deterministic caller self-id leg (`nonce → terminal_id → lifecycle record →
+/// claude_session_id`) needs one. The in-cwd DEVICE document therefore spells
+/// its credential as `${QONTINUI_COORD_MCP_NONCE:-<workdir nonce>}`: the MCP
+/// client (measured on Claude Code 2.1.283, for both `--mcp-config` and a
+/// project `.mcp.json`) expands `${VAR}` and `${VAR:-default}` in http `headers`
+/// values and in stdio `args`, so a terminal the runner spawned — which exports
+/// a terminal-bound nonce under this name into its PTY — presents THAT, while
+/// every other session in the cwd (a hand-launched `claude`, a peer's shell)
+/// falls back to the workdir nonce exactly as before.
+///
+/// The default is load-bearing, not decorative: with the variable unset and
+/// NO default the client sends the literal text `${VAR}` rather than failing,
+/// which would 401 every session the runner did not spawn. Every reference the
+/// runner writes carries `:-<default>`.
+pub const QONTINUI_COORD_MCP_NONCE_ENV: &str = "QONTINUI_COORD_MCP_NONCE";
+
+/// The stdio twin of [`QONTINUI_COORD_MCP_NONCE_ENV`]: the per-process path of
+/// the runner-owned credential file the fleet shim should read, referenced from
+/// the in-cwd stdio document's `--credential` argument as
+/// `${QONTINUI_COORD_MCP_CREDENTIAL:-<workdir credential file>}`.
+pub const QONTINUI_COORD_MCP_CREDENTIAL_ENV: &str = "QONTINUI_COORD_MCP_CREDENTIAL";
+
+/// The result of resolving every `${NAME:-default}` reference in a string to
+/// its DEFAULT arm — what the MCP client sends when `NAME` is unset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvRefExpansion<'a> {
+    /// The string with every defaulted reference replaced by its default. A
+    /// reference with no default (`${NAME}`) is kept VERBATIM — that is what the
+    /// client sends with the variable unset — and named in `unresolved`.
+    pub value: std::borrow::Cow<'a, str>,
+    /// Names of the `${NAME}` references that carry no default.
+    pub unresolved: Vec<String>,
+}
+
+/// One parsed `${...}` reference: its byte span, name and optional default.
+struct EnvRef<'a> {
+    start: usize,
+    end: usize,
+    name: &'a str,
+    default: Option<&'a str>,
+}
+
+/// Every well-formed `${NAME}` / `${NAME:-default}` reference in `s`, in order.
+///
+/// Grammar, matching the client's expansion: `NAME` is a non-empty run of
+/// ASCII alphanumerics and `_`; the default runs to the first `}` and may be
+/// empty. Anything else — an unterminated `${`, an empty or invalid name, a
+/// `:` not followed by `-` — is not a reference and stays literal text.
+fn parse_env_refs(s: &str) -> Vec<EnvRef<'_>> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = s.get(from..).and_then(|rest| rest.find("${")) {
+        let start = from + rel;
+        let body_start = start + 2;
+        let Some(close_rel) = s.get(body_start..).and_then(|rest| rest.find('}')) else {
+            break;
+        };
+        let end = body_start + close_rel + 1;
+        let body = s.get(body_start..end - 1).unwrap_or("");
+        let (name, default) = match body.split_once(":-") {
+            Some((n, d)) => (n, Some(d)),
+            None => (body, None),
+        };
+        let valid =
+            !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+        if valid {
+            out.push(EnvRef {
+                start,
+                end,
+                name,
+                default,
+            });
+            from = end;
+        } else {
+            from = body_start;
+        }
+    }
+    out
+}
+
+/// Resolve every `${NAME:-default}` in `s` to its default arm, reporting any
+/// `${NAME}` that has none. **Never reads the environment** — the runner has no
+/// terminal's variable, and every runner reader reasons about the WORKDIR key.
+pub fn expand_env_ref_defaults(s: &str) -> EnvRefExpansion<'_> {
+    let refs = parse_env_refs(s);
+    if refs.is_empty() {
+        return EnvRefExpansion {
+            value: std::borrow::Cow::Borrowed(s),
+            unresolved: Vec::new(),
+        };
+    }
+    let mut value = String::with_capacity(s.len());
+    let mut unresolved = Vec::new();
+    let mut at = 0;
+    for r in &refs {
+        value.push_str(s.get(at..r.start).unwrap_or(""));
+        match r.default {
+            Some(d) => value.push_str(d),
+            None => {
+                value.push_str(s.get(r.start..r.end).unwrap_or(""));
+                unresolved.push(r.name.to_owned());
+            }
+        }
+        at = r.end;
+    }
+    value.push_str(s.get(at..).unwrap_or(""));
+    EnvRefExpansion {
+        value: std::borrow::Cow::Owned(value),
+        unresolved,
+    }
+}
+
+/// `s` as the client would send it with every referenced variable UNSET: the
+/// default arm of each `${NAME:-default}`, and the literal text of a `${NAME}`
+/// that has none.
+pub fn env_ref_client_default(s: &str) -> std::borrow::Cow<'_, str> {
+    expand_env_ref_defaults(s).value
+}
+
+/// The names of every well-formed reference in `s` (with or without default).
+pub fn env_ref_names(s: &str) -> Vec<&str> {
+    parse_env_refs(s).into_iter().map(|r| r.name).collect()
+}
+
+/// True iff the RAW `coord-mcp` entry (not the effective one — the credential
+/// file stays literal) references [`QONTINUI_COORD_MCP_NONCE_ENV`] in a
+/// `headers` value or [`QONTINUI_COORD_MCP_CREDENTIAL_ENV`] in `args`.
+///
+/// That is the runner's own in-cwd DEVICE document and nothing else: the agent
+/// writer, the per-terminal `--mcp-config` and the `provision-session` route all
+/// emit literal credentials, and a hand-written or foreign document does not
+/// name these variables. The identity seam keys the terminal-bound mint on it.
+pub fn config_doc_references_terminal_env(doc: &serde_json::Value) -> bool {
+    let Some(entry) = coord_mcp_entry(doc) else {
+        return false;
+    };
+    let names_ours = |s: &str| {
+        env_ref_names(s)
+            .into_iter()
+            .any(|n| n == QONTINUI_COORD_MCP_NONCE_ENV || n == QONTINUI_COORD_MCP_CREDENTIAL_ENV)
+    };
+    let in_headers = entry
+        .get("headers")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|h| {
+            h.values()
+                .filter_map(serde_json::Value::as_str)
+                .any(names_ours)
+        });
+    let in_args = entry
+        .get("args")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|a| {
+            a.iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(names_ours)
+        });
+    in_headers || in_args
+}
+
 /// Basename of the fleet's stdio MCP shim
 /// (`<qontinui-root>/qontinui-claude-config/scripts/coord-mcp-shim.py`) — the
 /// `args[0]` of a stdio-shaped `coord-mcp` entry. Plan
@@ -192,7 +361,12 @@ pub fn stdio_shim_credential_path(doc: &serde_json::Value) -> Option<std::path::
     let mut it = args.iter().filter_map(serde_json::Value::as_str);
     while let Some(arg) = it.next() {
         if arg == COORD_MCP_STDIO_SHIM_CREDENTIAL_FLAG {
-            return it.next().map(std::path::PathBuf::from);
+            // The in-cwd device document spells this argument as
+            // `${QONTINUI_COORD_MCP_CREDENTIAL:-<workdir file>}`; the runner
+            // reads the WORKDIR file (the default arm), never its own env.
+            return it
+                .next()
+                .map(|raw| std::path::PathBuf::from(env_ref_client_default(raw).as_ref()));
         }
     }
     None
@@ -217,18 +391,73 @@ pub fn stdio_shim_credential_path(doc: &serde_json::Value) -> Option<std::path::
 /// in-cwd nonce reuse would mint on every spawn, the rotation log would carry
 /// an empty `key_prefix`, and the agent-principal write refusal would stop
 /// seeing the marker. One resolver keeps one contract.
+///
+/// **Environment references resolve to their DEFAULT arm here** (plan
+/// `2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages`).
+/// The in-cwd device document spells its credential as
+/// `${QONTINUI_COORD_MCP_NONCE:-<workdir nonce>}` (http `headers` values) or
+/// `${QONTINUI_COORD_MCP_CREDENTIAL:-<workdir file>}` (the stdio `--credential`
+/// argument). Every runner reader reasons about the WORKDIR key, so both are
+/// read as their defaults — the runner process has no terminal's variable and
+/// this function never consults its own environment. A `${NAME}` with no default
+/// is kept verbatim, which is exactly what the client would send.
 pub fn effective_coord_mcp_entry(
     doc: &serde_json::Value,
 ) -> Option<std::borrow::Cow<'_, serde_json::Value>> {
     let entry = coord_mcp_entry(doc)?;
     match stdio_shim_credential_path(doc) {
-        None => Some(std::borrow::Cow::Borrowed(entry)),
+        None => Some(resolve_header_env_defaults(std::borrow::Cow::Borrowed(
+            entry,
+        ))),
         Some(path) => {
             let raw = std::fs::read_to_string(path).ok()?;
             let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-            v.is_object().then_some(std::borrow::Cow::Owned(v))
+            v.is_object()
+                .then(|| resolve_header_env_defaults(std::borrow::Cow::Owned(v)))
         }
     }
+}
+
+/// Any MCP server entry (not only `coord-mcp`) with its `headers` values
+/// resolved to their default arm — for a reader that walks every server, such as
+/// the `qontinui_cli` walk-up. The `coord-mcp` entry itself is read through
+/// [`effective_coord_mcp_entry`], which also follows the stdio indirection.
+pub fn entry_with_env_defaults(
+    entry: &serde_json::Value,
+) -> std::borrow::Cow<'_, serde_json::Value> {
+    resolve_header_env_defaults(std::borrow::Cow::Borrowed(entry))
+}
+
+/// Rewrite every `headers` VALUE of an entry to its default arm
+/// ([`env_ref_client_default`]). Borrowed through untouched when no value
+/// carries a reference, so the common literal document costs no clone.
+fn resolve_header_env_defaults(
+    entry: std::borrow::Cow<'_, serde_json::Value>,
+) -> std::borrow::Cow<'_, serde_json::Value> {
+    let has_ref = entry
+        .get("headers")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|h| {
+            h.values()
+                .filter_map(serde_json::Value::as_str)
+                .any(|v| !env_ref_names(v).is_empty())
+        });
+    if !has_ref {
+        return entry;
+    }
+    let mut owned = entry.into_owned();
+    if let Some(h) = owned
+        .get_mut("headers")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for v in h.values_mut() {
+            if let Some(s) = v.as_str() {
+                let resolved = env_ref_client_default(s).into_owned();
+                *v = serde_json::Value::String(resolved);
+            }
+        }
+    }
+    std::borrow::Cow::Owned(owned)
 }
 
 /// The `url` the effective entry addresses — inline for http, from the
@@ -637,5 +866,130 @@ mod tests {
         )
         .unwrap();
         assert_eq!(proxy_nonce_from_config_doc(&doc), None);
+    }
+
+    // -- Environment references (plan 2026-09-22 one-nonce-per-terminal) ----
+
+    #[test]
+    fn env_ref_defaults_resolve_embedded_whole_absent_malformed_and_undefaulted() {
+        // Embedded in a bearer value.
+        let e = expand_env_ref_defaults("Bearer ${X:-abc}");
+        assert_eq!(e.value, "Bearer abc");
+        assert!(e.unresolved.is_empty());
+        // The whole string.
+        assert_eq!(
+            env_ref_client_default("${QONTINUI_COORD_MCP_NONCE:-n0nce}"),
+            "n0nce"
+        );
+        // An empty default is still a default.
+        assert_eq!(env_ref_client_default("a${X:-}b"), "ab");
+        // No reference: borrowed through untouched.
+        let e = expand_env_ref_defaults("Bearer plain");
+        assert!(matches!(
+            e.value,
+            std::borrow::Cow::Borrowed("Bearer plain")
+        ));
+        assert!(e.unresolved.is_empty());
+        // Malformed: unterminated, empty name, invalid name, `:` without `-`.
+        for m in [
+            "${X:-abc",
+            "${}",
+            "${:-abc}",
+            "${A B:-x}",
+            "${X:abc}",
+            "$X",
+            "${",
+        ] {
+            let e = expand_env_ref_defaults(m);
+            assert_eq!(e.value, m, "{m} is not a reference and stays literal");
+            assert!(e.unresolved.is_empty(), "{m}");
+        }
+        // No default: kept verbatim (what the client sends) and REPORTED.
+        let e = expand_env_ref_defaults("Bearer ${X}");
+        assert_eq!(e.value, "Bearer ${X}");
+        assert_eq!(e.unresolved, vec!["X".to_string()]);
+        // Mixed: the defaulted one resolves, the bare one is reported.
+        let e = expand_env_ref_defaults("${A:-1}-${B}-${C:-3}");
+        assert_eq!(e.value, "1-${B}-3");
+        assert_eq!(e.unresolved, vec!["B".to_string()]);
+        assert_eq!(env_ref_names("${A:-1}${B}x"), vec!["A", "B"]);
+    }
+
+    /// The chokepoint never reads the process environment: even for a
+    /// variable SET in this process, every reader sees the default arm.
+    #[test]
+    fn config_readers_resolve_env_refs_to_the_default_and_ignore_the_process_env() {
+        let n = nonce();
+        let doc: serde_json::Value = serde_json::from_str(&format!(
+            r#"{{"mcpServers":{{"coord-mcp":{{"type":"http","url":"http://127.0.0.1:9876/coord-mcp","headers":{{"Authorization":"Bearer ${{QONTINUI_COORD_MCP_NONCE:-{n}}}","X-Coord-Mcp-Proxy-Key":"${{QONTINUI_COORD_MCP_NONCE:-{n}}}"}}}}}}}}"#
+        ))
+        .unwrap();
+        assert!(config_doc_references_terminal_env(&doc));
+        assert_eq!(proxy_nonce_from_config_doc(&doc), Some(n.clone()));
+        assert!(config_doc_has_static_authorization(&doc));
+        assert!(!config_doc_is_agent_marked(&doc));
+        assert_eq!(
+            effective_coord_mcp_url(&doc).as_deref(),
+            Some("http://127.0.0.1:9876/coord-mcp")
+        );
+        // `PATH` is always set in this process; the reader must still answer
+        // the default arm, because it never consults the environment.
+        let doc_other: serde_json::Value = serde_json::from_str(&format!(
+            r#"{{"mcpServers":{{"coord-mcp":{{"headers":{{"Authorization":"Bearer ${{PATH:-{n}}}"}}}}}}}}"#
+        ))
+        .unwrap();
+        assert!(std::env::var_os("PATH").is_some());
+        assert_eq!(proxy_nonce_from_config_doc(&doc_other), Some(n.clone()));
+        assert!(
+            !config_doc_references_terminal_env(&doc_other),
+            "only OUR two variables mark the runner's env-ref document"
+        );
+
+        // A literal document does not reference them.
+        let literal: serde_json::Value = serde_json::from_str(&format!(
+            r#"{{"mcpServers":{{"coord-mcp":{{"headers":{{"Authorization":"Bearer {n}"}}}}}}}}"#
+        ))
+        .unwrap();
+        assert!(!config_doc_references_terminal_env(&literal));
+    }
+
+    /// The stdio `--credential` argument resolves to its default arm before the
+    /// credential file is read, and the file's own headers read back.
+    #[test]
+    fn stdio_credential_argument_env_ref_resolves_to_the_workdir_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cred = tmp.path().join("cred.json");
+        let n = nonce();
+        std::fs::write(
+            &cred,
+            format!(
+                r#"{{"url":"http://127.0.0.1:9876/coord-mcp","headers":{{"Authorization":"Bearer {n}","X-Coord-Mcp-Proxy-Key":"{n}"}}}}"#
+            ),
+        )
+        .unwrap();
+        let arg = format!("${{QONTINUI_COORD_MCP_CREDENTIAL:-{}}}", cred.display());
+        let doc = serde_json::json!({
+            "mcpServers": {"coord-mcp": {
+                "type": "stdio",
+                "command": "/usr/bin/python3",
+                "args": ["/x/coord-mcp-shim.py", "--credential", arg],
+            }}
+        });
+        assert!(config_doc_references_terminal_env(&doc));
+        assert_eq!(
+            stdio_shim_credential_path(&doc).as_deref(),
+            Some(cred.as_path())
+        );
+        assert_eq!(proxy_nonce_from_config_doc(&doc), Some(n));
+        // No default: the literal `${...}` path does not exist, so the entry is
+        // unreadable — the fail-closed arm every reader already has.
+        let bare = serde_json::json!({
+            "mcpServers": {"coord-mcp": {
+                "type": "stdio",
+                "command": "/usr/bin/python3",
+                "args": ["/x/coord-mcp-shim.py", "--credential", "${QONTINUI_COORD_MCP_CREDENTIAL}"],
+            }}
+        });
+        assert!(effective_coord_mcp_entry(&bare).is_none());
     }
 }
