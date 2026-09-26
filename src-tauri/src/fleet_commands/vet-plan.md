@@ -260,7 +260,8 @@ So read the DOOR: `coord-revive.sh tools`, then look for `independence` in that
 tool's `inputSchema`. If your own tool list is the stale one, send the
 declaration with `coord-revive.sh call coord_work_unit_transition '<json>'`
 rather than the tool your session advertises, and verify by read — a zero exit
-is not evidence the write landed. The worked declaration is in §5.4 Step C's
+is not evidence the write landed. How the declaration is built, and when it
+is sent at all, is §5.4 Step B; its shape is in Step C's
 `self_attestation_forbidden` bullet.
 
 Caveats, all live. A well-formed declaration is still refused
@@ -888,7 +889,88 @@ Use `Read` on the path. Don't skim — note every concrete claim:
 
 A plan written by someone else (or by past-you) usually has 2–4 things that look right but aren't. Your job is to find them.
 
+### 1.5. Hand the JUDGEMENT to a fresh-context subagent — always
+
+**The vet is performed by a subagent that received the artifact and not the
+reasoning.** Spawn exactly one `general-purpose` subagent (the `Agent` tool)
+and give it the work of Steps 2 and 3 — verify every claim, record each as a
+§2a manifest entry, classify the defects, resolve the open questions under the
+Decision policy. It is the authority for that judgement; this session is not.
+The property is served policy `verification-and-evidence`
+`independence-is-context-not-credential` — read the clause live, do not restate
+it here [policy: never-pin-a-mutable-policy-value].
+
+**Spawn unconditionally — including when this session did not author the
+plan.** A session cannot reliably tell whether its context carries authoring
+reasoning: it may be `/pvi`, a resumed run, or a compacted one whose summary
+still holds the author's rationale. A uniform rule has no such failure mode
+(robustness). A re-vet of an already-VETTED plan gets a FRESH subagent too: the
+artifact changed, so a prior verdict names a different `against`.
+
+**The prompt carries exactly four things, and nothing else:**
+
+1. the resolved plan path;
+2. the plan body **as read from `origin/main`** of the repo holding it (`git -C
+   <plans repo> fetch` then `git show origin/main:<path>`) — not its git
+   history, not earlier drafts. If the plan is not on `origin/main` yet, pass
+   the body Step 1 read and say so — the stamp's `Vetted-by:` then reads
+   "working-tree body (not on origin/main)" in place of "`origin/main` body"
+   (its `against` names the CODE repo's sha, so the fact does not go there);
+3. the repos it touches;
+4. the vetting rubric — Steps 2 and 3 of this file, §2a's manifest rules and
+   the Decision policy, **PASTED into the prompt**. Never point at this file's
+   path: it also carries Steps 4, 5 and §5.4, which WRITE, and a subagent
+   told to follow `/vet-plan` will follow them.
+
+The prompt also says, in terms: **return the verdict only — no `Edit` or
+`Write`, no commit or push, no coord write of any kind.** The subagent reads;
+this session writes.
+
+⚠️ **Do NOT put the authoring conversation, a defect list, or "what the author
+meant" into that prompt** — no "here is why I chose this design", no "I already
+noticed X", no prior turn, no summary of this session. That omission IS the
+control, and it is the one thing an implementer would "helpfully" add. A
+subagent briefed on the author's intent is the reviewer who cannot catch what
+the author assumed. The subagent may still run `git log` or read anything
+itself: that is verification, not inherited context.
+
+**It returns a structured verdict**, and you ask for exactly this shape:
+
+- **defects** — each `{category, section, evidence file:line, proposed fix}`,
+  with `category` one of Step 3's five;
+- **resolved open questions** — each with the deciding priority named;
+- **manifest** — the §2a entries it computed, as the JSON array §5.4 submits;
+- **read list** — every `repo@sha` it read (`git rev-parse --short
+  origin/main` after its own fetch), which is what the stamp's `against` and
+  §5.4's `independence.against` are built from;
+- **checks** — one line naming what it verified (premises re-derived, counts
+  recounted, prior art searched), which becomes `independence.verified`;
+- **policies** — every served policy document it read to decide (`/policy`,
+  `name@version`), which is the stamp's `served policy` list.
+
+**This session stays the single writer.** Independence is a property of the
+judgement, not of the file write, and one writer avoids the concurrent-edit
+class entirely. From Step 4 onward you apply the verdict. You may re-check a
+defect only where you are about to edit on it — to place the edit, not to
+re-litigate it. Where your re-check contradicts the verdict, the contradiction
+goes in the §6 report; do not silently overrule it. Keep the verdict: Step 5's
+stamp and §5.4's declaration are both built from it.
+
+**When no spawn is possible** — no `Agent` tool in this harness, or the spawn
+failed and a retry failed — do Steps 2 and 3 inline yourself and take the
+**self path** everywhere downstream: Step 5 writes `VETTED (self)` with
+`Independence: NONE`, and §5.4 sends no declaration. Never write the
+unqualified stamp on a vet this session performed in its own context. An
+independence you could not obtain is UNKNOWN and renders as NONE, never as
+silence [policy: unknown-must-not-render-as-a-default].
+
+Wait for the verdict on a bounded timer, per the **Parallelize research** rule
+below; never end a turn purely awaiting it.
+
 ### 2. Verify every concrete claim
+
+**The Step 1.5 subagent does this step, not you.** What follows is its rubric:
+hand it over verbatim. You apply the verdict it returns.
 
 For each claim in the plan, validate against the current codebase. Run these in parallel where possible:
 - **File / module exists** → `Glob` or `Read`
@@ -1244,7 +1326,8 @@ making review unforgeable. It raises the floor and makes decay observable.
 
 ### 3. Identify defects
 
-Categorize what you find:
+**The Step 1.5 subagent does this step too**, and returns each defect in the
+verdict shape named there; you apply it. Its categories:
 - **Wrong** — claim contradicts the code (path, signature, behavior)
 - **Redundant** — proposes new code that duplicates existing infrastructure
 - **Missing** — overlooks a concrete consumer, edge case, or coupled subsystem
@@ -1259,6 +1342,10 @@ Don't flag style preferences or hypothetical concerns — only material defects.
 plan reserve returned `granted` / `claimed` / `renewed` (or took the documented
 no-machine-UUID skip). A foreign `held`, or a reserve that could not be answered,
 stops the run before any `Edit`.
+
+**You are applying the Step 1.5 verdict here, not forming a new one.** Every
+edit below traces to a defect or a resolved question the subagent returned (or,
+on the self path, to your own inline Steps 2–3).
 
 Use `Edit` (not `Write`) to surgically fix the plan, preserving the author's voice and structure. Specifically:
 - **Add a "Discovered prior art" section** near the top if the plan missed existing infrastructure. Include a small table with `Piece | Location | Notes`.
@@ -1344,7 +1431,41 @@ use, so the lifecycle reads cleanly:
 > and what survived the audit>. Defects found: <count>. Auto-fixed: <count>.
 > Surfaced for user: <count>. <Optional: pointer to follow-up plan if you
 > created one in the report.>
+> Vetted-by: subagent (fresh context: plan path + `origin/main` body + repos
+> + rubric only; no authoring context); served policy <names>@<versions>.
+> Independence: context — the reviewer did not hold the author's reasoning.
 ```
+
+**The stamp records WHO vetted, and with what context** *(plan
+`2026-09-08-vetting-is-not-independent-and-nothing-records-that-it-was`)*. The
+policy's recording half — the independence claim is STORED with the artifact,
+beside what was verified and against what [policy:
+`independence-is-context-not-credential`] — has its human-readable home in
+this line. The `against <repo> origin/main <sha>` clause above already is the
+"verified against"; do not add a second sha. Build `Vetted-by:` from the
+Step 1.5 prompt as you actually constructed it — name every input it received,
+and the served policy documents from the verdict's **policies** field — and the
+`against` from the verdict's read list. §5.4's `independence`
+object is built from these SAME facts, so the stamp and
+`metadata.attestations` cannot disagree.
+
+**When Step 1.5 could not spawn, qualify the stamp — never omit the line.**
+`VETTED` stays the FIRST token after `Status:`, so every parser that reads the
+lifecycle still reads it:
+
+```markdown
+> **Status: VETTED (self) <YYYY-MM-DD>, against <repo> `origin/main` <short-sha>.**
+> <summary as above>.
+> Vetted-by: the invoking session (no subagent: <why the spawn was not made>).
+> Independence: NONE — vetted in the invoking session's context.
+```
+
+The test-equivalent, stated so it can be checked: **a vet run with the spawn
+suppressed must produce the `VETTED (self)` stamp with `Independence: NONE`,
+never an unqualified `VETTED`.** An independence this run could not obtain is
+UNKNOWN and renders as NONE, never as a missing line [policy:
+`unknown-must-not-render-as-a-default`] — an unqualified stamp is exactly the
+indistinguishable-from-a-real-review artifact this line exists to end.
 
 **The stamp names the TREE the vet read, not only the date** *(plan
 `2026-09-05-a-verification-report-never-states-the-tree-it-read`, Phase 4)*.
@@ -1674,7 +1795,8 @@ decisions only — see the predicate guidance in `_gate-registration`).
 > it — a duplicate, parallel run of the same work (the exact concurrent-WIP clobber
 > the coordination layer exists to prevent). So by default: still upsert the work
 > unit, transition its status (per the registry step below — attempt `vetted`, fall
-> back to `vetted_unattested`), and register the `unit_ready` gate for
+> back to `vetted_unattested` (self path, or a subagent-path refusal per §5.4
+> Step C's prologue)), and register the `unit_ready` gate for
 > registry/dashboard visibility keyed on whichever status actually landed (it
 > auto-clears by predicate), but with NO continuation of any kind.
 >
@@ -2004,7 +2126,8 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    (canonical spec: `_gate-registration` → "Continuation cancel + refresh".)
 4. **Set the work unit's registry status — UNCONDITIONALLY, on BOTH arms.** This
    is the "Set the work unit's registry status" block below
-   (read current → attempt `vetted` → fall back to `vetted_unattested`); do it
+   (read current → attempt `vetted` → fall back to `vetted_unattested` (self
+   path, or a subagent-path refusal per §5.4 Step C's prologue)); do it
    here, before registering, and carry the status that landed into step 5. It is
    written out after this list only because it is long.
 
@@ -2054,7 +2177,11 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
      > registers the gate was the one actor barred from satisfying it.
      >
      > Ordering the transition first removes the guesswork: `vetted` when the
-     > attestation genuinely lands, `vetted_unattested` when it is refused. Never
+     > attestation genuinely lands, `vetted_unattested` when it is refused and
+     > §5.4 Step C is taken (self path, or a subagent-path refusal per its
+     > prologue) — never the read status of a refused transition, and nothing
+     > at all when Step A's status is UNKNOWN. (Step A's skip arm, which keys on
+     > an already-past status it read, is the one exception.) Never
      > `in_progress` — that is what `/implement-plan` Step 0.5 writes, and reusing
      > it makes "vetted, waiting to start" and "already being implemented"
      > indistinguishable.
@@ -2415,8 +2542,42 @@ derivation this whole ordering exists to protect.
 ```
 POST $COORD_HTTP_URL/coord/work-units/<plan stem>/transition
      {to_status:"vetted", by_actor:"<this session>",
-      vet_evidence:[ <the manifest you built in §2a> ]}
+      vet_evidence:[ <the manifest you built in §2a> ],
+      independence:{ <on the subagent path ONLY — see below> }}
 ```
+
+**On the subagent path (Step 1.5 spawned), send the `independence`
+declaration.** Build it from the SAME facts as Step 5's `Vetted-by:` line — one
+source, two readers: the stamp is what a human reads, `metadata.attestations`
+is what a machine reads, and they cannot disagree if neither is composed
+separately.
+
+| Field | Built from |
+|---|---|
+| `verified` | the verdict's **checks** line — what the subagent verified |
+| `against` | the verdict's **read list** — every `repo@sha`, plus the plan at `origin/main <sha>`, or "working-tree body (not on origin/main)" when Step 1.5 passed that, exactly as `Vetted-by:` says |
+| `context` | how the Step 1.5 prompt was constructed — the `Vetted-by:` text, naming each input it received and that no authoring context was passed |
+
+⚠️ **The door is `coord_work_unit_transition` (or the `/transition` POST above)
+— NEVER `coord_work_unit_upsert`.** The upsert takes a `status` and has no
+`independence` field, so a `vetted` sent through it carries no declaration and
+cannot attest by context at all. Coord finding `05a215f1` is that
+shape measured: two plans vetted by fresh-context subagents, stuck at `draft`
+because the attestation went through the upsert. If your own tool list lacks
+the field, read the door (`coord-revive.sh tools`) and send over it, per the
+"LANDED is not SERVED" note near the top of this file.
+
+**Confirm the declaration was STORED, not only that the transition landed.**
+`admitted_on: identity` cannot tell the actor-key arm from the declaration arm
+(the Step C table says why), so read `GET
+/coord/agent-work-units/<plan stem>` and find your declaration in
+`metadata.attestations`. Quote both in §6. A `200` with no stored declaration
+is UNKNOWN, not attested by context.
+
+**On the self path (`VETTED (self)`), send NO declaration.** This session
+held the context the control exists to exclude, so any declaration it sent
+would be the unearned, false witness statement Step C forbids. Send `vetted`
+without `independence` and expect Step C.
 
 `vet_evidence` is the §2a manifest array, verbatim. Send it on **both** Step B
 and Step C — the fallback transition carries it too, so the evidence is stored
@@ -2468,6 +2629,38 @@ and it is also the path the graduated-self-attestation relaxation
 arms it.
 
 **Step C — the fallback, and it is NOT the normal path.**
+
+**Step C is the `VETTED (self)` path's — and the subagent path's only after
+one bounded retry.** On the subagent path, branch on the code that refused:
+
+- **`attester_unresolved`** — re-send Step B, declaration and manifest
+  unchanged, ONCE, over a door carrying a device-identified JWT. Refused again,
+  or no device-identified door resolves: TAKE Step C as written below —
+  `vetted_unattested`, the `from_status` CAS guard, the manifest, and the gate
+  keyed on `vetted_unattested`. Report the attestation as **owed**, and say the
+  declaration's facts are kept for a re-send. Nothing is lost by falling back:
+  the declaration arm ignores both the owner and the from-status, so coord
+  admits a later declared `→ vetted` from `vetted_unattested`
+  (`work_unit_registry.rs`, the declaration arm of
+  `authorize_target_transition`).
+- **`self_attestation_forbidden` or `owner_unresolved`** — both mean the
+  declaration never arrived: coord returns them only on the legacy arm, when no
+  declaration was received, and a declaration that does arrive never yields
+  either. See the `self_attestation_forbidden` bullet below. Re-send it over a
+  door that serves the field. If no door does, take Step C and report it owed,
+  as above.
+- **`422 independence_declaration_malformed`** — fix the field and re-send
+  ONCE (bullet below). If it still 422s, report the transition **not made**
+  with the code and stop — no loop. **Never Step C for this**: a malformed
+  declaration is a bug in what you sent, not a refusal of the witness.
+
+"Transition **not made**, gate **not registered**" is reserved for exactly two
+cases: Step A's status is UNKNOWN (the blockquote under Step A), and a 422 that
+survives its one re-send (above). Never key the
+gate on the read status of a REFUSED transition — on a fresh unit that is `""`,
+and a `ready_status: ""` gate clears at once, the false green Step A forbids.
+(Step A's skip arm, and the 409 re-apply of it, key on an already-past status
+they read; that is the exception, not this case.)
 
 Reach for this only when Step B actually refused. **A manifest does not change
 the authorization verdict** — coord has no evidence-admission arm. Plan
@@ -2538,9 +2731,19 @@ Three 403 codes are expected here and NONE is a failure of the vet:
   > So `coord_work_unit_transition` takes an optional `independence`
   > declaration — `{verified, against, context}`. When present and well-formed
   > it AUTHORIZES the Attested transition and is stored on the unit at
-  > `metadata.attestations`. Do the vetting in a fresh-context subagent (hand
-  > it the plan body and NOT your reasoning), then send what it verified, what
-  > it verified that against, and how it came by a context free of yours:
+  > `metadata.attestations`. **Meeting this refusal is too late to earn one.**
+  > The fresh-context vet is Step 1.5's, performed before a single claim was
+  > checked; a subagent spawned here, after this session has already vetted,
+  > edited and stamped the plan, is a spawn whose only purpose is satisfying
+  > an identity check — the kind of spawn the clause refuses to require. If
+  > Step 1.5 spawned, you sent the declaration in Step B and this refusal
+  > means it **never arrived** — a stale tool schema with no `independence`
+  > field, or an older HTTP door that silently drops unknown fields. (A
+  > malformed one is a 422, never this 403 — see the 422 bullet below.) Read the
+  > DOOR, per the "LANDED is not SERVED" note near the top of this file, and
+  > re-send over one whose schema carries the field. If Step 1.5 could not
+  > spawn, you are on the `VETTED (self)` path: send no declaration and take
+  > Step C. The declaration's shape, for reference:
   >
   > ```json
   > {"slug": "<stem>", "to_status": "vetted",
@@ -2549,6 +2752,10 @@ Three 403 codes are expected here and NONE is a failure of the vet:
   >    "against":  "plans/<stem>.md at origin/main <sha>",
   >    "context":  "fresh-context subagent; received the plan body, not the author's rationale"}}
   > ```
+  >
+  > For a plan not yet on `origin/main`, `against` names it as "working-tree
+  > body (not on origin/main)" instead — the same words the stamp's
+  > `Vetted-by:` uses, so the two cannot disagree.
   >
   > **Do not fabricate the declaration to get past the 403.** It is
   > unfalsifiable by construction — the policy says so in the same breath as
@@ -2566,13 +2773,22 @@ Three 403 codes are expected here and NONE is a failure of the vet:
   attester's context, and an unresolved owner is deliberately not an obstacle to
   it (pinned in coord by
   `a_declaration_attests_an_ownerless_unit_but_never_anonymously`). This is the
-  one refusal a declaration actually removes.
+  one refusal a declaration actually removes — so **on the subagent path,
+  `owner_unresolved` means the declaration never arrived**, exactly as
+  `self_attestation_forbidden` does there: route it through that branch of Step
+  C's prologue (re-send over a door that serves the field).
 - **`attester_unresolved`** — YOUR token derives no actor key, i.e. it carries a
   `tenant_id` but no `device_id`. This is the one you will hit on the acting-user
-  service token (transport tier 3 above). Fall back the same way, but say in your
-  report that the attestation was not merely refused — it was **unattemptable from
-  this door**, and would need a device- or agent-identified caller even to be
-  evaluated.
+  service token (transport tier 3 above). **On the self path**, fall back the
+  same way, but say in your report that the attestation was not merely refused —
+  it was **unattemptable from this door**, and would need a device- or
+  agent-identified caller even to be evaluated. **On the subagent path**, follow
+  Step C's prologue: one re-send over a device-identified door, then Step C.
+- **`422 independence_declaration_malformed`** — not one of the three 403s, and
+  not a refusal of the witness: coord could not parse what you sent. Every
+  field must be non-blank — zero-width characters count as blank — and at most
+  `work_unit_registry::INDEPENDENCE_FIELD_MAX` bytes. Fix the field and re-send
+  Step B ONCE, per Step C's prologue. It is **never** a reason for Step C.
 
 Graduation relaxes exactly ONE of the three: `self_attestation_forbidden`. Both
 `owner_unresolved` and `attester_unresolved` are returned verbatim and are **not**
@@ -2581,9 +2797,15 @@ resolvable actor key there is nothing that could have been earned
 (`crates/coord/src/policies/lifecycle_autonomy.rs`, the
 `OwnerUnresolved | AttesterUnresolved` arm).
 
-None of the three is a transport problem, a credential problem, or a coord bug — do
-not run `/coord-revive`, do not retry on another door, and do not report the vet as
-failed. Two facts so you do not burn a cycle looking for a way around it:
+**On the self path**, none of the three is a transport problem, a credential
+problem, or a coord bug — do not run `/coord-revive`, do not retry on another
+door, and do not report the vet as failed. **On the subagent path there are two
+exceptions**, both in Step C's prologue: `attester_unresolved` is re-sent once
+over a device-identified door, and `self_attestation_forbidden` /
+`owner_unresolved` are re-sent over a door whose schema serves `independence` —
+there the refusal IS a door problem, because the declaration was dropped. Never
+report the vet as failed on either path. Two facts so you
+do not burn a cycle looking for a way around it:
 
 - **The check is the six-tier `non_author_allows_identities` ladder**
   (`gates_authority.rs`) over `ActorIdentity { device, agent, session }` — the same
@@ -2628,7 +2850,11 @@ proven binding; fall back only when the ladder actually refuses. A unit left at
 never derives `ready`, because that derivation matches the literal `vetted`. You
 keep dispatch (the `unit_ready` gate clears) and lose one derived observation.
 `shipped` is unaffected — it derives from PR citations, independent of the
-from-status. Treat the attestation as **owed, not blocked**: say in your report
+from-status. **On the `VETTED (self)` path, and on a subagent-path refusal
+Step C's prologue sent here** (`attester_unresolved` twice, no
+device-identified door, or a declaration no door would carry), treat the attestation as **owed, not blocked** — on the
+subagent path it is owed a RE-SEND of the kept declaration, not a new vet: say
+in your report
 that the unit sits at `vetted_unattested` and a `→ vetted` attestation is
 outstanding. The plan is fully dispatchable meanwhile, and `/implement-plan` gates
 on the plan file's VETTED stamp — it never reads the registry status.
@@ -2639,16 +2865,20 @@ say so in your report.** `vetted_unattested` is **not a coord status at all**:
 files it as **`Free`** — and a Free transition *claims ownership*. The fallback
 therefore stamps **this** session as the unit's owner, which is precisely the
 condition that makes every later `→ vetted` from this session refuse
-`self_attestation_forbidden`, permanently. The ordinary outcome of the control is
-a unit parked in a status coord does not recognize, owned by the one actor barred
-from fixing it. That is a trap, not a graceful degradation — do not report it as
+`self_attestation_forbidden`, permanently **absent a declaration** — i.e. on the
+self path. A subagent-path fallback escapes it by re-sending the kept
+declaration, which the declaration arm admits regardless of owner. The ordinary
+outcome of the control is a unit parked in a status coord does not recognize,
+owned by the one actor barred from fixing it. That is a trap, not a graceful degradation — do not report it as
 a clean fallback.
 
 > **No evidence arm keeps you out of that trap.** Plan
 > `2026-09-01-vet-evidence-manifest-and-decay` Phase 7 designed one — a manifest
 > meeting a floor would admit `→ vetted` regardless of identity — but it is
 > **not on `qontinui-coord`'s `origin/main`**, and `qontinui-coord#2207` left it
-> out on purpose (see Step C). So the fallback fires whenever identity refuses.
+> out on purpose (see Step C). So the fallback fires whenever identity refuses
+> on the self path, and on the subagent path whenever Step C's prologue sends
+> you there.
 > Never tell the operator the manifest changed the verdict; `admitted_on` is the
 > only thing entitled to settle which arm carried you, and it has no `evidence`
 > value.
@@ -2823,7 +3053,8 @@ leave it in the report.
   `{status:"idle"}`); a vetted plan that is ready, dispatchable work → `unit_ready`
   `{work_unit_id, ready_status}` — transition the unit FIRST and set `ready_status`
   to the status that actually landed (`vetted`, else the Free fallback
-  `vetted_unattested`); a hardcoded Attested value on a unit you own never clears,
+  `vetted_unattested` (self path, or a subagent-path refusal per §5.4 Step C's
+  prologue)); a hardcoded Attested value on a unit you own never clears,
   since an owner may not attest (§5.4 has the full procedure; canonical:
   `_gate-registration`). (**NOT** `operator_approval` — `operator_approval`
   is for genuine human decisions, not a work queue); schema/alembic-at-head →
@@ -2958,6 +3189,16 @@ Brief — under 150 words. State:
   origin/main <short-sha>` — and **quote the sha**, not just the date. It is
   what lets the next reader tell a citation that has gone stale from one that
   was always wrong, without re-resolving every row
+- **The independence path taken** — `subagent` (Step 1.5 spawned: say whether
+  the `independence` declaration was sent on `coord_work_unit_transition` and
+  whether `metadata.attestations` shows it stored) or `self` (no spawn: name
+  why, and confirm the stamp reads `VETTED (self)` with `Independence: NONE`).
+  Where your edit-time re-check contradicted the subagent's verdict, say so.
+  **Subagent path, transition refused:** name the code, whether you re-sent,
+  what the gate was keyed on (`vetted_unattested` after Step C, or not
+  registered when Step A's status was UNKNOWN or a 422 survived its one
+  re-send), and whether the declaration is
+  owed a re-send
 - **The evidence manifest** (§2a): quote `stored` from the transition's `vet_evidence` receipt — the count coord **kept**, never the count you sent — and `admitted_on`, the arm that actually carried the transition (`identity` / `graduation` / `no_transition`). **Read both; do not infer either.** ⚠️ Where you sent an `independence` declaration, SAY SO explicitly: `admitted_on` reads `identity` on that path too, so it cannot be quoted as evidence of an actor difference. No receipt at all means the running coord has no manifest surface: say *built but not stored*. If you fell back to `vetted_unattested`, name the identity refusal that sent you there (`self_attestation_forbidden` / `owner_unresolved` / `attester_unresolved`) — never the manifest, which admits nothing
 - Open questions you **resolved using the Decision policy**, with the deciding priority in parentheses (e.g. "picked registry-backed lookup (scalability)")
 - Anything you flagged for the user that you did NOT auto-fix — limit this to product/scope/stakeholder calls the Decision policy can't decide; engineering trade-offs should already be resolved in the plan
