@@ -340,7 +340,23 @@ run_case "unparseable settings report a parse failure, not an absent approval" \
 echo "  -- verdict invariant --"
 inv_dir="$SANDBOX/inv"
 mkdir -p "$inv_dir/home" "$inv_dir/proj/.claude"
+printf '0.00 0.00 0.00 1/1 1\n' > "$inv_dir/loadavg"   # the pinned load read (see inv_run)
 decl_coord "$inv_dir/proj"
+# THE LOAD GATE IS PINNED OPEN in both runs. coord-revive's floor gate
+# (floor_gate_reason) turns a DEAD sweep's exit 1 into exit 5 whenever the box
+# is under its own load: a load ratio, a count of live build processes (default
+# threshold 0, so ONE cargo/rustc anywhere on the box trips it) or a slow
+# /health. Those are sampled independently in each run, so on a busy CI runner
+# the two runs could land on opposite sides of the threshold and this case
+# failed "the approval half moved the exit code" about a difference the approval
+# half did not cause -- measured on qontinui-claude-config#1183's windows shard
+# 2026-09-26 (exit 1 with approval, 5 without; coord finding 7c45157e). The
+# thresholds are pinned out of reach, and the load itself is read from a fixture
+# (COORD_REVIVE_LOADAVG_FILE) rather than sampled, so the gate reads the same in
+# both runs. One input stays sampled per run: the build-process census has no
+# seam, and a census that FAILS (pgrep >= 2, tasklist error) still blocks FLOOR,
+# so a failure in only one run could still flip the exit. That residual is left
+# open deliberately -- it is a read failure, which the gate is right to report.
 inv_run() {  # <outfile> -> prints "<exit> <verdict line>", full output to <outfile>
   local o rc
   o="$(cd "$inv_dir/proj" && HOME="$inv_dir/home" USERPROFILE="$inv_dir/home" \
@@ -349,6 +365,9 @@ inv_run() {  # <outfile> -> prints "<exit> <verdict line>", full output to <outf
        COORD_HTTP_URL="http://127.0.0.1:1" \
        QONTINUI_WEB_HTTP_URL="http://127.0.0.1:1" \
        COORD_AGENT_JWT="" COORD_DEVICE_JWT="" \
+       COORD_REVIVE_LOAD_RATIO=1000000 COORD_REVIVE_BUILD_PROCS=1000000 \
+       COORD_REVIVE_HEALTH_SLOW_MS=1000000000 \
+       COORD_REVIVE_LOADAVG_FILE="$inv_dir/loadavg" \
        bash "$SCRIPT" 2>/dev/null)"
   rc=$?
   printf '%s\n' "$o" > "$1"
