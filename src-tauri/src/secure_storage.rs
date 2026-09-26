@@ -463,6 +463,62 @@ enum WriteMode {
     Fresh,
 }
 
+/// Serializes every read-modify-write of the token store in this process.
+///
+/// Each writer loads the WHOLE struct, changes one slot and saves it back, so
+/// two unsynchronized writers lose an update: a background writer (the
+/// device-JWT refresher, the machine-key enrolment task of plan
+/// `2026-09-24-runner-coord-credential-stranded-after-outage`) that loaded
+/// before a concurrent re-pair saved would write the stale JWT slot back.
+///
+/// This file compiles into BOTH the lib and the runner bin, and each crate gets
+/// its own copy of this static. Every lock site therefore names the LIB's copy
+/// (`qontinui_runner_lib::`, which the lib aliases to itself), so there is one
+/// lock per process; the bin's own copy is never used. Not cross-process: the
+/// `qontinui_profile` CLI is a separate process.
+#[allow(dead_code)]
+pub static TOKEN_STORE_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Keep `/health.coordCredential.machineKey` in step with every write of the
+/// machine key (plan `2026-09-24-runner-coord-credential-stranded-after-outage`
+/// Phase 3): `None` = no key now, `Some(expires_at)` = a key with that
+/// (possibly unknown) expiry. Goes through the lib's process-wide tracker from
+/// either crate this file compiles into.
+fn note_machine_key_state(key: Option<Option<i64>>) {
+    use qontinui_runner_lib::machine_key_enrol as mke;
+    let stored = match key {
+        None => mke::StoredKey::Absent,
+        Some(expires_at) => mke::StoredKey::Present { expires_at },
+    };
+    mke::observe_machine_key_state(mke::classify(stored, chrono::Utc::now().timestamp()));
+}
+
+fn token_store_write_lock() -> std::sync::MutexGuard<'static, ()> {
+    qontinui_runner_lib::secure_storage::TOKEN_STORE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+/// A loaded [`StoredTokens`] that holds [`TOKEN_STORE_WRITE_LOCK`] until it is
+/// dropped — i.e. across the whole read-modify-write of the method holding it.
+struct TokensForWrite {
+    tokens: StoredTokens,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl std::ops::Deref for TokensForWrite {
+    type Target = StoredTokens;
+    fn deref(&self) -> &StoredTokens {
+        &self.tokens
+    }
+}
+
+impl std::ops::DerefMut for TokensForWrite {
+    fn deref_mut(&mut self) -> &mut StoredTokens {
+        &mut self.tokens
+    }
+}
+
 /// Outcome of reading a credential slot out of the encrypted store.
 ///
 /// NO-DOWNGRADE: `Absent` ("definitively nothing stored") and `Unreadable`
@@ -698,7 +754,7 @@ impl SecureStorage {
     /// The EXPLICIT credential-acquisition writers instead call
     /// [`Self::load_tokens_for_write_mode`] with [`WriteMode::Fresh`], which
     /// starts from blank rather than refusing — see that method and `WriteMode`.
-    fn load_tokens_for_write(&self) -> Result<StoredTokens> {
+    fn load_tokens_for_write(&self) -> Result<TokensForWrite> {
         self.load_tokens_for_write_mode(WriteMode::Merge)
     }
 
@@ -708,7 +764,19 @@ impl SecureStorage {
     /// and [`WriteMode::Fresh`] returns a blank [`StoredTokens`] so the explicit
     /// caller can rewrite the (cryptographically-dead) store from scratch. On a
     /// readable or genuinely-absent store the two are identical.
-    fn load_tokens_for_write_mode(&self, mode: WriteMode) -> Result<StoredTokens> {
+    ///
+    /// The returned value holds [`TOKEN_STORE_WRITE_LOCK`], taken BEFORE the
+    /// load, so the caller's save lands before any other writer can load.
+    fn load_tokens_for_write_mode(&self, mode: WriteMode) -> Result<TokensForWrite> {
+        let lock = token_store_write_lock();
+        let tokens = self.load_tokens_for_write_mode_unlocked(mode)?;
+        Ok(TokensForWrite {
+            tokens,
+            _lock: lock,
+        })
+    }
+
+    fn load_tokens_for_write_mode_unlocked(&self, mode: WriteMode) -> Result<StoredTokens> {
         match self.load_tokens() {
             Ok(tokens) => Ok(tokens),
             Err(e) if self.store_file_exists() => match mode {
@@ -799,6 +867,7 @@ impl SecureStorage {
     /// identifier, not a credential. (Every other writer refuses, because for
     /// them a blank rewrite is silent credential loss, not the point.)
     pub fn clear_tokens(&self) -> Result<()> {
+        let _lock = token_store_write_lock();
         let mut tokens = self.load_tokens().unwrap_or_default();
         tokens.access_token = None;
         tokens.refresh_token = None;
@@ -824,6 +893,7 @@ impl SecureStorage {
         tokens.interactive_signed_out = true;
         self.save_tokens(&tokens)?;
         info!("Tokens cleared from secure file storage");
+        note_machine_key_state(None);
         Ok(())
     }
 
@@ -1388,6 +1458,23 @@ impl SecureStorage {
         tokens.device_machine_key_expires_at = expires_at;
         self.save_tokens(&tokens)?;
         info!("device machine key stored in secure file storage");
+        note_machine_key_state(Some(expires_at));
+        Ok(())
+    }
+
+    /// Mark the stored machine key's expiry unknown, leaving the key alone.
+    /// Used when web answers self-mint with 409 ("usable beyond 7 days"): the
+    /// stored value was a stale lower bound (web slides expiry on each
+    /// exchange), and 409 proves only "more than 7 days".
+    pub fn clear_device_machine_key_expiry(&self) -> Result<()> {
+        let mut tokens = self.load_tokens_for_write()?;
+        tokens.device_machine_key_expires_at = None;
+        let present = tokens
+            .device_machine_key
+            .as_deref()
+            .is_some_and(|k| !k.trim().is_empty());
+        self.save_tokens(&tokens)?;
+        note_machine_key_state(present.then_some(None));
         Ok(())
     }
 
@@ -1409,6 +1496,7 @@ impl SecureStorage {
         tokens.device_machine_key_expires_at = None;
         self.save_tokens(&tokens)?;
         info!("device machine key cleared from secure file storage");
+        note_machine_key_state(None);
         Ok(())
     }
 
@@ -2108,6 +2196,41 @@ mod tests {
         let raw = r#"{"access_token":"a","refresh_token":"r","device_id":"d"}"#;
         let parsed: StoredTokens = serde_json::from_str(raw).expect("legacy shape must decode");
         assert!(parsed.tenant_device_jwts.is_empty());
+    }
+
+    /// Review finding 4 (plan 2026-09-24 Phase 3): concurrent read-modify-
+    /// writes must not lose each other's updates. Each thread writes its OWN
+    /// tenant slot through a separate `SecureStorage` on the same file (the
+    /// refresher, the enrol task and a Tauri command each hold their own);
+    /// without the process-wide lock, a writer that loaded before another saved
+    /// writes the stale struct back and that slot vanishes.
+    #[test]
+    fn concurrent_writers_do_not_lose_updates() {
+        let path = std::env::temp_dir()
+            .join("qontinui_test_storage_lock")
+            .join(format!("{}.enc", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let tenants: Vec<uuid::Uuid> = (0..16).map(|_| uuid::Uuid::now_v7()).collect();
+        let handles: Vec<_> = tenants
+            .iter()
+            .map(|t| {
+                let (path, t) = (path.clone(), *t);
+                std::thread::spawn(move || {
+                    let s = SecureStorage::with_path(path).unwrap();
+                    s.store_tenant_device_jwt(&t, &format!("jwt-{t}")).unwrap();
+                    s.store_device_machine_key("dmk_concurrent").unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let s = SecureStorage::with_path(path).unwrap();
+        let mut held = s.list_tenant_device_jwt_tenants();
+        held.sort();
+        let mut want = tenants.clone();
+        want.sort();
+        assert_eq!(held, want, "every concurrent writer's slot survives");
     }
 
     /// Plan 2026-09-24 Phase 3: the machine key's expiry is stored with the

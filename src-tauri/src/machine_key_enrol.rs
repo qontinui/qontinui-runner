@@ -24,7 +24,7 @@
 //!
 //! Callers:
 //! - the device-JWT refresher, after every SUCCESSFUL refresh
-//!   ([`spawn_ensure_after_refresh`]) — gated by [`plan_enrolment`] and
+//!   ([`ensure_after_refresh`], spawned by the refresher) — gated by [`plan_enrolment`] and
 //!   rate-limited by [`EnrolGate`], so a refusal or an outage never hammers web;
 //! - the pair-code and browser pairing paths, right after a successful pairing
 //!   ([`self_mint_blocking`], via `pair::enrol_machine_key_into`) —
@@ -66,6 +66,8 @@ pub trait MachineKeyStore {
     fn machine_key_expires_at(&self) -> anyhow::Result<Option<i64>>;
     /// Persist a freshly enrolled key and its reported expiry.
     fn store_machine_key(&self, key: &str, expires_at: Option<i64>) -> anyhow::Result<()>;
+    /// Mark the stored key's expiry unknown, leaving the key itself alone.
+    fn forget_machine_key_expiry(&self) -> anyhow::Result<()>;
 }
 
 /// What the store holds, collapsed to the three cases the decision needs.
@@ -357,12 +359,35 @@ pub enum EnrolOutcome {
     StoreFailed(String),
 }
 
+/// Refusals that are about the PRESENTED TOKEN rather than the device. The
+/// gate is process-wide and several triggers present different tokens (a
+/// tenant slot's, the legacy slot's), so one token's refusal must not hold the
+/// others off for the long refusal backoff. Codes from qontinui-web
+/// `get_paired_device` and `self_mint_device_machine_credential`.
+fn refusal_is_token_specific(status: u16, code: Option<&str>) -> bool {
+    status == 401
+        || matches!(
+            code,
+            Some(
+                "device_token_provenance_refused"
+                    | "not_a_device_principal"
+                    | "device_mismatch"
+                    | "coord_refused_device_token"
+            )
+        )
+}
+
 impl EnrolOutcome {
     /// Seconds before the next attempt is allowed, or `None` for no wait.
     fn backoff_secs(&self) -> Option<i64> {
         match self {
             Self::Enrolled { .. } => None,
             Self::StillUsable => Some(BACKOFF_STILL_USABLE_SECS),
+            Self::Refused { status, code }
+                if refusal_is_token_specific(*status, code.as_deref()) =>
+            {
+                Some(BACKOFF_TRANSIENT_SECS)
+            }
             Self::Refused { .. } => Some(BACKOFF_REFUSED_SECS),
             Self::Unsupported { .. } => Some(BACKOFF_UNSUPPORTED_SECS),
             Self::Transient { .. } | Self::StoreFailed(_) => Some(BACKOFF_TRANSIENT_SECS),
@@ -370,20 +395,42 @@ impl EnrolOutcome {
     }
 }
 
+/// Run blocking store I/O off the async worker. A join failure reads as an
+/// unreadable store — UNKNOWN, never "absent".
+async fn read_stored_key_blocking<S>(store: &Arc<S>) -> StoredKey
+where
+    S: MachineKeyStore + Send + Sync + 'static,
+{
+    let s = Arc::clone(store);
+    crate::wedge_diagnostics::spawn_blocking_tracked(move || read_stored_key(s.as_ref()))
+        .await
+        .unwrap_or(StoredKey::Unreadable)
+}
+
 /// Call self-mint and, on 201, store the key and its expiry.
-pub async fn enrol_with<S: MachineKeyStore + ?Sized>(
-    store: &S,
+pub async fn enrol_with<S>(
+    store: &Arc<S>,
     client: &reqwest::Client,
     web_base: &str,
     device_id: &str,
     device_jwt: &str,
-) -> EnrolOutcome {
+) -> EnrolOutcome
+where
+    S: MachineKeyStore + Send + Sync + 'static,
+{
     match self_mint(client, web_base, device_id, device_jwt).await {
-        SelfMintHttp::Minted { key, expires_at } => match store.store_machine_key(&key, expires_at)
-        {
-            Ok(()) => EnrolOutcome::Enrolled { expires_at },
-            Err(e) => EnrolOutcome::StoreFailed(format!("{e:#}")),
-        },
+        SelfMintHttp::Minted { key, expires_at } => {
+            let s = Arc::clone(store);
+            let stored = crate::wedge_diagnostics::spawn_blocking_tracked(move || {
+                s.store_machine_key(&key, expires_at)
+            })
+            .await;
+            match stored {
+                Ok(Ok(())) => EnrolOutcome::Enrolled { expires_at },
+                Ok(Err(e)) => EnrolOutcome::StoreFailed(format!("{e:#}")),
+                Err(join) => EnrolOutcome::StoreFailed(format!("store task failed: {join}")),
+            }
+        }
         SelfMintHttp::StillUsable => EnrolOutcome::StillUsable,
         SelfMintHttp::Refused { status, code } => EnrolOutcome::Refused { status, code },
         SelfMintHttp::Unsupported { status } => EnrolOutcome::Unsupported { status },
@@ -485,8 +532,36 @@ impl StateTracker {
     }
 }
 
+/// Minimum spacing of the refresher's idle-tick store reads
+/// ([`observe_stored_key_if_due`]).
+const IDLE_OBSERVE_INTERVAL_SECS: i64 = 30 * 60;
+
+/// "Has at least `interval` passed since the last `due` that said yes?"
+#[derive(Debug, Default)]
+pub struct ReadThrottle {
+    last: Mutex<Option<i64>>,
+}
+
+impl ReadThrottle {
+    pub const fn new() -> Self {
+        Self {
+            last: Mutex::new(None),
+        }
+    }
+
+    pub fn due(&self, now: i64, interval: i64) -> bool {
+        let mut last = self.last.lock().unwrap_or_else(|p| p.into_inner());
+        if last.is_some_and(|t| now - t < interval) {
+            return false;
+        }
+        *last = Some(now);
+        true
+    }
+}
+
 static GATE: EnrolGate = EnrolGate::new();
 static TRACKER: StateTracker = StateTracker::new();
+static IDLE_READS: ReadThrottle = ReadThrottle::new();
 
 /// Record the process-wide machine-key state (one log line per change).
 pub fn observe_machine_key_state(state: MachineKeyState) -> bool {
@@ -494,9 +569,29 @@ pub fn observe_machine_key_state(state: MachineKeyState) -> bool {
 }
 
 /// The process-wide machine-key state for `/health.coordCredential.machineKey`
-/// — `unknown` until something in this process has read the store.
+/// — `unknown` until something in this process has read or written the key.
 pub fn machine_key_health_state() -> MachineKeyState {
     TRACKER.current()
+}
+
+/// Read the store and record its state process-wide. BLOCKING — call from a
+/// blocking thread. The refresher calls it once at start so `/health` does not
+/// read `unknown` until the first refresh.
+pub fn observe_stored_key<S: MachineKeyStore + ?Sized>(store: &S) -> MachineKeyState {
+    let state = classify(read_stored_key(store), chrono::Utc::now().timestamp());
+    TRACKER.observe(state);
+    state
+}
+
+/// [`observe_stored_key`], at most once per [`IDLE_OBSERVE_INTERVAL_SECS`] —
+/// for the refresher's idle ticks, which keep an `expiring` key's state moving
+/// with the clock. BLOCKING when due.
+pub fn observe_stored_key_if_due<S: MachineKeyStore + ?Sized>(
+    store: &S,
+) -> Option<MachineKeyState> {
+    IDLE_READS
+        .due(chrono::Utc::now().timestamp(), IDLE_OBSERVE_INTERVAL_SECS)
+        .then(|| observe_stored_key(store))
 }
 
 /// What [`ensure_machine_key`] did.
@@ -516,10 +611,19 @@ pub enum EnsureResult {
 
 /// Read the stored key, record its state, and — when [`plan_enrolment`] says
 /// so and `gate` allows — enrol through self-mint. Called after a successful
-/// device-JWT refresh with that refresh's (live) JWT.
+/// device-JWT refresh with that refresh's (live) JWT. Every store read and
+/// write runs on the blocking pool.
+///
+/// **A 409 on a key whose stored expiry says `expiring` forgets that expiry.**
+/// Web slides a key's `expires_at` on every successful `/exchange` and the
+/// runner never learns the new value, so a stored expiry is only a lower
+/// bound that goes stale. A 409 proves the key is usable beyond 7 days but not
+/// by how much, so the honest record is "unknown" (`/health` then reads
+/// `present`, not a permanent `expiring`); the key is re-checked with web no
+/// more than once a day ([`EnrolReason::ExpiryUnknown`] + the 409 backoff).
 #[allow(clippy::too_many_arguments)]
-pub async fn ensure_machine_key<S: MachineKeyStore + ?Sized>(
-    store: &S,
+pub async fn ensure_machine_key<S>(
+    store: &Arc<S>,
     gate: &EnrolGate,
     tracker: &StateTracker,
     client: &reqwest::Client,
@@ -527,8 +631,11 @@ pub async fn ensure_machine_key<S: MachineKeyStore + ?Sized>(
     device_id: &str,
     device_jwt: &str,
     now: i64,
-) -> EnsureResult {
-    let stored = read_stored_key(store);
+) -> EnsureResult
+where
+    S: MachineKeyStore + Send + Sync + 'static,
+{
+    let stored = read_stored_key_blocking(store).await;
     tracker.observe(classify(stored, now));
     let reason = match plan_enrolment(stored, now) {
         EnrolPlan::Skip(why) => return EnsureResult::Skipped(why),
@@ -552,39 +659,59 @@ pub async fn ensure_machine_key<S: MachineKeyStore + ?Sized>(
              (user-bearer /machine-credential/mint) or re-pair"
         ),
         EnrolOutcome::StillUsable => {
-            info!("device machine key: web reports the key usable for > 7 days")
+            info!("device machine key: web reports the key usable for > 7 days");
+            if matches!(
+                stored,
+                StoredKey::Present {
+                    expires_at: Some(_)
+                }
+            ) {
+                let s = Arc::clone(store);
+                match crate::wedge_diagnostics::spawn_blocking_tracked(move || {
+                    s.forget_machine_key_expiry()
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        warn!("device machine key: forgetting a stale expiry failed: {e:#}")
+                    }
+                    Err(e) => warn!("device machine key: forgetting a stale expiry failed: {e}"),
+                }
+            }
         }
         other => warn!("device machine key: self-mint enrolment did not complete: {other:?}"),
     }
-    tracker.observe(classify(read_stored_key(store), now));
+    tracker.observe(classify(read_stored_key_blocking(store).await, now));
     EnsureResult::Attempted { reason, outcome }
 }
 
-/// The refresher's post-refresh hook: run [`ensure_machine_key`] on its own
-/// task against the process-wide gate and tracker, so the refresh pass never
-/// waits on web.
-pub fn spawn_ensure_after_refresh<S>(
+/// The refresher's post-refresh step: [`ensure_machine_key`] against the
+/// process-wide gate and tracker. The caller spawns it so the refresh pass
+/// never waits on web.
+pub async fn ensure_after_refresh<S>(
     store: Arc<S>,
     web_base: String,
     device_id: String,
     device_jwt: String,
-) where
+) -> Option<EnsureResult>
+where
     S: MachineKeyStore + Send + Sync + 'static,
 {
-    tokio::spawn(async move {
-        let client = match reqwest::Client::builder()
-            .timeout(SELF_MINT_TIMEOUT)
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("device machine key: self-mint client build failed: {e}");
-                return;
-            }
-        };
-        let now = chrono::Utc::now().timestamp();
-        let _ = ensure_machine_key(
-            store.as_ref(),
+    let client = match reqwest::Client::builder()
+        .timeout(SELF_MINT_TIMEOUT)
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("device machine key: self-mint client build failed: {e}");
+            return None;
+        }
+    };
+    let now = chrono::Utc::now().timestamp();
+    Some(
+        ensure_machine_key(
+            &store,
             &GATE,
             &TRACKER,
             &client,
@@ -593,8 +720,8 @@ pub fn spawn_ensure_after_refresh<S>(
             &device_jwt,
             now,
         )
-        .await;
-    });
+        .await,
+    )
 }
 
 #[cfg(test)]
@@ -624,6 +751,10 @@ mod tests {
         fn machine_key_expires_at(&self) -> anyhow::Result<Option<i64>> {
             Ok(*self.exp.lock().unwrap())
         }
+        fn forget_machine_key_expiry(&self) -> anyhow::Result<()> {
+            *self.exp.lock().unwrap() = None;
+            Ok(())
+        }
         fn store_machine_key(&self, key: &str, expires_at: Option<i64>) -> anyhow::Result<()> {
             if self.fail_store {
                 anyhow::bail!("disk full");
@@ -634,12 +765,12 @@ mod tests {
         }
     }
 
-    fn store_with(key: Option<&str>, exp: Option<i64>) -> MemStore {
-        MemStore {
+    fn store_with(key: Option<&str>, exp: Option<i64>) -> Arc<MemStore> {
+        Arc::new(MemStore {
             key: Mutex::new(key.map(str::to_string)),
             exp: Mutex::new(exp),
             ..Default::default()
-        }
+        })
     }
 
     // ---- decision helper (plan step 3) ----
@@ -724,7 +855,7 @@ mod tests {
             assert_eq!(classify(stored, NOW).as_str(), want, "{stored:?}");
         }
         assert_eq!(
-            read_stored_key(&store_with(Some("  "), None)),
+            read_stored_key(&*store_with(Some("  "), None)),
             StoredKey::Absent
         );
         let unreadable = MemStore {
@@ -863,7 +994,7 @@ mod tests {
 
     const MINTED: &str = r#"{"device_id":"0199a1b2-0000-7000-8000-000000000001","device_machine_key":"dmk_fresh_fixture","prefix":"dmk_fresh_fix","expires_at":"2026-11-25T10:00:00Z"}"#;
 
-    async fn run(store: &MemStore, gate: &EnrolGate, base: &str, now: i64) -> EnsureResult {
+    async fn run(store: &Arc<MemStore>, gate: &EnrolGate, base: &str, now: i64) -> EnsureResult {
         let tracker = StateTracker::new();
         ensure_machine_key(
             store,
@@ -906,7 +1037,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conflict_leaves_the_stored_key_untouched_and_is_not_an_error() {
+    async fn conflict_keeps_the_key_forgets_its_stale_expiry_and_is_not_an_error() {
         let web = spawn_web(409, r#"{"detail":{"code":"machine_key_still_usable"}}"#).await;
         let store = store_with(Some("dmk_existing"), Some(NOW + 2 * DAY));
         let gate = EnrolGate::new();
@@ -919,7 +1050,14 @@ mod tests {
             }
         );
         assert_eq!(store.key.lock().unwrap().as_deref(), Some("dmk_existing"));
-        assert_eq!(*store.exp.lock().unwrap(), Some(NOW + 2 * DAY));
+        // Web slides expiry on each exchange, so the stored value was a stale
+        // lower bound; 409 proves only "> 7 days", so it becomes UNKNOWN and
+        // the key reads `present`, not a permanent `expiring`.
+        assert_eq!(*store.exp.lock().unwrap(), None);
+        assert_eq!(
+            classify(read_stored_key(&*store), NOW),
+            MachineKeyState::Present
+        );
         // Not an error: no hourly retry, but a daily re-ask.
         assert_eq!(
             gate.try_claim(NOW + BACKOFF_TRANSIENT_SECS),
@@ -1000,10 +1138,10 @@ mod tests {
     #[tokio::test]
     async fn a_minted_key_that_cannot_be_stored_is_reported() {
         let web = spawn_web(201, MINTED).await;
-        let store = MemStore {
+        let store = Arc::new(MemStore {
             fail_store: true,
             ..Default::default()
-        };
+        });
         let got = run(&store, &EnrolGate::new(), &web.base, NOW).await;
         assert!(
             matches!(
@@ -1025,5 +1163,36 @@ mod tests {
             matches!(got, SelfMintHttp::Transient { status: None, .. }),
             "{got:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_token_specific_refusal_does_not_hold_off_other_tokens_for_long() {
+        let web = spawn_web(
+            403,
+            r#"{"detail":{"code":"device_token_provenance_refused"}}"#,
+        )
+        .await;
+        let store = store_with(None, None);
+        let gate = EnrolGate::new();
+        let _ = run(&store, &gate, &web.base, NOW).await;
+        assert_eq!(
+            gate.try_claim(NOW + 60),
+            Err(NOW + BACKOFF_TRANSIENT_SECS),
+            "a refusal about THIS token backs off like a transient, not 6h"
+        );
+        assert!(gate.try_claim(NOW + BACKOFF_TRANSIENT_SECS).is_ok());
+        assert!(refusal_is_token_specific(401, None));
+        assert!(!refusal_is_token_specific(
+            403,
+            Some("device_machine_key_revoked")
+        ));
+    }
+
+    #[test]
+    fn idle_reads_are_throttled() {
+        let t = ReadThrottle::new();
+        assert!(t.due(NOW, 1800));
+        assert!(!t.due(NOW + 1799, 1800));
+        assert!(t.due(NOW + 1800, 1800));
     }
 }

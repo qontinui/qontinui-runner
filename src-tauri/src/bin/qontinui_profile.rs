@@ -1033,6 +1033,25 @@ impl PairCodeBaseSource {
 ///
 /// The [`PairCodeBaseSource`] half is returned rather than logged here so the
 /// function stays pure and the caller owns the output surface.
+/// The web base the browser pair flow may send its fresh device JWT to for the
+/// machine-key self-mint, or `None` when this binary cannot know it.
+///
+/// Unlike [`resolve_pair_code_base`], the production default is taken ONLY when
+/// the device just paired against the production coord: a device paired
+/// against a dev coord must never present its JWT to production web. An
+/// explicit `$QONTINUI_WEB_BASE` always wins. The runner's canonical resolver
+/// (`api_config`) is unreachable from this binary (see
+/// [`resolve_pair_code_base`]), so anything else is left to the runner's
+/// refresher, which enrols after its next refresh with that resolver's base.
+fn browser_pair_enrol_web_base(coord_base: &str, web_base_env: Option<&str>) -> Option<String> {
+    if let Some(explicit) = web_base_env.filter(|s| !s.trim().is_empty()) {
+        return Some(explicit.trim().trim_end_matches('/').to_string());
+    }
+    let is_prod_coord =
+        coord_base.trim().trim_end_matches('/') == qontinui_runner_lib::profiles::PROD_COORD_BASE;
+    is_prod_coord.then(|| PROD_API_BASE_URL.to_string())
+}
+
 fn resolve_pair_code_base(web_base_env: Option<&str>) -> (String, PairCodeBaseSource) {
     if let Some(explicit) = web_base_env.filter(|s| !s.trim().is_empty()) {
         // Trailing slash would build `<base>//api/v1/...`; trim it here so the
@@ -1180,9 +1199,20 @@ fn cmd_device_pair(
                 // 2026-09-24-runner-coord-credential-stranded-after-outage
                 // Phase 3). Pair-code redeem does this inside
                 // `pair_with_pair_code`; pair-cli's response already carries one.
-                let (web_base, _) =
-                    resolve_pair_code_base(std::env::var("QONTINUI_WEB_BASE").ok().as_deref());
-                qontinui_runner_lib::pair::enrol_machine_key_into(&mut resp, &web_base);
+                match browser_pair_enrol_web_base(
+                    &base,
+                    std::env::var("QONTINUI_WEB_BASE").ok().as_deref(),
+                ) {
+                    Some(web_base) => {
+                        qontinui_runner_lib::pair::enrol_machine_key_into(&mut resp, &web_base)
+                    }
+                    None => eprintln!(
+                        "note: machine key not enrolled at pairing — coord {base} is not \
+                         production and $QONTINUI_WEB_BASE is unset, so the matching web \
+                         backend is unknown here; the runner enrols one after its next \
+                         device-JWT refresh"
+                    ),
+                }
                 resp
             })
         }
@@ -2306,6 +2336,28 @@ mod tests {
     // with no profiles.json and no override must still be able to redeem
     // a pair code against production, not hard-error.
     // ------------------------------------------------------------------
+
+    #[test]
+    fn browser_pair_enrol_never_sends_a_dev_pairing_to_production_web() {
+        assert_eq!(
+            browser_pair_enrol_web_base("http://localhost:9870", None),
+            None,
+            "a dev coord with no explicit web base must not default to prod web"
+        );
+        assert_eq!(
+            browser_pair_enrol_web_base("https://coord.qontinui.io/", None).as_deref(),
+            Some(PROD_API_BASE_URL)
+        );
+        assert_eq!(
+            browser_pair_enrol_web_base("http://localhost:9870", Some("http://localhost:8000/"))
+                .as_deref(),
+            Some("http://localhost:8000")
+        );
+        assert_eq!(
+            browser_pair_enrol_web_base("http://localhost:9870", Some("  ")),
+            None
+        );
+    }
 
     #[test]
     fn resolve_pair_code_base_prefers_env_override_over_everything() {

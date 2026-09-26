@@ -3062,6 +3062,10 @@ impl qontinui_runner_lib::machine_key_enrol::MachineKeyStore for AuthManager {
     fn store_machine_key(&self, key: &str, expires_at: Option<i64>) -> Result<()> {
         self.store_device_machine_key_with_expiry(key, expires_at)
     }
+
+    fn forget_machine_key_expiry(&self) -> Result<()> {
+        self.secure_storage.clear_device_machine_key_expiry()
+    }
 }
 
 #[cfg(test)]
