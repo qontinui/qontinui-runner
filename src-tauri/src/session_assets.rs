@@ -160,7 +160,10 @@ fn provision_session_assets_from_root(root: Option<&Path>, workdir: &str, regist
 /// arm. Which arm answered is a fact about resolution, not provisioning, so a
 /// session that is given nothing still records it; otherwise a box whose
 /// sessions all land on such a cwd reads both capability rows as unknown. The
-/// two provisioners are its only other recorders.
+/// two provisioners are its only other recorders. The repo-authored arm is
+/// tested through `skip_repo_authored_claude_tree` directly, because
+/// `provision_session_cwd` itself also runs coord-mcp and allocation steps that
+/// a unit test cannot drive.
 pub(crate) fn observe_registries(registries: &Registries) {
     crate::fleet_commands::observe_commands_registry(&registries.commands);
     crate::fleet_skills::observe_skills_registry(&registries.skills);
