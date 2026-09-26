@@ -1331,8 +1331,7 @@ pub(crate) fn build_visibility_report(
             continue;
         }
         // Classified AFTER the minRatio filter, as the SDK does.
-        let is_expected_overlay =
-            modal_ids.is_some_and(|ids| is_tracked_overlay(occluded_by, ids));
+        let is_expected_overlay = modal_ids.is_some_and(|ids| is_tracked_overlay(occluded_by, ids));
         if is_expected_overlay && !include_expected {
             expected_overlays_filtered += 1;
             continue;
@@ -1854,7 +1853,11 @@ mod visibility_tests {
     fn modal_ids_from_context_distinguishes_unavailable_from_empty() {
         use super::modal_ids_from_context;
 
-        assert_eq!(modal_ids_from_context(&json!(null)), None, "null = no detector");
+        assert_eq!(
+            modal_ids_from_context(&json!(null)),
+            None,
+            "null = no detector"
+        );
         assert_eq!(
             modal_ids_from_context(&json!({})),
             None,
@@ -1897,21 +1900,29 @@ mod visibility_tests {
     #[test]
     fn is_tracked_overlay_matches_identities_only() {
         use super::is_tracked_overlay;
-        let ids: std::collections::HashSet<String> =
-            ["modal-1".to_string()].into_iter().collect();
+        let ids: std::collections::HashSet<String> = ["modal-1".to_string()].into_iter().collect();
 
         assert!(is_tracked_overlay("modal-1", &ids));
         assert!(is_tracked_overlay("div#modal-1", &ids));
         assert!(is_tracked_overlay("#modal-1", &ids));
-        assert!(!is_tracked_overlay("div.modal-1", &ids), "a class is not an identity");
-        assert!(!is_tracked_overlay("div", &ids), "a bare tag is not an identity");
+        assert!(
+            !is_tracked_overlay("div.modal-1", &ids),
+            "a class is not an identity"
+        );
+        assert!(
+            !is_tracked_overlay("div", &ids),
+            "a bare tag is not an identity"
+        );
         assert!(!is_tracked_overlay("modal-10", &ids));
         assert!(
             !is_tracked_overlay("div#x#modal-1", &ids),
             "split at the FIRST `#`, as `indexOf('#')` does: the remainder is \
              `x#modal-1`, which is not a modal id"
         );
-        assert!(!is_tracked_overlay("modal-1", &std::collections::HashSet::new()));
+        assert!(!is_tracked_overlay(
+            "modal-1",
+            &std::collections::HashSet::new()
+        ));
     }
 
     /// The route must be BOTH mounted and declared - `route_entries()` is what
