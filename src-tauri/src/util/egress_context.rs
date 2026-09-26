@@ -395,12 +395,14 @@ pub(crate) fn open_descriptor_count() -> Measured {
 
     #[cfg(not(target_os = "linux"))]
     {
-        // Windows' `GetProcessHandleCount` counts every kernel handle —
-        // threads, events, mutexes — not descriptors, and there is no
-        // per-process ceiling to hold it against (see [`fd_soft_limit`]).
-        // Publishing it as `fd_open` would label a handle count a descriptor
-        // count, so off Linux this read is honestly UNKNOWN. The handle count
-        // is still reported by `handle_census` under its own name.
+        // There is no `/proc/self/fd` to walk off Linux. On Windows the
+        // census's `GetProcessHandleCount` counts every kernel handle —
+        // threads, events, mutexes — not descriptors, with no per-process
+        // ceiling to hold it against (see [`fd_soft_limit`]); on macOS and
+        // other Unixes an RLIMIT exists but no descriptor count is taken.
+        // Publishing a handle count as `fd_open` would mislabel it, so off
+        // Linux this read is honestly UNKNOWN. The Windows handle count is
+        // still reported by `handle_census` under its own name.
         Measured::Unavailable("descriptor count is measured on Linux only")
     }
 }
@@ -773,6 +775,14 @@ mod tests {
             assert!(limit > 0, "a running test process has a positive limit");
             assert!(h.headroom().counted().is_some());
         }
+    }
+
+    /// Off Linux the descriptor count is UNKNOWN — never a kernel handle
+    /// count relabelled as descriptors.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn descriptor_count_is_unavailable_off_linux() {
+        assert!(matches!(open_descriptor_count(), Measured::Unavailable(_)));
     }
 
     /// Windows has no RLIMIT_NOFILE; the limit (and so the headroom) is typed

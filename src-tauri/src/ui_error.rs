@@ -909,7 +909,8 @@ impl FdPressureInputs {
 pub const FD_STARVED_FLOOR: u64 = 32;
 
 /// The headroom below which the receive path is treated as starved:
-/// `max(FD_STARVED_FLOOR, soft_limit / 20)`.
+/// `max(FD_STARVED_FLOOR, soft_limit / 20)`, capped at `soft_limit / 4`,
+/// minimum 1.
 ///
 /// Why 5 %: the floor alone is meaningless against a 1,048,576 limit (a
 /// process that has leaked a million descriptors has 32 left for a
