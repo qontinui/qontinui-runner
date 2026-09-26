@@ -21,6 +21,7 @@
 //! `(site, host, kind)`: a DIFFERENT failure — another host, or the same host
 //! failing a different way (DNS → connect refused → timeout) — is new
 //! information and logs immediately. Only the identical repeat is suppressed.
+//! The map is bounded ([`TRANSPORT_LOG_MAX_KEYS`]).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -29,6 +30,11 @@ use std::time::{Duration, Instant};
 /// How long an identical `(site, host, kind)` failure stays quiet after it
 /// last logged.
 pub(crate) const TRANSPORT_LOG_WINDOW: Duration = Duration::from_secs(5 * 60);
+
+/// Most distinct keys remembered. Past this the least-recently-emitted key is
+/// evicted, so a flood of distinct hosts can never grow the map without bound
+/// (an evicted key simply logs again the next time it fails).
+pub(crate) const TRANSPORT_LOG_MAX_KEYS: usize = 256;
 
 /// Coarse class of a transport failure, derived from the error chain. Coarse
 /// on purpose: it is a dedupe key, and the full chain still goes in the line.
@@ -124,6 +130,15 @@ impl TransportLogDedupe {
                 LogDecision::Emit { suppressed }
             }
             None => {
+                if entries.len() >= TRANSPORT_LOG_MAX_KEYS {
+                    if let Some(oldest) = entries
+                        .iter()
+                        .min_by_key(|(_, e)| e.last_emitted)
+                        .map(|(k, _)| k.clone())
+                    {
+                        entries.remove(&oldest);
+                    }
+                }
                 entries.insert(
                     key,
                     Entry {
@@ -142,13 +157,14 @@ fn global() -> &'static TransportLogDedupe {
     GLOBAL.get_or_init(|| TransportLogDedupe::new(TRANSPORT_LOG_WINDOW))
 }
 
-/// Host of `url`, or the raw string when it does not parse — a dedupe key
-/// must never collapse two different failures into "".
+/// Host of `url`, or `"unparseable"` when it has none. Never the full URL:
+/// a path or query in the key would split one failing host into many keys
+/// (and put request detail into a long-lived map).
 pub(crate) fn host_of(url: &str) -> String {
     reqwest::Url::parse(url)
         .ok()
         .and_then(|u| u.host_str().map(str::to_string))
-        .unwrap_or_else(|| url.to_string())
+        .unwrap_or_else(|| "unparseable".to_string())
 }
 
 /// `warn!` a reqwest send failure at most once per `(site, host, kind)` per
@@ -272,11 +288,33 @@ mod tests {
     }
 
     #[test]
+    fn the_key_map_is_bounded() {
+        let d = TransportLogDedupe::new(Duration::from_secs(300));
+        let t0 = Instant::now();
+        for i in 0..(TRANSPORT_LOG_MAX_KEYS + 50) {
+            let _ = d.decide(
+                "s",
+                &format!("h{i}"),
+                TransportErrorKind::Dns,
+                t0 + Duration::from_millis(i as u64),
+            );
+        }
+        assert_eq!(d.entries.lock().unwrap().len(), TRANSPORT_LOG_MAX_KEYS);
+        // The oldest were evicted, the newest kept.
+        assert!(!d.entries.lock().unwrap().contains_key(&(
+            "s".into(),
+            "h0".into(),
+            TransportErrorKind::Dns
+        )));
+    }
+
+    #[test]
     fn host_of_parses_urls_and_never_collapses_to_empty() {
         assert_eq!(
             host_of("https://coord.qontinui.io/coord/trees/upsert"),
             "coord.qontinui.io"
         );
-        assert_eq!(host_of("not a url"), "not a url");
+        assert_eq!(host_of("not a url"), "unparseable");
+        assert_eq!(host_of("/coord/trees/upsert?x=1"), "unparseable");
     }
 }
