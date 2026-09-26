@@ -423,7 +423,7 @@ only one of them means "rescue":
 > already written in `/create-plan` §5 and in this step — what was missing was
 > anything that **verified** it, which is why the instruction moved into the
 > subagent's reply contract. Committing is necessary, not sufficient: the plan
-> is not on `main` until a PR lands it, which is the check immediately below.
+> is not on `main` until it lands there, which is the check immediately below.
 >
 > Note the detector trap this also fixes. **This paragraph is background for
 > whoever builds the corpus-wide sweep — it is not a step to run here.** A
@@ -438,18 +438,25 @@ only one of them means "rescue":
 > branches, which are on a ref and so invisible to `git status` while being just
 > as invisible to every peer.
 
-**Confirm a PR carries that branch's push too — the push is not the
-publication.** On a coord-merge-authority repo a pushed branch with no pull
-request never reaches `main`, so the plan stays invisible to every
-`origin/main` reader (9 stems were pushed and never proposed on 2026-09-02).
-Read `gh pr list --repo <owner/repo> --head <branch> --state all --json
-number,state,headRefOid` and apply
+**Then land the plan with the helper — the push is not the publication.**
+A branch pushed with no pull request, onto a repo that needs one, never reaches
+`main`, so the plan stays invisible to every `origin/main` reader (9 stems were
+pushed and never proposed on 2026-09-02). Publish the committed plan file with
+`bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh "<plans-repo-root>" "<repo-relative path>" "<local file>" "<commit subject>"` rather than asserting from prose whether the plans repo needs a PR:
+the helper's ruleset probe of the default branch decides. It lands the blob
+directly and prints `LANDED <commit|unchanged> <blob>`, or — where a PR is
+required or the probe cannot tell — cuts a fresh branch, opens a new PR with
+`gh pr create` (the only opener it runs; never `gh pr merge`) and prints
+`PROPOSED <pr-url|branch> <branch>`. A caller holding coord's MCP door that
+wants `coord_create_pr` sets `LAND_PLAN_STAMP_NO_PR=1` — the helper then pushes
+and reads back the branch, prints it, and opens nothing — and opens the PR
+itself with `coord_create_pr`, falling back to `gh pr create`. It never pushes to an existing branch. A
+non-zero exit means the plan is NOT published — report it. On `PROPOSED`, read
+`gh pr list --repo <owner/repo> --head <branch> --state all --json
+number,state,headRefOid` for the branch the line names. A NON-stamp push to an
+existing branch stays governed by
 `knowledge-base/qontinui-specific/coord-ff-lands.md` → "Pushing to a branch
-whose PR may already have landed". An empty
-result carries nothing, and so does one with only CLOSED or MERGED PRs, or one
-whose OPEN PR's head is already on `origin/main` by content. When commits remain unlanded, take its
-fresh-branch path and open the new PR — `coord_create_pr` first, then
-`gh pr create`, never `gh pr merge`. Runbook:
+whose PR may already have landed". Runbook:
 `knowledge-base/qontinui-specific/bodyless-work-units-and-stranded-plans.md`.
 
 ### Step 3 — Vet + implement
