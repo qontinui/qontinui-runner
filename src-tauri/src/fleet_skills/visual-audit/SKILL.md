@@ -272,23 +272,32 @@ finding, which reaches every surface that can produce a snapshot.
 last of which is why an empty `occlusions` list is not automatically good
 news.
 
-**A 404 is UNKNOWN, never a pass.** On the runner and on React Native the route
-does not exist, and a web surface running an `@qontinui/ui-bridge` build older
-than 2026-08-27 (`4284cd29`) will 404 it too. Never delete the check on a 404:
+**A 404 is UNKNOWN, never a pass.** On React Native the route does not exist,
+a web surface running an `@qontinui/ui-bridge` build older than 2026-08-27
+(`4284cd29`) will 404 it, and so will a runner build older than 2026-08-30 (the
+runner serves it from its own Rust twin since then). Never delete the check on a 404:
 record the page's occlusion state as UNVERIFIED and fall back to `analyze`'s
 `occlusion` finding (above), which reaches every surface that can produce a
 snapshot.
 
-⚠️ **`includeExpected` is accepted and echoed back but NEVER APPLIED.** Commit
-`ccb77d2` deleted the `if (occ.isExpectedOverlay && !includeExpected) continue;`
-filter along with the `computeVisibility` import (a genuine package cycle —
-`ui-bridge-auto` depends on `ui-bridge`), and both the handler and its relay
-twin now hardcode `isExpectedOverlay: false`. So **an open modal or dropdown
-reports `occlusions_found` with `hidesText: true`** — expected overlays are not
-suppressed. Triage those by hand against what you know is open; do not read them
-as a regression. Restoring the filter needs a design decision about where
-`isExpectedOverlay` is computed, tracked in plan
-`2026-08-27-mobile-relay-followups-observability-and-sdk-contracts`.
+**`includeExpected` (default `false`) drops occlusions by a TRACKED modal —
+read `expectedOverlayDetection` to know whether that happened.** Filtered
+entries are counted in `expectedOverlaysFiltered`; `includeExpected: true` keeps
+them, marked `isExpectedOverlay: true`. The SDK has applied it since `fc6838e`
+(2026-08-30, restoring the filter `ccb77d2` removed) on the handler and its
+relay twin, and the runner's Rust twin does from plan
+`2026-09-10-the-runners-rust-visibility-twin-diverges-from-the-sdk-it-mirrors`
+onward. `"modal-stack"` means a modal detector answered and matched occluders were
+filtered; a remaining `hidesText: true` entry is either a real finding or an
+occluder the narrow rule could not match (a class-described backdrop, a modal
+child with its own id), so check it against what is open before calling a
+FAIL. `"unavailable"` — or the field ABSENT, which itself identifies a build
+predating classification — means nothing was
+classified: **an open modal or dropdown still reports `occlusions_found` with
+`hidesText: true`**, so triage those by hand against what you know is open
+rather than reading them as a regression. Matching is deliberately narrow
+(registry id or DOM id equal to the modal's id), so an untracked dropdown or
+popover is never filtered.
 
 ## The Assertion DSL
 

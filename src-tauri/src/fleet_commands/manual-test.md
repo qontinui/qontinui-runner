@@ -1314,23 +1314,39 @@ the wrong application. On the runner and on mobile, step 1 is **skipped**.
   warning: a covered label destroys information the reader cannot recover.
 - `verdict: "unknown_empty_registry"` → the registry was empty. UNVERIFIED, not
   clear.
-- **A 404 is UNVERIFIED, never a pass.** On the runner and on mobile the route
-  does not exist, and a web surface running an `@qontinui/ui-bridge` build older
-  than 2026-08-27 (`4284cd29`) 404s it too. Do not drop the requirement: record
+- **A 404 is UNVERIFIED, never a pass.** On mobile the route does not exist, a
+  web surface running an `@qontinui/ui-bridge` build older than 2026-08-27
+  (`4284cd29`) 404s it, and so does a runner build older than 2026-08-30 (the
+  runner serves it from its own Rust twin since then). Do not drop the requirement: record
   the page's occlusion state as UNVERIFIED and get the signal from step 2's
   `analyze` `occlusion` finding instead, which works on every surface that can
   produce a snapshot.
-- ⚠️ **Occlusion by a tracked modal/dropdown is NOT filtered out.**
-  `includeExpected` is accepted and echoed back but never applied: commit
-  `ccb77d2` deleted the `if (occ.isExpectedOverlay && !includeExpected) continue;`
-  filter along with the `computeVisibility` import (a real package cycle —
-  `ui-bridge-auto` depends on `ui-bridge`), and both the handler and its relay
-  twin now hardcode `isExpectedOverlay: false`. **An open modal therefore reports
-  `occlusions_found` with `hidesText: true`.** That is the tool working as
-  currently built, not a page defect — triage such entries by hand against what
-  you know is open before calling a FAIL. Restoring the filter needs a design
-  decision about where `isExpectedOverlay` is computed; tracked in plan
-  `2026-08-27-mobile-relay-followups-observability-and-sdk-contracts`.
+- **Occlusion by a tracked modal is filtered by default — READ
+  `expectedOverlayDetection` before trusting that.** `includeExpected` (default
+  `false`) drops occlusions whose occluder is a modal the webview's modal
+  detector is tracking, counts them in `expectedOverlaysFiltered`, and
+  `includeExpected: true` keeps them with `isExpectedOverlay: true`. The SDK has
+  done this since `fc6838e` (2026-08-30, which restored the filter `ccb77d2`
+  had removed) on both the handler and its relay twin; the runner's Rust twin
+  does it from plan
+  `2026-09-10-the-runners-rust-visibility-twin-diverges-from-the-sdk-it-mirrors`
+  onward. The field says whether classification actually ran:
+  - `"modal-stack"` — a modal detector answered, and occluders it could match
+    to an open modal are already filtered. A remaining `hidesText: true` entry
+    is EITHER a real finding OR an occluder the deliberately narrow rule below
+    could not match (a backdrop described by class, a modal child registered
+    under its own id, a detector id like `modal-3` that no occluder carries) —
+    check it against what is open before calling a FAIL.
+  - `"unavailable"` — nothing was classified and nothing was filtered: an open
+    modal still reports `occlusions_found` with `hidesText: true`. Triage those
+    entries by hand against what you know is open before calling a FAIL.
+  - **field absent** — the build you are driving predates classification; the
+    absence IS the build check, no version lookup needed (a runner build
+    without this change, or an SDK build before `fc6838e`). Treat it exactly as
+    `"unavailable"`.
+  Matching is deliberately narrow (the occluder's registry id, or its DOM id,
+  equals the modal's id); a dropdown or popover the detector does not track is
+  never filtered.
 
 For a page reachable **by URL**, prefer `scripts/verify-page-verdict.sh` —
 it runs this same chain through the shipped qontinui-web adapter and cannot
