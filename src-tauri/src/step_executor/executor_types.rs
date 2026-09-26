@@ -533,6 +533,14 @@ pub struct ExecutionStepConfig {
     #[serde(alias = "a11yQueryLabel", alias = "query_label")]
     pub a11y_query_label: Option<String>,
 
+    /// Automation ID filter for "query" action (UIA AutomationId / test ID)
+    #[serde(alias = "a11yQueryAutomationId", alias = "query_automation_id")]
+    pub a11y_query_automation_id: Option<String>,
+
+    /// Class name filter for "query" action (native control class / CSS class)
+    #[serde(alias = "a11yQueryClassName", alias = "query_class_name")]
+    pub a11y_query_class_name: Option<String>,
+
     /// Only include interactive elements (for "query" and "ai_context")
     #[serde(alias = "a11yInteractiveOnly", alias = "interactive_only", default)]
     pub a11y_interactive_only: Option<bool>,
