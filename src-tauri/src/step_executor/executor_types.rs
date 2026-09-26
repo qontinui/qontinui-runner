@@ -92,6 +92,15 @@ pub struct ExecutionStepConfig {
     #[serde(rename = "type", alias = "step_type")]
     pub step_type: String,
 
+    /// Set by a step-conversion seam (`unified_workflow_executor::step_conversion`)
+    /// when the step could not be parsed and no faithful fallback exists
+    /// (today: a `ui_bridge` step). A step carrying it FAILS at execution with
+    /// this message (`DispatchRoute::ConversionFailed`) — it is never run as a
+    /// snapshot or skipped, so a workflow cannot pass without it. Serialized,
+    /// so it survives `execution_steps_json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversion_error: Option<String>,
+
     /// Explicit command mode: "shell", "check", "check_group", or "test".
     /// When set, the command handler uses this directly instead of inferring
     /// from which optional fields are populated.
@@ -581,9 +590,10 @@ pub struct ExecutionStepConfig {
     /// VGA: UUID referencing `runner.vga_state_machines.id` — the persisted
     /// state machine defining the elements the step may click/type/wait for.
     ///
-    /// VGA state machine id. See `qontinui-schemas::workflow_step`
-    /// for the canonical spelling (`vgaStateMachineId`) — the aliases
-    /// here exist only for historical JSON compatibility.
+    /// Serializes as `vga_state_machine_id`, which
+    /// `qontinui_types::workflow_step::VgaAutomateStep` accepts as an alias
+    /// (it serializes `stateMachineId`). Also accepts `stateMachineId` and
+    /// `state_machine_id`.
     #[serde(alias = "stateMachineId", alias = "state_machine_id", default)]
     pub vga_state_machine_id: Option<String>,
 
@@ -626,7 +636,16 @@ pub struct ExecutionStepConfig {
     /// Wrapper Action: JSON object of params to pass to the action.
     /// Values may contain `{{ variable }}` template references that are
     /// resolved against the workflow's runtime context before dispatch.
-    #[serde(alias = "wrapperParams", alias = "wrapper_params", default)]
+    ///
+    /// `params` is the key the Builder writes (`AddStepDropdown.tsx`,
+    /// `WrapperActionStepConfig.tsx`); without the alias a Builder step's
+    /// params never reached the handler.
+    #[serde(
+        alias = "wrapperParams",
+        alias = "wrapper_params",
+        alias = "params",
+        default
+    )]
     pub wrapper_params: Option<serde_json::Value>,
 
     /// Wrapper Action: Optional name of a workflow variable to write the

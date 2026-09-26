@@ -101,6 +101,8 @@ const VALID_UI_BRIDGE_ACTIONS: &[&str] = &[
     "snapshot",
     "snapshot_assert",
     "element_action",
+    "component_action",
+    "click",
     "wait_for_element",
     "wait",
     "compare",

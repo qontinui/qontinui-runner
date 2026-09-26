@@ -528,6 +528,74 @@ fn parse_ui_bridge_target_as_criteria(raw: Option<&str>) -> Result<serde_json::V
         .map_err(|e| format!("ui_bridge_target is not valid JSON: {} (raw: {:?})", e, s))
 }
 
+/// Decode a `component_action` step's `ui_bridge_target` into its typed
+/// target (qontinui-schemas `UiBridgeComponentActionTarget`).
+fn parse_component_action_target(
+    raw: Option<&str>,
+) -> Result<qontinui_types::workflow_step::UiBridgeComponentActionTarget, String> {
+    let raw = raw.ok_or(
+        "UI Bridge component_action requires 'ui_bridge_target' {componentId, actionId, params}",
+    )?;
+    serde_json::from_str(raw)
+        .map_err(|e| format!("UI Bridge component_action: invalid target {raw:?}: {e}"))
+}
+
+/// The component-action route for a snapshot target, mirroring the snapshot
+/// arm: `sdk` is the SDK's route through the runner
+/// (`POST /ui-bridge/sdk/component/:id/action/:actionId`, `sdk_client.rs`),
+/// `control` (the default) the runner's own UI, `proxy:PORT` a proxied app.
+fn component_action_endpoint(
+    base_url: &str,
+    snapshot_target: Option<&str>,
+    target: &qontinui_types::workflow_step::UiBridgeComponentActionTarget,
+) -> Result<String, String> {
+    let path = format!(
+        "component/{}/action/{}",
+        urlencoding::encode(&target.component_id),
+        urlencoding::encode(&target.action_id)
+    );
+    let base = base_url.trim_end_matches('/');
+    match snapshot_target {
+        None | Some("control") => Ok(format!("{base}/control/{path}")),
+        Some("sdk") => Ok(format!("{base}/sdk/{path}")),
+        Some(t) => match t.strip_prefix("proxy:") {
+            Some(port) => Ok(format!(
+                "http://127.0.0.1:{port}/__ui-bridge/control/{path}"
+            )),
+            None => Err(format!(
+                "Unknown snapshot target: '{t}'. Use 'control', 'sdk', or 'proxy:PORT'"
+            )),
+        },
+    }
+}
+
+/// The step result for a component-action response. Fails on a non-2xx
+/// status, on a top-level `success: false` (the SDK route answers a refused
+/// action with HTTP 200), and on a nested `data.success: false` (the control
+/// route's WS dispatch wraps the app's own reply in
+/// `ApiResponse::success(value)`).
+fn component_action_result(
+    target: &qontinui_types::workflow_step::UiBridgeComponentActionTarget,
+    status: reqwest::StatusCode,
+    body: serde_json::Value,
+) -> StepHandlerResult {
+    let refused = |v: &serde_json::Value| v.get("success").and_then(|s| s.as_bool()) == Some(false);
+    let nested_refused = body.get("data").is_some_and(refused);
+    if status.is_success() && !refused(&body) && !nested_refused {
+        StepHandlerResult::success_with_data(serde_json::json!({
+            "action": "component_action",
+            "componentId": target.component_id,
+            "actionId": target.action_id,
+            "result": body,
+        }))
+    } else {
+        StepHandlerResult::failure(format!(
+            "component_action {} on '{}' failed: {} - {}",
+            target.action_id, target.component_id, status, body
+        ))
+    }
+}
+
 /// Create a human-readable summary of search criteria for error messages.
 fn criteria_summary(criteria: &serde_json::Map<String, serde_json::Value>) -> String {
     criteria
@@ -724,6 +792,12 @@ impl Default for UiBridgeFailureTracker {
 // UiBridgeHandler
 // ---------------------------------------------------------------------------
 
+/// The action an action-less ui_bridge step runs. Both step editors display
+/// an action-less step as `snapshot`, and the typed view
+/// (`to_full_runner_step`, qontinui-schemas `UiBridgeAction`'s `#[default]`)
+/// agrees, so what the user was shown is what runs.
+pub(crate) const DEFAULT_UI_BRIDGE_ACTION: &str = "snapshot";
+
 /// Handler for UI Bridge steps.
 ///
 /// Performs UI Bridge SDK operations:
@@ -732,6 +806,7 @@ impl Default for UiBridgeFailureTracker {
 /// - assert: Assert a condition on a UI element
 /// - snapshot: Capture a snapshot of the current UI state
 /// - compare: Compare current snapshot against a reference
+/// - component_action: Run a registered component's action
 pub struct UiBridgeHandler;
 
 #[async_trait]
@@ -753,7 +828,10 @@ impl StepHandler for UiBridgeHandler {
         step: &ExecutionStepConfig,
         context: &HandlerContext,
     ) -> StepHandlerResult {
-        let action = step.ui_bridge_action.as_deref().unwrap_or("snapshot");
+        let action = step
+            .ui_bridge_action
+            .as_deref()
+            .unwrap_or(DEFAULT_UI_BRIDGE_ACTION);
         let self_base = crate::mcp::types::get_self_base_url(&context.app_state);
         let default_ui_bridge = format!("{}/ui-bridge", self_base);
         let raw_url = step.ui_bridge_url.as_deref().unwrap_or(&default_ui_bridge);
@@ -1016,6 +1094,13 @@ impl StepHandler for UiBridgeHandler {
             let result = self
                 .execute_element_action(step, base_url, timeout_ms)
                 .await;
+            self.track_result(context, base_url, &result).await;
+            return result;
+        }
+
+        // Handle component_action: run a registered component's action
+        if action == "component_action" {
+            let result = self.execute_component_action(step, &client, base_url).await;
             self.track_result(context, base_url, &result).await;
             return result;
         }
@@ -1617,6 +1702,53 @@ impl UiBridgeHandler {
         }
     }
 
+    /// Execute a "component_action" — run a registered component's action.
+    /// Target JSON: `UiBridgeComponentActionTarget` `{componentId, actionId, params}`.
+    async fn execute_component_action(
+        &self,
+        step: &ExecutionStepConfig,
+        client: &reqwest::Client,
+        base_url: &str,
+    ) -> StepHandlerResult {
+        let target = match parse_component_action_target(step.ui_bridge_target.as_deref()) {
+            Ok(t) => t,
+            Err(e) => return StepHandlerResult::failure(e),
+        };
+        let endpoint = match component_action_endpoint(
+            base_url,
+            step.ui_bridge_snapshot_target.as_deref(),
+            &target,
+        ) {
+            Ok(e) => e,
+            Err(e) => return StepHandlerResult::failure(e),
+        };
+        let params = target
+            .params
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({}));
+        info!(
+            "component_action: {} on component '{}' via {}",
+            target.action_id, target.component_id, endpoint
+        );
+        let resp = match client
+            .post(&endpoint)
+            .json(&serde_json::json!({ "params": params }))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return StepHandlerResult::failure(format!(
+                    "component_action {} on '{}' failed: {}",
+                    target.action_id, target.component_id, e
+                ));
+            }
+        };
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::json!({}));
+        component_action_result(&target, status, body)
+    }
+
     /// Execute a "wait_for_element" — poll snapshot until an element matching criteria appears.
     /// Target JSON: { "criteria": {...}, "timeout": 5000 }
     #[expect(
@@ -2182,6 +2314,81 @@ mod tests {
     use super::*;
 
     // --- severity_to_order tests ---
+
+    #[test]
+    fn component_action_target_decodes_the_builder_shape() {
+        // `buildSpecWorkflow.ts` writes JSON.stringify({componentId, actionId, params}).
+        let t = parse_component_action_target(Some(
+            r#"{"componentId":"grid","actionId":"setLayout","params":{"layoutId":"single"}}"#,
+        ))
+        .unwrap();
+        assert_eq!(t.component_id, "grid");
+        assert_eq!(t.action_id, "setLayout");
+        assert_eq!(t.params, Some(serde_json::json!({"layoutId": "single"})));
+        assert!(parse_component_action_target(None).is_err());
+        assert!(parse_component_action_target(Some("{}")).is_err());
+    }
+
+    #[test]
+    fn component_action_result_fails_on_every_refusal_shape() {
+        use reqwest::StatusCode;
+        use serde_json::json;
+        let t =
+            parse_component_action_target(Some(r#"{"componentId":"c","actionId":"a"}"#)).unwrap();
+        let ok = component_action_result(
+            &t,
+            StatusCode::OK,
+            json!({"success": true, "data": {"success": true}}),
+        );
+        assert!(ok.success, "{:?}", ok.error);
+        assert_eq!(ok.output_data.unwrap()["componentId"], "c");
+        for (status, body, why) in [
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"success": true}),
+                "non-2xx",
+            ),
+            (
+                StatusCode::OK,
+                json!({"success": false, "error": "no such action"}),
+                "top-level success:false",
+            ),
+            (
+                StatusCode::OK,
+                json!({"success": true, "data": {"success": false, "error": "refused"}}),
+                "nested data.success:false",
+            ),
+        ] {
+            let r = component_action_result(&t, status, body);
+            assert!(!r.success, "{why} must fail");
+            assert!(
+                r.error
+                    .unwrap()
+                    .starts_with("component_action a on 'c' failed"),
+                "{why}"
+            );
+        }
+    }
+
+    #[test]
+    fn component_action_endpoint_follows_the_snapshot_target() {
+        let t = parse_component_action_target(Some(r#"{"componentId":"a b","actionId":"go"}"#))
+            .unwrap();
+        let base = "http://127.0.0.1:9876/ui-bridge/";
+        assert_eq!(
+            component_action_endpoint(base, Some("sdk"), &t).unwrap(),
+            "http://127.0.0.1:9876/ui-bridge/sdk/component/a%20b/action/go"
+        );
+        assert_eq!(
+            component_action_endpoint(base, None, &t).unwrap(),
+            "http://127.0.0.1:9876/ui-bridge/control/component/a%20b/action/go"
+        );
+        assert_eq!(
+            component_action_endpoint(base, Some("proxy:4000"), &t).unwrap(),
+            "http://127.0.0.1:4000/__ui-bridge/control/component/a%20b/action/go"
+        );
+        assert!(component_action_endpoint(base, Some("elsewhere"), &t).is_err());
+    }
 
     #[test]
     fn test_severity_to_order_critical() {
