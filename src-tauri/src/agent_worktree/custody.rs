@@ -28,6 +28,10 @@
 //!   `unattributed` — matching coord's shipped precedent, `GET
 //!   /coord/trees/wip-owners/:device_id`, described there as an *"ownership
 //!   join (honest `unattributed`)"*;
+//! * no source at all **while the coord ownership index was PARTIAL** ⇒
+//!   [`AttributionSource::NonePartialCoordIndex`] and the label
+//!   `unattributed-partial-coord-index` — the rows the cursor walk never
+//!   reached are a coverage gap, not an established absence of owners;
 //! * an id we have but cannot resolve to a human-readable session (**a
 //!   ghost**: no name-file AND no transcript in ANY of the five
 //!   `C:/claude/.claude-*` account roots — 16 of 111 measured 2026-08-22)
@@ -590,7 +594,22 @@ pub enum AttributionSource {
     CommitTrailer,
     /// Nothing spoke. Renders the literal `unattributed`.
     None,
+    /// Nothing spoke, **but the coord ownership index was PARTIAL** (the
+    /// cursor walk over `GET /coord/sessions/worktrees` stopped before coord's
+    /// last page). Sources 2 and 3 were consulted over a PREFIX of the ledger,
+    /// so the allocation row may sit on a page that was never read — "nobody
+    /// owns this" is not established. Renders
+    /// [`UNATTRIBUTED_PARTIAL_COORD_INDEX_LABEL`], never the confident
+    /// `unattributed`. Never produced by [`resolve_attribution`] (which is
+    /// index-agnostic); the survey applies it via
+    /// [`Attribution::unattributed_in_partial_coord_index`].
+    NonePartialCoordIndex,
 }
+
+/// The row label for [`AttributionSource::NonePartialCoordIndex`]. Spelled
+/// the same as the wip-orphan report's `orphan_reason` arm for the same
+/// condition, so the two surfaces cannot disagree about what they mean.
+pub const UNATTRIBUTED_PARTIAL_COORD_INDEX_LABEL: &str = "unattributed-partial-coord-index";
 
 impl AttributionSource {
     pub fn as_str(self) -> &'static str {
@@ -600,6 +619,7 @@ impl AttributionSource {
             Self::CoordBranchAuthor => "coord_branch_author",
             Self::CommitTrailer => "commit_trailer",
             Self::None => "none",
+            Self::NonePartialCoordIndex => "none_partial_coord_index",
         }
     }
 }
@@ -717,6 +737,19 @@ pub struct Attribution {
 }
 
 impl Attribution {
+    /// The empty answer when the coord ownership index was PARTIAL: same
+    /// shape as [`Self::unattributed`], but labelled
+    /// [`UNATTRIBUTED_PARTIAL_COORD_INDEX_LABEL`] with source
+    /// `none_partial_coord_index`, so no consumer reads a confident
+    /// "unattributed" off an index that did not cover the whole ledger.
+    pub fn unattributed_in_partial_coord_index() -> Self {
+        Self {
+            session_label: UNATTRIBUTED_PARTIAL_COORD_INDEX_LABEL.to_string(),
+            source: AttributionSource::NonePartialCoordIndex.as_str(),
+            ..Self::unattributed()
+        }
+    }
+
     /// The honest empty: `unattributed`, never a blank string.
     pub fn unattributed() -> Self {
         Self {

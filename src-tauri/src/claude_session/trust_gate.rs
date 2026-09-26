@@ -314,6 +314,34 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(3);
 /// for a gate in front of a spawn.
 const LEDGER_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a PARTIAL allocation index (the cursor walk stopped before coord's
+/// last page) counts as fresh — much shorter than [`DIAL_TTL`], which is what a
+/// COMPLETE index gets.
+///
+/// Why short: a miss in a partial index answers `Unavailable`, so while one is
+/// cached every spawn whose row sat on an unread page loses coord's answer and
+/// falls back to local evidence. Holding that degraded answer for the full
+/// 90 s would keep the gate blind long after the ledger could have been walked
+/// to its end. Why not zero: the walk costs up to [`LEDGER_TIMEOUT`] in front
+/// of a spawn, so a burst of spawns must not each pay it. 15 s is three walk
+/// budgets and equal to [`DIAL_ERROR_BACKOFF`] — the same cadence the gate
+/// already retries a failed read at, which is what a partial walk is: a read
+/// that did not finish.
+const PARTIAL_INDEX_TTL: Duration = Duration::from_secs(15);
+
+/// How old a COMPLETE cached index may be and still be preferred over a freshly
+/// fetched PARTIAL one.
+///
+/// The two are wrong in different ways. A complete index `N` seconds old lacks
+/// only the allocations coord made in those `N` seconds — and a new worktree
+/// missing from it reads `NoRow`, which [`decide_worktree_conjunct`] already
+/// reconciles against the local layout. A partial index lacks an ARBITRARY
+/// slice of the ledger, however old. So for a few refresh cycles the complete
+/// one is the better answer; past this its staleness is unbounded and the fresh
+/// partial wins. Five minutes is a few [`DIAL_TTL`]s — enough to ride out a
+/// transiently slow ledger — and far inside [`MAX_DIAL_AGE`].
+const COMPLETE_INDEX_PREFERRED_AGE: Duration = Duration::from_secs(5 * 60);
+
 struct DialCache {
     tier: Option<AutonomyTier>,
     fetched_at: Option<Instant>,
@@ -1274,7 +1302,9 @@ pub struct TrustGateReport {
 /// adding a second reader of the same door — a divergent second join is how the
 /// two would start disagreeing about what "allocated" means. The index is cached
 /// for [`DIAL_TTL`] because it is one fleet-wide response (~1.5k rows on this
-/// fleet) and a per-spawn fetch would be absurd.
+/// fleet) and a per-spawn fetch would be absurd — a PARTIAL index only for
+/// [`PARTIAL_INDEX_TTL`], and never in place of a complete one younger than
+/// [`COMPLETE_INDEX_PREFERRED_AGE`] (see [`choose_index`]).
 ///
 /// **Only the PATH-keyed arm counts.** `owner_for` also answers from a
 /// `(repo, branch)` binding, which names some OTHER worktree's allocation; that
@@ -1329,6 +1359,40 @@ fn lookup_in_index(
 
 type OwnershipIndex = std::sync::Arc<crate::agent_worktree::custody::coord::CoordOwnership>;
 
+/// Whether a cached index of this completeness and age may answer without a
+/// refetch. Pure. A complete index lives [`DIAL_TTL`]; a partial one only
+/// [`PARTIAL_INDEX_TTL`].
+fn cached_index_is_fresh(partial: bool, age: Duration) -> bool {
+    age <= if partial { PARTIAL_INDEX_TTL } else { DIAL_TTL }
+}
+
+/// What to do with a freshly fetched index, given what is cached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexChoice {
+    /// Store the fetched index and answer from it.
+    TakeFetched,
+    /// Leave the cached (complete) index in place and answer from it; the
+    /// fetched one was partial.
+    KeepCached,
+}
+
+/// Decide between a cached index (`(partial, age)`, if any) and a freshly
+/// fetched one. Pure.
+///
+/// **A fresh PARTIAL index never replaces a COMPLETE one still within
+/// [`COMPLETE_INDEX_PREFERRED_AGE`]** — see that constant for why the stale
+/// complete answer is the better one. Every other case takes the fetch: a
+/// complete fetch always wins, and a partial fetch beats a cached partial (it
+/// is newer) or a complete one past its preferred age.
+fn choose_index(cached: Option<(bool, Duration)>, fetched_partial: bool) -> IndexChoice {
+    match cached {
+        Some((false, age)) if fetched_partial && age <= COMPLETE_INDEX_PREFERRED_AGE => {
+            IndexChoice::KeepCached
+        }
+        _ => IndexChoice::TakeFetched,
+    }
+}
+
 struct IndexCache {
     index: Option<OwnershipIndex>,
     fetched_at: Option<Instant>,
@@ -1347,12 +1411,8 @@ static WORKTREE_INDEX: Lazy<tokio::sync::Mutex<IndexCache>> = Lazy::new(|| {
 
 async fn worktree_index() -> Result<OwnershipIndex, String> {
     let mut guard = WORKTREE_INDEX.lock().await;
-    let fresh = guard
-        .fetched_at
-        .map(|at| at.elapsed() <= DIAL_TTL)
-        .unwrap_or(false);
-    if fresh {
-        if let Some(idx) = &guard.index {
+    if let (Some(idx), Some(at)) = (&guard.index, guard.fetched_at) {
+        if cached_index_is_fresh(idx.partial.is_some(), at.elapsed()) {
             return Ok(idx.clone());
         }
     }
@@ -1382,11 +1442,34 @@ async fn worktree_index() -> Result<OwnershipIndex, String> {
         });
         match fetched {
             Ok(Some(idx)) => {
-                let idx = std::sync::Arc::new(idx);
-                guard.index = Some(idx.clone());
-                guard.fetched_at = Some(Instant::now());
-                guard.last_error = None;
-                return Ok(idx);
+                let cached = match (&guard.index, guard.fetched_at) {
+                    (Some(c), Some(at)) => Some((c.partial.is_some(), at.elapsed())),
+                    _ => None,
+                };
+                match choose_index(cached, idx.partial.is_some()) {
+                    IndexChoice::TakeFetched => {
+                        let idx = std::sync::Arc::new(idx);
+                        guard.index = Some(idx.clone());
+                        guard.fetched_at = Some(Instant::now());
+                        guard.last_error = None;
+                        return Ok(idx);
+                    }
+                    IndexChoice::KeepCached => {
+                        // `fetched_at` is NOT bumped: the complete index keeps
+                        // aging toward `COMPLETE_INDEX_PREFERRED_AGE`, and
+                        // `last_attempt` (set above) spaces the next walk by
+                        // `DIAL_ERROR_BACKOFF`.
+                        if let Some(p) = &idx.partial {
+                            debug!(
+                                "trust gate: kept the complete allocation index over a fresh \
+                                 PARTIAL one ({p})"
+                            );
+                        }
+                        if let Some(c) = &guard.index {
+                            return Ok(c.clone());
+                        }
+                    }
+                }
             }
             Ok(None) => {
                 guard.last_error = Some("no coord base configured".to_string());
@@ -1692,6 +1775,44 @@ mod tests {
             CoordRowLookup::Unavailable { reason } => assert!(reason.contains("PARTIAL")),
             other => panic!("a miss in a partial index must be UNKNOWN, got {other:?}"),
         }
+    }
+
+    /// A partial index is cached for the SHORT TTL; a complete one for the
+    /// full `DIAL_TTL`.
+    #[test]
+    fn a_partial_index_goes_stale_sooner_than_a_complete_one() {
+        let between = PARTIAL_INDEX_TTL + Duration::from_secs(1);
+        assert!(between < DIAL_TTL, "the partial TTL must be the shorter one");
+        assert!(cached_index_is_fresh(false, between));
+        assert!(!cached_index_is_fresh(true, between));
+        assert!(cached_index_is_fresh(true, PARTIAL_INDEX_TTL));
+        assert!(!cached_index_is_fresh(false, DIAL_TTL + Duration::from_secs(1)));
+    }
+
+    /// A fresh PARTIAL index never replaces a COMPLETE last-known-good one
+    /// still within its preferred age; every other pairing takes the fetch.
+    #[test]
+    fn a_complete_cached_index_is_preferred_over_a_fresh_partial_one() {
+        let young = DIAL_TTL + Duration::from_secs(1); // refetched, still preferred
+        let old = COMPLETE_INDEX_PREFERRED_AGE + Duration::from_secs(1);
+        // complete cached, partial fetched, within the preferred age -> keep
+        assert_eq!(choose_index(Some((false, young)), true), IndexChoice::KeepCached);
+        assert_eq!(
+            choose_index(Some((false, COMPLETE_INDEX_PREFERRED_AGE)), true),
+            IndexChoice::KeepCached
+        );
+        // ...past it -> the fresh partial wins
+        assert_eq!(choose_index(Some((false, old)), true), IndexChoice::TakeFetched);
+        // a complete fetch always wins
+        assert_eq!(choose_index(Some((false, young)), false), IndexChoice::TakeFetched);
+        assert_eq!(choose_index(Some((true, young)), false), IndexChoice::TakeFetched);
+        // partial over partial: the newer one
+        assert_eq!(choose_index(Some((true, young)), true), IndexChoice::TakeFetched);
+        // nothing cached: take whatever came back
+        assert_eq!(choose_index(None, true), IndexChoice::TakeFetched);
+        assert_eq!(choose_index(None, false), IndexChoice::TakeFetched);
+        // the preference window sits inside the last-known-good cap
+        assert!(COMPLETE_INDEX_PREFERRED_AGE < MAX_DIAL_AGE);
     }
 
     // ---------------------------------------------------------------- dial
