@@ -1298,12 +1298,32 @@ pub async fn coord_row_lookup(dir: &Path) -> CoordRowLookup {
     let dir = &workspace_trust::git_root(dir).unwrap_or_else(|| dir.to_path_buf());
     let path = dir.to_string_lossy().replace('\\', "/");
     let repo = crate::agent_worktree::canonical_paths::repo_slug_for_path(dir).unwrap_or_default();
+    lookup_in_index(&index, &path, &repo)
+}
+
+/// Answer one path from an ownership index. Pure.
+///
+/// **A miss in a PARTIAL index is `Unavailable`, never `NoRow`.** The index is
+/// built by walking `GET /coord/sessions/worktrees`'s cursor; when that walk
+/// stopped before coord's last page (`CoordOwnership::partial`), the row may
+/// simply sit on a page that was not read, so "no row" would be a confident
+/// wrong answer — the same reason rung 4 of [`decide_worktree_conjunct`] exists.
+fn lookup_in_index(
+    index: &crate::agent_worktree::custody::coord::CoordOwnership,
+    path: &str,
+    repo: &str,
+) -> CoordRowLookup {
     match index
-        .owner_for(&path, &repo, None)
+        .owner_for(path, repo, None)
         .and_then(|o| o.allocation_session_id)
     {
         Some(session_id) => CoordRowLookup::Matched { session_id },
-        None => CoordRowLookup::NoRow,
+        None => match &index.partial {
+            Some(p) => CoordRowLookup::Unavailable {
+                reason: format!("no row in a PARTIAL allocation index: {p}"),
+            },
+            None => CoordRowLookup::NoRow,
+        },
     }
 }
 
@@ -1342,14 +1362,16 @@ async fn worktree_index() -> Result<OwnershipIndex, String> {
         .unwrap_or(false);
     if !backing_off {
         guard.last_attempt = Some(Instant::now());
-        // `fetch_ownership` builds its own 15s-timeout client, which is right for
-        // the operator-facing worktree SURVEY it was written for and far too long
-        // in front of a spawn. Bound it here rather than forking the fetcher: a
-        // timeout falls through to `Unavailable`, which conjunct 1 already knows
-        // how to answer from local evidence.
+        // `fetch_ownership` walks a paged ledger; its budget bounds the WHOLE
+        // walk. The survey's budget is far too long in front of a spawn, so the
+        // spawn path passes `LEDGER_TIMEOUT`: a walk that runs out after page
+        // one returns a PARTIAL index (a miss in it reads `Unavailable`, see
+        // `lookup_in_index`), and one that gets no page at all errors into
+        // `Unavailable`, which conjunct 1 already answers from local evidence.
+        // The outer timeout is only a backstop past the walk's own deadline.
         let fetched = tokio::time::timeout(
-            LEDGER_TIMEOUT,
-            crate::agent_worktree::custody::coord::fetch_ownership(),
+            LEDGER_TIMEOUT + Duration::from_secs(1),
+            crate::agent_worktree::custody::coord::fetch_ownership(LEDGER_TIMEOUT),
         )
         .await
         .unwrap_or_else(|_| {
@@ -1637,6 +1659,40 @@ fn finish(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------- allocation index lookup
+
+    /// A miss in a PARTIAL index (the cursor walk stopped early) is UNKNOWN,
+    /// not "coord holds no row"; the same miss in a COMPLETE index is `NoRow`.
+    #[test]
+    fn a_miss_in_a_partial_index_is_unavailable_not_no_row() {
+        use crate::agent_worktree::custody::coord::CoordOwnership;
+        let resp = serde_json::from_str(
+            r#"{"sessions":[{"sessionId":"s1","ownerSessionState":"active",
+                "worktrees":[{"worktreePath":"agent-worktrees/a/qontinui-runner",
+                "repo":"qontinui-runner"}]}]}"#,
+        )
+        .unwrap();
+        let whole = CoordOwnership::from_response(resp);
+        assert!(matches!(
+            lookup_in_index(&whole, "/w/agent-worktrees/a/qontinui-runner", "qontinui-runner"),
+            CoordRowLookup::Matched { .. }
+        ));
+        assert_eq!(
+            lookup_in_index(&whole, "/w/agent-worktrees/b/qontinui-runner", "qontinui-runner"),
+            CoordRowLookup::NoRow
+        );
+
+        let partial = whole.with_partial(Some("stopped at the page bound".to_string()));
+        assert!(matches!(
+            lookup_in_index(&partial, "/w/agent-worktrees/a/qontinui-runner", "qontinui-runner"),
+            CoordRowLookup::Matched { .. }
+        ));
+        match lookup_in_index(&partial, "/w/agent-worktrees/b/qontinui-runner", "qontinui-runner") {
+            CoordRowLookup::Unavailable { reason } => assert!(reason.contains("PARTIAL")),
+            other => panic!("a miss in a partial index must be UNKNOWN, got {other:?}"),
+        }
+    }
 
     // ---------------------------------------------------------------- dial
 
