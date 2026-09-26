@@ -1590,7 +1590,8 @@ fn main() {
     std::env::set_var("RUST_BACKTRACE", "1");
 
     // Strip any inherited terminal-bound coord-mcp key variables
-    // (`QONTINUI_COORD_MCP_NONCE_<K>` / `QONTINUI_COORD_MCP_CREDENTIAL_<K>`) from
+    // (`QONTINUI_COORD_MCP_NONCE_<K>` / `QONTINUI_COORD_MCP_CREDENTIAL_<K>`, and
+    // the legacy bare `QONTINUI_COORD_MCP_NONCE` / `QONTINUI_COORD_MCP_CREDENTIAL`) from
     // this process ONCE, beside the other startup env mutation and before any
     // thread is spawned (plan
     // `2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages`).

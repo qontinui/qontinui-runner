@@ -767,6 +767,13 @@ impl TerminalManager {
             map.clear();
         }
 
+        // Every terminal-bound coord-mcp key the identity seam minted, revoked in
+        // ONE synchronous store write (the per-session close skips it under a
+        // deadline). Ahead of the empty-map return: a key can outlive the map
+        // entry of the terminal it was minted for. The runner is exiting, so the
+        // panes it owns are being torn down with it.
+        crate::coord_mcp::release_all_terminal_bound_keys();
+
         if sessions.is_empty() {
             return;
         }
@@ -789,9 +796,6 @@ impl TerminalManager {
                 sessions.len()
             );
         }
-        // Every terminal-bound coord-mcp key the identity seam minted, revoked in
-        // ONE store write (the per-session close skips it under a deadline).
-        crate::coord_mcp::release_all_terminal_bound_keys();
         info!("All terminal sessions closed");
     }
 

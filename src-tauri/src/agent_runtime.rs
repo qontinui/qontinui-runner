@@ -8551,7 +8551,7 @@ pub(crate) fn finalize_headless_child_env(
     // cleared it, so this is the per-site backstop.
     for (name, _) in std::env::vars_os() {
         if let Some(name) = name.to_str() {
-            if crate::coord_mcp_config::is_terminal_key_env_name(name) {
+            if crate::coord_mcp_config::is_any_terminal_env_name(name) {
                 cmd.env_remove(name);
             }
         }

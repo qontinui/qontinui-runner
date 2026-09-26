@@ -3133,6 +3133,14 @@ pub(crate) fn spawn_log_proxy_upstream_unreachable(
 ///   a live credential, and the in-cwd `.mcp.json` that terminal wrote is read
 ///   by other consumers (the `qontinui-pr` walk-up, hand-launched clients), so
 ///   that shape can strand a session that is still using the file.
+///
+///   **One exception, and why it is safe:** the terminal-bound key
+///   [`mint_terminal_key_for_declared_cwd`] mints for an env-referenced cwd is
+///   written to NO file anyone else reads — it lives only in that terminal's
+///   PTY environment (plus, under stdio, its own terminal-keyed credential
+///   file). Once that terminal's process tree has been killed nothing can be
+///   presenting it, so [`release_terminal_bound_key`] revokes it at close,
+///   after the kill and only when the kill succeeded.
 /// * Eviction is **oldest-first** ([`NonceBinding::minted_at`]), tie-broken by
 ///   the nonce string so the emitted map is deterministic — `enqueue_nonce_persist`
 ///   compares snapshots for equality to skip no-op writes, and a
@@ -7401,9 +7409,43 @@ fn reusable_in_cwd_device_nonce(
         terminal_id: binding.terminal_id,
         // The literal -> env-reference upgrade rides the same kill switch as
         // the writer: with it off, a literal file is exactly what we'd write.
+        //
+        // With it OFF the upgrade runs the other way too: a file already written
+        // in the env-referenced shape (any `<K>`, or the legacy bare name) is
+        // rewritten literally with the same nonce, so turning the switch off
+        // rolls the fleet's files back rather than only stopping new ones.
         needs_header_upgrade: !read_static_authorization_presence(&path)
-            || (terminal_env_ref_enabled() && !read_terminal_env_reference(&path, workdir)),
+            || if terminal_env_ref_enabled() {
+                !read_terminal_env_reference(&path, workdir)
+            } else {
+                read_any_terminal_env_reference(&path)
+            },
     })
+}
+
+/// Whether the `.mcp.json` at `config_path` references a terminal variable of
+/// ANY generation or workdir ([`crate::coord_mcp_config::config_doc_references_terminal_env`]).
+/// An unreadable file is `false`.
+fn read_any_terminal_env_reference(config_path: &Path) -> bool {
+    std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .map(|v| crate::coord_mcp_config::config_doc_references_terminal_env(&v))
+        .unwrap_or(false)
+}
+
+/// Whether the `.mcp.json` at `config_path` carries the header shape the boot
+/// self-heal should LEAVE: the static `Authorization` key
+/// ([`read_static_authorization_presence`]) and — only while the terminal env
+/// reference is switched OFF ([`COORD_MCP_TERMINAL_ENV_REF_ENV`]) — no env
+/// reference of any generation. A `false` here is what drives the
+/// nonce-preserving `UpgradeHeaders` rewrite, which then writes the literal
+/// shape. With the switch ON a literal file is left alone at boot (it is
+/// upgraded by the in-cwd reuse at its next spawn), so this never rewrites a
+/// file on every boot.
+fn read_header_shape_current(config_path: &Path) -> bool {
+    read_static_authorization_presence(config_path)
+        && (terminal_env_ref_enabled() || !read_any_terminal_env_reference(config_path))
 }
 
 /// Whether the `.mcp.json` at `config_path` spells its credential as the
@@ -10834,38 +10876,58 @@ fn terminal_bound_keys() -> &'static Mutex<HashMap<String, TerminalBoundKeyRecor
 
 /// Revoke the terminal-bound key [`mint_terminal_key_for_declared_cwd`] minted
 /// for `terminal_id` and delete its credential file. Called from the terminal's
-/// interactive close (`TerminalSession::close_inner`). A terminal this path
-/// never minted for is a no-op. Idempotent.
+/// interactive close (`TerminalSession::close_inner`), AFTER the pane's process
+/// was killed. A terminal this path never minted for is a no-op. Idempotent.
 ///
 /// Why at close: every such key is a PERSISTED device nonce, so without this
 /// each closed terminal would leave one live binding in the encrypted store and
 /// (under stdio) one credential file under `~/.qontinui/coord-mcp-shim/` for
-/// the life of the box.
+/// the life of the box. Unlike the in-cwd key, nothing but that terminal's own
+/// process tree ever held it (it lives only in that PTY's environment), so once
+/// the tree is dead no other consumer can be stranded.
 pub(crate) fn release_terminal_bound_key(terminal_id: &str) {
-    let record = terminal_bound_keys()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(terminal_id);
-    if let Some(record) = record {
-        revoke_proxy_nonce(&record.nonce);
-        if let Some(path) = record.credential {
-            let _ = std::fs::remove_file(path);
-        }
-        info!("coord-mcp: terminal {terminal_id}: terminal-bound key revoked at close");
-    }
+    release_terminal_bound_keys(|t| t == terminal_id, false, "terminal closed");
 }
 
 /// [`release_terminal_bound_key`] for EVERY tracked terminal at once, with ONE
-/// store write — for the app-shutdown path (`TerminalManager::close_all`),
-/// which closes every pane under a deadline and must not pay one encrypted-store
-/// rewrite per terminal.
+/// store write that is flushed SYNCHRONOUSLY — for the app-shutdown path
+/// (`TerminalManager::close_all`), which closes every pane under a deadline, must
+/// not pay one encrypted-store rewrite per terminal, and cannot rely on the
+/// debounced background writer outliving the process.
 pub(crate) fn release_all_terminal_bound_keys() {
-    release_terminal_bound_keys_where(|_| true);
+    release_terminal_bound_keys(|_| true, true, "runner shutdown");
 }
 
-/// [`release_all_terminal_bound_keys`] over the terminals `select` picks — the
-/// seam that lets a test release only its own terminals in a shared registry.
-fn release_terminal_bound_keys_where(select: impl Fn(&str) -> bool) {
+/// Test seam for the close path in `terminal/session.rs`: track a freshly minted
+/// terminal-bound key for `terminal_id` exactly as the seam would, and return
+/// its nonce.
+#[cfg(test)]
+pub(crate) fn track_terminal_bound_key_for_test(terminal_id: &str, workdir: &str) -> String {
+    let nonce = register_proxy_nonce_with(workdir, Some(terminal_id), MintPin::MachineNow);
+    terminal_bound_keys()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            terminal_id.to_string(),
+            TerminalBoundKeyRecord {
+                nonce: nonce.clone(),
+                credential: None,
+            },
+        );
+    nonce
+}
+
+/// Test seam: is `nonce` a live binding?
+#[cfg(test)]
+pub(crate) fn nonce_is_live_for_test(nonce: &str) -> bool {
+    live_binding(nonce).is_some()
+}
+
+/// The one body behind both release paths: take the selected records out of the
+/// tracker, revoke their nonces through [`revoke_nonce_set`], delete their
+/// credential files. `select` is also the seam a test uses to release only its
+/// own terminals from the shared tracker.
+fn release_terminal_bound_keys(select: impl Fn(&str) -> bool, flush_now: bool, why: &str) {
     let records: Vec<(String, TerminalBoundKeyRecord)> = {
         let mut keys = terminal_bound_keys()
             .lock()
@@ -10879,34 +10941,68 @@ fn release_terminal_bound_keys_where(select: impl Fn(&str) -> bool) {
     if records.is_empty() {
         return;
     }
-    let snapshot = {
-        let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
-        let mut removed = Vec::new();
-        for (_, r) in &records {
-            if let Some(b) = map.remove(&r.nonce) {
-                removed.push((r.nonce.clone(), b));
-            }
-        }
-        (!removed.is_empty()).then(|| (map.clone(), removed))
-    };
+    let nonces: Vec<String> = records.iter().map(|(_, r)| r.nonce.clone()).collect();
+    let revoked = revoke_nonce_set(
+        &nonces,
+        &format!("terminal-bound key revoked ({why})"),
+        flush_now,
+    );
     for (_, r) in &records {
         if let Some(path) = &r.credential {
             let _ = std::fs::remove_file(path);
         }
     }
-    if let Some((snapshot, removed)) = snapshot {
-        record_nonce_tombstones(
-            &removed,
-            TombstoneKind::Revoked,
-            false,
-            "terminal-bound keys revoked at shutdown",
-        );
-        persist_proxy_nonces(&snapshot);
-        info!(
-            "coord-mcp: revoked {} terminal-bound key(s) at shutdown (one store write)",
-            removed.len()
-        );
+    info!(
+        "coord-mcp: released {} terminal-bound key(s) ({why}; {revoked} live binding(s) \
+         revoked, one store write{})",
+        records.len(),
+        if flush_now {
+            ", flushed synchronously"
+        } else {
+            ""
+        }
+    );
+}
+
+/// Revoke a SET of nonces with one registry pass and one store write: removed
+/// from the live map AND the grace map (revocation is total, as in
+/// [`revoke_proxy_nonce`]), a `Revoked` tombstone and a `revoke` rotation line
+/// per key, then the shrunken set persisted. With `flush_now` the persist is
+/// written synchronously ([`flush_nonce_persist_once`]) instead of being left to
+/// the debounced writer. Returns how many LIVE bindings were removed.
+fn revoke_nonce_set(nonces: &[String], cause: &str, flush_now: bool) -> usize {
+    let (snapshot, removed) = {
+        let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
+        let removed: Vec<(String, NonceBinding)> = nonces
+            .iter()
+            .filter_map(|n| map.remove(n).map(|b| (n.clone(), b)))
+            .collect();
+        (map.clone(), removed)
+    };
+    let graced_removed: Vec<(String, GracedNonce)> = {
+        let mut graced = graced_nonces().lock().expect("graced nonce map poisoned");
+        nonces
+            .iter()
+            .filter_map(|n| graced.remove(n).map(|g| (n.clone(), g)))
+            .collect()
+    };
+    if removed.is_empty() && graced_removed.is_empty() {
+        return 0;
     }
+    record_nonce_tombstones(&removed, TombstoneKind::Revoked, false, cause);
+    for (n, b) in &removed {
+        log_rotation_event("revoke", &b.workdir, n, cause);
+    }
+    for (n, g) in &graced_removed {
+        if !removed.iter().any(|(r, _)| r == n) {
+            log_rotation_event("revoke", &g.workdir, n, cause);
+        }
+    }
+    persist_proxy_nonces(&snapshot);
+    if flush_now {
+        flush_nonce_persist_once();
+    }
+    removed.len()
 }
 
 /// Mint a terminal-bound key for a cwd that already declares coord-mcp, IFF
@@ -10970,9 +11066,25 @@ fn mint_terminal_key_for_declared_cwd(
     let doc: serde_json::Value = std::fs::read_to_string(Path::new(cwd).join(".mcp.json"))
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())?;
-    if !crate::coord_mcp_config::config_doc_references_terminal_env_for(&doc, cwd)
-        || config_doc_is_agent_marked(&doc)
-    {
+    if !crate::coord_mcp_config::config_doc_references_terminal_env_for(&doc, cwd) {
+        // The document IS env-referenced, but for another `<K>`: a copied
+        // document, or a spelling of this directory the writer canonicalized
+        // differently. Name both keys (never a nonce) so the mismatch is
+        // diagnosable rather than a silent no-mint.
+        let referenced = crate::coord_mcp_config::config_doc_terminal_env_names(&doc);
+        if !referenced.is_empty() {
+            let doc_keys: Vec<&str> = referenced
+                .iter()
+                .map(|n| crate::coord_mcp_config::terminal_env_name_key(n).unwrap_or("<legacy>"))
+                .collect();
+            warn!(
+                "coord-mcp: terminal {terminal_id}: {cwd}/.mcp.json references terminal key                  variable(s) with key(s) {doc_keys:?}, but this cwd's key is {} — no                  terminal-bound key minted; the session presents the document's default",
+                crate::coord_mcp_config::terminal_env_key(cwd)
+            );
+        }
+        return None;
+    }
+    if config_doc_is_agent_marked(&doc) {
         return None;
     }
     let Some((workdir_nonce, binding)) = live_cwd_device_binding(cwd, port) else {
@@ -11791,7 +11903,7 @@ fn resolve_root_reconcile(
         current_port,
         on_disk_nonce.as_deref(),
         registered,
-        read_static_authorization_presence(&path),
+        read_header_shape_current(&path),
         bound_port,
         read_agent_principal_marker(&path),
     );
@@ -12018,7 +12130,7 @@ fn reconcile_root_config_at(root_dir: &Path, bound_port: u16) -> RootReconcileAc
             // nonce being adopted was minted when the file was LAST written by a
             // provisioning path, and that is the moment this reads.
             let minted_at = config_mtime_or_epoch(&config_path);
-            let needs_upgrade = !read_static_authorization_presence(&config_path);
+            let needs_upgrade = !read_header_shape_current(&config_path);
             let rewritten =
                 needs_upgrade && rewrite_config_preserving_nonce(&root, bound_port, &nonce);
             adopt_on_disk_nonce(&root, &nonce, rewritten, minted_at);
@@ -12243,7 +12355,10 @@ where
         // `COORD_MCP_PRINCIPAL_HEADER_JSON`.
         let is_agent_marked = read_agent_principal_marker(&config_path);
         let current_proxy_port = read_proxy_port(&workdir);
-        let has_static_authorization = read_static_authorization_presence(&config_path);
+        // The header shape the reconcile leaves alone — which, with the
+        // terminal env reference switched OFF, excludes an env-referenced file
+        // (rolled back literally by the `UpgradeHeaders` arm, nonce preserved).
+        let has_static_authorization = read_header_shape_current(&config_path);
         // Phase 3a — boot heal. `clear_degraded_breadcrumb` used to have exactly
         // ONE call site (the probe's success arm, at PROVISIONING time), so a
         // session whose port was reconciled, whose nonce was rotated back into
@@ -23736,7 +23851,7 @@ mod terminal_env_reference_tests {
             .unwrap();
         // The production path is `release_all_terminal_bound_keys`; scoped to
         // this test's terminals so a parallel test's keys are not revoked.
-        release_terminal_bound_keys_where(|t| t == t1 || t == t2);
+        release_terminal_bound_keys(|t| t == t1 || t == t2, true, "test shutdown");
         for k in [&k1, &k2] {
             assert!(live_binding(&k.nonce).is_none());
             assert!(!k.credential.as_ref().unwrap().exists());
@@ -23815,5 +23930,67 @@ mod terminal_env_reference_tests {
         assert!(live_binding(&workdir_nonce).is_some());
         // Nothing left tracked for close to revoke.
         assert!(!terminal_bound_keys().lock().unwrap().contains_key(&term));
+    }
+
+    /// W1: switching the terminal env reference OFF rolls an ALREADY-WRITTEN
+    /// env-referenced file back to the literal shape with the SAME nonce — via
+    /// the in-cwd reuse, the session boot reconcile, and the root self-heal.
+    #[test]
+    fn switching_the_env_reference_off_rolls_written_files_back_to_literal() {
+        let amb = crate::test_env::isolated_ambient();
+        let (reuse_wd, session_wd, root_wd) = (
+            workdir(&amb, "rb-reuse"),
+            workdir(&amb, "rb-session"),
+            workdir(&amb, "rb-root"),
+        );
+        for wd in [&reuse_wd, &session_wd, &root_wd] {
+            write_coord_mcp_proxy_config(wd, PORT, None);
+            assert!(read_any_terminal_env_reference(
+                &Path::new(wd).join(".mcp.json")
+            ));
+        }
+        let nonce_of = |wd: &str| read_proxy_nonce(&Path::new(wd).join(".mcp.json")).unwrap();
+        let (n_reuse, n_session, n_root) = (
+            nonce_of(&reuse_wd),
+            nonce_of(&session_wd),
+            nonce_of(&root_wd),
+        );
+
+        // Switch ON: all three are healthy and left alone.
+        assert!(
+            !reusable_in_cwd_device_nonce(&reuse_wd, PORT, None)
+                .unwrap()
+                .needs_header_upgrade
+        );
+        assert!(read_header_shape_current(
+            &Path::new(&session_wd).join(".mcp.json")
+        ));
+
+        // `isolated_ambient` holds the env lock and restores the key on drop.
+        std::env::set_var(COORD_MCP_TERMINAL_ENV_REF_ENV, "0");
+        let reuse = reusable_in_cwd_device_nonce(&reuse_wd, PORT, None).unwrap();
+        let reuse_rewrote = reuse.needs_header_upgrade
+            && rewrite_config_preserving_nonce(&reuse_wd, PORT, &reuse.nonce);
+        let counts = reconcile_session_configs(vec![session_wd.clone()], PORT);
+        let root_action = reconcile_root_config_at(Path::new(&root_wd), PORT);
+        std::env::remove_var(COORD_MCP_TERMINAL_ENV_REF_ENV);
+
+        assert!(reuse_rewrote, "the reuse rolls an env-referenced file back");
+        assert_eq!(counts.upgraded, 1, "the session reconcile rolls it back");
+        assert_eq!(counts.rewritten, 0, "…without a mint");
+        assert_eq!(root_action, RootReconcileAction::UpgradeHeaders);
+        for (wd, n) in [
+            (&reuse_wd, &n_reuse),
+            (&session_wd, &n_session),
+            (&root_wd, &n_root),
+        ] {
+            let mcp = Path::new(wd).join(".mcp.json");
+            assert!(
+                !read_any_terminal_env_reference(&mcp),
+                "{wd} is literal again"
+            );
+            assert_eq!(&read_proxy_nonce(&mcp).unwrap(), n, "{wd}: same nonce");
+            assert!(live_binding(n).is_some());
+        }
     }
 }

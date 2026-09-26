@@ -2353,13 +2353,13 @@ impl TerminalSession {
         // runner started by any other means.
         cmd.env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV);
         // The per-terminal coord-mcp key names the in-cwd `.mcp.json` references
-        // (`${QONTINUI_COORD_MCP_NONCE:-…}`). A value inherited from whatever
-        // launched the RUNNER (a runner started from inside another runner's
-        // pane) names a key THIS runner never minted and would silently shadow
-        // the workdir default with a 401. Only the identity seam, downstream,
-        // sets them — for this terminal's own key.
-        // Every workdir-keyed name (`QONTINUI_COORD_MCP_NONCE_<K>` /
-        // `QONTINUI_COORD_MCP_CREDENTIAL_<K>`) is matched by shape.
+        // (`${QONTINUI_COORD_MCP_NONCE_<K>:-…}` / `${QONTINUI_COORD_MCP_CREDENTIAL_<K>:-…}`).
+        // A value inherited from whatever launched the RUNNER (a runner started
+        // from inside another runner's pane) names a key THIS runner never
+        // minted and would silently shadow the workdir default with a 401. Only
+        // the identity seam, downstream, sets them — for this terminal's own key.
+        // Every keyed name, and the legacy bare `QONTINUI_COORD_MCP_NONCE` /
+        // `QONTINUI_COORD_MCP_CREDENTIAL`, is matched by shape.
         let inherited = crate::coord_mcp_config::terminal_key_env_names(
             cmd.iter_full_env_as_str().map(|(k, _)| k),
         );
@@ -4353,16 +4353,6 @@ impl TerminalSession {
         info!(terminal_id = %self.id, "Closing terminal session");
         self.is_alive.store(false, Ordering::Relaxed);
 
-        // Revoke the terminal-bound coord-mcp key the identity seam minted for
-        // an env-referenced declared cwd, and delete its credential file (plan
-        // `2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages`).
-        // Interactive close only: one revoke re-encrypts the whole nonce store,
-        // so the deadline-bound shutdown path (`TerminalManager::close_all`)
-        // releases every tracked key in ONE write after its loop instead.
-        if deadline.is_none() {
-            crate::coord_mcp::release_terminal_bound_key(&self.id);
-        }
-
         // Phase 2 — drop the isolated edit context first so the
         // claim-release fire-and-forget posts ahead of the PTY teardown
         // (release uses tokio::spawn; running it before we drain threads
@@ -4379,17 +4369,44 @@ impl TerminalSession {
         // walks EVERY live terminal on shutdown (138 were live during the
         // 2026-08-30 wedge), so an unbounded taskkill is a per-terminal
         // blocked thread at exactly the moment the process is trying to exit.
-        if kill_child {
+        let process_tree_gone = if kill_child {
             let kill_budget =
                 std::cmp::max(clamp_to_deadline(TASKKILL_TIMEOUT, deadline), KILL_FLOOR);
-            if let Err(e) = self.io.kill(kill_budget) {
-                warn!(terminal_id = %self.id, pid = ?self.child_pid, "{e}");
+            match self.io.kill(kill_budget) {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!(terminal_id = %self.id, pid = ?self.child_pid, "{e}");
+                    false
+                }
             }
         } else {
             info!(
                 terminal_id = %self.id,
                 "pane process already exited — closing without a kill"
             );
+            true
+        };
+
+        // Revoke the terminal-bound coord-mcp key the identity seam minted for
+        // an env-referenced declared cwd, and delete its credential file (plan
+        // `2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages`).
+        // AFTER the kill, and only when the pane's process tree is known gone: the
+        // key lives in that tree's environment, and revoking it while a `claude`
+        // in the tree may still be running would 401 a live session. A failed
+        // kill keeps the key (logged). Interactive close only: one revoke
+        // re-encrypts the whole nonce store, so the deadline-bound shutdown path
+        // (`TerminalManager::close_all`) releases every tracked key in ONE
+        // synchronous write instead.
+        if deadline.is_none() {
+            if process_tree_gone {
+                crate::coord_mcp::release_terminal_bound_key(&self.id);
+            } else {
+                warn!(
+                    terminal_id = %self.id,
+                    "pane kill failed — its terminal-bound coord-mcp key (if any) is KEPT, \
+                     since a process in the tree may still be presenting it"
+                );
+            }
         }
 
         // Drop the writer to signal EOF on stdin.
@@ -5123,6 +5140,77 @@ mod tests {
         fn release(&self, _budget: Duration) -> Result<(), String> {
             Ok(())
         }
+    }
+
+    /// A pane whose kill FAILS — the close path must then keep the terminal's
+    /// coord-mcp key.
+    struct FailingKillPaneIo;
+
+    impl crate::terminal::pane_io::PaneIo for FailingKillPaneIo {
+        fn reader(&self) -> Result<Box<dyn Read + Send>, String> {
+            Ok(Box::new(std::io::empty()))
+        }
+        fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
+            Ok(Box::new(std::io::sink()))
+        }
+        fn resize(&self, _cols: u16, _rows: u16) -> Result<(), String> {
+            Ok(())
+        }
+        fn wait(&self) -> Result<i32, String> {
+            Ok(0)
+        }
+        fn kill(&self, _budget: Duration) -> Result<(), String> {
+            Err("injected kill failure".to_string())
+        }
+        fn set_paused(&self, _paused: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn pid(&self) -> Option<u32> {
+            None
+        }
+        fn credential_scrub(&self) -> crate::terminal::pane_io::CredentialScrub {
+            crate::terminal::pane_io::CredentialScrub::NoChildEnv
+        }
+        fn release(&self, _budget: Duration) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// W4 (plan `2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages`):
+    /// an interactive close revokes the terminal-bound coord-mcp key AFTER a
+    /// successful kill, and KEEPS it when the kill failed.
+    #[test]
+    fn close_revokes_the_terminal_key_only_after_a_successful_kill() {
+        let amb = crate::test_env::isolated_ambient();
+        let wd = amb.dir().to_string_lossy().to_string();
+
+        // Kill fails: key kept.
+        let failing_id = format!("term-{}", uuid::Uuid::new_v4());
+        let kept = crate::coord_mcp::track_terminal_bound_key_for_test(&failing_id, &wd);
+        let mut session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        session.id = failing_id.clone();
+        session.io = Arc::new(FailingKillPaneIo);
+        session.close();
+        assert!(
+            crate::coord_mcp::nonce_is_live_for_test(&kept),
+            "a failed kill must keep the key"
+        );
+
+        // Kill succeeds: key revoked.
+        let ok_id = format!("term-{}", uuid::Uuid::new_v4());
+        let revoked = crate::coord_mcp::track_terminal_bound_key_for_test(&ok_id, &wd);
+        let io = Arc::new(KillCountingPaneIo::default());
+        let mut session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        session.id = ok_id.clone();
+        let pane: Arc<dyn crate::terminal::pane_io::PaneIo> = io.clone();
+        session.io = pane;
+        session.close();
+        assert_eq!(io.kills(), 1);
+        assert!(
+            !crate::coord_mcp::nonce_is_live_for_test(&revoked),
+            "a successful close revokes the key"
+        );
+        crate::coord_mcp::release_terminal_bound_key(&failing_id);
     }
 
     /// A writer that records what was typed and, like a TUI input line, echoes
