@@ -598,6 +598,11 @@ pub struct SurveySummary {
     pub coord_ownership_reachable: bool,
     /// Present when `coord_ownership_reachable == false`.
     pub coord_ownership_error: Option<String>,
+    /// Present when coord answered but the cursor walk over
+    /// `GET /coord/sessions/worktrees` stopped before its last page. The index
+    /// is then a PREFIX of the ledger: `unattributed` rows are partly a
+    /// coverage gap, not an absence of owners.
+    pub coord_ownership_partial: Option<String>,
 
     // --- Volume headroom (disk-monitoring Phase 1, step 3) ---
     /// Free/total bytes per mounted volume. EMPTY while `volumes_status` is
@@ -955,16 +960,23 @@ pub async fn survey(query: SurveyQuery) -> Result<Survey, String> {
         None
     };
     // The coord ownership read (sources 2+3) joins the SAME concurrency
-    // group, so the worst case stays max(15s, 15s, wait <=10s) rather than
-    // their sum.
+    // group, so the worst case stays max(15s, SURVEY_WALK_BUDGET = 20s,
+    // wait <=10s) rather than their sum. The ownership read is a multi-page
+    // cursor walk; its budget bounds the whole walk, and running out after
+    // page one yields a PARTIAL index (`coord_ownership_partial`), not a hang.
     let (pull, waited, ownership) = tokio::join!(
         reclaim::fetch_pull(),
         census::wait_for_census_after(wait_for, query.wait()),
-        custody::coord::fetch_ownership()
+        custody::coord::fetch_ownership(custody::coord::SURVEY_WALK_BUDGET)
     );
 
     let (ownership, ownership_error) = match ownership {
-        Ok(Some(o)) => (Some(o), None),
+        Ok(Some(o)) => {
+            if let Some(p) = &o.partial {
+                warn!("agent_worktrees: coord ownership index is PARTIAL: {p}");
+            }
+            (Some(o), None)
+        }
         Ok(None) => (None, Some("no coord_url configured".to_string())),
         Err(e) => {
             // NEVER fatal: attribution degrades to the custody record and the
@@ -1075,6 +1087,7 @@ fn assemble_survey(
                 session_roots_scanned: directory.roots_scanned(),
                 coord_ownership_reachable: ownership.is_some(),
                 coord_ownership_error: ownership_error.clone(),
+                coord_ownership_partial: ownership.and_then(|o| o.partial.clone()),
                 ..SurveySummary::default()
             }
             .with_volume_sample(volume_sample, now),
@@ -1120,6 +1133,7 @@ fn assemble_survey(
         session_roots_scanned: directory.roots_scanned(),
         coord_ownership_reachable: ownership.is_some(),
         coord_ownership_error: ownership_error,
+        coord_ownership_partial: ownership.and_then(|o| o.partial.clone()),
         ..Default::default()
     };
     summarize_attribution(&items, &mut summary);
@@ -1756,8 +1770,8 @@ pub struct WipOrphanReport {
     pub wip_unreadable: usize,
     pub orphans: Vec<WipOrphan>,
     /// Of [`Self::orphans`], how many came in through a MEASURED-work arm
-    /// (`unattributed-wip` | `custody-stale` | `owner-closed` |
-    /// `owner-liveness-unknown`). A subset of [`Self::wip_total`].
+    /// (`unattributed-wip` | `unattributed-partial-coord-index` |
+    /// `custody-stale` | `owner-closed` | `owner-liveness-unknown`). A subset of [`Self::wip_total`].
     ///
     /// Published because [`Self::note`] states the report's arithmetic in
     /// prose, and a prose count nobody can check against a field is exactly
@@ -1784,6 +1798,10 @@ pub struct WipOrphanReport {
     pub session_roots_scanned: usize,
     pub coord_ownership_reachable: bool,
     pub coord_ownership_error: Option<String>,
+    /// See [`SurveySummary::coord_ownership_partial`]: `Some` ⇒ the ownership
+    /// index was a prefix, so some `orphans` may have an owner coord did not
+    /// get to report.
+    pub coord_ownership_partial: Option<String>,
 }
 
 /// **The orphan predicate.** Stated here, on the wire, and in the doc comment,
@@ -1816,9 +1834,15 @@ pub struct WipOrphanReport {
 pub const WIP_ORPHAN_PREDICATE: &str =
     "(is_dirty OR dirtiness unmeasurable) AND owner_live != true; each row carries the \
      arm that admitted it in `orphan_reason` (dirtiness-unknown | unattributed-wip | \
-     custody-stale | owner-closed | owner-liveness-unknown)";
+     unattributed-partial-coord-index | custody-stale | owner-closed | \
+     owner-liveness-unknown)";
 
-fn orphan_reason_for(item: &SurveyItem) -> Option<&'static str> {
+/// `coord_ownership_partial` is whether the coord ownership index was a
+/// PREFIX (the cursor walk over `GET /coord/sessions/worktrees` stopped
+/// early). A row with no owner is then `unattributed-partial-coord-index`
+/// rather than `unattributed-wip`: its allocation row may sit on a page that
+/// was never read, so "nobody owns this" is not established.
+fn orphan_reason_for(item: &SurveyItem, coord_ownership_partial: bool) -> Option<&'static str> {
     // The published predicate's first clause, spelled the way
     // [`WIP_ORPHAN_PREDICATE`] states it: `is_dirty` **OR** dirtiness
     // unmeasurable. Testing `is_dirty` alone was VACUOUS-BUT-WRONG — vacuous
@@ -1844,6 +1868,9 @@ fn orphan_reason_for(item: &SurveyItem) -> Option<&'static str> {
         return Some("dirtiness-unknown");
     }
     if item.session_id.is_none() {
+        if coord_ownership_partial {
+            return Some("unattributed-partial-coord-index");
+        }
         // Dirty, and NOTHING named an owner. The population the plan exists for.
         return Some("unattributed-wip");
     }
@@ -1929,11 +1956,12 @@ pub fn build_wip_orphans(survey: &Survey, now: chrono::DateTime<chrono::Utc>) ->
         .filter(|i| i.is_dirty && i.is_dirty_known)
         .count();
     let wip_unreadable = survey.items.iter().filter(|i| !i.is_dirty_known).count();
+    let ownership_partial = survey.summary.coord_ownership_partial.is_some();
     let mut orphans: Vec<WipOrphan> = survey
         .items
         .iter()
         .filter_map(|item| {
-            let orphan_reason = orphan_reason_for(item)?;
+            let orphan_reason = orphan_reason_for(item, ownership_partial)?;
             // Both lines are COPY-PASTED INTO A SHELL, and every input comes
             // from a file a shell script in another repo writes (or from a
             // commit trailer any author controls). A token that cannot be
@@ -2056,7 +2084,7 @@ pub fn build_wip_orphans(survey: &Survey, now: chrono::DateTime<chrono::Utc>) ->
         .count();
     let orphans_with_measured_wip = orphans.len() - orphans_with_unknown_dirtiness;
 
-    let note = match survey.census_status {
+    let mut note = match survey.census_status {
         CensusStatus::Pending => "No disk snapshot yet — this is NOT 'nothing is orphaned', \
              it is 'not known yet'."
             .to_string(),
@@ -2084,6 +2112,12 @@ pub fn build_wip_orphans(survey: &Survey, now: chrono::DateTime<chrono::Utc>) ->
             }
         ),
     };
+    if let Some(p) = &survey.summary.coord_ownership_partial {
+        note.push_str(&format!(
+            " The coord ownership index was PARTIAL ({p}), so a row here may have an owner \
+             coord did not get to report."
+        ));
+    }
 
     WipOrphanReport {
         generated_at: now.to_rfc3339(),
@@ -2101,6 +2135,7 @@ pub fn build_wip_orphans(survey: &Survey, now: chrono::DateTime<chrono::Utc>) ->
         session_roots_scanned: survey.summary.session_roots_scanned,
         coord_ownership_reachable: survey.summary.coord_ownership_reachable,
         coord_ownership_error: survey.summary.coord_ownership_error.clone(),
+        coord_ownership_partial: survey.summary.coord_ownership_partial.clone(),
     }
 }
 
@@ -3237,6 +3272,34 @@ mod tests {
         assert!(report.predicate.contains("is_dirty"));
     }
 
+    /// A partial coord ownership index (the cursor walk stopped at its bound)
+    /// must reach the orphan report — both as a field and in the prose note —
+    /// so an `unattributed-wip` row is not read as proof nobody owns it.
+    #[test]
+    fn a_partial_ownership_index_is_declared_on_the_orphan_report() {
+        let _amb = crate::test_env::isolated_ambient();
+        let wt = "D:/qontinui-root/wt-anon";
+        let mut s = survey_of(vec![census_row(wt, true, Some(false))], &directory(), 1_000);
+        s.summary.coord_ownership_reachable = true;
+        s.summary.coord_ownership_partial = Some("stopped at the 100-page bound".to_string());
+        let report = build_wip_orphans(&s, chrono::Utc::now());
+        assert_eq!(
+            report.coord_ownership_partial.as_deref(),
+            Some("stopped at the 100-page bound")
+        );
+        assert!(report.note.contains("PARTIAL"), "{}", report.note);
+        assert_eq!(
+            report.orphans[0].orphan_reason, "unattributed-partial-coord-index",
+            "a row the partial index did not cover must not claim nobody owns it"
+        );
+
+        let whole = survey_of(vec![census_row(wt, true, Some(false))], &directory(), 1_000);
+        let report = build_wip_orphans(&whole, chrono::Utc::now());
+        assert_eq!(report.coord_ownership_partial, None);
+        assert!(!report.note.contains("PARTIAL"));
+        assert_eq!(report.orphans[0].orphan_reason, "unattributed-wip");
+    }
+
     /// A dirty worktree nobody owns is the population the whole plan exists
     /// for, and it must be IN the report with a stated reason — not dropped
     /// for lacking a session id.
@@ -3618,7 +3681,7 @@ mod tests {
         item.is_dirty = false; // the combination the published predicate covers
         item.is_dirty_known = false;
         assert_eq!(
-            orphan_reason_for(&item),
+            orphan_reason_for(&item, false),
             Some("dirtiness-unknown"),
             "the code must implement the predicate it publishes"
         );
@@ -3626,7 +3689,7 @@ mod tests {
         // A measured-clean row is still not an orphan — the OR did not widen
         // the report to everything.
         item.is_dirty_known = true;
-        assert_eq!(orphan_reason_for(&item), None);
+        assert_eq!(orphan_reason_for(&item, false), None);
     }
 
     /// A survey item with no owner and no measurement — the shape the
