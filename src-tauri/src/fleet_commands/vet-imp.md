@@ -42,7 +42,13 @@ has opened the PRs (Step 5).
 
   Any trailing flags `/implement-plan` understands (e.g. `--wait-timeout=<Nm>`)
   are forwarded verbatim to the implement step; they are ignored by the vet
-  step.
+  step. **`--phase N` is the one exception** — on a phase-claimable plan
+  (`/preflight` §0c's parsed declaration, not inferred), forward it to BOTH
+  halves: `/vet-plan --phase N <path>` at Step 2 and
+  `/implement-plan --phase N <path>` at Step 4, so the phase-scoped reserve,
+  the scoped status-line edit, and the skipped whole-plan registry/gates
+  (`/vet-plan` §0.21) line up with the SAME phase claim `/implement-plan`
+  Step 0.6 already takes for that number.
 
 ## Plan directories
 
@@ -265,7 +271,13 @@ implementation to keep correct beats four that drift.
 phase's agent is mine to spawn."* A vetter and an implementer share no phase
 number, so only the plan key can ever see them collide — measured 2026-08-25,
 **14 strict duplicate-PR pairs in 60 days** (one MERGED + one CLOSED-unmerged,
-< 4 h apart, ≥ 2 shared files, Jaccard ≥ 0.50).
+< 4 h apart, ≥ 2 shared files, Jaccard ≥ 0.50). **On a phase-claimable plan
+this chain forwards `--phase N` to both halves rather than reserving the phase
+key itself** — see the Arguments section above. `/preflight` §0c is the ONE
+implementation of the phase-key mechanics (spelling, `kind: "phase"`, the
+advisory-vs-STOP split between the plan key and the phase key); `/vet-plan`
+§0.21 and `/implement-plan`'s "Phase-scoped runs (`--phase N`)" section cite it
+rather than re-deriving it.
 
 #### Resolution
 
@@ -1198,6 +1210,8 @@ implementation, invoked from two places, not a second copy of the check:
 bash <workspace-root>/qontinui-claude-config/scripts/review-arm-corroborate.sh --artifact "$ARM_FILE" --tree-root <the worktree the implement half reviewed>
 ```
 
+**Run it in the background.** Door calls and tree re-measures are serial, each bounded by `REVIEW_ARM_CORROBORATE_TIMEOUT` (default 600 s), so a run can take up to (N+1+T) × that budget (N PRs, the coverage call, T checkouts re-measured). Start it with the Bash tool's `run_in_background` (or watch it with Monitor) and read the verdict line when it exits — a foreground call under the tool's 120 s / 600 s timeout is killed with no verdict.
+
 Branch on its exit code, exactly as Step 4.7 documents it:
 
 - **`0` CORROBORATED** — every PR's coord `head_sha` equals the artifact's
@@ -1220,7 +1234,11 @@ Branch on its exit code, exactly as Step 4.7 documents it:
   `require_review` gate reads that line, not the artifact — so the re-review
   must edit the body (`gh pr edit <n> --body-file <file>`, `/implement-plan`
   Step 4.5) as well as re-record.
-- **`3` UNKNOWN** — the door did not answer, the card reads `confidence:
+- **`3` UNKNOWN** — the door did not answer (`unknown_door` — it refused;
+  `unknown_door_timeout` — its curl gave up with exit 28, its connect bound or
+  its `COORD_REVIVE_CALL_TIMEOUT` total bound; `unknown_budget_expired` — this
+  script's `REVIEW_ARM_CORROBORATE_TIMEOUT` expired before the door exited; the
+  row's detail names the budgets involved and the elapsed time), the card reads `confidence:
   unknown`, the artifact predates `reviewed_head_sha`
   (`unknown_no_reviewed_head`) or `reviewed_tree` (`unknown_no_reviewed_tree`),
   or the tree could not be compared at all (`unknown_tree`: the producer
@@ -1232,6 +1250,8 @@ Branch on its exit code, exactly as Step 4.7 documents it:
   `unknown-must-not-render-as-a-default`]. UNKNOWN does not by itself make the
   chain INCOMPLETE — it makes the report say what could not be established.
 - **`4` USAGE** — no artifact: the presence verdict above already covers this.
+- **Any other exit** (1, 129/130/143, …) — UNKNOWN: the run did not complete and
+  the artifact may or may not have been rewritten. Report it as corroboration UNKNOWN, never corroborated.
 
 The rows the script appends (`corroboration[]`, `coverage`) are merged into the
 same artifact, so a later reader finds the implementer-written half and the

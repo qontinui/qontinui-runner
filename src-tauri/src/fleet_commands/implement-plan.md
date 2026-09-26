@@ -6,6 +6,15 @@ Execute an approved implementation plan end-to-end in a single session, without 
 
 ## Arguments
 - `$ARGUMENTS` - Optional: specific notes or constraints for this implementation run
+- `--phase N` — Optional. On a **phase-claimable** plan (`/preflight` §0c's
+  parsed declaration — `How to take a phase` / `independently claimable` /
+  `Phase-Claimable: yes`, never inferred), scopes THIS ENTIRE RUN to phase N
+  alone: Step 0.6 claims and Step 1 spawns cover phase N only, never the
+  "for each phase" whole-plan loop those steps otherwise run. See "Phase-scoped
+  runs (`--phase N`)" below for exactly what narrows and what does not. Passing
+  `--phase N` against a plan that is NOT phase-claimable is a usage error —
+  report it and stop before Step 0.4, rather than silently scoping a plan that
+  was never declared safe to split.
 
 ## Plan directories
 
@@ -145,6 +154,59 @@ launched outside the runner will not have it.
 **Neither directory has to be inside a git repo.** Wherever this skill commits or pushes
 a plan edit it first checks `git -C "<dir>" rev-parse --is-inside-work-tree`; when that
 fails, the edit on disk is the whole ritual. Nothing here requires a second repo.
+
+## Phase-scoped runs (`--phase N`)
+
+*(Plan `2026-09-06-multi-phase-plans-have-no-per-phase-lifecycle-in-vet-plan-preflight-and-coord`
+Phase 1/Phase 2 item 3 — canonical spec; `/preflight` §0c defines the phase
+reserve key this section's claim reuses, and `/vet-imp`'s Arguments section
+forwards `--phase N` here as well as to `/vet-plan --phase N`.)*
+
+`--phase N` narrows THIS RUN to a single phase of a phase-claimable plan. It
+changes four things below and nothing else — every other step (Step 0.4's
+dependency gate, Step 0.5's IN PROGRESS stamp, Step 4/4.4-4.7's PR flow, Step 6's
+SHIPPED-stamp gate) still applies to the WHOLE plan document exactly as written,
+because a phase-scoped run is one session's contribution to a plan multiple
+sessions are implementing concurrently, not a separate plan.
+
+1. **Step 0.6's phase-claim loop and Step 1's "for each phase" spawn loop each
+   run over exactly ONE phase — phase N — not every phase in the plan.** Every
+   other mechanic in those two steps (the resource key
+   `plan:<plan-stem>:phase:<n>`, `kind: "phase"`, the owner token, the
+   heartbeat ledger, the conflict-resolution flow on a foreign `held`) is
+   unchanged; only the loop bound narrows from "every phase" to "phase N".
+2. **The Step 0.5 / Step 0.6 cancel-then-mute of the vet→implement safety net
+   targets the PHASE-QUALIFIED gate, not the bare one.** Look up the gate row
+   whose `phase_name` is `vet→implement safety net (phase N)` for this specific
+   N — never the bare `vet→implement safety net`, which on a phase-claimable
+   plan is `/vet-plan` §0.21's WHOLE-PLAN net (skipped entirely on a
+   phase-scoped vet per §0.21 point 3) and is not this phase's concern.
+3. **Step 0.5's IN PROGRESS stamp becomes a scoped status line, not a
+   whole-plan block replace** — the same splice `/vet-plan` §0.21 point 2 uses
+   for a scoped VETTED line, applied to IN PROGRESS: append (never replace) a
+   line `Phase N: IN PROGRESS <date> (session <short-id>).` after the existing
+   status paragraph, via the same separate-index pinned-`$BASE` push recipe.
+   The single-stamp invariant governs the top-level `> **Status:` blockquote
+   only; a phase-scoped line is not that blockquote and does not compete with
+   it. **Do not run the guarded-state disposition table (case 0-3) against the
+   whole-plan stamp on a phase-scoped run** — that table decides whether THIS
+   session may move the PLAN's own lifecycle word, which a single-phase run
+   never does.
+4. **Step 6's SHIPPED stamp is a whole-plan decision and is UNCHANGED — a
+   phase-scoped run does not make it.** When phase N's work lands, record it
+   the same way `/vet-plan` §0.21 point 4 records a phase-scoped vet verdict:
+   `metadata.phase_vets[]` (or, once shipped, the merge-safe `metadata_patch`
+   arm) carries `{phase: N, verdict: "shipped", ...}`. Whether the WHOLE plan
+   is now SHIPPED is a separate question this run does not answer — leave the
+   plan's own status word to whichever session (this one or a later one) is
+   implementing the last remaining phase, or to `/verify-plan-status`.
+
+Everything else in this skill — Step 0.4's dependency gate, the concurrent-work
+reconnaissance in Step 0.45, the plan reserve in Step 0.48 (still whole-plan;
+`--phase N` adds the NESTED phase claim on top of it, never instead of it), the
+PR flow in Step 4 onward, and Step 7's `/unattended` — reads "the plan" exactly
+as it would on a whole-plan run, because a phase-scoped run is still one run
+against the one plan document.
 
 ## Instructions
 
@@ -3039,6 +3101,8 @@ the second stage.
 bash <workspace-root>/qontinui-claude-config/scripts/review-arm-corroborate.sh --tree-root <the worktree you reviewed>
 ```
 
+**Run it in the background.** Door calls and tree re-measures are serial, each bounded by `REVIEW_ARM_CORROBORATE_TIMEOUT` (default 600 s), so a run can take up to (N+1+T) × that budget (N PRs, the coverage call, T checkouts re-measured). Start it with the Bash tool's `run_in_background` (or watch it with Monitor) and read the verdict line when it exits — a foreground call under the tool's 120 s / 600 s timeout is killed with no verdict.
+
 **Run the peer-land probe here too, and before every rebase** *(plan
 `2026-09-05-a-verification-report-never-states-the-tree-it-read` Phase 5)*:
 
@@ -3080,8 +3144,9 @@ touched), and exits on the **worst** verdict:
 |---|---|---|---|
 | `0` | **CORROBORATED** | every PR's coord `head_sha` equals the artifact's `reviewed_head_sha`, the re-measured tree equals the artifact's `reviewed_tree`, and the coverage read found no PR coord holds for this session that `prs[]` omits | proceed — but read the `coverage=` half of the verdict line too, below |
 | `2` | **CONTRADICTION** | `contradiction_head_drift` — the PR carries code the review did not see; `contradiction_tree_moved` — the **working tree** moved since the review measured it, committed or not; or `contradiction_uncovered_pr` — coord attributes a PR to this session that the artifact omits | **this is a failure of the review gate, not a note.** Re-review the head that is actually on the PR and the tree that is actually on disk (Step 4.4 items 3–6 again, which re-measures `reviewed_head_sha` and `reviewed_tree`), or cover the omitted PR; then add the new head's `Coord-Reviewed-Head:` line to the PR body (`gh pr edit <n> --body-file <file>`, Step 4.5 — coord harvests it on `edited`) so the trailer coord's `require_review` gate reads and the artifact agree; then re-run this step. Do not proceed to Step 6 with a contradiction standing, and never edit the `corroboration[]` row by hand |
-| `3` | **UNKNOWN** | the card door did not answer, the card reads `confidence: unknown` or carries no `head_sha`, the artifact predates `reviewed_head_sha` (`unknown_no_reviewed_head`) or `reviewed_tree` (`unknown_no_reviewed_tree`), or the tree could not be compared — the producer refused, a field is the unresolved sentinel, or the two lines name different checkouts (`unknown_tree`) | UNKNOWN is never a pass and never a contradiction. Say so in the Step 6 report — *"corroboration UNKNOWN: <the detail the row carries>"* — and never report the review as corroborated |
+| `3` | **UNKNOWN** | the card door did not answer — `unknown_door` (it refused or answered garbage), `unknown_door_timeout` (the door's curl gave up with exit 28 — its connect bound or its `COORD_REVIVE_CALL_TIMEOUT` total bound; the line cannot say which) or `unknown_budget_expired` (this script's `REVIEW_ARM_CORROBORATE_TIMEOUT`, default 600 s, expired before the door exited; *most likely* local starvation only when the inner budget sits below it), each detail naming the budgets involved and the elapsed wall time — the card reads `confidence: unknown` or carries no `head_sha`, the artifact predates `reviewed_head_sha` (`unknown_no_reviewed_head`) or `reviewed_tree` (`unknown_no_reviewed_tree`), or the tree could not be compared — the producer refused, a field is the unresolved sentinel, or the two lines name different checkouts (`unknown_tree`) | UNKNOWN is never a pass and never a contradiction. Say so in the Step 6 report — *"corroboration UNKNOWN: <the detail the row carries>"* — and never report the review as corroborated |
 | `4` | **USAGE** | no artifact, no session id | the same finding Step 6 item 6 names: the review gate never wrote its record |
+| any other | **UNKNOWN** | any other exit (1, 129/130/143, …): the run did not complete — a crash, or a HUP / INT / TERM, e.g. a foreground Bash-tool timeout — and the artifact may or may not have been rewritten | report *"corroboration UNKNOWN: the run did not complete (exit <n>)"*; never corroborated |
 
 **The verdict line carries TWO halves — `heads=<n>/<m>` and `coverage=<…>` —
 and only the first decides the exit code.** The coverage read
@@ -3091,7 +3156,9 @@ door answers `mine=true requires a session-scoped identity (no
 caller_session_id)`. Folding that structural refusal into the exit code would
 render every real run UNKNOWN and bury the head verdict, so a coverage UNKNOWN
 is instead printed on the verdict line and stored as the artifact's `coverage`
-row (`verdict: unknown_door`, with the door's own words), while a coverage
+row (`verdict: unknown_door`, with the door's own words — or
+`unknown_door_timeout` / `unknown_budget_expired` when a budget expired, as on
+the card rows), while a coverage
 **contradiction** still exits `2`. Read `CORROBORATED heads=2/2
 coverage=UNKNOWN` as exactly that — heads proven, coverage not established — and
 carry both halves into the Step 6 report. Never write it up as "coverage
