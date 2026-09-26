@@ -216,6 +216,12 @@ mod rag;
 mod recording;
 mod reflection;
 mod regression_api;
+/// Renderer-memory self-watchdog (plan
+/// `2026-06-09-runner-renderer-memory-watchdog-and-twin-slo`, Phase 1 + the
+/// Phase 3.1 producer): samples the WebView2 subtree's working set, self-heals
+/// through `webview_recovery`'s pong-verified ladder before a hard OOM, and
+/// publishes the memory/reload telemetry the device heartbeat reports.
+mod renderer_watchdog;
 mod repo_detection;
 /// Spawn-time resource gate (plan
 /// `2026-08-07-runner-resource-guard-and-session-protection` §Part D). Top-level
@@ -4975,6 +4981,18 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // boot-restored tabs; the loop itself waits a boot-settle delay
                 // before its first tick.
                 looping_agent_supervisor::start(app.handle());
+
+                // Renderer-memory self-watchdog (plan
+                // `2026-06-09-runner-renderer-memory-watchdog-and-twin-slo`,
+                // Phase 1). Started unconditionally, including in server mode:
+                // the sampler and the Phase 3.1 heartbeat telemetry are worth
+                // having on every runner, and the self-heal gates itself —
+                // `webview_recovery::trigger_ui_recovery` answers
+                // `Skipped { why: "server_mode" | "no_main_window" }`, which the
+                // watchdog latches so it stops attempting and keeps sampling.
+                // Its first sample is one tick (30s default) away, so it does
+                // not race the main-window build below.
+                renderer_watchdog::start(app.handle().clone());
 
                 // Session-tracking health check (plan 2026-07-03-runner-
                 // session-tracking-drift-and-guardrails Phase 3 item 2): every
