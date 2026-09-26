@@ -182,6 +182,10 @@ fn store_trunk_tool_policy(policy: Option<TrunkToolPolicy>) {
 /// declaration. Line comments inside the block are stripped first, so a
 /// commented-out entry is not read as a member. `None` when the declaration
 /// is absent or unterminated.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn parse_str_slice_const(source: &str, name: &str) -> Option<Vec<String>> {
     let needle = format!("const {name}: &[&str] = &[");
     let start = source.find(&needle)? + needle.len();

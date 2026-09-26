@@ -104,6 +104,10 @@ pub struct ParsedMetaPromptRewrite {
 // ── Marker extraction ───────────────────────────────────────────────────
 
 /// Extract all blocks between `[TAG]` and `[/TAG]` from `output`.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_marker_blocks(output: &str, tag: &str) -> Vec<String> {
     let open = format!("[{}]", tag);
     let close = format!("[/{}]", tag);
@@ -129,6 +133,10 @@ fn extract_marker_blocks(output: &str, tag: &str) -> Vec<String> {
 /// Supports:
 /// - `key: value` (single line)
 /// - `key: |` followed by indented multiline content
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn parse_key_value_pairs(block: &str) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
     let lines: Vec<&str> = block.lines().collect();

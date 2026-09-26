@@ -11,7 +11,12 @@
  * that could refuse a spawn — only a display predicate.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+import { renderToStaticMarkup } from "react-dom/server";
+
+vi.mock("@/lib/perfCaps", () => ({
+  usePerfCaps: () => ({ max_sessions_warn: 30 }),
+}));
 
 import * as bannerModule from "./SessionCountBanner";
 import { shouldShowSessionCountBanner, shouldResetDismissal } from "./SessionCountBanner";
@@ -40,7 +45,7 @@ describe("shouldShowSessionCountBanner", () => {
   });
 
   it("never warns with nothing open, however low the threshold", () => {
-    // `0 >= 0` is true, but "0 sessions open" on an empty terminal page is
+    // `0 >= 0` is true, but "0 panes open" on an empty terminal page is
     // noise, not advice.
     expect(shouldShowSessionCountBanner(0, 0, false)).toBe(false);
     expect(shouldShowSessionCountBanner(0, 30, false)).toBe(false);
@@ -82,5 +87,28 @@ describe("the rail warns and never refuses", () => {
       expect(typeof shouldShowSessionCountBanner(count, 30, false)).toBe("boolean");
       expect(typeof shouldResetDismissal(count, 30)).toBe("boolean");
     }
+  });
+});
+
+describe("the banner labels its population", () => {
+  /**
+   * The banner is fed `tabs.length` — open PTY panes — while the status strip
+   * on the same page prints "N sessions" from the Claude-session model. Two
+   * numbers both labelled "sessions" stacked on one page was the defect; the
+   * banner's copy must name panes.
+   */
+  it('reads "N panes open", never "sessions open"', () => {
+    const html = renderToStaticMarkup(
+      <bannerModule.SessionCountBanner openPaneCount={4} threshold={4} />,
+    );
+    expect(html).toContain("4 panes open");
+    expect(html).not.toContain("sessions open");
+    expect(html).toContain('data-open-pane-count="4"');
+  });
+
+  it("renders nothing below the threshold (negative control)", () => {
+    expect(
+      renderToStaticMarkup(<bannerModule.SessionCountBanner openPaneCount={3} threshold={4} />),
+    ).toBe("");
   });
 });

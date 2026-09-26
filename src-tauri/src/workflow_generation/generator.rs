@@ -3177,6 +3177,10 @@ fn parse_verification_response(response: &str) -> Vec<String> {
 }
 
 /// Extract a JSON array from a response that might be wrapped in markdown.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_json_array_from_response(response: &str) -> String {
     let trimmed = response.trim();
 
@@ -3378,6 +3382,10 @@ fn apply_request_options(workflow: &mut UnifiedWorkflow, request: &GenerateWorkf
 /// 2. JSON in a generic ``` code block
 /// 3. First `{` to last `}` in the text
 /// 4. Original text (trimmed) as fallback
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn extract_json_from_response(response: &str) -> String {
     let trimmed = response.trim();
 

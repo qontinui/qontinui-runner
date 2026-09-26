@@ -208,17 +208,65 @@ mod tests {
             "Missing CircuitBreakerState enum"
         );
 
-        // Write SDL to file for frontend codegen reference
+        // The committed SDL is what external consumers codegen against, so it
+        // is a DRIFT GATE, not a side effect: a schema change that is not
+        // regenerated into `schema.graphql` fails here. Regenerate with
+        // `QONTINUI_UPDATE_GRAPHQL_SDL=1` and commit the result. (Until
+        // 2026-09-23 this test rewrote the file unconditionally and asserted
+        // nothing, so a stale published SDL — 13 of 27 error codes — passed.)
         let sdl_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")
             .join("graphql")
             .join("schema.graphql");
-        std::fs::write(&sdl_path, &sdl).expect("Failed to write schema.graphql");
-        println!("Schema exported to: {}", sdl_path.display());
-        println!(
-            "Schema length: {} bytes, {} lines",
-            sdl.len(),
-            sdl.lines().count()
+        if std::env::var("QONTINUI_UPDATE_GRAPHQL_SDL").as_deref() == Ok("1") {
+            std::fs::write(&sdl_path, &sdl).expect("Failed to write schema.graphql");
+            println!("Schema exported to: {}", sdl_path.display());
+            return;
+        }
+        let committed = std::fs::read_to_string(&sdl_path).expect("Failed to read schema.graphql");
+        assert!(
+            committed == sdl,
+            "src/graphql/schema.graphql is stale against the live schema. \
+             Regenerate: `npm run graphql:schema` (QONTINUI_UPDATE_GRAPHQL_SDL=1 \
+             cargo test --bin qontinui-runner schema_exports_valid_sdl), then `npm run graphql:codegen`, and commit both."
         );
+    }
+
+    /// The GraphQL `UiBridgeErrorCode` is the canonical enum itself (not a
+    /// copy), so its variant SET cannot drift. What could still drift is the
+    /// SPELLING: async-graphql and serde each apply their own rename rule. This
+    /// pins that every GraphQL value name equals the serde wire name an HTTP
+    /// caller sees, and that the published SDL lists every one of them.
+    #[test]
+    fn ui_bridge_error_code_graphql_names_equal_serde_wire_names() {
+        use crate::graphql::types::UiBridgeErrorCode;
+        use async_graphql::resolver_utils::EnumType;
+
+        let items = <UiBridgeErrorCode as EnumType>::items();
+        assert!(items.len() >= 27, "expected the full canonical vocabulary");
+        let sdl = export_sdl();
+        let block_start = sdl
+            .find("enum UiBridgeErrorCode {")
+            .expect("SDL must publish enum UiBridgeErrorCode");
+        // The enum's closing brace sits alone on its line; a bare `find('}')`
+        // would stop inside a variant description that quotes a JSON payload.
+        let block_len = sdl[block_start..]
+            .find("\n}\n")
+            .expect("enum UiBridgeErrorCode block must close");
+        let block = &sdl[block_start..block_start + block_len];
+        for item in items {
+            let wire = serde_json::to_value(item.value).expect("serialize code");
+            assert_eq!(
+                wire.as_str(),
+                Some(item.name),
+                "GraphQL name and serde wire name diverge for {:?}",
+                item.value
+            );
+            assert!(
+                block.lines().any(|l| l.trim() == item.name),
+                "SDL enum UiBridgeErrorCode is missing {}",
+                item.name
+            );
+        }
     }
 }

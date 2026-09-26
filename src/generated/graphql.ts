@@ -425,7 +425,7 @@ export type MutationRoot = {
   uiBridgePageBack: ActionResult;
   /** Navigate forward in browser history. */
   uiBridgePageForward: ActionResult;
-  /** Navigate to a URL. */
+  /** Navigate to a URL. Unrouted targets are rejected, not reported as success. */
   uiBridgePageNavigate: ActionResult;
   /** Refresh the current page. */
   uiBridgePageRefresh: ActionResult;
@@ -788,10 +788,29 @@ export type TaskRunUpdateEvent = {
 
 /**
  * Machine-readable error codes for UI Bridge operations.
- * Maps 1:1 to the existing UiBridgeErrorCode enum.
+ * Enables AI agents to match on error type rather than parsing strings.
+ *
+ * This is the ONLY declaration of the vocabulary. The GraphQL surface
+ * (`graphql::types::UiBridgeErrorCode`, published in `graphql/schema.graphql`)
+ * is a re-export of this very type via the `async_graphql::Enum` derive, so a
+ * variant added here reaches GraphQL clients with no second list to update.
+ * The GraphQL value names and the serde wire names are both
+ * SCREAMING_SNAKE_CASE; `ui_bridge_error_code_graphql_names_equal_serde_wire_names`
+ * (`graphql/schema.rs`) pins that.
  */
 export const UiBridgeErrorCode = {
   ActionFailed: "ACTION_FAILED",
+  /**
+   * The requested action name is not in the element's advertised
+   * `actions` list. Issued pre-IPC by `ui_bridge_execute_action_handler`
+   * so the caller gets a flat HTTP 400 with the supported-action list in
+   * `context.supported_actions` BEFORE the Phase 5 RecoveryExecutor can
+   * synthesize a misleading `recovered:true` success against a side-action.
+   * Loop iter-2 item 2 — mirrors the post-recovery contract-violation
+   * branch's `data.code = "ACTION_NOT_SUPPORTED"` shape so callers see a
+   * consistent envelope on both pre-IPC and post-recovery rejection.
+   */
+  ActionNotSupported: "ACTION_NOT_SUPPORTED",
   AssertionFailed: "ASSERTION_FAILED",
   CircuitBreakerOpen: "CIRCUIT_BREAKER_OPEN",
   ConcurrencyLimitReached: "CONCURRENCY_LIMIT_REACHED",
@@ -799,11 +818,97 @@ export const UiBridgeErrorCode = {
   ElementNotFound: "ELEMENT_NOT_FOUND",
   ElementNotVisible: "ELEMENT_NOT_VISIBLE",
   ElementStale: "ELEMENT_STALE",
+  /**
+   * The **native** event loop has stopped pumping messages, so anything
+   * that must be *dispatched* to it — `window.close()`, `AppHandle::exit`,
+   * every window getter, `eval` from off-thread — silently queues instead
+   * of running.
+   *
+   * Deliberately distinct from [`Self::FrontendNotReady`] and
+   * [`Self::FrontendUnresponsive`], and the distinction is the whole point
+   * of the variant: in this failure the frontend is typically **fine**
+   * (WebView2 services `fetch` out-of-process, so the UI Bridge pong keeps
+   * arriving) and it is the Win32 host loop that is wedged. A caller that
+   * cannot tell the two apart retries a readiness wait that will never
+   * succeed. Produced by the close door in `page.rs` off
+   * `health_monitor::ui_thread_pumping`; see plan
+   * `2026-08-19-runner-blocked-ui-thread-cannot-be-closed`, Phase 3.
+   */
+  EventLoopUnresponsive: "EVENT_LOOP_UNRESPONSIVE",
+  FrontendNotReady: "FRONTEND_NOT_READY",
   FrontendUnresponsive: "FRONTEND_UNRESPONSIVE",
   InternalError: "INTERNAL_ERROR",
+  /**
+   * A request field is present but has the wrong shape / wrong name.
+   * Issued specifically for per-action param-name validation (loop B
+   * iter 2 — runner-side analogue of ui-bridge PR #33's SDK-boundary
+   * `WRONG_TYPE_PARAM` gate). Carries a `didYouMean` recovery hint in
+   * `context` so callers can self-correct without a round-trip.
+   */
+  InvalidParam: "INVALID_PARAM",
+  InvalidRequest: "INVALID_REQUEST",
+  /**
+   * The `state` parameter on a `wait-for-element-state` request is not
+   * one of the recognised enum values. The list is not repeated here —
+   * `intents::ALLOWED_STATES` is the single source of truth, and a prose
+   * copy is exactly how this drifted past the ui-bridge #144
+   * `disabled`/`ariaDisabled` split.
+   * Issued as a flat HTTP 400 with `context.allowed_states: [...]` so
+   * callers can self-correct without parsing prose. Loop iter-2 item 3 —
+   * mirrors the `tab/activate` -> `knownTabs` and the action-name gate's
+   * envelope shape.
+   */
+  InvalidState: "INVALID_STATE",
+  /**
+   * The `tabId` on a `tab/activate` request is not in the static
+   * `VALID_TAB_IDS` registry. Issued as a flat HTTP 400 with
+   * `context.knownTabs: [...]` so callers can self-correct without
+   * parsing prose. Loop iter-3 item 1 — previously the rejection
+   * envelope had `error_detail = None`, so `error_detail.code` came
+   * back as `null` even though the `error` prose and `data.knownTabs`
+   * payload were present. Now the machine-readable code lives in
+   * `error_detail.code = "INVALID_TAB_ID"` to match the rest of the
+   * envelope taxonomy.
+   */
+  InvalidTabId: "INVALID_TAB_ID",
+  /**
+   * A required request field is missing. Sibling of [`InvalidParam`]
+   * for the "field absent" case. The runner emits this for
+   * `{action:"type", params:{}}` (no `text`, no `value`) so callers
+   * get a deterministic 400 instead of a recovered no-op via the
+   * LLM fallback.
+   */
+  MissingParam: "MISSING_PARAM",
+  /** `pasteText`'s `text` was not a string. */
+  PasteTextInvalid: "PASTE_TEXT_INVALID",
+  /** `getScrollback`'s `maxLines` was not a positive integer. */
+  ScrollbackMaxLinesInvalid: "SCROLLBACK_MAX_LINES_INVALID",
+  /**
+   * `sendKeys`' `keys` payload was not translatable to a PTY sequence.
+   * Caller-payload error: the identical request will fail identically, so
+   * the recovery hint is [`RecoveryHint::FixRequest`].
+   */
+  SendKeysInvalid: "SEND_KEYS_INVALID",
+  /**
+   * A view-only action (`focus` / `blur`) was asked of a pane with no
+   * mounted terminal view. NOT a payload error — the request is well
+   * formed and the remedy is to bring the pane on screen, which is why it
+   * carries [`RecoveryHint::ScrollIntoView`] rather than `FixRequest`.
+   */
+  TerminalNoMountedView: "TERMINAL_NO_MOUNTED_VIEW",
   Timeout: "TIMEOUT",
   UnknownAssertionType: "UNKNOWN_ASSERTION_TYPE",
+  /**
+   * A fetch the frontend makes on the caller's behalf failed upstream —
+   * today the runtime spec loader's `GET /apps/{app}/spec/list`. The
+   * caller's request was fine and the runner is fine; a DEPENDENCY
+   * answered badly, which is a 502, never a 400. See
+   * `request.rs::status_for_inner_failure`.
+   */
+  UpstreamFetchFailed: "UPSTREAM_FETCH_FAILED",
   WindowNotFound: "WINDOW_NOT_FOUND",
+  /** `writeToTerminal`'s `text` was not a string. */
+  WriteTextInvalid: "WRITE_TEXT_INVALID",
 } as const;
 
 export type UiBridgeErrorCode = (typeof UiBridgeErrorCode)[keyof typeof UiBridgeErrorCode];
@@ -815,7 +920,10 @@ export type UiBridgeErrorDetail = {
   context?: Maybe<Scalars["JSON"]["output"]>;
   /** Human-readable error message. */
   message: Scalars["String"]["output"];
-  /** Suggested recovery action (e.g., "Resnapshot", "RetryAfterDelay"). */
+  /**
+   * Suggested recovery action, in the serde wire spelling of `RecoveryHint`
+   * (e.g. `"RESNAPSHOT"`, or `{"RETRY_AFTER_MS":1000}` for a data-carrying hint).
+   */
   recovery?: Maybe<Scalars["String"]["output"]>;
 };
 

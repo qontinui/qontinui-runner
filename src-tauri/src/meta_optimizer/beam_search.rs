@@ -382,6 +382,10 @@ fn build_rewrite_prompt(
 /// Parse a single `[BEAM_REWRITE]...[/BEAM_REWRITE]` block.
 ///
 /// Returns `(critique, changes_summary, rewritten_prompt)`.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn parse_beam_rewrite(text: &str) -> Option<(String, String, String)> {
     let start_tag = "[BEAM_REWRITE]";
     let end_tag = "[/BEAM_REWRITE]";
@@ -397,6 +401,10 @@ pub fn parse_beam_rewrite(text: &str) -> Option<(String, String, String)> {
 }
 
 /// Extract ALL `[BEAM_REWRITE]` blocks from text.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn extract_beam_rewrite_blocks(text: &str) -> Vec<(String, String, String)> {
     let start_tag = "[BEAM_REWRITE]";
     let end_tag = "[/BEAM_REWRITE]";
@@ -438,6 +446,10 @@ fn parse_beam_fields(inner: &str) -> Option<(String, String, String)> {
 /// Searches for the key at the start of a line (after optional whitespace) to avoid
 /// matching keys that appear inside field values (e.g., a rewritten_prompt that
 /// contains "critique:" in its text).
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_field(text: &str, key: &str) -> Option<String> {
     // Find key anchored at the start of a line
     let key_pos = find_line_anchored(text, key)?;

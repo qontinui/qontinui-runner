@@ -522,6 +522,21 @@ table "runs" {
     null = true
     type = text
   }
+  // The run's `OrchestrationRunConfig`, serialized at create. The boot sweep
+  // relaunches a `running` run with these knobs rather than the defaults.
+  // Null for a row that predates the column (relaunched at defaults).
+  column "config" {
+    null = true
+    type = jsonb
+  }
+  // The runner instance that started this run: `QONTINUI_INSTANCE_NAME`, or
+  // `primary` when unset. A temp runner and the primary share one embedded PG
+  // cluster, so the boot sweep relaunches only rows it owns. A NULL owner
+  // predates the column and is logged and left alone, never adopted.
+  column "owner_instance" {
+    null = true
+    type = text
+  }
   column "created_at" {
     null    = false
     type    = timestamptz
@@ -610,6 +625,22 @@ table "subtasks" {
     type = text
   }
   column "gate_status" {
+    null = true
+    type = text
+  }
+  // Times the boot sweep returned this row from `working` to `submitted`
+  // because its worker died with the previous runner process. A row that
+  // would exceed 2 is failed instead ("worker lost across 2 restarts").
+  column "restart_resets" {
+    null    = false
+    type    = integer
+    default = 0
+  }
+  // Why the row reached `failed`: `dependency <id> failed`, a spawn or
+  // isolation refusal, a lost or silent worker. Null for a row that did not
+  // fail, and for one that failed before the column existed. A failed run's
+  // `status_reason` names its failed rows with these.
+  column "state_reason" {
     null = true
     type = text
   }

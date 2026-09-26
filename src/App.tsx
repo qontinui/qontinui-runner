@@ -176,8 +176,9 @@ function AppContent() {
   //      its owner is mounted, so registering inside the wizard left the
   //      component undiscoverable in exactly the state a driver needs it: a
   //      runner that auto-bypassed the wizard (`check_setup_completed` returns
-  //      true whenever `QONTINUI_TEST_AUTO_LOGIN_EMAIL` is set, which the
-  //      supervisor forwards to every temp runner). `scope: "global"` does not
+  //      true whenever `QONTINUI_SETUP_WIZARD_BYPASS=1` or
+  //      `QONTINUI_TEST_AUTO_LOGIN_EMAIL` is non-empty; the supervisor sets
+  //      the first on temp runners). `scope: "global"` does not
   //      survive an unmount.
   //   2. It keeps the operator's progress even across a wizard remount.
   const [wizardStep, setWizardStep] = useState(0);
@@ -208,7 +209,8 @@ function AppContent() {
       "step (0-6) — this also OPENS the wizard if it is currently dismissed, which " +
       "is how you reach first-run surfaces on a runner that auto-bypassed setup " +
       "(any supervisor temp runner, unless spawned with " +
-      'extra_env: { QONTINUI_TEST_AUTO_LOGIN_EMAIL: "" }).',
+      'extra_env: { QONTINUI_SETUP_WIZARD_BYPASS: "", QONTINUI_TEST_AUTO_LOGIN_EMAIL: "" }; ' +
+      'the bypass flag also accepts "0").',
     scope: "global",
     actions: [
       {

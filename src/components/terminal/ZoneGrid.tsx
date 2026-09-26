@@ -324,9 +324,10 @@ function ZoneGridInner({
   const prevLayoutIdRef = useRef(layout.id);
 
   // Flow-grid mode (past-9 synthesized scrolling grid): uniform tiles, no
-  // resize handles, no per-layout ratio persistence — the row count changes on
-  // every tab open/close, which would otherwise thrash the `zone-*-ratios-*`
-  // storage keyed on `layout.id`. All ratio machinery below is skipped here.
+  // resize handles, no per-layout ratio persistence — the row count follows
+  // `flowGridSlotCount` as tabs open and close, which would otherwise thrash
+  // the `zone-*-ratios-*` storage keyed on `layout.id`. All ratio machinery
+  // below is skipped here.
   const isFlowMode = layout.id === FLOW_GRID_ID;
 
   // Flow-grid virtualization (Phase 3): observe each zone cell against the
@@ -489,8 +490,9 @@ function ZoneGridInner({
     return () => clearInterval(interval);
   }, []);
 
-  const isMultiZone = layout.zones.length > 1;
-  const showLabels = isMultiZone;
+  // `zoneLayout.isMultiZone` is the ONE multi-zone definition
+  // (`useZoneLayout`); this file used to carry an inline copy of it.
+  const showLabels = zoneLayout.isMultiZone;
   const autoCompact = false;
   const forceCompact = viewMode === "compact";
 
@@ -781,7 +783,7 @@ function ZoneGridInner({
           onCancelRestart={onCancelRestart}
           isDropTarget={gridState.dropTargetZone === zoneIdx}
           showLabels={showLabels}
-          isMultiZone={isMultiZone}
+          isMultiZone={zoneLayout.isMultiZone}
           autoCompact={autoCompact}
           forceCompact={forceCompact}
           showFilterInput={gridState.showFilterInput}

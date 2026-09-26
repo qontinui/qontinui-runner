@@ -92,16 +92,15 @@ curl -s --max-time 120 -X POST "$COORD_HTTP_URL/claims/acquire" \
 > preserves the old machine-only behaviour. Any later
 > `/claims/heartbeat` or `/claims/release` MUST replay the SAME
 > `agent_session_id`, or it will not match. **The two doors spell that
-> non-match differently, and only one of them says `not_held`:**
+> token non-match differently, and only one of them says `not_held` for it:**
 > `/claims/release` answers `not_held`; `/claims/heartbeat` answers `stolen`,
 > because coord's `HEARTBEAT_LUA` (`claims.rs`) finds the key PRESENT and the
 > token different, so `heartbeat` reports a holder - and the holder it names is
 > your OWN machine and session, since you are still the stored owner. On that
-> door `stolen` ALSO covers an EXPIRED claim, spelled `current_holder: null`, so
-> `current_holder` is the discriminator rather than the verdict word;
-> `coord-claim-heartbeat.sh` makes the split and records the null case `lapsed`.
-> (qontinui/qontinui-coord#2206, still OPEN, gives the expired case its own
-> `not_held` verdict on this door; `hb_row` already maps it.)
+> door an EXPIRED claim answers `not_held` - qontinui/qontinui-coord#2206,
+> landed 2026-09-17 and deployed - and `stolen` always names a holder. A coord
+> predating #2206 folded the expiry into `stolen` with `current_holder: null`;
+> `coord-claim-heartbeat.sh` maps both spellings to `lapsed`.
 > `scripts/coord-claim-heartbeat.sh` (step 6) replays the pair for you on every
 > tick — **and a HAND heartbeat must too.** A hand-rolled `curl` that drops the
 > owner token does not fail loudly: it answers `stolen` naming YOU as the
@@ -151,9 +150,20 @@ and returns exactly one of:
   in step 4, exactly as this bullet used to say. If an older coord build still
   answers `fork_risk`, read it the same way — advisory overlay, not a hard
   holder — and proceed.
+- **`renewed`** — your owner token already holds the reservation, and coord
+  extended it. Proceed, but you are **not** its owner: whatever reserved it first
+  (typically `/vet-imp`, in this same session) heartbeats and releases it, so
+  start no heartbeat and release nothing. The owner token is only as narrow as
+  the door: `<machine_id>:<agent_session_id>` on the HTTP `/claims/acquire`
+  fallback, but the bare DEVICE over `coord_reserve_resource` — so over MCP a
+  second session on this box also reads `renewed`. If nothing earlier in THIS
+  session reserved the plan, treat it as a same-box peer holding it (see
+  `held`). A coord build predating the `renewed` outcome answered `granted`
+  here on both doors, so an older coord cannot tell you this case apart.
 - **`held`** — a peer is **already implementing this plan** (the response carries
   the holder identity). Do **not** start. Coordinate (hand off / sequence behind
-  them) or stop.
+  them) or stop. The one exception: a `held` whose `current_holder_session`
+  equals your own `agent_session_id` is YOUR hold — read it as `renewed`.
 
 > Verified 2026-08-25: `coord_reserve_resource` is registered at
 > `qontinui-coord/crates/coord/src/mcp/tools.rs:13575` (`reserve_resource_tool`),
@@ -513,7 +523,9 @@ coord_claim_acquire(kind="file_glob", resource_key="<glob>", ttl_seconds=900)   
   bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh add \
     --ledger "$CLAIM_LEDGER" --kind file_glob --key "<glob>" --ttl "<ttl_seconds>"
 
-  bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh start --ledger "$CLAIM_LEDGER"
+  # --max-runtime 21600 (6h): /preflight is a short pre-run check, not a
+  # long implementation chain, so it gets the smallest of the three ceilings.
+  bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh start --ledger "$CLAIM_LEDGER" --max-runtime 21600
   ```
 
   `start` detaches a background loop that re-heartbeats each row when THAT row
@@ -536,11 +548,15 @@ coord_claim_acquire(kind="file_glob", resource_key="<glob>", ttl_seconds=900)   
   out another holder; `LAPSED` (7) — a row's grant is gone (an expired answer,
   aged past its TTL, never confirmed, or a malformed TTL); `EMPTY` (8) — the
   loop lives but the ledger holds no rows, so nothing is renewed (an `add` was
-  refused or never ran). A row the loop records
-  as `stolen` or `lapsed` is terminal and never beaten again, while the loop
+  refused or never ran); `MAX_RUNTIME` (9) — the loop itself ended on its own
+  `--max-runtime` ceiling, not a coord verdict (these grants may still be live
+  at coord for up to their remaining ttl). A row the loop records
+  as `stolen`, `lapsed` or `max_runtime` is terminal and never beaten again,
+  while the loop
   keeps renewing the others; when no renewable row is left the loop ends, and
-  `status` reads `STOLEN` if any row was stolen, otherwise `DEAD`.
-  **Only `LIVE` means the claims are held.** The other five mean the claim is
+  `status` reads `STOLEN` if any row was stolen, `MAX_RUNTIME` if the ceiling
+  ended it, otherwise `DEAD`.
+  **Only `LIVE` means the claims are held.** The other six mean the claim is
   **UNKNOWN** (`STALE` usually self-heals on the next beat; re-acquiring
   anyway is harmless — a held claim answers `renewed`), which is a re-acquire and a line in the report, never a shrug — a
   dead loop and a healthy one look identical to anything that never asks. After

@@ -863,6 +863,10 @@ fn json_escape(s: &str) -> String {
 
 /// Best-effort grab of `"correlation_id":"…"` from a JSON response without a
 /// JSON parser (mirrors the bash `grep`). `None` if absent.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_correlation_id(resp: &str) -> Option<String> {
     let key = "\"correlation_id\"";
     let i = resp.find(key)? + key.len();
@@ -879,6 +883,10 @@ fn extract_correlation_id(resp: &str) -> Option<String> {
 /// (P4 — the dynamic per-install interception mode). `None` when absent (an
 /// old runner/coord that omits the field) so the caller keeps the spawn-time
 /// env mode. Mirrors `extract_correlation_id` + the bash shim's grep.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_effective_mode(resp: &str) -> Option<String> {
     let key = "\"effective_mode\"";
     let i = resp.find(key)? + key.len();
@@ -898,6 +906,10 @@ fn extract_effective_mode(resp: &str) -> Option<String> {
 
 /// Best-effort display-only join of the `risk_factors` string array. Not
 /// load-bearing (only the gate field is) — mirrors the bash extraction.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_risk_factors(resp: &str) -> String {
     let key = "\"risk_factors\"";
     let Some(i) = resp.find(key) else {
@@ -1135,6 +1147,10 @@ fn http_post(port: u16, path: &str, body: &str) -> Result<String, String> {
 /// injection would let a caller forge a second request on this socket. The one
 /// value passed today is the loopback handshake key, which is hex, so this can
 /// only ever fire on a corrupted key file.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn http_post_with_timeouts(
     port: u16,
     path: &str,

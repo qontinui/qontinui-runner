@@ -18,6 +18,10 @@ pub const TRACE_ID_HEADER: &str = "X-Trace-Id";
 /// - Generates a new trace ID if none is present
 /// - Records the trace ID on the current tracing span
 /// - Includes `X-Trace-Id` in the response
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub async fn trace_propagation_middleware(request: Request<Body>, next: Next) -> Response<Body> {
     // Extract or generate trace ID
     let trace_id = request

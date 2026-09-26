@@ -135,6 +135,10 @@ fn collect_rs_files() -> Vec<PathBuf> {
 /// 1. the attribute must START its own line (only whitespace before it), and
 /// 2. it must be IMMEDIATELY followed by the fn — allowing only further
 ///    attributes, whitespace, and `pub` / `async` in between.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn defined_commands(source: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cursor = 0;
@@ -210,6 +214,10 @@ fn defined_commands(source: &str) -> Vec<String> {
 
 /// The bare command idents inside the FIRST `generate_handler![...]` list in
 /// `source`, e.g. `commands::auth::sign_out_full,` → `sign_out_full`.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn handler_list(source: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     let Some(start) = source.find("generate_handler![") else {
@@ -282,6 +290,10 @@ fn handler_list(source: &str) -> BTreeSet<String> {
 /// A command registered in a mounted plugin's handler is reachable (under the
 /// `plugin:<name>|<cmd>` prefix); one registered only in an UNMOUNTED `plugin()`
 /// fn is not. That distinction is the whole point of this guard.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn mounted_plugin_commands(main_src: &str) -> BTreeSet<String> {
     let root = crate_root();
     let mut out = BTreeSet::new();

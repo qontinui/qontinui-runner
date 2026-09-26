@@ -545,6 +545,10 @@ async fn capture_mobile_logcat_impl(
 }
 
 /// Parse a logcat line into (level, tag, message)
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn parse_logcat_line(line: &str) -> Option<(String, String, String)> {
     // Format: DATE TIME PID TID LEVEL TAG: MESSAGE
     // Example: 01-18 12:34:56.789  1234  5678 E ReactNativeJS: Error message

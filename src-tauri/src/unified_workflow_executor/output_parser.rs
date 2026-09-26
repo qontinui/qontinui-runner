@@ -67,6 +67,10 @@ pub fn parse_agentic_output(raw_output: &str) -> AgenticPhaseOutput {
 ///
 /// The JSON must contain at least a "status" key to be recognized as a
 /// structured agentic output (vs. any random JSON the AI might output).
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn try_parse_json_summary(raw_output: &str) -> Option<AgenticPhaseOutput> {
     // Find ```json blocks
     let mut search_start = 0;
@@ -144,6 +148,10 @@ fn try_parse_json_summary(raw_output: &str) -> Option<AgenticPhaseOutput> {
 }
 
 /// Extract unfixable reason from text near the [UNFIXABLE_ERRORS] marker.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_unfixable_reason(raw_output: &str) -> Option<String> {
     // Look for text on the same line or the next line after the marker
     for marker in &["[UNFIXABLE_ERRORS]", "[UNFIXABLE_ERROR]"] {

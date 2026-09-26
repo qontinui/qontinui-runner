@@ -205,7 +205,17 @@ pub async fn terminal_create(
     // the configured plan directories). Derived from the live isolated edit
     // context before it is parked on the session; each var is omitted when it
     // does not resolve. See `agent_worktree::session_env`.
-    let extra_env = crate::agent_worktree::session_env::session_extra_env(isolated_ctx.as_ref());
+    //
+    // The admitted spawn tenant rides along as the plan/prompt directory LOOKUP
+    // KEY: a device bound to several tenants may keep each one's plans
+    // elsewhere, and this is the tenant the picker chose for this launch. It
+    // selects a stored path and nothing more — attribution of anything the
+    // session captures comes from the credential, never from this.
+    let spawn_tenant_key = spawn_tenant_id.map(|t| t.to_string());
+    let extra_env = crate::agent_worktree::session_env::session_extra_env(
+        isolated_ctx.as_ref(),
+        spawn_tenant_key.as_deref(),
+    );
     // Phase 6 (B4): the whole blocking spawn (PTY open, identity seam, child
     // exec) runs on a BLOCKING thread, matching the AI path
     // (`commands::ai_session`). It used to be a bare synchronous call on a
@@ -1227,6 +1237,7 @@ pub fn terminal_session_record_open(
         finished_at: None,
         finish_reason: None,
         finish_synced: false,
+        spawn_device_default: None,
     };
     let session_id = record.claude_session_id.clone();
     store.record_open(record);
@@ -2140,8 +2151,13 @@ pub(crate) fn create_terminal_session_backend(
     // convenience for `claude` launches is appended into `command` by the
     // caller (gate-continuation in `agent_runtime.rs`), since only the caller
     // knows the launch is `claude`.
+    // No acting tenant: a gate continuation is coord-spawned, so no picker chose
+    // one (`tenant_id: None` below), and there is nothing here to key the
+    // plan/prompt directories by. `None` resolves the DEVICE DEFAULT, which is
+    // what this path has always been handed — inventing a tenant would let
+    // something other than the picker decide which directory it authors into.
     let mut env_pairs: Vec<(String, String)> =
-        crate::agent_worktree::session_env::session_env(isolated_ctx.as_ref());
+        crate::agent_worktree::session_env::session_env(isolated_ctx.as_ref(), None);
     // Account selection: pin the spawned PTY to the account the caller chose
     // (gate continuations set `capture_hint.config_dir` to the selected,
     // token-bearing account). Without this, a backend-spawned `claude` inherits
@@ -2507,6 +2523,7 @@ async fn poll_and_record_session<F>(
                 finished_at: None,
                 finish_reason: None,
                 finish_synced: false,
+                spawn_device_default: None,
             };
             store.record_open(record);
             info!(
@@ -2596,6 +2613,7 @@ pub(crate) fn record_pinned_session_open(
         finished_at: None,
         finish_reason: None,
         finish_synced: false,
+        spawn_device_default: None,
     });
     info!(
         terminal_id = %terminal_id,
@@ -2789,6 +2807,7 @@ mod tests {
             finished_at: None,
             finish_reason: None,
             finish_synced: false,
+            spawn_device_default: None,
         }
     }
 

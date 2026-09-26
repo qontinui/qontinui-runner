@@ -533,20 +533,86 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     ProxyableCommand {
         name: "get_coord_device_token",
         dispatch: Dispatch::InProcess,
-        description: "Return this runner's coord DEVICE JWT (the token in AuthManager's access_token slot), or null when the runner is unpaired. The eval-free credential door: POST /ui-bridge/control/page/evaluate cannot mint on a CSP-enforcing build. This is a PROBE and does NOT check `exp` -- validate the token's expiry before use and treat an expired one as no credential. A credential-store read error is a 500 (pairing state UNKNOWN), never null.",
-        args_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
+        description: "Return a coord DEVICE JWT this runner holds, or null when it holds none for what was asked. Args: {\"tenantId\": \"<uuid>\"} returns THAT tenant's token (its own slot, or the default slot only when it is the default binding -- never another tenant's; null when unpaired for it). With no tenantId: the default slot (AuthManager's access_token), EXCEPT on a runner holding more than one tenant slot, where it is a 409 get_coord_device_token:tenant_required (kill switch QONTINUI_DEVICE_TOKEN_DOOR_DEFAULT_SLOT=1). The eval-free credential door: POST /ui-bridge/control/page/evaluate cannot mint on a CSP-enforcing build. The no-tenant arm is a PROBE and does NOT check `exp` -- validate expiry before use and treat an expired token as no credential. A credential-store read error is a 500 (UNKNOWN), never null.",
+        args_schema: r#"{"type":"object","properties":{"tenantId":{"type":["string","null"]}},"additionalProperties":false}"#,
         response_schema: r#"{"type":["string","null"]}"#,
         // The startup probe is a FRONTEND-transport probe: it emits
         // `ui-bridge:invoke-request` for every entry regardless of `dispatch`
         // (`ui_bridge_invoke_probe.rs`). Probing this one would therefore route
         // a live device JWT through the React frontend and back over IPC on
-        // every boot -- for a command that takes no args, so there is no
-        // required key that could be missing and no schema drift to detect. On
+        // every boot -- for a command whose only arg (`tenantId`) is optional,
+        // so there is no required key that could be missing and no schema drift
+        // to detect. On
         // a headless runner it would simply sit out the 10 s probe timeout.
         // Opt out, as both other `Dispatch::InProcess` entries do.
         probe_with_empty_args: false,
         // Invoke tier only. An observe projection would have to reveal the
         // token to be useful, so there is nothing to project.
+        observe_projection: None,
+    },
+    // ---- Gate-1 headless-reachable cloud-sync settings (plan
+    // 2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls §3.5) ----
+    //
+    // `get_cloud_sync_settings` / `save_cloud_sync_settings`
+    // (`crate::commands::cloud_sync_settings`) were, until this plan, wired
+    // only into the desktop `WebIntegrationSettings.tsx` settings panel via
+    // Tauri IPC -- unreachable from a headless (`QONTINUI_SERVER_MODE`)
+    // runner instance with no webview at all. Mirrors the
+    // `get_coord_device_token` precedent immediately above: the underlying
+    // fns are plain `settings.json` read/write with no webview dependency,
+    // so `Dispatch::InProcess` is what lets a headless box read and flip
+    // gate 1 of the session-history cloud-sync consent model over HTTP.
+    ProxyableCommand {
+        name: "get_cloud_sync_settings",
+        dispatch: Dispatch::InProcess,
+        description: "Return this runner's current cloud-sync consent settings -- gate 1 (`cloud_sync_enabled`) of the session-history cloud-sync consent model (already registered in Tauri; this entry only allowlists it over HTTP so a headless runner instance can read it without a desktop session). `Dispatch::InProcess`: a plain settings.json read, so it answers on a webview-less runner.",
+        args_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
+        response_schema: r#"{"type":"object","required":["success","data"],"properties":{"success":{"type":"boolean"},"message":{"type":["string","null"]},"data":{"type":"object","required":["cloud_sync_enabled"],"properties":{"cloud_sync_enabled":{"type":"boolean"}}}}}"#,
+        // Same FRONTEND-transport boot-probe caveat as `get_coord_device_token`
+        // above: probing routes through the webview regardless of `dispatch`,
+        // and would simply sit out the 10s timeout on a headless runner for no
+        // schema-drift benefit (no required key to miss). Opt out, matching
+        // every other `Dispatch::InProcess` entry in this table.
+        probe_with_empty_args: false,
+        observe_projection: None,
+    },
+    ProxyableCommand {
+        name: "save_cloud_sync_settings",
+        dispatch: Dispatch::InProcess,
+        description: "Persist this runner's `cloud_sync_enabled` consent flag -- gate 1 of the session-history cloud-sync consent model (already registered in Tauri; this entry only allowlists it over HTTP so a headless runner instance can flip it without a desktop session). `Dispatch::InProcess`: a plain settings.json write. `cloudSyncEnabled` is required.",
+        args_schema: r#"{"type":"object","required":["cloudSyncEnabled"],"properties":{"cloudSyncEnabled":{"type":"boolean"}}}"#,
+        response_schema: r#"{"type":"object","required":["success"],"properties":{"success":{"type":"boolean"},"message":{"type":["string","null"]},"data":{"type":"null"}}}"#,
+        // Required arg + mutates settings.json; an empty-args probe would
+        // both fail the required-key check and write nothing useful.
+        probe_with_empty_args: false,
+        observe_projection: None,
+    },
+    // ---- Gate-2 sibling: session-metadata sync consent ----
+    //
+    // The consent model was split into two runner-global flags by plan
+    // `2026-07-10-split-cloud-sync-consent`, and both sit side by side in
+    // `WebIntegrationSettings.tsx`. Allowlisting only gate 1 above left a
+    // headless runner able to reach one half of that model and not the other;
+    // this pair is the same plain settings.json read/write, so it takes the
+    // same `Dispatch::InProcess` shape.
+    ProxyableCommand {
+        name: "get_session_metadata_sync_settings",
+        dispatch: Dispatch::InProcess,
+        description: "Return this runner's session-metadata sync consent flag (`session_metadata_sync_enabled`) -- the gate-2 sibling of `get_cloud_sync_settings` (already registered in Tauri; this entry only allowlists it over HTTP so a headless runner instance can read it without a desktop session). `Dispatch::InProcess`: a plain settings.json read, so it answers on a webview-less runner.",
+        args_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
+        response_schema: r#"{"type":"object","required":["success","data"],"properties":{"success":{"type":"boolean"},"message":{"type":["string","null"]},"data":{"type":"object","required":["session_metadata_sync_enabled"],"properties":{"session_metadata_sync_enabled":{"type":"boolean"}}}}}"#,
+        // Same boot-probe opt-out as `get_cloud_sync_settings` above.
+        probe_with_empty_args: false,
+        observe_projection: None,
+    },
+    ProxyableCommand {
+        name: "save_session_metadata_sync_settings",
+        dispatch: Dispatch::InProcess,
+        description: "Persist this runner's `session_metadata_sync_enabled` consent flag -- the gate-2 sibling of `save_cloud_sync_settings` (already registered in Tauri; this entry only allowlists it over HTTP so a headless runner instance can flip it without a desktop session). `Dispatch::InProcess`: a plain settings.json write. `sessionMetadataSyncEnabled` is required.",
+        args_schema: r#"{"type":"object","required":["sessionMetadataSyncEnabled"],"properties":{"sessionMetadataSyncEnabled":{"type":"boolean"}}}"#,
+        response_schema: r#"{"type":"object","required":["success"],"properties":{"success":{"type":"boolean"},"message":{"type":["string","null"]},"data":{"type":"null"}}}"#,
+        // Required arg + mutates settings.json, as `save_cloud_sync_settings`.
+        probe_with_empty_args: false,
         observe_projection: None,
     },
 ];
@@ -766,6 +832,34 @@ mod tests {
     #[test]
     fn is_allowlisted_recognizes_coord_terminal_commands() {
         assert!(is_allowlisted("terminal_set_title"));
+    }
+
+    /// Plan `2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls`
+    /// §3.5: gate 1's cloud-sync settings commands must be reachable over
+    /// HTTP, in-process, so a headless runner can read/write them with no
+    /// desktop session.
+    ///
+    /// The gate-2 session-metadata pair rides along, so a headless runner can
+    /// reach both halves of the split consent model.
+    #[test]
+    fn is_allowlisted_recognizes_cloud_sync_settings_commands() {
+        for name in [
+            "get_cloud_sync_settings",
+            "save_cloud_sync_settings",
+            "get_session_metadata_sync_settings",
+            "save_session_metadata_sync_settings",
+        ] {
+            assert!(is_allowlisted(name), "{name}");
+            assert_eq!(
+                UI_BRIDGE_COMMANDS
+                    .iter()
+                    .find(|c| c.name == name)
+                    .unwrap()
+                    .dispatch,
+                Dispatch::InProcess,
+                "{name}"
+            );
+        }
     }
 
     #[test]

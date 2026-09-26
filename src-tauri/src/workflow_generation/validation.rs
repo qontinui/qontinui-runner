@@ -566,6 +566,10 @@ fn validate_ui_bridge_step_fields(steps: &[Value], phase: &str, errors: &mut Vec
 /// - All step IDs in `depends_on` arrays reference existing step IDs
 /// - All step ID references in `inputs` values (via `${step_id.field}` syntax) reference existing step IDs
 /// - No circular dependencies exist in `depends_on` chains
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn validate_step_references(all_steps: &[&Value], errors: &mut Vec<ValidationError>) {
     // Collect all step IDs
     let step_ids: std::collections::HashSet<String> = all_steps

@@ -593,6 +593,10 @@ fn parse_tsc_output(stdout: &str, stderr: &str) -> ParsedOutput {
     }
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn parse_tsc_line(line: &str) -> Option<CheckIssue> {
     // Format: file.ts(line,col): error TSxxxx: message
     // Or: file.ts:line:col - error TSxxxx: message

@@ -506,6 +506,10 @@ Rules:
 
 /// Parse a structured VerificationVerdict from AI output.
 /// Looks for a JSON block in the output matching the verdict schema.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn parse_verification_verdict(output: &str) -> Option<VerificationVerdict> {
     // Try to find JSON block (with or without markdown code fences)
     let json_str = if let Some(start) = output.find("```json") {

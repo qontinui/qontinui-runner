@@ -20,6 +20,15 @@
  * viewport anchor is the only one all of them agree on regardless of which
  * container they render from.
  *
+ * The container anchors at `top-20`, not `top-2`: unlike the `absolute`
+ * positioning it replaced (which was relative to `App.tsx`'s `<main>`, itself
+ * already offset below the always-rendered `StatusIndicator` bar), `fixed`
+ * anchors to the viewport directly, so `top-2` would sit the stack inside —
+ * not below — that bar. `StatusIndicator.tsx`'s own fixed error overlay in
+ * the same corner already established `top-20` as this app's clearance
+ * value for a viewport-anchored top-right element; this stack reuses it
+ * rather than inventing a second one.
+ *
  * `AdvisorySlot` degrades to an in-place render when no provider is mounted
  * above it (an isolated component test rendering a banner directly, with no
  * `AdvisoryStackProvider` in the tree) — using the stack is production
@@ -56,7 +65,7 @@ export function AdvisoryStackProvider({ children }: { children: ReactNode }) {
           setNode(el);
         }}
         data-ui-bridge-id="terminal.advisory-stack"
-        className="fixed top-2 right-2 z-30 flex flex-col items-end gap-2 pointer-events-none"
+        className="fixed top-20 right-2 z-30 flex flex-col items-end gap-2 pointer-events-none"
       />
     </AdvisoryStackContext.Provider>
   );

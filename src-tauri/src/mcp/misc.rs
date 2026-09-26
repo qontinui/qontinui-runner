@@ -806,6 +806,10 @@ pub async fn get_instances(
 ///
 /// MCP clients can use this to invalidate their tool cache when
 /// the available tools change (e.g., new tests added).
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub async fn get_tool_version(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<ToolVersionResponse>>, (StatusCode, Json<ApiResponse<()>>)> {

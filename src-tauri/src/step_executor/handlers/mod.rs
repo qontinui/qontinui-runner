@@ -927,6 +927,10 @@ fn parse_pass_fail(response: &str) -> Option<bool> {
 }
 
 /// Extract reasoning from AI response (the text after PASS:/FAIL:).
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_reasoning(response: &str) -> String {
     for line in response.lines() {
         let line = line.trim();

@@ -315,6 +315,10 @@ fn count_test_assertions(content: &str) -> usize {
     patterns.iter().map(|p| content.matches(p).count()).sum()
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_component_refs(content: &str) -> Vec<String> {
     // Extract import references — look for component names in imports
     let mut refs = vec![];

@@ -3392,6 +3392,10 @@ mod tests {
     /// probe/metrics split below already uses: the production probe loop must
     /// construct EACH detector with `with_diagnostics(..)`, never `default()`.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn the_probe_loop_builds_its_diagnostics_rig_at_start() {
         let src = include_str!("health_monitor.rs");
         let body = src

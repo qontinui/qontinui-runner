@@ -64,22 +64,25 @@ export function resolveSpawnTenant(args: {
 }
 
 /**
- * Page-level resolution of the tenant a spawn binds to — used by EVERY spawn
- * path on the terminal page (console `/spawn`/`/spawn-ai --tenant`, the New
- * Session button, the launch-menu `create-*` actions, the profile-load
- * auto-fill, and Ctrl+Shift+T).
+ * Page-level resolution of the tenant a spawn SENDS — used by EVERY spawn path
+ * on the terminal page (console `/spawn`/`/spawn-ai --tenant`, the New Session
+ * button, the launch-menu `create-*` actions, the profile-load auto-fill, and
+ * Ctrl+Shift+T).
  *
- * Precedence: an explicit per-invocation tenant (the `/spawn-ai --tenant`
- * flag) wins; else the picker's published selection (`spawnTenantId`, itself
- * already the {@link resolveSpawnTenant} result); else the device's default
- * tenant for new sessions. Returns `undefined` when nothing is known, so the caller omits
- * `tenant_id` and Rust applies its own device-default stamping — byte-identical
- * to pre-F2 behaviour on a single-tenant or unpaired device.
+ * Only an EXPLICIT choice is a spawn tenant: the per-invocation tenant (the
+ * `/spawn-ai --tenant` flag), else the tenant the operator actually picked in
+ * {@link SpawnTenantPicker} (`spawnTenantId`, which the picker publishes ONLY for
+ * a pick — see {@link explicitSpawnTenant}). The repo inference and the device
+ * default are DISPLAYED by the picker but never sent. With nothing chosen this
+ * returns `undefined`, the caller omits `tenant_id`, and Rust stamps its own
+ * device default.
  *
- * Threading this through every spawn path (not just the console handlers) is
- * what makes `TerminalTab.tenantId` equal what Rust stamps onto
- * `Intent.tenant_id`, so `TenantBadge` renders on all new spawns, not only the
- * console ones.
+ * Why (plan 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential,
+ * re-review F1): the runner now REFUSES a spawn tenant it cannot present a
+ * credential for, fail-closed. Sending the default on every spawn made a plain
+ * shell tab refuse with `tenant_not_paired` after `sign_out_full` (slots
+ * cleared, `paired_user.json` kept) or on a store with no tenant slot — a spawn
+ * refused for a tenant it never asked for.
  *
  * Pure + exported so the precedence contract is unit-testable without
  * rendering the page (the runner's vitest config is `environment: "node"`).
@@ -87,11 +90,59 @@ export function resolveSpawnTenant(args: {
 export function pickSpawnTenant(args: {
   explicit?: string;
   spawnTenantId?: string | null;
-  defaultTenantIdForNewSessions?: string | null;
 }): string | undefined {
-  const { explicit, spawnTenantId, defaultTenantIdForNewSessions } = args;
-  const chosen = explicit?.trim() || spawnTenantId || defaultTenantIdForNewSessions;
-  return chosen ?? undefined;
+  const { explicit, spawnTenantId } = args;
+  return explicit?.trim() || spawnTenantId?.trim() || undefined;
+}
+
+/**
+ * What {@link SpawnTenantPicker} publishes as `spawnTenantId`: the operator's
+ * own pick for the current cwd, when it is a tenant this device is bound to —
+ * and nothing else. The inferred and default tenants are only displayed.
+ */
+export function explicitSpawnTenant(args: {
+  override?: string | null;
+  candidates: readonly string[];
+}): string | null {
+  const { override, candidates } = args;
+  return override && candidates.includes(override) ? override : null;
+}
+
+/** One `<option>` of the picker. */
+export interface SpawnTenantOption {
+  value: string;
+  label: string;
+}
+
+/**
+ * What the picker SHOWS, derived from what it SENDS (re-review P1). The select's
+ * value is the published explicit pick, or `""` — a leading "device default"
+ * option — when there is none, so the display always matches what a spawn will
+ * carry: nothing picked shows "device default (A)" and sends no tenant. The
+ * repo inference is a hint on its option's label ("B (repo)"), never a
+ * pre-selected value; choosing it is an explicit pick like any other.
+ */
+export function spawnTenantPickerModel(args: {
+  override?: string | null;
+  inferred?: string | null;
+  defaultForNewSessions?: string | null;
+  candidates: readonly string[];
+}): { value: string; published: string | null; options: SpawnTenantOption[] } {
+  const { override, inferred, defaultForNewSessions, candidates } = args;
+  const published = explicitSpawnTenant({ override, candidates });
+  const options: SpawnTenantOption[] = [
+    {
+      value: "",
+      label: defaultForNewSessions
+        ? `device default (${shortTenantId(defaultForNewSessions)})`
+        : "device default",
+    },
+    ...candidates.map((id) => ({
+      value: id,
+      label: `${shortTenantId(id)}${id === inferred ? " (repo)" : ""}`,
+    })),
+  ];
+  return { value: published ?? "", published, options };
 }
 
 /** Short display form for a tenant id (uuids share a long tail). */
@@ -151,18 +202,20 @@ export function SpawnTenantPicker({ cwd, className }: SpawnTenantPickerProps) {
     };
   }, [cwd, showSwitcher]);
 
-  const resolved = resolveSpawnTenant({
+  // Publish ONLY an explicit pick for the page's spawn handlers (see
+  // `pickSpawnTenant`), and DISPLAY exactly that (see `spawnTenantPickerModel`):
+  // no pick shows "device default", the repo inference is a label hint. The
+  // onChange below and this effect are the only writers of `spawnTenantId`.
+  const model = spawnTenantPickerModel({
     override,
     inferred,
     defaultForNewSessions: defaultTenantIdForNewSessions,
     candidates,
   });
-
-  // Publish the resolved choice so the page's spawn handlers can read it.
-  // This is the sole writer of `spawnTenantId`.
+  const published = model.published;
   useEffect(() => {
-    setSpawnTenantId(resolved ?? null);
-  }, [resolved, setSpawnTenantId]);
+    setSpawnTenantId(published);
+  }, [published, setSpawnTenantId]);
 
   if (!showSwitcher) return null;
 
@@ -171,7 +224,8 @@ export function SpawnTenantPicker({ cwd, className }: SpawnTenantPickerProps) {
       className={`flex items-center gap-1 shrink-0 text-[10px] text-[#565f89] ${className ?? ""}`}
       title={
         "Tenant for the NEXT session spawned from this page. " +
-        "Defaults to the tenant coord associates with this repo. " +
+        '"device default" sends no tenant, and the runner uses this device\'s default. ' +
+        '"(repo)" marks the tenant coord associates with this repo — a hint; pick it to use it. ' +
         "A running session's tenant never changes."
       }
     >
@@ -179,17 +233,20 @@ export function SpawnTenantPicker({ cwd, className }: SpawnTenantPickerProps) {
       <select
         data-ui-bridge-id="terminal.spawn-tenant-picker"
         aria-label="Tenant for the next spawned session"
-        value={resolved ?? ""}
+        value={model.value}
         onChange={(e) => {
           setOverriddenForCwd(cwd ?? "");
           setSpawnTenantId(e.target.value || null);
         }}
         className="bg-transparent text-[10px] text-[#7aa2f7] font-mono outline-none cursor-pointer hover:text-[#c0caf5]"
       >
-        {candidates.map((id) => (
-          <option key={id} value={id} className="bg-[#1a1b26] text-[#c0caf5]">
-            {shortTenantId(id)}
-            {id === inferred ? " (repo)" : ""}
+        {model.options.map((option) => (
+          <option
+            key={option.value || "device-default"}
+            value={option.value}
+            className="bg-[#1a1b26] text-[#c0caf5]"
+          >
+            {option.label}
           </option>
         ))}
       </select>

@@ -488,6 +488,10 @@ fn find_nested_rule_files(root: &Path) -> Vec<std::path::PathBuf> {
 /// `globs` key may be a YAML list or a single comma-separated string. Returns
 /// `(Some(globs), body)` when a non-empty `globs:` is present, else
 /// `(None, full_content)`.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn parse_mdc_frontmatter(raw: &str) -> (Option<Vec<String>>, String) {
     let trimmed = raw.trim_start();
     if !trimmed.starts_with("---") {
@@ -613,6 +617,10 @@ struct ContextFrontmatter {
 ///
 /// Frontmatter is delimited by `---` lines at the top of the file.
 /// Returns (parsed frontmatter, remaining content).
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn parse_frontmatter(raw: &str) -> (Option<ContextFrontmatter>, String) {
     let trimmed = raw.trim_start();
     if !trimmed.starts_with("---") {

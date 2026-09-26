@@ -303,10 +303,16 @@ pub async fn create_terminal_handler(
     // The shared session-env contribution (`QONTINUI_SESSION_WORKTREES` + the
     // configured plan directories), derived from the live context before it is
     // parked on the session; each var is omitted when it does not resolve.
-    // See `agent_worktree::session_env`.
+    // See `agent_worktree::session_env`. The admitted spawn tenant selects that
+    // tenant's plan/prompt directories where the device keys them — a lookup
+    // key, never an attribution claim.
+    let spawn_tenant_key = spawn_tenant.map(|t| t.to_string());
     let mut extra_env_vec: Vec<(String, String)> =
-        crate::agent_worktree::session_env::session_extra_env(isolated_ctx.as_ref())
-            .unwrap_or_default();
+        crate::agent_worktree::session_env::session_extra_env(
+            isolated_ctx.as_ref(),
+            spawn_tenant_key.as_deref(),
+        )
+        .unwrap_or_default();
 
     // Per-request account pin: resolve → validate → pre-seed CLAUDE_CONFIG_DIR
     // onto the PTY env (merged with the session env above, not replacing it).
@@ -1329,6 +1335,10 @@ mod tests {
     /// file and was defeated by prose in a doc comment (including this one),
     /// which is a test that fails for a reason unrelated to what it claims.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn route_entries_covers_every_route_registration_in_this_file() {
         // Both built at runtime so this test's own source cannot match itself.
         let needle = format!(".{}(", "route");

@@ -2051,6 +2051,13 @@ pub(crate) struct SlotCensus {
     states: std::collections::BTreeMap<uuid::Uuid, crate::auth::SlotState>,
     default_tenant: Option<uuid::Uuid>,
     default_slot: crate::auth::SlotState,
+    /// Whether that legacy slot's token is the DEFAULT binding's credential —
+    /// `auth::credential_state`'s `default_slot_serves` input. A state alone
+    /// cannot say it: the selector admits the legacy slot only for a token that
+    /// names the binding (or an unclaimed one on a device measured to hold a
+    /// single binding), so a census that dropped this would report a device
+    /// able to act in a tenant the selector refuses.
+    default_slot_serves: bool,
 }
 
 impl SlotCensus {
@@ -2060,11 +2067,13 @@ impl SlotCensus {
         states: impl IntoIterator<Item = (uuid::Uuid, crate::auth::SlotState)>,
         default_tenant: Option<uuid::Uuid>,
         default_slot: crate::auth::SlotState,
+        default_slot_serves: bool,
     ) -> Self {
         Self {
             states: states.into_iter().collect(),
             default_tenant,
             default_slot,
+            default_slot_serves,
         }
     }
 
@@ -2086,6 +2095,7 @@ impl SlotCensus {
             self.state_of(tenant),
             self.default_tenant.as_ref() == Some(tenant),
             self.default_slot,
+            self.default_slot_serves,
         )
     }
 
@@ -2149,9 +2159,20 @@ fn read_local_slot_census() -> (Option<SlotCensus>, String) {
         .collect();
     let n = states.len();
     let default_tenant = crate::auth::default_binding_tenant();
-    let default_slot = crate::auth::read_legacy_slot(&auth).state();
+    let default_slot_read = crate::auth::read_legacy_slot(&auth);
+    let default_slot = default_slot_read.state();
+    let default_slot_serves = crate::auth::legacy_slot_serves_default_tenant(
+        &auth,
+        &default_slot_read,
+        default_tenant.as_ref(),
+    );
     (
-        Some(SlotCensus::new(states, default_tenant, default_slot)),
+        Some(SlotCensus::new(
+            states,
+            default_tenant,
+            default_slot,
+            default_slot_serves,
+        )),
         format!("{n} tenant slot(s) enumerated from the per-tenant device-JWT store"),
     )
 }
@@ -3056,7 +3077,12 @@ mod tests {
     /// the shape almost every case wants, since the legacy fallback only ever
     /// applies to the default tenant.
     fn census(states: &[(uuid::Uuid, crate::auth::SlotState)]) -> SlotCensus {
-        SlotCensus::new(states.iter().copied(), None, crate::auth::SlotState::Absent)
+        SlotCensus::new(
+            states.iter().copied(),
+            None,
+            crate::auth::SlotState::Absent,
+            false,
+        )
     }
 
     /// A census in which every listed tenant holds a usable slot.
@@ -3529,6 +3555,9 @@ mod tests {
             std::iter::empty::<(uuid::Uuid, crate::auth::SlotState)>(),
             Some(default),
             crate::auth::SlotState::Usable,
+            // ...and that legacy token IS the default binding's, which is the
+            // arm this case is about.
+            true,
         );
         let bound = vec![default, other];
         let (ok, detail) = tenant_bindings_verdict(

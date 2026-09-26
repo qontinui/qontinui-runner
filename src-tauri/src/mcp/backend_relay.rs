@@ -52,6 +52,7 @@ use qontinui_runner_lib::env_agent::{
     config::EnvAgentConfig,
     enroll::{self, EnrollParams},
 };
+use qontinui_types::runner::RunnerInstanceRole;
 use serde_json::Value;
 use tauri::Manager;
 use tokio::sync::{broadcast, watch, Mutex};
@@ -1112,10 +1113,14 @@ async fn relay_loop(
                 // never leave two writers alive.
                 //
                 // `tokio::select!` drops all of its futures when it returns, so
-                // by this line every `RelayWriter` clone held by a handler is
-                // gone; `writer` below is the last sender. Dropping it closes
-                // all three lanes, which the writer's own loop treats as
-                // end-of-life. The abort then makes the teardown immediate
+                // by this line every `RelayWriter` clone held by a HANDLER is
+                // gone. `writer` below is not necessarily the last sender: a
+                // spawned `terminal_create` (see `handle_inbound`) may still
+                // hold a clone. So the lanes are not guaranteed to close on
+                // the drop — the abort below is what ends the writer task, and
+                // once it has, that create's `try_send_reply` answers
+                // `WriterGone` and it closes its terminal
+                // (`deliver_create_reply`). The abort also makes the teardown immediate
                 // rather than waiting for a drain of frames destined for a
                 // socket that is being discarded — so a frame an enqueue
                 // already returned `Ok(())` for CAN still be discarded here.
@@ -1347,6 +1352,102 @@ fn devenv_runner_info_block(
     })
 }
 
+/// Which runner instance on this box a `runner_info` came from.
+///
+/// Every runner instance on a machine — the primary on `:9876` and every
+/// supervisor-spawned secondary on `:9877-9899` — presents the SAME machine
+/// `device_id` (`machine_identity.rs`), so the backend cannot tell two sockets
+/// from one box apart by device identity alone (plan
+/// `2026-09-20-runner-selector-drives-a-transport-not-a-target`, reading A0.2:
+/// siblings collapse into one `coord.devices` row, last writer wins on `port`).
+/// This pair is what will let the backend keep one row per instance under that
+/// one device.
+///
+/// Wire keys are the TOP-LEVEL camelCase `instanceKey` / `instanceRole` (see
+/// [`build_runner_info`]). They are a separate contract from
+/// `devenv.instance_role`, which serves devenv enrollment suppression and is
+/// deliberately left untouched — the two happen to share a predicate, not a
+/// consumer. The role is the shared schema enum so its wire spelling is the
+/// one `qontinui_types::runner::RunnerInstance` declares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunnerInstanceIdentity {
+    /// Namespaced per-instance key — see [`RunnerInstanceIdentity::resolve`]
+    /// for exactly what is and is not guaranteed about it.
+    key: String,
+    role: RunnerInstanceRole,
+}
+
+impl RunnerInstanceIdentity {
+    /// Pure decision core — every input injected so it is testable without
+    /// touching process-global env.
+    ///
+    /// - `owns_shared_state`: [`crate::instance::owns_shared_root_state`] — the
+    ///   SAME primary/secondary predicate `devenv.instance_role` uses, so a
+    ///   nameless secondary (supervisor forgot `QONTINUI_INSTANCE_NAME`) reads
+    ///   as secondary here too rather than impersonating the primary.
+    /// - `runner_id`: `QONTINUI_RUNNER_ID`, set by the supervisor on every spawn
+    ///   from the runner's config id (`named-<port>-<uuid>` for a named runner,
+    ///   `test-<hex>` for a temp one) — unique by construction.
+    /// - `instance_name`: [`crate::instance::instance_name`]
+    ///   (`QONTINUI_INSTANCE_NAME`).
+    /// - `api_port`: this runner's bound API port.
+    ///
+    /// Keys, in precedence order. Each source carries its own namespace prefix,
+    /// so no value of one source can ever spell a key of another — a runner
+    /// NAMED `port:9878` keys as `name:port:9878`, never as the nameless
+    /// `:9878`'s `port:9878`, and a secondary can never produce the bare
+    /// `primary`, whatever it is named:
+    /// - primary → `primary`;
+    /// - secondary with `QONTINUI_RUNNER_ID` → `runner:<id>`. A named runner's
+    ///   id is persisted in the supervisor's settings with its config and
+    ///   reused on every restart, so this key is restart-stable for named
+    ///   runners; a temp runner's id is minted per spawn and a temp runner is
+    ///   never restarted as the same instance. Preferred over the name because
+    ///   the supervisor does not refuse two named runners with the same name;
+    /// - secondary with only `QONTINUI_INSTANCE_NAME` → `name:<name>` (a
+    ///   hand-launched secondary; unique only as far as its launcher chose);
+    /// - nameless secondary → `port:<api_port>`. **This fallback is only
+    ///   PORT-stable**: it survives a restart only if the instance comes back on
+    ///   the same port, and two different nameless instances that reuse a port
+    ///   over time share a key.
+    ///
+    /// Empty env values are treated as absent — the same rule
+    /// [`crate::instance::instance_name`] applies; any other value is used
+    /// verbatim (no trimming), so the key names exactly what the env said.
+    ///
+    /// **What is NOT guaranteed.** Two processes that each believe themselves
+    /// the primary (e.g. two copies both on the default port with no secondary
+    /// signal, one of which failed to bind) both report `primary`. Consumers —
+    /// the qontinui-web backend in particular — must treat two LIVE sockets
+    /// under one device reporting the same key as a conflict to surface, never
+    /// as a reconnect that silently overwrites the first.
+    fn resolve(
+        owns_shared_state: bool,
+        runner_id: Option<&str>,
+        instance_name: Option<&str>,
+        api_port: u16,
+    ) -> Self {
+        if owns_shared_state {
+            return Self {
+                key: "primary".to_string(),
+                role: RunnerInstanceRole::Primary,
+            };
+        }
+        let present = |v: Option<&str>| v.filter(|s| !s.is_empty()).map(str::to_string);
+        let key = if let Some(id) = present(runner_id) {
+            format!("runner:{id}")
+        } else if let Some(name) = present(instance_name) {
+            format!("name:{name}")
+        } else {
+            format!("port:{api_port}")
+        };
+        Self {
+            key,
+            role: RunnerInstanceRole::Secondary,
+        }
+    }
+}
+
 /// Build the whole `runner_info` payload. Extracted from [`send_runner_info`]
 /// purely so the wire keys can be pinned by a test — `"devenv"` in particular is
 /// a cross-repo string literal (qontinui-web `devices_ws.py` reads it) that no
@@ -1356,11 +1457,18 @@ fn devenv_runner_info_block(
 /// Field names are camelCase where the pre-existing backend contract is
 /// camelCase; the `devenv` block is snake_case because that is what the devenv
 /// half of the API speaks. Do not "normalize" either half.
+///
+/// `instanceKey` / `instanceRole` are the per-instance identity (see
+/// [`RunnerInstanceIdentity`]). Nothing reads them yet: qontinui-web
+/// `devices_ws.py` is to key one `coord.device_connections` row per instance
+/// on them in plan `2026-09-20-runner-selector-drives-a-transport-not-a-target`
+/// Phase 6 (web half).
 fn build_runner_info(
     name: String,
     hostname: Option<String>,
     port: u16,
     capabilities: Vec<String>,
+    instance: RunnerInstanceIdentity,
     devenv: Value,
 ) -> Value {
     serde_json::json!({
@@ -1372,6 +1480,8 @@ fn build_runner_info(
         "os": std::env::consts::OS,
         "osVersion": std::env::consts::ARCH,
         "capabilities": capabilities,
+        "instanceKey": instance.key,
+        "instanceRole": instance.role,
         "devenv": devenv,
     })
 }
@@ -1746,10 +1856,21 @@ where
     // local kill switch — see `devenv_runner_info_block` for why the block is
     // always present, and why both suppression signals must mirror
     // `devenv_enroll_refusal` exactly.
+    let owns_shared_state = crate::instance::owns_shared_root_state();
     let devenv = devenv_runner_info_block(
         EnvAgentConfig::load(),
-        crate::instance::owns_shared_root_state(),
+        owns_shared_state,
         devenv_auto_enroll_opted_out(),
+    );
+
+    // Per-instance identity under the shared machine `device_id` (plan
+    // `2026-09-20-runner-selector-drives-a-transport-not-a-target`, A0.2).
+    let runner_id = std::env::var("QONTINUI_RUNNER_ID").ok();
+    let instance = RunnerInstanceIdentity::resolve(
+        owns_shared_state,
+        runner_id.as_deref(),
+        instance_name.as_deref(),
+        port,
     );
 
     let runner_info = build_runner_info(
@@ -1757,6 +1878,7 @@ where
         hostname,
         port,
         capabilities,
+        instance,
         devenv,
     );
 
@@ -1787,7 +1909,21 @@ async fn handle_inbound<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    while let Some(msg_result) = read.next().await {
+    // Raised by a spawned `terminal_create` whose reply found the reply lane
+    // full — the same "end the connection" verdict the inline arm below acts
+    // on with a `return`, delivered from outside this loop.
+    let end_connection = Arc::new(tokio::sync::Notify::new());
+    loop {
+        let msg_result = tokio::select! {
+            next = read.next() => match next {
+                Some(m) => m,
+                None => break,
+            },
+            _ = end_connection.notified() => {
+                warn!("Backend relay reply lane full (spawned terminal_create) — ending the connection");
+                return;
+            }
+        };
         // Any inbound frame (including Pong, which we otherwise discard
         // below) is proof the server is reachable. Stamp the shared
         // timestamp before doing anything else so the keepalive pinger's
@@ -1810,6 +1946,53 @@ async fn handle_inbound<S>(
                         // up. Mark the ack so a later close isn't
                         // misclassified as close-before-ack.
                         connected_ack.store(true, Ordering::Relaxed);
+                        continue;
+                    }
+
+                    // A `terminal_create` runs OFF the read loop. It allocates
+                    // a worktree, spawns a PTY and — for a remote create —
+                    // waits up to REMOTE_CREATE_REGISTRATION_TIMEOUT for coord
+                    // to confirm the session, which together could outlast the
+                    // relay's 20 s ping timeout. And the read loop is one arm
+                    // of a `select!` that a kick, shutdown or stale keepalive
+                    // DROPS: awaited here, a dropped create abandoned its
+                    // half-registered session and its PTY with no cleanup and
+                    // no reply. Spawned, it always runs to its own end and
+                    // replies through the writer. A reply that cannot be sent
+                    // closes the remote terminal it announced
+                    // (`deliver_create_reply`), and a full reply lane ends the
+                    // connection through `end_connection`.
+                    if msg_type == "terminal_create" {
+                        let api_state = api_state.clone();
+                        let writer = writer.clone();
+                        let end_connection = end_connection.clone();
+                        let msg_type = msg_type.to_string();
+                        tokio::spawn(async move {
+                            let Some(response) =
+                                handle_relay_command(&api_state, &msg_type, &data).await
+                            else {
+                                return;
+                            };
+                            let tm = api_state
+                                .app_handle
+                                .try_state::<Arc<crate::terminal::TerminalManager>>()
+                                .map(|s| s.inner().clone());
+                            let end = deliver_create_reply(
+                                &writer,
+                                &response,
+                                |terminal_id| async move {
+                                    if let Some(tm) = tm {
+                                        let _ =
+                                            spawn_blocking_tracked(move || tm.close(&terminal_id))
+                                                .await;
+                                    }
+                                },
+                            )
+                            .await;
+                            if end {
+                                end_connection.notify_one();
+                            }
+                        });
                         continue;
                     }
 
@@ -4279,24 +4462,39 @@ fn remote_create_targets() -> crate::mcp::remote_terminal::CreateTargets {
 /// would mint coord rows for a population that has never had them, which is a
 /// separate decision with its own blast radius and is not this plan's.
 ///
-/// `None` on any failure — no registry in state, or a registry refusal — which
-/// the source then reports as "created but not attachable" rather than as a
-/// success. Failure never affects the terminal, which is already running.
-fn register_remote_created_session(
+/// **The id is returned only once COORD has confirmed the row**
+/// ([`crate::session::SessionRegistry::register_external_confirmed`], bounded by
+/// [`REMOTE_CREATE_REGISTRATION_TIMEOUT`]). Until 2026-09-23 this appended the
+/// `started` row to the local outbox and returned the id at once; the source
+/// then minted an attach grant against a session coord had never heard of, and
+/// when the drain was stalled or dropped the row, every attach answered `404`.
+///
+/// `Err` on any failure — no registry in state, a local refusal, or coord not
+/// confirming — and the caller then closes the terminal it just spawned and
+/// replies `coord_registration_unconfirmed`. A PTY nobody can ever attach to is
+/// not a partial success; it is an orphan on another person's machine.
+async fn register_remote_created_session(
     api_state: &Arc<ApiState>,
     tm: &Arc<crate::terminal::TerminalManager>,
     terminal_id: &str,
     purpose: Option<String>,
     working_dir: Option<String>,
     intent_repo: Option<String>,
-) -> Option<uuid::Uuid> {
+) -> Result<uuid::Uuid, crate::session::coord_sync::CoordRegistrationFailure> {
     use crate::session::{intent::Intent, SessionKind};
 
-    let registry = api_state
+    let Some(registry) = api_state
         .app_handle
-        .try_state::<Arc<crate::session::SessionRegistry>>()?
-        .inner()
-        .clone();
+        .try_state::<Arc<crate::session::SessionRegistry>>()
+        .map(|r| r.inner().clone())
+    else {
+        return Err(crate::session::coord_sync::CoordRegistrationFailure {
+            kind: "local",
+            status: None,
+            detail: "no session registry in state — this runner cannot register sessions"
+                .to_string(),
+        });
+    };
     let perf = crate::settings::get_performance_settings();
     let intent = Intent {
         kind: SessionKind::TerminalShell,
@@ -4328,41 +4526,230 @@ fn register_remote_created_session(
     let pinned_session_id = tm
         .get(terminal_id)
         .map(|s| s.pinned_session_id().to_string());
-    match registry.register_external_with_lineage(intent, None, pinned_session_id) {
+    match registry
+        .register_external_confirmed(
+            intent,
+            None,
+            pinned_session_id,
+            REMOTE_CREATE_REGISTRATION_TIMEOUT,
+        )
+        .await
+    {
         Ok(coord_id) => {
-            if let Some(session) = tm.get(terminal_id) {
-                session.set_coord_session_id(coord_id);
-                // Close the coord mirror the instant the PTY exits, instead of
-                // leaving a ghost for coord's stale watcher to reap. Same
-                // idempotent door the explicit close uses.
-                let close_registry = registry.clone();
-                session.set_on_exit(Box::new(move |id| {
-                    if let Err(e) = close_registry.close_by_id(id) {
-                        warn!(
-                            coord_session = %id,
-                            error = %e,
-                            "remote create: coord session close failed on PTY exit"
-                        );
-                    }
-                }));
-                let rx = session.subscribe_output();
-                registry.attach_output_pipe(coord_id, rx, true);
+            // The confirmation took up to REMOTE_CREATE_REGISTRATION_TIMEOUT,
+            // and the PTY may have exited — or been closed — meanwhile. The exit
+            // hook is installed FIRST and liveness checked AFTER, so an exit
+            // either fires the hook or is seen by the check; there is no window
+            // in which a confirmed coord session outlives its terminal.
+            let Some(session) = tm.get(terminal_id) else {
+                return Err(terminal_gone_after_confirm(&registry, coord_id));
+            };
+            session.set_coord_session_id(coord_id);
+            // Close the coord mirror the instant the PTY exits, instead of
+            // leaving a ghost for coord's stale watcher to reap. Same
+            // idempotent door the explicit close uses.
+            let close_registry = registry.clone();
+            session.set_on_exit(Box::new(move |id| {
+                if let Err(e) = close_registry.close_by_id(id) {
+                    warn!(
+                        coord_session = %id,
+                        error = %e,
+                        "remote create: coord session close failed on PTY exit"
+                    );
+                }
+            }));
+            if !session.is_alive() {
+                return Err(terminal_gone_after_confirm(&registry, coord_id));
             }
+            let rx = session.subscribe_output();
+            registry.attach_output_pipe(coord_id, rx, true);
             info!(
                 terminal_id = %terminal_id,
                 coord_session = %coord_id,
-                "remote create: coord session registered — the source can mint an attach grant"
+                "remote create: coord CONFIRMED the session — the source can mint an attach grant"
             );
-            Some(coord_id)
+            Ok(coord_id)
         }
         Err(e) => {
             warn!(
                 terminal_id = %terminal_id,
+                kind = e.kind,
+                status = ?e.status,
                 error = %e,
-                "remote create: coord session registration FAILED — the terminal is running but \
-                 the source cannot attach to it (no session id to mint an attach grant against)"
+                "remote create: coord did NOT confirm the session registration — the terminal \
+                 will be closed and the create refused (no attach grant could ever reach it)"
             );
+            Err(e)
+        }
+    }
+}
+
+/// The terminal went away while coord was confirming its session: close the
+/// now-confirmed coord session (idempotent — the exit hook may already have)
+/// and refuse the create, so no source is handed an id for a dead PTY.
+fn terminal_gone_after_confirm(
+    registry: &Arc<crate::session::SessionRegistry>,
+    coord_id: uuid::Uuid,
+) -> crate::session::coord_sync::CoordRegistrationFailure {
+    if let Err(e) = registry.close_by_id(coord_id) {
+        warn!(
+            coord_session = %coord_id,
+            error = %e,
+            "remote create: closing the session of a terminal that exited during \
+             confirmation failed"
+        );
+    }
+    crate::session::coord_sync::CoordRegistrationFailure {
+        kind: "terminal_exited",
+        status: None,
+        detail: "the terminal exited while coord was confirming its session".to_string(),
+    }
+}
+
+/// Upper bound on the coord confirmation a remote create waits for. The create
+/// runs in its own task (see `handle_inbound`), so this bounds how long the
+/// SOURCE waits for its reply, not the relay's read loop; a coord that cannot
+/// answer a single `POST /sessions` in this long is not one an attach could
+/// succeed against.
+const REMOTE_CREATE_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Send a spawned `terminal_create`'s reply, and deal with a reply that cannot
+/// be sent. Returns `true` when the caller must END the connection.
+///
+/// - Sent: nothing more to do.
+/// - Not sent, for a REMOTE create that produced a terminal: the source will
+///   never learn the terminal's id, and its create grant is spent — so the
+///   terminal is an orphan on this machine. `close_terminal` closes it (its
+///   exit hook closes the confirmed coord session with it).
+/// - `ReplyLaneFull`: `try_send_reply`'s contract is that a full lane ends the
+///   connection so the reconnect path settles every in-flight request; the
+///   `true` return asks the read loop to do exactly that.
+async fn deliver_create_reply<F, Fut>(
+    writer: &RelayWriter,
+    response: &Value,
+    close_terminal: F,
+) -> bool
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let text = serde_json::to_string(response).unwrap_or_default();
+    let Err(e) = writer.try_send_reply(Message::Text(text.into())) else {
+        return false;
+    };
+    let orphan = (response.get("type").and_then(Value::as_str) == Some("terminal_created")
+        && response.get("remote").is_some())
+    .then(|| {
+        response
+            .pointer("/terminal/id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })
+    .flatten();
+    match orphan {
+        Some(terminal_id) => {
+            warn!(
+                terminal_id = %terminal_id,
+                error = %e,
+                "remote create: the terminal_created reply could not be sent — closing the \
+                 terminal, which no source can ever reach"
+            );
+            close_terminal(terminal_id).await;
+        }
+        None => warn!("Failed to send terminal_create reply: {}", e),
+    }
+    matches!(e, RelayWriteError::ReplyLaneFull)
+}
+
+/// Finish a REMOTE create's reply from its coord registration outcome.
+///
+/// `Ok` stamps `coordSessionId` into the terminal object and returns `None`
+/// (the caller sends its `terminal_created`). `Err` runs `close_terminal` — the
+/// PTY just spawned must not outlive a create the source is told failed — and
+/// returns the typed `coord_registration_unconfirmed` error frame, carrying
+/// coord's status and failure kind. No `coordSessionId` coord did not confirm
+/// is ever reported.
+async fn settle_remote_registration<F, Fut>(
+    registration: Result<uuid::Uuid, crate::session::coord_sync::CoordRegistrationFailure>,
+    terminal: &mut Value,
+    terminal_id: &str,
+    data: &Value,
+    close_terminal: F,
+) -> Option<Value>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    match registration {
+        Ok(coord_id) => {
+            if let Some(obj) = terminal.as_object_mut() {
+                // INSIDE the terminal object on purpose: the relay reads a
+                // top-level `coord_session_id` first and falls back to
+                // `terminal.coordSessionId`, but a relay predating that dropped
+                // every top-level key it did not know. This spelling reaches
+                // the source through both.
+                obj.insert(
+                    "coordSessionId".to_string(),
+                    Value::String(coord_id.to_string()),
+                );
+            }
             None
+        }
+        Err(failure) if failure.kind == "terminal_exited" => {
+            // Coord DID confirm the session; the terminal exited while it was
+            // confirming, and `terminal_gone_after_confirm` already closed the
+            // session. There is nothing left to close.
+            Some(serde_json::json!({
+                "type": "error",
+                "code": "terminal_exited",
+                "message": "Coord confirmed the session, but the terminal exited while the \
+                            registration was being confirmed; the session has been closed. \
+                            The create grant is spent: retrying needs a NEW create grant.",
+                "coord_failure_kind": failure.kind,
+                "coord_status": failure.status,
+                "terminal_id": terminal_id,
+                "terminal_closed": true,
+                "request_id": data.get("request_id"),
+            }))
+        }
+        Err(failure) => {
+            let closed = match close_terminal().await {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!(
+                        terminal_id = %terminal_id,
+                        error = %e,
+                        "remote create: closing the unregistered terminal failed"
+                    );
+                    false
+                }
+            };
+            let status = failure
+                .status
+                .map(|s| format!("HTTP {s}"))
+                .unwrap_or_else(|| "no HTTP answer".to_string());
+            Some(serde_json::json!({
+                "type": "error",
+                "code": "coord_registration_unconfirmed",
+                "message": format!(
+                    "The terminal was spawned but coord did not confirm its session \
+                     registration ({kind}, {status}): {detail}. {closed_note}",
+                    kind = failure.kind,
+                    detail = failure.detail,
+                    closed_note = if closed {
+                        "The terminal was closed — nothing is left running unattached. \
+                         The create grant is spent: retrying needs a NEW create grant."
+                    } else {
+                        "Closing the terminal FAILED; it may still be running unattached. \
+                         The create grant is spent: retrying needs a NEW create grant."
+                    },
+                ),
+                "coord_failure_kind": failure.kind,
+                "coord_status": failure.status,
+                "terminal_id": terminal_id,
+                "terminal_closed": closed,
+                "request_id": data.get("request_id"),
+            }))
         }
     }
 }
@@ -4434,12 +4821,13 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
             // round-trip and is refused exactly as before. The first gate
             // refused at the LOOKUP, before any consume, so re-gating is
             // idempotent.
-            // THROTTLED, because this `await` runs on the relay's SERIAL read
-            // loop: an unthrottled re-read stalls terminal input, output and
-            // every other frame for up to the coord timeout, once per forged
-            // jti. `claim_grant_reread` allows one per jti and one per
-            // cooldown window; everything else is refused from memory at no
-            // cost. It RECORDS the attempt, so call it once.
+            // THROTTLED. A `terminal_create` now runs in its own task (see
+            // `handle_inbound`), so this `await` no longer stalls the relay's
+            // read loop — but unthrottled, a stream of forged jtis would still
+            // buy one coord round-trip each, concurrently. `claim_grant_reread`
+            // allows one per jti and one per cooldown window; everything else
+            // is refused from memory at no cost. It RECORDS the attempt, so
+            // call it once.
             let Some(jti) = crate::mcp::remote_terminal::reread_decision(
                 &frame,
                 crate::mcp::remote_terminal::GrantFamily::Create,
@@ -4459,8 +4847,8 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
                          before refusing (the directive may not have landed yet)"
                     );
                     // BOUNDED, and the bound is a second rather than the
-                    // catch-up's ten: this `await` holds the relay's serial
-                    // read loop, so it is the whole device's liveness budget.
+                    // catch-up's ten: it is the latency a racing legitimate
+                    // create pays before its reply.
                     crate::session::create::catch_up_now_within(
                         &registry,
                         crate::mcp::remote_terminal::GRANT_REREAD_TIMEOUT,
@@ -4468,10 +4856,10 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
                     .await;
                     // Re-stamp the cooldown on COMPLETION. `claim_grant_reread`
                     // stamped it when the re-read started, which bounds how
-                    // often one begins and not how much of the read loop it
-                    // occupies — a round-trip as long as the cooldown left the
-                    // next unknown jti free to claim immediately, so the stalls
-                    // ran back to back.
+                    // often one begins and not how long one lasts — a
+                    // round-trip as long as the cooldown left the next unknown
+                    // jti free to claim immediately, so the re-reads ran back
+                    // to back.
                     crate::mcp::remote_terminal::finish_grant_reread(
                         crate::mcp::remote_terminal::now_epoch_secs(),
                     );
@@ -4621,8 +5009,14 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
         // The shared session-env contribution (`QONTINUI_SESSION_WORKTREES` +
         // the configured plan directories) onto the PTY, derived before the
         // ctx is parked. See `agent_worktree::session_env`.
+        //
+        // No tenant key, for the same reason there is no spawn tenant above: the
+        // frame came over the relay from another machine and names no tenant, so
+        // reading one off it would let the remote party choose which of this
+        // device's per-tenant plan directories a session authors into. `None`
+        // resolves the device default.
         let extra_env =
-            crate::agent_worktree::session_env::session_extra_env(isolated_ctx.as_ref());
+            crate::agent_worktree::session_env::session_extra_env(isolated_ctx.as_ref(), None);
 
         // Kept for the coord registration below, which runs after `title` has
         // been moved into the spawn.
@@ -4663,27 +5057,34 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
                 // A REMOTE create is registered as a coord session; a local /
                 // mobile one is not, and that asymmetry is deliberate — see
                 // `register_remote_created_session`.
-                if admitted.is_some() {
-                    if let Some(coord_id) = register_remote_created_session(
+                if let Some(create) = admitted.as_ref() {
+                    let registration = register_remote_created_session(
                         api_state,
                         &tm,
                         &info.id,
                         registration_purpose,
                         registration_dir,
                         registration_repo,
-                    ) {
-                        if let Some(obj) = terminal.as_object_mut() {
-                            // INSIDE the terminal object on purpose: the
-                            // relay reads a top-level `coord_session_id`
-                            // first and falls back to `terminal.coordSessionId`,
-                            // but a relay predating that dropped every
-                            // top-level key it did not know. This spelling
-                            // reaches the source through both.
-                            obj.insert(
-                                "coordSessionId".to_string(),
-                                serde_json::Value::String(coord_id.to_string()),
-                            );
-                        }
+                    )
+                    .await;
+                    let close_tm = tm.clone();
+                    let close_id = info.id.clone();
+                    if let Some(mut refusal) = settle_remote_registration(
+                        registration,
+                        &mut terminal,
+                        &info.id,
+                        data,
+                        || async move {
+                            spawn_blocking_tracked(move || close_tm.close(&close_id))
+                                .await
+                                .map_err(|e| format!("join error: {e}"))?
+                        },
+                    )
+                    .await
+                    {
+                        refusal["grant_jti"] = serde_json::json!(create.block.grant_jti);
+                        refusal["remote"] = crate::mcp::remote_terminal::remote_echo(data);
+                        return Some(refusal);
                     }
                 }
                 let mut frame = serde_json::json!({
@@ -5355,6 +5756,10 @@ mod tests {
     /// `a_relay_shaped_created_reply_passes_admission` (routing) and
     /// `remote_terminal::created_reply_tests` (parsing + waking the waiter).
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn the_created_reply_echoes_the_admitted_grant_jti() {
         const DISPATCHER: &str = include_str!("backend_relay.rs");
 
@@ -5400,6 +5805,10 @@ mod tests {
     /// Nothing typed connects these three lists: they are string literals in
     /// two files and a `match`. So the invariant is pinned by comparing them.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn every_reply_handle_inbound_knows_passes_both_inbound_gates() {
         const DISPATCHER: &str = include_str!("backend_relay.rs");
         const CLIENT: &str = include_str!("remote_terminal.rs");
@@ -6857,6 +7266,7 @@ mod tests {
             Some("box-1".to_string()),
             9876,
             vec!["gui_automation".to_string()],
+            RunnerInstanceIdentity::resolve(true, None, None, 9876),
             devenv_runner_info_block(Some(enrolled_cfg()), true, false),
         );
 
@@ -6872,6 +7282,125 @@ mod tests {
         assert_eq!(payload["port"], 9876);
         assert!(payload.get("ipAddress").is_some());
         assert!(payload.get("osVersion").is_some());
+    }
+
+    /// `instanceKey` / `instanceRole` are TOP-LEVEL camelCase keys that
+    /// qontinui-web `devices_ws.py` is to read to key one
+    /// `coord.device_connections` row per instance (plan
+    /// `2026-09-20-runner-selector-drives-a-transport-not-a-target`, Phase 6
+    /// web half — not yet shipped). A typo would silently collapse every
+    /// instance on a box back into one — the A0.2 defect — so the spelling is
+    /// pinned here, and so is the fact that the pre-existing
+    /// `devenv.instance_role` contract is untouched beside it.
+    #[test]
+    fn runner_info_payload_carries_instance_key_and_role_under_their_wire_keys() {
+        let payload = build_runner_info(
+            "canary".to_string(),
+            Some("box-1".to_string()),
+            9877,
+            vec!["gui_automation".to_string()],
+            RunnerInstanceIdentity::resolve(false, Some("named-9877-abc"), Some("canary"), 9877),
+            devenv_runner_info_block(Some(enrolled_cfg()), false, false),
+        );
+
+        assert_eq!(payload["instanceKey"], "runner:named-9877-abc");
+        assert_eq!(payload["instanceRole"], "secondary");
+        // Not snake_case at the top level, and not nested in `devenv`.
+        assert!(payload.get("instance_key").is_none());
+        assert!(payload.get("instance_role").is_none());
+        assert!(payload["devenv"].get("instanceKey").is_none());
+        // The devenv block keeps its own, separate snake_case field.
+        assert_eq!(payload["devenv"]["instance_role"], "secondary");
+    }
+
+    /// The role's wire spelling is the shared schema enum's, not a local string.
+    #[test]
+    fn runner_instance_role_serializes_as_the_schema_spelling() {
+        let primary = RunnerInstanceIdentity::resolve(true, None, None, 9876);
+        let payload = build_runner_info(
+            "primary".to_string(),
+            None,
+            9876,
+            vec![],
+            primary,
+            devenv_runner_info_block(None, true, false),
+        );
+        assert_eq!(payload["instanceKey"], "primary");
+        assert_eq!(payload["instanceRole"], "primary");
+    }
+
+    #[test]
+    fn runner_instance_identity_primary_is_keyed_primary() {
+        // Even with supervisor env present, the primary is `primary`.
+        let id = RunnerInstanceIdentity::resolve(true, Some("primary"), None, 9876);
+        assert_eq!(id.key, "primary");
+        assert_eq!(id.role, RunnerInstanceRole::Primary);
+    }
+
+    #[test]
+    fn runner_instance_identity_prefers_the_supervisor_runner_id() {
+        // Keyed by runner id, not port: a restart onto a different port keeps
+        // the key.
+        let a = RunnerInstanceIdentity::resolve(false, Some("named-9877-u1"), Some("canary"), 9877);
+        let b = RunnerInstanceIdentity::resolve(false, Some("named-9877-u1"), Some("canary"), 9881);
+        assert_eq!(a.key, "runner:named-9877-u1");
+        assert_eq!(a.role, RunnerInstanceRole::Secondary);
+        assert_eq!(a, b);
+    }
+
+    /// The supervisor's `spawn-named` does not refuse a duplicate name, so two
+    /// runners named alike must still key apart by their distinct runner ids.
+    #[test]
+    fn runner_instance_identity_same_name_different_runner_ids_differ() {
+        let a = RunnerInstanceIdentity::resolve(false, Some("named-9877-u1"), Some("canary"), 9877);
+        let b = RunnerInstanceIdentity::resolve(false, Some("named-9878-u2"), Some("canary"), 9878);
+        assert_ne!(a.key, b.key);
+    }
+
+    /// A runner NAMED `port:9878` must not collide with a nameless runner on
+    /// `:9878` — each source carries its own namespace.
+    #[test]
+    fn runner_instance_identity_name_spelling_a_port_key_does_not_collide() {
+        let named = RunnerInstanceIdentity::resolve(false, None, Some("port:9878"), 9877);
+        let nameless = RunnerInstanceIdentity::resolve(false, None, None, 9878);
+        assert_eq!(named.key, "name:port:9878");
+        assert_eq!(nameless.key, "port:9878");
+        assert_ne!(named.key, nameless.key);
+    }
+
+    /// A secondary can never produce the bare `primary` key, whatever it is
+    /// named (e.g. a hand-launched `QONTINUI_INSTANCE_NAME=primary`).
+    #[test]
+    fn runner_instance_identity_secondary_named_primary_is_not_primary() {
+        let by_name = RunnerInstanceIdentity::resolve(false, None, Some("primary"), 9877);
+        let by_id = RunnerInstanceIdentity::resolve(false, Some("primary"), None, 9877);
+        assert_eq!(by_name.key, "name:primary");
+        assert_eq!(by_id.key, "runner:primary");
+        assert_eq!(by_name.role, RunnerInstanceRole::Secondary);
+        assert_ne!(by_name.key, "primary");
+        assert_ne!(by_id.key, "primary");
+    }
+
+    #[test]
+    fn runner_instance_identity_nameless_secondary_falls_back_to_port() {
+        // A secondary by another signal (non-default port / primary_port) with
+        // no QONTINUI_RUNNER_ID / QONTINUI_INSTANCE_NAME must never take the
+        // primary's key. Empty env values count as absent.
+        let id = RunnerInstanceIdentity::resolve(false, None, None, 9878);
+        assert_eq!(id.key, "port:9878");
+        assert_eq!(id.role, RunnerInstanceRole::Secondary);
+        let empty = RunnerInstanceIdentity::resolve(false, Some(""), Some(""), 9878);
+        assert_eq!(empty, id);
+    }
+
+    /// Documented limit, pinned so it is not mistaken for a guarantee: two
+    /// self-believed primaries report the same key, and the consumer must
+    /// treat that as a conflict.
+    #[test]
+    fn runner_instance_identity_two_self_believed_primaries_share_a_key() {
+        let a = RunnerInstanceIdentity::resolve(true, None, None, 9876);
+        let b = RunnerInstanceIdentity::resolve(true, None, None, 9876);
+        assert_eq!(a.key, b.key);
     }
 
     /// Pins the command-type SPELLING qontinui-web sends.
@@ -7932,5 +8461,222 @@ mod relay_writer_tests {
                 "a full liveness lane must coalesce, never block and never error                  — a stale heartbeat or a redundant keepalive is worth nothing"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod remote_create_registration_tests {
+    use super::*;
+    use crate::session::coord_sync::CoordRegistrationFailure;
+    use std::sync::atomic::AtomicBool;
+
+    fn created_terminal() -> Value {
+        serde_json::json!({ "id": "term-1", "title": "remote" })
+    }
+
+    /// Coord answered 5xx: the reply is the typed refusal carrying coord's
+    /// status and kind, the terminal just spawned is CLOSED, and no
+    /// `coordSessionId` reaches the source.
+    #[tokio::test]
+    async fn an_unconfirmed_registration_closes_the_terminal_and_refuses() {
+        let closed = Arc::new(AtomicBool::new(false));
+        let flag = closed.clone();
+        let mut terminal = created_terminal();
+        let data = serde_json::json!({ "request_id": "r-1" });
+        let frame = settle_remote_registration(
+            Err(CoordRegistrationFailure {
+                kind: "server_error",
+                status: Some(503),
+                detail: "503 Service Unavailable: upstream".to_string(),
+            }),
+            &mut terminal,
+            "term-1",
+            &data,
+            || async move {
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .expect("an unconfirmed registration must produce an error reply");
+
+        assert!(
+            closed.load(Ordering::SeqCst),
+            "the spawned terminal must be closed"
+        );
+        assert_eq!(frame["type"], "error");
+        assert_eq!(frame["code"], "coord_registration_unconfirmed");
+        assert_eq!(frame["coord_status"], 503);
+        assert_eq!(frame["coord_failure_kind"], "server_error");
+        assert_eq!(frame["terminal_closed"], true);
+        assert_eq!(frame["request_id"], "r-1");
+        assert!(frame["message"].as_str().unwrap().contains("HTTP 503"));
+        assert!(
+            terminal.get("coordSessionId").is_none(),
+            "an id coord did not confirm is never reported"
+        );
+    }
+
+    /// Coord answered 2xx: the confirmed id rides the terminal object and the
+    /// terminal is left running.
+    #[tokio::test]
+    async fn a_confirmed_registration_reports_the_coord_session_id() {
+        let closed = Arc::new(AtomicBool::new(false));
+        let flag = closed.clone();
+        let mut terminal = created_terminal();
+        let id = Uuid::new_v4();
+        let frame = settle_remote_registration(
+            Ok(id),
+            &mut terminal,
+            "term-1",
+            &serde_json::json!({}),
+            || async move {
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(
+            frame.is_none(),
+            "success sends the ordinary terminal_created"
+        );
+        assert!(
+            !closed.load(Ordering::SeqCst),
+            "a confirmed terminal stays up"
+        );
+        assert_eq!(terminal["coordSessionId"], id.to_string());
+    }
+
+    fn remote_created_frame() -> Value {
+        serde_json::json!({
+            "type": "terminal_created",
+            "terminal": { "id": "term-9", "coordSessionId": Uuid::new_v4().to_string() },
+            "remote": { "grant_jti": "j" },
+        })
+    }
+
+    /// Round-2 finding 1: the writer is GONE (teardown aborted it) when a
+    /// spawned remote create finishes. The reply cannot be sent, so the
+    /// terminal it announced is closed rather than left as an orphan.
+    #[tokio::test]
+    async fn a_dead_writer_closes_the_remote_terminal_it_could_not_announce() {
+        let (writer, rx) = RelayWriter::new();
+        drop(rx);
+        let closed = Arc::new(std::sync::Mutex::new(None::<String>));
+        let slot = closed.clone();
+        let end = deliver_create_reply(&writer, &remote_created_frame(), |id| async move {
+            *slot.lock().unwrap() = Some(id);
+        })
+        .await;
+        assert!(!end, "a gone writer is already the end of the connection");
+        assert_eq!(closed.lock().unwrap().as_deref(), Some("term-9"));
+    }
+
+    /// A FULL reply lane both closes the orphan and asks the read loop to end
+    /// the connection — `try_send_reply`'s contract.
+    #[tokio::test]
+    async fn a_full_reply_lane_closes_the_terminal_and_ends_the_connection() {
+        let (writer, _rx) = RelayWriter::new();
+        while writer
+            .try_send_reply(Message::Text("filler".to_string().into()))
+            .is_ok()
+        {}
+        let closed = Arc::new(AtomicBool::new(false));
+        let flag = closed.clone();
+        let end = deliver_create_reply(&writer, &remote_created_frame(), |_| async move {
+            flag.store(true, Ordering::SeqCst);
+        })
+        .await;
+        assert!(end, "a full reply lane must end the connection");
+        assert!(closed.load(Ordering::SeqCst));
+    }
+
+    /// A delivered reply closes nothing; a failed reply for a LOCAL (non-remote)
+    /// create closes nothing either — that terminal has an operator here.
+    #[tokio::test]
+    async fn only_an_undeliverable_remote_create_closes_its_terminal() {
+        let (writer, _rx) = RelayWriter::new();
+        let closed = Arc::new(AtomicBool::new(false));
+        let flag = closed.clone();
+        assert!(
+            !deliver_create_reply(&writer, &remote_created_frame(), |_| async move {
+                flag.store(true, Ordering::SeqCst);
+            })
+            .await
+        );
+        assert!(!closed.load(Ordering::SeqCst));
+
+        let (dead, rx) = RelayWriter::new();
+        drop(rx);
+        let local = serde_json::json!({ "type": "terminal_created", "terminal": { "id": "t" } });
+        let flag = closed.clone();
+        deliver_create_reply(&dead, &local, |_| async move {
+            flag.store(true, Ordering::SeqCst);
+        })
+        .await;
+        assert!(!closed.load(Ordering::SeqCst));
+    }
+
+    /// Round-3: a terminal that exited DURING the confirmation is reported as
+    /// exactly that — coord confirmed, the terminal is gone, nothing to close —
+    /// not as an unconfirmed registration with a failed close.
+    #[tokio::test]
+    async fn a_terminal_that_exited_during_confirmation_is_reported_as_closed() {
+        let called = Arc::new(AtomicBool::new(false));
+        let flag = called.clone();
+        let mut terminal = created_terminal();
+        let frame = settle_remote_registration(
+            Err(CoordRegistrationFailure {
+                kind: "terminal_exited",
+                status: None,
+                detail: "the terminal exited while coord was confirming its session".to_string(),
+            }),
+            &mut terminal,
+            "term-1",
+            &serde_json::json!({ "request_id": "r-2" }),
+            || async move {
+                flag.store(true, Ordering::SeqCst);
+                Err("Terminal session not found".to_string())
+            },
+        )
+        .await
+        .expect("the create is refused");
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "an exited terminal is not closed again"
+        );
+        assert_eq!(frame["code"], "terminal_exited");
+        assert_eq!(frame["terminal_closed"], true);
+        let msg = frame["message"].as_str().unwrap();
+        assert!(msg.contains("Coord confirmed"), "{msg}");
+        assert!(!msg.contains("FAILED"), "{msg}");
+        assert!(terminal.get("coordSessionId").is_none());
+    }
+
+    /// A failed close is reported, not hidden: the source learns a PTY may be
+    /// left running unattached.
+    #[tokio::test]
+    async fn a_failed_close_is_reported_in_the_refusal() {
+        let mut terminal = created_terminal();
+        let frame = settle_remote_registration(
+            Err(CoordRegistrationFailure {
+                kind: "timeout",
+                status: None,
+                detail: "no answer".to_string(),
+            }),
+            &mut terminal,
+            "term-1",
+            &serde_json::json!({}),
+            || async { Err("already gone".to_string()) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(frame["terminal_closed"], false);
+        assert!(frame["coord_status"].is_null());
+        assert!(frame["message"]
+            .as_str()
+            .unwrap()
+            .contains("no HTTP answer"));
     }
 }

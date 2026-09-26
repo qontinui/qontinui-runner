@@ -199,6 +199,10 @@ pub fn parse_session_id_from_cmdline(cmdline: &str) -> Option<String> {
 /// `-r`, which as a bare substring also occurs inside `--resume` and inside
 /// ordinary paths (`C:\foo-r bar`); the long flags keep their historical
 /// substring scan so their behavior is byte-identical to before.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn find_flag_uuid(cmdline: &str, needle: &str, require_token_start: bool) -> Option<String> {
     let mut search_from = 0usize;
     while let Some(rel) = cmdline[search_from..].find(needle) {
@@ -228,6 +232,10 @@ fn find_flag_uuid(cmdline: &str, needle: &str, require_token_start: bool) -> Opt
 }
 
 /// First whitespace-delimited token of `s`, leading whitespace/quote trimmed.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_first_token(s: &str) -> &str {
     let s = s.trim_start();
     let end = s.find(char::is_whitespace).unwrap_or(s.len());
@@ -313,6 +321,10 @@ fn persistent_identity_shim_dir() -> Option<&'static str> {
 /// Pure over its inputs; parsed with manual `/`+`\` splitting (not
 /// `std::path`) so Windows-style snapshot paths behave identically on every
 /// host, mirroring [`is_claude_image`].
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn is_shim_dir_exe_path(exe_path: &str, persistent_identity_dir: Option<&str>) -> bool {
     use crate::install_effects_producer::intercept::shim_materializer::{
         IDENTITY_DIR_PREFIX, SHIM_DIR_PREFIX,
@@ -833,6 +845,10 @@ async fn snapshot_process_table() -> ProcessSnapshot {
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn snapshot_process_table_sync() -> ProcessSnapshot {
     let mut snap = ProcessSnapshot::default();
 

@@ -539,6 +539,10 @@ pub async fn get_modified_files() -> Vec<String> {
 }
 
 /// Build a compensation action for a git reset to a specific commit.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn git_reset_compensation(
     execution_id: &str,
     phase: &str,

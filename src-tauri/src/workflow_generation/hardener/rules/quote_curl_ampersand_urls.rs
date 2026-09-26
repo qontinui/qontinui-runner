@@ -50,6 +50,10 @@ impl HardenRule for QuoteCurlAmpersandUrls {
 /// Pure function: wrap http(s) URLs containing `?` AND `&` in double
 /// quotes when they're not already quoted. Returns `None` if nothing to
 /// fix.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn quote_curl_urls_with_ampersand(cmd: &str) -> Option<String> {
     if !cmd.contains("curl ") || !cmd.contains('&') {
         return None;

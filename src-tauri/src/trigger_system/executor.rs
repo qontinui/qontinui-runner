@@ -107,6 +107,10 @@ impl Clone for TriggerExecutorDeps {
 /// Spawn a workflow in response to a trigger event.
 ///
 /// Returns the execution_id (task_run_id) on success.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub async fn execute_triggered_workflow(
     deps: &TriggerExecutorDeps,
     workflow_id: &str,

@@ -1159,6 +1159,10 @@ fn derive_expo_app_info(pkg_name: &str) -> (String, String) {
 /// `config` are populated. Server adapter, screenshot/navigation/route
 /// providers, deviceId, cloud relay are left out — they require sibling
 /// deps and runtime decisions the integrator can't make.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn wrap_with_provider_expo_router(content: &str, app_id: &str, app_name: &str) -> String {
     let import_line = "import { UIBridgeNativeProvider } from '@qontinui/ui-bridge-native';\n";
     let insert_pos = find_last_import_pos(content);
@@ -1208,6 +1212,10 @@ fn wrap_with_provider_expo_router(content: &str, app_id: &str, app_name: &str) -
 /// Helper: wrap a single self-closing `<Tag ... />` (e.g. `<Stack />`) with the
 /// given provider open/close tags. Returns Some(new_content) only if a match
 /// was found; None otherwise.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn wrap_self_closing_root(
     content: &str,
     tag: &str,
@@ -1343,6 +1351,10 @@ async fn integrate_expo_router(
     );
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn wrap_with_provider_react(content: &str, file_path: &str) -> String {
     let import_line =
         "import { UIBridgeProvider, AutoRegisterProvider, CommandRelayListener } from '@qontinui/ui-bridge/react';\n";
@@ -1377,6 +1389,10 @@ fn wrap_with_provider_react(content: &str, file_path: &str) -> String {
     }
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn wrap_with_provider_nextjs(content: &str) -> String {
     let import_line =
         "import { UIBridgeProvider, AutoRegisterProvider, CommandRelayListener } from '@qontinui/ui-bridge/react';\n";
@@ -1397,6 +1413,10 @@ fn wrap_with_provider_nextjs(content: &str) -> String {
 /// For projects that already have UIBridgeProvider but are missing CommandRelayListener,
 /// add the import and component. This handles the "upgrade" case where a project was
 /// integrated before CommandRelayListener existed.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 async fn add_missing_command_relay_listener(
     project: &std::path::Path,
     analysis: &ProjectAnalysis,
@@ -1557,6 +1577,10 @@ async fn integrate_standalone_server(
     );
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn find_last_import_pos(content: &str) -> usize {
     let mut last_import_end = 0;
     for (i, line) in content.lines().enumerate() {
@@ -2265,6 +2289,10 @@ async fn handle_write_hooks(
 
 /// After writing hook files, modify the root layout to import and render <UIBridgeHooks />.
 /// Follows the same pattern as `add_missing_command_relay_listener`.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 async fn add_hooks_to_layout(
     project: &std::path::Path,
     analysis: &ProjectAnalysis,
@@ -2366,6 +2394,10 @@ async fn add_hooks_to_layout(
 
 /// After writing registration files, modify each page component to import and call
 /// the registration hook. Only modifies files that don't already import the hook.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 async fn add_registration_imports(
     project: &std::path::Path,
     written_files: &[String],
@@ -2492,6 +2524,10 @@ async fn add_registration_imports(
 
 /// After writing tutorial .ts files, update the tutorial registry (data/index.ts)
 /// to import and register the new tutorials.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 async fn update_tutorial_registry(
     project: &std::path::Path,
     written_files: &[String],
@@ -3452,6 +3488,10 @@ fn extract_local_imports(source: &str) -> Vec<String> {
 
 /// Resolve TypeScript path aliases from tsconfig.json.
 /// Returns the filesystem base directory for a given alias prefix (e.g., "@/" → "src/").
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn resolve_ts_alias(project_root: &PathBuf, alias_prefix: &str) -> Option<PathBuf> {
     // Try tsconfig.json, then tsconfig.app.json
     for config_name in &["tsconfig.json", "tsconfig.app.json"] {
@@ -3493,6 +3533,10 @@ fn resolve_ts_alias(project_root: &PathBuf, alias_prefix: &str) -> Option<PathBu
 }
 
 /// Resolve an import path to an actual file on disk.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 async fn resolve_import(
     from_dir: &std::path::Path,
     project_root: &PathBuf,

@@ -632,6 +632,10 @@ fn resume_respawn_extra_required(
 /// already confirmed exhaustion) and the manual Tauri command
 /// (`terminal_migrate_session_account`, where the operator's click is the
 /// confirmation).
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn migrate_session(
     app: &tauri::AppHandle,
     record: &TerminalSessionRecord,

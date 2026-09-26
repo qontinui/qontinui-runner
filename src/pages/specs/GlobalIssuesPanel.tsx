@@ -34,8 +34,20 @@ import type {
 import { ISSUE_CATEGORIES, ISSUE_SEVERITIES } from "@qontinui/shared-types";
 import { useDiscoveredSpecs } from "@/lib/ui-bridge/use-discovered-specs";
 import { SEVERITY_STYLES, CATEGORY_STYLES, STATUS_STYLES } from "./issue-styles";
+import {
+  computeIssueHeaderStats,
+  type IssueStatusFilter,
+  type LoadedIssueFilters,
+} from "./issueHeaderStats";
 
-type StatusFilter = "all" | "active" | "resolved" | "monitoring";
+type StatusFilter = IssueStatusFilter;
+
+/** Filter values at mount — seeds both the controls and `loadedFilters`. */
+const DEFAULT_ISSUE_FILTERS: LoadedIssueFilters = {
+  status: "active",
+  category: "all",
+  severity: "all",
+};
 
 // ============================================================================
 // Badge & ConfidenceBar
@@ -434,12 +446,20 @@ function CreateIssueForm({
 
 export function GlobalIssuesPanel() {
   const [issues, setIssues] = useState<KnownIssue[]>([]);
+  // The server-side filters `issues` was ACTUALLY fetched with. The filter
+  // controls change immediately, but `issues` keeps the previous result until
+  // the refetch lands (or for good, if it fails) — so the header must label the
+  // loaded population by these, never by the live control values.
+  const [loadedFilters, setLoadedFilters] = useState<LoadedIssueFilters>(DEFAULT_ISSUE_FILTERS);
+  // Monotonic request id: a slower, older response must not overwrite a newer
+  // one (which would pair stale rows with the newer label, or vice versa).
+  const loadSeqRef = useRef(0);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>("active");
-  const [categoryFilter, setCategoryFilter] = useState<string>("all");
-  const [severityFilter, setSeverityFilter] = useState<string>("all");
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>(DEFAULT_ISSUE_FILTERS.status);
+  const [categoryFilter, setCategoryFilter] = useState<string>(DEFAULT_ISSUE_FILTERS.category);
+  const [severityFilter, setSeverityFilter] = useState<string>(DEFAULT_ISSUE_FILTERS.severity);
   const [searchQuery, setSearchQuery] = useState("");
 
   const [showForm, setShowForm] = useState(false);
@@ -451,20 +471,30 @@ export function GlobalIssuesPanel() {
   // ------ Data loading ------
 
   const loadIssues = useCallback(async () => {
+    const seq = ++loadSeqRef.current;
+    const requested: LoadedIssueFilters = {
+      status: statusFilter,
+      category: categoryFilter,
+      severity: severityFilter,
+    };
     setIsLoading(true);
     setError(null);
     try {
       const query: ListKnownIssuesQuery = {};
-      if (statusFilter !== "all") query.status = statusFilter;
-      if (categoryFilter !== "all") query.category = categoryFilter;
-      if (severityFilter !== "all") query.severity = severityFilter;
+      if (requested.status !== "all") query.status = requested.status;
+      if (requested.category !== "all") query.category = requested.category;
+      if (requested.severity !== "all") query.severity = requested.severity;
 
       const result = await invoke<KnownIssue[]>("list_known_issues", { query });
+      if (seq !== loadSeqRef.current) return;
+      // Rows and the filters they were fetched with move TOGETHER.
       setIssues(result);
+      setLoadedFilters(requested);
     } catch (err) {
+      if (seq !== loadSeqRef.current) return;
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setIsLoading(false);
+      if (seq === loadSeqRef.current) setIsLoading(false);
     }
   }, [statusFilter, categoryFilter, severityFilter]);
 
@@ -513,15 +543,12 @@ export function GlobalIssuesPanel() {
 
   // ------ Stats ------
 
-  const stats = useMemo(() => {
-    return {
-      total: issues.length,
-      critical: issues.filter((i) => i.severity === "critical" && i.status === "active").length,
-      high: issues.filter((i) => i.severity === "high" && i.status === "active").length,
-      medium: issues.filter((i) => i.severity === "medium" && i.status === "active").length,
-      low: issues.filter((i) => i.severity === "low" && i.status === "active").length,
-    };
-  }, [issues]);
+  // Every header number describes the list below it and names its
+  // population — see `computeIssueHeaderStats`.
+  const stats = useMemo(
+    () => computeIssueHeaderStats(issues, filteredIssues, { ...loadedFilters, searchQuery }),
+    [issues, filteredIssues, loadedFilters, searchQuery],
+  );
 
   // ------ Actions ------
 
@@ -674,16 +701,25 @@ export function GlobalIssuesPanel() {
             <Bug className="w-4 h-4 text-amber-400" />
             <span className="text-sm font-semibold">All Issues</span>
             <div className="flex items-center gap-1.5 ml-1">
-              <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-white/10 text-muted-foreground">
-                {stats.total}
+              <span
+                className="text-[10px] px-1.5 py-0.5 rounded-full bg-white/10 text-muted-foreground"
+                title={stats.badgeTitle}
+              >
+                {stats.badgeText}
               </span>
               {stats.critical > 0 && (
-                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-red-500/15 text-red-400">
+                <span
+                  className="text-[10px] px-1.5 py-0.5 rounded-full bg-red-500/15 text-red-400"
+                  title="Active critical issues in the list below"
+                >
                   {stats.critical} crit
                 </span>
               )}
               {stats.high > 0 && (
-                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-orange-500/15 text-orange-400">
+                <span
+                  className="text-[10px] px-1.5 py-0.5 rounded-full bg-orange-500/15 text-orange-400"
+                  title="Active high-severity issues in the list below"
+                >
                   {stats.high} high
                 </span>
               )}
@@ -868,8 +904,8 @@ export function GlobalIssuesPanel() {
             <p className="text-xs mt-1">
               {searchQuery
                 ? "Try adjusting your search or filters"
-                : statusFilter !== "all"
-                  ? `No ${statusFilter} issues. Try changing the status filter.`
+                : loadedFilters.status !== "all"
+                  ? `No ${loadedFilters.status} issues. Try changing the status filter.`
                   : "Create a new issue to start tracking known problems."}
             </p>
           </div>

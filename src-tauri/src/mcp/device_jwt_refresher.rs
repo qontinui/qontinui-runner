@@ -1773,6 +1773,10 @@ pub(crate) const CREDENTIAL_REJECTION_CODES: &[&str] = &[
 /// quoted value. `serde_json` sorts object keys, so coord's top-level `code`
 /// precedes any nested one; this is a key lookup, never a body-wide
 /// `contains`.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub(crate) fn upstream_refusal_code(body: &str) -> Option<String> {
     if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(body) {
         if let Some(serde_json::Value::String(code)) = map.get("code") {
@@ -8371,6 +8375,10 @@ mod tenant_slot_refresh_tests {
     /// `the_coord_mcp_proxy_reports_its_upstream_verdict_to_the_posture` uses —
     /// and requires the call to come AFTER `persist_pairing`.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn every_in_process_re_pair_path_retires_the_stale_rejection_streak() {
         for (file, item) in [
             ("src/commands/auth.rs", "async fn finalize_signed_in("),
@@ -9001,6 +9009,10 @@ mod tenant_slot_refresh_tests {
     /// `store_tokens` directly — a STRICTER invariant than before, not a
     /// weaker one, and this scan must track wherever that seam moves to next.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn every_legacy_mint_in_this_file_retires_the_stale_rejection_streaks() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src/mcp/device_jwt_refresher.rs");

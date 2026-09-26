@@ -168,16 +168,26 @@ mod tests {
     /// variable: a SET env var has NO effect on the resolved plans dir. The
     /// resolver returns the setting regardless of the environment, and an
     /// unset setting stays unset however the env is exported.
+    ///
+    /// The empty map and `None` tenant are the device-default rung — this
+    /// migration is device-wide and deliberately keys nothing by tenant: it
+    /// seeds the scalar that every tenant without its own entry falls back to.
     #[test]
     fn a_set_env_var_has_no_effect_on_the_resolved_plans_dir() {
+        let no_tenant_overrides = std::collections::BTreeMap::new();
         with_env(Some("/env/plans"), || {
             assert_eq!(
-                resolve_plans_dir(Some("/settings/plans".to_string())).as_deref(),
+                resolve_plans_dir(
+                    Some("/settings/plans".to_string()),
+                    &no_tenant_overrides,
+                    None
+                )
+                .as_deref(),
                 Some("/settings/plans"),
                 "the setting is the only source"
             );
             assert_eq!(
-                resolve_plans_dir(None),
+                resolve_plans_dir(None, &no_tenant_overrides, None),
                 None,
                 "an exported env var must not arm a tier the setting leaves off"
             );

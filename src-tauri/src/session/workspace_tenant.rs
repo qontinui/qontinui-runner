@@ -383,6 +383,10 @@ fn path_segment_eq(a: &str, b: &str) -> bool {
 
 /// `prefix` covers `target` only on a whole path SEGMENT boundary: `D:/repo`
 /// covers `D:/repo` and `D:/repo/sub`, and never `D:/repo-other`.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn prefix_matches(prefix: &str, target: &str) -> bool {
     if prefix.is_empty() || target.is_empty() {
         return false;
