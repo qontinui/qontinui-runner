@@ -335,10 +335,14 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
         // hours — logging each tick would rebuild, in the recovery path, the
         // same log storm this plan exists to remove.
         //
-        // Holds the ARM that was announced, not a bool: an episode that
-        // changes cause (undeliverable → fd starved) is a new fact and gets
-        // its own `warn!` rather than being folded into the first one.
-        let mut suppression_announced: Option<crate::ui_error::PingDelivery> = None;
+        // One flag PER ARM, not one bool: an episode whose cause changes
+        // (undeliverable → fd starved) is a new fact and gets its own `warn!`
+        // rather than being folded into the first one. But each arm warns at
+        // most ONCE per episode — a mixed storm that flips cause every 15s
+        // tick must not rebuild the per-tick log storm this gate exists to
+        // remove, so later flips back to an already-announced arm are `debug!`.
+        let mut announced_undeliverable = false;
+        let mut announced_starved = false;
 
         loop {
             ticker.tick().await;
@@ -499,8 +503,13 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
                 ping_report.fd_starved_suppressed = crate::ui_error::fd_starved_suppressed_count();
                 let emit_failures = ping_report.emit_failures;
                 let starved = ping_report.delivery == crate::ui_error::PingDelivery::Starved;
-                if suppression_announced != Some(ping_report.delivery) {
-                    suppression_announced = Some(ping_report.delivery);
+                let announced = if starved {
+                    &mut announced_starved
+                } else {
+                    &mut announced_undeliverable
+                };
+                if !*announced {
+                    *announced = true;
                     if starved {
                         warn!(
                             ping_delivery = ping_report.delivery.as_str(),
@@ -554,7 +563,8 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
                 // and then fails again is a NEW episode by any reading, but the
                 // flag was never cleared, so that episode announced itself at
                 // `debug!` and the operator saw nothing.
-                suppression_announced = None;
+                announced_undeliverable = false;
+                announced_starved = false;
             }
             if recover {
                 if let Some(handle) = crate::tauri_app_handle::current() {
