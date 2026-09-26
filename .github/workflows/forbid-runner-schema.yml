@@ -22,7 +22,16 @@ on:
   pull_request:
     branches: [main, develop]
   push:
-    branches: [main, develop]
+    branches:
+      - main
+      - develop
+      # merge-candidate refs are the tips coord LANDS: coord's candidate verdict
+      # reduces every check-run on the candidate tip, so a gate that does not
+      # run here takes no part in the land decision (plan
+      # 2026-09-12-red-main-fix-pr-opened-after-the-red-never-gets-a-probe-candidate D5).
+      - 'merge-candidate/**'
+      - 'merge-candidate-spec/**'
+      - 'merge-candidate-batch/**'
   # `workflow_dispatch` exists so this workflow can be RE-FIRED on a head whose
   # PR never matched the `branches:` filter above.
   #

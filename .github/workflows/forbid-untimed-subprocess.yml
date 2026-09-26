@@ -257,8 +257,13 @@ name: forbid untimed subprocess waits
 # targets a feature branch), but it did mean an untimed wait introduced inside a
 # stack went ungated until the stack re-targeted `main`. At ~8s a run, closing
 # that is cheaper than reasoning about it. `push:` stays pinned to the trunk
-# branches: a push run on every feature branch would be pure duplication of the
-# PR run.
+# branches PLUS coord's merge-candidate refs. A push run on every feature
+# branch would be pure duplication of the PR run, but a candidate ref is not a
+# feature branch: it is the rebased tip coord will land, the only run that sees
+# the PR combined with everything that landed before it. The red window that
+# opened 2026-09-02T07:56Z began exactly there: `ae52e215f` landed before this
+# gate existed, and the gate's own PR run judged a base without it, so no run
+# ever scanned the two together until main.
 #
 # It is still NOT REGISTERED as a required context today: red CI is this repo's
 # sanctioned merge-stopper and `main` carries pre-existing red, so promoting a
@@ -323,7 +328,16 @@ on:
   workflow_dispatch:
   pull_request:
   push:
-    branches: [main, develop]
+    branches:
+      - main
+      - develop
+      # merge-candidate refs are the tips coord LANDS: coord's candidate verdict
+      # reduces every check-run on the candidate tip, so a gate that does not
+      # run here takes no part in the land decision (plan
+      # 2026-09-12-red-main-fix-pr-opened-after-the-red-never-gets-a-probe-candidate D5).
+      - 'merge-candidate/**'
+      - 'merge-candidate-spec/**'
+      - 'merge-candidate-batch/**'
 
 # Serialise per ref. `cancel-in-progress: false` on purpose, matching
 # atlas-exclude-fresh.yml and page-spec-paths.yml rather than the two
@@ -401,7 +415,8 @@ jobs:
       # problem — and it turns the conflicting-PR case into a NAMED failure
       # instead of a silent scan of a six-day-old tree.
       #
-      # `push:` runs are untouched: there is no PR to merge on a trunk branch.
+      # `push:` runs are untouched: there is no PR to merge on a trunk branch
+      # or on a merge-candidate ref (the tip coord will land).
       #
       # Plan: 2026-09-08-a-gating-workflows-pr-verdict-is-frozen-at-its-original-merge-commit-so-a-red-main-window-wedges-every-pr-that-ran-during-it
       - name: Re-derive this PR's merge state against the current base

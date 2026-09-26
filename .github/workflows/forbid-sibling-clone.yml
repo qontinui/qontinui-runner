@@ -33,7 +33,20 @@ on:
     paths:
       - ".github/**"
   push:
-    branches: [main]
+    branches:
+      - main
+      # merge-candidate refs are the tips coord LANDS: coord's candidate verdict
+      # reduces every check-run on the candidate tip, so a gate that does not
+      # run here takes no part in the land decision (plan
+      # 2026-09-12-red-main-fix-pr-opened-after-the-red-never-gets-a-probe-candidate D5).
+      - 'merge-candidate/**'
+      - 'merge-candidate-spec/**'
+      - 'merge-candidate-batch/**'
+    # Kept on candidate refs too: a candidate that changes no .github/** path
+    # has nothing for this gate to scan. Best-effort on a NEW ref: GitHub diffs
+    # it against the parent of the deepest pushed commit and reads only the
+    # first 300 changed files, so a very large batch candidate may skip this
+    # run. A skipped run adds no check row, which coord treats as neutral.
     paths:
       - ".github/**"
 
