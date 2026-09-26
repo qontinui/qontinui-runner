@@ -113,6 +113,8 @@ mod dom_capture;
 mod drain;
 #[cfg(test)]
 mod runner_spawn_sites;
+#[cfg(test)]
+mod session_asset_sites;
 // `embedded_pg` lives in the LIB crate as of P4 (lib-side consumers need it).
 // Re-bound here as `pub(crate)` so every existing `crate::embedded_pg::...`
 // path in this binary - including mcp_api.rs's /health reporting - keeps
@@ -210,7 +212,7 @@ mod projects;
 mod prompt_library;
 mod prompt_snippets;
 mod prompts;
-/// The shared tracked-destination guard both fleet provisioners consult.
+/// The shared tracked-destination guard every session-asset provisioner consults.
 mod provision_guard;
 mod rag;
 mod recording;
@@ -241,6 +243,7 @@ mod security;
 mod semantic_conventions;
 mod server_mode;
 mod session; // Plan 2026-05-22-coord-native-session-coordination Phase 2 — unified Session primitive
+mod session_assets;
 mod session_pr_reconciler; // Runner-local per-session PR attribution → project.session_prs (Terminal dropdown)
                            // Hook-free, runner-side WIP-attribution capture (mirrors fleet::tree_publisher).
                            // Reads each hosted session's transcript and POSTs file-edit attribution to

@@ -860,6 +860,21 @@ fn provision_fleet_commands_into(
     commands_dir: &Path,
     registry: &AgentCommandRegistry,
 ) -> std::io::Result<ProvisionReport> {
+    // Never through a symlink: a linked `.claude` or `.claude/commands` would
+    // put every write — `create_dir_all` included — inside the link's target.
+    if let Some(why) = crate::provision_guard::redirected_asset_dir(commands_dir) {
+        info!(
+            "fleet_commands: not provisioning {} — {why}",
+            commands_dir.display()
+        );
+        return Ok(ProvisionReport::stood_down(
+            "fleet_commands",
+            registry.all().len(),
+            capability_manifest::Rung::Unresolved,
+            commands_dir.display().to_string(),
+            capability_manifest::SkipReason::Symlinked(why),
+        ));
+    }
     std::fs::create_dir_all(commands_dir)?;
     let tracked = crate::provision_guard::TrackedPaths::probe(commands_dir);
     let resolved = registry.all();
@@ -876,6 +891,10 @@ fn provision_fleet_commands_into(
     for command in &resolved {
         let file_name = command.file_name();
         let dst = commands_dir.join(&file_name);
+        if let Some(why) = crate::provision_guard::symlink_below(commands_dir, &dst) {
+            out.skip(file_name, capability_manifest::SkipReason::Symlinked(why));
+            continue;
+        }
         if tracked.should_skip(&dst, Path::new(&file_name)) {
             info!(
                 "fleet_commands: skipping {} — it is tracked by the enclosing git \
@@ -1052,6 +1071,30 @@ mod tests {
         let (_, on_disk) = strip_provenance(&on_disk).expect("provenance line");
         assert_eq!(on_disk, "# my own procedure\n");
         assert_ne!(on_disk, default_body);
+    }
+
+    /// Never through a symlink: a per-file link into a canonical checkout —
+    /// which the tracked probe of THIS repo cannot see — keeps its target
+    /// byte-identical, and every other command is still written.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_command_file_is_never_written_through() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let canonical = tmp.path().join("canonical.md");
+        std::fs::write(&canonical, b"# canonical body\n").unwrap();
+        let commands_dir = tmp.path().join(".claude").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        let (name, _) = FLEET_COMMANDS[0];
+        std::os::unix::fs::symlink(&canonical, commands_dir.join(format!("{name}.md"))).unwrap();
+
+        let out = provision_fleet_commands_into(&commands_dir, &AgentCommandRegistry::new())
+            .expect("provision");
+
+        assert_eq!(std::fs::read(&canonical).unwrap(), b"# canonical body\n");
+        assert_eq!(out.skipped.len(), 1);
+        assert_eq!(out.skipped[0].unit, format!("{name}.md"));
+        assert_eq!(out.skipped[0].reason.wire(), "symlinked");
+        assert_eq!(out.written, FLEET_COMMANDS.len() - 1);
     }
 
     /// A destination that is TRACKED by the enclosing git repository must be

@@ -845,7 +845,7 @@ pub async fn acquire_for_terminal(
         }
     };
     if let Some(wd) = &out.0 {
-        provision_session_cwd(wd, out.1.is_some(), spawn_tenant);
+        provision_session_cwd_off_runtime(wd, out.1.is_some(), spawn_tenant).await;
     }
     out
 }
@@ -936,12 +936,14 @@ pub async fn acquire_for_worker(
             format!("allocate for {repo} returned no worktree"),
         )));
     };
-    provision_session_cwd(&wd, true, spawn_tenant);
+    provision_session_cwd_off_runtime(&wd, true, spawn_tenant).await;
     Ok((wd, ctx))
 }
 
 /// Provision the per-session cwd artifacts — the coord-mcp `.mcp.json` and the
-/// fleet commands/skills — into a session's finalized working dir. Shared by
+/// session assets (subagent definitions, fleet commands, fleet skills) — into a
+/// session's finalized working dir. BLOCKING (file writes and bounded `git`
+/// probes): async callers use [`provision_session_cwd_off_runtime`]. Shared by
 /// [`acquire_for_terminal`], [`acquire_for_worker`], and the orchestration
 /// dispatch of a worker that declares no repo.
 ///
@@ -1027,9 +1029,9 @@ pub(crate) fn provision_session_cwd(
     // not "writes only when it would change something" — which is exactly
     // why the guard below is needed.
     //
-    // GUARDED, unlike the three agent-path call sites. Those target a fresh
-    // agent worktree or an agent-private home dir, where an unconditional
-    // overwrite is correct and wanted. THIS chokepoint can resolve to an
+    // GUARDED at the tree level, unlike the other spawn paths. Those target a
+    // fresh agent worktree or an agent-private home dir and rely on the
+    // per-file tracked-file guard alone. THIS chokepoint can resolve to an
     // arbitrary operator cwd — including `qontinui-claude-config`, which
     // TRACKS 124 paths under `.claude/` and is the upstream these bundled
     // bodies were copied from. Provisioning there would overwrite the
@@ -1045,11 +1047,33 @@ pub(crate) fn provision_session_cwd(
         info!(
             workdir = %wd,
             "fleet provisioning: skipped — this cwd's .claude/ is git-tracked, so the repo \
-             authors its own skills/commands and the bundle must not clobber them"
+             authors its own agents/skills/commands and the bundle must not clobber them"
         );
     } else {
-        crate::fleet_commands::provision_fleet_commands_for_session(wd);
-        crate::fleet_skills::provision_fleet_skills_for_session(wd);
+        crate::session_assets::provision_session_assets(wd);
+    }
+}
+
+/// [`provision_session_cwd`] on the blocking pool, awaited — for the async
+/// spawn paths, so its file writes and `git` probes never occupy a tokio
+/// worker. A `JoinError` (a panic on the pool) is logged and swallowed:
+/// provisioning never aborts a spawn.
+pub(crate) async fn provision_session_cwd_off_runtime(
+    wd: &str,
+    allocated_here: bool,
+    spawn_tenant: Option<uuid::Uuid>,
+) {
+    let owned = wd.to_string();
+    if let Err(e) = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+        provision_session_cwd(&owned, allocated_here, spawn_tenant)
+    })
+    .await
+    {
+        warn!(
+            workdir = %wd,
+            "provision_session_cwd: provisioning task did not complete (continuing \
+             spawn without some session cwd artifacts): {e}"
+        );
     }
 }
 

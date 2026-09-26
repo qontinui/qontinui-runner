@@ -20,8 +20,17 @@
 //!   (optionally `.inner()`) `.create(`. A manager bound to an unrelated name and
 //!   then `.create(`-ed is not seen. The type-level fix — an admission token the
 //!   spawn primitives require — is a recorded follow-up.
-//! * A block comment is recognised when `/*` opens a line; a `/*` in the middle
-//!   of a code line is not tracked.
+//! * Per-line masking ([`comment_mask`], what the call scan blanks) recognises
+//!   a block comment only when `/*` opens a line; a `/*` in the middle of a code
+//!   line leaves that line and the comment's later lines unmasked, so a call
+//!   written inside such a comment can read as a call. Finding a test module's
+//!   END is different: [`code_brace_counts`] tracks `/*` anywhere, nested, as
+//!   well as every string, raw/byte/C-string and char literal.
+//! * [`comment_mask`] is whole-line: a line that STARTS with `/*` is blanked
+//!   entirely, and so is the comment's last line even when code follows the
+//!   closing `*/`. So `/* x */ tm.create(a);` is dropped. It is also not
+//!   literal-aware, so a line inside a multi-line string that starts with `/*`
+//!   blanks every line until the next `*/`.
 //! * The scan sees a spawn PRIMITIVE, so a path that reaches `claude` by some
 //!   other construction is invisible until its shape is added to
 //!   `primitive_res`. `Command::new("claude")` was exactly that until review
@@ -85,7 +94,7 @@ struct Row {
     detail: String,
 }
 
-type Sources = BTreeMap<String, String>;
+pub(crate) type Sources = BTreeMap<String, String>;
 type Rows = BTreeMap<(String, String), Row>;
 
 fn src_root() -> PathBuf {
@@ -105,7 +114,7 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn load_sources() -> Sources {
+pub(crate) fn load_sources() -> Sources {
     let root = src_root();
     let mut files = Vec::new();
     collect_rs(&root, &mut files);
@@ -130,7 +139,7 @@ fn load_sources() -> Sources {
 /// Per line: is it a comment? `//` lines, and every line of a `/* … */` block
 /// that opens a line. A `*`-led CODE line (`*slot = tm.create(..)`) is code —
 /// only inside a block comment does a leading `*` mean a comment.
-fn comment_mask(lines: &[&str]) -> Vec<bool> {
+pub(crate) fn comment_mask(lines: &[&str]) -> Vec<bool> {
     let mut in_block = false;
     lines
         .iter()
@@ -155,8 +164,14 @@ fn comment_mask(lines: &[&str]) -> Vec<bool> {
 }
 
 /// Line spans covered by a `#[cfg(test)] mod … { … }`.
-fn test_spans(lines: &[&str]) -> Vec<(usize, usize)> {
-    let comments = comment_mask(lines);
+///
+/// The module's end is found by counting braces in CODE only
+/// ([`code_brace_counts`]): a `{` inside a string, char literal or comment does
+/// not open anything. Counting raw `{`/`}` characters left a module whose tests
+/// contain an unbalanced literal (`"{not json"`) open to end of file — no span
+/// at all, so every test call in it read as production code.
+pub(crate) fn test_spans(lines: &[&str]) -> Vec<(usize, usize)> {
+    let braces = code_brace_counts(lines);
     let mut spans = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         if !line.trim_start().starts_with("#[cfg(test)]") {
@@ -168,12 +183,9 @@ fn test_spans(lines: &[&str]) -> Vec<(usize, usize)> {
             continue;
         };
         let mut depth = 0usize;
-        for (j, l) in lines.iter().enumerate().skip(open) {
-            if comments[j] {
-                continue;
-            }
-            depth += l.matches('{').count();
-            depth = depth.saturating_sub(l.matches('}').count());
+        for (j, (opens, closes)) in braces.iter().enumerate().skip(open) {
+            depth += opens;
+            depth = depth.saturating_sub(*closes);
             if depth == 0 {
                 spans.push((open, j + 1));
                 break;
@@ -183,9 +195,122 @@ fn test_spans(lines: &[&str]) -> Vec<(usize, usize)> {
     spans
 }
 
-fn fn_decl_re() -> Regex {
-    Regex::new(r"^(\s*)(?:pub(?:\([a-z]+\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)")
-        .expect("fn decl regex")
+/// Per line, `(opening, closing)` braces that are CODE — not inside a string
+/// (`"…"`, `b"…"`, `c"…"`), raw string (`r"…"`, `r#"…"#`, `br"…"`, `cr#"…"#`),
+/// char literal (`'{'`, `'\''`, `'\u{7b}'`), line comment or (nested) block
+/// comment. Literal and comment state carries across lines. A lifetime or label
+/// (`'a`, `'static`, `'outer:`) is code.
+pub(crate) fn code_brace_counts(lines: &[&str]) -> Vec<(usize, usize)> {
+    #[derive(Clone, Copy)]
+    enum State {
+        Code,
+        Block(usize),
+        Str,
+        Raw(usize),
+    }
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut state = State::Code;
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        let chars: Vec<char> = line.chars().collect();
+        let (mut opens, mut closes) = (0usize, 0usize);
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            let next = chars.get(i + 1).copied();
+            match state {
+                State::Block(depth) => {
+                    if c == '*' && next == Some('/') {
+                        state = if depth == 1 {
+                            State::Code
+                        } else {
+                            State::Block(depth - 1)
+                        };
+                        i += 1;
+                    } else if c == '/' && next == Some('*') {
+                        state = State::Block(depth + 1);
+                        i += 1;
+                    }
+                }
+                State::Str => {
+                    if c == '\\' {
+                        i += 1;
+                    } else if c == '"' {
+                        state = State::Code;
+                    }
+                }
+                State::Raw(hashes) => {
+                    if c == '"'
+                        && chars[i + 1..]
+                            .iter()
+                            .take(hashes)
+                            .filter(|h| **h == '#')
+                            .count()
+                            == hashes
+                    {
+                        state = State::Code;
+                        i += hashes;
+                    }
+                }
+                State::Code => {
+                    // The identifier run immediately before `c`: a raw string's
+                    // `r` may carry only a `b` or `c` prefix, so `r#type`,
+                    // `cr)` or `abcr"` never open one.
+                    let run_start = (0..i)
+                        .rev()
+                        .take_while(|&j| is_ident(chars[j]))
+                        .last()
+                        .unwrap_or(i);
+                    let prefix = &chars[run_start..i];
+                    if c == '/' && next == Some('/') {
+                        break;
+                    } else if c == '/' && next == Some('*') {
+                        state = State::Block(1);
+                        i += 1;
+                    } else if c == '"' {
+                        state = State::Str;
+                    } else if c == 'r' && matches!(prefix, [] | ['b'] | ['c']) {
+                        let hashes = chars[i + 1..].iter().take_while(|h| **h == '#').count();
+                        if chars.get(i + 1 + hashes) == Some(&'"') {
+                            state = State::Raw(hashes);
+                            i += hashes + 1;
+                        }
+                    } else if c == '\'' {
+                        // A char literal is `'x'` or `'\…'`; anything else is a
+                        // lifetime or label. After `'\` the escaped char (at
+                        // `i + 2`) is never the closer — `'\''` and `'\\'` close
+                        // at `i + 3` — so the search starts past it.
+                        if next == Some('\\') {
+                            let close = chars
+                                .get(i + 3..)
+                                .and_then(|rest| rest.iter().position(|ch| *ch == '\''));
+                            i = close.map_or(chars.len(), |p| i + 3 + p);
+                        } else if chars.get(i + 2) == Some(&'\'') {
+                            i += 2;
+                        }
+                    } else if c == '{' {
+                        opens += 1;
+                    } else if c == '}' {
+                        closes += 1;
+                    }
+                }
+            }
+            i += 1;
+        }
+        out.push((opens, closes));
+    }
+    out
+}
+
+pub(crate) fn fn_decl_re() -> Regex {
+    // Visibility (`pub`, `pub(crate)`, `pub(in path)`) then any qualifiers —
+    // `const`, `async`, `unsafe`, `extern` with or without an ABI string — so a
+    // qualified fn is its own enclosing fn rather than being attributed to
+    // whatever plain `fn` precedes it.
+    Regex::new(
+        r#"^(\s*)(?:pub(?:\([^)]*\))?\s+)?(?:(?:const|async|unsafe|extern(?:\s+"[^"]*")?)\s+)*fn\s+([A-Za-z_][A-Za-z0-9_]*)"#,
+    )
+    .expect("fn decl regex")
 }
 
 /// The spawn primitives. Multi-line: a receiver on one line and `.create(` on
@@ -259,7 +384,7 @@ fn primitive_families() -> Vec<(&'static str, Vec<Regex>)> {
 
 /// A literal call token (`foo(`, `.start_inner(`) as a regex that tolerates
 /// whitespace before the paren.
-fn token_re(token: &str) -> Regex {
+pub(crate) fn token_re(token: &str) -> Regex {
     let (head, paren) = match token.strip_suffix('(') {
         Some(h) => (h, r"\s*\("),
         None => (token, ""),
@@ -273,10 +398,11 @@ fn token_re(token: &str) -> Regex {
 }
 
 /// `(file, fn)` for every production call of any pattern in `patterns`.
-#[expect(
-    clippy::string_slice,
-    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-)]
+///
+/// A match that starts at the NAME a fn-declaration line declares is that fn's
+/// own declaration (a helper row's `fn recipe(`), not a call; any other match on
+/// a declaration line — a one-line `pub(crate) async fn f() { tm.create(a) }` —
+/// is a call, attributed to the fn that line declares.
 fn scan_calls(sources: &Sources, patterns: &[Regex]) -> BTreeSet<(String, String)> {
     let decl = fn_decl_re();
     let mut out = BTreeSet::new();
@@ -303,8 +429,17 @@ fn scan_calls(sources: &Sources, patterns: &[Regex]) -> BTreeSet<(String, String
         let joined = code.join("\n");
         for re in patterns {
             for m in re.find_iter(&joined) {
-                let line = joined[..m.start()].matches('\n').count();
-                if decl.is_match(code[line]) {
+                let before = &joined.as_bytes()[..m.start()];
+                let line = before.iter().filter(|b| **b == b'\n').count();
+                let line_start = before
+                    .iter()
+                    .rposition(|b| *b == b'\n')
+                    .map_or(0, |p| p + 1);
+                let declares_match = decl
+                    .captures(code[line])
+                    .and_then(|c| c.get(2))
+                    .is_some_and(|name| line_start + name.start() == m.start());
+                if declares_match {
                     continue;
                 }
                 let enclosing = (0..=line)
@@ -331,7 +466,7 @@ fn scan_sites(sources: &Sources, rows: &Rows) -> BTreeSet<(String, String)> {
 
 /// The text of `fn name` in `src`, comment lines dropped: its declaration line
 /// to the next fn declaration at the same or a shallower indentation.
-fn fn_body(src: &str, name: &str) -> Option<String> {
+pub(crate) fn fn_body(src: &str, name: &str) -> Option<String> {
     let decl = fn_decl_re();
     let lines: Vec<&str> = src.lines().collect();
     let (start, indent) = lines.iter().enumerate().find_map(|(i, l)| {
@@ -938,4 +1073,92 @@ fn a_star_led_code_line_is_code_and_a_block_comment_is_not() {
         comment_mask(&lines),
         vec![false, false, true, true, true, true, true, false]
     );
+}
+
+/// Braces are counted in CODE only: literals and comments of every shape are
+/// skipped, lifetimes are not mistaken for char literals, and literal/comment
+/// state carries across lines.
+#[test]
+fn code_brace_counts_skip_literals_and_comments() {
+    let lines = [
+        r#"fn f<'a>(x: &'a str) -> char { let s = "{"; let b = b"}}"; '{' }"#,
+        r##"    let r = r#"{ "}" {"#; let br = br"{"; let e = '\u{7b}';"##,
+        "    /* { /* nested } */ { */ // }",
+        r#"    let multi = "line one {"#,
+        r#"    line two }"; }"#,
+        // Escaped char literals close at their REAL closing quote.
+        r#"    f('\'', '}'); g('\\', '{'); h('\n', '}');"#,
+        // Adjacent to the next literal: the old search (from `i + 2`) closed
+        // `'\''` at the ESCAPED quote, read `','` as a char literal and counted
+        // the brace — (0, 1) and (1, 0) respectively.
+        r#"    f('\'','}');"#,
+        r#"    x(b'\'','{');"#,
+        // Escaped quote inside a string; a string ending in an escaped backslash.
+        r#"    let q = "\"}"; let bs = "\\"; {"#,
+        // C strings, raw C strings and a byte char; a lifetime, `'static` and a
+        // label stay code.
+        r##"    let c = c"{"; let cr = cr"}"; let crh = cr#"a"b{"#; let bc = b'{'; }"##,
+        r#"    'outer: loop { let s: &'static str = x; let _: &'_ T = y; break 'outer; }"#,
+        // Not a raw-string prefix: `r#type` is a raw identifier, `cr)` an ident.
+        r#"    let r#type = m!(cr); {"#,
+    ];
+    assert_eq!(
+        code_brace_counts(&lines),
+        vec![
+            (1, 1),
+            (0, 0),
+            (0, 0),
+            (0, 0),
+            (0, 1),
+            (0, 0),
+            (0, 0),
+            (0, 0),
+            (1, 0),
+            (0, 1),
+            (1, 1),
+            (1, 0),
+        ]
+    );
+}
+
+/// A test module holding a `cr#"…"#` with an unbalanced quote still closes at
+/// its own `}`: the span ends there instead of running on over `fn prod`.
+#[test]
+fn a_raw_c_string_in_a_test_module_does_not_hold_it_open() {
+    let lines = [
+        "#[cfg(test)]",
+        "mod tests {",
+        r##"    fn t() { let s = cr#"a"b{"#; let e = '\''; }"##,
+        "}",
+        "fn prod() {}",
+    ];
+    assert_eq!(test_spans(&lines), vec![(1, 4)]);
+}
+
+/// A one-line qualified fn making a spawn call is a site, attributed to itself;
+/// a helper's own one-line declaration is not a call of that helper.
+#[test]
+fn a_spawn_call_on_a_one_line_qualified_fn_is_a_site() {
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        "one_line.rs".to_string(),
+        "fn plain() {}\n\
+         pub(in crate::x) async unsafe fn door(tm: &T) { let _ = tm.create(a); }\n\
+         const fn recipe() { ClaudeSession::spawn(x) }\n\
+         fn uses() { recipe(); }\n"
+            .to_string(),
+    );
+    let mut rows = BTreeMap::new();
+    rows.insert(
+        ("one_line.rs".to_string(), "recipe".to_string()),
+        Row {
+            class: "helper".into(),
+            detail: "recipe(".into(),
+        },
+    );
+    let found: Vec<_> = scan_sites(&sources, &rows)
+        .into_iter()
+        .map(|(_, f)| f)
+        .collect();
+    assert_eq!(found, vec!["door", "recipe", "uses"]);
 }

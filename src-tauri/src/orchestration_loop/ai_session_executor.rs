@@ -521,7 +521,10 @@ pub async fn dispatch_subtask(
                 .unwrap_or_else(|_| ".".to_string());
             // Still provisioned, as `acquire_for_terminal` did for this arm:
             // the cwd `.mcp.json` is how a worker reaches the coord-mcp proxy.
-            crate::agent_worktree::isolated_edit::provision_session_cwd(&cwd, false, None);
+            crate::agent_worktree::isolated_edit::provision_session_cwd_off_runtime(
+                &cwd, false, None,
+            )
+            .await;
             (cwd, None)
         }
         Some(repo) => {

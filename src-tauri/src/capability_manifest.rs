@@ -937,6 +937,18 @@ pub enum SkipReason {
     /// bucket. Nothing here is an error value: the pass continues and the spawn
     /// proceeds, the session simply lacks that skill.
     Rejected(String),
+    /// The destination resolves to (or inside) the very directory the unit
+    /// would be copied FROM — e.g. a session cwd at the workspace root, whose
+    /// `.claude` is a symlink into `qontinui-claude-config/.claude`. Writing
+    /// there would overwrite (and, for a copy onto itself, truncate) the
+    /// canonical sources, so the whole pass is skipped. The session still has
+    /// the definitions: they are the source files themselves.
+    CanonicalSource(String),
+    /// A component of the destination path at or below `<cwd>/.claude` — the
+    /// file itself, or a directory above it — is a symlink, so the write would
+    /// land somewhere other than the session cwd (possibly a canonical source a
+    /// tracked-file probe of THIS repo cannot see). Never written through.
+    Symlinked(String),
 }
 
 impl SkipReason {
@@ -948,6 +960,8 @@ impl SkipReason {
             SkipReason::WriteFailed(_) => "write_failed",
             SkipReason::Unresolved(_) => "unresolved",
             SkipReason::Rejected(_) => "rejected",
+            SkipReason::CanonicalSource(_) => "canonical_source",
+            SkipReason::Symlinked(_) => "symlinked",
         }
     }
 
@@ -961,6 +975,12 @@ impl SkipReason {
             SkipReason::WriteFailed(why) => format!("write failed: {why}"),
             SkipReason::Unresolved(why) => format!("source rung did not resolve: {why}"),
             SkipReason::Rejected(why) => format!("refused by validation: {why}"),
+            SkipReason::CanonicalSource(why) => {
+                format!("destination is the canonical source — left alone: {why}")
+            }
+            SkipReason::Symlinked(why) => {
+                format!("destination is reached through a symlink — never written through: {why}")
+            }
         }
     }
 }
@@ -1041,6 +1061,25 @@ impl ProvisionReport {
     ) -> Self {
         let mut report = ProvisionReport::new(capability, expected, Rung::Unresolved);
         report.skip(unit, SkipReason::Unresolved(why.into()));
+        report
+    }
+
+    /// A pass that STOOD DOWN before writing anything, for a deliberate reason
+    /// that covers the whole destination ([`SkipReason::CanonicalSource`],
+    /// [`SkipReason::Symlinked`]): nothing written, one skipped unit naming
+    /// `destination`.
+    #[must_use]
+    pub fn stood_down(
+        capability: &'static str,
+        expected: usize,
+        rung: Rung,
+        destination: impl Into<String>,
+        reason: SkipReason,
+    ) -> Self {
+        let destination = destination.into();
+        let mut report =
+            ProvisionReport::new(capability, expected, rung).with_destination(destination.clone());
+        report.skip(destination, reason);
         report
     }
 
@@ -1189,7 +1228,7 @@ impl SessionProvisionLedger {
 /// How many sessions' ledgers are retained. A long-lived runner spawns
 /// thousands of sessions; this store is a diagnostic, not a record, so it is
 /// bounded and drops the oldest rather than growing without limit.
-const LEDGER_CAPACITY: usize = 64;
+pub(crate) const LEDGER_CAPACITY: usize = 64;
 
 /// The process-wide store. Two indexes over the same writes: per-session
 /// ledgers (bounded, ordered) and the latest observation per capability (which
@@ -1230,29 +1269,70 @@ fn with_store<T>(f: impl FnOnce(&mut ProvisionStore) -> T) -> T {
 ///
 /// **Never fails and never panics**, because it is called from spawn paths whose
 /// contract is that provisioning cannot abort a launch. It logs the report at
-/// `info!` when the pass was complete and at `warn!` when it degraded — the same
-/// two levels the provisioners used before, now carrying counts and reasons
-/// instead of a bare sentence.
+/// `info!` when the pass was complete — or when every skip is a deliberate one
+/// ([`SkipReason::GitTracked`], [`SkipReason::CanonicalSource`],
+/// [`SkipReason::Symlinked`]), the intended
+/// outcome in a checkout cwd that would otherwise `warn!` on every spawn
+/// there — and at `warn!` when it
+/// degraded for any other reason. [`ProvisionReport::is_degraded`] itself is
+/// unchanged: the manifest still reads a tracked skip as a shortfall.
+///
+/// A workdir holds ONE report per capability — the latest pass replaces the
+/// previous one in place — so a reused workdir (a looping agent's home, the
+/// scheduler's workspace root, an operator terminal cwd) describes what its
+/// most recent spawn got rather than accumulating every spawn's rows. Recording
+/// into an existing ledger also moves it to the back of the store, so eviction
+/// drops the least recently provisioned workdir.
 pub fn record_provision(workdir: &str, report: ProvisionReport) {
-    if report.is_degraded() {
+    let only_deliberate_skips = !report.skipped.is_empty()
+        && report.skipped.iter().all(|u| {
+            matches!(
+                u.reason,
+                SkipReason::GitTracked | SkipReason::CanonicalSource(_) | SkipReason::Symlinked(_)
+            )
+        });
+    if report.is_degraded() && !only_deliberate_skips {
         tracing::warn!("provisioning degraded — {}", report.summary());
     } else {
         tracing::info!("provisioned — {}", report.summary());
     }
+    // A pass that STOOD DOWN — wrote nothing because its destination is the
+    // canonical source, or is reached through a symlink — is a fact about this
+    // SESSION's cwd, not about what the device can deliver, so it must not
+    // become the capability's device-level reading.
+    let stood_down = report.written == 0
+        && !report.skipped.is_empty()
+        && report.skipped.iter().all(|u| {
+            matches!(
+                u.reason,
+                SkipReason::CanonicalSource(_) | SkipReason::Symlinked(_)
+            )
+        });
     with_store(|s| {
-        s.latest.insert(report.capability, report.observation());
-        match s.sessions.iter_mut().find(|l| l.workdir == workdir) {
-            Some(ledger) => ledger.reports.push(report),
+        if !stood_down {
+            s.latest.insert(report.capability, report.observation());
+        }
+        let mut ledger = match s.sessions.iter().position(|l| l.workdir == workdir) {
+            Some(at) => s.sessions.remove(at).expect("position is in bounds"),
             None => {
                 if s.sessions.len() >= LEDGER_CAPACITY {
                     s.sessions.pop_front();
                 }
-                s.sessions.push_back(SessionProvisionLedger {
+                SessionProvisionLedger {
                     workdir: workdir.to_string(),
-                    reports: vec![report],
-                });
+                    reports: Vec::new(),
+                }
             }
+        };
+        match ledger
+            .reports
+            .iter_mut()
+            .find(|r| r.capability == report.capability)
+        {
+            Some(previous) => *previous = report,
+            None => ledger.reports.push(report),
         }
+        s.sessions.push_back(ledger);
     });
 }
 
@@ -1272,6 +1352,73 @@ pub fn session_provision_ledgers() -> Vec<SessionProvisionLedger> {
     with_store(|s| s.sessions.iter().cloned().collect())
 }
 
+/// The `GET /capability-manifest/sessions` body: every retained ledger (or only
+/// `workdir`'s when a filter is given), each with its capability-id set and its
+/// degraded rows, plus the store's bounds.
+///
+/// `retained` and `capacity` are always present because this store is bounded
+/// and process-local: a workdir that is not listed may have aged out, or been
+/// provisioned by another runner process, so its absence is UNKNOWN — never
+/// "that session got nothing". A filtered miss says so in `workdir_status`
+/// rather than answering with a bare empty list or a 404. PURE over its inputs.
+#[must_use]
+pub(crate) fn session_ledgers_document(
+    ledgers: &[SessionProvisionLedger],
+    workdir: Option<&str>,
+) -> serde_json::Value {
+    let sessions: Vec<serde_json::Value> = ledgers
+        .iter()
+        .filter(|l| workdir.is_none_or(|w| same_workdir(&l.workdir, w)))
+        .map(|l| {
+            serde_json::json!({
+                "workdir": l.workdir,
+                "capability_ids": l.reports.iter().map(|r| r.capability).collect::<Vec<_>>(),
+                "degraded": l.degraded().iter().map(|r| serde_json::json!({
+                    "capability": r.capability,
+                    "summary": r.summary(),
+                })).collect::<Vec<_>>(),
+                "reports": l.reports,
+            })
+        })
+        .collect();
+    let mut doc = serde_json::json!({
+        "retained": ledgers.len(),
+        "capacity": LEDGER_CAPACITY,
+        "absence": format!(
+            "unknown — this store is process-local and keeps only the {LEDGER_CAPACITY} most \
+             recently provisioned workdirs, so a workdir missing here may have aged out or \
+             been provisioned by another runner process"
+        ),
+    });
+    if let Some(w) = workdir {
+        doc["workdir"] = serde_json::Value::from(w);
+        doc["workdir_status"] = serde_json::Value::from(if sessions.is_empty() {
+            "unknown"
+        } else {
+            "retained"
+        });
+    }
+    doc["sessions"] = serde_json::Value::Array(sessions);
+    doc
+}
+
+/// Whether two workdir strings name the same directory for the purpose of a
+/// `?workdir=` filter: equal once trailing separators are stripped (a bare `/`
+/// stays `/`). Nothing else is normalised — no case folding, no symlink or `..`
+/// resolution — because the ledger is keyed by the exact string a spawn path
+/// provisioned.
+fn same_workdir(a: &str, b: &str) -> bool {
+    fn trim(p: &str) -> &str {
+        let t = p.trim_end_matches(['/', '\\']);
+        if t.is_empty() {
+            p
+        } else {
+            t
+        }
+    }
+    trim(a) == trim(b)
+}
+
 /// The most recent observation recorded for `capability`, if any.
 #[must_use]
 pub fn latest_observation(capability: &str) -> Option<CapabilityObservation> {
@@ -1284,6 +1431,17 @@ pub fn record_observation(capability: &'static str, observation: CapabilityObser
     with_store(|s| {
         s.latest.insert(capability, observation);
     });
+}
+
+/// Serializes every test that WRITES the process-wide provisioning store —
+/// directly, or through a provisioner that records into it. `cargo test` runs a
+/// binary's tests in parallel threads, so a test that resets the store, or
+/// fills it to [`LEDGER_CAPACITY`], would otherwise see another test's writes
+/// land mid-assertion — a flake, not a finding.
+#[cfg(test)]
+pub(crate) fn store_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Discard everything recorded so far. Test support only: the store is
@@ -2134,15 +2292,6 @@ mod tests {
     // The provisioning ledger (Phase 3).
     // ------------------------------------------------------------------
 
-    /// Serializes the two tests that mutate the PROCESS-WIDE provisioning
-    /// store. `cargo test` runs a binary's tests in parallel threads, so two
-    /// tests each calling `reset_provision_store` would otherwise erase each
-    /// other's writes intermittently — a flake, not a finding.
-    fn store_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
     /// **The Phase 3 gate.** A degraded provisioning pass reports its skipped
     /// units WITH reasons instead of silently succeeding.
     ///
@@ -2343,6 +2492,149 @@ mod tests {
             .as_deref()
             .is_some_and(|n| n.contains("bundled_resources::resolve_with_rung")));
 
+        reset_provision_store();
+    }
+
+    /// The served document names each session's capability ids and degraded
+    /// rows, and a filtered miss reads UNKNOWN with the store's bounds beside it
+    /// — never a bare empty answer.
+    #[test]
+    fn the_session_ledgers_document_states_its_bounds_and_filters() {
+        let mut commands = ProvisionReport::new("fleet_commands", 2, Rung::Embedded);
+        commands.record_written();
+        commands.skip("vet-plan.md", SkipReason::GitTracked);
+        let mut skills = ProvisionReport::new("fleet_skills", 1, Rung::Embedded);
+        skills.record_written();
+        let ledgers = vec![
+            SessionProvisionLedger {
+                workdir: "/wt/a".to_string(),
+                reports: vec![commands, skills],
+            },
+            SessionProvisionLedger {
+                workdir: "/wt/b".to_string(),
+                reports: vec![],
+            },
+        ];
+
+        let all = session_ledgers_document(&ledgers, None);
+        assert_eq!(all["retained"], 2);
+        assert_eq!(all["capacity"], LEDGER_CAPACITY);
+        assert!(all.get("workdir_status").is_none());
+        assert_eq!(all["sessions"].as_array().unwrap().len(), 2);
+        let a = &all["sessions"][0];
+        assert_eq!(a["workdir"], "/wt/a");
+        assert_eq!(
+            a["capability_ids"],
+            serde_json::json!(["fleet_commands", "fleet_skills"])
+        );
+        assert_eq!(a["degraded"].as_array().unwrap().len(), 1);
+        assert_eq!(a["degraded"][0]["capability"], "fleet_commands");
+        assert!(a["degraded"][0]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("vet-plan.md"));
+        assert_eq!(a["reports"][0]["skipped"][0]["reason"], "git_tracked");
+
+        let hit = session_ledgers_document(&ledgers, Some("/wt/b"));
+        assert_eq!(hit["workdir_status"], "retained");
+        assert_eq!(hit["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            hit["retained"], 2,
+            "bounds describe the store, not the filter"
+        );
+
+        let slashed = session_ledgers_document(&ledgers, Some("/wt/b/"));
+        assert_eq!(
+            slashed["workdir_status"], "retained",
+            "a trailing separator on the query must not turn a hit into UNKNOWN"
+        );
+
+        let miss = session_ledgers_document(&ledgers, Some("/wt/never"));
+        assert_eq!(miss["workdir_status"], "unknown");
+        assert_eq!(miss["workdir"], "/wt/never");
+        assert!(miss["sessions"].as_array().unwrap().is_empty());
+        assert!(miss["absence"].as_str().unwrap().starts_with("unknown"));
+    }
+
+    /// A canonical-source row (the cwd's `.claude` IS the checkout source) lands
+    /// in the session ledger but never becomes the capability's device-level
+    /// `latest` reading, which would flip the manifest row to a rung that says
+    /// nothing about what the device can deliver.
+    #[test]
+    fn a_canonical_source_row_does_not_replace_the_device_reading() {
+        let _guard = store_lock();
+        reset_provision_store();
+        let mut embedded = ProvisionReport::new("fleet_agents", 1, Rung::Embedded);
+        embedded.record_written();
+        record_provision("/tmp/ordinary-session", embedded);
+        let mut canonical = ProvisionReport::new("fleet_agents", 1, Rung::OperatorCheckout);
+        canonical.skip(
+            "/root/.claude/agents",
+            SkipReason::CanonicalSource("resolves to the source".to_string()),
+        );
+        record_provision("/root", canonical);
+
+        assert_eq!(
+            latest_observation("fleet_agents").expect("recorded").rung,
+            Rung::Embedded,
+            "the device-level reading must stay the ordinary session's"
+        );
+        let ledger = session_provision_ledger("/root").expect("the session row is kept");
+        assert_eq!(
+            ledger.reports[0].skipped[0].reason.wire(),
+            "canonical_source"
+        );
+        reset_provision_store();
+    }
+
+    /// A reused workdir keeps ONE report per capability (the latest pass), and
+    /// re-provisioning it moves its ledger to the back so eviction drops the
+    /// least recently provisioned workdir, not the first-seen one.
+    #[test]
+    fn a_reused_workdir_keeps_the_latest_pass_and_survives_eviction() {
+        let _guard = store_lock();
+        reset_provision_store();
+        let reused = "/tmp/reused-workdir";
+        let mut first = ProvisionReport::new("fleet_skills", 2, Rung::Embedded);
+        first.skip("a", SkipReason::WriteFailed("disk full".to_string()));
+        record_provision(reused, first);
+        record_provision(
+            reused,
+            ProvisionReport::new("fleet_commands", 0, Rung::Embedded),
+        );
+        for i in 0..(LEDGER_CAPACITY - 1) {
+            record_provision(
+                &format!("/tmp/filler-{i}"),
+                ProvisionReport::new("fleet_skills", 0, Rung::Embedded),
+            );
+        }
+        // Re-provision the oldest workdir: its skills row is replaced in place,
+        // and the ledger becomes the most recently used.
+        record_provision(
+            reused,
+            ProvisionReport::new("fleet_skills", 0, Rung::Embedded),
+        );
+        let ledger = session_provision_ledger(reused).expect("retained");
+        assert_eq!(
+            ledger
+                .reports
+                .iter()
+                .map(|r| r.capability)
+                .collect::<Vec<_>>(),
+            vec!["fleet_skills", "fleet_commands"],
+            "one row per capability, in first-recorded order"
+        );
+        assert!(
+            ledger.degraded().is_empty(),
+            "the stale degraded pass must have been replaced"
+        );
+        // One more workdir evicts the least recently used — filler-0, not `reused`.
+        record_provision(
+            "/tmp/one-more",
+            ProvisionReport::new("fleet_skills", 0, Rung::Embedded),
+        );
+        assert!(session_provision_ledger(reused).is_some());
+        assert!(session_provision_ledger("/tmp/filler-0").is_none());
         reset_provision_store();
     }
 
