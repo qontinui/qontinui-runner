@@ -7,6 +7,7 @@
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import {
+  changeTrackingVerdict,
   handleChangeTrackingCommand,
   type ChangeTrackerLike,
   type ChangeTrackingDeps,
@@ -486,5 +487,86 @@ describe("handleChangeTrackingCommand (runner/snake_case)", () => {
       const result = await handleChangeTrackingCommand(ct, "unknown_action", {}, deps);
       expect(result).toBeUndefined();
     });
+  });
+});
+
+// ============================================================================
+// changeTrackingVerdict — Phase 3 of plan
+// 2026-09-10-two-runner-call-sites-still-report-success-for-an-action-that-did-not-happen
+// ============================================================================
+
+describe("changeTrackingVerdict", () => {
+  const diff = { appeared: [], disappeared: [], modified: [] };
+
+  it("execute_with_diff with actionSuccess:false is an outer failure, diff kept by caller", async () => {
+    const ctResult = {
+      actionSuccess: false,
+      actionResult: { success: false, error: "Element btn not found" },
+      diff,
+    };
+    const tracker = createMockTracker({
+      executeWithDiff: vi.fn().mockResolvedValue(ctResult),
+    });
+    const result = await handleChangeTrackingCommand(
+      tracker,
+      "execute_with_diff",
+      { elementAction: { elementId: "btn", action: "click" } },
+      createMockDeps(),
+    );
+    const verdict = changeTrackingVerdict("execute_with_diff", result);
+    expect(verdict.success).toBe(false);
+    expect(verdict.error).toBe("ACTION_FAILED: Element btn not found");
+    // What the runner sends: the verdict plus the untouched result as `data`.
+    const envelope = { ...verdict, data: result };
+    expect(envelope.data).toBe(ctResult);
+    expect((envelope.data as typeof ctResult).diff).toBe(diff);
+  });
+
+  it("execute_with_diff with actionSuccess:true succeeds", () => {
+    expect(changeTrackingVerdict("execute_with_diff", { actionSuccess: true, diff })).toEqual({
+      success: true,
+    });
+  });
+
+  it("execute_with_diff with actionSuccess ABSENT is a failure", () => {
+    const v = changeTrackingVerdict("execute_with_diff", { diff });
+    expect(v.success).toBe(false);
+    expect(v.error).toMatch(/^ACTION_FAILED: /);
+  });
+
+  it("does not re-read actionResult.success — actionSuccess is the one definition", () => {
+    expect(
+      changeTrackingVerdict("execute_with_diff", {
+        actionSuccess: false,
+        actionResult: { success: true },
+      }).success,
+    ).toBe(false);
+  });
+
+  it("execute_batch_with_diff succeeds only when every op succeeded", async () => {
+    const ops = [
+      { actionSuccess: true, diff },
+      { actionSuccess: false, actionResult: { error: "disabled" }, diff },
+    ];
+    const tracker = createMockTracker({
+      executeWithDiff: vi.fn().mockResolvedValueOnce(ops[0]).mockResolvedValueOnce(ops[1]),
+    });
+    const result = await handleChangeTrackingCommand(
+      tracker,
+      "execute_batch_with_diff",
+      { operations: [{}, {}] },
+      createMockDeps(),
+    );
+    const v = changeTrackingVerdict("execute_batch_with_diff", result);
+    expect(v.success).toBe(false);
+    expect(v.error).toBe("ACTION_FAILED: 1 of 2 operations failed (first: operation 1: disabled)");
+    expect(
+      changeTrackingVerdict("execute_batch_with_diff", { results: [ops[0], ops[0]] }).success,
+    ).toBe(true);
+  });
+
+  it("other change-tracking commands keep success:true", () => {
+    expect(changeTrackingVerdict("list_bookmarks", ["a"])).toEqual({ success: true });
+    expect(changeTrackingVerdict("wait_for_change", null)).toEqual({ success: true });
   });
 });
