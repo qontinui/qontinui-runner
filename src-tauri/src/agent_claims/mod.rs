@@ -342,13 +342,10 @@ mod tests {
         let _ = tracked_count();
     }
 
-    #[test]
-    fn release_unknown_agent_is_noop() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            // No handle registered for this id — should be a silent no-op.
-            release_for_agent("00000000-0000-0000-0000-0000000000ff").await;
-        });
+    #[tokio::test]
+    async fn release_unknown_agent_is_noop() {
+        // No handle registered for this id — should be a silent no-op.
+        release_for_agent("00000000-0000-0000-0000-0000000000ff").await;
     }
 
     /// `lapsed` is the field `StolenBanner.tsx` reads to stop rendering a
