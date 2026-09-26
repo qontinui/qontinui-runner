@@ -583,7 +583,8 @@ fn credential_doors_health_with_posture(
             "canAnswer": forwarder_can_answer,
             "posture": posture.map(|p| p.as_str()),
             "transport": "POST /coord-mcp, GET /coord-mcp/claims/*, GET /coord-mcp/agent-*, \
-                          GET /coord-mcp/pr-merge/*, POST /coord-mcp/{gates,work-units}/*",
+                          GET /coord-mcp/pr-merge/*, POST /coord-mcp/{gates,work-units}/*, \
+                          POST|DELETE /coord-mcp/pr-labels",
             "reason": forwarder_reason,
             "requiresWebview": false,
             // Phase 1e (plan 2026-09-02-steering-layers-unreadable-without-a-
@@ -1458,6 +1459,17 @@ async fn health(
         // with a serving emitter used to be diagnosable only by log grep on
         // the emitting box.
         "transportRung": transport_rung_health_snapshot(),
+        // The coord session outbox drain (qontinui-runner manual-test-loop
+        // 2026-09-23): `pending` rows and the `oldestUnackedAt` among them as
+        // of the drain's last tick (`observedAt`; `pending: null` = no tick
+        // yet, UNKNOWN rather than empty), `lastAckAt` of anything coord
+        // accepted, and `lastFailure {kind, status, at}` — `kind` one of
+        // server_error / rate_limited / unauthorized / rejected / conflict /
+        // network / timeout. `retryingSessions` are on their own backoff;
+        // `quarantinedSessions` had their rows moved to the
+        // `<outbox>.quarantine.jsonl` sidecar after failing while coord served
+        // everything else. A stalled drain used to be invisible from here.
+        "sessionOutbox": crate::session::coord_sync::session_outbox_health_json(),
         // Session-message push evidence (plan
         // 2026-09-07-session-message-delivery-is-blind-and-park-collection-
         // resolves-on-a-guess, Phase 4): every tick the poller could not push
@@ -4050,6 +4062,11 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_notify_sensitive_action",
     "coord_orient",
     "coord_post_finding",
+    // The agent-facing coord:* PR-label door (plan
+    // 2026-08-27-coord-pr-label-write-path-single-door Phase 4a) — the pair an
+    // ordinary session calls instead of the retired gh-then-POST skill shape.
+    "coord_pr_label_set",
+    "coord_pr_label_unset",
     "coord_pr_status",
     "coord_predict_resource_collisions",
     "coord_recent_errors",
@@ -4443,6 +4460,185 @@ fn coord_mcp_filter_tools_list_response(
             leaked: removed,
         },
     }
+}
+
+// ===========================================================================
+// Runner-local tools on the `/coord-mcp` door (plan
+// `2026-09-23-conductor-e2e-phase1-defects`, Phase 3, P1-5).
+//
+// An orchestration worker is told to report through the MCP tool
+// `orchestration_report_subtask`, but until this no MCP server it had served
+// one: the tool existed only as the HTTP route `POST
+// /orchestration/report-subtask`, so every worker fell back to hand-rolling
+// that POST. Workers already reach THIS proxy through the `.mcp.json` their
+// worktree is provisioned with, and the proxy already rewrites `tools/list`
+// and gates `tools/call` — so it serves the tool here, answered IN-PROCESS
+// through `report_subtask_inner` and never forwarded to coord.
+//
+// AUTHORITY: none added. The call is answered only after the session's nonce
+// resolves to a principal (the same bar every forwarded call clears), and it
+// does exactly what the loopback HTTP route already lets any local caller do.
+// It is not a coord tool, so it is outside `COORD_MCP_ALLOWED_TOOLS` on
+// purpose: that list names what may be FORWARDED.
+// ===========================================================================
+
+/// The one runner-local tool this door serves.
+const RUNNER_LOCAL_REPORT_TOOL: &str = "orchestration_report_subtask";
+
+/// The `tools/list` entry for [`RUNNER_LOCAL_REPORT_TOOL`]. Its input schema is
+/// generated from `CompletionReport`, so it cannot drift from what the route
+/// accepts; the report schema's `$defs` are lifted to the top level, where its
+/// `#/$defs/...` references resolve.
+fn runner_local_report_tool_descriptor() -> serde_json::Value {
+    let mut report = crate::mcp::orchestration_report::completion_report_schema();
+    let defs = report.as_object_mut().and_then(|o| {
+        o.remove("$schema");
+        o.remove("$defs")
+    });
+    let mut input = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "run_id": {
+                "type": "string",
+                "format": "uuid",
+                "description": "The run uuid named in your brief's report contract."
+            },
+            "task_id": {
+                "type": "string",
+                "description": "Your subtask's task_id, named in your brief's report contract."
+            },
+            "completion_report": report,
+        },
+        "required": ["run_id", "task_id", "completion_report"],
+    });
+    if let Some(defs) = defs {
+        input["$defs"] = defs;
+    }
+    serde_json::json!({
+        "name": RUNNER_LOCAL_REPORT_TOOL,
+        "description": "Report a finished orchestration subtask to the runner that dispatched you: \
+            its run_id, task_id and a CompletionReport. Call it once, when the subtask is done \
+            (or blocked), before printing [TASK_COMPLETE]. A malformed report is refused with \
+            the expected schema and leaves the subtask unchanged, so correct it and call again.",
+        "inputSchema": input,
+    })
+}
+
+/// When `body` is a single (non-batch) JSON-RPC `tools/call` naming
+/// [`RUNNER_LOCAL_REPORT_TOOL`], its `id` and `arguments`. A batch containing
+/// one is NOT answered locally: it falls to the body gate, which refuses it
+/// like any tool this door does not forward.
+fn coord_mcp_runner_local_call(body: &[u8]) -> Option<(serde_json::Value, serde_json::Value)> {
+    // Cheap pre-check, as for `tools/list`: this runs on every proxied request.
+    let needle = RUNNER_LOCAL_REPORT_TOOL.as_bytes();
+    if !body.windows(needle.len()).any(|w| w == needle) {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+    if parsed.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    let params = parsed.get("params")?;
+    if params.get("name").and_then(|n| n.as_str()) != Some(RUNNER_LOCAL_REPORT_TOOL) {
+        return None;
+    }
+    let id = parsed.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    Some((id, arguments))
+}
+
+/// The MCP `tools/call` result for one text payload. A tool that ran and
+/// refused (bad arguments, a schema violation, an unknown subtask) is a
+/// RESULT with `isError: true`, per MCP, not a JSON-RPC protocol error.
+fn coord_mcp_tool_result(id: serde_json::Value, text: String, is_error: bool) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "content": [{ "type": "text", "text": text }],
+            "isError": is_error,
+        },
+    })
+}
+
+/// Answer [`RUNNER_LOCAL_REPORT_TOOL`] in-process through the same
+/// implementation as `POST /orchestration/report-subtask`.
+async fn coord_mcp_answer_runner_local_report(
+    state: &Arc<ApiState>,
+    id: serde_json::Value,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    let body: crate::mcp::orchestration_report::ReportSubtaskBody =
+        match serde_json::from_value(arguments) {
+            Ok(b) => b,
+            Err(e) => {
+                let text = serde_json::json!({
+                    "error": "invalid_arguments",
+                    "detail": e.to_string(),
+                    "retryable": true,
+                    "hint": "pass run_id (uuid), task_id and completion_report",
+                })
+                .to_string();
+                return coord_mcp_tool_result(id, text, true);
+            }
+        };
+    match crate::mcp::orchestration_report::report_subtask_inner(state, body).await {
+        Ok(resp) => {
+            let text = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string());
+            coord_mcp_tool_result(id, text, false)
+        }
+        Err((status, message)) => {
+            info!(
+                %status,
+                "coord-mcp proxy: runner-local {RUNNER_LOCAL_REPORT_TOOL} refused: {message}"
+            );
+            coord_mcp_tool_result(id, message, true)
+        }
+    }
+}
+
+/// Add the runner-local tool to a `tools/list` RESPONSE, after the allowlist
+/// filter has run. Returns the response unchanged when the request is not a
+/// `tools/list`, when the body is not JSON (an SSE frame, say), or when there
+/// is no `result.tools` array to add to — this never turns an answer into an
+/// error. Each element of a batch answer that carries `result.tools` gets the
+/// tool once.
+fn coord_mcp_append_runner_local_tools(request: &[u8], response: bytes::Bytes) -> bytes::Bytes {
+    if !coord_mcp_request_is_tools_list(request) {
+        return response;
+    }
+    let mut parsed: serde_json::Value = match serde_json::from_slice(&response) {
+        Ok(v) => v,
+        Err(_) => return response,
+    };
+    let add = |v: &mut serde_json::Value| -> bool {
+        let Some(tools) = v
+            .pointer_mut("/result/tools")
+            .and_then(|t| t.as_array_mut())
+        else {
+            return false;
+        };
+        let present = tools
+            .iter()
+            .any(|t| t.get("name").and_then(|n| n.as_str()) == Some(RUNNER_LOCAL_REPORT_TOOL));
+        if !present {
+            tools.push(runner_local_report_tool_descriptor());
+        }
+        !present
+    };
+    let changed = match &mut parsed {
+        serde_json::Value::Array(elems) => elems.iter_mut().fold(false, |c, e| add(e) | c),
+        other => add(other),
+    };
+    if !changed {
+        return response;
+    }
+    serde_json::to_vec(&parsed)
+        .map(bytes::Bytes::from)
+        .unwrap_or(response)
 }
 
 /// A gate rejection: the JSON-RPC `id` to echo (Null when unparseable) plus a
@@ -5496,6 +5692,76 @@ fn maybe_spool_finding(
     )
 }
 
+/// How the `/coord-mcp` 401/403 retry arm ended.
+///
+/// Plan: `2026-09-14-credential-posture-second-residuals` Phase 3 (b), review
+/// round 1. The two outcomes whose forwarded response is the RETRY's carry the
+/// tenant the re-selection named, inside the variant. It used to be a
+/// separately assigned `Option`, and deleting that one assignment still
+/// compiled and passed every test while filing a pinned session's
+/// `retried-recovered` 2xx under the default bucket. Now building either
+/// variant without its tenant does not compile, and
+/// [`coord_mcp_verdict_tenant`] can read a re-selected tenant only from an
+/// outcome that says the retry was sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpstreamRetry {
+    /// Retry sent with the re-selected bearer; coord answered 2xx.
+    Recovered { tenant: Option<uuid::Uuid> },
+    /// Retry sent with the re-selected bearer; coord still refused it.
+    StillRejected { tenant: Option<uuid::Uuid> },
+    /// A fresher bearer was selected but the retry did not complete, so
+    /// attempt 1's response is forwarded.
+    TransportFailed,
+    /// The re-selection returned the same bearer (or none); nothing re-sent.
+    NoFresherBearer,
+    /// The re-selection itself refused; attempt 1's response is forwarded.
+    ReselectionRefused,
+}
+
+impl UpstreamRetry {
+    /// The label logged in the upstream-rejected row and recorded as `retry` in
+    /// the forwarded error envelope. Derived from the variant, so the label and
+    /// the tenant it implies cannot drift apart.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Recovered { .. } => "retried-recovered",
+            Self::StillRejected { .. } => "retried-still-rejected",
+            Self::TransportFailed => "retry-transport-failed",
+            Self::NoFresherBearer => "no-fresher-bearer",
+            Self::ReselectionRefused => "reselection-refused",
+        }
+    }
+}
+
+/// The tenant whose credential bucket the `/coord-mcp` proxy files coord's
+/// verdict under, once the 401/403 retry arm has run.
+///
+/// Plan: `2026-09-14-credential-posture-second-residuals` Phase 3 (b). The
+/// verdict recorded is the FINAL response's, so it belongs to the credential
+/// that produced that response. When the retry was actually sent and answered
+/// (`Recovered`, `StillRejected`) that is the RE-SELECTION's tenant, carried in
+/// the variant, which can differ from the first selection's — the machine pin
+/// is read per request. Every other outcome forwards attempt 1's response, so
+/// the first selection's tenant stands. Filing a re-selection's 2xx under the
+/// first tenant used to reset a streak coord never retired. The match is
+/// exhaustive on purpose: a new outcome must decide which tenant it files under.
+fn coord_mcp_verdict_tenant(
+    first_selection: Option<uuid::Uuid>,
+    upstream_retry: Option<UpstreamRetry>,
+) -> Option<uuid::Uuid> {
+    match upstream_retry {
+        Some(UpstreamRetry::Recovered { tenant } | UpstreamRetry::StillRejected { tenant }) => {
+            tenant
+        }
+        Some(
+            UpstreamRetry::TransportFailed
+            | UpstreamRetry::NoFresherBearer
+            | UpstreamRetry::ReselectionRefused,
+        )
+        | None => first_selection,
+    }
+}
+
 async fn coord_mcp_proxy_handler(
     axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
     headers: axum::http::HeaderMap,
@@ -5587,6 +5853,18 @@ async fn coord_mcp_proxy_handler(
         }
     };
 
+    // The runner-local tool is answered HERE: after the nonce has resolved to
+    // a principal, before the forwarding allowlist (it is not a coord tool and
+    // is never forwarded) and before any bearer I/O, so the CALL needs no coord
+    // credential. Its DISCOVERY still does: `initialize` and `tools/list` are
+    // forwarded, and a runner whose coord credential is dark answers those
+    // with an error before the tool is appended. A worker in that state is
+    // told the HTTP route in its brief (`build_report_instruction`).
+    if let Some((id, arguments)) = coord_mcp_runner_local_call(&body) {
+        let answer = coord_mcp_answer_runner_local_report(&state, id, arguments).await;
+        return (axum::http::StatusCode::OK, Json(answer)).into_response();
+    }
+
     // Credential-hygiene Task 4: allowlist the JSON-RPC method + tool BEFORE
     // any token I/O — a nonce authenticates a *session*, not an operator, so a
     // request outside the enumerated coordination surface is never forwarded
@@ -5657,17 +5935,12 @@ async fn coord_mcp_proxy_handler(
             let (session_tenant, initial_tok) =
                 match crate::coord_mcp::session_bearer_and_tenant_or_refuse(nonce.clone()).await {
                     Ok(pair) => pair,
-                    Err((status, msg)) => {
-                        warn!("coord-mcp proxy: {msg}");
+                    Err(refusal) => {
+                        warn!("coord-mcp proxy: {}", refusal.message);
                         return (
-                            axum::http::StatusCode::from_u16(status)
+                            axum::http::StatusCode::from_u16(refusal.status)
                                 .unwrap_or(axum::http::StatusCode::SERVICE_UNAVAILABLE),
-                            Json(serde_json::json!({
-                                "success": false,
-                                "error": msg,
-                                "code": "COORD_MCP_PROXY_TENANT_UNRESOLVABLE",
-                                "retryable": false,
-                            })),
+                            Json(refusal.json_body()),
                         )
                             .into_response();
                     }
@@ -6128,7 +6401,7 @@ async fn coord_mcp_proxy_handler(
     //    Re-sending the same dead token would double every request on a box
     //    whose credential is genuinely gone — the load amplification a retry
     //    loop is famous for — and would also double coord's own 401 accounting.
-    let mut upstream_retry: Option<&'static str> = None;
+    let mut upstream_retry: Option<UpstreamRetry> = None;
     // The bearer that produced the response we end up forwarding: the drift
     // finding below must ride THAT one, not a first bearer coord rejected.
     let mut effective_bearer = bearer.clone();
@@ -6147,13 +6420,17 @@ async fn coord_mcp_proxy_handler(
         // own answer from attempt 1 and returning it is strictly better than
         // replacing it with a second, less informative error.
         match crate::coord_mcp::session_bearer_and_tenant_or_refuse(nonce.clone()).await {
-            Ok((_tenant, Some(fresh))) if !fresh.trim().is_empty() && fresh != bearer => {
+            // `tenant` is the re-selection's: it names the credential the retry
+            // sends. It travels INSIDE the outcome that says the retry was sent,
+            // which is where `coord_mcp_verdict_tenant` reads it — there is no
+            // separate assignment left to forget.
+            Ok((tenant, Some(fresh))) if !fresh.trim().is_empty() && fresh != bearer => {
                 match build_forward(&fresh).send().await {
                     Ok(resp) => {
                         upstream_retry = Some(if resp.status().is_success() {
-                            "retried-recovered"
+                            UpstreamRetry::Recovered { tenant }
                         } else {
-                            "retried-still-rejected"
+                            UpstreamRetry::StillRejected { tenant }
                         });
                         info!(
                             first_status = upstream.status().as_u16(),
@@ -6172,23 +6449,28 @@ async fn coord_mcp_proxy_handler(
                             "coord-mcp proxy: retry after upstream {} did not complete: {e}",
                             upstream.status().as_u16()
                         );
-                        upstream_retry = Some("retry-transport-failed");
+                        upstream_retry = Some(UpstreamRetry::TransportFailed);
                     }
                 }
             }
             // Same bearer back means the refresher has not produced a new one
             // yet. Saying so is the honest answer; re-sending it is not.
             Ok(_) => {
-                upstream_retry = Some("no-fresher-bearer");
+                upstream_retry = Some(UpstreamRetry::NoFresherBearer);
             }
-            Err((status, msg)) => {
+            Err(refusal) => {
                 warn!(
-                    reselect_status = status,
-                    "coord-mcp proxy: re-selection after upstream 401/403 refused: {msg}"
+                    reselect_status = refusal.status,
+                    reselect_code = refusal.code,
+                    "coord-mcp proxy: re-selection after upstream 401/403 refused: {}",
+                    refusal.message
                 );
-                upstream_retry = Some("reselection-refused");
+                upstream_retry = Some(UpstreamRetry::ReselectionRefused);
             }
         }
+        // Phase 3 (b): the verdict below rides the response we forward, so it
+        // is filed under the tenant whose credential produced that response.
+        device_tenant = coord_mcp_verdict_tenant(device_tenant, upstream_retry);
 
         // 3c: attribute the upstream rejection to a workdir. The nonce is LIVE
         // here by construction (it passed the gate above), so this row carries
@@ -6200,7 +6482,7 @@ async fn coord_mcp_proxy_handler(
                 upstream.status().as_u16(),
                 format!(
                     "coord rejected the injected device bearer (retry: {})",
-                    upstream_retry.unwrap_or("not-attempted"),
+                    upstream_retry.map_or("not-attempted", UpstreamRetry::label),
                 ),
             );
         }
@@ -6473,7 +6755,9 @@ async fn coord_mcp_proxy_handler(
                         // means the principal was an AGENT, whose credential
                         // this proxy does not manage.
                         "retry",
-                        serde_json::Value::from(upstream_retry.unwrap_or("not-attempted")),
+                        serde_json::Value::from(
+                            upstream_retry.map_or("not-attempted", UpstreamRetry::label),
+                        ),
                     ),
                 ],
             )),
@@ -6487,16 +6771,14 @@ async fn coord_mcp_proxy_handler(
     // [`coord_mcp_filter_tools_list_response`]. Only the `Filtered` outcome
     // rewrites anything; the other three forward the upstream bytes untouched,
     // and they are kept distinct because one of them is a failure to check.
-    let out_body = match coord_mcp_filter_tools_list_response(&body, &bytes) {
-        CoordMcpToolsListFilter::NotApplicable | CoordMcpToolsListFilter::NoToolsArray => {
-            axum::body::Body::from(bytes)
-        }
+    let out_bytes: bytes::Bytes = match coord_mcp_filter_tools_list_response(&body, &bytes) {
+        CoordMcpToolsListFilter::NotApplicable | CoordMcpToolsListFilter::NoToolsArray => bytes,
         CoordMcpToolsListFilter::Unchanged => {
             // A `tools/list` that withheld nothing is an OBSERVED-CLEAN
             // answer, and recording it is what lets `/health`'s
             // `coordMcpDrift` distinguish "clean" from "never looked".
             record_observed_coord_mcp_drift(&[]);
-            axum::body::Body::from(bytes)
+            bytes
         }
         CoordMcpToolsListFilter::Filtered {
             body: filtered,
@@ -6560,7 +6842,7 @@ async fn coord_mcp_proxy_handler(
                     set,
                 ));
             }
-            axum::body::Body::from(filtered)
+            bytes::Bytes::from(filtered)
         }
         CoordMcpToolsListFilter::Uninspectable { reason, leaked } => {
             // The upstream bytes still go out — this filter never turns a
@@ -6572,9 +6854,12 @@ async fn coord_mcp_proxy_handler(
                 "coord-mcp proxy: could not filter a tools/list response — it is forwarded \
                  unfiltered and may advertise tools this door will refuse"
             );
-            axum::body::Body::from(bytes)
+            bytes
         }
     };
+    // ...then add the runner-local tools this door answers itself, so the list
+    // advertises exactly what it will serve (see `RUNNER_LOCAL_REPORT_TOOL`).
+    let out_body = axum::body::Body::from(coord_mcp_append_runner_local_tools(&body, out_bytes));
 
     let mut builder = axum::http::Response::builder().status(status_code);
     for (name, value) in upstream_headers.iter() {
@@ -6880,17 +7165,12 @@ async fn nonce_gated_coord_get(
     let (session_tenant, bearer) =
         match crate::coord_mcp::session_bearer_and_tenant_or_refuse(nonce.clone()).await {
             Ok(pair) => pair,
-            Err((status, msg)) => {
-                warn!("{door}: {msg}");
+            Err(refusal) => {
+                warn!("{door}: {}", refusal.message);
                 return (
-                    axum::http::StatusCode::from_u16(status)
+                    axum::http::StatusCode::from_u16(refusal.status)
                         .unwrap_or(axum::http::StatusCode::SERVICE_UNAVAILABLE),
-                    Json(serde_json::json!({
-                        "success": false,
-                        "error": msg,
-                        "code": "COORD_MCP_PROXY_TENANT_UNRESOLVABLE",
-                        "retryable": false,
-                    })),
+                    Json(refusal.json_body()),
                 )
                     .into_response();
             }
@@ -7582,6 +7862,27 @@ enum CoordWriteTarget {
     /// `POST {coord}/coord/work-units/{slug}/deps` (replace-set dependency
     /// edge write)
     WorkUnitSetDeps { slug: String },
+    /// `POST {coord}/coord/pr-labels` — declare coord:* labels on a PR through
+    /// coord's ONE label door (plan
+    /// 2026-08-27-coord-pr-label-write-path-single-door Phase 4a). GitHub is
+    /// written first by coord, then the row; repo + pr_number travel in the
+    /// JSON body, no dynamic path segment.
+    PrLabelsDeclare,
+    /// `DELETE {coord}/coord/pr-labels` — retract one coord:* label from both
+    /// stores. The only non-POST write this forwarder carries; see
+    /// [`CoordWriteTarget::method`].
+    PrLabelsRetract,
+}
+
+impl CoordWriteTarget {
+    /// The upstream HTTP method. Every write was a POST until the label door's
+    /// retract verb, which is a DELETE with a JSON body on coord.
+    fn method(&self) -> reqwest::Method {
+        match self {
+            CoordWriteTarget::PrLabelsRetract => reqwest::Method::DELETE,
+            _ => reqwest::Method::POST,
+        }
+    }
 }
 
 /// A coord **work-unit** slug stem: lowercase alphanumeric + hyphens, must start
@@ -7636,7 +7937,10 @@ impl CoordWriteTarget {
     /// rejected before any coord URL is built — a bad path can never be smuggled).
     fn validate(&self) -> Result<(), (u16, &'static str, String)> {
         match self {
-            CoordWriteTarget::RegisterGate | CoordWriteTarget::WorkUnitUpsert => Ok(()),
+            CoordWriteTarget::RegisterGate
+            | CoordWriteTarget::WorkUnitUpsert
+            | CoordWriteTarget::PrLabelsDeclare
+            | CoordWriteTarget::PrLabelsRetract => Ok(()),
             CoordWriteTarget::WorkUnitTransition { slug }
             | CoordWriteTarget::WorkUnitRegisterGate { slug }
             | CoordWriteTarget::WorkUnitSetDeps { slug } => {
@@ -7693,6 +7997,9 @@ fn write_upstream_url(base: &str, target: &CoordWriteTarget) -> String {
         CoordWriteTarget::WorkUnitSetDeps { slug } => {
             format!("{base}/coord/work-units/{slug}/deps")
         }
+        CoordWriteTarget::PrLabelsDeclare | CoordWriteTarget::PrLabelsRetract => {
+            format!("{base}/coord/pr-labels")
+        }
     }
 }
 
@@ -7716,6 +8023,14 @@ impl CoordWriteTarget {
             CoordWriteTarget::WorkUnitUpsert
             | CoordWriteTarget::WorkUnitTransition { .. }
             | CoordWriteTarget::WorkUnitSetDeps { .. } => false,
+            // The label door derives its audit actor from the VERIFIED
+            // PRINCIPAL — `actor_from_auth` (the agent id for an agent token,
+            // else the device id) — and reads no caller-session header at all.
+            // Checked against the door's own implementation in
+            // qontinui-coord#2282 (and #1887, which it supersedes): zero
+            // occurrences of the header in either diff. So the forward must
+            // NOT carry it.
+            CoordWriteTarget::PrLabelsDeclare | CoordWriteTarget::PrLabelsRetract => false,
         }
     }
 }
@@ -7814,17 +8129,12 @@ async fn coord_write_proxy_handler(
     let (session_tenant, bearer) =
         match crate::coord_mcp::session_bearer_and_tenant_or_refuse(nonce.clone()).await {
             Ok(pair) => pair,
-            Err((status, msg)) => {
-                warn!("coord-mcp write proxy: {msg}");
+            Err(refusal) => {
+                warn!("coord-mcp write proxy: {}", refusal.message);
                 return (
-                    axum::http::StatusCode::from_u16(status)
+                    axum::http::StatusCode::from_u16(refusal.status)
                         .unwrap_or(axum::http::StatusCode::SERVICE_UNAVAILABLE),
-                    Json(serde_json::json!({
-                        "success": false,
-                        "error": msg,
-                        "code": "COORD_MCP_PROXY_TENANT_UNRESOLVABLE",
-                        "retryable": false,
-                    })),
+                    Json(refusal.json_body()),
                 )
                     .into_response();
             }
@@ -7905,7 +8215,8 @@ async fn coord_write_proxy_handler(
 
     let (coord_base, coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
     let url = write_upstream_url(&coord_base, &target);
-    forward_coord_write_post(
+    forward_coord_write(
+        target.method(),
         &url,
         &bearer,
         body,
@@ -8090,6 +8401,35 @@ async fn forward_coord_write_post(
     tenant: Option<uuid::Uuid>,
     caller_session: Option<uuid::Uuid>,
 ) -> axum::response::Response {
+    forward_coord_write(
+        reqwest::Method::POST,
+        url,
+        bearer,
+        body,
+        coord_base_source,
+        spool,
+        tenant,
+        caller_session,
+    )
+    .await
+}
+
+/// Method-generic core of [`forward_coord_write_post`]: the label door's
+/// retract verb is a DELETE with a JSON body, every other write is a POST. Same
+/// client, same timeouts, same verbatim relay of coord's status/headers/body.
+async fn forward_coord_write(
+    method: reqwest::Method,
+    url: &str,
+    bearer: &str,
+    body: axum::body::Bytes,
+    coord_base_source: qontinui_runner_lib::profiles::CoordBaseSource,
+    spool: Option<&GateSpoolPlan>,
+    // The tenant whose device slot supplied `bearer` (M2). Every target on
+    // this forwarder is a real coord WRITE behind a real guard, so there is no
+    // `upstream_authenticates` question here — the answer is always yes.
+    tenant: Option<uuid::Uuid>,
+    caller_session: Option<uuid::Uuid>,
+) -> axum::response::Response {
     use axum::response::IntoResponse;
 
     use crate::util::egress_context as egress;
@@ -8109,14 +8449,29 @@ async fn forward_coord_write_post(
             .expect("coord write proxy reqwest client")
     });
 
+    // Verb-shaped on purpose — NOT `client.request(method, url)`:
+    // tests/coord_auth_pin.rs finds coord writes by builder verb (`.post(` /
+    // `.delete(`), so a `.request(`-built write is invisible to that coverage
+    // readout. Two annotated sites, one executes.
+    // `.bearer_auth(` stays ON THE VERB LINE in both arms, not hoisted to the
+    // shared builder below: `tests/coord_auth_pin.rs` only scores a `.post(` /
+    // `.delete(` as a reqwest write when a builder token sits in its window,
+    // and the egress guard between the branch and the builder pushes the
+    // nearest one out of reach — which reads as an UNANNOTATED coord write.
+    let request = if method == reqwest::Method::DELETE {
+        // coord-auth-exempt(forwarder): write-forwarder hop, DELETE arm (the
+        // label door's retract verb) — `bearer` is the caller-resolved
+        // credential passed in by the handler, not this device's.
+        client.delete(url).bearer_auth(bearer)
+    } else {
+        // coord-auth-exempt(forwarder): write-forwarder hop, POST arm — `bearer`
+        // is the caller-resolved credential passed in by the handler, not this
+        // device's.
+        client.post(url).bearer_auth(bearer)
+    };
     let upstream = {
         let _in_flight = egress::in_flight(EG);
-        // coord-auth-exempt(forwarder): write-forwarder hop — `bearer` is the
-        // caller-resolved credential passed in by the handler, not this device's.
-        let mut req = client
-            .post(url)
-            .bearer_auth(bearer)
-            .header(axum::http::header::CONTENT_TYPE, "application/json");
+        let mut req = request.header(axum::http::header::CONTENT_TYPE, "application/json");
         // The RUNNER-resolved caller session only. The client's own copy of
         // the header never reaches here: this leg builds its headers from
         // scratch rather than passing the request's through.
@@ -8311,6 +8666,22 @@ async fn coord_work_unit_register_gate_handler(
     .await
 }
 
+/// `POST /coord-mcp/pr-labels` — see [`coord_write_proxy_handler`].
+async fn coord_pr_labels_declare_handler(
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    coord_write_proxy_handler(CoordWriteTarget::PrLabelsDeclare, headers, body).await
+}
+
+/// `DELETE /coord-mcp/pr-labels` — see [`coord_write_proxy_handler`].
+async fn coord_pr_labels_retract_handler(
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    coord_write_proxy_handler(CoordWriteTarget::PrLabelsRetract, headers, body).await
+}
+
 /// `POST /coord-mcp/work-units/{slug}/deps` — see [`coord_write_proxy_handler`].
 async fn coord_work_unit_set_deps_handler(
     axum::extract::Path(slug): axum::extract::Path<String>,
@@ -8358,6 +8729,15 @@ struct ProvisionSessionBody {
     /// serves THAT tenant's credential per request or refuses; it never falls
     /// back to another slot. Absent (`None`) keeps the machine pin, which is
     /// what every caller before this field got.
+    ///
+    /// **The P1 kill switch covers this field.** With
+    /// `QONTINUI_SPAWN_TENANT_CREDENTIAL=0` in the runner's environment the
+    /// handler runs `tenant` through
+    /// [`crate::coord_mcp::credential_spawn_tenant`] first, which answers `None`
+    /// — so a named tenant is neither admitted nor pinned and the caller gets
+    /// exactly the tenant-less document. That is the point of the switch: one
+    /// lever reverses "a chosen tenant reaches the credential" on every door,
+    /// rather than on the spawn paths while this one quietly keeps pinning.
     #[serde(default)]
     tenant: Option<uuid::Uuid>,
 }
@@ -8568,13 +8948,25 @@ fn provision_session_after_gate(body: &[u8]) -> axum::response::Response {
         );
     }
 
+    // The P1 kill switch covers THIS door too (plan
+    // `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`).
+    // `QONTINUI_SPAWN_TENANT_CREDENTIAL=0` reverses "a chosen tenant reaches the
+    // credential"; without this call it reversed the spawn paths only, so a
+    // launcher POSTing `{"cwd":…, "tenant":"<B>"}` here still got a nonce frozen
+    // to `Pinned(B)` while `credential_spawn_tenant` logged that the switch had
+    // taken effect. A reversal lever that reports success and works partially is
+    // worse than an absent one, because the operator stops looking. `None` from
+    // here is exactly a tenant-less request: no admission, no pin, the machine's
+    // pin — the same document a caller that named nothing gets.
+    let requested = crate::coord_mcp::credential_spawn_tenant(req.tenant);
+
     // A caller-named tenant is admitted BEFORE anything is minted (plan
     // `2026-09-17-findings-carry-a-triage-stamp-and-the-steward-reads-since-last-run`
     // Design decision 8): the same typed admission the spawn picker's
     // `--tenant` passes through. A refusal names the tenant and the heal and
     // mints NOTHING — never a nonce on the machine's default slot, which would
     // hand the caller a session that writes into a tenant it did not name.
-    if let Some(tenant) = req.tenant {
+    if let Some(tenant) = requested {
         use crate::coord_mcp::SpawnTenantRefusal;
         if let Err(refusal) = crate::coord_mcp::validate_spawn_tenant(tenant) {
             let (status, code) = match &refusal {
@@ -8631,11 +9023,11 @@ fn provision_session_after_gate(body: &[u8]) -> axum::response::Response {
     }
 
     // The shared mint core (§2) — fail-closed on an unresolvable bound port.
-    match crate::coord_mcp::provision_session_proxy_config(cwd, req.tenant) {
+    match crate::coord_mcp::provision_session_proxy_config(cwd, requested) {
         Some(config) => {
             info!(
                 cwd = %cwd,
-                tenant = ?req.tenant,
+                tenant = ?requested,
                 "coord-mcp provision-session: minted an ephemeral device session config"
             );
             (axum::http::StatusCode::OK, Json(config)).into_response()
@@ -8846,17 +9238,12 @@ async fn vcs_create_pull_request_handler(
             let (session_tenant, initial_tok) =
                 match crate::coord_mcp::session_bearer_and_tenant_or_refuse(nonce.clone()).await {
                     Ok(pair) => pair,
-                    Err((status, msg)) => {
-                        warn!("vcs pr proxy: {msg}");
+                    Err(refusal) => {
+                        warn!("vcs pr proxy: {}", refusal.message);
                         return (
-                            axum::http::StatusCode::from_u16(status)
+                            axum::http::StatusCode::from_u16(refusal.status)
                                 .unwrap_or(axum::http::StatusCode::SERVICE_UNAVAILABLE),
-                            Json(serde_json::json!({
-                                "success": false,
-                                "error": msg,
-                                "code": "COORD_MCP_PROXY_TENANT_UNRESOLVABLE",
-                                "retryable": false,
-                            })),
+                            Json(refusal.json_body()),
                         )
                             .into_response();
                     }
@@ -11005,6 +11392,15 @@ pub fn create_router(
             "/coord-mcp/work-units/{slug}/deps",
             get(coord_work_unit_deps_get_handler).post(coord_work_unit_set_deps_handler),
         )
+        // The agent-facing coord:* PR-label door (plan
+        // 2026-08-27-coord-pr-label-write-path-single-door Phase 4a): coord's
+        // device/agent-JWT authed `POST|DELETE /coord/pr-labels`, reached here
+        // with the session's proxy nonce so a shell client needs no credential
+        // of its own. Same enumerated-target posture as the writes above.
+        .route(
+            "/coord-mcp/pr-labels",
+            post(coord_pr_labels_declare_handler).delete(coord_pr_labels_retract_handler),
+        )
         // Nonce-gated PR-creation forwarder (plan
         // qontinui-pr-credential-provisioning, Phase 2b). Same gate + live
         // per-principal JWT injection (device OR agent) as the coord-mcp
@@ -12436,6 +12832,7 @@ mod self_id_chain_tests {
             wind_down_at: None,
             finish_reason: None,
             finish_synced: false,
+            spawn_device_default: None,
         }
     }
 
@@ -14130,9 +14527,11 @@ mod memory_search_enrichment_tests {
 #[cfg(test)]
 mod coord_mcp_body_gate_tests {
     use super::{
-        coord_mcp_body_gate, coord_mcp_filter_tools_list_response, coord_mcp_tool_is_allowed,
-        coord_mcp_withholding_is_deliberate, CoordMcpToolsListFilter, COORD_MCP_ALLOWED_METHODS,
-        COORD_MCP_ALLOWED_TOOLS, COORD_MCP_DELIBERATE_EXCLUSIONS,
+        coord_mcp_append_runner_local_tools, coord_mcp_body_gate,
+        coord_mcp_filter_tools_list_response, coord_mcp_runner_local_call,
+        coord_mcp_tool_is_allowed, coord_mcp_withholding_is_deliberate, CoordMcpToolsListFilter,
+        COORD_MCP_ALLOWED_METHODS, COORD_MCP_ALLOWED_TOOLS, COORD_MCP_DELIBERATE_EXCLUSIONS,
+        RUNNER_LOCAL_REPORT_TOOL,
     };
 
     fn gate(v: serde_json::Value) -> Result<(), (serde_json::Value, String)> {
@@ -14282,6 +14681,75 @@ mod coord_mcp_body_gate_tests {
     }
 
     const TOOLS_LIST_REQ: &str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+
+    // --- runner-local `orchestration_report_subtask` (conductor Phase 3) ----
+
+    /// A `tools/list` answer gains the runner-local report tool exactly once,
+    /// with an input schema whose `$defs` references resolve at its top level;
+    /// anything that is not a `tools/list` answer passes through untouched.
+    #[test]
+    fn tools_list_advertises_the_runner_local_report_tool_once() {
+        let upstream = bytes::Bytes::from(tools_list_response(&["coord_inbox"]));
+        let out = coord_mcp_append_runner_local_tools(TOOLS_LIST_REQ.as_bytes(), upstream);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let tools = v["result"]["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["coord_inbox", RUNNER_LOCAL_REPORT_TOOL]);
+
+        let schema = &tools[1]["inputSchema"];
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["run_id", "task_id", "completion_report"])
+        );
+        let text = schema.to_string();
+        assert!(text.contains("followUps") && text.contains("blockingForDependents"));
+        for r in text.split("\"#/$defs/").skip(1) {
+            let name = r.split('"').next().unwrap_or_default();
+            assert!(
+                schema["$defs"].get(name).is_some(),
+                "reference to {name} must resolve at the input schema's top level"
+            );
+        }
+
+        // Idempotent: a list that already carries it is not given a second.
+        let again = coord_mcp_append_runner_local_tools(TOOLS_LIST_REQ.as_bytes(), out.clone());
+        assert_eq!(again, out);
+
+        // Not a tools/list request, or not JSON: untouched.
+        let call =
+            br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"coord_inbox"}}"#;
+        let resp = bytes::Bytes::from(tools_list_response(&["coord_inbox"]));
+        assert_eq!(
+            coord_mcp_append_runner_local_tools(call, resp.clone()),
+            resp
+        );
+        let sse = bytes::Bytes::from_static(b"event: message\ndata: {}\n\n");
+        assert_eq!(
+            coord_mcp_append_runner_local_tools(TOOLS_LIST_REQ.as_bytes(), sse.clone()),
+            sse
+        );
+    }
+
+    /// Only a single `tools/call` naming the runner-local tool is answered
+    /// in-process; every other request goes on to the gate and upstream.
+    #[test]
+    fn only_a_single_call_of_the_local_tool_is_answered_in_process() {
+        let call = br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"orchestration_report_subtask","arguments":{"task_id":"T1"}}}"#;
+        let (id, args) = coord_mcp_runner_local_call(call).expect("answered locally");
+        assert_eq!(id, serde_json::json!(7));
+        assert_eq!(args, serde_json::json!({"task_id": "T1"}));
+
+        let other = br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"coord_inbox","arguments":{"note":"orchestration_report_subtask"}}}"#;
+        assert!(coord_mcp_runner_local_call(other).is_none());
+        let batch = br#"[{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"orchestration_report_subtask"}}]"#;
+        assert!(
+            coord_mcp_runner_local_call(batch).is_none(),
+            "a batch falls to the gate"
+        );
+        assert!(coord_mcp_runner_local_call(TOOLS_LIST_REQ.as_bytes()).is_none());
+        // The forwarding allowlist is untouched: the tool is served, never forwarded.
+        assert!(!coord_mcp_tool_is_allowed(RUNNER_LOCAL_REPORT_TOOL));
+    }
 
     /// Names surviving the filter, plus the names it reported removing.
     /// `None` for any outcome that did not rewrite the body.
@@ -15605,6 +16073,10 @@ mod coord_claims_proxy_tests {
     /// technique `ui_error`'s writer guard uses. It fails against a
     /// `coord_mcp_proxy_handler` that does not make the call.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn the_coord_mcp_proxy_reports_its_upstream_verdict_to_the_posture() {
         // From CARGO_MANIFEST_DIR, never the CWD: a test binary can be run
         // from anywhere.
@@ -15631,6 +16103,100 @@ mod coord_claims_proxy_tests {
              comes from that agent's own slot and says nothing about this \
              runner's credential"
         );
+        // Phase 3 (b) wiring. Comment lines are dropped first, so a needle left
+        // behind in a comment cannot satisfy the assertion.
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("device_tenant = coord_mcp_verdict_tenant("),
+            "after the 401/403 retry arm the verdict tenant must be re-decided \
+             from the retry outcome, or a re-selection's response is filed under \
+             the first selection's tenant"
+        );
+        // Review round 1: the sent outcomes are built from the re-selection's
+        // own binding, not a hardcoded `tenant: None`.
+        for sent in [
+            "UpstreamRetry::Recovered { tenant }",
+            "UpstreamRetry::StillRejected { tenant }",
+        ] {
+            assert!(
+                code.contains(sent),
+                "the retry arm must carry the re-selected tenant into `{sent}`"
+            );
+        }
+    }
+
+    /// **Phase 3 (b)** of `2026-09-14-credential-posture-second-residuals`.
+    /// The 401/403 retry re-selects the bearer through the same door as
+    /// attempt 1, and the machine pin is read per request, so the re-selection
+    /// can name a DIFFERENT tenant. The forwarded response is then the retry's,
+    /// and its verdict must be filed under the re-selected tenant B, leaving
+    /// the first selection's tenant A untouched.
+    #[test]
+    fn a_401_retry_files_its_verdict_under_the_retried_tenant() {
+        use super::{coord_mcp_verdict_tenant, UpstreamRetry};
+        use crate::mcp::device_jwt_refresher as djr;
+        let _serialised = djr::posture_test_lock();
+        djr::reset_coord_credential_posture_for_test();
+
+        let a = uuid::Uuid::from_bytes([0xA1; 16]);
+        let b = uuid::Uuid::from_bytes([0xB2; 16]);
+        // Seed A with a real rejection, so "untouched" is distinguishable from
+        // "was already zero".
+        djr::note_coord_upstream_verdict(Some(a), true, 401, br#"{"code":"token_expired"}"#);
+
+        // retried-recovered with a re-selection naming B: the 2xx goes to B.
+        let filed =
+            coord_mcp_verdict_tenant(Some(a), Some(UpstreamRetry::Recovered { tenant: Some(b) }));
+        assert_eq!(filed, Some(b));
+        djr::note_coord_upstream_verdict(filed, true, 200, br#"{"jsonrpc":"2.0","result":{}}"#);
+        let sig_a = djr::upstream_signal_for(Some(&a.to_string()));
+        assert_eq!(
+            sig_a.consecutive_rejections, 1,
+            "a 2xx earned by B's credential must not retire A's streak"
+        );
+        assert!(sig_a.last_ok_at.is_none(), "nor stamp lastOkAt on A");
+        assert!(
+            djr::upstream_signal_for(Some(&b.to_string()))
+                .last_ok_at
+                .is_some(),
+            "the retry's 2xx is evidence about B's credential"
+        );
+
+        // retried-still-rejected: the retry's refusal is B's too.
+        assert_eq!(
+            coord_mcp_verdict_tenant(
+                Some(a),
+                Some(UpstreamRetry::StillRejected { tenant: Some(b) })
+            ),
+            Some(b)
+        );
+        // A re-selection that resolved the default slot is honoured as such.
+        assert_eq!(
+            coord_mcp_verdict_tenant(Some(a), Some(UpstreamRetry::Recovered { tenant: None })),
+            None
+        );
+
+        // Every outcome that forwards attempt 1's response keeps attempt 1's
+        // tenant. Those variants carry no tenant at all, so a re-selection that
+        // named B and then failed to send has nowhere to leak B from.
+        for outcome in [
+            None,
+            Some(UpstreamRetry::TransportFailed),
+            Some(UpstreamRetry::NoFresherBearer),
+            Some(UpstreamRetry::ReselectionRefused),
+        ] {
+            assert_eq!(
+                coord_mcp_verdict_tenant(Some(a), outcome),
+                Some(a),
+                "outcome {outcome:?} forwards attempt 1's response"
+            );
+        }
+
+        djr::reset_coord_credential_posture_for_test();
     }
 
     /// **Phase 3a wiring** (plan `2026-09-12-runner-loads-with-an-expired-
@@ -15649,6 +16215,10 @@ mod coord_claims_proxy_tests {
     /// `coord_mcp_url_with_source()` would still dial coord and still hand the
     /// caller `token_expired`, which is the whole incident.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn the_coord_mcp_proxy_refuses_locally_on_a_dead_runner_credential() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs");
         let text = std::fs::read_to_string(&src).expect("read mcp_api.rs");
@@ -15687,6 +16257,36 @@ mod coord_claims_proxy_tests {
             "the `credential_free_doors` catalogue the local 401 carries is coord's, copied \
              from the last coord answer"
         );
+    }
+
+    /// Review round 1: the five retry labels are what readers of the
+    /// upstream-rejected row and the `retry` envelope field match on, so moving
+    /// them onto [`super::UpstreamRetry`] must not change a single string —
+    /// and the tenant a sent outcome carries must not change its label.
+    #[test]
+    fn upstream_retry_labels_are_unchanged() {
+        use super::UpstreamRetry;
+        let t = Some(uuid::Uuid::from_bytes([0x7E; 16]));
+        for (outcome, label) in [
+            (UpstreamRetry::Recovered { tenant: t }, "retried-recovered"),
+            (
+                UpstreamRetry::Recovered { tenant: None },
+                "retried-recovered",
+            ),
+            (
+                UpstreamRetry::StillRejected { tenant: t },
+                "retried-still-rejected",
+            ),
+            (
+                UpstreamRetry::StillRejected { tenant: None },
+                "retried-still-rejected",
+            ),
+            (UpstreamRetry::TransportFailed, "retry-transport-failed"),
+            (UpstreamRetry::NoFresherBearer, "no-fresher-bearer"),
+            (UpstreamRetry::ReselectionRefused, "reselection-refused"),
+        ] {
+            assert_eq!(outcome.label(), label, "{outcome:?}");
+        }
     }
 
     /// Coord unreachable → 502 from the runner with the distinct upstream
@@ -16418,6 +17018,72 @@ mod coord_provision_session_gate_tests {
         );
     }
 
+    /// W1. The P1 kill switch reaches THIS door, not just the spawn paths.
+    ///
+    /// The observation is the admission FORK, because it is the only place a
+    /// unit test can see the decision: `resolve_bound_api_port()` is `None`
+    /// without a Tauri runtime, so the route can never reach a real mint here
+    /// (that is what `provision_session_proxy_config_fail_closed_without_bound_port`
+    /// pins). So:
+    ///
+    /// - switch ON (default): a `tenant` this runner is unpaired for is **403
+    ///   `_TENANT_NOT_PAIRED`** — the tenant was carried into admission.
+    /// - switch `=0`: the SAME body is **503 `_PORT_UNRESOLVABLE`** — it never
+    ///   reached admission at all, which is only possible if the tenant was
+    ///   dropped to `None` first. That is the same answer a body naming no
+    ///   tenant gets, asserted here beside it so "identical to tenant-less" is
+    ///   a measurement rather than a claim.
+    ///
+    /// Fail-before: with `req.tenant` used directly (the shape before W1), the
+    /// `=0` case still 403s, because admission still sees B.
+    #[tokio::test]
+    async fn the_kill_switch_stops_a_named_tenant_reaching_this_doors_admission() {
+        let amb = crate::test_env::isolated_ambient();
+        let b = uuid::Uuid::from_u128(0xB0B0_0000_0000_4000_8000_0000_0000_00B0);
+        let cwd = amb.dir().join("provision-killswitch-cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd_str = cwd.to_string_lossy().to_string();
+        let named = serde_json::json!({"cwd": cwd_str, "tenant": b.to_string()}).to_string();
+        let tenantless = serde_json::json!({"cwd": cwd_str}).to_string();
+
+        // Safe to mutate the process env: `isolated_ambient` holds the
+        // process-wide env lock for this whole test and
+        // `QONTINUI_SPAWN_TENANT_CREDENTIAL` is in `ambient::AMBIENT_ENV_KEYS`,
+        // so the fixture restores it on drop even if an assertion panics.
+        std::env::remove_var(crate::coord_mcp::SPAWN_TENANT_CREDENTIAL_ENV);
+        let resp = super::provision_session_after_gate(named.as_bytes());
+        assert_eq!(
+            resp.status(),
+            403,
+            "switch ON: a named unpaired tenant must reach admission"
+        );
+        assert_eq!(
+            body_json(resp).await["code"],
+            "COORD_MCP_PROVISION_TENANT_NOT_PAIRED"
+        );
+
+        std::env::set_var(crate::coord_mcp::SPAWN_TENANT_CREDENTIAL_ENV, "0");
+        let resp = super::provision_session_after_gate(named.as_bytes());
+        assert_eq!(
+            resp.status(),
+            503,
+            "switch OFF: the named tenant must be dropped BEFORE admission, so the route \
+             falls through to the port check exactly as a tenant-less body does"
+        );
+        assert_eq!(
+            body_json(resp).await["code"],
+            "COORD_MCP_PROVISION_PORT_UNRESOLVABLE"
+        );
+
+        let resp = super::provision_session_after_gate(tenantless.as_bytes());
+        assert_eq!(resp.status(), 503);
+        assert_eq!(
+            body_json(resp).await["code"],
+            "COORD_MCP_PROVISION_PORT_UNRESOLVABLE",
+            "the switched-off answer above is the tenant-less answer, not a coincidence"
+        );
+    }
+
     /// The gate still runs FIRST with a `tenant` in the body: no handshake ⇒
     /// `_NO_HANDSHAKE`, and the denial carries neither the tenant string nor a
     /// pairing verdict — an unauthenticated caller never learns this machine's
@@ -16787,7 +17453,8 @@ mod coord_provision_session_gate_tests {
 #[cfg(test)]
 mod coord_write_proxy_tests {
     use super::{
-        coord_attest_gate_handler, coord_register_gate_handler,
+        coord_attest_gate_handler, coord_pr_labels_declare_handler,
+        coord_pr_labels_retract_handler, coord_register_gate_handler,
         coord_work_unit_register_gate_handler, coord_work_unit_set_deps_handler,
         coord_work_unit_transition_handler, coord_work_unit_upsert_handler,
         forward_coord_write_post, gate_id_is_valid, maybe_spool_finding,
@@ -16872,6 +17539,11 @@ mod coord_write_proxy_tests {
                 "/coord-mcp/work-units/2026-07-03-some-unit/deps",
                 post(coord_work_unit_set_deps_handler),
             ),
+            (
+                "/coord-mcp/pr-labels",
+                "/coord-mcp/pr-labels",
+                post(coord_pr_labels_declare_handler).delete(coord_pr_labels_retract_handler),
+            ),
         ]
     }
 
@@ -16922,6 +17594,12 @@ mod coord_write_proxy_tests {
                 "/coord-mcp/work-units/{slug}/register-gate"
             }
             CoordWriteTarget::WorkUnitSetDeps { .. } => "/coord-mcp/work-units/{slug}/deps",
+            // Both label verbs share ONE route template (POST + DELETE on the
+            // same path); `all_write_targets` samples one of them so the 1:1
+            // route test compares them as one route.
+            CoordWriteTarget::PrLabelsDeclare | CoordWriteTarget::PrLabelsRetract => {
+                "/coord-mcp/pr-labels"
+            }
         }
     }
 
@@ -16939,6 +17617,7 @@ mod coord_write_proxy_tests {
             CoordWriteTarget::WorkUnitTransition { slug: slug.clone() },
             CoordWriteTarget::WorkUnitRegisterGate { slug: slug.clone() },
             CoordWriteTarget::WorkUnitSetDeps { slug },
+            CoordWriteTarget::PrLabelsDeclare,
         ]
     }
 
@@ -17104,6 +17783,27 @@ mod coord_write_proxy_tests {
                 },
             ),
             "https://coord.example.test/coord/work-units/2026-07-03-some-unit/deps"
+        );
+        for target in [
+            CoordWriteTarget::PrLabelsDeclare,
+            CoordWriteTarget::PrLabelsRetract,
+        ] {
+            assert_eq!(
+                write_upstream_url("https://coord.example.test/", &target),
+                "https://coord.example.test/coord/pr-labels"
+            );
+        }
+        assert_eq!(
+            CoordWriteTarget::PrLabelsDeclare.method(),
+            reqwest::Method::POST
+        );
+        assert_eq!(
+            CoordWriteTarget::PrLabelsRetract.method(),
+            reqwest::Method::DELETE
+        );
+        assert_eq!(
+            CoordWriteTarget::WorkUnitUpsert.method(),
+            reqwest::Method::POST
         );
     }
 

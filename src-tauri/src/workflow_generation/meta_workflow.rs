@@ -390,6 +390,10 @@ pub fn build_meta_workflow_template(
 /// - Markdown headings (`# Title` → `Title`)
 /// - Multi-line specs (uses first meaningful line)
 /// - Long descriptions (truncates to ~60 chars at a word boundary)
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_workflow_name_from_description(description: &str) -> String {
     let max_len = 60;
 
@@ -1147,6 +1151,10 @@ pub fn read_referenced_files_from_description_pub(description: &str) -> String {
 /// Uses the same `extract_relative_paths` logic as the discovery tools to find
 /// file paths in the description, then reads them from disk. Walks up parent
 /// directories from the project root to find files in sibling directories.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn read_referenced_files_from_description(description: &str) -> String {
     let paths = super::discovery_tools::extract_relative_paths_pub(description);
     if paths.is_empty() {

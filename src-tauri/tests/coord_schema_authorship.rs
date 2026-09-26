@@ -229,6 +229,10 @@ fn classify(line: &str) -> Option<(Kind, String)> {
 }
 
 /// Extract the `coord.<table>` identifier immediately following `marker`.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn table_after(line: &str, marker: &str) -> Option<String> {
     let idx = line.find(marker)?;
     let rest = &line[idx + marker.len()..];
@@ -245,6 +249,10 @@ fn table_after(line: &str, marker: &str) -> Option<String> {
 
 /// For an `ALTER TABLE` at `start`, find the `ADD COLUMN IF NOT EXISTS <col>`
 /// column on this or the next few lines.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn find_added_column(lines: &[&str], start: usize) -> Option<String> {
     let needle = "ADD COLUMN IF NOT EXISTS ";
     for line in lines.iter().skip(start).take(4) {

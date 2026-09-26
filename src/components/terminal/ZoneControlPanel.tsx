@@ -17,6 +17,7 @@ import { instanceStorage } from "@/lib/instance-storage";
 import { useTerminalSession, useZoneMetadata, useUIStateCx } from "./contexts";
 import { useHotField } from "./useTerminalHotStore";
 import { SpawnTenantPicker } from "./SpawnTenantPicker";
+import { tabsForIds } from "./useZoneLayout";
 import {
   LayoutGrid,
   ChevronLeft,
@@ -979,18 +980,18 @@ export const ZoneControlPanel = React.memo(function ZoneControlPanel({
     return zones.filter((z) => activeFilters.has(z.state));
   }, [zones, activeFilters]);
 
-  // Find unassigned tabs, split by liveness. Live unassigned = hidden-but-live
+  // Unassigned tabs, split by liveness. Live unassigned = hidden-but-live
   // (the honest "N more" set); exited unassigned = tombstones surfaced
   // separately with a dismiss affordance so dead sessions never inflate the
-  // live count.
-  const assignedTabIds = useMemo(() => new Set(Object.values(assignments)), [assignments]);
+  // live count. CONSUMED from the zone layout (`partitionUnassignedTabIds`),
+  // not re-derived here, so this panel and the UnzonedChip cannot disagree.
   const unassignedTabs = useMemo(
-    () => tabs.filter((t) => !assignedTabIds.has(t.id) && t.isAlive),
-    [tabs, assignedTabIds],
+    () => tabsForIds(zoneLayout.unassignedTabIds, tabs),
+    [zoneLayout.unassignedTabIds, tabs],
   );
   const exitedUnassignedTabs = useMemo(
-    () => tabs.filter((t) => !assignedTabIds.has(t.id) && !t.isAlive),
-    [tabs, assignedTabIds],
+    () => tabsForIds(zoneLayout.exitedUnassignedTabIds, tabs),
+    [zoneLayout.exitedUnassignedTabIds, tabs],
   );
 
   // Total session count

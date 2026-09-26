@@ -250,6 +250,10 @@ pub(crate) struct RenderedBlock {
 ///
 /// Note single braces are untouched: today's briefing legitimately contains
 /// `{kind}` / `{name}` as literal URL-template text.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub(crate) fn substitute(
     body: &str,
     runner_api_base: &str,
@@ -287,6 +291,10 @@ pub(crate) fn substitute(
 }
 
 /// Every `{{token}}` in `body`, in order.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn placeholder_tokens(body: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = body;

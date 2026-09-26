@@ -1019,6 +1019,7 @@ mod tests {
             wind_down_at: None,
             finish_reason: None,
             finish_synced: false,
+            spawn_device_default: None,
         };
         let s = SnapshotSession::from(&rec);
         assert_eq!(s.claude_session_id, "sess-1");
@@ -1084,6 +1085,7 @@ mod tests {
             wind_down_at: None,
             finish_reason: None,
             finish_synced: false,
+            spawn_device_default: None,
         }
     }
 

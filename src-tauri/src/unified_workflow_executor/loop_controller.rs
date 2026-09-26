@@ -674,6 +674,10 @@ impl LoopController {
     ///
     /// After all stages complete, the top-level completion phase runs.
     /// Context accumulates across stages: each stage's output is visible to later stages.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     async fn run_multi_stage(
         &mut self,
         mut config: LoopConfig,

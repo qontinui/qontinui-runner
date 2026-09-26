@@ -5370,6 +5370,10 @@ mod grant_gate_tests {
     fn each_relay_handler_rereads_its_own_feed_with_its_own_family() {
         const RELAY: &str = include_str!("backend_relay.rs");
 
+        #[expect(
+            clippy::string_slice,
+            reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+        )]
         fn handler_body<'a>(src: &'a str, sig: &str) -> &'a str {
             let start = src
                 .find(sig)

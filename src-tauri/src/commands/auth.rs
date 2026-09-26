@@ -796,9 +796,18 @@ pub async fn get_access_token_for_websocket() -> Result<String, String> {
 /// so the HTTP door and the Tauri command run the SAME function — plan
 /// `2026-09-02-steering-layers-unreadable-without-a-credential`, Phase 1f.
 ///
-/// What it returns is the signed-in OPERATOR's **Cognito access token**, not a
-/// coord device JWT: the fleet's `COORD_DEVICE_JWT` name for what the doors
-/// mint here is a misnomer that `coord-revive`'s SKILL.md already records.
+/// What it returns is the legacy `access_token` slot — the DEFAULT binding's
+/// **coord device JWT**, not a Cognito token. (Corrected by plan
+/// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P3 Step 0,
+/// a read of every writer of that slot: `pair::persist_pairing`,
+/// `pair::reconcile`, and the device-JWT refresher's Cognito pair, device
+/// self-refresh and device-machine-key exchange all store a coord-minted device
+/// token there; the operator's Cognito tokens live in the separate OAuth slots
+/// written by `cognito::store_cognito_tokens`. This doc, and `coord-revive`'s
+/// SKILL.md, used to say "Cognito access token".) The one exception is a
+/// pre-migration install whose store file is absent, where the keychain backup
+/// answers with whatever it last held. Unlike [`get_coord_device_token`] it takes
+/// no tenant — its tenant is whatever the default binding is.
 ///
 /// `require_tier_2()` stays the FIRST statement: a Tier-0/1 runner answers the
 /// structured "Tier 0/1 …" error before any keychain read, so a headless
@@ -1557,15 +1566,40 @@ pub fn device_jwt_present() -> Result<bool, String> {
     }
 }
 
-/// Returns the runner's coord **device-JWT** (the token stored in
-/// `AuthManager`'s `access_token` slot), or `None` when the device is unpaired
-/// — i.e. the slot is empty or does not hold a JWT-shaped value.
+/// Returns a coord **device JWT** this runner holds, or `None` when it holds
+/// none for what was asked.
 ///
-/// The CI-runner settings panel attaches this as `Authorization: Bearer <jwt>`
-/// on its loopback calls to the supervisor (`:9875` enable/disable), which now
-/// require + forward the credential so coord can enforce `FleetPrincipal` on
-/// the registration-token mint. A `None` return is the FE's cue to surface a
-/// "pair this runner first" CTA rather than calling the supervisor anonymously.
+/// # What it returns (plan `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P3)
+///
+/// - **`tenant_id: Some(t)`** — tenant `t`'s credential, through
+///   [`crate::auth::select_device_bearer`] (the [`crate::auth::device_bearer_for`]
+///   core): `t`'s own `device_jwt:<t>` slot, or the legacy `access_token` slot
+///   ONLY when `t` is the device's default binding. The no-substitution rule is
+///   intact — a tenant this runner holds no usable credential for is `Ok(None)`,
+///   never another tenant's token, and a token whose `tenant_id` claim does not
+///   name `t` (or names none) is not returned for it. That path also applies the selector's
+///   validity gate: an expired or opaque slot reads as `None`.
+/// - **`tenant_id: None` on a runner holding credentials for at most one
+///   tenant** ([`crate::auth::HeldDeviceTenants`]: the per-tenant slots plus the
+///   default binding when the legacy slot holds its JWT) — the
+///   legacy `access_token` slot, exactly as before P3. That slot holds the
+///   DEFAULT binding's coord device JWT: every non-test writer of it
+///   (`pair::persist_pairing`, `pair::reconcile`, and the refresher's Cognito
+///   pair, device self-refresh and device-machine-key exchange paths) stores a
+///   coord-minted device token, and Cognito's own tokens live in the separate
+///   OAuth slots. This arm stays a PROBE: it does not check `exp`.
+/// - **`tenant_id: None` on a runner holding credentials for more than one
+///   tenant** (same definition; an unreadable input is an error, not a count) —
+///   REFUSED with [`DEVICE_TOKEN_TENANT_REQUIRED`]. Which tenant the default slot
+///   belongs to is not something a caller of this door can see, and a skill that
+///   silently gets the default tenant's token writes to the wrong tenant with a
+///   `201`. Kill switch: [`DEVICE_TOKEN_DOOR_DEFAULT_SLOT_ENV`]`=1` restores the
+///   default-slot answer. Design fork recorded as coord finding
+///   `1416461a-9f9a-46bc-ac68-7b10eb386879` (deciding priority: robustness).
+///
+/// The CI-runner settings panel attaches the result as `Authorization: Bearer
+/// <jwt>` on its loopback calls to the supervisor; a `None` return is its cue to
+/// surface a "pair this runner first" CTA rather than calling anonymously.
 ///
 /// Unlike [`get_access_token_for_websocket`], this neither requires tier-2 nor
 /// errors when unpaired: it is a credential *probe*, so a missing token is a
@@ -1576,19 +1610,167 @@ pub fn device_jwt_present() -> Result<bool, String> {
 /// renders as "pair this runner first" — wrong remediation, and it disabled
 /// the CI-runner controls on a paired runner. A read error is now `Err`, so
 /// `Ok(None)` keeps its single meaning: definitively no device JWT.
+///
+/// Security: glob `**/auth*` + content trigger 5 (which credential a caller is
+/// handed).
 #[tauri::command]
-pub fn get_coord_device_token() -> Result<Option<String>, String> {
+pub fn get_coord_device_token(tenant_id: Option<String>) -> Result<Option<String>, String> {
+    let tenant = parse_device_token_tenant(tenant_id.as_deref())?;
+    let am = AuthManager::new();
+    let held = crate::auth::HeldDeviceTenants::read(&am);
+    coord_device_token_for(&am, tenant, &held, device_token_door_default_slot_enabled()).map_err(
+        |e| {
+            error!("get_coord_device_token: {e}");
+            e
+        },
+    )
+}
+
+/// Runner kill switch for P3's refusal: exactly `1` makes a tenant-less
+/// [`get_coord_device_token`] answer the default slot again on a runner holding
+/// several tenant slots. Read per call, so it applies without a restart.
+pub(crate) const DEVICE_TOKEN_DOOR_DEFAULT_SLOT_ENV: &str =
+    "QONTINUI_DEVICE_TOKEN_DOOR_DEFAULT_SLOT";
+
+/// Stable prefix of the refusal a tenant-less call gets on a multi-slot runner.
+pub(crate) const DEVICE_TOKEN_TENANT_REQUIRED: &str = "get_coord_device_token:tenant_required";
+
+/// Stable prefix of the refusal a malformed `tenant_id` gets.
+pub(crate) const DEVICE_TOKEN_TENANT_INVALID: &str = "get_coord_device_token:tenant_invalid";
+
+fn device_token_door_default_slot_enabled() -> bool {
+    device_token_door_default_slot_enabled_from(
+        std::env::var(DEVICE_TOKEN_DOOR_DEFAULT_SLOT_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn device_token_door_default_slot_enabled_from(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
+/// Blank or absent is "no tenant named"; anything else must be a uuid — a typo
+/// is refused rather than silently read as "no tenant", which would hand back
+/// the default slot's token.
+pub(crate) fn parse_device_token_tenant(raw: Option<&str>) -> Result<Option<uuid::Uuid>, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(raw) => uuid::Uuid::parse_str(raw).map(Some).map_err(|e| {
+            format!("{DEVICE_TOKEN_TENANT_INVALID}: tenant_id {raw:?} is not a tenant uuid: {e}")
+        }),
+    }
+}
+
+/// Pure-over-injected-parts core of [`get_coord_device_token`].
+pub(crate) fn coord_device_token_for(
+    am: &AuthManager,
+    tenant: Option<uuid::Uuid>,
+    held: &crate::auth::HeldDeviceTenants,
+    default_slot_switch: bool,
+) -> Result<Option<String>, String> {
     use crate::secure_storage::StoredTokenRead;
-    match AuthManager::new().probe_access_token() {
+
+    if let Some(t) = tenant {
+        let default_tenant = match held.default_binding {
+            crate::auth::BindingTenantRead::Bound(d) => Some(d),
+            _ => None,
+        };
+        // The token must NAME the tenant asked for. A token whose claim names
+        // another tenant — or none — is not a credential for `t`, and is treated
+        // exactly like no token: the miss path below.
+        if let Some(jwt) =
+            crate::auth::select_device_bearer(am, Some(&t), default_tenant).filter(|jwt| {
+                match crate::auth::jwt_tenant_claim(jwt) {
+                    Some(claim) => claim == t,
+                    // No claim. The selector can return one from TWO routes: t's own
+                    // per-tenant slot (a slot hit), or the legacy-slot fallback for
+                    // the default binding, where it has already applied the
+                    // measured single-binding rule. This door accepts only the
+                    // second: t must be the default binding AND the slot store must
+                    // hold no slot for t. A claimless token found IN t's slot is
+                    // refused here and takes the miss path below — the door hands
+                    // out only tokens whose provenance it can state, and a re-pair
+                    // (which writes a claim) is the recovery.
+                    None => {
+                        // Fail closed: an UNREADABLE slot store cannot show that
+                        // t has no slot of its own, so it never admits the token.
+                        let admitted = default_tenant == Some(t)
+                            && matches!(&held.slots, Ok(slots) if !slots.contains(&t));
+                        // This is a SECOND copy of half of
+                        // `auth::legacy_token_serves_tenant`, positioned to drift
+                        // against the module's "one place" doctrine. It is safe
+                        // by construction — a conjunction on top of a token the
+                        // selector already admitted, so it can only narrow, never
+                        // widen — and the invariant that makes that true is worth
+                        // asserting rather than asserting in prose: anything this
+                        // door admits, the shared predicate admits too. If the
+                        // copy ever drifts the other way, every debug build and
+                        // every test trips here instead of silently handing out a
+                        // token whose provenance the door cannot state. (The
+                        // shared call also arms a once-per-process warning; that
+                        // is idempotent and debug-only.)
+                        debug_assert!(
+                            !admitted
+                                || crate::auth::legacy_token_serves_tenant(
+                                    am,
+                                    jwt,
+                                    &t,
+                                    crate::auth::measured_device_binding_count(),
+                                ),
+                            "the device-token door admitted a claimless legacy token that \
+                             `legacy_token_serves_tenant` refuses — the door's local copy of \
+                             the rule has drifted wider than the selector's"
+                        );
+                        admitted
+                    }
+                }
+            })
+        {
+            return Ok(Some(jwt));
+        }
+        // A miss (including a mismatched claim) is "no credential for t" only if
+        // the slot store was READ. An unreadable store is UNKNOWN — the same
+        // no-downgrade rule as below.
+        return match &held.slots {
+            Ok(_) => Ok(None),
+            Err(e) => Err(format!(
+                "Could not read the credential store, so whether this runner holds a device \
+                 token for tenant {t} is unknown (it has NOT been unpaired): {e}"
+            )),
+        };
+    }
+
+    if !default_slot_switch {
+        // The SAME held-tenants definition the spawn / provision-session tenant
+        // admission uses, so a default binding that lives only in the legacy slot
+        // counts.
+        let held_set = held.set().map_err(|unknown| {
+            format!(
+                "Could not establish which tenants this runner holds credentials for, so \
+                 whether a tenant-less answer is unambiguous is unknown (it has NOT been \
+                 unpaired): {unknown}"
+            )
+        })?;
+        if held_set.len() > 1 {
+            return Err(format!(
+                "{DEVICE_TOKEN_TENANT_REQUIRED}: this runner holds coord credentials for {} \
+                 tenants, so a token requested without a tenant could belong to the wrong one \
+                 — pass `tenant_id` (UI Bridge invoke args: {{\"tenantId\": \"<uuid>\"}}) naming \
+                 the tenant the caller acts for. Operator override: set \
+                 {DEVICE_TOKEN_DOOR_DEFAULT_SLOT_ENV}=1 on the runner to answer the default slot",
+                held_set.len()
+            ));
+        }
+    }
+
+    match am.probe_access_token() {
         StoredTokenRead::Present(token) if crate::auth::looks_like_jwt(&token) => Ok(Some(token)),
         StoredTokenRead::Present(_) | StoredTokenRead::Absent => Ok(None),
-        StoredTokenRead::Unreadable(e) => {
-            error!("get_coord_device_token: credential store unreadable — pairing state is UNKNOWN, not unpaired: {e}");
-            Err(format!(
-                "Could not read the credential store, so this runner's device token is \
-                 unknown (it has NOT been unpaired): {e}"
-            ))
-        }
+        StoredTokenRead::Unreadable(e) => Err(format!(
+            "Could not read the credential store, so this runner's device token is \
+             unknown (it has NOT been unpaired): {e}"
+        )),
     }
 }
 
@@ -1873,5 +2055,396 @@ mod tests {
                 "{rendered} lost its remediation"
             );
         }
+    }
+}
+
+/// Plan `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P3:
+/// the device-token door names its tenant, and refuses to guess one.
+#[cfg(test)]
+mod device_token_door_tests {
+    use super::*;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+    fn tenant(n: u128) -> uuid::Uuid {
+        uuid::Uuid::from_u128(n)
+    }
+
+    /// A structurally valid, unexpired device JWT carrying `tenant`'s claim —
+    /// distinct per tenant, so an assertion can tell whose token came back.
+    ///
+    /// **`exp` is sampled ONCE per process, not per call.** Several tests store
+    /// `jwt_for(t)` and then assert the door handed back `jwt_for(t)` — a second
+    /// call. With a per-call `now + 3600` those two strings differ whenever the
+    /// calls straddle a second boundary, so the assertion was a time race that
+    /// passed on a fast box and failed on a slow one. It failed exactly that way
+    /// on `test (windows-latest)` (`the_kill_switch_restores_the_default_slot`,
+    /// two `Ok(Some("***"))` that were not equal — the redacting `Debug` hid
+    /// that the payloads differed by one second). Memoising the deadline makes
+    /// the helper a stable identity per tenant while keeping the token
+    /// genuinely unexpired, which is what every caller actually needs.
+    fn jwt_exp() -> u64 {
+        static EXP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *EXP.get_or_init(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after the unix epoch")
+                .as_secs()
+                + 3_600
+        })
+    }
+
+    fn jwt_for(tenant: uuid::Uuid) -> String {
+        let exp = jwt_exp();
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({"sub_type": "device", "tenant_id": tenant, "exp": exp}).to_string(),
+        );
+        format!("{header}.{payload}.sig")
+    }
+
+    /// The held-tenants read the door would make, with the default binding
+    /// injected (the ambient has no `paired_user.json`).
+    fn held(am: &AuthManager, default: Option<uuid::Uuid>) -> crate::auth::HeldDeviceTenants {
+        crate::auth::HeldDeviceTenants::read_with(
+            am,
+            default.map_or(
+                crate::auth::BindingTenantRead::Unbound,
+                crate::auth::BindingTenantRead::Bound,
+            ),
+        )
+    }
+
+    /// Never the real OS keychain: `AuthManager::new()` keys it on the fixed
+    /// real `SERVICE_NAME`, and `store_tokens` writes that entry unless
+    /// `QONTINUI_DISABLE_KEYCHAIN` is set — so on a paired Windows box these
+    /// tests would overwrite the runner's own keychain backup, the documented
+    /// recovery when the `.enc` store will not decrypt. On Linux the keyring
+    /// call fails and is swallowed as `debug!`, which is why it stays invisible
+    /// until Windows. `isolated_ambient` captures the key but sets neither it
+    /// nor a removal, so the guard belongs here; it is safe inside the fixture,
+    /// which holds `env_lock` and has already captured the key for restore.
+    ///
+    /// Every `AuthManager` in this module comes from here, so the ordering
+    /// (guard BEFORE the first `store_tokens`) is enforced rather than
+    /// remembered.
+    fn hermetic_auth_manager() -> AuthManager {
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        AuthManager::new()
+    }
+
+    /// A runner paired for A (the default binding, in the legacy slot and — by
+    /// the mirror — its own slot) and for B.
+    fn two_slot_runner() -> (AuthManager, uuid::Uuid, uuid::Uuid) {
+        let (a, b) = (tenant(0xA1), tenant(0xB2));
+        let am = hermetic_auth_manager();
+        am.store_tokens(&jwt_for(a), "").unwrap();
+        am.store_tenant_device_jwt(&b, &jwt_for(b)).unwrap();
+        assert_eq!(am.try_list_tenant_device_jwt_tenants().unwrap().len(), 2);
+        (am, a, b)
+    }
+
+    /// The fixture invariant three assertions in this module silently rely on:
+    /// `jwt_for(t)` is ONE string for the life of the process, so "the door
+    /// returned the token we stored" is a real comparison rather than a race
+    /// against the wall clock. Fails on a per-call `exp` only when the two calls
+    /// straddle a second, which is why it needs to be asserted rather than
+    /// observed.
+    #[test]
+    fn the_token_fixture_is_stable_across_calls() {
+        let t = tenant(0xA1);
+        assert_eq!(jwt_for(t), jwt_for(t));
+        assert_ne!(jwt_for(t), jwt_for(tenant(0xB2)));
+        assert_eq!(crate::auth::jwt_tenant_claim(&jwt_for(t)), Some(t));
+        assert!(crate::auth::looks_like_jwt(&jwt_for(t)));
+    }
+
+    /// P3 acceptance 1. Two tenant slots and no argument: refused, typed, and
+    /// naming the argument — never the default slot's token.
+    #[test]
+    fn a_tenantless_call_on_a_two_slot_runner_refuses() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (am, a, _) = two_slot_runner();
+        let refusal = coord_device_token_for(&am, None, &held(&am, Some(a)), false)
+            .expect_err("two slots and no tenant must refuse");
+        assert!(
+            refusal.starts_with(DEVICE_TOKEN_TENANT_REQUIRED),
+            "{refusal}"
+        );
+        assert!(refusal.contains("tenant_id"), "{refusal}");
+        assert!(
+            !refusal.contains(&jwt_for(a)),
+            "a refusal never carries a token"
+        );
+    }
+
+    /// P3 acceptance 2. Argument B returns B's slot, not the default's.
+    #[test]
+    fn a_named_tenant_gets_that_tenants_slot() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (am, a, b) = two_slot_runner();
+        let token = coord_device_token_for(&am, Some(b), &held(&am, Some(a)), false).unwrap();
+        assert_eq!(
+            token.as_deref().and_then(crate::auth::jwt_tenant_claim),
+            Some(b)
+        );
+        let token = coord_device_token_for(&am, Some(a), &held(&am, Some(a)), false).unwrap();
+        assert_eq!(
+            token.as_deref().and_then(crate::auth::jwt_tenant_claim),
+            Some(a)
+        );
+    }
+
+    /// P3 acceptance 3. A tenant this runner is not paired for gets `None` —
+    /// never A's token, not even with the kill switch thrown.
+    #[test]
+    fn an_unpaired_tenant_never_gets_another_tenants_token() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (am, a, _) = two_slot_runner();
+        let c = tenant(0xC3);
+        for switch in [false, true] {
+            assert_eq!(
+                coord_device_token_for(&am, Some(c), &held(&am, Some(a)), switch),
+                Ok(None)
+            );
+        }
+    }
+
+    /// P3 kill switch. `QONTINUI_DEVICE_TOKEN_DOOR_DEFAULT_SLOT=1` restores the
+    /// default slot for a tenant-less call on a multi-slot runner, and only `1`
+    /// throws it.
+    #[test]
+    fn the_kill_switch_restores_the_default_slot() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (am, a, _) = two_slot_runner();
+        assert_eq!(
+            coord_device_token_for(&am, None, &held(&am, Some(a)), true),
+            Ok(Some(jwt_for(a)))
+        );
+        // Safe to mutate the process env: `isolated_ambient` holds the process-wide
+        // env lock for this whole test, and the key is in
+        // `ambient::AMBIENT_ENV_KEYS`, so the fixture restores it on drop even if
+        // an assertion panics first.
+        std::env::set_var(DEVICE_TOKEN_DOOR_DEFAULT_SLOT_ENV, "1");
+        assert!(device_token_door_default_slot_enabled());
+        std::env::remove_var(DEVICE_TOKEN_DOOR_DEFAULT_SLOT_ENV);
+        assert!(!device_token_door_default_slot_enabled_from(None));
+        assert!(!device_token_door_default_slot_enabled_from(Some("0")));
+        assert!(!device_token_door_default_slot_enabled_from(Some("true")));
+        assert!(device_token_door_default_slot_enabled_from(Some(" 1 ")));
+    }
+
+    /// A single-slot runner keeps today's answer for a tenant-less call, and an
+    /// unpaired one keeps its `None`.
+    #[test]
+    fn a_single_slot_runner_is_unchanged() {
+        let _amb = crate::test_env::isolated_ambient();
+        let am = hermetic_auth_manager();
+        assert_eq!(
+            coord_device_token_for(&am, None, &held(&am, None), false),
+            Ok(None)
+        );
+        let a = tenant(0xA1);
+        am.store_tokens(&jwt_for(a), "").unwrap();
+        assert_eq!(
+            coord_device_token_for(&am, None, &held(&am, Some(a)), false),
+            Ok(Some(jwt_for(a)))
+        );
+    }
+
+    /// R1 (review). A default binding whose credential lives ONLY in the legacy
+    /// slot, plus one other tenant slot, is two held tenants: a tenant-less call
+    /// refuses. Counting per-tenant slots alone read it as one and answered the
+    /// default tenant's token.
+    #[test]
+    fn a_legacy_only_default_plus_one_slot_is_two_tenants_and_refuses() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (a, b) = (tenant(0xA1), tenant(0xB2));
+        let am = hermetic_auth_manager();
+        am.store_tokens(&jwt_for(a), "").unwrap();
+        am.clear_tenant_device_jwt(&a).unwrap(); // the mirror's copy gone: legacy only
+        am.store_tenant_device_jwt(&b, &jwt_for(b)).unwrap();
+        assert_eq!(am.try_list_tenant_device_jwt_tenants().unwrap(), vec![b]);
+
+        let refusal = coord_device_token_for(&am, None, &held(&am, Some(a)), false)
+            .expect_err("legacy-only default A + slot B is two tenants");
+        assert!(
+            refusal.starts_with(DEVICE_TOKEN_TENANT_REQUIRED),
+            "{refusal}"
+        );
+        assert!(refusal.contains("for 2 tenants"), "{refusal}");
+
+        // An unreadable default binding is not a count: UNKNOWN, an error.
+        let unknown =
+            crate::auth::HeldDeviceTenants::read_with(&am, crate::auth::BindingTenantRead::Unknown);
+        let err = coord_device_token_for(&am, None, &unknown, false).unwrap_err();
+        assert!(!err.starts_with(DEVICE_TOKEN_TENANT_REQUIRED), "{err}");
+        assert!(err.contains("paired_user.json"), "{err}");
+    }
+
+    /// Nit (review). A named tenant served from the legacy slot must be that
+    /// token's own tenant: a legacy token naming another tenant, or none, is
+    /// "no credential for t".
+    #[test]
+    fn a_named_tenant_never_gets_a_legacy_token_that_names_another_tenant() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (a, b) = (tenant(0xA1), tenant(0xB2));
+        let am = hermetic_auth_manager();
+        // The legacy slot holds B's token while the binding file says A.
+        am.store_tokens(&jwt_for(b), "").unwrap();
+        am.clear_tenant_device_jwt(&b).unwrap();
+        assert_eq!(
+            coord_device_token_for(&am, Some(a), &held(&am, Some(a)), false),
+            Ok(None)
+        );
+        // An opaque-claimless but otherwise usable legacy token: also none.
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3_600;
+        let claimless = format!(
+            "{}.{}.sig",
+            URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#),
+            URL_SAFE_NO_PAD
+                .encode(serde_json::json!({"sub_type": "device", "exp": exp}).to_string())
+        );
+        am.store_tokens(&claimless, "").unwrap();
+        let paired = _amb.dir().join("paired_user.json");
+        // Should-fix (fail closed): with NO paired_user.json the binding count
+        // is unmeasured, and the claimless token is refused...
+        let _ = std::fs::remove_file(&paired);
+        assert_eq!(
+            coord_device_token_for(&am, Some(a), &held(&am, Some(a)), false),
+            Ok(None)
+        );
+        // ...as it is for an unparseable file and for malformed v2 shapes...
+        for body in [
+            "{not json".to_string(),
+            serde_json::json!({"default_tenant_id": a, "bindings": "a"}).to_string(),
+            serde_json::json!({"default_tenant_id": a, "bindings": []}).to_string(),
+        ] {
+            std::fs::write(&paired, &body).unwrap();
+            assert_eq!(
+                coord_device_token_for(&am, Some(a), &held(&am, Some(a)), false),
+                Ok(None),
+                "claimless token must be refused beside {body}"
+            );
+        }
+        // Re-review P2: on a device MEASURED to hold one binding the claimless
+        // token IS a's (no slot for a)...
+        std::fs::write(
+            &paired,
+            serde_json::json!({"default_tenant_id": a, "bindings": [{"tenant_id": a}]}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            coord_device_token_for(&am, Some(a), &held(&am, Some(a)), false),
+            Ok(Some(claimless.clone()))
+        );
+        // ...a claimless token sitting in a's OWN slot is not handed out by the
+        // door (its provenance is the slot key alone)...
+        am.store_tenant_device_jwt(&a, &claimless).unwrap();
+        assert_eq!(
+            coord_device_token_for(&am, Some(a), &held(&am, Some(a)), false),
+            Ok(None)
+        );
+        am.clear_tenant_device_jwt(&a).unwrap();
+        // ...and on a two-binding device it is not.
+        std::fs::write(
+            &paired,
+            serde_json::json!({
+                "default_tenant_id": a,
+                "bindings": [{"tenant_id": a}, {"tenant_id": b}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            coord_device_token_for(&am, Some(a), &held(&am, Some(a)), false),
+            Ok(None)
+        );
+    }
+
+    /// Nit (re-review). A named-tenant lookup whose only candidate names another
+    /// tenant is a MISS, and a miss on an unreadable slot store is the typed
+    /// unreadable error — never `Ok(None)`.
+    #[test]
+    fn a_claim_mismatch_on_an_unreadable_store_is_the_unreadable_error() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (a, b) = (tenant(0xA1), tenant(0xB2));
+        let am = hermetic_auth_manager();
+        am.store_tokens(&jwt_for(b), "").unwrap();
+        am.clear_tenant_device_jwt(&b).unwrap();
+        let held = crate::auth::HeldDeviceTenants {
+            slots: Err("slot store io".into()),
+            default_binding: crate::auth::BindingTenantRead::Bound(a),
+            legacy_slot: Ok(false),
+        };
+        let err = coord_device_token_for(&am, Some(a), &held, false).unwrap_err();
+        assert!(err.contains("slot store io"), "{err}");
+    }
+
+    /// Final-review nit (a): the door fails CLOSED on a claimless token when
+    /// its own slot-store read failed — an unreadable store cannot show that t
+    /// has no slot, so the token is not handed out and the typed unreadable
+    /// error is returned, even though the selector (reading the store itself)
+    /// produced the token.
+    #[test]
+    fn a_claimless_token_is_not_handed_out_beside_an_unreadable_slot_store() {
+        let _amb = crate::test_env::isolated_ambient();
+        let a = tenant(0xA1);
+        let am = hermetic_auth_manager();
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3_600;
+        let claimless = format!(
+            "{}.{}.sig",
+            URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#),
+            URL_SAFE_NO_PAD
+                .encode(serde_json::json!({"sub_type": "device", "exp": exp}).to_string())
+        );
+        am.store_tokens(&claimless, "").unwrap();
+        am.clear_tenant_device_jwt(&a).unwrap();
+        std::fs::write(
+            _amb.dir().join("paired_user.json"),
+            serde_json::json!({"default_tenant_id": a, "bindings": [{"tenant_id": a}]}).to_string(),
+        )
+        .unwrap();
+        // Precondition: with a READABLE store the door hands the token out.
+        assert_eq!(
+            coord_device_token_for(&am, Some(a), &held(&am, Some(a)), false),
+            Ok(Some(claimless.clone()))
+        );
+        let unreadable = crate::auth::HeldDeviceTenants {
+            slots: Err("slot store io".into()),
+            default_binding: crate::auth::BindingTenantRead::Bound(a),
+            legacy_slot: Ok(true),
+        };
+        let err = coord_device_token_for(&am, Some(a), &unreadable, false).unwrap_err();
+        assert!(err.contains("slot store io"), "{err}");
+        assert!(
+            !err.contains(&claimless),
+            "a refusal must not carry the token it refused to hand out"
+        );
+        // S1: the TENANT-LESS arm interpolates the same HeldTenantsUnknown,
+        // whose Unreadable(e) carries a store error string. Same rule there.
+        let err = coord_device_token_for(&am, None, &unreadable, false).unwrap_err();
+        assert!(err.contains("slot store io"), "{err}");
+        assert!(
+            !err.contains(&claimless),
+            "the tenant-less refusal must not carry the token either"
+        );
+    }
+
+    #[test]
+    fn a_malformed_tenant_is_refused_not_read_as_absent() {
+        assert_eq!(parse_device_token_tenant(None), Ok(None));
+        assert_eq!(parse_device_token_tenant(Some("  ")), Ok(None));
+        let e = parse_device_token_tenant(Some("nope")).unwrap_err();
+        assert!(e.starts_with(DEVICE_TOKEN_TENANT_INVALID), "{e}");
+        let t = tenant(0xB2);
+        assert_eq!(parse_device_token_tenant(Some(&t.to_string())), Ok(Some(t)));
     }
 }

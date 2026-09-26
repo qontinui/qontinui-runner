@@ -1864,15 +1864,23 @@ mod web_integration_default_tests {
 mod cloud_sync_tests {
     use super::*;
 
-    /// Consent contract (plan 2026-07-09-runner-session-history-cloud-sync
-    /// gate 1): a fresh install AND an upgrading settings.json missing the
-    /// key must both land on `cloud_sync_enabled = false` — nothing leaves
-    /// the machine without an explicit opt-in.
+    /// Consent contract as of plan
+    /// `2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls`
+    /// §3.5 (`engineering-priorities` `capability-ships-enabled`): a fresh
+    /// install AND an upgrading settings.json missing the key must both
+    /// land on `cloud_sync_enabled = true` — ship-on-by-default, with
+    /// privacy governed by the reachable off-switch (this setting's own
+    /// save door) and by redaction, not by defaulting off. This inverts the
+    /// prior `cloud_sync_defaults_off` contract; see
+    /// `cloud_sync_explicit_value_round_trips` immediately below for the
+    /// complementary "an existing settings.json that wrote an explicit
+    /// value keeps it" half — the default only applies to a key that is
+    /// ABSENT.
     #[test]
-    fn cloud_sync_defaults_off() {
-        assert!(!Settings::default().cloud_sync_enabled);
+    fn cloud_sync_defaults_on() {
+        assert!(Settings::default().cloud_sync_enabled);
         let parsed: Settings = serde_json::from_str("{}").expect("empty object must deserialize");
-        assert!(!parsed.cloud_sync_enabled);
+        assert!(parsed.cloud_sync_enabled);
     }
 
     /// An explicit opt-in round-trips through serialization.
@@ -1883,6 +1891,22 @@ mod cloud_sync_tests {
         assert!(parsed.cloud_sync_enabled);
         let json = serde_json::to_string(&parsed).unwrap();
         assert!(json.contains("\"cloud_sync_enabled\":true"));
+    }
+
+    /// The default-flip in plan
+    /// `2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls`
+    /// only changes what an ABSENT key resolves to. A runner that already
+    /// wrote an explicit `false` into its own settings.json (opted out under
+    /// the old default, or via the save door) must keep that value — a
+    /// settings file is explicit prior state, never silently overwritten by
+    /// a later default change.
+    #[test]
+    fn cloud_sync_explicit_false_is_preserved() {
+        let parsed: Settings =
+            serde_json::from_str(r#"{"cloud_sync_enabled": false}"#).expect("must deserialize");
+        assert!(!parsed.cloud_sync_enabled);
+        let json = serde_json::to_string(&parsed).unwrap();
+        assert!(json.contains("\"cloud_sync_enabled\":false"));
     }
 }
 
@@ -2326,7 +2350,7 @@ mod ci_node_tests {
             serde_json::from_str::<Settings>("{}").expect("empty object must deserialize"),
         ] {
             assert!(!s.ci_node.enabled);
-            assert_eq!(s.ci_node.max_concurrent_builds, 1);
+            assert_eq!(s.ci_node.max_concurrent_builds, None);
             assert!(s.ci_node.repo_allowlist.is_empty());
             assert_eq!(s.ci_node.min_free_disk_gb, 20);
         }
@@ -2342,7 +2366,7 @@ mod ci_node_tests {
         )
         .expect("must deserialize");
         assert!(parsed.ci_node.enabled);
-        assert_eq!(parsed.ci_node.max_concurrent_builds, 2);
+        assert_eq!(parsed.ci_node.max_concurrent_builds, Some(2));
         assert_eq!(
             parsed.ci_node.repo_allowlist,
             vec!["qontinui/qontinui-runner".to_string()]
@@ -2359,9 +2383,66 @@ mod ci_node_tests {
     fn ci_node_partial_object_fills_defaults() {
         let parsed: Settings = serde_json::from_str(r#"{"ci_node": {"enabled": true}}"#).unwrap();
         assert!(parsed.ci_node.enabled);
-        assert_eq!(parsed.ci_node.max_concurrent_builds, 1);
+        assert_eq!(parsed.ci_node.max_concurrent_builds, None);
         assert!(parsed.ci_node.repo_allowlist.is_empty());
         assert_eq!(parsed.ci_node.min_free_disk_gb, 20);
+    }
+
+    /// An existing settings.json carrying `1` (the old default, written out
+    /// by every prior save) stays an explicit 1 — it is never reinterpreted
+    /// as "use the suggestion". And an explicit `null` round-trips as None.
+    #[test]
+    fn ci_node_explicit_one_stays_explicit_and_null_is_unset() {
+        let one: Settings =
+            serde_json::from_str(r#"{"ci_node": {"max_concurrent_builds": 1}}"#).unwrap();
+        assert_eq!(one.ci_node.max_concurrent_builds, Some(1));
+        let null: Settings =
+            serde_json::from_str(r#"{"ci_node": {"max_concurrent_builds": null}}"#).unwrap();
+        assert_eq!(null.ci_node.max_concurrent_builds, None);
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&null).unwrap()).unwrap();
+        assert_eq!(back.ci_node.max_concurrent_builds, None);
+    }
+
+    /// None is omitted on disk (older builds fail on `null` in a `u32`), and an
+    /// explicit value is written.
+    #[test]
+    fn ci_node_unset_capacity_is_omitted_on_disk() {
+        let unset = serde_json::to_value(CiNodeSettings::default()).unwrap();
+        assert!(
+            unset.get("max_concurrent_builds").is_none(),
+            "None must be omitted, not null: {unset}"
+        );
+        let set = serde_json::to_value(CiNodeSettings {
+            max_concurrent_builds: Some(4),
+            ..CiNodeSettings::default()
+        })
+        .unwrap();
+        assert_eq!(set["max_concurrent_builds"], 4);
+    }
+
+    /// The one accessor: an explicit value wins verbatim (floored at 1 for
+    /// admission); None resolves to the host suggestion.
+    #[test]
+    fn ci_node_effective_capacity_prefers_explicit_then_suggestion() {
+        use crate::ci_node::host_sizing::HostCapacity;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let big = HostCapacity {
+            mem_bytes: Some(368 * GIB),
+            cpus: 48,
+        };
+        let mut ci = CiNodeSettings::default();
+        assert_eq!(ci.configured_or_suggested_builds(big), 12);
+        assert_eq!(ci.effective_max_concurrent_builds_for(big), 12);
+        ci.max_concurrent_builds = Some(3);
+        assert_eq!(ci.configured_or_suggested_builds(big), 3);
+        assert_eq!(ci.effective_max_concurrent_builds_for(big), 3);
+        assert_eq!(ci.effective_max_concurrent_builds(), 3);
+        ci.max_concurrent_builds = Some(0);
+        assert_eq!(ci.configured_or_suggested_builds(big), 0);
+        assert_eq!(ci.effective_max_concurrent_builds_for(big), 1);
+        assert_eq!(ci.effective_max_concurrent_builds(), 1);
+        ci.max_concurrent_builds = None;
+        assert!(ci.effective_max_concurrent_builds() >= 1);
     }
 }
 
@@ -2669,9 +2750,21 @@ pub struct CiNodeSettings {
     #[serde(default)]
     pub enabled: bool,
     /// Maximum concurrent CI builds admitted by the executor, and the value
-    /// advertised via the device budget POST when enabled. Default 1.
-    #[serde(default = "default_ci_node_max_concurrent_builds")]
-    pub max_concurrent_builds: u32,
+    /// advertised via the device budget POST when enabled.
+    ///
+    /// `None` (the default, and what a missing key loads as) means "never
+    /// configured — use the host's suggestion"
+    /// ([`crate::ci_node::host_sizing::suggested_concurrent_builds`]).
+    /// `Some(n)` is an explicit operator value and always wins; an existing
+    /// settings.json carrying a number stays explicit. Read it through
+    /// [`CiNodeSettings::effective_max_concurrent_builds`], never directly, so
+    /// the advertised and admitted numbers cannot diverge.
+    ///
+    /// `None` is OMITTED on disk rather than written as `null`: an older runner
+    /// build reading this file (a rollback) treats a missing key as its own
+    /// default, but fails to parse `null` into its `u32`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_builds: Option<u32>,
     /// Repos this device may build. Entries match either the coord
     /// `owner/name` slug or the bare repo basename. Empty (the default)
     /// means no repo is runnable — allowlisting is a deliberate act.
@@ -2700,19 +2793,51 @@ pub struct CiNodeSettings {
     pub canonical_converge: bool,
 }
 
-fn default_ci_node_max_concurrent_builds() -> u32 {
-    1
-}
-
 fn default_ci_node_min_free_disk_gb() -> u64 {
     20
+}
+
+impl CiNodeSettings {
+    /// The CI slot count this node ADVERTISES for `host`: the explicit value
+    /// verbatim (including a deliberate `0`, an opinion the budget publish must
+    /// carry), else the host suggestion. Pure — `fleet::build_budget_request`
+    /// reads this.
+    pub(crate) fn configured_or_suggested_builds(
+        &self,
+        host: crate::ci_node::host_sizing::HostCapacity,
+    ) -> u32 {
+        match self.max_concurrent_builds {
+            Some(n) => n,
+            None => crate::ci_node::host_sizing::suggested_concurrent_builds(host),
+        }
+    }
+
+    /// The concurrency the executor ADMITS against for `host` — the same
+    /// number as [`Self::configured_or_suggested_builds`], floored at 1 exactly
+    /// as admission always has been (and as coord's `ci_dispatch` floors it).
+    /// Pure.
+    pub(crate) fn effective_max_concurrent_builds_for(
+        &self,
+        host: crate::ci_node::host_sizing::HostCapacity,
+    ) -> u32 {
+        self.configured_or_suggested_builds(host).max(1)
+    }
+
+    /// [`Self::effective_max_concurrent_builds_for`] against the live host.
+    /// An explicit value never touches the host; only `None` probes it.
+    pub fn effective_max_concurrent_builds(&self) -> u32 {
+        match self.max_concurrent_builds {
+            Some(n) => n.max(1),
+            None => self.effective_max_concurrent_builds_for(crate::ci_node::host_sizing::probe()),
+        }
+    }
 }
 
 impl Default for CiNodeSettings {
     fn default() -> Self {
         Self {
             enabled: false,
-            max_concurrent_builds: default_ci_node_max_concurrent_builds(),
+            max_concurrent_builds: None,
             repo_allowlist: Vec::new(),
             min_free_disk_gb: default_ci_node_min_free_disk_gb(),
             canonical_converge: false,
@@ -3293,10 +3418,21 @@ pub struct Settings {
     /// §3.1). When true, AI conversation transcript chunks and terminal
     /// session records are mirrored to the operator's coord tenant via the
     /// session outbox (warm tier ~7 days post-close, cold archive 90 days).
-    /// Default FALSE — with the toggle off the feature is inert: no outbox
-    /// entries, no network egress, nothing leaves this machine. A missing
-    /// key in an existing settings.json loads as false.
-    #[serde(default)]
+    /// Default TRUE as of plan
+    /// `2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls`
+    /// §3.5 — `engineering-priorities` `capability-ships-enabled`: this is a
+    /// user-preference axis, shipped ON with a reachable off-switch (this
+    /// setting's own save door, plus the desktop settings panel), not
+    /// off-by-default as a safety measure. Privacy is governed by that
+    /// reachable off-switch and by redaction (defense in depth,
+    /// `redact_secrets` / `effective_redact_secrets`), not by the default
+    /// being off. A missing key in an existing settings.json loads as true
+    /// (fresh install); an existing settings.json that already wrote an
+    /// EXPLICIT `false` keeps it — a settings file is explicit prior state
+    /// and is never silently overwritten by a default-flip (see
+    /// `default_true` below and the deserialize-vs-default distinction in
+    /// this struct's own `Default` impl doc comment).
+    #[serde(default = "default_true")]
     pub cloud_sync_enabled: bool,
     /// Session-metadata sync consent — gate 2 of the session-history
     /// cloud-sync consent model (split from `cloud_sync_enabled` per plan

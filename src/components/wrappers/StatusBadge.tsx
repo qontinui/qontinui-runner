@@ -3,14 +3,17 @@
  *
  * Visual mapping:
  *   - running    → emerald / green ("alive, accepting dispatches")
- *   - idle       → muted ("installed but no subprocess yet")
- *   - error      → red
- *   - degraded   → amber ("alive but health-check is failing")
- *   - unknown    → muted, italic
+ *   - stopped    → muted ("installed but no subprocess")
+ *   - degraded   → amber ("process alive, health-check failing — NOT routable")
+ *   - unknown    → muted, italic (the status read failed)
+ *
+ * Labels come from `wrapperStatusLabel` so the degraded pill states that
+ * dispatch will not reach the wrapper.
  */
 
-import { CircleDot, Circle, AlertTriangle, AlertCircle, HelpCircle } from "lucide-react";
+import { CircleDot, Circle, AlertTriangle, HelpCircle } from "lucide-react";
 import type { WrapperStatus } from "@/lib/wrappers/types";
+import { wrapperStatusLabel } from "@/lib/wrappers/status";
 
 export interface StatusBadgeProps {
   status?: WrapperStatus;
@@ -22,47 +25,37 @@ export interface StatusBadgeProps {
 
 const STYLES: Record<
   WrapperStatus,
-  { bg: string; text: string; border: string; Icon: typeof Circle; label: string }
+  { bg: string; text: string; border: string; Icon: typeof Circle }
 > = {
   running: {
     bg: "bg-emerald-500/10",
     text: "text-emerald-400",
     border: "border-emerald-500/40",
     Icon: CircleDot,
-    label: "Running",
   },
-  idle: {
+  stopped: {
     bg: "bg-muted/30",
     text: "text-muted-foreground",
     border: "border-border",
     Icon: Circle,
-    label: "Idle",
-  },
-  error: {
-    bg: "bg-red-500/10",
-    text: "text-red-400",
-    border: "border-red-500/40",
-    Icon: AlertCircle,
-    label: "Error",
   },
   degraded: {
     bg: "bg-amber-500/10",
     text: "text-amber-400",
     border: "border-amber-500/40",
     Icon: AlertTriangle,
-    label: "Degraded",
   },
   unknown: {
     bg: "bg-muted/20",
     text: "text-muted-foreground/70",
     border: "border-border",
     Icon: HelpCircle,
-    label: "Unknown",
   },
 };
 
 export function StatusBadge({ status = "unknown", label, size = "sm" }: StatusBadgeProps) {
-  const style = STYLES[status] ?? STYLES.unknown;
+  const known: WrapperStatus = Object.hasOwn(STYLES, status) ? status : "unknown";
+  const style = STYLES[known];
   const sizing = size === "md" ? "px-2.5 py-1 text-xs" : "px-2 py-0.5 text-[11px]";
   const Icon = style.Icon;
   return (
@@ -70,7 +63,7 @@ export function StatusBadge({ status = "unknown", label, size = "sm" }: StatusBa
       className={`inline-flex items-center gap-1.5 rounded-full border ${sizing} font-medium tracking-wide ${style.bg} ${style.text} ${style.border}`}
     >
       <Icon className="w-3 h-3" />
-      {label ?? style.label}
+      {label ?? wrapperStatusLabel(known)}
     </span>
   );
 }

@@ -834,6 +834,10 @@ fn pid_reads_its_terminal(_pid: u32) -> bool {
 /// process group (field 8, `tpgid`). The fields are read after the LAST `)`,
 /// because the command name in field 2 may itself contain spaces or `)`.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn stat_says_foreground(stat: &str) -> bool {
     let Some(close) = stat.rfind(')') else {
         return false;
@@ -1128,6 +1132,10 @@ fn reminder_close_tag_end(bytes: &[u8], start: usize) -> Option<usize> {
 /// since keeping the closer out is what keeps the field inside the envelope.
 /// Clean text — every real message — is borrowed, so the common path
 /// allocates nothing.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn neutralize_reminder_close(s: &str) -> Cow<'_, str> {
     let bytes = s.as_bytes();
     // `None` until the first match, so a clean field is returned borrowed.
@@ -2274,6 +2282,7 @@ mod tests {
             wind_down_at: None,
             finish_reason: None,
             finish_synced: false,
+            spawn_device_default: None,
         }
     }
 
@@ -2522,6 +2531,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn delivery_loop_reports_every_priority() {
         // Grep-shaped guard on the delivery loop itself (the async loop needs
         // a live `ApiState` and cannot be driven from a unit test): the

@@ -492,6 +492,10 @@ impl LoopController {
     ///
     /// Each agent produces a typed, serialized trace (PipelineAgentTrace) that
     /// enables per-agent benchmarking and replay.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     pub(super) async fn run_multi_agent_pipeline_loop(
         &self,
         config: &mut LoopConfig,
@@ -2458,6 +2462,10 @@ impl PipelineShared {
 
 /// L0 file tree: directory structure only (unique directory paths).
 /// Much smaller than the full file listing — typically 10-50x fewer lines.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub(super) fn get_file_tree_l0(project_path: &str) -> String {
     // Bounded: rebuilt on every pipeline-loop iteration.
     let mut cmd = crate::process_helpers::no_window("git");

@@ -1389,6 +1389,10 @@ mod tests {
     /// When the look-back offset lands exactly on a line start (the byte before
     /// it is a newline), that first line is whole and is NOT skipped.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn a_recent_tail_on_a_line_boundary_keeps_the_first_line() {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();

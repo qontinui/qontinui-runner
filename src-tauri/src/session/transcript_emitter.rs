@@ -24,13 +24,22 @@
 //! from the PTY counter, per the binding PK decision
 //! (`(session_id, stream, chunk_offset)` coord-side).
 //!
-//! ## Gates (all default-safe)
+//! ## Gates
 //!
-//! 1. **Runner-global** — `Settings.cloud_sync_enabled` (default false).
+//! 1. **Runner-global** — `Settings.cloud_sync_enabled`. Default `true` as
+//!    of plan `2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls`
+//!    §3.5 (`engineering-priorities` `capability-ships-enabled`: ship-on
+//!    with a reachable off-switch, not off-by-default) — an existing
+//!    settings.json that already wrote an explicit `false` keeps it.
 //!    Checked before anything is written: with the toggle off, no outbox
 //!    entry is created and nothing leaves the machine.
-//! 2. **Per-tenant** — enforced coord-side (`session_coordination_enabled`
-//!    + warm/cold quotas); the drain simply forwards.
+//! 2. **Per-tenant** — coord-side, on ingest (warm/cold quotas, and the
+//!    per-tenant consent column `coord.tenant_policies.transcript_sync_enabled`
+//!    from plan
+//!    `2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls`
+//!    §3.1–§3.3 — NOT `session_coordination_enabled`, which is the unrelated
+//!    Phase 10 dual-write flag). Whether coord enforces it is coord's code;
+//!    the drain simply forwards and this module makes no tenant-policy check.
 //! 3. **Per-session** — redaction, which ALWAYS runs. Workflow runs have no
 //!    coord-native [`super::Intent`] carrying a per-session opt-out (the
 //!    registrar binding is a plain id ↔ id index), so every transcript byte
@@ -502,11 +511,17 @@ impl TranscriptEmitter {
                 self.machine_id,
                 session_id,
                 SessionEventKind::OutputChunk,
-                json!({
-                    "stream": TRANSCRIPT_STREAM,
-                    "chunk_offset": end_offset,
-                    "payload_b64": base64::engine::general_purpose::STANDARD.encode(chunk),
-                }),
+                // The owning tenant picks the push's credential slot; the
+                // wire body is rebuilt from the named fields, so it never
+                // reaches coord.
+                self.registrar.stamp_tenant(
+                    session_id,
+                    json!({
+                        "stream": TRANSCRIPT_STREAM,
+                        "chunk_offset": end_offset,
+                        "payload_b64": base64::engine::general_purpose::STANDARD.encode(chunk),
+                    }),
+                ),
             ));
             end_offset += chunk.len() as i64;
         }
@@ -571,9 +586,21 @@ mod tests {
     /// SECOND emitter over the same outbox file + offset sidecar — i.e.
     /// model a runner restart.
     fn emitter_in(dir: &Path) -> (TranscriptEmitter, Arc<AiCoordRegistrar>, Arc<OutboxWriter>) {
+        emitter_with_tenant(dir, || None)
+    }
+
+    /// [`emitter_in`] with the registrar's new-session tenant injected.
+    fn emitter_with_tenant(
+        dir: &Path,
+        tenant: fn() -> Option<Uuid>,
+    ) -> (TranscriptEmitter, Arc<AiCoordRegistrar>, Arc<OutboxWriter>) {
         let outbox = Arc::new(OutboxWriter::open(dir.join("outbox.jsonl")).unwrap());
         let machine_id = Uuid::new_v4();
-        let registrar = Arc::new(AiCoordRegistrar::new(outbox.clone(), machine_id));
+        let registrar = Arc::new(AiCoordRegistrar::with_tenant_resolver(
+            outbox.clone(),
+            machine_id,
+            tenant,
+        ));
         let em = TranscriptEmitter::new(outbox.clone(), machine_id, registrar.clone());
         (em, registrar, outbox)
     }
@@ -624,6 +651,24 @@ mod tests {
                 .unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn transcript_chunks_carry_the_sessions_owning_tenant() {
+        // qontinui-runner#1702 follow-up: an AI session is not in
+        // SessionRegistry, so a chunk with no top-level `tenant_id` resolves to
+        // `TenantScope::Unresolved` — unauthenticated on a multi-bound device.
+        const TENANT: Uuid = Uuid::from_u128(0xc231d9da_0ca8_4fe4_bd81_0e3d6c20339a);
+        let dir = tempdir().unwrap();
+        let (em, registrar, outbox) = emitter_with_tenant(dir.path(), || Some(TENANT));
+        let (trid, sid) = linked_run(&registrar, &outbox);
+
+        em.emit_inner(&trid, "a block");
+
+        let rows = transcript_rows(&outbox);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, sid);
+        assert_eq!(rows[0].payload["tenant_id"], json!(TENANT));
     }
 
     #[test]

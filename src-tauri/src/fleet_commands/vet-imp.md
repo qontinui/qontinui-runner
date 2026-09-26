@@ -356,6 +356,14 @@ also what makes the nested renewals below work at all: without an owner token,
 - **`renewed`**, or a **`held` whose `current_holder_session` equals your own
   `$AGENT_SESSION_ID`** — this session already holds it. Proceed, and leave the
   release to whoever acquired it.
+  **`renewed` is only as narrow as the door's owner token.** Over
+  `coord_reserve_resource` (MCP) that token is the bare DEVICE, so a second
+  session on this same box re-reserving the plan ALSO reads `renewed`; only the
+  HTTP `/claims/acquire` fallback, which carries `agent_session_id`, makes it
+  session-scoped. So a `renewed` is YOUR hold only if something earlier in THIS
+  session reserved the plan (you are nested under `/vet-imp`, or this run
+  re-reserves its own key). If nothing did, treat it as `held` by a same-box
+  peer — the rule below.
 - **`held` by a DIFFERENT owner — STOP.** Do not push, do not invoke `/vet-plan`.
   Report the holder and surface to the operator via `AskUserQuestion` (header
   `Plan reserved`, options **Abort** / **Wait** — poll every 30 s, then
@@ -500,7 +508,10 @@ bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh ad
   --kind semantic_resource \
   --key "plan:<plan-stem>" \
   --ttl "<ttl_seconds>"
-bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh start --ledger "$CLAIM_LEDGER"
+# --max-runtime 604800 (7 days): this is the LONGEST lifecycle chain of the
+# three — session 93078f26 ran one vet-imp-style effort for twelve days and
+# lapsed five hand-raised ceilings (12h, 12h, 24h, 48h, 168h) before it gave up.
+bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh start --ledger "$CLAIM_LEDGER" --max-runtime 604800
 ```
 
 `start` detaches a background loop that re-heartbeats each row when THAT row
@@ -508,19 +519,23 @@ falls due — every min(max(its own TTL/3, 60 s), TTL/2) since its last ok —
 replaying the owner token
 `<machine_id>:<agent_session_id>` on every request — coord matches on that pair,
 so a heartbeat without it does not renew anything and the claim ages out
-regardless. **It does not answer `not_held`** - that is the release door's word.
-`HeartbeatResult` (`claims.rs`) is `ok` or `stolen` today, so the discriminator
+regardless. On a coord predating qontinui/qontinui-coord#2206 the heartbeat
+never answered `not_held` (that was only the release door's word):
+`HeartbeatResult` (`claims.rs`) was `ok` or `stolen`, so the discriminator
 is `current_holder`, not the verdict word: a NAMED holder is a token mismatch or
 a theft (drop the owner token and coord names *you*, since you are still the
 stored owner), while `current_holder: null` is a claim that had already expired.
 `scripts/coord-claim-heartbeat.sh` makes that split and records the null case
 `lapsed`. Opposite recoveries - fix the owner token, versus re-`acquire` - so
-read `current_holder`. (qontinui/qontinui-coord#2206, still OPEN, gives the
-expired case its own `not_held` verdict here; `hb_row` already maps it.)
+read `current_holder`. That is a coord PREDATING qontinui/qontinui-coord#2206;
+#2206 landed 2026-09-17 and is deployed, and a current coord answers the expired
+case `not_held` here, with a named holder always on `stolen`. `hb_row` maps both
+spellings.
 
 Read the loop at any point with `status`, which prints one line per row plus a
 verdict on its **exit code**: `LIVE` (0), `STALE` (3), `DEAD` (4), `STOLEN` (5),
-`LAPSED` (7), `EMPTY` (8).
+`LAPSED` (7), `EMPTY` (8), `MAX_RUNTIME` (9 — the loop ended on its own
+`--max-runtime` ceiling, not a coord verdict; re-`add` then `start`).
 
 ```bash
 bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh status --ledger "$CLAIM_LEDGER"

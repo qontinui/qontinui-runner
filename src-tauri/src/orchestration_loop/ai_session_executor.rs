@@ -144,18 +144,24 @@ pub fn build_report_instruction(run_id: Uuid, task_id: &str, report_url: &str) -
          [ORCHESTRATION REPORT CONTRACT — REQUIRED]\n\
          You are a worker subtask in an orchestrated run. When you have FINISHED \
          this subtask you MUST report a structured result before stopping:\n\n\
-         1. Call the runner MCP tool `orchestration_report_subtask` with EXACTLY:\n\
+         1. Call the runner MCP tool `orchestration_report_subtask` (served on \
+            the `coord-mcp` server, so it may be listed as \
+            `mcp__coord-mcp__orchestration_report_subtask`) with EXACTLY this \
+            shape. Every array element carries the fields shown; any array may \
+            be empty, and `blockingForDependents` defaults to false:\n\
             {{\n\
               \"run_id\": \"{run_id}\",\n\
               \"task_id\": \"{task_id}\",\n\
               \"completion_report\": {{\n\
                 \"summaryMd\": \"<markdown summary of what you did>\",\n\
                 \"deliverables\": [{{\"kind\": \"pr|commit|file|endpoint|schema-change|spec|other\", \"reference\": \"<ref>\", \"description\": \"<one line>\"}}],\n\
-                \"breakingChanges\": [],\n\
-                \"followUps\": []\n\
+                \"breakingChanges\": [{{\"area\": \"<subsystem>\", \"description\": \"<what broke and what dependents must do>\", \"migrationStepsMd\": \"<markdown steps, or empty>\"}}],\n\
+                \"followUps\": [{{\"description\": \"<the loose end>\", \"priority\": \"critical|important|nice-to-have\", \"blockingForDependents\": false}}]\n\
               }}\n\
             }}\n\
-            (If you have no runner MCP client, POST the same JSON to `{report_url}`.)\n\
+            (If you have no MCP client for it, POST the same JSON to `{report_url}`.) \
+            A malformed report is refused with the expected schema and your \
+            subtask is NOT failed: correct the report and call again.\n\
          2. Only AFTER the tool returns success, you MAY print `[TASK_COMPLETE]` \
             on its own line. The sentinel alone is NOT sufficient — the report \
             is what marks you done.\n\
@@ -174,7 +180,151 @@ fn report_endpoint_url(app_handle: &tauri::AppHandle) -> String {
         .map(|s| s.api_port.load(std::sync::atomic::Ordering::Relaxed))
         .filter(|p| *p != 0)
         .unwrap_or(crate::mcp::types::MCP_API_PORT);
-    format!("http://localhost:{port}/orchestration/report-subtask")
+    // The runner binds the IPv4 loopback only, and `localhost` resolves to
+    // `::1` first on Windows — a doomed connect before the one that answers.
+    format!("http://127.0.0.1:{port}/orchestration/report-subtask")
+}
+
+/// How long [`dispatch_subtask`] reuses a subtask's last isolation refusal
+/// before asking coord to allocate again.
+///
+/// Every `POST /agents/allocate` mints a coord allocation row, and the
+/// conductor retries a refused row on every 5 s tick. Without this, a subtask
+/// coord keeps answering `wait` for — a state that is by design unbounded —
+/// would mint roughly 720 rows an hour, and a refused `shared_branch` about 60
+/// before its run stalls. Coord's `retry_when` is free text, so it is reported
+/// rather than parsed; a fixed interval bounds the churn instead.
+const ISOLATION_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Per-subtask memory of the last isolation refusal, so a retry inside
+/// [`ISOLATION_RETRY_BACKOFF`] returns the same answer without re-allocating.
+/// Process-local on purpose: a restart simply asks coord again.
+#[derive(Default)]
+pub(crate) struct IsolationBackoff {
+    entries: std::collections::HashMap<(Uuid, String), (std::time::Instant, DispatchError)>,
+}
+
+impl IsolationBackoff {
+    /// The refusal to repeat for `(run_id, task_id)` at `now`, or `None` when
+    /// there is none or its backoff has elapsed. Expired entries are dropped.
+    pub(crate) fn pending(
+        &mut self,
+        run_id: Uuid,
+        task_id: &str,
+        now: std::time::Instant,
+    ) -> Option<DispatchError> {
+        self.entries
+            .retain(|_, (at, _)| now.duration_since(*at) < ISOLATION_RETRY_BACKOFF);
+        self.entries
+            .get(&(run_id, task_id.to_string()))
+            .map(|(_, e)| e.clone())
+    }
+
+    /// Remember a non-terminal refusal. A terminal one never retries, so it is
+    /// not recorded.
+    pub(crate) fn record(
+        &mut self,
+        run_id: Uuid,
+        task_id: &str,
+        now: std::time::Instant,
+        error: DispatchError,
+    ) {
+        self.entries
+            .insert((run_id, task_id.to_string()), (now, error));
+    }
+
+    /// Forget a subtask once it got its worktree.
+    pub(crate) fn clear(&mut self, run_id: Uuid, task_id: &str) {
+        self.entries.remove(&(run_id, task_id.to_string()));
+    }
+}
+
+static ISOLATION_BACKOFF: std::sync::LazyLock<std::sync::Mutex<IsolationBackoff>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn isolation_backoff() -> std::sync::MutexGuard<'static, IsolationBackoff> {
+    ISOLATION_BACKOFF
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// How [`dispatch_subtask`] reports a subtask that got no isolated worktree.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct IsolationRefusal {
+    /// What the conductor reads. [`DispatchError::Transient`] keeps the row
+    /// queued and out of the stall fingerprint; [`DispatchError::Failed`]
+    /// leaves it `Submitted` but fingerprinted, so a permanent cause stalls the
+    /// run naming it.
+    pub error: DispatchError,
+    /// `true` when retrying cannot change the answer, so the row is marked
+    /// `Failed` before the error is returned.
+    pub terminal: bool,
+}
+
+/// Classify why a worker got no isolated worktree. Pure, so every arm is
+/// unit-tested without a live allocation (plan
+/// `2026-09-23-conductor-e2e-phase1-defects` Phase 1):
+///
+/// - coord's `wait`, or a claim another agent holds → `Transient`, carrying
+///   coord's reason and `retry_when`: coord said "not yet", not "no";
+/// - worktree mode off → `Failed` and TERMINAL: a standing configuration;
+/// - anything else (coord's `shared_branch` refused, transport blips, coord
+///   5xx, `git worktree add` failures) → `Failed`, NOT terminal, since a
+///   transport blip can clear on a retry and the stall window still bounds a
+///   permanent cause.
+///
+/// Every `Failed` message leads with the `no_isolated_worktree` token the
+/// continuation path uses for the same condition.
+pub(crate) fn isolation_refusal(
+    task_id: &str,
+    repo: &str,
+    err: &crate::agent_worktree::isolated_edit::WorkerIsolationError,
+) -> IsolationRefusal {
+    use crate::agent_worktree::isolated_edit::WorkerIsolationError;
+    use crate::agent_worktree::{AllocateError, NO_ISOLATED_WORKTREE};
+
+    match err {
+        WorkerIsolationError::Allocate(AllocateError::Wait(w)) => IsolationRefusal {
+            error: DispatchError::Transient(format!(
+                "dispatch_subtask: {task_id} not dispatched — coord answered wait for {repo} \
+                 (reason={}, blocking={}, retry_when={}). Transient: the subtask stays queued \
+                 and a later tick retries.",
+                w.reason.as_deref().unwrap_or("-"),
+                w.blocking.as_deref().unwrap_or("-"),
+                w.retry_when.as_deref().unwrap_or("-"),
+            )),
+            terminal: false,
+        },
+        WorkerIsolationError::Allocate(e @ AllocateError::ClaimConflict(_)) => IsolationRefusal {
+            error: DispatchError::Transient(format!(
+                "dispatch_subtask: {task_id} not dispatched — {e} for {repo}. Transient: the \
+                 subtask stays queued and a later tick retries."
+            )),
+            terminal: false,
+        },
+        WorkerIsolationError::ModeOff => IsolationRefusal {
+            error: DispatchError::Failed(format!(
+                "{NO_ISOLATED_WORKTREE}: worktree mode is off, so subtask {task_id} ({repo}) is \
+                 not dispatched into the shared checkout"
+            )),
+            terminal: true,
+        },
+        WorkerIsolationError::Allocate(e) => {
+            let e = e.to_string();
+            let message = if e.starts_with(NO_ISOLATED_WORKTREE) {
+                format!("{e} (subtask {task_id} not dispatched)")
+            } else {
+                format!(
+                    "{NO_ISOLATED_WORKTREE}: subtask {task_id} ({repo}) not dispatched — \
+                     worktree allocate failed: {e}"
+                )
+            };
+            IsolationRefusal {
+                error: DispatchError::Failed(message),
+                terminal: false,
+            }
+        }
+    }
 }
 
 /// DISPATCH — turn one ready [`Subtask`] into a live worker AI-session tab.
@@ -185,10 +335,12 @@ fn report_endpoint_url(app_handle: &tauri::AppHandle) -> String {
 /// [`worker_terminal_state`] and gate completion via [`can_complete`].
 ///
 /// Steps (contract §1):
-/// 1. Allocate an isolated worktree for `subtask.repo` (when `Some`) via the
-///    shared `acquire_for_terminal` path — same helper `terminal_create` uses,
-///    so the worker edits an isolated checkout when `QONTINUI_AGENT_WORKTREE_MODE`
-///    is on and the shared cwd otherwise.
+/// 1. Allocate an isolated worktree for `subtask.repo` (when `Some`) via
+///    `acquire_for_worker`, the fail-closed sibling of the terminal helper. No
+///    worktree means no worker: coord's `wait` or a held claim is
+///    [`DispatchError::Transient`], anything else is [`DispatchError::Failed`],
+///    and worktree mode being off also marks the row `Failed` — see
+///    [`isolation_refusal`].
 /// 2. **Re-pick** the lowest-utilization Claude account via `pick_best_account`
 ///    — PER DISPATCH, not once per run, so account exhaustion across a long run
 ///    is mitigated.
@@ -316,10 +468,7 @@ pub async fn dispatch_subtask(
                 );
             }
             warn!("dispatch_subtask: {} refused: {refusal}", subtask.task_id);
-            if let Err(e) = pg
-                .set_subtask_state(run_id, &subtask.task_id, SubtaskState::Failed)
-                .await
-            {
+            if let Err(e) = pg.fail_subtask(run_id, &subtask.task_id, &refusal).await {
                 warn!(
                     "dispatch_subtask: could not mark {} Failed after an authorization \
                      refusal: {e}",
@@ -356,25 +505,74 @@ pub async fn dispatch_subtask(
         }
     };
 
-    // 1. Worktree allocation (best-effort, mirrors terminal_create). When
-    //    `repo` is None the helper is a no-op and returns the default cwd.
-    let default_cwd = std::env::current_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| ".".to_string());
+    // 1. Worktree allocation. A subtask that declares a `repo` gets an isolated
+    //    worktree or is NOT dispatched: unlike an operator's terminal, a worker
+    //    never falls back to the shared checkout (plan
+    //    `2026-09-23-conductor-e2e-phase1-defects` Phase 1). `repo: None` still
+    //    runs in the runner's process cwd — recorded in that plan as residual.
     let purpose = format!(
         "orchestration worker {}: {}",
         subtask.task_id, subtask.title
     );
-    let (working_dir_opt, isolated_ctx) =
-        crate::agent_worktree::isolated_edit::acquire_for_terminal(
-            subtask.repo.as_deref(),
-            &purpose,
-            Some(default_cwd.clone()),
-            Some(task_run_id),
-            None,
-        )
-        .await;
-    let working_dir = working_dir_opt.unwrap_or(default_cwd);
+    let (working_dir, isolated_ctx) = match subtask.repo.as_deref() {
+        None => {
+            let cwd = std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| ".".to_string());
+            // Still provisioned, as `acquire_for_terminal` did for this arm:
+            // the cwd `.mcp.json` is how a worker reaches the coord-mcp proxy.
+            crate::agent_worktree::isolated_edit::provision_session_cwd(&cwd, false, None);
+            (cwd, None)
+        }
+        Some(repo) => {
+            // Inside the backoff after a refusal: answer as before, without
+            // minting another coord allocation (see ISOLATION_RETRY_BACKOFF).
+            if let Some(repeat) =
+                isolation_backoff().pending(run_id, &subtask.task_id, std::time::Instant::now())
+            {
+                return Err(repeat);
+            }
+            match crate::agent_worktree::isolated_edit::acquire_for_worker(
+                repo,
+                &purpose,
+                Some(task_run_id),
+                None,
+            )
+            .await
+            {
+                Ok((wd, ctx)) => {
+                    isolation_backoff().clear(run_id, &subtask.task_id);
+                    (wd, Some(ctx))
+                }
+                Err(e) => {
+                    let refusal = isolation_refusal(&subtask.task_id, repo, &e);
+                    if refusal.terminal {
+                        // A standing decision, like the authorization refusal
+                        // above: mark the row Failed FIRST so the conductor stops
+                        // re-deciding it every tick.
+                        if let Err(pe) = pg
+                            .fail_subtask(run_id, &subtask.task_id, &refusal.error.to_string())
+                            .await
+                        {
+                            warn!(
+                                "dispatch_subtask: could not mark {} Failed after an \
+                                 isolation refusal: {pe}",
+                                subtask.task_id
+                            );
+                        }
+                    } else {
+                        isolation_backoff().record(
+                            run_id,
+                            &subtask.task_id,
+                            std::time::Instant::now(),
+                            refusal.error.clone(),
+                        );
+                    }
+                    return Err(refusal.error);
+                }
+            }
+        }
+    };
 
     // 2. Re-pick the lowest-utilization account for THIS dispatch (account
     //    exhaustion mitigation — never pin once per run). No-op unless
@@ -538,6 +736,7 @@ pub async fn dispatch_subtask(
                 wind_down_at: None,
                 finish_reason: None,
                 finish_synced: false,
+                spawn_device_default: None,
             },
         );
         info!(
@@ -680,6 +879,7 @@ mod tests {
             produced_by: None,
             gate_id: None,
             gate_status: None,
+            state_reason: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -756,6 +956,141 @@ mod tests {
         assert!(!can_complete(&st, WorkerSignal::Gone));
     }
 
+    // --- isolation_refusal: a worker never falls back to the shared cwd ----
+    //
+    // Plan `2026-09-23-conductor-e2e-phase1-defects` Phase 1. `dispatch_subtask`
+    // returns this refusal BEFORE the account pick and the spawn, so every arm
+    // below is a dispatch that spawned no session and — unless `terminal` —
+    // left the row `Submitted`.
+
+    use crate::agent_worktree::isolated_edit::WorkerIsolationError;
+    use crate::agent_worktree::{AllocateError, ClaimConflict, WaitOutcome};
+
+    #[test]
+    fn coords_wait_is_transient_and_carries_its_reason_and_retry_when() {
+        let r = isolation_refusal(
+            "T1",
+            "qontinui-runner",
+            &WorkerIsolationError::Allocate(AllocateError::Wait(WaitOutcome {
+                agent_id: "a1".to_string(),
+                reason: Some("upstream PR in flight".to_string()),
+                blocking: Some("qontinui-runner#1".to_string()),
+                retry_when: Some("after merge".to_string()),
+            })),
+        );
+        assert!(!r.terminal, "a wait is not a standing decision");
+        assert!(r.error.transient(), "{:?}", r.error);
+        let text = r.error.to_string();
+        assert!(text.contains("upstream PR in flight"), "{text}");
+        assert!(text.contains("after merge"), "{text}");
+    }
+
+    #[test]
+    fn a_held_claim_is_transient() {
+        let r = isolation_refusal(
+            "T1",
+            "qontinui-runner",
+            &WorkerIsolationError::Allocate(AllocateError::ClaimConflict(ClaimConflict {
+                kind: "phase".to_string(),
+                resource_key: "plan:p:phase:1".to_string(),
+                current_holder: "peer".to_string(),
+                intent: None,
+            })),
+        );
+        assert!(!r.terminal);
+        assert!(r.error.transient(), "{:?}", r.error);
+        assert!(r.error.to_string().contains("claim already held"));
+    }
+
+    #[test]
+    fn any_other_allocate_error_is_failed_but_retried() {
+        let r = isolation_refusal(
+            "T1",
+            "qontinui-runner",
+            &WorkerIsolationError::Allocate(AllocateError::Other(
+                "POST https://coord/agents/allocate returned 503".to_string(),
+            )),
+        );
+        assert!(!r.terminal, "a transport blip can clear on a retry");
+        assert!(matches!(r.error, DispatchError::Failed(_)), "{:?}", r.error);
+        let text = r.error.to_string();
+        assert!(text.starts_with("no_isolated_worktree: "), "{text}");
+        assert!(text.contains("503"), "{text}");
+    }
+
+    #[test]
+    fn worktree_mode_off_is_terminal() {
+        let r = isolation_refusal("T1", "qontinui-runner", &WorkerIsolationError::ModeOff);
+        assert!(r.terminal, "mode off is a standing configuration");
+        assert!(matches!(r.error, DispatchError::Failed(_)), "{:?}", r.error);
+        let text = r.error.to_string();
+        assert!(
+            text.starts_with("no_isolated_worktree: worktree mode is off"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_refused_shared_branch_is_failed_and_keeps_its_token_first() {
+        let refusal = crate::agent_worktree::shared_branch_policy_refusal(&[
+            crate::agent_worktree::RepoRequest {
+                repo: "qontinui-runner".to_string(),
+                parent_sha: None,
+            },
+        ]);
+        let r = isolation_refusal(
+            "T1",
+            "qontinui-runner",
+            &WorkerIsolationError::Allocate(AllocateError::Other(refusal.to_string())),
+        );
+        assert!(!r.terminal);
+        assert!(matches!(r.error, DispatchError::Failed(_)), "{:?}", r.error);
+        let text = r.error.to_string();
+        assert!(
+            text.starts_with("no_isolated_worktree: coord chose shared_branch"),
+            "{text}"
+        );
+        assert!(text.contains("T1"), "{text}");
+    }
+
+    // --- IsolationBackoff: a refused subtask does not re-allocate every tick --
+
+    #[test]
+    fn a_refusal_repeats_inside_the_backoff_and_expires_after_it() {
+        let mut b = IsolationBackoff::default();
+        let run = Uuid::new_v4();
+        let t0 = std::time::Instant::now();
+        assert_eq!(b.pending(run, "T1", t0), None);
+
+        let wait = DispatchError::Transient("coord answered wait".to_string());
+        b.record(run, "T1", t0, wait.clone());
+        let inside = t0 + ISOLATION_RETRY_BACKOFF - std::time::Duration::from_secs(1);
+        assert_eq!(b.pending(run, "T1", inside), Some(wait));
+        assert_eq!(b.pending(run, "T2", inside), None, "keyed per subtask");
+        assert_eq!(
+            b.pending(Uuid::new_v4(), "T1", inside),
+            None,
+            "keyed per run"
+        );
+
+        assert_eq!(b.pending(run, "T1", t0 + ISOLATION_RETRY_BACKOFF), None);
+    }
+
+    #[test]
+    fn a_granted_worktree_clears_the_backoff() {
+        let mut b = IsolationBackoff::default();
+        let run = Uuid::new_v4();
+        let t0 = std::time::Instant::now();
+        b.record(
+            run,
+            "T1",
+            t0,
+            DispatchError::Failed("no_isolated_worktree: x".into()),
+        );
+        b.clear(run, "T1");
+        assert_eq!(b.pending(run, "T1", t0), None);
+    }
+
     // --- build_report_instruction inlines identity --------------------------
 
     #[test]
@@ -764,9 +1099,24 @@ mod tests {
         let block = build_report_instruction(
             run,
             "T42",
-            "http://localhost:9876/orchestration/report-subtask",
+            "http://127.0.0.1:9876/orchestration/report-subtask",
         );
         assert!(block.contains(&run.to_string()), "run_id must be inlined");
+        // Phase 3 (P1-4): the element shapes are spelled out, so a worker
+        // cannot guess a `followUps` entry wrong and be refused for it.
+        for field in [
+            "\"priority\"",
+            "\"blockingForDependents\"",
+            "critical|important|nice-to-have",
+            "\"area\"",
+            "\"migrationStepsMd\"",
+        ] {
+            assert!(block.contains(field), "instruction must name {field}");
+        }
+        assert!(
+            block.contains("http://127.0.0.1:9876/"),
+            "the fallback URL is the IPv4 loopback"
+        );
         assert!(
             block.contains("\"task_id\": \"T42\""),
             "task_id must be inlined"

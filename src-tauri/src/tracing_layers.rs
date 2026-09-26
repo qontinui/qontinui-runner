@@ -154,11 +154,19 @@ impl JsonlSpanLayer {
     }
 
     /// Generate a trace ID (shared within a trace tree)
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn generate_trace_id() -> String {
         uuid::Uuid::new_v4().to_string()[..8].to_string()
     }
 
     /// Generate a span ID
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn generate_span_id() -> String {
         uuid::Uuid::new_v4().to_string()[..12].to_string()
     }

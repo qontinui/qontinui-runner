@@ -57,10 +57,14 @@
 //!
 //! ## Gates + posture
 //!
-//! 1. **Consent gate (hard)** — `Settings.cloud_sync_enabled` (default
-//!    false). Checked BEFORE anything else: with the toggle off,
-//!    [`enqueue_memory_record`] returns without writing to the outbox (or
-//!    even materializing it), so nothing leaves the machine.
+//! 1. **Consent gate (hard)** — `Settings.cloud_sync_enabled`. Default
+//!    `true` as of plan
+//!    `2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls`
+//!    §3.5 (ship-on with a reachable off-switch, per `engineering-priorities`
+//!    `capability-ships-enabled`) — an existing settings.json that already
+//!    wrote an explicit `false` keeps it. Checked BEFORE anything else: with
+//!    the toggle off, [`enqueue_memory_record`] returns without writing to
+//!    the outbox (or even materializing it), so nothing leaves the machine.
 //! 2. **Redaction** — every record's title + content pass through the shared
 //!    [`crate::session::redact`] sweep BEFORE the durable outbox write, so a
 //!    planted secret never persists locally, let alone egresses.
@@ -861,6 +865,10 @@ fn redact_text(s: &str) -> String {
 }
 
 /// Truncate to at most `max_bytes` bytes on a char boundary.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;

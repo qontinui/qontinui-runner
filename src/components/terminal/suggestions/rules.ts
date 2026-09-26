@@ -27,7 +27,17 @@
  *     exposes a match query).
  */
 
-import type { SessionState, ZoneAssignments } from "../useZoneLayout";
+// The ONE count→preset ladder (`useZoneLayout.pickLayout`). This file used to
+// carry its own copy, which had drifted: it had no `>= 10 → flow-grid` rung, so
+// past 9 tabs it suggested `full-grid` — a layout that cannot show them all.
+import {
+  FLOW_GRID_ID,
+  LAYOUT_PRESETS,
+  pickLayout,
+  synthesizeFlowGrid,
+  type SessionState,
+  type ZoneAssignments,
+} from "../useZoneLayout";
 
 /** Read-only snapshot of every piece of state the rules can branch on. */
 export interface SuggestionContext {
@@ -73,36 +83,13 @@ export interface ChipCandidate {
   args: Record<string, unknown>;
 }
 
-/** Pick the smallest layout preset that fits N tabs. Mirrors the helper
- *  in `TerminalPage.tsx` (intentionally duplicated — both ride on the
- *  same `LAYOUT_PRESETS` definition; collapsing into one shared helper
- *  is a Phase 9 cleanup). */
-function pickLayout(totalTabs: number): string {
-  if (totalTabs >= 7) return "full-grid";
-  if (totalTabs >= 5) return "six-pack";
-  if (totalTabs >= 3) return "quad";
-  if (totalTabs >= 2) return "split";
-  return "single";
-}
-
 /**
- * Pretty-name a layout preset for the chip headline.
+ * Pretty-name a layout preset for the chip headline — the preset table's own
+ * display name, so this file carries no layout-id literals of its own.
  */
-function prettyLayoutName(preset: string): string {
-  switch (preset) {
-    case "full-grid":
-      return "Full grid";
-    case "six-pack":
-      return "6-pack";
-    case "quad":
-      return "Quad";
-    case "split":
-      return "Split";
-    case "single":
-      return "Single";
-    default:
-      return preset;
-  }
+function prettyLayoutName(preset: string, tabsCount: number): string {
+  if (preset === FLOW_GRID_ID) return synthesizeFlowGrid(tabsCount).name;
+  return LAYOUT_PRESETS.find((l) => l.id === preset)?.name ?? preset;
 }
 
 const ELAPSED_NEEDS_INPUT_MS = 30_000;
@@ -203,7 +190,7 @@ export function ruleLayoutMismatch(ctx: SuggestionContext): ChipCandidate[] {
       ruleId: "layout-mismatch",
       zoneIdx: ctx.focusedZone,
       priority: 30,
-      headline: `Switch to ${prettyLayoutName(suggested)} — show all ${ctx.tabsCount} sessions`,
+      headline: `Switch to ${prettyLayoutName(suggested, ctx.tabsCount)} — show all ${ctx.tabsCount} sessions`,
       slash: `/layout ${suggested}`,
       actionId: "terminal.layout",
       args: { preset: suggested },
@@ -250,8 +237,6 @@ export function reconcileChips(
   }
   // Cap at maxOnPage — drop the lowest-priority chips first.
   if (byZone.size <= maxOnPage) return byZone;
-  const sorted = [...byZone.entries()].sort(
-    (a, b) => b[1].priority - a[1].priority,
-  );
+  const sorted = [...byZone.entries()].sort((a, b) => b[1].priority - a[1].priority);
   return new Map(sorted.slice(0, maxOnPage));
 }

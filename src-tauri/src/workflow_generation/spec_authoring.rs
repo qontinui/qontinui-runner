@@ -1950,6 +1950,10 @@ mod tests {
     ///
     /// Deliberately derived from the SQL rather than hand-copied: the point of
     /// the bind test is that nobody has to keep two lists in their head.
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn placeholders(sql: &str) -> (usize, std::collections::BTreeSet<usize>) {
         let mut used = std::collections::BTreeSet::new();
         let bytes = sql.as_bytes();
@@ -2005,6 +2009,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn page_history_placeholders_read_in_visual_order() {
         // `page_label` and `app_id` are both `&str`, so transposing them in the
         // bind slice compiles clean AND executes clean — both sides are TEXT —

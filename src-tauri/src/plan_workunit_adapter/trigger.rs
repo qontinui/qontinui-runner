@@ -46,6 +46,7 @@ use super::push::{
     push_archive_metadata, push_work_unit, push_work_unit_with_remote,
     push_work_unit_with_status_write, PushOutcomeKind, SetDepsOutcome, StatusWrite, WorkUnitSink,
 };
+use super::ref_scan::CycleRefPin;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1177,54 +1178,6 @@ fn blob_cache_tick() -> u64 {
     N.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Fetches already performed, keyed by `(repo_root, default_ref)`, with the
-/// instant each succeeded.
-///
-/// The scan's byte source is resolved PER CONSUMER — the work-unit reconcile
-/// and the document layer each resolve it, and the document layer once per
-/// root — and `resolve_scan_source` fetches. Without this memo one cycle
-/// fetches the same ref `1 + roots` times, which is not merely wasteful: it is
-/// a repeated WRITE into a checkout other agents are working in, each attempt
-/// can fail independently (taking one layer dark on a cycle the other
-/// succeeded on), and two fetches straddling a push make the bodies published
-/// come from a different ref state than the census reported beside them —
-/// breaking the one-cycle coherence the scan-root report claims.
-///
-/// **What this buys is COST, plus only a NARROW slice of coherence — it does
-/// not make the two halves read one ref state, and an earlier draft of this
-/// comment claimed it did.** Two things defeat that claim. A cycle slower than
-/// the TTL re-fetches mid-cycle — and the scan's own call-site comment measures
-/// a cold first cycle in MINUTES, far past this TTL. And suppressing THIS
-/// process's fetch does nothing about a PEER's `git fetch` in the same shared
-/// checkout, which is routine here and can advance the ref between the two
-/// halves' independent `rev_parse` calls. Closing that needs ONE resolved sha
-/// shared between the halves, which this deliberately does not do. So: one ref
-/// state only when the gap is under the TTL AND no peer fetched inside it.
-///
-/// A fetch for a `(root, ref)` already fetched inside
-/// [`SCAN_FETCH_MEMO_TTL`] is SKIPPED and reports success — recorded only
-/// after a SUCCESS, so a failure is never masked.
-///
-/// ⚠️ The TTL's safety rests on the reconcile interval being LONGER than it,
-/// and nothing enforces that: `QONTINUI_PLAN_ADAPTER_INTERVAL_SECS` has no
-/// floor beyond `max(1)`. At a configured interval at or under the TTL the memo
-/// spans whole cycles and `fetch_default` returns `Ok(())` without touching the
-/// network, so the loop publishes from a ref up to one TTL stale. The TTL is
-/// kept well under the 60 s default for that reason; an operator shortening the
-/// interval below it must shorten this too.
-fn fetch_memo() -> &'static std::sync::Mutex<HashMap<(PathBuf, String), std::time::Instant>> {
-    static M: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<(PathBuf, String), std::time::Instant>>,
-    > = std::sync::OnceLock::new();
-    M.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-}
-
-/// How long a successful fetch suppresses a repeat for the same
-/// `(repo_root, default_ref)`. Deliberately well under the reconcile
-/// interval, so this collapses the fetches WITHIN a cycle and never skips a
-/// cycle's fetch.
-const SCAN_FETCH_MEMO_TTL: Duration = Duration::from_secs(30);
-
 /// The production [`GitRefReader`]: shells out to `git`, always with an
 /// explicit `-C <dir>` so the probe can never pick up the runner's own cwd.
 ///
@@ -1543,26 +1496,15 @@ impl GitRefReader for ProcessGit {
                 ))
             }
         };
-        // MEMOISED per `(repo_root, default_ref)` — see [`fetch_memo`]. The
-        // source is resolved once per consumer and once per root, so without
-        // this a cycle fetches the same ref `1 + roots` times; with it, the
-        // first caller in a cycle fetches and the rest read the same ref
-        // state, which is what keeps the bodies and the census coherent.
-        let key = (repo_root.to_path_buf(), default_ref.to_string());
-        {
-            let memo = fetch_memo().lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(at) = memo.get(&key) {
-                if at.elapsed() < SCAN_FETCH_MEMO_TTL {
-                    return Ok(());
-                }
-            }
-        }
+        // Called at most once per `(repo_root, default_ref)` per cycle: the
+        // cycle's [`CycleRefPin`] dedups every consumer and every root onto
+        // its first fetch, so this reader holds no memo of its own.
         // `-c gc.auto=0`: this is a WRITE into a checkout other agents are
         // working in. git runs `gc --auto` after a fetch by default, and a
         // repack fired off by the scan loop is a side effect on a shared
         // resource the scan has no business causing.
         // `--no-tags`: the scan reads one branch; tag traffic is pure cost.
-        let out = Self::run_within(
+        Self::run_within(
             repo_root,
             &[
                 "-c",
@@ -1576,14 +1518,7 @@ impl GitRefReader for ProcessGit {
             "plan adapter: scan fetch",
             SCAN_FETCH_TIMEOUT,
         )
-        .map(|_| ());
-        if out.is_ok() {
-            fetch_memo()
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(key, std::time::Instant::now());
-        }
-        out
+        .map(|_| ())
     }
 
     fn list_ref_dir(
@@ -1948,13 +1883,19 @@ fn relative_source_path(root: Option<&str>, path: &Path) -> String {
 /// failing — the tree walk skips an unreadable or unstattable file, the ref
 /// walk skips a blob that will not read or is not UTF-8 — and a short `Ok`
 /// must not be read as the absence of what it skipped.
+///
+/// `pin` is the cycle's [`CycleRefPin`]: the ref is fetched and resolved to an
+/// object id at most once per cycle, and the document half
+/// ([`scan_roots_at_source`]) reads through the SAME pin — so the census this
+/// returns and the bodies that half publishes are listed at one commit.
 pub fn read_plans_for_cycle(
     dir: &Path,
     conv: &PlanConvention,
     git: &dyn GitRefReader,
+    pin: &CycleRefPin,
 ) -> Result<CycleScan, String> {
-    use super::ref_scan::{read_ref_dir, resolve_scan_source, ScanSource};
-    match resolve_scan_source(git, dir) {
+    use super::ref_scan::{read_ref_dir_at, ScanSource};
+    match pin.resolve_source(git, dir) {
         ScanSource::WorkTree => {
             let scan = scan_plan_dir(dir, conv);
             Ok(CycleScan {
@@ -1966,6 +1907,7 @@ pub fn read_plans_for_cycle(
                 // an empty set. A zero here would be the claim that the default
                 // branch holds no plans, which nothing measured.
                 ref_census: None,
+                dangling_link_slugs: scan.dangling_link_slugs,
             })
         }
         ScanSource::Unavailable { reason } => Err(reason),
@@ -1973,7 +1915,15 @@ pub fn read_plans_for_cycle(
             repo_root,
             ref_name,
             rel_dir,
-        } => match read_ref_dir(git, &repo_root, &ref_name, &rel_dir) {
+        } => match read_ref_dir_at(
+            git,
+            &repo_root,
+            &ref_name,
+            // `resolve_source` just resolved this pair, so this is the pinned
+            // answer, never a second fetch.
+            pin.resolve_ref(git, &repo_root, &ref_name)?,
+            &rel_dir,
+        ) {
             Ok(listing) => {
                 // Resolved ONCE per scan, as in `read_plan_dir`: it walks the
                 // ancestor chain for a `.git` and every entry shares the answer.
@@ -1999,6 +1949,7 @@ pub fn read_plans_for_cycle(
                         .collect(),
                     complete,
                     ref_census: Some(ref_census),
+                    dangling_link_slugs: Vec::new(),
                 })
             }
             Err(e) => Err(format!(
@@ -2022,7 +1973,7 @@ pub fn read_plans_for_cycle(
 ///
 /// Produced by BOTH scan sources: [`scan_plan_dir`] for a working tree, and
 /// [`read_plans_for_cycle`]'s ref arm, whose per-blob skip
-/// ([`super::ref_scan::read_ref_dir`]) is the same partial-read shape.
+/// ([`super::ref_scan::read_ref_dir_at`]) is the same partial-read shape.
 #[derive(Debug)]
 pub struct PlanDirScan {
     pub units: Vec<ParsedWorkUnit>,
@@ -2033,6 +1984,22 @@ pub struct PlanDirScan {
     /// single failure makes it `false` — the PARTIAL read is the nastier
     /// shape, because the vector still looks plausible.
     pub complete: bool,
+    /// Stems whose `*.md` NAME is in the directory as a DANGLING symlink —
+    /// resolved as not-a-plan, so absent from `units` without clearing
+    /// `complete` (see [`is_dangling_symlink`]).
+    ///
+    /// Carried because "not a plan" and "not there" are different claims, and
+    /// the disappeared-slug detector asks the second: a link whose target is
+    /// briefly missing (a non-atomic rewrite of the target) has NOT left the
+    /// active dir, and warning about it would burn the slug's warn-once for
+    /// the life of the process. Read ONLY as presence, never as a plan.
+    ///
+    /// The price, accepted on purpose: a link that stays broken for good is
+    /// SILENT to the detector too, because its name never leaves. It is not
+    /// silent overall — the scan logs it every cycle at debug, and the
+    /// body-sync dry-run names it as a `dangling_symlink` skip — and a missed
+    /// warning is the recoverable direction, where a false one burns the slug.
+    pub dangling_link_slugs: Vec<String>,
 }
 
 /// What one `*.md` directory entry turned out to be, once its metadata was
@@ -2057,6 +2024,11 @@ enum PlanEntry {
     /// Resolved, and genuinely not a plan — a DIRECTORY named `*.md`. Skipping
     /// it is the guard's legitimate purpose and costs the scan nothing.
     NotAPlan,
+    /// A symlink whose target is not there — see [`is_dangling_symlink`].
+    /// RESOLVED, like [`PlanEntry::NotAPlan`], and so it does not clear
+    /// [`PlanDirScan::complete`]; kept as its own arm so the skip is logged
+    /// under its real name rather than as a directory.
+    DanglingLink,
     /// The listing yielded the name and `stat` refused it. A GAP, not a skip.
     Unstattable(std::io::Error),
 }
@@ -2064,12 +2036,67 @@ enum PlanEntry {
 /// Classify one entry from its metadata result. Pure, so the `Err` arm is
 /// testable on every platform — including a box where no unprivileged process
 /// can manufacture a real `stat` failure.
-fn classify_plan_entry(meta: std::io::Result<std::fs::Metadata>) -> PlanEntry {
+///
+/// `lstat` is consulted ONLY on a failed `stat`, to tell the one DECIDED
+/// failure (a dangling symlink) from the uncertain ones — see
+/// [`is_dangling_symlink`].
+fn classify_plan_entry(
+    meta: std::io::Result<std::fs::Metadata>,
+    lstat: impl FnOnce() -> std::io::Result<std::fs::Metadata>,
+) -> PlanEntry {
     match meta {
         Ok(m) if m.is_file() => PlanEntry::Read,
         Ok(_) => PlanEntry::NotAPlan,
+        Err(e) if is_dangling_symlink(&e, lstat) => PlanEntry::DanglingLink,
         Err(e) => PlanEntry::Unstattable(e),
     }
+}
+
+/// Whether a failed, link-FOLLOWING `stat` failed because the entry is a
+/// DANGLING SYMLINK — `stat` says `NotFound` while `lstat` finds a symlink.
+///
+/// That is a DECIDED answer, and the only metadata failure that is: the entry
+/// is a link, and there is no plan behind it. Both plan-dir walks (this
+/// module's [`scan_plan_dir`] and `body_push`'s listing, which the work-tree
+/// slug census is taken from) resolve it as NOT A PLAN rather than as a gap.
+/// Treated as a gap it was PERMANENT darkness from a knowable cause: the link
+/// answers the same way every cycle, so the work-tree census reported ABSENT
+/// and this scan reported PARTIAL — disarming the disappeared-slug detector —
+/// for as long as nobody noticed the link.
+///
+/// Not-a-plan is also what the REF side already says about the same entry:
+/// `ProcessGit::list_ref_dir` skips every mode-`120000` entry, so a link is
+/// never a ref stem either.
+///
+/// Deliberately narrow. Every OTHER failure still reads as a gap:
+///
+///  * `stat` refused for any other reason (`PermissionDenied`, EIO, ESTALE,
+///    ELOOP) — the entry's kind is exactly what was not established.
+///  * `stat` says `NotFound` and `lstat` does too — a file removed between
+///    `read_dir` and `stat`, or one being replaced by an unlink-then-create
+///    (a `git checkout` does exactly that). The name may be back a moment
+///    later, so shrinking the stem set on it would under-report a plan that
+///    exists; the gap costs one cycle and recovers by itself.
+///  * `lstat` failing at all — nothing was decided.
+///
+/// A link that WORKED last cycle and breaks this one therefore drops its stem
+/// from a COMPLETE scan's plans and from the work-tree census — which may be
+/// only the one cycle a non-atomic rewrite of the TARGET takes, the same race
+/// as a vanished plain file, landing on the decided side. That is tolerable
+/// for both because neither remembers: the census is re-taken every report.
+/// The one consumer that DOES remember — the disappeared-slug detector, whose
+/// warn-once set is never pruned — is kept off it by
+/// [`PlanDirScan::dangling_link_slugs`], which counts the link's NAME as
+/// present.
+///
+/// `lstat` is a thunk so it is only issued for a `NotFound` — the one kind that
+/// can be decided — rather than on every failed `stat`.
+pub(super) fn is_dangling_symlink(
+    stat_err: &std::io::Error,
+    lstat: impl FnOnce() -> std::io::Result<std::fs::Metadata>,
+) -> bool {
+    stat_err.kind() == std::io::ErrorKind::NotFound
+        && lstat().is_ok_and(|m| m.file_type().is_symlink())
 }
 
 /// The REF census of an already-taken listing.
@@ -2142,11 +2169,15 @@ pub fn ref_census_only(
 /// One cycle's scan: the parsed units, and what the cycle can say about the
 /// REF side's stem set.
 ///
-/// The two halves of this adapter scan different sources — the work-unit half
-/// reads the fetched REF, the body sync reads the WORKING TREE — so one device
-/// is the only thing in the fleet that holds both answers. This carries the
-/// ref half out to the scan-root report, where the web can difference it
-/// against the tree half instead of computing a ratio off one of them.
+/// Both halves of this adapter now publish from the fetched REF (the body sync
+/// since Phase 3, through the same [`CycleRefPin`] on a writing cycle — on a
+/// withheld cycle the census comes from the no-fetch [`ref_census_only`] and is
+/// deliberately not pinned), but the scan-root report
+/// still compares that ref against the WORKING TREE the checkout is parked
+/// on — and one device is the only thing in the fleet that holds both
+/// answers. This carries the ref half out to the scan-root report, where the
+/// web can difference it against the tree half instead of computing a ratio
+/// off one of them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CycleScan {
     pub units: Vec<ParsedWorkUnit>,
@@ -2160,15 +2191,18 @@ pub struct CycleScan {
     /// plans dir is not in a repo at all, so there is no ref side to report —
     /// ABSENT (UNKNOWN), never an empty set.
     pub ref_census: Option<super::body_push::PlanSlugCensus>,
+    /// [`PlanDirScan::dangling_link_slugs`], forwarded by the WORK-TREE arm.
+    /// Always empty on the ref arm, which skips every symlink at the listing.
+    pub dangling_link_slugs: Vec<String>,
 }
 
 /// Read + parse every `*.md` in `dir` (non-recursive — the plans dir is flat,
 /// matching coord's `walk_root`), reporting whether the walk was COMPLETE.
 /// IO errors on individual files — a refused `stat` as well as a refused read
 /// — are logged and skipped; a missing dir yields an empty vec. All of those
-/// clear [`PlanDirScan::complete`]. A DIRECTORY named `*.md` is the one entry
-/// skipped WITHOUT clearing it: it is resolved, and it is genuinely not a
-/// plan.
+/// clear [`PlanDirScan::complete`]. A DIRECTORY named `*.md` and a DANGLING
+/// symlink named `*.md` are the two entries skipped WITHOUT clearing it: each
+/// is resolved, and genuinely not a plan (see [`is_dangling_symlink`]).
 ///
 /// The absolute path is still what is OPENED and what is logged on an IO
 /// error; only the path RECORDED on the parsed unit is made relative — see
@@ -2181,6 +2215,7 @@ pub fn scan_plan_dir(dir: &Path, conv: &PlanConvention) -> PlanDirScan {
             return PlanDirScan {
                 units: Vec::new(),
                 complete: false,
+                dangling_link_slugs: Vec::new(),
             };
         }
     };
@@ -2189,6 +2224,7 @@ pub fn scan_plan_dir(dir: &Path, conv: &PlanConvention) -> PlanDirScan {
     let source_root = super::body_push::derive_source_repo(dir);
     let mut out = Vec::new();
     let mut complete = true;
+    let mut dangling_link_slugs = Vec::new();
     for entry in entries {
         let entry = match entry {
             Ok(e) => e,
@@ -2209,9 +2245,18 @@ pub fn scan_plan_dir(dir: &Path, conv: &PlanConvention) -> PlanDirScan {
         if path.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
         }
-        match classify_plan_entry(path.metadata()) {
+        match classify_plan_entry(path.metadata(), || path.symlink_metadata()) {
             PlanEntry::Read => {}
             PlanEntry::NotAPlan => continue,
+            PlanEntry::DanglingLink => {
+                tracing::debug!(
+                    path = %path.display(),
+                    "plan adapter: a plans-dir entry is a dangling symlink; resolved as NOT a \
+                     plan, so the scan stays COMPLETE"
+                );
+                dangling_link_slugs.push(slug_from_filename(&path.to_string_lossy()));
+                continue;
+            }
             PlanEntry::Unstattable(e) => {
                 tracing::warn!(
                     path = %path.display(),
@@ -2238,6 +2283,7 @@ pub fn scan_plan_dir(dir: &Path, conv: &PlanConvention) -> PlanDirScan {
     PlanDirScan {
         units: out,
         complete,
+        dangling_link_slugs,
     }
 }
 
@@ -2432,20 +2478,29 @@ fn denial_of(err: &anyhow::Error) -> Option<CoordDenial> {
 /// deletion. The work-unit reconcile has a disappearance concept and must
 /// therefore publish nothing at all rather than publish a short set; here the
 /// per-root independence is safe and strictly better, because one unreadable
-/// root must not stop the others refreshing.
+/// root must not stop the others refreshing. That independence holds across
+/// REPOS: roots sharing a repo share the pin's single fetch, so a failed fetch
+/// takes all of them dark together for that cycle.
+///
+/// `pin` is the cycle's [`CycleRefPin`]. The reconcile loop hands in the SAME
+/// pin [`read_plans_for_cycle`] resolved through, so the bodies published here
+/// are listed at the commit the work-unit half's census was listed at, and two
+/// roots in one repo share one fetch. A caller with no work-unit half (the
+/// catch-up CLI, a withheld cycle) passes a fresh one.
 pub fn scan_roots_at_source(
     roots: &[super::body_push::ScanRoot],
     conv: &PlanConvention,
     git: &dyn GitRefReader,
+    pin: &CycleRefPin,
 ) -> (
     Vec<super::body_push::ScannedArtifact>,
     Vec<super::body_push::SkippedFile>,
 ) {
-    use super::ref_scan::{read_ref_dir, resolve_scan_source, ScanSource};
+    use super::ref_scan::{read_ref_dir_at, ScanSource};
     let mut artifacts = Vec::new();
     let mut skipped = Vec::new();
     for root in roots {
-        match resolve_scan_source(git, &root.dir) {
+        match pin.resolve_source(git, &root.dir) {
             // Not in a repo at all — a SUPPORTED layout (a tenant may author
             // into a plain directory), so the tree is the only source there is
             // and reading it is correct rather than a degradation.
@@ -2456,8 +2511,12 @@ pub fn scan_roots_at_source(
                 repo_root,
                 ref_name,
                 rel_dir,
-            } => match read_ref_dir(git, &repo_root, &ref_name, &rel_dir) {
+            } => match pin
+                .resolve_ref(git, &repo_root, &ref_name)
+                .and_then(|sha| read_ref_dir_at(git, &repo_root, &ref_name, sha, &rel_dir))
+            {
                 Ok(listing) => {
+                    record_ref_listing_gaps(root, &listing, &mut skipped);
                     artifacts.extend(super::body_push::scan_one_root_at_ref(
                         root,
                         &listing.files,
@@ -2470,6 +2529,10 @@ pub fn scan_roots_at_source(
                     // the very defect this arm removes, and it would republish
                     // the parked bytes under the same identity
                     // [policy: `unknown-must-not-render-as-a-default`].
+                    skipped.push(super::body_push::SkippedFile {
+                        path: root.dir.to_string_lossy().to_string(),
+                        reason: "unreadable_ref",
+                    });
                     tracing::warn!(
                         root = %root.label,
                         repo_root = %repo_root.display(),
@@ -2482,6 +2545,10 @@ pub fn scan_roots_at_source(
                 }
             },
             ScanSource::Unavailable { reason } => {
+                skipped.push(super::body_push::SkippedFile {
+                    path: root.dir.to_string_lossy().to_string(),
+                    reason: "scan_source_unavailable",
+                });
                 tracing::warn!(
                     root = %root.label,
                     dir = %root.dir.display(),
@@ -2493,6 +2560,48 @@ pub fn scan_roots_at_source(
         }
     }
     (artifacts, skipped)
+}
+
+/// Record what a ref listing could NOT read as `SkippedFile`s — the ref-arm
+/// twin of the work-tree arm's `unreadable_file` / `unreadable_entry` records
+/// in `body_push::scan_listing`.
+///
+/// [`super::ref_scan::read_ref_dir_at`] logs each blob it could not read and
+/// clears [`super::ref_scan::RefListing::complete`], but until this existed
+/// nothing consumed that flag and no skip was recorded — so a catch-up dry run
+/// over a ref-sourced root reported a PARTIAL scan as a whole one: the missing
+/// plan was absent from both the artifact count and the skipped list. Absence
+/// of a report is not a report of absence
+/// [policy: `unknown-must-not-render-as-a-default`].
+///
+/// Each stem the listing NAMED but did not return is recorded individually, at
+/// the path the work-tree walk would have recorded it at. A short `read_blobs`
+/// answer lands here too, because `names` is taken before any blob is read. An
+/// incomplete listing with no missing name (which `read_ref_dir_at` cannot
+/// produce today) is still recorded, at the root, so the flag can never be
+/// cleared without a trace.
+fn record_ref_listing_gaps(
+    root: &super::body_push::ScanRoot,
+    listing: &super::ref_scan::RefListing,
+    skipped: &mut Vec<super::body_push::SkippedFile>,
+) {
+    if listing.complete {
+        return;
+    }
+    let read: HashSet<&str> = listing.files.iter().map(|f| f.name.as_str()).collect();
+    let before = skipped.len();
+    for name in listing.names.iter().filter(|n| !read.contains(n.as_str())) {
+        skipped.push(super::body_push::SkippedFile {
+            path: root.dir.join(name).to_string_lossy().to_string(),
+            reason: "unreadable_file",
+        });
+    }
+    if skipped.len() == before {
+        skipped.push(super::body_push::SkippedFile {
+            path: root.dir.to_string_lossy().to_string(),
+            reason: "unreadable_entry",
+        });
+    }
 }
 
 /// Push every parsed unit through the edge-trigger + conflict logic, updating
@@ -3792,6 +3901,12 @@ impl LoopState {
             if let Some(bs) = self.body_sync.as_mut() {
                 // Both sides travel: the ref census listed just above, and the
                 // work-tree census `run_cycle` takes of the active plans root.
+                //
+                // NOT pinned to the census: that listing deliberately fetches
+                // nothing, and pinning the body sync to it would stop a
+                // standing withheld device ever refreshing its corpus. The
+                // census carries its own `ref_sha`, so the two sides are each
+                // self-describing; the body sync pins its own roots.
                 bs.run_cycle(&self.conv, metrics, ref_census).await;
             }
             return;
@@ -3810,9 +3925,17 @@ impl LoopState {
         // the scan duration. That is the mechanism behind a 20s keepalive firing
         // 264s late and an 8s backoff taking 25.5 minutes. See `off_runtime.rs`
         // for why a `tokio::time::timeout` cannot rescue this on its own.
+        // ONE ref state for this whole cycle: the work-unit scan below resolves
+        // through this pin, and the body sync further down reads through the
+        // SAME one, so the census reported and the bodies published are listed
+        // at one commit however long the reconcile between them runs and
+        // whoever fetches the shared checkout meanwhile. Dropped with the
+        // cycle, so the next cycle fetches afresh. See [`CycleRefPin`].
+        let pin = std::sync::Arc::new(CycleRefPin::default());
         let active_scan = {
             let scan_dir = dir.clone();
             let conv = self.conv.clone();
+            let pin = std::sync::Arc::clone(&pin);
             // The loop's OWN git reader, not a hardcoded `ProcessGit`: the
             // divergence probe two statements up already uses it, and a scan
             // that can look at a different reader than the probe measuring it
@@ -3820,7 +3943,7 @@ impl LoopState {
             // the publish-nothing arm reachable from a test.
             let git = std::sync::Arc::clone(&self.git);
             match tokio::task::spawn_blocking(move || {
-                read_plans_for_cycle(&scan_dir, &conv, git.as_ref())
+                read_plans_for_cycle(&scan_dir, &conv, git.as_ref(), &pin)
             })
             .await
             {
@@ -3953,6 +4076,7 @@ impl LoopState {
         // fields, so the order of the two partial moves is not itself
         // load-bearing.)
         let ref_census = active_scan.ref_census;
+        let active_dangling = active_scan.dangling_link_slugs;
         let units = active_scan.units;
         self.bulk_seed(&units, sink, metrics).await;
         let summary = reconcile_once(
@@ -4005,6 +4129,7 @@ impl LoopState {
                         PlanDirScan {
                             units: Vec::new(),
                             complete: false,
+                            dangling_link_slugs: Vec::new(),
                         }
                     }
                 }
@@ -4015,9 +4140,11 @@ impl LoopState {
             None => PlanDirScan {
                 units: Vec::new(),
                 complete: true,
+                dangling_link_slugs: Vec::new(),
             },
         };
         let archive_scan_complete = archive_scan.complete;
+        let archive_dangling = archive_scan.dangling_link_slugs;
         let archived = archive_scan.units;
         if !archived.is_empty() {
             let asum = reconcile_archive_once(&archived, sink, metrics).await;
@@ -4032,8 +4159,10 @@ impl LoopState {
         if let Some(bs) = self.body_sync.as_mut() {
             // The ref census this cycle's listing produced travels with the
             // body sync's own work-tree census, so ONE report carries both
-            // sides of the set difference as of ONE cycle.
-            bs.run_cycle(&self.conv, metrics, ref_census).await;
+            // sides of the set difference as of ONE cycle — and the pin makes
+            // the bodies it publishes come from the commit that census names.
+            bs.run_cycle_pinned(&self.conv, metrics, ref_census, pin)
+                .await;
         }
 
         let active_slugs: HashSet<String> = units.iter().map(|u| u.slug.clone()).collect();
@@ -4067,10 +4196,24 @@ impl LoopState {
         // `runner-lifecycle`. Only the scan's own `complete` flag
         // distinguishes a short read from a short directory.
         if active_scan_complete && archive_scan_complete {
+            // A dangling link's NAME is still in its dir: the plan has not
+            // LEFT it, whatever its target is doing this cycle — so it counts
+            // as present here, and only here (it was never read, so it is not
+            // SEEN above). See `PlanDirScan::dangling_link_slugs`.
+            let present_active: HashSet<String> = active_slugs
+                .iter()
+                .cloned()
+                .chain(active_dangling)
+                .collect();
+            let present_archive: HashSet<String> = archive_slugs
+                .iter()
+                .cloned()
+                .chain(archive_dangling)
+                .collect();
             for slug in newly_disappeared_slugs(
                 &self.seen_slugs,
-                &active_slugs,
-                &archive_slugs,
+                &present_active,
+                &present_archive,
                 &mut self.warned_disappeared,
             ) {
                 tracing::warn!(
@@ -4932,6 +5075,25 @@ impl BodySync {
         metrics: &AdapterMetrics,
         ref_census: Option<super::body_push::PlanSlugCensus>,
     ) {
+        self.run_cycle_pinned(
+            conv,
+            metrics,
+            ref_census,
+            std::sync::Arc::new(CycleRefPin::default()),
+        )
+        .await;
+    }
+
+    /// [`Self::run_cycle`] reading through a [`CycleRefPin`] the caller
+    /// already resolved the work-unit half through, so both halves of one
+    /// reconcile cycle publish from one commit.
+    pub async fn run_cycle_pinned(
+        &mut self,
+        conv: &PlanConvention,
+        metrics: &AdapterMetrics,
+        ref_census: Option<super::body_push::PlanSlugCensus>,
+        pin: std::sync::Arc<CycleRefPin>,
+    ) {
         let gate_open = (self.capture_gate)();
         if let Some(message) = capture_gate_message(self.last_gate_open, gate_open) {
             tracing::info!(capture_enabled = gate_open, "{message}");
@@ -4974,17 +5136,19 @@ impl BodySync {
         // either way, and doing that inline blocks a tokio worker for the whole
         // walk, starving every other task sharing it. Since Phase 3 it ALSO
         // resolves each root's source, which spawns `git` and — on the first
-        // caller of a cycle — performs a network fetch on a 120 s budget
-        // (`SCAN_FETCH_TIMEOUT`, memoised per `(root, ref)` by `fetch_memo`, so
-        // a cycle pays it once rather than once per consumer). A tick's worst
-        // case therefore scales with the root count; size it deliberately
+        // resolution of a `(repo, ref)` in the cycle — performs a network
+        // fetch on a 120 s budget (`SCAN_FETCH_TIMEOUT`). The pin dedups that
+        // across both halves and every root, so a cycle pays it once per repo;
+        // a root in a different repo still pays its own, so a tick's worst
+        // case scales with the number of distinct repos. Size it deliberately
         // against the reconcile interval rather than assuming the old walk's
         // cost.
         let roots = self.roots.clone();
         let conv = conv.clone();
         let git = std::sync::Arc::clone(&self.git);
         let scanned =
-            spawn_blocking_tracked(move || scan_roots_at_source(&roots, &conv, git.as_ref())).await;
+            spawn_blocking_tracked(move || scan_roots_at_source(&roots, &conv, git.as_ref(), &pin))
+                .await;
         let (artifacts, skipped) = match scanned {
             Ok(v) => v,
             Err(e) => {
@@ -5284,6 +5448,28 @@ mod tests {
     use anyhow::Result;
     use std::sync::Mutex;
 
+    /// W2: [`read_device_binding_count`] fills `local` from
+    /// `auth::device_binding_count`, and nothing else observes WHICH auth
+    /// function that is — `work_unit_write_posture` is tested as a pure
+    /// function and `LoopState` injects the reading. A malformed 2-entry
+    /// `bindings` array is the shape where the two auth parsers diverge: the
+    /// strict one calls it Unknown, which collapses to ONE and would turn this
+    /// device's withheld posture into a write in another tenant's name.
+    #[test]
+    fn read_device_binding_count_reads_the_devices_own_loose_count() {
+        let amb = crate::test_env::isolated_ambient();
+        std::fs::write(
+            amb.dir().join("paired_user.json"),
+            br#"{"bindings": [{"tenant_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}, {"tenant_id": 7}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_device_binding_count().local,
+            2,
+            "the adapter gate must see the two bindings this file states"
+        );
+    }
+
     // ---- scan-source divergence detector (plan 2026-09-10-…-not-a-ref, P1) ----
 
     /// A [`GitRefReader`] built from canned answers, so every arm of
@@ -5437,7 +5623,8 @@ mod tests {
             ..FakeGit::healthy(0, 0)
         };
         assert_eq!(
-            super::super::ref_scan::resolve_scan_source(&git, Path::new("/plans")),
+            super::super::ref_scan::CycleRefPin::default()
+                .resolve_source(&git, Path::new("/plans")),
             super::super::ref_scan::ScanSource::WorkTree
         );
     }
@@ -5452,7 +5639,9 @@ mod tests {
             fetch: Err("network is unreachable".to_string()),
             ..FakeGit::healthy(0, 0)
         };
-        match super::super::ref_scan::resolve_scan_source(&git, Path::new("/repo/plans")) {
+        match super::super::ref_scan::CycleRefPin::default()
+            .resolve_source(&git, Path::new("/repo/plans"))
+        {
             super::super::ref_scan::ScanSource::Unavailable { reason } => {
                 assert!(
                     reason.contains("network is unreachable"),
@@ -5470,7 +5659,8 @@ mod tests {
             ..FakeGit::healthy(0, 0)
         };
         assert!(matches!(
-            super::super::ref_scan::resolve_scan_source(&git, Path::new("/repo/plans")),
+            super::super::ref_scan::CycleRefPin::default()
+                .resolve_source(&git, Path::new("/repo/plans")),
             super::super::ref_scan::ScanSource::Unavailable { .. }
         ));
     }
@@ -5479,7 +5669,8 @@ mod tests {
     fn a_healthy_clone_scans_the_ref_at_the_repo_relative_dir() {
         let git = FakeGit::healthy(0, 0);
         assert_eq!(
-            super::super::ref_scan::resolve_scan_source(&git, Path::new("/repo/plans")),
+            super::super::ref_scan::CycleRefPin::default()
+                .resolve_source(&git, Path::new("/repo/plans")),
             super::super::ref_scan::ScanSource::Ref {
                 repo_root: PathBuf::from("/repo"),
                 ref_name: "origin/main".to_string(),
@@ -5750,6 +5941,7 @@ mod tests {
                 root: Ok(None),
                 ..FakeGit::healthy(0, 0)
             },
+            &CycleRefPin::default(),
         )
         .expect("the tree arm reads");
 
@@ -5769,6 +5961,7 @@ mod tests {
                     .collect(),
                 ..FakeGit::healthy(0, 0)
             },
+            &CycleRefPin::default(),
         )
         .expect("the ref arm reads");
 
@@ -5795,7 +5988,7 @@ mod tests {
     /// The no-fallback contract at the function that IMPLEMENTS it.
     ///
     /// `a_failed_fetch_publishes_nothing_rather_than_falling_back_to_the_tree`
-    /// pins `resolve_scan_source`'s VARIANT and would still pass if this arm
+    /// pins `CycleRefPin::resolve_source`'s VARIANT and would still pass if this arm
     /// were changed back to `read_plan_dir(dir, conv)` — reinstating the whole
     /// defect. This one puts a perfectly readable plan on disk and demands it
     /// NOT come back.
@@ -5818,6 +6011,7 @@ mod tests {
                 fetch: Err("no route to host".to_string()),
                 ..FakeGit::healthy(0, 0)
             },
+            &CycleRefPin::default(),
         )
         .expect_err("a failed fetch must not fall back to the tree");
         assert!(err.contains("no route to host"), "got: {err}");
@@ -6673,6 +6867,7 @@ mod tests {
                 root: Ok(None),
                 ..FakeGit::healthy(0, 0)
             },
+            &CycleRefPin::default(),
         );
 
         // Ref arm: the same dir IS the repo root, serving the same bytes.
@@ -6690,6 +6885,7 @@ mod tests {
                     .collect(),
                 ..FakeGit::healthy(0, 0)
             },
+            &CycleRefPin::default(),
         );
 
         assert_eq!(tree.len(), 1, "the fixture holds exactly one plan");
@@ -6701,8 +6897,9 @@ mod tests {
         // NOT asserted: that the two arms produce the same SKIP records. They
         // do not, and an earlier draft asserted it — vacuously, because this
         // fixture has one file and no subdirectory, so both sides were empty.
-        // The tree walk emits `subdirectory_not_scanned` per subdir plus
-        // `unreadable_entry` / `unreadable_dir`; the ref arm sees none of those
+        // The tree walk emits `subdirectory_not_scanned` per subdir,
+        // `dangling_symlink` per broken `*.md` link, plus `unreadable_entry` /
+        // `unreadable_dir`; the ref arm sees none of those
         // because `list_ref_dir` filters trees out before `scan_one_root_at_ref`
         // is reached. Add one subdirectory to this fixture and the old
         // assertion fails. What this test pins is CLASSIFICATION parity, which
@@ -6745,6 +6942,7 @@ mod tests {
                     .collect(),
                 ..FakeGit::healthy(717, 0)
             },
+            &CycleRefPin::default(),
         );
 
         assert_eq!(got.len(), 1);
@@ -6781,9 +6979,10 @@ mod tests {
         )
         .unwrap();
 
-        for (label, git) in [
+        for (label, reason, git) in [
             (
                 "fetch fails",
+                "scan_source_unavailable",
                 FakeGit {
                     root: Ok(Some(tmp.path().to_path_buf())),
                     fetch: Err("no route to host".into()),
@@ -6792,6 +6991,7 @@ mod tests {
             ),
             (
                 "no origin/HEAD",
+                "scan_source_unavailable",
                 FakeGit {
                     root: Ok(Some(tmp.path().to_path_buf())),
                     default_ref: Err("`origin/HEAD` is not set in this clone".into()),
@@ -6800,6 +7000,7 @@ mod tests {
             ),
             (
                 "listing unreadable",
+                "unreadable_ref",
                 FakeGit {
                     root: Ok(Some(tmp.path().to_path_buf())),
                     ref_dir: Err("bad object".into()),
@@ -6807,16 +7008,125 @@ mod tests {
                 },
             ),
         ] {
-            let (got, _) = scan_roots_at_source(
+            let (got, skipped) = scan_roots_at_source(
                 &[plans_root(tmp.path())],
                 &PlanConvention::operator_default(),
                 &git,
+                &CycleRefPin::default(),
             );
             assert!(
                 got.is_empty(),
                 "{label}: an unresolvable source must publish nothing, never the parked tree"
             );
+            // ...and the dry-run report SAYS the root contributed nothing,
+            // rather than rendering a root with zero plans and zero skips.
+            //
+            // Neuter check: drop either root-level `skipped.push` in
+            // `scan_roots_at_source` and the matching labels fail here.
+            assert_eq!(
+                skipped,
+                vec![super::super::body_push::SkippedFile {
+                    path: tmp.path().to_string_lossy().to_string(),
+                    reason,
+                }],
+                "{label}: a dark root must be RECORDED as skipped"
+            );
+            // ...and the catch-up CLI's by-root table can tell it from an
+            // empty root, which is what it keys the UNKNOWN rendering on.
+            assert_eq!(
+                super::super::body_push::root_dark_reason(tmp.path(), &skipped),
+                Some(reason),
+                "{label}: the root-level record is what marks the root dark"
+            );
         }
+    }
+
+    /// A ref listing that could not read one blob publishes the rest AND
+    /// records the missing plan as skipped — the ref-arm twin of the tree
+    /// walk's `unreadable_file`. Before this, `RefListing::complete` was
+    /// dropped on the document half, so the catch-up dry run reported a
+    /// partial root as a whole one: the plan was absent from the count and
+    /// from the skipped list alike.
+    ///
+    /// Neuter check: make `record_ref_listing_gaps` return immediately and
+    /// this fails on the skipped list.
+    #[test]
+    fn a_partial_ref_listing_records_each_unread_plan_as_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "# A plan
+
+> **Status: DRAFT 2026-09-01.**
+
+Body.
+";
+        let git = FakeGit {
+            root: Ok(Some(tmp.path().to_path_buf())),
+            ref_dir: Ok(vec![
+                RefDirEntry {
+                    name: "2026-01-01-good.md".into(),
+                    id: "idg".into(),
+                },
+                RefDirEntry {
+                    name: "2026-01-02-bad.md".into(),
+                    id: "idb".into(),
+                },
+            ]),
+            blobs: [
+                ("idg".to_string(), Ok(body.to_string())),
+                ("idb".to_string(), Err("corrupt".to_string())),
+            ]
+            .into_iter()
+            .collect(),
+            ..FakeGit::healthy(0, 0)
+        };
+        let (got, skipped) = scan_roots_at_source(
+            &[plans_root(tmp.path())],
+            &PlanConvention::operator_default(),
+            &git,
+            &CycleRefPin::default(),
+        );
+        assert_eq!(got.len(), 1, "the readable plan is still published");
+        assert_eq!(
+            skipped,
+            vec![super::super::body_push::SkippedFile {
+                path: tmp
+                    .path()
+                    .join("2026-01-02-bad.md")
+                    .to_string_lossy()
+                    .to_string(),
+                reason: "unreadable_file",
+            }],
+            "the unread plan is named, at the path the tree walk would record"
+        );
+        assert_eq!(
+            super::super::body_push::RootYield::of(tmp.path(), got.len(), &skipped),
+            super::super::body_push::RootYield::Partial {
+                read: 1,
+                unreadable: 1
+            },
+            "a partial root was READ in part: its count is a floor, not UNKNOWN"
+        );
+
+        // A WHOLE listing records nothing: the gap record is for gaps only.
+        let (whole, none) = scan_roots_at_source(
+            &[plans_root(tmp.path())],
+            &PlanConvention::operator_default(),
+            &FakeGit {
+                blobs: [
+                    ("idg".to_string(), Ok(body.to_string())),
+                    ("idb".to_string(), Ok(body.to_string())),
+                ]
+                .into_iter()
+                .collect(),
+                ..git
+            },
+            &CycleRefPin::default(),
+        );
+        assert_eq!(whole.len(), 2);
+        assert!(
+            none.is_empty(),
+            "a complete listing skips nothing: {none:?}"
+        );
     }
 
     /// The eviction POLICY, directly — the coverage that was lost when the
@@ -6997,6 +7307,10 @@ mod tests {
     /// grew back into the wrapper nothing would cover it — which is the state
     /// this change just left.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn read_blobs_wrapper_is_a_pure_delegation() {
         let src = include_str!("trigger.rs");
         let at = src
@@ -7181,6 +7495,7 @@ mod tests {
                 good: good.path().to_path_buf(),
                 body: "# Good\n\n> **Status: DRAFT 2026-09-01.**\n".to_string(),
             },
+            &CycleRefPin::default(),
         );
         assert_eq!(
             got.len(),
@@ -7494,8 +7809,13 @@ mod tests {
         real_git(&clone, &["add", "-A"], None);
         real_git(&clone, &["commit", "-q", "-m", "parked"], None);
 
-        let scan = read_plans_for_cycle(&plans, &PlanConvention::operator_default(), &ProcessGit)
-            .expect("a healthy clone scans");
+        let scan = read_plans_for_cycle(
+            &plans,
+            &PlanConvention::operator_default(),
+            &ProcessGit,
+            &CycleRefPin::default(),
+        )
+        .expect("a healthy clone scans");
         let slugs: Vec<_> = scan.units.iter().map(|u| u.slug.as_str()).collect();
         assert!(
             !slugs.contains(&"2026-01-09-only-on-the-parked-branch"),
@@ -9106,6 +9426,283 @@ mod tests {
             reporter.states().len(),
             1,
             "the unchanged reading is not re-posted inside the heartbeat"
+        );
+    }
+
+    // ---- one resolved sha per cycle (follow-up to 2026-09-10-…-not-a-ref) ----
+
+    /// A clone whose `origin/main` MOVES on every read — a peer `git fetch` in
+    /// the same shared checkout between any two of this cycle's `git` calls,
+    /// which is the routine case on this fleet, not an adversarial one.
+    ///
+    /// Every resolution of `origin/main` yields a new sha, and the listing at
+    /// each sha names a DIFFERENT blob, whose body records which sha it was
+    /// read at. So a consumer that resolved the ref for itself publishes a body
+    /// saying so, and a test can tell the two halves' commits apart.
+    struct MovingRef {
+        root: PathBuf,
+        reads: std::sync::atomic::AtomicUsize,
+        fetches: std::sync::atomic::AtomicUsize,
+        listed: Mutex<Vec<String>>,
+    }
+
+    impl MovingRef {
+        fn at(root: &Path) -> Self {
+            Self {
+                root: root.to_path_buf(),
+                reads: Default::default(),
+                fetches: Default::default(),
+                listed: Mutex::new(Vec::new()),
+            }
+        }
+        fn fetches(&self) -> usize {
+            self.fetches.load(Ordering::SeqCst)
+        }
+        fn listed(&self) -> Vec<String> {
+            self.listed.lock().unwrap().clone()
+        }
+    }
+
+    impl GitRefReader for MovingRef {
+        fn work_tree_root(&self, _dir: &Path) -> Result<Option<PathBuf>, String> {
+            Ok(Some(self.root.clone()))
+        }
+        fn default_ref(&self, _repo_root: &Path) -> Result<String, String> {
+            Ok("origin/main".to_string())
+        }
+        fn rev_parse(&self, _repo_root: &Path, rev: &str) -> Result<String, String> {
+            if rev == "origin/main" {
+                let n = self.reads.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(format!("{n:040x}"))
+            } else {
+                Ok("b".repeat(40))
+            }
+        }
+        fn count_behind_ahead(&self, _: &Path, _: &str, _: &str) -> Result<(u64, u64), String> {
+            Ok((0, 0))
+        }
+        fn ref_refresh_stamps(
+            &self,
+            _: &Path,
+            _: &str,
+            _: &str,
+        ) -> Vec<Result<Option<i64>, String>> {
+            vec![Ok(Some(NOW - 60))]
+        }
+        fn fetch_default(&self, _repo_root: &Path, _default_ref: &str) -> Result<(), String> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn list_ref_dir(
+            &self,
+            _repo_root: &Path,
+            ref_name: &str,
+            _rel_dir: &str,
+        ) -> Result<Vec<RefDirEntry>, String> {
+            self.listed.lock().unwrap().push(ref_name.to_string());
+            Ok(vec![RefDirEntry {
+                name: "2026-01-01-a-plan.md".into(),
+                id: format!("blob-at-{ref_name}"),
+            }])
+        }
+        fn read_blobs(&self, _repo_root: &Path, ids: &[String]) -> Vec<Result<String, String>> {
+            ids.iter()
+                .map(|id| {
+                    Ok(format!(
+                        "# A plan\n\n> **Status: DRAFT 2026-09-01.**\n\nRead from {id}.\n"
+                    ))
+                })
+                .collect()
+        }
+    }
+
+    /// **Both halves of one cycle read ONE commit, however the ref moves.**
+    ///
+    /// The work-unit half lists the ref and reports its census; the document
+    /// half then publishes bodies. Before the pin each half fetched and
+    /// resolved `origin/main` for itself, so a peer fetch between them made the
+    /// census name commit A while the bodies came from commit B — every field
+    /// well-formed, the pair incoherent.
+    ///
+    /// Neuter check: in `CycleRefPin::resolve_ref`, drop the early return on a
+    /// memoised answer. The document half then fetches again, resolves the
+    /// moved ref, and publishes a body read at the second sha — this fails on
+    /// all three assertions.
+    #[test]
+    fn both_halves_of_one_cycle_read_one_commit_while_the_ref_moves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git = MovingRef::at(tmp.path());
+        let conv = PlanConvention::operator_default();
+        let pin = CycleRefPin::default();
+
+        let scan = read_plans_for_cycle(tmp.path(), &conv, &git, &pin).expect("the ref reads");
+        let census_sha = scan
+            .ref_census
+            .as_ref()
+            .and_then(|c| c.ref_sha.clone())
+            .expect("the work-unit half resolved the ref");
+
+        let (bodies, _) = scan_roots_at_source(&[plans_root(tmp.path())], &conv, &git, &pin);
+
+        assert_eq!(
+            git.fetches(),
+            1,
+            "one fetch per repo per cycle, not one per half"
+        );
+        assert_eq!(
+            git.listed(),
+            vec![census_sha.clone(), census_sha.clone()],
+            "both halves list at the object id the census names"
+        );
+        assert_eq!(bodies.len(), 1);
+        assert!(
+            bodies[0]
+                .upsert
+                .body
+                .contains(&format!("blob-at-{census_sha}")),
+            "the published body must come from the census's commit: {}",
+            bodies[0].upsert.body
+        );
+    }
+
+    /// A failed fetch is ONE answer for the whole cycle: a second consumer of
+    /// the same repo sees the same `Unavailable` rather than retrying its way
+    /// into a different ref state from the first.
+    ///
+    /// Neuter check: as above — without the memoised early return the second
+    /// resolution fetches again and this fails on the count.
+    #[test]
+    fn a_failed_fetch_is_one_answer_for_the_whole_cycle() {
+        struct FailsOnce(std::sync::atomic::AtomicUsize, FakeGit);
+        impl GitRefReader for FailsOnce {
+            fn work_tree_root(&self, d: &Path) -> Result<Option<PathBuf>, String> {
+                self.1.work_tree_root(d)
+            }
+            fn default_ref(&self, r: &Path) -> Result<String, String> {
+                self.1.default_ref(r)
+            }
+            fn rev_parse(&self, r: &Path, rev: &str) -> Result<String, String> {
+                self.1.rev_parse(r, rev)
+            }
+            fn count_behind_ahead(&self, r: &Path, a: &str, b: &str) -> Result<(u64, u64), String> {
+                self.1.count_behind_ahead(r, a, b)
+            }
+            fn ref_refresh_stamps(
+                &self,
+                r: &Path,
+                d: &str,
+                s: &str,
+            ) -> Vec<Result<Option<i64>, String>> {
+                self.1.ref_refresh_stamps(r, d, s)
+            }
+            fn fetch_default(&self, _: &Path, _: &str) -> Result<(), String> {
+                // Fails the first time only — a retry WOULD succeed, which is
+                // exactly the second answer a cycle must not get.
+                match self.0.fetch_add(1, Ordering::SeqCst) {
+                    0 => Err("transient".to_string()),
+                    _ => Ok(()),
+                }
+            }
+            fn list_ref_dir(&self, r: &Path, n: &str, d: &str) -> Result<Vec<RefDirEntry>, String> {
+                self.1.list_ref_dir(r, n, d)
+            }
+            fn read_blobs(&self, r: &Path, ids: &[String]) -> Vec<Result<String, String>> {
+                self.1.read_blobs(r, ids)
+            }
+        }
+        let git = FailsOnce(Default::default(), FakeGit::healthy(0, 0));
+        let pin = CycleRefPin::default();
+        for _ in 0..2 {
+            assert!(matches!(
+                pin.resolve_source(&git, Path::new("/repo/plans")),
+                super::super::ref_scan::ScanSource::Unavailable { .. }
+            ));
+        }
+        assert_eq!(
+            git.0.load(Ordering::SeqCst),
+            1,
+            "the failure is not retried within the cycle"
+        );
+    }
+
+    /// The same property at the TICK — the wiring, not just the functions.
+    /// The two tests above hold the pin fixed by hand; this one proves the
+    /// reconcile loop actually hands the work-unit half's pin to the body sync.
+    ///
+    /// Neuter check: in `LoopState::tick`, call `bs.run_cycle(..)` instead of
+    /// `bs.run_cycle_pinned(.., pin)`. The body sync then resolves a fresh pin,
+    /// fetches a second time and lists at a moved sha — this fails on both.
+    #[tokio::test]
+    async fn the_tick_hands_the_work_unit_halfs_pin_to_the_body_sync() {
+        let dir = one_plan_dir();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        let git = std::sync::Arc::new(MovingRef::at(dir.path()));
+        let mut state = LoopState::new(
+            reader,
+            Some(super::super::body_push::HttpArtifactSink::new(
+                "http://127.0.0.1:9",
+            )),
+            std::sync::Arc::new(|| true) as CaptureGate,
+        )
+        .with_scan_report_gate(owns_the_machine())
+        .with_scan_reporter(std::sync::Arc::new(FakeReporter::default()))
+        .with_binding_count(1, Some(1))
+        .with_git(git.clone());
+
+        state
+            .tick(&FakeSink::default(), &AdapterMetrics::default())
+            .await;
+
+        let listed = git.listed();
+        assert_eq!(
+            listed.len(),
+            2,
+            "the work-unit half AND the body sync each listed the ref: {listed:?}"
+        );
+        assert_eq!(
+            listed[0], listed[1],
+            "both halves listed ONE commit: {listed:?}"
+        );
+        assert_eq!(git.fetches(), 1, "one fetch for the whole cycle");
+    }
+
+    /// The other half of the pin's contract: it must NOT outlive its cycle. A
+    /// pin kept across ticks (stored on `LoopState`, say) would never fetch
+    /// again and freeze the corpus at one commit — the very staleness this
+    /// plan family exists to remove, reached from the opposite direction.
+    ///
+    /// Neuter check: hoist the pin out of `tick` into a `LoopState` field that
+    /// every tick reuses. The second tick then fetches nothing and lists the
+    /// first tick's sha — this fails on both.
+    #[tokio::test]
+    async fn a_pin_does_not_outlive_its_cycle() {
+        let dir = one_plan_dir();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        let git = std::sync::Arc::new(MovingRef::at(dir.path()));
+        let mut state = LoopState::new(
+            reader,
+            Some(super::super::body_push::HttpArtifactSink::new(
+                "http://127.0.0.1:9",
+            )),
+            std::sync::Arc::new(|| true) as CaptureGate,
+        )
+        .with_scan_report_gate(owns_the_machine())
+        .with_scan_reporter(std::sync::Arc::new(FakeReporter::default()))
+        .with_binding_count(1, Some(1))
+        .with_git(git.clone());
+
+        let metrics = AdapterMetrics::default();
+        state.tick(&FakeSink::default(), &metrics).await;
+        state.tick(&FakeSink::default(), &metrics).await;
+
+        let listed = git.listed();
+        assert_eq!(listed.len(), 4, "two halves, two ticks: {listed:?}");
+        assert_eq!(git.fetches(), 2, "each cycle fetches afresh");
+        assert_ne!(
+            listed[0], listed[2],
+            "the second cycle must read the moved ref, not the first cycle's pin: {listed:?}"
         );
     }
 
@@ -13200,14 +13797,21 @@ Body.
         );
         assert!(!partial.complete, "...but the scan is PARTIAL and says so");
 
-        // 4. UNSTATTABLE: listed, and `stat` refuses it — the arm
-        //    `Path::is_file()` swallowed. A dangling symlink is the portable
-        //    spelling. Its OWN tempdir: reusing case 3's leaves that case's
-        //    unreadable file behind, which clears `complete` by itself and
-        //    makes this case prove nothing.
+        // 4. A DANGLING SYMLINK: listed, and `stat` refuses it with
+        //    `NotFound` — but `lstat` finds the link, so it is a DECIDED
+        //    not-a-plan and the scan stays COMPLETE (`is_dangling_symlink`).
+        //    It used to be this test's portable spelling of an unstattable
+        //    entry, which is how a standing broken link came to hold the scan
+        //    PARTIAL — and the disappeared-slug detector disarmed — forever.
+        //    The genuinely unstattable arm (`PermissionDenied`, a name gone
+        //    mid-scan) is pinned by
+        //    `an_entry_that_cannot_be_statted_is_a_gap_not_a_skip`. Its OWN
+        //    tempdir: reusing case 3's leaves that case's unreadable file
+        //    behind, which clears `complete` by itself and makes this case
+        //    prove nothing.
         //
-        //    Neuter check: restore `if !path.is_file() { continue; }` and the
-        //    `complete` assertion below fails.
+        //    Neuter check: drop the `DanglingLink` arm from
+        //    `classify_plan_entry` and the `complete` assertion below fails.
         let dir4 = tempfile::tempdir().unwrap();
         std::fs::write(
             dir4.path().join("2026-01-03-c.md"),
@@ -13221,19 +13825,23 @@ Body.
                     std::fs::metadata(&dangling).is_err(),
                     "precondition: the link must be UNSTATTABLE"
                 );
-                let unstattable = scan_plan_dir(dir4.path(), &conv);
-                assert_eq!(unstattable.units.len(), 1);
+                let dangling_scan = scan_plan_dir(dir4.path(), &conv);
+                assert_eq!(dangling_scan.units.len(), 1);
                 assert!(
-                    !unstattable.complete,
-                    "an entry the OS LISTED but could not STAT is a gap, not a silent skip"
+                    dangling_scan.complete,
+                    "a dangling symlink is a DECIDED not-a-plan, never a standing gap"
+                );
+                assert_eq!(
+                    dangling_scan.dangling_link_slugs,
+                    vec!["2026-01-04-d".to_string()],
+                    "...whose NAME is still carried, as presence only"
                 );
             }
             Err(e) => {
                 // Not a pass: an explicit, printed inability to run this case.
                 eprintln!(
-                    "SKIPPED case 4 (unstattable entry): this platform refused to create a \
-                     symlink ({e}). The Err arm is pinned by \
-                     `an_entry_that_cannot_be_statted_is_a_gap_not_a_skip` instead."
+                    "SKIPPED case 4 (dangling symlink): this platform refused to create a \
+                     symlink ({e})."
                 );
             }
         }
@@ -13260,25 +13868,51 @@ Body.
         let file = dir.path().join("x.md");
         std::fs::write(&file, "x").unwrap();
         assert!(matches!(
-            classify_plan_entry(file.metadata()),
+            classify_plan_entry(file.metadata(), || file.symlink_metadata()),
             PlanEntry::Read
         ));
         assert!(
             matches!(
-                classify_plan_entry(dir.path().metadata()),
+                classify_plan_entry(dir.path().metadata(), || dir.path().symlink_metadata()),
                 PlanEntry::NotAPlan
             ),
             "a DIRECTORY named `*.md` is resolved and genuinely not a plan"
         );
         assert!(
             matches!(
-                classify_plan_entry(Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "EACCES",
-                ))),
+                classify_plan_entry(
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "EACCES",
+                    )),
+                    || panic!("lstat must not be consulted for a non-NotFound failure"),
+                ),
                 PlanEntry::Unstattable(_)
             ),
             "a REFUSED stat is a hole in the scan, never `not a plan`"
+        );
+        // `NotFound` with NOTHING behind the name either — the entry went
+        // away between `read_dir` and `stat`. Uncertain (it may be an
+        // unlink-then-create in flight), so still a gap.
+        let gone = dir.path().join("gone.md");
+        assert!(
+            matches!(
+                classify_plan_entry(gone.metadata(), || gone.symlink_metadata()),
+                PlanEntry::Unstattable(_)
+            ),
+            "a name that vanished mid-scan is UNCERTAIN, so it is a gap"
+        );
+        // `NotFound` on a REGULAR file's lstat is the same uncertain shape:
+        // only a SYMLINK makes the `NotFound` a decided answer.
+        assert!(
+            matches!(
+                classify_plan_entry(
+                    Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                    || file.symlink_metadata(),
+                ),
+                PlanEntry::Unstattable(_)
+            ),
+            "NotFound from stat plus a non-link lstat decides nothing"
         );
     }
 
@@ -13344,6 +13978,159 @@ Body.
             "the real disappearance is surfaced exactly once; got: {logged}"
         );
         assert!(logged.contains("2026-02-02-b"));
+    }
+
+    /// **A symlinked plan whose TARGET goes missing has not left the active
+    /// dir, so it must not burn its warn-once.**
+    ///
+    /// A dangling link is a DECIDED not-a-plan (`is_dangling_symlink`), which
+    /// keeps the scan COMPLETE and so arms the detector — and a non-atomic
+    /// rewrite of the target makes a working link dangle for one cycle. Were
+    /// the link's stem simply absent, that cycle would warn falsely and insert
+    /// the slug into `warned_disappeared`, which is never pruned: the REAL
+    /// removal in cycle 3 would then say nothing.
+    ///
+    /// Neuter check: pass `&active_slugs` instead of `&present_active` to
+    /// `newly_disappeared_slugs` — cycle 2 warns and cycle 3 is silent.
+    #[tokio::test]
+    async fn a_dangling_plan_link_is_present_to_the_disappearance_detector() {
+        let logs = CapturedLogs::start();
+        let dir = tempfile::tempdir().unwrap();
+        let targets = tempfile::tempdir().unwrap();
+        let target = targets.path().join("real-plan.md");
+        std::fs::write(&target, "# L\n\n> **Status: DRAFT**\n").unwrap();
+        let link = dir.path().join("2026-02-03-linked.md");
+        if let Err(e) = try_symlink(&target, &link) {
+            eprintln!("SKIPPED: this platform refused to create a symlink ({e})");
+            return;
+        }
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut state = tick_state(reader);
+
+        state.tick(&sink, &metrics).await;
+        assert!(
+            state.seen_slugs.contains("2026-02-03-linked"),
+            "the working link was read as a plan"
+        );
+
+        // The TARGET goes away; the link's name stays.
+        std::fs::remove_file(&target).unwrap();
+        state.tick(&sink, &metrics).await;
+        assert_eq!(
+            logs.text()
+                .matches("disappeared from the active dir")
+                .count(),
+            0,
+            "a link whose target is missing has not left the dir; got: {}",
+            logs.text()
+        );
+        assert!(
+            state.warned_disappeared.is_empty(),
+            "...and poisons nothing"
+        );
+
+        // The LINK goes away: that is a real disappearance, surfaced once.
+        std::fs::remove_file(&link).unwrap();
+        state.tick(&sink, &metrics).await;
+        let logged = logs.text();
+        assert_eq!(
+            logged.matches("disappeared from the active dir").count(),
+            1,
+            "the real disappearance is surfaced exactly once; got: {logged}"
+        );
+        assert!(logged.contains("2026-02-03-linked"));
+    }
+
+    /// **The same protection on the ARCHIVE side.** `archive_scan.dangling_link_slugs`
+    /// is chained into `present_archive` exactly as the active arm chains its
+    /// own into `present_active` — this pins that the archive chain is wired,
+    /// not just present in the diff.
+    ///
+    /// A slug first seen in the active dir moves to the archive dir as a
+    /// working symlink (no warning: it is genuinely present there). Its
+    /// TARGET then goes missing while the link's name stays in the archive
+    /// dir — the same race as the active-side test, on the other scan.
+    ///
+    /// Neuter check: drop `.chain(archive_dangling)` from `present_archive`
+    /// in `LoopState::tick` — cycle 3 below then warns falsely.
+    #[tokio::test]
+    async fn a_dangling_archived_link_is_present_to_the_disappearance_detector() {
+        let logs = CapturedLogs::start();
+        let dir = tempfile::tempdir().unwrap();
+        let archive = tempfile::tempdir().unwrap();
+        let targets = tempfile::tempdir().unwrap();
+
+        let slug_file = dir.path().join("2026-02-04-archived.md");
+        std::fs::write(&slug_file, "# A\n\n> **Status: DRAFT**\n").unwrap();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = PathInputs {
+            plans_archive_dir: Some(archive.path().to_string_lossy().to_string()),
+            ..plans_dir_input(dir.path())
+        };
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut state = tick_state(reader);
+
+        // Cycle 1: seen in the active dir.
+        state.tick(&sink, &metrics).await;
+        assert!(
+            state.seen_slugs.contains("2026-02-04-archived"),
+            "the plan file was read from the active dir"
+        );
+
+        // Cycle 2: moved out of active into the archive dir, as a WORKING
+        // symlink (target present) — genuinely there, no dangling-link
+        // protection needed yet.
+        std::fs::remove_file(&slug_file).unwrap();
+        let target = targets.path().join("archived-target.md");
+        std::fs::write(&target, "# A\n\n> **Status: DRAFT**\n").unwrap();
+        let link = archive.path().join("2026-02-04-archived.md");
+        if let Err(e) = try_symlink(&target, &link) {
+            eprintln!("SKIPPED: this platform refused to create a symlink ({e})");
+            return;
+        }
+        state.tick(&sink, &metrics).await;
+        assert_eq!(
+            logs.text()
+                .matches("disappeared from the active dir")
+                .count(),
+            0,
+            "moved into the archive dir via a working link — genuinely present"
+        );
+
+        // Cycle 3: the archived link's TARGET goes missing; the link's name
+        // stays in the archive dir. Without `archive_dangling`, this slug
+        // would be absent from both `present_active` and `present_archive`
+        // and warn falsely.
+        std::fs::remove_file(&target).unwrap();
+        state.tick(&sink, &metrics).await;
+        assert_eq!(
+            logs.text()
+                .matches("disappeared from the active dir")
+                .count(),
+            0,
+            "a dangling archive link has not left the archive dir; got: {}",
+            logs.text()
+        );
+        assert!(
+            state.warned_disappeared.is_empty(),
+            "...and poisons nothing"
+        );
+
+        // Cycle 4: the archive link itself goes away — a real disappearance,
+        // surfaced once.
+        std::fs::remove_file(&link).unwrap();
+        state.tick(&sink, &metrics).await;
+        let logged = logs.text();
+        assert_eq!(
+            logged.matches("disappeared from the active dir").count(),
+            1,
+            "the real disappearance is surfaced exactly once; got: {logged}"
+        );
+        assert!(logged.contains("2026-02-04-archived"));
     }
 
     /// **The same property on main's REF scan.** A blob the listing names but

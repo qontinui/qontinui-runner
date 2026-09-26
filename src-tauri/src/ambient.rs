@@ -192,6 +192,7 @@ pub const AMBIENT_ENV_KEYS: &[&str] = &[
     "QONTINUI_COORDINATOR_SHADOW",
     "QONTINUI_CRASH_DUMP_FRESHNESS_SECS",
     "QONTINUI_DEVENV_AUTO_ENROLL",
+    "QONTINUI_DEVICE_TOKEN_DOOR_DEFAULT_SLOT",
     "QONTINUI_DEV_BOOTSTRAP",
     "QONTINUI_DEV_ENDPOINTS",
     "QONTINUI_DIRTY_POLL_INTERVAL_SECS",
@@ -274,6 +275,7 @@ pub const AMBIENT_ENV_KEYS: &[&str] = &[
     "QONTINUI_SESSION_AUTOMATION_REGISTER",
     "QONTINUI_SESSION_NAMES_DIR",
     "QONTINUI_SESSION_WORKTREES",
+    "QONTINUI_SETUP_WIZARD_BYPASS",
     "QONTINUI_SPAWN_AUTHZ_DISABLED",
     "QONTINUI_SPAWN_AUTHZ_POLICY_REQUIRED_FLOOR",
     "QONTINUI_SPAWN_OUTCOME_ENABLED",
@@ -1869,6 +1871,10 @@ mod tests {
     /// Does a literal spell the `.qontinui` DIRECTORY — `".qontinui"`,
     /// `"{}/.qontinui/machine.json"` — as opposed to the bundle identifier
     /// `com.qontinui.runner`, where `.qontinui` is a segment of a dotted name?
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn spells_the_qontinui_dir(lit: &str) -> bool {
         lit.match_indices(".qontinui").any(|(at, _)| {
             let before = lit[..at].chars().next_back();

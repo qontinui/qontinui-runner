@@ -1077,7 +1077,7 @@ mod resume_context_tests {
         assert!(
             context.contains("[truncated,"),
             "{}",
-            &context[..200.min(context.len())]
+            crate::str_utils::truncate_str(&context, 200)
         );
         assert!(context.len() < 3000);
     }

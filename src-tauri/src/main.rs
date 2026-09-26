@@ -348,12 +348,13 @@ mod tier_matrix_tests;
 // Plan `2026-08-25-runner-test-suite-env-isolation` Phase 2.
 #[cfg(test)]
 mod env_write_lock_guard;
-// Source-scan ratchet for the `tokio_postgres::Row::get` deny lint: the
-// fn-level `#[expect(clippy::disallowed_methods)]` count only falls, and the
-// gate (repo-root clippy.toml + the two deny levels in Cargo.toml) stays wired.
-// Plan 2026-09-03-coord-row-get-panic-class-closed-by-lint-and-supervisor.
+// Source-scan ratchets for the deny lints that grandfather sites with a
+// fn-level `#[expect]` (`clippy::disallowed_methods` for `Row::get`,
+// `clippy::string_slice`): each count only falls, and each gate stays wired.
+// Plans 2026-09-03-coord-row-get-panic-class-closed-by-lint-and-supervisor and
+// 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate.
 #[cfg(test)]
-mod row_get_ratchet;
+mod expect_ratchet;
 mod turn_ending_shadow;
 mod worktree;
 mod wrappers;
@@ -3963,11 +3964,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 let restore_record_outbox = registrar_outbox.clone();
 
                 // Transcript cloud sync (plan 2026-07-09-runner-session-
-                // history-cloud-sync, Phase 2) — durable, opt-in mirror of
-                // AI transcript blocks into the SAME session outbox the
-                // drain loop reads. Gated on Settings.cloud_sync_enabled
-                // inside `emit`; the AI-output persist sites reach it via
-                // Tauri state.
+                // history-cloud-sync, Phase 2) — durable mirror of AI
+                // transcript blocks into the SAME session outbox the drain
+                // loop reads. Gated on Settings.cloud_sync_enabled (default
+                // on since plan 2026-09-22-transcript-sync-default-on-with-
+                // tenant-and-user-controls) inside `emit`; the AI-output
+                // persist sites reach it via Tauri state.
                 let transcript_emitter =
                     std::sync::Arc::new(session::transcript_emitter::TranscriptEmitter::new(
                         registrar_outbox,
@@ -5054,7 +5056,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         loop_registry.clone(),
                         handoff_lifecycle_store,
                     );
-                    // Remote-attach grant catch-up on a 60 s timer (plan
+                    // Remote-attach grant catch-up on a timer of
+                    // `session::attach::POLL_INTERVAL` (plan
                     // `2026-08-31-remote-session-tabs-in-runner-terminal`,
                     // Phase 3c): the push arm rides the handoff receiver's
                     // socket above; this is the poll beside it.
@@ -5532,6 +5535,29 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
 
+            // Conductor restart-resume: relaunch every `running` orchestration
+            // run THIS instance owns, settling the workers that died with the
+            // previous process first. Runs on secondaries too — ownership is
+            // per instance, so a temp runner resumes its own runs and never
+            // the primary's (they share one embedded PG cluster). Plan
+            // `2026-09-23-conductor-e2e-phase1-defects`, Phase 2.
+            if crate::database::pg::pg_available() {
+                let resume_state: Arc<commands::AppState> =
+                    app.state::<Arc<commands::AppState>>().inner().clone();
+                let resume_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    // Same settle delay the scheduler takes: let the MCP API
+                    // bind before workers that report through it are spawned.
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    orchestration_loop::loop_engine::resume_owned_runs(
+                        resume_state.orchestration_loops.clone(),
+                        resume_handle,
+                        resume_state.pg_db.clone(),
+                    )
+                    .await;
+                });
+            }
+
             // Phase 1.5 — transcript-tail populator. Watches Claude CLI's
             // per-session JSONL transcripts and writes Edit/Write/MultiEdit
             // touches into `project.session_touched_files` so the per-terminal
@@ -5996,9 +6022,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
             // Start the tenant memory-synthesis poller (plan
             // 2026-07-11-tenant-memory-v1-1). Consent-gated on
-            // `cloud_sync_enabled` — idles with zero network calls until the
-            // user opts in. Claims synthesis jobs from the web memory API,
-            // distills them via the warm Claude provider, and posts results.
+            // `cloud_sync_enabled` (default on) — idles with zero network
+            // calls while the user has it switched off. Claims synthesis
+            // jobs from the web memory API, distills them via the warm
+            // Claude provider, and posts results.
             info!("Starting tenant memory-synthesis poller");
             memory::memory_synthesis::start_memory_job_poller();
 
@@ -6069,15 +6096,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // runners whose Settings/Terminal UI never polls usage. This
                 // loop ONLY refreshes the cache — re-picking is deferred to
                 // the next unit of AI work (so warm-provider prompt-cache
-                // locality within a unit is preserved). `refresh_*` is a
-                // no-op unless ≥2 accounts are configured.
+                // locality within a unit is preserved). The account half is a
+                // no-op unless ≥2 accounts are configured; the prepaid half
+                // (`refresh_fleet_usage_report`) reports regardless.
+                //
+                // The immediate first tick is NOT skipped: it is the first
+                // prepaid report, run here rather than in the startup call
+                // above so the provider round-trip never sits in front of
+                // `pick_best_account`. Its account half is served from the
+                // probe cache the startup refresh just filled.
                 tauri::async_runtime::spawn(async {
                     let mut tick =
                         tokio::time::interval(tokio::time::Duration::from_secs(10 * 60));
-                    tick.tick().await; // consume the immediate first tick (just refreshed)
                     loop {
                         tick.tick().await;
-                        commands::ai_settings::refresh_account_usage_snapshot().await;
+                        commands::ai_settings::refresh_fleet_usage_report().await;
                     }
                 });
             });

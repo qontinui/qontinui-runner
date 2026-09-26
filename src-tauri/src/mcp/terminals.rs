@@ -1336,6 +1336,10 @@ mod tests {
     /// file and was defeated by prose in a doc comment (including this one),
     /// which is a test that fails for a reason unrelated to what it claims.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn route_entries_covers_every_route_registration_in_this_file() {
         // Both built at runtime so this test's own source cannot match itself.
         let needle = format!(".{}(", "route");

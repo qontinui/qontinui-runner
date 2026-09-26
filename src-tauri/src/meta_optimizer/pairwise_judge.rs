@@ -228,6 +228,10 @@ fn resolve_winner(positional: PositionalWinner, was_swapped: bool) -> PairwiseWi
 
 /// Extract the JSON substring from a response that may wrap it in a markdown
 /// code block.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_json(response: &str) -> Option<&str> {
     // Try ```json ... ``` first
     if let Some(start) = response.find("```json") {
@@ -288,6 +292,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn test_build_prompt_no_swap() {
         let input = sample_input();
         let prompt = build_pairwise_prompt(&input, false);
@@ -307,6 +315,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn test_build_prompt_with_swap() {
         let input = sample_input();
         let prompt = build_pairwise_prompt(&input, true);

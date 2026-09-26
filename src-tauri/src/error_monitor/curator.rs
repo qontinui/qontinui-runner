@@ -410,7 +410,7 @@ impl DebugContextCurator {
                 areas.push(format!(
                     "CRITICAL: {} - {}",
                     error_type,
-                    &error.message[..50.min(error.message.len())]
+                    crate::str_utils::truncate_str(&error.message, 50)
                 ));
             }
         }

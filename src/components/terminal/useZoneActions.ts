@@ -1,7 +1,7 @@
 import { useCallback } from "react";
 import { save } from "@tauri-apps/plugin-dialog";
 import { writeTextFile } from "@tauri-apps/plugin-fs";
-import type { SessionState } from "./useZoneLayout";
+import { computeQuickLaunchLayoutId, type SessionState } from "./useZoneLayout";
 import type { UIAction } from "./useUIState";
 import type { TerminalTab } from "./useTerminalManager";
 import type { Metrics } from "./useEventHistory";
@@ -124,16 +124,14 @@ export function useZoneActions({
       const currentZoneCount = zoneLayout.layout.zones.length;
       const hasEmptyZone = zoneLayout.layout.zones.some((_, idx) => !zoneLayout.assignments[idx]);
 
-      if (totalTabs > currentZoneCount || (!hasEmptyZone && totalTabs > 1)) {
-        let targetLayout: string;
-        if (totalTabs >= 7) targetLayout = "full-grid";
-        else if (totalTabs >= 5) targetLayout = "six-pack";
-        else if (totalTabs >= 3) targetLayout = "quad";
-        else targetLayout = "split";
-        if (targetLayout !== zoneLayout.layoutId) {
-          zoneLayout.setLayoutId(targetLayout);
-        }
-      }
+      // The canonical, grow-only decision — see `computeQuickLaunchLayoutId`.
+      const targetLayout = computeQuickLaunchLayoutId(
+        zoneLayout.layoutId,
+        currentZoneCount,
+        hasEmptyZone,
+        totalTabs,
+      );
+      if (targetLayout !== null) zoneLayout.setLayoutId(targetLayout);
 
       return tabId;
     },
@@ -243,9 +241,8 @@ export function useZoneActions({
     // Count the sessions whose output is actually in the file: every assigned
     // zone whose tab still exists, plus the unassigned ones written above.
     const exported =
-      Object.values(zoneLayout.assignments).filter((tabId) =>
-        tabs.some((t) => t.id === tabId),
-      ).length + unassigned.length;
+      Object.values(zoneLayout.assignments).filter((tabId) => tabs.some((t) => t.id === tabId))
+        .length + unassigned.length;
 
     try {
       await writeTextFile(filePath, lines.join("\n"));
@@ -323,13 +320,7 @@ export function useZoneActions({
         console.error("Export failed:", err);
       }
     },
-    [
-      tabs,
-      hotStore,
-      stateTracking.sessionStates,
-      labelsAndTags.zoneLabels,
-      zoneLayout.assignments,
-    ],
+    [tabs, hotStore, stateTracking.sessionStates, labelsAndTags.zoneLabels, zoneLayout.assignments],
   );
 
   return {

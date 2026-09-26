@@ -833,6 +833,8 @@ pub fn export_all_schemas() -> Value {
     add!("RunnerStatus", qrn::RunnerStatus);
     add!("RunnerUiError", qrn::RunnerUiError);
     add!("RunnerCrash", qrn::RunnerCrash);
+    add!("RunnerInstance", qrn::RunnerInstance);
+    add!("RunnerInstanceRole", qrn::RunnerInstanceRole);
 
     // ── runner-local: WS relay envelopes + backend-originated runner-status
     // events (`crate::relay_envelopes`). These bind the previously-untyped
@@ -909,10 +911,17 @@ mod tests {
         // 2026-08-31-runner-publishes-embedded-command-defaults Phase 1) = 549
         // - the 1 recommendation-review payload (RecommendationReviewDecisionPayload,
         // deleted with the plan/task board by Phase 4 of
-        // 2026-09-12-consolidate-local-orchestration-onto-conductor) = 548.
+        // 2026-09-12-consolidate-local-orchestration-onto-conductor) = 548
+        // + the 2 per-instance runner types (RunnerInstance, RunnerInstanceRole —
+        // plan 2026-09-20-runner-selector-drives-a-transport-not-a-target
+        // Phase 6) = 550.
         // Independently corroborated by the codegen, which reports
-        // "Processing 548 top-level types" and emits 548 .d.ts files.
-        assert_eq!(obj.len(), 548, "Expected 548 schema entries");
+        // "Processing 550 top-level types" and emits 550 .d.ts files.
+        assert_eq!(obj.len(), 550, "Expected 550 schema entries");
+        assert!(
+            obj.contains_key("RunnerInstance") && obj.contains_key("RunnerInstanceRole"),
+            "Missing RunnerInstance / RunnerInstanceRole schema"
+        );
 
         // Sanity-check that qontinui_types re-exports are present
         assert!(

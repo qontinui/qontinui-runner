@@ -119,24 +119,13 @@ pub struct SnapshotChunk {
 // Error Types
 // ==========================================================================
 
-/// Machine-readable error codes for UI Bridge operations.
-/// Maps 1:1 to the existing UiBridgeErrorCode enum.
-#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
-pub enum UiBridgeErrorCode {
-    Timeout,
-    CircuitBreakerOpen,
-    ConcurrencyLimitReached,
-    FrontendUnresponsive,
-    WindowNotFound,
-    ElementNotFound,
-    ElementNotVisible,
-    ElementNotEnabled,
-    ElementStale,
-    ActionFailed,
-    AssertionFailed,
-    UnknownAssertionType,
-    InternalError,
-}
+/// Machine-readable error codes for UI Bridge operations — NOT a copy.
+///
+/// Re-exported from the canonical `mcp::ui_bridge::types::UiBridgeErrorCode`,
+/// which derives `async_graphql::Enum` itself. A hand-kept GraphQL mirror stood
+/// here under a "Maps 1:1" docstring while carrying 13 of 27 variants; the
+/// re-export makes that drift unrepresentable.
+pub use crate::mcp::ui_bridge::types::UiBridgeErrorCode;
 
 /// Structured error detail with recovery hint.
 #[derive(SimpleObject, Clone, Debug)]
@@ -145,7 +134,8 @@ pub struct UiBridgeErrorDetail {
     pub code: UiBridgeErrorCode,
     /// Human-readable error message.
     pub message: String,
-    /// Suggested recovery action (e.g., "Resnapshot", "RetryAfterDelay").
+    /// Suggested recovery action, in the serde wire spelling of `RecoveryHint`
+    /// (e.g. `"RESNAPSHOT"`, or `{"RETRY_AFTER_MS":1000}` for a data-carrying hint).
     pub recovery: Option<String>,
     /// Additional context as JSON.
     pub context: Option<Json<serde_json::Value>>,

@@ -2416,6 +2416,7 @@ mod tests {
             wind_down_at: None,
             finish_reason: None,
             finish_synced: false,
+            spawn_device_default: None,
         }
     }
 
@@ -2932,6 +2933,7 @@ mod tests {
             wind_down_at: None,
             finish_reason: None,
             finish_synced: false,
+            spawn_device_default: None,
         });
 
         // The confirming hook fires with bash-flavored context.
@@ -3019,6 +3021,7 @@ mod tests {
             wind_down_at: None,
             finish_reason: None,
             finish_synced: false,
+            spawn_device_default: None,
         });
 
         // The provider reports a DIFFERENT id about itself, from bash.
@@ -3103,6 +3106,7 @@ mod tests {
             wind_down_at: None,
             finish_reason: None,
             finish_synced: false,
+            spawn_device_default: None,
         });
 
         let req = SessionOpenRequest {

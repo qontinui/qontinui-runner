@@ -1,5 +1,8 @@
 /**
- * Pure-helper tests for the StatusStrip's two count reconciliations.
+ * Pure-helper tests for the Terminal page's count reconciliations
+ * (`sessionCounts.ts`, promoted out of `StatusStrip.tsx`). The file keeps its
+ * pre-move name deliberately: coord's blast-radius gate reads a renamed test file
+ * as an untouched caller of the moved exports (removes-referenced-export).
  *
  * The runner's vitest config is `environment: "node"` (no jsdom), so the strip
  * itself can't be rendered here — the counting rules are extracted as pure
@@ -11,10 +14,13 @@ import { describe, expect, it } from "vitest";
 import {
   countLiveTabs,
   countTabsInState,
+  formatWorking,
   splitNeedsInput,
+  splitWorking,
   unionErrorCount,
   unionSessionCount,
-} from "./StatusStrip";
+  windowTitleCounts,
+} from "./sessionCounts";
 
 describe("countTabsInState", () => {
   it("counts only tabs that are still in the live tab list", () => {
@@ -111,5 +117,53 @@ describe("splitNeedsInput", () => {
     // The two models settle at different times; a tab-scoped count ahead of
     // the session bucketing must not render "+-1 external".
     expect(splitNeedsInput(0, 2)).toEqual({ actionable: 2, external: 0 });
+  });
+});
+
+describe("windowTitleCounts", () => {
+  it("counts one live needs-input tab as 1 (positive case)", () => {
+    // Without this, a helper returning 0 always would pass the stale case.
+    const tabs = [{ id: "a" }, { id: "b" }];
+    const states = { a: "needs-input", b: "working" } as const;
+    expect(windowTitleCounts(tabs, states)).toEqual({ needsInputCount: 1, errorCount: 0 });
+  });
+
+  it("drops to 0 once the needs-input tab is closed but its state entry is not reaped", () => {
+    // Tab `a` was closed: it is gone from `tabs`, but `sessionStates` still
+    // carries its entry. The title must not keep counting it.
+    const tabs = [{ id: "b" }];
+    const states = { a: "needs-input", b: "working" } as const;
+    expect(windowTitleCounts(tabs, states)).toEqual({ needsInputCount: 0, errorCount: 0 });
+  });
+
+  it("applies the same live-tab filter to the error count", () => {
+    const states = { a: "error", b: "error" } as const;
+    expect(windowTitleCounts([{ id: "a" }, { id: "b" }], states).errorCount).toBe(2);
+    expect(windowTitleCounts([{ id: "b" }], states).errorCount).toBe(1);
+  });
+
+  it("returns zeros for absent inputs", () => {
+    expect(windowTitleCounts(undefined, undefined)).toEqual({ needsInputCount: 0, errorCount: 0 });
+  });
+});
+
+describe("splitWorking / formatWorking", () => {
+  it("scopes the headline to this page and reports external apart — THE DEFECT", () => {
+    const split = splitWorking(5, 4);
+    expect(split).toEqual({ page: 1, external: 4 });
+    expect(formatWorking(split)).toBe("1 working +4 external");
+  });
+
+  it("omits the suffix when nothing runs externally", () => {
+    expect(formatWorking(splitWorking(2, 0))).toBe("2 working");
+  });
+
+  it("is null when nothing is working anywhere", () => {
+    expect(formatWorking(splitWorking(0, 0))).toBeNull();
+  });
+
+  it("never renders a negative page count from an inconsistent pair", () => {
+    expect(splitWorking(1, 3)).toEqual({ page: 0, external: 1 });
+    expect(splitWorking(2, -1)).toEqual({ page: 2, external: 0 });
   });
 });

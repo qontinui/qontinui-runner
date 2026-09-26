@@ -162,6 +162,10 @@ fn input_start(line: &PromptLine) -> usize {
 }
 
 /// `1. Yes`-shaped: a numbered choice, after any leading marker or box edge.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn is_numbered_option(text: &str) -> bool {
     let body = text.trim_start_matches(|c: char| c.is_whitespace() || c == '│' || c == '❯');
     let digits = body.chars().take_while(|c| c.is_ascii_digit()).count();

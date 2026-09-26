@@ -685,6 +685,7 @@ fn build_budget_request(
     resources: Resources,
     disk_reserved_gb: u64,
     ci: &crate::settings::CiNodeSettings,
+    host: crate::ci_node::host_sizing::HostCapacity,
 ) -> DeviceBudgetRequest {
     DeviceBudgetRequest {
         hostname: hostname.to_string(),
@@ -697,13 +698,15 @@ fn build_budget_request(
             MachineRole::Build => 0,
         },
         // `ci.max_concurrent_builds` is the RUNNER-LOCAL settings key
-        // (`ci_node.max_concurrent_builds`, default 1) — the same value
-        // `ci_node/admission.rs` admits against — and it is deliberately not
-        // renamed. It is operator-visible, and the split is about which coord
-        // COLUMN carries the number, not about what the node calls its own
-        // capacity.
+        // (`ci_node.max_concurrent_builds`; unset ⇒ the host suggestion for
+        // `host`) — resolved through the same accessor `ci_node/admission.rs`
+        // admits against, so the advertised and admitted numbers cannot
+        // diverge. It is deliberately not renamed. It is operator-visible, and
+        // the split is about which coord COLUMN carries the number, not about
+        // what the node calls its own capacity. `host` is passed in rather than
+        // probed here so this function stays pure over its arguments.
         max_concurrent_ci_jobs: if ci.enabled {
-            ci.max_concurrent_builds.min(i32::MAX as u32) as i32
+            ci.configured_or_suggested_builds(host).min(i32::MAX as u32) as i32
         } else {
             0
         },
@@ -772,7 +775,14 @@ pub async fn publish_budget(
     let device_id_str = device_id_uuid.to_string();
 
     let ci = crate::settings::get_ci_node_settings();
-    let body = build_budget_request(&device.hostname, role, resources, disk_reserved_gb, &ci);
+    let body = build_budget_request(
+        &device.hostname,
+        role,
+        resources,
+        disk_reserved_gb,
+        &ci,
+        crate::ci_node::host_sizing::probe(),
+    );
 
     // Cache the payload regardless of whether the POST succeeds — this is
     // the operator's lifeline when coord is unreachable.
@@ -3663,6 +3673,10 @@ fn behind_default_compare_branch<'a>(branch: &str, default_branch: &'a str) -> O
 /// `None` when the directory isn't a git repo (no `.git/` dir). All
 /// `git` calls use `process_helpers::no_window("git")` so they go through the operator's
 /// PATH-resolved git — same as the rest of the runner.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     let dot_git = repo_path.join(".git");
     if !dot_git.exists() {
@@ -4096,6 +4110,10 @@ struct RestoreParams {
 /// Apply one safe verdict to one repo's working tree. Blocking git via the
 /// caller's `spawn_blocking`. Returns the outcome to record. NEVER performs an
 /// unsafe op regardless of the verdict (defense in depth, plan §5).
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn apply_pull_verdict_blocking(
     repo_path: &std::path::Path,
     verdict_kind: &str,
@@ -4279,6 +4297,10 @@ fn apply_pull_verdict_blocking(
 /// aborts on failure with a distinct outcome (idempotent — the next publish
 /// tick re-evaluates whatever state the tree was left in; every intermediate
 /// state is a valid git state strictly no staler than the parked one).
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn apply_restore_default_blocking(
     repo_path: &std::path::Path,
     repo_str: &str,
@@ -5861,10 +5883,19 @@ mod tests {",
     fn ci_settings(enabled: bool, max_concurrent_builds: u32) -> crate::settings::CiNodeSettings {
         crate::settings::CiNodeSettings {
             enabled,
-            max_concurrent_builds,
+            max_concurrent_builds: Some(max_concurrent_builds),
             repo_allowlist: Vec::new(),
             min_free_disk_gb: 50,
             canonical_converge: false,
+        }
+    }
+
+    /// A fixed host for the budget tests: 48 cores / 368 GiB (merytshost), so
+    /// the unset-capacity suggestion is a known 12.
+    fn test_host() -> crate::ci_node::host_sizing::HostCapacity {
+        crate::ci_node::host_sizing::HostCapacity {
+            mem_bytes: Some(368 * 1024 * 1024 * 1024),
+            cpus: 48,
         }
     }
 
@@ -5879,6 +5910,7 @@ mod tests {",
             },
             0,
             ci,
+            test_host(),
         ))
         .expect("budget payload must serialize")
     }
@@ -5954,6 +5986,7 @@ mod tests {",
                     },
                     0,
                     &ci_settings(enabled, 2),
+                    test_host(),
                 ))
                 .expect("budget payload must serialize");
                 assert!(
@@ -5995,6 +6028,30 @@ mod tests {",
             Some(0),
             "an enabled ci_node configured to 0 is an OPINION of zero and must \
              reach the wire — omission would make capacity un-withdrawable"
+        );
+    }
+
+    /// Plan `2026-09-22-ci-capacity-is-hand-typed-...` Phase 2: an enabled
+    /// node that was never configured publishes the HOST suggestion for the
+    /// supplied capacity, not a flat 1; a disabled one still publishes 0.
+    #[test]
+    fn budget_payload_publishes_the_host_suggestion_when_capacity_is_unset() {
+        let mut ci = ci_settings(true, 0);
+        ci.max_concurrent_builds = None;
+        assert_eq!(
+            budget_json(&ci)
+                .get("max_concurrent_ci_jobs")
+                .and_then(|v| v.as_i64()),
+            Some(12),
+            "48c/368GiB suggests 12 slots"
+        );
+        ci.enabled = false;
+        assert_eq!(
+            budget_json(&ci)
+                .get("max_concurrent_ci_jobs")
+                .and_then(|v| v.as_i64()),
+            Some(0),
+            "disabled ⇒ 0 is unchanged"
         );
     }
 

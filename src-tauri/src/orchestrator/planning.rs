@@ -347,6 +347,10 @@ pub fn build_planning_user_prompt(context: &PlanningContext) -> String {
 }
 
 /// Parse the planning agent's response into a VerificationPlan.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn parse_planning_response(response: &str) -> Result<VerificationPlan, String> {
     // Try to extract JSON from the response
     let json_str = if let Some(start) = response.find('{') {

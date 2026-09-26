@@ -542,12 +542,41 @@ fn ambient_claude_code_session_id() -> Option<String> {
 /// (`machine.json::active_tenant_id`, whose semantics are now
 /// default-for-NEW-sessions). Immutable afterwards — the recorded value
 /// drives both the coord `POST /sessions` body and which device-JWT slot the
-/// coord-sync loop presents for this session's writes. Stays `None` on
-/// single-tenant installs with no configured default (coord resolves
-/// sole-binding server-side, exactly the pre-8b behavior).
+/// coord-sync loop presents for this session's writes.
+///
+/// When `machine.json` names no active tenant (an unpinned device), the
+/// device's DEFAULT binding from `paired_user.json`
+/// ([`crate::auth::default_binding_tenant`]) is used, so the session is owned
+/// by a real tenant — its `POST /sessions` body carries that tenant rather than
+/// the nil UUID, and its pushes present that tenant's device-JWT slot instead
+/// of degrading to `TenantScope::Unresolved`.
+///
+/// The fallback applies to [`tenant_pin::TenantPin::Unpinned`] ONLY. An
+/// `Unresolvable` machine (no or unreadable `machine.json`) cannot state its
+/// tenant, and `tenant_pin` requires that to fail closed — so it records no
+/// tenant rather than guessing one. `None` too on an unpaired device.
+fn tenant_for_new_session(pin: tenant_pin::TenantPin) -> Option<Uuid> {
+    match pin {
+        tenant_pin::TenantPin::Pinned(t) => Some(t),
+        tenant_pin::TenantPin::Unpinned => crate::auth::default_binding_tenant(),
+        tenant_pin::TenantPin::Unresolvable => None,
+    }
+}
+
+/// The tenant a NEW session with no spawn-input tenant is recorded under,
+/// read from the live pin. The single source [`stamp_session_tenant`] fills
+/// from, shared with the sessions that live OUTSIDE the registry — the
+/// Claude AI sessions `AiCoordRegistrar` records and their federation context
+/// — so every session's recorded tenant resolves the same way. `machine.json`
+/// alone would answer `None` on an unpinned device, where the recorded tenant
+/// is the paired default binding.
+pub(crate) fn resolve_new_session_tenant() -> Option<Uuid> {
+    tenant_for_new_session(tenant_pin::resolve_tenant_pin())
+}
+
 fn stamp_session_tenant(mut intent: Intent) -> Intent {
     if intent.tenant_id.is_none() {
-        intent.tenant_id = dual_write::resolve_active_tenant_id();
+        intent.tenant_id = resolve_new_session_tenant();
     }
     intent
 }
@@ -821,10 +850,139 @@ impl SessionRegistry {
         parent_session_id: Option<Uuid>,
         claude_code_session_id_override: Option<String>,
     ) -> Result<Uuid, SessionError> {
+        let id = uuid_v7();
+        let (_, record) = self.write_external_started(
+            id,
+            intent,
+            parent_session_id,
+            claude_code_session_id_override,
+        )?;
+        self.sessions
+            .lock()
+            .expect("session registry poisoned")
+            .insert(id, record);
+        Ok(id)
+    }
+
+    /// [`SessionRegistry::register_external_with_lineage`], but the id is
+    /// reported only once COORD has confirmed the row.
+    ///
+    /// The plain variant appends a `started` row to the local outbox and
+    /// returns at once, leaving delivery to the drain loop. That is right for a
+    /// mirror nobody addresses by id, and wrong for a REMOTE create: the source
+    /// mints an attach grant by the returned id straight away, so an id whose
+    /// row is still queued (or was dropped by a stalled drain) answers every
+    /// attach with a `404`. Here the `started` row is pushed immediately
+    /// ([`coord_sync::CoordSync::confirm_started`]) under a drain hold, bounded
+    /// by `timeout`.
+    ///
+    /// On `Err` the session is torn down locally: the unconfirmed `started`
+    /// row is ACK-dropped so the drain can never create a coord row for a
+    /// session the caller has been told does not exist, and the session is
+    /// never inserted into the registry (it enters only on success), so no
+    /// heartbeat and no `closed` row is ever queued for it — a DELETE for a
+    /// row coord never created is a guaranteed refusal (and since census E2 a
+    /// `401`) that would only overwrite `/health`'s `lastFailure` with noise. On
+    /// a `timeout` coord may still have created the row; coord's stale reaper
+    /// closes it. The caller owns the terminal and must close it.
+    ///
+    /// **Runs to completion even if the caller's future is dropped.** The
+    /// confirmation and its cleanup run in a spawned task that this method
+    /// only awaits: a relay reconnect or shutdown that drops the caller
+    /// mid-confirmation used to release the drain hold with no cleanup, leaving
+    /// an Active session whose `started` row the drain then POSTed.
+    pub async fn register_external_confirmed(
+        self: &Arc<Self>,
+        intent: Intent,
+        parent_session_id: Option<Uuid>,
+        claude_code_session_id_override: Option<String>,
+        timeout: std::time::Duration,
+    ) -> Result<Uuid, coord_sync::CoordRegistrationFailure> {
+        let registry = Arc::clone(self);
+        let task = tokio::spawn(async move {
+            registry
+                .confirm_registration(
+                    intent,
+                    parent_session_id,
+                    claude_code_session_id_override,
+                    timeout,
+                )
+                .await
+        });
+        match task.await {
+            Ok(result) => result,
+            Err(e) => Err(coord_sync::CoordRegistrationFailure {
+                kind: "local",
+                status: None,
+                detail: format!("the registration task did not complete: {e}"),
+            }),
+        }
+    }
+
+    /// The body of [`SessionRegistry::register_external_confirmed`], run in its
+    /// own task so nothing can cancel it between the push and the cleanup.
+    async fn confirm_registration(
+        self: Arc<Self>,
+        intent: Intent,
+        parent_session_id: Option<Uuid>,
+        claude_code_session_id_override: Option<String>,
+        timeout: std::time::Duration,
+    ) -> Result<Uuid, coord_sync::CoordRegistrationFailure> {
+        let id = uuid_v7();
+        // Taken BEFORE the row exists, so no drain tick ever sees it un-held.
+        let _hold = self.coord_sync.hold_drain(id);
+        // The session enters the registry only once coord has confirmed it.
+        // Inserted earlier, the heartbeat loop would snapshot it during the
+        // confirmation and queue heartbeat rows that outlive a failure — PATCHes
+        // for a row coord never created, or keeping a timed-out ghost alive.
+        let (started, record) = self
+            .write_external_started(
+                id,
+                intent,
+                parent_session_id,
+                claude_code_session_id_override,
+            )
+            .map_err(|e| coord_sync::CoordRegistrationFailure {
+                kind: "local",
+                status: None,
+                detail: e.to_string(),
+            })?;
+        match self.coord_sync.confirm_started(&started, timeout).await {
+            Ok(()) => {
+                self.sessions
+                    .lock()
+                    .expect("session registry poisoned")
+                    .insert(id, record);
+                Ok(id)
+            }
+            Err(failure) => {
+                if let Err(e) = self.coord_sync.outbox().ack(&[(id, started.seq)]) {
+                    tracing::warn!(
+                        session = %id,
+                        error = %e,
+                        "remote registration: could not discard the unconfirmed started row — \
+                         the drain may still create it (coord's stale reaper closes it)"
+                    );
+                }
+                Err(failure)
+            }
+        }
+    }
+
+    /// Build an external session under a caller-chosen `id` and write its
+    /// `started` outbox row. Returns that row and the record, which the CALLER
+    /// inserts into the registry — immediately for a plain mirror, only after
+    /// coord's confirmation for [`SessionRegistry::register_external_confirmed`].
+    fn write_external_started(
+        self: &Arc<Self>,
+        id: Uuid,
+        intent: Intent,
+        parent_session_id: Option<Uuid>,
+        claude_code_session_id_override: Option<String>,
+    ) -> Result<(local_store::OutboxRecord, SessionRecord), SessionError> {
         intent.validate()?;
         let intent = stamp_session_tenant(intent);
 
-        let id = uuid_v7();
         let now = chrono::Utc::now();
         let claude_code_session_id =
             claude_code_session_id_override.or_else(ambient_claude_code_session_id);
@@ -860,15 +1018,13 @@ impl SessionRegistry {
             "parent_session_id": parent_session_id,
             "claude_code_session_id": claude_code_session_id,
         });
-        self.coord_sync
+        let started = self
+            .coord_sync
             .outbox()
             .record(self.machine_id, id, SessionEventKind::Started, payload)
             .map_err(|e| SessionError::Outbox(e.to_string()))?;
 
-        let mut sessions = self.sessions.lock().expect("session registry poisoned");
-        sessions.insert(id, record);
-
-        Ok(id)
+        Ok((started, record))
     }
 
     /// Record the harness (Claude Code) session id a provider CONFIRMED for an

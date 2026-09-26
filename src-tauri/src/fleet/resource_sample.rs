@@ -848,7 +848,8 @@ fn collect_host_lane() -> ResourceSample {
     let ci = crate::settings::get_ci_node_settings();
     let (running, queued) = crate::ci_node::admission::occupancy();
     if ci.enabled {
-        s.build_slots_total = Some(ci.max_concurrent_builds.max(1).min(i32::MAX as u32) as i32);
+        s.build_slots_total =
+            Some(ci.effective_max_concurrent_builds().min(i32::MAX as u32) as i32);
     }
     s.build_slots_busy = Some(running.min(i32::MAX as usize) as i32);
     s.build_queue_depth = Some(queued.min(i32::MAX as usize) as i32);
@@ -2068,6 +2069,10 @@ MemAvailable:   15335424 kB
     ///
     /// Structural, because the behaviour needs a live WSL VM to exercise.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn the_wsl_lane_still_takes_exactly_one_fork() {
         const SRC: &str = include_str!("resource_sample.rs");
         let prod = SRC
@@ -2102,6 +2107,10 @@ MemAvailable:   15335424 kB
     /// a call written inside a test must not satisfy a pin production code
     /// fails.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn the_wsl_lane_publishes_a_disk_axis() {
         const SRC: &str = include_str!("resource_sample.rs");
         let prod = SRC
@@ -2219,6 +2228,10 @@ MemAvailable:   15335424 kB
     /// PR #951 as it grows to cover the heartbeat, the tree publisher and the
     /// worktree census, and a pin that breaks on a rename pins the wrong thing.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn a_secondary_never_reaches_the_sampler() {
         let src = fleet_prod_src();
         let fn_start = src
@@ -2683,6 +2696,10 @@ MemAvailable:   15335424 kB
     /// above and below. Split off the test module first, so a call site written
     /// inside a test cannot satisfy a pin that production code fails — the same
     /// discipline as [`fleet_prod_src`].
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn collect_host_lane_src() -> &'static str {
         const SRC: &str = include_str!("resource_sample.rs");
         let prod = SRC
@@ -2708,6 +2725,10 @@ MemAvailable:   15335424 kB
     /// reading — through `resource_guard::evaluate_threads`, taken at the
     /// instant it decides, not smuggled through the publisher's reading.)
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn the_spawn_gate_reading_did_not_grow_the_spawn_pressure_probes() {
         const SRC: &str = include_str!("resource_sample.rs");
         let prod = SRC
@@ -2789,6 +2810,10 @@ MemAvailable:   15335424 kB
     /// `spawn_gate_reading`'s doc would quietly stop being true — and on the
     /// pre-PTY path that argument is the reason the reading is allowed at all.
     #[test]
+    #[expect(
+        clippy::string_slice,
+        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+    )]
     fn one_os_call_yields_both_readings() {
         const SRC: &str = include_str!("resource_sample.rs");
         let prod = SRC

@@ -409,6 +409,10 @@ fn extract_resume_name(content: &str) -> Option<String> {
 /// instead of writing a second one with subtly different partial-line handling.
 /// It reads with a much larger cap — see that module for why 4 KB is wrong for
 /// classifying a turn's final paragraph.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub(crate) fn read_tail_bytes(path: &Path, max: u64) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = fs::File::open(path).ok()?;
@@ -1242,6 +1246,10 @@ pub enum AgentLogObs {
 
 /// Truncate `s` to at most `AGENT_LOG_TEXT_CAP` bytes on a char boundary,
 /// appending an ellipsis marker when it was cut. Bounds per-line volume.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn truncate_for_log(s: &str) -> String {
     if s.len() <= AGENT_LOG_TEXT_CAP {
         return s.to_string();
@@ -1555,6 +1563,10 @@ const GENERIC_PREFIXES: &[&str] = &[
 /// Strips XML/HTML tags, markdown heading markers, and generic prefixes, then
 /// truncates to ~50 chars at a word boundary. Falls back to a date-based name
 /// for short or uninformative messages (slash commands, "continue", etc.).
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn generate_display_name(first_preview: &Option<String>, last_modified: &str) -> String {
     if let Some(preview) = first_preview {
         // Strip ANSI FIRST: an escape run left in place survives `strip_xml_tags`
@@ -1614,6 +1626,10 @@ fn generate_display_name(first_preview: &Option<String>, last_modified: &str) ->
 }
 
 /// Strip known generic prefixes to get to the actual meaningful content.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn strip_generic_prefix(text: &str) -> &str {
     let lower = text.to_lowercase();
     for prefix in GENERIC_PREFIXES {
@@ -1647,6 +1663,10 @@ fn extract_first_timestamp(content: &str) -> Option<String> {
 /// Scans user records, skipping system-generated content (caveats, command
 /// markup, interruption notices) to find the actual user prompt. Returns
 /// up to ~80 characters of the first meaningful message.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 fn extract_first_user_preview(content: &str) -> Option<String> {
     // Scan up to 50 lines to find a meaningful user message (system caveats
     // and command records can consume the first 5-10 lines).
@@ -1714,6 +1734,10 @@ fn extract_first_user_preview(content: &str) -> Option<String> {
 ///
 /// Reads the last ~4KB of the file (seeking from end) to extract the last
 /// user and assistant messages without parsing the entire transcript.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn session_digest(
     config_dir: &Path,
     project_path: &str,

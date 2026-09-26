@@ -207,6 +207,10 @@ fn extract_missing_key(error: &str) -> Option<String> {
 /// scanning quoted identifiers at the top-level of the outermost `{}`. A
 /// trailing `?` on the key (e.g. `"metadata"?`) is treated as the optional
 /// marker and stripped from the returned name.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
 pub fn extract_top_level_keys(schema_str: &str) -> Vec<String> {
     let trimmed = schema_str.trim();
 
