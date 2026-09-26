@@ -21,6 +21,10 @@ These four are the **engineering priorities** — they decide *what* gets built.
 ## Arguments
 
 - `$ARGUMENTS` — Path to the plan file (absolute or relative). If omitted, look for the most recently modified `*.md` under `$QONTINUI_PLANS_DIR` (see below) and the working tree root, and ask the user to confirm before editing.
+- `--phase N` — Optional. Vet only phase N of a **phase-claimable** plan
+  (`/preflight` §0c's parsed declaration, never inferred) rather than the whole
+  document — see "§0.21. `--phase N`: vet only that phase" below for the full
+  narrowing (reserve, edit scope, and which coord writes are skipped).
 
 ## Plan directories
 
@@ -610,6 +614,66 @@ branch above. Always issue the call, always STOP on a foreign `held`, always fai
 closed on an unanswerable one. Do not write `plan` into a hand-maintained
 mandatory list here — that is what Step 0.7.5 forbids and what the registry
 replaces.
+
+### 0.21. `--phase N`: vet only that phase, on a phase-claimable plan
+
+*(Plan `2026-09-06-multi-phase-plans-have-no-per-phase-lifecycle-in-vet-plan-preflight-and-coord`
+Phase 1 — canonical spec; `/preflight` §0c defines the phase key and the
+reserve mechanics this section reuses rather than re-deriving.)*
+
+When invoked as `/vet-plan --phase N <plan path>` on a plan that is
+**phase-claimable** (`How to take a phase` / `independently claimable` /
+`Phase-Claimable: yes` — parsed, not inferred), this run's scope narrows in
+three ways relative to a whole-plan vet:
+
+1. **Reserve the phase key, not just the plan key.** After §0.2's whole-plan
+   reserve (which still runs — this is a NESTED reserve, never a substitute),
+   also reserve `plan:<plan-stem>:phase:<n>` per `/preflight` §0c: same
+   `kind: "phase"` primitive `/implement-plan` Step 0.6 already uses, same
+   owner token. **A foreign `held` on the plan key is advisory here** — name
+   the holder and continue, since a peer vetting or implementing a different
+   phase is expected concurrency, not a collision. **STOP only on a foreign
+   `held` of the phase key itself** — someone else is already vetting or
+   implementing this exact phase.
+2. **Edit only that phase's section, plus ONE scoped line in the status
+   block.** Do not touch other phases' sections, and do not run the
+   single-stamp-invariant full-block replace §5 describes for a whole-plan
+   vet. Instead, splice a single scoped line into the existing status
+   blockquote using the same separate-index, pinned-`$BASE` push recipe
+   `CLAUDE.md` already documents for a shared checkout (`git hash-object -w`
+   → `GIT_INDEX_FILE=<tmp> git read-tree "$BASE"` → `update-index` →
+   `write-tree` → `commit-tree -p "$BASE"` → push), so a concurrent phase
+   session's own scoped edit is never clobbered by a full-block rewrite. The
+   scoped line reads:
+   ```
+   Phase N: VETTED <date> (session <short-id>) — see § Phase N.
+   ```
+   appended after the existing status paragraph, never replacing it and never
+   producing a second top-level `> **Status:` blockquote.
+3. **Skip the coord registry transition and BOTH §5.4 gates.** §5.4's
+   `→ vetted` registry transition and its `unit_ready` / `time_elapsed` gate
+   registrations are whole-plan primitives — they answer "is THE PLAN ready,
+   dispatchable work", which a single phase's vet cannot answer on a
+   multi-phase, partially-vetted document. Registering either against a
+   phase-scoped vet would misrepresent five-sixths-DRAFT work as ready. Skip
+   both, and **say which arm skipped them** — "phase-scoped vet: registry
+   transition and both §5.4 gates skipped by design (Phase 1 of
+   `2026-09-06-…`)" — in the report, so a reader sees a sanctioned skip rather
+   than an omission.
+4. **Record the scoped verdict on the work unit's `metadata.phase_vets[]`**
+   (`{phase, verdict, date, session, pr}`), through
+   `coord_work_unit_upsert`'s `metadata_patch` merge arm when the running
+   coord serves it (Phase 2 of the plan cited above); when it does not yet,
+   read the current `metadata.phase_vets` first, append this phase's entry,
+   and send the FULL merged object back (a plain `metadata` upsert REPLACES
+   the whole object) — and say in the report that this was a manual
+   read-modify-write rather than an atomic merge, so a concurrent phase
+   session's own write is not silently lost to a race between your read and
+   your write.
+
+A whole-plan `/vet-plan` (no `--phase` flag) is unaffected by any of this —
+every rule above applies only to the `--phase N` invocation on a
+phase-claimable plan.
 
 ### 0.25. Capture the status block and read delivery — BEFORE any edit
 
@@ -1563,6 +1627,12 @@ unreserve the plan mid-lifecycle. `"not_held"` is otherwise fine and idempotent.
 ### 5.4. Register a `unit_ready` gate for the vetted plan (dispatchable-work queue)
 
 *(canonical spec: `_gate-registration` — keep copies in sync)*
+
+> ⚠️ **A phase-scoped run (`--phase N`, §0.21) never reaches this section at
+> all — §0.21 point 3 skips BOTH the registry transition and both gates below,
+> on every caller, standalone or `/vet-imp` alike.** The table just below this
+> one decides which gate a WHOLE-PLAN vet registers; it does not apply to a
+> phase-scoped vet, which registers neither.
 
 > ⚠️ **A hand-written work-unit status does not stick — the plan adapter reverts it,
 > and this gate is what gets stranded.** The runner's plan/work-unit adapter
