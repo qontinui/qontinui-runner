@@ -4763,11 +4763,12 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
     if let crate::coord_drain_state::DrainGate::Defer { reason, class } =
         crate::coord_drain_state::drain_gate_for_work(
             crate::coord_drain_state::SpawnOrigin::Unknown,
-            &format!(
-                "relay_terminal:{}",
+            // Caller-supplied request id — BOUNDED (review N4).
+            &crate::coord_drain_state::bounded_work_key(
+                "relay_terminal",
                 data.get("request_id")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("-")
+                    .unwrap_or("-"),
             ),
         )
     {

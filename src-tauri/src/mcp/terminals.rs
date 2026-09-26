@@ -247,9 +247,10 @@ pub async fn create_terminal_handler(
     if let crate::coord_drain_state::DrainGate::Defer { reason, class } =
         crate::coord_drain_state::drain_gate_for_work(
             crate::coord_drain_state::SpawnOrigin::Unknown,
-            &format!(
-                "http_terminal:{}",
-                request.title.as_deref().unwrap_or("untitled")
+            // Caller-supplied title — BOUNDED (review N4).
+            &crate::coord_drain_state::bounded_work_key(
+                "http_terminal",
+                request.title.as_deref().unwrap_or("untitled"),
             ),
         )
     {

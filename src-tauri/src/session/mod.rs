@@ -90,8 +90,9 @@ pub use qontinui_runner_lib::tenant_pin;
 pub mod tracking_health;
 pub mod transcript_emitter;
 pub mod transport;
-pub mod wind_down_observer;
-pub mod workspace_tenant; // The workspace's own tenant declaration — tiers 1-3 of coord_mcp's authority order (plan 2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin, D1/Phase 1) // Wind-down eligibility observation — the one entry point readiness and the drain wind-down tick share (plan 2026-09-13-drained-runner-never-reaches-idle)
+pub mod wind_down_executor; // The wind-down TICK — the only place a drain closes a session (plan 2026-09-13-drained-runner-never-reaches-idle, Phase 4)
+pub mod wind_down_observer; // Wind-down eligibility observation — the one entry point readiness and the drain wind-down tick share (plan 2026-09-13-drained-runner-never-reaches-idle)
+pub mod workspace_tenant; // The workspace's own tenant declaration — tiers 1-3 of coord_mcp's authority order (plan 2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin, D1/Phase 1)
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

@@ -4164,11 +4164,19 @@ impl TerminalSession {
     /// backward or forward step of at least the grace period (an NTP
     /// correction, a VM resume, a manual clock set) therefore moves the window
     /// without the pane having been idle for it, and can promote a pane to
-    /// `Eligible`. Harmless while Phase 1 is a dry run — nothing acts on the
-    /// verdict — but it must be settled before anything closes a pane on it.
-    /// A monotonic clock is the fix; it is not made here because the observed
-    /// `since` is also reported over `/restart-readiness` as an absolute epoch
-    /// millis, so the two would have to change together.
+    /// `Eligible`. This was harmless while Phase 1 only reported the verdict;
+    /// **it is not any more** — the Phase 4 wind-down executor closes panes on
+    /// it.
+    ///
+    /// It is SETTLED, but not here and not by a monotonic clock. A monotonic
+    /// window cannot be built at this seam: the same verdict also folds coord's
+    /// `finished_at`, which arrives as a wall-clock instant over the wire, and
+    /// the `since` this produces is reported over `/restart-readiness` as
+    /// absolute epoch millis. Instead `session::wind_down_executor`'s
+    /// `ClockJumpGuard` measures the wall clock against the monotonic one on
+    /// every tick and quarantines wind-down for a full grace period whenever
+    /// they disagree — so a stepped window is refused rather than acted on. See
+    /// that module's "Hazard 1" section.
     pub fn observe_grid_idle(&self) -> qontinui_runner_lib::wind_down::GridIdle {
         use qontinui_runner_lib::looping_agent::idle::snapshot_looks_idle;
 
@@ -4211,7 +4219,7 @@ impl TerminalSession {
     ) -> crate::terminal::graceful_exit::GracefulExitOutcome
     where
         C: FnOnce() -> CF,
-        CF: std::future::Future<Output = ()>,
+        CF: std::future::Future<Output = crate::terminal::graceful_exit::CloseTabResult>,
     {
         let root = self.child_pid;
         self.graceful_exit_driven(
@@ -4234,7 +4242,7 @@ impl TerminalSession {
         P: FnMut(Vec<crate::terminal::graceful_exit::ProcIdentity>) -> PF,
         PF: std::future::Future<Output = crate::terminal::graceful_exit::ClaudeProbe>,
         C: FnOnce() -> CF,
-        CF: std::future::Future<Output = ()>,
+        CF: std::future::Future<Output = crate::terminal::graceful_exit::CloseTabResult>,
     {
         use crate::terminal::graceful_exit::{drive, GracefulExitOutcome};
 
@@ -4257,9 +4265,24 @@ impl TerminalSession {
                 pids = ?claude_pids,
                 "graceful_exit: claude outlived the deadline — left RUNNING, tab not closed"
             ),
+            GracefulExitOutcome::CloseRefused { reason, .. } => warn!(
+                terminal_id = %self.id,
+                "graceful_exit: the pane could not be proven clear at the close — \
+                 nothing killed, tab left open: {reason}"
+            ),
+            GracefulExitOutcome::CloseOutcomeUnknown { detail, .. } => warn!(
+                terminal_id = %self.id,
+                "graceful_exit: the close was attempted and its result is UNKNOWN — \
+                 do not read this as the tab being left alone: {detail}"
+            ),
             other => info!(terminal_id = %self.id, outcome = ?other, "graceful_exit: done"),
         }
         outcome
+    }
+
+    /// The pane's own root process id, for the graceful-exit probe.
+    pub(super) fn pane_root_pid(&self) -> Option<u32> {
+        self.child_pid
     }
 
     /// Close the tab after a graceful exit. When the pane's own process has
@@ -4268,6 +4291,13 @@ impl TerminalSession {
     /// a dead pid can only land on whatever reused it. Otherwise the pane holds
     /// a bare shell (the caller established no `claude` is alive anywhere) and
     /// the ordinary close applies.
+    ///
+    /// `kill_child` is `is_alive()`, a COARSE proxy — it answers "is the pane's
+    /// shell running", not "is a live `claude` in this pane". The relaunch
+    /// window that makes the difference is closed one level up, by
+    /// `TerminalManager::graceful_exit`'s re-probe, which refuses the close
+    /// rather than reaching this function at all when a `claude` reappeared
+    /// (see `graceful_exit::CloseTabResult`).
     pub(super) fn close_after_graceful_exit(&self) {
         let kill_child = self.is_alive();
         self.close_inner(None, kill_child);
@@ -5187,7 +5217,10 @@ mod tests {
             .graceful_exit_driven(
                 exit_timing(),
                 |_tracked| std::future::ready(pane_view(&[CLAUDE_ID], &[CLAUDE_ID])),
-                move || async move { closer.close_after_graceful_exit() },
+                move || async move {
+                    closer.close_after_graceful_exit();
+                    crate::terminal::graceful_exit::CloseTabResult::Closed
+                },
             )
             .await;
 
@@ -5221,7 +5254,10 @@ mod tests {
                         pane_view(&[], &[CLAUDE_ID])
                     })
                 },
-                move || async move { closer.close_after_graceful_exit() },
+                move || async move {
+                    closer.close_after_graceful_exit();
+                    crate::terminal::graceful_exit::CloseTabResult::Closed
+                },
             )
             .await;
         assert!(
@@ -5253,7 +5289,10 @@ mod tests {
                         pane_view(&[], &[])
                     })
                 },
-                move || async move { closer.close_after_graceful_exit() },
+                move || async move {
+                    closer.close_after_graceful_exit();
+                    crate::terminal::graceful_exit::CloseTabResult::Closed
+                },
             )
             .await;
         assert!(
@@ -5291,7 +5330,10 @@ mod tests {
                         pane_view(&[], &[])
                     })
                 },
-                move || async move { closer.close_after_graceful_exit() },
+                move || async move {
+                    closer.close_after_graceful_exit();
+                    crate::terminal::graceful_exit::CloseTabResult::Closed
+                },
             )
             .await;
         assert!(
@@ -5316,7 +5358,10 @@ mod tests {
             .graceful_exit_driven(
                 exit_timing(),
                 |_tracked| std::future::ready(pane_view(&[CLAUDE_ID], &[])),
-                move || async move { closer.close_after_graceful_exit() },
+                move || async move {
+                    closer.close_after_graceful_exit();
+                    crate::terminal::graceful_exit::CloseTabResult::Closed
+                },
             )
             .await;
         assert!(
@@ -5345,7 +5390,10 @@ mod tests {
             .graceful_exit_driven(
                 exit_timing(),
                 |_tracked| std::future::ready(pane_view(&[CLAUDE_ID], &[])),
-                move || async move { closer.close_after_graceful_exit() },
+                move || async move {
+                    closer.close_after_graceful_exit();
+                    crate::terminal::graceful_exit::CloseTabResult::Closed
+                },
             )
             .await;
         match &outcome {
@@ -5372,7 +5420,10 @@ mod tests {
             .graceful_exit_driven(
                 exit_timing(),
                 |_tracked| std::future::ready(pane_view(&[CLAUDE_ID], &[])),
-                move || async move { closer.close_after_graceful_exit() },
+                move || async move {
+                    closer.close_after_graceful_exit();
+                    crate::terminal::graceful_exit::CloseTabResult::Closed
+                },
             )
             .await;
         assert!(
