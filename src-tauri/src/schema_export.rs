@@ -354,6 +354,9 @@ pub fn export_all_schemas() -> Value {
     add!("DiagnosticResult", qoc::DiagnosticResult);
     add!("ExitStrategy", qoc::ExitStrategy);
     add!("BetweenIterations", qoc::BetweenIterations);
+    add!("RestartPathKind", qoc::RestartPathKind);
+    add!("RestartUnsupportedCode", qoc::RestartUnsupportedCode);
+    add!("RestartCapability", qoc::RestartCapability);
     add!("LoopPhase", qoc::LoopPhase);
     add!("OrchestrationLoopStatus", qoc::OrchestrationLoopStatus);
     add!("IterationResult", qoc::IterationResult);
@@ -914,13 +917,21 @@ mod tests {
         // 2026-09-12-consolidate-local-orchestration-onto-conductor) = 548
         // + the 2 per-instance runner types (RunnerInstance, RunnerInstanceRole —
         // plan 2026-09-20-runner-selector-drives-a-transport-not-a-target
-        // Phase 6) = 550.
-        // Independently corroborated by the codegen, which reports
-        // "Processing 550 top-level types" and emits 550 .d.ts files.
-        assert_eq!(obj.len(), 550, "Expected 550 schema entries");
+        // Phase 6) = 550
+        // + the 3 orchestration-loop restart-verdict types (RestartCapability,
+        // RestartPathKind, RestartUnsupportedCode — plan
+        // 2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor
+        // Phase 3) = 553.
+        assert_eq!(obj.len(), 553, "Expected 553 schema entries");
         assert!(
             obj.contains_key("RunnerInstance") && obj.contains_key("RunnerInstanceRole"),
             "Missing RunnerInstance / RunnerInstanceRole schema"
+        );
+        assert!(
+            obj.contains_key("RestartCapability")
+                && obj.contains_key("RestartPathKind")
+                && obj.contains_key("RestartUnsupportedCode"),
+            "Missing orchestration-loop restart-verdict schemas"
         );
 
         // Sanity-check that qontinui_types re-exports are present

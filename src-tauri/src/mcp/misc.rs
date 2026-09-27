@@ -1707,6 +1707,34 @@ async fn stop_instance(
     Ok(Json(ApiResponse::success("stopped".to_string())))
 }
 
+/// POST /instances/{id}/restart — restart a runner-owned child in place:
+/// stop → wait for its port to free → relaunch the same slot on the same
+/// port. `404` when `id` is not a live child of THIS runner (nothing is
+/// touched); `500` for every other typed failure, with the reason in `error`.
+/// The AppHandle is passed so the slot's `spawn_placement` survives.
+async fn restart_instance(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiResponse<()>>)> {
+    let pid = state
+        .instance_manager
+        .restart_instance(&id, Some(&state.app_handle))
+        .await
+        .map_err(|e| {
+            let status = match e {
+                crate::instance_manager::InstanceRestartError::NotRunning { .. } => {
+                    axum::http::StatusCode::NOT_FOUND
+                }
+                _ => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, Json(ApiResponse::error(e.to_string())))
+        })?;
+
+    Ok(Json(ApiResponse::success(
+        serde_json::json!({ "pid": pid }),
+    )))
+}
+
 /// POST /instances/{id}/launch — launch an existing configured instance.
 async fn launch_instance(
     State(state): State<Arc<ApiState>>,
@@ -2291,6 +2319,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/instances/{id}", delete(delete_instance))
         .route("/instances/{id}/stop", post(stop_instance))
         .route("/instances/{id}/launch", post(launch_instance))
+        .route("/instances/{id}/restart", post(restart_instance))
         .route("/instances/{id}/heartbeat", post(instance_heartbeat))
         .route(
             "/spawn-placement/preview",

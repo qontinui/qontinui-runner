@@ -286,6 +286,7 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     "POST /sessions/{id}/commit-progress",
     "POST /instances/{id}/launch",
     "POST /instances/{id}/stop",
+    "POST /instances/{id}/restart",
     "POST /launch-debug-chrome",
     "POST /bridges",
     "POST /bridges/{id}/workflow",

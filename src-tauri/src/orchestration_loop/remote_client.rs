@@ -1,18 +1,127 @@
 //! HTTP clients for communicating with target runners and the supervisor.
 
 use serde::Deserialize;
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 /// Client for interacting with a target runner's HTTP API.
+///
+/// It also remembers every task run it STARTED (or discovered as a child of
+/// one it started) on the target — the loop's own runs. The between-iterations
+/// restart gate uses that set to tell the loop's own AI-plane sessions from
+/// anyone else's (see `restart_path::ReadinessSummary::foreign`).
 pub struct RunnerClient {
     client: reqwest::Client,
     base_url: String,
+    launched: Arc<StdMutex<BTreeSet<String>>>,
 }
 
 /// Client for interacting with the supervisor's HTTP API.
 pub struct SupervisorClient {
     client: reqwest::Client,
     base_url: String,
+    /// How often a detached rebuild-restart's status is polled.
+    poll_interval: Duration,
+}
+
+/// How long a detached supervisor rebuild-restart may run before the loop
+/// gives up on it.
+pub const DETACHED_REBUILD_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+/// How long a `404` from `GET /build/{id}/status` is tolerated after the 202.
+/// The supervisor answers the 202 BEFORE its detached task registers the
+/// submission (`build_submissions::submit_detached` inserts it inside the
+/// spawned task), so an immediate poll can legitimately miss it; a 404 that
+/// persists past this grace means the supervisor lost it (restarted).
+const DETACHED_NOT_FOUND_GRACE: Duration = Duration::from_secs(30);
+/// Default poll interval for a detached rebuild-restart.
+const DETACHED_REBUILD_POLL: Duration = Duration::from_secs(5);
+
+/// Why a supervisor restart did not complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SupervisorRestartError {
+    /// The request itself failed or was refused.
+    Request(String),
+    /// The detached rebuild-restart reached a terminal FAILED state.
+    BuildFailed {
+        submission_id: String,
+        error: String,
+    },
+    /// The detached rebuild-restart had not finished within the bound.
+    TimedOut {
+        submission_id: String,
+        waited_secs: u64,
+    },
+    /// The loop was stopped while waiting.
+    Stopped,
+}
+
+impl std::fmt::Display for SupervisorRestartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Request(e) => write!(f, "supervisor restart request failed: {e}"),
+            Self::BuildFailed {
+                submission_id,
+                error,
+            } => write!(
+                f,
+                "supervisor rebuild-restart {submission_id} failed: {error}"
+            ),
+            Self::TimedOut {
+                submission_id,
+                waited_secs,
+            } => write!(
+                f,
+                "supervisor rebuild-restart {submission_id} did not finish within {waited_secs}s"
+            ),
+            Self::Stopped => write!(f, "Loop stopped"),
+        }
+    }
+}
+
+impl std::error::Error for SupervisorRestartError {}
+
+/// The state of a detached supervisor submission, read from
+/// `GET /build/{id}/status` (qontinui-supervisor `build_submissions`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetachedBuildState {
+    /// Queued or running.
+    Pending,
+    /// Built and restarted.
+    Succeeded,
+    /// Terminal failure, with the supervisor's error.
+    Failed(String),
+}
+
+/// Parse a `GET /build/{id}/status` body. The submission's `status.state` is
+/// `queued` | `running` | `succeeded` | `failed`; a detached action also
+/// carries `detached: {http_status, body}` once terminal, and a detached
+/// action whose inner restart failed reports that as a non-2xx `http_status`.
+pub fn parse_detached_build_status(body: &serde_json::Value) -> DetachedBuildState {
+    let state = body
+        .pointer("/status/state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let detached_status = body
+        .pointer("/detached/http_status")
+        .and_then(|v| v.as_u64());
+    let error = || {
+        body.pointer("/detached/body/error")
+            .or_else(|| body.pointer("/status/error"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("submission ended {state:?} with no error text"))
+    };
+    match state {
+        "failed" => DetachedBuildState::Failed(error()),
+        "succeeded" => match detached_status {
+            Some(code) if (200..300).contains(&code) => DetachedBuildState::Succeeded,
+            Some(_) => DetachedBuildState::Failed(error()),
+            // Terminal but the outcome body has not been attached yet.
+            None => DetachedBuildState::Pending,
+        },
+        _ => DetachedBuildState::Pending,
+    }
 }
 
 #[derive(Deserialize)]
@@ -32,7 +141,21 @@ impl RunnerClient {
         Self {
             client,
             base_url: format!("http://127.0.0.1:{}", port),
+            launched: Arc::new(StdMutex::new(BTreeSet::new())),
         }
+    }
+
+    /// Remember a task run this loop started (or a child of one it started).
+    fn record_launched(&self, task_run_id: &str) {
+        if let Ok(mut set) = self.launched.lock() {
+            set.insert(task_run_id.to_string());
+        }
+    }
+
+    /// Every task run this client started on the target, or discovered as a
+    /// reflection / fixer of one it started.
+    pub fn launched_run_ids(&self) -> BTreeSet<String> {
+        self.launched.lock().map(|s| s.clone()).unwrap_or_default()
     }
 
     /// Check if the runner's API is responding.
@@ -90,11 +213,14 @@ impl RunnerClient {
             resp_body
         };
 
-        data.get("task_run_id")
+        let id = data
+            .get("task_run_id")
             .or_else(|| data.get("id"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
-            .ok_or_else(|| format!("No task_run_id in response: {}", data))
+            .ok_or_else(|| format!("No task_run_id in response: {}", data))?;
+        self.record_launched(&id);
+        Ok(id)
     }
 
     /// Poll a task run until it completes. Returns the workflow state.
@@ -190,7 +316,11 @@ impl RunnerClient {
 
         if resp.status().as_u16() == 409 {
             // Already running — find the existing reflection
-            return self.find_reflection_for(task_run_id).await;
+            let found = self.find_reflection_for(task_run_id).await?;
+            if let Some(id) = &found {
+                self.record_launched(id);
+            }
+            return Ok(found);
         }
 
         let body: serde_json::Value = resp
@@ -209,6 +339,9 @@ impl RunnerClient {
             .or_else(|| data.get("id"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        if let Some(id) = &id {
+            self.record_launched(id);
+        }
 
         Ok(id)
     }
@@ -350,6 +483,7 @@ impl RunnerClient {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .ok_or_else(|| format!("No task_run_id in generate response: {}", data))?;
+        self.record_launched(&task_run_id);
 
         // Poll until the meta-workflow completes
         let stop_rx_dummy = tokio::sync::watch::channel(false).1;
@@ -476,6 +610,11 @@ impl RunnerClient {
                                 .unwrap_or(false);
                             if !is_fixer {
                                 continue;
+                            }
+                            // A fixer spawned for one of this loop's runs is
+                            // the loop's own work.
+                            if let Some(id) = run.get("id").and_then(|v| v.as_str()) {
+                                self.record_launched(id);
                             }
                             let status = run
                                 .get("status")
@@ -623,11 +762,31 @@ impl SupervisorClient {
         Self {
             client,
             base_url: format!("http://127.0.0.1:{}", port),
+            poll_interval: DETACHED_REBUILD_POLL,
         }
     }
 
-    /// Restart a runner by ID.
-    pub async fn restart_runner(&self, runner_id: &str, rebuild: bool) -> Result<(), String> {
+    /// Override the detached-rebuild poll interval (tests).
+    pub fn with_poll_interval(mut self, poll_interval: Duration) -> Self {
+        self.poll_interval = poll_interval;
+        self
+    }
+
+    /// Restart a runner by ID and return only once the restart is DONE.
+    ///
+    /// A `rebuild: true` restart is answered `202 Accepted` with a
+    /// `submission_id`: the supervisor builds and restarts DETACHED from the
+    /// request. A 202 is therefore not completion — this polls
+    /// `GET /build/{id}/status` until the submission is terminal (bounded by
+    /// `timeout`, abandoned on `stop_rx`), and a failed build is a typed
+    /// [`SupervisorRestartError::BuildFailed`].
+    pub async fn restart_runner(
+        &self,
+        runner_id: &str,
+        rebuild: bool,
+        timeout: Duration,
+        stop_rx: &tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), SupervisorRestartError> {
         let url = format!("{}/runners/{}/restart", self.base_url, runner_id);
         let resp = self
             .client
@@ -635,13 +794,101 @@ impl SupervisorClient {
             .json(&serde_json::json!({ "rebuild": rebuild, "source": "workflow_loop" }))
             .send()
             .await
-            .map_err(|e| format!("Failed to restart runner: {}", e))?;
+            .map_err(|e| {
+                SupervisorRestartError::Request(format!("Failed to restart runner: {e}"))
+            })?;
 
-        if !resp.status().is_success() {
+        let status = resp.status();
+        if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Supervisor returned error: {}", body));
+            return Err(SupervisorRestartError::Request(format!(
+                "Supervisor returned HTTP {status}: {body}"
+            )));
+        }
+        if status.as_u16() != 202 {
+            return Ok(());
         }
 
-        Ok(())
+        let body: serde_json::Value = resp.json().await.map_err(|e| {
+            SupervisorRestartError::Request(format!(
+                "unparseable 202 body from the supervisor: {e}"
+            ))
+        })?;
+        let submission_id = body
+            .get("submission_id")
+            .or_else(|| body.get("build_id"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                SupervisorRestartError::Request(format!(
+                    "the supervisor accepted the rebuild but named no submission id: {body}"
+                ))
+            })?;
+        self.wait_for_detached(&submission_id, timeout, stop_rx)
+            .await
+    }
+
+    /// Poll a detached submission until it is terminal.
+    async fn wait_for_detached(
+        &self,
+        submission_id: &str,
+        timeout: Duration,
+        stop_rx: &tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), SupervisorRestartError> {
+        let start = std::time::Instant::now();
+        let url = format!("{}/build/{}/status", self.base_url, submission_id);
+        loop {
+            if *stop_rx.borrow() {
+                return Err(SupervisorRestartError::Stopped);
+            }
+            if start.elapsed() > timeout {
+                return Err(SupervisorRestartError::TimedOut {
+                    submission_id: submission_id.to_string(),
+                    waited_secs: timeout.as_secs(),
+                });
+            }
+            // A transient poll failure (the supervisor briefly busy) is not a
+            // verdict; only a terminal status decides.
+            if let Ok(resp) = self.client.get(&url).send().await {
+                if resp.status().is_success() {
+                    if let Ok(body) = resp.json::<serde_json::Value>().await {
+                        match parse_detached_build_status(&body) {
+                            DetachedBuildState::Succeeded => return Ok(()),
+                            DetachedBuildState::Failed(error) => {
+                                return Err(SupervisorRestartError::BuildFailed {
+                                    submission_id: submission_id.to_string(),
+                                    error,
+                                })
+                            }
+                            DetachedBuildState::Pending => {}
+                        }
+                    }
+                } else if resp.status().as_u16() == 404 {
+                    if start.elapsed() > DETACHED_NOT_FOUND_GRACE {
+                        return Err(SupervisorRestartError::BuildFailed {
+                            submission_id: submission_id.to_string(),
+                            error: "the supervisor no longer knows this submission (restarted?)"
+                                .to_string(),
+                        });
+                    }
+                } else if resp.status().is_client_error() {
+                    // Any other 4xx (e.g. 400 for an id the supervisor cannot
+                    // parse) will not change on retry — terminal.
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(SupervisorRestartError::BuildFailed {
+                        submission_id: submission_id.to_string(),
+                        error: format!(
+                            "the supervisor refused the status poll: HTTP {status}: {body}"
+                        ),
+                    });
+                }
+            }
+            let mut rx = stop_rx.clone();
+            tokio::select! {
+                _ = tokio::time::sleep(self.poll_interval) => {}
+                _ = rx.changed() => {}
+            }
+        }
     }
 }

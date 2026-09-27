@@ -15,6 +15,24 @@ import {
   ChevronRight,
 } from "lucide-react";
 import { MultiLoopPanel } from "./MultiLoopPanel";
+import {
+  GatedStartButton,
+  RestartCapabilityNotice,
+  betweenToWire,
+  startBlockedReason,
+  useRestartCapability,
+} from "./restartCapability";
+import {
+  FRESH_FORM_BETWEEN,
+  isUnmatchedSavedTarget,
+  mergeTargetRunners,
+  rematchPendingTarget,
+  restoreTarget,
+  runnerListToken,
+  selectTarget,
+  type SupervisorRunnerRow,
+  type TargetRunnerRow,
+} from "./targetPicker";
 
 // --- Types matching the Rust backend ---
 
@@ -46,34 +64,6 @@ interface PipelineConfig {
     snapshot_max_chars: number;
     model_override: string | null;
   } | null;
-}
-
-interface RunnerInstance {
-  id: string;
-  name: string;
-  port: number;
-  running: boolean;
-  pid: number | null;
-  api_ready: boolean;
-  /**
-   * `"configured"` for slots saved in `settings.json` (Settings → Runner
-   * Instances), `"discovered"` for runners that exist only in the DB
-   * registry (e.g. supervisor-spawned children that registered themselves
-   * but were never saved as a slot). Optional for backward compatibility
-   * with older runner builds.
-   */
-  source?: "configured" | "discovered";
-}
-
-/** Subset of supervisor `/runners` rows the picker actually consumes. */
-interface SupervisorRunner {
-  id: string;
-  name: string;
-  port: number;
-  is_primary: boolean;
-  running: boolean;
-  pid: number | null;
-  api_responding: boolean;
 }
 
 interface OrchestrationLoopStatus {
@@ -214,11 +204,14 @@ export function OrchestrationLoopPanel() {
   const [showSaveInput, setShowSaveInput] = useState(false);
 
   // Runner instances for the target dropdown
-  const [runnerInstances, setRunnerInstances] = useState<RunnerInstance[]>([]);
+  const [runnerInstances, setRunnerInstances] = useState<TargetRunnerRow[]>([]);
   const [targetRunner, setTargetRunner] = useState("self"); // "self" or instance id
   // This runner's own port — used to filter "self" out of the supervisor
   // dropdown rows. Populated once via get_runner_identity on mount.
   const ownPortRef = useRef<number | null>(null);
+  // Port of a restored saved target that no row matched yet — re-matched
+  // when the runner list next loads (see `rematchPendingTarget`).
+  const pendingRestorePortRef = useRef<string | null>(null);
 
   // Form state
   const [mode, setMode] = useState<"simple" | "pipeline">("pipeline");
@@ -229,7 +222,9 @@ export function OrchestrationLoopPanel() {
   // null = unlimited; loop exits on success/stop, not iteration count.
   const [maxIter, setMaxIter] = useState<number | null>(null);
   const [exitStrategy, setExitStrategy] = useState("reflection");
-  const [between, setBetween] = useState("restart_on_signal");
+  // The default target is this runner, which no restart mode can restart
+  // (it would end the loop) — so a fresh form starts on Wait Healthy.
+  const [between, setBetween] = useState(FRESH_FORM_BETWEEN);
   const [buildDesc, setBuildDesc] = useState("");
   const [buildContext, setBuildContext] = useState("");
   const [enableFixes, setEnableFixes] = useState(true);
@@ -284,12 +279,20 @@ export function OrchestrationLoopPanel() {
   const loadFormState = (s: OrchestrationLoopFormState) => {
     setMode(s.mode || "pipeline");
     setWorkflowId(s.workflowId || "");
-    setTargetPort(s.targetPort || "");
-    setTargetRunnerId(s.targetRunnerId || "");
+    // Target re-matched by port against the current rows (the id is
+    // re-derived from the matched row, so a saved runner-owned id is never
+    // re-sent); the saved "Between" value is restored verbatim — if the
+    // capability check refuses it, the reason is shown under the select
+    // rather than the value being rewritten.
+    const restored = restoreTarget(s, runnerInstances);
+    pendingRestorePortRef.current = restored.pending ? restored.targetPort : null;
+    setTargetRunner(restored.targetRunner);
+    setTargetPort(restored.targetPort);
+    setTargetRunnerId(restored.targetRunnerId);
+    setBetween(restored.between);
     setSupervisorPort(s.supervisorPort || "9875");
     setMaxIter(s.maxIter ?? null);
     setExitStrategy(s.exitStrategy || "reflection");
-    setBetween(s.between || "restart_on_signal");
     setBuildDesc(s.buildDesc || "");
     setBuildContext(s.buildContext || "");
     setEnableFixes(s.enableFixes ?? true);
@@ -302,28 +305,18 @@ export function OrchestrationLoopPanel() {
     setDiagnoseCaptureSnapshot(s.diagnoseCaptureSnapshot ?? true);
     setDiagnoseSnapshotMaxChars(s.diagnoseSnapshotMaxChars ?? 8000);
     setDiagnoseModelOverride(s.diagnoseModelOverride || "");
-    // Resolve targetRunner from saved port/id
-    if (s.targetPort) {
-      const match = runnerInstances.find((r) => String(r.port) === s.targetPort);
-      setTargetRunner(match ? match.id : "self");
-    } else {
-      setTargetRunner("self");
-    }
   };
 
   // When targetRunner changes, update the underlying port/id fields
   const handleTargetRunnerChange = (value: string) => {
-    setTargetRunner(value);
-    if (value === "self") {
-      setTargetPort("");
-      setTargetRunnerId("");
-    } else {
-      const inst = runnerInstances.find((r) => r.id === value);
-      if (inst) {
-        setTargetPort(String(inst.port));
-        setTargetRunnerId(inst.id);
-      }
-    }
+    // `target_runner_id` is only ever the dev supervisor's id (rebuild);
+    // a runner-owned row is resolved by port and sends no id.
+    const sel = selectTarget(value, runnerInstances);
+    if (!sel) return;
+    pendingRestorePortRef.current = null; // an explicit pick supersedes a restore
+    setTargetRunner(sel.targetRunner);
+    setTargetPort(sel.targetPort);
+    setTargetRunnerId(sel.targetRunnerId);
   };
 
   // --- Data fetching ---
@@ -350,42 +343,40 @@ export function OrchestrationLoopPanel() {
   }, []);
 
   const loadRunnerInstances = useCallback(async () => {
-    // Source of truth is the supervisor's /runners endpoint — it lists
-    // every actually-running instance (primary + supervised children +
-    // self-registered with a live heartbeat) by their canonical names,
-    // and matches the supervisor dashboard exactly. Stale settings slots
-    // and dead DB rows aren't represented, which is what we want for a
-    // target picker.
+    // Runner-owned truth FIRST (`get_runner_instances`, the only source a
+    // published install has); the dev supervisor's `/runners` is merged after
+    // as a supplement for ports not already present. See `targetPicker.ts`.
+    let owned: TargetRunnerRow[] = [];
     try {
-      const portStr = supervisorPort.trim() || "9875";
-      const resp = await fetch(`http://localhost:${portStr}/runners`);
-      if (!resp.ok) throw new Error(`supervisor /runners: HTTP ${resp.status}`);
-      const all: SupervisorRunner[] = await resp.json();
-      const ownPort = ownPortRef.current;
-      const active: RunnerInstance[] = all
-        .filter((r) => r.running && r.port !== ownPort)
-        .map((r) => ({
-          id: r.id,
-          name: r.name,
-          port: r.port,
-          running: r.running,
-          pid: r.pid,
-          api_ready: r.api_responding,
-        }));
-      setRunnerInstances(active);
-      return;
+      owned = await invoke<TargetRunnerRow[]>("get_runner_instances");
     } catch {
-      // Supervisor unreachable — fall through to the Tauri command. The
-      // fallback is less accurate (it merges settings.json with the DB
-      // registry), but better than rendering an empty picker when the
-      // user is running the runner standalone (no supervisor).
+      /* runner-owned list unavailable — the supplement may still answer */
     }
 
+    let supervisorRows: SupervisorRunnerRow[] = [];
     try {
-      const instances = await invoke<RunnerInstance[]>("get_runner_instances");
-      setRunnerInstances(instances.filter((i) => i.running));
+      const portStr = supervisorPort.trim() || "9875";
+      const resp = await fetch(`http://127.0.0.1:${portStr}/runners`);
+      if (resp.ok) supervisorRows = await resp.json();
     } catch {
-      /* both sources down — leave list empty */
+      /* no dev supervisor — the normal case for a published install */
+    }
+
+    const rows = mergeTargetRunners(owned, supervisorRows, ownPortRef.current);
+    setRunnerInstances(rows);
+
+    // A restored config whose target was not in the list at restore time is
+    // re-matched now, so the picker stops showing it as unmatched and the id
+    // (supervisor rows only) is derived from the row that arrived.
+    const pendingPort = pendingRestorePortRef.current;
+    if (pendingPort) {
+      const sel = rematchPendingTarget(pendingPort, rows);
+      if (sel) {
+        pendingRestorePortRef.current = null;
+        setTargetRunner(sel.targetRunner);
+        setTargetPort(sel.targetPort);
+        setTargetRunnerId(sel.targetRunnerId);
+      }
     }
   }, [supervisorPort]);
 
@@ -474,15 +465,22 @@ export function OrchestrationLoopPanel() {
 
   // --- Start/Stop/Signal ---
 
-  const buildBetween = (): { type: string; rebuild?: boolean } => {
-    if (between === "restart_on_signal") return { type: "restart_on_signal", rebuild: true };
-    if (between === "restart_on_signal_no_rebuild")
-      return { type: "restart_on_signal", rebuild: false };
-    if (between === "restart_runner") return { type: "restart_runner", rebuild: true };
-    if (between === "restart_runner_no_rebuild") return { type: "restart_runner", rebuild: false };
-    if (between === "wait_healthy") return { type: "wait_healthy" };
-    return { type: "none" };
-  };
+  const buildBetween = () => betweenToWire(between);
+
+  // Pre-start restart capability: re-asked (debounced) whenever the target,
+  // the between mode or the supervisor port changes — and whenever the
+  // polled runner list changes (a target launched in Settings, a relaunch),
+  // so a refusal never outlives the condition it described.
+  const restartCapability = useRestartCapability(
+    {
+      target_runner_port: targetPort ? parseInt(targetPort) : null,
+      target_runner_id: targetRunnerId || null,
+      supervisor_port: parseInt(supervisorPort) || 9875,
+      between_iterations: betweenToWire(between),
+    },
+    runnerListToken(runnerInstances),
+  );
+  const startBlocked = startBlockedReason(restartCapability);
 
   const handleStart = async () => {
     setError(null);
@@ -678,13 +676,12 @@ export function OrchestrationLoopPanel() {
               Stop
             </button>
           ) : (
-            <button
+            <GatedStartButton
               onClick={handleStart}
-              className="px-2.5 py-1 text-xs font-medium rounded bg-primary/15 text-primary hover:bg-primary/25"
-            >
-              <Play className="w-3 h-3 inline mr-1" />
-              Run Loop
-            </button>
+              blockedReason={startBlocked}
+              label="Run Loop"
+              icon={<Play className="w-3 h-3 inline mr-1" />}
+            />
           )}
         </div>
       </div>
@@ -871,22 +868,29 @@ export function OrchestrationLoopPanel() {
                       Pipeline
                     </label>
                   </div>
-                  <div className="flex items-center gap-1.5">
-                    <span className={labelCls}>Between</span>
-                    <select
-                      aria-label="Between iterations"
-                      value={between}
-                      onChange={(e) => setBetween(e.target.value)}
-                      className={cn(inputCls, "w-auto [&>option]:text-black [&>option]:bg-white")}
-                      style={{ colorScheme: "dark" }}
-                    >
-                      <option value="restart_on_signal">Signal (rebuild)</option>
-                      <option value="restart_on_signal_no_rebuild">Signal (no rebuild)</option>
-                      <option value="restart_runner">Always (rebuild)</option>
-                      <option value="restart_runner_no_rebuild">Always (no rebuild)</option>
-                      <option value="wait_healthy">Wait Healthy</option>
-                      <option value="none">None</option>
-                    </select>
+                  <div className="flex flex-col gap-0.5">
+                    <div className="flex items-center gap-1.5">
+                      <span className={labelCls}>Between</span>
+                      <select
+                        aria-label="Between iterations"
+                        value={between}
+                        onChange={(e) => setBetween(e.target.value)}
+                        className={cn(inputCls, "w-auto [&>option]:text-black [&>option]:bg-white")}
+                        style={{ colorScheme: "dark" }}
+                      >
+                        <option value="restart_on_signal">Signal (rebuild)</option>
+                        <option value="restart_on_signal_no_rebuild">Signal (no rebuild)</option>
+                        <option value="restart_runner">Always (rebuild)</option>
+                        <option value="restart_runner_no_rebuild">Always (no rebuild)</option>
+                        <option value="wait_healthy">Wait Healthy</option>
+                        <option value="none">None</option>
+                      </select>
+                    </div>
+                    <RestartCapabilityNotice
+                      state={restartCapability}
+                      className="max-w-[420px]"
+                      testId="ol-restart-capability"
+                    />
                   </div>
                   <div className="flex items-center gap-1.5">
                     <span className={labelCls}>Max</span>
@@ -920,10 +924,16 @@ export function OrchestrationLoopPanel() {
                       style={{ colorScheme: "dark" }}
                     >
                       <option value="self">This runner (self)</option>
+                      {isUnmatchedSavedTarget(targetRunner) && (
+                        <option value={targetRunner}>
+                          Saved target (:{targetPort}) — not in the runner list yet
+                        </option>
+                      )}
                       {runnerInstances.map((inst) => (
                         <option key={inst.id} value={inst.id}>
                           {inst.name} (:{inst.port}){inst.running ? "" : " [stopped]"}
                           {inst.source === "discovered" ? " (discovered)" : ""}
+                          {inst.source === "supervisor" ? " (dev supervisor)" : ""}
                         </option>
                       ))}
                     </select>
@@ -971,6 +981,26 @@ export function OrchestrationLoopPanel() {
                     </span>
                   </label>
                 </div>
+
+                <details className="text-xs" data-tutorial-id="ol-advanced-dev">
+                  <summary className="cursor-pointer text-muted-foreground select-none">
+                    Advanced (dev)
+                  </summary>
+                  <div className="mt-2 flex items-center gap-1.5 flex-wrap">
+                    <span className={labelCls}>Supervisor port</span>
+                    <input
+                      type="text"
+                      aria-label="Supervisor port"
+                      value={supervisorPort}
+                      onChange={(e) => setSupervisorPort(e.target.value)}
+                      className={cn(inputCls, "w-20 text-center")}
+                    />
+                    <span className="text-muted-foreground/60 text-[0.7rem]">
+                      — Only matters for the rebuild modes, which need a dev supervisor with a
+                      source checkout. Plain restarts of runner-managed instances never use it.
+                    </span>
+                  </div>
+                </details>
 
                 {mode === "simple" ? (
                   <div className="flex items-center gap-4 flex-wrap">

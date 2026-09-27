@@ -506,6 +506,47 @@ impl InstanceManager {
         Ok(pid)
     }
 
+    /// The live child this runner spawned on `port`, if any.
+    ///
+    /// Only a handle whose process is still alive counts — a slot whose child
+    /// exited (crashed, killed by hand) is NOT owned any more, even though its
+    /// stale handle may linger until the next launch/status call reaps it.
+    /// This is the lookup the Orchestration Loop resolves a restart target by:
+    /// by PORT, so it is immune to the supervisor-id vs settings-slot-id split
+    /// (plan `2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor`).
+    pub async fn owned_instance_on_port(&self, port: u16) -> Option<RunnerInstanceConfig> {
+        let mut instances = self.instances.lock().await;
+        for handle in instances.values_mut() {
+            if handle.config.port == port && is_process_alive(&mut handle.child) {
+                return Some(handle.config.clone());
+            }
+        }
+        None
+    }
+
+    /// The live child this runner spawned for slot `id`, if any. Same
+    /// liveness rule as [`Self::owned_instance_on_port`].
+    pub async fn owned_instance(&self, id: &str) -> Option<RunnerInstanceConfig> {
+        let mut instances = self.instances.lock().await;
+        let handle = instances.get_mut(id)?;
+        is_process_alive(&mut handle.child).then(|| handle.config.clone())
+    }
+
+    /// Restart a runner-owned child in place: stop it, wait for its port to
+    /// free, relaunch the SAME slot config, and verify it came back on the
+    /// same port. See [`restart_with`] for the ordering and error contract.
+    ///
+    /// Pass the `AppHandle` whenever one is available: the slot's
+    /// `spawn_placement` is only honoured with it, and dropping it would move
+    /// the user's configured window on every restart.
+    pub async fn restart_instance(
+        &self,
+        id: &str,
+        app: Option<&tauri::AppHandle>,
+    ) -> Result<u32, InstanceRestartError> {
+        restart_with(self, id, app).await
+    }
+
     /// Stop a running instance by ID.
     pub async fn stop_instance(&self, id: &str) -> Result<(), String> {
         let mut instances = self.instances.lock().await;
@@ -653,6 +694,188 @@ impl InstanceManager {
 }
 
 // ============================================================================
+// In-place restart of a runner-owned child
+// ============================================================================
+
+/// How long [`restart_with`] waits for a stopped child's port to free before
+/// giving up with [`InstanceRestartError::PortNeverFreed`].
+pub const RESTART_PORT_FREE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The lifecycle operations an in-place restart is composed of.
+///
+/// [`InstanceManager`] is the only production implementation; the trait
+/// exists so the restart ORDERING (stop → port free → launch → same port) and
+/// every error arm can be tested without spawning a real runner process.
+#[async_trait::async_trait]
+pub trait InstanceLifecycle: Send + Sync {
+    /// See [`InstanceManager::owned_instance_on_port`].
+    async fn owned_instance_on_port(&self, port: u16) -> Option<RunnerInstanceConfig>;
+    /// See [`InstanceManager::owned_instance`].
+    async fn owned_instance(&self, id: &str) -> Option<RunnerInstanceConfig>;
+    /// Kill and reap the child for `id`.
+    async fn stop(&self, id: &str) -> Result<(), String>;
+    /// Block (off the async workers) until `port` is free or `timeout` passes.
+    async fn wait_port_free(&self, port: u16, timeout: std::time::Duration) -> bool;
+    /// Launch `config` through the normal, resource-gated launch path.
+    async fn launch(
+        &self,
+        config: &RunnerInstanceConfig,
+        app: Option<&tauri::AppHandle>,
+    ) -> Result<u32, String>;
+}
+
+#[async_trait::async_trait]
+impl InstanceLifecycle for InstanceManager {
+    async fn owned_instance_on_port(&self, port: u16) -> Option<RunnerInstanceConfig> {
+        InstanceManager::owned_instance_on_port(self, port).await
+    }
+
+    async fn owned_instance(&self, id: &str) -> Option<RunnerInstanceConfig> {
+        InstanceManager::owned_instance(self, id).await
+    }
+
+    async fn stop(&self, id: &str) -> Result<(), String> {
+        self.stop_instance(id).await
+    }
+
+    async fn wait_port_free(&self, port: u16, timeout: std::time::Duration) -> bool {
+        // `wait_for_port_free` sleeps in a loop — never on an async worker.
+        spawn_blocking_tracked(move || wait_for_port_free(port, timeout))
+            .await
+            .unwrap_or(false)
+    }
+
+    async fn launch(
+        &self,
+        config: &RunnerInstanceConfig,
+        app: Option<&tauri::AppHandle>,
+    ) -> Result<u32, String> {
+        // No resource override: a restart is gated exactly like any launch,
+        // and a refusal surfaces as a typed error rather than a forced spawn.
+        self.launch_instance_with_app(config, app, false).await
+    }
+}
+
+/// Why an in-place restart of a runner-owned child did not complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstanceRestartError {
+    /// No live child for this slot — nothing of ours to restart.
+    NotRunning { id: String },
+    /// Killing the child failed; nothing was relaunched.
+    StopFailed { id: String, cause: String },
+    /// The child was stopped but its port was still bound after the timeout,
+    /// so a relaunch would have collided. The child is NOT running now.
+    PortNeverFreed {
+        id: String,
+        port: u16,
+        waited_secs: u64,
+    },
+    /// The relaunch was refused (resource gate) or failed to spawn. The child
+    /// is NOT running now.
+    LaunchFailed { id: String, cause: String },
+    /// The relaunch spawned a process that was already gone when checked.
+    ChildVanishedAfterLaunch { id: String },
+}
+
+impl std::fmt::Display for InstanceRestartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotRunning { id } => {
+                write!(f, "instance '{id}' is not a live child of this runner")
+            }
+            Self::StopFailed { id, cause } => {
+                write!(f, "stopping instance '{id}' failed: {cause}")
+            }
+            Self::PortNeverFreed {
+                id,
+                port,
+                waited_secs,
+            } => write!(
+                f,
+                "instance '{id}' was stopped but port {port} was still in use after \
+                 {waited_secs}s; not relaunched"
+            ),
+            Self::LaunchFailed { id, cause } => write!(
+                f,
+                "instance '{id}' was stopped but relaunching it failed: {cause}"
+            ),
+            Self::ChildVanishedAfterLaunch { id } => write!(
+                f,
+                "instance '{id}' was relaunched but its process was already gone"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for InstanceRestartError {}
+
+/// Restart the runner-owned child `id` through `lifecycle`.
+///
+/// Ordering, each step gating the next:
+/// 1. capture the slot config (only a LIVE child is restartable);
+/// 2. stop it;
+/// 3. wait up to [`RESTART_PORT_FREE_TIMEOUT`] for its port to free;
+/// 4. relaunch the captured config (resource-gated like any launch) — the
+///    same slot config, so the same fixed port;
+/// 5. assert the relaunched child is still alive.
+///
+/// That the process then ANSWERING on the port is this child is not provable
+/// here (a child can be alive while another process holds its port); the
+/// Orchestration Loop confirms it by PID once the target is healthy
+/// (`orchestration_loop::restart_path::verify_new_child`).
+///
+/// Every failure is a typed [`InstanceRestartError`]; nothing waits unbounded.
+/// Returns the new child's PID.
+pub async fn restart_with(
+    lifecycle: &(impl InstanceLifecycle + ?Sized),
+    id: &str,
+    app: Option<&tauri::AppHandle>,
+) -> Result<u32, InstanceRestartError> {
+    let config = lifecycle
+        .owned_instance(id)
+        .await
+        .ok_or_else(|| InstanceRestartError::NotRunning { id: id.to_string() })?;
+    let port = config.port;
+
+    lifecycle
+        .stop(id)
+        .await
+        .map_err(|cause| InstanceRestartError::StopFailed {
+            id: id.to_string(),
+            cause,
+        })?;
+
+    if !lifecycle
+        .wait_port_free(port, RESTART_PORT_FREE_TIMEOUT)
+        .await
+    {
+        return Err(InstanceRestartError::PortNeverFreed {
+            id: id.to_string(),
+            port,
+            waited_secs: RESTART_PORT_FREE_TIMEOUT.as_secs(),
+        });
+    }
+
+    let pid = lifecycle.launch(&config, app).await.map_err(|cause| {
+        InstanceRestartError::LaunchFailed {
+            id: id.to_string(),
+            cause,
+        }
+    })?;
+
+    match lifecycle.owned_instance(id).await {
+        None => Err(InstanceRestartError::ChildVanishedAfterLaunch { id: id.to_string() }),
+        Some(_) => {
+            info!(
+                "Instance '{}' restarted in place (PID {}, port {})",
+                id, pid, port
+            );
+            Ok(pid)
+        }
+    }
+}
+
+// ============================================================================
 // Active-instance session persistence
 // ============================================================================
 
@@ -750,4 +973,209 @@ async fn probe_instance_api(port: u16) -> bool {
 
     let url = format!("http://localhost:{}/status", port);
     client.get(&url).send().await.is_ok()
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    fn slot(id: &str, port: u16) -> RunnerInstanceConfig {
+        RunnerInstanceConfig {
+            id: id.to_string(),
+            name: format!("{id}-name"),
+            port,
+            spawn_placement: None,
+        }
+    }
+
+    /// A scripted [`InstanceLifecycle`] that records every call in order.
+    struct FakeLifecycle {
+        calls: StdMutex<Vec<String>>,
+        /// What `owned_instance` answers, popped front-first per call; an
+        /// exhausted script answers `None`.
+        owned_script: StdMutex<Vec<Option<RunnerInstanceConfig>>>,
+        stop_result: Result<(), String>,
+        port_frees: bool,
+        launch_result: Result<u32, String>,
+    }
+
+    impl FakeLifecycle {
+        fn new(owned_script: Vec<Option<RunnerInstanceConfig>>) -> Self {
+            Self {
+                calls: StdMutex::new(Vec::new()),
+                owned_script: StdMutex::new(owned_script),
+                stop_result: Ok(()),
+                port_frees: true,
+                launch_result: Ok(4242),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InstanceLifecycle for FakeLifecycle {
+        async fn owned_instance_on_port(&self, port: u16) -> Option<RunnerInstanceConfig> {
+            self.calls.lock().unwrap().push(format!("on_port:{port}"));
+            None
+        }
+        async fn owned_instance(&self, id: &str) -> Option<RunnerInstanceConfig> {
+            self.calls.lock().unwrap().push(format!("owned:{id}"));
+            let mut script = self.owned_script.lock().unwrap();
+            if script.is_empty() {
+                None
+            } else {
+                script.remove(0)
+            }
+        }
+        async fn stop(&self, id: &str) -> Result<(), String> {
+            self.calls.lock().unwrap().push(format!("stop:{id}"));
+            self.stop_result.clone()
+        }
+        async fn wait_port_free(&self, port: u16, timeout: std::time::Duration) -> bool {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("wait_free:{port}:{}", timeout.as_secs()));
+            self.port_frees
+        }
+        async fn launch(
+            &self,
+            config: &RunnerInstanceConfig,
+            app: Option<&tauri::AppHandle>,
+        ) -> Result<u32, String> {
+            self.calls.lock().unwrap().push(format!(
+                "launch:{}:{}:app={}",
+                config.id,
+                config.port,
+                app.is_some()
+            ));
+            self.launch_result.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_runs_stop_then_port_free_then_launch_then_verifies_the_port() {
+        let fake = FakeLifecycle::new(vec![Some(slot("a", 9877)), Some(slot("a", 9877))]);
+        let pid = restart_with(&fake, "a", None).await.expect("restart");
+        assert_eq!(pid, 4242);
+        assert_eq!(
+            fake.calls(),
+            vec![
+                "owned:a".to_string(),
+                "stop:a".to_string(),
+                "wait_free:9877:30".to_string(),
+                "launch:a:9877:app=false".to_string(),
+                "owned:a".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_of_a_slot_with_no_live_child_touches_nothing() {
+        let fake = FakeLifecycle::new(vec![None]);
+        let err = restart_with(&fake, "a", None).await.unwrap_err();
+        assert_eq!(err, InstanceRestartError::NotRunning { id: "a".into() });
+        assert_eq!(fake.calls(), vec!["owned:a".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_stop_does_not_wait_or_relaunch() {
+        let mut fake = FakeLifecycle::new(vec![Some(slot("a", 9877))]);
+        fake.stop_result = Err("access denied".into());
+        let err = restart_with(&fake, "a", None).await.unwrap_err();
+        assert!(
+            matches!(err, InstanceRestartError::StopFailed { .. }),
+            "{err}"
+        );
+        assert_eq!(
+            fake.calls(),
+            vec!["owned:a".to_string(), "stop:a".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_port_that_never_frees_is_typed_and_never_relaunched() {
+        let mut fake = FakeLifecycle::new(vec![Some(slot("a", 9877))]);
+        fake.port_frees = false;
+        let err = restart_with(&fake, "a", None).await.unwrap_err();
+        assert_eq!(
+            err,
+            InstanceRestartError::PortNeverFreed {
+                id: "a".into(),
+                port: 9877,
+                waited_secs: 30
+            }
+        );
+        assert!(
+            !fake.calls().iter().any(|c| c.starts_with("launch:")),
+            "must not relaunch onto a busy port: {:?}",
+            fake.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_launch_refused_by_the_resource_gate_is_typed() {
+        let mut fake = FakeLifecycle::new(vec![Some(slot("a", 9877))]);
+        fake.launch_result = Err("resource guard refused: low memory".into());
+        let err = restart_with(&fake, "a", None).await.unwrap_err();
+        match err {
+            InstanceRestartError::LaunchFailed { id, cause } => {
+                assert_eq!(id, "a");
+                assert!(cause.contains("resource guard"));
+            }
+            other => panic!("expected LaunchFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_child_that_dies_right_after_launch_is_typed() {
+        let fake = FakeLifecycle::new(vec![Some(slot("a", 9877)), None]);
+        let err = restart_with(&fake, "a", None).await.unwrap_err();
+        assert_eq!(
+            err,
+            InstanceRestartError::ChildVanishedAfterLaunch { id: "a".into() }
+        );
+    }
+
+    /// The real lookup honours liveness: a handle whose process exited is not
+    /// "owned", even while the stale handle is still in the table.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owned_instance_on_port_sees_only_a_live_child() {
+        let mgr = InstanceManager::new(crate::database::pg::PgDb::new_noop_for_test());
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        mgr.instances.lock().await.insert(
+            "slot-1".to_string(),
+            InstanceHandle {
+                config: slot("slot-1", 9891),
+                child,
+            },
+        );
+
+        assert_eq!(
+            mgr.owned_instance_on_port(9891).await.map(|c| c.id),
+            Some("slot-1".to_string())
+        );
+        assert!(mgr.owned_instance_on_port(9892).await.is_none());
+        assert_eq!(
+            mgr.owned_instance("slot-1").await.map(|c| c.port),
+            Some(9891)
+        );
+
+        {
+            let mut instances = mgr.instances.lock().await;
+            let handle = instances.get_mut("slot-1").expect("handle");
+            handle.child.kill().expect("kill sleep");
+            handle.child.wait().expect("reap sleep");
+        }
+        assert!(mgr.owned_instance_on_port(9891).await.is_none());
+        assert!(mgr.owned_instance("slot-1").await.is_none());
+    }
 }

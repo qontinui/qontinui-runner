@@ -4,6 +4,19 @@ import { cn } from "../../lib/utils";
 import { Play, Square, Loader2, Zap, AlertTriangle, FileSearch } from "lucide-react";
 import { SpecPartitionWizard } from "./SpecPartitionWizard";
 import { MultiLoopResults } from "./MultiLoopResults";
+import {
+  GatedStartButton,
+  RestartCapabilityNotice,
+  betweenToWire,
+  multiStartBlockedReason,
+  useRestartCapabilities,
+} from "./restartCapability";
+import {
+  FRESH_FORM_BETWEEN,
+  runnerListToken,
+  targetRunnerIdFor,
+  type TargetRunnerRow,
+} from "./targetPicker";
 
 // --- Types matching the Rust multi-loop backend ---
 
@@ -77,14 +90,8 @@ interface IterationResult {
   } | null;
 }
 
-interface RunnerInstance {
-  id: string;
-  name: string;
-  port: number;
-  running: boolean;
-  pid: number | null;
-  api_ready: boolean;
-}
+/** A `get_runner_instances` row — runner-owned, never a dev-supervisor row. */
+type RunnerInstance = TargetRunnerRow;
 
 interface SavedWorkflow {
   id: string;
@@ -145,6 +152,12 @@ interface LoopAssignment {
   runnerId: string;
   runnerName: string;
   port: number;
+  /**
+   * `target_runner_id` to send: the dev supervisor's id, or null. Rows here
+   * come from `get_runner_instances` (runner-owned), resolved by port, so
+   * this is null for them — their row id is only the loop id.
+   */
+  targetRunnerId: string | null;
   workflowId: string;
   label: string;
 }
@@ -165,7 +178,10 @@ export function MultiLoopPanel() {
   // null = unlimited (loop exits on success/stop, not iteration count).
   const [maxIter, setMaxIter] = useState<number | null>(null);
   const [exitStrategy, setExitStrategy] = useState("reflection");
-  const [between, setBetween] = useState("restart_on_signal");
+  // No target is assigned yet, and any assignment may be the orchestrating
+  // runner itself (which no restart mode can restart) — so a fresh form
+  // starts on Wait Healthy, the one default valid against every target.
+  const [between, setBetween] = useState(FRESH_FORM_BETWEEN);
   const [stopAllOnError, setStopAllOnError] = useState(false);
   const [supervisorPort, setSupervisorPort] = useState("9875");
 
@@ -232,6 +248,7 @@ export function MultiLoopPanel() {
         runnerId: runner.id,
         runnerName: runner.name,
         port: runner.port,
+        targetRunnerId: targetRunnerIdFor(runner),
         workflowId: "",
         label: runner.name,
       },
@@ -248,15 +265,25 @@ export function MultiLoopPanel() {
 
   // --- Start / Stop ---
 
-  const buildBetween = (): { type: string; rebuild?: boolean } => {
-    if (between === "restart_on_signal") return { type: "restart_on_signal", rebuild: true };
-    if (between === "restart_on_signal_no_rebuild")
-      return { type: "restart_on_signal", rebuild: false };
-    if (between === "restart_runner") return { type: "restart_runner", rebuild: true };
-    if (between === "restart_runner_no_rebuild") return { type: "restart_runner", rebuild: false };
-    if (between === "wait_healthy") return { type: "wait_healthy" };
-    return { type: "none" };
-  };
+  const buildBetween = () => betweenToWire(between);
+
+  // Pre-start restart capability, one verdict per assignment, re-asked
+  // (debounced) whenever an assignment's target, the mode or the supervisor
+  // port changes. One refusal blocks Start All — the backend refuses the
+  // whole multi-loop for it.
+  const capabilities = useRestartCapabilities(
+    assignments.map((a) => ({
+      target_runner_port: a.port,
+      target_runner_id: a.targetRunnerId,
+      supervisor_port: parseInt(supervisorPort) || 9875,
+      between_iterations: betweenToWire(between),
+    })),
+    runnerListToken(runnerInstances),
+  );
+  const startBlocked = multiStartBlockedReason(
+    capabilities,
+    assignments.map((a) => a.label || a.runnerName),
+  );
 
   const handleStartMulti = async () => {
     setError(null);
@@ -278,7 +305,7 @@ export function MultiLoopPanel() {
         label: a.label || a.runnerName,
         config: {
           target_runner_port: a.port,
-          target_runner_id: a.runnerId,
+          target_runner_id: a.targetRunnerId,
           supervisor_port: parseInt(supervisorPort) || 9875,
           workflow_id: a.workflowId,
           max_iterations: maxIter,
@@ -383,14 +410,13 @@ export function MultiLoopPanel() {
                 <FileSearch className="w-3 h-3 inline mr-1" />
                 From Specs
               </button>
-              <button
+              <GatedStartButton
                 onClick={handleStartMulti}
-                disabled={assignments.length === 0}
-                className="px-2.5 py-1 text-xs font-medium rounded bg-primary/15 text-primary hover:bg-primary/25 disabled:opacity-40"
-              >
-                <Play className="w-3 h-3 inline mr-1" />
-                Start All
-              </button>
+                blockedReason={startBlocked}
+                extraDisabled={assignments.length === 0}
+                label="Start All"
+                icon={<Play className="w-3 h-3 inline mr-1" />}
+              />
             </>
           )}
         </div>
@@ -526,38 +552,47 @@ export function MultiLoopPanel() {
             <label className={labelCls}>Runner → Workflow Assignments</label>
             <div className="mt-1 space-y-1.5">
               {assignments.map((a, idx) => (
-                <div key={a.runnerId} className="flex items-center gap-2">
-                  <span className="text-xs font-mono min-w-[100px] truncate" title={a.runnerName}>
-                    {a.runnerName}
-                    <span className="text-muted-foreground">:{a.port}</span>
-                  </span>
-                  <select
-                    aria-label="Select workflow"
-                    value={a.workflowId}
-                    onChange={(e) => updateAssignment(idx, "workflowId", e.target.value)}
-                    className={cn(inputCls, "flex-1")}
-                  >
-                    <option value="">Select workflow...</option>
-                    {workflows.map((wf) => (
-                      <option key={wf.id} value={wf.id}>
-                        {wf.name}
-                      </option>
-                    ))}
-                  </select>
-                  <input
-                    type="text"
-                    aria-label="Loop label"
-                    value={a.label}
-                    onChange={(e) => updateAssignment(idx, "label", e.target.value)}
-                    className={cn(inputCls, "w-[100px]")}
-                    placeholder="Label"
-                  />
-                  <button
-                    onClick={() => removeAssignment(idx)}
-                    className="text-muted-foreground hover:text-red-400 text-xs"
-                  >
-                    ✕
-                  </button>
+                <div key={a.runnerId} className="space-y-0.5">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-mono min-w-[100px] truncate" title={a.runnerName}>
+                      {a.runnerName}
+                      <span className="text-muted-foreground">:{a.port}</span>
+                    </span>
+                    <select
+                      aria-label="Select workflow"
+                      value={a.workflowId}
+                      onChange={(e) => updateAssignment(idx, "workflowId", e.target.value)}
+                      className={cn(inputCls, "flex-1")}
+                    >
+                      <option value="">Select workflow...</option>
+                      {workflows.map((wf) => (
+                        <option key={wf.id} value={wf.id}>
+                          {wf.name}
+                        </option>
+                      ))}
+                    </select>
+                    <input
+                      type="text"
+                      aria-label="Loop label"
+                      value={a.label}
+                      onChange={(e) => updateAssignment(idx, "label", e.target.value)}
+                      className={cn(inputCls, "w-[100px]")}
+                      placeholder="Label"
+                    />
+                    <button
+                      onClick={() => removeAssignment(idx)}
+                      className="text-muted-foreground hover:text-red-400 text-xs"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                  {capabilities[idx] && (
+                    <RestartCapabilityNotice
+                      state={capabilities[idx]}
+                      className="pl-1"
+                      testId={`ml-restart-capability-${a.runnerId}`}
+                    />
+                  )}
                 </div>
               ))}
               {availableRunners.length > 0 && (
@@ -614,16 +649,6 @@ export function MultiLoopPanel() {
               />
             </div>
             <div>
-              <label className={labelCls}>Supervisor Port</label>
-              <input
-                type="text"
-                aria-label="Supervisor Port"
-                value={supervisorPort}
-                onChange={(e) => setSupervisorPort(e.target.value)}
-                className={cn(inputCls, "w-full mt-0.5")}
-              />
-            </div>
-            <div>
               <label className={labelCls}>Exit Strategy</label>
               <select
                 aria-label="Exit Strategy"
@@ -653,6 +678,26 @@ export function MultiLoopPanel() {
               </select>
             </div>
           </div>
+
+          <details className="text-xs" data-tutorial-id="ml-advanced-dev">
+            <summary className="cursor-pointer text-muted-foreground select-none">
+              Advanced (dev)
+            </summary>
+            <div className="mt-2">
+              <label className={labelCls}>Supervisor Port</label>
+              <input
+                type="text"
+                aria-label="Supervisor Port"
+                value={supervisorPort}
+                onChange={(e) => setSupervisorPort(e.target.value)}
+                className={cn(inputCls, "w-24 mt-0.5 ml-2")}
+              />
+              <p className="mt-1 text-[0.7rem] text-muted-foreground/70">
+                Only matters for the rebuild modes, which need a dev supervisor with a source
+                checkout. Plain restarts of runner-managed instances never use it.
+              </p>
+            </div>
+          </details>
 
           <label className="flex items-center gap-2 text-xs cursor-pointer">
             <input

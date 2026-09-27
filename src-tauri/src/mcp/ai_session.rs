@@ -83,15 +83,16 @@ Invoke-RestMethod -Uri "http://localhost:9875/runner/restart" -Method Post -Cont
 - GET /health - Check if supervisor is running
 - POST /runner/stop - Stop the runner
 - POST /runner/restart - Restart runner (options: rebuild, trigger_auto_continue, wait_timeout_seconds)
-- POST /workflow-loop/signal-restart - Signal that runner restart is needed (use during workflow loops)
 
 **IMPORTANT:** If you modified qontinui-runner Rust code, use `"rebuild": true` to recompile before restart.
 
-**Workflow Loop Signal:** If you are running inside a supervisor workflow loop and you modify runner code, call:
+**Orchestration Loop Signal:** If you are running inside an Orchestration Loop whose between-iterations mode is "restart on signal" and you modify runner code, signal the ORCHESTRATING runner (the runner that spawned you, not the supervisor):
 ```powershell
-Invoke-RestMethod -Uri "http://localhost:9875/workflow-loop/signal-restart" -Method Post
+Invoke-RestMethod -Uri "http://127.0.0.1:<runner port>/orchestration-loop/signal-restart" -Method Post
+# or, for one loop of a multi-runner loop:
+Invoke-RestMethod -Uri "http://127.0.0.1:<runner port>/orchestration-loop/<loop_id>/signal-restart" -Method Post
 ```
-This tells the supervisor to restart the runner between iterations. If you don't signal, the loop skips the restart (saving time when only non-runner repos were changed).
+`<runner port>` is the orchestrating runner's HTTP API port (9876 for the primary). This tells the loop to restart its target runner between iterations. If you don't signal, the loop skips the restart (saving time when only non-runner repos were changed).
 
 ---
 

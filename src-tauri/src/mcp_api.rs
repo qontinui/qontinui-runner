@@ -1309,6 +1309,11 @@ async fn health(
         "heartbeatAgeMs": pong_age_ms,
         "windowPongs": crate::ui_error::window_pong_report(now_ms),
         "uptimeSeconds": uptime_secs,
+        // This process's PID — the identity a restarter checks after a
+        // relaunch, so "healthy on the port" cannot be satisfied by some
+        // OTHER process holding it (plan 2026-09-22-orchestration-loop-
+        // restart-modes-depend-on-the-dev-only-supervisor).
+        "pid": std::process::id(),
         "pendingRequests": pending_count,
         "circuitBreaker": format!("{:?}", circuit_breaker_state),
         "consoleErrorCount": console_errors,

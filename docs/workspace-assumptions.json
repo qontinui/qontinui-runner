@@ -2105,15 +2105,6 @@
     {
       "class": "supervisor_dependency",
       "file": "src/mcp/ai_session.rs",
-      "symbol": "const AI_SESSION_RULES_SUPERVISOR_AVAILABLE",
-      "excerpt": "Invoke-RestMethod -Uri \"http://localhost:9875/workflow-loop/signal-restart\" -Method Post",
-      "count": 1,
-      "disposition": "fallback_correct",
-      "note": "Chosen by runner_rules_prefix only when check_supervisor_available() is true; the supervisor-DOWN arm is used otherwise."
-    },
-    {
-      "class": "supervisor_dependency",
-      "file": "src/mcp/ai_session.rs",
       "symbol": "run_prompt",
       "excerpt": "super::auto_continue::check_supervisor_available(),",
       "count": 1,
@@ -2194,48 +2185,12 @@
     },
     {
       "class": "supervisor_dependency",
-      "file": "src/orchestration_loop/loop_engine.rs",
-      "symbol": "<module>",
-      "excerpt": "use super::remote_client::{RunnerClient, SupervisorClient};",
-      "count": 1,
-      "disposition": "defect(2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)",
-      "note": "Imports SupervisorClient for the orchestration loop; see handle_between_iterations."
-    },
-    {
-      "class": "supervisor_dependency",
-      "file": "src/orchestration_loop/loop_engine.rs",
-      "symbol": "handle_between_iterations",
-      "excerpt": "supervisor: &SupervisorClient,",
-      "count": 1,
-      "disposition": "defect(2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)",
-      "note": "User-facing Orchestration Loop panel: the RestartRunner / RestartOnSignal between-iterations modes restart the target runner ONLY via the supervisor's POST /runners/{id}/restart, with no in-process path; with no supervisor (every operator install) the loop errors out. Violates the boundary in webview_recovery.rs's module doc."
-    },
-    {
-      "class": "supervisor_dependency",
-      "file": "src/orchestration_loop/loop_engine.rs",
-      "symbol": "run_loop",
-      "excerpt": "let supervisor = SupervisorClient::new(config.supervisor_port);",
-      "count": 1,
-      "disposition": "defect(2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)",
-      "note": "Constructs the SupervisorClient that handle_between_iterations depends on."
-    },
-    {
-      "class": "supervisor_dependency",
-      "file": "src/orchestration_loop/loop_engine.rs",
-      "symbol": "run_pipeline_loop",
-      "excerpt": "supervisor: SupervisorClient,",
-      "count": 1,
-      "disposition": "defect(2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)",
-      "note": "Pipeline variant of the same loop; passes SupervisorClient to handle_between_iterations."
-    },
-    {
-      "class": "supervisor_dependency",
       "file": "src/orchestration_loop/remote_client.rs",
       "symbol": "SupervisorClient::<impl>",
       "excerpt": "impl SupervisorClient {",
       "count": 1,
-      "disposition": "defect(2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)",
-      "note": "restart_runner: the :9875 HTTP call the orchestration loop's restart modes depend on."
+      "disposition": "dev_only_surface",
+      "note": "The dev-supervisor HTTP client, now reached ONLY through the Orchestration Loop's DevSupervisor restart arm (between-iterations mode with rebuild: true, supervisor verified up and the target port matched in its GET /runners at loop start). Every plain restart of a runner-managed target is in-process (plan 2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor); dev path only (rebuild)."
     },
     {
       "class": "supervisor_dependency",
@@ -2243,8 +2198,179 @@
       "symbol": "struct SupervisorClient",
       "excerpt": "pub struct SupervisorClient {",
       "count": 1,
-      "disposition": "defect(2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)",
-      "note": "The supervisor HTTP client used by the user-facing orchestration loop."
+      "disposition": "dev_only_surface",
+      "note": "The dev-supervisor HTTP client, now reached ONLY through the Orchestration Loop's DevSupervisor restart arm (between-iterations mode with rebuild: true, supervisor verified up and the target port matched in its GET /runners at loop start). Every plain restart of a runner-managed target is in-process (plan 2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor); dev path only (rebuild)."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/orchestration_loop/restart_path.rs",
+      "symbol": "<module>",
+      "excerpt": "client: SupervisorClient,",
+      "count": 1,
+      "disposition": "dev_only_surface",
+      "note": "The DevSupervisor restart arm of the Orchestration Loop, reached ONLY for a between-iterations mode with rebuild: true (rebuilding compiles from a source checkout, which only the dev supervisor can do) and only after its /health answered AND its GET /runners matched the target port to exactly one runner id at loop start; every plain restart of a runner-managed target goes in-process (plan 2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/orchestration_loop/restart_path.rs",
+      "symbol": "<module>",
+      "excerpt": "supervisor_port: u16,",
+      "count": 1,
+      "disposition": "dev_only_surface",
+      "note": "The DevSupervisor restart arm of the Orchestration Loop, reached ONLY for a between-iterations mode with rebuild: true (rebuilding compiles from a source checkout, which only the dev supervisor can do) and only after its /health answered AND its GET /runners matched the target port to exactly one runner id at loop start; every plain restart of a runner-managed target goes in-process (plan 2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/orchestration_loop/restart_path.rs",
+      "symbol": "<module>",
+      "excerpt": "use super::remote_client::{SupervisorClient, DETACHED_REBUILD_TIMEOUT};",
+      "count": 1,
+      "disposition": "dev_only_surface",
+      "note": "The DevSupervisor restart arm of the Orchestration Loop, reached ONLY for a between-iterations mode with rebuild: true (rebuilding compiles from a source checkout, which only the dev supervisor can do) and only after its /health answered AND its GET /runners matched the target port to exactly one runner id at loop start; every plain restart of a runner-managed target goes in-process (plan 2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/orchestration_loop/restart_path.rs",
+      "symbol": "HttpSupervisorProbe::answers",
+      "excerpt": ".get(format!(\"http://127.0.0.1:{supervisor_port}/health\"))",
+      "count": 1,
+      "disposition": "dev_only_surface",
+      "note": "The DevSupervisor restart arm of the Orchestration Loop, reached ONLY for a between-iterations mode with rebuild: true (rebuilding compiles from a source checkout, which only the dev supervisor can do) and only after its /health answered AND its GET /runners matched the target port to exactly one runner id at loop start; every plain restart of a runner-managed target goes in-process (plan 2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/orchestration_loop/restart_path.rs",
+      "symbol": "HttpSupervisorProbe::answers",
+      "excerpt": "async fn answers(&self, supervisor_port: u16) -> bool {",
+      "count": 1,
+      "disposition": "dev_only_surface",
+      "note": "The DevSupervisor restart arm of the Orchestration Loop, reached ONLY for a between-iterations mode with rebuild: true (rebuilding compiles from a source checkout, which only the dev supervisor can do) and only after its /health answered AND its GET /runners matched the target port to exactly one runner id at loop start; every plain restart of a runner-managed target goes in-process (plan 2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/orchestration_loop/restart_path.rs",
+      "symbol": "HttpSupervisorProbe::runners",
+      "excerpt": ".get(format!(\"http://127.0.0.1:{supervisor_port}/runners\"))",
+      "count": 1,
+      "disposition": "dev_only_surface",
+      "note": "The DevSupervisor restart arm of the Orchestration Loop, reached ONLY for a between-iterations mode with rebuild: true (rebuilding compiles from a source checkout, which only the dev supervisor can do) and only after its /health answered AND its GET /runners matched the target port to exactly one runner id at loop start; every plain restart of a runner-managed target goes in-process (plan 2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/orchestration_loop/restart_path.rs",
+      "symbol": "HttpSupervisorProbe::runners",
+      "excerpt": "async fn runners(&self, supervisor_port: u16) -> Result<Vec<SupervisorRunnerRow>, String> {",
+      "count": 1,
+      "disposition": "dev_only_surface",
+      "note": "The DevSupervisor restart arm of the Orchestration Loop, reached ONLY for a between-iterations mode with rebuild: true (rebuilding compiles from a source checkout, which only the dev supervisor can do) and only after its /health answered AND its GET /runners matched the target port to exactly one runner id at loop start; every plain restart of a runner-managed target goes in-process (plan 2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/orchestration_loop/restart_path.rs",
+      "symbol": "HttpSupervisorProbe::runners",
+      "excerpt": "parse_supervisor_runners(&body)",
+      "count": 1,
+      "disposition": "dev_only_surface",
+      "note": "The DevSupervisor restart arm of the Orchestration Loop, reached ONLY for a between-iterations mode with rebuild: true (rebuilding compiles from a source checkout, which only the dev supervisor can do) and only after its /health answered AND its GET /runners matched the target port to exactly one runner id at loop start; every plain restart of a runner-managed target goes in-process (plan 2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/orchestration_loop/restart_path.rs",
+      "symbol": "SupervisorProbe:::answers",
+      "excerpt": "async fn answers(&self, supervisor_port: u16) -> bool;",
+      "count": 1,
+      "disposition": "dev_only_surface",
+      "note": "The DevSupervisor restart arm of the Orchestration Loop, reached ONLY for a between-iterations mode with rebuild: true (rebuilding compiles from a source checkout, which only the dev supervisor can do) and only after its /health answered AND its GET /runners matched the target port to exactly one runner id at loop start; every plain restart of a runner-managed target goes in-process (plan 2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/orchestration_loop/restart_path.rs",
+      "symbol": "SupervisorProbe:::runners",
+      "excerpt": "async fn runners(&self, supervisor_port: u16) -> Result<Vec<SupervisorRunnerRow>, String>;",
+      "count": 1,
+      "disposition": "dev_only_surface",
+      "note": "The DevSupervisor restart arm of the Orchestration Loop, reached ONLY for a between-iterations mode with rebuild: true (rebuilding compiles from a source checkout, which only the dev supervisor can do) and only after its /health answered AND its GET /runners matched the target port to exactly one runner id at loop start; every plain restart of a runner-managed target goes in-process (plan 2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/orchestration_loop/restart_path.rs",
+      "symbol": "TargetRestarter::new",
+      "excerpt": "client: SupervisorClient::new(*supervisor_port),",
+      "count": 1,
+      "disposition": "dev_only_surface",
+      "note": "The DevSupervisor restart arm of the Orchestration Loop, reached ONLY for a between-iterations mode with rebuild: true (rebuilding compiles from a source checkout, which only the dev supervisor can do) and only after its /health answered AND its GET /runners matched the target port to exactly one runner id at loop start; every plain restart of a runner-managed target goes in-process (plan 2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/orchestration_loop/restart_path.rs",
+      "symbol": "TargetRestarter::new",
+      "excerpt": "supervisor_port,",
+      "count": 1,
+      "disposition": "dev_only_surface",
+      "note": "The DevSupervisor restart arm of the Orchestration Loop, reached ONLY for a between-iterations mode with rebuild: true (rebuilding compiles from a source checkout, which only the dev supervisor can do) and only after its /health answered AND its GET /runners matched the target port to exactly one runner id at loop start; every plain restart of a runner-managed target goes in-process (plan 2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/orchestration_loop/restart_path.rs",
+      "symbol": "parse_supervisor_runners",
+      "excerpt": "pub fn parse_supervisor_runners(",
+      "count": 1,
+      "disposition": "dev_only_surface",
+      "note": "The DevSupervisor restart arm of the Orchestration Loop, reached ONLY for a between-iterations mode with rebuild: true (rebuilding compiles from a source checkout, which only the dev supervisor can do) and only after its /health answered AND its GET /runners matched the target port to exactly one runner id at loop start; every plain restart of a runner-managed target goes in-process (plan 2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/orchestration_loop/restart_path.rs",
+      "symbol": "resolve_restart_path",
+      "excerpt": "config.supervisor_port",
+      "count": 1,
+      "disposition": "dev_only_surface",
+      "note": "The DevSupervisor restart arm of the Orchestration Loop, reached ONLY for a between-iterations mode with rebuild: true (rebuilding compiles from a source checkout, which only the dev supervisor can do) and only after its /health answered AND its GET /runners matched the target port to exactly one runner id at loop start; every plain restart of a runner-managed target goes in-process (plan 2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/orchestration_loop/restart_path.rs",
+      "symbol": "resolve_restart_path",
+      "excerpt": "let runner_id = supervisor_runner_on_port(config, port, supervisor).await?;",
+      "count": 1,
+      "disposition": "dev_only_surface",
+      "note": "The DevSupervisor restart arm of the Orchestration Loop, reached ONLY for a between-iterations mode with rebuild: true (rebuilding compiles from a source checkout, which only the dev supervisor can do) and only after its /health answered AND its GET /runners matched the target port to exactly one runner id at loop start; every plain restart of a runner-managed target goes in-process (plan 2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/orchestration_loop/restart_path.rs",
+      "symbol": "resolve_restart_path",
+      "excerpt": "supervisor_port: config.supervisor_port,",
+      "count": 1,
+      "disposition": "dev_only_surface",
+      "note": "The DevSupervisor restart arm of the Orchestration Loop, reached ONLY for a between-iterations mode with rebuild: true (rebuilding compiles from a source checkout, which only the dev supervisor can do) and only after its /health answered AND its GET /runners matched the target port to exactly one runner id at loop start; every plain restart of a runner-managed target goes in-process (plan 2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/orchestration_loop/restart_path.rs",
+      "symbol": "resolve_restart_path",
+      "excerpt": "} else if supervisor.answers(config.supervisor_port).await {",
+      "count": 1,
+      "disposition": "dev_only_surface",
+      "note": "The DevSupervisor restart arm of the Orchestration Loop, reached ONLY for a between-iterations mode with rebuild: true (rebuilding compiles from a source checkout, which only the dev supervisor can do) and only after its /health answered AND its GET /runners matched the target port to exactly one runner id at loop start; every plain restart of a runner-managed target goes in-process (plan 2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/orchestration_loop/restart_path.rs",
+      "symbol": "supervisor_runner_on_port",
+      "excerpt": "async fn supervisor_runner_on_port(",
+      "count": 1,
+      "disposition": "dev_only_surface",
+      "note": "The DevSupervisor restart arm of the Orchestration Loop, reached ONLY for a between-iterations mode with rebuild: true (rebuilding compiles from a source checkout, which only the dev supervisor can do) and only after its /health answered AND its GET /runners matched the target port to exactly one runner id at loop start; every plain restart of a runner-managed target goes in-process (plan 2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/orchestration_loop/restart_path.rs",
+      "symbol": "supervisor_runner_on_port",
+      "excerpt": "let sup = config.supervisor_port;",
+      "count": 1,
+      "disposition": "dev_only_surface",
+      "note": "The DevSupervisor restart arm of the Orchestration Loop, reached ONLY for a between-iterations mode with rebuild: true (rebuilding compiles from a source checkout, which only the dev supervisor can do) and only after its /health answered AND its GET /runners matched the target port to exactly one runner id at loop start; every plain restart of a runner-managed target goes in-process (plan 2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)."
     },
     {
       "class": "tenant_literal",

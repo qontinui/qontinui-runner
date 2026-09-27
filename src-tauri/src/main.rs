@@ -3233,6 +3233,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::new_project::github_oauth_status,
             orchestration_loop::commands::get_multi_orchestration_loop_status,
             orchestration_loop::commands::get_orchestration_loop_status,
+            orchestration_loop::commands::orchestration_loop_restart_capability,
             orchestration_loop::commands::signal_orchestration_restart,
             orchestration_loop::commands::signal_orchestration_restart_by_id,
             orchestration_loop::commands::start_multi_orchestration_loop,

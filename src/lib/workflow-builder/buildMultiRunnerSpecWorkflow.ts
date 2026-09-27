@@ -12,8 +12,16 @@ import { buildSpecWorkflow, type BuildSpecWorkflowInput } from "./buildSpecWorkf
 import type { UnifiedWorkflow } from "../../types/unified-workflow";
 
 export interface RunnerTarget {
-  /** Runner instance ID (used by supervisor for restarts). */
+  /** Runner instance row ID — names the loop (`spec-<runnerId>`). */
   runnerId: string;
+  /**
+   * The dev supervisor's id for this runner, when (and only when) the row came
+   * from the supervisor's `/runners`. It is the only value ever sent as
+   * `target_runner_id`: the backend resolves a restart target by port and
+   * uses the id solely for a dev-supervisor rebuild, refusing an explicit id
+   * that is not the supervisor's. Omit for runner-owned rows.
+   */
+  supervisorRunnerId?: string | null;
   /** Port the target runner is listening on. */
   port: number;
   /** Human-readable name for display. */
@@ -85,7 +93,11 @@ export interface MultiLoopEntry {
     /** `null` indicates an unlimited cap. */
     max_iterations: number | null;
     exit_strategy: { type: string };
-    between_iterations: { type: string; rebuild?: boolean };
+    between_iterations:
+      | { type: "restart_runner"; rebuild: boolean }
+      | { type: "restart_on_signal"; rebuild: boolean }
+      | { type: "wait_healthy" }
+      | { type: "none" };
     retry_on_failure: boolean;
     wait_for_fixer: boolean;
     pipeline: null;
@@ -117,6 +129,11 @@ function mergeSpecConfigs(specs: DiscoveredSpec[]): BuildSpecWorkflowInput["spec
       elementSource: specs[0]?.config.metadata?.elementSource ?? "control",
     },
   };
+}
+
+/** `target_runner_id` for a spec loop: the supervisor id, or null. */
+export function targetRunnerIdForLoop(runner: RunnerTarget): string | null {
+  return runner.supervisorRunnerId ?? null;
 }
 
 /**
@@ -181,7 +198,7 @@ export function buildMultiRunnerSpecWorkflow(
       label: `${partition.label} → ${runner.name}`,
       config: {
         target_runner_port: runner.port,
-        target_runner_id: runner.runnerId,
+        target_runner_id: targetRunnerIdForLoop(runner),
         supervisor_port: loopSettings.supervisorPort ?? 9875,
         workflow_id: workflow.id ?? "",
         // null = unlimited (matches the new convention); only fall back to a

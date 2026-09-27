@@ -12,7 +12,8 @@ use super::context_summarizer::{estimate_tokens, ContextSummarizer, IterationCon
 use super::diagnostician;
 use super::fix_agent;
 use super::intervention;
-use super::remote_client::{RunnerClient, SupervisorClient};
+use super::remote_client::RunnerClient;
+use super::restart_path::{self, LoopHost, RestartPath, RestartUnsupported, TargetRestarter};
 use super::stall_detector::StallDetector;
 use super::subtask_executor;
 use super::task_decomposer;
@@ -57,6 +58,11 @@ pub struct LoopState {
     pub restart_signaled: bool,
     /// Resolved target runner port (set once the loop starts).
     pub resolved_target_port: u16,
+    /// How the target is restarted between iterations, resolved once at
+    /// start (plan
+    /// `2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor`).
+    /// `None` until a loop has been started on this state.
+    pub restart_path: Option<RestartPath>,
 }
 
 impl LoopState {
@@ -72,6 +78,7 @@ impl LoopState {
             stop_tx: None,
             restart_signaled: false,
             resolved_target_port: 0,
+            restart_path: None,
         }
     }
 
@@ -98,31 +105,181 @@ impl LoopState {
     }
 }
 
-/// Start an orchestration loop. Spawns a background task and returns immediately.
-pub async fn start_loop(
-    loop_state: SharedLoopState,
-    config: OrchestrationLoopConfig,
-) -> Result<(), String> {
-    let mut state = loop_state.lock().await;
-    if state.running {
-        return Err("Orchestration loop is already running".to_string());
-    }
+/// Why a loop (or a multi-loop) refused to start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoopStartError {
+    /// The configured between-iterations restart cannot run against its
+    /// target here — decided before anything started. `loop_id` names the
+    /// offending entry of a multi-loop.
+    Unsupported {
+        loop_id: Option<String>,
+        unsupported: RestartUnsupported,
+    },
+    /// Any other refusal (already running, target not healthy, duplicate id…).
+    Refused(String),
+}
 
-    // Verify target runner is healthy before starting
-    let target_port = config.target_runner_port.unwrap_or_else(|| {
-        std::env::var("QONTINUI_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(9876)
-    });
+impl LoopStartError {
+    /// The typed code for an `Unsupported` refusal — what the HTTP 409 body
+    /// carries as `code`.
+    pub fn code(&self) -> Option<RestartUnsupportedCode> {
+        match self {
+            Self::Unsupported { unsupported, .. } => Some(unsupported.code),
+            Self::Refused(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for LoopStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported {
+                loop_id: None,
+                unsupported,
+            } => write!(f, "{unsupported}"),
+            Self::Unsupported {
+                loop_id: Some(id),
+                unsupported,
+            } => write!(
+                f,
+                "unsupported here: {}: loop '{}': {}",
+                restart_path::code_token(unsupported.code),
+                id,
+                unsupported.reason
+            ),
+            Self::Refused(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl std::error::Error for LoopStartError {}
+
+impl From<String> for LoopStartError {
+    fn from(msg: String) -> Self {
+        Self::Refused(msg)
+    }
+}
+
+/// The network half of starting a loop: health-check the target and resolve
+/// how it will be restarted. Runs with NO lock held (plan L1: every status read
+/// of a loop would otherwise queue behind these probes). Refuses when the
+/// target is not healthy, or when the configured between-iterations restart
+/// cannot run against it ([`LoopStartError::Unsupported`], whose message
+/// begins `unsupported here: `).
+async fn preflight(
+    config: &OrchestrationLoopConfig,
+    host: &LoopHost,
+    loop_id: Option<&str>,
+) -> Result<RestartPath, LoopStartError> {
+    let target_port = restart_path::target_port(config, host.self_port);
     let runner = RunnerClient::new(target_port);
     if !runner.is_healthy().await {
-        return Err(format!(
-            "Target runner on port {} is not running. Start the runner before running workflows.",
-            target_port
-        ));
+        return Err(match loop_id {
+            None => format!(
+                "Target runner on port {target_port} is not running. Start the runner before \
+                 running workflows."
+            ),
+            Some(id) => format!("Target runner on port {target_port} (loop '{id}') is not healthy"),
+        }
+        .into());
+    }
+    restart_path::resolve_restart_path(
+        config,
+        host.instances.as_ref(),
+        host.self_port,
+        host.supervisor_probe.as_ref(),
+    )
+    .await
+    .map_err(|unsupported| LoopStartError::Unsupported {
+        loop_id: loop_id.map(str::to_string),
+        unsupported,
+    })
+}
+
+/// One loop ready to be armed: its id, its (possibly pre-existing) state, and
+/// its preflighted config and restart path.
+struct Armable {
+    id: LoopId,
+    state: SharedLoopState,
+    config: OrchestrationLoopConfig,
+    path: RestartPath,
+    metadata: Option<LoopMetadata>,
+}
+
+/// THE one place a loop becomes running — every start path goes through it.
+///
+/// Under a single hold of the manager mutex it (1) refuses if any loop of the
+/// set is already running, (2) refuses if any OTHER running loop drives the
+/// same target port while either loop restarts that target between iterations
+/// (a restart kills the other loop's work), and only then (3) inserts and arms
+/// every loop of the set. Check and arm are therefore one atomic step: two
+/// concurrent starts at one target cannot both pass (2). The set is armed
+/// all-or-nothing.
+///
+/// Lock order is manager → loop state, the order every other multi-loop path
+/// here already takes; nothing acquires the manager while holding a loop state.
+async fn arm_set(
+    states: &SharedLoopStates,
+    set: Vec<Armable>,
+    host: &LoopHost,
+) -> Result<(), LoopStartError> {
+    let restarts = |p: &RestartPath| !matches!(p, RestartPath::NotNeeded);
+    let mut mgr = states.lock().await;
+
+    for a in &set {
+        if let Some(existing) = mgr.loops.get(&a.id) {
+            if existing.lock().await.running {
+                return Err(if a.id == DEFAULT_LOOP_ID {
+                    "Orchestration loop is already running".to_string()
+                } else {
+                    format!("Loop '{}' is already running", a.id)
+                }
+                .into());
+            }
+        }
     }
 
+    for (id, ls) in mgr.loops.iter() {
+        if set.iter().any(|a| &a.id == id) {
+            continue;
+        }
+        let st = ls.lock().await;
+        if !st.running {
+            continue;
+        }
+        let other_restarts = st.restart_path.as_ref().map(restarts).unwrap_or(true);
+        for a in &set {
+            let port = restart_path::target_port(&a.config, host.self_port);
+            if st.resolved_target_port == port && (restarts(&a.path) || other_restarts) {
+                return Err(format!(
+                    "loop '{id}' is already running against the runner on port {port}, and a \
+                     between-iterations restart of that runner would kill the other loop's \
+                     work; stop it first or target a different runner"
+                )
+                .into());
+            }
+        }
+    }
+
+    for a in set {
+        mgr.loops.insert(a.id.clone(), a.state.clone());
+        if let Some(meta) = a.metadata {
+            mgr.metadata.insert(a.id.clone(), meta);
+        }
+        let mut st = a.state.lock().await;
+        arm_and_spawn(&mut st, a.state.clone(), a.config, host.clone(), a.path);
+    }
+    Ok(())
+}
+
+/// Mark `state` running with the resolved path and spawn the loop task.
+fn arm_and_spawn(
+    state: &mut LoopState,
+    loop_state: SharedLoopState,
+    config: OrchestrationLoopConfig,
+    host: LoopHost,
+    path: RestartPath,
+) {
     let (stop_tx, stop_rx) = watch::channel(false);
 
     state.running = true;
@@ -133,15 +290,12 @@ pub async fn start_loop(
     state.error = None;
     state.iteration_results.clear();
     state.stop_tx = Some(stop_tx);
+    state.resolved_target_port = restart_path::target_port(&config, host.self_port);
+    state.restart_path = Some(path.clone());
 
-    drop(state);
-
-    let loop_state_clone = loop_state.clone();
     tokio::spawn(async move {
-        run_loop(loop_state_clone, config, stop_rx).await;
+        run_loop(loop_state, config, stop_rx, host, path).await;
     });
-
-    Ok(())
 }
 
 /// Stop the orchestration loop.
@@ -193,9 +347,27 @@ async fn get_or_create_default(states: &SharedLoopStates) -> SharedLoopState {
 pub async fn start_loop_compat(
     states: SharedLoopStates,
     config: OrchestrationLoopConfig,
-) -> Result<(), String> {
+    host: &LoopHost,
+) -> Result<(), LoopStartError> {
     let loop_state = get_or_create_default(&states).await;
-    start_loop(loop_state, config).await
+    // Cheap early refusal before the network preflight; `arm_set` re-checks
+    // under the manager lock.
+    if loop_state.lock().await.running {
+        return Err("Orchestration loop is already running".to_string().into());
+    }
+    let path = preflight(&config, host, None).await?;
+    arm_set(
+        &states,
+        vec![Armable {
+            id: DEFAULT_LOOP_ID.to_string(),
+            state: loop_state,
+            config,
+            path,
+            metadata: None,
+        }],
+        host,
+    )
+    .await
 }
 
 /// Stop the default loop (backwards-compatible).
@@ -219,19 +391,24 @@ pub async fn signal_restart_compat(states: SharedLoopStates) -> Result<(), Strin
 // --- Multi-loop management ---
 
 /// Start multiple loops simultaneously, each targeting a different runner.
+///
+/// Every entry is health-checked AND restart-resolved before any loop starts,
+/// so one entry whose restart mode is unsupported refuses the whole set with
+/// that entry's code and no loop state is inserted for any entry.
 pub async fn start_multi_loop(
     states: SharedLoopStates,
     multi_config: MultiLoopConfig,
-) -> Result<(), String> {
+    host: &LoopHost,
+) -> Result<(), LoopStartError> {
     if multi_config.loops.is_empty() {
-        return Err("No loops configured".to_string());
+        return Err("No loops configured".to_string().into());
     }
 
     // Validate no duplicate loop IDs
     let mut seen_ids = std::collections::HashSet::new();
     for entry in &multi_config.loops {
         if !seen_ids.insert(entry.loop_id.clone()) {
-            return Err(format!("Duplicate loop ID: {}", entry.loop_id));
+            return Err(format!("Duplicate loop ID: {}", entry.loop_id).into());
         }
     }
     let loop_count = seen_ids.len();
@@ -239,108 +416,54 @@ pub async fn start_multi_loop(
 
     // Validate no duplicate target runner ports (resolve None to actual port)
     let mut seen_ports = std::collections::HashSet::new();
-    let default_port: u16 = std::env::var("QONTINUI_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(9876);
     for entry in &multi_config.loops {
-        let port = entry.config.target_runner_port.unwrap_or(default_port);
+        let port = restart_path::target_port(&entry.config, host.self_port);
         if !seen_ports.insert(port) {
-            return Err(format!(
-                "Multiple loops target the same runner port: {}",
-                port
-            ));
+            return Err(format!("Multiple loops target the same runner port: {}", port).into());
         }
     }
 
-    // Health-check all target runners before starting any loops
+    // Preflight every entry (network, no lock held) before starting any loop.
+    // One unsupported entry refuses the whole multi-loop here, before any
+    // state is inserted.
+    let mut resolved_paths: Vec<RestartPath> = Vec::with_capacity(multi_config.loops.len());
     for entry in &multi_config.loops {
-        let port = entry.config.target_runner_port.unwrap_or_else(|| {
-            std::env::var("QONTINUI_PORT")
-                .ok()
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(9876)
-        });
-        let runner = RunnerClient::new(port);
-        if !runner.is_healthy().await {
-            return Err(format!(
-                "Target runner on port {} (loop '{}') is not healthy",
-                port, entry.loop_id
-            ));
-        }
-    }
-
-    // Check none of the requested loop IDs are already running
-    {
-        let mgr = states.lock().await;
-        for entry in &multi_config.loops {
-            if let Some(existing) = mgr.loops.get(&entry.loop_id) {
-                let state = existing.lock().await;
-                if state.running {
-                    return Err(format!("Loop '{}' is already running", entry.loop_id));
-                }
-            }
-        }
+        resolved_paths.push(preflight(&entry.config, host, Some(&entry.loop_id)).await?);
     }
 
     // Clean up any finished loops before launching new ones
     cleanup_finished_loops(states.clone()).await;
 
-    // Launch each loop, rolling back on failure
+    // Arm the whole set atomically (see `arm_set`): all or nothing.
     let stop_all_on_error = multi_config.stop_all_on_error;
-    let mut started_ids: Vec<String> = Vec::new();
+    let set: Vec<Armable> = multi_config
+        .loops
+        .into_iter()
+        .zip(resolved_paths)
+        .map(|(entry, path)| Armable {
+            id: entry.loop_id,
+            state: Arc::new(Mutex::new(LoopState::new())),
+            config: entry.config,
+            path,
+            metadata: Some(LoopMetadata {
+                label: entry.label,
+                stop_all_on_error,
+            }),
+        })
+        .collect();
+    let armed: Vec<(LoopId, SharedLoopState)> = set
+        .iter()
+        .map(|a| (a.id.clone(), a.state.clone()))
+        .collect();
+    arm_set(&states, set, host).await?;
+    states.lock().await.stop_all_on_error = stop_all_on_error;
 
-    for entry in multi_config.loops {
-        let loop_state = Arc::new(Mutex::new(LoopState::new()));
-        {
-            let mut mgr = states.lock().await;
-            mgr.loops.insert(entry.loop_id.clone(), loop_state.clone());
-            mgr.metadata.insert(
-                entry.loop_id.clone(),
-                LoopMetadata {
-                    label: entry.label.clone(),
-                    stop_all_on_error,
-                },
-            );
-            mgr.stop_all_on_error = stop_all_on_error;
-        }
-
-        match start_loop(loop_state.clone(), entry.config).await {
-            Ok(()) => {
-                started_ids.push(entry.loop_id.clone());
-
-                // If stop_all_on_error, spawn a watcher for this loop
-                if stop_all_on_error {
-                    let states_clone = states.clone();
-                    let loop_id = entry.loop_id.clone();
-                    let loop_state_clone = loop_state.clone();
-                    tokio::spawn(async move {
-                        watch_loop_for_error(states_clone, loop_id, loop_state_clone).await;
-                    });
-                }
-            }
-            Err(e) => {
-                // Roll back: stop all already-started loops
-                warn!(
-                    "Loop '{}' failed to start, rolling back {} already-started loops: {}",
-                    entry.loop_id,
-                    started_ids.len(),
-                    e
-                );
-                for started_id in &started_ids {
-                    if let Err(stop_err) = stop_loop_by_id(states.clone(), started_id).await {
-                        error!(
-                            "Failed to stop loop '{}' during rollback: {}",
-                            started_id, stop_err
-                        );
-                    }
-                }
-                // Remove the failed loop's state
-                let mut mgr = states.lock().await;
-                mgr.loops.remove(&entry.loop_id);
-                mgr.metadata.remove(&entry.loop_id);
-                return Err(format!("Failed to start loop '{}': {}", entry.loop_id, e));
-            }
+    if stop_all_on_error {
+        for (loop_id, loop_state) in armed {
+            let states_clone = states.clone();
+            tokio::spawn(async move {
+                watch_loop_for_error(states_clone, loop_id, loop_state).await;
+            });
         }
     }
 
@@ -1131,22 +1254,16 @@ async fn run_loop(
     loop_state: SharedLoopState,
     config: OrchestrationLoopConfig,
     stop_rx: watch::Receiver<bool>,
+    host: LoopHost,
+    path: RestartPath,
 ) {
-    // Resolve target runner port (default: self via QONTINUI_PORT or 9876)
-    let target_port = config.target_runner_port.unwrap_or_else(|| {
-        std::env::var("QONTINUI_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(9876)
-    });
-
-    let target_runner_id = config
-        .target_runner_id
-        .clone()
-        .unwrap_or_else(|| "primary".to_string());
+    // Resolve target runner port (default: this runner's own bound port)
+    let target_port = restart_path::target_port(&config, host.self_port);
 
     let runner = RunnerClient::new(target_port);
-    let supervisor = SupervisorClient::new(config.supervisor_port);
+    // The restart mechanism resolved at start. A `SupervisorClient` exists
+    // only inside it, and only on the `DevSupervisor` path.
+    let restarter = TargetRestarter::new(&path, host);
 
     // Store the resolved port in state so status queries can see it
     {
@@ -1175,15 +1292,7 @@ async fn run_loop(
 
     // Branch on pipeline mode vs simple mode
     if config.pipeline.is_some() {
-        run_pipeline_loop(
-            loop_state,
-            config,
-            stop_rx,
-            runner,
-            supervisor,
-            &target_runner_id,
-        )
-        .await;
+        run_pipeline_loop(loop_state, config, stop_rx, runner, restarter).await;
         return;
     }
 
@@ -1503,9 +1612,8 @@ async fn run_loop(
                 if iteration < config.iter_cap() {
                     if let Err(e) = handle_between_iterations(
                         &runner,
-                        &supervisor,
+                        &restarter,
                         &config,
-                        &target_runner_id,
                         &loop_state,
                         &stop_rx,
                     )
@@ -1693,15 +1801,8 @@ async fn run_loop(
 
         // --- Phase 3: Between iterations ---
         if iteration < config.iter_cap() {
-            if let Err(e) = handle_between_iterations(
-                &runner,
-                &supervisor,
-                &config,
-                &target_runner_id,
-                &loop_state,
-                &stop_rx,
-            )
-            .await
+            if let Err(e) =
+                handle_between_iterations(&runner, &restarter, &config, &loop_state, &stop_rx).await
             {
                 set_error(&loop_state, &format!("Between-iterations failed: {}", e)).await;
                 return;
@@ -1779,9 +1880,8 @@ async fn evaluate_reflection_exit(
 /// Handle between-iterations action.
 async fn handle_between_iterations(
     runner: &RunnerClient,
-    supervisor: &SupervisorClient,
+    restarter: &TargetRestarter,
     config: &OrchestrationLoopConfig,
-    target_runner_id: &str,
     loop_state: &SharedLoopState,
     stop_rx: &watch::Receiver<bool>,
 ) -> Result<(), String> {
@@ -1793,11 +1893,12 @@ async fn handle_between_iterations(
     match &config.between_iterations {
         BetweenIterations::RestartRunner { rebuild } => {
             info!(
-                "Restarting target runner '{}' (rebuild={})",
-                target_runner_id, rebuild
+                "Restarting target {} (rebuild={})",
+                restarter.describe(),
+                rebuild
             );
-            supervisor
-                .restart_runner(target_runner_id, *rebuild)
+            let outcome = restarter
+                .restart(*rebuild, &runner.launched_run_ids(), stop_rx)
                 .await?;
 
             {
@@ -1809,6 +1910,7 @@ async fn handle_between_iterations(
             if !runner.wait_for_healthy(120, stop_rx).await {
                 return Err("Target runner not healthy after restart".to_string());
             }
+            restarter.confirm_restarted(outcome).await?;
             info!("Target runner is healthy");
         }
         BetweenIterations::RestartOnSignal { rebuild } => {
@@ -1821,11 +1923,12 @@ async fn handle_between_iterations(
 
             if signaled {
                 info!(
-                    "RestartOnSignal — restart signaled, restarting target runner '{}' (rebuild={})",
-                    target_runner_id, rebuild
+                    "RestartOnSignal — restart signaled, restarting target {} (rebuild={})",
+                    restarter.describe(),
+                    rebuild
                 );
-                supervisor
-                    .restart_runner(target_runner_id, *rebuild)
+                let outcome = restarter
+                    .restart(*rebuild, &runner.launched_run_ids(), stop_rx)
                     .await?;
 
                 {
@@ -1837,6 +1940,7 @@ async fn handle_between_iterations(
                 if !runner.wait_for_healthy(120, stop_rx).await {
                     return Err("Target runner not healthy after restart".to_string());
                 }
+                restarter.confirm_restarted(outcome).await?;
                 info!("Target runner is healthy");
             } else {
                 info!("RestartOnSignal — no signal received, skipping restart");
@@ -2036,8 +2140,7 @@ async fn run_pipeline_loop(
     config: OrchestrationLoopConfig,
     stop_rx: watch::Receiver<bool>,
     runner: RunnerClient,
-    supervisor: SupervisorClient,
-    target_runner_id: &str,
+    restarter: TargetRestarter,
 ) {
     let Some(pipeline) = config.pipeline.as_ref() else {
         error!("Pipeline loop called without pipeline config");
@@ -2565,15 +2668,8 @@ async fn run_pipeline_loop(
 
         // --- Phase 5: Between iterations ---
         if iteration < config.iter_cap() {
-            if let Err(e) = handle_between_iterations(
-                &runner,
-                &supervisor,
-                &config,
-                target_runner_id,
-                &loop_state,
-                &stop_rx,
-            )
-            .await
+            if let Err(e) =
+                handle_between_iterations(&runner, &restarter, &config, &loop_state, &stop_rx).await
             {
                 set_error(&loop_state, &format!("Between-iterations failed: {}", e)).await;
                 return;
@@ -2779,5 +2875,447 @@ mod tests {
             Some(serde_json::json!({ "concurrency_cap": "three" })),
         );
         assert_eq!(stored_run_config(&bad), d);
+    }
+}
+
+/// Phase 1 acceptance for plan
+/// `2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor`:
+/// the restart path is resolved before start, and an unsupported one refuses
+/// the start (single loop) or the WHOLE set (multi-loop) with no loop state
+/// inserted.
+#[cfg(test)]
+mod restart_preflight_tests {
+    use super::*;
+    use crate::instance_manager::InstanceLifecycle;
+    use crate::settings::RunnerInstanceConfig;
+    use restart_path::{HttpSupervisorProbe, HttpTargetProbe};
+
+    /// Live children keyed by port; restart operations are never reached here.
+    struct OwnedPorts(Vec<(String, u16)>);
+
+    #[async_trait::async_trait]
+    impl InstanceLifecycle for OwnedPorts {
+        async fn owned_instance_on_port(&self, port: u16) -> Option<RunnerInstanceConfig> {
+            self.0
+                .iter()
+                .find(|(_, p)| *p == port)
+                .map(|(id, p)| RunnerInstanceConfig {
+                    id: id.clone(),
+                    name: id.clone(),
+                    port: *p,
+                    spawn_placement: None,
+                })
+        }
+        async fn owned_instance(&self, _id: &str) -> Option<RunnerInstanceConfig> {
+            None
+        }
+        async fn stop(&self, _id: &str) -> Result<(), String> {
+            Err("not reached in preflight tests".into())
+        }
+        async fn wait_port_free(&self, _port: u16, _timeout: std::time::Duration) -> bool {
+            false
+        }
+        async fn launch(
+            &self,
+            _config: &RunnerInstanceConfig,
+            _app: Option<&tauri::AppHandle>,
+        ) -> Result<u32, String> {
+            Err("not reached in preflight tests".into())
+        }
+    }
+
+    /// A loopback server answering `/health`, standing in for a target runner.
+    async fn healthy_runner() -> (u16, tokio::task::JoinHandle<()>) {
+        let app = axum::Router::new().route("/health", axum::routing::get(|| async { "ok" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (port, handle)
+    }
+
+    fn closed_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    fn host(self_port: u16, owned: Vec<(String, u16)>) -> LoopHost {
+        LoopHost {
+            instances: Arc::new(OwnedPorts(owned)),
+            app: None,
+            self_port,
+            supervisor_probe: Arc::new(HttpSupervisorProbe),
+            target_probe: Arc::new(HttpTargetProbe),
+        }
+    }
+
+    fn cfg(
+        between: BetweenIterations,
+        target: Option<u16>,
+        supervisor_port: u16,
+    ) -> OrchestrationLoopConfig {
+        let mut v = serde_json::json!({
+            "workflowId": "wf-1",
+            "maxIterations": 1,
+            "betweenIterations": serde_json::to_value(&between).unwrap(),
+            "supervisorPort": supervisor_port,
+        });
+        if let Some(p) = target {
+            v["targetRunnerPort"] = serde_json::json!(p);
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn states() -> SharedLoopStates {
+        Arc::new(Mutex::new(MultiLoopManager::new()))
+    }
+
+    async fn default_loop_armed(states: &SharedLoopStates) -> (bool, Option<RestartPath>) {
+        let ls = get_or_create_default(states).await;
+        let st = ls.lock().await;
+        (st.running, st.restart_path.clone())
+    }
+
+    #[tokio::test]
+    async fn a_no_rebuild_restart_against_self_is_refused_target_is_orchestrator() {
+        let (self_port, server) = healthy_runner().await;
+        let states = states();
+        let err = start_loop_compat(
+            states.clone(),
+            cfg(
+                BetweenIterations::RestartRunner { rebuild: false },
+                None,
+                closed_port(),
+            ),
+            &host(self_port, vec![]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Some(RestartUnsupportedCode::TargetIsOrchestrator)
+        );
+        assert!(err
+            .to_string()
+            .starts_with("unsupported here: target_is_orchestrator: "));
+        assert_eq!(
+            default_loop_armed(&states).await,
+            (false, None),
+            "no loop started"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_restart_of_a_port_no_child_owns_is_refused_target_not_runner_managed() {
+        let (self_port, s1) = healthy_runner().await;
+        let (target, s2) = healthy_runner().await;
+        let states = states();
+        let err = start_loop_compat(
+            states.clone(),
+            cfg(
+                BetweenIterations::RestartOnSignal { rebuild: false },
+                Some(target),
+                closed_port(),
+            ),
+            &host(self_port, vec![]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Some(RestartUnsupportedCode::TargetNotRunnerManaged)
+        );
+        assert_eq!(default_loop_armed(&states).await, (false, None));
+        s1.abort();
+        s2.abort();
+    }
+
+    #[tokio::test]
+    async fn a_rebuild_with_no_supervisor_is_refused_rebuild_needs_dev_supervisor() {
+        let (self_port, s1) = healthy_runner().await;
+        let (target, s2) = healthy_runner().await;
+        let states = states();
+        let err = start_loop_compat(
+            states.clone(),
+            cfg(
+                BetweenIterations::RestartRunner { rebuild: true },
+                Some(target),
+                closed_port(),
+            ),
+            // Even an owned child: rebuild still needs the supervisor.
+            &host(self_port, vec![("slot-a".into(), target)]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Some(RestartUnsupportedCode::RebuildNeedsDevSupervisor)
+        );
+        assert_eq!(default_loop_armed(&states).await, (false, None));
+        s1.abort();
+        s2.abort();
+    }
+
+    #[tokio::test]
+    async fn wait_healthy_against_self_starts_as_before() {
+        let (self_port, server) = healthy_runner().await;
+        let states = states();
+        start_loop_compat(
+            states.clone(),
+            cfg(BetweenIterations::WaitHealthy, None, closed_port()),
+            &host(self_port, vec![]),
+        )
+        .await
+        .expect("wait_healthy needs no restart path");
+        let ls = get_or_create_default(&states).await;
+        {
+            let st = ls.lock().await;
+            assert_eq!(st.restart_path, Some(RestartPath::NotNeeded));
+            assert_eq!(st.resolved_target_port, self_port);
+        }
+        let _ = stop_loop(ls).await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn one_unsupported_entry_refuses_the_whole_multi_loop_with_no_state_inserted() {
+        let (self_port, s0) = healthy_runner().await;
+        let (a, s1) = healthy_runner().await;
+        let (b, s2) = healthy_runner().await;
+        let states = states();
+        let multi: MultiLoopConfig = serde_json::from_value(serde_json::json!({
+            "loops": [
+                {"loopId": "ok-entry", "config": serde_json::to_value(cfg(BetweenIterations::WaitHealthy, Some(a), closed_port())).unwrap()},
+                {"loopId": "bad-entry", "config": serde_json::to_value(cfg(BetweenIterations::RestartRunner { rebuild: false }, Some(b), closed_port())).unwrap()},
+            ],
+            "stopAllOnError": false,
+        }))
+        .unwrap();
+
+        let err = start_multi_loop(states.clone(), multi, &host(self_port, vec![]))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Some(RestartUnsupportedCode::TargetNotRunnerManaged)
+        );
+        assert!(
+            err.to_string()
+                .starts_with("unsupported here: target_not_runner_managed: loop 'bad-entry': "),
+            "{err}"
+        );
+        let mgr = states.lock().await;
+        assert!(mgr.loops.is_empty(), "no loop state inserted for ANY entry");
+        assert!(mgr.metadata.is_empty());
+        drop(mgr);
+        for s in [s0, s1, s2] {
+            s.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fully_supported_multi_loop_starts_every_entry_with_its_path() {
+        let (self_port, s0) = healthy_runner().await;
+        let (a, s1) = healthy_runner().await;
+        let (b, s2) = healthy_runner().await;
+        let states = states();
+        let multi: MultiLoopConfig = serde_json::from_value(serde_json::json!({
+            "loops": [
+                {"loopId": "wait", "config": serde_json::to_value(cfg(BetweenIterations::WaitHealthy, Some(a), closed_port())).unwrap()},
+                {"loopId": "owned", "config": serde_json::to_value(cfg(BetweenIterations::RestartRunner { rebuild: false }, Some(b), closed_port())).unwrap()},
+            ],
+            "stopAllOnError": false,
+        }))
+        .unwrap();
+
+        start_multi_loop(
+            states.clone(),
+            multi,
+            &host(self_port, vec![("slot-b".into(), b)]),
+        )
+        .await
+        .expect("both entries supported");
+        let owned = {
+            let mgr = states.lock().await;
+            assert_eq!(mgr.loops.len(), 2);
+            mgr.loops.get("owned").unwrap().clone()
+        };
+        assert_eq!(
+            owned.lock().await.restart_path,
+            Some(RestartPath::InstanceManager {
+                instance_id: "slot-b".into(),
+                port: b
+            })
+        );
+        let _ = stop_all_loops(states).await;
+        for s in [s0, s1, s2] {
+            s.abort();
+        }
+    }
+
+    /// A running loop, inserted directly (a real one would error out against
+    /// the fake target within milliseconds and stop being "running").
+    async fn insert_running(states: &SharedLoopStates, id: &str, port: u16, path: RestartPath) {
+        let mut st = LoopState::new();
+        st.running = true;
+        st.resolved_target_port = port;
+        st.restart_path = Some(path);
+        states
+            .lock()
+            .await
+            .loops
+            .insert(id.to_string(), Arc::new(Mutex::new(st)));
+    }
+
+    #[tokio::test]
+    async fn a_restarting_loop_is_refused_on_a_target_another_running_loop_drives() {
+        let (self_port, s0) = healthy_runner().await;
+        let (p, s1) = healthy_runner().await;
+        let states = states();
+        insert_running(&states, "other", p, RestartPath::NotNeeded).await;
+
+        let err = start_loop_compat(
+            states.clone(),
+            cfg(
+                BetweenIterations::RestartRunner { rebuild: false },
+                Some(p),
+                closed_port(),
+            ),
+            &host(self_port, vec![("slot-p".into(), p)]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), None, "a plain refusal, no schema code");
+        assert!(
+            err.to_string().contains("loop 'other' is already running"),
+            "{err}"
+        );
+        assert_eq!(default_loop_armed(&states).await, (false, None));
+
+        // Two non-restarting loops may share a target.
+        start_loop_compat(
+            states.clone(),
+            cfg(BetweenIterations::WaitHealthy, Some(p), closed_port()),
+            &host(self_port, vec![]),
+        )
+        .await
+        .expect("wait_healthy beside wait_healthy is fine");
+        let _ = stop_all_loops(states).await;
+        s0.abort();
+        s1.abort();
+    }
+
+    #[tokio::test]
+    async fn any_loop_is_refused_on_a_target_a_running_loop_restarts() {
+        let (self_port, s0) = healthy_runner().await;
+        let (p, s1) = healthy_runner().await;
+        let states = states();
+        insert_running(
+            &states,
+            "restarter",
+            p,
+            RestartPath::InstanceManager {
+                instance_id: "slot-p".into(),
+                port: p,
+            },
+        )
+        .await;
+
+        let err = start_loop_compat(
+            states.clone(),
+            cfg(BetweenIterations::WaitHealthy, Some(p), closed_port()),
+            &host(self_port, vec![]),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("loop 'restarter'"), "{err}");
+
+        let multi: MultiLoopConfig = serde_json::from_value(serde_json::json!({
+            "loops": [
+                {"loopId": "new", "config": serde_json::to_value(cfg(BetweenIterations::WaitHealthy, Some(p), closed_port())).unwrap()},
+            ],
+        }))
+        .unwrap();
+        let err = start_multi_loop(states.clone(), multi, &host(self_port, vec![]))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("loop 'restarter'"), "{err}");
+        assert!(!states.lock().await.loops.contains_key("new"));
+        s0.abort();
+        s1.abort();
+    }
+
+    /// A target that answers `/health` but never answers anything else, so a
+    /// started loop stays RUNNING (parked on its first workflow start) for the
+    /// whole test instead of erroring out and freeing the port.
+    async fn hanging_runner() -> (u16, tokio::task::JoinHandle<()>) {
+        let app = axum::Router::new()
+            .route("/health", axum::routing::get(|| async { "ok" }))
+            .fallback(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                ""
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (port, handle)
+    }
+
+    /// The race the atomic `arm_set` closes: two starts at ONE target, fired
+    /// concurrently, each passing its own preflight — exactly one may arm.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_starts_at_one_target_arm_exactly_one() {
+        let (self_port, s0) = healthy_runner().await;
+        let (p, s1) = hanging_runner().await;
+        for round in 0..10 {
+            let states = states();
+            let h = host(self_port, vec![("slot-p".into(), p)]);
+            let restart = cfg(
+                BetweenIterations::RestartRunner { rebuild: false },
+                Some(p),
+                closed_port(),
+            );
+            let multi = |id: &str| -> MultiLoopConfig {
+                serde_json::from_value(serde_json::json!({
+                    "loops": [{"loopId": id, "config": serde_json::to_value(&restart).unwrap()}],
+                }))
+                .unwrap()
+            };
+            let (a, b, c) = tokio::join!(
+                start_multi_loop(states.clone(), multi("a"), &h),
+                start_multi_loop(states.clone(), multi("b"), &h),
+                start_loop_compat(states.clone(), restart.clone(), &h),
+            );
+            let oks = [&a, &b, &c].iter().filter(|r| r.is_ok()).count();
+            assert_eq!(oks, 1, "round {round}: {a:?} / {b:?} / {c:?}");
+            for r in [&a, &b, &c] {
+                if let Err(e) = r {
+                    assert!(
+                        e.to_string()
+                            .contains("is already running against the runner on port"),
+                        "{e}"
+                    );
+                }
+            }
+            let running = {
+                let loops: Vec<SharedLoopState> =
+                    states.lock().await.loops.values().cloned().collect();
+                let mut n = 0;
+                for ls in loops {
+                    if ls.lock().await.running {
+                        n += 1;
+                    }
+                }
+                n
+            };
+            assert_eq!(running, 1, "round {round}: exactly one loop armed");
+            let _ = stop_all_loops(states).await;
+        }
+        s0.abort();
+        s1.abort();
     }
 }

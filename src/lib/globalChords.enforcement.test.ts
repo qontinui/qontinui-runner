@@ -368,6 +368,7 @@ const KEY_FIELD_ROSTER: readonly string[] = [
   "components/navigation/Sidebar.tsx",
   "components/observations/ObservationBrowser.tsx",
   "components/orchestration-loop/OrchestrationLoopPanel.tsx",
+  "components/orchestration-loop/restartCapability.tsx",
   "components/pipeline-events/PipelineEventsTimeline.tsx",
   "components/process-manager/ProcessManagerTab.tsx",
   "components/productivity/overlappingIntentsApi.ts",
