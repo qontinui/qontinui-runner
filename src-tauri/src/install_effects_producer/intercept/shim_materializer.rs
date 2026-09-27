@@ -338,10 +338,11 @@ pub fn materialize_identity(base_dir: &Path) -> Option<PathBuf> {
     // then the operator opens one" case, where every live pane's PATH suddenly
     // names a directory being `remove_dir_all`'d. See [`maybe_sweep_stale`].
     if let Ok(md) = std::fs::metadata(&marker) {
-        // A complete dir can still hold an unpublishable `qontinui-pr` — a
-        // 0-byte copy an older build delivered, or one truncated before the
-        // marker was written. The marker vouches for the scripts, not for that.
-        repair_session_cli_if_unpublishable(&dir);
+        // The marker vouches for the scripts, not for `qontinui-pr`: its first
+        // delivery may have failed on I/O, it may have appeared beside the
+        // runner exe since, or the published copy may have been damaged since.
+        // See [`reconcile_session_cli_if_due`].
+        reconcile_session_cli_if_due(&dir);
         refresh_identity_liveness(&marker, &md);
         maybe_sweep_stale(base_dir);
         return Some(dir);
@@ -375,23 +376,14 @@ pub fn materialize_identity(base_dir: &Path) -> Option<PathBuf> {
     // qontinui-pr-credential-provisioning, Phase 2b) onto the same always-on
     // PATH dir. Best-effort, fail-open: an absent/uncopyable binary never
     // breaks the terminal — the identity dir still materializes.
-    let cli = materialize_session_cli(&dir);
-
-    // A TRANSIENT delivery failure (an I/O error — an AV lock, a racing
-    // writer — rather than a definite "not a binary" verdict) must not seal
-    // the dir: the marker is what turns every later spawn into the fast path,
-    // so writing it now would leave the CLI missing for the whole life of this
-    // build. Leave the marker unwritten and the next spawn retries.
-    if !session_cli_outcome_seals_the_dir(&cli) {
-        tracing::warn!(
-            dir = %dir.display(),
-            outcome = ?cli,
-            "session cli: transient delivery failure — leaving the identity dir unsealed so \
-             the next spawn retries"
-        );
-        maybe_sweep_stale(base_dir);
-        return Some(dir);
-    }
+    //
+    // Its outcome deliberately does NOT gate the marker. A CLI that could not
+    // be delivered now is retried by the fast path
+    // ([`reconcile_session_cli_if_due`]). Leaving the dir unsealed instead
+    // would make every later spawn pay this whole rewrite in a dir live panes
+    // are executing from, and `identity_dir_if_materialized` would report "not
+    // on PATH" for a dir the spawn seam does prepend.
+    materialize_session_cli(&dir);
 
     // The marker goes LAST and is what makes the fast path safe: a crash
     // part-way through the writes above leaves no marker, so the next spawn
@@ -550,18 +542,43 @@ pub const SESSION_CLI_BIN: &str = if cfg!(windows) {
     "qontinui-pr"
 };
 
-/// One-shot latch: warn that the session CLI could not be delivered (absent,
+/// One-shot latch: warn that the session CLI has no deliverable source (absent,
 /// or refused as not a runnable executable) ONCE per process, not once per
-/// terminal spawn. The source path is fixed for a process, so its verdict is
-/// too.
+/// terminal spawn. It bounds the log volume only. The file at the source path
+/// can change under a running runner (the 0-byte incident was exactly that),
+/// so every attempt still re-checks it.
 static SESSION_CLI_UNDELIVERED_WARNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Minimum spacing, per identity dir, between two FAST-PATH attempts to put a
+/// runnable `qontinui-pr` into a sealed dir that lacks one. The slow path always
+/// attempts. This bounds what a persistent failure costs a burst of spawns: a
+/// full volume, an obstruction at the CLI's path, or a source that is simply
+/// not there each cost at most one source check and one link-or-copy per
+/// interval per dir.
+const SESSION_CLI_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// When each identity dir last had a fast-path delivery attempt. Keyed by dir,
+/// so one dir's attempt never defers another's (and tests, each with its own
+/// tempdir, cannot starve each other). A runner has one identity dir per build,
+/// so this stays tiny; past [`SESSION_CLI_RETRY_CAP`] entries the ones at least
+/// [`SESSION_CLI_RETRY_INTERVAL`] old are dropped.
+static SESSION_CLI_RETRIES: std::sync::Mutex<Vec<(PathBuf, std::time::Instant)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Size past which [`SESSION_CLI_RETRIES`] drops expired entries.
+const SESSION_CLI_RETRY_CAP: usize = 64;
+
+/// Sequence for staging-file names: unique within the process, and the pid in
+/// the name makes them unique across runner processes sharing a dir.
+static SESSION_CLI_STAGE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Outcome of one attempt to put the `qontinui-pr` session CLI into an identity
 /// dir. Returned, not only logged, so each arm is pinned by a test.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SessionCliDelivery {
-    /// A validated native executable is in the dir.
+    /// A validated native executable is in the dir: placed now, or already
+    /// there.
     Delivered,
     /// No binary beside the runner exe. `qontinui-pr` is then absent from this
     /// dir: the command is not found, or PATH falls through to a real one.
@@ -570,11 +587,13 @@ enum SessionCliDelivery {
     /// executable, so it is NOT published. Publishing the 0-byte build
     /// placeholder is what made `qontinui-pr create` exit 0 having opened no PR.
     SourceRefused(NotExecutable),
-    /// The source was sound but the copy in the dir was not (truncated), so
-    /// the copy was removed.
+    /// The source was sound but the copy staged from it was not (cut short:
+    /// a full volume, a racing writer), so the staged copy was discarded
+    /// without replacing anything.
     DestRefused(NotExecutable),
-    /// The dir could not be written: a stale copy could not be removed, or the
-    /// hard link and the copy both failed.
+    /// An I/O error: the hard link and the copy both failed, or the staged
+    /// copy could not be renamed into place. What was already published is
+    /// left as it was, unless it was definitely not runnable.
     Failed(String),
 }
 
@@ -638,13 +657,14 @@ fn materialize_session_cli(dir: &Path) -> SessionCliDelivery {
         SessionCliDelivery::DestRefused(why) => tracing::warn!(
             dir = %dir.display(),
             reason = %why,
-            "session cli: the {SESSION_CLI_BIN} copy in the identity dir was not a runnable \
-             executable and was removed"
+            "session cli: the {SESSION_CLI_BIN} copy staged into the identity dir was not a \
+             runnable executable and was discarded — a later spawn retries"
         ),
         SessionCliDelivery::Failed(detail) => tracing::warn!(
             dir = %dir.display(),
             detail = %detail,
-            "session cli: failed to materialize {SESSION_CLI_BIN} into the identity dir"
+            "session cli: failed to materialize {SESSION_CLI_BIN} into the identity dir — a \
+             later spawn retries"
         ),
     }
     outcome
@@ -652,18 +672,29 @@ fn materialize_session_cli(dir: &Path) -> SessionCliDelivery {
 
 /// The delivery itself, with the source passed in so tests need no binary next
 /// to the test executable. See [`materialize_session_cli`] for the contract.
+///
+/// It never deletes a runnable CLI and never exposes a partial one:
+/// - a published copy that is already a runnable image is kept as it is
+///   (`Delivered`, nothing written) — the dir's name already pins the source's
+///   size and mtime ([`identity_build_tag`]);
+/// - a published copy that is DEFINITELY not runnable ([`is_definite_refusal`])
+///   comes off PATH first, whatever happens next: absent beats a CLI that exits
+///   0 having done nothing. An UNREADABLE one (an I/O error, e.g. a sharing
+///   violation) is not a verdict, so it is left for the rename to replace;
+/// - the new copy is staged under a hidden name, checked, and only then
+///   renamed over the published name, so a concurrent terminal sees the old
+///   file or the complete new one, never a partial copy.
 fn deliver_session_cli(src: Option<&Path>, dir: &Path) -> SessionCliDelivery {
     let format = ExecutableFormat::host();
     let dest = dir.join(SESSION_CLI_BIN);
-    // Never leave a previous copy in place: what ends up here is either
-    // re-derived from a validated source below, or nothing. (The hard link
-    // below also refuses an existing destination.)
-    match std::fs::remove_file(&dest) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return SessionCliDelivery::Failed(format!("remove stale {}: {e}", dest.display()))
-        }
+    let published = native_executable::check(&dest, format);
+    if published.is_ok() {
+        return SessionCliDelivery::Delivered;
+    }
+    if matches!(&published, Err(why) if is_definite_refusal(why)) {
+        // A directory at the path is a definite refusal too, but remove_file
+        // cannot remove it; the rename below then fails and says so.
+        let _ = std::fs::remove_file(&dest);
     }
     let Some(src) = src else {
         return SessionCliDelivery::SourceMissing;
@@ -673,76 +704,126 @@ fn deliver_session_cli(src: Option<&Path>, dir: &Path) -> SessionCliDelivery {
         Err(NotExecutable::Missing) => return SessionCliDelivery::SourceMissing,
         Err(why) => return SessionCliDelivery::SourceRefused(why),
     }
+    let stage = dir.join(format!(
+        ".{SESSION_CLI_BIN}.{}.{}.tmp",
+        std::process::id(),
+        SESSION_CLI_STAGE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_file(&stage);
     // Hardlink first (zero extra disk when temp shares the exe's volume); fall
     // back to a plain copy (temp on another volume, FS without links).
-    if std::fs::hard_link(src, &dest).is_err() {
-        if let Err(e) = std::fs::copy(src, &dest) {
-            let _ = std::fs::remove_file(&dest);
+    if std::fs::hard_link(src, &stage).is_err() {
+        if let Err(e) = std::fs::copy(src, &stage) {
+            let _ = std::fs::remove_file(&stage);
             return SessionCliDelivery::Failed(format!(
                 "copy {} -> {}: {e}",
                 src.display(),
-                dest.display()
+                stage.display()
             ));
         }
     }
     // Validate what actually landed, not only what was asked for: a copy cut
-    // short (disk full, a racing writer) must not become the published CLI.
-    if let Err(why) = native_executable::check(&dest, format) {
-        let _ = std::fs::remove_file(&dest);
+    // short (a full volume, a racing writer) must not become the published CLI.
+    if let Err(why) = native_executable::check(&stage, format) {
+        let _ = std::fs::remove_file(&stage);
         return SessionCliDelivery::DestRefused(why);
+    }
+    if let Err(e) = std::fs::rename(&stage, &dest) {
+        let _ = std::fs::remove_file(&stage);
+        return SessionCliDelivery::Failed(format!(
+            "rename {} -> {}: {e}",
+            stage.display(),
+            dest.display()
+        ));
     }
     SessionCliDelivery::Delivered
 }
 
-/// Whether a delivery outcome is FINAL enough to seal the identity dir (write
-/// its completion marker). Everything is, except a failure caused by an I/O
-/// error rather than a verdict: `Failed`, or a refusal whose reason is
-/// `Unreadable`. Those may clear on the next spawn, and a sealed dir never
-/// retries. Pure.
-fn session_cli_outcome_seals_the_dir(outcome: &SessionCliDelivery) -> bool {
-    !matches!(
-        outcome,
-        SessionCliDelivery::Failed(_)
-            | SessionCliDelivery::SourceRefused(NotExecutable::Unreadable(_))
-            | SessionCliDelivery::DestRefused(NotExecutable::Unreadable(_))
+/// Whether a verdict is DEFINITE: the file is not a runnable image and reading
+/// it again will not change that. `Missing` (nothing there) and `Unreadable`
+/// (an I/O error, which may clear: a sharing violation, an AV scan) are not.
+/// Only a definite refusal justifies deleting a published copy. Pure.
+fn is_definite_refusal(why: &NotExecutable) -> bool {
+    matches!(
+        why,
+        NotExecutable::NotAFile
+            | NotExecutable::Empty
+            | NotExecutable::WrongFormat { .. }
+            | NotExecutable::NoExecutePermission
     )
 }
 
-/// Keep the published session CLI publishable for the life of an identity
-/// dir, not only at the moment it was written. Returns `None` when there was
-/// nothing to repair (a sound CLI, or none), else the re-delivery's outcome.
+/// Whether the published CLI's verdict calls for a delivery attempt: it is
+/// absent, or definitely not runnable. A runnable copy does not, and neither
+/// does an unreadable one — deleting a working CLI on an I/O error would be the
+/// worse failure. Pure.
+fn session_cli_needs_delivery(published: &Result<u64, NotExecutable>) -> bool {
+    match published {
+        Ok(_) => false,
+        Err(NotExecutable::Missing) => true,
+        Err(why) => is_definite_refusal(why),
+    }
+}
+
+/// Keep a runnable `qontinui-pr` in a SEALED identity dir for the life of the
+/// build, not only at the moment the dir was written. Called from
+/// [`materialize_identity`]'s fast path on every spawn.
 ///
-/// DEFENSE IN DEPTH, and stated precisely so nobody over-reads it: this build
-/// never seals a dir holding an unpublishable CLI itself — delivery validates
-/// the landed copy before the marker is written — and a dir from a PRE-fix
-/// build is never reused, because the dir's name is a tag over the runner
-/// exe's and the CLI source's size+mtime ([`identity_build_tag`]). What this
-/// re-check guards is a CLI that goes bad AFTER delivery: an in-place
-/// truncation written through a hard link shared with the source, AV or
-/// tamper damage, or a future change to the tag's inputs. A dir whose marker
-/// exists is served by [`materialize_identity`]'s fast path with no rewrite at
-/// all, so without this such a file would stay on every terminal's PATH for
-/// the life of the build. Repair = remove it and re-deliver only a validated
-/// source; an absent CLI is left absent. Cost: one stat per spawn, plus a
-/// 4-byte header read when the file is present.
-fn repair_session_cli_if_unpublishable(dir: &Path) -> Option<SessionCliDelivery> {
+/// The marker does not wait for the CLI, so this is where three cases get
+/// handled: a CLI whose first delivery failed on I/O is retried; one that
+/// appears beside the runner exe after the dir was sealed (a
+/// `cargo build --bin qontinui-pr` while the runner runs) is delivered; and a
+/// published copy damaged after delivery (an in-place truncation through a
+/// hard link shared with the source, AV or tamper damage) is repaired.
+///
+/// Cost: one stat, plus a 4-byte header read when the file is present. A dir
+/// that needs delivery also pays at most one attempt per
+/// [`SESSION_CLI_RETRY_INTERVAL`].
+fn reconcile_session_cli_if_due(dir: &Path) -> Option<SessionCliDelivery> {
+    reconcile_session_cli_at(dir, std::time::Instant::now(), materialize_session_cli)
+}
+
+/// [`reconcile_session_cli_if_due`] with the clock and the delivery injected,
+/// so tests drive it with their own source and time.
+fn reconcile_session_cli_at(
+    dir: &Path,
+    now: std::time::Instant,
+    deliver: impl FnOnce(&Path) -> SessionCliDelivery,
+) -> Option<SessionCliDelivery> {
     let dest = dir.join(SESSION_CLI_BIN);
-    let unpublishable = |dest: &Path| match native_executable::check(dest, ExecutableFormat::host())
-    {
-        Ok(_) | Err(NotExecutable::Missing) => None,
-        Err(why) => Some(why),
-    };
-    unpublishable(&dest)?;
+    let needs =
+        || session_cli_needs_delivery(&native_executable::check(&dest, ExecutableFormat::host()));
+    if !needs() || !session_cli_retry_due(dir, now) {
+        return None;
+    }
     let _guard = IDENTITY_MATERIALIZE_LOCK.lock();
-    // Re-check under the lock: a peer spawn may have just repaired it.
-    let why = unpublishable(&dest)?;
-    tracing::warn!(
-        path = %dest.display(),
-        reason = %why,
-        "session cli: the published {SESSION_CLI_BIN} is not a runnable executable — repairing \
-         (an empty one exits 0 having opened no PR)"
-    );
-    Some(materialize_session_cli(dir))
+    // Re-check under the lock: a peer spawn may have just delivered it.
+    if !needs() {
+        return None;
+    }
+    Some(deliver(dir))
+}
+
+/// Whether `dir` may have a fast-path delivery attempt at `now`, recording the
+/// attempt when it may. See [`SESSION_CLI_RETRY_INTERVAL`].
+fn session_cli_retry_due(dir: &Path, now: std::time::Instant) -> bool {
+    let mut attempts = SESSION_CLI_RETRIES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let expired =
+        |at: &std::time::Instant| now.saturating_duration_since(*at) >= SESSION_CLI_RETRY_INTERVAL;
+    if let Some(entry) = attempts.iter_mut().find(|(d, _)| d == dir) {
+        if !expired(&entry.1) {
+            return false;
+        }
+        entry.1 = now;
+        return true;
+    }
+    if attempts.len() >= SESSION_CLI_RETRY_CAP {
+        attempts.retain(|(_, at)| !expired(at));
+    }
+    attempts.push((dir.to_path_buf(), now));
+    true
 }
 
 /// Render an identity shim template by substituting its `@@…@@` placeholders.
@@ -945,8 +1026,13 @@ pub fn materialize_persistent_identity() -> Result<PathBuf, String> {
     copy_exe_stub(&dir, PERSISTENT_IDENTITY_TOOL);
     let stub = dir.join(format!("{PERSISTENT_IDENTITY_TOOL}.exe"));
     // A runnable image, not merely a file: an empty `claude.exe` on the USER
-    // PATH would be the persistent twin of the 0-byte `qontinui-pr` defect.
-    if native_executable::check(&stub, ExecutableFormat::host()).is_err() {
+    // PATH would be the persistent twin of the 0-byte `qontinui-pr` defect. A
+    // definitely unrunnable one already there (this dir may be on the USER
+    // PATH from an earlier install) is removed before refusing.
+    if let Err(why) = native_executable::check(&stub, ExecutableFormat::host()) {
+        if is_definite_refusal(&why) {
+            let _ = std::fs::remove_file(&stub);
+        }
         return Err(format!(
             "the qontinui-shim stub could not be copied to {} — it is not next to the runner \
              executable (a dev build without `cargo build --bin qontinui-shim`?). Refusing to \
@@ -983,10 +1069,14 @@ pub fn persistent_identity_installed() -> Result<bool, String> {
     let Some(dir) = qontinui_runner_lib::profile_cli::identity_shim_dir() else {
         return Ok(false);
     };
+    // A runnable image, the same test `materialize_persistent_identity`
+    // applies: an empty `claude.exe` is not "installed".
     #[cfg(target_os = "windows")]
-    let stub_present = dir
-        .join(format!("{PERSISTENT_IDENTITY_TOOL}.exe"))
-        .is_file();
+    let stub_present = native_executable::check(
+        &dir.join(format!("{PERSISTENT_IDENTITY_TOOL}.exe")),
+        ExecutableFormat::host(),
+    )
+    .is_ok();
     #[cfg(not(target_os = "windows"))]
     let stub_present = false;
     if !stub_present {
@@ -2009,34 +2099,155 @@ mod session_cli_tests {
     }
 
     #[test]
-    fn repair_leaves_a_sound_or_absent_cli_alone() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path();
-        // Absent: nothing to repair, and nothing is delivered in its place.
-        assert_eq!(repair_session_cli_if_unpublishable(dir), None);
-        assert!(!dir.join(SESSION_CLI_BIN).exists());
-        // Sound: untouched.
-        write_executable(&dir.join(SESSION_CLI_BIN), &native_image());
-        assert_eq!(repair_session_cli_if_unpublishable(dir), None);
+    fn a_runnable_published_copy_is_kept_whatever_the_source_says() {
+        // Never delete a working CLI: a sound copy stays, byte for byte, when
+        // the source has since vanished or been replaced by a placeholder.
+        for src_bytes in [None, Some(&b""[..])] {
+            let (_tmp, src, identity) = fixture(&native_image());
+            let dest = identity.join(SESSION_CLI_BIN);
+            write_executable(&dest, &native_image());
+            match src_bytes {
+                None => std::fs::remove_file(&src).unwrap(),
+                Some(bytes) => write_executable(&src, bytes),
+            }
+            assert_eq!(
+                deliver_session_cli(Some(&src), &identity),
+                SessionCliDelivery::Delivered
+            );
+            assert_eq!(std::fs::read(&dest).unwrap(), native_image());
+        }
+    }
+
+    #[test]
+    fn delivery_leaves_no_staging_file_behind() {
+        let (_tmp, src, identity) = fixture(&native_image());
         assert_eq!(
-            std::fs::read(dir.join(SESSION_CLI_BIN)).unwrap(),
-            native_image()
+            deliver_session_cli(Some(&src), &identity),
+            SessionCliDelivery::Delivered
+        );
+        let names: Vec<String> = std::fs::read_dir(&identity)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![SESSION_CLI_BIN.to_string()]);
+    }
+
+    #[test]
+    fn an_obstruction_at_the_cli_path_fails_without_a_partial_copy() {
+        // A directory where the CLI goes cannot be replaced by the rename.
+        let (_tmp, src, identity) = fixture(&native_image());
+        let dest = identity.join(SESSION_CLI_BIN);
+        std::fs::create_dir(&dest).unwrap();
+        assert!(matches!(
+            deliver_session_cli(Some(&src), &identity),
+            SessionCliDelivery::Failed(ref d) if d.starts_with("rename ")
+        ));
+        assert!(dest.is_dir(), "the obstruction is reported, not destroyed");
+        assert_eq!(
+            std::fs::read_dir(&identity).unwrap().count(),
+            1,
+            "no staging file is left behind"
         );
     }
 
     #[test]
-    fn repair_removes_an_unpublishable_cli() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dest = tmp.path().join(SESSION_CLI_BIN);
-        write_executable(&dest, b"");
-        let outcome = repair_session_cli_if_unpublishable(tmp.path());
-        assert!(outcome.is_some(), "a 0-byte CLI must trigger a re-delivery");
-        // Whatever the re-delivery found beside the test executable, what is
-        // left is either nothing or a runnable image — never the empty file.
-        match std::fs::metadata(&dest) {
-            Err(_) => {}
-            Ok(_) => assert!(native_executable::check(&dest, ExecutableFormat::host()).is_ok()),
+    fn only_a_missing_or_definitely_unrunnable_cli_needs_delivery() {
+        assert!(!session_cli_needs_delivery(&Ok(64)));
+        assert!(
+            !session_cli_needs_delivery(&Err(NotExecutable::Unreadable(
+                "sharing violation".into()
+            ))),
+            "an I/O error is not a verdict: a working CLI must not be deleted on one"
+        );
+        for why in [
+            NotExecutable::Missing,
+            NotExecutable::NotAFile,
+            NotExecutable::Empty,
+            NotExecutable::WrongFormat {
+                len: 17,
+                expected: ExecutableFormat::host(),
+            },
+            NotExecutable::NoExecutePermission,
+        ] {
+            assert!(session_cli_needs_delivery(&Err(why.clone())), "{why:?}");
         }
+        assert!(!is_definite_refusal(&NotExecutable::Missing));
+        assert!(!is_definite_refusal(&NotExecutable::Unreadable("x".into())));
+    }
+
+    #[test]
+    fn reconcile_leaves_a_runnable_cli_alone() {
+        let (_tmp, _src, identity) = fixture(&native_image());
+        write_executable(&identity.join(SESSION_CLI_BIN), &native_image());
+        let t0 = std::time::Instant::now();
+        assert_eq!(
+            reconcile_session_cli_at(&identity, t0, |_| panic!(
+                "a runnable CLI must not be re-delivered"
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn reconcile_delivers_a_cli_the_sealed_dir_lacks_then_goes_quiet() {
+        // A dir sealed while its CLI could not be delivered (an I/O failure,
+        // or no source yet): the fast path delivers it once a source is sound.
+        let (_tmp, src, identity) = fixture(&native_image());
+        let t0 = std::time::Instant::now();
+        assert_eq!(
+            reconcile_session_cli_at(&identity, t0, |d| deliver_session_cli(Some(&src), d)),
+            Some(SessionCliDelivery::Delivered)
+        );
+        assert!(native_executable::check(
+            &identity.join(SESSION_CLI_BIN),
+            ExecutableFormat::host()
+        )
+        .is_ok());
+        assert_eq!(
+            reconcile_session_cli_at(&identity, t0 + SESSION_CLI_RETRY_INTERVAL * 2, |_| {
+                panic!("delivered: nothing left to do")
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn reconcile_is_spaced_while_delivery_keeps_failing() {
+        let (_tmp, src, identity) = fixture(&native_image());
+        std::fs::remove_file(&src).unwrap();
+        let deliver = |d: &Path| deliver_session_cli(Some(&src), d);
+        let t0 = std::time::Instant::now();
+        assert_eq!(
+            reconcile_session_cli_at(&identity, t0, deliver),
+            Some(SessionCliDelivery::SourceMissing)
+        );
+        assert_eq!(
+            reconcile_session_cli_at(&identity, t0 + std::time::Duration::from_secs(1), deliver),
+            None,
+            "a second attempt inside the interval is skipped"
+        );
+        assert_eq!(
+            reconcile_session_cli_at(&identity, t0 + SESSION_CLI_RETRY_INTERVAL, deliver),
+            Some(SessionCliDelivery::SourceMissing)
+        );
+    }
+
+    #[test]
+    fn retry_spacing_is_per_dir() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let t0 = std::time::Instant::now();
+        let t1 = t0 + std::time::Duration::from_secs(1);
+        assert!(session_cli_retry_due(a.path(), t0));
+        assert!(!session_cli_retry_due(a.path(), t1));
+        assert!(
+            session_cli_retry_due(b.path(), t1),
+            "one dir's attempt must never defer another's"
+        );
+        assert!(session_cli_retry_due(
+            a.path(),
+            t0 + SESSION_CLI_RETRY_INTERVAL
+        ));
     }
 
     /// End to end through the public entry point, and written WITHOUT any
@@ -2070,34 +2281,9 @@ mod session_cli_tests {
     }
 
     #[test]
-    fn only_a_transient_failure_leaves_the_dir_unsealed() {
-        use SessionCliDelivery as D;
-        // Verdicts seal: re-running delivery would decide the same thing.
-        assert!(session_cli_outcome_seals_the_dir(&D::Delivered));
-        assert!(session_cli_outcome_seals_the_dir(&D::SourceMissing));
-        assert!(session_cli_outcome_seals_the_dir(&D::SourceRefused(
-            NotExecutable::Empty
-        )));
-        assert!(session_cli_outcome_seals_the_dir(&D::DestRefused(
-            NotExecutable::Empty
-        )));
-        // I/O errors do not: the next spawn must be allowed to retry.
-        assert!(!session_cli_outcome_seals_the_dir(&D::Failed(
-            "copy: disk full".into()
-        )));
-        assert!(!session_cli_outcome_seals_the_dir(&D::SourceRefused(
-            NotExecutable::Unreadable("sharing violation".into())
-        )));
-        assert!(!session_cli_outcome_seals_the_dir(&D::DestRefused(
-            NotExecutable::Unreadable("sharing violation".into())
-        )));
-    }
-
-    #[test]
-    fn a_transient_delivery_failure_does_not_seal_the_identity_dir() {
+    fn a_failed_delivery_still_seals_the_dir_and_the_fast_path_retries() {
         let tmp = tempfile::tempdir().unwrap();
-        // Make delivery fail on I/O: a DIRECTORY where the CLI goes cannot be
-        // removed with remove_file, so the delivery ends `Failed`.
+        // Make delivery fail: a DIRECTORY where the CLI goes cannot be replaced.
         let dir = identity_dir(tmp.path());
         std::fs::create_dir_all(dir.join(SESSION_CLI_BIN)).unwrap();
 
@@ -2107,8 +2293,31 @@ mod session_cli_tests {
             assert!(dir.join(tool).is_file(), "{tool} shim still written");
         }
         assert!(
-            !dir.join(IDENTITY_MARKER).exists(),
-            "a transient failure must leave the dir unsealed so the next spawn retries"
+            dir.join(IDENTITY_MARKER).exists(),
+            "the CLI must not gate the marker: an unsealed dir makes every spawn \
+             pay the full rewrite"
+        );
+        assert_eq!(
+            identity_dir_if_materialized(tmp.path()),
+            Some(dir.clone()),
+            "the config report must agree with what the spawn seam prepends"
+        );
+
+        // The obstruction clears; the fast path's reconcile delivers.
+        std::fs::remove_dir(dir.join(SESSION_CLI_BIN)).unwrap();
+        let src_dir = tmp.path().join("runner-exe-dir");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join(SESSION_CLI_BIN);
+        write_executable(&src, &native_image());
+        assert_eq!(
+            reconcile_session_cli_at(&dir, std::time::Instant::now(), |d| {
+                deliver_session_cli(Some(&src), d)
+            }),
+            Some(SessionCliDelivery::Delivered)
+        );
+        assert_eq!(
+            std::fs::read(dir.join(SESSION_CLI_BIN)).unwrap(),
+            native_image()
         );
     }
 }
