@@ -70,6 +70,19 @@ pub enum DispatchError {
 
     #[error("app returned non-JSON response: {0}")]
     InvalidJson(String),
+
+    /// The app ANSWERED over HTTP with `{success:false, error, code?}` — an
+    /// app-reported failure, not a transport one. `code` is the app's own
+    /// machine-readable code (`code`, else `errorCode`) when it sent one, so a
+    /// caller can hand it on instead of flattening it into a message. Display
+    /// matches the `HttpStatus` form this case used to be reported as.
+    #[error("http dispatch to '{url}' returned status {status}: {error}")]
+    AppAnswered {
+        url: String,
+        status: u16,
+        error: String,
+        code: Option<String>,
+    },
 }
 
 impl DispatchError {
@@ -317,10 +330,15 @@ impl AppDispatcher {
                 .and_then(|v| v.as_str())
                 .unwrap_or("Unknown error from SDK app")
                 .to_string();
-            return Err(DispatchError::HttpStatus {
+            let code = ["code", "errorCode"]
+                .into_iter()
+                .find_map(|k| json.get(k).and_then(|v| v.as_str()))
+                .map(String::from);
+            return Err(DispatchError::AppAnswered {
                 url,
                 status: status.as_u16(),
-                body: msg,
+                error: msg,
+                code,
             });
         }
         if !status.is_success() && json.get("success").is_none() {
