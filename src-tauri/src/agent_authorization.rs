@@ -1708,7 +1708,19 @@ pub enum FanoutAdmission {
     /// Coord's device drain deferred this spawn. **Transient**, like
     /// `SlotUnavailable`: never a task failure — retry once the drain lifts.
     /// Decided before the gate is touched, so no slot is taken.
-    DeferredByDrain { reason: String },
+    ///
+    /// `class` is carried alongside `reason` deliberately. `reason` is
+    /// operator-readable free text and two of its three producers embed a
+    /// counter or an age, so it changes on every read of an unchanged
+    /// condition — see [`crate::coord_drain_state::DrainTracker::miss`] and
+    /// [`crate::coord_drain_state::effective_state`]. A caller that wants to
+    /// know whether this is the SAME deferral it saw last tick (a log rate
+    /// limiter, a memo) must read `class`; comparing `reason` answers a
+    /// different question.
+    DeferredByDrain {
+        reason: String,
+        class: crate::coord_drain_state::DeferClass,
+    },
 }
 
 /// Authorize ONE `parallel_fanout` spawn and admit it against the declared
@@ -1742,10 +1754,10 @@ pub async fn authorize_fanout_spawn_with_budget(
     let path = SpawnPath::ParallelFanout;
     // The drain first: a deferred spawn must neither cost a registry lookup
     // nor take (or queue for) a fan-out slot.
-    if let Some(SpawnDecision::DeferredByDrain { reason, .. }) =
+    if let Some(SpawnDecision::DeferredByDrain { reason, class }) =
         drain_admission(agent_name, path, &admission.into())
     {
-        return FanoutAdmission::DeferredByDrain { reason };
+        return FanoutAdmission::DeferredByDrain { reason, class };
     }
     let resolved = CACHE.resolve_at(Instant::now(), fetch_effective).await;
     let verdict = decide(resolved.as_resolution(), agent_name, path);
