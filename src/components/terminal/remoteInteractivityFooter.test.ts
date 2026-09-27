@@ -9,6 +9,7 @@ import {
   INPUT_ACK_DEADLINE_MS,
   inputAwaitingAck,
   remoteInteractivityFooter,
+  type RemoteInputAck,
   type RemoteInteractivitySnapshot,
 } from "./remoteTabs";
 
@@ -19,6 +20,7 @@ function snap(over: Partial<RemoteInteractivitySnapshot> = {}): RemoteInteractiv
     attachedAtMs: NOW - 60_000,
     lastInputSent: null,
     lastInputAcked: null,
+    lastProbeAcked: null,
     acksReceived: 0,
     acksSinceAttach: 0,
     lastProbeSent: null,
@@ -27,9 +29,7 @@ function snap(over: Partial<RemoteInteractivitySnapshot> = {}): RemoteInteractiv
   };
 }
 
-function acked(
-  over: Partial<NonNullable<RemoteInteractivitySnapshot["lastInputAcked"]>> = {},
-): NonNullable<RemoteInteractivitySnapshot["lastInputAcked"]> {
+function acked(over: Partial<RemoteInputAck> = {}): RemoteInputAck {
   return {
     seq: 1,
     atMs: NOW - 1_000,
@@ -55,6 +55,7 @@ describe("remoteInteractivityFooter", () => {
         lastInputSent: { seq: 1, atMs: NOW - 1_200, bytes: 1 },
         lastInputAcked: acked(),
         acksReceived: 1,
+        acksSinceAttach: 1,
       }),
       NOW,
       "merytshost",
@@ -69,6 +70,7 @@ describe("remoteInteractivityFooter", () => {
         lastInputSent: { seq: 2, atMs: NOW - (INPUT_ACK_DEADLINE_MS - 1), bytes: 1 },
         lastInputAcked: acked(),
         acksReceived: 1,
+        acksSinceAttach: 1,
       }),
       NOW,
       "merytshost",
@@ -82,6 +84,7 @@ describe("remoteInteractivityFooter", () => {
         lastInputSent: { seq: 2, atMs: NOW - INPUT_ACK_DEADLINE_MS, bytes: 1 },
         lastInputAcked: acked(),
         acksReceived: 1,
+        acksSinceAttach: 1,
       }),
       NOW,
       "merytshost",
@@ -108,6 +111,7 @@ describe("remoteInteractivityFooter", () => {
         lastInputSent: { seq: 3, atMs: NOW - 2_000, bytes: 1 },
         lastInputAcked: acked({ seq: 3, accepted: false, error: "terminal_exited" }),
         acksReceived: 3,
+        acksSinceAttach: 3,
       }),
       NOW,
       "spaceship",
@@ -119,11 +123,48 @@ describe("remoteInteractivityFooter", () => {
 
   it("a probe ack is labelled as a probe, not a keystroke", () => {
     const f = remoteInteractivityFooter(
-      snap({ lastInputAcked: acked({ via: "probe", bytes: 0 }), acksReceived: 1 }),
+      snap({
+        lastProbeAcked: acked({ via: "probe", bytes: 0 }),
+        acksReceived: 1,
+        acksSinceAttach: 1,
+      }),
       NOW,
       "x",
     );
-    expect(f.summary).toContain("input path probed 1s ago");
+    expect(f.summary).toContain("no input sent yet (input path probed 1s ago)");
+  });
+
+  it("an accepted probe after a refused keystroke leaves the refusal visible", () => {
+    const f = remoteInteractivityFooter(
+      snap({
+        lastInputSent: { seq: 4, atMs: NOW - 3_000, bytes: 1 },
+        lastInputAcked: acked({ seq: 4, accepted: false, error: "terminal_exited" }),
+        lastProbeAcked: acked({ seq: 5, via: "probe", bytes: 0, atMs: NOW - 500 }),
+        acksReceived: 2,
+        acksSinceAttach: 2,
+      }),
+      NOW,
+      "spaceship",
+    );
+    expect(f.summary).toContain("last keystroke rejected");
+    expect(f.note).toBe("input rejected by spaceship: terminal_exited");
+  });
+
+  it("after a reattach with no ack yet, an overdue keystroke is an honest unknown", () => {
+    const f = remoteInteractivityFooter(
+      snap({
+        lastInputSent: { seq: 9, atMs: NOW - 10_000, bytes: 1 },
+        lastInputAcked: acked({ seq: 8, atMs: NOW - 60_000 }),
+        acksReceived: 8,
+        acksSinceAttach: 0,
+      }),
+      NOW,
+      "spaceship",
+    );
+    expect(f.note).toBe(
+      "target has not acknowledged input since reattach (possibly an older build)",
+    );
+    expect(f.noteKind).toBe("info");
   });
 
   it("no frame received yet reads as no output yet", () => {
