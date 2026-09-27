@@ -1965,7 +1965,9 @@ pub fn input_ack_frame(
             frame["error"] = json!(code);
             frame["error_detail"] = json!(crate::str_utils::truncate_str_ellipsis(
                 detail,
-                INPUT_ACK_ERROR_DETAIL_MAX_BYTES
+                // The ellipsis adds 3 bytes when it truncates; reserve them so
+                // the result is <= the cap.
+                INPUT_ACK_ERROR_DETAIL_MAX_BYTES - 3,
             ));
         }
     }
@@ -3757,7 +3759,7 @@ mod tests {
         assert_eq!(ack["error"], "input_write_failed");
         let detail = ack["error_detail"].as_str().unwrap();
         assert!(
-            detail.len() <= INPUT_ACK_ERROR_DETAIL_MAX_BYTES + 3,
+            detail.len() <= INPUT_ACK_ERROR_DETAIL_MAX_BYTES,
             "{}",
             detail.len()
         );
