@@ -105,6 +105,28 @@ pub(crate) struct CiDispatchPayload {
     /// the active profile's coord base.
     #[serde(default)]
     pub coord_http_url: String,
+    /// The progress phases the dispatching coord's progress route honours
+    /// (coord `ci_dispatch::PROGRESS_PHASES`). Absent on a payload from a
+    /// coord that predates queue heartbeats; see
+    /// [`CiDispatchPayload::coord_accepts_queue_heartbeat`].
+    #[serde(default)]
+    pub progress_phases: Vec<String>,
+}
+
+impl CiDispatchPayload {
+    /// May this runner renew the lease on this dispatch while it sits QUEUED?
+    ///
+    /// Only when the coord that sent it advertised the `queued` phase. An older
+    /// coord ignores an unknown `phase` field and reads a queue heartbeat as a
+    /// BUILD heartbeat, promoting the row to `running` and stamping
+    /// `started_at` for a build that never began. So an unadvertised coord gets
+    /// no queue heartbeat at all, which is exactly its behaviour before this
+    /// existed: the lease lapses as it always did.
+    pub(crate) fn coord_accepts_queue_heartbeat(&self) -> bool {
+        self.progress_phases
+            .iter()
+            .any(|p| p == reporting::QUEUED_PHASE)
+    }
 }
 
 /// A `events.ci.build_cancelled.<device_id>` payload.

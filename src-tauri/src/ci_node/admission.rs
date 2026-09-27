@@ -13,8 +13,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::{reporting, CiDispatchPayload};
 use crate::settings::CiNodeSettings;
@@ -605,15 +606,29 @@ pub(crate) fn commit_below_floor(available_bytes: u64, floor_gb: u64) -> bool {
     available_bytes / (1024 * 1024 * 1024) < floor_gb
 }
 
+/// A deferred dispatch and when it FIRST entered this device's queue.
+///
+/// `queued_since` survives re-submission: a dispatch popped for re-admission
+/// that defers again goes back in with its original stamp, so a dispatch
+/// bounced between the queue and a failed re-test cannot reset its own clock
+/// and outlive [`QUEUE_RELEASE_AFTER`].
+struct QueuedDispatch {
+    payload: CiDispatchPayload,
+    queued_since: Instant,
+}
+
 struct CiState {
     /// dispatch_id → cancel token for the running build.
     running: HashMap<String, CancellationToken>,
     /// Deferred (at-cap, or below headroom) dispatches, FIFO.
-    queued: VecDeque<CiDispatchPayload>,
+    queued: VecDeque<QueuedDispatch>,
     /// A [`spawn_headroom_waker`] task is in flight. At most one, ever —
     /// otherwise a box that stays under the headroom threshold would accrue one
     /// sleeping task per redelivered dispatch.
     waker_armed: bool,
+    /// A [`spawn_queue_keeper`] task is in flight. At most one, and it disarms
+    /// itself (under this lock) the tick it finds the queue empty.
+    keeper_armed: bool,
 }
 
 fn ci_state() -> &'static Mutex<CiState> {
@@ -623,8 +638,189 @@ fn ci_state() -> &'static Mutex<CiState> {
             running: HashMap::new(),
             queued: VecDeque::new(),
             waker_armed: false,
+            keeper_armed: false,
         })
     })
+}
+
+/// How often the queue-keeper renews coord's lease on every queued dispatch.
+///
+/// Coord's lease is 15 minutes and, before the keeper, a queued dispatch
+/// renewed it NEVER: the runner contacted coord about a deferred dispatch only
+/// once it was admitted, so any deferral longer than the lease was swept `lost`
+/// with `started_at` NULL. That is 26 of the prod ledger's 122 `lost` rows, each
+/// created while another dispatch was live on the same device (plan
+/// `2026-09-27-ci-node-shadow-dispatch-never-passes-checkout-race-lost-leases-unfiltered-selection`
+/// Phase 3). One minute gives fifteen renewals per lease.
+pub(crate) const QUEUE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How long a dispatch may wait in this device's queue before it is RELEASED
+/// back to coord as `cancelled` with reason [`DEFERRED_PAST_LEASE_REASON`].
+///
+/// One coord lease (`LEASE_SECS`, 15 min). Renewing forever would let a
+/// dispatch stuck behind a wedged build hold coord's one-live-dispatch-per-
+/// proposal slot indefinitely, so that proposal could never be dispatched
+/// anywhere else. Releasing it frees the slot for a re-dispatch, and names why
+/// in the ledger instead of leaving a reason-free `lost`. `cancelled` is a
+/// non-verdict for shadow parity, which is exactly what an unrun build is.
+pub(crate) const QUEUE_RELEASE_AFTER: Duration = Duration::from_secs(15 * 60);
+
+/// The `summary.reason` a released queued dispatch carries. A machine token,
+/// not prose, so the ledger can be counted by it.
+pub(crate) const DEFERRED_PAST_LEASE_REASON: &str = "deferred_past_lease";
+
+/// The `summary.reason` for a queued dispatch released because coord refused
+/// its lease renewal (past coord's queued-age ceiling).
+pub(crate) const QUEUED_RENEWAL_REFUSED_REASON: &str = "queued_renewal_refused";
+
+/// Remove and return every queued dispatch that has waited at least
+/// `release_after` as of `now`, preserving the FIFO order of the rest. Pure over
+/// the injected clock, so the release rule is unit-tested without a timer.
+fn take_expired(
+    queue: &mut VecDeque<QueuedDispatch>,
+    now: Instant,
+    release_after: Duration,
+) -> Vec<QueuedDispatch> {
+    let mut expired = Vec::new();
+    let mut kept = VecDeque::with_capacity(queue.len());
+    for q in queue.drain(..) {
+        if now.saturating_duration_since(q.queued_since) >= release_after {
+            expired.push(q);
+        } else {
+            kept.push_back(q);
+        }
+    }
+    *queue = kept;
+    expired
+}
+
+/// Push a deferred dispatch and arm the queue-keeper if none is running.
+/// Returns `(queue depth, keeper newly armed)`; the caller spawns the keeper
+/// OUTSIDE the lock.
+fn enqueue_locked(
+    state: &mut CiState,
+    payload: CiDispatchPayload,
+    queued_since: Option<Instant>,
+) -> (usize, bool) {
+    state.queued.push_back(QueuedDispatch {
+        payload,
+        queued_since: queued_since.unwrap_or_else(Instant::now),
+    });
+    let arm = !state.keeper_armed;
+    if arm {
+        state.keeper_armed = true;
+    }
+    (state.queued.len(), arm)
+}
+
+/// The queue-keeper: every [`QUEUE_HEARTBEAT_INTERVAL`], release what has
+/// waited past [`QUEUE_RELEASE_AFTER`] and renew coord's lease on the rest.
+///
+/// A renewal that reads back a TERMINAL state (coord swept or cancelled the
+/// dispatch) drops it from the queue silently — the ledger is already settled,
+/// and building it would be work nobody will read. A renewal that FAILS keeps
+/// the dispatch queued: the next tick retries, and the release deadline still
+/// bounds how long it can sit.
+fn spawn_queue_keeper() {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(QUEUE_HEARTBEAT_INTERVAL).await;
+            let (expired, renew, emptied) = {
+                let mut state = ci_state().lock().unwrap();
+                let expired = take_expired(&mut state.queued, Instant::now(), QUEUE_RELEASE_AFTER);
+                // Only dispatches whose coord advertised the queued phase are
+                // renewed; see `CiDispatchPayload::coord_accepts_queue_heartbeat`.
+                let renew: Vec<(String, Option<String>)> = state
+                    .queued
+                    .iter()
+                    .filter(|q| q.payload.coord_accepts_queue_heartbeat())
+                    .map(|q| (q.payload.dispatch_id.clone(), report_base(&q.payload)))
+                    .collect();
+                let emptied = state.queued.is_empty();
+                if emptied {
+                    // Disarmed under the same lock a push arms under, so a
+                    // dispatch queued after this point spawns a fresh keeper
+                    // and this one exits after its final releases.
+                    state.keeper_armed = false;
+                }
+                (expired, renew, emptied)
+            };
+            for q in expired {
+                warn!(
+                    "ci_node: releasing dispatch {} for {} after {:?} queued on this device \
+                     (> {QUEUE_RELEASE_AFTER:?}) — reporting cancelled/{DEFERRED_PAST_LEASE_REASON} \
+                     so coord can re-dispatch it",
+                    q.payload.dispatch_id,
+                    q.payload.repo,
+                    q.queued_since.elapsed()
+                );
+                release(&q.payload, DEFERRED_PAST_LEASE_REASON);
+            }
+            for (dispatch_id, base) in renew {
+                let Some(base) = base else {
+                    warn!("ci_node: no coord base to renew queued dispatch {dispatch_id}");
+                    continue;
+                };
+                match reporting::post_queued_heartbeat(&base, &dispatch_id).await {
+                    reporting::QueueHeartbeat::Renewed => {
+                        debug!("ci_node: renewed coord lease on queued dispatch {dispatch_id}");
+                    }
+                    reporting::QueueHeartbeat::Terminal(state) => {
+                        info!(
+                            "ci_node: coord reports queued dispatch {dispatch_id} already \
+                             {state} — dropping it from the queue"
+                        );
+                        remove_queued(&dispatch_id);
+                    }
+                    reporting::QueueHeartbeat::Refused => {
+                        // Still queued here? Then coord will not renew it again;
+                        // release it now rather than let the lease lapse into a
+                        // reason-free `lost`. If it was admitted since the
+                        // snapshot, the refusal is about a running build and
+                        // there is nothing to release.
+                        if let Some(q) = remove_queued(&dispatch_id) {
+                            warn!(
+                                "ci_node: coord refused the lease renewal for queued dispatch \
+                                 {dispatch_id} — releasing it as \
+                                 cancelled/{QUEUED_RENEWAL_REFUSED_REASON}"
+                            );
+                            release(&q.payload, QUEUED_RENEWAL_REFUSED_REASON);
+                        }
+                    }
+                    reporting::QueueHeartbeat::Failed(why) => {
+                        warn!(
+                            "ci_node: lease renewal for queued dispatch {dispatch_id} failed \
+                             ({why}); retrying next tick"
+                        );
+                    }
+                }
+            }
+            if emptied {
+                return;
+            }
+        }
+    });
+}
+
+/// Remove one dispatch from the queue, returning it if it was there.
+fn remove_queued(dispatch_id: &str) -> Option<QueuedDispatch> {
+    let mut state = ci_state().lock().unwrap();
+    let pos = state
+        .queued
+        .iter()
+        .position(|q| q.payload.dispatch_id == dispatch_id)?;
+    state.queued.remove(pos)
+}
+
+/// Hand a queued dispatch back to coord as `cancelled` with a machine reason.
+fn release(payload: &CiDispatchPayload, reason: &str) {
+    if let Some(base) = report_base(payload) {
+        reporting::post_cancelled_result_detached(
+            base,
+            payload.dispatch_id.clone(),
+            reason.to_string(),
+        );
+    }
 }
 
 /// `(running, queued)` — this device's live CI occupancy, for the A1 resource
@@ -657,6 +853,12 @@ fn reject(payload: &CiDispatchPayload, reason: String) {
 
 /// Entry point from the WS subscription for `build_requested`.
 pub(crate) fn submit(payload: CiDispatchPayload) {
+    admit(payload, None);
+}
+
+/// Admission proper. `queued_since` is `Some` when this is a RE-admission of a
+/// dispatch popped off the queue, so a second deferral keeps its first stamp.
+fn admit(payload: CiDispatchPayload, queued_since: Option<Instant>) {
     // Identifier safety FIRST: an unsafe dispatch_id can't even be reported
     // (it rides the result URL path), so it is dropped with a log only.
     if !super::dispatch_id_is_safe(&payload.dispatch_id) {
@@ -690,7 +892,7 @@ pub(crate) fn submit(payload: CiDispatchPayload) {
             || state
                 .queued
                 .iter()
-                .any(|p| p.dispatch_id == payload.dispatch_id)
+                .any(|q| q.payload.dispatch_id == payload.dispatch_id)
         {
             info!(
                 "ci_node: duplicate dispatch {} ignored (already running/queued)",
@@ -711,9 +913,9 @@ pub(crate) fn submit(payload: CiDispatchPayload) {
         Admission::Reject(reason) => reject(&payload, reason),
         Admission::Defer => {
             let (dispatch_id, repo) = (payload.dispatch_id.clone(), payload.repo.clone());
-            let (depth, needs_waker) = {
+            let (depth, needs_waker, needs_keeper) = {
                 let mut state = ci_state().lock().unwrap();
-                state.queued.push_back(payload);
+                let (_, needs_keeper) = enqueue_locked(&mut state, payload, queued_since);
                 // An at-cap defer is drained by `on_build_finished` — something
                 // is running, so something will finish. A HEADROOM defer has no
                 // such guarantee: with nothing running, nothing will ever
@@ -724,7 +926,7 @@ pub(crate) fn submit(payload: CiDispatchPayload) {
                 if needs {
                     state.waker_armed = true;
                 }
-                (state.queued.len(), needs)
+                (state.queued.len(), needs, needs_keeper)
             };
             info!(
                 "ci_node: deferring dispatch {dispatch_id} for {repo} (queue depth {depth}, \
@@ -733,8 +935,11 @@ pub(crate) fn submit(payload: CiDispatchPayload) {
             if needs_waker {
                 spawn_headroom_waker();
             }
+            if needs_keeper {
+                spawn_queue_keeper();
+            }
         }
-        Admission::Proceed => start_build(payload, settings, host, max_concurrent),
+        Admission::Proceed => start_build(payload, settings, host, max_concurrent, queued_since),
     }
 }
 
@@ -765,12 +970,12 @@ fn spawn_headroom_waker() {
                 None
             }
         };
-        if let Some(payload) = next {
+        if let Some(q) = next {
             info!(
                 "ci_node: re-testing headroom for deferred dispatch {}",
-                payload.dispatch_id
+                q.payload.dispatch_id
             );
-            submit(payload);
+            admit(q.payload, Some(q.queued_since));
         }
     });
 }
@@ -780,12 +985,14 @@ fn spawn_headroom_waker() {
 ///
 /// `host` and `max_concurrent` are the probe and resolved capacity `submit`
 /// admitted against; they are threaded through so the re-check and the
-/// executor's per-dispatch host share use the same N.
+/// executor's per-dispatch host share use the same N. `queued_since` is carried
+/// for the slot-race re-defer below, so it keeps the dispatch's original stamp.
 fn start_build(
     payload: CiDispatchPayload,
     settings: CiNodeSettings,
     host: super::host_sizing::HostCapacity,
     max_concurrent: u32,
+    queued_since: Option<Instant>,
 ) {
     let Some(root) = crate::agent_runtime::qontinui_root_dir() else {
         reject(
@@ -851,12 +1058,13 @@ fn start_build(
         // Re-check the cap under the lock (submit's read was unlocked
         // in-between for the disk probe).
         if state.running.len() >= max_concurrent.max(1) as usize {
+            let dispatch_id = payload.dispatch_id.clone();
+            let (_, needs_keeper) = enqueue_locked(&mut state, payload, queued_since);
             drop(state);
-            info!(
-                "ci_node: slot taken while gating — deferring dispatch {}",
-                payload.dispatch_id
-            );
-            ci_state().lock().unwrap().queued.push_back(payload);
+            info!("ci_node: slot taken while gating — deferring dispatch {dispatch_id}");
+            if needs_keeper {
+                spawn_queue_keeper();
+            }
             return;
         }
         state
@@ -884,12 +1092,12 @@ fn on_build_finished(dispatch_id: &str) {
         state.running.remove(dispatch_id);
         state.queued.pop_front()
     };
-    if let Some(payload) = next {
+    if let Some(q) = next {
         info!(
             "ci_node: slot freed by {} — re-admitting deferred dispatch {}",
-            dispatch_id, payload.dispatch_id
+            dispatch_id, q.payload.dispatch_id
         );
-        submit(payload);
+        admit(q.payload, Some(q.queued_since));
     }
 }
 
@@ -903,9 +1111,9 @@ pub(crate) fn cancel(dispatch_id: &str) {
         } else {
             let before = state.queued.len();
             let mut removed: Option<CiDispatchPayload> = None;
-            state.queued.retain(|p| {
-                if p.dispatch_id == dispatch_id {
-                    removed = Some(p.clone());
+            state.queued.retain(|q| {
+                if q.payload.dispatch_id == dispatch_id {
+                    removed = Some(q.payload.clone());
                     false
                 } else {
                     true
@@ -972,6 +1180,108 @@ pub(crate) fn cancel_all_for_shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn queued_payload(id: &str) -> CiDispatchPayload {
+        serde_json::from_value(serde_json::json!({
+            "dispatch_id": id,
+            "repo": "qontinui/qontinui-runner",
+            "head_sha": "0123456789abcdef0123456789abcdef01234567",
+            "fetch_url": "https://coord.example/git/qontinui/qontinui-runner.git",
+            "candidate_ref": "refs/heads/merge-candidate/x",
+            "check_name": "qontinui-ci-node/shadow",
+            "manifest_path": ".qontinui/ci.toml",
+            "coord_http_url": "https://coord.example"
+        }))
+        .expect("fixture payload parses")
+    }
+
+    /// REGRESSION (plan 2026-09-27 Phase 3): a deferred dispatch used to sit in
+    /// the queue with no coord contact until its lease lapsed. The release rule
+    /// hands back exactly the entries that have waited a full lease, oldest
+    /// first, and keeps the rest in FIFO order.
+    #[test]
+    fn a_dispatch_queued_past_one_lease_is_released_and_younger_ones_stay() {
+        // "now" sits in the future of every stamp, so no `Instant` subtraction
+        // can underflow however recently the host booted.
+        let base = Instant::now();
+        let now = base + Duration::from_secs(20 * 60);
+        let mut q: VecDeque<QueuedDispatch> = VecDeque::new();
+        for (id, age_secs) in [
+            ("old-a", 16 * 60),
+            ("young-b", 60),
+            ("edge-c", 15 * 60),
+            ("young-d", 0),
+        ] {
+            q.push_back(QueuedDispatch {
+                payload: queued_payload(id),
+                queued_since: now - Duration::from_secs(age_secs),
+            });
+        }
+        let released = take_expired(&mut q, now, QUEUE_RELEASE_AFTER);
+        let released: Vec<&str> = released
+            .iter()
+            .map(|r| r.payload.dispatch_id.as_str())
+            .collect();
+        assert_eq!(released, ["old-a", "edge-c"], "the boundary is inclusive");
+        let kept: Vec<&str> = q.iter().map(|r| r.payload.dispatch_id.as_str()).collect();
+        assert_eq!(
+            kept,
+            ["young-b", "young-d"],
+            "FIFO order of the survivors is kept"
+        );
+    }
+
+    #[test]
+    fn the_queue_keeper_renews_many_times_per_lease_and_releases_at_one_lease() {
+        // Coord's LEASE_SECS: 15 min. The release must not be LATER than the
+        // lease, or coord sweeps the row `lost` first and the reason is lost.
+        const COORD_LEASE: Duration = Duration::from_secs(15 * 60);
+        assert!(QUEUE_RELEASE_AFTER <= COORD_LEASE);
+        assert!(QUEUE_HEARTBEAT_INTERVAL * 5 <= COORD_LEASE);
+        assert_eq!(DEFERRED_PAST_LEASE_REASON, "deferred_past_lease");
+    }
+
+    /// Rollout safety: an older coord reads `phase: "queued"` as a build
+    /// heartbeat and stamps `started_at`, so the runner may queue-heartbeat only
+    /// a dispatch whose coord advertised the phase.
+    #[test]
+    fn queue_heartbeats_go_only_to_a_coord_that_advertised_them() {
+        let legacy = queued_payload("legacy");
+        assert!(
+            !legacy.coord_accepts_queue_heartbeat(),
+            "a payload with no progress_phases is from a coord that would promote the row"
+        );
+        let mut current = queued_payload("current");
+        current.progress_phases = vec!["running".into(), "queued".into()];
+        assert!(current.coord_accepts_queue_heartbeat());
+        let mut running_only = queued_payload("running-only");
+        running_only.progress_phases = vec!["running".into()];
+        assert!(!running_only.coord_accepts_queue_heartbeat());
+    }
+
+    /// A re-admitted dispatch that defers again must keep its FIRST stamp, or
+    /// a queue that keeps bouncing a dispatch would never release it.
+    #[test]
+    fn re_enqueue_keeps_the_original_stamp_and_arms_one_keeper() {
+        let mut state = CiState {
+            running: HashMap::new(),
+            queued: VecDeque::new(),
+            waker_armed: false,
+            keeper_armed: false,
+        };
+        // A stamp from the "future" proves the carried value is used verbatim
+        // rather than replaced by `now()`.
+        let first = Instant::now() + Duration::from_secs(600);
+        let (depth, armed) = enqueue_locked(&mut state, queued_payload("a"), Some(first));
+        assert_eq!((depth, armed), (1, true));
+        assert_eq!(state.queued[0].queued_since, first);
+        let (depth, armed) = enqueue_locked(&mut state, queued_payload("b"), None);
+        assert_eq!((depth, armed), (2, false), "one keeper, ever");
+        assert!(
+            state.queued[1].queued_since < first,
+            "a fresh defer is stamped now"
+        );
+    }
 
     fn settings(enabled: bool, allow: &[&str], cap: u32) -> CiNodeSettings {
         CiNodeSettings {
