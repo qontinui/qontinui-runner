@@ -106,10 +106,10 @@ Import of `<workspace-root>/qontinui-claude-config/.claude/commands/*.md` as run
 
 ### 11. `session_cli`
 
-The `qontinui-pr` session CLI, copied from beside the runner exe onto every runner terminal's PATH (the shared identity-shim dir) so an agent can run `qontinui-pr create` with no personal GitHub login. A dev build answers from the cargo profile dir it was built in; an installed build answers from the installer's `bundle.externalBin` sidecar placed beside the exe. A file that is present but is not a runnable native executable is REFUSED, never published, and named in `rejected`: a 0-byte build placeholder on PATH made `qontinui-pr create` exit 0 having opened no PR, while an absent CLI fails loudly as command-not-found. Unlike the other session-provisioning rows this one is probed read-only from a cold process too, because its source is a single file beside the exe.
+The `qontinui-pr` session CLI on every runner terminal's PATH (the shared identity-shim dir), copied there from beside the runner exe so an agent can run `qontinui-pr create` with no personal GitHub login. The row describes the file a terminal actually RUNS: once this build's identity dir exists it is decided by the published copy on PATH, with the source beside the exe reported alongside (a runnable copy is kept when the source later disappears; a missing copy is re-delivered by a later spawn); before any terminal has spawned it is decided by the source, i.e. what the next spawn would deliver. A dev build (a debug build, or one run from a cargo target dir) answers `exe_relative_checkout`; an installed release build answers from the installer's `bundle.externalBin` sidecar. A file that is present but is not a runnable native executable is REFUSED, never published, and named in `rejected`: a 0-byte build placeholder on PATH made `qontinui-pr create` exit 0 having opened no PR, while an absent CLI fails loudly as command-not-found. Probed read-only, so a cold process answers too.
 
 - Class: `session_provisioning`
-- Resolved by: `shim_materializer::{materialize_session_cli, session_cli_observation} over SESSION_CLI_BIN beside current_exe()`
+- Resolved by: `shim_materializer::{materialize_session_cli, session_cli_observation} over the published SESSION_CLI_BIN, else the one beside current_exe()`
 - Expected rungs: bundle_resource, exe_relative_checkout, unresolved
 
 ---
