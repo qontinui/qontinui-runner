@@ -874,9 +874,9 @@ jobs:
       #   Dirty qontinui-runner: the file
       #   `src-tauri\binaries\qontinui_profile-x86_64-pc-windows-msvc.exe`
       #   has changed (…, 24036100ns after last build at …)
-      # (`tauri.conf.json` `bundle.externalBin`, which this repo's own build.rs
-      # self-provisions as placeholder stubs). Same defect CLASS — the package
-      # is an input to itself — two different files. The conclusion is identical
+      # (`tauri.conf.json` `bundle.externalBin`, which this repo's build.rs
+      # used to self-provision as placeholder stubs). Same defect CLASS — the
+      # package is an input to itself — two different files. The conclusion is identical
       # on both legs and is what this step acts on: never invoke cargo twice.
       # A single `cargo test` never notices, because it only checks freshness
       # once. Splitting into two invocations makes cargo check twice, and the
@@ -892,21 +892,20 @@ jobs:
       # path cargo named there is an `OUT_DIR` codegen asset, so that observed
       # failure is `tauri-build`/`tauri-codegen` (2.5) and is upstream. Scoped
       # to the observation rather than to the leg, because the ours-half
-      # mechanism below exists on ubuntu too: the same
-      # `ensure_sidecar_placeholders()` writes
-      # `qontinui_profile-x86_64-unknown-linux-gnu` under the same gitignore
-      # glob. Ubuntu simply tripped the upstream one first. **The WINDOWS half
-      # IS ours.** That sidecar stub is written by our own
-      # `ensure_sidecar_placeholders()`. It is touch-if-absent rather than an
-      # unconditional rewrite (`if path.exists() { continue; }`), and
-      # `src-tauri/binaries/qontinui_profile-*` is gitignored — so on a fresh CI
-      # checkout it is ALWAYS absent, invocation 1's build script creates it
-      # inside the fingerprint window, and invocation 2 sees it changed.
-      # One-shot rather than perpetual, which is exactly why it never surfaced
-      # under a single `cargo test` and appeared the moment the step was split.
-      # Cheap for us to fix (write the stub before the fingerprint window, or
-      # emit it into `OUT_DIR`) and NOT blocked on upstream, unlike the ubuntu
-      # half. Both recorded as follow-ups rather than worked around silently.
+      # mechanism below existed on ubuntu too. **The WINDOWS half WAS ours, and
+      # is closed.** Its sidecar stub was written by our own
+      # `ensure_sidecar_placeholders()`, touch-if-absent into the gitignored
+      # `src-tauri/binaries/`, so on a fresh CI checkout invocation 1's build
+      # script created it inside the fingerprint window and invocation 2 saw
+      # it changed (one-shot, which is why a single `cargo test` never
+      # surfaced it). Plan
+      # `2026-09-27-qontinui-pr-zero-byte-sidecar-placeholder-published-as-session-cli`
+      # replaced that function with `hide_external_bin_from_tauri_build()`,
+      # which merges `bundle.externalBin: null` into tauri-build's
+      # `TAURI_CONFIG` and writes nothing into `binaries/`, so tauri-build no
+      # longer validates, copies or fingerprints the sidecars at all. The
+      # ubuntu half (the tauri-build/tauri-codegen `OUT_DIR` asset) is
+      # upstream and still open, which is why the split below stays.
       #
       # So the run half executes the binaries the build half ALREADY produced.
       # cargo prints one `Executable \`<path>\`` line per test target under
