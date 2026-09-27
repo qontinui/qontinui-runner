@@ -1523,7 +1523,10 @@ mod tests {
         chmod_x(root, ".claude/skills/coord-revive/probe");
         let m = mirror(root, &url);
         let snapshot = m.refresh().expect("refresh");
-        let loaded = m.load(&snapshot, &[], &["coord-revive"]).expect("load").skills;
+        let loaded = m
+            .load(&snapshot, &[], &["coord-revive"])
+            .expect("load")
+            .skills;
         assert!(
             loaded.skills.contains_key("coord-revive"),
             "fixture must validate"
