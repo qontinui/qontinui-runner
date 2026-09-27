@@ -53,6 +53,11 @@ pub struct AtspiAdapter {
     /// `connect`/`disconnect`, and on drop. A `std` mutex because
     /// `subscribe_events` takes `&self`; never held across an `.await`.
     event_listener: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Whether this connection has asked the AT-SPI registry to have
+    /// application bridges emit the event classes the listener needs (see
+    /// `register_registry_events`). Reset whenever the connection is replaced:
+    /// the registry drops a client's registrations when its bus name vanishes.
+    registry_events_registered: AtomicBool,
 }
 
 impl Drop for AtspiAdapter {
@@ -77,19 +82,64 @@ impl AtspiAdapter {
             next_ref: AtomicU64::new(1),
             connected: AtomicBool::new(false),
             event_listener: Mutex::new(None),
+            registry_events_registered: AtomicBool::new(false),
         }
     }
 
     /// Abort the event listener task, if any. Dropping its match-rule streams
     /// queues their removal from the bus.
     fn stop_event_listener(&self) {
-        let listener = self
-            .event_listener
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        if let Some(handle) = listener {
-            handle.abort();
+        self.replace_event_listener(None);
+    }
+
+    /// Put `next` in the listener slot and abort whatever it displaces, so at
+    /// most one listener (and one set of match-rule streams) exists. The one
+    /// place the slot is written — `stop_event_listener` and
+    /// `subscribe_events` both go through it.
+    fn replace_event_listener(&self, next: Option<tokio::task::JoinHandle<()>>) {
+        let displaced = std::mem::replace(
+            &mut *self
+                .event_listener
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            next,
+        );
+        if let Some(old) = displaced {
+            old.abort();
+        }
+    }
+
+    /// Ask the AT-SPI registry to have application bridges emit focus and
+    /// object events, once per connection.
+    ///
+    /// A match rule only filters what reaches this client; whether a GTK / Qt
+    /// bridge emits an event at all depends on some client having registered
+    /// for it with the registry (`org.a11y.atspi.Registry.RegisterEvent`).
+    /// With no screen reader running, nothing else has, and the listener would
+    /// hear nothing. Only the registry half of the crate's `register_event` is
+    /// used: its match-rule half adds a bus-wide rule that is never removed,
+    /// while the listener's own per-stream rules are removed with the streams.
+    /// A refusal is logged, not returned: the streams still receive whatever
+    /// the bridges emit for other clients.
+    async fn register_registry_events(&self, conn: &AccessibilityConnection) {
+        use atspi::events::focus::FocusEvents;
+        use atspi::events::object::ObjectEvents;
+
+        if self.registry_events_registered.load(Ordering::Acquire) {
+            return;
+        }
+        let focus = conn.add_registry_event::<FocusEvents>().await;
+        let object = conn.add_registry_event::<ObjectEvents>().await;
+        match (focus, object) {
+            (Ok(()), Ok(())) => {
+                self.registry_events_registered
+                    .store(true, Ordering::Release);
+            }
+            (focus, object) => {
+                for e in [focus.err(), object.err()].into_iter().flatten() {
+                    warn!("AT-SPI registry event registration failed: {e}");
+                }
+            }
         }
     }
 
@@ -443,6 +493,8 @@ impl PlatformAdapter for AtspiAdapter {
             .context("Failed to connect to AT-SPI accessibility bus")?;
 
         self.connection = Some(conn);
+        self.registry_events_registered
+            .store(false, Ordering::Release);
 
         // Get the desktop root (registry).
         let registry_addr = AtspiAddress {
@@ -485,6 +537,8 @@ impl PlatformAdapter for AtspiAdapter {
         self.root_address = None;
         self.handle_table.write().await.clear();
         self.connection = None;
+        self.registry_events_registered
+            .store(false, Ordering::Release);
         debug!("AT-SPI adapter disconnected");
         Ok(())
     }
@@ -525,6 +579,7 @@ impl PlatformAdapter for AtspiAdapter {
         let zconn = conn.connection().clone();
 
         self.stop_event_listener();
+        self.register_registry_events(conn).await;
 
         // One stream per AT-SPI event match rule: focus changes, state changes
         // and structural (children) mutations. `for_match_rule` registers the
@@ -560,43 +615,26 @@ impl PlatformAdapter for AtspiAdapter {
                 let header = msg.header();
                 let interface = header.interface().map(|i| i.as_str().to_string());
                 let member = header.member().map(|m| m.as_str().to_string());
-
-                let event = match (interface.as_deref(), member.as_deref()) {
-                    (Some("org.a11y.atspi.Event.Focus"), _) => {
-                        // Focus event — extract sender path as ref placeholder.
-                        let path = header
-                            .path()
-                            .map(|p| p.as_str().to_string())
-                            .unwrap_or_default();
-                        Some(A11yEvent::FocusChanged {
-                            ref_id: path,
-                            node_name: None,
-                        })
-                    }
-                    (Some("org.a11y.atspi.Event.Object"), Some("StateChanged")) => {
-                        let path = header
-                            .path()
-                            .map(|p| p.as_str().to_string())
-                            .unwrap_or_default();
-                        Some(A11yEvent::PropertyChanged {
-                            ref_id: path,
-                            property: "state".to_string(),
-                            old_value: None,
-                            new_value: None,
-                        })
-                    }
-                    (Some("org.a11y.atspi.Event.Object"), Some("ChildrenChanged")) => {
-                        let path = header
-                            .path()
-                            .map(|p| p.as_str().to_string())
-                            .unwrap_or_default();
-                        Some(A11yEvent::StructureChanged {
-                            parent_ref: path,
-                            change_type: StructureChangeType::Subtree,
-                        })
-                    }
-                    _ => None,
+                let path = header
+                    .path()
+                    .map(|p| p.as_str().to_string())
+                    .unwrap_or_default();
+                // Only a state change's detail decides its mapping; skip
+                // decoding every other body.
+                let detail = if member.as_deref() == Some("StateChanged") {
+                    event_detail(&msg)
+                } else {
+                    None
                 };
+
+                let event = map_atspi_signal(
+                    interface.as_deref(),
+                    member.as_deref(),
+                    path,
+                    detail
+                        .as_ref()
+                        .map(|(kind, detail1)| (kind.as_str(), *detail1)),
+                );
 
                 if let Some(evt) = event {
                     if tx.send(evt).await.is_err() {
@@ -607,14 +645,7 @@ impl PlatformAdapter for AtspiAdapter {
             }
         });
 
-        let displaced = self
-            .event_listener
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .replace(listener);
-        if let Some(old) = displaced {
-            old.abort();
-        }
+        self.replace_event_listener(Some(listener));
 
         Ok(Some(rx))
     }
@@ -846,6 +877,67 @@ impl PlatformAdapter for AtspiAdapter {
 // Helper functions
 // ---------------------------------------------------------------------------
 
+/// The `(kind, detail1)` of an AT-SPI event body — e.g. `("focused", 1)` for
+/// `object:state-changed:focused` turning on. GTK and most toolkits send the
+/// `siiva{sv}` body; Qt sends `siiv(so)`. `None` when neither decodes.
+fn event_detail(msg: &zbus::Message) -> Option<(String, i32)> {
+    use atspi::events::{EventBodyOwned, EventBodyQT};
+
+    let body = msg.body();
+    if let Ok(b) = body.deserialize::<EventBodyOwned>() {
+        return Some((b.kind, b.detail1));
+    }
+    body.deserialize::<EventBodyQT>()
+        .ok()
+        .map(|b| (b.kind, b.detail1))
+}
+
+/// Map one AT-SPI signal to an [`A11yEvent`]. Pure, so the mapping is tested
+/// without a bus.
+///
+/// `path` is the emitting object's D-Bus path (carried as the event's ref:
+/// it is not a ref-manager ref, and consumers resolve it themselves).
+/// `detail` is the state-change body's `(kind, detail1)`, when decoded.
+///
+/// Focus arrives two ways. The legacy `Event.Focus:Focus` signal, and — what
+/// current GTK and Qt actually emit — `Event.Object:StateChanged` with kind
+/// `focused` and `detail1 == 1`. Both become `FocusChanged`. A `focused`
+/// state turning OFF (`detail1 == 0`) is the old element losing focus; the
+/// gaining element sends its own `focused`/1, so that one stays an ordinary
+/// state `PropertyChanged`.
+fn map_atspi_signal(
+    interface: Option<&str>,
+    member: Option<&str>,
+    path: String,
+    detail: Option<(&str, i32)>,
+) -> Option<A11yEvent> {
+    match (interface, member) {
+        (Some("org.a11y.atspi.Event.Focus"), _) => Some(A11yEvent::FocusChanged {
+            ref_id: path,
+            node_name: None,
+        }),
+        (Some("org.a11y.atspi.Event.Object"), Some("StateChanged")) => match detail {
+            Some(("focused", 1)) => Some(A11yEvent::FocusChanged {
+                ref_id: path,
+                node_name: None,
+            }),
+            _ => Some(A11yEvent::PropertyChanged {
+                ref_id: path,
+                property: "state".to_string(),
+                old_value: None,
+                new_value: None,
+            }),
+        },
+        (Some("org.a11y.atspi.Event.Object"), Some("ChildrenChanged")) => {
+            Some(A11yEvent::StructureChanged {
+                parent_ref: path,
+                change_type: StructureChangeType::Subtree,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Map AT-SPI `Role` enum to `UnifiedRole`.
 fn map_atspi_role(role: Role) -> UnifiedRole {
     match role {
@@ -968,4 +1060,137 @@ fn determine_patterns(interfaces: &InterfaceSet) -> Vec<InteractionPattern> {
     }
 
     patterns
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OBJECT: Option<&str> = Some("org.a11y.atspi.Event.Object");
+    const PATH: &str = "/org/a11y/atspi/accessible/42";
+
+    fn focus_changed(event: Option<A11yEvent>) -> Option<(String, Option<String>)> {
+        match event {
+            Some(A11yEvent::FocusChanged { ref_id, node_name }) => Some((ref_id, node_name)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn legacy_focus_signal_maps_to_focus_changed() {
+        let ev = map_atspi_signal(
+            Some("org.a11y.atspi.Event.Focus"),
+            Some("Focus"),
+            PATH.into(),
+            None,
+        );
+        assert_eq!(focus_changed(ev), Some((PATH.to_string(), None)));
+    }
+
+    #[test]
+    fn state_changed_focused_on_maps_to_focus_changed() {
+        let ev = map_atspi_signal(
+            OBJECT,
+            Some("StateChanged"),
+            PATH.into(),
+            Some(("focused", 1)),
+        );
+        assert_eq!(focus_changed(ev), Some((PATH.to_string(), None)));
+    }
+
+    #[test]
+    fn state_changed_focused_off_stays_a_property_change() {
+        let ev = map_atspi_signal(
+            OBJECT,
+            Some("StateChanged"),
+            PATH.into(),
+            Some(("focused", 0)),
+        );
+        assert!(matches!(
+            ev,
+            Some(A11yEvent::PropertyChanged { ref ref_id, ref property, .. })
+                if ref_id == PATH && property == "state"
+        ));
+    }
+
+    #[test]
+    fn other_state_changes_and_undecoded_bodies_stay_property_changes() {
+        for detail in [Some(("checked", 1)), Some(("selected", 0)), None] {
+            let ev = map_atspi_signal(OBJECT, Some("StateChanged"), PATH.into(), detail);
+            assert!(
+                matches!(ev, Some(A11yEvent::PropertyChanged { .. })),
+                "{detail:?} -> {ev:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn children_changed_maps_to_structure_changed() {
+        let ev = map_atspi_signal(OBJECT, Some("ChildrenChanged"), PATH.into(), None);
+        assert!(matches!(
+            ev,
+            Some(A11yEvent::StructureChanged { ref parent_ref, .. }) if parent_ref == PATH
+        ));
+    }
+
+    #[test]
+    fn unrelated_signals_are_dropped() {
+        assert!(map_atspi_signal(OBJECT, Some("BoundsChanged"), PATH.into(), None).is_none());
+        assert!(map_atspi_signal(None, None, PATH.into(), None).is_none());
+    }
+
+    /// A stand-in listener: pending forever, holding a sender whose drop
+    /// signals that the task was torn down (aborted and dropped).
+    fn parked_listener() -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let (alive_tx, alive_rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            let _alive = alive_tx;
+            std::future::pending::<()>().await;
+        });
+        (handle, alive_rx)
+    }
+
+    async fn torn_down(alive: tokio::sync::oneshot::Receiver<()>) -> bool {
+        // The sender is only ever dropped, never sent on: Err == torn down.
+        matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), alive).await,
+            Ok(Err(_))
+        )
+    }
+
+    #[tokio::test]
+    async fn replacing_the_listener_tears_the_previous_one_down() {
+        let adapter = AtspiAdapter::new();
+        let (first, first_alive) = parked_listener();
+        adapter.replace_event_listener(Some(first));
+        let (second, mut second_alive) = parked_listener();
+        adapter.replace_event_listener(Some(second));
+
+        assert!(
+            torn_down(first_alive).await,
+            "displaced listener still running"
+        );
+        assert!(
+            matches!(
+                second_alive.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "the new listener must keep running"
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnect_tears_the_listener_down_without_a_bus() {
+        let mut adapter = AtspiAdapter::new();
+        let (listener, alive) = parked_listener();
+        adapter.replace_event_listener(Some(listener));
+
+        adapter.disconnect().await.unwrap();
+
+        assert!(torn_down(alive).await, "listener outlived disconnect");
+        assert!(adapter.event_listener.lock().unwrap().is_none());
+    }
 }
