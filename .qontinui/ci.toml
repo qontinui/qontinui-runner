@@ -153,22 +153,6 @@ cargo_build_jobs = 1
 #
 # MIRRORED WITH A DECLARED ADAPTATION
 #
-# - "Cargo.lock is in sync with the pinned qontinui-schemas" runs
-#   `cargo metadata --locked --format-version 1 > /dev/null` in a bash step.
-#   An argv step has no redirect, and this lane pushes every stdout line to
-#   coord as a progress line — `cargo metadata` prints its whole graph as ONE
-#   multi-megabyte JSON line. `cargo tree --locked --workspace --depth 0` does
-#   the same full workspace resolve under `--locked` (so a stale lock fails
-#   it identically, without compiling) and prints one line per member.
-#   ci.yml's failure-path diagnostics (the lock diff, the fix instructions)
-#   are not reproduced; the error cargo prints under `--locked` names the
-#   condition. NOTE the interaction with the qontinui-schemas DECLARED
-#   DIVERGENCE above: this lane still floats that sibling, so a schemas
-#   version bump on its default branch ahead of .github/sibling-pins.conf reds
-#   THIS step while the pinned Actions lane stays green. That is the sibling
-#   divergence surfacing, not a second one; it closes when that entry flips to
-#   `pin = "pin-file"`.
-#
 # - "Clippy check" is UBUNTU-ONLY in the `test` job; Windows clippy is the
 #   separate `clippy-windows` job. `rust-clippy` below runs on every host
 #   anyway — extra coverage (it is the only cfg(windows) lint pass a Windows
@@ -181,8 +165,11 @@ cargo_build_jobs = 1
 #   meaning (fail-fast on the first failing binary), without the per-phase
 #   bounds; and `cargo test` also runs the doctests the split drops. The
 #   split exists to attribute an Actions-timeout expiry, which this lane's
-#   own per-step timeout does not need. Its CARGO_BUILD_JOBS=2 on windows is
-#   [limits] above.
+#   own per-step timeout does not need. ci.yml runs it at CARGO_BUILD_JOBS=2
+#   on windows; this lane is capped at 1 by [limits] above — a declared
+#   difference (compile is slower here), not an equivalence. And because
+#   `cargo test` also runs the doctests the Actions split drops, a broken
+#   doctest reds THIS lane alone: that red is a real doctest defect, not drift.
 #
 # DECLARED DIVERGENCES — ci.yml runs these in the `test` job, this lane does
 # not. The manifest has NO per-OS step selector (CiManifest is a flat
@@ -190,6 +177,34 @@ cargo_build_jobs = 1
 # OS-conditional step cannot be expressed without either failing on the
 # other OS or inventing a wrapper. Adding a selector is a runner-first
 # schema change (older runners refuse an unknown key); until then:
+#
+# - "Cargo.lock is in sync with the pinned qontinui-schemas" (`cargo metadata
+#   --locked`): NOT mirrored while qontinui-schemas floats in this lane (the
+#   sibling DECLARED DIVERGENCE above). Measured 2026-09-27: schemas
+#   origin/main declares qontinui-types 3.1.0 while Cargo.lock (and the
+#   sibling-pins.conf pin) record 3.0.0, so a `--locked` resolve here would red
+#   EVERY dispatch while the pinned Actions lane stays green — a guaranteed
+#   false red, which poisons the verdict-parity this manifest exists for. Add
+#   it back (as `cargo tree --locked --workspace --depth 0`: argv has no
+#   redirect, and `cargo metadata` prints one multi-megabyte line that this
+#   lane would push to coord as a single progress line) in the SAME PR that
+#   flips the schemas sibling to `pin = "pin-file"`.
+#
+# - "Build Tauri app (development)" (`pnpm run tauri build --debug
+#   --no-bundle`): NOT mirrored for the first shadow soak. Its
+#   beforeBuildCommand also runs `bundle:profile-sidecar`, i.e. a full
+#   `cargo build --release` of the graph (scripts/bundle-profile-sidecar.mjs),
+#   on top of the debug build — and this lane compiles at CARGO_BUILD_JOBS=1.
+#   Unmeasured on a CI node, it is a likely timeout (false red) and the
+#   largest wall-clock and memory cost on a host that also serves interactive
+#   sessions. Add it once a soak has measured the rest of the lane's
+#   wall-clock on a real node.
+#
+# - Hosted-infra setup ("Configure pagefile (Windows)", the Node 20 /
+#   pnpm / Rust toolchain setup actions, the Rust cache): not mirrored — a CI
+#   node uses the host's own toolchain and pagefile. Toolchain versions can
+#   therefore differ from the hosted runner's; a red that reproduces only on
+#   one toolchain is that difference.
 #
 # - "Contract-smoke effect-probe verdict (PS 5.1)" (windows only),
 #   `powershell -File scripts/tests/test-effect-probe.ps1`, and
@@ -233,8 +248,8 @@ cargo_build_jobs = 1
 # ===========================================================================
 
 [[steps]]
-# ci.yml "Run CI-tooling unit tests" — first, before any install: both
-# files import only Node built-ins, and a break is cheap to see early.
+# ci.yml "Run CI-tooling unit tests" — first, before any install: all
+# three files import only Node built-ins, and a break is cheap to see early.
 name = "ci-tooling-node-tests"
 command = [
   "node",
@@ -243,16 +258,6 @@ command = [
   "scripts/__tests__/ci-test-results-ingest.test.mjs",
   "scripts/__tests__/ci-expiry-phase-summary.test.mjs",
 ]
-
-[[steps]]
-# ci.yml "Cargo.lock is in sync with the pinned qontinui-schemas" — resolve
-# only, no compile, so it may precede the frontend build; see the STEP
-# PARITY block for why this is `cargo tree`, not `cargo metadata`. Runs at
-# the repo root, where the workspace Cargo.toml and Cargo.lock live. 600s =
-# ci.yml's `timeout-minutes: 10`.
-name = "cargo-lock-sync"
-command = ["cargo", "tree", "--locked", "--workspace", "--depth", "0"]
-timeout_secs = 600
 
 [[steps]]
 name = "frontend-install"
@@ -303,15 +308,4 @@ working_dir = "src-tauri"
 # Skip keychain-backed auth paths in CI (ci.yml parity — keychain prompts
 # hang headless environments).
 env = { QONTINUI_DISABLE_KEYCHAIN = "1" }
-timeout_secs = 7200
-
-[[steps]]
-# ci.yml "Build Tauri app (development)" — the compile + link sanity gate
-# for the real binary (a different profile/feature set from the test
-# binaries). No `--` before `--debug` (tauri CLI 2.11 forwards post-`--`
-# args to cargo, which rejects it) and `--no-bundle` (updater signing would
-# fail with no private key); both reasons are ci.yml's. The tauri
-# beforeBuildCommand re-runs the frontend build, as it does there.
-name = "tauri-build-debug"
-command = ["pnpm", "run", "tauri", "build", "--debug", "--no-bundle"]
 timeout_secs = 7200
