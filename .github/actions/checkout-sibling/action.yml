@@ -144,7 +144,7 @@ description: >-
 #     twelfth reappears.
 #
 # The sibling repo is an INPUT rather than hard-coded, so the three qontinui-web
-# matchers (atlas-exclude-fresh.yml, clorinde-bindings-fresh.yml,
+# matchers (atlas-schema-check.yml, clorinde-bindings-fresh.yml,
 # schema-pg-sql-fresh.yml — each still doing `git ls-remote --heads … | grep -q
 # .` against qontinui-web) can adopt this resolver as a WIRING change rather
 # than a second rewrite. Three copy-pasted blocks must not become four.
@@ -333,7 +333,7 @@ runs:
           # against the root of the repo that owns this action. Both are needed:
           # ci.yml, clippy-tiers.yml and onboarding-doc-fresh.yml check the
           # runner out AT the workspace root, while qontinui-types-drift.yml,
-          # atlas-exclude-fresh.yml and clorinde-bindings-fresh.yml check it out
+          # atlas-schema-check.yml and clorinde-bindings-fresh.yml check it out
           # under `path: qontinui-runner`. Resolving only against
           # $GITHUB_WORKSPACE would silently find no manifest in the latter
           # three — harmless while they only ask about an unpinned sibling, but

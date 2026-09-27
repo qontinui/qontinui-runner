@@ -340,7 +340,7 @@ on:
       - 'merge-candidate-batch/**'
 
 # Serialise per ref. `cancel-in-progress: false` on purpose, matching
-# atlas-exclude-fresh.yml and page-spec-paths.yml rather than the two
+# atlas-schema-check.yml and page-spec-paths.yml rather than the two
 # cancel-in-progress siblings: a cancelled run on a gating workflow presents to
 # coord as an unverified tip (the condition ci-rerun-on-declaration.yml's header
 # describes), and this gate is eligible to become a required context. An 8s job

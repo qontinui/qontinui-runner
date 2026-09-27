@@ -1,0 +1,161 @@
+name: atlas schema ownership
+
+# Atlas owns exactly two Postgres schemas, WHOLLY: `atlas_managed` and
+# `orchestration` (atlas/atlas.hcl, atlas/schema.hcl). Every other schema is
+# alembic's (qontinui-web) and is outside Atlas's scope entirely, so there is
+# no exclude list to keep fresh -- plan `2026-05-14-atlas-wave-6-triage`.
+#
+# The invariant that replaces the old exclude-list freshness guard:
+#
+#   "every schema in `schemas` holds only objects schema.hcl declares"
+#
+# This job checks it against the REAL alembic chain: it applies
+# `alembic upgrade head` to a scratch Postgres, then runs
+# atlas/scripts/check_schema.sh, which fails when
+#   - the apply plan contains any DROP (an alembic migration put a foreign
+#     object in an Atlas-owned schema; a real apply would destroy it),
+#   - a second diff after the apply is non-empty (a declaration Atlas cannot
+#     converge), or
+#   - any declared table is absent afterwards (the check read nothing -- the
+#     fail-open shape a green-but-vacuous run would have).
+#
+# Triggers:
+#   - pull_request on atlas/** (and this file): a runner-side HCL edit is
+#     validated before it lands. Self-inclusion is deliberate -- a
+#     paths-filtered gate that omits its own path never runs on the PR that
+#     edits it (src-tauri/tests/workflow_paths_self_inclusion.rs).
+#   - schedule (nightly): the other direction. A qontinui-web migration that
+#     creates something in atlas_managed/orchestration lands without touching
+#     this repo; the nightly surfaces it within 24h.
+#   - workflow_dispatch: on demand, e.g. before a manual `schema apply`.
+#
+# Not a required check: a qontinui-web migration must not red unrelated runner
+# PRs. There is no self-heal arm -- nothing is regenerated, so a red run means
+# a human decides whether the object belongs in schema.hcl or out of the schema.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - "atlas/**"
+      - ".github/workflows/atlas-schema-check.yml"
+
+# `pull-requests: read` is a real requirement: on a pull_request event the
+# checkout-sibling action reads this PR's labels and the sibling's open PRs to
+# resolve the qontinui-schemas ref.
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: atlas-schema-check-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: qontinui_user
+          POSTGRES_PASSWORD: qontinui_dev_password
+          POSTGRES_DB: qontinui_db
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U qontinui_user -d qontinui_db"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      LIVE_URL: postgresql://qontinui_user:qontinui_dev_password@localhost:5433/qontinui_db
+
+    steps:
+      - name: Checkout qontinui-runner
+        uses: actions/checkout@v5
+        with:
+          path: qontinui-runner
+
+      # Prefer a qontinui-web branch with the SAME name as this PR's branch, so
+      # a coordinated cross-repo change (an alembic move plus the matching HCL)
+      # is checked together before either lands; else main. A pure YAML
+      # expression cannot do this -- github.head_ref is non-empty on every PR.
+      # On schedule/dispatch head_ref is empty and ref_name is the default
+      # branch, so this resolves to main. (Same logic as
+      # schema-pg-sql-fresh.yml and clorinde-bindings-fresh.yml.)
+      - name: Resolve qontinui-web ref
+        id: resolve_ref
+        shell: bash
+        # Branch name via env, not `${{ }}` splicing: a refname may contain
+        # shell metacharacters.
+        env:
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          branch="$BRANCH"
+          if [ -n "$branch" ] && git ls-remote --heads https://github.com/qontinui/qontinui-web.git "$branch" | grep -q .; then
+            echo "Using qontinui-web ref: $branch (matches this PR's branch)"
+            echo "ref=$branch" >> "$GITHUB_OUTPUT"
+          else
+            echo "Using qontinui-web ref: main (branch '$branch' absent on qontinui-web)"
+            echo "ref=main" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout qontinui-web (sibling)
+        uses: actions/checkout@v5
+        with:
+          repository: qontinui/qontinui-web
+          path: qontinui-web
+          ref: ${{ steps.resolve_ref.outputs.ref }}
+
+      # alembic's env.py imports the whole backend model layer, which
+      # path-depends on the qontinui-schemas and qontinui siblings, so they sit
+      # beside the checkouts at the workspace root.
+      - name: Check out sibling qontinui-schemas
+        uses: ./qontinui-runner/.github/actions/checkout-sibling
+        with:
+          path: ${{ github.workspace }}/qontinui-schemas
+
+      - name: Checkout sibling repo (qontinui)
+        shell: bash
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          git clone --depth 1 https://github.com/qontinui/qontinui.git
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Poetry
+        run: |
+          curl -sSL https://install.python-poetry.org | python3 -
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install backend dependencies (poetry, default groups only)
+        working-directory: qontinui-web/backend
+        run: poetry install --no-interaction --no-root
+
+      - name: Apply alembic chain
+        working-directory: qontinui-web/backend
+        env:
+          DATABASE_URL: ${{ env.LIVE_URL }}
+        run: poetry run alembic upgrade head
+
+      # check_schema.sh provisions its own throwaway Atlas dev database (no
+      # `public` schema -- spike Q1-1's apply-abort precondition) beside the
+      # alembic-head database, and drops it on exit. Atlas and psql both run
+      # from pinned docker images (atlas/scripts/lib.sh), so nothing is
+      # installed here.
+      - name: Check Atlas owns atlas_managed + orchestration cleanly
+        working-directory: qontinui-runner
+        timeout-minutes: 10
+        env:
+          ATLAS_LIVE_URL: ${{ env.LIVE_URL }}
+        run: bash atlas/scripts/check_schema.sh
