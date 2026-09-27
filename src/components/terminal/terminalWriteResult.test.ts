@@ -12,7 +12,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  buildClipboardReadFailure,
   buildWriteFailure,
+  CLIPBOARD_READ_FAILED,
+  readClipboardForPaste,
   throwIfWriteFailed,
   TERMINAL_EXITED,
   TERMINAL_WRITE_FAILED,
@@ -122,5 +125,31 @@ describe("throwIfWriteFailed", () => {
     expect((thrown as Error).message).toContain(TERMINAL_EXITED);
     expect((thrown as Error & { code?: string }).code).toBe(TERMINAL_EXITED);
     expect((thrown as Error & { exitCode?: number }).exitCode).toBe(137);
+  });
+});
+
+describe("readClipboardForPaste", () => {
+  it("throws a typed CLIPBOARD_READ_FAILED when the read is REJECTED", async () => {
+    const read = () => Promise.reject(new DOMException("Document is not focused.", "NotAllowedError"));
+    await expect(readClipboardForPaste(read)).rejects.toMatchObject({
+      code: CLIPBOARD_READ_FAILED,
+      hint: expect.stringMatching(/focus|permission/i),
+    });
+    await expect(readClipboardForPaste(read)).rejects.toThrow(/Document is not focused\./);
+  });
+
+  it('resolves "" for a genuinely EMPTY clipboard — that is not a failure', async () => {
+    await expect(readClipboardForPaste(async () => "")).resolves.toBe("");
+  });
+
+  it("resolves the clipboard text unchanged", async () => {
+    await expect(readClipboardForPaste(async () => "ls -la\n")).resolves.toBe("ls -la\n");
+  });
+
+  it("the failure message names the code and the cause", () => {
+    const err = buildClipboardReadFailure("denied");
+    expect(err.code).toBe(CLIPBOARD_READ_FAILED);
+    expect(err.message.startsWith(`${CLIPBOARD_READ_FAILED}:`)).toBe(true);
+    expect(err.message).toContain("denied");
   });
 });

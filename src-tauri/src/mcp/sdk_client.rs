@@ -466,6 +466,54 @@ fn manager_has_active(manager: &SdkConnectionManager) -> bool {
     manager.active_connection().is_some()
 }
 
+/// Machine-readable code on the failure body a handler answers when the
+/// connected SDK app's dispatch errored and the IPC fallback was REFUSED.
+const SDK_DISPATCH_FAILED: &str = "SDK_DISPATCH_FAILED";
+
+/// The IPC-fallback decision, as a pure function of "is an SDK app connected?".
+///
+/// `None` means falling back to `ui_bridge_request_sync` is legitimate: no SDK
+/// app is connected, so the runner's own UI IS the target (the runner-self
+/// case). `Some(body)` means an SDK app IS connected, so the dispatch error —
+/// a thrown handler, `Timeout`, `Disconnected`, `Displaced`, `NotResponsive`,
+/// an HTTP send/non-2xx failure — is the answer. `ui_bridge_request_sync`
+/// targets the RUNNER's Tauri window, never the app, so retrying there would
+/// re-execute the action on the wrong UI and could report it green. The body
+/// is `{success:false, error, code, transportError}`, the error labelled so a
+/// caller can tell a transport failure from an app-answered one.
+///
+/// Plan `2026-09-27-ui-bridge-action-failures-still-masked-after-the-strict-success-readers`
+/// Case 1. The rule itself is `sdk_app_connected`'s doc comment.
+fn ipc_fallback_refusal(
+    app_connected: bool,
+    route: &str,
+    transport_err: &str,
+) -> Option<serde_json::Value> {
+    if !app_connected {
+        return None;
+    }
+    Some(serde_json::json!({
+        "success": false,
+        "error": format!(
+            "{SDK_DISPATCH_FAILED}: {route} dispatch to the connected SDK app failed \
+             ({transport_err}); the action was NOT retried on the runner's own UI"
+        ),
+        "code": SDK_DISPATCH_FAILED,
+        "transportError": transport_err,
+    }))
+}
+
+/// [`ipc_fallback_refusal`] over the live connection state. Every handler with
+/// a `ui_bridge_request_sync` fallback after a failed `dispatch_app_request`
+/// asks this FIRST, and returns the body it yields instead of falling back.
+async fn refuse_ipc_fallback_if_app_connected(
+    state: &Arc<ApiState>,
+    route: &str,
+    transport_err: &str,
+) -> Option<serde_json::Value> {
+    ipc_fallback_refusal(sdk_app_connected(state).await, route, transport_err)
+}
+
 // =============================================================================
 // Handlers
 // =============================================================================
@@ -1345,52 +1393,65 @@ async fn handle_element_action(
                 .unwrap_or(true);
             (Json(data), success, None)
         }
-        Err(_) => {
-            // Fall back to IPC — wrap action in an object to match the format
-            // expected by the TypeScript handler (action.action, action.params, etc.)
-            let params = body
-                .get("params")
-                .cloned()
-                .unwrap_or(serde_json::json!(null));
-            let wait_options = body
-                .get("waitOptions")
-                .cloned()
-                .unwrap_or(serde_json::json!(null));
-            // Forward the D3 effect-calculus per-request opt-in so the IPC path
-            // matches the WS/HTTP path (which forwards the body verbatim). Without
-            // this, `effect_check` would never receive `effectVerification` when
-            // the executor falls back to IPC.
-            let verify_effect = body
-                .get("verifyEffect")
-                .cloned()
-                .unwrap_or(serde_json::json!(null));
-            let payload = serde_json::json!({
-                "elementId": id,
-                "action": {
-                    "action": action_name,
-                    "params": params,
-                    "waitOptions": wait_options,
-                    "verifyEffect": verify_effect
-                }
-            });
-            match ui_bridge_request_sync(&state, "execute_action", payload).await {
-                Ok(data) => {
-                    if data.get("success") == Some(&serde_json::json!(false)) {
-                        let err = data.get("error").and_then(|v| v.as_str()).map(String::from);
-                        (Json(data), false, err)
-                    } else {
-                        (
-                            Json(serde_json::json!({ "success": true, "data": data })),
-                            true,
-                            None,
-                        )
+        Err(e) => {
+            // An SDK app is connected: its dispatch error IS the answer. Never
+            // retarget the action onto the runner's own UI (Case 1).
+            if let Some(refusal) =
+                refuse_ipc_fallback_if_app_connected(&state, "element action", &e).await
+            {
+                let err = refusal
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                // Recorded as a FAILED action_executed event below.
+                (Json(refusal), false, err)
+            } else {
+                // Fall back to IPC — wrap action in an object to match the format
+                // expected by the TypeScript handler (action.action, action.params, etc.)
+                let params = body
+                    .get("params")
+                    .cloned()
+                    .unwrap_or(serde_json::json!(null));
+                let wait_options = body
+                    .get("waitOptions")
+                    .cloned()
+                    .unwrap_or(serde_json::json!(null));
+                // Forward the D3 effect-calculus per-request opt-in so the IPC path
+                // matches the WS/HTTP path (which forwards the body verbatim). Without
+                // this, `effect_check` would never receive `effectVerification` when
+                // the executor falls back to IPC.
+                let verify_effect = body
+                    .get("verifyEffect")
+                    .cloned()
+                    .unwrap_or(serde_json::json!(null));
+                let payload = serde_json::json!({
+                    "elementId": id,
+                    "action": {
+                        "action": action_name,
+                        "params": params,
+                        "waitOptions": wait_options,
+                        "verifyEffect": verify_effect
                     }
+                });
+                match ui_bridge_request_sync(&state, "execute_action", payload).await {
+                    Ok(data) => {
+                        if data.get("success") == Some(&serde_json::json!(false)) {
+                            let err = data.get("error").and_then(|v| v.as_str()).map(String::from);
+                            (Json(data), false, err)
+                        } else {
+                            (
+                                Json(serde_json::json!({ "success": true, "data": data })),
+                                true,
+                                None,
+                            )
+                        }
+                    }
+                    Err(e) => (
+                        Json(serde_json::json!({ "success": false, "error": e })),
+                        false,
+                        Some(e),
+                    ),
                 }
-                Err(e) => (
-                    Json(serde_json::json!({ "success": false, "error": e })),
-                    false,
-                    Some(e),
-                ),
             }
         }
     };
@@ -1866,7 +1927,12 @@ async fn handle_ai_execute(
     .await
     {
         Ok(data) => Json(data),
-        Err(_sdk_err) => {
+        Err(sdk_err) => {
+            if let Some(refusal) =
+                refuse_ipc_fallback_if_app_connected(&state, "ai/execute", &sdk_err).await
+            {
+                return Json(refusal);
+            }
             debug!("SDK ai/execute unavailable, falling back to IPC control endpoint");
             let payload = serde_json::json!({ "params": body });
             match ui_bridge_request_sync(&state, "ai_execute", payload).await {
@@ -1893,7 +1959,12 @@ async fn handle_ai_assert(
     .await
     {
         Ok(data) => Json(data),
-        Err(_sdk_err) => {
+        Err(sdk_err) => {
+            if let Some(refusal) =
+                refuse_ipc_fallback_if_app_connected(&state, "ai/assert", &sdk_err).await
+            {
+                return Json(refusal);
+            }
             debug!("SDK ai/assert unavailable, falling back to IPC control endpoint");
             let payload = serde_json::json!({ "params": body });
             match ui_bridge_request_sync(&state, "ai_assert", payload).await {
@@ -2511,7 +2582,12 @@ async fn handle_page_refresh(
     .await
     {
         Ok(data) => Json(data),
-        Err(_) => {
+        Err(sdk_err) => {
+            if let Some(refusal) =
+                refuse_ipc_fallback_if_app_connected(&state, "page/refresh", &sdk_err).await
+            {
+                return Json(refusal);
+            }
             // Fall back to IPC — the RUNNER-LOCAL path, where `page_refresh`
             // is a documented no-op (`usePageEvents.ts`: "ignoring (full
             // reload disabled in runner)"). Stamp the same outcome field the
@@ -2546,7 +2622,12 @@ async fn handle_page_navigate(
     .await
     {
         Ok(data) => Json(data),
-        Err(_) => {
+        Err(sdk_err) => {
+            if let Some(refusal) =
+                refuse_ipc_fallback_if_app_connected(&state, "page/navigate", &sdk_err).await
+            {
+                return Json(refusal);
+            }
             // Runner-local fallback: `dispatch_app_request` failing means no
             // wrapper app claimed this navigation, so the target is a RUNNER
             // route — and the unrouted-target gate the control route applies
@@ -3797,8 +3878,77 @@ async fn handle_ct_execute_with_diff(
     )
     .await
     {
-        Ok(data) => Json(data),
+        Ok(data) => Json(guard_execute_with_diff(data)),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// Read an `execute_with_diff` result's `actionSuccess`, at the top level (the
+/// relay payload) or under `data` (the in-process server's `success(result)`
+/// envelope). `None` when neither carries the field (or carries `null`); a
+/// present non-boolean is "present and not `true`", so `Some(false)`.
+fn execute_with_diff_action_success(data: &serde_json::Value) -> Option<bool> {
+    [
+        data.get("actionSuccess"),
+        data.get("data").and_then(|d| d.get("actionSuccess")),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|v| !v.is_null())
+    .map(|v| v == &serde_json::Value::Bool(true))
+}
+
+/// The inner action's own error message, when the result carries one.
+fn execute_with_diff_inner_error(data: &serde_json::Value) -> Option<String> {
+    [
+        data.get("actionResult"),
+        data.get("data").and_then(|d| d.get("actionResult")),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|r| r.get("error").and_then(serde_json::Value::as_str))
+    .map(String::from)
+}
+
+/// Strict guard over the SDK's `execute_with_diff` body, which this route used
+/// to pass through verbatim (plan
+/// `2026-09-27-ui-bridge-action-failures-still-masked-after-the-strict-success-readers`
+/// Case 2). The in-process SDK server answers `success(result)`, so the OUTER
+/// flag is true even when the action failed — the verdict lives only in
+/// `actionSuccess`.
+///
+/// - `actionSuccess: true` → passed through unchanged. Never marked failed.
+/// - `actionSuccess` present and not `true` → an explicit failure
+///   `{success:false, error:"ACTION_FAILED: …", data:<original>}`.
+/// - `actionSuccess` absent → passed through, with `verdict: "indeterminate"`
+///   added to an object body that is not already an explicit failure. NOT
+///   turned into a failure: the relay/React producer
+///   (`ui-bridge` `react/commandHandlers.ts` `executeWithDiff`) emits no
+///   `actionSuccess` at all today — `{actionResult, diff}` — so every
+///   currently-successful relay call would go red until the SDK fix ships.
+///   The marker says what the runner does not know without asserting either
+///   answer; absent still never reads as a confirmed success.
+fn guard_execute_with_diff(data: serde_json::Value) -> serde_json::Value {
+    match execute_with_diff_action_success(&data) {
+        Some(true) => data,
+        Some(false) => {
+            let error = match execute_with_diff_inner_error(&data) {
+                Some(inner) => format!("ACTION_FAILED: {inner}"),
+                None => "ACTION_FAILED: execute-with-diff reported actionSuccess=false".to_string(),
+            };
+            serde_json::json!({ "success": false, "error": error, "data": data })
+        }
+        None => {
+            let mut data = data;
+            let already_failed = data.get("success") == Some(&serde_json::Value::Bool(false));
+            if let (false, Some(obj)) = (already_failed, data.as_object_mut()) {
+                obj.insert(
+                    "verdict".to_string(),
+                    serde_json::Value::String("indeterminate".to_string()),
+                );
+            }
+            data
+        }
     }
 }
 
@@ -4519,7 +4669,12 @@ async fn handle_ai_assert_batch(
     .await
     {
         Ok(data) => Json(data),
-        Err(_sdk_err) => {
+        Err(sdk_err) => {
+            if let Some(refusal) =
+                refuse_ipc_fallback_if_app_connected(&state, "ai/assert/batch", &sdk_err).await
+            {
+                return Json(refusal);
+            }
             debug!("SDK ai/assert/batch unavailable, falling back to IPC control endpoint");
             let payload = serde_json::json!({ "params": body });
             match ui_bridge_request_sync(&state, "ai_assert_batch", payload).await {
@@ -7174,5 +7329,166 @@ mod tests {
             !manager_has_active(&mgr),
             "no active_url must report not-active even if a connection lingers"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Case 1 — the IPC fallback is gated on "no SDK app connected"
+    // (plan 2026-09-27-ui-bridge-action-failures-still-masked-after-the-strict-success-readers)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn ipc_fallback_refused_when_app_connected() {
+        let refusal = ipc_fallback_refusal(true, "element action", "Request timed out after 30s")
+            .expect("a connected app's dispatch error must NOT fall back to IPC");
+        assert_eq!(refusal["success"], serde_json::json!(false));
+        assert_eq!(refusal["code"], serde_json::json!(SDK_DISPATCH_FAILED));
+        assert_eq!(
+            refusal["transportError"],
+            serde_json::json!("Request timed out after 30s")
+        );
+        let error = refusal["error"].as_str().expect("error is a string");
+        assert!(
+            error.starts_with("SDK_DISPATCH_FAILED: element action"),
+            "{error}"
+        );
+        assert!(error.contains("Request timed out after 30s"), "{error}");
+        assert!(
+            error.contains("NOT retried on the runner's own UI"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn ipc_fallback_allowed_when_no_app_connected() {
+        assert!(
+            ipc_fallback_refusal(false, "element action", "No active SDK app connection").is_none(),
+            "with no SDK app connected the runner's own UI is the target: fall back"
+        );
+    }
+
+    #[test]
+    fn ipc_fallback_decision_follows_the_live_connection_predicate() {
+        // The async gate is `ipc_fallback_refusal(manager_has_active(..))`;
+        // prove the composition over both manager states.
+        let connected = manager_with_active_conn("wapp", "http://127.0.0.1:3000");
+        assert!(ipc_fallback_refusal(manager_has_active(&connected), "r", "e").is_some());
+        let empty = SdkConnectionManager::new();
+        assert!(ipc_fallback_refusal(manager_has_active(&empty), "r", "e").is_none());
+    }
+
+    /// Every handler that used to fall back to `ui_bridge_request_sync` on ANY
+    /// dispatch error asks the gate first, and asks it BEFORE the fallback.
+    /// A handler cannot be driven here without a full `ApiState`, so the wiring
+    /// is proved from source (the same technique as
+    /// `ws_dispatch_action_names_are_well_formed`).
+    #[test]
+    fn gated_handlers_ask_before_falling_back_to_ipc() {
+        let src = include_str!("sdk_client.rs");
+        for handler in [
+            "handle_element_action",
+            "handle_ai_execute",
+            "handle_ai_assert",
+            "handle_page_refresh",
+            "handle_page_navigate",
+            "handle_ai_assert_batch",
+        ] {
+            let needle = format!("\nasync fn {handler}(");
+            let body = src
+                .split(needle.as_str())
+                .nth(1)
+                .unwrap_or_else(|| panic!("{handler} not found"))
+                .split("\nasync fn ")
+                .next()
+                .unwrap_or_default();
+            let gate = body
+                .find("refuse_ipc_fallback_if_app_connected(")
+                .unwrap_or_else(|| panic!("{handler} never asks the IPC-fallback gate"));
+            let fallback = body
+                .find("ui_bridge_request_sync(")
+                .unwrap_or_else(|| panic!("{handler} has no IPC fallback any more"));
+            assert!(
+                gate < fallback,
+                "{handler} must ask the gate BEFORE falling back to IPC"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Case 2 — strict guard over execute_with_diff's body
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn execute_with_diff_present_true_passes_through_unchanged() {
+        // In-process server shape: `success(result)`.
+        let body = serde_json::json!({
+            "success": true,
+            "data": { "actionSuccess": true, "diff": { "added": [] } },
+        });
+        assert_eq!(guard_execute_with_diff(body.clone()), body);
+        // Top-level shape (a relay payload that carries it).
+        let top = serde_json::json!({ "actionSuccess": true, "actionResult": {} });
+        assert_eq!(guard_execute_with_diff(top.clone()), top);
+    }
+
+    #[test]
+    fn execute_with_diff_present_false_is_an_explicit_failure() {
+        // The outer flag is TRUE — the defect: this used to be passed through green.
+        let body = serde_json::json!({
+            "success": true,
+            "data": {
+                "actionSuccess": false,
+                "actionResult": { "success": false, "error": "element not found: btn-7" },
+            },
+        });
+        let out = guard_execute_with_diff(body.clone());
+        assert_eq!(out["success"], serde_json::json!(false));
+        assert_eq!(
+            out["error"],
+            serde_json::json!("ACTION_FAILED: element not found: btn-7")
+        );
+        assert_eq!(out["data"], body, "the original payload is kept");
+
+        let top = serde_json::json!({ "actionSuccess": false });
+        let out = guard_execute_with_diff(top);
+        assert_eq!(out["success"], serde_json::json!(false));
+        assert!(out["error"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("ACTION_FAILED: ")));
+
+        // Present but not a boolean is "present and not true".
+        let odd = serde_json::json!({ "actionSuccess": "yes" });
+        assert_eq!(
+            guard_execute_with_diff(odd)["success"],
+            serde_json::json!(false)
+        );
+    }
+
+    #[test]
+    fn execute_with_diff_absent_is_marked_indeterminate_not_failed() {
+        // Today's relay/React producer shape: no actionSuccess at all.
+        let body = serde_json::json!({
+            "actionResult": { "success": true },
+            "diff": { "before": 3, "after": 4, "timestamp": 0 },
+        });
+        let out = guard_execute_with_diff(body.clone());
+        assert_eq!(out["verdict"], serde_json::json!("indeterminate"));
+        assert!(out.get("success").is_none(), "not turned into a failure");
+        assert_eq!(out["actionResult"], body["actionResult"]);
+        assert_eq!(out["diff"], body["diff"]);
+
+        // An already-explicit failure is left as it is.
+        let failed = serde_json::json!({ "success": false, "error": "EXECUTE_WITH_DIFF_ERROR" });
+        assert_eq!(guard_execute_with_diff(failed.clone()), failed);
+    }
+
+    #[test]
+    fn execute_with_diff_route_applies_the_guard() {
+        let src = include_str!("sdk_client.rs");
+        let body = src
+            .split("\nasync fn handle_ct_execute_with_diff(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nasync fn ").next())
+            .expect("handle_ct_execute_with_diff present");
+        assert!(body.contains("Ok(data) => Json(guard_execute_with_diff(data)),"));
     }
 }
