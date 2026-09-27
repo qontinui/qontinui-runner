@@ -14,7 +14,10 @@
  * session's tenant is decided by three mechanisms — the coord row stamped at
  * spawn, the runner's data-plane writes, and the coord-mcp credential its
  * memory / prompt-document / gate writes present — and a session labelled
- * tenant B has written to tenant A through the third. The badge reads the
+ * tenant B has written to tenant A through the third. A fourth leg (plan
+ * `2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant`)
+ * names the tenant the repo in the session's working directory belongs to and
+ * whether coord's answers came from it. The badge reads the
  * session-info tenancy block and renders a divergence as a divergence, and an
  * unknown credential as unknown, rather than showing the stamped label alone —
  * served policy `ux-priorities` `a-status-signal-must-observe-the-state-it-names`.
@@ -33,11 +36,52 @@ import { Building2 } from "lucide-react";
 
 import { useTenant } from "@/contexts/TenantContext";
 
-import { useSessionInfo, type SessionTenancy } from "./useSessionInfo";
+import { useSessionInfo, type SessionTenancy, type TenancyRepoExpected } from "./useSessionInfo";
 
 /** The chip's discriminating stem: uuids share a long tail. */
 function stem(tenantId: string): string {
   return tenantId.length > 8 ? tenantId.slice(0, 8) : tenantId;
+}
+
+/**
+ * The fourth leg in words (plan
+ * `2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant`
+ * Phase 2): the tenant the repo in the session's working directory belongs to,
+ * and the latest comparison of a coord answer with it. Every non-resolved arm
+ * says what it is — an unknown is never rendered as agreement. Pure; exported
+ * for the unit test.
+ */
+export function repoExpectedText(repo: TenancyRepoExpected | null | undefined): string {
+  if (!repo) return "unknown (this runner does not report the repo leg)";
+  const named = repo.callerNamedTenantId
+    ? `named explicitly: ${repo.callerNamedTenantId} (${repo.callerNamedSource ?? "no source"}); `
+    : "";
+  let where: string;
+  switch (repo.status) {
+    case "resolved":
+      where =
+        `${repo.tenantSlug ? `${repo.tenantSlug} ` : ""}${repo.tenantId ?? "?"} ` +
+        `(repo ${repo.repo ?? "?"}, via ${repo.source ?? "?"} at ${repo.observedAt ?? "?"})`;
+      break;
+    case "no_repo":
+      where = "no repo (the working directory is not a git checkout)";
+      break;
+    case "repo_unregistered":
+      where = `none (repo ${repo.repo ?? "?"} has no owning tenant in coord)`;
+      break;
+    case "several":
+      where = `ambiguous (repo ${repo.repo ?? "?"} is registered to ${repo.tenantIds.length} tenants: ${repo.tenantIds.join(", ")})`;
+      break;
+    case "pending":
+      where = "still resolving";
+      break;
+    default:
+      where = `unknown (${repo.reason ?? "no reason given"})`;
+  }
+  const verdict = repo.verdict
+    ? ` — latest coord answer: ${repo.verdict}${repo.verdictDetail ? ` (${repo.verdictDetail})` : ""}`
+    : " — no coord answer compared yet";
+  return `${named}${where}${verdict}`;
 }
 
 export interface TenantBadgeLabel {
@@ -101,6 +145,7 @@ export function tenantBadgeLabel(
       `coord-mcp writes (memory, prompt documents, gates): ${
         credential ?? `unknown (${tenancy.credential.reason ?? "no reason given"})`
       }`,
+      `Repo in the working directory belongs to: ${repoExpectedText(tenancy.repoExpected)}`,
     ];
     return { text, title: lines.join("\n"), diverged: true, credentialUnknown };
   }
@@ -124,9 +169,12 @@ export function tenantBadgeLabel(
     tenancy && tenancy.divergence === "unknown"
       ? ` Whether its coord-mcp writes go to the same tenant could not be compared.`
       : "";
+  const repoLine = tenancy
+    ? ` Repo in the working directory belongs to: ${repoExpectedText(tenancy.repoExpected)}.`
+    : "";
   return {
     text: stem(acting),
-    title: `This session is acting as tenant ${acting}.${unconfirmed} ${fixed}`,
+    title: `This session is acting as tenant ${acting}.${unconfirmed}${repoLine} ${fixed}`,
     diverged: false,
     credentialUnknown: false,
   };
@@ -167,6 +215,8 @@ export function TenantBadge({ tenantId, claudeSessionId, className }: TenantBadg
       data-tenant-id={tenantId}
       data-tenant-diverged={label.diverged ? "true" : "false"}
       data-tenant-credential={info.body?.tenancy?.credential.tenantId ?? undefined}
+      data-tenant-repo-expected={info.body?.tenancy?.repoExpected?.status ?? undefined}
+      data-tenant-repo-verdict={info.body?.tenancy?.repoExpected?.verdict ?? undefined}
       className={`flex items-center gap-0.5 shrink-0 text-[8px] px-1 py-0 rounded font-mono ${tone} ${
         className ?? ""
       }`}

@@ -682,9 +682,15 @@ by a runner build carrying qontinui-runner PR #1558):
 | **row** | the tenant the spawn picker / `--tenant` stamped on the session | `tenancy.row.tenantId` |
 | **data plane** | the tenant the runner's own work-scoped coord writes present | `tenancy.dataPlane` |
 | **credential** | the tenant this session's coord-mcp key actually selects — where its memory, prompt-document and gate writes land | `tenancy.credential` |
+| **repo expected** | the tenant the repo in this session's spawn directory belongs to, and the latest verdict of comparing each coord answer's stamped tenant with it (plan `2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant` Phase 2) | `tenancy.repoExpected` |
 
 A session labelled B whose credential resolves to A writes to A and gets a
-`201` for it; this card is where that is visible. Read it from the runner's own
+`201` for it; this card is where that is visible. The fourth leg catches the
+case the first three cannot: all three agree on A while the repo you are
+standing in is tenant B's — `repo expected` names B, and its `verdict` is
+`mismatch` once a coord answer stamped A has come back (the proxy also appends
+`TENANT MISMATCH` to that answer). A build without the leg serves no
+`repoExpected` key: print it as UNKNOWN (absent field), never as agreement. Read it from the runner's own
 census, `GET /control/sessions/info`, for the entry whose `identity.terminalId`
 is `$QONTINUI_TERMINAL_ID`, and print what it says **verbatim**, reasons
 included — never pick one tenant as "the" tenant.
@@ -740,6 +746,8 @@ if command -v jq >/dev/null 2>&1; then
         "data plane     \(v($t.dataPlane.status))  tenant \(v($t.dataPlane.tenantId))  reason \(v($t.dataPlane.reason))",
         "credential     \(v($t.credential.status))  tenant \(v($t.credential.tenantId))  slot \(v($t.credential.slot))  reason \(v($t.credential.reason))",
         "slot posture   \(v($t.credential.posture.status))  value \(v($t.credential.posture.value))  canAnswer \(v($t.credential.posture.canAnswer))  reason \(v($t.credential.posture.reason))",
+        (if ($t.repoExpected | type) != "object" then "repo expected  UNKNOWN - no repoExpected leg (runner build predates it; absent field, NOT agreement)"
+         else $t.repoExpected as $r | "repo expected  \(v($r.status))  tenant \(v($r.tenantId)) slug \(v($r.tenantSlug))  repo \(v($r.repo))  source \(v($r.source))  observed \(v($r.observedAt))  reason \(v($r.reason))  named \(v($r.callerNamedTenantId)) [\(v($r.callerNamedSource))]  verdict \(v($r.verdict)) \(v($r.verdictDetail)) at \(v($r.verdictAt))" end),
         (if ($t | has("divergence")) then "divergence     \($t.divergence)"
          else "divergence     unknown (runner predates the divergence field; its diverged=\(v($t.diverged)) cannot say \"could not compare\")" end)
       end
@@ -764,12 +772,19 @@ print("row            tenant %s  spawn-default %s [%s %s]  current-default %s (c
 print("data plane     %s  tenant %s  reason %s" % (v(g(dp,"status")),v(g(dp,"tenantId")),v(g(dp,"reason"))))
 print("credential     %s  tenant %s  slot %s  reason %s" % (v(g(cr,"status")),v(g(cr,"tenantId")),v(g(cr,"slot")),v(g(cr,"reason"))))
 print("slot posture   %s  value %s  canAnswer %s  reason %s" % (v(g(po,"status")),v(g(po,"value")),v(g(po,"canAnswer")),v(g(po,"reason"))))
+re_=t.get("repoExpected")
+print("repo expected  UNKNOWN - no repoExpected leg (runner build predates it; absent field, NOT agreement)" if not isinstance(re_,dict) else "repo expected  %s  tenant %s slug %s  repo %s  source %s  observed %s  reason %s  named %s [%s]  verdict %s %s at %s" % tuple(v(g(re_,k)) for k in ("status","tenantId","tenantSlug","repo","source","observedAt","reason","callerNamedTenantId","callerNamedSource","verdict","verdictDetail","verdictAt")))
 print("divergence     %s" % (t["divergence"] if "divergence" in t else "unknown (runner predates the divergence field; its diverged=%s cannot say \"could not compare\")" % v(t.get("diverged"))))' "$BODYP"  # envelope-ok: the same predicate search as the jq arm
 fi
 ```
 
 Read the rows, do not summarise them away: a `credential` tenant that differs
-from the `row` tenant is the wrong-tenant-write condition itself, and
+from the `row` tenant is the wrong-tenant-write condition itself, a
+`repo expected` verdict of `mismatch` is the wrong-tenant-READ condition (coord
+answered from a tenant other than the repo's — or other than the one the
+session was explicitly named for, shown as `named`), and `expected_unknown` /
+`answer_unstamped` mean the comparison could not be made, not that it passed;
+the leg describes the SPAWN directory, not wherever the session has `cd`'d since, and
 `current-default` is context only (so is Step 4's `default tenant` row: the
 runner's `activeTenantPin`, what a `--tenant`-less `/findings-steward` cycle
 runs against, never this session's tenant) — after an operator switches the device

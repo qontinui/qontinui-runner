@@ -493,6 +493,161 @@ pub struct TenancyCredential {
     pub posture: TenancyPosture,
 }
 
+/// The fourth leg: the tenant the repo in the session's spawn workdir belongs
+/// to — what every coord answer is compared WITH — and the latest verdict of
+/// that comparison (plan
+/// `2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant`
+/// Phase 2). The other three legs can all agree on tenant A while the repo is
+/// tenant B's; this is the leg that sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TenancyRepoExpected {
+    /// `resolved` | `no_repo` | `repo_unregistered` | `several` | `pending`
+    /// (resolution still in flight) | [`TENANCY_UNKNOWN`] (with `reason`) |
+    /// `not_read` (a projection built without the leg — never served).
+    pub status: String,
+    /// The repo's owning tenant, when `resolved`.
+    pub tenant_id: Option<String>,
+    /// Display only — from coord's own stamp on an answer from that tenant;
+    /// `None` until one arrived.
+    pub tenant_slug: Option<String>,
+    /// Every owner, when `several`.
+    pub tenant_ids: Vec<String>,
+    /// The `owner/name` (or remote) the expectation was resolved for.
+    pub repo: Option<String>,
+    /// Where the ownership fact came from (`canonical_repos`).
+    pub source: Option<String>,
+    pub observed_at: Option<String>,
+    /// Why the leg is `unknown`.
+    pub reason: Option<String>,
+    /// Set when the session's tenant was NAMED (spawn tenant or a workspace
+    /// declaration): then THAT is the expectation, and a differing repo owner
+    /// is agreement by declaration, not a divergence.
+    pub caller_named_tenant_id: Option<String>,
+    pub caller_named_source: Option<String>,
+    /// The latest comparison of a coord answer with this leg: `agree` |
+    /// `mismatch` | `expected_unknown` | `answer_unstamped` | `no_repo`;
+    /// `None` until the session's first `tools/call`.
+    pub verdict: Option<String>,
+    pub verdict_detail: Option<String>,
+    pub verdict_at: Option<String>,
+}
+
+/// [`TenancyRepoExpected::status`] of a projection made without the leg.
+pub const REPO_EXPECTED_NOT_READ: &str = "not_read";
+
+impl TenancyRepoExpected {
+    fn empty(status: &str) -> Self {
+        Self {
+            status: status.to_string(),
+            tenant_id: None,
+            tenant_slug: None,
+            tenant_ids: Vec::new(),
+            repo: None,
+            source: None,
+            observed_at: None,
+            reason: None,
+            caller_named_tenant_id: None,
+            caller_named_source: None,
+            verdict: None,
+            verdict_detail: None,
+            verdict_at: None,
+        }
+    }
+
+    /// Project the live read. Pure.
+    pub(crate) fn from_read(read: &crate::coord_mcp::RepoExpectationRead) -> Self {
+        use crate::coord_mcp::RepoExpectationRead;
+        use qontinui_runner_lib::repo_tenant::CwdTenant;
+        let (cwd, caller_named, latest) = match read {
+            RepoExpectationRead::Unknown(reason) => {
+                let mut leg = Self::empty(TENANCY_UNKNOWN);
+                leg.reason = Some(reason.to_string());
+                return leg;
+            }
+            RepoExpectationRead::Known {
+                cwd,
+                caller_named,
+                latest,
+            } => (cwd, caller_named, latest),
+        };
+        let mut leg = match cwd {
+            None => Self::empty("pending"),
+            Some(CwdTenant::Resolved {
+                tenant_id,
+                repo,
+                source,
+                observed_at,
+            }) => {
+                let mut leg = Self::empty(TENANCY_RESOLVED);
+                leg.tenant_id = Some(tenant_id.to_string());
+                leg.repo = Some(repo.clone());
+                leg.source = Some(source.clone());
+                leg.observed_at = Some(observed_at.clone());
+                leg
+            }
+            Some(CwdTenant::NoRepo) => Self::empty("no_repo"),
+            Some(CwdTenant::RepoUnregistered { repo }) => {
+                let mut leg = Self::empty("repo_unregistered");
+                leg.repo = Some(repo.clone());
+                leg
+            }
+            Some(CwdTenant::Several { repo, tenant_ids }) => {
+                let mut leg = Self::empty("several");
+                leg.repo = Some(repo.clone());
+                leg.tenant_ids = tenant_ids.iter().map(|t| t.to_string()).collect();
+                leg
+            }
+            Some(CwdTenant::Unknown { reason }) => {
+                let mut leg = Self::empty(TENANCY_UNKNOWN);
+                leg.reason = Some(reason.clone());
+                leg
+            }
+        };
+        if let Some(named) = caller_named {
+            leg.caller_named_tenant_id = Some(named.tenant_id.to_string());
+            leg.caller_named_source = Some(named.source.clone());
+        }
+        if let Some(v) = latest {
+            // The slug is coord's own, and only for the tenant it names.
+            if v.answered_tenant_id.is_some() && v.answered_tenant_id == leg.tenant_id {
+                leg.tenant_slug = v.answered_tenant_slug.clone();
+            }
+            leg.verdict = Some(v.verdict.clone());
+            leg.verdict_detail = v.detail.clone();
+            leg.verdict_at = Some(v.observed_at.clone());
+        }
+        leg
+    }
+
+    /// The tenant this leg EXPECTS, for the comparison: the caller-named one
+    /// when there is one, else the repo's single owner.
+    fn expected_tenant(&self) -> Option<&str> {
+        self.caller_named_tenant_id
+            .as_deref()
+            .or(if self.status == TENANCY_RESOLVED {
+                self.tenant_id.as_deref()
+            } else {
+                None
+            })
+    }
+
+    /// Does this leg leave the comparison UNKNOWN? `no_repo` and
+    /// `repo_unregistered` are answers ("nothing to expect") and do not;
+    /// `several` does unless `credential` is one of the owners.
+    fn blocks_agreement(&self, credential: Option<&str>) -> bool {
+        if self.caller_named_tenant_id.is_some() {
+            return false;
+        }
+        match self.status.as_str() {
+            TENANCY_RESOLVED | "no_repo" | "repo_unregistered" | REPO_EXPECTED_NOT_READ => false,
+            "several" => !credential
+                .is_some_and(|c| self.tenant_ids.iter().any(|t| t.eq_ignore_ascii_case(c))),
+            _ => true,
+        }
+    }
+}
+
 /// Which tenant each half of this session acts as, and whether they disagree
 /// (plan `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`
 /// P0).
@@ -509,6 +664,9 @@ pub struct SessionTenancy {
     pub row: TenancyRow,
     pub data_plane: TenancyDataPlane,
     pub credential: TenancyCredential,
+    /// The fourth leg — see [`TenancyRepoExpected`]. Folded into both
+    /// [`Self::diverged`] and [`Self::divergence`].
+    pub repo_expected: TenancyRepoExpected,
     /// True iff the tenants that ARE known name more than one tenant. An
     /// unknown value never manufactures a divergence, and never hides one.
     /// `false` is NOT agreement — read [`Self::divergence`] for that.
@@ -659,27 +817,7 @@ pub(crate) fn project_tenancy(
         SpawnDefaultRead::Recorded(t) => (t.map(|t| t.to_string()), TENANCY_RECORDED, None),
         SpawnDefaultRead::NotRecorded(reason) => (None, TENANCY_UNKNOWN, Some(reason.to_string())),
     };
-    let expected = row_tenant
-        .map(String::from)
-        .or_else(|| data_plane.tenant_id.clone())
-        .or_else(|| spawn_default.clone());
-    let mut known: Vec<String> = Vec::with_capacity(4);
-    known.extend(expected.as_deref().map(str::to_ascii_lowercase));
-    known.extend(row_tenant.map(str::to_ascii_lowercase));
-    known.extend(data_plane.tenant_id.as_deref().map(str::to_ascii_lowercase));
-    known.extend(credential.tenant_id.as_deref().map(str::to_ascii_lowercase));
-    known.sort();
-    known.dedup();
-    let diverged = known.len() > 1;
-    let divergence = if diverged {
-        DIVERGENCE_DIVERGED
-    } else if credential.tenant_id.is_some() && expected.is_some() {
-        DIVERGENCE_AGREE
-    } else {
-        TENANCY_UNKNOWN
-    };
-
-    SessionTenancy {
+    let mut tenancy = SessionTenancy {
         row: TenancyRow {
             tenant_id: row_tenant.map(String::from),
             spawn_device_default_tenant_id: spawn_default,
@@ -689,8 +827,69 @@ pub(crate) fn project_tenancy(
         },
         data_plane,
         credential,
-        diverged,
-        divergence: divergence.to_string(),
+        repo_expected: TenancyRepoExpected::empty(REPO_EXPECTED_NOT_READ),
+        diverged: false,
+        divergence: String::new(),
+    };
+    tenancy.fold_divergence();
+    tenancy
+}
+
+impl SessionTenancy {
+    /// Attach the fourth leg and re-derive the comparison with it.
+    pub(crate) fn with_repo_expected(mut self, leg: TenancyRepoExpected) -> Self {
+        self.repo_expected = leg;
+        self.fold_divergence();
+        self
+    }
+
+    /// `diverged` / `divergence` over every leg that is known.
+    fn fold_divergence(&mut self) {
+        let row_tenant = self.row.tenant_id.as_deref();
+        let expected = row_tenant
+            .map(String::from)
+            .or_else(|| self.data_plane.tenant_id.clone())
+            .or_else(|| self.row.spawn_device_default_tenant_id.clone());
+        let mut known: Vec<String> = Vec::with_capacity(5);
+        known.extend(expected.as_deref().map(str::to_ascii_lowercase));
+        known.extend(row_tenant.map(str::to_ascii_lowercase));
+        known.extend(
+            self.data_plane
+                .tenant_id
+                .as_deref()
+                .map(str::to_ascii_lowercase),
+        );
+        known.extend(
+            self.credential
+                .tenant_id
+                .as_deref()
+                .map(str::to_ascii_lowercase),
+        );
+        // The repo leg takes part like any other known tenant — and a coord
+        // answer already OBSERVED to come from another tenant is a divergence
+        // by itself, whatever the other legs say.
+        known.extend(
+            self.repo_expected
+                .expected_tenant()
+                .map(str::to_ascii_lowercase),
+        );
+        known.sort();
+        known.dedup();
+        let diverged = known.len() > 1 || self.repo_expected.verdict.as_deref() == Some("mismatch");
+        let divergence = if diverged {
+            DIVERGENCE_DIVERGED
+        } else if self.credential.tenant_id.is_some()
+            && expected.is_some()
+            && !self
+                .repo_expected
+                .blocks_agreement(self.credential.tenant_id.as_deref())
+        {
+            DIVERGENCE_AGREE
+        } else {
+            TENANCY_UNKNOWN
+        };
+        self.diverged = diverged;
+        self.divergence = divergence.to_string();
     }
 }
 
@@ -719,6 +918,10 @@ pub(crate) fn read_session_tenancy(rec: &TerminalSessionRecord) -> SessionTenanc
         &rec.terminal_id,
         non_empty(rec.working_dir.as_ref()).as_deref(),
     );
+    let repo_expected = crate::coord_mcp::session_repo_expectation(
+        &rec.terminal_id,
+        non_empty(rec.working_dir.as_ref()).as_deref(),
+    );
     project_tenancy(
         rec.tenant_id.as_deref(),
         data_plane,
@@ -730,6 +933,7 @@ pub(crate) fn read_session_tenancy(rec: &TerminalSessionRecord) -> SessionTenanc
         crate::session::tenant_pin::resolve_tenant_pin().pinned(),
         crate::mcp::device_jwt_refresher::coord_credential_posture().as_ref(),
     )
+    .with_repo_expected(TenancyRepoExpected::from_read(&repo_expected))
 }
 
 /// The projected body — every field group of D1. Flattened into
@@ -1271,6 +1475,172 @@ mod tests {
         assert_eq!(t.credential.slot.as_deref(), Some("tenant"));
         assert_eq!(t.credential.posture.status, TENANCY_OBSERVED);
         assert_eq!(t.credential.posture.value.as_deref(), Some("live"));
+    }
+
+    // ---- the fourth leg: the repo's expected tenant (plan 2026-09-20 P2) ----
+
+    /// Three legs agreeing on A, in a repo owned by B — the 2026-09-11 incident
+    /// shape. `SessionTenancy` used to read `agree` here.
+    fn agreeing_on(t: uuid::Uuid) -> SessionTenancy {
+        project_tenancy(
+            Some(&t.to_string()),
+            Some(crate::auth::TenantScope::Owned(t)),
+            &crate::coord_mcp::CredentialTenantRead::Resolved(Some(t)),
+            crate::auth::BindingTenantRead::Unknown,
+            SpawnDefaultRead::NotRecorded("not_recorded"),
+            None,
+            None,
+        )
+    }
+
+    fn repo_read(
+        cwd: Option<qontinui_runner_lib::repo_tenant::CwdTenant>,
+        caller_named: Option<uuid::Uuid>,
+        verdict: Option<&str>,
+    ) -> crate::coord_mcp::RepoExpectationRead {
+        crate::coord_mcp::RepoExpectationRead::Known {
+            cwd,
+            caller_named: caller_named.map(|t| crate::coord_mcp_tenant::CallerNamed {
+                tenant_id: t,
+                source: "spawn_tenant".to_string(),
+            }),
+            latest: verdict.map(|v| crate::coord_mcp_tenant::VerdictRecord {
+                verdict: v.to_string(),
+                detail: None,
+                answered_tenant_id: None,
+                answered_tenant_slug: None,
+                observed_at: "2026-09-27T00:00:00Z".to_string(),
+            }),
+        }
+    }
+
+    fn owned_by(t: uuid::Uuid) -> qontinui_runner_lib::repo_tenant::CwdTenant {
+        qontinui_runner_lib::repo_tenant::CwdTenant::Resolved {
+            tenant_id: t,
+            repo: "acme/pizzeria".to_string(),
+            source: "canonical_repos".to_string(),
+            observed_at: "2026-09-27T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_repo_owned_by_another_tenant_diverges_even_when_three_legs_agree() {
+        let (a, b) = (tenant(0xA1), tenant(0xB2));
+        assert_eq!(agreeing_on(a).divergence, DIVERGENCE_AGREE);
+        let t = agreeing_on(a).with_repo_expected(TenancyRepoExpected::from_read(&repo_read(
+            Some(owned_by(b)),
+            None,
+            None,
+        )));
+        assert!(t.diverged);
+        assert_eq!(t.divergence, DIVERGENCE_DIVERGED);
+        assert_eq!(t.repo_expected.status, TENANCY_RESOLVED);
+        assert_eq!(t.repo_expected.tenant_id, Some(b.to_string()));
+        assert_eq!(t.repo_expected.repo.as_deref(), Some("acme/pizzeria"));
+    }
+
+    #[test]
+    fn a_repo_owned_by_the_same_tenant_keeps_agreement() {
+        let a = tenant(0xA1);
+        let t = agreeing_on(a).with_repo_expected(TenancyRepoExpected::from_read(&repo_read(
+            Some(owned_by(a)),
+            None,
+            Some("agree"),
+        )));
+        assert!(!t.diverged);
+        assert_eq!(t.divergence, DIVERGENCE_AGREE);
+        assert_eq!(t.repo_expected.verdict.as_deref(), Some("agree"));
+    }
+
+    /// A caller-named session's expectation is the NAMED tenant: its repo's
+    /// owner differing is agreement by declaration, not a divergence.
+    #[test]
+    fn a_caller_named_tenant_overrides_the_repo_owner() {
+        let (a, b) = (tenant(0xA1), tenant(0xB2));
+        let t = agreeing_on(a).with_repo_expected(TenancyRepoExpected::from_read(&repo_read(
+            Some(owned_by(b)),
+            Some(a),
+            Some("agree"),
+        )));
+        assert!(!t.diverged, "{t:?}");
+        assert_eq!(t.divergence, DIVERGENCE_AGREE);
+        assert_eq!(t.repo_expected.caller_named_tenant_id, Some(a.to_string()));
+    }
+
+    /// An OBSERVED mismatch diverges by itself.
+    #[test]
+    fn an_observed_mismatch_verdict_diverges() {
+        let a = tenant(0xA1);
+        let t = agreeing_on(a).with_repo_expected(TenancyRepoExpected::from_read(&repo_read(
+            Some(qontinui_runner_lib::repo_tenant::CwdTenant::NoRepo),
+            None,
+            Some("mismatch"),
+        )));
+        assert!(t.diverged);
+    }
+
+    /// "Nothing to expect" (no repo, no owner) is an answer and keeps agreement;
+    /// "could not look" (unknown, pending, no key) makes the comparison unknown.
+    #[test]
+    fn the_repo_leg_is_unknown_only_when_nothing_was_established() {
+        use qontinui_runner_lib::repo_tenant::CwdTenant;
+        let a = tenant(0xA1);
+        for (cwd, want) in [
+            (Some(CwdTenant::NoRepo), DIVERGENCE_AGREE),
+            (
+                Some(CwdTenant::RepoUnregistered {
+                    repo: "acme/x".into(),
+                }),
+                DIVERGENCE_AGREE,
+            ),
+            (
+                Some(CwdTenant::Unknown {
+                    reason: "coord unreachable".into(),
+                }),
+                TENANCY_UNKNOWN,
+            ),
+            (None, TENANCY_UNKNOWN),
+            (
+                Some(CwdTenant::Several {
+                    repo: "acme/s".into(),
+                    tenant_ids: vec![tenant(0xB2), tenant(0xC3)],
+                }),
+                TENANCY_UNKNOWN,
+            ),
+            (
+                Some(CwdTenant::Several {
+                    repo: "acme/s".into(),
+                    tenant_ids: vec![a, tenant(0xC3)],
+                }),
+                DIVERGENCE_AGREE,
+            ),
+        ] {
+            let leg = TenancyRepoExpected::from_read(&repo_read(cwd.clone(), None, None));
+            let t = agreeing_on(a).with_repo_expected(leg);
+            assert_eq!(t.divergence, want, "{cwd:?}");
+            assert!(!t.diverged, "{cwd:?}");
+        }
+        let no_key = TenancyRepoExpected::from_read(
+            &crate::coord_mcp::RepoExpectationRead::Unknown("nonce_not_live"),
+        );
+        assert_eq!(no_key.status, TENANCY_UNKNOWN);
+        assert_eq!(no_key.reason.as_deref(), Some("nonce_not_live"));
+        assert_eq!(
+            agreeing_on(a).with_repo_expected(no_key).divergence,
+            TENANCY_UNKNOWN
+        );
+    }
+
+    #[test]
+    fn the_repo_leg_serializes_camel_case() {
+        let t = agreeing_on(tenant(0xA1)).with_repo_expected(TenancyRepoExpected::from_read(
+            &repo_read(Some(owned_by(tenant(0xB2))), None, Some("mismatch")),
+        ));
+        let v = serde_json::to_value(&t).unwrap();
+        assert_eq!(v["repoExpected"]["status"], "resolved");
+        assert_eq!(v["repoExpected"]["verdict"], "mismatch");
+        assert!(v["repoExpected"]["tenantIds"].is_array());
+        assert!(v["repoExpected"].get("callerNamedTenantId").is_some());
     }
 
     /// The published posture is the WORST slot's. A reading about tenant A's

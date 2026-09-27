@@ -155,6 +155,30 @@ export interface SessionPrs {
  * spawn, the runner's data-plane writes, and the coord-mcp credential — and a
  * session labelled one tenant has written to another through the third.
  */
+/** Mirrors the Rust `TenancyRepoExpected`; keep the spellings in step. */
+export interface TenancyRepoExpected {
+  /** `"resolved"` | `"no_repo"` | `"repo_unregistered"` | `"several"` |
+   * `"pending"` | `"unknown"` (with `reason`). */
+  status: string;
+  tenantId: string | null;
+  /** Display only — coord's own slug for that tenant, once an answer carried it. */
+  tenantSlug: string | null;
+  /** Every owner when `several`. */
+  tenantIds: string[];
+  repo: string | null;
+  source: string | null;
+  observedAt: string | null;
+  reason: string | null;
+  /** Set when the session's tenant was NAMED — then that is the expectation. */
+  callerNamedTenantId: string | null;
+  callerNamedSource: string | null;
+  /** `"agree"` | `"mismatch"` | `"expected_unknown"` | `"answer_unstamped"` |
+   * `"no_repo"`; `null` before the session's first coord tool call. */
+  verdict: string | null;
+  verdictDetail: string | null;
+  verdictAt: string | null;
+}
+
 export interface SessionTenancy {
   /** `tenantId: null` ⇒ the spawn chose none (coord's row holds the device
    * default) — NOT "no tenant". */
@@ -197,6 +221,12 @@ export interface SessionTenancy {
       reason: string | null;
     };
   };
+  /** The fourth leg: the tenant the repo in the session's spawn workdir
+   * belongs to — what every coord answer is compared with — and the latest
+   * verdict of that comparison (plan
+   * `2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant`
+   * Phase 2). `null` when the runner predates the leg — UNKNOWN, not agreement. */
+  repoExpected: TenancyRepoExpected | null;
   /** The tenants that ARE known name more than one tenant. `false` is NOT
    * agreement — read {@link divergence}. */
   diverged: boolean;
@@ -852,6 +882,7 @@ export function normalizeTenancy(raw: unknown): SessionTenancy | null {
       reason?: unknown;
       posture?: { status?: unknown; value?: unknown; canAnswer?: unknown; reason?: unknown };
     };
+    repoExpected?: Record<string, unknown> | null;
     diverged?: unknown;
     divergence?: unknown;
   };
@@ -904,8 +935,34 @@ export function normalizeTenancy(raw: unknown): SessionTenancy | null {
         reason: str(posture?.reason),
       },
     },
+    repoExpected: normalizeRepoExpected(v.repoExpected),
     diverged: v.diverged,
     divergence,
+  };
+}
+
+/** The fourth tenancy leg → typed, or `null` when absent/malformed. Pure. */
+export function normalizeRepoExpected(raw: unknown): TenancyRepoExpected | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  const status = str(r.status);
+  if (!status) return null;
+  return {
+    status,
+    tenantId: str(r.tenantId),
+    tenantSlug: str(r.tenantSlug),
+    tenantIds: Array.isArray(r.tenantIds)
+      ? r.tenantIds.filter((t): t is string => typeof t === "string")
+      : [],
+    repo: str(r.repo),
+    source: str(r.source),
+    observedAt: str(r.observedAt),
+    reason: str(r.reason),
+    callerNamedTenantId: str(r.callerNamedTenantId),
+    callerNamedSource: str(r.callerNamedSource),
+    verdict: str(r.verdict),
+    verdictDetail: str(r.verdictDetail),
+    verdictAt: str(r.verdictAt),
   };
 }
 

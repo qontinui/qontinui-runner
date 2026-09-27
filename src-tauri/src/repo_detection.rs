@@ -52,50 +52,37 @@ pub async fn tenant_scope_for_path(path: &Path) -> crate::auth::TenantScope {
 /// tab's cwd without re-implementing slug parsing in TypeScript. `repo` wins
 /// when both are supplied.
 ///
-/// Returns the tenant id coord associates with the repo, or `None` when the
-/// repo is unknown / not tenant-scoped / coord is unreachable. The frontend
-/// treats `None` as "keep the active pin" and shows no error: inference is a
-/// smart default, never a hard lock, so an unreachable coord must degrade
-/// silently rather than block a spawn.
+/// A thin projection of [`repo_tenant::cwd_tenant_for_path`] — the SAME
+/// resolver the coord-mcp proxy compares every coord answer against (plan
+/// `2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant`
+/// Phase 2), so the picker's hint and the proxy's verdict can never disagree
+/// about which tenant a repo belongs to.
 ///
-/// **Phase 6:** the lookup now lives in
-/// [`repo_tenant::tenant_scope_for_repo_slug`], which returns a `TenantScope`
-/// and so keeps "coord said no tenant" apart from "coord did not answer".
-/// This command deliberately collapses both back to `None` — that IS the right
-/// answer for a spawn-picker default — and is a thin wrapper so the two can
-/// never drift.
+/// Returns the tagged [`repo_tenant::CwdTenant`] (`state`: `resolved` |
+/// `no_repo` | `repo_unregistered` | `several` | `unknown`). This used to
+/// return `Ok(None)` for "no tenant", "not a repo" and "coord unreachable"
+/// alike, so the picker could not say which; now every arm reaches the
+/// frontend, which renders the non-`resolved` ones as short text. Inference is
+/// still a smart default, never a hard lock: no arm blocks a spawn, and the
+/// command itself never errors on a lookup failure — that is `unknown`.
 #[tauri::command]
 pub async fn tenant_for_repo(
     repo: Option<String>,
     working_dir: Option<String>,
-) -> Result<Option<String>, String> {
+) -> Result<repo_tenant::CwdTenant, String> {
     let explicit = repo
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(String::from);
-
-    let slug = match explicit {
-        Some(s) => Some(s),
-        None => match working_dir.filter(|d| !d.trim().is_empty()) {
-            // `git remote get-url` shells out — keep it off the async runtime.
-            Some(dir) => spawn_blocking_tracked(move || repo_tenant::detect_repo_slug(&dir))
-                .await
-                .ok()
-                .flatten(),
-            None => None,
-        },
-    };
-
-    let slug = match slug {
-        Some(s) => s,
-        None => return Ok(None),
-    };
-
-    Ok(repo_tenant::tenant_scope_for_repo_slug(&slug)
-        .await
-        .declared_tenant()
-        .map(|t| t.to_string()))
+    if let Some(slug) = explicit {
+        return Ok(repo_tenant::cwd_tenant_for_slug(&slug).await);
+    }
+    match working_dir.filter(|d| !d.trim().is_empty()) {
+        Some(dir) => Ok(repo_tenant::cwd_tenant_for_path(Path::new(&dir)).await),
+        // No directory and no slug: there is no repo to ask about.
+        None => Ok(repo_tenant::CwdTenant::NoRepo),
+    }
 }
 
 pub async fn check_and_emit_unregistered(

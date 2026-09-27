@@ -1621,6 +1621,12 @@ async fn health(
         // `{driftedTools: [], …}` = observed clean. Same producer as
         // `/coord-mcp/tool-policy`'s field, never re-derived.
         "coordMcpDrift": observed_coord_mcp_drift_json(),
+        // `coord_mcp_tenant_verdict_total{verdict}` since boot (plan
+        // 2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-
+        // answer-names-its-tenant, Phase 2): how coord-mcp answers compared
+        // with the tenant of each session's repo. A series at 0 = observed
+        // none; a build that serves no such key is UNKNOWN, not zero.
+        "coordMcpTenantVerdict": crate::coord_mcp_tenant::verdict_counts_json(),
         // Session-tracking health (see `crate::session::tracking_health`):
         // last cross-reference timestamp, live-but-untracked / tracked-but-
         // dead counts + detail, and the untracked-backend-spawn counter.
@@ -6966,6 +6972,19 @@ async fn coord_mcp_proxy_handler(
             .into_response();
     }
 
+    // Plan 2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-
+    // answer-names-its-tenant, Phase 2: compare the tenant coord says ANSWERED
+    // (`_meta["io.qontinui/answered_by"]`) with the tenant of the repo this
+    // session stands in, and SAY it when they differ — `_meta` never reaches
+    // the model, so a disagreement left there reaches nobody. `tools/call`
+    // only; an agreeing answer's bytes pass through untouched. A non-2xx is a
+    // transport answer, not a tool result, and is never annotated.
+    let bytes = if (200..300).contains(&status) {
+        coord_mcp_apply_tenant_verdict(nonce.as_deref(), &body, bytes).await
+    } else {
+        bytes
+    };
+
     // Keep the two gates in agreement: a `tools/list` answer is filtered
     // through the same allowlist that gates `tools/call`, so this door never
     // advertises a tool it would refuse to forward. See
@@ -7092,6 +7111,67 @@ async fn coord_mcp_proxy_handler(
         )
             .into_response()
     })
+}
+
+/// The coord-mcp proxy's tenant comparison for one upstream answer (plan
+/// `2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant`
+/// Phase 2). See [`crate::coord_mcp_tenant`] for the rules.
+///
+/// The expectation is the nonce binding's, resolved at most once per binding
+/// (the mint started it in the background; this awaits the same cell, bounded
+/// by the resolver's own budget and never under a lock). A key with no live
+/// binding — a superseded key inside its grace window — carries no
+/// expectation, which is UNKNOWN and said, never agreement.
+async fn coord_mcp_apply_tenant_verdict(
+    nonce: Option<&str>,
+    request: &[u8],
+    response: bytes::Bytes,
+) -> bytes::Bytes {
+    // Cheap pre-check: this runs on every proxied answer, and only a
+    // `tools/call` is compared. A hit still goes through the real parse.
+    const NEEDLE: &[u8] = b"tools/call";
+    if !request.windows(NEEDLE.len()).any(|w| w == NEEDLE) {
+        return response;
+    }
+    let (expected, caller_named) =
+        match nonce.and_then(crate::coord_mcp::session_expectation_for_nonce) {
+            Some((expectation, workdir)) => (
+                expectation.resolve(workdir.as_deref()).await,
+                expectation.caller_named().cloned(),
+            ),
+            None => (
+                qontinui_runner_lib::repo_tenant::CwdTenant::Unknown {
+                    reason: "this proxy key has no live binding to carry an expectation \
+                             (a superseded key inside its grace window)"
+                        .to_string(),
+                },
+                None,
+            ),
+        };
+    let key = nonce.unwrap_or("").to_string();
+    let mut claim_first_notice = || crate::coord_mcp_tenant::claim_unverified_notice(&key);
+    let (out, verdicts) = crate::coord_mcp_tenant::apply_tenant_verdict(
+        request,
+        response,
+        &expected,
+        caller_named.as_ref(),
+        &mut claim_first_notice,
+    );
+    for v in &verdicts {
+        if let crate::coord_mcp_tenant::TenantVerdict::Mismatch { expected, answered } = &v.verdict
+        {
+            warn!(
+                verdict = "mismatch",
+                expected_tenant = %expected.tenant_id,
+                expected_source = %expected.source,
+                answered_tenant = ?answered.tenant_id,
+                "coord-mcp proxy: a coord answer came from a different tenant than this \
+                 session's working directory implies — annotated TENANT MISMATCH"
+            );
+        }
+    }
+    crate::coord_mcp_tenant::record_verdicts(nonce, &verdicts);
+    out
 }
 
 /// The ONLY coord READ routes the nonce-gated read passthrough may reach:

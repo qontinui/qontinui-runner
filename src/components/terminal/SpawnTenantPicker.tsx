@@ -10,9 +10,14 @@
  * Default selection comes from the repo the operator is standing in: coord
  * maps repos to tenants, so opening a `portofino-pizzeria` checkout
  * pre-selects that tenant. Inference is a smart DEFAULT, never a hard lock —
- * the operator can always override, and an unreachable coord degrades
- * SILENTLY to the device default (no error surface: a coord hiccup must not
- * interrupt a spawn).
+ * the operator can always override, and no inference outcome blocks or
+ * delays a spawn. What the inference could NOT establish is still SAID, as a
+ * short note beside the select (no repo / no tenant / several / unknown) —
+ * `tenant_for_repo` used to answer `null` for all of those and for "coord
+ * unreachable" alike, so the picker showed nothing and the operator could not
+ * tell "this repo has no tenant" from "we could not look" (plan
+ * `2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant`
+ * Phase 2).
  *
  * Renders NOTHING when the device has <= 1 binding (`showSwitcher`), per the
  * plan's D12 no-clutter rule — a single-tenant operator never sees tenant UI.
@@ -145,6 +150,88 @@ export function spawnTenantPickerModel(args: {
   return { value: published ?? "", published, options };
 }
 
+/** What `tenant_for_repo` answers: the tagged Rust `CwdTenant`. */
+export type RepoTenantAnswer =
+  | { state: "resolved"; tenantId: string; repo: string; source: string; observedAt: string }
+  | { state: "no_repo" }
+  | { state: "repo_unregistered"; repo: string }
+  | { state: "several"; repo: string; tenantIds: string[] }
+  | { state: "unknown"; reason: string };
+
+/** The picker's reading of one `tenant_for_repo` answer. */
+export interface RepoTenantHint {
+  /** The inferred tenant to label "(repo)" — only for a single owner. */
+  inferred: string | null;
+  /** Short text shown beside the select; `null` when the inference speaks for
+   * itself (a resolved tenant this device is bound to). */
+  note: string | null;
+  /** The long form, for the note's tooltip. */
+  detail: string | null;
+}
+
+/**
+ * Read a `tenant_for_repo` answer. Every arm that is not a usable single owner
+ * becomes a short NOTE rather than nothing — the arms mean different things
+ * and "coord could not be asked" must never look like "this repo has no
+ * tenant". `undefined` (not asked yet) claims nothing. Tolerates an older
+ * runner's bare `string | null` answer. Pure +
+ * exported for the unit test.
+ */
+export function repoTenantHint(answer: unknown, candidates: readonly string[]): RepoTenantHint {
+  // Not asked yet (the first read is in flight): claim nothing.
+  if (answer === undefined) return { inferred: null, note: null, detail: null };
+  if (typeof answer === "string") return { inferred: answer, note: null, detail: null };
+  if (!answer || typeof answer !== "object") {
+    return {
+      inferred: null,
+      note: "repo: unknown",
+      detail:
+        "The runner did not say which tenant this repo belongs to (an older runner answers only a tenant or nothing).",
+    };
+  }
+  const a = answer as Partial<Record<string, unknown>> & { state?: unknown };
+  const text = (v: unknown): string => (typeof v === "string" && v ? v : "?");
+  switch (a.state) {
+    case "resolved": {
+      const id = text(a.tenantId);
+      if (candidates.includes(id)) return { inferred: id, note: null, detail: null };
+      return {
+        inferred: id,
+        note: `repo: ${shortTenantId(id)} (not paired)`,
+        detail: `Repo ${text(a.repo)} belongs to tenant ${id}, which this device is not paired for — a session here would read another tenant's coord.`,
+      };
+    }
+    case "no_repo":
+      return {
+        inferred: null,
+        note: "no repo",
+        detail: "The working directory is not inside a git checkout, so no tenant is implied.",
+      };
+    case "repo_unregistered":
+      return {
+        inferred: null,
+        note: "repo: no tenant",
+        detail: `Repo ${text(a.repo)} has no owning tenant in coord's registry.`,
+      };
+    case "several": {
+      const ids = Array.isArray(a.tenantIds)
+        ? a.tenantIds.filter((t): t is string => typeof t === "string")
+        : [];
+      return {
+        inferred: null,
+        note: `repo: ${ids.length} tenants`,
+        detail: `Repo ${text(a.repo)} is registered to several tenants (${ids.join(", ")}) — pick one.`,
+      };
+    }
+    default:
+      return {
+        inferred: null,
+        note: "repo: unknown",
+        detail: `Which tenant this repo belongs to could not be determined (${text(a.reason)}). Not the same as "no tenant".`,
+      };
+  }
+}
+
 /** Short display form for a tenant id (uuids share a long tail). */
 export function shortTenantId(tenantId: string): string {
   return tenantId.length > 8 ? tenantId.slice(0, 8) : tenantId;
@@ -170,7 +257,8 @@ export function SpawnTenantPicker({ cwd, className }: SpawnTenantPickerProps) {
     spawnTenantId,
     setSpawnTenantId,
   } = useTenant();
-  const [inferred, setInferred] = useState<string | null>(null);
+  /** `undefined` until the first answer arrives — nothing is claimed yet. */
+  const [answer, setAnswer] = useState<unknown>(undefined);
   /**
    * The cwd whose inference the operator has already overridden. Moving to a
    * different repo re-arms inference (the new repo's tenant is a fresh, more
@@ -179,21 +267,21 @@ export function SpawnTenantPicker({ cwd, className }: SpawnTenantPickerProps) {
   const [overriddenForCwd, setOverriddenForCwd] = useState<string | null>(null);
   const override = overriddenForCwd === (cwd ?? "") ? spawnTenantId : null;
 
-  // Repo→tenant inference. Silent on every failure path: `tenant_for_repo`
-  // already returns Ok(None) for an unreachable coord, and a thrown invoke
-  // (command missing on an older backend) is logged, not surfaced.
+  // Repo→tenant inference. Never blocks a spawn; every outcome that is not a
+  // usable single owner is rendered as a short note (see `repoTenantHint`). A
+  // thrown invoke (command missing on an older backend) reads as unknown.
   useEffect(() => {
     if (!showSwitcher) return;
     let cancelled = false;
     void (async () => {
       try {
-        const result = await invoke<string | null>("tenant_for_repo", {
+        const result = await invoke<RepoTenantAnswer | string | null>("tenant_for_repo", {
           repo: null,
           workingDir: cwd ?? null,
         });
-        if (!cancelled) setInferred(result ?? null);
+        if (!cancelled) setAnswer(result ?? null);
       } catch (e) {
-        if (!cancelled) setInferred(null);
+        if (!cancelled) setAnswer({ state: "unknown", reason: `tenant_for_repo failed: ${e}` });
         logger.warn(`tenant_for_repo failed: ${e}`);
       }
     })();
@@ -201,6 +289,8 @@ export function SpawnTenantPicker({ cwd, className }: SpawnTenantPickerProps) {
       cancelled = true;
     };
   }, [cwd, showSwitcher]);
+  const hint = repoTenantHint(answer, candidates);
+  const inferred = hint.inferred;
 
   // Publish ONLY an explicit pick for the page's spawn handlers (see
   // `pickSpawnTenant`), and DISPLAY exactly that (see `spawnTenantPickerModel`):
@@ -250,6 +340,15 @@ export function SpawnTenantPicker({ cwd, className }: SpawnTenantPickerProps) {
           </option>
         ))}
       </select>
+      {hint.note && (
+        <span
+          data-ui-bridge-id="terminal.spawn-tenant-repo-hint"
+          className="font-mono text-[9px] text-[#565f89]"
+          title={hint.detail ?? undefined}
+        >
+          {hint.note}
+        </span>
+      )}
     </label>
   );
 }

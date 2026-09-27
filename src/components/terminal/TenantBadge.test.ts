@@ -8,11 +8,12 @@
 
 import { describe, expect, it } from "vitest";
 
-import { tenantBadgeLabel } from "./TenantBadge";
-import type { SessionTenancy } from "./useSessionInfo";
+import { repoExpectedText, tenantBadgeLabel } from "./TenantBadge";
+import type { SessionTenancy, TenancyRepoExpected } from "./useSessionInfo";
 import {
   explicitSpawnTenant,
   pickSpawnTenant,
+  repoTenantHint,
   resolveSpawnTenant,
   shortTenantId,
   spawnTenantPickerModel,
@@ -60,6 +61,7 @@ function tenancy(overrides: {
   diverged: boolean;
   divergence?: SessionTenancy["divergence"];
   spawnDefault?: { status: string; tenantId?: string | null; reason?: string | null };
+  repoExpected?: TenancyRepoExpected | null;
 }): SessionTenancy {
   return {
     row: {
@@ -81,10 +83,188 @@ function tenancy(overrides: {
       reason: overrides.credentialReason ?? null,
       posture: { status: "unknown", value: null, canAnswer: null, reason: "no_posture_published" },
     },
+    repoExpected: overrides.repoExpected ?? null,
     diverged: overrides.diverged,
     divergence: overrides.divergence ?? (overrides.diverged ? "diverged" : "agree"),
   };
 }
+
+/** A repo leg as the runner serves it (Rust `TenancyRepoExpected`). */
+function repoLeg(
+  overrides: Partial<TenancyRepoExpected> & { status: string },
+): TenancyRepoExpected {
+  return {
+    tenantId: null,
+    tenantSlug: null,
+    tenantIds: [],
+    repo: null,
+    source: null,
+    observedAt: null,
+    reason: null,
+    callerNamedTenantId: null,
+    callerNamedSource: null,
+    verdict: null,
+    verdictDetail: null,
+    verdictAt: null,
+    ...overrides,
+  };
+}
+
+describe("the fourth tenancy leg (plan 2026-09-20 Phase 2)", () => {
+  it("names the repo's tenant and a mismatched coord answer in the divergence tooltip", () => {
+    const label = tenantBadgeLabel(
+      A,
+      true,
+      tenancy({
+        row: A,
+        dataPlane: A,
+        credential: A,
+        diverged: true,
+        repoExpected: repoLeg({
+          status: "resolved",
+          tenantId: B,
+          repo: "acme/pizzeria",
+          source: "canonical_repos",
+          observedAt: "2026-09-27T00:00:00Z",
+          verdict: "mismatch",
+          verdictDetail: `answered by ${A}, expected ${B}`,
+        }),
+      }),
+    );
+    expect(label?.diverged).toBe(true);
+    expect(label?.title).toContain(`Repo in the working directory belongs to: ${B}`);
+    expect(label?.title).toContain("latest coord answer: mismatch");
+  });
+
+  it("says every non-resolved arm in words, never as agreement", () => {
+    expect(repoExpectedText(null)).toContain("unknown");
+    expect(repoExpectedText(repoLeg({ status: "no_repo" }))).toContain("no repo");
+    expect(repoExpectedText(repoLeg({ status: "repo_unregistered", repo: "acme/x" }))).toContain(
+      "acme/x has no owning tenant",
+    );
+    expect(
+      repoExpectedText(repoLeg({ status: "several", repo: "acme/s", tenantIds: [A, B] })),
+    ).toContain("registered to 2 tenants");
+    expect(repoExpectedText(repoLeg({ status: "pending" }))).toContain("still resolving");
+    expect(repoExpectedText(repoLeg({ status: "unknown", reason: "nonce_not_live" }))).toContain(
+      "unknown (nonce_not_live)",
+    );
+    expect(repoExpectedText(repoLeg({ status: "no_repo" }))).toContain(
+      "no coord answer compared yet",
+    );
+  });
+
+  it("names a caller-named tenant as the expectation", () => {
+    expect(
+      repoExpectedText(
+        repoLeg({
+          status: "resolved",
+          tenantId: B,
+          callerNamedTenantId: A,
+          callerNamedSource: "spawn_tenant",
+        }),
+      ),
+    ).toContain(`named explicitly: ${A} (spawn_tenant)`);
+  });
+
+  it("puts the repo leg in the plain label's tooltip too", () => {
+    const label = tenantBadgeLabel(
+      B,
+      true,
+      tenancy({
+        row: B,
+        credential: B,
+        diverged: false,
+        repoExpected: repoLeg({ status: "no_repo" }),
+      }),
+    );
+    expect(label?.diverged).toBe(false);
+    expect(label?.title).toContain("Repo in the working directory belongs to: no repo");
+  });
+});
+
+describe("repoTenantHint (SpawnTenantPicker renders every non-resolved arm)", () => {
+  const candidates = [A, B];
+
+  it("claims nothing before the first answer", () => {
+    expect(repoTenantHint(undefined, candidates)).toEqual({
+      inferred: null,
+      note: null,
+      detail: null,
+    });
+  });
+
+  it("a resolved, paired tenant is the inference with no note", () => {
+    const hint = repoTenantHint(
+      {
+        state: "resolved",
+        tenantId: B,
+        repo: "acme/p",
+        source: "canonical_repos",
+        observedAt: "t",
+      },
+      candidates,
+    );
+    expect(hint).toEqual({ inferred: B, note: null, detail: null });
+  });
+
+  it("a resolved tenant this device is not paired for is SAID", () => {
+    const unbound = "ffffffff-0000-4000-8000-00000000ffff";
+    const hint = repoTenantHint(
+      {
+        state: "resolved",
+        tenantId: unbound,
+        repo: "acme/p",
+        source: "canonical_repos",
+        observedAt: "t",
+      },
+      candidates,
+    );
+    expect(hint.note).toBe("repo: ffffffff (not paired)");
+    // …and never pre-selected (the device holds no credential for it).
+    expect(
+      resolveSpawnTenant({ inferred: hint.inferred, defaultForNewSessions: A, candidates }),
+    ).toBe(A);
+  });
+
+  it("no_repo renders as text", () => {
+    expect(repoTenantHint({ state: "no_repo" }, candidates)).toMatchObject({
+      inferred: null,
+      note: "no repo",
+    });
+  });
+
+  it("repo_unregistered renders as text", () => {
+    const hint = repoTenantHint({ state: "repo_unregistered", repo: "acme/x" }, candidates);
+    expect(hint).toMatchObject({ inferred: null, note: "repo: no tenant" });
+    expect(hint.detail).toContain("acme/x");
+  });
+
+  it("several renders as text naming the count, and infers nothing", () => {
+    const hint = repoTenantHint(
+      { state: "several", repo: "acme/s", tenantIds: [A, B] },
+      candidates,
+    );
+    expect(hint).toMatchObject({ inferred: null, note: "repo: 2 tenants" });
+  });
+
+  it("unknown renders as text distinct from 'no tenant'", () => {
+    const hint = repoTenantHint(
+      { state: "unknown", reason: "coord repo registry unreadable: 503" },
+      candidates,
+    );
+    expect(hint.note).toBe("repo: unknown");
+    expect(hint.detail).toContain("503");
+    expect(hint.note).not.toBe(
+      repoTenantHint({ state: "repo_unregistered", repo: "r" }, candidates).note,
+    );
+  });
+
+  it("tolerates an older runner's bare answer", () => {
+    expect(repoTenantHint(B, candidates).inferred).toBe(B);
+    expect(repoTenantHint(null, candidates).note).toBe("repo: unknown");
+  });
+});
 
 describe("tenantBadgeLabel — the session's tenancy (plan 2026-09-10 P0)", () => {
   it("renders a divergence as a mismatch naming all three tenants, never as the stamped label", () => {
