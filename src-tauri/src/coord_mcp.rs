@@ -291,13 +291,15 @@ pub(crate) struct NonceBinding {
     /// Phase 2). The coord-mcp proxy compares every `tools/call` answer's
     /// `answered_by` stamp with it ([`crate::coord_mcp_tenant::tenant_verdict`]).
     ///
-    /// Computed ONCE per binding and never re-resolved (F2: a session's tenant
-    /// is fixed at spawn): [`mint_and_register_nonce`] starts the resolution in
-    /// the background OUTSIDE the registry lock — it may run a bounded `git`
-    /// probe and a cached coord read — and the proxy's first call awaits the
-    /// same shared cell. Persisted with the binding, so a restart keeps it; a
-    /// store entry written before the field restores as
-    /// `Unknown { reason: "restored_without_expectation" }`, never as a guess.
+    /// Resolved from the binding's workdir (F2: a session's tenant is fixed at
+    /// spawn): [`mint_and_register_nonce`] starts the resolution in the
+    /// background OUTSIDE the registry lock — it may run a bounded `git` probe
+    /// and a cached coord read — and the proxy's first call awaits the same
+    /// shared state. A PERMANENT answer is frozen; a transient unknown is
+    /// retried in the background at most once a minute (see
+    /// [`crate::coord_mcp_tenant::SessionExpectation`]). Only a settled answer
+    /// is persisted (re-persisted the moment it settles); a store entry
+    /// without one restores pending and is re-resolved, never guessed.
     expected: crate::coord_mcp_tenant::SessionExpectation,
 }
 
@@ -413,6 +415,20 @@ fn caller_named_tenant(
             }
         }
     }
+}
+
+/// The hook every PERSISTABLE binding's expectation carries: when its
+/// expectation settles, mirror the live set to the store (debounced and
+/// persistence-gated like every other write), so a settled answer is never
+/// lost to a restart just because it landed after the mint's own write.
+fn persist_on_settle() -> crate::coord_mcp_tenant::SettleHook {
+    crate::coord_mcp_tenant::SettleHook::new(|| {
+        let live = proxy_nonces()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        persist_proxy_nonces(&live);
+    })
 }
 
 /// The workdir an expectation resolves from: `None` for the "no workdir"
@@ -3274,12 +3290,12 @@ fn device_nonce_snapshot(
                     // W-C: the pin's provenance, only beside a pin.
                     session_tenant_origin: b.session_pin.pinned().map(|_| b.pin_origin.into()),
                     // Phase 2 of plan 2026-09-20-a-sessions-tenant-follows-its-
-                    // repo…: the resolved expectation, so a restart keeps
-                    // comparing against the SPAWN-time one. `None` while the
-                    // resolution is still in flight — the mint re-persists once
-                    // it lands.
-                    // Only a SETTLED answer: a transient unknown is never
-                    // persisted, so a restart retries instead of freezing it.
+                    // repo…: the SETTLED expectation only, so a restart keeps
+                    // comparing against the spawn-time answer. `None` while it
+                    // is unresolved or only a transient unknown is known — a
+                    // transient is never persisted, so a restart re-resolves
+                    // instead of freezing it. The binding's settle hook
+                    // re-persists the set the moment an answer settles.
                     expected_tenant: b.expected.settled(),
                 },
             )
@@ -4584,14 +4600,16 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> No
                 &ProxyPrincipal::Device,
                 &normalize_binding_workdir(&binding.workdir),
             );
-            let expected = crate::coord_mcp_tenant::SessionExpectation::known(
-                binding.expected_tenant.clone().unwrap_or_else(|| {
-                    qontinui_runner_lib::repo_tenant::CwdTenant::unknown(
-                        "restored_without_expectation",
-                    )
-                }),
-                caller_named,
-            );
+            // A record without a settled expectation (written before the
+            // field, before its resolution landed, or holding one this build
+            // cannot read) restores PENDING: the first proxied call
+            // re-resolves it from the persisted workdir, rather than
+            // freezing a standing unknown for the life of the key.
+            let expected = match binding.expected_tenant.clone() {
+                Some(cwd) => crate::coord_mcp_tenant::SessionExpectation::known(cwd, caller_named),
+                None => crate::coord_mcp_tenant::SessionExpectation::pending(caller_named),
+            }
+            .with_settle_hook(persist_on_settle());
             (nonce, binding, expected)
         })
         .collect();
@@ -4981,12 +4999,16 @@ fn mint_and_register_nonce_with(
     // its-repo… Phase 2): the caller-named half is read NOW (declaration files,
     // outside the lock); the cwd half resolves in the background below, after
     // the lock is released, into a cell every clone of this binding shares.
-    let expected = crate::coord_mcp_tenant::SessionExpectation::pending(caller_named_tenant(
+    let mut expected = crate::coord_mcp_tenant::SessionExpectation::pending(caller_named_tenant(
         session_pin,
         pin_origin,
         &principal,
         workdir,
     ));
+    // Only a binding that is ever persisted re-persists on settling.
+    if principal == ProxyPrincipal::Device && !ephemeral {
+        expected = expected.with_settle_hook(persist_on_settle());
+    }
     let expected_for_resolution = expected.clone();
     // Forensics cause resolved BEFORE `principal` is moved into the map.
     let mint_cause = match (&principal, ephemeral) {
@@ -5130,25 +5152,10 @@ fn mint_and_register_nonce_with(
         &[("terminal_id", serde_json::Value::from(terminal_id))],
     );
     // Off the lock and off the caller: a bounded `git` probe plus a cached
-    // coord read, whose answer lands in the binding's shared cell. Without a
-    // runtime (a sync caller) the proxy's first call resolves it instead.
-    //
-    // Once resolved, a persistable binding re-mirrors the live set: the store
-    // write this mint's caller makes from `snapshot` saw the cell still empty,
-    // and a restart would otherwise restore it as `restored_without_expectation`.
-    // Debounced and persistence-gated like every other write.
-    let persistable = snapshot
-        .get(&nonce)
-        .is_some_and(|b| b.principal == ProxyPrincipal::Device && !b.lifetime.is_ephemeral());
-    expected_for_resolution.spawn_resolution(expectation_workdir(workdir), move || {
-        if persistable {
-            let live = proxy_nonces()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            persist_proxy_nonces(&live);
-        }
-    });
+    // coord read, whose answer lands in the binding's shared state (and, via
+    // the settle hook, in the store). Without a runtime (a sync caller) the
+    // proxy's first call resolves it instead.
+    expected_for_resolution.spawn_resolution(expectation_workdir(workdir));
     (nonce, snapshot)
 }
 
@@ -11462,7 +11469,8 @@ fn adopt_on_disk_nonce(
         PinOrigin::MachineSampled,
         &ProxyPrincipal::Device,
         workdir,
-    ));
+    ))
+    .with_settle_hook(persist_on_settle());
     let evicted = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
         // Persistent AND terminal-less only — an adopted nonce came from a
@@ -16105,7 +16113,8 @@ mod tests {
         let (old, _) = session_expectation_for_nonce(&without).expect("old record restored");
         assert_eq!(
             old.settled(),
-            Some(CwdTenant::unknown("restored_without_expectation"))
+            None,
+            "an old record restores PENDING — re-resolved on first use, not frozen"
         );
         let (legacy, _) = session_expectation_for_nonce(&legacy_pin).expect("restored");
         assert_eq!(
