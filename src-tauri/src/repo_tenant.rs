@@ -726,14 +726,18 @@ fn display_remote(url: &str) -> String {
     // a path (`/`): a later `@` belongs to the path (`host:org/x@v2`), and a
     // path-only remote (`host:org/x@v2` with no user) keeps its `@`.
     //
-    // A local path — a Windows drive (`C:\…`, `D:/…`) or anything with a
-    // backslash — is not an scp remote at all and carries no userinfo.
+    // A real Windows path — a UNC share (`\\server\…`) or a drive letter
+    // (`C:`, `C:\…`, `D:/…`) — is not an scp remote and carries no userinfo.
+    // ONLY those exact shapes are exempt: a backslash elsewhere
+    // (`https://u:p@host/a\b`, `user:tok@host:org\repo`) still goes through
+    // redaction below.
     let bytes = url.as_bytes();
-    let windows_path = url.contains('\\')
-        || (bytes.len() >= 2
-            && bytes[0].is_ascii_alphabetic()
-            && bytes[1] == b':'
-            && bytes.get(2).is_none_or(|b| *b == b'/' || *b == b'\\'));
+    let windows_path = !url.contains("://")
+        && (url.starts_with("\\\\")
+            || (bytes.len() >= 2
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && bytes.get(2).is_none_or(|b| *b == b'/' || *b == b'\\')));
     if windows_path {
         return url.to_string();
     }
@@ -1641,6 +1645,16 @@ mod tests {
             "C:\\Users\\me@corp\\repo"
         );
         assert_eq!(display_remote("D:/work/me@x/repo"), "D:/work/me@x/repo");
+        assert_eq!(
+            display_remote("\\\\server\\share\\me@x"),
+            "\\\\server\\share\\me@x"
+        );
+        // A backslash elsewhere is NOT a free pass: both of these used to leak.
+        let https_bs = display_remote("https://u:p@host.example/a\\b");
+        assert!(!https_bs.contains("u:p"), "{https_bs}");
+        let scp_bs = display_remote("user:tok@host.example:org\\repo");
+        assert!(!scp_bs.contains("tok"), "{scp_bs}");
+        assert_eq!(scp_bs, "host.example:org\\repo");
         let https = display_remote("https://u:p@gitlab.com/a/b.git?private_token=s3cret#frag");
         assert!(
             !https.contains("s3cret") && !https.contains("u:p"),
