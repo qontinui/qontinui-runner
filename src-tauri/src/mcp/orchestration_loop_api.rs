@@ -248,7 +248,10 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body.code.as_deref(), Some("target_is_orchestrator"));
         let msg = body.error.unwrap();
-        assert!(msg.starts_with("unsupported here: target_is_orchestrator: "), "{msg}");
+        assert!(
+            msg.starts_with("unsupported here: target_is_orchestrator: "),
+            "{msg}"
+        );
     }
 
     #[test]

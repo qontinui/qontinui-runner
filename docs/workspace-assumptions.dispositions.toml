@@ -325,9 +325,9 @@ symbol = "<module>"
 disposition = "dev_only_surface"
 note = "The DevSupervisor restart arm of the Orchestration Loop, reached ONLY for a between-iterations mode with rebuild: true (rebuilding compiles from a source checkout, which only the dev supervisor can do) and only after its /health answered AND its GET /runners matched the target port to exactly one runner id at loop start; every plain restart of a runner-managed target goes in-process (plan 2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor)."
 reviewed = [
-    "DevSupervisor { client: SupervisorClient, runner_id: String },",
+    "client: SupervisorClient,",
     "supervisor_port: u16,",
-    "use super::remote_client::SupervisorClient;",
+    "use super::remote_client::{SupervisorClient, DETACHED_REBUILD_TIMEOUT};",
 ]
 
 [[disposition]]

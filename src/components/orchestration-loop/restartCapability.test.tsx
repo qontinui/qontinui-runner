@@ -25,6 +25,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 import {
   CAPABILITY_DEBOUNCE_MS,
+  SPEC_WIZARD_DEFAULT_BETWEEN,
   GatedStartButton,
   RestartCapabilityNotice,
   betweenToWire,
@@ -40,6 +41,17 @@ import {
   type RestartCapabilityProbe,
   type RestartCapabilityState,
 } from "./restartCapability";
+import {
+  FRESH_FORM_BETWEEN,
+  mergeTargetRunners,
+  restoreTarget,
+  runnerListToken,
+  selectTarget,
+  targetRunnerIdFor,
+  type SupervisorRunnerRow,
+  type TargetRunnerRow,
+} from "./targetPicker";
+import { targetRunnerIdForLoop } from "../../lib/workflow-builder/buildMultiRunnerSpecWorkflow";
 
 const ORCHESTRATOR_REASON =
   "the loop runs inside this runner; restarting it would end the loop — target a secondary instance";
@@ -52,9 +64,10 @@ const selfProbe = (between: string): RestartCapabilityProbe => ({
   between_iterations: betweenToWire(between),
 });
 
+/** A runner-owned secondary: resolved by port, so no id is sent. */
 const secondaryProbe = (between: string): RestartCapabilityProbe => ({
   target_runner_port: 9877,
-  target_runner_id: "runner-2",
+  target_runner_id: null,
   supervisor_port: 9875,
   between_iterations: betweenToWire(between),
 });
@@ -144,9 +157,15 @@ describe("a supported capability enables Start", () => {
     expect(state.status).toBe("ready");
     expect(startBlockedReason(state)).toBeNull();
 
+    // Derived from the verdict exactly as the panel does — not hard-coded.
     const button = renderToStaticMarkup(
-      <GatedStartButton blockedReason={null} onClick={() => {}} label="Run Loop" />,
+      <GatedStartButton
+        blockedReason={startBlockedReason(state)}
+        onClick={() => {}}
+        label="Run Loop"
+      />,
     );
+    expect(button).toMatch(/<button[^>]*>/);
     expect(button).not.toContain('disabled=""');
     expect(button).not.toContain("Start blocked");
 
@@ -200,7 +219,8 @@ describe("a supported capability enables Start", () => {
 });
 
 describe("fresh panel default", () => {
-  it("targeting self defaults to wait_healthy (both panels call defaultBetween(true))", () => {
+  it("targeting self defaults to wait_healthy (both panels start on FRESH_FORM_BETWEEN)", () => {
+    expect(FRESH_FORM_BETWEEN).toBe("wait_healthy");
     expect(defaultBetween(true)).toBe("wait_healthy");
     expect(betweenToWire(defaultBetween(true))).toEqual({ type: "wait_healthy" });
   });
@@ -214,9 +234,36 @@ describe("fresh panel default", () => {
   });
 });
 
+describe("spec-partition wizard default", () => {
+  it("keeps restart-on-signal intent without rebuild (works in-process, no dev supervisor)", () => {
+    expect(SPEC_WIZARD_DEFAULT_BETWEEN).toBe("restart_on_signal_no_rebuild");
+    expect(betweenToWire(SPEC_WIZARD_DEFAULT_BETWEEN)).toEqual({
+      type: "restart_on_signal",
+      rebuild: false,
+    });
+  });
+
+  it("maps every wizard option, including the rebuild variants, unchanged", () => {
+    expect(betweenToWire("restart_on_signal")).toEqual({
+      type: "restart_on_signal",
+      rebuild: true,
+    });
+    expect(betweenToWire("restart_runner")).toEqual({ type: "restart_runner", rebuild: true });
+    expect(betweenToWire("restart_runner_no_rebuild")).toEqual({
+      type: "restart_runner",
+      rebuild: false,
+    });
+    expect(betweenToWire("wait_healthy")).toEqual({ type: "wait_healthy" });
+    expect(betweenToWire("none")).toEqual({ type: "none" });
+  });
+});
+
 describe("restored saved config", () => {
   it("keeps a saved restart_on_signal verbatim and shows why it is refused", async () => {
-    const restored = restoreBetween("restart_on_signal", true);
+    // The panel's restore path, targeting self (no saved port).
+    const target = restoreTarget({ targetPort: "", between: "restart_on_signal" }, []);
+    expect(target.targetRunner).toBe("self");
+    const restored = target.between;
     expect(restored).toBe("restart_on_signal"); // never silently rewritten
 
     mockInvoke.mockResolvedValue(refusedSelf);
@@ -311,5 +358,154 @@ describe("wire normalization", () => {
     mockInvoke.mockResolvedValue({});
     const state = await fetchRestartCapability(selfProbe("restart_runner"));
     expect(state.status).toBe("unknown");
+  });
+});
+
+// ── Target picker (both panels) ────────────────────────────────────────────
+
+const ownedRow = (over: Partial<TargetRunnerRow>): TargetRunnerRow => ({
+  id: "slot-1",
+  name: "Secondary",
+  port: 9877,
+  running: true,
+  pid: 100,
+  api_ready: true,
+  source: "configured",
+  ...over,
+});
+
+const supRow = (over: Partial<SupervisorRunnerRow>): SupervisorRunnerRow => ({
+  id: "sup-a",
+  name: "sup A",
+  port: 9880,
+  is_primary: false,
+  running: true,
+  pid: 200,
+  api_responding: true,
+  ...over,
+});
+
+describe("target picker order", () => {
+  it("lists runner-owned rows first, then supervisor rows only for ports not already present", () => {
+    const rows = mergeTargetRunners(
+      [
+        ownedRow({ id: "slot-1", port: 9877 }),
+        ownedRow({ id: "ext-9878-1", port: 9878, source: "discovered" }),
+      ],
+      [
+        supRow({ id: "sup-dup", port: 9877 }), // same port as a runner-owned row
+        supRow({ id: "sup-new", port: 9880 }),
+      ],
+      9876,
+    );
+    expect(rows.map((r) => [r.id, r.source])).toEqual([
+      ["slot-1", "configured"],
+      ["ext-9878-1", "discovered"],
+      ["sup-new", "supervisor"],
+    ]);
+  });
+
+  it("drops the orchestrating runner's own port and stopped rows from both sources", () => {
+    const rows = mergeTargetRunners(
+      [ownedRow({ id: "me", port: 9876 }), ownedRow({ id: "off", port: 9879, running: false })],
+      [supRow({ id: "primary", port: 9876, is_primary: true }), supRow({ running: false })],
+      9876,
+    );
+    expect(rows).toEqual([]);
+  });
+
+  it("uses runner-owned rows when there is no supervisor at all", () => {
+    expect(mergeTargetRunners([ownedRow({})], [], 9876).map((r) => r.id)).toEqual(["slot-1"]);
+  });
+});
+
+describe("target_runner_id is sent only for a dev-supervisor row", () => {
+  it("runner-owned rows (configured, discovered, unlabelled) send no id", () => {
+    expect(targetRunnerIdFor(ownedRow({ source: "configured" }))).toBeNull();
+    expect(targetRunnerIdFor(ownedRow({ id: "ext-9878-1", source: "discovered" }))).toBeNull();
+    expect(targetRunnerIdFor(ownedRow({ source: undefined }))).toBeNull();
+    expect(targetRunnerIdFor({ id: "sup-a", source: "supervisor" })).toBe("sup-a");
+  });
+
+  it("single panel selection: port always set, id only for the supervisor row", () => {
+    const rows = mergeTargetRunners(
+      [ownedRow({ id: "ext-9878-1", port: 9878, source: "discovered" })],
+      [supRow({ id: "sup-a", port: 9880 })],
+      9876,
+    );
+    expect(selectTarget("ext-9878-1", rows)).toEqual({
+      targetRunner: "ext-9878-1",
+      targetPort: "9878",
+      targetRunnerId: "",
+    });
+    expect(selectTarget("sup-a", rows)).toEqual({
+      targetRunner: "sup-a",
+      targetPort: "9880",
+      targetRunnerId: "sup-a",
+    });
+    expect(selectTarget("self", rows)).toEqual({
+      targetRunner: "self",
+      targetPort: "",
+      targetRunnerId: "",
+    });
+    expect(selectTarget("gone", rows)).toBeNull();
+  });
+
+  it("restoring a saved runner-owned id re-derives it from the matched row (no id sent)", () => {
+    const rows = [ownedRow({ id: "slot-1", port: 9877 })];
+    expect(
+      restoreTarget(
+        { targetPort: "9877", targetRunnerId: "slot-1", between: "restart_runner" },
+        rows,
+      ),
+    ).toEqual({
+      targetRunner: "slot-1",
+      targetPort: "9877",
+      targetRunnerId: "",
+      between: "restart_runner",
+    });
+  });
+
+  it("spec-partition loops send the supervisor id only when the target carries one", () => {
+    expect(targetRunnerIdForLoop({ runnerId: "slot-1", port: 9877, name: "s" })).toBeNull();
+    expect(
+      targetRunnerIdForLoop({
+        runnerId: "sup-a",
+        port: 9880,
+        name: "s",
+        supervisorRunnerId: "sup-a",
+      }),
+    ).toBe("sup-a");
+  });
+});
+
+describe("capability refresh on runner-list change", () => {
+  it("the refresh token changes when a target is launched, stopped or relaunched", () => {
+    const before = runnerListToken([ownedRow({ running: false, pid: null })]);
+    const launched = runnerListToken([ownedRow({ running: true, pid: 100 })]);
+    const relaunched = runnerListToken([ownedRow({ running: true, pid: 101 })]);
+    expect(launched).not.toBe(before);
+    expect(relaunched).not.toBe(launched);
+    // Order-insensitive: a re-poll returning the same rows is not a change.
+    const a = ownedRow({ id: "a", port: 1 });
+    const b = ownedRow({ id: "b", port: 2 });
+    expect(runnerListToken([a, b])).toBe(runnerListToken([b, a]));
+  });
+
+  it("re-asking the same probe after a launch replaces a stale target_not_runner_managed refusal", async () => {
+    mockInvoke
+      .mockResolvedValueOnce({
+        supported: false,
+        code: "target_not_runner_managed",
+        reason: "the runner on :9877 was not started by this runner",
+        targetPort: 9877,
+      })
+      .mockResolvedValueOnce(supportedSecondary);
+    const probe = secondaryProbe("restart_runner_no_rebuild");
+    const [first] = await requestOnce([probe]);
+    expect(startBlockedReason(first)).toMatch(/not started by this runner/);
+    const [second] = await requestOnce([probe]);
+    expect(startBlockedReason(second)).toBeNull();
+    expect(mockInvoke).toHaveBeenCalledTimes(2);
   });
 });

@@ -8,10 +8,15 @@ import {
   GatedStartButton,
   RestartCapabilityNotice,
   betweenToWire,
-  defaultBetween,
   multiStartBlockedReason,
   useRestartCapabilities,
 } from "./restartCapability";
+import {
+  FRESH_FORM_BETWEEN,
+  runnerListToken,
+  targetRunnerIdFor,
+  type TargetRunnerRow,
+} from "./targetPicker";
 
 // --- Types matching the Rust multi-loop backend ---
 
@@ -85,14 +90,8 @@ interface IterationResult {
   } | null;
 }
 
-interface RunnerInstance {
-  id: string;
-  name: string;
-  port: number;
-  running: boolean;
-  pid: number | null;
-  api_ready: boolean;
-}
+/** A `get_runner_instances` row — runner-owned, never a dev-supervisor row. */
+type RunnerInstance = TargetRunnerRow;
 
 interface SavedWorkflow {
   id: string;
@@ -153,6 +152,12 @@ interface LoopAssignment {
   runnerId: string;
   runnerName: string;
   port: number;
+  /**
+   * `target_runner_id` to send: the dev supervisor's id, or null. Rows here
+   * come from `get_runner_instances` (runner-owned), resolved by port, so
+   * this is null for them — their row id is only the loop id.
+   */
+  targetRunnerId: string | null;
   workflowId: string;
   label: string;
 }
@@ -176,7 +181,7 @@ export function MultiLoopPanel() {
   // No target is assigned yet, and any assignment may be the orchestrating
   // runner itself (which no restart mode can restart) — so a fresh form
   // starts on Wait Healthy, the one default valid against every target.
-  const [between, setBetween] = useState(() => defaultBetween(true));
+  const [between, setBetween] = useState(FRESH_FORM_BETWEEN);
   const [stopAllOnError, setStopAllOnError] = useState(false);
   const [supervisorPort, setSupervisorPort] = useState("9875");
 
@@ -243,6 +248,7 @@ export function MultiLoopPanel() {
         runnerId: runner.id,
         runnerName: runner.name,
         port: runner.port,
+        targetRunnerId: targetRunnerIdFor(runner),
         workflowId: "",
         label: runner.name,
       },
@@ -268,10 +274,11 @@ export function MultiLoopPanel() {
   const capabilities = useRestartCapabilities(
     assignments.map((a) => ({
       target_runner_port: a.port,
-      target_runner_id: a.runnerId,
+      target_runner_id: a.targetRunnerId,
       supervisor_port: parseInt(supervisorPort) || 9875,
       between_iterations: betweenToWire(between),
     })),
+    runnerListToken(runnerInstances),
   );
   const startBlocked = multiStartBlockedReason(
     capabilities,
@@ -298,7 +305,7 @@ export function MultiLoopPanel() {
         label: a.label || a.runnerName,
         config: {
           target_runner_port: a.port,
-          target_runner_id: a.runnerId,
+          target_runner_id: a.targetRunnerId,
           supervisor_port: parseInt(supervisorPort) || 9875,
           workflow_id: a.workflowId,
           max_iterations: maxIter,
@@ -669,11 +676,6 @@ export function MultiLoopPanel() {
                 <option value="wait_healthy">Wait healthy</option>
                 <option value="none">None</option>
               </select>
-              {startBlocked && (
-                <div className="mt-1 text-[0.7rem] text-red-400" role="alert">
-                  Unsupported here — {startBlocked}
-                </div>
-              )}
             </div>
           </div>
 

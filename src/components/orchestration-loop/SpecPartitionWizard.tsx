@@ -18,6 +18,7 @@ import {
   type MultiRunnerSpecWorkflowResult,
 } from "../../lib/workflow-builder";
 import { type PartitionStrategy } from "../../lib/workflow-builder";
+import { SPEC_WIZARD_DEFAULT_BETWEEN, betweenToWire } from "./restartCapability";
 interface RunnerInstance {
   id: string;
   name: string;
@@ -51,7 +52,7 @@ export function SpecPartitionWizard({ onClose, onLaunched }: SpecPartitionWizard
   const [strategy, setStrategy] = useState<PartitionStrategy>("balanced");
   const [maxIter, setMaxIter] = useState(5);
   const [specMaxIter, setSpecMaxIter] = useState(3);
-  const [between, setBetween] = useState("restart_on_signal");
+  const [between, setBetween] = useState(SPEC_WIZARD_DEFAULT_BETWEEN);
   const [stopAllOnError, setStopAllOnError] = useState(false);
 
   // Preview
@@ -87,13 +88,7 @@ export function SpecPartitionWizard({ onClose, onLaunched }: SpecPartitionWizard
     });
   };
 
-  const buildBetween = useCallback(() => {
-    if (between === "restart_on_signal")
-      return { type: "restart_on_signal" as const, rebuild: true };
-    if (between === "restart_runner") return { type: "restart_runner" as const, rebuild: true };
-    if (between === "wait_healthy") return { type: "wait_healthy" as const };
-    return { type: "none" as const };
-  }, [between]);
+  const buildBetween = useCallback(() => betweenToWire(between), [between]);
 
   // Generate preview when moving to preview step
   const generatePreview = useCallback(() => {
@@ -278,7 +273,9 @@ export function SpecPartitionWizard({ onClose, onLaunched }: SpecPartitionWizard
                 className={cn(inputCls, "w-full mt-0.5")}
               >
                 <option value="restart_on_signal">Restart on signal (rebuild)</option>
+                <option value="restart_on_signal_no_rebuild">Restart on signal (no rebuild)</option>
                 <option value="restart_runner">Always restart (rebuild)</option>
+                <option value="restart_runner_no_rebuild">Always restart (no rebuild)</option>
                 <option value="wait_healthy">Wait healthy</option>
                 <option value="none">None</option>
               </select>

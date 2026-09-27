@@ -765,15 +765,16 @@ pub enum InstanceRestartError {
     StopFailed { id: String, cause: String },
     /// The child was stopped but its port was still bound after the timeout,
     /// so a relaunch would have collided. The child is NOT running now.
-    PortNeverFreed { id: String, port: u16, waited_secs: u64 },
+    PortNeverFreed {
+        id: String,
+        port: u16,
+        waited_secs: u64,
+    },
     /// The relaunch was refused (resource gate) or failed to spawn. The child
     /// is NOT running now.
     LaunchFailed { id: String, cause: String },
     /// The relaunch spawned a process that was already gone when checked.
     ChildVanishedAfterLaunch { id: String },
-    /// The relaunched child is on a different port than before — callers
-    /// that resolved the target by port would now be pointing at nothing.
-    PortChanged { id: String, before: u16, after: u16 },
 }
 
 impl std::fmt::Display for InstanceRestartError {
@@ -802,10 +803,6 @@ impl std::fmt::Display for InstanceRestartError {
                 f,
                 "instance '{id}' was relaunched but its process was already gone"
             ),
-            Self::PortChanged { id, before, after } => write!(
-                f,
-                "instance '{id}' came back on port {after}, not {before}"
-            ),
         }
     }
 }
@@ -818,8 +815,14 @@ impl std::error::Error for InstanceRestartError {}
 /// 1. capture the slot config (only a LIVE child is restartable);
 /// 2. stop it;
 /// 3. wait up to [`RESTART_PORT_FREE_TIMEOUT`] for its port to free;
-/// 4. relaunch the captured config (resource-gated like any launch);
-/// 5. assert the relaunched child is live on the SAME port.
+/// 4. relaunch the captured config (resource-gated like any launch) — the
+///    same slot config, so the same fixed port;
+/// 5. assert the relaunched child is still alive.
+///
+/// That the process then ANSWERING on the port is this child is not provable
+/// here (a child can be alive while another process holds its port); the
+/// Orchestration Loop confirms it by PID once the target is healthy
+/// (`orchestration_loop::restart_path::verify_new_child`).
 ///
 /// Every failure is a typed [`InstanceRestartError`]; nothing waits unbounded.
 /// Returns the new child's PID.
@@ -853,23 +856,20 @@ pub async fn restart_with(
         });
     }
 
-    let pid = lifecycle
-        .launch(&config, app)
-        .await
-        .map_err(|cause| InstanceRestartError::LaunchFailed {
+    let pid = lifecycle.launch(&config, app).await.map_err(|cause| {
+        InstanceRestartError::LaunchFailed {
             id: id.to_string(),
             cause,
-        })?;
+        }
+    })?;
 
     match lifecycle.owned_instance(id).await {
         None => Err(InstanceRestartError::ChildVanishedAfterLaunch { id: id.to_string() }),
-        Some(after) if after.port != port => Err(InstanceRestartError::PortChanged {
-            id: id.to_string(),
-            before: port,
-            after: after.port,
-        }),
         Some(_) => {
-            info!("Instance '{}' restarted in place (PID {}, port {})", id, pid, port);
+            info!(
+                "Instance '{}' restarted in place (PID {}, port {})",
+                id, pid, port
+            );
             Ok(pid)
         }
     }
@@ -1047,10 +1047,12 @@ mod restart_tests {
             config: &RunnerInstanceConfig,
             app: Option<&tauri::AppHandle>,
         ) -> Result<u32, String> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("launch:{}:{}:app={}", config.id, config.port, app.is_some()));
+            self.calls.lock().unwrap().push(format!(
+                "launch:{}:{}:app={}",
+                config.id,
+                config.port,
+                app.is_some()
+            ));
             self.launch_result.clone()
         }
     }
@@ -1085,8 +1087,14 @@ mod restart_tests {
         let mut fake = FakeLifecycle::new(vec![Some(slot("a", 9877))]);
         fake.stop_result = Err("access denied".into());
         let err = restart_with(&fake, "a", None).await.unwrap_err();
-        assert!(matches!(err, InstanceRestartError::StopFailed { .. }), "{err}");
-        assert_eq!(fake.calls(), vec!["owned:a".to_string(), "stop:a".to_string()]);
+        assert!(
+            matches!(err, InstanceRestartError::StopFailed { .. }),
+            "{err}"
+        );
+        assert_eq!(
+            fake.calls(),
+            vec!["owned:a".to_string(), "stop:a".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -1130,20 +1138,6 @@ mod restart_tests {
         assert_eq!(
             err,
             InstanceRestartError::ChildVanishedAfterLaunch { id: "a".into() }
-        );
-    }
-
-    #[tokio::test]
-    async fn a_relaunch_on_a_different_port_is_typed() {
-        let fake = FakeLifecycle::new(vec![Some(slot("a", 9877)), Some(slot("a", 9880))]);
-        let err = restart_with(&fake, "a", None).await.unwrap_err();
-        assert_eq!(
-            err,
-            InstanceRestartError::PortChanged {
-                id: "a".into(),
-                before: 9877,
-                after: 9880
-            }
         );
     }
 

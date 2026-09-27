@@ -12,8 +12,16 @@ import { buildSpecWorkflow, type BuildSpecWorkflowInput } from "./buildSpecWorkf
 import type { UnifiedWorkflow } from "../../types/unified-workflow";
 
 export interface RunnerTarget {
-  /** Runner instance ID (used by supervisor for restarts). */
+  /** Runner instance row ID — names the loop (`spec-<runnerId>`). */
   runnerId: string;
+  /**
+   * The dev supervisor's id for this runner, when (and only when) the row came
+   * from the supervisor's `/runners`. It is the only value ever sent as
+   * `target_runner_id`: the backend resolves a restart target by port and
+   * uses the id solely for a dev-supervisor rebuild, refusing an explicit id
+   * that is not the supervisor's. Omit for runner-owned rows.
+   */
+  supervisorRunnerId?: string | null;
   /** Port the target runner is listening on. */
   port: number;
   /** Human-readable name for display. */
@@ -119,6 +127,11 @@ function mergeSpecConfigs(specs: DiscoveredSpec[]): BuildSpecWorkflowInput["spec
   };
 }
 
+/** `target_runner_id` for a spec loop: the supervisor id, or null. */
+export function targetRunnerIdForLoop(runner: RunnerTarget): string | null {
+  return runner.supervisorRunnerId ?? null;
+}
+
 /**
  * Build a multi-runner spec workflow configuration.
  *
@@ -181,7 +194,7 @@ export function buildMultiRunnerSpecWorkflow(
       label: `${partition.label} → ${runner.name}`,
       config: {
         target_runner_port: runner.port,
-        target_runner_id: runner.runnerId,
+        target_runner_id: targetRunnerIdForLoop(runner),
         supervisor_port: loopSettings.supervisorPort ?? 9875,
         workflow_id: workflow.id ?? "",
         // null = unlimited (matches the new convention); only fall back to a

@@ -68,7 +68,11 @@ export function normalizeRestartCapability(raw: unknown): RestartCapability | nu
 
 // --- Between-mode helpers shared by both panels ---
 
-export type BetweenWire = { type: string; rebuild?: boolean };
+export type BetweenWire =
+  | { type: "restart_runner"; rebuild: boolean }
+  | { type: "restart_on_signal"; rebuild: boolean }
+  | { type: "wait_healthy" }
+  | { type: "none" };
 
 /** Map a "Between" select value to the backend's `between_iterations`. */
 export function betweenToWire(between: string): BetweenWire {
@@ -94,6 +98,16 @@ export function isRestartMode(between: string): boolean {
 export function defaultBetween(targetIsSelf: boolean): string {
   return targetIsSelf ? "wait_healthy" : "restart_on_signal";
 }
+
+/**
+ * Spec-partition wizard default. Its loops target runner-owned secondaries,
+ * never this runner, so it keeps its restart-on-signal intent — but WITHOUT
+ * rebuild: the no-rebuild variant restarts in-process through the
+ * InstanceManager on a published install, whereas rebuild needs the dev
+ * supervisor and a source checkout. (The wizard persists nothing, so there is
+ * no restore path to apply {@link restoreBetween} to.)
+ */
+export const SPEC_WIZARD_DEFAULT_BETWEEN = "restart_on_signal_no_rebuild";
 
 /**
  * Value restored from a saved config. A saved value is kept VERBATIM even when
@@ -213,6 +227,7 @@ export function createCapabilityRequester(
  */
 export function useRestartCapabilities(
   probes: RestartCapabilityProbe[],
+  refreshToken: string = "",
   invokeFn: CapabilityInvoke = invoke,
 ): RestartCapabilityState[] {
   const key = probes.length > 0 ? JSON.stringify(probes) : "";
@@ -225,7 +240,12 @@ export function useRestartCapabilities(
       setAnswer({ key, results }),
     );
     return requester.cancel;
-  }, [key, invokeFn]);
+    // `refreshToken` re-asks the SAME probes when the world they depend on
+    // changes (e.g. the user launched the target in Settings → Runner
+    // Instances, turning a `target_not_runner_managed` refusal stale). The
+    // previous verdict stays displayed until the fresh one lands, because the
+    // answer is still keyed to the unchanged probes.
+  }, [key, refreshToken, invokeFn]);
 
   if (!key) return [];
   if (!answer || answer.key !== key) return probes.map(() => ({ status: "checking" }));
@@ -235,9 +255,10 @@ export function useRestartCapabilities(
 /** Single-probe form of {@link useRestartCapabilities}. */
 export function useRestartCapability(
   probe: RestartCapabilityProbe | null,
+  refreshToken: string = "",
   invokeFn: CapabilityInvoke = invoke,
 ): RestartCapabilityState {
-  const states = useRestartCapabilities(probe ? [probe] : [], invokeFn);
+  const states = useRestartCapabilities(probe ? [probe] : [], refreshToken, invokeFn);
   return states[0] ?? { status: "idle" };
 }
 
