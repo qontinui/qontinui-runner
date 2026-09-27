@@ -58,22 +58,10 @@ export function RemoteTabControls({
   // take a whole catch-up poll tick — so the busy state has to say so rather
   // than spin silently.
   const attachWaiting = useRemoteAttachWaiting();
-  // Polled only for a live remote tab; a dead pane has no receipts to read.
-  const [interactivity, nowMs] = useRemoteInteractivity(
-    tab.remote && tab.isAlive ? tab.id : null,
-  );
 
   if (!badge || !tab.remote) return null;
   const remote = tab.remote;
   const waitingLine = attachWaitingMessage(attachWaiting[remote.sessionId]);
-  const footer =
-    tab.isAlive && interactivity
-      ? remoteInteractivityFooter(
-          interactivity,
-          nowMs,
-          remote.deviceLabel.trim() || remote.deviceId.slice(0, 8),
-        )
-      : null;
 
   const loadHistory = async () => {
     if (busy) return;
@@ -206,27 +194,13 @@ export function RemoteTabControls({
           {waitingLine}
         </span>
       )}
-      {footer && (
-        <span
-          data-ui-bridge-id={`terminal.remote-interactivity.${tab.id}`}
-          className="text-[8px] text-[#565f89] truncate max-w-[18rem]"
-          title={footer.summary}
-          role="status"
-        >
-          {footer.summary}
-        </span>
-      )}
-      {footer?.note && (
-        <span
-          data-ui-bridge-id={`terminal.remote-input-note.${tab.id}`}
-          className={`text-[8px] truncate max-w-[14rem] ${
-            footer.noteKind === "warning" ? "text-[#f7768e]" : "text-[#e0af68]"
-          }`}
-          title={footer.note}
-          role={footer.noteKind === "warning" ? "alert" : "status"}
-        >
-          {footer.note}
-        </span>
+      {/* Mounted only for a live remote tab, so its 1 Hz poll re-renders
+          just this footer and never a local tab's controls. */}
+      {tab.isAlive && (
+        <RemoteInteractivityFooter
+          terminalId={tab.id}
+          deviceLabel={remote.deviceLabel.trim() || remote.deviceId.slice(0, 8)}
+        />
       )}
       {note && !(busy === "reattach" && waitingLine) && (
         <span
@@ -235,6 +209,48 @@ export function RemoteTabControls({
           title={note}
         >
           {note}
+        </span>
+      )}
+    </>
+  );
+}
+
+/**
+ * The interactivity footer of a live remote tab (plan
+ * `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`,
+ * A1): "last output received Ns ago · last keystroke accepted Ns ago", plus an
+ * inline note when input is not getting through or its fate is unknown.
+ */
+function RemoteInteractivityFooter({
+  terminalId,
+  deviceLabel,
+}: {
+  terminalId: string;
+  deviceLabel: string;
+}) {
+  const [snapshot, nowMs] = useRemoteInteractivity(terminalId);
+  if (!snapshot) return null;
+  const footer = remoteInteractivityFooter(snapshot, nowMs, deviceLabel);
+  return (
+    <>
+      <span
+        data-ui-bridge-id={`terminal.remote-interactivity.${terminalId}`}
+        className="text-[8px] text-[#565f89] truncate max-w-[18rem]"
+        title={footer.summary}
+        role="status"
+      >
+        {footer.summary}
+      </span>
+      {footer.note && (
+        <span
+          data-ui-bridge-id={`terminal.remote-input-note.${terminalId}`}
+          className={`text-[8px] truncate max-w-[14rem] ${
+            footer.noteKind === "warning" ? "text-[#f7768e]" : "text-[#e0af68]"
+          }`}
+          title={footer.note}
+          role={footer.noteKind === "warning" ? "alert" : "status"}
+        >
+          {footer.note}
         </span>
       )}
     </>

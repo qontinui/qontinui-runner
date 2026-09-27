@@ -7838,6 +7838,57 @@ mod relay_routing_tests {
         assert_eq!(msg_type, "remote_terminal_created");
     }
 
+    /// The A1 input ack, relay-shaped (the relay strips `remote`, `request_id`
+    /// and `code` and retypes it) and with the target's echo left on, is
+    /// dispatched unchanged — and the dispatched frame, handed to the same
+    /// `handle_inbound` the `remote_terminal_input_ack` arm calls, lands on the
+    /// pane. `handle_relay_command` itself needs an `ApiState` (a live
+    /// `tauri::AppHandle`) and cannot be built in a unit test; the arm's
+    /// presence is pinned textually by
+    /// `every_reply_handle_inbound_knows_passes_both_inbound_gates`.
+    #[test]
+    fn a_relay_shaped_input_ack_is_dispatched_unchanged_and_reaches_the_pane() {
+        use crate::mcp::remote_terminal::RemoteAttachClient;
+        use crate::terminal::remote_pane_io::{AttachedRing, RemotePaneIo};
+        let relay_shaped = json!({
+            "type": "remote_terminal_input_ack",
+            "grant_jti": "jti-a1",
+            "terminal_id": "t1",
+            "seq": 3,
+            "bytes": 1,
+            "accepted": true,
+            "via": "traffic",
+            "accepted_at": "2026-09-27T00:00:00.000Z",
+        });
+        let (msg_type, data) = dispatched(route_relay_frame(
+            "remote_terminal_input_ack",
+            &relay_shaped,
+        ));
+        assert_eq!(msg_type, "remote_terminal_input_ack");
+        assert_eq!(data, relay_shaped, "routing must not reshape the frame");
+        let mut echoed = relay_shaped.clone();
+        echoed["remote"] = attach_block();
+        let (msg_type, _) = dispatched(route_relay_frame("remote_terminal_input_ack", &echoed));
+        assert_eq!(msg_type, "remote_terminal_input_ack");
+
+        let client = RemoteAttachClient::new();
+        let pane = std::sync::Arc::new(RemotePaneIo::new(
+            "jti-a1",
+            "t1",
+            "g",
+            client.sink(),
+            80,
+            24,
+            AttachedRing::default(),
+        ));
+        client.register_pane(pane.clone());
+        assert!(client.handle_inbound(&msg_type, &data));
+        assert_eq!(
+            pane.interactivity().last_input_acked.map(|a| a.seq),
+            Some(Some(3))
+        );
+    }
+
     /// **The finding-1 scenario-B frame.** An ATTACH block on the envelope over
     /// a `terminal_create` payload: the block must reach the inner type, where
     /// it is refused because an attach grant does not buy a spawn. Before the

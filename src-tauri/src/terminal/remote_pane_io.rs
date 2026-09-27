@@ -191,7 +191,12 @@ pub struct RemoteInteractivity {
     /// When this pane was attached (constructed from the attach reply).
     pub attached_at_ms: u64,
     pub last_input_sent: Option<InputSent>,
+    /// The last ack for a KEYSTROKE (`via: traffic`). Probe acks never land
+    /// here: an accepted probe must not hide a refused keystroke, nor count as
+    /// acknowledging keystrokes sent before it.
     pub last_input_acked: Option<InputAcked>,
+    /// The last ack for a write PROBE (`via: probe`).
+    pub last_probe_acked: Option<InputAcked>,
     /// Acks received over this pane's whole life, accepted or not.
     pub acks_received: u64,
     /// Acks received since the CURRENT attachment was (re)established — reset
@@ -298,6 +303,7 @@ impl RemotePaneIo {
                     attached_at_ms: now_epoch_ms(),
                     last_input_sent: None,
                     last_input_acked: None,
+                    last_probe_acked: None,
                     acks_received: 0,
                     acks_since_attach: 0,
                     last_probe_sent: None,
@@ -321,7 +327,8 @@ impl RemotePaneIo {
         }
     }
 
-    /// Record a `remote_terminal_input_ack` routed here by `grant_jti`.
+    /// Record a `remote_terminal_input_ack` routed here by `grant_jti`, into
+    /// the traffic or the probe slot by its `via`.
     ///
     /// Recorded as it arrives: the relay preserves order per attachment, so the
     /// newest ack is the newest answer. `seq` is echoed from the frame the
@@ -366,23 +373,22 @@ impl RemotePaneIo {
                 "remote pane: the target refused input it had admitted"
             );
         }
-        let mut g = self
-            .interactivity
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut g = self.interactivity.lock().unwrap_or_else(|e| e.into_inner());
         g.snapshot.acks_received = g.snapshot.acks_received.saturating_add(1);
+        // Any ack — probe or traffic — proves the target speaks the protocol.
         g.snapshot.acks_since_attach = g.snapshot.acks_since_attach.saturating_add(1);
-        g.snapshot.last_input_acked = Some(acked);
+        if acked.via == "probe" {
+            g.snapshot.last_probe_acked = Some(acked);
+        } else {
+            g.snapshot.last_input_acked = Some(acked);
+        }
     }
 
     /// The relay re-established this pane's attachment (a reattach after a
     /// relay drop). The target behind it may now be a different build, so
     /// what it proved about acknowledging input no longer holds.
     pub fn note_reattached(&self) {
-        let mut g = self
-            .interactivity
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut g = self.interactivity.lock().unwrap_or_else(|e| e.into_inner());
         g.snapshot.acks_since_attach = 0;
     }
 
@@ -398,10 +404,7 @@ impl RemotePaneIo {
     /// phantom turns that slot exists to catch. Only a target that has ALREADY
     /// acked on this attachment is known to honour the flag.
     pub fn send_input_probe(&self) -> Result<u64, String> {
-        let mut g = self
-            .interactivity
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut g = self.interactivity.lock().unwrap_or_else(|e| e.into_inner());
         if g.snapshot.acks_since_attach == 0 {
             return Err(format!(
                 "{TARGET_PREDATES_INPUT_ACK}: no input ack has been received on this attachment, \
@@ -430,10 +433,7 @@ impl RemotePaneIo {
     /// Stamp the read half: a frame from the target was just spliced.
     fn note_frame_received(&self) {
         let through_offset = self.remote_offset();
-        let mut g = self
-            .interactivity
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut g = self.interactivity.lock().unwrap_or_else(|e| e.into_inner());
         g.snapshot.last_frame_received = Some(FrameReceived {
             at_ms: now_epoch_ms(),
             through_offset,
@@ -537,8 +537,12 @@ impl RemotePaneIo {
                 ring_end = end,
                 "remote pane: reattach ring adds nothing new"
             );
-            // Still a frame the target answered with — the read half holds.
-            self.note_frame_received();
+            // Still a frame the target answered with — the read half holds —
+            // but only while the pane is open, as in `push_output`: a frame
+            // after exit went nowhere and is not a receipt.
+            if self.output_open() {
+                self.note_frame_received();
+            }
             return;
         }
         let skip = if have > start {
@@ -586,6 +590,13 @@ impl RemotePaneIo {
             "remote pane: target reported an error — closing the pane"
         );
         self.mark_exit(ERROR_EXIT_CODE);
+    }
+
+    fn output_open(&self) -> bool {
+        self.output_tx
+            .lock()
+            .map(|tx| tx.is_some())
+            .unwrap_or(false)
     }
 
     fn close_output(&self) {
@@ -713,10 +724,7 @@ impl Write for FrameWriter {
         // whose frame failed to queue is consumed anyway: seq need only be
         // strictly increasing, and reusing one would let a late ack for it
         // acknowledge a different keystroke.
-        let mut g = self
-            .interactivity
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut g = self.interactivity.lock().unwrap_or_else(|e| e.into_inner());
         let seq = g.next_seq;
         g.next_seq = g.next_seq.saturating_add(1);
         self.sink
@@ -936,6 +944,68 @@ pub(crate) mod tests {
         assert_eq!((sent.seq, sent.bytes), (3, 1));
     }
 
+    /// A frame the relay could not queue (backlog full) still CONSUMES its seq
+    /// — reusing it would let a late ack for it acknowledge a different
+    /// keystroke — but is not recorded as sent, and the write errors.
+    #[test]
+    fn a_frame_that_fails_to_queue_consumes_its_seq_but_is_not_recorded_sent() {
+        struct FlakySink {
+            fail_next: Mutex<bool>,
+            frames: Mutex<Vec<Value>>,
+        }
+        impl RemoteFrameSink for FlakySink {
+            fn send_frame(&self, frame: Value) -> Result<(), String> {
+                let mut f = self.fail_next.lock().unwrap();
+                if *f {
+                    *f = false;
+                    return Err("remote attach: relay outbound backlog is full".into());
+                }
+                self.frames.lock().unwrap().push(frame);
+                Ok(())
+            }
+        }
+        let sink = Arc::new(FlakySink {
+            fail_next: Mutex::new(true),
+            frames: Mutex::new(Vec::new()),
+        });
+        let dyn_sink: Arc<dyn RemoteFrameSink> = sink.clone();
+        let pane = RemotePaneIo::new("j", "t", "g", dyn_sink, 80, 24, AttachedRing::default());
+        let mut w = pane.writer().unwrap();
+        assert!(
+            w.write(b"a").is_err(),
+            "a frame that did not queue must error"
+        );
+        assert_eq!(pane.interactivity().last_input_sent, None);
+        w.write_all(b"b").unwrap();
+        let frames = sink.frames.lock().unwrap().clone();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0]["seq"], 2,
+            "seq 1 was consumed by the failed frame"
+        );
+        assert_eq!(pane.interactivity().last_input_sent.map(|s| s.seq), Some(2));
+    }
+
+    /// Probe acks land in their own slot: an accepted probe after a refused
+    /// keystroke leaves the keystroke's refusal visible.
+    #[test]
+    fn a_probe_ack_does_not_overwrite_the_keystroke_ack() {
+        let sink = Arc::new(RecordingSink::default());
+        let pane = pane(&sink, AttachedRing::default());
+        pane.record_input_ack(&json!({
+            "seq": 4, "accepted": false, "error": "terminal_exited", "via": "traffic",
+        }));
+        pane.record_input_ack(&json!({"seq": 5, "accepted": true, "via": "probe", "bytes": 0}));
+        let i = pane.interactivity();
+        let key = i.last_input_acked.expect("keystroke ack");
+        assert_eq!((key.seq, key.accepted), (Some(4), false));
+        assert_eq!(i.last_probe_acked.map(|p| p.seq), Some(Some(5)));
+        assert_eq!(
+            i.acks_since_attach, 2,
+            "a probe ack still proves the protocol"
+        );
+    }
+
     /// A1: an ack updates `last_input_acked` (source-clock arrival time,
     /// the target's code on a refusal) and counts toward `acks_received`.
     #[test]
@@ -990,14 +1060,22 @@ pub(crate) mod tests {
         assert_eq!(probe["seq"], 2);
         let i = pane.interactivity();
         assert_eq!(i.last_probe_sent.map(|p| p.seq), Some(2));
-        assert_eq!(i.last_input_sent.map(|p| p.seq), Some(1), "a probe is not a keystroke");
+        assert_eq!(
+            i.last_input_sent.map(|p| p.seq),
+            Some(1),
+            "a probe is not a keystroke"
+        );
 
         pane.note_reattached();
         assert!(pane
             .send_input_probe()
             .unwrap_err()
             .starts_with(TARGET_PREDATES_INPUT_ACK));
-        assert_eq!(pane.interactivity().acks_received, 1, "lifetime count survives");
+        assert_eq!(
+            pane.interactivity().acks_received,
+            1,
+            "lifetime count survives"
+        );
     }
 
     /// A1 read half: the attach seed, live output and a reattach ring (even
@@ -1019,7 +1097,10 @@ pub(crate) mod tests {
         assert_eq!(seeded.through_offset, 14);
         pane.push_output(b"xyz");
         assert_eq!(
-            pane.interactivity().last_frame_received.unwrap().through_offset,
+            pane.interactivity()
+                .last_frame_received
+                .unwrap()
+                .through_offset,
             17
         );
         // A ring wholly behind what we have is still a receipt.
@@ -1030,16 +1111,25 @@ pub(crate) mod tests {
             history_start: None,
         });
         assert_eq!(
-            pane.interactivity().last_frame_received.unwrap().through_offset,
+            pane.interactivity()
+                .last_frame_received
+                .unwrap()
+                .through_offset,
             17
         );
-        // After exit, output goes nowhere and is NOT a receipt.
+        // After exit, output goes nowhere and is NOT a receipt — neither a
+        // live chunk nor a reattach ring that adds nothing.
+        let before = pane.interactivity().last_frame_received;
         pane.mark_exit(0);
+        std::thread::sleep(Duration::from_millis(2));
         pane.push_output(b"late");
-        assert_eq!(
-            pane.interactivity().last_frame_received.unwrap().through_offset,
-            17
-        );
+        pane.splice_replay(&AttachedRing {
+            buffer: b"x".to_vec(),
+            start_offset: 11,
+            total_bytes_produced: 12,
+            history_start: None,
+        });
+        assert_eq!(pane.interactivity().last_frame_received, before);
     }
 
     /// resize / set_paused / kill / release map to the contract's frames;

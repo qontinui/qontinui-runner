@@ -1024,12 +1024,24 @@ pub fn terminal_remote_interactivity(
     terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
     terminal_id: String,
 ) -> Result<CommandResponse, String> {
-    let Some(identity) = terminal_manager.remote_identity(&terminal_id) else {
+    remote_interactivity_response(terminal_manager.inner(), &terminal_id, |jti| {
+        client().pane(jti)
+    })
+}
+
+/// The body of [`terminal_remote_interactivity`], with the live-pane lookup
+/// injected so it is testable without the process-wide client.
+pub(crate) fn remote_interactivity_response(
+    terminal_manager: &TerminalManager,
+    terminal_id: &str,
+    live_pane: impl Fn(&str) -> Option<Arc<crate::terminal::remote_pane_io::RemotePaneIo>>,
+) -> Result<CommandResponse, String> {
+    let Some(identity) = terminal_manager.remote_identity(terminal_id) else {
         return Err(format!(
             "remote_attach:not_remote: terminal {terminal_id} is not a remote tab"
         ));
     };
-    let Some(pane) = client().pane(&identity.grant_jti) else {
+    let Some(pane) = live_pane(&identity.grant_jti) else {
         return Ok(CommandResponse {
             success: false,
             message: Some("the remote pane behind this tab is closed".to_string()),
@@ -1703,5 +1715,76 @@ mod represent_tests {
             GRANT_LEARN_WINDOW > crate::session::attach::POLL_INTERVAL,
             "the window must cover at least one tick of a target that polls as this one does"
         );
+    }
+}
+
+#[cfg(test)]
+mod interactivity_command_tests {
+    use super::remote_interactivity_response;
+    use crate::terminal::remote_pane_io::tests::RecordingSink;
+    use crate::terminal::remote_pane_io::{AttachedRing, RemoteFrameSink, RemotePaneIo};
+    use crate::terminal::types::RemoteTabIdentity;
+    use crate::terminal::TerminalManager;
+    use std::sync::Arc;
+
+    fn identity() -> RemoteTabIdentity {
+        RemoteTabIdentity {
+            device_id: "device-1".into(),
+            device_label: "spaceship".into(),
+            session_id: "session-1".into(),
+            remote_terminal_id: "rt-1".into(),
+            grant_jti: "jti-1".into(),
+            history_available: false,
+        }
+    }
+
+    #[test]
+    fn a_local_tab_is_refused_as_not_remote() {
+        let tm = TerminalManager::new();
+        let err = remote_interactivity_response(&tm, "local-1", |_| None).unwrap_err();
+        assert!(err.starts_with("remote_attach:not_remote"), "{err}");
+    }
+
+    #[test]
+    fn a_closed_pane_answers_success_false_not_a_stale_snapshot() {
+        let tm = TerminalManager::new();
+        tm.set_remote_identity("tab-1", identity());
+        let r = remote_interactivity_response(&tm, "tab-1", |_| None).unwrap();
+        assert!(!r.success);
+        assert!(r.data.is_none());
+    }
+
+    #[test]
+    fn a_live_pane_serves_its_camel_case_snapshot() {
+        let tm = TerminalManager::new();
+        tm.set_remote_identity("tab-1", identity());
+        let sink: Arc<dyn RemoteFrameSink> = Arc::new(RecordingSink::default());
+        let pane = Arc::new(RemotePaneIo::new(
+            "jti-1",
+            "rt-1",
+            "g",
+            sink,
+            80,
+            24,
+            AttachedRing::default(),
+        ));
+        let r = remote_interactivity_response(&tm, "tab-1", |jti| {
+            (jti == "jti-1").then(|| pane.clone())
+        })
+        .unwrap();
+        assert!(r.success);
+        let d = r.data.unwrap();
+        for key in [
+            "attachedAtMs",
+            "lastInputSent",
+            "lastInputAcked",
+            "lastProbeAcked",
+            "acksReceived",
+            "acksSinceAttach",
+            "lastProbeSent",
+            "lastFrameReceived",
+        ] {
+            assert!(d.get(key).is_some(), "missing {key} in {d}");
+        }
     }
 }
