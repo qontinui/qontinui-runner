@@ -233,15 +233,21 @@ pub(crate) async fn run_dispatch(
         &payload.fetch_url,
         &payload.candidate_ref,
         &payload.head_sha,
+        &cancel,
     )
     .await
     {
         Ok(p) => p,
         Err(e) => {
+            // A head that never reached the mirror (or was replaced) is a
+            // non-verdict — `cancelled` + `head_sha_unavailable` — never a
+            // `failure`, which would poison shadow parity with a red the code
+            // under test did not earn.
+            let (conclusion, reason) = e.result_disposition();
             sink.push(&format!("[ci-node] checkout failed: {e}"));
             steps_summary.push(StepSummary {
                 name: "[setup] checkout".to_string(),
-                conclusion: "failure".to_string(),
+                conclusion: conclusion.to_string(),
                 duration_secs: checkout_started.elapsed().as_secs(),
             });
             let tail = sink.finish().await;
@@ -249,9 +255,9 @@ pub(crate) async fn run_dispatch(
             let reported = reporting::post_result(
                 &base,
                 &payload.dispatch_id,
-                "failure",
+                conclusion,
                 &steps_summary,
-                None,
+                reason,
                 &tail,
                 None,
                 // The gate has not run yet — at these two exits the manifest is
