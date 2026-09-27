@@ -49,64 +49,150 @@ const REGISTRY_EVENTS: [&str; 3] = [
     "focus:",
 ];
 
-/// The registry events one listener registered. Each successful
-/// `RegisterEvent` is tracked separately, so only those are deregistered.
+/// How long one `RegisterEvent` / `DeregisterEvent` call may take. The
+/// registry is a single D-Bus service every client shares; a wedged one must
+/// not hang `connect`, `disconnect` or `subscribe_events`. On elapse the call
+/// is logged and abandoned (its reply, if any, is ignored).
+const REGISTRY_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Where registry registrations go: the AT-SPI registry in production, a
+/// recording fake in tests (so the deregistration paths are exercised
+/// without a bus).
+#[async_trait]
+trait RegistrySink: Send + Sync + 'static {
+    async fn register_event(&self, event: &'static str) -> anyhow::Result<()>;
+    async fn deregister_event(&self, event: &'static str) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+impl RegistrySink for RegistryProxy<'static> {
+    async fn register_event(&self, event: &'static str) -> anyhow::Result<()> {
+        Ok(RegistryProxy::register_event(self, event).await?)
+    }
+
+    async fn deregister_event(&self, event: &'static str) -> anyhow::Result<()> {
+        Ok(RegistryProxy::deregister_event(self, event).await?)
+    }
+}
+
+/// The lock serializing registration and deregistration on one adapter (see
+/// [`AtspiAdapter::subscribe_lock`]), and an owned guard of it.
+type SubscribeLock = Arc<tokio::sync::Mutex<()>>;
+type SubscribeGuard = tokio::sync::OwnedMutexGuard<()>;
+
+/// The registry events one listener registered. Each `RegisterEvent` that
+/// was not refused is tracked separately, so only those are deregistered.
 ///
 /// Deregister with [`RegistryRegistrations::deregister`] where an `.await` is
-/// possible; dropping it instead spawns the deregistration on the current
-/// tokio runtime (best effort — the only path from a synchronous `Drop`).
+/// possible; it pops each event only once its call has completed (or timed
+/// out), so a cancelled deregistration leaves the rest to `Drop`. Dropping
+/// the set with events left spawns their deregistration on the current tokio
+/// runtime (best effort — the only path from a synchronous `Drop`). The
+/// spawned task deregisters under the adapter's `subscribe_lock`: it takes
+/// over the guard this set holds, if any (a cancelled `subscribe_events` or
+/// stop), and otherwise acquires the lock first — so it can never interleave
+/// with a `subscribe_events` registering the same event strings.
 struct RegistryRegistrations {
-    registry: Option<RegistryProxy<'static>>,
+    sink: Option<Arc<dyn RegistrySink>>,
     events: Vec<&'static str>,
+    lock: Option<SubscribeLock>,
+    /// The `subscribe_lock` guard, while this set is being registered or
+    /// deregistered under it.
+    held: Option<SubscribeGuard>,
 }
 
 impl RegistryRegistrations {
     /// No registrations (no bus, or nothing registered).
     fn none() -> Self {
         Self {
-            registry: None,
+            sink: None,
             events: Vec::new(),
+            lock: None,
+            held: None,
         }
     }
 
-    /// Register each of [`REGISTRY_EVENTS`]. A refusal is logged, not
-    /// returned: the listener's match rules still receive whatever the
-    /// bridges emit for other clients.
-    async fn register(registry: &RegistryProxy<'static>) -> Self {
-        let mut events = Vec::with_capacity(REGISTRY_EVENTS.len());
+    /// Register each of [`REGISTRY_EVENTS`] with `sink`, holding `guard`
+    /// throughout (release it with [`Self::release_guard`]). A refusal is
+    /// logged, not returned: the listener's match rules still receive
+    /// whatever the bridges emit for other clients. An event is recorded
+    /// before its call, so a cancellation or timeout mid-call still
+    /// deregisters it (deregistering an event the registry never recorded is
+    /// a no-op there); only an explicit refusal un-records it.
+    async fn register(
+        sink: Arc<dyn RegistrySink>,
+        lock: SubscribeLock,
+        guard: SubscribeGuard,
+    ) -> Self {
+        let mut this = Self {
+            sink: Some(sink.clone()),
+            events: Vec::with_capacity(REGISTRY_EVENTS.len()),
+            lock: Some(lock),
+            held: Some(guard),
+        };
         for event in REGISTRY_EVENTS {
-            match registry.register_event(event).await {
-                Ok(()) => events.push(event),
-                Err(e) => warn!("AT-SPI registry RegisterEvent({event}) failed: {e}"),
+            this.events.push(event);
+            match tokio::time::timeout(REGISTRY_CALL_TIMEOUT, sink.register_event(event)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    this.events.pop();
+                    warn!("AT-SPI registry RegisterEvent({event}) failed: {e}");
+                }
+                Err(_) => warn!(
+                    "AT-SPI registry RegisterEvent({event}) timed out after {REGISTRY_CALL_TIMEOUT:?}"
+                ),
             }
         }
-        Self {
-            registry: Some(registry.clone()),
-            events,
-        }
+        this
     }
 
-    /// Deregister everything this set registered, awaiting each call.
-    async fn deregister(mut self) {
-        let events = std::mem::take(&mut self.events);
-        if let Some(registry) = self.registry.take() {
-            deregister_events(&registry, &events).await;
+    /// Hand back the `subscribe_lock` guard this set holds.
+    fn release_guard(&mut self) -> Option<SubscribeGuard> {
+        self.held.take()
+    }
+
+    /// Deregister everything still registered, awaiting each call (bounded
+    /// by [`REGISTRY_CALL_TIMEOUT`]). Each event is popped only after its
+    /// call completes, so if this future is cancelled the remainder is
+    /// deregistered by `Drop`.
+    async fn deregister(&mut self) {
+        let Some(sink) = self.sink.clone() else {
+            self.events.clear();
+            return;
+        };
+        while let Some(&event) = self.events.last() {
+            deregister_one(sink.as_ref(), event).await;
+            self.events.pop();
         }
     }
 }
 
 impl Drop for RegistryRegistrations {
     fn drop(&mut self) {
+        let held = self.held.take();
         let events = std::mem::take(&mut self.events);
-        let Some(registry) = self.registry.take() else {
+        let Some(sink) = self.sink.take() else {
             return;
         };
         if events.is_empty() {
             return;
         }
+        let lock = self.lock.take();
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
-                runtime.spawn(async move { deregister_events(&registry, &events).await });
+                runtime.spawn(async move {
+                    // Keep (or take) the lock until every event is
+                    // deregistered, so a retrying `subscribe_events` cannot
+                    // register in between and then be undone.
+                    let _guard = match (held, lock) {
+                        (Some(guard), _) => Some(guard),
+                        (None, Some(lock)) => Some(lock.lock_owned().await),
+                        (None, None) => None,
+                    };
+                    for event in events.iter().rev() {
+                        deregister_one(sink.as_ref(), event).await;
+                    }
+                });
             }
             Err(_) => warn!(
                 "AT-SPI registry events {events:?} not deregistered: no tokio runtime at drop"
@@ -115,11 +201,15 @@ impl Drop for RegistryRegistrations {
     }
 }
 
-async fn deregister_events(registry: &RegistryProxy<'static>, events: &[&'static str]) {
-    for event in events {
-        if let Err(e) = registry.deregister_event(event).await {
-            warn!("AT-SPI registry DeregisterEvent({event}) failed: {e}");
-        }
+/// One bounded `DeregisterEvent`; a failure or timeout is logged, never
+/// returned (there is nothing a caller could do but carry on).
+async fn deregister_one(sink: &dyn RegistrySink, event: &'static str) {
+    match tokio::time::timeout(REGISTRY_CALL_TIMEOUT, sink.deregister_event(event)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("AT-SPI registry DeregisterEvent({event}) failed: {e}"),
+        Err(_) => warn!(
+            "AT-SPI registry DeregisterEvent({event}) timed out after {REGISTRY_CALL_TIMEOUT:?}"
+        ),
     }
 }
 
@@ -149,10 +239,14 @@ pub struct AtspiAdapter {
     /// `connect`/`disconnect`, and on drop. A `std` mutex because
     /// `subscribe_events` takes `&self`; never held across an `.await`.
     event_listener: Mutex<Option<EventListener>>,
-    /// Serializes `subscribe_events`, so one call's deregistration can never
-    /// interleave with (and undo) another call's registration of the same
-    /// event strings.
-    subscribe_lock: tokio::sync::Mutex<()>,
+    /// Serializes every registration and deregistration of registry events:
+    /// `subscribe_events` holds it across stopping the old listener and
+    /// registering for the new one, stops on `connect` / `disconnect` take
+    /// it, and a deregistration spawned from `Drop` (cancellation, adapter
+    /// drop) runs under it — taking over a cancelled caller's guard, or
+    /// acquiring it first. So no deregistration can interleave with (and
+    /// undo) a registration of the same event strings on this adapter.
+    subscribe_lock: SubscribeLock,
 }
 
 impl Drop for AtspiAdapter {
@@ -178,7 +272,7 @@ impl AtspiAdapter {
             next_ref: AtomicU64::new(1),
             connected: AtomicBool::new(false),
             event_listener: Mutex::new(None),
-            subscribe_lock: tokio::sync::Mutex::new(()),
+            subscribe_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -199,11 +293,26 @@ impl AtspiAdapter {
         })
     }
 
-    /// Stop the listener and await the deregistration of its registry events.
+    /// Stop the listener and await the deregistration of its registry
+    /// events, under `subscribe_lock`.
     async fn stop_event_listener(&self) {
-        if let Some(registrations) = self.take_event_listener() {
-            registrations.deregister().await;
-        }
+        let guard = self.subscribe_lock.clone().lock_owned().await;
+        drop(self.stop_event_listener_locked(guard).await);
+    }
+
+    /// [`Self::stop_event_listener`] for a caller already holding the lock.
+    /// The guard rides in the registrations while they deregister, so if this
+    /// future is cancelled their `Drop` finishes the job still holding it;
+    /// on completion the guard is handed back.
+    async fn stop_event_listener_locked(&self, guard: SubscribeGuard) -> SubscribeGuard {
+        let Some(mut registrations) = self.take_event_listener() else {
+            return guard;
+        };
+        registrations.held = Some(guard);
+        registrations.deregister().await;
+        registrations
+            .release_guard()
+            .expect("the guard was stored above and only Drop takes it")
     }
 
     /// Put `listener` in the slot. Anything it displaces (only possible if a
@@ -639,7 +748,10 @@ impl PlatformAdapter for AtspiAdapter {
     /// Idempotent per connection: the previous listener (its match rules and
     /// its registry registrations) is stopped first. The match rules are
     /// registered before this returns, so a bus refusal is an `Err`, not a
-    /// silently empty stream.
+    /// silently empty stream — and before any registry event is registered,
+    /// so that `Err` leaves nothing registered. The whole call runs under
+    /// `subscribe_lock`; if it is cancelled mid-registration, the partial
+    /// registrations deregister from `Drop` still holding that lock.
     ///
     /// A match rule only filters what reaches this client; whether a GTK / Qt
     /// bridge emits an event at all depends on some client having registered
@@ -655,10 +767,8 @@ impl PlatformAdapter for AtspiAdapter {
             .context("Not connected to AT-SPI bus")?;
         let zconn = conn.connection().clone();
 
-        let _serialized = self.subscribe_lock.lock().await;
-        self.stop_event_listener().await;
-        // `AccessibilityConnection` derefs to the registry proxy.
-        let registrations = RegistryRegistrations::register(conn).await;
+        let guard = self.subscribe_lock.clone().lock_owned().await;
+        let guard = self.stop_event_listener_locked(guard).await;
 
         // One stream per AT-SPI event match rule: focus changes, state changes
         // and structural (children) mutations. `for_match_rule` registers the
@@ -677,6 +787,15 @@ impl PlatformAdapter for AtspiAdapter {
         }
         let mut stream = futures::stream::select_all(streams);
 
+        // Only now, with every match rule in place, ask the bridges to emit.
+        // Nothing fallible follows, so there is no error path that would
+        // have to await their deregistration.
+        // `AccessibilityConnection` derefs to the registry proxy.
+        let registry: Arc<dyn RegistrySink> = Arc::new(RegistryProxy::clone(conn));
+        let mut registrations =
+            RegistryRegistrations::register(registry, self.subscribe_lock.clone(), guard).await;
+        let guard = registrations.release_guard();
+
         let (tx, rx) = mpsc::channel::<A11yEvent>(256);
 
         let listener = tokio::spawn(async move {
@@ -692,7 +811,15 @@ impl PlatformAdapter for AtspiAdapter {
                         continue;
                     }
                 };
+                // Taken at receipt: the dedupe window measures how close
+                // together the bus delivered two signals, not how long the
+                // previous `send` waited on a full channel.
+                let received = std::time::Instant::now();
                 let header = msg.header();
+                let sender = header
+                    .sender()
+                    .map(|s| s.as_str().to_string())
+                    .unwrap_or_default();
                 let interface = header.interface().map(|i| i.as_str().to_string());
                 let member = header.member().map(|m| m.as_str().to_string());
                 let path = header
@@ -718,8 +845,8 @@ impl PlatformAdapter for AtspiAdapter {
 
                 if let Some(evt) = event {
                     if let A11yEvent::FocusChanged { ref_id, .. } = &evt {
-                        if !focus_dedupe.admit(ref_id, std::time::Instant::now()) {
-                            trace!("AT-SPI duplicate focus for {ref_id} dropped");
+                        if !focus_dedupe.admit(&sender, ref_id, received) {
+                            trace!("AT-SPI duplicate focus for {sender} {ref_id} dropped");
                             continue;
                         }
                     }
@@ -735,6 +862,7 @@ impl PlatformAdapter for AtspiAdapter {
             task: listener,
             registrations,
         });
+        drop(guard);
 
         Ok(Some(rx))
     }
@@ -1000,25 +1128,32 @@ fn leading_kind_and_detail1(fields: &[zbus::zvariant::Value<'_>]) -> Option<(Str
 const FOCUS_DEDUPE_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Drops a `FocusChanged` that repeats the previous one's element within
-/// [`FOCUS_DEDUPE_WINDOW`]. Pure (the clock is passed in), so it is tested
-/// without a bus.
+/// [`FOCUS_DEDUPE_WINDOW`]. An element is its emitting bus name AND object
+/// path: two applications routinely expose the same path (e.g. every Qt app
+/// numbers its objects from the same base), so a path alone would merge a
+/// real focus move between them. Pure (the clock is passed in), so it is
+/// tested without a bus.
 #[derive(Debug, Default)]
 struct FocusDedupe {
-    /// The last `FocusChanged` admitted: its element path and when.
-    last: Option<(String, std::time::Instant)>,
+    /// The last `FocusChanged` admitted: its sender, element path and when.
+    last: Option<(String, String, std::time::Instant)>,
 }
 
 impl FocusDedupe {
-    /// Whether a `FocusChanged` for `path` at `now` should be forwarded. The
-    /// window runs from the last ADMITTED event, so a steady repeat is still
-    /// forwarded once per window rather than suppressed forever.
-    fn admit(&mut self, path: &str, now: std::time::Instant) -> bool {
-        if let Some((last_path, at)) = &self.last {
-            if last_path == path && now.saturating_duration_since(*at) < FOCUS_DEDUPE_WINDOW {
+    /// Whether a `FocusChanged` from `sender` for `path`, received at `now`,
+    /// should be forwarded. The window runs from the last ADMITTED event, so
+    /// a steady repeat is still forwarded once per window rather than
+    /// suppressed forever.
+    fn admit(&mut self, sender: &str, path: &str, now: std::time::Instant) -> bool {
+        if let Some((last_sender, last_path, at)) = &self.last {
+            if last_sender == sender
+                && last_path == path
+                && now.saturating_duration_since(*at) < FOCUS_DEDUPE_WINDOW
+            {
                 return false;
             }
         }
-        self.last = Some((path.to_owned(), now));
+        self.last = Some((sender.to_owned(), path.to_owned(), now));
         true
     }
 }
@@ -1333,16 +1468,245 @@ mod tests {
         assert!(adapter.event_listener.lock().unwrap().is_none());
     }
 
-    #[test]
-    fn dropping_the_adapter_outside_a_runtime_does_not_panic() {
+    /// A registry stand-in recording every call, in order, as
+    /// `"register <event>"` / `"deregister <event>"`.
+    #[derive(Default)]
+    struct FakeSink {
+        log: Mutex<Vec<String>>,
+        refuse_register: bool,
+        stall_register: bool,
+        /// Deregistering this event never completes.
+        stall_deregister: Option<&'static str>,
+        /// Every deregistration waits for a permit here.
+        gate: Option<Arc<tokio::sync::Semaphore>>,
+    }
+
+    impl FakeSink {
+        fn record(&self, entry: String) {
+            self.log.lock().unwrap().push(entry);
+        }
+
+        fn log(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl RegistrySink for FakeSink {
+        async fn register_event(&self, event: &'static str) -> anyhow::Result<()> {
+            self.record(format!("register {event}"));
+            if self.stall_register {
+                std::future::pending::<()>().await;
+            }
+            if self.refuse_register {
+                bail!("refused");
+            }
+            Ok(())
+        }
+
+        async fn deregister_event(&self, event: &'static str) -> anyhow::Result<()> {
+            self.record(format!("deregister {event}"));
+            if self.stall_deregister == Some(event) {
+                std::future::pending::<()>().await;
+            }
+            if let Some(gate) = &self.gate {
+                gate.acquire().await.unwrap().forget();
+            }
+            Ok(())
+        }
+    }
+
+    fn deregistered(events: &[&str]) -> Vec<String> {
+        events.iter().map(|e| format!("deregister {e}")).collect()
+    }
+
+    /// All of [`REGISTRY_EVENTS`], registered with `sink`.
+    fn registered(
+        sink: &Arc<FakeSink>,
+        lock: Option<SubscribeLock>,
+        held: Option<SubscribeGuard>,
+    ) -> RegistryRegistrations {
+        RegistryRegistrations {
+            sink: Some(sink.clone()),
+            events: REGISTRY_EVENTS.to_vec(),
+            lock,
+            held,
+        }
+    }
+
+    /// Poll `done` (yielding to the runtime) for up to 2 s of real time.
+    async fn eventually(mut done: impl FnMut() -> bool) -> bool {
+        for _ in 0..200 {
+            if done() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        done()
+    }
+
+    fn new_lock() -> SubscribeLock {
+        Arc::new(tokio::sync::Mutex::new(()))
+    }
+
+    #[tokio::test]
+    async fn register_records_every_event_and_hands_the_guard_back() {
+        let sink = Arc::new(FakeSink::default());
+        let lock = new_lock();
+        let guard = lock.clone().lock_owned().await;
+        let mut regs = RegistryRegistrations::register(sink.clone(), lock.clone(), guard).await;
+        assert_eq!(regs.events, REGISTRY_EVENTS.to_vec());
+        assert!(
+            lock.try_lock().is_err(),
+            "the guard is held through register"
+        );
+        drop(regs.release_guard());
+        assert!(lock.try_lock().is_ok());
+        regs.deregister().await;
+    }
+
+    #[tokio::test]
+    async fn a_refused_registration_is_not_deregistered() {
+        let sink = Arc::new(FakeSink {
+            refuse_register: true,
+            ..FakeSink::default()
+        });
+        let lock = new_lock();
+        let guard = lock.clone().lock_owned().await;
+        let regs = RegistryRegistrations::register(sink.clone(), lock, guard).await;
+        assert!(regs.events.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wedged_registry_cannot_hang_register_or_deregister() {
+        let sink = Arc::new(FakeSink {
+            stall_register: true,
+            stall_deregister: Some(REGISTRY_EVENTS[1]),
+            ..FakeSink::default()
+        });
+        let lock = new_lock();
+        let guard = lock.clone().lock_owned().await;
+        let started = tokio::time::Instant::now();
+        let mut regs = RegistryRegistrations::register(sink.clone(), lock, guard).await;
+        // A timed-out registration may still have landed: it is kept.
+        assert_eq!(regs.events, REGISTRY_EVENTS.to_vec());
+        assert_eq!(started.elapsed(), REGISTRY_CALL_TIMEOUT * 3);
+
+        let started = tokio::time::Instant::now();
+        regs.deregister().await;
+        assert!(regs.events.is_empty());
+        assert_eq!(started.elapsed(), REGISTRY_CALL_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_deregistration_leaves_the_rest_to_drop() {
+        let [first, second, third] = REGISTRY_EVENTS;
+        let sink = Arc::new(FakeSink {
+            stall_deregister: Some(second),
+            ..FakeSink::default()
+        });
+        let mut regs = registered(&sink, None, None);
+        let cancelled = tokio::time::timeout(REGISTRY_CALL_TIMEOUT / 5, regs.deregister()).await;
+        assert!(cancelled.is_err());
+        // `third` completed and was popped; `second` was in flight.
+        assert_eq!(regs.events, vec![first, second]);
+
+        drop(regs);
+        tokio::time::sleep(REGISTRY_CALL_TIMEOUT * 4).await;
+        assert_eq!(sink.log(), deregistered(&[third, second, second, first]));
+    }
+
+    #[tokio::test]
+    async fn a_dropped_set_deregisters_only_once_it_holds_the_lock() {
+        let sink = Arc::new(FakeSink::default());
+        let lock = new_lock();
+        let subscribing = lock.clone().lock_owned().await;
+        drop(registered(&sink, Some(lock.clone()), None));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            sink.log().is_empty(),
+            "deregistered while the lock was held"
+        );
+
+        drop(subscribing);
+        let mut expected = REGISTRY_EVENTS;
+        expected.reverse();
+        assert!(eventually(|| sink.log() == deregistered(&expected)).await);
+    }
+
+    /// The cancellation path: a set dropped while holding the guard keeps the
+    /// lock until its deregistration finishes, so a retrying
+    /// `subscribe_events` registers only after it.
+    #[tokio::test]
+    async fn a_dropped_set_holding_the_guard_keeps_the_lock_until_deregistered() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let sink = Arc::new(FakeSink {
+            gate: Some(gate.clone()),
+            ..FakeSink::default()
+        });
+        let lock = new_lock();
+        let guard = lock.clone().lock_owned().await;
+        drop(registered(&sink, Some(lock.clone()), Some(guard)));
+
+        let retry = tokio::spawn({
+            let (lock, sink) = (lock.clone(), sink.clone());
+            async move {
+                let _serialized = lock.lock_owned().await;
+                sink.record("register (retry)".to_string());
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            lock.try_lock().is_err(),
+            "lock released before deregistering"
+        );
+
+        gate.add_permits(REGISTRY_EVENTS.len());
+        tokio::time::timeout(std::time::Duration::from_secs(2), retry)
+            .await
+            .expect("the retry never got the lock")
+            .unwrap();
+        let mut expected = REGISTRY_EVENTS;
+        expected.reverse();
+        let mut want = deregistered(&expected);
+        want.push("register (retry)".to_string());
+        assert_eq!(sink.log(), want);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_adapter_in_a_runtime_deregisters_its_events() {
         let adapter = AtspiAdapter::new();
+        let sink = Arc::new(FakeSink::default());
+        let (listener, alive) = parked_listener();
+        adapter.install_event_listener(EventListener {
+            task: listener,
+            registrations: registered(&sink, Some(adapter.subscribe_lock.clone()), None),
+        });
+
+        drop(adapter);
+
+        assert!(torn_down(alive).await, "listener outlived the adapter");
+        assert!(eventually(|| sink.log().len() == REGISTRY_EVENTS.len()).await);
+    }
+
+    #[test]
+    fn dropping_the_adapter_outside_a_runtime_warns_instead_of_deregistering() {
+        let adapter = AtspiAdapter::new();
+        let sink = Arc::new(FakeSink::default());
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         let (listener, _alive) = rt.block_on(async { parked_listener() });
-        adapter.install_event_listener(busless(listener));
+        adapter.install_event_listener(EventListener {
+            task: listener,
+            registrations: registered(&sink, Some(adapter.subscribe_lock.clone()), None),
+        });
+
+        // Outside `block_on` there is no current runtime to spawn on.
         drop(adapter);
+
+        assert!(sink.log().is_empty());
     }
 
     #[test]
@@ -1415,20 +1779,39 @@ mod tests {
         let t0 = std::time::Instant::now();
         let ms = std::time::Duration::from_millis;
         let mut d = FocusDedupe::default();
-        assert!(d.admit("/a", t0));
+        assert!(d.admit(":1.7", "/a", t0));
         assert!(
-            !d.admit("/a", t0 + ms(10)),
+            !d.admit(":1.7", "/a", t0 + ms(10)),
             "same element, inside the window"
         );
         assert!(
-            d.admit("/b", t0 + ms(20)),
+            d.admit(":1.7", "/b", t0 + ms(20)),
             "a different element is a new focus"
         );
-        assert!(d.admit("/a", t0 + ms(30)), "back to /a is a real change");
-        assert!(!d.admit("/a", t0 + ms(79)));
         assert!(
-            d.admit("/a", t0 + ms(80)),
+            d.admit(":1.7", "/a", t0 + ms(30)),
+            "back to /a is a real change"
+        );
+        assert!(!d.admit(":1.7", "/a", t0 + ms(79)));
+        assert!(
+            d.admit(":1.7", "/a", t0 + ms(80)),
             "window runs from the last admitted"
+        );
+    }
+
+    #[test]
+    fn focus_dedupe_keys_on_the_sender_as_well_as_the_path() {
+        let t0 = std::time::Instant::now();
+        let ms = std::time::Duration::from_millis;
+        let mut d = FocusDedupe::default();
+        assert!(d.admit(":1.7", "/a", t0));
+        assert!(
+            d.admit(":1.9", "/a", t0 + ms(5)),
+            "the same path in another application is a different element"
+        );
+        assert!(
+            !d.admit(":1.9", "/a", t0 + ms(10)),
+            "a repeat from that application is still collapsed"
         );
     }
 }
