@@ -3982,6 +3982,35 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// run. coord's own grant (`mcp/agent_tool_access.rs`) is the authority on who
 /// may call it; this list only forwards.
 ///
+/// `coord_retire_gate` and `coord_retire_gates` are IN because they are a SHIPPED
+/// RETIREMENT ROUTE, and a retirement route an agent cannot reach recreates the
+/// defect it was built to close (plan
+/// `2026-09-27-agent-gate-cleanup-verbs-cover-every-gate-an-agent-finds`, Phases 2
+/// and 4). Before them, an agent that found a gate on a terminal unit, an
+/// attestation request its unit had moved past, or a net whose arm was gone had
+/// no verb that fit: `coord_withdraw_gate` is registrant-only (so it cannot touch
+/// NULL-registrant or system-registered gates), `coord_reject_gate` is
+/// `operator_approval`-only and writes `failed`, which pages, and force-clear is a
+/// false green. The retire verbs authorize on EVIDENCE rather than identity: coord
+/// re-derives, at call time, one reason from a closed server-checked list
+/// (`anchor_terminal`, `awaited_status_passed`, `pr_closed_unlanded`,
+/// `continuation_retired_and_muted`, `target_gate_terminal`, `successor_gate`) and
+/// refuses with the observed state when it cannot, so a confused agent cannot
+/// retire a live gate. The registrant is not consulted, but clearance authority
+/// still applies, and every `operator_approval` gate is refused before any reason
+/// code is evaluated — a terminal unit says nothing about whether a human decision
+/// is moot. They are MUTATING (the gate goes to `withdrawn`, with `verdict_reason`
+/// `retired:<reason_code>: <evidence>`), DIAL-GOVERNED (Notify tier on the
+/// `gate_action` dial) and NOTIFYING (an operator notification per single-row use,
+/// and one summary notification per wet bulk call). The bulk form is the
+/// single-row predicate in a server-side loop, `dry_run` by default and capped by
+/// `max_rows`, so it grants nothing the single-row verb does not. As with the
+/// gate-verb family, withholding them here would not add a check — the dial can
+/// only govern what this door forwards — it would only make the cleanup coord
+/// ships answer `-32601` from inside the product. coord's own grant
+/// (`mcp/agent_tool_access.rs`) is the authority on who may call them; this list
+/// only forwards.
+///
 /// **Landed is not delivered** (plan `2026-09-03-coord-mcp-403-names-its-own-cause`
 /// Phase 3). This list is compiled into the binary, so a PR that edits it is
 /// NOT in effect on any box until that box rebuilds from a sha containing the
@@ -4083,6 +4112,8 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_resolve_origin",
     "coord_resolve_pr_author_session",
     "coord_resolve_session",
+    "coord_retire_gate",
+    "coord_retire_gates",
     "coord_secret_presence",
     "coord_send_message",
     "coord_session_worktrees",
@@ -15094,6 +15125,12 @@ mod coord_mcp_body_gate_tests {
             // The registrant-only re-point (coord#2056): the only way to carry a
             // superseded gate's continuation onto the replacement PR.
             "coord_repoint_gate",
+            // The evidence-authorized retirement pair (plan
+            // 2026-09-27-agent-gate-cleanup-verbs-cover-every-gate-an-agent-finds):
+            // mutating, Notify tier on `gate_action`, an operator notification per
+            // use (per wet call for the bulk form), `operator_approval` refused.
+            "coord_retire_gate",
+            "coord_retire_gates",
             // P4's own addition: mutates nothing, so neither dial-governed nor
             // notifying.
             "coord_gate_doctor",
