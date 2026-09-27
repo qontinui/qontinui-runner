@@ -7489,28 +7489,80 @@ mod tests {
         }
     }
 
-    /// No handler that falls back to the runner's own UI after an app
-    /// dispatch may decide that from the LIVE connection state — the read
-    /// races WS teardown (see `ipc_fallback_refusal`). Scans every handler,
-    /// not only the listed ones, so a new copy of the old gate is caught too.
+    /// Read-only handlers that KNOWINGLY keep the ungated IPC fallback: they
+    /// only read (elements, snapshot, forms, routes, …), so a fallback cannot
+    /// re-execute an action on the wrong UI — at worst it answers with the
+    /// runner's own data. Gating them is a separate follow-up. A handler that
+    /// ACTS must never be added here; it must ask `ipc_fallback_refusal`.
+    const UNGATED_READ_ONLY_FALLBACKS: [&str; 16] = [
+        "handle_elements",
+        "handle_element",
+        "handle_snapshot",
+        "handle_discover",
+        "handle_components",
+        "handle_console_errors",
+        "handle_ai_search",
+        "handle_forms",
+        "handle_network_requests",
+        "handle_ai_snapshot",
+        "handle_ai_summary",
+        "handle_undo_state",
+        "handle_element_state",
+        "handle_ai_find",
+        "handle_diagnostics",
+        "handle_page_routes",
+    ];
+
+    /// Every production `async fn` that both dispatches to the app and falls
+    /// back to the runner must ask `ipc_fallback_refusal` — whatever helper it
+    /// might otherwise use to decide — unless it is on the read-only exemption
+    /// list above. Scans the whole file, so a NEW action handler with an
+    /// ungated (or live-state-gated) fallback fails here without being listed.
     #[test]
-    fn no_dispatching_handler_decides_its_fallback_from_live_state() {
+    fn every_dispatching_fallback_is_gated_or_an_exempt_read() {
         let src = include_str!("sdk_client.rs");
         let production = src
             .split("\n#[cfg(test)]\nmod tests {")
             .next()
             .unwrap_or_default();
+        let mut exempt_seen = Vec::new();
         for chunk in production.split("\nasync fn ").skip(1) {
-            let dispatches = chunk.contains("dispatch_app_request");
+            let name = chunk.split('(').next().unwrap_or_default();
+            let dispatches = [
+                "dispatch_app_request(",
+                "dispatch_app_request_typed(",
+                "dispatch_app_request_by_id(",
+                "dispatch_active(",
+                "sdk_request(",
+                "try_ws_dispatch(",
+            ]
+            .iter()
+            .any(|d| chunk.contains(d));
             let falls_back = chunk.contains("ui_bridge_request_sync(")
-                || chunk.contains("ui_bridge_send_keys_to_page_handler(");
-            if dispatches && falls_back {
-                let name = chunk.split('(').next().unwrap_or_default();
+                || (chunk.contains("crate::mcp::ui_bridge::") && chunk.contains("_handler("));
+            if !(dispatches && falls_back) {
+                continue;
+            }
+            let gated = chunk.contains("ipc_fallback_refusal(");
+            if UNGATED_READ_ONLY_FALLBACKS.contains(&name) {
                 assert!(
-                    !chunk.contains("sdk_app_connected("),
-                    "{name} decides its IPC fallback from the live connection state"
+                    !gated,
+                    "{name} is gated now — remove it from UNGATED_READ_ONLY_FALLBACKS"
+                );
+                exempt_seen.push(name);
+            } else {
+                assert!(
+                    gated,
+                    "{name} dispatches to the app and falls back to the runner's UI \
+                     without asking ipc_fallback_refusal"
                 );
             }
+        }
+        for name in UNGATED_READ_ONLY_FALLBACKS {
+            assert!(
+                exempt_seen.contains(&name),
+                "stale exemption: {name} no longer dispatches with a fallback"
+            );
         }
     }
 
