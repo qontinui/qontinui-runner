@@ -244,7 +244,7 @@ pub(crate) async fn run_dispatch(
             // `failure`, which would poison shadow parity with a red the code
             // under test did not earn.
             let (conclusion, reason) = e.result_disposition();
-            sink.push(&format!("[ci-node] checkout failed: {e}"));
+            sink.push(&format!("{} {e}", e.log_prefix()));
             steps_summary.push(StepSummary {
                 name: "[setup] checkout".to_string(),
                 conclusion: conclusion.to_string(),

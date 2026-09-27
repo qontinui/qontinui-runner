@@ -1499,13 +1499,22 @@ fn build_host_capabilities(os: &str, powershell: bool, docker: bool, webview: bo
 /// whitespace) would make coord elect a device admission then refuses.
 pub(crate) const CI_REPO_CAPABILITY_PREFIX: &str = "ci_repo:";
 
+/// Upper bound on `ci_repo:` tokens per heartbeat. The allowlist is
+/// operator-edited and rides every 30 s heartbeat into a JSONB column that
+/// coord's selection SQL `@>`-scans, so its size must not be whatever a
+/// settings file happens to hold. Entries past the cap are not advertised —
+/// coord cannot elect this device for them (admission would still accept), and
+/// the heartbeat logs that it truncated.
+pub(crate) const MAX_CI_REPO_CAPABILITIES: usize = 64;
+
 /// Pure assembly of the whole `capabilities` vector the heartbeat sends.
 ///
 /// `ci_node` leads (it is the coarse fleet-role flag the CI filters read),
 /// followed by one [`CI_REPO_CAPABILITY_PREFIX`] token per allowlist entry —
 /// both ONLY when CI-node mode is on, so turning it off retracts them together
 /// — and then the probed host facts. Empty and duplicate allowlist entries are
-/// dropped (an empty entry matches no repo, so it could elect nothing).
+/// dropped (an empty entry matches no repo, so it could elect nothing), and at
+/// most [`MAX_CI_REPO_CAPABILITIES`] tokens are emitted, in allowlist order.
 /// Unit-tested without disk or subprocesses.
 fn build_device_capabilities(
     ci_node: bool,
@@ -1515,11 +1524,20 @@ fn build_device_capabilities(
     let mut caps = Vec::with_capacity(host.len() + 1 + repo_allowlist.len());
     if ci_node {
         caps.push("ci_node".to_string());
+        let mut repo_tokens = 0usize;
         for entry in repo_allowlist.iter().filter(|e| !e.is_empty()) {
             let token = format!("{CI_REPO_CAPABILITY_PREFIX}{entry}");
-            if !caps.contains(&token) {
-                caps.push(token);
+            if caps.contains(&token) {
+                continue;
             }
+            if repo_tokens == MAX_CI_REPO_CAPABILITIES {
+                warn!(
+                    "fleet: ci_node.repo_allowlist has more than {MAX_CI_REPO_CAPABILITIES}                      distinct entries; advertising the first {MAX_CI_REPO_CAPABILITIES} only"
+                );
+                break;
+            }
+            caps.push(token);
+            repo_tokens += 1;
         }
     }
     caps.extend(host.iter().cloned());
@@ -7098,8 +7116,7 @@ mod tests {",
         // Assembled, not hand-built: CI-node mode OFF with a populated
         // allowlist must still put `[]` on the wire — no `ci_node`, and no
         // `ci_repo:` token either.
-        let caps =
-            build_device_capabilities(false, &["qontinui/qontinui-runner".to_string()], &[]);
+        let caps = build_device_capabilities(false, &["qontinui/qontinui-runner".to_string()], &[]);
         let body = serde_json::to_value(heartbeat_payload_with_ci(caps, Vec::new())).unwrap();
         assert_eq!(
             body.get("capabilities"),
@@ -7120,8 +7137,11 @@ mod tests {",
     /// matching.
     #[test]
     fn heartbeat_sends_host_capability_tokens_verbatim() {
-        let caps =
-            build_device_capabilities(true, &[], &build_host_capabilities("windows", true, true, true));
+        let caps = build_device_capabilities(
+            true,
+            &[],
+            &build_host_capabilities("windows", true, true, true),
+        );
         let body = serde_json::to_value(heartbeat_payload_with_ci(caps, Vec::new())).unwrap();
         assert_eq!(
             body.get("capabilities"),
@@ -7366,13 +7386,25 @@ mod tests {",
         ];
         assert_eq!(
             build_device_capabilities(true, &allow, &[]),
-            vec!["ci_node", "ci_repo:qontinui-runner", "ci_repo:Qontinui/Qontinui-Web"]
+            vec![
+                "ci_node",
+                "ci_repo:qontinui-runner",
+                "ci_repo:Qontinui/Qontinui-Web"
+            ]
         );
     }
 
     /// The token set and admission agree: every repo admission accepts is
     /// named by a token coord can match (slug or basename), and one it
     /// rejects is named by none.
+    ///
+    /// The `electable` predicate below is the RUNNER-side restatement of
+    /// coord's selection filter (plan
+    /// `2026-09-27-ci-node-shadow-dispatch-never-passes-checkout-race-lost-leases-unfiltered-selection`
+    /// Phase 4c: `capabilities @> ['ci_repo:' || slug] OR
+    /// capabilities @> ['ci_repo:' || basename]` in `select_ci_node_device`).
+    /// Changing the token shape here without changing that SQL, or the reverse,
+    /// makes devices unelectable for repos they accept.
     #[test]
     fn ci_repo_tokens_match_exactly_what_admission_accepts() {
         let allow = vec![
@@ -7396,6 +7428,23 @@ mod tests {",
                 "coord's electability of {repo} must equal admission's verdict"
             );
         }
+    }
+
+    /// A huge allowlist is capped, in order, and duplicates do not consume the
+    /// budget.
+    #[test]
+    fn ci_repo_tokens_are_capped() {
+        let mut allow: Vec<String> = vec!["dup".to_string(), "dup".to_string()];
+        allow.extend((0..100).map(|i| format!("repo-{i}")));
+        let caps = build_device_capabilities(true, &allow, &["os:linux".to_string()]);
+        let repo_caps: Vec<&String> = caps
+            .iter()
+            .filter(|c| c.starts_with(CI_REPO_CAPABILITY_PREFIX))
+            .collect();
+        assert_eq!(repo_caps.len(), MAX_CI_REPO_CAPABILITIES);
+        assert_eq!(repo_caps[0], "ci_repo:dup");
+        assert_eq!(repo_caps[1], "ci_repo:repo-0");
+        assert_eq!(caps.last().map(String::as_str), Some("os:linux"));
     }
 
     #[test]
