@@ -2756,8 +2756,7 @@ pub fn tick_exit(
         fingerprint.remove_key(tid);
         fingerprint.push(tid.clone(), format!("T:{tid}"));
     }
-    let Some(evidence) = watch.observe(&fingerprint, now, StallWindows::from_config(config))
-    else {
+    let Some(evidence) = watch.observe(&fingerprint, now, StallWindows::from_config(config)) else {
         watch.clear_held_open();
         return None;
     };
@@ -5348,8 +5347,11 @@ mod tests {
             // every tick and reset everything.
             let churn = format!("churn-{tick}");
             let entry = format!("R:{churn}");
-            if let Some(ev) = w.observe(&fp(&[("stuck", "C:x:stuck"), (&churn, &entry)]), now, windows)
-            {
+            if let Some(ev) = w.observe(
+                &fp(&[("stuck", "C:x:stuck"), (&churn, &entry)]),
+                now,
+                windows,
+            ) {
                 assert_eq!(ev.stuck_keys, vec!["stuck".to_string()]);
                 fired = Some(now);
                 break;
@@ -5392,12 +5394,21 @@ mod tests {
             now += c.tick_interval_secs as i64;
         }
         // ...and past it, the run is ENDED and the reason names the row.
-        let exit = tick_exit(&plan, &outcome, &mut watch, c.transient_stall_after_secs, &c)
-            .expect("a transient condition that never clears is bounded");
+        let exit = tick_exit(
+            &plan,
+            &outcome,
+            &mut watch,
+            c.transient_stall_after_secs,
+            &c,
+        )
+        .expect("a transient condition that never clears is bounded");
         assert_eq!(exit.status(), RunExit::STATUS_STALLED);
         let reason = exit.reason().unwrap();
         assert!(reason.contains("T:A"), "{reason}");
-        assert!(reason.starts_with("Stall detected: A stuck for"), "{reason}");
+        assert!(
+            reason.starts_with("Stall detected: A stuck for"),
+            "{reason}"
+        );
     }
 
     /// The other half of the same claim, stated on its own so a regression that
@@ -5499,8 +5510,14 @@ mod tests {
         // on the result, which asserts on two lines of the test rather than on
         // the two lines under review: delete the production change and it
         // still passed.
-        let exit = tick_exit(&plan, &outcome, &mut watch, c.transient_stall_after_secs, &c)
-            .expect("it is on the long one");
+        let exit = tick_exit(
+            &plan,
+            &outcome,
+            &mut watch,
+            c.transient_stall_after_secs,
+            &c,
+        )
+        .expect("it is on the long one");
         let reason = exit.reason().unwrap();
         assert!(reason.contains("T:A"), "{reason}");
         assert!(
@@ -6825,8 +6842,14 @@ mod tests {
         // read out of the exit `tick_exit` produced; this block used to
         // re-run `remove_key` + `push` on a clone here and assert on THAT,
         // which passes with the production change reverted.
-        let exit = tick_exit(&plan, &outcome, &mut watch, c.transient_stall_after_secs, &c)
-            .expect("a fan-out bound that never frees is eventually a stall");
+        let exit = tick_exit(
+            &plan,
+            &outcome,
+            &mut watch,
+            c.transient_stall_after_secs,
+            &c,
+        )
+        .expect("a fan-out bound that never frees is eventually a stall");
         let reason = exit.reason().unwrap();
         assert!(reason.contains("T:A"), "{exit:?}");
         assert!(
