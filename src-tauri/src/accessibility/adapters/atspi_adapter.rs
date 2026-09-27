@@ -117,8 +117,9 @@ impl RegistryRegistrations {
     /// logged, not returned: the listener's match rules still receive
     /// whatever the bridges emit for other clients. An event is recorded
     /// before its call, so a cancellation or timeout mid-call still
-    /// deregisters it (deregistering an event the registry never recorded is
-    /// a no-op there); only an explicit refusal un-records it.
+    /// deregisters it (if the registry never recorded it, any error from that
+    /// deregistration is logged and ignored); only an explicit refusal
+    /// un-records it.
     async fn register(
         sink: Arc<dyn RegistrySink>,
         lock: SubscribeLock,
@@ -1129,8 +1130,8 @@ const FOCUS_DEDUPE_WINDOW: std::time::Duration = std::time::Duration::from_milli
 
 /// Drops a `FocusChanged` that repeats the previous one's element within
 /// [`FOCUS_DEDUPE_WINDOW`]. An element is its emitting bus name AND object
-/// path: two applications routinely expose the same path (e.g. every Qt app
-/// numbers its objects from the same base), so a path alone would merge a
+/// path: two applications can expose the same path (every application's
+/// root is `/org/a11y/atspi/accessible/root`), so a path alone would merge a
 /// real focus move between them. Pure (the clock is passed in), so it is
 /// tested without a bus.
 #[derive(Debug, Default)]
