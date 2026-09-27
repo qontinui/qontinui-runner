@@ -16,9 +16,17 @@
 // artifacts to the triple-suffixed paths Tauri expects.
 //
 // Wired into `beforeBuildCommand` (`tauri.conf.json`), so it runs on every
-// `tauri build` (CI release + local bundle) and NOT on `cargo build`/`cargo check`
-// (the supervisor's debug-exe rebuild path is unaffected — externalBin only gates
-// bundling). Fails LOUD: a missing binary at bundle time would abort `tauri build`
+// `tauri build` (CI release + local bundle) and NOT on `cargo build`/`cargo check`.
+// Those cargo-only builds (the supervisor's debug-exe rebuild, CI `cargo test`)
+// have no sidecars here, and externalBin is NOT bundling-only: tauri-build's
+// build script copies every externalBin into the cargo target dir on every run.
+// `src-tauri/build.rs` `scope_external_bin_to_real_sidecars` therefore hides the
+// absent/non-binary ones from tauri-build on those builds. Until 2026-09-27 it
+// wrote 0-byte placeholders instead, which tauri-build copied over the real
+// `qontinui-pr` and the runner then published onto PATH as a CLI that exits 0
+// having opened no PR (plan
+// 2026-09-27-qontinui-pr-zero-byte-sidecar-placeholder-published-as-session-cli).
+// Fails LOUD: a missing binary at bundle time would abort `tauri build`
 // anyway, so surfacing the cause here (with the exact cargo error) is strictly
 // better than a downstream "external binary not found".
 //
@@ -37,7 +45,8 @@ const runnerRoot = resolve(scriptDir, "..");
 const srcTauri = join(runnerRoot, "src-tauri");
 
 // Keep in sync with `tauri.conf.json` `bundle.externalBin` and
-// `src-tauri/build.rs` `ensure_sidecar_placeholders`.
+// `src-tauri/build.rs` `EXTERNAL_BIN_SIDECARS` (a build.rs test pins the
+// latter to tauri.conf.json).
 const SIDECAR_BINS = ["qontinui_profile", "qontinui-pr"];
 
 function fail(msg) {
