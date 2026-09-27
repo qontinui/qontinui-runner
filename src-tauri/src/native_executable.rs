@@ -110,8 +110,11 @@ impl std::fmt::Display for NotExecutable {
     }
 }
 
-/// How many leading bytes the format check reads. Four covers every magic
-/// above; nothing shorter than that can be a real image.
+/// How many leading bytes the format check reads, and the fewest a file must
+/// have to pass it. Four covers every magic above. PE's own magic is only the
+/// two bytes `MZ`, so a 2- or 3-byte file starting `MZ` would match it; no real
+/// image is that short, so [`check`] refuses anything under four bytes before
+/// it looks at the magic at all.
 const MAGIC_LEN: usize = 4;
 
 /// Check that `path` is a regular, non-empty file carrying `format`'s magic
@@ -145,7 +148,7 @@ pub fn check(path: &Path, format: ExecutableFormat) -> Result<u64, NotExecutable
     if let Err(e) = read {
         return Err(NotExecutable::Unreadable(e.to_string()));
     }
-    if !format.matches(&head) {
+    if head.len() < MAGIC_LEN || !format.matches(&head) {
         return Err(NotExecutable::WrongFormat {
             len,
             expected: format,
@@ -269,6 +272,21 @@ mod tests {
             check(&p, ExecutableFormat::Pe),
             Err(NotExecutable::WrongFormat {
                 len: 1,
+                expected: ExecutableFormat::Pe
+            })
+        );
+    }
+
+    #[test]
+    fn check_refuses_a_bare_pe_magic_too_short_to_be_an_image() {
+        // `MZ` alone satisfies `ExecutableFormat::Pe::matches`; `check` must
+        // not, or a 2-byte file would be published as the CLI.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = file(tmp.path(), "mz", b"MZ");
+        assert_eq!(
+            check(&p, ExecutableFormat::Pe),
+            Err(NotExecutable::WrongFormat {
+                len: 2,
                 expected: ExecutableFormat::Pe
             })
         );

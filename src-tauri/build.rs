@@ -36,6 +36,9 @@ fn main() {
     // the function for the full mechanism. Must run before
     // `tauri_build::build()` — it sets `TAURI_CONFIG` for it.
     hide_external_bin_from_tauri_build();
+    // Then repair what the old placeholder mechanism already did to this
+    // profile dir: remove the ZERO-LENGTH sidecar copies it left there.
+    remove_zero_length_sidecar_copies_from_profile_dir();
 
     // Tell Cargo to re-run this build script (and re-embed the frontend) when
     // the dist directory changes.  Without this, incremental builds silently
@@ -490,9 +493,8 @@ fn ensure_dist_placeholder() {
 /// `scripts/bundle-profile-sidecar.mjs` `SIDECAR_BINS`.
 const EXTERNAL_BIN_SIDECARS: &[&str] = &["binaries/qontinui_profile", "binaries/qontinui-pr"];
 
-/// Hide `bundle.externalBin` from `tauri_build::build()` on EVERY run, and
-/// remove the zero-byte sidecar copies the previous mechanism left in the
-/// cargo profile dir. Must run before `tauri_build::build()`.
+/// Hide `bundle.externalBin` from `tauri_build::build()` on EVERY run. Must
+/// run before `tauri_build::build()`.
 ///
 /// WHY. tauri-build (2.6.2, `copy_binaries`) runs on every build-script
 /// execution, not only at bundle time. For each `externalBin` entry it removes
@@ -523,9 +525,16 @@ const EXTERNAL_BIN_SIDECARS: &[&str] = &["binaries/qontinui_profile", "binaries/
 /// the `generate_context!` codegen reads `TAURI_CONFIG` from rustc's own
 /// environment and never reads `externalBin`, and the bundler copies sidecars
 /// from `binaries/` through the config the tauri CLI parsed itself
-/// (tauri-bundler 2.9.0 `Settings::copy_binaries`). The sidecars a runner
-/// needs next to its exe come from cargo building those bins (the supervisor's
-/// sidecar build, `bundle-profile-sidecar`), never from this script.
+/// (tauri-bundler 2.9.0 `Settings::copy_binaries`).
+///
+/// The sidecars a runner needs next to its exe come from cargo building those
+/// bins, never from this script: `scripts/bundle-profile-sidecar.mjs` for a
+/// bundle, a plain `cargo build --bin qontinui-pr` for a dev build, and for a
+/// supervisor-started runner the supervisor's sidecar build (qontinui-supervisor
+/// `build_sidecars`, the same plan's Phase 3). A supervisor that predates that
+/// change builds only `qontinui-shim`, so a runner it starts has NO
+/// `qontinui-pr` beside its exe: `qontinui-pr` is then command-not-found in its
+/// terminals, which is the honest failure, not the silent exit 0 it replaced.
 fn hide_external_bin_from_tauri_build() {
     match external_bin_patch(std::env::var("TAURI_CONFIG").ok().as_deref()) {
         // Single-threaded build script; nothing else reads the env concurrently.
@@ -536,11 +545,15 @@ fn hide_external_bin_from_tauri_build() {
              the TAURI_CONFIG merge-patch in the environment is unusable: {e}"
         ),
     }
+}
 
-    // Repair what the old placeholders already did to this profile dir. Only a
-    // ZERO-LENGTH copy is removed — no build produces one except that copy
-    // chain — and never content. The profile dir is derived exactly as
-    // tauri-build derives it: OUT_DIR = <target>/<profile>/build/<pkg>-<hash>/out.
+/// Repair what the old placeholder mechanism already did to this cargo profile
+/// dir: remove each ZERO-LENGTH `qontinui-pr` / `qontinui_profile` copy
+/// tauri-build left there. Only a zero-length file is removed — no build
+/// produces one except that copy chain — and never content. The profile dir is
+/// derived exactly as tauri-build derives it:
+/// `OUT_DIR = <target>/<profile>/build/<pkg>-<hash>/out`.
+fn remove_zero_length_sidecar_copies_from_profile_dir() {
     let Ok(target) = std::env::var("TARGET") else {
         return;
     };
@@ -587,7 +600,10 @@ fn remove_zero_length_sidecar_copies(dir: &std::path::Path, exe_ext: &str) -> Ve
 /// Fold `bundle.externalBin = null` into an existing `TAURI_CONFIG` merge-patch
 /// (the tauri CLI passes one during `tauri dev`/`build`), keeping every other
 /// key. In a JSON merge-patch `null` DELETES the key, so tauri-build sees no
-/// `externalBin` at all. Pure.
+/// `externalBin` at all. An existing `"bundle": null` already deletes the whole
+/// `bundle` section, `externalBin` with it, so that patch is returned as it
+/// was: replacing the `null` with an object would turn "delete `bundle`" into
+/// "edit `bundle`". Pure.
 fn external_bin_patch(existing: Option<&str>) -> Result<String, String> {
     use serde_json::Value;
 
@@ -600,6 +616,9 @@ fn external_bin_patch(existing: Option<&str>) -> Result<String, String> {
     let obj = root
         .as_object_mut()
         .ok_or_else(|| "not a JSON object".to_string())?;
+    if obj.get("bundle").is_some_and(Value::is_null) {
+        return serde_json::to_string(&root).map_err(|e| e.to_string());
+    }
     let bundle = obj
         .entry("bundle")
         .or_insert_with(|| Value::Object(serde_json::Map::new()))
@@ -1425,6 +1444,40 @@ mod sidecar_scope_tests {
         assert_eq!(
             external_bin_patch(Some(r#"{"bundle":7}"#)).unwrap_err(),
             "its `bundle` key is not a JSON object"
+        );
+    }
+
+    #[test]
+    fn a_patch_that_already_deletes_bundle_is_kept_as_it_was() {
+        // `"bundle": null` deletes the whole section, externalBin included.
+        // Overwriting the null with `{"externalBin":null}` would turn that
+        // delete into an edit and bring the rest of `bundle` back.
+        let patched: serde_json::Value = serde_json::from_str(
+            &external_bin_patch(Some(r#"{"bundle":null,"build":{"devUrl":"x"}}"#)).unwrap(),
+        )
+        .unwrap();
+        assert!(patched.as_object().unwrap().contains_key("bundle"));
+        assert_eq!(patched["bundle"], serde_json::Value::Null);
+        assert_eq!(patched["build"]["devUrl"], "x");
+    }
+
+    /// `scripts/bundle-profile-sidecar.mjs` builds and validates the files the
+    /// bundler ships; its list must be this one, or a sidecar would be shipped
+    /// that nothing built.
+    #[test]
+    fn the_bundle_script_builds_every_external_bin_sidecar() {
+        let script = include_str!("../scripts/bundle-profile-sidecar.mjs");
+        let line = script
+            .lines()
+            .find(|l| l.trim_start().starts_with("const SIDECAR_BINS"))
+            .expect("bundle-profile-sidecar.mjs declares SIDECAR_BINS");
+        let quoted: Vec<String> = EXTERNAL_BIN_SIDECARS
+            .iter()
+            .map(|e| format!("\"{}\"", e.trim_start_matches("binaries/")))
+            .collect();
+        assert_eq!(
+            line.trim(),
+            format!("const SIDECAR_BINS = [{}];", quoted.join(", "))
         );
     }
 
