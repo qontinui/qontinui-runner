@@ -308,8 +308,8 @@ fn pr_door_without_personal_login(session_cli_deliverable: bool, api_port: Optio
          needs no personal login). Authenticate with this session's coord-mcp proxy \
          nonce. It is in the `coord-mcp` entry of its `.mcp.json`: in that entry's \
          `headers` on the http shape, or on the stdio shape in the credential file \
-         named after `--credential` in the entry's `args` (qontinui-claude-config's \
-         `coord-revive.sh` resolves both). Send it as `Authorization: Bearer <nonce>` (the legacy \
+         named after `--credential` in the entry's `args` (a JSON file whose \
+         `headers` carry it). Send it as `Authorization: Bearer <nonce>` (the legacy \
          `X-Coord-Mcp-Proxy-Key: <nonce>` also works), and keep the nonce off argv: \
          write the header to a file and pass `curl -H @<file>`. Else `gh pr create`"
     )
