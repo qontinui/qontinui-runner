@@ -89,6 +89,9 @@ mod coord_drain_state;
 mod coord_http;
 mod coord_mcp;
 mod coord_mcp_config;
+// Plan 2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant
+// Phase 2 — compare each coord answer's tenant with the session repo's tenant.
+mod coord_mcp_tenant;
 // The OUTSIDE observer of coord's own liveness — the one fault class coord's
 // leader-gated pager cannot report about itself (plan
 // 2026-09-12-merge-train-alerts-page-a-reader-and-act-on-nothing Phase 3b).

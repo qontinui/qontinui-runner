@@ -978,6 +978,40 @@ describe("normalizeTenancy (plan 2026-09-10 P0)", () => {
     expect(named?.row.spawnDeviceDefaultReason).toBeNull();
   });
 
+  it("carries the fourth leg (repoExpected), and reads its absence as null — unknown", () => {
+    const base = {
+      row: { tenantId: "b" },
+      dataPlane: { status: "owned", tenantId: "b", reason: null },
+      credential: { status: "resolved", tenantId: "a", slot: "tenant", reason: null, posture: {} },
+      diverged: true,
+      divergence: "diverged",
+    };
+    const t = normalizeTenancy({
+      ...base,
+      repoExpected: {
+        status: "resolved",
+        tenantId: "b",
+        tenantSlug: null,
+        tenantIds: [],
+        repo: "acme/pizzeria",
+        source: "canonical_repos",
+        observedAt: "2026-09-27T00:00:00Z",
+        reason: null,
+        callerNamedTenantId: null,
+        callerNamedSource: null,
+        verdict: "mismatch",
+        verdictDetail: "answered by a, expected b",
+        verdictAt: "2026-09-27T00:00:01Z",
+      },
+    });
+    expect(t?.repoExpected?.tenantId).toBe("b");
+    expect(t?.repoExpected?.verdict).toBe("mismatch");
+    expect(t?.repoExpected?.repo).toBe("acme/pizzeria");
+    // A runner that predates the leg serves none: null, never "agrees".
+    expect(normalizeTenancy(base)?.repoExpected).toBeNull();
+    expect(normalizeTenancy({ ...base, repoExpected: { tenantId: "b" } })?.repoExpected).toBeNull();
+  });
+
   it("reads an absent or malformed block as null (unknown), never as agreeing", () => {
     expect(normalizeTenancy(undefined)).toBeNull();
     expect(normalizeTenancy({ row: { tenantId: "b" } })).toBeNull();
