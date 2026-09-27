@@ -264,13 +264,20 @@ impl std::fmt::Display for ConnectError {
 /// were written against. Centralized here so the handler signature for
 /// `dispatch_app_request` (and friends) stays `Result<_, String>`.
 fn dispatch_err_to_string(err: DispatchError) -> String {
+    dispatch_err_message(&err)
+}
+
+/// Borrowing form of [`dispatch_err_to_string`], for callers that still need
+/// the typed error after rendering it (the IPC-fallback gate).
+fn dispatch_err_message(err: &DispatchError) -> String {
     match err {
         DispatchError::NotConnected => "No active SDK app connection".to_string(),
-        DispatchError::NotResponsive(msg) => msg,
-        // For HttpStatus we previously surfaced just the SDK's `error` field
-        // (the dispatcher's HTTP arm puts that in `body` when the app
-        // returned `{success:false, error:"..."}`). Keep that exact shape.
-        DispatchError::HttpStatus { body, .. } => body,
+        DispatchError::NotResponsive(msg) => msg.clone(),
+        // An app-answered `{success:false, error}` surfaces as just the SDK's
+        // `error` field — the shape this case had when it was an `HttpStatus`
+        // whose `body` carried that field.
+        DispatchError::AppAnswered { error, .. } => error.clone(),
+        DispatchError::HttpStatus { body, .. } => body.clone(),
         other => other.to_user_message(),
     }
 }
@@ -340,6 +347,22 @@ pub async fn dispatch_app_request(
     http_path: &str,
     http_body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
+    dispatch_app_request_typed(state, action, ws_payload, http_method, http_path, http_body)
+        .await
+        .map_err(dispatch_err_to_string)
+}
+
+/// [`dispatch_app_request`] keeping the TYPED [`DispatchError`]. Handlers with
+/// an IPC fallback use this form, because whether they may fall back is a
+/// property of the error CLASS (see [`ipc_fallback_refusal`]).
+async fn dispatch_app_request_typed(
+    state: &Arc<ApiState>,
+    action: &str,
+    ws_payload: serde_json::Value,
+    http_method: Method,
+    http_path: &str,
+    http_body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, DispatchError> {
     // The legacy split fed `ws_payload` to the WS arm and `http_body` to
     // the HTTP arm. Most call sites pass identical bodies; when they
     // differ, prefer `http_body` for the HTTP path to mirror legacy
@@ -368,7 +391,6 @@ pub async fn dispatch_app_request(
             payload,
         )
         .await
-        .map_err(dispatch_err_to_string)
 }
 
 /// Send an HTTP request to the connected SDK app.
@@ -452,6 +474,11 @@ pub async fn dispatch_app_request_by_id(
 /// IPC fallback is only legitimate when NO SDK app is connected (the
 /// runner-self case), mirroring the per-app-id snapshot path which already
 /// skips fallback for the same reason.
+///
+/// Caveat: read AFTER a dispatch error, this races the WebSocket teardown,
+/// which clears the active connection before it fails in-flight commands. A
+/// `Disconnected`/`Displaced` dispatch can therefore wake to "not connected".
+/// Prefer deciding from the error's class — [`ipc_fallback_refusal`].
 async fn sdk_app_connected(state: &Arc<ApiState>) -> bool {
     let guard = state.sdk_connection.lock().await;
     manager_has_active(&guard)
@@ -466,52 +493,78 @@ fn manager_has_active(manager: &SdkConnectionManager) -> bool {
     manager.active_connection().is_some()
 }
 
-/// Machine-readable code on the failure body a handler answers when the
-/// connected SDK app's dispatch errored and the IPC fallback was REFUSED.
+/// Fallback `code` on the failure body a handler answers when the IPC
+/// fallback was REFUSED and the error carried no code of the app's own.
 const SDK_DISPATCH_FAILED: &str = "SDK_DISPATCH_FAILED";
 
-/// The IPC-fallback decision, as a pure function of "is an SDK app connected?".
+/// The app's own machine-readable code, from a JSON error body that has one
+/// (`code` / `errorCode`, top level or under `error`).
+fn app_code_from_body(body: &str) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_str(body).ok()?;
+    let code = [Some(&json), json.get("error")]
+        .into_iter()
+        .flatten()
+        .flat_map(|v| [v.get("code"), v.get("errorCode")])
+        .flatten()
+        .find_map(|v| v.as_str())
+        .map(String::from);
+    code
+}
+
+/// The IPC-fallback decision, made from the dispatch error's CLASS — never
+/// from the live connection state.
 ///
-/// `None` means falling back to `ui_bridge_request_sync` is legitimate: no SDK
-/// app is connected, so the runner's own UI IS the target (the runner-self
-/// case). `Some(body)` means an SDK app IS connected, so the dispatch error —
-/// a thrown handler, `Timeout`, `Disconnected`, `Displaced`, `NotResponsive`,
-/// an HTTP send/non-2xx failure — is the answer. `ui_bridge_request_sync`
-/// targets the RUNNER's Tauri window, never the app, so retrying there would
-/// re-execute the action on the wrong UI and could report it green. The body
-/// is `{success:false, error, code, transportError}`, the error labelled so a
-/// caller can tell a transport failure from an app-answered one.
+/// `None` means falling back to `ui_bridge_request_sync` is legitimate. That
+/// is true for exactly one class: [`DispatchError::NotConnected`], which
+/// `dispatch_active` returns when no SDK app was connected AT DISPATCH TIME,
+/// so the runner's own UI is the target (the runner-self case).
+///
+/// Every other error means an app WAS the target: a thrown handler, an
+/// app-answered `{success:false}`, `Timeout`, `Disconnected`, `Displaced`,
+/// `NotResponsive`, an HTTP send/non-2xx failure. `ui_bridge_request_sync`
+/// targets the RUNNER's Tauri window, never the app, so falling back would
+/// re-execute the action on the wrong UI. Those are answered with
+/// `Some(body)`: `{success:false, error, code, failure_origin, detail}`.
+///
+/// Why not ask `sdk_app_connected()` after the error: on a WebSocket
+/// disconnect the relay's teardown clears the active connection BEFORE it
+/// fails the in-flight commands, so a dispatch that wakes with
+/// `Disconnected`/`Displaced` would read "not connected" and fall back —
+/// the very retargeting this gate exists to refuse.
+///
+/// `failure_origin` is `"app"` when the app itself answered with a failure
+/// ([`DispatchError::AppAnswered`], or a wrapper `WrapperError` over the
+/// relay) and `"transport"` for everything else. `code` is the app's own code
+/// when the error carries one, else [`SDK_DISPATCH_FAILED`].
 ///
 /// Plan `2026-09-27-ui-bridge-action-failures-still-masked-after-the-strict-success-readers`
-/// Case 1. The rule itself is `sdk_app_connected`'s doc comment.
-fn ipc_fallback_refusal(
-    app_connected: bool,
-    route: &str,
-    transport_err: &str,
-) -> Option<serde_json::Value> {
-    if !app_connected {
-        return None;
-    }
+/// Case 1.
+fn ipc_fallback_refusal(err: &DispatchError, route: &str) -> Option<serde_json::Value> {
+    use super::command_relay::CommandRelayError;
+    let (origin, app_code) = match err {
+        DispatchError::NotConnected => return None,
+        DispatchError::AppAnswered { code, .. } => ("app", code.clone()),
+        DispatchError::WebSocket(CommandRelayError::WrapperError(_)) => ("app", None),
+        DispatchError::HttpStatus { body, .. } => ("transport", app_code_from_body(body)),
+        _ => ("transport", None),
+    };
+    let detail = dispatch_err_message(err);
+    let code = app_code.unwrap_or_else(|| SDK_DISPATCH_FAILED.to_string());
+    let what = if origin == "app" {
+        "the connected SDK app answered with a failure"
+    } else {
+        "dispatch to the connected SDK app failed"
+    };
     Some(serde_json::json!({
         "success": false,
         "error": format!(
-            "{SDK_DISPATCH_FAILED}: {route} dispatch to the connected SDK app failed \
-             ({transport_err}); the action was NOT retried on the runner's own UI"
+            "{code}: {route}: {what} ({detail}); the action was NOT retried on \
+             the runner's own UI"
         ),
-        "code": SDK_DISPATCH_FAILED,
-        "transportError": transport_err,
+        "code": code,
+        "failure_origin": origin,
+        "detail": detail,
     }))
-}
-
-/// [`ipc_fallback_refusal`] over the live connection state. Every handler with
-/// a `ui_bridge_request_sync` fallback after a failed `dispatch_app_request`
-/// asks this FIRST, and returns the body it yields instead of falling back.
-async fn refuse_ipc_fallback_if_app_connected(
-    state: &Arc<ApiState>,
-    route: &str,
-    transport_err: &str,
-) -> Option<serde_json::Value> {
-    ipc_fallback_refusal(sdk_app_connected(state).await, route, transport_err)
 }
 
 // =============================================================================
@@ -1376,7 +1429,7 @@ async fn handle_element_action(
         None => serde_json::json!({ "id": id, "request": body.clone() }),
     };
     let path = append_tab_id_query(&format!("/control/element/{}/action", id), tab_id);
-    let result = match dispatch_app_request(
+    let result = match dispatch_app_request_typed(
         &state,
         "executeElementAction",
         ws_payload,
@@ -1396,9 +1449,7 @@ async fn handle_element_action(
         Err(e) => {
             // An SDK app is connected: its dispatch error IS the answer. Never
             // retarget the action onto the runner's own UI (Case 1).
-            if let Some(refusal) =
-                refuse_ipc_fallback_if_app_connected(&state, "element action", &e).await
-            {
+            if let Some(refusal) = ipc_fallback_refusal(&e, "element action") {
                 let err = refusal
                     .get("error")
                     .and_then(|v| v.as_str())
@@ -1916,7 +1967,7 @@ async fn handle_ai_execute(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    match dispatch_app_request(
+    match dispatch_app_request_typed(
         &state,
         "aiExecute",
         body.clone(),
@@ -1928,9 +1979,7 @@ async fn handle_ai_execute(
     {
         Ok(data) => Json(data),
         Err(sdk_err) => {
-            if let Some(refusal) =
-                refuse_ipc_fallback_if_app_connected(&state, "ai/execute", &sdk_err).await
-            {
+            if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "ai/execute") {
                 return Json(refusal);
             }
             debug!("SDK ai/execute unavailable, falling back to IPC control endpoint");
@@ -1948,7 +1997,7 @@ async fn handle_ai_assert(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    match dispatch_app_request(
+    match dispatch_app_request_typed(
         &state,
         "aiAssert",
         body.clone(),
@@ -1960,9 +2009,7 @@ async fn handle_ai_assert(
     {
         Ok(data) => Json(data),
         Err(sdk_err) => {
-            if let Some(refusal) =
-                refuse_ipc_fallback_if_app_connected(&state, "ai/assert", &sdk_err).await
-            {
+            if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "ai/assert") {
                 return Json(refusal);
             }
             debug!("SDK ai/assert unavailable, falling back to IPC control endpoint");
@@ -2571,7 +2618,7 @@ async fn handle_page_refresh(
     let body_inner = body.map(|b| b.0);
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
     let ws_payload = body_inner.clone().unwrap_or(serde_json::json!({}));
-    match dispatch_app_request(
+    match dispatch_app_request_typed(
         &state,
         "pageRefresh",
         ws_payload,
@@ -2583,9 +2630,7 @@ async fn handle_page_refresh(
     {
         Ok(data) => Json(data),
         Err(sdk_err) => {
-            if let Some(refusal) =
-                refuse_ipc_fallback_if_app_connected(&state, "page/refresh", &sdk_err).await
-            {
+            if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "page/refresh") {
                 return Json(refusal);
             }
             // Fall back to IPC — the RUNNER-LOCAL path, where `page_refresh`
@@ -2611,7 +2656,7 @@ async fn handle_page_navigate(
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
-    match dispatch_app_request(
+    match dispatch_app_request_typed(
         &state,
         "pageNavigate",
         body.clone(),
@@ -2623,9 +2668,7 @@ async fn handle_page_navigate(
     {
         Ok(data) => Json(data),
         Err(sdk_err) => {
-            if let Some(refusal) =
-                refuse_ipc_fallback_if_app_connected(&state, "page/navigate", &sdk_err).await
-            {
+            if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "page/navigate") {
                 return Json(refusal);
             }
             // Runner-local fallback: `dispatch_app_request` failing means no
@@ -3919,7 +3962,12 @@ fn execute_with_diff_inner_error(data: &serde_json::Value) -> Option<String> {
 ///
 /// - `actionSuccess: true` → passed through unchanged. Never marked failed.
 /// - `actionSuccess` present and not `true` → an explicit failure
-///   `{success:false, error:"ACTION_FAILED: …", data:<original>}`.
+///   `{success:false, error:"ACTION_FAILED: …", data:<payload>}`, where
+///   `<payload>` is the diff-bearing object for BOTH producers — the relay
+///   body itself, or the in-process envelope's inner `data` — so the diff
+///   always sits at `.data.diff` rather than `.data.data.diff`. A `code` /
+///   `errorCode` the producer set (payload first, then envelope) is hoisted
+///   to the top level beside `error`.
 /// - `actionSuccess` absent → passed through, with `verdict: "indeterminate"`
 ///   added to an object body that is not already an explicit failure. NOT
 ///   turned into a failure: the relay/React producer
@@ -3936,7 +3984,28 @@ fn guard_execute_with_diff(data: serde_json::Value) -> serde_json::Value {
                 Some(inner) => format!("ACTION_FAILED: {inner}"),
                 None => "ACTION_FAILED: execute-with-diff reported actionSuccess=false".to_string(),
             };
-            serde_json::json!({ "success": false, "error": error, "data": data })
+            let top_level = data.get("actionSuccess").is_some_and(|v| !v.is_null());
+            let mut out = serde_json::json!({ "success": false, "error": error });
+            for key in ["code", "errorCode"] {
+                let hoisted = [data.get("data"), Some(&data)]
+                    .into_iter()
+                    .flatten()
+                    .find_map(|v| v.get(key).filter(|c| c.is_string()))
+                    .cloned();
+                if let (Some(value), Some(obj)) = (hoisted, out.as_object_mut()) {
+                    obj.insert(key.to_string(), value);
+                }
+            }
+            let payload = match (top_level, data) {
+                (false, serde_json::Value::Object(mut envelope)) => {
+                    envelope.remove("data").unwrap_or(serde_json::Value::Null)
+                }
+                (_, data) => data,
+            };
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert("data".to_string(), payload);
+            }
+            out
         }
         None => {
             let mut data = data;
@@ -4658,7 +4727,7 @@ async fn handle_ai_assert_batch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    match dispatch_app_request(
+    match dispatch_app_request_typed(
         &state,
         "aiAssertBatch",
         body.clone(),
@@ -4670,9 +4739,7 @@ async fn handle_ai_assert_batch(
     {
         Ok(data) => Json(data),
         Err(sdk_err) => {
-            if let Some(refusal) =
-                refuse_ipc_fallback_if_app_connected(&state, "ai/assert/batch", &sdk_err).await
-            {
+            if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "ai/assert/batch") {
                 return Json(refusal);
             }
             debug!("SDK ai/assert/batch unavailable, falling back to IPC control endpoint");
@@ -7332,52 +7399,138 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Case 1 — the IPC fallback is gated on "no SDK app connected"
+    // Case 1 — the IPC fallback is decided by the dispatch error's CLASS
     // (plan 2026-09-27-ui-bridge-action-failures-still-masked-after-the-strict-success-readers)
     // ------------------------------------------------------------------
 
+    use crate::mcp::command_relay::CommandRelayError;
+
+    /// Every error class that means an app WAS the dispatch target.
+    fn app_targeted_errors() -> Vec<DispatchError> {
+        vec![
+            DispatchError::WebSocket(CommandRelayError::Disconnected),
+            DispatchError::WebSocket(CommandRelayError::Displaced("new tab".into())),
+            DispatchError::WebSocket(CommandRelayError::Timeout(std::time::Duration::from_secs(
+                30,
+            ))),
+            DispatchError::WebSocket(CommandRelayError::WrapperError("boom".into())),
+            DispatchError::WebSocket(CommandRelayError::NotConnected("wapp".into())),
+            DispatchError::NotResponsive("app not responsive".into()),
+            DispatchError::HttpStatus {
+                url: "http://127.0.0.1:3000/x".into(),
+                status: 502,
+                body: "bad gateway".into(),
+            },
+            DispatchError::AppAnswered {
+                url: "http://127.0.0.1:3000/x".into(),
+                status: 200,
+                error: "element not found".into(),
+                code: None,
+            },
+            DispatchError::InvalidJson("<html>".into()),
+        ]
+    }
+
     #[test]
-    fn ipc_fallback_refused_when_app_connected() {
-        let refusal = ipc_fallback_refusal(true, "element action", "Request timed out after 30s")
-            .expect("a connected app's dispatch error must NOT fall back to IPC");
-        assert_eq!(refusal["success"], serde_json::json!(false));
+    fn ipc_fallback_allowed_only_for_not_connected() {
+        assert!(
+            ipc_fallback_refusal(&DispatchError::NotConnected, "element action").is_none(),
+            "no SDK app at dispatch time: the runner's own UI is the target, fall back"
+        );
+    }
+
+    /// The race the live-state gate lost: WS teardown clears the active
+    /// connection BEFORE failing in-flight commands, so at decision time the
+    /// live state reads NOT connected. The error class must still refuse.
+    #[test]
+    fn app_targeted_errors_are_refused_even_when_live_state_reads_disconnected() {
+        let live = SdkConnectionManager::new();
+        assert!(
+            !manager_has_active(&live),
+            "precondition: live state reads not connected"
+        );
+        for err in app_targeted_errors() {
+            let refusal = ipc_fallback_refusal(&err, "element action")
+                .unwrap_or_else(|| panic!("{err:?} must NOT fall back to the runner's UI"));
+            assert_eq!(refusal["success"], serde_json::json!(false), "{err:?}");
+            let error = refusal["error"].as_str().expect("error is a string");
+            assert!(error.contains("element action"), "{error}");
+            assert!(
+                error.contains("NOT retried on the runner's own UI"),
+                "{error}"
+            );
+            assert_eq!(
+                refusal["detail"],
+                serde_json::json!(dispatch_err_message(&err)),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn refusal_labels_transport_failures() {
+        let err = DispatchError::WebSocket(CommandRelayError::Timeout(
+            std::time::Duration::from_secs(30),
+        ));
+        let refusal = ipc_fallback_refusal(&err, "ai/execute").expect("refused");
+        assert_eq!(refusal["failure_origin"], serde_json::json!("transport"));
         assert_eq!(refusal["code"], serde_json::json!(SDK_DISPATCH_FAILED));
+        assert!(refusal["error"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("SDK_DISPATCH_FAILED: ai/execute: dispatch")));
+    }
+
+    #[test]
+    fn refusal_carries_the_apps_own_code_and_labels_it_app_answered() {
+        let err = DispatchError::AppAnswered {
+            url: "http://127.0.0.1:3000/x".into(),
+            status: 200,
+            error: "element not found: btn-7".into(),
+            code: Some("ELEMENT_NOT_FOUND".into()),
+        };
+        let refusal = ipc_fallback_refusal(&err, "element action").expect("refused");
+        assert_eq!(refusal["failure_origin"], serde_json::json!("app"));
+        assert_eq!(refusal["code"], serde_json::json!("ELEMENT_NOT_FOUND"));
         assert_eq!(
-            refusal["transportError"],
-            serde_json::json!("Request timed out after 30s")
+            refusal["detail"],
+            serde_json::json!("element not found: btn-7")
         );
-        let error = refusal["error"].as_str().expect("error is a string");
-        assert!(
-            error.starts_with("SDK_DISPATCH_FAILED: element action"),
-            "{error}"
-        );
-        assert!(error.contains("Request timed out after 30s"), "{error}");
-        assert!(
-            error.contains("NOT retried on the runner's own UI"),
-            "{error}"
-        );
+        assert!(refusal["error"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("ELEMENT_NOT_FOUND: element action: the connected")));
+
+        // A wrapper-thrown failure over the relay is app-answered too.
+        let ws = DispatchError::WebSocket(CommandRelayError::WrapperError("boom".into()));
+        let refusal = ipc_fallback_refusal(&ws, "element action").expect("refused");
+        assert_eq!(refusal["failure_origin"], serde_json::json!("app"));
+        assert_eq!(refusal["code"], serde_json::json!(SDK_DISPATCH_FAILED));
+
+        // A non-2xx JSON body's own code is carried through.
+        let http = DispatchError::HttpStatus {
+            url: "u".into(),
+            status: 500,
+            body: r#"{"error":{"code":"RENDER_FAILED","message":"x"}}"#.into(),
+        };
+        let refusal = ipc_fallback_refusal(&http, "page/navigate").expect("refused");
+        assert_eq!(refusal["code"], serde_json::json!("RENDER_FAILED"));
+        assert_eq!(refusal["failure_origin"], serde_json::json!("transport"));
     }
 
     #[test]
-    fn ipc_fallback_allowed_when_no_app_connected() {
-        assert!(
-            ipc_fallback_refusal(false, "element action", "No active SDK app connection").is_none(),
-            "with no SDK app connected the runner's own UI is the target: fall back"
-        );
-    }
-
-    #[test]
-    fn ipc_fallback_decision_follows_the_live_connection_predicate() {
-        // The async gate is `ipc_fallback_refusal(manager_has_active(..))`;
-        // prove the composition over both manager states.
-        let connected = manager_with_active_conn("wapp", "http://127.0.0.1:3000");
-        assert!(ipc_fallback_refusal(manager_has_active(&connected), "r", "e").is_some());
-        let empty = SdkConnectionManager::new();
-        assert!(ipc_fallback_refusal(manager_has_active(&empty), "r", "e").is_none());
+    fn app_answered_renders_as_the_apps_error_string() {
+        // The `Result<_, String>` call sites keep the pre-variant shape.
+        let err = DispatchError::AppAnswered {
+            url: "u".into(),
+            status: 200,
+            error: "element not found".into(),
+            code: Some("X".into()),
+        };
+        assert_eq!(dispatch_err_to_string(err), "element not found");
     }
 
     /// Every handler that used to fall back to `ui_bridge_request_sync` on ANY
-    /// dispatch error asks the gate first, and asks it BEFORE the fallback.
+    /// dispatch error keeps the TYPED error and asks the class gate BEFORE the
+    /// fallback — and never re-reads the live connection state to decide.
     /// A handler cannot be driven here without a full `ApiState`, so the wiring
     /// is proved from source (the same technique as
     /// `ws_dispatch_action_names_are_well_formed`).
@@ -7400,8 +7553,16 @@ mod tests {
                 .split("\nasync fn ")
                 .next()
                 .unwrap_or_default();
+            assert!(
+                body.contains("dispatch_app_request_typed("),
+                "{handler} must keep the typed DispatchError"
+            );
+            assert!(
+                !body.contains("sdk_app_connected("),
+                "{handler} must not decide from the live connection state"
+            );
             let gate = body
-                .find("refuse_ipc_fallback_if_app_connected(")
+                .find("ipc_fallback_refusal(&")
                 .unwrap_or_else(|| panic!("{handler} never asks the IPC-fallback gate"));
             let fallback = body
                 .find("ui_bridge_request_sync(")
@@ -7446,7 +7607,10 @@ mod tests {
             out["error"],
             serde_json::json!("ACTION_FAILED: element not found: btn-7")
         );
-        assert_eq!(out["data"], body, "the original payload is kept");
+        assert_eq!(
+            out["data"], body["data"],
+            "the in-process envelope is unwrapped: the payload sits under data once"
+        );
 
         let top = serde_json::json!({ "actionSuccess": false });
         let out = guard_execute_with_diff(top);
@@ -7490,5 +7654,39 @@ mod tests {
             .and_then(|rest| rest.split("\nasync fn ").next())
             .expect("handle_ct_execute_with_diff present");
         assert!(body.contains("Ok(data) => Json(guard_execute_with_diff(data)),"));
+    }
+
+    #[test]
+    fn execute_with_diff_failure_puts_the_diff_at_data_diff_for_both_producers() {
+        // In-process envelope: `success(result)` wraps the payload once more.
+        let envelope = serde_json::json!({
+            "success": true,
+            "data": {
+                "actionSuccess": false,
+                "code": "ELEMENT_NOT_FOUND",
+                "actionResult": { "success": false, "error": "nope" },
+                "diff": { "added": [1] },
+            },
+        });
+        let out = guard_execute_with_diff(envelope);
+        assert_eq!(out["data"]["diff"], serde_json::json!({ "added": [1] }));
+        assert!(out["data"].get("data").is_none(), "no double nesting");
+        assert_eq!(out["code"], serde_json::json!("ELEMENT_NOT_FOUND"));
+
+        // Relay payload: the flag is top level; the payload is kept as is.
+        let relay = serde_json::json!({
+            "actionSuccess": false,
+            "errorCode": "ACTION_FAILED",
+            "actionResult": { "success": false },
+            "diff": { "before": 3, "after": 3 },
+        });
+        let out = guard_execute_with_diff(relay.clone());
+        assert_eq!(out["data"], relay);
+        assert_eq!(out["data"]["diff"], relay["diff"]);
+        assert_eq!(out["errorCode"], serde_json::json!("ACTION_FAILED"));
+        assert!(
+            out.get("code").is_none(),
+            "only codes the producer set are hoisted"
+        );
     }
 }
