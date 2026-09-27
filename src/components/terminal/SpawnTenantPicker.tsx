@@ -156,7 +156,7 @@ export type RepoTenantAnswer =
   | { state: "no_repo" }
   | { state: "repo_unregistered"; repo: string }
   | { state: "several"; repo: string; tenantIds: string[] }
-  | { state: "unknown"; reason: string };
+  | { state: "unknown"; reason: string; transient?: boolean };
 
 /** The picker's reading of one `tenant_for_repo` answer. */
 export interface RepoTenantHint {
@@ -257,8 +257,14 @@ export function SpawnTenantPicker({ cwd, className }: SpawnTenantPickerProps) {
     spawnTenantId,
     setSpawnTenantId,
   } = useTenant();
-  /** `undefined` until the first answer arrives — nothing is claimed yet. */
-  const [answer, setAnswer] = useState<unknown>(undefined);
+  /**
+   * The last `tenant_for_repo` answer AND the cwd it was for. An answer for a
+   * different cwd is never shown: after a move the hint reads `undefined`
+   * (nothing claimed) until the new repo's answer arrives, rather than the old
+   * repo's note sitting beside the new cwd.
+   */
+  const [answered, setAnswered] = useState<{ cwd: string; answer: unknown } | null>(null);
+  const answer = answered && answered.cwd === (cwd ?? "") ? answered.answer : undefined;
   /**
    * The cwd whose inference the operator has already overridden. Moving to a
    * different repo re-arms inference (the new repo's tenant is a fresh, more
@@ -279,9 +285,13 @@ export function SpawnTenantPicker({ cwd, className }: SpawnTenantPickerProps) {
           repo: null,
           workingDir: cwd ?? null,
         });
-        if (!cancelled) setAnswer(result ?? null);
+        if (!cancelled) setAnswered({ cwd: cwd ?? "", answer: result ?? null });
       } catch (e) {
-        if (!cancelled) setAnswer({ state: "unknown", reason: `tenant_for_repo failed: ${e}` });
+        if (!cancelled)
+          setAnswered({
+            cwd: cwd ?? "",
+            answer: { state: "unknown", reason: `tenant_for_repo failed: ${e}` },
+          });
         logger.warn(`tenant_for_repo failed: ${e}`);
       }
     })();

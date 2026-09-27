@@ -3278,7 +3278,9 @@ fn device_nonce_snapshot(
                     // comparing against the SPAWN-time one. `None` while the
                     // resolution is still in flight — the mint re-persists once
                     // it lands.
-                    expected_tenant: b.expected.get().cloned(),
+                    // Only a SETTLED answer: a transient unknown is never
+                    // persisted, so a restart retries instead of freezing it.
+                    expected_tenant: b.expected.settled(),
                 },
             )
         })
@@ -4584,9 +4586,9 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> No
             );
             let expected = crate::coord_mcp_tenant::SessionExpectation::known(
                 binding.expected_tenant.clone().unwrap_or_else(|| {
-                    qontinui_runner_lib::repo_tenant::CwdTenant::Unknown {
-                        reason: "restored_without_expectation".to_string(),
-                    }
+                    qontinui_runner_lib::repo_tenant::CwdTenant::unknown(
+                        "restored_without_expectation",
+                    )
                 }),
                 caller_named,
             );
@@ -10354,15 +10356,33 @@ pub(crate) fn session_credential_tenant(
     terminal_id: &str,
     workdir: Option<&str>,
 ) -> CredentialTenantRead {
-    match session_nonce(terminal_id, workdir) {
+    credential_from_session_nonce(&session_nonce(terminal_id, workdir))
+}
+
+fn credential_from_session_nonce(nonce: &SessionNonce) -> CredentialTenantRead {
+    match nonce {
         SessionNonce::Nonce(nonce) => credential_tenant_for_nonce(nonce.as_deref()),
         SessionNonce::NoNonce => CredentialTenantRead::NoNonce,
         SessionNonce::DeliveryUnrecorded => CredentialTenantRead::DeliveryUnrecorded,
     }
 }
 
+/// The credential leg AND the repo-expected leg of one session, from ONE
+/// resolution of its nonce — so the census's two legs always describe the
+/// same key, even if a re-provision lands between them.
+pub(crate) fn session_tenancy_reads(
+    terminal_id: &str,
+    workdir: Option<&str>,
+) -> (CredentialTenantRead, RepoExpectationRead) {
+    let nonce = session_nonce(terminal_id, workdir);
+    (
+        credential_from_session_nonce(&nonce),
+        repo_expectation_from_session_nonce(&nonce),
+    )
+}
+
 /// Which nonce is the session in `terminal_id`'s credential — the lookup
-/// [`session_credential_tenant`] and [`session_repo_expectation`] share, so the
+/// [`session_credential_tenant`] and [`session_tenancy_reads`] share, so the
 /// two tenancy legs always describe the SAME key.
 enum SessionNonce {
     /// This nonce (`None`: the cwd's `.mcp.json` held no runner nonce).
@@ -10422,11 +10442,8 @@ pub(crate) enum RepoExpectationRead {
     Unknown(&'static str),
 }
 
-pub(crate) fn session_repo_expectation(
-    terminal_id: &str,
-    workdir: Option<&str>,
-) -> RepoExpectationRead {
-    let nonce = match session_nonce(terminal_id, workdir) {
+fn repo_expectation_from_session_nonce(nonce: &SessionNonce) -> RepoExpectationRead {
+    let nonce = match nonce {
         SessionNonce::Nonce(Some(n)) => n,
         SessionNonce::Nonce(None) | SessionNonce::NoNonce => {
             return RepoExpectationRead::Unknown("no_session_nonce")
@@ -10435,11 +10452,11 @@ pub(crate) fn session_repo_expectation(
             return RepoExpectationRead::Unknown("coord_mcp_delivery_unrecorded")
         }
     };
-    match live_binding(&nonce) {
+    match live_binding(nonce) {
         Some(b) => RepoExpectationRead::Known {
-            cwd: b.expected.get().cloned(),
+            cwd: b.expected.current(),
             caller_named: b.expected.caller_named().cloned(),
-            latest: crate::coord_mcp_tenant::latest_verdict(&nonce),
+            latest: crate::coord_mcp_tenant::latest_verdict(nonce),
         },
         None => RepoExpectationRead::Unknown("nonce_not_live"),
     }
@@ -16084,13 +16101,11 @@ mod tests {
 
         restore_proxy_nonces_from(&store);
         let (exp, _) = session_expectation_for_nonce(&with).expect("restored");
-        assert_eq!(exp.get(), Some(&resolved));
+        assert_eq!(exp.settled(), Some(resolved.clone()));
         let (old, _) = session_expectation_for_nonce(&without).expect("old record restored");
         assert_eq!(
-            old.get(),
-            Some(&CwdTenant::Unknown {
-                reason: "restored_without_expectation".into()
-            })
+            old.settled(),
+            Some(CwdTenant::unknown("restored_without_expectation"))
         );
         let (legacy, _) = session_expectation_for_nonce(&legacy_pin).expect("restored");
         assert_eq!(

@@ -207,8 +207,31 @@ pub struct StoredNonceBinding {
     /// for every entry written before the field (and for a binding persisted
     /// before its resolution finished); the restore reads that as
     /// `Unknown { reason: "restored_without_expectation" }`, never as a guess.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// Read LENIENTLY ([`lenient_expected_tenant`]): a value this build cannot
+    /// read (a variant from a newer build, after a rollback) becomes `None`,
+    /// never a failed store load — this record shares its file with the
+    /// device's access and refresh tokens.
+    #[serde(
+        default,
+        deserialize_with = "lenient_expected_tenant",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub expected_tenant: Option<qontinui_runner_lib::repo_tenant::CwdTenant>,
+}
+
+/// Deserialize [`StoredNonceBinding::expected_tenant`] without ever failing:
+/// take any JSON value, and keep it only if it reads as a `CwdTenant`. An
+/// unreadable one is `None`, which restores as
+/// `Unknown { reason: "restored_without_expectation" }`.
+fn lenient_expected_tenant<'de, D>(
+    deserializer: D,
+) -> Result<Option<qontinui_runner_lib::repo_tenant::CwdTenant>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <Option<serde_json::Value> as Deserialize>::deserialize(deserializer)?;
+    Ok(raw.and_then(|v| serde_json::from_value(v).ok()))
 }
 
 /// On-disk spelling of `coord_mcp::PinOrigin`.
@@ -2216,6 +2239,42 @@ mod tests {
     /// The age round-trips as a bare integer (unix seconds), and `0` — the
     /// "unknown, therefore oldest" sentinel the restore leg re-emits — survives
     /// a rewrite as `0` rather than being dropped or laundered.
+    /// An `expected_tenant` this build cannot read — a variant from a newer
+    /// build after a rollback, or a wrong shape — must never fail the store
+    /// load: the same file holds the device's access and refresh tokens.
+    #[test]
+    fn an_unreadable_expected_tenant_still_loads_the_store() {
+        let raw = serde_json::json!({
+            "access_token": "acc",
+            "refresh_token": "ref",
+            "coord_mcp_nonces": {
+                "future": {
+                    "workdir": "D:\\wd",
+                    "expected_tenant": { "state": "from_a_future_build", "x": 1 }
+                },
+                "wrong_shape": { "workdir": "D:\\wd2", "expected_tenant": 42 },
+                "good": {
+                    "workdir": "D:\\wd3",
+                    "expected_tenant": { "state": "no_repo" }
+                }
+            }
+        });
+        let tokens: StoredTokens = serde_json::from_value(raw).expect("the store must load");
+        assert_eq!(tokens.access_token.as_deref(), Some("acc"));
+        assert_eq!(tokens.refresh_token.as_deref(), Some("ref"));
+        let nonces: std::collections::HashMap<String, StoredNonceBinding> = tokens
+            .coord_mcp_nonces
+            .into_iter()
+            .map(|(k, v)| (k, v.into()))
+            .collect();
+        assert_eq!(nonces["future"].expected_tenant, None);
+        assert_eq!(nonces["wrong_shape"].expected_tenant, None);
+        assert_eq!(
+            nonces["good"].expected_tenant,
+            Some(qontinui_runner_lib::repo_tenant::CwdTenant::NoRepo)
+        );
+    }
+
     #[test]
     fn test_minted_at_unix_round_trips_as_seconds() {
         let v = serde_json::to_value(StoredNonceEntry::Modern(StoredNonceBinding {
