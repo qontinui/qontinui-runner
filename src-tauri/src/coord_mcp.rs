@@ -4613,10 +4613,20 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> No
             (nonce, binding, expected)
         })
         .collect();
+    // Restored bindings whose expectation is unsettled: resolved in the
+    // background once the lock is released, so a restored session's first
+    // tools/call does not wait out the resolver budget.
+    let mut to_resolve: Vec<(crate::coord_mcp_tenant::SessionExpectation, String)> = Vec::new();
     let live_map_len = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
         for (nonce, binding, expected) in persisted {
             let vacant = !map.contains_key(&nonce);
+            if vacant && expected.settled().is_none() {
+                to_resolve.push((
+                    expected.clone(),
+                    normalize_binding_workdir(&binding.workdir),
+                ));
+            }
             // Only DEVICE bindings are ever persisted (OQ3), so a restored entry
             // is unconditionally a Device principal. An agent nonce can never be
             // restored — its slot is process-global and gone after a restart, so
@@ -4700,6 +4710,9 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> No
         }
         map.len()
     };
+    for (expected, workdir) in &to_resolve {
+        expected.spawn_resolution(expectation_workdir(workdir));
+    }
     // Honest counts: `inserted` is what the restore actually recovered,
     // `skipped` is the persisted entries a live mint already occupied (the
     // `or_insert` no-op), and `live_map_len` is the map size afterwards — a
@@ -11563,16 +11576,18 @@ fn adopt_on_disk_nonce(
 ) {
     // Read OUTSIDE the registry lock (both are file reads): the machine pin the
     // binding records, and — from it — whether a workspace declaration names
-    // the session's tenant. The adopted binding's cwd expectation resolves on
-    // its first proxied call; a `.mcp.json` carries none to adopt.
+    // the session's tenant. The adopted binding's cwd expectation is resolved in the
+    // background once it is registered; a `.mcp.json` carries none to adopt.
     let adopt_pin = crate::session::tenant_pin::resolve_tenant_pin();
     let expected = crate::coord_mcp_tenant::SessionExpectation::pending(caller_named_tenant(
         adopt_pin,
         PinOrigin::MachineSampled,
         &ProxyPrincipal::Device,
         workdir,
-    ))
-    .with_settle_hook(persist_on_settle());
+    ));
+    // No settle hook: this function deliberately never persists (see its
+    // tail). The expectation is re-derived with the binding on the next boot.
+    let expected_for_resolution = expected.clone();
     let evicted = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
         // Persistent AND terminal-less only — an adopted nonce came from a
@@ -11655,6 +11670,10 @@ fn adopt_on_disk_nonce(
     // binding is re-derived from the same `.mcp.json` on the next boot; putting
     // it in the encrypted store would only make a credential of unattestable
     // provenance outlive the file that justified it.
+    //
+    // Resolve the expectation now, off the lock, so the adopted session's
+    // first tools/call does not wait out the resolver budget.
+    expected_for_resolution.spawn_resolution(expectation_workdir(workdir));
 }
 
 /// Read the root `.mcp.json` ONCE and resolve both the self-heal action and the

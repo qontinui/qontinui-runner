@@ -1355,10 +1355,14 @@ mod tests {
     #[tokio::test]
     async fn a_transient_unknown_is_retried_in_the_background_and_never_settled() {
         use std::sync::atomic::AtomicUsize;
+        const WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+        let past_window = WINDOW + std::time::Duration::from_millis(100);
         let settles = Arc::new(AtomicUsize::new(0));
         let hook_count = settles.clone();
         let e = SessionExpectation::pending(None)
-            .with_retry_after(std::time::Duration::from_millis(50))
+            // ~1s: wide enough that the "inside the window" step cannot
+            // cross it on a loaded box.
+            .with_retry_after(WINDOW)
             .with_settle_hook(SettleHook::new(move || {
                 hook_count.fetch_add(1, Ordering::SeqCst);
             }));
@@ -1385,13 +1389,14 @@ mod tests {
 
         // Past it: the caller STILL gets the stale answer immediately, and a
         // background attempt runs.
-        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        tokio::time::sleep(past_window).await;
         assert!(e.resolve_with(make.clone()).await.is_transient());
         eventually(|| calls.load(Ordering::SeqCst) == 2).await;
-        eventually(|| e.current().is_some()).await;
+        // The background attempt holds the flight until it has stored.
+        eventually(|| e.flight.try_lock().is_ok()).await;
         assert_eq!(e.settled(), None);
 
-        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        tokio::time::sleep(past_window).await;
         let _ = e.resolve_with(make.clone()).await;
         eventually(|| e.settled().is_some()).await;
         assert_eq!(e.settled(), Some(resolved(t(0xA1))));
@@ -1402,7 +1407,7 @@ mod tests {
         );
 
         // Frozen: never re-resolved.
-        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        tokio::time::sleep(past_window).await;
         assert_eq!(e.resolve_with(make.clone()).await, resolved(t(0xA1)));
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert_eq!(settles.load(Ordering::SeqCst), 1);
