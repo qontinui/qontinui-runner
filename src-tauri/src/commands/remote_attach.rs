@@ -1009,6 +1009,40 @@ pub fn terminal_remote_identities(
     })
 }
 
+/// What the remote tab `terminal_id` has observed about its session's
+/// interactivity — the read receipt (`lastFrameReceived`), the last input
+/// queued (`lastInputSent`) and the target's last answer to one
+/// (`lastInputAcked`, `acksReceived`). Plan
+/// `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`,
+/// A1; the tab footer (`RemoteTabControls`) polls it.
+///
+/// Every timestamp is epoch ms on THIS machine's clock, so "Ns ago" never
+/// compares clocks across devices. A tab whose pane has ended answers
+/// `success: false` rather than a stale snapshot dressed as live.
+#[tauri::command]
+pub fn terminal_remote_interactivity(
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+    terminal_id: String,
+) -> Result<CommandResponse, String> {
+    let Some(identity) = terminal_manager.remote_identity(&terminal_id) else {
+        return Err(format!(
+            "remote_attach:not_remote: terminal {terminal_id} is not a remote tab"
+        ));
+    };
+    let Some(pane) = client().pane(&identity.grant_jti) else {
+        return Ok(CommandResponse {
+            success: false,
+            message: Some("the remote pane behind this tab is closed".to_string()),
+            data: None,
+        });
+    };
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::to_value(pane.interactivity()).map_err(|e| e.to_string())?),
+    })
+}
+
 /// How long a history request waits for the target's ring range.
 const HISTORY_TIMEOUT: Duration = Duration::from_secs(15);
 

@@ -2670,6 +2670,12 @@ const REMOTE_SOURCE_ADMITTED: &[&str] = &[
     "remote_terminal_exit",
     "remote_terminal_buffer",
     "remote_terminal_error",
+    // The target's answer to one input frame (plan
+    // `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`,
+    // A1). The relay retypes `terminal_input_ack` to this and copies the rest
+    // of the frame — including, possibly, the target's `remote` echo — so
+    // unlike its siblings this entry may be load-bearing, not only a hedge.
+    "remote_terminal_input_ack",
     // The backend refuses a `remote_terminal_attach` as a bare `error`,
     // correlated by request_id — see the dispatch arm below.
     "error",
@@ -2955,10 +2961,11 @@ async fn handle_relay_command(
         | "remote_terminal_output"
         | "remote_terminal_exit"
         | "remote_terminal_buffer"
-        | "remote_terminal_error" => {
+        | "remote_terminal_error"
+        | "remote_terminal_input_ack" => {
             // The return is "did this client CONSUME the frame"
             // (`handle_inbound`'s own doc), NOT "did it wake a waiter": every
-            // arm for these six returns `true` unconditionally, warning
+            // arm for these seven returns `true` unconditionally, warning
             // internally on the no-waiter path. So there is nothing to branch
             // on here, and a check would be dead code. The sibling `error` arm
             // below checks it because `handle_inbound` genuinely can return
@@ -5848,8 +5855,8 @@ mod tests {
         // failure, which is what it is for.
         assert_eq!(
             known.len(),
-            6,
-            "expected 6 remote_terminal_* reply types in handle_inbound, got {known:?} — if a \
+            7,
+            "expected 7 remote_terminal_* reply types in handle_inbound, got {known:?} — if a \
              type was genuinely added or removed, update this count deliberately"
         );
 
@@ -7660,6 +7667,7 @@ mod remote_admission_tests {
             "remote_terminal_exit",
             "remote_terminal_buffer",
             "remote_terminal_error",
+            "remote_terminal_input_ack",
             "error",
         ] {
             assert!(

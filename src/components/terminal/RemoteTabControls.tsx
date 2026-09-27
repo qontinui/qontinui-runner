@@ -9,12 +9,14 @@ import {
   attachWaitingMessage,
   decodeHistoryBase64,
   remoteBadgeLabel,
+  remoteInteractivityFooter,
   sessionLabelFromTitle,
   REMOTE_HISTORY_EVENT,
   type RemoteHistoryDetail,
   type RemoteTerminalInfoWire,
 } from "./remoteTabs";
 import { useRemoteAttachWaiting } from "./useRemoteAttachWaiting";
+import { useRemoteInteractivity } from "./useRemoteInteractivity";
 
 /**
  * Zone-header controls for a REMOTE tab (plan
@@ -30,6 +32,12 @@ import { useRemoteAttachWaiting } from "./useRemoteAttachWaiting";
  *   `(deviceId, sessionId)`, then closes the dead tab. A live tab whose relay
  *   merely dropped needs none of this: the Rust pane keeps the session open,
  *   writes an in-band notice, and reattaches by itself on reconnect.
+ *
+ * - the interactivity footer (plan
+ *   `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`,
+ *   A1) — "last output received Ns ago · last keystroke accepted Ns ago", from
+ *   the pane's own receipts and the target's input acks; an unacked keystroke
+ *   past the deadline, or a refused one, is called out inline.
  *
  * Renders nothing for a local tab. Every action acknowledges itself — busy
  * state while pending, the outcome shown inline and kept until the next
@@ -50,10 +58,22 @@ export function RemoteTabControls({
   // take a whole catch-up poll tick — so the busy state has to say so rather
   // than spin silently.
   const attachWaiting = useRemoteAttachWaiting();
+  // Polled only for a live remote tab; a dead pane has no receipts to read.
+  const [interactivity, nowMs] = useRemoteInteractivity(
+    tab.remote && tab.isAlive ? tab.id : null,
+  );
 
   if (!badge || !tab.remote) return null;
   const remote = tab.remote;
   const waitingLine = attachWaitingMessage(attachWaiting[remote.sessionId]);
+  const footer =
+    tab.isAlive && interactivity
+      ? remoteInteractivityFooter(
+          interactivity,
+          nowMs,
+          remote.deviceLabel.trim() || remote.deviceId.slice(0, 8),
+        )
+      : null;
 
   const loadHistory = async () => {
     if (busy) return;
@@ -184,6 +204,28 @@ export function RemoteTabControls({
           role="status"
         >
           {waitingLine}
+        </span>
+      )}
+      {footer && (
+        <span
+          data-ui-bridge-id={`terminal.remote-interactivity.${tab.id}`}
+          className="text-[8px] text-[#565f89] truncate max-w-[18rem]"
+          title={footer.summary}
+          role="status"
+        >
+          {footer.summary}
+        </span>
+      )}
+      {footer?.note && (
+        <span
+          data-ui-bridge-id={`terminal.remote-input-note.${tab.id}`}
+          className={`text-[8px] truncate max-w-[14rem] ${
+            footer.noteKind === "warning" ? "text-[#f7768e]" : "text-[#e0af68]"
+          }`}
+          title={footer.note}
+          role={footer.noteKind === "warning" ? "alert" : "status"}
+        >
+          {footer.note}
         </span>
       )}
       {note && !(busy === "reattach" && waitingLine) && (
