@@ -216,6 +216,13 @@ pub mod plan_workunit_adapter;
 // reads the one definition.
 pub mod build_provenance;
 
+// "Is this file a real native executable image?" — the one definition shared
+// by `build.rs` (which externalBin sidecars tauri-build may copy) and the
+// identity-shim materializer (whether the `qontinui-pr` session CLI may be
+// published onto a terminal's PATH). Plan
+// `2026-09-27-qontinui-pr-zero-byte-sidecar-placeholder-published-as-session-cli`.
+pub mod native_executable;
+
 // Wedge diagnostics (Phase 4 of
 // `2026-08-30-runner-blocking-pool-exhaustion-and-wedge-diagnostics`). In the
 // LIB crate so both crates' `spawn_blocking` sites share ONE counter.

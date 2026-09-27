@@ -25,6 +25,8 @@
 
 use std::path::{Path, PathBuf};
 
+use qontinui_runner_lib::native_executable::{self, ExecutableFormat, NotExecutable};
+
 use super::classify::{self, ShimTool};
 use super::gate::InterceptMode;
 
@@ -325,9 +327,10 @@ pub fn materialize_identity(base_dir: &Path) -> Option<PathBuf> {
     let dir = identity_dir(base_dir);
     let marker = dir.join(IDENTITY_MARKER);
 
-    // FAST PATH — a complete dir for THIS build already exists. Zero writes:
-    // no scripts, no exe copies, no hardlink. This is what every spawn after the
-    // first one costs.
+    // FAST PATH — a complete dir for THIS build already exists. No scripts, no
+    // exe copies, no hardlink: a stat of the marker, plus one stat (and, when
+    // the file is present, a 4-byte header read) of the delivered session CLI.
+    // This is what every spawn after the first one costs.
     //
     // The orphan sweep runs AFTER this, never before it: liveness is refreshed
     // here, so sweeping first would let the very dir this call is about to
@@ -335,6 +338,10 @@ pub fn materialize_identity(base_dir: &Path) -> Option<PathBuf> {
     // then the operator opens one" case, where every live pane's PATH suddenly
     // names a directory being `remove_dir_all`'d. See [`maybe_sweep_stale`].
     if let Ok(md) = std::fs::metadata(&marker) {
+        // A complete dir can still hold an unpublishable `qontinui-pr` — a
+        // 0-byte copy an older build delivered, or one truncated before the
+        // marker was written. The marker vouches for the scripts, not for that.
+        repair_session_cli_if_unpublishable(&dir);
         refresh_identity_liveness(&marker, &md);
         maybe_sweep_stale(base_dir);
         return Some(dir);
@@ -527,30 +534,63 @@ pub const SESSION_CLI_BIN: &str = if cfg!(windows) {
     "qontinui-pr"
 };
 
-/// One-shot latch: warn about the missing session-CLI binary ONCE per process,
-/// not once per terminal spawn.
-static SESSION_CLI_MISSING_WARNED: std::sync::atomic::AtomicBool =
+/// One-shot latch: warn that the session CLI could not be delivered (absent,
+/// or refused as not a runnable executable) ONCE per process, not once per
+/// terminal spawn. The source path is fixed for a process, so its verdict is
+/// too.
+static SESSION_CLI_UNDELIVERED_WARNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Hardlink (or copy) the built `qontinui-pr` session CLI binary — it sits
-/// next to the runner exe at runtime: bundled installs carry it as a Tauri
-/// `externalBin` sidecar (`tauri.conf.json` + `scripts/bundle-profile-sidecar.mjs`,
-/// same mechanism as `qontinui_profile`), and dev/supervisor builds have it in
-/// the shared cargo target dir — into the per-terminal identity dir so
-/// `qontinui-pr create` is on every session's PATH. Best-effort, fail-open:
-/// every failure (dev build without the binary, cross-volume hardlink refusal,
-/// copy error) only logs and the terminal spawns unaffected. Never panics.
-/// An ABSENT binary warns once per process (not per terminal) so a broken
-/// bundle is diagnosable instead of silently degrading.
-fn materialize_session_cli(dir: &Path) {
-    let name = SESSION_CLI_BIN;
-    let src = match std::env::current_exe()
+/// Outcome of one attempt to put the `qontinui-pr` session CLI into an identity
+/// dir. Returned, not only logged, so each arm is pinned by a test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionCliDelivery {
+    /// A validated native executable is in the dir.
+    Delivered,
+    /// No binary beside the runner exe. `qontinui-pr` is then absent from this
+    /// dir: the command is not found, or PATH falls through to a real one.
+    SourceMissing,
+    /// Something is beside the runner exe but it is not a runnable native
+    /// executable, so it is NOT published. Publishing the 0-byte build
+    /// placeholder is what made `qontinui-pr create` exit 0 having opened no PR.
+    SourceRefused(NotExecutable),
+    /// The source was sound but the copy in the dir was not (truncated), so
+    /// the copy was removed.
+    DestRefused(NotExecutable),
+    /// The dir could not be written: a stale copy could not be removed, or the
+    /// hard link and the copy both failed.
+    Failed(String),
+}
+
+/// Deliver the built `qontinui-pr` session CLI — it sits next to the runner exe
+/// at runtime: bundled installs carry it as a Tauri `externalBin` sidecar
+/// (`tauri.conf.json` + `scripts/bundle-profile-sidecar.mjs`, same mechanism as
+/// `qontinui_profile`), and dev/supervisor builds have it in the cargo target
+/// dir — into the identity dir so `qontinui-pr create` is on every session's
+/// PATH. Best-effort, fail-open: no failure ever breaks the terminal, and none
+/// panics.
+///
+/// What it will NOT do is publish something that is not a runnable native
+/// executable. A 0-byte `qontinui-pr.exe` on PATH is worse than none: Git Bash
+/// runs a non-PE file as a shell script, so `qontinui-pr create` exits 0,
+/// prints nothing and opens no PR, and every caller reading the exit code
+/// believes a PR exists (plan
+/// `2026-09-27-qontinui-pr-zero-byte-sidecar-placeholder-published-as-session-cli`).
+/// An absent CLI is the honest state — the command is not found. An absent or
+/// refused binary warns once per process (not per terminal), naming why.
+fn materialize_session_cli(dir: &Path) -> SessionCliDelivery {
+    let src = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|d| d.join(name)))
-    {
-        Some(p) if p.is_file() => p,
-        _ => {
-            if SESSION_CLI_MISSING_WARNED
+        .and_then(|exe| exe.parent().map(|d| d.join(SESSION_CLI_BIN)));
+    let outcome = deliver_session_cli(src.as_deref(), dir);
+    let src_shown = src.as_deref().map_or_else(
+        || "<runner exe dir unresolvable>".to_string(),
+        |p| p.display().to_string(),
+    );
+    match &outcome {
+        SessionCliDelivery::Delivered => {}
+        SessionCliDelivery::SourceMissing | SessionCliDelivery::SourceRefused(_) => {
+            if SESSION_CLI_UNDELIVERED_WARNED
                 .compare_exchange(
                     false,
                     true,
@@ -559,30 +599,111 @@ fn materialize_session_cli(dir: &Path) {
                 )
                 .is_ok()
             {
-                tracing::warn!(
-                    tool = name,
-                    "session cli: {name} not found next to the runner exe — \
-                     `qontinui-pr create` unavailable in every terminal of this \
-                     runner (dev build without the bin, or a bundle missing the \
-                     externalBin sidecar)"
-                );
+                match &outcome {
+                    SessionCliDelivery::SourceRefused(why) => tracing::warn!(
+                        source = %src_shown,
+                        reason = %why,
+                        "session cli: refusing to put {SESSION_CLI_BIN} on PATH — it is not a \
+                         runnable executable, and an empty or non-native one exits 0 having \
+                         opened no PR (Git Bash runs it as an empty script). Left off PATH so \
+                         `qontinui-pr` fails loudly instead; rebuild it with \
+                         `cargo build --bin qontinui-pr` or reinstall the runner"
+                    ),
+                    _ => tracing::warn!(
+                        source = %src_shown,
+                        "session cli: {SESSION_CLI_BIN} not found next to the runner exe — \
+                         `qontinui-pr create` unavailable in every terminal of this \
+                         runner (dev build without the bin, or a bundle missing the \
+                         externalBin sidecar)"
+                    ),
+                }
             }
-            return;
         }
+        SessionCliDelivery::DestRefused(why) => tracing::warn!(
+            dir = %dir.display(),
+            reason = %why,
+            "session cli: the {SESSION_CLI_BIN} copy in the identity dir was not a runnable \
+             executable and was removed"
+        ),
+        SessionCliDelivery::Failed(detail) => tracing::warn!(
+            dir = %dir.display(),
+            detail = %detail,
+            "session cli: failed to materialize {SESSION_CLI_BIN} into the identity dir"
+        ),
+    }
+    outcome
+}
+
+/// The delivery itself, with the source passed in so tests need no binary next
+/// to the test executable. See [`materialize_session_cli`] for the contract.
+fn deliver_session_cli(src: Option<&Path>, dir: &Path) -> SessionCliDelivery {
+    let format = ExecutableFormat::host();
+    let dest = dir.join(SESSION_CLI_BIN);
+    // Never leave a previous copy in place: what ends up here is either
+    // re-derived from a validated source below, or nothing. (The hard link
+    // below also refuses an existing destination.)
+    match std::fs::remove_file(&dest) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return SessionCliDelivery::Failed(format!("remove stale {}: {e}", dest.display()))
+        }
+    }
+    let Some(src) = src else {
+        return SessionCliDelivery::SourceMissing;
     };
-    let dest = dir.join(name);
-    // Hardlink first (zero extra disk when temp shares the exe's volume);
-    // fall back to a plain copy (temp on another volume, FS without links).
-    if std::fs::hard_link(&src, &dest).is_ok() {
-        return;
+    match native_executable::check(src, format) {
+        Ok(_) => {}
+        Err(NotExecutable::Missing) => return SessionCliDelivery::SourceMissing,
+        Err(why) => return SessionCliDelivery::SourceRefused(why),
     }
-    if let Err(e) = std::fs::copy(&src, &dest) {
-        tracing::debug!(
-            tool = name,
-            error = %e,
-            "session cli: failed to materialize {name} into the identity shim dir"
-        );
+    // Hardlink first (zero extra disk when temp shares the exe's volume); fall
+    // back to a plain copy (temp on another volume, FS without links).
+    if std::fs::hard_link(src, &dest).is_err() {
+        if let Err(e) = std::fs::copy(src, &dest) {
+            let _ = std::fs::remove_file(&dest);
+            return SessionCliDelivery::Failed(format!(
+                "copy {} -> {}: {e}",
+                src.display(),
+                dest.display()
+            ));
+        }
     }
+    // Validate what actually landed, not only what was asked for: a copy cut
+    // short (disk full, a racing writer) must not become the published CLI.
+    if let Err(why) = native_executable::check(&dest, format) {
+        let _ = std::fs::remove_file(&dest);
+        return SessionCliDelivery::DestRefused(why);
+    }
+    SessionCliDelivery::Delivered
+}
+
+/// Keep the published session CLI publishable for the life of an identity
+/// dir, not only at the moment it was written. Returns `None` when there was
+/// nothing to repair (a sound CLI, or none), else the re-delivery's outcome.
+///
+/// A dir whose marker exists is served by [`materialize_identity`]'s fast path
+/// with no rewrite at all, so without this a 0-byte `qontinui-pr` it once
+/// received would stay on every terminal's PATH forever. Repair = remove it
+/// and re-deliver only a validated source; an absent CLI is left absent.
+fn repair_session_cli_if_unpublishable(dir: &Path) -> Option<SessionCliDelivery> {
+    let dest = dir.join(SESSION_CLI_BIN);
+    let unpublishable = |dest: &Path| match native_executable::check(dest, ExecutableFormat::host())
+    {
+        Ok(_) | Err(NotExecutable::Missing) => None,
+        Err(why) => Some(why),
+    };
+    unpublishable(&dest)?;
+    let _guard = IDENTITY_MATERIALIZE_LOCK.lock();
+    // Re-check under the lock: a peer spawn may have just repaired it.
+    let why = unpublishable(&dest)?;
+    tracing::warn!(
+        path = %dest.display(),
+        reason = %why,
+        "session cli: the published {SESSION_CLI_BIN} is not a runnable executable — repairing \
+         (an empty one exits 0 having opened no PR)"
+    );
+    Some(materialize_session_cli(dir))
 }
 
 /// Render an identity shim template by substituting its `@@…@@` placeholders.
@@ -714,14 +835,23 @@ fn copy_exe_stub(shim_dir: &Path, name: &str) {
 }
 
 /// Locate the `qontinui-shim` stub binary next to the runner exe. Returns the
-/// first existing candidate or `None` (dev build / not packaged).
+/// first candidate that is a runnable native executable, or `None` (dev build /
+/// not packaged). A present-but-unrunnable candidate (an empty or truncated
+/// file) is skipped like an absent one, so the callers fall back to the
+/// scripts instead of copying it in as `claude.exe` / `cargo.exe`.
 #[cfg(target_os = "windows")]
 fn locate_stub_exe() -> Option<PathBuf> {
     let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
     for cand in ["qontinui-shim.exe", "qontinui_shim.exe"] {
         let p = dir.join(cand);
-        if p.is_file() {
-            return Some(p);
+        match native_executable::check(&p, ExecutableFormat::host()) {
+            Ok(_) => return Some(p),
+            Err(NotExecutable::Missing) => {}
+            Err(why) => tracing::debug!(
+                stub = %p.display(),
+                reason = %why,
+                "install-intercept: qontinui-shim stub candidate is not a runnable executable — skipped"
+            ),
         }
     }
     None
@@ -775,7 +905,9 @@ pub fn materialize_persistent_identity() -> Result<PathBuf, String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     copy_exe_stub(&dir, PERSISTENT_IDENTITY_TOOL);
     let stub = dir.join(format!("{PERSISTENT_IDENTITY_TOOL}.exe"));
-    if !stub.is_file() {
+    // A runnable image, not merely a file: an empty `claude.exe` on the USER
+    // PATH would be the persistent twin of the 0-byte `qontinui-pr` defect.
+    if native_executable::check(&stub, ExecutableFormat::host()).is_err() {
         return Err(format!(
             "the qontinui-shim stub could not be copied to {} — it is not next to the runner \
              executable (a dev build without `cargo build --bin qontinui-shim`?). Refusing to \
@@ -1594,7 +1726,9 @@ mod tests {
         let created = if stub.exists() {
             false
         } else {
-            std::fs::write(&stub, b"fake stub payload").unwrap();
+            // A PE header, not arbitrary bytes: `locate_stub_exe` now skips a
+            // candidate that is not a runnable image.
+            std::fs::write(&stub, session_cli_tests::native_image()).unwrap();
             true
         };
 
@@ -1638,16 +1772,28 @@ mod tests {
         let created = if cli.exists() {
             false
         } else {
-            std::fs::write(&cli, b"fake cli payload").unwrap();
+            // A native image header, not arbitrary bytes: the materializer now
+            // refuses to publish anything the OS loader would not run (an
+            // arbitrary payload is exactly the 0-byte-placeholder class).
+            session_cli_tests::write_executable(&cli, &session_cli_tests::native_image());
             true
         };
 
         let tmp = tempfile::tempdir().unwrap();
         let dir = materialize_identity(tmp.path()).expect("identity materialize ok");
-        assert!(
-            dir.join(name).is_file(),
-            "{name} must be materialized into the identity dir"
-        );
+        if native_executable::check(&cli, ExecutableFormat::host()).is_ok() {
+            assert!(
+                dir.join(name).is_file(),
+                "{name} must be materialized into the identity dir"
+            );
+        } else {
+            // A pre-existing, unpublishable file we did not create: it must be
+            // refused, never published.
+            assert!(
+                !dir.join(name).exists(),
+                "an unrunnable {name} must not be published"
+            );
+        }
 
         if created {
             let _ = std::fs::remove_file(&cli);
@@ -1679,5 +1825,208 @@ mod tests {
         assert!(!exe_shadow_needed(ShimTool::Npx));
         assert!(!exe_shadow_needed(ShimTool::Pnpm));
         assert!(!exe_shadow_needed(ShimTool::Yarn));
+    }
+}
+
+/// The session-CLI publication guard (plan
+/// `2026-09-27-qontinui-pr-zero-byte-sidecar-placeholder-published-as-session-cli`,
+/// coord dossier `qontinui-pr-shim-zero-byte-opens-no-pr`). Every test here
+/// passes its own source, so none writes beside the test executable.
+#[cfg(test)]
+mod session_cli_tests {
+    use super::*;
+
+    /// The smallest file the host loader's magic check accepts, padded so it is
+    /// visibly more than a header. Not runnable — it only has to be what the
+    /// materializer's check, and a real linker's output, have in common.
+    pub(super) fn native_image() -> Vec<u8> {
+        let magic: &[u8] = match ExecutableFormat::host() {
+            ExecutableFormat::Pe => b"MZ\x90\x00",
+            ExecutableFormat::Elf => b"\x7fELF",
+            ExecutableFormat::MachO => &[0xcf, 0xfa, 0xed, 0xfe],
+        };
+        let mut v = magic.to_vec();
+        v.extend_from_slice(&[0u8; 60]);
+        v
+    }
+
+    /// Write `bytes` and (unix) set the execute bits PATH lookup requires.
+    pub(super) fn write_executable(path: &Path, bytes: &[u8]) {
+        std::fs::write(path, bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// A source dir holding `bytes` as the CLI, and an empty identity dir.
+    fn fixture(bytes: &[u8]) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("runner-exe-dir");
+        let identity = tmp.path().join("identity");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&identity).unwrap();
+        let src = src_dir.join(SESSION_CLI_BIN);
+        write_executable(&src, bytes);
+        (tmp, src, identity)
+    }
+
+    #[test]
+    fn a_zero_length_source_is_refused_and_nothing_is_published() {
+        // The defect: build.rs's placeholder, copied beside the runner exe by
+        // tauri-build, then published onto PATH where it exits 0 silently.
+        let (_tmp, src, identity) = fixture(b"");
+        assert_eq!(
+            deliver_session_cli(Some(&src), &identity),
+            SessionCliDelivery::SourceRefused(NotExecutable::Empty)
+        );
+        assert!(!identity.join(SESSION_CLI_BIN).exists());
+    }
+
+    #[test]
+    fn a_non_native_source_is_refused_and_nothing_is_published() {
+        // Non-empty is not enough: a script placeholder exits 0 just the same.
+        let (_tmp, src, identity) = fixture(b"#!/bin/sh\nexit 0\n");
+        assert!(matches!(
+            deliver_session_cli(Some(&src), &identity),
+            SessionCliDelivery::SourceRefused(NotExecutable::WrongFormat { len: 17, .. })
+        ));
+        assert!(!identity.join(SESSION_CLI_BIN).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_native_source_without_an_execute_bit_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, src, identity) = fixture(&native_image());
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            deliver_session_cli(Some(&src), &identity),
+            SessionCliDelivery::SourceRefused(NotExecutable::NoExecutePermission)
+        );
+        assert!(!identity.join(SESSION_CLI_BIN).exists());
+    }
+
+    #[test]
+    fn a_native_source_is_published_byte_identical() {
+        // The happy path is unchanged: link or copy, same bytes.
+        let (_tmp, src, identity) = fixture(&native_image());
+        assert_eq!(
+            deliver_session_cli(Some(&src), &identity),
+            SessionCliDelivery::Delivered
+        );
+        let dest = identity.join(SESSION_CLI_BIN);
+        assert_eq!(std::fs::read(&dest).unwrap(), native_image());
+        assert!(native_executable::check(&dest, ExecutableFormat::host()).is_ok());
+    }
+
+    #[test]
+    fn a_stale_zero_byte_copy_is_replaced_from_a_sound_source() {
+        let (_tmp, src, identity) = fixture(&native_image());
+        let dest = identity.join(SESSION_CLI_BIN);
+        write_executable(&dest, b"");
+        assert_eq!(
+            deliver_session_cli(Some(&src), &identity),
+            SessionCliDelivery::Delivered
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), native_image());
+    }
+
+    #[test]
+    fn a_stale_zero_byte_copy_is_removed_when_the_source_is_missing() {
+        let (_tmp, src, identity) = fixture(&native_image());
+        std::fs::remove_file(&src).unwrap();
+        let dest = identity.join(SESSION_CLI_BIN);
+        write_executable(&dest, b"");
+        assert_eq!(
+            deliver_session_cli(Some(&src), &identity),
+            SessionCliDelivery::SourceMissing
+        );
+        assert!(
+            !dest.exists(),
+            "absent beats a CLI that exits 0 having done nothing"
+        );
+
+        // An unresolvable runner-exe dir is the same honest absence.
+        write_executable(&dest, b"");
+        assert_eq!(
+            deliver_session_cli(None, &identity),
+            SessionCliDelivery::SourceMissing
+        );
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn a_stale_zero_byte_copy_is_removed_when_the_source_is_refused() {
+        let (_tmp, src, identity) = fixture(b"");
+        let dest = identity.join(SESSION_CLI_BIN);
+        write_executable(&dest, b"");
+        assert_eq!(
+            deliver_session_cli(Some(&src), &identity),
+            SessionCliDelivery::SourceRefused(NotExecutable::Empty)
+        );
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn repair_leaves_a_sound_or_absent_cli_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // Absent: nothing to repair, and nothing is delivered in its place.
+        assert_eq!(repair_session_cli_if_unpublishable(dir), None);
+        assert!(!dir.join(SESSION_CLI_BIN).exists());
+        // Sound: untouched.
+        write_executable(&dir.join(SESSION_CLI_BIN), &native_image());
+        assert_eq!(repair_session_cli_if_unpublishable(dir), None);
+        assert_eq!(
+            std::fs::read(dir.join(SESSION_CLI_BIN)).unwrap(),
+            native_image()
+        );
+    }
+
+    #[test]
+    fn repair_removes_an_unpublishable_cli() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join(SESSION_CLI_BIN);
+        write_executable(&dest, b"");
+        let outcome = repair_session_cli_if_unpublishable(tmp.path());
+        assert!(outcome.is_some(), "a 0-byte CLI must trigger a re-delivery");
+        // Whatever the re-delivery found beside the test executable, what is
+        // left is either nothing or a runnable image — never the empty file.
+        match std::fs::metadata(&dest) {
+            Err(_) => {}
+            Ok(_) => assert!(native_executable::check(&dest, ExecutableFormat::host()).is_ok()),
+        }
+    }
+
+    /// End to end through the public entry point, and written WITHOUT any
+    /// symbol this fix added, so the identical test compiles against the
+    /// pre-fix code and fails there: a dir materialized once, then found
+    /// holding a 0-byte `qontinui-pr`, must not keep serving it from the fast
+    /// path.
+    #[test]
+    fn materialize_identity_repairs_a_stale_zero_byte_session_cli() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = materialize_identity(tmp.path()).expect("first materialize");
+        let cli = dir.join(SESSION_CLI_BIN);
+        // Plant the defect's exact shape: a zero-length file with the execute
+        // bit, the way the placeholder copy chain left it on PATH.
+        std::fs::write(&cli, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let again = materialize_identity(tmp.path()).expect("fast-path materialize");
+        assert_eq!(again, dir, "the fast path must serve the same dir");
+        match std::fs::metadata(&cli) {
+            Err(_) => {} // repaired to absent: the command is honestly not found
+            Ok(md) => assert!(
+                md.len() > 0,
+                "the fast path kept publishing a 0-byte {SESSION_CLI_BIN} on PATH"
+            ),
+        }
     }
 }
