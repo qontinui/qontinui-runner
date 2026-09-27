@@ -461,38 +461,6 @@ pub async fn dispatch_app_request_by_id(
         .map_err(dispatch_err_to_string)
 }
 
-/// Whether an SDK app is currently the active connection.
-///
-/// This is the exact condition `AppDispatcher::dispatch_active` uses to decide
-/// whether to relay over WebSocket/HTTP vs. return `DispatchError::NotConnected`
-/// (see `app_dispatch.rs`: `active_connection().ok_or(DispatchError::NotConnected)`).
-///
-/// Handlers use it to gate the IPC/self-webview fallback: when an SDK app IS
-/// connected and the relayed action *fails*, the failure must be surfaced to
-/// the caller — falling back to the runner's own Tauri webview would silently
-/// execute the action against the wrong UI and report bogus success. The
-/// IPC fallback is only legitimate when NO SDK app is connected (the
-/// runner-self case), mirroring the per-app-id snapshot path which already
-/// skips fallback for the same reason.
-///
-/// Caveat: read AFTER a dispatch error, this races the WebSocket teardown,
-/// which clears the active connection before it fails in-flight commands. A
-/// `Disconnected`/`Displaced` dispatch can therefore wake to "not connected".
-/// Prefer deciding from the error's class — [`ipc_fallback_refusal`].
-async fn sdk_app_connected(state: &Arc<ApiState>) -> bool {
-    let guard = state.sdk_connection.lock().await;
-    manager_has_active(&guard)
-}
-
-/// Pure predicate over a locked `SdkConnectionManager`: is an SDK app the
-/// active connection? Extracted so the connected-vs-runner-self decision can
-/// be unit-tested without constructing a full `ApiState` (mirrors the
-/// `select_app_payload` extraction). This is the same `active_connection()`
-/// check `AppDispatcher::dispatch_active` uses to gate `NotConnected`.
-fn manager_has_active(manager: &SdkConnectionManager) -> bool {
-    manager.active_connection().is_some()
-}
-
 /// Fallback `code` on the failure body a handler answers when the IPC
 /// fallback was REFUSED and the error carried no code of the app's own.
 const SDK_DISPATCH_FAILED: &str = "SDK_DISPATCH_FAILED";
@@ -526,7 +494,8 @@ fn app_code_from_body(body: &str) -> Option<String> {
 /// re-execute the action on the wrong UI. Those are answered with
 /// `Some(body)`: `{success:false, error, code, failure_origin, detail}`.
 ///
-/// Why not ask `sdk_app_connected()` after the error: on a WebSocket
+/// Why not re-read the live connection state after the error (the former
+/// `sdk_app_connected()` gate, deleted once no handler used it): on a WebSocket
 /// disconnect the relay's teardown clears the active connection BEFORE it
 /// fails the in-flight commands, so a dispatch that wakes with
 /// `Disconnected`/`Displaced` would read "not connected" and fall back —
@@ -6445,7 +6414,7 @@ async fn handle_click_by_text(
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
-    match dispatch_app_request(
+    match dispatch_app_request_typed(
         &state,
         "clickByText",
         body.clone(),
@@ -6457,11 +6426,11 @@ async fn handle_click_by_text(
     {
         Ok(data) => Json(data),
         Err(e) => {
-            // An SDK app is connected but rejected the relayed action — surface
-            // the real error instead of silently retargeting the runner's own
-            // webview. Only fall back to IPC when NO SDK app is connected.
-            if sdk_app_connected(&state).await {
-                return Json(serde_json::json!({ "success": false, "error": e }));
+            // Only "no SDK app at dispatch time" may fall back to the runner's
+            // own webview; any other error class means the app WAS the target,
+            // so its error is the answer (decided by class, never live state).
+            if let Some(refusal) = ipc_fallback_refusal(&e, "page/click-by-text") {
+                return Json(refusal);
             }
             let payload = serde_json::json!({ "params": body });
             match ui_bridge_request_sync(&state, "click_by_text", payload).await {
@@ -6478,7 +6447,7 @@ async fn handle_click_by_selector(
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
-    match dispatch_app_request(
+    match dispatch_app_request_typed(
         &state,
         "clickBySelector",
         body.clone(),
@@ -6490,10 +6459,11 @@ async fn handle_click_by_selector(
     {
         Ok(data) => Json(data),
         Err(e) => {
-            // SDK app connected but rejected the action — surface the error
-            // rather than falling back to the runner's own webview.
-            if sdk_app_connected(&state).await {
-                return Json(serde_json::json!({ "success": false, "error": e }));
+            // Only "no SDK app at dispatch time" may fall back to the runner's
+            // own webview; any other error class means the app WAS the target,
+            // so its error is the answer (decided by class, never live state).
+            if let Some(refusal) = ipc_fallback_refusal(&e, "page/click-by-selector") {
+                return Json(refusal);
             }
             let payload = serde_json::json!({ "params": body });
             match ui_bridge_request_sync(&state, "click_by_selector", payload).await {
@@ -6510,7 +6480,7 @@ async fn handle_type_into(
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
-    match dispatch_app_request(
+    match dispatch_app_request_typed(
         &state,
         "typeInto",
         body.clone(),
@@ -6522,10 +6492,11 @@ async fn handle_type_into(
     {
         Ok(data) => Json(data),
         Err(e) => {
-            // SDK app connected but rejected the action — surface the error
-            // rather than falling back to the runner's own webview.
-            if sdk_app_connected(&state).await {
-                return Json(serde_json::json!({ "success": false, "error": e }));
+            // Only "no SDK app at dispatch time" may fall back to the runner's
+            // own webview; any other error class means the app WAS the target,
+            // so its error is the answer (decided by class, never live state).
+            if let Some(refusal) = ipc_fallback_refusal(&e, "page/type-into") {
+                return Json(refusal);
             }
             let payload = serde_json::json!({ "params": body });
             match ui_bridge_request_sync(&state, "type_into", payload).await {
@@ -6542,7 +6513,7 @@ async fn handle_read_value(
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
-    match dispatch_app_request(
+    match dispatch_app_request_typed(
         &state,
         "readValue",
         body.clone(),
@@ -6554,10 +6525,11 @@ async fn handle_read_value(
     {
         Ok(data) => Json(data),
         Err(e) => {
-            // SDK app connected but rejected the action — surface the error
-            // rather than falling back to the runner's own webview.
-            if sdk_app_connected(&state).await {
-                return Json(serde_json::json!({ "success": false, "error": e }));
+            // Only "no SDK app at dispatch time" may fall back to the runner's
+            // own webview; any other error class means the app WAS the target,
+            // so its error is the answer (decided by class, never live state).
+            if let Some(refusal) = ipc_fallback_refusal(&e, "page/read-value") {
+                return Json(refusal);
             }
             let payload = serde_json::json!({ "params": body });
             match ui_bridge_request_sync(&state, "read_value", payload).await {
@@ -6586,7 +6558,7 @@ async fn handle_send_keys_to_page(
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
-    match dispatch_app_request(
+    match dispatch_app_request_typed(
         &state,
         "sendKeysToPage",
         body.clone(),
@@ -6598,10 +6570,11 @@ async fn handle_send_keys_to_page(
     {
         Ok(data) => Json(data),
         Err(e) => {
-            // SDK app connected but rejected the action — surface the error
-            // rather than falling back to the runner's own webview.
-            if sdk_app_connected(&state).await {
-                return Json(serde_json::json!({ "success": false, "error": e }));
+            // Only "no SDK app at dispatch time" may fall back to the runner's
+            // own webview; any other error class means the app WAS the target,
+            // so its error is the answer (decided by class, never live state).
+            if let Some(refusal) = ipc_fallback_refusal(&e, "page/send-keys") {
+                return Json(refusal);
             }
             // Fall back to the runner's own webview by DELEGATING to the
             // canonical `/control/page/send-keys` handler rather than
@@ -6634,7 +6607,7 @@ async fn handle_find_by_text(
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
-    match dispatch_app_request(
+    match dispatch_app_request_typed(
         &state,
         "findByText",
         body.clone(),
@@ -6646,10 +6619,11 @@ async fn handle_find_by_text(
     {
         Ok(data) => Json(data),
         Err(e) => {
-            // SDK app connected but rejected the action — surface the error
-            // rather than falling back to the runner's own webview.
-            if sdk_app_connected(&state).await {
-                return Json(serde_json::json!({ "success": false, "error": e }));
+            // Only "no SDK app at dispatch time" may fall back to the runner's
+            // own webview; any other error class means the app WAS the target,
+            // so its error is the answer (decided by class, never live state).
+            if let Some(refusal) = ipc_fallback_refusal(&e, "page/find-by-text") {
+                return Json(refusal);
             }
             let payload = serde_json::json!({ "params": body });
             match ui_bridge_request_sync(&state, "find_by_text", payload).await {
@@ -6710,7 +6684,7 @@ async fn handle_navigate_by_adapter(
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
-    match dispatch_app_request(
+    match dispatch_app_request_typed(
         &state,
         "navigateByAdapter",
         body.clone(),
@@ -6722,10 +6696,11 @@ async fn handle_navigate_by_adapter(
     {
         Ok(data) => Json(data),
         Err(e) => {
-            // SDK app connected but rejected the action — surface the error
-            // rather than falling back to the runner's own webview.
-            if sdk_app_connected(&state).await {
-                return Json(serde_json::json!({ "success": false, "error": e }));
+            // Only "no SDK app at dispatch time" may fall back to the runner's
+            // own webview; any other error class means the app WAS the target,
+            // so its error is the answer (decided by class, never live state).
+            if let Some(refusal) = ipc_fallback_refusal(&e, "page/navigate-to") {
+                return Json(refusal);
             }
             let payload = serde_json::json!({ "params": body });
             match ui_bridge_request_sync(&state, "navigate_by_adapter", payload).await {
@@ -7329,76 +7304,6 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Connected-SDK vs. runner-self fallback gate
-    //
-    // Regression guard: when an SDK app IS connected and a relayed command
-    // action fails, the handlers must surface the error — NOT silently fall
-    // back to the runner's own Tauri webview (which would execute against the
-    // wrong UI and report bogus success). `manager_has_active` is the exact
-    // predicate the handlers use to choose; it must mirror
-    // `AppDispatcher::dispatch_active`'s `active_connection()` NotConnected gate.
-    // ------------------------------------------------------------------
-
-    fn manager_with_active_conn(app_id: &str, url: &str) -> SdkConnectionManager {
-        let mut mgr = SdkConnectionManager::new();
-        let info = SdkAppInfo {
-            app_id: app_id.to_string(),
-            app_name: "t".into(),
-            app_type: "web".into(),
-            framework: None,
-            version: None,
-            capabilities: vec![],
-            port: 0,
-        };
-        let conn = SdkConnection {
-            app_url: url.to_string(),
-            base_path: "".into(),
-            app_info: info,
-            client: reqwest::Client::new(),
-            connected_at: 0,
-            transport_kind: None,
-            physical_device_id: None,
-        };
-        mgr.connections.insert(url.to_string(), conn);
-        mgr.active_url = Some(url.to_string());
-        mgr
-    }
-
-    #[test]
-    fn manager_has_active_false_when_no_connection() {
-        // No SDK app connected => fallback to runner-self IPC is legitimate.
-        let mgr = SdkConnectionManager::new();
-        assert!(
-            !manager_has_active(&mgr),
-            "empty manager must report no active SDK app (IPC fallback allowed)"
-        );
-    }
-
-    #[test]
-    fn manager_has_active_true_when_app_connected() {
-        // SDK app connected => a failed relayed action MUST surface the error,
-        // not fall back to the runner's own webview.
-        let mgr = manager_with_active_conn("wapp", "http://127.0.0.1:3000");
-        assert!(
-            manager_has_active(&mgr),
-            "connected SDK app must report active (error surfaced, no IPC fallback)"
-        );
-    }
-
-    #[test]
-    fn manager_has_active_false_when_connection_present_but_inactive() {
-        // A registered connection with no active_url (e.g. after disconnecting
-        // the active one) is treated as not-connected — matches
-        // `active_connection()` returning None.
-        let mut mgr = manager_with_active_conn("wapp", "http://127.0.0.1:3000");
-        mgr.active_url = None;
-        assert!(
-            !manager_has_active(&mgr),
-            "no active_url must report not-active even if a connection lingers"
-        );
-    }
-
-    // ------------------------------------------------------------------
     // Case 1 — the IPC fallback is decided by the dispatch error's CLASS
     // (plan 2026-09-27-ui-bridge-action-failures-still-masked-after-the-strict-success-readers)
     // ------------------------------------------------------------------
@@ -7446,7 +7351,7 @@ mod tests {
     fn app_targeted_errors_are_refused_even_when_live_state_reads_disconnected() {
         let live = SdkConnectionManager::new();
         assert!(
-            !manager_has_active(&live),
+            live.active_connection().is_none(),
             "precondition: live state reads not connected"
         );
         for err in app_targeted_errors() {
@@ -7544,6 +7449,13 @@ mod tests {
             "handle_page_refresh",
             "handle_page_navigate",
             "handle_ai_assert_batch",
+            "handle_click_by_text",
+            "handle_click_by_selector",
+            "handle_type_into",
+            "handle_read_value",
+            "handle_send_keys_to_page",
+            "handle_find_by_text",
+            "handle_navigate_by_adapter",
         ] {
             let needle = format!("\nasync fn {handler}(");
             let body = src
@@ -7564,13 +7476,41 @@ mod tests {
             let gate = body
                 .find("ipc_fallback_refusal(&")
                 .unwrap_or_else(|| panic!("{handler} never asks the IPC-fallback gate"));
+            // `handle_send_keys_to_page` falls back by delegating to the
+            // canonical `/control/page/send-keys` handler instead.
             let fallback = body
                 .find("ui_bridge_request_sync(")
+                .or_else(|| body.find("ui_bridge_send_keys_to_page_handler("))
                 .unwrap_or_else(|| panic!("{handler} has no IPC fallback any more"));
             assert!(
                 gate < fallback,
                 "{handler} must ask the gate BEFORE falling back to IPC"
             );
+        }
+    }
+
+    /// No handler that falls back to the runner's own UI after an app
+    /// dispatch may decide that from the LIVE connection state — the read
+    /// races WS teardown (see `ipc_fallback_refusal`). Scans every handler,
+    /// not only the listed ones, so a new copy of the old gate is caught too.
+    #[test]
+    fn no_dispatching_handler_decides_its_fallback_from_live_state() {
+        let src = include_str!("sdk_client.rs");
+        let production = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or_default();
+        for chunk in production.split("\nasync fn ").skip(1) {
+            let dispatches = chunk.contains("dispatch_app_request");
+            let falls_back = chunk.contains("ui_bridge_request_sync(")
+                || chunk.contains("ui_bridge_send_keys_to_page_handler(");
+            if dispatches && falls_back {
+                let name = chunk.split('(').next().unwrap_or_default();
+                assert!(
+                    !chunk.contains("sdk_app_connected("),
+                    "{name} decides its IPC fallback from the live connection state"
+                );
+            }
         }
     }
 

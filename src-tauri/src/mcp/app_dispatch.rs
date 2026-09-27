@@ -362,8 +362,12 @@ impl AppDispatcher {
     /// HTTP transport additionally enforces a 10s responsiveness cache: when
     /// the app's `/health` endpoint recently reported `responsive: false`
     /// (no active browser tab), the call short-circuits with
-    /// `DispatchError::NotResponsive` so handlers can fall back to IPC
-    /// without waiting for a 10s HTTP retry. WebSocket-transport apps skip
+    /// `DispatchError::NotResponsive` instead of waiting for a 10s HTTP retry.
+    /// That is NOT a licence to fall back to the runner's own UI: an app WAS
+    /// the target, so the action handlers refuse the IPC fallback for it —
+    /// only `NotConnected` may fall back (`sdk_client::ipc_fallback_refusal`).
+    /// Read-only handlers without that gate still fall back on any error.
+    /// WebSocket-transport apps skip
     /// the cache entirely — their liveness is already tracked by the relay
     /// heartbeat in `WsConnectionManager`.
     ///
