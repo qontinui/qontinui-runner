@@ -451,7 +451,7 @@ Workflows in `.github/workflows/` split into three tiers. The authoritative list
 
   So this red *is* meant to be cleared by the author. What must never be "fixed" is the underlying weakening: declare the change honestly, because the guard computes the surface diff from trusted `main` and contradicts a false declaration. It is a visibility guarantee, not a permission one — an earlier version of this bullet described an operator-review arm that was deliberately retired, on the reasoning that routing routine CI work through a human click both stalls agents and trains the operator to rubber-stamp.
 - `clippy-tiers.yml` → `Clippy nightly (unscoped, all-targets)` + `Clippy diff-scoped (advisory)`. Ubuntu-only, advisory by design; not a substitute for either blocking clippy context above.
-- `reproducibility-gate.yml`, `atlas-exclude-fresh.yml`, `page-spec-paths.yml`, `frontend-coverage-producer.yml`.
+- `reproducibility-gate.yml`, `atlas-schema-check.yml`, `page-spec-paths.yml`, `frontend-coverage-producer.yml`.
 - `qontinui-types-drift.yml` — advisory **on your PR**, but read the next section before treating its `main` red as someone else's problem. Its `push` half is not advisory to anything.
 
 ### Advisory on a PR is not harmless on `main`
