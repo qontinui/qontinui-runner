@@ -636,7 +636,8 @@ impl SignalSource for ManagerSignalSource {
 ///
 /// The other two variants are TRANSIENT — they resolve without anything in this
 /// run changing, so [`transient`](Self::transient) reads `true` and `tick_exit`
-/// DROPS the row's fingerprint key instead of accruing stall time against it:
+/// REPLACES the row's fingerprint entries with a single `T:` one, putting it on
+/// the long transient window instead of the row-sized default:
 ///
 /// * [`DeferredByDrain`](Self::DeferredByDrain) — coord has drained this device
 ///   (or its drain state is unknown). Expected for as long as the drain holds,
@@ -842,7 +843,10 @@ pub struct TickPlan {
     /// residual, stated plainly: while any worker is live, a run queued behind
     /// a bound held entirely by peers is held open past its window, for as long
     /// as those workers last. That is bounded by the workers' own
-    /// `working_silence_secs` rather than by the transient window, and the
+    /// `working_silence_secs` WHERE IT APPLIES, and by nothing at all for a
+    /// worker that wedges while still emitting — the chatty-wedged case this
+    /// file names at the `working_silence_secs` field and again in
+    /// [`tick_exit`]'s doc, which is precisely where this residual bites. The
     /// transient window keeps accumulating underneath the guard — so the stall
     /// fires on the first tick the run has nothing live, with no extra wait.
     ///
@@ -2711,7 +2715,12 @@ impl StallWatch {
 ///
 /// That is deliberately the safer of the two failure modes — a stall exit is
 /// terminal and orphans the sessions, while holding open leaves them reachable
-/// — it warns every tick, and `stop_orchestration_run` still ends the run. In
+/// — and `stop_orchestration_run` still ends the run. Note the warning is
+/// EDGE-TRIGGERED (see `announce_held_open`): it fires when the hold starts and
+/// when the held-open set changes, NOT every tick, so the absence of a fresh
+/// line is not evidence the run stopped being held open. `apply_tick`'s
+/// per-tick summary carries `waiting-for-a-slot=<rows>` if you need the live
+/// view. In
 /// every case where a `Working` row DOES reach a deadline, the in-flight set
 /// drains on its own, and because the window keeps accumulating underneath the
 /// guard, the stall fires the moment it does.
