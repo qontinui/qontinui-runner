@@ -3145,6 +3145,15 @@ impl AcceptRemoteAttach {
 pub struct RemoteAttachSettings {
     #[serde(default)]
     pub accept_remote_attach: AcceptRemoteAttach,
+    /// When this runner's Fleet view last opened a device's session list,
+    /// keyed by the device id, RFC 3339 UTC. The runner's own interactivity
+    /// probe scheduler sweeps a device every `PROBE_EVERY` while its entry is
+    /// under seven days old (plan
+    /// `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`,
+    /// A3) — an operator who has not looked at a device in a week is not
+    /// served by probing it. Pruned on every write.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub fleet_view_opened_at: std::collections::BTreeMap<String, String>,
 }
 
 /// Who may ask this device to CREATE a terminal remotely (plan
@@ -6108,6 +6117,21 @@ pub fn save_remote_attach_preference(pref: AcceptRemoteAttach) -> Result<(), Str
         *cache = Some((std::time::Instant::now(), pref));
     }
     Ok(())
+}
+
+/// When the Fleet view last opened each device (see
+/// [`RemoteAttachSettings::fleet_view_opened_at`]).
+pub fn get_fleet_view_opened_at() -> std::collections::BTreeMap<String, String> {
+    load_settings().remote_attach.fleet_view_opened_at
+}
+
+/// Rewrite the Fleet-view opened-at map through `mutate` (the caller records
+/// and prunes; this persists).
+pub fn update_fleet_view_opened_at<F>(mutate: F) -> Result<(), String>
+where
+    F: FnOnce(&mut std::collections::BTreeMap<String, String>),
+{
+    update_settings(|settings| mutate(&mut settings.remote_attach.fleet_view_opened_at))
 }
 
 /// The remote-CREATE preference. Default [`AcceptRemoteCreate::Off`].

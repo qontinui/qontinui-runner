@@ -42,6 +42,14 @@ import {
 } from "./remoteTabs";
 import { useRemoteAttachWaiting } from "./useRemoteAttachWaiting";
 import {
+  describeFact,
+  describeSurface,
+  devicesToProbe,
+  FACT_TONE_CLASS,
+  servesInteractivity,
+} from "./remoteInteractivityFacts";
+import { useInteractivityProbe } from "./useInteractivityProbe";
+import {
   createButtonState,
   describeRemoteCreateFailure,
   fleetDeviceCreateErrorId,
@@ -402,6 +410,22 @@ export function FleetSessionPicker() {
     truncation.kind === "more-available",
   );
   const conflict = fleetFilterConflict(server);
+
+  /**
+   * Remote interactivity (plan
+   * `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`,
+   * A3): loading the Fleet view probes each REMOTE device's not-fresh sessions
+   * once, then re-reads so the facts it filed show. Off against a coord that
+   * serves no facts (it has no door to record them in).
+   */
+  const interactivityServed = servesInteractivity(response);
+  const probeDevices = useMemo(() => devicesToProbe(deviceCatalog), [deviceCatalog]);
+  const refreshAfterSweep = useCallback(() => void refresh(), [refresh]);
+  const { sweeping: probingDevice, errors: probeErrors } = useInteractivityProbe(
+    probeDevices,
+    interactivityServed,
+    refreshAfterSweep,
+  );
 
   const { pageId, setActiveId } = useTerminalSession();
   const [attachState, setAttachState] = useState<Record<string, RowAttachState>>({});
@@ -912,6 +936,25 @@ export function FleetSessionPicker() {
                   <span className="text-[10px] text-[#565f89]">
                     {g.sessions.length} session{g.sessions.length !== 1 ? "s" : ""}
                   </span>
+                  {probingDevice === g.deviceId && (
+                    <span
+                      data-ui-bridge-id={`terminal.fleet-device-probing.${g.deviceId}`}
+                      className="text-[9px] text-[#e0af68]"
+                      role="status"
+                      title="Measuring whether this device's sessions are readable and writable from here — no byte is typed into any session"
+                    >
+                      measuring…
+                    </span>
+                  )}
+                  {probeErrors[g.deviceId] && (
+                    <span
+                      data-ui-bridge-id={`terminal.fleet-device-probe-error.${g.deviceId}`}
+                      className="text-[9px] text-[#f7768e] truncate"
+                      title={probeErrors[g.deviceId]}
+                    >
+                      measurement failed
+                    </span>
+                  )}
                   <div className="flex-1" />
                   {/* CREATE (Phase 5). A per-DEVICE action, so it lives on the
                       group header — the per-tab affordances belong in
@@ -1021,6 +1064,43 @@ export function FleetSessionPicker() {
                           </div>
                         );
                       })()}
+                      {interactivityServed &&
+                        (() => {
+                          // The two measured facts. An ABSENT fact (a coord
+                          // before them) renders nothing — never "failed" —
+                          // and `unknown` carries its reason, distinct from
+                          // `failed`, which carries the refusal code.
+                          const read = describeFact("read", s.readableRemotely);
+                          const write = describeFact("write", s.writableRemotely);
+                          const surface = describeSurface(s.interactiveSurface);
+                          if (!read && !write && !surface) return null;
+                          return (
+                            <div
+                              data-ui-bridge-id={`terminal.fleet-session-interactivity.${s.sessionId}`}
+                              data-read-state={read?.state}
+                              data-read-reason={read?.reason ?? undefined}
+                              data-write-state={write?.state}
+                              data-write-reason={write?.reason ?? undefined}
+                              data-surface={s.interactiveSurface}
+                              className="text-[10px] text-[#565f89] truncate"
+                            >
+                              {[read, write].map((f, i) =>
+                                f ? (
+                                  <span key={i} className={FACT_TONE_CLASS[f.tone]} title={f.title}>
+                                    {i > 0 && read ? " · " : ""}
+                                    {f.label}
+                                  </span>
+                                ) : null,
+                              )}
+                              {surface && (
+                                <span title="Whether coord classifies this session as a remote PTY">
+                                  {read || write ? " · " : ""}
+                                  {surface}
+                                </span>
+                              )}
+                            </div>
+                          );
+                        })()}
                       {waitingLine && (
                         <div
                           data-ui-bridge-id={`terminal.fleet-session-attach-waiting.${s.sessionId}`}

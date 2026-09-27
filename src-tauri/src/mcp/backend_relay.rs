@@ -2177,6 +2177,13 @@ async fn handle_connected_message(api_state: &Arc<ApiState>, data: &Value) {
         });
     }
     let coord_base = crate::commands::remote_attach::coord_base_for(&api_state.app_handle);
+    // 4. Remote interactivity (plan
+    //    `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`):
+    //    observations go to the coord this runner mints grants against, and
+    //    the probe sweep's scheduler starts on the first connect — the sweep
+    //    rides this relay, so there is nothing for it to do before one.
+    crate::mcp::remote_interactivity::set_coord_base(&coord_base);
+    crate::commands::remote_interactivity_probe::ensure_probe_scheduler(&api_state.app_handle);
     tokio::spawn(
         crate::commands::remote_attach::mirror_attach_preference_logged(coord_base.clone()),
     );
@@ -5155,13 +5162,23 @@ fn handle_terminal_input(api_state: &Arc<ApiState>, data: &Value) -> Option<Valu
         // The gate + decode + write live in `remote_terminal` so the "a
         // refused frame never reaches the PTY" property is unit-tested
         // against a recorder. No `remote` block → the pre-existing path.
-        return crate::mcp::remote_terminal::apply_terminal_input(
+        let reply = crate::mcp::remote_terminal::apply_terminal_input(
             tm.as_ref(),
             crate::mcp::remote_terminal::grants(),
             crate::settings::get_remote_attach_preference,
             data,
             crate::mcp::remote_terminal::now_epoch_secs(),
         );
+        // TARGET role of plan
+        // `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`
+        // (A2): an ack is this runner MEASURING the write half, so it is
+        // reported to coord — coalesced and queued, never awaited here (this
+        // is the relay's serial read loop). A refusal frame or `None` is not
+        // an ack and reports nothing.
+        if let Some(ack) = reply.as_ref() {
+            crate::mcp::remote_interactivity::report_target_ack(ack);
+        }
+        return reply;
     }
     None
 }

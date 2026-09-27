@@ -262,6 +262,13 @@ impl RemoteAttachGrants {
         self.inner.lock().ok()?.remove(grant_jti)
     }
 
+    /// The row for `grant_jti`, expired or not, WITHOUT admitting anything —
+    /// a read for bookkeeping (the interactivity reporter reads the session
+    /// and source device a just-acked input ran under). Never a gate.
+    pub fn get(&self, grant_jti: &str) -> Option<AttachGrant> {
+        self.inner.lock().ok()?.get(grant_jti).cloned()
+    }
+
     /// True when this jti names a row in the ATTACH table, expired or not.
     ///
     /// Used by the create gate, and only there: a jti coord minted as an
@@ -2862,6 +2869,16 @@ impl RemoteAttachClient {
         if let Ok(mut panes) = self.panes.lock() {
             panes.remove(grant_jti);
         }
+    }
+
+    /// Stop routing inbound frames to the pane holding `grant_jti` — the
+    /// interactivity probe's pane, which has no tab to close and so no other
+    /// door out of the routing table (plan
+    /// `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`,
+    /// A3). Any pre-registration output slot is discarded with it.
+    pub fn forget_pane(&self, grant_jti: &str) {
+        self.drop_pane(grant_jti);
+        self.discard_pending_output(grant_jti);
     }
 
     /// Route one inbound frame. Returns `true` when this client consumed it.

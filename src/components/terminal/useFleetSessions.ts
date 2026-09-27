@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
+import type { InteractiveSurface, InteractivityFact } from "./remoteInteractivityFacts";
 import {
   EMPTY_FLEET_WALK,
   FLEET_CURSOR_STALLED_MESSAGE,
@@ -88,6 +89,21 @@ export interface FleetSession {
   startedAt: string | null;
   lastHeartbeatAt: string | null;
   closedAt: string | null;
+  /**
+   * Bytes this session produced reached a SOURCE device's pane — measured at
+   * the source (plan
+   * `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`,
+   * A2). Always an object on a coord that serves it (`unknown/unprobed` when
+   * nothing was observed); OPTIONAL here because an older coord omits it, and
+   * an absent fact is UNKNOWN — rendered as nothing, never as "failed".
+   */
+  readableRemotely?: InteractivityFact;
+  /** Bytes a source sent were written into this session's PTY — measured at
+   * the TARGET. Same object, same absence rule. */
+  writableRemotely?: InteractivityFact;
+  /** Whether this session is a remote PTY surface at all. Absent on an older
+   * coord. */
+  interactiveSurface?: InteractiveSurface;
 }
 
 /**
@@ -131,6 +147,14 @@ export interface FleetSessionsResponse {
   sessionBridgeColumnPresent: boolean;
   workAxisColumnsPresent: boolean;
   deviceIdentityColumnsPresent: boolean;
+  /**
+   * `false` ⇒ coord could not read its interactivity observations on this
+   * call, and every fact is `unknown/events_unreadable`. ABSENT ⇒ a coord that
+   * predates the facts altogether (see `servesInteractivity`).
+   */
+  interactivityEventsPresent?: boolean;
+  /** The freshness window coord applied, in seconds (a compiled constant). */
+  freshForSecs?: number;
 }
 
 export interface FleetSessionsQuery {

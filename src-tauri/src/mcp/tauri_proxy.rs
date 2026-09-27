@@ -38,6 +38,13 @@ pub const ALLOWED_PROXIED_COMMANDS: &[&str] = &[
     "list_terminals",
     "get_claude_config_dirs",
     "check_accounts_usage",
+    // The remote-interactivity probe sweep (plan
+    // `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`,
+    // A3): a headless agent measures a device's sessions without a webview.
+    // It mints grants and attaches with this runner's own device credential,
+    // exactly as the Fleet view does, and carries no input byte by
+    // construction (`ProbeFrameSink`).
+    "remote_interactivity_probe",
 ];
 
 // ============================================================================
@@ -433,6 +440,31 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                     "message": cmd.message,
                     "data": cmd.data,
                 })),
+                Err(e) => TauriInvokeResponse::err(e),
+            }
+        }
+
+        // ── remote interactivity ─────────────────────────────────────────────
+        "remote_interactivity_probe" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Args {
+                device_id: String,
+                #[serde(default)]
+                trigger: Option<String>,
+            }
+            let a = match serde_json::from_value::<Args>(req.args) {
+                Ok(v) => v,
+                Err(e) => return TauriInvokeResponse::err(format!("bad args: {}", e)),
+            };
+            match crate::commands::remote_interactivity_probe::run_probe_command(
+                &state.app_handle,
+                &a.device_id,
+                a.trigger.as_deref(),
+            )
+            .await
+            {
+                Ok(report) => TauriInvokeResponse::ok(report),
                 Err(e) => TauriInvokeResponse::err(e),
             }
         }
