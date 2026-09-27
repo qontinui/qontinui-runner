@@ -14,6 +14,7 @@ use atspi::proxy::accessible::AccessibleProxy;
 use atspi::proxy::action::ActionProxy;
 use atspi::proxy::component::ComponentProxy;
 use atspi::proxy::editable_text::EditableTextProxy;
+use atspi::proxy::registry::RegistryProxy;
 use atspi::proxy::value::ValueProxy;
 use atspi::{AccessibilityConnection, CoordType, Interface, InterfaceSet, Role, State};
 use tokio::sync::{mpsc, RwLock};
@@ -35,6 +36,100 @@ struct AtspiAddress {
     object_path: String,
 }
 
+/// The event strings the listener asks the AT-SPI registry to have
+/// application bridges emit, in the `class:major:minor` form libatspi clients
+/// pass to `RegisterEvent` (libatspi itself registers `object:children-changed`
+/// and `object:state-changed:defunct` this way). Deliberately narrow: the
+/// registry fans every registration out to every bridge on the bus, so a whole
+/// class such as `Object:` would make every application emit every object
+/// event for as long as the registration lives.
+const REGISTRY_EVENTS: [&str; 3] = [
+    "object:state-changed:focused",
+    "object:children-changed",
+    "focus:",
+];
+
+/// The registry events one listener registered. Each successful
+/// `RegisterEvent` is tracked separately, so only those are deregistered.
+///
+/// Deregister with [`RegistryRegistrations::deregister`] where an `.await` is
+/// possible; dropping it instead spawns the deregistration on the current
+/// tokio runtime (best effort — the only path from a synchronous `Drop`).
+struct RegistryRegistrations {
+    registry: Option<RegistryProxy<'static>>,
+    events: Vec<&'static str>,
+}
+
+impl RegistryRegistrations {
+    /// No registrations (no bus, or nothing registered).
+    fn none() -> Self {
+        Self {
+            registry: None,
+            events: Vec::new(),
+        }
+    }
+
+    /// Register each of [`REGISTRY_EVENTS`]. A refusal is logged, not
+    /// returned: the listener's match rules still receive whatever the
+    /// bridges emit for other clients.
+    async fn register(registry: &RegistryProxy<'static>) -> Self {
+        let mut events = Vec::with_capacity(REGISTRY_EVENTS.len());
+        for event in REGISTRY_EVENTS {
+            match registry.register_event(event).await {
+                Ok(()) => events.push(event),
+                Err(e) => warn!("AT-SPI registry RegisterEvent({event}) failed: {e}"),
+            }
+        }
+        Self {
+            registry: Some(registry.clone()),
+            events,
+        }
+    }
+
+    /// Deregister everything this set registered, awaiting each call.
+    async fn deregister(mut self) {
+        let events = std::mem::take(&mut self.events);
+        if let Some(registry) = self.registry.take() {
+            deregister_events(&registry, &events).await;
+        }
+    }
+}
+
+impl Drop for RegistryRegistrations {
+    fn drop(&mut self) {
+        let events = std::mem::take(&mut self.events);
+        let Some(registry) = self.registry.take() else {
+            return;
+        };
+        if events.is_empty() {
+            return;
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move { deregister_events(&registry, &events).await });
+            }
+            Err(_) => warn!(
+                "AT-SPI registry events {events:?} not deregistered: no tokio runtime at drop"
+            ),
+        }
+    }
+}
+
+async fn deregister_events(registry: &RegistryProxy<'static>, events: &[&'static str]) {
+    for event in events {
+        if let Err(e) = registry.deregister_event(event).await {
+            warn!("AT-SPI registry DeregisterEvent({event}) failed: {e}");
+        }
+    }
+}
+
+/// The running event listener: the task owning the match-rule streams, and
+/// the registry registrations made for it. Both end together.
+struct EventListener {
+    task: tokio::task::JoinHandle<()>,
+    registrations: RegistryRegistrations,
+}
+
 /// Linux AT-SPI2 adapter.
 pub struct AtspiAdapter {
     connection: Option<AccessibilityConnection>,
@@ -47,22 +142,23 @@ pub struct AtspiAdapter {
     /// Monotonic ref counter for node ref IDs.
     next_ref: AtomicU64,
     connected: AtomicBool,
-    /// The D-Bus event listener spawned by `subscribe_events`. It owns the
+    /// The event listener started by `subscribe_events`. Its task owns the
     /// match-rule streams, so aborting it drops them and zbus deregisters the
-    /// rules. At most one exists: stopped before every re-subscribe, on
+    /// rules; its registry registrations are deregistered with it. At most
+    /// one exists: shut down before every re-subscribe, on
     /// `connect`/`disconnect`, and on drop. A `std` mutex because
     /// `subscribe_events` takes `&self`; never held across an `.await`.
-    event_listener: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Whether this connection has asked the AT-SPI registry to have
-    /// application bridges emit the event classes the listener needs (see
-    /// `register_registry_events`). Reset whenever the connection is replaced:
-    /// the registry drops a client's registrations when its bus name vanishes.
-    registry_events_registered: AtomicBool,
+    event_listener: Mutex<Option<EventListener>>,
+    /// Serializes `subscribe_events`, so one call's deregistration can never
+    /// interleave with (and undo) another call's registration of the same
+    /// event strings.
+    subscribe_lock: tokio::sync::Mutex<()>,
 }
 
 impl Drop for AtspiAdapter {
     fn drop(&mut self) {
-        self.stop_event_listener();
+        // No `.await` here: the registrations deregister from their own Drop.
+        drop(self.take_event_listener());
     }
 }
 
@@ -82,64 +178,41 @@ impl AtspiAdapter {
             next_ref: AtomicU64::new(1),
             connected: AtomicBool::new(false),
             event_listener: Mutex::new(None),
-            registry_events_registered: AtomicBool::new(false),
+            subscribe_lock: tokio::sync::Mutex::new(()),
         }
     }
 
-    /// Abort the event listener task, if any. Dropping its match-rule streams
-    /// queues their removal from the bus.
-    fn stop_event_listener(&self) {
-        self.replace_event_listener(None);
+    fn listener_slot(&self) -> std::sync::MutexGuard<'_, Option<EventListener>> {
+        self.event_listener
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Put `next` in the listener slot and abort whatever it displaces, so at
-    /// most one listener (and one set of match-rule streams) exists. The one
-    /// place the slot is written — `stop_event_listener` and
-    /// `subscribe_events` both go through it.
-    fn replace_event_listener(&self, next: Option<tokio::task::JoinHandle<()>>) {
-        let displaced = std::mem::replace(
-            &mut *self
-                .event_listener
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            next,
-        );
+    /// Take the listener out of its slot and abort its task (dropping the
+    /// match-rule streams queues their removal from the bus). The returned
+    /// registrations are still live; the caller deregisters or drops them.
+    fn take_event_listener(&self) -> Option<RegistryRegistrations> {
+        let taken = self.listener_slot().take();
+        taken.map(|listener| {
+            listener.task.abort();
+            listener.registrations
+        })
+    }
+
+    /// Stop the listener and await the deregistration of its registry events.
+    async fn stop_event_listener(&self) {
+        if let Some(registrations) = self.take_event_listener() {
+            registrations.deregister().await;
+        }
+    }
+
+    /// Put `listener` in the slot. Anything it displaces (only possible if a
+    /// caller bypassed `subscribe_lock`) is aborted, and its registrations
+    /// deregister on drop.
+    fn install_event_listener(&self, listener: EventListener) {
+        let displaced = self.listener_slot().replace(listener);
         if let Some(old) = displaced {
-            old.abort();
-        }
-    }
-
-    /// Ask the AT-SPI registry to have application bridges emit focus and
-    /// object events, once per connection.
-    ///
-    /// A match rule only filters what reaches this client; whether a GTK / Qt
-    /// bridge emits an event at all depends on some client having registered
-    /// for it with the registry (`org.a11y.atspi.Registry.RegisterEvent`).
-    /// With no screen reader running, nothing else has, and the listener would
-    /// hear nothing. Only the registry half of the crate's `register_event` is
-    /// used: its match-rule half adds a bus-wide rule that is never removed,
-    /// while the listener's own per-stream rules are removed with the streams.
-    /// A refusal is logged, not returned: the streams still receive whatever
-    /// the bridges emit for other clients.
-    async fn register_registry_events(&self, conn: &AccessibilityConnection) {
-        use atspi::events::focus::FocusEvents;
-        use atspi::events::object::ObjectEvents;
-
-        if self.registry_events_registered.load(Ordering::Acquire) {
-            return;
-        }
-        let focus = conn.add_registry_event::<FocusEvents>().await;
-        let object = conn.add_registry_event::<ObjectEvents>().await;
-        match (focus, object) {
-            (Ok(()), Ok(())) => {
-                self.registry_events_registered
-                    .store(true, Ordering::Release);
-            }
-            (focus, object) => {
-                for e in [focus.err(), object.err()].into_iter().flatten() {
-                    warn!("AT-SPI registry event registration failed: {e}");
-                }
-            }
+            old.task.abort();
         }
     }
 
@@ -483,8 +556,9 @@ impl PlatformAdapter for AtspiAdapter {
     async fn connect(&mut self, target: ConnectionTarget, timeout_ms: u64) -> anyhow::Result<()> {
         let timeout = std::time::Duration::from_millis(timeout_ms);
 
-        // A listener from a previous connection must not outlive it.
-        self.stop_event_listener();
+        // A listener from a previous connection must not outlive it; its
+        // registrations are deregistered over that (still held) connection.
+        self.stop_event_listener().await;
 
         // Connect to the AT-SPI accessibility bus with a timeout.
         let conn = tokio::time::timeout(timeout, AccessibilityConnection::new())
@@ -493,8 +567,6 @@ impl PlatformAdapter for AtspiAdapter {
             .context("Failed to connect to AT-SPI accessibility bus")?;
 
         self.connection = Some(conn);
-        self.registry_events_registered
-            .store(false, Ordering::Release);
 
         // Get the desktop root (registry).
         let registry_addr = AtspiAddress {
@@ -532,13 +604,11 @@ impl PlatformAdapter for AtspiAdapter {
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
-        self.stop_event_listener();
+        self.stop_event_listener().await;
         self.connected.store(false, Ordering::Release);
         self.root_address = None;
         self.handle_table.write().await.clear();
         self.connection = None;
-        self.registry_events_registered
-            .store(false, Ordering::Release);
         debug!("AT-SPI adapter disconnected");
         Ok(())
     }
@@ -566,9 +636,16 @@ impl PlatformAdapter for AtspiAdapter {
         Ok(node)
     }
 
-    /// Idempotent per connection: the previous listener (and its match rules)
-    /// is stopped first. The match rules are registered before this returns,
-    /// so a bus refusal is an `Err`, not a silently empty stream.
+    /// Idempotent per connection: the previous listener (its match rules and
+    /// its registry registrations) is stopped first. The match rules are
+    /// registered before this returns, so a bus refusal is an `Err`, not a
+    /// silently empty stream.
+    ///
+    /// A match rule only filters what reaches this client; whether a GTK / Qt
+    /// bridge emits an event at all depends on some client having registered
+    /// for it with the registry (`org.a11y.atspi.Registry.RegisterEvent`).
+    /// With no screen reader running, nothing else has, so the listener
+    /// registers [`REGISTRY_EVENTS`] itself and deregisters them when it stops.
     async fn subscribe_events(&self) -> anyhow::Result<Option<mpsc::Receiver<A11yEvent>>> {
         use futures::StreamExt;
 
@@ -578,8 +655,10 @@ impl PlatformAdapter for AtspiAdapter {
             .context("Not connected to AT-SPI bus")?;
         let zconn = conn.connection().clone();
 
-        self.stop_event_listener();
-        self.register_registry_events(conn).await;
+        let _serialized = self.subscribe_lock.lock().await;
+        self.stop_event_listener().await;
+        // `AccessibilityConnection` derefs to the registry proxy.
+        let registrations = RegistryRegistrations::register(conn).await;
 
         // One stream per AT-SPI event match rule: focus changes, state changes
         // and structural (children) mutations. `for_match_rule` registers the
@@ -601,6 +680,7 @@ impl PlatformAdapter for AtspiAdapter {
         let (tx, rx) = mpsc::channel::<A11yEvent>(256);
 
         let listener = tokio::spawn(async move {
+            let mut focus_dedupe = FocusDedupe::default();
             while let Some(msg) = stream.next().await {
                 // zbus 4 yields `Result<Message, Error>` from MessageStream rather
                 // than the bare `Arc<Message>` of zbus 3. Drop transient errors and
@@ -637,6 +717,12 @@ impl PlatformAdapter for AtspiAdapter {
                 );
 
                 if let Some(evt) = event {
+                    if let A11yEvent::FocusChanged { ref_id, .. } = &evt {
+                        if !focus_dedupe.admit(ref_id, std::time::Instant::now()) {
+                            trace!("AT-SPI duplicate focus for {ref_id} dropped");
+                            continue;
+                        }
+                    }
                     if tx.send(evt).await.is_err() {
                         debug!("AT-SPI event receiver dropped, stopping event loop");
                         break;
@@ -645,7 +731,10 @@ impl PlatformAdapter for AtspiAdapter {
             }
         });
 
-        self.replace_event_listener(Some(listener));
+        self.install_event_listener(EventListener {
+            task: listener,
+            registrations,
+        });
 
         Ok(Some(rx))
     }
@@ -878,18 +967,60 @@ impl PlatformAdapter for AtspiAdapter {
 // ---------------------------------------------------------------------------
 
 /// The `(kind, detail1)` of an AT-SPI event body — e.g. `("focused", 1)` for
-/// `object:state-changed:focused` turning on. GTK and most toolkits send the
-/// `siiva{sv}` body; Qt sends `siiv(so)`. `None` when neither decodes.
+/// `object:state-changed:focused` turning on.
+///
+/// Only the two leading fields are read. The body is decoded as a structure
+/// of whatever signature it carries, so the trailing fields may be anything:
+/// GTK and most toolkits send `siiva{sv}`, Qt sends `siiv(so)`, and the typed
+/// `EventBodyOwned` of atspi 0.22 additionally requires the properties dict
+/// to be keyed by unique bus names — a body that breaks that would lose its
+/// focus event. `None` when the body does not start with a string and an
+/// `i32`.
 fn event_detail(msg: &zbus::Message) -> Option<(String, i32)> {
-    use atspi::events::{EventBodyOwned, EventBodyQT};
-
     let body = msg.body();
-    if let Ok(b) = body.deserialize::<EventBodyOwned>() {
-        return Some((b.kind, b.detail1));
+    let fields: zbus::zvariant::Structure<'_> = body.deserialize().ok()?;
+    leading_kind_and_detail1(fields.fields())
+}
+
+/// `(kind, detail1)` from an event body's fields, ignoring everything after
+/// the second. Pure, so it is tested without a message.
+fn leading_kind_and_detail1(fields: &[zbus::zvariant::Value<'_>]) -> Option<(String, i32)> {
+    use zbus::zvariant::Value;
+
+    match fields {
+        [Value::Str(kind), Value::I32(detail1), ..] => Some((kind.as_str().to_owned(), *detail1)),
+        _ => None,
     }
-    body.deserialize::<EventBodyQT>()
-        .ok()
-        .map(|b| (b.kind, b.detail1))
+}
+
+/// How close together two `FocusChanged` for one element must be to count as
+/// one focus change. A bridge that emits both the legacy `Focus:Focus` signal
+/// and `object:state-changed:focused` reports a single change twice, back to
+/// back.
+const FOCUS_DEDUPE_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Drops a `FocusChanged` that repeats the previous one's element within
+/// [`FOCUS_DEDUPE_WINDOW`]. Pure (the clock is passed in), so it is tested
+/// without a bus.
+#[derive(Debug, Default)]
+struct FocusDedupe {
+    /// The last `FocusChanged` admitted: its element path and when.
+    last: Option<(String, std::time::Instant)>,
+}
+
+impl FocusDedupe {
+    /// Whether a `FocusChanged` for `path` at `now` should be forwarded. The
+    /// window runs from the last ADMITTED event, so a steady repeat is still
+    /// forwarded once per window rather than suppressed forever.
+    fn admit(&mut self, path: &str, now: std::time::Instant) -> bool {
+        if let Some((last_path, at)) = &self.last {
+            if last_path == path && now.saturating_duration_since(*at) < FOCUS_DEDUPE_WINDOW {
+                return false;
+            }
+        }
+        self.last = Some((path.to_owned(), now));
+        true
+    }
 }
 
 /// Map one AT-SPI signal to an [`A11yEvent`]. Pure, so the mapping is tested
@@ -899,9 +1030,10 @@ fn event_detail(msg: &zbus::Message) -> Option<(String, i32)> {
 /// it is not a ref-manager ref, and consumers resolve it themselves).
 /// `detail` is the state-change body's `(kind, detail1)`, when decoded.
 ///
-/// Focus arrives two ways. The legacy `Event.Focus:Focus` signal, and — what
-/// current GTK and Qt actually emit — `Event.Object:StateChanged` with kind
-/// `focused` and `detail1 == 1`. Both become `FocusChanged`. A `focused`
+/// Focus arrives two ways. Modern bridges emit `Event.Object:StateChanged`
+/// with kind `focused` and `detail1 == 1`; some also still emit the legacy
+/// `Event.Focus:Focus` signal (the listener collapses the resulting pair, see
+/// [`FocusDedupe`]). Both become `FocusChanged`. A `focused`
 /// state turning OFF (`detail1 == 0`) is the old element losing focus; the
 /// gaining element sends its own `focused`/1, so that one stays an ordinary
 /// state `PropertyChanged`.
@@ -1161,13 +1293,20 @@ mod tests {
         )
     }
 
+    fn busless(task: tokio::task::JoinHandle<()>) -> EventListener {
+        EventListener {
+            task,
+            registrations: RegistryRegistrations::none(),
+        }
+    }
+
     #[tokio::test]
     async fn replacing_the_listener_tears_the_previous_one_down() {
         let adapter = AtspiAdapter::new();
         let (first, first_alive) = parked_listener();
-        adapter.replace_event_listener(Some(first));
+        adapter.install_event_listener(busless(first));
         let (second, mut second_alive) = parked_listener();
-        adapter.replace_event_listener(Some(second));
+        adapter.install_event_listener(busless(second));
 
         assert!(
             torn_down(first_alive).await,
@@ -1186,11 +1325,110 @@ mod tests {
     async fn disconnect_tears_the_listener_down_without_a_bus() {
         let mut adapter = AtspiAdapter::new();
         let (listener, alive) = parked_listener();
-        adapter.replace_event_listener(Some(listener));
+        adapter.install_event_listener(busless(listener));
 
         adapter.disconnect().await.unwrap();
 
         assert!(torn_down(alive).await, "listener outlived disconnect");
         assert!(adapter.event_listener.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn dropping_the_adapter_outside_a_runtime_does_not_panic() {
+        let adapter = AtspiAdapter::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (listener, _alive) = rt.block_on(async { parked_listener() });
+        adapter.install_event_listener(busless(listener));
+        drop(adapter);
+    }
+
+    #[test]
+    fn registry_events_are_narrow_and_in_libatspi_form() {
+        for event in REGISTRY_EVENTS {
+            assert_eq!(event, event.to_lowercase(), "{event}");
+            assert!(event.contains(':'), "{event}");
+        }
+        assert!(
+            !REGISTRY_EVENTS.contains(&"object:") && !REGISTRY_EVENTS.contains(&"Object:"),
+            "a whole-class registration makes every bridge emit every object event"
+        );
+    }
+
+    /// A real `StateChanged` signal, built offline (no connection).
+    fn state_changed_message<B>(body: &B) -> zbus::Message
+    where
+        B: serde::Serialize + zbus::zvariant::DynamicType,
+    {
+        zbus::Message::signal(PATH, "org.a11y.atspi.Event.Object", "StateChanged")
+            .unwrap()
+            .build(body)
+            .unwrap()
+    }
+
+    #[test]
+    fn event_detail_decodes_a_standard_state_changed_body() {
+        use zbus::zvariant::Value;
+        let props: HashMap<String, Value<'_>> = HashMap::new();
+        let msg = state_changed_message(&("focused", 1i32, 0i32, Value::from(0i32), props));
+        assert_eq!(msg.body().signature().unwrap().as_str(), "siiva{sv}");
+        assert_eq!(event_detail(&msg), Some(("focused".to_string(), 1)));
+    }
+
+    #[test]
+    fn event_detail_tolerates_a_properties_dict_not_keyed_by_unique_names() {
+        use zbus::zvariant::Value;
+        let mut props: HashMap<String, Value<'_>> = HashMap::new();
+        props.insert("not a unique name".to_string(), Value::from("x"));
+        let msg = state_changed_message(&("focused", 1i32, 0i32, Value::from(0i32), props));
+        // The typed body the crate offers refuses this one.
+        assert!(msg
+            .body()
+            .deserialize::<atspi::events::EventBodyOwned>()
+            .is_err());
+        assert_eq!(event_detail(&msg), Some(("focused".to_string(), 1)));
+    }
+
+    #[test]
+    fn event_detail_decodes_a_qt_state_changed_body() {
+        use zbus::zvariant::{ObjectPath, Value};
+        let msg = state_changed_message(&(
+            "focused",
+            1i32,
+            0i32,
+            Value::from(0i32),
+            (":1.42", ObjectPath::try_from(PATH).unwrap()),
+        ));
+        assert_eq!(event_detail(&msg), Some(("focused".to_string(), 1)));
+    }
+
+    #[test]
+    fn event_detail_is_none_for_a_body_without_the_leading_fields() {
+        let msg = state_changed_message(&(7i32, "focused"));
+        assert_eq!(event_detail(&msg), None);
+    }
+
+    #[test]
+    fn focus_dedupe_drops_a_repeat_within_the_window_only() {
+        let t0 = std::time::Instant::now();
+        let ms = std::time::Duration::from_millis;
+        let mut d = FocusDedupe::default();
+        assert!(d.admit("/a", t0));
+        assert!(
+            !d.admit("/a", t0 + ms(10)),
+            "same element, inside the window"
+        );
+        assert!(
+            d.admit("/b", t0 + ms(20)),
+            "a different element is a new focus"
+        );
+        assert!(d.admit("/a", t0 + ms(30)), "back to /a is a real change");
+        assert!(!d.admit("/a", t0 + ms(79)));
+        assert!(
+            d.admit("/a", t0 + ms(80)),
+            "window runs from the last admitted"
+        );
     }
 }
