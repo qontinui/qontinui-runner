@@ -123,3 +123,54 @@ export function throwIfWriteFailed(result: TerminalWriteResult): TerminalWriteRe
   });
   throw err;
 }
+
+/**
+ * Machine-readable failure code: the clipboard read behind a `paste` action was
+ * REJECTED (permission denied, document not focused, no clipboard API).
+ */
+export const CLIPBOARD_READ_FAILED = "CLIPBOARD_READ_FAILED";
+
+/**
+ * Build the typed error a `paste` handler throws when the clipboard read is
+ * rejected. Pure, so the envelope is unit-testable without a clipboard.
+ */
+export function buildClipboardReadFailure(cause: unknown): Error & {
+  code: typeof CLIPBOARD_READ_FAILED;
+  hint: string;
+} {
+  const detail = cause instanceof Error ? cause.message : cause == null ? "" : String(cause);
+  const hint =
+    "The page may lack focus or clipboard permission. Focus the runner window " +
+    "and retry, or send the text directly with `pasteText`.";
+  const err = new Error(
+    `${CLIPBOARD_READ_FAILED}: navigator.clipboard.readText() was rejected${
+      detail ? `: ${detail}` : ""
+    }. ${hint}`,
+  );
+  return Object.assign(err, { code: CLIPBOARD_READ_FAILED, hint } as const);
+}
+
+/**
+ * Read the clipboard for a `paste` custom action — the ONE reader both paste
+ * paths (`TerminalInstance` mounted, `TerminalBridgeProxies` by id) share.
+ *
+ * THE DEFECT this replaces: both paths did
+ * `navigator.clipboard.readText().catch(() => "")` followed by
+ * `if (!text) return { success: true, bytes: 0 }`, so a REJECTED read was
+ * indistinguishable from an empty clipboard and reported green. A rejection
+ * now throws a {@link CLIPBOARD_READ_FAILED} error — throwing is the only
+ * signal that reaches the SDK executor's `success` (see
+ * {@link throwIfWriteFailed}). A genuinely empty clipboard still resolves `""`,
+ * which the callers keep answering as `{ success: true, bytes: 0 }`.
+ *
+ * `read` is injectable for tests; production callers pass nothing.
+ */
+export async function readClipboardForPaste(
+  read: () => Promise<string> = () => navigator.clipboard.readText(),
+): Promise<string> {
+  try {
+    return await read();
+  } catch (cause) {
+    throw buildClipboardReadFailure(cause);
+  }
+}

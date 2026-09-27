@@ -41,6 +41,7 @@ import {
 import { PASTE_TEXT_INVALID, WRITE_TEXT_INVALID, requireTextPayload } from "./terminalTextPayload";
 import {
   buildWriteFailure,
+  readClipboardForPaste,
   throwIfWriteFailed,
   type TerminalWriteResult,
 } from "./terminalWriteResult";
@@ -1873,7 +1874,9 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
               effect: "destructive",
               description: "Read clipboard and write to PTY (same as Ctrl+V)",
               handler: async () => {
-                const text = await navigator.clipboard.readText().catch(() => "");
+                // A REJECTED read throws CLIPBOARD_READ_FAILED; only a genuinely
+                // empty clipboard is the zero-byte success below.
+                const text = await readClipboardForPaste();
                 if (!text) return { success: true, bytes: 0 };
                 // Same bracketed-paste + newline normalization as the Ctrl+V
                 // path (see `preparePaste.ts`).
