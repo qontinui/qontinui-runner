@@ -45,12 +45,51 @@ pub(crate) fn provision_session_assets(workdir: &str) {
     provision_session_assets_from_root(
         crate::agent_runtime::qontinui_root_dir().as_deref(),
         workdir,
+        &Registries::resolve(),
     );
 }
 
-/// Core of [`provision_session_assets`] with the workspace root passed in —
-/// resolved ONCE per spawn by the wrapper and handed to the agent-definition
-/// path — so a test can drive every arm without mutating process env.
+/// The command and skill registries one provisioning pass writes from (or, on
+/// the canonical-source arm, only observes).
+///
+/// Resolved ONCE per spawn by [`provision_session_assets`] and passed down,
+/// rather than resolved inside the provisioners, for two reasons: every arm —
+/// including the canonical-source one, which writes nothing — records which
+/// resolution arm answered from the same value; and a test hands in
+/// [`Registries::embedded`] instead, because real resolution reads the
+/// credential store (with an OS-keychain fallback), makes a live fetch, and
+/// stores or clears the on-disk override cache under the platform config dir.
+pub(crate) struct Registries {
+    pub(crate) commands: crate::agent_commands::AgentCommandRegistry,
+    pub(crate) skills: crate::agent_skills::AgentSkillRegistry,
+}
+
+impl Registries {
+    /// Fresh fetch → disk cache → embedded defaults, for each registry. Not
+    /// free (a network fetch with a disk-cache fallback): call it only from a
+    /// blocking context.
+    pub(crate) fn resolve() -> Self {
+        Self {
+            commands: crate::agent_commands::resolve_registry(),
+            skills: crate::agent_skills::resolve_registry(),
+        }
+    }
+
+    /// The embedded defaults alone — what a device with no account resolves
+    /// to — with no credential read, fetch or cache write.
+    #[cfg(test)]
+    pub(crate) fn embedded() -> Self {
+        Self {
+            commands: crate::agent_commands::AgentCommandRegistry::new(),
+            skills: crate::agent_skills::AgentSkillRegistry::new(),
+        }
+    }
+}
+
+/// Core of [`provision_session_assets`] with the workspace root and the
+/// registries passed in — each resolved ONCE per spawn by the wrapper — so a
+/// test can drive every arm without mutating process env or touching the
+/// network, the credential store or the override cache.
 ///
 /// **The canonical-source arm.** A cwd at the workspace root sees
 /// `<root>/.claude` as a symlink into `qontinui-claude-config/.claude` — the
@@ -59,14 +98,22 @@ pub(crate) fn provision_session_assets(workdir: &str) {
 /// probe fails soft (a timeout reads as "nothing tracked"). So the verdict is
 /// taken ONCE for the whole `.claude` tree, and when it holds no asset kind is
 /// written: the session already has every asset, as the source files. Each kind
-/// still gets a ledger row saying so.
-fn provision_session_assets_from_root(root: Option<&Path>, workdir: &str) {
+/// still gets a ledger row saying so, and both registries still record which
+/// arm resolved them.
+///
+/// The verdict holds on either of two tests: the cwd's `.claude` resolves into
+/// the canonical `.claude` (a path compare, following symlinks), or the cwd is a
+/// work tree of the canonical REPOSITORY — a linked worktree of
+/// `qontinui-claude-config` has a real `.claude/` at another path, which the
+/// path compare misses ([`crate::provision_guard::same_repository`]). The
+/// identity test walks up to the cwd's NEAREST `.git`, so it deliberately covers
+/// a cwd nested anywhere inside such a work tree, not only its top level.
+fn provision_session_assets_from_root(root: Option<&Path>, workdir: &str, registries: &Registries) {
     let claude_dir = Path::new(workdir).join(".claude");
     if let Some(why) = root.and_then(|r| {
-        crate::provision_guard::destination_is_source(
-            &claude_dir,
-            &r.join("qontinui-claude-config").join(".claude"),
-        )
+        let checkout = r.join("qontinui-claude-config");
+        crate::provision_guard::destination_is_source(&claude_dir, &checkout.join(".claude"))
+            .or_else(|| crate::provision_guard::same_repository(Path::new(workdir), &checkout))
     }) {
         info!("session_assets: not provisioning {workdir} — {why}");
         for capability in CANONICAL_SOURCE_ROWS {
@@ -80,6 +127,7 @@ fn provision_session_assets_from_root(root: Option<&Path>, workdir: &str) {
             );
             capability_manifest::record_provision(workdir, report);
         }
+        observe_registries(registries);
         return;
     }
     match crate::agent_runtime::provision_agent_definitions_from_root(root, workdir) {
@@ -101,8 +149,24 @@ fn provision_session_assets_from_root(root: Option<&Path>, workdir: &str) {
             capability_manifest::record_provision(workdir, report);
         }
     }
-    crate::fleet_commands::provision_fleet_commands_for_session(workdir);
-    crate::fleet_skills::provision_fleet_skills_for_session(workdir);
+    crate::fleet_commands::provision_fleet_commands_for_session(workdir, &registries.commands);
+    crate::fleet_skills::provision_fleet_skills_for_session(workdir, &registries.skills);
+}
+
+/// Record which resolution arm answered for each registry, writing nothing.
+///
+/// The one observation path for every arm that skips provisioning — this
+/// module's canonical-source arm and `isolated_edit`'s repo-authored `.claude/`
+/// arm. Which arm answered is a fact about resolution, not provisioning, so a
+/// session that is given nothing still records it; otherwise a box whose
+/// sessions all land on such a cwd reads both capability rows as unknown. The
+/// two provisioners are its only other recorders. The repo-authored arm is
+/// tested through `skip_repo_authored_claude_tree` directly, because
+/// `provision_session_cwd` itself also runs coord-mcp and allocation steps that
+/// a unit test cannot drive.
+pub(crate) fn observe_registries(registries: &Registries) {
+    crate::fleet_commands::observe_commands_registry(&registries.commands);
+    crate::fleet_skills::observe_skills_registry(&registries.skills);
 }
 
 /// The ledger rows the canonical-source arm records — one per capability the
@@ -158,6 +222,7 @@ mod tests {
     #[test]
     fn a_cwd_whose_claude_tree_is_the_checkout_source_is_left_untouched() {
         let _store = capability_manifest::store_lock();
+        capability_manifest::reset_provision_store();
         let root = tempfile::tempdir().unwrap();
         let claude = root.path().join("qontinui-claude-config").join(".claude");
         for (rel, body) in [
@@ -176,7 +241,7 @@ mod tests {
         std::os::unix::fs::symlink(&claude, cwd.path().join(".claude")).unwrap();
         let cwd_s = cwd.path().to_string_lossy().into_owned();
 
-        provision_session_assets_from_root(Some(root.path()), &cwd_s);
+        provision_session_assets_from_root(Some(root.path()), &cwd_s, &Registries::embedded());
 
         assert_eq!(
             listing(&claude),
@@ -195,6 +260,129 @@ mod tests {
                 .map(|c| (*c, "canonical_source"))
                 .collect::<Vec<_>>()
         );
+        assert_registry_observations_recorded();
+    }
+
+    /// Standing down on the canonical source skips both provisioners, but not
+    /// the facts they report about resolution: WHICH arm of each registry
+    /// answered is still a capability-manifest row, so a box whose spawns all
+    /// land on the canonical source does not read those rows as unknown.
+    fn assert_registry_observations_recorded() {
+        for capability in ["agent_commands_registry", "agent_skills_registry"] {
+            assert!(
+                capability_manifest::latest_observation(capability).is_some(),
+                "{capability} must be observed on the canonical-source arm"
+            );
+        }
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = crate::provision_guard::test_support::git(dir)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} should succeed");
+    }
+
+    /// `git init` a repo at `repo` with one committed `.claude/agents` file,
+    /// then `git worktree add` it at `worktree`.
+    fn seed_repo_with_worktree(repo: &Path, worktree: &Path) {
+        let agents = repo.join(".claude").join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        crate::provision_guard::test_support::git_init(repo);
+        std::fs::write(agents.join("code-reviewer.md"), "# committed reviewer").unwrap();
+        git(repo, &["add", "--", ".claude"]);
+        git(repo, &["commit", "--quiet", "-m", "seed"]);
+        git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                &worktree.to_string_lossy(),
+            ],
+        );
+    }
+
+    /// The negative twin of the worktree test: a worktree of an UNRELATED
+    /// repository, with the canonical checkout present under the same root, is
+    /// provisioned as usual. A repository-identity check that answered "same"
+    /// for everything would stand every session down; this goes red on it.
+    #[test]
+    fn a_worktree_of_an_unrelated_repository_is_provisioned() {
+        let _store = capability_manifest::store_lock();
+        capability_manifest::reset_provision_store();
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        seed_repo_with_worktree(
+            &root.path().join("qontinui-claude-config"),
+            &elsewhere.path().join("config-worktree"),
+        );
+        let worktree = elsewhere.path().join("unrelated-worktree");
+        seed_repo_with_worktree(&elsewhere.path().join("unrelated"), &worktree);
+        let cwd_s = worktree.to_string_lossy().into_owned();
+
+        provision_session_assets_from_root(Some(root.path()), &cwd_s, &Registries::embedded());
+
+        let ledger = capability_manifest::session_provision_ledger(&cwd_s).expect("recorded");
+        assert!(
+            ledger
+                .reports
+                .iter()
+                .flat_map(|r| &r.skipped)
+                .all(|skip| skip.reason.wire() != "canonical_source"),
+            "an unrelated repository is not the canonical source"
+        );
+        let commands = worktree.join(".claude").join("commands");
+        assert!(
+            std::fs::read_dir(&commands).is_ok_and(|mut d| d.next().is_some()),
+            "fleet commands were written into {}",
+            commands.display()
+        );
+    }
+
+    /// A linked worktree OF the canonical checkout — the shape of an
+    /// `agent-worktrees/<id>/qontinui-claude-config`. Its `.claude/` is a real
+    /// directory (no symlink to stand it down) at a path that is not
+    /// `<root>/qontinui-claude-config/.claude`, so the path compare misses; the
+    /// only thing left would be the fail-soft tracked-file probe, which WRITES
+    /// every path it does not see tracked. Repository identity must stand every
+    /// kind down instead: nothing written, a canonical-source row per kind.
+    #[test]
+    fn a_worktree_of_the_canonical_checkout_is_left_untouched() {
+        let _store = capability_manifest::store_lock();
+        capability_manifest::reset_provision_store();
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let worktree = elsewhere.path().join("qontinui-claude-config");
+        seed_repo_with_worktree(&root.path().join("qontinui-claude-config"), &worktree);
+        let before = listing(&worktree.join(".claude"));
+        let cwd_s = worktree.to_string_lossy().into_owned();
+
+        provision_session_assets_from_root(Some(root.path()), &cwd_s, &Registries::embedded());
+
+        assert_eq!(
+            listing(&worktree.join(".claude")),
+            before,
+            "the worktree's .claude tree must be byte-identical"
+        );
+        let ledger = capability_manifest::session_provision_ledger(&cwd_s).expect("recorded");
+        assert_eq!(
+            ledger
+                .reports
+                .iter()
+                .map(|r| (r.capability, r.skipped[0].reason.wire()))
+                .collect::<Vec<_>>(),
+            CANONICAL_SOURCE_ROWS
+                .iter()
+                .map(|c| (*c, "canonical_source"))
+                .collect::<Vec<_>>()
+        );
+        assert_registry_observations_recorded();
     }
 
     /// No workspace root resolved (a published install), and the cwd's
@@ -220,7 +408,7 @@ mod tests {
         std::os::unix::fs::symlink(target.path(), cwd.path().join(".claude")).unwrap();
         let cwd_s = cwd.path().to_string_lossy().into_owned();
 
-        provision_session_assets_from_root(None, &cwd_s);
+        provision_session_assets_from_root(None, &cwd_s, &Registries::embedded());
 
         assert_eq!(
             listing(target.path()),

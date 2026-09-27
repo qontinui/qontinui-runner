@@ -636,9 +636,9 @@ pub(crate) enum CacheAction {
 ///
 /// **Which of the three arms answered is now a value**, not just a log line:
 /// read it off the returned registry with
-/// [`AgentCommandRegistry::resolution_arm`]. The caller
-/// (`fleet_commands::provision_fleet_commands_for_session`) turns it into the
-/// capability manifest's `agent_commands_registry` row. Before plan
+/// [`AgentCommandRegistry::resolution_arm`]. `fleet_commands::observe_commands_registry`
+/// turns it into the capability manifest's `agent_commands_registry` row; the
+/// caller is `session_assets`, which resolves once per spawn. Before plan
 /// `2026-08-31-published-build-parity-check` Phase 3 nothing reported it at
 /// all, so a published install falling back to its cache and a dev box
 /// resolving off the network were indistinguishable from outside.

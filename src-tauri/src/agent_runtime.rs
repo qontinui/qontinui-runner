@@ -5921,7 +5921,9 @@ async fn run_continuation_terminal(
     let bound_port = app
         .try_state::<Arc<crate::commands::AppState>>()
         .map(|s| crate::mcp::types::runner_api_port(s.inner()));
-    let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port, None);
+    let coord_mcp =
+        crate::coord_mcp::provision_coord_mcp_for_session_off_runtime(workdir, bound_port, None)
+            .await;
 
     // The argv, built HERE rather than beside `launch_cfg` above: the briefing
     // it carries gates its memory clause on `coord_mcp`, which the call
@@ -7014,7 +7016,9 @@ async fn run_continuation_headless(
     // memory clause is gated on, and provisioning runs before the spawn here so
     // the honest value is available (plan
     // `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`).
-    let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port, None);
+    let coord_mcp =
+        crate::coord_mcp::provision_coord_mcp_for_session_off_runtime(workdir, bound_port, None)
+            .await;
     // Subagent definitions, fleet commands and fleet skills — parity with the
     // terminal arm. This arm used to provision none of them, so a headless
     // continuation could not spawn `code-reviewer` or resolve `/vet-plan`.
