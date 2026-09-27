@@ -496,7 +496,7 @@ pub async fn dispatch_subtask(
                 waited.as_millis()
             )));
         }
-        crate::agent_authorization::FanoutAdmission::DeferredByDrain { reason } => {
+        crate::agent_authorization::FanoutAdmission::DeferredByDrain { reason, class } => {
             // TRANSIENT, like the bound above: coord has drained this device (or
             // its drain state is unknown). The subtask stays `Submitted` — the
             // work is deferred, never failed — and a later tick dispatches it
@@ -505,11 +505,19 @@ pub async fn dispatch_subtask(
             // `transient_stall_after_secs` window rather than the row-sized
             // one — a window, not an exemption: a drain that never lifts still
             // ends the run eventually instead of leaving it unbounded.
-            return Err(DispatchError::DeferredByDrain(format!(
-                "dispatch_subtask: {} not dispatched — {reason}. Transient: the subtask stays \
-                 queued and a later tick retries.",
-                subtask.task_id
-            )));
+            return Err(DispatchError::DeferredByDrain {
+                message: format!(
+                    "dispatch_subtask: {} not dispatched — {reason}. Transient: the subtask \
+                     stays queued and a later tick retries.",
+                    subtask.task_id
+                ),
+                // Carried beside the message because the message is not a
+                // stable identity for the condition: an `Unknown` drain's
+                // `reason` embeds a miss counter or a heartbeat age, so it
+                // differs on every tick of one unchanged deferral. The
+                // conductor's log rate limiter keys on `class`.
+                class,
+            });
         }
     };
 
@@ -1179,7 +1187,15 @@ mod tests {
         // `get`, not `&src[f..]`: `clippy::string-slice` is denied here, and
         // the lint is right in general even though `find` always returns a
         // char boundary.
-        let body = src.get(f..).expect("a `find` offset is a char boundary");
+        let rest = src.get(f..).expect("a `find` offset is a char boundary");
+        // ...and bounded at `dispatch_subtask`'s OWN closing brace — the first
+        // `}` in column 0 after its signature, since every brace inside the
+        // body is indented. Unbounded, the slice ran to end-of-file and so
+        // included this test module, which makes the `count() == 1` assert
+        // below fail spuriously the day any later code in this file writes the
+        // same statement.
+        let end = rest.find("\n}\n").map_or(rest.len(), |i| i + 3);
+        let body = rest.get(..end).expect("a `find` offset is a char boundary");
 
         let attempt = body
             .find("attempting dispatch")
@@ -1187,8 +1203,10 @@ mod tests {
         let admission = body
             .find("authorize_fanout_spawn_with_budget")
             .expect("the admission check");
-        // Built at runtime so this test's own source does not match it — the
-        // count assert below reads the function, not the assert.
+        // Built at runtime so this test's own source does not match it. Belt
+        // and braces beside the slice bound above: the bound is what keeps
+        // the count assert reading `dispatch_subtask` and nothing else, and
+        // this keeps the assert honest even if the bound is ever widened.
         let mint_stmt = format!("let task_run_id = {}::new_v4();", "Uuid");
         let mint = body.find(&mint_stmt).expect("the mint");
 
