@@ -18,7 +18,16 @@ import {
   type MultiRunnerSpecWorkflowResult,
 } from "../../lib/workflow-builder";
 import { type PartitionStrategy } from "../../lib/workflow-builder";
-import { SPEC_WIZARD_DEFAULT_BETWEEN, betweenToWire } from "./restartCapability";
+import {
+  GatedStartButton,
+  RestartCapabilityNotice,
+  SPEC_WIZARD_DEFAULT_BETWEEN,
+  betweenToWire,
+  multiStartBlockedReason,
+  useRestartCapabilities,
+} from "./restartCapability";
+import { probesFromLoopEntries, runnerListToken } from "./targetPicker";
+
 interface RunnerInstance {
   id: string;
   name: string;
@@ -119,6 +128,18 @@ export function SpecPartitionWizard({ onClose, onLaunched }: SpecPartitionWizard
     stopAllOnError,
     buildBetween,
   ]);
+
+  // Pre-start restart capability for exactly the loops Launch would submit
+  // (one per partition), so a refusal is visible on the preview before Start.
+  const loopEntries = result?.multiLoopConfig.loops ?? [];
+  const capabilities = useRestartCapabilities(
+    probesFromLoopEntries(loopEntries),
+    runnerListToken(runnerInstances),
+  );
+  const launchBlocked = multiStartBlockedReason(
+    capabilities,
+    loopEntries.map((l) => l.label ?? l.loop_id),
+  );
 
   // Launch the multi-loop
   const handleLaunch = async () => {
@@ -325,17 +346,27 @@ export function SpecPartitionWizard({ onClose, onLaunched }: SpecPartitionWizard
               <span>Specs</span>
               <span>Assertions</span>
             </div>
-            {result.partitions.map((p) => (
-              <div
-                key={p.loopId}
-                className="grid grid-cols-[1fr_auto_auto_auto] gap-x-3 px-3 py-1.5 border-b border-border/50 text-xs"
-              >
-                <span className="font-medium truncate">{p.label}</span>
-                <span className="text-muted-foreground">{p.runner.name}</span>
-                <span className="font-mono text-right">{p.specCount}</span>
-                <span className="font-mono text-right">{p.assertionCount}</span>
-              </div>
-            ))}
+            {result.partitions.map((p) => {
+              const idx = loopEntries.findIndex((l) => l.loop_id === p.loopId);
+              const capability = idx >= 0 ? capabilities[idx] : undefined;
+              return (
+                <div key={p.loopId} className="border-b border-border/50">
+                  <div className="grid grid-cols-[1fr_auto_auto_auto] gap-x-3 px-3 py-1.5 text-xs">
+                    <span className="font-medium truncate">{p.label}</span>
+                    <span className="text-muted-foreground">{p.runner.name}</span>
+                    <span className="font-mono text-right">{p.specCount}</span>
+                    <span className="font-mono text-right">{p.assertionCount}</span>
+                  </div>
+                  {capability && (
+                    <RestartCapabilityNotice
+                      state={capability}
+                      className="px-3 pb-1.5"
+                      testId={`spw-restart-capability-${p.loopId}`}
+                    />
+                  )}
+                </div>
+              );
+            })}
           </div>
           <div className="flex justify-between">
             <button
@@ -344,12 +375,13 @@ export function SpecPartitionWizard({ onClose, onLaunched }: SpecPartitionWizard
             >
               <ChevronLeft className="w-3 h-3" /> Back
             </button>
-            <button
+            <GatedStartButton
               onClick={handleLaunch}
-              className="px-3 py-1 text-xs font-medium rounded bg-primary/15 text-primary hover:bg-primary/25 flex items-center gap-1"
-            >
-              <Play className="w-3 h-3" /> Launch Multi-Loop
-            </button>
+              blockedReason={launchBlocked}
+              label="Launch Multi-Loop"
+              icon={<Play className="w-3 h-3" />}
+              className="px-3 flex items-center gap-1"
+            />
           </div>
         </div>
       )}

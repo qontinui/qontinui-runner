@@ -152,12 +152,21 @@ pub struct SupervisorRunnerRow {
 
 impl SupervisorRunnerRow {
     /// The supervisor's own classification says this is the dev PRIMARY.
+    ///
+    /// When `kind` is absent (a supervisor predating the field) the id is the
+    /// only signal left, and the supervisor's primary is always registered as
+    /// id `"primary"` (`RunnerConfig::default_primary`) — so that id counts as
+    /// primary rather than letting an older supervisor's primary through.
     pub fn is_primary(&self) -> bool {
-        self.kind
+        match self
+            .kind
             .as_ref()
             .and_then(|k| k.get("type"))
             .and_then(|t| t.as_str())
-            == Some("primary")
+        {
+            Some(kind) => kind == "primary",
+            None => self.id == "primary",
+        }
     }
 }
 
@@ -235,6 +244,8 @@ impl SupervisorProbe for HttpSupervisorProbe {
 pub struct ReadinessSummary {
     /// `safe_to_restart` — the target's own verdict.
     pub safe: bool,
+    /// `reason` — the target's own explanation of that verdict.
+    pub reason: String,
     /// `live_claude.blocking` — every live `claude` process counted as work in
     /// flight (terminal-hosted not declared `finished`, AI-plane, headless and
     /// unclassified alike). The target's verdict reads exactly this.
@@ -418,6 +429,7 @@ pub fn parse_readiness(body: &serde_json::Value) -> Result<ReadinessSummary, Str
     }
     Ok(ReadinessSummary {
         safe: wire.safe_to_restart,
+        reason: wire.reason.clone().unwrap_or_default(),
         blocking: live.blocking,
         terminal_blocking: terminal.blocking_count,
         headless: headless.count,
@@ -812,6 +824,25 @@ pub async fn check_readiness(
     let cause = match probe.readiness(port).await {
         Ok(summary) => {
             let foreign = summary.foreign(own_runs);
+            // The target's own verdict is authoritative for anything this
+            // gate does not model. With nothing foreign, the ONLY unsafe
+            // condition the gate can explain is AI sessions this loop
+            // launched; an unsafe verdict with none of those is a condition
+            // the gate cannot see, so it refuses rather than kills.
+            if foreign.is_empty() && !summary.safe && summary.ai_session_ids.is_empty() {
+                return Err(RestartIterationError::TargetReadinessUnknown {
+                    port,
+                    cause: format!(
+                        "the target reports safe_to_restart=false for a reason this gate does \
+                         not model ({})",
+                        if summary.reason.is_empty() {
+                            "no reason given"
+                        } else {
+                            summary.reason.as_str()
+                        }
+                    ),
+                });
+            }
             return if foreign.is_empty() {
                 if !summary.ai_session_ids.is_empty() {
                     info!(
@@ -1214,6 +1245,7 @@ mod tests {
     fn quiet() -> ReadinessSummary {
         ReadinessSummary {
             safe: true,
+            reason: String::new(),
             blocking: 0,
             terminal_blocking: 0,
             headless: 0,
@@ -1453,6 +1485,8 @@ mod tests {
         assert!(rows[0].is_primary());
         assert_eq!(rows[1], row("test-1", 9877));
         assert!(!rows[1].is_primary());
+        // An older supervisor serves no `kind`: the id is the only signal.
+        assert!(row("primary", 9876).is_primary());
         assert!(parse_supervisor_runners(&serde_json::json!({"x": 1})).is_err());
     }
 
@@ -1528,6 +1562,7 @@ mod tests {
             s,
             ReadinessSummary {
                 safe: false,
+                reason: "x".into(),
                 blocking: 6,
                 terminal_blocking: 2,
                 headless: 1,
@@ -1722,6 +1757,47 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(inst.calls().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn an_unsafe_verdict_the_gate_cannot_explain_refuses() {
+        // Nothing foreign by the gate's own accounting, no AI session of the
+        // loop's either — yet the target says unsafe: refuse, never kill.
+        let inst = FakeInstances::with(vec![slot("slot-a", 9877)]);
+        let probe = FakeProbe::new(
+            Ok(ReadinessSummary {
+                safe: false,
+                reason: "an unreadable lifecycle store".into(),
+                ..quiet()
+            }),
+            vec![HealthAnswer::Answered(200)],
+        );
+        let err = restart_owned_target(&inst, &probe, "slot-a", 9877, &no_runs(), None)
+            .await
+            .unwrap_err();
+        match &err {
+            RestartIterationError::TargetReadinessUnknown { cause, .. } => {
+                assert!(cause.contains("an unreadable lifecycle store"), "{cause}")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(inst.calls().is_empty(), "nothing is stopped");
+    }
+
+    #[tokio::test]
+    async fn unsafe_only_because_of_the_loops_own_ai_sessions_proceeds() {
+        let probe = FakeProbe::new(
+            Ok(ReadinessSummary {
+                safe: false,
+                ai_session_ids: vec!["run-a".into()],
+                ..quiet()
+            }),
+            vec![HealthAnswer::Answered(200)],
+        );
+        assert_eq!(
+            check_readiness(&probe, 9877, &runs(&["run-a"])).await,
+            Ok(ReadinessOutcome::Clear)
+        );
     }
 
     async fn unknown_readiness_with(
@@ -2089,6 +2165,66 @@ mod tests {
             crate::orchestration_loop::remote_client::SupervisorRestartError::Stopped
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_4xx_status_poll_is_terminal_not_polled_to_timeout() {
+        use axum::{
+            http::StatusCode,
+            routing::{get, post},
+            Json, Router,
+        };
+        let app = Router::new()
+            .route(
+                SUPERVISOR_RESTART_ROUTE,
+                post(|| async {
+                    (
+                        StatusCode::ACCEPTED,
+                        Json(serde_json::json!({"submission_id": "not-a-uuid"})),
+                    )
+                }),
+            )
+            .route(
+                SUPERVISOR_BUILD_STATUS_ROUTE,
+                get(|| async { (StatusCode::BAD_REQUEST, "invalid uuid: not-a-uuid") }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = SupervisorClient::new(port).with_poll_interval(Duration::from_millis(10));
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let started = std::time::Instant::now();
+        let err = client
+            .restart_runner("test-1", true, Duration::from_secs(60), &rx)
+            .await
+            .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "terminal, not timed out"
+        );
+        match err {
+            crate::orchestration_loop::remote_client::SupervisorRestartError::BuildFailed {
+                error,
+                ..
+            } => assert!(error.contains("400"), "{error}"),
+            other => panic!("{other:?}"),
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_older_supervisors_primary_without_kind_is_refused_by_id() {
+        // An older supervisor serves no `kind`; its primary is still id
+        // "primary", and the resolver must not ask it to rebuild that runner.
+        let inst = FakeInstances::default();
+        let sup = FakeSupervisor::with_rows(true, Ok(vec![row("primary", 9879)]));
+        let err = resolve_restart_path(&rebuild_cfg(9879, None), &inst, SELF_PORT, &sup)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, RestartUnsupportedCode::RebuildNeedsDevSupervisor);
+        assert!(err.reason.contains("PRIMARY"), "{}", err.reason);
     }
 
     #[test]

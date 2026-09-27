@@ -24,7 +24,9 @@ import {
 } from "./restartCapability";
 import {
   FRESH_FORM_BETWEEN,
+  isUnmatchedSavedTarget,
   mergeTargetRunners,
+  rematchPendingTarget,
   restoreTarget,
   runnerListToken,
   selectTarget,
@@ -207,6 +209,9 @@ export function OrchestrationLoopPanel() {
   // This runner's own port — used to filter "self" out of the supervisor
   // dropdown rows. Populated once via get_runner_identity on mount.
   const ownPortRef = useRef<number | null>(null);
+  // Port of a restored saved target that no row matched yet — re-matched
+  // when the runner list next loads (see `rematchPendingTarget`).
+  const pendingRestorePortRef = useRef<string | null>(null);
 
   // Form state
   const [mode, setMode] = useState<"simple" | "pipeline">("pipeline");
@@ -280,6 +285,7 @@ export function OrchestrationLoopPanel() {
     // capability check refuses it, the reason is shown under the select
     // rather than the value being rewritten.
     const restored = restoreTarget(s, runnerInstances);
+    pendingRestorePortRef.current = restored.pending ? restored.targetPort : null;
     setTargetRunner(restored.targetRunner);
     setTargetPort(restored.targetPort);
     setTargetRunnerId(restored.targetRunnerId);
@@ -307,6 +313,7 @@ export function OrchestrationLoopPanel() {
     // a runner-owned row is resolved by port and sends no id.
     const sel = selectTarget(value, runnerInstances);
     if (!sel) return;
+    pendingRestorePortRef.current = null; // an explicit pick supersedes a restore
     setTargetRunner(sel.targetRunner);
     setTargetPort(sel.targetPort);
     setTargetRunnerId(sel.targetRunnerId);
@@ -355,7 +362,22 @@ export function OrchestrationLoopPanel() {
       /* no dev supervisor — the normal case for a published install */
     }
 
-    setRunnerInstances(mergeTargetRunners(owned, supervisorRows, ownPortRef.current));
+    const rows = mergeTargetRunners(owned, supervisorRows, ownPortRef.current);
+    setRunnerInstances(rows);
+
+    // A restored config whose target was not in the list at restore time is
+    // re-matched now, so the picker stops showing it as unmatched and the id
+    // (supervisor rows only) is derived from the row that arrived.
+    const pendingPort = pendingRestorePortRef.current;
+    if (pendingPort) {
+      const sel = rematchPendingTarget(pendingPort, rows);
+      if (sel) {
+        pendingRestorePortRef.current = null;
+        setTargetRunner(sel.targetRunner);
+        setTargetPort(sel.targetPort);
+        setTargetRunnerId(sel.targetRunnerId);
+      }
+    }
   }, [supervisorPort]);
 
   useEffect(() => {
@@ -902,6 +924,11 @@ export function OrchestrationLoopPanel() {
                       style={{ colorScheme: "dark" }}
                     >
                       <option value="self">This runner (self)</option>
+                      {isUnmatchedSavedTarget(targetRunner) && (
+                        <option value={targetRunner}>
+                          Saved target (:{targetPort}) — not in the runner list yet
+                        </option>
+                      )}
                       {runnerInstances.map((inst) => (
                         <option key={inst.id} value={inst.id}>
                           {inst.name} (:{inst.port}){inst.running ? "" : " [stopped]"}

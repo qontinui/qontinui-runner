@@ -27,7 +27,13 @@ pub struct SupervisorClient {
 
 /// How long a detached supervisor rebuild-restart may run before the loop
 /// gives up on it.
-pub const DETACHED_REBUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+pub const DETACHED_REBUILD_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+/// How long a `404` from `GET /build/{id}/status` is tolerated after the 202.
+/// The supervisor answers the 202 BEFORE its detached task registers the
+/// submission (`build_submissions::submit_detached` inserts it inside the
+/// spawned task), so an immediate poll can legitimately miss it; a 404 that
+/// persists past this grace means the supervisor lost it (restarted).
+const DETACHED_NOT_FOUND_GRACE: Duration = Duration::from_secs(30);
 /// Default poll interval for a detached rebuild-restart.
 const DETACHED_REBUILD_POLL: Duration = Duration::from_secs(5);
 
@@ -858,10 +864,23 @@ impl SupervisorClient {
                         }
                     }
                 } else if resp.status().as_u16() == 404 {
+                    if start.elapsed() > DETACHED_NOT_FOUND_GRACE {
+                        return Err(SupervisorRestartError::BuildFailed {
+                            submission_id: submission_id.to_string(),
+                            error: "the supervisor no longer knows this submission (restarted?)"
+                                .to_string(),
+                        });
+                    }
+                } else if resp.status().is_client_error() {
+                    // Any other 4xx (e.g. 400 for an id the supervisor cannot
+                    // parse) will not change on retry — terminal.
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
                     return Err(SupervisorRestartError::BuildFailed {
                         submission_id: submission_id.to_string(),
-                        error: "the supervisor no longer knows this submission (restarted?)"
-                            .to_string(),
+                        error: format!(
+                            "the supervisor refused the status poll: HTTP {status}: {body}"
+                        ),
                     });
                 }
             }

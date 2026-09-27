@@ -15,7 +15,12 @@
  * Plan: 2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor.
  */
 
-import { defaultBetween, restoreBetween } from "./restartCapability";
+import {
+  defaultBetween,
+  restoreBetween,
+  type BetweenWire,
+  type RestartCapabilityProbe,
+} from "./restartCapability";
 
 export interface TargetRunnerRow {
   id: string;
@@ -92,35 +97,87 @@ export function selectTarget(value: string, rows: TargetRunnerRow[]): TargetSele
   };
 }
 
+/** Picker value for a restored target whose port no current row matches (yet). */
+export const SAVED_TARGET_PREFIX = "saved:";
+
+export function isUnmatchedSavedTarget(targetRunner: string): boolean {
+  return targetRunner.startsWith(SAVED_TARGET_PREFIX);
+}
+
 /**
- * Target fields and "Between" value for a restored saved config. The target
- * is re-matched by port against the current rows, and the id is re-derived
- * from the matched row (a saved runner-owned id is never re-sent). With no
- * matching row the saved port/id are kept as saved — the capability check
- * then explains what is wrong with them. The saved mode is kept verbatim.
+ * Target fields and "Between" value for a restored saved config.
+ *
+ * The target is matched by PORT against the current rows and its id is
+ * re-derived from the matched row, so a saved runner-owned id is never
+ * re-sent. The saved id itself is NEVER sent: it may predate the rule that
+ * only a dev-supervisor id goes out, and without a row there is no way to tell
+ * a supervisor id from a runner-owned one.
+ *
+ * With no matching row yet (the list has not loaded, or the target is not
+ * running) the port is kept, the picker shows the saved target as such
+ * rather than "self", and `pending` asks the panel to re-match when rows
+ * arrive ({@link rematchPendingTarget}). The saved mode is kept verbatim.
  */
 export function restoreTarget(
   saved: { targetPort?: string; targetRunnerId?: string; between?: string },
   rows: TargetRunnerRow[],
-): TargetSelection & { between: string } {
+): TargetSelection & { between: string; pending: boolean } {
   const targetPort = saved.targetPort || "";
   const between = restoreBetween(saved.between, !targetPort);
-  if (!targetPort) return { targetRunner: "self", targetPort: "", targetRunnerId: "", between };
-  const match = rows.find((r) => String(r.port) === targetPort);
+  if (!targetPort) {
+    return { targetRunner: "self", targetPort: "", targetRunnerId: "", between, pending: false };
+  }
+  const match = rematchPendingTarget(targetPort, rows);
   if (!match) {
     return {
-      targetRunner: "self",
+      targetRunner: `${SAVED_TARGET_PREFIX}${targetPort}`,
       targetPort,
-      targetRunnerId: saved.targetRunnerId || "",
+      targetRunnerId: "",
       between,
+      pending: true,
     };
   }
+  return { ...match, between, pending: false };
+}
+
+/**
+ * Re-match a restored target's port against rows that have since arrived.
+ * `null` while still unmatched.
+ */
+export function rematchPendingTarget(
+  targetPort: string,
+  rows: TargetRunnerRow[],
+): TargetSelection | null {
+  const match = rows.find((r) => String(r.port) === targetPort);
+  if (!match) return null;
   return {
     targetRunner: match.id,
     targetPort,
     targetRunnerId: targetRunnerIdFor(match) ?? "",
-    between,
   };
+}
+
+/**
+ * Restart-capability probes for the loops a multi-loop start will actually
+ * send (the spec-partition wizard's generated entries), so the pre-start
+ * verdict is asked about exactly what Start would submit.
+ */
+export function probesFromLoopEntries(
+  loops: Array<{
+    config: {
+      target_runner_port: number | null;
+      target_runner_id: string | null;
+      supervisor_port: number;
+      between_iterations: BetweenWire;
+    };
+  }>,
+): RestartCapabilityProbe[] {
+  return loops.map(({ config }) => ({
+    target_runner_port: config.target_runner_port,
+    target_runner_id: config.target_runner_id,
+    supervisor_port: config.supervisor_port,
+    between_iterations: config.between_iterations,
+  }));
 }
 
 /** The "Between" value a fresh form starts on (target = this runner). */

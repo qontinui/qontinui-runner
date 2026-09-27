@@ -93,7 +93,11 @@ export interface MultiLoopEntry {
     /** `null` indicates an unlimited cap. */
     max_iterations: number | null;
     exit_strategy: { type: string };
-    between_iterations: { type: string; rebuild?: boolean };
+    between_iterations:
+      | { type: "restart_runner"; rebuild: boolean }
+      | { type: "restart_on_signal"; rebuild: boolean }
+      | { type: "wait_healthy" }
+      | { type: "none" };
     retry_on_failure: boolean;
     wait_for_fixer: boolean;
     pipeline: null;

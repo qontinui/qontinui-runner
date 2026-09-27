@@ -39,11 +39,15 @@ import {
   startBlockedReason,
   type CapabilityResult,
   type RestartCapabilityProbe,
+  type BetweenWire,
   type RestartCapabilityState,
 } from "./restartCapability";
 import {
   FRESH_FORM_BETWEEN,
+  isUnmatchedSavedTarget,
   mergeTargetRunners,
+  probesFromLoopEntries,
+  rematchPendingTarget,
   restoreTarget,
   runnerListToken,
   selectTarget,
@@ -463,6 +467,7 @@ describe("target_runner_id is sent only for a dev-supervisor row", () => {
       targetPort: "9877",
       targetRunnerId: "",
       between: "restart_runner",
+      pending: false,
     });
   });
 
@@ -507,5 +512,110 @@ describe("capability refresh on runner-list change", () => {
     const [second] = await requestOnce([probe]);
     expect(startBlockedReason(second)).toBeNull();
     expect(mockInvoke).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("restore before the runner list loads (N4)", () => {
+  const saved = { targetPort: "9880", targetRunnerId: "slot-old", between: "restart_runner" };
+
+  it("an unmatched restore keeps the port, is shown as the saved target (not self), and sends no id", () => {
+    const r = restoreTarget(saved, []);
+    expect(r.pending).toBe(true);
+    expect(r.targetPort).toBe("9880");
+    expect(r.targetRunner).not.toBe("self");
+    expect(isUnmatchedSavedTarget(r.targetRunner)).toBe(true);
+    expect(r.targetRunnerId).toBe(""); // the saved (possibly runner-owned) id is never re-sent
+    expect(r.between).toBe("restart_runner");
+  });
+
+  it("re-matches when rows arrive, deriving the id from the row that arrived", () => {
+    expect(rematchPendingTarget("9880", [])).toBeNull();
+    // Runner-owned row on that port: no id.
+    expect(
+      rematchPendingTarget("9880", [
+        ownedRow({ id: "ext-9880-1", port: 9880, source: "discovered" }),
+      ]),
+    ).toEqual({ targetRunner: "ext-9880-1", targetPort: "9880", targetRunnerId: "" });
+    // Dev-supervisor row on that port: its supervisor id.
+    const rows = mergeTargetRunners([], [supRow({ id: "sup-a", port: 9880 })], 9876);
+    expect(rematchPendingTarget("9880", rows)).toEqual({
+      targetRunner: "sup-a",
+      targetPort: "9880",
+      targetRunnerId: "sup-a",
+    });
+  });
+
+  it("an unmatched restore of a saved supervisor-looking id still sends nothing until a row proves it", () => {
+    expect(restoreTarget({ targetPort: "9880", targetRunnerId: "sup-a" }, []).targetRunnerId).toBe(
+      "",
+    );
+  });
+});
+
+describe("spec-partition wizard pre-start capability (N5)", () => {
+  const entry = (port: number, between: BetweenWire) => ({
+    loop_id: `spec-${port}`,
+    label: `p → r${port}`,
+    config: {
+      target_runner_port: port,
+      target_runner_id: null,
+      supervisor_port: 9875,
+      between_iterations: between,
+    },
+  });
+
+  it("asks about exactly the loops Launch would submit, one probe per partition", () => {
+    const probes = probesFromLoopEntries([
+      entry(9877, betweenToWire(SPEC_WIZARD_DEFAULT_BETWEEN)),
+      entry(9878, betweenToWire(SPEC_WIZARD_DEFAULT_BETWEEN)),
+    ]);
+    expect(probes).toEqual([
+      {
+        target_runner_port: 9877,
+        target_runner_id: null,
+        supervisor_port: 9875,
+        between_iterations: { type: "restart_on_signal", rebuild: false },
+      },
+      {
+        target_runner_port: 9878,
+        target_runner_id: null,
+        supervisor_port: 9875,
+        between_iterations: { type: "restart_on_signal", rebuild: false },
+      },
+    ]);
+  });
+
+  it("a refused partition shows its reason and disables Launch", async () => {
+    mockInvoke.mockImplementation(
+      (_cmd: string, args: { config: { target_runner_port: number } }) =>
+        Promise.resolve(
+          args.config.target_runner_port === 9878
+            ? {
+                supported: false,
+                code: "target_not_runner_managed",
+                reason: "the runner on :9878 was not started by this runner",
+                targetPort: 9878,
+              }
+            : supportedSecondary,
+        ),
+    );
+    const loops = [
+      entry(9877, { type: "restart_on_signal", rebuild: false }),
+      entry(9878, { type: "restart_on_signal", rebuild: false }),
+    ];
+    const states = await requestOnce(probesFromLoopEntries(loops));
+    const reason = multiStartBlockedReason(
+      states,
+      loops.map((l) => l.label),
+    );
+    expect(reason).toBe("p → r9878: the runner on :9878 was not started by this runner");
+    expect(renderToStaticMarkup(<RestartCapabilityNotice state={states[1]} />)).toContain(
+      'data-restart-code="target_not_runner_managed"',
+    );
+    const button = renderToStaticMarkup(
+      <GatedStartButton blockedReason={reason} onClick={() => {}} label="Launch Multi-Loop" />,
+    );
+    expect(button).toMatch(/<button[^>]*disabled=""/);
+    expect(button).toContain("Start blocked: p → r9878:");
   });
 });
