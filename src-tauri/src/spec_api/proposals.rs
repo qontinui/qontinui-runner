@@ -6,7 +6,7 @@
 //! - `POST /spec/proposals/scan` — discovers eligible `fullPage` candidates
 //!   (un-spec'd pathnames with ≥ N observations in the lookback window) and
 //!   `patch` candidates (drift-flagged specs), inserts them into
-//!   `project.spec_proposals` with `status = 'queued'`.
+//!   `atlas_managed.spec_proposals` with `status = 'queued'`.
 //! - `POST /spec/proposals/{id}/execute` — drives one queued proposal through
 //!   `spec_authoring::author_candidate` then `validator::validate_candidate`
 //!   (Step 8 — distinctness → round-trip → coverage → b-green) and lands
@@ -1454,7 +1454,7 @@ mod tests {
     }
 
     /// PG-bound tests are gated behind `pg_integration_tests` because the
-    /// shared dev DB is the only place the `project.spec_proposals` table
+    /// shared dev DB is the only place the `atlas_managed.spec_proposals` table
     /// exists (Atlas-managed). Unit tests above cover the pure helpers
     /// (slug, JSON shapes, placeholder writer).
     ///
@@ -1464,20 +1464,23 @@ mod tests {
         use super::*;
         use crate::database::pg::PgDb;
 
-        async fn fresh_db() -> std::sync::Arc<PgDb> {
+        async fn fresh_db() -> (tokio::sync::MutexGuard<'static, ()>, std::sync::Arc<PgDb>) {
+            let guard = crate::database::pg::spec_proposals::SPEC_PROPOSALS_TEST_LOCK
+                .lock()
+                .await;
             // The integration DB must already have spec_proposals (Atlas).
-            let db = PgDb::new_blocking_for_test();
+            let db = PgDb::new_for_test().await;
             // Wipe any prior test rows so dedup behaves deterministically.
             let conn = db.pool().get().await.expect("pg conn");
-            conn.execute("TRUNCATE TABLE spec_proposals", &[])
+            conn.execute("TRUNCATE TABLE atlas_managed.spec_proposals", &[])
                 .await
                 .expect("truncate spec_proposals");
-            db
+            (guard, db)
         }
 
         #[tokio::test(flavor = "multi_thread")]
         async fn insert_dedupes_on_kind_and_target() {
-            let db = fresh_db().await;
+            let (_guard, db) = fresh_db().await;
             let first = db
                 .insert_proposal(
                     "prop_test_one",
@@ -1506,7 +1509,7 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn list_round_trips_inserted_rows() {
-            let db = fresh_db().await;
+            let (_guard, db) = fresh_db().await;
             db.insert_proposal(
                 "prop_test_list",
                 "fullPage",

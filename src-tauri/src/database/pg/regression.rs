@@ -101,7 +101,7 @@ impl PgDb {
         let id = Uuid::new_v4();
         conn.execute(
             r#"
-            INSERT INTO regression_suites (id, ir_doc_id, suite_json)
+            INSERT INTO atlas_managed.regression_suites (id, ir_doc_id, suite_json)
             VALUES ($1, $2, $3::jsonb)
             "#,
             &[&id, &ir_doc_id, suite_json],
@@ -139,7 +139,7 @@ impl PgDb {
         let id = Uuid::new_v4();
         conn.execute(
             r#"
-            INSERT INTO regression_runs (
+            INSERT INTO atlas_managed.regression_runs (
                 id, suite_id, run_id, passed, failed,
                 started_at, completed_at, run_result_json, drift_report_json
             ) VALUES (
@@ -180,7 +180,7 @@ impl PgDb {
         let id = Uuid::new_v4();
         conn.execute(
             r#"
-            INSERT INTO regression_diagnoses (id, run_id, diagnosis_json)
+            INSERT INTO atlas_managed.regression_diagnoses (id, run_id, diagnosis_json)
             VALUES ($1, $2, $3::jsonb)
             "#,
             &[&id, &run_id, diagnosis_json],
@@ -213,7 +213,7 @@ impl PgDb {
         let rows_affected = conn
             .execute(
                 r#"
-                INSERT INTO regression_assertion_executions (
+                INSERT INTO atlas_managed.regression_assertion_executions (
                     id, run_id, case_id, assertion_id, assertion_kind, status,
                     started_at, duration_ms, failure_kind,
                     failure_evidence_json, error_message
@@ -273,8 +273,8 @@ impl PgDb {
                     ae.duration_ms,
                     ae.failure_kind,
                     ae.error_message
-                FROM regression_assertion_executions ae
-                JOIN regression_runs r ON r.id = ae.run_id
+                FROM atlas_managed.regression_assertion_executions ae
+                JOIN atlas_managed.regression_runs r ON r.id = ae.run_id
                 WHERE r.suite_id = $1
                 ORDER BY ae.started_at ASC
                 "#,
@@ -327,8 +327,8 @@ impl PgDb {
                     d.run_id::TEXT,
                     d.diagnosis_json,
                     d.created_at::TEXT
-                FROM regression_diagnoses d
-                JOIN regression_runs r ON r.id = d.run_id
+                FROM atlas_managed.regression_diagnoses d
+                JOIN atlas_managed.regression_runs r ON r.id = d.run_id
                 WHERE r.suite_id = $1
                 ORDER BY d.created_at DESC
                 LIMIT $2
@@ -376,12 +376,12 @@ impl PgDb {
                     s.created_at::TEXT,
                     COALESCE(stats.run_count, 0)::BIGINT AS run_count,
                     stats.last_run_at::TEXT
-                FROM regression_suites s
+                FROM atlas_managed.regression_suites s
                 LEFT JOIN LATERAL (
                     SELECT
                         COUNT(*) AS run_count,
                         MAX(started_at) AS last_run_at
-                    FROM regression_runs
+                    FROM atlas_managed.regression_runs
                     WHERE suite_id = s.id
                 ) stats ON TRUE
                 ORDER BY s.created_at DESC
@@ -427,7 +427,7 @@ impl PgDb {
                     s.ir_doc_id,
                     s.suite_json,
                     s.created_at::TEXT
-                FROM regression_suites s
+                FROM atlas_managed.regression_suites s
                 WHERE s.id = $1
                 "#,
                 &[&suite_id],
@@ -468,7 +468,7 @@ impl PgDb {
             .query(
                 r#"
                 SELECT drift_report_json
-                FROM regression_runs
+                FROM atlas_managed.regression_runs
                 WHERE run_id = $1 AND drift_report_json IS NOT NULL
                 ORDER BY started_at DESC
                 LIMIT 1
@@ -513,7 +513,7 @@ impl PgDb {
                     r.failed,
                     r.started_at::TEXT,
                     r.completed_at::TEXT
-                FROM regression_runs r
+                FROM atlas_managed.regression_runs r
                 WHERE r.suite_id = $1
                 ORDER BY r.started_at DESC
                 LIMIT $2
