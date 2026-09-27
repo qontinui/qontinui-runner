@@ -279,6 +279,34 @@ fn wait_child_with_timeout(
     }
 }
 
+/// The half of every `prCredential` hint that names a PR door needing no
+/// personal `gh` login. Pure.
+///
+/// `qontinui-pr create` is recommended ONLY when the session CLI is actually
+/// deliverable onto runner terminals' PATH — the capability manifest's
+/// `session_cli` row reads a resolved rung. Recommending it unconditionally is
+/// how a 0-byte placeholder CLI (which exited 0 having opened no PR) was
+/// advertised as the fix (plan
+/// `2026-09-27-qontinui-pr-zero-byte-sidecar-placeholder-published-as-session-cli`,
+/// Phase 1d). Otherwise it names the door that CLI itself calls — this runner's
+/// proxy-nonce-gated loopback `POST /vcs/pull-requests`, coord-brokered — and
+/// `gh pr create` after it. `api_port` is this runner's BOUND port; `None`
+/// (no Tauri runtime) names the route without guessing a port.
+fn pr_door_without_personal_login(session_cli_deliverable: bool, api_port: Option<u16>) -> String {
+    if session_cli_deliverable {
+        return "`qontinui-pr create` (coord-brokered) needs no personal login".to_string();
+    }
+    let door = match api_port {
+        Some(port) => format!("`POST http://127.0.0.1:{port}/vcs/pull-requests`"),
+        None => "this runner's loopback `POST /vcs/pull-requests`".to_string(),
+    };
+    format!(
+        "`qontinui-pr` is NOT deliverable on this runner (capability-manifest row \
+         `session_cli` is unresolved), so open the PR through {door} (coord-brokered, \
+         proxy-nonce gated, needs no personal login), else `gh pr create`"
+    )
+}
+
 /// Run `gh auth status` (blocking — call off the async executor) and resolve a
 /// [`PrCredentialProbe`]. Exit code 0 ⇒ authenticated; non-zero ⇒ no credential;
 /// a missing `gh` binary resolves unauthenticated with a distinct hint. The
@@ -296,35 +324,36 @@ fn run_pr_credential_probe() -> PrCredentialProbe {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
+    // Which login-free PR door to name, decided by the SAME read-only probe the
+    // capability manifest's `session_cli` row reports: a stat plus a 4-byte
+    // header read, on this blocking thread, never on /health's hot path.
+    let door = pr_door_without_personal_login(
+        crate::install_effects_producer::intercept::shim_materializer::session_cli_observation()
+            .rung
+            .is_resolved(),
+        crate::coord_mcp::resolve_bound_api_port(),
+    );
     let (authenticated, hint) = match spawned {
         Ok(mut child) => match wait_child_with_timeout(&mut child, PR_CRED_PROBE_CHILD_TIMEOUT) {
             Some(status) if status.success() => (Some(true), None),
             Some(_) => (
                 Some(false),
-                Some(
-                    "no PR credential — `gh auth login` is the interim unblock; \
-                     `qontinui-pr create` (coord-brokered) needs no personal login"
-                        .to_string(),
-                ),
+                Some(format!(
+                    "no PR credential — `gh auth login` is the interim unblock; {door}"
+                )),
             ),
             None => (
                 None,
                 Some(format!(
                     "gh auth status did not finish within {}s and was killed — \
-                     credential state unknown; `qontinui-pr create` \
-                     (coord-brokered) needs no personal login",
+                     credential state unknown; {door}",
                     PR_CRED_PROBE_CHILD_TIMEOUT.as_secs()
                 )),
             ),
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
-            Some(false),
-            Some(
-                "gh CLI not installed — `qontinui-pr create` (coord-brokered) \
-                 needs no personal login"
-                    .to_string(),
-            ),
-        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            (Some(false), Some(format!("gh CLI not installed — {door}")))
+        }
         Err(e) => (
             Some(false),
             Some(format!("gh auth status probe failed: {e}")),
@@ -18918,6 +18947,39 @@ mod pr_credential_probe_tests {
             started.elapsed() < Duration::from_secs(10),
             "the kill happens at the deadline, not after the child's own runtime"
         );
+    }
+
+    /// The hint recommends `qontinui-pr create` ONLY when the session CLI is
+    /// deliverable; otherwise it names the loopback door (on the BOUND port)
+    /// and `gh pr create`, and never advertises the undeliverable CLI.
+    #[test]
+    fn pr_door_hint_recommends_the_session_cli_only_when_deliverable() {
+        let deliverable = pr_door_without_personal_login(true, Some(9876));
+        assert!(
+            deliverable.contains("`qontinui-pr create`"),
+            "{deliverable}"
+        );
+        assert!(!deliverable.contains("/vcs/pull-requests"), "{deliverable}");
+
+        let not = pr_door_without_personal_login(false, Some(9877));
+        assert!(
+            !not.contains("qontinui-pr create"),
+            "an undeliverable CLI must not be recommended: {not}"
+        );
+        assert!(
+            not.contains("`POST http://127.0.0.1:9877/vcs/pull-requests`"),
+            "the loopback door is named on this runner's bound port: {not}"
+        );
+        assert!(not.contains("`gh pr create`"), "{not}");
+        assert!(not.contains("session_cli"), "{not}");
+
+        // No bound port known: the route is named without a guessed port.
+        let unbound = pr_door_without_personal_login(false, None);
+        assert!(
+            unbound.contains("loopback `POST /vcs/pull-requests`"),
+            "{unbound}"
+        );
+        assert!(!unbound.contains("127.0.0.1"), "{unbound}");
     }
 }
 

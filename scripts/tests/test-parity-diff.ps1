@@ -134,6 +134,15 @@ function Remove-Row {
     return $Manifest
 }
 
+function Add-Row {
+    # A NAMED mutation for a row the 2026-09-02 fixture predates (session_cli,
+    # added 2026-09-27). Same wire shape as every fixture row.
+    param($Manifest, [string]$Id, [string]$Rung)
+    $row = [PSCustomObject]@{ id = $Id; rung = $Rung; rejected = $null; resolved_path = $null; detail = $null; note = $null }
+    $Manifest.rows = @($Manifest.rows) + @($row)
+    return $Manifest
+}
+
 Write-Host ""
 Write-Host "test-parity-diff: classifier over the real 2026-09-02 manifest sample"
 Write-Host ""
@@ -295,8 +304,12 @@ Assert-Equal "wildcard entry excuses" 0 $r7c.ParityDefectCount
 # would be as dishonest as a missing one.
 $text7 = Format-ParityReportText -Result $r7
 Assert-True "report prints the allowlist entry" ($text7 -match 'designed debug-vs-release difference')
-$text1 = Format-ParityReportText -Result $r1
+$text1 = Format-ParityReportText -Result (Compare-CapabilityManifests -Dev (New-Manifest) -Published (New-Manifest) -Allowlist @())
 Assert-True "report says the allowlist is empty" ($text1 -match 'allowlist: \(empty\)')
+# ...and the SHIPPED allowlist is printed entry by entry, reason included.
+$textShipped = Format-ParityReportText -Result $r1
+Assert-True "report prints the shipped session_cli entry" ($textShipped -match "allowlist: session_cli  dev='exe_relative_checkout' published='bundle_resource'")
+Assert-True "report prints the shipped entry's reason"    ($textShipped -match 'both are working deliveries')
 
 # The three report blocks NO EXISTING CASE RENDERS. Measured with breakpoint
 # hit-counts over this suite: the defect-detail lines and the published-only
@@ -324,15 +337,43 @@ Assert-True "published-only block names the row"     ($textPubOnly -match 'works
 
 # ---------------------------------------------------------------------------
 # 8. THE SHIPPED ALLOWLIST. Measured 2026-09-02: no CAPABILITY_SPECS row is
-#    resolved by a cfg-gated module, so it is empty. And workspace_root must
-#    NEVER appear on it -- that row differing is the plan's central finding.
+#    resolved by a cfg-gated module. Since 2026-09-27 it holds exactly ONE
+#    entry, the placement-exclusive session_cli pair, rung-pinned on both
+#    sides. And workspace_root must NEVER appear on it -- that row differing
+#    is the plan's central finding.
 # ---------------------------------------------------------------------------
 Write-Host "[8] the shipped allowlist"
-Assert-Equal "shipped allowlist is empty" 0 (@($ParityExpectedDifferences).Count)
+Assert-Equal "shipped allowlist holds exactly one entry" 1 (@($ParityExpectedDifferences).Count)
+$cliEntry = @($ParityExpectedDifferences | Where-Object { $_.Id -eq 'session_cli' })[0]
+Assert-Equal "that entry is session_cli"            "session_cli" $cliEntry.Id
+Assert-Equal "its dev rung is pinned"               "exe_relative_checkout" $cliEntry.DevRung
+Assert-Equal "its published rung is pinned"        "bundle_resource" $cliEntry.PublishedRung
+Assert-Equal "no shipped entry is a wildcard" 0 (@($ParityExpectedDifferences | Where-Object { $_.DevRung -eq '*' -or $_.PublishedRung -eq '*' }).Count)
 Assert-Equal "workspace_root is never allowlisted" 0 (@($ParityExpectedDifferences | Where-Object { $_.Id -eq 'workspace_root' }).Count)
 foreach ($e in @($ParityExpectedDifferences)) {
     Assert-True "allowlist entry '$($e.Id)' carries a reason" (-not [string]::IsNullOrWhiteSpace($e.Reason))
 }
+
+# ---------------------------------------------------------------------------
+# 8b. session_cli UNDER THE SHIPPED ALLOWLIST. Both legs delivering is the
+#     designed difference; a published leg that REFUSED or lacks the sidecar
+#     is the defect the row exists to surface, and is never excused.
+# ---------------------------------------------------------------------------
+Write-Host "[8b] session_cli: designed placement difference vs a missing published CLI"
+$devCli = Add-Row (New-Manifest) 'session_cli' 'exe_relative_checkout'
+$r8a = Compare-CapabilityManifests -Dev $devCli -Published (Add-Row (New-Manifest) 'session_cli' 'bundle_resource')
+Assert-Equal "both delivering is not a defect"  0 $r8a.ParityDefectCount
+Assert-Equal "it is the expected difference"    "expected_difference" (Get-Row $r8a 'session_cli').Disposition
+Assert-Equal "expected_differences"             1 $r8a.ExpectedDiffCount
+Assert-Equal "and it is comparable"             2 $r8a.ComparableCount
+
+$r8b = Compare-CapabilityManifests -Dev (Add-Row (New-Manifest) 'session_cli' 'exe_relative_checkout') -Published (Add-Row (New-Manifest) 'session_cli' 'unresolved')
+Assert-Equal "a published unresolved CLI is a defect" 1 $r8b.ParityDefectCount
+Assert-Equal "disposition"                            "defect" (Get-Row $r8b 'session_cli').Disposition
+
+# The allowlist is directional: the reverse pair is not the designed one.
+$r8c = Compare-CapabilityManifests -Dev (Add-Row (New-Manifest) 'session_cli' 'bundle_resource') -Published (Add-Row (New-Manifest) 'session_cli' 'exe_relative_checkout')
+Assert-Equal "the reverse pair is not excused" 1 $r8c.ParityDefectCount
 
 # ---------------------------------------------------------------------------
 # 9. THE ZERO-COMPARISON CASE. Every row unknown on both legs: the verdict must
