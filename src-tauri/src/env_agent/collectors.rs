@@ -3297,7 +3297,9 @@ fn collect_claude_accounts_from(
     let settings_file = runner_dir.join("settings.json");
 
     let mut config_dirs: Vec<String> = Vec::new();
-    let mut selection_mode = String::from("least_usage");
+    // Mirrors `AccountSelectionMode::default()` (settings.rs) — the mode a
+    // roster/settings file with no explicit field resolves to.
+    let mut selection_mode = String::from("highest_expected_usage");
     let mut launch_commands: HashMap<String, String> = HashMap::new();
     let mut accounts_file_found = false;
 

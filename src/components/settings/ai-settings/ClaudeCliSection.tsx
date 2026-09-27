@@ -24,7 +24,7 @@ import type {
 } from "./types";
 import { EXECUTION_MODE_OPTIONS } from "./types";
 import type { CliExecutionMode } from "../types";
-import { compareByUsageHeadroom } from "../types";
+import { compareForAccountSelectionMode } from "../types";
 
 interface ClaudeCliSectionProps {
   settings: AiSettings;
@@ -257,7 +257,7 @@ export function ClaudeCliSection({
         setAccountUsages(result.data);
         const best = result.data
           .filter((a) => !a.error)
-          .sort(compareByUsageHeadroom)[0];
+          .sort(compareForAccountSelectionMode(settings.claude_cli.account_selection_mode))[0];
         if (best) {
           onLog(
             "success",
@@ -461,17 +461,17 @@ export function ClaudeCliSection({
                 const usage = accountUsages.find((a) => a.config_dir === dir);
                 const live = liveAccounts.find((a) => a.config_dir === dir);
                 const label = dir.split(/[\\/]/).filter(Boolean).pop() || dir;
-                const isSelected =
-                  settings.claude_cli.account_selection_mode !== "least_usage" &&
-                  settings.claude_cli.config_dir === dir;
+                const isManualMode = settings.claude_cli.account_selection_mode === "manual";
+                const isSelected = isManualMode && settings.claude_cli.config_dir === dir;
                 const isLiveActive = live?.is_active ?? false;
                 const isRateLimited = live?.is_rate_limited ?? false;
                 const isBest =
-                  settings.claude_cli.account_selection_mode === "least_usage" &&
+                  !isManualMode &&
                   accountUsages.length > 0 &&
                   accountUsages
                     .filter((a) => !a.error)
-                    .sort(compareByUsageHeadroom)[0]?.config_dir === dir;
+                    .sort(compareForAccountSelectionMode(settings.claude_cli.account_selection_mode))[0]
+                    ?.config_dir === dir;
 
                 return (
                   <div
@@ -485,7 +485,7 @@ export function ClaudeCliSection({
                     }`}
                   >
                     <div className="flex items-center gap-2">
-                      {settings.claude_cli.account_selection_mode !== "least_usage" && (
+                      {isManualMode && (
                         <input
                           type="radio"
                           name="manual_account"
@@ -722,7 +722,7 @@ export function ClaudeCliSection({
               <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide">
                 Selection Mode
               </span>
-              <div className="grid grid-cols-2 gap-2">
+              <div className="grid grid-cols-3 gap-2">
                 <button
                   onClick={() =>
                     setSettings((prev) => ({
@@ -734,13 +734,34 @@ export function ClaudeCliSection({
                     }))
                   }
                   className={`p-2.5 rounded-lg text-left transition-colors ${
-                    settings.claude_cli.account_selection_mode !== "least_usage"
+                    settings.claude_cli.account_selection_mode === "manual"
                       ? "bg-primary/10 ring-1 ring-primary/30"
                       : "bg-muted/30 hover:bg-muted/50"
                   }`}
                 >
                   <div className="text-xs font-medium">Manual</div>
                   <div className="text-[10px] text-muted-foreground">Select account above</div>
+                </button>
+                <button
+                  onClick={() =>
+                    setSettings((prev) => ({
+                      ...prev,
+                      claude_cli: {
+                        ...prev.claude_cli,
+                        account_selection_mode: "highest_expected_usage",
+                      },
+                    }))
+                  }
+                  className={`p-2.5 rounded-lg text-left transition-colors ${
+                    settings.claude_cli.account_selection_mode === "highest_expected_usage"
+                      ? "bg-primary/10 ring-1 ring-primary/30"
+                      : "bg-muted/30 hover:bg-muted/50"
+                  }`}
+                >
+                  <div className="text-xs font-medium">Highest Expected Usage</div>
+                  <div className="text-[10px] text-muted-foreground">
+                    Auto-select the under-pace account closest to its reset
+                  </div>
                 </button>
                 <button
                   onClick={() =>
@@ -823,7 +844,7 @@ export function ClaudeCliSection({
             </div>
           )}
 
-          {settings.claude_cli.account_selection_mode !== "least_usage" && (
+          {settings.claude_cli.account_selection_mode === "manual" && (
             <div className="space-y-1">
               <label
                 htmlFor="claude-cli-custom-config-dir"

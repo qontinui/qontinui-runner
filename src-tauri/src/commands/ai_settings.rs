@@ -143,13 +143,15 @@ pub fn save_ai_settings(
     // Get existing settings to preserve Gemini configuration when saving Claude settings
     let existing_settings = settings::get_ai_settings();
 
-    // Default to least-usage; only an explicit "manual" pins to a single
-    // account. (None / unknown / "least_usage" all resolve to LeastUsage so a
-    // multi-account runner auto-balances by default — matching the
-    // AccountSelectionMode::LeastUsage default in settings.rs.)
+    // Default to highest-expected-usage; only an explicit "manual" pins to a
+    // single account, and only an explicit "least_usage" opts into the older
+    // headroom-only ranking. (None / unknown resolve to HighestExpectedUsage
+    // so a multi-account runner auto-balances by default — matching the
+    // AccountSelectionMode::HighestExpectedUsage default in settings.rs.)
     let selection_mode = match account_selection_mode.as_deref() {
         Some("manual") => AccountSelectionMode::Manual,
-        _ => AccountSelectionMode::LeastUsage,
+        Some("least_usage") => AccountSelectionMode::LeastUsage,
+        _ => AccountSelectionMode::HighestExpectedUsage,
     };
 
     let ai_settings = AiSettings {

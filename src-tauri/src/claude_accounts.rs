@@ -376,7 +376,7 @@ mod tests {
         assert_eq!(parsed.claude_config_dirs, vec!["/a".to_string()]);
         assert_eq!(
             parsed.account_selection_mode,
-            AccountSelectionMode::LeastUsage
+            AccountSelectionMode::HighestExpectedUsage
         );
         assert_eq!(parsed.config_dir, None);
     }

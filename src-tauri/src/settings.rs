@@ -103,9 +103,10 @@ pub enum CliExecutionMode {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountSelectionMode {
-    Manual, // Use the explicitly configured config_dir
+    Manual,     // Use the explicitly configured config_dir
+    LeastUsage, // Auto-select the account with lowest utilization relative to expected pace.
     #[default]
-    LeastUsage, // Auto-select the account with lowest utilization. No-op when fewer than two config dirs are configured, so safe as the default.
+    HighestExpectedUsage, // Auto-select, among accounts under their expected pace, the one with the highest expected usage. No-op when fewer than two config dirs are configured, so safe as the default.
 }
 
 impl AccountSelectionMode {
@@ -121,6 +122,7 @@ impl AccountSelectionMode {
         match self {
             AccountSelectionMode::Manual => "manual",
             AccountSelectionMode::LeastUsage => "least_usage",
+            AccountSelectionMode::HighestExpectedUsage => "highest_expected_usage",
         }
     }
 }
@@ -170,7 +172,7 @@ impl Default for ClaudeCliSettings {
             custom_path: None,
             timeout_seconds: 600,
             config_dir: None,
-            account_selection_mode: AccountSelectionMode::LeastUsage,
+            account_selection_mode: AccountSelectionMode::HighestExpectedUsage,
             auto_migrate_on_token_exhaustion: default_auto_migrate_on_token_exhaustion(),
             auto_continue_after_migration: default_auto_continue_after_migration(),
         }
@@ -6700,6 +6702,7 @@ mod account_selection_mode_tests {
         for mode in [
             AccountSelectionMode::Manual,
             AccountSelectionMode::LeastUsage,
+            AccountSelectionMode::HighestExpectedUsage,
         ] {
             let serde_spelling = serde_json::to_value(mode).expect("serializes");
             assert_eq!(serde_spelling, serde_json::json!(mode.as_str()));
@@ -6707,6 +6710,10 @@ mod account_selection_mode_tests {
         // Pin the literals too: the coord half codes against these strings.
         assert_eq!(AccountSelectionMode::Manual.as_str(), "manual");
         assert_eq!(AccountSelectionMode::LeastUsage.as_str(), "least_usage");
+        assert_eq!(
+            AccountSelectionMode::HighestExpectedUsage.as_str(),
+            "highest_expected_usage"
+        );
     }
 }
 

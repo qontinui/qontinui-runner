@@ -1,43 +1,55 @@
 //! Weekly-usage-aware Claude account selection.
 //!
 //! [`pick_best_account`] picks an effective Claude config dir from the
-//! configured `claude_config_dirs`. Among accounts that are **not** in a
-//! rate-limit cooldown, it ranks by [`super::config::usage_rank`] and
-//! [`super::config::cmp_rank`], mirroring the Terminal "best account" picker
-//! (`compareByUsageHeadroom` in `src/components/settings/types.ts`). The
-//! co-pilot relays its planning prompt through this picker, so it chooses the
-//! same account a human would when opening a new session.
+//! configured `claude_config_dirs`, using one of two ranking strategies
+//! depending on `account_selection_mode`:
 //!
-//! **The rule is use-it-or-lose-it.** Unused weekly capacity expires at the
-//! account's reset and does not roll over, so the account worth burning is the
-//! one whose spare capacity is about to be lost — *not* the emptiest one,
-//! whose runway is in no danger. Concretely: among accounts under their
-//! projected pace, the one whose 7-day window is furthest along wins.
+//! - `HighestExpectedUsage` (the default): among accounts that are **not** in
+//!   a rate-limit cooldown, not exhausted, AND currently under their expected
+//!   linear pace (actual 7-day utilization < expected utilization at this
+//!   point in the billing window), picks the one with the **highest expected
+//!   utilization** — see [`super::config::usage_rank_highest_expected`]. An
+//!   account at or over its expected pace is never selected by this tier; an
+//!   exhausted account never is either.
+//! - `LeastUsage`: ranks by [`super::config::usage_rank`] and
+//!   [`super::config::cmp_rank`], mirroring the Terminal "best account" picker
+//!   (`compareByUsageHeadroom` in `src/components/settings/types.ts`).
+//!   **The rule is use-it-or-lose-it.** Unused weekly capacity expires at the
+//!   account's reset and does not roll over, so the account worth burning is
+//!   the one whose spare capacity is about to be lost — *not* the emptiest
+//!   one, whose runway is in no danger. Concretely: among accounts under
+//!   their projected pace, the one whose 7-day window is furthest along wins.
+//!   Ranking key, in order (see [`super::config::PaceRank`] for the tier
+//!   keys):
+//!   1. `exhausted` — the dominating tier. An out-of-tokens / rejected
+//!      account is deprioritized no matter how favourable its pace key; a
+//!      fully-used account whose window is nearly over still has nothing
+//!      left to burn.
+//!   2. Pace **tier**: under-pace (`usage_delta < 0`) before unknown (no
+//!      usable pace signal) before over-pace (`usage_delta >= 0`).
+//!   3. Within a tier only, that tier's own key in its own direction:
+//!      - under-pace → `expected` **DESCENDING** (use-it-or-lose-it);
+//!      - unknown → raw `utilization` ascending (unchanged behaviour for the
+//!        population that never had a pace signal);
+//!      - over-pace → the **ratio** `utilization / expected` ASCENDING. A
+//!        ratio, not a difference: a difference is not comparable across
+//!        accounts at different points in their windows, since +5 points over
+//!        at 10% expected is far more over-pace than +5 points over at 80%
+//!        expected, yet a difference scores the two identically.
 //!
-//! Ranking key, in order (see [`super::config::PaceRank`] for the tier keys):
-//! 1. `exhausted` — the dominating tier. An out-of-tokens / rejected account
-//!    is deprioritized no matter how favourable its pace key; a fully-used
-//!    account whose window is nearly over still has nothing left to burn.
-//! 2. Pace **tier**: under-pace (`usage_delta < 0`) before unknown (no usable
-//!    pace signal) before over-pace (`usage_delta >= 0`).
-//! 3. Within a tier only, that tier's own key in its own direction:
-//!    - under-pace → `expected_utilization` **DESCENDING** (use-it-or-lose-it);
-//!    - unknown → raw `utilization` ascending (unchanged behaviour for the
-//!      population that never had a pace signal);
-//!    - over-pace → the **ratio** `utilization / expected_utilization`
-//!      ASCENDING. A ratio, not a difference: a difference is not comparable
-//!      across accounts at different points in their windows, since +5 points
-//!      over at 10% expected is far more over-pace than +5 points over at 80%
-//!      expected, yet a difference scores the two identically.
+//! The co-pilot relays its planning prompt through this picker, so it chooses
+//! the same account a human would when opening a new session.
 //!
-//! Selection order:
-//! 1. Among non-cooled accounts with a fresh usage sample, the best by the
-//!    ranking key above.
-//! 2. If no non-cooled account has a fresh sample (cold start / stale
-//!    snapshot), the first non-cooled account that is not *known-exhausted*
-//!    (per the last sample, with a longer staleness tolerance); if every
-//!    available account is known-exhausted, the first non-cooled. The
-//!    single-account case resolves here — the one account is simply pinned.
+//! Selection order (both modes share this shape; only the "best among
+//! available" step differs):
+//! 1. Among non-cooled accounts with a fresh, qualifying usage sample, the
+//!    best by the active mode's ranking.
+//! 2. If no non-cooled account has a qualifying sample (cold start / stale
+//!    snapshot / — for `HighestExpectedUsage` — every account at-or-over
+//!    pace), the first non-cooled account that is not *known-exhausted* (per
+//!    the last sample, with a longer staleness tolerance); if every available
+//!    account is known-exhausted, the first non-cooled. The single-account
+//!    case resolves here — the one account is simply pinned.
 //! 3. If every account is cooled, the one with the **shortest remaining
 //!    cooldown** (closest to expiry).
 //!
@@ -56,7 +68,7 @@
 //! subprocess path uses [`super::config::mark_account_rate_limited`] with
 //! the default 5-minute cooldown (no header source on stdout).
 //!
-//! [`pick_best_account`] is a no-op when `account_selection_mode != LeastUsage`
+//! [`pick_best_account`] is a no-op when `account_selection_mode == Manual`
 //! or no accounts are configured.
 
 use super::config::{cmp_rank, UsageRank};
@@ -77,15 +89,16 @@ use tracing::info;
 ///
 /// With a single configured account it simply pins that account (so the
 /// effective config dir resolves even for users who never set a manual
-/// `config_dir`). With several, selection prefers the non-cooled,
-/// non-exhausted account whose spare weekly capacity is closest to expiring —
-/// among accounts under their projected pace, the one furthest through its
-/// 7-day window, because unused capacity does not roll over past the reset.
-/// Falls back to first-non-cooled (cold start), then to the soonest-to-expire
-/// cooldown when every account is rate-limited. Full key: the module doc.
+/// `config_dir`). With several, selection prefers (per the active mode) the
+/// non-cooled, non-exhausted account either furthest under its expected pace
+/// (`LeastUsage`) or, among those under pace, with the highest expected usage
+/// (`HighestExpectedUsage`, the default); falls back to first-non-cooled
+/// (cold start), then to the soonest-to-expire cooldown when every account is
+/// rate-limited. Full key: the module doc.
 pub fn pick_best_account() {
     let ai_settings = settings::get_ai_settings();
-    if ai_settings.claude_cli.account_selection_mode != AccountSelectionMode::LeastUsage {
+    let mode = ai_settings.claude_cli.account_selection_mode;
+    if mode == AccountSelectionMode::Manual {
         return;
     }
 
@@ -94,14 +107,25 @@ pub fn pick_best_account() {
         return;
     }
 
-    let chosen = pick_from(
-        &config_dirs,
-        |d| super::oauth_refresh::has_valid_credentials(d),
-        |d| super::config::is_account_cooled_down(d),
-        |d| super::config::usage_rank(d),
-        |d| super::config::account_known_exhausted(d),
-        |d| super::config::time_until_cooled_down(d),
-    );
+    let chosen = match mode {
+        AccountSelectionMode::HighestExpectedUsage => pick_from_highest_expected(
+            &config_dirs,
+            |d| super::oauth_refresh::has_valid_credentials(d),
+            |d| super::config::is_account_cooled_down(d),
+            |d| super::config::usage_rank_highest_expected(d),
+            |d| super::config::account_known_exhausted(d),
+            |d| super::config::time_until_cooled_down(d),
+        ),
+        AccountSelectionMode::LeastUsage => pick_from(
+            &config_dirs,
+            |d| super::oauth_refresh::has_valid_credentials(d),
+            |d| super::config::is_account_cooled_down(d),
+            |d| super::config::usage_rank(d),
+            |d| super::config::account_known_exhausted(d),
+            |d| super::config::time_until_cooled_down(d),
+        ),
+        AccountSelectionMode::Manual => unreachable!("returned above"),
+    };
 
     if let Some(dir) = chosen {
         let current = super::config::get_resolved_config_dir();
@@ -183,6 +207,66 @@ fn pick_from<'a>(
     // credential-less dir has no cooldown entry (`remaining` → `None` →
     // `Duration::ZERO`) and would otherwise win the `min` precisely when every
     // authenticated account is rate-limited.
+    valid
+        .iter()
+        .min_by_key(|d| remaining(d).unwrap_or(Duration::ZERO))
+        .map(|d| (*d).clone())
+}
+
+/// Pure selection core for `AccountSelectionMode::HighestExpectedUsage`,
+/// parameterised exactly like [`pick_from`] except for the `usage` closure:
+/// here it returns `Some(expected_utilization)` only for an account that
+/// qualifies for the primary tier — usable AND currently under its expected
+/// pace (mirrors [`super::config::usage_rank_highest_expected`]) — and `None`
+/// for everything else (exhausted, at-or-over pace, or no fresh sample).
+///
+/// Because a `None` from `usage` is indistinguishable here from "no sample",
+/// an over-pace or exhausted account is never chosen by the primary ranking —
+/// it can only be picked up by the same cold-start / all-known-exhausted
+/// fallback tail [`pick_from`] uses, exactly the "should not be selected
+/// [when a better option exists]" behaviour this mode calls for.
+///
+/// Credential validity and cooldown filtering, and the cold-start / all-
+/// cooled fallback tail, are identical to [`pick_from`] — only the "best
+/// among available" step differs (highest `expected_utilization` wins here,
+/// vs. lowest `(exhausted, headroom)` there).
+fn pick_from_highest_expected<'a>(
+    config_dirs: &'a [String],
+    has_valid_creds: impl Fn(&str) -> bool,
+    is_cooled: impl Fn(&str) -> bool,
+    usage: impl Fn(&str) -> Option<f64>,
+    known_exhausted: impl Fn(&str) -> bool,
+    remaining: impl Fn(&str) -> Option<Duration>,
+) -> Option<String> {
+    let valid: Vec<&'a String> = config_dirs.iter().filter(|d| has_valid_creds(d)).collect();
+    if valid.is_empty() {
+        return None;
+    }
+
+    let available: Vec<&'a String> = valid.iter().filter(|d| !is_cooled(d)).copied().collect();
+
+    if !available.is_empty() {
+        // Among available accounts under their expected pace, the one with
+        // the highest expected utilization wins.
+        let best = available
+            .iter()
+            .filter_map(|d| usage(d).map(|expected| (*d, expected)))
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(d, _)| d.clone());
+        return best
+            // No account qualified (none under pace, or cold start / stale
+            // snapshot): prefer the first available account NOT
+            // known-exhausted, same fallback as `pick_from`.
+            .or_else(|| {
+                available
+                    .iter()
+                    .find(|d| !known_exhausted(d))
+                    .map(|d| (*d).clone())
+            })
+            .or_else(|| available.first().map(|d| (*d).clone()));
+    }
+
+    // All (credential-valid) accounts cooled: shortest remaining cooldown.
     valid
         .iter()
         .min_by_key(|d| remaining(d).unwrap_or(Duration::ZERO))
@@ -933,6 +1017,129 @@ mod tests {
         let d: Vec<String> = Vec::new();
         let chosen = pick_from(&d, |_| true, |_| false, |_| None, |_| false, |_| None);
         assert_eq!(chosen, None);
+    }
+
+    // --- pick_from_highest_expected: the HighestExpectedUsage ranking core --
+    //
+    // `usage` returns `Some(expected_utilization)` only for accounts under
+    // their expected pace (mirrors `usage_rank_highest_expected`); `None`
+    // (over-pace, exhausted, or no sample) falls through to the same
+    // cold-start / cooldown fallback `pick_from` uses.
+
+    #[test]
+    fn highest_expected_wins_among_under_pace_accounts() {
+        let d = dirs(&["/a", "/b", "/c"]);
+        // All under pace; /b has the highest expected utilization → chosen.
+        let chosen = pick_from_highest_expected(
+            &d,
+            |_| true,
+            |_| false,
+            |x| match x {
+                "/a" => Some(0.40),
+                "/b" => Some(0.90),
+                "/c" => Some(0.55),
+                _ => None,
+            },
+            |_| false,
+            |_| None,
+        );
+        assert_eq!(chosen.as_deref(), Some("/b"));
+    }
+
+    #[test]
+    fn over_pace_account_excluded_even_with_highest_expected() {
+        let d = dirs(&["/over", "/under"]);
+        // /over has a higher expected_utilization but is at/over pace (usage()
+        // returns None for it, mirroring usage_rank_highest_expected) → must
+        // not be picked; /under wins despite lower expected usage.
+        let chosen = pick_from_highest_expected(
+            &d,
+            |_| true,
+            |_| false,
+            |x| match x {
+                "/over" => None,
+                "/under" => Some(0.30),
+                _ => None,
+            },
+            |_| false,
+            |_| None,
+        );
+        assert_eq!(chosen.as_deref(), Some("/under"));
+    }
+
+    #[test]
+    fn all_over_pace_falls_back_to_first_not_known_exhausted() {
+        let d = dirs(&["/a", "/b"]);
+        // Neither account is under pace (usage() → None for both) → falls
+        // back like a stale snapshot: first available not known-exhausted.
+        let chosen =
+            pick_from_highest_expected(&d, |_| true, |_| false, |_| None, |x| x == "/a", |_| None);
+        assert_eq!(chosen.as_deref(), Some("/b"));
+    }
+
+    #[test]
+    fn highest_expected_cooled_account_excluded() {
+        let d = dirs(&["/a", "/b"]);
+        // /a has the higher expected usage but is cooled → must not be picked.
+        let chosen = pick_from_highest_expected(
+            &d,
+            |_| true,
+            |x| x == "/a",
+            |x| match x {
+                "/a" => Some(0.95),
+                "/b" => Some(0.30),
+                _ => None,
+            },
+            |_| false,
+            |_| None,
+        );
+        assert_eq!(chosen.as_deref(), Some("/b"));
+    }
+
+    #[test]
+    fn highest_expected_all_cooled_picks_soonest_to_expire() {
+        let d = dirs(&["/a", "/b"]);
+        let chosen = pick_from_highest_expected(
+            &d,
+            |_| true,
+            |_| true, // all cooled
+            |_| None,
+            |_| false,
+            |x| match x {
+                "/a" => Some(Duration::from_secs(600)),
+                "/b" => Some(Duration::from_secs(30)),
+                _ => None,
+            },
+        );
+        assert_eq!(chosen.as_deref(), Some("/b"));
+    }
+
+    #[test]
+    fn highest_expected_single_account_is_pinned() {
+        let d = dirs(&["/only"]);
+        let chosen =
+            pick_from_highest_expected(&d, |_| true, |_| false, |_| None, |_| false, |_| None);
+        assert_eq!(chosen.as_deref(), Some("/only"));
+    }
+
+    #[test]
+    fn highest_expected_credential_invalid_dir_never_selected() {
+        let d = dirs(&["/no-creds", "/authed"]);
+        // /no-creds has the highest expected usage but no live credentials →
+        // excluded entirely; /authed wins despite lower expected usage.
+        let chosen = pick_from_highest_expected(
+            &d,
+            |x| x == "/authed",
+            |_| false,
+            |x| match x {
+                "/no-creds" => Some(0.95),
+                "/authed" => Some(0.30),
+                _ => None,
+            },
+            |_| false,
+            |_| None,
+        );
+        assert_eq!(chosen.as_deref(), Some("/authed"));
     }
 
     // --- credential-validity filter (highest precedence) --------------------

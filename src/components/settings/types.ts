@@ -95,7 +95,7 @@ export type UpdateStatus = "idle" | "checking" | "downloading" | "installing" | 
 export type AiProvider = "claude_cli" | "claude_api" | "gemini_cli" | "gemini_api";
 export type CliExecutionMode = "auto" | "windows_native" | "wsl" | "native";
 export type GeminiAuthMethod = "oauth" | "api_key";
-export type AccountSelectionMode = "manual" | "least_usage";
+export type AccountSelectionMode = "manual" | "least_usage" | "highest_expected_usage";
 
 export interface ClaudeCliSettings {
   execution_mode: CliExecutionMode;
@@ -321,6 +321,71 @@ export function compareByUsageHeadroom(a: RankableAccount, b: RankableAccount): 
   // arms are exhaustive. TypeScript cannot narrow `ra.tier === rb.tier` from
   // `ta === tb`, so the branch has to be spelled out.
   return 0;
+}
+
+/**
+ * Comparator for the `highest_expected_usage` selection mode. Three-level key
+ * `(exhausted, !underPace, -expected_utilization)`, ascending — the best
+ * account sorts first.
+ *
+ * 1. Exhausted accounts (see {@link isAccountExhausted}) always sort AFTER
+ *    usable ones, exactly like {@link compareByUsageHeadroom}.
+ * 2. An account currently UNDER its projected pace (`usage_delta < 0`, with
+ *    both `usage_delta` and `expected_utilization` known) always sorts before
+ *    one that is at or over pace — an at-or-over-pace account is never
+ *    preferred by this mode.
+ * 3. Within the under-pace tier, the HIGHEST `expected_utilization` wins
+ *    (furthest along its billing window, so it is "spent down" before an
+ *    account that still has most of its week ahead of it).
+ *
+ * Mirrors the runner's `pick_from_highest_expected` ranking
+ * (`ai_provider/account_usage.rs`).
+ */
+export function compareByHighestExpectedUsage(
+  a: {
+    utilization: number;
+    usage_delta?: number | null;
+    expected_utilization?: number | null;
+    status?: string | null;
+    error?: string | null;
+  },
+  b: {
+    utilization: number;
+    usage_delta?: number | null;
+    expected_utilization?: number | null;
+    status?: string | null;
+    error?: string | null;
+  },
+): number {
+  const ea = isAccountExhausted(a) ? 1 : 0;
+  const eb = isAccountExhausted(b) ? 1 : 0;
+  if (ea !== eb) return ea - eb;
+
+  const underPace = (x: typeof a): boolean =>
+    x.usage_delta != null && x.usage_delta < 0 && x.expected_utilization != null;
+  const ua = underPace(a) ? 0 : 1;
+  const ub = underPace(b) ? 0 : 1;
+  if (ua !== ub) return ua - ub;
+
+  if (ua === 0) {
+    // Both under pace and known: higher expected_utilization wins.
+    return (b.expected_utilization as number) - (a.expected_utilization as number);
+  }
+  // Neither qualifies for the primary tier: fall back to headroom order so
+  // the result stays deterministic and matches the runner's fallback intent.
+  const ka = a.usage_delta ?? a.utilization ?? 0;
+  const kb = b.usage_delta ?? b.utilization ?? 0;
+  return ka - kb;
+}
+
+/** The comparator matching a configured `AccountSelectionMode`. `manual`
+ * falls back to {@link compareByUsageHeadroom} since it has no auto-pick
+ * ranking of its own — callers that reach here for `manual` are asking for
+ * an explicit "best account" regardless of the pinned one. */
+export function compareForAccountSelectionMode(
+  mode: AccountSelectionMode | undefined,
+): typeof compareByUsageHeadroom {
+  return mode === "highest_expected_usage" ? compareByHighestExpectedUsage : compareByUsageHeadroom;
 }
 
 export interface ClaudeApiSettings {

@@ -18,7 +18,7 @@
  * constructed X/Y pair below is the case that tells the two apart.
  */
 import { describe, expect, it } from "vitest";
-import { compareByUsageHeadroom, isAccountExhausted } from "./types";
+import { compareByHighestExpectedUsage, compareByUsageHeadroom, isAccountExhausted } from "./types";
 
 type A = {
   utilization: number;
@@ -29,10 +29,15 @@ type A = {
   label?: string;
 };
 
+type B = A & { expected_utilization?: number | null };
+
 const order = (accounts: A[]): string[] =>
   [...accounts].sort(compareByUsageHeadroom).map((x) => x.label ?? "");
 
 const best = (accounts: A[]): string => order(accounts)[0] ?? "";
+
+const bestExpected = (accounts: B[]): string =>
+  [...accounts].sort(compareByHighestExpectedUsage)[0]?.label ?? "";
 
 describe("compareByUsageHeadroom", () => {
   // ── Level 3a — within under-pace, highest `expected_utilization` wins ─────
@@ -291,6 +296,70 @@ describe("compareByUsageHeadroom", () => {
       { label: "ok", utilization: 0.7, expected_utilization: 0.6, usage_delta: 0.1 },
     ];
     expect(best(errored)).toBe("ok");
+  });
+});
+
+describe("compareByHighestExpectedUsage", () => {
+  it("picks the highest expected_utilization among under-pace accounts, not the lowest utilization", () => {
+    const accounts: B[] = [
+      { label: "low-expected", utilization: 0.2, usage_delta: -0.1, expected_utilization: 0.3 },
+      { label: "high-expected", utilization: 0.5, usage_delta: -0.4, expected_utilization: 0.9 },
+    ];
+    expect(bestExpected(accounts)).toBe("high-expected");
+  });
+
+  it("never picks an account at or over its expected pace when an under-pace one exists", () => {
+    // 'over' has the highest expected_utilization but is OVER pace (positive
+    // delta) → must lose to 'under', which qualifies for the primary tier.
+    const accounts: B[] = [
+      { label: "over", utilization: 0.95, usage_delta: 0.1, expected_utilization: 0.85 },
+      { label: "under", utilization: 0.2, usage_delta: -0.1, expected_utilization: 0.3 },
+    ];
+    expect(bestExpected(accounts)).toBe("under");
+  });
+
+  it("treats delta exactly zero (at pace) as not under pace", () => {
+    const accounts: B[] = [
+      { label: "at-pace", utilization: 0.5, usage_delta: 0, expected_utilization: 0.5 },
+      { label: "under-pace", utilization: 0.1, usage_delta: -0.05, expected_utilization: 0.15 },
+    ];
+    expect(bestExpected(accounts)).toBe("under-pace");
+  });
+
+  it("a usable account beats an exhausted one regardless of expected usage", () => {
+    const accounts: B[] = [
+      { label: "full", utilization: 1.0, usage_delta: -0.05, expected_utilization: 1.05 },
+      { label: "usable", utilization: 0.2, usage_delta: -0.1, expected_utilization: 0.3 },
+    ];
+    expect(bestExpected(accounts)).toBe("usable");
+  });
+
+  it("falls back to headroom order when no account qualifies as under-pace", () => {
+    const accounts: B[] = [
+      { label: "a", utilization: 0.6, usage_delta: 0.2, expected_utilization: 0.4 },
+      { label: "b", utilization: 0.6, usage_delta: 0.05, expected_utilization: 0.55 },
+    ];
+    // Neither is under pace, so this falls back to compareByUsageHeadroom's
+    // ascending-delta order: 'b' (smaller positive delta) sorts first.
+    expect(bestExpected(accounts)).toBe("b");
+  });
+
+  it("falls back to headroom order when expected_utilization is unknown for both", () => {
+    const accounts: B[] = [
+      { label: "a", utilization: 0.6, usage_delta: -0.2 }, // no expected_utilization
+      { label: "b", utilization: 0.3, usage_delta: -0.1 }, // no expected_utilization
+    ];
+    // Neither can qualify for the primary tier without expected_utilization →
+    // falls back to headroom order, where 'a' (-0.2) beats 'b' (-0.1).
+    expect(bestExpected(accounts)).toBe("a");
+  });
+
+  it("an account missing expected_utilization loses to one that has it, even with worse headroom", () => {
+    const accounts: B[] = [
+      { label: "no-expected", utilization: 0.6, usage_delta: -0.2 }, // no expected_utilization → tier 1
+      { label: "has-expected", utilization: 0.3, usage_delta: -0.1, expected_utilization: 0.4 }, // tier 0
+    ];
+    expect(bestExpected(accounts)).toBe("has-expected");
   });
 });
 

@@ -6069,7 +6069,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 // Weekly-usage-aware account selection. `pick_best_account`
-                // internally checks `account_selection_mode == LeastUsage`
+                // internally checks `account_selection_mode != Manual`
                 // and returns immediately otherwise — no need to gate the
                 // call here. Refresh the usage snapshot FIRST so the initial
                 // pick can rank accounts by weekly-usage pace rather than

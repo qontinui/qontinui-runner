@@ -23,7 +23,8 @@ const RATE_LIMIT_COOLDOWN_SECS: u64 = 300;
 
 /// One account's weekly-usage sample, captured by the usage probe
 /// (`commands::ai_settings::probe_account_usage`) and ranked by
-/// [`usage_rank`].
+/// [`usage_rank`] — or, in `HighestExpectedUsage` mode, by
+/// [`usage_rank_highest_expected`].
 ///
 /// `usage_delta` is the account's actual 7-day utilization minus its
 /// *expected* linear utilization at this point in the billing window
@@ -31,9 +32,10 @@ const RATE_LIMIT_COOLDOWN_SECS: u64 = 300;
 /// it (e.g. the 7d-reset header was absent). Its **sign** is what selects the
 /// pace tier — it is no longer a ranking key in its own right. `expected` is
 /// the key the under-pace tier actually ranks on, and the denominator of the
-/// over-pace ratio. `utilization` is the raw 0.0–1.0 weekly fraction: the
-/// ranking key for the `Unknown` tier, and the numerator of the over-pace
-/// ratio.
+/// over-pace ratio; it is also the value [`usage_rank_highest_expected`]
+/// returns directly for a qualifying under-pace account. `utilization` is the
+/// raw 0.0–1.0 weekly fraction: the ranking key for the `Unknown` tier, and
+/// the numerator of the over-pace ratio.
 ///
 /// Ranking runs on **use-it-or-lose-it**: unused weekly capacity expires at
 /// the reset and does not roll over, so among accounts under their pace the
@@ -192,15 +194,22 @@ pub fn get_effective_config_dir(
     cli_settings: &settings::ClaudeCliSettings,
 ) -> (Option<String>, ClaudeConfigDirSource) {
     let (candidate, source) = match cli_settings.account_selection_mode {
-        AccountSelectionMode::LeastUsage => match get_resolved_config_dir() {
-            // The resolved dir (set by the credential-aware picker) wins.
-            Some(dir) => (Some(dir), ClaudeConfigDirSource::LeastUsageResolved),
-            // else fall back to the manual config_dir.
-            None => (
-                cli_settings.config_dir.clone(),
-                ClaudeConfigDirSource::LeastUsageConfigDirFallback,
-            ),
-        },
+        // Both auto modes (`LeastUsage` and `HighestExpectedUsage`) pin their
+        // choice via the same `RESOLVED_CONFIG_DIR` set by `pick_best_account`
+        // — the source names predate `HighestExpectedUsage` but still apply:
+        // they describe "the auto-picker resolved / fell back", not which
+        // ranking the picker used.
+        AccountSelectionMode::LeastUsage | AccountSelectionMode::HighestExpectedUsage => {
+            match get_resolved_config_dir() {
+                // The resolved dir (set by the credential-aware picker) wins.
+                Some(dir) => (Some(dir), ClaudeConfigDirSource::LeastUsageResolved),
+                // else fall back to the manual config_dir.
+                None => (
+                    cli_settings.config_dir.clone(),
+                    ClaudeConfigDirSource::LeastUsageConfigDirFallback,
+                ),
+            }
+        }
         AccountSelectionMode::Manual => (
             cli_settings.config_dir.clone(),
             ClaudeConfigDirSource::Manual,
@@ -314,7 +323,8 @@ pub fn time_until_cooled_down(config_dir: &str) -> Option<Duration> {
 /// (see `UsageSample::expected`) and is **not optional detail**: [`usage_rank`]
 /// ranks the under-pace tier on it directly (highest first — that account's
 /// spare capacity expires soonest and does not roll over) and divides by it to
-/// get the over-pace ratio. A feeder that passes `None` for it drops the
+/// get the over-pace ratio; [`usage_rank_highest_expected`] returns it
+/// directly as its ranking key. A feeder that passes `None` for it drops the
 /// account into the `Unknown` tier, where it can never outrank a measured
 /// under-pace account.
 pub fn record_account_usage(samples: &[(String, f64, Option<f64>, Option<f64>, bool)]) {
@@ -508,6 +518,39 @@ pub fn cmp_rank(a: &UsageRank, b: &UsageRank) -> Ordering {
             // Unreachable: `tier_index` already separated different tiers.
             _ => Ordering::Equal,
         })
+}
+
+/// Selection rank for the `HighestExpectedUsage` mode: `Some(expected_utilization)`
+/// only for an account that is BOTH usable (not exhausted) AND currently under
+/// its projected weekly pace (`usage_delta < 0.0`, i.e. actual utilization is
+/// less than expected). Every other case — exhausted, at-or-over projected
+/// pace, or no fresh/computable sample — returns `None`, exactly like
+/// [`usage_rank`] returning `None` for a stale/missing sample: the caller
+/// (`account_usage::pick_from_highest_expected`) treats `None` as "not a
+/// candidate for the primary ranking" and falls through to the same
+/// cold-start / cooldown-ordering fallback [`usage_rank`]'s callers use.
+///
+/// Among the `Some` survivors the caller picks the MAXIMUM
+/// `expected_utilization`: of the accounts with headroom, prefer the one
+/// furthest along its billing window (soonest to reset), so an account that
+/// still has a full week of headroom ahead of it is saved for later rather
+/// than spent down first.
+pub fn usage_rank_highest_expected(config_dir: &str) -> Option<f64> {
+    let snap = USAGE_SNAPSHOT.lock().ok()?;
+    let map = snap.as_ref()?;
+    let sample = map.get(config_dir)?;
+    if sample.captured_at.elapsed() > USAGE_SNAPSHOT_TTL {
+        return None;
+    }
+    if sample.exhausted {
+        return None;
+    }
+    let expected = sample.expected?;
+    let delta = sample.usage_delta?;
+    if delta >= 0.0 {
+        return None;
+    }
+    Some(expected)
 }
 
 /// Whether an account was last seen **exhausted** (out of tokens / rejected),
@@ -1093,6 +1136,42 @@ mod tests {
         assert!(!account_known_exhausted(dir_ok), "usable sample → false");
         // Unrecorded account is treated as not-known-exhausted (eligible).
         assert!(!account_known_exhausted("/test/config/known_never"));
+    }
+
+    #[test]
+    fn usage_rank_highest_expected_returns_expected_when_under_pace() {
+        let dir = "/test/config/hexp_under_pace";
+        // utilization 0.30, expected 0.50 → delta -0.20 (under pace).
+        record_account_usage(&[(dir.to_string(), 0.30, Some(-0.20), Some(0.50), false)]);
+        assert_eq!(usage_rank_highest_expected(dir), Some(0.50));
+    }
+
+    #[test]
+    fn usage_rank_highest_expected_excludes_at_or_over_pace() {
+        let dir_over = "/test/config/hexp_over_pace";
+        let dir_at = "/test/config/hexp_at_pace";
+        // utilization 0.60, expected 0.50 → delta +0.10 (over pace) → excluded.
+        record_account_usage(&[(dir_over.to_string(), 0.60, Some(0.10), Some(0.50), false)]);
+        assert_eq!(usage_rank_highest_expected(dir_over), None);
+        // utilization exactly at expected pace (delta 0.0) → excluded too.
+        record_account_usage(&[(dir_at.to_string(), 0.50, Some(0.0), Some(0.50), false)]);
+        assert_eq!(usage_rank_highest_expected(dir_at), None);
+    }
+
+    #[test]
+    fn usage_rank_highest_expected_excludes_exhausted() {
+        let dir = "/test/config/hexp_exhausted";
+        // Under pace on paper, but exhausted → still excluded.
+        record_account_usage(&[(dir.to_string(), 1.0, Some(-0.05), Some(1.05), true)]);
+        assert_eq!(usage_rank_highest_expected(dir), None);
+    }
+
+    #[test]
+    fn usage_rank_highest_expected_excludes_unknown_expected_or_delta() {
+        let dir = "/test/config/hexp_unknown";
+        // No usage_delta / expected_utilization (probe couldn't compute it).
+        record_account_usage(&[(dir.to_string(), 0.30, None, None, false)]);
+        assert_eq!(usage_rank_highest_expected(dir), None);
     }
 
     #[test]

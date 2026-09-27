@@ -224,7 +224,8 @@ export function AiSettings({ onLog }: AiSettingsProps) {
         customPath: settings.claude_cli.custom_path || null,
         timeoutSeconds: settings.claude_cli.timeout_seconds,
         configDir: settings.claude_cli.config_dir || null,
-        accountSelectionMode: settings.claude_cli.account_selection_mode || "least_usage",
+        accountSelectionMode:
+          settings.claude_cli.account_selection_mode || "highest_expected_usage",
         autoMigrateOnTokenExhaustion: settings.claude_cli.auto_migrate_on_token_exhaustion ?? true,
         autoContinueAfterMigration: settings.claude_cli.auto_continue_after_migration ?? true,
         model: settings.claude_api.model,

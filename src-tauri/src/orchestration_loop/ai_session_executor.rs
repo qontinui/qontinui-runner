@@ -574,9 +574,9 @@ pub async fn dispatch_subtask(
         }
     };
 
-    // 2. Re-pick the lowest-utilization account for THIS dispatch (account
-    //    exhaustion mitigation — never pin once per run). No-op unless
-    //    LeastUsage mode is configured; mirrors `agent_runtime`'s call site.
+    // 2. Re-pick the best account for THIS dispatch (account exhaustion
+    //    mitigation — never pin once per run). No-op only in Manual mode;
+    //    mirrors `agent_runtime`'s call site.
     crate::ai_provider::account_usage::pick_best_account();
 
     // Resolve managed state up-front so a missing dependency fails loud before
