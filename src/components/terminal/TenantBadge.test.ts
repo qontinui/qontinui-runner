@@ -260,6 +260,12 @@ describe("repoTenantHint (SpawnTenantPicker renders every non-resolved arm)", ()
     );
   });
 
+  it("an answer in an unrecognised shape reads as unknown, never as a tenant", () => {
+    const hint = repoTenantHint({ state: "from_a_future_runner" }, candidates);
+    expect(hint).toMatchObject({ inferred: null, note: "repo: unknown" });
+    expect(repoTenantHint(42, candidates).note).toBe("repo: unknown");
+  });
+
   it("tolerates an older runner's bare answer", () => {
     expect(repoTenantHint(B, candidates).inferred).toBe(B);
     expect(repoTenantHint(null, candidates).note).toBe("repo: unknown");

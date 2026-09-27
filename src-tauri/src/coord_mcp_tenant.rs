@@ -124,16 +124,37 @@ pub(crate) struct CallerNamed {
     pub source: String,
 }
 
-/// The expectation a nonce carries: the cwd's tenant (resolved once, off the
-/// hot path) and whether the session's tenant was caller-named.
+/// How long a TRANSIENT unknown expectation (coord unreachable, git timed out,
+/// the budget ran out) stands before the next call may retry the resolution.
+/// Bounds the retry cost to one attempt per window per binding.
+pub(crate) const TRANSIENT_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What one binding's expectation has established so far.
+#[derive(Debug, Default)]
+struct ExpectationState {
+    /// A PERMANENT answer (`Resolved` / `NoRepo` / `RepoUnregistered` /
+    /// `Several`, or a standing `Unknown`): frozen for the binding's life (F2).
+    settled: Option<CwdTenant>,
+    /// The last TRANSIENT unknown and when it was reached: reported, never
+    /// frozen, never persisted, and retried once [`TRANSIENT_RETRY_AFTER`]
+    /// has passed.
+    transient: Option<(std::time::Instant, CwdTenant)>,
+}
+
+/// The expectation a nonce carries: the cwd's tenant (resolved off the hot
+/// path) and whether the session's tenant was caller-named.
 ///
-/// The cell is SHARED between clones of the binding. The mint kicks off its
-/// resolution in the background; the proxy's first `tools/call` awaits the
-/// same cell (bounded by [`qontinui_runner_lib::repo_tenant::CWD_TENANT_BUDGET`]),
-/// so the resolver runs exactly once per binding whoever gets there first.
+/// The state is SHARED between clones of the binding. The mint kicks off its
+/// resolution in the background; the proxy's calls await the same state behind
+/// a single-flight lock (each attempt bounded by
+/// [`qontinui_runner_lib::repo_tenant::CWD_TENANT_BUDGET`]). A permanent answer
+/// is reached once and frozen; a transient unknown is retried, at most once per
+/// [`TRANSIENT_RETRY_AFTER`].
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SessionExpectation {
-    cwd: Arc<tokio::sync::OnceCell<CwdTenant>>,
+    state: Arc<Mutex<ExpectationState>>,
+    /// Single-flight: at most one resolution attempt in progress per binding.
+    flight: Arc<tokio::sync::Mutex<()>>,
     caller_named: Option<CallerNamed>,
 }
 
@@ -141,43 +162,104 @@ impl SessionExpectation {
     /// Not yet resolved; resolves on first use.
     pub(crate) fn pending(caller_named: Option<CallerNamed>) -> Self {
         Self {
-            cwd: Arc::default(),
             caller_named,
+            ..Self::default()
         }
     }
 
-    /// Already known — a restored binding.
+    /// Already known — a restored binding. A transient value is never stored,
+    /// so one handed in here is treated as not yet resolved.
     pub(crate) fn known(cwd: CwdTenant, caller_named: Option<CallerNamed>) -> Self {
-        Self {
-            cwd: Arc::new(tokio::sync::OnceCell::new_with(Some(cwd))),
-            caller_named,
+        let this = Self::pending(caller_named);
+        if !cwd.is_transient() {
+            this.lock().settled = Some(cwd);
         }
+        this
     }
 
-    /// The resolved expectation, or `None` while resolution has not finished.
-    pub(crate) fn get(&self) -> Option<&CwdTenant> {
-        self.cwd.get()
+    fn lock(&self) -> std::sync::MutexGuard<'_, ExpectationState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The frozen (permanent) expectation — the only one that may be
+    /// persisted. `None` while unresolved or while only a transient unknown is
+    /// known.
+    pub(crate) fn settled(&self) -> Option<CwdTenant> {
+        self.lock().settled.clone()
+    }
+
+    /// What is known right now, for display: the settled answer, else the last
+    /// transient unknown, else `None` (still resolving).
+    pub(crate) fn current(&self) -> Option<CwdTenant> {
+        let s = self.lock();
+        s.settled
+            .clone()
+            .or_else(|| s.transient.as_ref().map(|(_, t)| t.clone()))
     }
 
     pub(crate) fn caller_named(&self) -> Option<&CallerNamed> {
         self.caller_named.as_ref()
     }
 
-    /// Resolve (once) and return the expectation for `workdir`. `None` means
-    /// the binding has no usable workdir, which is UNKNOWN — never `NoRepo`.
+    /// Resolve and return the expectation for `workdir`. `None` means the
+    /// binding has no usable workdir, which is UNKNOWN — never `NoRepo`.
     pub(crate) async fn resolve(&self, workdir: Option<&str>) -> CwdTenant {
         let workdir = workdir.map(str::to_string);
-        self.cwd
-            .get_or_init(|| async move { resolve_workdir(workdir.as_deref()).await })
-            .await
-            .clone()
+        self.resolve_with(std::time::Instant::now(), || async move {
+            resolve_workdir(workdir.as_deref()).await
+        })
+        .await
+    }
+
+    /// [`Self::resolve`] with the clock and the resolver injected.
+    async fn resolve_with<F, Fut>(&self, now: std::time::Instant, resolver: F) -> CwdTenant
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = CwdTenant>,
+    {
+        let answered = |s: &ExpectationState| -> Option<CwdTenant> {
+            if let Some(t) = &s.settled {
+                return Some(t.clone());
+            }
+            match &s.transient {
+                Some((at, t)) if now.saturating_duration_since(*at) < TRANSIENT_RETRY_AFTER => {
+                    Some(t.clone())
+                }
+                _ => None,
+            }
+        };
+        // Each guard is taken and dropped within one statement, so no std
+        // guard is ever alive across an `.await`.
+        let hit = answered(&self.lock());
+        if let Some(t) = hit {
+            return t;
+        }
+        let _flight = self.flight.lock().await;
+        // A concurrent caller may have resolved while we waited.
+        let hit = answered(&self.lock());
+        if let Some(t) = hit {
+            return t;
+        }
+        let fresh = resolver().await;
+        {
+            let mut s = self.lock();
+            if fresh.is_transient() {
+                s.transient = Some((now, fresh.clone()));
+            } else {
+                s.settled = Some(fresh.clone());
+                s.transient = None;
+            }
+        }
+        fresh
     }
 
     /// Start resolving in the background when a runtime is available (the mint
     /// path), then run `on_resolved` — the mint uses it to re-persist the nonce
-    /// set, so the resolved expectation reaches the store instead of the
-    /// still-empty cell the mint's own snapshot saw. Without a runtime (a sync
-    /// unit test) nothing is spawned and the first proxy call resolves it.
+    /// set, so a SETTLED expectation reaches the store instead of the still-empty
+    /// state the mint's own snapshot saw. A transient result is not persisted
+    /// (the callback still runs; the snapshot simply finds nothing settled).
+    /// Without a runtime (a sync unit test) nothing is spawned and the first
+    /// proxy call resolves it.
     pub(crate) fn spawn_resolution(
         &self,
         workdir: Option<&str>,
@@ -187,8 +269,10 @@ impl SessionExpectation {
             let this = self.clone();
             let workdir = workdir.map(str::to_string);
             handle.spawn(async move {
-                this.resolve(workdir.as_deref()).await;
-                on_resolved();
+                let got = this.resolve(workdir.as_deref()).await;
+                if !got.is_transient() {
+                    on_resolved();
+                }
             });
         }
     }
@@ -199,12 +283,10 @@ async fn resolve_workdir(workdir: Option<&str>) -> CwdTenant {
         Some(w) if std::path::Path::new(w).is_absolute() => {
             qontinui_runner_lib::repo_tenant::cwd_tenant_for_path(std::path::Path::new(w)).await
         }
-        Some(w) => CwdTenant::Unknown {
-            reason: format!("the session's workdir {w:?} is not an absolute path"),
-        },
-        None => CwdTenant::Unknown {
-            reason: "the session's nonce records no workdir".to_string(),
-        },
+        Some(w) => CwdTenant::unknown(format!(
+            "the session's workdir {w:?} is not an absolute path"
+        )),
+        None => CwdTenant::unknown("the session's nonce records no workdir"),
     }
 }
 
@@ -215,11 +297,31 @@ async fn resolve_workdir(workdir: Option<&str>) -> CwdTenant {
 /// What the answer was compared WITH, as the mismatch notice names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExpectedTenant {
-    pub tenant_id: Uuid,
+    /// The acceptable tenants: one for a single owner or a named tenant,
+    /// every owner for a repo registered to several.
+    pub tenant_ids: Vec<Uuid>,
     /// `Some(repo)` when the expectation came from the cwd's repo.
     pub repo: Option<String>,
     /// `canonical_repos`, or `caller_named: <source>`.
     pub source: String,
+}
+
+impl ExpectedTenant {
+    /// `tenant <id>` or `one of tenants <id>, <id>` — the ids only, since the
+    /// repo registry serves no slugs.
+    pub(crate) fn label(&self) -> String {
+        let ids = self
+            .tenant_ids
+            .iter()
+            .map(Uuid::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        if self.tenant_ids.len() == 1 {
+            ids
+        } else {
+            format!("one of {ids}")
+        }
+    }
 }
 
 /// Why agreement was reached.
@@ -278,8 +380,8 @@ impl TenantVerdict {
 /// The comparison. Pure; compares on `tenant_id` only.
 ///
 /// No input arm defaults to `Agree`: agreement requires a stamped answer AND a
-/// known expectation (the repo's single owner, or the caller-named tenant)
-/// naming the same tenant.
+/// known expectation (the repo's owner — one of its owners when it has
+/// several — or the caller-named tenant) naming the same tenant.
 pub(crate) fn tenant_verdict(
     expected: &CwdTenant,
     answered: Option<&AnsweredBy>,
@@ -298,7 +400,7 @@ pub(crate) fn tenant_verdict(
         } else {
             TenantVerdict::Mismatch {
                 expected: ExpectedTenant {
-                    tenant_id: named.tenant_id,
+                    tenant_ids: vec![named.tenant_id],
                     repo: None,
                     source: format!("caller_named: {}", named.source),
                 },
@@ -309,22 +411,27 @@ pub(crate) fn tenant_verdict(
 
     match expected {
         CwdTenant::NoRepo => TenantVerdict::NoRepo,
-        CwdTenant::Unknown { reason } => TenantVerdict::ExpectedUnknown {
+        CwdTenant::Unknown { reason, .. } => TenantVerdict::ExpectedUnknown {
             why: reason.clone(),
         },
         CwdTenant::RepoUnregistered { repo } => TenantVerdict::ExpectedUnknown {
             why: format!("repo {repo} has no owning tenant in coord's registry"),
         },
-        CwdTenant::Several { repo, tenant_ids } => TenantVerdict::ExpectedUnknown {
-            why: format!(
-                "repo {repo} is registered to {} tenants ({})",
-                tenant_ids.len(),
-                tenant_ids
-                    .iter()
-                    .map(Uuid::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
+        // A repo registered to several tenants: an answer from ANY owner is
+        // that repo's data; one from a non-owner is another project's.
+        CwdTenant::Several { repo, tenant_ids } => match answered_tenant {
+            None => TenantVerdict::AnswerUnstamped,
+            Some((t, _)) if tenant_ids.contains(&t) => TenantVerdict::Agree {
+                source: AgreeSource::Repo,
+            },
+            Some((_, answer)) => TenantVerdict::Mismatch {
+                expected: ExpectedTenant {
+                    tenant_ids: tenant_ids.clone(),
+                    repo: Some(repo.clone()),
+                    source: "canonical_repos".to_string(),
+                },
+                answered: answer.clone(),
+            },
         },
         CwdTenant::Resolved {
             tenant_id,
@@ -338,7 +445,7 @@ pub(crate) fn tenant_verdict(
             },
             Some((_, answer)) => TenantVerdict::Mismatch {
                 expected: ExpectedTenant {
-                    tenant_id: *tenant_id,
+                    tenant_ids: vec![*tenant_id],
                     repo: Some(repo.clone()),
                     source: source.clone(),
                 },
@@ -367,7 +474,8 @@ pub(crate) fn verdict_notice(
             // The expected tenant's slug is not known here (the repo registry
             // serves ids); the answer's slug is used only when it names the
             // same tenant, which in a mismatch it never does.
-            let expected_label = format!("{} ({})", expected.tenant_id, expected.tenant_id);
+            // So the id is printed once, never as `<id> (<id>)`.
+            let expected_label = expected.label();
             Some(match &expected.repo {
                 Some(repo) => format!(
                     "TENANT MISMATCH: this answer came from tenant {}. The repo in this \
@@ -624,7 +732,7 @@ pub(crate) fn record_verdicts(nonce: Option<&str>, verdicts: &[ObservedVerdict])
             TenantVerdict::Mismatch { expected, answered } => Some(format!(
                 "answered by {}, expected {} ({})",
                 answered.describe(),
-                expected.tenant_id,
+                expected.label(),
                 expected.source
             )),
             TenantVerdict::ExpectedUnknown { why } => Some(why.clone()),
@@ -714,16 +822,16 @@ mod tests {
                     tenant_ids: vec![a, b],
                 },
             ),
+            ("unknown", CwdTenant::unknown_transient("coord unreachable")),
             (
-                "unknown",
-                CwdTenant::Unknown {
-                    reason: "coord unreachable".into(),
-                },
+                "unknown_standing",
+                CwdTenant::unknown("workdir does not exist"),
             ),
         ];
         let answers = [
             ("stamped_a", Some(answered(Some(a), Some("pizzeria")))),
             ("stamped_b", Some(answered(Some(b), Some("qontinui")))),
+            ("stamped_c", Some(answered(Some(c), Some("steward")))),
             ("stamped_no_tenant", Some(answered(None, None))),
             ("unstamped", None),
         ];
@@ -773,6 +881,22 @@ mod tests {
                                 assert!(matches!(v, TenantVerdict::Mismatch { .. }), "{case}");
                                 continue;
                             }
+                            (CwdTenant::Several { .. }, None) => TenantVerdict::AnswerUnstamped,
+                            (CwdTenant::Several { tenant_ids, .. }, Some(at))
+                                if tenant_ids.contains(&at) =>
+                            {
+                                TenantVerdict::Agree {
+                                    source: AgreeSource::Repo,
+                                }
+                            }
+                            (CwdTenant::Several { tenant_ids, .. }, Some(_)) => {
+                                assert!(
+                                    matches!(&v, TenantVerdict::Mismatch { expected, .. }
+                                        if expected.tenant_ids == *tenant_ids),
+                                    "the mismatch names the owner set: {case}"
+                                );
+                                continue;
+                            }
                             _ => {
                                 assert!(
                                     matches!(v, TenantVerdict::ExpectedUnknown { .. }),
@@ -792,19 +916,45 @@ mod tests {
     }
 
     #[test]
-    fn several_and_unregistered_name_their_why() {
-        let v = tenant_verdict(
-            &CwdTenant::Several {
-                repo: "acme/shared".into(),
-                tenant_ids: vec![t(1), t(2)],
-            },
-            Some(&answered(Some(t(1)), None)),
-            None,
+    fn several_owners_agree_with_any_owner_and_name_the_set_on_a_mismatch() {
+        let several = CwdTenant::Several {
+            repo: "acme/shared".into(),
+            tenant_ids: vec![t(1), t(2)],
+        };
+        assert_eq!(
+            tenant_verdict(&several, Some(&answered(Some(t(2)), None)), None),
+            TenantVerdict::Agree {
+                source: AgreeSource::Repo
+            }
+        );
+        let v = tenant_verdict(&several, Some(&answered(Some(t(3)), Some("other"))), None);
+        let notice = verdict_notice(&v, None).unwrap();
+        assert!(
+            notice.contains(&format!("belongs to tenant one of {}, {}", t(1), t(2))),
+            "{notice}"
+        );
+        assert_eq!(
+            tenant_verdict(&several, None, None),
+            TenantVerdict::AnswerUnstamped
+        );
+    }
+
+    #[test]
+    fn a_single_owner_mismatch_prints_its_id_once() {
+        let v = tenant_verdict(&resolved(t(2)), Some(&answered(Some(t(1)), None)), None);
+        let notice = verdict_notice(&v, None).unwrap();
+        assert!(
+            notice.contains(&format!("belongs to tenant {}. Treat", t(2))),
+            "{notice}"
         );
         assert!(
-            matches!(&v, TenantVerdict::ExpectedUnknown { why } if why.contains("2 tenants")),
-            "{v:?}"
+            !notice.contains(&format!("{} ({})", t(2), t(2))),
+            "{notice}"
         );
+    }
+
+    #[test]
+    fn unregistered_names_its_why() {
         let v = tenant_verdict(
             &CwdTenant::RepoUnregistered {
                 repo: "acme/x".into(),
@@ -959,9 +1109,7 @@ mod tests {
     async fn unverified_is_appended_once_per_nonce_and_on_identity_tools() {
         let a = t(0xA1);
         let url = stub_upstream(stamped_body(a, "pizzeria")).await;
-        let unknown = CwdTenant::Unknown {
-            reason: "coord repo registry unreadable: 503".into(),
-        };
+        let unknown = CwdTenant::unknown_transient("coord repo registry unreadable: 503");
         let nonce = format!("test-nonce-{}", Uuid::new_v4());
         let mut claim = || claim_unverified_notice(&nonce);
         let mut appended = Vec::new();
@@ -1100,7 +1248,7 @@ mod tests {
         let v = ObservedVerdict {
             verdict: TenantVerdict::Mismatch {
                 expected: ExpectedTenant {
-                    tenant_id: t(2),
+                    tenant_ids: vec![t(2)],
                     repo: Some("acme/x".into()),
                     source: "canonical_repos".into(),
                 },
@@ -1122,10 +1270,78 @@ mod tests {
         }
     }
 
+    /// A TRANSIENT unknown is not frozen: it stands for the retry window, is
+    /// retried after it, is never reported as settled (so never persisted),
+    /// and a permanent answer reached on a retry is then frozen for good.
+    #[tokio::test]
+    async fn a_transient_unknown_is_retried_after_the_window_and_never_settled() {
+        let e = SessionExpectation::pending(None);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let t0 = std::time::Instant::now();
+        let transient = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { CwdTenant::unknown_transient("coord repo registry unreadable: 503") }
+        };
+        assert!(e.resolve_with(t0, transient).await.is_transient());
+        assert_eq!(e.settled(), None, "a transient unknown is never settled");
+        assert!(e.current().is_some_and(|c| c.is_transient()));
+        // Inside the window: answered from the last attempt, no new attempt.
+        let _ = e
+            .resolve_with(t0 + TRANSIENT_RETRY_AFTER / 2, transient)
+            .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // Past it: retried, and a permanent answer is frozen.
+        let got = e
+            .resolve_with(t0 + TRANSIENT_RETRY_AFTER, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { resolved(t(0xA1)) }
+            })
+            .await;
+        assert_eq!(got, resolved(t(0xA1)));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(e.settled(), Some(resolved(t(0xA1))));
+        // Frozen: never re-resolved, whatever the clock says.
+        let again = e
+            .resolve_with(t0 + TRANSIENT_RETRY_AFTER * 10, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { CwdTenant::NoRepo }
+            })
+            .await;
+        assert_eq!(again, resolved(t(0xA1)));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // A transient value handed to `known` (a restore) is not frozen either.
+        let restored = SessionExpectation::known(CwdTenant::unknown_transient("x"), None);
+        assert_eq!(restored.settled(), None);
+    }
+
+    /// Concurrent first calls share ONE resolution (single flight).
+    #[tokio::test]
+    async fn concurrent_resolutions_are_single_flight() {
+        let e = SessionExpectation::pending(None);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let now = std::time::Instant::now();
+        let mut joins = Vec::new();
+        for _ in 0..8 {
+            let (e, calls) = (e.clone(), calls.clone());
+            joins.push(tokio::spawn(async move {
+                e.resolve_with(now, || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    CwdTenant::NoRepo
+                })
+                .await
+            }));
+        }
+        for j in joins {
+            assert_eq!(j.await.unwrap(), CwdTenant::NoRepo);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn the_expectation_resolves_once_and_a_missing_workdir_is_unknown() {
         let e = SessionExpectation::pending(None);
-        assert!(e.get().is_none());
+        assert!(e.current().is_none());
         let got = e.resolve(None).await;
         assert!(matches!(got, CwdTenant::Unknown { .. }));
         // Resolved once: a later call with a real dir does not re-resolve.

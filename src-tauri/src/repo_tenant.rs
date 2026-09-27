@@ -82,6 +82,10 @@ impl RepoOwners {
 /// artifact.
 pub const CACHE_TTL: Duration = Duration::from_secs(60);
 
+/// HTTP budget for `GET /coord/canonical-repos` — strictly below
+/// [`CWD_TENANT_BUDGET`] minus the git probe's share.
+const CANONICAL_REPOS_HTTP_TIMEOUT: Duration = Duration::from_secs(4);
+
 // ===========================================================================
 // slug parsing
 // ===========================================================================
@@ -230,7 +234,9 @@ async fn fetch_registered_repos() -> Result<CanonicalRepos, String> {
     let url = format!("{base}/coord/canonical-repos");
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
+        // Strictly below CWD_TENANT_BUDGET, so a slow coord surfaces as this
+        // read's own error (named) rather than the resolver's generic timeout.
+        .timeout(CANONICAL_REPOS_HTTP_TIMEOUT)
         .build()
         .map_err(|e| format!("build http client: {e}"))?;
 
@@ -316,6 +322,11 @@ struct CanonicalRepoCache {
     ttl: Duration,
     /// `(fetched_at, outcome)`. `None` = never fetched.
     state: RwLock<Option<(Instant, Result<CanonicalRepos, String>)>>,
+    /// SINGLE-FLIGHT for refreshes: a cold burst (every terminal spawn now
+    /// resolves its repo's tenant) must cost one coord read, not one per
+    /// caller. Held across the fetch; a waiter re-checks the snapshot after
+    /// acquiring it and finds the winner's answer.
+    refresh: tokio::sync::Mutex<()>,
 }
 
 impl CanonicalRepoCache {
@@ -323,7 +334,14 @@ impl CanonicalRepoCache {
         Self {
             ttl,
             state: RwLock::new(None),
+            refresh: tokio::sync::Mutex::new(()),
         }
+    }
+
+    async fn fresh_hit(&self, now: Instant) -> Option<Result<CanonicalRepos, String>> {
+        let state = self.state.read().await;
+        let (at, outcome) = state.as_ref()?;
+        (now.saturating_duration_since(*at) < self.ttl).then(|| outcome.clone())
     }
 
     /// Read the snapshot, refreshing through `fetch` when it is cold or older
@@ -337,13 +355,13 @@ impl CanonicalRepoCache {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<CanonicalRepos, String>>,
     {
-        {
-            let state = self.state.read().await;
-            if let Some((at, outcome)) = state.as_ref() {
-                if now.duration_since(*at) < self.ttl {
-                    return outcome.clone();
-                }
-            }
+        if let Some(hit) = self.fresh_hit(now).await {
+            return hit;
+        }
+        let _flight = self.refresh.lock().await;
+        // Another caller may have refreshed while we waited for the flight.
+        if let Some(hit) = self.fresh_hit(now).await {
+            return hit;
         }
         let fresh = fetch().await;
         let mut state = self.state.write().await;
@@ -369,12 +387,15 @@ static CANONICAL_REPOS: once_cell::sync::Lazy<CanonicalRepoCache> =
 /// as stable as a fact gets, so a TTL'd answer is honest; `None` (not a git
 /// checkout, or `git` failed) is cached for the same reason coord's negative
 /// answers are — it is the steady state for any non-repo directory.
-struct RepoSlugCache {
+struct DirCache<V> {
     ttl: Duration,
-    entries: RwLock<HashMap<PathBuf, (Instant, Option<String>)>>,
+    entries: RwLock<HashMap<PathBuf, (Instant, V)>>,
 }
 
-impl RepoSlugCache {
+/// The slug cache is the `Option<String>` instance of [`DirCache`].
+type RepoSlugCache = DirCache<Option<String>>;
+
+impl<V: Clone> DirCache<V> {
     fn new(ttl: Duration) -> Self {
         Self {
             ttl,
@@ -382,6 +403,38 @@ impl RepoSlugCache {
         }
     }
 
+    /// Answer for `dir` from the cache, else through `detect`, storing the
+    /// fresh answer only when `cacheable` says so (a transient failure is not
+    /// remembered — the next caller asks again).
+    async fn lookup<F, Fut>(
+        &self,
+        dir: &Path,
+        now: Instant,
+        detect: F,
+        cacheable: impl FnOnce(&V) -> bool,
+    ) -> V
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = V>,
+    {
+        {
+            let entries = self.entries.read().await;
+            if let Some((at, v)) = entries.get(dir) {
+                if now.saturating_duration_since(*at) < self.ttl {
+                    return v.clone();
+                }
+            }
+        }
+        let fresh = detect().await;
+        if cacheable(&fresh) {
+            let mut entries = self.entries.write().await;
+            entries.insert(dir.to_path_buf(), (now, fresh.clone()));
+        }
+        fresh
+    }
+}
+
+impl RepoSlugCache {
     /// As [`CanonicalRepoCache::snapshot`]: `now` and `detect` are injected so
     /// the TTL is testable without sleeping or shelling out to `git`.
     async fn slug_for<F, Fut>(&self, dir: &Path, now: Instant, detect: F) -> Option<String>
@@ -389,20 +442,15 @@ impl RepoSlugCache {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Option<String>>,
     {
-        {
-            let entries = self.entries.read().await;
-            if let Some((at, slug)) = entries.get(dir) {
-                if now.duration_since(*at) < self.ttl {
-                    return slug.clone();
-                }
-            }
-        }
-        let fresh = detect().await;
-        let mut entries = self.entries.write().await;
-        entries.insert(dir.to_path_buf(), (now, fresh.clone()));
-        fresh
+        self.lookup(dir, now, detect, |_| true).await
     }
 }
+
+/// TTL'd `directory → RepoProbe` cache for the cwd resolver — the same bound
+/// as [`REPO_SLUGS`] for a burst of spawns into one checkout. A
+/// [`RepoProbe::Failed`] is never cached: it is transient by definition.
+static REPO_PROBES: once_cell::sync::Lazy<DirCache<RepoProbe>> =
+    once_cell::sync::Lazy::new(|| DirCache::new(CACHE_TTL));
 
 static REPO_SLUGS: once_cell::sync::Lazy<RepoSlugCache> =
     once_cell::sync::Lazy::new(|| RepoSlugCache::new(CACHE_TTL));
@@ -602,7 +650,15 @@ pub enum CwdTenant {
     /// The repo is registered to more than one tenant.
     Several { repo: String, tenant_ids: Vec<Uuid> },
     /// Nothing could be established. UNKNOWN, never "no tenant".
-    Unknown { reason: String },
+    Unknown {
+        reason: String,
+        /// The failure may clear by itself (git timed out, coord unreachable,
+        /// the budget ran out, coord served a tenant id we could not read):
+        /// such an answer is retried later and never persisted. `false` for a
+        /// standing fact (no workdir, a workdir that does not exist).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        transient: bool,
+    },
 }
 
 impl CwdTenant {
@@ -615,6 +671,33 @@ impl CwdTenant {
             CwdTenant::Several { .. } => "several",
             CwdTenant::Unknown { .. } => "unknown",
         }
+    }
+
+    /// A standing UNKNOWN (`transient: false`).
+    pub fn unknown(reason: impl Into<String>) -> Self {
+        CwdTenant::Unknown {
+            reason: reason.into(),
+            transient: false,
+        }
+    }
+
+    /// An UNKNOWN that may clear by itself — see [`CwdTenant::Unknown`].
+    pub fn unknown_transient(reason: impl Into<String>) -> Self {
+        CwdTenant::Unknown {
+            reason: reason.into(),
+            transient: true,
+        }
+    }
+
+    /// Is this an answer that must be retried rather than frozen?
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            CwdTenant::Unknown {
+                transient: true,
+                ..
+            }
+        )
     }
 }
 
@@ -634,16 +717,23 @@ fn display_remote(url: &str) -> String {
     // otherwise happily parse `user:secret@host:path` as scheme `user` with an
     // opaque path, keeping the secret. Whatever precedes the `@` is dropped —
     // normally a bare user, but `user:secret@` is not unheard of.
+    //
+    // The userinfo ends at the FIRST `@`, and only when nothing before it is
+    // a path (`/`): a later `@` belongs to the path (`host:org/x@v2`), and a
+    // path-only remote (`host:org/x@v2` with no user) keeps its `@`.
     if !url.contains("://") {
-        return match url.rsplit_once('@') {
-            Some((_, host_path)) => host_path.to_string(),
-            None => url.to_string(),
+        return match url.split_once('@') {
+            Some((userinfo, host_path)) if !userinfo.contains('/') => host_path.to_string(),
+            _ => url.to_string(),
         };
     }
     match url::Url::parse(url) {
         Ok(mut parsed) => {
             let _ = parsed.set_username("");
             let _ = parsed.set_password(None);
+            // A query string or fragment can carry a token too.
+            parsed.set_query(None);
+            parsed.set_fragment(None);
             parsed.to_string()
         }
         // Anything else that does not parse is shown as a class, never
@@ -661,11 +751,7 @@ pub fn classify_cwd_tenant(
 ) -> CwdTenant {
     let slug = match probe {
         RepoProbe::NotACheckout => return CwdTenant::NoRepo,
-        RepoProbe::Failed(reason) => {
-            return CwdTenant::Unknown {
-                reason: reason.clone(),
-            }
-        }
+        RepoProbe::Failed(reason) => return CwdTenant::unknown_transient(reason.clone()),
         RepoProbe::NotGithub(url) => {
             return CwdTenant::RepoUnregistered {
                 repo: format!("{} (not a GitHub remote)", display_remote(url)),
@@ -677,21 +763,17 @@ pub fn classify_cwd_tenant(
         Ok(r) => r,
         // Coord did not answer: UNKNOWN, never "unregistered".
         Err(e) => {
-            return CwdTenant::Unknown {
-                reason: format!("coord repo registry unreadable: {e}"),
-            }
+            return CwdTenant::unknown_transient(format!("coord repo registry unreadable: {e}"))
         }
     };
     let Some(owners) = repos.get(slug) else {
         return CwdTenant::RepoUnregistered { repo: slug.clone() };
     };
     if !owners.malformed.is_empty() {
-        return CwdTenant::Unknown {
-            reason: format!(
-                "coord served an unparseable tenant id for {slug}: {}",
-                owners.malformed.join(", ")
-            ),
-        };
+        return CwdTenant::unknown_transient(format!(
+            "coord served an unparseable tenant id for {slug}: {}",
+            owners.malformed.join(", ")
+        ));
     }
     match owners.tenants.as_slice() {
         [] => CwdTenant::RepoUnregistered { repo: slug.clone() },
@@ -724,17 +806,31 @@ where
     Fut: Future<Output = Result<CanonicalRepos, String>>,
 {
     let resolve = async {
-        let Some(dir) = repo_dir_for(path) else {
-            return CwdTenant::NoRepo;
-        };
-        let probe = match crate::wedge_diagnostics::spawn_blocking_tracked(move || {
-            probe_repo(&dir.to_string_lossy(), CWD_REMOTE_PROBE_BUDGET)
-        })
-        .await
-        {
-            Ok(p) => p,
-            Err(e) => RepoProbe::Failed(format!("git probe did not complete: {e}")),
-        };
+        // A session's workdir is a DIRECTORY. One that does not exist says
+        // nothing about any repo — probing its parent would answer for a
+        // different directory (and could name the enclosing checkout).
+        if !path.is_dir() {
+            return CwdTenant::unknown(format!("workdir does not exist: {}", path.display()));
+        }
+        let dir = path.to_path_buf();
+        let probe = REPO_PROBES
+            .lookup(
+                &dir,
+                Instant::now(),
+                || async {
+                    let probe_dir = dir.clone();
+                    match crate::wedge_diagnostics::spawn_blocking_tracked(move || {
+                        probe_repo(&probe_dir.to_string_lossy(), CWD_REMOTE_PROBE_BUDGET)
+                    })
+                    .await
+                    {
+                        Ok(p) => p,
+                        Err(e) => RepoProbe::Failed(format!("git probe did not complete: {e}")),
+                    }
+                },
+                |p| !matches!(p, RepoProbe::Failed(_)),
+            )
+            .await;
         let observed_at = chrono::Utc::now().to_rfc3339();
         match &probe {
             // Only a slug needs coord at all.
@@ -747,12 +843,10 @@ where
     };
     match tokio::time::timeout(budget, resolve).await {
         Ok(t) => t,
-        Err(_) => CwdTenant::Unknown {
-            reason: format!(
-                "repo→tenant resolution did not finish within {}s",
-                budget.as_secs()
-            ),
-        },
+        Err(_) => CwdTenant::unknown_transient(format!(
+            "repo→tenant resolution did not finish within {}s",
+            budget.as_secs()
+        )),
     }
 }
 
@@ -1317,7 +1411,7 @@ mod tests {
             "t0",
         );
         match t {
-            CwdTenant::Unknown { reason } => assert!(reason.contains("connection refused")),
+            CwdTenant::Unknown { reason, .. } => assert!(reason.contains("connection refused")),
             other => panic!("coord unreachable must be Unknown, got {other:?}"),
         }
     }
@@ -1394,7 +1488,7 @@ mod tests {
         })
         .await;
         assert!(
-            matches!(&t, CwdTenant::Unknown { reason } if reason.contains("connection refused")),
+            matches!(&t, CwdTenant::Unknown { reason, .. } if reason.contains("connection refused")),
             "{t:?}"
         );
 
@@ -1416,9 +1510,112 @@ mod tests {
         })
         .await;
         assert!(
-            matches!(&t, CwdTenant::Unknown { reason } if reason.contains("did not finish")),
+            matches!(&t, CwdTenant::Unknown { reason, .. } if reason.contains("did not finish")),
             "{t:?}"
         );
+    }
+
+    /// A workdir that does not exist says nothing about any repo — it must
+    /// not be answered from its parent (which could be a checkout).
+    #[tokio::test]
+    async fn a_nonexistent_workdir_is_unknown_not_its_parent() {
+        let Some(d) = github_checkout() else { return };
+        let gone = d.path().join("deleted-subdir");
+        let t = cwd_tenant_with(&gone, Duration::from_secs(5), || async {
+            Err("must not be asked".to_string())
+        })
+        .await;
+        assert!(
+            matches!(&t, CwdTenant::Unknown { reason, transient: false }
+                if reason.contains("does not exist")),
+            "{t:?}"
+        );
+    }
+
+    #[test]
+    fn the_coord_read_times_out_inside_the_resolver_budget() {
+        assert!(CANONICAL_REPOS_HTTP_TIMEOUT + CWD_REMOTE_PROBE_BUDGET < CWD_TENANT_BUDGET);
+    }
+
+    /// A cold burst of concurrent reads costs ONE coord fetch.
+    #[tokio::test]
+    async fn concurrent_snapshot_refreshes_are_single_flight() {
+        let cache = std::sync::Arc::new(CanonicalRepoCache::new(Duration::from_secs(60)));
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let now = Instant::now();
+        let mut joins = Vec::new();
+        for _ in 0..8 {
+            let (cache, calls) = (cache.clone(), calls.clone());
+            joins.push(tokio::spawn(async move {
+                cache
+                    .snapshot(now, || async move {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        Ok(map(&[("a/b", Some(T1))]))
+                    })
+                    .await
+            }));
+        }
+        for j in joins {
+            assert!(j.await.unwrap().unwrap().contains_key("a/b"));
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// The probe cache keeps answers but never a transient failure.
+    #[tokio::test]
+    async fn the_probe_cache_never_keeps_a_failure() {
+        let cache: DirCache<RepoProbe> = DirCache::new(Duration::from_secs(60));
+        let dir = Path::new("/w/repo");
+        let now = Instant::now();
+        let failed = cache
+            .lookup(
+                dir,
+                now,
+                || async { RepoProbe::Failed("timed out".into()) },
+                |p| !matches!(p, RepoProbe::Failed(_)),
+            )
+            .await;
+        assert!(matches!(failed, RepoProbe::Failed(_)));
+        let got = cache
+            .lookup(
+                dir,
+                now,
+                || async { RepoProbe::Slug("a/b".into()) },
+                |p| !matches!(p, RepoProbe::Failed(_)),
+            )
+            .await;
+        assert_eq!(
+            got,
+            RepoProbe::Slug("a/b".into()),
+            "the failure was not cached"
+        );
+        let cached = cache
+            .lookup(dir, now, || async { RepoProbe::NotACheckout }, |_| true)
+            .await;
+        assert_eq!(
+            cached,
+            RepoProbe::Slug("a/b".into()),
+            "the answer was cached"
+        );
+    }
+
+    #[test]
+    fn display_remote_keeps_path_ats_and_drops_query_strings() {
+        assert_eq!(
+            display_remote("git@example.org:org/x@v2.git"),
+            "example.org:org/x@v2.git"
+        );
+        assert_eq!(
+            display_remote("example.org:org/x@v2.git"),
+            "example.org:org/x@v2.git"
+        );
+        let https = display_remote("https://u:p@gitlab.com/a/b.git?private_token=s3cret#frag");
+        assert!(
+            !https.contains("s3cret") && !https.contains("u:p"),
+            "{https}"
+        );
+        assert!(https.ends_with("gitlab.com/a/b.git"), "{https}");
     }
 
     #[tokio::test]

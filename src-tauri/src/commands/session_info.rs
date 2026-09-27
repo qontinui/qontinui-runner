@@ -598,7 +598,7 @@ impl TenancyRepoExpected {
                 leg.tenant_ids = tenant_ids.iter().map(|t| t.to_string()).collect();
                 leg
             }
-            Some(CwdTenant::Unknown { reason }) => {
+            Some(CwdTenant::Unknown { reason, .. }) => {
                 let mut leg = Self::empty(TENANCY_UNKNOWN);
                 leg.reason = Some(reason.clone());
                 leg
@@ -634,17 +634,28 @@ impl TenancyRepoExpected {
 
     /// Does this leg leave the comparison UNKNOWN? `no_repo` and
     /// `repo_unregistered` are answers ("nothing to expect") and do not;
-    /// `several` does unless `credential` is one of the owners.
+    /// `several` does only while the credential tenant is unknown — the same
+    /// rule the proxy's verdict applies (any owner agrees, a non-owner
+    /// mismatches; see [`Self::outside_owner_set`]).
     fn blocks_agreement(&self, credential: Option<&str>) -> bool {
         if self.caller_named_tenant_id.is_some() {
             return false;
         }
         match self.status.as_str() {
             TENANCY_RESOLVED | "no_repo" | "repo_unregistered" | REPO_EXPECTED_NOT_READ => false,
-            "several" => !credential
-                .is_some_and(|c| self.tenant_ids.iter().any(|t| t.eq_ignore_ascii_case(c))),
+            "several" => credential.is_none(),
             _ => true,
         }
+    }
+
+    /// A repo registered to several tenants, and a known credential tenant
+    /// that is none of them — a divergence, exactly as the proxy's verdict
+    /// calls an answer from a non-owner a mismatch.
+    fn outside_owner_set(&self, credential: Option<&str>) -> bool {
+        self.caller_named_tenant_id.is_none()
+            && self.status == "several"
+            && credential
+                .is_some_and(|c| !self.tenant_ids.iter().any(|t| t.eq_ignore_ascii_case(c)))
     }
 }
 
@@ -875,7 +886,11 @@ impl SessionTenancy {
         );
         known.sort();
         known.dedup();
-        let diverged = known.len() > 1 || self.repo_expected.verdict.as_deref() == Some("mismatch");
+        let diverged = known.len() > 1
+            || self.repo_expected.verdict.as_deref() == Some("mismatch")
+            || self
+                .repo_expected
+                .outside_owner_set(self.credential.tenant_id.as_deref());
         let divergence = if diverged {
             DIVERGENCE_DIVERGED
         } else if self.credential.tenant_id.is_some()
@@ -914,11 +929,8 @@ pub(crate) fn read_session_tenancy(rec: &TerminalSessionRecord) -> SessionTenanc
         })
         .and_then(|terminal| terminal.coord_session_id())
         .map(|id| crate::session::session_tenant_scope(Some(id)));
-    let credential = crate::coord_mcp::session_credential_tenant(
-        &rec.terminal_id,
-        non_empty(rec.working_dir.as_ref()).as_deref(),
-    );
-    let repo_expected = crate::coord_mcp::session_repo_expectation(
+    // One nonce resolution for both legs, so they describe the same key.
+    let (credential, repo_expected) = crate::coord_mcp::session_tenancy_reads(
         &rec.terminal_id,
         non_empty(rec.working_dir.as_ref()).as_deref(),
     );
@@ -1594,19 +1606,10 @@ mod tests {
                 DIVERGENCE_AGREE,
             ),
             (
-                Some(CwdTenant::Unknown {
-                    reason: "coord unreachable".into(),
-                }),
+                Some(CwdTenant::unknown_transient("coord unreachable")),
                 TENANCY_UNKNOWN,
             ),
             (None, TENANCY_UNKNOWN),
-            (
-                Some(CwdTenant::Several {
-                    repo: "acme/s".into(),
-                    tenant_ids: vec![tenant(0xB2), tenant(0xC3)],
-                }),
-                TENANCY_UNKNOWN,
-            ),
             (
                 Some(CwdTenant::Several {
                     repo: "acme/s".into(),
@@ -1620,6 +1623,19 @@ mod tests {
             assert_eq!(t.divergence, want, "{cwd:?}");
             assert!(!t.diverged, "{cwd:?}");
         }
+        // Several owners, none of them the credential's: diverged, as the
+        // proxy's verdict would call a non-owner's answer a mismatch.
+        let outside =
+            agreeing_on(a).with_repo_expected(TenancyRepoExpected::from_read(&repo_read(
+                Some(CwdTenant::Several {
+                    repo: "acme/s".into(),
+                    tenant_ids: vec![tenant(0xB2), tenant(0xC3)],
+                }),
+                None,
+                None,
+            )));
+        assert!(outside.diverged);
+        assert_eq!(outside.divergence, DIVERGENCE_DIVERGED);
         let no_key = TenancyRepoExpected::from_read(
             &crate::coord_mcp::RepoExpectationRead::Unknown("nonce_not_live"),
         );

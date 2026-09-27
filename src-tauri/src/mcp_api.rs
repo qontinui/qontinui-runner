@@ -7140,11 +7140,10 @@ async fn coord_mcp_apply_tenant_verdict(
                 expectation.caller_named().cloned(),
             ),
             None => (
-                qontinui_runner_lib::repo_tenant::CwdTenant::Unknown {
-                    reason: "this proxy key has no live binding to carry an expectation \
-                             (a superseded key inside its grace window)"
-                        .to_string(),
-                },
+                qontinui_runner_lib::repo_tenant::CwdTenant::unknown(
+                    "this proxy key has no live binding to carry an expectation \
+                     (a superseded key inside its grace window)",
+                ),
                 None,
             ),
         };
@@ -7162,7 +7161,7 @@ async fn coord_mcp_apply_tenant_verdict(
         {
             warn!(
                 verdict = "mismatch",
-                expected_tenant = %expected.tenant_id,
+                expected_tenant = %expected.label(),
                 expected_source = %expected.source,
                 answered_tenant = ?answered.tenant_id,
                 "coord-mcp proxy: a coord answer came from a different tenant than this \
