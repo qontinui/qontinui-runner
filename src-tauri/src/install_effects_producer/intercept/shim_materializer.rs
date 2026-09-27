@@ -27,6 +27,8 @@ use std::path::{Path, PathBuf};
 
 use qontinui_runner_lib::native_executable::{self, ExecutableFormat, NotExecutable};
 
+use crate::capability_manifest::{CapabilityObservation, Rung};
+
 use super::classify::{self, ShimTool};
 use super::gate::InterceptMode;
 
@@ -613,11 +615,18 @@ enum SessionCliDelivery {
 /// `2026-09-27-qontinui-pr-zero-byte-sidecar-placeholder-published-as-session-cli`).
 /// An absent CLI is the honest state — the command is not found. An absent or
 /// refused binary warns once per process (not per terminal), naming why.
+///
+/// Every outcome is also RECORDED as the capability manifest's `session_cli`
+/// row ([`session_cli_delivery_observation`]), so a running instance reports
+/// what delivery actually did rather than only what a log line said.
 fn materialize_session_cli(dir: &Path) -> SessionCliDelivery {
-    let src = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|d| d.join(SESSION_CLI_BIN)));
+    let exe_dir = current_exe_dir();
+    let src = exe_dir.as_deref().map(|d| d.join(SESSION_CLI_BIN));
     let outcome = deliver_session_cli(src.as_deref(), dir);
+    crate::capability_manifest::record_observation(
+        "session_cli",
+        session_cli_delivery_observation(exe_dir.as_deref(), dir, &outcome),
+    );
     let src_shown = src.as_deref().map_or_else(
         || "<runner exe dir unresolvable>".to_string(),
         |p| p.display().to_string(),
@@ -824,6 +833,223 @@ fn session_cli_retry_due(dir: &Path, now: std::time::Instant) -> bool {
     }
     attempts.push((dir.to_path_buf(), now));
     true
+}
+
+// ---------------------------------------------------------------------------
+// The capability manifest's `session_cli` row (plan
+// `2026-09-27-qontinui-pr-zero-byte-sidecar-placeholder-published-as-session-cli`,
+// Phase 1d). Delivery used to fail SILENTLY — a 0-byte placeholder published
+// as the CLI — so which placement answered, and what was refused, is a value.
+// ---------------------------------------------------------------------------
+
+/// The directory the running exe sits in — where the `qontinui-pr` source is.
+fn current_exe_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+}
+
+/// True when `dir` is a cargo PROFILE dir (`<target>/debug`, `<target>/release`,
+/// `<target>/<triple>/<profile>`): cargo always creates both `deps/` and
+/// `.fingerprint/` there, and an installer's app dir has neither. Requiring
+/// BOTH keeps an app dir that merely ships a `deps` folder from reading as a
+/// dev build.
+fn is_cargo_profile_dir(dir: &Path) -> bool {
+    dir.join("deps").is_dir() && dir.join(".fingerprint").is_dir()
+}
+
+/// Which rung a runnable CLI beside an exe in `exe_dir` answers on, plus a
+/// sentence saying why.
+///
+/// - The exe dir or an ANCESTOR is a cargo profile dir →
+///   [`Rung::ExeRelativeCheckout`]: a dev build, and the CLI is a cargo
+///   artifact of the checkout the exe was built in. The ancestor walk is what
+///   covers a supervisor-started temp runner, whose exe is copied into
+///   `<profile>/runners/<pool>/` — a dir with no `deps/` of its own that is
+///   still a checkout's target dir.
+/// - Otherwise → [`Rung::BundleResource`]: an installed build, and the CLI is
+///   the installer's `bundle.externalBin` sidecar placed beside the exe.
+///
+/// Read-only: two `is_dir` stats per ancestor.
+fn session_cli_placement(exe_dir: &Path) -> (Rung, String) {
+    match exe_dir.ancestors().find(|d| is_cargo_profile_dir(d)) {
+        Some(profile) => (
+            Rung::ExeRelativeCheckout,
+            format!(
+                "the runner exe runs from a cargo target dir (profile dir {}) — a dev \
+                 build, so the CLI is that checkout's cargo artifact",
+                profile.display()
+            ),
+        ),
+        None => (
+            Rung::BundleResource,
+            "the runner exe runs from no cargo target dir — an installed build, so the \
+             CLI is the installer's `bundle.externalBin` sidecar"
+                .to_string(),
+        ),
+    }
+}
+
+/// The `session_cli` observation for the CLI source `src` beside an exe in
+/// `exe_dir`, given the executable check's `verdict` on it. The one mapping the
+/// probe ([`session_cli_observation_in`]) and the delivery recording
+/// ([`session_cli_delivery_observation`]) share, so the two cannot disagree
+/// about what a verdict means.
+///
+/// - runnable → the placement's rung, `resolved_path` = the source;
+/// - absent → [`Rung::Unresolved`], nothing `rejected` (an absent CLI is the
+///   honest state: command-not-found);
+/// - present but refused → [`Rung::Unresolved`], `rejected` naming the path and
+///   the [`NotExecutable`] reason (the 0-byte placeholder class).
+fn session_cli_source_observation(
+    exe_dir: &Path,
+    src: &Path,
+    verdict: Result<u64, NotExecutable>,
+) -> CapabilityObservation {
+    let (rung, placement) = session_cli_placement(exe_dir);
+    match verdict {
+        Ok(len) => CapabilityObservation::new(rung)
+            .with_resolved_path(src.display().to_string())
+            .with_detail(format!(
+                "runnable: {len} bytes, {}; {placement}",
+                ExecutableFormat::host()
+            )),
+        Err(NotExecutable::Missing) => {
+            let remedy = if rung == Rung::ExeRelativeCheckout {
+                "build it with `cargo build --bin qontinui-pr` into that target dir"
+            } else {
+                "the installed bundle is missing its `bundle.externalBin` sidecar"
+            };
+            CapabilityObservation::new(Rung::Unresolved)
+                .with_detail(placement)
+                .with_note(format!(
+                    "no {SESSION_CLI_BIN} beside the runner exe (looked at {}): \
+                     `qontinui-pr` is absent from every runner terminal's PATH, so it \
+                     fails loudly as command-not-found — the honest state, not a \
+                     silent success. To deliver it, {remedy}.",
+                    src.display()
+                ))
+        }
+        Err(why) => CapabilityObservation::new(Rung::Unresolved)
+            .with_rejected(format!("{}: {why}", src.display()))
+            .with_detail(placement)
+            .with_note(format!(
+                "REFUSED: a file is beside the runner exe but it is not a runnable native \
+                 executable, so it is never published onto a terminal's PATH — under Git \
+                 Bash an empty or non-native `qontinui-pr` runs as a shell script and exits \
+                 0 having opened no PR. `qontinui-pr` is absent from every runner \
+                 terminal's PATH until a real {SESSION_CLI_BIN} replaces it."
+            )),
+    }
+}
+
+/// The `session_cli` row, probed READ-ONLY for an exe in `exe_dir`: one stat of
+/// `exe_dir/`[`SESSION_CLI_BIN`] plus at most a 4-byte header read — the very
+/// [`native_executable::check`] delivery applies, and nothing written. The
+/// seam tests drive with a tempdir.
+fn session_cli_observation_in(exe_dir: &Path) -> CapabilityObservation {
+    let src = exe_dir.join(SESSION_CLI_BIN);
+    let verdict = native_executable::check(&src, ExecutableFormat::host());
+    session_cli_source_observation(exe_dir, &src, verdict)
+}
+
+/// The capability manifest's `session_cli` row for THIS process, probed
+/// read-only from the running exe's directory — what
+/// [`crate::capability_manifest::ManifestInputs::observed_here`] reports, and
+/// what `/health`'s `prCredential` hint consults before recommending
+/// `qontinui-pr create`. Never materializes the identity dir it describes.
+pub fn session_cli_observation() -> CapabilityObservation {
+    match current_exe_dir() {
+        Some(exe_dir) => session_cli_observation_in(&exe_dir),
+        None => exe_dir_unresolvable_observation(),
+    }
+}
+
+/// `current_exe()` has no parent: there is no source to deliver from, which is
+/// a finding about the machine (delivery fails the same way), not about the
+/// observer.
+fn exe_dir_unresolvable_observation() -> CapabilityObservation {
+    CapabilityObservation::new(Rung::Unresolved).with_note(format!(
+        "the runner exe's directory could not be resolved (`std::env::current_exe()` \
+         failed or has no parent), so there is no {SESSION_CLI_BIN} source to deliver \
+         and `qontinui-pr` is absent from every runner terminal's PATH"
+    ))
+}
+
+/// What one delivery ACTUALLY did, as the `session_cli` row — recorded by
+/// [`materialize_session_cli`] for every outcome, on the slow path and on each
+/// fast-path re-delivery ([`reconcile_session_cli_if_due`]). The two source
+/// verdicts map exactly as the probe maps them; the rest describe the
+/// PUBLISHED copy, which only a recording can see.
+///
+/// - `Delivered` → the placement's rung, `resolved_path` = the published copy
+///   on PATH (what answers `qontinui-pr` in a terminal). `Delivered` also
+///   covers a runnable copy kept as it was, which says nothing about the
+///   source today — the live probe reports that.
+/// - `DestRefused` → `unresolved`, `rejected` naming the copy STAGED from the
+///   source, which was discarded without replacing anything.
+/// - `Failed` → `unresolved`: an I/O error, not a verdict, retried by a later
+///   spawn at most once per [`SESSION_CLI_RETRY_INTERVAL`] per identity dir.
+fn session_cli_delivery_observation(
+    exe_dir: Option<&Path>,
+    dir: &Path,
+    outcome: &SessionCliDelivery,
+) -> CapabilityObservation {
+    let Some(exe_dir) = exe_dir else {
+        return exe_dir_unresolvable_observation();
+    };
+    let src = exe_dir.join(SESSION_CLI_BIN);
+    let dest = dir.join(SESSION_CLI_BIN);
+    let (rung, placement) = session_cli_placement(exe_dir);
+    let retry = format!(
+        "a later terminal spawn retries (at most once every {}s per identity dir)",
+        SESSION_CLI_RETRY_INTERVAL.as_secs()
+    );
+    match outcome {
+        // Re-reading the published copy gives the row a real length. Should it
+        // have gone bad since, the row says so about THAT file.
+        SessionCliDelivery::Delivered => {
+            match native_executable::check(&dest, ExecutableFormat::host()) {
+                Ok(len) => CapabilityObservation::new(rung)
+                    .with_resolved_path(dest.display().to_string())
+                    .with_detail(format!(
+                        "published on PATH: runnable, {len} bytes, {}; {placement}",
+                        ExecutableFormat::host()
+                    )),
+                Err(why) => CapabilityObservation::new(Rung::Unresolved)
+                    .with_rejected(format!("{}: {why}", dest.display()))
+                    .with_detail(placement)
+                    .with_note(format!(
+                        "the published copy was not a runnable executable when re-read \
+                         after delivery; {retry}"
+                    )),
+            }
+        }
+        SessionCliDelivery::SourceMissing => {
+            session_cli_source_observation(exe_dir, &src, Err(NotExecutable::Missing))
+        }
+        SessionCliDelivery::SourceRefused(why) => {
+            session_cli_source_observation(exe_dir, &src, Err(why.clone()))
+        }
+        SessionCliDelivery::DestRefused(why) => CapabilityObservation::new(Rung::Unresolved)
+            .with_rejected(format!(
+                "copy of {} staged into {}: {why}",
+                src.display(),
+                dir.display()
+            ))
+            .with_detail(placement)
+            .with_note(format!(
+                "the source was sound, but the copy staged from it into the identity dir \
+                 was not a runnable executable (cut short: a full volume, a racing \
+                 writer) and was discarded without replacing anything; {retry}"
+            )),
+        SessionCliDelivery::Failed(detail) => CapabilityObservation::new(Rung::Unresolved)
+            .with_detail(placement)
+            .with_note(format!(
+                "delivery failed ({detail}) — an I/O error, not a verdict: whatever was \
+                 already published is left as it was, and {retry}"
+            )),
+    }
 }
 
 /// Render an identity shim template by substituting its `@@…@@` placeholders.
@@ -2319,5 +2545,237 @@ mod session_cli_tests {
             std::fs::read(dir.join(SESSION_CLI_BIN)).unwrap(),
             native_image()
         );
+    }
+}
+
+/// The capability manifest's `session_cli` row (plan
+/// `2026-09-27-qontinui-pr-zero-byte-sidecar-placeholder-published-as-session-cli`,
+/// Phase 1d). Every test passes its own tempdir as the exe dir, so none reads
+/// the real `qontinui-pr` beside the test executable.
+#[cfg(test)]
+mod session_cli_manifest_tests {
+    use super::session_cli_tests::{native_image, write_executable};
+    use super::*;
+
+    /// A fake cargo PROFILE dir (what `<target>/debug` always holds) under
+    /// `root`, returned.
+    fn cargo_profile_dir(root: &Path) -> PathBuf {
+        let profile = root.join("target").join("debug");
+        std::fs::create_dir_all(profile.join("deps")).unwrap();
+        std::fs::create_dir_all(profile.join(".fingerprint")).unwrap();
+        profile
+    }
+
+    /// An installer-shaped app dir under `root`: no cargo markers anywhere.
+    fn installed_app_dir(root: &Path) -> PathBuf {
+        let app = root.join("Qontinui Runner");
+        std::fs::create_dir_all(&app).unwrap();
+        app
+    }
+
+    /// (a) A runnable CLI beside an exe in a cargo profile dir: the dev
+    /// build's rung, with the source as the resolved path and nothing rejected.
+    #[test]
+    fn session_cli_beside_a_cargo_profile_dir_exe_reads_exe_relative_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = cargo_profile_dir(tmp.path());
+        let cli = profile.join(SESSION_CLI_BIN);
+        write_executable(&cli, &native_image());
+
+        let obs = session_cli_observation_in(&profile);
+        assert_eq!(obs.rung, Rung::ExeRelativeCheckout);
+        assert_eq!(
+            obs.resolved_path.as_deref(),
+            Some(&*cli.display().to_string())
+        );
+        assert_eq!(obs.rejected, None);
+        let detail = obs.detail.expect("detail");
+        assert!(detail.contains("runnable: 64 bytes"), "{detail}");
+        assert!(detail.contains("cargo target dir"), "{detail}");
+    }
+
+    /// (a, temp runner) The supervisor copies a temp runner's exe into
+    /// `<profile>/runners/<pool>/`, a dir with no `deps/` of its own. It is
+    /// still a dev build, found by walking up to the profile dir.
+    #[test]
+    fn session_cli_beside_a_temp_runner_copy_under_a_profile_dir_reads_exe_relative_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = cargo_profile_dir(tmp.path());
+        let pool = profile.join("runners").join("temp-9877");
+        std::fs::create_dir_all(&pool).unwrap();
+        write_executable(&pool.join(SESSION_CLI_BIN), &native_image());
+
+        let obs = session_cli_observation_in(&pool);
+        assert_eq!(obs.rung, Rung::ExeRelativeCheckout);
+        assert!(obs
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains(&*profile.display().to_string())));
+    }
+
+    /// (b) The same CLI beside an exe in an installed app dir: the installer's
+    /// `bundle.externalBin` sidecar, i.e. `bundle_resource`.
+    #[test]
+    fn session_cli_beside_an_installed_exe_reads_bundle_resource() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = installed_app_dir(tmp.path());
+        let cli = app.join(SESSION_CLI_BIN);
+        write_executable(&cli, &native_image());
+
+        let obs = session_cli_observation_in(&app);
+        assert_eq!(obs.rung, Rung::BundleResource);
+        assert_eq!(
+            obs.resolved_path.as_deref(),
+            Some(&*cli.display().to_string())
+        );
+        assert_eq!(obs.rejected, None);
+        assert!(obs
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains("externalBin")));
+    }
+
+    /// (b, markers) A `deps` folder alone does not make an app dir a cargo
+    /// profile dir: both cargo markers are required.
+    #[test]
+    fn session_cli_needs_both_cargo_markers_to_read_as_a_dev_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = installed_app_dir(tmp.path());
+        std::fs::create_dir_all(app.join("deps")).unwrap();
+        write_executable(&app.join(SESSION_CLI_BIN), &native_image());
+        assert_eq!(session_cli_observation_in(&app).rung, Rung::BundleResource);
+    }
+
+    /// (c) THE DEFECT: a 0-byte `qontinui-pr` beside the exe is REFUSED —
+    /// `unresolved`, with `rejected` naming the path and the Empty reason.
+    #[test]
+    fn session_cli_zero_byte_file_is_refused_as_unresolved_naming_empty() {
+        for exe_dir_of in [cargo_profile_dir, installed_app_dir] {
+            let tmp = tempfile::tempdir().unwrap();
+            let exe_dir = exe_dir_of(tmp.path());
+            let cli = exe_dir.join(SESSION_CLI_BIN);
+            write_executable(&cli, b"");
+
+            let obs = session_cli_observation_in(&exe_dir);
+            assert_eq!(obs.rung, Rung::Unresolved);
+            assert_eq!(
+                obs.rejected.as_deref(),
+                Some(&*format!("{}: {}", cli.display(), NotExecutable::Empty)),
+                "the refused file must be named WITH its reason"
+            );
+            assert!(obs.rejected.unwrap().contains("zero-length"));
+            assert_eq!(obs.resolved_path, None, "nothing answered");
+            assert!(obs.note.is_some_and(|n| n.contains("REFUSED")));
+        }
+    }
+
+    /// (d) Absent: `unresolved` with NOTHING rejected — an absent CLI is the
+    /// honest command-not-found state, not a refusal.
+    #[test]
+    fn session_cli_absent_reads_unresolved_with_nothing_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = cargo_profile_dir(tmp.path());
+
+        let obs = session_cli_observation_in(&profile);
+        assert_eq!(obs.rung, Rung::Unresolved);
+        assert_eq!(obs.rejected, None);
+        assert_eq!(obs.resolved_path, None);
+        let note = obs.note.expect("an absent CLI says why and what to do");
+        assert!(note.contains("command-not-found"), "{note}");
+        assert!(note.contains("cargo build --bin qontinui-pr"), "{note}");
+    }
+
+    /// The probe is read-only: it neither creates the CLI nor touches the dir.
+    #[test]
+    fn session_cli_probe_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = installed_app_dir(tmp.path());
+        let _ = session_cli_observation_in(&app);
+        assert_eq!(std::fs::read_dir(&app).unwrap().count(), 0);
+    }
+
+    /// The delivery RECORDING maps the three source verdicts exactly as the
+    /// probe does, and states the two delivery-stage failures only a recording
+    /// can see.
+    #[test]
+    fn session_cli_delivery_recording_states_what_delivery_did() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = cargo_profile_dir(tmp.path());
+        let identity = tmp.path().join("identity");
+        std::fs::create_dir_all(&identity).unwrap();
+        let src = profile.join(SESSION_CLI_BIN);
+        write_executable(&src, &native_image());
+
+        // Delivered: the placement's rung, and the published copy on PATH.
+        let outcome = deliver_session_cli(Some(&src), &identity);
+        assert_eq!(outcome, SessionCliDelivery::Delivered);
+        let obs = session_cli_delivery_observation(Some(&profile), &identity, &outcome);
+        assert_eq!(obs.rung, Rung::ExeRelativeCheckout);
+        assert_eq!(
+            obs.resolved_path.as_deref(),
+            Some(&*identity.join(SESSION_CLI_BIN).display().to_string())
+        );
+        assert!(obs
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains("published on PATH: runnable, 64 bytes")));
+
+        // Delivered, but the published copy went bad before it was re-read:
+        // the row blames THAT file, not the sound source.
+        std::fs::remove_file(identity.join(SESSION_CLI_BIN)).unwrap();
+        write_executable(&identity.join(SESSION_CLI_BIN), b"");
+        let stale = session_cli_delivery_observation(Some(&profile), &identity, &outcome);
+        assert_eq!(stale.rung, Rung::Unresolved);
+        assert!(stale.rejected.is_some_and(|r| r
+            .contains(&*identity.join(SESSION_CLI_BIN).display().to_string())
+            && r.contains("zero-length")));
+
+        // Source verdicts: identical to the probe's mapping.
+        let refused = session_cli_delivery_observation(
+            Some(&profile),
+            &identity,
+            &SessionCliDelivery::SourceRefused(NotExecutable::Empty),
+        );
+        assert_eq!(refused.rung, Rung::Unresolved);
+        assert!(refused.rejected.is_some_and(|r| r.contains("zero-length")));
+        let missing = session_cli_delivery_observation(
+            Some(&profile),
+            &identity,
+            &SessionCliDelivery::SourceMissing,
+        );
+        assert_eq!(missing.rung, Rung::Unresolved);
+        assert_eq!(missing.rejected, None);
+
+        // Delivery-stage failures: the STAGED copy is named, not the sound
+        // source, and a failure says it is retried rather than final.
+        let dest_refused = session_cli_delivery_observation(
+            Some(&profile),
+            &identity,
+            &SessionCliDelivery::DestRefused(NotExecutable::Empty),
+        );
+        assert_eq!(dest_refused.rung, Rung::Unresolved);
+        let rejected = dest_refused.rejected.expect("the staged copy is named");
+        assert!(rejected.starts_with("copy of "), "{rejected}");
+        assert!(
+            rejected.contains(&*format!("staged into {}", identity.display())),
+            "{rejected}"
+        );
+        assert!(rejected.contains("zero-length"), "{rejected}");
+        assert!(dest_refused.note.is_some_and(|n| n.contains("discarded")));
+        let failed = session_cli_delivery_observation(
+            Some(&profile),
+            &identity,
+            &SessionCliDelivery::Failed("copy: disk full".into()),
+        );
+        assert_eq!(failed.rung, Rung::Unresolved);
+        assert_eq!(failed.rejected, None, "an I/O error is not a refusal");
+        assert!(failed.note.is_some_and(|n| n.contains("copy: disk full")
+            && n.contains("retries")
+            && !n.contains("unsealed")));
+
+        // No exe dir at all: nothing to deliver from — a machine finding.
+        let no_exe =
+            session_cli_delivery_observation(None, &identity, &SessionCliDelivery::SourceMissing);
+        assert_eq!(no_exe.rung, Rung::Unresolved);
     }
 }

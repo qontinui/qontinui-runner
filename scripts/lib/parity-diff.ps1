@@ -87,11 +87,13 @@
 # (rendered "n/a"), never 0 -- 0 is a claim, and no claim was earned.
 #
 # =============================================================================
-# THE ALLOWLIST -- WHAT IS ON IT, AND WHY IT IS EMPTY TODAY
+# THE ALLOWLIST -- WHAT IS ON IT, AND WHY
 # =============================================================================
 #
 # Some differences between a debug build and a release build are DESIGNED, not
-# defects. The class is real and named in this repo:
+# defects. Two classes qualify, and only two:
+#
+# (1) CFG-GATED. Real and named in this repo:
 #
 #   mcp/test_fixtures::routes()  #[cfg(any(debug_assertions, feature = "test-fixtures"))]
 #   mcp/debug_wedge::routes()    #[cfg(debug_assertions)]        (/__debug/wedge-ui-thread)
@@ -99,18 +101,34 @@
 # Both are compiled OUT of the published build by construction. A capability
 # resolved by such a module would legitimately answer differently on the two
 # legs, and counting it as a parity defect would put permanent noise into the
-# metric.
-#
-# $ParityExpectedDifferences is therefore a first-class, per-row allowlist -- and
-# measured 2026-09-02 it is EMPTY, because NONE of the CAPABILITY_SPECS rows
-# is resolved by a cfg-gated module:
+# metric. Measured 2026-09-02, NONE of the CAPABILITY_SPECS rows is resolved by
+# a cfg-gated module:
 #
 #   workspace_root  bundled_resources      spec_pages  fleet_commands  fleet_skills
 #   fleet_agents    agent_definitions      agent_commands_registry
-#   agent_skills_registry                  slash_commands
+#   agent_skills_registry                  slash_commands  session_cli
 #
 # and neither debug-only surface above appears in `UI_BRIDGE_ROUTES` either, so
 # the behavioural axis does not see them as a route delta.
+#
+# (2) PLACEMENT-EXCLUSIVE BY CONSTRUCTION: a row whose resolver decides the
+# rung from WHERE THE EXE RUNS, so that each build can answer only its own
+# rung and both rungs are working deliveries. Exactly one row, added
+# 2026-09-27 with it (plan
+# 2026-09-27-qontinui-pr-zero-byte-sidecar-placeholder-published-as-session-cli,
+# Phase 1d):
+#
+#   session_cli  dev 'exe_relative_checkout' -> published 'bundle_resource'
+#
+# `shim_materializer::session_cli_placement` reads `exe_relative_checkout` iff
+# the exe runs inside a cargo profile dir (`deps/` + `.fingerprint/`), which a
+# dev build always does and an installed build never does; otherwise it reads
+# `bundle_resource`. So a working CLI on BOTH legs necessarily differs, and the
+# metric -- "works in dev and NOT in published" -- must not count it. The entry
+# is rung-pinned: a published `unresolved` (the sidecar missing or REFUSED as
+# a 0-byte placeholder) is still a defect, which is the finding the row exists
+# for. bundled_resources is deliberately NOT in this class: its bundle rung can
+# answer on a dev box too, so a dev_checkout reading there is a real difference.
 #
 # An empty allowlist is reported, not assumed: Format-ParityReportText always
 # prints the "Expected differences" section, prints every entry with its reason,
@@ -143,7 +161,17 @@ $script:ParityUnobservedRungs = @('unknown')
 # not every future difference on that row. A blanket per-id allowlist would hide
 # a real regression behind a legitimate one.
 # ---------------------------------------------------------------------------
-$script:ParityExpectedDifferences = @()
+$script:ParityExpectedDifferences = @(
+    [PSCustomObject]@{
+        Id            = 'session_cli'
+        DevRung       = 'exe_relative_checkout'
+        PublishedRung = 'bundle_resource'
+        Reason        = ("placement-exclusive by construction: a dev build runs from a cargo " +
+                         "profile dir and delivers the qontinui-pr it built there, an installed " +
+                         "build delivers its bundle.externalBin sidecar -- both are working " +
+                         "deliveries. A published 'unresolved' is NOT excused.")
+    }
+)
 
 function Get-ParityRowRung {
     param($Row)
@@ -452,10 +480,10 @@ function Format-ParityReportText {
     $L.Add("   be as dishonest as a missing one.")
     $L.Add("")
     if (@($Result.Allowlist).Count -eq 0) {
-        $L.Add("   allowlist: (empty) -- no CAPABILITY_SPECS row is resolved by a cfg-gated")
-        $L.Add("              module, so nothing is excused. The class it exists for is real")
-        $L.Add("              (mcp/test_fixtures, mcp/debug_wedge -- both compiled out of a")
-        $L.Add("              release build); no capability row is resolved by either today.")
+        $L.Add("   allowlist: (empty) -- nothing is excused. The classes it exists for are")
+        $L.Add("              real (cfg-gated modules such as mcp/test_fixtures and")
+        $L.Add("              mcp/debug_wedge, compiled out of a release build; and rows whose")
+        $L.Add("              rung is placement-exclusive by construction).")
     } else {
         foreach ($e in @($Result.Allowlist)) {
             $L.Add(("   allowlist: {0}  dev='{1}' published='{2}'" -f $e.Id, $e.DevRung, $e.PublishedRung))
