@@ -7117,9 +7117,12 @@ async fn coord_mcp_proxy_handler(
 /// `2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant`
 /// Phase 2). See [`crate::coord_mcp_tenant`] for the rules.
 ///
-/// The expectation is the nonce binding's, resolved at most once per binding
-/// (the mint started it in the background; this awaits the same cell, bounded
-/// by the resolver's own budget and never under a lock). A key with no live
+/// The expectation is the nonce binding's. Only a binding's FIRST resolution
+/// is awaited here (the mint usually finished it in the background already;
+/// single-flight, bounded by the resolver's own budget, never under a lock). A
+/// settled answer is returned as is; a transient unknown is returned at once
+/// and, once its retry window has passed, retried in a background task — a
+/// retry never delays a `tools/call`. A key with no live
 /// binding — a superseded key inside its grace window — carries no
 /// expectation, which is UNKNOWN and said, never agreement.
 async fn coord_mcp_apply_tenant_verdict(

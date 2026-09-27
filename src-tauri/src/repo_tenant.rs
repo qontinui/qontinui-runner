@@ -428,6 +428,10 @@ impl<V: Clone> DirCache<V> {
         let fresh = detect().await;
         if cacheable(&fresh) {
             let mut entries = self.entries.write().await;
+            // Prune expired entries on every insert, so directories that are
+            // never asked about again (every spawn's cwd) do not accumulate.
+            let ttl = self.ttl;
+            entries.retain(|_, (at, _)| now.saturating_duration_since(*at) < ttl);
             entries.insert(dir.to_path_buf(), (now, fresh.clone()));
         }
         fresh
@@ -721,6 +725,18 @@ fn display_remote(url: &str) -> String {
     // The userinfo ends at the FIRST `@`, and only when nothing before it is
     // a path (`/`): a later `@` belongs to the path (`host:org/x@v2`), and a
     // path-only remote (`host:org/x@v2` with no user) keeps its `@`.
+    //
+    // A local path — a Windows drive (`C:\…`, `D:/…`) or anything with a
+    // backslash — is not an scp remote at all and carries no userinfo.
+    let bytes = url.as_bytes();
+    let windows_path = url.contains('\\')
+        || (bytes.len() >= 2
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes.get(2).is_none_or(|b| *b == b'/' || *b == b'\\'));
+    if windows_path {
+        return url.to_string();
+    }
     if !url.contains("://") {
         return match url.split_once('@') {
             Some((userinfo, host_path)) if !userinfo.contains('/') => host_path.to_string(),
@@ -808,11 +824,21 @@ where
     let resolve = async {
         // A session's workdir is a DIRECTORY. One that does not exist says
         // nothing about any repo — probing its parent would answer for a
-        // different directory (and could name the enclosing checkout).
-        if !path.is_dir() {
-            return CwdTenant::unknown(format!("workdir does not exist: {}", path.display()));
-        }
+        // different directory (and could name the enclosing checkout). It is
+        // TRANSIENT: a worktree being materialised can appear a moment later.
+        // The stat runs on the blocking pool like the probe (a wedged network
+        // mount must not stall the runtime).
         let dir = path.to_path_buf();
+        let stat_dir = dir.clone();
+        let exists = crate::wedge_diagnostics::spawn_blocking_tracked(move || stat_dir.is_dir())
+            .await
+            .unwrap_or(false);
+        if !exists {
+            return CwdTenant::unknown_transient(format!(
+                "workdir does not exist: {}",
+                path.display()
+            ));
+        }
         let probe = REPO_PROBES
             .lookup(
                 &dir,
@@ -1526,7 +1552,7 @@ mod tests {
         })
         .await;
         assert!(
-            matches!(&t, CwdTenant::Unknown { reason, transient: false }
+            matches!(&t, CwdTenant::Unknown { reason, transient: true }
                 if reason.contains("does not exist")),
             "{t:?}"
         );
@@ -1610,6 +1636,11 @@ mod tests {
             display_remote("example.org:org/x@v2.git"),
             "example.org:org/x@v2.git"
         );
+        assert_eq!(
+            display_remote("C:\\Users\\me@corp\\repo"),
+            "C:\\Users\\me@corp\\repo"
+        );
+        assert_eq!(display_remote("D:/work/me@x/repo"), "D:/work/me@x/repo");
         let https = display_remote("https://u:p@gitlab.com/a/b.git?private_token=s3cret#frag");
         assert!(
             !https.contains("s3cret") && !https.contains("u:p"),

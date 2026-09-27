@@ -205,8 +205,9 @@ pub struct StoredNonceBinding {
     /// Persisted so a restart keeps comparing against the SPAWN-time
     /// expectation rather than re-resolving it. `#[serde(default)]` ⇒ `None`
     /// for every entry written before the field (and for a binding persisted
-    /// before its resolution finished); the restore reads that as
-    /// `Unknown { reason: "restored_without_expectation" }`, never as a guess.
+    /// before its resolution settled); the restore reads that as PENDING and
+    /// re-resolves it from the workdir on first use — never as a guess, and
+    /// never as a frozen unknown. A transient unknown is never written.
     ///
     /// Read LENIENTLY ([`lenient_expected_tenant`]): a value this build cannot
     /// read (a variant from a newer build, after a rollback) becomes `None`,
@@ -222,8 +223,7 @@ pub struct StoredNonceBinding {
 
 /// Deserialize [`StoredNonceBinding::expected_tenant`] without ever failing:
 /// take any JSON value, and keep it only if it reads as a `CwdTenant`. An
-/// unreadable one is `None`, which restores as
-/// `Unknown { reason: "restored_without_expectation" }`.
+/// unreadable one is `None`, which restores as pending (re-resolved).
 fn lenient_expected_tenant<'de, D>(
     deserializer: D,
 ) -> Result<Option<qontinui_runner_lib::repo_tenant::CwdTenant>, D::Error>
@@ -2236,9 +2236,6 @@ mod tests {
         );
     }
 
-    /// The age round-trips as a bare integer (unix seconds), and `0` — the
-    /// "unknown, therefore oldest" sentinel the restore leg re-emits — survives
-    /// a rewrite as `0` rather than being dropped or laundered.
     /// An `expected_tenant` this build cannot read — a variant from a newer
     /// build after a rollback, or a wrong shape — must never fail the store
     /// load: the same file holds the device's access and refresh tokens.
@@ -2275,6 +2272,9 @@ mod tests {
         );
     }
 
+    /// The age round-trips as a bare integer (unix seconds), and `0` — the
+    /// "unknown, therefore oldest" sentinel the restore leg re-emits — survives
+    /// a rewrite as `0` rather than being dropped or laundered.
     #[test]
     fn test_minted_at_unix_round_trips_as_seconds() {
         let v = serde_json::to_value(StoredNonceEntry::Modern(StoredNonceBinding {

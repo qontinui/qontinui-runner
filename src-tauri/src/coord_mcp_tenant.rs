@@ -141,21 +141,55 @@ struct ExpectationState {
     transient: Option<(std::time::Instant, CwdTenant)>,
 }
 
+/// Runs when a binding's expectation SETTLES (first permanent answer) — the
+/// nonce registry uses it to re-persist, so the settled answer reaches the
+/// store however late it lands (mint background task, a retry, a first proxy
+/// call on a restored or adopted binding).
+#[derive(Clone)]
+pub(crate) struct SettleHook(Arc<dyn Fn() + Send + Sync>);
+
+impl SettleHook {
+    pub(crate) fn new(f: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+}
+
+impl std::fmt::Debug for SettleHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SettleHook")
+    }
+}
+
 /// The expectation a nonce carries: the cwd's tenant (resolved off the hot
 /// path) and whether the session's tenant was caller-named.
 ///
-/// The state is SHARED between clones of the binding. The mint kicks off its
-/// resolution in the background; the proxy's calls await the same state behind
-/// a single-flight lock (each attempt bounded by
-/// [`qontinui_runner_lib::repo_tenant::CWD_TENANT_BUDGET`]). A permanent answer
-/// is reached once and frozen; a transient unknown is retried, at most once per
-/// [`TRANSIENT_RETRY_AFTER`].
-#[derive(Debug, Clone, Default)]
+/// The state is SHARED between clones of the binding. A permanent answer is
+/// reached once and frozen. A transient unknown is retried at most once per
+/// retry window — IN THE BACKGROUND: a call that finds a stale transient
+/// answer returns it immediately and, if no attempt is already running,
+/// spawns one. Only the very first resolution of a binding is awaited, behind
+/// a single-flight lock and bounded by
+/// [`qontinui_runner_lib::repo_tenant::CWD_TENANT_BUDGET`].
+#[derive(Debug, Clone)]
 pub(crate) struct SessionExpectation {
     state: Arc<Mutex<ExpectationState>>,
     /// Single-flight: at most one resolution attempt in progress per binding.
     flight: Arc<tokio::sync::Mutex<()>>,
     caller_named: Option<CallerNamed>,
+    on_settle: Option<SettleHook>,
+    retry_after: std::time::Duration,
+}
+
+impl Default for SessionExpectation {
+    fn default() -> Self {
+        Self {
+            state: Arc::default(),
+            flight: Arc::default(),
+            caller_named: None,
+            on_settle: None,
+            retry_after: TRANSIENT_RETRY_AFTER,
+        }
+    }
 }
 
 impl SessionExpectation {
@@ -175,6 +209,18 @@ impl SessionExpectation {
             this.lock().settled = Some(cwd);
         }
         this
+    }
+
+    /// Attach the hook run when this expectation settles.
+    pub(crate) fn with_settle_hook(mut self, hook: SettleHook) -> Self {
+        self.on_settle = Some(hook);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_retry_after(mut self, retry_after: std::time::Duration) -> Self {
+        self.retry_after = retry_after;
+        self
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ExpectationState> {
@@ -205,74 +251,94 @@ impl SessionExpectation {
     /// binding has no usable workdir, which is UNKNOWN — never `NoRepo`.
     pub(crate) async fn resolve(&self, workdir: Option<&str>) -> CwdTenant {
         let workdir = workdir.map(str::to_string);
-        self.resolve_with(std::time::Instant::now(), || async move {
-            resolve_workdir(workdir.as_deref()).await
+        self.resolve_with(move || {
+            let workdir = workdir.clone();
+            async move { resolve_workdir(workdir.as_deref()).await }
         })
         .await
     }
 
-    /// [`Self::resolve`] with the clock and the resolver injected.
-    async fn resolve_with<F, Fut>(&self, now: std::time::Instant, resolver: F) -> CwdTenant
-    where
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = CwdTenant>,
-    {
-        let answered = |s: &ExpectationState| -> Option<CwdTenant> {
-            if let Some(t) = &s.settled {
-                return Some(t.clone());
-            }
-            match &s.transient {
-                Some((at, t)) if now.saturating_duration_since(*at) < TRANSIENT_RETRY_AFTER => {
-                    Some(t.clone())
-                }
-                _ => None,
-            }
-        };
-        // Each guard is taken and dropped within one statement, so no std
-        // guard is ever alive across an `.await`.
-        let hit = answered(&self.lock());
-        if let Some(t) = hit {
-            return t;
-        }
-        let _flight = self.flight.lock().await;
-        // A concurrent caller may have resolved while we waited.
-        let hit = answered(&self.lock());
-        if let Some(t) = hit {
-            return t;
-        }
-        let fresh = resolver().await;
-        {
+    /// Record one resolver answer: transient answers are stamped with the time
+    /// they were REACHED (after the resolver returned), permanent ones settle
+    /// and fire the settle hook — outside the lock.
+    fn store(&self, fresh: &CwdTenant) {
+        let settled_now = {
             let mut s = self.lock();
             if fresh.is_transient() {
-                s.transient = Some((now, fresh.clone()));
+                s.transient = Some((std::time::Instant::now(), fresh.clone()));
+                false
             } else {
+                let first = s.settled.is_none();
                 s.settled = Some(fresh.clone());
                 s.transient = None;
+                first
+            }
+        };
+        if settled_now {
+            if let Some(hook) = &self.on_settle {
+                (hook.0)();
             }
         }
+    }
+
+    /// [`Self::resolve`] with the resolver injected (`make` builds one attempt).
+    async fn resolve_with<F, Fut>(&self, make: F) -> CwdTenant
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = CwdTenant> + Send + 'static,
+    {
+        // (settled, stale transient) — read in one statement, so no std guard
+        // is ever alive across an `.await`.
+        let read = |s: &ExpectationState| -> (Option<CwdTenant>, Option<(bool, CwdTenant)>) {
+            (
+                s.settled.clone(),
+                s.transient
+                    .as_ref()
+                    .map(|(at, t)| (at.elapsed() >= self.retry_after, t.clone())),
+            )
+        };
+        let (settled, transient) = read(&self.lock());
+        if let Some(t) = settled {
+            return t;
+        }
+        if let Some((stale, last)) = transient {
+            // A retry never blocks a caller: the last answer goes back now,
+            // and at most one background attempt runs.
+            if stale {
+                if let Ok(guard) = self.flight.clone().try_lock_owned() {
+                    let this = self.clone();
+                    let attempt = make();
+                    tokio::spawn(async move {
+                        let _guard = guard;
+                        let fresh = attempt.await;
+                        this.store(&fresh);
+                    });
+                }
+            }
+            return last;
+        }
+        // The FIRST resolution of this binding: there is nothing to answer
+        // with yet, so this one is awaited (single flight, bounded).
+        let _flight = self.flight.lock().await;
+        let (settled, transient) = read(&self.lock());
+        if let Some(t) = settled.or(transient.map(|(_, t)| t)) {
+            return t;
+        }
+        let fresh = make().await;
+        self.store(&fresh);
         fresh
     }
 
     /// Start resolving in the background when a runtime is available (the mint
-    /// path), then run `on_resolved` — the mint uses it to re-persist the nonce
-    /// set, so a SETTLED expectation reaches the store instead of the still-empty
-    /// state the mint's own snapshot saw. A transient result is not persisted
-    /// (the callback still runs; the snapshot simply finds nothing settled).
-    /// Without a runtime (a sync unit test) nothing is spawned and the first
-    /// proxy call resolves it.
-    pub(crate) fn spawn_resolution(
-        &self,
-        workdir: Option<&str>,
-        on_resolved: impl FnOnce() + Send + 'static,
-    ) {
+    /// path). A settled answer is persisted by the settle hook. Without a
+    /// runtime (a sync unit test) nothing is spawned and the first proxy call
+    /// resolves it.
+    pub(crate) fn spawn_resolution(&self, workdir: Option<&str>) {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let this = self.clone();
             let workdir = workdir.map(str::to_string);
             handle.spawn(async move {
-                let got = this.resolve(workdir.as_deref()).await;
-                if !got.is_transient() {
-                    on_resolved();
-                }
+                this.resolve(workdir.as_deref()).await;
             });
         }
     }
@@ -307,7 +373,8 @@ pub(crate) struct ExpectedTenant {
 }
 
 impl ExpectedTenant {
-    /// `tenant <id>` or `one of tenants <id>, <id>` — the ids only, since the
+    /// `tenant <id>` or `one of tenants <id>, <id>` — the whole phrase, so no
+    /// caller prefixes its own "tenant". The ids only, since the
     /// repo registry serves no slugs.
     pub(crate) fn label(&self) -> String {
         let ids = self
@@ -317,9 +384,9 @@ impl ExpectedTenant {
             .collect::<Vec<_>>()
             .join(", ");
         if self.tenant_ids.len() == 1 {
-            ids
+            format!("tenant {ids}")
         } else {
-            format!("one of {ids}")
+            format!("one of tenants {ids}")
         }
     }
 }
@@ -479,13 +546,13 @@ pub(crate) fn verdict_notice(
             Some(match &expected.repo {
                 Some(repo) => format!(
                     "TENANT MISMATCH: this answer came from tenant {}. The repo in this \
-                     session's working directory ({repo}) belongs to tenant {expected_label}. \
+                     session's working directory ({repo}) belongs to {expected_label}. \
                      Treat this answer as another project's data.",
                     answered.describe()
                 ),
                 None => format!(
                     "TENANT MISMATCH: this answer came from tenant {}. This session's tenant \
-                     was named explicitly ({}) as tenant {expected_label}. Treat this answer as \
+                     was named explicitly ({}) as {expected_label}. Treat this answer as \
                      another project's data.",
                     answered.describe(),
                     expected.source
@@ -930,7 +997,7 @@ mod tests {
         let v = tenant_verdict(&several, Some(&answered(Some(t(3)), Some("other"))), None);
         let notice = verdict_notice(&v, None).unwrap();
         assert!(
-            notice.contains(&format!("belongs to tenant one of {}, {}", t(1), t(2))),
+            notice.contains(&format!("belongs to one of tenants {}, {}", t(1), t(2))),
             "{notice}"
         );
         assert_eq!(
@@ -1270,64 +1337,119 @@ mod tests {
         }
     }
 
+    /// Wait (bounded) for a background retry to land.
+    async fn eventually(mut done: impl FnMut() -> bool) {
+        for _ in 0..200 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("condition not reached within 2s");
+    }
+
     /// A TRANSIENT unknown is not frozen: it stands for the retry window, is
-    /// retried after it, is never reported as settled (so never persisted),
-    /// and a permanent answer reached on a retry is then frozen for good.
+    /// retried after it IN THE BACKGROUND (the caller gets the stale answer at
+    /// once), is never settled (so never persisted), and a permanent answer
+    /// reached on a retry is frozen for good and fires the settle hook once.
     #[tokio::test]
-    async fn a_transient_unknown_is_retried_after_the_window_and_never_settled() {
-        let e = SessionExpectation::pending(None);
-        let calls = std::sync::atomic::AtomicUsize::new(0);
-        let t0 = std::time::Instant::now();
-        let transient = || {
-            calls.fetch_add(1, Ordering::SeqCst);
-            async { CwdTenant::unknown_transient("coord repo registry unreadable: 503") }
+    async fn a_transient_unknown_is_retried_in_the_background_and_never_settled() {
+        use std::sync::atomic::AtomicUsize;
+        let settles = Arc::new(AtomicUsize::new(0));
+        let hook_count = settles.clone();
+        let e = SessionExpectation::pending(None)
+            .with_retry_after(std::time::Duration::from_millis(50))
+            .with_settle_hook(SettleHook::new(move || {
+                hook_count.fetch_add(1, Ordering::SeqCst);
+            }));
+        let calls = Arc::new(AtomicUsize::new(0));
+        // Transient on the first two attempts, then resolved.
+        let make = {
+            let calls = calls.clone();
+            move || {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n < 2 {
+                        CwdTenant::unknown_transient("coord repo registry unreadable: 503")
+                    } else {
+                        resolved(t(0xA1))
+                    }
+                }
+            }
         };
-        assert!(e.resolve_with(t0, transient).await.is_transient());
+        assert!(e.resolve_with(make.clone()).await.is_transient());
         assert_eq!(e.settled(), None, "a transient unknown is never settled");
-        assert!(e.current().is_some_and(|c| c.is_transient()));
-        // Inside the window: answered from the last attempt, no new attempt.
-        let _ = e
-            .resolve_with(t0 + TRANSIENT_RETRY_AFTER / 2, transient)
-            .await;
+        // Inside the window: the last answer, no new attempt.
+        assert!(e.resolve_with(make.clone()).await.is_transient());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        // Past it: retried, and a permanent answer is frozen.
-        let got = e
-            .resolve_with(t0 + TRANSIENT_RETRY_AFTER, || {
-                calls.fetch_add(1, Ordering::SeqCst);
-                async { resolved(t(0xA1)) }
-            })
-            .await;
-        assert_eq!(got, resolved(t(0xA1)));
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // Past it: the caller STILL gets the stale answer immediately, and a
+        // background attempt runs.
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert!(e.resolve_with(make.clone()).await.is_transient());
+        eventually(|| calls.load(Ordering::SeqCst) == 2).await;
+        eventually(|| e.current().is_some()).await;
+        assert_eq!(e.settled(), None);
+
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        let _ = e.resolve_with(make.clone()).await;
+        eventually(|| e.settled().is_some()).await;
         assert_eq!(e.settled(), Some(resolved(t(0xA1))));
-        // Frozen: never re-resolved, whatever the clock says.
-        let again = e
-            .resolve_with(t0 + TRANSIENT_RETRY_AFTER * 10, || {
-                calls.fetch_add(1, Ordering::SeqCst);
-                async { CwdTenant::NoRepo }
-            })
-            .await;
-        assert_eq!(again, resolved(t(0xA1)));
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            settles.load(Ordering::SeqCst),
+            1,
+            "the hook fires on settling"
+        );
+
+        // Frozen: never re-resolved.
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert_eq!(e.resolve_with(make.clone()).await, resolved(t(0xA1)));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(settles.load(Ordering::SeqCst), 1);
+
         // A transient value handed to `known` (a restore) is not frozen either.
         let restored = SessionExpectation::known(CwdTenant::unknown_transient("x"), None);
         assert_eq!(restored.settled(), None);
     }
 
-    /// Concurrent first calls share ONE resolution (single flight).
+    /// A slow retry never blocks the calls that arrive while it runs.
     #[tokio::test]
-    async fn concurrent_resolutions_are_single_flight() {
+    async fn a_running_retry_does_not_block_concurrent_calls() {
+        let e = SessionExpectation::pending(None)
+            .with_retry_after(std::time::Duration::from_millis(10));
+        let transient = || async { CwdTenant::unknown_transient("git timed out") };
+        let _ = e.resolve_with(transient).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let slow = || async {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            CwdTenant::NoRepo
+        };
+        let started = std::time::Instant::now();
+        for _ in 0..5 {
+            assert!(e.resolve_with(slow).await.is_transient());
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "no caller waited on the running retry"
+        );
+    }
+
+    /// Concurrent FIRST calls share one resolution (single flight).
+    #[tokio::test]
+    async fn concurrent_first_resolutions_are_single_flight() {
         let e = SessionExpectation::pending(None);
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let now = std::time::Instant::now();
         let mut joins = Vec::new();
         for _ in 0..8 {
             let (e, calls) = (e.clone(), calls.clone());
             joins.push(tokio::spawn(async move {
-                e.resolve_with(now, || async move {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                    CwdTenant::NoRepo
+                e.resolve_with(move || {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        CwdTenant::NoRepo
+                    }
                 })
                 .await
             }));
