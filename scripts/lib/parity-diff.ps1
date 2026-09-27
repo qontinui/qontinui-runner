@@ -121,10 +121,11 @@
 #   session_cli  dev 'exe_relative_checkout' -> published 'bundle_resource'
 #
 # `shim_materializer::session_cli_placement` reads `exe_relative_checkout` iff
-# the exe runs inside a cargo profile dir (`deps/` + `.fingerprint/`), which a
-# dev build always does and an installed build never does; otherwise it reads
-# `bundle_resource`. So a working CLI on BOTH legs necessarily differs, and the
-# metric -- "works in dev and NOT in published" -- must not count it. The entry
+# the exe runs inside a cargo profile dir (`deps/` + `.fingerprint/`) OR is a
+# debug build -- the dev leg is both -- and `bundle_resource` for a release
+# build outside any target dir, which is exactly the installed published leg.
+# So a working CLI on BOTH legs necessarily differs, and the metric -- "works
+# in dev and NOT in published" -- must not count it. The entry
 # is rung-pinned: a published `unresolved` (the sidecar missing or REFUSED as
 # a 0-byte placeholder) is still a defect, which is the finding the row exists
 # for. bundled_resources is deliberately NOT in this class: its bundle rung can

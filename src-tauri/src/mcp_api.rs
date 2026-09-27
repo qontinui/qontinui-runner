@@ -289,8 +289,10 @@ fn wait_child_with_timeout(
 /// advertised as the fix (plan
 /// `2026-09-27-qontinui-pr-zero-byte-sidecar-placeholder-published-as-session-cli`,
 /// Phase 1d). Otherwise it names the door that CLI itself calls — this runner's
-/// proxy-nonce-gated loopback `POST /vcs/pull-requests`, coord-brokered — and
-/// `gh pr create` after it. `api_port` is this runner's BOUND port; `None`
+/// loopback `POST /vcs/pull-requests`, coord-brokered — with how to
+/// authenticate it (the session's coord-mcp proxy nonce from its `.mcp.json`,
+/// in the header [`crate::coord_mcp::proxy_nonce_from_request`] reads, kept off
+/// argv), and `gh pr create` after it. `api_port` is this runner's BOUND port; `None`
 /// (no Tauri runtime) names the route without guessing a port.
 fn pr_door_without_personal_login(session_cli_deliverable: bool, api_port: Option<u16>) -> String {
     if session_cli_deliverable {
@@ -301,9 +303,13 @@ fn pr_door_without_personal_login(session_cli_deliverable: bool, api_port: Optio
         None => "this runner's loopback `POST /vcs/pull-requests`".to_string(),
     };
     format!(
-        "`qontinui-pr` is NOT deliverable on this runner (capability-manifest row \
-         `session_cli` is unresolved), so open the PR through {door} (coord-brokered, \
-         proxy-nonce gated, needs no personal login), else `gh pr create`"
+        "`qontinui-pr` is NOT usable on this runner (capability-manifest row \
+         `session_cli` is not resolved), so open the PR through {door} (coord-brokered, \
+         needs no personal login). Authenticate with this session's coord-mcp proxy \
+         nonce — the value in the `coord-mcp` entry's headers in its `.mcp.json` — \
+         sent as `Authorization: Bearer <nonce>` (the legacy \
+         `X-Coord-Mcp-Proxy-Key: <nonce>` also works), and keep the nonce off argv: \
+         write the header to a file and pass `curl -H @<file>`. Else `gh pr create`"
     )
 }
 
@@ -18972,6 +18978,13 @@ mod pr_credential_probe_tests {
         );
         assert!(not.contains("`gh pr create`"), "{not}");
         assert!(not.contains("session_cli"), "{not}");
+        // HOW the door is authenticated, not merely that it is: the header,
+        // where the nonce comes from, and how to keep it off argv.
+        assert!(not.contains("`Authorization: Bearer <nonce>`"), "{not}");
+        assert!(not.contains("`X-Coord-Mcp-Proxy-Key: <nonce>`"), "{not}");
+        assert!(not.contains("`.mcp.json`"), "{not}");
+        assert!(not.contains("`coord-mcp`"), "{not}");
+        assert!(not.contains("curl -H @"), "{not}");
 
         // No bound port known: the route is named without a guessed port.
         let unbound = pr_door_without_personal_login(false, None);
