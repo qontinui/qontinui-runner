@@ -620,7 +620,7 @@ enum SessionCliDelivery {
 /// row ([`session_cli_delivery_observation`]), so a running instance reports
 /// what delivery actually did rather than only what a log line said.
 fn materialize_session_cli(dir: &Path) -> SessionCliDelivery {
-    remove_stale_session_cli_stages(dir, std::process::id());
+    remove_stale_session_cli_stages(dir, std::process::id(), unix_now_secs());
     let exe_dir = current_exe_dir();
     let src = exe_dir.as_deref().map(|d| d.join(SESSION_CLI_BIN));
     let outcome = deliver_session_cli(src.as_deref(), dir);
@@ -716,6 +716,7 @@ fn deliver_session_cli(src: Option<&Path>, dir: &Path) -> SessionCliDelivery {
     }
     let stage = dir.join(session_cli_stage_name(
         std::process::id(),
+        unix_now_secs(),
         SESSION_CLI_STAGE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     ));
     let _ = std::fs::remove_file(&stage);
@@ -748,22 +749,42 @@ fn deliver_session_cli(src: Option<&Path>, dir: &Path) -> SessionCliDelivery {
     SessionCliDelivery::Delivered
 }
 
-/// The hidden name a delivery stages its copy under before renaming it into
-/// place: `.{SESSION_CLI_BIN}.{pid}.{seq}.tmp`. The ONE spelling — the stale
-/// sweep ([`session_cli_stage_pid`]) parses exactly what this writes. Pure.
-fn session_cli_stage_name(pid: u32, seq: u64) -> String {
-    format!(".{SESSION_CLI_BIN}.{pid}.{seq}.tmp")
+/// Seconds since the Unix epoch now; 0 if the clock reads before it.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
-/// The pid in a staging-file name [`session_cli_stage_name`] wrote, or `None`
-/// when `name` is not one. Pure.
-fn session_cli_stage_pid(name: &str) -> Option<u32> {
+/// The hidden name a delivery stages its copy under before renaming it into
+/// place: `.{SESSION_CLI_BIN}.{pid}.{created_secs}.{seq}.tmp`. The ONE spelling
+/// — the stale sweep ([`session_cli_stage_parts`]) parses exactly what this
+/// writes. Pure.
+///
+/// The creation time is IN THE NAME because the file's own mtime cannot say
+/// it: a stage is a hard link to the source (same inode, so the source's
+/// mtime) or a copy (which keeps the source's last-write time), so a stage
+/// made a second ago from a days-old binary reads as days old. Never
+/// `set_modified` a stage instead — through a hard link that rewrites the
+/// source's own mtime, an input to [`identity_build_tag`].
+fn session_cli_stage_name(pid: u32, created_secs: u64, seq: u64) -> String {
+    format!(".{SESSION_CLI_BIN}.{pid}.{created_secs}.{seq}.tmp")
+}
+
+/// `(pid, created_secs)` from a staging-file name [`session_cli_stage_name`]
+/// wrote, or `None` when `name` is not one. Pure.
+fn session_cli_stage_parts(name: &str) -> Option<(u32, u64)> {
     let rest = name
         .strip_prefix(&format!(".{SESSION_CLI_BIN}."))?
         .strip_suffix(".tmp")?;
-    let (pid, seq) = rest.split_once('.')?;
-    seq.parse::<u64>().ok()?;
-    pid.parse().ok()
+    let mut fields = rest.split('.');
+    let pid = fields.next()?.parse().ok()?;
+    let created = fields.next()?.parse().ok()?;
+    fields.next()?.parse::<u64>().ok()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    Some((pid, created))
 }
 
 /// How old another process's staging copy must be before it counts as
@@ -775,37 +796,33 @@ const SESSION_CLI_STAGE_ABANDONED_AFTER: std::time::Duration =
 
 /// Remove the staging copies a delivery in ANOTHER process abandoned in `dir` —
 /// a runner that crashed between the link-or-copy and the rename leaves a
-/// hidden `.qontinui-pr[.exe].<pid>.<n>.tmp` (up to ~24 MB) that nothing else
-/// reaps until the whole dir is swept. Only a stage at least
-/// [`SESSION_CLI_STAGE_ABANDONED_AFTER`] old is removed, so a delivery another
-/// live runner of the same build (same exe, so same dir) is running right now
-/// is never cut short. `own_pid`'s stages are left alone: they belong to a
-/// delivery this process may be running.
+/// hidden `.qontinui-pr[.exe].<pid>.<created>.<n>.tmp` (up to ~24 MB) that
+/// nothing else reaps until the whole dir is swept. Only a stage whose NAMED
+/// creation time is at least [`SESSION_CLI_STAGE_ABANDONED_AFTER`] before
+/// `now_secs` is removed (never its mtime: see [`session_cli_stage_name`]), so
+/// a delivery another live runner of the same build (same exe, so same dir) is
+/// running right now is never cut short. A stage named in the future (a clock
+/// step) reads as fresh and stays. `own_pid`'s stages are left alone: they
+/// belong to a delivery this process may be running.
 ///
 /// Called by [`materialize_session_cli`], so on the slow path and on every
 /// fast-path re-delivery, and always under [`IDENTITY_MATERIALIZE_LOCK`] —
 /// which serialises this process's own deliveries. Errors are ignored: a file
 /// another process holds open, or one whose age cannot be read, simply stays
 /// for the next attempt.
-fn remove_stale_session_cli_stages(dir: &Path, own_pid: u32) {
+fn remove_stale_session_cli_stages(dir: &Path, own_pid: u32, now_secs: u64) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let Some(pid) = name.to_str().and_then(session_cli_stage_pid) else {
+        let Some((pid, created)) = name.to_str().and_then(session_cli_stage_parts) else {
             continue;
         };
         if pid == own_pid {
             continue;
         }
-        let abandoned = entry
-            .metadata()
-            .ok()
-            .and_then(|md| md.modified().ok())
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age >= SESSION_CLI_STAGE_ABANDONED_AFTER);
-        if abandoned {
+        if now_secs.saturating_sub(created) >= SESSION_CLI_STAGE_ABANDONED_AFTER.as_secs() {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -1197,6 +1214,14 @@ fn session_cli_row(
 /// `std::env::temp_dir()` — the SAME base the terminal spawn seam
 /// (`terminal::session`, `materialize_identity(&std::env::temp_dir())`) uses,
 /// so the row names the file a terminal of this build actually runs.
+///
+/// One limit, on the COLD `--capability-manifest` door only: the dir's name is
+/// [`identity_build_tag`], which each process computes once, from the source's
+/// size and mtime at that moment. A cold process started after the source
+/// changed computes a different tag than the running runner did, finds no dir,
+/// and reports the source instead of the published copy. The running
+/// instance's `GET /capability-manifest` and `/health` share its tag, so they
+/// read the right dir.
 pub fn session_cli_observation() -> CapabilityObservation {
     session_cli_row(
         identity_dir_if_materialized(&std::env::temp_dir()).as_deref(),
@@ -2803,20 +2828,21 @@ mod session_cli_tests {
     #[test]
     fn session_cli_stage_names_round_trip_and_nothing_else_parses() {
         assert_eq!(
-            session_cli_stage_pid(&session_cli_stage_name(4242, 7)),
-            Some(4242)
+            session_cli_stage_parts(&session_cli_stage_name(4242, 1_790_000_000, 7)),
+            Some((4242, 1_790_000_000))
         );
         for not_a_stage in [
             SESSION_CLI_BIN.to_string(),
             IDENTITY_MARKER.to_string(),
             "claude".to_string(),
-            format!("{SESSION_CLI_BIN}.12.3.tmp"),
-            format!(".{SESSION_CLI_BIN}.12.tmp"),
-            format!(".{SESSION_CLI_BIN}.abc.3.tmp"),
-            format!(".{SESSION_CLI_BIN}.12.3.4.tmp"),
-            format!(".{SESSION_CLI_BIN}.12.3.tmp.bak"),
+            format!("{SESSION_CLI_BIN}.12.5.3.tmp"),
+            format!(".{SESSION_CLI_BIN}.12.3.tmp"),
+            format!(".{SESSION_CLI_BIN}.abc.5.3.tmp"),
+            format!(".{SESSION_CLI_BIN}.12.x.3.tmp"),
+            format!(".{SESSION_CLI_BIN}.12.5.3.4.tmp"),
+            format!(".{SESSION_CLI_BIN}.12.5.3.tmp.bak"),
         ] {
-            assert_eq!(session_cli_stage_pid(&not_a_stage), None, "{not_a_stage}");
+            assert_eq!(session_cli_stage_parts(&not_a_stage), None, "{not_a_stage}");
         }
     }
 
@@ -2835,25 +2861,52 @@ mod session_cli_tests {
     /// and the rename) is removed. A FRESH stage of another process may be a
     /// live runner's delivery in flight and stays, as do this process's own
     /// stages, the published CLI and every other file.
+    ///
+    /// The in-flight stage is made the way delivery makes one — a hard link
+    /// to (or copy of) a source whose mtime is days old — because that is
+    /// what made an mtime-based age reap live deliveries: the stage inherits
+    /// the source's mtime.
     #[test]
     fn stale_stages_of_other_processes_are_removed_and_ours_are_kept() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path();
+        let dir = tmp.path().join("identity");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.as_path();
+        let now = unix_now_secs();
+        let old_secs = SESSION_CLI_STAGE_ABANDONED_AFTER.as_secs() + 60;
         let own = std::process::id();
-        let abandoned = dir.join(session_cli_stage_name(own.wrapping_add(1), 0));
-        let in_flight = dir.join(session_cli_stage_name(own.wrapping_add(2), 0));
-        let ours = dir.join(session_cli_stage_name(own, 0));
+
+        let old_source = tmp.path().join("old-source");
+        write_executable(&old_source, &native_image());
+        age(&old_source, 3 * 24 * 3600);
+
+        let abandoned = dir.join(session_cli_stage_name(
+            own.wrapping_add(1),
+            now - old_secs,
+            0,
+        ));
+        let in_flight = dir.join(session_cli_stage_name(own.wrapping_add(2), now, 0));
+        let ours = dir.join(session_cli_stage_name(own, now - old_secs, 0));
         let cli = dir.join(SESSION_CLI_BIN);
         let unrelated = dir.join("claude");
-        for f in [&abandoned, &in_flight, &ours, &cli, &unrelated] {
+        for f in [&abandoned, &ours, &cli, &unrelated] {
             write_executable(f, &native_image());
         }
-        let old = SESSION_CLI_STAGE_ABANDONED_AFTER.as_secs() + 60;
-        for f in [&abandoned, &ours, &cli, &unrelated] {
-            age(f, old);
+        if std::fs::hard_link(&old_source, &in_flight).is_err() {
+            std::fs::copy(&old_source, &in_flight).unwrap();
         }
+        let in_flight_age = std::fs::metadata(&in_flight)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .elapsed()
+            .unwrap();
+        assert!(
+            in_flight_age >= SESSION_CLI_STAGE_ABANDONED_AFTER,
+            "fixture: a fresh stage of an old source must read OLD by mtime"
+        );
 
-        remove_stale_session_cli_stages(dir, own);
+        remove_stale_session_cli_stages(dir, own, now);
 
         assert!(
             !abandoned.exists(),
@@ -2876,10 +2929,10 @@ mod session_cli_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let foreign = dir.join(session_cli_stage_name(
             std::process::id().wrapping_add(1),
+            unix_now_secs() - (SESSION_CLI_STAGE_ABANDONED_AFTER.as_secs() + 60),
             9,
         ));
         std::fs::write(&foreign, native_image()).unwrap();
-        age(&foreign, SESSION_CLI_STAGE_ABANDONED_AFTER.as_secs() + 60);
 
         materialize_identity(tmp.path()).expect("the terminal still gets its dir");
 

@@ -306,8 +306,10 @@ fn pr_door_without_personal_login(session_cli_deliverable: bool, api_port: Optio
         "`qontinui-pr` is NOT usable on this runner (capability-manifest row \
          `session_cli` is not resolved), so open the PR through {door} (coord-brokered, \
          needs no personal login). Authenticate with this session's coord-mcp proxy \
-         nonce — the value in the `coord-mcp` entry's headers in its `.mcp.json` — \
-         sent as `Authorization: Bearer <nonce>` (the legacy \
+         nonce. It is in the `coord-mcp` entry of its `.mcp.json`: in that entry's \
+         `headers` on the http shape, or on the stdio shape in the credential file \
+         named after `--credential` in the entry's `args` (qontinui-claude-config's \
+         `coord-revive.sh` resolves both). Send it as `Authorization: Bearer <nonce>` (the legacy \
          `X-Coord-Mcp-Proxy-Key: <nonce>` also works), and keep the nonce off argv: \
          write the header to a file and pass `curl -H @<file>`. Else `gh pr create`"
     )
@@ -18984,6 +18986,10 @@ mod pr_credential_probe_tests {
         assert!(not.contains("`X-Coord-Mcp-Proxy-Key: <nonce>`"), "{not}");
         assert!(not.contains("`.mcp.json`"), "{not}");
         assert!(not.contains("`coord-mcp`"), "{not}");
+        // Both shapes the runner writes: inline headers (http) and the
+        // credential file a stdio entry names (`--credential <file>`).
+        assert!(not.contains("`headers`"), "{not}");
+        assert!(not.contains("`--credential`"), "{not}");
         assert!(not.contains("curl -H @"), "{not}");
 
         // No bound port known: the route is named without a guessed port.
