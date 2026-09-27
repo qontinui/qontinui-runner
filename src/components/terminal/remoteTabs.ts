@@ -326,3 +326,124 @@ export function applyAttachWaiting(
   }
   return { ...prev, [w.sessionId]: w };
 }
+
+// ---------------------------------------------------------------------------
+// Remote interactivity footer (plan
+// `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`, A1)
+// ---------------------------------------------------------------------------
+
+/**
+ * How long a keystroke may go unacknowledged before the footer says so. The
+ * wire contract's `INPUT_ACK_DEADLINE` (5 s).
+ */
+export const INPUT_ACK_DEADLINE_MS = 5_000;
+
+/**
+ * `terminal_remote_interactivity`'s payload (Rust `RemoteInteractivity`,
+ * camelCase). Every timestamp is epoch ms on THIS machine's clock.
+ */
+export interface RemoteInteractivitySnapshot {
+  attachedAtMs: number;
+  lastInputSent: { seq: number; atMs: number; bytes: number } | null;
+  lastInputAcked: {
+    seq: number | null;
+    atMs: number;
+    bytes: number;
+    accepted: boolean;
+    error: string | null;
+    via: string;
+    targetAcceptedAt: string | null;
+  } | null;
+  /** Acks received over this pane's life, accepted or not. */
+  acksReceived: number;
+  /** Acks since the current attachment (reset on reattach). */
+  acksSinceAttach: number;
+  /** The last write probe queued — never a keystroke. */
+  lastProbeSent: { seq: number; atMs: number; bytes: number } | null;
+  lastFrameReceived: { atMs: number; throughOffset: number } | null;
+}
+
+export interface RemoteInteractivityFooter {
+  /** "last output received 3s ago · last keystroke accepted 1s ago". */
+  summary: string;
+  /** An inline note that needs the operator's eye, or null. */
+  note: string | null;
+  /** `warning`: input is not getting through. `info`: an honest unknown. */
+  noteKind: "warning" | "info" | null;
+}
+
+function agoLabel(atMs: number, nowMs: number): string {
+  const secs = Math.max(0, Math.floor((nowMs - atMs) / 1000));
+  if (secs < 60) return `${secs}s ago`;
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins}m ago`;
+  return `${Math.floor(mins / 60)}h ago`;
+}
+
+/**
+ * Is the newest keystroke this pane sent still waiting for its ack? Compared by
+ * `seq` when the ack carries one; by arrival order when a relay dropped it.
+ */
+export function inputAwaitingAck(s: RemoteInteractivitySnapshot): boolean {
+  const sent = s.lastInputSent;
+  if (!sent) return false;
+  const ack = s.lastInputAcked;
+  if (!ack) return true;
+  if (ack.seq !== null) return ack.seq < sent.seq;
+  return ack.atMs < sent.atMs;
+}
+
+/**
+ * The footer for a remote tab, derived only from what the pane observed.
+ *
+ * - Before any input: "no input sent yet" — never an implied success.
+ * - A refused ack is shown with the target's code.
+ * - An unacked keystroke past {@link INPUT_ACK_DEADLINE_MS} is "input not
+ *   acknowledged by <device>" — UNLESS this attachment has never received an
+ *   ack at all, which is what a target predating acknowledgements looks like;
+ *   that is said as such, and is not rendered as a failure forever.
+ */
+export function remoteInteractivityFooter(
+  s: RemoteInteractivitySnapshot,
+  nowMs: number,
+  deviceLabel: string,
+): RemoteInteractivityFooter {
+  const read = s.lastFrameReceived
+    ? `last output received ${agoLabel(s.lastFrameReceived.atMs, nowMs)}`
+    : "no output yet";
+
+  const ack = s.lastInputAcked;
+  let write: string;
+  if (!s.lastInputSent && !ack) {
+    write = "no input sent yet";
+  } else if (ack && ack.accepted) {
+    write =
+      ack.via === "probe"
+        ? `input path probed ${agoLabel(ack.atMs, nowMs)}`
+        : `last keystroke accepted ${agoLabel(ack.atMs, nowMs)}`;
+  } else if (ack) {
+    write = `last keystroke rejected ${agoLabel(ack.atMs, nowMs)}`;
+  } else {
+    write = "keystrokes sent, none acknowledged yet";
+  }
+
+  let note: string | null = null;
+  let noteKind: RemoteInteractivityFooter["noteKind"] = null;
+  const pending = inputAwaitingAck(s);
+  const overdue =
+    pending && s.lastInputSent !== null && nowMs - s.lastInputSent.atMs >= INPUT_ACK_DEADLINE_MS;
+  if (ack && !ack.accepted && !pending) {
+    note = `input rejected by ${deviceLabel}: ${ack.error ?? "unknown error"}`;
+    noteKind = "warning";
+  } else if (overdue && s.acksReceived === 0) {
+    note = "target does not acknowledge input (older build)";
+    noteKind = "info";
+  } else if (overdue) {
+    note = `input not acknowledged by ${deviceLabel}`;
+    noteKind = "warning";
+  } else if (ack && !ack.accepted) {
+    note = `input rejected by ${deviceLabel}: ${ack.error ?? "unknown error"}`;
+    noteKind = "warning";
+  }
+  return { summary: `${read} · ${write}`, note, noteKind };
+}
