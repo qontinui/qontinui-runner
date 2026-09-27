@@ -1,14 +1,9 @@
-//! Is this file a real native executable image? The ONE definition, shared by
-//! the two places that decide whether a binary may be handed on:
-//!
-//! - `build.rs` (`scope_external_bin_to_real_sidecars`), which decides which
-//!   `bundle.externalBin` sidecars `tauri_build` may copy into the cargo target
-//!   dir. It includes this file with `#[path]` in its build-script compile and
-//!   `use`s this module in its test compile, so there is no second copy.
-//! - the identity-shim materializer
-//!   (`install_effects_producer::intercept::shim_materializer`), which decides
-//!   whether the `qontinui-pr` session CLI beside the runner exe may be
-//!   published onto every runner terminal's PATH.
+//! Is this file a real native executable image? The ONE definition of "a binary
+//! the OS loader will actually run", used wherever the runner is about to hand
+//! a binary on — today the identity-shim materializer
+//! (`install_effects_producer::intercept::shim_materializer`), which decides
+//! whether the `qontinui-pr` session CLI and the `qontinui-shim` stub beside the
+//! runner exe may be published onto every runner terminal's PATH.
 //!
 //! WHY a format check and not just `len() > 0`: the defect this closes
 //! (plan `2026-09-27-qontinui-pr-zero-byte-sidecar-placeholder-published-as-session-cli`,
@@ -18,9 +13,6 @@
 //! `qontinui-pr create` exited 0 having opened no PR. A non-empty text
 //! placeholder would do the same with extra steps. Only a file carrying the
 //! platform's executable magic is something the OS loader will actually run.
-//!
-//! Plain `std` only: this file is compiled into the build script, which cannot
-//! see the crate's dependencies.
 
 use std::io::Read;
 use std::path::Path;
@@ -43,19 +35,6 @@ impl ExecutableFormat {
         if cfg!(windows) {
             Self::Pe
         } else if cfg!(target_vendor = "apple") {
-            Self::MachO
-        } else {
-            Self::Elf
-        }
-    }
-
-    /// The format a cargo `TARGET` triple produces — what `build.rs` may let
-    /// `tauri_build` copy. Keyed on the triple, never on the build HOST, so a
-    /// cross-compile judges the sidecar by the platform it will run on.
-    pub fn for_target_triple(triple: &str) -> Self {
-        if triple.contains("windows") {
-            Self::Pe
-        } else if triple.contains("apple") {
             Self::MachO
         } else {
             Self::Elf
@@ -232,31 +211,6 @@ mod tests {
         ] {
             assert!(!f.matches(b"#!/bin/sh\nexit 0\n"), "{f:?}");
         }
-    }
-
-    #[test]
-    fn target_triples_map_to_the_format_that_platform_runs() {
-        use ExecutableFormat::*;
-        assert_eq!(
-            ExecutableFormat::for_target_triple("x86_64-pc-windows-msvc"),
-            Pe
-        );
-        assert_eq!(
-            ExecutableFormat::for_target_triple("aarch64-pc-windows-msvc"),
-            Pe
-        );
-        assert_eq!(
-            ExecutableFormat::for_target_triple("x86_64-unknown-linux-gnu"),
-            Elf
-        );
-        assert_eq!(
-            ExecutableFormat::for_target_triple("aarch64-apple-darwin"),
-            MachO
-        );
-        assert_eq!(
-            ExecutableFormat::for_target_triple("x86_64-apple-darwin"),
-            MachO
-        );
     }
 
     #[test]

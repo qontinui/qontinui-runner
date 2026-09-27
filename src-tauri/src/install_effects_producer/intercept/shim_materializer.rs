@@ -375,7 +375,23 @@ pub fn materialize_identity(base_dir: &Path) -> Option<PathBuf> {
     // qontinui-pr-credential-provisioning, Phase 2b) onto the same always-on
     // PATH dir. Best-effort, fail-open: an absent/uncopyable binary never
     // breaks the terminal — the identity dir still materializes.
-    materialize_session_cli(&dir);
+    let cli = materialize_session_cli(&dir);
+
+    // A TRANSIENT delivery failure (an I/O error — an AV lock, a racing
+    // writer — rather than a definite "not a binary" verdict) must not seal
+    // the dir: the marker is what turns every later spawn into the fast path,
+    // so writing it now would leave the CLI missing for the whole life of this
+    // build. Leave the marker unwritten and the next spawn retries.
+    if !session_cli_outcome_seals_the_dir(&cli) {
+        tracing::warn!(
+            dir = %dir.display(),
+            outcome = ?cli,
+            "session cli: transient delivery failure — leaving the identity dir unsealed so \
+             the next spawn retries"
+        );
+        maybe_sweep_stale(base_dir);
+        return Some(dir);
+    }
 
     // The marker goes LAST and is what makes the fast path safe: a crash
     // part-way through the writes above leaves no marker, so the next spawn
@@ -678,14 +694,37 @@ fn deliver_session_cli(src: Option<&Path>, dir: &Path) -> SessionCliDelivery {
     SessionCliDelivery::Delivered
 }
 
+/// Whether a delivery outcome is FINAL enough to seal the identity dir (write
+/// its completion marker). Everything is, except a failure caused by an I/O
+/// error rather than a verdict: `Failed`, or a refusal whose reason is
+/// `Unreadable`. Those may clear on the next spawn, and a sealed dir never
+/// retries. Pure.
+fn session_cli_outcome_seals_the_dir(outcome: &SessionCliDelivery) -> bool {
+    !matches!(
+        outcome,
+        SessionCliDelivery::Failed(_)
+            | SessionCliDelivery::SourceRefused(NotExecutable::Unreadable(_))
+            | SessionCliDelivery::DestRefused(NotExecutable::Unreadable(_))
+    )
+}
+
 /// Keep the published session CLI publishable for the life of an identity
 /// dir, not only at the moment it was written. Returns `None` when there was
 /// nothing to repair (a sound CLI, or none), else the re-delivery's outcome.
 ///
-/// A dir whose marker exists is served by [`materialize_identity`]'s fast path
-/// with no rewrite at all, so without this a 0-byte `qontinui-pr` it once
-/// received would stay on every terminal's PATH forever. Repair = remove it
-/// and re-deliver only a validated source; an absent CLI is left absent.
+/// DEFENSE IN DEPTH, and stated precisely so nobody over-reads it: this build
+/// never seals a dir holding an unpublishable CLI itself — delivery validates
+/// the landed copy before the marker is written — and a dir from a PRE-fix
+/// build is never reused, because the dir's name is a tag over the runner
+/// exe's and the CLI source's size+mtime ([`identity_build_tag`]). What this
+/// re-check guards is a CLI that goes bad AFTER delivery: an in-place
+/// truncation written through a hard link shared with the source, AV or
+/// tamper damage, or a future change to the tag's inputs. A dir whose marker
+/// exists is served by [`materialize_identity`]'s fast path with no rewrite at
+/// all, so without this such a file would stay on every terminal's PATH for
+/// the life of the build. Repair = remove it and re-deliver only a validated
+/// source; an absent CLI is left absent. Cost: one stat per spawn, plus a
+/// 4-byte header read when the file is present.
 fn repair_session_cli_if_unpublishable(dir: &Path) -> Option<SessionCliDelivery> {
     let dest = dir.join(SESSION_CLI_BIN);
     let unpublishable = |dest: &Path| match native_executable::check(dest, ExecutableFormat::host())
@@ -2028,5 +2067,48 @@ mod session_cli_tests {
                 "the fast path kept publishing a 0-byte {SESSION_CLI_BIN} on PATH"
             ),
         }
+    }
+
+    #[test]
+    fn only_a_transient_failure_leaves_the_dir_unsealed() {
+        use SessionCliDelivery as D;
+        // Verdicts seal: re-running delivery would decide the same thing.
+        assert!(session_cli_outcome_seals_the_dir(&D::Delivered));
+        assert!(session_cli_outcome_seals_the_dir(&D::SourceMissing));
+        assert!(session_cli_outcome_seals_the_dir(&D::SourceRefused(
+            NotExecutable::Empty
+        )));
+        assert!(session_cli_outcome_seals_the_dir(&D::DestRefused(
+            NotExecutable::Empty
+        )));
+        // I/O errors do not: the next spawn must be allowed to retry.
+        assert!(!session_cli_outcome_seals_the_dir(&D::Failed(
+            "copy: disk full".into()
+        )));
+        assert!(!session_cli_outcome_seals_the_dir(&D::SourceRefused(
+            NotExecutable::Unreadable("sharing violation".into())
+        )));
+        assert!(!session_cli_outcome_seals_the_dir(&D::DestRefused(
+            NotExecutable::Unreadable("sharing violation".into())
+        )));
+    }
+
+    #[test]
+    fn a_transient_delivery_failure_does_not_seal_the_identity_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Make delivery fail on I/O: a DIRECTORY where the CLI goes cannot be
+        // removed with remove_file, so the delivery ends `Failed`.
+        let dir = identity_dir(tmp.path());
+        std::fs::create_dir_all(dir.join(SESSION_CLI_BIN)).unwrap();
+
+        let got = materialize_identity(tmp.path()).expect("the terminal still gets its dir");
+        assert_eq!(got, dir);
+        for tool in IDENTITY_TOOLS {
+            assert!(dir.join(tool).is_file(), "{tool} shim still written");
+        }
+        assert!(
+            !dir.join(IDENTITY_MARKER).exists(),
+            "a transient failure must leave the dir unsealed so the next spawn retries"
+        );
     }
 }
