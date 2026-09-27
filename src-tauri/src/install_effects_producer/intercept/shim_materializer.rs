@@ -766,19 +766,27 @@ fn session_cli_stage_pid(name: &str) -> Option<u32> {
     pid.parse().ok()
 }
 
-/// Remove the staging copies a delivery in ANOTHER process left in `dir` — a
-/// runner that crashed between the link-or-copy and the rename leaves a hidden
-/// `.qontinui-pr[.exe].<pid>.<n>.tmp` (up to ~24 MB) that nothing else reaps
-/// until the whole dir is swept. `own_pid`'s stages are left alone: they
-/// belong to a delivery this process may be running.
+/// How old another process's staging copy must be before it counts as
+/// abandoned. A live delivery links or copies and then renames within seconds,
+/// so an older stage is a crashed delivery's. A younger one may belong to a
+/// second live runner of the same build sharing the dir, and is left for it.
+const SESSION_CLI_STAGE_ABANDONED_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(10 * 60);
+
+/// Remove the staging copies a delivery in ANOTHER process abandoned in `dir` —
+/// a runner that crashed between the link-or-copy and the rename leaves a
+/// hidden `.qontinui-pr[.exe].<pid>.<n>.tmp` (up to ~24 MB) that nothing else
+/// reaps until the whole dir is swept. Only a stage at least
+/// [`SESSION_CLI_STAGE_ABANDONED_AFTER`] old is removed, so a delivery another
+/// live runner of the same build (same exe, so same dir) is running right now
+/// is never cut short. `own_pid`'s stages are left alone: they belong to a
+/// delivery this process may be running.
 ///
 /// Called by [`materialize_session_cli`], so on the slow path and on every
 /// fast-path re-delivery, and always under [`IDENTITY_MATERIALIZE_LOCK`] —
-/// which serialises this process's own deliveries. A stage of a DIFFERENT live
-/// runner process sharing the dir (same exe, so same build tag) can be removed
-/// mid-delivery; its rename then fails and that process retries a minute later,
-/// which is the cheap side of the trade. Errors are ignored: a file another
-/// process holds open simply stays for the next attempt.
+/// which serialises this process's own deliveries. Errors are ignored: a file
+/// another process holds open, or one whose age cannot be read, simply stays
+/// for the next attempt.
 fn remove_stale_session_cli_stages(dir: &Path, own_pid: u32) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -788,7 +796,16 @@ fn remove_stale_session_cli_stages(dir: &Path, own_pid: u32) {
         let Some(pid) = name.to_str().and_then(session_cli_stage_pid) else {
             continue;
         };
-        if pid != own_pid {
+        if pid == own_pid {
+            continue;
+        }
+        let abandoned = entry
+            .metadata()
+            .ok()
+            .and_then(|md| md.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= SESSION_CLI_STAGE_ABANDONED_AFTER);
+        if abandoned {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -2803,25 +2820,49 @@ mod session_cli_tests {
         }
     }
 
-    /// A stage another process left behind (a crash between the link-or-copy
-    /// and the rename) is removed; this process's own stages, the published
-    /// CLI and every other file are left alone.
+    /// Backdate `path`'s mtime by `secs`.
+    fn age(path: &Path, secs: u64) {
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    /// A stage another process abandoned (a crash between the link-or-copy
+    /// and the rename) is removed. A FRESH stage of another process may be a
+    /// live runner's delivery in flight and stays, as do this process's own
+    /// stages, the published CLI and every other file.
     #[test]
     fn stale_stages_of_other_processes_are_removed_and_ours_are_kept() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         let own = std::process::id();
-        let foreign = dir.join(session_cli_stage_name(own.wrapping_add(1), 0));
+        let abandoned = dir.join(session_cli_stage_name(own.wrapping_add(1), 0));
+        let in_flight = dir.join(session_cli_stage_name(own.wrapping_add(2), 0));
         let ours = dir.join(session_cli_stage_name(own, 0));
         let cli = dir.join(SESSION_CLI_BIN);
         let unrelated = dir.join("claude");
-        for f in [&foreign, &ours, &cli, &unrelated] {
+        for f in [&abandoned, &in_flight, &ours, &cli, &unrelated] {
             write_executable(f, &native_image());
+        }
+        let old = SESSION_CLI_STAGE_ABANDONED_AFTER.as_secs() + 60;
+        for f in [&abandoned, &ours, &cli, &unrelated] {
+            age(f, old);
         }
 
         remove_stale_session_cli_stages(dir, own);
 
-        assert!(!foreign.exists(), "a dead delivery's stage must be reaped");
+        assert!(
+            !abandoned.exists(),
+            "a dead delivery's stage must be reaped"
+        );
+        assert!(
+            in_flight.exists(),
+            "a fresh stage may be another live runner's delivery in flight"
+        );
         assert!(ours.exists(), "a stage this process may be using stays");
         assert!(cli.exists(), "the published CLI is never touched");
         assert!(unrelated.exists(), "nothing that is not a stage is touched");
@@ -2838,6 +2879,7 @@ mod session_cli_tests {
             9,
         ));
         std::fs::write(&foreign, native_image()).unwrap();
+        age(&foreign, SESSION_CLI_STAGE_ABANDONED_AFTER.as_secs() + 60);
 
         materialize_identity(tmp.path()).expect("the terminal still gets its dir");
 
