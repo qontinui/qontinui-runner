@@ -280,7 +280,7 @@ Tokens, in the runner's order (full contract in `runner-development.md` →
 |---|---|
 | `served-corpus` | canonical path of `<workdir>/.claude` (symlinks resolved) |
 | `checkout` | the git checkout holding it: branch@sha, `upstream=` (the LOCAL remote-tracking ref measured against), `behind`/`ahead` of it, `as-of` (the newer of that ref's last `FETCH_HEAD` and its newest reflog entry), and `dirty-claude` (tracked entries only); `none (not a git work tree)` is a stated non-checkout |
-| `bundle` | `<N>/<M> identical-to-build <gitSha> stamped=<k> stamped-tracked=<t> dirty-bundle=<d> served: canonical@<sha12> <c> fetched <rfc3339>, builtin <b>, account <a>, unstamped <u>; identical-to-source <i>/<v> unverifiable=<x>`: how many of the M files the spawning binary carries match the disk copy; how many disk copies carry a `qontinui-provenance:` stamp; how many of those stamped files git tracks (`stamped-tracked`); how many bundle-roster paths have tracked changes (`dirty-bundle`); then the `served:` breakdown below. `stamped-tracked` and `dirty-bundle` read `n/a` outside a git work tree and a bare `UNKNOWN` when git could not answer — never 0; the reason is in the `checkout` token, not repeated here |
+| `bundle` | `<N>/<M> identical-to-build <gitSha> stamped=<k> stamped-tracked=<t> dirty-bundle=<d> served: canonical@<sha12> <c> fetched <rfc3339>, builtin <b>, account <a>, unstamped <u>; identical-to-source <i>/<v> unverifiable=<x>`: how many of the M files the spawning binary carries match the disk copy; how many disk copies carry a `qontinui-provenance:` stamp; how many of those stamped files git tracks (`stamped-tracked`); how many bundle-roster paths have tracked changes (`dirty-bundle`); then the `served:` breakdown below. `stamped-tracked` and `dirty-bundle` read `n/a` outside a git work tree and `UNKNOWN(<code>)` — no space, a lowercase-hyphen code — when the count could not be measured, never 0. Codes on both counts (always identical): `no-served-corpus` (no `.claude/`; see `served-corpus`), `checkout-unknown` (git could not locate the checkout; see `checkout`), `outside-work-tree` (the corpus path resolves outside the toplevel git reported). `dirty-bundle` only: `status-unknown` (the checkout's git status was unreadable; see `dirty-claude` in `checkout`). `stamped-tracked` only: `ls-files-failed`, `deadline` (probe budget already spent; git not run), `timed-out` (this `ls-files` run was killed at the budget), `git-unavailable` (git could not be spawned), `output-incomplete` (git exited but its output could not be read in full). A bare `UNKNOWN` is an intermediate build that rendered no reason. Every OTHER token keeps `UNKNOWN (<reason>)` with a space |
 | `bundle` → `served:` | The stamped files split by the rung their stamp names, and how many of them still match their SOURCE. `canonical@<sha12> <c>` files are verified only against the canonical snapshot the runner has loaded (`canonical@unloaded <c>`, with no `fetched`, when none is loaded); `builtin <b>` files against this build's bundle; `account <a>` (`served`/`disk_cache`) are never compared; `unstamped <u>` carry no key. `identical-to-source <i>/<v>` is how many of the `<v>` verifiable files match that source, and `unverifiable=<x>` counts files stamped by a different snapshot or build, which this spawn cannot check. A reader cuts the value at `identical-to-build`, ` stamped=` and ` served: `, never by position |
 | `provisioned` | `commands written=<w>/<e> skipped-<reason>=<n>… as-of=<ts>; skills written=<w>/<e> skipped-<reason>=<n>… as-of=<ts>`: each provisioner's latest pass for this workdir, units written of units expected and one `skipped-<reason>=<n>` per reason (`git-tracked`, `write-failed`, `unresolved`, `rejected`, `repo-authored`); `UNKNOWN (no provision recorded for this workdir)` when the runner's ledger holds no pass |
 | `cwd` | the same checkout probe on the workdir itself, or `same checkout` |
@@ -349,19 +349,32 @@ field() {
   case "$FIELD_RAW" in ''|*[!0-9]*) ;; *) FIELD_OUT="$FIELD_RAW" ;; esac
 }
 # Why a `stamped-tracked` / `dirty-bundle` value is not a count. Both read `n/a`
-# outside a git work tree and a bare `UNKNOWN` when git could not answer - never
-# 0 - and are absent on a build predating them. The runner does not repeat git's
-# reason inside the bundle token; it is in the `checkout` token printed above.
+# outside a git work tree and `UNKNOWN(<code>)` (no space, so `field` keeps it
+# whole) when the count could not be measured - never 0 - and are absent on a
+# build predating them. Only the codes that NAME another token point at one; a
+# code this reader does not know is printed verbatim, and a bare `UNKNOWN` is an
+# intermediate build that rendered no reason.
 why_not_counted() {
   case "$FIELD_RAW" in
     '')     WHY="the bundle token carries no $FIELD_NAME field - the spawning build predates it" ;;
     n/a)    WHY="$FIELD_NAME=n/a - the served .claude is not in a git work tree, so nothing in it is tracked source" ;;
-    UNKNOWN*)
-      case "$FIELD_NAME" in
-        stamped-tracked) WHY="stamped-tracked=$FIELD_RAW - git could not say which bundle files are tracked" ;;
-        *)               WHY="$FIELD_NAME=$FIELD_RAW - git could not report tracked changes (status)" ;;
+    UNKNOWN)
+      WHY="$FIELD_NAME=UNKNOWN - the spawning build rendered no reason for it" ;;
+    "UNKNOWN("*")")
+      CODE="${FIELD_RAW#UNKNOWN(}"; CODE="${CODE%)}"
+      case "$CODE" in
+        no-served-corpus)  WHY="there is no served .claude/ - see the served-corpus row above" ;;
+        checkout-unknown)  WHY="git could not locate the checkout - see the checkout row above" ;;
+        outside-work-tree) WHY="the served .claude resolves outside the toplevel git reported" ;;
+        status-unknown)    WHY="the checkout's git status was unreadable - see dirty-claude in the checkout row above" ;;
+        ls-files-failed)   WHY="git ls-files exited non-zero" ;;
+        deadline)          WHY="the git probe budget was already spent; git ls-files was not run" ;;
+        timed-out)         WHY="this git ls-files run was killed at the probe budget" ;;
+        git-unavailable)   WHY="git could not be spawned" ;;
+        output-incomplete) WHY="git exited but its output could not be read in full" ;;
+        *)                 WHY="reason code '$CODE' is not one this reader knows" ;;
       esac
-      WHY="$WHY; the reason is in the [checkout: ...] token above" ;;
+      WHY="$FIELD_NAME=$FIELD_RAW - $WHY" ;;
     *)      WHY="$FIELD_NAME=$FIELD_RAW - not a count, n/a or UNKNOWN; this reader does not know the value" ;;
   esac
 }
@@ -1065,15 +1078,32 @@ function Get-ServedNum([string]$t, [string]$name) {
   $raw = Get-ServedRaw $t $name
   if ($raw -cmatch '^[0-9]+$') { [int]$raw } else { $null }
 }
-# A bare `UNKNOWN` carries no reason of its own: the runner puts git's reason
-# in the `checkout` token printed above, not in the bundle token.
+# The bash `why_not_counted`, code for code: `UNKNOWN(<code>)` carries its
+# reason; only the codes that NAME another token point at one; an unknown code
+# is printed verbatim; a bare `UNKNOWN` is a build that rendered no reason.
+$notCountedCodes = @{
+  'no-served-corpus'  = 'there is no served .claude/ - see the served-corpus row above'
+  'checkout-unknown'  = 'git could not locate the checkout - see the checkout row above'
+  'outside-work-tree' = 'the served .claude resolves outside the toplevel git reported'
+  'status-unknown'    = "the checkout's git status was unreadable - see dirty-claude in the checkout row above"
+  'ls-files-failed'   = 'git ls-files exited non-zero'
+  'deadline'          = 'the git probe budget was already spent; git ls-files was not run'
+  'timed-out'         = 'this git ls-files run was killed at the probe budget'
+  'git-unavailable'   = 'git could not be spawned'
+  'output-incomplete' = 'git exited but its output could not be read in full'
+}
 function Get-NotCountedWhy([string]$name, [string]$raw) {
   if (-not $raw)         { "the bundle token carries no $name field - the spawning build predates it" }
   elseif ($raw -ceq 'n/a') { "$name=n/a - the served .claude is not in a git work tree, so nothing in it is tracked source" }
-  elseif ($raw -clike 'UNKNOWN*') {
-    if ($name -ceq 'stamped-tracked') { $what = 'git could not say which bundle files are tracked' }
-    else { $what = 'git could not report tracked changes (status)' }
-    "$name=$raw - $what; the reason is in the [checkout: ...] token above"
+  elseif ($raw -ceq 'UNKNOWN') { "$name=UNKNOWN - the spawning build rendered no reason for it" }
+  elseif ($raw -cmatch '^UNKNOWN\((.*)\)$') {
+    $code = $Matches[1]
+    # A PowerShell hashtable matches keys case-INSENSITIVELY; the bash `case`
+    # does not, so the key is found with -ceq to keep the twins identical.
+    $hit = @($notCountedCodes.Keys | Where-Object { $_ -ceq $code })
+    if ($hit.Count -eq 1) { $what = $notCountedCodes[$hit[0]] }
+    else { $what = "reason code '$code' is not one this reader knows" }
+    "$name=$raw - $what"
   }
   else                   { "$name=$raw - not a count, n/a or UNKNOWN; this reader does not know the value" }
 }
@@ -1242,7 +1272,7 @@ cwd           : <path>
 === SERVED CORPUS (fixed at spawn) ===
 served-corpus : <canonical .claude path> | UNKNOWN (<reason>)
 checkout      : <repo> <branch>@<sha12> upstream=<ref> behind=<n> ahead=<m> as-of=<ts> dirty-claude=<k> | none (not a git work tree) | UNKNOWN (<reason>)
-bundle        : <N>/<M> identical-to-build <gitSha> stamped=<k> stamped-tracked=<t|n/a|UNKNOWN> dirty-bundle=<d|n/a|UNKNOWN> served: canonical@<sha12|unloaded> <c>[ fetched <ts>], builtin <b>, account <a>, unstamped <u>; identical-to-source <i>/<v> unverifiable=<x> | UNKNOWN (<reason>)
+bundle        : <N>/<M> identical-to-build <gitSha> stamped=<k> stamped-tracked=<t|n/a|UNKNOWN(<code>)> dirty-bundle=<d|n/a|UNKNOWN(<code>)> served: canonical@<sha12|unloaded> <c>[ fetched <ts>], builtin <b>, account <a>, unstamped <u>; identical-to-source <i>/<v> unverifiable=<x> | UNKNOWN (<reason>)
 provisioned   : commands written=<w>/<e> [skipped-<reason>=<n> ...] as-of=<ts>; skills written=<w>/<e> [skipped-<reason>=<n> ...] as-of=<ts> | UNKNOWN (no provision recorded for this workdir)
 cwd           : <repo> <branch>@<sha12> behind=<n> as-of=<ts> dirty=<m> | same checkout | UNKNOWN (<reason>)
 [PROVISIONER OVERWRITE PROVEN BY STAMP - ... | stamped=<k>, stamped-tracked=0 - ... | stamp verdict: none - <why>]
