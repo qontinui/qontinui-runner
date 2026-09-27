@@ -59,7 +59,7 @@ HOST="${CLORINDE_PG_HOST:-localhost}"
 PORT="${CLORINDE_PG_PORT:-5433}"
 DB="${CLORINDE_PG_DB:-qontinui_db}"
 PG_USER="${CLORINDE_PG_USER:-qontinui_user}"
-SCHEMAS=(project coord agent auth cloud public)
+SCHEMAS=(project coord agent auth cloud public atlas_managed)
 
 # Default to relative path; can be overridden by env.
 QONTINUI_WEB_DIR="${QONTINUI_WEB_DIR:-../../../qontinui-web/backend}"
@@ -127,7 +127,8 @@ cat > "$TMP" <<'EOF'
 --
 -- Source: alembic-managed schema, dumped via pg_dump with
 --   --schema=project --schema=coord --schema=agent --schema=auth
---   --schema=cloud --schema=public --no-owner --no-privileges.
+--   --schema=cloud --schema=public --schema=atlas_managed --no-owner
+--   --no-privileges.
 --
 -- Consumers: Clorinde (validates queries/*.sql against this file).
 --

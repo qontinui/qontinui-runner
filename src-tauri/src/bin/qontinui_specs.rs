@@ -10,7 +10,7 @@
 //!   `project.workflow_verification_phase_results.result_json`.
 //! - `flywheel` — "is the flywheel actually turning?" Proposal queue depth,
 //!   promotion velocity, demotion rate, drift detection rate,
-//!   and the last 20 transitions from `project.proposal_events`.
+//!   and the last 20 transitions from `atlas_managed.proposal_events`.
 //!
 //! The CLI opens its own short-lived PG connection (via the active profile's
 //! `database_url`) and exits. It does NOT talk to the running primary runner
@@ -653,8 +653,8 @@ async fn run_flywheel(client: &Client, args: &FlywheelArgs) -> Result<(), String
     let days = args.days as i32;
     let app_filter = args.app.as_deref();
 
-    let proposals_table = table_exists(client, "project", "spec_proposals").await?;
-    let events_table = table_exists(client, "project", "proposal_events").await?;
+    let proposals_table = table_exists(client, "atlas_managed", "spec_proposals").await?;
+    let events_table = table_exists(client, "atlas_managed", "proposal_events").await?;
 
     // spec-multi-app Stream E.6: section list — one app or all registered apps.
     let app_sections: Vec<String> = match app_filter {
@@ -775,7 +775,7 @@ async fn run_flywheel(client: &Client, args: &FlywheelArgs) -> Result<(), String
         first_app, args.days
     );
     println!();
-    println!("  Queue (status counts from spec_proposals):");
+    println!("  Queue (status counts from atlas_managed.spec_proposals):");
     let q = |s: &str| queue_counts.get(s).copied().unwrap_or(0);
     println!(
         "    queued: {:>6}    pendingValidation: {:>3}    promoted: {:>3}",
@@ -852,7 +852,7 @@ async fn query_queue_counts(
     }
     let rows = client
         .query(
-            "SELECT status, count(*)::bigint FROM project.spec_proposals GROUP BY status",
+            "SELECT status, count(*)::bigint FROM atlas_managed.spec_proposals GROUP BY status",
             &[],
         )
         .await
@@ -889,7 +889,7 @@ async fn query_recent_events(
                 failing_assertion_id,
                 at::TEXT,
                 app_id
-            FROM proposal_events
+            FROM atlas_managed.proposal_events
             WHERE $1::text IS NULL OR app_id = $1
             ORDER BY at DESC, id
             LIMIT 20
@@ -929,7 +929,7 @@ async fn count_proposal_events_in_window(
         .query_one(
             r#"
             SELECT count(*)::bigint
-            FROM proposal_events
+            FROM atlas_managed.proposal_events
             WHERE event_type = $2
               AND at > now() - make_interval(days => $1)
               AND ($3::text IS NULL OR app_id = $3)
@@ -962,7 +962,7 @@ async fn query_drift_event_count(
         .query_one(
             r#"
             SELECT count(*)::bigint
-            FROM proposal_events
+            FROM atlas_managed.proposal_events
             WHERE event_type = $2
               AND failing_assertion_id IS NOT NULL
               AND at > now() - make_interval(days => $1)
@@ -998,19 +998,22 @@ async fn list_app_ids(client: &Client) -> Result<Vec<String>, String> {
 // Shared helpers
 // ============================================================================
 
-/// `to_regclass($schema.$name)` IS NOT NULL — works without privilege to read
-/// `information_schema` rows the caller didn't author.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
-)]
+/// Whether `schema.name` exists as a table, read from `pg_catalog` (which,
+/// unlike `information_schema`, lists relations the caller did not author).
 async fn table_exists(client: &Client, schema: &str, name: &str) -> Result<bool, String> {
-    let qualified = format!("{}.{}", schema, name);
+    // A TABLE (ordinary or partitioned) of that name, not any relation: a view,
+    // sequence or index named like the table must not read as present.
     let row = client
-        .query_one("SELECT to_regclass($1::text) IS NOT NULL", &[&qualified])
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r', 'p'))",
+            &[&schema, &name],
+        )
         .await
-        .map_err(|e| format!("to_regclass({}) failed: {}", qualified, e))?;
-    Ok(row.get(0))
+        .map_err(|e| format!("table_exists({}.{}) failed: {}", schema, name, e))?;
+    row.try_get(0)
+        .map_err(|e| format!("table_exists({}.{}) failed: {}", schema, name, e))
 }
 
 fn round1(v: f64) -> f64 {
