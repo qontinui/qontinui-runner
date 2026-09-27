@@ -122,27 +122,104 @@ pub struct UiaAdapter {
     focus_subscription: Mutex<Option<FocusSubscription>>,
 }
 
-/// A live `AddFocusChangedEventHandler` registration.
+/// A live `AddFocusChangedEventHandler` registration, removed exactly once:
+/// by [`FocusSubscription::remove`], or else when it is dropped.
+///
+/// The drop arm is what makes a cancelled `subscribe_events` safe: the
+/// registration is made inside a blocking task, and if the future awaiting it
+/// is dropped the task still completes and drops its `FocusSubscription`, which
+/// then unregisters the handler instead of leaking it in UIA.
 struct FocusSubscription {
+    /// `None` once removed, which disarms the drop.
+    registration: Option<FocusRegistration>,
+}
+
+/// The handler plus the exact `IUIAutomation` it was registered on.
+struct FocusRegistration {
     automation: IUIAutomation,
     handler: IUIAutomationFocusChangedEventHandler,
 }
 
-// SAFETY: both are COM pointers, thread-safe under COINIT_MULTITHREADED — the
-// same argument as `UiaState`'s `unsafe impl Send`.
-unsafe impl Send for FocusSubscription {}
+// SAFETY: `automation` is an interface pointer created in the MTA (`uia3`
+// initializes COM with COINIT_MULTITHREADED), so it may be used from any
+// thread that is itself in the MTA — and the only use after the move,
+// `FocusRegistration::remove`, joins the MTA before calling it. `handler` is
+// our own `FocusChangedHandler`, whose only state is an `mpsc::Sender`
+// (`Send`). The same argument as `UiaState`'s `unsafe impl Send`.
+unsafe impl Send for FocusRegistration {}
 
 impl FocusSubscription {
-    /// Unregister the handler. Blocking COM call — run it off the async
-    /// runtime. Once removed, UIA drops its reference to the handler, which
-    /// drops the channel sender and ends the receiver's stream.
+    fn new(automation: IUIAutomation, handler: IUIAutomationFocusChangedEventHandler) -> Self {
+        Self {
+            registration: Some(FocusRegistration {
+                automation,
+                handler,
+            }),
+        }
+    }
+
+    /// Unregister the handler now, on this thread. Blocking COM call — run it
+    /// off the async runtime. Once removed, UIA drops its reference to the
+    /// handler, which drops the channel sender and ends the receiver's stream.
+    fn remove(mut self) {
+        if let Some(registration) = self.registration.take() {
+            registration.remove();
+        }
+    }
+}
+
+impl Drop for FocusSubscription {
+    /// Remove a registration that was never explicitly removed, on a plain OS
+    /// thread: `drop` may run on an async worker (or inside a blocking task
+    /// whose awaiting future was cancelled), where it must neither block on
+    /// COM nor wait for anything.
+    fn drop(&mut self) {
+        if let Some(registration) = self.registration.take() {
+            std::thread::spawn(move || registration.remove());
+        }
+    }
+}
+
+impl FocusRegistration {
     fn remove(self) {
-        // SAFETY: `handler` was registered on this `automation` instance.
+        use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
+        use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+
+        // The calling thread may never have touched COM (a fresh thread from
+        // `Drop`, or a pooled blocking thread). Join the MTA first. S_OK and
+        // S_FALSE ("already initialized in the MTA") each take a reference
+        // that must be paired with CoUninitialize. RPC_E_CHANGED_MODE means
+        // the thread is already in an STA (not expected: only our own threads
+        // and tokio's blocking pool run this). COM is initialized there and
+        // the removal is still attempted — its HRESULT is logged if it fails —
+        // but that call took no reference, so none is released.
+        //
+        // SAFETY: plain COM initialization of the current thread.
+        let init = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        let paired = init.is_ok(); // S_OK or S_FALSE
+        if !paired && init != RPC_E_CHANGED_MODE {
+            warn!(
+                "CoInitializeEx before removing the UIA focus handler failed: {:?}",
+                init
+            );
+        }
+
+        // SAFETY: `handler` was registered on this `automation` instance, and
+        // COM is initialized on this thread (see above) — or, when
+        // initialization failed outright, the call reports that as an error
+        // instead of touching uninitialized COM state.
         if let Err(e) = unsafe {
             self.automation
                 .RemoveFocusChangedEventHandler(&self.handler)
         } {
             warn!("Failed to remove UIA focus event handler: {}", e);
+        }
+        // Release the COM pointers before the apartment reference.
+        drop(self);
+
+        if paired {
+            // SAFETY: pairs the successful CoInitializeEx above.
+            unsafe { CoUninitialize() };
         }
     }
 }
@@ -291,10 +368,7 @@ impl PlatformAdapter for UiaAdapter {
             // SAFETY: COM call on an MTA-initialized `IUIAutomation`.
             unsafe { state.automation.AddFocusChangedEventHandler(None, &handler) }
                 .map_err(|e| anyhow!("Failed to register UIA focus event handler: {}", e))?;
-            Ok(FocusSubscription {
-                automation: state.automation.clone(),
-                handler,
-            })
+            Ok(FocusSubscription::new(state.automation.clone(), handler))
         })
         .await??;
 
@@ -352,11 +426,10 @@ impl PlatformAdapter for UiaAdapter {
 
 impl Drop for UiaAdapter {
     /// Backstop for an adapter dropped without `disconnect` (e.g. when the
-    /// manager swaps in the JAB adapter): remove the handler on a plain OS
-    /// thread, since `drop` cannot await and must not block the runtime.
+    /// manager swaps in the JAB adapter): dropping the subscription removes
+    /// the handler on a plain OS thread (see `FocusSubscription`'s `Drop`),
+    /// since `drop` cannot await and must not block the runtime.
     fn drop(&mut self) {
-        if let Some(sub) = self.take_focus_subscription() {
-            std::thread::spawn(move || sub.remove());
-        }
+        drop(self.take_focus_subscription());
     }
 }
