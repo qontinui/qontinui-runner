@@ -3981,6 +3981,18 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// run. coord's own grant (`mcp/agent_tool_access.rs`) is the authority on who
 /// may call it; this list only forwards.
 ///
+/// `coord_answer_agent_question` is IN because it is the consumer half of
+/// `coord_ask_question`, which this list already forwards: coord's agent-tier
+/// questions door (Plan D) is how an agent-audience question gets answered at
+/// all, and `coord_operator_touches` (plan
+/// `2026-08-27-operator-touch-read-and-surface`) points agents at it for every
+/// `agent_dispatchable` question touch. coord bounds the write itself: the
+/// UPDATE only matches `audience = 'agent'` rows, the responder is derived from
+/// the verified credential (stored `agent:<id>`, never an argument), and the
+/// tenant comes from the token. Withheld here, following that advice answers
+/// `-32601`. Its read twin, `coord_pending_agent_questions`, is IN for the same
+/// reason.
+///
 /// **Landed is not delivered** (plan `2026-09-03-coord-mcp-403-names-its-own-cause`
 /// Phase 3). This list is compiled into the binary, so a PR that edits it is
 /// NOT in effect on any box until that box rebuilds from a sha containing the
