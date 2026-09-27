@@ -372,18 +372,23 @@ pub(crate) fn isolation_refusal(
 /// The error is TYPED, and the conductor reads the type rather than the text:
 /// [`DispatchError::Transient`] for a fan-out bound that is momentarily full and
 /// [`DispatchError::DeferredByDrain`] for a device coord has drained — in both
-/// the row is queued, not stuck, so the conductor must not count it toward a
-/// stall — and [`DispatchError::Failed`] for everything else.
+/// the row is queued rather than stuck, so the conductor times it on its own
+/// long window instead of the row-sized one — and [`DispatchError::Failed`]
+/// for everything else.
 pub async fn dispatch_subtask(
     app_handle: &tauri::AppHandle,
     pg: &Arc<crate::database::pg::PgDb>,
     run_id: Uuid,
     subtask: &Subtask,
 ) -> Result<Uuid, DispatchError> {
-    let task_run_id = Uuid::new_v4();
+    // The ATTEMPT line. It carries no `task_run_id` because none has been
+    // minted yet — see the mint below the admission check — and it is logged
+    // before that check on purpose: a dispatch that is refused at admission
+    // must still be visible, or the operator sees nothing between a subtask
+    // going `Submitted` and a later tick that happens to succeed.
     info!(
-        "dispatch_subtask: run={} task_id={} -> task_run_id={} (repo={:?})",
-        run_id, subtask.task_id, task_run_id, subtask.repo
+        "dispatch_subtask: run={} task_id={} attempting dispatch (repo={:?})",
+        run_id, subtask.task_id, subtask.repo
     );
 
     // Agent-registry spawn authorization (plan
@@ -495,8 +500,11 @@ pub async fn dispatch_subtask(
             // TRANSIENT, like the bound above: coord has drained this device (or
             // its drain state is unknown). The subtask stays `Submitted` — the
             // work is deferred, never failed — and a later tick dispatches it
-            // once the drain lifts. Typed so the conductor logs it quietly and
-            // `tick_exit` drops the row's fingerprint key.
+            // once the drain lifts. Typed so the conductor rate-limits its log
+            // line and `tick_exit` times the row on the long
+            // `transient_stall_after_secs` window rather than the row-sized
+            // one — a window, not an exemption: a drain that never lifts still
+            // ends the run eventually instead of leaving it unbounded.
             return Err(DispatchError::DeferredByDrain(format!(
                 "dispatch_subtask: {} not dispatched — {reason}. Transient: the subtask stays \
                  queued and a later tick retries.",
@@ -504,6 +512,18 @@ pub async fn dispatch_subtask(
             )));
         }
     };
+
+    // Minted only now that admission has ADMITTED. It used to be minted at the
+    // top of this function, above the check — so every refused attempt burned
+    // an id: one measured run queued behind a full fan-out bound minted 96
+    // distinct `task_run_id`s for a single subtask that was never dispatched,
+    // all of them garbage in the log and in the id space an operator greps.
+    // The id identifies a worker, and until admission there is no worker.
+    let task_run_id = Uuid::new_v4();
+    info!(
+        "dispatch_subtask: run={} task_id={} -> task_run_id={} (repo={:?})",
+        run_id, subtask.task_id, task_run_id, subtask.repo
+    );
 
     // 1. Worktree allocation. A subtask that declares a `repo` gets an isolated
     //    worktree or is NOT dispatched: unlike an operator's terminal, a worker
@@ -1130,6 +1150,61 @@ mod tests {
         assert!(
             block.contains("NOT sufficient"),
             "must state the sentinel alone is insufficient"
+        );
+    }
+
+    /// **A dispatch refused at admission mints no `task_run_id`, and still logs
+    /// the attempt** (plan
+    /// `2026-09-27-a-transient-dispatch-failure-that-never-clears-leaves-a-conductor-run-unbounded`
+    /// D2). The mint used to sit at the top of [`dispatch_subtask`], above the
+    /// fan-out admission check, so every refused attempt burned an id: one
+    /// measured run minted 96 distinct `task_run_id`s for a single subtask that
+    /// was never dispatched, all of them garbage in the log and in the id space
+    /// an operator greps.
+    ///
+    /// This is a SOURCE-ORDER test, deliberately, because there is no seam to
+    /// call the behaviour through: `dispatch_subtask` needs a live
+    /// `tauri::AppHandle`, a `PgDb` and the process-global agent registry
+    /// before it reaches the arm under test, and the property being pinned —
+    /// "the mint is below the admission `match`" — is a property of the order
+    /// of two statements. A behavioural test would need a harness that does not
+    /// exist; this one fails loudly and correctly the moment the mint moves
+    /// back up.
+    #[test]
+    fn the_task_run_id_is_minted_below_the_admission_check() {
+        let src = include_str!("ai_session_executor.rs");
+        let f = src
+            .find("pub async fn dispatch_subtask(")
+            .expect("dispatch_subtask");
+        // `get`, not `&src[f..]`: `clippy::string-slice` is denied here, and
+        // the lint is right in general even though `find` always returns a
+        // char boundary.
+        let body = src.get(f..).expect("a `find` offset is a char boundary");
+
+        let attempt = body
+            .find("attempting dispatch")
+            .expect("the ATTEMPT line must survive — a refused dispatch stays visible");
+        let admission = body
+            .find("authorize_fanout_spawn_with_budget")
+            .expect("the admission check");
+        // Built at runtime so this test's own source does not match it — the
+        // count assert below reads the function, not the assert.
+        let mint_stmt = format!("let task_run_id = {}::new_v4();", "Uuid");
+        let mint = body.find(&mint_stmt).expect("the mint");
+
+        assert!(
+            attempt < admission,
+            "the attempt is logged BEFORE admission, or a refusal leaves no record at all"
+        );
+        assert!(
+            admission < mint,
+            "the id is minted only once admission has ADMITTED — a refused attempt \
+             must mint nothing"
+        );
+        assert_eq!(
+            body.matches(&mint_stmt).count(),
+            1,
+            "exactly one mint, or the one below the check is not the only one"
         );
     }
 }
