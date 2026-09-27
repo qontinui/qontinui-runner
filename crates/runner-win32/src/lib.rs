@@ -28,6 +28,11 @@
 #[cfg(windows)]
 pub mod job_object;
 
+// NOT cfg-gated: the creation-flag constants and the route type are plain
+// data, so the test that locks `CREATE_NEW_PROCESS_GROUP` out of every holder
+// route runs on Linux CI too. The Win32 calls inside are gated individually.
+pub mod holder_spawn;
+
 #[cfg(windows)]
 pub use job_object::{
     assign_process_to_job, current_job_pid_saturation, init_job_object, ScopedKillOnCloseJob,
