@@ -29,13 +29,13 @@ fn main() {
     // ever ships by accident.
     ensure_dist_placeholder();
 
-    // Let `tauri_build::build()` see ONLY the `bundle.externalBin` sidecars
-    // that are real binaries. On a cargo-only build (supervisor, CI
-    // `cargo test`, `cargo check`, `tauri dev`) they are absent, and tauri-build
-    // would otherwise both demand them AND delete the real `qontinui-pr` cargo
-    // uplifted into the profile dir. See the function for the full mechanism.
-    // Must run before `tauri_build::build()` — it sets `TAURI_CONFIG` for it.
-    scope_external_bin_to_real_sidecars();
+    // Hide `bundle.externalBin` from `tauri_build::build()`: tauri-build would
+    // otherwise demand the sidecars on every cargo-only build AND copy
+    // `binaries/` over the real `qontinui-pr` cargo uplifted into the profile
+    // dir. Bundling is unaffected (the bundler reads `binaries/` itself). See
+    // the function for the full mechanism. Must run before
+    // `tauri_build::build()` — it sets `TAURI_CONFIG` for it.
+    hide_external_bin_from_tauri_build();
 
     // Tell Cargo to re-run this build script (and re-embed the frontend) when
     // the dist directory changes.  Without this, incremental builds silently
@@ -485,141 +485,110 @@ fn ensure_dist_placeholder() {
     }
 }
 
-// The one definition of "a real native executable image", shared with the
-// runner's identity-shim materializer. The build script is its own crate and
-// cannot see the library, so it compiles the same FILE; the library's test
-// compile (which pulls this whole file in through `wedge_diagnostics`) uses the
-// library's module instead, so the tests there exercise one copy, not two.
-#[cfg(not(test))]
-#[path = "src/native_executable.rs"]
-#[allow(dead_code)]
-mod native_executable;
-#[cfg(test)]
-use crate::native_executable;
-
 /// The `bundle.externalBin` sidecars, spelled exactly as `tauri.conf.json`
 /// spells them. Keep in sync with it (a test pins that) and with
 /// `scripts/bundle-profile-sidecar.mjs` `SIDECAR_BINS`.
 const EXTERNAL_BIN_SIDECARS: &[&str] = &["binaries/qontinui_profile", "binaries/qontinui-pr"];
 
-/// Let `tauri_build::build()` see only the `bundle.externalBin` sidecars that
-/// are REAL binaries for the target, so it never copies anything else into the
-/// cargo target dir. Must run before `tauri_build::build()`.
+/// Hide `bundle.externalBin` from `tauri_build::build()` on EVERY run, and
+/// remove the zero-byte sidecar copies the previous mechanism left in the
+/// cargo profile dir. Must run before `tauri_build::build()`.
 ///
-/// WHY. tauri-build (2.6.2, `copy_binaries`) runs on EVERY build-script
-/// execution, not only at bundle time: for each `externalBin` entry it removes
-/// `<target>/<profile>/<name>` and copies `binaries/<name>-<triple>` over it.
-/// This function replaced `ensure_sidecar_placeholders()`, which satisfied
-/// tauri-build's existence check by writing ZERO-BYTE placeholders there. So
-/// every cargo-only build (the supervisor's `--bin qontinui-runner`, CI
-/// `cargo test`, `cargo check`, `tauri dev`) deleted the real `qontinui-pr`
-/// cargo had uplifted and left the empty placeholder in its place (with the
-/// placeholder's mtime — `fs::copy` preserves it on Windows). The identity-shim
+/// WHY. tauri-build (2.6.2, `copy_binaries`) runs on every build-script
+/// execution, not only at bundle time. For each `externalBin` entry it removes
+/// `<target>/<profile>/<name>` and copies `binaries/<name>-<triple>` over it,
+/// and before that it refuses to build at all if a listed sidecar is missing.
+/// This replaced `ensure_sidecar_placeholders()`, which satisfied that check
+/// by writing ZERO-BYTE placeholders into `binaries/`. So every cargo-only
+/// build — the supervisor's `--bin qontinui-runner`, CI `cargo test`,
+/// `cargo check`, `tauri dev` — deleted the real `qontinui-pr` cargo had
+/// uplifted and left the empty placeholder in its place (with the
+/// placeholder's mtime; `fs::copy` preserves it on Windows). The identity-shim
 /// materializer then published that empty file onto every terminal's PATH,
 /// where Git Bash runs it as an empty script: `qontinui-pr create` exited 0
 /// having opened no PR (plan
 /// `2026-09-27-qontinui-pr-zero-byte-sidecar-placeholder-published-as-session-cli`).
-/// That function is also what `.github/workflows/ci.yml`'s split-invocation
-/// comment names as the "Windows half" of a package that dirties its own
+/// `.github/workflows/ci.yml`'s split-invocation comment also names that
+/// function as the "Windows half" of a package that dirties its own
 /// fingerprint: it wrote into `binaries/` inside cargo's fingerprint window on
-/// every fresh checkout. This one writes there only to delete a legacy empty
-/// placeholder, which no fresh checkout has.
+/// every fresh checkout. Nothing here writes into `binaries/` at all.
 ///
-/// HOW. When every sidecar is real (a `tauri build`, after `beforeBuildCommand`
-/// ran `bundle-profile-sidecar`), nothing changes and tauri-build copies them
-/// exactly as before. Otherwise this sets `TAURI_CONFIG` — which tauri-build
-/// reads as a JSON merge-patch before it validates or copies `externalBin` —
-/// in THIS process only, listing just the real ones. tauri-build then neither
-/// demands a placeholder nor touches the profile dir's copy. Two readers are
-/// deliberately unaffected: the `generate_context!` codegen (it runs in rustc,
-/// not in this process) and the bundler (the tauri CLI reads `tauri.conf.json`
-/// itself).
-///
-/// A zero-length file at a sidecar path can only be a placeholder the old
-/// function wrote; it is deleted (with a warning) so no bundle that skips
-/// `beforeBuildCommand` can ship it. A non-empty non-binary is only warned
-/// about — this never deletes content it did not create.
-fn scope_external_bin_to_real_sidecars() {
-    use std::path::Path;
-
-    // A real sidecar APPEARING (bundle-profile-sidecar writing it) must re-run
-    // this script so tauri-build copies it. Cargo scans a watched directory's
-    // whole contents.
-    println!("cargo:rerun-if-changed=binaries");
-
-    // Cargo sets TARGET for build scripts to the triple being compiled; the
-    // externalBin path is `<entry>-<triple>[.exe]` relative to src-tauri (this
-    // build script's CWD).
-    let Ok(target) = std::env::var("TARGET") else {
-        return;
-    };
-    let format = native_executable::ExecutableFormat::for_target_triple(&target);
-    let ext = if target.contains("windows") {
-        ".exe"
-    } else {
-        ""
-    };
-
-    let mut checks = Vec::with_capacity(EXTERNAL_BIN_SIDECARS.len());
-    for entry in EXTERNAL_BIN_SIDECARS {
-        let path = format!("{entry}-{target}{ext}");
-        let verdict = native_executable::check(Path::new(&path), format);
-        match &verdict {
-            Ok(_) | Err(native_executable::NotExecutable::Missing) => {}
-            Err(native_executable::NotExecutable::Empty) => match std::fs::remove_file(&path) {
-                Ok(()) => println!(
-                    "cargo:warning=qontinui-runner: removed the zero-byte sidecar placeholder \
-                     {path} — an older build.rs wrote it, and an empty file is never a binary"
-                ),
-                Err(e) => println!(
-                    "cargo:warning=qontinui-runner: could not remove the zero-byte sidecar \
-                     placeholder {path}: {e}"
-                ),
-            },
-            Err(why) => println!(
-                "cargo:warning=qontinui-runner: not letting tauri-build copy sidecar {path}: {why}"
-            ),
-        }
-        checks.push((*entry, verdict));
-    }
-
-    let Some(keep) = external_bin_to_keep(&checks) else {
-        return; // every sidecar is real: leave tauri-build's view untouched
-    };
-    match external_bin_patch(std::env::var("TAURI_CONFIG").ok().as_deref(), &keep) {
+/// HOW. Merge `{"bundle":{"externalBin":null}}` into `TAURI_CONFIG` — which
+/// tauri-build reads as a JSON merge-patch before it validates or copies
+/// `externalBin` — in THIS process only, keeping any keys the tauri CLI already
+/// passed. Unconditional, not "only when a sidecar is missing": even a REAL
+/// sidecar in `binaries/` is whatever an earlier `tauri build` left there
+/// (built `--release`), and copying it would overwrite a fresh cargo build of
+/// `qontinui-pr` with a stale one. Two readers are deliberately unaffected:
+/// the `generate_context!` codegen reads `TAURI_CONFIG` from rustc's own
+/// environment and never reads `externalBin`, and the bundler copies sidecars
+/// from `binaries/` through the config the tauri CLI parsed itself
+/// (tauri-bundler 2.9.0 `Settings::copy_binaries`). The sidecars a runner
+/// needs next to its exe come from cargo building those bins (the supervisor's
+/// sidecar build, `bundle-profile-sidecar`), never from this script.
+fn hide_external_bin_from_tauri_build() {
+    match external_bin_patch(std::env::var("TAURI_CONFIG").ok().as_deref()) {
         // Single-threaded build script; nothing else reads the env concurrently.
         Ok(patch) => std::env::set_var("TAURI_CONFIG", patch),
         // tauri-build would fail to parse it anyway; say why here instead.
         Err(e) => panic!(
-            "qontinui-runner: cannot scope bundle.externalBin to the real sidecars — \
+            "qontinui-runner: cannot hide bundle.externalBin from tauri-build — \
              the TAURI_CONFIG merge-patch in the environment is unusable: {e}"
         ),
     }
-}
 
-/// Which `externalBin` entries tauri-build may see. `None` when every one is a
-/// real binary, meaning "leave the config alone"; otherwise the real subset
-/// (possibly empty), in `EXTERNAL_BIN_SIDECARS` order. Pure.
-fn external_bin_to_keep(
-    checks: &[(&str, Result<u64, native_executable::NotExecutable>)],
-) -> Option<Vec<String>> {
-    if checks.iter().all(|(_, verdict)| verdict.is_ok()) {
-        return None;
+    // Repair what the old placeholders already did to this profile dir. Only a
+    // ZERO-LENGTH copy is removed — no build produces one except that copy
+    // chain — and never content. The profile dir is derived exactly as
+    // tauri-build derives it: OUT_DIR = <target>/<profile>/build/<pkg>-<hash>/out.
+    let Ok(target) = std::env::var("TARGET") else {
+        return;
+    };
+    let Some(profile_dir) = std::env::var_os("OUT_DIR").and_then(|out| {
+        std::path::PathBuf::from(out)
+            .ancestors()
+            .nth(3)
+            .map(std::path::Path::to_path_buf)
+    }) else {
+        return;
+    };
+    let exe_ext = if target.contains("windows") {
+        ".exe"
+    } else {
+        ""
+    };
+    for removed in remove_zero_length_sidecar_copies(&profile_dir, exe_ext) {
+        println!(
+            "cargo:warning=qontinui-runner: removed the zero-byte sidecar copy {removed} — \
+             a build placeholder, never a binary (the real one comes from building its bin)"
+        );
     }
-    Some(
-        checks
-            .iter()
-            .filter(|(_, verdict)| verdict.is_ok())
-            .map(|(entry, _)| (*entry).to_string())
-            .collect(),
-    )
 }
 
-/// Fold `bundle.externalBin = keep` into an existing `TAURI_CONFIG` merge-patch
+/// Remove each `<dir>/<sidecar><exe_ext>` that is a ZERO-LENGTH regular file;
+/// return the paths removed. Leaves absent, non-empty and non-file entries
+/// alone, and treats an unremovable file as not removed (the materializer
+/// refuses to publish it either way).
+fn remove_zero_length_sidecar_copies(dir: &std::path::Path, exe_ext: &str) -> Vec<String> {
+    let mut removed = Vec::new();
+    for entry in EXTERNAL_BIN_SIDECARS {
+        let name = entry.trim_start_matches("binaries/");
+        let path = dir.join(format!("{name}{exe_ext}"));
+        let zero_length_file = std::fs::metadata(&path)
+            .map(|md| md.is_file() && md.len() == 0)
+            .unwrap_or(false);
+        if zero_length_file && std::fs::remove_file(&path).is_ok() {
+            removed.push(path.display().to_string());
+        }
+    }
+    removed
+}
+
+/// Fold `bundle.externalBin = null` into an existing `TAURI_CONFIG` merge-patch
 /// (the tauri CLI passes one during `tauri dev`/`build`), keeping every other
-/// key. A JSON merge-patch REPLACES arrays wholesale, which is exactly the
-/// semantics wanted: the listed entries become the whole `externalBin`. Pure.
-fn external_bin_patch(existing: Option<&str>, keep: &[String]) -> Result<String, String> {
+/// key. In a JSON merge-patch `null` DELETES the key, so tauri-build sees no
+/// `externalBin` at all. Pure.
+fn external_bin_patch(existing: Option<&str>) -> Result<String, String> {
     use serde_json::Value;
 
     let mut root = match existing.map(str::trim).filter(|s| !s.is_empty()) {
@@ -636,10 +605,7 @@ fn external_bin_patch(existing: Option<&str>, keep: &[String]) -> Result<String,
         .or_insert_with(|| Value::Object(serde_json::Map::new()))
         .as_object_mut()
         .ok_or_else(|| "its `bundle` key is not a JSON object".to_string())?;
-    bundle.insert(
-        "externalBin".to_string(),
-        Value::Array(keep.iter().cloned().map(Value::String).collect()),
-    );
+    bundle.insert("externalBin".to_string(), Value::Null);
     serde_json::to_string(&root).map_err(|e| e.to_string())
 }
 
@@ -1398,19 +1364,14 @@ mod provenance_tests {
     }
 }
 
-/// `scope_external_bin_to_real_sidecars`'s pure halves. The IO shell around
-/// them is exercised by every build; these pin the decisions it makes.
+/// `hide_external_bin_from_tauri_build`'s pure and file-level halves. The
+/// env-setting shell around them runs on every build.
 #[cfg(test)]
 mod sidecar_scope_tests {
-    use super::{external_bin_patch, external_bin_to_keep, EXTERNAL_BIN_SIDECARS};
-    use crate::native_executable::NotExecutable;
+    use super::{external_bin_patch, remove_zero_length_sidecar_copies, EXTERNAL_BIN_SIDECARS};
 
-    fn keep(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
-    }
-
-    /// The list this script scopes must be the list tauri-build reads, or a
-    /// sidecar added to `tauri.conf.json` would be judged by nobody.
+    /// The list this script repairs must be the list tauri-build would copy,
+    /// or a sidecar added to `tauri.conf.json` would be missed.
     #[test]
     fn the_sidecar_list_is_tauri_conf_external_bin() {
         let conf: serde_json::Value =
@@ -1429,90 +1390,74 @@ mod sidecar_scope_tests {
     }
 
     #[test]
-    fn all_real_sidecars_leave_the_config_alone() {
-        let checks = [
-            ("binaries/qontinui_profile", Ok(24_569_344)),
-            ("binaries/qontinui-pr", Ok(23_827_968)),
-        ];
-        assert_eq!(external_bin_to_keep(&checks), None);
-    }
-
-    #[test]
-    fn a_cargo_only_build_lets_tauri_build_copy_nothing() {
-        // The supervisor / CI / `cargo check` shape: no sidecars at all.
-        let checks = [
-            ("binaries/qontinui_profile", Err(NotExecutable::Missing)),
-            ("binaries/qontinui-pr", Err(NotExecutable::Missing)),
-        ];
-        assert_eq!(external_bin_to_keep(&checks), Some(keep(&[])));
-    }
-
-    #[test]
-    fn a_zero_byte_placeholder_is_never_kept() {
-        // The defect's own shape: the empty placeholder beside a real sibling.
-        let checks = [
-            ("binaries/qontinui_profile", Ok(24_569_344)),
-            ("binaries/qontinui-pr", Err(NotExecutable::Empty)),
-        ];
+    fn the_patch_alone_deletes_external_bin() {
         assert_eq!(
-            external_bin_to_keep(&checks),
-            Some(keep(&["binaries/qontinui_profile"]))
-        );
-    }
-
-    #[test]
-    fn a_non_binary_sidecar_is_never_kept() {
-        let checks = [
-            (
-                "binaries/qontinui_profile",
-                Err(NotExecutable::WrongFormat {
-                    len: 17,
-                    expected: crate::native_executable::ExecutableFormat::Pe,
-                }),
-            ),
-            ("binaries/qontinui-pr", Ok(23_827_968)),
-        ];
-        assert_eq!(
-            external_bin_to_keep(&checks),
-            Some(keep(&["binaries/qontinui-pr"]))
-        );
-    }
-
-    #[test]
-    fn the_patch_alone_names_only_the_kept_sidecars() {
-        assert_eq!(
-            external_bin_patch(None, &keep(&["binaries/qontinui-pr"])).unwrap(),
-            r#"{"bundle":{"externalBin":["binaries/qontinui-pr"]}}"#
+            external_bin_patch(None).unwrap(),
+            r#"{"bundle":{"externalBin":null}}"#
         );
         assert_eq!(
-            external_bin_patch(Some("  "), &keep(&[])).unwrap(),
-            r#"{"bundle":{"externalBin":[]}}"#
+            external_bin_patch(Some("  ")).unwrap(),
+            r#"{"bundle":{"externalBin":null}}"#
         );
     }
 
     #[test]
     fn the_patch_keeps_every_key_the_tauri_cli_passed() {
-        // `tauri dev` passes its own merge-patch; ours must not drop it.
+        // `tauri dev`/`tauri build` pass their own merge-patch; ours must not
+        // drop it, and must override an externalBin the CLI passed too.
         let cli = r#"{"build":{"devUrl":"http://localhost:1420"},"bundle":{"active":false,"externalBin":["binaries/qontinui_profile","binaries/qontinui-pr"]}}"#;
         let patched: serde_json::Value =
-            serde_json::from_str(&external_bin_patch(Some(cli), &keep(&[])).unwrap()).unwrap();
+            serde_json::from_str(&external_bin_patch(Some(cli)).unwrap()).unwrap();
         assert_eq!(patched["build"]["devUrl"], "http://localhost:1420");
         assert_eq!(patched["bundle"]["active"], false);
-        assert_eq!(patched["bundle"]["externalBin"], serde_json::json!([]));
+        assert_eq!(patched["bundle"]["externalBin"], serde_json::Value::Null);
     }
 
     #[test]
     fn an_unusable_existing_patch_is_refused_not_overwritten() {
-        assert!(external_bin_patch(Some("not json"), &keep(&[]))
+        assert!(external_bin_patch(Some("not json"))
             .unwrap_err()
             .contains("not valid JSON"));
         assert_eq!(
-            external_bin_patch(Some("[1,2]"), &keep(&[])).unwrap_err(),
+            external_bin_patch(Some("[1,2]")).unwrap_err(),
             "not a JSON object"
         );
         assert_eq!(
-            external_bin_patch(Some(r#"{"bundle":7}"#), &keep(&[])).unwrap_err(),
+            external_bin_patch(Some(r#"{"bundle":7}"#)).unwrap_err(),
             "its `bundle` key is not a JSON object"
         );
+    }
+
+    #[test]
+    fn only_zero_length_sidecar_copies_are_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // The defect's residue: the placeholder copy beside a real sibling.
+        std::fs::write(dir.join("qontinui-pr.exe"), b"").unwrap();
+        std::fs::write(dir.join("qontinui_profile.exe"), b"MZ\x90\x00real").unwrap();
+        // Same names without the platform suffix are not this build's copies.
+        std::fs::write(dir.join("qontinui-pr"), b"").unwrap();
+
+        let removed = remove_zero_length_sidecar_copies(dir, ".exe");
+        assert_eq!(removed.len(), 1, "{removed:?}");
+        assert!(removed[0].ends_with("qontinui-pr.exe"));
+        assert!(!dir.join("qontinui-pr.exe").exists());
+        assert_eq!(
+            std::fs::read(dir.join("qontinui_profile.exe")).unwrap(),
+            b"MZ\x90\x00real",
+            "a non-empty sidecar is content and must never be touched"
+        );
+        assert!(dir.join("qontinui-pr").exists());
+
+        // Nothing left to remove: a second pass is a no-op.
+        assert!(remove_zero_length_sidecar_copies(dir, ".exe").is_empty());
+    }
+
+    #[test]
+    fn a_directory_at_a_sidecar_path_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("qontinui-pr")).unwrap();
+        assert!(remove_zero_length_sidecar_copies(tmp.path(), "").is_empty());
+        assert!(tmp.path().join("qontinui-pr").is_dir());
     }
 }

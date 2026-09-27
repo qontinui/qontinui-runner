@@ -216,11 +216,10 @@ pub mod plan_workunit_adapter;
 // reads the one definition.
 pub mod build_provenance;
 
-// "Is this file a real native executable image?" — the one definition shared
-// by `build.rs` (which externalBin sidecars tauri-build may copy) and the
-// identity-shim materializer (whether the `qontinui-pr` session CLI may be
-// published onto a terminal's PATH). Plan
-// `2026-09-27-qontinui-pr-zero-byte-sidecar-placeholder-published-as-session-cli`.
+// "Is this file a real native executable image?" — the one definition the
+// identity-shim materializer uses to decide whether the `qontinui-pr` session
+// CLI and the `qontinui-shim` stub may be published onto a terminal's PATH.
+// Plan `2026-09-27-qontinui-pr-zero-byte-sidecar-placeholder-published-as-session-cli`.
 pub mod native_executable;
 
 // Wedge diagnostics (Phase 4 of
