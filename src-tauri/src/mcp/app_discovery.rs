@@ -1592,6 +1592,7 @@ mod supervisor_port_tests {
             probed_at: String::new(),
             port,
             base_url: None,
+            reason: None,
         }
     }
 
@@ -1599,11 +1600,7 @@ mod supervisor_port_tests {
     /// no supervisor, and scanning its port anyway assumes a dev box.
     #[test]
     fn the_default_desktop_scan_names_no_supervisor_port() {
-        let supervisor_default: u16 = crate::api_config::get_supervisor_socket_addr()
-            .rsplit(':')
-            .next()
-            .and_then(|p| p.parse().ok())
-            .expect("default supervisor addr has a port");
+        let supervisor_default: u16 = crate::api_config::DEFAULT_SUPERVISOR_PORT;
         assert!(!DESKTOP_APP_PORTS.contains(&supervisor_default));
     }
 

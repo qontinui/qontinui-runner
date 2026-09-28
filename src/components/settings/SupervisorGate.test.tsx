@@ -46,6 +46,7 @@ function read(observed: boolean | null, port: number | null = 4242): SupervisorO
       probed_at: "2026-09-28T00:00:00Z",
       port: observed === null ? null : port,
       base_url: observed === null ? null : `http://127.0.0.1:${port}`,
+      reason: observed === true ? null : "not observed",
     },
   };
 }
@@ -107,6 +108,7 @@ describe("SupervisorGateView", () => {
         probed_at: "x",
         port: 7,
         base_url: "http://127.0.0.1:7/",
+        reason: null,
       },
     };
     const html = renderToStaticMarkup(

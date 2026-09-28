@@ -110,11 +110,12 @@ export function resolveLandingTab(stored: string | null, ctx: LandingContext): M
   // but has no `SETTINGS_ITEMS` entry, so the registry-membership check below
   // would wave it straight through. Ask the gate that actually governs it.
   if (migrated.startsWith("settings-")) {
-    // `supervisorObserved: true` — the cold-start resolver runs before any
-    // supervisor observation exists, and a dev-surface tab can only have been
-    // persisted from a box that listed it; if none is observed now, the panel
-    // itself renders its neutral "not available" line.
-    return isSettingsNavItemVisible(migrated, isEnabled, undefined, true)
+    // `supervisorObserved: false` — fail closed. The cold-start resolver runs
+    // before any supervisor observation exists, and every runner listed "Test
+    // My Change" before dev surfaces were gated, so a persisted dev-surface tab
+    // says nothing about THIS box. Landing a published user on it would also
+    // re-show its nav entry through the anti-stranding rule.
+    return isSettingsNavItemVisible(migrated, isEnabled, undefined, false)
       ? migrated
       : DEFAULT_TAB_ID;
   }

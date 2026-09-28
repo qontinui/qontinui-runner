@@ -1989,28 +1989,19 @@
       "class": "supervisor_dependency",
       "file": "src/api_config.rs",
       "symbol": "get_supervisor_socket_addr",
-      "excerpt": "format!(\"127.0.0.1:{}\", DEFAULT_SUPERVISOR_PORT)",
+      "excerpt": "pub fn get_supervisor_socket_addr() -> Option<String> {",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "Resolver only; parses get_supervisor_url, contacts nothing."
+      "note": "Resolver only: the host:port of get_supervisor_url, None when the URL names no port (no substituted default); contacts nothing."
     },
     {
       "class": "supervisor_dependency",
       "file": "src/api_config.rs",
       "symbol": "get_supervisor_socket_addr",
-      "excerpt": "let url = get_supervisor_url();",
+      "excerpt": "supervisor_host_port(&get_supervisor_url())",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "Resolver only; parses get_supervisor_url, contacts nothing."
-    },
-    {
-      "class": "supervisor_dependency",
-      "file": "src/api_config.rs",
-      "symbol": "get_supervisor_socket_addr",
-      "excerpt": "pub fn get_supervisor_socket_addr() -> String {",
-      "count": 1,
-      "disposition": "fallback_correct",
-      "note": "Resolver only; parses get_supervisor_url, contacts nothing."
+      "note": "Resolver only: the host:port of get_supervisor_url, None when the URL names no port (no substituted default); contacts nothing."
     },
     {
       "class": "supervisor_dependency",
@@ -2038,6 +2029,15 @@
       "count": 1,
       "disposition": "fallback_correct",
       "note": "Resolver only (env override, else 127.0.0.1:9875); returns a URL and contacts nothing. Callers carry their own disposition."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/api_config.rs",
+      "symbol": "supervisor_host_port",
+      "excerpt": "pub fn supervisor_host_port(url: &str) -> Option<String> {",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Pure URL authority parser; contacts nothing."
     },
     {
       "class": "supervisor_dependency",
@@ -2151,7 +2151,7 @@
       "class": "supervisor_dependency",
       "file": "src/mcp/auto_continue.rs",
       "symbol": "check_supervisor_available",
-      "excerpt": "&crate::api_config::get_supervisor_socket_addr(),",
+      "excerpt": "&crate::api_config::get_supervisor_socket_addr()?,",
       "count": 1,
       "disposition": "fallback_correct",
       "note": "The one 500 ms TCP probe. Tri-state: Some(false) when no supervisor listens, None when the configured address does not parse (nothing probed). Callers treat only Some(true) as present."
@@ -2177,6 +2177,24 @@
     {
       "class": "supervisor_dependency",
       "file": "src/mcp/auto_continue.rs",
+      "symbol": "confirm_supervisor_identity",
+      "excerpt": "fn confirm_supervisor_identity(base_url: &str, timeout: std::time::Duration) -> Result<(), String> {",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "GET <base>/health bounded by 1.5 s; anything but a supervisor-shaped body reads observed=false with a reason."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/mcp/auto_continue.rs",
+      "symbol": "confirm_supervisor_identity",
+      "excerpt": "if is_supervisor_health(&body) {",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "GET <base>/health bounded by 1.5 s; anything but a supervisor-shaped body reads observed=false with a reason."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/mcp/auto_continue.rs",
       "symbol": "get_supervisor_observation",
       "excerpt": "async fn get_supervisor_observation() -> Json<ApiResponse<SupervisorObservation>> {",
       "count": 1,
@@ -2186,11 +2204,11 @@
     {
       "class": "supervisor_dependency",
       "file": "src/mcp/auto_continue.rs",
-      "symbol": "observe_supervisor",
-      "excerpt": "&crate::api_config::get_supervisor_socket_addr(),",
+      "symbol": "is_supervisor_health",
+      "excerpt": "pub fn is_supervisor_health(body: &serde_json::Value) -> bool {",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "Resolves the configured supervisor address/URL and probes it; contacts nothing but the TCP connect, and an absent supervisor reads observed=false."
+      "note": "Pure identity predicate over a /health body (supervisor.project_dir); contacts nothing."
     },
     {
       "class": "supervisor_dependency",
@@ -2223,7 +2241,43 @@
       "class": "supervisor_dependency",
       "file": "src/mcp/auto_continue.rs",
       "symbol": "observe_supervisor_at",
-      "excerpt": "observed: probe_supervisor_at(addr, timeout),",
+      "excerpt": "\"the configured supervisor URL {supervisor_url:?} names no port, so nothing was probed\"",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Pure observation builder over one address; port/base_url are null when the address does not parse."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/mcp/auto_continue.rs",
+      "symbol": "observe_supervisor_at",
+      "excerpt": "Some(true) => match confirm_supervisor_identity(&base_url, identity_budget) {",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Pure observation builder over one address; port/base_url are null when the address does not parse."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/mcp/auto_continue.rs",
+      "symbol": "observe_supervisor_at",
+      "excerpt": "let Some(host_port) = crate::api_config::supervisor_host_port(supervisor_url) else {",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Pure observation builder over one address; port/base_url are null when the address does not parse."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/mcp/auto_continue.rs",
+      "symbol": "observe_supervisor_at",
+      "excerpt": "let scheme = supervisor_url.split_once(\"://\").map_or(\"http\", |x| x.0);",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Pure observation builder over one address; port/base_url are null when the address does not parse."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/mcp/auto_continue.rs",
+      "symbol": "observe_supervisor_at",
+      "excerpt": "match probe_supervisor_at(&host_port, tcp_budget) {",
       "count": 1,
       "disposition": "fallback_correct",
       "note": "Pure observation builder over one address; port/base_url are null when the address does not parse."
@@ -2240,11 +2294,20 @@
     {
       "class": "supervisor_dependency",
       "file": "src/mcp/auto_continue.rs",
-      "symbol": "probe_supervisor_at",
-      "excerpt": "pub fn probe_supervisor_at(addr: &str, timeout: std::time::Duration) -> Option<bool> {",
+      "symbol": "observe_supervisor_at",
+      "excerpt": "supervisor_url: &str,",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "Pure TCP probe of one address; None on an unparseable address, never collapsed into false."
+      "note": "Pure observation builder over one address; port/base_url are null when the address does not parse."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/mcp/auto_continue.rs",
+      "symbol": "probe_supervisor_at",
+      "excerpt": "pub fn probe_supervisor_at(addr: &str, budget: std::time::Duration) -> Option<bool> {",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Resolves host:port and tries every address within one bounded budget; an absent supervisor reads Some(false), unresolvable None."
     },
     {
       "class": "supervisor_dependency",

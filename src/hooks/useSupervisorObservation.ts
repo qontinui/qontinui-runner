@@ -28,6 +28,8 @@ export interface SupervisorObservation {
   probed_at: string;
   port: number | null;
   base_url: string | null;
+  /** Why `observed` is not `true` (nothing listens / not a supervisor / nothing probed). */
+  reason: string | null;
 }
 
 /**
@@ -76,8 +78,25 @@ interface Envelope<T> {
   error?: string;
 }
 
-export async function fetchSupervisorObservation(): Promise<SupervisorObservation> {
-  const res = await tracedFetch(`${getApiBase()}/supervisor/observation`);
+/**
+ * Client-side bound on one read. The runner's own budget is ≤ 0.5 s TCP plus
+ * ≤ 1.5 s identity check; anything past this is a stuck hop, not an answer.
+ */
+export const SUPERVISOR_OBSERVATION_FETCH_TIMEOUT_MS = 4_000;
+
+export async function fetchSupervisorObservation(
+  timeoutMs: number = SUPERVISOR_OBSERVATION_FETCH_TIMEOUT_MS,
+): Promise<SupervisorObservation> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  let res: Response;
+  try {
+    res = await tracedFetch(`${getApiBase()}/supervisor/observation`, {
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeoutId);
+  }
   if (!res.ok) {
     throw new Error(`HTTP ${res.status}`);
   }
@@ -118,13 +137,20 @@ export function nextObservationState(
   return prev.kind === "read" ? prev : { kind: "error", message: outcome.message };
 }
 
+let inFlight = false;
+
+/** One read. A tick that lands while the previous read is still out is skipped. */
 async function readOnce() {
+  if (inFlight) return;
+  inFlight = true;
   try {
     const observation = await fetchSupervisorObservation();
     publish(nextObservationState(sharedState, { ok: true, observation }));
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     publish(nextObservationState(sharedState, { ok: false, message }));
+  } finally {
+    inFlight = false;
   }
 }
 
@@ -151,7 +177,15 @@ export function useSupervisorObservation(): SupervisorObservationState {
   );
 }
 
-/** Convenience for nav gating: `true` only for an OBSERVED supervisor. */
+/**
+ * Nav gating: `true` only for an OBSERVED supervisor. Snapshots a primitive,
+ * so the sidebar and sub-nav re-render only when the verdict flips, not on
+ * every poll (each poll publishes a fresh object with a new `probed_at`).
+ */
 export function useSupervisorObserved(): boolean {
-  return observedSupervisorBase(useSupervisorObservation()) !== null;
+  return useSyncExternalStore(
+    subscribe,
+    () => observedSupervisorBase(sharedState) !== null,
+    () => false,
+  );
 }
