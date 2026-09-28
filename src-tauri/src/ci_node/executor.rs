@@ -234,6 +234,9 @@ pub(crate) async fn run_dispatch(
         &payload.candidate_ref,
         &payload.head_sha,
         &cancel,
+        // One line per retry: it tells the operator why the checkout is
+        // waiting, and the progress POST it rides is what renews the lease.
+        &mut |line: &str| sink.push(line),
     )
     .await
     {
