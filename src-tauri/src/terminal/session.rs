@@ -2194,7 +2194,11 @@ impl TerminalSession {
                 if let Ok(mut ec) = waiter_exit.lock() {
                     *ec = code;
                 }
-                waiter_alive.store(false, Ordering::Relaxed);
+                // `swap` reports whether a runner-initiated close (`close_inner`
+                // / `close_kill_only`) had already cleared `is_alive` before its
+                // kill — in which case the exit code is the KILL's, not the
+                // agent's (see `on_exit_hook_code`).
+                let runner_initiated = !waiter_alive.swap(false, Ordering::Relaxed);
 
                 info!(terminal_id = %waiter_id, exit_code = ?code, "Terminal process exited");
 
@@ -2236,7 +2240,7 @@ impl TerminalSession {
                                 coord_session = %coord_id,
                                 "terminal exit — closing coord session mirror"
                             );
-                            cb(coord_id, code);
+                            cb(coord_id, on_exit_hook_code(code, runner_initiated));
                         }
                     }
                 }
@@ -4041,8 +4045,9 @@ impl TerminalSession {
     /// command — `SessionRegistry::close_by_id` is already idempotent). It
     /// also receives the PTY's real exit code (plan
     /// `2026-08-27-operator-touch-observation-runner-emitter` §2b/§2c) —
-    /// `None` when the waiter itself failed to observe a status, never a
-    /// synthesized value.
+    /// `None` when the waiter itself failed to observe a status, or when the
+    /// exit was caused by a runner-initiated close's kill (see
+    /// `on_exit_hook_code`) — never a synthesized value.
     pub fn set_on_exit(&self, hook: Box<dyn Fn(uuid::Uuid, Option<i32>) + Send + Sync>) {
         if let Ok(mut slot) = self.on_exit.lock() {
             *slot = Some(hook);
@@ -4537,6 +4542,22 @@ impl TerminalSession {
     }
 }
 
+/// The exit code handed to the `on_exit` hook.
+///
+/// A close the RUNNER started (tab close, remote close, `close_all` at
+/// shutdown) kills the child — SIGTERM on unix, `taskkill /F` on Windows — so
+/// the child's non-zero status reports the kill, not an agent stopping short.
+/// Such an exit is reported as `None` ("no observed agent exit code"), which the
+/// operator-touch `session_exit` trigger ignores, so an ordinary close never
+/// inflates that metric. The pane's own recorded exit code is unaffected.
+fn on_exit_hook_code(code: Option<i32>, runner_initiated: bool) -> Option<i32> {
+    if runner_initiated {
+        None
+    } else {
+        code
+    }
+}
+
 /// Default per-thread join cap on the interactive close path.
 const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -4649,6 +4670,17 @@ impl Drop for TerminalSession {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_runner_initiated_close_hands_the_hook_no_exit_code() {
+        // The kill's SIGTERM / taskkill status must never read as an agent's
+        // non-zero exit (operator-touch `session_exit` inflation).
+        assert_eq!(super::on_exit_hook_code(Some(1), true), None);
+        assert_eq!(super::on_exit_hook_code(Some(0), true), None);
+        assert_eq!(super::on_exit_hook_code(Some(1), false), Some(1));
+        assert_eq!(super::on_exit_hook_code(Some(0), false), Some(0));
+        assert_eq!(super::on_exit_hook_code(None, false), None);
+    }
+
     use super::*;
 
     // =======================================================================

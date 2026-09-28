@@ -107,6 +107,12 @@ pub fn scan_idle_touches_once() {
     }
 
     for (tid, session) in sessions {
+        // An exited pane stays in the snapshot (a non-zero exit is kept
+        // visible), and its frozen last frame can read as "idle at the
+        // prompt" forever. A dead process is not waiting on the operator.
+        if !session.is_alive() {
+            continue;
+        }
         let Some(coord_session_id) = session.coord_session_id() else {
             // No coord mirror ⇒ nothing to attribute the touch to. Not an
             // error: plenty of terminals (a bare shell tab, a session whose

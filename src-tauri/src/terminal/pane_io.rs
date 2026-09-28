@@ -101,8 +101,9 @@ pub trait PaneIo: Send + Sync {
     /// `126` not-executable, `2` misuse, an explicit `exit N` — which a prior
     /// `success()`-only mapping flattened to a bare `0`/`1`.
     ///
-    /// ⚠️ This does **not** distinguish a crash from a signal: `ExitStatus` is
-    /// a private-field struct exposing only `success()`/`exit_code()`, and on
+    /// ⚠️ This does **not** distinguish a crash from a signal: `ExitStatus`
+    /// offers no typed signal accessor (only `success()`/`exit_code()`; the
+    /// signal name surfaces solely through its `Display` text), and on
     /// unix `From<std::process::ExitStatus>` maps a signalled process through
     /// `status.code().unwrap_or(1)` — SIGKILL and SIGTERM both arrive as
     /// `exit_code() == 1`, identically to an ordinary `exit 1`. A caller may
