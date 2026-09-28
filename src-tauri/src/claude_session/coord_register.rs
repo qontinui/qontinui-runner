@@ -2728,8 +2728,8 @@ mod tests {
     /// neighbouring test's offline service also carries `agent-log-emitter`,
     /// so a poll on the name would prove nothing about this one. The negative
     /// checks are then read only after every handle has been closed AND the
-    /// service has absorbed those closes (the gauge back at 0), which is the
-    /// latest point a per-handle thread could have been spawned and scheduled.
+    /// service has absorbed those closes (the gauge back at 0) — the latest
+    /// point the test can observe before reading names.
     /// They stay point-in-time, not a proof: a per-handle thread that exists
     /// but has never been scheduled still carries an inherited `comm` that no
     /// prefix here matches — the `family` read is a prefix match too, and on
@@ -2772,9 +2772,7 @@ mod tests {
             }
             // Close the sentinel LAST and wait for 0: every send came from this
             // thread, so the channel's FIFO order means the gauge cannot reach
-            // 0 until all 50 closes and the sentinel's have been absorbed. The
-            // service thread itself lives until `drop(service)`, so the name
-            // reads below still see it.
+            // 0 until all 50 closes and the sentinel's have been absorbed.
             sentinel.close();
             assert!(
                 wait_for_live_agents(gauge, 0),
@@ -2790,8 +2788,8 @@ mod tests {
             );
             // Family backstop: whatever suffix a per-handle thread might carry
             // under the `agent-log` prefix, 50 handles must not have produced
-            // anything like 50 emitter-family threads. Other tests hold a handful of offline
-            // services at most.
+            // anything like 50 emitter-family threads. Other tests hold a
+            // handful of offline services at most.
             let family = threads_named("agent-log").expect("procfs readable");
             assert!(
                 family < 50,
