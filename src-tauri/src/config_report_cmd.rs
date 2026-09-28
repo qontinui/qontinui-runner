@@ -126,12 +126,7 @@ pub(crate) fn api_base_url_reading(
     inputs: &ApiBaseUrlInputs,
     captured_at: DateTime<Utc>,
 ) -> LayerReading {
-    let (value, arm) = resolve_api_base_url(
-        inputs.env_web.clone(),
-        inputs.env_api.clone(),
-        inputs.persisted.clone(),
-        inputs.is_debug,
-    );
+    let (value, arm) = resolve_api_base_url(inputs);
     let fp = EnvFingerprinter::new();
     LayerReading::known(
         EnvVarReading::classify(&fp, arm.value_origin_name(), &value)
@@ -1679,7 +1674,7 @@ pub(crate) struct SettingsDerivedInputs {
     pub provenance: crate::settings::SettingsProvenance,
     /// Layer 1 — the bounded load error, present only for `unreadable`.
     pub error: Option<String>,
-    /// Layer 5 — the four rungs of the backend-URL resolution.
+    /// Layer 5 — the five rungs of the backend-URL resolution.
     pub api_base_url: ApiBaseUrlInputs,
     /// Layer 11 — the resolved `CLAUDE_CONFIG_DIR` and its selection arm.
     pub claude_config_dir: (Option<String>, ClaudeConfigDirSource),
@@ -1906,21 +1901,34 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    /// The four pre-profile rungs, with no profile `api_url` — the shape most
+    /// tests want. Use [`inputs_with_profile`] to exercise the profile rung.
     fn inputs(
         env_web: Option<&str>,
         env_api: Option<&str>,
         persisted: Option<&str>,
         is_debug: bool,
     ) -> ApiBaseUrlInputs {
+        inputs_with_profile(env_web, env_api, None, persisted, is_debug)
+    }
+
+    fn inputs_with_profile(
+        env_web: Option<&str>,
+        env_api: Option<&str>,
+        profile_api_url: Option<&str>,
+        persisted: Option<&str>,
+        is_debug: bool,
+    ) -> ApiBaseUrlInputs {
         ApiBaseUrlInputs {
             env_web: env_web.map(str::to_string),
             env_api: env_api.map(str::to_string),
+            profile_api_url: profile_api_url.map(str::to_string),
             persisted: persisted.map(str::to_string),
             is_debug,
         }
     }
 
-    /// Each of the four documented rungs produces the arm string AND the value
+    /// Each of the five documented rungs produces the arm string AND the value
     /// that rung's input implies — both asserted as LITERALS, so neither the
     /// precedence order nor the arm vocabulary can drift silently.
     #[test]
@@ -1945,6 +1953,17 @@ mod tests {
                 ),
                 "env:QONTINUI_API_URL",
                 "https://api.example",
+            ),
+            (
+                inputs_with_profile(
+                    None,
+                    Some("  "),
+                    Some("https://profile.example/"),
+                    Some("https://persisted.example"),
+                    true,
+                ),
+                "profile:api_url",
+                "https://profile.example",
             ),
             (
                 inputs(Some("   "), None, Some("https://persisted.example/"), true),
@@ -2117,6 +2136,7 @@ mod tests {
         for (arm, expected) in [
             (ApiBaseUrlArm::EnvWebBackendUrl, "QONTINUI_WEB_BACKEND_URL"),
             (ApiBaseUrlArm::EnvApiUrl, "QONTINUI_API_URL"),
+            (ApiBaseUrlArm::ProfileApiUrl, "profiles.json api_url"),
             (
                 ApiBaseUrlArm::PersistedBackendUrl,
                 "web_integration.backend_url",
