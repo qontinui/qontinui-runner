@@ -1441,7 +1441,7 @@ If the capability exists and is merely off, the deliverable is **not a plan** �
 it is an activation, plus a gate if flipping it waits on an observable
 precondition or an operator decision.
 
-**Arming a fixer arm (`pr_fix`, `red_main_fix`, `admission_stall_fix`) reads `coord_fixer_arm_readiness` `blocking_conjuncts` BEFORE the taskdef edit** — every conjunct that would still stop a dispatch (flag, repo knob, autonomy, policy), not just the first gate a past consult hit; on a coord build whose readiness response predates that field, ALSO read `GET https://coord.qontinui.io/coord/agent-next-step-settings` for the effective autonomy level, since arming into `guidance_only` just moves the holds to the next gate.
+**Arming a fixer arm (`pr_fix`, `red_main_fix`, `admission_stall_fix`) reads `coord_fixer_arm_readiness` `blocking_conjuncts` BEFORE the taskdef edit** — every conjunct that would still stop a dispatch (flag, repo knob, autonomy, policy), not just the first gate a past consult hit. Only `blocking_conjuncts: []` means nothing blocks; an ABSENT field is UNKNOWN, never an empty list. On a coord build whose readiness response predates that field, `GET https://coord.qontinui.io/coord/agent-next-step-settings` answers AUTONOMY for `pr_fix` and `red_main_fix` only (arming into `guidance_only` just moves the holds to the next gate); for `admission_stall_fix`, and for the repo knob on every arm, such a build gives no pre-arming answer — that is UNKNOWN, so read the `held_by` markers `coord_fixer_arm_readiness` reports rather than treating it as clear.
 
 #### 3a's output is a DIAGNOSTIC ARTIFACT — write it, do not leave it in the transcript
 
