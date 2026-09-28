@@ -2726,11 +2726,14 @@ mod tests {
     /// handle emits one line and the service's own gauge must reach 1. The
     /// gauge is per-service while thread names are process-wide — a
     /// neighbouring test's offline service also carries `agent-log-emitter`,
-    /// so a poll on the name would prove nothing about this one. Only then are
-    /// the names read. The negative checks stay point-in-time, not a proof: a
-    /// per-handle thread spawned after the service's first pass could still be
-    /// unnamed at the reading, which is why the name-agnostic `family` backstop
-    /// and the non-Linux count arm remain.
+    /// so a poll on the name would prove nothing about this one. The negative
+    /// checks are then read only after every handle has been closed AND the
+    /// service has absorbed those closes (the gauge back at 0), which is the
+    /// latest point a per-handle thread could have been spawned and scheduled.
+    /// They stay point-in-time, not a proof: a per-handle thread that exists
+    /// but has never been scheduled still carries an inherited `comm` that no
+    /// prefix here matches — the `family` read is a prefix match too, and on
+    /// Linux there is no count-based backstop behind it.
     ///
     /// Elsewhere, where thread names are unreadable, the fallback is
     /// the process thread count within `baseline + 2` — `+1` for this test's
@@ -2767,14 +2770,15 @@ mod tests {
                 handle.stream_line("one line");
                 handle.close();
             }
-            // The sentinel's queue stays open, so the settled value is 1, not
-            // 0. The gauge already reads 1, so this wait can return before the
-            // 50 closes are absorbed; the drain is proven by the wait for 0
-            // after the sentinel's close below, which the channel's FIFO order
-            // cannot satisfy until every earlier close has been processed.
+            // Close the sentinel LAST and wait for 0: every send came from this
+            // thread, so the channel's FIFO order means the gauge cannot reach
+            // 0 until all 50 closes and the sentinel's have been absorbed. The
+            // service thread itself lives until `drop(service)`, so the name
+            // reads below still see it.
+            sentinel.close();
             assert!(
-                wait_for_live_agents(gauge, 1),
-                "{} queue(s) held after every handle closed — only the sentinel's should remain",
+                wait_for_live_agents(gauge, 0),
+                "{} queue(s) still held after every handle and the sentinel closed",
                 gauge.load(std::sync::atomic::Ordering::Relaxed)
             );
             let per_session =
@@ -2784,20 +2788,14 @@ mod tests {
                 "{per_session} thread(s) carry the per-session prefix — the emitter is \
                  spawning per handle again"
             );
-            // Name-agnostic backstop: whatever a per-handle thread might be
-            // called, 50 handles must not have produced anything like 50
-            // emitter-family threads. Other tests hold a handful of offline
+            // Family backstop: whatever suffix a per-handle thread might carry
+            // under the `agent-log` prefix, 50 handles must not have produced
+            // anything like 50 emitter-family threads. Other tests hold a handful of offline
             // services at most.
             let family = threads_named("agent-log").expect("procfs readable");
             assert!(
                 family < 50,
                 "{family} agent-log* threads — one per handle again under a new name?"
-            );
-            sentinel.close();
-            assert!(
-                wait_for_live_agents(gauge, 0),
-                "{} queue(s) still held after every handle and the sentinel closed",
-                gauge.load(std::sync::atomic::Ordering::Relaxed)
             );
             drop(sentinel);
             drop(handles);
