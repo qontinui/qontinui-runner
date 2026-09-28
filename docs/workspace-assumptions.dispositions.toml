@@ -182,18 +182,6 @@ reviewed = [
 [[disposition]]
 class = "supervisor_dependency"
 file = "src/api_config.rs"
-symbol = "get_supervisor_socket_addr"
-disposition = "fallback_correct"
-note = "Resolver only; parses get_supervisor_url, contacts nothing."
-reviewed = [
-    "format!(\"127.0.0.1:{}\", DEFAULT_SUPERVISOR_PORT)",
-    "let url = get_supervisor_url();",
-    "pub fn get_supervisor_socket_addr() -> String {",
-]
-
-[[disposition]]
-class = "supervisor_dependency"
-file = "src/api_config.rs"
 symbol = "get_supervisor_url"
 disposition = "fallback_correct"
 note = "Resolver only (env override, else 127.0.0.1:9875); returns a URL and contacts nothing. Callers carry their own disposition."
@@ -294,7 +282,7 @@ symbol = "check_supervisor_available"
 disposition = "fallback_correct"
 note = "The one 500 ms TCP probe. Tri-state: Some(false) when no supervisor listens, None when the configured address does not parse (nothing probed). Callers treat only Some(true) as present."
 reviewed = [
-    "&crate::api_config::get_supervisor_socket_addr(),",
+    "&crate::api_config::get_supervisor_socket_addr()?,",
     "probe_supervisor_at(",
     "pub fn check_supervisor_available() -> Option<bool> {",
 ]
@@ -316,7 +304,6 @@ symbol = "observe_supervisor"
 disposition = "fallback_correct"
 note = "Resolves the configured supervisor address/URL and probes it; contacts nothing but the TCP connect, and an absent supervisor reads observed=false."
 reviewed = [
-    "&crate::api_config::get_supervisor_socket_addr(),",
     "&crate::api_config::get_supervisor_url(),",
     "observe_supervisor_at(",
     "pub fn observe_supervisor() -> SupervisorObservation {",
@@ -329,18 +316,13 @@ symbol = "observe_supervisor_at"
 disposition = "fallback_correct"
 note = "Pure observation builder over one address; port/base_url are null when the address does not parse."
 reviewed = [
-    "observed: probe_supervisor_at(addr, timeout),",
+    "\"the configured supervisor URL {supervisor_url:?} names no port, so nothing was probed\"",
+    "Some(true) => match confirm_supervisor_identity(&base_url, identity_budget) {",
+    "let Some(host_port) = crate::api_config::supervisor_host_port(supervisor_url) else {",
+    "let scheme = supervisor_url.split_once(\"://\").map_or(\"http\", |x| x.0);",
+    "match probe_supervisor_at(&host_port, tcp_budget) {",
+    "supervisor_url: &str,",
     "pub fn observe_supervisor_at(",
-]
-
-[[disposition]]
-class = "supervisor_dependency"
-file = "src/mcp/auto_continue.rs"
-symbol = "probe_supervisor_at"
-disposition = "fallback_correct"
-note = "Pure TCP probe of one address; None on an unparseable address, never collapsed into false."
-reviewed = [
-    "pub fn probe_supervisor_at(addr: &str, timeout: std::time::Duration) -> Option<bool> {",
 ]
 
 [[disposition]]
@@ -443,4 +425,56 @@ disposition = "fallback_correct"
 note = "Not a tenant: the public OAuth client id of the Claude CLI app, identical on every install."
 reviewed = [
     "const CLIENT_ID: &str = \"9d1c250a-e61b-44d9-88ed-5944d1962f5e\";",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/api_config.rs"
+symbol = "get_supervisor_socket_addr"
+disposition = "fallback_correct"
+note = "Resolver only: the host:port of get_supervisor_url, None when the URL names no port (no substituted default); contacts nothing."
+reviewed = [
+    "pub fn get_supervisor_socket_addr() -> Option<String> {",
+    "supervisor_host_port(&get_supervisor_url())",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/api_config.rs"
+symbol = "supervisor_host_port"
+disposition = "fallback_correct"
+note = "Pure URL authority parser; contacts nothing."
+reviewed = [
+    "pub fn supervisor_host_port(url: &str) -> Option<String> {",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/mcp/auto_continue.rs"
+symbol = "confirm_supervisor_identity"
+disposition = "fallback_correct"
+note = "GET <base>/health bounded by 1.5 s; anything but a supervisor-shaped body reads observed=false with a reason."
+reviewed = [
+    "fn confirm_supervisor_identity(base_url: &str, timeout: std::time::Duration) -> Result<(), String> {",
+    "if is_supervisor_health(&body) {",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/mcp/auto_continue.rs"
+symbol = "is_supervisor_health"
+disposition = "fallback_correct"
+note = "Pure identity predicate over a /health body (supervisor.project_dir); contacts nothing."
+reviewed = [
+    "pub fn is_supervisor_health(body: &serde_json::Value) -> bool {",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/mcp/auto_continue.rs"
+symbol = "probe_supervisor_at"
+disposition = "fallback_correct"
+note = "Resolves host:port and tries every address within one bounded budget; an absent supervisor reads Some(false), unresolvable None."
+reviewed = [
+    "pub fn probe_supervisor_at(addr: &str, budget: std::time::Duration) -> Option<bool> {",
 ]

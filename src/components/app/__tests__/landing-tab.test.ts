@@ -19,7 +19,12 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { getProductMode, getShowHiddenItems, setProductMode, setShowHiddenItems } from "@qontinui/navigation";
+import {
+  getProductMode,
+  getShowHiddenItems,
+  setProductMode,
+  setShowHiddenItems,
+} from "@qontinui/navigation";
 
 import { resolveLandingTab, type LandingContext } from "../landing-tab";
 import { DEFAULT_TAB_ID } from "../tab-types";
@@ -161,6 +166,16 @@ describe("resolveLandingTab", () => {
     expect(resolveLandingTab("settings-playwright", ADVANCED)).toBe("settings-playwright");
     expect(resolveLandingTab("settings-mobile", VISUAL)).toBe("settings-mobile");
     expect(resolveLandingTab("settings-general", NEITHER)).toBe("settings-general");
+  });
+
+  it("fails closed on a persisted dev-surface settings tab", () => {
+    // Every runner listed "Test My Change" before dev surfaces were gated on
+    // an observed supervisor, so a persisted one says nothing about this box;
+    // landing a published user on it would also re-show its nav entry.
+    for (const ctx of [NEITHER, ADVANCED, VISUAL]) {
+      expect(resolveLandingTab("settings-dev-loop", ctx)).toBe(DEFAULT_TAB_ID);
+      expect(resolveLandingTab("settings-ci-runner", ctx)).toBe(DEFAULT_TAB_ID);
+    }
   });
 
   it("resolves a legacy alias before judging it", () => {
