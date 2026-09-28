@@ -1477,6 +1477,75 @@ jobs:
           cd src-tauri
           cargo clippy
 
+  # Tests + clippy for the standalone workspace crates that the `test` job
+  # never reaches.
+  #
+  # WHY: every Rust step above runs `cd src-tauri && cargo …`, and cargo run
+  # from a member directory selects THAT package only — so `crates/pty-holder`
+  # (plan 2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions,
+  # Phase 1) and `crates/runner-win32` are compiled only as src-tauri's
+  # dependencies (runner-win32) or not at all (pty-holder), and none of their
+  # own tests or [lints] run in CI. pty-holder's frozen-envelope wire-shape
+  # pin and its byte-fidelity source guard protect nothing unless something
+  # executes them, and the windows leg is the only place its named-pipe /
+  # DACL / LockFileEx code executes at all.
+  #
+  # Setup mirrors `clippy-windows` for everything that is not the cargo
+  # command, minus what these crates do not need: no qontinui-web / ui-bridge
+  # siblings and no pnpm / node / frontend build (only src-tauri's
+  # tauri::generate_context! reads ../dist, and neither crate compiles
+  # src-tauri), and no pagefile (two small crates, no link-time OOM risk).
+  # qontinui-schemas IS still checked out: cargo resolves the whole workspace
+  # even for `-p`, and src-tauri path-depends on ../../qontinui-schemas/*.
+  #
+  # Clippy is PLAIN (no `-D warnings`), the repo convention: levels come from
+  # each crate's own [lints] table, where correctness/suspicious are `deny`.
+  #
+  # Not a required check (not registered in the ruleset by this change).
+  holder-crates:
+    name: Holder crates (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.platform }}
+    # UNMEASURED at introduction: no run of this job exists yet. The two
+    # crates plus serde/libc/windows-sys compile in seconds locally (clean
+    # `cargo test -p qontinui-pty-holder` build: ~2 s on merytshost), so the
+    # budget is dominated by checkout + toolchain + cache restore. 20 min is a
+    # generous first bound, well under GitHub's 360-minute default; tighten it
+    # once there are runs to measure.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      # Rust path-dep on ../../qontinui-schemas/rust — needed only so cargo can
+      # load the workspace; same action (and declared-adaptation resolution)
+      # as the `test` and `clippy-windows` jobs.
+      - name: Check out sibling qontinui-schemas
+        uses: ./.github/actions/checkout-sibling
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          components: clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          cache-on-failure: true
+          # Save from main only, as `clippy-windows` does: a separate cache
+          # scope that candidate/PR runs must not grow against the 10 GB cap.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Test holder crates
+        run: cargo test -p qontinui-pty-holder -p qontinui-runner-win32
+
+      - name: Clippy holder crates
+        run: cargo clippy -p qontinui-pty-holder --all-targets
+
   # Gating frontend unit-test lane (vitest).
   #
   # The matrix `test` job above also runs `pnpm test`, but it is wedged between

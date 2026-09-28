@@ -160,6 +160,16 @@ cargo_build_jobs = 1
 #   `test (windows-latest)` does not pay, so wall-clock comparisons against
 #   that leg must subtract it.
 #
+# - The separate `holder-crates` job (ci.yml, matrix ubuntu + windows) runs
+#   `cargo test -p qontinui-pty-holder -p qontinui-runner-win32` and
+#   `cargo clippy -p qontinui-pty-holder --all-targets` from the repo root,
+#   because every src-tauri step selects the src-tauri package only and never
+#   reaches those crates' own tests or [lints]. Mirrored below as
+#   `holder-crates-test` / `holder-crates-clippy` on the same reasoning as
+#   `rust-clippy`: extra coverage over `test (windows-latest)`, not a parity
+#   break — and on a Windows CI node it is where the pty-holder's named-pipe /
+#   DACL / LockFileEx code executes. Both are small crates, seconds to build.
+#
 # - "Build Rust tests" + "Run Rust tests" (the `cargo test --no-run` / run-
 #   the-recovered-binaries split) are ONE `cargo test` below. Same pass/fail
 #   meaning (fail-fast on the first failing binary), without the per-phase
@@ -309,3 +319,17 @@ working_dir = "src-tauri"
 # hang headless environments).
 env = { QONTINUI_DISABLE_KEYCHAIN = "1" }
 timeout_secs = 7200
+
+[[steps]]
+# ci.yml `holder-crates` job, "Test holder crates" — see STEP PARITY above.
+# From the repo root: `-p` selects workspace members src-tauri never tests.
+name = "holder-crates-test"
+command = ["cargo", "test", "-p", "qontinui-pty-holder", "-p", "qontinui-runner-win32"]
+timeout_secs = 1800
+
+[[steps]]
+# ci.yml `holder-crates` job, "Clippy holder crates" — PLAIN clippy, levels
+# from the crate's own [lints] table, exactly like `rust-clippy`.
+name = "holder-crates-clippy"
+command = ["cargo", "clippy", "-p", "qontinui-pty-holder", "--all-targets"]
+timeout_secs = 1800
