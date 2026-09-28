@@ -397,9 +397,9 @@ pub const RUNNER_CONTEXT_SOURCE_MARKER: &str = concat!(
 /// The first, in full: the plan/prompt **capture** protocol is
 /// appended only when [`crate::mcp::fleet_policy_poller::effective_plan_capture_level`]
 /// reads `record` (plan `2026-08-10-plan-and-prompt-library-in-web` Phase 4).
-/// `record` is the domain default — the resting value, the value after a coord
-/// 404 or no-row answer, and the value on an unpaired or offline runner that
-/// has never polled (operator decision 2026-09-24, matching coord's
+/// `record` is the domain default — the resting value, the value after a
+/// no-row answer, and the value on an unpaired or offline runner that has
+/// never polled (operator decision 2026-09-24, matching coord's
 /// `PLAN_CAPTURE_DEFAULT`). At `off` — an explicit tenant row, or an
 /// unrecognised level — the clause is ABSENT. The read is a synchronous lock
 /// read, never I/O: this function runs on the spawn path.
@@ -471,8 +471,12 @@ pub fn runner_context(api_port: u16, coord_mcp: crate::coord_mcp::CoordMcpDelive
     let mut briefing = String::new();
 
     // Fleet-gated clause. Read synchronously from the poller's process-global
-    // cache — `off` before the first successful poll, on a coord 404/401, on an
-    // unpaired runner and on a poisoned lock, so the default is "no clause".
+    // cache — the domain default `record` before the first successful poll, on
+    // a no-row answer, on an unpaired runner and on a poisoned lock (a 401/404
+    // keeps last-good), so the default is "clause present"; only an explicit
+    // `off` row or an unrecognised level omits it. Unlike the data write paths
+    // this does NOT wait for coord's first answer — it is an instruction, not
+    // a publish.
     if crate::mcp::fleet_policy_poller::effective_plan_capture_level()
         == crate::mcp::fleet_policy_poller::PLAN_CAPTURE_RECORD
     {

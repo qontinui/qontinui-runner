@@ -2349,8 +2349,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // effect on the next tick rather than needing a restart.
                     let capture_gate: qontinui_runner_lib::plan_workunit_adapter::trigger::CaptureGate =
                         std::sync::Arc::new(|| {
-                            mcp::fleet_policy_poller::effective_plan_capture_level()
-                                == mcp::fleet_policy_poller::PLAN_CAPTURE_RECORD
+                            use qontinui_runner_lib::plan_workunit_adapter::trigger::CaptureVerdict;
+                            // Writes wait for an AUTHORITATIVE answer: the
+                            // `record` default alone must not push every plan
+                            // on a cold start before an explicit `off` can
+                            // arrive (see `plan_capture_writes_authorized`).
+                            if !mcp::fleet_policy_poller::plan_capture_answered() {
+                                CaptureVerdict::Unanswered
+                            } else if mcp::fleet_policy_poller::plan_capture_writes_authorized(
+                                &mcp::fleet_policy_poller::effective_plan_capture_level(),
+                                true,
+                            ) {
+                                CaptureVerdict::Open
+                            } else {
+                                CaptureVerdict::Closed
+                            }
                         });
                     // The scan-root reading is machine-scoped (one row per
                     // device on the web), so only the instance that owns shared
