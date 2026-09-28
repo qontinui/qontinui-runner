@@ -65,6 +65,64 @@ pub fn connect(pane_dir: &Path, pane: &PaneId, deadline: Instant) -> io::Result<
     }
 }
 
+/// `Read + Write` over a [`Conn`] where EVERY syscall is bounded by what is
+/// left of ONE deadline.
+///
+/// A timeout armed once per frame is a per-SYSCALL bound: `read_exact` loops,
+/// and each of its reads would get the full remaining time again, so a peer
+/// that trickles one byte just inside each timeout stretches a single frame to
+/// N x the deadline. Re-arming `remaining(deadline)` before every read and
+/// write makes the deadline a bound on the whole operation, on both OSes.
+#[derive(Debug)]
+pub struct DeadlineIo<'a> {
+    conn: &'a mut Conn,
+    deadline: Instant,
+}
+
+impl<'a> DeadlineIo<'a> {
+    pub fn new(conn: &'a mut Conn, deadline: Instant) -> Self {
+        DeadlineIo { conn, deadline }
+    }
+}
+
+impl io::Read for DeadlineIo<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.conn.set_timeout(Some(remaining(self.deadline)?))?;
+        self.conn.read(buf)
+    }
+}
+
+impl io::Write for DeadlineIo<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.conn.set_timeout(Some(remaining(self.deadline)?))?;
+        self.conn.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.conn.flush()
+    }
+}
+
+/// The payload of an accept error that must END the holder rather than be
+/// retried. Only the Windows listener produces one: a pipe name found squatted
+/// when it had to be re-created from zero instances.
+#[derive(Debug)]
+pub struct FatalAcceptError(pub String);
+
+impl std::fmt::Display for FatalAcceptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for FatalAcceptError {}
+
+/// Whether `Listener::accept`'s error is a [`FatalAcceptError`]. Every other
+/// accept error is transient and retried with backoff.
+pub fn accept_error_is_fatal(e: &io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(|inner| inner.is::<FatalAcceptError>())
+}
+
 /// Time left until `deadline`, or `TimedOut` when none is.
 pub fn remaining(deadline: Instant) -> io::Result<Duration> {
     let now = Instant::now();
@@ -90,6 +148,16 @@ mod tests {
         assert!(peer_authorized(1000, 1000));
         assert!(!peer_authorized(0, 1000), "root is not the holder's user");
         assert!(!peer_authorized(1001, 1000));
+    }
+
+    #[test]
+    fn pty_holder_only_the_fatal_marker_is_fatal() {
+        let fatal = io::Error::other(FatalAcceptError("squatted".into()));
+        assert!(accept_error_is_fatal(&fatal));
+        assert!(!accept_error_is_fatal(&io::Error::other("transient")));
+        assert!(!accept_error_is_fatal(&io::Error::from(
+            io::ErrorKind::Interrupted
+        )));
     }
 
     #[test]

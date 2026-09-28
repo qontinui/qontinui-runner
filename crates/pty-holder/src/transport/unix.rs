@@ -37,6 +37,13 @@ impl Conn {
         peer_uid(self.stream.as_raw_fd())
     }
 
+    /// Wrap one end of a socketpair, so server tests can drive
+    /// `serve_conn_with` in-process.
+    #[cfg(test)]
+    pub(crate) fn from_stream(stream: UnixStream) -> Conn {
+        Conn { stream }
+    }
+
     /// Half-close nothing, close everything: used after a rejection.
     pub fn shutdown(&self) {
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
