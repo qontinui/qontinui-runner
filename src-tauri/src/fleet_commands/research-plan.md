@@ -396,7 +396,12 @@ waste yours.
   CLOSED or MERGED PR carries nothing pushed after its close. When commits
   remain unlanded, take its fresh-branch path and open the new PR,
   `coord_create_pr` first, then `gh pr create`; **never `gh pr merge`, never
-  `--admin`**. Runbook:
+  `--admin`**. Open it in `/implement-plan` Step 4.5b's served door order (the
+  runner's loopback door sits between the coord door and the `gh` fallback),
+  then READ it back — `gh pr list --repo <owner/repo> --head <branch>
+  --state all --json number,url,state,headRefOid` — and take the PR number only
+  from a row whose `headRefOid` is the head you pushed, never from the create
+  call's exit status or output. Runbook:
   `knowledge-base/qontinui-specific/bodyless-work-units-and-stranded-plans.md`.
 - Also print the full prompt content in your response, so the operator can
   copy-paste it without opening the file.

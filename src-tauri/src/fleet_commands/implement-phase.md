@@ -478,8 +478,17 @@ trigger is NOT a gate; skip those and just report the blocker.
   the cancel "stays operator-only" and that a device session had to reach an
   operator door; that was wrong — it named the unprefixed OPERATOR route, which
   answers an agent 401. It then named a dispatched-only filter, which was wrong
-  the other way.) (canonical spec: `_gate-registration` → "Continuation cancel +
-  refresh", and → "How long you actually have" for the window.)
+  the other way.) **Then WITHDRAW the prior OPEN gate** — never the `unit_ready` record
+  gate you still need cleared — `coord_withdraw_gate`
+  `{gate_id, reason}`, or its HTTP twin `POST .../coord/gates/:gate_id/withdraw`
+  `{reason}` (registrant-only; it also cancels a still-pending continuation, so
+  it alone suffices when you registered the prior gate). A cancel leaves the
+  verdict `open`, so a superseded gate that is only cancelled sits in the open
+  set forever; mute is for noise, not retirement. On a not-the-registrant
+  refusal (MCP error / HTTP 403), cancel + mute and name the gate id in your
+  closeout. (canonical spec:
+  `_gate-registration` → "Continuation cancel + refresh", and → "How long you
+  actually have" for the window.)
 
 **Attest-on-completion (close the loop).** If this phase instead COMPLETES work
 that a registered gate was watching (a previously-blocked phase now finishes), it

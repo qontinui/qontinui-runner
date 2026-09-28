@@ -375,7 +375,12 @@ whose PR may already have landed". When it says no PR carries the push and
 commits remain unlanded, take its fresh-branch path and open the new PR:
 **`coord_create_pr` first, then `gh pr create`**, with a line-anchored
 `Plan: <stem>` marker in the body. **Never `gh pr merge`, never `--admin`** —
-coord is the sole merge authority. Runbook:
+coord is the sole merge authority. Open it in `/implement-plan` Step 4.5b's
+served door order (the runner's loopback door sits between the coord door and
+the `gh` fallback), then READ it back — the same `gh pr list --repo <owner/repo>
+--head <branch> --state all` read as above — and take the PR number only from a
+row whose `headRefOid` is the head you pushed, never from the create call's exit
+status or output. Runbook:
 `knowledge-base/qontinui-specific/bodyless-work-units-and-stranded-plans.md`.
 
 Note what publishing the plan does **not** by itself buy you: it does not make the

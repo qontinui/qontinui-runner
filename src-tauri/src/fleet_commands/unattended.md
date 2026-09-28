@@ -104,6 +104,31 @@ whose PR may already have landed":
 - Landed-ness is per-commit `git patch-id --stable`, never
   `git merge-base --is-ancestor`, because after a rebase-land your SHA is never
   on `main`.
+- **But patch-id UNDER-REPORTS too, and a patch-id `UNLANDED` is therefore
+  UNKNOWN rather than a strand.** It is sound only on a branch nothing merged
+  INTO. Where coord's merge orchestrator merged `main` into the branch before
+  landing it — which it does routinely to clear a conflict, leaving a
+  `Merge branch 'main' into …` commit on the branch — the patch coord finally
+  lands is not the patch your commit carried, so the hash does not match. The
+  merge commits themselves never match either, for the same reason.
+- **Escalate every patch-id `UNLANDED` to a per-file BLOB comparison before
+  recording anything.** For each file the branch changed against its base,
+  compare `git rev-parse <tip>:<path>` against `git rev-parse origin/main:<path>`;
+  an identical blob sha means that file's content is on `main` whatever any
+  commit-level test said. Read the residue carefully: a file that DIFFERS is
+  only a strand if YOUR change is the thing missing from it — `main` moving on
+  after the land edits your files legitimately, so grep `main` for your own
+  additions in exactly those files before concluding.
+- This is a DETECTING consumer and the firing condition is "not found on
+  `main`", so an input you could not measure must not reach it
+  [policy: `verification-and-evidence` `an-unknown-input-must-not-fire-a-detector`].
+  Recording a strand off patch-id alone manufactures a false one, and the
+  remediation it triggers re-proposes landed work.
+  MEASURED 2026-09-28 on `qontinui/qontinui-runner#1597`: patch-id called 2 of
+  8 non-merge commits UNLANDED, including the one that created a 1054-line new
+  file that was on `main` the whole time. 32 of the branch's 35 files were
+  byte-identical to `main` and the other 3 carried every one of its additions.
+  Coord memory `383738fd-4f6d-4b0e-90b0-44443cf4438a`.
 
 Read it with `gh pr list --head <branch> --state all --json number,state,headRefOid`.
 Without `--state all`, an empty answer cannot tell "no PR yet" from "PR closed
@@ -346,10 +371,14 @@ Independently of capture, audit this session against `planning-and-scope`
 <!-- detector-reach-fence:start -->
 > **A capability negative cites a CENSUS, never a probe.** Before recording
 > "no door", "agents cannot", "this route does not exist" or any other claim
-> that a capability is ABSENT, run `bash scripts/coord-route-census.sh
-> <fragment>` (qontinui-claude-config; reads `origin/main` of BOTH
-> `qontinui-coord` and `qontinui-web`, never a working tree and never a live
-> host) and paste its trailer verbatim beside the claim:
+> that a capability is ABSENT, run
+> `bash <workspace-root>/qontinui-claude-config/scripts/coord-route-census.sh <fragment>`
+> — spelled absolutely, because a bare `scripts/...` resolves only from a
+> checkout of `qontinui-claude-config`, and a session standing anywhere else
+> gets exit 127
+> (it reads `origin/main` of BOTH `qontinui-coord` and `qontinui-web`, never
+> a working tree and never a live host) — and paste its trailer verbatim
+> beside the claim:
 > `census: fragment=<f> hosts_read=coord.qontinui.io,api.qontinui.io ref=<sha>,<sha> routes=<n> unextracted=<n> unmounted=<n> generated=<ISO time>`
 > — the line that parses under `CENSUS_TRAILER_RE` in
 > `scripts/detector_reach/__init__.py`. A 401, 404 or 405 on ONE spelling of
@@ -675,10 +704,14 @@ the census trailer is part of the body, or the finding is not posted.
 <!-- detector-reach-fence:start -->
 > **A capability negative cites a CENSUS, never a probe.** Before recording
 > "no door", "agents cannot", "this route does not exist" or any other claim
-> that a capability is ABSENT, run `bash scripts/coord-route-census.sh
-> <fragment>` (qontinui-claude-config; reads `origin/main` of BOTH
-> `qontinui-coord` and `qontinui-web`, never a working tree and never a live
-> host) and paste its trailer verbatim beside the claim:
+> that a capability is ABSENT, run
+> `bash <workspace-root>/qontinui-claude-config/scripts/coord-route-census.sh <fragment>`
+> — spelled absolutely, because a bare `scripts/...` resolves only from a
+> checkout of `qontinui-claude-config`, and a session standing anywhere else
+> gets exit 127
+> (it reads `origin/main` of BOTH `qontinui-coord` and `qontinui-web`, never
+> a working tree and never a live host) — and paste its trailer verbatim
+> beside the claim:
 > `census: fragment=<f> hosts_read=coord.qontinui.io,api.qontinui.io ref=<sha>,<sha> routes=<n> unextracted=<n> unmounted=<n> generated=<ISO time>`
 > — the line that parses under `CENSUS_TRAILER_RE` in
 > `scripts/detector_reach/__init__.py`. A 401, 404 or 405 on ONE spelling of

@@ -236,7 +236,12 @@ fresh-branch path and open the new PR — **`coord_create_pr` first, then
 `gh pr create`** — with a line-anchored `Plan: <stem>` marker in the body,
 carrying the DELIVERY SCOPE for the phases this PR actually implements
 (`Plan: <stem> phases: 2,3` — `/implement-plan` Step 4.5 has the grammar and the
-reason). **Where this skill used to WITHHOLD a citation because the PRs deliver
+reason). Open it in `/implement-plan` Step 4.5b's served door order (the
+runner's loopback door sits between the coord door and the `gh` fallback), then
+READ it back — `gh pr list --repo <owner/repo> --head <branch> --state all
+--json number,url,state,headRefOid` — and take the PR number only from a row
+whose `headRefOid` is the head you pushed, never from the create call's exit
+status or output. **Where this skill used to WITHHOLD a citation because the PRs deliver
 only part of the plan, cite it with a scope instead.** Withholding never worked:
 the webhook auto-captures the `Plan:` marker from the PR body and those captures
 are not removable, so a withheld citation was recorded anyway — measured
@@ -759,7 +764,7 @@ fresh visible session to implement the plan instead of leaving it stranded.
 > holds only while the unit is at its vetted status with no unmuted sibling
 > open. The net above is registered on the same `work_unit_id` seconds later
 > and pins it `Open`; `/implement-plan` Step 0.5 then transitions the unit to
-> `in_progress` **before** it mutes that net — so the window in which the record
+> `in_progress` **before** it withdraws that net — so the window in which the record
 > gate could clear is closed by this chain's own next step, and the gate fails
 > **OPEN** with no alert until the 7-day stale sweep. Measured 2026-09-04 over
 > 26 work units: **6 of 25 `unit_ready` gates (24%) ended unclearable**; the rest
@@ -778,7 +783,7 @@ fresh visible session to implement the plan instead of leaving it stranded.
 >
 > ⛔ **But `all_unit_gates_cleared` is `total > 0 && total == cleared`, and the
 > first conjunct matters.** The query now excludes archived, muted AND withdrawn
-> rows (`work_unit_derive_worker.rs:752` — the old `:337-353` citation had
+> rows (`work_unit_derive_worker.rs:1077` — the old `:337-353` citation had
 > drifted), so withdrawal REMOVES the row: withdraw the last counted gate and
 > `total = 0`, which is **vacuously false**. Coord's own regression test only
 > demonstrates the fix on a unit that keeps another cleared gate. So withdrawal
@@ -821,19 +826,33 @@ The net's window is genuinely unsatisfied for its whole 30 minutes, which is the
 property `unit_ready` could not provide: it is false the instant it is armed and
 becomes true only if nobody picks the plan up.
 
-`/implement-plan` Step 0.5 retires the net when it stamps IN PROGRESS —
-**cancel, then mute**, on the `"vet→implement safety net"` gate specifically
-(`coord_cancel_continuation {gate_id, reason}`, or the REST twin
-`POST $COORD_HTTP_URL/coord/gates/<gate_id>/agent/continuation-cancel`; then
-mute, or the record gate stays pinned `Open` on it as a sibling —
-`coord_withdraw_gate` is the one-call equivalent and is LIVE). At that stamp the
+`/implement-plan` Step 0.5 retires the net when it stamps IN PROGRESS — by
+**withdrawing** the `"vet→implement safety net"` gate specifically:
+`coord_withdraw_gate {gate_id, reason}`, or its HTTP twin, the bare device-authed
+`POST $COORD_HTTP_URL/coord/gates/<gate_id>/withdraw` `{reason}` (no `/agent/`
+infix exists for withdraw), with reason
+`safety net retired: implementation taken over by session <id>`. One call sets
+the terminal, non-clear, non-paging `withdrawn` verdict, cancels a
+dispatched-but-unconsumed continuation itself, and takes the row out of the open
+set (`withdraw_gate_core`, qontinui-coord `gates.rs:9131`). It replaced *cancel,
+then mute* on 2026-09-27: for `open_sibling_gates` and `all_unit_gates_cleared`
+the two are identical, but a muted gate stays `open` and the sweep skips it, so
+it never clears — **mute is for noise, not retirement** (plan
+`2026-09-27-gate-backlog-is-unretired-gates-not-slow-spawns`). The pre-dispatch
+cancel (`coord_cancel_continuation {gate_id, reason}`, or the REST twin
+`POST $COORD_HTTP_URL/coord/gates/<gate_id>/agent/continuation-cancel`) may
+precede the withdraw as a race optimisation; and when the withdraw answers
+`NotRegistrant` (not the registrant — MCP error or HTTP 403; causes: `_gate-registration` → "Continuation cancel + refresh", point 2) Step 0.5 falls back to that
+cancel plus `coord_mute_gate {gate_id}` (REST twin
+`POST $COORD_HTTP_URL/coord/gates/<gate_id>/agent/mute`) and names the gate id in
+its closeout. At that stamp the
 **expected** row state is `continuation_spawn != null ∧ dispatched_at == null`
 — pre-dispatch and armed, which is precisely what a 30-minute window exists to
-produce, and `cancel_continuation` deliberately omits the
-`continuation_dispatched_at IS NOT NULL` guard (*"the pre-dispatch stamp is the
-whole point"*). A `409 already_consumed` now means the chain took **longer than
-the window** to reach Step 0.5, not that the race is unwinnable; the residual is
-then a **visible** redundant terminal that should stand down at
+produce; a withdrawn gate never clears, so it never dispatches. A consumed
+continuation (the optional cancel's `409 already_consumed`) now means the chain
+took **longer than the window** to reach Step 0.5, not that the race is
+unwinnable; the withdraw still follows, and the residual is then a **visible**
+redundant terminal that should stand down at
 `/implement-plan` Step 0.45 / Step 0.6 — never a silent strand.
 
 This is a **backstop, not a licence to stop here**: a stalled chain that gets
@@ -1232,8 +1251,8 @@ Branch on its exit code, exactly as Step 4.7 documents it:
   CONTRADICTION also
   means the PR body's `Coord-Reviewed-Head:` line is stale — coord's
   `require_review` gate reads that line, not the artifact — so the re-review
-  must edit the body (`gh pr edit <n> --body-file <file>`, `/implement-plan`
-  Step 4.5) as well as re-record.
+  must edit the body (`gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -F "body=@<file>"`,
+  `/implement-plan` Step 4.5 — never `gh pr edit`, which fails before writing) as well as re-record.
 - **`3` UNKNOWN** — the door did not answer (`unknown_door` — it refused;
   `unknown_door_timeout` — its curl gave up with exit 28, its connect bound or
   its `COORD_REVIVE_CALL_TIMEOUT` total bound; `unknown_budget_expired` — this
