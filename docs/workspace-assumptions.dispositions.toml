@@ -14,45 +14,18 @@
 # After editing, regenerate the roster:
 #   UPDATE_WORKSPACE_ASSUMPTIONS=1 cargo-guard.sh test --test workspace_assumptions_are_enumerated
 #
+# THE RATCHET (plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists,
+# Phase A6): the roster's `unreviewed` ROW count must EQUAL this. A new
+# unreviewed row reds the test, naming it — review it here, or remove the
+# assumption; raising this number instead is a visible choice that needs its
+# reason in the PR. When triage brings the count down, the test asks for this
+# number to come down with it, so the gain is held.
+unreviewed_ceiling = 218
+
 # First triage pass (plan 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports Phase 4):
 # every supervisor_dependency, tenant_literal and machine_path key. The
 # supervisor is dev-only; a user-facing path that depends on :9875 is a defect
 # (src-tauri/src/webview_recovery.rs module doc).
-
-[[disposition]]
-class = "machine_path"
-file = "src/commands/accessibility.rs"
-symbol = "get_default_chrome_paths"
-disposition = "fallback_correct"
-note = "Standard Windows browser install locations inside a cfg!(windows) branch, used as existence-checked candidates."
-reviewed = [
-    "r\"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe\",",
-    "r\"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe\",",
-    "r\"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe\",",
-    "r\"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe\",",
-    "r\"C:\\Users\\%USERNAME%\\AppData\\Local\\Google\\Chrome\\Application\\chrome.exe\",",
-]
-
-[[disposition]]
-class = "machine_path"
-file = "src/commands/global_log_sources.rs"
-symbol = "find_log_sources_with_ai"
-disposition = "fallback_correct"
-note = "Example paths in an AI prompt's prose, not a path the runner reads."
-reviewed = [
-    "\"C:/ProgramData, %APPDATA%, etc.\"",
-    "{{\\\"name\\\": \\\"Application Log\\\", \\\"type\\\": \\\"file\\\", \\\"path\\\": \\\"C:/ProgramData/AppName/logs/app.log\\\", \\\"description\\\": \\\"Main applicati...",
-]
-
-[[disposition]]
-class = "machine_path"
-file = "src/commands/mobile.rs"
-symbol = "find_adb_path"
-disposition = "fallback_correct"
-note = "Last-resort candidate after the configured adb_path and PATH; existence-checked."
-reviewed = [
-    "PathBuf::from(r\"C:\\Android\\sdk\\platform-tools\\adb.exe\"),",
-]
 
 [[disposition]]
 class = "machine_path"
@@ -62,27 +35,6 @@ disposition = "fallback_correct"
 note = "Probes the fleet's C:\\claude multi-account convention behind is_dir(); absent everywhere else, where CLAUDE_CONFIG_DIR and ~/.claude still apply."
 reviewed = [
     "let claude_root = std::path::Path::new(\"C:\\\\claude\");",
-]
-
-[[disposition]]
-class = "machine_path"
-file = "src/demo_workflows.rs"
-symbol = "update_workspace_paths"
-disposition = "fallback_correct"
-note = "Placeholder text REPLACED by the resolved temp dir; the literal is never used as a path."
-reviewed = [
-    "script.replace(\"C:/temp/qontinui-demo\", &demo_base_str)",
-]
-
-[[disposition]]
-class = "machine_path"
-file = "src/mcp/misc.rs"
-symbol = "launch_debug_chrome"
-disposition = "fallback_correct"
-note = "Standard Windows Chrome install locations, existence-checked candidates."
-reviewed = [
-    "r\"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe\",",
-    "r\"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe\",",
 ]
 
 [[disposition]]
@@ -97,16 +49,6 @@ reviewed = [
 
 [[disposition]]
 class = "machine_path"
-file = "src/mcp/test_fixtures.rs"
-symbol = "record_from_seed"
-disposition = "dev_only_surface"
-note = "Debug-gated test-fixture injection endpoints; C:/repo is a fake session's working dir."
-reviewed = [
-    "working_dir: seed.working_dir.clone().or(Some(\"C:/repo\".to_string())),",
-]
-
-[[disposition]]
-class = "machine_path"
 file = "src/projects/snapshot.rs"
 symbol = "const NOISE_PREFIXES"
 disposition = "fallback_correct"
@@ -117,35 +59,12 @@ reviewed = [
 
 [[disposition]]
 class = "machine_path"
-file = "src/reflection/workflow.rs"
-symbol = "build_execution_analysis_steps"
-disposition = "fallback_correct"
-note = "Example path inside an AI prompt's prose."
-reviewed = [
-    "Reasoning: The AI spent 3 iterations searching for project files because it didn't know the workspace root. The conversation output shows...",
-]
-
-[[disposition]]
-class = "machine_path"
 file = "src/session_archive/discovery.rs"
 symbol = "discover_account_homes_from_env"
 disposition = "fallback_correct"
 note = "Probes C:/claude behind is_dir() on every platform, per its own doc comment; false everywhere else."
 reviewed = [
     "Some(PathBuf::from(\"C:\\\\claude\")),",
-]
-
-[[disposition]]
-class = "machine_path"
-file = "src/step_executor/handlers/shell_command.rs"
-symbol = "ShellCommandHandler::find_git_bash"
-disposition = "fallback_correct"
-note = "Standard Git-for-Windows install locations, existence-checked candidates."
-reviewed = [
-    "r\"C:\\Program Files (x86)\\Git\\bin\\bash.exe\",",
-    "r\"C:\\Program Files (x86)\\Git\\usr\\bin\\bash.exe\",",
-    "r\"C:\\Program Files\\Git\\bin\\bash.exe\",",
-    "r\"C:\\Program Files\\Git\\usr\\bin\\bash.exe\",",
 ]
 
 [[disposition]]
@@ -219,16 +138,6 @@ disposition = "dev_only_surface"
 note = "Registered only when <workspace-root>/qontinui-supervisor/frontend exists, i.e. only on a developer workspace."
 reviewed = [
     "\"http://localhost:9875\",",
-]
-
-[[disposition]]
-class = "supervisor_dependency"
-file = "src/env_agent/collectors.rs"
-symbol = "const KNOWN_DEV_PORTS"
-disposition = "dev_only_surface"
-note = "Liveness probe of the dev-topology ports for the env report; 'closed' is the correct reading on an operator box."
-reviewed = [
-    "(\"supervisor\", 9875),",
 ]
 
 [[disposition]]
