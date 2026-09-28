@@ -19,7 +19,7 @@
  * Plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists, B2.
  */
 
-import { useEffect, useState } from "react";
+import { useSyncExternalStore } from "react";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 /** Wire shape of `GET /supervisor/observation` (inside the `ApiResponse` envelope). */
@@ -88,35 +88,70 @@ export async function fetchSupervisorObservation(): Promise<SupervisorObservatio
   return body.data;
 }
 
-export function useSupervisorObservation(
-  pollMs: number = SUPERVISOR_OBSERVATION_POLL_MS,
+// ---------------------------------------------------------------------------
+// One shared poller. The sidebar, the Settings sub-nav and the panel itself
+// all read this; each mounting its own interval would triple the runner-side
+// probes for one answer. The interval runs while at least one subscriber is
+// mounted and stops when the last one leaves.
+// ---------------------------------------------------------------------------
+
+let sharedState: SupervisorObservationState = { kind: "loading" };
+const listeners = new Set<() => void>();
+let timer: number | null = null;
+
+function publish(next: SupervisorObservationState) {
+  sharedState = next;
+  for (const l of listeners) l();
+}
+
+/**
+ * The transition rule, PURE. A failed RE-read keeps the last actual
+ * observation: unmounting a panel mid-build (or dropping its nav entry)
+ * because one poll of the runner timed out would act on a hop that says
+ * nothing about the supervisor. Only a read that answers moves the verdict.
+ */
+export function nextObservationState(
+  prev: SupervisorObservationState,
+  outcome: { ok: true; observation: SupervisorObservation } | { ok: false; message: string },
 ): SupervisorObservationState {
-  const [state, setState] = useState<SupervisorObservationState>({ kind: "loading" });
+  if (outcome.ok) return { kind: "read", observation: outcome.observation };
+  return prev.kind === "read" ? prev : { kind: "error", message: outcome.message };
+}
 
-  useEffect(() => {
-    let cancelled = false;
-    const read = async () => {
-      try {
-        const observation = await fetchSupervisorObservation();
-        if (!cancelled) setState({ kind: "read", observation });
-      } catch (err) {
-        if (!cancelled) {
-          // A failed RE-read keeps the last actual observation: unmounting a
-          // panel mid-build because one poll of the runner timed out would
-          // abort the operator's work over a hop that says nothing about the
-          // supervisor. Only a read that answers moves the verdict.
-          const message = err instanceof Error ? err.message : String(err);
-          setState((prev) => (prev.kind === "read" ? prev : { kind: "error", message }));
-        }
-      }
-    };
-    void read();
-    const id = window.setInterval(() => void read(), pollMs);
-    return () => {
-      cancelled = true;
-      window.clearInterval(id);
-    };
-  }, [pollMs]);
+async function readOnce() {
+  try {
+    const observation = await fetchSupervisorObservation();
+    publish(nextObservationState(sharedState, { ok: true, observation }));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    publish(nextObservationState(sharedState, { ok: false, message }));
+  }
+}
 
-  return state;
+function subscribe(listener: () => void): () => void {
+  listeners.add(listener);
+  if (timer === null) {
+    void readOnce();
+    timer = window.setInterval(() => void readOnce(), SUPERVISOR_OBSERVATION_POLL_MS);
+  }
+  return () => {
+    listeners.delete(listener);
+    if (listeners.size === 0 && timer !== null) {
+      window.clearInterval(timer);
+      timer = null;
+    }
+  };
+}
+
+export function useSupervisorObservation(): SupervisorObservationState {
+  return useSyncExternalStore(
+    subscribe,
+    () => sharedState,
+    () => sharedState,
+  );
+}
+
+/** Convenience for nav gating: `true` only for an OBSERVED supervisor. */
+export function useSupervisorObserved(): boolean {
+  return observedSupervisorBase(useSupervisorObservation()) !== null;
 }

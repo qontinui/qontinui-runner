@@ -110,7 +110,13 @@ export function resolveLandingTab(stored: string | null, ctx: LandingContext): M
   // but has no `SETTINGS_ITEMS` entry, so the registry-membership check below
   // would wave it straight through. Ask the gate that actually governs it.
   if (migrated.startsWith("settings-")) {
-    return isSettingsNavItemVisible(migrated, isEnabled) ? migrated : DEFAULT_TAB_ID;
+    // `supervisorObserved: true` — the cold-start resolver runs before any
+    // supervisor observation exists, and a dev-surface tab can only have been
+    // persisted from a box that listed it; if none is observed now, the panel
+    // itself renders its neutral "not available" line.
+    return isSettingsNavItemVisible(migrated, isEnabled, undefined, true)
+      ? migrated
+      : DEFAULT_TAB_ID;
   }
 
   // Not a sidebar item at all → a deliberate destination, honour it.

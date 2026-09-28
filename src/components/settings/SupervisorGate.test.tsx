@@ -30,6 +30,7 @@ import { DevLoopSettings } from "./DevLoopSettings";
 import { DiscoverySettings } from "./DiscoverySettings";
 import { NOT_AVAILABLE_TEXT, SupervisorGateView } from "./SupervisorGate";
 import {
+  nextObservationState,
   observedSupervisorBase,
   observedSupervisorPort,
   withObservedPort,
@@ -152,5 +153,27 @@ describe("observation helpers", () => {
     expect(withObservedPort([1, 2], 3)).toEqual([1, 2, 3]);
     expect(withObservedPort([1, 2], 2)).toEqual([1, 2]);
     expect(withObservedPort([1, 2], null)).toEqual([1, 2]);
+  });
+});
+
+describe("nextObservationState — a transient failure keeps the last read", () => {
+  it("keeps an observed read across a failed re-read", () => {
+    const prev = read(true);
+    expect(nextObservationState(prev, { ok: false, message: "timeout" })).toBe(prev);
+  });
+  it("reports error only when there was no read yet", () => {
+    expect(nextObservationState({ kind: "loading" }, { ok: false, message: "x" })).toEqual({
+      kind: "error",
+      message: "x",
+    });
+  });
+  it("an answering read always moves the verdict", () => {
+    const next = read(false);
+    expect(
+      nextObservationState(read(true), {
+        ok: true,
+        observation: (next as Extract<SupervisorObservationState, { kind: "read" }>).observation,
+      }),
+    ).toEqual(next);
   });
 });

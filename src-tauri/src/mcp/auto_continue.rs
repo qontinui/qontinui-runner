@@ -204,7 +204,9 @@ async fn get_supervisor_observation() -> Json<ApiResponse<SupervisorObservation>
         Err(e) => Json(ApiResponse {
             success: false,
             data: None,
-            error: Some(format!("supervisor observation probe did not complete: {e}")),
+            error: Some(format!(
+                "supervisor observation probe did not complete: {e}"
+            )),
             error_detail: None,
             hint: None,
             code: None,
