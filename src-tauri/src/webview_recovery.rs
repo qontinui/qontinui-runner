@@ -1012,7 +1012,8 @@ pub fn classify_latch(age_ms: Option<u64>) -> LatchReport {
 /// run reportable.
 static RECOVERY_LATCH: InFlightLatch = InFlightLatch::new();
 
-/// Held between `destroy()` and the rebuild — the exit veto's flag. Carries the
+/// Held across the recreate swap — taken before `capture_placement`'s window
+/// reads and released after the rebuild — the exit veto's flag. Carries the
 /// same age term so a permanent [`ExitVeto::VetoSwapInFlight`] is legible;
 /// **what the veto decides is unchanged**.
 static WINDOW_SWAP_LATCH: InFlightLatch = InFlightLatch::new();
@@ -1063,8 +1064,9 @@ static NATIVE_HANG_SURFACED: AtomicBool = AtomicBool::new(false);
 /// together by [`InProgressGuard::drop`], so a later wedge surfaces again.
 static RECOVERY_WEDGE_SURFACED: AtomicBool = AtomicBool::new(false);
 
-/// True while the recovery ladder is between `destroy()` and the rebuild of the
-/// main window.
+/// True while the recovery ladder is inside the recreate swap of the main
+/// window — from before its placement reads, through `destroy()`, to the
+/// rebuild.
 ///
 /// **Load-bearing, not cosmetic.** Tauri treats "the last window was destroyed"
 /// as an exit request: `tauri-runtime-wry`'s `TaoWindowEvent::Destroyed` arm
@@ -1889,22 +1891,24 @@ fn report_recovery_wedge(app: &tauri::AppHandle, refused: RecoveryReason, in_fli
         ),
     );
 
-    const TITLE: &str = "Qontinui Runner — UI recovery is stuck";
+    // The warning leads, in the title and the first sentence: this is the
+    // incident's ONLY channel (no dialog), and a Windows toast shows only the
+    // first few wrapped lines of its body, so what must not be missed — do not
+    // end the runner reflexively — cannot sit in a later paragraph.
+    const TITLE: &str = "Qontinui Runner — UI recovery stuck; don't end the runner yet";
     // The whole run's in-flight time (backoff, reload watch and recreate), not
     // only the time spent blocked on the window system — so the text says
     // "trying to recover for", never "waiting on the window system for".
     let in_flight_secs = in_flight_ms / 1000;
     let body = format!(
-        "The runner has been trying to recover its window for {in_flight_secs} seconds and is \
-         waiting on the window system — the window may be frozen or missing until it \
-         answers.\n\n\
-         Automation and the API on port 9876 are still running, and your sessions are NOT \
-         lost right now. The window usually returns on its own.\n\n\
-         If it has not come back after several minutes it may be stuck for good, and the only \
-         way out is to end the Qontinui Runner process from Task Manager — which ends every \
-         session in flight, so check http://127.0.0.1:9876/restart-readiness first. An \
-         incident line has been written to wedge-incidents.log in the runner's dev-logs \
-         directory."
+        "Your sessions and the API are still running; ending the runner process ends every \
+         session in flight. The window has been recovering for {in_flight_secs} s and may be \
+         frozen or missing until the window system answers — it can come back on its own. \
+         If the window is back, ignore this.\n\n\
+         If it has not returned after several minutes it may be stuck for good; the only way \
+         out is ending the Qontinui Runner process, so check \
+         http://127.0.0.1:9876/restart-readiness first. Details are in wedge-incidents.log in \
+         the runner's dev-logs directory."
     );
     // Toast only: a loop-queued dialog could appear only after the wedge ended.
     if surface_incident_to_user(
