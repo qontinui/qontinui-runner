@@ -29,11 +29,11 @@ use std::time::{Duration, Instant};
 
 use crate::frame::{read_frame, write_frame, Frame, KIND_CONTROL};
 use crate::lock::{read_record, LockRecord, PaneLock, TryLock};
-use crate::pane::{lock_path, PaneId};
+use crate::pane::{check_private_dir, lock_path, PaneId};
 use crate::protocol::{
     parse_reply, to_payload, CensusReply, HelloAck, Reply, Request, PROTOCOL_VERSIONS,
 };
-use crate::transport::{self, remaining, Conn};
+use crate::transport::{self, remaining, Conn, DeadlineIo};
 
 /// Why [`connect`] did not produce a [`Client`].
 #[derive(Debug)]
@@ -138,8 +138,11 @@ pub fn connect_with_versions(
 }
 
 fn send(conn: &mut Conn, req: &Request, deadline: Instant) -> io::Result<()> {
-    conn.set_timeout(Some(remaining(deadline)?))?;
-    write_frame(conn, KIND_CONTROL, &to_payload(req))
+    write_frame(
+        &mut DeadlineIo::new(conn, deadline),
+        KIND_CONTROL,
+        &to_payload(req),
+    )
 }
 
 fn recv(conn: &mut Conn, deadline: Instant) -> Result<Reply, ConnectError> {
@@ -154,8 +157,7 @@ fn recv(conn: &mut Conn, deadline: Instant) -> Result<Reply, ConnectError> {
 }
 
 fn recv_frame(conn: &mut Conn, deadline: Instant) -> io::Result<Frame> {
-    conn.set_timeout(Some(remaining(deadline)?))?;
-    read_frame(conn)?
+    read_frame(&mut DeadlineIo::new(conn, deadline))?
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "holder closed the connection"))
 }
 
@@ -199,14 +201,16 @@ impl Client {
         payload: &[u8],
         deadline: Instant,
     ) -> io::Result<()> {
-        self.conn.set_timeout(Some(remaining(deadline)?))?;
-        write_frame(&mut self.conn, kind, payload)
+        write_frame(
+            &mut DeadlineIo::new(&mut self.conn, deadline),
+            kind,
+            payload,
+        )
     }
 
     /// Read one raw frame, or `None` at a clean EOF.
     pub fn recv_raw_frame(&mut self, deadline: Instant) -> io::Result<Option<Frame>> {
-        self.conn.set_timeout(Some(remaining(deadline)?))?;
-        read_frame(&mut self.conn)
+        read_frame(&mut DeadlineIo::new(&mut self.conn, deadline))
     }
 }
 
@@ -226,13 +230,15 @@ pub struct RawConn {
 
 impl RawConn {
     pub fn send_frame(&mut self, kind: u8, payload: &[u8], deadline: Instant) -> io::Result<()> {
-        self.conn.set_timeout(Some(remaining(deadline)?))?;
-        write_frame(&mut self.conn, kind, payload)
+        write_frame(
+            &mut DeadlineIo::new(&mut self.conn, deadline),
+            kind,
+            payload,
+        )
     }
 
     pub fn recv_frame(&mut self, deadline: Instant) -> io::Result<Option<Frame>> {
-        self.conn.set_timeout(Some(remaining(deadline)?))?;
-        read_frame(&mut self.conn)
+        read_frame(&mut DeadlineIo::new(&mut self.conn, deadline))
     }
 }
 
@@ -276,6 +282,19 @@ pub fn probe_with_versions(
     deadline: Instant,
     versions: &[u32],
 ) -> Probe {
+    // Never trust a directory we did not verify: a pane dir another user can
+    // write to could hold a planted lock file or endpoint (Unix; a no-op on
+    // Windows, where the pipe's owner is proven against the lock record).
+    match check_private_dir(pane_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Probe::Absent,
+        Err(e) => {
+            return Probe::Unknown {
+                reason: format!("pane dir refused: {e}"),
+                record: None,
+            }
+        }
+    }
     let lock_file = lock_path(pane_dir, pane);
     match std::fs::symlink_metadata(&lock_file) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Probe::Absent,
@@ -328,19 +347,33 @@ pub struct CensusEntry {
 /// Probe every `*.lock` in `pane_dir` concurrently, all under ONE deadline
 /// `timeout` from now. Returns rows sorted by pane id.
 ///
-/// An unreadable pane directory is an error — the census is UNKNOWN, not
+/// An unreadable pane directory — or, on Unix, one that is a symlink, not
+/// ours, or group/other-writable — is an error: the census is UNKNOWN, not
 /// empty. A missing one is an empty census (no holder was ever started there).
-pub fn census(pane_dir: &Path, timeout: Duration) -> io::Result<Vec<CensusEntry>> {
-    census_with_versions(pane_dir, timeout, PROTOCOL_VERSIONS)
+///
+/// **The same lock race as [`probe`]:** probing a pane whose holder has not
+/// yet answered takes that pane's lock for a moment when the handshake fails,
+/// and a holder being spawned at that instant loses its lock race and exits
+/// `lock held`. Pass the panes the caller is currently spawning in `skip`:
+/// they are not probed and are reported as `Unknown` ("being spawned by the
+/// caller") — counted, never dropped.
+pub fn census(pane_dir: &Path, timeout: Duration, skip: &[PaneId]) -> io::Result<Vec<CensusEntry>> {
+    census_with_versions(pane_dir, timeout, skip, PROTOCOL_VERSIONS)
 }
 
 /// [`census`] with an explicit version offer.
 pub fn census_with_versions(
     pane_dir: &Path,
     timeout: Duration,
+    skip: &[PaneId],
     versions: &[u32],
 ) -> io::Result<Vec<CensusEntry>> {
     let deadline = Instant::now() + timeout;
+    match check_private_dir(pane_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    }
     let entries = match std::fs::read_dir(pane_dir) {
         Ok(e) => e,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -377,6 +410,16 @@ pub fn census_with_versions(
                 continue;
             }
         };
+        if skip.contains(&pane) {
+            rows.push(CensusEntry {
+                probe: Probe::Unknown {
+                    reason: "not probed: being spawned by the caller".into(),
+                    record: read_record(&lock_path(pane_dir, &pane)),
+                },
+                pane_id: stem,
+            });
+            continue;
+        }
         pending.push(stem.clone());
         let tx = tx.clone();
         let dir = pane_dir.to_path_buf();

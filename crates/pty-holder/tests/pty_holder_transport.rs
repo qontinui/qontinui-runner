@@ -90,9 +90,50 @@ fn spawn_holder(dir: &Path, pane: &str) -> (Spawned, String) {
         .spawn()
         .expect("spawn holder");
     let stdout = child.stdout.take().unwrap();
-    let mut line = String::new();
-    BufReader::new(stdout).read_line(&mut line).unwrap();
-    (Spawned { child }, line.trim().to_string())
+    // Bounded: a holder that never prints must fail the test, not hang it.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = BufReader::new(stdout).read_line(&mut line);
+        let _ = tx.send(line);
+    });
+    let spawned = Spawned { child };
+    match rx.recv_timeout(Duration::from_secs(15)) {
+        Ok(line) => (spawned, line.trim().to_string()),
+        // `spawned` is dropped here, killing and reaping the child.
+        Err(_) => panic!("holder printed no report line within 15 s"),
+    }
+}
+
+/// A private pane dir (0700), as the runner will create it — never one whose
+/// mode depends on this test process's umask.
+fn make_private_dir(dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .unwrap();
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir).unwrap();
+}
+
+/// Probe until `want` holds or `bound` elapses; returns the last verdict.
+/// A holder's lock is released by the OS as the process is torn down, which on
+/// Windows can lag the `wait()` that reaped it — so "dead" is polled for, not
+/// asserted once.
+fn probe_until(dir: &Path, pane: &str, bound: Duration, want: impl Fn(&Probe) -> bool) -> Probe {
+    let end = Instant::now() + bound;
+    loop {
+        let p = probe(dir, &pid(pane), Instant::now() + Duration::from_secs(2));
+        if want(&p) || Instant::now() >= end {
+            return p;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn spawn_ready(dir: &Path, pane: &str) -> Spawned {
@@ -117,7 +158,9 @@ fn expect_rejected(frame: Option<qontinui_pty_holder::frame::Frame>, want: Rejec
 fn pty_holder_probe_of_a_pane_with_no_lock_is_absent() {
     let dir = pane_dir("absent");
     assert_eq!(probe(&dir, &pid("nobody"), soon()), Probe::Absent);
-    assert!(census(&dir, Duration::from_secs(1)).unwrap().is_empty());
+    assert!(census(&dir, Duration::from_secs(1), &[])
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -273,7 +316,7 @@ fn pty_holder_no_common_version_is_incompatible_not_dead() {
             holder_versions: PROTOCOL_VERSIONS.to_vec()
         }
     );
-    let rows = census_with_versions(&dir, Duration::from_secs(3), &future).unwrap();
+    let rows = census_with_versions(&dir, Duration::from_secs(3), &[], &future).unwrap();
     assert_eq!(rows.len(), 1);
     assert!(matches!(rows[0].probe, Probe::Incompatible { .. }));
 
@@ -341,7 +384,9 @@ fn pty_holder_killed_holder_is_dead_and_the_pane_is_reusable() {
     let old_pid = h.pid();
     h.kill();
 
-    match probe(&dir, &pid("p1"), soon()) {
+    match probe_until(&dir, "p1", Duration::from_secs(5), |p| {
+        matches!(p, Probe::Dead { .. })
+    }) {
         Probe::Dead { record } => assert_eq!(record.unwrap().holder_pid, old_pid),
         other => panic!("{other:?}"),
     }
@@ -368,7 +413,7 @@ fn pty_holder_killed_holder_is_dead_and_the_pane_is_reusable() {
 #[test]
 fn pty_holder_held_lock_without_handshake_is_unknown() {
     let dir = pane_dir("held");
-    std::fs::create_dir_all(&dir).unwrap();
+    make_private_dir(&dir);
     let _lock = match PaneLock::try_acquire(&lock_path(&dir, &pid("p1"))).unwrap() {
         TryLock::Acquired(l) => l,
         TryLock::Held => panic!("fresh"),
@@ -424,28 +469,36 @@ fn pty_holder_census_classifies_every_pane_under_one_deadline() {
     let mut dead = spawn_ready(&dir, "b-dead");
     let wedged = spawn_ready(&dir, "c-wedged");
     let wedged2 = spawn_ready(&dir, "d-wedged");
+    let wedged3 = spawn_ready(&dir, "e-wedged");
     dead.kill();
-    for w in [&wedged, &wedged2] {
+    assert!(matches!(
+        probe_until(&dir, "b-dead", Duration::from_secs(5), |p| matches!(
+            p,
+            Probe::Dead { .. }
+        )),
+        Probe::Dead { .. }
+    ));
+    for w in [&wedged, &wedged2, &wedged3] {
         // SAFETY: stopping children this test spawned.
         assert_eq!(unsafe { libc::kill(w.pid() as i32, libc::SIGSTOP) }, 0);
     }
     // A foreign lock file whose name is not a pane id is reported, not skipped.
     std::fs::write(dir.join("not a pane.lock"), b"").unwrap();
 
+    let timeout = Duration::from_millis(800);
     let started = Instant::now();
-    let rows = census(&dir, Duration::from_millis(800)).unwrap();
+    let rows = census(&dir, timeout, &[]).unwrap();
     let took = started.elapsed();
-    // Two wedged panes probed serially would take 2x the deadline; concurrently, ~1x.
-    assert!(
-        took < Duration::from_millis(1_500),
-        "census overran: {took:?}"
-    );
+    // Relative bound: three wedged panes probed serially would take >= 3x the
+    // deadline; concurrently under one deadline, ~1x. 2x leaves a full
+    // deadline of scheduling slack for a loaded box and still fails serial.
+    assert!(took < timeout * 2, "census overran: {took:?}");
 
     let by: std::collections::HashMap<_, _> = rows
         .iter()
         .map(|r| (r.pane_id.as_str(), &r.probe))
         .collect();
-    assert_eq!(rows.len(), 5, "{rows:#?}");
+    assert_eq!(rows.len(), 6, "{rows:#?}");
     assert!(
         matches!(by["a-healthy"], Probe::Healthy { hello_ack } if hello_ack.holder_pid == healthy.pid())
     );
@@ -464,8 +517,13 @@ fn pty_holder_census_classifies_every_pane_under_one_deadline() {
         "{:?}",
         by["d-wedged"]
     );
+    assert!(
+        matches!(by["e-wedged"], Probe::Unknown { .. }),
+        "{:?}",
+        by["e-wedged"]
+    );
     assert!(matches!(by["not a pane"], Probe::Unknown { .. }));
-    drop((healthy, wedged, wedged2));
+    drop((healthy, wedged, wedged2, wedged3));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -476,7 +534,14 @@ fn pty_holder_census_healthy_and_dead() {
     let healthy = spawn_ready(&dir, "live");
     let mut dead = spawn_ready(&dir, "gone");
     dead.kill();
-    let rows = census(&dir, Duration::from_secs(3)).unwrap();
+    assert!(matches!(
+        probe_until(&dir, "gone", Duration::from_secs(5), |p| matches!(
+            p,
+            Probe::Dead { .. }
+        )),
+        Probe::Dead { .. }
+    ));
+    let rows = census(&dir, Duration::from_secs(3), &[]).unwrap();
     assert_eq!(rows.len(), 2, "{rows:#?}");
     assert_eq!(rows[0].pane_id, "gone");
     assert!(matches!(rows[0].probe, Probe::Dead { .. }));
@@ -521,4 +586,136 @@ fn pty_holder_bin_usage_errors_exit_2() {
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
     assert!(out.stdout.starts_with(b"holder_error=start"));
+}
+
+/// L4: a pane the caller is spawning is not probed, but still counted.
+#[test]
+fn pty_holder_census_skip_is_counted_not_probed() {
+    let dir = pane_dir("skip");
+    let h = spawn_ready(&dir, "spawning");
+    let rows = census(&dir, Duration::from_secs(3), &[pid("spawning")]).unwrap();
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    match &rows[0].probe {
+        Probe::Unknown { reason, record } => {
+            assert!(reason.contains("being spawned"), "{reason}");
+            assert_eq!(record.as_ref().unwrap().holder_pid, h.pid());
+        }
+        other => panic!("{other:?}"),
+    }
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The connection cap: past MAX_CONNECTIONS live connections a new client
+/// gets a typed `busy` rejection, and the holder serves again once one closes.
+#[test]
+fn pty_holder_connection_cap_rejects_busy() {
+    use qontinui_pty_holder::server::MAX_CONNECTIONS;
+    let dir = pane_dir("cap");
+    let h = spawn_ready(&dir, "p1");
+    let pane = pid("p1");
+    let mut held: Vec<_> = (0..MAX_CONNECTIONS)
+        .map(|_| connect(&dir, &pane, soon()).expect("within the cap"))
+        .collect();
+    let mut over = connect_raw(&dir, &pane, soon()).unwrap();
+    expect_rejected(over.recv_frame(soon()).unwrap(), RejectReason::Busy);
+    // Healthy is not claimed while at the cap: the probe's own connection is
+    // the one refused.
+    assert!(!matches!(probe(&dir, &pane, soon()), Probe::Healthy { .. }));
+    held.pop();
+    let end = Instant::now() + Duration::from_secs(5);
+    loop {
+        match probe(&dir, &pane, soon()) {
+            Probe::Healthy { .. } => break,
+            other if Instant::now() >= end => panic!("never served again: {other:?}"),
+            _ => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    drop(held);
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// M2: the probe deadline bounds the whole OPERATION, not each syscall. A fake
+/// holder that holds the lock, accepts, and then trickles its reply one byte
+/// at a time — each byte inside a per-read timeout — must not stretch the
+/// probe past its deadline.
+#[cfg(unix)]
+#[test]
+fn pty_holder_trickling_peer_cannot_stretch_the_probe_deadline() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+
+    let dir = pane_dir("trickle");
+    make_private_dir(&dir);
+    let pane = pid("p1");
+    let _lock = match PaneLock::try_acquire(&lock_path(&dir, &pane)).unwrap() {
+        TryLock::Acquired(l) => l,
+        TryLock::Held => panic!("fresh"),
+    };
+    let listener = UnixListener::bind(dir.join("p1.sock")).unwrap();
+    let step = Duration::from_millis(150);
+    std::thread::spawn(move || {
+        if let Ok((mut s, _)) = listener.accept() {
+            let mut buf = [0u8; 64];
+            let _ = s.read(&mut buf);
+            // A valid hello_ack, one byte per `step`.
+            let ack = qontinui_pty_holder::frame::encode_frame(
+                KIND_CONTROL,
+                br#"{"type":"hello_ack","version":1,"holder_build":"x","holder_pid":1,"child_pid":null}"#,
+            )
+            .unwrap();
+            for b in ack {
+                std::thread::sleep(step);
+                if s.write_all(&[b]).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+
+    let deadline = Duration::from_millis(500);
+    let started = Instant::now();
+    let verdict = probe(&dir, &pane, started + deadline);
+    let took = started.elapsed();
+    assert!(
+        matches!(verdict, Probe::Unknown { .. }),
+        "a reply that cannot arrive by the deadline is Unknown: {verdict:?}"
+    );
+    // Per-syscall timeouts would have taken ~90 bytes x 150 ms.
+    assert!(
+        took < deadline + Duration::from_millis(300),
+        "probe overran its deadline: {took:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// L1: a pre-existing group/other-WRITABLE pane dir is refused, not repaired.
+#[cfg(unix)]
+#[test]
+fn pty_holder_writable_pane_dir_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = pane_dir("loose");
+    make_private_dir(&dir);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let (mut h, line) = spawn_holder(&dir, "p1");
+    assert!(line.starts_with("holder_error=start"), "{line}");
+    assert!(line.contains("writable"), "{line}");
+    assert_eq!(h.child.wait().unwrap().code(), Some(1));
+    let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o777, "refused, not chmod-repaired");
+    assert!(
+        !dir.join("p1.lock").exists(),
+        "nothing created in a refused dir"
+    );
+
+    // L2: the client refuses it too — typed, never Absent or Dead.
+    std::fs::write(dir.join("p1.lock"), b"").unwrap();
+    assert!(matches!(
+        probe(&dir, &pid("p1"), soon()),
+        Probe::Unknown { .. }
+    ));
+    let err = census(&dir, Duration::from_secs(1), &[]).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    let _ = std::fs::remove_dir_all(&dir);
 }

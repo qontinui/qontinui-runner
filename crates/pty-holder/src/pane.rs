@@ -16,6 +16,7 @@
 //! than a directory, so [`pipe_name`] folds the pane directory into the name.
 
 use std::fmt;
+use std::io;
 use std::path::{Path, PathBuf};
 
 /// Longest accepted pane id.
@@ -98,6 +99,58 @@ pub fn pipe_name(pane_dir: &Path, pane: &PaneId) -> String {
     )
 }
 
+/// Refuse a pane directory this user cannot trust (plan D5, both sides).
+///
+/// Unix: the path must be a real directory (not a symlink), owned by this
+/// process's effective uid, and not group- or other-WRITABLE — anyone who can
+/// write there can plant a lock file or an endpoint. `NotFound` passes through
+/// unchanged so callers can tell "no pane dir yet" from "refused"; every
+/// refusal is `PermissionDenied`.
+///
+/// Windows: only existence is checked. The directory inherits the per-user
+/// app-data ACL it is created under, and the client proves the pipe server
+/// against the lock record rather than trusting the directory.
+pub fn check_private_dir(dir: &Path) -> io::Result<()> {
+    let md = std::fs::symlink_metadata(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let refuse = |why: String| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("pane dir {}: {why}", dir.display()),
+            ))
+        };
+        if md.file_type().is_symlink() {
+            return refuse("is a symlink".into());
+        }
+        if !md.is_dir() {
+            return refuse("is not a directory".into());
+        }
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        if md.uid() != me {
+            return refuse(format!("owned by uid {}, not {me}", md.uid()));
+        }
+        if md.mode() & 0o022 != 0 {
+            return refuse(format!(
+                "mode {:o} is group/other-writable",
+                md.mode() & 0o777
+            ));
+        }
+    }
+    #[cfg(windows)]
+    {
+        if !md.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("pane dir {} is not a directory", dir.display()),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn dir_hash(pane_dir: &Path) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -164,6 +217,52 @@ mod tests {
         ] {
             assert!(PaneId::new(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pty_holder_check_private_dir_refusals() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!(
+            "pty-holder-pdir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let set = |p: &Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap()
+        };
+        set(&base, 0o700);
+        assert!(check_private_dir(&base).is_ok());
+        set(&base, 0o755);
+        assert!(check_private_dir(&base).is_ok(), "readable is not writable");
+        for m in [0o775, 0o757, 0o777] {
+            set(&base, m);
+            let e = check_private_dir(&base).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{m:o}");
+        }
+        set(&base, 0o700);
+        let link = base.with_extension("lnk");
+        std::os::unix::fs::symlink(&base, &link).unwrap();
+        assert_eq!(
+            check_private_dir(&link).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let file = base.join("f");
+        std::fs::write(&file, b"").unwrap();
+        assert_eq!(
+            check_private_dir(&file).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            check_private_dir(&base.join("missing")).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

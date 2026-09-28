@@ -14,10 +14,10 @@ use std::ptr::{null, null_mut};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND,
-    ERROR_INSUFFICIENT_BUFFER, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_PIPE_BUSY,
-    ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE,
-    INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, GetLastError, LocalFree, ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE,
+    ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_IO_PENDING, ERROR_NO_DATA,
+    ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, GENERIC_READ, GENERIC_WRITE,
+    HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -31,9 +31,9 @@ use windows_sys::Win32::Storage::FileSystem::{
     OPEN_EXISTING, PIPE_ACCESS_DUPLEX, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
 };
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeServerProcessId, WaitNamedPipeW,
-    PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
-    PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeServerProcessId,
+    WaitNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
+    PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows_sys::Win32::System::Threading::{
     CreateEventW, GetCurrentProcess, OpenProcessToken, WaitForSingleObject, INFINITE,
@@ -300,7 +300,21 @@ fn owner_only_descriptor() -> io::Result<SecurityDescriptor> {
     Ok(SecurityDescriptor(sd))
 }
 
-/// A listening pipe name. Always has one instance waiting for a client.
+/// A listening pipe name.
+///
+/// **Invariant: from `bind` on, this listener always owns at least one
+/// instance of the pipe name** — the `pending` one, waiting for a client. That
+/// is what keeps the name ours: while an instance with our owner-only DACL
+/// exists, nobody else can create another instance of that name, and once the
+/// last instance closes the name is free for anyone to create with a
+/// permissive DACL, which the runner would then connect to. So a replacement
+/// instance is always created BEFORE the one it replaces is given away or
+/// dropped, and a failed connect disconnects and REUSES its instance rather
+/// than dropping it.
+///
+/// If the invariant were ever broken (`pending` empty), the name is
+/// re-created as a FIRST instance, and `ERROR_ACCESS_DENIED` there means the
+/// name was squatted in the gap: a [`super::FatalAcceptError`].
 pub struct Listener {
     name: Vec<u16>,
     sd: SecurityDescriptor,
@@ -322,9 +336,23 @@ impl Listener {
             sd: owner_only_descriptor()?,
             pending: std::sync::Mutex::new(None),
         };
-        let first = listener.create_instance(true)?;
+        let first = listener.create_first_instance()?;
         *listener.pending.lock().unwrap_or_else(|p| p.into_inner()) = Some(first);
         Ok(listener)
+    }
+
+    /// A first instance; `ERROR_ACCESS_DENIED` means someone else already
+    /// holds the name, which is fatal.
+    fn create_first_instance(&self) -> io::Result<Handle> {
+        self.create_instance(true).map_err(|e| {
+            if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
+                io::Error::other(super::FatalAcceptError(format!(
+                    "pipe name is held by another process (squatted): {e}"
+                )))
+            } else {
+                e
+            }
+        })
     }
 
     fn create_instance(&self, first: bool) -> io::Result<Handle> {
@@ -357,41 +385,82 @@ impl Listener {
         Ok(Handle(h))
     }
 
-    /// Wait for a client on the pending instance, then create the next one
-    /// before returning so a second client never finds the name absent.
-    pub fn accept(&self) -> io::Result<Conn> {
-        let mut slot = self.pending.lock().unwrap_or_else(|p| p.into_inner());
-        let h = match slot.take() {
-            Some(h) => h,
-            None => self.create_instance(false)?,
-        };
+    /// Wait for a client on `h`.
+    fn connect_instance(h: &Handle) -> io::Result<()> {
         let event = new_event()?;
         // SAFETY: plain data, zeroed initial state.
         let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
         ov.hEvent = event.0;
         // SAFETY: valid pipe handle; `ov` outlives the wait below.
         let ok = unsafe { ConnectNamedPipe(h.0, &mut ov) };
-        if ok == 0 {
-            match last_error() {
-                ERROR_PIPE_CONNECTED => {}
-                ERROR_IO_PENDING => {
-                    let mut n = 0u32;
-                    // SAFETY: valid handles; wait for the connect to finish.
-                    let done = unsafe {
-                        WaitForSingleObject(event.0, INFINITE);
-                        GetOverlappedResult(h.0, &ov, &mut n, 1)
-                    };
-                    if done == 0 {
-                        return Err(io::Error::last_os_error());
+        if ok != 0 {
+            return Ok(());
+        }
+        match last_error() {
+            ERROR_PIPE_CONNECTED => Ok(()),
+            ERROR_IO_PENDING => {
+                let mut n = 0u32;
+                // SAFETY: valid handles; wait for the connect to finish.
+                let done = unsafe {
+                    WaitForSingleObject(event.0, INFINITE);
+                    GetOverlappedResult(h.0, &ov, &mut n, 1)
+                };
+                if done == 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            }
+            code => Err(io::Error::from_raw_os_error(code as i32)),
+        }
+    }
+
+    /// Wait for a client, then hand its instance out — but only after a
+    /// replacement instance exists (see the type's invariant).
+    pub fn accept(&self) -> io::Result<Conn> {
+        let mut slot = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        let h = match slot.take() {
+            Some(h) => h,
+            // Unreachable while the invariant holds; if it was broken, the
+            // name may have zero instances, so only a FIRST instance is safe.
+            None => self.create_first_instance()?,
+        };
+        match Self::connect_instance(&h) {
+            Ok(()) => match self.create_instance(false) {
+                Ok(next) => {
+                    *slot = Some(next);
+                    drop(slot);
+                    Conn::from_handle(h)
+                }
+                Err(e) => {
+                    // No replacement: this client cannot be served without
+                    // leaving the name with zero listening instances once it
+                    // hangs up. Drop the client, keep the instance.
+                    // SAFETY: valid pipe handle.
+                    unsafe { DisconnectNamedPipe(h.0) };
+                    *slot = Some(h);
+                    Err(e)
+                }
+            },
+            Err(e) => {
+                // A client that came and went (ERROR_NO_DATA), or a failed
+                // wait. Disconnect and reuse this instance; if it cannot be
+                // reset, replace it BEFORE dropping it.
+                // SAFETY: valid pipe handle.
+                if unsafe { DisconnectNamedPipe(h.0) } != 0 {
+                    *slot = Some(h);
+                } else {
+                    match self.create_instance(false) {
+                        Ok(next) => {
+                            *slot = Some(next);
+                            drop(h);
+                        }
+                        Err(_) => *slot = Some(h),
                     }
                 }
-                code => return Err(io::Error::from_raw_os_error(code as i32)),
+                Err(e)
             }
         }
-        // Best effort: a failure here is retried by the next accept.
-        *slot = self.create_instance(false).ok();
-        drop(slot);
-        Conn::from_handle(h)
     }
 }
 

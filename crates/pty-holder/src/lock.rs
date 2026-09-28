@@ -71,14 +71,16 @@ impl PaneLock {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let file = opts.open(path)?;
+        let file = open_checked(&mut opts, path)?;
         Self::try_lock_file(file, path)
     }
 
     /// Like [`PaneLock::try_acquire`], but never creates the file: a missing
     /// lock file is `NotFound`. What a prober uses, so probing cannot litter.
     pub fn try_acquire_existing(path: &Path) -> io::Result<TryLock> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true);
+        let file = open_checked(&mut opts, path)?;
         Self::try_lock_file(file, path)
     }
 
@@ -94,6 +96,13 @@ impl PaneLock {
     }
 
     /// Replace the file's contents with `record`, while holding the lock.
+    ///
+    /// NOT atomic: a reader can observe the file empty or half-written between
+    /// `set_len(0)` and the final write, and reads that as "holder
+    /// unidentified". So until an atomic rewrite exists, a holder writes its
+    /// record exactly once, BEFORE it binds its endpoint — no client can be
+    /// talking to it yet, and a prober of a lock-held/endpoint-less pane
+    /// already answers Unknown.
     pub fn write_record(&mut self, record: &LockRecord) -> io::Result<()> {
         let bytes = serde_json::to_vec(record).map_err(io::Error::other)?;
         self.file.set_len(0)?;
@@ -110,10 +119,60 @@ impl PaneLock {
 /// Read the record from a lock file WITHOUT taking the lock. `None` when the
 /// file is missing, empty (a holder between lock and write) or unparseable —
 /// callers treat that as "holder unidentified", never as "no holder".
+///
+/// Opened with the same checks as the lock itself (no symlink, a regular file
+/// owned by this user) and read up to [`MAX_RECORD_LEN`]; anything larger is
+/// not a record this crate wrote and reads as `None`.
 pub fn read_record(path: &Path) -> Option<LockRecord> {
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    let file = open_checked(&mut opts, path).ok()?;
     let mut buf = Vec::new();
-    File::open(path).ok()?.read_to_end(&mut buf).ok()?;
+    file.take(MAX_RECORD_LEN + 1).read_to_end(&mut buf).ok()?;
+    if buf.len() as u64 > MAX_RECORD_LEN {
+        return None;
+    }
     serde_json::from_slice(&buf).ok()
+}
+
+/// Largest lock record [`read_record`] will read.
+pub const MAX_RECORD_LEN: u64 = 64 * 1024;
+
+/// Open a lock file refusing anything but a regular file this user owns.
+///
+/// Unix: `O_NOFOLLOW` (a symlink at the lock path fails the open with
+/// `ELOOP` instead of locking or truncating whatever it points at) and
+/// `O_NONBLOCK` (a FIFO planted at the path cannot hang the open); then
+/// `fstat` of the OPENED fd — not a racy `stat` of the path — must say
+/// regular file and our euid. Windows: regular-file check only; the directory
+/// is the per-user app-data tree.
+fn open_checked(opts: &mut OpenOptions, path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = opts.open(path)?;
+    let md = file.metadata()?;
+    if !md.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        if md.uid() != me {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} is owned by uid {}, not {me}", path.display(), md.uid()),
+            ));
+        }
+    }
+    Ok(file)
 }
 
 #[cfg(unix)]
@@ -252,6 +311,37 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
         assert!(!path.exists());
         assert_eq!(read_record(&path), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pty_holder_lock_refuses_symlinks_fifos_and_oversized_records() {
+        let dir = tmpdir("nofollow");
+        let target = dir.join("target");
+        std::fs::write(&target, b"precious").unwrap();
+        let link = dir.join("l.lock");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(PaneLock::try_acquire(&link).is_err());
+        assert!(PaneLock::try_acquire_existing(&link).is_err());
+        assert_eq!(read_record(&link), None);
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"precious",
+            "target untouched"
+        );
+
+        let fifo = dir.join("f.lock");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        // Must return (not hang on the FIFO) and refuse it.
+        assert!(PaneLock::try_acquire_existing(&fifo).is_err());
+        assert_eq!(read_record(&fifo), None);
+
+        let big = dir.join("big.lock");
+        std::fs::write(&big, vec![b' '; MAX_RECORD_LEN as usize + 1]).unwrap();
+        assert_eq!(read_record(&big), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

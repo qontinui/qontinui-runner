@@ -134,6 +134,12 @@ pub enum RejectReason {
     PeerNotAuthorized,
     /// The holder is at its connection cap.
     Busy,
+    /// DESERIALIZE-ONLY: a reason string this build does not know — a newer
+    /// holder's. The reason set is part of the frozen `rejected` shape, but it
+    /// may GROW, so an older runner must still read the rejection as typed
+    /// rather than fail to parse it. Never sent: serializing it is an error.
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// Holder → runner.
@@ -312,7 +318,20 @@ mod tests {
         ];
         for (r, s) in all {
             assert_eq!(serde_json::to_string(&r).unwrap(), format!("\"{s}\""));
+            let back: RejectReason = serde_json::from_str(&format!("\"{s}\"")).unwrap();
+            assert_eq!(back, r);
         }
+        // A newer holder's reason reads as typed Unknown, not a parse failure…
+        let newer = br#"{"type":"rejected","reason":"quota_exhausted_v9","detail":"d"}"#;
+        assert_eq!(
+            parse_reply(newer).unwrap(),
+            Reply::Rejected {
+                reason: RejectReason::Unknown,
+                detail: "d".into(),
+            }
+        );
+        // …and Unknown is never put on the wire.
+        assert!(serde_json::to_string(&RejectReason::Unknown).is_err());
     }
 
     /// A newer holder may add fields to the envelope replies; an older runner
