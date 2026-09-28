@@ -1051,8 +1051,9 @@ static EXHAUSTION_SURFACED: AtomicBool = AtomicBool::new(false);
 static NATIVE_HANG_SURFACED: AtomicBool = AtomicBool::new(false);
 
 /// And one more: latches once the user has been told a recovery run is
-/// wedged — the main window destroyed and its rebuild waiting on the window
-/// system.
+/// wedged — it has held the single-flight latch past the ladder's own maximum,
+/// blocked on the window system either before or after `destroy()` of the old
+/// main window.
 ///
 /// Paired with [`RECOVERY_WEDGE_REPORTED`], not independent of it:
 /// [`report_recovery_wedge`] returns early once that latch is armed, so the
@@ -1297,7 +1298,13 @@ fn surface_exhaustion_to_user(app: &tauri::AppHandle, attempts: u32) {
          crash originates inside WebView2 rather than in Qontinui."
     );
 
-    if surface_incident_to_user(app, &EXHAUSTION_SURFACED, TITLE, &body) {
+    if surface_incident_to_user(
+        app,
+        &EXHAUSTION_SURFACED,
+        TITLE,
+        &body,
+        IncidentChannels::NotificationAndDialog,
+    ) {
         error!(
             attempts,
             "UI recovery exhausted — surfaced to the user natively (notification + dialog)"
@@ -1357,7 +1364,13 @@ pub fn report_native_ui_thread_hang(app: &tauri::AppHandle, unresponsive_for_sec
          runner's dev-logs directory."
     );
 
-    if surface_incident_to_user(app, &NATIVE_HANG_SURFACED, TITLE, &body) {
+    if surface_incident_to_user(
+        app,
+        &NATIVE_HANG_SURFACED,
+        TITLE,
+        &body,
+        IncidentChannels::NotificationAndDialog,
+    ) {
         error!(
             unresponsive_for_secs,
             "Native UI thread hang surfaced to the user (notification always; dialog only if \
@@ -1374,7 +1387,18 @@ pub fn clear_native_ui_thread_hang() {
     NATIVE_HANG_SURFACED.store(false, Ordering::SeqCst);
 }
 
-/// The one place an incident becomes an OS-native notification + dialog.
+/// Which native channels [`surface_incident_to_user`] posts to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncidentChannels {
+    /// The OS toast plus a dialog. The dialog is enqueued onto the event loop,
+    /// so it appears only once that loop is pumping.
+    NotificationAndDialog,
+    /// The OS toast alone — for an incident whose text would be wrong by the
+    /// time a loop-queued dialog could appear.
+    NotificationOnly,
+}
+
+/// The one place an incident becomes an OS-native notification (+ dialog).
 ///
 /// Returns `true` when this call is the one that surfaced it, so the caller
 /// can log exactly once. `latch` makes that at-most-once per incident:
@@ -1385,6 +1409,7 @@ fn surface_incident_to_user(
     latch: &AtomicBool,
     title: &str,
     body: &str,
+    channels: IncidentChannels,
 ) -> bool {
     // Server mode has no desktop to surface to. `trigger_ui_recovery` returns
     // before reaching here, but this is defence in depth for any future caller.
@@ -1403,7 +1428,7 @@ fn surface_incident_to_user(
         }
     }
 
-    {
+    if channels == IncidentChannels::NotificationAndDialog {
         use tauri_plugin_dialog::DialogExt;
         // Non-blocking `show`: a modal `blocking_show` here would park a
         // runtime thread on user input during an active incident.
@@ -1820,17 +1845,19 @@ pub async fn trigger_ui_recovery(
 /// # Why it also surfaces natively
 ///
 /// A breadcrumb nobody is looking at does not stop the one harmful reaction to
-/// this condition: an operator who sees the main window vanish and restarts
-/// the runner, destroying every session in flight to "fix" something that
-/// resolves itself once the window system answers. In the incident this was
-/// built for, `recreate_main_window` had already destroyed the main window by
-/// the time the wedge was detected, so there is no webview to render an in-app
-/// banner — and the supervisor is
-/// dev-only and must never carry user-facing behaviour (module docs). So it
-/// goes through [`surface_incident_to_user`], exactly like the exhaustion and
-/// native-hang incidents: the toast is posted off the main thread and is the
-/// load-bearing channel; the dialog is enqueued onto the stuck loop and appears
-/// only if it resumes (see [`report_native_ui_thread_hang`]). Plan
+/// this condition: an operator who sees the main window freeze or vanish and
+/// restarts the runner, destroying every session in flight to "fix" something
+/// that usually resolves itself once the window system answers. No in-app
+/// surface can carry the notice: the wedge may be detected while
+/// `recreate_main_window` is still blocked in `capture_placement`'s getters
+/// (old window frozen on screen) or after `destroy()` (no window at all) — in
+/// neither state is there a live webview to render a banner — and the
+/// supervisor is dev-only and must never carry user-facing behaviour (module
+/// docs). So it goes through [`surface_incident_to_user`], like the exhaustion
+/// and native-hang incidents, but **toast only**: the toast is posted off the
+/// main thread, whereas a dialog would be queued onto the stuck loop and could
+/// appear only after the wedge had ended — telling the user to end a process
+/// that had already recovered. Plan
 /// `2026-09-28-runner-popout-window-geometry-poisoning-and-webview-recovery-wedge`,
 /// Phase 5.
 fn report_recovery_wedge(app: &tauri::AppHandle, refused: RecoveryReason, in_flight_ms: u64) {
@@ -1862,25 +1889,34 @@ fn report_recovery_wedge(app: &tauri::AppHandle, refused: RecoveryReason, in_fli
         ),
     );
 
-    const TITLE: &str = "Qontinui Runner — the window is being rebuilt";
-    let waiting_secs = in_flight_ms / 1000;
+    const TITLE: &str = "Qontinui Runner — UI recovery is stuck";
+    // The whole run's in-flight time (backoff, reload watch and recreate), not
+    // only the time spent blocked on the window system — so the text says
+    // "trying to recover for", never "waiting on the window system for".
+    let in_flight_secs = in_flight_ms / 1000;
     let body = format!(
-        "The runner's window is being rebuilt after its UI stopped responding, and the rebuild \
-         has been waiting on the window system for {waiting_secs} seconds so far.\n\n\
-         Automation and the API on port 9876 are still running, and your sessions are NOT \
-         lost right now. The window usually returns on its own once the window system \
+        "The runner has been trying to recover its window for {in_flight_secs} seconds and is \
+         waiting on the window system — the window may be frozen or missing until it \
          answers.\n\n\
+         Automation and the API on port 9876 are still running, and your sessions are NOT \
+         lost right now. The window usually returns on its own.\n\n\
          If it has not come back after several minutes it may be stuck for good, and the only \
          way out is to end the Qontinui Runner process from Task Manager — which ends every \
          session in flight, so check http://127.0.0.1:9876/restart-readiness first. An \
          incident line has been written to wedge-incidents.log in the runner's dev-logs \
          directory."
     );
-    if surface_incident_to_user(app, &RECOVERY_WEDGE_SURFACED, TITLE, &body) {
+    // Toast only: a loop-queued dialog could appear only after the wedge ended.
+    if surface_incident_to_user(
+        app,
+        &RECOVERY_WEDGE_SURFACED,
+        TITLE,
+        &body,
+        IncidentChannels::NotificationOnly,
+    ) {
         error!(
             in_flight_ms,
-            "UI recovery wedge surfaced to the user (notification always; dialog only if the \
-             loop resumes)"
+            "UI recovery wedge surfaced to the user (OS notification only)"
         );
     }
 }
@@ -2412,7 +2448,10 @@ async fn recreate_main_window(app: &tauri::AppHandle) -> Result<(), String> {
     let _swap = SwapGuard;
 
     // Preserve whatever the operator had on screen. These are tao/HWND reads,
-    // independent of the (dead) WebView2 host, so they still answer.
+    // independent of the (dead) WebView2 host — but they are `window_getter!`
+    // round-trips that DO block on the tao event loop, with no timeout. A
+    // wedged loop therefore stalls the run here, before `destroy()`, with the
+    // old window still on screen (which `report_recovery_wedge` must allow for).
     let mut spec = base_spec.clone();
     if let Some(existing) = app.get_webview_window(label) {
         spec.placement = capture_placement(&existing, &base_spec.placement);
