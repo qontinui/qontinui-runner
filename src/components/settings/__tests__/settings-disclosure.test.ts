@@ -45,7 +45,8 @@ describe("settings sub-nav disclosure gating", () => {
     // opted into.
     expect(visible).toEqual([
       "account",
-      "dev-loop",
+      // No "dev-loop" / "ci-runner": dev surfaces, listed only when a
+      // supervisor is observed — see the dev-surface block below.
       "backend-connection",
       "devenv-enroll",
       "ai",
@@ -62,7 +63,6 @@ describe("settings sub-nav disclosure gating", () => {
       "instances",
       "otel",
       "containers",
-      "ci-runner",
       // Ungated on purpose: the session-protection floors guard the
       // Terminal-first user's own sessions against commit exhaustion, which is
       // the most default-path failure this app has.
@@ -110,7 +110,7 @@ describe("settings sub-nav disclosure gating", () => {
   });
 
   it("shows every panel when both disclosures are on", () => {
-    expect(idsOf(visibleSettingsTabs(ALL))).toEqual(idsOf(SETTINGS_TABS));
+    expect(idsOf(visibleSettingsTabs(ALL, true))).toEqual(idsOf(SETTINGS_TABS));
   });
 });
 
@@ -205,5 +205,40 @@ describe("the sidebar Settings flyout agrees with the Settings sub-nav", () => {
     // Defensive: a `settings-*` nav id the registry does not know about is a
     // bug to surface elsewhere, not a reason to vanish it from the flyout.
     expect(isSettingsNavItemVisible("settings-does-not-exist", NONE)).toBe(true);
+  });
+});
+
+describe("dev-surface tabs need an OBSERVED supervisor (plan B2)", () => {
+  const DEV = ["dev-loop", "ci-runner"];
+
+  it("marks exactly Test My Change and CI Runner as dev surfaces", () => {
+    expect(idsOf(SETTINGS_TABS.filter((t) => t.devSurface))).toEqual(DEV);
+  });
+
+  it("the Settings sub-nav omits both when not observed, includes both when observed", () => {
+    for (const predicate of [NONE, only("advanced"), only("visual"), ALL]) {
+      const hidden = idsOf(settingsTabsFor(predicate, "general", false));
+      for (const id of DEV) expect(hidden).not.toContain(id);
+      const shown = idsOf(settingsTabsFor(predicate, "general", true));
+      for (const id of DEV) expect(shown).toContain(id);
+    }
+    // A caller that does not pass the observation hides them (fail closed).
+    for (const id of DEV) expect(idsOf(visibleSettingsTabs(ALL))).not.toContain(id);
+  });
+
+  it("the sidebar Settings flyout omits both when not observed, includes both when observed", () => {
+    for (const id of DEV) {
+      const navId = `settings-${id}`;
+      expect(isSettingsNavItemVisible(navId, ALL, "settings-general", false)).toBe(false);
+      expect(isSettingsNavItemVisible(navId, ALL, "settings-general", true)).toBe(true);
+      expect(isSettingsNavItemVisible(navId, NONE)).toBe(false);
+    }
+  });
+
+  it("a deep-link keeps the active dev tab listed (anti-stranding); the panel shows the neutral line", () => {
+    expect(idsOf(settingsTabsFor(NONE, "dev-loop", false))).toContain("dev-loop");
+    expect(isSettingsNavItemVisible("settings-ci-runner", NONE, "settings-ci-runner", false)).toBe(
+      true,
+    );
   });
 });
