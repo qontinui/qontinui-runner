@@ -1050,6 +1050,17 @@ static EXHAUSTION_SURFACED: AtomicBool = AtomicBool::new(false);
 /// pumping again, which is that rung's equivalent of the incident reset.
 static NATIVE_HANG_SURFACED: AtomicBool = AtomicBool::new(false);
 
+/// And one more: latches once the user has been told a recovery run is
+/// wedged — the main window destroyed and its rebuild waiting on the window
+/// system.
+///
+/// Separate from [`RECOVERY_WEDGE_REPORTED`] for the same reason the two above
+/// are separate from each other: that one de-duplicates the durable breadcrumb,
+/// this one the user-facing notice, and neither may silence the other. Re-armed
+/// alongside it by [`InProgressGuard::drop`], so each wedge surfaces once and a
+/// later wedge surfaces again.
+static RECOVERY_WEDGE_SURFACED: AtomicBool = AtomicBool::new(false);
+
 /// True while the recovery ladder is between `destroy()` and the rebuild of the
 /// main window.
 ///
@@ -1597,7 +1608,7 @@ pub async fn trigger_ui_recovery(
     //    past it — see `RECOVERY_WEDGE_AFTER_MS`.
     if let Err(in_flight_ms) = RECOVERY_LATCH.try_take(latch_now_ms()) {
         if in_flight_ms >= RECOVERY_WEDGE_AFTER_MS {
-            report_recovery_wedge(reason, in_flight_ms);
+            report_recovery_wedge(app, reason, in_flight_ms);
             return RecoveryOutcome::Wedged { in_flight_ms };
         }
         debug!(
@@ -1795,15 +1806,33 @@ pub async fn trigger_ui_recovery(
     }
 }
 
-/// Surface a latched-off recovery: one `error!` and one durable line in
-/// `wedge-incidents.log`, at most once per wedge.
+/// Surface a latched-off recovery: one `error!`, one durable line in
+/// `wedge-incidents.log`, and one OS-native notice to the user, each at most
+/// once per wedge.
 ///
 /// The breadcrumb goes into the **existing** incident sink rather than a new
 /// file. `wedge-incidents.log` is already the one place to read after an
 /// unexplained outage — and `runner-lifecycle.log` is truncated at every
 /// startup, so a restart destroys the evidence of the wedge that provoked it.
 /// Same writer, same grammar as `ui_thread_wedged` / `backend_wedged`.
-fn report_recovery_wedge(refused: RecoveryReason, in_flight_ms: u64) {
+///
+/// # Why it also surfaces natively
+///
+/// A breadcrumb nobody is looking at does not stop the one harmful reaction to
+/// this condition: an operator who sees the main window vanish and restarts
+/// the runner, destroying every session in flight to "fix" something that
+/// resolves itself once the window system answers. In the incident this was
+/// built for, `recreate_main_window` had already destroyed the main window by
+/// the time the wedge was detected, so there is no webview to render an in-app
+/// banner — and the supervisor is
+/// dev-only and must never carry user-facing behaviour (module docs). So it
+/// goes through [`surface_incident_to_user`], exactly like the exhaustion and
+/// native-hang incidents: the toast is posted off the main thread and is the
+/// load-bearing channel; the dialog is enqueued onto the stuck loop and appears
+/// only if it resumes (see [`report_native_ui_thread_hang`]). Plan
+/// `2026-09-28-runner-popout-window-geometry-poisoning-and-webview-recovery-wedge`,
+/// Phase 5.
+fn report_recovery_wedge(app: &tauri::AppHandle, refused: RecoveryReason, in_flight_ms: u64) {
     if RECOVERY_WEDGE_REPORTED.swap(true, Ordering::SeqCst) {
         debug!(
             refused_reason = refused.as_str(),
@@ -1831,6 +1860,25 @@ fn report_recovery_wedge(refused: RecoveryReason, in_flight_ms: u64) {
             refused.as_str()
         ),
     );
+
+    const TITLE: &str = "Qontinui Runner — the window is being rebuilt";
+    let waiting_secs = in_flight_ms / 1000;
+    let body = format!(
+        "The runner's window is being rebuilt after its UI stopped responding, and the rebuild \
+         has been waiting on the window system for {waiting_secs} seconds so far.\n\n\
+         Automation and the API on port 9876 are still running, and your sessions are NOT \
+         lost. The window normally comes back on its own within a few minutes.\n\n\
+         Do not restart the runner: that would end every session currently in flight. An \
+         incident line has been written to wedge-incidents.log in the runner's dev-logs \
+         directory."
+    );
+    if surface_incident_to_user(app, &RECOVERY_WEDGE_SURFACED, TITLE, &body) {
+        error!(
+            in_flight_ms,
+            "UI recovery wedge surfaced to the user (notification always; dialog only if the \
+             loop resumes)"
+        );
+    }
 }
 
 /// Verdict of a post-rung pong watch (reload or recreate).
@@ -2229,14 +2277,16 @@ fn ui_bridge_last_pong(app: &tauri::AppHandle) -> Option<std::sync::Arc<AtomicU6
 
 /// Releases [`RECOVERY_LATCH`] even if the recovery future is dropped.
 ///
-/// Also re-arms [`RECOVERY_WEDGE_REPORTED`], so a future wedge is a fresh
-/// incident with its own breadcrumb rather than a silent repeat.
+/// Also re-arms [`RECOVERY_WEDGE_REPORTED`] and [`RECOVERY_WEDGE_SURFACED`], so
+/// a future wedge is a fresh incident with its own breadcrumb and its own user
+/// notice rather than a silent repeat.
 struct InProgressGuard;
 
 impl Drop for InProgressGuard {
     fn drop(&mut self) {
         RECOVERY_LATCH.release();
         RECOVERY_WEDGE_REPORTED.store(false, Ordering::SeqCst);
+        RECOVERY_WEDGE_SURFACED.store(false, Ordering::SeqCst);
     }
 }
 
@@ -3617,6 +3667,21 @@ mod tests {
         );
         // Leave the shared statics as we found them for the other tests.
         EXHAUSTION_SURFACED.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn dropping_the_in_progress_guard_re_arms_the_wedge_surfacing_latch() {
+        // Each wedge is its own incident: once the run in flight returns, the
+        // next wedge must surface to the user again, not stay silenced by the
+        // last one. No test takes `RECOVERY_LATCH`, and its release is
+        // idempotent (`latch_release_is_idempotent`), so dropping a guard here
+        // disturbs nothing else.
+        RECOVERY_WEDGE_SURFACED.store(true, Ordering::SeqCst);
+        RECOVERY_WEDGE_REPORTED.store(true, Ordering::SeqCst);
+        drop(InProgressGuard);
+        assert!(!RECOVERY_WEDGE_SURFACED.load(Ordering::SeqCst));
+        assert!(!RECOVERY_WEDGE_REPORTED.load(Ordering::SeqCst));
+        assert!(!RECOVERY_LATCH.is_held());
     }
 
     #[test]
