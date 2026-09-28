@@ -242,10 +242,14 @@ pub(crate) async fn run_dispatch(
     {
         Ok(p) => p,
         Err(e) => {
-            // A head that never reached the mirror (or was replaced) is a
-            // non-verdict — `cancelled` + `head_sha_unavailable` — never a
+            // A checkout that never produced a tree says nothing about the
+            // code under test, so it is a non-verdict — `cancelled` — never a
             // `failure`, which would poison shadow parity with a red the code
-            // under test did not earn.
+            // did not earn. The reason says which: `head_sha_unavailable`
+            // (the mirror lacks the commit), `fetch_failed` (the fetch failed
+            // otherwise), `checkout_deadline` (the deadline ran out in a local
+            // step), or none (the dispatch was cancelled). Only a genuine
+            // setup fault (`CheckoutError::Failed`) reports `failure`.
             let (conclusion, reason) = e.result_disposition();
             sink.push(&format!("{} {e}", e.log_prefix()));
             steps_summary.push(StepSummary {

@@ -160,6 +160,17 @@ pub(crate) const HEAD_UNAVAILABLE_REASON: &str = "head_sha_unavailable";
 /// never earned. The distinct reason is what keeps the two apart for a reader.
 pub(crate) const FETCH_FAILED_REASON: &str = "fetch_failed";
 
+/// `summary.reason` for a checkout whose deadline ran out during a LOCAL step
+/// (the warm-SHA probe, the stale-dir cleanup, the worktree add) — typically a
+/// slow mirror followed by a slow disk. Nothing was built, so this is
+/// `cancelled` as well, never a red.
+pub(crate) const CHECKOUT_DEADLINE_REASON: &str = "checkout_deadline";
+
+/// Least time worth starting another attempt with: a retry that would be cut
+/// off almost at once establishes nothing, so the loop stops instead when the
+/// deadline leaves less than the pause plus this.
+const MIN_USEFUL_ATTEMPT: Duration = Duration::from_secs(15);
+
 /// Candidate-ref namespaces coord dispatches: the merge-candidate branch, and
 /// the per-dispatch ref (plan Phase 2).
 const CANDIDATE_REF_PREFIXES: [&str; 2] = ["refs/heads/merge-candidate/", "refs/ci-dispatch/"];
@@ -215,10 +226,13 @@ pub(crate) enum CheckoutError {
     /// under test, so it must not be a red verdict, and the reason keeps it
     /// distinguishable from a missing head.
     FetchFailed(String),
+    /// The checkout deadline ran out during a local step. Reported as
+    /// `cancelled` + `checkout_deadline`: nothing was built, so no verdict.
+    DeadlineExhausted(String),
     /// The dispatch was cancelled while the checkout was running.
     Cancelled,
-    /// Any other setup failure (an invalid payload, no primary checkout, the
-    /// deadline spent on a local step, worktree add failed…).
+    /// A genuine setup fault (an invalid payload, no primary checkout, an I/O
+    /// error creating the dispatch dir, a git error from `worktree add`…).
     Failed(String),
 }
 
@@ -235,6 +249,7 @@ impl std::fmt::Display for CheckoutError {
                 "head_sha {head_sha} not available from {fetch_url} after {attempts} attempt(s): {detail}"
             ),
             CheckoutError::FetchFailed(e) => f.write_str(e),
+            CheckoutError::DeadlineExhausted(e) => f.write_str(e),
             CheckoutError::Cancelled => write!(f, "dispatch cancelled during checkout"),
             CheckoutError::Failed(e) => f.write_str(e),
         }
@@ -253,6 +268,7 @@ impl CheckoutError {
         match self {
             CheckoutError::HeadUnavailable { .. } => ("cancelled", Some(HEAD_UNAVAILABLE_REASON)),
             CheckoutError::FetchFailed(_) => ("cancelled", Some(FETCH_FAILED_REASON)),
+            CheckoutError::DeadlineExhausted(_) => ("cancelled", Some(CHECKOUT_DEADLINE_REASON)),
             CheckoutError::Cancelled => ("cancelled", None),
             CheckoutError::Failed(_) => ("failure", None),
         }
@@ -264,6 +280,7 @@ impl CheckoutError {
         match self {
             CheckoutError::HeadUnavailable { .. } => "[ci-node] checkout: head unavailable:",
             CheckoutError::FetchFailed(_) => "[ci-node] checkout: fetch failed:",
+            CheckoutError::DeadlineExhausted(_) => "[ci-node] checkout: deadline exhausted:",
             CheckoutError::Cancelled => "[ci-node] checkout cancelled:",
             CheckoutError::Failed(_) => "[ci-node] checkout failed:",
         }
@@ -306,12 +323,15 @@ fn validate_fetch_args(fetch_url: &str, candidate_ref: &str, head_sha: &str) -> 
     // path on a local volume. A UNC path (`\\host\share`, `//host/share`), a
     // verbatim `\\?\` path or `file://host/…` would make this device reach
     // out to another machine over SMB on a payload's say-so.
-    let remote_path = fetch_url.starts_with("\\\\") || fetch_url.starts_with("//");
     let transport_ok = if let Some(rest) = fetch_url.strip_prefix("file://") {
-        rest.starts_with('/') && !rest.starts_with("//")
+        // Empty host only, and nothing a path parser or git could turn back
+        // into a host: no backslash (`file:///\\host\share`), no
+        // percent-encoding (`file:///%5C%5Chost`), no second leading slash.
+        rest.starts_with('/') && !rest.starts_with("//") && !rest.contains(['\\', '%'])
+    } else if fetch_url.starts_with("https://") || fetch_url.starts_with("http://") {
+        true
     } else {
-        FETCH_URL_SCHEMES.iter().any(|s| fetch_url.starts_with(s))
-            || (!remote_path && Path::new(fetch_url).is_absolute())
+        is_local_absolute_path(fetch_url)
     };
     if !(plain && transport_ok) {
         return Err(format!(
@@ -320,6 +340,28 @@ fn validate_fetch_args(fetch_url: &str, candidate_ref: &str, head_sha: &str) -> 
         ));
     }
     Ok(())
+}
+
+/// An absolute path on a LOCAL volume. On Windows the first component must be
+/// a drive (`Prefix::Disk`), which refuses every UNC and verbatim form however
+/// its separators are mixed (`\\host\share`, `//host/share`, `\/host/share`,
+/// `\\?\C:\…`). Elsewhere it must be a single-slash absolute path with no
+/// backslash in it.
+fn is_local_absolute_path(p: &str) -> bool {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let path = Path::new(p);
+        path.is_absolute()
+            && matches!(
+                path.components().next(),
+                Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_))
+            )
+    }
+    #[cfg(not(windows))]
+    {
+        p.starts_with('/') && !p.starts_with("//") && !p.contains('\\')
+    }
 }
 
 /// Why a bounded step stopped early.
@@ -414,11 +456,11 @@ fn fetch_args<'a>(fetch_url: &'a str, what: &'a str) -> Vec<&'a str> {
     args
 }
 
-/// A local step's `Stop` as the checkout's error.
+/// A local step's `Stop` as the checkout's error: both are non-verdicts.
 fn local_stop(stop: Stop, step: &str, policy: &HeadFetchPolicy<'_>) -> CheckoutError {
     match stop {
         Stop::Cancelled => CheckoutError::Cancelled,
-        Stop::Deadline => CheckoutError::Failed(format!(
+        Stop::Deadline => CheckoutError::DeadlineExhausted(format!(
             "checkout deadline ({}s) exhausted during {step}",
             policy.deadline.as_secs()
         )),
@@ -482,10 +524,11 @@ async fn fetch_head(
                 _ => "fetch failed",
             };
             let detail = verdict.as_ref().map(|(_, d)| d.as_str()).unwrap_or("");
-            if remaining <= backoff {
-                // The pause would run into the deadline, so no retry can
-                // start after it: say so, and stop here rather than sleep to
-                // the deadline announcing a retry that will never run.
+            if remaining <= backoff + MIN_USEFUL_ATTEMPT {
+                // The pause would leave no useful time before the deadline, so
+                // no retry can establish anything after it: say so, and stop
+                // here rather than sleep to the deadline announcing a retry
+                // that will never run.
                 progress(&format!(
                     "[ci-node] head {head_sha} {what} (attempt {}/{max_attempts}: {detail}); \
                      checkout deadline reached, no further retry",
@@ -512,8 +555,6 @@ async fn fetch_head(
             }
             policy.retry_fetch_timeout
         };
-        attempts = attempt;
-
         let mut notes: Vec<String> = Vec::new();
         match bounds
             .git(repo_dir, &fetch_args(fetch_url, candidate_ref), per_fetch)
@@ -576,6 +617,9 @@ async fn fetch_head(
         let detail = notes.join("; ");
         warn!("ci_node: {head_sha} not obtained (attempt {attempt}/{max_attempts}, {evidence:?}): {detail}");
         verdict = Some((evidence, detail));
+        // Counted only once it has a verdict: an attempt the deadline cut off
+        // established nothing and is not reported as one.
+        attempts = attempt;
     }
 
     let suffix = cut_off.map(|c| format!("; then {c}")).unwrap_or_default();
@@ -711,18 +755,18 @@ async fn prepare_worktree_with(
     Ok(wt_path)
 }
 
-/// Always-run cleanup: `git worktree remove -f -f` + prune, then a
-/// best-effort delete of the whole dispatch root — which sweeps the worktree,
-/// every provisioned sibling, and anything git left behind, in one call.
+/// Always-run cleanup: `git worktree remove -f -f`, a best-effort delete of
+/// the whole dispatch root — which sweeps the worktree, every provisioned
+/// sibling, and anything git left behind, in one call — then `worktree
+/// unlock` + prune for the admin entry.
 /// Failure is logged, never propagated (cleanup runs on failure paths too).
 ///
 /// `-f` twice because a `worktree add` killed mid-way (cancel, deadline)
 /// leaves its admin entry LOCKED ("initializing"), and a single `--force`
-/// refuses a locked worktree. The directory delete runs on the blocking pool,
-/// so a caller that bounds this future (the checkout's stale-dir cleanup)
-/// stops waiting at its deadline; the delete itself then finishes in the
-/// background, which is harmless — it only ever removes this dispatch's own
-/// root.
+/// refuses a locked worktree. The directory delete is
+/// [`delete_dispatch_root`]: a caller that bounds this future (the checkout's
+/// stale-dir cleanup) stops waiting at its deadline while the delete finishes
+/// in its own task, and a later cleanup of the same root waits for it.
 pub(crate) async fn cleanup_dispatch(root: &Path, repo: &str, dispatch_id: &str) {
     let repo_dir = root.join(crate::agent_runtime::local_repo_name(repo));
     let wt_path = ci_worktree_path(root, dispatch_id, repo);
@@ -737,23 +781,74 @@ pub(crate) async fn cleanup_dispatch(root: &Path, repo: &str, dispatch_id: &str)
     {
         warn!("ci_node: worktree remove failed (continuing to prune): {e}");
     }
+    delete_dispatch_root(dispatch_root).await;
+    // An add killed before it wrote the worktree's `.git` file leaves an
+    // admin entry locked "initializing" that neither `remove` nor `prune`
+    // clears; unlock it (an error just means there was no such lock) so the
+    // prune that follows can drop it.
+    let _ = run_git(
+        &repo_dir,
+        &["worktree", "unlock", &wt_str],
+        GIT_LOCAL_TIMEOUT,
+    )
+    .await;
     if let Err(e) = run_git(&repo_dir, &["worktree", "prune"], GIT_LOCAL_TIMEOUT).await {
         warn!("ci_node: worktree prune failed: {e}");
     }
-    if dispatch_root.exists() {
-        let target = dispatch_root.clone();
-        match tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&target)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => warn!(
-                "ci_node: residual dispatch dir {} not removable: {e}",
-                dispatch_root.display()
-            ),
-            Err(e) => warn!(
-                "ci_node: delete of dispatch dir {} did not complete: {e}",
-                dispatch_root.display()
-            ),
+}
+
+/// Delete a dispatch root on the blocking pool, at most one delete per root at
+/// a time.
+///
+/// The delete runs in its own task, so a caller that stops waiting (a bounded
+/// cleanup cut off by its deadline) does not stop the delete. A second
+/// cleanup of the same root — the executor's final one, after the checkout's
+/// stale-dir one was cut off — waits on the same per-root lock for the first
+/// to finish instead of racing it, and a path that vanished meanwhile
+/// (`NotFound`) is success, not a warning.
+async fn delete_dispatch_root(dispatch_root: PathBuf) {
+    static IN_FLIGHT: std::sync::LazyLock<
+        std::sync::Mutex<
+            std::collections::HashMap<PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>,
+        >,
+    > = std::sync::LazyLock::new(Default::default);
+    let lock = match IN_FLIGHT.lock() {
+        Ok(mut map) => map.entry(dispatch_root.clone()).or_default().clone(),
+        Err(poisoned) => poisoned
+            .into_inner()
+            .entry(dispatch_root.clone())
+            .or_default()
+            .clone(),
+    };
+    let task = tokio::spawn(async move {
+        let result = {
+            let _held = lock.lock().await;
+            if dispatch_root.exists() {
+                let target = dispatch_root.clone();
+                match tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&target)).await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Ok(Err(e)) => Err(format!("not removable: {e}")),
+                    Err(e) => Err(format!("delete did not complete: {e}")),
+                }
+            } else {
+                Ok(())
+            }
+        };
+        // Forget the lock once nobody else holds it (the map's copy and ours).
+        if let Ok(mut map) = IN_FLIGHT.lock() {
+            if std::sync::Arc::strong_count(&lock) <= 2 {
+                map.remove(&dispatch_root);
+            }
         }
-    }
+        if let Err(e) = result {
+            warn!(
+                "ci_node: residual dispatch dir {}: {e}",
+                dispatch_root.display()
+            );
+        }
+    });
+    let _ = task.await;
 }
 
 #[cfg(test)]
@@ -1058,7 +1153,7 @@ mod tests {
     }
 
     /// A deadline spent before anything runs stops the checkout before any
-    /// git process is spawned, as a setup failure naming the step.
+    /// git process is spawned, as a non-verdict naming the step.
     #[tokio::test]
     async fn spent_deadline_stops_before_any_git_runs() {
         let f = fixture();
@@ -1078,9 +1173,15 @@ mod tests {
         .await
         .expect_err("nothing can run with no time left");
         assert!(
-            matches!(&err, CheckoutError::Failed(m) if m.contains("deadline") && m.contains("warm-SHA")),
+            matches!(&err, CheckoutError::DeadlineExhausted(m) if m.contains("warm-SHA")),
             "{err:?}"
         );
+        assert_eq!(
+            err.result_disposition(),
+            ("cancelled", Some(CHECKOUT_DEADLINE_REASON)),
+            "a spent deadline is a non-verdict, never a red"
+        );
+        assert_eq!(err.log_prefix(), "[ci-node] checkout: deadline exhausted:");
     }
 
     /// A deadline that leaves no room for the next pause ends the loop right
@@ -1238,7 +1339,12 @@ mod tests {
         let trigger = cancel.clone();
         let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
         let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
+            let Ok(Ok((mut socket, _))) =
+                tokio::time::timeout(Duration::from_secs(30), listener.accept()).await
+            else {
+                let _ = closed_tx.send(Err("git never connected to the listener".to_string()));
+                return;
+            };
             trigger.cancel();
             // Drain the request, then wait for the peer to go away.
             let closed = tokio::time::timeout(Duration::from_secs(20), async {
@@ -1275,13 +1381,18 @@ mod tests {
             "a hung fetch must not be waited out, took {:?}",
             started.elapsed()
         );
-        let closed = closed_rx.await.expect("the listener saw the connection");
+        // Bounded, so an environment where git never reaches the listener
+        // (an HTTP proxy, say) fails this test instead of hanging it.
+        let closed = tokio::time::timeout(Duration::from_secs(30), closed_rx)
+            .await
+            .expect("the listener never reported the connection closing")
+            .expect("the listener saw the connection");
         assert_eq!(
             closed,
             Ok(()),
             "the fetch's transport helper must be killed"
         );
-        server.await.unwrap();
+        server.abort();
     }
 
     /// Through the PRODUCTION entry point: a dispatch already cancelled
@@ -1317,7 +1428,7 @@ mod tests {
     async fn option_shaped_or_malformed_payload_is_refused() {
         let f = fixture();
         let url = slash(&f.origin);
-        let cases: [(&str, &str, &str); 16] = [
+        let cases: [(&str, &str, &str); 22] = [
             (url.as_str(), "--upload-pack=touch pwned", GHOST),
             (url.as_str(), "refs/heads/main", GHOST),
             (url.as_str(), "refs/heads/merge-candidate/", GHOST),
@@ -1338,6 +1449,12 @@ mod tests {
             ("\\\\?\\C:\\mirror.git", CANDIDATE, GHOST),
             ("file://server/share/mirror.git", CANDIDATE, GHOST),
             ("file:////server/share/mirror.git", CANDIDATE, GHOST),
+            ("file:///\\server\\share\\mirror.git", CANDIDATE, GHOST),
+            ("file:///%5C%5Cserver/share/mirror.git", CANDIDATE, GHOST),
+            ("file:///C:/mirror%2Egit", CANDIDATE, GHOST),
+            ("\\/server/share/mirror.git", CANDIDATE, GHOST),
+            ("/\\server\\share\\mirror.git", CANDIDATE, GHOST),
+            ("C:relative\\mirror.git", CANDIDATE, GHOST),
         ];
         for (fetch_url, candidate_ref, head) in cases {
             let err = prepare_worktree_with(
