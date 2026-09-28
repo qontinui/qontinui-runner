@@ -14,7 +14,7 @@
 //! {
 //!   "active": "dev",
 //!   "profiles": {
-//!     "dev":     { "database_url": "...", "redis_url": "...", "blob": {...}, "coord_url": "...", "auth": {...} },
+//!     "dev":     { "database_url": "...", "redis_url": "...", "blob": {...}, "coord_url": "...", "api_url": "...", "auth": {...} },
 //!     "staging": { ... },
 //!     "prod":    { ... }
 //!   }
@@ -33,6 +33,14 @@
 //! | redis_url     | `REDIS_URL`             |
 //! | blob.endpoint | `S3_ENDPOINT`           |
 //! | coord_url     | `COORD_URL`             |
+//!
+//! `api_url` has NO legacy env var here: the two env vars that name the web
+//! backend (`QONTINUI_WEB_BACKEND_URL`, `QONTINUI_API_URL`) are already the two
+//! rungs above the profile in `api_config::resolve_api_base_url`. `api_url` is
+//! the per-machine web-backend (qontinui-web FastAPI) base, e.g.
+//! `https://api.qontinui.io` or a local `http://127.0.0.1:8000` for a machine
+//! that tests qontinui-web; absent or blank means "not configured here". Read
+//! it through [`api_url_with_source`].
 //!
 //! ## `database_url` is OPTIONAL, and that is the whole design
 //!
@@ -97,6 +105,11 @@ pub struct Profile {
     /// Coordinator service URL (WebSocket — `ws://` or `wss://`).
     #[serde(default)]
     pub coord_url: Option<String>,
+    /// qontinui-web backend base URL (`http(s)://host[:port]`). The per-machine
+    /// rung of `api_config::resolve_api_base_url`, between the two env vars and
+    /// the persisted `settings.json` value. Absent or blank is "not configured".
+    #[serde(default)]
+    pub api_url: Option<String>,
     /// Auth provider configuration.
     #[serde(default)]
     pub auth: Option<AuthConfig>,
@@ -145,6 +158,9 @@ pub struct ResolvedProfile {
     pub redis_url: Option<String>,
     pub blob: Option<BlobConfig>,
     pub coord_url: Option<String>,
+    /// The profile's `api_url`, verbatim (no env fallback: the env vars that
+    /// name the web backend are separate, higher rungs of the API ladder).
+    pub api_url: Option<String>,
     pub auth: Option<AuthConfig>,
 }
 
@@ -226,6 +242,7 @@ fn load_inner() -> Result<ResolvedProfile> {
         coord_url: profile
             .coord_url
             .or_else(|| std::env::var("COORD_URL").ok()),
+        api_url: profile.api_url,
         auth: profile.auth,
     })
 }
@@ -310,8 +327,45 @@ fn legacy_env_fallback() -> ResolvedProfile {
         redis_url: std::env::var("REDIS_URL").ok(),
         blob: None,
         coord_url: std::env::var("COORD_URL").ok(),
+        api_url: None,
         auth: None,
     }
+}
+
+/// Which profile supplied an [`api_url_with_source`] value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiUrlSource {
+    /// Name of the active profile (`QONTINUI_ENV`, else the file's `active`,
+    /// else `dev`).
+    pub profile: String,
+}
+
+/// The active profile's `api_url`, with the profile that supplied it.
+///
+/// `None` when there is no profiles.json, it cannot be parsed, the active
+/// profile is absent, or its `api_url` is missing or blank. Read-only and
+/// side-effect free (no warning on a missing file, unlike [`load`]): it sits
+/// under `api_config::get_api_base_url`, which timers reach through ~70 call
+/// sites, and the config report depends on it not mutating anything.
+pub fn api_url_with_source() -> Option<(String, ApiUrlSource)> {
+    let path = profiles_path()?;
+    api_url_at(&path, std::env::var("QONTINUI_ENV").ok().as_deref())
+}
+
+/// Path-parameterized core of [`api_url_with_source`] (hermetic tests point it
+/// at a temp file; `env_active` stands in for the `QONTINUI_ENV` read).
+fn api_url_at(path: &std::path::Path, env_active: Option<&str>) -> Option<(String, ApiUrlSource)> {
+    let bytes = std::fs::read(path).ok()?;
+    let file: ProfilesFile = serde_json::from_slice(&bytes).ok()?;
+    let active = env_active
+        .map(str::to_string)
+        .or(file.active)
+        .unwrap_or_else(|| "dev".to_string());
+    let url = file.profiles.get(&active)?.api_url.as_deref()?.trim();
+    if url.is_empty() {
+        return None;
+    }
+    Some((url.to_string(), ApiUrlSource { profile: active }))
 }
 
 // ============================================================================
@@ -2101,6 +2155,87 @@ fn ensure_coord_url_at(
 
 #[cfg(test)]
 mod tests {
+
+    fn write_profiles(dir: &tempfile::TempDir, body: serde_json::Value) -> std::path::PathBuf {
+        let path = dir.path().join("profiles.json");
+        std::fs::write(&path, serde_json::to_vec(&body).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn api_url_absent_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_profiles(
+            &dir,
+            serde_json::json!({"active": "dev", "profiles": {"dev": {"coord_url": "ws://h/ws"}}}),
+        );
+        assert_eq!(api_url_at(&path, None), None);
+        // No file at all, and an unparseable file, are also "not configured".
+        assert_eq!(api_url_at(&dir.path().join("missing.json"), None), None);
+        std::fs::write(&path, b"{not json").unwrap();
+        assert_eq!(api_url_at(&path, None), None);
+    }
+
+    #[test]
+    fn api_url_blank_is_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        for blank in ["", "   "] {
+            let path = write_profiles(
+                &dir,
+                serde_json::json!({"active": "dev", "profiles": {"dev": {"api_url": blank}}}),
+            );
+            assert_eq!(api_url_at(&path, None), None, "blank {blank:?}");
+        }
+    }
+
+    #[test]
+    fn api_url_present_is_returned_trimmed_with_its_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_profiles(
+            &dir,
+            serde_json::json!({"profiles": {"dev": {"api_url": " https://api.qontinui.io "}}}),
+        );
+        // No `active` in the file: falls to "dev".
+        assert_eq!(
+            api_url_at(&path, None),
+            Some((
+                "https://api.qontinui.io".to_string(),
+                ApiUrlSource {
+                    profile: "dev".to_string()
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn api_url_follows_the_active_profile_and_env_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_profiles(
+            &dir,
+            serde_json::json!({
+                "active": "dev",
+                "profiles": {
+                    "dev": {"api_url": "http://127.0.0.1:8000"},
+                    "staging": {"api_url": "https://staging.example"},
+                    "bare": {}
+                }
+            }),
+        );
+        let url = |env: Option<&str>| api_url_at(&path, env).map(|(u, s)| (u, s.profile));
+        assert_eq!(
+            url(None),
+            Some(("http://127.0.0.1:8000".into(), "dev".into()))
+        );
+        // QONTINUI_ENV outranks the file's `active`.
+        assert_eq!(
+            url(Some("staging")),
+            Some(("https://staging.example".into(), "staging".into()))
+        );
+        // A profile without the key, or one that does not exist, is unset:
+        // it does NOT fall back to another profile's value.
+        assert_eq!(url(Some("bare")), None);
+        assert_eq!(url(Some("nope")), None);
+    }
 
     #[test]
     fn redact_dsn_password_covers_both_spellings() {
