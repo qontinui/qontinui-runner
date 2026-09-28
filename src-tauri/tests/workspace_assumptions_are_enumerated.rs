@@ -246,12 +246,8 @@ fn load_vocabulary(path: &Path) -> Result<Vocabulary, String> {
             path.display()
         )
     })?;
-    let vocab: Vocabulary = toml::from_str(&text).map_err(|e| {
-        format!(
-            "FLEET-NOUN VOCABULARY UNPARSEABLE: {}: {e}",
-            path.display()
-        )
-    })?;
+    let vocab: Vocabulary = toml::from_str(&text)
+        .map_err(|e| format!("FLEET-NOUN VOCABULARY UNPARSEABLE: {}: {e}", path.display()))?;
     if vocab.version != VOCABULARY_VERSION {
         return Err(format!(
             "FLEET-NOUN VOCABULARY VERSION {} at {} — this matcher implements version \
@@ -294,11 +290,7 @@ fn first_surviving_match(re: &Regex, exclude: Option<&Regex>, text: &str) -> Opt
         .map(|e| e.find_iter(text).map(|m| (m.start(), m.end())).collect())
         .unwrap_or_default();
     re.find_iter(text)
-        .find(|m| {
-            !excluded
-                .iter()
-                .any(|&(s, e)| m.start() < e && s < m.end())
-        })
+        .find(|m| !excluded.iter().any(|&(s, e)| m.start() < e && s < m.end()))
         .map(|m| m.start())
 }
 
@@ -1168,9 +1160,8 @@ fn scan_source(
                             // holding the match, not the line that opens it.
                             Some(if lit.contains('\n') {
                                 let start = lit[..m_start].rfind('\n').map_or(0, |i| i + 1);
-                                let end = lit[m_start..]
-                                    .find('\n')
-                                    .map_or(lit.len(), |i| m_start + i);
+                                let end =
+                                    lit[m_start..].find('\n').map_or(lit.len(), |i| m_start + i);
                                 excerpt_of(&lit[start..end])
                             } else {
                                 excerpt_of(&line.code)
@@ -2297,7 +2288,10 @@ fn unusable_vocabulary_is_red_naming_the_path() {
     let path = dir.path().join("fleet-nouns.toml");
     for (body, want) in [
         ("version = 1\n[[class]\nid = ", "UNPARSEABLE"),
-        ("version = 2\n[[class]]\nid = \"x\"\npattern = \"x\"\n", "VERSION"),
+        (
+            "version = 2\n[[class]]\nid = \"x\"\npattern = \"x\"\n",
+            "VERSION",
+        ),
         ("version = 1\n", "EMPTY"),
         (
             "version = 1\n[[class]]\nid = \"plans_dir\"\npattern = \"x\"\n",
@@ -2344,8 +2338,14 @@ fn unreviewed_ceiling_is_an_exact_ratchet() {
     grown.push(row("machine_path", "brand_new", "unreviewed"));
     let err = check_ceiling(&grown, &checked, 1).expect_err("above the ceiling");
     assert!(err.contains("UNREVIEWED ABOVE CEILING"), "{err}");
-    assert!(err.contains("[machine_path] src/x.rs :: brand_new"), "{err}");
-    assert!(!err.contains(":: a ::"), "an old unreviewed row is not new: {err}");
+    assert!(
+        err.contains("[machine_path] src/x.rs :: brand_new"),
+        "{err}"
+    );
+    assert!(
+        !err.contains(":: a ::"),
+        "an old unreviewed row is not new: {err}"
+    );
 
     let triaged = vec![
         row("dev_ports", "a", "fallback_correct"),
