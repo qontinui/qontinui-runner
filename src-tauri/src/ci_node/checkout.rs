@@ -25,8 +25,8 @@
 //! - a strictly SMALLER cleanup surface than provisioning siblings anywhere
 //!   else would be, because the parent is still a single `remove_dir_all`.
 //!
-//! [`cleanup_dispatch`] therefore keeps its three-step shape — worktree
-//! remove, prune, directory delete — with the delete widened from the worktree
+//! [`cleanup_dispatch`] therefore keeps one shape — worktree remove, worktree
+//! unlock, directory delete, prune — with the delete widened from the worktree
 //! to the dispatch root. Nothing outside `<root>/.ci-worktrees/<dispatch_id>`
 //! is ever touched.
 
@@ -784,10 +784,11 @@ pub(crate) async fn cleanup_dispatch(root: &Path, repo: &str, dispatch_id: &str)
     // An add killed before it wrote the worktree's `.git` file leaves an
     // admin entry locked "initializing" that neither `remove` nor `prune`
     // clears; unlock it (an error just means there was no such lock) so the
-    // prune below can drop it. BEFORE the delete: git resolves the argument
-    // against the directory on disk, so once the directory is gone the unlock
-    // matches nothing (measured on git 2.45.2.windows.1). Both spellings,
-    // because the admin entry records the path in git's forward-slash form.
+    // prune below can drop it. Measured on git 2.45.2.windows.1: while the
+    // directory exists the native (backslash) spelling matches; once it is
+    // deleted only the forward-slash spelling (the form the admin entry
+    // records) still matches. So unlock BEFORE the delete, and try both
+    // spellings, which makes either condition sufficient on its own.
     let wt_slash = wt_str.replace('\\', "/");
     for spelling in [wt_str.as_str(), wt_slash.as_str()] {
         let _ = run_git(
@@ -1561,7 +1562,10 @@ mod tests {
     /// the shape a `worktree add` killed mid-way leaves — is fully cleared by
     /// `cleanup_dispatch`: no entry survives in `git worktree list`. `remove`
     /// refuses it (no working tree) and `prune` skips a locked entry, so this
-    /// holds only because the unlock runs while the directory still exists.
+    /// holds only because the unlock matches. It guards WINDOWS: there the
+    /// native path is backslashed and, after the delete, stops matching. On
+    /// Unix the native spelling is already forward-slash, so it passes either
+    /// way and pins only the end state.
     #[tokio::test]
     async fn cleanup_clears_a_locked_half_added_worktree() {
         let f = fixture();
