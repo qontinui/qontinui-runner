@@ -1038,29 +1038,238 @@ describe("hasNarrowingServerFilter — only what coord SAW can explain coord's z
   });
 });
 
-describe("fleetEmptyReadMessage — three different facts, never merged", () => {
+describe("fleetEmptyReadMessage — three facts and two scopes, never merged", () => {
+  const TENANT = "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a";
+  const FILTERED = { ...DEFAULT_FLEET_SERVER_FILTER, state: "active" } as const;
+  // Every (filter, text) shape that reaches a different branch. Swept wherever
+  // a property is claimed of "the message", so no branch can drift out from
+  // under an assertion that names all of them.
+  const BRANCHES = [
+    [DEFAULT_FLEET_SERVER_FILTER, ""],
+    [DEFAULT_FLEET_SERVER_FILTER, "foo"],
+    [FILTERED, ""],
+  ] as const;
+  const COMPLETE = true;
+
   it("blames the filters only when coord actually had some", () => {
-    const r = fleetEmptyReadMessage({ ...DEFAULT_FLEET_SERVER_FILTER, state: "active" }, "");
+    const r = fleetEmptyReadMessage(FILTERED, "", TENANT, COMPLETE);
     expect(r.message).toMatch(/what coord returned for them/i);
     expect(r.offerClear).toBe(true);
   });
 
-  it("reports a real empty fleet when coord was asked with no narrowing filter", () => {
-    const r = fleetEmptyReadMessage(DEFAULT_FLEET_SERVER_FILTER, "");
-    expect(r.message).toBe("No open sessions anywhere on the fleet.");
+  it("reports an empty read when coord was asked with no narrowing filter", () => {
+    const r = fleetEmptyReadMessage(DEFAULT_FLEET_SERVER_FILTER, "", TENANT, COMPLETE);
+    expect(r.message).toBe(`No open sessions in tenant ${TENANT}.`);
     expect(r.offerClear).toBe(false);
   });
 
   it("clears the text box of suspicion instead of blaming it", () => {
-    const r = fleetEmptyReadMessage(DEFAULT_FLEET_SERVER_FILTER, "foo");
-    expect(r.message).toMatch(/No open sessions anywhere on the fleet/);
-    expect(r.message).toMatch(/not sent to coord/i);
+    const r = fleetEmptyReadMessage(DEFAULT_FLEET_SERVER_FILTER, "foo", TENANT, COMPLETE);
+    expect(r.message).toBe(
+      `No open sessions in tenant ${TENANT}. Your text filter is not sent to coord, ` +
+        `so it is not what emptied this list.`,
+    );
     expect(r.message).not.toMatch(/what coord returned for them/i);
+    expect(r.offerClear).toBe(true);
   });
 
   it("a raised limit alone never makes the list read as filtered", () => {
-    const r = fleetEmptyReadMessage({ ...DEFAULT_FLEET_SERVER_FILTER, limit: 500 }, "");
-    expect(r.message).toBe("No open sessions anywhere on the fleet.");
+    const r = fleetEmptyReadMessage(
+      { ...DEFAULT_FLEET_SERVER_FILTER, limit: 500 },
+      "",
+      TENANT,
+      COMPLETE,
+    );
+    expect(r.message).toBe(`No open sessions in tenant ${TENANT}.`);
+  });
+
+  // ---- scope, axis 1: TENANT. The live false report of 2026-09-28 ------
+  //
+  // A runner showed "No open sessions anywhere on the fleet." while coord held
+  // 200 sessions across three devices. The read was correct and EMPTY — it had
+  // authenticated under the device's DEFAULT tenant binding and covered a
+  // different tenant than the one the sessions lived in. The message claimed
+  // the fleet; the read covered one tenant.
+
+  it("NEVER claims a scope wider than the tenant it read", () => {
+    for (const [server, text] of BRANCHES) {
+      for (const complete of [false, COMPLETE]) {
+        for (const tenant of [TENANT, null]) {
+          const r = fleetEmptyReadMessage(server, text, tenant, complete);
+          // The two retired phrases, so the exact regression cannot return...
+          expect(r.message).not.toMatch(/anywhere on the fleet/i);
+          expect(r.message).not.toMatch(/empty fleet/i);
+          // ...and the POSITIVE property, so the sweep cannot pass on an empty
+          // string or on some NEW way of overclaiming ("across your machines",
+          // "on any device you own"). A negative-only sweep pins a regression,
+          // not the property its name asserts.
+          expect(r.message).toMatch(
+            tenant === null ? /an unnamed tenant/ : new RegExp(`tenant ${tenant}`),
+          );
+        }
+      }
+    }
+  });
+
+  it("names the tenant it actually read, so the claim is checkable", () => {
+    for (const [server, text] of BRANCHES) {
+      expect(fleetEmptyReadMessage(server, text, TENANT, COMPLETE).message).toContain(TENANT);
+    }
+  });
+
+  it("trims the tenant it was handed but keeps the id itself", () => {
+    const r = fleetEmptyReadMessage(DEFAULT_FLEET_SERVER_FILTER, "", `  ${TENANT}\n`, COMPLETE);
+    expect(r.message).toBe(`No open sessions in tenant ${TENANT}.`);
+  });
+
+  it("says the scope is UNKNOWN rather than dropping it when no tenant came", () => {
+    // Dropping the clause leaves a bare "No open sessions." under a panel
+    // titled Fleet, and the reader supplies the widest scope available —
+    // rebuilding the very claim this function exists to stop printing. Every
+    // branch therefore says WHICH scope it could not name.
+    for (const t of [null, "", "   "]) {
+      expect(fleetEmptyReadMessage(DEFAULT_FLEET_SERVER_FILTER, "", t, COMPLETE).message).toBe(
+        "No open sessions in an unnamed tenant. coord's response did not name the tenant this " +
+          "read covered.",
+      );
+      // ORDER: the note follows the sentence carrying the scope, not the end
+      // of the message. Appended last it bound to the wrong antecedent — in
+      // the filtered branch "that tenant" attached to `an empty tenant` in the
+      // sentence before it, so the message said the opposite of what it meant.
+      expect(fleetEmptyReadMessage(DEFAULT_FLEET_SERVER_FILTER, "foo", t, COMPLETE).message).toBe(
+        "No open sessions in an unnamed tenant. coord's response did not name the tenant this " +
+          "read covered. Your text filter is not sent to coord, so it is not what emptied " +
+          "this list.",
+      );
+      expect(fleetEmptyReadMessage(FILTERED, "", t, COMPLETE).message).toBe(
+        "These filters matched no session in an unnamed tenant. coord's response did not name " +
+          "the tenant this read covered. This is what coord returned for them — not " +
+          "necessarily an empty tenant.",
+      );
+    }
+  });
+
+  it("scopes the FILTERED branch too — it also spoke for a whole fleet", () => {
+    const r = fleetEmptyReadMessage(FILTERED, "", TENANT, COMPLETE);
+    // Verb-early, so the scope attaches to the SESSIONS rather than to the
+    // filters ("matches these filters in tenant X" reads as filters scoped to
+    // a tenant) — and without the garden path noun-first produced, where "No
+    // session in <long scope> matches these filters" puts a verb-ending
+    // modifier between the subject and its own verb.
+    expect(r.message).toBe(
+      `These filters matched no session in tenant ${TENANT}. This is what coord returned for ` +
+        `them — not necessarily an empty tenant.`,
+    );
+  });
+
+  it("closes the scope with a full stop, so no noun can garden-path into a verb", () => {
+    // The pre-fix filtered branch was noun-first ("No session in <scope>
+    // matches these filters"), which put a modifier between the subject and
+    // its verb: a scope ending in a verb read as "…this read covered matches
+    // these filters". The rewrite is verb-early, so the scope now TRAILS the
+    // verb and is terminated.
+    //
+    // That is what this pins — the sentence shape — rather than the nouns.
+    // Asserting "no noun ends in a verb" would be vacuous here: no branch
+    // contains the word "matches" at all any more, so a regex looking for
+    // `covered matches` cannot fail however the noun is spelled.
+    for (const t of [TENANT, null]) {
+      for (const complete of [true, false]) {
+        const m = fleetEmptyReadMessage(FILTERED, "", t, complete).message;
+        // The subject's own verb precedes the scope, and the scope is closed
+        // by a full stop — so no word in it can be read as the verb, whatever
+        // the noun ends in. A second assertion on the verb's position would
+        // add nothing: given this regex passes, both indices are fixed.
+        expect(m).toMatch(/^These filters matched no session in [^.]+\./);
+      }
+    }
+  });
+
+  // ---- scope, axis 2: COMPLETENESS -----------------------------------
+  //
+  // `readIsComplete` is whether coord POSITIVELY said this was the last page.
+  // It is NOT "coord has more": an empty first page carrying a cursor cannot
+  // occur, because coord's `finish_page` truncates to `limit >= 1` rows before
+  // minting one. The reachable states are the walk's own — a cursor coord
+  // served that the walk can no longer use, and no response to classify yet.
+  // Either way coord has not said this is the whole list, so a sentence about
+  // the tenant would be a sentence about the rows read so far.
+
+  // ⚠️ DEFENSIVE, not live coverage. Through the only caller today these four
+  // tests exercise an unreachable state: wherever the message renders the
+  // accumulation is empty, so the last page was empty, so it carried no cursor
+  // (coord's `finish_page` truncates to `limit >= 1` rows before minting one)
+  // and `truncation.kind` is always "none". They are kept because the function
+  // is exported and independently testable, and because the arm goes live the
+  // moment a second caller has a partial read — not because they pin a bug
+  // anyone can see today.
+
+  it("scopes the HEAD when completeness is unconfirmed — never asserts then retracts", () => {
+    // The defect this shape avoids: "No open sessions in tenant X. coord has
+    // not confirmed this is the whole list." asserts the tenant claim and then
+    // withdraws it, and a reader who stops at the full stop has been told
+    // something false. So the head itself is narrowed, and the trailing clause
+    // widens a claim that was correct to begin with — the shape
+    // `fleetFilteredOutMessage` already uses.
+    const r = fleetEmptyReadMessage(DEFAULT_FLEET_SERVER_FILTER, "", TENANT);
+    expect(r.message).toBe(
+      `No open sessions in what has been read so far from tenant ${TENANT}. coord has not ` +
+        `confirmed this is the whole list.`,
+    );
+    for (const [server, text] of BRANCHES) {
+      const m = fleetEmptyReadMessage(server, text, TENANT).message;
+      expect(m).toMatch(/coord has not confirmed this is the whole list\./);
+      // The unqualified claim must not appear as a standalone sentence.
+      expect(m).not.toMatch(
+        new RegExp(`(^|\\s)No (open sessions|session) in tenant ${TENANT}[.\\s]`),
+      );
+    }
+  });
+
+  it("defaults to the HEDGED sentence, not the confident one", () => {
+    // A caller that forgets the argument must not get the overclaim — the
+    // failure mode of this function is claiming too much, so the default has
+    // to fall on the safe side.
+    for (const [server, text] of BRANCHES) {
+      expect(fleetEmptyReadMessage(server, text, TENANT)).toEqual(
+        fleetEmptyReadMessage(server, text, TENANT, false),
+      );
+      expect(fleetEmptyReadMessage(server, text, TENANT).message).not.toEqual(
+        fleetEmptyReadMessage(server, text, TENANT, COMPLETE).message,
+      );
+    }
+  });
+
+  it("says nothing about completeness once coord confirmed the last page", () => {
+    for (const [server, text] of BRANCHES) {
+      expect(fleetEmptyReadMessage(server, text, TENANT, COMPLETE).message).not.toMatch(
+        /whole list|read so far/,
+      );
+    }
+  });
+
+  it("carries BOTH scopes at once, in a fixed order — neither displaces the other", () => {
+    // Asserted whole rather than by fragment, so swapping the two trailing
+    // clauses cannot stay green.
+    expect(fleetEmptyReadMessage(DEFAULT_FLEET_SERVER_FILTER, "", null).message).toBe(
+      "No open sessions in what has been read so far from an unnamed tenant. coord's response " +
+        "did not name the tenant this read covered. coord has not confirmed this is the " +
+        "whole list.",
+    );
+  });
+
+  it("neither scope axis changes which filter branch was taken", () => {
+    for (const complete of [false, COMPLETE]) {
+      for (const tenant of [TENANT, null]) {
+        expect(fleetEmptyReadMessage(FILTERED, "", tenant, complete).offerClear).toBe(true);
+        expect(
+          fleetEmptyReadMessage(DEFAULT_FLEET_SERVER_FILTER, "x", tenant, complete).offerClear,
+        ).toBe(true);
+        expect(
+          fleetEmptyReadMessage(DEFAULT_FLEET_SERVER_FILTER, "", tenant, complete).offerClear,
+        ).toBe(false);
+      }
+    }
   });
 });
 
