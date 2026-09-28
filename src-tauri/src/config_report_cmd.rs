@@ -1348,7 +1348,7 @@ pub(crate) fn fleet_policy_dial_reading(
     let value = format!(
         "install_interception={}{} | session floors host warn={} crit={}, wsl warn={} crit={}, \
          thread ceilings warn={} crit={} | \
-         plan_capture={}{} (armed at {:?}) | briefings: {} | poll interval {} ms | last refresh of \
+         plan_capture={}{} (armed at {:?}; {}) | briefings: {} | poll interval {} ms | last refresh of \
          the first three caches: {}",
         dial.install_intercept_mode,
         ambiguous(&dial.install_intercept_mode, dial.install_intercept_default),
@@ -1361,6 +1361,12 @@ pub(crate) fn fleet_policy_dial_reading(
         dial.plan_capture_level,
         ambiguous(&dial.plan_capture_level, dial.plan_capture_default),
         dial.plan_capture_record_level,
+        if dial.plan_capture_answered {
+            "coord has answered"
+        } else {
+            "coord has NOT answered this process — the level is the unconfirmed default and \
+             plan-capture writes are held"
+        },
         briefings,
         dial.poll_interval_ms,
         if dial.caches_expose_refresh_time {
@@ -3195,6 +3201,7 @@ mod tests {
             // The domain default is `record` (operator decision 2026-09-24).
             plan_capture_default: "record",
             plan_capture_record_level: "record",
+            plan_capture_answered: true,
             briefings,
             caches_expose_refresh_time: false,
         }
@@ -3323,6 +3330,21 @@ mod tests {
             source.contains("TIME-VARYING with no restart"),
             "got {source}"
         );
+        assert!(value.contains("coord has answered"), "got {value}");
+
+        // A never-answered runner at the `record` default must read
+        // differently from an armed one.
+        let mut cold = dial("off", "record", (None, None, None, None), Vec::new());
+        cold.plan_capture_answered = false;
+        let LayerReading::Known { value, .. } = fleet_policy_dial_reading(&cold, fixed_stamp())
+        else {
+            panic!("the runner app always resolves layer 10");
+        };
+        assert!(
+            value.contains("coord has NOT answered this process"),
+            "got {value}"
+        );
+        assert!(value.contains("writes are held"), "got {value}");
     }
 
     // =======================================================================
