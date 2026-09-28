@@ -1,6 +1,6 @@
 ---
 name: coord-pr-label
-description: Set coord:* labels on a pull request — declare intent (upstream-of/downstream-of/stacked-on dependency edges, requires-tag, merge-strategy, credibility-override/migrate-repair flags) so the PR Merge Orchestrator can schedule the auto-merge correctly. All three dep labels work cross-repo with the [<owner>/]<repo>#<n> grammar; no label holds a PR. Validates against the namespace and GitHub's 50-character label-name ceiling before sending (--dry-run checks a label without sending anything, and a failing label add is diagnosed rather than relayed; a missing dynamic-value label is created on demand); the coord row is written only when the tenant your agent's worktree carries is PROVEN to own the repo (else withheld, exit 5).
+description: Set coord:* labels on a pull request — declare intent (upstream-of/downstream-of/stacked-on dependency edges, requires-tag, merge-strategy, credibility-override/migrate-repair flags) so the PR Merge Orchestrator can schedule the auto-merge correctly. All three dep labels work cross-repo with the [<owner>/]<repo>#<n> grammar; no label holds a PR. Validates against the namespace and GitHub's 50-character label-name ceiling before sending (--dry-run checks a label without sending anything, and a failing label add is diagnosed rather than relayed; a missing dynamic-value label is created on demand); the coord row is written only when the tenant your agent's worktree carries is PROVEN to own the repo (else withheld, exit 5), and is then READ BACK through coord's GET /coord/agent-pr-labels — ok only when the row is listed; a 200 without it is a contradiction (exit 4), a read that could not be made is written-but-UNKNOWN (exit 6), never ok.
 user-invocable: true
 ---
 
@@ -19,12 +19,20 @@ intent. Wraps:
    writes and deletes no `pr_labels` row; it does re-run coord's idempotent
    dependency-edge resync for the PR) that reads back the tenant coord
    would write under: the tenant of your `agent_id`'s worktree row.
-3. An ownership proof for that tenant — `GET <coord>/pr-merge/<owner%2Fname>/<pr>/author-session`
+3. An ownership proof for that tenant — `GET <coord>/pr-merge/<owner%2Fname>/0/author-session`
+   (through the shared owner-tenant library, `lib/coord-tenant-credential.sh`;
+   coord checks ownership before it looks up the PR, so pr `0` proves it, and a
+   200 counts only when its body names the repo that was asked about)
    under a device credential whose `tenant_id` claim IS that tenant (a static
    `$COORD_DEVICE_JWT` / `~/.qontinui/coord-device-jwt` claiming it, else
    `POST /agents/credential` naming it). 200 proves ownership; 404 refutes it.
    Only on a proof does the real `POST <coord>/pr-merge/labels` go out,
    recording the label in `coord.pr_labels` with `source='coord_skill'`.
+4. A read-back — `GET <coord>/coord/agent-pr-labels?repo=<owner/name>&pr_number=<n>`
+   under a credential for the same tenant (a token minted in step 3 is reused,
+   not minted again). The write's `written=1` is coord's claim about itself;
+   `ok:` is printed only when the read door LISTS the label. Plan
+   `2026-09-10-coord-pr-labels-have-no-agent-read-door` Phase 3.
 
 Why step 3 exists: on a device bound to several tenants the worktree row is
 often stamped with the wrong one, and coord's own ownership check
@@ -123,7 +131,8 @@ reference — the summary above is sufficient).
   `$QONTINUI_AGENT_ID` from the environment. This is set by the
   agent-spawn flow; if absent the skill exits with an explanation.
 - **Coord URL** — defaults to `https://coord.qontinui.io`; override via
-  `$COORD_URL` (then `$COORD_HTTP_URL`).
+  `$COORD_URL` (then `$COORD_HTTP_URL`). A `ws://` / `wss://` `$COORD_URL` —
+  the runner exports coord's websocket door under that name — is ignored.
 - **Device identity** (for the ownership proof) — `$QONTINUI_MACHINE_ID`, else
   `~/.qontinui/machine.json`; a fresh `$COORD_DEVICE_JWT` or
   `~/.qontinui/coord-device-jwt` is used only when its `tenant_id` claim is the
@@ -216,8 +225,8 @@ The skill enforces the namespace before sending — this table mirrors
 | `coord:blocked` / `coord:experimental`             | REJECTED — retired hold labels (2026-06-20); coord treats them as inert (`inert_hold_labels`). To hold a PR, convert it to draft (`gh pr ready --undo <n>`) |
 | `coord:credibility-override`                       | Flag — Tier-7 credibility-gate escape hatch                 |
 | `coord:migrate-repair`                             | Flag — accepted. **The one flag here that RELEASES a hold** rather than restricting: it can make a land happen that otherwise would not. coord bounds it at the *consuming* end, not the validator — `merge_scheduler::migrate_self_blocking` refuses to honour it unless the land is genuinely self-blocking, **and is further scoped to `EXPECTED_WEB_REPO` and the `PendingHead` escalation arm only**. Setting it is cheap and auditable; acting on it is not, and coord keeps those two decisions apart |
-| `coord:priority` / `coord:priority=*`              | REJECTED — set it on the PR itself with `gh pr edit --add-label coord:priority`. A skill-set row writes `source='coord_skill'` and the merge scheduler only honours `source='github'`, so it would be inert (and invisible on GitHub). **Both spellings hit a bespoke error that names that fix** (coord's `PRIORITY_LABEL_ERR`); the parameterised form is caught deliberately, because the lever is ONE BIT and an author writing `=1` is reaching for numeric levels that do not exist |
-| `coord:red-main-fix`                               | REJECTED — a flag with no `=`, so it lands on the generic `parameterised labels need "=value"`. coord has **no bespoke arm for it and this mirror must not invent one.** If you want it on the PR anyway, `gh pr edit --add-label coord:red-main-fix` — but understand it buys nothing: see below |
+| `coord:priority` / `coord:priority=*`              | REJECTED — set it on the PR itself with `gh api -X POST repos/<owner>/<repo>/issues/<n>/labels -f 'labels[]=coord:priority'`. A skill-set row writes `source='coord_skill'` and the merge scheduler only honours `source='github'`, so it would be inert (and invisible on GitHub). **Both spellings hit a bespoke error that names that fix** (coord's `PRIORITY_LABEL_ERR`); the parameterised form is caught deliberately, because the lever is ONE BIT and an author writing `=1` is reaching for numeric levels that do not exist |
+| `coord:red-main-fix`                               | REJECTED — a flag with no `=`, so it lands on the generic `parameterised labels need "=value"`. coord has **no bespoke arm for it and this mirror must not invent one.** If you want it on the PR anyway, `gh api -X POST repos/<owner>/<repo>/issues/<n>/labels -f 'labels[]=coord:red-main-fix'` — but understand it buys nothing: see below |
 | `coord:operator-review`                            | REJECTED — retired label; labels no longer hold PRs (convert the PR to draft, or register a coord gate with a `MergePr` continuation) |
 | `coord:version-bump` / `coord:version-bump=*`      | REJECTED — same retirement as operator-review (coord rejects the bare flag too) |
 | `coord:state=*`, `coord:blocked-by=*`, `coord:specialist-decision=*` | REJECTED — coord-SET labels, read-only through this surface; change them at the state-mutation surface, not here |
@@ -309,7 +318,7 @@ What actually lands a red-main fix is coord's **ordinary** merge path: `main-red
 is checked only at ENQUEUE (Tier 4 of `pr_merge::predicate::is_simple_green_path`)
 and is never re-consulted at land. So open the fix PR green and non-draft and let
 coord land it; never `gh pr merge --admin`. Applying the label as *intent
-signalling* is still fine — `gh pr edit --add-label coord:red-main-fix` — just do
+signalling* is still fine — `gh api -X POST repos/<owner>/<repo>/issues/<n>/labels -f 'labels[]=coord:red-main-fix'` — just do
 not expect it to change scheduling.
 
 **coord itself will still tell you otherwise — that is a known, tracked defect,
@@ -339,8 +348,38 @@ On success, prints:
 
 ```
 ok: gh added label "<label>" to <repo>#<pr>
-ok: coord recorded label "<label>" in pr_labels (tenant_id=<uuid>, written=1)
+ok: coord recorded label "<label>" in pr_labels (tenant_id=<uuid>, written=1) (read back: present, source=coord_skill)
 ```
+
+A bare-repo dep label (`coord:downstream-of=qontinui-web#9`) is stored by coord
+in its canonical owner-qualified form, so the read-back accepts that spelling
+too and names it: `(read back: present, source=coord_skill, stored as
+"coord:downstream-of=qontinui/qontinui-web#9")`.
+
+### Exit codes
+
+| Exit | Means | What to do |
+|------|-------|------------|
+| 0 | GitHub label applied, coord row written **and read back present** | nothing |
+| 2 | usage error or invalid label — nothing sent | fix the label |
+| 3 | the GitHub-side label add failed | read gh's relayed error |
+| 4 | coord refused or failed the write — **or contradicted it**: the read door answered 200 without the label coord said it wrote | report it; both bodies are printed |
+| 5 | coord row **withheld** — the write tenant was not proven to own the repo | see below |
+| 6 | **written but read-back UNKNOWN** — the read door could not be asked | re-ask later; never treat as ok |
+
+4 and 6 are deliberately distinct: "coord contradicted itself" is a coord defect
+to report, while "coord could not be asked" is a question to ask again — the
+remedies are opposite, and folding 6 into 4 would file a coord bug every time
+the door was merely unreachable. Exit 6 covers an unreachable coord, a 401, a
+5xx, an unparseable or malformed body (including one answering a different
+`pr_number`), no credential that could be staged, and **404**. A 404 is most
+likely a running coord that **predates the read door** — the route does not
+exist there and 404s for everyone — since the door's other 404 (a repo the
+caller's tenant does not own) is the one the owner check has just ruled out.
+It is also 6 when coord's `enforce` arm chose the write tenant itself and echoed
+none on the probe or the write: no credential can then be scoped to the read,
+and the skill will not guess one. The withheld path (5) writes no row and makes
+no read-back; `--dry-run` sends nothing at all.
 
 On validation failure, prints the reason to stderr + exits non-zero:
 
@@ -400,7 +439,8 @@ owns the repo. Exit 5 never means UNKNOWN was treated as ownership.
 
 On a coord-side error, prints the coord response + exits non-zero. The
 GitHub-side label add still succeeds first — if you need to remove
-it, run `gh pr edit <pr> --remove-label "<label>"`.
+it, run `gh api -X DELETE "repos/<owner>/<repo>/issues/<pr>/labels/<url-encoded label>"`
+(not `gh pr edit --remove-label`, which fails on gh 2.46 before writing — see step 1).
 
 ## Failure modes
 
@@ -446,12 +486,16 @@ it, run `gh pr edit <pr> --remove-label "<label>"`.
 - **Coord unreachable** — gh-side label add succeeds (GitHub is the
   canonical state), but `coord.pr_labels` will be out of sync until
   the reconciler watcher (Phase 1 D1.5) catches up on its next tick.
+  Unreachable only AFTER the write — at the read-back — is exit 6, not 4:
+  the row may well be there, and re-sending cannot tell you (the write is an
+  upsert). Re-read it later through `GET /coord/agent-pr-labels` or the
+  `labels` field of `coord_pr_status`.
 
 ## Files
 
 - `SKILL.md` — this file.
 - `set-label.sh` — the bash wrapper. Validates, calls `gh api` (issues/labels),
-  POSTs to coord.
+  POSTs to coord, reads the row back.
 - `set-label-selftest.sh` — runs the shipped validator over a known-bad /
   known-good corpus via `--dry-run`: no network, and no real `gh` — a stub
   shadows it on `PATH` as a tripwire, and the run asserts `--dry-run` never
@@ -476,7 +520,12 @@ it, run `gh pr edit <pr> --remove-label "<label>"`.
   captured, and the merged text is identical either way. Every case also asserts
   that the stub was actually invoked, so a regression that exits before `gh` is
   reached fails loudly instead of satisfying the negative assertions by never
-  running.
+  running. The coord-reaching section serves a stub `curl` and pins the owner
+  proof and the read-back: present → 0 (with the minted token reused, not
+  re-minted), a 200 without the row → 4, a 404 / 000 / 401 / 5xx / unparseable
+  or wrong-PR body → 6 and never `ok:`, the canonical owner-qualified spelling of
+  a bare-repo dep label counted as present, and no read-back on the withheld or
+  dry-run paths.
 
 ## See Also
 
