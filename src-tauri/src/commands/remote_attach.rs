@@ -807,10 +807,13 @@ pub(crate) async fn open_remote_tab(
         rows,
         attached.ring,
     ));
-    client().register_pane(pane.clone());
+    // The report context goes on BEFORE the pane is routable, so no frame
+    // routed to it (buffered output flushed by `register_pane`, or the first
+    // live chunk) can be spliced before the read half is being measured.
     if let Some(ctx) = report_ctx {
         pane.attach_report_context(ctx);
     }
+    client().register_pane(pane.clone());
 
     let target_id = minted
         .target_device_id
