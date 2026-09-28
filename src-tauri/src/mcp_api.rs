@@ -3487,7 +3487,7 @@ fn hand_off_transport_rung(
         hdr(rung::REPORTER_HEADER),
         hdr(rung::REPORTER_STEP_HEADER),
         hdr(rung::ATTEMPTED_HEADER),
-        hdr(rung::FAILURE_CLASS_HEADER),
+        declared_failure_class(headers),
         // Runner-observed: this rung DID carry the call as far as this door.
         // The row is written before the upstream forward on purpose — the
         // metric asks whether the rung reached the door, and a row written
@@ -3512,6 +3512,21 @@ fn hand_off_transport_rung(
     // `outboxWriteFailed`.
     transport_rung_emitted_counter().fetch_add(1, Ordering::Relaxed);
     tokio::task::spawn_blocking(move || emitter.emit(lane, &obs));
+}
+
+/// The raw `x-qontinui-failure-class` declaration, for
+/// [`crate::session::coord_transport_rung::parse_failure_class`].
+///
+/// Unlike the other declaration headers, a PRESENT value that is not visible
+/// ASCII (`to_str()` fails) must not read as absent: the header's presence is
+/// itself the claim "a rung failed", and dropping it would lose a declared
+/// failure. So it is handed on as `"unclassified"` — a member of the closed
+/// vocabulary — and the caller's bytes still never reach the payload.
+fn declared_failure_class(headers: &axum::http::HeaderMap) -> Option<&str> {
+    use crate::session::coord_transport_rung as rung;
+    headers
+        .get(rung::FAILURE_CLASS_HEADER)
+        .map(|v| v.to_str().unwrap_or(rung::FAILURE_CLASS_UNCLASSIFIED))
 }
 
 /// Why the pure lifecycle selection produced no caller. Each variant names the
@@ -12565,9 +12580,10 @@ mod window_getter_single_flight_tests {
 #[cfg(test)]
 mod transport_rung_counter_tests {
     use super::{
-        hand_off_transport_rung, record_event_lane_miss, transport_rung_emitted_counter,
-        transport_rung_health_snapshot, transport_rung_lane_miss_counters,
-        transport_rung_snapshot_from, EventLaneMiss, LANE_MISS_SLOTS,
+        declared_failure_class, hand_off_transport_rung, record_event_lane_miss,
+        transport_rung_emitted_counter, transport_rung_health_snapshot,
+        transport_rung_lane_miss_counters, transport_rung_snapshot_from, EventLaneMiss,
+        LANE_MISS_SLOTS,
     };
     use std::sync::atomic::Ordering;
 
@@ -12750,7 +12766,14 @@ mod transport_rung_counter_tests {
     /// and the observation really reaches the outbox, so this is the hand-off
     /// counted, not a bare counter bump.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn successful_emit_increments_emitted() {
+        // `hand_off_transport_rung` bumps the process-global `emitted`
+        // counter, which `successful_emit_increments_emitted` asserts EXACTLY;
+        // every test that hands off serialises on the module lock. Held across
+        // the bounded outbox wait: each `#[tokio::test]` owns its own
+        // current-thread runtime, so a parked peer cannot starve this one.
+        let _serialised = series_lock();
         use crate::session::coord_transport_rung::{RungEmitter, TRANSPORT_HEADER};
         use crate::session::local_store::OutboxWriter;
 
@@ -12811,7 +12834,14 @@ mod transport_rung_counter_tests {
     /// from hand-typed header names, so the config writer and the proxy reader
     /// are proven to agree end to end.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn proxied_call_with_the_http_arm_headers_is_tagged_native_mcp() {
+        // `hand_off_transport_rung` bumps the process-global `emitted`
+        // counter, which `successful_emit_increments_emitted` asserts EXACTLY;
+        // every test that hands off serialises on the module lock. Held across
+        // the bounded outbox wait: each `#[tokio::test]` owns its own
+        // current-thread runtime, so a parked peer cannot starve this one.
+        let _serialised = series_lock();
         use crate::session::coord_transport_rung::RungEmitter;
         use crate::session::local_store::OutboxWriter;
 
@@ -12867,7 +12897,14 @@ mod transport_rung_counter_tests {
     /// the payload's own `failure_class` key through the proxy's header read —
     /// validated, and never in the runner-observed `failure_reason`.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn proxied_failure_class_declaration_lands_in_failure_class() {
+        // `hand_off_transport_rung` bumps the process-global `emitted`
+        // counter, which `successful_emit_increments_emitted` asserts EXACTLY;
+        // every test that hands off serialises on the module lock. Held across
+        // the bounded outbox wait: each `#[tokio::test]` owns its own
+        // current-thread runtime, so a parked peer cannot starve this one.
+        let _serialised = series_lock();
         use crate::session::coord_transport_rung::{
             RungEmitter, ATTEMPTED_HEADER, FAILURE_CLASS_HEADER, TRANSPORT_HEADER,
         };
@@ -12908,6 +12945,36 @@ mod transport_rung_counter_tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+    }
+    /// A present `x-qontinui-failure-class` header whose value is not visible
+    /// ASCII is a declared failure, not an absent one: it resolves to
+    /// `unclassified`, never to `None`.
+    #[test]
+    fn non_ascii_failure_class_header_is_unclassified_not_dropped() {
+        use crate::session::coord_transport_rung::{
+            parse_failure_class, FAILURE_CLASS_HEADER, FAILURE_CLASS_UNCLASSIFIED,
+        };
+        let mut headers = axum::http::HeaderMap::new();
+        assert_eq!(
+            declared_failure_class(&headers),
+            None,
+            "absent stays absent"
+        );
+
+        headers.insert(
+            FAILURE_CLASS_HEADER,
+            axum::http::HeaderValue::from_bytes(b"runner_n\xffnce").unwrap(),
+        );
+        assert!(headers[FAILURE_CLASS_HEADER].to_str().is_err());
+        let raw = declared_failure_class(&headers);
+        assert_eq!(raw, Some(FAILURE_CLASS_UNCLASSIFIED));
+        assert_eq!(parse_failure_class(raw), Some(FAILURE_CLASS_UNCLASSIFIED));
+
+        headers.insert(FAILURE_CLASS_HEADER, "tool_masked".parse().unwrap());
+        assert_eq!(
+            parse_failure_class(declared_failure_class(&headers)),
+            Some("tool_masked")
+        );
     }
 }
 
