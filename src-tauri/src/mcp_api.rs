@@ -4591,9 +4591,10 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 ///   classification sidecar), `coord_land_provenance_backfill` (dry-run by
 ///   default, precedence-aware re-derive, reversible by re-running).
 ///
-/// `coord_retire_gate` and `coord_retire_gates` are IN because they are a SHIPPED
-/// RETIREMENT ROUTE, and a retirement route an agent cannot reach recreates the
-/// defect it was built to close (plan
+/// `coord_retire_gate` and `coord_retire_gates` are IN because they are coord's
+/// retirement route (landing in qontinui-coord alongside this change, which is
+/// ordered behind it by a cross-repo dependency label), and a retirement route an
+/// agent cannot reach recreates the defect it was built to close (plan
 /// `2026-09-27-agent-gate-cleanup-verbs-cover-every-gate-an-agent-finds`, Phases 2
 /// and 4). Before them, an agent that found a gate on a terminal unit, an
 /// attestation request its unit had moved past, or a net whose arm was gone had
@@ -4610,10 +4611,12 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// code is evaluated — a terminal unit says nothing about whether a human decision
 /// is moot. They are MUTATING (the gate goes to `withdrawn`, with `verdict_reason`
 /// `retired:<reason_code>: <evidence>`), DIAL-GOVERNED (Notify tier on the
-/// `gate_action` dial) and NOTIFYING (an operator notification per single-row use,
+/// `gate_action` dial; the bulk form's dry run is dial-exempt because it writes
+/// nothing) and NOTIFYING (an operator notification per single-row use,
 /// and one summary notification per wet bulk call). The bulk form is the
 /// single-row predicate in a server-side loop, `dry_run` by default and capped by
-/// `max_rows`, so it grants nothing the single-row verb does not. As with the
+/// `max_rows`, so it grants nothing the single-row verb does not — it is a strict subset, since
+/// it also refuses `successor_gate`, which needs a successor named per gate. As with the
 /// gate-verb family, withholding them here would not add a check — the dial can
 /// only govern what this door forwards — it would only make the cleanup coord
 /// ships answer `-32601` from inside the product. coord's own grant
