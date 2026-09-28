@@ -175,9 +175,11 @@ pub const FAILURE_CLASS_UNCLASSIFIED: &str = "unclassified";
 
 /// THE closed failure-class vocabulary — why a refused rung refused (plan
 /// `2026-09-20-first-rung-coord-reachability-is-unmeasured-then-unfixed`,
-/// Phase 3, Design decision D3). Mirrored in coord's `agent_door_observer.rs`;
-/// the two copies are pinned by lint, so this order and spelling is a wire
-/// contract, not a style choice.
+/// Phase 3, Design decision D3). Coord mirrors this list in
+/// `agent_door_observer.rs` (same plan, Phase 3, coord half, in a sibling PR),
+/// and a qontinui-claude-config parity lint pins the producers' literals.
+/// Until both of those land, reordering or respelling an entry here is an
+/// UNGUARDED wire change — treat the order and spelling as a contract anyway.
 ///
 /// NOT sorted (the plan's order is the contract), so membership is a linear
 /// scan — eight entries.
