@@ -311,15 +311,17 @@ fn is_fresh_traffic_ok(fact: Option<&Value>, fresh_for_secs: i64, now: DateTime<
 }
 
 /// `None` = probe it; `Some(reason)` = skip.
-/// `own_probe`: `Some(recent)` when THIS runner holds an attempt stamp for the
-/// row (`recent` = inside the re-probe window at the sweep's start), `None`
-/// when it holds none — then coord's `observedAt` on a probe fact (another
-/// device's, or one from before a restart) is all there is to go on.
+/// `own_probe`: `Some` when THIS runner holds an attempt stamp for the row —
+/// `recent` = inside the re-probe window at the sweep's start, `device` = this
+/// runner's device. The stamp decides only for a probe fact THIS device filed
+/// (`sourceDeviceId == device`); another device's probe fact, or any probe
+/// fact when there is no stamp, is judged by coord's `observedAt` against the
+/// re-probe window.
 pub(crate) fn skip_reason(
     row: &Value,
     fresh_for_secs: i64,
     now: DateTime<Utc>,
-    own_probe: Option<bool>,
+    own_probe: Option<OwnProbe>,
 ) -> Option<&'static str> {
     if row.get("isCallerDevice").and_then(|v| v.as_bool()) == Some(true) {
         return Some("caller_device");
@@ -359,8 +361,14 @@ pub(crate) fn skip_reason(
     let current = |fact: Option<&Value>| -> bool {
         let via_probe =
             fact.is_some_and(|f| f.get("via").and_then(|v| v.as_str()) == Some("probe"));
-        match (via_probe, own_probe) {
-            (true, Some(recent)) => recent && fact_is_fresh(fact, fresh_for_secs, now),
+        let ours = own_probe.filter(|own| {
+            fact.and_then(|f| f.get("sourceDeviceId"))
+                .and_then(|v| v.as_str())
+                .and_then(|d| Uuid::parse_str(d.trim()).ok())
+                == Some(own.device)
+        });
+        match (via_probe, ours) {
+            (true, Some(own)) => own.recent && fact_is_fresh(fact, fresh_for_secs, now),
             (true, None) => fact_is_fresh(fact, reprobe_window_secs(fresh_for_secs), now),
             (false, _) => fact_is_fresh(fact, fresh_for_secs, now),
         }
@@ -383,6 +391,15 @@ pub(crate) fn skip_reason(
         return Some("recently_probed");
     }
     None
+}
+
+/// This runner's own attempt stamp for a row, as [`skip_reason`] reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OwnProbe {
+    /// The stamp is inside the re-probe window at the sweep's start.
+    pub recent: bool,
+    /// This runner's device — only a fact filed by it is judged by the stamp.
+    pub device: Uuid,
 }
 
 /// Slack taken off the re-probe window. Attempts are stamped with the SWEEP's
@@ -433,6 +450,7 @@ impl ProbeAttempts {
     }
 
     /// Whether `session_id` was probed within the re-probe window before `now`.
+    #[cfg(test)]
     pub(crate) fn recently(
         &self,
         session_id: &str,
@@ -639,16 +657,21 @@ pub(crate) async fn run_probe_sweep(
         // `unspecified`) is someone asking now: this runner's attempt memory
         // does not hold it back. The per-device throttle still applies.
         let manual = trigger == "manual";
-        let own_probe = if manual {
+        let stamped = if manual {
             None
         } else {
             doors
                 .attempts()
                 .recently_if_stamped(&session_id, flags.fresh_for_secs, started)
         };
+        let own_probe = stamped.and_then(|recent| {
+            doors
+                .local_device_id()
+                .map(|device| OwnProbe { recent, device })
+        });
         let reason = skip_reason(row, flags.fresh_for_secs, started_utc, own_probe)
             .or_else(|| doors.live_tab_here(&session_id).then_some("live_tab_here"))
-            .or_else(|| (own_probe == Some(true)).then_some("recently_attempted"));
+            .or_else(|| (stamped == Some(true)).then_some("recently_attempted"));
         if let Some(reason) = reason {
             outcomes.push(RowOutcome {
                 session_id,
@@ -1284,12 +1307,7 @@ pub(crate) async fn run_probe_command(
         format!("remote_interactivity_probe:invalid_device_id: {device_id:?} is not a uuid: {e}")
     })?;
     let device_id = device.to_string();
-    // Absent means UNSPECIFIED, not manual: only an explicit `manual` bypasses
-    // the attempt memory.
-    let trigger = trigger
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .unwrap_or("unspecified");
+    let trigger = normalize_trigger(trigger);
     if trigger == "fleet_view" {
         // Settings I/O is blocking file work: off the async runtime, and only
         // when the stamp is actually due.
@@ -1321,6 +1339,15 @@ pub(crate) async fn run_probe_command(
         .map_err(|e| e.to_string())?;
     log_report(&report);
     serde_json::to_value(&report).map_err(|e| e.to_string())
+}
+
+/// A command's trigger: absent or blank means UNSPECIFIED, not manual — only
+/// an explicit `manual` bypasses the attempt memory.
+pub(crate) fn normalize_trigger(trigger: Option<&str>) -> &str {
+    trigger
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or("unspecified")
 }
 
 fn log_report(r: &ProbeSweepReport) {
@@ -1960,7 +1987,15 @@ mod tests {
             }),
         );
         assert_eq!(
-            skip_reason(&r, 1800, now, Some(false)),
+            skip_reason(
+                &r,
+                1800,
+                now,
+                Some(OwnProbe {
+                    recent: false,
+                    device: Uuid::parse_str(ME).unwrap(),
+                }),
+            ),
             None,
             "due at the tick"
         );
@@ -1970,7 +2005,16 @@ mod tests {
             "no stamp: the filing time is all there is"
         );
         // And with the stamp inside the window the row is skipped.
-        assert!(skip_reason(&r, 1800, now, Some(true)).is_some());
+        assert!(skip_reason(
+            &r,
+            1800,
+            now,
+            Some(OwnProbe {
+                recent: true,
+                device: Uuid::parse_str(ME).unwrap(),
+            })
+        )
+        .is_some());
         // End to end: the attempt stamp at the previous sweep's start makes the
         // next tick's sweep probe it.
         let a = ProbeAttempts::default();
@@ -1980,6 +2024,64 @@ mod tests {
             a.recently_if_stamped(&sid(1), 1800, prev + PROBE_EVERY),
             Some(false)
         );
+    }
+
+    /// Two runners: this runner's stale stamp does NOT override another
+    /// device's recent probe fact — that one is judged by its observedAt.
+    #[test]
+    fn another_devices_probe_fact_is_judged_by_its_filing_time() {
+        let now = Utc::now();
+        let other = "22222222-2222-4222-8222-222222222222";
+        let mut theirs = fact("ok", Some("probe"), 300, None);
+        theirs["sourceDeviceId"] = json!(other);
+        let r = row(
+            1,
+            json!({
+                "readableRemotely": theirs,
+                "writableRemotely": fact("unknown", None, 0, Some("unprobed")),
+            }),
+        );
+        let mine_stale = Some(OwnProbe {
+            recent: false,
+            device: Uuid::parse_str(ME).unwrap(),
+        });
+        assert_eq!(
+            skip_reason(&r, 1800, now, mine_stale),
+            Some("write_unmeasurable"),
+            "the other runner probed 300 s ago — not due"
+        );
+    }
+
+    /// Sweep level: a row whose OWN stamp is past the window is probed, even
+    /// though coord's probe fact (filed mid-way through that earlier sweep) is
+    /// younger than the window.
+    #[tokio::test]
+    async fn a_row_whose_own_stamp_is_past_the_window_is_probed() {
+        let target = RecorderTarget::new(vec![row(
+            1,
+            json!({
+                "readableRemotely": fact("ok", Some("probe"), PROBE_EVERY.as_secs() as i64 - 300, None),
+                "writableRemotely": fact("unknown", None, 0, Some("unprobed")),
+            }),
+        )]);
+        let prev = std::time::Instant::now()
+            .checked_sub(PROBE_EVERY)
+            .expect("the box has been up longer than PROBE_EVERY");
+        target.attempts.note(&sid(1), prev);
+        let report = run_probe_sweep(&target, DEVICE, "scheduler").await.unwrap();
+        assert_eq!(
+            report.outcomes[0].decision, "probed",
+            "{:?}",
+            report.outcomes[0]
+        );
+    }
+
+    #[test]
+    fn an_absent_trigger_is_unspecified_not_manual() {
+        assert_eq!(normalize_trigger(None), "unspecified");
+        assert_eq!(normalize_trigger(Some("  ")), "unspecified");
+        assert_eq!(normalize_trigger(Some(" manual ")), "manual");
+        assert_eq!(normalize_trigger(Some("fleet_view")), "fleet_view");
     }
 
     /// S4: probe facts are current only for the re-probe window (so a probed
