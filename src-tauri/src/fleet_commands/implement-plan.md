@@ -175,7 +175,7 @@ sessions are implementing concurrently, not a separate plan.
    `plan:<plan-stem>:phase:<n>`, `kind: "phase"`, the owner token, the
    heartbeat ledger, the conflict-resolution flow on a foreign `held`) is
    unchanged; only the loop bound narrows from "every phase" to "phase N".
-2. **The Step 0.5 / Step 0.6 cancel-then-mute of the vet→implement safety net
+2. **The Step 0.5 / Step 0.6 withdraw of the vet→implement safety net
    targets the PHASE-QUALIFIED gate, not the bare one.** Look up the gate row
    whose `phase_name` is `vet→implement safety net (phase N)` for this specific
    N — never the bare `vet→implement safety net`, which on a phase-claimable
@@ -777,7 +777,7 @@ the **explicitly-timed** fallback ALSO fails is the arm below reached:
 > **Coord unreachable** (connection error, timeout, non-2xx, unparseable body)
 > on a device that DID resolve a machine UUID: this is **UNKNOWN, not free.** Do
 > not stamp and do not launch any phase agent. Report the transport failure
-> verbatim, run `bash .claude/skills/coord-revive/coord-revive.sh --floor-claim` from the real cwd,
+> verbatim, run `bash <workspace-root>/qontinui-claude-config/.claude/skills/coord-revive/coord-revive.sh --floor-claim` from the real cwd,
 > paste its `FLOOR-CLAIM:` block verbatim, and re-issue over the door it
 > reports LIVE. "No door is live" is licensed ONLY by that block reading
 > `verdict=FLOOR`; then surface to the operator via `AskUserQuestion`
@@ -980,7 +980,7 @@ the roster's guard applies before the edit:
 
 <!-- status-guard:start -->
 > **`IN PROGRESS` is a GUARDED STATE — it is never freely overwritable.**
-> *(Roster and gate: `.claude/commands/_status-writers.md`, check #64. The full
+> *(Roster and gate: `.claude/commands/_status-writers.md`, check #66. The full
 > arm table and its evaluation order: `/vet-plan`, "`IN PROGRESS` is
 > CONDITIONALLY overwritable".)* Before this command writes, replaces,
 > downgrades or re-dates a plan's lifecycle stamp, read the stamp already there
@@ -1094,7 +1094,7 @@ file push. (A repo that is NOT coord sole-authority lands its PRs via normal Git
 > stale copy, that is the expected outcome: **report the residual and carry on.**
 > **Do NOT loop re-transitioning — the next scan wins again.**
 
-#### Retire the vet→implement safety net — cancel, then mute (do this AT the stamp)
+#### Retire the vet→implement safety net — withdraw it (do this AT the stamp)
 
 The IN PROGRESS stamp is the moment this session provably took the work over, so
 it is the moment to retire the net that was armed in case it didn't.
@@ -1123,11 +1123,11 @@ set is forgotten across restarts).
 >
 > Read `continuation_deferred_count` on the gate row to know which regime you are
 > in — it is the only tell, and the row read below already returns it. Do not
-> promise yourself a comfortable window: fire the cancel anyway (it is race-safe
-> and idempotent), **mute regardless**, and if it answers `409 already_consumed`
-> report that honestly instead of claiming a clean takeover. This is also why the
-> **pre-dispatch** cancel is the one that matters: on an un-deferred gate it is
-> very nearly the only reliable window.
+> promise yourself a comfortable window: act at the stamp, **withdraw regardless**
+> of how the optional cancel below answers, and if the continuation was already
+> consumed report that honestly instead of claiming a clean takeover. This is also
+> why acting **pre-dispatch** is what matters: on an un-deferred gate it is very
+> nearly the only reliable window.
 
 **"Born cleared" = the predicate was satisfied at the DOOR — never a row
 state.** The row is born `open`, the first sweep tick clears it, and a sibling
@@ -1151,12 +1151,12 @@ run. With the 30-minute net, the expected state here is **pre-dispatch** again.
 
 > ⚠️ **This step's ORDERING is what made the record gate unclearable, and it is
 > why that gate is no longer registered on this arm.** The work-unit transition
-> above moves the unit to `in_progress` **before** the mute below removes the net
+> above moves the unit to `in_progress` **before** the withdraw below removes the net
 > from `open_siblings` — so a record gate still pinned by that sibling can never
 > clear afterwards (`status != ready_status`), fails **OPEN** with no
 > `gate_unclearable_terminal` alert, and is reaped by nothing until the 7-day
 > stale smell. Measured 2026-09-04: **6 of 25 `unit_ready` gates (24%) ended
-> unclearable this way.** Do not "fix" it by moving the mute above the
+> unclearable this way.** Do not "fix" it by moving the withdraw above the
 > transition — that only narrows the race to one sweep tick. The fix is that
 > §5.4 does not register the gate under this caller.
 >
@@ -1170,7 +1170,7 @@ run. With the 30-minute net, the expected state here is **pre-dispatch** again.
 >
 > ⛔ **But `all_unit_gates_cleared` is `total > 0 && total == cleared`, and the
 > first conjunct matters.** The query now excludes archived, muted AND withdrawn
-> rows (`work_unit_derive_worker.rs:752` — the old `:337-353` citation had
+> rows (`work_unit_derive_worker.rs:1077` — the old `:337-353` citation had
 > drifted), so withdrawal REMOVES the row: withdraw the last counted gate and
 > `total = 0`, which is **vacuously false**. Coord's own regression test only
 > demonstrates the fix on a unit that keeps another cleared gate. So withdrawal
@@ -1185,96 +1185,149 @@ run. With the 30-minute net, the expected state here is **pre-dispatch** again.
 > ⚠️ Verified for the **ready-derivation path only**; other predicates are
 > UNVERIFIED. Record the `gate_id` either way. Canonical: `_gate-registration`.
 
-**Retiring the net is TWO calls, in this order: cancel, then MUTE.** The cancel is
-the race-safe stamp — it forecloses the dispatch. The mute is what unblocks the
-record gate: `open_sibling_gates` counts every open gate on the same
-`work_unit_id` across phase names, excluding only `unit_ready` predicates and rows
-with `muted = true`, and `cancel_continuation` writes only the `continuation_*`
-columns — **the verdict is untouched**. So a cancel alone leaves the net gate
-`open` forever, and — on a standalone-vetted unit that HAS a record gate —
-`unit_ready` reads `Open` with *"…but 1 sibling gate(s) still open"* forever with
-it. Mute the **net** gate only — never `unit_ready`, which must stay unmuted to
-clear. (Under `/vet-imp` there is no record gate on the unit at all, so the mute
-here is purely about not leaving a dead net row open.)
+**Retiring the net is ONE call: `coord_withdraw_gate` `{gate_id, reason}`**, or
+its HTTP twin — the bare, device-authed
+`POST $COORD_HTTP_URL/coord/gates/<gate_id>/withdraw` `{reason}` (there is **no**
+`/agent/` infix for withdraw; it is bare-path like `attest`). Reason:
+`safety net retired: implementation taken over by session <id>`. Verified against
+qontinui-coord `origin/main` `089403222`: `withdraw_gate_core` (`gates.rs:9131`)
+sets the terminal, non-clear verdict `withdrawn`, **cancels a
+dispatched-but-unconsumed continuation itself** (a consumed one is left alone),
+resolves the gate's alerts, and pages no one. A withdrawn gate never clears, so a
+pre-dispatch continuation never dispatches. Measured live 2026-09-27: gate
+`dd46ac4e` withdrawn from a device session came back `verdict: withdrawn` with
+`continuation.cancelled_at` set, in one call.
+
+**Why withdraw and not mute (changed 2026-09-27).** This step used to be *cancel,
+then mute*. For every consumer that reads the net the two are identical —
+`open_sibling_gates` (`gates.rs:17290-17306`) counts only
+`verdict = 'open' AND NOT muted`, and `all_unit_gates_cleared`
+(`work_unit_derive_worker.rs:1077-1095`) excludes muted AND withdrawn rows — so
+either one un-pins a `unit_ready` record gate. The difference is the open set. A
+MUTED gate is still `verdict = 'open'`, and `run_gate_sweep` (`gates.rs:20072`)
+skips muted gates, so its `time_elapsed` predicate is never re-evaluated and the
+row sits open **forever** (family A of plan
+`2026-09-27-gate-backlog-is-unretired-gates-not-slow-spawns`). A
+withdrawn gate leaves the open set in the same call. **Mute is for noise, not
+retirement — a muted gate never clears.** A bare cancel is not a retirement
+either: `cancel_continuation` writes only the `continuation_*` columns and leaves
+the verdict `open`.
+
+Withdraw the **net** only. **Never withdraw the `unit_ready` record gate you
+still need cleared**: withdrawal removes a row from `all_unit_gates_cleared`'s
+population, and withdrawing the last counted gate leaves `total = 0` — vacuously
+NOT ready (the ⛔ block above). (Under `/vet-imp` there is no record gate on the
+unit at all; the withdraw is purely about not leaving a dead net row open.)
+
+**Optional race optimisation — the pre-dispatch cancel.** On an un-deferred gate
+the window is seconds (above), so you MAY fire `coord_cancel_continuation`
+`{gate_id, reason}`, or its `/agent/` infix REST twin
+`POST $COORD_HTTP_URL/coord/gates/<gate_id>/agent/continuation-cancel` `{reason}`,
+immediately before the withdraw. It is still legal pre-dispatch —
+`cancel_continuation` deliberately omits the `continuation_dispatched_at IS NOT
+NULL` guard (*"the pre-dispatch stamp is the whole point"*) — and idempotent, and
+it is the one call that still reaches a continuation whose gate the sweep cleared
+a moment ago (the withdraw accepts only `verdict = 'open'`). It is an
+optimisation, not a step: the withdraw alone is a complete retirement, and
+**whatever the cancel answers — `409 already_consumed` included — the withdraw
+still follows.**
+
+**Fallback — the withdraw answers `NotRegistrant`.** Withdraw authorizes by
+registrant identity (`caller_is_registrant`, `gates.rs:9029`); it is refused on a
+different device, on the same device when both sides carry differing agent ids,
+or on a NULL registrant. You see the MCP error *"only the gate's registrant may
+withdraw it; …"* or HTTP **403** — never the word `NotRegistrant` (full list:
+`_gate-registration` → "Continuation cancel + refresh", point 2). Then, and only then, fall back to two calls on the same
+gate: the cancel above, **then** the mute — `coord_mute_gate` `{gate_id}`, or its
+`/agent/` infix REST twin `POST $COORD_HTTP_URL/coord/gates/<gate_id>/agent/mute`
+— **and write one line naming the gate id in this session's closeout** (e.g.
+*"net `<gate_id>` muted, not withdrawn — NotRegistrant; still in the open set"*),
+because a muted net never leaves the open set on its own. That line is the
+interim until plan
+`2026-09-27-agent-gate-cleanup-verbs-cover-every-gate-an-agent-finds` ships
+`coord_retire_gate` (reason code `continuation_retired_and_muted`).
 
 **Branch on the GATE ROW, not on an HTTP status.** Resolve the work unit for
 this plan-stem, then `GET $COORD_HTTP_URL/coord/agent-gates?work_unit_id=<id>` and look
-at each row's `continuation_spawn` / `continuation_dispatched_at` /
+at each row's `verdict` / `continuation_spawn` / `continuation_dispatched_at` /
 `continuation_consumed_at` / `continuation_cancelled_at` fields. The row to act on
 is whichever one carries a `continuation_spawn`. (`/coord/agent-gates`
 is the **device-authed** read door — the operator `GET /coord/gates` is
-`TenantId`-only and 403s this session's device JWT. **Both writes are
-device-authed too**, and each is one capability on two agent-side transports:
-`coord_cancel_continuation` / `coord_mute_gate` natively, or the `/agent/` infix
-REST twins `POST /coord/gates/<id>/agent/continuation-cancel` and
-`POST /coord/gates/<id>/agent/mute` — so this session
-does the whole loop itself. This parenthetical used to say "the
-cancel below stays operator-only"; that was false, and it is what let gate
-`7902e457` spawn a redundant terminal on 2026-08-20.)
+`TenantId`-only and 403s this session's device JWT. **Every write here is
+device-authed too**: the withdraw (`coord_withdraw_gate`, or the bare
+`POST /coord/gates/<id>/withdraw`), and — for the optional cancel and the
+fallback mute — `coord_cancel_continuation` / `coord_mute_gate` natively, or
+their `/agent/` infix REST twins `POST /coord/gates/<id>/agent/continuation-cancel`
+and `POST /coord/gates/<id>/agent/mute`. So this session does the whole loop
+itself. A parenthetical here once said "the cancel below stays operator-only";
+that was false, and it is what let gate `7902e457` spawn a redundant terminal on
+2026-08-20.)
 
 | Row state | What it means | What to do |
 |---|---|---|
-| `continuation_spawn != null` ∧ `dispatched_at == null` | **PRE-DISPATCH — the net is ARMED. This is the EXPECTED state at this stamp**, and what the 30-minute `time_elapsed` net exists to produce. | **Cancel, then mute.** `coord_cancel_continuation` `{gate_id, reason}` (the native MCP tool), or the equivalent REST twin `POST $COORD_HTTP_URL/coord/gates/<gate_id>/agent/continuation-cancel` `{reason}` — legal pre-dispatch, and the point of it: `cancel_continuation` deliberately omits the `continuation_dispatched_at IS NOT NULL` guard (*"the pre-dispatch stamp is the whole point"*). **Then** `POST .../coord/gates/<gate_id>/agent/mute` on the same gate, or the record gate stays pinned `Open` on it as a sibling. `coord_withdraw_gate` is the one-call equivalent and is LIVE. |
-| `dispatched_at != null` ∧ `consumed_at == null` ∧ `cancelled_at == null` | Dispatched, not yet consumed — a net older than its 30-minute window, or a gate registered by a coord that predates the split. **Read `continuation_deferred_count` on this row**: `> 0` means a deferral bought you hours; `0` means this window is measured in *seconds* and you are unlikely to still be in it. | **Same two calls, same order, either transport.** `coord_cancel_continuation` `{gate_id, reason}` — the native MCP tool, callable from this device-JWT session — or the REST twin `POST .../coord/gates/<gate_id>/agent/continuation-cancel` `{reason}`. Same capability, same `cancel_continuation_inner`; if the MCP tool is not visible that is masking, not absence, so fall through to the REST door rather than concluding the path is closed. The cancel returns `200 {"cancelled":true}` if you won the race; the mute is required either way. |
-| `dispatched_at != null` ∧ `consumed_at != null` | The rescue spawn already fired. The honest fallback arm — reachable on gates registered by an older coord, where the continuation rode the born-cleared `unit_ready` gate. | The cancel answers `409 already_consumed`; **do not** claim a clean takeover (see the responses below). **Still mute the gate.** |
-| no row carries a `continuation_spawn` | Genuinely nothing pending — e.g. a standalone `/implement-plan` whose gates were registered continuation-less. | Say so and proceed. **Do not mute anything.** |
+| `verdict: open` ∧ `continuation_spawn != null` ∧ `dispatched_at == null` | **PRE-DISPATCH — the net is ARMED. This is the EXPECTED state at this stamp**, and what the 30-minute `time_elapsed` net exists to produce. | **Withdraw.** `coord_withdraw_gate` `{gate_id, reason}`, or `POST $COORD_HTTP_URL/coord/gates/<gate_id>/withdraw` `{reason}`. A withdrawn gate never clears, so it never dispatches. (The optional pre-dispatch cancel may go first.) |
+| `verdict: open` ∧ `dispatched_at != null` ∧ `consumed_at == null` ∧ `cancelled_at == null` | Dispatched, not yet consumed — a net older than its 30-minute window, or a gate registered by a coord that predates the split. **Read `continuation_deferred_count` on this row**: `> 0` means a deferral bought you hours; `0` means this window is measured in *seconds* and you are unlikely to still be in it. | **Withdraw — the same call.** `withdraw_gate_core` cancels a dispatched-but-unconsumed continuation itself; read the row back for `continuation_cancelled_at`. If the MCP tool is not visible that is masking, not absence, so fall through to the HTTP twin rather than concluding the path is closed. |
+| `dispatched_at != null` ∧ `consumed_at != null` | The rescue spawn already fired. The honest fallback arm — reachable on gates registered by an older coord, where the continuation rode the born-cleared `unit_ready` gate. | **Do not** claim a clean takeover (see the responses below). If the verdict is still `open`, **still withdraw** — it leaves the consumed continuation alone and takes the row out of the open set. |
+| no row carries a `continuation_spawn` | Genuinely nothing pending — e.g. a standalone `/implement-plan` whose gates were registered continuation-less. | Say so and proceed. **Do not withdraw or mute anything.** |
 
 **Why the row and not the status code.** The row tells you which gate carries the
 continuation and which window it is in; the status code alone conflates a gate
-that was never armed with one you failed to reach. Read `continuation_spawn`
-first, act second. (This paragraph used to say `continuation-cancel` governs the
+that was never armed with one you failed to reach. Read the row first, act
+second. (This paragraph once said `continuation-cancel` governs the
 "post-dispatch window only" and that a pre-dispatch POST 404s. **That was wrong**
 — coord's `cancel_continuation` is deliberately unguarded on
-`continuation_dispatched_at`, so the pre-dispatch stamp is a supported call and
-the correct FIRST action in every armed row-state. Canonical:
-`_gate-registration` → "Continuation cancel + refresh".)
+`continuation_dispatched_at`. Canonical: `_gate-registration` → "Continuation
+cancel + refresh".)
 
-Responses to the cancel:
+Responses:
 
-- **200 `{cancelled:true}`** — the continuation is retired. Now mute the gate.
-- **200 `{cancelled:true, already:true}`** — idempotent; it was already
-  cancelled (Step 0.6's copy, or an earlier run). Still mute the gate.
-- **401 `operator context missing; SSO required`** — **you used the OPERATOR
-  route.** This is not a permissions wall and it is not inherent to an agent
-  session: it is a wrong door. Both actions have device-authed `/agent/` infix
-  twins, which is what this session — holding a device JWT, not an operator
-  bearer — must call: `POST .../coord/gates/<gate_id>/agent/continuation-cancel`
-  with `{reason}` only (`cancelled_by` derives from the JWT and is not a body
-  field), and the mute — `coord_mute_gate` `{gate_id}`, or its twin
-  `POST .../coord/gates/<gate_id>/agent/mute`. The unprefixed
-  `TenantId` routes are the operator-side equivalents; mention them in a report if
-  you like, but never call them from here. Reporting "the net is still armed, a
-  redundant terminal may still spawn" on the strength of this 401 is exactly the
-  mistake that let gate `7902e457` spawn a redundant session against a SHIPPED
-  plan on 2026-08-20. Only if the TWIN also fails is the net genuinely still armed.
-- **409 `already_consumed`** — the rescue spawn already fired. Say so honestly:
-  a second session may now be working this plan, so reconcile before launching
-  phase agents rather than claiming a clean takeover. Mute the gate anyway — the
-  spawn is not undoable, but the open sibling still pins the record gate.
+- **Withdraw succeeded** — read the row back: `verdict: withdrawn`, and
+  `continuation_cancelled_at` set unless the continuation was already consumed.
+  Narrate the `gate_id`.
+- **Withdraw refused as not-the-registrant** (MCP *"only the gate's registrant
+  may withdraw it"* / HTTP 403 — another device or agent registered the net). Take
+  the fallback above: cancel, then mute, plus the closeout line.
+- **Withdraw refused because the verdict is not `open`** — the net already
+  reached a terminal verdict (it fired and cleared, or an earlier run withdrew
+  it). It is out of the open set; nothing to withdraw. If it cleared with a
+  dispatched-but-unconsumed continuation, fire the cancel — the one case only
+  the cancel reaches — and report whether a spawn was consumed.
+- **Optional cancel → `200 {cancelled:true}`** (or `{cancelled:true,
+  already:true}`, idempotent) — fine; withdraw next.
+- **Optional cancel → `409 already_consumed`** — the rescue spawn already fired.
+  Say so honestly: a second session may now be working this plan, so reconcile
+  before launching phase agents rather than claiming a clean takeover. **The
+  withdraw still follows.**
+- **401 `operator context missing; SSO required`** on the cancel or the mute —
+  **you used the OPERATOR route.** A wrong door, not a permissions wall: call the
+  `/agent/` infix twins named above (`cancelled_by` derives from the JWT and is
+  not a body field). The withdraw has no operator route at all. Reporting "the
+  net is still armed, a redundant terminal may still spawn" on the strength of
+  this 401 is exactly the mistake that let gate `7902e457` spawn a redundant
+  session against a SHIPPED plan on 2026-08-20.
 
 **Best-effort throughout — this MUST NOT block the stamp or Step 1.** If none of
-it lands, proceed and report the residual honestly — and say which half is
-outstanding, since they fail independently: an uncancelled continuation risks a
-redundant terminal, while an unmuted net gate pins the `unit_ready` record gate
-`Open` and stops the plan publishing as ready, dispatchable work.
+it lands, proceed and report the residual honestly, naming the `gate_id`: an
+unretired net risks a redundant terminal when its 30 minutes elapse, and — on a
+standalone-vetted unit — pins the `unit_ready` record gate `Open` as a sibling.
 
-**Second line of defence, when the cancel does not land.** How genuinely
-*fallback* this is depends on the regime above: on a **deferred** gate the cancel
-normally DOES land (`200 {"cancelled":true}`) and this is a true backstop; on an
-**un-deferred** gate the 7.18 s window means this path is the expected one, so do
-not treat it as rare. A continuation that spawns anyway
+**Second line of defence, when the retirement does not land in time.** On a
+**deferred** gate the withdraw normally lands before any spawn and this is a true
+backstop; on an **un-deferred** gate that already dispatched, the seconds-scale
+window means a consumed spawn is the expected outcome, so do not treat it as
+rare. A continuation that spawns anyway
 runs `/implement-plan` on a plan this session has already stamped IN PROGRESS, so
 that run hits Step 0.45's concurrent-work reconnaissance and Step 0.6's
 phase-claim conflict and should stand down. That is a real mitigation — but it is
 a *behavioural* gate, not a mechanical one, so never treat it as a reason to skip
-the cancel, and never report "a redundant terminal may still spawn" without
-having tried the `/agent/` twin.
+the withdraw, and never report "a redundant terminal may still spawn" without
+having tried both withdraw doors.
 
 **Run it once per run.** Doing it here means Step 0.6's copy is normally a no-op
 second sweep; that is deliberate belt-and-braces, since Step 0.6 is skipped
 entirely in non-coord environments and on the claim-conflict path. If you already
-cancelled here, Step 0.6's sweep will simply find nothing pending — do not report
-it as a second cancellation.
+withdrew the net here, Step 0.6's sweep will find nothing open and pending — do
+not report it as a second retirement.
 
 (canonical spec: `_gate-registration` → "Continuation cancel + refresh" — keep in sync)
 
@@ -1430,7 +1483,7 @@ snake_case-tagged. Parse it:
   OPEN. Step 0.48 states the identical arm for the plan reserve; it is one rule
   at two granularities.
 
-#### Cancel and mute a pending continuation on takeover
+#### Withdraw a pending continuation's gate on takeover
 
 Taking the phase claim directly means THIS session is doing the work a
 **vet→implement safety-net** gate's continuation may have queued as a fresh
@@ -1439,21 +1492,24 @@ runner-terminal spawn. Leaving that continuation alive means the runner spawns a
 forgotten across restarts, and the pending row survives up to **7 days** — the
 window was widened from 24h on 2026-07-23).
 
-**Normally Step 0.5 already did this** — it cancels-and-mutes at the IN PROGRESS
+**Normally Step 0.5 already did this** — it withdraws the net at the IN PROGRESS
 stamp, which is earlier, and that earlier retirement is what makes `/vet-plan`
 §5.4's `/vet-imp` safety net safe. This copy is the backstop for the paths
 where Step 0.5 did not run or did not land: a non-coord environment, a
 transport failure, or a gate that only became pending between the stamp and here.
-If nothing is pending, say "no pending continuation to cancel" — do not report a
-second cancellation of the same gate.
+If nothing is pending, say "no pending continuation to retire" — do not report a
+second retirement of the same gate.
 
-**Same two calls, same order, same doors as Step 0.5: cancel, then mute.** Since
+**Same call, same doors as Step 0.5: withdraw** — with the same optional
+pre-dispatch cancel before it and the same `NotRegistrant` fallback. Since
 2026-08-30 the continuation rides a separate `time_elapsed` net gate under
 `phase_name` `"vet→implement safety net"`, not the `unit_ready` record gate, so
 the row you act on is whichever one carries a `continuation_spawn` — and it is
-normally still **pre-dispatch**, which the cancel handles (`cancel_continuation`
-is deliberately unguarded on `continuation_dispatched_at`). The mute is what stops
-the retired net blocking `unit_ready` as an open sibling.
+normally still **pre-dispatch**, where a withdrawn gate simply never clears and so
+never dispatches. The withdraw is also what stops the retired net blocking
+`unit_ready` as an open sibling, and — unlike the mute this step used to teach —
+it takes the row out of the open set instead of leaving it open forever. **Mute
+is for noise, not retirement — a muted gate never clears.**
 
 So, **best-effort, right after the FIRST phase claim of this run succeeds** (do it
 once per run, not per phase):
@@ -1476,22 +1532,20 @@ once per run, not per phase):
    `continuation_dispatched_at != null`** — that filter drops the pre-dispatch
    rows, which under the 30-minute net are the common case, and pre-dispatch is
    exactly the state the cancel was built to stamp.
-3. For each such gate, fire the cancel. **Two agent-side transports, one
-   capability:** `coord_cancel_continuation` `{gate_id, reason}` is the native
-   MCP tool and is the shorter path when it is visible; the REST recipe below is
-   the **`/agent/` infix twin** of it — same `cancel_continuation_inner`, so use
-   whichever is alive, and a masked MCP tool is masking, not a closed path.
-   Either way (device or agent JWT) tenant and `cancelled_by` derive server-side
-   from the token, so the body carries `reason` alone — an implementing session
-   holds a device JWT, so the unprefixed `TenantId` routes are the operator-side
-   equivalents and are not yours to call:
+3. For each such gate, **withdraw it**. **Two transports, one capability:**
+   `coord_withdraw_gate` `{gate_id, reason}` is the native MCP tool and the
+   shorter path when it is visible; the REST recipe below is its HTTP twin, the
+   **bare** device-authed `POST /coord/gates/<gate_id>/withdraw` — there is no
+   `/agent/` infix for withdraw, and no operator withdraw route either. A masked
+   MCP tool is masking, not a closed path. The body carries `reason` alone; the
+   caller's identity derives from the token:
 
    ```bash
-   curl -fsS -X POST "$COORD_HTTP_URL/coord/gates/<gate_id>/agent/continuation-cancel" \
+   curl -fsS -X POST "$COORD_HTTP_URL/coord/gates/<gate_id>/withdraw" \
      -H "Content-Type: application/json" \
      -H @"$HDR_FILE" \
      -d "$(cat <<EOF
-   { "reason": "taken over by session $AGENT_SESSION_ID" }
+   { "reason": "safety net retired: implementation taken over by session $AGENT_SESSION_ID" }
    EOF
    )"
    ```
@@ -1501,25 +1555,35 @@ once per run, not per phase):
    process's argv — every peer session on the machine can read a cmdline. Reach
    the route over the `/coord-mcp` proxy instead and no header is needed at all:
    the runner injects a live device JWT.
-4. **Then mute the same gate.** Same two-transport shape as the cancel:
-   `coord_mute_gate` `{gate_id}` is the native MCP tool, and the REST twin is
-   `POST "$COORD_HTTP_URL/coord/gates/<gate_id>/agent/mute"` with the same
-   headers — a masked MCP tool is masking, not a closed path. The cancel
-   writes only the `continuation_*` columns and leaves the **verdict untouched**,
-   so without the mute the net gate stays `open` and, on a standalone-vetted unit
-   that has one, pins the `unit_ready` record gate `Open` with a *"1 sibling
-   gate(s) still open"* reason indefinitely. Mute the gate that carried the
-   continuation, never `unit_ready` — and never **withdraw** a `unit_ready` gate
-   either: a `withdrawn` row is not `cleared`, so it permanently blocks that
-   unit from deriving `ready`.
+
+   One call is the whole retirement: `withdraw_gate_core` sets the terminal,
+   non-clear, non-paging `withdrawn` verdict and cancels a
+   dispatched-but-unconsumed continuation itself. The pre-dispatch cancel —
+   `coord_cancel_continuation` `{gate_id, reason}`, or its `/agent/` infix twin
+   `POST "$COORD_HTTP_URL/coord/gates/<gate_id>/agent/continuation-cancel"` with
+   the same headers — MAY go first as a race optimisation (it is legal
+   pre-dispatch); it never replaces the withdraw.
+4. **On `NotRegistrant`, fall back — and say so in the closeout.** Withdraw is
+   registrant-only (`caller_is_registrant`), so a net armed from another device
+   or agent, or with no recorded registrant, refuses it (MCP error or HTTP 403;
+   causes: `_gate-registration` → "Continuation cancel + refresh", point 2). Then fire that cancel, **then** the mute — `coord_mute_gate`
+   `{gate_id}` natively, or its `/agent/` infix REST twin
+   `POST "$COORD_HTTP_URL/coord/gates/<gate_id>/agent/mute"` — and write one line
+   naming the gate id in the session closeout, since a muted net stays in the
+   open set until plan
+   `2026-09-27-agent-gate-cleanup-verbs-cover-every-gate-an-agent-finds` ships
+   `coord_retire_gate` (`continuation_retired_and_muted`). Act on the gate that
+   carried the continuation, **never on `unit_ready`**: withdrawing (or muting)
+   the last counted gate on a unit leaves `all_unit_gates_cleared` with
+   `total = 0`, which is vacuously not ready.
 
 This is **best-effort and MUST NOT block** the phase launch: a non-2xx, a 404
 (no such gate), or a network failure is fine —
-narrate it and proceed. A **409 `already_consumed`** means a spawn already
-happened: report it honestly (do not claim a clean takeover), still mute the
-gate, and still proceed with this session's work. Narrate the outcome either
-way — "cancelled and muted net gate `<gate_id>`" or "no pending continuation to
-cancel".
+narrate it and proceed. A **409 `already_consumed`** on the optional cancel means
+a spawn already happened: report it honestly (do not claim a clean takeover),
+still withdraw the gate, and still proceed with this session's work. Narrate the
+outcome either way — "withdrew net gate `<gate_id>`" or "no pending continuation
+to retire".
 
 (canonical spec: `_gate-registration` → "Continuation cancel + refresh" — keep in sync)
 
@@ -2686,7 +2750,8 @@ Phase 3)*:
   time**, taken from the reviewer's own report rather than from a `git
   rev-parse` you run afterwards. Every other field in this artifact is the
   reviewer's own word; this one is the only identity coord can later disagree
-  with. Copy it onto the `prs[]` row when the PR opens (Step 4.5),
+  with. Copy it onto the `prs[]` row when the PR opens (Step 4.5b, whose
+  read-back supplies that row's `number` and `url`),
   and if you commit again after the review, **review again** and record the new
   head — a PR whose coord `head_sha` differs from the artifact's
   `reviewed_head_sha` carries code no review saw, and Step 4.7 fails it. The
@@ -2935,12 +3000,12 @@ carries it toward `main`. When that section says the PR no longer carries the
 push, take its fresh-branch path, and add these steps here:
 1. Re-run Step 4.4 items 3–6 on the new branch's head.
 2. Push the new branch.
-3. Open the new PR in Step 6's order (`coord_create_pr`, falling back to
-   `gh pr create`), with the full Step 4.5 trailer block. Its first
+3. Open the new PR through Step 4.5b below — the served door order, then the
+   read-back — with the full Step 4.5 trailer block. Its first
    `Coord-Reviewed-Head:` line is this new head's review.
 4. Record its `prs[]` row through `scripts/review-arm-record.sh`, using the
-   PR number the create call returned (`coord_create_pr`, or `gh pr create` on
-   fallback). coord's `mine=true` coverage will not
+   PR number and URL Step 4.5b's READ returned, never the create call's
+   output. coord's `mine=true` coverage will not
    attribute a hand-cut branch to this session, so that row is the only thing
    that covers it.
 
@@ -2950,8 +3015,15 @@ section): re-run Step 4.4 items 3–6 on the new head (a new
 then EDIT the PR body to add a second `Coord-Reviewed-Head:` line for it:
 
 ```
-gh pr edit <n> --body-file <file>
+gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -F "body=@<file>"
+gh api repos/<owner>/<repo>/pulls/<n> --jq .body | grep 'Coord-Reviewed-Head'   # read it back
 ```
+
+Not `gh pr edit --body-file`: on this fleet's gh 2.46.0 it exits 1 on the retired
+`repository.pullRequest.projectCards` GraphQL prefetch **before** writing, and
+its only output reads like a deprecation warning, so a caller that trusts the
+printed line believes it edited a body it never touched. The REST route does not
+touch projects. Read the body back either way.
 
 coord re-reads the body on every `pull_request.*` webhook including `edited`,
 so the edit is harvested; a `pr-merge hydrate` sweep heals a missed one.
@@ -2963,6 +3035,76 @@ trailer is the half coord's gate reads, and the two agree only when both are
 re-written for the same head — a re-review that re-records the artifact and
 forgets the body edit leaves a PR that corroborates locally and is refused by
 coord.
+
+#### Step 4.5b: Open the PR in the served door order — then READ it back before anything uses its number
+
+*(Plan `2026-09-27-qontinui-pr-zero-byte-sidecar-placeholder-published-as-session-cli`
+Phase 2.)* This is the canonical PR-opening step: every instruction in this skill
+that opens a PR routes here, and every other command that opens one points here.
+It adds no doctrine of its own — the order is served policy and the read-back is
+the served rule that a status signal must observe the state it names.
+
+**1. The door order is served policy; read it there, not from this line.**
+`git-operations` `pr-create-preference-order`, as extended by
+`git-operations` `masked-is-not-missing-and-the-loopback-door-precedes-the-fallback`
+(`/policy get policy git-operations`). The doors those clauses name, and how each
+is reached from here:
+
+- `coord_create_pr` (MCP) or its HTTP twin;
+- the runner's loopback door, `POST http://127.0.0.1:9876/vcs/pull-requests`,
+  a JSON body with `repo` (`owner/name`), `head` and `title` required, and
+  `base`, `body` and `draft` optional. `qontinui-pr create --title <t> --body-file <f>`
+  is its client and finds the nonce and the port in the session `.mcp.json`
+  itself. To call the door directly, take the nonce header and the port from
+  that file's coord-mcp entry (the port is 9876 only on the primary runner),
+  stage the header in a private file and pass `curl -H @file` — never on argv,
+  where every peer session on the box can read it;
+- `gh pr create`, which attributes the PR to the operator's GitHub account, so
+  say so in the report.
+
+Never `gh pr merge`, never `--admin` — coord is the sole merge authority.
+
+**2. READ IT BACK. The PR exists only when a read shows it**, whichever door
+answered and whatever it printed or exited:
+
+```bash
+PUSHED_HEAD="$(git rev-parse HEAD)"   # in the worktree you pushed from
+gh pr list --repo <owner/repo> --head <branch> --state all \
+  --json number,url,state,headRefOid \
+  --jq ".[] | select(.headRefOid == \"$PUSHED_HEAD\") | \"\(.number) \(.state) \(.url)\""
+```
+
+or, when a door did return a number, `coord_pr_status(repo, number)`, whose
+`head_sha` must be that same head. The PR exists only when a row's `headRefOid`
+is the head you pushed. `--state all`, because coord can land and close a PR
+within seconds of its creation, and an open-only read then reports it as never
+proposed. A row carrying a DIFFERENT head is an earlier push, not this one —
+`knowledge-base/qontinui-specific/coord-ff-lands.md` → "Pushing to a branch
+whose PR may already have landed" decides whether it still carries yours.
+
+- **An empty read right after a create is UNKNOWN, not absent**: GitHub's list
+  can trail the create. Re-read about 10 s later.
+- **Two empty reads = no PR.** Do not report one opened; take the next door in
+  the order above, and read back again after it.
+
+**3. Every downstream use of a PR number in this skill takes it from THIS
+read**, never from the create call's output: the review-arm `prs[]` row
+(`number`, `url`) Step 4.4's recorder writes, the Step 4.5 trailer edits
+(`gh api -X PATCH repos/<owner>/<repo>/pulls/<n>`), Step 4.7's corroboration,
+and Step 6.5's gates. A number no
+read returned is a number nothing verified.
+
+**4. Why the create call's word is not enough.** `qontinui-pr create` prints
+the PR URL on success, but prints the raw response body when that body has no
+`url` field — so its stdout is a hint, never the proof. Empty stdout from a
+create that exited 0 is the signature of dossier
+`qontinui-pr-shim-zero-byte-opens-no-pr` (findings
+`1f68e51b-2eb5-4ca9-a635-bf0400689cba`, `a67bac1f-081b-433a-8fb8-06482eea0b89`):
+a zero-length `qontinui-pr.exe` on PATH runs under Git Bash as an empty script,
+exits 0, prints nothing and opens no PR. Read the hint as a reason to expect an
+empty read — the read is still the verdict, whichever way the hint points. That
+is served policy `ux-priorities` `a-status-signal-must-observe-the-state-it-names`
+applied to your own tool: a create's exit status observes a process, not a PR.
 
 #### Step 4.6: Record every identified-but-unowned follow-up as an edge
 
@@ -3166,7 +3308,7 @@ touched), and exits on the **worst** verdict:
 | exit | verdict | what it means | what you do |
 |---|---|---|---|
 | `0` | **CORROBORATED** | every PR's coord `head_sha` equals the artifact's `reviewed_head_sha`, the re-measured tree equals the artifact's `reviewed_tree`, and the coverage read found no PR coord holds for this session that `prs[]` omits | proceed — but read the `coverage=` half of the verdict line too, below |
-| `2` | **CONTRADICTION** | `contradiction_head_drift` — the PR carries code the review did not see; `contradiction_tree_moved` — the **working tree** moved since the review measured it, committed or not; or `contradiction_uncovered_pr` — coord attributes a PR to this session that the artifact omits | **this is a failure of the review gate, not a note.** Re-review the head that is actually on the PR and the tree that is actually on disk (Step 4.4 items 3–6 again, which re-measures `reviewed_head_sha` and `reviewed_tree`), or cover the omitted PR; then add the new head's `Coord-Reviewed-Head:` line to the PR body (`gh pr edit <n> --body-file <file>`, Step 4.5 — coord harvests it on `edited`) so the trailer coord's `require_review` gate reads and the artifact agree; then re-run this step. Do not proceed to Step 6 with a contradiction standing, and never edit the `corroboration[]` row by hand |
+| `2` | **CONTRADICTION** | `contradiction_head_drift` — the PR carries code the review did not see; `contradiction_tree_moved` — the **working tree** moved since the review measured it, committed or not; or `contradiction_uncovered_pr` — coord attributes a PR to this session that the artifact omits | **this is a failure of the review gate, not a note.** Re-review the head that is actually on the PR and the tree that is actually on disk (Step 4.4 items 3–6 again, which re-measures `reviewed_head_sha` and `reviewed_tree`), or cover the omitted PR; then add the new head's `Coord-Reviewed-Head:` line to the PR body (`gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -F "body=@<file>"`, Step 4.5 — coord harvests it on `edited`) so the trailer coord's `require_review` gate reads and the artifact agree; then re-run this step. Do not proceed to Step 6 with a contradiction standing, and never edit the `corroboration[]` row by hand |
 | `3` | **UNKNOWN** | the card door did not answer — `unknown_door` (it refused or answered garbage), `unknown_door_timeout` (the door's curl gave up with exit 28 — its connect bound or its `COORD_REVIVE_CALL_TIMEOUT` total bound; the line cannot say which) or `unknown_budget_expired` (this script's `REVIEW_ARM_CORROBORATE_TIMEOUT`, default 600 s, expired before the door exited; *most likely* local starvation only when the inner budget sits below it), each detail naming the budgets involved and the elapsed wall time — the card reads `confidence: unknown` or carries no `head_sha`, the artifact predates `reviewed_head_sha` (`unknown_no_reviewed_head`) or `reviewed_tree` (`unknown_no_reviewed_tree`), or the tree could not be compared — the producer refused, a field is the unresolved sentinel, or the two lines name different checkouts (`unknown_tree`) | UNKNOWN is never a pass and never a contradiction. Say so in the Step 6 report — *"corroboration UNKNOWN: <the detail the row carries>"* — and never report the review as corroborated |
 | `4` | **USAGE** | no artifact, no session id | the same finding Step 6 item 6 names: the review gate never wrote its record |
 | any other | **UNKNOWN** | any other exit (1, 129/130/143, …): the run did not complete — a crash, or a HUP / INT / TERM, e.g. a foreground Bash-tool timeout — and the artifact may or may not have been rewritten | report *"corroboration UNKNOWN: the run did not complete (exit <n>)"*; never corroborated |
@@ -3326,8 +3468,9 @@ established — a clean `gh pr checks` read is not proof of the latter.
    `merge-authority` is not in tension — coord is sole merge authority for
    `qontinui/*` **application** repos, and a notes/plans repo is neither. If the
    plans repo IS one coord lands, open a PR for the plan branch instead
-   ([policy: pr-create-preference-order]) and let coord land it; the read-back
-   above is still what closes the step.
+   ([policy: pr-create-preference-order]), through Step 4.5b — the served door
+   order, then the read-back its number comes from — and let coord land it; the
+   content read-back above is still what closes the step.
 
    If the `rev-parse --is-inside-work-tree` check fails, the plan directory is a plain folder: the
    stamped file on disk **is** the record, there is nothing to commit, push or
@@ -3362,9 +3505,9 @@ established — a clean `gh pr checks` read is not proof of the latter.
    nothing pushed after its close.
 
    When the section says no PR carries the push and commits remain unlanded,
-   take its fresh-branch path. Open the new PR with **`coord_create_pr` first,
-   then `gh pr create`**, carrying the line-anchored `Plan: <stem>` marker Step
-   4.5 specifies. **Never `gh pr merge`, never `--admin`**: coord is the sole
+   take its fresh-branch path. Open the new PR through **Step 4.5b** — the
+   served door order, then the read-back its number comes from — carrying the
+   line-anchored `Plan: <stem>` marker Step 4.5 specifies. **Never `gh pr merge`, never `--admin`**: coord is the sole
    merge authority and that spelling is denied to agents fleet-wide. If the plan
    branch is the same branch as the implementation PR, that PR satisfies the
    assertion only while the same section says it carries the push; say so rather
@@ -3798,7 +3941,7 @@ gate rots open until a human clicks it.
 - **Honesty:** NEVER report a deferred item as done without EITHER a cleared
   `gate_id` OR an explicit "gate not found" note.
 
-**Continuation cancel + mute (refresh + takeover).** A continuation-carrying gate
+**Continuation retirement — withdraw (refresh + takeover).** A continuation-carrying gate
 — since 2026-08-30 that is the `time_elapsed` **net** gate beside the `unit_ready`
 record gate, not `unit_ready` itself — may have a queued runner-terminal spawn. If
 you **re-register** a gate for the same plan/anchor, or this run **directly takes
@@ -3807,21 +3950,27 @@ in Step 0.6), retire it so the runner does not spawn a redundant terminal: find 
 via `GET $COORD_HTTP_URL/coord/agent-gates?work_unit_id=<id>` (rows carrying a
 `continuation_spawn` with `continuation_consumed_at == null ∧
 continuation_cancelled_at == null` — **pre-dispatch rows included**), then
-`coord_cancel_continuation` `{gate_id, reason}` — or its REST twin
-`POST $COORD_HTTP_URL/coord/gates/:gate_id/agent/continuation-cancel` `{reason}`,
-same capability, pick whichever transport is alive — **followed by** the mute,
-which has the same two doors: `coord_mute_gate` `{gate_id}`, or its REST twin
-`POST $COORD_HTTP_URL/coord/gates/:gate_id/agent/mute`
-— the device-authed doors, so a device session does the WHOLE loop
-itself: `/coord/agent-gates` discovers the row, `/agent/continuation-cancel`
-retires the spawn (it is deliberately unguarded on `continuation_dispatched_at`,
-so pre-dispatch is a supported stamp, not a 404), and `/agent/mute` stops the
-dead net gate pinning the record gate `Open` as an open sibling. (The unprefixed
-routes are the operator's and answer an agent 401.) Best-effort, never blocking:
-404 = no such gate; **409 `already_consumed` = a spawn already happened, report
-it honestly** rather than claiming the cancel landed — and mute regardless.
-Narrate the retired `gate_id`. (canonical spec: `_gate-registration` →
-"Continuation cancel + refresh".)
+**withdraw it**: `coord_withdraw_gate` `{gate_id, reason}`, or its HTTP twin, the
+bare device-authed `POST $COORD_HTTP_URL/coord/gates/:gate_id/withdraw` `{reason}`
+(no `/agent/` infix exists for withdraw). One call sets the terminal, non-clear,
+non-paging `withdrawn` verdict, cancels a dispatched-but-unconsumed continuation,
+and takes the row out of the open set — which a mute never does: a muted gate is
+still `open` and the sweep skips it, so it never clears. **Mute is for noise, not
+retirement.** The pre-dispatch cancel — `coord_cancel_continuation`
+`{gate_id, reason}`, or its REST twin
+`POST $COORD_HTTP_URL/coord/gates/:gate_id/agent/continuation-cancel` `{reason}` —
+MAY precede the withdraw as a race optimisation. If the withdraw answers
+`NotRegistrant` (not the registrant — MCP error or HTTP 403; causes: `_gate-registration` → "Continuation cancel + refresh", point 2), fall back to that cancel
+**followed by** the mute — `coord_mute_gate` `{gate_id}`, or its REST twin
+`POST $COORD_HTTP_URL/coord/gates/:gate_id/agent/mute` — and name the gate id in
+the session closeout until `coord_retire_gate` ships (plan
+`2026-09-27-agent-gate-cleanup-verbs-cover-every-gate-an-agent-finds`). Never
+withdraw the `unit_ready` record gate you still need cleared. (The unprefixed
+cancel/mute routes are the operator's and answer an agent 401.) Best-effort, never
+blocking: 404 = no such gate; **409 `already_consumed` on the cancel = a spawn
+already happened, report it honestly** rather than claiming the cancel landed —
+and withdraw regardless. Narrate the retired `gate_id`. (canonical spec:
+`_gate-registration` → "Continuation cancel + refresh".)
 
 ### Step 7: Run `/unattended` (mandatory, last action)
 

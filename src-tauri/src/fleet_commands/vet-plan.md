@@ -21,6 +21,10 @@ These four are the **engineering priorities** — they decide *what* gets built.
 ## Arguments
 
 - `$ARGUMENTS` — Path to the plan file (absolute or relative). If omitted, look for the most recently modified `*.md` under `$QONTINUI_PLANS_DIR` (see below) and the working tree root, and ask the user to confirm before editing.
+- `--phase N` — Optional. Vet only phase N of a **phase-claimable** plan
+  (`/preflight` §0c's parsed declaration, never inferred) rather than the whole
+  document — see "§0.21. `--phase N`: vet only that phase" below for the full
+  narrowing (reserve, edit scope, and which coord writes are skipped).
 
 ## Plan directories
 
@@ -182,6 +186,12 @@ a CLOSED or MERGED PR carries nothing pushed after its close. When the section
 says no PR carries the push and commits remain unlanded, take its fresh-branch
 path and open the new PR — **`coord_create_pr` first, then `gh pr create`** —
 with a line-anchored `Plan: <stem>` marker in the body. **Never `gh pr merge`, never `--admin`.**
+Open it in `/implement-plan` Step 4.5b's served door order (the runner's loopback
+door sits between the coord door and the `gh` fallback), then READ it back —
+`gh pr list --repo <owner/repo> --head <branch> --state all --json
+number,url,state,headRefOid` — and take the PR number only from a row whose
+`headRefOid` is the head you pushed, never from the create call's exit status or
+output.
 That marker is an **indexability** claim, not a delivery one: once plan
 `2026-09-04-docs-only-plan-marker-prs-derive-shipped` Phase 1 is deployed
 (authored 2026-09-04, not deployed as of that date), coord classifies a citation
@@ -260,8 +270,7 @@ So read the DOOR: `coord-revive.sh tools`, then look for `independence` in that
 tool's `inputSchema`. If your own tool list is the stale one, send the
 declaration with `coord-revive.sh call coord_work_unit_transition '<json>'`
 rather than the tool your session advertises, and verify by read — a zero exit
-is not evidence the write landed. How the declaration is built, and when it
-is sent at all, is §5.4 Step B; its shape is in Step C's
+is not evidence the write landed. The worked declaration is in §5.4 Step C's
 `self_attestation_forbidden` bullet.
 
 Caveats, all live. A well-formed declaration is still refused
@@ -612,6 +621,66 @@ closed on an unanswerable one. Do not write `plan` into a hand-maintained
 mandatory list here — that is what Step 0.7.5 forbids and what the registry
 replaces.
 
+### 0.21. `--phase N`: vet only that phase, on a phase-claimable plan
+
+*(Plan `2026-09-06-multi-phase-plans-have-no-per-phase-lifecycle-in-vet-plan-preflight-and-coord`
+Phase 1 — canonical spec; `/preflight` §0c defines the phase key and the
+reserve mechanics this section reuses rather than re-deriving.)*
+
+When invoked as `/vet-plan --phase N <plan path>` on a plan that is
+**phase-claimable** (`How to take a phase` / `independently claimable` /
+`Phase-Claimable: yes` — parsed, not inferred), this run's scope narrows in
+three ways relative to a whole-plan vet:
+
+1. **Reserve the phase key, not just the plan key.** After §0.2's whole-plan
+   reserve (which still runs — this is a NESTED reserve, never a substitute),
+   also reserve `plan:<plan-stem>:phase:<n>` per `/preflight` §0c: same
+   `kind: "phase"` primitive `/implement-plan` Step 0.6 already uses, same
+   owner token. **A foreign `held` on the plan key is advisory here** — name
+   the holder and continue, since a peer vetting or implementing a different
+   phase is expected concurrency, not a collision. **STOP only on a foreign
+   `held` of the phase key itself** — someone else is already vetting or
+   implementing this exact phase.
+2. **Edit only that phase's section, plus ONE scoped line in the status
+   block.** Do not touch other phases' sections, and do not run the
+   single-stamp-invariant full-block replace §5 describes for a whole-plan
+   vet. Instead, splice a single scoped line into the existing status
+   blockquote using the same separate-index, pinned-`$BASE` push recipe
+   `CLAUDE.md` already documents for a shared checkout (`git hash-object -w`
+   → `GIT_INDEX_FILE=<tmp> git read-tree "$BASE"` → `update-index` →
+   `write-tree` → `commit-tree -p "$BASE"` → push), so a concurrent phase
+   session's own scoped edit is never clobbered by a full-block rewrite. The
+   scoped line reads:
+   ```
+   Phase N: VETTED <date> (session <short-id>) — see § Phase N.
+   ```
+   appended after the existing status paragraph, never replacing it and never
+   producing a second top-level `> **Status:` blockquote.
+3. **Skip the coord registry transition and BOTH §5.4 gates.** §5.4's
+   `→ vetted` registry transition and its `unit_ready` / `time_elapsed` gate
+   registrations are whole-plan primitives — they answer "is THE PLAN ready,
+   dispatchable work", which a single phase's vet cannot answer on a
+   multi-phase, partially-vetted document. Registering either against a
+   phase-scoped vet would misrepresent five-sixths-DRAFT work as ready. Skip
+   both, and **say which arm skipped them** — "phase-scoped vet: registry
+   transition and both §5.4 gates skipped by design (Phase 1 of
+   `2026-09-06-…`)" — in the report, so a reader sees a sanctioned skip rather
+   than an omission.
+4. **Record the scoped verdict on the work unit's `metadata.phase_vets[]`**
+   (`{phase, verdict, date, session, pr}`), through
+   `coord_work_unit_upsert`'s `metadata_patch` merge arm when the running
+   coord serves it (Phase 2 of the plan cited above); when it does not yet,
+   read the current `metadata.phase_vets` first, append this phase's entry,
+   and send the FULL merged object back (a plain `metadata` upsert REPLACES
+   the whole object) — and say in the report that this was a manual
+   read-modify-write rather than an atomic merge, so a concurrent phase
+   session's own write is not silently lost to a race between your read and
+   your write.
+
+A whole-plan `/vet-plan` (no `--phase` flag) is unaffected by any of this —
+every rule above applies only to the `--phase N` invocation on a
+phase-claimable plan.
+
 ### 0.25. Capture the status block and read delivery — BEFORE any edit
 
 Two facts this run depends on are destroyed by its own later steps, so capture
@@ -889,88 +958,7 @@ Use `Read` on the path. Don't skim — note every concrete claim:
 
 A plan written by someone else (or by past-you) usually has 2–4 things that look right but aren't. Your job is to find them.
 
-### 1.5. Hand the JUDGEMENT to a fresh-context subagent — always
-
-**The vet is performed by a subagent that received the artifact and not the
-reasoning.** Spawn exactly one `general-purpose` subagent (the `Agent` tool)
-and give it the work of Steps 2 and 3 — verify every claim, record each as a
-§2a manifest entry, classify the defects, resolve the open questions under the
-Decision policy. It is the authority for that judgement; this session is not.
-The property is served policy `verification-and-evidence`
-`independence-is-context-not-credential` — read the clause live, do not restate
-it here [policy: never-pin-a-mutable-policy-value].
-
-**Spawn unconditionally — including when this session did not author the
-plan.** A session cannot reliably tell whether its context carries authoring
-reasoning: it may be `/pvi`, a resumed run, or a compacted one whose summary
-still holds the author's rationale. A uniform rule has no such failure mode
-(robustness). A re-vet of an already-VETTED plan gets a FRESH subagent too: the
-artifact changed, so a prior verdict names a different `against`.
-
-**The prompt carries exactly four things, and nothing else:**
-
-1. the resolved plan path;
-2. the plan body **as read from `origin/main`** of the repo holding it (`git -C
-   <plans repo> fetch` then `git show origin/main:<path>`) — not its git
-   history, not earlier drafts. If the plan is not on `origin/main` yet, pass
-   the body Step 1 read and say so — the stamp's `Vetted-by:` then reads
-   "working-tree body (not on origin/main)" in place of "`origin/main` body"
-   (its `against` names the CODE repo's sha, so the fact does not go there);
-3. the repos it touches;
-4. the vetting rubric — Steps 2 and 3 of this file, §2a's manifest rules and
-   the Decision policy, **PASTED into the prompt**. Never point at this file's
-   path: it also carries Steps 4, 5 and §5.4, which WRITE, and a subagent
-   told to follow `/vet-plan` will follow them.
-
-The prompt also says, in terms: **return the verdict only — no `Edit` or
-`Write`, no commit or push, no coord write of any kind.** The subagent reads;
-this session writes.
-
-⚠️ **Do NOT put the authoring conversation, a defect list, or "what the author
-meant" into that prompt** — no "here is why I chose this design", no "I already
-noticed X", no prior turn, no summary of this session. That omission IS the
-control, and it is the one thing an implementer would "helpfully" add. A
-subagent briefed on the author's intent is the reviewer who cannot catch what
-the author assumed. The subagent may still run `git log` or read anything
-itself: that is verification, not inherited context.
-
-**It returns a structured verdict**, and you ask for exactly this shape:
-
-- **defects** — each `{category, section, evidence file:line, proposed fix}`,
-  with `category` one of Step 3's five;
-- **resolved open questions** — each with the deciding priority named;
-- **manifest** — the §2a entries it computed, as the JSON array §5.4 submits;
-- **read list** — every `repo@sha` it read (`git rev-parse --short
-  origin/main` after its own fetch), which is what the stamp's `against` and
-  §5.4's `independence.against` are built from;
-- **checks** — one line naming what it verified (premises re-derived, counts
-  recounted, prior art searched), which becomes `independence.verified`;
-- **policies** — every served policy document it read to decide (`/policy`,
-  `name@version`), which is the stamp's `served policy` list.
-
-**This session stays the single writer.** Independence is a property of the
-judgement, not of the file write, and one writer avoids the concurrent-edit
-class entirely. From Step 4 onward you apply the verdict. You may re-check a
-defect only where you are about to edit on it — to place the edit, not to
-re-litigate it. Where your re-check contradicts the verdict, the contradiction
-goes in the §6 report; do not silently overrule it. Keep the verdict: Step 5's
-stamp and §5.4's declaration are both built from it.
-
-**When no spawn is possible** — no `Agent` tool in this harness, or the spawn
-failed and a retry failed — do Steps 2 and 3 inline yourself and take the
-**self path** everywhere downstream: Step 5 writes `VETTED (self)` with
-`Independence: NONE`, and §5.4 sends no declaration. Never write the
-unqualified stamp on a vet this session performed in its own context. An
-independence you could not obtain is UNKNOWN and renders as NONE, never as
-silence [policy: unknown-must-not-render-as-a-default].
-
-Wait for the verdict on a bounded timer, per the **Parallelize research** rule
-below; never end a turn purely awaiting it.
-
 ### 2. Verify every concrete claim
-
-**The Step 1.5 subagent does this step, not you.** What follows is its rubric:
-hand it over verbatim. You apply the verdict it returns.
 
 For each claim in the plan, validate against the current codebase. Run these in parallel where possible:
 - **File / module exists** → `Glob` or `Read`
@@ -1326,8 +1314,7 @@ making review unforgeable. It raises the floor and makes decay observable.
 
 ### 3. Identify defects
 
-**The Step 1.5 subagent does this step too**, and returns each defect in the
-verdict shape named there; you apply it. Its categories:
+Categorize what you find:
 - **Wrong** — claim contradicts the code (path, signature, behavior)
 - **Redundant** — proposes new code that duplicates existing infrastructure
 - **Missing** — overlooks a concrete consumer, edge case, or coupled subsystem
@@ -1342,10 +1329,6 @@ Don't flag style preferences or hypothetical concerns — only material defects.
 plan reserve returned `granted` / `claimed` / `renewed` (or took the documented
 no-machine-UUID skip). A foreign `held`, or a reserve that could not be answered,
 stops the run before any `Edit`.
-
-**You are applying the Step 1.5 verdict here, not forming a new one.** Every
-edit below traces to a defect or a resolved question the subagent returned (or,
-on the self path, to your own inline Steps 2–3).
 
 Use `Edit` (not `Write`) to surgically fix the plan, preserving the author's voice and structure. Specifically:
 - **Add a "Discovered prior art" section** near the top if the plan missed existing infrastructure. Include a small table with `Piece | Location | Notes`.
@@ -1431,41 +1414,7 @@ use, so the lifecycle reads cleanly:
 > and what survived the audit>. Defects found: <count>. Auto-fixed: <count>.
 > Surfaced for user: <count>. <Optional: pointer to follow-up plan if you
 > created one in the report.>
-> Vetted-by: subagent (fresh context: plan path + `origin/main` body + repos
-> + rubric only; no authoring context); served policy <names>@<versions>.
-> Independence: context — the reviewer did not hold the author's reasoning.
 ```
-
-**The stamp records WHO vetted, and with what context** *(plan
-`2026-09-08-vetting-is-not-independent-and-nothing-records-that-it-was`)*. The
-policy's recording half — the independence claim is STORED with the artifact,
-beside what was verified and against what [policy:
-`independence-is-context-not-credential`] — has its human-readable home in
-this line. The `against <repo> origin/main <sha>` clause above already is the
-"verified against"; do not add a second sha. Build `Vetted-by:` from the
-Step 1.5 prompt as you actually constructed it — name every input it received,
-and the served policy documents from the verdict's **policies** field — and the
-`against` from the verdict's read list. §5.4's `independence`
-object is built from these SAME facts, so the stamp and
-`metadata.attestations` cannot disagree.
-
-**When Step 1.5 could not spawn, qualify the stamp — never omit the line.**
-`VETTED` stays the FIRST token after `Status:`, so every parser that reads the
-lifecycle still reads it:
-
-```markdown
-> **Status: VETTED (self) <YYYY-MM-DD>, against <repo> `origin/main` <short-sha>.**
-> <summary as above>.
-> Vetted-by: the invoking session (no subagent: <why the spawn was not made>).
-> Independence: NONE — vetted in the invoking session's context.
-```
-
-The test-equivalent, stated so it can be checked: **a vet run with the spawn
-suppressed must produce the `VETTED (self)` stamp with `Independence: NONE`,
-never an unqualified `VETTED`.** An independence this run could not obtain is
-UNKNOWN and renders as NONE, never as a missing line [policy:
-`unknown-must-not-render-as-a-default`] — an unqualified stamp is exactly the
-indistinguishable-from-a-real-review artifact this line exists to end.
 
 **The stamp names the TREE the vet read, not only the date** *(plan
 `2026-09-05-a-verification-report-never-states-the-tree-it-read`, Phase 4)*.
@@ -1549,7 +1498,7 @@ inline.
 
 <!-- status-guard:start -->
 > **`IN PROGRESS` is a GUARDED STATE — it is never freely overwritable.**
-> *(Roster and gate: `.claude/commands/_status-writers.md`, check #64. The full
+> *(Roster and gate: `.claude/commands/_status-writers.md`, check #66. The full
 > arm table and its evaluation order: `/vet-plan`, "`IN PROGRESS` is
 > CONDITIONALLY overwritable".)* Before this command writes, replaces,
 > downgrades or re-dates a plan's lifecycle stamp, read the stamp already there
@@ -1685,6 +1634,12 @@ unreserve the plan mid-lifecycle. `"not_held"` is otherwise fine and idempotent.
 
 *(canonical spec: `_gate-registration` — keep copies in sync)*
 
+> ⚠️ **A phase-scoped run (`--phase N`, §0.21) never reaches this section at
+> all — §0.21 point 3 skips BOTH the registry transition and both gates below,
+> on every caller, standalone or `/vet-imp` alike.** The table just below this
+> one decides which gate a WHOLE-PLAN vet registers; it does not apply to a
+> phase-scoped vet, which registers neither.
+
 > ⚠️ **A hand-written work-unit status does not stick — the plan adapter reverts it,
 > and this gate is what gets stranded.** The runner's plan/work-unit adapter
 > (`qontinui-runner/src-tauri/src/plan_workunit_adapter/`, actor
@@ -1732,7 +1687,7 @@ decisions only — see the predicate guidance in `_gate-registration`).
 > is open on the unit. Step 6 registers the net on this same `work_unit_id`
 > moments later, which pins the record gate `Open` as a sibling; and
 > `/implement-plan` Step 0.5 transitions the unit to `in_progress` **before** it
-> mutes that net. So by the time the sibling clears, `status != ready_status`
+> withdraws that net. So by the time the sibling clears, `status != ready_status`
 > and the gate can never clear again — it fails **OPEN**, raising no
 > `gate_unclearable_terminal` alert (that alert is verdict-scoped to
 > `failed`/`misconfigured`), reaped by neither the orphan reconciler (whose
@@ -1762,7 +1717,7 @@ decisions only — see the predicate guidance in `_gate-registration`).
 >
 > ⛔ **But `all_unit_gates_cleared` is `total > 0 && total == cleared`, and the
 > first conjunct matters.** The query now excludes archived, muted AND withdrawn
-> rows (`work_unit_derive_worker.rs:752` — the old `:337-353` citation had
+> rows (`work_unit_derive_worker.rs:1077` — the old `:337-353` citation had
 > drifted), so withdrawal REMOVES the row: withdraw the last counted gate and
 > `total = 0`, which is **vacuously false**. Coord's own regression test only
 > demonstrates the fix on a unit that keeps another cleared gate. So withdrawal
@@ -1795,8 +1750,7 @@ decisions only — see the predicate guidance in `_gate-registration`).
 > it — a duplicate, parallel run of the same work (the exact concurrent-WIP clobber
 > the coordination layer exists to prevent). So by default: still upsert the work
 > unit, transition its status (per the registry step below — attempt `vetted`, fall
-> back to `vetted_unattested` (self path, or a subagent-path refusal per §5.4
-> Step C's prologue)), and register the `unit_ready` gate for
+> back to `vetted_unattested`), and register the `unit_ready` gate for
 > registry/dashboard visibility keyed on whichever status actually landed (it
 > auto-clears by predicate), but with NO continuation of any kind.
 >
@@ -1828,7 +1782,7 @@ decisions only — see the predicate guidance in `_gate-registration`).
 > against the siblings that exist by *then*, and step 6 registers the net gate
 > on this same `work_unit_id` moments later, so the record gate goes back to
 > `Open` behind it — *"…but 1 sibling gate(s) still open"* — until
-> `/implement-plan` mutes the net. The continuation argument above does not
+> `/implement-plan` withdraws the net. The continuation argument above does not
 > need the stronger claim: one tick is already enough for the dispatch to beat
 > any cancel, which is the whole reason `unit_ready` is registered
 > continuation-less. See step 7's `initial_verdict`-is-advisory note and,
@@ -1891,45 +1845,65 @@ decisions only — see the predicate guidance in `_gate-registration`).
 > every-run duplicate spawn with extra steps. Measure the latency across recent
 > `/vet-imp` runs before changing the number.
 >
-> ⚠️ **The net gate BLOCKS the record gate until it is MUTED — cancelling its
-> continuation is not enough.** `open_sibling_gates` counts every open gate on the
-> same `work_unit_id` **across phase names**, excluding only `unit_ready`
-> predicates on that unit and rows with `muted = true`. The net is a
-> `time_elapsed` gate on this unit, so it is a **blocking sibling** of the
-> `unit_ready` record gate: while it is open, `unit_ready` evaluates `Open` with
-> the reason *"…but 1 sibling gate(s) still open"* and stops publishing "ready,
-> dispatchable work" for the whole window. And `cancel_continuation` writes only
-> the `continuation_*` columns — **the verdict is untouched** — so a chain that
-> cancels and walks away leaves the net gate open FOREVER, pinning `unit_ready`
-> open with it: the silent fail-open this section exists to prevent, merely
-> relocated. `/implement-plan` Step 0.5 therefore **cancels and THEN mutes** the
-> net (`coord_mute_gate` `{gate_id}`, or its twin
-> `POST .../coord/gates/<id>/agent/mute`) — the cancel is the race-safe
-> stamp, the mute is what removes the row from `open_siblings` and lets the record
-> gate clear. Mute the NET gate only; never mute the `unit_ready` record gate,
-> which must stay unmuted to clear at all. (Under `/vet-imp` there is no record
-> gate to mute or unblock — that arm registers the net alone — so this sentence
-> governs the standalone arm, where the net clears on its own 30-minute
-> predicate and the record gate clears behind it.)
+> ⚠️ **The net gate BLOCKS the record gate until it CLEARS or is WITHDRAWN —
+> cancelling its continuation is not enough, and muting it is not a retirement.**
+> `open_sibling_gates` (`gates.rs:17290-17306`, qontinui-coord `089403222`)
+> counts every gate on the same `work_unit_id` **across phase names** with
+> `verdict = 'open' AND NOT muted`, excluding `unit_ready` predicates on that
+> unit. The net is a `time_elapsed` gate on this unit, so it is a **blocking
+> sibling** of the `unit_ready` record gate: while it is open, `unit_ready`
+> evaluates `Open` with the reason *"…but 1 sibling gate(s) still open"* and
+> stops publishing "ready, dispatchable work" for the whole window. And
+> `cancel_continuation` writes only the `continuation_*` columns — **the verdict
+> is untouched** — so a chain that cancels and walks away leaves the net gate
+> open FOREVER, pinning `unit_ready` open with it: the silent fail-open this
+> section exists to prevent, merely relocated. `/implement-plan` Step 0.5
+> therefore **withdraws** the net — `coord_withdraw_gate` `{gate_id, reason}`, or
+> its HTTP twin, the bare device-authed `POST .../coord/gates/<id>/withdraw`
+> `{reason}` (no `/agent/` infix exists for withdraw). `withdraw_gate_core`
+> (`gates.rs:9131`) sets the terminal, non-clear, non-paging `withdrawn`
+> verdict, cancels a dispatched-but-unconsumed continuation itself, and takes the
+> row out of `open_siblings` and out of the open set in one call.
+>
+> **Mute is for noise, not retirement — a muted gate never clears.** This step
+> used to be *cancel, then mute*. A mute un-pins the record gate exactly as a
+> withdraw does (`open_sibling_gates` skips muted rows, and
+> `all_unit_gates_cleared`, `work_unit_derive_worker.rs:1077-1095`, excludes
+> muted and withdrawn alike), but a muted gate is still `verdict = 'open'` and
+> `run_gate_sweep` (`gates.rs:20072`) skips it, so its predicate is never
+> re-evaluated and the row sits in the open set forever (family A of plan
+> `2026-09-27-gate-backlog-is-unretired-gates-not-slow-spawns`). Withdraw the NET gate only; **never withdraw the `unit_ready` record
+> gate you still need cleared** — withdrawing the last counted gate leaves
+> `all_unit_gates_cleared` with `total = 0`, vacuously not ready. (Under
+> `/vet-imp` there is no record gate to unblock — that arm registers the net
+> alone — so this governs the standalone arm, where the net clears on its own
+> 30-minute predicate and the record gate clears behind it unless a later
+> `/implement-plan` withdraws the net first.)
 >
 > *Why arming the net is safe.* `/implement-plan` **retires it when it stamps IN
-> PROGRESS** (its Step 0.5, via `coord_cancel_continuation` `{gate_id, reason}`
-> or the equivalent REST twin
-> `POST $COORD_HTTP_URL/coord/gates/<gate_id>/agent/continuation-cancel` — one
-> capability, two agent-side transports, the same takeover mechanism its Step 0.6
-> has always used — then the mute, `coord_mute_gate` `{gate_id}` or its
-> `/agent/mute` twin). Because the net's predicate is
-> genuinely unsatisfied for 30 minutes, that cancel lands **pre-dispatch**, which is the
-> state Step 0.5 documents and handles. Pre-dispatch is a supported call, not a
-> 404: `cancel_continuation` deliberately omits the
-> `continuation_dispatched_at IS NOT NULL` guard — *"the pre-dispatch stamp is the
-> whole point"* — so the stamp lands before there is anything to race.
+> PROGRESS** (its Step 0.5): the withdraw above, optionally preceded by the
+> pre-dispatch cancel `coord_cancel_continuation` `{gate_id, reason}` or its REST
+> twin `POST $COORD_HTTP_URL/coord/gates/<gate_id>/agent/continuation-cancel` as
+> a race optimisation. Because the net's predicate is genuinely unsatisfied for
+> 30 minutes, the retirement lands **pre-dispatch**, which is the state Step 0.5
+> documents and handles: a withdrawn gate never clears, so it never dispatches.
+> The cancel is legal pre-dispatch too — `cancel_continuation` deliberately omits
+> the `continuation_dispatched_at IS NOT NULL` guard, *"the pre-dispatch stamp is
+> the whole point"*. Withdraw authorizes by registrant identity
+> (`caller_is_registrant`, `gates.rs:9029`), so when THIS vet and the
+> implementing session run on different devices (or other not-the-registrant
+> cases — MCP error or HTTP 403; `_gate-registration` → "Continuation cancel +
+> refresh", point 2) the withdraw answers `NotRegistrant`; Step 0.5 then falls back to the cancel plus the mute
+> (`coord_mute_gate` `{gate_id}`, or its twin
+> `POST .../coord/gates/<id>/agent/mute`) and names the gate id in its closeout,
+> until plan `2026-09-27-agent-gate-cleanup-verbs-cover-every-gate-an-agent-finds`
+> ships `coord_retire_gate`.
 >
 > | window at the IN PROGRESS stamp | remedy from THIS session |
 > |---|---|
-> | pre-dispatch (`dispatched_at == null`) — **the expected state**, and the one the 30-minute net exists to produce | `POST .../coord/gates/<id>/agent/continuation-cancel` `{reason}` stamps it cancelled pre-dispatch, **then** the mute — `coord_mute_gate` `{gate_id}`, or its twin `POST .../coord/gates/<id>/agent/mute` — to unblock the record gate. `coord_withdraw_gate` also works and does both at once |
-> | post-dispatch, unconsumed (a net older than its window, or one registered by an older coord) | same cancel → `200 {"cancelled":true}`, then the same mute |
-> | already consumed | `409 already_consumed` — the spawn happened; report it, do not claim a clean takeover. **Still mute the gate**, or it pins `unit_ready` open |
+> | pre-dispatch (`dispatched_at == null`) — **the expected state**, and the one the 30-minute net exists to produce | `coord_withdraw_gate` `{gate_id, reason}`, or `POST .../coord/gates/<id>/withdraw` `{reason}` — the withdrawn gate never clears, so it never dispatches, and it leaves the open set, unblocking the record gate. The pre-dispatch cancel may go first as a race optimisation |
+> | post-dispatch, unconsumed (a net older than its window, or one registered by an older coord) | the same withdraw — it cancels the dispatched-but-unconsumed continuation itself |
+> | already consumed | the spawn happened (the optional cancel answers `409 already_consumed`); report it, do not claim a clean takeover. **Still withdraw the gate** if it is open, or it pins `unit_ready` open |
 >
 > **This paragraph used to say the residual was unavoidable.** It said the cancel
 > could not land from the session doing the work and that a redundant terminal
@@ -1956,7 +1930,7 @@ decisions only — see the predicate guidance in `_gate-registration`).
 > continuation and self-healed; `/vet-imp` specifically opted out of it. The net
 > restores that self-healing without paying for it on every completed run.
 >
-> Net effect: **a completed chain cancels AND mutes its own safety net; a dropped
+> Net effect: **a completed chain withdraws its own safety net; a dropped
 > chain self-heals into a fresh, visible session 30 minutes later.**
 >
 > Follow step 2's `device_id` resolution and step 6's `continuation_spawn` shape
@@ -1972,7 +1946,7 @@ decisions only — see the predicate guidance in `_gate-registration`).
 > implementation follows this session and the dispatch into a visible session is
 > the whole point — **or vetting under `/vet-imp`, per the exception above,
 > where the continuation is the net under a chain that may drop and
-> `/implement-plan` Step 0.5 cancels-then-mutes it when the chain holds**. In
+> `/implement-plan` Step 0.5 withdraws it when the chain holds**. In
 > BOTH cases the continuation rides the step-6 `time_elapsed` net gate, never
 > the `unit_ready` record gate;
 > (3) `operator_approval` / genuine human-decision gates, which
@@ -2108,26 +2082,34 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    `unit_ready` record gate for this plan, and any OPEN net gate beside it). If
    one exists, **refresh** it rather than creating a duplicate. **Before
    refreshing, retire the prior net gate** so the old queued runner-terminal spawn
-   does not fire alongside the new one: for any row in that GET carrying a
+   does not fire alongside the new one: for any OPEN row in that GET carrying a
    `continuation_spawn` that is not yet consumed or cancelled — **pre-dispatch
-   rows included**, which under the 30-minute net is the usual state — fire
-   `POST $COORD_HTTP_URL/coord/gates/:gate_id/agent/continuation-cancel`
-   `{reason:"refreshed — superseded by re-registration"}`, **then**
-   `POST $COORD_HTTP_URL/coord/gates/:gate_id/agent/mute` on the same gate. Both
-   are the device-authed `/agent/` **infix** twins, so the device session does the
-   whole loop itself: `/coord/agent-gates` discovers the row, the cancel retires
-   the queued spawn and the mute stops the stale net blocking the fresh record
-   gate as an open sibling. `cancelled_by` derives from the JWT and is not a body
-   field. (The unprefixed routes are the operator's and answer an agent 401.)
-   The cancel is **legal pre-dispatch** — `cancel_continuation` deliberately omits
-   the `continuation_dispatched_at IS NOT NULL` guard — so do not skip it on a
-   row that has not dispatched. Best-effort: a 409 `already_consumed` = a spawn
-   already happened (report it, don't pretend the cancel landed; still mute).
+   rows included**, which under the 30-minute net is the usual state — **withdraw
+   it**: `coord_withdraw_gate` `{gate_id, reason}`, or its HTTP twin, the bare
+   device-authed `POST $COORD_HTTP_URL/coord/gates/:gate_id/withdraw`
+   `{reason:"refreshed — superseded by re-registration"}` (no `/agent/` infix
+   exists for withdraw). One call sets the terminal `withdrawn` verdict, cancels a
+   dispatched-but-unconsumed continuation itself, and takes the stale net out of
+   the open set, so it stops blocking the fresh record gate as an open sibling.
+   **Do not mute it instead** — a muted gate stays open forever (mute is for
+   noise, not retirement). The pre-dispatch cancel,
+   `POST $COORD_HTTP_URL/coord/gates/:gate_id/agent/continuation-cancel` (the
+   device-authed `/agent/` **infix** twin of `coord_cancel_continuation`), may
+   precede the withdraw as a race optimisation; it is legal pre-dispatch.
+   If the withdraw answers `NotRegistrant` (not the registrant — MCP error or HTTP 403; causes: `_gate-registration` → "Continuation cancel + refresh", point 2),
+   fall back to that cancel **then**
+   `POST $COORD_HTTP_URL/coord/gates/:gate_id/agent/mute` (`coord_mute_gate`)
+   on the same gate, and name the gate id in this session's closeout. The device
+   session does the whole loop itself: `/coord/agent-gates` discovers the row.
+   `cancelled_by` derives from the JWT and is not a body field. (The unprefixed
+   cancel/mute routes are the operator's and answer an agent 401.) Never withdraw
+   the `unit_ready` record gate you are refreshing — refresh it.
+   Best-effort: a 409 `already_consumed` on the cancel = a spawn already happened
+   (report it, don't pretend the cancel landed; still withdraw).
    (canonical spec: `_gate-registration` → "Continuation cancel + refresh".)
 4. **Set the work unit's registry status — UNCONDITIONALLY, on BOTH arms.** This
    is the "Set the work unit's registry status" block below
-   (read current → attempt `vetted` → fall back to `vetted_unattested` (self
-   path, or a subagent-path refusal per §5.4 Step C's prologue)); do it
+   (read current → attempt `vetted` → fall back to `vetted_unattested`); do it
    here, before registering, and carry the status that landed into step 5. It is
    written out after this list only because it is long.
 
@@ -2177,11 +2159,7 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
      > registers the gate was the one actor barred from satisfying it.
      >
      > Ordering the transition first removes the guesswork: `vetted` when the
-     > attestation genuinely lands, `vetted_unattested` when it is refused and
-     > §5.4 Step C is taken (self path, or a subagent-path refusal per its
-     > prologue) — never the read status of a refused transition, and nothing
-     > at all when Step A's status is UNKNOWN. (Step A's skip arm, which keys on
-     > an already-past status it read, is the one exception.) Never
+     > attestation genuinely lands, `vetted_unattested` when it is refused. Never
      > `in_progress` — that is what `/implement-plan` Step 0.5 writes, and reusing
      > it makes "vetted, waiting to start" and "already being implemented"
      > indistinguishable.
@@ -2196,7 +2174,7 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
      drops any continuation armed on it (step 7's
      `continuation_dropped_born_cleared:` carve-out). *Born cleared = the
      predicate held at the DOOR; the row is still born `open`, and step 6's net
-     pins it back `Open` until muted.* When an exception DOES apply
+     pins it back `Open` until the net clears or is withdrawn.* When an exception DOES apply
      (most often: vetting standalone, **vetting under `/vet-imp`** — see the
      exception above — or a wait longer than rule 10's ≲2h window), the
      continuation goes on the SEPARATE net gate in step 6, targeting the
@@ -2304,14 +2282,14 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
      > guess is wrong.** It does not orphan the net. `/implement-plan` Step 0.5
      > retires the net by acting on *"whichever row carries a
      > `continuation_spawn`"*, not by matching this string, so a validly-armed
-     > net under an odd name is still cancelled and muted at the IN PROGRESS
+     > net under an odd name is still withdrawn at the IN PROGRESS
      > stamp. The cost is addressability and legibility, not a stranded gate.
      > Do not read the paragraph above as a stronger claim than it makes.
    - **`continuation_spawn`:** the shape shown in step 5, with a populated
      `repos`. This is the **only** gate §5.4 registers that carries one.
-   - **This gate is a blocking sibling of the record gate until it is muted or
-     clears** — see the sibling warning in the exception blockquote above. Under
-     `/vet-imp`, `/implement-plan` Step 0.5 cancels-then-mutes it at the IN
+   - **This gate is a blocking sibling of the record gate until it is withdrawn
+     or clears** — see the sibling warning in the exception blockquote above.
+     Under `/vet-imp`, `/implement-plan` Step 0.5 withdraws it at the IN
      PROGRESS stamp; standalone, nothing retires it and it fires at 30 minutes,
      which IS the dispatch. Say in your report that the record gate reads `Open`
      with a *"1 sibling gate(s) still open"* reason until then — that is the
@@ -2417,8 +2395,9 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
 
    ⚠️ **Under `/vet-imp`, a `unit_ready` row PRESENT on this unit is the defect,
    not the success signal.** It means step 5 was run anyway; say so, and leave
-   it alone — do **not** withdraw it, because a `withdrawn` row permanently
-   blocks that unit from ever deriving `ready` (see the caller table's ⛔ note).
+   it alone — do **not** withdraw it: withdrawal removes it from the count, and
+   if it is the unit's last counted gate `total = 0` makes `ready` vacuously
+   false (see the caller table's ⛔ note).
 
    **Recognise the net by its PREDICATE and its ARMED continuation, not by its
    `phase_name`.** The canonical name is what step 6 tells you to write and what
@@ -2542,42 +2521,8 @@ derivation this whole ordering exists to protect.
 ```
 POST $COORD_HTTP_URL/coord/work-units/<plan stem>/transition
      {to_status:"vetted", by_actor:"<this session>",
-      vet_evidence:[ <the manifest you built in §2a> ],
-      independence:{ <on the subagent path ONLY — see below> }}
+      vet_evidence:[ <the manifest you built in §2a> ]}
 ```
-
-**On the subagent path (Step 1.5 spawned), send the `independence`
-declaration.** Build it from the SAME facts as Step 5's `Vetted-by:` line — one
-source, two readers: the stamp is what a human reads, `metadata.attestations`
-is what a machine reads, and they cannot disagree if neither is composed
-separately.
-
-| Field | Built from |
-|---|---|
-| `verified` | the verdict's **checks** line — what the subagent verified |
-| `against` | the verdict's **read list** — every `repo@sha`, plus the plan at `origin/main <sha>`, or "working-tree body (not on origin/main)" when Step 1.5 passed that, exactly as `Vetted-by:` says |
-| `context` | how the Step 1.5 prompt was constructed — the `Vetted-by:` text, naming each input it received and that no authoring context was passed |
-
-⚠️ **The door is `coord_work_unit_transition` (or the `/transition` POST above)
-— NEVER `coord_work_unit_upsert`.** The upsert takes a `status` and has no
-`independence` field, so a `vetted` sent through it carries no declaration and
-cannot attest by context at all. Coord finding `05a215f1` is that
-shape measured: two plans vetted by fresh-context subagents, stuck at `draft`
-because the attestation went through the upsert. If your own tool list lacks
-the field, read the door (`coord-revive.sh tools`) and send over it, per the
-"LANDED is not SERVED" note near the top of this file.
-
-**Confirm the declaration was STORED, not only that the transition landed.**
-`admitted_on: identity` cannot tell the actor-key arm from the declaration arm
-(the Step C table says why), so read `GET
-/coord/agent-work-units/<plan stem>` and find your declaration in
-`metadata.attestations`. Quote both in §6. A `200` with no stored declaration
-is UNKNOWN, not attested by context.
-
-**On the self path (`VETTED (self)`), send NO declaration.** This session
-held the context the control exists to exclude, so any declaration it sent
-would be the unearned, false witness statement Step C forbids. Send `vetted`
-without `independence` and expect Step C.
 
 `vet_evidence` is the §2a manifest array, verbatim. Send it on **both** Step B
 and Step C — the fallback transition carries it too, so the evidence is stored
@@ -2629,38 +2574,6 @@ and it is also the path the graduated-self-attestation relaxation
 arms it.
 
 **Step C — the fallback, and it is NOT the normal path.**
-
-**Step C is the `VETTED (self)` path's — and the subagent path's only after
-one bounded retry.** On the subagent path, branch on the code that refused:
-
-- **`attester_unresolved`** — re-send Step B, declaration and manifest
-  unchanged, ONCE, over a door carrying a device-identified JWT. Refused again,
-  or no device-identified door resolves: TAKE Step C as written below —
-  `vetted_unattested`, the `from_status` CAS guard, the manifest, and the gate
-  keyed on `vetted_unattested`. Report the attestation as **owed**, and say the
-  declaration's facts are kept for a re-send. Nothing is lost by falling back:
-  the declaration arm ignores both the owner and the from-status, so coord
-  admits a later declared `→ vetted` from `vetted_unattested`
-  (`work_unit_registry.rs`, the declaration arm of
-  `authorize_target_transition`).
-- **`self_attestation_forbidden` or `owner_unresolved`** — both mean the
-  declaration never arrived: coord returns them only on the legacy arm, when no
-  declaration was received, and a declaration that does arrive never yields
-  either. See the `self_attestation_forbidden` bullet below. Re-send it over a
-  door that serves the field. If no door does, take Step C and report it owed,
-  as above.
-- **`422 independence_declaration_malformed`** — fix the field and re-send
-  ONCE (bullet below). If it still 422s, report the transition **not made**
-  with the code and stop — no loop. **Never Step C for this**: a malformed
-  declaration is a bug in what you sent, not a refusal of the witness.
-
-"Transition **not made**, gate **not registered**" is reserved for exactly two
-cases: Step A's status is UNKNOWN (the blockquote under Step A), and a 422 that
-survives its one re-send (above). Never key the
-gate on the read status of a REFUSED transition — on a fresh unit that is `""`,
-and a `ready_status: ""` gate clears at once, the false green Step A forbids.
-(Step A's skip arm, and the 409 re-apply of it, key on an already-past status
-they read; that is the exception, not this case.)
 
 Reach for this only when Step B actually refused. **A manifest does not change
 the authorization verdict** — coord has no evidence-admission arm. Plan
@@ -2731,19 +2644,9 @@ Three 403 codes are expected here and NONE is a failure of the vet:
   > So `coord_work_unit_transition` takes an optional `independence`
   > declaration — `{verified, against, context}`. When present and well-formed
   > it AUTHORIZES the Attested transition and is stored on the unit at
-  > `metadata.attestations`. **Meeting this refusal is too late to earn one.**
-  > The fresh-context vet is Step 1.5's, performed before a single claim was
-  > checked; a subagent spawned here, after this session has already vetted,
-  > edited and stamped the plan, is a spawn whose only purpose is satisfying
-  > an identity check — the kind of spawn the clause refuses to require. If
-  > Step 1.5 spawned, you sent the declaration in Step B and this refusal
-  > means it **never arrived** — a stale tool schema with no `independence`
-  > field, or an older HTTP door that silently drops unknown fields. (A
-  > malformed one is a 422, never this 403 — see the 422 bullet below.) Read the
-  > DOOR, per the "LANDED is not SERVED" note near the top of this file, and
-  > re-send over one whose schema carries the field. If Step 1.5 could not
-  > spawn, you are on the `VETTED (self)` path: send no declaration and take
-  > Step C. The declaration's shape, for reference:
+  > `metadata.attestations`. Do the vetting in a fresh-context subagent (hand
+  > it the plan body and NOT your reasoning), then send what it verified, what
+  > it verified that against, and how it came by a context free of yours:
   >
   > ```json
   > {"slug": "<stem>", "to_status": "vetted",
@@ -2752,10 +2655,6 @@ Three 403 codes are expected here and NONE is a failure of the vet:
   >    "against":  "plans/<stem>.md at origin/main <sha>",
   >    "context":  "fresh-context subagent; received the plan body, not the author's rationale"}}
   > ```
-  >
-  > For a plan not yet on `origin/main`, `against` names it as "working-tree
-  > body (not on origin/main)" instead — the same words the stamp's
-  > `Vetted-by:` uses, so the two cannot disagree.
   >
   > **Do not fabricate the declaration to get past the 403.** It is
   > unfalsifiable by construction — the policy says so in the same breath as
@@ -2773,22 +2672,13 @@ Three 403 codes are expected here and NONE is a failure of the vet:
   attester's context, and an unresolved owner is deliberately not an obstacle to
   it (pinned in coord by
   `a_declaration_attests_an_ownerless_unit_but_never_anonymously`). This is the
-  one refusal a declaration actually removes — so **on the subagent path,
-  `owner_unresolved` means the declaration never arrived**, exactly as
-  `self_attestation_forbidden` does there: route it through that branch of Step
-  C's prologue (re-send over a door that serves the field).
+  one refusal a declaration actually removes.
 - **`attester_unresolved`** — YOUR token derives no actor key, i.e. it carries a
   `tenant_id` but no `device_id`. This is the one you will hit on the acting-user
-  service token (transport tier 3 above). **On the self path**, fall back the
-  same way, but say in your report that the attestation was not merely refused —
-  it was **unattemptable from this door**, and would need a device- or
-  agent-identified caller even to be evaluated. **On the subagent path**, follow
-  Step C's prologue: one re-send over a device-identified door, then Step C.
-- **`422 independence_declaration_malformed`** — not one of the three 403s, and
-  not a refusal of the witness: coord could not parse what you sent. Every
-  field must be non-blank — zero-width characters count as blank — and at most
-  `work_unit_registry::INDEPENDENCE_FIELD_MAX` bytes. Fix the field and re-send
-  Step B ONCE, per Step C's prologue. It is **never** a reason for Step C.
+  service token (transport tier 3 above). Fall back the same way, but say in your
+  report that the attestation was not merely refused — it was **unattemptable from
+  this door**, and would need a device- or agent-identified caller even to be
+  evaluated.
 
 Graduation relaxes exactly ONE of the three: `self_attestation_forbidden`. Both
 `owner_unresolved` and `attester_unresolved` are returned verbatim and are **not**
@@ -2797,15 +2687,9 @@ resolvable actor key there is nothing that could have been earned
 (`crates/coord/src/policies/lifecycle_autonomy.rs`, the
 `OwnerUnresolved | AttesterUnresolved` arm).
 
-**On the self path**, none of the three is a transport problem, a credential
-problem, or a coord bug — do not run `/coord-revive`, do not retry on another
-door, and do not report the vet as failed. **On the subagent path there are two
-exceptions**, both in Step C's prologue: `attester_unresolved` is re-sent once
-over a device-identified door, and `self_attestation_forbidden` /
-`owner_unresolved` are re-sent over a door whose schema serves `independence` —
-there the refusal IS a door problem, because the declaration was dropped. Never
-report the vet as failed on either path. Two facts so you
-do not burn a cycle looking for a way around it:
+None of the three is a transport problem, a credential problem, or a coord bug — do
+not run `/coord-revive`, do not retry on another door, and do not report the vet as
+failed. Two facts so you do not burn a cycle looking for a way around it:
 
 - **The check is the six-tier `non_author_allows_identities` ladder**
   (`gates_authority.rs`) over `ActorIdentity { device, agent, session }` — the same
@@ -2850,11 +2734,7 @@ proven binding; fall back only when the ladder actually refuses. A unit left at
 never derives `ready`, because that derivation matches the literal `vetted`. You
 keep dispatch (the `unit_ready` gate clears) and lose one derived observation.
 `shipped` is unaffected — it derives from PR citations, independent of the
-from-status. **On the `VETTED (self)` path, and on a subagent-path refusal
-Step C's prologue sent here** (`attester_unresolved` twice, no
-device-identified door, or a declaration no door would carry), treat the attestation as **owed, not blocked** — on the
-subagent path it is owed a RE-SEND of the kept declaration, not a new vet: say
-in your report
+from-status. Treat the attestation as **owed, not blocked**: say in your report
 that the unit sits at `vetted_unattested` and a `→ vetted` attestation is
 outstanding. The plan is fully dispatchable meanwhile, and `/implement-plan` gates
 on the plan file's VETTED stamp — it never reads the registry status.
@@ -2865,20 +2745,16 @@ say so in your report.** `vetted_unattested` is **not a coord status at all**:
 files it as **`Free`** — and a Free transition *claims ownership*. The fallback
 therefore stamps **this** session as the unit's owner, which is precisely the
 condition that makes every later `→ vetted` from this session refuse
-`self_attestation_forbidden`, permanently **absent a declaration** — i.e. on the
-self path. A subagent-path fallback escapes it by re-sending the kept
-declaration, which the declaration arm admits regardless of owner. The ordinary
-outcome of the control is a unit parked in a status coord does not recognize,
-owned by the one actor barred from fixing it. That is a trap, not a graceful degradation — do not report it as
+`self_attestation_forbidden`, permanently. The ordinary outcome of the control is
+a unit parked in a status coord does not recognize, owned by the one actor barred
+from fixing it. That is a trap, not a graceful degradation — do not report it as
 a clean fallback.
 
 > **No evidence arm keeps you out of that trap.** Plan
 > `2026-09-01-vet-evidence-manifest-and-decay` Phase 7 designed one — a manifest
 > meeting a floor would admit `→ vetted` regardless of identity — but it is
 > **not on `qontinui-coord`'s `origin/main`**, and `qontinui-coord#2207` left it
-> out on purpose (see Step C). So the fallback fires whenever identity refuses
-> on the self path, and on the subagent path whenever Step C's prologue sends
-> you there.
+> out on purpose (see Step C). So the fallback fires whenever identity refuses.
 > Never tell the operator the manifest changed the verdict; `admitted_on` is the
 > only thing entitled to settle which arm carried you, and it has no `evidence`
 > value.
@@ -3053,8 +2929,7 @@ leave it in the report.
   `{status:"idle"}`); a vetted plan that is ready, dispatchable work → `unit_ready`
   `{work_unit_id, ready_status}` — transition the unit FIRST and set `ready_status`
   to the status that actually landed (`vetted`, else the Free fallback
-  `vetted_unattested` (self path, or a subagent-path refusal per §5.4 Step C's
-  prologue)); a hardcoded Attested value on a unit you own never clears,
+  `vetted_unattested`); a hardcoded Attested value on a unit you own never clears,
   since an owner may not attest (§5.4 has the full procedure; canonical:
   `_gate-registration`). (**NOT** `operator_approval` — `operator_approval`
   is for genuine human decisions, not a work queue); schema/alembic-at-head →
@@ -3103,25 +2978,31 @@ leave it in the report.
   Canonical: `_gate-registration` → "Dead-transport honesty".
 - The plan-file `## Gates` block is a **local convenience mirror only** — coord is
   the source of truth; never require it, never read it back as authoritative.
-- **Re-registering for the same plan/anchor:** first cancel the prior gate's
-  PENDING continuation (the §5.4 refresh-cancel rule applies to any
-  continuation-carrying gate too) — `GET .../coord/agent-gates?work_unit_id=<id>` for rows
+- **Re-registering for the same plan/anchor:** first retire the prior gate
+  (the §5.4 refresh rule applies to any continuation-carrying gate too) —
+  `GET .../coord/agent-gates?work_unit_id=<id>` for OPEN rows
   carrying a `continuation_spawn` with `continuation_consumed_at == null ∧
-  continuation_cancelled_at == null` (**including pre-dispatch rows** —
-  `cancel_continuation` is deliberately unguarded on
-  `continuation_dispatched_at`), then the cancel — `coord_cancel_continuation`
+  continuation_cancelled_at == null` (**including pre-dispatch rows**), then
+  **withdraw** it — `coord_withdraw_gate` `{gate_id, reason}` (native MCP) or
+  `POST .../coord/gates/:gate_id/withdraw {reason}` (its HTTP twin, bare and
+  device-authed — no `/agent/` infix exists for withdraw). One call sets the
+  terminal `withdrawn` verdict, cancels a dispatched-but-unconsumed
+  continuation, and takes the dead gate out of the open set so it stops blocking
+  its siblings; a mute would leave it open forever (mute is for noise, not
+  retirement). The pre-dispatch cancel — `coord_cancel_continuation`
   `{gate_id, reason}` (native MCP) or
   `POST .../coord/gates/:gate_id/agent/continuation-cancel {reason}` (its REST
-  twin); one capability, so use whichever transport is alive — followed by
-  the mute — `coord_mute_gate` `{gate_id}` (native MCP) or its REST twin
-  `POST .../coord/gates/:gate_id/agent/mute`. These are the device-authed
-  doors, so a device session does the whole loop itself:
-  `/coord/agent-gates` discovers the pending continuation, the cancel retires it
-  and the mute stops the dead gate blocking its siblings. `cancelled_by` derives
-  from the JWT and is not a body field. Best-effort. (This bullet used to say the cancel "stays operator-only" and that
-  a device session had to reach an operator door; that was wrong — it named the
-  unprefixed OPERATOR route, which answers an agent 401.) (canonical spec:
-  `_gate-registration` → "Continuation cancel + refresh".)
+  twin; `cancel_continuation` is deliberately unguarded on
+  `continuation_dispatched_at`) — may precede it as a race optimisation. On
+  `NotRegistrant` (not the registrant — MCP error or HTTP 403; causes: `_gate-registration` → "Continuation cancel + refresh", point 2) fall back to that
+  cancel **followed by** the mute — `coord_mute_gate` `{gate_id}` (native MCP) or
+  its REST twin `POST .../coord/gates/:gate_id/agent/mute` — and name the gate id
+  in the session closeout. These are the device-authed doors, so a device
+  session does the whole loop itself. `cancelled_by` derives from the JWT and is
+  not a body field. Best-effort. (This bullet used to say the cancel "stays
+  operator-only" and that a device session had to reach an operator door; that
+  was wrong — it named the unprefixed OPERATOR route, which answers an agent
+  401.) (canonical spec: `_gate-registration` → "Continuation cancel + refresh".)
 
 **Attest-on-completion (close the loop).** Vetting normally registers gates
 rather than completing gated work — but if this run also COMPLETES work that a
@@ -3189,16 +3070,6 @@ Brief — under 150 words. State:
   origin/main <short-sha>` — and **quote the sha**, not just the date. It is
   what lets the next reader tell a citation that has gone stale from one that
   was always wrong, without re-resolving every row
-- **The independence path taken** — `subagent` (Step 1.5 spawned: say whether
-  the `independence` declaration was sent on `coord_work_unit_transition` and
-  whether `metadata.attestations` shows it stored) or `self` (no spawn: name
-  why, and confirm the stamp reads `VETTED (self)` with `Independence: NONE`).
-  Where your edit-time re-check contradicted the subagent's verdict, say so.
-  **Subagent path, transition refused:** name the code, whether you re-sent,
-  what the gate was keyed on (`vetted_unattested` after Step C, or not
-  registered when Step A's status was UNKNOWN or a 422 survived its one
-  re-send), and whether the declaration is
-  owed a re-send
 - **The evidence manifest** (§2a): quote `stored` from the transition's `vet_evidence` receipt — the count coord **kept**, never the count you sent — and `admitted_on`, the arm that actually carried the transition (`identity` / `graduation` / `no_transition`). **Read both; do not infer either.** ⚠️ Where you sent an `independence` declaration, SAY SO explicitly: `admitted_on` reads `identity` on that path too, so it cannot be quoted as evidence of an actor difference. No receipt at all means the running coord has no manifest surface: say *built but not stored*. If you fell back to `vetted_unattested`, name the identity refusal that sent you there (`self_attestation_forbidden` / `owner_unresolved` / `attester_unresolved`) — never the manifest, which admits nothing
 - Open questions you **resolved using the Decision policy**, with the deciding priority in parentheses (e.g. "picked registry-backed lookup (scalability)")
 - Anything you flagged for the user that you did NOT auto-fix — limit this to product/scope/stakeholder calls the Decision policy can't decide; engineering trade-offs should already be resolved in the plan
