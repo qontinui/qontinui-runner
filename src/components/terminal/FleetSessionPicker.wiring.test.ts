@@ -53,6 +53,79 @@ function codeOf(text: string): string {
   return text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
 }
 
+/**
+ * The arguments of the picker's single `fleetEmptyReadMessage(...)` call,
+ * comments stripped and whitespace flattened.
+ *
+ * Anchored to the CALL rather than matched against the whole file, so an
+ * argument cannot be deleted while the guard stays green on a mention of the
+ * same text somewhere else — and read through `codeOf`, so a comment naming an
+ * argument does not satisfy an assertion about passing one.
+ *
+ * Every failure is LOUD and says which failure it was. A source-grep guard
+ * that degrades quietly is worse than none: it reports the absence of an
+ * argument when the real fault is that the scan stopped early, and the two
+ * arguments this guard exists for are the LAST two, which is exactly what a
+ * truncated scan drops.
+ *
+ *  - More than one call site, or none: thrown, separately worded. The
+ *    single-site check is what makes "the first occurrence" a safe thing to
+ *    measure — otherwise a helper declared above the real call would be
+ *    silently measured in its place.
+ *  - Unbalanced, or not four arguments: thrown. Paren counting here does not
+ *    understand string, template or regex literals, so a `)` inside an
+ *    argument would end the slice early; the arity check turns that from a
+ *    confusing green-ish failure into a stated one.
+ */
+function emptyReadArgs(): string[] {
+  const code = codeOf(SOURCE);
+  const needle = "fleetEmptyReadMessage(";
+  const sites = code.split(needle).length - 1;
+  if (sites === 0) throw new Error("FleetSessionPicker no longer calls fleetEmptyReadMessage(");
+  if (sites > 1) {
+    throw new Error(
+      `FleetSessionPicker has ${sites} fleetEmptyReadMessage( call sites; this guard measures ` +
+        `the first, so it can no longer speak for the picker's own call`,
+    );
+  }
+  const open = code.indexOf(needle) + needle.length - 1;
+  let depth = 0;
+  let end = -1;
+  for (let i = open; i < code.length; i += 1) {
+    if (code[i] === "(") depth += 1;
+    else if (code[i] === ")") {
+      depth -= 1;
+      if (depth === 0) {
+        end = i;
+        break;
+      }
+    }
+  }
+  if (end < 0) throw new Error("unbalanced fleetEmptyReadMessage( call in FleetSessionPicker");
+
+  const inner = code.slice(open + 1, end);
+  const args: string[] = [];
+  let buf = "";
+  let d = 0;
+  for (const ch of inner) {
+    if (ch === "(" || ch === "[" || ch === "{") d += 1;
+    else if (ch === ")" || ch === "]" || ch === "}") d -= 1;
+    if (ch === "," && d === 0) {
+      args.push(buf);
+      buf = "";
+    } else buf += ch;
+  }
+  if (buf.trim()) args.push(buf);
+  const cleaned = args.map((a) => a.replace(/\s+/g, " ").trim()).filter((a) => a.length > 0);
+  if (cleaned.length !== 4) {
+    throw new Error(
+      `expected 4 arguments to fleetEmptyReadMessage, parsed ${cleaned.length}: ` +
+        JSON.stringify(cleaned),
+    );
+  }
+  return cleaned;
+}
+
 describe("everything said ABOUT the loaded rows is said with the query they came from", () => {
   it("classifies completeness from the response and the ACCUMULATED count", () => {
     // Stronger than passing the applied limit in: the page size now comes off
@@ -74,8 +147,101 @@ describe("everything said ABOUT the loaded rows is said with the query they came
     // The fallback only bites before any read completed, where the two are
     // equal anyway — and that branch renders "no successful read yet", not an
     // emptiness claim.
-    expect(SOURCE).toContain("fleetEmptyReadMessage(appliedQuery ?? server");
+    expect(emptyReadArgs()[0]).toBe("appliedQuery ?? server");
   });
+
+  it("hands the empty message the live text box, not a literal", () => {
+    // `text` is a `string`, so replacing it with `""` is not a tsc error — and
+    // it silently deletes the whole text-filter branch, the one sentence that
+    // stops an operator blaming the search box for an empty list. Same class
+    // as the tenant substitution below, and the last unpinned argument.
+    expect(emptyReadArgs()[1]).toBe("text");
+  });
+
+  it("does not hand the empty message a tenant it invented", () => {
+    // The tenant argument is REQUIRED (`tenantId: string | null`), so omitting
+    // it is a tsc failure and needs no guard here. What tsc cannot catch is
+    // substituting something for the envelope's own value — a remembered
+    // tenant, a default, the device's binding — which is exactly the read that
+    // produced the 2026-09-28 false report: a correct, empty read of a
+    // DIFFERENT tenant than the one holding 200 sessions.
+    expect(emptyReadArgs()[2]).toBe("response?.tenantId ?? null");
+  });
+
+  it("takes completeness from coord's POSITIVE signal, not from the walk's silence", () => {
+    // `readIsComplete` defaults to false, so unlike the tenant the compiler
+    // does not hold this one and the guard has to.
+    //
+    // It must be `kind === "none"` — coord said this was the last page.
+    // `!== "unknown"` or `=== "more-available"` would both treat `unreachable`
+    // (coord served a cursor the walk can no longer use) as a finished walk,
+    // printing "No open sessions in tenant X" under a strip saying coord has
+    // more.
+    //
+    // That state is unreachable through this caller, so this is defence in
+    // depth and is labelled so wherever it appears: an empty accumulation
+    // means every page was empty, and an empty page carries no cursor because
+    // coord's `finish_page` truncates to `limit >= 1` rows before minting one.
+    // An earlier draft credited that to "every path producing `unreachable`
+    // also sets `error` in the same tick" — which does hold, but is not the
+    // reason and is not the simplest one.
+    expect(emptyReadArgs()[3]).toBe('truncation.kind === "none"');
+  });
+
+  it("projects the tenant as an attribute on the element whose dataset is captured", () => {
+    // This file's own rule, stated above with the other data-fleet-* pins: the
+    // sentence is not the contract, because a driver matching on it breaks on
+    // any rewording. The tenant scope is the claim this change turns on, so it
+    // gets a machine-readable projection like every other fleet fact.
+    //
+    // PLACEMENT is the assertion, not mere presence — and the element that
+    // matters is the REGISTERED one. `data-page-element` does not put a node
+    // in the control snapshot (the scanner takes interactive elements plus
+    // anything carrying `data-ui-bridge-id`), so both are pinned: the root
+    // carries the control id, and the tenant sits in its attribute block.
+    const code = codeOf(SOURCE);
+    const start = code.indexOf("data-page-element={FLEET_SESSION_PICKER_ELEMENT}");
+    const end = code.indexOf("data-fleet-pending-include-closed=");
+    // Both markers asserted before slicing. `indexOf` returning -1 would make
+    // `slice(start, -1)` run to the end of the file, degrading this into a
+    // whole-file presence check — the quiet failure `emptyReadArgs` above
+    // refuses to have, and it was reachable here by rewording a className.
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    const block = code.slice(start, end);
+    expect(block).toContain("data-ui-bridge-id={FLEET_PICKER_ROOT_ID}");
+    expect(block).toContain('data-fleet-tenant={response?.tenantId ?? ""}');
+  });
+
+  it("does not print an UNSCOPED count beside the scoped message", () => {
+    // "0 sessions on 0 devices" was the FIRST line of the 2026-09-28 false
+    // report. `fleetCountSummary` takes no tenant and emits that under a panel
+    // titled Fleet, above the message — so fixing only the sentence would have
+    // left the same unscoped claim on the line read first.
+    //
+    // `sessions.length`, not `visible.length`: the latter would also suppress
+    // "0 of 47 loaded on 0 of 3 devices", which is this line at its most
+    // informative and is exactly when `fleetFilteredOutMessage` renders.
+    expect(codeOf(SOURCE)).toMatch(/sessions\.length === 0\s*\?\s*null\s*:\s*fleetCountSummary/);
+  });
+
+  it("licenses the empty message with observed-empty, never with a failed or absent read", () => {
+    // Every sentence `fleetEmptyReadMessage` emits presupposes a SUCCESSFUL
+    // read that returned nothing. This gate is what makes that true, and it is
+    // invisible to that function's own tests: `emptyReasonFor` returns
+    // "not-loaded" whenever `response` is null, so the null-tenant arm can
+    // never actually render — the reachable unknown-tenant case is coord's
+    // untyped envelope, not a first paint.
+    expect(codeOf(SOURCE)).toContain('emptyReason !== "observed-empty"');
+  });
+
+  // NOT COVERED HERE, and stated rather than implied: nothing asserts that the
+  // empty message and the truncation strip cannot both be on screen making
+  // opposite claims, which is the whole point of the completeness axis. It is
+  // not merely untested but untestable in this suite — the runner's vitest is
+  // `environment: "node"` (see this file's header), so there is no render to
+  // inspect. The guards above pin the INPUTS that make the pair consistent;
+  // they cannot pin the pair.
 
   it("projects the applied query under data-fleet-*, the pending one under data-fleet-pending-*", () => {
     // A UI Bridge driver reads these in one pass, so the filter set and the row
