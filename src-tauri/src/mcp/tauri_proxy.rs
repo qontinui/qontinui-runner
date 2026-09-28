@@ -465,15 +465,9 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
             // an explicit `manual` through and otherwise runs `unspecified`
             // (which, unlike manual, honours the attempt memory); any other
             // trigger is refused.
-            let trigger = match a.trigger.as_deref().map(str::trim) {
-                None | Some("") => "unspecified",
-                Some("manual") => "manual",
-                Some(t) => {
-                    return TauriInvokeResponse::err(format!(
-                        "remote_interactivity_probe:trigger_not_allowed: {t:?} — the proxy \
-                         runs only trigger \"manual\" (or none)"
-                    ))
-                }
+            let trigger = match proxy_probe_trigger(a.trigger.as_deref()) {
+                Ok(t) => t,
+                Err(e) => return TauriInvokeResponse::err(e),
             };
             match crate::commands::remote_interactivity_probe::run_probe_command(
                 &state.app_handle,
@@ -492,6 +486,21 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
     }
 }
 
+/// The `remote_interactivity_probe` trigger a headless proxy caller may run:
+/// absent/blank → `unspecified`, `manual` → `manual`, anything else (notably
+/// `fleet_view`, which would stamp the device into the scheduler's sweep set)
+/// refused.
+fn proxy_probe_trigger(raw: Option<&str>) -> Result<&'static str, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok("unspecified"),
+        Some("manual") => Ok("manual"),
+        Some(t) => Err(format!(
+            "remote_interactivity_probe:trigger_not_allowed: {t:?} — the proxy runs only \
+             trigger \"manual\" (or none)"
+        )),
+    }
+}
+
 // ============================================================================
 // Router
 // ============================================================================
@@ -499,6 +508,26 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
 pub fn routes() -> axum::Router<Arc<ApiState>> {
     use axum::routing::post;
     axum::Router::new().route("/ui-bridge/tauri/invoke", post(tauri_invoke_handler))
+}
+
+#[cfg(test)]
+mod probe_trigger_tests {
+    use super::proxy_probe_trigger;
+
+    #[test]
+    fn the_proxy_maps_probe_triggers() {
+        assert_eq!(proxy_probe_trigger(None), Ok("unspecified"));
+        assert_eq!(proxy_probe_trigger(Some("")), Ok("unspecified"));
+        assert_eq!(proxy_probe_trigger(Some("   ")), Ok("unspecified"));
+        assert_eq!(proxy_probe_trigger(Some("manual")), Ok("manual"));
+        for refused in ["fleet_view", "scheduler", "Manual", "anything"] {
+            let e = proxy_probe_trigger(Some(refused)).unwrap_err();
+            assert!(
+                e.starts_with("remote_interactivity_probe:trigger_not_allowed:"),
+                "{e}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
