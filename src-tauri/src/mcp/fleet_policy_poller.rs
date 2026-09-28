@@ -37,10 +37,10 @@
 //! 3. The tenant-wide **plan-capture level** (`off` | `record`), read just as
 //!    synchronously by [`crate::terminal::runner_context`] — which renders the
 //!    system-prompt briefing at spawn time and therefore must not make a network
-//!    call either. At `record` the briefing gains the plan-library capture
-//!    clause; at `off` (the resting value, and every fail-safe path) the clause
-//!    is ABSENT, because an instruction with no live authorization must not
-//!    appear in a system prompt.
+//!    call either. At `record` (the resting value — the domain default when the
+//!    tenant has said nothing, see below) the briefing gains the plan-library
+//!    capture clause; at `off` (an explicit tenant row, or an unrecognised
+//!    level) the clause is ABSENT.
 //! 4. The tenant's **session-briefing documents** — coord prompt documents
 //!    under kind [`BRIEFING_KIND`], read synchronously by
 //!    [`crate::terminal::runner_context`] and by [`crate::mcp::ai_session`],
@@ -95,24 +95,35 @@
 //!   PR, so until both land `controls` simply carries the six older §D1 fields
 //!   and the four floor fields decode to `None`.
 //!
-//! For the plan-capture level, the SAME posture with `off` again playing the
-//! safe role — and here it is load-bearing in a way worth stating, because the
-//! cache's value decides whether an INSTRUCTION appears in an agent's system
-//! prompt:
+//! For the plan-capture level the posture is DIFFERENT: the default is
+//! **`record`**, not `off`. Plan capture is on unless the tenant has said
+//! otherwise — operator decision 2026-09-24 ("plan_capture should be on by
+//! default"), and the same default coord's resolver already answers for a
+//! tenant with no row (`qontinui-coord` `fleet_policy.rs`
+//! `PLAN_CAPTURE_DEFAULT = "record"`), so runner and coord agree on what
+//! "unconfigured" means. Before that decision the runner's own fallback was
+//! `off`, so a runner that could not reach coord (no live device JWT, polls
+//! failing) sat CLOSED forever for a tenant that had never turned capture off.
 //!
-//! - Before the FIRST successful poll the cache reads **`off`**, so a runner
-//!   that has never reached coord injects no clause.
-//! - A poll ERROR keeps the LAST-GOOD level.
-//! - A coord **404 / 401 / auth-required** resets to **`off`**. With no
-//!   `plan_capture` row at all coord answers 404, which is precisely the
-//!   "unconfigured tenant" case — and it must read as "do not instruct", never
-//!   as "record".
+//! - Before the FIRST successful poll the cache reads **`record`** — the
+//!   domain default ([`PLAN_CAPTURE_DEFAULT_LEVEL`]).
+//! - An authoritative no-row answer (`resolved_scope: "none"`) ⇒ **`record`**.
+//! - A coord **404** (an older coord with no row AND no domain default) ⇒
+//!   **`record`**: it is the same no-row case.
+//! - An explicit row answering `off` ⇒ **`off`**. A tenant that turned capture
+//!   off always wins over the default.
+//! - A poll ERROR — including a **401**, which is non-authoritative for the
+//!   tenant's policy — keeps the LAST-GOOD level (no write).
 //! - Unpaired ⇒ SKIPPED quietly, cache untouched.
-//! - Any level that is not exactly `record` (including `observe`, `gate`, a
-//!   typo, or an empty string) normalizes to `off`: this domain's vocabulary is
-//!   two-valued and an unrecognised level is not an authorization.
+//! - Any explicit level that is not exactly `record` (including `observe`,
+//!   `gate`, a typo, or an empty string) normalizes to `off`
+//!   ([`PLAN_CAPTURE_UNRECOGNISED_LEVEL`]): an unidentifiable explicit value is
+//!   not the no-row case, so it neither authorizes capture nor inherits the
+//!   default.
 //! - Degradation is logged ONCE, on a transition.
-//! - A poisoned lock degrades to `off`.
+//! - A poisoned lock reads the domain default, `record` — a lock we cannot
+//!   read carries no tenant answer, which is exactly the no-information case
+//!   the default exists for.
 //!
 //! For the session-briefing documents, the SAME posture with the compiled-in
 //! **builtin** playing the safe role — it is the text the runner injected
@@ -207,8 +218,8 @@ const PLAN_CAPTURE_DOMAIN: &str = "plan_capture";
 const DEFAULT_MODE: &str = "off";
 
 /// The only level that TURNS PLAN CAPTURE ON. The domain's vocabulary is
-/// two-valued (`off` | `record`); everything else normalizes to
-/// [`DEFAULT_PLAN_CAPTURE_LEVEL`].
+/// two-valued (`off` | `record`); every other explicit level normalizes to
+/// [`PLAN_CAPTURE_UNRECOGNISED_LEVEL`].
 ///
 /// `pub(crate)` because [`crate::terminal::runner_context`] compares the cached
 /// level against it to decide whether to append the capture clause. The word is
@@ -217,11 +228,19 @@ const DEFAULT_MODE: &str = "off";
 /// that a rename could silently split.
 pub(crate) const PLAN_CAPTURE_RECORD: &str = "record";
 
-/// The fail-safe default for [`PLAN_CAPTURE_DOMAIN`]. Spelled separately from
-/// [`DEFAULT_MODE`] even though both are `"off"`: they are different domains'
-/// vocabularies that merely coincide today, and collapsing them would let a
-/// future edit to one silently move the other.
-const DEFAULT_PLAN_CAPTURE_LEVEL: &str = "off";
+/// The DOMAIN DEFAULT for [`PLAN_CAPTURE_DOMAIN`]: what the cache holds when
+/// the tenant has said nothing — before the first successful poll, on an
+/// authoritative no-row answer, on a coord 404, and behind a poisoned lock.
+/// `record`, per the operator decision of 2026-09-24 and matching coord's own
+/// `PLAN_CAPTURE_DEFAULT = "record"`, so runner and coord agree.
+const PLAN_CAPTURE_DEFAULT_LEVEL: &str = PLAN_CAPTURE_RECORD;
+
+/// What an UNRECOGNISED explicit level normalizes to: `off`. Deliberately NOT
+/// [`PLAN_CAPTURE_DEFAULT_LEVEL`] — coord answering a value we cannot identify
+/// is not the "tenant said nothing" case, and a level we cannot read is never
+/// an authorization to capture. Spelled separately from [`DEFAULT_MODE`] too:
+/// the two domains' `off` merely coincide.
+const PLAN_CAPTURE_UNRECOGNISED_LEVEL: &str = "off";
 
 // ===========================================================================
 // Process-global cache
@@ -393,7 +412,7 @@ static PLAN_CAPTURE_LEVEL: OnceLock<RwLock<String>> = OnceLock::new();
 /// it decides what a runner that has never reached coord puts in a system
 /// prompt — so it is callable from a test, which an inline closure is not.
 fn new_plan_capture_cache() -> RwLock<String> {
-    RwLock::new(DEFAULT_PLAN_CAPTURE_LEVEL.to_string())
+    RwLock::new(PLAN_CAPTURE_DEFAULT_LEVEL.to_string())
 }
 
 fn plan_capture_cache() -> &'static RwLock<String> {
@@ -411,20 +430,20 @@ fn read_cached_level(cache: &RwLock<String>, fallback: &str) -> String {
         .unwrap_or_else(|_| fallback.to_string())
 }
 
-/// Read the current effective plan-capture level. Returns `"off"` until the
-/// first successful poll (and after any auth/absent reset).
+/// Read the current effective plan-capture level. Returns the domain default,
+/// `"record"`, until the first successful poll (and after a 404 / no-row
+/// answer); an explicit `off` row is the only way it reads `"off"`.
 ///
 /// SYNCHRONOUS + lock-only — safe to call from
 /// [`crate::terminal::runner_context`], which renders the spawn-time briefing
-/// and must not do I/O. A poisoned lock degrades fail-safe to `"off"`, i.e. the
-/// capture clause is omitted.
+/// and must not do I/O. A poisoned lock reads the domain default, `"record"`.
 ///
 /// `pub(crate)` rather than `pub`: the level is only meaningful next to
 /// [`PLAN_CAPTURE_RECORD`], which is also crate-visible, so exporting the
 /// reader without the vocabulary would hand a caller a string it cannot
 /// correctly compare.
 pub(crate) fn effective_plan_capture_level() -> String {
-    read_cached_level(plan_capture_cache(), DEFAULT_PLAN_CAPTURE_LEVEL)
+    read_cached_level(plan_capture_cache(), PLAN_CAPTURE_DEFAULT_LEVEL)
 }
 
 /// Overwrite the cached plan-capture level. Internal — only the poll loop calls
@@ -515,7 +534,7 @@ impl PlanCaptureLevelPin {
 #[cfg(test)]
 impl Drop for PlanCaptureLevelPin {
     fn drop(&mut self) {
-        set_plan_capture_level(DEFAULT_PLAN_CAPTURE_LEVEL);
+        set_plan_capture_level(PLAN_CAPTURE_DEFAULT_LEVEL);
         set_plan_capture_scope(None);
         clear_briefing_cache();
         // The list validator is process-global too, and a test that plants one
@@ -550,7 +569,7 @@ pub(crate) fn briefing_for_test(
 }
 
 /// Acquire the pin. Blocks until any other pinning test has released it, and
-/// restores the fail-safe level AND the empty briefing cache when the returned
+/// restores the domain-default level AND the empty briefing cache when the returned
 /// guard drops.
 #[cfg(test)]
 pub(crate) fn pin_plan_capture_level_for_test(level: &str) -> PlanCaptureLevelPin {
@@ -571,8 +590,11 @@ pub(crate) fn pin_plan_capture_level_for_test(level: &str) -> PlanCaptureLevelPi
 ///
 /// Exactly `record` (case-insensitively, trimmed) turns capture on. Absent,
 /// null, empty, and every unrecognised value — including the interception
-/// domain's `observe` / `gate`, which mean nothing here — collapse to `off`.
-/// Never honor a level we cannot identify as an authorization to instruct.
+/// domain's `observe` / `gate`, which mean nothing here — collapse to
+/// [`PLAN_CAPTURE_UNRECOGNISED_LEVEL`] (`off`), NOT to the domain default:
+/// never honor a level we cannot identify as an authorization to instruct.
+/// (The no-row case, where the default does apply, is decided before this is
+/// called — see [`plan_capture_outcome_for_body`].)
 fn normalize_plan_capture_level(raw: Option<&str>) -> String {
     let level = raw
         .map(|s| s.trim().to_ascii_lowercase())
@@ -580,7 +602,7 @@ fn normalize_plan_capture_level(raw: Option<&str>) -> String {
     if level == PLAN_CAPTURE_RECORD {
         PLAN_CAPTURE_RECORD.to_string()
     } else {
-        DEFAULT_PLAN_CAPTURE_LEVEL.to_string()
+        PLAN_CAPTURE_UNRECOGNISED_LEVEL.to_string()
     }
 }
 
@@ -602,9 +624,11 @@ fn next_plan_capture_level(outcome: &PollOutcome) -> Option<String> {
         // that arm, so today this is belt-and-braces; it is what keeps the
         // runner correct if coord's resolver default is ever changed back.
         PollOutcome::UpdatedNoRow => Some(PLAN_CAPTURE_RECORD.to_string()),
-        // Absent policy (404) ⇒ never instruct. A 401 no longer reaches this
-        // arm for THIS domain — see `plan_capture_outcome_for_error`.
-        PollOutcome::ResetOff(_) => Some(DEFAULT_PLAN_CAPTURE_LEVEL.to_string()),
+        // Absent policy (404) ⇒ the domain default, `record`: an older coord
+        // with no row and no resolver default is the same "tenant said
+        // nothing" case as `UpdatedNoRow`. A 401 no longer reaches this arm for
+        // THIS domain — see `plan_capture_outcome_for_error`.
+        PollOutcome::ResetOff(_) => Some(PLAN_CAPTURE_DEFAULT_LEVEL.to_string()),
         // Unpaired or a transient failure ⇒ the cache is left exactly as it was.
         PollOutcome::SkippedNoJwt | PollOutcome::Kept(_) => None,
     }
@@ -862,7 +886,8 @@ pub(crate) struct FleetPolicyDial {
     pub(crate) threads_critical_count: Option<u32>,
     /// Cache 3 — the plan-capture level (`off` | `record`).
     pub(crate) plan_capture_level: String,
-    /// Cache 3's resting value.
+    /// Cache 3's resting value — the domain default (`record`), what the level
+    /// reads when the tenant has said nothing.
     pub(crate) plan_capture_default: &'static str,
     /// Cache 3's ON word, so a reader can tell whether the level is armed
     /// without knowing the vocabulary.
@@ -907,7 +932,7 @@ pub(crate) fn dial_snapshot() -> FleetPolicyDial {
         threads_warn_count: threads.warn_thread_count,
         threads_critical_count: threads.critical_thread_count,
         plan_capture_level: effective_plan_capture_level(),
-        plan_capture_default: DEFAULT_PLAN_CAPTURE_LEVEL,
+        plan_capture_default: PLAN_CAPTURE_DEFAULT_LEVEL,
         plan_capture_record_level: PLAN_CAPTURE_RECORD,
         briefings: BRIEFING_NAMES
             .iter()
@@ -1959,7 +1984,9 @@ enum PollOutcome {
     UpdatedNoRow,
     /// No device JWT yet (unpaired) — poll skipped, cache untouched.
     SkippedNoJwt,
-    /// Coord said 401 / 404 / auth-required — cache RESET to `off` (fail-safe).
+    /// Coord said 401 / 404 / auth-required — cache RESET to the domain's
+    /// default (`off` for interception; `record` for plan capture, which only
+    /// ever sees a 404 here).
     ResetOff(u16),
     /// Network / decode / other non-2xx error — LAST-GOOD value kept.
     Kept(String),
@@ -2079,8 +2106,9 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
     // We do NOT `return` on Disabled: the task supervisor respawns any loop that
     // returns without a shutdown signal (task_supervisor.rs:108), which would
     // re-run this probe + re-log every backoff window. Instead we log ONCE and
-    // PARK on the shutdown channel — the cache already reads the fail-safe
-    // `off`, so a non-polling parked loop is exactly the desired "stay off".
+    // PARK on the shutdown channel — every cache already reads its default
+    // (interception `off`, plan capture `record`), so a non-polling parked loop
+    // is exactly "hold the defaults".
     if check_fleet_policy_capability().await == CapabilityCheck::Disabled {
         info!("fleet_policy_poller: coord lacks fleet_policy capability — staying off");
         // Park until shutdown (the cache stays at the fail-safe DEFAULT_MODE).
@@ -2092,7 +2120,7 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
     info!(
         "Fleet-policy poller started (domains={DOMAIN},{CONTROLS_DOMAIN},{PLAN_CAPTURE_DOMAIN}, \
          interval={}s, fail-safe defaults: mode={DEFAULT_MODE}, session floors unset, \
-         plan capture={DEFAULT_PLAN_CAPTURE_LEVEL})",
+         plan capture={PLAN_CAPTURE_DEFAULT_LEVEL})",
         POLL_INTERVAL.as_secs()
     );
 
@@ -2270,18 +2298,19 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
                 PollOutcome::SkippedNoJwt => {
                     info!(
                         "fleet_policy_poller: no device JWT yet (unpaired) — skipping the \
-                         {PLAN_CAPTURE_DOMAIN} poll, plan-capture level stays \
-                         {DEFAULT_PLAN_CAPTURE_LEVEL}"
+                         {PLAN_CAPTURE_DOMAIN} poll, plan-capture level stays at its \
+                         current value ({})",
+                        effective_plan_capture_level()
                     );
                 }
                 PollOutcome::ResetOff(status) => {
-                    // 404 is the NORMAL answer for a tenant that never set this
-                    // policy, so this is info, not warn — the clause is simply
-                    // not authorized.
+                    // 404 is what an older coord answers for a tenant that never
+                    // set this policy, so this is info, not warn — the domain
+                    // default applies.
                     info!(
                         "fleet_policy_poller: coord returned {status} for {PLAN_CAPTURE_DOMAIN} \
-                         (auth/absent) — plan-capture level reset to \
-                         {DEFAULT_PLAN_CAPTURE_LEVEL} (fail-safe: never instruct)"
+                         (absent policy) — plan-capture level set to the domain default \
+                         {PLAN_CAPTURE_DEFAULT_LEVEL}"
                     );
                 }
                 PollOutcome::Kept(err) => {
@@ -2912,7 +2941,8 @@ mod tests {
         // there, so a typo produces a permanent 404 and a permanently `off`
         // clause with no error anywhere. State it.
         assert_eq!(PLAN_CAPTURE_DOMAIN, "plan_capture");
-        assert_eq!(DEFAULT_PLAN_CAPTURE_LEVEL, "off");
+        assert_eq!(PLAN_CAPTURE_DEFAULT_LEVEL, "record");
+        assert_eq!(PLAN_CAPTURE_UNRECOGNISED_LEVEL, "off");
         assert_eq!(PLAN_CAPTURE_RECORD, "record");
         // …and the two pre-existing domains are untouched by this addition.
         assert_eq!(DOMAIN, "install_interception");
@@ -2920,17 +2950,17 @@ mod tests {
     }
 
     #[test]
-    fn fresh_plan_capture_cache_initializes_to_off() {
+    fn fresh_plan_capture_cache_initializes_to_record() {
         // Calls the SHIPPING init (`new_plan_capture_cache`, the very function
         // the OnceLock is seeded with) against a throwaway lock, so this is
         // race-free AND cannot keep passing if the real initial value moves.
-        // This is the arm where a regression puts an unauthorized instruction
-        // into every agent's system prompt on a runner that has never reached
-        // coord, so it must exercise the shipping expression, not a copy.
+        // This is the arm that decides what a runner that has never reached
+        // coord does — the operator's 2026-09-24 decision is that capture is ON
+        // until the tenant says otherwise.
         let fresh = new_plan_capture_cache();
-        assert_eq!(*fresh.read().unwrap(), "off");
+        assert_eq!(*fresh.read().unwrap(), "record");
         // …and read back through the shipping reader too.
-        assert_eq!(read_cached_level(&fresh, "sentinel-never-used"), "off");
+        assert_eq!(read_cached_level(&fresh, "sentinel-never-used"), "record");
     }
 
     #[test]
@@ -2945,7 +2975,8 @@ mod tests {
         // read as "an on-ish level, close enough".
         assert_eq!(normalize_plan_capture_level(Some("observe")), "off");
         assert_eq!(normalize_plan_capture_level(Some("gate")), "off");
-        // Typos, empties and absence all collapse to off.
+        // Typos, empties and absence all collapse to off — the UNRECOGNISED
+        // level, deliberately not the `record` domain default.
         assert_eq!(normalize_plan_capture_level(Some("recording")), "off");
         assert_eq!(normalize_plan_capture_level(Some("recor")), "off");
         assert_eq!(normalize_plan_capture_level(Some("")), "off");
@@ -2979,12 +3010,12 @@ mod tests {
             None
         );
 
-        // 404 ⇒ an explicit write of off, EVEN FROM record: coord has no row
-        // AND no domain default (an older coord), and that must read as "do
-        // not instruct" rather than leave a stale `record` in place.
+        // 404 ⇒ an explicit write of the domain default, record, EVEN FROM
+        // off: coord has no row AND no resolver default (an older coord), which
+        // is the same "tenant said nothing" case as a no-row 2xx.
         assert_eq!(
             next_plan_capture_level(&PollOutcome::ResetOff(404)),
-            Some("off".to_string())
+            Some("record".to_string())
         );
         // 401 ⇒ NO write (D3, inverted from the original reset): a credential
         // failure is non-authoritative for the tenant's policy, so this domain
@@ -3102,7 +3133,8 @@ mod tests {
     /// poll keeps the level exactly where it was — `off` stays `off` (someone
     /// who turned capture off must never have it turn back on because a poll
     /// 401'd) and `record` stays `record` (a runner must not veto the tenant).
-    /// A 404 still resets, and the shared mapper is untouched.
+    /// A 404 still resets — to the domain default, `record` — and the shared
+    /// mapper is untouched.
     #[test]
     fn a_401_keeps_the_last_good_plan_capture_level_whichever_way_it_points() {
         let pin = pin_plan_capture_level_for_test("off");
@@ -3133,11 +3165,13 @@ mod tests {
             "record stays record across a 401"
         );
 
-        // 404 is still authoritative absence (older coord): reset.
+        // 404 is still authoritative absence (older coord): reset to the
+        // domain default, even from an `off` that a 401 just kept.
+        pin.set("off");
         let absent = plan_capture_outcome_for_error(FetchError::AuthOrAbsent(404));
         assert_eq!(absent, PollOutcome::ResetOff(404));
         apply(&absent);
-        assert_eq!(effective_plan_capture_level(), "off");
+        assert_eq!(effective_plan_capture_level(), "record");
 
         // The other arms pass straight through to the shared mapper.
         assert_eq!(
@@ -3155,37 +3189,41 @@ mod tests {
         );
     }
 
-    /// Cold start stays `off` (D3, deliberate), and the scope cache starts
-    /// UNKNOWN — `None`, never a scope nobody reported.
+    /// Cold start is the domain default, `record` (operator decision
+    /// 2026-09-24), and the scope cache starts UNKNOWN — `None`, never a scope
+    /// nobody reported.
     #[test]
-    fn cold_start_is_off_with_no_scope_and_the_pin_restores_both() {
-        assert_eq!(*new_plan_capture_cache().read().unwrap(), "off");
+    fn cold_start_is_record_with_no_scope_and_the_pin_restores_both() {
+        assert_eq!(*new_plan_capture_cache().read().unwrap(), "record");
         {
-            let pin = pin_plan_capture_level_for_test("record");
+            let pin = pin_plan_capture_level_for_test("off");
             pin.set_scope(Some("tenant"));
+            assert_eq!(effective_plan_capture_level(), "off");
             assert_eq!(effective_plan_capture_scope().as_deref(), Some("tenant"));
         }
-        assert_eq!(effective_plan_capture_level(), "off");
+        assert_eq!(effective_plan_capture_level(), "record");
         assert_eq!(effective_plan_capture_scope(), None);
     }
 
     #[test]
-    fn a_poisoned_plan_capture_lock_degrades_to_off() {
-        // A poisoned lock must read as `off` (no clause), not panic and not
-        // hold a stale `record`. Exercised through the SHIPPING reader against
-        // a throwaway lock, so the shared global is not disturbed.
-        let lock = RwLock::new(PLAN_CAPTURE_RECORD.to_string());
-        assert_eq!(
-            read_cached_level(&lock, DEFAULT_PLAN_CAPTURE_LEVEL),
-            "record"
-        );
+    fn a_poisoned_plan_capture_lock_reads_the_domain_default() {
+        // A poisoned lock carries no tenant answer, so it reads the domain
+        // default `record` — not panic, and not whatever stale value it held.
+        // Seeded with `off` so the default is distinguishable from the stale
+        // value. Exercised through the SHIPPING reader against a throwaway
+        // lock, so the shared global is not disturbed.
+        let lock = RwLock::new(PLAN_CAPTURE_UNRECOGNISED_LEVEL.to_string());
+        assert_eq!(read_cached_level(&lock, PLAN_CAPTURE_DEFAULT_LEVEL), "off");
 
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = lock.write().unwrap();
             panic!("poison the lock");
         }));
         assert!(lock.is_poisoned(), "the lock must actually be poisoned");
-        assert_eq!(read_cached_level(&lock, DEFAULT_PLAN_CAPTURE_LEVEL), "off");
+        assert_eq!(
+            read_cached_level(&lock, PLAN_CAPTURE_DEFAULT_LEVEL),
+            "record"
+        );
     }
 
     /// Replays a tick sequence through the SHIPPING edge-trigger + key and

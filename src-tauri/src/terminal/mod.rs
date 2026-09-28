@@ -398,11 +398,12 @@ pub const RUNNER_CONTEXT_SOURCE_MARKER: &str = concat!(
 /// The first, in full: the plan/prompt **capture** protocol is
 /// appended only when [`crate::mcp::fleet_policy_poller::effective_plan_capture_level`]
 /// reads `record` (plan `2026-08-10-plan-and-prompt-library-in-web` Phase 4).
-/// At `off` — which is the resting value, the value after any coord 404/401,
-/// and the value on an unpaired or offline runner — the clause is ABSENT, on
-/// the principle that an instruction with no live authorization must not appear
-/// in a system prompt. The read is a synchronous lock read, never I/O: this
-/// function runs on the spawn path.
+/// `record` is the domain default — the resting value, the value after a coord
+/// 404 or no-row answer, and the value on an unpaired or offline runner that
+/// has never polled (operator decision 2026-09-24, matching coord's
+/// `PLAN_CAPTURE_DEFAULT`). At `off` — an explicit tenant row, or an
+/// unrecognised level — the clause is ABSENT. The read is a synchronous lock
+/// read, never I/O: this function runs on the spawn path.
 ///
 /// The clause obeys the same protocol-and-links-only contract as the rest of
 /// this briefing — endpoints and a pointer to the coord prompt document, with
