@@ -28,12 +28,12 @@ fn cfg_match_arm(m: Mode) -> &'static str {
     match m {
         #[cfg(test)]
         Mode::Test => "/home/test-only-arm",
-        Mode::Prod => "D:/after/arm",
+        Mode::Prod => "D:/Projects/after/arm",
     }
 }
 
 fn after_cfg_match_arm() -> &'static str {
-    "C:/after/the/match"
+    "C:/claude/after/the/match"
 }
 
 fn lexer_raw_string() -> &'static str {
@@ -43,11 +43,11 @@ fn lexer_raw_string() -> &'static str {
 
 /* outer /* nested */ "http://localhost:8000" still inside the outer comment */
 fn lexer_nested_comment() -> &'static str {
-    "C:/after/nested"
+    "C:/Users/someone/after/nested"
 }
 
 fn lexer_chars() -> (char, char, &'static str) {
-    ('\'', '/', "http://127.0.0.1:9875/x")
+    ('\'', '/', "http://127.0.0.1:9875/x then http://localhost:8000/y")
 }
 
 fn lexer_lifetime<'a>(x: &'a str) -> &'a str {
@@ -70,8 +70,8 @@ mod win_outer {
     }
 }
 
-fn after_nested_regions() -> u16 {
-    9875
+fn after_nested_regions() -> &'static str {
+    "listening on :9875"
 }
 
 // Region STACK, both directions. The outer `cfg(windows)` must survive the
@@ -90,7 +90,7 @@ mod win_stack {
 
     pub fn after_nested_test_mod() -> &'static str {
         let _ = std::process::Command::new("taskkill").arg("/F").status();
-        "D:/reported-under-windows"
+        "D:/Projects/reported-under-windows"
     }
 }
 
@@ -139,5 +139,5 @@ mod tests {
 "#;
 
 fn after_template() -> &'static str {
-    "http://localhost:9875/health"
+    "http://localhost:9875/health or http://localhost:8000/health"
 }

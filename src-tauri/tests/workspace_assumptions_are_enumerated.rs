@@ -1,4 +1,4 @@
-//! The static workspace-assumption sweep: a checked-in ROSTER, not a gate.
+//! The static workspace-assumption sweep: a checked-in ROSTER with one ratchet.
 //!
 //! Phase 4 of plan
 //! `2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports`.
@@ -10,17 +10,36 @@
 //! text scan of `src-tauri/src` (no binary, no model, no scoring — the shape of
 //! `tauri_commands_are_registered.rs`) for a FIXED table of literal patterns that
 //! each encode one way the runner can silently assume it is running on a
-//! developer's workspace rather than on an operator's published install:
+//! developer's workspace rather than on an operator's published install.
 //!
-//! | class id                | pattern family |
-//! |-------------------------|----------------|
-//! | `repo_layout`           | sibling-repo names as path components in string literals (`ui-bridge` only as a bare name, `../ui-bridge` or `ui-bridge/packages`); `QONTINUI_ROOT` reads |
-//! | `dev_ports`             | `:8000` `:3001` `:9875` `:5432` `:5433` `:6379` `:9000` as host:port literals |
-//! | `supervisor_dependency` | `9875` / supervisor URL, port or client call sites; calls to supervisor-named snake_case helpers |
-//! | `plans_dir`             | `.plans_dir` / `QONTINUI_PLANS_DIR` reads |
-//! | `tenant_literal`        | UUID literals |
-//! | `os_bound_tooling`      | `powershell` `pwsh` `cmd.exe` `taskkill` `schtasks` `.ps1` literals outside `cfg(windows)`; and a `cfg(windows)` fn with no non-windows sibling of the same name in its file |
-//! | `machine_path`          | drive-letter and `/home/<name>` / `/Users/<name>` literals |
+//! ## Where the class table comes from
+//!
+//! The FLEET-NOUN classes are not defined here. They are read, at test time,
+//! from `qontinui-schemas/fleet-nouns.toml` — the ONE vocabulary every
+//! fleet-noun lint reads — out of the sibling checkout `src-tauri/Cargo.toml`
+//! already path-depends on (plan
+//! `2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists`,
+//! Phase A6). Every `[[class]]` in that file is a class here, under the file's
+//! id, matched per the file's contract: one comment-stripped LINE at a time
+//! (string literals kept), `exclude` SPAN-scoped (it removes only the matches
+//! it overlaps, never the line). Today that is `repo_layout`, `dev_ports`,
+//! `supervisor_dependency`, `tenant_literal`, `machine_path`,
+//! `fleet_host_name`, `fleet_device_uuid` — read the file, not this list.
+//!
+//! A missing, unparseable, wrong-version or class-less vocabulary is a RED
+//! naming the path, never a skip: an absent vocabulary is UNKNOWN, not "no
+//! fleet nouns".
+//!
+//! Runner-local, because the vocabulary deliberately does not carry them:
+//!
+//! | class id           | pattern family |
+//! |--------------------|----------------|
+//! | `plans_dir`        | `.plans_dir` / `QONTINUI_PLANS_DIR` reads (`$QONTINUI_PLANS_DIR` is a product constant there) |
+//! | `os_bound_tooling` | `powershell` `pwsh` `cmd.exe` `taskkill` `schtasks` `.ps1` literals outside `cfg(windows)`; and a `cfg(windows)` fn with no non-windows sibling of the same name in its file (a platform class, not a fleet noun) |
+//!
+//! plus one runner-local STRUCTURAL refinement ADDED to the vocabulary's
+//! `supervisor_dependency` (which the file's header permits): a call to a
+//! snake_case helper named for the supervisor (`check_supervisor_available()`).
 //!
 //! Excluded from the scan: `#[cfg(test)]` items (inline modules, fns, `use`s),
 //! whole files declared through `#[cfg(test)] mod x;` or carrying
@@ -29,13 +48,18 @@
 //!
 //! ## What fails, and what does not
 //!
-//! The ONLY failure is ROSTER STALENESS — a hit with no row in
-//! `docs/workspace-assumptions.json`, or a row with no hit — plus the two vacuity
-//! guards (the `scanned_files` floor, and every class matching its own planted
-//! fixture). It does **not** fail on `unreviewed` or `defect` counts: the plan
-//! gates nothing (parent Non-goal 2). It prints
-//! `unreviewed=<n> defect=<n> scanned_files=<n> skipped_files=<n (reason)>`, so
-//! "0 hits" is distinguishable from "scanned nothing".
+//! ROSTER STALENESS — a hit with no row in `docs/workspace-assumptions.json`,
+//! or a row with no hit — plus the vacuity guards (the `scanned_files` floor,
+//! every class matching its own planted fixture, the vocabulary's own examples
+//! and look-alikes through this matcher, an unreadable vocabulary), plus the
+//! UNREVIEWED RATCHET: the `unreviewed` row count must equal the
+//! `unreviewed_ceiling` checked into the dispositions file. Above it, the test
+//! names the new rows (a new assumption is looked at once, by its author, at
+//! PR time); below it, the test asks for the ceiling to be lowered, so a
+//! triage gain is held. It does **not** fail on `defect` counts (parent
+//! Non-goal 2 stands). It prints
+//! `unreviewed=<n> unreviewed_ceiling=<n> defect=<n> scanned_files=<n> skipped_files=<n (reason)>`,
+//! so "0 hits" is distinguishable from "scanned nothing".
 //!
 //! ## Dispositions
 //!
@@ -61,7 +85,9 @@
 //!
 //! rewrites `docs/workspace-assumptions.{json,md}` from the scan plus the
 //! dispositions file. Review the diff like any other: a new row is a new
-//! workspace assumption someone just shipped.
+//! workspace assumption someone just shipped. Regeneration REFUSES when the
+//! unreviewed count would exceed `unreviewed_ceiling` (it names the rows), so
+//! the ratchet cannot be laundered through a regenerate.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -74,6 +100,11 @@ use serde::{Deserialize, Serialize};
 /// defect cites the plan that owns its fix.
 const PLAN_STEM: &str =
     "2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports";
+
+/// The plan whose Phase A6 re-pointed the class table at `fleet-nouns.toml`
+/// and added the `unreviewed_ceiling` ratchet.
+const VOCABULARY_PLAN_STEM: &str =
+    "2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists";
 
 /// Vacuity floor on the number of `.rs` files actually scanned.
 ///
@@ -90,17 +121,21 @@ const ROSTER_MD: &str = "../docs/workspace-assumptions.md";
 const DISPOSITIONS_TOML: &str = "../docs/workspace-assumptions.dispositions.toml";
 const FIXTURE_DIR: &str = "tests/fixtures/workspace-assumptions";
 const UPDATE_ENV: &str = "UPDATE_WORKSPACE_ASSUMPTIONS";
+/// The ONE fleet-noun vocabulary, read from the sibling qontinui-schemas
+/// checkout this crate already path-depends on (`../../qontinui-schemas/rust`).
+const FLEET_NOUNS_TOML: &str = "../../qontinui-schemas/fleet-nouns.toml";
 
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
 // ===========================================================================
-// The class table — fixed, literal, no scoring.
+// The class table — the fleet-noun VOCABULARY (qontinui-schemas) plus the two
+// runner-local classes. Fixed, literal, no scoring.
 // ===========================================================================
 
 /// What a pattern is matched against.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Target {
     /// The code text of a line with comments removed (string literals kept).
     Code,
@@ -108,149 +143,246 @@ enum Target {
     Literal,
 }
 
-struct PatternSpec {
+struct LocalPattern {
     target: Target,
     pattern: &'static str,
-    /// A literal/line also matching this is NOT a hit for this pattern.
-    exclude: Option<&'static str>,
 }
 
-struct ClassSpec {
+struct LocalClass {
     id: &'static str,
-    patterns: &'static [PatternSpec],
+    patterns: &'static [LocalPattern],
 }
 
-const CLASSES: &[ClassSpec] = &[
-    ClassSpec {
-        id: "repo_layout",
-        patterns: &[
-            // A sibling repo as a path component (or the whole literal). URLs and
-            // `owner/repo` slugs are references to a repo, not to a layout.
-            PatternSpec {
-                target: Target::Literal,
-                pattern: r"(?:^|[/\\])(?:qontinui-(?:claude-config|dev-notes|schemas|web|coord|supervisor|mcp|inspect|stack|mobile|devtools|root)|multistate)(?:[/\\]|$)",
-                exclude: Some(r"://|^qontinui/"),
-            },
-            // The `ui-bridge` sibling repo — as a bare `.join("ui-bridge")`, a
-            // `../ui-bridge` relative path, or its `ui-bridge/packages` tree. NOT
-            // every `ui-bridge` path segment: the runner's own `/ui-bridge/...`
-            // HTTP routes and `{base}/ui-bridge/sdk/...` URLs are not layout.
-            PatternSpec {
-                target: Target::Literal,
-                pattern: r"^ui-bridge$|\.\.[/\\]ui-bridge\b|(?:^|[/\\])ui-bridge[/\\]packages\b",
-                exclude: Some(r"://"),
-            },
-            PatternSpec {
-                target: Target::Code,
-                pattern: r"\bQONTINUI_(?:WORKSPACE_)?ROOT\b",
-                exclude: None,
-            },
-        ],
-    },
-    ClassSpec {
-        id: "dev_ports",
-        patterns: &[PatternSpec {
-            target: Target::Literal,
-            pattern: r"(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|host\.docker\.internal):(?:8000|3001|9875|5432|5433|6379|9000)\b",
-            exclude: None,
-        }],
-    },
-    ClassSpec {
-        id: "supervisor_dependency",
-        patterns: &[
-            PatternSpec {
-                target: Target::Code,
-                pattern: r"\b9875\b",
-                // `\u{9875}` is a CJK character escape, not a port.
-                exclude: Some(r"\\u\{9875\}"),
-            },
-            PatternSpec {
-                target: Target::Code,
-                // A call to any snake_case helper named for the supervisor —
-                // `check_supervisor_available()`, `supervisor_injected_reading()`.
-                // …or passes one by path as an argument
-                // (`spawn_blocking(auto_continue::check_supervisor_available)`).
-                // The in-process `worker_supervisor` / `task_supervisor`
-                // MODULES are not the dev supervisor, and a module path is
-                // followed by `::`, never by `,` or `)`.
-                pattern: r"\b[a-z0-9_]*(?:_supervisor|supervisor_)[a-z0-9_]*\s*\(|::[a-z0-9_]*(?:_supervisor|supervisor_)[a-z0-9_]*\s*[,)]",
-                exclude: None,
-            },
-            PatternSpec {
-                target: Target::Code,
-                pattern: r"(?i)\b(?:get_|default_)?supervisor_?(?:url|base|port|endpoint|client|api|host|addr|socket_addr)\b|\bSupervisorClient\b|\bQONTINUI_SUPERVISOR\w*",
-                exclude: None,
-            },
-        ],
-    },
-    ClassSpec {
+/// The classes that are NOT fleet nouns and so are NOT in `fleet-nouns.toml`
+/// (its header says so): `plans_dir` flags code reading the product's own
+/// optional `QONTINUI_PLANS_DIR` setting, and `os_bound_tooling` is a PLATFORM
+/// class (`powershell.exe` is correct under `cfg(windows)`). Both stay here.
+const RUNNER_LOCAL_CLASSES: &[LocalClass] = &[
+    LocalClass {
         id: "plans_dir",
-        patterns: &[PatternSpec {
+        patterns: &[LocalPattern {
             target: Target::Code,
             pattern: r"\.plans_dir\b|\bQONTINUI_PLANS_DIR\b",
-            exclude: None,
         }],
     },
-    ClassSpec {
-        id: "tenant_literal",
-        patterns: &[PatternSpec {
-            target: Target::Literal,
-            pattern: r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
-            exclude: None,
-        }],
-    },
-    ClassSpec {
-        id: "os_bound_tooling",
+    LocalClass {
+        id: OS_BOUND,
         // The second half of this class — a `cfg(windows)` fn with no
         // non-windows sibling — is structural, see `scan_source`.
-        patterns: &[PatternSpec {
+        patterns: &[LocalPattern {
             target: Target::Literal,
             pattern: r"(?i)\b(?:powershell|pwsh|taskkill|schtasks)\b|\bcmd\.exe\b|\.ps1\b",
-            exclude: None,
         }],
-    },
-    ClassSpec {
-        id: "machine_path",
-        patterns: &[
-            PatternSpec {
-                target: Target::Literal,
-                pattern: r"(?:^|[^A-Za-z0-9])[A-Za-z]:(?:\\{1,2}|/)[A-Za-z_]",
-                exclude: None,
-            },
-            PatternSpec {
-                target: Target::Literal,
-                pattern: r"/home/[A-Za-z_][A-Za-z0-9_.-]*|/Users/[A-Za-z]",
-                exclude: None,
-            },
-        ],
     },
 ];
 
+/// Runner-local STRUCTURAL refinements added to a vocabulary class — which the
+/// vocabulary's header permits ("a consumer may keep such refinements locally
+/// but may not redefine a class id"). A refinement ADDS matches to a class the
+/// vocabulary owns; naming a class the vocabulary does not carry is a red.
+const RUNNER_REFINEMENTS: &[(&str, LocalPattern)] = &[(
+    "supervisor_dependency",
+    // A CALL to any snake_case helper named for the supervisor —
+    // `check_supervisor_available()`, `supervisor_injected_reading()` — or one
+    // passed by path as an argument
+    // (`spawn_blocking(auto_continue::check_supervisor_available)`). The
+    // in-process `worker_supervisor` / `task_supervisor` MODULES are not the dev
+    // supervisor, and a module path is followed by `::`, never by `,` or `)`.
+    // The vocabulary's accessor arm names only url/port/host/client-shaped
+    // helpers; the supervisor-PRESENCE probe is the call this catches.
+    LocalPattern {
+        target: Target::Code,
+        pattern: r"\b[a-z0-9_]*(?:_supervisor|supervisor_)[a-z0-9_]*\s*\(|::[a-z0-9_]*(?:_supervisor|supervisor_)[a-z0-9_]*\s*[,)]",
+    },
+)];
+
 const OS_BOUND: &str = "os_bound_tooling";
 
-struct CompiledClass {
-    id: &'static str,
-    patterns: Vec<(Target, Regex, Option<Regex>)>,
+/// `fleet-nouns.toml`, parsed. Only the fields this consumer reads; the file's
+/// other fields (`why`, `literals`, `portability_probes`, …) are ignored.
+#[derive(Debug, Deserialize)]
+struct Vocabulary {
+    version: u32,
+    #[serde(default)]
+    lookalikes: Vec<String>,
+    #[serde(default, rename = "class")]
+    classes: Vec<VocabClass>,
+    #[serde(default, rename = "product_constant")]
+    product_constants: Vec<ProductConstant>,
 }
 
-fn compile_classes() -> Vec<CompiledClass> {
-    CLASSES
+#[derive(Debug, Deserialize)]
+struct VocabClass {
+    id: String,
+    pattern: String,
+    #[serde(default)]
+    exclude: Option<String>,
+    #[serde(default)]
+    examples: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProductConstant {
+    value: String,
+}
+
+/// The one vocabulary version this matcher implements.
+const VOCABULARY_VERSION: u32 = 1;
+
+fn vocabulary_path() -> PathBuf {
+    crate_root().join(FLEET_NOUNS_TOML)
+}
+
+/// Read and parse the vocabulary. EVERY failure is an `Err` naming the path —
+/// an absent file is UNKNOWN, never "no fleet nouns", so no caller may turn it
+/// into a skip.
+fn load_vocabulary(path: &Path) -> Result<Vocabulary, String> {
+    let text = fs::read_to_string(path).map_err(|e| {
+        format!(
+            "FLEET-NOUN VOCABULARY UNREADABLE: {}: {e}. The workspace-assumption classes are \
+             read from the sibling qontinui-schemas checkout (src-tauri/Cargo.toml already \
+             path-depends on it); check it out beside this repo at or past schemas 02fdbb97. \
+             An absent vocabulary is UNKNOWN, never \"no fleet nouns\" — this is not a skip.",
+            path.display()
+        )
+    })?;
+    let vocab: Vocabulary = toml::from_str(&text).map_err(|e| {
+        format!(
+            "FLEET-NOUN VOCABULARY UNPARSEABLE: {}: {e}",
+            path.display()
+        )
+    })?;
+    if vocab.version != VOCABULARY_VERSION {
+        return Err(format!(
+            "FLEET-NOUN VOCABULARY VERSION {} at {} — this matcher implements version \
+             {VOCABULARY_VERSION}; re-read the file's HOW A CONSUMER MATCHES contract and update \
+             the runner",
+            vocab.version,
+            path.display()
+        ));
+    }
+    if vocab.classes.is_empty() {
+        return Err(format!(
+            "FLEET-NOUN VOCABULARY EMPTY: {} declares no [[class]] — a vocabulary with no \
+             classes would scan nothing and pass",
+            path.display()
+        ));
+    }
+    Ok(vocab)
+}
+
+struct CompiledPattern {
+    target: Target,
+    re: Regex,
+    /// SPAN-scoped: a match of `re` is discarded when its span overlaps a
+    /// match of this in the same text (the vocabulary's contract). It never
+    /// hides a separate, non-overlapping match elsewhere on the line.
+    exclude: Option<Regex>,
+    /// `true` for a runner-local pattern (not from the vocabulary).
+    local: bool,
+}
+
+struct CompiledClass {
+    id: String,
+    patterns: Vec<CompiledPattern>,
+}
+
+/// The first surviving match of `re` in `text` (its start offset), after the
+/// span-scoped `exclude`. Matches are non-overlapping, left to right.
+fn first_surviving_match(re: &Regex, exclude: Option<&Regex>, text: &str) -> Option<usize> {
+    let excluded: Vec<(usize, usize)> = exclude
+        .map(|e| e.find_iter(text).map(|m| (m.start(), m.end())).collect())
+        .unwrap_or_default();
+    re.find_iter(text)
+        .find(|m| {
+            !excluded
+                .iter()
+                .any(|&(s, e)| m.start() < e && s < m.end())
+        })
+        .map(|m| m.start())
+}
+
+/// Does `text` (one line, no terminator) hit `class` through its VOCABULARY
+/// patterns alone? The contract check in `vocabulary_contract_holds_under_this_matcher`.
+fn vocabulary_hits(class: &CompiledClass, text: &str) -> bool {
+    class
+        .patterns
         .iter()
-        .map(|c| CompiledClass {
-            id: c.id,
-            patterns: c
+        .filter(|p| !p.local)
+        .any(|p| first_surviving_match(&p.re, p.exclude.as_ref(), text).is_some())
+}
+
+fn compile_local(p: &LocalPattern, id: &str) -> Result<CompiledPattern, String> {
+    Ok(CompiledPattern {
+        target: p.target,
+        re: Regex::new(p.pattern).map_err(|e| format!("runner-local `{id}` pattern: {e}"))?,
+        exclude: None,
+        local: true,
+    })
+}
+
+/// The full class table: every vocabulary class (in file order, matched
+/// against each comment-stripped LINE, as the vocabulary's contract says),
+/// plus the runner-local refinements and classes.
+fn compile_classes_from(path: &Path) -> Result<Vec<CompiledClass>, String> {
+    let vocab = load_vocabulary(path)?;
+    let mut out: Vec<CompiledClass> = Vec::new();
+    for c in &vocab.classes {
+        if out.iter().any(|o| o.id == c.id) {
+            return Err(format!("{}: duplicate class id `{}`", path.display(), c.id));
+        }
+        if RUNNER_LOCAL_CLASSES.iter().any(|l| l.id == c.id) {
+            return Err(format!(
+                "{}: class `{}` is runner-local here and may not also come from the vocabulary",
+                path.display(),
+                c.id
+            ));
+        }
+        let re = Regex::new(&c.pattern)
+            .map_err(|e| format!("{}: class `{}` pattern: {e}", path.display(), c.id))?;
+        let exclude = c
+            .exclude
+            .as_deref()
+            .map(Regex::new)
+            .transpose()
+            .map_err(|e| format!("{}: class `{}` exclude: {e}", path.display(), c.id))?;
+        out.push(CompiledClass {
+            id: c.id.clone(),
+            patterns: vec![CompiledPattern {
+                target: Target::Code,
+                re,
+                exclude,
+                local: false,
+            }],
+        });
+    }
+    for (id, p) in RUNNER_REFINEMENTS {
+        let class = out.iter_mut().find(|c| c.id == *id).ok_or_else(|| {
+            format!(
+                "runner refinement for `{id}`, but {} carries no such class — a refinement may \
+                 only ADD to a vocabulary class",
+                path.display()
+            )
+        })?;
+        class.patterns.push(compile_local(p, id)?);
+    }
+    for l in RUNNER_LOCAL_CLASSES {
+        out.push(CompiledClass {
+            id: l.id.to_string(),
+            patterns: l
                 .patterns
                 .iter()
-                .map(|p| {
-                    (
-                        p.target,
-                        Regex::new(p.pattern).expect("class pattern compiles"),
-                        p.exclude.map(|e| Regex::new(e).expect("exclude compiles")),
-                    )
-                })
-                .collect(),
-        })
-        .collect()
+                .map(|p| compile_local(p, l.id))
+                .collect::<Result<_, _>>()?,
+        });
+    }
+    Ok(out)
+}
+
+/// The class table from the sibling vocabulary — PANICS (red, naming the path)
+/// when it cannot be read. Never a skip.
+fn compile_classes() -> Vec<CompiledClass> {
+    compile_classes_from(&vocabulary_path()).unwrap_or_else(|e| panic!("{e}"))
 }
 
 // ===========================================================================
@@ -1021,23 +1153,24 @@ fn scan_source(
                     continue;
                 }
                 let mut excerpt: Option<String> = None;
-                for (target, re, exclude) in &class.patterns {
-                    let excluded = |t: &str| exclude.as_ref().is_some_and(|e| e.is_match(t));
-                    excerpt = match target {
-                        Target::Code => (re.is_match(&line.code) && !excluded(&line.code))
-                            .then(|| excerpt_of(&line.code)),
+                for p in &class.patterns {
+                    let (re, exclude) = (&p.re, p.exclude.as_ref());
+                    excerpt = match p.target {
+                        // One line, terminator stripped (the vocabulary's
+                        // contract: a lone `\r` means different things per engine).
+                        Target::Code => {
+                            first_surviving_match(re, exclude, line.code.trim_end_matches('\r'))
+                                .map(|_| excerpt_of(&line.code))
+                        }
                         Target::Literal => line.literals.iter().find_map(|lit| {
-                            let m = re.find(lit)?;
-                            if excluded(lit) {
-                                return None;
-                            }
+                            let m_start = first_surviving_match(re, exclude, lit)?;
                             // A multi-line literal: quote the literal's own line
                             // holding the match, not the line that opens it.
                             Some(if lit.contains('\n') {
-                                let start = lit[..m.start()].rfind('\n').map_or(0, |i| i + 1);
-                                let end = lit[m.start()..]
+                                let start = lit[..m_start].rfind('\n').map_or(0, |i| i + 1);
+                                let end = lit[m_start..]
                                     .find('\n')
-                                    .map_or(lit.len(), |i| m.start() + i);
+                                    .map_or(lit.len(), |i| m_start + i);
                                 excerpt_of(&lit[start..end])
                             } else {
                                 excerpt_of(&line.code)
@@ -1304,6 +1437,11 @@ fn check_floor(result: &ScanResult) -> Result<(), String> {
 
 #[derive(Debug, Deserialize)]
 struct DispositionsFile {
+    /// The ratchet: the roster's `unreviewed` ROW count must EQUAL this. More
+    /// is a new, un-looked-at assumption (red, naming the rows); fewer means
+    /// someone triaged one and the ceiling must come down to hold the gain.
+    /// Absent is a red, never "no ceiling".
+    unreviewed_ceiling: Option<usize>,
     #[serde(default)]
     disposition: Vec<DispositionEntry>,
 }
@@ -1369,12 +1507,19 @@ fn valid_disposition(d: &str) -> bool {
 
 type Key = (String, String, String);
 
-fn load_dispositions(root: &Path) -> Result<BTreeMap<Key, Disposition>, String> {
+fn load_dispositions(root: &Path) -> Result<(BTreeMap<Key, Disposition>, usize), String> {
     let path = root.join(DISPOSITIONS_TOML);
     let text =
         fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let parsed: DispositionsFile =
         toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let ceiling = parsed.unreviewed_ceiling.ok_or_else(|| {
+        format!(
+            "{} has no top-level `unreviewed_ceiling = <n>` — the ratchet's checked-in bound \
+             is required (an absent ceiling is not \"unbounded\")",
+            path.display()
+        )
+    })?;
     let mut out = BTreeMap::new();
     for e in parsed.disposition {
         if !valid_disposition(&e.disposition) {
@@ -1404,7 +1549,52 @@ fn load_dispositions(root: &Path) -> Result<BTreeMap<Key, Disposition>, String> 
             ));
         }
     }
-    Ok(out)
+    Ok((out, ceiling))
+}
+
+/// The exact ratchet on `unreviewed` rows. `fresh` is this scan's roster,
+/// `checked` the checked-in one (used only to NAME what is new).
+fn check_ceiling(fresh: &[Row], checked: &[Row], ceiling: usize) -> Result<(), String> {
+    let unreviewed: Vec<&Row> = fresh
+        .iter()
+        .filter(|r| r.disposition == "unreviewed")
+        .collect();
+    let n = unreviewed.len();
+    if n > ceiling {
+        let was: BTreeSet<String> = checked
+            .iter()
+            .filter(|r| r.disposition == "unreviewed")
+            .map(row_ident)
+            .collect();
+        let new_rows: Vec<String> = unreviewed
+            .iter()
+            .map(|r| row_ident(r))
+            .filter(|k| !was.contains(k))
+            .collect();
+        let named = if new_rows.is_empty() {
+            "(none differ from the checked-in roster, so the ceiling itself was lowered below \
+             the roster's own unreviewed count — restore it)"
+                .to_string()
+        } else {
+            new_rows.join("\n    ")
+        };
+        return Err(format!(
+            "UNREVIEWED ABOVE CEILING: unreviewed={n} > unreviewed_ceiling={ceiling} in \
+             {DISPOSITIONS_TOML}. New unreviewed row(s):\n    {named}\n\
+             Review each: give it a disposition (fallback_correct | dev_only_surface | \
+             defect(<plan stem>)) with its `reviewed` excerpt, or remove the assumption. \
+             Raising the ceiling instead is a visible, reviewable choice — make it only with \
+             the reason in the PR."
+        ));
+    }
+    if n < ceiling {
+        return Err(format!(
+            "UNREVIEWED BELOW CEILING: unreviewed={n} < unreviewed_ceiling={ceiling}. Lower \
+             `unreviewed_ceiling` to {n} in {DISPOSITIONS_TOML} so the gain is held (exact \
+             ratchet)."
+        ));
+    }
+    Ok(())
 }
 
 /// `(capability id, identifier tokens of its anchor)` for every CAPABILITY_SPECS
@@ -1476,6 +1666,7 @@ fn capability_for(hit: &Hit, anchors: &[(String, BTreeSet<String>)]) -> Option<S
 
 struct Built {
     roster: Roster,
+    unreviewed_ceiling: usize,
     /// A disposition key, or one of its reviewed excerpts, that matches no hit.
     orphan_dispositions: Vec<String>,
     /// Rows under a dispositioned key whose excerpt was never reviewed.
@@ -1483,7 +1674,7 @@ struct Built {
 }
 
 fn build_roster(root: &Path, hits: &[Hit]) -> Result<Built, String> {
-    let dispositions = load_dispositions(root)?;
+    let (dispositions, unreviewed_ceiling) = load_dispositions(root)?;
     let anchors = capability_anchors(root);
 
     let mut counted: BTreeMap<Hit, usize> = BTreeMap::new();
@@ -1554,6 +1745,7 @@ fn build_roster(root: &Path, hits: &[Hit]) -> Result<Built, String> {
             plan: PLAN_STEM.to_string(),
             rows,
         },
+        unreviewed_ceiling,
         orphan_dispositions,
         new_since_review,
     })
@@ -1563,7 +1755,7 @@ fn md_escape(s: &str) -> String {
     s.replace('|', "\\|").replace('`', "'")
 }
 
-fn render_md(roster: &Roster) -> String {
+fn render_md(roster: &Roster, class_ids: &[String]) -> String {
     let mut out = String::new();
     out.push_str("# Workspace assumptions — the static roster\n\n");
     out.push_str(
@@ -1574,8 +1766,12 @@ fn render_md(roster: &Roster) -> String {
     );
     out.push_str(&format!(
         "Every place `src-tauri/src` (outside `cfg(test)` and comments) matches one of the \
-         fixed workspace-assumption patterns — Phase 4 of plan `{PLAN_STEM}`. A roster, not \
-         a gate: the test fails only when this file is stale, never on a count. \
+         fixed workspace-assumption patterns — Phase 4 of plan `{PLAN_STEM}`. The fleet-noun \
+         classes come from `qontinui-schemas/fleet-nouns.toml` (plan `{VOCABULARY_PLAN_STEM}`, \
+         Phase A6); `plans_dir` and `os_bound_tooling` are runner-local. The test fails when \
+         this file is stale, and when the `unreviewed` row count differs from the \
+         `unreviewed_ceiling` checked into the dispositions file (a ratchet: it may only \
+         fall, and each fall lowers the ceiling). It never fails on a `defect` count. \
          `docs/workspace-assumptions.json` is the machine-readable twin.\n\n"
     ));
     out.push_str(
@@ -1588,8 +1784,8 @@ fn render_md(roster: &Roster) -> String {
     );
 
     let mut by_class: BTreeMap<&str, Vec<&Row>> = BTreeMap::new();
-    for c in CLASSES {
-        by_class.insert(c.id, Vec::new());
+    for c in class_ids {
+        by_class.insert(c.as_str(), Vec::new());
     }
     for r in &roster.rows {
         by_class.entry(r.class.as_str()).or_default().push(r);
@@ -1599,12 +1795,12 @@ fn render_md(roster: &Roster) -> String {
         "| class | rows | hits | unreviewed | fallback_correct | dev_only_surface | defect |\n",
     );
     out.push_str("|---|---:|---:|---:|---:|---:|---:|\n");
-    for c in CLASSES {
-        let rows = &by_class[c.id];
+    for c in class_ids {
+        let rows = &by_class[c.as_str()];
         let n = |p: &dyn Fn(&str) -> bool| rows.iter().filter(|r| p(&r.disposition)).count();
         out.push_str(&format!(
             "| `{}` | {} | {} | {} | {} | {} | {} |\n",
-            c.id,
+            c,
             rows.len(),
             rows.iter().map(|r| r.count).sum::<usize>(),
             n(&|d| d == "unreviewed"),
@@ -1615,14 +1811,14 @@ fn render_md(roster: &Roster) -> String {
     }
     out.push('\n');
 
-    for c in CLASSES {
-        let rows = &by_class[c.id];
-        out.push_str(&format!("## `{}` ({} rows)\n\n", c.id, rows.len()));
+    for c in class_ids {
+        let rows = &by_class[c.as_str()];
+        out.push_str(&format!("## `{}` ({} rows)\n\n", c, rows.len()));
         if rows.is_empty() {
             out.push_str("_No hits._\n\n");
             continue;
         }
-        let cap_col = c.id == "repo_layout";
+        let cap_col = c == "repo_layout";
         if cap_col {
             out.push_str("| file | symbol | excerpt | n | disposition | capability |\n|---|---|---|---:|---|---|\n");
         } else {
@@ -1724,9 +1920,9 @@ fn workspace_assumption_roster_is_fresh() {
         .collect::<Vec<_>>()
         .join(", ");
     let counts = format!(
-        "unreviewed={unreviewed} defect={defect} new_since_review={} scanned_files={} \
-         skipped_files={skipped_total} ({skipped_detail})",
-        built.new_since_review, result.scanned_files
+        "unreviewed={unreviewed} unreviewed_ceiling={} defect={defect} new_since_review={} \
+         scanned_files={} skipped_files={skipped_total} ({skipped_detail})",
+        built.unreviewed_ceiling, built.new_since_review, result.scanned_files
     );
     println!("{counts}");
     // CI captures test stdout on a green run; the job summary is where a
@@ -1756,10 +1952,19 @@ fn workspace_assumption_roster_is_fresh() {
 
     check_floor(&result).unwrap_or_else(|e| panic!("{e}"));
 
+    let class_ids: Vec<String> = compile_classes().into_iter().map(|c| c.id).collect();
     let json = to_json(&built.roster);
-    let md = render_md(&built.roster);
+    let md = render_md(&built.roster, &class_ids);
     let json_path = root.join(ROSTER_JSON);
     let md_path = root.join(ROSTER_MD);
+
+    let checked_json = fs::read_to_string(&json_path)
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
+    let checked_rows: Vec<Row> = serde_json::from_str::<Roster>(&checked_json)
+        .map(|r| r.rows)
+        .unwrap_or_default();
+    let ceiling = check_ceiling(rows, &checked_rows, built.unreviewed_ceiling);
 
     if std::env::var(UPDATE_ENV).is_ok_and(|v| v == "1") {
         assert!(
@@ -1767,6 +1972,15 @@ fn workspace_assumption_roster_is_fresh() {
             "dispositions with no matching hit (fix the key or delete the entry): {:#?}",
             built.orphan_dispositions
         );
+        // Regeneration may not launder a new unreviewed row into the checked-in
+        // roster: above the ceiling it refuses, naming the rows. Below it, the
+        // roster is written and the normal run then asks for the ceiling to fall.
+        if unreviewed > built.unreviewed_ceiling {
+            panic!("{}", ceiling.expect_err("above the ceiling is an error"));
+        }
+        if let Err(e) = &ceiling {
+            println!("NOTE: {e}");
+        }
         fs::write(&json_path, &json).expect("write roster json");
         fs::write(&md_path, &md).expect("write roster md");
         println!(
@@ -1777,9 +1991,6 @@ fn workspace_assumption_roster_is_fresh() {
         return;
     }
 
-    let checked_json = fs::read_to_string(&json_path)
-        .unwrap_or_default()
-        .replace("\r\n", "\n");
     let checked_md = fs::read_to_string(&md_path)
         .unwrap_or_default()
         .replace("\r\n", "\n");
@@ -1798,9 +2009,13 @@ fn workspace_assumption_roster_is_fresh() {
     if checked_md != md {
         problems.push("docs/workspace-assumptions.md differs from a fresh render".into());
     }
+    if let Err(e) = ceiling {
+        problems.push(e);
+    }
     assert!(
         problems.is_empty(),
-        "\nThe workspace-assumption roster is STALE ({} problem(s)):\n\n  {}\n\n\
+        "\nThe workspace-assumption roster is STALE or off its unreviewed ceiling ({} \
+         problem(s)):\n\n  {}\n\n\
          A new row is a new workspace assumption: review it, give it a disposition in \
          docs/workspace-assumptions.dispositions.toml if you can, then regenerate with\n  \
          {UPDATE_ENV}=1 cargo-guard.sh test --test workspace_assumptions_are_enumerated\n",
@@ -1817,7 +2032,7 @@ fn every_class_matches_its_planted_fixture() {
     let root = crate_root();
     let st = Structure::new();
     let classes = compile_classes();
-    for class in CLASSES {
+    for class in &classes {
         let path = root.join(FIXTURE_DIR).join(format!("{}.rs.txt", class.id));
         let src = fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("missing fixture {}: {e}", path.display()));
@@ -1981,7 +2196,7 @@ fn attribute_shaped_lines_inside_string_literals_are_data() {
     let st = Structure::new();
     let classes = compile_classes();
 
-    let src = "fn holds_a_template() -> &'static str {\n    r#\"\n#[cfg(test)] the supervisor answers on 9875\n\"#\n}\n";
+    let src = "fn holds_a_template() -> &'static str {\n    r#\"\n#[cfg(test)] the supervisor answers on :9875\n\"#\n}\n";
     let hits = scan_source(&st, &classes, "fixture.rs", src, false);
     assert!(
         hits.iter()
@@ -2008,4 +2223,135 @@ fn empty_scan_root_fails_on_the_scanned_files_floor() {
     assert!(result.hits.is_empty());
     let err = check_floor(&result).expect_err("an empty scan root must fail the floor");
     assert!(err.contains("VACUOUS SCAN"), "{err}");
+}
+
+/// The vocabulary's own planted positives and negatives, run through THIS
+/// matcher: every `examples` entry hits its class, and no `lookalikes` entry or
+/// product constant hits any class. The schemas repo proves the patterns under
+/// three engines; this proves the runner implements the file's contract —
+/// above all the SPAN-scoped `exclude` (`the spaceship operator <=> ran on
+/// spaceship` must still hit; `C:\\Users\\Public\\x and C:\\Users\\josh\\y` too).
+#[test]
+fn vocabulary_contract_holds_under_this_matcher() {
+    let path = vocabulary_path();
+    let vocab = load_vocabulary(&path).unwrap_or_else(|e| panic!("{e}"));
+    let classes = compile_classes_from(&path).unwrap_or_else(|e| panic!("{e}"));
+    let mut problems = Vec::new();
+    let mut examples = 0;
+    for vc in &vocab.classes {
+        let class = classes.iter().find(|c| c.id == vc.id).expect("compiled");
+        if vc.examples.is_empty() {
+            problems.push(format!("class `{}` carries no examples", vc.id));
+        }
+        for ex in &vc.examples {
+            examples += 1;
+            if !vocabulary_hits(class, ex) {
+                problems.push(format!("example {ex:?} does not hit its class `{}`", vc.id));
+            }
+        }
+    }
+    let negatives: Vec<&str> = vocab
+        .lookalikes
+        .iter()
+        .map(String::as_str)
+        .chain(vocab.product_constants.iter().map(|p| p.value.as_str()))
+        .collect();
+    for text in &negatives {
+        for class in &classes {
+            if vocabulary_hits(class, text) {
+                problems.push(format!("negative {text:?} hits class `{}`", class.id));
+            }
+        }
+    }
+    assert!(
+        examples > 0 && !negatives.is_empty(),
+        "vacuous contract check: examples={examples} negatives={}",
+        negatives.len()
+    );
+    assert!(
+        problems.is_empty(),
+        "{} disagrees with this matcher:\n  {}",
+        path.display(),
+        problems.join("\n  ")
+    );
+}
+
+/// A missing vocabulary is a RED that names the path — never a skip, never
+/// "no fleet nouns".
+#[test]
+fn missing_vocabulary_is_red_naming_the_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("qontinui-schemas").join("fleet-nouns.toml");
+    let err = compile_classes_from(&missing)
+        .err()
+        .expect("a missing vocabulary must be an error");
+    assert!(err.contains("UNREADABLE"), "{err}");
+    assert!(err.contains(&missing.display().to_string()), "{err}");
+}
+
+/// An unparseable, wrong-version or class-less vocabulary is a red naming the
+/// path, too.
+#[test]
+fn unusable_vocabulary_is_red_naming_the_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("fleet-nouns.toml");
+    for (body, want) in [
+        ("version = 1\n[[class]\nid = ", "UNPARSEABLE"),
+        ("version = 2\n[[class]]\nid = \"x\"\npattern = \"x\"\n", "VERSION"),
+        ("version = 1\n", "EMPTY"),
+        (
+            "version = 1\n[[class]]\nid = \"plans_dir\"\npattern = \"x\"\n",
+            "runner-local",
+        ),
+        (
+            "version = 1\n[[class]]\nid = \"dev_ports\"\npattern = \"x\"\n",
+            "supervisor_dependency",
+        ),
+    ] {
+        fs::write(&path, body).expect("write");
+        let err = compile_classes_from(&path)
+            .err()
+            .unwrap_or_else(|| panic!("{body:?} must be an error"));
+        assert!(err.contains(want), "{body:?}: {err}");
+        assert!(err.contains(&path.display().to_string()), "{body:?}: {err}");
+    }
+}
+
+fn row(class: &str, symbol: &str, disposition: &str) -> Row {
+    Row {
+        class: class.to_string(),
+        file: "src/x.rs".to_string(),
+        symbol: symbol.to_string(),
+        excerpt: "e".to_string(),
+        count: 1,
+        disposition: disposition.to_string(),
+        capability: None,
+        note: None,
+    }
+}
+
+/// The exact ratchet: equal passes; one more unreviewed row is a red naming it;
+/// one fewer is a red asking for the ceiling to fall.
+#[test]
+fn unreviewed_ceiling_is_an_exact_ratchet() {
+    let checked = vec![
+        row("dev_ports", "a", "unreviewed"),
+        row("dev_ports", "b", "fallback_correct"),
+    ];
+    assert!(check_ceiling(&checked, &checked, 1).is_ok());
+
+    let mut grown = checked.clone();
+    grown.push(row("machine_path", "brand_new", "unreviewed"));
+    let err = check_ceiling(&grown, &checked, 1).expect_err("above the ceiling");
+    assert!(err.contains("UNREVIEWED ABOVE CEILING"), "{err}");
+    assert!(err.contains("[machine_path] src/x.rs :: brand_new"), "{err}");
+    assert!(!err.contains(":: a ::"), "an old unreviewed row is not new: {err}");
+
+    let triaged = vec![
+        row("dev_ports", "a", "fallback_correct"),
+        row("dev_ports", "b", "fallback_correct"),
+    ];
+    let err = check_ceiling(&triaged, &checked, 1).expect_err("below the ceiling");
+    assert!(err.contains("UNREVIEWED BELOW CEILING"), "{err}");
+    assert!(err.contains("to 0"), "{err}");
 }

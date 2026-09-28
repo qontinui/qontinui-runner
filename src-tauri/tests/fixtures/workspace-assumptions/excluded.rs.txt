@@ -1,5 +1,5 @@
 // Negative fixture: every pattern below sits somewhere the sweep must NOT look.
-// "http://localhost:8000" "C:\\Users\\x" "/home/someone" "powershell" 9875
+// "http://localhost:8000" "C:\\Users\\x" "/home/someone" "powershell" :9875 merytshost c231d9da
 /* block comment: "qontinui-dev-notes/plans" 0f8fad5b-d9cb-469f-a165-70867728950e */
 /// doc comment: QONTINUI_PLANS_DIR, paths.plans_dir, SUPERVISOR_URL
 fn clean() -> u32 {
@@ -23,7 +23,7 @@ mod tests {
     }
     #[test]
     fn t() {
-        let _ = ("D:/x", "/home/me", 9875, "qontinui-web/backend", "0f8fad5b-d9cb-469f-a165-70867728950e");
+        let _ = ("D:/Projects/x", "/home/me", "localhost:9875", "../qontinui-web/backend", "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a", "merytshost", "eb2155ed-4152-4a91-be82-5d4346f717fc");
     }
 }
 
