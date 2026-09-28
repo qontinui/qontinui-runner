@@ -214,7 +214,8 @@ pub const CODE_WRITE_KILLED: &str = "PLAN_LIBRARY_WRITE_KILLED";
 pub const CODE_DIAL_OFF: &str = "PLAN_LIBRARY_DIAL_OFF";
 
 /// The tenant's `plan_capture` level as the poller currently caches it —
-/// `record` or `off`; `off` until the first successful poll.
+/// `record` or `off`; the domain default `record` until the first successful
+/// poll.
 fn dial_level() -> String {
     crate::mcp::fleet_policy_poller::effective_plan_capture_level()
 }

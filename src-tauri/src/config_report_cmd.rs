@@ -3172,7 +3172,8 @@ mod tests {
             threads_warn_count: None,
             threads_critical_count: None,
             plan_capture_level: capture.to_string(),
-            plan_capture_default: "off",
+            // The domain default is `record` (operator decision 2026-09-24).
+            plan_capture_default: "record",
             plan_capture_record_level: "record",
             briefings,
             caches_expose_refresh_time: false,
@@ -3195,7 +3196,7 @@ mod tests {
 
         let d = dial(
             "off",
-            "record",
+            "off",
             (Some(3_221_225_472), None, None, None),
             vec![
                 BriefingDial {
@@ -3294,8 +3295,9 @@ mod tests {
             "got {value}"
         );
         assert!(
-            value.contains("plan_capture=record (armed at"),
-            "a non-default level must not be annotated as ambiguous: {value}"
+            value.contains("plan_capture=off (armed at"),
+            "a non-default level (an explicit off row) must not be annotated as ambiguous: \
+             {value}"
         );
         assert!(
             source.contains("TIME-VARYING with no restart"),
