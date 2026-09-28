@@ -13,7 +13,19 @@
  *   1. the zone that already shows the tab — focus only;
  *   2. an empty zone — assign there, nothing is displaced;
  *   3. the focused zone — assign there; the displaced tab stays alive and
- *      reappears among the hidden tabs, exactly as a manual reassignment would.
+ *      reappears among the hidden tabs, exactly as a manual reassignment would;
+ *   4. (only when the focused zone is itself reserved) the first zone that
+ *      isn't reserved, occupied or not.
+ *
+ * A zone RESERVED for a session record still being restored (see
+ * `useZoneLayout`'s `reservedZonesRef`) is skipped in steps 2 AND 3 exactly as
+ * `reconcileAssignments`' auto-fill skips it — a reveal click racing the async
+ * restore window must not hand a hidden tab the zone a Claude session record
+ * has already claimed, or the restore lands that session in an unassigned
+ * slot when its reserved zone turns out occupied. Step 3 needs its own check
+ * because the focused zone defaults to 0, the same zone a restoring session
+ * typically reserves first — so the empty-zone search in step 2 finding
+ * nothing free would otherwise fall straight through onto the reservation.
  */
 export interface TabRevealPlan {
   zone: number;
@@ -26,6 +38,7 @@ export function planTabReveal(
   zoneCount: number,
   focusedZone: number,
   tabId: string,
+  reservedZones: ReadonlySet<number> = new Set(),
 ): TabRevealPlan | null {
   if (zoneCount <= 0) return null;
 
@@ -35,9 +48,21 @@ export function planTabReveal(
   }
 
   for (let zone = 0; zone < zoneCount; zone++) {
-    if (!assignments[zone]) return { zone, assign: true };
+    if (!assignments[zone] && !reservedZones.has(zone)) return { zone, assign: true };
   }
 
-  const zone = focusedZone >= 0 && focusedZone < zoneCount ? focusedZone : 0;
-  return { zone, assign: true };
+  const preferred = focusedZone >= 0 && focusedZone < zoneCount ? focusedZone : 0;
+  if (!reservedZones.has(preferred)) return { zone: preferred, assign: true };
+
+  // The focused zone is itself reserved for an in-flight restore — displacing
+  // it would fight that restore instead of the click. Every zone here is
+  // either occupied or reserved (step 2 already ruled out an empty,
+  // unreserved one), so take the first zone that is at least not reserved.
+  for (let zone = 0; zone < zoneCount; zone++) {
+    if (!reservedZones.has(zone)) return { zone, assign: true };
+  }
+
+  // Pathological: every zone in the layout is reserved. Nothing safe to
+  // pick — fall back to the focused zone anyway.
+  return { zone: preferred, assign: true };
 }
