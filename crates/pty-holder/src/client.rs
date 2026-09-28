@@ -44,6 +44,10 @@ pub enum ConnectError {
     Protocol(String),
     /// Connect, write, read or deadline failure.
     Io(io::Error),
+    /// An earlier call on this [`Client`] failed, so the stream's position is
+    /// unknown (a reply may be half-read, a request half-written). Nothing
+    /// more is sent or read on it; the string is the failure that poisoned it.
+    Poisoned(String),
 }
 
 impl std::fmt::Display for ConnectError {
@@ -57,6 +61,10 @@ impl std::fmt::Display for ConnectError {
             }
             ConnectError::Protocol(m) => write!(f, "protocol error: {m}"),
             ConnectError::Io(e) => write!(f, "{e}"),
+            ConnectError::Poisoned(why) => write!(
+                f,
+                "connection poisoned by an earlier failure ({why}); reconnect"
+            ),
         }
     }
 }
@@ -70,10 +78,28 @@ impl From<io::Error> for ConnectError {
 }
 
 /// A connection that completed the handshake.
+///
+/// **Poisoned on the first failure.** A deadline can expire in the middle of
+/// a frame — after some of a request was written or some of a reply read —
+/// and a stream in that state cannot be resynchronized: the next read would
+/// start mid-frame or return the stale reply to the previous request, and the
+/// holder would see a torn frame. So ANY I/O error, protocol error or
+/// `rejected` reply (after which the holder closes) poisons the client, and
+/// every later call returns [`ConnectError::Poisoned`] without touching the
+/// stream. The remedy is a new [`connect`]. A flag rather than consuming
+/// `self` on error keeps `ping`/`census` as plain `&mut self` calls and makes
+/// "this client is dead" a typed, testable answer instead of a moved value.
+///
+/// **Drop clients promptly on EOF or error — before respawning the pane's
+/// holder.** On Windows an open client handle keeps an instance of the pipe
+/// name alive after its holder dies, and a new holder's
+/// `FILE_FLAG_FIRST_PIPE_INSTANCE` bind then fails with `ERROR_ACCESS_DENIED`
+/// exactly as it would for a squatter.
 #[derive(Debug)]
 pub struct Client {
     conn: Conn,
     ack: HelloAck,
+    poisoned: Option<String>,
 }
 
 /// Connect to a pane's holder and complete the handshake by `deadline`,
@@ -127,7 +153,11 @@ pub fn connect_with_versions(
     };
     send(&mut conn, &hello, deadline)?;
     match recv(&mut conn, deadline)? {
-        Reply::HelloAck(ack) => Ok(Client { conn, ack }),
+        Reply::HelloAck(ack) => Ok(Client {
+            conn,
+            ack,
+            poisoned: None,
+        }),
         Reply::NoCommonVersion { holder_versions } => {
             Err(ConnectError::Incompatible { holder_versions })
         }
@@ -138,11 +168,8 @@ pub fn connect_with_versions(
 }
 
 fn send(conn: &mut Conn, req: &Request, deadline: Instant) -> io::Result<()> {
-    write_frame(
-        &mut DeadlineIo::new(conn, deadline),
-        KIND_CONTROL,
-        &to_payload(req),
-    )
+    let payload = to_payload(req).map_err(io::Error::other)?;
+    write_frame(&mut DeadlineIo::new(conn, deadline), KIND_CONTROL, &payload)
 }
 
 fn recv(conn: &mut Conn, deadline: Instant) -> Result<Reply, ConnectError> {
@@ -167,19 +194,51 @@ impl Client {
         &self.ack
     }
 
+    /// Why this client refuses further calls, if it does.
+    pub fn poisoned(&self) -> Option<&str> {
+        self.poisoned.as_deref()
+    }
+
+    fn check(&self) -> Result<(), ConnectError> {
+        match &self.poisoned {
+            Some(why) => Err(ConnectError::Poisoned(why.clone())),
+            None => Ok(()),
+        }
+    }
+
+    /// Record `result`'s failure, if any, as the poison.
+    fn poison_on_err<T>(&mut self, result: Result<T, ConnectError>) -> Result<T, ConnectError> {
+        if let Err(e) = &result {
+            self.poisoned = Some(e.to_string());
+        }
+        result
+    }
+
     /// Send one request and read one reply by `deadline`.
+    ///
+    /// Poisons the client on any failure, and on a `rejected` reply (the
+    /// holder closes the connection after one), which is still returned.
     pub fn request(&mut self, req: &Request, deadline: Instant) -> Result<Reply, ConnectError> {
-        send(&mut self.conn, req, deadline)?;
-        recv(&mut self.conn, deadline)
+        self.check()?;
+        let result = send(&mut self.conn, req, deadline)
+            .map_err(ConnectError::from)
+            .and_then(|()| recv(&mut self.conn, deadline));
+        let result = self.poison_on_err(result);
+        if let Ok(Reply::Rejected { reason, detail }) = &result {
+            self.poisoned = Some(format!(
+                "holder rejected the request ({reason:?}: {detail})"
+            ));
+        }
+        result
     }
 
     /// `ping` → `pong`.
     pub fn ping(&mut self, deadline: Instant) -> Result<(), ConnectError> {
         match self.request(&Request::Ping, deadline)? {
             Reply::Pong => Ok(()),
-            other => Err(ConnectError::Protocol(format!(
+            other => self.poison_on_err(Err(ConnectError::Protocol(format!(
                 "expected pong, got {other:?}"
-            ))),
+            )))),
         }
     }
 
@@ -187,30 +246,36 @@ impl Client {
     pub fn census(&mut self, deadline: Instant) -> Result<CensusReply, ConnectError> {
         match self.request(&Request::Census, deadline)? {
             Reply::CensusReply(c) => Ok(c),
-            other => Err(ConnectError::Protocol(format!(
+            other => self.poison_on_err(Err(ConnectError::Protocol(format!(
                 "expected census_reply, got {other:?}"
-            ))),
+            )))),
         }
     }
 
     /// Send a raw frame. For tests of the holder's refusal paths; a runner
-    /// sends typed requests.
+    /// sends typed requests. Poisons on failure, like [`Client::request`].
     pub fn send_raw_frame(
         &mut self,
         kind: u8,
         payload: &[u8],
         deadline: Instant,
-    ) -> io::Result<()> {
-        write_frame(
+    ) -> Result<(), ConnectError> {
+        self.check()?;
+        let r = write_frame(
             &mut DeadlineIo::new(&mut self.conn, deadline),
             kind,
             payload,
         )
+        .map_err(ConnectError::from);
+        self.poison_on_err(r)
     }
 
-    /// Read one raw frame, or `None` at a clean EOF.
-    pub fn recv_raw_frame(&mut self, deadline: Instant) -> io::Result<Option<Frame>> {
-        read_frame(&mut DeadlineIo::new(&mut self.conn, deadline))
+    /// Read one raw frame, or `None` at a clean EOF. Poisons on failure.
+    pub fn recv_raw_frame(&mut self, deadline: Instant) -> Result<Option<Frame>, ConnectError> {
+        self.check()?;
+        let r =
+            read_frame(&mut DeadlineIo::new(&mut self.conn, deadline)).map_err(ConnectError::from);
+        self.poison_on_err(r)
     }
 }
 

@@ -167,10 +167,12 @@ pub enum Reply {
 }
 
 /// Serialize a message to its control-frame payload.
-pub fn to_payload<T: Serialize>(msg: &T) -> Vec<u8> {
-    // Serializing these plain structs cannot fail: no maps with non-string
-    // keys, no custom serializers.
-    serde_json::to_vec(msg).expect("control messages always serialize")
+///
+/// FALLIBLE, and callers must handle it: [`RejectReason::Unknown`] is
+/// deserialize-only (`skip_serializing`), so a `Reply::Rejected` carrying it
+/// fails to serialize. Every other message is plain data and serializes.
+pub fn to_payload<T: Serialize>(msg: &T) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(msg)
 }
 
 /// Parse a request, telling an unknown verb apart from a malformed one.
@@ -208,7 +210,7 @@ mod tests {
     use crate::frame::{encode_frame, KIND_CONTROL};
 
     fn frame_of<T: Serialize>(msg: &T) -> Vec<u8> {
-        encode_frame(KIND_CONTROL, &to_payload(msg)).unwrap()
+        encode_frame(KIND_CONTROL, &to_payload(msg).unwrap()).unwrap()
     }
 
     /// Prefix + kind + the exact JSON text.
@@ -330,8 +332,14 @@ mod tests {
                 detail: "d".into(),
             }
         );
-        // …and Unknown is never put on the wire.
+        // …and Unknown is never put on the wire: to_payload reports it as an
+        // error instead of panicking.
         assert!(serde_json::to_string(&RejectReason::Unknown).is_err());
+        assert!(to_payload(&Reply::Rejected {
+            reason: RejectReason::Unknown,
+            detail: "d".into(),
+        })
+        .is_err());
     }
 
     /// A newer holder may add fields to the envelope replies; an older runner
@@ -391,7 +399,7 @@ mod tests {
                 other => panic!("REQUEST_VERBS has {other:?} with no Request variant"),
             };
             assert_eq!(req.verb(), *verb);
-            assert_eq!(parse_request(&to_payload(&req)).unwrap(), req);
+            assert_eq!(parse_request(&to_payload(&req).unwrap()).unwrap(), req);
         }
     }
 }

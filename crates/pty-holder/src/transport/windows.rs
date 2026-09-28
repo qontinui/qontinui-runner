@@ -155,8 +155,13 @@ impl Conn {
             // so `ov` is not freed while the kernel still references it.
             unsafe { CancelIoEx(self.handle.0, &ov) };
             // SAFETY: as above; bWait = TRUE.
-            if unsafe { GetOverlappedResult(self.handle.0, &ov, &mut n, 1) } != 0 {
-                // It completed before the cancel landed: keep the bytes.
+            let completed = unsafe { GetOverlappedResult(self.handle.0, &ov, &mut n, 1) } != 0;
+            // Completed before the cancel landed, OR aborted
+            // (ERROR_OPERATION_ABORTED) after moving some bytes: either way
+            // those bytes were transferred and must be reported, or the
+            // stream position the caller tracks is wrong. Only a transfer of
+            // zero bytes is a timeout.
+            if completed || n > 0 {
                 return Ok(n as usize);
             }
             return Err(io::Error::new(
@@ -165,13 +170,16 @@ impl Conn {
             ));
         }
         if waited != WAIT_OBJECT_0 {
-            // Not signaled and not timed out: still make sure the I/O is gone.
+            // WAIT_FAILED: capture its error BEFORE the cleanup calls below
+            // overwrite the thread's last-error value.
+            let err = io::Error::last_os_error();
+            // Still make sure the I/O is gone before `ov` leaves scope.
             // SAFETY: as above.
             unsafe {
                 CancelIoEx(self.handle.0, &ov);
                 GetOverlappedResult(self.handle.0, &ov, &mut n, 1);
             }
-            return Err(io::Error::last_os_error());
+            return Err(err);
         }
         // SAFETY: the operation has completed; bWait = FALSE.
         if unsafe { GetOverlappedResult(self.handle.0, &ov, &mut n, 0) } == 0 {
@@ -313,13 +321,30 @@ fn owner_only_descriptor() -> io::Result<SecurityDescriptor> {
 /// than dropping it.
 ///
 /// If the invariant were ever broken (`pending` empty), the name is
-/// re-created as a FIRST instance, and `ERROR_ACCESS_DENIED` there means the
-/// name was squatted in the gap: a [`super::FatalAcceptError`].
+/// re-created as a FIRST instance, and `ERROR_ACCESS_DENIED` there means an
+/// instance of the name still exists that is not ours to serve: a
+/// [`super::FatalAcceptError`].
 pub struct Listener {
     name: Vec<u16>,
     sd: SecurityDescriptor,
-    pending: std::sync::Mutex<Option<Handle>>,
+    state: std::sync::Mutex<AcceptState>,
 }
+
+/// What `accept` carries between calls.
+struct AcceptState {
+    /// The listening instance (the type invariant: `Some` from `bind` on).
+    pending: Option<Handle>,
+    /// Consecutive accepts in which the pending instance could neither be
+    /// reset (`DisconnectNamedPipe`) nor replaced. Past
+    /// [`MAX_STUCK_INSTANCE_RETRIES`] the instance is declared broken.
+    stuck: u32,
+}
+
+/// How many consecutive "cannot reset, cannot replace" accepts are retried
+/// (with the server's backoff, up to ~30 s) before the listener gives up with
+/// a [`super::FatalAcceptError`] rather than retrying one broken instance
+/// forever.
+pub const MAX_STUCK_INSTANCE_RETRIES: u32 = 30;
 
 impl std::fmt::Debug for Listener {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -334,20 +359,33 @@ impl Listener {
         let listener = Listener {
             name: wide(name),
             sd: owner_only_descriptor()?,
-            pending: std::sync::Mutex::new(None),
+            state: std::sync::Mutex::new(AcceptState {
+                pending: None,
+                stuck: 0,
+            }),
         };
         let first = listener.create_first_instance()?;
-        *listener.pending.lock().unwrap_or_else(|p| p.into_inner()) = Some(first);
+        listener
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pending = Some(first);
         Ok(listener)
     }
 
-    /// A first instance; `ERROR_ACCESS_DENIED` means someone else already
-    /// holds the name, which is fatal.
+    /// A first instance; `ERROR_ACCESS_DENIED` means an instance of the name
+    /// already exists, which is fatal.
+    ///
+    /// That is not only a squatter: an open CLIENT handle to a previous holder
+    /// of this pane keeps that holder's instance alive after it died, so a
+    /// runner that still holds an idle `Client` produces the same error. The
+    /// runner must drop its clients before respawning a pane's holder.
     fn create_first_instance(&self) -> io::Result<Handle> {
         self.create_instance(true).map_err(|e| {
             if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
                 io::Error::other(super::FatalAcceptError(format!(
-                    "pipe name is held by another process (squatted): {e}"
+                    "an instance of this pipe name still exists (a squatter, or a \
+                     stale client handle to a previous holder): {e}"
                 )))
             } else {
                 e
@@ -418,8 +456,8 @@ impl Listener {
     /// Wait for a client, then hand its instance out — but only after a
     /// replacement instance exists (see the type's invariant).
     pub fn accept(&self) -> io::Result<Conn> {
-        let mut slot = self.pending.lock().unwrap_or_else(|p| p.into_inner());
-        let h = match slot.take() {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let h = match st.pending.take() {
             Some(h) => h,
             // Unreachable while the invariant holds; if it was broken, the
             // name may have zero instances, so only a FIRST instance is safe.
@@ -428,8 +466,9 @@ impl Listener {
         match Self::connect_instance(&h) {
             Ok(()) => match self.create_instance(false) {
                 Ok(next) => {
-                    *slot = Some(next);
-                    drop(slot);
+                    st.pending = Some(next);
+                    st.stuck = 0;
+                    drop(st);
                     Conn::from_handle(h)
                 }
                 Err(e) => {
@@ -438,7 +477,7 @@ impl Listener {
                     // hangs up. Drop the client, keep the instance.
                     // SAFETY: valid pipe handle.
                     unsafe { DisconnectNamedPipe(h.0) };
-                    *slot = Some(h);
+                    st.pending = Some(h);
                     Err(e)
                 }
             },
@@ -448,17 +487,35 @@ impl Listener {
                 // reset, replace it BEFORE dropping it.
                 // SAFETY: valid pipe handle.
                 if unsafe { DisconnectNamedPipe(h.0) } != 0 {
-                    *slot = Some(h);
-                } else {
-                    match self.create_instance(false) {
-                        Ok(next) => {
-                            *slot = Some(next);
-                            drop(h);
+                    st.pending = Some(h);
+                    st.stuck = 0;
+                    return Err(e);
+                }
+                let disconnect_err = io::Error::last_os_error();
+                match self.create_instance(false) {
+                    Ok(next) => {
+                        st.pending = Some(next);
+                        st.stuck = 0;
+                        drop(h);
+                        Err(e)
+                    }
+                    Err(create_err) => {
+                        // Neither reset nor replaced: keep the (possibly
+                        // broken) instance so the name stays ours, but do not
+                        // retry it forever.
+                        st.pending = Some(h);
+                        st.stuck += 1;
+                        if st.stuck >= MAX_STUCK_INSTANCE_RETRIES {
+                            return Err(io::Error::other(super::FatalAcceptError(format!(
+                                "pipe instance unusable after {} consecutive attempts: \
+                                 connect failed ({e}), DisconnectNamedPipe failed \
+                                 ({disconnect_err}), CreateNamedPipeW failed ({create_err})",
+                                st.stuck
+                            ))));
                         }
-                        Err(_) => *slot = Some(h),
+                        Err(e)
                     }
                 }
-                Err(e)
             }
         }
     }
