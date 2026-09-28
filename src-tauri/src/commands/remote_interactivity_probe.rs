@@ -366,17 +366,20 @@ pub(crate) fn skip_reason(
     None
 }
 
-/// Slack taken off the re-probe window. A sweep records its attempts (and
-/// coord its facts) some seconds AFTER the scheduler tick that started it, so
-/// a window of exactly [`PROBE_EVERY`] would make the next tick see every row
-/// as probed "PROBE_EVERY minus a few seconds" ago and skip it — probing each
-/// row only every OTHER period, past the freshness window.
+/// Slack taken off the re-probe window. Attempts are stamped with the SWEEP's
+/// start (see [`run_probe_sweep`]), so time spent inside a sweep cannot push a
+/// row past the next tick; the slack covers what stamping cannot — scheduler
+/// jitter, and coord's facts, which carry the time they were FILED (mid-sweep).
+/// Without it a row looked at a little after one tick would still be "recent"
+/// at the next and be probed only every OTHER period, past freshness.
 const REPROBE_SLACK: Duration = Duration::from_secs(120);
 
 /// How long after a probe a row is not probed again, in seconds:
-/// `min(PROBE_EVERY, freshFor) - REPROBE_SLACK`.
+/// `w - min(REPROBE_SLACK, w / 2)` with `w = min(PROBE_EVERY, freshFor)` — so a
+/// short freshness window keeps half of itself instead of collapsing to 0.
 fn reprobe_window_secs(fresh_for_secs: i64) -> i64 {
-    ((PROBE_EVERY.as_secs() as i64).min(fresh_for_secs) - REPROBE_SLACK.as_secs() as i64).max(0)
+    let w = (PROBE_EVERY.as_secs() as i64).min(fresh_for_secs).max(0);
+    w - (REPROBE_SLACK.as_secs() as i64).min(w / 2)
 }
 
 /// In-process memory of when each session was last PROBED, whatever came of
@@ -426,6 +429,15 @@ impl ProbeAttempts {
     #[cfg(test)]
     fn len(&self) -> usize {
         self.last.lock().unwrap().len()
+    }
+
+    #[cfg(test)]
+    fn get(&self, session_id: &str) -> Option<std::time::Instant> {
+        self.last
+            .lock()
+            .unwrap()
+            .get(&session_id.trim().to_ascii_lowercase())
+            .copied()
     }
 }
 
@@ -566,6 +578,12 @@ pub(crate) async fn run_probe_sweep(
                 .to_string(),
         });
     }
+    // ONE clock reading for the whole sweep: every skip decision (coord facts
+    // and the attempt memory) is taken against the sweep's start, and every
+    // attempt is stamped with it — so a slow row ahead of another cannot make
+    // the later row look probed later than the sweep that probed it.
+    let started = std::time::Instant::now();
+    let started_utc = Utc::now();
     let (flags, rows) = read_fleet(doors, device_id).await?;
     let mut outcomes = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -585,13 +603,16 @@ pub(crate) async fn run_probe_sweep(
             });
             continue;
         }
-        let reason = skip_reason(row, flags.fresh_for_secs, Utc::now())
+        let reason = skip_reason(row, flags.fresh_for_secs, started_utc)
             .or_else(|| doors.live_tab_here(&session_id).then_some("live_tab_here"))
             .or_else(|| {
-                doors
-                    .attempts()
-                    .recently(&session_id, flags.fresh_for_secs, std::time::Instant::now())
-                    .then_some("recently_attempted")
+                // A MANUAL sweep is someone asking now: it is not held back by
+                // the attempt memory (the per-device throttle still applies).
+                (trigger != "manual"
+                    && doors
+                        .attempts()
+                        .recently(&session_id, flags.fresh_for_secs, started))
+                .then_some("recently_attempted")
             });
         if let Some(reason) = reason {
             outcomes.push(RowOutcome {
@@ -602,12 +623,7 @@ pub(crate) async fn run_probe_sweep(
             });
             continue;
         }
-        // Recorded BEFORE the probe, so a row whose probe is cancelled
-        // mid-way is not immediately re-probed either.
-        doors
-            .attempts()
-            .note(&session_id, std::time::Instant::now());
-        outcomes.push(probe_row(doors, device_id, &session_id).await);
+        outcomes.push(probe_row(doors, device_id, &session_id, started).await);
     }
     Ok(ProbeSweepReport {
         device_id: device_id.to_string(),
@@ -648,7 +664,12 @@ fn refusal_half(
     }
 }
 
-async fn probe_row(doors: &dyn ProbeDoors, device_id: &str, session_id: &str) -> RowOutcome {
+async fn probe_row(
+    doors: &dyn ProbeDoors,
+    device_id: &str,
+    session_id: &str,
+    sweep_started: std::time::Instant,
+) -> RowOutcome {
     let mut out = RowOutcome {
         session_id: session_id.to_string(),
         decision: "probed".into(),
@@ -682,6 +703,10 @@ async fn probe_row(doors: &dyn ProbeDoors, device_id: &str, session_id: &str) ->
         }
     };
     out.grant_jti = Some(minted.grant_jti.clone());
+    // Noted only once a grant exists — a local or coord fault at the mint must
+    // not hold the row back — and before anything else can fail or be
+    // cancelled, stamped with the sweep's start.
+    doors.attempts().note(session_id, sweep_started);
     // From the mint until the pane guard takes over: a DROPPED sweep future
     // (cancelled mid-attach) must not leave the grant's pending-output slot,
     // or a half-registered route, behind.
@@ -1384,6 +1409,10 @@ mod tests {
         read_probe_hangs: bool,
         /// The attach never answers (to cancel a sweep mid-attach).
         attach_hangs: bool,
+        /// Sessions whose mint takes this long (a slow row).
+        mint_delay: Option<(String, Duration)>,
+        /// Sessions whose mint fails.
+        mint_fails: Option<String>,
         attempts: ProbeAttempts,
     }
 
@@ -1437,6 +1466,8 @@ mod tests {
                 relay_up: true,
                 read_probe_hangs: false,
                 attach_hangs: false,
+                mint_delay: None,
+                mint_fails: None,
                 attempts: ProbeAttempts::default(),
             }
         }
@@ -1517,6 +1548,14 @@ mod tests {
         }
 
         async fn mint(&self, session_id: Uuid) -> Result<AttachGrantResponse, String> {
+            if let Some((s, d)) = &self.mint_delay {
+                if *s == session_id.to_string() {
+                    tokio::time::sleep(*d).await;
+                }
+            }
+            if self.mint_fails.as_deref() == Some(session_id.to_string().as_str()) {
+                return Err("remote_attach:coord_unreachable: POST …: connection refused".into());
+            }
             let mut n = self.minted.lock().unwrap();
             *n += 1;
             Ok(AttachGrantResponse {
@@ -1801,6 +1840,65 @@ mod tests {
             Some("recently_attempted")
         );
         assert_eq!(*target.minted.lock().unwrap(), 1, "no second grant");
+    }
+
+    /// Attempts are stamped with the SWEEP's start: a slow row ahead of the
+    /// row under test does not push that row's stamp later, so the next tick
+    /// (PROBE_EVERY after this sweep started) finds it due.
+    #[tokio::test]
+    async fn attempts_are_stamped_with_the_sweep_start() {
+        let mut target = RecorderTarget::new(vec![row(1, json!({})), row(2, json!({}))]);
+        target.mint_delay = Some((sid(1), Duration::from_millis(400)));
+        let before = std::time::Instant::now();
+        run_probe_sweep(&target, DEVICE, "scheduler").await.unwrap();
+        let after = std::time::Instant::now();
+        assert!(after.duration_since(before) >= Duration::from_millis(400));
+        let stamped = target.attempts.get(&sid(2)).expect("row 2 was attempted");
+        assert!(
+            stamped.duration_since(before) < Duration::from_millis(100),
+            "row 2 stamped {:?} after the sweep began — not the sweep start",
+            stamped.duration_since(before)
+        );
+        // The next tick, PROBE_EVERY after this sweep started, finds it due.
+        assert!(!target
+            .attempts
+            .recently(&sid(2), 1800, before + PROBE_EVERY));
+    }
+
+    /// A failed mint notes nothing; a manual sweep ignores the attempt memory.
+    #[tokio::test]
+    async fn a_failed_mint_is_not_noted_and_manual_ignores_the_memory() {
+        let mut target = RecorderTarget::new(vec![row(1, json!({})), row(2, json!({}))]);
+        target.mint_fails = Some(sid(1));
+        target.refuse_attach(&sid(2), "attach_terminal_busy");
+        run_probe_sweep(&target, DEVICE, "scheduler").await.unwrap();
+        assert!(
+            target.attempts.get(&sid(1)).is_none(),
+            "mint fault not noted"
+        );
+        assert!(target.attempts.get(&sid(2)).is_some());
+        let again = run_probe_sweep(&target, DEVICE, "scheduler").await.unwrap();
+        assert_eq!(
+            again.outcomes[0].decision, "probed",
+            "mint fault is retried"
+        );
+        assert_eq!(
+            again.outcomes[1].skip_reason.as_deref(),
+            Some("recently_attempted")
+        );
+        let manual = run_probe_sweep(&target, DEVICE, "manual").await.unwrap();
+        assert_eq!(
+            manual.outcomes[1].decision, "probed",
+            "manual is not held back"
+        );
+    }
+
+    #[test]
+    fn a_short_fresh_window_keeps_half_of_itself() {
+        assert_eq!(reprobe_window_secs(60), 30);
+        assert_eq!(reprobe_window_secs(200), 100);
+        assert_eq!(reprobe_window_secs(1800), 1200 - 120);
+        assert_eq!(reprobe_window_secs(0), 0);
     }
 
     /// The attempt memory is bounded and honours the slack.
