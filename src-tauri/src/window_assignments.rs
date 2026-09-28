@@ -70,6 +70,30 @@ pub struct WindowGeometry {
     pub maximized: bool,
 }
 
+/// Windows reports a minimized ("iconic") window's `outer_position()` as
+/// `(-32000, -32000)`. Persisting it — with the `0×0` size that comes with it —
+/// and applying it on the next boot produced a real, taskbar-visible pop-out
+/// parked off-screen at zero size (plan
+/// `2026-09-28-runner-popout-window-geometry-poisoning-and-webview-recovery-wedge`).
+const WINDOWS_ICONIC_SENTINEL: i32 = -32000;
+
+impl WindowGeometry {
+    /// Whether this geometry can be applied to a window and yield something
+    /// visible: a non-zero size, and not parked at the Windows iconic sentinel.
+    ///
+    /// The ONE validity rule, enforced on both sides — capture refuses to
+    /// persist and restore refuses to apply anything it rejects — so writer and
+    /// reader cannot drift. Negative coordinates on their own are legitimate (a
+    /// monitor left of or above the primary, e.g. `x = -1920`), so only the
+    /// sentinel corner is refused. `maximized` geometry is held to the same
+    /// rule: restore still positions the window before maximizing it, so the
+    /// monitor it lands on comes from `x`/`y`.
+    pub fn is_restorable(&self) -> bool {
+        let iconic = self.x <= WINDOWS_ICONIC_SENTINEL && self.y <= WINDOWS_ICONIC_SENTINEL;
+        self.w > 0 && self.h > 0 && !iconic
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowRecord {
     pub label: WindowLabel,
@@ -594,6 +618,33 @@ impl WindowAssignments {
         true
     }
 
+    /// Forget a window's persisted geometry, so it is restored at the builder's
+    /// default size with OS placement. Used when restore rejects a record that
+    /// fails [`WindowGeometry::is_restorable`]: `update_geometry` refuses
+    /// nothing, so without this a poisoned record would survive until the
+    /// window next moved. Persists only when a geometry was actually present;
+    /// returns `true` when it wrote. Unknown labels are ignored.
+    pub fn clear_geometry(&self, label: &str) -> bool {
+        let snapshot = {
+            let mut s = match self.inner.lock() {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "window_assignments: lock poisoned on clear_geometry");
+                    return false;
+                }
+            };
+            match s.windows.get_mut(label) {
+                Some(rec) if rec.geometry.is_some() => {
+                    rec.geometry = None;
+                }
+                _ => return false, // unknown window, or no geometry to clear
+            }
+            s.clone()
+        };
+        self.persist(&snapshot);
+        true
+    }
+
     /// Drop `session_owner` entries whose target window no longer exists in the
     /// registry (e.g. a hand-edited or partially-written state file), reverting
     /// those sessions to the default `"main"`. Run once on boot, after the
@@ -970,6 +1021,59 @@ mod tests {
         let records = wa.pop_out_records();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].geometry.as_ref(), Some(&g2));
+    }
+
+    fn geom(x: i32, y: i32, w: u32, h: u32, maximized: bool) -> WindowGeometry {
+        WindowGeometry {
+            x,
+            y,
+            w,
+            h,
+            maximized,
+        }
+    }
+
+    #[test]
+    fn is_restorable_rejects_degenerate_and_iconic_geometry() {
+        // The exact record found poisoned on the operator's box.
+        assert!(!geom(-32000, -32000, 0, 0, false).is_restorable());
+        // The sentinel alone is enough, even with a plausible size.
+        assert!(!geom(-32000, -32000, 800, 600, false).is_restorable());
+        assert!(!geom(100, 100, 0, 0, false).is_restorable());
+        assert!(!geom(100, 100, 0, 600, false).is_restorable());
+        assert!(!geom(100, 100, 800, 0, false).is_restorable());
+    }
+
+    #[test]
+    fn is_restorable_accepts_normal_maximized_and_negative_but_sane_geometry() {
+        assert!(geom(100, 200, 800, 600, false).is_restorable());
+        assert!(geom(0, 0, 1920, 1040, true).is_restorable());
+        // A monitor left of (or above) the primary is legitimately negative.
+        assert!(geom(-1920, 0, 1000, 720, false).is_restorable());
+        assert!(geom(-1920, -1080, 1000, 720, false).is_restorable());
+        // Only BOTH axes at the sentinel is iconic.
+        assert!(geom(-32000, 0, 1000, 720, false).is_restorable());
+    }
+
+    #[test]
+    fn clear_geometry_persists_only_when_a_geometry_was_present() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("window-assignments.json");
+        let wa = WindowAssignments::open(&path).unwrap();
+        wa.ensure_main(1);
+        let w = create_window(&wa, None, Some(geom(-32000, -32000, 0, 0, false)), None, 10);
+        // First clear writes.
+        assert!(wa.clear_geometry(&w.label));
+        // Nothing left to clear: a no-op, no disk churn.
+        assert!(!wa.clear_geometry(&w.label));
+        // Unknown window is ignored.
+        assert!(!wa.clear_geometry("term-999"));
+        // The cleared state is what was persisted — it survives a reopen.
+        drop(wa);
+        let reopened = WindowAssignments::open(&path).unwrap();
+        let records = reopened.pop_out_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].geometry, None);
     }
 
     #[test]
