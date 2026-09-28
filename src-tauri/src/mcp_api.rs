@@ -13286,7 +13286,9 @@ mod transport_rung_counter_tests {
     #[test]
     fn write_forwarder_upstream_leg_cannot_carry_declaration_headers() {
         let code = fn_body("async fn forward_coord_write(");
-        let sig_end = code.find(") -> axum::response::Response").expect("signature ends");
+        let sig_end = code
+            .find(") -> axum::response::Response")
+            .expect("signature ends");
         assert!(
             !code[..sig_end].contains("HeaderMap"),
             "forward_coord_write must not take the caller's request headers"
