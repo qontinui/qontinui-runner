@@ -332,9 +332,10 @@ pub const LAYER_SPECS: &[LayerSpec] = &[
         name: "api_endpoint_registry",
         title: "Endpoint registry — qontinui-web backend base URL",
         describes: "the single source of truth for the web-backend base across \
-                    every runner subsystem, resolved over a documented four-rung \
+                    every runner subsystem, resolved over a documented five-rung \
                     order (env `QONTINUI_WEB_BACKEND_URL`, env `QONTINUI_API_URL`, \
-                    the persisted paired backend, the build default)",
+                    the active profile's `api_url` in profiles.json, the persisted \
+                    paired backend, the build default)",
         anchor: "api_config::resolve_api_base_url",
         side: LayerSide::Bin,
         status: LayerStatus::Resolved,
@@ -648,7 +649,7 @@ pub struct ConfigReportInputs {
     /// module.
     pub config_dir: Option<LayerReading>,
     /// Layer 5 (`api_endpoint_registry`): the effective qontinui-web backend
-    /// base URL plus which of the four documented rungs won. Resolved in the
+    /// base URL plus which of the five documented rungs won. Resolved in the
     /// bin by `config_report_cmd::api_base_url_reading`, because
     /// `api_config` is a bin-only module.
     pub api_endpoint_registry: Option<LayerReading>,

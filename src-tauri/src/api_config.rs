@@ -93,11 +93,23 @@ pub fn derive_web_base_url(backend_url: &str) -> String {
 /// Resolution order:
 /// 1. `env_web` (`QONTINUI_WEB_BACKEND_URL`) — operator/test explicit override
 /// 2. `env_api` (`QONTINUI_API_URL`) — legacy explicit override
-/// 3. `persisted` — the paired backend the user signed into (the one that can
+/// 3. `profile_api_url` — the active profile's `api_url` in
+///    `~/.qontinui/profiles.json`: the per-machine choice. It outranks the
+///    settings file because `settings.json` is a whole-document struct
+///    rewritten on every save, so a value in it cannot be told from a default
+///    the build wrote back. Like the env rungs it is a deliberate act and is
+///    NOT subject to the release loopback refusal below (a release machine
+///    that tests qontinui-web locally says so in its profile); the persisted
+///    refusal exists because a settings file can be copied or inherited
+///    unnoticed, which a profile edit is not.
+/// 4. `persisted` — the paired backend the user signed into (the one that can
 ///    verify this device's JWT). NEW: closes the prod/local device-JWT split
 ///    where a debug relay verified against local while pairing minted against
 ///    prod. See `plans/2026-07-08-runner-relay-honor-persisted-backend-url.md`.
-/// 4. build default: debug `http://127.0.0.1:8000` (IPv4 — the backend only
+///    [`api_base_url_inputs_from`] drops a value byte-equal to the build
+///    default, so a debug build's own default written back by a settings save
+///    is attributed to rung 5, not reported as configured.
+/// 5. build default: debug `http://127.0.0.1:8000` (IPv4 — the backend only
 ///    binds IPv4; `localhost` may resolve to IPv6 `::1` first) / release
 ///    `PROD_API_BASE_URL`.
 ///
@@ -113,7 +125,7 @@ pub fn derive_web_base_url(backend_url: &str) -> String {
 /// in a SECOND function walking the same rungs; that second copy of the
 /// precedence rule is exactly the divergence hazard the plan names as its
 /// dominant correctness risk, so Phase 2 folded it back in here. There is now
-/// ONE traversal of the four rungs, and it emits the value and the arm together
+/// ONE traversal of the five rungs, and it emits the value and the arm together
 /// — they can no longer disagree by construction, because nothing computes them
 /// separately.
 ///
@@ -144,16 +156,12 @@ pub fn derive_web_base_url(backend_url: &str) -> String {
 /// DEBUG builds are untouched — local dev must keep resolving to
 /// `http://127.0.0.1:8000`, whether that comes from the persisted rung or the
 /// build default.
-pub(crate) fn resolve_api_base_url(
-    env_web: Option<String>,
-    env_api: Option<String>,
-    persisted: Option<String>,
-    is_debug: bool,
-) -> (String, ApiBaseUrlArm) {
+pub(crate) fn resolve_api_base_url(inputs: &ApiBaseUrlInputs) -> (String, ApiBaseUrlArm) {
+    let is_debug = inputs.is_debug;
     // Blank/whitespace at any rung is "unset", not "configured to empty" — an
     // exported-but-empty env var is how a shell communicates absence.
-    let usable = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
-    let persisted = usable(persisted);
+    let usable = |v: &Option<String>| v.clone().filter(|s| !s.trim().is_empty());
+    let persisted = usable(&inputs.persisted);
     // RELEASE builds refuse a LOOPBACK persisted `backend_url`. See the
     // "Why a release build refuses a loopback persisted value" section above.
     // Only the persisted rung is filtered: the two env rungs are an operator
@@ -168,9 +176,10 @@ pub(crate) fn resolve_api_base_url(
     } else {
         persisted
     };
-    let (pick, arm) = usable(env_web)
+    let (pick, arm) = usable(&inputs.env_web)
         .map(|v| (v, ApiBaseUrlArm::EnvWebBackendUrl))
-        .or_else(|| usable(env_api).map(|v| (v, ApiBaseUrlArm::EnvApiUrl)))
+        .or_else(|| usable(&inputs.env_api).map(|v| (v, ApiBaseUrlArm::EnvApiUrl)))
+        .or_else(|| usable(&inputs.profile_api_url).map(|v| (v, ApiBaseUrlArm::ProfileApiUrl)))
         .or_else(|| persisted.map(|v| (v, ApiBaseUrlArm::PersistedBackendUrl)))
         .unwrap_or_else(|| {
             if is_debug {
@@ -411,9 +420,9 @@ pub fn get_api_base_url() -> String {
     url
 }
 
-/// [`get_api_base_url`] plus WHICH of the four documented rungs produced it.
+/// [`get_api_base_url`] plus WHICH of the five documented rungs produced it.
 ///
-/// This is the live-I/O door: it gathers the four inputs from this process and
+/// This is the live-I/O door: it gathers the inputs from this process and
 /// hands them to [`resolve_api_base_url`], so a caller asking "where did the
 /// backend URL come from?" is answered by the same traversal that produced the
 /// URL every other subsystem is using. No consumer — the config report
@@ -424,22 +433,17 @@ pub(crate) fn get_api_base_url_with_source() -> (String, ApiBaseUrlArm) {
     // value, and a warning that could not name what it rejected would be as
     // unactionable as the silence it replaces.
     let persisted = inputs.persisted.clone();
-    let (url, arm) = resolve_api_base_url(
-        inputs.env_web,
-        inputs.env_api,
-        inputs.persisted,
-        inputs.is_debug,
-    );
+    let (url, arm) = resolve_api_base_url(&inputs);
     if arm == ApiBaseUrlArm::BuildDefaultReleaseLoopbackRejected {
         warn_persisted_loopback_rejected(persisted.as_deref().unwrap_or("<unset>"), &url);
     }
     (url, arm)
 }
 
-/// The four inputs [`resolve_api_base_url`] weighs, gathered from the live
+/// The inputs [`resolve_api_base_url`] weighs, gathered from the live
 /// process in one place.
 ///
-/// Extracted so that "what are the four inputs, and where does each come from?"
+/// Extracted so that "what are the inputs, and where does each come from?"
 /// is answered exactly ONCE. [`get_api_base_url`] and the config report both
 /// consume this, so the report can never be looking at a different set of
 /// inputs than the value every other subsystem actually resolves.
@@ -449,15 +453,20 @@ pub(crate) struct ApiBaseUrlInputs {
     pub env_web: Option<String>,
     /// `QONTINUI_API_URL` — legacy explicit override.
     pub env_api: Option<String>,
+    /// The active profile's `api_url` (`~/.qontinui/profiles.json`), the
+    /// per-machine rung between the env vars and the persisted value.
+    pub profile_api_url: Option<String>,
     /// The persisted paired backend, present only when web-integration is
     /// ENABLED (a disabled integration means "don't reach web", so its stored
-    /// URL must not override the build default).
+    /// URL must not override the build default). A value byte-equal to the
+    /// build default is dropped by [`api_base_url_inputs_from`]: the URL is the
+    /// same either way, only the attribution differs.
     pub persisted: Option<String>,
     /// Whether this is a debug build (selects which build default applies).
     pub is_debug: bool,
 }
 
-/// Read the four inputs from env + settings. The only I/O in the resolution.
+/// Read the inputs from env + profile + settings. The only I/O in the resolution.
 ///
 /// **This is not a read.** `load_settings()` is `load_settings_full()`, which
 /// runs `claude_accounts::load_with_migration()` (writing
@@ -472,7 +481,10 @@ pub(crate) fn gather_api_base_url_inputs() -> ApiBaseUrlInputs {
 }
 
 /// [`gather_api_base_url_inputs`] over a `Settings` the caller already holds —
-/// the READ-ONLY twin, whose only I/O is two `std::env::var` calls.
+/// the READ-ONLY twin, whose only I/O is two `std::env::var` calls and a pure
+/// read of `~/.qontinui/profiles.json`
+/// ([`qontinui_runner_lib::profiles::api_url_with_source`], which writes and
+/// warns about nothing).
 ///
 /// # Why this exists
 ///
@@ -501,18 +513,26 @@ pub(crate) fn gather_api_base_url_inputs() -> ApiBaseUrlInputs {
 /// overlay; that would be the second-copy defect this module's `(value, arm)`
 /// shape exists to prevent.
 pub(crate) fn api_base_url_inputs_from(s: &crate::settings::Settings) -> ApiBaseUrlInputs {
+    let build_default = crate::settings::default_web_integration_backend_url();
     ApiBaseUrlInputs {
         env_web: std::env::var("QONTINUI_WEB_BACKEND_URL").ok(),
         env_api: std::env::var("QONTINUI_API_URL").ok(),
+        profile_api_url: qontinui_runner_lib::profiles::api_url_with_source().map(|(url, _)| url),
+        // A persisted value equal to the build default is not a choice: any
+        // settings save writes the default back (the struct is serialized
+        // whole), so on disk it is indistinguishable from one. Treat it as
+        // unset so it is attributed to the build-default arm. The resolved URL
+        // is identical either way.
         persisted: s
             .web_integration
             .enabled
-            .then(|| s.web_integration.backend_url.clone()),
+            .then(|| s.web_integration.backend_url.clone())
+            .filter(|v| v.trim() != build_default),
         is_debug: cfg!(debug_assertions),
     }
 }
 
-/// Which rung of [`resolve_api_base_url`]'s documented four-rung order produced
+/// Which rung of [`resolve_api_base_url`]'s documented five-rung order produced
 /// the value — the house `(value, source)` shape that `profiles::CoordBaseSource`
 /// already has and this resolver does not.
 ///
@@ -524,6 +544,8 @@ pub(crate) enum ApiBaseUrlArm {
     EnvWebBackendUrl,
     /// Env `QONTINUI_API_URL` won.
     EnvApiUrl,
+    /// The active profile's `api_url` (`~/.qontinui/profiles.json`) won.
+    ProfileApiUrl,
     /// The persisted paired backend won (web-integration enabled).
     PersistedBackendUrl,
     /// Nothing configured; the debug build default (`127.0.0.1:8000`) applied.
@@ -548,11 +570,36 @@ impl ApiBaseUrlArm {
         match self {
             ApiBaseUrlArm::EnvWebBackendUrl => "env:QONTINUI_WEB_BACKEND_URL",
             ApiBaseUrlArm::EnvApiUrl => "env:QONTINUI_API_URL",
+            ApiBaseUrlArm::ProfileApiUrl => "profile:api_url",
             ApiBaseUrlArm::PersistedBackendUrl => "persisted:web_integration.backend_url",
             ApiBaseUrlArm::BuildDefaultDebug => "build_default:debug",
             ApiBaseUrlArm::BuildDefaultRelease => "build_default:release",
             ApiBaseUrlArm::BuildDefaultReleaseLoopbackRejected => {
                 "build_default:release:persisted_loopback_rejected"
+            }
+        }
+    }
+
+    /// One-line operator remedy for a connection failure to the URL this arm
+    /// chose — what to edit or unset to point the runner somewhere else.
+    pub(crate) fn remedy(self) -> &'static str {
+        match self {
+            ApiBaseUrlArm::EnvWebBackendUrl => {
+                "Unset or correct the QONTINUI_WEB_BACKEND_URL environment variable."
+            }
+            ApiBaseUrlArm::EnvApiUrl => {
+                "Unset or correct the QONTINUI_API_URL environment variable."
+            }
+            ApiBaseUrlArm::ProfileApiUrl => "Edit `api_url` in ~/.qontinui/profiles.json.",
+            ApiBaseUrlArm::PersistedBackendUrl
+            | ApiBaseUrlArm::BuildDefaultReleaseLoopbackRejected => {
+                "Edit `web_integration.backend_url` in settings.json, or set `api_url` in the active profile in ~/.qontinui/profiles.json."
+            }
+            ApiBaseUrlArm::BuildDefaultDebug => {
+                "Debug builds default to a local backend; set `api_url` in the active profile in ~/.qontinui/profiles.json, or export QONTINUI_WEB_BACKEND_URL."
+            }
+            ApiBaseUrlArm::BuildDefaultRelease => {
+                "Nothing is configured, so the release default applies; set `api_url` in the active profile in ~/.qontinui/profiles.json, or export QONTINUI_WEB_BACKEND_URL."
             }
         }
     }
@@ -566,11 +613,12 @@ impl ApiBaseUrlArm {
     /// classified this rung's value under a made-up label would silently lose
     /// that arm — `scheme://ops@host` would print the account name — so the name
     /// handed to the classifier is the real slot: the env variable for the two
-    /// env rungs, the settings field path for the persisted rung, and a
-    /// field-shaped label for the build defaults so all five are judged under
+    /// env rungs, the profile file and key for the profile rung, the settings field
+    /// path for the persisted rung, and a
+    /// field-shaped label for the build defaults so all six are judged under
     /// the same connection-string rule.
     ///
-    /// Every one of the five ends in `_URL` once upper-cased, which is what makes
+    /// Every one of the six ends in `_URL` once upper-cased, which is what makes
     /// the joint arm reachable for all of them. That is a property of this
     /// mapping, not a coincidence, and
     /// `config_report_cmd::tests::config_report_api_arm_origin_names_are_url_named`
@@ -579,6 +627,7 @@ impl ApiBaseUrlArm {
         match self {
             ApiBaseUrlArm::EnvWebBackendUrl => "QONTINUI_WEB_BACKEND_URL",
             ApiBaseUrlArm::EnvApiUrl => "QONTINUI_API_URL",
+            ApiBaseUrlArm::ProfileApiUrl => "profiles.json api_url",
             ApiBaseUrlArm::PersistedBackendUrl => "web_integration.backend_url",
             ApiBaseUrlArm::BuildDefaultDebug
             | ApiBaseUrlArm::BuildDefaultRelease
@@ -662,6 +711,34 @@ mod tests {
 
     use crate::test_env::env_lock;
 
+    /// The four legacy rungs as positional arguments, with no profile value —
+    /// keeps the pre-profile precedence tests readable. Tests that involve the
+    /// profile rung build an [`ApiBaseUrlInputs`] directly.
+    fn resolve(
+        env_web: Option<String>,
+        env_api: Option<String>,
+        persisted: Option<String>,
+        is_debug: bool,
+    ) -> (String, ApiBaseUrlArm) {
+        resolve_api_base_url(&ApiBaseUrlInputs {
+            env_web,
+            env_api,
+            profile_api_url: None,
+            persisted,
+            is_debug,
+        })
+    }
+
+    fn inputs_all(profile: &str, persisted: &str, is_debug: bool) -> ApiBaseUrlInputs {
+        ApiBaseUrlInputs {
+            env_web: Some("https://web.example".to_string()),
+            env_api: Some("https://api.example".to_string()),
+            profile_api_url: Some(profile.to_string()),
+            persisted: Some(persisted.to_string()),
+            is_debug,
+        }
+    }
+
     #[test]
     fn supervisor_url_uses_default_port() {
         let _env_lock = env_lock();
@@ -744,7 +821,7 @@ mod tests {
 
         // env_web wins over everything.
         assert_eq!(
-            resolve_api_base_url(web(), api(), persisted(), true),
+            resolve(web(), api(), persisted(), true),
             (
                 "https://web.example".to_string(),
                 ApiBaseUrlArm::EnvWebBackendUrl
@@ -752,12 +829,12 @@ mod tests {
         );
         // env_api wins over persisted + default.
         assert_eq!(
-            resolve_api_base_url(None, api(), persisted(), true),
+            resolve(None, api(), persisted(), true),
             ("https://api.example".to_string(), ApiBaseUrlArm::EnvApiUrl)
         );
         // persisted wins over the build default.
         assert_eq!(
-            resolve_api_base_url(None, None, persisted(), true),
+            resolve(None, None, persisted(), true),
             (
                 "https://persisted.example".to_string(),
                 ApiBaseUrlArm::PersistedBackendUrl
@@ -769,7 +846,7 @@ mod tests {
     fn resolve_api_base_url_build_defaults() {
         // All absent → debug default is the IPv4-pinned localhost.
         assert_eq!(
-            resolve_api_base_url(None, None, None, true),
+            resolve(None, None, None, true),
             (
                 "http://127.0.0.1:8000".to_string(),
                 ApiBaseUrlArm::BuildDefaultDebug
@@ -777,7 +854,7 @@ mod tests {
         );
         // All absent → release default is prod.
         assert_eq!(
-            resolve_api_base_url(None, None, None, false),
+            resolve(None, None, None, false),
             (
                 "https://api.qontinui.io".to_string(),
                 ApiBaseUrlArm::BuildDefaultRelease
@@ -789,7 +866,7 @@ mod tests {
     fn resolve_api_base_url_skips_blank_and_trims() {
         // Blank / whitespace at any level is treated as unset (not selected).
         assert_eq!(
-            resolve_api_base_url(
+            resolve(
                 Some("   ".to_string()),
                 Some("".to_string()),
                 Some("https://persisted.example".to_string()),
@@ -802,7 +879,7 @@ mod tests {
         );
         // A blank persisted with no env falls through to the build default.
         assert_eq!(
-            resolve_api_base_url(None, None, Some("  ".to_string()), true),
+            resolve(None, None, Some("  ".to_string()), true),
             (
                 "http://127.0.0.1:8000".to_string(),
                 ApiBaseUrlArm::BuildDefaultDebug
@@ -810,7 +887,7 @@ mod tests {
         );
         // Trailing slash is trimmed on the chosen value.
         assert_eq!(
-            resolve_api_base_url(Some("https://web.example/".to_string()), None, None, true),
+            resolve(Some("https://web.example/".to_string()), None, None, true),
             (
                 "https://web.example".to_string(),
                 ApiBaseUrlArm::EnvWebBackendUrl
@@ -830,7 +907,7 @@ mod tests {
     #[test]
     fn resolve_api_base_url_debug_honors_persisted_prod() {
         assert_eq!(
-            resolve_api_base_url(None, None, Some(PROD_API_BASE_URL.to_string()), true),
+            resolve(None, None, Some(PROD_API_BASE_URL.to_string()), true),
             (
                 "https://api.qontinui.io".to_string(),
                 ApiBaseUrlArm::PersistedBackendUrl
@@ -849,6 +926,7 @@ mod tests {
             "env:QONTINUI_WEB_BACKEND_URL"
         );
         assert_eq!(ApiBaseUrlArm::EnvApiUrl.as_str(), "env:QONTINUI_API_URL");
+        assert_eq!(ApiBaseUrlArm::ProfileApiUrl.as_str(), "profile:api_url");
         assert_eq!(
             ApiBaseUrlArm::PersistedBackendUrl.as_str(),
             "persisted:web_integration.backend_url"
@@ -909,7 +987,7 @@ mod tests {
             "::1",
         ] {
             assert_eq!(
-                resolve_api_base_url(None, None, Some(spelling.to_string()), false),
+                resolve(None, None, Some(spelling.to_string()), false),
                 (
                     PROD_API_BASE_URL.to_string(),
                     ApiBaseUrlArm::BuildDefaultReleaseLoopbackRejected
@@ -936,7 +1014,7 @@ mod tests {
             // 128.0.0.1 is one bit outside 127.0.0.0/8.
             "http://128.0.0.1:8000",
         ] {
-            let (url, arm) = resolve_api_base_url(None, None, Some(remote.to_string()), false);
+            let (url, arm) = resolve(None, None, Some(remote.to_string()), false);
             assert_eq!(
                 arm,
                 ApiBaseUrlArm::PersistedBackendUrl,
@@ -982,7 +1060,7 @@ mod tests {
         for is_debug in [true, false] {
             for candidate in loopback.iter().chain(remote.iter()) {
                 let (_, arm) =
-                    resolve_api_base_url(None, None, Some((*candidate).to_string()), is_debug);
+                    resolve(None, None, Some((*candidate).to_string()), is_debug);
                 let ladder_refused = arm == ApiBaseUrlArm::BuildDefaultReleaseLoopbackRejected;
                 assert_eq!(
                     persisted_backend_url_refused(candidate, is_debug),
@@ -1026,14 +1104,14 @@ mod tests {
             "http://[::1]:8000",
         ] {
             assert_eq!(
-                resolve_api_base_url(None, None, Some(spelling.to_string()), true),
+                resolve(None, None, Some(spelling.to_string()), true),
                 (spelling.to_string(), ApiBaseUrlArm::PersistedBackendUrl),
                 "debug build must keep honouring persisted {spelling}"
             );
         }
         // And with nothing persisted at all, the debug default is still local.
         assert_eq!(
-            resolve_api_base_url(None, None, None, true),
+            resolve(None, None, None, true),
             (
                 "http://127.0.0.1:8000".to_string(),
                 ApiBaseUrlArm::BuildDefaultDebug
@@ -1048,7 +1126,7 @@ mod tests {
     #[test]
     fn release_loopback_refusal_does_not_touch_the_env_rungs() {
         assert_eq!(
-            resolve_api_base_url(
+            resolve(
                 Some("http://127.0.0.1:8000".to_string()),
                 None,
                 Some("http://localhost:8000".to_string()),
@@ -1060,7 +1138,7 @@ mod tests {
             )
         );
         assert_eq!(
-            resolve_api_base_url(
+            resolve(
                 None,
                 Some("http://localhost:8000".to_string()),
                 Some("http://127.0.0.1:8000".to_string()),
@@ -1079,14 +1157,14 @@ mod tests {
     #[test]
     fn release_blank_persisted_is_absent_not_rejected() {
         assert_eq!(
-            resolve_api_base_url(None, None, Some("   ".to_string()), false),
+            resolve(None, None, Some("   ".to_string()), false),
             (
                 PROD_API_BASE_URL.to_string(),
                 ApiBaseUrlArm::BuildDefaultRelease
             )
         );
         assert_eq!(
-            resolve_api_base_url(None, None, None, false),
+            resolve(None, None, None, false),
             (
                 PROD_API_BASE_URL.to_string(),
                 ApiBaseUrlArm::BuildDefaultRelease
@@ -1171,7 +1249,7 @@ mod tests {
             // out-of-ladder readers and honoured by `resolve_api_base_url`,
             // which is the divergence, just pointing the other way.
             for is_debug in [true, false] {
-                let (_, arm) = resolve_api_base_url(None, None, Some(yes.to_string()), is_debug);
+                let (_, arm) = resolve(None, None, Some(yes.to_string()), is_debug);
                 assert_eq!(
                     arm == ApiBaseUrlArm::BuildDefaultReleaseLoopbackRejected,
                     persisted_backend_url_refused(yes, is_debug),
@@ -1231,6 +1309,184 @@ mod tests {
             assert!(
                 !(is_loopback_backend_url(any) && is_unspecified_backend_url(any)),
                 "{any} belongs to exactly one host class"
+            );
+        }
+    }
+
+    /// Full precedence chain, every rung configured, peeled one at a time from
+    /// the top, at both build settings.
+    #[test]
+    fn precedence_chain_across_all_rungs_at_both_build_settings() {
+        for is_debug in [true, false] {
+            let mut i = inputs_all("https://profile.example", "https://persisted.example", is_debug);
+            assert_eq!(
+                resolve_api_base_url(&i),
+                (
+                    "https://web.example".to_string(),
+                    ApiBaseUrlArm::EnvWebBackendUrl
+                ),
+                "is_debug={is_debug}"
+            );
+            i.env_web = None;
+            assert_eq!(
+                resolve_api_base_url(&i),
+                ("https://api.example".to_string(), ApiBaseUrlArm::EnvApiUrl),
+                "is_debug={is_debug}"
+            );
+            i.env_api = None;
+            assert_eq!(
+                resolve_api_base_url(&i),
+                (
+                    "https://profile.example".to_string(),
+                    ApiBaseUrlArm::ProfileApiUrl
+                ),
+                "is_debug={is_debug}"
+            );
+            i.profile_api_url = None;
+            assert_eq!(
+                resolve_api_base_url(&i),
+                (
+                    "https://persisted.example".to_string(),
+                    ApiBaseUrlArm::PersistedBackendUrl
+                ),
+                "is_debug={is_debug}"
+            );
+            i.persisted = None;
+            let (url, arm) = resolve_api_base_url(&i);
+            if is_debug {
+                assert_eq!(
+                    (url.as_str(), arm),
+                    ("http://127.0.0.1:8000", ApiBaseUrlArm::BuildDefaultDebug)
+                );
+            } else {
+                assert_eq!(
+                    (url.as_str(), arm),
+                    (PROD_API_BASE_URL, ApiBaseUrlArm::BuildDefaultRelease)
+                );
+            }
+        }
+    }
+
+    /// A profile value outranks a persisted LOOPBACK one in debug and release,
+    /// and is itself never refused for being loopback (a deliberate act).
+    #[test]
+    fn profile_beats_persisted_loopback_and_is_not_refused() {
+        for is_debug in [true, false] {
+            let mut i = ApiBaseUrlInputs {
+                env_web: None,
+                env_api: None,
+                profile_api_url: Some("https://api.qontinui.io".to_string()),
+                persisted: Some("http://127.0.0.1:8000".to_string()),
+                is_debug,
+            };
+            assert_eq!(
+                resolve_api_base_url(&i),
+                (
+                    "https://api.qontinui.io".to_string(),
+                    ApiBaseUrlArm::ProfileApiUrl
+                ),
+                "is_debug={is_debug}"
+            );
+            // A loopback PROFILE value is honoured even by a release build.
+            i.profile_api_url = Some("http://127.0.0.1:8000/".to_string());
+            assert_eq!(
+                resolve_api_base_url(&i),
+                (
+                    "http://127.0.0.1:8000".to_string(),
+                    ApiBaseUrlArm::ProfileApiUrl
+                ),
+                "is_debug={is_debug}"
+            );
+        }
+    }
+
+    #[test]
+    fn blank_profile_api_url_is_unset() {
+        for blank in ["", "  ", "\t"] {
+            let i = ApiBaseUrlInputs {
+                env_web: None,
+                env_api: None,
+                profile_api_url: Some(blank.to_string()),
+                persisted: Some("https://persisted.example".to_string()),
+                is_debug: true,
+            };
+            assert_eq!(
+                resolve_api_base_url(&i),
+                (
+                    "https://persisted.example".to_string(),
+                    ApiBaseUrlArm::PersistedBackendUrl
+                )
+            );
+        }
+    }
+
+    /// The read-side filter: a persisted value byte-equal to the build default
+    /// is dropped, so the arm becomes the build-default arm; a different value
+    /// stays `PersistedBackendUrl`. Drives `api_base_url_inputs_from` with env
+    /// locked and cleared; the profile input it reads from disk is overwritten
+    /// before resolving so the developer's real profiles.json cannot leak in.
+    #[test]
+    fn persisted_equal_to_build_default_is_attributed_to_the_build_default() {
+        let _env_lock = env_lock();
+        std::env::remove_var("QONTINUI_WEB_BACKEND_URL");
+        std::env::remove_var("QONTINUI_API_URL");
+        let default = crate::settings::default_web_integration_backend_url();
+        let mut settings = crate::settings::Settings::default();
+        settings.web_integration.enabled = true;
+
+        settings.web_integration.backend_url = default.clone();
+        let mut i = api_base_url_inputs_from(&settings);
+        assert_eq!(i.persisted, None, "default-equal persisted must be dropped");
+        i.profile_api_url = None;
+        let (url, arm) = resolve_api_base_url(&i);
+        assert_eq!(url, default);
+        assert_eq!(
+            arm,
+            if cfg!(debug_assertions) {
+                ApiBaseUrlArm::BuildDefaultDebug
+            } else {
+                ApiBaseUrlArm::BuildDefaultRelease
+            }
+        );
+
+        // Whitespace around the default is still the default.
+        settings.web_integration.backend_url = format!("  {default} ");
+        assert_eq!(api_base_url_inputs_from(&settings).persisted, None);
+
+        // A differing value is still a choice.
+        settings.web_integration.backend_url = "https://elsewhere.example".to_string();
+        let mut i = api_base_url_inputs_from(&settings);
+        i.profile_api_url = None;
+        assert_eq!(
+            resolve_api_base_url(&i),
+            (
+                "https://elsewhere.example".to_string(),
+                ApiBaseUrlArm::PersistedBackendUrl
+            )
+        );
+    }
+
+    #[test]
+    fn remedy_names_the_place_to_fix_for_every_arm() {
+        for (arm, needle) in [
+            (ApiBaseUrlArm::EnvWebBackendUrl, "QONTINUI_WEB_BACKEND_URL"),
+            (ApiBaseUrlArm::EnvApiUrl, "QONTINUI_API_URL"),
+            (ApiBaseUrlArm::ProfileApiUrl, "profiles.json"),
+            (
+                ApiBaseUrlArm::PersistedBackendUrl,
+                "web_integration.backend_url",
+            ),
+            (ApiBaseUrlArm::BuildDefaultDebug, "api_url"),
+            (ApiBaseUrlArm::BuildDefaultRelease, "api_url"),
+            (
+                ApiBaseUrlArm::BuildDefaultReleaseLoopbackRejected,
+                "web_integration.backend_url",
+            ),
+        ] {
+            assert!(
+                arm.remedy().contains(needle),
+                "{arm:?} remedy {:?} must mention {needle}",
+                arm.remedy()
             );
         }
     }
