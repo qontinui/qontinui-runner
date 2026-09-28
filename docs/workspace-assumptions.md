@@ -10,7 +10,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 |---|---:|---:|---:|---:|---:|---:|
 | `repo_layout` | 55 | 68 | 55 | 0 | 0 | 0 |
 | `dev_ports` | 27 | 27 | 27 | 0 | 0 | 0 |
-| `supervisor_dependency` | 32 | 32 | 0 | 22 | 4 | 6 |
+| `supervisor_dependency` | 43 | 43 | 0 | 33 | 4 | 6 |
 | `plans_dir` | 32 | 33 | 32 | 0 | 0 | 0 |
 | `tenant_literal` | 1 | 1 | 0 | 1 | 0 | 0 |
 | `os_bound_tooling` | 105 | 106 | 105 | 0 | 0 | 0 |
@@ -108,7 +108,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/workflow_generation/specification.rs` | `build_specification_prompt` | `- 'assumptions': list of assumptions you're making (e.g., "Project uses TypeScript", "Frontend runs on localhost:3001")` | 1 | unreviewed |
 | `src/workflow_generation/structured_output.rs` | `detect_backend` | `base_url: "http://localhost:8000".to_string(),` | 1 | unreviewed |
 
-## `supervisor_dependency` (32 rows)
+## `supervisor_dependency` (43 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -129,10 +129,21 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/mcp/ai_session.rs` | `const AI_SESSION_RULES_SUPERVISOR_AVAILABLE` | `Invoke-RestMethod -Uri "http://localhost:9875/runner/restart" -Method Post -ContentType "application/json" -Body '{"rebuild": true, "trig...` | 1 | fallback_correct — Chosen by runner_rules_prefix only when check_supervisor_available() is true; the supervisor-DOWN arm is used otherwise. |
 | `src/mcp/ai_session.rs` | `const AI_SESSION_RULES_SUPERVISOR_AVAILABLE` | `Invoke-RestMethod -Uri "http://localhost:9875/runner/restart" -Method Post -ContentType "application/json" -Body '{"trigger_auto_continue...` | 1 | fallback_correct — Chosen by runner_rules_prefix only when check_supervisor_available() is true; the supervisor-DOWN arm is used otherwise. |
 | `src/mcp/ai_session.rs` | `const AI_SESSION_RULES_SUPERVISOR_AVAILABLE` | `Invoke-RestMethod -Uri "http://localhost:9875/workflow-loop/signal-restart" -Method Post` | 1 | fallback_correct — Chosen by runner_rules_prefix only when check_supervisor_available() is true; the supervisor-DOWN arm is used otherwise. |
-| `src/mcp/ai_session.rs` | `run_prompt` | `super::auto_continue::check_supervisor_available(),` | 1 | fallback_correct — Passes check_supervisor_available() to runner_rules_prefix, which picks the supervisor-DOWN rules block when it is false. |
-| `src/mcp/app_discovery.rs` | `const DESKTOP_APP_PORTS` | `9875,` | 1 | fallback_correct — One port in a discovery scan list; an absent listener is simply not discovered. |
-| `src/mcp/auto_continue.rs` | `check_supervisor_available` | `let addr = crate::api_config::get_supervisor_socket_addr();` | 1 | fallback_correct — A 500 ms TCP probe that returns false when no supervisor listens; that false is what selects the supervisor-less briefing. |
-| `src/mcp/auto_continue.rs` | `check_supervisor_available` | `pub fn check_supervisor_available() -> bool {` | 1 | fallback_correct — A 500 ms TCP probe that returns false when no supervisor listens; that false is what selects the supervisor-less briefing. |
+| `src/mcp/ai_session.rs` | `run_prompt` | `super::auto_continue::check_supervisor_available() == Some(true),` | 1 | fallback_correct — Passes check_supervisor_available() == Some(true) to runner_rules_prefix: only an OBSERVED listener selects the supervisor recipe; absent or unknown (None) selects the supervisor-DOWN rules block. |
+| `src/mcp/app_discovery.rs` | `desktop_ports_merged` | `let (supervisor, user) = tokio::join!(observed_supervisor_port(), user_discovery_ports());` | 1 | fallback_correct — Adds the supervisor's port to the desktop scan only when the observation reports observed=true; no supervisor port is hard-coded (plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B2). |
+| `src/mcp/app_discovery.rs` | `observed_supervisor_port` | `async fn observed_supervisor_port() -> Option<u16> {` | 1 | fallback_correct — Runs the one supervisor probe off the async runtime; a failed join or a not-observed/unknown verdict yields None, so nothing extra is scanned. |
+| `src/mcp/app_discovery.rs` | `observed_supervisor_port` | `let obs = spawn_blocking_tracked(crate::mcp::auto_continue::observe_supervisor)` | 1 | fallback_correct — Runs the one supervisor probe off the async runtime; a failed join or a not-observed/unknown verdict yields None, so nothing extra is scanned. |
+| `src/mcp/auto_continue.rs` | `check_supervisor_available` | `&crate::api_config::get_supervisor_socket_addr(),` | 1 | fallback_correct — The one 500 ms TCP probe. Tri-state: Some(false) when no supervisor listens, None when the configured address does not parse (nothing probed). Callers treat only Some(true) as present. |
+| `src/mcp/auto_continue.rs` | `check_supervisor_available` | `probe_supervisor_at(` | 1 | fallback_correct — The one 500 ms TCP probe. Tri-state: Some(false) when no supervisor listens, None when the configured address does not parse (nothing probed). Callers treat only Some(true) as present. |
+| `src/mcp/auto_continue.rs` | `check_supervisor_available` | `pub fn check_supervisor_available() -> Option<bool> {` | 1 | fallback_correct — The one 500 ms TCP probe. Tri-state: Some(false) when no supervisor listens, None when the configured address does not parse (nothing probed). Callers treat only Some(true) as present. |
+| `src/mcp/auto_continue.rs` | `get_supervisor_observation` | `async fn get_supervisor_observation() -> Json<ApiResponse<SupervisorObservation>> {` | 1 | fallback_correct — GET /supervisor/observation: the same probe served as a read for the dev-only settings panels, which render nothing supervisor-related unless observed=true (plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B2). |
+| `src/mcp/auto_continue.rs` | `observe_supervisor` | `&crate::api_config::get_supervisor_socket_addr(),` | 1 | fallback_correct — Resolves the configured supervisor address/URL and probes it; contacts nothing but the TCP connect, and an absent supervisor reads observed=false. |
+| `src/mcp/auto_continue.rs` | `observe_supervisor` | `&crate::api_config::get_supervisor_url(),` | 1 | fallback_correct — Resolves the configured supervisor address/URL and probes it; contacts nothing but the TCP connect, and an absent supervisor reads observed=false. |
+| `src/mcp/auto_continue.rs` | `observe_supervisor` | `observe_supervisor_at(` | 1 | fallback_correct — Resolves the configured supervisor address/URL and probes it; contacts nothing but the TCP connect, and an absent supervisor reads observed=false. |
+| `src/mcp/auto_continue.rs` | `observe_supervisor` | `pub fn observe_supervisor() -> SupervisorObservation {` | 1 | fallback_correct — Resolves the configured supervisor address/URL and probes it; contacts nothing but the TCP connect, and an absent supervisor reads observed=false. |
+| `src/mcp/auto_continue.rs` | `observe_supervisor_at` | `observed: probe_supervisor_at(addr, timeout),` | 1 | fallback_correct — Pure observation builder over one address; port/base_url are null when the address does not parse. |
+| `src/mcp/auto_continue.rs` | `observe_supervisor_at` | `pub fn observe_supervisor_at(` | 1 | fallback_correct — Pure observation builder over one address; port/base_url are null when the address does not parse. |
+| `src/mcp/auto_continue.rs` | `probe_supervisor_at` | `pub fn probe_supervisor_at(addr: &str, timeout: std::time::Duration) -> Option<bool> {` | 1 | fallback_correct — Pure TCP probe of one address; None on an unparseable address, never collapsed into false. |
 | `src/mcp/misc.rs` | `spawn_instance` | `None => format!("{}/runners", crate::api_config::get_supervisor_url()),` | 1 | fallback_correct — Best-effort POST /runners registration after the instance is already launched; failure is logged at debug and the primary runner stays coordinator. |
 | `src/mcp/misc.rs` | `spawn_instance` | `let sup_url = match std::env::var("QONTINUI_SUPERVISOR_PORT")` | 1 | fallback_correct — Best-effort POST /runners registration after the instance is already launched; failure is logged at debug and the primary runner stays coordinator. |
 | `src/mcp/origin_guard.rs` | `const DEFAULT_TRUSTED_ORIGINS` | `"http://127.0.0.1:9875",` | 1 | dev_only_surface — Admits the dev supervisor dashboard origin as Trusted. Nothing user-facing depends on it, but on a box with no supervisor any local listener on :9875 inherits that trust — worth a look by the origin-guard owner. |
