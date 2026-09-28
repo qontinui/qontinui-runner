@@ -1441,8 +1441,10 @@ jobs:
   # from a member directory selects THAT package only — so `crates/pty-holder`
   # (plan 2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions,
   # Phase 1) and `crates/runner-win32` are compiled only as src-tauri's
-  # dependencies (runner-win32) or not at all (pty-holder), and none of their
-  # own tests or [lints] run in CI. pty-holder's frozen-envelope wire-shape
+  # dependencies (runner-win32) or not at all (pty-holder), so neither
+  # crate's own tests run in CI, and pty-holder's [lints] table is never
+  # applied (runner-win32 has no [lints] table and is not clippy'd here —
+  # its tests are). pty-holder's frozen-envelope wire-shape
   # pin and its byte-fidelity source guard protect nothing unless something
   # executes them, and the windows leg is the only place its named-pipe /
   # DACL / LockFileEx code executes at all.
@@ -1467,11 +1469,10 @@ jobs:
         platform: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.platform }}
     # UNMEASURED at introduction: no run of this job exists yet. The two
-    # crates plus serde/libc/windows-sys compile in seconds locally (clean
-    # `cargo test -p qontinui-pty-holder` build: ~2 s on merytshost), so the
-    # budget is dominated by checkout + toolchain + cache restore. 20 min is a
-    # generous first bound, well under GitHub's 360-minute default; tighten it
-    # once there are runs to measure.
+    # crates depend only on serde/serde_json and libc or windows-sys, so the
+    # budget should be dominated by checkout + toolchain + cache restore. 20
+    # min is a generous first bound, well under GitHub's 360-minute default;
+    # tighten it once there are runs to measure.
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
