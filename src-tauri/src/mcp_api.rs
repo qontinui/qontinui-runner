@@ -3127,8 +3127,13 @@ fn anchor_as_caller_session(claude_session_id: &str) -> Option<uuid::Uuid> {
 /// low count is trustworthy, and a misattributed row corrupts two sessions'
 /// numbers at once while a dropped one only under-counts (visibly, via the
 /// `debug!` field set at the call site).
+///
+/// `app` is `None` when the caller has no Tauri handle to hand (the REST write
+/// forwarder reads the process-global one, which is unset in a headless test
+/// runner). That is not a separate arm: every probe below simply finds its
+/// state missing and reports the same miss a handle without that state would.
 fn resolve_event_lane_session_id(
-    state: &Arc<ApiState>,
+    app: Option<&tauri::AppHandle>,
     nonce: Option<&str>,
 ) -> Result<uuid::Uuid, EventLaneMiss> {
     let Some(nonce) = nonce else {
@@ -3139,9 +3144,7 @@ fn resolve_event_lane_session_id(
     // so does every miss.
     match event_lane_terminal_leg(
         crate::coord_mcp::terminal_id_for_nonce(nonce).as_deref(),
-        |terminal_id| match state
-            .app_handle
-            .try_state::<Arc<crate::terminal::TerminalManager>>()
+        |terminal_id| match app.and_then(|a| a.try_state::<Arc<crate::terminal::TerminalManager>>())
         {
             None => TerminalLaneProbe::NoManager,
             Some(tm) => match tm.get(terminal_id) {
@@ -3158,15 +3161,12 @@ fn resolve_event_lane_session_id(
     }
     // Leg 2 — the runner-managed AI plane, keyed on the nonce's workdir.
     let workdir = crate::coord_mcp::workdir_for_nonce(nonce).ok_or(EventLaneMiss::NoWorkdir)?;
-    let task_run_id = state
-        .app_handle
-        .try_state::<Arc<crate::claude_session::SessionManager>>()
+    let task_run_id = app
+        .and_then(|a| a.try_state::<Arc<crate::claude_session::SessionManager>>())
         .ok_or(EventLaneMiss::AiPlaneStateMissing)?
         .task_run_id_for_workdir(&workdir)
         .ok_or(EventLaneMiss::NoTaskRun)?;
-    state
-        .app_handle
-        .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()
+    app.and_then(|a| a.try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>())
         .ok_or(EventLaneMiss::AiPlaneStateMissing)?
         .session_id_for(&task_run_id)
         .ok_or(EventLaneMiss::AiSessionUnregistered)
@@ -3326,7 +3326,7 @@ fn record_event_lane_miss(miss: EventLaneMiss, door: &str, nonce: Option<&str>) 
             reason = %miss.as_str(),
             terminal_id = ?nonce.and_then(crate::coord_mcp::terminal_id_for_nonce),
             nonce_prefix = %nonce.map(nonce_log_prefix).unwrap_or_default(),
-            "coord-mcp proxy: no coord.sessions lane for this caller — transport-rung \
+            "coord door (proxy or write forwarder): no coord.sessions lane for this caller — transport-rung \
              observation not recorded; first-rung reachability under-counts \
              (GET /health transportRung.laneMiss carries the totals)"
         );
@@ -3338,7 +3338,7 @@ fn record_event_lane_miss(miss: EventLaneMiss, door: &str, nonce: Option<&str>) 
             reason = %miss.as_str(),
             terminal_id = ?nonce.and_then(crate::coord_mcp::terminal_id_for_nonce),
             nonce_prefix = %nonce.map(nonce_log_prefix).unwrap_or_default(),
-            "coord-mcp proxy: no coord.sessions lane for this caller — transport-rung \
+            "coord door (proxy or write forwarder): no coord.sessions lane for this caller — transport-rung \
              observation not recorded"
         );
     }
@@ -3474,11 +3474,25 @@ fn nonce_log_prefix(nonce: &str) -> String {
 /// arrived at this door, under which session's nonce, for which JSON-RPC
 /// operation — is authoritative, and is what the row's lane and the
 /// runner-observed payload fields carry.
+///
+/// ## Two doors, one recorder
+///
+/// Both coord doors on this runner call it: the JSON-RPC `/coord-mcp` proxy
+/// (`operation` classified from the JSON-RPC body by
+/// [`crate::session::coord_transport_rung::operation_for_body`]) and the REST
+/// write forwarder ([`coord_write_proxy_handler`], `operation` always
+/// [`crate::session::coord_transport_rung::OPERATION_WRITE`] — its routes are
+/// an enumerated set of coord WRITES, and its REST body is not JSON-RPC, so the
+/// body classifier would call every one of them a read). The operation is
+/// therefore the CALLER's to supply, never re-derived here. Plan
+/// `2026-09-20-first-rung-coord-reachability-is-unmeasured-then-unfixed`,
+/// Phase 2: before the forwarder called this, every gate write a caller
+/// declared as `write_forwarder` produced no row at all.
 fn record_coord_transport_rung(
-    state: &Arc<ApiState>,
+    app: Option<&tauri::AppHandle>,
     headers: &axum::http::HeaderMap,
     nonce: Option<&str>,
-    body: &[u8],
+    operation: &'static str,
     door: &str,
     caller_session_id: Option<uuid::Uuid>,
 ) {
@@ -3489,7 +3503,7 @@ fn record_coord_transport_rung(
         // that never reached `main.rs`'s install). Nothing to record into.
         return;
     };
-    let lane = match resolve_event_lane_session_id(state, nonce) {
+    let lane = match resolve_event_lane_session_id(app, nonce) {
         Ok(lane) => lane,
         Err(miss) => {
             // A dropped observation has to be IDENTIFIABLE, or "the runner
@@ -3501,7 +3515,7 @@ fn record_coord_transport_rung(
             return;
         }
     };
-    hand_off_transport_rung(emitter, lane, headers, body, door, caller_session_id);
+    hand_off_transport_rung(emitter, lane, headers, operation, door, caller_session_id);
 }
 
 /// The lane-resolved half of [`record_coord_transport_rung`]: build the
@@ -3512,7 +3526,7 @@ fn hand_off_transport_rung(
     emitter: Arc<crate::session::coord_transport_rung::RungEmitter>,
     lane: uuid::Uuid,
     headers: &axum::http::HeaderMap,
-    body: &[u8],
+    operation: &'static str,
     door: &str,
     caller_session_id: Option<uuid::Uuid>,
 ) {
@@ -3531,7 +3545,7 @@ fn hand_off_transport_rung(
         // after the hop would be missing exactly when the hop is what failed.
         rung::OUTCOME_OK,
         door,
-        rung::operation_for_body(body),
+        operation,
         caller_session_id,
     );
     // The outbox append is group-committed and returns only once the line is
@@ -6560,10 +6574,10 @@ async fn coord_mcp_proxy_handler(
     // and BEFORE the forward, so the row exists even when the hop that follows
     // dies. Best-effort telemetry: it cannot fail or slow the proxied call.
     record_coord_transport_rung(
-        &state,
+        Some(&state.app_handle),
         &headers,
         nonce.as_deref(),
-        &body,
+        crate::session::coord_transport_rung::operation_for_body(&body),
         &url,
         caller_session_id,
     );
@@ -8622,6 +8636,31 @@ async fn coord_write_proxy_handler(
 
     let (coord_base, coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
     let url = write_upstream_url(&coord_base, &target);
+
+    // Plan 2026-09-20-first-rung-coord-reachability-is-unmeasured-then-unfixed,
+    // Phase 2 — the same per-call transport-rung row the JSON-RPC proxy writes
+    // ([`record_coord_transport_rung`]), for the same reasons and at the same
+    // point: after the door URL is known and BEFORE the forward, so the row
+    // exists even when the hop that follows dies. Without it, every write a
+    // caller declared as `write_forwarder` (`/gate` Part B's REST leg) was a
+    // silent hole in the first-rung instrument. Best-effort telemetry: it
+    // cannot fail or slow the forwarded write.
+    //
+    // The caller's declaration headers are read here and go no further:
+    // [`forward_coord_write`] takes no request headers at all and builds the
+    // upstream request from scratch, so none of them can reach coord.
+    // `caller_session` is `None` on targets coord does not attribute — the
+    // row's `agent_session_id` then says "not resolved", which is what
+    // happened.
+    record_coord_transport_rung(
+        crate::tauri_app_handle::current().as_ref(),
+        &headers,
+        nonce.as_deref(),
+        crate::session::coord_transport_rung::OPERATION_WRITE,
+        &url,
+        caller_session,
+    );
+
     forward_coord_write(
         target.method(),
         &url,
@@ -12891,7 +12930,9 @@ mod transport_rung_counter_tests {
             emitter,
             lane,
             &headers,
-            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"coord_inbox","arguments":{}}}"#,
+            crate::session::coord_transport_rung::operation_for_body(
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"coord_inbox","arguments":{}}}"#,
+            ),
             "https://coord.qontinui.io/mcp",
             None,
         );
@@ -12969,7 +13010,9 @@ mod transport_rung_counter_tests {
             emitter,
             lane,
             &headers,
-            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"coord_inbox","arguments":{}}}"#,
+            crate::session::coord_transport_rung::operation_for_body(
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"coord_inbox","arguments":{}}}"#,
+            ),
             "https://coord.qontinui.io/mcp",
             None,
         );
@@ -13024,7 +13067,9 @@ mod transport_rung_counter_tests {
             emitter,
             uuid::Uuid::new_v4(),
             &headers,
-            br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            crate::session::coord_transport_rung::operation_for_body(
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            ),
             "https://coord.qontinui.io/mcp",
             None,
         );
@@ -13074,6 +13119,194 @@ mod transport_rung_counter_tests {
         assert_eq!(
             parse_failure_class(declared_failure_class(&headers)),
             Some("tool_masked")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Plan 2026-09-20-first-rung-coord-reachability-is-unmeasured-then-unfixed,
+    // Phase 2 — the REST write forwarder records a rung row too.
+    // -----------------------------------------------------------------------
+
+    /// Hand one observation off exactly as `coord_write_proxy_handler` does —
+    /// operation `write`, door = the upstream write URL — and return the single
+    /// outbox payload it lands, after a bounded wait. The caller holds
+    /// `series_lock`.
+    async fn forwarder_row(headers: &axum::http::HeaderMap) -> serde_json::Value {
+        use crate::session::coord_transport_rung::{RungEmitter, OPERATION_WRITE};
+        use crate::session::local_store::OutboxWriter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = std::sync::Arc::new(
+            OutboxWriter::open(dir.path().join("session-outbox.jsonl")).expect("outbox opens"),
+        );
+        let emitter = std::sync::Arc::new(RungEmitter::new(outbox.clone(), uuid::Uuid::new_v4()));
+        let door = super::write_upstream_url(
+            "https://coord.qontinui.io",
+            &super::CoordWriteTarget::RegisterGate,
+        );
+
+        let before = transport_rung_emitted_counter().load(Ordering::Relaxed);
+        hand_off_transport_rung(
+            emitter,
+            uuid::Uuid::new_v4(),
+            headers,
+            OPERATION_WRITE,
+            &door,
+            None,
+        );
+        assert_eq!(
+            transport_rung_emitted_counter().load(Ordering::Relaxed),
+            before + 1,
+            "a forwarded write moves `emitted` by one, exactly as a proxied call does"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let pending = outbox.pending().expect("pending readable");
+            if !pending.is_empty() {
+                assert_eq!(pending.len(), 1);
+                assert_eq!(pending[0].event_kind, "coord-transport-rung");
+                assert_eq!(
+                    pending[0].payload["door"],
+                    serde_json::json!("https://coord.qontinui.io/coord/gates/register-agent")
+                );
+                return pending[0].payload.clone();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the forwarded write's observation never reached the outbox"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// `/gate` Part B's REST leg declares `write_forwarder` / `gate`; the row
+    /// carries exactly that, and says `write`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn forwarded_write_declaring_write_forwarder_yields_a_write_forwarder_row() {
+        // Bumps the process-global `emitted` counter, which
+        // `successful_emit_increments_emitted` asserts EXACTLY.
+        let _serialised = series_lock();
+        use crate::session::coord_transport_rung::{
+            REPORTER_HEADER, REPORTER_STEP_HEADER, TRANSPORT_HEADER,
+        };
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(TRANSPORT_HEADER, "write_forwarder".parse().unwrap());
+        headers.insert(REPORTER_HEADER, "gate".parse().unwrap());
+        headers.insert(REPORTER_STEP_HEADER, "2".parse().unwrap());
+
+        let p = forwarder_row(&headers).await;
+        assert_eq!(p["transport"], serde_json::json!("write_forwarder"));
+        assert_eq!(p["reporter"], serde_json::json!("gate"));
+        assert_eq!(p["reporter_step"], serde_json::json!("2"));
+        assert_eq!(p["operation"], serde_json::json!("write"));
+        assert_eq!(p["outcome"], serde_json::json!("ok"));
+        assert_eq!(p["off_cascade"], serde_json::json!(false));
+    }
+
+    /// A forwarded write nobody tagged is the VISIBLE untagged arm —
+    /// `unknown` / `untagged` — never a skipped emit, and still a `write`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn forwarded_undeclared_write_yields_an_untagged_unknown_row() {
+        let _serialised = series_lock();
+        let p = forwarder_row(&axum::http::HeaderMap::new()).await;
+        assert_eq!(p["transport"], serde_json::json!("unknown"));
+        assert_eq!(p["reporter"], serde_json::json!("untagged"));
+        assert_eq!(p["operation"], serde_json::json!("write"));
+        assert_eq!(p["failure_class"], serde_json::Value::Null);
+    }
+
+    /// Why the forwarder supplies `write` rather than letting the recorder
+    /// classify its body: a REST gate body is not JSON-RPC, and the JSON-RPC
+    /// classifier calls anything that is not a `tools/call` a READ. Re-deriving
+    /// the operation from the body would file every forwarded gate write as a
+    /// read.
+    #[test]
+    fn rest_write_bodies_would_misclassify_as_reads_under_the_jsonrpc_classifier() {
+        use crate::session::coord_transport_rung::{operation_for_body, OPERATION_READ};
+        assert_eq!(
+            operation_for_body(br#"{"predicate":{"kind":"unit_ready"},"phase_name":"Phase 3"}"#),
+            OPERATION_READ,
+        );
+    }
+
+    /// The body of one `async fn` / `fn` in this file, comments stripped.
+    fn fn_body(name_with_paren: &str) -> String {
+        let text = include_str!("mcp_api.rs");
+        let start = text
+            .find(name_with_paren)
+            .unwrap_or_else(|| panic!("{name_with_paren} exists"));
+        let end = text[start..]
+            .find("\n}\n")
+            .map(|i| start + i)
+            .expect("its body ends");
+        text[start..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The write forwarder records a rung row — through the SAME recorder the
+    /// JSON-RPC proxy uses, as a `write`, and BEFORE the upstream hop (so the
+    /// row exists even when the hop dies). This is the pin that goes red on
+    /// the defect: before plan 2026-09-20 Phase 2 the handler never called the
+    /// recorder, and forwarded writes produced no row at all.
+    #[test]
+    fn write_forwarder_records_its_rung_before_forwarding() {
+        let code = fn_body("async fn coord_write_proxy_handler(");
+        let record = code
+            .find("record_coord_transport_rung(")
+            .expect("coord_write_proxy_handler must record a transport-rung row");
+        let forward = code
+            .find("forward_coord_write(")
+            .expect("coord_write_proxy_handler forwards");
+        assert!(
+            record < forward,
+            "the rung row must be written BEFORE the upstream forward"
+        );
+        let call = &code[record..forward];
+        assert!(
+            call.contains("OPERATION_WRITE"),
+            "the forwarder's row must say `write`, not a body-classified operation"
+        );
+        assert!(
+            !call.contains("operation_for_body"),
+            "a REST write body must not go through the JSON-RPC classifier"
+        );
+    }
+
+    /// The caller's declaration headers are CLAIMS and never reach coord. The
+    /// JSON-RPC proxy strips them explicitly; the write forwarder's upstream leg
+    /// takes no request headers at all and builds its request from scratch —
+    /// pinned here so a future "pass the caller's headers through" refactor
+    /// has to confront the strip.
+    #[test]
+    fn write_forwarder_upstream_leg_cannot_carry_declaration_headers() {
+        let code = fn_body("async fn forward_coord_write(");
+        let sig_end = code.find(") -> axum::response::Response").expect("signature ends");
+        assert!(
+            !code[..sig_end].contains("HeaderMap"),
+            "forward_coord_write must not take the caller's request headers"
+        );
+        assert!(
+            !code.contains("headers.iter()"),
+            "forward_coord_write must not copy request headers upstream"
+        );
+        for h in crate::session::coord_transport_rung::DECLARATION_HEADERS {
+            assert!(
+                !code.contains(h),
+                "forward_coord_write must not set declaration header {h}"
+            );
+        }
+        // …and the handler hands the leg no header map either.
+        let handler = fn_body("async fn coord_write_proxy_handler(");
+        let call = &handler[handler.find("forward_coord_write(").unwrap()..];
+        assert!(
+            !call.contains("&headers") && !call.contains("headers,"),
+            "the handler must not pass request headers to the upstream leg"
         );
     }
 }
