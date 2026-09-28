@@ -159,6 +159,7 @@ mod unix {
         ids: Vec<Identity>,
         children: Vec<Child>,
         files: Vec<PathBuf>,
+        dirs: Vec<PathBuf>,
     }
 
     impl Reap {
@@ -201,6 +202,9 @@ mod unix {
             }
             for f in &self.files {
                 let _ = std::fs::remove_file(f);
+            }
+            for d in &self.dirs {
+                let _ = std::fs::remove_dir_all(d);
             }
         }
     }
@@ -402,6 +406,258 @@ mod unix {
             wait_until(Duration::from_secs(10), || !still_same(&child)),
             "PTY child {child:?} outlived its holder — the master close did not hang it up"
         );
+    }
+
+    /// Read ALL of `stdout` until EOF (the process exited), bounded.
+    fn read_all_bounded(stdout: ChildStdout) -> String {
+        use std::io::Read;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut all = String::new();
+            let _ = BufReader::new(stdout).read_to_string(&mut all);
+            let _ = tx.send(all);
+        });
+        rx.recv_timeout(LINE_TIMEOUT)
+            .expect("process did not close stdout within the timeout")
+    }
+
+    /// Exit status within `LINE_TIMEOUT`, or panic.
+    fn exit_status(child: &mut Child) -> std::process::ExitStatus {
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(s) = child.try_wait().expect("try_wait") {
+                return s;
+            }
+            assert!(start.elapsed() < LINE_TIMEOUT, "process did not exit");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// A `sleep` argument unique to one test, so leftovers can be found by
+    /// cmdline without knowing their pids.
+    fn marker() -> String {
+        let n = uuid::Uuid::new_v4().as_u128() % 1_000_000;
+        format!("3599.{n:06}")
+    }
+
+    /// Pids whose argv contains `marker` exactly.
+    #[cfg(target_os = "linux")]
+    fn pids_with_arg(marker: &str) -> Vec<i32> {
+        let Ok(rd) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        rd.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<i32>().ok())
+            .filter(|pid| {
+                std::fs::read(format!("/proc/{pid}/cmdline"))
+                    .map(|c| c.split(|&b| b == 0).any(|a| a == marker.as_bytes()))
+                    .unwrap_or(false)
+            })
+            .filter(|&pid| is_alive(pid))
+            .collect()
+    }
+
+    fn unwritable_report_path() -> PathBuf {
+        std::env::temp_dir()
+            .join(format!(
+                "pty-holder-spike-missing-{}",
+                uuid::Uuid::new_v4().simple()
+            ))
+            .join("report")
+    }
+
+    /// M1 (holder): an unwritable `--report-file` must never read as success —
+    /// stdout carries `holder_error=`, the exit is non-zero, and the PTY child
+    /// it had already spawned is gone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pty_holder_spike_unwritable_report_file_fails_the_holder_cleanly() {
+        let mut reap = Reap::default();
+        let mark = marker();
+        let holder = Command::new(RUNNER_BIN)
+            .arg(SPIKE_FLAG)
+            .arg("--report-file")
+            .arg(unwritable_report_path())
+            .args(["--", "sleep", &mark])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn holder");
+        let (hi, out) = reap.adopt(holder);
+        let all = read_all_bounded(out.unwrap());
+        let first = all.lines().next().unwrap_or("");
+        assert!(
+            first.starts_with("holder_error=report-file"),
+            "stdout must carry the error, not success: {all:?}"
+        );
+        assert!(!all.contains("holder_pid="), "success line leaked: {all:?}");
+        let status = exit_status(&mut reap.children[hi]);
+        assert!(!status.success(), "holder must exit non-zero: {status}");
+        assert!(
+            wait_until(Duration::from_secs(5), || pids_with_arg(&mark).is_empty()),
+            "PTY child left behind: {:?}",
+            pids_with_arg(&mark)
+        );
+    }
+
+    /// M1 (parent): an unwritable parent `--report-file` → `parent_error=` on
+    /// stdout, non-zero exit, and the holder it spawned (scope unit included)
+    /// is torn down rather than orphaned.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pty_holder_spike_unwritable_report_file_parent_abandons_its_holder() {
+        let mut reap = Reap::default();
+        let mark = marker();
+        let parent = Command::new(RUNNER_BIN)
+            .arg(SPIKE_PARENT_FLAG)
+            .arg("--report-file")
+            .arg(unwritable_report_path())
+            .args(["--", "sleep", &mark])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn parent");
+        let (pi, out) = reap.adopt(parent);
+        let all = read_all_bounded(out.unwrap());
+        for line in all.lines() {
+            if let Some(unit) = report_str(line, "holder_unit") {
+                reap.units.push(unit.to_string());
+            }
+        }
+        assert!(
+            all.lines()
+                .next()
+                .unwrap_or("")
+                .starts_with("parent_error="),
+            "stdout must carry the error, not success: {all:?}"
+        );
+        assert!(!all.contains("holder_pid="), "success line leaked: {all:?}");
+        let status = exit_status(&mut reap.children[pi]);
+        assert!(!status.success(), "parent must exit non-zero: {status}");
+        assert!(
+            wait_until(Duration::from_secs(5), || pids_with_arg(&mark).is_empty()),
+            "holder/PTY child left behind: {:?}",
+            pids_with_arg(&mark)
+        );
+        for unit in &reap.units {
+            let active = Command::new("systemctl")
+                .args(["--user", "is-active", "--quiet", unit])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(!active, "holder unit {unit} left active");
+        }
+    }
+
+    /// A directory holding a FAKE `systemd-run` that fails loudly, for
+    /// driving the scope route into failure without touching the real one.
+    #[cfg(target_os = "linux")]
+    fn failing_systemd_run_path() -> (PathBuf, std::ffi::OsString) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "pty-holder-spike-fakebin-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("systemd-run");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\necho 'boom-from-fake-systemd-run: scope refused' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut path = std::ffi::OsString::from(&dir);
+        path.push(":");
+        path.push(std::env::var_os("PATH").unwrap_or_default());
+        (dir, path)
+    }
+
+    /// Whether THIS test process sits where `auto` would try `scope` given a
+    /// `systemd-run` on PATH.
+    #[cfg(target_os = "linux")]
+    fn auto_would_try_scope() -> bool {
+        use qontinui_runner_lib::pty_holder::spike::{
+            cgroup_is_in_systemd_unit, user_systemd_reachable,
+        };
+        std::fs::read_to_string("/proc/self/cgroup")
+            .map(|c| cgroup_is_in_systemd_unit(&c))
+            .unwrap_or(false)
+            && user_systemd_reachable()
+    }
+
+    /// M2 + M3: `auto` inside a unit whose scope spawn FAILS falls back to
+    /// `plain`, says why (systemd-run's stderr), and flags the pane
+    /// `unprotected=cgroup`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pty_holder_spike_auto_falls_back_to_plain_when_the_scope_spawn_fails() {
+        if !auto_would_try_scope() {
+            eprintln!(
+                "SKIPPED pty_holder_spike_auto_falls_back_to_plain_when_the_scope_spawn_fails: \
+                 this test process is not in a systemd unit cgroup with a user systemd"
+            );
+            return;
+        }
+        let mut reap = Reap::default();
+        let (fakebin, path) = failing_systemd_run_path();
+        reap.dirs.push(fakebin);
+        let mut parent = Command::new(RUNNER_BIN)
+            .args([SPIKE_PARENT_FLAG, "--route", "auto", "--", "sleep", "3600"])
+            .env("PATH", &path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn parent");
+        let out = parent.stdout.take();
+        reap.children.push(parent);
+        let line = read_line_bounded(out.unwrap());
+        let (holder_pid, child_pid) = pids_of(&line);
+        reap.track(child_pid);
+        reap.track(holder_pid);
+        assert_eq!(report_str(&line, "route"), Some("plain"), "{line:?}");
+        assert_eq!(
+            report_str(&line, "fallback_from"),
+            Some("scope"),
+            "{line:?}"
+        );
+        assert!(
+            report_str(&line, "reason").is_some_and(|r| r.contains("boom-from-fake-systemd-run")),
+            "reason must carry systemd-run's stderr: {line:?}"
+        );
+        assert_eq!(report_str(&line, "unprotected"), Some("cgroup"), "{line:?}");
+        assert_eq!(report_str(&line, "holder_unit"), None, "{line:?}");
+    }
+
+    /// M2: a FORCED `--route scope` never falls back — it fails loudly with
+    /// systemd-run's stderr and a non-zero exit.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pty_holder_spike_forced_scope_fails_loudly_without_fallback() {
+        let mut reap = Reap::default();
+        let (fakebin, path) = failing_systemd_run_path();
+        reap.dirs.push(fakebin);
+        let mark = marker();
+        let parent = Command::new(RUNNER_BIN)
+            .args([SPIKE_PARENT_FLAG, "--route", "scope", "--", "sleep", &mark])
+            .env("PATH", &path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn parent");
+        let (pi, out) = reap.adopt(parent);
+        let all = read_all_bounded(out.unwrap());
+        assert!(
+            all.starts_with("parent_error=") && all.contains("boom-from-fake-systemd-run"),
+            "forced scope must fail with systemd-run's stderr: {all:?}"
+        );
+        assert!(!all.contains("holder_pid="), "{all:?}");
+        assert!(!all.contains("fallback_from"), "{all:?}");
+        let status = exit_status(&mut reap.children[pi]);
+        assert!(!status.success(), "{status}");
+        assert!(pids_with_arg(&mark).is_empty());
     }
 
     // ── systemd: the killer on a Linux box whose runner is a user service ──
