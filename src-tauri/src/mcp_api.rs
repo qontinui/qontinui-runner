@@ -3452,6 +3452,7 @@ fn hand_off_transport_rung(
         hdr(rung::REPORTER_HEADER),
         hdr(rung::REPORTER_STEP_HEADER),
         hdr(rung::ATTEMPTED_HEADER),
+        hdr(rung::FAILURE_CLASS_HEADER),
         // Runner-observed: this rung DID carry the call as far as this door.
         // The row is written before the upstream forward on purpose — the
         // metric asks whether the rung reached the door, and a row written
@@ -12503,6 +12504,111 @@ mod transport_rung_counter_tests {
                     pending[0].payload["transport"],
                     serde_json::json!("loopback_proxy")
                 );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the handed-off observation never reached the outbox"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Plan 2026-09-20 first-rung, Phase 1: a proxied call carrying EXACTLY the
+    /// static headers the http-arm `.mcp.json` document declares yields a row
+    /// tagged `native_mcp` / `mcp-client`. Built from the document itself, not
+    /// from hand-typed header names, so the config writer and the proxy reader
+    /// are proven to agree end to end.
+    #[tokio::test]
+    async fn proxied_call_with_the_http_arm_headers_is_tagged_native_mcp() {
+        use crate::session::coord_transport_rung::RungEmitter;
+        use crate::session::local_store::OutboxWriter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = std::sync::Arc::new(
+            OutboxWriter::open(dir.path().join("session-outbox.jsonl")).expect("outbox opens"),
+        );
+        let emitter = std::sync::Arc::new(RungEmitter::new(outbox.clone(), uuid::Uuid::new_v4()));
+        let lane = uuid::Uuid::new_v4();
+
+        // The headers the MCP client sends are the document's static map.
+        let doc = crate::coord_mcp::http_proxy_config_json(9876, "nonce-under-test", false);
+        let mut headers = axum::http::HeaderMap::new();
+        for (k, v) in doc["mcpServers"]["coord-mcp"]["headers"]
+            .as_object()
+            .expect("headers object")
+        {
+            headers.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.as_str().unwrap().parse().unwrap(),
+            );
+        }
+
+        hand_off_transport_rung(
+            emitter,
+            lane,
+            &headers,
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"coord_inbox","arguments":{}}}"#,
+            "https://coord.qontinui.io/mcp",
+            None,
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let pending = outbox.pending().expect("pending readable");
+            if !pending.is_empty() {
+                assert_eq!(pending.len(), 1);
+                let p = &pending[0].payload;
+                assert_eq!(p["transport"], serde_json::json!("native_mcp"));
+                assert_eq!(p["reporter"], serde_json::json!("mcp-client"));
+                assert_eq!(p["failure_class"], serde_json::Value::Null);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the handed-off observation never reached the outbox"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Plan 2026-09-20 first-rung, Phase 3: a declared failure class reaches
+    /// the payload's own `failure_class` key through the proxy's header read —
+    /// validated, and never in the runner-observed `failure_reason`.
+    #[tokio::test]
+    async fn proxied_failure_class_declaration_lands_in_failure_class() {
+        use crate::session::coord_transport_rung::{
+            RungEmitter, ATTEMPTED_HEADER, FAILURE_CLASS_HEADER, TRANSPORT_HEADER,
+        };
+        use crate::session::local_store::OutboxWriter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = std::sync::Arc::new(
+            OutboxWriter::open(dir.path().join("session-outbox.jsonl")).expect("outbox opens"),
+        );
+        let emitter = std::sync::Arc::new(RungEmitter::new(outbox.clone(), uuid::Uuid::new_v4()));
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(TRANSPORT_HEADER, "loopback_proxy".parse().unwrap());
+        headers.insert(ATTEMPTED_HEADER, "native_mcp".parse().unwrap());
+        headers.insert(FAILURE_CLASS_HEADER, "Runner_Nonce".parse().unwrap());
+
+        hand_off_transport_rung(
+            emitter,
+            uuid::Uuid::new_v4(),
+            &headers,
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            "https://coord.qontinui.io/mcp",
+            None,
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let pending = outbox.pending().expect("pending readable");
+            if !pending.is_empty() {
+                let p = &pending[0].payload;
+                assert_eq!(p["failure_class"], serde_json::json!("runner_nonce"));
+                assert_eq!(p["failure_reason"], serde_json::Value::Null);
+                assert_eq!(p["attempted"], serde_json::json!(["native_mcp"]));
                 break;
             }
             assert!(

@@ -8095,11 +8095,31 @@ fn coord_mcp_proxy_config_json(
     proxy_config_json_for(bound_port, nonce, identity, false)
 }
 
-/// The http-transport document — today's shape, byte-for-byte — with the
-/// AGENT principal marker added to `headers` when `agent_marked`. This is the
-/// `{url, headers}` contract; the stdio arm carries exactly this object into
-/// the credential file rather than inline.
-fn http_proxy_config_json(bound_port: u16, nonce: &str, agent_marked: bool) -> serde_json::Value {
+/// The http-transport document, with the AGENT principal marker added to
+/// `headers` when `agent_marked`. This is the `{url, headers}` contract; the
+/// stdio arm carries exactly this object into the credential file rather than
+/// inline.
+///
+/// ## The transport-rung declaration (plan 2026-09-20 first-rung, Phase 1)
+///
+/// `headers` also carries `x-qontinui-transport: native_mcp` and
+/// `x-qontinui-reporter: mcp-client`. The MCP client sends its static headers
+/// on every call, so a native coord tool call through this arm lands at the
+/// runner's `/coord-mcp` proxy tagged as the first rung — made by
+/// fleet-provisioned config the session never touches (Design decision D1),
+/// where before every such row read `transport: unknown`. The proxy strips both
+/// before the upstream forward (`DECLARATION_HEADERS`), so coord never sees the
+/// claim.
+///
+/// Under the stdio arm these two keys ride into the credential file too, and
+/// go no further: the shim's `load_credential` copies only its three
+/// allowlisted auth headers and declares its own rung in code.
+pub(crate) fn http_proxy_config_json(
+    bound_port: u16,
+    nonce: &str,
+    agent_marked: bool,
+) -> serde_json::Value {
+    use crate::session::coord_transport_rung as rung;
     let mut doc = serde_json::json!({
         "mcpServers": {
             "coord-mcp": {
@@ -8108,6 +8128,8 @@ fn http_proxy_config_json(bound_port: u16, nonce: &str, agent_marked: bool) -> s
                 "headers": {
                     (PROXY_AUTHORIZATION_HEADER_JSON): format!("{PROXY_BEARER_PREFIX}{nonce}"),
                     (COORD_MCP_PROXY_KEY_HEADER_JSON): nonce,
+                    (rung::TRANSPORT_HEADER): rung::TRANSPORT_NATIVE_MCP,
+                    (rung::REPORTER_HEADER): rung::REPORTER_MCP_CLIENT,
                 }
             }
         }
@@ -12891,6 +12913,39 @@ mod tests {
         assert!(
             !crate::coord_mcp_config::looks_like_jwt("abc123"),
             "the proxy shape must never bake a static bearer TOKEN"
+        );
+        // Plan 2026-09-20 first-rung, Phase 1: the http arm declares the native
+        // rung in its static headers, spelled from the rung vocabulary's own
+        // constants so the two cannot drift.
+        use crate::session::coord_transport_rung as rung;
+        assert_eq!(server["headers"][rung::TRANSPORT_HEADER], "native_mcp");
+        assert_eq!(server["headers"][rung::REPORTER_HEADER], "mcp-client");
+        assert_eq!(
+            server["headers"]["x-qontinui-transport"], "native_mcp",
+            "the wire header name is the one the proxy reads"
+        );
+        assert_eq!(server["headers"]["x-qontinui-reporter"], "mcp-client");
+    }
+
+    /// Plan 2026-09-20 first-rung, Phase 1: the AGENT-marked twin carries the
+    /// same rung declaration as the device document — the marker is additive,
+    /// it does not replace the declaration.
+    #[test]
+    fn agent_marked_http_document_also_declares_the_native_rung() {
+        use crate::session::coord_transport_rung as rung;
+        let v = http_proxy_config_json(9877, "abc123", true);
+        let headers = &v["mcpServers"]["coord-mcp"]["headers"];
+        assert_eq!(
+            headers[COORD_MCP_PRINCIPAL_HEADER_JSON],
+            COORD_MCP_PRINCIPAL_AGENT
+        );
+        assert_eq!(headers[rung::TRANSPORT_HEADER], rung::TRANSPORT_NATIVE_MCP);
+        assert_eq!(headers[rung::REPORTER_HEADER], rung::REPORTER_MCP_CLIENT);
+        // The nonce is still readable through the one resolver every
+        // runner-side reader uses — the new keys did not disturb it.
+        assert_eq!(
+            crate::coord_mcp_config::proxy_nonce_from_header_object(headers).as_deref(),
+            Some("abc123")
         );
     }
 
