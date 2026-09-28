@@ -66,18 +66,15 @@ export function useInteractivityProbe(
         try {
           await invoke("remote_interactivity_probe", { deviceId: device, trigger: "fleet_view" });
           if (!mounted.current) break;
-          setErrors((prev) => {
-            if (!(device in prev)) return prev;
-            const next = { ...prev };
-            delete next[device];
-            return next;
-          });
+          setErrors((prev) => withoutDevice(prev, device));
           onSweptRef.current();
         } catch (err) {
           if (!mounted.current) break;
           // `throttled` = this device was swept moments ago (a re-mounted
-          // view): already measured, not a failure. Re-read what it filed.
+          // view): already measured, not a failure — clear any stale error
+          // exactly as a success does, and re-read what was filed.
           if (String(err).startsWith("remote_interactivity_probe:throttled:")) {
+            setErrors((prev) => withoutDevice(prev, device));
             onSweptRef.current();
             continue;
           }
@@ -92,4 +89,12 @@ export function useInteractivityProbe(
   }, [devices, enabled]);
 
   return { sweeping, errors };
+}
+
+/** `errors` without `device` — the same object when there was nothing to drop. */
+function withoutDevice(errors: Record<string, string>, device: string): Record<string, string> {
+  if (!(device in errors)) return errors;
+  const next = { ...errors };
+  delete next[device];
+  return next;
 }
