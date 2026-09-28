@@ -103,8 +103,15 @@ pub const ROUTES: [&str; 5] = ["auto", "plain", "scope", "breakaway", "wmi"];
 /// failure, teardown and `auto` fallback paths all still run. Spike-only
 /// override; default [`DEFAULT_REPORT_TIMEOUT`].
 pub const REPORT_TIMEOUT_ENV: &str = "QONTINUI_PTY_HOLDER_SPIKE_REPORT_TIMEOUT_MS";
-/// Default for [`REPORT_TIMEOUT_ENV`].
-pub const DEFAULT_REPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Default for [`REPORT_TIMEOUT_ENV`]: 120 s, the same allowance the
+/// integration tests give a slow debug holder on a loaded box — a deadline
+/// shorter than that would kill a slow-but-healthy holder as "silent".
+pub const DEFAULT_REPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long [`SpawnedHolder::abandon`] lets `systemctl --user stop --no-block`
+/// take before killing it: `--no-block` only enqueues the stop job, but the
+/// D-Bus call itself can still hang on a wedged user manager.
+pub const SYSTEMCTL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// TEST HOOK (spike-only): a comma list of [`HostFacts`] fields to force
 /// `true` — `in_unit_cgroup`, `scope_tooling` — so the `auto`-scope paths can
@@ -297,6 +304,9 @@ pub fn success_pids(line: &str) -> Option<(i32, i32)> {
 /// session (portable-pty's child `setsid()`s onto the PTY). `None` when the
 /// identity cannot be verified — callers then rely on the holder's death (or
 /// the scope unit's stop) instead of signalling a pid that may be recycled.
+///
+/// **Only confirms on Linux** (it reads `/proc`). Elsewhere it always answers
+/// `None`, so off Linux a teardown never signals the PTY child explicitly.
 #[cfg(target_os = "linux")]
 pub fn verified_pty_child(line: &str) -> Option<i32> {
     let (holder, child) = success_pids(line)?;
@@ -308,6 +318,7 @@ pub fn verified_pty_child(line: &str) -> Option<i32> {
     (ppid == holder && session == child).then_some(child)
 }
 
+/// Non-Linux: identity cannot be confirmed, so never a pid (see the Linux doc).
 #[cfg(not(target_os = "linux"))]
 pub fn verified_pty_child(_line: &str) -> Option<i32> {
     None
@@ -872,16 +883,33 @@ impl SpawnedHolder {
             .collect()
     }
 
+    /// Whether `line` is a success line whose `holder_pid` is the process we
+    /// actually spawned. On the plain and scope routes the holder IS that
+    /// process (`systemd-run --scope` execs it); anything else is not a
+    /// report this spawner can trust.
+    fn reports_this_holder(&self, line: &str) -> bool {
+        success_pids(line).is_some_and(|(holder, _)| holder as u32 == self.child.id())
+    }
+
     /// Leave nothing behind, in this order:
-    /// 1. SIGKILL the PTY child named by `line` — only a SUCCESS line, and
-    ///    only once [`verified_pty_child`] confirms it is still that process;
-    ///    unverifiable → no explicit signal (steps 2-3 still end it: the unit
-    ///    stop kills its cgroup, and the holder's death hangs up its PTY).
-    /// 2. Stop the holder's scope unit, if any (everything in it dies).
-    /// 3. Kill and reap the holder process itself.
+    /// 1. SIGKILL the PTY child named by `line` — only a SUCCESS line whose
+    ///    `holder_pid` is our own spawned process, and only once
+    ///    [`verified_pty_child`] confirms it is still that process (Linux
+    ///    only); unverifiable → no explicit signal (steps 2-3 still end it:
+    ///    the unit stop kills its cgroup, and the holder's death hangs up its
+    ///    PTY).
+    /// 2. Stop the holder's scope unit, if any, with `--no-block` behind
+    ///    [`SYSTEMCTL_DEADLINE`] — the unit's processes are killed by the
+    ///    manager asynchronously.
+    /// 3. Kill and reap the holder process itself (the scope route's holder
+    ///    is our direct child, so this does not wait on the manager).
+    ///
+    /// End-to-end bound: at most [`SYSTEMCTL_DEADLINE`] (5 s) plus a
+    /// SIGKILL-and-reap, even with a wedged user manager.
     fn abandon(&mut self, line: &str) {
         #[cfg(unix)]
-        if let Some(child_pid) = verified_pty_child(line) {
+        if let Some(child_pid) = verified_pty_child(line).filter(|_| self.reports_this_holder(line))
+        {
             // SAFETY: a plain signal to a pid in 2..=i32::MAX whose parent and
             // session were just verified against our own holder's report.
             unsafe {
@@ -891,12 +919,22 @@ impl SpawnedHolder {
         #[cfg(not(unix))]
         let _ = line;
         if let Some(unit) = &self.unit {
-            let _ = Command::new("systemctl")
-                .args(["--user", "stop", "--quiet", unit])
+            let spawned = Command::new("systemctl")
+                .args(["--user", "stop", "--no-block", "--quiet", unit])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .status();
+                .spawn();
+            if let Ok(mut systemctl) = spawned {
+                let deadline = std::time::Instant::now() + SYSTEMCTL_DEADLINE;
+                while matches!(systemctl.try_wait(), Ok(None))
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                let _ = systemctl.kill();
+                let _ = systemctl.wait();
+            }
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -973,6 +1011,17 @@ fn run_parent(args: &[OsString]) -> i32 {
     if is_error_line(&line) {
         holder.abandon(&line);
         return fail("parent", &format!("holder failed: {line}"), report_file, 1);
+    }
+    if !holder.reports_this_holder(&line) {
+        // Not a report from the process we spawned: trust none of its pids.
+        let spawned = holder.child.id();
+        holder.abandon("");
+        return fail(
+            "parent",
+            &format!("holder report does not name the spawned holder (pid {spawned}): {line}"),
+            report_file,
+            1,
+        );
     }
     let mut relay = format!("{line} route={}", route.as_str());
     if let Some(reason) = &fallback {

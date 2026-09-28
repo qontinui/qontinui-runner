@@ -182,21 +182,13 @@ mod unix {
 
     impl Drop for Reap {
         fn drop(&mut self) {
-            // Marker processes first: stop the holder scope each one lives in
-            // (only `qontinui-pty-holder-*` — our own prefix), then SIGKILL
-            // it. The unique argv IS the identity check.
+            // Marker processes: SIGKILL any live process carrying this
+            // test's unique 128-bit marker argument (the marker IS the
+            // identity check). No unit is ever DISCOVERED from a marker — a
+            // cgroup path lists ancestors too, and one of them may be the
+            // scope hosting this very test.
             #[cfg(target_os = "linux")]
             for mark in &self.markers {
-                for pid in pids_with_arg(mark) {
-                    if let Some(unit) = holder_scope_of(pid) {
-                        let _ = Command::new("systemctl")
-                            .args(["--user", "stop", "--quiet", &unit])
-                            .stdin(Stdio::null())
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .status();
-                    }
-                }
                 for pid in pids_with_arg(mark) {
                     // SAFETY: a pid whose argv carries this test's unique marker.
                     unsafe {
@@ -204,7 +196,14 @@ mod unix {
                     }
                 }
             }
+            // Units: only names this test learned from a `holder_unit=` line
+            // or created itself, and never one that hosts THIS process.
+            let own_cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
             for unit in &self.units {
+                if own_cgroup.contains(&format!("/{unit}.")) {
+                    eprintln!("Reap: NOT stopping {unit}: it hosts this test process");
+                    continue;
+                }
                 let _ = Command::new("systemctl")
                     .args(["--user", "stop", "--quiet", unit])
                     .stdin(Stdio::null())
@@ -231,17 +230,6 @@ mod unix {
                 let _ = std::fs::remove_dir_all(d);
             }
         }
-    }
-
-    /// The `qontinui-pty-holder-*` scope unit `pid` lives in, if any.
-    #[cfg(target_os = "linux")]
-    fn holder_scope_of(pid: i32) -> Option<String> {
-        use qontinui_runner_lib::pty_holder::spike::HOLDER_UNIT_PREFIX;
-        let cg = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
-        cg.lines()
-            .flat_map(|l| l.rsplit('/'))
-            .find(|c| c.starts_with(HOLDER_UNIT_PREFIX) && c.ends_with(".scope"))
-            .map(|c| c.trim_end_matches(".scope").to_string())
     }
 
     /// Print a SKIPPED line — or FAIL when `PTY_HOLDER_REQUIRE_SCOPE=1`, so a
@@ -481,8 +469,10 @@ mod unix {
     /// A `sleep` argument unique to one test, so leftovers can be found by
     /// cmdline without knowing their pids.
     fn marker() -> String {
-        let n = uuid::Uuid::new_v4().as_u128() % 1_000_000;
-        format!("3599.{n:06}")
+        // ~106 bits of the UUID as the fraction (GNU sleep accepts it), so a
+        // collision with any process not spawned by this test is negligible.
+        let n = uuid::Uuid::new_v4().as_u128() % 10u128.pow(32);
+        format!("3599.{n:032}")
     }
 
     /// Pids whose argv contains `marker` exactly.
