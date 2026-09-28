@@ -1054,11 +1054,12 @@ static NATIVE_HANG_SURFACED: AtomicBool = AtomicBool::new(false);
 /// wedged — the main window destroyed and its rebuild waiting on the window
 /// system.
 ///
-/// Separate from [`RECOVERY_WEDGE_REPORTED`] for the same reason the two above
-/// are separate from each other: that one de-duplicates the durable breadcrumb,
-/// this one the user-facing notice, and neither may silence the other. Re-armed
-/// alongside it by [`InProgressGuard::drop`], so each wedge surfaces once and a
-/// later wedge surfaces again.
+/// Paired with [`RECOVERY_WEDGE_REPORTED`], not independent of it:
+/// [`report_recovery_wedge`] returns early once that latch is armed, so the
+/// notice is reached only on the call that arms it — one breadcrumb and one
+/// notice per wedge. This latch is the at-most-once guard
+/// [`surface_incident_to_user`] requires of every caller. Both are re-armed
+/// together by [`InProgressGuard::drop`], so a later wedge surfaces again.
 static RECOVERY_WEDGE_SURFACED: AtomicBool = AtomicBool::new(false);
 
 /// True while the recovery ladder is between `destroy()` and the rebuild of the
@@ -1867,8 +1868,11 @@ fn report_recovery_wedge(app: &tauri::AppHandle, refused: RecoveryReason, in_fli
         "The runner's window is being rebuilt after its UI stopped responding, and the rebuild \
          has been waiting on the window system for {waiting_secs} seconds so far.\n\n\
          Automation and the API on port 9876 are still running, and your sessions are NOT \
-         lost. The window normally comes back on its own within a few minutes.\n\n\
-         Do not restart the runner: that would end every session currently in flight. An \
+         lost right now. The window usually returns on its own once the window system \
+         answers.\n\n\
+         If it has not come back after several minutes it may be stuck for good, and the only \
+         way out is to end the Qontinui Runner process from Task Manager — which ends every \
+         session in flight, so check http://127.0.0.1:9876/restart-readiness first. An \
          incident line has been written to wedge-incidents.log in the runner's dev-logs \
          directory."
     );
@@ -2543,16 +2547,44 @@ async fn recreate_main_window(app: &tauri::AppHandle) -> Result<(), String> {
 
 /// Best-effort: rebuild where the window actually is, not where it booted.
 fn capture_placement(win: &tauri::WebviewWindow, fallback: &WindowPlacement) -> WindowPlacement {
-    if win.is_maximized().unwrap_or(false) {
+    placement_from_snapshot(
+        win.is_minimized().unwrap_or(false),
+        win.is_maximized().unwrap_or(false),
+        win.outer_position().ok().map(|p| (p.x, p.y)),
+        win.outer_size().ok().map(|s| (s.width, s.height)),
+        fallback,
+    )
+}
+
+/// The placement a recreate should rebuild at, from one read of the old window.
+///
+/// A minimized main window must not be rebuilt where it "is": on Windows that
+/// is the iconic sentinel `(-32000, -32000)` with a small non-zero caption-strip
+/// size, which would rebuild the window parked off-screen — the main-window
+/// twin of the pop-out geometry bug (plan
+/// `2026-09-28-runner-popout-window-geometry-poisoning-and-webview-recovery-wedge`).
+/// So a minimized window, and any rect the shared
+/// [`crate::window_assignments::is_restorable_rect`] rejects, falls back to the
+/// boot placement. Pure, so the decision is testable without a live window.
+fn placement_from_snapshot(
+    minimized: bool,
+    maximized: bool,
+    pos: Option<(i32, i32)>,
+    size: Option<(u32, u32)>,
+    fallback: &WindowPlacement,
+) -> WindowPlacement {
+    if minimized {
+        return fallback.clone();
+    }
+    if maximized {
         return WindowPlacement::Maximized;
     }
-    match (win.outer_position(), win.outer_size()) {
-        (Ok(pos), Ok(size)) if size.width > 0 && size.height > 0 => WindowPlacement::Positioned {
-            x: pos.x,
-            y: pos.y,
-            w: size.width,
-            h: size.height,
-        },
+    match (pos, size) {
+        (Some((x, y)), Some((w, h)))
+            if crate::window_assignments::is_restorable_rect(x, y, w, h) =>
+        {
+            WindowPlacement::Positioned { x, y, w, h }
+        }
         _ => fallback.clone(),
     }
 }
@@ -3667,6 +3699,73 @@ mod tests {
         );
         // Leave the shared statics as we found them for the other tests.
         EXHAUSTION_SURFACED.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn placement_from_snapshot_never_rebuilds_at_a_minimized_position() {
+        // `SecondaryDefault` as the fallback: distinguishable from every
+        // placement the snapshot itself can produce.
+        let fb = WindowPlacement::SecondaryDefault;
+        let is_fallback = |p: WindowPlacement| matches!(p, WindowPlacement::SecondaryDefault);
+        // Windows' minimized main window: the sentinel corner with a small,
+        // NON-zero caption strip — a size-only guard lets this through.
+        assert!(is_fallback(placement_from_snapshot(
+            true,
+            false,
+            Some((-32000, -32000)),
+            Some((160, 28)),
+            &fb
+        )));
+        // Minimized wins even over a maximized read or a plausible rect.
+        assert!(is_fallback(placement_from_snapshot(
+            true,
+            true,
+            Some((10, 10)),
+            Some((800, 600)),
+            &fb
+        )));
+        // The sentinel without a minimized report is rejected by the shared rule.
+        assert!(is_fallback(placement_from_snapshot(
+            false,
+            false,
+            Some((-32000, -32000)),
+            Some((160, 28)),
+            &fb
+        )));
+    }
+
+    #[test]
+    fn placement_from_snapshot_keeps_a_real_window_where_it_is() {
+        let fb = WindowPlacement::SecondaryDefault;
+        let is_fallback = |p: WindowPlacement| matches!(p, WindowPlacement::SecondaryDefault);
+        assert!(matches!(
+            placement_from_snapshot(false, false, Some((-1920, 40)), Some((1200, 800)), &fb),
+            WindowPlacement::Positioned {
+                x: -1920,
+                y: 40,
+                w: 1200,
+                h: 800
+            }
+        ));
+        assert!(matches!(
+            placement_from_snapshot(false, true, Some((0, 0)), Some((1920, 1040)), &fb),
+            WindowPlacement::Maximized
+        ));
+        // A zero size or an unreadable rect keeps the fallback, as before.
+        assert!(is_fallback(placement_from_snapshot(
+            false,
+            false,
+            Some((10, 10)),
+            Some((0, 0)),
+            &fb
+        )));
+        assert!(is_fallback(placement_from_snapshot(
+            false,
+            false,
+            None,
+            Some((800, 600)),
+            &fb
+        )));
     }
 
     #[test]
