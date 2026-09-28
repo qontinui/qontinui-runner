@@ -2562,6 +2562,12 @@ impl RemoteAttachClient {
         if let Ok(mut pending) = self.pending.lock() {
             pending.insert(request_id.clone(), tx);
         }
+        // A caller that DROPS this future (a cancelled probe sweep, a timeout
+        // wrapped around the attach) must not leave its waiter behind.
+        let _pending = PendingEntryGuard {
+            client: self,
+            request_id: &request_id,
+        };
         if !self.outbound_pump_state().0 {
             self.take_pending(&request_id);
             return Err(relay_not_connected("attach"));
@@ -2602,6 +2608,11 @@ impl RemoteAttachClient {
 
     fn take_pending(&self, request_id: &str) -> Option<PendingAttach> {
         self.pending.lock().ok()?.remove(request_id)
+    }
+
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        self.pending.lock().map(|p| p.len()).unwrap_or(0)
     }
 
     fn take_pending_create(&self, request_id: &str) -> Option<PendingCreate> {
@@ -2699,6 +2710,10 @@ impl RemoteAttachClient {
         if let Ok(mut pending) = self.pending.lock() {
             pending.insert(request_id.clone(), tx);
         }
+        let _pending = PendingEntryGuard {
+            client: self,
+            request_id: &request_id,
+        };
         let frame = json!({
             "type": "remote_terminal_buffer",
             "request_id": request_id,
@@ -3195,6 +3210,20 @@ impl RemoteAttachClient {
                 );
             }
         }
+    }
+}
+
+/// Removes a request's entry from `pending` when the request future ends —
+/// normally a no-op (the reply or the timeout arm already took it), but the
+/// only cleanup when the future is DROPPED mid-wait.
+struct PendingEntryGuard<'a> {
+    client: &'a RemoteAttachClient,
+    request_id: &'a str,
+}
+
+impl Drop for PendingEntryGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.client.take_pending(self.request_id);
     }
 }
 
@@ -4772,6 +4801,38 @@ mod tests {
         resync["type"] = json!("remote_terminal_buffer");
         assert!(client.handle_inbound("remote_terminal_buffer", &resync));
         assert_eq!(pane.remote_offset(), 1_008);
+    }
+
+    /// A cancelled attach or history request (the future dropped mid-wait)
+    /// leaves no waiter behind in `pending`.
+    #[tokio::test]
+    async fn a_dropped_request_future_removes_its_pending_entry() {
+        let client = RemoteAttachClient::new();
+        let _pump = client.lock_outbound().await;
+        let r = tokio::time::timeout(
+            Duration::from_millis(20),
+            client.attach("grant.jwt", 80, 24, Duration::from_secs(60)),
+        )
+        .await;
+        assert!(r.is_err(), "cancelled mid-wait");
+        assert_eq!(client.pending_len(), 0, "attach waiter removed on drop");
+
+        let pane = RemotePaneIo::new(
+            "jti-h",
+            "t",
+            "g",
+            client.sink(),
+            80,
+            24,
+            AttachedRing::default(),
+        );
+        let r = tokio::time::timeout(
+            Duration::from_millis(20),
+            client.request_history(&pane, 5, 5, Duration::from_secs(60)),
+        )
+        .await;
+        assert!(r.is_err());
+        assert_eq!(client.pending_len(), 0, "history waiter removed on drop");
     }
 
     /// A1 source side: a `remote_terminal_input_ack` is routed to the pane by

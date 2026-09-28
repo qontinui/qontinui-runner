@@ -176,6 +176,9 @@ pub(crate) trait ProbeDoors: Send + Sync {
     /// Whether a relay connection holds the outbound pump right now — a frame
     /// queued otherwise is discarded, so a sweep mints nothing without one.
     fn relay_connected(&self) -> bool;
+    /// Where this runner remembers its probe attempts (process-wide in
+    /// production; per test otherwise).
+    fn attempts(&self) -> &ProbeAttempts;
     /// Whether THIS runner already has a live tab onto `session_id`. Such a
     /// session is measured by that tab's traffic; probing it would only be
     /// refused as held — by us.
@@ -353,19 +356,80 @@ pub(crate) fn skip_reason(
     if fact_is_fresh(read, fresh_for_secs, now) && write_is_unmeasurable(write) {
         return Some("write_unmeasurable");
     }
-    // And a read this runner's own probe filed less than PROBE_EVERY ago is not
-    // re-probed, whatever the write half says.
+    // And a read any probe filed within the re-probe window is not re-probed,
+    // whatever the write half says.
     if read.is_some_and(|f| f.get("via").and_then(|v| v.as_str()) == Some("probe"))
-        && fact_is_fresh(
-            read,
-            (PROBE_EVERY.as_secs() as i64).min(fresh_for_secs),
-            now,
-        )
+        && fact_is_fresh(read, reprobe_window_secs(fresh_for_secs), now)
     {
         return Some("recently_probed");
     }
     None
 }
+
+/// Slack taken off the re-probe window. A sweep records its attempts (and
+/// coord its facts) some seconds AFTER the scheduler tick that started it, so
+/// a window of exactly [`PROBE_EVERY`] would make the next tick see every row
+/// as probed "PROBE_EVERY minus a few seconds" ago and skip it — probing each
+/// row only every OTHER period, past the freshness window.
+const REPROBE_SLACK: Duration = Duration::from_secs(120);
+
+/// How long after a probe a row is not probed again, in seconds:
+/// `min(PROBE_EVERY, freshFor) - REPROBE_SLACK`.
+fn reprobe_window_secs(fresh_for_secs: i64) -> i64 {
+    ((PROBE_EVERY.as_secs() as i64).min(fresh_for_secs) - REPROBE_SLACK.as_secs() as i64).max(0)
+}
+
+/// In-process memory of when each session was last PROBED, whatever came of
+/// it. Coord only remembers what was filed, and several outcomes file nothing
+/// that marks the row as recently looked at (a mint refusal, a target
+/// mismatch, an unreachable or busy target): without this, every sweep would
+/// re-spend a grant on them. Bounded; the oldest entries go first.
+#[derive(Default)]
+pub(crate) struct ProbeAttempts {
+    last: Mutex<std::collections::HashMap<String, std::time::Instant>>,
+}
+
+/// Bound on [`ProbeAttempts`].
+const PROBE_ATTEMPTS_CAP: usize = 4096;
+
+impl ProbeAttempts {
+    pub(crate) fn note(&self, session_id: &str, at: std::time::Instant) {
+        let mut g = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let key = session_id.trim().to_ascii_lowercase();
+        if !g.contains_key(&key) && g.len() >= PROBE_ATTEMPTS_CAP {
+            g.retain(|_, t| at.saturating_duration_since(*t) < PROBE_EVERY);
+            while g.len() >= PROBE_ATTEMPTS_CAP {
+                let Some(oldest) = g.iter().min_by_key(|(_, t)| **t).map(|(k, _)| k.clone()) else {
+                    break;
+                };
+                g.remove(&oldest);
+            }
+        }
+        g.insert(key, at);
+    }
+
+    /// Whether `session_id` was probed within the re-probe window before `now`.
+    pub(crate) fn recently(
+        &self,
+        session_id: &str,
+        fresh_for_secs: i64,
+        now: std::time::Instant,
+    ) -> bool {
+        let g = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        g.get(&session_id.trim().to_ascii_lowercase())
+            .is_some_and(|t| {
+                (now.saturating_duration_since(*t).as_secs() as i64)
+                    < reprobe_window_secs(fresh_for_secs)
+            })
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.last.lock().unwrap().len()
+    }
+}
+
+static PROBE_ATTEMPTS: OnceLock<ProbeAttempts> = OnceLock::new();
 
 /// coord's `NON_LIVE_STATES` (`stale`, `expected`) plus `closed`.
 const NON_LIVE_STATES: [&str; 3] = ["stale", "expected", "closed"];
@@ -522,7 +586,13 @@ pub(crate) async fn run_probe_sweep(
             continue;
         }
         let reason = skip_reason(row, flags.fresh_for_secs, Utc::now())
-            .or_else(|| doors.live_tab_here(&session_id).then_some("live_tab_here"));
+            .or_else(|| doors.live_tab_here(&session_id).then_some("live_tab_here"))
+            .or_else(|| {
+                doors
+                    .attempts()
+                    .recently(&session_id, flags.fresh_for_secs, std::time::Instant::now())
+                    .then_some("recently_attempted")
+            });
         if let Some(reason) = reason {
             outcomes.push(RowOutcome {
                 session_id,
@@ -532,6 +602,11 @@ pub(crate) async fn run_probe_sweep(
             });
             continue;
         }
+        // Recorded BEFORE the probe, so a row whose probe is cancelled
+        // mid-way is not immediately re-probed either.
+        doors
+            .attempts()
+            .note(&session_id, std::time::Instant::now());
         outcomes.push(probe_row(doors, device_id, &session_id).await);
     }
     Ok(ProbeSweepReport {
@@ -607,6 +682,14 @@ async fn probe_row(doors: &dyn ProbeDoors, device_id: &str, session_id: &str) ->
         }
     };
     out.grant_jti = Some(minted.grant_jti.clone());
+    // From the mint until the pane guard takes over: a DROPPED sweep future
+    // (cancelled mid-attach) must not leave the grant's pending-output slot,
+    // or a half-registered route, behind.
+    let mut grant_guard = GrantGuard {
+        doors,
+        grant_jti: minted.grant_jti.clone(),
+        armed: true,
+    };
     if !coord_places_session_on(device_id, minted.target_device_id.as_deref()) {
         out.attach_error = Some(format!(
             "target_mismatch: coord placed the session on {:?}, not {device_id}",
@@ -668,6 +751,8 @@ async fn probe_row(doors: &dyn ProbeDoors, device_id: &str, session_id: &str) ->
         pane: pane.clone(),
         armed: true,
     };
+    // The pane guard now owns the teardown (it forgets the same grant).
+    grant_guard.armed = false;
 
     // 3. read probe — the empty range at the end of the target's ring.
     let at = reply.ring.total_bytes_produced;
@@ -695,6 +780,24 @@ async fn probe_row(doors: &dyn ProbeDoors, device_id: &str, session_id: &str) ->
     doors.forget(&minted.grant_jti);
     out.frames_sent = sink.sent().len();
     out
+}
+
+/// Forgets a minted grant's routing state (the pending-output slot an
+/// `attached` reply opens) if the probe future is dropped between the mint and
+/// the pane's registration. Harmless on the paths that return normally: a
+/// forget of a jti nothing routes is a no-op.
+struct GrantGuard<'a> {
+    doors: &'a dyn ProbeDoors,
+    grant_jti: String,
+    armed: bool,
+}
+
+impl Drop for GrantGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.doors.forget(&self.grant_jti);
+        }
+    }
 }
 
 /// Tears a probe pane down if the probe never reached its own detach — the
@@ -1088,6 +1191,10 @@ impl ProbeDoors for RunnerDoors {
             .0
     }
 
+    fn attempts(&self) -> &ProbeAttempts {
+        PROBE_ATTEMPTS.get_or_init(ProbeAttempts::default)
+    }
+
     fn live_tab_here(&self, session_id: &str) -> bool {
         use tauri::Manager as _;
         let Some(tm) = self
@@ -1198,6 +1305,10 @@ async fn scheduled_sweep(app: &tauri::AppHandle) {
     for device in devices {
         match run_guarded(&doors, &device, "scheduler").await {
             Ok(report) => log_report(&report),
+            Err(e) if e.door == THROTTLED_DOOR => tracing::debug!(
+                device_id = %device,
+                "remote interactivity probe: scheduled sweep skipped — already measured ({e})"
+            ),
             Err(e) => {
                 warn!(device_id = %device, error = %e, "remote interactivity probe: scheduled sweep failed")
             }
@@ -1271,6 +1382,9 @@ mod tests {
         relay_up: bool,
         /// The read probe never answers (to cancel a sweep mid-probe).
         read_probe_hangs: bool,
+        /// The attach never answers (to cancel a sweep mid-attach).
+        attach_hangs: bool,
+        attempts: ProbeAttempts,
     }
 
     /// Every frame the relay would carry, and — for a zero-byte probe — the
@@ -1322,6 +1436,8 @@ mod tests {
                 live_tab: None,
                 relay_up: true,
                 read_probe_hangs: false,
+                attach_hangs: false,
+                attempts: ProbeAttempts::default(),
             }
         }
 
@@ -1426,6 +1542,9 @@ mod tests {
             _cols: u16,
             _rows: u16,
         ) -> Result<AttachedReply, AttachError> {
+            if self.attach_hangs {
+                std::future::pending::<()>().await;
+            }
             let session = grant.trim_start_matches("grant.jwt.");
             if let Some(code) = self.attach_refusal.lock().unwrap().get(session) {
                 return Err(AttachError {
@@ -1501,6 +1620,10 @@ mod tests {
 
         fn relay_connected(&self) -> bool {
             self.relay_up
+        }
+
+        fn attempts(&self) -> &ProbeAttempts {
+            &self.attempts
         }
     }
 
@@ -1660,6 +1783,65 @@ mod tests {
             Some("write_unmeasurable")
         );
         assert_eq!(*target.minted.lock().unwrap(), 1, "no second grant");
+    }
+
+    /// Convergence on the FAILURE paths: a row whose probe met a busy
+    /// terminal (filed `unknown/held_by_other_source`, which does not mark the
+    /// row as recently probed in coord's facts) is not re-probed by the next
+    /// sweep.
+    #[tokio::test]
+    async fn a_row_whose_probe_failed_is_not_reprobed_by_the_next_sweep() {
+        let target = RecorderTarget::new(vec![row(1, json!({}))]);
+        target.refuse_attach(&sid(1), "attach_terminal_busy");
+        let first = run_probe_sweep(&target, DEVICE, "manual").await.unwrap();
+        assert_eq!(first.outcomes[0].decision, "probed");
+        let second = run_probe_sweep(&target, DEVICE, "scheduler").await.unwrap();
+        assert_eq!(
+            second.outcomes[0].skip_reason.as_deref(),
+            Some("recently_attempted")
+        );
+        assert_eq!(*target.minted.lock().unwrap(), 1, "no second grant");
+    }
+
+    /// The attempt memory is bounded and honours the slack.
+    #[test]
+    fn probe_attempts_are_bounded_and_windowed() {
+        let a = ProbeAttempts::default();
+        let t = std::time::Instant::now();
+        for n in 0..(PROBE_ATTEMPTS_CAP + 10) {
+            a.note(&format!("s{n}"), t + Duration::from_millis(n as u64));
+        }
+        assert!(a.len() <= PROBE_ATTEMPTS_CAP);
+        let last = format!("s{}", PROBE_ATTEMPTS_CAP + 9);
+        assert!(a.recently(&last, 1800, t + Duration::from_secs(60)));
+        // The window is min(PROBE_EVERY, freshFor) - slack: a row attempted a
+        // few seconds into one 20-minute tick is due again at the next.
+        assert!(!a.recently(
+            &last,
+            1800,
+            // `last` was noted ~4.1 s after `t`.
+            t + PROBE_EVERY - REPROBE_SLACK + Duration::from_secs(10)
+        ));
+        assert!(
+            !a.recently("s0", 1800, t + Duration::from_secs(60)),
+            "evicted"
+        );
+    }
+
+    /// A sweep cancelled mid-ATTACH (after the mint, before any pane) forgets
+    /// the minted grant's routing state.
+    #[tokio::test]
+    async fn a_sweep_cancelled_mid_attach_forgets_the_grant() {
+        let mut target = RecorderTarget::new(vec![row(1, json!({}))]);
+        target.attach_hangs = true;
+        let r = tokio::time::timeout(
+            Duration::from_millis(100),
+            run_probe_sweep(&target, DEVICE, "manual"),
+        )
+        .await;
+        assert!(r.is_err());
+        assert!(target.registered.lock().unwrap().is_empty(), "no pane");
+        assert_eq!(target.forgotten.lock().unwrap().clone(), vec![jti(1)]);
     }
 
     /// No relay: a typed `relay` error, before the fleet walk and before any
@@ -1840,7 +2022,7 @@ mod tests {
                 "{reason}"
             );
         }
-        // ...and so is a read our own probe filed under PROBE_EVERY ago.
+        // ...and so is a read any probe filed within the re-probe window.
         assert_eq!(
             skip_reason(
                 &row(
@@ -1947,6 +2129,9 @@ mod tests {
             }
             fn relay_connected(&self) -> bool {
                 true
+            }
+            fn attempts(&self) -> &ProbeAttempts {
+                unreachable!()
             }
         }
         let e = run_probe_sweep(&Down, DEVICE, "manual").await.unwrap_err();
