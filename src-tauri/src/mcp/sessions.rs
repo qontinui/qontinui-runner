@@ -1073,8 +1073,11 @@ async fn context_low(Path(id): Path<String>, body: axum::body::Bytes) -> Json<se
 /// Phase B2, §2a4's resolution: ship via the `qontinui-claude-config`
 /// installer, landing HERE rather than in the runner's own bundled
 /// `--settings`). `{id}` is the runner terminal id the hook script sends
-/// (`QONTINUI_TERMINAL_ID`, falling back to the Claude session id) — the SAME
-/// key space `/sessions/{id}/context-low` uses. Body = the raw Claude
+/// (`QONTINUI_TERMINAL_ID`) and is looked up as an exact terminal id — there
+/// is NO Claude-session-id fallback here (unlike `/sessions/{id}/context-low`,
+/// which only uses its key as a debounce latch): an unknown key answers
+/// `recorded:false`, so the hook stands down when it has no terminal id
+/// (plan vet 2026-09-24, D1). Body = the raw Claude
 /// `Notification` hook payload (parsed LENIENTLY — empty/non-JSON reads as
 /// `{}` so a curl probe works). Always 200: fail-open by design (a broken
 /// watcher must never break a hook), and all policy lives in
