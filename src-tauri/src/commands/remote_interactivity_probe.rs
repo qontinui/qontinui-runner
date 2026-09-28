@@ -173,6 +173,9 @@ pub(crate) trait ProbeDoors: Send + Sync {
     fn report(&self, obs: Observation);
     /// This device, when the mint response does not name it.
     fn local_device_id(&self) -> Option<Uuid>;
+    /// Whether a relay connection holds the outbound pump right now — a frame
+    /// queued otherwise is discarded, so a sweep mints nothing without one.
+    fn relay_connected(&self) -> bool;
     /// Whether THIS runner already has a live tab onto `session_id`. Such a
     /// session is measured by that tab's traffic; probing it would only be
     /// refused as held — by us.
@@ -313,10 +316,21 @@ pub(crate) fn skip_reason(
     if row.get("isCallerDevice").and_then(|v| v.as_bool()) == Some(true) {
         return Some("caller_device");
     }
-    let closed = row.get("state").and_then(|v| v.as_str()) == Some("closed")
-        || row.get("closedAt").is_some_and(|v| !v.is_null());
-    if closed {
+    if row.get("closedAt").is_some_and(|v| !v.is_null()) {
         return Some("closed");
+    }
+    // coord's `NON_LIVE_STATES` plus `closed`: not a live PTY, so nothing to
+    // measure (and coord excludes them from the metric's denominator).
+    if let Some(state) = row
+        .get("state")
+        .and_then(|v| v.as_str())
+        .filter(|s| NON_LIVE_STATES.contains(s))
+    {
+        return Some(match state {
+            "closed" => "closed",
+            "stale" => "stale",
+            _ => "expected",
+        });
     }
     if row.get("interactiveSurface").and_then(|v| v.as_str()) == Some("none") {
         return Some("not_interactive");
@@ -331,7 +345,41 @@ pub(crate) fn skip_reason(
     if fact_is_fresh(read, fresh_for_secs, now) && fact_is_fresh(write, fresh_for_secs, now) {
         return Some("fresh");
     }
+    // Convergence. A probe measures the READ half; the write half it can only
+    // measure against a target known to acknowledge input. So a row whose read
+    // is fresh and whose write coord records as unmeasurable (never probed, or
+    // the target predates acks) would be re-probed every sweep to learn
+    // nothing new.
+    if fact_is_fresh(read, fresh_for_secs, now) && write_is_unmeasurable(write) {
+        return Some("write_unmeasurable");
+    }
+    // And a read this runner's own probe filed less than PROBE_EVERY ago is not
+    // re-probed, whatever the write half says.
+    if read.is_some_and(|f| f.get("via").and_then(|v| v.as_str()) == Some("probe"))
+        && fact_is_fresh(
+            read,
+            (PROBE_EVERY.as_secs() as i64).min(fresh_for_secs),
+            now,
+        )
+    {
+        return Some("recently_probed");
+    }
     None
+}
+
+/// coord's `NON_LIVE_STATES` (`stale`, `expected`) plus `closed`.
+const NON_LIVE_STATES: [&str; 3] = ["stale", "expected", "closed"];
+
+/// The write fact is one a probe cannot move: `unknown` because it was never
+/// probed, or because the target predates input acknowledgements.
+fn write_is_unmeasurable(write: Option<&Value>) -> bool {
+    write.is_some_and(|f| {
+        f.get("state").and_then(|v| v.as_str()) == Some("unknown")
+            && matches!(
+                f.get("reason").and_then(|v| v.as_str()),
+                Some("unprobed" | "target_predates_input_ack")
+            )
+    })
 }
 
 /// What is known about the target acknowledging input.
@@ -446,6 +494,14 @@ pub(crate) async fn run_probe_sweep(
     device_id: &str,
     trigger: &str,
 ) -> Result<ProbeSweepReport, ProbeSweepError> {
+    if !doors.relay_connected() {
+        return Err(ProbeSweepError {
+            door: "relay",
+            message: "this runner's relay is not connected — no grant was minted; the sweep \
+                      runs once the relay reconnects"
+                .to_string(),
+        });
+    }
     let (flags, rows) = read_fleet(doors, device_id).await?;
     let mut outcomes = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -602,6 +658,16 @@ async fn probe_row(doors: &dyn ProbeDoors, device_id: &str, session_id: &str) ->
         reply.ring.clone(),
     ));
     doors.register(pane.clone());
+    // From here the pane is in the routing table and holds the target's
+    // binding. If this future is DROPPED (a cancelled command, a timeout
+    // wrapped around the sweep), the guard detaches it and takes it out of
+    // routing — otherwise the binding and the pane's unbounded output channel
+    // would outlive the probe.
+    let mut guard = ProbePaneGuard {
+        doors,
+        pane: pane.clone(),
+        armed: true,
+    };
 
     // 3. read probe — the empty range at the end of the target's ring.
     let at = reply.ring.total_bytes_produced;
@@ -619,6 +685,7 @@ async fn probe_row(doors: &dyn ProbeDoors, device_id: &str, session_id: &str) ->
     out.write = Some(write_probe(doors, ctx.as_ref(), &minted, &pane).await);
 
     // 5. detach, honestly.
+    guard.armed = false;
     let _ = pane.kill(Duration::ZERO);
     out.detach = Some(match pane.detach_outcome() {
         DetachOutcome::Queued => "queued".to_string(),
@@ -628,6 +695,35 @@ async fn probe_row(doors: &dyn ProbeDoors, device_id: &str, session_id: &str) ->
     doors.forget(&minted.grant_jti);
     out.frames_sent = sink.sent().len();
     out
+}
+
+/// Tears a probe pane down if the probe never reached its own detach — the
+/// sweep future was dropped mid-row. Disarmed on the normal path, which
+/// detaches explicitly and reports the outcome.
+struct ProbePaneGuard<'a> {
+    doors: &'a dyn ProbeDoors,
+    pane: Arc<RemotePaneIo>,
+    armed: bool,
+}
+
+impl Drop for ProbePaneGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // `release` closes the output channel (nothing reads a probe pane's
+        // output) and queues the detach; `kill` settles `wait` so the client's
+        // sweep treats the pane as finished.
+        let _ = self.pane.release(Duration::ZERO);
+        let _ = self.pane.kill(Duration::ZERO);
+        self.doors.forget(self.pane.grant_jti());
+        warn!(
+            grant_jti = %self.pane.grant_jti(),
+            detach = ?self.pane.detach_outcome(),
+            "remote interactivity probe: sweep cancelled mid-probe — probe pane detached and \
+             dropped from routing"
+        );
+    }
 }
 
 async fn write_probe(
@@ -767,7 +863,34 @@ impl Drop for InFlight {
     }
 }
 
-/// [`run_probe_sweep`], refusing a second concurrent sweep of one device.
+/// Minimum gap between two FINISHED sweeps of one device. Back-to-back calls
+/// (a Fleet view re-mounted, a headless caller looping) inside it are refused
+/// as `throttled` rather than spending a grant per row again; the scheduler's
+/// own period ([`PROBE_EVERY`]) is far above it.
+pub const SWEEP_MIN_INTERVAL: Duration = crate::mcp::remote_interactivity::REPORT_EVERY;
+
+static LAST_FINISHED: OnceLock<Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+    OnceLock::new();
+
+/// `Some(remaining)` when `device_id` finished a sweep less than
+/// [`SWEEP_MIN_INTERVAL`] before `now`.
+fn throttled_for(device_id: &str, now: std::time::Instant) -> Option<Duration> {
+    let map = LAST_FINISHED.get()?;
+    let g = map.lock().unwrap_or_else(|e| e.into_inner());
+    let last = *g.get(&device_id.trim().to_ascii_lowercase())?;
+    let since = now.saturating_duration_since(last);
+    (since < SWEEP_MIN_INTERVAL).then(|| SWEEP_MIN_INTERVAL - since)
+}
+
+fn note_finished(device_id: &str, now: std::time::Instant) {
+    let map = LAST_FINISHED.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut g = map.lock().unwrap_or_else(|e| e.into_inner());
+    g.retain(|_, at| now.saturating_duration_since(*at) < SWEEP_MIN_INTERVAL);
+    g.insert(device_id.trim().to_ascii_lowercase(), now);
+}
+
+/// [`run_probe_sweep`], refusing a second concurrent sweep of one device and
+/// a sweep inside [`SWEEP_MIN_INTERVAL`] of the last one that finished.
 pub(crate) async fn run_guarded(
     doors: &dyn ProbeDoors,
     device_id: &str,
@@ -779,8 +902,24 @@ pub(crate) async fn run_guarded(
             message: format!("a sweep of device {device_id} is already running"),
         });
     };
-    run_probe_sweep(doors, device_id, trigger).await
+    if let Some(wait) = throttled_for(device_id, std::time::Instant::now()) {
+        return Err(ProbeSweepError {
+            door: THROTTLED_DOOR,
+            message: format!(
+                "device {device_id} was swept less than {}s ago; next sweep allowed in {}s",
+                SWEEP_MIN_INTERVAL.as_secs(),
+                wait.as_secs()
+            ),
+        });
+    }
+    let report = run_probe_sweep(doors, device_id, trigger).await?;
+    note_finished(device_id, std::time::Instant::now());
+    Ok(report)
 }
+
+/// The `door` of a throttled refusal — the Fleet view treats it as "already
+/// measured", not as a failure.
+pub const THROTTLED_DOOR: &str = "throttled";
 
 // ---------------------------------------------------------------------------
 // Fleet-view recency (pure) and its store
@@ -805,6 +944,30 @@ fn opened_within_recent(at: &str, now: DateTime<Utc>) -> bool {
         let age = now.signed_duration_since(at.with_timezone(&Utc));
         age.num_seconds() <= FLEET_VIEW_RECENT.as_secs() as i64
     })
+}
+
+/// How old a Fleet-view stamp must be before it is rewritten: re-opening the
+/// view every minute must not rewrite the settings file every minute.
+pub const FLEET_VIEW_RESTAMP_AFTER: Duration = Duration::from_secs(3600);
+
+/// Whether `device_id`'s stamp is absent, unreadable, or older than
+/// [`FLEET_VIEW_RESTAMP_AFTER`].
+pub(crate) fn needs_restamp(
+    map: &BTreeMap<String, String>,
+    device_id: &str,
+    now: DateTime<Utc>,
+) -> bool {
+    match map
+        .get(&device_id.trim().to_ascii_lowercase())
+        .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+    {
+        None => true,
+        Some(at) => {
+            now.signed_duration_since(at.with_timezone(&Utc))
+                .num_seconds()
+                >= FLEET_VIEW_RESTAMP_AFTER.as_secs() as i64
+        }
+    }
 }
 
 /// The devices the scheduler sweeps: opened within [`FLEET_VIEW_RECENT`].
@@ -919,6 +1082,12 @@ impl ProbeDoors for RunnerDoors {
         crate::agent_runtime::load_local_device_id()
     }
 
+    fn relay_connected(&self) -> bool {
+        crate::mcp::remote_terminal::client()
+            .outbound_pump_state()
+            .0
+    }
+
     fn live_tab_here(&self, session_id: &str) -> bool {
         use tauri::Manager as _;
         let Some(tm) = self
@@ -953,10 +1122,22 @@ pub(crate) async fn run_probe_command(
         .filter(|t| !t.is_empty())
         .unwrap_or("manual");
     if trigger == "fleet_view" {
-        let now = Utc::now();
-        if let Err(e) = crate::settings::update_fleet_view_opened_at(|map| {
-            record_fleet_view_opened(map, &device_id, now)
-        }) {
+        // Settings I/O is blocking file work: off the async runtime, and only
+        // when the stamp is actually due.
+        let device = device_id.clone();
+        let stamped = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+            let now = Utc::now();
+            if !needs_restamp(&crate::settings::get_fleet_view_opened_at(), &device, now) {
+                return Ok(());
+            }
+            crate::settings::update_fleet_view_opened_at(|map| {
+                record_fleet_view_opened(map, &device, now)
+            })
+        })
+        .await
+        .map_err(|e| format!("join: {e}"))
+        .and_then(|r| r);
+        if let Err(e) = stamped {
             warn!(
                 device_id = %device_id,
                 error = %e,
@@ -1087,6 +1268,9 @@ mod tests {
         minted: Mutex<u128>,
         /// A session this runner already has a live tab onto.
         live_tab: Option<String>,
+        relay_up: bool,
+        /// The read probe never answers (to cancel a sweep mid-probe).
+        read_probe_hangs: bool,
     }
 
     /// Every frame the relay would carry, and — for a zero-byte probe — the
@@ -1136,6 +1320,8 @@ mod tests {
                 forgotten: Mutex::new(Vec::new()),
                 minted: Mutex::new(0),
                 live_tab: None,
+                relay_up: true,
+                read_probe_hangs: false,
             }
         }
 
@@ -1181,8 +1367,28 @@ mod tests {
         ) -> Result<Value, String> {
             assert_eq!(device_id, DEVICE);
             assert!(cursor.is_none());
+            // Serve what coord would: each row's facts are the newest
+            // observation filed for its session and half.
+            let mut rows = self.rows.clone();
+            for obs in self.reported() {
+                for r in rows.iter_mut() {
+                    if r["sessionId"] == obs.session_id.to_string() {
+                        let key = match obs.half {
+                            Half::Read => "readableRemotely",
+                            Half::Write => "writableRemotely",
+                        };
+                        r[key] = json!({
+                            "state": obs.state.as_str(),
+                            "observedAt": obs.observed_at.to_rfc3339(),
+                            "sourceDeviceId": obs.source_device_id.to_string(),
+                            "via": obs.via.map(Via::as_str),
+                            "reason": obs.reason,
+                        });
+                    }
+                }
+            }
             let mut body = json!({
-                "sessions": self.rows,
+                "sessions": rows,
                 "callerDeviceId": ME,
                 "nextCursor": null,
             });
@@ -1254,6 +1460,9 @@ mod tests {
             pane: &RemotePaneIo,
             offset: u64,
         ) -> Result<AttachedReply, AttachError> {
+            if self.read_probe_hangs {
+                std::future::pending::<()>().await;
+            }
             // Record the buffer request as the relay would carry it.
             self.wire.frames.lock().unwrap().push(json!({
                 "type": "remote_terminal_buffer",
@@ -1288,6 +1497,10 @@ mod tests {
 
         fn live_tab_here(&self, session_id: &str) -> bool {
             self.live_tab.as_deref() == Some(session_id)
+        }
+
+        fn relay_connected(&self) -> bool {
+            self.relay_up
         }
     }
 
@@ -1431,6 +1644,106 @@ mod tests {
         assert_eq!(*target.minted.lock().unwrap(), 1);
     }
 
+    /// Convergence: a second sweep straight after the first measures nothing
+    /// new — the read is fresh and the write half is unmeasurable (unknown
+    /// capability) — so it probes no row and spends no grant.
+    #[tokio::test]
+    async fn a_second_sweep_right_after_the_first_skips_the_row() {
+        let target = RecorderTarget::new(vec![row(1, json!({}))]);
+        let first = run_probe_sweep(&target, DEVICE, "manual").await.unwrap();
+        assert_eq!(first.outcomes[0].decision, "probed");
+        assert_eq!(*target.minted.lock().unwrap(), 1);
+        let second = run_probe_sweep(&target, DEVICE, "scheduler").await.unwrap();
+        assert_eq!(second.outcomes[0].decision, "skipped");
+        assert_eq!(
+            second.outcomes[0].skip_reason.as_deref(),
+            Some("write_unmeasurable")
+        );
+        assert_eq!(*target.minted.lock().unwrap(), 1, "no second grant");
+    }
+
+    /// No relay: a typed `relay` error, before the fleet walk and before any
+    /// mint.
+    #[tokio::test]
+    async fn no_relay_is_a_typed_error_and_mints_nothing() {
+        let mut target = RecorderTarget::new(vec![row(1, json!({}))]);
+        target.relay_up = false;
+        let e = run_probe_sweep(&target, DEVICE, "manual")
+            .await
+            .unwrap_err();
+        assert_eq!(e.door, "relay");
+        assert_eq!(*target.minted.lock().unwrap(), 0);
+    }
+
+    /// A sweep future dropped mid-probe (after register, while the read probe
+    /// waits) does not leak the probe pane: it is detached, finished, and out
+    /// of routing.
+    #[tokio::test]
+    async fn a_cancelled_sweep_tears_the_probe_pane_down() {
+        let mut target = RecorderTarget::new(vec![row(1, json!({}))]);
+        target.read_probe_hangs = true;
+        let r = tokio::time::timeout(
+            Duration::from_millis(100),
+            run_probe_sweep(&target, DEVICE, "manual"),
+        )
+        .await;
+        assert!(r.is_err(), "the sweep was cancelled mid-probe");
+        let panes = target.registered.lock().unwrap().clone();
+        assert_eq!(panes.len(), 1);
+        let pane = &panes[0];
+        assert!(pane.is_finished(), "wait settled");
+        assert_eq!(pane.detach_outcome(), DetachOutcome::Queued);
+        assert_eq!(
+            target.forgotten.lock().unwrap().clone(),
+            vec![pane.grant_jti().to_string()],
+            "dropped from routing"
+        );
+        let detaches = target
+            .wire
+            .frames
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|f| f["type"] == "remote_terminal_detach")
+            .count();
+        assert_eq!(
+            detaches, 1,
+            "exactly one detach even though release+kill both ran"
+        );
+    }
+
+    /// Back-to-back sweeps of one device are throttled for SWEEP_MIN_INTERVAL.
+    #[test]
+    fn finished_sweeps_throttle_the_next_one() {
+        let dev = "throttle-test-device";
+        let t0 = std::time::Instant::now();
+        assert!(throttled_for(dev, t0).is_none());
+        note_finished(dev, t0);
+        assert!(throttled_for(dev, t0 + Duration::from_secs(10)).is_some());
+        assert!(throttled_for(&dev.to_uppercase(), t0 + Duration::from_secs(10)).is_some());
+        assert!(throttled_for(dev, t0 + SWEEP_MIN_INTERVAL).is_none());
+    }
+
+    #[test]
+    fn the_fleet_view_stamp_is_rewritten_only_when_due() {
+        let now = Utc::now();
+        let mut map = BTreeMap::new();
+        assert!(needs_restamp(&map, "Dev-A", now));
+        record_fleet_view_opened(&mut map, "Dev-A", now);
+        assert!(!needs_restamp(
+            &map,
+            "dev-a",
+            now + chrono::Duration::minutes(59)
+        ));
+        assert!(needs_restamp(
+            &map,
+            "dev-a",
+            now + chrono::Duration::minutes(61)
+        ));
+        map.insert("dev-b".into(), "garbage".into());
+        assert!(needs_restamp(&map, "dev-b", now));
+    }
+
     /// The off switch: a target with `accept_remote_attach: off` refuses the
     /// attach, and that is filed as the true statement `failed/remote_attach_disabled`.
     #[tokio::test]
@@ -1492,18 +1805,67 @@ mod tests {
             ),
             Some("fresh")
         );
-        // One half fresh is not enough; an aged fact is not fresh; unknown never is.
+        // One half fresh is not enough while the write half is measurable (a
+        // STALE write fact, which a probe against an acking target can move);
+        // an aged fact is not fresh; unknown never is.
         assert_eq!(
             skip_reason(
                 &row(
                     1,
-                    json!({"readableRemotely": fact("ok", Some("probe"), 10, None)})
+                    json!({
+                        "readableRemotely": fact("ok", Some("probe"), 1500, None),
+                        "writableRemotely": fact("unknown", Some("traffic"), 4000, Some("stale")),
+                    })
                 ),
                 f,
                 now
             ),
             None
         );
+        // Convergence: a fresh read with an unmeasurable write is skipped...
+        for reason in ["unprobed", "target_predates_input_ack"] {
+            assert_eq!(
+                skip_reason(
+                    &row(
+                        1,
+                        json!({
+                            "readableRemotely": fact("ok", Some("probe"), 1500, None),
+                            "writableRemotely": fact("unknown", None, 0, Some(reason)),
+                        })
+                    ),
+                    f,
+                    now
+                ),
+                Some("write_unmeasurable"),
+                "{reason}"
+            );
+        }
+        // ...and so is a read our own probe filed under PROBE_EVERY ago.
+        assert_eq!(
+            skip_reason(
+                &row(
+                    1,
+                    json!({
+                        "readableRemotely": fact("ok", Some("probe"), 10, None),
+                        "writableRemotely": fact("unknown", Some("traffic"), 4000, Some("stale")),
+                    })
+                ),
+                f,
+                now
+            ),
+            Some("recently_probed")
+        );
+        // Non-live states are skipped like coord's NON_LIVE_STATES.
+        for (state, why) in [
+            ("stale", "stale"),
+            ("expected", "expected"),
+            ("closed", "closed"),
+        ] {
+            assert_eq!(
+                skip_reason(&row(1, json!({"state": state})), f, now),
+                Some(why)
+            );
+        }
         assert_eq!(
             skip_reason(
                 &row(
@@ -1582,6 +1944,9 @@ mod tests {
             }
             fn live_tab_here(&self, _: &str) -> bool {
                 false
+            }
+            fn relay_connected(&self) -> bool {
+                true
             }
         }
         let e = run_probe_sweep(&Down, DEVICE, "manual").await.unwrap_err();

@@ -81,10 +81,11 @@ pub const REPORT_QUEUE_CAP: usize = 256;
 /// Per-POST deadline. A slow coord costs the worker, never a caller.
 pub const POST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Bound on the coalescer's memory: past this many keys, entries older than
-/// two [`REPORT_EVERY`] windows are forgotten (they could not suppress
-/// anything anyway).
-const COALESCER_KEYS_SOFT_CAP: usize = 4096;
+/// HARD bound on the coalescer's memory. Past it, entries older than two
+/// [`REPORT_EVERY`] windows are forgotten first (they could not suppress
+/// anything anyway); if that frees nothing, the OLDEST entry is evicted — the
+/// worst it costs is one extra report for that key.
+pub const COALESCER_KEYS_CAP: usize = 4096;
 
 /// Coord's closed `unknown` vocabulary (`session_interactivity::UNKNOWN_REASONS`).
 pub const UNKNOWN_REASONS: [&str; 6] = [
@@ -300,6 +301,7 @@ struct CoalesceKey {
 struct LastKept {
     state: FactState,
     reason: Option<String>,
+    via: Option<Via>,
     at: Instant,
 }
 
@@ -308,13 +310,19 @@ struct LastKept {
 #[derive(Debug)]
 pub struct Coalescer {
     every: Duration,
+    cap: usize,
     last: HashMap<CoalesceKey, LastKept>,
 }
 
 impl Coalescer {
     pub fn new(every: Duration) -> Self {
+        Self::with_cap(every, COALESCER_KEYS_CAP)
+    }
+
+    pub fn with_cap(every: Duration, cap: usize) -> Self {
         Self {
             every,
+            cap: cap.max(1),
             last: HashMap::new(),
         }
     }
@@ -325,22 +333,35 @@ impl Coalescer {
         let keep = match self.last.get(&key) {
             None => true,
             Some(prev) => {
+                // A change of `via` is a transition too: "measured by a probe"
+                // and "measured by real traffic" are different statements.
                 prev.state != obs.state
                     || prev.reason != obs.reason
+                    || prev.via != obs.via
                     || now.saturating_duration_since(prev.at) >= self.every
             }
         };
         if keep {
-            if self.last.len() >= COALESCER_KEYS_SOFT_CAP {
+            if !self.last.contains_key(&key) && self.last.len() >= self.cap {
                 let horizon = self.every * 2;
                 self.last
                     .retain(|_, v| now.saturating_duration_since(v.at) < horizon);
+                while self.last.len() >= self.cap {
+                    let oldest = self.last.iter().min_by_key(|(_, v)| v.at).map(|(k, _)| *k);
+                    match oldest {
+                        Some(k) => {
+                            self.last.remove(&k);
+                        }
+                        None => break,
+                    }
+                }
             }
             self.last.insert(
                 key,
                 LastKept {
                     state: obs.state,
                     reason: obs.reason.clone(),
+                    via: obs.via,
                     at: now,
                 },
             );
@@ -692,7 +713,14 @@ const HELD_CODES: &[&str] = &["attach_terminal_busy"];
 /// the target was observed (a local code, or one that is not a wire code).
 pub fn classify_refusal(code: &str) -> Option<(FactState, &str)> {
     let code = code.trim();
-    if LOCAL_ONLY_CODES.contains(&code) || code.starts_with("coord_") {
+    // `attach_grant_*` (expired / unknown / consumed / wrong_source / invalid)
+    // describe THIS source's credential, not the session: a grant that aged
+    // out or was never recorded says nothing about whether the session is
+    // reachable. Nothing is filed for them.
+    if LOCAL_ONLY_CODES.contains(&code)
+        || code.starts_with("coord_")
+        || code.starts_with("attach_grant_")
+    {
         return None;
     }
     if HELD_CODES.contains(&code) {
@@ -938,10 +966,47 @@ mod tests {
             .refusal("session_not_local", &[Half::Write], Utc::now())
             .remove(0);
         let b = ctx()
-            .refusal("attach_grant_expired", &[Half::Write], Utc::now())
+            .refusal("cross_tenant", &[Half::Write], Utc::now())
             .remove(0);
         assert!(c.admit(&a, t0));
         assert!(c.admit(&b, t0 + Duration::from_secs(1)));
+    }
+
+    /// A change of `via` (traffic after probe, or back) is a transition.
+    #[test]
+    fn a_via_change_is_a_transition() {
+        let mut c = Coalescer::new(REPORT_EVERY);
+        let t = Instant::now();
+        let traffic = ctx().read_ok(Utc::now());
+        let mut probe_ctx = ctx();
+        probe_ctx.via = Via::Probe;
+        let probe = probe_ctx.read_ok(Utc::now());
+        assert!(c.admit(&traffic, t));
+        assert!(!c.admit(&traffic, t + Duration::from_secs(1)));
+        assert!(c.admit(&probe, t + Duration::from_secs(2)));
+        assert!(c.admit(&traffic, t + Duration::from_secs(3)));
+    }
+
+    /// The map is HARD-capped: when no entry is old enough to forget, the
+    /// oldest is evicted, and the map never exceeds the cap.
+    #[test]
+    fn the_coalescer_map_is_hard_capped() {
+        let mut c = Coalescer::with_cap(REPORT_EVERY, 3);
+        let t = Instant::now();
+        for n in 0..10u128 {
+            let mut k = ctx();
+            k.session_id = u(500 + n);
+            assert!(c.admit(&k.read_ok(Utc::now()), t + Duration::from_secs(n as u64)));
+            assert!(c.len() <= 3, "len {} over the cap", c.len());
+        }
+        // The oldest were evicted, so the first key is admitted again at once;
+        // the newest is still remembered.
+        let mut first = ctx();
+        first.session_id = u(500);
+        assert!(c.admit(&first.read_ok(Utc::now()), t + Duration::from_secs(11)));
+        let mut newest = ctx();
+        newest.session_id = u(509);
+        assert!(!c.admit(&newest.read_ok(Utc::now()), t + Duration::from_secs(12)));
     }
 
     /// Keys are per (session, half, source, role): another session, another
@@ -1089,12 +1154,11 @@ mod tests {
             Some((FactState::Unknown, "target_unreachable"))
         );
         for code in [
-            "attach_grant_unknown",
             "cross_tenant",
             "session_not_local",
             "target_runner_predates_remote_attach",
             "remote_attach_disabled",
-            "attach_grant_expired",
+            "attach_terminal_mismatch",
         ] {
             assert_eq!(
                 classify_refusal(code),
@@ -1107,6 +1171,12 @@ mod tests {
             "relay_disconnected",
             "coord_unreachable",
             "Not A Code",
+            // The source's own credential, not the session.
+            "attach_grant_unknown",
+            "attach_grant_expired",
+            "attach_grant_consumed",
+            "attach_grant_wrong_source",
+            "attach_grant_invalid",
         ] {
             assert_eq!(classify_refusal(local), None, "{local}");
         }

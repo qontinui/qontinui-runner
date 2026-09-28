@@ -457,10 +457,21 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 Ok(v) => v,
                 Err(e) => return TauriInvokeResponse::err(format!("bad args: {}", e)),
             };
+            // A headless caller is not the Fleet view: `fleet_view` would
+            // stamp the device into the scheduler's sweep set for a week on
+            // behalf of an operator who never opened it. Only `manual` here.
+            if let Some(t) = a.trigger.as_deref().map(str::trim) {
+                if !t.is_empty() && t != "manual" {
+                    return TauriInvokeResponse::err(format!(
+                        "remote_interactivity_probe:trigger_not_allowed: {t:?} — the proxy \
+                         runs only trigger \"manual\""
+                    ));
+                }
+            }
             match crate::commands::remote_interactivity_probe::run_probe_command(
                 &state.app_handle,
                 &a.device_id,
-                a.trigger.as_deref(),
+                Some("manual"),
             )
             .await
             {

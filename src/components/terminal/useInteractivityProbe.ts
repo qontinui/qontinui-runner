@@ -75,6 +75,12 @@ export function useInteractivityProbe(
           onSweptRef.current();
         } catch (err) {
           if (!mounted.current) break;
+          // `throttled` = this device was swept moments ago (a re-mounted
+          // view): already measured, not a failure. Re-read what it filed.
+          if (String(err).startsWith("remote_interactivity_probe:throttled:")) {
+            onSweptRef.current();
+            continue;
+          }
           setErrors((prev) => ({ ...prev, [device]: String(err) }));
         }
       }
