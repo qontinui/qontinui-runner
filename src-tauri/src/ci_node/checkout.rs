@@ -48,21 +48,34 @@ pub(super) async fn run_git(
     args: &[&str],
     timeout: Duration,
 ) -> Result<String, String> {
+    use crate::process_helpers::ChildTreeGuard;
     let mut cmd = crate::process_helpers::tokio_no_window("git");
-    // kill_on_drop: a fetch raced against cancellation or cut off by its
-    // timeout is dropped, and its git child must die with it, not linger
-    // holding the repo's locks.
+    // A git call raced against cancellation or cut off by a timeout is
+    // DROPPED mid-flight, and what must die with it is the whole process
+    // TREE, not only `git` itself: a fetch runs `git-remote-https`,
+    // `index-pack` and friends as children, and those — not `git` — are what
+    // hold the mirror connection and the repo's locks. `kill_on_drop` kills
+    // the direct child; the [`ChildTreeGuard`] (a kill-on-close Job Object on
+    // Windows, a process group + `killpg` on Unix) kills everything under it
+    // when the future is dropped. A call that runs to completion disarms the
+    // guard, so nothing a finished git left behind is touched.
     cmd.current_dir(repo_dir)
         .kill_on_drop(true)
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    ChildTreeGuard::arm_tokio(&mut cmd);
     let fut = async {
-        let out = cmd
-            .output()
-            .await
+        let child = cmd
+            .spawn()
             .map_err(|e| format!("spawn git {}: {e}", args.join(" ")))?;
+        let tree = ChildTreeGuard::attach_armed_tokio(&child);
+        let out = child
+            .wait_with_output()
+            .await
+            .map_err(|e| format!("wait for git {}: {e}", args.join(" ")))?;
+        tree.disarm();
         let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         if out.status.success() {
@@ -141,7 +154,10 @@ pub(crate) const HEAD_UNAVAILABLE_REASON: &str = "head_sha_unavailable";
 
 /// `summary.reason` for a fetch that failed for any reason OTHER than the
 /// mirror saying the commit is not there (DNS, auth, TLS, disk, a corrupt
-/// checkout, a fetch the deadline cut off).
+/// checkout, a fetch the deadline cut off). Reported as `cancelled` too: coord
+/// reads the conclusion, not the reason, and `cancelled` is its only
+/// non-verdict — a transient mirror fault must not become a red the candidate
+/// never earned. The distinct reason is what keeps the two apart for a reader.
 pub(crate) const FETCH_FAILED_REASON: &str = "fetch_failed";
 
 /// Candidate-ref namespaces coord dispatches: the merge-candidate branch, and
@@ -155,14 +171,20 @@ const FETCH_URL_SCHEMES: [&str; 3] = ["https://", "http://", "file://"];
 
 /// Config for every fetch: a fetch killed by cancellation or the deadline must
 /// not leave an auto-gc, maintenance or commit-graph writer (and its lock)
-/// behind in the SHARED primary checkout.
-const FETCH_CONFIG: [&str; 6] = [
+/// behind in the SHARED primary checkout; and an HTTP transfer that stalls
+/// below 1 byte/s for 60 s aborts on its own — a backstop under the tree kill,
+/// for a mirror that accepts the connection and then goes silent.
+const FETCH_CONFIG: [&str; 10] = [
     "-c",
     "gc.auto=0",
     "-c",
     "maintenance.auto=false",
     "-c",
     "fetch.writeCommitGraph=false",
+    "-c",
+    "http.lowSpeedLimit=1",
+    "-c",
+    "http.lowSpeedTime=60",
 ];
 
 /// git stderr that means "the remote answered, and it does not have that" —
@@ -188,9 +210,10 @@ pub(crate) enum CheckoutError {
         attempts: usize,
         detail: String,
     },
-    /// The fetch failed for some other reason. Reported as `failure` +
-    /// `fetch_failed`, so it is neither mistaken for a missing head nor for a
-    /// red build.
+    /// The fetch failed for some other reason. Reported as `cancelled` +
+    /// `fetch_failed`: like a missing head it says nothing about the code
+    /// under test, so it must not be a red verdict, and the reason keeps it
+    /// distinguishable from a missing head.
     FetchFailed(String),
     /// The dispatch was cancelled while the checkout was running.
     Cancelled,
@@ -229,7 +252,7 @@ impl CheckoutError {
     pub(crate) fn result_disposition(&self) -> (&'static str, Option<&'static str>) {
         match self {
             CheckoutError::HeadUnavailable { .. } => ("cancelled", Some(HEAD_UNAVAILABLE_REASON)),
-            CheckoutError::FetchFailed(_) => ("failure", Some(FETCH_FAILED_REASON)),
+            CheckoutError::FetchFailed(_) => ("cancelled", Some(FETCH_FAILED_REASON)),
             CheckoutError::Cancelled => ("cancelled", None),
             CheckoutError::Failed(_) => ("failure", None),
         }
@@ -279,8 +302,17 @@ fn validate_fetch_args(fetch_url: &str, candidate_ref: &str, head_sha: &str) -> 
         && !fetch_url
             .chars()
             .any(|c| c.is_whitespace() || c.is_control());
-    let transport_ok = FETCH_URL_SCHEMES.iter().any(|s| fetch_url.starts_with(s))
-        || Path::new(fetch_url).is_absolute();
+    // A local mirror must be LOCAL: `file:///…` (empty host) or an absolute
+    // path on a local volume. A UNC path (`\\host\share`, `//host/share`), a
+    // verbatim `\\?\` path or `file://host/…` would make this device reach
+    // out to another machine over SMB on a payload's say-so.
+    let remote_path = fetch_url.starts_with("\\\\") || fetch_url.starts_with("//");
+    let transport_ok = if let Some(rest) = fetch_url.strip_prefix("file://") {
+        rest.starts_with('/') && !rest.starts_with("//")
+    } else {
+        FETCH_URL_SCHEMES.iter().any(|s| fetch_url.starts_with(s))
+            || (!remote_path && Path::new(fetch_url).is_absolute())
+    };
     if !(plain && transport_ok) {
         return Err(format!(
             "refusing dispatch: fetch_url {fetch_url:?} is not an {} URL or an absolute path",
@@ -298,25 +330,52 @@ enum Stop {
 }
 
 /// One checkout's bounds. Every git call and every pause goes through here, so
-/// each races `cancel` and is clipped to `deadline`; a dropped git child is
-/// killed (`run_git` sets `kill_on_drop`), never orphaned.
+/// each races `cancel` and is clipped to the deadline; a git call dropped by
+/// either has its whole process tree killed (see [`run_git`]), never orphaned.
 struct Bounds<'a> {
-    deadline: tokio::time::Instant,
+    /// Behind a lock only so a test can move it (see [`Self::set_deadline`]);
+    /// production sets it once.
+    deadline: std::sync::Mutex<tokio::time::Instant>,
     cancel: &'a CancellationToken,
 }
 
-impl Bounds<'_> {
+impl<'a> Bounds<'a> {
+    fn new(deadline: tokio::time::Instant, cancel: &'a CancellationToken) -> Self {
+        Self {
+            deadline: std::sync::Mutex::new(deadline),
+            cancel,
+        }
+    }
+
+    fn deadline(&self) -> tokio::time::Instant {
+        match self.deadline.lock() {
+            Ok(d) => *d,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    /// Move the deadline — the test seam that lets a test spend the deadline
+    /// at an exact point instead of sleeping until it runs out.
+    #[cfg(test)]
+    fn set_deadline(&self, to: tokio::time::Instant) {
+        match self.deadline.lock() {
+            Ok(mut d) => *d = to,
+            Err(poisoned) => *poisoned.into_inner() = to,
+        }
+    }
+
     async fn run<T>(&self, fut: impl std::future::Future<Output = T>) -> Result<T, Stop> {
         if self.cancel.is_cancelled() {
             return Err(Stop::Cancelled);
         }
-        if tokio::time::Instant::now() >= self.deadline {
+        let deadline = self.deadline();
+        if tokio::time::Instant::now() >= deadline {
             return Err(Stop::Deadline);
         }
         tokio::select! {
             biased;
             _ = self.cancel.cancelled() => Err(Stop::Cancelled),
-            r = tokio::time::timeout_at(self.deadline, fut) => r.map_err(|_| Stop::Deadline),
+            r = tokio::time::timeout_at(deadline, fut) => r.map_err(|_| Stop::Deadline),
         }
     }
 
@@ -343,7 +402,7 @@ impl Bounds<'_> {
     }
 
     fn remaining(&self) -> Duration {
-        self.deadline
+        self.deadline()
             .saturating_duration_since(tokio::time::Instant::now())
     }
 }
@@ -388,11 +447,13 @@ fn says_missing(git_error: &str) -> bool {
 /// follows: the coord mirror honours want-by-SHA for any commit ever pushed,
 /// so that fetch's outcome is the attempt's evidence ([`Evidence`]).
 ///
-/// Before each retry one progress line goes to `progress` (it reaches coord,
-/// and renews the lease); `before_retry(attempt)` runs after the pause, before
-/// that attempt's fetches (a test seam; production passes a no-op). The
-/// verdict is the evidence of the last attempt that COMPLETED — an attempt the
-/// deadline cut off establishes nothing.
+/// After each failed attempt one progress line goes to `progress` (it reaches
+/// coord, and renews the lease): either the retry and its delay, or — when the
+/// deadline leaves no room for the full pause — that the deadline is reached,
+/// and no further attempt is made. `after_attempt(attempt, bounds)` runs after
+/// each failed attempt, before that line (a test seam; production passes a
+/// no-op). The verdict is the evidence of the last attempt that COMPLETED — an
+/// attempt the deadline cut off establishes nothing.
 #[allow(clippy::too_many_arguments)]
 async fn fetch_head(
     repo_dir: &Path,
@@ -402,7 +463,7 @@ async fn fetch_head(
     policy: &HeadFetchPolicy<'_>,
     bounds: &Bounds<'_>,
     progress: &mut (dyn FnMut(&str) + Send),
-    before_retry: &mut (dyn FnMut(usize) + Send),
+    after_attempt: &mut (dyn FnMut(usize, &Bounds<'_>) + Send),
 ) -> Result<(), CheckoutError> {
     let max_attempts = policy.backoff.len() + 1;
     let mut attempts = 0usize;
@@ -413,20 +474,32 @@ async fn fetch_head(
         let per_fetch = if attempt == 1 {
             policy.first_fetch_timeout
         } else {
-            let wait = policy.backoff[attempt - 2].min(bounds.remaining());
-            if let Some((evidence, detail)) = &verdict {
-                let what = match evidence {
-                    Evidence::Missing => "not yet available",
-                    Evidence::Broken => "fetch failed",
-                };
+            after_attempt(attempt - 1, bounds);
+            let backoff = policy.backoff[attempt - 2];
+            let remaining = bounds.remaining();
+            let what = match verdict.as_ref().map(|(e, _)| *e) {
+                Some(Evidence::Missing) => "not yet available",
+                _ => "fetch failed",
+            };
+            let detail = verdict.as_ref().map(|(_, d)| d.as_str()).unwrap_or("");
+            if remaining <= backoff {
+                // The pause would run into the deadline, so no retry can
+                // start after it: say so, and stop here rather than sleep to
+                // the deadline announcing a retry that will never run.
                 progress(&format!(
                     "[ci-node] head {head_sha} {what} (attempt {}/{max_attempts}: {detail}); \
-                     retry {attempt}/{max_attempts} in {}s",
-                    attempt - 1,
-                    wait.as_secs()
+                     checkout deadline reached, no further retry",
+                    attempt - 1
                 ));
+                break;
             }
-            match bounds.pause(wait).await {
+            progress(&format!(
+                "[ci-node] head {head_sha} {what} (attempt {}/{max_attempts}: {detail}); \
+                 retry {attempt}/{max_attempts} in {}s",
+                attempt - 1,
+                backoff.as_secs()
+            ));
+            match bounds.pause(backoff).await {
                 Err(Stop::Cancelled) => return Err(CheckoutError::Cancelled),
                 Err(Stop::Deadline) => break,
                 Ok(()) => {}
@@ -437,7 +510,6 @@ async fn fetch_head(
             if bounds.remaining().is_zero() {
                 break;
             }
-            before_retry(attempt);
             policy.retry_fetch_timeout
         };
         attempts = attempt;
@@ -528,7 +600,7 @@ async fn fetch_head(
 /// Validate + fetch + verify + worktree-add. Returns the worktree path.
 ///
 /// `cancel` interrupts every git call and every retry pause (a cancelled git
-/// process is killed), and the whole call is bounded by
+/// process tree is killed), and the whole call is bounded by
 /// [`HEAD_FETCH_POLICY`]'s deadline. `progress` receives one line per retry.
 pub(crate) async fn prepare_worktree(
     root: &Path,
@@ -550,7 +622,7 @@ pub(crate) async fn prepare_worktree(
         &HEAD_FETCH_POLICY,
         cancel,
         progress,
-        &mut |_| {},
+        &mut |_, _| {},
     )
     .await
 }
@@ -566,13 +638,10 @@ async fn prepare_worktree_with(
     policy: &HeadFetchPolicy<'_>,
     cancel: &CancellationToken,
     progress: &mut (dyn FnMut(&str) + Send),
-    before_retry: &mut (dyn FnMut(usize) + Send),
+    after_attempt: &mut (dyn FnMut(usize, &Bounds<'_>) + Send),
 ) -> Result<PathBuf, CheckoutError> {
     validate_fetch_args(fetch_url, candidate_ref, head_sha)?;
-    let bounds = Bounds {
-        deadline: tokio::time::Instant::now() + policy.deadline,
-        cancel,
-    };
+    let bounds = Bounds::new(tokio::time::Instant::now() + policy.deadline, cancel);
     let repo_dir = root.join(crate::agent_runtime::local_repo_name(repo));
     if !repo_dir.join(".git").exists() {
         return Err(CheckoutError::Failed(format!(
@@ -602,7 +671,7 @@ async fn prepare_worktree_with(
             policy,
             &bounds,
             progress,
-            before_retry,
+            after_attempt,
         )
         .await?;
     }
@@ -642,10 +711,18 @@ async fn prepare_worktree_with(
     Ok(wt_path)
 }
 
-/// Always-run cleanup: `git worktree remove --force` + prune, then a
+/// Always-run cleanup: `git worktree remove -f -f` + prune, then a
 /// best-effort delete of the whole dispatch root — which sweeps the worktree,
 /// every provisioned sibling, and anything git left behind, in one call.
 /// Failure is logged, never propagated (cleanup runs on failure paths too).
+///
+/// `-f` twice because a `worktree add` killed mid-way (cancel, deadline)
+/// leaves its admin entry LOCKED ("initializing"), and a single `--force`
+/// refuses a locked worktree. The directory delete runs on the blocking pool,
+/// so a caller that bounds this future (the checkout's stale-dir cleanup)
+/// stops waiting at its deadline; the delete itself then finishes in the
+/// background, which is harmless — it only ever removes this dispatch's own
+/// root.
 pub(crate) async fn cleanup_dispatch(root: &Path, repo: &str, dispatch_id: &str) {
     let repo_dir = root.join(crate::agent_runtime::local_repo_name(repo));
     let wt_path = ci_worktree_path(root, dispatch_id, repo);
@@ -653,7 +730,7 @@ pub(crate) async fn cleanup_dispatch(root: &Path, repo: &str, dispatch_id: &str)
     let wt_str = wt_path.to_string_lossy().to_string();
     if let Err(e) = run_git(
         &repo_dir,
-        &["worktree", "remove", "--force", &wt_str],
+        &["worktree", "remove", "-f", "-f", &wt_str],
         GIT_LOCAL_TIMEOUT,
     )
     .await
@@ -664,11 +741,17 @@ pub(crate) async fn cleanup_dispatch(root: &Path, repo: &str, dispatch_id: &str)
         warn!("ci_node: worktree prune failed: {e}");
     }
     if dispatch_root.exists() {
-        if let Err(e) = std::fs::remove_dir_all(&dispatch_root) {
-            warn!(
+        let target = dispatch_root.clone();
+        match tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&target)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!(
                 "ci_node: residual dispatch dir {} not removable: {e}",
                 dispatch_root.display()
-            );
+            ),
+            Err(e) => warn!(
+                "ci_node: delete of dispatch dir {} did not complete: {e}",
+                dispatch_root.display()
+            ),
         }
     }
 }
@@ -804,7 +887,7 @@ mod tests {
         policy: &HeadFetchPolicy<'_>,
         cancel: &CancellationToken,
         progress: &mut (dyn FnMut(&str) + Send),
-        before_retry: &mut (dyn FnMut(usize) + Send),
+        after_attempt: &mut (dyn FnMut(usize, &Bounds<'_>) + Send),
     ) -> Result<PathBuf, CheckoutError> {
         prepare_worktree_with(
             &f.root,
@@ -816,7 +899,7 @@ mod tests {
             policy,
             cancel,
             progress,
-            before_retry,
+            after_attempt,
         )
         .await
     }
@@ -833,7 +916,7 @@ mod tests {
             &TEST_POLICY,
             &CancellationToken::new(),
             &mut |_| {},
-            &mut |_| {},
+            &mut |_, _| {},
         )
         .await
     }
@@ -879,7 +962,7 @@ mod tests {
     #[tokio::test]
     async fn head_the_mirror_does_not_have_is_head_unavailable() {
         let f = fixture();
-        let mut retries = 0usize;
+        let mut failed_attempts = 0usize;
         let mut lines: Vec<String> = Vec::new();
         let err = prepare_with(
             &f,
@@ -888,7 +971,7 @@ mod tests {
             &TEST_POLICY,
             &CancellationToken::new(),
             &mut |l| lines.push(l.to_string()),
-            &mut |_| retries += 1,
+            &mut |_, _| failed_attempts += 1,
         )
         .await
         .expect_err("a ghost head cannot be checked out");
@@ -905,7 +988,10 @@ mod tests {
             }
             other => panic!("expected HeadUnavailable, got {other:?}"),
         }
-        assert_eq!(retries, 2, "three attempts means two retries");
+        assert_eq!(
+            failed_attempts, 2,
+            "the hook runs before each of the two retries"
+        );
         assert_eq!(lines.len(), 2, "one progress line per retry: {lines:?}");
         assert!(lines[0].contains("not yet available") && lines[0].contains("retry 2/3"));
         assert_eq!(
@@ -920,7 +1006,8 @@ mod tests {
 
     /// The other arm of the taxonomy: a fetch that fails for a reason other
     /// than "the mirror has no such commit" (here, no repository at the URL)
-    /// is `failure` + `fetch_failed` — neither a missing head nor a red build.
+    /// is `fetch_failed` — distinct from a missing head, and like it a
+    /// non-verdict (`cancelled`), never a red build.
     #[tokio::test]
     async fn a_fetch_that_fails_for_another_reason_is_fetch_failed() {
         let f = fixture();
@@ -935,7 +1022,7 @@ mod tests {
             &TEST_POLICY,
             &CancellationToken::new(),
             &mut |_| {},
-            &mut |_| {},
+            &mut |_, _| {},
         )
         .await
         .expect_err("there is no mirror to fetch from");
@@ -945,7 +1032,7 @@ mod tests {
         );
         assert_eq!(
             err.result_disposition(),
-            ("failure", Some(FETCH_FAILED_REASON))
+            ("cancelled", Some(FETCH_FAILED_REASON))
         );
         assert_eq!(err.log_prefix(), "[ci-node] checkout: fetch failed:");
     }
@@ -986,7 +1073,7 @@ mod tests {
             &policy,
             &CancellationToken::new(),
             &mut |_| {},
-            &mut |_| {},
+            &mut |_, _| {},
         )
         .await
         .expect_err("nothing can run with no time left");
@@ -996,26 +1083,32 @@ mod tests {
         );
     }
 
-    /// A deadline that runs out DURING a retry pause ends the loop there: the
-    /// verdict is attempt 1's real git error, not a synthetic "deadline" one,
-    /// and the attempt count is not inflated by an attempt that never ran.
+    /// A deadline that leaves no room for the next pause ends the loop right
+    /// there: the progress line says the deadline is reached (it does not
+    /// announce a retry that will never run), the verdict is attempt 1's real
+    /// git error, and the attempt count is not inflated. The deadline is moved
+    /// through the `Bounds` seam after attempt 1, so nothing sleeps and
+    /// nothing depends on how fast this box runs git.
     #[tokio::test]
-    async fn deadline_spent_in_a_pause_keeps_the_last_real_error() {
+    async fn deadline_reached_before_a_retry_keeps_the_last_real_error() {
         let f = fixture();
         let policy = HeadFetchPolicy {
             backoff: &[Duration::from_secs(600)],
-            deadline: Duration::from_secs(10),
+            deadline: Duration::from_secs(1800),
             ..TEST_POLICY
         };
-        let mut retries = 0usize;
+        let mut lines: Vec<String> = Vec::new();
         let err = prepare_with(
             &f,
             CANDIDATE,
             GHOST,
             &policy,
             &CancellationToken::new(),
-            &mut |_| {},
-            &mut |_| retries += 1,
+            &mut |l| lines.push(l.to_string()),
+            &mut |_, bounds| {
+                // Less than the 600 s pause, so no retry fits.
+                bounds.set_deadline(tokio::time::Instant::now() + Duration::from_secs(60))
+            },
         )
         .await
         .expect_err("a ghost head cannot be checked out");
@@ -1028,16 +1121,20 @@ mod tests {
             }
             other => panic!("expected HeadUnavailable, got {other:?}"),
         }
-        assert_eq!(retries, 0, "no attempt starts after the deadline");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("deadline reached") && !lines[0].contains("retry 2"),
+            "{lines:?}"
+        );
     }
 
     /// The race the backoff exists for: the dispatch arrives before coord has
-    /// pushed the ref naming its head. The head lands in origin before the
-    /// first retry, and that retry checks it out.
+    /// pushed the ref naming its head. The head lands in origin after the
+    /// first attempt, and the retry checks it out.
     #[tokio::test]
     async fn head_published_during_backoff_is_picked_up_by_the_retry() {
         let f = fixture();
-        // B exists only in a scratch clone until the retry hook pushes it.
+        // B exists only in a scratch clone until the hook pushes it.
         let scratch = f._tmp.path().join("scratch");
         git(
             f._tmp.path(),
@@ -1045,7 +1142,7 @@ mod tests {
         );
         let b = commit(&scratch, "B");
         let origin = slash(&f.origin);
-        let mut retries = 0usize;
+        let mut failed_attempts = 0usize;
         let wt = prepare_with(
             &f,
             CANDIDATE,
@@ -1053,9 +1150,9 @@ mod tests {
             &TEST_POLICY,
             &CancellationToken::new(),
             &mut |_| {},
-            &mut |_| {
-                retries += 1;
-                if retries == 1 {
+            &mut |_, _| {
+                failed_attempts += 1;
+                if failed_attempts == 1 {
                     git(
                         &scratch,
                         &["push", "-q", "-f", &origin, &format!("HEAD:{CANDIDATE}")],
@@ -1065,13 +1162,14 @@ mod tests {
         )
         .await
         .expect("the retry must see the late-published head");
-        assert_eq!(retries, 1);
+        assert_eq!(failed_attempts, 1);
         assert_eq!(git(&wt, &["rev-parse", "HEAD"]), b);
     }
 
-    /// Cancellation DURING a real (non-zero) retry pause: the token is
-    /// cancelled when the retry is announced, i.e. after attempt 1 and just
-    /// before a 600 s pause, and the checkout returns `Cancelled` at once.
+    /// Cancellation DURING a real (non-zero) retry pause: the retry is
+    /// announced, a separate task cancels ~200 ms later — by which time the
+    /// checkout is parked in the 600 s pause — and the pause's cancel branch
+    /// returns `Cancelled` at once.
     #[tokio::test]
     async fn cancel_during_backoff_is_cancelled() {
         let f = fixture();
@@ -1081,8 +1179,17 @@ mod tests {
             ..TEST_POLICY
         };
         let cancel = CancellationToken::new();
-        let trigger = cancel.clone();
-        let mut retries = 0usize;
+        let announced = std::sync::Arc::new(tokio::sync::Notify::new());
+        let canceller = {
+            let (cancel, announced) = (cancel.clone(), announced.clone());
+            tokio::spawn(async move {
+                announced.notified().await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                cancel.cancel();
+            })
+        };
+        let signal = announced.clone();
+        let mut lines: Vec<String> = Vec::new();
         let started = std::time::Instant::now();
         let err = prepare_with(
             &f,
@@ -1090,39 +1197,62 @@ mod tests {
             GHOST,
             &policy,
             &cancel,
-            &mut |_| trigger.cancel(),
-            &mut |_| retries += 1,
+            &mut |l| {
+                lines.push(l.to_string());
+                signal.notify_one();
+            },
+            &mut |_, _| {},
         )
         .await
         .expect_err("cancelled");
         assert_eq!(err, CheckoutError::Cancelled);
-        assert_eq!(retries, 0, "the pause was interrupted, not slept out");
+        assert_eq!(lines.len(), 1, "exactly one retry was announced: {lines:?}");
+        assert!(lines[0].contains("retry 2/3 in 600s"), "{lines:?}");
         assert!(
             started.elapsed() < Duration::from_secs(60),
             "cancellation must cut the 600 s pause short, took {:?}",
             started.elapsed()
         );
+        canceller.await.unwrap();
     }
 
-    /// Cancellation of a fetch that is IN FLIGHT: the mirror is a local TCP
-    /// listener that accepts the connection and never answers, so the fetch
-    /// would hang for its whole timeout. The token is cancelled the moment git
-    /// connects; the checkout returns `Cancelled` at once and the git child is
-    /// dropped (and, by `kill_on_drop`, killed) rather than waited out.
+    /// Cancellation of a fetch that is IN FLIGHT, and what it must kill. The
+    /// mirror is a local TCP listener that accepts the connection and never
+    /// answers, so the fetch would hang. The token is cancelled the moment the
+    /// connection arrives. Asserted:
+    ///
+    /// - the checkout returns `Cancelled` at once;
+    /// - the MIRROR CONNECTION CLOSES. That socket is held by git's transport
+    ///   helper (`git-remote-http`), a CHILD of `git` — so its close is the
+    ///   portable, observable proof that the whole process tree was killed,
+    ///   not just `git`. With `kill_on_drop` alone the helper survives and the
+    ///   connection stays open until `http.lowSpeedTime` (60 s) — longer than
+    ///   this test waits.
     #[tokio::test]
-    async fn cancel_during_a_hung_fetch_is_cancelled() {
+    async fn cancel_during_a_hung_fetch_kills_the_whole_fetch_tree() {
+        use tokio::io::AsyncReadExt;
         let f = fixture();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/mirror.git", listener.local_addr().unwrap());
         let cancel = CancellationToken::new();
         let trigger = cancel.clone();
-        let (connected_tx, connected_rx) = tokio::sync::oneshot::channel::<()>();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
         let server = tokio::spawn(async move {
-            // Hold the accepted socket open and silent until the test ends.
-            let (_socket, _) = listener.accept().await.unwrap();
-            let _ = connected_tx.send(());
+            let (mut socket, _) = listener.accept().await.unwrap();
             trigger.cancel();
-            std::future::pending::<()>().await;
+            // Drain the request, then wait for the peer to go away.
+            let closed = tokio::time::timeout(Duration::from_secs(20), async {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            })
+            .await
+            .map_err(|_| "the mirror connection outlived the cancel by 20 s".to_string());
+            let _ = closed_tx.send(closed);
         });
         let started = std::time::Instant::now();
         let err = prepare_worktree_with(
@@ -1135,21 +1265,23 @@ mod tests {
             &TEST_POLICY,
             &cancel,
             &mut |_| {},
-            &mut |_| {},
+            &mut |_, _| {},
         )
         .await
         .expect_err("cancelled");
         assert_eq!(err, CheckoutError::Cancelled);
         assert!(
-            connected_rx.await.is_ok(),
-            "git must have connected, so the cancel landed mid-fetch"
-        );
-        assert!(
             started.elapsed() < Duration::from_secs(30),
             "a hung fetch must not be waited out, took {:?}",
             started.elapsed()
         );
-        server.abort();
+        let closed = closed_rx.await.expect("the listener saw the connection");
+        assert_eq!(
+            closed,
+            Ok(()),
+            "the fetch's transport helper must be killed"
+        );
+        server.await.unwrap();
     }
 
     /// Through the PRODUCTION entry point: a dispatch already cancelled
@@ -1185,7 +1317,7 @@ mod tests {
     async fn option_shaped_or_malformed_payload_is_refused() {
         let f = fixture();
         let url = slash(&f.origin);
-        let cases: [(&str, &str, &str); 11] = [
+        let cases: [(&str, &str, &str); 16] = [
             (url.as_str(), "--upload-pack=touch pwned", GHOST),
             (url.as_str(), "refs/heads/main", GHOST),
             (url.as_str(), "refs/heads/merge-candidate/", GHOST),
@@ -1201,6 +1333,11 @@ mod tests {
             ("ext::sh", CANDIDATE, GHOST),
             ("ssh://host/repo.git", CANDIDATE, GHOST),
             ("relative/path", CANDIDATE, GHOST),
+            ("\\\\server\\share\\mirror.git", CANDIDATE, GHOST),
+            ("//server/share/mirror.git", CANDIDATE, GHOST),
+            ("\\\\?\\C:\\mirror.git", CANDIDATE, GHOST),
+            ("file://server/share/mirror.git", CANDIDATE, GHOST),
+            ("file:////server/share/mirror.git", CANDIDATE, GHOST),
         ];
         for (fetch_url, candidate_ref, head) in cases {
             let err = prepare_worktree_with(
@@ -1213,7 +1350,7 @@ mod tests {
                 &TEST_POLICY,
                 &CancellationToken::new(),
                 &mut |_| {},
-                &mut |_| {},
+                &mut |_, _| {},
             )
             .await
             .expect_err("must be refused");
@@ -1231,6 +1368,7 @@ mod tests {
             "https://coord.qontinui.io/git/qontinui/qontinui-runner.git",
             "http://127.0.0.1:9/mirror.git",
             "file:///srv/mirror.git",
+            "file:///C:/mirror.git",
         ] {
             assert!(validate_fetch_args(ok, CANDIDATE, GHOST).is_ok(), "{ok}");
         }
@@ -1245,6 +1383,9 @@ mod tests {
             "maintenance.auto=false",
             "fetch.writeCommitGraph=false",
         ] {
+            assert!(joined.contains(c), "{joined}");
+        }
+        for c in ["http.lowSpeedLimit=1", "http.lowSpeedTime=60"] {
             assert!(joined.contains(c), "{joined}");
         }
         let fetch_at = args.iter().position(|a| *a == "fetch").unwrap();
