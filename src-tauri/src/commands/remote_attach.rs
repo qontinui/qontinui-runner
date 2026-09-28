@@ -1117,7 +1117,8 @@ pub(crate) fn remote_interactivity_response(
 ///
 /// `trigger` is `fleet_view` (the Fleet view loading that device — also
 /// stamps the device so the runner's scheduler keeps sweeping it for seven
-/// days), `scheduler`, or `manual` (the default). Returns the per-row outcome
+/// days), `scheduler`, `manual` (an explicit request: bypasses the per-session
+/// attempt memory), or absent (`unspecified`, which does not). Returns the per-row outcome
 /// list plus the fleet flags the sweep read; `Err` names the door that failed
 /// (`remote_interactivity_probe:<door>: …`). Proxied for headless agents
 /// (`mcp/tauri_proxy.rs`).

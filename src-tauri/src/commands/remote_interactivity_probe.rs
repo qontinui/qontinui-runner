@@ -311,10 +311,15 @@ fn is_fresh_traffic_ok(fact: Option<&Value>, fresh_for_secs: i64, now: DateTime<
 }
 
 /// `None` = probe it; `Some(reason)` = skip.
+/// `own_probe`: `Some(recent)` when THIS runner holds an attempt stamp for the
+/// row (`recent` = inside the re-probe window at the sweep's start), `None`
+/// when it holds none — then coord's `observedAt` on a probe fact (another
+/// device's, or one from before a restart) is all there is to go on.
 pub(crate) fn skip_reason(
     row: &Value,
     fresh_for_secs: i64,
     now: DateTime<Utc>,
+    own_probe: Option<bool>,
 ) -> Option<&'static str> {
     if row.get("isCallerDevice").and_then(|v| v.as_bool()) == Some(true) {
         return Some("caller_device");
@@ -345,21 +350,35 @@ pub(crate) fn skip_reason(
     {
         return Some("fresh_traffic");
     }
-    if fact_is_fresh(read, fresh_for_secs, now) && fact_is_fresh(write, fresh_for_secs, now) {
+    // "Current" is per source. A traffic fact is good for freshFor. A PROBE
+    // fact only for the re-probe window — the sweep must renew it before it
+    // goes stale, so it cannot be allowed to hold a row back past the next
+    // tick; and when this runner stamped the probe itself, the stamp (taken
+    // at the sweep's start) decides, not coord's filing time, which lands
+    // mid-sweep and would otherwise skip every other tick.
+    let current = |fact: Option<&Value>| -> bool {
+        let via_probe =
+            fact.is_some_and(|f| f.get("via").and_then(|v| v.as_str()) == Some("probe"));
+        match (via_probe, own_probe) {
+            (true, Some(recent)) => recent && fact_is_fresh(fact, fresh_for_secs, now),
+            (true, None) => fact_is_fresh(fact, reprobe_window_secs(fresh_for_secs), now),
+            (false, _) => fact_is_fresh(fact, fresh_for_secs, now),
+        }
+    };
+    if current(read) && current(write) {
         return Some("fresh");
     }
     // Convergence. A probe measures the READ half; the write half it can only
     // measure against a target known to acknowledge input. So a row whose read
-    // is fresh and whose write coord records as unmeasurable (never probed, or
-    // the target predates acks) would be re-probed every sweep to learn
+    // is current and whose write coord records as unmeasurable (never probed,
+    // or the target predates acks) would be re-probed every sweep to learn
     // nothing new.
-    if fact_is_fresh(read, fresh_for_secs, now) && write_is_unmeasurable(write) {
+    if current(read) && write_is_unmeasurable(write) {
         return Some("write_unmeasurable");
     }
-    // And a read any probe filed within the re-probe window is not re-probed,
-    // whatever the write half says.
-    if read.is_some_and(|f| f.get("via").and_then(|v| v.as_str()) == Some("probe"))
-        && fact_is_fresh(read, reprobe_window_secs(fresh_for_secs), now)
+    // And a probe read that is still current is not re-probed, whatever the
+    // write half says.
+    if read.is_some_and(|f| f.get("via").and_then(|v| v.as_str()) == Some("probe")) && current(read)
     {
         return Some("recently_probed");
     }
@@ -382,11 +401,13 @@ fn reprobe_window_secs(fresh_for_secs: i64) -> i64 {
     w - (REPROBE_SLACK.as_secs() as i64).min(w / 2)
 }
 
-/// In-process memory of when each session was last PROBED, whatever came of
-/// it. Coord only remembers what was filed, and several outcomes file nothing
-/// that marks the row as recently looked at (a mint refusal, a target
-/// mismatch, an unreachable or busy target): without this, every sweep would
-/// re-spend a grant on them. Bounded; the oldest entries go first.
+/// In-process memory of when this runner last PROBED each session — noted
+/// once a grant was minted (a refused or failed mint is NOT noted, so it is
+/// retried next sweep), stamped with the sweep's start, whatever came of the
+/// probe after that. Coord only remembers what was filed, and several outcomes
+/// file nothing that marks the row as recently looked at (a target mismatch,
+/// an unreachable or busy target): without this, every sweep would re-spend a
+/// grant on them. Bounded; the oldest entries go first.
 #[derive(Default)]
 pub(crate) struct ProbeAttempts {
     last: Mutex<std::collections::HashMap<String, std::time::Instant>>,
@@ -418,12 +439,23 @@ impl ProbeAttempts {
         fresh_for_secs: i64,
         now: std::time::Instant,
     ) -> bool {
+        self.recently_if_stamped(session_id, fresh_for_secs, now)
+            .unwrap_or(false)
+    }
+
+    /// `None` when there is no stamp for `session_id`; else whether it falls
+    /// inside the re-probe window before `now`.
+    pub(crate) fn recently_if_stamped(
+        &self,
+        session_id: &str,
+        fresh_for_secs: i64,
+        now: std::time::Instant,
+    ) -> Option<bool> {
         let g = self.last.lock().unwrap_or_else(|e| e.into_inner());
-        g.get(&session_id.trim().to_ascii_lowercase())
-            .is_some_and(|t| {
-                (now.saturating_duration_since(*t).as_secs() as i64)
-                    < reprobe_window_secs(fresh_for_secs)
-            })
+        g.get(&session_id.trim().to_ascii_lowercase()).map(|t| {
+            (now.saturating_duration_since(*t).as_secs() as i64)
+                < reprobe_window_secs(fresh_for_secs)
+        })
     }
 
     #[cfg(test)]
@@ -603,17 +635,20 @@ pub(crate) async fn run_probe_sweep(
             });
             continue;
         }
-        let reason = skip_reason(row, flags.fresh_for_secs, started_utc)
+        // A MANUAL sweep (an explicit `manual` — an absent trigger is
+        // `unspecified`) is someone asking now: this runner's attempt memory
+        // does not hold it back. The per-device throttle still applies.
+        let manual = trigger == "manual";
+        let own_probe = if manual {
+            None
+        } else {
+            doors
+                .attempts()
+                .recently_if_stamped(&session_id, flags.fresh_for_secs, started)
+        };
+        let reason = skip_reason(row, flags.fresh_for_secs, started_utc, own_probe)
             .or_else(|| doors.live_tab_here(&session_id).then_some("live_tab_here"))
-            .or_else(|| {
-                // A MANUAL sweep is someone asking now: it is not held back by
-                // the attempt memory (the per-device throttle still applies).
-                (trigger != "manual"
-                    && doors
-                        .attempts()
-                        .recently(&session_id, flags.fresh_for_secs, started))
-                .then_some("recently_attempted")
-            });
+            .or_else(|| (own_probe == Some(true)).then_some("recently_attempted"));
         if let Some(reason) = reason {
             outcomes.push(RowOutcome {
                 session_id,
@@ -1249,10 +1284,12 @@ pub(crate) async fn run_probe_command(
         format!("remote_interactivity_probe:invalid_device_id: {device_id:?} is not a uuid: {e}")
     })?;
     let device_id = device.to_string();
+    // Absent means UNSPECIFIED, not manual: only an explicit `manual` bypasses
+    // the attempt memory.
     let trigger = trigger
         .map(str::trim)
         .filter(|t| !t.is_empty())
-        .unwrap_or("manual");
+        .unwrap_or("unspecified");
     if trigger == "fleet_view" {
         // Settings I/O is blocking file work: off the async runtime, and only
         // when the stamp is actually due.
@@ -1350,6 +1387,11 @@ mod tests {
 
     const DEVICE: &str = "84c02292-32cb-4983-be85-d00f868b7003";
     const ME: &str = "11111111-1111-4111-8111-111111111111";
+
+    /// `skip_reason` for a runner holding no attempt stamp for the row.
+    fn skip_reason_no_stamp(row: &Value, f: i64, now: DateTime<Utc>) -> Option<&'static str> {
+        skip_reason(row, f, now, None)
+    }
 
     fn sid(n: u128) -> String {
         Uuid::from_u128(0x5e55_0000 + n).to_string()
@@ -1901,6 +1943,71 @@ mod tests {
         assert_eq!(reprobe_window_secs(0), 0);
     }
 
+    /// W1: when this runner stamped the probe, its stamp decides — a fact that
+    /// coord filed 300 s after the previous sweep STARTED is still re-probed at
+    /// the next PROBE_EVERY tick. Without a stamp the filing time is all there
+    /// is, and the same fact reads as recently probed.
+    #[test]
+    fn this_runners_stamp_decides_over_coords_filing_time() {
+        let now = Utc::now();
+        // Previous sweep started PROBE_EVERY ago; its fact was filed 300 s in.
+        let age = PROBE_EVERY.as_secs() as i64 - 300;
+        let r = row(
+            1,
+            json!({
+                "readableRemotely": fact("ok", Some("probe"), age, None),
+                "writableRemotely": fact("unknown", None, 0, Some("unprobed")),
+            }),
+        );
+        assert_eq!(
+            skip_reason(&r, 1800, now, Some(false)),
+            None,
+            "due at the tick"
+        );
+        assert_eq!(
+            skip_reason(&r, 1800, now, None),
+            Some("write_unmeasurable"),
+            "no stamp: the filing time is all there is"
+        );
+        // And with the stamp inside the window the row is skipped.
+        assert!(skip_reason(&r, 1800, now, Some(true)).is_some());
+        // End to end: the attempt stamp at the previous sweep's start makes the
+        // next tick's sweep probe it.
+        let a = ProbeAttempts::default();
+        let prev = std::time::Instant::now();
+        a.note(&sid(1), prev);
+        assert_eq!(
+            a.recently_if_stamped(&sid(1), 1800, prev + PROBE_EVERY),
+            Some(false)
+        );
+    }
+
+    /// S4: probe facts are current only for the re-probe window (so a probed
+    /// row is renewed every PROBE_EVERY and never goes stale between T+1800 and
+    /// T+2400); traffic facts keep freshFor.
+    #[test]
+    fn probe_facts_are_current_for_the_reprobe_window_traffic_for_fresh_for() {
+        let now = Utc::now();
+        let age = reprobe_window_secs(1800) + 20; // past the window, inside freshFor
+        assert!(age < 1800);
+        let probed = row(
+            1,
+            json!({
+                "readableRemotely": fact("ok", Some("probe"), age, None),
+                "writableRemotely": fact("failed", Some("probe"), age, Some("terminal_exited")),
+            }),
+        );
+        assert_eq!(skip_reason(&probed, 1800, now, None), None);
+        let trafficked = row(
+            1,
+            json!({
+                "readableRemotely": fact("failed", Some("traffic"), age, Some("session_not_local")),
+                "writableRemotely": fact("failed", Some("traffic"), age, Some("terminal_exited")),
+            }),
+        );
+        assert_eq!(skip_reason(&trafficked, 1800, now, None), Some("fresh"));
+    }
+
     /// The attempt memory is bounded and honours the slack.
     #[test]
     fn probe_attempts_are_bounded_and_windowed() {
@@ -2049,19 +2156,19 @@ mod tests {
         let now = Utc::now();
         let f = 1800;
         assert_eq!(
-            skip_reason(&row(1, json!({"isCallerDevice": true})), f, now),
+            skip_reason_no_stamp(&row(1, json!({"isCallerDevice": true})), f, now),
             Some("caller_device")
         );
         assert_eq!(
-            skip_reason(&row(1, json!({"state": "closed"})), f, now),
+            skip_reason_no_stamp(&row(1, json!({"state": "closed"})), f, now),
             Some("closed")
         );
         assert_eq!(
-            skip_reason(&row(1, json!({"interactiveSurface": "none"})), f, now),
+            skip_reason_no_stamp(&row(1, json!({"interactiveSurface": "none"})), f, now),
             Some("not_interactive")
         );
         assert_eq!(
-            skip_reason(
+            skip_reason_no_stamp(
                 &row(
                     1,
                     json!({"writableRemotely": fact("ok", Some("traffic"), 10, None)})
@@ -2072,7 +2179,7 @@ mod tests {
             Some("fresh_traffic")
         );
         assert_eq!(
-            skip_reason(
+            skip_reason_no_stamp(
                 &row(
                     1,
                     json!({
@@ -2089,11 +2196,11 @@ mod tests {
         // STALE write fact, which a probe against an acking target can move);
         // an aged fact is not fresh; unknown never is.
         assert_eq!(
-            skip_reason(
+            skip_reason_no_stamp(
                 &row(
                     1,
                     json!({
-                        "readableRemotely": fact("ok", Some("probe"), 1500, None),
+                        "readableRemotely": fact("failed", Some("traffic"), 1500, Some("session_not_local")),
                         "writableRemotely": fact("unknown", Some("traffic"), 4000, Some("stale")),
                     })
                 ),
@@ -2105,11 +2212,11 @@ mod tests {
         // Convergence: a fresh read with an unmeasurable write is skipped...
         for reason in ["unprobed", "target_predates_input_ack"] {
             assert_eq!(
-                skip_reason(
+                skip_reason_no_stamp(
                     &row(
                         1,
                         json!({
-                            "readableRemotely": fact("ok", Some("probe"), 1500, None),
+                            "readableRemotely": fact("ok", Some("probe"), 600, None),
                             "writableRemotely": fact("unknown", None, 0, Some(reason)),
                         })
                     ),
@@ -2122,7 +2229,7 @@ mod tests {
         }
         // ...and so is a read any probe filed within the re-probe window.
         assert_eq!(
-            skip_reason(
+            skip_reason_no_stamp(
                 &row(
                     1,
                     json!({
@@ -2142,12 +2249,12 @@ mod tests {
             ("closed", "closed"),
         ] {
             assert_eq!(
-                skip_reason(&row(1, json!({"state": state})), f, now),
+                skip_reason_no_stamp(&row(1, json!({"state": state})), f, now),
                 Some(why)
             );
         }
         assert_eq!(
-            skip_reason(
+            skip_reason_no_stamp(
                 &row(
                     1,
                     json!({"readableRemotely": fact("ok", Some("traffic"), 1900, None)})
@@ -2159,7 +2266,7 @@ mod tests {
         );
         // not_runner_hosted and unknown surfaces are still probed.
         assert_eq!(
-            skip_reason(
+            skip_reason_no_stamp(
                 &row(1, json!({"interactiveSurface": "not_runner_hosted"})),
                 f,
                 now
@@ -2172,7 +2279,7 @@ mod tests {
         for k in ["readableRemotely", "writableRemotely", "interactiveSurface"] {
             bare.as_object_mut().unwrap().remove(k);
         }
-        assert_eq!(skip_reason(&bare, f, now), None);
+        assert_eq!(skip_reason_no_stamp(&bare, f, now), None);
     }
 
     /// A coord that predates the interactivity facts gets no probes at all:

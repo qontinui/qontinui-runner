@@ -461,19 +461,24 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
             };
             // A headless caller is not the Fleet view: `fleet_view` would
             // stamp the device into the scheduler's sweep set for a week on
-            // behalf of an operator who never opened it. Only `manual` here.
-            if let Some(t) = a.trigger.as_deref().map(str::trim) {
-                if !t.is_empty() && t != "manual" {
+            // behalf of an operator who never opened it. So the proxy passes
+            // an explicit `manual` through and otherwise runs `unspecified`
+            // (which, unlike manual, honours the attempt memory); any other
+            // trigger is refused.
+            let trigger = match a.trigger.as_deref().map(str::trim) {
+                None | Some("") => "unspecified",
+                Some("manual") => "manual",
+                Some(t) => {
                     return TauriInvokeResponse::err(format!(
                         "remote_interactivity_probe:trigger_not_allowed: {t:?} — the proxy \
-                         runs only trigger \"manual\""
-                    ));
+                         runs only trigger \"manual\" (or none)"
+                    ))
                 }
-            }
+            };
             match crate::commands::remote_interactivity_probe::run_probe_command(
                 &state.app_handle,
                 &a.device_id,
-                Some("manual"),
+                Some(trigger),
             )
             .await
             {
