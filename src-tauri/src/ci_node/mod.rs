@@ -111,6 +111,11 @@ pub(crate) struct CiDispatchPayload {
     /// [`CiDispatchPayload::coord_accepts_queue_heartbeat`].
     #[serde(default)]
     pub progress_phases: Vec<String>,
+    /// Coord's queue-renewal ceiling for this dispatch, in seconds from its
+    /// `created_at` (coord `ci_dispatch::QUEUED_RENEWAL_MAX_AGE_SECS`). The
+    /// admission queue derives how long it may hold the dispatch from this.
+    #[serde(default)]
+    pub queued_renewal_max_age_secs: Option<u64>,
 }
 
 impl CiDispatchPayload {
