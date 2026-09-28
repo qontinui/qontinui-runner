@@ -56,9 +56,12 @@ name: Flake escalation
 # (`load_result_history` over coord.test_results), not this repo's. A red
 # nightly says "the rail is dark"; a green one with no issues would say "no
 # flakes", which is the false clean bill of health the plan exists to abolish.
-# That condition is tracked as coord finding e5311ec9-1592-430e-a7f8-9cc6eb84032e
-# (topic `test-flakiness`); the fix is a coord/web index or a horizon-bounded
-# read, never a change to this workflow.
+# That condition is tracked by plan
+# `2026-09-28-coord-test-flakiness-history-read-still-hits-the-statement-timeout`
+# (qontinui-dev-notes/plans — a stem does not expire), and at the time of
+# writing by coord finding 1c1b9554-ef5e-4de4-bf16-145b778814a2 (topic
+# `test-flakiness`; findings expire after ~14 days, so trust the plan stem
+# first); the fix is a coord/web index or a horizon-bounded read, never a change to this workflow.
 # `history_read: thin` (no test has 20 samples yet) is a notice and exits 0.
 #
 # The plan's second escalation arm — "any occurrence on a push to
