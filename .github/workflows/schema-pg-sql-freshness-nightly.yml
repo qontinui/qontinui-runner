@@ -8,14 +8,18 @@ name: schema.pg.sql.generated nightly freshness
 # ---------------------------------------------------------------------------
 # `schema-pg-sql-fresh.yml` is a REQUIRED check (ruleset `main-merge-gates`)
 # and it works — for runner-authored changes. Its `detect` job computes
-# `schema_changed` from a diff of TWO runner paths:
+# `schema_changed` from a diff of runner paths:
 #
 #     src-tauri/queries/
 #     src-tauri/schema.pg.sql.generated
+#     src-tauri/scripts/regenerate_schema_pg_sql.sh
+#     atlas/
 #
-# But this dump contains no runner-authored schema at all. It dumps
-# `project coord agent auth cloud public` (see regenerate_schema_pg_sql.sh),
-# and every one of those schemas is authored by qontinui-web's alembic chain.
+# But almost all of this dump is not runner-authored. It dumps
+# `project coord agent auth cloud public atlas_managed` (SCHEMAS in
+# regenerate_schema_pg_sql.sh). `atlas_managed` is authored by the runner's own
+# atlas/schema.hcl, which the path filter above does see; every other schema is
+# authored by qontinui-web's alembic chain.
 # The `runner` schema is retired outright, and `forbid-runner-schema.yml` is a
 # required check that keeps it retired. So:
 #
@@ -24,7 +28,7 @@ name: schema.pg.sql.generated nightly freshness
 #   * and the aggregator shim passes trivially whenever verify skips, so the
 #     required context reads GREEN for as long as the drift persists.
 #
-# That is not a mis-set filter a wider glob would fix — the two `detect` paths
+# That is not a mis-set filter a wider glob would fix — the `detect` paths
 # can only go true AFTER a human has already noticed and regenerated. Measured
 # 2026-09-05: the dump had not been regenerated since 2026-08-24 while 27
 # qontinui-web alembic revisions had landed, and all 12 most recent
@@ -60,7 +64,7 @@ name: schema.pg.sql.generated nightly freshness
 # ---------------------------------------------------------------------------
 #   - schedule (nightly): bounds staleness at <=24h. Hand-regeneration was
 #     already running at roughly one commit per 9 days and still left the
-#     12-day window above open. The hour is offset from atlas-exclude-fresh.yml
+#     12-day window above open. The hour is offset from atlas-schema-check.yml
 #     (`17 6`) because both jobs stand up Postgres plus a full poetry install of
 #     the web backend and should not contend for runners.
 #   - workflow_dispatch: on-demand check, and the way to produce a deliberate
@@ -231,9 +235,19 @@ jobs:
           DATABASE_URL: postgresql://qontinui_user:qontinui_dev_password@localhost:5433/qontinui_db
         run: poetry run alembic upgrade head
 
+      # Atlas, not alembic, owns `atlas_managed` and `orchestration`
+      # (atlas/schema.hcl), and no alembic revision creates or moves their
+      # tables. Apply the HCL after the alembic chain so the database this job
+      # generates from carries them. The script provisions its own throwaway
+      # dev database and runs Atlas and psql from pinned docker images.
+      - name: Apply Atlas-owned schema (atlas/schema.hcl)
+        working-directory: qontinui-runner
+        timeout-minutes: 10
+        run: bash atlas/scripts/apply_to.sh postgresql://qontinui_user:qontinui_dev_password@localhost:5433/qontinui_db
+
       # Bounded against a job-time apt hang, same 10-minute bound and same
       # rationale as the identical step in schema-pg-sql-fresh.yml and
-      # atlas-exclude-fresh.yml: a 9-second download sample cannot size a bound
+      # ci.yml: a 9-second download sample cannot size a bound
       # that must also cover `apt-get update` on a congested mirror.
       - name: Install Postgres client (for pg_dump)
         timeout-minutes: 10
@@ -252,6 +266,8 @@ jobs:
           CLORINDE_PG_HOST: localhost
           CLORINDE_PG_PORT: "5433"
           PGPASSWORD: qontinui_dev_password
+          # Atlas was applied by the step above; do not apply it twice.
+          REGEN_SKIP_ATLAS: "1"
           # Single source of truth for the trigger predicate. Re-published as a
           # step OUTPUT below, before any exit path, so the delivery step
           # consumes this exact value instead of re-encoding the predicate — a
@@ -296,7 +312,9 @@ jobs:
             echo "::error::Regeneration produced an EMPTY dump. That is a bad read, not drift."
             exit 1
           fi
-          for schema in project coord agent auth; do
+          # atlas_managed guards the Atlas apply step: a dump taken without it
+          # would silently drop the six Atlas-owned tables.
+          for schema in project coord agent auth atlas_managed; do
             if ! grep -q "^CREATE TABLE ${schema}\." "$RUNNER_TEMP/schema.fresh.sql"; then
               echo "::error::Regenerated dump is missing the ENTIRE '${schema}' schema. That is a bad read, not drift."
               exit 1
@@ -373,7 +391,7 @@ jobs:
                 echo "::error::Usually permissions/config, not schema drift (see gh's errors above). EITHER of these unblocks it:"
                 echo "::error::  (a) Settings > Actions > General > Workflow permissions: enable 'Allow GitHub Actions to create and approve pull requests'; or"
                 echo "::error::  (b) grant the CLORINDE_AUTOCOMMIT_TOKEN PAT 'Pull requests: write' on $REPO."
-                echo "::error::This is the SAME grant atlas-exclude-fresh.yml needs — one grant unblocks both nightlies."
+                echo "::error::This is the SAME grant sibling-pin-bump.yml needs — one grant unblocks both nightlies."
                 ;;
               *)
                 echo "::error::This call runs on GITHUB_TOKEN under the job's 'pull-requests: write'; a refusal here means that permissions block has drifted (see gh's error above)."
@@ -417,7 +435,7 @@ jobs:
             # Quoted heredoc: the body is full of backticks, which an unquoted
             # one would run as command substitution. The content sits at the
             # block scalar's own indentation and YAML strips it, so the file
-            # lands at column 0 — same shape as atlas-exclude-fresh.yml.
+            # lands at column 0.
             cat <<'EOF'
           `src-tauri/schema.pg.sql.generated` was stale against a fresh `alembic upgrade head` +
           `pg_dump` of `qontinui-web@main`. This PR carries the regenerated dump, byte-identical

@@ -35,6 +35,24 @@ The rule that makes it hold: **every schema in `schemas` holds only objects
 | `atlas.hcl` | Atlas project config. The `runner_pilot` env scopes Atlas to `schemas = ["atlas_managed", "orchestration"]`. |
 | `schema.hcl` | The desired state of every object in those two schemas. |
 | `scripts/check_schema.sh` | The ownership check (below). |
+| `scripts/apply_to.sh` | Applies `schema.hcl` to a database (refusing any plan with a DROP). Every codegen pipeline runs it after `alembic upgrade head`. |
+| `scripts/lib.sh` | Shared helpers: containerised Atlas and psql, the throwaway no-`public` dev database. |
+
+## Codegen databases need Atlas applied
+
+No alembic revision creates or moves the Atlas-owned tables. A database built
+by `alembic upgrade head` alone has nothing in `atlas_managed`, but it does
+still carry four legacy `project.regression_*` tables from frozen revision
+`f9d3e8a4c1b6`. So every pipeline that builds a database to generate from runs
+`scripts/apply_to.sh` after alembic: `clorinde-bindings-fresh.yml`,
+`schema-pg-sql-fresh.yml`, `schema-pg-sql-freshness-nightly.yml`, and
+`src-tauri/scripts/regenerate_schema_pg_sql.sh`. The regeneration script also
+excludes the legacy `project.regression_*` copies from its dump, so
+`schema.pg.sql.generated` (and every fresh embedded cluster built from it)
+carries all six tables in `atlas_managed` and none in `project`.
+
+On a live database the runner reconciles any legacy copies at boot (see the
+last section).
 
 ## The ownership check
 
@@ -42,7 +60,8 @@ The rule that makes it hold: **every schema in `schemas` holds only objects
 `alembic upgrade head` to a scratch Postgres and runs
 `scripts/check_schema.sh`, which asserts:
 
-1. the Atlas dev database has no `public` schema (see below);
+1. the Atlas dev database has no `public` schema (see below; the script
+   provisions a throwaway one unless `ATLAS_DEV_URL` names one);
 2. the plan `schema apply --env runner_pilot` would run contains **no DROP** —
    a DROP means something Atlas does not declare lives in a schema it owns;
 3. after applying it, a second `schema diff` plans **nothing** (idempotence);
@@ -54,14 +73,15 @@ an object into an Atlas-owned schema without touching this repo), and on
 `workflow_dispatch`. It is deliberately not a required check. Locally:
 
 ```bash
-ATLAS_LIVE_URL='postgres://user:pass@localhost:5433/alembic_head_db?sslmode=disable' \
-ATLAS_DEV_URL='postgres://user:pass@localhost:5433/empty_dev_db?sslmode=disable' \
+ATLAS_LIVE_URL='postgres://user:pass@localhost:5433/alembic_head_db' \
   bash atlas/scripts/check_schema.sh
 ```
 
-It needs `psql` on `PATH` and runs Atlas from the pinned Community docker image
-(`ATLAS_BIN=/path/to/atlas` uses a native binary instead). It **applies** the
-plan to `ATLAS_LIVE_URL`, so point it at a scratch database.
+It needs only docker: Atlas runs from the pinned Community image and `psql`
+from `postgres:16` when no native `psql` is on `PATH` (`ATLAS_BIN=/path/to/atlas`
+uses a native Atlas instead). It **applies** the plan to `ATLAS_LIVE_URL`, so
+point it at a scratch database. It cannot see objects the runner's boot-time
+self-heal creates, because CI runs alembic only.
 
 ## The dev-database precondition
 
@@ -74,8 +94,9 @@ Abort: the planned state does not match the desired state after applying the fil
   -CREATE SCHEMA IF NOT EXISTS "public";
 ```
 
-Use a dedicated empty database and `DROP SCHEMA public CASCADE` in it. The
-target database's own `public` schema is irrelevant.
+`scripts/lib.sh` creates a dedicated empty database beside the target, drops
+its `public` schema, and drops the database again on exit. The target
+database's own `public` schema is irrelevant.
 
 ## Applying (manual)
 
@@ -99,8 +120,11 @@ schemas, and both must stay consistent with `schema.hcl`:
 - it imperatively creates `orchestration.runs` / `orchestration.subtasks` so a
   fresh database without Atlas applied still boots the conductor;
 - it moves any leftover `project.<t>` copy of the six `atlas_managed` tables
-  into `atlas_managed` (merging, and dropping the old copy only after every row
-  is verified present) — `migrate_atlas_managed_tables`.
+  into `atlas_managed` — `migrate_atlas_managed_tables`. A legacy-only table is
+  moved with `SET SCHEMA` (its FKs re-pointed at `atlas_managed` parents); a
+  table in both schemas is merged, and the old copy is dropped only when every
+  legacy row is present and identical in the target. Anything else is left in
+  place and logged at ERROR; the pass never fails boot.
 
 pgvector and pgcrypto stay imperatively bootstrapped there too: Atlas
 Community cannot own extensions.
