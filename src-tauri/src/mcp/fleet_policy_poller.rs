@@ -121,7 +121,7 @@
 //!   or no-row — in THIS process ([`plan_capture_answered`]). The default
 //!   `record` is enough to put the capture clause in a session prompt, but not
 //!   to push every plan body on a cold start before coord has had the chance to
-//!   say the tenant turned capture off. See [`plan_capture_writes_authorized`].
+//!   say the tenant turned capture off. See [`plan_capture_verdict`].
 //! - Unpaired ⇒ SKIPPED quietly, cache untouched.
 //! - Any explicit level that is not exactly `record` (including `observe`,
 //!   `gate`, a typo, or an empty string) normalizes to `off`
@@ -183,6 +183,7 @@ use tokio::sync::{watch, Mutex};
 use tracing::{info, warn};
 
 use crate::mcp::types::ApiState;
+pub(crate) use qontinui_runner_lib::plan_workunit_adapter::trigger::CaptureVerdict;
 
 /// How often the loop refreshes the cached effective level. 45s sits in the
 /// 30–60s window the plan specifies — long enough to not hammer coord, short
@@ -443,7 +444,7 @@ fn read_cached_level(cache: &RwLock<String>, fallback: &str) -> String {
 /// `"record"`, until the first successful poll (and after a no-row answer); an
 /// explicit `off` row (or an unrecognised level) is the only way it reads
 /// `"off"`. This is what the SESSION PROMPT clause reads; the data write paths
-/// read [`plan_capture_writes_authorized`] instead.
+/// read [`plan_capture_verdict`] instead.
 ///
 /// SYNCHRONOUS + lock-only — safe to call from
 /// [`crate::terminal::runner_context`], which renders the spawn-time briefing
@@ -478,8 +479,17 @@ fn set_plan_capture_answered(answered: bool) {
     PLAN_CAPTURE_ANSWERED.store(answered, Ordering::Release);
 }
 
-/// Whether the tenant dial authorizes the DATA WRITE paths — the body sync's
-/// push and the plan-library write door. PURE.
+/// Whether `outcome` is an AUTHORITATIVE plan-capture answer — one that marks
+/// [`PLAN_CAPTURE_ANSWERED`]. PURE. Only a 2xx is: an explicit row
+/// (`Updated`) or coord's no-row default (`UpdatedNoRow`). A kept failure, a
+/// skip while unpaired, and a reset (never produced for this domain) say
+/// nothing about the tenant.
+fn is_authoritative_plan_capture_answer(outcome: &PollOutcome) -> bool {
+    matches!(outcome, PollOutcome::Updated(_) | PollOutcome::UpdatedNoRow)
+}
+
+/// What the tenant dial says about the DATA WRITE paths — the body sync's push
+/// and the plan-library write door. PURE.
 ///
 /// Stricter than "the level reads `record`": it also requires an authoritative
 /// answer in this process. The level's `record` default is the operator's
@@ -488,8 +498,36 @@ fn set_plan_capture_answered(answered: bool) {
 /// sync's first cycle pushes every plan under the scan roots. A tenant that set
 /// `off` must never have its plans pushed in the window before the first poll
 /// answers, so those paths wait for coord; the session-prompt clause does not.
-pub(crate) fn plan_capture_writes_authorized(level: &str, answered: bool) -> bool {
-    answered && level == PLAN_CAPTURE_RECORD
+fn plan_capture_verdict_from(answered: bool, level: &str) -> CaptureVerdict {
+    if !answered {
+        CaptureVerdict::Unanswered
+    } else if level == PLAN_CAPTURE_RECORD {
+        CaptureVerdict::Open
+    } else {
+        CaptureVerdict::Closed
+    }
+}
+
+/// The write-path verdict right now. Reads the answered flag FIRST (Acquire),
+/// then the level through [`write_path_plan_capture_level`], whose poison
+/// fallback is `off` — so a poisoned lock after an explicit `off` cannot
+/// reopen writes. Lock-only, safe on any path.
+pub(crate) fn plan_capture_verdict() -> CaptureVerdict {
+    let answered = plan_capture_answered();
+    plan_capture_verdict_from(answered, &write_path_plan_capture_level())
+}
+
+/// The level as the WRITE paths read it: same cache, but a poisoned lock reads
+/// [`PLAN_CAPTURE_UNRECOGNISED_LEVEL`] (`off`) rather than the `record`
+/// default. The prompt clause may fall back to the default; a publish may not,
+/// because the value the poison hides may be an explicit `off`.
+fn write_path_plan_capture_level() -> String {
+    read_write_path_level(plan_capture_cache())
+}
+
+/// The body of [`write_path_plan_capture_level`] over any lock, for tests.
+fn read_write_path_level(cache: &RwLock<String>) -> String {
+    read_cached_level(cache, PLAN_CAPTURE_UNRECOGNISED_LEVEL)
 }
 
 /// Overwrite the cached plan-capture level. Internal — only the poll loop calls
@@ -948,6 +986,10 @@ pub(crate) struct FleetPolicyDial {
     /// Cache 3's ON word, so a reader can tell whether the level is armed
     /// without knowing the vocabulary.
     pub(crate) plan_capture_record_level: &'static str,
+    /// Whether coord has answered this process's plan-capture poll. `false`
+    /// means the level is the unconfirmed default and the write paths are
+    /// held — so a never-answered runner is distinguishable from an armed one.
+    pub(crate) plan_capture_answered: bool,
     /// Cache 4 — one entry per name in [`BRIEFING_NAMES`], always all three
     /// (an absent document is `present: false`, never a missing entry).
     pub(crate) briefings: Vec<BriefingDial>,
@@ -990,6 +1032,7 @@ pub(crate) fn dial_snapshot() -> FleetPolicyDial {
         plan_capture_level: effective_plan_capture_level(),
         plan_capture_default: PLAN_CAPTURE_DEFAULT_LEVEL,
         plan_capture_record_level: PLAN_CAPTURE_RECORD,
+        plan_capture_answered: plan_capture_answered(),
         briefings: BRIEFING_NAMES
             .iter()
             .map(|name| match cache.get(*name) {
@@ -2040,9 +2083,10 @@ enum PollOutcome {
     UpdatedNoRow,
     /// No device JWT yet (unpaired) — poll skipped, cache untouched.
     SkippedNoJwt,
-    /// Coord said 401 / 404 / auth-required — cache RESET to the domain's
-    /// default (`off` for interception; `record` for plan capture, which only
-    /// ever sees a 404 here).
+    /// Coord said 401 / 404 / auth-required — the interception cache RESETS to
+    /// `off`. Never produced for plan capture, which classifies 401/404 as
+    /// [`PollOutcome::Kept`] (see `plan_capture_outcome_for_error`); should one
+    /// arrive there it writes nothing.
     ResetOff(u16),
     /// Network / decode / other non-2xx error — LAST-GOOD value kept.
     Kept(String),
@@ -2327,10 +2371,7 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
         }
         // The scope moves only with a successful answer — a reset or a kept
         // failure says nothing new about which row (if any) is in force.
-        if matches!(
-            plan_capture_outcome,
-            PollOutcome::Updated(_) | PollOutcome::UpdatedNoRow
-        ) {
+        if is_authoritative_plan_capture_answer(&plan_capture_outcome) {
             set_plan_capture_scope(resolved_scope);
             set_plan_capture_answered(true);
         }
@@ -3008,8 +3049,9 @@ mod tests {
     #[test]
     fn plan_capture_domain_and_default_are_pinned() {
         // The domain name is the whole contract with coord — it is opaque TEXT
-        // there, so a typo produces a permanent 404 and a permanently `off`
-        // clause with no error anywhere. State it.
+        // there, so a typo produces a permanent 404: the level would sit at its
+        // `record` default and the write paths would stay UNANSWERED forever,
+        // with no error anywhere. State it.
         assert_eq!(PLAN_CAPTURE_DOMAIN, "plan_capture");
         assert_eq!(PLAN_CAPTURE_DEFAULT_LEVEL, "record");
         assert_eq!(PLAN_CAPTURE_UNRECOGNISED_LEVEL, "off");
@@ -3305,22 +3347,85 @@ mod tests {
     /// held.
     #[test]
     fn plan_capture_writes_wait_for_an_authoritative_answer() {
-        assert!(
-            !plan_capture_writes_authorized("record", false),
+        use CaptureVerdict::{Closed, Open, Unanswered};
+        // Every verdict, through the SHIPPING pure mapping.
+        assert_eq!(
+            plan_capture_verdict_from(false, "record"),
+            Unanswered,
             "cold start"
         );
-        assert!(plan_capture_writes_authorized("record", true));
-        assert!(!plan_capture_writes_authorized("off", true), "explicit off");
-        assert!(!plan_capture_writes_authorized("off", false));
+        assert_eq!(plan_capture_verdict_from(false, "off"), Unanswered);
+        assert_eq!(plan_capture_verdict_from(true, "record"), Open);
+        assert_eq!(
+            plan_capture_verdict_from(true, "off"),
+            Closed,
+            "explicit off"
+        );
+        assert_eq!(plan_capture_verdict_from(true, "garbage"), Closed);
 
+        // …and through the shipping reader over the real globals.
         let pin = pin_plan_capture_level_for_test("record");
         assert!(plan_capture_answered(), "a pinned level is an answer");
+        assert_eq!(plan_capture_verdict(), Open);
+        pin.set("off");
+        assert_eq!(plan_capture_verdict(), Closed);
+        pin.set("record");
         pin.set_unanswered();
         assert!(!plan_capture_answered());
+        assert_eq!(plan_capture_verdict(), Unanswered);
         assert_eq!(effective_plan_capture_level(), "record");
         drop(pin);
         assert!(!plan_capture_answered(), "the pin restores the cold state");
         assert_eq!(effective_plan_capture_level(), "record");
+    }
+
+    /// Only a 2xx marks the process answered — every other arm leaves the
+    /// write paths held.
+    #[test]
+    fn only_a_2xx_is_an_authoritative_plan_capture_answer() {
+        assert!(is_authoritative_plan_capture_answer(&PollOutcome::Updated(
+            "off".into()
+        )));
+        assert!(is_authoritative_plan_capture_answer(&PollOutcome::Updated(
+            "record".into()
+        )));
+        assert!(is_authoritative_plan_capture_answer(
+            &PollOutcome::UpdatedNoRow
+        ));
+        assert!(!is_authoritative_plan_capture_answer(
+            &PollOutcome::SkippedNoJwt
+        ));
+        assert!(!is_authoritative_plan_capture_answer(
+            &PollOutcome::ResetOff(404)
+        ));
+        assert!(!is_authoritative_plan_capture_answer(&PollOutcome::Kept(
+            "request: timeout".into()
+        )));
+        // …including the 401/404 this domain classifies as kept.
+        for status in [401u16, 404] {
+            assert!(!is_authoritative_plan_capture_answer(
+                &plan_capture_outcome_for_error(FetchError::AuthOrAbsent(status))
+            ));
+        }
+    }
+
+    /// The WRITE-path reader falls back to `off` on a poisoned lock, unlike the
+    /// clause reader: a poisoned lock after an explicit `off` must not reopen
+    /// writes.
+    #[test]
+    fn a_poisoned_lock_never_reopens_the_write_path() {
+        let lock = RwLock::new(PLAN_CAPTURE_UNRECOGNISED_LEVEL.to_string());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = lock.write().unwrap();
+            panic!("poison the lock");
+        }));
+        assert!(lock.is_poisoned());
+        assert_eq!(read_write_path_level(&lock), "off");
+        assert_eq!(read_plan_capture_level(&lock), "record");
+        assert_eq!(
+            plan_capture_verdict_from(true, &read_write_path_level(&lock)),
+            CaptureVerdict::Closed
+        );
     }
 
     /// Replays a tick sequence through the SHIPPING edge-trigger + key and
@@ -3340,14 +3445,17 @@ mod tests {
 
     #[test]
     fn degradation_is_logged_once_per_transition_not_once_per_tick() {
-        // Five ticks, two states: unpaired ×3 then 404 ×2 ⇒ two lines.
+        // Five ticks, two states: unpaired ×3 then a kept 404 ×2 ⇒ two lines.
+        // Built through the SHIPPING classifier, so these are the outcomes
+        // the loop actually sees (a 404 is `Kept` for this domain).
+        let not_found = || plan_capture_outcome_for_error(FetchError::AuthOrAbsent(404));
         assert_eq!(
             logged_lines(&[
                 PollOutcome::SkippedNoJwt,
                 PollOutcome::SkippedNoJwt,
                 PollOutcome::SkippedNoJwt,
-                PollOutcome::ResetOff(404),
-                PollOutcome::ResetOff(404),
+                not_found(),
+                not_found(),
             ]),
             2,
             "one line per transition, not one per tick"
@@ -3381,9 +3489,14 @@ mod tests {
             ]),
             3
         );
+        // A 404 and a 401 are both kept failures for this domain — one
+        // sustained degradation, not two.
         assert_eq!(
-            logged_lines(&[PollOutcome::ResetOff(404), PollOutcome::ResetOff(401)]),
-            2
+            logged_lines(&[
+                not_found(),
+                plan_capture_outcome_for_error(FetchError::AuthOrAbsent(401)),
+            ]),
+            1
         );
         // Recovering out of a failure into a level is a transition too.
         assert_eq!(

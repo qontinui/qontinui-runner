@@ -4498,6 +4498,15 @@ pub fn capture_gate_message(
              bodies are held (not pushed) until it does; the default is record, but an \
              explicit off must be able to win first",
         ),
+        // Leaving UNANSWERED is coord's first answer, not a flip — name it.
+        (Some(CaptureVerdict::Unanswered), CaptureVerdict::Open) => Some(
+            "plan library: coord answered: tenant plan_capture is record — the body sync is \
+             authorized and scanned plan bodies are now pushed to agent.work_artifacts",
+        ),
+        (Some(CaptureVerdict::Unanswered), CaptureVerdict::Closed) => Some(
+            "plan library: coord answered: tenant plan_capture is off — plan bodies stay held \
+             (not pushed to agent.work_artifacts) until the dial opens",
+        ),
         (Some(prev), now) if prev != now => {
             Some("plan library: tenant plan_capture level changed the body sync's authorization")
         }
@@ -4723,8 +4732,9 @@ pub fn scan_report_due(
 ///
 /// ## The fleet dial governs this, not just the briefing
 ///
-/// `run_cycle` consults [`CaptureGate`] — the tenant's `plan_capture` level —
-/// on every cycle, and does nothing at `off`. Without that the dial would be
+/// `run_cycle` consults [`CaptureGate`] — the tenant's `plan_capture` verdict —
+/// on every cycle, and does nothing unless it is [`CaptureVerdict::Open`]: at
+/// an explicit `off`, and until coord has answered this process at all. Without that the dial would be
 /// advisory for everything except the system-prompt clause: a runner with
 /// the body sync on would keep pushing the whole corpus at fleet level `off`.
 /// Capture is two independent switches in the same direction — a per-machine
@@ -9836,7 +9846,14 @@ Body.
         let flipped = capture_gate_message(Some(Closed), Open).expect("flip");
         assert!(flipped.contains("changed"), "{flipped}");
         assert_eq!(capture_gate_message(Some(Open), Closed), Some(flipped));
-        assert_eq!(capture_gate_message(Some(Unanswered), Open), Some(flipped));
+        // Leaving UNANSWERED names coord's answer rather than calling it a flip.
+        let answered_off = capture_gate_message(Some(Unanswered), Closed).expect("answered off");
+        assert!(answered_off.contains("coord answered"), "{answered_off}");
+        assert!(answered_off.contains("is off"), "{answered_off}");
+        let answered_on = capture_gate_message(Some(Unanswered), Open).expect("answered record");
+        assert!(answered_on.contains("coord answered"), "{answered_on}");
+        assert!(answered_on.contains("is record"), "{answered_on}");
+        assert_ne!(Some(answered_on), Some(flipped));
     }
 
     /// With the sync on by default, the thing that protects a release build is

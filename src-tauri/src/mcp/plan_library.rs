@@ -220,21 +220,17 @@ pub const CODE_DIAL_UNANSWERED: &str = "PLAN_LIBRARY_DIAL_UNANSWERED";
 
 /// The tenant's `plan_capture` level as the poller currently caches it —
 /// `record` or `off`; the domain default `record` until the first successful
-/// poll (writes additionally wait for that poll — see [`dial_answered`]).
+/// poll (writes additionally wait for that poll — see [`dial_verdict`]).
 fn dial_level() -> String {
     crate::mcp::fleet_policy_poller::effective_plan_capture_level()
 }
 
-/// Whether coord has answered this process's plan_capture poll yet.
-fn dial_answered() -> bool {
-    crate::mcp::fleet_policy_poller::plan_capture_answered()
-}
-
-/// Whether the tenant dial authorizes a WRITE right now: `record` AND an
-/// authoritative answer, so the cold-start `record` default cannot publish a
-/// tenant's plans before an explicit `off` arrives.
-fn dial_open(level: &str, answered: bool) -> bool {
-    crate::mcp::fleet_policy_poller::plan_capture_writes_authorized(level, answered)
+/// What the tenant dial says about a WRITE right now: `Open` only for `record`
+/// AND an authoritative answer, so the cold-start `record` default cannot
+/// publish a tenant's plans before an explicit `off` arrives. Reads the
+/// answered flag first, then the level (poison ⇒ `off`).
+fn dial_verdict() -> crate::mcp::fleet_policy_poller::CaptureVerdict {
+    crate::mcp::fleet_policy_poller::plan_capture_verdict()
 }
 
 /// The identity a write is attributed to, resolved from the request's proxy
@@ -391,12 +387,11 @@ fn authorize_write(
     if !write_enabled() {
         return Err(write_killed_error());
     }
-    if !dial_answered() {
-        return Err(dial_unanswered_error());
-    }
-    let level = dial_level();
-    if !dial_open(&level, true) {
-        return Err(dial_off_error(&level));
+    use crate::mcp::fleet_policy_poller::CaptureVerdict;
+    match dial_verdict() {
+        CaptureVerdict::Open => {}
+        CaptureVerdict::Unanswered => return Err(dial_unanswered_error()),
+        CaptureVerdict::Closed => return Err(dial_off_error(&dial_level())),
     }
     Ok(WritePrincipal::from_nonce(
         nonce.as_deref().unwrap_or_default(),
@@ -433,9 +428,12 @@ fn parse_write_body<T: serde::de::DeserializeOwned>(
 /// nonce is per request, and `writeRequiresNonce` says so.
 fn write_capability() -> serde_json::Map<String, Value> {
     let flag_on = write_enabled();
+    // Verdict FIRST (it reads the answered flag before the level, as
+    // `authorize_write` does), then the level for display.
+    let verdict = dial_verdict();
+    let answered = verdict != crate::mcp::fleet_policy_poller::CaptureVerdict::Unanswered;
+    let dial = verdict.is_open();
     let level = dial_level();
-    let answered = dial_answered();
-    let dial = dial_open(&level, answered);
     let scope = crate::mcp::fleet_policy_poller::effective_plan_capture_scope();
     let enabled = flag_on && dial;
     let instruction = if enabled {
