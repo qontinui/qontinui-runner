@@ -6,11 +6,13 @@
 //!
 //! Every test name starts `pty_holder_spike_` so the plan's gate,
 //! `cargo-guard.sh test pty_holder_spike`, selects exactly these (plus the
-//! argv unit tests in `src/pty_holder/spike.rs`).
+//! unit tests in `src/pty_holder/spike.rs`).
 //!
-//! Only processes these tests spawned are ever signalled, and a recorded pid
-//! is signalled only while its start-time identity still matches, so cleanup
-//! cannot hit a recycled pid.
+//! Cleanup discipline: every spawned `Child`, every pid identity and every
+//! transient systemd unit is registered with a drop guard the moment it
+//! exists, so a timeout or failed assertion leaks nothing. Only processes and
+//! units these tests created are ever signalled or stopped, and a recorded pid
+//! is signalled only while its start-time identity still matches.
 //!
 //! Windows and macOS arms need those boxes. The Windows tests below are
 //! `#[ignore]`d and are recorded UNRUN on merytshost, never passed.
@@ -20,7 +22,9 @@ use std::process::ChildStdout;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use qontinui_runner_lib::pty_holder::spike::{report_field, SPIKE_FLAG, SPIKE_PARENT_FLAG};
+use qontinui_runner_lib::pty_holder::spike::{
+    report_field, report_str, SPIKE_FLAG, SPIKE_PARENT_FLAG,
+};
 
 const RUNNER_BIN: &str = env!("CARGO_BIN_EXE_qontinui-runner");
 
@@ -56,6 +60,7 @@ fn pids_of(line: &str) -> (u32, u32) {
 mod unix {
     use super::*;
     use std::os::unix::process::CommandExt;
+    use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
 
     /// What identifies a process across time: its pid plus its start time.
@@ -144,16 +149,44 @@ mod unix {
         is_alive(id.pid) && start_of(id.pid).as_deref() == Some(id.start.as_str())
     }
 
-    /// Kills everything this test spawned on drop — including on a failed
-    /// assertion — and only while each recorded identity still matches.
+    /// Kills everything this test created on drop — including on a failed
+    /// assertion or a timeout. Units first (stopping a unit kills its whole
+    /// cgroup), then pids whose identity still matches, then `Child` handles,
+    /// then files.
     #[derive(Default)]
     struct Reap {
+        units: Vec<String>,
         ids: Vec<Identity>,
         children: Vec<Child>,
+        files: Vec<PathBuf>,
+    }
+
+    impl Reap {
+        /// Register `child` and hand back its stdout — registration happens
+        /// BEFORE anything can block or panic.
+        fn adopt(&mut self, mut child: Child) -> (usize, Option<ChildStdout>) {
+            let out = child.stdout.take();
+            self.children.push(child);
+            (self.children.len() - 1, out)
+        }
+
+        fn track(&mut self, pid: u32) -> Identity {
+            let id = identity(pid);
+            self.ids.push(id.clone());
+            id
+        }
     }
 
     impl Drop for Reap {
         fn drop(&mut self) {
+            for unit in &self.units {
+                let _ = Command::new("systemctl")
+                    .args(["--user", "stop", "--quiet", unit])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
             for id in &self.ids {
                 if start_of(id.pid).as_deref() == Some(id.start.as_str()) {
                     // SAFETY: plain signal to a pid we spawned and re-verified.
@@ -165,6 +198,9 @@ mod unix {
             for c in &mut self.children {
                 let _ = c.kill();
                 let _ = c.wait();
+            }
+            for f in &self.files {
+                let _ = std::fs::remove_file(f);
             }
         }
     }
@@ -187,7 +223,7 @@ mod unix {
     #[test]
     fn pty_holder_spike_child_survives_sigkill_of_spawner_process_group() {
         let mut reap = Reap::default();
-        let mut parent = Command::new("sh")
+        let parent = Command::new("sh")
             .arg("-c")
             .arg(r#""$0" "$1" -- sleep 3600 & wait"#)
             .arg(RUNNER_BIN)
@@ -198,13 +234,11 @@ mod unix {
             .spawn()
             .expect("spawn sh parent");
         let parent_pid = parent.id() as i32;
-        let line = read_line_bounded(parent.stdout.take().unwrap());
-        reap.children.push(parent);
+        let (pi, out) = reap.adopt(parent);
+        let line = read_line_bounded(out.unwrap());
         let (holder_pid, child_pid) = pids_of(&line);
-        let holder = identity(holder_pid);
-        let child = identity(child_pid);
-        reap.ids.push(child.clone());
-        reap.ids.push(holder.clone());
+        let child = reap.track(child_pid);
+        let holder = reap.track(holder_pid);
 
         #[cfg(target_os = "linux")]
         {
@@ -228,8 +262,7 @@ mod unix {
         // SIGKILL the spawner's whole process group (pgid == parent pid).
         // SAFETY: a negative pid addresses the group this test created.
         assert_eq!(unsafe { libc::kill(-parent_pid, libc::SIGKILL) }, 0);
-        let p = reap.children.last_mut().unwrap();
-        let _ = p.wait();
+        let _ = reap.children[pi].wait();
         assert!(!is_alive(parent_pid), "parent should be dead");
 
         // Give any delayed teardown (SIGHUP, reaper) time to land.
@@ -251,10 +284,13 @@ mod unix {
     }
 
     /// Same question with the runner's own spawner stand-in
-    /// (`--pty-holder-spike-parent`), i.e. the spawn path Phase 1 will grow,
-    /// SIGKILLed alone.
+    /// (`--pty-holder-spike-parent`, `auto` route), i.e. the spawn path Phase 1
+    /// will grow, SIGKILLed alone. `auto` resolves to `scope` wherever this
+    /// test itself runs inside a systemd unit, so the holder's unit is
+    /// registered for cleanup when one is reported.
     #[test]
     fn pty_holder_spike_child_survives_sigkill_of_runner_parent() {
+        use qontinui_runner_lib::pty_holder::spike::scope_route_applies;
         use std::io::Write;
         let mut reap = Reap::default();
         let mut parent = Command::new(RUNNER_BIN)
@@ -264,27 +300,30 @@ mod unix {
             .spawn()
             .expect("spawn runner parent");
         let parent_pid = parent.id() as i32;
-        parent
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(b"go\n")
-            .expect("write go line");
-        let line = read_line_bounded(parent.stdout.take().unwrap());
-        reap.children.push(parent);
-        assert!(
-            line.ends_with("route=auto"),
-            "unexpected relay line {line:?}"
-        );
+        let stdin = parent.stdin.take();
+        let (pi, out) = reap.adopt(parent);
+        stdin.unwrap().write_all(b"go\n").expect("write go line");
+        let line = read_line_bounded(out.unwrap());
+        if let Some(unit) = report_str(&line, "holder_unit") {
+            reap.units.push(unit.to_string());
+        }
         let (holder_pid, child_pid) = pids_of(&line);
-        let holder = identity(holder_pid);
-        let child = identity(child_pid);
-        reap.ids.push(child.clone());
-        reap.ids.push(holder.clone());
+        let child = reap.track(child_pid);
+        let holder = reap.track(holder_pid);
+        let expected = if scope_route_applies() {
+            "scope"
+        } else {
+            "plain"
+        };
+        assert_eq!(
+            report_str(&line, "route"),
+            Some(expected),
+            "auto must resolve by the observable: {line:?}"
+        );
 
         // SAFETY: SIGKILL to the parent this test spawned.
         assert_eq!(unsafe { libc::kill(parent_pid, libc::SIGKILL) }, 0);
-        let _ = reap.children.last_mut().unwrap().wait();
+        let _ = reap.children[pi].wait();
 
         std::thread::sleep(Duration::from_secs(1));
         assert!(
@@ -304,7 +343,7 @@ mod unix {
     #[test]
     fn pty_holder_spike_group_leader_holder_still_detaches() {
         let mut reap = Reap::default();
-        let mut spawned = Command::new(RUNNER_BIN)
+        let spawned = Command::new(RUNNER_BIN)
             .args([SPIKE_FLAG, "--", "sleep", "3600"])
             .process_group(0)
             .stdin(Stdio::null())
@@ -312,24 +351,22 @@ mod unix {
             .spawn()
             .expect("spawn group-leader holder");
         let group = spawned.id() as i32;
-        let line = read_line_bounded(spawned.stdout.take().unwrap());
-        reap.children.push(spawned);
+        let (si, out) = reap.adopt(spawned);
+        let line = read_line_bounded(out.unwrap());
         let (holder_pid, child_pid) = pids_of(&line);
+        let child = reap.track(child_pid);
+        let holder = reap.track(holder_pid);
         assert_ne!(
             holder_pid as i32, group,
             "a group leader must hand off to a re-exec'd, setsid()'d holder"
         );
-        let holder = identity(holder_pid);
-        let child = identity(child_pid);
-        reap.ids.push(child.clone());
-        reap.ids.push(holder.clone());
 
         // The intermediate may already have exited (ESRCH is fine).
         // SAFETY: a negative pid addresses the group this test created.
         unsafe {
             libc::kill(-group, libc::SIGKILL);
         }
-        let _ = reap.children.last_mut().unwrap().wait();
+        let _ = reap.children[si].wait();
         std::thread::sleep(Duration::from_secs(1));
         assert!(
             still_same(&child),
@@ -347,24 +384,164 @@ mod unix {
     #[test]
     fn pty_holder_spike_child_ends_when_its_holder_dies() {
         let mut reap = Reap::default();
-        let mut holder_proc = Command::new(RUNNER_BIN)
+        let holder_proc = Command::new(RUNNER_BIN)
             .args([SPIKE_FLAG, "--", "sleep", "3600"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .spawn()
             .expect("spawn holder");
-        let line = read_line_bounded(holder_proc.stdout.take().unwrap());
-        reap.children.push(holder_proc);
+        let (hi, out) = reap.adopt(holder_proc);
+        let line = read_line_bounded(out.unwrap());
         let (holder_pid, child_pid) = pids_of(&line);
-        let child = identity(child_pid);
-        reap.ids.push(child.clone());
-        assert_eq!(holder_pid, reap.children[0].id());
+        let child = reap.track(child_pid);
+        assert_eq!(holder_pid, reap.children[hi].id());
 
-        let _ = reap.children[0].kill(); // SIGKILL the holder
-        let _ = reap.children[0].wait();
+        let _ = reap.children[hi].kill(); // SIGKILL the holder
+        let _ = reap.children[hi].wait();
         assert!(
             wait_until(Duration::from_secs(10), || !still_same(&child)),
             "PTY child {child:?} outlived its holder — the master close did not hang it up"
+        );
+    }
+
+    // ── systemd: the killer on a Linux box whose runner is a user service ──
+    //
+    // `setsid()` leaves a process in its spawner's CGROUP, and a
+    // `KillMode=control-group` unit stop (or crash + `Restart=always`) kills
+    // the whole cgroup. These two tests model that: the stand-in parent runs
+    // as its OWN transient service with `KillMode=control-group`, spawns a
+    // holder by an explicit route, and the unit is stopped.
+
+    /// Whether `systemd-run --user` works here. Probed by actually running a
+    /// trivial transient scope — presence of the binary is not an answer.
+    #[cfg(target_os = "linux")]
+    fn user_systemd_usable() -> bool {
+        Command::new("systemd-run")
+            .args(["--user", "--scope", "--quiet", "--collect", "true"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cgroup_of(pid: i32) -> String {
+        std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default()
+    }
+
+    /// Start the parent as a transient `KillMode=control-group` service that
+    /// spawns a holder via `route`, then `systemctl --user stop` that service.
+    /// Returns the guard plus the (child, holder) identities recorded BEFORE
+    /// the stop. Everything is registered with the guard as it appears.
+    #[cfg(target_os = "linux")]
+    fn stop_service_parent(route: &str) -> (Reap, Identity, Identity) {
+        let mut reap = Reap::default();
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let parent_unit = format!("qontinui-pty-spike-parent-{tag}");
+        let report = std::env::temp_dir().join(format!("pty-holder-spike-{tag}.report"));
+        // Registered before they exist: stopping an absent unit is harmless.
+        reap.units.push(parent_unit.clone());
+        reap.files.push(report.clone());
+
+        let status = Command::new("systemd-run")
+            .args(["--user", "--quiet", "--collect"])
+            .arg(format!("--unit={parent_unit}"))
+            .arg("--property=KillMode=control-group")
+            .arg("--")
+            .arg(RUNNER_BIN)
+            .args([SPIKE_PARENT_FLAG, "--route", route, "--report-file"])
+            .arg(&report)
+            .args(["--", "sleep", "3600"])
+            .stdin(Stdio::null())
+            .status()
+            .expect("run systemd-run for the parent service");
+        assert!(status.success(), "systemd-run parent service: {status}");
+
+        assert!(
+            wait_until(LINE_TIMEOUT, || report.exists()),
+            "parent service {parent_unit} wrote no report file"
+        );
+        let line = std::fs::read_to_string(&report).unwrap();
+        let line = line.trim_end();
+        if let Some(unit) = report_str(line, "holder_unit") {
+            reap.units.push(unit.to_string());
+        }
+        let (holder_pid, child_pid) = pids_of(line);
+        let child = reap.track(child_pid);
+        let holder = reap.track(holder_pid);
+        assert_eq!(report_str(line, "route"), Some(route), "{line:?}");
+
+        // Where the holder actually lives decides the outcome; assert it so a
+        // pass cannot come from the wrong mechanism.
+        let cg = cgroup_of(holder.pid);
+        match report_str(line, "holder_unit") {
+            Some(unit) => {
+                assert!(
+                    cg.contains(&format!("{unit}.scope")),
+                    "holder not in its scope: {cg}"
+                );
+                assert!(
+                    !cg.contains(&parent_unit),
+                    "holder still in the parent's cgroup: {cg}"
+                );
+            }
+            None => assert!(
+                cg.contains(&format!("{parent_unit}.service")),
+                "plain holder should share the parent's cgroup: {cg}"
+            ),
+        }
+
+        let stop = Command::new("systemctl")
+            .args(["--user", "stop", &parent_unit])
+            .stdin(Stdio::null())
+            .status()
+            .expect("systemctl --user stop");
+        assert!(stop.success(), "stopping {parent_unit}: {stop}");
+        (reap, child, holder)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pty_holder_spike_scope_route_survives_stop_of_control_group_service() {
+        if !user_systemd_usable() {
+            eprintln!(
+                "SKIPPED pty_holder_spike_scope_route_survives_stop_of_control_group_service: \
+                 `systemd-run --user --scope` is not usable on this box"
+            );
+            return;
+        }
+        let (_reap, child, holder) = stop_service_parent("scope");
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(
+            still_same(&child),
+            "GO/NO-GO FAILED: PTY child {child:?} did not survive `systemctl --user stop` \
+             of its spawner's KillMode=control-group service (scope route)"
+        );
+        assert!(
+            still_same(&holder),
+            "holder {holder:?} died with the service"
+        );
+    }
+
+    /// Negative control: proves the test above can SEE the failure. A plain
+    /// (setsid-only) holder stays in the service's cgroup and dies with it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pty_holder_spike_plain_route_dies_on_stop_of_control_group_service() {
+        if !user_systemd_usable() {
+            eprintln!(
+                "SKIPPED pty_holder_spike_plain_route_dies_on_stop_of_control_group_service: \
+                 `systemd-run --user --scope` is not usable on this box"
+            );
+            return;
+        }
+        let (_reap, child, _holder) = stop_service_parent("plain");
+        assert!(
+            wait_until(Duration::from_secs(10), || !still_same(&child)),
+            "negative control FAILED: a setsid-only holder's child {child:?} survived a \
+             KillMode=control-group stop, so the scope test cannot tell success from failure"
         );
     }
 
@@ -422,17 +599,17 @@ mod unix {
         let mut spawn_ms: Vec<u128> = Vec::new();
         let mut spawn_one = |reap: &mut Reap| {
             let t = std::time::Instant::now();
-            let mut h = Command::new(RUNNER_BIN)
+            let h = Command::new(RUNNER_BIN)
                 .args([SPIKE_FLAG, "--", "sleep", "3600"])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .spawn()
                 .expect("spawn holder");
-            let line = read_line_bounded(h.stdout.take().unwrap());
+            let (_, out) = reap.adopt(h);
+            let line = read_line_bounded(out.unwrap());
             spawn_ms.push(t.elapsed().as_millis());
             let (hp, cp) = pids_of(&line);
-            reap.ids.push(identity(cp));
-            reap.children.push(h);
+            reap.track(cp);
             hp
         };
 
@@ -463,7 +640,7 @@ mod windows {
     use super::*;
     use qontinui_runner_win32::holder_spawn::OuterKillOnCloseJob;
     use std::io::Write;
-    use std::process::{Command, Stdio};
+    use std::process::{Child, Command, Stdio};
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, GetProcessTimes, OpenProcess, TerminateProcess,
@@ -500,10 +677,24 @@ mod windows {
         matches!(probe(pid), Some((true, c)) if c == created)
     }
 
-    struct Reap(Vec<(u32, u64)>);
+    /// Terminates everything this test spawned on drop, identity-checked.
+    #[derive(Default)]
+    struct Reap {
+        ids: Vec<(u32, u64)>,
+        children: Vec<Child>,
+    }
+
+    impl Reap {
+        fn track(&mut self, pid: u32) -> u64 {
+            let (_, created) = probe(pid).expect("probe spawned process");
+            self.ids.push((pid, created));
+            created
+        }
+    }
+
     impl Drop for Reap {
         fn drop(&mut self) {
-            for &(pid, created) in &self.0 {
+            for &(pid, created) in &self.ids {
                 if still_same(pid, created) {
                     // SAFETY: terminating a process this test spawned and re-verified.
                     unsafe {
@@ -515,6 +706,10 @@ mod windows {
                     }
                 }
             }
+            for c in &mut self.children {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
         }
     }
 
@@ -522,6 +717,7 @@ mod windows {
     /// a holder by `route`, kill the parent, close the job, and report whether
     /// the PTY child survived as the same process.
     fn child_survives(outer_job: Option<bool>, route: &str) -> bool {
+        let mut reap = Reap::default();
         let job = outer_job.map(|bok| OuterKillOnCloseJob::create(bok).expect("create job"));
         let mut parent = Command::new(RUNNER_BIN)
             .args([SPIKE_PARENT_FLAG, "--route", route])
@@ -529,26 +725,21 @@ mod windows {
             .stdout(Stdio::piped())
             .spawn()
             .expect("spawn runner parent");
+        let stdin = parent.stdin.take();
+        let stdout = parent.stdout.take();
+        reap.children.push(parent);
         if let Some(j) = &job {
-            j.assign(&parent).expect("assign parent to outer job");
+            j.assign(&reap.children[0])
+                .expect("assign parent to outer job");
         }
-        parent
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(b"go\n")
-            .expect("write go line");
-        let line = read_line_bounded(parent.stdout.take().unwrap());
+        stdin.unwrap().write_all(b"go\n").expect("write go line");
+        let line = read_line_bounded(stdout.unwrap());
         let (holder_pid, child_pid) = pids_of(&line);
-        let (_, holder_created) = probe(holder_pid).expect("probe holder");
-        let (_, child_created) = probe(child_pid).expect("probe child");
-        let _reap = Reap(vec![
-            (child_pid, child_created),
-            (holder_pid, holder_created),
-        ]);
+        let child_created = reap.track(child_pid);
+        reap.track(holder_pid);
 
-        let _ = parent.kill(); // TerminateProcess
-        let _ = parent.wait();
+        let _ = reap.children[0].kill(); // TerminateProcess
+        let _ = reap.children[0].wait();
         drop(job); // last handle: KILL_ON_JOB_CLOSE fires on whatever is still in it
         std::thread::sleep(Duration::from_secs(2));
         still_same(child_pid, child_created)

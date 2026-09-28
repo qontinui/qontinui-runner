@@ -14,7 +14,8 @@
 //! So the route is decided by an observable, not assumed:
 //!
 //! 1. `IsProcessInJob(GetCurrentProcess())` is false → [`HolderSpawnRoute::Plain`]:
-//!    `DETACHED_PROCESS | CREATE_NO_WINDOW`, no special machinery.
+//!    `DETACHED_PROCESS` (plus a redundant `CREATE_NO_WINDOW`, which Windows
+//!    ignores alongside it), no special machinery.
 //! 2. In a job → [`HolderSpawnRoute::Breakaway`]: add `CREATE_BREAKAWAY_FROM_JOB`,
 //!    legal only when every enclosing job sets `JOB_OBJECT_LIMIT_BREAKAWAY_OK`.
 //! 3. Breakaway refused (`ERROR_ACCESS_DENIED`) → WMI `Win32_Process.Create`,
@@ -37,7 +38,11 @@ pub const DETACHED_PROCESS: u32 = 0x0000_0008;
 pub const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 /// `CREATE_BREAKAWAY_FROM_JOB` — leave every enclosing job that allows it.
 pub const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
-/// `CREATE_NO_WINDOW` — no console window flashes up for the holder.
+/// `CREATE_NO_WINDOW`. **Ignored whenever `DETACHED_PROCESS` is also set**
+/// (documented `CreateProcess` behaviour), so in every route below it is
+/// redundant: `DETACHED_PROCESS` alone is what keeps the holder console-less.
+/// It stays in the flag sets only as a no-op belt should a later change drop
+/// `DETACHED_PROCESS`; nothing may rely on it while that flag is present.
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Win32 `ERROR_ACCESS_DENIED`: what `CreateProcess` answers when a
