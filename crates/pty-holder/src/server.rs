@@ -373,8 +373,13 @@ pub(crate) fn serve_conn_with(mut conn: Conn, info: &HolderInfo, params: ConnPar
                 // A client that stops reading cannot pin this thread on a
                 // full socket buffer.
                 let write_deadline = Instant::now() + REPLY_WRITE_TIMEOUT;
+                let Ok(payload) = to_payload(&reply) else {
+                    // Unserializable reply: close rather than send nothing
+                    // and leave the client waiting.
+                    return;
+                };
                 let mut io = DeadlineIo::new(&mut conn, write_deadline);
-                if write_frame(&mut io, KIND_CONTROL, &to_payload(&reply)).is_err() {
+                if write_frame(&mut io, KIND_CONTROL, &payload).is_err() {
                     return;
                 }
             }
@@ -449,11 +454,11 @@ fn reject(conn: &mut Conn, reason: RejectReason, detail: &str) {
         detail: detail.to_string(),
     };
     let deadline = Instant::now() + Duration::from_secs(1);
-    let _ = write_frame(
-        &mut DeadlineIo::new(conn, deadline),
-        KIND_CONTROL,
-        &to_payload(&reply),
-    );
+    // A reason that cannot be serialized (only the deserialize-only Unknown)
+    // still closes the connection; it just closes without the frame.
+    if let Ok(payload) = to_payload(&reply) {
+        let _ = write_frame(&mut DeadlineIo::new(conn, deadline), KIND_CONTROL, &payload);
+    }
     conn.shutdown();
 }
 
@@ -562,6 +567,8 @@ mod tests {
         };
 
         let (mut client, t) = serve_pair(params);
+        // Bounded: a server that never closes fails the test, not hangs it.
+        client.set_read_timeout(Some(timeout * 5)).unwrap();
         let started = Instant::now();
         let mut buf = [0u8; 8];
         // The server closes: EOF, with nothing sent.
@@ -576,7 +583,7 @@ mod tests {
         // per-read timeout, so only a whole-frame deadline can stop it.
         let hello = crate::frame::encode_frame(
             KIND_CONTROL,
-            &to_payload(&Request::Hello { versions: vec![1] }),
+            &to_payload(&Request::Hello { versions: vec![1] }).unwrap(),
         )
         .unwrap();
         for b in hello {
@@ -610,6 +617,9 @@ mod tests {
             expected_uid: transport::own_uid().wrapping_add(1),
         };
         let (mut client, t) = serve_pair(params);
+        client
+            .set_read_timeout(Some(Duration::from_secs(5) * 5))
+            .unwrap();
         let frame = read_frame(&mut client).unwrap().expect("a rejection");
         match crate::protocol::parse_reply(&frame.payload).unwrap() {
             Reply::Rejected { reason, .. } => assert_eq!(reason, RejectReason::PeerNotAuthorized),

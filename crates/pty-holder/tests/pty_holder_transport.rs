@@ -45,6 +45,11 @@ fn pane_dir(tag: &str) -> PathBuf {
     base.join(format!("ptyh-{tag}-{}-{nanos:x}", std::process::id()))
 }
 
+/// A request's control-frame payload.
+fn pl(req: &Request) -> Vec<u8> {
+    to_payload(req).expect("requests serialize")
+}
+
 fn pid(id: &str) -> PaneId {
     PaneId::new(id).unwrap()
 }
@@ -240,7 +245,7 @@ fn pty_holder_refusals_before_and_after_handshake() {
 
     // A non-hello first frame.
     let mut r = connect_raw(&dir, &pane, soon()).unwrap();
-    r.send_frame(KIND_CONTROL, &to_payload(&Request::Ping), soon())
+    r.send_frame(KIND_CONTROL, &pl(&Request::Ping), soon())
         .unwrap();
     expect_rejected(
         r.recv_frame(soon()).unwrap(),
@@ -281,7 +286,7 @@ fn pty_holder_refusals_before_and_after_handshake() {
     let mut c = connect(&dir, &pane, soon()).unwrap();
     c.send_raw_frame(
         KIND_CONTROL,
-        &to_payload(&Request::Hello { versions: vec![1] }),
+        &pl(&Request::Hello { versions: vec![1] }),
         soon(),
     )
     .unwrap();
@@ -324,7 +329,7 @@ fn pty_holder_no_common_version_is_incompatible_not_dead() {
     let mut r = connect_raw(&dir, &pane, soon()).unwrap();
     r.send_frame(
         KIND_CONTROL,
-        &to_payload(&Request::Hello {
+        &pl(&Request::Hello {
             versions: future.to_vec(),
         }),
         soon(),
@@ -335,14 +340,14 @@ fn pty_holder_no_common_version_is_incompatible_not_dead() {
         parse_reply(&f.payload).unwrap(),
         Reply::NoCommonVersion { .. }
     ));
-    r.send_frame(KIND_CONTROL, &to_payload(&Request::Census), soon())
+    r.send_frame(KIND_CONTROL, &pl(&Request::Census), soon())
         .unwrap();
     let f = r.recv_frame(soon()).unwrap().unwrap();
     match parse_reply(&f.payload).unwrap() {
         Reply::CensusReply(c) => assert_eq!(c.holder_pid, h.pid()),
         other => panic!("{other:?}"),
     }
-    r.send_frame(KIND_CONTROL, &to_payload(&Request::Ping), soon())
+    r.send_frame(KIND_CONTROL, &pl(&Request::Ping), soon())
         .unwrap();
     expect_rejected(
         r.recv_frame(soon()).unwrap(),
@@ -448,7 +453,12 @@ fn pty_holder_wedged_holder_is_unknown_within_the_deadline() {
     );
     let took = started.elapsed();
     match verdict {
-        Probe::Unknown { record, .. } => assert_eq!(record.unwrap().holder_pid, h.pid()),
+        Probe::Unknown { record, reason } => {
+            // The RIGHT Unknown: an unanswered handshake, not e.g. an
+            // immediate "pane dir refused".
+            assert!(reason.contains("handshake unanswered"), "{reason}");
+            assert_eq!(record.unwrap().holder_pid, h.pid())
+        }
         other => panic!("a wedged holder must be Unknown, got {other:?}"),
     }
     assert!(
@@ -678,10 +688,13 @@ fn pty_holder_trickling_peer_cannot_stretch_the_probe_deadline() {
     let started = Instant::now();
     let verdict = probe(&dir, &pane, started + deadline);
     let took = started.elapsed();
-    assert!(
-        matches!(verdict, Probe::Unknown { .. }),
-        "a reply that cannot arrive by the deadline is Unknown: {verdict:?}"
-    );
+    match &verdict {
+        Probe::Unknown { reason, .. } => assert!(
+            reason.contains("handshake unanswered"),
+            "the deadline, not an early refusal, must decide: {reason}"
+        ),
+        other => panic!("a reply that cannot arrive by the deadline is Unknown: {other:?}"),
+    }
     // Per-syscall timeouts would have taken ~90 bytes x 150 ms.
     assert!(
         took < deadline + Duration::from_millis(300),
@@ -717,5 +730,97 @@ fn pty_holder_writable_pane_dir_is_refused() {
     ));
     let err = census(&dir, Duration::from_secs(1), &[]).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// M-1: a request that times out mid-reply POISONS the client. Without it the
+/// next call would read the rest of the stale reply (or start mid-frame).
+#[cfg(unix)]
+#[test]
+fn pty_holder_client_is_poisoned_after_a_mid_frame_timeout() {
+    use qontinui_pty_holder::client::ConnectError;
+    use qontinui_pty_holder::frame::{encode_frame, read_frame};
+    use std::io::Write;
+    use std::os::unix::net::UnixListener;
+
+    let dir = pane_dir("poison");
+    make_private_dir(&dir);
+    let pane = pid("p1");
+    let _lock = match PaneLock::try_acquire(&lock_path(&dir, &pane)).unwrap() {
+        TryLock::Acquired(l) => l,
+        TryLock::Held => panic!("fresh"),
+    };
+    let listener = UnixListener::bind(dir.join("p1.sock")).unwrap();
+    let (half_sent_tx, half_sent_rx) = std::sync::mpsc::channel::<()>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let fake = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        // Handshake: answer properly.
+        read_frame(&mut s).unwrap().unwrap();
+        let ack = encode_frame(
+            KIND_CONTROL,
+            br#"{"type":"hello_ack","version":1,"holder_build":"fake","holder_pid":1,"child_pid":null}"#,
+        )
+        .unwrap();
+        s.write_all(&ack).unwrap();
+        // First ping: send HALF of a pong, then stall past the client's deadline.
+        read_frame(&mut s).unwrap().unwrap();
+        let pong = encode_frame(KIND_CONTROL, br#"{"type":"pong"}"#).unwrap();
+        let (head, tail) = pong.split_at(pong.len() / 2);
+        s.write_all(head).unwrap();
+        half_sent_tx.send(()).unwrap();
+        // Then complete it AND send a second, whole pong, so an unpoisoned
+        // client would "succeed" on stale or misaligned bytes.
+        go_rx.recv().unwrap();
+        s.write_all(tail).unwrap();
+        s.write_all(&pong).unwrap();
+        // Hold the connection open until the client is done.
+        let _ = read_frame(&mut s);
+    });
+
+    let mut c = connect(&dir, &pane, soon()).expect("handshake with the fake");
+    let err = c
+        .ping(Instant::now() + Duration::from_millis(300))
+        .unwrap_err();
+    assert!(
+        matches!(err, ConnectError::Io(_)),
+        "first failure is the timeout: {err:?}"
+    );
+    half_sent_rx.recv().unwrap();
+    assert!(c.poisoned().is_some());
+    go_tx.send(()).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Every later call refuses without touching the stream.
+    assert!(matches!(c.ping(soon()), Err(ConnectError::Poisoned(_))));
+    assert!(matches!(c.census(soon()), Err(ConnectError::Poisoned(_))));
+    assert!(matches!(
+        c.recv_raw_frame(soon()),
+        Err(ConnectError::Poisoned(_))
+    ));
+    assert!(matches!(
+        c.send_raw_frame(KIND_CONTROL, b"{}", soon()),
+        Err(ConnectError::Poisoned(_))
+    ));
+    drop(c);
+    fake.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// M-1: a `rejected` reply poisons too — the holder closes after sending it.
+#[test]
+fn pty_holder_client_is_poisoned_after_a_rejection() {
+    use qontinui_pty_holder::client::ConnectError;
+    let dir = pane_dir("poisonrej");
+    let h = spawn_ready(&dir, "p1");
+    let mut c = connect(&dir, &pid("p1"), soon()).unwrap();
+    // A second hello is a typed rejection.
+    let reply = c
+        .request(&Request::Hello { versions: vec![1] }, soon())
+        .unwrap();
+    assert!(matches!(reply, Reply::Rejected { .. }), "{reply:?}");
+    assert!(matches!(c.ping(soon()), Err(ConnectError::Poisoned(_))));
+    drop(h);
     let _ = std::fs::remove_dir_all(&dir);
 }

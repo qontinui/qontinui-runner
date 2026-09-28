@@ -1468,9 +1468,9 @@ jobs:
       matrix:
         platform: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.platform }}
-    # UNMEASURED at introduction: no run of this job exists yet. The two
-    # crates depend only on serde/serde_json and libc or windows-sys, so the
-    # budget should be dominated by checkout + toolchain + cache restore. 20
+    # UNMEASURED at introduction: no run of this job exists yet. Both crates
+    # are small with few dependencies, so the budget should be dominated by
+    # checkout + toolchain + cache restore. 20
     # min is a generous first bound, well under GitHub's 360-minute default;
     # tighten it once there are runs to measure.
     timeout-minutes: 20
