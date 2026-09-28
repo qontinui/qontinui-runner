@@ -2198,7 +2198,7 @@ impl TerminalSession {
                 // / `close_kill_only`) had already cleared `is_alive` before its
                 // kill — in which case the exit code is the KILL's, not the
                 // agent's (see `on_exit_hook_code`).
-                let runner_initiated = !waiter_alive.swap(false, Ordering::Relaxed);
+                let runner_initiated = mark_exited_was_runner_initiated(&waiter_alive);
 
                 info!(terminal_id = %waiter_id, exit_code = ?code, "Terminal process exited");
 
@@ -4363,7 +4363,10 @@ impl TerminalSession {
     /// ([`Self::close_after_graceful_exit`]); every other teardown step runs.
     fn close_inner(&self, deadline: Option<std::time::Instant>, kill_child: bool) {
         info!(terminal_id = %self.id, "Closing terminal session");
-        self.is_alive.store(false, Ordering::Relaxed);
+        // SeqCst, and BEFORE the kill: the waiter classifies the exit the kill
+        // causes as runner-initiated by seeing this store (see
+        // `mark_exited_was_runner_initiated`).
+        self.is_alive.store(false, Ordering::SeqCst);
 
         // Phase 2 — drop the isolated edit context first so the
         // claim-release fire-and-forget posts ahead of the PTY teardown
@@ -4534,12 +4537,21 @@ impl TerminalSession {
             terminal_id = %self.id,
             "Shutdown deadline exhausted — kill-only terminal teardown"
         );
-        self.is_alive.store(false, Ordering::Relaxed);
+        // SeqCst, before the kill — see `mark_exited_was_runner_initiated`.
+        self.is_alive.store(false, Ordering::SeqCst);
 
         if let Err(e) = self.io.kill(KILL_FLOOR) {
             warn!(terminal_id = %self.id, pid = ?self.child_pid, "kill-only {e}");
         }
     }
+}
+
+/// Called by the waiter once the child has exited: clears `is_alive` and
+/// reports whether a runner-initiated close (`close_inner` /
+/// `close_kill_only`, which clear it with SeqCst BEFORE they kill the child)
+/// got there first — i.e. whether this exit was caused by the runner's kill.
+fn mark_exited_was_runner_initiated(is_alive: &AtomicBool) -> bool {
+    !is_alive.swap(false, Ordering::SeqCst)
 }
 
 /// The exit code handed to the `on_exit` hook.
@@ -4670,18 +4682,94 @@ impl Drop for TerminalSession {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn a_runner_initiated_close_hands_the_hook_no_exit_code() {
         // The kill's SIGTERM / taskkill status must never read as an agent's
         // non-zero exit (operator-touch `session_exit` inflation).
-        assert_eq!(super::on_exit_hook_code(Some(1), true), None);
-        assert_eq!(super::on_exit_hook_code(Some(0), true), None);
-        assert_eq!(super::on_exit_hook_code(Some(1), false), Some(1));
-        assert_eq!(super::on_exit_hook_code(Some(0), false), Some(0));
-        assert_eq!(super::on_exit_hook_code(None, false), None);
+        assert_eq!(on_exit_hook_code(Some(1), true), None);
+        assert_eq!(on_exit_hook_code(Some(0), true), None);
+        assert_eq!(on_exit_hook_code(Some(1), false), Some(1));
+        assert_eq!(on_exit_hook_code(Some(0), false), Some(0));
+        assert_eq!(on_exit_hook_code(None, false), None);
     }
 
-    use super::*;
+    #[test]
+    fn a_natural_exit_is_not_classified_as_runner_initiated() {
+        let alive = AtomicBool::new(true);
+        assert!(!mark_exited_was_runner_initiated(&alive));
+        assert!(!alive.load(Ordering::SeqCst));
+    }
+
+    /// A pane that records whether `is_alive` was already cleared at the
+    /// moment it was killed.
+    struct AliveAtKillPaneIo {
+        alive: Arc<AtomicBool>,
+        alive_at_kill: Mutex<Option<bool>>,
+    }
+
+    impl crate::terminal::pane_io::PaneIo for AliveAtKillPaneIo {
+        fn reader(&self) -> Result<Box<dyn Read + Send>, String> {
+            Ok(Box::new(std::io::empty()))
+        }
+        fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
+            Ok(Box::new(std::io::sink()))
+        }
+        fn resize(&self, _cols: u16, _rows: u16) -> Result<(), String> {
+            Ok(())
+        }
+        fn wait(&self) -> Result<i32, String> {
+            Ok(1)
+        }
+        fn kill(&self, _budget: Duration) -> Result<(), String> {
+            *self.alive_at_kill.lock().unwrap() = Some(self.alive.load(Ordering::SeqCst));
+            Ok(())
+        }
+        fn set_paused(&self, _paused: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn pid(&self) -> Option<u32> {
+            None
+        }
+        fn credential_scrub(&self) -> crate::terminal::pane_io::CredentialScrub {
+            crate::terminal::pane_io::CredentialScrub::NoChildEnv
+        }
+        fn release(&self, _budget: Duration) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// The load-bearing ordering: both runner close paths clear `is_alive`
+    /// BEFORE killing the child, so the waiter that wakes on the kill sees a
+    /// runner-initiated exit and hands the hook `None`. Reordering a close
+    /// path (or adding a kill that does not clear the flag) fails this.
+    #[test]
+    fn both_runner_close_paths_clear_is_alive_before_the_kill() {
+        for kill_only in [false, true] {
+            let mut session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+            session.is_alive.store(true, Ordering::SeqCst);
+            let io = Arc::new(AliveAtKillPaneIo {
+                alive: session.is_alive.clone(),
+                alive_at_kill: Mutex::new(None),
+            });
+            let pane: Arc<dyn crate::terminal::pane_io::PaneIo> = io.clone();
+            session.io = pane;
+            if kill_only {
+                session.close_kill_only();
+            } else {
+                session.close();
+            }
+            assert_eq!(
+                *io.alive_at_kill.lock().unwrap(),
+                Some(false),
+                "kill_only={kill_only}: is_alive must be cleared before the kill"
+            );
+            // The waiter waking on that kill classifies it as runner-initiated.
+            assert!(mark_exited_was_runner_initiated(&session.is_alive));
+            assert_eq!(on_exit_hook_code(Some(1), true), None);
+        }
+    }
 
     // =======================================================================
     // PTY spawn seam — production call-site coverage for the credential scrub

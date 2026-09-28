@@ -150,7 +150,9 @@ pub fn emit(
 }
 
 /// Pure predicate: is this a PROVEN non-zero exit? `None` — the waiter thread
-/// itself failed to observe a status — is NOT proof of a non-zero exit, the
+/// itself failed to observe a status, or the exit was caused by a
+/// runner-initiated close's kill (`terminal::session::on_exit_hook_code`) — is
+/// NOT proof of a non-zero exit, the
 /// same `unknown`-is-honest discipline `policy_authorized` uses elsewhere in
 /// this store. Split out from [`emit_session_exit_if_nonzero`] so the
 /// boundary is unit-testable with no registry.
