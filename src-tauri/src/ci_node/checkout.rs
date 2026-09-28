@@ -757,8 +757,8 @@ async fn prepare_worktree_with(
 
 /// Always-run cleanup: `git worktree remove -f -f`, a best-effort delete of
 /// the whole dispatch root — which sweeps the worktree, every provisioned
-/// sibling, and anything git left behind, in one call — then `worktree
-/// unlock` + prune for the admin entry.
+/// sibling, and anything git left behind, in one call — with a `worktree
+/// unlock` before the delete and a prune after it for the admin entry.
 /// Failure is logged, never propagated (cleanup runs on failure paths too).
 ///
 /// `-f` twice because a `worktree add` killed mid-way (cancel, deadline)
@@ -781,17 +781,26 @@ pub(crate) async fn cleanup_dispatch(root: &Path, repo: &str, dispatch_id: &str)
     {
         warn!("ci_node: worktree remove failed (continuing to prune): {e}");
     }
-    delete_dispatch_root(dispatch_root).await;
     // An add killed before it wrote the worktree's `.git` file leaves an
     // admin entry locked "initializing" that neither `remove` nor `prune`
     // clears; unlock it (an error just means there was no such lock) so the
-    // prune that follows can drop it.
-    let _ = run_git(
-        &repo_dir,
-        &["worktree", "unlock", &wt_str],
-        GIT_LOCAL_TIMEOUT,
-    )
-    .await;
+    // prune below can drop it. BEFORE the delete: git resolves the argument
+    // against the directory on disk, so once the directory is gone the unlock
+    // matches nothing (measured on git 2.45.2.windows.1). Both spellings,
+    // because the admin entry records the path in git's forward-slash form.
+    let wt_slash = wt_str.replace('\\', "/");
+    for spelling in [wt_str.as_str(), wt_slash.as_str()] {
+        let _ = run_git(
+            &repo_dir,
+            &["worktree", "unlock", spelling],
+            GIT_LOCAL_TIMEOUT,
+        )
+        .await;
+        if wt_slash == wt_str {
+            break;
+        }
+    }
+    delete_dispatch_root(dispatch_root).await;
     if let Err(e) = run_git(&repo_dir, &["worktree", "prune"], GIT_LOCAL_TIMEOUT).await {
         warn!("ci_node: worktree prune failed: {e}");
     }
@@ -835,12 +844,21 @@ async fn delete_dispatch_root(dispatch_root: PathBuf) {
                 Ok(())
             }
         };
-        // Forget the lock once nobody else holds it (the map's copy and ours).
-        if let Ok(mut map) = IN_FLIGHT.lock() {
-            if std::sync::Arc::strong_count(&lock) <= 2 {
-                map.remove(&dispatch_root);
-            }
+        // Forget the lock once nobody else holds it. Under the map mutex, so
+        // no caller can clone it between the count and the removal: drop our
+        // own clone first, then only the map's copy may remain.
+        let mut map = match IN_FLIGHT.lock() {
+            Ok(map) => map,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        drop(lock);
+        if map
+            .get(&dispatch_root)
+            .is_some_and(|l| std::sync::Arc::strong_count(l) == 1)
+        {
+            map.remove(&dispatch_root);
         }
+        drop(map);
         if let Err(e) = result {
             warn!(
                 "ci_node: residual dispatch dir {}: {e}",
@@ -1537,6 +1555,46 @@ mod tests {
         let pauses: Duration = HEAD_FETCH_POLICY.backoff.iter().sum();
         assert!(pauses < HEAD_FETCH_POLICY.deadline);
         assert!(HEAD_FETCH_POLICY.retry_fetch_timeout <= Duration::from_secs(120));
+    }
+
+    /// A worktree whose admin entry is LOCKED and whose `.git` file is gone —
+    /// the shape a `worktree add` killed mid-way leaves — is fully cleared by
+    /// `cleanup_dispatch`: no entry survives in `git worktree list`. `remove`
+    /// refuses it (no working tree) and `prune` skips a locked entry, so this
+    /// holds only because the unlock runs while the directory still exists.
+    #[tokio::test]
+    async fn cleanup_clears_a_locked_half_added_worktree() {
+        let f = fixture();
+        let primary = f.root.join("qontinui-runner");
+        git(&primary, &["fetch", "-q", &slash(&f.origin), "main"]);
+        let wt = ci_worktree_path(&f.root, "d-1", REPO);
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        git(
+            &primary,
+            &["worktree", "add", "-q", "--detach", &slash(&wt), &f.a],
+        );
+        git(
+            &primary,
+            &["worktree", "lock", "--reason", "initializing", &slash(&wt)],
+        );
+        std::fs::remove_file(wt.join(".git")).unwrap();
+        let entries = |dir: &Path| {
+            git(dir, &["worktree", "list", "--porcelain"])
+                .lines()
+                .filter(|l| l.starts_with("worktree "))
+                .count()
+        };
+        assert_eq!(entries(&primary), 2, "fixture: the half-added entry exists");
+
+        cleanup_dispatch(&f.root, REPO, "d-1").await;
+
+        assert_eq!(
+            entries(&primary),
+            1,
+            "only the primary may remain: {}",
+            git(&primary, &["worktree", "list", "--porcelain"])
+        );
+        assert!(!ci_dispatch_root(&f.root, "d-1").exists());
     }
 
     #[test]
