@@ -1507,6 +1507,10 @@ pub(crate) const CI_REPO_CAPABILITY_PREFIX: &str = "ci_repo:";
 /// the heartbeat logs that it truncated.
 pub(crate) const MAX_CI_REPO_CAPABILITIES: usize = 64;
 
+/// Set once the truncation above has been logged, so it is logged once.
+static CI_REPO_CAP_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Pure assembly of the whole `capabilities` vector the heartbeat sends.
 ///
 /// `ci_node` leads (it is the coarse fleet-role flag the CI filters read),
@@ -1531,9 +1535,15 @@ fn build_device_capabilities(
                 continue;
             }
             if repo_tokens == MAX_CI_REPO_CAPABILITIES {
-                warn!(
-                    "fleet: ci_node.repo_allowlist has more than {MAX_CI_REPO_CAPABILITIES}                      distinct entries; advertising the first {MAX_CI_REPO_CAPABILITIES} only"
-                );
+                // Once per process: the heartbeat re-assembles this every 30 s,
+                // and the truncation is a standing property of the settings,
+                // not a new event each tick.
+                if !CI_REPO_CAP_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    warn!(
+                        "fleet: ci_node.repo_allowlist has more than {MAX_CI_REPO_CAPABILITIES} \
+                         distinct entries; advertising the first {MAX_CI_REPO_CAPABILITIES} only"
+                    );
+                }
                 break;
             }
             caps.push(token);
@@ -7389,10 +7399,6 @@ mod tests {",
         );
     }
 
-    /// With nothing probed and CI-node mode off the set is empty — and an
-    /// empty set is still SENT (see
-    /// `heartbeat_always_sends_capabilities_but_omits_empty_ci_labels`),
-    /// which is what lets coord's write-through retract a capability.
     /// Empty and duplicate allowlist entries advertise nothing extra, and
     /// entries ride VERBATIM — coord matches the slug or the basename exactly
     /// as `admission::repo_allowed` does, so no normalisation here.
@@ -7467,6 +7473,10 @@ mod tests {",
         assert_eq!(caps.last().map(String::as_str), Some("os:linux"));
     }
 
+    /// With nothing probed and CI-node mode off the set is empty — and an
+    /// empty set is still SENT (see
+    /// `heartbeat_always_sends_capabilities_but_omits_empty_ci_labels`),
+    /// which is what lets coord's write-through retract a capability.
     #[test]
     fn device_capabilities_can_be_empty() {
         assert!(build_device_capabilities(false, &[], &[]).is_empty());
