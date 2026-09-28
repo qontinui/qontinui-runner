@@ -28,8 +28,10 @@
 // `database/pg/mod.rs` -- the idiomatic bootstrap-vs-schema split. The six
 // atlas_managed tables used to live in `project`; the runner's
 // `verify_and_provision` moves (or merges) any leftover `project.<t>` copy
-// into `atlas_managed` on boot, and qontinui-web's alembic revision
-// "move Atlas-owned runner tables" does the same on the alembic side.
+// into `atlas_managed` on boot. No alembic revision moves them: an
+// alembic-only database still carries the four legacy project.regression_*
+// tables (frozen revision f9d3e8a4c1b6), so every codegen pipeline runs
+// atlas/scripts/apply_to.sh after `alembic upgrade head`.
 //
 // Use `--env runner_pilot` (atlas.hcl) so the two schemas stay the scope.
 // The dev database must have NO `public` schema, or `schema apply` aborts

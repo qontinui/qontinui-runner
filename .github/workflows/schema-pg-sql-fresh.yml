@@ -108,7 +108,8 @@ jobs:
           while IFS= read -r merge_base; do
             if [ -n "$merge_base" ]; then
               if ! from_base="$(git diff --name-only "$merge_base" "$head_sha" -- \
-                  'src-tauri/queries/' 'src-tauri/schema.pg.sql.generated')"; then
+                  'src-tauri/queries/' 'src-tauri/schema.pg.sql.generated' \
+                  'src-tauri/scripts/regenerate_schema_pg_sql.sh' 'atlas/')"; then
                 echo "::error::git diff against merge base $merge_base failed; cannot determine path-change scope."
                 exit 1
               fi
@@ -232,13 +233,23 @@ jobs:
           DATABASE_URL: postgresql://qontinui_user:qontinui_dev_password@localhost:5433/qontinui_db
         run: poetry run alembic upgrade head
 
+      # Atlas, not alembic, owns `atlas_managed` and `orchestration`
+      # (atlas/schema.hcl), and no alembic revision creates or moves their
+      # tables. Apply the HCL after the alembic chain so the database this job
+      # generates from carries them. The script provisions its own throwaway
+      # dev database and runs Atlas and psql from pinned docker images.
+      - name: Apply Atlas-owned schema (atlas/schema.hcl)
+        working-directory: qontinui-runner
+        timeout-minutes: 10
+        run: bash atlas/scripts/apply_to.sh postgresql://qontinui_user:qontinui_dev_password@localhost:5433/qontinui_db
+
       # Bounded against a job-time apt hang — see the rationale on the
       # `Install dependencies (Ubuntu)` step in .github/workflows/ci.yml.
       # Sizing: 8 successful runs, p50 6s, max 9s, newest 2026-08-08 — no
       # sample inside the 08-18..08-20 mirror event. Same 10-minute bound as
-      # atlas-exclude-fresh.yml's identical postgresql-client-16 install; see
-      # the comment there for why a 9-second download sample cannot size a
-      # bound that must also cover `apt-get update`.
+      # schema-pg-sql-freshness-nightly.yml's identical postgresql-client-16
+      # install; a 9-second download sample cannot size a bound that must also
+      # cover `apt-get update`.
       #
       # This one matters more: `schema-fresh` is a REQUIRED status check on
       # main (ruleset 16044811), so a bound tight enough to fire on a merely
@@ -263,6 +274,8 @@ jobs:
           CLORINDE_PG_HOST: localhost
           CLORINDE_PG_PORT: "5433"
           PGPASSWORD: qontinui_dev_password
+          # Atlas was applied by the step above; do not apply it twice.
+          REGEN_SKIP_ATLAS: "1"
         run: bash src-tauri/scripts/regenerate_schema_pg_sql.sh
 
       - name: Diff against checked-in
