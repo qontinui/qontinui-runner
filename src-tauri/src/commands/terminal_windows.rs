@@ -1174,7 +1174,10 @@ mod tests {
     fn snapshot_geometry_never_captures_a_minimized_window() {
         // Whatever the OS reports for a minimized window — the Windows iconic
         // sentinel, or a plausible-looking rect — the prior record must stand.
-        assert_eq!(snapshot_geometry(true, false, (-32000, -32000), (0, 0)), None);
+        assert_eq!(
+            snapshot_geometry(true, false, (-32000, -32000), (0, 0)),
+            None
+        );
         assert_eq!(snapshot_geometry(true, false, (100, 200), (800, 600)), None);
         assert_eq!(snapshot_geometry(true, true, (0, 0), (1920, 1040)), None);
     }
@@ -1197,6 +1200,9 @@ mod tests {
     #[test]
     fn snapshot_geometry_refuses_a_zero_size_window_not_reported_minimized() {
         assert_eq!(snapshot_geometry(false, false, (100, 200), (0, 0)), None);
-        assert_eq!(snapshot_geometry(false, false, (-32000, -32000), (0, 0)), None);
+        assert_eq!(
+            snapshot_geometry(false, false, (-32000, -32000), (0, 0)),
+            None
+        );
     }
 }

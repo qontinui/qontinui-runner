@@ -77,20 +77,28 @@ pub struct WindowGeometry {
 /// `2026-09-28-runner-popout-window-geometry-poisoning-and-webview-recovery-wedge`).
 const WINDOWS_ICONIC_SENTINEL: i32 = -32000;
 
+/// Whether a window rect can be applied to a window and yield something
+/// visible: a non-zero size, and not parked at the Windows iconic sentinel.
+///
+/// The ONE validity rule for every runner-owned window rect, whoever captures
+/// it: the pop-out registry ([`WindowGeometry::is_restorable`], on both its
+/// capture and restore sides) and the main-window recreate
+/// (`webview_recovery::capture_placement`). One function, so the writers and
+/// readers cannot drift. Negative coordinates on their own are legitimate (a
+/// monitor left of or above the primary, e.g. `x = -1920`), so only the
+/// sentinel corner is refused.
+pub fn is_restorable_rect(x: i32, y: i32, w: u32, h: u32) -> bool {
+    let iconic = x <= WINDOWS_ICONIC_SENTINEL && y <= WINDOWS_ICONIC_SENTINEL;
+    w > 0 && h > 0 && !iconic
+}
+
 impl WindowGeometry {
-    /// Whether this geometry can be applied to a window and yield something
-    /// visible: a non-zero size, and not parked at the Windows iconic sentinel.
-    ///
-    /// The ONE validity rule, enforced on both sides — capture refuses to
-    /// persist and restore refuses to apply anything it rejects — so writer and
-    /// reader cannot drift. Negative coordinates on their own are legitimate (a
-    /// monitor left of or above the primary, e.g. `x = -1920`), so only the
-    /// sentinel corner is refused. `maximized` geometry is held to the same
-    /// rule: restore still positions the window before maximizing it, so the
-    /// monitor it lands on comes from `x`/`y`.
+    /// [`is_restorable_rect`] over this geometry. Capture refuses to persist,
+    /// and restore refuses to apply, anything it rejects. `maximized` geometry
+    /// is held to the same rule: restore still positions the window before
+    /// maximizing it, so the monitor it lands on comes from `x`/`y`.
     pub fn is_restorable(&self) -> bool {
-        let iconic = self.x <= WINDOWS_ICONIC_SENTINEL && self.y <= WINDOWS_ICONIC_SENTINEL;
-        self.w > 0 && self.h > 0 && !iconic
+        is_restorable_rect(self.x, self.y, self.w, self.h)
     }
 }
 
