@@ -307,6 +307,7 @@ fn cmd_show() -> ExitCode {
                 "redis_url":    p.redis_url,
                 "blob":         blob_view,
                 "coord_url":    p.coord_url,
+                "api_url":      p.api_url,
                 "auth":         auth_view,
             });
             println!("{}", serde_json::to_string_pretty(&out).unwrap());
@@ -455,6 +456,7 @@ fn cmd_init(host: &str) -> ExitCode {
             secret_key: Some("qontinui-dev-secret".to_string()),
         }),
         coord_url: Some(format!("ws://{host}:9870/ws")),
+        api_url: None,
         auth: Some(AuthConfig {
             kind: "issuer".to_string(),
             issuer: Some(format!("http://{host}:8000")),
