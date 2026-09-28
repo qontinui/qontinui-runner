@@ -97,6 +97,68 @@ pub const HOLDER_UNIT_PREFIX: &str = "qontinui-pty-holder-";
 /// take a route refuses it at spawn time, with a reason).
 pub const ROUTES: [&str; 5] = ["auto", "plain", "scope", "breakaway", "wmi"];
 
+/// How long a spawner waits for a holder's one report line, in ms. A holder
+/// that is alive but silent (e.g. `systemd-run` blocked on a wedged user
+/// manager) is treated as having printed nothing once this passes, so the
+/// failure, teardown and `auto` fallback paths all still run. Spike-only
+/// override; default [`DEFAULT_REPORT_TIMEOUT`].
+pub const REPORT_TIMEOUT_ENV: &str = "QONTINUI_PTY_HOLDER_SPIKE_REPORT_TIMEOUT_MS";
+/// Default for [`REPORT_TIMEOUT_ENV`].
+pub const DEFAULT_REPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// TEST HOOK (spike-only): a comma list of [`HostFacts`] fields to force
+/// `true` — `in_unit_cgroup`, `scope_tooling` — so the `auto`-scope paths can
+/// be exercised on a box (or CI runner) that is not inside a systemd unit.
+/// It only ever widens what `auto` TRIES; the spawn itself is still real.
+pub const FORCE_FACTS_ENV: &str = "QONTINUI_PTY_HOLDER_SPIKE_FORCE_FACTS";
+
+/// The report deadline in effect for this process.
+pub fn report_timeout() -> std::time::Duration {
+    std::env::var(REPORT_TIMEOUT_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(DEFAULT_REPORT_TIMEOUT)
+}
+
+/// Read one line on a helper thread, giving up after `timeout`. `None` means
+/// the deadline passed (the helper thread stays parked on the pipe until its
+/// writer goes away, which the caller's teardown then causes).
+fn read_line_within<R: Read + Send + 'static>(
+    reader: R,
+    timeout: std::time::Duration,
+) -> Option<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("pty-holder-report".into())
+        .spawn(move || {
+            let mut line = String::new();
+            let _ = BufReader::new(reader).read_line(&mut line);
+            let _ = tx.send(line);
+        })
+        .ok()?;
+    rx.recv_timeout(timeout)
+        .ok()
+        .map(|l| l.trim_end().to_string())
+}
+
+/// Read to EOF on a helper thread, giving up after `timeout`.
+fn read_all_within<R: Read + Send + 'static>(
+    mut reader: R,
+    timeout: std::time::Duration,
+) -> Option<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("pty-holder-stderr".into())
+        .spawn(move || {
+            let mut all = String::new();
+            let _ = reader.read_to_string(&mut all);
+            let _ = tx.send(all);
+        })
+        .ok()?;
+    rx.recv_timeout(timeout).ok()
+}
+
 /// Dispatch from `main()`. `Some(exit_code)` when argv[1] is exactly one of
 /// the two spike flags, `None` otherwise (fall through to the GUI).
 pub fn try_run_spike() -> Option<i32> {
@@ -212,6 +274,43 @@ pub fn report_field(line: &str, key: &str) -> Option<u32> {
 pub fn report_str<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     line.split_whitespace()
         .find_map(|tok| tok.strip_prefix(key)?.strip_prefix('='))
+}
+
+/// `(holder_pid, child_pid)` from a SUCCESS report line only — never from an
+/// error line, which can embed arbitrary text (a report-file path, a relayed
+/// line) — and only when both are real, signalable process ids: `2..=i32::MAX`.
+/// Anything else is `None`, so no caller can turn a parse into `kill(0)`,
+/// `kill(-1)` or a signal to init.
+pub fn success_pids(line: &str) -> Option<(i32, i32)> {
+    if !line.starts_with("holder_pid=") || is_error_line(line) {
+        return None;
+    }
+    let pid = |v: u32| (v > 1 && v <= i32::MAX as u32).then_some(v as i32);
+    Some((
+        pid(report_field(line, "holder_pid")?)?,
+        pid(report_field(line, "child_pid")?)?,
+    ))
+}
+
+/// The PTY child named by a success `line`, but only if `/proc` confirms it is
+/// still THAT process: its parent is the reported holder and it leads its own
+/// session (portable-pty's child `setsid()`s onto the PTY). `None` when the
+/// identity cannot be verified — callers then rely on the holder's death (or
+/// the scope unit's stop) instead of signalling a pid that may be recycled.
+#[cfg(target_os = "linux")]
+pub fn verified_pty_child(line: &str) -> Option<i32> {
+    let (holder, child) = success_pids(line)?;
+    let raw = std::fs::read_to_string(format!("/proc/{child}/stat")).ok()?;
+    let rest = &raw[raw.rfind(')')? + 1..];
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    let ppid: i32 = f.get(1)?.parse().ok()?;
+    let session: i32 = f.get(3)?.parse().ok()?;
+    (ppid == holder && session == child).then_some(child)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn verified_pty_child(_line: &str) -> Option<i32> {
+    None
 }
 
 /// Write `line` to `path` atomically: a temp name unique to this process,
@@ -363,13 +462,25 @@ fn respawn_detached(args: &[OsString], report_file: Option<&Path>) -> i32 {
         Ok(h) => h,
         Err(e) => return fail("holder", &format!("respawn: {e}"), report_file, 1),
     };
-    let mut line = String::new();
-    if let Some(out) = holder.stdout.take() {
-        let _ = BufReader::new(out).read_line(&mut line);
-    }
-    let line = line.trim_end();
+    let timeout = report_timeout();
+    let line = holder
+        .stdout
+        .take()
+        .and_then(|out| read_line_within(out, timeout))
+        .unwrap_or_default();
+    let line = line.as_str();
     if line.is_empty() {
-        return fail("holder", "respawned holder printed nothing", report_file, 1);
+        let _ = holder.kill();
+        let _ = holder.wait();
+        return fail(
+            "holder",
+            &format!(
+                "respawned holder printed nothing within {}ms",
+                timeout.as_millis()
+            ),
+            report_file,
+            1,
+        );
     }
     let _ = emit_line("holder", line, None);
     // An error line (e.g. the real holder's report file failed) is relayed
@@ -580,14 +691,18 @@ pub struct HostFacts {
 impl HostFacts {
     pub fn probe() -> Self {
         let linux = cfg!(target_os = "linux");
+        let forced = std::env::var(FORCE_FACTS_ENV).unwrap_or_default();
+        let force = |name: &str| linux && forced.split(',').any(|f| f.trim() == name);
         HostFacts {
             windows: cfg!(windows),
             linux,
-            in_unit_cgroup: linux
-                && std::fs::read_to_string("/proc/self/cgroup")
-                    .map(|c| cgroup_is_in_systemd_unit(&c))
-                    .unwrap_or(false),
-            scope_tooling: linux && find_systemd_run().is_some() && user_systemd_reachable(),
+            in_unit_cgroup: force("in_unit_cgroup")
+                || (linux
+                    && std::fs::read_to_string("/proc/self/cgroup")
+                        .map(|c| cgroup_is_in_systemd_unit(&c))
+                        .unwrap_or(false)),
+            scope_tooling: force("scope_tooling")
+                || (linux && find_systemd_run().is_some() && user_systemd_reachable()),
         }
     }
 }
@@ -708,19 +823,22 @@ fn spawn_holder_for_route(
 }
 
 impl SpawnedHolder {
-    /// Read the holder's one report line (empty if it printed nothing).
-    fn read_report(&mut self) -> String {
-        let mut line = String::new();
-        if let Some(out) = self.child.stdout.take() {
-            let _ = BufReader::new(out).read_line(&mut line);
-        }
-        line.trim_end().to_string()
+    /// Read the holder's one report line within [`report_timeout`]. `Ok("")`
+    /// is EOF with nothing printed; `Err` names the missed deadline. Either
+    /// way the caller treats it as "printed nothing".
+    fn read_report(&mut self) -> Result<String, String> {
+        let timeout = report_timeout();
+        let Some(out) = self.child.stdout.take() else {
+            return Ok(String::new());
+        };
+        read_line_within(out, timeout)
+            .ok_or_else(|| format!("no report within {}ms", timeout.as_millis()))
     }
 
     /// Why a holder that printed nothing failed, as one whitespace-free
     /// token: its exit status and whatever systemd-run said on stderr. Waits
-    /// up to 3 s for the process to exit, KILLS it if it has not (so the
-    /// stderr read below cannot block on a live writer), then reads stderr.
+    /// up to 3 s for the process to exit, KILLS it if it has not, then reads
+    /// stderr — itself bounded, since a grandchild could still hold the pipe.
     fn failure_reason(&mut self) -> String {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         let status = loop {
@@ -736,10 +854,15 @@ impl SpawnedHolder {
                 }
             }
         };
-        let mut err = String::new();
-        if let Some(mut e) = self.child.stderr.take() {
-            let _ = e.read_to_string(&mut err);
-        }
+        let err = self
+            .child
+            .stderr
+            .take()
+            .map(|e| {
+                read_all_within(e, std::time::Duration::from_secs(2))
+                    .unwrap_or_else(|| "<stderr read timed out>".into())
+            })
+            .unwrap_or_default();
         format!("{} [{status}]", err.trim())
             .split_whitespace()
             .collect::<Vec<_>>()
@@ -749,10 +872,24 @@ impl SpawnedHolder {
             .collect()
     }
 
-    /// Leave nothing behind: stop the holder's scope unit (everything in it
-    /// dies), SIGKILL the PTY child named in `line` if any, and kill + reap
-    /// the holder process itself.
+    /// Leave nothing behind, in this order:
+    /// 1. SIGKILL the PTY child named by `line` — only a SUCCESS line, and
+    ///    only once [`verified_pty_child`] confirms it is still that process;
+    ///    unverifiable → no explicit signal (steps 2-3 still end it: the unit
+    ///    stop kills its cgroup, and the holder's death hangs up its PTY).
+    /// 2. Stop the holder's scope unit, if any (everything in it dies).
+    /// 3. Kill and reap the holder process itself.
     fn abandon(&mut self, line: &str) {
+        #[cfg(unix)]
+        if let Some(child_pid) = verified_pty_child(line) {
+            // SAFETY: a plain signal to a pid in 2..=i32::MAX whose parent and
+            // session were just verified against our own holder's report.
+            unsafe {
+                libc::kill(child_pid, libc::SIGKILL);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = line;
         if let Some(unit) = &self.unit {
             let _ = Command::new("systemctl")
                 .args(["--user", "stop", "--quiet", unit])
@@ -761,15 +898,6 @@ impl SpawnedHolder {
                 .stderr(Stdio::null())
                 .status();
         }
-        #[cfg(unix)]
-        if let Some(child_pid) = report_field(line, "child_pid") {
-            // SAFETY: a plain signal to the pid our own holder just reported.
-            unsafe {
-                libc::kill(child_pid as i32, libc::SIGKILL);
-            }
-        }
-        #[cfg(not(unix))]
-        let _ = line;
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -820,17 +948,14 @@ fn run_parent(args: &[OsString]) -> i32 {
 
     let (mut holder, line) = loop {
         let attempt = spawn_holder_for_route(route, &parsed.command).and_then(|mut h| {
-            let line = h.read_report();
-            if line.is_empty() {
-                let reason = h.failure_reason();
-                h.abandon("");
-                Err(format!(
-                    "holder printed nothing (route={}) reason={reason}",
-                    route.as_str()
-                ))
-            } else {
-                Ok((h, line))
-            }
+            let what = match h.read_report() {
+                Ok(line) if !line.is_empty() => return Ok((h, line)),
+                Ok(_) => "holder printed nothing".to_string(),
+                Err(deadline) => format!("holder printed nothing: {deadline}"),
+            };
+            let reason = h.failure_reason();
+            h.abandon("");
+            Err(format!("{what} (route={}) reason={reason}", route.as_str()))
         });
         match attempt {
             Ok(ok) => break ok,
@@ -864,7 +989,9 @@ fn run_parent(args: &[OsString]) -> i32 {
         // was so a caller can verify it is gone, then leave nothing behind.
         holder.abandon(&line);
         if let Some(unit) = &holder.unit {
-            println!("parent_error=abandoned holder_unit={unit} after: {e}");
+            let mut out = std::io::stdout().lock();
+            let _ = writeln!(out, "parent_error=abandoned holder_unit={unit} after: {e}");
+            let _ = out.flush();
         }
         return 1;
     }
@@ -1079,6 +1206,47 @@ mod tests {
         let d = decide_route("auto", &outside).unwrap();
         assert_eq!(d.route, ResolvedRoute::Plain);
         assert!(!d.unprotected_cgroup);
+    }
+
+    #[test]
+    fn pty_holder_spike_success_pids_parse_only_real_pids_from_success_lines() {
+        assert_eq!(
+            success_pids("holder_pid=100 child_pid=200 route=plain"),
+            Some((100, 200))
+        );
+        // An error line never yields pids, whatever it embeds.
+        assert_eq!(
+            success_pids("holder_error=report-file /tmp/holder_pid=5 child_pid=0: denied"),
+            None
+        );
+        assert_eq!(
+            success_pids("parent_error=holder failed: holder_pid=7 child_pid=8"),
+            None
+        );
+        // 0, 1 and anything that would not survive `as i32` are rejected.
+        assert_eq!(success_pids("holder_pid=100 child_pid=0"), None);
+        assert_eq!(success_pids("holder_pid=100 child_pid=1"), None);
+        assert_eq!(success_pids("holder_pid=100 child_pid=4294967295"), None);
+        assert_eq!(success_pids("holder_pid=100 child_pid=2147483648"), None);
+        assert_eq!(success_pids("holder_pid=100 child_pid=-1"), None);
+        assert_eq!(success_pids("holder_pid=1 child_pid=200"), None);
+        assert_eq!(
+            success_pids("holder_pid=100 child_pid=2147483647"),
+            Some((100, i32::MAX))
+        );
+        assert_eq!(success_pids(""), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pty_holder_spike_verified_pty_child_refuses_an_unrelated_process() {
+        // This test process is not a session-leading child of pid 2.
+        let me = std::process::id();
+        assert_eq!(
+            verified_pty_child(&format!("holder_pid=2 child_pid={me}")),
+            None
+        );
+        assert_eq!(verified_pty_child("holder_error=x child_pid=0"), None);
     }
 
     #[test]
