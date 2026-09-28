@@ -311,7 +311,9 @@ pub fn success_pids(line: &str) -> Option<(i32, i32)> {
 pub fn verified_pty_child(line: &str) -> Option<i32> {
     let (holder, child) = success_pids(line)?;
     let raw = std::fs::read_to_string(format!("/proc/{child}/stat")).ok()?;
-    let rest = &raw[raw.rfind(')')? + 1..];
+    // The comm field is parenthesised and may itself contain ')' or spaces, so
+    // the fields we want start after the LAST ')'.
+    let (_, rest) = raw.rsplit_once(')')?;
     let f: Vec<&str> = rest.split_whitespace().collect();
     let ppid: i32 = f.get(1)?.parse().ok()?;
     let session: i32 = f.get(3)?.parse().ok()?;
@@ -657,8 +659,7 @@ pub fn cgroup_is_in_systemd_unit(cgroup_file: &str) -> bool {
         };
         let Some(unit) = path
             .split('/')
-            .filter(|c| c.ends_with(".service") || c.ends_with(".scope"))
-            .next_back()
+            .rfind(|c| c.ends_with(".service") || c.ends_with(".scope"))
         else {
             return false;
         };
