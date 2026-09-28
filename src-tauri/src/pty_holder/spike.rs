@@ -456,6 +456,7 @@ fn respawn_detached(args: &[OsString], report_file: Option<&Path>) -> i32 {
         Ok(e) => e,
         Err(e) => return fail("holder", &format!("current_exe: {e}"), report_file, 1),
     };
+    // console-ok: unix-only re-exec (respawn_detached is #[cfg(unix)]).
     let mut cmd = Command::new(exe);
     cmd.arg(SPIKE_FLAG)
         .args(args)
@@ -786,6 +787,7 @@ fn holder_args(command: &[OsString]) -> Vec<OsString> {
 /// execs the command, so the holder (and the PTY child it forks) live in a
 /// cgroup of their own, outside the spawner's unit.
 pub fn scope_command(systemd_run: &Path, unit: &str, exe: &Path, args: &[OsString]) -> Command {
+    // console-ok: systemd-run exists only on Linux; the scope route is refused on Windows.
     let mut cmd = Command::new(systemd_run);
     cmd.args(["--user", "--scope", "--quiet", "--collect"])
         .arg(format!("--unit={unit}"))
@@ -814,6 +816,8 @@ fn spawn_holder_for_route(
             (scope_command(&systemd_run, &unit, &exe, &args), Some(unit))
         }
         _ => {
+            // console-ok: on Windows spawn_os hands this builder to runner-win32's
+            // spawn_holder, which sets DETACHED_PROCESS (no console) itself.
             let mut cmd = Command::new(&exe);
             cmd.args(&args);
             (cmd, None)
@@ -920,6 +924,7 @@ impl SpawnedHolder {
         #[cfg(not(unix))]
         let _ = line;
         if let Some(unit) = &self.unit {
+            // console-ok: only reached with a scope unit, i.e. on Linux.
             let spawned = Command::new("systemctl")
                 .args(["--user", "stop", "--no-block", "--quiet", unit])
                 .stdin(Stdio::null())
