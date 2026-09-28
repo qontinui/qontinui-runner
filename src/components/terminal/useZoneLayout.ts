@@ -629,6 +629,10 @@ export function useZoneLayout(
   // `assignTabToZone` registers the zone here so the guard holds across the
   // async restore window; the reservation is cleared once the zone is filled.
   const reservedZonesRef = useRef<Set<number>>(new Set());
+  // Exposed as a getter, not the ref's `.current` value, so a caller (the
+  // reveal-click handler) always reads it at CALL time — from an event
+  // handler, never during render, where a ref read is stale-by-design.
+  const getReservedZones = useCallback((): ReadonlySet<number> => reservedZonesRef.current, []);
 
   // Resolve through `resolveLayout` so a persisted/auto-grown `flow-grid` id
   // materializes a synthesized preset sized to the CURRENT live tabs, instead
@@ -890,6 +894,7 @@ export function useZoneLayout(
     revealRequest,
     requestReveal,
     consumeReveal,
+    getReservedZones,
     unassignedTabIds,
     exitedUnassignedTabIds,
     isMultiZone,

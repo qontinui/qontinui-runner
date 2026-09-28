@@ -33,6 +33,51 @@ describe("planTabReveal", () => {
   it("returns null when the layout has no zones", () => {
     expect(planTabReveal({}, 0, 0, "z")).toBeNull();
   });
+
+  it("skips an empty zone reserved for a session record still restoring", () => {
+    // Zone 0 is empty but claimed by an in-flight restore; zone 1 is the next
+    // real vacancy.
+    expect(planTabReveal({ 2: "c" }, 4, 0, "z", new Set([0]))).toEqual({
+      zone: 1,
+      assign: true,
+    });
+  });
+
+  it("falls through to the focused zone when it is full but not reserved", () => {
+    expect(planTabReveal({ 1: "b" }, 2, 1, "z", new Set([0]))).toEqual({
+      zone: 1,
+      assign: true,
+    });
+  });
+
+  it("still focuses a reserved zone that already shows the tab (no reassignment)", () => {
+    // A reservation guards an EMPTY zone from being stolen; it says nothing
+    // once the zone holds its intended tab.
+    expect(planTabReveal({ 0: "z" }, 2, 0, "z", new Set([0]))).toEqual({
+      zone: 0,
+      assign: false,
+    });
+  });
+
+  it("does not hand a reserved focused zone to the reveal when another zone is free to displace", () => {
+    // Zone 0 is both the focused zone AND reserved for an in-flight restore —
+    // the exact state a restoring session's first reserved zone tends to be
+    // in, since the focused zone also defaults to 0. Zone 1 is occupied but
+    // NOT reserved, so the reveal displaces it instead of colliding with the
+    // restore.
+    expect(planTabReveal({ 1: "b" }, 2, 0, "z", new Set([0]))).toEqual({
+      zone: 1,
+      assign: true,
+    });
+  });
+
+  it("falls back to the reserved focused zone only when every zone is reserved", () => {
+    // Pathological: no non-reserved zone exists anywhere in the layout.
+    expect(planTabReveal({}, 1, 0, "z", new Set([0]))).toEqual({
+      zone: 0,
+      assign: true,
+    });
+  });
 });
 
 describe("liveTabIdForSession — which card clicks go to a terminal", () => {
