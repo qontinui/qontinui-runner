@@ -146,6 +146,11 @@ pub struct RestoreRecordEmitter {
     /// ([`super::session_tenant_stamp`]) so a replay after a restart can still
     /// present the right credential. The process-wide lookup by default.
     tenant_of: Box<dyn Fn(Uuid) -> Option<Uuid> + Send + Sync>,
+    /// Whether this device is CURRENTLY bound to a tenant. A record's saved
+    /// `tenant_id` is trusted only when it is: a stale or foreign one names a
+    /// tenant no credential will ever be issued for, and its rows would be
+    /// held until they aged out. Reads `paired_user.json` by default.
+    bound_to: Box<dyn Fn(Uuid) -> bool + Send + Sync>,
 }
 
 impl RestoreRecordEmitter {
@@ -181,7 +186,16 @@ impl RestoreRecordEmitter {
             last_emitted: Mutex::new(HashMap::new()),
             skipped: Mutex::new(HashSet::new()),
             tenant_of: Box::new(super::session_tenant_stamp::lookup),
+            bound_to: Box::new(|t| {
+                crate::auth::device_bound_tenants().is_some_and(|b| b.contains(&t))
+            }),
         }
+    }
+
+    /// Replace the binding check (tests; production reads `paired_user.json`).
+    pub fn with_binding_check(mut self, bound_to: Box<dyn Fn(Uuid) -> bool + Send + Sync>) -> Self {
+        self.bound_to = bound_to;
+        self
     }
 
     /// Replace the tenant lookup (tests; production keeps the process-wide
@@ -225,12 +239,14 @@ impl RestoreRecordEmitter {
             return;
         };
 
-        // The record's own durable spawn tenant first (it survives a restart),
-        // then the live lookup for the hosting coord session.
+        // The record's own durable spawn tenant first (it survives a restart)
+        // — but only while this device is still bound to it; a stale or
+        // foreign one falls back to the live lookup for the hosting session.
         let tenant = rec
             .tenant_id
             .as_deref()
             .and_then(|t| Uuid::parse_str(t.trim()).ok())
+            .filter(|t| (self.bound_to)(*t))
             .or_else(|| (self.tenant_of)(session_id));
         let payload = super::session_tenant_stamp::stamp(
             restore_record_payload(rec, self.machine_id, transcript_exists),

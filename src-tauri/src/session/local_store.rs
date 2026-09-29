@@ -126,7 +126,7 @@ const COMPACT_MIN_DEAD_BYTES: u64 = 4096;
 /// After a cap-triggered trim, retain at most 4/5 of the cap so a bounded
 /// outbox does not re-trim on every single subsequent `record` call (each trim
 /// is a full read + rewrite).
-fn trim_target(max_bytes: u64) -> u64 {
+pub(crate) fn trim_target(max_bytes: u64) -> u64 {
     max_bytes / 5 * 4
 }
 
@@ -403,6 +403,12 @@ impl OutboxWriter {
         &self.path
     }
 
+    /// The byte cap this writer enforces (see [`DEFAULT_MAX_BYTES`]). Read by
+    /// the drain so its own bounds on held rows stay below the file trim.
+    pub fn max_bytes(&self) -> u64 {
+        self.max_bytes
+    }
+
     /// How many never-acked records this writer has dropped to stay under the
     /// cap. `0` on a healthy (drained) outbox.
     pub fn dropped_unacked(&self) -> u64 {
@@ -665,17 +671,45 @@ impl OutboxWriter {
             .rev()
             .take(protect_newest_unacked.max(1))
             .last();
+        // A dropped row that is its key's NEWEST seq in the file is not removed
+        // but turned into an acked, payload-less TOMBSTONE — the same seq floor
+        // `drop_acked_keeping_seq_floor` keeps. Removing it would let the
+        // next-seq scan on reopen restart BELOW seqs coord may already hold
+        // for this session (its earlier, delivered rows were compacted away),
+        // and coord's `UNIQUE (session_id, seq)` would then silently swallow
+        // every re-used seq as a duplicate.
+        let mut max_seq: HashMap<(Uuid, Uuid), i64> = HashMap::new();
+        for rec in &kept {
+            let e = max_seq
+                .entry((rec.machine_id, rec.session_id))
+                .or_insert(i64::MIN);
+            if rec.seq > *e {
+                *e = rec.seq;
+            }
+        }
+        let tomb_at = Utc::now();
+        let mut kept = kept;
         let mut drop_flags = vec![false; kept.len()];
         let mut dropped_unacked = 0usize;
-        for (i, rec) in kept.iter().enumerate() {
+        for i in 0..kept.len() {
             if live <= target {
                 break;
             }
-            if rec.acked_at.is_some() || protect_from.is_some_and(|p| i >= p) {
+            if kept[i].acked_at.is_some() || protect_from.is_some_and(|p| i >= p) {
                 continue;
             }
-            drop_flags[i] = true;
-            live -= sizes[i];
+            let rec = &kept[i];
+            let is_floor = max_seq
+                .get(&(rec.machine_id, rec.session_id))
+                .is_some_and(|m| *m == rec.seq);
+            if is_floor {
+                kept[i].payload = serde_json::Value::Null;
+                kept[i].acked_at = Some(tomb_at);
+                live = live - sizes[i] + serialized_len(&kept[i]);
+            } else {
+                drop_flags[i] = true;
+                live -= sizes[i];
+            }
             dropped_unacked += 1;
         }
 
@@ -1462,6 +1496,67 @@ mod tests {
         assert!(!pending.is_empty());
         assert_eq!(pending.last().unwrap().seq, 400);
         assert!(pending.windows(2).all(|w| w[0].seq < w[1].seq));
+    }
+
+    /// Review finding (plan 2026-09-28-anyone-holding-a-session-uuid-…, Phase
+    /// 2): the cap trim may drop EVERY row a session still has — including its
+    /// newest seq. Removing that row outright lets the next-seq scan on reopen
+    /// restart below seqs coord already holds (its delivered rows were
+    /// compacted away), and coord's `UNIQUE (session_id, seq)` then swallows
+    /// the reused seqs silently. The newest row must survive as a seq-floor
+    /// tombstone instead. MUTATION: drop it like any other row (remove the
+    /// `is_floor` arm) and the reopened writer hands out seq 1 again — this
+    /// fails.
+    #[test]
+    fn cap_trim_never_rewinds_a_sessions_seq() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("outbox.jsonl");
+        let cap = 8 * 1024;
+        let m = Uuid::new_v4();
+        let (old, busy) = (Uuid::new_v4(), Uuid::new_v4());
+        let outbox = OutboxWriter::open_with_max_bytes(&path, cap).unwrap();
+        // `old` delivered seqs 1..=3, then queued 4..=5 that were never sent.
+        for _ in 0..5 {
+            outbox
+                .record(
+                    m,
+                    old,
+                    SessionEventKind::OutputChunk,
+                    json!({"pad": "o".repeat(300)}),
+                )
+                .unwrap();
+        }
+        outbox.ack(&[(old, 1), (old, 2), (old, 3)]).unwrap();
+        // Another session's traffic pushes `old`'s whole backlog out.
+        for _ in 0..200 {
+            outbox
+                .record(
+                    m,
+                    busy,
+                    SessionEventKind::Heartbeat,
+                    json!({"pad": "b".repeat(200)}),
+                )
+                .unwrap();
+        }
+        assert!(outbox.dropped_unacked() > 0);
+        assert!(
+            outbox
+                .pending()
+                .unwrap()
+                .iter()
+                .all(|r| r.session_id != old),
+            "the trim dropped every one of `old`'s pending rows (the setup this test needs)"
+        );
+        drop(outbox);
+
+        let reopened = OutboxWriter::open_with_max_bytes(&path, cap).unwrap();
+        let next = reopened
+            .record(m, old, SessionEventKind::OutputChunk, json!({}))
+            .unwrap();
+        assert_eq!(
+            next.seq, 6,
+            "a trim must never let a session's seq restart below what it already issued"
+        );
     }
 
     /// A trim must exhaust ACKED rows before it destroys a single unacked
