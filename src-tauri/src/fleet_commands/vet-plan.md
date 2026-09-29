@@ -1827,6 +1827,7 @@ decisions only — see the predicate guidance in `_gate-registration`).
 > | Invocation | step 5 — `unit_ready` **record** gate | step 6 — `time_elapsed` **net** gate |
 > |---|---|---|
 > | **standalone `/vet-plan`** | **register it** | register it |
+> | **standalone `/vet-plan`, §5.4 REFUSED** | **DO NOT register it** | register it |
 > | **under `/vet-imp`** | **DO NOT register it** | register it |
 >
 > **Why the record gate is skipped under `/vet-imp`.** Its predicate can only be
@@ -2200,8 +2201,8 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    This step is **unconditional**, because step 6 is — see the correction in the
    exception blockquote above. If neither source yields a UUID, that — and only
    that — is the one case where the net gate is skipped: a `continuation_spawn`
-   has no target without it. Then still register the `unit_ready` record gate,
-   and **say in your report that the net was skipped because no `device_id`
+   has no target without it. Then still register the `unit_ready` record gate
+   (per step 5's conditions), and **say in your report that the net was skipped because no `device_id`
    resolved**, naming both sources you tried. A skipped net that goes unreported
    is the silent strand this whole section exists to prevent.
 3. **Check for existing gates** anchored to this work unit
@@ -2521,19 +2522,23 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
 
    (MCP twin: `coord_gate_list {work_unit_id, open_only: false}`.) **How many
    rows to assert depends on the caller** — the same split as the table at the
-   top of this section: **standalone `/vet-plan` asserts TWO; `/vet-imp` asserts
-   ONE (the net).** Report each one's `gate_id` **in full**
+   top of this section: **standalone `/vet-plan` asserts TWO when the
+   attestation landed; ONE (the net) when §5.4 ended REFUSED, and ONE (the net)
+   under `/vet-imp`.** Report each one's `gate_id` **in full**
    [policy: `coordination` `record-gate-ids-in-full`]:
 
    | expected row | how to recognise it | if it is MISSING |
    |---|---|---|
-   | the **record** gate — **standalone only** | `predicate_kind: unit_ready`, continuation `armed: false` | standalone: step 5 did not land — re-issue it, and never report §5.4 done without it. **Under `/vet-imp` its absence is CORRECT** — assert it is absent, and do not re-issue it |
+   | the **record** gate — **standalone only** | `predicate_kind: unit_ready`, continuation `armed: false` | standalone, attestation landed: step 5 did not land — re-issue it, and never report §5.4 done without it. **Under `/vet-imp` its absence is CORRECT** — assert it is absent, and do not re-issue it. **On the REFUSED arm its absence is CORRECT** — assert it absent, do not re-issue; quote coord's `attestation:vetted` gate id (none for `owner_unresolved` / `attester_unresolved`) |
    | the **net** gate — **always** | `predicate_kind: time_elapsed` **and** continuation `armed: true` **and** `will_dispatch: true` | step 6 did not land — re-issue it; if it still will not register, report **NO NET** explicitly with the reason, per step 6's honesty rule |
 
    ⚠️ **Under `/vet-imp`, a `unit_ready` row PRESENT on this unit is the defect,
    not the success signal.** It means step 5 was run anyway; say so, and leave
    it alone — do **not** withdraw it, because a `withdrawn` row permanently
    blocks that unit from ever deriving `ready` (see the caller table's ⛔ note).
+   **The same holds on the REFUSED arm of a standalone vet:** a `unit_ready` row present there means step 5 ran
+   despite its REFUSED skip — a gate keyed on `vetted` that can never clear.
+   Say so in the report.
 
    **Recognise the net by its PREDICATE and its ARMED continuation, not by its
    `phase_name`.** The canonical name is what step 6 tells you to write and what
@@ -3096,8 +3101,8 @@ leave it in the report.
   `{work_unit_id, ready_status}` — transition the unit FIRST (one `→ vetted`
   call carrying an `independence` declaration) and key `ready_status` on
   `vetted`; never on the status a REFUSED transition left, which on a fresh unit
-  is `""` and clears at once (§5.4 has the full procedure; canonical:
-  `_gate-registration`). (**NOT** `operator_approval` — `operator_approval`
+  is `""` and clears at once; on a refused transition register no `unit_ready`
+  gate (§5.4 has the full procedure; canonical: `_gate-registration`). (**NOT** `operator_approval` — `operator_approval`
   is for genuine human decisions, not a work queue); schema/alembic-at-head →
   `migration_at_head` `{schema}`; infra drift cleared → `infra_drift_clear`; a repo
   file/workflow existing → `file_exists` `{repo, path, on_ref?}` — **usable again;
@@ -3242,7 +3247,7 @@ Brief — under 150 words. State:
   `owner_unresolved` / `attester_unresolved`). On the subagent path the kept
   declaration is owed a re-send; on the self path the attestation needs a
   fresh-context review first
-- **The evidence manifest** (§2a): quote `stored` from the transition's `vet_evidence` receipt — the count coord **kept**, never the count you sent — and `admitted_on`, the arm that actually carried the transition (`identity` / `graduation` / `no_transition`). **Read both; do not infer either.** ⚠️ Where you sent an `independence` declaration, SAY SO explicitly: `admitted_on` reads `identity` on that path too, so it cannot be quoted as evidence of an actor difference. **The *built but not stored* arm — no receipt, or `stored` below the count you sent — REQUIRES its evidence:** quote the refusal body coord returned (HTTP status, error code, message) and name the §5.4 ladder rung you reached (1 native MCP tool / 2 `coord-revive.sh call` / 3 HTTP twin with a device JWT). A *built but not stored* line without both is not a report of the arm, because the next occurrence must be diagnosable from the report alone. On the REFUSED arm, report the transition as **refused, status unchanged, attestation OWED**, name the refusal code (`self_attestation_forbidden` / `owner_unresolved` / `attester_unresolved`, with every rung tried on the last) — never the manifest, which admits nothing — and quote `stored` and `admitted_on: no_transition` from the manifest-store upsert's receipt
+- **The evidence manifest** (§2a): quote `stored` from the transition's `vet_evidence` receipt — the count coord **kept**, never the count you sent — and `admitted_on`, the arm that actually carried the transition (`identity` / `graduation` / `no_transition`). **Read both; do not infer either.** ⚠️ Where you sent an `independence` declaration, SAY SO explicitly: `admitted_on` reads `identity` on that path too, so it cannot be quoted as evidence of an actor difference. **The *built but not stored* arm — no receipt, or `stored` below the count you sent — REQUIRES its evidence:** quote the refusal body coord returned (HTTP status, error code, message) and name the §5.4 ladder rung you reached (1 native MCP tool / 2 `coord-revive.sh call` / 3 HTTP twin with a device JWT). A *built but not stored* line without both is not a report of the arm, because the next occurrence must be diagnosable from the report alone. On the REFUSED arm, report the transition as **refused, status unchanged, attestation OWED**, say the record gate was **not registered** and quote coord's `attestation:vetted` gate id (none for `owner_unresolved` / `attester_unresolved`), name the refusal code (`self_attestation_forbidden` / `owner_unresolved` / `attester_unresolved`, with every rung tried on the last) — never the manifest, which admits nothing — and quote `stored` and `admitted_on: no_transition` from the manifest-store upsert's receipt
 - Open questions you **resolved using the Decision policy**, with the deciding priority in parentheses (e.g. "picked registry-backed lookup (scalability)")
 - Anything you flagged for the user that you did NOT auto-fix — limit this to product/scope/stakeholder calls the Decision policy can't decide; engineering trade-offs should already be resolved in the plan
 

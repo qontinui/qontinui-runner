@@ -3701,8 +3701,9 @@ supersedes unit_ready for the dependency-gated case".)
   ready, dispatchable work → `unit_ready` `{work_unit_id, ready_status}` —
   transition the unit FIRST (one `→ vetted` call carrying an `independence`
   declaration) and key `ready_status` on `vetted`; never on the status a
-  REFUSED transition left, which on a fresh unit is `""` and clears at once
-  (canonical: `_gate-registration`). (**NOT**
+  REFUSED transition left, which on a fresh unit is `""` and clears at once;
+  on a refused transition register no `unit_ready` gate (canonical:
+  `_gate-registration`). (**NOT**
   `operator_approval` — `operator_approval` is for genuine human decisions, not a
   work queue); schema/alembic-at-head → `migration_at_head` `{schema}`; infra drift
   cleared → `infra_drift_clear`; a repo file/workflow existing → ⛔ `file_exists`
