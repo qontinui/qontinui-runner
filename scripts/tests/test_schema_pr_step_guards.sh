@@ -886,11 +886,20 @@ assert "no drift: drift=false" "false" "$(out_of drift)"
 assert "no drift: healed=false" "false" "$(out_of healed)"
 assert "no drift: PR step does not run" "false" "$(eval_if "$pr_if" "$work/fresh.out")"
 assert "no drift: sweep step runs" "true" "$(eval_if "$sweep_if" "$work/fresh.out")"
+# drift=false means main already carries the fresh dump, so the open PR is
+# OBSOLETE whatever its state: readying it could land stale schema. Closed.
 rc="$(run_sweep)"
 assert "no drift: sweep exit code" 0 "$rc"
-assert "no drift: sweep invoked the script and readied the draft" 1 "$(grep -c '^readied #4242$' "$work/sweep.log" || true)"
-assert "no drift: sweep called the ready mutation once" 1 "$(grep -c '^graphql$' "$work/gh.log" || true)"
-assert "no drift: sweep summary names the outcome" 1 "$(grep -c 'sweep outcome: `readied #4242`' "$work/sweep.summary.md" || true)"
+assert "no drift: sweep closes the obsolete draft" 1 "$(grep -c '^closed-obsolete #4242$' "$work/sweep.log" || true)"
+assert "no drift: never readied" 0 "$(grep -c '^graphql$' "$work/gh.log" || true)"
+assert "no drift: sweep summary names the outcome" 1 "$(grep -c 'sweep outcome: `closed-obsolete #4242`' "$work/sweep.summary.md" || true)"
+# A2'. When fresh_check could not say (drift ''), or on a drift night, the
+#      sweep re-decides the draft instead: it has checks, so it is readied.
+SWEEP_DRIFT_OVERRIDE=EMPTY
+rc="$(run_sweep)"
+SWEEP_DRIFT_OVERRIDE=""
+assert "unknown drift: sweep invoked the script and readied the draft" 1 "$(grep -c '^readied #4242$' "$work/sweep.log" || true)"
+assert "unknown drift: sweep called the ready mutation once" 1 "$(grep -c '^graphql$' "$work/gh.log" || true)"
 
 # B. Drift on a self-heal run: healed=true, the summary names the drift, and
 #    both the PR step and the sweep run.
@@ -930,9 +939,11 @@ ready_line() {
   printf '4242\t%s\ta47f223e3a47f223e3a47f223e3a47f223e3a47f\tPR_kwDOtest4242\t2026-01-01T00:00:00Z\thttps://github.com/qontinui/qontinui-runner/pull/4242\tjspinak\t%s\t%s' "$1" "$2" "$3"
 }
 
-# E. The sweep over an already-ready PR, and over no PR at all, is a green no-op.
+# E. On a drift night the sweep over an already-ready PR, and over no PR at
+#    all, is a green no-op.
 GH_STUB_READY_LINE="$(ready_line false MERGEABLE CLEAN)"
-run_fresh true "$base_dump" > /dev/null
+# (A drift night: on a no-drift night the open PR is closed as obsolete — F.)
+run_fresh true "$drift_dump" > /dev/null
 rc="$(run_sweep)"
 assert "sweep over a ready PR: exit code" 0 "$rc"
 assert "sweep over a ready PR: already-ready, no mutation" "already-ready #4242 0" "$(tail -n1 "$work/sweep.log") $(grep -c '^graphql$' "$work/gh.log" || true)"
@@ -966,7 +977,7 @@ GH_STUB_READY_LINE=""
 # G. The sweep pins the head via `git ls-remote`: a lookup still reporting a
 #    stale head decides nothing; an absent branch pins nothing; a refused
 #    ls-remote is a red, not "no branch".
-run_fresh true "$base_dump" > /dev/null
+run_fresh true "$drift_dump" > /dev/null
 GIT_STUB_REMOTE_HEAD="c69f445a5c69f445a5c69f445a5c69f445a5c69f"
 rc="$(run_sweep)"
 assert "sweep, stale head: exit code" 0 "$rc"
