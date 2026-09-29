@@ -627,11 +627,31 @@ function Get-ParityProvisionWitness {
 
     $count = {
         param([string]$Dir, [string]$Filter, [bool]$Recurse)
-        if (-not (Test-Path -LiteralPath $Dir)) { return 0 }
         try {
+            # A path this harness did not build itself can carry Rust's VERBATIM
+            # prefix: `std::fs::canonicalize` returns `\\?\C:\...` on Windows,
+            # and `provisioned_into` comes straight from it. Windows PowerShell
+            # 5.1's FileSystem provider does not interpret that prefix -- it
+            # parses the leading `\\` as UNC -- so `Test-Path` answers $false for
+            # a directory that plainly exists, and this scriptblock would return
+            # 0: "could not look" rendered as "looked and found nothing", which
+            # is the precise conflation this whole file exists to prevent. Two
+            # fabricated `row_claims_units_but_directory_is_empty` findings per
+            # leg, on every Windows run, about the instrument itself.
+            if     ($Dir -like '\\?\UNC\*') { $Dir = '\\' + $Dir.Substring(8) }
+            elseif ($Dir -like '\\?\*')      { $Dir = $Dir.Substring(4) }
+
+            # Test-Path lives INSIDE the try on purpose. $ErrorActionPreference
+            # is script-scope 'Stop', so a provider that cannot interpret the
+            # path throws a TERMINATING error; outside the try that escapes this
+            # scriptblock entirely, propagates through Get-ParityProvisionWitness
+            # into Get-ManifestOverHttp's catch, and loses the whole leg as a
+            # manifest-read failure.
+            if (-not (Test-Path -LiteralPath $Dir)) { return 0 }
             $items = Get-ChildItem -LiteralPath $Dir -Filter $Filter -File -Recurse:$Recurse -ErrorAction Stop
             return @($items).Count
         } catch {
+            # UNKNOWN, never 0.
             return $null
         }
     }
@@ -808,8 +828,9 @@ if ($NegativeControl) {
 
     $wA = $legA.Witness
     $wB = $legB.Witness
-    Write-Host ("  leg A witness: commands={0} skills={1} agents={2}" -f $wA.commands, $wA.skills, $wA.agents)
-    Write-Host ("  leg B witness: commands={0} skills={1} agents={2}" -f $wB.commands, $wB.skills, $wB.agents)
+    $shown = { param($v) if ($null -eq $v) { 'unknown' } else { "$v" } }
+    Write-Host ("  leg A witness: commands={0} skills={1} agents={2}" -f (& $shown $wA.commands), (& $shown $wA.skills), (& $shown $wA.agents))
+    Write-Host ("  leg B witness: commands={0} skills={1} agents={2}" -f (& $shown $wB.commands), (& $shown $wB.skills), (& $shown $wB.agents))
     Write-Host ("  slash_commands_status across the two legs: {0}" -f (Get-ParitySlashCommandsStatus -DevWitness $wA -PublishedWitness $wB))
     Write-Host ""
 

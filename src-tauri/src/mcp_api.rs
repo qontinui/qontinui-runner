@@ -1004,7 +1004,8 @@ async fn capability_manifest_provision_probe(
         Err(e) => {
             return refuse(format!(
                 "workdir {requested:?} could not be resolved: {e}. \
-                 Create the scratch dir first; the probe never creates its own target."
+                 Create the scratch directory first; the probe resolves it, it does not \
+                 create it — it creates only its own subdirectory inside it."
             ))
         }
     };
@@ -1034,10 +1035,19 @@ async fn capability_manifest_provision_probe(
             // direction is deliberately absent: on Windows the harness's own
             // scratch dir lives under %USERPROFILE%\AppData\Local\Temp.
             if path == home || home.starts_with(&path) {
+                // NOTE on the reason, which changed under this guard's feet: it was
+                // written when the probe wrote `<workdir>/.claude/agents` directly, so
+                // pointing it at `$HOME` would have overwritten the operator's own
+                // definitions. The probe now writes only inside a directory it creates,
+                // so that can no longer happen and this guard is belt-and-braces. It
+                // stays for the reason below — a probe has no business littering a home
+                // directory — and must NOT be deleted on discovering the old rationale
+                // is stale.
                 return refuse(format!(
                     "workdir {requested:?} resolves to {workdir:?}, which is the home directory \
-                     {home:?} or an ancestor of it. Provisioning there would overwrite the \
-                     user-scoped ~/.claude/agents definitions. Point it at a scratch directory."
+                     {home:?} or an ancestor of it. The probe creates directories where it is \
+                     pointed and has no business doing that in a home directory. Point it at a \
+                     scratch directory."
                 ));
             }
         }
@@ -1074,6 +1084,28 @@ async fn capability_manifest_provision_probe(
              continue."
         ));
     }
+    // RESIDUAL, stated precisely so it is not over-trusted: the caller cannot
+    // PREDICT this name, but it can OBSERVE it (it owns `workdir` and can watch
+    // it with inotify / ReadDirectoryChangesW). Between the `create_dir` above
+    // and the provisioning below, a local caller could remove the directory and
+    // put a symlink in its place. Re-resolving here and requiring the result to
+    // stay under the vetted workdir closes that window to the point where the
+    // swap must beat this call, and turns a successful swap into a refusal
+    // rather than a write-through.
+    let target = match std::fs::canonicalize(&target) {
+        Ok(t) if t.starts_with(&path) => t,
+        Ok(t) => {
+            return refuse(format!(
+                "the probe's own target directory resolved to {t:?}, outside the vetted \
+                 workdir {workdir:?}. Refusing rather than writing through it."
+            ))
+        }
+        Err(e) => {
+            return refuse(format!(
+                "could not resolve the probe's own target directory under {workdir:?}: {e}"
+            ))
+        }
+    };
     let provisioned_into = target.display().to_string();
 
     let workdir_for_task = provisioned_into.clone();
@@ -20219,7 +20251,8 @@ mod provision_probe_tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_symlink_into_a_git_work_tree_is_refused() {
-        let root = std::env::temp_dir().join(format!("parity-probe-symlink-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("parity-probe-symlink-{}", std::process::id()));
         let repo = root.join("repo");
         let inside = repo.join("sub");
         std::fs::create_dir_all(&inside).expect("create repo/sub");
@@ -20272,6 +20305,12 @@ mod provision_probe_tests {
         let canary = repo_claude.join("agents").join("merge-specialist.md");
         std::fs::write(&canary, b"HAND-AUTHORED\n").expect("write canary");
 
+        // Compare against the CANONICAL paths: the handler canonicalizes, and on
+        // macOS `std::env::temp_dir()` is /var/folders/... which resolves to
+        // /private/var/folders/... The sibling test below already learned this.
+        let scratch_c = std::fs::canonicalize(&scratch).unwrap_or_else(|_| scratch.clone());
+        let repo_c = std::fs::canonicalize(&repo).unwrap_or_else(|_| repo.clone());
+
         let (status, body) = probe(&scratch.display().to_string()).await;
 
         // The call may succeed -- the scratch dir IS outside any work tree. What
@@ -20283,13 +20322,15 @@ mod provision_probe_tests {
         );
         if status == axum::http::StatusCode::OK {
             let parsed: serde_json::Value = serde_json::from_str(&body).expect("json");
-            let into = parsed["provisioned_into"].as_str().expect("provisioned_into");
+            let into = parsed["provisioned_into"]
+                .as_str()
+                .expect("provisioned_into");
             assert!(
-                std::path::Path::new(into).starts_with(&scratch),
+                std::path::Path::new(into).starts_with(&scratch_c),
                 "provisioning must land inside the caller's own scratch dir, not {into}"
             );
             assert!(
-                !std::path::Path::new(into).starts_with(&repo),
+                !std::path::Path::new(into).starts_with(&repo_c),
                 "and never inside the repository"
             );
         }
@@ -20319,7 +20360,17 @@ mod provision_probe_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_absent_workdir_field_is_a_typed_refusal() {
         let resp = capability_manifest_provision_probe(Json(
-            serde_json::from_str::<ProvisionProbeBody>("{}").expect("an absent workdir deserializes"),
+            serde_json::from_str::<ProvisionProbeBody>("{}")
+                .expect("an absent workdir deserializes"),
+        ))
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+
+        // An EXPLICIT null is the other half of the claim, and it is a different
+        // serde path: `#[serde(default)]` alone covers only a missing field.
+        let resp = capability_manifest_provision_probe(Json(
+            serde_json::from_str::<ProvisionProbeBody>(r#"{"workdir": null}"#)
+                .expect("an explicit null deserializes"),
         ))
         .await;
         assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
@@ -20352,7 +20403,9 @@ mod provision_probe_tests {
         );
         // The probe never writes into the caller's directory itself.
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("json");
-        let into = parsed["provisioned_into"].as_str().expect("provisioned_into");
+        let into = parsed["provisioned_into"]
+            .as_str()
+            .expect("provisioned_into");
         assert_ne!(
             std::path::Path::new(into),
             canonical.as_path(),

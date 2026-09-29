@@ -253,7 +253,11 @@ jobs:
               fail=1
             fi
           }
-          check src-tauri/src/mcp_api.rs            "\"${route}\"," "axum route registration"
+          # The route is registered across several lines, so pin the HANDLER
+          # binding rather than a `.route("...")` one-liner that does not exist:
+          # a doc comment can repeat the path, but not this.
+          check src-tauri/src/mcp_api.rs            "post(capability_manifest_provision_probe)" "axum handler registration"
+          check src-tauri/src/mcp_api.rs            "\"${route}\"," "axum route path"
           check src-tauri/src/mcp/origin_guard.rs   "\"POST ${route}\"," "credential-door entry"
           check scripts/published-parity.ps1        "\$base${route}\"" "harness request URL"
           exit $fail
@@ -1004,7 +1008,11 @@ jobs:
               fail=1
             fi
           }
-          check src-tauri/src/mcp_api.rs            "\"${route}\"," "axum route registration"
+          # The route is registered across several lines, so pin the HANDLER
+          # binding rather than a `.route("...")` one-liner that does not exist:
+          # a doc comment can repeat the path, but not this.
+          check src-tauri/src/mcp_api.rs            "post(capability_manifest_provision_probe)" "axum handler registration"
+          check src-tauri/src/mcp_api.rs            "\"${route}\"," "axum route path"
           check src-tauri/src/mcp/origin_guard.rs   "\"POST ${route}\"," "credential-door entry"
           check scripts/published-parity.ps1        "\$base${route}\"" "harness request URL"
           exit $fail
@@ -1178,10 +1186,12 @@ jobs:
       # CODE -- the value the control itself sets, which a truncated or missing
       # log cannot forge:
       #
-      #   1  the control ran and the instrument is BLIND             -> RED
-      #   0  the control ran and the instrument sees the class       -> green
-      #   2  the control could not run (no dev exe, boot failed)     -> green + warning
-      #   empty (the step was cancelled, timed out, or never ran)    -> green + warning
+      #   1    the control ran and the instrument is BLIND           -> RED
+      #   0    the control ran and the instrument sees the class     -> green
+      #   2    the control could not run (no dev exe, boot failed)   -> green + warning
+      #   124  the inner wrapper's own timeout fired (-TimeoutSec)   -> green + warning
+      #   ""   cancelled, killed at the STEP bound, or never ran     -> green + warning
+      #   *    any other code, reported AS that code                 -> green + warning
       #
       # "Could not look" is never "blind" -- resolving an unknown into a red here
       # would reproduce the #1511 shape this file already paid four days for.
@@ -1216,8 +1226,21 @@ jobs:
               echo "::warning::The negative control could not run (exit 2) -- no dev exe, or a leg failed to boot. That is UNKNOWN, not a pass and not a failure; read the uploaded log."
               exit 0
               ;;
+            124)
+              # invoke-ps51-detached.ps1 returns 124 on ITS OWN timeout, which is
+              # the whole reason that wrapper exists. With -TimeoutSec 1500 inside
+              # a 30-minute step, the inner bound fires first, so 124 is EXPECTED
+              # on a slow box -- not an unexplained code, and emphatically not
+              # "blind".
+              echo "::warning::The negative control TIMED OUT (exit 124 from invoke-ps51-detached at -TimeoutSec 1500). UNKNOWN, not blind -- read the uploaded log for the survivor census."
+              exit 0
+              ;;
+            "")
+              echo "::warning::The negative control produced no exit code at all (step outcome '${OUTCOME:-none}', log marker '${marker}') -- it was cancelled, timed out at the STEP bound, or never ran. UNKNOWN -- read the uploaded log."
+              exit 0
+              ;;
             *)
-              echo "::warning::The negative control produced no exit code (step outcome '${OUTCOME:-none}', log marker '${marker}'). UNKNOWN -- read the uploaded log."
+              echo "::warning::The negative control exited with an unexpected code '${CODE}' (step outcome '${OUTCOME:-none}', log marker '${marker}'). UNKNOWN, not blind -- read the uploaded log."
               exit 0
               ;;
           esac
