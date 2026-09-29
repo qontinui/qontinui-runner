@@ -15723,7 +15723,9 @@ mod coord_mcp_body_gate_tests {
             "the operator escalate override must stay withheld; agents clear escalate \
              blocks through coord_submit_escalate_evidence"
         );
-        assert!(coord_mcp_withholding_is_deliberate("coord_attest_escalate_override"));
+        assert!(coord_mcp_withholding_is_deliberate(
+            "coord_attest_escalate_override"
+        ));
     }
 
     /// Non-allowlisted tools are refused with the request's id echoed —
