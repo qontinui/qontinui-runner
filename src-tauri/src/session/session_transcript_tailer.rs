@@ -69,30 +69,47 @@
 //! ### File marks
 //!
 //! Replay and live tailing must never emit the same file bytes twice or out of
-//! order, so every emit goes through [`SessionTranscriptTailer::emit_file_range`]
-//! under a PER-SESSION lock, and advances a durable FILE MARK: the byte offset
-//! in the JSONL through which the file has been handed to the emitter. A
-//! watcher batch that overlaps the mark (a replay read the same lines first)
-//! is trimmed to its unseen suffix; one wholly below it is dropped. The marks
-//! persist in a sidecar beside the outbox (the emitter's own
+//! order, so every emit goes through one path (`emit_range`) under a
+//! PER-SESSION lock and advances a durable FILE MARK: the byte offset in the
+//! JSONL through which the file has been handed to the emitter. Marks are keyed
+//! on `(session, path)` and persisted beside the outbox (the emitter's own
 //! [`TranscriptOffsetLog`] type, reused as a durable key → i64 map), so a
-//! re-bind after a runner restart replays only the bytes the previous process
-//! never emitted rather than the whole file again.
+//! re-bind after a runner restart replays only what no process emitted.
 //!
-//! The mark is an at-least-once record: it advances AFTER the emitter reports
-//! its chunks durably queued, so a crash between the two re-sends a batch
-//! rather than skipping one.
+//! - **Overlap.** A watcher batch that overlaps the mark (a replay read the
+//!   same lines first) is trimmed to its unseen suffix; one wholly below it is
+//!   dropped.
+//! - **Gap.** A batch that starts ABOVE the mark (a sniffer-bound resumed
+//!   session whose tail started at EOF, appends dropped while unbound, a
+//!   batch deferred under contention) first has `[mark, batch start)` read
+//!   from the file and emitted, under the same lock, so file order holds and
+//!   the prefix is never skipped. If that fill cannot complete, the batch is
+//!   not emitted either and the mark stays: the next batch or bind retries.
+//! - **Rewrite.** Beside each mark sits a fingerprint of the file's first line.
+//!   A mark is trusted only while the file is at least that long, the byte
+//!   before the mark is a newline, and the first line still hashes the same;
+//!   otherwise the file was rewritten and the mark resets to 0. The watcher's
+//!   `truncated` flag alone does not reset a mark whose fingerprint still
+//!   matches — a replay may already have reset and re-emitted that content.
+//!
+//! **Crash posture — at most once across a crash, never duplicated.** The mark
+//! is reserved (fsynced) BEFORE the emitter queues the bytes, mirroring the
+//! emitter's own write-ahead offset lane, and rolled back on a clean outbox
+//! failure. A crash between the two therefore leaves a hole of at most one
+//! batch rather than re-sending bytes under fresh `chunk_offset`s, which coord
+//! could not dedupe.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Duration;
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::claude_session::coord_register::AiCoordRegistrar;
+use crate::claude_session::coord_register::{AiCoordRegistrar, TranscriptBindRefusal};
 
 use super::transcript_emitter::{TranscriptEmitter, TranscriptOffsetLog};
 
@@ -101,6 +118,13 @@ use super::transcript_emitter::{TranscriptEmitter, TranscriptOffsetLog};
 /// of batches rather than one allocation of the whole file. Batches end on a
 /// line boundary; a single line longer than this is emitted alone.
 const REPLAY_BATCH_BYTES: usize = 1024 * 1024;
+
+/// Longest first line the rewrite fingerprint reads. A longer one yields no
+/// fingerprint, and the mark is then guarded by the length and newline checks.
+const FINGERPRINT_LINE_CAP: u64 = 256 * 1024;
+
+/// How far into a JSONL the ownership check looks for a `cwd` record.
+const OWNERSHIP_SCAN_LINES: usize = 200;
 
 /// How often the coverage summary is logged. Long enough that an idle fleet
 /// costs one line a minute, short enough that a rebuild's recovery window is
@@ -113,19 +137,29 @@ const MAX_REPORTED_UNBOUND: usize = 16;
 
 /// Tails watched Claude Code transcripts into the coord transcript stream.
 /// Managed as Tauri state (`Arc<SessionTranscriptTailer>`) and handed to the
-/// transcript watcher, which calls [`Self::on_appended`] from its per-session
-/// tail loop.
+/// transcript watcher, which feeds it from its per-session tail loop
+/// ([`Self::admit`] then [`Self::try_emit_batch`] / [`Self::emit_batch`]).
 pub struct SessionTranscriptTailer {
     emitter: Arc<TranscriptEmitter>,
     registrar: Arc<AiCoordRegistrar>,
     coverage: Mutex<Coverage>,
-    /// Per-session emit locks. Every emit — a watcher batch or a replay batch
-    /// — holds its session's lock across the mark read, the emit and the mark
-    /// write, which is what keeps the offset lane in FILE order when a replay
-    /// and a live append race. Grows by one entry per distinct session key.
+    /// Per-session emit locks. Every emit — a watcher batch, a gap fill or a
+    /// replay batch — holds its session's lock across the mark read, the emit
+    /// and the mark write, which is what keeps the offset lane in FILE order
+    /// when a replay and a live append race. One entry per session key.
     session_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    /// Durable file marks — see the module header's "File marks".
+    /// Durable file marks and their fingerprints — module header, "File marks".
     marks: TranscriptOffsetLog,
+}
+
+/// What the caller of [`SessionTranscriptTailer::bind_and_replay`] asks for.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BindRequest {
+    /// An existing coord session to adopt — ONLY one the caller has confirmed
+    /// with coord belongs to this Claude session in this tenant.
+    pub adopt: Option<Uuid>,
+    /// The caller's resolved tenant, stamped on a fresh registration.
+    pub tenant: Option<Uuid>,
 }
 
 /// What a successful [`SessionTranscriptTailer::bind_and_replay`] did.
@@ -136,10 +170,15 @@ pub struct BindOutcome {
     /// The key was already bound before this call (by the sniffer, a workflow
     /// registration, or an earlier bind).
     pub already_bound: bool,
+    /// This call bound the key to the requested existing coord session.
+    pub adopted: bool,
     /// File bytes handed to the emitter by this call's replay.
     pub replayed_bytes: u64,
     /// Outbox chunks those bytes became.
     pub replayed_chunks: u64,
+    /// The file offset the replay stopped at when it could not reach the last
+    /// complete line (an outbox refusal, a non-UTF-8 line). `None` = complete.
+    pub replay_stopped_at: Option<u64>,
 }
 
 /// Why [`SessionTranscriptTailer::bind_and_replay`] refused. Typed so the
@@ -153,6 +192,8 @@ pub enum BindRefusal {
     /// The registrar declined to bind (`QONTINUI_SESSION_AUTOMATION_REGISTER`
     /// off, or its `Started` write failed).
     RegistrationDisabled,
+    /// The coord session to adopt is already bound to a different key.
+    CoordSessionInUse,
     /// The JSONL could not be read for the replay. The binding HAS been
     /// written; later appends are tailed.
     Unreadable(String),
@@ -161,9 +202,10 @@ pub enum BindRefusal {
 /// Why [`locate_session_jsonl`] found no file to bind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocateRefusal {
-    /// No Claude config dir was discovered, so the watcher watches nothing.
+    /// The transcript watcher watches no config dir (not started, or no
+    /// `projects/` root existed when it did).
     NoConfigDirs,
-    /// No `<config_dir>/projects/*/<id>.jsonl` exists under any of them.
+    /// No `<config_dir>/projects/*/<id>.jsonl` exists under any watched root.
     NotFound { searched: Vec<String> },
     /// The file carries the runner's workflow-session marker. The watcher
     /// never tails those — the executor is their transcript producer — so
@@ -175,12 +217,14 @@ impl LocateRefusal {
     /// Operator-readable detail for the route's `422` body.
     pub fn detail(&self) -> String {
         match self {
-            Self::NoConfigDirs => "no Claude config dir was discovered on this machine, so the \
-                 transcript watcher watches no JSONL at all"
+            Self::NoConfigDirs => "the transcript watcher is watching no Claude config dir on \
+                 this runner (it is not running, or no config dir had a projects/ root when it \
+                 started), so no JSONL would be tailed after a bind"
                 .to_string(),
             Self::NotFound { searched } => format!(
                 "no <config_dir>/projects/*/<claude_code_session_id>.jsonl exists under any \
-                 discovered config dir ({}); a transcript outside them is not watched",
+                 config dir the transcript watcher watches ({}); a transcript outside them is \
+                 not tailed",
                 searched.join(", ")
             ),
             Self::WorkflowSession { path } => format!(
@@ -191,22 +235,22 @@ impl LocateRefusal {
     }
 }
 
-/// Find the Claude Code JSONL for `claude_code_session_id` under the
-/// discovered config dirs — the same `<config_dir>/projects/<project>/` tree
-/// the transcript watcher watches recursively, so a file found here is one the
-/// watcher tails once bound. Newest by mtime when several projects hold the
-/// id. The id must already be validated as a UUID by the caller: it becomes a
-/// file name.
+/// Find the Claude Code JSONL for `claude_code_session_id` under the config
+/// dirs the transcript watcher ACTUALLY watches
+/// (`transcript_watcher::watched_config_dirs`) — a fresh discovery could name
+/// a dir added since the watcher started, whose file would then never be
+/// tailed. Newest by mtime when several projects hold the id. The id must
+/// already be validated as a UUID by the caller: it becomes a file name.
 pub fn locate_session_jsonl(
-    config_dirs: &[PathBuf],
+    watched_config_dirs: &[PathBuf],
     claude_code_session_id: &str,
 ) -> Result<PathBuf, LocateRefusal> {
-    if config_dirs.is_empty() {
+    if watched_config_dirs.is_empty() {
         return Err(LocateRefusal::NoConfigDirs);
     }
     let file_name = format!("{claude_code_session_id}.jsonl");
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
-    for dir in config_dirs {
+    for dir in watched_config_dirs {
         let Ok(projects) = std::fs::read_dir(dir.join("projects")) else {
             continue;
         };
@@ -226,7 +270,7 @@ pub fn locate_session_jsonl(
     }
     let Some((_, path)) = best else {
         return Err(LocateRefusal::NotFound {
-            searched: config_dirs
+            searched: watched_config_dirs
                 .iter()
                 .map(|d| d.display().to_string())
                 .collect(),
@@ -252,6 +296,102 @@ fn head_is_workflow_session(path: &Path) -> bool {
         .map(|l| l + "\n")
         .collect();
     crate::terminal::transcript::is_workflow_session_marker(&head)
+}
+
+/// Does the Claude Code session in `path` belong to `workdir` — the workdir a
+/// proxy nonce was provisioned into? The ownership half of
+/// `POST /sessions/transcript-bind`'s authorization.
+///
+/// The session's own `cwd` record decides when the file carries one (Claude
+/// Code stamps it on every user/assistant record): it must EQUAL the workdir,
+/// not merely sit under it, so a nonce for a workspace root cannot claim every
+/// session in the worktrees below it. A file with no `cwd` record in its first
+/// [`OWNERSHIP_SCAN_LINES`] falls back to the project directory, which Claude
+/// Code names after the launch cwd.
+pub fn jsonl_belongs_to_workdir(path: &Path, workdir: &str) -> bool {
+    let want = normalize_dir(workdir);
+    if want.is_empty() {
+        return false;
+    }
+    if let Ok(f) = std::fs::File::open(path) {
+        for line in BufReader::new(f.take(4 * 1024 * 1024))
+            .lines()
+            .take(OWNERSHIP_SCAN_LINES)
+            .map_while(Result::ok)
+        {
+            if !line.contains("\"cwd\"") {
+                continue;
+            }
+            if let Some(cwd) = serde_json::from_str::<serde_json::Value>(&line)
+                .ok()
+                .and_then(|v| v.get("cwd").and_then(|c| c.as_str()).map(str::to_string))
+            {
+                return normalize_dir(&cwd) == want;
+            }
+        }
+    }
+    path.parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .is_some_and(|dir| dir == crate::terminal::transcript_watcher::encode_for_lookup(workdir))
+}
+
+/// Separator-, trailing-slash- and (on Windows) case-insensitive directory form.
+fn normalize_dir(dir: &str) -> String {
+    let t = dir.trim().replace('\\', "/");
+    let t = t.trim_end_matches('/');
+    if cfg!(windows) {
+        t.to_ascii_lowercase()
+    } else {
+        t.to_string()
+    }
+}
+
+/// SHA-256 of the file's first complete line, folded to an `i64` so it fits
+/// the mark log. Stable across runner builds (unlike `DefaultHasher`), which
+/// matters because it is persisted. `None` when the first line is incomplete,
+/// longer than [`FINGERPRINT_LINE_CAP`], or unreadable.
+fn first_line_fingerprint(path: &Path) -> Option<i64> {
+    let f = std::fs::File::open(path).ok()?;
+    let mut line = Vec::new();
+    BufReader::new(f.take(FINGERPRINT_LINE_CAP))
+        .read_until(b'\n', &mut line)
+        .ok()?;
+    if line.last() != Some(&b'\n') {
+        return None;
+    }
+    let digest = Sha256::digest(&line);
+    let mut eight = [0u8; 8];
+    eight.copy_from_slice(&digest[..8]);
+    Some(i64::from_le_bytes(eight))
+}
+
+/// Is the byte just before `offset` a newline? (`offset` > 0.)
+fn newline_precedes(path: &Path, offset: u64) -> Option<bool> {
+    let mut f = std::fs::File::open(path).ok()?;
+    f.seek(SeekFrom::Start(offset - 1)).ok()?;
+    let mut b = [0u8; 1];
+    f.read_exact(&mut b).ok()?;
+    Some(b[0] == b'\n')
+}
+
+/// One replay pass over `[from, until)`.
+#[derive(Debug, Default)]
+struct ReplayPass {
+    bytes: u64,
+    chunks: u64,
+    stopped_at: Option<u64>,
+}
+
+/// The mark key: session AND path, so a moved or re-created transcript for the
+/// same session never inherits another file's offset.
+fn mark_key(session_key: &str, path: &Path) -> String {
+    format!("{session_key}\u{1f}{}", path.display())
+}
+
+/// The key the first-line fingerprint for mark `mk` is stored under.
+fn fingerprint_key(mk: &str) -> String {
+    format!("fp\u{1f}{mk}")
 }
 
 /// Mutable coverage state. Session-id sets rather than counters, because the
@@ -311,28 +451,27 @@ impl SessionTranscriptTailer {
     }
 
     /// Feed one batch of newly-appended transcript bytes for `session_key`
-    /// (the JSONL stem — the pane's `claude_code_session_id`).
-    ///
-    /// Called from the watcher's tail loop once per wake with every
-    /// fully-terminated line it just consumed, NOT once per line: one call is
-    /// one outbox batch and one offset reservation, so batching here is what
-    /// keeps the fsync rate at the wake rate rather than the line rate.
-    ///
-    /// Never fails and never blocks the watcher — the emitter swallows its own
-    /// I/O errors by contract.
+    /// (the JSONL stem — the pane's `claude_code_session_id`), BLOCKING on the
+    /// session lock. The watcher does not call this from its async loop — it
+    /// uses [`Self::admit`] + [`Self::try_emit_batch`] and falls back to
+    /// [`Self::emit_batch`] on a blocking thread; this is the one-call form
+    /// for synchronous callers and tests.
     ///
     /// `file_start` is the JSONL byte offset `appended` begins at, and
     /// `truncated` says the watcher saw the file shrink and restarted its
     /// cursor at 0 before this read — together they place the batch against
     /// the session's file mark (module header, "File marks").
-    pub fn on_appended(&self, session_key: &str, file_start: u64, appended: &str, truncated: bool) {
-        // Gate 1 (`Settings.cloud_sync_enabled`) is resolved here rather than
-        // inside the emitter because the coverage summary needs its value —
-        // "off" and "on but reaching nobody" are different diagnoses. The
-        // gated body then calls `emit_inner`, which by contract does NOT
-        // re-check it.
+    pub fn on_appended(
+        &self,
+        session_key: &str,
+        path: &Path,
+        file_start: u64,
+        appended: &str,
+        truncated: bool,
+    ) {
         self.on_appended_gated(
             session_key,
+            path,
             file_start,
             appended,
             truncated,
@@ -346,32 +485,35 @@ impl SessionTranscriptTailer {
     pub(crate) fn on_appended_gated(
         &self,
         session_key: &str,
+        path: &Path,
         file_start: u64,
         appended: &str,
         truncated: bool,
         cloud_sync_enabled: bool,
     ) {
-        if appended.is_empty() {
-            return;
+        if self.admit(session_key, appended.len(), cloud_sync_enabled) {
+            self.emit_batch(session_key, path, file_start, appended, truncated);
         }
+    }
 
-        if truncated && self.file_mark(session_key).is_some() {
-            // The file was rewritten under the same name: its bytes restart at
-            // 0, so a mark describing the OLD content would swallow the new.
-            // Reset whether or not the session is bound or synced right now —
-            // the mark must describe this file when it next matters.
-            let lock = self.session_lock(session_key);
-            let _held = lock
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            self.marks.set(session_key, file_start as i64);
+    /// Gate 1 and the binding, with the coverage bookkeeping. `true` = this
+    /// batch should be emitted (then call [`Self::try_emit_batch`] or
+    /// [`Self::emit_batch`]); `false` = drop it. Never blocks on a session
+    /// lock.
+    ///
+    /// Gate 1 (`Settings.cloud_sync_enabled`) is resolved by the caller rather
+    /// than inside the emitter because the coverage summary needs its value —
+    /// "off" and "on but reaching nobody" are different diagnoses. The emit
+    /// path then calls `emit_inner`, which by contract does NOT re-check it.
+    pub fn admit(&self, session_key: &str, len: usize, cloud_sync_enabled: bool) -> bool {
+        if len == 0 {
+            return false;
         }
-
         if !cloud_sync_enabled {
             let mut cov = self.lock_coverage();
             cov.cloud_sync_enabled = Some(false);
             cov.appends_skipped_gate_off += 1;
-            return;
+            return false;
         }
 
         // Resolve the binding HERE as well as inside the emitter. The
@@ -386,26 +528,84 @@ impl SessionTranscriptTailer {
             cov.tailed.insert(session_key.to_string());
             cov.unbound.remove(session_key);
             cov.appends_emitted += 1;
-            cov.bytes_emitted += appended.len() as u64;
+            cov.bytes_emitted += len as u64;
         } else {
             cov.unbound.insert(session_key.to_string());
             cov.appends_skipped_unbound += 1;
         }
-        drop(cov);
+        bound
+    }
 
-        if !bound {
-            // Emitting would be a no-op with a silent skip; returning here
-            // keeps the redaction pass off the hot path for a pane that has
-            // nowhere to send bytes.
-            return;
+    /// The NON-BLOCKING emit the watcher's async loop tries first. Emits and
+    /// returns `true` only on the common case: the session lock is free, the
+    /// watcher did not report a truncation, and the batch starts exactly at
+    /// the mark (no overlap to trim, no gap to fill, nothing to re-validate).
+    /// Anything else returns `false` having done NOTHING, and the caller runs
+    /// [`Self::emit_batch`] on a blocking thread — so a long replay holding
+    /// the lock, or a gap fill reading megabytes, never stalls a runtime
+    /// worker, and no batch is ever dropped for contention.
+    pub fn try_emit_batch(
+        &self,
+        session_key: &str,
+        path: &Path,
+        file_start: u64,
+        appended: &str,
+        truncated: bool,
+    ) -> bool {
+        if truncated {
+            return false;
         }
+        let lock = self.session_lock(session_key);
+        let _held = match lock.try_lock() {
+            Ok(g) => g,
+            Err(TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(TryLockError::WouldBlock) => return false,
+        };
+        let mk = mark_key(session_key, path);
+        if self.current_mark(&mk) != file_start {
+            return false;
+        }
+        let _ = self.emit_range(session_key, &mk, path, file_start, appended);
+        true
+    }
 
-        // Gate 1 is already satisfied above — see `emit_inner`'s contract.
+    /// The full, BLOCKING emit of one watcher batch: validate the mark
+    /// against the file (rewrite detection), fill any gap below the batch from
+    /// the file, then emit the batch's unseen part — all under the session
+    /// lock. Synchronous file I/O; call it from a blocking context.
+    pub fn emit_batch(
+        &self,
+        session_key: &str,
+        path: &Path,
+        file_start: u64,
+        appended: &str,
+        truncated: bool,
+    ) {
         let lock = self.session_lock(session_key);
         let _held = lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.emit_file_range(session_key, file_start, appended);
+        let mk = mark_key(session_key, path);
+        let mark = self.validated_mark(&mk, path, truncated);
+        if file_start > mark {
+            // Gap: the bytes below this batch were never emitted. Emit them
+            // first, from the file, so the lane stays in file order.
+            match self.replay_locked(session_key, &mk, path, mark, Some(file_start)) {
+                Ok(pass) if pass.stopped_at.is_none() => {}
+                other => {
+                    tracing::warn!(
+                        session_key,
+                        mark,
+                        file_start,
+                        outcome = ?other,
+                        "session_transcript_tailer: could not fill the gap below a batch — \
+                         batch held back (mark unchanged; the next batch or a bind retries)"
+                    );
+                    return;
+                }
+            }
+        }
+        let _ = self.emit_range(session_key, &mk, path, file_start, appended);
     }
 
     /// The per-session emit lock for `session_key`.
@@ -418,56 +618,102 @@ impl SessionTranscriptTailer {
             .clone()
     }
 
-    /// The session's file mark, `None` before anything was emitted for it.
-    fn file_mark(&self, session_key: &str) -> Option<u64> {
+    /// The mark as recorded, `0` when none.
+    fn current_mark(&self, mk: &str) -> u64 {
         self.marks
-            .get(session_key)
+            .get(mk)
             .map(|m| u64::try_from(m).unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    /// The mark, trusted only if it still describes THIS file — module
+    /// header, "Rewrite". A rewritten file resets the mark to 0.
+    fn validated_mark(&self, mk: &str, path: &Path, truncated: bool) -> u64 {
+        let mark = self.current_mark(mk);
+        if mark == 0 {
+            return 0;
+        }
+        let Ok(len) = std::fs::metadata(path).map(|m| m.len()) else {
+            return mark; // unreadable now; the emit/replay reports it
+        };
+        let stored = self.marks.get(&fingerprint_key(mk));
+        let now = first_line_fingerprint(path);
+        let reason = if len < mark {
+            Some("file shorter than the mark")
+        } else if newline_precedes(path, mark) == Some(false) {
+            Some("mark is not on a line boundary")
+        } else if matches!((stored, now), (Some(s), Some(n)) if s != n) {
+            Some("first line changed")
+        } else if truncated && (stored.is_none() || now.is_none()) {
+            // No fingerprint to overrule the watcher's own truncation report.
+            Some("watcher reported truncation and no fingerprint is available")
+        } else {
+            None
+        };
+        match reason {
+            Some(reason) => {
+                tracing::info!(
+                    mark,
+                    len,
+                    reason,
+                    "session_transcript_tailer: transcript was rewritten — file mark reset to 0"
+                );
+                self.marks.set(mk, 0);
+                0
+            }
+            None => mark,
+        }
     }
 
     /// Hand the file range `[file_start, file_start + text.len())` to the
-    /// emitter, minus whatever the file mark says is already emitted, and
-    /// advance the mark. THE one emit path for both live appends and replay.
+    /// emitter, minus whatever the mark says is already emitted. THE one emit
+    /// path for live batches, gap fills and replay. The caller holds the
+    /// session lock and has already filled any gap, so the range never starts
+    /// above the mark.
     ///
-    /// **The caller holds `session_key`'s lock** ([`Self::session_lock`]).
-    /// Returns `(file bytes emitted, outbox chunks queued)`.
-    ///
-    /// A range starting ABOVE the mark (a gap: appends dropped while unbound
-    /// in an earlier process, or before an upgrade that introduced marks) is
-    /// emitted as it stands and the gap is left — filling it here would put
-    /// its bytes AFTER the ones just emitted, out of file order.
-    fn emit_file_range(&self, session_key: &str, file_start: u64, text: &str) -> (u64, u64) {
+    /// The mark is reserved BEFORE the emit and rolled back if nothing was
+    /// queued (module header, "Crash posture"). Returns `(file bytes emitted,
+    /// chunks queued)`, or `None` when the emitter queued nothing.
+    fn emit_range(
+        &self,
+        session_key: &str,
+        mk: &str,
+        path: &Path,
+        file_start: u64,
+        text: &str,
+    ) -> Option<(u64, u64)> {
+        let mark = self.current_mark(mk);
         let file_end = file_start + text.len() as u64;
-        let from = match self.file_mark(session_key) {
-            Some(mark) if mark > file_start => mark,
-            _ => file_start,
-        };
+        let from = mark.max(file_start);
         if from >= file_end {
-            return (0, 0); // wholly emitted already (a replay got there first)
+            return Some((0, 0)); // wholly emitted already
         }
         let skip = usize::try_from(from - file_start).unwrap_or(usize::MAX);
         let Some(unseen) = text.get(skip..) else {
-            // Marks sit on the line boundaries the watcher and the replay both
-            // cut at, so this is a mark from DIFFERENT content. Emitting the
-            // whole text would duplicate, trimming mid-character is impossible;
-            // drop the batch loudly rather than guess.
+            // `validated_mark` keeps marks on line boundaries, which are
+            // character boundaries; reaching here means the batch itself is
+            // not what the file holds. Emit nothing rather than guess.
             tracing::warn!(
                 session_key,
                 file_start,
-                mark = from,
-                "session_transcript_tailer: file mark is not on a character boundary of \
-                 this batch — batch skipped; a re-bind replays from the mark"
+                mark,
+                "session_transcript_tailer: mark falls inside a character of this batch — skipped"
             );
-            return (0, 0);
+            return Some((0, 0));
         };
+        if mark == 0 {
+            if let Some(fp) = first_line_fingerprint(path) {
+                self.marks.set(&fingerprint_key(mk), fp);
+            }
+        }
+        // Write-ahead reservation.
+        self.marks.set(mk, file_end as i64);
         let chunks = self.emitter.emit_inner(session_key, unseen);
         if chunks == 0 {
-            // Nothing queued (no binding, or a clean outbox failure): the mark
-            // stays, so a later replay can still carry these bytes.
-            return (0, 0);
+            self.marks.set(mk, mark as i64);
+            return None;
         }
-        self.marks.set(session_key, file_end as i64);
-        (file_end - from, chunks as u64)
+        Some((file_end - from, chunks as u64))
     }
 
     /// Bind `session_key` (a Claude Code session id, the JSONL stem) into the
@@ -480,12 +726,15 @@ impl SessionTranscriptTailer {
     /// takes, so the lane stays in file order. The replay covers whole lines
     /// only, exactly as the watcher reads them.
     ///
+    /// A key the registrar ALREADY maps is never re-registered: its existing
+    /// coord session is returned (`already_bound`), whatever `req.adopt` says.
+    ///
     /// Synchronous file I/O; call it from a blocking context.
     pub fn bind_and_replay(
         &self,
         session_key: &str,
         path: &Path,
-        coord_session_id: Option<Uuid>,
+        req: BindRequest,
         cloud_sync_enabled: bool,
     ) -> Result<BindOutcome, BindRefusal> {
         if !cloud_sync_enabled {
@@ -498,12 +747,20 @@ impl SessionTranscriptTailer {
 
         let existing = self.registrar.session_id_for(session_key);
         let already_bound = existing.is_some();
-        let coord_session_id = match existing {
-            Some(id) => id,
-            None => self
-                .registrar
-                .bind_transcript_session(session_key, coord_session_id)
-                .ok_or(BindRefusal::RegistrationDisabled)?,
+        let (coord_session_id, adopted) = match existing {
+            Some(id) => (id, false),
+            None => {
+                let id = self
+                    .registrar
+                    .bind_transcript_session(session_key, req.adopt, req.tenant)
+                    .map_err(|e| match e {
+                        TranscriptBindRefusal::RegistrationDisabled => {
+                            BindRefusal::RegistrationDisabled
+                        }
+                        TranscriptBindRefusal::CoordSessionInUse => BindRefusal::CoordSessionInUse,
+                    })?;
+                (id, req.adopt == Some(id))
+            }
         };
         {
             let mut cov = self.lock_coverage();
@@ -511,53 +768,67 @@ impl SessionTranscriptTailer {
             cov.tailed.insert(session_key.to_string());
         }
 
-        let (replayed_bytes, replayed_chunks) = self.replay_locked(session_key, path)?;
+        let mk = mark_key(session_key, path);
+        let mark = self.validated_mark(&mk, path, false);
+        let pass = self
+            .replay_locked(session_key, &mk, path, mark, None)
+            .map_err(|e| BindRefusal::Unreadable(format!("{}: {e}", path.display())))?;
         tracing::info!(
             session_key,
             coord_session = %coord_session_id,
             already_bound,
-            replayed_bytes,
-            replayed_chunks,
+            adopted,
+            replayed_bytes = pass.bytes,
+            replayed_chunks = pass.chunks,
+            replay_stopped_at = ?pass.stopped_at,
             path = %path.display(),
             "session_transcript_tailer: transcript bound on request"
         );
         Ok(BindOutcome {
             coord_session_id,
             already_bound,
-            replayed_bytes,
-            replayed_chunks,
+            adopted,
+            replayed_bytes: pass.bytes,
+            replayed_chunks: pass.chunks,
+            replay_stopped_at: pass.stopped_at,
         })
     }
 
-    /// Read `path` from the file mark to its last complete line and feed it
-    /// through [`Self::emit_file_range`] in bounded batches. Caller holds the
-    /// session lock.
-    fn replay_locked(&self, session_key: &str, path: &Path) -> Result<(u64, u64), BindRefusal> {
-        let unreadable =
-            |e: std::io::Error| BindRefusal::Unreadable(format!("{}: {e}", path.display()));
-        let mut file = std::fs::File::open(path).map_err(unreadable)?;
-        let len = file.metadata().map_err(unreadable)?.len();
-        let mut pos = match self.file_mark(session_key) {
-            // A mark past the end: the file was rewritten since. Its content is
-            // new, so it is replayed from the start (the truncation rule the
-            // watcher applies).
-            Some(mark) if mark > len => {
-                self.marks.set(session_key, 0);
-                0
+    /// Read `path` over `[from, until)` — `until = None` meaning "through the
+    /// last complete line" — and feed it through [`Self::emit_range`] in
+    /// bounded, line-aligned batches. Caller holds the session lock.
+    ///
+    /// `stopped_at` is set when the pass could not cover its range: the
+    /// emitter queued nothing (the batch's start), a non-UTF-8 line, or — for a
+    /// bounded gap fill — the file not holding complete lines up to `until`.
+    fn replay_locked(
+        &self,
+        session_key: &str,
+        mk: &str,
+        path: &Path,
+        from: u64,
+        until: Option<u64>,
+    ) -> std::io::Result<ReplayPass> {
+        let mut file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len();
+        let end = until.unwrap_or(len).min(len);
+        let mut pass = ReplayPass::default();
+        if from >= end {
+            if until.is_some_and(|u| from < u) {
+                pass.stopped_at = Some(from);
             }
-            Some(mark) => mark,
-            None => 0,
-        };
-        file.seek(SeekFrom::Start(pos)).map_err(unreadable)?;
-        let mut reader = BufReader::new(file.take(len - pos));
+            return Ok(pass);
+        }
+        file.seek(SeekFrom::Start(from))?;
+        let mut reader = BufReader::new(file.take(end - from));
 
-        let (mut bytes, mut chunks) = (0u64, 0u64);
+        let mut pos = from;
         let mut batch = String::new();
         let mut batch_start = pos;
         let mut line = Vec::new();
         loop {
             line.clear();
-            let n = reader.read_until(b'\n', &mut line).map_err(unreadable)?;
+            let n = reader.read_until(b'\n', &mut line)?;
             // EOF, or an unterminated tail the writer has not finished: the
             // watcher delivers that line once its newline lands.
             let complete = n > 0 && line.last() == Some(&b'\n');
@@ -577,17 +848,22 @@ impl SessionTranscriptTailer {
                     offset = pos,
                     "session_transcript_tailer: replay stopped at a non-UTF-8 line"
                 );
+                pass.stopped_at = Some(pos);
             }
             let stop = text.is_none();
             if !batch.is_empty() && (stop || batch.len() >= REPLAY_BATCH_BYTES) {
-                let (b, c) = self.emit_file_range(session_key, batch_start, &batch);
-                if c == 0 && self.file_mark(session_key).unwrap_or(0) < pos {
-                    // Nothing queued and the mark did not cover it: the outbox
-                    // refused. Stop rather than skip ahead of a hole.
-                    break;
+                match self.emit_range(session_key, mk, path, batch_start, &batch) {
+                    Some((b, c)) => {
+                        pass.bytes += b;
+                        pass.chunks += c;
+                    }
+                    None => {
+                        // Nothing queued: stop BEFORE this batch rather than
+                        // skip ahead of a hole.
+                        pass.stopped_at = Some(batch_start);
+                        return Ok(pass);
+                    }
                 }
-                bytes += b;
-                chunks += c;
                 batch.clear();
                 batch_start = pos;
             }
@@ -595,7 +871,10 @@ impl SessionTranscriptTailer {
                 break;
             }
         }
-        Ok((bytes, chunks))
+        if pass.stopped_at.is_none() && until.is_some_and(|u| pos < u) {
+            pass.stopped_at = Some(pos);
+        }
+        Ok(pass)
     }
 
     /// Current coverage. Cheap; safe to call from a command handler.
@@ -706,6 +985,10 @@ mod tests {
     use tempfile::tempdir;
     use uuid::Uuid;
 
+    /// A transcript path that does not exist — for the cases that exercise
+    /// gating and binding but never need the file.
+    const NO_FILE: &str = "/nonexistent/qontinui-tailer-test/none.jsonl";
+
     /// Build a tailer over a tempdir outbox, mirroring production wiring
     /// (registrar and emitter share the SAME outbox `Arc`, and the emitter
     /// derives its durable offset sidecar from that outbox's path).
@@ -796,7 +1079,14 @@ mod tests {
         let (t, registrar, outbox) = tailer(dir.path());
         let csid = Uuid::new_v4().to_string();
 
-        t.on_appended_gated(&csid, 0, "{\"type\":\"user\"}\n", false, true);
+        t.on_appended_gated(
+            &csid,
+            NO_FILE.as_ref(),
+            0,
+            "{\"type\":\"user\"}\n",
+            false,
+            true,
+        );
         let r = t.coverage();
         assert_eq!(r.sessions_unbound, 1, "unbound pane is visible");
         assert_eq!(r.unbound_session_ids, vec![csid.clone()]);
@@ -808,7 +1098,14 @@ mod tests {
         );
 
         sniff_register(&registrar, &csid);
-        t.on_appended_gated(&csid, 16, "{\"type\":\"assistant\"}\n", false, true);
+        t.on_appended_gated(
+            &csid,
+            NO_FILE.as_ref(),
+            16,
+            "{\"type\":\"assistant\"}\n",
+            false,
+            true,
+        );
         let r = t.coverage();
         assert_eq!(r.sessions_unbound, 0, "binding clears the coverage hole");
         assert_eq!(r.sessions_tailed, 1);
@@ -825,7 +1122,14 @@ mod tests {
         let csid = Uuid::new_v4().to_string();
         sniff_register(&registrar, &csid);
 
-        t.on_appended_gated(&csid, 0, "should not leave the machine", false, false);
+        t.on_appended_gated(
+            &csid,
+            NO_FILE.as_ref(),
+            0,
+            "should not leave the machine",
+            false,
+            false,
+        );
 
         assert!(transcript_offsets(&outbox).is_empty());
         let r = t.coverage();
@@ -845,8 +1149,8 @@ mod tests {
         let csid = Uuid::new_v4().to_string();
         sniff_register(&registrar, &csid);
 
-        t.on_appended_gated(&csid, 0, "aaaa", false, true);
-        t.on_appended_gated(&csid, 4, "bb", false, true);
+        t.on_appended_gated(&csid, NO_FILE.as_ref(), 0, "aaaa", false, true);
+        t.on_appended_gated(&csid, NO_FILE.as_ref(), 4, "bb", false, true);
 
         assert_eq!(transcript_offsets(&outbox), vec![0, 4]);
         let r = t.coverage();
@@ -870,7 +1174,7 @@ mod tests {
         let first_coord_id = {
             let (t, registrar, outbox) = tailer(dir.path());
             let sid = sniff_register(&registrar, &csid);
-            t.on_appended_gated(&csid, 0, "0123456789", false, true);
+            t.on_appended_gated(&csid, NO_FILE.as_ref(), 0, "0123456789", false, true);
             assert_eq!(transcript_offsets(&outbox), vec![0]);
             sid
         };
@@ -883,7 +1187,7 @@ mod tests {
             "the registrar mints a fresh coord session id per process — which is \
              exactly why the lane cannot be keyed on it"
         );
-        t2.on_appended_gated(&csid, 10, "abcde", false, true);
+        t2.on_appended_gated(&csid, NO_FILE.as_ref(), 10, "abcde", false, true);
 
         // The post-restart chunk continues the lane at 10, NOT at 0. At 0 it
         // would collide with the pre-restart chunk under any read that joins
@@ -945,7 +1249,7 @@ mod tests {
     /// reason `sniff_register` retries).
     fn bind(t: &SessionTranscriptTailer, csid: &str, path: &Path) -> BindOutcome {
         for _ in 0..200 {
-            match t.bind_and_replay(csid, path, None, true) {
+            match t.bind_and_replay(csid, path, BindRequest::default(), true) {
                 Ok(o) => return o,
                 Err(BindRefusal::RegistrationDisabled) => {
                     std::thread::sleep(Duration::from_millis(10))
@@ -1040,7 +1344,7 @@ mod tests {
         let path = jsonl(dir.path(), &csid, &format!("{l1}{l2}"));
 
         // Pre-bind: the watcher read l1 and dropped it (unbound).
-        t.on_appended_gated(&csid, 0, l1, false, true);
+        t.on_appended_gated(&csid, &path, 0, l1, false, true);
         assert!(transcript_offsets(&outbox).is_empty());
 
         let o = bind(&t, &csid, &path);
@@ -1049,9 +1353,16 @@ mod tests {
         // The writer appends l3; the watcher's cursor was after l1, so its
         // batch is l2 + l3 starting at l1.len().
         append(&path, l3);
-        t.on_appended_gated(&csid, l1.len() as u64, &format!("{l2}{l3}"), false, true);
+        t.on_appended_gated(
+            &csid,
+            &path,
+            l1.len() as u64,
+            &format!("{l2}{l3}"),
+            false,
+            true,
+        );
         // A re-delivery of an old batch is inert.
-        t.on_appended_gated(&csid, 0, l1, false, true);
+        t.on_appended_gated(&csid, &path, 0, l1, false, true);
 
         assert_eq!(
             delivered(&outbox, o.coord_session_id),
@@ -1079,7 +1390,7 @@ mod tests {
                     for i in 0..200 {
                         let line = format!("{{\"round\":{round},\"i\":{i}}}\n");
                         append(&path, &line);
-                        t.on_appended_gated(&csid, cursor, &line, false, true);
+                        t.on_appended_gated(&csid, &path, cursor, &line, false, true);
                         cursor += line.len() as u64;
                     }
                 })
@@ -1142,7 +1453,7 @@ mod tests {
         let path = jsonl(dir.path(), &csid, "{\"n\":1}\n");
 
         assert_eq!(
-            t.bind_and_replay(&csid, &path, None, false),
+            t.bind_and_replay(&csid, &path, BindRequest::default(), false),
             Err(BindRefusal::SyncDisabled)
         );
         assert!(
@@ -1166,18 +1477,27 @@ mod tests {
         let path = jsonl(dir.path(), &csid, "{\"n\":1}\n");
 
         let o = (0..200)
-            .find_map(
-                |_| match t.bind_and_replay(&csid, &path, Some(existing), true) {
+            .find_map(|_| {
+                match t.bind_and_replay(
+                    &csid,
+                    &path,
+                    BindRequest {
+                        adopt: Some(existing),
+                        tenant: None,
+                    },
+                    true,
+                ) {
                     Ok(o) => Some(o),
                     Err(BindRefusal::RegistrationDisabled) => {
                         std::thread::sleep(Duration::from_millis(10));
                         None
                     }
                     Err(e) => panic!("{e:?}"),
-                },
-            )
+                }
+            })
             .expect("bind");
         assert_eq!(o.coord_session_id, existing);
+        assert!(o.adopted);
         assert_eq!(registrar.session_id_for(&csid), Some(existing));
         let started = outbox
             .pending()
@@ -1187,6 +1507,138 @@ mod tests {
             .count();
         assert_eq!(started, 0);
         assert_eq!(delivered(&outbox, existing), "{\"n\":1}\n");
+    }
+
+    /// Adopting a coord session another key already holds is refused, and
+    /// the holder's mapping is untouched.
+    #[test]
+    fn adopting_an_already_mapped_coord_session_is_refused() {
+        let dir = tempdir().unwrap();
+        let (t, registrar, _outbox) = tailer(dir.path());
+        let (a, b) = (Uuid::new_v4().to_string(), Uuid::new_v4().to_string());
+        let pa = jsonl(dir.path(), &a, "{\"n\":1}\n");
+        let pb = jsonl(dir.path(), &b, "{\"n\":2}\n");
+        let held = bind(&t, &a, &pa).coord_session_id;
+
+        let refused = (0..200)
+            .find_map(|_| {
+                match t.bind_and_replay(
+                    &b,
+                    &pb,
+                    BindRequest {
+                        adopt: Some(held),
+                        tenant: None,
+                    },
+                    true,
+                ) {
+                    Err(BindRefusal::RegistrationDisabled) => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        None
+                    }
+                    other => Some(other),
+                }
+            })
+            .expect("a verdict");
+        assert_eq!(refused, Err(BindRefusal::CoordSessionInUse));
+        assert_eq!(registrar.session_id_for(&a), Some(held));
+        assert_eq!(registrar.session_id_for(&b), None);
+    }
+
+    /// A session bound by the SNIFFER while its file already held content (a
+    /// resumed session: the watcher's tail started at EOF): the first live
+    /// batch fills the prefix from the file first, so the transcript is the
+    /// whole file, once, in order — and a later route bind replays nothing.
+    #[test]
+    fn sniffer_bound_resumed_session_gets_its_prefix_once() {
+        let dir = tempdir().unwrap();
+        let (t, registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let (l1, l2, l3) = ("{\"n\":1}\n", "{\"n\":2}\n", "{\"n\":3}\n");
+        let path = jsonl(dir.path(), &csid, &format!("{l1}{l2}"));
+        let coord = sniff_register(&registrar, &csid);
+
+        append(&path, l3);
+        t.on_appended_gated(&csid, &path, (l1.len() + l2.len()) as u64, l3, false, true);
+        assert_eq!(delivered(&outbox, coord), format!("{l1}{l2}{l3}"));
+
+        let o = bind(&t, &csid, &path);
+        assert!(o.already_bound);
+        assert_eq!(
+            o.coord_session_id, coord,
+            "no second row for a mapped session"
+        );
+        assert_eq!((o.replayed_bytes, o.replayed_chunks), (0, 0));
+        assert_eq!(delivered(&outbox, coord), format!("{l1}{l2}{l3}"));
+    }
+
+    /// A rewritten transcript (different first line) resets the mark; the
+    /// replay that notices it re-sends the NEW content once, and the watcher's
+    /// later `truncated` batch of the same content does not send it again.
+    #[test]
+    fn rewrite_is_detected_and_not_double_emitted() {
+        let dir = tempdir().unwrap();
+        let (t, _registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let a = "{\"v\":\"a1\"}\n{\"v\":\"a2\"}\n";
+        let path = jsonl(dir.path(), &csid, a);
+        let coord = bind(&t, &csid, &path).coord_session_id;
+
+        // Rewritten LONGER, so no shrink is visible — only the fingerprint
+        // tells the old mark does not describe this file.
+        let c = "{\"v\":\"c1-longer-line\"}\n{\"v\":\"c2\"}\n";
+        std::fs::write(&path, c).unwrap();
+        let again = bind(&t, &csid, &path);
+        assert_eq!(again.replayed_bytes, c.len() as u64);
+        // The watcher now reports the truncation it saw, with the same bytes.
+        t.on_appended_gated(&csid, &path, 0, c, true, true);
+
+        assert_eq!(delivered(&outbox, coord), format!("{a}{c}"));
+    }
+
+    /// Under contention the non-blocking path does NOTHING (so the async
+    /// watcher never waits on a replay), and the blocking path then carries
+    /// the batch — nothing is lost.
+    #[test]
+    fn contended_batch_is_deferred_not_dropped() {
+        let dir = tempdir().unwrap();
+        let (t, _registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let l1 = "{\"n\":1}\n";
+        let path = jsonl(dir.path(), &csid, "");
+        let coord = bind(&t, &csid, &path).coord_session_id;
+
+        append(&path, l1);
+        let lock = t.session_lock(&csid);
+        {
+            let _held = lock.lock().unwrap();
+            assert!(!t.try_emit_batch(&csid, &path, 0, l1, false));
+        }
+        assert!(transcript_offsets(&outbox).is_empty());
+        t.emit_batch(&csid, &path, 0, l1, false);
+        assert_eq!(delivered(&outbox, coord), l1);
+        // Uncontended and exactly at the mark: the fast path takes it.
+        let l2 = "{\"n\":2}\n";
+        append(&path, l2);
+        assert!(t.try_emit_batch(&csid, &path, l1.len() as u64, l2, false));
+        assert_eq!(delivered(&outbox, coord), format!("{l1}{l2}"));
+    }
+
+    /// Ownership: the session's own `cwd` decides; a workspace ROOT does not
+    /// own the sessions in the worktrees under it.
+    #[test]
+    fn ownership_is_the_sessions_own_cwd() {
+        let dir = tempdir().unwrap();
+        let csid = Uuid::new_v4().to_string();
+        let path = jsonl(
+            dir.path(),
+            &csid,
+            "{\"type\":\"summary\"}\n{\"type\":\"user\",\"cwd\":\"/work/a\"}\n",
+        );
+        assert!(jsonl_belongs_to_workdir(&path, "/work/a"));
+        assert!(jsonl_belongs_to_workdir(&path, "/work/a/"));
+        assert!(!jsonl_belongs_to_workdir(&path, "/work/b"));
+        assert!(!jsonl_belongs_to_workdir(&path, "/work"));
+        assert!(!jsonl_belongs_to_workdir(&path, ""));
     }
 
     /// The locator's three refusals, and its one success.
