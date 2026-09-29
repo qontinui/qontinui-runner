@@ -894,11 +894,13 @@ pub(crate) struct TranscriptBindEnv {
 /// 2. **Tenant** — the nonce's session tenant from `session_tenant_or_refuse`,
 ///    the resolver the forwarder uses for its bearer; an unresolvable one is
 ///    refused, and the resolved tenant is what a fresh registration stamps.
-/// 3. **Ownership** — the session must be the CALLER's: an open lifecycle
-///    record hosting it in the nonce's own terminal is owned, one hosting it in
-///    any other terminal is refused; an unhosted session's JSONL `cwd` must be
-///    exactly the nonce's workdir, and no `cwd` record yet is refused. A nonce
-///    cannot bind another workdir's session.
+/// 3. **Ownership** — the session must belong to the nonce: an open lifecycle
+///    record hosting it in the nonce's own terminal is accepted, one hosting it
+///    in any other terminal is refused; an UNHOSTED session is accepted when
+///    its JSONL `cwd` is exactly the nonce's workdir (so any session of that
+///    workdir — not strictly the calling one — can be bound by a nonce for
+///    it), and no `cwd` record yet is refused. A nonce cannot bind another
+///    workdir's session.
 /// 4. **Adoption** — a supplied `coord_session_id` is adopted only after coord
 ///    confirms (over the runner's device credential for that tenant) that the
 ///    row belongs to this Claude session; an unconfirmed id is refused and
@@ -906,7 +908,10 @@ pub(crate) struct TranscriptBindEnv {
 ///
 /// Answers (the client contract; later fields are additive):
 /// - `200 {"bound":true,"already_bound":b,"adopted":b,"replayed_bytes":n,"replayed_chunks":n,"coord_session_id":id,"replay_stopped_at":n|null}`
-///   — `adopted` is true iff a supplied `coord_session_id` was adopted
+///   — `adopted` is true iff a supplied `coord_session_id` was adopted; also
+///   `"prefix_truncated_bytes":n` (older unsent-prefix bytes skipped by the
+///   8 MiB prefix cap, 0 when none) and `"prefix_after_chunk_offset":n|null`
+///   (the lane offset where arrival order stops matching file order)
 /// - `401 {"error":"nonce_required"}` — no registered proxy nonce
 /// - `400 {"error":"malformed_request"|"malformed_id"}`
 /// - `403 {"error":"tenant_unresolvable"}` — the nonce's tenant is not knowable
@@ -1191,6 +1196,8 @@ pub(crate) async fn transcript_bind_core(
                 "replayed_chunks": o.replayed_chunks,
                 "coord_session_id": o.coord_session_id,
                 "replay_stopped_at": o.replay_stopped_at,
+                "prefix_truncated_bytes": o.prefix_truncated_bytes,
+                "prefix_after_chunk_offset": o.prefix_after_chunk_offset,
             });
             (StatusCode::OK, body)
         }
