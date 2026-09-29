@@ -103,13 +103,29 @@
 //! pane the pre-mark tailer had already synced would be re-sent from byte 0
 //! under fresh `chunk_offset`s coord cannot dedupe. So the floor
 //! (`unsent_prefix_end`) is recorded durably beside the mark, and ONLY
-//! [`SessionTranscriptTailer::bind_and_replay`] sends `[0, floor)` — first,
+//! [`SessionTranscriptTailer::bind_and_replay`] sends the prefix — first,
 //! under the session lock, with its own write-ahead progress record — then
 //! continues from the mark, then clears the floor so a re-bind sends nothing.
-//! Consequence: for such a session the prefix reaches the lane AFTER the bytes
-//! the live path already sent, so its `chunk_offset` order is emission order,
-//! not file order. A session never tailed has no floor and no mark, and a bind
-//! replays it from 0 in file order.
+//!
+//! - **Arrival order, not file order.** For such a session the prefix reaches
+//!   the lane AFTER the bytes the live path already sent, so `chunk_offset`
+//!   order is arrival order. The bind answers `prefix_after_chunk_offset` (the
+//!   lane value just before the prefix) so a reader knows where the break is.
+//! - **Capped.** Only the most recent [`PREFIX_REPLAY_CAP_BYTES`] (8 MiB) of
+//!   the prefix are sent, from a line boundary; older bytes are reported as
+//!   `prefix_truncated_bytes`. coord's warm tier is a 10 MiB FIFO evicting in
+//!   arrival order, so an uncapped prefix — arriving last — would evict the
+//!   author's most recent turns; the cap also bounds one bind's volume.
+//! - **Aligned.** A tail that starts inside a line (a file that ended in an
+//!   unterminated fragment when the tail began) is first tracked from the next
+//!   line boundary; the floor covers the straddling line, sent whole by a bind.
+//! - **Consent.** Batches appended while `Settings.cloud_sync_enabled` is off
+//!   move a tracked session's mark past them (`withhold_batch`), so no later
+//!   gap fill sends bytes written while sync was off.
+//!
+//! A session never tailed BY THIS BUILD has no floor and no mark, and a bind
+//! replays it from 0 in file order — which, for a session a pre-mark build
+//! already tailed, re-sends the bytes that build synced.
 //!
 //! **Crash posture — at most once across a crash, never duplicated.** The mark
 //! is reserved (fsynced) BEFORE the emitter queues the bytes, mirroring the
@@ -137,6 +153,11 @@ use super::transcript_emitter::{TranscriptEmitter, TranscriptOffsetLog};
 /// of batches rather than one allocation of the whole file. Batches end on a
 /// line boundary; a single line longer than this is emitted alone.
 const REPLAY_BATCH_BYTES: usize = 1024 * 1024;
+
+/// Most recent bytes of an unsent prefix a bind replays (module header,
+/// "Unsent prefix"). Below coord's 10 MiB warm FIFO so the prefix cannot by
+/// itself evict the author's most recent turns, which arrived before it.
+const PREFIX_REPLAY_CAP_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Longest first line the rewrite fingerprint reads. A longer one yields no
 /// fingerprint, and the mark is then guarded by the length and newline checks.
@@ -172,6 +193,20 @@ pub struct SessionTranscriptTailer {
     /// path as the caller spelled it → [`file_identity`], so the canonicalize
     /// syscall runs once per spelling rather than once per batch.
     identities: Mutex<HashMap<PathBuf, String>>,
+    /// [`PREFIX_REPLAY_CAP_BYTES`]; a field so tests can shrink it.
+    prefix_cap: u64,
+}
+
+/// [`SessionTranscriptTailer::admit`]'s verdict on one batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admit {
+    /// Bound and consented: emit it.
+    Emit,
+    /// Not bound (or empty): drop it.
+    Drop,
+    /// Gate 1 is off: consent withheld — mark it passed
+    /// ([`SessionTranscriptTailer::withhold_batch`]) so no later fill sends it.
+    Withheld,
 }
 
 /// What the caller of [`SessionTranscriptTailer::bind_and_replay`] asks for.
@@ -201,6 +236,14 @@ pub struct BindOutcome {
     /// The file offset the replay stopped at when it could not reach the last
     /// complete line (an outbox refusal, a non-UTF-8 line). `None` = complete.
     pub replay_stopped_at: Option<u64>,
+    /// Older bytes of the unsent prefix NOT sent because the prefix replay is
+    /// capped to its most recent `PREFIX_REPLAY_CAP_BYTES`. 0 when nothing
+    /// was skipped.
+    pub prefix_truncated_bytes: u64,
+    /// The emitter lane value (next `chunk_offset`) just before the prefix
+    /// was queued — where arrival order stops matching file order for this
+    /// session. `None` when this call sent no prefix.
+    pub prefix_after_chunk_offset: Option<i64>,
 }
 
 /// Why [`SessionTranscriptTailer::bind_and_replay`] refused. Typed so the
@@ -418,6 +461,24 @@ fn newline_precedes(path: &Path, offset: u64) -> Option<bool> {
     Some(b[0] == b'\n')
 }
 
+/// The first line start at or after `offset` (`offset` itself when the byte
+/// before it is a newline), not past `limit`.
+fn next_line_start(path: &Path, offset: u64, limit: u64) -> std::io::Result<u64> {
+    if offset == 0 {
+        return Ok(0);
+    }
+    let mut f = std::fs::File::open(path)?;
+    f.seek(SeekFrom::Start(offset - 1))?;
+    let mut reader = BufReader::new(f.take(limit - (offset - 1)));
+    let mut skipped = Vec::new();
+    let n = reader.read_until(b'\n', &mut skipped)?;
+    if skipped.last() == Some(&b'\n') {
+        Ok((offset - 1 + n as u64).min(limit))
+    } else {
+        Ok(limit)
+    }
+}
+
 /// One replay pass over `[from, until)`.
 #[derive(Debug, Default)]
 struct ReplayPass {
@@ -460,6 +521,9 @@ fn hole_lane_key(mk: &str) -> String {
 }
 fn hole_from_key(mk: &str) -> String {
     format!("hf\u{1f}{mk}")
+}
+fn hole_end_key(mk: &str) -> String {
+    format!("he\u{1f}{mk}")
 }
 
 /// The key the first-line fingerprint for mark `mk` is stored under.
@@ -525,6 +589,7 @@ impl SessionTranscriptTailer {
             session_locks: Mutex::new(HashMap::new()),
             marks,
             identities: Mutex::new(HashMap::new()),
+            prefix_cap: PREFIX_REPLAY_CAP_BYTES,
         }
     }
 
@@ -569,8 +634,12 @@ impl SessionTranscriptTailer {
         truncated: bool,
         cloud_sync_enabled: bool,
     ) {
-        if self.admit(session_key, appended.len(), cloud_sync_enabled) {
-            self.emit_batch(session_key, path, file_start, appended, truncated);
+        match self.admit(session_key, appended.len(), cloud_sync_enabled) {
+            Admit::Emit => self.emit_batch(session_key, path, file_start, appended, truncated),
+            Admit::Withheld => {
+                self.withhold_batch(session_key, path, file_start, appended.len());
+            }
+            Admit::Drop => {}
         }
     }
 
@@ -583,15 +652,15 @@ impl SessionTranscriptTailer {
     /// than inside the emitter because the coverage summary needs its value —
     /// "off" and "on but reaching nobody" are different diagnoses. The emit
     /// path then calls `emit_inner`, which by contract does NOT re-check it.
-    pub fn admit(&self, session_key: &str, len: usize, cloud_sync_enabled: bool) -> bool {
+    pub fn admit(&self, session_key: &str, len: usize, cloud_sync_enabled: bool) -> Admit {
         if len == 0 {
-            return false;
+            return Admit::Drop;
         }
         if !cloud_sync_enabled {
             let mut cov = self.lock_coverage();
             cov.cloud_sync_enabled = Some(false);
             cov.appends_skipped_gate_off += 1;
-            return false;
+            return Admit::Withheld;
         }
 
         // Resolve the binding HERE as well as inside the emitter. The
@@ -611,7 +680,54 @@ impl SessionTranscriptTailer {
             cov.unbound.insert(session_key.to_string());
             cov.appends_skipped_unbound += 1;
         }
-        bound
+        if bound {
+            Admit::Emit
+        } else {
+            Admit::Drop
+        }
+    }
+
+    /// A batch appended while Gate 1 was OFF: consent was withheld for these
+    /// bytes, so a TRACKED session's mark moves past them — the gap fill must
+    /// never send them later, when the toggle is back on. (An untracked
+    /// session has no mark to move; its bytes are only ever sent by an
+    /// explicit bind.) Non-blocking: `false` = the lock was busy and nothing
+    /// was done; run [`Self::withhold_batch`] on a blocking thread.
+    pub fn try_withhold_batch(
+        &self,
+        session_key: &str,
+        path: &Path,
+        file_start: u64,
+        len: usize,
+    ) -> bool {
+        let lock = self.session_lock(session_key);
+        let _held = match lock.try_lock() {
+            Ok(g) => g,
+            Err(TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(TryLockError::WouldBlock) => return false,
+        };
+        self.withhold_locked(session_key, path, file_start, len);
+        true
+    }
+
+    /// Blocking form of [`Self::try_withhold_batch`].
+    pub fn withhold_batch(&self, session_key: &str, path: &Path, file_start: u64, len: usize) {
+        let lock = self.session_lock(session_key);
+        let _held = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.withhold_locked(session_key, path, file_start, len);
+    }
+
+    fn withhold_locked(&self, session_key: &str, path: &Path, file_start: u64, len: usize) {
+        let mk = self.mark_key(session_key, path);
+        let Some(mark) = self.marks.get(&mk).map(|m| u64::try_from(m).unwrap_or(0)) else {
+            return;
+        };
+        let end = file_start + len as u64;
+        if end > mark {
+            self.marks.set(&mk, end as i64);
+        }
     }
 
     /// The NON-BLOCKING emit the watcher's async loop tries first. Emits and
@@ -671,7 +787,22 @@ impl SessionTranscriptTailer {
             // `POST /sessions/transcript-bind` sends that prefix — backfilling
             // every sniffer-bound pane on upgrade would move ~1.2 GiB/day on
             // one box and re-send bytes the pre-mark tailer already synced.
-            self.init_mark_at(&mk, path, file_start);
+            // H1: the watcher's tail may start INSIDE a line (a file that
+            // ended in an unterminated fragment when the tail began at EOF).
+            // A mark there is not on a line boundary, which `validated_mark`
+            // would read as a rewrite and reset to 0 — a whole-history upload
+            // with no bind. Align to the first line boundary in the batch; the
+            // floor then covers the straddling line, so a later bind sends it
+            // whole, and its tail fragment in this batch is dropped.
+            let aligned = match newline_precedes(path, file_start) {
+                Some(false) => appended
+                    .find('\n')
+                    .map_or(file_start + appended.len() as u64, |i| {
+                        file_start + i as u64 + 1
+                    }),
+                _ => file_start,
+            };
+            self.init_mark_at(&mk, path, aligned);
         }
         let mark = self.validated_mark(&mk, path, truncated);
         if file_start > mark {
@@ -741,10 +872,18 @@ impl SessionTranscriptTailer {
             return Some((0, 0));
         }
         let unseen = text.get(usize::try_from(from - file_start).unwrap_or(usize::MAX)..)?;
-        self.marks.set(&key, file_end as i64);
+        let lane_before = self.emitter.offsets().next_offset(session_key);
+        self.report_hole_if_any(session_key, mk, lane_before);
+        self.marks.set_many(&[
+            (&hole_lane_key(mk), lane_before),
+            (&hole_from_key(mk), from as i64),
+            (&hole_end_key(mk), file_end as i64),
+            (&key, file_end as i64),
+        ]);
         let chunks = self.emitter.emit_inner(session_key, unseen);
         if chunks == 0 {
-            self.marks.set(&key, sent as i64);
+            self.marks
+                .set_many(&[(&hole_lane_key(mk), -1), (&key, sent as i64)]);
             return None;
         }
         Some((file_end - from, chunks as u64))
@@ -877,12 +1016,13 @@ impl SessionTranscriptTailer {
             }
         }
         let lane_before = self.emitter.offsets().next_offset(session_key);
-        self.report_hole_if_any(session_key, mk, mark, lane_before);
+        self.report_hole_if_any(session_key, mk, lane_before);
         // Write-ahead reservation, in one fsync: the hole record first, the
         // mark LAST, so a torn append never commits a mark without its record.
         self.marks.set_many(&[
             (&hole_lane_key(mk), lane_before),
             (&hole_from_key(mk), from as i64),
+            (&hole_end_key(mk), file_end as i64),
             (mk, file_end as i64),
         ]);
         let chunks = self.emitter.emit_inner(session_key, unseen);
@@ -896,31 +1036,39 @@ impl SessionTranscriptTailer {
         Some((file_end - from, chunks as u64))
     }
 
-    /// Hole visibility (no delivery change). The last reservation recorded the
-    /// emitter's lane value before its emit; if the lane has NOT advanced past
-    /// it, that emit never queued its bytes — the runner died between the
-    /// mark and the outbox — so `[from, mark)` never reached coord. Logged once
-    /// and counted; the record is overwritten by the reservation that follows.
-    fn report_hole_if_any(&self, session_key: &str, mk: &str, mark: u64, lane_now: i64) {
+    /// Hole visibility (no delivery change). Every reservation — live or
+    /// prefix — records the emitter's lane value before its emit and the byte
+    /// range it reserved. If the lane has NOT advanced past that value by the
+    /// next reservation, that emit never queued its bytes (the runner died
+    /// between the reservation and the outbox), so the range never reached
+    /// coord. Logged once and counted; the record is overwritten by the
+    /// reservation that follows. A crash in the middle of the reservation's
+    /// own append can over-report one range that was in fact retried.
+    fn report_hole_if_any(&self, session_key: &str, mk: &str, lane_now: i64) {
         let Some(lane_then) = self.marks.get(&hole_lane_key(mk)).filter(|l| *l >= 0) else {
             return;
         };
-        let from = self
-            .marks
-            .get(&hole_from_key(mk))
-            .map(|f| u64::try_from(f).unwrap_or(0))
-            .unwrap_or(mark);
-        if lane_now <= lane_then && from < mark {
+        let get = |k: String| {
+            self.marks
+                .get(&k)
+                .map(|v| u64::try_from(v).unwrap_or(0))
+                .unwrap_or(0)
+        };
+        let (from, to) = (get(hole_from_key(mk)), get(hole_end_key(mk)));
+        if lane_now <= lane_then && from < to {
             tracing::warn!(
                 session_key,
                 hole_from = from,
-                hole_to = mark,
+                hole_to = to,
                 lane = lane_now,
                 "transcript_hole: a reserved transcript range was never queued (the runner \
-                 stopped between reserving the file mark and the outbox write); bytes \
+                 stopped between reserving it and the outbox write); bytes \
                  [hole_from, hole_to) of this JSONL did not reach coord"
             );
             self.lock_coverage().transcript_holes += 1;
+            // Consumed: report a given hole once (only on this rare path, so
+            // the steady state pays no extra fsync).
+            self.marks.set(&hole_lane_key(mk), -1);
         }
     }
 
@@ -994,7 +1142,6 @@ impl SessionTranscriptTailer {
         self.report_hole_if_any(
             session_key,
             &mk,
-            mark,
             self.emitter.offsets().next_offset(session_key),
         );
 
@@ -1002,20 +1149,42 @@ impl SessionTranscriptTailer {
         //    (module header, "Unsent prefix") — only this door sends it. Then
         //    clear the floor, so a re-bind replays nothing.
         let mut pass = ReplayPass::default();
+        let mut prefix_truncated_bytes = 0u64;
+        let mut prefix_after_chunk_offset = None;
         if let Some(floor) = self.prefix_floor(&mk) {
             let sent = self
                 .marks
                 .get(&prefix_sent_key(&mk))
                 .map(|v| u64::try_from(v).unwrap_or(0))
                 .unwrap_or(0);
+            // M-c: only the MOST RECENT `prefix_cap` bytes of the unsent
+            // prefix, starting on a line boundary. The prefix arrives after the
+            // live bytes, and coord's warm FIFO evicts in arrival order, so an
+            // uncapped prefix would push the author's recent work out of warm.
+            let start = if floor.saturating_sub(sent) > self.prefix_cap {
+                let raw = floor - self.prefix_cap;
+                next_line_start(path, raw, floor).map_err(unreadable)?
+            } else {
+                sent
+            };
+            prefix_truncated_bytes = start.saturating_sub(sent);
+            if prefix_truncated_bytes > 0 {
+                self.marks.set(&prefix_sent_key(&mk), start as i64);
+            }
+            prefix_after_chunk_offset = Some(self.emitter.offsets().next_offset(session_key));
             pass = self
-                .replay_with(path, sent, Some(floor), session_key, |start, text| {
+                .replay_with(path, start, Some(floor), session_key, |start, text| {
                     self.emit_prefix_range(session_key, &mk, start, text)
                 })
                 .map_err(unreadable)?;
             if pass.stopped_at.is_none() {
-                self.marks
-                    .set_many(&[(&prefix_sent_key(&mk), 0), (&prefix_floor_key(&mk), -1)]);
+                // Clear the floor ALONE — one entry cannot tear. Writing the
+                // progress reset beside it could keep `sent = 0` with the floor
+                // intact after a torn append, and the next bind would re-send
+                // the whole prefix. The stale progress value is harmless: only
+                // `init_mark_at` (which resets it) or a rewrite reset (which
+                // resets it) can create a floor again.
+                self.marks.set(&prefix_floor_key(&mk), -1);
             }
         }
 
@@ -1053,6 +1222,8 @@ impl SessionTranscriptTailer {
             replayed_bytes: pass.bytes,
             replayed_chunks: pass.chunks,
             replay_stopped_at: pass.stopped_at,
+            prefix_truncated_bytes,
+            prefix_after_chunk_offset,
         })
     }
 
@@ -1861,6 +2032,100 @@ mod tests {
         let again = bind(&t, &csid, &path);
         assert_eq!((again.replayed_bytes, again.replayed_chunks), (0, 0));
         assert_eq!(delivered(&outbox, coord), format!("{l3}{l1}{l2}{l4}"));
+        // A restart (fresh index, same durable marks): the cleared floor is
+        // still cleared, so the prefix is not sent again.
+        let (t2, _r2, _o2) = tailer(dir.path());
+        let after_restart = bind(&t2, &csid, &path);
+        assert_eq!(after_restart.replayed_bytes, 0);
+    }
+
+    /// H1: the tail starts INSIDE a line (the file ended in an unterminated
+    /// fragment). The live path aligns to the next line boundary and sends
+    /// nothing below it; a later bind sends `[0, aligned floor)` — the
+    /// straddling line whole — exactly once.
+    #[test]
+    fn a_mid_line_first_batch_sends_nothing_below_it_and_bind_sends_the_line_whole() {
+        let dir = tempdir().unwrap();
+        let (t, registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let l1 = "{\"n\":1}\n";
+        let (head, rest) = ("{\"n\":2,", "\"x\":1}\n");
+        let l3 = "{\"n\":3}\n";
+        let path = jsonl(dir.path(), &csid, &format!("{l1}{head}"));
+        let coord = sniff_register(&registrar, &csid);
+        let tail_start = (l1.len() + head.len()) as u64;
+
+        append(&path, &format!("{rest}{l3}"));
+        t.on_appended_gated(
+            &csid,
+            &path,
+            tail_start,
+            &format!("{rest}{l3}"),
+            false,
+            true,
+        );
+        assert_eq!(
+            delivered(&outbox, coord),
+            l3,
+            "nothing below the aligned batch"
+        );
+
+        let o = bind(&t, &csid, &path);
+        assert_eq!(
+            o.replayed_bytes,
+            (l1.len() + head.len() + rest.len()) as u64
+        );
+        assert_eq!(delivered(&outbox, coord), format!("{l3}{l1}{head}{rest}"));
+        assert_eq!(bind(&t, &csid, &path).replayed_bytes, 0);
+    }
+
+    /// M-b: a batch appended while Gate 1 is OFF never reaches the outbox,
+    /// even though the gap fill would otherwise carry it once sync is back on.
+    #[test]
+    fn a_batch_written_while_sync_was_off_is_never_sent() {
+        let dir = tempdir().unwrap();
+        let (t, _registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let (l1, l2, l3) = ("{\"n\":1}\n", "{\"n\":2}\n", "{\"n\":3}\n");
+        let path = jsonl(dir.path(), &csid, l1);
+        let coord = bind(&t, &csid, &path).coord_session_id;
+
+        append(&path, l2);
+        t.on_appended_gated(&csid, &path, l1.len() as u64, l2, false, false);
+        append(&path, l3);
+        t.on_appended_gated(&csid, &path, (l1.len() + l2.len()) as u64, l3, false, true);
+
+        assert_eq!(delivered(&outbox, coord), format!("{l1}{l3}"));
+    }
+
+    /// M-c: a bind sends only the most recent `prefix_cap` bytes of the unsent
+    /// prefix, from a line boundary, and reports what it skipped and where the
+    /// ordering break sits.
+    #[test]
+    fn the_prefix_replay_is_capped_to_its_most_recent_bytes() {
+        let dir = tempdir().unwrap();
+        let (mut t, registrar, outbox) = tailer(dir.path());
+        Arc::get_mut(&mut t).unwrap().prefix_cap = 20;
+        let csid = Uuid::new_v4().to_string();
+        let lines: Vec<String> = (1..=6).map(|n| format!("{{\"n\":{n}}}\n")).collect();
+        assert!(lines.iter().all(|l| l.len() == 8));
+        let path = jsonl(dir.path(), &csid, &lines[..5].concat());
+        let coord = sniff_register(&registrar, &csid);
+
+        append(&path, &lines[5]);
+        t.on_appended_gated(&csid, &path, 40, &lines[5], false, true);
+        let lane_before_prefix = t.emitter.offsets().next_offset(&csid);
+
+        let o = bind(&t, &csid, &path);
+        // cap 20 of a 40-byte prefix -> raw start 20 -> next line start 24.
+        assert_eq!(o.prefix_truncated_bytes, 24);
+        assert_eq!(o.replayed_bytes, 16);
+        assert_eq!(o.prefix_after_chunk_offset, Some(lane_before_prefix));
+        assert_eq!(
+            delivered(&outbox, coord),
+            format!("{}{}{}", lines[5], lines[3], lines[4])
+        );
+        assert_eq!(bind(&t, &csid, &path).replayed_bytes, 0);
     }
 
     /// A gap ABOVE an existing mark — a batch of an already-tracked session
@@ -2056,6 +2321,7 @@ mod tests {
         t.marks.set_many(&[
             (&hole_lane_key(&mk), lane),
             (&hole_from_key(&mk), l1.len() as i64),
+            (&hole_end_key(&mk), end),
             (&mk, end),
         ]);
 

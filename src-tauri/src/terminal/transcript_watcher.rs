@@ -1579,12 +1579,31 @@ async fn tail_session(
         // (the per-wake fan-out that `commit_report`'s bounded queue exists to
         // prevent).
         if let Some(t) = tailer.as_ref() {
+            use crate::session::session_transcript_tailer::Admit;
             let file_start = reader.cursor().saturating_sub(bytes.len() as u64);
-            if t.admit(
+            let verdict = t.admit(
                 &session_id,
                 bytes.len(),
                 crate::settings::get_cloud_sync_enabled(),
-            ) && !t.try_emit_batch(&session_id, &path, file_start, &bytes, truncated)
+            );
+            // Same two-step for a batch whose consent was withheld (Gate 1
+            // off): a tracked session's mark moves past it, so no later gap
+            // fill sends bytes written while sync was off.
+            if verdict == Admit::Withheld
+                && !t.try_withhold_batch(&session_id, &path, file_start, bytes.len())
+            {
+                let (t, sid, p, n) = (t.clone(), session_id.clone(), path.clone(), bytes.len());
+                if let Err(e) =
+                    spawn_blocking_tracked(move || t.withhold_batch(&sid, &p, file_start, n)).await
+                {
+                    warn!(
+                        "transcript_watcher: withholding a consent-off batch for {} failed to run: {}",
+                        session_id, e
+                    );
+                }
+            }
+            if verdict == Admit::Emit
+                && !t.try_emit_batch(&session_id, &path, file_start, &bytes, truncated)
             {
                 let (t, sid, p, b) = (t.clone(), session_id.clone(), path.clone(), bytes.clone());
                 if let Err(e) = spawn_blocking_tracked(move || {
