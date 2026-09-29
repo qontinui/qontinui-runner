@@ -205,7 +205,16 @@ jobs:
     timeout-minutes: 150
 
     steps:
+      # Full history, blobless: workspace_assumptions_are_enumerated.rs takes its
+      # swap-rule base from `merge-base HEAD origin/main`, which a depth-1 clone
+      # cannot compute (it would print SWAP RULE UNKNOWN and enforce nothing).
+      # `filter: blob:none` keeps the fetch to commits and trees; the one roster
+      # blob it reads at the merge base is fetched lazily. Plan
+      # 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists, A6.
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          filter: blob:none
 
       # qontinui-runner's frontend cross-repo deps now resolve via npm
       # (see package.json: @qontinui/* moved from link: to ^x.y.z ranges).
