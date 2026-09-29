@@ -35,6 +35,28 @@
 # re-indented, extraction yields nothing and this test FAILS rather than
 # silently asserting over an empty string.
 #
+# SINCE plan 2026-09-17-atlas-self-heal-files-its-own-fix-as-a-draft-and-nothing-lands-it
+# this file also pins what happens AROUND that step, by running the shipped
+# bytes of two more steps and evaluating the shipped `if:` conditions:
+#
+#   3. The PR step hands its draft to scripts/ci/ready-bot-draft-pr.sh, and a
+#      failure there is a red through pr_op_failed — never a silent green.
+#
+#   4. The `Sweep the refresh PR` step runs on EVERY self-heal run, drift or
+#      not, while the PR step runs only on drift. A no-drift night is exactly
+#      when a parked draft needs re-deciding, so gating the sweep on drift
+#      would re-create the park this plan removes.
+#
+#   5. `fresh_check` publishes `healed=true` EXACTLY when drift=true and
+#      self_heal=true, so "green because healed" is distinguishable from
+#      "green because fresh" without parsing prose.
+#
+# Properties 4 and 5 carry MUTATION PROOFS: the last section re-runs this whole
+# file against deliberately broken copies of the workflow and asserts each is
+# caught by the case that guards it (the child sets SCHEMA_STEP_MUTANT=1, which
+# skips that section). The `if:` evaluator below is strict — any expression
+# shape it does not model is a loud failure, never a guess.
+#
 # Plan: plans/2026-08-07-runner-schema-freshness-cross-repo-blind-spot.md
 #
 # Run locally:
@@ -44,12 +66,18 @@ set -euo pipefail
 
 tests_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$tests_dir/../.." && pwd)"
-workflow="$repo_root/.github/workflows/schema-pg-sql-freshness-nightly.yml"
+real_workflow="$repo_root/.github/workflows/schema-pg-sql-freshness-nightly.yml"
+# Overridable ONLY so the mutation-proof section can point a child run at a
+# broken copy. Never set it by hand to make this pass.
+workflow="${SCHEMA_WORKFLOW_UNDER_TEST:-$real_workflow}"
+ready_script="$repo_root/scripts/ci/ready-bot-draft-pr.sh"
 
-if [ ! -f "$workflow" ]; then
-  echo "::error::cannot find $workflow"
-  exit 1
-fi
+for f in "$workflow" "$ready_script"; do
+  if [ ! -f "$f" ]; then
+    echo "::error::cannot find $f"
+    exit 1
+  fi
+done
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -204,6 +232,12 @@ assert "the only bare call is the open-PR lookup" "gh pr list " "$bare_calls"
 assert "branch is rebuilt from the triggering sha" 1 "$(grep -c 'checkout -B "\$BRANCH" "\$TRIGGER_SHA"' "$code_only" || true)"
 assert "no 'git add -A' (siblings share the workspace)" 0 "$(grep -c 'git add -A' "$code_only" || true)"
 assert "PRs are created as drafts" 2 "$(grep -c -- '--draft' "$code_only" || true)"
+# Born a draft, then handed to the shared script — with a wait, because this
+# step force-pushed moments earlier and the check runs it fired take seconds to
+# register — and a failure there routes through the step's reporter.
+assert "PR step calls the draft->ready script once" 1 "$(grep -c 'bash scripts/ci/ready-bot-draft-pr.sh ' "$code_only" || true)"
+assert "PR step waits for the push's checks to register" 1 "$(grep -c 'ready-bot-draft-pr.sh .*--wait-for-checks-seconds [1-9]' "$code_only" || true)"
+assert "a ready-script failure goes through pr_op_failed" 1 "$(grep -c 'pr_op_failed "ready-for-review' "$code_only" || true)"
 
 # --- Stub bin -----------------------------------------------------------------
 bin="$work/bin"
@@ -221,15 +255,32 @@ cat > "$bin/gh" <<'STUB'
 # sees argv[1]=pr argv[2]=create — it keys on argv, never on argv[0]'s position.
 # GH_STUB_FAIL_FIRST_CREATE models the measured production shape: the PAT create
 # refused, the GITHUB_TOKEN retry accepted.
+#
+# It also answers scripts/ci/ready-bot-draft-pr.sh, which the step (and the
+# sweep step) call: its PR lookup (`pr list` with isDraft in --json) keys as
+# `list:ready`, and its REST/GraphQL calls key as `graphql`, `check-runs`,
+# `comments-read` and `comment-post`. Knobs: GH_STUB_READY_LINE (the lookup's
+# TSV row; "none" = no open PR), GH_STUB_CHECKS, GH_STUB_GRAPHQL_ISDRAFT.
 prev=""
 json=""
+method="GET"
 for a in "$@"; do
   if [ "$prev" = "--json" ]; then json="$a"; fi
+  if [ "$prev" = "-X" ]; then method="$a"; fi
   prev="$a"
 done
 verb="${2:-}"
 key="$verb"
 if [ "$verb" = "view" ]; then key="view:$json"; fi
+case "$json" in *isDraft*) [ "$verb" = "list" ] && key="list:ready" ;; esac
+if [ "${1:-}" = "api" ]; then
+  case "$*" in
+    *" graphql "*)   key="graphql" ;;
+    *"/check-runs"*) key="check-runs" ;;
+    *"/comments"*)   if [ "$method" = "POST" ]; then key="comment-post"; else key="comments-read"; fi ;;
+    *)               key="api:unhandled" ;;
+  esac
+fi
 echo "$key" >> "${GH_STUB_LOG:-/dev/null}"
 case " ${GH_STUB_FAIL:-} " in
   *" $key "*)
@@ -244,6 +295,15 @@ if [ "$key" = "create" ] && [ -n "${GH_STUB_FAIL_FIRST_CREATE:-}" ] \
 fi
 case "$key" in
   list)      printf '%s\n' "${GH_STUB_LIST_OPEN:-}" ;;
+  list:ready)
+    if [ "${GH_STUB_READY_LINE:-}" != "none" ]; then
+      printf '%s\n' "${GH_STUB_READY_LINE:-$(printf '4242\ttrue\t%s\tPR_kwDOtest4242\t2026-09-29T00:00:00Z\thttps://github.com/qontinui/qontinui-runner/pull/4242\tjspinak' a47f223e3a47f223e3a47f223e3a47f223e3a47f)}"
+    fi
+    ;;
+  check-runs)    printf '%s\n' "${GH_STUB_CHECKS:-3}" ;;
+  graphql)       printf '%s\n' "${GH_STUB_GRAPHQL_ISDRAFT:-false}" ;;
+  comments-read) : ;;
+  comment-post)  echo "https://github.com/qontinui/qontinui-runner/pull/4242#issuecomment-1" ;;
   # GH_STUB_EMPTY_URL models a gh that exits 0 having printed nothing.
   view:url)  [ -n "${GH_STUB_EMPTY_URL:-}" ] || printf '%s\n' "${GH_STUB_URL:?}" ;;
   create)    [ -n "${GH_STUB_EMPTY_URL:-}" ] || printf '%s\n' "${GH_STUB_URL:?}" ;;
@@ -268,13 +328,23 @@ fi
 exit 0
 STUB
 
-chmod +x "$bin/gh" "$bin/git"
+# The ready script's re-poll sleeps; never actually wait in a unit test.
+cat > "$bin/sleep" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+
+chmod +x "$bin/gh" "$bin/git" "$bin/sleep"
 
 # --- Fixture inputs the step reads --------------------------------------------
 runner_temp="$work/runner-temp"
 mkdir -p "$runner_temp" "$work/repo/src-tauri"
 printf 'CREATE TABLE project.a ();\nCREATE TABLE coord.b ();\n' > "$runner_temp/schema.fresh.sql"
 : > "$work/repo/src-tauri/schema.pg.sql.generated"
+# The step runs `bash scripts/ci/ready-bot-draft-pr.sh` from the checkout root,
+# so the fixture checkout carries the REAL script — the one CI ships.
+mkdir -p "$work/repo/scripts/ci"
+cp "$ready_script" "$work/repo/scripts/ci/ready-bot-draft-pr.sh"
 
 STUB_URL="https://github.com/qontinui/qontinui-runner/pull/4242"
 
@@ -285,7 +355,11 @@ GH_STUB_EMPTY_URL=""
 GH_STUB_FAIL_FIRST_CREATE=""
 GIT_STUB_STAGED=1
 PAT_TOKEN_STUB="stub-pat-token"
+GH_STUB_READY_LINE=""
+GH_STUB_CHECKS=3
+GH_STUB_GRAPHQL_ISDRAFT=false
 export GH_STUB_EMPTY_URL GH_STUB_FAIL_FIRST_CREATE GIT_STUB_STAGED PAT_TOKEN_STUB
+export GH_STUB_READY_LINE GH_STUB_CHECKS GH_STUB_GRAPHQL_ISDRAFT
 
 # run_step <fail-keys> <list-open>
 # Echoes the exit code; leaves stdout+stderr in $work/out.txt, the gh call log in
@@ -306,6 +380,9 @@ run_step() {
     GH_STUB_URL="$STUB_URL" \
     GH_STUB_EMPTY_URL="${GH_STUB_EMPTY_URL:-}" \
     GH_STUB_FAIL_FIRST_CREATE="${GH_STUB_FAIL_FIRST_CREATE:-}" \
+    GH_STUB_READY_LINE="${GH_STUB_READY_LINE:-}" \
+    GH_STUB_CHECKS="${GH_STUB_CHECKS:-3}" \
+    GH_STUB_GRAPHQL_ISDRAFT="${GH_STUB_GRAPHQL_ISDRAFT:-false}" \
     GH_TOKEN="stub-token" \
     PAT_TOKEN="${PAT_TOKEN_STUB:-}" \
     REPO="qontinui/qontinui-runner" \
@@ -344,6 +421,9 @@ assert "create path: pushed the branch" 1 "$(grep -c 'push --force origin HEAD:r
 assert "create path: called create once" 1 "$(grep -c '^create$' "$work/gh.log" || true)"
 assert "create path: no edit call" 0 "$(grep -c '^edit$' "$work/gh.log" || true)"
 assert "create path: PR url in step summary" 1 "$(grep -c "$STUB_URL" "$work/summary.md" || true)"
+assert "create path: readied the draft (it carries checks)" 1 "$(grep -c '^readied #4242$' "$work/out.txt" || true)"
+assert "create path: ready mutation called once" 1 "$(grep -c '^graphql$' "$work/gh.log" || true)"
+assert "create path: summary names the ready state" 1 "$(grep -c 'Refresh PR state: ready for review' "$work/summary.md" || true)"
 
 # 2. Happy path with an existing open PR: edit, never create.
 rc="$(run_step "" "77")"
@@ -351,6 +431,7 @@ assert "edit path: exit code" 0 "$rc"
 assert "edit path: called edit once" 1 "$(grep -c '^edit$' "$work/gh.log" || true)"
 assert "edit path: never called create" 0 "$(grep -c '^create$' "$work/gh.log" || true)"
 assert "edit path: PR url in step summary" 1 "$(grep -c "$STUB_URL" "$work/summary.md" || true)"
+assert "edit path: readied the draft (it carries checks)" 1 "$(grep -c '^readied #4242$' "$work/out.txt" || true)"
 
 # 3. `create` refused by BOTH tokens => non-zero AND the create remediation.
 rc="$(run_step "create" "")"
@@ -407,6 +488,301 @@ GH_STUB_EMPTY_URL=""
 assert "empty url on create: hard red" 1 "$rc"
 assert "empty url on create: names the read-back" 1 "$(grep -c 'URL read-back' "$work/out.txt" || true)"
 
+# 10. The draft->ready script fails AFTER the PR was written => a red through
+#     pr_op_failed's ready arm, never a green with the draft undecided.
+GH_STUB_GRAPHQL_ISDRAFT=true
+rc="$(run_step "" "77")"
+GH_STUB_GRAPHQL_ISDRAFT=false
+assert "ready script fails: exit code" 1 "$rc"
+assert "ready script fails: reporter names the ready step" 1 "$(grep -c 'could not be decided' "$work/out.txt" || true)"
+assert "ready script fails: does NOT print create's remediation" 0 "$(grep -c "$REMEDIATION_CREATE" "$work/out.txt" || true)"
+rc="$(run_step "list:ready" "77")"
+assert "ready lookup refused: exit code" 1 "$rc"
+
+# 11. A draft whose head has no checks after the wait stays a draft, the step
+#     stays green (delivery succeeded), and the summary says so.
+GH_STUB_CHECKS=0
+rc="$(run_step "" "77")"
+GH_STUB_CHECKS=3
+assert "no checks yet: exit code" 0 "$rc"
+assert "no checks yet: never calls the mutation" 0 "$(grep -c '^graphql$' "$work/gh.log" || true)"
+assert "no checks yet: summary says still a DRAFT" 1 "$(grep -c 'Refresh PR state: still a DRAFT' "$work/summary.md" || true)"
+
+# =============================================================================
+# The steps AROUND the PR step: fresh_check's outputs, the shipped `if:`
+# conditions, and the sweep step's body.
+# =============================================================================
+
+# extract_run <step name> <out file> — the `run: |` body of a step, verbatim,
+# by the same brittle-and-loud rule as the PR step above (empty => FAIL).
+extract_run() {
+  awk -v name="$1" '
+    state == 0 && $0 == "      - name: " name { state = 1; next }
+    state == 1 && $0 ~ /^      - name: / { exit }
+    state == 1 && $0 == "        run: |" { state = 2; next }
+    state == 2 {
+      if ($0 ~ /^[[:space:]]*$/) { print ""; next }
+      if ($0 !~ /^          /) { exit }
+      print substr($0, 11)
+    }
+  ' "$workflow" > "$2"
+  if [ "$(grep -c 'set -euo pipefail' "$2" || true)" -lt 1 ]; then
+    echo "::error::step '$1' did not extract from $workflow (renamed or re-indented?)."
+    exit 1
+  fi
+  bash -n "$2"
+}
+
+# extract_if <step name> — the step's `if:` expression, a folded (`>-`) value
+# joined onto one line. Prints nothing when the step has no `if:`.
+extract_if() {
+  awk -v name="$1" '
+    state == 0 && $0 == "      - name: " name { state = 1; next }
+    state == 1 && $0 ~ /^      - name: / { exit }
+    state == 1 && $0 ~ /^        if: / {
+      v = substr($0, 13)
+      if (v == ">-" || v == ">" || v == "|") { state = 2; next }
+      print v; exit
+    }
+    state == 2 {
+      if ($0 ~ /^          /) { sub(/^ +/, ""); printf "%s ", $0; next }
+      exit
+    }
+  ' "$workflow"
+}
+
+# eval_if <expression> <outputs file> — evaluates a step `if:` against the
+# fresh_check outputs, under the implicit success() (every earlier step
+# passed). STRICT: it models `steps.fresh_check.outputs.<name>`, string
+# literals, ==, !=, &&, ||, ! and parentheses — anything else (a function
+# call, another step's outputs) is a loud error, never a guess. Prints
+# true/false.
+eval_if() {
+  python3 - "$1" "$2" <<'PY'
+import re, sys
+expr, outputs_path = sys.argv[1].strip(), sys.argv[2]
+outputs = {}
+for line in open(outputs_path):
+    line = line.rstrip("\n")
+    if "=" in line:
+        k, v = line.split("=", 1)
+        outputs[k] = v
+if expr.startswith("${{") and expr.endswith("}}"):
+    expr = expr[3:-2].strip()
+if not expr:
+    sys.exit("eval_if: empty expression")
+tokens = re.findall(r"steps\.fresh_check\.outputs\.[A-Za-z_][A-Za-z0-9_]*|'[^']*'|==|!=|&&|\|\||!|\(|\)|\S+", expr)
+out = []
+for t in tokens:
+    if t.startswith("steps.fresh_check.outputs."):
+        out.append(repr(outputs.get(t.rsplit(".", 1)[1], "")))
+    elif t.startswith("'") and t.endswith("'"):
+        out.append(repr(t[1:-1]))
+    elif t in ("==", "!=", "(", ")"):
+        out.append(t)
+    elif t == "&&":
+        out.append("and")
+    elif t == "||":
+        out.append("or")
+    elif t == "!":
+        out.append("not")
+    else:
+        sys.exit("eval_if: unmodelled token %r in %r" % (t, expr))
+print("true" if eval(" ".join(out), {"__builtins__": {}}) else "false")
+PY
+}
+
+FRESH_STEP="Check schema.pg.sql.generated is fresh"
+PR_STEP="Open or update the schema refresh PR"
+SWEEP_STEP="Sweep the refresh PR (ready it once it carries checks; page if parked)"
+
+fresh_body="$work/fresh-step.sh"
+sweep_body="$work/sweep-step.sh"
+extract_run "$FRESH_STEP" "$fresh_body"
+extract_run "$SWEEP_STEP" "$sweep_body"
+pr_if="$(extract_if "$PR_STEP")"
+sweep_if="$(extract_if "$SWEEP_STEP")"
+[ -n "$pr_if" ] && [ -n "$sweep_if" ] || {
+  echo "::error::could not extract the PR step's or the sweep step's if: from $workflow"
+  exit 1
+}
+
+echo ""
+echo "Static properties of the sweep step:"
+assert "sweep calls the script with --max-age-hours 48" 1 "$(grep -c 'bash scripts/ci/ready-bot-draft-pr.sh .*--max-age-hours 48' "$sweep_body" || true)"
+assert "sweep: no '|| true'" 0 "$(grep -vE '^[[:space:]]*#' "$sweep_body" | grep -c '|| true' || true)"
+# Belt and braces over the behavioural case below: the sweep's selector must
+# not mention drift at all.
+assert "sweep's if: does not reference drift" 0 "$(printf '%s\n' "$sweep_if" | grep -c 'drift' || true)"
+# The sweep must be the LAST step that touches the PR: after the PR step.
+pr_line_no="$(grep -nF -- "- name: $PR_STEP" "$workflow" | cut -d: -f1)"
+sweep_line_no="$(grep -nF -- "- name: $SWEEP_STEP" "$workflow" | cut -d: -f1)"
+assert "sweep step comes after the PR step" 1 "$([ "${sweep_line_no:-0}" -gt "${pr_line_no:-0}" ] && echo 1 || echo 0)"
+
+# --- fresh_check fixture ------------------------------------------------------
+# A checkout whose regenerate script is a stub that writes $REGEN_STUB_SOURCE
+# over the dump. The step's own shape guards need every schema present and a
+# non-shrinking line count, so the base dump carries all of them.
+fc="$work/fc-repo"
+mkdir -p "$fc/src-tauri/scripts"
+base_dump="$work/dump.base.sql"
+{
+  echo "-- Dumped by pg_dump version 16.0"
+  for schema in project coord agent auth atlas_managed; do
+    echo "CREATE TABLE ${schema}.t ();"
+  done
+} > "$base_dump"
+drift_dump="$work/dump.drift.sql"
+{ cat "$base_dump"; echo "CREATE TABLE coord.brand_new_table ();"; } > "$drift_dump"
+cat > "$fc/src-tauri/scripts/regenerate_schema_pg_sql.sh" <<'STUB'
+#!/usr/bin/env bash
+cp "${REGEN_STUB_SOURCE:?}" src-tauri/schema.pg.sql.generated
+STUB
+
+# run_fresh <SELF_HEAL> <fresh-dump> — echoes the exit code; outputs in
+# $work/fresh.out, summary in $work/fresh.summary.md, log in $work/fresh.log.
+run_fresh() {
+  cp "$base_dump" "$fc/src-tauri/schema.pg.sql.generated"
+  : > "$work/fresh.out"
+  : > "$work/fresh.summary.md"
+  local rc=0
+  (
+    cd "$fc"
+    PATH="$bin:$PATH" \
+    GIT_STUB_LOG="$work/git.log" \
+    REGEN_STUB_SOURCE="$2" \
+    SELF_HEAL="$1" \
+    CLORINDE_PG_CONTAINER="" \
+    CLORINDE_PG_HOST=localhost \
+    CLORINDE_PG_PORT=5433 \
+    PGPASSWORD=stub \
+    REGEN_SKIP_ATLAS=1 \
+    RUNNER_TEMP="$runner_temp" \
+    GITHUB_OUTPUT="$work/fresh.out" \
+    GITHUB_STEP_SUMMARY="$work/fresh.summary.md" \
+    bash "$fresh_body"
+  ) > "$work/fresh.log" 2>&1 || rc=$?
+  echo "$rc"
+}
+
+# run_sweep — echoes the exit code; stdout+stderr in $work/sweep.log, gh keys in
+# $work/gh.log, summary in $work/sweep.summary.md.
+run_sweep() {
+  : > "$work/gh.log"
+  : > "$work/sweep.summary.md"
+  local rc=0
+  (
+    cd "$work/repo"
+    PATH="$bin:$PATH" \
+    GH_STUB_LOG="$work/gh.log" \
+    GH_STUB_FAIL="" \
+    GH_STUB_READY_LINE="${GH_STUB_READY_LINE:-}" \
+    GH_STUB_CHECKS="${GH_STUB_CHECKS:-3}" \
+    GH_STUB_GRAPHQL_ISDRAFT="${GH_STUB_GRAPHQL_ISDRAFT:-false}" \
+    GH_TOKEN="stub-token" \
+    REPO="qontinui/qontinui-runner" \
+    BRANCH="chore/schema-pg-sql-refresh" \
+    HEALED="$(sed -n 's/^healed=//p' "$work/fresh.out")" \
+    RUNNER_TEMP="$runner_temp" \
+    GITHUB_STEP_SUMMARY="$work/sweep.summary.md" \
+    bash "$sweep_body"
+  ) > "$work/sweep.log" 2>&1 || rc=$?
+  echo "$rc"
+}
+
+out_of() { sed -n "s/^$1=//p" "$work/fresh.out"; }
+
+echo ""
+echo "Workflow cases (fresh_check -> if: -> sweep):"
+
+# A. The case this plan exists for: NO drift on a self-heal run, and an open
+#    DRAFT refresh PR from an earlier night whose head carries checks. The PR
+#    step must not run (nothing to deliver); the sweep must, and must ready it.
+rc="$(run_fresh true "$base_dump")"
+assert "no drift: fresh_check exit code" 0 "$rc"
+assert "no drift: drift=false" "false" "$(out_of drift)"
+assert "no drift: healed=false" "false" "$(out_of healed)"
+assert "no drift: PR step does not run" "false" "$(eval_if "$pr_if" "$work/fresh.out")"
+assert "no drift: sweep step runs" "true" "$(eval_if "$sweep_if" "$work/fresh.out")"
+rc="$(run_sweep)"
+assert "no drift: sweep exit code" 0 "$rc"
+assert "no drift: sweep invoked the script and readied the draft" 1 "$(grep -c '^readied #4242$' "$work/sweep.log" || true)"
+assert "no drift: sweep called the ready mutation once" 1 "$(grep -c '^graphql$' "$work/gh.log" || true)"
+assert "no drift: sweep summary names the outcome" 1 "$(grep -c 'sweep outcome: `readied #4242`' "$work/sweep.summary.md" || true)"
+
+# B. Drift on a self-heal run: healed=true, the summary names the drift, and
+#    both the PR step and the sweep run.
+rc="$(run_fresh true "$drift_dump")"
+assert "drift + self-heal: fresh_check exit code (green: healed)" 0 "$rc"
+assert "drift + self-heal: drift=true" "true" "$(out_of drift)"
+assert "drift + self-heal: healed=true" "true" "$(out_of healed)"
+assert "drift + self-heal: summary says HEALED, not fresh" 1 "$(grep -c 'drift HEALED' "$work/fresh.summary.md" || true)"
+assert "drift + self-heal: summary names the drifted table" 1 "$(grep -c 'coord.brand_new_table' "$work/fresh.summary.md" || true)"
+assert "drift + self-heal: PR step runs" "true" "$(eval_if "$pr_if" "$work/fresh.out")"
+assert "drift + self-heal: sweep step runs" "true" "$(eval_if "$sweep_if" "$work/fresh.out")"
+
+# C. No drift, not a self-heal run (a PR or a non-main dispatch): neither runs.
+rc="$(run_fresh false "$base_dump")"
+assert "no drift, no self-heal: exit code" 0 "$rc"
+assert "no drift, no self-heal: healed=false" "false" "$(out_of healed)"
+assert "no drift, no self-heal: PR step does not run" "false" "$(eval_if "$pr_if" "$work/fresh.out")"
+assert "no drift, no self-heal: sweep does not run" "false" "$(eval_if "$sweep_if" "$work/fresh.out")"
+
+# D. Drift that may NOT self-heal: red, and healed=false (nothing was healed).
+rc="$(run_fresh false "$drift_dump")"
+assert "drift, no self-heal: exit code (red)" 1 "$rc"
+assert "drift, no self-heal: healed=false" "false" "$(out_of healed)"
+assert "drift, no self-heal: no HEALED summary" 0 "$(grep -c 'drift HEALED' "$work/fresh.summary.md" || true)"
+
+# E. The sweep over an already-ready PR, and over no PR at all, is a green no-op.
+GH_STUB_READY_LINE="$(printf '4242\tfalse\ta47f223e3a47f223e3a47f223e3a47f223e3a47f\tPR_kwDOtest4242\t2026-01-01T00:00:00Z\thttps://github.com/qontinui/qontinui-runner/pull/4242\tjspinak')"
+run_fresh true "$base_dump" > /dev/null
+rc="$(run_sweep)"
+assert "sweep over a ready PR: exit code" 0 "$rc"
+assert "sweep over a ready PR: already-ready, no mutation" "already-ready #4242 0" "$(tail -n1 "$work/sweep.log") $(grep -c '^graphql$' "$work/gh.log" || true)"
+GH_STUB_READY_LINE="none"
+rc="$(run_sweep)"
+GH_STUB_READY_LINE=""
+assert "sweep with no PR: exit code" 0 "$rc"
+assert "sweep with no PR: no-pr" "no-pr" "$(tail -n1 "$work/sweep.log")"
+
+# --- Mutation proofs ----------------------------------------------------------
+if [ -z "${SCHEMA_STEP_MUTANT:-}" ]; then
+  echo ""
+  echo "Mutation proofs (each broken workflow must be caught by its named case):"
+
+  # mutate <name> <awk-program over the workflow> <case that must FAIL>
+  mutate() {
+    local name="$1" prog="$2" want="$3"
+    local mutant="$work/mutant-$name.yml"
+    awk "$prog" "$real_workflow" > "$mutant"
+    local changed
+    changed="$( { diff "$real_workflow" "$mutant" || true; } | { grep -c '^>' || true; } )"
+    if [ "$changed" != "1" ]; then
+      assert "mutant '$name': changed exactly one line" 1 "$changed"
+      return
+    fi
+    local rc=0
+    SCHEMA_STEP_MUTANT=1 SCHEMA_WORKFLOW_UNDER_TEST="$mutant" \
+      bash "${BASH_SOURCE[0]}" > "$work/mutant-$name.out" 2>&1 || rc=$?
+    assert "mutant '$name': suite exits non-zero" 1 "$([ "$rc" -ne 0 ] && echo 1 || echo 0)"
+    assert "mutant '$name': caught by '$want'" 1 \
+      "$( { grep -F "FAIL  $want" "$work/mutant-$name.out" || true; } | head -n1 | wc -l | tr -d ' ')"
+  }
+
+  # Gate the sweep on drift (the regression: a no-drift night would then never
+  # re-decide a parked draft).
+  mutate sweep-gated-on-drift \
+    "BEGIN { want = \"      - name: $SWEEP_STEP\" }
+     \$0 == want { in_sweep = 1 }
+     in_sweep && /^        if: / { \$0 = \"        if: steps.fresh_check.outputs.drift == 'true' && steps.fresh_check.outputs.self_heal == 'true'\"; in_sweep = 0 }
+     { print }" \
+    "no drift: sweep step runs"
+  # Hard-code healed=false (green-because-healed indistinguishable again).
+  mutate healed-hardcoded-false \
+    '$0 == "            echo \"healed=$healed\"" { $0 = "            echo \"healed=false\"" } { print }' \
+    "drift + self-heal: healed=true"
+fi
 echo ""
 if [ "$failures" -ne 0 ]; then
   echo "FAILED: $failures assertion(s)"

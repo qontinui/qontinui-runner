@@ -47,7 +47,8 @@ name: sibling pin bump
 # ---------------------------------------------------------------------------
 #
 #   - schedule (daily): the bump cadence itself. Behind-ness is surfaced as a
-#     draft PR, never as a red.
+#     PR — born a draft, auto-readied once its head carries checks — never as
+#     a red.
 #   - workflow_dispatch: bump on demand when a sibling lands something you want
 #     now. Also the only way to satisfy "the mechanism has produced one bump PR"
 #     without waiting a day.
@@ -69,7 +70,22 @@ name: sibling pin bump
 # (`crates/coord/src/ci_baseline.rs`: `assert!(!establishes_main_baseline
 # (Some("schedule")))`). A schedule-driven required check would freeze the
 # baseline with no in-repo commit able to thaw it. The bump lands as an ordinary
-# draft PR and is gated by the ordinary required checks on that PR.
+# PR and is gated by the ordinary required checks on that PR.
+#
+# ---------------------------------------------------------------------------
+# BORN A DRAFT, READIED BY MEASUREMENT
+# ---------------------------------------------------------------------------
+#
+# The PR is created with `--draft` so a PR that may carry no checks (the
+# GITHUB_TOKEN arm below) cannot sit in a merge-train slot. But coord does not
+# propose drafts, so a draft nothing un-drafts never lands: #1496 sat 18 days
+# with 25 green check runs on its head. scripts/ci/ready-bot-draft-pr.sh —
+# shared with schema-pg-sql-freshness-nightly.yml, and tested by that
+# workflow's selftest — marks it ready once its head carries >= 1 check run,
+# leaves a zero-check PR a draft, and pages once on a draft parked past 48h.
+# It runs right after the PR is written AND in the last step of every
+# scheduled/dispatched default-branch run, drift or not.
+# Plan: plans/2026-09-17-atlas-self-heal-files-its-own-fix-as-a-draft-and-nothing-lands-it.md
 #
 # ---------------------------------------------------------------------------
 # THE PR-CREATION PRECONDITION
@@ -125,7 +141,9 @@ jobs:
       cancel-in-progress: false
 
     # `contents: write` pushes the bump branch; `pull-requests: write` lets the
-    # bump step list/edit/reopen its PR. A job-level block REPLACES the
+    # bump step list/edit/reopen its PR, and lets the sweep step mark it ready
+    # for review and page on it (GITHUB_TOKEN; verified present for plan
+    # 2026-09-17-atlas-self-heal-files-its-own-fix-as-a-draft-and-nothing-lands-it). A job-level block REPLACES the
     # workflow-level one wholesale rather than merging with it, so everything
     # this job needs is stated here. Permissions are not event-conditional — a
     # same-repo `pull_request` run carries this token too — so the gating is in
@@ -489,9 +507,21 @@ jobs:
             self_heal=true
           fi
 
+          # `sweep` is self_heal WITHOUT the drift term: every schedule or
+          # dispatch on the default branch, whether or not a pin moved. The
+          # last step re-decides the bump PR's draft state on it — a quiet day
+          # (no drift, so the PR step is skipped) is exactly when a parked
+          # draft from an earlier day still needs deciding.
+          sweep=false
+          if [ "$GITHUB_EVENT_NAME" != "pull_request" ] \
+             && [ "$GITHUB_REF" = "refs/heads/${DEFAULT_BRANCH}" ]; then
+            sweep=true
+          fi
+
           {
             echo "drift=$drift"
             echo "self_heal=$self_heal"
+            echo "sweep=$sweep"
           } >> "$GITHUB_OUTPUT"
 
           # Behind-but-not-self-healing splits two ways, and only one of them is
@@ -758,8 +788,11 @@ jobs:
 
           ---
 
-          **Opened as a draft on purpose**, so a PR that may carry no checks cannot sit in a
-          merge-train slot. Mark it ready for review once CI is satisfied.
+          **Born a draft on purpose**, so a PR that may carry no checks cannot sit in a
+          merge-train slot — and **auto-readied** by `scripts/ci/ready-bot-draft-pr.sh` as soon as
+          its head carries at least one check run, so coord's merge train can land it without a
+          human. Every scheduled run re-decides this; a draft that still has no checks after 48
+          hours is paged once on this PR.
           EOF
             if [ "$PAT_AVAILABLE" = "true" ]; then
               cat <<'EOF'
@@ -772,8 +805,9 @@ jobs:
 
           Authored with `GITHUB_TOKEN`, which by design does **not** fire `pull_request`
           workflows — so it starts with no checks at all, and the drift test this bump exists
-          to exercise has NOT run. Close and reopen it (that fires `reopened`), or push an
-          empty commit, before trusting it.
+          to exercise has NOT run, and it stays a draft until checks exist. Close and reopen it
+          by hand (that fires `reopened`), or push an empty commit; the next scheduled run then
+          marks it ready.
           EOF
             fi
             cat <<'EOF'
@@ -815,7 +849,61 @@ jobs:
             fi
             echo "Opened bump PR: $url"
           fi
+
+          # Born a draft (the create above passes --draft), so a PR that may
+          # carry no checks cannot sit in a merge-train slot. coord does not
+          # propose drafts, so decide it now by MEASUREMENT: >= 1 check run on
+          # the head => ready; 0 => stays a draft. The wait covers the seconds
+          # between the force-push above and the check runs it fired
+          # registering. `tee` keeps the script's ::error:: lines in the log;
+          # under pipefail the `if !` sees the script's own exit status.
+          ready_log="$RUNNER_TEMP/ready-bot-draft-pr.pr-step.log"
+          if ! bash scripts/ci/ready-bot-draft-pr.sh --repo "$REPO" --branch "$BRANCH" --wait-for-checks-seconds 300 | tee "$ready_log"; then
+            pr_write_failed "Marking the bump PR ready for review (scripts/ci/ready-bot-draft-pr.sh; its ::error:: above names the gh call)"
+          fi
           {
             echo ""
             echo "Bump PR: $url"
+            echo ""
+            echo "Bump PR draft/ready state: \`$(tail -n1 "$ready_log")\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Re-decide the bump PR's draft state on EVERY scheduled/dispatched
+      # default-branch run — pins moved or not. The PR step above runs only
+      # when a pin moved, and decides at one instant; a PR created on the
+      # GITHUB_TOKEN arm, or before its checks registered, would otherwise stay
+      # a draft until the next bump. Keyed on `sweep` (self_heal without the
+      # drift term), under the default success() semantics: a skipped step
+      # does not fail the job, while an earlier FAILED step stops this one.
+      #
+      # This is the LAST step that touches the PR, deliberately after every
+      # `isDraft` read — the schemas step's lock-refresh skip and the PR step's
+      # force-push guard — so it never changes an answer those reads depend on
+      # within one run. The next night a readied PR is handled by the PR
+      # step's existing ready arm (comment, never force-push).
+      #
+      # GITHUB_TOKEN under the job's `pull-requests: write` carries the
+      # markPullRequestReadyForReview mutation and the page comment (only
+      # `create` needs the PAT). --max-age-hours 48 (two nightlies) pages once
+      # on a zero-check draft parked past the budget.
+      - name: Sweep the bump PR (ready it once it carries checks; page if parked)
+        if: steps.scan.outputs.sweep == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: chore/sibling-pin-bump
+        run: |
+          set -euo pipefail
+          sweep_log="$RUNNER_TEMP/ready-bot-draft-pr.sweep.log"
+          if ! bash scripts/ci/ready-bot-draft-pr.sh --repo "$REPO" --branch "$BRANCH" --max-age-hours 48 | tee "$sweep_log"; then
+            echo "::error::The bump-PR sweep could not decide the draft/ready state of '$BRANCH''s PR on $REPO (see the ::error:: above)."
+            echo "::error::It runs on GITHUB_TOKEN under the job's 'pull-requests: write'; a refusal means that permissions block has drifted."
+            exit 1
+          fi
+          {
+            echo ""
+            echo "### bump-PR sweep"
+            echo ""
+            echo "Outcome: \`$(tail -n1 "$sweep_log")\`"
           } >> "$GITHUB_STEP_SUMMARY"
