@@ -5,8 +5,9 @@
 
 use super::PgDb;
 use crate::scheduler::{
-    scheduled_task_type_default, CatchUpPolicy, ConditionScheduleConfig, ScheduleExpression,
-    ScheduledTask, ScheduledTaskStatus, ScheduledTaskType, SchedulerSettings, TaskExecutionRecord,
+    scheduled_task_type_default, CatchUpPolicy, ConditionScheduleConfig, ConditionStatus,
+    ScheduleConditions, ScheduleExpression, ScheduledTask, ScheduledTaskStatus, ScheduledTaskType,
+    SchedulerSettings, TaskExecutionRecord,
 };
 use chrono::{DateTime, Utc};
 use tracing::warn;
@@ -23,22 +24,30 @@ use tracing::warn;
 /// added by the v12 (Phase A) additive migration in `schema.pg.sql` and
 /// self-heal on next runner restart per
 /// `proj_pg_schema_drift_audit.md`.
+///
+/// `conditions` (JSONB, qontinui-web revision
+/// `sched_cond_01_scheduled_tasks_conditions`; self-healed on an embedded PG by
+/// `PgDb::verify_and_provision`) and `condition_status` (TEXT holding JSON)
+/// are the last two. Before plan
+/// `2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-so-a-24x7-box-never-gets-one`
+/// Phase 4c neither was read, so every task loaded with no conditions and
+/// every schedule condition was inert.
 const SELECT_TASK_COLS: &str = r#"
     id, name, description, enabled,
     schedule_type, schedule_value, task_config,
     skip_if_completed, auto_fix_on_failure, success_criteria,
     created_at, modified_at, next_run, last_run_id,
     catch_up_policy, catch_up_grace_seconds,
-    consecutive_launch_failures, launch_failure_backoff_seconds
+    consecutive_launch_failures, launch_failure_backoff_seconds,
+    conditions, condition_status
 "#;
 
 /// Whether this store round-trips a task's `ScheduleConditions`: true iff the
-/// column list it reads names a `conditions` column. Today it does not —
-/// `project.scheduled_tasks` has no such column, so conditions are dropped on
-/// write and read back as `None` (see
-/// `crate::scheduler_service::enforced_conditions`). Derived from
-/// [`SELECT_TASK_COLS`] rather than declared, so it cannot disagree with the
-/// query that decides it.
+/// column list it reads names a `conditions` column (it does since Phase 4c;
+/// see `crate::scheduler_service::enforced_conditions`, which serves the
+/// scheduler's condition list on `/health` only while this holds). Derived
+/// from [`SELECT_TASK_COLS`] rather than declared, so it cannot disagree with
+/// the query that decides it.
 pub fn task_store_persists_conditions() -> bool {
     SELECT_TASK_COLS
         .split(|c: char| c == ',' || c.is_whitespace())
@@ -74,12 +83,67 @@ fn catch_up_policy_to_str(policy: CatchUpPolicy) -> &'static str {
     }
 }
 
-/// Map a tokio_postgres Row to a ScheduledTask.
+/// Serialize a task's conditions for the `conditions` JSONB column.
+fn conditions_to_json(
+    conditions: Option<&ScheduleConditions>,
+) -> Result<Option<serde_json::Value>, String> {
+    conditions
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|e| format!("Serialize conditions: {e}"))
+}
+
+/// Parse the `conditions` column. An unparseable value is an ERROR, never
+/// "no conditions": reading it as `None` would run the task ungated, so the
+/// caller refuses to load that task instead (fail closed).
+fn conditions_from_json(
+    task_id: &str,
+    raw: Option<serde_json::Value>,
+) -> Result<Option<ScheduleConditions>, String> {
+    raw.map(|value| {
+        serde_json::from_value(value).map_err(|e| {
+            format!("task {task_id}: stored conditions are unreadable ({e}); refusing to load it")
+        })
+    })
+    .transpose()
+}
+
+/// Parse the `condition_status` column. It is transient wait state (when the
+/// wait began, the last sub-condition results), so an unreadable value is
+/// logged and dropped — the wait restarts — rather than blocking the task.
+fn condition_status_from_text(task_id: &str, raw: Option<String>) -> Option<ConditionStatus> {
+    let raw = raw?;
+    match serde_json::from_str(&raw) {
+        Ok(status) => Some(status),
+        Err(e) => {
+            warn!("task {task_id}: stored condition_status is unreadable ({e}); restarting the wait");
+            None
+        }
+    }
+}
+
+/// Map rows to tasks, dropping (with an ERROR log) any whose conditions are
+/// unreadable — such a task must not run, and running it ungated is the only
+/// alternative a loader has.
+fn rows_to_scheduled_tasks(rows: &[tokio_postgres::Row]) -> Vec<ScheduledTask> {
+    rows.iter()
+        .filter_map(|row| match row_to_scheduled_task(row) {
+            Ok(task) => Some(task),
+            Err(e) => {
+                tracing::error!("scheduler: {e}");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Map a tokio_postgres Row to a ScheduledTask. `Err` when the row's
+/// `conditions` cannot be parsed (see [`conditions_from_json`]).
 #[expect(
     clippy::disallowed_methods,
     reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
 )]
-fn row_to_scheduled_task(row: &tokio_postgres::Row) -> ScheduledTask {
+fn row_to_scheduled_task(row: &tokio_postgres::Row) -> Result<ScheduledTask, String> {
     let schedule_type: String = row.get(4);
     let schedule_value: String = row.get(5);
     let task_config_json: String = row.get(6);
@@ -129,9 +193,12 @@ fn row_to_scheduled_task(row: &tokio_postgres::Row) -> ScheduledTask {
     let catch_up_grace_seconds: i32 = row.get(15);
     let consecutive_launch_failures: i32 = row.get(16);
     let launch_failure_backoff_seconds: i32 = row.get(17);
+    let id: String = row.get(0);
+    let conditions = conditions_from_json(&id, row.get(18))?;
+    let condition_status = condition_status_from_text(&id, row.get(19));
 
-    ScheduledTask {
-        id: row.get(0),
+    Ok(ScheduledTask {
+        id,
         name: row.get(1),
         description: row.get(2),
         enabled: row.get(3),
@@ -144,8 +211,8 @@ fn row_to_scheduled_task(row: &tokio_postgres::Row) -> ScheduledTask {
         modified_at: modified.to_rfc3339(),
         next_run: next.map(|dt| dt.to_rfc3339()),
         last_run: None,
-        conditions: None,
-        condition_status: None,
+        conditions,
+        condition_status,
         catch_up_policy: parse_catch_up_policy(&catch_up_policy_raw),
         // INTEGER columns surface as i32; clamp negatives to 0 defensively
         // (NOT NULL DEFAULT in schema, but drift audits remind us that
@@ -153,7 +220,7 @@ fn row_to_scheduled_task(row: &tokio_postgres::Row) -> ScheduledTask {
         catch_up_grace_seconds: catch_up_grace_seconds.max(0) as u32,
         consecutive_launch_failures: consecutive_launch_failures.max(0) as u32,
         launch_failure_backoff_seconds: launch_failure_backoff_seconds.max(0) as u32,
-    }
+    })
 }
 
 /// Convert a ScheduleExpression to (type, value) strings for storage.
@@ -264,7 +331,7 @@ impl PgDb {
             .await
             .map_err(|e| crate::database::pg::pg_err("PG get_all_scheduled_tasks", &e))?;
 
-        Ok(rows.iter().map(row_to_scheduled_task).collect())
+        Ok(rows_to_scheduled_tasks(&rows))
     }
 
     /// Retrieve a single scheduled task by ID, or None if not found.
@@ -286,7 +353,7 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG get_scheduled_task {}: {}", id, e))?;
 
-        Ok(row.as_ref().map(row_to_scheduled_task))
+        row.as_ref().map(row_to_scheduled_task).transpose()
     }
 
     /// Insert a new scheduled task.
@@ -310,6 +377,13 @@ impl PgDb {
             task.consecutive_launch_failures.min(i32::MAX as u32) as i32;
         let launch_failure_backoff_seconds_i32: i32 =
             task.launch_failure_backoff_seconds.min(i32::MAX as u32) as i32;
+        let conditions_json = conditions_to_json(task.conditions.as_ref())?;
+        let condition_status_text: Option<String> = task
+            .condition_status
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| format!("Serialize condition_status: {e}"))?;
 
         conn.execute(
             r#"
@@ -319,9 +393,10 @@ impl PgDb {
                  skip_if_completed, auto_fix_on_failure, success_criteria,
                  created_at, modified_at, next_run, last_run_id,
                  catch_up_policy, catch_up_grace_seconds,
-                 consecutive_launch_failures, launch_failure_backoff_seconds)
+                 consecutive_launch_failures, launch_failure_backoff_seconds,
+                 conditions, condition_status)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                    $11, $12, $13, $14, $15, $16, $17, $18)
+                    $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
             "#,
             &[
                 &task.id as &(dyn tokio_postgres::types::ToSql + Sync),
@@ -351,6 +426,8 @@ impl PgDb {
                 &catch_up_grace_seconds_i32,
                 &consecutive_launch_failures_i32,
                 &launch_failure_backoff_seconds_i32,
+                &conditions_json,
+                &condition_status_text,
             ],
         )
         .await
@@ -390,6 +467,13 @@ impl PgDb {
             task.consecutive_launch_failures.min(i32::MAX as u32) as i32;
         let launch_failure_backoff_seconds_i32: i32 =
             task.launch_failure_backoff_seconds.min(i32::MAX as u32) as i32;
+        let conditions_json = conditions_to_json(task.conditions.as_ref())?;
+        let condition_status_text: Option<String> = task
+            .condition_status
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| format!("Serialize condition_status: {e}"))?;
 
         let updated = conn
             .execute(
@@ -410,7 +494,9 @@ impl PgDb {
                 catch_up_policy = $13,
                 catch_up_grace_seconds = $14,
                 consecutive_launch_failures = $15,
-                launch_failure_backoff_seconds = $16
+                launch_failure_backoff_seconds = $16,
+                conditions = $19,
+                condition_status = $20
             WHERE id = $17 AND modified_at = $18
             "#,
                 &[
@@ -438,6 +524,8 @@ impl PgDb {
                     &launch_failure_backoff_seconds_i32,
                     &task.id,
                     &expected,
+                    &conditions_json,
+                    &condition_status_text,
                 ],
             )
             .await
@@ -909,5 +997,133 @@ impl PgDb {
         .map_err(|e| crate::database::pg::pg_err("PG update_scheduler_settings", &e))?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scheduler::{ProbeCondition, ScheduledTaskExt};
+
+    fn probe_conditions() -> ScheduleConditions {
+        ScheduleConditions {
+            require_probe: Some(ProbeCondition {
+                enabled: true,
+                command: vec!["sh".into(), "-c".into(), "exit 0".into()],
+                poll_seconds: 300,
+                timeout_seconds: 60,
+            }),
+            timeout_minutes: Some(120),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_store_reads_the_conditions_columns() {
+        assert!(task_store_persists_conditions());
+        // `condition_status` alone must not satisfy the column check.
+        assert!(!"condition_status"
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .any(|column| column == "conditions"));
+    }
+
+    #[test]
+    fn conditions_round_trip_through_the_column_encoding() {
+        let conditions = probe_conditions();
+        let json = conditions_to_json(Some(&conditions)).unwrap();
+        assert_eq!(json.as_ref().unwrap()["requireProbe"]["pollSeconds"], 300);
+        let back = conditions_from_json("t", json).unwrap().unwrap();
+        assert_eq!(back.require_probe, conditions.require_probe);
+        assert_eq!(back.timeout_minutes, Some(120));
+        assert_eq!(conditions_to_json(None).unwrap(), None);
+        assert!(conditions_from_json("t", None).unwrap().is_none());
+    }
+
+    /// An unreadable `conditions` value is an error, never "no conditions" —
+    /// the latter would run the task ungated.
+    #[test]
+    fn unreadable_conditions_fail_closed() {
+        let bad = serde_json::json!({ "requireProbe": { "enabled": "yes" } });
+        let err = conditions_from_json("t1", Some(bad)).unwrap_err();
+        assert!(err.contains("t1") && err.contains("refusing"), "{err}");
+    }
+
+    #[test]
+    fn an_unreadable_condition_status_restarts_the_wait() {
+        assert!(condition_status_from_text("t", Some("not json".into())).is_none());
+        let status = crate::scheduler::condition_status_default();
+        let text = serde_json::to_string(&status).unwrap();
+        let back = condition_status_from_text("t", Some(text)).unwrap();
+        assert_eq!(back.waiting_since, status.waiting_since);
+    }
+
+    // PG-gated, per the `database/pg/*` convention (see event_log.rs):
+    //   DATABASE_URL=... cargo test --bin qontinui-runner \
+    //     database::pg::scheduler -- --ignored
+    #[tokio::test]
+    #[ignore = "requires PG via DATABASE_URL"]
+    async fn conditions_and_condition_status_survive_insert_read_and_update() {
+        let db = PgDb::new_for_test().await;
+        let mut task = ScheduledTask::new(
+            "phase-4c round trip".to_string(),
+            None,
+            ScheduleExpression::Cron("0 20 7 * * *".to_string()),
+            scheduled_task_type_default(),
+        );
+        task.conditions = Some(probe_conditions());
+        db.insert_scheduled_task(&task).await.expect("insert");
+
+        let read = db
+            .get_scheduled_task(&task.id)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(
+            read.conditions.as_ref().and_then(|c| c.require_probe.clone()),
+            task.conditions.as_ref().and_then(|c| c.require_probe.clone()),
+            "require_probe must survive insert -> read"
+        );
+        assert!(read.has_conditions());
+        assert!(db
+            .get_all_scheduled_tasks()
+            .await
+            .expect("list")
+            .iter()
+            .any(|t| t.id == task.id && t.conditions.is_some()));
+
+        // condition_status written by the tick path reads back.
+        let mut status = crate::scheduler::condition_status_default();
+        status.probe_met = Some(false);
+        status.probe_detail = Some("exit 1".to_string());
+        db.update_task_condition_status(
+            &task.id,
+            Some(&serde_json::to_string(&status).unwrap()),
+        )
+        .await
+        .expect("status write");
+        let read = db.get_scheduled_task(&task.id).await.unwrap().unwrap();
+        assert_eq!(
+            read.condition_status.as_ref().and_then(|s| s.probe_detail.clone()),
+            Some("exit 1".to_string())
+        );
+
+        // An update clears the conditions, conditionally on modified_at.
+        let mut edited = read.clone();
+        edited.conditions = None;
+        edited.condition_status = None;
+        edited.touch();
+        assert!(db
+            .update_scheduled_task(&edited, &read.modified_at)
+            .await
+            .expect("update"));
+        // A second write against the now-stale snapshot is refused.
+        assert!(!db
+            .update_scheduled_task(&edited, &read.modified_at)
+            .await
+            .expect("stale update"));
+        let read = db.get_scheduled_task(&task.id).await.unwrap().unwrap();
+        assert!(read.conditions.is_none() && read.condition_status.is_none());
+
+        db.delete_scheduled_task(&task.id).await.expect("cleanup");
     }
 }

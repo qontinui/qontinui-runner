@@ -1005,6 +1005,33 @@ impl PgDb {
         // instead of binding the leftover copy.
         let _moved = atlas_managed_move::migrate_atlas_managed_tables(&mut conn).await;
 
+        // project.scheduled_tasks.conditions (JSONB) — the task's
+        // ScheduleConditions. AUTHORED by qontinui-web alembic revision
+        // `sched_cond_01_scheduled_tasks_conditions` (the table is in web's
+        // chain, not the runner's); mirrored here as a gated
+        // `ADD COLUMN IF NOT EXISTS` because an embedded Postgres (an end-user
+        // install) has no alembic and was provisioned from the bundled schema
+        // dump once, at creation — without this, a runner reading the column
+        // would fail every scheduled-task query on every such existing install.
+        // The alembic revision is itself `IF NOT EXISTS`, so whichever runs
+        // first, the other is a no-op. Gated on the table existing: on a
+        // database with no canonical schema yet this is skipped, and the
+        // schema apply creates the column.
+        conn.batch_execute(
+            "DO $$
+             BEGIN
+               IF EXISTS (
+                 SELECT 1 FROM information_schema.tables
+                 WHERE table_schema = 'project' AND table_name = 'scheduled_tasks'
+               ) THEN
+                 ALTER TABLE project.scheduled_tasks
+                     ADD COLUMN IF NOT EXISTS conditions JSONB;
+               END IF;
+             END $$;",
+        )
+        .await
+        .map_err(|e| format!("scheduled_tasks.conditions self-heal failed: {}", e))?;
+
         // spec-multi-app Stream E.1: backfill `app_id` onto
         // atlas_managed.proposal_events. The table predates the multi-tenant
         // model, so existing rows are migrated under the bootstrap app_id

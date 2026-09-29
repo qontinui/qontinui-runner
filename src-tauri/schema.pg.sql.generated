@@ -12995,7 +12995,8 @@ CREATE TABLE project.scheduled_tasks (
     catch_up_policy text DEFAULT 'run_once'::text NOT NULL,
     catch_up_grace_seconds integer DEFAULT 300 NOT NULL,
     consecutive_launch_failures integer DEFAULT 0 NOT NULL,
-    launch_failure_backoff_seconds integer DEFAULT 60 NOT NULL
+    launch_failure_backoff_seconds integer DEFAULT 60 NOT NULL,
+    conditions jsonb
 );
 
 

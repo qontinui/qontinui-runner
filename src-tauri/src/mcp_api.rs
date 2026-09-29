@@ -17910,21 +17910,20 @@ mod coord_provision_session_gate_tests {
             "{region}"
         );
         // And it renders as the JSON array a client reads: the evaluator's
-        // list when the task store persists conditions, otherwise empty.
+        // full list, now that the task store persists conditions (Phase 4c).
         let rendered = serde_json::json!({
             "schedulerConditions": crate::scheduler_service::enforced_conditions(),
         });
-        let expected = if crate::database::pg::scheduler::task_store_persists_conditions() {
+        assert!(crate::database::pg::scheduler::task_store_persists_conditions());
+        assert_eq!(
+            rendered["schedulerConditions"],
             serde_json::json!([
                 "require_idle",
                 "require_repo_inactive",
                 "require_probe",
                 "timeout_minutes"
             ])
-        } else {
-            serde_json::json!([])
-        };
-        assert_eq!(rendered["schedulerConditions"], expected);
+        );
     }
 
     /// Plan `2026-09-21-runner-blocking-pool-ratchets-to-peak-because-transcript-
