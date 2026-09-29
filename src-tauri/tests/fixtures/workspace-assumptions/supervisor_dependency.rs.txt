@@ -4,3 +4,8 @@ fn planted_supervisor_dependency() -> String {
     let _ = check_supervisor_available();
     "http://127.0.0.1:9875/health".to_string()
 }
+
+// The runner-local bare-port-constant refinement (code, literals blanked).
+fn planted_supervisor_port_constant() -> (&'static str, u16) {
+    ("supervisor", 9875)
+}

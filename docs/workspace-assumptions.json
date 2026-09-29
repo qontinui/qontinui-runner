@@ -9,7 +9,8 @@
       "symbol": "const DEFAULT_EMBEDDING_URL",
       "excerpt": "const DEFAULT_EMBEDDING_URL: &str = \"http://127.0.0.1:8001/api/embeddings/compute-text\";",
       "count": 1,
-      "disposition": "unreviewed"
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
     },
     {
       "class": "dev_ports",
@@ -97,7 +98,8 @@
       "symbol": "compute_embedding_sync",
       "excerpt": ".post(\"http://127.0.0.1:8001/api/embeddings/compute-text\")",
       "count": 1,
-      "disposition": "unreviewed"
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
     },
     {
       "class": "dev_ports",
@@ -1415,7 +1417,8 @@
       "symbol": "self_path_hit",
       "excerpt": "\"reaches its own tree through a `qontinui-claude-config` checkout\".to_string(),",
       "count": 1,
-      "disposition": "unreviewed"
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
     },
     {
       "class": "repo_layout",
@@ -1423,7 +1426,8 @@
       "symbol": "static CONFIG_REPO_CLAUDE_RE",
       "excerpt": "Lazy::new(|| Regex::new(r\"qontinui-claude-config[/\\\\]+\\.claude\\b\").expect(\"arm A regex\"));",
       "count": 1,
-      "disposition": "unreviewed"
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
     },
     {
       "class": "repo_layout",
@@ -1431,7 +1435,8 @@
       "symbol": "static ROOTED_TOKEN_RE",
       "excerpt": "r\"^(?:<workspace-root>\",",
       "count": 1,
-      "disposition": "unreviewed"
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
     },
     {
       "class": "repo_layout",
@@ -1439,7 +1444,8 @@
       "symbol": "build_and_publish",
       "excerpt": "debug!(\"worktree_census: no qontinui-root dir resolved — skipping\");",
       "count": 1,
-      "disposition": "unreviewed"
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
     },
     {
       "class": "repo_layout",
@@ -1454,6 +1460,15 @@
       "file": "src/agent_worktree/fs_backstop.rs",
       "symbol": "tick_once",
       "excerpt": "debug!(\"fs_backstop: no qontinui-root dir resolved — skipping\");",
+      "count": 1,
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/ai_router.rs",
+      "symbol": "route_with_learning",
+      "excerpt": "has_ui_component: context.prompt.to_lowercase().contains(\"ui-bridge\")",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -1495,7 +1510,8 @@
       "symbol": "Rung::describe",
       "excerpt": "\"found under `<workspace-root>/qontinui-runner/src-tauri/…` — this \\",
       "count": 1,
-      "disposition": "unreviewed"
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
     },
     {
       "class": "repo_layout",
@@ -1503,14 +1519,15 @@
       "symbol": "Rung::describe",
       "excerpt": "`qontinui-claude-config`) — answers only where that repo exists\"",
       "count": 1,
-      "disposition": "unreviewed"
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
     },
     {
       "class": "repo_layout",
       "file": "src/capability_manifest.rs",
       "symbol": "const CAPABILITY_SPECS",
       "excerpt": "`<workspace-root>/qontinui-claude-config/.claude/agents/*.md` off \\",
-      "count": 1,
+      "count": 2,
       "disposition": "unreviewed"
     },
     {
@@ -1526,6 +1543,14 @@
       "file": "src/capability_manifest.rs",
       "symbol": "const CAPABILITY_SPECS",
       "excerpt": "description: \"Import of `<workspace-root>/qontinui-claude-config/.claude/commands/*.md` \\",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/check_executor/command_builder.rs",
+      "symbol": "build_devtools_command",
+      "excerpt": "Ok((\"qontinui-devtools\".to_string(), args))",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -1555,11 +1580,60 @@
     },
     {
       "class": "repo_layout",
+      "file": "src/context/builtins.rs",
+      "symbol": "get_builtin_contexts",
+      "excerpt": "\"qontinui-mobile\".to_string(),",
+      "count": 2,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/context/builtins.rs",
+      "symbol": "get_builtin_contexts",
+      "excerpt": "\"qontinui-web\".to_string(),",
+      "count": 2,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/context/builtins.rs",
+      "symbol": "get_builtin_contexts",
+      "excerpt": "\"ui-bridge\".to_string(),",
+      "count": 7,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/context/builtins.rs",
+      "symbol": "get_builtin_contexts",
+      "excerpt": "category: Some(\"ui-bridge\".to_string()),",
+      "count": 4,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/context/builtins.rs",
+      "symbol": "get_builtin_contexts",
+      "excerpt": "file_patterns: Some(vec![\"**/qontinui-mobile/**\".to_string()]),",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/context/builtins.rs",
+      "symbol": "get_builtin_contexts",
+      "excerpt": "file_patterns: Some(vec![\"**/qontinui-web/**\".to_string()]),",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "repo_layout",
       "file": "src/coord_doctor.rs",
       "symbol": "render_onboarding_doc",
       "excerpt": "consts, and `coord-gates-and-access.md` in `qontinui-claude-config`.\\n\\n\",",
       "count": 1,
-      "disposition": "unreviewed"
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
     },
     {
       "class": "repo_layout",
@@ -1587,6 +1661,30 @@
     },
     {
       "class": "repo_layout",
+      "file": "src/database/pg/apps.rs",
+      "symbol": "const DEV_SIBLING_APPS",
+      "excerpt": "\"qontinui-supervisor\",",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/database/pg/apps.rs",
+      "symbol": "const DEV_SIBLING_APPS",
+      "excerpt": "\"qontinui-web\",",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/dev_services.rs",
+      "symbol": "get_default_dev_services",
+      "excerpt": "let web_dir = workspace.join(\"qontinui-web\");",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "repo_layout",
       "file": "src/env_agent/apply_repos.rs",
       "symbol": "apply_section_with",
       "excerpt": "\"Set $QONTINUI_ROOT, or the runner's `paths.workspace_root` setting, to the \\",
@@ -1607,7 +1705,8 @@
       "symbol": "claude_md_plain_ok",
       "excerpt": "(Some(\"@qontinui-claude-config/CLAUDE.md\"), None)",
       "count": 1,
-      "disposition": "unreviewed"
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
     },
     {
       "class": "repo_layout",
@@ -1622,6 +1721,14 @@
       "file": "src/env_agent/collectors.rs",
       "symbol": "const HARNESS_PLANS_REPO_DIR",
       "excerpt": "const HARNESS_PLANS_REPO_DIR: &str = \"qontinui-dev-notes\";",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/env_agent/collectors.rs",
+      "symbol": "const WEB_REPO_DIR",
+      "excerpt": "const WEB_REPO_DIR: &str = \"qontinui-web\";",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -1647,7 +1754,8 @@
       "symbol": "SkillParityViolation::describe",
       "excerpt": "qontinui-claude-config has no readable .claude/skills/{rel} — \\",
       "count": 1,
-      "disposition": "unreviewed"
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
     },
     {
       "class": "repo_layout",
@@ -1655,7 +1763,8 @@
       "symbol": "SkillParityViolation::describe",
       "excerpt": "qontinui-claude-config/.claude/skills/{rel} — sessions read the \\",
       "count": 1,
-      "disposition": "unreviewed"
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
     },
     {
       "class": "repo_layout",
@@ -1692,10 +1801,20 @@
     {
       "class": "repo_layout",
       "file": "src/fleet_commands.rs",
+      "symbol": "const FLEET_COMMANDS",
+      "excerpt": "(\"ui-bridge\", UI_BRIDGE),",
+      "count": 1,
+      "disposition": "unreviewed",
+      "capability": "fleet_commands"
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/fleet_commands.rs",
       "symbol": "with_provenance",
       "excerpt": "\"{PROVENANCE_KEY} source={} canonical=qontinui-claude-config:.claude/commands/{name}.md \\",
       "count": 1,
-      "disposition": "unreviewed"
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
     },
     {
       "class": "repo_layout",
@@ -1719,7 +1838,8 @@
       "symbol": "const WRITE_CONTRACT",
       "excerpt": "with (a runner scan uses `<repo>/<dir>`, e.g. `qontinui-dev-notes/prompts`). \\",
       "count": 1,
-      "disposition": "unreviewed"
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
     },
     {
       "class": "repo_layout",
@@ -1727,7 +1847,8 @@
       "symbol": "analyze_handler",
       "excerpt": "Json(api_error(format!(\"Cannot find qontinui-root: {}\", e))),",
       "count": 1,
-      "disposition": "unreviewed"
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
     },
     {
       "class": "repo_layout",
@@ -1742,6 +1863,30 @@
       "file": "src/mcp/task_runs.rs",
       "symbol": "migrate_task_run_logs",
       "excerpt": "Set $QONTINUI_ROOT (or the `paths.workspace_root` setting) to the \\",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/online_learning/context.rs",
+      "symbol": "normalize_domain",
+      "excerpt": "if lower.contains(\"frontend\") || lower.contains(\"ui-bridge\") {",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/orchestrator/learning_recorder.rs",
+      "symbol": "infer_domain_tags",
+      "excerpt": "tags.insert(\"ui-bridge\".to_string());",
+      "count": 2,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/planning_bridge.rs",
+      "symbol": "const HTN_SRC_REPOS",
+      "excerpt": "const HTN_SRC_REPOS: [&str; 2] = [\"qontinui\", \"multistate\"];",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -1766,6 +1911,15 @@
       "file": "src/reflection/workflow.rs",
       "symbol": "build_ui_bridge_completion_steps",
       "excerpt": "- Write the full plan to `qontinui-dev-notes/ui-bridge-implementation-plan.md`",
+      "count": 1,
+      "disposition": "unreviewed",
+      "note": "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/routing/q_router.rs",
+      "symbol": "Domain::from_domain_tags",
+      "excerpt": "if lower.contains(\"frontend\") || lower.contains(\"ui-bridge\") {",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -1795,6 +1949,22 @@
       "count": 1,
       "disposition": "unreviewed",
       "capability": "slash_commands"
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/ui_bridge_plugin.rs",
+      "symbol": "init",
+      "excerpt": "Builder::new(\"ui-bridge\")",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/workflow_generation/generator.rs",
+      "symbol": "generate_workflow",
+      "excerpt": "|| stage_json.contains(\"ui-bridge\");",
+      "count": 1,
+      "disposition": "unreviewed"
     },
     {
       "class": "repo_layout",
@@ -1923,6 +2093,15 @@
     },
     {
       "class": "supervisor_dependency",
+      "file": "src/env_agent/collectors.rs",
+      "symbol": "const KNOWN_DEV_PORTS",
+      "excerpt": "(\"supervisor\", 9875),",
+      "count": 1,
+      "disposition": "dev_only_surface",
+      "note": "Liveness probe of the dev-topology ports for the env report; 'closed' is the correct reading on an operator box."
+    },
+    {
+      "class": "supervisor_dependency",
       "file": "src/mcp/ai_session.rs",
       "symbol": "const AI_SESSION_RULES_SUPERVISOR_AVAILABLE",
       "excerpt": "**Supervisor API (port 9875):**",
@@ -1965,6 +2144,15 @@
       "count": 1,
       "disposition": "fallback_correct",
       "note": "Passes check_supervisor_available() to runner_rules_prefix, which picks the supervisor-DOWN rules block when it is false."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/mcp/app_discovery.rs",
+      "symbol": "const DESKTOP_APP_PORTS",
+      "excerpt": "9875,",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "One port in a discovery scan list; an absent listener is simply not discovered."
     },
     {
       "class": "supervisor_dependency",
