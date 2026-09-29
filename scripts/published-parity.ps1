@@ -72,34 +72,49 @@
 # WHAT THIS HARNESS CAN AND CANNOT SEE -- STATED, NOT IMPLIED
 # =============================================================================
 #
-# Even over the HTTP door, a freshly booted instance has not spawned an agent
-# session. Seven of the ten rows -- fleet_commands, fleet_skills, fleet_agents,
+# Seven of the ten rows -- fleet_commands, fleet_skills, fleet_agents,
 # agent_definitions, agent_commands_registry, agent_skills_registry,
-# slash_commands -- are filled by
-# the Phase 3 provisioning ledger, which records at SESSION SPAWN. No spawn, no
-# reading. They will report `unknown` on BOTH legs and land in the `unobserved`
-# bucket.
+# slash_commands -- are filled by the Phase 3 provisioning ledger, which records
+# at SESSION SPAWN. A harness that only boots an artifact and asks it a question
+# leaves all seven `unknown` on BOTH legs, and `unknown == unknown` is the
+# absence of two readings rather than agreement.
 #
-# This harness does NOT fake a spawn to fill them. A fabricated observation is
-# the exact defect class the manifest's honesty rule exists to prevent.
+# Since plan
+# 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports
+# (Phase 5) this harness DRIVES that provisioning through the artifact's own
+# doors before reading the manifest -- see Invoke-ParityProvisioningDrive. It
+# still does NOT fake a spawn: every row is filled by the artifact's real
+# provisioning code, reached through an HTTP door that artifact serves, or it
+# stays `unknown` with the refusing door named.
 #
-# It DOES take one real read it can take honestly: a best-effort
+#   POST /terminals                 fleet_commands, agent_commands_registry,
+#                                   fleet_skills, agent_skills_registry
+#                                   (acquire_for_terminal, the same chokepoint
+#                                   an operator's own terminal takes)
+#   POST /slash-commands/sync       slash_commands
+#   POST /capability-manifest/
+#        provision-probe            fleet_agents, agent_definitions -- the two
+#                                   rows written only by agent_runtime's spawn
+#                                   path. A 404 here means the ARTIFACT predates
+#                                   the probe route (every release up to and
+#                                   including v1.0.11 does), which reads as
+#                                   unknown(door_404...), never as absent rows.
+#
+# It also takes one read it could always take honestly: a best-effort
 # `GET /apps/qontinui-runner/spec/list`, which calls
 # `spec_api::storage::list_pages` through the real handler and so records a real
-# `spec_pages` observation. That is a genuine read through the production path,
-# not an injected value; when it fails (no database, no apps-registry row) the
+# `spec_pages` observation. When it fails (no database, no apps-registry row) the
 # row simply stays `unknown` and the report says so.
 #
-# So, today, the observable set over the HTTP door is at most:
-#
-#     workspace_root       always observed
-#     bundled_resources    observed once the app handle exists
-#     spec_pages           observed only if the warm-up read succeeds
-#
-# and the other seven are structurally out of reach until this harness can drive a
-# real session spawn on both legs. The report prints this per row, computed from
-# the data rather than asserted, so a reader can never mistake a thin
-# observation for a clean bill of health.
+# AND IT DOES NOT TRUST THE ANSWER. A capability manifest is a SELF-REPORT: a row
+# says which rung answered, never that a file landed. So after the drive the
+# harness LISTS `.claude/{commands,skills,agents}` in the scratch workdir itself
+# and compares the listing with the rows (Get-ParitySelfReportDisagreements). A
+# row claiming a rung over an empty directory -- or a directory with files under
+# a row that took no reading -- is reported as `self_report_disagrees`: a finding
+# about THIS INSTRUMENT, counted separately and never folded into parity_defects
+# or unobserved. The slash-commands verdict (`slash_commands_status`) is derived
+# from that listing too, not from the manifest's own claim.
 #
 # =============================================================================
 # NEVER THE DEV BINARY ON THE PUBLISHED LEG
@@ -138,7 +153,15 @@ param(
     [string]$SummaryOut = $null,
     # Emit one ::warning:: workflow annotation per differing row.
     [switch]$Annotate,
-    [int]$BootTimeoutSecs = 180
+    [int]$BootTimeoutSecs = 180,
+    # INSTRUMENT SELF-CHECK, not a parity run. Boots the DEVELOPMENT build twice
+    # -- once with QONTINUI_ROOT pointed at a real workspace, once at an empty
+    # directory -- drives provisioning on both, and requires the comparator to
+    # report at least one defect row. If it reports none, this harness cannot
+    # see a missing-checkout difference and every 0 it has ever printed was
+    # worthless. Needs no release and no installed exe, so it runs on a PR.
+    # Exit 1 means BLIND; exit 0 means the instrument demonstrably sees the class.
+    [switch]$NegativeControl
 )
 
 $ErrorActionPreference = "Stop"
@@ -284,7 +307,7 @@ function Stop-ParityProcessTree {
 }
 
 function Start-ParityRunner {
-    param([string]$ExePath, [int]$Port, [string]$Label)
+    param([string]$ExePath, [int]$Port, [string]$Label, [hashtable]$EnvOverrides = $null)
 
     # -LiteralPath: the published exe is "qontinui-runner.exe" under
     # "...\Qontinui Runner\". The space is harmless, but a wildcard
@@ -309,6 +332,14 @@ function Start-ParityRunner {
     # ARTIFACT, not from an environment this script arranged. Whatever
     # QONTINUI_ROOT happens to be is recorded in the report's observability
     # block so a reader can see what the two legs were measured under.
+    #
+    # $EnvOverrides is the ONE exception and it exists for exactly one caller:
+    # -NegativeControl, whose whole purpose is to vary the environment on
+    # purpose and check that this harness can still SEE the resulting
+    # difference. It is $null on every parity path, so the rule above holds
+    # wherever a parity number is produced. A future caller reaching for it to
+    # arrange a parity leg would be defeating the invariant, not using a
+    # feature.
     $prev = @{}
     $toSet = @{
         "QONTINUI_PORT"               = "$Port"
@@ -319,6 +350,9 @@ function Start-ParityRunner {
         "WEBVIEW2_USER_DATA_FOLDER"   = $webviewDir
         "QONTINUI_DISABLE_KEYCHAIN"   = "1"
         "QONTINUI_RUNNER_LOG_DIR"     = $logDir
+    }
+    if ($EnvOverrides) {
+        foreach ($k in $EnvOverrides.Keys) { $toSet[$k] = $EnvOverrides[$k] }
     }
     foreach ($k in $toSet.Keys) {
         $prev[$k] = [System.Environment]::GetEnvironmentVariable($k, "Process")
@@ -400,13 +434,185 @@ function Dump-ParityRunnerDiagnostics {
 # Manifest is $null when the read failed; Error says why. Never throws past the
 # caller -- a failed leg is a reported inability, not a crash.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Provisioning drive (plan
+# 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports,
+# Phase 5).
+#
+# The seven session-provisioning rows are filled by the ledger at SESSION SPAWN.
+# A harness that only boots an artifact and asks it a question leaves all seven
+# 'unknown' on both legs -- and `unknown == unknown` is the absence of two
+# readings, not parity. So before reading the manifest we drive the provisioning
+# doors the artifact itself exposes, in this order:
+#
+#   1. POST /terminals            -> acquire_for_terminal(), which provisions
+#                                    fleet_commands + agent_commands_registry +
+#                                    fleet_skills + agent_skills_registry.
+#                                    A REAL user-path door: this is the same
+#                                    chokepoint an operator's terminal takes.
+#                                    Provisioning happens BEFORE the PTY is
+#                                    created, so no claude binary or login is
+#                                    needed for the rows to land.
+#   2. POST /slash-commands/sync  -> slash_commands.
+#   3. POST /capability-manifest/provision-probe
+#                                 -> fleet_agents + agent_definitions, the two
+#                                    rows written ONLY by agent_runtime's spawn
+#                                    path, which needs a launchable claude, a
+#                                    coord credential and a DB this box has
+#                                    none of. The probe calls the same function
+#                                    that path calls.
+#
+# NOT `POST /sessions/spawn`, which was this plan's original door and provisions
+# nothing at all: its handler goes straight to ClaudeSession::spawn, which never
+# reaches acquire_for_terminal, and the route is DB-backed (pg_guard), so it 503s
+# under QONTINUI_ALLOW_NO_DB, which this workflow sets.
+#
+# Every door is BOUNDED and every failure is TYPED. A door that refuses leaves
+# its rows unobserved and says which door refused and why -- never a silent
+# partial that reads as a clean bill of health.
+# ---------------------------------------------------------------------------
+function Invoke-ParityProvisioningDrive {
+    param([int]$Port, [string]$Label, [int]$TerminalRetrySecs = 90)
+
+    $base = "http://127.0.0.1:$Port"
+    # RUNNER_TEMP on a GitHub runner, the OS temp dir otherwise. Either way this
+    # is outside any git work tree, which the probe door REQUIRES: the agent-path
+    # provisioners overwrite .claude/agents/*.md unconditionally, so a checkout
+    # would be clobbered and left dirty-from-birth.
+    $tempRoot = $env:RUNNER_TEMP
+    if ([string]::IsNullOrWhiteSpace($tempRoot)) { $tempRoot = [System.IO.Path]::GetTempPath() }
+    $workdir = Join-Path $tempRoot ("parity-provision-" + $Label + "-" + [System.Guid]::NewGuid().ToString("N").Substring(0, 8))
+    New-Item -ItemType Directory -Force -Path $workdir | Out-Null
+
+    $drive = [PSCustomObject]@{
+        workdir        = $workdir
+        terminal       = 'not_attempted'
+        slash_sync     = 'not_attempted'
+        provision_probe = 'not_attempted'
+    }
+
+    # --- 1. POST /terminals -------------------------------------------------
+    #
+    # The 409 retry is not politeness, it is the boot-time drain state: coord's
+    # drain gate starts at Unknown and an HTTP terminal create is an AUTONOMOUS
+    # spawn, so it is DEFERRED until the first drain read folds. On a box with no
+    # ~/.qontinui/machine.json that fold resolves to NotEnrolled (allow), but it
+    # has to happen first. A bounded wait distinguishes "not yet folded" from
+    # "refused", which a single attempt cannot.
+    $terminalId = $null
+    $deadline = (Get-Date).AddSeconds($TerminalRetrySecs)
+    $lastRefusal = $null
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $body = @{ workingDir = $workdir; title = "published-parity provisioning probe" } | ConvertTo-Json -Compress
+            $resp = Invoke-WebRequest -Uri "$base/terminals" -Method Post -Body $body `
+                -ContentType 'application/json' -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+            $parsed = $resp.Content | ConvertFrom-Json
+            if ($parsed.data -and $parsed.data.id) { $terminalId = [string]$parsed.data.id }
+            $drive.terminal = $(if ($terminalId) { "created($terminalId)" } else { 'created(no id in body)' })
+            break
+        } catch {
+            $code = $null
+            if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
+            $lastRefusal = "HTTP $code $($_.Exception.Message)"
+            if ($code -eq 409) {
+                # Deferred, not refused. Wait and re-ask.
+                Start-Sleep -Seconds 5
+                continue
+            }
+            break
+        }
+    }
+    if (-not $terminalId) {
+        $drive.terminal = "unknown(terminal_create_refused: $lastRefusal)"
+        Write-Host "    provisioning drive: POST /terminals did not create a terminal -- $lastRefusal"
+    } else {
+        Write-Host "    provisioning drive: terminal $terminalId created in $workdir"
+        # Close ONLY what this harness opened. Exercising a live surface must
+        # leave the state it found: the terminal we created is ours to remove,
+        # and nothing else here is touched.
+        try {
+            $null = Invoke-WebRequest -Uri "$base/terminals/$terminalId" -Method Delete `
+                -UseBasicParsing -TimeoutSec 20 -ErrorAction Stop
+            Write-Host "    provisioning drive: terminal $terminalId closed"
+        } catch {
+            Write-Host "    provisioning drive: could not close terminal $terminalId ($($_.Exception.Message))"
+            $drive.terminal = "$($drive.terminal);close_failed"
+        }
+    }
+
+    # --- 2. POST /slash-commands/sync --------------------------------------
+    try {
+        $null = Invoke-WebRequest -Uri "$base/slash-commands/sync" -Method Post `
+            -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+        $drive.slash_sync = 'ok'
+    } catch {
+        $code = $null
+        if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
+        # 503 is the honest answer on a box with no database: the route is
+        # DB-backed and QONTINUI_ALLOW_NO_DB degrades it. Typed, not swallowed.
+        $reason = $(if ($code -eq 503) { 'db_unavailable' } else { "http_$code" })
+        $drive.slash_sync = "unknown($reason)"
+        Write-Host "    provisioning drive: /slash-commands/sync -> $reason"
+    }
+
+    # --- 3. POST /capability-manifest/provision-probe -----------------------
+    try {
+        $body = @{ workdir = $workdir } | ConvertTo-Json -Compress
+        $resp = Invoke-WebRequest -Uri "$base/capability-manifest/provision-probe" -Method Post `
+            -Body $body -ContentType 'application/json' -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+        $drive.provision_probe = 'ok'
+        Write-Host "    provisioning drive: provision-probe ok"
+    } catch {
+        $code = $null
+        if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
+        # A 404 here is the expected answer from any artifact built before this
+        # route landed -- including every release up to v1.0.11. That is a
+        # statement about the ARTIFACT, and it must read as unknown(door_404),
+        # never as "the rows are absent".
+        $reason = $(if ($code -eq 404) { 'door_404_artifact_predates_probe' } else { "http_$code" })
+        $drive.provision_probe = "unknown($reason)"
+        Write-Host "    provisioning drive: provision-probe -> $reason"
+    }
+
+    return $drive
+}
+
+# ---------------------------------------------------------------------------
+# The filesystem witness. The manifest is a self-report; this is the listing
+# that can contradict it. Counts are $null when the directory could not be
+# listed at all -- "could not look" is not "looked and found nothing", and only
+# the second can contradict a row (see Get-ParitySelfReportDisagreements).
+# ---------------------------------------------------------------------------
+function Get-ParityProvisionWitness {
+    param([string]$Workdir)
+
+    $count = {
+        param([string]$Dir, [string]$Filter, [bool]$Recurse)
+        if (-not (Test-Path -LiteralPath $Dir)) { return 0 }
+        try {
+            $items = Get-ChildItem -LiteralPath $Dir -Filter $Filter -File -Recurse:$Recurse -ErrorAction Stop
+            return @($items).Count
+        } catch {
+            return $null
+        }
+    }
+
+    $claude = Join-Path $Workdir '.claude'
+    return [PSCustomObject]@{
+        commands = & $count (Join-Path $claude 'commands') '*.md' $false
+        skills   = & $count (Join-Path $claude 'skills') 'SKILL.md' $true
+        agents   = & $count (Join-Path $claude 'agents') '*.md' $false
+    }
+}
+
 function Get-ManifestOverHttp {
-    param([string]$ExePath, [string]$Label, [int]$TimeoutSecs)
+    param([string]$ExePath, [string]$Label, [int]$TimeoutSecs, [hashtable]$EnvOverrides = $null)
 
     $port = Get-FreeParityPort
     $runner = $null
     try {
-        $runner = Start-ParityRunner -ExePath $ExePath -Port $port -Label $Label
+        $runner = Start-ParityRunner -ExePath $ExePath -Port $port -Label $Label -EnvOverrides $EnvOverrides
         Wait-ParityRunnerHttp -Port $port -TimeoutSecs $TimeoutSecs -Process $runner.Process
 
         # Best-effort real read so `spec_pages` has an observation. This drives
@@ -420,13 +626,23 @@ function Get-ManifestOverHttp {
             Write-Host "    spec corpus warm-up: no reading taken ($($_.Exception.Message))"
         }
 
+        # Fill the session-provisioning rows BEFORE reading the manifest: the
+        # ledger is process-wide state, so the read below carries whatever the
+        # drive just recorded. Same step, same workdir shape, on both legs.
+        $drive = Invoke-ParityProvisioningDrive -Port $port -Label $Label
+        $witness = Get-ParityProvisionWitness -Workdir $drive.workdir
+        Write-Host ("    provisioning witness: commands={0} skills={1} agents={2}" -f `
+            $(if ($null -eq $witness.commands) { 'unknown' } else { $witness.commands }), `
+            $(if ($null -eq $witness.skills) { 'unknown' } else { $witness.skills }), `
+            $(if ($null -eq $witness.agents) { 'unknown' } else { $witness.agents }))
+
         $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$port/capability-manifest" `
             -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
         $manifest = $resp.Content | ConvertFrom-Json
-        return [PSCustomObject]@{ Manifest = $manifest; Door = "http:GET /capability-manifest"; Error = $null; Raw = $resp.Content }
+        return [PSCustomObject]@{ Manifest = $manifest; Door = "http:GET /capability-manifest"; Error = $null; Raw = $resp.Content; Drive = $drive; Witness = $witness }
     } catch {
         if ($runner) { Dump-ParityRunnerDiagnostics -Runner $runner }
-        return [PSCustomObject]@{ Manifest = $null; Door = "http:GET /capability-manifest"; Error = $_.Exception.Message; Raw = $null }
+        return [PSCustomObject]@{ Manifest = $null; Door = "http:GET /capability-manifest"; Error = $_.Exception.Message; Raw = $null; Drive = $null; Witness = $null }
     } finally {
         if ($runner -and $runner.Process) {
             Stop-ParityProcessTree -RootPid $runner.Process.Id
@@ -449,22 +665,27 @@ function Get-ManifestOverCli {
                 Manifest = $null
                 Door     = "cli:--capability-manifest --json"
                 Raw      = $null
+                Drive    = $null
+                Witness  = $null
                 Error    = ("the CLI door returned no output. On a RELEASE build that is expected " +
                             "rather than informative: the published binary is GUI-subsystem " +
                             "(windows_subsystem = `"windows`"), so redirected stdout can come back " +
                             "empty. It is NOT evidence the binary produced nothing. Use -Door http.")
             }
         }
-        return [PSCustomObject]@{ Manifest = ($text | ConvertFrom-Json); Door = "cli:--capability-manifest --json"; Error = $null; Raw = $text }
+        return [PSCustomObject]@{ Manifest = ($text | ConvertFrom-Json); Door = "cli:--capability-manifest --json"; Error = $null; Raw = $text; Drive = $null; Witness = $null }
     } catch {
-        return [PSCustomObject]@{ Manifest = $null; Door = "cli:--capability-manifest --json"; Error = $_.Exception.Message; Raw = $null }
+        return [PSCustomObject]@{ Manifest = $null; Door = "cli:--capability-manifest --json"; Error = $_.Exception.Message; Raw = $null; Drive = $null; Witness = $null }
     }
 }
 
 function Get-Manifest {
-    param([string]$ExePath, [string]$Label, [string]$Mode, [int]$TimeoutSecs)
+    param([string]$ExePath, [string]$Label, [string]$Mode, [int]$TimeoutSecs, [hashtable]$EnvOverrides = $null)
+    # The CLI door takes no overrides: it is a cold process this function does
+    # not launch through Start-ParityRunner, so an override would be silently
+    # dropped. -NegativeControl refuses the cli door up front for that reason.
     if ($Mode -eq 'cli') { return Get-ManifestOverCli -ExePath $ExePath -Label $Label }
-    return Get-ManifestOverHttp -ExePath $ExePath -Label $Label -TimeoutSecs $TimeoutSecs
+    return Get-ManifestOverHttp -ExePath $ExePath -Label $Label -TimeoutSecs $TimeoutSecs -EnvOverrides $EnvOverrides
 }
 
 # ===========================================================================
@@ -480,6 +701,104 @@ try {
     Write-Host "PARITY-UNAVAILABLE dev_leg" -ForegroundColor Red
     Write-Host $_.Exception.Message
     exit 2
+}
+
+# ---------------------------------------------------------------------------
+# INSTRUMENT SELF-CHECK (-NegativeControl). Runs instead of a parity comparison,
+# needs no release and no installed build, and answers one question: CAN this
+# harness see a capability that resolves from a checkout on one side and not on
+# the other? That is the negative control the parity number is worthless
+# without -- a harness reporting 0 defects while structurally blind is the
+# failure mode this whole plan exists to remove, and until now nothing proved it
+# was not the state we were in.
+#
+# Both legs are the DEVELOPMENT build. That is legitimate here precisely because
+# no parity claim is made: the legs are labelled by their ENVIRONMENT, the
+# result is never written to $JsonOut, and no parity-count output is emitted.
+# The published-leg locator is never called, so the "never the dev binary on the
+# published leg" invariant above is untouched.
+# ---------------------------------------------------------------------------
+if ($NegativeControl) {
+    if ($Door -eq 'cli') {
+        Write-Host "NEGATIVE-CONTROL-UNAVAILABLE cli_door" -ForegroundColor Red
+        Write-Host "  The cold door observes one row and cannot carry a provisioning reading."
+        exit 2
+    }
+
+    # WITH a workspace: whatever this checkout resolves. Derived from this
+    # script's own location, never hardcoded.
+    $withRoot = (Get-Item $PSScriptRoot).Parent.Parent.FullName
+    # WITHOUT one: an empty directory. Not an unset variable -- unset would let
+    # the runner fall back to its own resolution and the two legs would not
+    # differ by the one thing under test.
+    $emptyRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("parity-empty-root-" + [System.Guid]::NewGuid().ToString("N").Substring(0, 8))
+    New-Item -ItemType Directory -Force -Path $emptyRoot | Out-Null
+
+    Write-Host "negative control: the SAME development build, two environments"
+    Write-Host "  leg A  QONTINUI_ROOT = $withRoot"
+    Write-Host "  leg B  QONTINUI_ROOT = $emptyRoot   (an empty directory)"
+    Write-Host ""
+
+    $legA = Get-Manifest -ExePath $devPath -Label "ncontrol-with-checkout" -Mode $Door `
+        -TimeoutSecs $BootTimeoutSecs -EnvOverrides @{ "QONTINUI_ROOT" = $withRoot }
+    $legB = Get-Manifest -ExePath $devPath -Label "ncontrol-empty-root" -Mode $Door `
+        -TimeoutSecs $BootTimeoutSecs -EnvOverrides @{ "QONTINUI_ROOT" = $emptyRoot }
+
+    Remove-Item -LiteralPath $emptyRoot -Recurse -Force -ErrorAction SilentlyContinue
+
+    $ncFailed = @()
+    if ($null -eq $legA.Manifest) { $ncFailed += "leg A ($($legA.Door)): $($legA.Error)" }
+    if ($null -eq $legB.Manifest) { $ncFailed += "leg B ($($legB.Door)): $($legB.Error)" }
+    if ($ncFailed.Count -gt 0) {
+        Write-Host "NEGATIVE-CONTROL-UNAVAILABLE manifest_read" -ForegroundColor Red
+        foreach ($f in $ncFailed) { Write-Host "  $f" }
+        Write-Host "  The control did not run. That is UNKNOWN, not a pass."
+        exit 2
+    }
+
+    # The real comparator, over the two real manifests.
+    $nc = Compare-CapabilityManifests -Dev $legA.Manifest -Published $legB.Manifest `
+        -Allowlist $ParityExpectedDifferences -DevDoor $legA.Door -PublishedDoor $legB.Door
+    Write-Host (Format-ParityReportText -Result $nc)
+    Write-Host ""
+
+    $wA = $legA.Witness
+    $wB = $legB.Witness
+    Write-Host ("  leg A witness: commands={0} skills={1} agents={2}" -f $wA.commands, $wA.skills, $wA.agents)
+    Write-Host ("  leg B witness: commands={0} skills={1} agents={2}" -f $wB.commands, $wB.skills, $wB.agents)
+    Write-Host ("  slash_commands_status across the two legs: {0}" -f (Get-ParitySlashCommandsStatus -DevWitness $wA -PublishedWitness $wB))
+    Write-Host ""
+
+    # The assertion. A row difference on a checkout-resolved capability is what
+    # "this instrument can see the class" means. `agent_definitions` is the one
+    # that must move: leg A overlays the checkout's defs, leg B finds no
+    # claude-config dir and reports the embedded floor / unresolved instead.
+    $sensitive = @('agent_definitions', 'agent_commands_registry', 'agent_skills_registry', 'workspace_root', 'slash_commands')
+    $moved = @($nc.Rows | Where-Object {
+        ($sensitive -contains $_.Id) -and
+        ($_.Disposition -eq 'defect' -or $_.Disposition -eq 'only_in_dev') })
+    $observedBoth = @($nc.Rows | Where-Object { $_.DevObserved -and $_.PublishedObserved })
+
+    Write-Host "-- Negative control verdict -------------------------------------------------"
+    Write-Host ("   rows observed on BOTH legs: {0}" -f @($observedBoth).Count)
+    Write-Host ("   checkout-sensitive rows that differ: {0}" -f (@($moved | ForEach-Object { $_.Id }) -join ', '))
+
+    if (@($moved).Count -lt 1) {
+        Write-Host ""
+        Write-Host "NEGATIVE-CONTROL FAILED: the instrument is BLIND" -ForegroundColor Red
+        Write-Host ("  Removing the entire qontinui-claude-config checkout from the runner's view " +
+                    "changed NO checkout-sensitive capability row. A parity run cannot see the " +
+                    "class it exists to measure, so its defect count -- including a 0 -- carries " +
+                    "no information. Fix the harness or the ledger before trusting another report.")
+        Write-Host "::error::published-parity negative control FAILED -- the harness cannot see a missing-checkout difference."
+        exit 1
+    }
+
+    Write-Host ""
+    Write-Host "NEGATIVE-CONTROL OK: the instrument sees the class" -ForegroundColor Green
+    $okMsg = "  {0} checkout-sensitive row(s) moved when the checkout was taken away, and {1} row(s) were observed on both legs."
+    Write-Host ($okMsg -f @($moved).Count, @($observedBoth).Count)
+    exit 0
 }
 
 try {
@@ -527,18 +846,46 @@ $sessionLedgerRows = @('fleet_commands', 'fleet_skills', 'fleet_agents',
                        'agent_definitions', 'agent_commands_registry',
                        'agent_skills_registry', 'slash_commands')
 $unobservedBoth = @($result.Rows | Where-Object { -not $_.DevObserved -and -not $_.PublishedObserved } | ForEach-Object { $_.Id })
+
+# The provisioning drive's own results (Phase 5). Computed here because this is
+# the only place that holds BOTH legs' manifests and BOTH legs' filesystem
+# listings. A disagreement between the two is a finding about the INSTRUMENT and
+# is carried in its own field -- never added to parity_defects, never to
+# unobserved.
+$selfReportDisagreements = @()
+$selfReportDisagreements += @(Get-ParitySelfReportDisagreements -Manifest $devRead.Manifest -Witness $devRead.Witness |
+    ForEach-Object { $_ | Add-Member -NotePropertyName leg -NotePropertyValue 'dev' -PassThru })
+$selfReportDisagreements += @(Get-ParitySelfReportDisagreements -Manifest $pubRead.Manifest -Witness $pubRead.Witness |
+    ForEach-Object { $_ | Add-Member -NotePropertyName leg -NotePropertyValue 'published' -PassThru })
+$slashCommandsStatus = Get-ParitySlashCommandsStatus -DevWitness $devRead.Witness -PublishedWitness $pubRead.Witness
+
 $observability = [PSCustomObject]@{
     door                       = $Door
     comparable_rows            = $result.ComparableCount
     unobserved_rows            = $result.UnobservedCount
     unobserved_on_both_legs    = @($unobservedBoth)
     session_ledger_rows        = @($sessionLedgerRows)
+    # Phase 5: what the provisioning drive did on each leg, and what the
+    # directory listing witnessed afterwards.
+    provisioning_drive         = [PSCustomObject]@{
+        dev       = $devRead.Drive
+        published = $pubRead.Drive
+    }
+    provisioning_witness       = [PSCustomObject]@{
+        dev       = $devRead.Witness
+        published = $pubRead.Witness
+    }
+    self_report_disagrees      = @($selfReportDisagreements)
+    slash_commands_status      = $slashCommandsStatus
     session_ledger_limitation  = ("These rows are filled by the Phase 3 provisioning ledger, which records at " +
-                                  "AGENT SESSION SPAWN. This harness boots each artifact and asks it a question; " +
-                                  "it never spawns a session and never fabricates one, so these rows report " +
-                                  "'unknown' on both legs and are excluded from the defect count. Until this " +
-                                  "harness can drive a real spawn on both legs, a clean report says nothing " +
-                                  "about them.")
+                                  "SESSION SPAWN. This harness now DRIVES that provisioning through the " +
+                                  "artifact's own doors before reading the manifest (POST /terminals for the " +
+                                  "commands/skills rows, POST /slash-commands/sync for slash_commands, and " +
+                                  "POST /capability-manifest/provision-probe for fleet_agents and " +
+                                  "agent_definitions), and lists the resulting directories itself as an " +
+                                  "independent witness. A row still reading 'unknown' after that means the " +
+                                  "door it needed refused -- read provisioning_drive for which one and why. " +
+                                  "Nothing here fabricates an observation.")
     qontinui_root_env          = $(if ($env:QONTINUI_ROOT) { $env:QONTINUI_ROOT } else { "<unset>" })
     qontinui_root_note         = ("Recorded, not manipulated. Both legs are launched under the SAME environment; " +
                                   "the difference the report measures must come from the artifact. A dev box with " +
@@ -556,6 +903,15 @@ if (@($unobservedBoth).Count -gt 0) {
     Write-Host "   unobserved on BOTH legs: $($unobservedBoth -join ', ')"
 }
 Write-Host "   $($observability.session_ledger_limitation)"
+Write-Host "   slash_commands_status: $slashCommandsStatus"
+if (@($selfReportDisagreements).Count -gt 0) {
+    Write-Host "   SELF-REPORT DISAGREES with the filesystem on $(@($selfReportDisagreements).Count) row(s) -- a finding about the INSTRUMENT, counted separately:"
+    foreach ($d in @($selfReportDisagreements)) {
+        Write-Host "     [$($d.leg)] $($d.id): $($d.kind) -- $($d.note)"
+    }
+} else {
+    Write-Host "   self-report vs filesystem witness: no disagreement recorded"
+}
 Write-Host "   QONTINUI_ROOT during this run: $($observability.qontinui_root_env)"
 Write-Host ""
 
@@ -612,6 +968,15 @@ if ($SummaryOut) {
             $md.Add("- ``$($e.Id)`` (dev ``$($e.DevRung)`` / published ``$($e.PublishedRung)``): $($e.Reason)")
         }
         $md.Add("")
+        $md.Add("**slash_commands_status = ``" + $slashCommandsStatus + "``** (from the filesystem witness, not the manifest's self-report).")
+        $md.Add("")
+        if (@($selfReportDisagreements).Count -gt 0) {
+            $md.Add("**Self-report disagrees with the filesystem on " + @($selfReportDisagreements).Count + " row(s).** A finding about the INSTRUMENT, counted separately from both numbers:")
+            foreach ($d in @($selfReportDisagreements)) {
+                $md.Add("- ``" + $d.id + "`` (" + $d.leg + "): " + $d.kind + " -- " + $d.note)
+            }
+            $md.Add("")
+        }
         $md.Add("Rows unobservable by this harness today (filled only at agent-session spawn): " +
                 (($sessionLedgerRows | ForEach-Object { "``$_``" }) -join ", ") + ". This harness never fabricates a spawn, so a clean report says nothing about them.")
     }
@@ -659,6 +1024,8 @@ if ($env:GITHUB_OUTPUT) {
     Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "unobserved-count=$($result.UnobservedCount)"
     Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "expected-difference-count=$($result.ExpectedDiffCount)"
     Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "schema-refused=$($result.SchemaRefusal.ToString().ToLower())"
+    Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "slash-commands-status=$slashCommandsStatus"
+    Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "self-report-disagreements=$(@($selfReportDisagreements).Count)"
 }
 
 # Report mode: a parity outcome NEVER sets the exit code.

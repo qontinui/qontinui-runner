@@ -370,6 +370,79 @@ $objR = ConvertTo-ParityReportObject -Result $r5 -GeneratedAt "2026-09-02T00:00:
 Assert-Equal "refusal serializes null"  $null $objR.counts.parity_defects
 Assert-Equal "refusal flag serialized"  $true $objR.schema_refused
 
+Write-Host "[11] the filesystem witness rules (Phase 5)"
+# A witness is the harness's OWN directory listing. These rules decide when it
+# CONTRADICTS the manifest's self-report -- the check that stops this harness
+# certifying provisioning it never saw land.
+$mObserved = New-Manifest   # the real fixture: every provisioning row is `unknown`
+# Give three provisioning rows an observed rung so the "claims units" arm is reachable.
+foreach ($row in @($mObserved.rows)) {
+    if ($row.id -eq 'fleet_commands')   { $row.rung = 'embedded' }
+    if ($row.id -eq 'fleet_skills')     { $row.rung = 'embedded' }
+    if ($row.id -eq 'agent_definitions'){ $row.rung = 'operator_checkout' }
+}
+
+# (a) observed rung over an EMPTY directory -> a disagreement naming the row.
+$witnessEmpty = [PSCustomObject]@{ commands = 0; skills = 0; agents = 0 }
+$dis = @(Get-ParitySelfReportDisagreements -Manifest $mObserved -Witness $witnessEmpty)
+Assert-True  "empty dirs contradict observed rows" (@($dis).Count -ge 3)
+Assert-True  "the kind names the direction" (@($dis | Where-Object { $_.kind -eq 'row_claims_units_but_directory_is_empty' }).Count -ge 3)
+Assert-True  "fleet_commands is named"      (@($dis | Where-Object { $_.id -eq 'fleet_commands' }).Count -eq 1)
+
+# (b) a count that could NOT be taken contradicts nothing. `$null` is "could not
+# look"; 0 is "looked and found nothing". Conflating them would manufacture
+# findings out of an unreadable directory.
+$witnessUnknown = [PSCustomObject]@{ commands = $null; skills = $null; agents = $null }
+$disU = @(Get-ParitySelfReportDisagreements -Manifest $mObserved -Witness $witnessUnknown)
+Assert-Equal "unknown counts contradict nothing" 0 (@($disU).Count)
+
+# (c) files present under a row that took no reading -> the opposite direction.
+$mUnknown = New-Manifest    # untouched: every provisioning row is `unknown`
+$witnessFull = [PSCustomObject]@{ commands = 73; skills = 12; agents = 9 }
+$disR = @(Get-ParitySelfReportDisagreements -Manifest $mUnknown -Witness $witnessFull)
+Assert-True  "files under an unknown row are reported" (@($disR | Where-Object { $_.kind -eq 'directory_has_units_but_row_is_unknown' }).Count -ge 1)
+
+# (d) EVERY provisioning row observed, WITH files -> nothing to report.
+# Note $mObserved gave only three rows a rung, so against a full listing the
+# four still-`unknown` rows legitimately disagree (arm (c)) -- which is why this
+# case needs its own fully-observed manifest rather than reusing that one. The
+# first version of this assertion got that wrong and the rule was right.
+$mAllObserved = New-Manifest
+foreach ($row in @($mAllObserved.rows)) {
+    if ($script:ParityWitnessDirs.ContainsKey($row.id)) { $row.rung = 'embedded' }
+}
+$disOk = @(Get-ParitySelfReportDisagreements -Manifest $mAllObserved -Witness $witnessFull)
+Assert-Equal "agreement reports nothing" 0 (@($disOk).Count)
+# ... and the partially-observed manifest against the same listing reports
+# exactly the rows that took no reading.
+$disPartial = @(Get-ParitySelfReportDisagreements -Manifest $mObserved -Witness $witnessFull)
+# THREE, not four: the witness map covers seven provisioning rows, three were
+# given a rung above, and of the four remaining one has no row in this fixture at
+# all -- `agent_skills_registry`, which did not exist when the fixture was
+# emitted on 2026-09-02 (the fixture carries nine rows; the binary now emits
+# ten). A capability the manifest does not carry is SKIPPED rather than invented,
+# which is the behaviour this number pins -- and it is the arm that matters when
+# the published leg is an older release whose roster is genuinely shorter.
+Assert-Equal "only the unread rows present in the manifest are named" 3 (@($disPartial).Count)
+Assert-True  "and all of them in the unknown-row direction" (@($disPartial | Where-Object { $_.kind -eq 'directory_has_units_but_row_is_unknown' }).Count -eq 3)
+Assert-Equal "a capability absent from the manifest is never invented" 0 (@($disPartial | Where-Object { $_.id -eq 'agent_skills_registry' }).Count)
+
+# (e) a missing manifest or witness is UNKNOWN, never a finding.
+Assert-Equal "null manifest yields nothing" 0 (@(Get-ParitySelfReportDisagreements -Manifest $null -Witness $witnessFull).Count)
+Assert-Equal "null witness yields nothing"  0 (@(Get-ParitySelfReportDisagreements -Manifest $mObserved -Witness $null).Count)
+
+Write-Host "[12] the typed slash-commands verdict (Phase 5, exit (d))"
+Assert-Equal "equal counts" 'provisioned_equal' (Get-ParitySlashCommandsStatus -DevWitness ([PSCustomObject]@{ commands = 73 }) -PublishedWitness ([PSCustomObject]@{ commands = 73 }))
+# The metric's baseline defect: a dev box with a checkout resolves more commands
+# than a published install carrying only its embedded bundle.
+Assert-Equal "published fewer is typed WITH both counts" 'provisioned_fewer(dev=93,published=72)' (Get-ParitySlashCommandsStatus -DevWitness ([PSCustomObject]@{ commands = 93 }) -PublishedWitness ([PSCustomObject]@{ commands = 72 }))
+Assert-Equal "published MORE is stated, not folded" 'provisioned_more(dev=10,published=11)' (Get-ParitySlashCommandsStatus -DevWitness ([PSCustomObject]@{ commands = 10 }) -PublishedWitness ([PSCustomObject]@{ commands = 11 }))
+Assert-Equal "both zero"  'none_provisioned' (Get-ParitySlashCommandsStatus -DevWitness ([PSCustomObject]@{ commands = 0 }) -PublishedWitness ([PSCustomObject]@{ commands = 0 }))
+# An unreadable leg is UNKNOWN and names WHICH leg -- never 0, never 'equal'.
+Assert-Equal "dev unreadable"       'unknown(no_command_listing_on_the_dev_leg)'       (Get-ParitySlashCommandsStatus -DevWitness ([PSCustomObject]@{ commands = $null }) -PublishedWitness ([PSCustomObject]@{ commands = 5 }))
+Assert-Equal "published unreadable" 'unknown(no_command_listing_on_the_published_leg)' (Get-ParitySlashCommandsStatus -DevWitness ([PSCustomObject]@{ commands = 5 }) -PublishedWitness ([PSCustomObject]@{ commands = $null }))
+Assert-Equal "neither leg"          'unknown(no_command_listing_on_either_leg)'        (Get-ParitySlashCommandsStatus -DevWitness $null -PublishedWitness $null)
+
 Write-Host ""
 if ($failures -gt 0) {
     Write-Host "PARITY-DIFF-TESTS FAILED: $failures of $checks checks" -ForegroundColor Red

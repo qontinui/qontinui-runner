@@ -903,6 +903,126 @@ async fn capability_manifest() -> impl axum::response::IntoResponse {
     )
 }
 
+/// Request body for `POST /capability-manifest/provision-probe`.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ProvisionProbeBody {
+    /// Absolute path to a scratch directory the probe may write
+    /// `.claude/agents/` into. Caller-supplied and caller-owned: the probe
+    /// creates nothing outside it and removes nothing.
+    workdir: String,
+}
+
+/// What `POST /capability-manifest/provision-probe` answers with.
+#[derive(Debug, serde::Serialize)]
+struct ProvisionProbeResponse {
+    /// Echoed back so a caller driving several probes can match answers to
+    /// requests without relying on ordering.
+    workdir: String,
+    /// The reports this pass RECORDED into the session-provisioning ledger.
+    /// `agent_definitions` here; the embedded `fleet_agents` floor is recorded
+    /// from inside the same call and is visible on the next manifest read.
+    recorded: Vec<crate::capability_manifest::ProvisionReport>,
+}
+
+/// `POST /capability-manifest/provision-probe` — fill the two
+/// session-provisioning rows that NO other door on this binary can reach.
+///
+/// Plan `2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-
+/// reports` Phase 5, Fork B. The parity harness fills the other five rows
+/// through real user-path doors — `POST /terminals` (four rows, via
+/// `acquire_for_terminal`) and `POST /slash-commands/sync` (one) — because a
+/// door users actually hit is better evidence than a probe. `fleet_agents` and
+/// `agent_definitions` have no such door: they are written only by
+/// `agent_runtime`'s spawn path, which needs a launchable `claude`, a coord
+/// credential and a DB the parity box has none of. Without this route those two
+/// rows report `unknown` on BOTH legs forever, and `unknown == unknown` is the
+/// absence of two readings, never parity.
+///
+/// It calls [`crate::agent_runtime::provision_agent_definitions_recorded`] —
+/// the SAME function the spawn path calls, not a copy. That is the condition
+/// Fork B was decided on: a probe that can drift from the real path would
+/// certify a provisioning arm nobody runs.
+///
+/// **Refusals are typed and name the next action**, because this door exists to
+/// make an UNKNOWN legible and a vague 500 would defeat it:
+/// * a relative or empty `workdir` → 400;
+/// * a `workdir` that is not an existing directory → 400 naming the path;
+/// * a `workdir` inside a git work tree → 400. The agent-path provisioners
+///   overwrite `.claude/agents/*.md` unconditionally (the terminal chokepoint's
+///   `claude_tree_is_repo_authored` guard is on that path, not this one), so
+///   pointing this at a checkout would clobber hand-authored definitions and
+///   leave the repo dirty-from-birth. A scratch dir is the only correct target.
+async fn capability_manifest_provision_probe(
+    Json(body): Json<ProvisionProbeBody>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let refuse = |msg: String| -> axum::response::Response {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": msg })),
+        )
+            .into_response()
+    };
+
+    let workdir = body.workdir.trim().to_string();
+    if workdir.is_empty() {
+        return refuse("workdir is required and must be an absolute path".to_string());
+    }
+    let path = std::path::Path::new(&workdir);
+    if !path.is_absolute() {
+        return refuse(format!(
+            "workdir must be an absolute path; got {workdir:?}. \
+             The probe resolves nothing against a cwd it does not own."
+        ));
+    }
+    if !path.is_dir() {
+        return refuse(format!(
+            "workdir {workdir:?} is not an existing directory. \
+             Create the scratch dir first; the probe never creates its own target."
+        ));
+    }
+    if let Some(repo_root) = enclosing_git_work_tree(path) {
+        return refuse(format!(
+            "workdir {workdir:?} is inside the git work tree at {repo_root:?}. \
+             This probe overwrites .claude/agents/*.md unconditionally, which in a \
+             checkout would clobber hand-authored definitions and leave the tree dirty. \
+             Point it at a scratch directory outside any repository."
+        ));
+    }
+
+    let workdir_for_task = workdir.clone();
+    let recorded = spawn_blocking_tracked(move || {
+        crate::agent_runtime::provision_agent_definitions_recorded(&workdir_for_task)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::error!("provision probe task panicked: {e}");
+        Vec::new()
+    });
+
+    Json(ProvisionProbeResponse { workdir, recorded }).into_response()
+}
+
+/// The git work tree `path` sits in, if any — the directory holding a `.git`
+/// entry at `path` or above it.
+///
+/// A `.git` FILE counts as well as a directory: that is exactly what a linked
+/// worktree has, and a linked worktree of a checkout is precisely the tree this
+/// guard must refuse. Walking parents (rather than shelling out to
+/// `git rev-parse`) keeps the check dependency-free and equally correct on a
+/// box with no git on PATH.
+fn enclosing_git_work_tree(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut cur = Some(path);
+    while let Some(dir) = cur {
+        if dir.join(".git").exists() {
+            return Some(dir.to_path_buf());
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
 /// The `/health` fields that state this runner's DEFAULT tenant — the tenant a
 /// session that names none is minted into (plan
 /// `2026-09-17-findings-carry-a-triage-stamp-and-the-steward-reads-since-last-run`,
@@ -11378,6 +11498,13 @@ pub fn create_router(
         // answered for each capability it delivers, so a development build's
         // report and a published build's report can be diffed.
         .route("/capability-manifest", get(capability_manifest))
+        // The two session-provisioning rows no other door on this binary can
+        // fill (`fleet_agents`, `agent_definitions`). Writes into a
+        // caller-supplied scratch dir; refuses one inside a git work tree.
+        .route(
+            "/capability-manifest/provision-probe",
+            post(capability_manifest_provision_probe),
+        )
         .route("/ui-bridge/health", get(health))
         .route("/ui-bridge/status", get(health))
         // The capture that used to run inline inside `/health` (Phase 1.2).
@@ -19896,5 +20023,103 @@ mod supervised_workers_health_tests {
             src.contains(".route(\"/health\", get(health))"),
             "`/health` must still be served by `health`"
         );
+    }
+}
+
+#[cfg(test)]
+mod provision_probe_tests {
+    use super::{capability_manifest_provision_probe, enclosing_git_work_tree, ProvisionProbeBody};
+    use axum::response::Json;
+
+    /// Drive the handler and return `(status, body)`.
+    async fn probe(workdir: &str) -> (axum::http::StatusCode, String) {
+        let resp = capability_manifest_provision_probe(Json(ProvisionProbeBody {
+            workdir: workdir.to_string(),
+        }))
+        .await;
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_empty_or_relative_workdir_is_refused_by_shape() {
+        let (status, body) = probe("   ").await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(body.contains("absolute"), "refusal names the shape: {body}");
+
+        let (status, body) = probe("relative/scratch").await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            body.contains("absolute"),
+            "a relative path is refused, not resolved against a cwd: {body}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_missing_directory_is_refused_naming_the_path() {
+        let missing = std::env::temp_dir().join("parity-probe-does-not-exist-9d3f1c");
+        let _ = std::fs::remove_dir_all(&missing);
+        let (status, body) = probe(&missing.display().to_string()).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            body.contains("not an existing directory"),
+            "refusal says the dir is missing rather than failing later: {body}"
+        );
+    }
+
+    /// The guard that keeps this probe from clobbering a checkout's
+    /// hand-authored `.claude/agents/*.md`. A `.git` FILE (a linked worktree)
+    /// counts as much as a directory.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_workdir_inside_a_git_work_tree_is_refused() {
+        let root = std::env::temp_dir().join(format!("parity-probe-repo-{}", std::process::id()));
+        let nested = root.join("nested").join("deep");
+        std::fs::create_dir_all(&nested).expect("create nested scratch");
+        std::fs::write(root.join(".git"), b"gitdir: /elsewhere\n").expect("write .git file");
+
+        assert_eq!(
+            enclosing_git_work_tree(&nested).as_deref(),
+            Some(root.as_path()),
+            "the walk finds the enclosing work tree from a nested dir"
+        );
+
+        let (status, body) = probe(&nested.display().to_string()).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            body.contains("git work tree"),
+            "refusal names WHY, so the caller can fix it: {body}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A scratch dir outside any repo is accepted, and the answer carries the
+    /// row the ledger recorded — the property the parity harness reads.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scratch_dir_is_probed_and_the_recorded_row_comes_back() {
+        let dir = std::env::temp_dir().join(format!("parity-probe-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create scratch");
+        // Guard the guard: a temp dir that happens to sit inside a repo would
+        // make this test assert the wrong arm.
+        if enclosing_git_work_tree(&dir).is_some() {
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
+
+        let (status, body) = probe(&dir.display().to_string()).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "body: {body}");
+        assert!(
+            body.contains("agent_definitions"),
+            "the response names the capability it recorded: {body}"
+        );
+        assert!(
+            body.contains("\"workdir\""),
+            "the workdir is echoed so concurrent probes can be matched: {body}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

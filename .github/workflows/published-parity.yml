@@ -73,6 +73,18 @@ on:
         default: ""
   release:
     types: [published]
+  # The NEGATIVE CONTROL only (see the `negative-control` job). A PR that
+  # touches the harness must prove the harness can still SEE the class it
+  # measures -- the one thing a nightly green cannot tell you. Paths-filtered
+  # because it costs a dev build: a PR touching nothing here does not run it.
+  pull_request:
+    paths:
+      - "scripts/published-parity.ps1"
+      - "scripts/lib/parity-diff.ps1"
+      - "scripts/lib/installed-runner.ps1"
+      - "scripts/tests/test-parity-diff.ps1"
+      - "src-tauri/src/capability_manifest.rs"
+      - ".github/workflows/published-parity.yml"
 
 permissions:
   contents: read
@@ -89,6 +101,9 @@ concurrency:
 jobs:
   published-parity:
     name: Published-build parity (windows)
+    # A pull_request event carries no release to compare against; that event
+    # runs the negative-control job below instead.
+    if: github.event_name != 'pull_request'
     runs-on: windows-latest
     # 150, matching ci.yml's windows leg, which runs this SAME
     # `pnpm run tauri build --debug --no-bundle` and sized itself from 90
@@ -207,6 +222,19 @@ jobs:
         uses: ./.github/actions/checkout-sibling
         with:
           repo: qontinui/ui-bridge
+
+      # The DEV leg's checkout-resolved capabilities need a real
+      # qontinui-claude-config on disk. Without it both legs are
+      # operator-shaped installs with no checkout, `agent_definitions` and the
+      # two registry rows resolve to the same embedded floor on each side, and
+      # the run structurally cannot see the class the metric's baseline defect
+      # belongs to (plan
+      # 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports,
+      # Phase 5). Checked out as a SIBLING, at the depth QONTINUI_ROOT expects.
+      - name: Check out sibling qontinui-claude-config
+        uses: ./.github/actions/checkout-sibling
+        with:
+          repo: qontinui/qontinui-claude-config
 
       # Same guard, same size, same reason as ci.yml's windows leg ("Configure
       # pagefile (Windows -- guard against link-time OOM)"): windows-latest
@@ -767,3 +795,275 @@ jobs:
             echo "::warning::No parity count was produced. The comparison refused (schema mismatch) or could not run. This is UNKNOWN, not zero."
           fi
         shell: bash
+
+  # ===========================================================================
+  # THE NEGATIVE CONTROL -- the one check that can falsify the instrument.
+  # ===========================================================================
+  #
+  # A nightly that prints `parity_defects = 0` is worthless unless something
+  # proves the harness would have said otherwise had there been a difference.
+  # This job is that proof, and it is the acceptance criterion of Phase 5 of plan
+  # 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports.
+  #
+  # It boots the SAME development build twice -- once with QONTINUI_ROOT pointing
+  # at a real workspace, once at an empty directory -- drives provisioning on
+  # both through the artifact's own doors, and requires the comparator to report
+  # at least one checkout-sensitive row moving. If taking away the entire
+  # qontinui-claude-config checkout changes no row, the instrument is blind and
+  # this job FAILS RED. That is deliberate and is the one thing in this workflow
+  # that gates: it gates on the REPORTER working, never on a parity outcome.
+  #
+  # Needs no release, no installed build and no published artifact, so it runs on
+  # a pull request -- which is the only point at which a harness change can still
+  # be fixed cheaply.
+  negative-control:
+    name: Parity harness negative control (windows)
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    # Dev build only: no install, no release download, no second boot of a
+    # 320 MB installed binary. Sized from the parity job's own measurements
+    # (warm dev build 20.6-28.4 min, cold completions up to 54) plus two boots.
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # FIRST, before any compile: the rust-cache `shared-key` coupling this
+      # job depends on for its warmth. The `Swatinem/rust-cache@v2` step below
+      # reads by `shared-key: "test"` -- ci.yml's `test` job's own cache key,
+      # not a key this job earns itself (it is read-only here, `save-if:
+      # "false"`) -- so the value is a silent, load-bearing assumption about a
+      # DIFFERENT workflow file. If `test` is ever renamed, this job goes cold
+      # every night with no error, exactly as it did before `shared-key` was
+      # added ("No cache found." on every run). Fail loudly at the door
+      # instead: assert ci.yml still declares a job with that id.
+      - name: Assert ci.yml still has a job named "test" (the rust-cache shared-key)
+        shell: bash
+        run: |
+          if ! grep -qE '^  test:' .github/workflows/ci.yml; then
+            echo "::error::ci.yml no longer declares a job named 'test'. This job's Swatinem/rust-cache step reads shared-key: \"test\" -- ci.yml's job id -- to get main's warm cache. If that job was renamed, rename the shared-key here to match, or this workflow silently runs cold every night."
+            exit 1
+          fi
+          echo "ci.yml still declares job 'test' -- shared-key coupling holds."
+
+      # FIRST, before any compile: the classifier's own unit test. It needs no
+      # binary, no install and no network and runs in ~1s, so a broken harness
+      # fails here instead of after a 25-minute build and two exe boots. Same
+      # ordering rationale as ci.yml's "Contract-smoke summary invariants" step.
+      #
+      # This is the ONLY step here that is deliberately not continue-on-error.
+      # Everything below reports; this one asserts that the reporter works. A
+      # broken classifier is a harness defect, not a parity verdict, and its
+      # dangerous failure is a FALSE GREEN -- `unknown` on both legs counted as
+      # agreement would make this job report 0 defects while observing nothing.
+      #
+      # `powershell -File`, NOT `pwsh`: PS 5.1 is the interpreter every script
+      # step below actually uses, and its PSCustomObject `.Count` behaviour is the
+      # bug class these assertions exist to catch. Passing under pwsh 7 would
+      # green-light a regression that still breaks the real thing.
+      - name: Parity comparator unit tests (PS 5.1)
+        run: |
+          powershell -File scripts/tests/test-parity-diff.ps1
+          powershell -File scripts/tests/test-invoke-ps51-detached.ps1
+          powershell -File scripts/tests/test-installed-runner.ps1
+        shell: bash
+
+      # Every script below is run by `powershell -File` -- Windows PowerShell
+      # 5.1, which reads a file with no byte-order mark as the ANSI code page,
+      # not UTF-8. A UTF-8 em dash (E2 80 94) then decodes as `â€”`, and 0x94 is
+      # `”` -- a string delimiter to the 5.1 tokenizer. On 2026-09-19 (run
+      # 35408109575) three em dashes inside string literals in
+      # published-parity.ps1 produced "Missing ')' in method call" at PARSE
+      # time, so the manifest axis never ran and `parity-count` was empty -- 40
+      # minutes after the build, under continue-on-error, as a warning nobody
+      # reads. This step is the bound: no non-ASCII byte in a BOM-less script,
+      # and every script parses under the interpreter that will run it.
+      # Comments are held to the same rule as strings because the tokenizer
+      # decides which is which only after it has decoded the bytes.
+      - name: PS 5.1 scripts are ASCII and parse (the interpreter that runs them)
+        run: |
+          set -euo pipefail
+          status=0
+          for f in scripts/published-parity.ps1 scripts/contract-smoke.ps1 scripts/lib/*.ps1 scripts/tests/test-parity-diff.ps1 scripts/tests/test-invoke-ps51-detached.ps1 scripts/tests/test-installed-runner.ps1; do
+            [ "$(head -c3 "$f" | od -An -tx1 | tr -d ' \n')" = "efbbbf" ] && continue
+            # grep's exit 2 (no PCRE, unreadable file) must not read as "clean".
+            rc=0; LC_ALL=C grep -nP '[^\x00-\x7F]' "$f" || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              echo "::error file=$f::non-ASCII bytes in a BOM-less .ps1 -- Windows PowerShell 5.1 decodes them as ANSI (see the lines above)"
+              status=1
+            elif [ "$rc" -ge 2 ]; then
+              echo "::error file=$f::could not scan for non-ASCII bytes (grep exit $rc) -- UNKNOWN, not clean"
+              status=1
+            fi
+          done
+          powershell -NoProfile -Command '
+            $bad = 0
+            foreach ($f in @("scripts/published-parity.ps1", "scripts/contract-smoke.ps1", "scripts/tests/test-parity-diff.ps1", "scripts/tests/test-invoke-ps51-detached.ps1", "scripts/tests/test-installed-runner.ps1") + @(Get-ChildItem scripts/lib -Filter *.ps1 | ForEach-Object { $_.FullName })) {
+              $tokens = $null; $errors = $null
+              [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f).Path, [ref]$tokens, [ref]$errors)
+              if ($errors -and $errors.Count -gt 0) {
+                foreach ($e in $errors) { Write-Host ("::error file={0},line={1}::{2}" -f $f, $e.Extent.StartLineNumber, $e.Message) }
+                $bad++
+              } else { Write-Host ("parses under {0}: {1}" -f $PSVersionTable.PSVersion, $f) }
+            }
+            exit $bad
+          ' || status=1
+          exit $status
+        shell: bash
+
+      # Siblings. qontinui-schemas is a hard compile dependency
+      # (src-tauri/Cargo.toml's `qontinui-types = { path = "../../qontinui-schemas/rust" }`);
+      # ui-bridge carries the UI_BRIDGE_ROUTES source that contract-smoke parses
+      # and that -SdkTypesPath must be pointed at. qontinui-web is NOT checked
+      # out here — ci.yml pins it only as a believed-vestigial holdover, and
+      # nothing in this job reads it.
+      - name: Check out sibling qontinui-schemas
+        uses: ./.github/actions/checkout-sibling
+
+      - name: Check out sibling ui-bridge
+        uses: ./.github/actions/checkout-sibling
+        with:
+          repo: qontinui/ui-bridge
+
+      # The DEV leg's checkout-resolved capabilities need a real
+      # qontinui-claude-config on disk. Without it both legs are
+      # operator-shaped installs with no checkout, `agent_definitions` and the
+      # two registry rows resolve to the same embedded floor on each side, and
+      # the run structurally cannot see the class the metric's baseline defect
+      # belongs to (plan
+      # 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports,
+      # Phase 5). Checked out as a SIBLING, at the depth QONTINUI_ROOT expects.
+      - name: Check out sibling qontinui-claude-config
+        uses: ./.github/actions/checkout-sibling
+        with:
+          repo: qontinui/qontinui-claude-config
+
+      # Same guard, same size, same reason as ci.yml's windows leg ("Configure
+      # pagefile (Windows -- guard against link-time OOM)"): windows-latest
+      # ships 16 GB RAM and a small pagefile, and this job runs the same
+      # `pnpm run tauri build --debug --no-bundle` that step exists for. ci.yml
+      # measured the failure as rustc-LLVM "out of memory" aborts; what this
+      # job saw on 2026-09-13 (run 34751720151, no pagefile, cold cache) was
+      # the other shape Windows takes under commit pressure -- not an abort but
+      # a 52-minute silence after `Compiling git2` until the job timeout killed
+      # it. The build never fails loudly here; it stops making progress. Keep
+      # this in lockstep with ci.yml's step: if that one moves its size, move
+      # this one.
+      - name: Configure pagefile (Windows — guard against link-time OOM)
+        uses: al-cheb/configure-pagefile-action@v1.4
+        with:
+          minimum-size: 32GB
+          maximum-size: 32GB
+          disk-root: "D:"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+          cache: "pnpm"
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Setup Rust
+        # Pin matches rust-toolchain.toml (channel = "1.95.0").
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The cargo workspace root is the REPO root (./Cargo.toml -> ./target),
+          # not src-tauri. Pointing this at src-tauri caches a path that does not
+          # exist -- the exact defect ci.yml documents at its own rust-cache step.
+          workspaces: ". -> target"
+          # SHARE ci.yml's cache. rust-cache keys on `github.job` by default
+          # (`add-job-id-key: true`), so without this the key here was
+          # `v0-rust-published-parity-Windows_NT-x64-<env>-<lock>` while ci.yml's
+          # windows leg saves `v0-rust-test-Windows_NT-x64-<env>-<lock>` -- same
+          # env hash (c72906ae on both, measured 2026-09-13 / 2026-09-17),
+          # different job segment, never a hit. The earlier comment here said
+          # "this job still gets main's warm cache"; it did not, and every
+          # nightly ran cold ("No cache found."). `shared-key` REPLACES the
+          # job-id segment, so this reads exactly the key ci.yml's `test` job
+          # writes on main, restore-keys prefix included (a Cargo.lock change
+          # since main's last save still restores the nearest prefix match).
+          # COUPLING: the value is ci.yml's job id. If that job is renamed,
+          # rename this too, or the nightly silently goes cold again.
+          shared-key: "test"
+          # Read-only. This job is not on the merge path, and a ~2.6 GB save per
+          # nightly run under this workflow's own ref would add another consumer
+          # to the repo's 10 GB cache cap and evict main's -- the eviction
+          # problem ci.yml's save-if guard exists to prevent. Restores are
+          # unrestricted, so with the shared key above this job gets main's
+          # warm cache (measured 2026-09-17 on ci main run 35179013554: the
+          # same build took 4m34s + 17m35s warm).
+          #
+          # `cache-on-failure` would be a NO-OP here while this is "false" --
+          # that flag only relaxes the SUCCESS precondition on a save that
+          # `save-if` has already turned off unconditionally. If you are here
+          # because a `Post Run Swatinem/rust-cache@v2` step read `skipped` on
+          # a cancelled/failed run, that is EXPECTED and means nothing: this
+          # job never saved anything to lose, on any conclusion. Its warmth
+          # comes entirely from ci.yml's `test` job cache, above.
+          save-if: "false"
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The DEVELOPMENT leg's artifact. `--no-bundle`: this job installs the
+      # PUBLISHED bundle from the release, it does not build one.
+      #
+      # `timeout-minutes: 60` — the previously unbounded rung. NOT
+      # `continue-on-error`: a build that genuinely fails is a real signal and
+      # should redden the run, unlike the reporting steps below it, so a
+      # timeout here fails the step normally and the job walks out through its
+      # post-steps rather than being cancelled outright.
+      #
+      # Sizing: warm builds measure 20.6-28.4 min (n=6); the one cold build
+      # that ever COMPLETED took 54.0 min, and the one that was killed by the
+      # then-75-minute job bound was censored at >=73.9 min -- so the cold
+      # distribution straddles anything in the 54-74 range and no bound here
+      # can be an observed maximum, only a ceiling past which we give up. 60
+      # sits above the completed cold observation (with real margin, unlike a
+      # ~55 bound which would leave under a minute over it) and below the
+      # censored one: it tolerates the cold case this job has actually seen
+      # finish and gives up on the one it has not. There is no self-healing
+      # story behind this number -- a killed run does not bank the cache on
+      # its way out (see save-if below) -- so a cold night here means ci.yml's
+      # own `test`-job cache is cold or its key moved, which is rare and is
+      # not this job's to fix. Effective ladder with this bound: 65 (the four
+      # already-bounded steps, by their INNER TimeoutSec bounds, not the outer
+      # backstops) + 60 + ~4.5 of unbounded scaffolding + 5 (the behavioural
+      # axis, below) = ~134.5 of the job's 150-minute budget.
+      - name: Build Tauri app (development)
+        timeout-minutes: 60
+        run: pnpm run tauri build --debug --no-bundle
+
+      # The control itself. NOT continue-on-error: a blind instrument is exactly
+      # what this job exists to redden.
+      - name: Negative control -- can this harness see a missing checkout?
+        timeout-minutes: 20
+        env:
+          # Same as the parity job's manifest step: the harness boots runners on
+          # a box with no database and must be allowed to degrade rather than
+          # refuse to start.
+          QONTINUI_ALLOW_NO_DB: "1"
+        run: |
+          pwsh -File scripts/lib/invoke-ps51-detached.ps1 `
+            -ScriptPath scripts/published-parity.ps1 -LogPath negative-control.log -TimeoutSec 900 `
+            -NegativeControl
+          exit $LASTEXITCODE
+        shell: pwsh
+
+      - name: Upload the negative control log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-negative-control
+          path: negative-control.log
+          if-no-files-found: warn
+          retention-days: 30

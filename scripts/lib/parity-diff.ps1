@@ -591,3 +591,136 @@ function ConvertTo-ParityReportObject {
         rows = $rows
     }
 }
+
+# ---------------------------------------------------------------------------
+# The filesystem witness rules (plan
+# 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports,
+# Phase 5).
+#
+# A capability manifest is a SELF-REPORT. The provisioning rows say which rung
+# answered, and nothing in them is evidence that a file landed. So after driving
+# the real provisioning doors the harness lists the directories itself, and these
+# two pure rules compare the claim against the listing.
+#
+# A disagreement is a finding ABOUT THE INSTRUMENT, never a parity defect: it is
+# counted and reported separately and is never folded into parity_defects or
+# unobserved. A harness that quietly reported its own blindness as parity is the
+# failure this whole plan exists to prevent.
+#
+# Pure: both take already-parsed data and touch no disk, so
+# scripts/tests/test-parity-diff.ps1 pins them without provisioning anything.
+# ---------------------------------------------------------------------------
+
+# Which directory each provisioning row's units land in. A row absent from this
+# map has no filesystem footprint to witness (workspace_root, spec_pages, ...)
+# and is skipped rather than guessed at.
+$script:ParityWitnessDirs = @{
+    'fleet_commands'          = 'commands'
+    'slash_commands'          = 'commands'
+    'agent_commands_registry' = 'commands'
+    'fleet_skills'            = 'skills'
+    'agent_skills_registry'   = 'skills'
+    'fleet_agents'            = 'agents'
+    'agent_definitions'       = 'agents'
+}
+
+function Get-ParityManifestRow {
+    param($Manifest, [string]$Id)
+    if ($null -eq $Manifest) { return $null }
+    if (-not ($Manifest.PSObject.Properties.Name -contains 'rows')) { return $null }
+    foreach ($r in @($Manifest.rows)) {
+        if ($r.id -eq $Id) { return $r }
+    }
+    return $null
+}
+
+# Compare each provisioning row's claim with what the directory listing shows.
+#
+# $Witness is the harness's own listing: @{ commands = <int>; skills = <int>;
+# agents = <int> } as file counts. A count that could not be taken must be
+# $null, NOT 0 -- "could not look" and "looked and found nothing" are different
+# findings and only the second one can contradict a row.
+#
+# Emits one record per disagreement, each naming the direction:
+#   row_claims_units_but_directory_is_empty  observed rung, zero files
+#   directory_has_units_but_row_is_unknown   files present, row took no reading
+function Get-ParitySelfReportDisagreements {
+    param($Manifest, $Witness)
+
+    $out = @()
+    if ($null -eq $Manifest -or $null -eq $Witness) { return @($out) }
+
+    foreach ($id in ($script:ParityWitnessDirs.Keys | Sort-Object)) {
+        $dirKey = $script:ParityWitnessDirs[$id]
+        if (-not ($Witness.PSObject.Properties.Name -contains $dirKey)) { continue }
+        $count = $Witness.$dirKey
+        # UNKNOWN count: a listing that could not be taken contradicts nothing.
+        if ($null -eq $count) { continue }
+
+        $row = Get-ParityManifestRow -Manifest $Manifest -Id $id
+        $rung = Get-ParityRowRung -Row $row
+        if ($null -eq $rung) { continue }
+        $observed = Test-ParityRungObserved -Rung $rung
+
+        if ($observed -and [int]$count -eq 0) {
+            $out += [PSCustomObject]@{
+                id          = $id
+                kind        = 'row_claims_units_but_directory_is_empty'
+                rung        = $rung
+                witness_dir = ".claude/$dirKey"
+                witness_files = 0
+                note        = ("the manifest row resolved to rung '$rung' while .claude/$dirKey " +
+                               "holds no files. The row is a self-report; the listing is the witness.")
+            }
+        } elseif (-not $observed -and [int]$count -gt 0) {
+            $out += [PSCustomObject]@{
+                id          = $id
+                kind        = 'directory_has_units_but_row_is_unknown'
+                rung        = $rung
+                witness_dir = ".claude/$dirKey"
+                witness_files = [int]$count
+                note        = ("$count file(s) are present in .claude/$dirKey while the row took no " +
+                               "reading at all. Provisioning ran and the ledger did not record it.")
+            }
+        }
+    }
+    return @($out)
+}
+
+# The typed slash-commands verdict the metric's baseline defect is stated in.
+#
+# Exactly one of:
+#   provisioned_equal                  both legs provisioned the same count
+#   provisioned_fewer(dev=N,published=M)  published provisioned fewer
+#   provisioned_more(dev=N,published=M)   published provisioned MORE (stated,
+#                                         not silently folded into 'equal')
+#   none_provisioned                   both legs provisioned nothing
+#   unknown(<reason>)                  a count could not be taken on a leg
+#
+# Counts come from the WITNESS, not the manifest: the question "does a published
+# install get the fleet commands" is answered by files on disk.
+function Get-ParitySlashCommandsStatus {
+    param($DevWitness, $PublishedWitness)
+
+    $devCount = $null
+    $pubCount = $null
+    if ($null -ne $DevWitness -and ($DevWitness.PSObject.Properties.Name -contains 'commands')) {
+        $devCount = $DevWitness.commands
+    }
+    if ($null -ne $PublishedWitness -and ($PublishedWitness.PSObject.Properties.Name -contains 'commands')) {
+        $pubCount = $PublishedWitness.commands
+    }
+
+    if ($null -eq $devCount -and $null -eq $pubCount) {
+        return 'unknown(no_command_listing_on_either_leg)'
+    }
+    if ($null -eq $devCount) { return 'unknown(no_command_listing_on_the_dev_leg)' }
+    if ($null -eq $pubCount) { return 'unknown(no_command_listing_on_the_published_leg)' }
+
+    $d = [int]$devCount
+    $p = [int]$pubCount
+    if ($d -eq 0 -and $p -eq 0) { return 'none_provisioned' }
+    if ($d -eq $p) { return 'provisioned_equal' }
+    if ($p -lt $d) { return "provisioned_fewer(dev=$d,published=$p)" }
+    return "provisioned_more(dev=$d,published=$p)"
+}

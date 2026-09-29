@@ -216,6 +216,12 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     // `EnforceDoors`, a Foreign origin reaches it while the identically
     // capable `POST /terminals/{id}/write` is refused.
     "POST /__debug/terminals/{id}/graceful-exit",
+    // Writes `.claude/agents/*.md` into a caller-named directory (plan
+    // `2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-
+    // reports` Phase 5). `GET /capability-manifest` beside it is a pure read
+    // and is deliberately NOT here; the write arm is a door and this entry is
+    // route-exact, so adding it cannot widen the read.
+    "POST /capability-manifest/provision-probe",
     "/shell-commands/*",
     "/processes/*",
     "/instances/spawn",
