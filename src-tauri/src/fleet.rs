@@ -1982,6 +1982,13 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
         // Best-effort throughout: a parse/IO miss just retries next tick.
         let body = resp.text().await.unwrap_or_default();
         if let Some(coord_set) = qontinui_runner_lib::pair::response_tenant_ids(&body) {
+            // The PREVIOUS echo, read before this one is recorded: a binding
+            // drop needs both to omit the tenant (`drop_confirmed_coord_set`),
+            // so one transient or short echo cannot destroy a binding and its
+            // credential slot (plan
+            // 2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential,
+            // Phase 4).
+            let prior_echo = qontinui_runner_lib::pair::coord_bound_tenants();
             // Record coord's COUNT before reconciling: the plan adapter asks
             // "is this device bound to more than one tenant?", which the
             // slot-backed binding file cannot answer (plan
@@ -1989,29 +1996,40 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
             if let Err(e) = qontinui_runner_lib::pair::record_coord_bound_tenants(&coord_set) {
                 tracing::debug!("fleet::heartbeat: coord-bound tenant record non-fatal: {e}");
             }
-            // Off the async worker: the reconcile holds file locks that may
-            // wait (bounded) on a peer process.
-            let reconcile_set = coord_set;
-            let reconciled = spawn_blocking_tracked(move || {
-                qontinui_runner_lib::pair::reconcile_paired_bindings(&reconcile_set)
-            })
-            .await
-            .unwrap_or_else(|e| Err(format!("reconcile task failed: {e}")));
-            match reconciled {
-                Ok(report) => {
-                    if report.changed() {
-                        info!(
-                            "fleet::heartbeat: reconciled bindings against coord \
-                             (dropped={:?} dropped_slots={:?} default_repointed={:?})",
-                            report.dropped, report.dropped_slots, report.default_repointed
-                        );
+            match qontinui_runner_lib::pair::drop_confirmed_coord_set(&coord_set, &prior_echo) {
+                None => tracing::debug!(
+                    "fleet::heartbeat: no previous tenant_ids echo on record — deferring \
+                     binding reconciliation one heartbeat so a drop is confirmed twice"
+                ),
+                Some(confirmed) => {
+                    // Off the async worker: the reconcile holds file locks that may
+                    // wait (bounded) on a peer process.
+                    let reconciled = spawn_blocking_tracked(move || {
+                        qontinui_runner_lib::pair::reconcile_paired_bindings(&confirmed)
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(format!("reconcile task failed: {e}")));
+                    match reconciled {
+                        Ok(report) => {
+                            if report.changed() {
+                                info!(
+                                    "fleet::heartbeat: reconciled bindings against coord \
+                                     (dropped={:?} dropped_slots={:?} default_repointed={:?})",
+                                    report.dropped, report.dropped_slots, report.default_repointed
+                                );
+                            }
+                            // Only tenants THIS echo names: one held over from
+                            // the previous echo is being unbound, not a gap.
+                            for (t, slot) in report.coord_only {
+                                if coord_set.contains(&t) {
+                                    warn_coord_only_binding_once(t, slot);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("fleet::heartbeat: binding reconcile non-fatal: {e}");
+                        }
                     }
-                    for (t, slot) in report.coord_only {
-                        warn_coord_only_binding_once(t, slot);
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!("fleet::heartbeat: binding reconcile non-fatal: {e}");
                 }
             }
         } else if let Some(resp_tenant) = response_tenant_id(&body) {
