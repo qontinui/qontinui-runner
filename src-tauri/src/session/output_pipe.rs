@@ -33,10 +33,14 @@
 //! 5. POSTs each coalesced chunk to coord
 //!    `POST /sessions/:id/output {chunk_offset, payload_b64}`. The
 //!    `chunk_offset` is a monotonic per-session byte counter, giving the
-//!    warm tier a stable FIFO order + idempotency key. coord resolves the
-//!    session's tenant server-side, so the runner sends no tenant in the
-//!    PAYLOAD — but it does present the owning session's device-JWT slot as
-//!    the bearer, which is what coord resolves that tenant FROM.
+//!    warm tier a stable FIFO order + idempotency key. coord takes the
+//!    row's tenant from the SESSION ROW (`coord.sessions.tenant_id`), never
+//!    from the bearer, so the runner sends no tenant in the payload. The
+//!    bearer is the owning session's device-JWT slot, and it is what coord
+//!    checks OWNERSHIP against (plan
+//!    `2026-09-28-anyone-holding-a-session-uuid-can-write-its-transcript-because-session-output-and-event-writes-are-anonymous`):
+//!    with no live credential the flush sends nothing at all rather than an
+//!    anonymous request (see [`flush`]).
 //!
 //! ## Transport coupling
 //!
@@ -107,11 +111,12 @@ const MAX_BUFFER_BYTES: usize = 512 * 1024;
 ///
 /// `tenant` is the OWNING session's scope, supplied by the caller. It is not
 /// resolved here: this pipe can start BEFORE the session record is inserted, so
-/// a self-resolving version would answer `Unresolved` for early chunks and
-/// (on a multi-bound device) drop their authentication for no reason. A wrong
-/// `Owned` would be worse still — `/sessions/{id}/output` is a route where
-/// coord derives the row's tenant from the verified bearer, so it would file
-/// another tenant's transcript with no observable.
+/// a self-resolving version would answer `Unresolved` for early chunks and (on
+/// a multi-bound device) find no credential to send them under for no reason.
+/// It selects WHICH device-JWT slot is presented; coord does not derive the
+/// row's tenant from that bearer (it reads the session row) but checks the
+/// bearer against the row's owning device and tenant, so a wrong `Owned`
+/// presents a credential coord will refuse.
 pub fn spawn(
     coord_sync: CoordSync,
     session_id: Uuid,
@@ -240,12 +245,18 @@ async fn run_pipe(
 }
 
 /// POST the buffered bytes as one coalesced chunk + advance the offset.
-/// Best-effort: a coord-side failure (network, 429 quota, 5xx) is logged
+/// Best-effort: a coord-side failure (network, 401, 429 quota, 5xx) is logged
 /// and the buffer is cleared — output streaming is a courtesy mirror, so
 /// we never block the operator's session or retry-storm coord. A 429
 /// (tenant warm quota exceeded) is logged at info and treated as
 /// "stop trying for now"; the next flush simply tries again on fresh
 /// output (coord re-checks the quota each call).
+///
+/// **No live credential, no request.** The route admits only the owning
+/// device's credential, so when [`crate::auth::try_attach_device_auth_for`]
+/// resolves none the chunk is dropped WITHOUT a POST — the same loss this lossy
+/// path already takes on a 429 or 5xx, minus an anonymous request. The durable
+/// transcript lane (the outbox) holds instead; this one never did.
 async fn flush(
     http: &reqwest::Client,
     url: &str,
@@ -257,6 +268,12 @@ async fn flush(
     if buffer.is_empty() {
         return;
     }
+    if super::coord_sync::transcript_sync_refused(session_id) {
+        // The tenant turned transcript sync off (coord 429
+        // `transcript_sync_disabled`, which covers every stream).
+        buffer.clear();
+        return;
+    }
     let payload_b64 = base64::engine::general_purpose::STANDARD.encode(&buffer[..]);
     let offset = *next_offset;
     let len = buffer.len() as i64;
@@ -265,10 +282,19 @@ async fn flush(
         "payload_b64": payload_b64,
     });
 
-    match crate::auth::attach_device_auth_for(http.post(url).json(&body), tenant)
-        .send()
-        .await
-    {
+    let rb = match crate::auth::try_attach_device_auth_for(http.post(url).json(&body), tenant) {
+        Ok(rb) => rb,
+        Err(cause) => {
+            tracing::debug!(
+                session = %session_id,
+                %cause,
+                "session output_pipe: no live device credential — dropping chunk unsent"
+            );
+            buffer.clear();
+            return;
+        }
+    };
+    match rb.send().await {
         Ok(resp) => {
             let status = resp.status();
             if status.is_success() {
@@ -276,11 +302,33 @@ async fn flush(
                 // transient failure re-sends the same offset (idempotent
                 // on coord). On success, the bytes are durably in warm.
                 *next_offset += len;
-            } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                tracing::info!(
+            } else if status == reqwest::StatusCode::UNAUTHORIZED {
+                // Coord refused the credential presented. Dropped like a 429
+                // or 5xx — this path is lossy by design; the durable outbox
+                // lane holds its rows instead.
+                tracing::debug!(
                     session = %session_id,
-                    "session output_pipe: coord warm quota exceeded — dropping chunk"
+                    "session output_pipe: coord refused the device credential (401) — \
+                     dropping chunk"
                 );
+            } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                let detail = resp.text().await.unwrap_or_default();
+                if detail.contains("transcript_sync_disabled") {
+                    // Tenant consent is off for every stream: stop asking for
+                    // this session until the next start, like the outbox lane.
+                    if super::coord_sync::note_transcript_sync_refused(session_id) {
+                        tracing::info!(
+                            session = %session_id,
+                            "session output_pipe: the tenant has transcript sync turned off \
+                             — no more output for this session until the next start"
+                        );
+                    }
+                } else {
+                    tracing::info!(
+                        session = %session_id,
+                        "session output_pipe: coord warm quota exceeded — dropping chunk"
+                    );
+                }
                 // Drop the chunk (don't advance offset — but also don't
                 // resend; the bytes are gone for the shared tail). Clearing
                 // below handles it.
@@ -301,4 +349,100 @@ async fn flush(
         }
     }
     buffer.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A fake coord `POST /sessions/:id/output` that counts requests and
+    /// records whether each carried a bearer.
+    async fn fake_output_route() -> (String, Arc<AtomicUsize>, Arc<std::sync::Mutex<Vec<bool>>>) {
+        use axum::{routing::post, Router};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let authed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (h, a) = (hits.clone(), authed.clone());
+        let app = Router::new().route(
+            "/sessions/{id}/output",
+            post(move |headers: axum::http::HeaderMap| {
+                let (h, a) = (h.clone(), a.clone());
+                async move {
+                    h.fetch_add(1, Ordering::SeqCst);
+                    a.lock()
+                        .unwrap()
+                        .push(headers.contains_key("authorization"));
+                    axum::Json(serde_json::json!({"stored": true}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), hits, authed)
+    }
+
+    /// A device JWT of the shape `slot_jwt_is_usable` accepts (live `exp`).
+    fn live_device_jwt() -> String {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let exp = chrono::Utc::now().timestamp() + 3 * 60 * 60;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!(r#"{{"tenant_id":"{}","exp":{exp}}}"#, Uuid::now_v7()).as_bytes());
+        format!("{header}.{payload}.sig")
+    }
+
+    /// The lossy PTY path never sends an ANONYMOUS request: with no live device
+    /// credential the chunk is dropped unsent (buffer cleared, offset kept),
+    /// and with one it is POSTed carrying the bearer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pty_flush_sends_nothing_without_a_live_credential() {
+        let _amb = crate::test_env::isolated_ambient();
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        let (base, hits, authed) = fake_output_route().await;
+        let http = reqwest::Client::new();
+        let session = Uuid::new_v4();
+        let url = format!("{base}/sessions/{session}/output");
+
+        let mut buffer = b"hello".to_vec();
+        let mut next_offset = 0i64;
+        flush(
+            &http,
+            &url,
+            session,
+            &mut buffer,
+            &mut next_offset,
+            TenantScope::Unresolved,
+        )
+        .await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "no live credential → no request at all, never an anonymous one"
+        );
+        assert!(buffer.is_empty(), "the chunk is dropped (lossy by design)");
+        assert_eq!(
+            next_offset, 0,
+            "a dropped chunk does not advance the offset"
+        );
+
+        crate::auth::AuthManager::new()
+            .store_tokens(&live_device_jwt(), "")
+            .unwrap();
+        let mut buffer = b"hello".to_vec();
+        flush(
+            &http,
+            &url,
+            session,
+            &mut buffer,
+            &mut next_offset,
+            TenantScope::Unresolved,
+        )
+        .await;
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(*authed.lock().unwrap(), vec![true], "sent WITH the bearer");
+        assert_eq!(next_offset, 5);
+    }
 }

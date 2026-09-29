@@ -2983,6 +2983,31 @@ pub fn attach_device_auth_for(
     }
 }
 
+/// The FAIL-CLOSED form of [`attach_device_auth_for`]: `Err` instead of an
+/// unauthenticated builder whenever no usable credential resolves for `scope`.
+///
+/// For writes that coord admits only from the OWNING device's credential
+/// (`POST /sessions/:id/output` and `/events`, plan
+/// `2026-09-28-anyone-holding-a-session-uuid-can-write-its-transcript-because-session-output-and-event-writes-are-anonymous`
+/// Phase 2). Sending such a write anonymously can only be refused, so the
+/// caller is told BEFORE the request exists and holds the row instead. The
+/// `Err` carries the selector's own cause — an absent slot, a
+/// [`SlotRead::PresentButDead`] one, or [`TenantScope::Unresolved`] on a
+/// multi-bound device ([`NoCredential::UnresolvedOnMultiBound`]) — so the
+/// caller can tell a credential that will recover from a scope that never
+/// will.
+///
+/// Same resolver and same coverage counters as [`attach_device_auth_for`]
+/// ([`count_and_resolve_bearer_result`]), so a held write is counted as the
+/// unauthenticated call it would otherwise have been.
+pub fn try_attach_device_auth_for(
+    rb: reqwest::RequestBuilder,
+    scope: TenantScope,
+) -> Result<reqwest::RequestBuilder, NoCredential> {
+    count_and_resolve_bearer_result(scope)
+        .map(|token| rb.header("Authorization", format!("Bearer {token}")))
+}
+
 /// Blocking-client sibling of [`attach_device_auth_for`], for the targets that
 /// run without a tokio runtime (`qontinui_profile device init` →
 /// `register_with_coord`, and the blocking session/log registrars).
@@ -3029,9 +3054,21 @@ pub fn attach_device_auth_blocking(
 /// The returned token is only ever moved into a request header; it must never
 /// reach a log line or a process argument.
 fn count_and_resolve_bearer(scope: TenantScope) -> Option<String> {
+    count_and_resolve_bearer_result(scope).ok()
+}
+
+/// [`count_and_resolve_bearer`], keeping the CAUSE of a miss for
+/// [`try_attach_device_auth_for`]. The one body both share, so the fail-soft
+/// and fail-closed forms can never count or resolve differently.
+fn count_and_resolve_bearer_result(scope: TenantScope) -> Result<String, NoCredential> {
     let total = DATA_PLANE_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    let bearer = device_bearer_scoped(scope);
-    if bearer.is_some() {
+    let bearer = select_scoped_bearer_lazy_result(
+        &AuthManager::new(),
+        scope,
+        default_binding_tenant(),
+        device_binding_count,
+    );
+    if bearer.is_ok() {
         DATA_PLANE_AUTHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     if total.is_multiple_of(25) && coverage_log_due() {
