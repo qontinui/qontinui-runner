@@ -470,36 +470,75 @@ fn write_capability() -> serde_json::Map<String, Value> {
         "writeContract".to_string(),
         Value::String(WRITE_CONTRACT.to_string()),
     );
-    // The provenance edge relation vocabulary, MACHINE-READABLE rather than
-    // only prose a driver has to parse out of `writeContract`. Before this
-    // field existed, an agent learned the seven-value set only by triggering
-    // a 422 and reading its message — exactly the "learned by taking an
-    // error" shape the paragraph above exists to close for the two other
-    // contract facts. Spelled as LITERALS, matching every other mirror of
-    // this vocabulary in this file (`EdgeSpec::relation`'s doc, the
-    // `edge_payload` and `LinkRequest` refusal text): none of them derive
-    // from a shared constant, so a widening on the web side that is not
-    // carried here goes red in
-    // `the_refusal_message_names_the_whole_relation_vocabulary` rather than
-    // silently drifting.
-    m.insert(
-        "relations".to_string(),
-        serde_json::json!([
-            "produced_report",
-            "feeds",
-            "authored_plan",
-            "supersedes",
-            "depends_on",
-            "spawned_followup",
-            "refutes",
-        ]),
-    );
+    // Every closed field the loopback write doors accept, MACHINE-READABLE and
+    // keyed by field, so a driver learns each set before the write rather than
+    // by triggering a refusal. Rendered from the enums — never retyped — so it
+    // cannot drift from what the door enforces (`relation`, via
+    // `EdgeRelation`'s parse) or from what the adapter itself writes (`kind`,
+    // via `ArtifactKind`, whose serde-free `as_str()` is the wire string).
+    m.insert("writeVocabulary".to_string(), write_vocabulary());
+    // How a wrong durable write is corrected, per door — the fact an agent
+    // otherwise learns only after it has written something it cannot take back.
+    m.insert("writeCorrection".to_string(), write_correction());
     m
+}
+
+/// `writeVocabulary`: every closed field the loopback write doors accept,
+/// keyed by field name, each rendered from its enum's `ALL` — `relation` from
+/// [`EdgeRelation`], `kind` from
+/// [`qontinui_runner_lib::plan_workunit_adapter::body_push::ArtifactKind`]
+/// (rendered through its `as_str()`; the adapter owns that enum and it carries
+/// no serde derives). One object rather than one sibling key per field, so a
+/// further closed field is one more entry here, not a second key describing the
+/// same concept.
+fn write_vocabulary() -> Value {
+    use qontinui_runner_lib::plan_workunit_adapter::body_push::ArtifactKind;
+    let relation: Vec<&str> = EdgeRelation::ALL.iter().map(|r| r.as_str()).collect();
+    let kind: Vec<&str> = ArtifactKind::ALL.iter().map(|k| k.as_str()).collect();
+    serde_json::json!({ "relation": relation, "kind": kind })
+}
+
+/// The qontinui-web PR that adds the upstream route the loopback
+/// edge-correction verbs forward to. Named ONCE so the caveat in
+/// [`write_correction`] is dropped in one place when that PR is deployed.
+const EDGE_CORRECTION_WEB_PR: &str = "qontinui-web PR #1459";
+
+/// `writeCorrection`: per write door, how a WRONG durable write is corrected,
+/// in plan `2026-09-20-nothing-checks-that-an-agent-writable-evidence-store-ships-its-vocabulary-and-a-correction-verb`'s
+/// posture arms (`Verb` / `SupersedeArg` / `AppendOnlyByDesign` / `Gap`).
+/// Honest about cross-repo state at build time: a verb whose upstream route is
+/// not deployed is not yet a correction, so the sentence says so.
+fn write_correction() -> Value {
+    let links = format!(
+        "Gap until the web backend carries edge correction, then Verb: \
+         DELETE /plan-library/links/{{id}} retracts a wrong edge and PUT /plan-library/links/{{id}} \
+         corrects its relation/to_id/note in place (both need a non-empty `reason`). Both forward \
+         to PUT|DELETE /api/v1/plan-library/edges/{{id}}, which exists only on OPEN \
+         {EDGE_CORRECTION_WEB_PR}. Until a backend carrying it is deployed, a correction answers \
+         405 Method Not Allowed (that path is registered upstream for PATCH only) and a wrong edge \
+         stays recorded; after it is deployed, a 404 means no such edge. `supersedes` is not a \
+         correction: it asserts that one \
+         artifact REPLACES another (a newer version of the same thing)."
+    );
+    let artifacts = "AppendOnlyByDesign for content: re-POST the same (kind, slug, source_repo) \
+         to replace metadata and append a body version. Gap for a wrong `kind`: `kind` is part of \
+         the row's identity and the kind-override route is operator-only by design, so the \
+         correction is to soft-delete the mis-kinded agent-written row and re-upsert under the \
+         right kind. That needs BOTH the web soft-delete, pending qontinui-web #1545 (plan \
+         2026-09-12-plan-library-has-no-delete-so-a-junk-row-is-permanent), AND a loopback \
+         soft-delete forwarder, which this door does not have yet (it serves no artifact DELETE). \
+         Until both exist, a wrong `kind` is PERMANENT through this door. `writeVocabulary.kind` \
+         only rules out an INVALID kind; a valid-but-wrong kind is the permanent case, so choose \
+         it deliberately.";
+    serde_json::json!({
+        "/plan-library/links": links,
+        "/plan-library/artifacts": artifacts,
+    })
 }
 
 /// The advertised write contract: the rules a driver cannot infer from the
 /// request shape, and whose violation is silent rather than loud — including
-/// the relation vocabulary (also published structured as `relations`) and the
+/// where the closed vocabularies are published (`writeVocabulary`) and the
 /// two edge-correction verbs added by Phase 5 of
 /// `2026-09-20-a-recorded-delivery-scope-is-permanent-so-a-mis-declared-phase-is-uncorrectable`.
 ///
@@ -519,11 +558,14 @@ fn write_capability() -> serde_json::Map<String, Value> {
 /// doubt — would be a fresh instance of the very defect class this door's
 /// capability block exists to close.
 const WRITE_CONTRACT: &str = "\
-An edge's `relation` is one of produced_report | feeds | authored_plan | supersedes | \
-depends_on | spawned_followup | refutes — the same seven values `POST /plan-library/links`, \
-`DELETE /plan-library/links/{id}` and `PUT /plan-library/links/{id}` accept, also published \
-structured (not just in this prose) as this same read's `relations` array, so a caller does \
-not have to trigger a 422 to learn the set. A recorded edge is CORRECTABLE, not only \
+Every closed field the write doors accept is published structured on this same read as \
+`writeVocabulary` — `writeVocabulary.relation` is the set an edge's `relation` must come from \
+(on `POST /plan-library/artifacts` edges, `POST /plan-library/links` and \
+`PUT /plan-library/links/{id}`), `writeVocabulary.kind` the set an artifact's `kind` must come \
+from — so a caller does not have to trigger a refusal to learn either; a `relation` outside \
+the set is refused 400 at this door before any upstream call. How a wrong write is corrected, \
+per door, is `writeCorrection` — including whether the web route the two edge-correction \
+verbs below forward to is deployed yet. A recorded edge is meant to be CORRECTABLE, not only \
 appendable: `POST /plan-library/links` re-posting an identical (from_id, to_id, relation) \
 triple is idempotent, but a DIFFERENT one off the same (from_id, relation) pair APPENDS a \
 second edge rather than replacing the first. `DELETE /plan-library/links/{id}` \
@@ -636,6 +678,97 @@ type RawReadResult = Result<(StatusCode, HeaderMap, Bytes), (StatusCode, Json<Ap
 // Requests
 // ===========================================================================
 
+/// A provenance edge's `relation` — the ONE typed source of the vocabulary.
+///
+/// Mirrors `WorkArtifactRelation` in
+/// `qontinui-web/backend/app/schemas/plan_library.py`. Every place this door
+/// names the set — the loopback refusal ([`relation_refusal`]), the
+/// `writeVocabulary.relation` array [`write_capability`] publishes, and the
+/// request structs' docs (which point here rather than retype it) — is rendered
+/// from [`EdgeRelation::ALL`], so outside the tests the set is spelled once,
+/// in [`EdgeRelation::as_str`].
+/// The cross-repo drift alarm is the LITERAL list in
+/// `closed_vocabularies_match_the_web_literals`: a widening on the
+/// web side that is not carried here goes red there.
+///
+/// Serializes to the snake_case wire string (`rename_all`), so the JSON
+/// forwarded upstream is byte-identical to what the untyped `String` sent.
+/// Deserializes through [`TryFrom<String>`] so a value outside the set is
+/// refused AT THE LOOPBACK, before any upstream call, with the set named —
+/// previously only a blank value was refused here and every other typo was
+/// round-tripped to the web route for a 422.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", try_from = "String")]
+pub enum EdgeRelation {
+    ProducedReport,
+    Feeds,
+    AuthoredPlan,
+    Supersedes,
+    DependsOn,
+    SpawnedFollowup,
+    Refutes,
+}
+
+impl EdgeRelation {
+    /// Every relation, in the web `Literal`'s order.
+    pub const ALL: [EdgeRelation; 7] = [
+        EdgeRelation::ProducedReport,
+        EdgeRelation::Feeds,
+        EdgeRelation::AuthoredPlan,
+        EdgeRelation::Supersedes,
+        EdgeRelation::DependsOn,
+        EdgeRelation::SpawnedFollowup,
+        EdgeRelation::Refutes,
+    ];
+
+    /// The wire string. Agrees with the serde rename by construction and by
+    /// test (`edge_relation_wire_strings_match_serde`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            EdgeRelation::ProducedReport => "produced_report",
+            EdgeRelation::Feeds => "feeds",
+            EdgeRelation::AuthoredPlan => "authored_plan",
+            EdgeRelation::Supersedes => "supersedes",
+            EdgeRelation::DependsOn => "depends_on",
+            EdgeRelation::SpawnedFollowup => "spawned_followup",
+            EdgeRelation::Refutes => "refutes",
+        }
+    }
+}
+
+impl TryFrom<String> for EdgeRelation {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        EdgeRelation::ALL
+            .into_iter()
+            .find(|r| r.as_str() == value)
+            .ok_or_else(|| relation_refusal(&value))
+    }
+}
+
+/// The refusal for a blank or unknown `relation`, rendered from
+/// [`EdgeRelation::ALL`] — never a hand-typed copy of the set.
+fn relation_refusal(got: &str) -> String {
+    let set = EdgeRelation::ALL
+        .iter()
+        .map(|r| r.as_str())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if got.trim().is_empty() {
+        format!("`relation` is required ({set})")
+    } else {
+        // Echo a bounded prefix only: the value is caller-supplied and ends up
+        // in a response body and logs.
+        const ECHO_MAX_CHARS: usize = 64;
+        let mut echoed: String = got.chars().take(ECHO_MAX_CHARS).collect();
+        if got.chars().count() > ECHO_MAX_CHARS {
+            echoed.push('…');
+        }
+        format!("`relation` `{echoed}` is not one of ({set})")
+    }
+}
+
 /// One provenance edge to create alongside an artifact write. Exactly one of
 /// `to_id` / `from_id`, matching the web edge route's own rule.
 #[derive(Debug, Clone, Deserialize)]
@@ -644,12 +777,11 @@ pub struct EdgeSpec {
     pub to_id: Option<String>,
     #[serde(default)]
     pub from_id: Option<String>,
-    /// `produced_report | feeds | authored_plan | supersedes | depends_on |
-    /// spawned_followup | refutes`. Mirrors `WorkArtifactRelation` in
-    /// `qontinui-web/backend/app/schemas/plan_library.py` — the web route is
-    /// the gate (a value outside the set is a 422); this doc is what an agent
-    /// READS to learn the vocabulary, so it must not lag it.
-    pub relation: String,
+    /// One of [`EdgeRelation::ALL`] — also published on every read as
+    /// `writeVocabulary.relation`. A value outside the set is refused while the
+    /// request body is parsed, i.e. before the artifact upsert, so it can never
+    /// leave an artifact written without its edges.
+    pub relation: EdgeRelation,
     #[serde(default)]
     pub note: Option<String>,
 }
@@ -728,7 +860,8 @@ pub struct ArtifactWriteRequest {
 pub struct LinkRequest {
     pub from_id: String,
     pub to_id: String,
-    pub relation: String,
+    /// One of [`EdgeRelation::ALL`]; refused at parse otherwise.
+    pub relation: EdgeRelation,
     #[serde(default)]
     pub note: Option<String>,
     #[serde(default)]
@@ -750,12 +883,13 @@ pub struct LinkRetractRequest {
 
 /// `PUT /plan-library/links/{id}` body — replace a recorded edge's
 /// `relation` / `to_id` / `note` in place, a correction rather than a fresh
-/// observation. Mirrors [`EdgeSpec`]'s relation vocabulary; `to_id` is
+/// observation. Same [`EdgeRelation`] vocabulary as [`EdgeSpec`]; `to_id` is
 /// omittable only for `spawned_followup`, exactly as on create. `reason` is
 /// required and non-blank, same rationale as [`LinkRetractRequest`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct LinkCorrectRequest {
-    pub relation: String,
+    /// One of [`EdgeRelation::ALL`]; refused at parse otherwise.
+    pub relation: EdgeRelation,
     #[serde(default)]
     pub to_id: Option<String>,
     #[serde(default)]
@@ -1389,19 +1523,10 @@ fn missing_replace_fields(req: &ArtifactWriteRequest) -> Vec<&'static str> {
 /// a second value that could never differ from the first and only invited a
 /// reader to wonder when it might.
 fn edge_payload(spec: &EdgeSpec) -> Result<Value, String> {
-    // Checked HERE rather than in the handler so it cannot be checked in only
-    // one of the two places the handler calls this. A blank relation used to
-    // pass the pre-upsert validation (which tested only the exactly-one-end
-    // rule) and then 422 at the edge call — leaving behind precisely the
-    // half-written artifact-without-its-edges state the pre-validation exists
-    // to prevent.
-    if spec.relation.trim().is_empty() {
-        return Err(
-            "`relation` is required on every edge (produced_report | feeds | authored_plan | \
-             supersedes | depends_on | spawned_followup | refutes)"
-                .to_string(),
-        );
-    }
+    // No relation check here: `spec.relation` is an [`EdgeRelation`], so a
+    // blank or unknown value was already refused when the request body was
+    // parsed — before the artifact upsert, which is what keeps a bad relation
+    // from leaving a half-written artifact-without-its-edges.
     match (&spec.to_id, &spec.from_id) {
         (Some(_), Some(_)) | (None, None) => Err(
             "supply exactly one of `to_id` (outgoing) or `from_id` (incoming) per edge".to_string(),
@@ -1518,15 +1643,6 @@ pub async fn create_link_handler(headers: HeaderMap, body: Bytes) -> ApiResult {
             Json(api_error("`from_id` and `to_id` are required")),
         ));
     }
-    if req.relation.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(api_error(
-                "`relation` is required (produced_report | feeds | authored_plan | \
-                 supersedes | depends_on | spawned_followup | refutes)",
-            )),
-        ));
-    }
     // Flat (from, to) → the web route's anchor-relative shape: anchor on
     // `from_id`, far end as `to_id`, which is the OUTGOING direction.
     let path = format!("/api/v1/plan-library/{}/edges", req.from_id);
@@ -1628,15 +1744,6 @@ pub async fn correct_link_handler(
 ) -> ApiResult {
     let principal = authorize_write(&headers)?;
     let req: LinkCorrectRequest = parse_write_body(&body)?;
-    if req.relation.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(api_error(
-                "`relation` is required (produced_report | feeds | authored_plan | \
-                 supersedes | depends_on | spawned_followup | refutes)",
-            )),
-        ));
-    }
     if req.reason.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -2724,7 +2831,7 @@ mod tests {
         let both = EdgeSpec {
             to_id: Some("a".into()),
             from_id: Some("b".into()),
-            relation: "feeds".into(),
+            relation: EdgeRelation::Feeds,
             note: None,
         };
         assert!(edge_payload(&both).is_err());
@@ -2732,38 +2839,83 @@ mod tests {
         let neither = EdgeSpec {
             to_id: None,
             from_id: None,
-            relation: "feeds".into(),
+            relation: EdgeRelation::Feeds,
             note: None,
         };
         assert!(edge_payload(&neither).is_err());
     }
 
-    /// A blank `relation` used to pass the handler's pre-upsert validation
-    /// (which tested only the exactly-one-end rule) and then 422 at the edge
-    /// call — leaving exactly the half-written artifact-without-its-edges state
-    /// the pre-validation exists to prevent. The check lives in `edge_payload`
-    /// now, so BOTH call sites get it.
+    /// A blank or unknown `relation` is refused while the body is PARSED — the
+    /// same step for all three structs that carry one — with the set named.
+    /// Parse precedes the artifact upsert, so a bad relation can never leave a
+    /// written artifact without its edges (the half-written state the old
+    /// blank-only check in `edge_payload` existed to prevent).
     #[test]
-    fn a_blank_relation_is_refused_by_the_payload_builder_itself() {
+    fn a_blank_or_unknown_relation_is_refused_at_parse_with_the_set_named() {
         for relation in ["", "   ", "\t"] {
-            let spec = EdgeSpec {
-                to_id: Some("peer".into()),
-                from_id: None,
-                relation: relation.to_string(),
-                note: None,
-            };
-            let err = edge_payload(&spec).unwrap_err();
+            let err = serde_json::from_value::<EdgeSpec>(
+                serde_json::json!({"to_id": "peer", "relation": relation}),
+            )
+            .unwrap_err()
+            .to_string();
             assert!(err.contains("`relation` is required"), "got {err}");
+        }
+        let err = serde_json::from_value::<LinkRequest>(
+            serde_json::json!({"from_id": "a", "to_id": "b", "relation": "blocks"}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("`relation` `blocks` is not one of"),
+            "got {err}"
+        );
+        let err = serde_json::from_value::<LinkCorrectRequest>(
+            serde_json::json!({"relation": "Feeds", "reason": "r"}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("`relation` `Feeds` is not one of"),
+            "got {err}"
+        );
+        // A caller-supplied value is echoed only as a bounded prefix.
+        let long = "x".repeat(10_000);
+        let refusal = relation_refusal(&long);
+        assert!(refusal.contains(&"x".repeat(64)), "{refusal}");
+        assert!(!refusal.contains(&"x".repeat(65)), "echo is not capped");
+        for r in EdgeRelation::ALL {
+            assert!(
+                err.contains(r.as_str()),
+                "refusal omits `{}`: {err}",
+                r.as_str()
+            );
         }
     }
 
-    /// These strings validate NOTHING — `edge_payload` only tests presence, and
-    /// the web route is the real gate. They are what an agent READS to learn
-    /// the vocabulary, so a stale mirror teaches a value the store will 422.
-    /// The set is spelled out as LITERALS here (not built from a constant) so a
-    /// widening on the web side that is not carried here goes red.
+    /// `as_str()` and the serde rename must agree: the forwarded JSON is built
+    /// by serializing the enum, and the upstream CHECK compares strings.
     #[test]
-    fn the_refusal_message_names_the_whole_relation_vocabulary() {
+    fn edge_relation_wire_strings_match_serde() {
+        for r in EdgeRelation::ALL {
+            assert_eq!(
+                serde_json::to_value(r).unwrap(),
+                serde_json::json!(r.as_str())
+            );
+            let back: EdgeRelation = serde_json::from_value(serde_json::json!(r.as_str())).unwrap();
+            assert_eq!(back, r);
+        }
+    }
+
+    /// The cross-repo drift alarm. The loopback's relation vocabulary now has
+    /// ONE source (`EdgeRelation::ALL`, from which the refusal text and
+    /// `writeVocabulary.relation` are rendered), and `kind`'s is
+    /// `ArtifactKind::ALL`. The sets are spelled out as LITERALS here (not
+    /// built from a constant) and mirror the web `Literal`s
+    /// (`WorkArtifactRelation`, `WorkArtifactKind` in
+    /// `qontinui-web/backend/app/schemas/plan_library.py`), so a widening on
+    /// the web side that is not carried here goes red.
+    #[test]
+    fn closed_vocabularies_match_the_web_literals() {
         const VOCABULARY: [&str; 7] = [
             "produced_report",
             "feeds",
@@ -2773,101 +2925,128 @@ mod tests {
             "spawned_followup",
             "refutes",
         ];
+        const KINDS: [&str; 7] = [
+            "investigation_prompt",
+            "plan_authoring_prompt",
+            "implementation_prompt",
+            "investigation_report",
+            "handoff",
+            "plan",
+            "diagnostic",
+        ];
 
-        let spec = EdgeSpec {
-            to_id: Some("peer".into()),
-            from_id: None,
-            relation: String::new(),
-            note: None,
-        };
-        let err = edge_payload(&spec).unwrap_err();
-        for relation in VOCABULARY {
-            assert!(
-                err.contains(relation),
-                "the per-edge refusal omits `{relation}`: {err}"
-            );
-        }
-
-        // Mirrors 2 and 3 are a handler arm this unit test cannot reach and a
-        // doc comment. Both are read out of the SOURCE FILE rather than
-        // re-typed here: a re-typed copy would assert only that the copy
-        // contains its own substrings, which is a tautology, not a test.
-        // Extracted by LINE so a multi-byte character in the file cannot make
-        // a byte-offset slice panic.
-        let source_lines: Vec<&str> = include_str!("plan_library.rs").lines().collect();
-
-        fn window(lines: &[&str], anchor: &str, before: usize, after: usize) -> String {
-            let at = lines
-                .iter()
-                .position(|l| l.contains(anchor))
-                .unwrap_or_else(|| panic!("anchor not found in the source: {anchor}"));
-            lines[at.saturating_sub(before)..(at + after).min(lines.len())].join("\n")
-        }
-
-        // Mirror 2 — the `LinkRequest` handler's refusal. The message wraps
-        // over two lines, hence the window rather than the single line.
-        let link_message = window(
-            &source_lines,
-            "`relation` is required (produced_report",
-            0,
-            3,
+        // Mirror 1 — the typed source, exactly (no extra, no missing value).
+        let all: Vec<&str> = EdgeRelation::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(
+            all.len(),
+            VOCABULARY.len(),
+            "EdgeRelation::ALL differs in size from the web vocabulary: {all:?}"
         );
         for relation in VOCABULARY {
             assert!(
-                link_message.contains(relation),
-                "the link refusal omits `{relation}`: {link_message}"
+                all.contains(&relation),
+                "EdgeRelation::ALL omits `{relation}`: {all:?}"
             );
         }
 
-        // Mirror 3 — the `EdgeSpec::relation` struct doc, the text an agent
-        // actually reads to learn the vocabulary.
-        let doc = window(&source_lines, "pub struct EdgeSpec {", 0, 12);
-        for relation in VOCABULARY {
-            assert!(
-                doc.contains(relation),
-                "the EdgeSpec relation doc omits `{relation}`: {doc}"
-            );
-        }
-
-        // Mirror 4 — `correct_link_handler`'s own refusal (`PUT
-        // /plan-library/links/{id}`). It shares `create_link_handler`'s exact
-        // wording today, but is located by ITS OWN anchor (the function
-        // signature) rather than reusing Mirror 2's window, so a future
-        // divergence between the two refusals is still caught instead of
-        // trivially passing off Mirror 2's find.
-        let correct_message = window(&source_lines, "pub async fn correct_link_handler(", 0, 40);
-        for relation in VOCABULARY {
-            assert!(
-                correct_message.contains(relation),
-                "the correct_link_handler refusal omits `{relation}`: {correct_message}"
-            );
-        }
-
-        // Mirror 5 — the MACHINE-READABLE `relations` field `write_capability()`
-        // publishes, and the `writeContract` prose beside it. Phase 5 of
-        // `2026-09-20-a-recorded-delivery-scope-is-permanent-so-a-mis-declared-phase-is-uncorrectable`
-        // added both so the vocabulary is discoverable BEFORE a write, not only
-        // re-taught after a 422.
+        // Mirror 2 — the MACHINE-READABLE `writeVocabulary` a read publishes.
         let _pin = pin("off");
-        let contract = with_flag(None, || with_write_capability(serde_json::json!({})));
-        let relations: Vec<&str> = contract["relations"]
-            .as_array()
-            .expect("relations is a published array")
-            .iter()
-            .map(|v| v.as_str().expect("each relation is a string"))
-            .collect();
+        let cap = with_flag(None, || with_write_capability(serde_json::json!({})));
+        let strings = |field: &str| -> Vec<String> {
+            cap["writeVocabulary"][field]
+                .as_array()
+                .unwrap_or_else(|| panic!("writeVocabulary.{field} is a published array"))
+                .iter()
+                .map(|v| v.as_str().expect("each entry is a string").to_string())
+                .collect()
+        };
+        let relations = strings("relation");
+        assert_eq!(relations.len(), VOCABULARY.len(), "{relations:?}");
         for relation in VOCABULARY {
             assert!(
-                relations.contains(&relation),
-                "the published `relations` array omits `{relation}`: {relations:?}"
+                relations.iter().any(|r| r == relation),
+                "writeVocabulary.relation omits `{relation}`: {relations:?}"
             );
         }
-        let write_contract_text = contract["writeContract"].as_str().unwrap();
+        let kinds = strings("kind");
+        assert_eq!(kinds.len(), KINDS.len(), "{kinds:?}");
+        for kind in KINDS {
+            assert!(
+                kinds.iter().any(|k| k == kind),
+                "writeVocabulary.kind omits `{kind}`: {kinds:?}"
+            );
+        }
+
+        // And the refusal an agent actually receives names the whole set.
+        let err = relation_refusal("");
         for relation in VOCABULARY {
             assert!(
-                write_contract_text.contains(relation),
-                "writeContract prose omits `{relation}`: {write_contract_text}"
+                err.contains(relation),
+                "the refusal omits `{relation}`: {err}"
             );
+        }
+    }
+
+    /// Both new capability keys exist with the right SHAPES, on every read —
+    /// the capability tests above assert individual keys, so this is the one
+    /// that goes red when `writeVocabulary` or `writeCorrection` is dropped.
+    #[test]
+    fn write_capability_advertises_vocabulary_and_correction() {
+        let _pin = pin("off");
+        for flag in [None, Some("0")] {
+            let cap = with_flag(flag, || with_write_capability(serde_json::json!({})));
+            assert!(
+                cap.get("relations").is_none(),
+                "the flat `relations` key is retired"
+            );
+
+            let vocab = cap["writeVocabulary"]
+                .as_object()
+                .expect("writeVocabulary is an object keyed by field");
+            let mut fields: Vec<&str> = vocab.keys().map(String::as_str).collect();
+            fields.sort_unstable();
+            assert_eq!(fields, ["kind", "relation"]);
+            for (field, values) in vocab {
+                let values = values
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{field} is an array"));
+                assert!(!values.is_empty(), "{field} is empty");
+                assert!(values.iter().all(Value::is_string), "{field}: {values:?}");
+            }
+
+            let correction = cap["writeCorrection"]
+                .as_object()
+                .expect("writeCorrection is an object keyed by door");
+            let links = correction["/plan-library/links"].as_str().unwrap();
+            for claim in [
+                "DELETE /plan-library/links",
+                "PUT /plan-library/links",
+                "#1459",
+                "405",
+                "`supersedes`",
+                "REPLACES",
+            ] {
+                assert!(
+                    links.contains(claim),
+                    "links correction omits `{claim}`: {links}"
+                );
+            }
+            let artifacts = correction["/plan-library/artifacts"].as_str().unwrap();
+            for claim in [
+                "soft-delete",
+                "re-upsert",
+                "#1545",
+                "loopback",
+                "forwarder",
+                "PERMANENT",
+                "valid-but-wrong",
+                "2026-09-12-plan-library-has-no-delete-so-a-junk-row-is-permanent",
+            ] {
+                assert!(
+                    artifacts.contains(claim),
+                    "artifacts correction omits `{claim}`: {artifacts}"
+                );
+            }
         }
     }
 
@@ -2876,7 +3055,7 @@ mod tests {
         let spec = EdgeSpec {
             to_id: Some("peer".into()),
             from_id: None,
-            relation: "authored_plan".into(),
+            relation: EdgeRelation::AuthoredPlan,
             note: Some("chain".into()),
         };
         let body = edge_payload(&spec).unwrap();
@@ -2890,7 +3069,7 @@ mod tests {
         let spec = EdgeSpec {
             to_id: None,
             from_id: Some("producer".into()),
-            relation: "produced_report".into(),
+            relation: EdgeRelation::ProducedReport,
             note: None,
         };
         let body = edge_payload(&spec).unwrap();
