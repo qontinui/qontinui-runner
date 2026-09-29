@@ -332,9 +332,28 @@ function Start-ParityRunner {
     $configDir = Join-Path $tmpRoot "config"
     $webviewDir = Join-Path $tmpRoot "webview2"
     $logDir = Join-Path $tmpRoot "logs"
+    # Per-leg embedded-PostgreSQL root. NOT optional isolation, and not derivable
+    # from QONTINUI_CONFIG_DIR: embedded_pg.rs's `default_data_root()` is
+    # `dirs::data_local_dir()/com.qontinui.runner/embedded-pg`, a MACHINE-SHARED
+    # path that the other four dirs below cannot reach. Its own doc comment
+    # (embedded_pg.rs:205-217) says a fixed root means "a temp runner cannot
+    # avoid joining the machine-shared database", and its test
+    # `data_root_override_wins_over_the_shared_default` says such a runner
+    # "provisions or ATTACHES to the machine-shared cluster".
+    #
+    # MEASURED on the run that certified this harness (PR #1844, head 79582c60c):
+    # after leg A, 9 postgres.exe survived as ONE cluster -- postmaster pid 4116
+    # plus 8 children all at ppid 4116 -- so leg B did not start its own, it
+    # attached to leg A's. Two legs of an instrument whose entire premise is that
+    # they differ in ONE property were sharing a database.
+    #
+    # Reaping harder cannot fix that: the next leg would re-attach to the same
+    # shared root. Isolation is the fix.
+    $pgDir = Join-Path $tmpRoot "embedded-pg"
     New-Item -ItemType Directory -Force -Path $configDir  | Out-Null
     New-Item -ItemType Directory -Force -Path $webviewDir | Out-Null
     New-Item -ItemType Directory -Force -Path $logDir     | Out-Null
+    New-Item -ItemType Directory -Force -Path $pgDir      | Out-Null
 
     $stdoutFile = Join-Path $tmpRoot "runner-stdout.log"
     $stderrFile = Join-Path $tmpRoot "runner-stderr.log"
@@ -363,6 +382,10 @@ function Start-ParityRunner {
         "WEBVIEW2_USER_DATA_FOLDER"   = $webviewDir
         "QONTINUI_DISABLE_KEYCHAIN"   = "1"
         "QONTINUI_RUNNER_LOG_DIR"     = $logDir
+        # A blank value reads as UNSET (embedded_pg.rs
+        # `blank_data_root_override_is_treated_as_unset`), so this must carry a
+        # real path -- which $pgDir always does, having just been created.
+        "QONTINUI_EMBEDDED_PG_DIR"    = $pgDir
     }
     if ($EnvOverrides) {
         foreach ($k in $EnvOverrides.Keys) { $toSet[$k] = $EnvOverrides[$k] }
