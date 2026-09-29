@@ -1989,9 +1989,19 @@ pub async fn allocate_and_materialize_with_claim(
         // config only when every entry it names exists — an override naming a
         // missing directory fails every build in the allocation, while an
         // unwritten one only costs the old per-allocation rebuild.
-        if let Some(root) = &local_agent_root {
-            if let Some(worktree_root) = root.parent() {
-                fill_sibling_store(worktree_root, &sibling_sources);
+        // Off the async worker: `git archive` + unpack of a sibling is blocking
+        // I/O measured in seconds.
+        if let Some(worktree_root) = local_agent_root
+            .as_ref()
+            .and_then(|root| root.parent())
+            .map(Path::to_path_buf)
+        {
+            let sources = sibling_sources;
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || fill_sibling_store(&worktree_root, &sources))
+                    .await
+            {
+                warn!("sibling store: fill task failed: {e}");
             }
         }
         if cargo_override_is_backed(&write_path, &write_contents) {
@@ -3373,6 +3383,14 @@ mod tests {
             .join(format!("qontinui-schemas@{sha}"))
             .join("rust");
         std::fs::create_dir_all(&crate_dir).unwrap();
+        std::fs::write(
+            crate_dir
+                .parent()
+                .unwrap()
+                .join(sibling_store::COMPLETE_MARKER),
+            "",
+        )
+        .unwrap();
         // A directory with no Cargo.toml is not a crate cargo can use.
         assert!(!cargo_override_is_backed(&write_path, &body));
         std::fs::write(crate_dir.join("Cargo.toml"), "").unwrap();
